@@ -1,0 +1,9 @@
+Spor graph nodes relevant to this prompt (auto-compiled; node files live in /graph/pricing/nodes; run /spor:brief for a full briefing):
+
+- **spec-rc — Billing cost spec** (artifact, meridian, 2026-06-01): The revenue versus cost target spec that bounds price book pricing decisions and the usage limits every plan must respect.
+- **dec-new — Vendor neutral price book pricing** (decision, meridian, 2026-06-09): The price book prices vendor-neutral with composed and plan pricing.
+- **q-tier-pricing — Does the plan tier table inherit composed bundle discounts** (question, meridian, 2026-06-10): Open question on whether plan tier table pricing inherits the composed bundle discount structure or prices flat.
+- **art-catalogue — Published price book** (artifact, meridian, 2026-06-05): The published price book of plans, composed bundles, and the plan tier table that customers quote from.
+
+Standing corrections:
+> Quote prices from art-catalogue; never recompute price figures inline.

@@ -1,0 +1,50 @@
+# Host adapters
+
+The Spor client is a portable core behind per-host adapters
+(dec-cc-portable-core-adapters):
+
+- **Core**: the four hook engines in `scripts/` (session-start briefing,
+  prompt-context digest, post-tool journal, distill capture) and the
+  `bin/spor-hook` dispatcher that normalizes host payload quirks and
+  envelope event names. All engines are fail-open: any failure injects
+  nothing and exits 0.
+- **Universal surfaces**: the server's MCP endpoint (`/mcp`) and REST
+  (`/v1/*`) work from any host; `spor-hook agents-md` maintains a managed
+  Spor section in `AGENTS.md` as the floor for hook-less hosts.
+- **Adapters**: a manifest per host mapping its event names onto the
+  dispatcher.
+
+| Host | Adapter | Fidelity |
+|---|---|---|
+| Claude Code | the plugin itself (`hooks/hooks.json`) | full |
+| Codex CLI | `adapters/codex/` | full (debounced distill on turn-scoped `Stop`; generic transcript fallback) |
+| Gemini CLI | `adapters/gemini/` | full (generic transcript fallback for distill) |
+| OpenCode | `adapters/opencode/` — JS plugin over the same dispatcher | full (parts injection via `chat.message`; debounced distill on `session.idle` with SDK transcript export) |
+| Cursor | `adapters/cursor/` | partial — briefing at `sessionStart`, journal + distill; no per-prompt digest (`beforeSubmitPrompt` is block-only) |
+| Copilot CLI | `adapters/copilot/` | partial — capture full (journal + debounced distill on `agentStop`); no ambient injection (`sessionStart` has no output, prompt-submit observe-only), briefing via the AGENTS.md floor |
+| Cowork / claude.ai | MCP only | on-demand (no ambient injection) |
+| Goose, Amp, Crush, others | MCP + `AGENTS.md` section (`spor-hook agents-md`) | floor |
+
+An ACP (Agent Client Protocol) stdio proxy is the eventual single adapter for
+editor-hosted agents; it is deliberately sequenced after these (see the
+decision node for the rationale and revisit triggers).
+
+## Distiller backend
+
+The end-of-session distiller defaults to `claude -p --model haiku`. Hosts
+without the claude CLI set `SPOR_DISTILL_CMD` (contract: prompt on
+stdin, response on stdout), e.g. `codex exec -` or `gemini`. (Legacy
+`SUBSTRATE_*` names are still read for all user-facing variables.) The
+`SPOR_DISTILLING=1` recursion guard is exported around the call either
+way, so a distiller whose own exit fires a session-end hook cannot recurse.
+
+`scripts/distill-gemini.sh` is a ready-made backend implementing the
+contract against the Gemini API directly (no CLI; `GEMINI_API_KEY`
+required, model via `SPOR_DISTILL_MODEL`, default `gemini-3.5-flash`):
+
+```sh
+export SPOR_DISTILL_CMD="$HOME/repos/spor/scripts/distill-gemini.sh"
+```
+
+The journal records the backend per call (`journal/llm-calls/`), so distill
+quality stays observable across backends through the same eval loop.

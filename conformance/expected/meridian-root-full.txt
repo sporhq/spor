@@ -1,0 +1,34 @@
+# Compiled neighborhood
+
+## THE TASK
+
+### obj-q3-reliability — Q3 — dashboard p95 under 800ms
+
+Reliability objective for the shipments dashboard at enterprise row counts.
+
+## LINEAGE (structural arm: typed-edge walk)
+
+## OUTSIDE VIEW (content arm — no lineage connection; check for prior art and unowned constraints)
+
+### team-shipments — Shipments (team, 2026-06-10)
+*selected via: content similarity 0.246*
+
+Owns the dashboard and export surfaces.
+
+### feat-bulk-export — Bulk CSV export (feature, 2026-06-10)
+*selected via: content similarity 0.213*
+
+Self-serve bulk export for the shipments dashboard.
+
+### schema-objective — objective — Meridian-defined node type (schema, 2026-06-10)
+*selected via: content similarity 0.200*
+
+Org-defined vocabulary - the objective type exists only in this fixture's registry, authored by the org itself (a quarterly objective).
+
+### schema-key-result — key-result — Meridian-defined node type (schema, 2026-06-10)
+*selected via: content similarity 0.068*
+
+Org-defined vocabulary - the key-result type exists only in this fixture's registry, authored by the org itself (a measurable key result under an objective).
+
+## ORG NORMS (always-on)
+

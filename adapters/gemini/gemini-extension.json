@@ -1,0 +1,5 @@
+{
+  "name": "spor",
+  "version": "0.1.0",
+  "description": "Spor context compiler — standing briefing at session start, relevance digest per prompt, end-of-session knowledge capture into the team graph."
+}

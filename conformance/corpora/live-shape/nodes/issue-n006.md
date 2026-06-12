@@ -1,0 +1,35 @@
+---
+id: issue-n006
+type: issue
+project: p1
+title: we70cfa wf120ea "wbf680c" w68fddf w908eef w43690c wed38c6 w6481cf — w90a815 wc0626f w2b3373 w627fcb w6df567 w43690c w4feda7 we9e6a2
+summary: wfea49b 2026-05-29 w17ec0f w6376e8 we70cfa w12e1d9 wf7817b w6376e8 wa61bb9 w821fc9 wb663e5 wd17337 wb0875d/w38f03d w91c0b2. w68fddf 2026-06-01 w6a8281 we851e6 w56bb0e w9df9da — w6376e8 wb93acc w647d86 wdb17e2 wb406fb w6376e8 wa61bb9 w908eef w6376e8 wb3e37a w1f78dd w6a8281 we851e6 w842071 w3769a3 (wde1e9f w6376e8 w6eabd9 w358993* wd78abe); wed38c6 wfc3aa7 w3d4b6a w43690c wcdbbbd we7db50 w16d2c1 w6a4351 w35d0ff w565678 w1c2001. we90243 wc4b98d w763ec4 w6376e8 wae7fba (wbd384e) wc95a71 we4c72e w6376e8 w1c2001 (5wb671d0); w57a684 we65900 w416f29 wcc9ee0 w8dcdf0 117.
+status: resolved
+date: 2026-06-01
+edges:
+  - {type: relates-to, to: spec-n002}
+  - {type: relates-to, to: issue-n004}
+---
+
+w36d3e9 wc4b98d w6376e8 w8c95f8/w358993 w0f20b5 wa79eed `w4d7921/wcf36cf`
+(2026-05-29), w57a687 w191197 wcc9ee0 `wed38c6/w966363/w75b7e3.w565678.w903894` (13 w416f29 +
+1 w191197). w4c9522 w0e1403 w794a5a w8b2c8a w6376e8 w0cc360 w64ca60 w6ac87a w466a5b 112-116 wc95a71 wc0626f
+wc30532 w3126ff w7515f1 w27666e wc4b98d w6a4351 w58be4b w421ac2 w0f20b5 wd17337 w6dcc6d w3a451f w6376e8
+w358993 w3bbd73 wf37845.
+
+w0f6573 (2026-06-01): `wbd384e w90a815(wed38c6): #86 — w521c62 we70cfa
+w12e1d9 w2b3373 wcc44b2 w6376e8 wb3e37a w821fc9 we7db50` wcaefd4 w6376e8 w62ef4e
+wc0626f wa4141b we81c19 w2b17aa — w6376e8 w647d86 wdb17e2 + @wd8eb87 ("w1a3705 wc6f58d w6376e8
+w821fc9 w1e9f8c w297eee wc4b98d w6376e8 w3a55c1") w0c311b we851e6 w842071 w3769a3, w6376e8 wd4c14b
+w7b5212 w606265 w908eef wf5f7bc/w4020f5/w770067;
+w6dcc6d w6376e8 w6876a7/w63f743 w794513 w0c311b+wa5a6de w43690c w3769a3 wa61bb9. w6376e8 w0f65a5 "wd4c14b
+w821fc9 w8f65db w908eef w38f03d/wb0875d" w1c2001 wc0626f wb666e2 wcc9ee0 `5wb671d0
+w565678(wd9f7d4)` (w4f0448 w61d480 w43f29f wb663e5) w3b707d we8a95b wed38c6 wc69e44 wb4e6b5 w97f7d4
+w6376e8 wc58b31 we7db50. w6376e8 w6d9f6a wae7fba w8f1be5 w148882 w3769a3 w1e9f8c wa2db35 wc95a71
+w12e1d9 wb9adab 204; w6a4351 w95615d wae7fba wc0626f w180bbf
+(`w5070b4`).
+
+w43690c w94f8b0 w103857: w8dcdf0 116'w91ec5a w2ae65f w65c78d #86 wc871bc w191197, wc69d5c w6376e8
+w627fcb wfc3aa7 wbe15a2 14 w6c093b w76de08 wd17337 wfb2735 w1b526f — w8dcdf0 117
+(`w5eee18`) w57a684 w4c9522 we65900 we90243 (`w75b7e3` 14/14 w416f29)
+wc95a71 wc6012d w6376e8 w4dd23c w2a36d3 w97f57f.

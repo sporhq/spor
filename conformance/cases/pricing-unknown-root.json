@@ -1,0 +1,4 @@
+{ "id": "pricing-unknown-root", "kind": "compile", "corpus": "pricing",
+  "input": { "rootId": "task-does-not-exist" },
+  "expected": "pricing-unknown-root.txt",
+  "covers": "unknown root marker" }

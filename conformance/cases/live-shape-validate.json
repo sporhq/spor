@@ -1,0 +1,4 @@
+{ "id": "live-shape-validate", "kind": "validate", "corpus": "live-shape",
+  "input": {},
+  "expected": "live-shape-validate.json",
+  "covers": "validator at live-graph scale" }

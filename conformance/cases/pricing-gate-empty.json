@@ -1,0 +1,4 @@
+{ "id": "pricing-gate-empty", "kind": "compile", "corpus": "pricing",
+  "input": { "query": "xyzzx qwfpgj zxcvbnmm flurble", "digest": true },
+  "expected": "pricing-gate-empty.txt",
+  "covers": "relevance gate: gibberish query emits nothing" }

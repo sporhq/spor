@@ -1,0 +1,4 @@
+{ "id": "pricing-query-full", "kind": "compile", "corpus": "pricing",
+  "input": { "query": "plan tier table discounts" },
+  "expected": "pricing-query-full.txt",
+  "covers": "query mode full document, THE QUERY header, outside view arm" }

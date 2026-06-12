@@ -1,0 +1,27 @@
+---
+id: dec-n067
+type: decision
+project: p3
+title: w6376e8 w645fcb w3a55c1 w1e9f8c w43690c w2c709c w7b77b6, w3126ff w6376e8 w889e0b
+summary: wcc79ab w751052 wbb3c9b 100w1a5744 w6376e8 wf4d5e4, w6376e8 wae8961 w4914bc w1e9f8c w47114a wad6922 - w3b707d w6376e8 w18c4bf w3a55c1 w1e9f8c w43690c w7b77b6 w8b2c8a w6376e8 wca33a0 w6dcc6d w8dee5a w6208cc w8de373 w80881f, wac7685 w3328a2 w2b9134 w6a8281 w404d18 wad475a wa33aaf. w6376e8 w889e0b w1e9f8c w6376e8 w84c4f5; w6376e8 w7b77b6 w1e9f8c w154ff1 wd0f0b3 w89d931 w4c9522. w4cbd22 w90bab9 w16d2c1 w6376e8 w770367 w08ebb1 wd4935b w6376e8 wfc4e82 w5d6b1a wae860b w15919a.
+status: active
+date: 2026-06-09
+edges:
+  - {type: decided-in, to: art-n036}
+  - {type: relates-to, to: art-n027}
+---
+
+w6376e8 w482a27 w889e0b w602bb5 w1e9f8c w27a9c5; w991167 wee0dbc w707319 w07cd44 w43690c
+w5f556e w45e9e3. w6376e8 w3ab595 w0dd72b w1e9f8c wd17337 wcc9ee0 w6a4351 w816464 w9755d9 w6376e8
+w864eda w197f00: w56bb0e w1e9f8c w1b4e2a, wad6922 w1e9f8c wae8961, wc95a71 w6376e8 w4bcd30
+w21f9b2 w4d1263 w6376e8 w1cd787 w3ae887 w4b82dd wa93c1b wb3e5a9 w6376e8 w72a6bd. wac7685 w7b77b6
+wae860b wc131a5 w6a8281 w7b1009 wad475a wa33aaf (w6376e8 wd4c14b w689bb4 wd17337 wda2837
+w751052 wda2837 w6376e8 w1cd787 w2c709c w74da9c).
+
+w6376e8 wec5ed2 w79130f w838226 w6376e8 w5d6b1a w7f6a22 wae860b w15919a: w81735a
+w47fc65 w770367 w561903 wd252f0 w67bd48 weca369 w6376e8 wb3ea47 wc95a71 w39e014 wcc44b2 w43690c w47114a
+w908eef w4cbd22 w90bab9, w6a8281 w43690c weac97c wd0b42a w0134e8 w908eef w6a4351 waeac2f w587b5d
+wa79eed wd39d21 w56708c (wf3a370). w6376e8 we8a750 wc35d69
+w7f6384 — w43690c wbe610a w064afa w1e9f8c w322d20 w8f4fef w66f91d w6dcc6d w43690c w47114a w6208cc w1f2f07.
+wced0d4 wcc9ee0 w6376e8 wf7e750 wd17337 w830395 w4e2faf wcc9ee0 w6376e8 w3ab595 wbd4597
+w93e74c w07cd44 wb248cb wa0b8b8.

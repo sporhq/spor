@@ -1,0 +1,144 @@
+{
+  "items": [
+    {
+      "id": "task-unblocker",
+      "title": "Land the schema migration",
+      "type": "task",
+      "status": "open",
+      "project": "alpha",
+      "priority": "p2",
+      "score": 8.4,
+      "signals": {
+        "blocking": 1,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 1,
+        "staleness": 0,
+        "age_days": 42
+      },
+      "suggest": "do",
+      "why": "priority p2 (human-set); blocks 1 live node; neighborhood active (heat 1); 42d old; 1 open gardener finding: finding-open",
+      "findings": [
+        "finding-open"
+      ]
+    },
+    {
+      "id": "task-front",
+      "title": "Draft the audit runbook",
+      "type": "task",
+      "status": "open",
+      "project": "beta",
+      "priority": null,
+      "score": 7.37,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 40,
+        "heat": 3,
+        "staleness": 0,
+        "age_days": 11
+      },
+      "suggest": "do",
+      "why": "your active front (40 writes this week); neighborhood active (heat 3); 11d old"
+    },
+    {
+      "id": "task-blocked",
+      "title": "Rewrite the indexer",
+      "type": "task",
+      "status": "open",
+      "project": "alpha",
+      "priority": "p1",
+      "score": 6.98,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 1,
+        "front": 0,
+        "heat": 2,
+        "staleness": 0,
+        "age_days": 72
+      },
+      "suggest": "blocked",
+      "why": "priority p1 (human-set); blocked by task-unblocker — do the unblocker first; neighborhood active (heat 2); 72d old",
+      "blocked_by": [
+        "task-unblocker"
+      ]
+    },
+    {
+      "id": "task-stale",
+      "title": "Tune the legacy cache layer",
+      "type": "task",
+      "status": "open",
+      "project": "alpha",
+      "priority": null,
+      "score": 2.97,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 1,
+        "age_days": 89
+      },
+      "suggest": "close",
+      "why": "89d old; 100% of anchors superseded or gone — consider closing"
+    },
+    {
+      "id": "task-muted",
+      "title": "Sideline project chore",
+      "type": "task",
+      "status": "open",
+      "project": "muteproj",
+      "priority": null,
+      "score": 1.1,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 33
+      },
+      "suggest": "do",
+      "why": "33d old"
+    },
+    {
+      "id": "finding-open",
+      "title": "Migration task has a dangling gate",
+      "type": "finding",
+      "status": "open",
+      "project": "alpha",
+      "priority": null,
+      "score": 1.1,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 1,
+        "staleness": 0,
+        "age_days": 3
+      },
+      "suggest": "do",
+      "why": "neighborhood active (heat 1); 3d old"
+    },
+    {
+      "id": "cap-triage",
+      "title": "NOFIT capture about retry storms",
+      "type": "capture-pending",
+      "status": null,
+      "project": "beta",
+      "priority": null,
+      "score": 0.13,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 4
+      },
+      "suggest": "do",
+      "why": "4d old; unprocessed capture awaiting triage"
+    }
+  ],
+  "count": 7
+}

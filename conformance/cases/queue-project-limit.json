@@ -1,0 +1,4 @@
+{ "id": "queue-project-limit", "kind": "queue", "corpus": "queue",
+  "input": { "now": "2026-06-12T00:00:00Z", "project": "alpha", "limit": 2 },
+  "expected": "queue-project-limit.json",
+  "covers": "project filter and pre-limit count" }

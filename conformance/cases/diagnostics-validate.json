@@ -1,0 +1,4 @@
+{ "id": "diagnostics-validate", "kind": "validate", "corpus": "diagnostics",
+  "input": {},
+  "expected": "diagnostics-validate.json",
+  "covers": "every error class (no frontmatter, missing fields, id!=filename, duplicate id, correction sans target, unparseable schema) and warning class (unknown type, unknown edge, dangling edge, missing date)" }

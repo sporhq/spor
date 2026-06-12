@@ -1,0 +1,4 @@
+{ "id": "queue-policy-blend", "kind": "queue", "corpus": "queue-policy",
+  "input": { "now": "2026-06-12T00:00:00Z" },
+  "expected": "queue-policy-blend.json",
+  "covers": "attached queueSignals signal joins the blend; queue-policy rank() rescoring; proposed schema surfaces as approve item" }

@@ -1,0 +1,4 @@
+{ "id": "queue-viewer-mutes", "kind": "queue", "corpus": "queue",
+  "input": { "now": "2026-06-12T00:00:00Z", "viewer": "person-viewer" },
+  "expected": "queue-viewer-mutes.json",
+  "covers": "queue_mute: project mute, dated id mute active, expired mute inactive, muted count" }

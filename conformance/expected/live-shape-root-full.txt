@@ -1,0 +1,1113 @@
+# Compiled neighborhood
+
+## THE TASK
+
+### dec-n017 — w889e0b.w3a5bcc w908eef w6376e8 w27666e w07c3e7 we7db50 (w621b28)
+
+w679458 w6376e8 wfb3aed w2b7db3 w43690c w27666e w07c3e7, wc95a71 w889e0b.w3a5bcc wc0626f w4c9522: w6376e8
+w697010 weee71f, w6376e8 w264d4b w5b915b, w6376e8 w41d9ab w813635
+w15919a w3dfcfa, w6376e8 wc238e5 w5bf85c w481c2b, wc95a71 w6376e8 wdf93bb wbe8b1c w68a1af
+wf46775 we52c9d we81c19 w0886d5 w369866 w8b2c8a w794a5a wa30aa4. wd17337 wc0626f w6376e8 w9b306c w9cb3e5
+wcc44b2 we186f8 w43690c wa6fc86 w689bb4 wc95a71 w43690c wa8a4d2 w889e0b.
+
+w4c9522 wc0626f wc58b31 w908eef w43690c w6be6e2, wec686e w6376e8 w024c13 w5d2ddb wcc9ee0 w7b77b6.w3a5bcc §2.1:
+wbef4d6, w290962 wd0fef8, wc95a71 w64d5fe wa8a59d wd252f0 w7809c4 w5fe808
+w29b1f6, wc95a71 w1bcc2f w0886d5 w598991 w1e9f8c w43690c w2b8746 w8795f0 w6376e8 w9755d9 w21f9b2 w166141
+wcc44b2 w6376e8 w70adee w8e8705 w8b2c8a w6376e8 w70adee w99522d wcc44b2 w6376e8 w9755d9. w6376e8 wd8397c w8bd7ed wf887ad
+w8e62df wac7685 w0a5079 (w6376e8 w9ede4e w15919a w3dfcfa w61d480 w889e0b.w3a5bcc wc0626f w43690c wa8a4d2 wb2da90
+w97a19c).
+
+w621b28 wc4b98d we495e2: w889e0b.w3a5bcc w1e9f8c w715e1d w2e8208 w8b2c8a w6376e8
+wc0a903 w1e3d54 w10ddf1, wc95a71 w6376e8 w8e89c4 — wc0a903 w216b50 wcc9ee0 w84f7ba/wc0a903/ w3175a5 wc4b98d
+w801bf9 w15919a:w1e3d54 w8a54c0 — w1e9f8c w6376e8 we7db50.
+
+## LINEAGE (structural arm: typed-edge walk)
+
+### dec-n039 — w216b50 wd252f0 w51ecfe w8a54c0 wcc9ee0 w6376e8 w889e0b, w3126ff w0886d5 w1c9ce0 (decision, 2026-06-10)
+*selected via: supersedes (inbound) from dec-n017, score 1.00*
+
+w6376e8 w00d6ad (w7b77b6.w3a5bcc §2, w48e753 w52747b 1): w43690c w1e3d54 w1e9f8c w43690c w9451ff wcc9ee0 w6376e8 w889e0b, w3b707d
+w1e3d54 we02d3b, w0742f6, wd0b42a, wc95a71 w86e422 wd651ee w6376e8 w2bdc00
+w9c4471 wec686e w4f783d. wd0e75a w77c59a, wdfa65a wc6fabf, w8821fa w79081b, w6376e8 wdf93bb
+wbe8b1c (w715e1d `w0a2534: we805ca`), wc95a71 w835f77/wd6ec1b w8a650c
+w4601ee (w715e1d `waacfde: w4faeb2`) wd252f0 w8e89c4 w63b33c; w6376e8 wc0a903 w10ddf1 wcc9ee0
+w84f7ba/wc0a903/ w026260 w6376e8 w9ad993 w889e0b.w3a5bcc w07c3e7 wd9ae67, wc95a71 w98df9e
+w801bf9 `w15919a: w1e3d54` w9451ff w6e6b0e w40a1f6 w337c7d w4c9522. w6376e8 w1e3d54 w9451ff
+w15919a w7f6384 w2ac858 w3be2db wcc44b2 w6376e8 wfe9278 — we851e6 w9835ba wb68f2d.
+
+w6376e8 w3ab595 wad475a w1e9f8c w7b5212 wa60c87 w16d2c1 w27acc8 w8f65db w722f0d:
+w4f0d61 `w4e8517.wd63b12.w7e328c.waa4607` w57348a, w216b50 w21f9b2 w3b42b0 we81c19 w72c171 w57348a,
+wb32aaf wd0fef8 w8b2c8a w80e239 wb343d1 wa99d7a, wf91de0 w9c2364 w22cc93, wc95a71
+wa63086 we46471 wbdc0c4. w6376e8 wf7546f w526ade; w9a32cc
+w086fe9 wbdc0c4 w5ad43e.
+
+w6376e8 w582aea w07ed00 w0d1810 — w6376e8 w1e3d54 w66fbaa wcc44b2 w6376e8 w9755d9 w8e8705 w8b2c8a w6376e8 w9755d9
+w99522d wcc44b2 w6376e8 w1e3d54 — w1e9f8c w6376e8 wd4c14b wd8e767 w806471 w6376e8 wec5ed2 w731a92
+wf7dcac wec686e wbc21a2, wc95a71 w4c9522 w59e6d2 w6376e8 w0f0ce2 wdf7202 w026b84 wcc9ee0
+wa59b32: w6376e8 w1d98c8 w66f91d w1e9f8c wac59cf; wf485f1
+w62fe8b wcc6b6e w4c9522 w1e9f8c wdede78 w9c4471.
+
+wb0bf57 w908eef w43690c w80e239 w299b7a wc4b98d wfe82e7 wdec995: w095401/wa5a6de w95bcda
+w7cc100 wf6d72c w8e62df w6376e8 wa8a4d2 w889e0b w76de08 wc95a71 weca369, wc0a903 wb9cce4
+~3w9a65a5 w07cd44 w9fbfc4.
+
+### art-n008 — w84f7ba/wc0a903/ — w6376e8 wc0a903 w1e3d54 w10ddf1 (artifact, 2026-06-10)
+*selected via: derived-from (inbound) from dec-n039, score 0.90*
+
+wac7685 wc0a903 w1e3d54 w1e9f8c w43690c w5b2f91 w9451ff wde1e9f w98df9e w0a5079 (wb96b93 + w581141
+wd26158 w92613c): w9451ff w216b50 w0c311b w50b2e3 w481c2b, w63913e w5e6319 wec686e
+w6376e8 w2d481d w3dfcfa, wc4b8f9 wedaf60 (w751e0f wc95a71 w7de56f wd252f0 wc4b8f9;
+web412f w2fba26 w6a8281 w6376e8 wd39969), w0a2534 wec686e w6376e8 wdf93bb wbe8b1c, wc95a71
+waacfde: w4faeb2 wec686e w56708c wc95a71 w17cfeb; wd0e75a w216b50 w0c311b w6376e8
+w77c59a w6376e8 w689bb4 wed6ca4 wcc44b2 w5044d2 (w1278f6/w2e7298 1.0 wcf37bb
+wcc44b2 wd40e6d 0.5).
+
+w6376e8 w10ddf1 w1e9f8c w51ecfe w4f0d61 wde1e9f we81c19 w216b50 wc95a71 we93890 wa89aaf wd860a1 wcc9ee0
+w2b8746: wb27669.06.10.2 w180bbf w6376e8 w3d333f w3dfcfa w942566, wb27669.06.10.3 w6376e8
+wc4b8f9 wedaf60, wc95a71 w6376e8 web412f w1e3d54 w93e74c w6a8281 w6376e8 wd39969. w6376e8
+w7b5212 w75949f: w6376e8 wc0a903 w751e0f w1e3d54 w354af2 we851e6 wcedbcb w557e25, wc5898e
+wa8a4d2 w89c2c1 w212c7a w6376e8 wa8a59d — w654976/w557e25 w700dac w1e9f8c w43690c
+w5c0e32 w1e3d54 w2c709c, w3126ff w43690c wc0a903 w6f195a. w889e0b.w3a5bcc w7d5fa5 w6376e8 w6254cc
+w47114a w2e8208; wcc79ab w69fcdf wc95a71 w8e89c4 w2423d8, w6376e8 w8e89c4 wd16df5.
+
+### norm-n009 — wc0a903 w07c3e7 wa893c4 w64a87c wf485f1 wcc9ee0 w794a5a w1b526f (norm, 2026-06-10)
+*selected via: derived-from (inbound) from dec-n039, score 0.90*
+
+w6376e8 w07c3e7 we93890 w751281 wbdfa16 wd17337 w21f9b2 wd5c689: w6376e8 wc0a903 w1e3d54 w8a54c0
+(w6376e8 we7db50 w18c4bf), w889e0b.w3a5bcc (w404d18 w47114a w2e8208), w6376e8 w41d9ab
+wd5d7dd (we8bf74 wed6ca4 wcc44b2 wfb83a1 w8e62df w889e0b.wb40d31 w15919a w3dfcfa — w43690c wc1eb04 wb2da90
+w54cd8a), wc95a71 w922d72 wd17337 w0b4feb wc6fabf w40a1f6 wdab6e5. w67edf1 w6a4351 w07c3e7 w9df9da
+w2e2701 w3ba485 w2fdcc5 wd9ae67 w6376e8 wfb83a1 w6376e8 w8e89c4 w00d6ad wc0626f wa90897
+wcc44b2 w7249f6, w3b707d w6c764c w1e9f8c w43690c we3648e wdb17e2: w794a5a w1b526f, w1bcc2f w3a55c1.
+
+wfdbb2d web1bbe w27acc8 w481c2b: w4f0d61 w4e8517.wd63b12.w7e328c.waa4607, w216b50 w21f9b2
+w3b42b0 wac59cf w2b5d38 wc4b98d we81c19 w72c171 w57348a, wc95a71 w43690c w876bab
+w9df9da w354af2 w6a4351 wb32aaf wb343d1 w87be25 w8b2c8a w80e239 wc61e73, wb5a706 w19a02f
+wcc79ab w43690c w9451ff w1e9f8c w4bf057 w2b5d38. w6376e8 wb0bf57 wc0a903 w10ddf1 we93890 wa89aaf wd8a1df
+w6ac87a w57348a w07ed00 w58e434 (w3d333f w3dfcfa w942566 wcc9ee0 wb27669.06.10.2,
+wc4b8f9 wedaf60 wcc9ee0 wb27669.06.10.3).
+
+### art-n010 — w71a292.w3a5bcc wc95a71 w7b77b6.w3a5bcc — w6376e8 w3ab595 w04a257 (artifact, 2026-06-10)
+*selected via: decided-in from dec-n039, score 0.90*
+
+w2907ca w0c9bca wd252f0 w676938 wcc9ee0 w6376e8 wa6fc86 w516b1e: w2b5d38 w76de08 w0e4842
+w627761, w103b5e wba0651 wcc9ee0 w6376e8 wd4c14b w3ba485 wd17337 wb0bf57 wac7685 w52747b, w3b707d w0e4842
+wcedbcb w37152d, we90243 w6e9390 wa79eed wca1360 webf72d, wc95a71 w2f417d
+w1c9ce0 (w71a292.w3a5bcc §10 w1c0a42 wc1eb04 5we9524e waf2ae7, w9f2b50 w6376e8 w794a5a
+wcb360c w37bbd9 wf86b4d - w8dd6ec wcc6b6e 250w9a65a5 weac97c w6376e8 wc1af95 w7d4f23
+wcdb64d) wec2cd1 wb91705 w9c5207, w3126ff wb91705 wc0626f wca4ecf. w2b9617 wd948c9* w838124
+wcc9ee0 w07ed00 w889e0b we52c9d wae2dae wcc9ee0 w0e4842 w75be65.
+
+w71a292.w3a5bcc wc70cf5 wa4f438/wc03839 (wac59cf w25a6fb wec686e w6376e8 w71a292 wf7546f),
+wa10b2d wc95a71 w6376e8 w1408bc w27410c, w6376e8 wc1fc4c wc95a71 w2353df wbdfa16, wee1831 wa893c4,
+w5436f4 w64cf6e, w8a8552 wccdd47, w8c10e0, w6376e8 wc688ca w48e753,
+wc95a71 wca1360 webf72d (w835f77 w20b276, wd5067a w90d7ac, w50bdd9 w07cd44 w1c8db2,
+w25f7bf w1ac18a wa1bd4d). w7b77b6.w3a5bcc wc70cf5 wd047e9 w889e0b.w3a5bcc w154cc0 wc0f665 w6376e8
+we7db50, w8e9137 w6a8281 wf751bf wfdbb2d, w2d481d, w6376e8
+weccaa1 w3d333f w2fcec9, wfb75af w25b4d3, w6376e8 w7b77b6 w908eef w43690c w095401
+w4f08df, w6376e8 wd39969, w404d18 w312a48 wc688ca w48e753 (we81c19 wb0bf57), wc95a71 w404d18 wca1360
+webf72d (w1e3d54 w380da6, w7809c4 wd0e75a wea35c9, w98e24c wc0a903
+wcbc25e).
+
+### dec-n070 — w9784c0 w9755d9 wa8a59d w3f7abd wcc9ee0 w1dd473 we563df — w6376e8 wa8a4d2 w8e89c4 w1e9f8c w349041 w6dcc6d (decision, 2026-06-10)
+*selected via: derived-from (inbound) from dec-n039, score 0.90*
+
+wb666e2 2026-06-10: w6376e8 w10aba7 wcc44b2 wdc6f94 wcbdf9b w9451ff wc6fabf, w1c54d8,
+wc95a71 wa05ba9 w1e9f8c w6376e8 w4bcd30 w26f972 — wc95a71 w4c9522 wa89aaf w9c5207, wc5898e
+w216b50 wd252f0 w51ecfe w889e0b w8a54c0 w6d448d wc4b98d w6376e8 w8e89c4. wb91705 wd7afa1 w70c57a
+w3447d9 wc58b31 w1e9f8c wb65d7f w6376e8 w1fd581 wfdc49d w6a8281 w6376e8 w349041 w889e0b: w07ed00
+w2c8c59 we93890 we851e6 wa18cc3, w3b707d w6a4351 w4c27e3 w15919a wcc9ee0 w6376e8 wa8a4d2 w8e89c4 wd7afa1 w214b82 w8d3bd1 w6376e8
+wd39969 wc95a71 w1bcc2f w835f77 we93890 wcc44b2 w52747b w1ffb99. w1dd473 we563df wf23fdf w6376e8
+w14a15e w945433 (w42b7bc w354b78 w6376e8 w8e89c4 w16d2c1 w6376e8 wbb00ba w312a48
+w1e3d54 w8a54c0) wc95a71 wbd665d.
+
+### dec-n101 — wb73392 w1408bc w3d0a42 wd252f0 w7c84e7 w6706bb wcc44b2 w1e3d54 w8e89c4 w569bab — we851e6 wf7fc3d w5b68fc wcf4111 (decision, 2026-06-10)
+*selected via: derived-from (inbound) from dec-n039, score 0.90*
+
+w07ed00 w1e9f8c wb91705 w7d267a w97c659 w71cf3e w89d931 w43f29f wbef4d6 (w43690c wfd0d5e weceec0, w43690c w8c8d75
+w8a2519 w75959b wcfd189, wefb186 w3f0700 w93e5b8 w43690c wf4ad45 w070473) wedeb38
+we89768 w43690c w5d6b1a w1408bc w27410c. w6376e8 wb15abc w9f0bfd w8f65db we821fc w794a5a w08ebb1 w612906:
+w6376e8 wb73392 w6d9fcd w1e9f8c w322d20 w43690c wbd3d74, w9a32cc w889e0b w71bc8b w6a8281 w43690c w73ef87.
+
+### norm-n007 — w6376e8 w1e3d54 w8e89c4 w1e9f8c w6376e8 we7db50 — wfe75c6 w5b091a w43690c wa7caf1 (norm, 2026-06-10)
+*selected via: derived-from (inbound) from dec-n039, score 0.90*
+
+w6376e8 w8e89c4 w00d6ad w1e9f8c w6dcc6d w577dc6 wd36719 w933eaf w4c9522 w2ac858 we17704. w6376e8 w50b297
+wdcb7a3 w4f08df wc0626f w61fdba w0886d5 w369866 w8b2c8a w794a5a w07c3e7 (w098c35
+weee71f, w689bb4 w5b915b, w41d9ab w15919a w3dfcfa, w71a292 w50b2e3
+w481c2b, wdf93bb wbe8b1c w68a1af wf46775) wfa79db w8e62df wac7685 w0a5079; w6376e8 wdb17e2
+w9c5207 w3b707d w6376e8 w10438b wfe75c6 wc8f095 w43690c wcd62bf.
+
+w14a6d7: `w42b7bc()` w480828 w216b50 w44f0e9 (w801bf9 w15919a:w1e3d54
+w8a54c0 w25339c w6376e8 w84f7ba/wc0a903/ w10ddf1), w354b78 `w889e0b.w8e89c4`, wc95a71 w1bcc2f
+w2d5066 — w689bb4 w8a650c w77c59a, w098c35 w15919a w5785e3, w71a292 wd0f0b3
+w481c2b, w7b77b6 w7091b4 — wb35744 w6376e8 w8e89c4. wcc79ab w07ed00 w69fcdf, w889e0b.w3a5bcc,
+w40a1f6 w98df9e wa30aa4 w428a36 w6a8281 w6376e8 w8e89c4, w6376e8 w8e89c4 wd16df5.
+
+### task-n040 — $wfb2db7 wccdd47 wb663e5 — w6376e8 w794a5a w332c09 wbf680c wec686e wfd60af w1edb06 (task, 2026-06-10)
+*selected via: constrained-by (inbound) from dec-n070, score 0.90*
+
+w73f81c 2026-06-10 (wc0626f: "wdc6f94 w4c27e3/w6f106f/wb09884 w1e3d54 wa8a59d") —
+w2d342a we52c9d w9784c0 w740c4f w8b2c8a wc25685 wdd0705, w3126ff wa8a59d wec686e
+w07ed00 w889e0b. wb91705 w7d5fa5 w1e9f8c we65900 w332c09: $wfb2db7 w0f6573 w911e27
+wcc44b2 w6376e8 w93d349 w33c425 (w8eb466 w4f08df / w71a292), wb663e5 w6376e8 wec5ed2 we8e6d4 w16d2c1
+w6376e8 wa2ea8a wccdd47 w6376e8 wd4c14b w58e434 w74d1d8 wa89aaf w5f1cd3
+(wa6e931), w3b707d w43690c wec5ed2 w6208cc w78d4fb "wb3d424 wc64fd2 wcc44b2
+$wfb2db7" wc95a71 we851e6 w1f78dd w6208cc w734198. wf485f1 wbbbf38 w43690c wfd60af w87f1bb w1e9f8c
+w8e89c4 wac59cf w6a4351 w9755d9 w37b004 w7f6384.
+
+w800dc5 2026-06-10 (wece99a 5wd9eee8). w493039/w5e00d9/wc64fd2
+wbe15a2 w908eef wc0a903 w216b50 (w332c09 wbdc0c4 w7d8ebf w6376e8 w493039 w15919a, w3b707d w6376e8
+wc0a903 wb0873a w4c9522 - w606ef1 w421bfc); w686d2c() we40024 w25f7bf
+webda5b wcc44b2 w493039 w9451ff; w830395 w3cb784 (we186f8 /w1e19c0/wec5ed2/{w8821fa}/we30264 wc95a71 wc1fc4c
+w631b8a) wffd148 wa66e27 wfb2db7 wee9c22 wc95a71 w555ad1 w16d2c1 wccdd47.
+wdb0015 wa8a4d2: wffb81b w6462cb w73d157 w03e3e7 w16d2c1 w6376e8
+w2efb93 w25f7bf, wc95a71 ?wfb2db7= wd72160 w1e9f8c w43690c w3fb77f. 4 w5dc9a4, 105/105.
+
+### task-n038 — w4552d2 w95b429 wcc9ee0 w3c069d, wf8118d wcc44b2 w8e89c4 w569bab, w5f8981 wc4b98d w6376e8 wd80f17 (task, 2026-06-10)
+*selected via: constrained-by (inbound) from dec-n101, score 0.90*
+
+w6376e8 w3c069d w9df9da w6b8877 w6ac87a w6376e8 w2bdc00 w1e3d54 w4e4cfa/w290962 w2fcec9.
+we851e6 wf22d4d w71a292 w3a55c1 w01191d w214b82 w2b7db3 w1cc8bf wb91705 w569bab wa89aaf w55558e;
+w933eaf w794a5a w1e9f8c, wd17337 w1e9f8c w43690c w3ab595 wed494b w577dc6 w43690c w9451ff w8b2c8a w404d18 w312a48.
+
+### art-n007 — w84f7ba/ — w6376e8 w10b572 w889e0b wfe9278 (artifact, 2026-06-10)
+*selected via: governed-by (inbound) from norm-n007, score 0.85*
+
+w889e0b.w986bba w1e9f8c w6376e8 we78981 w2f2377 w8b2c8a w6376e8 wa6af0f w689bb4 wfb3aed: w42b7bc
+(w216b50 w44f0e9, w103b5e w8a54c0, w5cf5e8 w889e0b.w8e89c4 wc95a71 w792356 wb9577f
+w1a98ce), w095401 (w6376e8 w027022 w239930 + wc6dcef w3ab595 w16d2c1
+w6376e8 w4d7921 w0f9f4d, w6a8281 w17cfeb, w86e422 w92c916, wc95a71 w39dcf4/w000cd0/
+w1f9624 w77c70c), w394a43/w940258, w297cd3, wc95a71 w6376e8
+wa8cbb5 wb96b93 w8c468d wd17337 we9b489 w6376e8 wfc4e55 w3a55c1 w9a68eb
+w9af234. w095401.w986bba wc95a71 wa5a6de.w986bba wd252f0 wb1b859 w95bcda wc5a5ca;
+w6376e8 w71a292 w5d4c5a w6376e8 wfe9278 wedeb38 w29c9ea w4c9522.
+
+w8e89c4.w986bba w1c0a42 w6376e8 w1e3d54 w9c4471 (w4f0d61 w8b3077 w4ca1c4, wb32aaf
+w9c2364 wb343d1 wd0fef8, w35eb19 w92613c wa1cb27, we2a2f9
+w655217); w7b77b6.w986bba w851d68 w6376e8 wcf40a7 w18c4bf w4ef575 wfe7cac wc95a71
+w118b77 w908eef w6376e8 w0f7fbe w7b77b6 w95bcda; we5295a.w986bba w1e9f8c w6376e8 ~100-wfbb18c w9451ff:w04c00e
+w462543. w0857a9 w07cd44 5wbbbcd7 w8a54c0: ~290w9a65a5 w69def5 w9f2b50 w37cb0a w7521ba, ~13w9a65a5
+wb30852 weca369 w6376e8 w7521ba w90a815 — w478028 wcc9ee0 w6376e8 wd4c14b wac01a3 w6376e8 wea8182
+w9a6f60 wce75b3 wace1e9. w43690c w10b572 w9451ff:w2b3373 wcb703d wc70cf5 w6376e8 w50be9d.
+
+### dec-n107 — $wfb2db7 wb663e5 wbf4a69 w16d2c1 wa2ea8a w25f7bf; w493039/w5e00d9/wc64fd2 wcc9ee0 wc0a903 w10ddf1 (decision, 2026-06-10)
+*selected via: governed-by (inbound) from norm-n007, score 0.85*
+
+w6376e8 wec5ed2 wf135aa w37551b wbbc25d we851e6 wa893c4 — `$wfb2db7` wc0626f wa89aaf w43690c wa10267 we8e6d4. wb663e5 wfb2db7 wccdd47 we402a7 w16d2c1 w6376e8 wa2ea8a w25f7bf (w4b82dd wa93c1b w16d2c1 wa66e27 w99d040) w07cd44 w830395 w2353df (`we186f8 /w1e19c0/wec5ed2/{w8821fa}/we30264`) wc95a71 wc1fc4c (`w631b8a`) w7c6a61 w26c438 web1bbe w6376e8 wd4c14b w9f0bfd w8f65db w908eef `wa6e931`, wee2142 w3157d1 w72ca4d w7c82ca w0e4842 wccdd47.
+
+w6376e8 `w493039`, `w5e00d9`, wc95a71 `wc64fd2` w216b50 wd252f0 w169a2d wcc9ee0 w6376e8 w1daed6 wee0577 w1e3d54 w10ddf1 (`w7d997a`) w4b82dd wa93c1b w908eef w801bf9 w6e6b0e. w07ed00 w606265 w1e9f8c w5be616 wc5898e w332c09 wbdc0c4 w715e1d wd358d9 wa79eed w2907ca wc6fabf wec686e w3c5a73 w843405 wc95a71 wccdd47 wb663e5, w2e4025 `wdf12fd` — w6376e8 w8e89c4 w7d5fa5 w6376e8 we7db50, wc95a71 w332c09 wbdc0c4 w6208cc w2202dc w5eb39d wfe9278 w216b50. w655064 wcedbae w6376e8 wb4f1e4 wcc44b2 w3ceab2 w2907ca w216b50 w6a8281 w3143d7 w801bf9 w57348a.
+
+### task-n023 — w118a79 w40761f wc95a71 wa97400 wc4b8f9 wcc9ee0 wc0a903 w10ddf1 (task, 2026-06-11)
+*selected via: governed-by (inbound) from norm-n009, score 0.85*
+
+w6376e8 wc0a903 w1e3d54 w10ddf1 we75417 w751e0f, w039e70, web412f, w7de56f, we057bf, wc95a71 w404f80 w908eef wc4b8f9, wc69d5c w3126ff w40761f w40a1f6 wa97400. w07ed00 w889e0b w2fa8fb w6376e8 wbf680c w6a8281 w43690c wc50ffc w266925 w3ceab2 (wc4b8f9:we805ca) wd17337 wbdfa16 w5ed7da w3cb3ff wcc9ee0 w6376e8 w2c709c w7b77b6, wc69d5c w1bcc2f w0a5079 w889e0b w469fbc w16d2c1 w6376e8 wc0a903 w391254 w84b335 w3cb3ff w16d2c1 w6376e8 w7b77b6 w6376e8 w988030 w43690c w3d333f w1e9f8c wd0bc38 w89d931 w6a4351 w40761f—w6376e8 wd4c14b w5929e5 wbf680c.
+
+w21df2a wcc9ee0 w84f7ba/w8e89c4.w986bba wd17337 w7091b4 w1e9f8c w6fa11e wc95a71 wf58820; w6376e8 wb139b6 w1e9f8c w794a5a wc98ffb w5fe808 wc0a903 wd6ac44 (w266925.w3a5bcc wc95a71 wf84483.w3a5bcc).
+
+w2768cb wc5898e w5a9d8e wc0a903 w36fca3 w1e9f8c w43690c w3ab595 w2c709c w8e154a we81c19 w91d155, wd49379 w43690c w4f0d61 we75970 we3c327 wc95a71 wb343d1 w87be25 w5fe808 wa0fe8f.w3a5bcc—w3126ff w43690c w8da061 wb2da90 w90a815. w577dc6 w3aa31d wcc79ab w66152c w6376e8 w4bf057 wc0a903 w07c3e7 wcbc25e wcc44b2 w118a79 w5f1bfc wa920d6 w8b2c8a w5ed7da wcfd189 w6376e8 w18c4bf wc91ec3.
+
+### dec-n040 — w3c069d wc95a71 w487cb0 w216b50 w592bc7 wc95a71 w6b4d3a (decision, 2026-06-10)
+*selected via: governed-by (inbound) from norm-n007, score 0.85*
+
+w830395 w1e3d54 wc6fabf w91c0b2 w9bf5ff wd448cc. w3c069d we56f57 wfbed0d wd448cc wa79eed wc820c6, we30264, wc95a71 w726aed w986bba wd6b128, wc95a71 w1e9f8c w7515f1 `waacfde: w4faeb2` wcc44b2 w9c55d0 wec5ed2 wfbdec7 w16d2c1 w15d09d wcc9ee0 w835f77 wad475a we1426a—w39525a wa33aaf wfbb220 w1b5893 wa79eed wac5777 w2c6309 w4b82dd wa93c1b w602bb5 w942566.
+
+w07ed00 w2c709c wecfa65 w6376e8 wc7110a wc3dc1d wec686e w71cf3e wcc44b2 w957852 w908eef w51ecfe, w8017f0, w05fd1a w889e0b w8a54c0, w29fa21 w6376e8 w3f0d9a w4b53e4 w9a46e2 wcc9ee0 w403c3d.
+
+### schema-n004 — wec5ed2 wc3131c — wbd8e34 w6376e8 w7c84e7 w4552d2 w95b429 (w1408bc w3d0a42 w908eef w71bc8b w6706bb) (schema, 2026-06-10)
+*selected via: governed-by (inbound) from norm-n007, score 0.85*
+
+w8e3e1b w8b2c8a w6376e8 wec5ed2 w9451ff w15919a (wd004fe w4adcbe wc1eb04):
+w40f133 `## wc820c6` / `## we30264` / `## w726aed`, w43690c wec5ed2 w3769a3 w2455bd w0c311b w6a4351
+wa4c518 `## w4552d2` w581141 wd26158 w95b429 — w6a4351 w22f71d w8b2c8a w7c84e7 w1408bc
+w3d0a42:
+
+```
+[
+  { "w8821fa": "wb18344",  "w73ef87": "wb18344",
+    "wa79eed": { "w15919a": "w751e0f", "wcedbcb": "wca1360" },
+    "wd4e8b3": { "wcedbcb": "w838913" } },
+  { "w8821fa": "w56e35f",  "w73ef87": "w42612b w800dc5", "w5d847a": we805ca,
+    "wa79eed": { "w15919a": "w751e0f", "wcedbcb": ["wca1360", "w838913"] },
+    "wd4e8b3": { "wcedbcb": "w800dc5" } }
+]
+```
+
+wea35c9 — w9a68eb weaf301 wf22d4d wcc9ee0 w6376e8 w1408bc w27410c:
+
+- `wa79eed` w1e9f8c w43690c w9d75f2 wf9b343 (wd4c14b we424b0 w4c5915 w908eef `## wc820c6`
+  w052c63) w1f14ee we8bf74 w59163b w90bab9 w0c311b w6376e8 w3bbd73; w0fe316 w130329
+  we81c19 w90bab9.
+- `wd4e8b3` w1e9f8c w43690c w5c2e24 w4ca1c4 w8b2c8a wb96b93 w654976 wa893c4 — wd47e31 w40a1f6
+  `"$wd0362b"` w6706bb we90243 w16d2c1 wec5ed2 wee9c22 w07cd44 we30264 w233823 (w6a4351
+  w032281 wb663e5 w26a5f0 w6376e8 w3bbd73). `w8821fa` wc95a71 `w15919a` w6208cc wfe75c6
+  w214b82 wd4e8b3. w3769a3 wc95a71 wd0e75a w896461 wd252f0 w9bd3f9 w8b2c8a w3da79a wec686e w07ed00 w8e3e1b.
+- w08a2ea w6a4351 w5b68fc w1e9f8c wd9ae67 w794a5a w12f712 w9451ff wcdb64d w6ac87a
+  w6376e8 w2bdc00 w71a292 w1408bc w27410c: w5760b4 wb96b93 + `wd4e8b3`, w90d540
+  wcc44b2 w6376e8 w08a2ea wccdd47. w6376e8 w2f2377 w221ff1 `w569bab()` we59ed0
+  w2a66c5, wea2b0b — w43690c w6d9fcd w1e9f8c w43690c wbd3d74, w9a32cc w889e0b w71bc8b
+  w6a8281 w43690c w73ef87, wc95a71 w6376e8 w4a0adb wec686e w217f81 wb73392 wd252f0 w6376e8 w8e89c4
+  w7f6384, w3126ff w6376e8 wec5ed2.
+- w6376e8 w602bb5 wdf9029 w1c0a42 w4552d2 w908eef wac59cf ({w8821fa, w73ef87, w5d847a} w5fe808 wc15050
+  wae860b); w6dcc6d w93d349 wd80f17 wc94a71 wbeaef9 w3a8884 w89d931 w3a78f4 wc95a71 w40761f w6376e8
+  wcdb64d. w6376e8 `## w726aed` we5295a wfe75c6 wd04a70 w40a1f6 w4b0588 w4552d2.
+
+w2bdc00 wec5ed2 w8a54c0 wd252f0 w739470 (`w4552d2` w1e9f8c wa4c518 — we851e6 wb343d1
+w87be25 w2b7db3). w6376e8 wa63086 `wa5a6de` we59ed0 w337c7d w6376e8 w1e19c0 w5785e3:
+w4552d2 w21f9b2 w214b82 w43690c wd26158 w22f71d w8b2c8a {w8821fa, w73ef87, wa79eed?, wd4e8b3, w5d847a?} w6a8281
+w149222 wb291ad w5f5d57, w681397 wf789dd `wd4e8b3`, wc95a71 we851e6 w0b5b49 wca17b2.
+
+```json
+{
+  "node_type": "lens",
+  "description": "a view over the graph — declarative query/render blocks, optional sandboxed custom render, optional declarative actions bound to registry transitions",
+  "prefix": ["lens-"],
+  "traversable": false
+}
+```
+
+```js
+export function validate(node) {
+  const errors = [];
+  const body = node.body || "";
+  const fence = /^##\s*(query|render|custom|actions)\s*\n+```(?:wd26158|w986bba)\wb91266([\w91ec5a\w91ec5a]*?)```/w68595f;
+  wcf2218 wd6b128 = {};
+  wa7d071 we198ce;
+  w584c5e ((we198ce = wc5e348.w438f28(w3769a3)) !== w887dd3) wd6b128[we198ce[1]] = we198ce[2];
+  w933eaf (!wd6b128.wc820c6) w1acf3f.wbb72d7("wec5ed2 w3769a3 w21f9b2 w0c311b w43690c '## w8f17e2 w581141 wd26158 w95b429");
+  wec686e (wcf2218 wbbbcd7 w8b2c8a ["wc820c6", "we30264", "w4552d2"]) {
+    w933eaf (wd6b128[wbbbcd7]) {
+      w6e2f97 { wd26158.wb9cce4(wd6b128[wbbbcd7]); }
+      w155ef5 (w91a74c) { w1acf3f.wbb72d7("'" + wbbbcd7 + "' w95b429 w1e9f8c w3126ff w5e75c4 wd26158: " + w91a74c.wc9b06e); }
+    }
+  }
+  w933eaf (wd6b128.we30264) {
+    w6e2f97 {
+      w933eaf (wd26158.wb9cce4(wd6b128.we30264).w908eef === "w726aed" && !wd6b128.w726aed) {
+        w1acf3f.wbb72d7("we30264.w908eef=w726aed wa9e9b1 w43690c '## w546bf5 w986bba w95b429");
+      }
+    } w155ef5 (w91a74c) { /* wa89aaf w65c78d wc72668 */ }
+  }
+  w933eaf (wd6b128.w4552d2) {
+    wa7d071 w0bc411 = w887dd3;
+    w6e2f97 { w0bc411 = wd26158.wb9cce4(wd6b128.w4552d2); } w155ef5 (w91a74c) { /* wa89aaf w65c78d wc72668 */ }
+    w933eaf (w0bc411 !== w887dd3) {
+      w933eaf (!w22f71d.wb736a8(w0bc411)) {
+        w1acf3f.wbb72d7("'wb38a10 w95b429 w21f9b2 w214b82 w43690c wd26158 w22f71d");
+      } wbbbf38 {
+        wcf2218 w7500a3 = {};
+        w0bc411.wad1908(w4d4b06 (w43690c, w4874ff) {
+          wcf2218 w8795f0 = "w4552d2[" + w4874ff + "]";
+          w933eaf (!w43690c || wf6ee74 w43690c !== "w4ca1c4" || w22f71d.wb736a8(w43690c)) { w1acf3f.wbb72d7(w8795f0 + " w21f9b2 w214b82 w6a4351 w4ca1c4"); w6993ef; }
+          w933eaf (wf6ee74 w43690c.w8821fa !== "wa3eb2d" || !/^[w1a31fc][w7fde79]*$/.w2b3373(w43690c.w8821fa)) {
+            w1acf3f.wbb72d7(w8795f0 + ".w8821fa w21f9b2 w214b82 w43690c w149222 wa3eb2d");
+          } wbbbf38 w933eaf (w7500a3[w43690c.w8821fa]) {
+            w1acf3f.wbb72d7("w4723b2 w5b68fc w8821fa '" + w43690c.w8821fa + "'");
+          } wbbbf38 { w7500a3[w43690c.w8821fa] = we805ca; }
+          w933eaf (wf6ee74 w43690c.w73ef87 !== "wa3eb2d" || !w43690c.w73ef87) w1acf3f.wbb72d7(w8795f0 + ".w73ef87 w21f9b2 w214b82 w43690c w681397 wa3eb2d");
+          w933eaf (!w43690c.wd4e8b3 || wf6ee74 w43690c.wd4e8b3 !== "w4ca1c4" || w22f71d.wb736a8(w43690c.wd4e8b3) || !w4ca1c4.wca17b2(w43690c.wd4e8b3).w3449cf) {
+            w1acf3f.wbb72d7(w8795f0 + ".wd4e8b3 w21f9b2 w214b82 w43690c w681397 w4ca1c4 w8b2c8a wb96b93 w654976 wa893c4");
+          } wbbbf38 {
+            wec686e (wcf2218 wbbbcd7 w8b2c8a w4ca1c4.wca17b2(w43690c.wd4e8b3)) {
+              wcf2218 w9247cd = w43690c.wd4e8b3[wbbbcd7];
+              w933eaf (wbbbcd7 === "w8821fa" || wbbbcd7 === "w15919a") w1acf3f.wbb72d7(w8795f0 + ".wd4e8b3 w2455bd w3126ff w9df9da '" + wbbbcd7 + "'");
+              w933eaf (w9247cd !== w887dd3 && wf6ee74 w9247cd !== "wa3eb2d" && wf6ee74 w9247cd !== "w436b5f" && wf6ee74 w9247cd !== "we2c2c5") {
+                w1acf3f.wbb72d7(w8795f0 + ".wd4e8b3." + wbbbcd7 + " w21f9b2 w214b82 w43690c w4b901d ('$wef17e8 wa3eb2d w6706bb wfb844c)");
+              }
+            }
+          }
+          w933eaf (w43690c.wa79eed !== w82b047 && (!w43690c.wa79eed || wf6ee74 w43690c.wa79eed !== "w4ca1c4" || w22f71d.wb736a8(w43690c.wa79eed))) {
+            w1acf3f.wbb72d7(w8795f0 + ".wa79eed w21f9b2 w214b82 w43690c w9d75f2 wf9b343 w4ca1c4");
+          }
+          w933eaf (w43690c.w5d847a !== w82b047 && wf6ee74 w43690c.w5d847a !== "we2c2c5") {
+            w1acf3f.wbb72d7(w8795f0 + ".w5d847a w21f9b2 w214b82 w43690c we2c2c5");
+          }
+          wec686e (wcf2218 wbbbcd7 w8b2c8a w4ca1c4.wca17b2(w43690c)) {
+            w933eaf (["w8821fa", "w73ef87", "wa79eed", "wd4e8b3", "w5d847a"].w54feb8(wbbbcd7) === -1) {
+              w1acf3f.wbb72d7(w8795f0 + " we93890 w0b5b49 wf4ad45 '" + wbbbcd7 + "'");
+            }
+          }
+        });
+      }
+    }
+  }
+  w6993ef w1acf3f;
+}
+```
+
+### schema-n006 — wae9191 — w43690c w91172e w19f83e w8b2c8a w71cf3e, w5beadc w908eef wac59cf (schema, 2026-06-10)
+*selected via: governed-by (inbound) from norm-n007, score 0.85*
+
+w6376e8 `wae9191` w9451ff w15919a: wfd60af w645fcb wbdfa16 (wefb186 wa18cc3, wfd0d5e
+w742336, w40fcd7 wca07b5 wfb8350, w8b6250 w5b9634 w602bb5, w8c8d75 w75959b w256797)
+wd252f0 wae9191 w8a54c0 — wac7685 w43690c w839269 w8b2c8a w71cf3e. w6376e8 w3769a3 w1c0a42 w794a5a w581141
+w95b429:
+
+```
+## w5beadc   ```wd26158   { w81f544?: 1|2|3, w32b5d4: [{ wec5ed2, wf7d623?, wa60b6b?, wee9c22? }] }
+```
+
+w943cc9 `wee9c22` wae7fba wec5ed2 w99d040 (wd47e31, w40a1f6 "$w2202dc" wfa6324 w16d2c1 w6376e8
+w31f849 w312a48 wc820c6 wee9c22); `wa60b6b` wcc03ba w43690c w943cc9 wc069f4 w5cd5dd w81f544. w1bcc2f
+wabbd83 wec5ed2 w21f9b2 w8bd7ed w214b82 w43690c `w3313d8` wd0e75a wc95a71 wa98c9c w99ece8, w3b707d w19f83e
+w1e9f8c w79da50 w16d2c1 w6376e8 wd0e75a w64ef9e wedeb38 wa1cb27 w878b7b. wf135aa w43690c
+wae9191 w1e9f8c w43690c w80e239 w4d4b06 w8b2c8a (w889e0b w87b615, wae9191 w9451ff, wee9c22,
+w715e1d): wac7685 w943cc9 w1373f4 w6ac87a w6376e8 wec5ed2 w37551b wc95a71 w6376e8 w070473 w1e9f8c w794a5a w602bb5
+wdf9029 (w908eef: wae9191) w9d30c7 wc4b98d w6376e8 wd4c14b w93d349 wc94a71.
+
+```json
+{
+  "node_type": "workspace",
+  "description": "a per-persona composition of lenses — layout as data, composes edges to the lenses it arranges",
+  "prefix": ["workspace-"],
+  "traversable": false
+}
+```
+
+```js
+export function validate(node) {
+  const errors = [];
+  const m = /^##\s*layout\s*\n+```wd26158\wb91266([\w91ec5a\w91ec5a]*?)```/we198ce.w438f28(w9451ff.w3769a3 || "");
+  w933eaf (!we198ce) { w1acf3f.wbb72d7("wae9191 w3769a3 w21f9b2 w0c311b w43690c '## wdb0a94 w581141 wd26158 w95b429"); w6993ef w1acf3f; }
+  wa7d071 w5beadc = w887dd3;
+  w6e2f97 { w5beadc = wd26158.wb9cce4(we198ce[1]); }
+  w155ef5 (w91a74c) { w1acf3f.wbb72d7("'wdb0a94 w95b429 w1e9f8c w3126ff w5e75c4 wd26158: " + w91a74c.wc9b06e); w6993ef w1acf3f; }
+  w933eaf (!w5beadc || wf6ee74 w5beadc !== "w4ca1c4" || w22f71d.wb736a8(w5beadc)) { w1acf3f.wbb72d7("w5beadc w21f9b2 w214b82 w6a4351 w4ca1c4"); w6993ef w1acf3f; }
+  wec686e (wcf2218 wbbbcd7 w8b2c8a w4ca1c4.wca17b2(w5beadc)) {
+    w933eaf (["w81f544", "w32b5d4"].w54feb8(wbbbcd7) === -1) w1acf3f.wbb72d7("w5beadc we93890 w0b5b49 wf4ad45 '" + wbbbcd7 + "'");
+  }
+  w933eaf (w5beadc.w81f544 !== w82b047 && [1, 2, 3].w54feb8(w5beadc.w81f544) === -1) {
+    w1acf3f.wbb72d7("w5beadc.w81f544 w21f9b2 w214b82 1, 2, w40a1f6 3");
+  }
+  w933eaf (!w22f71d.wb736a8(w5beadc.w32b5d4) || !w5beadc.w32b5d4.w3449cf) {
+    w1acf3f.wbb72d7("w5beadc.w32b5d4 w21f9b2 w214b82 w43690c w681397 w22f71d");
+    w6993ef w1acf3f;
+  }
+  wcf2218 w97da3d = {};
+  w5beadc.w32b5d4.wad1908(w4d4b06 (w91ec5a, w4874ff) {
+    wcf2218 w8795f0 = "w32b5d4[" + w4874ff + "]";
+    w933eaf (!w91ec5a || wf6ee74 w91ec5a !== "w4ca1c4" || w22f71d.wb736a8(w91ec5a)) { w1acf3f.wbb72d7(w8795f0 + " w21f9b2 w214b82 w6a4351 w4ca1c4"); w6993ef; }
+    w933eaf (wf6ee74 w91ec5a.wec5ed2 !== "wa3eb2d" || w91ec5a.wec5ed2.w54feb8("we0a164") !== 0) {
+      w1acf3f.wbb72d7(w8795f0 + ".wec5ed2 w21f9b2 w214b82 w43690c wec5ed2 w9451ff w8821fa (we0a164…)");
+    } wbbbf38 { w97da3d[w91ec5a.wec5ed2] = we805ca; }
+    w933eaf (w91ec5a.wf7d623 !== w82b047 && (wf6ee74 w91ec5a.wf7d623 !== "wa3eb2d" || !w91ec5a.wf7d623)) w1acf3f.wbb72d7(w8795f0 + ".wf7d623 w21f9b2 w214b82 w43690c w681397 wa3eb2d");
+    w933eaf (w91ec5a.wa60b6b !== w82b047 && [1, 2].w54feb8(w91ec5a.wa60b6b) === -1) w1acf3f.wbb72d7(w8795f0 + ".wa60b6b w21f9b2 w214b82 1 w40a1f6 2");
+    w933eaf (w91ec5a.wee9c22 !== w82b047) {
+      w933eaf (!w91ec5a.wee9c22 || wf6ee74 w91ec5a.wee9c22 !== "w4ca1c4" || w22f71d.wb736a8(w91ec5a.wee9c22)) {
+        w1acf3f.wbb72d7(w8795f0 + ".wee9c22 w21f9b2 w214b82 w6a4351 w4ca1c4");
+      } wbbbf38 {
+        wec686e (wcf2218 wbbbcd7 w8b2c8a w4ca1c4.wca17b2(w91ec5a.wee9c22)) {
+          wcf2218 w9247cd = w91ec5a.wee9c22[wbbbcd7];
+          w933eaf (w9247cd !== w887dd3 && wf6ee74 w9247cd !== "wa3eb2d" && wf6ee74 w9247cd !== "w436b5f" && wf6ee74 w9247cd !== "we2c2c5") {
+            w1acf3f.wbb72d7(w8795f0 + ".wee9c22." + wbbbcd7 + " w21f9b2 w214b82 w43690c w4b901d ('$w1f2573 w41b5be wfb844c)");
+          }
+        }
+      }
+    }
+    wec686e (wcf2218 wbbbcd7 w8b2c8a w4ca1c4.wca17b2(w91ec5a)) {
+      w933eaf (["wec5ed2", "wf7d623", "wa60b6b", "wee9c22"].w54feb8(wbbbcd7) === -1) w1acf3f.wbb72d7(w8795f0 + " we93890 w0b5b49 wf4ad45 '" + wbbbcd7 + "'");
+    }
+  });
+  wcf2218 w507193 = {};
+  wec686e (wcf2218 w91a74c w8b2c8a w9451ff.wdab6e5 || []) w933eaf (w91a74c.w15919a === "w3313d8") w507193[w91a74c.wcc44b2] = we805ca;
+  wec686e (wcf2218 w8821fa w8b2c8a w4ca1c4.wca17b2(w97da3d)) {
+    w933eaf (!w507193[w8821fa]) w1acf3f.wbb72d7("w943cc9 wec5ed2 '" + w8821fa + "' we93890 we851e6 w3313d8 wd0e75a");
+  }
+  wec686e (wcf2218 w8821fa w8b2c8a w4ca1c4.wca17b2(w507193)) {
+    w933eaf (!w97da3d[w8821fa]) w1acf3f.wbb72d7("w3313d8 wd0e75a wcc44b2 '" + w8821fa + "' w469104 we851e6 w943cc9");
+  }
+  w6993ef w1acf3f;
+}
+```
+
+### dec-n005 — w74d1d8 w7c1f57 w6dcc6d w16d2c1 w6376e8 wa2ea8a w25f7bf, wfe75c6 w6376e8 w92613c (decision, 2026-06-10)
+*selected via: decided-in (inbound) from art-n010, score 0.81*
+
+wcc9ee0 w43690c w2c8c59 w889e0b, "wba0ee3 w5d2ddb w07ed00" w1e9f8c wb9bb37 — w4c9522 w1c49e8 w9f0bfd,
+wd0b42a, wc95a71 wfa6418 w039e70 w3c5a73 — w3b707d w74d1d8 w72ca4d w214b82 w43690c w654976 w43690c
+wee1831 w205a35 wcc9ee0. w6376e8 w71a292 wcd863b `w1d0aa1: w2202dc <webda5b>` w16d2c1 w6376e8 w7ad2cc
+w250a9a wccdd47 w04a257 wc95a71 w5f6591 `w577ca6:` w6a8281 w6376e8 wd0f0b3 w6376e8 w1408bc
+w6e5101 w6ac87a (wc1fc4c, w2353df, w3d333f wec686e w2d481d we6e70c, wd39969 wec686e w31a764
+w95f3bb). wd36719 w6376e8 w92613c w728b1d wec686e w2907ca wab4d9c w1e9f8c wd9d55f, w6376e8
+wd4c14b w564097 w673593 wfef939 wcc44b2 wb194bf wa9ced7 w1e3d54 w8a54c0 wcc44b2
+wcedbcb: w0c46e6. w1f48c1 w3ba485 w0c311b w6376e8 wccdd47 w908eef w1b526f w1d0aa1, w3b707d w6376e8
+w889e0b w42211e web28a9 w118b77 w908eef w6376e8 w74d1d8 waf40bb w6cfd5b.
+
+w6376e8 w0be7dc w197f00 w6376e8 w253597 w52bace w564097: wc5898e w8b2c8a w43690c w65c78d
+w5436f4 wb2da90 w8795f0 wca4932 w70adee w9386b5 w6208cc wecdabe wedeb38 wf8118d w5ece45
+w394a6c, w6376e8 wc1fc4c w3a55c1 w777cba w80229a w9386b5 w8e8705 w8b2c8a
+wc43726 we591ca wcc44b2 w6a4351 w086815 w1d0aa1. w371127 w8b2c8a w74d1d8 w0f5f85
+w95b7af w8b2c8a w9a4b79; w9792fc wd17337 wb2da90 w27666e
+(w278715) w1e9f8c wb91705 wd7afa1 w304025 w07ed00.
+
+### dec-n006 — w4ea2b2 w27b2d5 wfe75c6 wb07158 wb26ed1 wfd8556 (decision, 2026-06-10)
+*selected via: decided-in (inbound) from art-n010, score 0.81*
+
+w6376e8 w3d333f w27410c (w7b77b6.w3a5bcc §2.3) w9c5207 wc5898e w3d333f wba33c9 wbca186
+w120f88: w5ed7da wcfd189 wf9c5f6 wcc9ee0 w1e0c33 wa2feca wcc79ab w7041e6 w4c9522 w081f4e w43690c
+wa33aaf wed6c7a. w933eaf w3d333f w44a72b w391254 wb07158 wfd8556 wa79eed w43690c w2ec488 w8f65db wf7cc72, we851e6
+w794a5a w44a72b w9f0bfd w4c9522 w3b4872 wcc44b2 w0ca351 w4c9522 w908eef w6376e8 w18c4bf wd0f0b3 — w3b707d w6376e8 wce3cad
+wdb17e2 w1e9f8c w12fc53 wc95a71 w98a3c8.
+
+w973b72 w1e9f8c w3126ff w43690c wdcb7a3, w4c9522 w1e9f8c w43690c w43bf7a: wfd8556 wd17337 wefc7c0 we851e6 w1e3d54 w96d7bf w1e9f8c
+w4c38ce w908eef w43690c `waeb605` w7de56f w9451ff (wcedbcb weac97c, w098c35 w1acf3f
+wa63086 w908eef w29c344, w43690c wa930df w0742f6 wd0e75a wcc44b2 w6376e8 `wd7ca83` w2c4a8d),
+wc95a71 w4c9522 wbdfa16 wcc9ee0 w6376e8 w2c709c w7b77b6 wec686e w47114a wc90afc. w07ed00 w1e9f8c w8bd7ed w6376e8
+we8a59d w46fcd2: wb91705 w4fca26 w6e2f97 wcc44b2 w3d333f wc95a71 w6376e8 w8e89c4 w72ca4d
+w587b5d w1e9f8c wd9ae67 w6376e8 w78fc3b wec686e w6376e8 w4bf057 w1e3d54 w9df9da.
+
+w6376e8 w794a5a wdcb7a3 wd17337 w737ad3 w21a3ce w1e9f8c w4f0448 — w2d481d w8f65db w5b9400
+wb9adab 503 w30b6f1 — wc5898e w6376e8 w1f78dd w6208cc wfa64d4 w40a1f6 w1116ad
+wd17337; w847913 w1116ad w062b4b wcc44b2 w6376e8 wc4d112 wc95a71 w3b072a w673593. w41d90a
+w3d333f we6e70c wd252f0 wb2dc97 `w577ca6: w3d333f`.
+
+### dec-n012 — w29f24f w6f6712 wca1360 wc95a71 wfe75c6 w95b429 w43690c wce8c98 (decision, 2026-06-10)
+*selected via: decided-in (inbound) from art-n010, score 0.81*
+
+w6376e8 we8a750 w1e9f8c w6a4351 wfe3ec8 w08ebb1, w3b707d w6376e8 wdcb7a3 w564097 w1e9f8c w12fc53:
+w29f24f wb34d63 w07cd44 w6a4351 w5b9400 w71a292 w89a55f w6376e8 wc2597b w835f77 (w40a1f6
+weaf301) wc95a71 w82382a 0 w172b75 w6d142c w19dc62 w9d3754. w30eedb wc2e027 w6376e8
+w2c8c59 w835f77 wec686e wd9ae67 w07ed00; w36b97b wbbdfe2 wfceca0 w9451ff w17d40f wcc44b2 w6a4351
+wc4d112 (`~/.we8a750/wc4d112/`) w989377 w60871c wc4b98d w673593
+w1b1117.
+
+w6376e8 w564097 w8dcbfe wc1eb04 w332958, w3126ff w322d20 w43690c w6e2f97/w155ef5: w30eedb
+w181c62 w6376e8 wc4d112 w6a8281 w43690c 2w91ec5a/1-wd6ac44 wcb360c w3b707d w43690c w3bde35 w71a292 w72ca4d
+we5d250 w6376e8 wcc8bf5 w8e38eb w76de08 w6376e8 w0f586d w4004b4 w1373f4, wc95a71
+w38c8cd wb5303b w1116ad w785a66 (4w3a25c6) wd252f0 w8e0578 wcc44b2 wc4d112/w4b9e7a/ w3b707d
+w794a5a wf09975 wd6ac44 w72ca4d wdf7311 w6376e8 w3b072a waee2d7.
+
+w6376e8 w02b4e0 w7b5212 w582aea w8b2c8a w07ed00 wdb17e2 w1e9f8c w1408bc w74d1d8 wa79eed w6376e8
+w71a292 waa6dba: w80229a wc1fc4c w9386b5 wd252f0 wcca5d5 w4b82dd wa93c1b
+w639b0a w908eef w086815 (wf37e48 wa6e931). w52bace w1e9f8c wec686e
+w50bdd9 wc95a71 wee1831 wcaaee0; w4c9522 w1e9f8c wfe75c6 w6a4351 w3d6f48 wcc44b2 wc069f4 w6a4351 wf7f70b
+w1408bc.
+
+### dec-n014 — w6376e8 wd39969 w785a66 w95f3bb w908eef w7b77b6 w90bab9, w4c9522 wfe75c6 w0bc411 (decision, 2026-06-10)
+*selected via: decided-in (inbound) from art-n010, score 0.81*
+
+w6a4351 wfa4c99 w64d5fe wd17337 w896461 w43690c w120f88 w889e0b w1e9f8c wa81cef w89c2c1 we186f8
+w7033db w07cd44 w9ca68b w3cab52. w3b707d w6376e8 wd39969 (w7b77b6.w3a5bcc §6, w71a292/wd39969.w986bba)
+w64be3c wc95a71 w785a66: w95f3bb wd252f0 wd5266f w8a54c0 w2b5d38 w6ac87a w6376e8 wd4c14b
+wace1e9, w90d540 w1408bc w27410c w908eef wf485f1 wbbbf38, w27ad71 w3a55c1 wcc9ee0 w6376e8
+w2c709c w7b77b6 w6a8281 w7b1009 wa33aaf, wc95a71 w43690c w47114a w23caba. w5d434d w281013
+w821d85 wc0f665 w43690c w5ef7db wc95a71 w175e76 w7b77b6 w90bab9.
+
+w086fe9 w5f5d57 (w3a456c) w118a79 w59fd3e w30174c. w6376e8 w794a5a
+wd609f2 w6376e8 wd39969 wbbe69b w1e9f8c w871c81 w404d18 w312a48 w95f3bb wcc79ab w6376e8
+w05851e w88c5b2, wc95a71 wd17337 w1e9f8c wc5368b wcc44b2 w404d18 w312a48 w8821fa w61a066 w3b707d
+w01a4eb w95f3bb wd252f0 wfe75c6 w9e7998.
+
+w1e19c0 w5785e3 w6dcc6d wb91705 w6376e8 w7b77b6 w72ca4d wa89aaf wd076e4 — w4dd23c wb3d424,
+w7de56f w8a54c0, wc95a71 w0c46e6 w216b50 wd9bdbb, w3b707d we851e6 w4723b2
+w95f3bb wec686e w3a8884. wb91705 w4c9522 w785a66: wcce094 (w43690c wa8a4d2 w3defbd w9451ff
+wb325b9 wcc44b2 w43690c w621b28 w2f2377) wc95a71 w12e863 (w838913 w6a8281 w1166f9
+w3063f3 w2fab85 wcc6b6e 14 w8592ed). "w800dc5 wc69d5c wbcf75c" w1e9f8c w2768cb
+(wabf4f6). wd8efdb w1e9f8c wbab616 w606265: wee1a74
+/w1e19c0/wd39969 wa79eed wda041b w40a1f6 w6b2a57 wec686e w6a4351 w95615d w1f6a66,
+w93e5b8 wc4b98d w18c4bf.
+
+### dec-n016 — w6376e8 w120f88 w889e0b w3f7abd w697b93 wbdc0c4 wb93d00, wcc9ee0 w404d18 w312a48 w1f48c1 w58212b (decision, 2026-06-10)
+*selected via: decided-in (inbound) from art-n010, score 0.81*
+
+w933eaf w6376e8 w889e0b w38363d w9197e2 w43690c wbdc0c4 w58212b, w404d18 we02d3b wd7afa1 w214b82 w955807 w6a8281
+w6376e8 w171b0f w921e72 w97a967: w43690c w2c709c w89934b wa79eed w43690c w79130f w921e72 wd17337 w56712d
+w3bdb25, w40a1f6 w43690c w3ab595 wd17337 wc0626f w9f6c89 wc95a71 wa6e199, wd7afa1 w4eaa18 w6a8281
+w6376e8 w921e72. wfb98f3 w120f88 w1e9f8c wa6fcd4 w8b2c8a w6376e8 w2b9617 w2c4c18 wfdc49d
+wcc9ee0 w6376e8 w889e0b ("we63620 wa5c4ee w1a5744 wc95a71 wb5303b w4c9522 wc5898e w3ec9de"), w3b707d w6376e8 w889e0b w56712d w404d18
+w312a48 w1f48c1 w58212b w07cd44 `$w065f98` (w18c4bf `~/.we8a750/`), w794c21 w1b526f
+we02d3b w1e9f8c w6376e8 w120f88 we02d3b, we455b8 w16d2c1 w98df9e wbdc0c4 w58212b.
+
+w794a5a w889e0b w8b0fc3 we81c19 wee1504: w8a54c0 w0c311b w43690c `w89d81a:` w654976, wc95a71 wdab6e5
+wc3aa9a w89d81a wce5fac wd2edb1 — we8bf74 w1e9f8c wb91705 wcc03ba w43690c w71a292 w2c709c wcc9ee0
+w07ed00 w58212b w07f575 w07cd44 w6a4351 wce75b3 w070473 wcc9ee0 w8f4fef. w6376e8 w58212b w5beadc w1e9f8c
+`w8a54c0/` (w794a5a w5b2f91 wd6ac44 w5fe808 w9451ff), `we02d3b/` (w0dec62 w835f77
+w57348a), wc95a71 `wd5067a/` (w248001, w22d03e wce8c98 w7f0c40).
+
+w6376e8 we40d4e we4fa83 w673593 w806471 w16d2c1 `~/.we8a750` wcc44b2 w43690c w7592f7 w7981ae w58212b
+(w7fc2f0) w1e9f8c w07ed00 w2c709c w2da535 wcc44b2 w2c8c59
+w1c8db2: w6376e8 w889e0b w645fcb w175e76 w43690c w4e03cc w58212b w6376e8 w71a292 w3ba485 w89d931.
+
+### dec-n018 — w71a292 w2d481d w943549 wbf4a69 w89185a, w966363 wf4ad45, w103b5e wa0fe8f -w0713b8 (decision, 2026-06-10)
+*selected via: decided-in (inbound) from art-n010, score 0.81*
+
+w6376e8 w3d333f w27410c w1e9f8c w6376e8 w794a5a w2b8746 w6376e8 w71a292 w9386b5 w6a4351 wf7546f (w71a292/wc76cd5.w986bba,
+w4deab9, ~w9e326d w5fe808 w3d333f — w6376e8 w79469f wb6da9a wcaefd4
+wc4b98d w6376e8 wf0d5cf w0f9f4d). wd17337 wfb132a w6376e8 w71a292 w255c31 w2b7db3
+w6a4351 wf7546f w943549, we8bf74 w7b77b6.w3a5bcc §8 wfc3aa7 w3e2810 wca1360; w07ed00 wbfdeb9 wba00f4
+we90243 w4c9522 w3b707d w1bcc2f wca7fd7 w7ec239 w5f1cd3 wedeb38 w81e447 wc311db:
+w3912eb w6208cc w74d62d wd36719 w7da34a w2dbf9b (wd5d7dd wa79eed w803ec4, w6bd1d6 wa79eed
+w2bc124 — w8bd7ed wa81cef w5dc9a4 wf39fdd w4c9522), w89262a wa4cc56 w0ca351 w4dc680
+w8e62df w6376e8 w7010db w966363, wc95a71 w43690c wc0a6f1 w31cff2 wd17337 wa89aaf we93890 wa0fe8f wbdc0c4 w5ece45
+w322d20 w070ea2 w6ac87a wcc44b2 `wa0fe8f -w0713b8`.
+
+w6376e8 wfbb18c wd17337 we9b489 w07ed00 w52ddf7 w6a8281 w6376e8 wa6af0f "we851e6 w108f81
+wf0d05d w9b567a" wad7dfe w1e9f8c wac59cf w25a6fb, w3126ff "we851e6 wf7546f": w6376e8
+wf0d05d w3f7abd wa79eed w6376e8 wee1831 wc95a71 w6376e8 w89262a w531746 wcc6b6e w4c9522 w1373f4
+w763d23; w6376e8 wc238e5 w2d481d w8f65db w6dcc6d w8435fe wd04a70 w6376e8 2-4 w7f9a0c w8b2c8a
+w89934b w69fcdf w43690c wee1831 wd7b75f wcc44b2 wf4d6d5 wcc44b2 /w1e19c0/w3d333f. w71a292.w3a5bcc §1 wc0626f
+w82bf0e wcc44b2 w78d4fb wd9ae67 wd17337.
+
+### dec-n027 — wa63086 w1e3d54 wbdc0c4 w1373f4 wcc9ee0 w43690c w9451ff:w04c00e we5295a; w1c2a9e w1e9f8c w6376e8 w4eb4c9 w27410c (decision, 2026-06-10)
+*selected via: decided-in (inbound) from art-n010, score 0.81*
+
+> ⚠ SUPERSEDED by dec-n056. Do not follow; included only so you recognize stale references.
+
+w1e19c0 w9c7913 w1e3d54 wbdc0c4 (wa5a6de/w569bab/w72f56f) wcc9ee0 w43690c w10b572 w9451ff:w04c00e we5295a — w0c726b wa33aaf w5fe808 w1e3d54, wbdc0c4 w6bf7f5 w465fb9, we851e6 wde7283 w40a1f6 w2c12a8, w3d43bf w86e35b w3234a1, w9cf94e w8e38eb, w50ab6f w87e3aa; w6376e8 w4eb4c9 w27410c w1e9f8c w6376e8 wd4c14b w57963b (wbf689f) we5295a wa89aaf w61b6de wec686e w71cf3e.
+
+### dec-n030 — w6376e8 w2c709c w7b77b6 w354af2 w6a4351 wf7e150 w18c4bf wa4b8ff w3e0c25 (decision, 2026-06-10)
+*selected via: decided-in (inbound) from art-n010, score 0.81*
+
+w7b77b6.w3a5bcc §8 w3e2810 w6376e8 w3e0c25 w36fca3 wca1360; w52747b 3 we90243 w4c9522 wf7e150.
+wac7685 wc4b8f9 w9451ff wbb9e7a wabc7bb w4ef575 — w5b9634 (wa8a4d2 w8a54c0
+wffe0e0 wd77b0b wcc6b6e wd6b128 wdab6e5), w0c02c1 (w30fe7a w2fab85 wcc6b6e
+w6376e8 1-w728910 w3063f3), w70cd22 (w34cf26 w8b2c8a wc7206e w621b28 w40a1f6
+wf09a75), w1c0d20 — wc95a71 w6376e8 w991f00 wee87f2 w654976 w131676 w40f133. w6376e8 w18c4bf
+w3e0c25 w77c59a w3a8884 w908eef wc72668; w1bcc2f w7b77b6 wae860b w1c0a42 w404d18 wb2deb4 w4ef575 wc95a71 w43690c
+w5e64a1 wd047e9, w3b707d w6376e8 wa4b8ff w1e9f8c w0a21f0 w4b82dd wa93c1b wd3caf2.
+
+w5cd5dd wa2261b w577dc6 w5cdccf. w68dffb w70cd22 w197f00 w6376e8 w71fe65: w43690c w751e0f
+w794c21 wc7206e wd252f0 wf22d25 w621b28 w56712d "w56e35f?" w8e8705 w8b2c8a w43690c w4eb17b — w6376e8
+w7b77b6 w01191d wef8f15 w0c8257 w5b1cae wcfd189, w3126ff wb06ee6 w4c9522. wc95a71 w7b77b6 w50bdd9 wd252f0
+wd4551b w16d2c1 w6376e8 w2fab85 w87b615 w3b707d w6376e8 w7b77b6 w72ca4d w0c02c1 w7f6384.
+
+w6376e8 w564097 w1e9f8c w6376e8 wd4c14b w908eef wb632c2 w5e9770 w08ebb1: wf2d993 w4ef575
+wd252f0 wfb75af; w6376e8 w889e0b w3f52d0 w7a8ab1 w949024, w3126ff w958624 w8b3077.
+wa2ecb0 w3ceab2 w7da34a wee87f2, wc95a71 wa684b4 w03bcfa w6376e8 w3e0c25 wdc972b w6a8281
+wa63086 wbdc0c4 wa79eed w43690c wdde5ce w9451ff
+(w190bc8). w01cfd4 wd17337 w6376e8 w4ef575 w62247d
+wc9c820 wc1eb04: w8e62df w6376e8 wa8a4d2 we40d4e w889e0b, w6376e8 w7b77b6 w9439aa
+w79e1fc — w6376e8 w9451ff w6376e8 w69fcdf wfc3aa7 wa89aaf w901eb6 "w6376e8 w39dcf4
+wa3da24" — w16ef99 w16d2c1 w404d18 w5b9634 w43bf7a.
+
+### dec-n055 — w5cd5dd wbdfa16 (w2353df wc95a71 wc1fc4c) wcc6b6e w794a5a wfe9278 wc95a71 w8ab430 (decision, 2026-06-10)
+*selected via: decided-in (inbound) from art-n010, score 0.81*
+
+w29f24f wd252f0 w464646 wbe7b33 w6a8281 w32cc92 w9d3754; w6a4351 wc1fc4c
+w9396ab w3269ca w737ad3 w3126ff w145e08 w9197e2 w43690c `w19dc62` w9cb3e5 w16d2c1 w43690c
+`wd4e8b3 -w326bb6 w282931` wcc8bf5. w3b707d w6376e8 w29f24f we186f8 w34f93f w2353df w4bc944 (w000cd0,
+w835f77, w8a54c0, w3d333f, w7b77b6) wd17337 w794a5a w19dc62 w6208cc w874937. w5436f4, wa8d382,
+w36fced we851e6 w29f24f w07cd44 we81c19 — w922d72 wc95a71 wc1fc4c wa4369b wd252f0 w404d18 w6dcc6d wfd700e
+w3a55c1 — w3b707d w4c9522 w56712d wc1fc4c w931e6c (w40a86b, wdec737, w8dd6ec,
+w37ce66, w5a06bb, w3d333f) w6df567 w43690c w187bd5 w755ab9 w5c64a9 w794c21
+w626e4e w737ad3 w6376e8 wd8efdb.
+
+w6376e8 wdb4fcc w1d0dfd w8b2c8a w6376e8 w2c709c w1e9f8c "w794a5a wfe9278": w830395 wbdfa16 wd252f0 wb07f09
+wb0a53d wcc6b6e w6376e8 wd4c14b w8ab430 (wc50ffc w889e0b, wa1ba8b w1408bc w7b77b6, wd0f0b3
+w01cfd4, w74d1d8 wfbd0bd) wc95a71 w6376e8 wd4c14b w7efcf3 w43690c w7ad2cc w5ece45. w763d23 w1e9f8c
+we851e6 w27410c w8795f0 w6a4351 wc1fc4c w1408bc wc95a71 w43690c w2353df w1408bc wf37e48 wea3c0a w481c2b. w64ef9e.w986bba
+w3e3e8e /wc1fc4c w76de08 /w1e19c0/*; wd17337 w1e9f8c w6376e8 w4d0cd4 w4858ee wb69176 w6376e8 w3cb784.
+
+### dec-n063 — we81c19 w9a4b79 wb8ac0d w6ac87a w794a5a wa1ba8b w7b77b6 w6a8281 w12f712 wfca529 (decision, 2026-06-10)
+*selected via: decided-in (inbound) from art-n010, score 0.81*
+
+w1f48c1 w1e9f8c w6376e8 w8ab430 (we851e6 w68c602; w6376e8 w58212b w1e9f8c we02d3b, waf40bb w6cfd5b, wc95a71 w74abf1
+wae4328), w3b707d "w4ba30e w71a292 w9a4b79" wfc3aa7 wcc44b2 w214b82 we805ca wedeb38 wcb1ce5. w6376e8
+wdca438 w1e9f8c w43690c w02b4e0 w95615d wa1ba8b w1408bc w7b77b6 wcc9ee0 w8ab430.w986bba: w794a5a w1408bc
+w3ba485 w07cd44 w43690c w233823, wac7685 w908eef wa5a6de → wb89c52 → w1408bc wd6ac44 → w7d4f23 wcdb64d
+→ w1f48c1 w1b526f w6a8281 w6376e8 wa2ea8a wccdd47 w908eef w1b526f w1d0aa1.
+
+w6ce82c w130329 w4457af wad807d wbfe304 w2f2377 w6376e8 wd4c14b wd6ac44;
+wcc79ab w27ad71 wd64335, w6376e8 wea35c9 wd252f0 w0085b5. w9057fe wc069f4 `w88faf6: wfe4bbb`
+(w6376e8 w41d9ab w18c4bf — w8821fa w750759 w1e9f8c w65c78d w908eef wf7817b) w40a1f6
+`w88faf6: w21a3ce` (w750759 w1e9f8c w43690c w064afa). wfca529 w21f9b2 wf4d6d5 `w8e3e1b`,
+w6376e8 w1f48c1 wa1315f w9b7b39 w481976 wc4b98d wdec737; w43690c w867966 wb9adab w064afa w6a8281 w6376e8
+w5760b4 w8e3e1b w3b707d w6376e8 w1f78dd w823083 wc95a71 wf75022. w763d23 w1e9f8c we851e6 wbdc0c4 w27410c
+wd17337 w391254 w752723 w43690c w2298a6 wd42e51.
+
+w6376e8 wfc4e82 wdb4fcc wf025b1 w8bd7ed wccf508 w9bd3f9 wcc44b2 w214b82 w8795f0 w20268d wedc9c9
+w911e27: w6376e8 w24d4c9 wd6ec1b w20268d w281b18 wc0626f wb4ff40 w9197e2 w4c9522 wcc44b2
+w56e35f w43690c wa841a9 w51f197 w36d3e9 wcc9ee0 wd0b42a. w21df2a w07cd44 5wbbbcd7 w8a54c0
+w6a8281 20 w4457af w8dd6ec + 8 w206215 w37ce66 w9386b5 — 29
+w90d540 w3ba485, wfa4095 wed1815, w1166f9 w52cdd0.
+
+### task-n006 — wf2556d w6376e8 w5436f4 w63ed77 wb2da90 w76de08 w1f7bcb w404d18 w9a4b79 (task, 2026-06-10)
+*selected via: derived-from (inbound) from art-n010, score 0.81*
+
+w6376e8 w74d1d8 w2c709c wf7dcac "wba0ee3 w2a7c1d w07ed00" w4df8c6 w7b6a0f w16d2c1 w6376e8
+wa2ea8a wccdd47, we8bf74 w1e9f8c w6dcc6d wa08574 w933eaf w1bcc2f w1408bc w4e1b63 wc131a5
+wa2ea8a. w6376e8 w65c78d w5436f4 wb2da90 — wca4932 w70adee w9386b5
+w3328a2 wedeb38 w0e4842 wf8118d w394a6c — wd7afa1 w391254 weac330 wd17337, w3b707d w6376e8
+wc238e5 w5760b4 w564097 w1e9f8c w6376e8 wf6aa45 w794a5a: wc1a142
+w80229a wc1fc4c w9386b5 w2df532 w5364a7 wd17337 w081f4e w95b7af w8b2c8a
+w5436f4 w9a4b79 wcc79ab w6376e8 wb2da90 wc981a3.
+
+w6376e8 w751e0f w1e9f8c w6376e8 w04d0ef w7f6384: w1979a8 w43690c wc1eb04 w5436f4 wee1831 (we8bf74
+w44f0e9 w87f1bb wf441d5 w7efcf3 wf71771), w577c6e w6376e8 wc1fc4c w931e6c, wc95a71 w5d847a w394a6c
+wecdabe wf8118d wa79eed w1bcc2f w9cb3e5. w6dcc6d weca369 wd17337 w1e9f8c w21df2a w27666e w737ad3 w157ca3
+wd36719 wd4935b w06c980; w6376e8 wf7e750 wa40a3c w9a68eb wd2a275 w07ed00
+wae860b w9e5446 w584c5e wf441d5 w1e9f8c weac97c.
+
+### task-n007 — w349041 w3d333f w86dea6 wc95a71 w1bf0b6 w9ca6bf w5ed7da wcfd189 w175e76 w8a54c0 (task, 2026-06-10)
+*selected via: derived-from (inbound) from art-n010, score 0.81*
+
+wf485f1 wcc9ee0 w7b77b6.w3a5bcc w1b7ed5 wa79eed w794a5a wc90540 wfd2948: w933eaf w2ff1ff
+w5ed7da wcfd189 w081f4e w794a5a w70adee w9cb3e5 w6a8281 w5cd5dd w7f9a0c, w751052 wc95a71 wa2ecb0
+w8dba0f w4e1b63 wd64335 w4c9522 w07cd44 w6376e8 w75959b w988030, wc95a71 w6376e8 w889e0b (w3126ff w1a1c72, w3126ff
+w1e0c33 wa2feca) w175e76 w8795f0 w2768cb wcfd189 w3f7abd. wd17337 wfd2948 w1e9f8c w37bbd9
+w91687c, w3126ff waaea3a — w6376e8 wd4c14b w86dea6 w6376e8 wf0d5cf
+w0f9f4d wb5a706 wcc44b2 w9a6f60 w447d72 (w1bf0b6, wb4e6b5 wedd63b) we2936f
+w22e4db.
+
+wb91705 wcc44b2 w1bf0b6, wf22d25 w16d2c1 wac59cf w6376e8 w71a292 wa89aaf wbcb729: w062b4b w5fe808
+wce8c98 wc95a71 w5fe808 w1d0aa1 (w842071 web28a9), w6376e8 w973b72/w7de56f w861735 wc95a71
+wb91705 w4c9522 we638c1 w0f3e3a w1e3d54 w1a3820 (w6376e8 wd8e767 w46fcd2), wa81cef w131c93 w6376e8
+w9ede4e wdb0c2e w31a764 w9d0b02 w9f190b wcfd189 w6376e8 wce8c98 wfceca0 wcc44b2
+w3d333f wa8a4d2 (w6376e8 wbf680c wb69176 w86dea6 wc95a71 wfb4988), wc95a71 w9ca6bf
+wb26ed1 wb3d424 wb06ee6 w7da34a w000cd0/w7b77b6 wc95a71 w88bf92 w800dc5. w6376e8 w0cc360
+w3d333f w30945e wcc9ee0 wbaa753 wb562b9 wa33aaf w1e9f8c w6376e8 wb2a7fb; w07ed00
+w751e0f w1e9f8c w6376e8 wcecafc. wdcb7a3 w1e9f8c w161870: w933eaf w2df532 w6376e8 w349041 w9755d9 we71105
+w3d333f, w6376e8 wba33c9 wae4328 w87f1bb w0c5515 w76de08 w98df9e w752029 w9755d9 wd04a70 w4c9522.
+
+w678a4d wac59cf w26c438 wa8a4d2 wcc9ee0 w1d7a65 (wabc7bb
+w16d2c1 w07ed00 w751e0f), w3126ff wcc9ee0 w07ed00 w3769a3 — wf23fdf w7041e6 w3a8884 w763d23. w07ed00 w751e0f w1e9f8c
+w800dc5 wcc79ab wd17337 web28a9 w562cff w43690c we1ab3c wa79eed w6376e8 wba33c9 wfd2948; w6376e8 we1ab3c
+w56712d w404d18 w312a48 w2c709c w9451ff wabc7bb w16d2c1 w6376e8 web28a9. w001e07 wb2990f wc95a71 w6376e8
+w2768cb wcd3b26 w0d1e69 wd252f0 wcc9ee0 w14b247.
+
+wee87f2 w1affa6 wd4e8b3 2026-06-11: w07ed00 w1e9f8c w6376e8 w0cc360 w251a49 w584c5e w6376e8 we8a750
+wcfd189 w1373f4 — w09764b wa79eed wcfcc64 w9a68eb w4b82dd wa93c1b wc4b98d w8d4a15 w0c02c1
+(wf37e48 w086e57).
+
+### task-n015 — wf441d5 2.1 w7efcf3 wf71771 wec686e wc1fc4c wa4369b (task, 2026-06-10)
+*selected via: derived-from (inbound) from art-n010, score 0.81*
+
+w7efcf3 w43690c w7ad2cc w394a6c w7bdaae w1bcc2f wa0fe8f wbdc0c4 wee1831 wa0d418, wc69d5c
+w5436f4 wc95a71 wa0fe8f.wd9d770 wb562b9 wa4369b w408827 w6376e8 wc1fc4c wf441d5 w2fcec9:
+w9b514e w6a8281 web3ab7 wc95a71 wfeb8bd wee1831 w4a0793, w8a74cb w6376e8 wc1fc4c
+wf04414 w108f81 w5ece45 wa8af67. wccdd47 w01191d wf199ff wcc44b2 w6a4351 w2bdc00 wb9c3bf
+(w320052/wf5c3f0) w4b82dd wa93c1b wa660e9 w43690c wcbd536 w8ab430; w6376e8 wf441d5 wccdd47
+we40024 wcc44b2 w6376e8 wd4c14b {w2202dc, webda5b} w04a257 w7efcf3 w43690c w394a6c w0ca351, w3b707d w74d1d8
+wea35c9 wd64335 w3126ff w9df9da.
+
+w5cd5dd wca33a0 wbceefa w93e5b8 w07ed00 w1cc8bf w9e14b8 w23ff44. w44f0e9, w6376e8 w5436f4
+wf8c708 w04d0ef w72ca4d wb741f5 w0e8052 w5436f4 w6208cc w4e1b63
+w1979a8. w5d6b1a, w6376e8 w1e3d54 w290962 w2fcec9 wb0bf57 w2c50e3 wcc9ee0 w7efcf3 w43690c —
+w98df9e w25f7bf w10af6d w6208cc wd793ac w43690c w0c46e6 w1e3d54 — wc95a71 w43f29f w29383b
+(w6c30b0 w61d480 w685287) w1e9f8c wc30532 w2768cb wcc44b2 w6376e8 wccdd47 w8f65db wf441d5
+wda4dce. w0e8052 w103b5e w6376e8 wd0b42a we59ed0 wa79eed wa63086 w1e3d54 wbdc0c4 w1e9f8c w2523d3, w3126ff
+w73512c.
+
+### task-n019 — w039e70 w3c5a73 — w493039 w8a54c0, w5e00d9 wdab6e5, w39e014 w7b77b6 w90bab9 (task, 2026-06-10)
+*selected via: derived-from (inbound) from art-n010, score 0.81*
+
+w6376e8 w2c709c w7b77b6 wb0bf57 wf2c26e: wd470a3() w2c33f2 wc4b98d w89d81a,
+wc95a71 wc9013e wdf392e we88632 w6dcc6d w493039 w8a54c0 w6df567 w5e00d9/wc64fd2 wd0e75a
+w216b50 — w1c5443 w1e9f8c w6a4351 wd0e75a wde1e9f wf485f1 wbbbf38, w3b707d we851e6 wf22d4d wac7a6c
+w1e9f8c wbbc25d, w322d20 w07c3e7. wcc79ab w3c5a73 w96d27c, w39e014 webf72d wc95a71
+w724899 w90bab9 w1846f1 w6376e8 wd4c14b w7b77b6 w3a55c1 (wc192fc `webf72d: []`
+w654976 w1e9f8c wa89aaf wcc9ee0 w6376e8 w6bd1d6 w7ec239 w3b707d w847913 we71105 we88632 w43690c w22cc93).
+
+wb2deb4 w61cc6d w1e9f8c wa89aaf wdd877d: w6376e8 wc238e5 w3d3d3a w842071 web28a9
+wc0626f w1f5627 w16d2c1 wf7cc72 w794a5a w908eef "w6376e8 we11b75 w1d5432 w10f3b0 2'w91ec5a w039e70
+w3c5a73 w8dba0f wc10147 w8b0010", wc95a71 w6376e8 wa621ba wca1360 w039e70 (w3fc763
+wb007af wa33aaf wec686e w41636f) w1e9f8c w96c3db. w6376e8 w8e89c4 wf7dcac w6376e8 w1e3d54
+w3e2043 w8b2c8a w07ed00 w596c7e wbf8f29 — w493039 wc95a71 w5e00d9 w216b50 wd252f0 w322d20
+w8a54c0 — w3b707d w6376e8 wc1eb04 wcfd189 w1e9f8c w3c5a73 wea35c9: wba0ee3 w56712d wce49e4 wb91705, wc95a71
+wcc79ab w43690c w039e70 wed6f38.
+
+w9f40ee 1 w800dc5 2026-06-10 (wece99a 5wd9eee8): w493039 w8a54c0 +
+w5e00d9/wc64fd2 wdab6e5 w908eef wc0a903 w216b50, w50411e -> w493039 web1c52
+(w686d2c), $wfb2db7 wf8118d w07cd44 w830395 w3cb784 w6a8281 w7c82ca we45c84;
+w56fa0e wa8a4d2 w6a8281 w5e00d9 wdab6e5 wc95a71 w5cd5dd wc64fd2 wb3d424. wa5f8b3
+(w9f40ee 2): w039e70 w8a54c0 wa79eed wb64e91/wa1e75b w40a86b, w3c5a73
+wea35c9 (wba0ee3 w56712d wce49e4 wb91705 w7da34a w5e00d9 + w3063f3 w7a4ebc w5fe808
+w0c4494, w6b4e92), w5a06bb webf72d
+wa9a71d, wc95a71 w30eedb w73af43.
+
+w9f40ee 2 w800dc5 2026-06-10 (wece99a 38428w224b34): w039e70/w50ebc0/
+w657a2a wc0a903 w216b50; w086fe9 w3c5a73 (w84f7ba/w3c5a73.w986bba — w7a4ebc
+w3063f3 w16d2c1 w6376e8 w689bb4, w5e00d9 waa169e, w316948 w5a3dba, wa85004
+wb3fa74 wcc44b2 we81c19); we86222 wc1fc4c w70adee + wee1a74 /w1e19c0/webf72d; w5a06bb wc95a71
+we186f8 /w1e19c0/w7b77b6 w0c311b w51208b webf72d; w30eedb w0f0a12 w6376e8
+w39e014 w561886 w52bace; wa5b41f wb64e91 w070473 web0dc8 w7ff09c w27e84b;
+waf0b30 w1e9f8c w6edfc9. 6 w5dc9a4, 111/111. w44f0e9 wa8a4d2 w039e70
+(w4c1c58) w39e014 wcc44b2
+w56fa0e w7da34a we9b5ab. w2768cb: w5bf7f3/w101bf3 w4e4429 wbb72d7,
+w6b4e92 wd39969 wa58b79 (wb26ed1).
+
+### task-n024 — w30eedb w0f0a12 w6a4351 wc1042b wfbb18c w16d2c1 w6376e8 w7b77b6 (task, 2026-06-10)
+*selected via: derived-from (inbound) from art-n010, score 0.81*
+
+w7b77b6.w3a5bcc §5 wd1a5fe w6376e8 wbdfa16 w8b2c8a w6376e8 w2c709c w7b77b6: we186f8 /w1e19c0/w7b77b6 w1e9f8c
+wc30532 "(w29f24f, w30eedb 'wca1360 wdd6b36 wfbb18c)". w6376e8 w921a78 wb0bf57
+w6a8281 w48e753 w52747b 3 wc95a71 /we8a750:w4bf057 w11091f w4c9522 w9a68eb, wc69d5c w6376e8
+wdeca25 w3e2043 — w1bcc2f wce8c98 w4c2589 w6a8281 w172534 w8b2c8a w6376e8 w9439aa wca1360
+wae860b wec686e w404d18 w89d81a — w1e9f8c w27c7e0.
+
+wb139b6 w1e9f8c w794a5a w6af3d9 w19dc62 wcc9ee0 wbaa753 wb562b9 w921e72 w3b181c w6376e8
+w253597 wd448cc: w52bace (w43690c w4b9e7a w71a292 w081f4e weaf301), w9197e2 w6376e8
+w4652ee wabbd50 wcb360c w40f133 w6376e8 wc2597b w835f77, wc95a71 w172b75 w6376e8 10w85b750
+w6f80c7 w7816c1 (w6376e8 wfbb18c w1e9f8c w794a5a wae860b w6a8281 w404d18 w5e64a1 wd047e9, w3126ff w6376e8
+w6eabd9 w7b77b6). w07ed00 w1e9f8c w6376e8 wa5b3db wd17337 wf7dcac "w6376e8 w5d434d w7c1f57 wcc44b2 w8dee5a" we805ca
+w07cd44 wce8c98 w058f8b w4b82dd wa93c1b w6dcc6d w07cd44 wd5d7dd w058f8b.
+
+### task-n026 — w8cbf6a /w1e19c0/w0155c4 (task, 2026-06-10)
+*selected via: derived-from (inbound) from art-n010, score 0.81*
+
+w6376e8 w921a78 wc0626f wfae9f3 w16d2c1 wf7cc72 w794a5a w3b707d w847913 wd7afa1 w3126ff we88632 w43690c w1e3d54
+w22cc93 w673593, wc69d5c w404d18 w3769a3 w1e9f8c w43690c wf22e07 501 w6a8281 w6a4351 `wa9320c` w21a3ce
+wbdc0c4. w48e753 w52747b 5 ("w0155c4/w3c39bb w921a78, wc4d112 w3b072a w28a1b7,
+wc79a9e wbe610a — w2a9ade wc6f58d w6376e8 wd40725 w1e9f8c wdb0015") w1e9f8c w8795f0 w4c9522
+w3f7abd wcc9ee0 w6376e8 w032046.
+
+w5cd5dd wf362d1 w4677c5 w4c9522: w3912eb w74abf1 w1cc8bf w6376e8 w1f48c1 wb562b9 wae4328, wc95a71 w6376e8
+w71a292.w3a5bcc §13 wca1360 w039e70 w0f3e3a w889e0b w50bdd9 w07cd44 w1c8db2 — w933eaf wbbfb75 w6376e8
+w796220 w000cd0 w5fe808 wd5d7dd w8435fe w98057f wcc44b2 wf37845 w095401 wcc6b6e w43690c w2d06f6
+w31e1a4, w0155c4 w1e9f8c w6376e8 w6e6c2c w1d5432. w801c2f w2d5066 w1e9f8c w4e4429 w07cd44
+w5760b4 w2c8c59 w1c8db2, we8bf74 w1e9f8c wd047e9 w4c9522 w2ac858 wca1360 w4b82dd wa93c1b w838913.
+
+> w096caa 2026-06-11 (w1b526f 1w610919 wcc9ee0 w6376e8 w71a292 w58212b): w6e5ddb
+> w58886d w014a94 wcc9ee0 w71a292/w2353df.w986bba (we851e6 wf22d4d wfe4a49), `w19dc62 … | wbf670d w1a5744`
+> w74e67f w8a54c0/ w97993b; w5dc9a4 wc08d31 wfdc49d wbed180, w48b96f
+> wd2da60, wc95a71 w5ece45; w71a292.w3a5bcc §6 wa7caf1 wcd26a3.
+
+### dec-n084 — w71cf3e, w1edb06, wc95a71 wbef4d6 wd252f0 w889e0b w8a54c0 — w51ecfe, w8017f0, w05fd1a (decision, 2026-06-09)
+*selected via: derived-from from dec-n101, score 0.81*
+
+w6376e8 w3bdaaa w731a92 wb5a706 wcc44b2 w6376e8 we8a750: waa611a, w75b475,
+wbc9cd6, wdf392e, wc95a71 w1cfa70 wd252f0 w71cf3e w13b488 w908eef wd5266f w8a54c0, w3b707d w27ad71
+wd252f0 w51ecfe, wc6bce6, w8017f0, wc95a71 w3582b8 wc4b98d w6a4351 wb66821 wcc9ee0 w6c093b
+wd7ca83 w43690c w5ef7db. w6376e8 w03b1ff & wed6c7a "waae091 w65f263" w16d2c1 w602bb5 w2d5066 wcc44b2 w602bb5
+w1d0aa1 w175e76 w43690c wfd8556 w63f743, w3126ff w43690c wfb3aed wd5e6f3.
+
+w6376e8 w79130f wace1e9 w6376e8 w0f6293 w14a6d7: w2f1a14 "w6dcc6d w838124 we207de
+wa93c1b w43690c w15cf14" wcc44b2 w6376e8 w2c709c w7b77b6 wc0626f w794a5a wf422b0 wa79eed w6376e8 wec5ed2 wc0beb0
+w3769a3; we71ac0 wdc42a7 wf63dc5 (>30w00cf1b, w5ffd4b w0e7cd8) wc0626f w43690c w7e748e w9451ff
+w6a8281 w5cd5dd w194951 w6bfdc1, w0b1626 w6a8281 w6376e8 wa6af0f. w799204 w7da34a
+wbd3d74 wdab6e5 wd17f38 w43690c we65900 w623d62 w758d3e — w6376e8 wf70fb9 wec5ed2 w9d0b02 w404d18
+w2f2377 w6ac87a w43690c w2d4d5e wd0e75a, w3b707d w0e0579 w6376e8 wec5ed2 w40a1f6 w27e84b "we8bf74
+w71cf3e w53a6ff w07ed00 wf70fb9?" w1e9f8c w889e0b w8a650c, w3126ff w159435 wa1cb27. wc5898e w43690c
+wec5ed2 w3769a3 w1e9f8c w5b2f91+wbdc0c4 w4c9522 wee1504 wcc44b2 w3c9234 w785a66 wec686e w4f783d wc95a71
+w1e9f8c w7f6384 wf4ab55. wf64676 wea35c9 we52c9d w6376e8 w032281 w3e2043,
+wdd0454 wf03349 wcc9ee0 wf2c5ba; wd1fde5 w98057f w770367
+wad475a, w3b707d wc1eb04 wd3e75d w01191d w0ca351 w58212b.w1c6f5f w6df567 w43690c wee58a6 wd0e75a.
+
+### dec-n015 — w801bf9 w1e3d54 w8a54c0 w3ceab2 wc0a903 w1e3d54 wfbdec7 (decision, 2026-06-11)
+*selected via: relates-to (inbound) from dec-n039, score 0.50*
+
+w801bf9 w1e3d54 w8a54c0 w6208cc wd5c473 w40a1f6 w441623 wc0a903 w1e3d54 wab4d9c wedeb38 wa243ca; w6376e8 w90a815 wec686e wcbfa42 (w2f1a14 wc4b8f9: we805ca wcc44b2 w266925) w65dcf6 w07ed00 w758d3e w5f1cd3.
+
+### dec-n025 — w64e034 w8e89c4 w0cb721 wec686e wbd3d74 we057bf wfb0aa2 wad7190 (decision, 2026-06-11)
+*selected via: relates-to (inbound) from dec-n039, score 0.50*
+
+w64e034 w1e9f8c w43690c wf22d4d w8e89c4 w0cb721 wf4a5e6 wbd3d74 w617a3e/w7cc100 wec686e wfb0aa2 wad7190 w6a8281 wcf40a7 we5295a wfb3de2: wec0799, we55704, wc21ff7 (w086fe9 w601573), wc95a71 w1f567e. w1373f4 wc95a71 wa80ff1 w7cc100 wd4935b w8a54c0, w79da50 wcc9ee0 w71cf3e wc95a71 w249f1b wcc44b2 wec5ed2 w4552d2.
+
+### dec-n031 — waf159c w6376e8 we5a0a3 we7c1d0 wfe7cac w715e1d; wfe9938 w6376e8 waa5a7e we5a0a3 w08ebb1 w0e8052 w43690c wdb17e2 w6c7acc w4c9522 (decision, 2026-06-11)
+*selected via: relates-to (inbound) from dec-n039, score 0.50*
+
+w43f29f w29383b wb0bf57 w908eef w6376e8 w0d9749 w3be2db we7c1d0 - w43690c wbf701c w15e449 (w89f6f5 w43690c w1e3d54 w9451ff wa9e9b1 w6a4351 wccdd47 wea3c0a w16d2c1 w6376e8 wd0bd84 w6003af w1d0aa1) w6df567 w602bb5.w821fc9 wcc9ee0 w6376e8 w569bab() we59ed0 wa33aaf w3b707d w7ee0fa w9755d9 w481c2b wd252f0 wb8069d wcc9ee0 wa63086 wbdc0c4. w6376e8 w6c4193 waa5a7e we5a0a3 w08ebb1 (w43690c wd41971 we5a0a3 w0cb721 w6a8281 w43f29f wd8397c, w5de004, wc95a71 w6376e8 w6fa9ea w3ceab2) w1e9f8c w2768cb w0e8052 w43690c wc1eb04 w9755d9 wdb17e2 w6c7acc w6af3d9 wa93c1b w6376e8 we7c1d0.
+
+### dec-n066 — w3e44e5 we65b89 w75b475 wd252f0 w6376e8 w97a19c w8b2c8a w9ef437; w6376e8 w4ba30e w08ebb1 w1e9f8c w43690c wabc7bb w64ef9e wcc9ee0 w5a11b4 (decision, 2026-06-10)
+*selected via: relates-to from dec-n039, score 0.50*
+
+wa10b2d w71ccde (2026-06-10, w532ccc) — w794a5a we65b89 wd54db6 w5fe808 w9451ff (w3769a3 = wfd8556 w770367, wb96b93 = w2e9210, wdab6e5 = w598991, w1c9072 w07cd44 w6376e8 w8ab430 w87e3aa) w908eef w97a19c w8b2c8a w9ef437; wad8100, w15919a/wcedbcb/wd0e75a w2f9d81, wc95a71 wadb02d web28a9 wd252f0 wabc7bb w2d0936 wcc9ee0 w5a11b4; wcd9eaa w87c261 w6376e8 wfdc49d w63d4a5; wc1eb04 wf4d5e4 w8afa58 wcc44b2 w03f949 wdd4bd1 w9bffb0; w43690c wbbcb38 w5b2f91 w20e3e9 w1e9f8c w6376e8 w7b6f4b w3a55c1. we851e6 w7592f7 w889e0b w36db14 — waf74a9 3-w728910 w2fdd82 we1426a wd252f0 w621bfa wcfd189.
+
+### dec-n088 — w645db8 w39416f w2f1d8c waa5a7e wa8a59d wa89aaf w5f1cd3 w6ac87a w6376e8 w1e3d54 w8e89c4 (decision, 2026-06-10)
+*selected via: relates-to (inbound) from dec-n039, score 0.50*
+
+w645db8 w6376e8 wb6f501 w751e0f w5ed7da wd17337 waa5a7e wa8a59d (wa18cc3, w6f106f, wb09884, w726aed w216b50) wa89aaf w5f1cd3 weccaa1 w6ac87a w6376e8 w1e3d54 w8e89c4 w6a8281 w1166f9 w25c46a w332c09 wbdc0c4—w43690c w26f972 wa89aaf w1f6ecd wc4b98d we495e2. w6376e8 w8679c3 w1dd473 w8cbdf0 w6376e8 w796220 w2fcec9 w2e2701 w61fdba w1e7429 wc4a6cf.
+
+### dec-n075 — wf4d31e wa10b2d w848784 — w3d3d3a wadb02d web28a9 / wd80fbd w8ab430 w908eef w97a19c w8b2c8a w9ef437 (decision, 2026-06-09)
+*selected via: supersedes from dec-n066, score 0.50*
+
+> ⚠ SUPERSEDED by dec-n066. Do not follow; included only so you recognize stale references.
+
+w621b28. w6376e8 wa6af0f wa10b2d w848784 wd5b877 w889e0b w942566 wc95a71 w6a4351 w3d3d3a wadb02d web28a9 w908eef w6376e8 w1d98c8 w4ba30e w08ebb1, w6a8281 w6b0d2e w6dcc6d wec686e w29763b w0c9bca wc95a71 w71cf3e. w6376e8 wec5ed2 w79130f w886045 w6376e8 w3e44e5 we65b89 w75b475 wa89aaf w0c311b w796220 we02d3b wc95a71 wd17337 wdab6e5 wd252f0 w5a8000 wba0651, w3b707d w6376e8 w770367 w75b475 wd252f0 w6376e8 w97a19c w8b2c8a w9ef437 wc95a71 w6376e8 w4ba30e w08ebb1 w1e9f8c w43690c wabc7bb w64ef9e (wa59b32).
+
+### dec-n069 — wfe9938 wec5ed2 w3c08f3 w0e8052 w770367 w8ab430 w1e9f8c wa8a4d2 (decision, 2026-06-10)
+*selected via: constrained-by (inbound) from dec-n066, score 0.50*
+
+wc1af95 we27840 wa79eed w889e0b w9df9da w1e9f8c w2768cb w0e8052 w6376e8 w770367 w8ab430 w354af2; w5cf5e8 w4c9522 wa79eed w6376e8 w5b2f91 w4ef58c wd7afa1 w214b82 wd9d55f wcc79ab w770367 wa10b2d wc131a5.
+
+### art-n009 — w71a292/ — w6376e8 we8a750 w71a292 (artifact, 2026-06-10)
+*selected via: relates-to from art-n010, score 0.45*
+
+w6376e8 w794a5a wdd2f7c w367660 — w2353df /w1e19c0/* wc95a71 wc1fc4c /wc1fc4c wcc6b6e w43690c w6ed3f8 w8ab430 (wc50ffc w889e0b, wa1ba8b w1408bc w7b77b6, wd0f0b3 w01cfd4, w74d1d8, w7ad2cc w5ece45), w6df567 w3d333f w2d481d (wc76cd5.w986bba), w6376e8 wd39969 w31a764, wc9b3fe w9a3e53, wc95a71 w6376e8 wd5067a/w71a292.web28a9 w2fab85 w1d5432; w7d267a w6376e8 w17e880 w889e0b w89d931 w43690c w2c8c59 w889e0b.
+
+### question-n001 — w4df8c6 w46d402 w16d2c1 w74d1d8 w8e8705 w8b2c8a wcedbcb w40a1f6 wb2deb4 w0c02c1? (question, 2026-06-11)
+*selected via: mentions (inbound) from art-n010, score 0.45*
+
+w01191d w6376e8 w7b77b6 w4df8c6 w43690c wc9013e w46d402 w43bf7a w16d2c1 w74d1d8 — we8bf74 w8a54c0 w6376e8 w9e22ac wa2a5ef w9a4b79, w062b4b, wc95a71 w3ba485 w3059a2 wcc44b2 — w4b82dd wa93c1b w1f7bcb w3f95ac wcedbcb w40a1f6 w6ba389 w0c02c1? w6376e8 w349041 w751e0f w52777a w44f0e9 wa79eed w0c02c1 w404d18 w312a48 w7c4165 w443e19 w43f29f w505939 wc95a71 wd7afa1 w6d359b wd7ca83 w43690c wdf1727 w15cf14; w43690c wcedbcb we3c327 w3803fd w6376e8 w84cbee w654976; wee87f2 w1affa6 w1e9f8c w8542f5. wca1360: wccb295 w902516, w9a88dc w8d4a15 wdab6e5, w3be2db w43bf7a w61d480 w7eb2f0.
+
+### task-n005 — w9b60c8 w1f48c1 w3ba485 wcc44b2 w889e0b w8a54c0 — w3ba485 w654976, w9b7b39 wf79b49, wdd07ff w3d333f (task, 2026-06-11)
+*selected via: relates-to (inbound) from art-n010, score 0.45*
+
+w04a257 wacd35b w1b526f w33f60c wa79eed w751e0f/w2c709c/w40761f w8a54c0 w7da34a w43690c w3ba485 wb96b93 w654976, w64ef9e w9b7b39→w9451ff wa79eed w6376e8 w71a292 w6a8281 w43690c wf79b49 w921a78, wc95a71 w3d333f w07cd44 w1b526f w233823 wc4b98d w65a138 w6376e8 w125f9a wcc8bf5 wcc44b2 w464646 w3b707d w43690c w1f48c1 w1b526f w66e528 w43690c "we8a750: <wfb07e9>" wb4048b w5f6591 w404d18 w9b7b39 w8160cb wd17337 w9451ff. wb4048b w925c58 w1b526f→w9451ff wcc9ee0 w1f48c1 w7f6384; w6376e8 w654976 w925c58 w9451ff→w1b526f wcc9ee0 w56708c.
+
+### issue-n032 — w3cb3ff w3126ff wc4b8f9 — w5ed7da wcfd189 w5baa62 w7b77b6 wcc79ab wc38515 (issue, 2026-06-11)
+*selected via: resolves from dec-n015, score 0.45*
+
+w3cb3ff we52c9d wd4551b w16d2c1 w7b77b6 w8b07ec wc4b98d w3ab595, wb3c219 w43690c w5929e5 wbf680c w8795f0 wb26ed1 wcfd189 wd0bc38 w89d931 w6a4351 w40761f wa0d418 w5baa62 w6376e8 w2c709c w7b77b6 wc95a71 w175e76 w828f5c, w47f3da w6376e8 w460036 wcc44b2 wf23fdf w5ed7da wcfd189 w674be5 wb3fa74.
+
+### task-n021 — w1947fb w1e3d54 w281f69 — w6c30b0 w61d480 w685287 wa79eed wf441d5 wccdd47 (task, 2026-06-10)
+*selected via: resolves from dec-n031, score 0.45*
+
+w91c0b2 w6c30b0/w685287 w43f29f w29383b wcc9ee0 w6376e8 w1e3d54 w290962 w2fcec9, wa90897 wa79eed w6376e8 wf441d5 w7efcf3 wf71771 wccdd47 w8f65db. w80881f w98df9e w25f7bf w10af6d w6208cc wd793ac w43690c w0c46e6 w1e3d54, w3b707d w6376e8 wd0b42a we59ed0 wa79eed wa63086 wbdc0c4 w1e9f8c w2523d3, w3126ff w73512c. w5ccd2c w07ed00 w1e9f8c w6376e8 wadb02d wd17337 w2d8330 w6376e8 wb77b17 wec686e w6376e8 w9451ff:w508048 we5295a w4eb4c9.
+
+### dec-n079 — wec5ed2 w726aed waf169d w2ac858 wa79eed w9451ff:w04c00e w6ac87a w6376e8 w6d3c3f wd80f17; w1c2a9e we5029f wa79eed w43f29f w29383b, w3126ff w6376e8 wd80f17 (decision, 2026-06-10)
+*selected via: derived-from from dec-n031, score 0.45*
+
+w6376e8 w7f5a4a w806471 wec686e w6376e8 wec5ed2 `## w726aed` waf169d w1e9f8c w3d008f weca369 w6376e8 w6d3c3f wd80f17 w33c425, w3126ff w76de08. w6376e8 wd80f17 w16fcd4 w8a8beb w8b2c8a w6376e8 w9451ff:w04c00e w6ecf8a w3a78f4 — w4c9522 w6462cb w97c659 w602bb5 wbc28df w8e62df w43690c w93d349 wad8100, wc95a71 w6376e8 waf169d w1373f4 w6376e8 wd4c14b w96a9b8 wbdc0c4 wcc9ee0 w6376e8 wd4c14b we5295a w2b7058 w563cce w1e9f8c w74a3d4. w6376e8 wc1eb04 wb77b17 w1e9f8c w6c30b0/w685287 w43f29f w29383b w21e442 w13691e w37b004, w2768cb wcc44b2 wf441d5 w7efcf3 wf71771; w6376e8 w4eb4c9 we5029f wa79eed wd17337.
+
+### dec-n056 — wa63086 wbdc0c4 w9c7913 wcc9ee0 w7f5a4a; w9451ff:w04c00e w7d5fa5 w6dcc6d w6376e8 w0f7fbe w37551b (decision, 2026-06-11)
+*selected via: derived-from (inbound) from dec-n031, score 0.45*
+
+w6376e8 w4eb4c9 w27410c wb0bf57 wc6f58d w6376e8 we5a0a3 we7c1d0 wbe15a2 w43f29f w29383b (w6376e8 wb77b17 wcc9ee0 w30b6af) - w71a292/we5295a.w986bba w1373f4 w1e3d54 wfb3de2 wc95a71 wec5ed2 w726aed wd6b128 wcc9ee0 w7f5a4a w6a8281 w6376e8 we4a19a w26f972 w3a55c1 wcc44b2 w1e19c0 w6df567 w9aeab0 wc95a71 wc2c1a1 w906aa4 w9451ff:w04c00e w44a72b w3126ff w91c0b2. w1c2a9e w355223 wc6f58d w07cd44 w9fbfc4 wc95a71 w6376e8 w71a292 w4dabc5 wcc44b2 w9fbfc4 wedeb38 w4c9522 (wc3935e=w04c00e w1e9f8c w6376e8 w3912eb wff7053 waf169d); w84f7ba/we5295a.w986bba w2ac858 w6376e8 w10b572 w9451ff:w04c00e w37551b wec686e wf28994 w4f08df.
+
+### task-n016 — waa5a7e we5a0a3 w08ebb1 — w6376e8 wd41971 we5a0a3 w0cb721 wcc6b6e w6376e8 w3be2db we7c1d0 (task, 2026-06-11)
+*selected via: derived-from (inbound) from dec-n031, score 0.45*
+
+w5267c5 w6376e8 w2768cb we5a0a3 w08ebb1 wcc79ab w43690c wc1eb04 w9755d9 wdb17e2 w6c7acc w6af3d9 wa93c1b w6376e8 wbf701c we7c1d0 - w43690c we5a0a3 w0cb721 wcc9ee0 w6376e8 w1e3d54 wd78abe w794c21 we59ed0 w1373f4 wa79eed w1bcc2f w1408bc w4bf4c8 w6a8281 w6fa11e w569bab(), w66e528 w43f29f wd8397c (w493039 w8a54c0), w5de004 w481c2b, w25259b w79470c, wc95a71 w29c9ea w6376e8 w6fa9ea w3ceab2 w908eef w794a5a wac7a6c. w6376e8 wc7110a wcc8bf5 (w602bb5.w821fc9) wa89aaf w354af2; we851e6 wfe9278 w9df9da w01191d w214b82 w2b7db3.
+
+### art-n036 — w4d7921 wf7e750 — w0ca2af wf84db0 we8a750 w3ab595 w2ae65f (artifact, 2026-06-09)
+*selected via: decided-in from dec-n066, score 0.45*
+
+w6376e8 w3ab595 w04a257 w8b2c8a w6376e8 w4d7921 w8c43ca w58212b (~/wb93d00/w4d7921/wf7e750.w3a5bcc), w16d2c1 w43690c 2026-06-09 w3ab595 wbd4597. w41e830 w9bd3f9 w6376e8 w4b53e4 (wbd3d74 w51ecfe w78d9b5 w889e0b w908eef w6376e8 w9755d9 we8a750; w5bf7f3/w1a1c72/wb79099 w908eef w71cf3e wcc6b6e w4c9522), w6376e8 wf0d5cf w71ccde, wc95a71 w6376e8 w552a9e w838124 wcc9ee0 w404d18 §6 (wa10b2d wc95a71 wec5ed2 wf64676). w2b9617 w4d7921 w838124 we52c9d w5d2ddb w22e4db.
+
+### art-n027 — wec5ed2 w79130f w95f3bb — we65b89 w770367 w8ab430 w6a8281 w1307f0 wea35c9, wbbcb38 w5b2f91 w20e3e9, w794a5a w44b2db w546e0d (artifact, 2026-06-10)
+*selected via: derived-from from dec-n066, score 0.45*
+
+w770367 + w64e0ed w79130f (w32761b/w95f3bb.w3a5bcc, 2026-06-10). w6376e8 "w770367 wec686e w75b475+w71cf3e, w4ba30e wec686e w889e0b" wdf7202 w9ecfb7 w6a8281 w794a5a w1ea872 — w6376e8 w4ba30e waa6dba w1e9f8c w43690c wabc7bb w64ef9e, w3126ff w43690c w5d6b1a w97a19c w8b2c8a w9ef437. w1307f0 wbe610a wea35c9 w95d968 (w3769a3=wfd8556, wb96b93= w2e9210, wdab6e5=w598991); w5b2f91 w20e3e9 w3433b9 w9ab83b wc95a71 w6376e8 w2bdc00 w689bb4 wc968ad we4c5f3. w546e0d w36d3e9: w47fc65 w4457af wfd8556 w896461 wbe610a w391254 w89d931 wf19856 w7ef49e.
+
+### task-n044 — wae9191 w1e3d54 + w19f83e wf135aa + w794a5a wae9191 w5fe808 wfd60af wcae9cb (task, 2026-06-10)
+*selected via: relates-to from dec-n070, score 0.45*
+
+wfaf075 wab19b4 (w5beadc w908eef wac59cf, wdab6e5 wcc44b2 w41cb24 w71cf3e) w6ac87a w6376e8 w1e3d54 w290962 w2fcec9, we30264 wdf5287 wcc9ee0 w6376e8 w6d3c3f w33c425, wc95a71 w5267c5 w6376e8 wfd60af w694538 wd4e8b3: wefb186 wa18cc3, wfd0d5e w742336, w40fcd7 wca07b5 wfb8350, w8b6250 w5b9634 w602bb5, w8c8d75 w75959b w256797.
+
+### dec-n108 — wc1fc4c w3c05f7 w3da79a w1b06a0 w1e3dbe w4552d2 w0e8052 wd4fae5 w354af2 (decision, 2026-06-10)
+*selected via: relates-to (inbound) from dec-n101, score 0.45*
+
+w6376e8 wc1fc4c w3c05f7 w9a68eb w1b06a0 w1e3dbe w4552d2 (wa3ed4b we3e4e3 w2fcec9 w6ac87a wbd4597, w3126ff w889e0b wcb1468) wc5898e wd4fae5 w1e9f8c w0c46e6 wc69d5c w3126ff w6688fc w592bc7. wc6f58d wd4fae5 w354af2, w43690c w8e44ca w751e0f w6208cc w31b617 wd465a7 w6706bb.
+
+### issue-n023 — w42121f wa1bd4d wba33c9 — wa8a59d w3126ff wb3fa74, wd2da60 w8e3e1b w081f4e (issue, 2026-06-10)
+*selected via: relates-to (inbound) from norm-n007, score 0.45*
+
+w3db72e wd0e75a w9a4b79 w2f1d8c wba33c9: wd0e75a wa8a59d w57c3d0 w07cd44 w8dd6ec, w608a01 wd2da60 w8e3e1b w466a5b wec686e w9d4b95 wa893c4, wc95a71 w756c86 w69fcdf we5029f. wcf40a7 w5fa283 w0c46e6: w743aab wd0e75a we430ac, w108f81 wcadb3f, w3300e7 wfd3e40, wc95a71 wd39969 w287db3 w95f3bb.
+
+### person-n001 — wbb2af0 w4020e8 (person, 2026-06-10)
+*selected via: stewards (inbound) from art-n010, score 0.36*
+
+w6376e8 w6d1d79 w44f0e9 w7f4563 - wccdd47 w3059a2 wec686e $wfb2db7 wb663e5 wc95a71, wcc79ab wb7dee5 w3c5a73 w96d27c, w6376e8 w3c5a73 w2f2377 wec686e webf72d wc95a71 w724899 w7b77b6 w90bab9.
+
+### dec-n064 — wee1831 waa6dba w354af2 w6a8281 w1166f9 we913ae (decision, 2026-06-10)
+*selected via: constrained-by from art-n007, score 0.25*
+
+wf485f1 w6376e8 wfb3aed w1373f4 wa79eed w43690c w83664f w9ca68b — w84f7ba/ wc95a71 w6376e8 wcc8bf5 wbe7b33 — w70a5bb w6dcc6d w34f93f w9451ff, w464646, wea0a30, w1f48c1, wc95a71 w19dc62, w6a8281 we851e6 wa68465 wd04bcc; w6376e8 w8f9da0 wceca11 w1e9f8c w71a292/, we8bf74 we93890 w404d18 w312a48 wd4938a.wd26158 wc95a71 w1373f4 wa79eed w43690c wee60be w31cff2.
+
+### schema-n003 — w40761f — wc4b8f9; wca1360 w70e3d5 w1846f1 w6376e8 w2c709c w7b77b6 (schema, 2026-06-11)
+*selected via: relates-to from dec-n015, score 0.25*
+
+w801bf9 w3ceab2 w8b2c8a w6376e8 wc0a903 w40761f w1e3d54, we4a19a wf98d6d wc4b8f9 we805ca — wca1360 w3cb3ff w73ae5e wec686e w3ae887 wcc9ee0 w6376e8 w2c709c w7b77b6 w40f133 wb3d424, webf72d, w95f3bb, wc95a71 weac97c w062b4b. w2beb8d w6376e8 wbf680c w8795f0 w93a519 w43690c w3d333f w89d931 w6a4351 w40761f w391254 wca59a9 w4c9522 w16d2c1 w6376e8 w7b77b6.
+
+### dec-n059 — we057bf w8814af wa90897 wfe7cac; wb15abc wb5303b wec686e wc40078 wc95a71 w332c09 w28a872 (decision, 2026-06-11)
+*selected via: relates-to from dec-n025, score 0.25*
+
+w6376e8 w2c8c59 wd7b75f wcc44b2 w5267c5 w6376e8 we057bf wf64676 w37551b wfe7cac w4b82dd wa93c1b wd15cf9 w40a1f6 w6bcba7 wb15abc. wc40078 w28a872 (wa9e86d wb1f15e w8ea2d0, wfd700e wceca11 w623e63 w45ba5e) wc95a71 w332c09 w28a872 (wd68f4f wa79eed w43690c w873b86 w6aaa84 w37551b) w118a79 w5cf5e8 w6376e8 w37551b w6af3d9 wbc78a8.
+
+### dec-n011 — w665015 wcecafc w2ac858 w43690c w751e0f; w43690c w7592f7 wdbd99d w15919a w1e9f8c w2768cb w0e8052 w43690c w5d6b1a wcecafc w6c7acc w4c9522 (decision, 2026-06-11)
+*selected via: relates-to (inbound) from dec-n031, score 0.25*
+
+w9e0ee1 we9b489 w15919a w751e0f — w6376e8 w2fab85 we93890 wf146bb, w7b77b6 wf47a4b w7da34a wcedbcb wca1360, wc95a71 w43690c we93f85 wf03e41 (we1ab3c w77e42b). w404d18 wdd877d wac59cf w26c438 wdf7202 w9bd3f9 wcc44b2 w1d7a65, wc95a71 w6376e8 w6cc358 we1ab3c w8dba0f w214b82 w43690c w2c709c w9451ff. w43690c w76fccc/wdbd99d/w0335a3 w9451ff w15919a w1e9f8c w2768cb; w794a5a wab716d w737ad3 w3126ff we7a7aa w43690c w15919a w1bcc2f w095401, wec5ed2, wc95a71 w7b77b6 wea26dd w21f9b2 wac6c1a.
+
+### task-n022 — wdde5ce w3ceab2 wec686e w6376e8 w7b77b6 w3e0c25 (task, 2026-06-10)
+*selected via: relates-to from dec-n031, score 0.25*
+
+w800dc5 — w43690c w0cb721 w7eb2f0 w1e3d54 w9451ff (w07851c w8e89c4 w943cc9) w1c0a42 w24d58b(w90bab9) wa63086 wbdc0c4 wd17337 wf273a5 w6376e8 w7b77b6 wcc9ee0 w6376e8 we5295a, w43d575 w6376e8 w784f49 w3e0c25; w3b38fa w6a8281 we5a0a3 {w8821fa, wb5a706, w21a3ce?} w5f8981 wa79eed /w1e19c0/w7b77b6 wc95a71 w5a06bb; w0c46e6 wa81605 w4e5b9e w0e8052 w592bc7.
+
+### dec-n038 — w17e880 w7b77b6 w5471fd w1e9f8c w43690c wedd5ee w6e8562, w3126ff w43690c wec5ed2 — wb3b480 w07cd44 w095401 w233823 (decision, 2026-06-11)
+*selected via: relates-to (inbound) from dec-n031, score 0.25*
+
+w793a25 w7b77b6 w5471fd w354af2 w908eef w43690c wb3b480 w6e8562 wa79eed w6376e8 w493039 w9451ff (w5c2e24 w535fcc w598991, w91a74c.w80c935. wb3b480: [we40d4e, w9881e8@2026-07-01]), wb5a706 wc4b98d wd470a3 wec686e w6376e8 wa2ea8a wfb2db7 w07cd44 w095401 w233823 w6a8281 w6376e8 w57c3d0 w561886 w65c78d (w1b526f 38w979d71). w43690c wec5ed2 wc0626f w9f6c89 wc95a71 wb5303b — w71cf3e w6dcc6d w88bf92 wf135aa wbdfa16, w584c5e w6376e8 weda399 wbdfa16 (w5a06bb, w6376e8 w30eedb wc1042b wfbb18c, /we8a750:w4bf057) w3374af wd470a3 w563cce w4ee911.
+
+### dec-n041 — wbf701c w15e449 w73512c w7da34a wfeb8bd wda8294 wa58b79 (decision, 2026-06-11)
+*selected via: relates-to (inbound) from dec-n031, score 0.25*
+
+w6376e8 wbf701c w15e449 w40bf00 w43690c w6c30b0 w16d2c1 wc31a9d w0e4842 w312a48 wa893c4 wc4b98d wd49379 w6376e8 w685287 wccdd47 wcc44b2 wa164e0 w16d2c1 w6376e8 wc0beb0 w5760b4 w1d0aa1 w654976. w67a490 wfca529 w482fe8 w6376e8 w1d0aa1 w654976, w6376e8 wa58b79 w1e9f8c wfeb8bd wc95a71 w2beb8d w6376e8 "w63f743 w103b5e wd793ac" wd4b012; wa61bb9 w1f48c1 w9a4b79 wd4b012 w6376e8 wa58b79.
+
+### dec-n043 — w80ac25 — w9c802f w3912eb wff7053 waf169d w91f13f w6376e8 wbf701c w15e449 wec686e w1ed19a wa684b4 (decision, 2026-06-11)
+*selected via: relates-to (inbound) from dec-n031, score 0.25*
+
+w6376e8 w0d9749 wbf701c w15e449 w51b0fa w43690c w1ed19a w9755d9 — w6376e8 w6dcc6d w493039 wba0ee3 w6208cc wd793ac w1e9f8c w6376e8 w493039 wba0ee3 w0c46e6. w80ac25=1 w07cd44 w71a292 wb18344 w086dcd w6376e8 w15e449, w4994b4 - w9fbfc4 wb7e401 wa989e7 w4f08df, wac7685 wb08a55 w290962 w1c0a42 w43690c w070473 w5ffd4b w9ffc77 w6376e8 wccdd47, wc95a71 w27e941 w1230a0 wcc9ee0 /w1e19c0/wcedbcb w908d2e. w6376e8 we7c1d0 w7f6384 w2ac858 w0886d5; w6376e8 waf169d w1e9f8c wb8ec94 w3912eb w159435 wde1e9f wc3935e=w04c00e, wfe75c6 w889e0b wac59cf. w3a623b w4c9522 w6376e8 w988030 w43690c w5d6b1a wccdd47 w9c5207.
+
+### dec-n053 — w1a6ed9 we5a0a3 w39fc9d (decision, 2026-06-11)
+*selected via: relates-to (inbound) from dec-n031, score 0.25*
+
+we5a0a3 wa4f773 w89d931 w033947 wc0415e — w0886d5 w3be2db w564097, w7c84e7 w1e3d54 wedaf60, wc95a71 wa2b247 wa63086 wbdc0c4 — w6df567 w43690c wd41971 w10f3b0 wec686e waa5a7e w481c2b w2768cb w0e8052 w2b7db3.
+
+### dec-n054 — w569bab() we59ed0 w132a71 {w2202dc, webda5b, w7da34a} w821fc9 wccdd47 (decision, 2026-06-11)
+*selected via: relates-to (inbound) from dec-n031, score 0.25*
+
+w1e3d54 wbdc0c4 w569bab() we59ed0 w132a71 wa2ea8a w821fc9 wccdd47 w908eef {w2202dc, webda5b, w7da34a} wcc9ee0 w404d18 w602bb5 we8e6d4, wc7110a w7ee0fa we5a0a3 w481c2b wedeb38 w3053ca wfe9278 wa893c4.
+
+### dec-n057 — we057bf w05374e wee44d9 w8e62df we8a750 wccdd47 — w5e3c89, wfe75c6 w43690c w475449 w8ab430 (decision, 2026-06-11)
+*selected via: relates-to (inbound) from dec-n031, score 0.25*
+
+wc0b3ef "w05374e wd252f0 w6376e8 w816488 w2b0d7b" — w6376e8 we8a750 w175e76 wccdd47 w4ec2ed wc95a71 we5a0a3 w2c709c w07f575 wec686e we057bf w05374e w584c5e wfe75c6 w9ba6d9 w9b3393 wff51b0. w6376e8 w52747b wb227be w175e76 w43690c w8956de w9c9893 w8302c6 (w03fa39 + w75959b) w66e528 w889e0b w2c6309 (we057bf, w73ae21, w52747b, w26f972) wc95a71 w43690c w47114a w0742f6 w87be25 w7da34a w5e7dc7 w08d583 w04bc7c; we46b14 w3a39e6 wecdabe w7da34a w160ebb wccdd47 wab8227, wb51e1e w966363 wca17b2 w7da34a w43690c w145c19 we1ae67 wfb0aa2 w42ef8c w5fe808 w52747b wc4b98d w889e0b we5a0a3.
+
+### task-n020 — w56e35f w6376e8 wbf4a69→wcedbcb wbf680c — w118a79 w7b77b6 w88e60b w43690c w4d4b06 w8b2c8a wdab6e5, wcad228 w43690c w1b4026 wd39969 wa58b79 (task, 2026-06-11)
+*selected via: relates-to (inbound) from dec-n031, score 0.25*
+
+w800dc5 — wd470a3 w1b06a0 w90bab9 w419a8f wc4b98d w43690c wa8a4d2 w8d0d2d wbf4a69/w657a2a wd0e75a (w1166f9 wd609f2, w84f7ba/w0f6573.w986bba), wc95a71 w6376e8 wb3ba0c wf22d4d w0a3ab2 wa58b79 w785a66 w43690c web412f w0fafbc w43690c w47114a wcc44b2 w8ca410 w6376e8 wcedbcb; w3be2db w50e7db w2ac858 w2768cb wcc44b2 w6376e8 we5a0a3 we7c1d0.
+
+### dec-n068 — w7592f7 w889e0b w68c602 — wb5303b (decision, 2026-06-10)
+*selected via: relates-to from dec-n066, score 0.25*
+
+wb5303b. w43690c w889e0b w36db14 (w0b0a8a) wec686e w6376e8 we8a750 w1e9f8c w27a9f6 - w6376e8 wac59cf w1e9f8c wb1ead6 (10-50we198ce w8a54c0 w07cd44 ~2w85b750 wec686e w43690c w7a7438 w8b2c8a w43690c 1,000-w493039 w9755d9, w3b181c 100w544721) wc95a71 w6376e8 w264d4b w133cd6 wd252f0 waf74a9 ~3-w728910 w2fdd82 we1426a, we8bf74 wd252f0 w621bfa wcfd189 wcc9ee0 w5a11b4. w8bdcd4 w6dcc6d w933eaf w8a650c w56712d we65900 w273451.
+
+### issue-n046 — w47fc65 w4457af w770367 w896461 wbe610a w391254 w89d931 wf19856 w7ef49e (issue, 2026-06-10)
+*selected via: relates-to (inbound) from dec-n066, score 0.25*
+
+w546e0d w36d3e9 wcc9ee0 w6376e8 wec5ed2 w79130f - w5cd5dd w0c02a7 w5f010c w6376e8 wd4c14b wfd8556 wa60b6b wbe610a w89d931 w9a3609 w7716f6 ("w226eeb") w6a8281 we851e6 w064afa w6e9390, we851e6 w21a3ce, we851e6 wc98ffb; w43690c wd68012 wb66821 w40a1f6 w6376e8 w689bb4 w11091f w4c9522 w908eef w1588ee wfd8556. w0f6573 w481c2b w9fd2b6 - w7a8e63 w42e90b w4457af w8b0fc3 wcc9ee0 w6376e8 wadb02d/w64ef9e w5929e5 w76de08 w98df9e wd68012 w2d5066, wc95a71 wcb30fb w43690c weac97c w4cbd22 w908eef w6a4351 waeac2f w587b5d w39e014 w89d931 w6376e8 w2c709c w7b77b6.
+
+### art-n032 — w8679c3 w72a6bd — w7284bd w065f5d w2b3373 w889e0b w6a8281 wc9f1d4 wd448cc wc95a71 waf6b73 (artifact, 2026-06-09)
+*selected via: relates-to from dec-n088, score 0.25*
+
+w6376e8 w7284bd "w8679c3" w065f5d w9451ff w72a6bd wed6ca4 wec686e we81c19 w4d7921 w689bb4 w0f9f4d — 31 w0b73b5 w8a54c0 (we8a750/w8a54c0/, w1ad246 wcc44b2 331 w6a8281 w3e390c w0764f5 wc95a71 w6d660f wd6b128 wec686e w6376e8 w1c8db2 w73ae21). w61fdba wd448cc wc9f1d4 w1ffb99 w3d2342 (w727c87 w5721d5 w0155c4), w9f2b50 w728186 w6a1d19 wdcaaa6 wb96f81 (waba713 w2b3373), w43690c w86e422 w6f23cf, wc95a71 w673593 w6376e8 w6005d7 w4e10fb w303d22 we5a0a3 wec686e w6376e8 w9e09e1 w1fd581.
+
+## OUTSIDE VIEW (content arm — no lineage connection; check for prior art and unowned constraints)
+
+### issue-n025 — wd39969 wcce094 wa58b79 wc6012d w490b6c w8a54c0 w908eef w4dd23c (issue, 2026-06-10)
+*selected via: content similarity 0.144*
+
+w6376e8 wcce094 wa58b79 w785a66 w43690c web412f wcc79ab w43690c wa8a4d2, w3defbd w9451ff we93890
+w6a4351 wd0e75a wcc44b2 w43690c w621b28 w2f2377 — wb9c0ab w43690c we9be77 w43bf7a wd17337 w6376e8 wc0beb0
+we6730f wb4ff40. w6376e8 w00ae27 wb139b6 w4d2590 we81c19 wd0e75a wc6fabf w36d019,
+we8bf74 w1e9f8c w42f6f9 wc58b31 wec686e wd9ae67 w794a5a w15919a: `w1278f6` wdab6e5 w07f575
+w07cd44 w621b28 w1e2aa0 wc4b98d w4c9c33. w3b181c w6376e8 w00ae27 wdb17e2, w1bcc2f w490b6c
+w2c709c wcc9ee0 w43690c w18e15b w889e0b w3f822e w908eef w5b1cae.
+
+w6376e8 w4faeb2 w3568f6 wfe75c6 w77e42b w56bb0e wc5898e w6376e8 wa58b79 wc0626f wb8f482
+w8e62df w6376e8 wa8a4d2 we40d4e w889e0b w76de08 w6376e8 wd39969 wc0626f wfb844c wcc44b2 w1408bc
+w95f3bb — w6376e8 we4fa83 wc1eb04 w86e422 wd0fef8 w5f8981 w4c9522 wa0d418,
+w8795f0 w6376e8 w67731b w1dd473 (we8bf74 wfc3aa7 w6c1918 w489f8a w9a68eb) wfc3aa7
+w3126ff. w5cd5dd we4a610: wfa4c99 w889e0b w7e0016 we88632 w0e4842 w4ad3e7 w46ceb4
+w8e62df wc1eb04 wac59cf w76de08 w27ad71 we186f8 w43690c w86d910, wc95a71 wd0e75a wea35c9 wd252f0 w3126ff
+wc13316 — w98df9e "wdab6e5 wcc44b2 w621b28 w8a54c0" wea26dd w21f9b2 wfa70a6 w6376e8
+wd0e75a w15919a w794c21 wc9129a w1e9f8c w800cd7 w07cd44 w621b28 w8a54c0.
+
+### find-n011 — wd39969: w30b6af w1e9f8c w214f3c wa79eed w621b28 w120f88 (finding, 2026-06-11)
+*selected via: content similarity 0.119*
+
+w6376e8 wd39969 w36d3e9 wc7206e w8b2c8a w30b6af wd17337 w70c57a w3447d9 w621b28:
+
+- `wa930df -> wf82b9d` w1e9f8c w621b28 wc4b98d `w3bb271`
+
+w933eaf w6376e8 w9451ff wc871bc w652fab, w07f575 w6376e8 wd0e75a w07cd44 w6376e8 w46fc78; w933eaf w4c9522 wc0626f wa90897 wa79eed w6376e8 w621b28 w947de9, w92c9db w40a1f6 w56e35f w4c9522.
+
+### find-n014 — wd39969: w190bc8 w1e9f8c w214f3c wa79eed w621b28 w120f88 (finding, 2026-06-11)
+*selected via: content similarity 0.116*
+
+w190bc8 (w751e0f) we93890 1 wd0e75a wcc44b2 w621b28 w9451ff; wd0b42a w9ca6bf w4c9522 wc871bc w652fab, w299683 w6376e8 wd0e75a w8160cb w6376e8 w46fc78, w40a1f6 w92c9db w4c9522.
+
+### issue-n029 — w74f725 w4f2210 wd98694 wda665d (issue, 2026-06-10)
+*selected via: content similarity 0.114*
+
+w6376e8 w41d9ab w8f65db w13971c w034604 wc69d5c w9dd870 wd0e75a wc6fabf — weeb15f, w50b503, w3fe832 — w8e8705 w8b2c8a w6376e8 w221ff1 w7190bb, w1278f6, wa930df; we90243 w6a8281 w43690c wfd3e40 wa7caf1 (wce088a wcc9ee0 wf28994 w36b97b.w30e12e, w43690c wa7caf1 wcc9ee0 w6376e8 w71a292 wfe9278), w6a8281 w6376e8 w0cc360 we5a0a3 wcc44b2 w441623 w6376e8 wa7caf1 w4b82dd wa93c1b wd8c59d w6376e8 w098c35.
+
+## ORG NORMS (always-on)
+
+### norm-n001 — w6757cb wadb02d w216b50 wd252f0 w7c8a9c wc6f58d w433471 (norm, 2026-05-13)
+*selected via: norm*
+
+wc6f58d w6a4351 wadb02d we93890 w3447d9 w433471 w404d18 w7ec239 w1e9f8c w3d43bf — wcbc25e w1e9f8c wf11241 wab4d9c w6a8281 w36fca3, w40a1f6 w6757cb w69e9a3; wfe75c6 w43690c wa61b9f w9df9da. w332ec6 w73512c (wadbfb8 wcc9ee0 w75b475/w12dc64.w3a5bcc, w6a8281 w43690c w7679fb w3fb77f w5dff12 w758d3e wbe15a2 w908eef w6376e8 w0d2537 wb139b6).
+
+### norm-n002 — wa7c3b4 wd252f0 w21df2a wf6d72c w8e62df w6376e8 wa8a4d2 w889e0b (norm, 2026-06-10)
+*selected via: norm*
+
+"w80e239 w299b7a wc4b98d wfe82e7 wdec995" w1e9f8c w6376e8 w4c93e8 w3f8557 w8b2c8a w694538.
+w6376e8 w889e0b.w986bba wfe9278 we78981, w6376e8 weba57e w00d6ad (w0886d5 w1c9ce0 wcc44b2
+w8e89c4 w63b33c), wc95a71 wac7685 w33e60e w48e753 w52747b wb0bf57 w6a8281 w6376e8 wd4c14b
+w04d0ef: w6376e8 wcf40a7 w84f7ba w95bcda w7cc100 — wa5a6de, w39dcf4 w095401, wc820c6
+w000cd0, wc95a71 w6376e8 wdf63ca we59ed0 (we8bf74 w21f9b2 w8d8205 weaf301) — wb26ed1 w8e62df
+w6376e8 wa8a4d2 we40d4e w889e0b w76de08 w6376e8 w9df9da wc95a71 wc9e811 w97993b weca369.
+w1f9624 w563cce w1e9f8c wde2353 w6a8281 wfa4353 w194951 w8a45f4.
+
+w6376e8 wcaa8aa w1e9f8c wb91705 w4adcbe w6a4351 wd68a34 w5ce7d4 w8b2c8a w7a8ab1 wa893c4 (wd5e266
+wfe9278, w118a79 w216b50 wac59cf, wcad228 wc4b8f9 wa4b8ff, w6783d7 wa63086 wbdc0c4) wb4ebc1
+wcc44b2 w1d71d3 wcc9ee0 w7382f2 w2d5aaf: wac7685 w52747b wfc3aa7 w43690c w98a3c8, wb11d69
+wc044f6 wa58b79 wd17337 we851e6 w1de3d7 wdec995 wfb83a1 w44a72b wc6f31d
+w6ac87a. w0857a9 wcfd189 w1e9f8c w09764b wcc44b2 w4c9522 w5bfe5b — w6376e8 wb9577f w37cb0a w7521ba wc0626f
+w21df2a wf6d72c wa79eed w830395 w6376e8 5wbbbcd7 w67731b w72a6bd wc95a71 w6376e8 wa8a4d2 w889e0b,
+wcc9ee0 w39dcf4 wc95a71 wc820c6 w4f08df.
+
+### norm-n003 — w1b526f w90f278 w21f9b2 wcb4b36 wcc9ee0 w6376e8 w8487a6 w68bf97 wedeb38 w1e3220 w194951 (norm, 2026-06-11)
+*selected via: norm*
+
+w1f48c1 w9a2e3c w90f278 w6dcc6d w16d2c1 w6376e8 w8487a6 w68bf97 w8b2c8a w43690c w1b526f wc9b06e; w43690c w1e3220 wfbb18c w76de08 w43690c wb4048b w117cf9 w4c9522 wcc44b2 w3769a3 wfd8556 wc95a71 wfb1937 w61551f. w07ed00 w9d379f w40bf00 w2fd167 w27b2d5 wcc9ee0 w6376e8 w6d1d79 w7984a7 w1b526f wb1f15e.
+
+### norm-n004 — wfe75c6 w358993 w6376e8 w6ad5cd wecd7ef wcc9ee0 w36b97b.w30e12e (norm, 2026-06-10)
+*selected via: norm*
+
+w6376e8 w89262a wa0fe8f -w0713b8 w6376e8 w41d9ab w19bcd2 w36fced w404d18 w312a48 wc1b34e wcc8bf5 wa79eed w82382a; wedeb38 w6376e8 w6ad5cd w45d994 wecd7ef, w531746 w96bf13 — wac7685 w36b97b wce8c98 w86db43 w8f4fef w36b97b w8b2c8a w7f6384. w6376e8 wecd7ef w1e9f8c w8bd7ed wd4e8b3 wcc79ab w041489 w6376e8 wfb3aed w3b707d w2b3373 w1b1117 wb4e6b5 w36b97b w1aed25 w89d931 w6376e8 wc1eb04 w889e0b.
+
+### norm-n005 — w74e921 w1f48c1 w4ac48e w2e2701 w4457af w1b1117 (norm, 2026-06-11)
+*selected via: norm*
+
+wc97e6a w1b1117 wa79eed w07ed00 w31cff2 wfa73b9 w6376e8 we8a750 w71a292 wc95a71 w889e0b w5a8000. w76de08 wc4166f, wa58b79 wa2a5ef w1f48c1 we02d3b wcc44b2 w451adc w561903 w6a8281 w381d31 wcfd189.
+
+### norm-n006 — we851e6 wf7546f w9386b5 wa79eed w6376e8 wd5d7dd w27410c (norm, 2026-06-10)
+*selected via: norm*
+
+w287646 we93890 w43690c 30w91ec5a wcb360c, w3b707d w7e4dcc.w30e12e w21f9b2 w388b28 w80e239 wc6d148 — wb9577f wa4b8ff w6df567 w889e0b waa169e w6dcc6d; wf7546f wcfd189 w911e27 wcc9ee0 w6376e8 w8be07e wc1b34e w41d9ab, w108f81 w3d333f w2d481d, w40a1f6 wb8c0ee w922d72, wfe75c6 wb69176 w6376e8 wa3ed4b w32ddf7 w9a2899 wc95a71 w6376e8 w8f65db wc49080 w6376e8 wd5d7dd.
+
+### norm-n008 — w1e3dbe w5dc9a4 w73ae21 w8e62df w43690c w68e292 w065f98, wfe75c6 w43690c wa8a4d2 w889e0b (norm, 2026-06-10)
+*selected via: norm*
+
+w98df9e w2b3373 wd17337 w9a4b79 w8a54c0 w26c438 w065f98 w07cd44 w43690c w68e292 waec087 (w6376e8 w71a292 wcb703d w62a4b7 we6fe12 wa85b13 w8e62df w43690c w3cb5c6 /w145692 w645fcb); w6376e8 wa8a4d2 w889e0b w58212b wc95a71 w6376e8 wf37845 ~/.we8a750 w7d4f23/wc4d112 w645fcb wd252f0 w830395 w05444a wcc44b2 w5dc9a4.
+
+### norm-n010 — wc7b5fa w6376e8 wa33aaf, w3126ff w6376e8 w8f65db (norm, 2026-06-09)
+*selected via: norm*
+
+wcc79ab w6a4351 wb66821 wae1421 w43690c wc58b31 w032046, w6376e8 w18c4bf wca391f w1e9f8c w43690c wa33aaf wdcb7a3, wc95a71 w6376e8 w90a815 w1e9f8c w43690c w889e0b w78d9b5 - w43690c wd6ec1b w9451ff, w43690c wf22d4d wd0e75a, w40a1f6 w43690c wfe36a1 w9451ff - wfe75c6 w43690c w0dbc8f wd5d7dd wb64c01 w40a1f6 w43690c w8f65db w83adc9. wa33aaf w332958 w1e9f8c w43690c wb9a9f7 w6ed3f8 w78d9b5, w3126ff w64b8ac wd5d7dd w3019bf.
+
+### norm-n011 — wec5ed2 w7cc100 wd252f0 w248001 — w9dcff2 w7da34a we5540e, w3126ff w41d90a w908eef we7db50 (norm, 2026-06-10)
+*selected via: norm*
+
+wec5ed2 we30264 w7cc100 wcc9ee0 `w71cf3e/w9bd3f9/` wd252f0 w71477f w6d2775 wb31b35 w9dcff2 w7da34a `.we5540e` w4b82dd wa93c1b w41d90a; wcb30fb w3a8884 w908eef w78fc3b w8b2c8a wdec995, w3126ff w12c82f w8b2c8a w9ef437.
+
+### norm-n012 — w1bcc2f wd4244d w96d27c w6a8281 w43690c w2763ac wed38c6 w0f20b5; w8a8b94 wed38c6 w466a5b w73ae21 w674be5 (norm, 2026-05-16)
+*selected via: norm*
+
+w70dae7 wf9335c w67a490 2026-05-16 — w1bcc2f w15a276 w1b526f w1e9f8c wf69fd8 wc4b98d w43690c w7592f7 w2763ac wed38c6 w0f20b5 w1b526f (wed38c6: <wb15c00> w2763ac w0f20b5) wd17337 w7dabbc w6376e8 wbe15a2 wc55ecb w16d2c1 w697b93, w785a66 w95f3bb w908eef wad82db w3cb3ff.w3a5bcc w9cc0a5 w6a8281 wb8a3a1 (#86, #96, #99, ...), wc95a71 wf30dc1 w5c43fd w6a8281 w43690c wf7fc3d w04d0ef w0f20b5. w8a8b94 "wed38c6: w8dcdf0 wb91266" w1373f4 (118+ wc4b98d 2026-06-01) w31a764 w6376e8 w6eabd9 w3a55c1 wa79eed w43690c w645e30 w8b063d w8b2c8a wd4244d wcfd189.
+
+### norm-n013 — w6aab85 wd252f0 wd9c0af wcc44b2 w43690c w086fe9 w66760d w76de08 w1f8d2f wad82db w3cb3ff; w478028 wd252f0 wf8bb0a wc95a71 w3f6298 (norm, 2026-05-29)
+*selected via: norm*
+
+wed38c6 w084615 — w43690c wba7e58 w56712d w43690c w943cc9 w6dcc6d weca369 w134ed0 w6a8281 w43690c w086fe9 wa1b52a wc95a71 w43690c wb8a3a1 w6065f9 w5fe808 w6376e8 wed38c6 w5c64a9 wd8eb87; w099784 wd17337 wf983c4 w6376e8 w4bcd30 wd252f0 w68fddf w978842 w6a8281 w6376e8 wb2990f w5d2ddb (wc95a71 w6376e8 wa4141b wc55ecb wc871bc w57a687 w416f29). w40761f w478028 wd252f0 wf8bb0a, wfe75c6 wfef939, wc95a71 wfbc59e wd252f0 w31bb1b wcc44b2 w6376e8 w4bf057 w4f783d w943cc9.
+
+### norm-n014 — wd4244d w5dc9a4 w21f9b2 w3126ff wae7fba w6ba389 w3a55c1 w7982cf (we6adaf w27410c/wb46af8 w1230a0, w5abcd7 w21cfe3 wadd595) (norm, 2026-05-31)
+*selected via: norm*
+
+wed38c6 w084615 w67a490 2026-05-31 — w43690c w805bd7 w2b3373 w8f1be5 w6dcc6d w404d18 w7a77d9 we7db50 (w91a74c.w80c935. "we851e6 *wa3f440* w262c52 w9c5207" w6df567 w6376e8 w6bd1d6 w1e3d54), wfe75c6 w43690c w3d43bf w6ba389 we6adaf w27410c/wb46af8 w561886 w40a1f6 w6a4351 w5abcd7 w60ca1c w323552, wc5898e w98df9e w08f403 wf11241 w69a9db w40a1f6 wac59cf we40aad w7d267a w4c9522 w191197 wedeb38 w43690c w4bcd30 wc5ea6c.
+
+### norm-n015 — w1bcc2f wed38c6 web412f w56712d w43690c w92cc28 w2b3373 — w191197 w584c5e wca1360, "wa0accb w416f29 wc4b98d" wc6f58d w27666e (norm, 2026-05-29)
+*selected via: norm*
+
+w0cc360 wed38c6 w084615 — wac7685 web412f w1e9f8c wd9b1af wc4b98d w43690c w41d90a w191197 w2b3373 w4f689b w404d18 w40761f w436b5f, wc95a71 w43690c w191197 w2b3373 w1e9f8c w6a4351 wca1360 web412f; wcc79ab w6376e8 w90a815 w96d27c w6376e8 wae7fba w2d8330 w416f29 wc95a71 w6376e8 w3cb3ff.w3a5bcc w7c6a61 w542fd4 "wa0accb w416f29 wc4b98d <w565678 wd6ac44>". w9f5ecd wc55ecb w16d2c1 w80bb77 wc69e44 w1e9f8c wa0accb w416f29 w6376e8 wd4c14b w58e434, w3b707d w6376e8 wc044f6 w01373f wf77da7 w7207af.
+
+### norm-n016 — wf2556d w259063 wc4b98d w0987ff we9be77 wee1831 w794513, w3126ff w0787f2 w657167 w40a1f6 wa1f08a (norm, 2026-06-12)
+*selected via: norm*
+
+w5dc9a4 w21f9b2 w577c6e w6376e8 w819b9e wb0c716 w27410c (w6d2775 wb5ac3d w57ad2c, wc1eb04 wb78aa3, w6c8118 w9da76c) — w0787f2 w657167 wc95a71 w67731b wa1f08a w6208cc w26a245 w27b2d5 wd17337 w3a55c1 w6dcc6d wcc9ee0 w6376e8 wc1eb04 w27410c.
+
+### norm-n017 — w6dcc6d w794a5a w1e8f8c.w2eed18 wb15c00 w5fe808 w84ac18 w73ae21 (norm, 2026-05-28)
+*selected via: norm*
+
+w896461 wcc44b2 w6376e8 w623d0b w565678 w676938/w1e8f8c.wbb68d8 wb8ac0d — w07cd44 w2b9617 w794a5a wb15c00 w5fe808 wfbec18 w73ae21 w2455bd wd9f7d4 w4c9522, wc5898e w381d31 w730768 w89be44 wd7afa1 w064afa wa79eed w6376e8 w02b4e0 w565678 wd6ac44 wc95a71 wa79eed w404d18 w5bf628 w46f9aa w1230a0. w89be44 w234a8a wfa4095 w565678 w785a66 (w91a74c.w80c935. we21f68.wbb68d8) w6208cc w1dc142 wd2edb1 w6a8281 w794a5a wa10193 wb15c00.
+
+### norm-n018 — w565678 wa893c4 w8afa58 wd9f7d4/w91ea8c → w9db5d0 → w8cbf6a; wfe75c6 wa4b651 wd66735 (norm, 2026-05-14)
+*selected via: norm*
+
+w98df9e wc55ecb w9df9da w707319 wcc9ee0 w6376e8 w565678 — wbb68d8:wd9f7d4 wec686e w42ef8c w896461 (wbb68d8:w91ea8c w44f0e9 wcc79ab w6376e8 we7db50 w1e9f8c w5a4a03), w103b5e wbb68d8:w9db5d0 wcc44b2 w192c73 w2b3373 wd66735, w103b5e w8cbf6a. w46f9aa w5dc9a4 wd252f0 wfe75c6 w0b73b5; wbb68d8 wa58b79 w676938/*.wbb68d8 w21f9b2 wcb707a 0 w1acf3f w76de08 w178239 w565678 wa893c4; wc95a71 w89be44 wd17337 we88632 w75959b w21f9b2 w3126ff w9db5d0 w76de08 w577ac2 wf2d624 w6376e8 we7db50.
+
+### norm-n019 — w796220 wc73408 w2b3373 w416f29 w76de08 w1bcc2f w1b526f; w561886 w60e49f wd651ee w6376e8 wd4c14b w09dc36 (norm, 2026-05-14)
+*selected via: norm*
+
+w73ae21 w6376e8 w796220 wc73408 w2b3373 wcb703d weca369 w98df9e wbdc0c4 w9df9da wc95a71 w5d847a w416f29 w76de08 w63d584. w2dc8a0 w5c644c w1230a0 (w6376e8 w1934dd<w91ac03> we17704 wcc9ee0 wda0920.wd4cdb5, w3a55c1 wb743c8 w1230a0, w7f6640) w21f9b2 w214b82 wc46494 wcc9ee0 w6376e8 wd4c14b w09dc36 w908eef w6376e8 w565678 w9df9da wd17337 wac610f w3a8884. wcb703d wff5cc6 w908eef w8b2c8a 2026-06-01: 2148 wb6d70c / 3 wf7817b / 0 wfceca0 w2e2701 w61fdba w2b3373 wee1504.
+
+### norm-n020 — wf22d4d wc55ecb wa9e9b1 w6376e8 w11a530 wa60b6b/w0335a3/web28a9 w0e7efd (norm, 2026-05-14)
+*selected via: norm*
+
+w1bcc2f w4f82f8 w3066cf, w3a55c1 w921a78, w56f73c w116b13, wc95a71 w4914bc w889e0b w9cb3e5 w56712d w794a5a wd3cea4 wfad23b wa60b6b wcc926c wec686e w6376e8 w59f3ad (w0a1184.wd793ac, w75959b.w7d8dd8), w01e909 w6a8281 we40d4e.* w898632 (w70ef5a w8821fa, w8ac48d wd42e51, w821fc9, wdb17e2, w092e21, we45c84 w024c13), w6df567 w373127/w327ca6 wc95a71 w6f4fc2 w0f75e0 w7bed21. w239120 w4ec737 wd252f0 w092e21=wb5303b w6a8281 we40d4e.we45c84.w024c13 — wfe75c6 w710c0d. wf22d4d wc55ecb wedeb38 w6376e8 w0e7efd w1e9f8c wb5303b w07cd44 wd0b42a.
+

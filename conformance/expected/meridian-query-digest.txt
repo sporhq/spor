@@ -1,0 +1,11 @@
+Spor graph nodes relevant to this prompt (auto-compiled; node files live in /graph/meridian/nodes; run /spor:brief for a full briefing):
+
+- **kr-api-latency — Export API p95 under 2s at 1M rows** (key-result, meridian, 2026-06-10): Latency target gated on keyset pagination landing.
+- **schema-key-result — key-result — Meridian-defined node type** (schema, meridian, 2026-06-10): Org-defined vocabulary - the key-result type exists only in this fixture's registry, authored by the org itself (a measurable key result under an objective).
+- **task-keyset-pagination — Keyset pagination for the export reader** (task, meridian, 2026-06-10): Replace OFFSET pagination so exports stream at 1M rows; gates the latency KR.
+- **task-export-streaming — Streamed CSV generation** (task, meridian, 2026-06-10): Stream rows to blob storage instead of buffering; blocked on keyset pagination.
+- **person-marco — Marco Diaz** (person, meridian, 2026-06-10): Shipments backend; pagination and streaming.
+- **schema-edge-measures — measures — Meridian-defined edge type** (schema, meridian, 2026-06-10, content match — no lineage, check for prior art): Org-defined edge - key result is measured by this work.
+- **feat-bulk-export — Bulk CSV export** (feature, meridian, 2026-06-10, content match — no lineage, check for prior art): Self-serve bulk export for the shipments dashboard.
+- **team-shipments — Shipments** (team, meridian, 2026-06-10, content match — no lineage, check for prior art): Owns the dashboard and export surfaces.
+- **kr-support-tickets — Export support tickets down 60%** (key-result, meridian, 2026-06-10, content match — no lineage, check for prior art): Ticket volume drop attributable to export templates.

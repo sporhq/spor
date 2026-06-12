@@ -1,0 +1,27 @@
+---
+id: norm-n015
+type: norm
+project: p1
+title: w1bcc2f wed38c6 web412f w56712d w43690c w92cc28 w2b3373 — w191197 w584c5e wca1360, "wa0accb w416f29 wc4b98d" wc6f58d w27666e
+summary: w0cc360 wed38c6 w084615 — wac7685 web412f w1e9f8c wd9b1af wc4b98d w43690c w41d90a w191197 w2b3373 w4f689b w404d18 w40761f w436b5f, wc95a71 w43690c w191197 w2b3373 w1e9f8c w6a4351 wca1360 web412f; wcc79ab w6376e8 w90a815 w96d27c w6376e8 wae7fba w2d8330 w416f29 wc95a71 w6376e8 w3cb3ff.w3a5bcc w7c6a61 w542fd4 "wa0accb w416f29 wc4b98d <w565678 wd6ac44>". w9f5ecd wc55ecb w16d2c1 w80bb77 wc69e44 w1e9f8c wa0accb w416f29 w6376e8 wd4c14b w58e434, w3b707d w6376e8 wc044f6 w01373f wf77da7 w7207af.
+status: active
+date: 2026-05-29
+edges:
+  - {type: relates-to, to: art-n034}
+---
+
+w6376e8 w758d3e wff17af wa79eed w491af9 w1bcc2f w3cb3ff.w3a5bcc w7c6a61: "w57a687 w191197 wc4b98d
+wed38c6/w966363/w451bc6.w565678.w903894", "13 w416f29 + 1 w191197 w92cc28
+#86", "wa0accb w416f29 wc4b98d wed38c6/wb73392/w1184fd.w565678.w903894". w6376e8
+w0be7dc wadbfb8: w43690c w191197 w2b3373 w1e9f8c w3e2810 w191197 w908eef w43690c w053b83 w0e8052 we65900
+w27666e (#95 wc0626f w9a68eb "w3e2810 w191197 ... we96743 w6a8281 w6376e8 wf41c36 'w191197
+w2b3373 = wca1360 w5f48a7 w084615"), wc95a71 w2df532 w43690c w978842 w56e35f wae1421 w43690c
+w416f29 wae7fba w01fb43 w6376e8 wa4141b wc55ecb (#84).
+
+w64ff72 wd252f0 w4f1a75 w5646fa: w43690c w2763ac wed38c6/ w2b3373 w8e62df w6376e8
+wa8a4d2 wf6a72f w6df567 w6a4351 w95615d wc73408 w2b3373 (w91a74c.w80c935. #85'w91ec5a
+we5ead9 w40f133 wcf3e33.w565678.w903894),
+wee9c30 wd77def w6376e8 w2763ac w45d994 w72ca4d w88bf92 (#94'w91ec5a w3051ff
+w921e72). w8a8b94 w466a5b w103b5e w0c311b w1bcc2f wae7fba w708346, we8bf74 w1e9f8c wa81cef w4dd23c
+w90a815 w04bc7c we186f8 w6eb49c (#86'w91ec5a "we65900 we90243" w28af8e wcc9ee0 w8dcdf0 117,
+#103'w91ec5a wa41871).

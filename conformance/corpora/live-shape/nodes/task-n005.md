@@ -1,0 +1,38 @@
+---
+id: task-n005
+type: task
+project: p2
+title: w9b60c8 w1f48c1 w3ba485 wcc44b2 w889e0b w8a54c0 — w3ba485 w654976, w9b7b39 wf79b49, wdd07ff w3d333f
+summary: w04a257 wacd35b w1b526f w33f60c wa79eed w751e0f/w2c709c/w40761f w8a54c0 w7da34a w43690c w3ba485 wb96b93 w654976, w64ef9e w9b7b39→w9451ff wa79eed w6376e8 w71a292 w6a8281 w43690c wf79b49 w921a78, wc95a71 w3d333f w07cd44 w1b526f w233823 wc4b98d w65a138 w6376e8 w125f9a wcc8bf5 wcc44b2 w464646 w3b707d w43690c w1f48c1 w1b526f w66e528 w43690c "we8a750: <wfb07e9>" wb4048b w5f6591 w404d18 w9b7b39 w8160cb wd17337 w9451ff. wb4048b w925c58 w1b526f→w9451ff wcc9ee0 w1f48c1 w7f6384; w6376e8 w654976 w925c58 w9451ff→w1b526f wcc9ee0 w56708c.
+date: 2026-06-11
+commits: [r2@184677c8f303a76718f7d0b2dfd715901d6dc2e4, r2@b4b8ce23308f3af4601ff6f22c7812d966770959]
+status: done
+author: person1
+authored_via: mcp
+edges:
+  - {type: relates-to, to: art-n010}
+---
+
+w1b1117 w908f5e w7614b4 w1f48c1 we02d3b wcc44b2 w1f34ec wd047e9 wbdc0c4 w9c5207; w6376e8
+wad475a w1b526f → w751e0f → w2c709c w1e9f8c w6dcc6d wdfa65a w07cd44 w1b526f w233823 wc95a71 w01191d w214b82
+w5d2ddb w103b5e, w3126ff wd4191a. w7b77b6.w3a5bcc wa89aaf w418914 w6376e8 w9b60c8
+we05325: w6376e8 w0f5bc8 w569bab() wdb17e2 ("w800dc5 wa9e9b1 w43690c wbf4a69 wd0e75a w40a1f6 w43690c
+w67ad2d w1b526f") wc95a71 w6376e8 w2768cb wd39969 wa58b79 "w800dc5 wc69d5c wbcf75c
+(w87f1bb wb621a1 wf7798d w8b2c8a w871c81 wf4d5e4)" — w830395 wedfc23 wc6f58d
+w3ba485 wd252f0 w67ad2d.
+
+w7ec239: w3ba485 wd252f0 w3126ff w8a54c0 (w43690c w413d37 wd4f764 w1f48c1 web28a9 wc95a71 wf371b9
+w6376e8 wf03ddb w889e0b). w8e8705 w43690c `w3ba485: [w58212b@w9b7b39, ...]` w535fcc w598991 wa79eed
+w2bdc00 w8a54c0 — w5c2e24 w3c8df6 wc5898e w6376e8 wb96b93 w8c468d w1e9f8c w43690c w086741
+wfc4e55 w43bb39; wacd35b wc5898e w6376e8 w889e0b w8b0fc3 wc97e6a wb93d00. w71a292
+w354b78 w43690c w9b7b39→w9451ff w64ef9e wc95a71 w87c261 w43690c wf79b49 (wc280e9 w43690c wfbb18c, we186f8 w6376e8 wd047e9).
+w43690c `wee1a74 /w1e19c0/w8a54c0/:w8821fa/w3ba485` wd00db6 wd4f764 w99f68b w3b707d w6376e8
+wcc8bf5 w6208cc wa6b02a wedeb38 w43690c w8e3e1b w848162 w3fbc92. w3d333f: w58955b w26acf0
+wfb8938 w464646; w125f9a w4e5266 w1f48c1 w1b526f, w50bdd9 w6376e8 wb4048b, w5f6591 w6376e8
+w9451ff w933eaf wcc926c, w7f0c40 w6376e8 w1b526f w1eedcc w58e434 wec686e wb3e582 wb1f15e.
+
+w47d5b9 wc3f95c: w6dcc6d w3ba485 w4adcbe w6a8281 w43690c w9451ff wcc9ee0 w7c3546 (w40a1f6 wb4048b
+w180bbf wc4b98d w908c82) we186f8 w67ad2d — w3a2b33 w0f5f85
+w0c8477. w2768cb we00e8d: w5e4c7f w8b2c8a wa2a5ef
+we02d3b, w6376e8 wd39969 "w800dc5 wc69d5c wbcf75c" wa58b79, w9755d9 w569bab w481c2b
+wd49379 w67ad2d w3ba485.

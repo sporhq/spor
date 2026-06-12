@@ -1,0 +1,4 @@
+{ "id": "pricing-root-digest", "kind": "compile", "corpus": "pricing",
+  "input": { "rootId": "task-pricing-rollout", "digest": true },
+  "expected": "pricing-root-digest.txt",
+  "covers": "digest mode, pinned-by tag, standing global correction footer" }

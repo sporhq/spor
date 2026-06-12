@@ -1,0 +1,26 @@
+{
+  "errors": [
+    "bad-missing.md: missing title",
+    "bad-missing.md: missing summary",
+    "bad-noframe.md: no frontmatter",
+    "bad-wrongid.md: id 'something-else' != filename",
+    "corr-notarget.md: correction without target",
+    "dup-z.md: id 'dup-a' != filename",
+    "dup-z.md: duplicate id 'dup-a' (also in dup-a.md)",
+    "bad-schema.md: schema_version 'not-calver' is not CalVer YYYY.MM.DD.MICRO",
+    "bad-schema.md: no fenced ```json payload block in body"
+  ],
+  "warnings": [
+    "warn-unknown.md: unknown type 'flurble'",
+    "warn-unknown.md: missing date",
+    "warn-unknown.md: unknown edge type 'defenestrates'",
+    "warn-unknown.md: dangling edge relates-to -> ghost-node"
+  ],
+  "byType": {
+    "task": 3,
+    "schema": 1,
+    "correction": 1,
+    "flurble": 1
+  },
+  "count": 6
+}

@@ -1,0 +1,4 @@
+{ "id": "live-shape-root-digest", "kind": "compile", "corpus": "live-shape",
+  "input": { "rootId": "task-n007", "digest": true },
+  "expected": "live-shape-root-digest.txt",
+  "covers": "digest at live-graph scale (343 scrubbed nodes)" }

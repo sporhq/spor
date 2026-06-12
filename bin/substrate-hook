@@ -1,0 +1,6 @@
+#!/bin/sh
+# substrate-hook — back-compat stub for the Spor rename (SPLIT.md): hooks
+# configs and adapter manifests written before the rename exec this path.
+# Forwards to spor-hook.js; remove after the dual-read window closes.
+command -v node >/dev/null 2>&1 || exit 0
+exec node "$(dirname "$0")/spor-hook.js" "$@"

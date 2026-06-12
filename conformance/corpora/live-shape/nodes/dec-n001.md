@@ -1,0 +1,24 @@
+---
+id: dec-n001
+type: decision
+project: p1
+title: w17ad58 wcf2156 w7da34a w6376e8 wa6ce01 wc1e188 w3f3857 w966363
+summary: w6376e8 wa6af0f w5e9770 w84b87b w3ab595 — w6376e8 wb93acc w2768cb wa13723 we7db50 w5a7b64 wc4b98d w43690c w7592f7 wc78a9f.w84b87b w89d81a wfb6cd1 w6376e8 wa6ce01 wc1e188 w3f3857 w966363 wa8a4d2, w6a8281 w2d62fa wc95a71 w43690c wd26158 w1dd473 wec686e weac4a4 wc0a6f1 — w8d89b2 w1bcc2f wad5376 w156427 wc0626f w6a4351 wa6ce01 w031492 w19f83e w8b2c8a wa0b8b8 w57617b w0fe7e7.
+status: superseded
+date: 2026-05-18
+edges:
+  - {type: derived-from, to: spec-n011}
+  - {type: relates-to, to: art-n002}
+---
+
+w6376e8 wd047e9 w07cd44 w6376e8 w233823: w6376e8 wad5376 wc0626f wf68f7e (w7efcf3 6 w577ac2,
+2026-05-15) wc95a71 w1bcc2f w156427 wbb85a5 w89d931 wee0577 wb81e90, wad8244 w26524a, w3e3b8b,
+w66b959, wc95a71 w74abf1 — wac7685 w6a8281 w43690c wc1e188 w67afe6, w3b707d w43690c w02b4e0 w613d42
+w84b87b w966363 we705d0 w6376e8 w6eabd9 w72912c. w1327ca wdb2188 we52c9d wc1e188 /
+wf6915f; w579a18 wc0626f w455f9c wec686e w67afe6 wf79b49.
+
+w621b28 2026-06-02 wc4b98d w6376e8 w8dfaf6 wad5376: wa13723
+wc0626f w17e48a wcc44b2 w6376e8 w5cce16 w17ad58(w156427, w579a18?, w673400) we7db50 wc95a71 w6376e8
+wa6ce01 wc1e188 w1d5432 w5282c5 w322d20 w794a5a w1d5432 wfb5a74 w4c9522. w6376e8 w84b87b w89d81a w7f6384
+w9ecfb7 w908eef wd17337 w0408fd wb139b6. wbe15a2 2026-05-18 (wce961d wa8a4d2 w1d5432,
+w12a721 w954741 w1d5432).

@@ -1,0 +1,6 @@
+{ "id": "queue-default", "kind": "queue", "corpus": "queue",
+  "input": { "now": "2026-06-12T00:00:00Z",
+             "activity": { "task-front": 3, "task-unblocker": 1 },
+             "front": { "task-front": 40 } },
+  "expected": "queue-default.json",
+  "covers": "default blend: priority bump, blocking boost, blocked-by cap, front log2 cap, heat, staleness close, resolves retirement, capture-pending, findings ride-along" }

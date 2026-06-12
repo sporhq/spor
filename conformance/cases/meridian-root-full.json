@@ -1,0 +1,4 @@
+{ "id": "meridian-root-full", "kind": "compile", "corpus": "meridian",
+  "input": { "rootId": "obj-q3-reliability" },
+  "expected": "meridian-root-full.txt",
+  "covers": "org-defined vocabulary: graph-resident schemas drive traversal weights" }

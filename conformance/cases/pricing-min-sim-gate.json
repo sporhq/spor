@@ -1,0 +1,4 @@
+{ "id": "pricing-min-sim-gate", "kind": "compile", "corpus": "pricing",
+  "input": { "query": "vendor neutral price book pricing", "digest": true, "minSim": 0.99 },
+  "expected": "pricing-min-sim-gate.txt",
+  "covers": "minSim override gates out an otherwise-relevant query" }

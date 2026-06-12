@@ -1,0 +1,4 @@
+{ "id": "pricing-query-digest", "kind": "compile", "corpus": "pricing",
+  "input": { "query": "vendor neutral price book pricing", "digest": true },
+  "expected": "pricing-query-digest.txt",
+  "covers": "query mode seeds, content-arm tags, supersession warning in digest" }

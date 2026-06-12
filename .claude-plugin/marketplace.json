@@ -1,0 +1,14 @@
+{
+  "name": "spor",
+  "owner": {
+    "name": "Anthony Allen"
+  },
+  "description": "Spor context compiler — knowledge-graph briefings, capture, and decision queue for Claude Code",
+  "plugins": [
+    {
+      "name": "spor",
+      "source": "./",
+      "description": "Maintains a typed knowledge graph and compiles lineage-aware context briefings: session-start injection, per-prompt digests, capture at discovery, end-of-session distillation, decision queue"
+    }
+  ]
+}

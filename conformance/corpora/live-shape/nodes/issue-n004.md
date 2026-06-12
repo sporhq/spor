@@ -1,0 +1,26 @@
+---
+id: issue-n004
+type: issue
+project: p1
+title: w16d04b w2e510a w79a2e6 — wd9c0af, w68fddf w978842 (w520053 w78d9b5)
+summary: wba7e58 wd17337 w6376e8 /w51887b?w6e9891=w16d04b we4fae1 w391254 wda2ca5 w43690c wfceca0 w38f03d w8926cd wc0626f wd9c0af wc95a71 w68fddf w978842 wa79eed 2026-05-29 — w43690c w086fe9 wc9023f.w262c52 w66760d wd17f38 w6376e8 wb73392 w737ad3 we30264 w6a4351 wec17d3 400 w0aa838 weca369 w6376e8 w68aeb8; w6376e8 wa6af0f "we851e6 w0aa838" wf07ac2 wc0626f w43690c w87b615 w4a83a2 w76de08 w6376e8 w0aa838 w59163b. w6376e8 wa4141b wc55ecb wc0626f wc871bc wa0accb w416f29 wc4b98d wed38c6/wb73392/w1184fd.w565678.w903894.
+status: resolved
+date: 2026-05-29
+edges:
+  - {type: relates-to, to: spec-n002}
+---
+
+w943cc9 #84 wc0626f wfea49b w16d2c1 w6376e8 w7c71f7 wb8bcfb w0f20b5 (2026-05-29) wa79eed w43690c
+wba7e58 w8e62df `w38f03d` (`w676938/w1e8f8c.wbb68d8` w76ab16):
+w43690c wa8a4d2 w3b7cf5 wfc3aa7 web268d 400w91ec5a (w424953 w09764b w21b3e0 `w5cd45e:[999]`
+w3e2810 wcc6b6e w16d2c1 wdcaaa6 wed38c6 w466a5b) w6a8281 we851e6 wb3fa74 w21a3ce. wd70bf0 w1bcc2f/w3e2043 w8b2c8a
+w6376e8 w2e510a w63fa94 wcc44b2 400 w7da34a `wc9023f.w262c52` w886045 w6376e8 wec17d3 w0aa838 "400 w2ec488
+w842071 <wc5b035>" w6462cb w44659e weca369 w6376e8 w68aeb8 wecfa65 — w43690c
+w520053 w78d9b5, we851e6 w421ac2 wc5ea6c.
+
+w5cd5dd wd1def6 w26c438 w4adcbe w4c9522 w10c6c0: w6376e8 w943cc9 wc0626f wd9c0af wcc44b2 w43690c
+w086fe9 w66760d *w76de08* wc0f665 w57a684 w908eef w6a4351 w40761f, wc95a71 w2df532 w6376e8
+w978842 w56e35f web268d w43690c w416f29 w92cc28 w2b3373 w3b707d w43690c we8a95b wc044f6 wd17337
+w84b335 w6376e8 w0aa838 wb95c37 w4c9522. w43690c wd4ee00 wb48f3c (w6376e8 w2e510a w63fa94 w1bcc2f w16d04b wbcf629,
+26 w63fa94 wec686e 26 w424953 — w30174c wc95a71 w5d79bf, w3b707d wa4141b) wc0626f
+w5d2ddb wcc9ee0 `wed38c6/w2ae65f.w3a5bcc` w4b82dd wa93c1b w908eef w6a4351 w40761f.

@@ -1,0 +1,554 @@
+// bin/spor-hook — host-agnostic dispatcher over the scripts/ engines.
+// Everything runs against a throwaway graph home in local mode; the
+// distiller backend is stubbed via the DISTILL_CMD env. Most tests drive the
+// legacy SUBSTRATE_* env spelling on purpose — the dual-read window
+// (SPLIT.md) must keep it working; the SPOR_* arm and the substrate-hook
+// stub get their own tests.
+const test = require('node:test');
+const assert = require('node:assert');
+const { spawnSync } = require('node:child_process');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const BIN = path.join(__dirname, '..', 'bin', 'spor-hook');
+const LEGACY_BIN = path.join(__dirname, '..', 'bin', 'substrate-hook');
+
+function freshEnv(home) {
+  const env = { ...process.env, SUBSTRATE_HOME: home };
+  for (const k of Object.keys(env)) {
+    if (k.startsWith('SUBSTRATE_') && k !== 'SUBSTRATE_HOME') delete env[k];
+    if (k.startsWith('SPOR_')) delete env[k];
+  }
+  return env;
+}
+
+// One scratch area per test: SUBSTRATE_HOME with a nodes/ dir, plus a fake
+// project cwd named projx (not a git repo, so the slug is its basename).
+function scratch() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'substrate-hookcli-'));
+  const home = path.join(root, 'graph');
+  fs.mkdirSync(path.join(home, 'nodes'), { recursive: true });
+  const cwd = path.join(root, 'projx');
+  fs.mkdirSync(cwd);
+  return { root, home, cwd };
+}
+
+function run(args, input, env) {
+  const r = spawnSync('bash', [BIN, ...args], { input, env, encoding: 'utf8' });
+  assert.strictEqual(r.status, 0, `exit 0 expected (fail-open): ${r.stderr}`);
+  return r.stdout;
+}
+
+const BRIEF = `---
+id: brief-projx
+type: briefing
+project: projx
+title: Standing briefing for projx
+summary: Test briefing.
+version: 3
+---
+
+The projx standing briefing body.
+`;
+
+test('session-start: local briefing in claude-code envelope', () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
+  const out = run(
+    ['session-start', '--host', 'claude-code'],
+    JSON.stringify({ cwd, hook_event_name: 'SessionStart' }),
+    freshEnv(home)
+  );
+  const json = JSON.parse(out);
+  assert.strictEqual(json.hookSpecificOutput.hookEventName, 'SessionStart');
+  assert.match(json.hookSpecificOutput.additionalContext, /brief-projx v3/);
+  assert.match(json.hookSpecificOutput.additionalContext, /projx standing briefing body/);
+});
+
+test('envelope echoes the host event name from the payload (gemini BeforeAgent)', () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
+  const out = run(
+    ['session-start', '--host', 'gemini'],
+    JSON.stringify({ cwd, hook_event_name: 'BeforeAgent' }),
+    freshEnv(home)
+  );
+  const json = JSON.parse(out);
+  assert.strictEqual(json.hookSpecificOutput.hookEventName, 'BeforeAgent');
+});
+
+test('prompt-context: trivial prompts inject nothing', () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
+  const out = run(
+    ['prompt-context', '--host', 'codex'],
+    JSON.stringify({ cwd, prompt: 'thanks', hook_event_name: 'UserPromptSubmit' }),
+    freshEnv(home)
+  );
+  assert.strictEqual(out, '');
+});
+
+test('post-tool: journals the touched file under the session id', () => {
+  const { home, cwd } = scratch();
+  run(
+    ['post-tool', '--host', 'claude-code'],
+    JSON.stringify({
+      cwd, session_id: 'sess-a', tool_name: 'Write',
+      tool_input: { file_path: '/x/y.js' }, hook_event_name: 'PostToolUse',
+    }),
+    freshEnv(home)
+  );
+  const line = JSON.parse(fs.readFileSync(path.join(home, 'journal', 'sess-a.jsonl'), 'utf8').trim());
+  assert.strictEqual(line.file, '/x/y.js');
+  assert.strictEqual(line.project, 'projx');
+  assert.strictEqual(line.tool, 'Write');
+});
+
+test('post-tool: codex tool_input.path is normalized to file_path', () => {
+  const { home, cwd } = scratch();
+  run(
+    ['post-tool', '--host', 'codex'],
+    JSON.stringify({
+      cwd, session_id: 'sess-b', tool_name: 'apply_patch',
+      tool_input: { path: '/x/z.js' }, hook_event_name: 'PostToolUse',
+    }),
+    freshEnv(home)
+  );
+  const line = JSON.parse(fs.readFileSync(path.join(home, 'journal', 'sess-b.jsonl'), 'utf8').trim());
+  assert.strictEqual(line.file, '/x/z.js');
+});
+
+test('post-tool: tool calls without a file path are skipped, not journaled', () => {
+  const { home, cwd } = scratch();
+  run(
+    ['post-tool', '--host', 'codex'],
+    JSON.stringify({
+      cwd, session_id: 'sess-c', tool_name: 'shell',
+      tool_input: { command: 'ls' }, hook_event_name: 'PostToolUse',
+    }),
+    freshEnv(home)
+  );
+  assert.ok(!fs.existsSync(path.join(home, 'journal', 'sess-c.jsonl')));
+});
+
+const STUB_RESPONSE = `===NODE dec-test-hookcli.md===
+---
+id: dec-test-hookcli
+type: decision
+project: projx
+title: Test decision
+summary: A decision emitted by the stubbed distiller backend.
+date: 2026-06-11
+---
+
+Body of the stub decision.
+===END===
+`;
+
+function makeStub(root) {
+  const stub = path.join(root, 'stub-distill.sh');
+  const resp = path.join(root, 'stub-response.txt');
+  fs.writeFileSync(resp, STUB_RESPONSE);
+  fs.writeFileSync(stub, `#!/bin/sh\ncat > /dev/null\ncat "${resp}"\n`);
+  fs.chmodSync(stub, 0o755);
+  return stub;
+}
+
+function words(n, w) {
+  return Array.from({ length: n }, (_, i) => `${w}${i}`).join(' ');
+}
+
+test('distill: SUBSTRATE_DISTILL_CMD replaces the claude backend (claude transcript)', () => {
+  const { root, home, cwd } = scratch();
+  const transcript = path.join(root, 'transcript.jsonl');
+  fs.writeFileSync(transcript, [
+    JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: words(60, 'alpha') }] } }),
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: words(60, 'beta') }] } }),
+  ].join('\n') + '\n');
+  const env = freshEnv(home);
+  env.SUBSTRATE_DISTILL_CMD = makeStub(root);
+  run(
+    ['distill', '--host', 'claude-code'],
+    JSON.stringify({ cwd, session_id: 'sess-d', transcript_path: transcript, hook_event_name: 'SessionEnd' }),
+    env
+  );
+  const node = fs.readFileSync(path.join(home, 'nodes', 'dec-test-hookcli.md'), 'utf8');
+  assert.match(node, /id: dec-test-hookcli/);
+  const llmDir = path.join(home, 'journal', 'llm-calls');
+  const rec = JSON.parse(fs.readFileSync(path.join(llmDir, fs.readdirSync(llmDir)[0]), 'utf8').trim());
+  assert.ok(rec.backend.startsWith('cmd:'), `backend records the cmd: ${rec.backend}`);
+  assert.ok(rec.response.includes('dec-test-hookcli'));
+});
+
+test('distill: non-claude transcript shapes fall back to generic .text extraction', () => {
+  const { root, home, cwd } = scratch();
+  const transcript = path.join(root, 'rollout.json');
+  fs.writeFileSync(transcript, JSON.stringify({
+    history: [{ entry: { text: words(50, 'gamma') } }, { entry: { text: words(50, 'delta') } }],
+  }));
+  const env = freshEnv(home);
+  env.SUBSTRATE_DISTILL_CMD = makeStub(root);
+  run(
+    ['distill', '--host', 'codex'],
+    JSON.stringify({ cwd, session_id: 'sess-e', transcript_path: transcript, hook_event_name: 'Stop' }),
+    env
+  );
+  assert.ok(fs.existsSync(path.join(home, 'nodes', 'dec-test-hookcli.md')));
+  const llmDir = path.join(home, 'journal', 'llm-calls');
+  const rec = JSON.parse(fs.readFileSync(path.join(llmDir, fs.readdirSync(llmDir)[0]), 'utf8').trim());
+  assert.match(rec.vars.CONVO, /gamma1/);
+});
+
+test('cursor session-start: payload mapped, output is flat {additional_context}', () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
+  const out = run(
+    ['session-start', '--host', 'cursor'],
+    JSON.stringify({ conversation_id: 'conv-1', workspace_roots: [cwd], hook_event_name: 'sessionStart' }),
+    freshEnv(home)
+  );
+  const json = JSON.parse(out);
+  assert.strictEqual(json.hookSpecificOutput, undefined, 'no claude envelope for cursor');
+  assert.match(json.additional_context, /projx standing briefing body/);
+});
+
+test('cursor afterFileEdit: file_path synthesized into tool_input, keyed by conversation_id', () => {
+  const { home, cwd } = scratch();
+  run(
+    ['post-tool', '--host', 'cursor'],
+    JSON.stringify({ conversation_id: 'conv-2', workspace_roots: [cwd], file_path: '/x/c.ts', hook_event_name: 'afterFileEdit' }),
+    freshEnv(home)
+  );
+  const line = JSON.parse(fs.readFileSync(path.join(home, 'journal', 'conv-2.jsonl'), 'utf8').trim());
+  assert.strictEqual(line.file, '/x/c.ts');
+  assert.strictEqual(line.tool, 'edit');
+});
+
+test('copilot postToolUse: camelCase payload and toolArgs.path normalized', () => {
+  const { home, cwd } = scratch();
+  run(
+    ['post-tool', '--host', 'copilot'],
+    JSON.stringify({ sessionId: 'sess-g', cwd, toolName: 'write', toolArgs: { path: '/x/d.js' }, hook_event_name: 'postToolUse' }),
+    freshEnv(home)
+  );
+  const line = JSON.parse(fs.readFileSync(path.join(home, 'journal', 'sess-g.jsonl'), 'utf8').trim());
+  assert.strictEqual(line.file, '/x/d.js');
+  assert.strictEqual(line.tool, 'write');
+});
+
+test('copilot distill: transcriptPath mapped to transcript_path', () => {
+  const { root, home, cwd } = scratch();
+  const transcript = path.join(root, 'transcript.jsonl');
+  fs.writeFileSync(transcript, [
+    JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: words(60, 'iota') }] } }),
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: words(60, 'kappa') }] } }),
+  ].join('\n') + '\n');
+  const env = freshEnv(home);
+  env.SUBSTRATE_DISTILL_CMD = makeStub(root);
+  run(
+    ['distill', '--host', 'copilot'],
+    JSON.stringify({ sessionId: 'sess-h', cwd, transcriptPath: transcript, hook_event_name: 'agentStop' }),
+    env
+  );
+  assert.ok(fs.existsSync(path.join(home, 'nodes', 'dec-test-hookcli.md')));
+});
+
+test('agents-md as a hook: cwd read from the stdin payload', () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
+  const out = run(['agents-md'], JSON.stringify({ cwd, hook_event_name: 'sessionStart' }), freshEnv(home));
+  assert.strictEqual(out, '', 'hook stdout stays clean');
+  const md = fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf8');
+  assert.match(md, /projx standing briefing body/);
+});
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+test('distill --debounce: spools, returns immediately, distills after quiesce', async () => {
+  const { root, home, cwd } = scratch();
+  const transcript = path.join(root, 'transcript.jsonl');
+  fs.writeFileSync(transcript, [
+    JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: words(60, 'epsilon') }] } }),
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: words(60, 'zeta') }] } }),
+  ].join('\n') + '\n');
+  const env = freshEnv(home);
+  env.SUBSTRATE_DISTILL_CMD = makeStub(root);
+  const t0 = Date.now();
+  run(
+    ['distill', '--host', 'codex', '--debounce', '1'],
+    JSON.stringify({ cwd, session_id: 'sess-f', transcript_path: transcript, hook_event_name: 'Stop' }),
+    env
+  );
+  assert.ok(Date.now() - t0 < 5000, 'hook returns without waiting for the distill');
+  const pending = path.join(home, 'journal', 'pending-distill', 'sess-f.json');
+  assert.ok(fs.existsSync(pending), 'payload spooled');
+  const node = path.join(home, 'nodes', 'dec-test-hookcli.md');
+  for (let i = 0; i < 40 && !fs.existsSync(node); i++) await sleep(250);
+  assert.ok(fs.existsSync(node), 'watcher ran the distill after quiesce');
+  for (let i = 0; i < 20 && fs.existsSync(pending); i++) await sleep(250);
+  assert.ok(!fs.existsSync(pending), 'spooled payload cleaned up');
+  assert.ok(!fs.existsSync(`${pending.slice(0, -5)}.lock`), 'watcher lock released');
+});
+
+test('agents-md: creates and idempotently refreshes the managed section', () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
+  fs.writeFileSync(path.join(cwd, 'AGENTS.md'), '# projx\n\nExisting content.\n');
+  const env = freshEnv(home);
+  run(['agents-md', '--cwd', cwd], '', env);
+  let md = fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf8');
+  assert.match(md, /Existing content/);
+  assert.match(md, /<!-- spor:begin -->/);
+  assert.match(md, /projx standing briefing body/);
+  run(['agents-md', '--cwd', cwd], '', env);
+  md = fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf8');
+  assert.strictEqual(md.match(/<!-- spor:begin -->/g).length, 1, 'refresh replaces, not appends');
+});
+
+test('agents-md: a pre-rename substrate-marker block is replaced, not duplicated', () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
+  fs.writeFileSync(
+    path.join(cwd, 'AGENTS.md'),
+    '# projx\n\n<!-- substrate:begin -->\nold managed block\n<!-- substrate:end -->\nTrailing content.\n'
+  );
+  run(['agents-md', '--cwd', cwd], '', freshEnv(home));
+  const md = fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf8');
+  assert.match(md, /<!-- spor:begin -->/);
+  assert.doesNotMatch(md, /old managed block/);
+  assert.doesNotMatch(md, /<!-- substrate:begin -->/);
+  assert.match(md, /Trailing content/);
+});
+
+// ---------------- post-tool commit linking (task-cc-commit-linking) ----------------
+
+// Make cwd a git repo with one commit. trailers: array of node ids for the
+// trailer (key `trailerKey`, default the current `Spor:`; pass `Substrate`
+// to exercise the legacy back-compat read); ageSeconds backdates the
+// committer date (the hook's freshness guard reads %ct).
+function gitCommit(cwd, { trailers = [], ageSeconds = 0, message = 'work', trailerKey = 'Spor' } = {}) {
+  const g = (args, env = {}) => {
+    const r = spawnSync('git', ['-C', cwd, ...args], {
+      encoding: 'utf8',
+      env: {
+        ...process.env, GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@example.com',
+        GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@example.com', ...env,
+      },
+    });
+    assert.strictEqual(r.status, 0, r.stderr);
+    return r.stdout;
+  };
+  g(['init', '-q']);
+  fs.writeFileSync(path.join(cwd, 'f.txt'), String(Math.random()));
+  g(['add', 'f.txt']);
+  const msg = message + (trailers.length ? '\n\n' + trailers.map((t) => `${trailerKey}: ${t}`).join('\n') : '');
+  const date = new Date(Date.now() - ageSeconds * 1000).toISOString();
+  g(['commit', '-q', '-m', msg], { GIT_COMMITTER_DATE: date, GIT_AUTHOR_DATE: date });
+  return g(['rev-parse', 'HEAD']).trim();
+}
+
+test('post-tool: a fresh git commit is journaled with its sha and trailer nodes', () => {
+  const { home, cwd } = scratch();
+  const sha = gitCommit(cwd, { trailers: ['task-cl-one', 'task-cl-two'] });
+  run(
+    ['post-tool', '--host', 'claude-code'],
+    JSON.stringify({
+      cwd, session_id: 'sess-g', tool_name: 'Bash',
+      tool_input: { command: 'git commit -m work' }, hook_event_name: 'PostToolUse',
+    }),
+    freshEnv(home)
+  );
+  const line = JSON.parse(fs.readFileSync(path.join(home, 'journal', 'sess-g.jsonl'), 'utf8').trim());
+  assert.strictEqual(line.tool, 'git-commit');
+  assert.strictEqual(line.sha, sha);
+  assert.strictEqual(line.project, 'projx');
+  assert.deepStrictEqual(line.nodes, ['task-cl-one', 'task-cl-two']);
+});
+
+test('post-tool: a stale HEAD (failed or old commit) is not journaled', () => {
+  const { home, cwd } = scratch();
+  gitCommit(cwd, { ageSeconds: 300 });
+  run(
+    ['post-tool', '--host', 'claude-code'],
+    JSON.stringify({
+      cwd, session_id: 'sess-h', tool_name: 'Bash',
+      tool_input: { command: 'git commit -m nope' }, hook_event_name: 'PostToolUse',
+    }),
+    freshEnv(home)
+  );
+  assert.ok(!fs.existsSync(path.join(home, 'journal', 'sess-h.jsonl')));
+});
+
+test('post-tool: non-commit commands are ignored even in a fresh repo', () => {
+  const { home, cwd } = scratch();
+  gitCommit(cwd);
+  run(
+    ['post-tool', '--host', 'claude-code'],
+    JSON.stringify({
+      cwd, session_id: 'sess-i', tool_name: 'Bash',
+      tool_input: { command: 'ls -la' }, hook_event_name: 'PostToolUse',
+    }),
+    freshEnv(home)
+  );
+  assert.ok(!fs.existsSync(path.join(home, 'journal', 'sess-i.jsonl')));
+});
+
+// Stub substrate server: records every request, answers everything 200 with
+// a body shaped well enough for both the briefing fetch and the stamp.
+function stubServer() {
+  const http = require('node:http');
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      hits.push({ method: req.method, url: req.url, auth: req.headers.authorization, body });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ status: 'updated', found: false, graph_status: { node_count: 0 } }));
+    });
+  });
+  return new Promise((resolve) => srv.listen(0, '127.0.0.1', () =>
+    resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
+}
+
+// async spawn — spawnSync would block the event loop and starve the stub
+// server while the hook's curl waits on it.
+function runAsync(args, input, env) {
+  const { spawn } = require('node:child_process');
+  return new Promise((resolve, reject) => {
+    const c = spawn('bash', [BIN, ...args], { env, stdio: ['pipe', 'ignore', 'ignore'] });
+    c.on('error', reject);
+    c.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`exit ${code}`))));
+    c.stdin.end(input);
+  });
+}
+
+test('post-tool: remote mode stamps trailered commits, range-scans past a parallel commit, marker makes re-runs no-ops', async () => {
+  const { home, cwd } = scratch();
+  // remote mode must not require a local graph dir (same gate as distill)
+  fs.rmSync(path.join(home, 'nodes'), { recursive: true });
+  // two commits land before the hook fires — the second simulates a parallel
+  // session advancing HEAD past ours; both must be journaled and stamped.
+  // sha1 uses the current `Spor:` trailer; sha2 uses the legacy `Substrate:`
+  // key, so this also pins the dual-read back-compat path.
+  const sha1 = gitCommit(cwd, { trailers: ['task-cl-mine'], message: 'mine' });
+  const sha2 = gitCommit(cwd, { trailers: ['task-cl-theirs'], message: 'theirs', trailerKey: 'Substrate' });
+  const { srv, hits, base } = await stubServer();
+  try {
+    const env = freshEnv(home);
+    env.SUBSTRATE_SERVER = base;
+    env.SUBSTRATE_TOKEN = 'sub_pat_test';
+    const payload = JSON.stringify({
+      cwd, session_id: 'sess-j', tool_name: 'Bash',
+      tool_input: { command: 'git commit -m mine' }, hook_event_name: 'PostToolUse',
+    });
+    await runAsync(['post-tool', '--host', 'claude-code'], payload, env);
+    const stamped = hits.map((h) => [h.url, JSON.parse(h.body).sha]).sort();
+    assert.deepStrictEqual(stamped, [
+      ['/v1/nodes/task-cl-mine/commits', sha1],
+      ['/v1/nodes/task-cl-theirs/commits', sha2],
+    ].sort());
+    assert.strictEqual(hits[0].auth, 'Bearer sub_pat_test');
+    assert.ok(hits.every((h) => JSON.parse(h.body).repo === 'projx'));
+    // journaled too, even in remote mode (no local nodes/ dir required)
+    const lines = fs.readFileSync(path.join(home, 'journal', 'sess-j.jsonl'), 'utf8')
+      .trim().split('\n').map((l) => JSON.parse(l));
+    assert.deepStrictEqual(lines.map((l) => l.sha).sort(), [sha1, sha2].sort());
+    assert.deepStrictEqual(lines.find((l) => l.sha === sha1).nodes, ['task-cl-mine']);
+    // marker: a second invocation scans marker..HEAD (empty) — no new stamps
+    const before = hits.length;
+    await runAsync(['post-tool', '--host', 'claude-code'], payload, env);
+    assert.strictEqual(hits.length, before);
+  } finally {
+    srv.close();
+  }
+});
+
+test('session-start: detached catch-up stamps commits made outside any session', async () => {
+  const { home, cwd } = scratch();
+  const sha = gitCommit(cwd, { trailers: ['task-cl-outside'] });
+  const { srv, hits, base } = await stubServer();
+  try {
+    const env = freshEnv(home);
+    env.SUBSTRATE_SERVER = base;
+    env.SUBSTRATE_TOKEN = 'sub_pat_test';
+    await runAsync(
+      ['session-start', '--host', 'claude-code'],
+      JSON.stringify({ cwd, hook_event_name: 'SessionStart' }),
+      env
+    );
+    // the catch-up is detached from the hook; poll for its stamp
+    const deadline = Date.now() + 8000;
+    let stamp;
+    while (!stamp && Date.now() < deadline) {
+      stamp = hits.find((h) => h.method === 'POST' && h.url === '/v1/nodes/task-cl-outside/commits');
+      if (!stamp) await sleep(100);
+    }
+    assert.ok(stamp, `catch-up never stamped; hits: ${JSON.stringify(hits.map((h) => h.url))}`);
+    assert.deepStrictEqual(JSON.parse(stamp.body), { repo: 'projx', sha });
+  } finally {
+    srv.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Spor rename (SPLIT.md): the SPOR_* env arm, and the substrate-hook stub.
+// ---------------------------------------------------------------------------
+
+test('rename: SPOR_HOME drives the graph home (no SUBSTRATE_HOME set)', () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
+  const env = freshEnv(home);
+  delete env.SUBSTRATE_HOME;
+  env.SPOR_HOME = home;
+  const out = run(
+    ['session-start', '--host', 'claude-code'],
+    JSON.stringify({ cwd, hook_event_name: 'SessionStart' }),
+    env
+  );
+  assert.match(JSON.parse(out).hookSpecificOutput.additionalContext, /brief-projx v3/);
+});
+
+test('rename: SPOR_HOME wins over a stale SUBSTRATE_HOME', () => {
+  const { home, cwd } = scratch();
+  const decoy = scratch().home; // empty graph — must NOT be used
+  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
+  const env = freshEnv(decoy);
+  env.SPOR_HOME = home;
+  const out = run(
+    ['session-start', '--host', 'claude-code'],
+    JSON.stringify({ cwd, hook_event_name: 'SessionStart' }),
+    env
+  );
+  assert.match(JSON.parse(out).hookSpecificOutput.additionalContext, /brief-projx v3/);
+});
+
+test('rename: the substrate-hook stub still dispatches (back-compat window)', () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
+  const r = spawnSync('bash', [LEGACY_BIN, 'session-start', '--host', 'claude-code'], {
+    input: JSON.stringify({ cwd, hook_event_name: 'SessionStart' }),
+    env: freshEnv(home),
+    encoding: 'utf8',
+  });
+  assert.strictEqual(r.status, 0, `exit 0 expected: ${r.stderr}`);
+  assert.match(JSON.parse(r.stdout).hookSpecificOutput.additionalContext, /brief-projx v3/);
+});
+
+test('rename: SPOR_DISTILL_CMD replaces the claude backend', () => {
+  const { root, home, cwd } = scratch();
+  const transcript = path.join(root, 'transcript.jsonl');
+  fs.writeFileSync(transcript, [
+    JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: words(60, 'epsilon') }] } }),
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: words(60, 'zeta') }] } }),
+  ].join('\n') + '\n');
+  const env = freshEnv(home);
+  env.SPOR_DISTILL_CMD = makeStub(root);
+  run(
+    ['distill', '--host', 'claude-code'],
+    JSON.stringify({ cwd, session_id: 'sess-spor', transcript_path: transcript, hook_event_name: 'SessionEnd' }),
+    env
+  );
+  assert.ok(fs.existsSync(path.join(home, 'nodes', 'dec-test-hookcli.md')), 'distiller (SPOR_DISTILL_CMD) wrote no nodes');
+});

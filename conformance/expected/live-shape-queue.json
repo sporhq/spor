@@ -1,0 +1,195 @@
+{
+  "items": [
+    {
+      "id": "task-n007",
+      "title": "w349041 w3d333f w86dea6 wc95a71 w1bf0b6 w9ca6bf w5ed7da wcfd189 w175e76 w8a54c0",
+      "type": "task",
+      "status": "open",
+      "project": "p2",
+      "priority": "p1",
+      "score": 6.07,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 2
+      },
+      "suggest": "do",
+      "why": "priority p1 (human-set); 2d old"
+    },
+    {
+      "id": "task-n008",
+      "title": "wd39969 wa58b79 wec686e wd1d088 wcfd189",
+      "type": "task",
+      "status": "open",
+      "project": "p2",
+      "priority": "p1",
+      "score": 6.07,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 2
+      },
+      "suggest": "do",
+      "why": "priority p1 (human-set); 2d old"
+    },
+    {
+      "id": "task-n001",
+      "title": "w010fe4/w7e81d8 w7da34a w9d94a2 w612906 — w6376e8 w39dcf4 wa3da24 wec686e we81c19 w56bb0e w4be4aa (wd4167f)",
+      "type": "task",
+      "status": "active",
+      "project": "p1",
+      "priority": null,
+      "score": 3.5,
+      "signals": {
+        "blocking": 1,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 15
+      },
+      "suggest": "do",
+      "why": "blocks 1 live node; 15d old"
+    },
+    {
+      "id": "issue-n009",
+      "title": "wb57fde wa8a4d2 wa99d7a wc98ffb wcc0939 wa79eed wf7cc72 w794a5a — w39c1ea w908eef w43690c w4bcd30 w039e70, w3126ff w43690c wc5ea6c",
+      "type": "issue",
+      "status": "open",
+      "project": "p1",
+      "priority": null,
+      "score": 0.43,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 13
+      },
+      "suggest": "do",
+      "why": "13d old"
+    },
+    {
+      "id": "task-n036",
+      "title": "wc1eb04 w7f794c w2dbb5f — w75959b wc871bc w1373f4 wa79eed w43690c w954741",
+      "type": "task",
+      "status": "active",
+      "project": "p1",
+      "priority": null,
+      "score": 0.37,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 11
+      },
+      "suggest": "do",
+      "why": "11d old"
+    },
+    {
+      "id": "task-n037",
+      "title": "w91ea8c w4bcd30 w460036 — wb57fde w87982f wc98ffb wcc0939 wa79eed wf7cc72 w794a5a",
+      "type": "task",
+      "status": "active",
+      "project": "p1",
+      "priority": null,
+      "score": 0.37,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 11
+      },
+      "suggest": "do",
+      "why": "11d old"
+    },
+    {
+      "id": "issue-n017",
+      "title": "w3d333f w10351b w2768cb wcfd189 w908eef w838124 w8e8705 w8b2c8a wb3d424",
+      "type": "issue",
+      "status": null,
+      "project": "p3",
+      "priority": null,
+      "score": 0.07,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 2
+      },
+      "suggest": "do",
+      "why": "2d old"
+    },
+    {
+      "id": "issue-n045",
+      "title": "wf441d5 w692dec wc9023f wfe36a1 wdaa0ec w57c3d0 w654976",
+      "type": "issue",
+      "status": null,
+      "project": "p3",
+      "priority": null,
+      "score": 0.07,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 2
+      },
+      "suggest": "do",
+      "why": "2d old"
+    },
+    {
+      "id": "issue-n046",
+      "title": "w47fc65 w4457af w770367 w896461 wbe610a w391254 w89d931 wf19856 w7ef49e",
+      "type": "issue",
+      "status": "active",
+      "project": "p3",
+      "priority": null,
+      "score": 0.07,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 2
+      },
+      "suggest": "do",
+      "why": "2d old"
+    },
+    {
+      "id": "task-n002",
+      "title": "w2db22d w70cd22 — w6744e6 wc95a71 w9cdd31 w56708c wcc79ab wa930df w12c82f w9df9da",
+      "type": "task",
+      "status": "active",
+      "project": "p3",
+      "priority": null,
+      "score": 0.07,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 2
+      },
+      "suggest": "do",
+      "why": "2d old"
+    }
+  ],
+  "count": 41
+}

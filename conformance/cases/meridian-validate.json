@@ -1,0 +1,4 @@
+{ "id": "meridian-validate", "kind": "validate", "corpus": "meridian",
+  "input": {},
+  "expected": "meridian-validate.json",
+  "covers": "clean corpus byType census with graph-resident schemas active" }

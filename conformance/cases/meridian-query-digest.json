@@ -1,0 +1,4 @@
+{ "id": "meridian-query-digest", "kind": "compile", "corpus": "meridian",
+  "input": { "query": "export latency key results", "digest": true },
+  "expected": "meridian-query-digest.txt",
+  "covers": "query digest over a custom-vocabulary corpus" }

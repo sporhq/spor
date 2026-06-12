@@ -1,0 +1,76 @@
+"use strict";
+// Drain spooled distiller payloads from $SPOR_HOME/outbox/ to the team
+// server (the fail-open spooling policy, API.md §6). Node port of
+// drain-outbox.sh — same two spool
+// shapes (*.capture.json -> /v1/capture, *.json -> /v1/nodes), same
+// caller-tunable per-file budget and file cap, same dead-letter policy for
+// permanent 4xx rejects. Best-effort and fail-open throughout.
+
+const fs = require("fs");
+const path = require("path");
+const u = require("./util");
+
+async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0) {
+  if (!u.serverBase()) return;
+  const outbox = path.join(graph, "outbox");
+  if (!fs.existsSync(outbox)) return;
+
+  u.ensureDir(path.join(graph, "journal"));
+  const rlog = u.makeLogger(path.join(graph, "journal", "remote.log"), `${tag} drain: `);
+
+  // Retries multiply wall-clock cost; with a tight per-file budget
+  // (session-start) skip them so one slow file can't eat the hook budget.
+  const retry = maxTimeSec <= 5 ? 0 : 2;
+
+  let files;
+  try {
+    files = fs.readdirSync(outbox).filter((f) => f.endsWith(".json")).sort();
+  } catch {
+    return;
+  }
+
+  let drained = 0;
+  for (const name of files) {
+    if (maxFiles > 0 && drained >= maxFiles) {
+      rlog(`file cap (${maxFiles}) reached; deferring the rest to the next drain`);
+      break;
+    }
+    const file = path.join(outbox, name);
+    const endpoint = name.endsWith(".capture.json") ? "/v1/capture" : "/v1/nodes";
+    let body;
+    try {
+      body = fs.readFileSync(file);
+    } catch {
+      continue;
+    }
+    const { http } = await u.curl(`${u.serverBase()}${endpoint}`, {
+      method: "POST",
+      headers: { ...u.bearer(), "Content-Type": "application/json" },
+      body,
+      timeoutMs: maxTimeSec * 1000,
+      retry,
+    });
+    drained++;
+    if (http === "200" || http === "207") {
+      try {
+        fs.unlinkSync(file);
+      } catch {}
+      rlog(`drained ${name} (http=${http})`);
+    } else if (http === "400" || http === "413" || http === "422") {
+      // Permanent client error: dead-letter it so it can't starve the drain.
+      try {
+        u.ensureDir(path.join(outbox, "dead"));
+        fs.renameSync(file, path.join(outbox, "dead", name));
+      } catch {
+        try {
+          fs.unlinkSync(file);
+        } catch {}
+      }
+      rlog(`dead-lettered ${name} (http=${http}, permanent); kept in outbox/dead/ for inspection`);
+    } else {
+      rlog(`drain failed for ${name} (http=${http}); leaving spooled`);
+    }
+  }
+}
+
+module.exports = { drainOutbox };

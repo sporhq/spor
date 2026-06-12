@@ -1,0 +1,50 @@
+{
+  "name": "@sporhq/spor",
+  "version": "0.1.1",
+  "description": "Spor — a shared memory substrate for teams and agents. Decisions, their reasons, and the traces they leave. Knowledge-graph context compiler: session-start briefings, per-prompt digests, capture at discovery, end-of-session distillation, decision queue.",
+  "license": "MIT",
+  "author": "Anthony Allen",
+  "homepage": "https://sporhq.io",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sporhq/spor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sporhq/spor/issues"
+  },
+  "keywords": [
+    "knowledge-graph",
+    "context",
+    "memory",
+    "agents",
+    "spor",
+    "provenance"
+  ],
+  "main": "lib/graph.js",
+  "bin": {
+    "spor-hook": "./bin/spor-hook.js"
+  },
+  "files": [
+    "lib/",
+    "bin/",
+    "scripts/engines/",
+    "scripts/distill-gemini.sh",
+    "prompts/client/",
+    "prompts/README.md",
+    "hooks/",
+    "adapters/",
+    "skills/",
+    "agents/",
+    "workers/",
+    "API.md",
+    "GRAPH.md",
+    "QUEUE.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "conformance": "node conformance/runner.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

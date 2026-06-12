@@ -1,0 +1,4 @@
+{ "id": "pricing-skeleton", "kind": "skeleton", "corpus": "pricing",
+  "input": { "rootId": "task-pricing-rollout", "version": 3, "date": "2026-06-12", "compiledAt": "2026-06-12T08:00:00.000Z" },
+  "expected": "pricing-skeleton.md",
+  "covers": "briefing skeleton: version, derived-from sources, shaped-by corrections" }

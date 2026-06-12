@@ -1,0 +1,24 @@
+{
+  "errors": [],
+  "warnings": [
+    "dec-n077.md: dangling edge supersedes -> gone-b85bc8",
+    "dec-n086.md: dangling edge supersedes -> gone-12a8e1",
+    "task-n018.md: dangling edge relates-to -> gone-86e01b"
+  ],
+  "byType": {
+    "artifact": 51,
+    "briefing": 3,
+    "capture-pending": 37,
+    "decision": 109,
+    "finding": 16,
+    "issue": 46,
+    "lens": 6,
+    "norm": 20,
+    "person": 1,
+    "question": 2,
+    "schema": 6,
+    "task": 45,
+    "workspace": 1
+  },
+  "count": 343
+}

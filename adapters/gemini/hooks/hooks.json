@@ -1,0 +1,33 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "name": "spor-session-start", "type": "command", "command": "__SPOR_ROOT__/bin/spor-hook session-start --host gemini", "timeout": 20000 }
+        ]
+      }
+    ],
+    "BeforeAgent": [
+      {
+        "hooks": [
+          { "name": "spor-prompt-context", "type": "command", "command": "__SPOR_ROOT__/bin/spor-hook prompt-context --host gemini", "timeout": 15000 }
+        ]
+      }
+    ],
+    "AfterTool": [
+      {
+        "matcher": "write_file|replace",
+        "hooks": [
+          { "name": "spor-post-tool", "type": "command", "command": "__SPOR_ROOT__/bin/spor-hook post-tool --host gemini", "timeout": 10000 }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "name": "spor-distill", "type": "command", "command": "__SPOR_ROOT__/bin/spor-hook distill --host gemini", "timeout": 300000 }
+        ]
+      }
+    ]
+  }
+}

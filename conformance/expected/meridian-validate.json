@@ -1,0 +1,16 @@
+{
+  "errors": [],
+  "warnings": [],
+  "byType": {
+    "feature": 4,
+    "key-result": 3,
+    "lens": 5,
+    "objective": 2,
+    "person": 3,
+    "schema": 11,
+    "task": 4,
+    "team": 2,
+    "workspace": 5
+  },
+  "count": 39
+}

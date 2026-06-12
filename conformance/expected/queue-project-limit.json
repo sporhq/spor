@@ -1,0 +1,49 @@
+{
+  "items": [
+    {
+      "id": "task-unblocker",
+      "title": "Land the schema migration",
+      "type": "task",
+      "status": "open",
+      "project": "alpha",
+      "priority": "p2",
+      "score": 7.4,
+      "signals": {
+        "blocking": 1,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 42
+      },
+      "suggest": "do",
+      "why": "priority p2 (human-set); blocks 1 live node; 42d old; 1 open gardener finding: finding-open",
+      "findings": [
+        "finding-open"
+      ]
+    },
+    {
+      "id": "task-blocked",
+      "title": "Rewrite the indexer",
+      "type": "task",
+      "status": "open",
+      "project": "alpha",
+      "priority": "p1",
+      "score": 5.4,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 1,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 72
+      },
+      "suggest": "blocked",
+      "why": "priority p1 (human-set); blocked by task-unblocker — do the unblocker first; 72d old",
+      "blocked_by": [
+        "task-unblocker"
+      ]
+    }
+  ],
+  "count": 4
+}

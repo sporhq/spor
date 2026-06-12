@@ -1,0 +1,4 @@
+{ "id": "pricing-root-full", "kind": "compile", "corpus": "pricing",
+  "input": { "rootId": "task-pricing-rollout" },
+  "expected": "pricing-root-full.txt",
+  "covers": "root compile, corrections section, pinned node, excluded node, norms ride-along" }

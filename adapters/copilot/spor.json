@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      { "type": "command", "command": "__SPOR_ROOT__/bin/spor-hook agents-md", "timeoutSec": 20 }
+    ],
+    "postToolUse": [
+      { "type": "command", "command": "__SPOR_ROOT__/bin/spor-hook post-tool --host copilot", "timeoutSec": 10 }
+    ],
+    "agentStop": [
+      { "type": "command", "command": "__SPOR_ROOT__/bin/spor-hook distill --host copilot --debounce 900", "timeoutSec": 10 }
+    ]
+  }
+}

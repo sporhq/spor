@@ -1,0 +1,4 @@
+{ "id": "live-shape-queue", "kind": "queue", "corpus": "live-shape",
+  "input": { "now": "2026-06-12T00:00:00Z", "limit": 10 },
+  "expected": "live-shape-queue.json",
+  "covers": "ranking at live-graph scale" }

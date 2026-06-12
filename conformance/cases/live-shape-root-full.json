@@ -1,0 +1,4 @@
+{ "id": "live-shape-root-full", "kind": "compile", "corpus": "live-shape",
+  "input": { "rootId": "dec-n017" },
+  "expected": "live-shape-root-full.txt",
+  "covers": "full compile at scale; supersession fixup pulls the superseder" }

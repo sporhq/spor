@@ -1,0 +1,499 @@
+// Zero-dependency test suite for the schema registry (lib/registry.js + the
+// registry-aware parts of lib/graph.js). Run: node --test
+//
+// Covers: CalVer parse/compare, upgrade-chain validation, lazy applyUpgrades
+// with synthetic schemas, schema-node parsing (json payload, preserved js
+// code), seed-pack-equals-GRAPH.md integrity, override-vs-seed resolution,
+// and registry-driven loadGraph/compile/validateGraph behavior.
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
+const graph = require(path.join(__dirname, "..", "lib", "graph.js"));
+const registry = require(path.join(__dirname, "..", "lib", "registry.js"));
+
+function tmpGraph(files) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "substrate-test-"));
+  const nodesDir = path.join(dir, "nodes");
+  fs.mkdirSync(nodesDir, { recursive: true });
+  for (const [name, content] of Object.entries(files)) {
+    fs.writeFileSync(path.join(nodesDir, name), content);
+  }
+  return { dir, nodesDir, load: () => graph.loadGraph(nodesDir) };
+}
+
+// ---------- CalVer ----------
+
+test("parseCalVer: accepts YYYY.MM.DD.MICRO and rejects malformed versions", () => {
+  assert.deepEqual(registry.parseCalVer("2026.06.10.1"), { year: 2026, month: 6, day: 10, micro: 1 });
+  assert.deepEqual(registry.parseCalVer("2026.12.31.42"), { year: 2026, month: 12, day: 31, micro: 42 });
+  for (const bad of ["2026.6.10.1", "2026.06.10", "2026.13.01.1", "2026.06.32.1", "2026.06.10.0", "v1", "", null]) {
+    assert.equal(registry.parseCalVer(bad), null, `should reject ${bad}`);
+  }
+});
+
+test("compareCalVer: orders numerically per component (micro is not lexicographic)", () => {
+  assert.equal(registry.compareCalVer("2026.06.10.1", "2026.06.10.1"), 0);
+  assert.equal(registry.compareCalVer("2026.06.10.2", "2026.06.10.10"), -1); // 2 < 10
+  assert.equal(registry.compareCalVer("2026.06.11.1", "2026.06.10.9"), 1);
+  assert.equal(registry.compareCalVer("2025.12.31.99", "2026.01.01.1"), -1);
+  assert.throws(() => registry.compareCalVer("nope", "2026.06.10.1"), /invalid CalVer/);
+});
+
+// ---------- upgrade chain validation ----------
+
+test("validateUpgradeChain: accepts an ordered chain ending at schema_version", () => {
+  const chain = [
+    { from: "2026.06.01.1", to: "2026.06.05.1" },
+    { from: "2026.06.05.1", to: "2026.06.10.2" },
+  ];
+  assert.deepEqual(registry.validateUpgradeChain(chain, "2026.06.10.2"), []);
+  assert.deepEqual(registry.validateUpgradeChain([], "2026.06.10.2"), []);
+  assert.deepEqual(registry.validateUpgradeChain(null, "2026.06.10.2"), []);
+});
+
+test("validateUpgradeChain: rejects non-forward, out-of-order, and dangling chains", () => {
+  const backward = registry.validateUpgradeChain(
+    [{ from: "2026.06.10.2", to: "2026.06.01.1" }], "2026.06.01.1");
+  assert.ok(backward.some((e) => /not forward/.test(e)));
+
+  const shuffled = registry.validateUpgradeChain([
+    { from: "2026.06.05.1", to: "2026.06.10.2" },
+    { from: "2026.06.01.1", to: "2026.06.05.1" },
+  ], "2026.06.05.1");
+  assert.ok(shuffled.some((e) => /chronological order/.test(e)));
+
+  const dangling = registry.validateUpgradeChain(
+    [{ from: "2026.06.01.1", to: "2026.06.05.1" }], "2026.06.10.2");
+  assert.ok(dangling.some((e) => /!= schema_version/.test(e)));
+});
+
+// ---------- applyUpgrades (synthetic schemas; no seed schema has a chain) ----------
+
+function widgetSchema() {
+  return {
+    id: "schema-widget", kind: "node-schema", version: "2026.06.10.3",
+    payload: { node_type: "widget" },
+    upgrades: [
+      { from: "2026.06.01.1", to: "2026.06.05.1", fn: (n) => ({ color: n.colour ?? "blue" }) },
+      { from: "2026.06.05.1", to: "2026.06.10.3", fn: (n) => ({ size: "medium" }) },
+    ],
+  };
+}
+
+test("applyUpgrades: unversioned node gets the whole chain, lazily stamped to current", () => {
+  const node = { id: "widget-a", type: "widget", colour: "red" };
+  const r = registry.applyUpgrades(node, widgetSchema());
+  assert.deepEqual(r.applied, ["2026.06.05.1", "2026.06.10.3"]);
+  assert.equal(r.node.color, "red");
+  assert.equal(r.node.size, "medium");
+  assert.equal(r.node.schema_version, "2026.06.10.3");
+  assert.equal(node.schema_version, undefined, "input node must not be mutated");
+});
+
+test("applyUpgrades: mid-chain node only gets the remaining hops", () => {
+  const node = { id: "widget-b", type: "widget", schema_version: "2026.06.05.1", color: "green" };
+  const r = registry.applyUpgrades(node, widgetSchema());
+  assert.deepEqual(r.applied, ["2026.06.10.3"]);
+  assert.equal(r.node.color, "green", "first upgrade must not re-run");
+  assert.equal(r.node.size, "medium");
+});
+
+test("applyUpgrades: node already at schema_version is a no-op", () => {
+  const node = { id: "widget-c", type: "widget", schema_version: "2026.06.10.3" };
+  const r = registry.applyUpgrades(node, widgetSchema());
+  assert.deepEqual(r.applied, []);
+  assert.equal(r.node, node);
+});
+
+test("applyUpgrades: forward-only — a node newer than the schema throws", () => {
+  const node = { id: "widget-d", type: "widget", schema_version: "2027.01.01.1" };
+  assert.throws(() => registry.applyUpgrades(node, widgetSchema()), /forward-only/);
+});
+
+test("applyUpgrades: empty chain with an older node just restamps the version", () => {
+  const schema = { id: "schema-gadget", kind: "node-schema", version: "2026.06.10.1", payload: { node_type: "gadget" }, upgrades: [] };
+  const r = registry.applyUpgrades({ id: "gadget-a", type: "gadget", schema_version: "2026.06.01.1" }, schema);
+  assert.deepEqual(r.applied, []);
+  assert.equal(r.node.schema_version, "2026.06.10.1");
+});
+
+test("applyUpgrades: markdown-attached upgrade code (no fn) throws instead of executing", () => {
+  const schema = {
+    id: "schema-widget", kind: "node-schema", version: "2026.06.10.1",
+    payload: { node_type: "widget" },
+    upgrades: [{ from: "2026.06.01.1", to: "2026.06.10.1", fnName: "upgrade1" }],
+  };
+  assert.throws(() => registry.applyUpgrades({ id: "widget-e", type: "widget" }, schema), /not executed/);
+});
+
+// ---------- schema-node parsing ----------
+
+const TASK_OVERRIDE_MD = `---
+id: schema-task
+type: schema
+kind: node-schema
+schema_version: 2026.06.10.2
+title: Task schema override
+summary: Org-local task schema overriding the seed pack entry for tasks.
+date: 2026-06-10
+---
+
+Override body.
+
+\`\`\`json
+{
+  "node_type": "task",
+  "prefix": ["task-"],
+  "queueable": true
+}
+\`\`\`
+
+\`\`\`js
+// validate(node, graph) — parsed and preserved, not executed in step 1
+export function validate(node, graph) { return []; }
+export function queueSignals(node, graph, activity) { return { age_days: 0 }; }
+\`\`\`
+`;
+
+test("parseSchemaNode: extracts json payload and preserves (does not run) js code", () => {
+  const n = graph.parseFrontmatter(TASK_OVERRIDE_MD, "schema-task.md");
+  const r = registry.parseSchemaNode(n);
+  assert.equal(r.ok, true, r.errors.join("; "));
+  assert.equal(r.schema.kind, "node-schema");
+  assert.equal(r.schema.key, "task");
+  assert.equal(r.schema.version, "2026.06.10.2");
+  assert.deepEqual(r.schema.payload.prefix, ["task-"]);
+  assert.equal(r.schema.payload.queueable, true);
+  // code: preserved verbatim as strings, indexed by export name.
+  assert.equal(typeof r.schema.code.validate, "string");
+  assert.equal(typeof r.schema.code.queueSignals, "string");
+  assert.match(r.schema.code.validate, /export function validate/);
+  assert.equal(r.schema.codeBlocks.length, 1);
+});
+
+test("parseSchemaNode: rejects bad kind, bad CalVer, missing/broken payload, native type", () => {
+  const make = (over, body) => {
+    const base = { id: "schema-x", kind: "node-schema", schema_version: "2026.06.10.1",
+      body: body ?? '```json\n{"node_type": "x"}\n```', ...over };
+    return registry.parseSchemaNode(base);
+  };
+  assert.ok(make({ kind: "field-schema" }).errors.some((e) => /kind/.test(e)));
+  assert.ok(make({ schema_version: "1.2.3" }).errors.some((e) => /CalVer/.test(e)));
+  assert.ok(make({}, "no payload here").errors.some((e) => /json payload/.test(e)));
+  assert.ok(make({}, '```json\n{not json}\n```').errors.some((e) => /does not parse/.test(e)));
+  assert.ok(make({}, '```json\n{"edge_type": "x"}\n```').errors.some((e) => /missing node_type/.test(e)));
+  assert.ok(make({}, '```json\n{"node_type": "schema"}\n```').errors.some((e) => /native/.test(e)),
+    "redefining the schema type itself must be rejected (no schema-for-schemas regress)");
+  assert.ok(make({ kind: "edge-schema" }, '```json\n{"edge_type": "zaps", "weight": "heavy"}\n```')
+    .errors.some((e) => /weight must be a number/.test(e)));
+});
+
+// ---------- queue-policy kind (QUEUE.md §4/§8) ----------
+
+test("parseSchemaNode: queue-policy kind parses to the singleton key, requires rank()", () => {
+  const make = (body) => registry.parseSchemaNode({
+    id: "schema-queue-policy", kind: "queue-policy", schema_version: "2026.06.11.1", body,
+  });
+  const ok = make('```json\n{"description": "org blend"}\n```\n\n```js\nexport function rank(items) { return {}; }\n```');
+  assert.equal(ok.ok, true, ok.errors.join("; "));
+  assert.equal(ok.schema.key, "queue-policy");
+  assert.equal(typeof ok.schema.code.rank, "string");
+  // a policy with no rank() export is inert by construction — reject it.
+  const noRank = make('```json\n{}\n```\n\n```js\nexport function score() { return {}; }\n```');
+  assert.ok(noRank.errors.some((e) => /rank\(\)/.test(e)));
+});
+
+test("Registry: queue-policy is a singleton slot with graph-beats-seed precedence", () => {
+  const reg = new registry.Registry();
+  const policy = (id, version) => ({
+    id, kind: "queue-policy", version, key: "queue-policy",
+    payload: {}, code: { rank: "export function rank() {}" }, codeBlocks: [], upgrades: [],
+  });
+  assert.equal(reg.add(policy("schema-qp-seed", "2026.06.11.5"), "seed"), true);
+  assert.equal(reg.queuePolicy.id, "schema-qp-seed");
+  // graph beats seed even at a lower version
+  assert.equal(reg.add(policy("schema-qp-org", "2026.06.11.1"), "graph"), true);
+  assert.equal(reg.queuePolicy.id, "schema-qp-org");
+  // seed never displaces graph
+  assert.equal(reg.add(policy("schema-qp-seed2", "2026.06.12.1"), "seed"), false);
+  // within graph, higher version wins
+  assert.equal(reg.add(policy("schema-qp-org2", "2026.06.12.1"), "graph"), true);
+  assert.equal(reg.queuePolicy.id, "schema-qp-org2");
+  // queue-policy does not register a node TYPE
+  assert.equal(reg.isKnownType("queue-policy"), false);
+});
+
+// ---------- seed pack integrity: expresses GRAPH.md exactly ----------
+
+test("seed pack: edge weights match the historic EDGE_WEIGHTS table exactly", () => {
+  const reg = graph.seedRegistry();
+  assert.deepEqual(reg.edgeWeights(), {
+    "supersedes": 1.0, "constrained-by": 1.0, "governed-by": 0.95,
+    "derived-from": 0.9, "decided-in": 0.9, "resolves": 0.9,
+    "blocks": 0.7, "relates-to": 0.5, "mentions": 0.5,
+    // Tier-2 question routing (38428bf) joined the seed after the historic
+    // table froze: answers + the person-graph edges.
+    "answers": 0.7, "assigned": 0.5, "stewards": 0.4, "routed-to": 0.3,
+    // The workflow-run rollout added run lineage edges to the seed:
+    // a run performs a workflow and is triggered-by its cause.
+    "performs": 0.8, "triggered-by": 0.7,
+  });
+  // provenance-only edges are known but unweighted (historic ?? 0.3 default)
+  assert.equal(reg.isKnownEdge("compiled-for"), true);
+  assert.equal(reg.isKnownEdge("shaped-by"), true);
+  assert.equal(reg.edgeWeight("compiled-for"), 0.3);
+  assert.equal(reg.edgeWeight("invented-edge"), 0.3);
+});
+
+test("seed pack: node types, prefixes, ride-along, and traversal match GRAPH.md", () => {
+  const reg = graph.seedRegistry();
+  for (const t of ["decision", "task", "issue", "incident", "artifact", "norm", "briefing", "correction"]) {
+    assert.equal(reg.isKnownType(t), true, `${t} known`);
+  }
+  assert.equal(reg.isKnownType("contraption"), false);
+  assert.deepEqual(reg.prefixesFor("artifact"), ["spec-", "art-"]);
+  assert.deepEqual(reg.prefixesFor("incident"), ["inc-"]);
+  assert.equal(reg.isAlwaysOn("norm"), true);
+  assert.equal(reg.isAlwaysOn("decision"), false);
+  assert.equal(reg.isTraversable("briefing"), false);
+  assert.equal(reg.isTraversable("correction"), false);
+  assert.equal(reg.isTraversable("decision"), true);
+  assert.equal(reg.isTraversable("never-heard-of-it"), true, "unknown types traverse, as before");
+});
+
+test("seed pack: the schema type itself is native — known, prefixed, traversable", () => {
+  const reg = graph.seedRegistry();
+  assert.equal(reg.isKnownType("schema"), true);
+  assert.deepEqual(reg.prefixesFor("schema"), ["schema-"]);
+  assert.equal(reg.isTraversable("schema"), true);
+  assert.equal(reg.isAlwaysOn("schema"), false);
+});
+
+test("seed pack: back-compat constant exports are derived from the seed", () => {
+  assert.deepEqual(graph.EDGE_WEIGHTS, graph.seedRegistry().edgeWeights());
+  assert.ok(graph.KNOWN_TYPES.has("decision") && graph.KNOWN_TYPES.has("schema"));
+  assert.ok(graph.KNOWN_EDGES.has("compiled-for"));
+});
+
+// ---------- override-vs-seed resolution ----------
+
+test("Registry.add: graph source beats seed regardless of version; higher CalVer wins within a source", () => {
+  const reg = graph.seedRegistry();
+  const seedBlocks = reg.edgeSchemas.get("blocks");
+  const mk = (version, weight) => ({
+    id: "schema-edge-blocks", kind: "edge-schema", version,
+    key: "blocks", payload: { edge_type: "blocks", weight }, code: {}, codeBlocks: [], upgrades: [],
+  });
+  // older graph schema still beats the seed
+  assert.equal(reg.add(mk("2026.01.01.1", 0.9), "graph"), true);
+  assert.equal(reg.edgeWeight("blocks"), 0.9);
+  // seed never reclaims a graph-owned entry
+  assert.equal(reg.add({ ...seedBlocks }, "seed"), false);
+  assert.equal(reg.edgeWeight("blocks"), 0.9);
+  // within graph source, higher version wins; lower does not
+  assert.equal(reg.add(mk("2026.06.10.1", 0.95), "graph"), true);
+  assert.equal(reg.edgeWeight("blocks"), 0.95);
+  assert.equal(reg.add(mk("2026.03.01.1", 0.2), "graph"), false);
+  assert.equal(reg.edgeWeight("blocks"), 0.95);
+});
+
+// ---------- registry-aware loadGraph / compile / validateGraph ----------
+
+const BASE_NODES = {
+  "spec-a.md": `---
+id: spec-a
+type: artifact
+title: Spec A
+summary: The base spec other nodes relate to in this fixture.
+date: 2026-06-01
+---
+Spec body.
+`,
+  "dec-b.md": `---
+id: dec-b
+type: decision
+title: Decision B
+summary: A decision weakly related to spec A.
+date: 2026-06-02
+edges:
+  - {type: relates-to, to: spec-a}
+---
+Decision body.
+`,
+};
+
+test("loadGraph: a graph-resident edge schema actually changes the traversal weight", () => {
+  const before = tmpGraph(BASE_NODES).load();
+  assert.equal(before.adj["dec-b"][0].weight, 0.5, "seed relates-to weight");
+
+  const after = tmpGraph({
+    ...BASE_NODES,
+    "schema-edge-relates-to.md": `---
+id: schema-edge-relates-to
+type: schema
+kind: edge-schema
+schema_version: 2026.06.10.2
+title: relates-to override
+summary: Org override raising relates-to to a strong association.
+date: 2026-06-10
+---
+
+\`\`\`json
+{
+  "edge_type": "relates-to",
+  "weight": 0.95
+}
+\`\`\`
+`,
+  }).load();
+  assert.equal(after.adj["dec-b"][0].weight, 0.95, "overridden relates-to weight");
+  assert.equal(after.registry.edgeWeight("relates-to"), 0.95);
+  // and the override propagates to compile: 0.95 from a 1.0 root clears the
+  // 0.6 full-body threshold that seed-weight 0.5 missed.
+  const r = graph.compile(after, { rootId: "dec-b", digest: false });
+  assert.match(r.text, /relates-to from dec-b, score 0\.95/);
+});
+
+test("loadGraph: a graph-resident node schema adds a new type with prefix and ride-along", () => {
+  const fx = tmpGraph({
+    ...BASE_NODES,
+    "schema-runbook.md": `---
+id: schema-runbook
+type: schema
+kind: node-schema
+schema_version: 2026.06.10.1
+title: Runbook node type
+summary: Org-specific runbook node type that rides along in every compile.
+date: 2026-06-10
+---
+
+\`\`\`json
+{
+  "node_type": "runbook",
+  "prefix": ["run-"],
+  "always_on": true
+}
+\`\`\`
+`,
+    "run-restore.md": `---
+id: run-restore
+type: runbook
+title: Restore runbook
+summary: How to restore the service from a cold backup.
+date: 2026-06-05
+---
+Restore steps.
+`,
+  });
+  const g = fx.load();
+  assert.equal(g.registry.isKnownType("runbook"), true);
+  assert.deepEqual(g.registry.prefixesFor("runbook"), ["run-"]);
+  // always_on: the runbook rides along in a compile it has no edges into.
+  const r = graph.compile(g, { rootId: "dec-b", digest: false });
+  assert.match(r.text, /## ORG NORMS \(always-on\)/);
+  assert.match(r.text, /run-restore/);
+  // and the validator no longer warns about the type.
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.deepEqual(v.errors, []);
+  assert.ok(!v.warnings.some((w) => /unknown type 'runbook'/.test(w)));
+});
+
+test("loadGraph: schema nodes are ordinary graph nodes (resident, traversable)", () => {
+  const fx = tmpGraph({
+    ...BASE_NODES,
+    "schema-edge-relates-to.md": `---
+id: schema-edge-relates-to
+type: schema
+kind: edge-schema
+schema_version: 2026.06.10.2
+title: relates-to override
+summary: Org override of the relates-to edge weight.
+date: 2026-06-10
+---
+
+\`\`\`json
+{ "edge_type": "relates-to", "weight": 0.6 }
+\`\`\`
+`,
+  });
+  const g = fx.load();
+  assert.ok(g.nodes["schema-edge-relates-to"], "schema node is resident in the graph");
+  assert.ok(g.docs.some((d) => d.id === "schema-edge-relates-to"), "schema node participates in the content arm");
+});
+
+test("loadGraph: a malformed schema node throws (same strictness as malformed frontmatter)", () => {
+  const fx = tmpGraph({
+    ...BASE_NODES,
+    "schema-broken.md": `---
+id: schema-broken
+type: schema
+kind: node-schema
+schema_version: not-calver
+title: Broken schema
+summary: A schema node whose version and payload are invalid.
+date: 2026-06-10
+---
+No payload block at all.
+`,
+  });
+  assert.throws(() => fx.load(), /invalid schema node/);
+});
+
+test("validateGraph: malformed schema node is an error; valid one is silent", () => {
+  const bad = tmpGraph({
+    ...BASE_NODES,
+    "schema-broken.md": `---
+id: schema-broken
+type: schema
+kind: node-schema
+schema_version: 2026.06.10.1
+title: Broken schema
+summary: Schema node with an unparseable payload.
+date: 2026-06-10
+---
+
+\`\`\`json
+{ this is not json }
+\`\`\`
+`,
+  });
+  const vBad = graph.validateGraph(bad.nodesDir);
+  assert.ok(vBad.errors.some((e) => /schema-broken\.md: payload json block does not parse/.test(e)));
+
+  const good = tmpGraph({ ...BASE_NODES, "schema-task.md": TASK_OVERRIDE_MD });
+  const vGood = graph.validateGraph(good.nodesDir);
+  assert.deepEqual(vGood.errors, []);
+  assert.ok(!vGood.warnings.some((w) => /schema-task/.test(w)), "schema type is known, no warning");
+});
+
+test("validateNode: schema node structural + payload rules", () => {
+  const n = graph.parseFrontmatter(TASK_OVERRIDE_MD, "schema-task.md");
+  assert.equal(graph.validateNode(null, n).ok, true);
+
+  const bad = graph.parseFrontmatter(`---
+id: schema-bad
+type: schema
+kind: nonsense
+schema_version: 2026.06.10.1
+title: Bad
+summary: Schema node with a bad kind and no payload.
+date: 2026-06-10
+---
+body
+`, "schema-bad.md");
+  const r = graph.validateNode(null, bad);
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => /kind/.test(e)));
+  assert.ok(r.errors.some((e) => /json payload/.test(e)));
+});
+
+test("no-schema graph behaves exactly as the seed pack (registry default)", () => {
+  const g = tmpGraph(BASE_NODES).load();
+  assert.equal(g.registry.edgeWeight("relates-to"), 0.5);
+  assert.equal(g.registry.isAlwaysOn("norm"), true);
+  assert.equal(g.registry.isTraversable("briefing"), false);
+});

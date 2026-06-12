@@ -1,0 +1,61 @@
+# Compiled neighborhood
+
+## THE QUERY
+
+plan tier table discounts
+
+## CORRECTIONS (standing guidance from prior briefing reviews — MUST be honored)
+
+### corr-global — Quote prices only from the price book artifact (2026-06-11)
+
+Quote prices from art-catalogue; never recompute price figures inline.
+
+## LINEAGE (structural arm: typed-edge walk)
+
+### q-tier-pricing — Does the plan tier table inherit composed bundle discounts (question, 2026-06-10)
+*selected via: content seed, score 0.90*
+
+If tier discounts compound with composed bundle discounts the margin model
+breaks; if they price flat the price book contradicts the spec.
+
+### task-pricing-rollout — Roll out vendor neutral pricing to the price book (task, 2026-06-10)
+*selected via: content seed, score 0.85*
+
+Reprice every published plan with the vendor neutral envelopes. The
+plan tier table ships last because the composed bundles feed it.
+
+### spec-rc — Billing cost spec (artifact, 2026-06-01)
+*selected via: constrained-by from task-pricing-rollout, score 0.85*
+
+Body of the billing cost spec about pricing envelopes. Usage limits
+bound every price book plan; the cost ceiling is vendor neutral by
+construction.
+
+### art-catalogue — Published price book (artifact, 2026-06-05)
+*selected via: content seed, score 0.80*
+
+The price book lists every plan with its usage limits and price.
+
+### dec-new — Vendor neutral price book pricing (decision, 2026-06-09)
+*selected via: derived-from from task-pricing-rollout, score 0.77*
+
+Price book pricing is vendor neutral: composed bundles price from the
+billing cost spec envelopes, never from a single vendor quote.
+
+### dec-old — Single vendor pricing (decision, 2026-06-02)
+*selected via: supersedes from dec-new, score 0.77*
+
+> ⚠ SUPERSEDED by dec-new. Do not follow; included only so you recognize stale references.
+
+Old single-vendor price book pricing decision, later superseded.
+
+## OUTSIDE VIEW (content arm — no lineage connection; check for prior art and unowned constraints)
+
+## ORG NORMS (always-on)
+
+### norm-pricing-review — Pricing changes are reviewed against the cost spec (norm, 2026-06-03)
+*selected via: norm*
+
+Every pricing change carries a spec-diff in review. No exceptions for
+composed bundles.
+
