@@ -507,11 +507,12 @@ test("queue-policy: a proposed policy node is inert until activated", () => {
   assert.notEqual(r.items.find((i) => i.id === "task-x").score, 999);
 });
 
-test("registry: seed queueability — task and capture-pending yes, others no", () => {
+test("registry: seed queueability — work types yes, record types no", () => {
   const reg = graph.seedRegistry();
-  assert.equal(reg.isQueueable("task"), true);
-  assert.equal(reg.isQueueable("capture-pending"), true);
-  for (const t of ["decision", "issue", "incident", "artifact", "norm", "briefing", "correction", "schema"]) {
+  for (const t of ["task", "capture-pending", "issue", "incident"]) {
+    assert.equal(reg.isQueueable(t), true, `${t} queueable`);
+  }
+  for (const t of ["decision", "artifact", "norm", "briefing", "correction", "schema"]) {
     assert.equal(reg.isQueueable(t), false, `${t} not queueable`);
   }
 });

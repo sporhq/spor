@@ -6,8 +6,8 @@ description: Present the Spor decision queue — what to work on next, ranked by
 # What should I work on next?
 
 The queue is computed from the graph, not kept as a list (QUEUE.md §4/§5):
-queueable live nodes (deferred tasks, unprocessed captures, org-defined
-types) ranked by an advisory blend — what they block, recent activity in
+queueable live nodes (deferred tasks, open issues and incidents,
+unprocessed captures, org-defined types) ranked by an advisory blend — what they block, recent activity in
 their neighborhood, age — plus any human-set `priority:`. High staleness
 (anchors superseded or gone) flips the suggestion to **close**, not do.
 

@@ -80,8 +80,8 @@ Rules:
 |------------|-----------|-----------------------------------------------------------|
 | decision   | `dec-`    | a choice that was made, with the why                      |
 | task       | `task-`   | active or planned work                                    |
-| issue      | `issue-`  | a defect/finding and its resolution lineage               |
-| incident   | `inc-`    | something that went wrong in operation                    |
+| issue      | `issue-`  | a defect/finding and its resolution lineage (queueable: open issues join the decision queue) |
+| incident   | `inc-`    | something that went wrong in operation (queueable: live incidents join the decision queue) |
 | artifact   | `spec-`, `art-` | a document, spec, module, or build product worth referencing |
 | norm       | `norm-`   | a standing convention or constraint (rides along in every compile) |
 | briefing   | `brief-`  | a compiled briefing (output of this system; never traversed) |
