@@ -70,7 +70,13 @@ function stripTrailingNewlines(s) {
 }
 
 // Project slug (see CLAUDE.md): basename of the git root, normalized to
-// kebab-case. Identity for names that are already kebab-case.
+// kebab-case. Identity for names that are already kebab-case. A committed
+// `.spor` marker file at the repo root (`project: <id>`) beats all
+// inference — it survives rename, move, fork, and history rewrite
+// (task-cc-project-identity-nodes). The marker value must already be
+// canonical (the server's SLUG_RE); a non-matching value is ignored rather
+// than normalized, so a typo degrades to inference instead of minting a
+// new identity.
 function projectSlug(cwd, fallback = "project") {
   let top = cwd || "";
   try {
@@ -81,12 +87,48 @@ function projectSlug(cwd, fallback = "project") {
   } catch {
     /* not a git repo: use cwd */
   }
+  try {
+    const marker = fs.readFileSync(path.join(top || cwd || "", ".spor"), "utf8");
+    const m = marker.match(/^project:[ \t]*([a-z0-9][a-z0-9-]*)[ \t]*$/m);
+    if (m) return m[1];
+  } catch {
+    /* no marker: infer from the basename */
+  }
   const slug = path
     .basename(top || cwd || "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
   return slug || fallback;
+}
+
+// Repo fingerprints (task-cc-project-identity-nodes): root-commit shas and
+// normalized remote URLs, the rename evidence a project node accumulates.
+// Remote normalization strips scheme, userinfo (never ship credentials),
+// and `.git`, and folds scp-style `host:path` into `host/path`, so the ssh
+// and https spellings of one repo converge on one fingerprint. Entries are
+// prefixed `root:`/`remote:` — the same flat-string register format the
+// project node's `fingerprints:` list uses. Fail-open: not a repo -> [].
+function repoFingerprints(cwd) {
+  const out = [];
+  const roots = git(cwd, ["rev-list", "--max-parents=0", "HEAD"]);
+  for (const sha of (roots ?? "").trim().split("\n").filter(Boolean).slice(0, 3)) {
+    out.push(`root:${sha}`);
+  }
+  const seen = new Set();
+  for (const line of (git(cwd, ["remote", "-v"]) ?? "").trim().split("\n")) {
+    const url = line.split(/\s+/)[1];
+    if (!url) continue;
+    const norm = url
+      .toLowerCase()
+      .replace(/^[a-z+]+:\/\//, "")
+      .replace(/^[^@/]+@/, "")
+      .replace(":", "/")
+      .replace(/\.git$/, "")
+      .replace(/\/+$/, "");
+    if (norm && !seen.has(norm)) { seen.add(norm); out.push(`remote:${norm}`); }
+  }
+  return out;
 }
 
 function git(cwd, args, opts = {}) {
@@ -306,6 +348,7 @@ module.exports = {
   wordCount,
   stripTrailingNewlines,
   projectSlug,
+  repoFingerprints,
   git,
   ensureDir,
   appendLine,

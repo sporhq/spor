@@ -25,7 +25,10 @@ git toplevel), and pass a `during` node id if the current task corresponds to
 a known graph node (check the session's briefing/digest for its id):
 
 ```bash
-SLUG=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" \
+TOP=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+# a committed .spor marker (project: <id>) beats basename inference
+SLUG=$(sed -nE 's/^project:[ \t]*([a-z0-9][a-z0-9-]*)[ \t]*$/\1/p' "$TOP/.spor" 2>/dev/null | head -1)
+[ -n "$SLUG" ] || SLUG=$(basename "$TOP" \
   | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
 curl -sS --max-time 90 -X POST \
   -H "Authorization: Bearer $SPOR_TOKEN" -H "Content-Type: application/json" \

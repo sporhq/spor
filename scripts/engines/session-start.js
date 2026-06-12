@@ -61,11 +61,19 @@ async function sessionStart(input) {
       u.spawnDetached([path.join(__dirname, "link-commits.js"), cwd]);
     }
 
-    // Fetch the standing briefing. Budget 6s. Fail open.
-    const brief = await u.curl(`${u.serverBase()}/v1/briefing/${slug}`, {
-      headers: u.bearer(),
-      timeoutMs: 6000,
-    });
+    // Fetch the standing briefing. Budget 6s. Fail open. Repo fingerprints
+    // (root shas + normalized remotes) ride along so the server can learn
+    // them onto the project node and spot renames — an unknown slug with a
+    // known fingerprint files an alias proposal in the queue
+    // (task-cc-project-identity-nodes). Local git calls, ms-cheap, fail-open.
+    const fp = cwd && fs.existsSync(cwd) ? u.repoFingerprints(cwd) : [];
+    const brief = await u.curl(
+      `${u.serverBase()}/v1/briefing/${slug}${fp.length ? `?fp=${encodeURIComponent(fp.join(","))}` : ""}`,
+      {
+        headers: u.bearer(),
+        timeoutMs: 6000,
+      }
+    );
     const host = u.serverHost();
 
     // Tier-2: questions routed to this identity + the open front, riding one
@@ -168,27 +176,48 @@ ${body}`;
     return null;
   }
   const count = files.length;
-  // grep -lm1 "^project: $SLUG$" — files whose content has that exact line.
-  let projCount = 0;
+  // Project identity (task-cc-project-identity-nodes): a resident `type:
+  // project` node whose `slugs:` register (or id) includes this session's
+  // slug widens matching to every alias it owns — historical stamps stay as
+  // written and resolve at read time. One scan collects both the per-file
+  // `project: X` lines (the old grep) and the project nodes; with no project
+  // node claiming the slug the alias set is {slug} and behavior is
+  // byte-identical to the original.
+  const stamps = []; // per file: the exact `project: ` line values it carries
+  const projects = []; // resident project nodes: { id, slugs }
   for (const f of files) {
     try {
-      const raw = fs.readFileSync(path.join(nodes, f), "utf8");
-      if (raw.split("\n").includes(`project: ${slug}`)) projCount++;
-    } catch {}
+      const lines = fs.readFileSync(path.join(nodes, f), "utf8").split("\n");
+      stamps.push(lines.filter((l) => l.startsWith("project: ")).map((l) => l.slice(9)));
+      if (lines.includes("type: project")) {
+        const id = lines.find((l) => l.startsWith("id: "))?.slice(4).trim() ?? "";
+        const m = lines.find((l) => l.startsWith("slugs:"))?.match(/\[([^\]]*)\]/);
+        projects.push({ id, slugs: (m?.[1] ?? "").split(",").map((s) => s.trim()).filter(Boolean) });
+      }
+    } catch {
+      stamps.push([]);
+    }
   }
+  const owner = projects.find((p) => p.id === slug || p.slugs.includes(slug));
+  const aliases = new Set([slug, ...(owner?.slugs ?? [])]);
+  const projCount = stamps.filter((vals) => vals.some((v) => aliases.has(v))).length;
   let ctx = `A Spor knowledge graph is active: ${count} nodes in ${nodes} (${projCount} tagged project: ${slug}). ${USAGE}`;
 
-  const briefFile = path.join(nodes, `brief-${slug}.md`);
-  if (fs.existsSync(briefFile)) {
+  // brief-<slug> lookup resolves the same aliases: exact slug first, then
+  // the owning project node's other slugs newest-first (last entry is the
+  // current name).
+  const briefCandidates = [slug, ...(owner?.slugs ?? []).slice().reverse().filter((s) => s !== slug)];
+  const briefSlug = briefCandidates.find((s) => fs.existsSync(path.join(nodes, `brief-${s}.md`)));
+  if (briefSlug) {
     let raw = "";
     try {
-      raw = fs.readFileSync(briefFile, "utf8");
+      raw = fs.readFileSync(path.join(nodes, `brief-${briefSlug}.md`), "utf8");
     } catch {}
     const body = nodeBody(raw);
     const version = raw.match(/^version: *(.*)$/m)?.[1] ?? "";
     ctx += `
 
-## Standing project briefing (brief-${slug} v${version || "1"}, machine-compiled — correct it with /spor:correct, don't silently work around errors)
+## Standing project briefing (brief-${briefSlug} v${version || "1"}, machine-compiled — correct it with /spor:correct, don't silently work around errors)
 
 ${body}`;
   }

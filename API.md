@@ -214,7 +214,7 @@ endpoint is the REST twin of a core call:
 | Endpoint | Typical caller | Semantics |
 |---|---|---|
 | `GET /v1/status` | session-start, monitoring | `{node_count, projects: {...}, head, uptime, metrics}`; doubles as the health check. `?titles=1` adds `titles: [{id, type, project, title}]` — the one-round-trip graph index the distiller dedups against |
-| `GET /v1/briefing/{project}` | session-start | read the `brief-<project>` node → `{found, version, body, graph_status}` |
+| `GET /v1/briefing/{project}` | session-start | read the `brief-<project>` node → `{found, version, body, graph_status}`. The slug resolves through project-node aliases (GRAPH.md "Project identity nodes") before lookup. Optional `?fp=root:<sha>,remote:<host/path>,...` carries the repo's fingerprints: the server learns them onto the owning project node, and an unknown slug with a known fingerprint files an alias proposal in the queue |
 | `POST /v1/digest` `{query, min_sim?}` | prompt-context | digest-mode compile → `{found, text}`; `found: false` is a successful empty result |
 | `GET /v1/nodes/{id}` | /spor:brief | `get_node` semantics; when a live inbound resolves/answers edge contradicts a still-open status the response carries `resolution`, and open gardener findings about the node ride along as `open_findings` |
 | `POST /v1/nodes` | drain-outbox, mechanical writers | `put_node` semantics, batch: `{nodes: [...], if_exists: "skip"}` (entries may be raw strings or `{node, if_exists, revision}`) → `{results: [...]}`, 207 when any entry failed |

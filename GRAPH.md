@@ -88,6 +88,43 @@ Rules:
 | correction | `corr-`   | standing fix to a briefing: pin/exclude/guidance (never traversed) |
 | capture-pending | `cap-` | raw captured text that fit no schema; filed by the server for later triage (QUEUE.md §2.3) |
 | finding    | `find-`   | a gardener observation about another node, filed as a queue item (QUEUE.md §6) |
+| project    | `proj-`   | durable project identity: slug aliases + repo fingerprints; heals renames at read time (below) |
+
+## Project identity nodes
+
+A session's project slug is derived (repo basename, kebab-cased — see the
+plugin's CLAUDE.md), so a rename would orphan every historical `project:`
+stamp. A `type: project` node makes the identity data instead
+(task-cc-project-identity-nodes):
+
+```markdown
+---
+id: proj-spor
+type: project
+title: Spor
+summary: The Spor knowledge-graph plugin and server.
+slugs: [cc-context-substrate, spor]
+fingerprints: [remote:github.com/sporhq/spor, root:47520dcafe1b]
+date: 2026-06-12
+---
+```
+
+- `slugs` lists every slug that has ever referred to the project, oldest
+  first; the last entry is the current name. The `project:` stamp on
+  existing nodes **never rewrites** — it is a historical fact about where
+  work was discovered. Consumers resolve aliases at read time instead:
+  queue project filters, mutes, and the session-start `brief-<slug>` lookup
+  all match any listed alias, so one edit to one node heals all history.
+- `fingerprints` accumulates repo evidence: `root:<sha>` (root commits) and
+  `remote:<host/path>` (remote URLs with scheme, userinfo, and `.git`
+  stripped; ssh and https spellings converge). An unknown slug arriving
+  with a known fingerprint is rename evidence — the server files the alias
+  as a queue item for a human to confirm. It is an accumulating set, not a
+  derivation rule: no single fingerprint survives every history rewrite.
+- A committed `.spor` marker file at a repo root (`project: <id>`) beats
+  all inference — escape hatch for forks, moves, and rewrites. Zero-config
+  slug inference stays the default, and a graph with no project nodes
+  behaves exactly as before.
 
 ## Edge types and traversal weights
 

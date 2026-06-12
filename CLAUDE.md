@@ -153,15 +153,19 @@ A session's project is `basename $(git rev-parse --show-toplevel)` of its
 cwd (falling back to `basename cwd`), normalized to kebab-case: lowercased,
 runs of non-alphanumerics collapsed to `-`, trimmed (`My_Repo` → `my-repo`,
 `MyProject.AppHost` → `myproject-apphost`; identity for names
-already kebab-case). The normalization lives in ONE place —
-`projectSlug()` in `scripts/engines/util.js` — and must stay in sync with
-the server's `SLUG_RE` (`^[a-z0-9][a-z0-9-]*$`, in the server repo's
-`server/rest.js`), which rejects anything non-canonical.
+already kebab-case). A committed `.spor` marker file at the repo root
+(`project: <id>`) beats inference; the value must already be canonical —
+a non-matching value is ignored, not normalized. The normalization lives
+in ONE place — `projectSlug()` in `scripts/engines/util.js` — and must
+stay in sync with the server's `SLUG_RE` (`^[a-z0-9][a-z0-9-]*$`, in the
+server repo's `server/rest.js`), which rejects anything non-canonical.
 The slug determines which `brief-<slug>` node session-start injects, the
-`project:` stamp on distilled nodes, and journal tagging. Changing this
-breaks the association between existing nodes and their repos — renaming a
-repo changes its slug and orphans the old project tag (the 2026-06-12
-substrate→spor rename did exactly this; see brief-spor / brief-spor-server).
+`project:` stamp on distilled nodes, and journal tagging. Renaming a repo
+changes its slug, which used to orphan the old project tag (the 2026-06-12
+substrate→spor rename did exactly this; see brief-spor / brief-spor-server)
+— `type: project` nodes with `slugs:` alias lists heal this at read time
+(GRAPH.md "Project identity nodes"); historical `project:` stamps never
+rewrite.
 
 ## Design context
 
