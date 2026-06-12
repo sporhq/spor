@@ -72,6 +72,12 @@ Rules:
   will not parse it as a trailer. Stamped automatically by the hooks when a commit carries the
   trailer; `GET /v1/commits/{sha}` answers the reverse lookup. Only
   milestone commits deserve hand-written entries.
+- `wake` is an optional `YYYY-MM-DD` scalar on queueable nodes (QUEUE.md
+  §4): scheduled dormancy. The decision queue counts the node as `dormant`
+  instead of ranking it until the date arrives, then surfaces it to every
+  viewer — the renew-the-cert / schedule-the-audit shape, kept with the
+  work instead of in one person's calendar. Everything else (compiles,
+  briefings, edges) sees a dormant node normally.
 - One fact per node. If you're writing "also" a lot, split it.
 
 ## Node types and id prefixes

@@ -516,3 +516,65 @@ test("registry: seed queueability — work types yes, record types no", () => {
     assert.equal(reg.isQueueable(t), false, `${t} not queueable`);
   }
 });
+
+// ---------- scheduled dormancy: wake dates (QUEUE.md §4) ----------
+
+// Raw node with a wake: field (the node() helper has no slot for it).
+const wakeNode = (id, wake, { status = "open", priority } = {}) => [
+  `${id}.md`,
+  `---
+id: ${id}
+type: task
+project: my-project
+title: Title of ${id}
+summary: Standalone summary for ${id} used by wake tests.
+status: ${status}
+${priority ? `priority: ${priority}\n` : ""}wake: ${wake}
+date: 2026-06-01
+---
+Body of ${id}.
+`,
+];
+
+test("wake: a future date parks the item — counted dormant, not ranked, for every viewer", () => {
+  const g = tmpGraph(Object.fromEntries([
+    wakeNode("task-renew-cert", "2027-05-01", { priority: "p1" }),
+    node("task-now", "task", { status: "open" }),
+  ])).load();
+  const r = rankQueue(g, { now: NOW });
+  assert.deepEqual(r.items.map((i) => i.id), ["task-now"]);
+  assert.equal(r.dormant, 1);
+  assert.equal(r.count, 1, "dormant items are not in count");
+});
+
+test("wake: on and after the date the item surfaces with priority intact and a woke marker", () => {
+  const g = tmpGraph(Object.fromEntries([
+    wakeNode("task-renew-cert", "2026-06-11", { priority: "p1" }),
+    node("task-plain", "task", { status: "open" }),
+  ])).load();
+  const r = rankQueue(g, { now: NOW }); // NOW is exactly 2026-06-11T00:00Z — wake day
+  assert.equal(r.items[0].id, "task-renew-cert", "p1 ranks first once awake");
+  assert.match(r.items[0].why, /priority p1/);
+  assert.match(r.items[0].why, /woke 2026-06-11 \(was dormant\)/);
+  assert.equal(r.dormant, undefined);
+});
+
+test("wake: an unparseable date fails open to awake (the validator warns instead)", () => {
+  const g = tmpGraph(Object.fromEntries([
+    wakeNode("task-bad-wake", "next-spring"),
+  ])).load();
+  const r = rankQueue(g, { now: NOW });
+  assert.deepEqual(r.items.map((i) => i.id), ["task-bad-wake"]);
+  assert.equal(r.dormant, undefined);
+  const v = graph.validateGraph(g.nodesDir);
+  assert.ok(v.warnings.some((w) => w.includes("wake 'next-spring' is not a parseable date")), v.warnings.join("; "));
+});
+
+test("wake: dormant wins over muted in the counts — graph state before personal preference", () => {
+  const g = tmpGraph(Object.fromEntries([
+    wakeNode("task-later", "2027-01-01"),
+  ])).load();
+  const r = rankQueue(g, { now: NOW, viewer: { queue_mute: ["task-later"] } });
+  assert.equal(r.dormant, 1);
+  assert.equal(r.muted, undefined);
+});

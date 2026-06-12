@@ -357,6 +357,21 @@ state — items stay live and visible to everyone else — and the hidden
 count is reported (`muted: N` on the result, a trailing line on `my_queue`)
 so the queue never silently truncates.
 
+Scheduled dormancy is the graph-state counterpart of the mute: a queueable
+node may carry `wake: YYYY-MM-DD` — "nothing to do against this until that
+date". Before the date the queue counts it (`dormant: N`) instead of
+ranking it; from the date on it surfaces to **every** viewer with its
+priority and signals intact, why-line flagged `woke <date> (was dormant)`.
+This is the renew-the-cert / schedule-the-audit shape: the classic failure
+is a reminder in one person's calendar — the owner leaves, the reminder
+leaves with them, the expiry becomes an incident. `wake:` keeps the
+schedule with the work, not the person: no scheduler or calendar exists
+anywhere, the queue simply compares dates at read time, and whoever looks
+at the queue after the wake date sees the item. An unparseable date fails
+open to awake (surfaced work beats silently hidden work; the validator
+warns), and a dormant item is still live graph state — compiles, briefings,
+and edges see it normally; only queue ranking waits.
+
 ## 5. Surfacing: the decision queue
 
 The queue is a compile mode, not a new store:

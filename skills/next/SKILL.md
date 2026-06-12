@@ -43,7 +43,9 @@ are identical.)
 ## Presenting and acting
 
 Show the ranked items with their `why` lines and any `suggest: close` flags —
-the signals are advisory; the human picks. Then:
+the signals are advisory; the human picks. If the result carries `muted` or
+`dormant` counts, mention them (hidden by the viewer's `queue_mute` /
+parked by a `wake:` date — never silently dropped). Then:
 
 1. **Item picked to DO** → start pre-briefed: run a full root compile for it
    (/spor:brief `<item-id>`, or locally
@@ -56,3 +58,9 @@ the signals are advisory; the human picks. Then:
 3. **`capture-pending` item** → read it (`GET /v1/nodes/<id>`), decide what
    it should have been, write the proper node(s), then mark the pending node
    resolved with `set_status`.
+4. **Item with nothing actionable until a date** (waiting on a measurement
+   window, a renewal, an external milestone) → set `wake: YYYY-MM-DD` on the
+   node (`put_node`; locally edit the file). The queue parks it as `dormant`
+   and resurfaces it to everyone on that date (QUEUE.md §4). Prefer this
+   over a personal `queue_mute` whenever the dormancy is a fact about the
+   work rather than a viewer preference.
