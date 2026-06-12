@@ -19,7 +19,7 @@ fallback). Project-local installs go in `.opencode/plugins/`. Environment
 is the usual set (legacy `SUBSTRATE_*` names are still read):
 
 ```sh
-export SPOR_SERVER=https://your-spor-server   # remote mode
+export SPOR_SERVER=https://spor.example.com   # remote mode
 export SPOR_TOKEN=spor_pat_...
 # Distiller backend (prompt on stdin -> response on stdout); without the
 # claude CLI installed, route through opencode itself:
@@ -47,5 +47,5 @@ export SPOR_DISTILL_CMD='opencode run "$(cat)"'
   access:
 
   ```json
-  { "mcp": { "spor": { "type": "remote", "url": "https://your-spor-server/mcp", "headers": { "Authorization": "Bearer {env:SPOR_TOKEN}" } } } }
+  { "mcp": { "spor": { "type": "remote", "url": "https://spor.example.com/mcp", "headers": { "Authorization": "Bearer {env:SPOR_TOKEN}" } } } }
   ```

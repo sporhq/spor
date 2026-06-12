@@ -36,5 +36,5 @@ For on-demand graph access, add the Spor MCP server to
 `~/.copilot/mcp-config.json`:
 
 ```json
-{ "mcpServers": { "spor": { "type": "http", "url": "https://your-spor-server/mcp", "headers": { "Authorization": "Bearer $SPOR_TOKEN" } } } }
+{ "mcpServers": { "spor": { "type": "http", "url": "https://spor.example.com/mcp", "headers": { "Authorization": "Bearer $SPOR_TOKEN" } } } }
 ```

@@ -41,7 +41,7 @@ node --test                                 # test suite, incl. conformance gold
 ```
 
 For team mode (a shared graph served over REST and MCP), see
-[Team mode](#team-mode-the-spor-server).
+[Team mode](#team-mode).
 
 ## Why a graph, not RAG
 
@@ -88,7 +88,7 @@ Two mechanisms make the system correctable rather than just queryable:
 | On demand | `/spor:defer` | Captures deferred or discovered work into the graph the moment it appears |
 | On demand | `/spor:next` | Presents the decision queue: deferred work and open questions, ranked by graph signals |
 | Bootstrap | `spor-backfill` agent | Mines git history / docs / issue trackers into a first graph (~40–80 nodes), prioritizing lineage edges over content volume |
-| Every 2 hours | cron (server repo) | Opus reviews every recorded Haiku prompt/response, files eval cases for improvable ones, and ships eval-gated prompt-template improvements (see [the Haiku quality loop](#the-haiku-quality-loop-record--review--improve)) |
+| Every 2 hours | Spor server (team mode) | Opus reviews every recorded Haiku prompt/response, files eval cases for improvable ones, and ships eval-gated prompt-template improvements (see [the Haiku quality loop](#the-haiku-quality-loop-record--review--improve)) |
 
 Every hook has two modes: **local** (the default, reading `$SPOR_HOME`
 directly) and **remote** (when `SPOR_SERVER`/`SPOR_TOKEN` are set, calling
@@ -119,16 +119,15 @@ the client that home is `~/.spor` (a legacy `~/.substrate` is used if
 
 The prompts themselves are `{{VAR}}` templates in
 [prompts/client/](prompts/client/), re-read on every call, so a template
-edit needs no restart. A cron job in the server repo
-(`review/run-review.sh`) runs every two hours, handing unreviewed records
-to a headless Opus session, which grades every response and files a replayable eval case for
-each one that could have been better. Once a template accumulates 3+ cases
-sharing a weakness, the job drafts a candidate template and adopts it only
-when the eval harness (Haiku replay, Opus judge — also in the server repo)
-scores it above the current template with no per-case regression,
-committing the winner. Review state (cursor, batches, reports, eval cases)
-lives under `~/.spor/llm-review/`, outside this repo, because eval cases
-embed session-transcript excerpts.
+edit needs no restart. The Spor server closes the loop: every two hours it
+hands unreviewed records to a headless Opus session, which grades every
+response and files a replayable eval case for each one that could have
+been better. Once a template accumulates 3+ cases sharing a weakness, it
+drafts a candidate template and adopts it only when the eval harness
+(Haiku replay, Opus judge) scores it above the current template with no
+per-case regression, committing the winner. Review state (cursor, batches,
+reports, eval cases) lives under `~/.spor/llm-review/`, outside this repo,
+because eval cases embed session-transcript excerpts.
 
 ## Storage: one graph, outside your repos
 
@@ -147,23 +146,21 @@ This is deliberate:
 Nodes are one-fact-per-file markdown with frontmatter (`id`, `type`,
 `project`, `summary`, typed `edges`). Full format spec: [GRAPH.md](GRAPH.md).
 
-## Team mode: the Spor server
+## Team mode
 
-Host the graph on the Spor server and point clients at it. The client
-contract is [API.md](API.md); the server itself — token minting, the daemon,
-operator runbooks — lives in a separate, private repo (`sporhq/spor-server`),
-with its own setup docs.
+Team mode is the Spor product: one graph served to your whole team —
+humans and agents — over REST and MCP, with per-identity attribution on
+every node, transactional writes, the decision queue, question routing,
+and the Haiku quality loop running for you around the clock. Everything in
+this repo is the complete single-player experience; team mode is what you
+buy when the graph should be shared. [API.md](API.md) is the full client
+contract the server implements.
+
+Pointing a client at a team server takes two env vars — hooks switch to
+remote mode and fail open (local cache, or nothing) when the server is
+unreachable, and `~/.spor` becomes the client-side cache/outbox home:
 
 ```bash
-# The server consumes this repo's lib/ as a file: dependency on a sibling
-# checkout (resolution order: $SPOR_LIB, then the installed @sporhq/spor
-# package, then ../spor). Only a name-reservation stub is on npm
-# (@sporhq/spor@0.1.0) — clone this repo as a sibling rather than
-# npm-installing it, or the installed stub wins the resolution order
-# over ../spor.
-
-# In each client environment: hooks switch to remote mode, fail open when
-# the server is down. ~/.spor becomes the client-side cache/outbox home.
 export SPOR_SERVER=https://spor.example.com
 export SPOR_TOKEN=spor_pat_...
 ```
@@ -191,7 +188,7 @@ Cowork and other MCP clients connect to `${SPOR_SERVER}/mcp`
   `registry.js`, `resolution.js`, `sandbox.js`, and `commit-inference.js`
   as façades over pure kernels in `lib/kernel/`; IO lives in `lib/shell/`,
   seed schemas in `lib/seed/`. The engine half (lenses, routing, workflow
-  runs, rendering) lives in the server repo.
+  runs, rendering) ships with the Spor server.
 - `conformance/` — language-neutral golden cases (inputs → outputs) for the
   kernel, run by the test suite
 - `hooks/hooks.json` — Claude Code hook wiring (see the table above)

@@ -27,7 +27,7 @@ into `~/.gemini/extensions/spor/`.
 Then approve the hooks (`/hooks panel`) and set the environment:
 
 ```sh
-export SPOR_SERVER=https://your-spor-server   # remote mode
+export SPOR_SERVER=https://spor.example.com   # remote mode
 export SPOR_TOKEN=spor_pat_...
 # Distiller backend (prompt on stdin, response on stdout):
 export SPOR_DISTILL_CMD='gemini --model gemini-2.5-flash'
@@ -53,7 +53,7 @@ export SPOR_DISTILL_CMD='gemini --model gemini-2.5-flash'
 - For on-demand graph access, add the Spor MCP server to settings:
 
   ```json
-  { "mcpServers": { "spor": { "httpUrl": "https://your-spor-server/mcp", "headers": { "Authorization": "Bearer $SPOR_TOKEN" } } } }
+  { "mcpServers": { "spor": { "httpUrl": "https://spor.example.com/mcp", "headers": { "Authorization": "Bearer $SPOR_TOKEN" } } } }
   ```
 
 - `GEMINI.md` users: point `contextFileName` at `AGENTS.md` and run

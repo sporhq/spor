@@ -236,15 +236,15 @@ else in this system:
   code is reviewed). The hardening path SHIPPED once the policy floor
   landed role separation (the trigger named in dec-lens-custom-wasm-timing):
   the server now executes attached code — schema verbs and lens `## custom`
-  blocks alike — in QuickJS-in-wasm (`server/sandbox.js`, server-side; lives
-  in the private spor-server repo; quickjs-emscripten), same capability surface so the swap was an engine
+  blocks alike — in a QuickJS-in-wasm sandbox (server-side,
+  quickjs-emscripten), same capability surface so the swap was an engine
   change: JSON boundary, no clock/randomness, codegen neutralized, frozen
   guest intrinsics, deadline interrupt (the fuel limit), plus a per-runtime
   memory cap node:vm could not enforce. The wasm module instantiates once
   at boot; calls stay synchronous. `lib/sandbox.js` remains the zero-dep
-  node:vm engine for local mode (`SPOR_SANDBOX=vm` is the ops escape
-  hatch, server-side; lives in the private spor-server repo — the server otherwise refuses to boot without the wasm engine
-  rather than silently degrading). Sandboxing secures execution, not
+  node:vm engine for local mode (`SPOR_SANDBOX=vm` is the server-side ops
+  escape hatch — the server otherwise refuses to boot without the wasm
+  engine rather than silently degrading). Sandboxing secures execution, not
   semantics — review is what secures semantics.
 
 Action verbs beyond validate/transitions/queueSignals are deliberately not
@@ -262,8 +262,8 @@ levels, and keeping them distinct is the design:
    last author. The floor is native because the policy layer cannot govern
    its own approval without circularity: a proposer could otherwise
    propose a permissive policy and approve it. One ops escape hatch:
-   `SPOR_SOLO=1` (server-side; lives in the private spor-server repo — the
-   legacy `SUBSTRATE_SOLO` spelling is still read)
+   `SPOR_SOLO=1` (a server-side env var — the legacy `SUBSTRATE_SOLO`
+   spelling is still read)
    waives the self-approval ban for single-identity orgs, where the
    floor would deadlock every proposal. The waiver is
    loud — boot announces SOLO MODE, each waived approval carries a result
@@ -388,8 +388,7 @@ was reverted), captures pending schema decisions, cold `in-progress` items.
 Backlog grooming stops being a meeting and becomes queue items with
 compiled context.
 
-As shipped (step 5, `server/gardener.js`, server-side; lives in the private
-spor-server repo): findings are ordinary
+As shipped (step 5, the server-side gardener): findings are ordinary
 `type: finding` nodes (queueable seed schema, prefix `find-`), written
 through the validated/attributed write path (`authored_via: gardener`) with
 deterministic ids so re-sweeps are idempotent; when a finding's condition
@@ -401,7 +400,7 @@ edges excluded) and **cold-work** (`in-progress` with no neighborhood
 activity over 14 days). Stale *tasks*, capture-pending nodes, and proposed
 schemas already self-surface in the queue, so no duplicate findings are
 filed for them. Trigger: `POST /v1/gardener` on demand, or
-`SPOR_GARDENER_MS` (server-side; lives in the private spor-server repo) for
+`SPOR_GARDENER_MS` (a server-side env var) for
 an in-process interval (off by default — the schedule is ops' choice). Deferred: "done but contradicted" (needs
 git-history analysis of resolving artifacts).
 
@@ -462,10 +461,9 @@ the structural truth:
    transitions / queueSignals / upgrade fns) is parsed and preserved but not
    executed — the §2.4 sandbox arrives with the first consumer.
 2. **Capture path** — ✅ SHIPPED. `capture` MCP tool + `POST /v1/capture` +
-   server-side ingestion model (`server/ingest.js` and `SPOR_INGEST_CMD` are
-   server-side; they live in the private spor-server repo: injected fn →
-   `SPOR_INGEST_CMD` → `ANTHROPIC_API_KEY` direct API → `claude -p`
-   fallback) with one-bounce self-correction and the capture-pending
+   server-side ingestion model (injected fn → `SPOR_INGEST_CMD` →
+   `ANTHROPIC_API_KEY` direct API → `claude -p` fallback, all
+   server-side) with one-bounce self-correction and the capture-pending
    durability rule (§2.3); the remote-mode distiller is a capture client
    (fact-finder prompt, schema knowledge left the script; local mode
    unchanged); `/spor:defer` skill; standing capture instruction in the
@@ -522,8 +520,7 @@ which held: each landed as one commit on top of the registry.
 ## 8. Open questions
 
 - **Ingestion credential** — RESOLVED with step 2: the server invokes its
-  ingestion model (all server-side; these env vars live in the private
-  spor-server repo) via, in precedence order, `SPOR_INGEST_CMD` (ops
+  ingestion model (all server-side) via, in precedence order, `SPOR_INGEST_CMD` (ops
   escape hatch), `ANTHROPIC_API_KEY` (direct Messages API, headless
   deploys), or a `claude -p` CLI fallback (boxes with Claude Code auth, the
   dogfood case). The server design spec's non-goal was rewritten to the coherent line:

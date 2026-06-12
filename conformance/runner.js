@@ -118,7 +118,7 @@ const KINDS = {
 
 };
 // The lens/viewtree and workflow-run kinds moved with their kernels to the
-// engine half (spor-server lib-engine/conformance — LIB-BOUNDARY.md); this
+// server-side engine half, which keeps its own conformance goldens; this
 // runner covers the client-core kinds only.
 
 function cases() {

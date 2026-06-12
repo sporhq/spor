@@ -22,7 +22,7 @@ is just a manifest over `bin/spor-hook`.
 4. Environment (same variables as the Claude Code plugin):
 
    ```sh
-   export SPOR_SERVER=https://your-spor-server   # remote mode
+   export SPOR_SERVER=https://spor.example.com   # remote mode
    export SPOR_TOKEN=spor_pat_...
    # Distiller backend — Codex hosts usually won't have the claude CLI.
    # Contract: prompt on stdin, response on stdout.
@@ -59,6 +59,6 @@ is just a manifest over `bin/spor-hook`.
 
   ```toml
   [mcp_servers.spor]
-  url = "https://your-spor-server/mcp"
+  url = "https://spor.example.com/mcp"
   bearer_token_env_var = "SPOR_TOKEN"
   ```

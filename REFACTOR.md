@@ -3,9 +3,9 @@
 Design record for the deep-refactor track: making Spor's behavior
 language-independent now that viability is proven, with self-hosting as a
 first-class requirement (dec-cc-spor-self-hosting-first-class — employer
-dogfood approved, sensitive graph content). Companion to SPLIT.md (repo
-topology + rename, in the private server repo); this doc covers what happens *inside* lib/ and where the
-implementation language is allowed to vary.
+dogfood approved, sensitive graph content). The repo topology and rename
+have their own server-side design record; this doc covers what happens
+*inside* lib/ and where the implementation language is allowed to vary.
 
 Grounded in a 2026-06-12 scan of lib/ (17 modules, 4,384 lines).
 
@@ -75,9 +75,9 @@ Sources: the existing test fixtures, the Meridian example corpus
 - Runner one: `node --test` over the JS kernel (replaces nothing; adds the
   oracle).
 - Runner two (later): the same fixtures over any wasm kernel build.
-- Allium: distill kernel obligations into specs alongside
-  `specs/workflow-runs.allium` (in the private server repo) so the contract is
-  recorded twice — executable fixtures + readable spec.
+- Allium: distill kernel obligations into specs alongside the server-side
+  workflow-runs spec so the contract is recorded twice — executable
+  fixtures + readable spec.
 
 This suite is the deliverable that makes every later step cheap. It also
 becomes the public repo's compatibility promise.
@@ -113,16 +113,16 @@ reimplementation honors the REST/MCP contract, verified by the server test
 suite repointed at a candidate. Server distribution (container image / single
 executable / a possible Rust server) and the pilot's hardening story (LLM
 egress and the data-flow map, auth/SSO, backup and ops, license/IP) are
-designed in the private spor-server repo's docs, not here — this client repo
-owns only the contract (API.md) those plans honor.
+designed server-side, not here — this client repo owns only the contract
+(API.md) those plans honor.
 
-## 5. Sequencing (deep refactor prioritized, revised from SPLIT.md, in the private server repo)
+## 5. Sequencing (deep refactor prioritized)
 
 1. Finish task-cc-node-port-hook-engines (in flight; rewrites the same files).
 2. **Kernel/shell split + conformance suite** (§1, §2) — in place, before the
    rename/split, so the public repo is born with the clean layout and the
    suite.
-3. Rename + repo split per SPLIT.md (in the private server repo; unchanged, now moves cleaner boundaries).
+3. Rename + repo split (done 2026-06-12; unchanged, now moves cleaner boundaries).
 4. **Rust spike** (§3) → decision node → staged kernel port if positive.
 5. Self-hosting hardening (§4) runs in parallel with 2-4 against the current
    Node server; container image and egress docs are not gated on anything
