@@ -213,42 +213,30 @@ Tiered so each step is independently useful. The expensive parts (compiler,
 corrections, distillation, node format) exist; what follows is transport
 and workflow.
 
-### Tier 1 — remote MCP server
-The spine of team mode, and the only path to Cowork: **Cowork has no hook
-support** (plugin hooks silently never fire there; skills + MCP connectors
-are the shared extension surface). Client contract: [API.md](API.md).
-- [x] MCP server wrapping the compiler: `query_graph`, `get_node`,
-  `put_node`, `propose_correction`, `my_queue`
-- [x] Bearer-token (Phase A) identity → node attribution (including on
-  distilled nodes); server-side transactional writes. (OAuth identity for
-  Cowork/claude.ai connectors — Phase B — is still pending.)
-- [x] Claude Code hooks call the server instead of local files; Cowork gets
-  a bundled skill that pulls via `query_graph` (no ambient injection there —
-  the skill description does the triggering, and will need iteration)
-- [x] Multi-root compile (e.g. local personal graph + remote team graph)
-- [ ] Verify the reported Cowork bug where remote-connector tool calls can
-  arrive without bound auth tokens before trusting attribution
+### Tier 1 — remote MCP, the spine of team mode
+The server wraps the compiler behind MCP (`query_graph`, `get_node`,
+`put_node`, `propose_correction`, `my_queue`) and REST, with per-identity
+attribution on every write — including distilled nodes — server-side
+transactional writes, and multi-root compile (a local personal graph
+layered on the remote team graph). Claude Code hooks switch to remote mode
+with two env vars. **Cowork has no hook support** (plugin hooks silently
+never fire there), so its path into the graph is the MCP connector plus a
+bundled skill that pulls briefings explicitly. Client contract:
+[API.md](API.md).
 
 ### Tier 2 — question routing / the decision queue
 The original Spor thesis materializing: home is a decision queue.
-- [x] `question` nodes — filed deliberately (`ask_question` tool /
-  `POST /v1/questions`) with the empty `query_graph` result nudging the
-  session to ask; routing is deterministic (the server's routing module):
-  the steward of the closest relevance-neighborhood node, ties by sorted
-  id, no steward → unrouted and visible to everyone
-- [x] `person` nodes + `stewards`/`assigned` edges — seed schemas, plus the
-  `$viewer` lens binding: both doors map the token's email to its person
-  node and overwrite `params.viewer` (never caller-supplied). Routing
-  semantics still open below.
-- [ ] Stewardship map population (start dumb: CODEOWNERS + an explicit map)
-- [x] Pull-based delivery: `my_queue` and `GET /v1/queue` carry the
-  routed-to-me `questions` (token → person, the `$viewer` shape), open
-  questions rank in the same queue, and session-start injects
-  "N questions routed to you" fail-open
-- [ ] Slack webhook for urgent questions
-- [x] Answer loop is lineage by construction: any node with an `answers`
-  edge (seed, weight 0.7) answers the question; flipping it to
-  `status: answered` (terminal) retires it from the queue
+`question` nodes are filed deliberately (`ask_question` /
+`POST /v1/questions`), with an empty `query_graph` result nudging the
+session to ask. Routing is deterministic: the question goes to the steward
+of the closest relevance-neighborhood node (ties by sorted id; no steward →
+visible to everyone), via `person` nodes with `stewards`/`assigned` edges
+and the `$viewer` binding that maps the caller's identity to its person
+node (never caller-supplied). Delivery is pull-based — `my_queue`,
+`GET /v1/queue`, and session-start's "N questions routed to you" — and the
+answer loop is lineage by construction: a node with an `answers` edge
+retires the question from the queue. Ahead: richer stewardship maps and
+push notification for urgent questions.
 
 ### Deliberately deferred
 - Team sync via a shared git remote on `~/.spor` (pull on SessionStart,
@@ -278,6 +266,3 @@ The original Spor thesis materializing: home is a decision queue.
 - `additionalContext` is capped at 10KB; the digest self-caps at 4.5KB.
 - The distiller spawns `claude -p`; the `SPOR_DISTILLING` env var is the
   recursion guard. Don't remove it.
-- Server auth is Phase A (admin-minted bearer tokens, full read/write — the
-  trust model of a shared repo). OAuth for Cowork/claude.ai connectors is
-  pending (OAuth Phase B, API.md §4), so Cowork can't connect yet.
