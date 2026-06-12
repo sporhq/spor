@@ -19,7 +19,7 @@ is just a manifest over `bin/spor-hook`.
    `~/.codex/config.toml`. Per-repo installs go in `<repo>/.codex/hooks.json`.)
 
 3. Approve the hooks in Codex's `/hooks` trust prompt on first run.
-4. Environment (same variables as the Claude Code plugin):
+4. Environment (the same variables on every host):
 
    ```sh
    export SPOR_SERVER=https://spor.example.com   # remote mode

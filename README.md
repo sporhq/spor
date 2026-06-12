@@ -1,268 +1,130 @@
 # Spor
 
-Spor is a Claude Code plugin that gives your sessions a shared memory: a
-typed, versioned knowledge graph of your work, holding decisions (including
-dismissed ones), issues, norms, specs, and tasks. It compiles compact,
-lineage-aware briefings from that graph at session start, on every prompt,
-and on demand, and sessions pay knowledge back in: an end-of-session
-distiller turns transcripts into new nodes.
+Spor gives your coding agent a memory that outlives the session and crosses
+between sessions and teammates. It is a typed, versioned knowledge graph of
+your work — decisions (including the ones you dismissed), issues, norms,
+specs, tasks — that your agent reads from and writes back to. Conversation
+goes in; briefings come out. When work starts, the session is briefed from
+the graph; when it ends, the transcript is distilled into a node or two and
+paid back in.
 
-The name is Norwegian — *spor*, the track something leaves. The long-term
-aim is a team graph shared by humans and agents, where a question the graph
-can't answer routes to the engineer who can, and the answer flows back as a
-node. See [Roadmap](#roadmap).
+The name is Norwegian — *spor*, the track something leaves.
 
 ## Quickstart
 
+Create the graph home (this is yours, kept outside any code repo):
+
 ```bash
-# 1. Create the graph home
 mkdir -p ~/.spor/nodes && git -C ~/.spor init \
   && printf 'journal/\n' > ~/.spor/.gitignore
+```
 
-# 2. Run Claude Code with the plugin (from your clone of this repo)
-claude --plugin-dir <path-to-your-clone>
+Then install for your agent. In Claude Code:
 
-# 3. Bootstrap a graph for your project (inside the session)
-#    "Use the spor-backfill agent to build a graph for this repo"
-#    …or just work: the distiller grows the graph session by session.
-
-# Persistent install
+```
 /plugin marketplace add sporhq/spor
 /plugin install spor@spor
 ```
 
-Sanity checks:
+For every other host — Codex CLI, Gemini CLI, Cursor, Copilot CLI, OpenCode,
+and an `AGENTS.md` fallback for hosts with no hook support — see
+[adapters/](adapters/).
 
-```bash
-node lib/validate.js                        # lint the graph
-node lib/compile.js --query "..." --digest  # what a prompt would inject
-node lib/compile.js --root <node-id>        # full neighborhood for a node
-node --test                                 # test suite, incl. conformance goldens
-```
+To start with a populated graph, point the bundled `spor-backfill` agent at
+your existing sources: it mines git history, design docs, and issue trackers
+into a first graph. Or skip that and just work — distillation grows the graph one session
+at a time.
 
-For team mode (a shared graph served over REST and MCP), see
-[Team mode](#team-mode).
+## What your agent gets, and gives back
 
-## Why a graph, not RAG
+The loop runs without you having to drive it:
 
-This plugin packages a context compiler validated by experiment (in a
-private research repo) on synthetic and scaled corpora:
+- A project briefing arrives when you begin work, so the session opens
+  knowing what's already been decided.
+- As you type, only what's relevant to the current prompt is pulled in —
+  often nothing, because nothing on the prompt path calls a model, so the
+  briefing lands in milliseconds rather than after a round trip.
+- While you work, Spor nudges you to capture findings worth keeping and links
+  your commits to the nodes they touch.
+- When the session ends, the transcript is distilled into zero to two new
+  nodes — including approaches you tried and rejected, kept on purpose so the
+  team doesn't relitigate them. Distillation runs a small, cheap model and
+  costs about $0.02 a session.
 
-- A planner agent fed a compiled briefing (~0.8k tokens) matched a
-  kitchen-sink context (~144k tokens) at 10/10 task quality, vs 4/10 with no
-  context — at ~2.6× lower cost, breaking even on compile cost at the first
-  agent.
-- Similarity-only retrieval (RAG, top-12) scored 7/10 on the same task: it
-  missed a constraint reachable only through lineage edges and was misled by
-  a near-miss node. Structure-aware compilation found both.
-- Distillation quality is model-tier-insensitive: Haiku distills sessions at
-  ~$0.02 with zero downstream quality loss.
+You can also ask for any of this directly: an on-demand briefing for a task,
+a correction when a briefing was wrong, a capture of work you're deferring,
+and a ranked queue of what to do next. In Claude Code these surface as
+`/spor:brief`, `/spor:correct`, `/spor:defer`, and `/spor:next`.
 
-The compiler has two arms. The **structural arm** walks typed edges
-(`supersedes`, `constrained-by`, `derived-from`, …) out from the task with
-weighted decay: relevance by lineage. The **content arm** runs tf-idf
-similarity across the whole graph, blind to edges. It is the counterweight
-that surfaces prior art from teams with no lineage connection to you — the
-anti-Conway's-law arm. Graph-aware fixups then resolve supersession (stale
-nodes are demoted to warnings and their supersessors pulled in), and org
-norms ride along in every compile.
+Corrections are durable. When a briefing includes something stale or misses
+something it should have known, you record the correction once, and every
+future briefing honors it — you don't re-explain it next week. Briefings are
+themselves versioned nodes, each carrying edges back to the sources it was
+built from and the corrections that shaped it. Debug the context, not the
+model.
 
-Two mechanisms make the system correctable rather than just queryable:
+## Why a graph, and not just retrieval
 
-- **Corrections are nodes.** When a briefing is wrong, you don't edit the
-  briefing. You record a correction (`pin`/`exclude`/free-text guidance)
-  that applies at every future compile. Debug the context, not the model.
-- **Briefings are nodes.** Versioned, with `derived-from` edges to every
-  source and `shaped-by` edges to corrections — context with provenance.
+The behavior above rests on a context compiler that was measured against the
+alternatives on the same planning task.
 
-## What runs when
+A planner agent fed a compiled briefing of about 0.8k tokens matched a
+144k-token kitchen-sink context at 10/10 task quality — versus 4/10 with no
+context at all — and did it at roughly 2.6× lower cost. Similarity-only
+retrieval (RAG over the top twelve matches) scored 7/10 on that same task: it
+missed a constraint that was only reachable by following lineage edges, the
+kind of link a graph keeps and a flat index does not. And the cost of
+distilling sessions back into the graph turned out to be insensitive to model
+tier — the cheap model writes nodes as well as an expensive one, at about
+$0.02 each.
 
-| Moment | Mechanism | What happens |
-|---|---|---|
-| Session start | `SessionStart` hook | Injects the standing `brief-<project>` briefing + graph status (no LLM, file read) |
-| Every prompt | `UserPromptSubmit` hook | Two-arm compile with the prompt as query over the whole org graph; injects a ≤4.5KB summary-resolution digest, or nothing when the graph isn't relevant (no LLM, milliseconds) |
-| Write/Edit/Bash | `PostToolUse` hook | Journals touched files (project-tagged) to the graph home's `journal/`, nudges live capture when a substantial prose write contains findings missing from the graph, and links git commits to nodes |
-| Session end | `SessionEnd` hook (async) | Distills transcript + journal into 0–2 project-stamped nodes — including dismissed approaches as `status: rejected` — via headless `claude -p --model haiku` (~$0.02); auto-commits the graph repo |
-| On demand | `/spor:brief <query\|node-id>` | Full compile + in-session distillation into a briefing; `--skeleton` persists it as a versioned briefing node |
-| On demand | `/spor:correct` | Records a standing correction node |
-| On demand | `/spor:defer` | Captures deferred or discovered work into the graph the moment it appears |
-| On demand | `/spor:next` | Presents the decision queue: deferred work and open questions, ranked by graph signals |
-| Bootstrap | `spor-backfill` agent | Mines git history / docs / issue trackers into a first graph (~40–80 nodes), prioritizing lineage edges over content volume |
-| Every 2 hours | Spor server (team mode) | Opus reviews every recorded Haiku prompt/response, files eval cases for improvable ones, and ships eval-gated prompt-template improvements (see [the Haiku quality loop](#the-haiku-quality-loop-record--review--improve)) |
+A graph holds two things a pile of documents cannot: the edges between facts,
+and the facts you decided against.
 
-Every hook has two modes: **local** (the default, reading `$SPOR_HOME`
-directly) and **remote** (when `SPOR_SERVER`/`SPOR_TOKEN` are set, calling
-the Spor server's REST twin and failing open to a local cache or to nothing
-if the server is unreachable). The legacy `SUBSTRATE_*` spellings of these
-variables are still read during the dual-read back-compat window. See
-[API.md](API.md) §6.
+## Storage and ownership
 
-## Other hosts (Codex, Gemini CLI, …)
+There is one graph per person, or one per organization. It lives at
+`$SPOR_HOME` (default `~/.spor/`), outside your code repositories, and is
+itself an ordinary git repo — its history is the history of what the team
+knows, separate from any code branch.
 
-The client is a portable core behind per-host adapters. The hook engines in
-`scripts/engines/` speak Claude Code's hook contract, and `bin/spor-hook`
-dispatches any host's payload onto them: manifests for Codex CLI, Gemini
-CLI, Cursor, and Copilot CLI, plus an in-process JS plugin for OpenCode.
-See [adapters/](adapters/) for install instructions, the fidelity table,
-the configurable distiller backend (`SPOR_DISTILL_CMD`), and the
-`AGENTS.md` floor for hook-less hosts (`bin/spor-hook agents-md`).
-
-## The Haiku quality loop (record → review → improve)
-
-Every prompt Spor sends to its small-model tier — the session-end distiller
-and the capture-nudge classifier — is recorded in full: prompt, response,
-template name + sha, latency, and the variables that built the prompt, as
-JSONL under `journal/llm-calls/` in the graph home that made the call. For
-the client that home is `~/.spor` (a legacy `~/.substrate` is used if
-`~/.spor` is absent); the server records its own calls under its
-`SPOR_HOME`.
-
-The prompts themselves are `{{VAR}}` templates in
-[prompts/client/](prompts/client/), re-read on every call, so a template
-edit needs no restart. The Spor server closes the loop: every two hours it
-hands unreviewed records to a headless Opus session, which grades every
-response and files a replayable eval case for each one that could have
-been better. Once a template accumulates 3+ cases sharing a weakness, it
-drafts a candidate template and adopts it only when the eval harness
-(Haiku replay, Opus judge) scores it above the current template with no
-per-case regression, committing the winner. Review state (cursor, batches,
-reports, eval cases) lives under `~/.spor/llm-review/`, outside this repo,
-because eval cases embed session-transcript excerpts.
-
-## Storage: one graph, outside your repos
-
-The graph lives at `$SPOR_HOME` (default `~/.spor/`) — **not** inside code
-repositories — and is its own git repo, auto-committed by the distiller.
-This is deliberate:
-
-- Knowledge distilled on branches that never merge survives. Dismissed
-  ideas are preserved: "we tried X and rejected it because Y" is exactly
-  what stops a team relitigating.
-- Edges cross repo boundaries; per-repo graphs would re-encode Conway's law.
-- The graph repo's history is the knowledge history, decoupled from code
-  history. Team sync arrives with the remote MCP server (see Roadmap),
-  which serves the same graph to every member.
-
-Nodes are one-fact-per-file markdown with frontmatter (`id`, `type`,
-`project`, `summary`, typed `edges`). Full format spec: [GRAPH.md](GRAPH.md).
+Because it sits outside your repos, knowledge distilled on a branch that
+never merges still survives, and dismissed ideas are kept deliberately rather
+than lost. Each node is one fact in its own plain-markdown file, with typed
+edges to the nodes it relates to; the format is documented in
+[GRAPH.md](GRAPH.md).
 
 ## Team mode
 
-Team mode is the Spor product: one graph served to your whole team —
-humans and agents — over REST and MCP, with per-identity attribution on
-every node, transactional writes, the decision queue, question routing,
-and the Haiku quality loop running for you around the clock. Everything in
-this repo is the complete single-player experience; team mode is what you
-buy when the graph should be shared. [API.md](API.md) is the full client
-contract the server implements.
+Single-player Spor is the whole client. Team mode is what you reach for when
+the graph should be shared: one graph served to your entire team — the people
+and their agents alike — with per-identity attribution on every node,
+transactional writes so concurrent work doesn't clobber, and a shared
+decision queue ranked across the team.
 
-Pointing a client at a team server takes two env vars — hooks switch to
-remote mode and fail open (local cache, or nothing) when the server is
-unreachable, and `~/.spor` becomes the client-side cache/outbox home:
+Team mode adds something a personal graph can't do: when a question can't be
+answered from what's already there, it routes to the person most likely to
+know, and their answer flows back into the graph as a node — so the next
+person who asks gets it from the graph instead.
+
+A client joins a team graph by pointing at it with two environment variables:
 
 ```bash
 export SPOR_SERVER=https://spor.example.com
-export SPOR_TOKEN=spor_pat_...
+export SPOR_TOKEN=...
 ```
 
-Tokens minted before the rename keep the `sub_pat_` prefix and stay valid;
-verification is hash-based and prefix-agnostic.
+Set those and the client talks to the team graph over REST and MCP; leave
+them unset and it runs entirely against your local `$SPOR_HOME`. If the team
+server is ever unreachable, the client fails open — it falls back to a local
+cache or to nothing, never blocking your session. The full contract a client
+programs against is in [API.md](API.md).
 
-Cowork and other MCP clients connect to `${SPOR_SERVER}/mcp`
-(`query_graph`, `get_node`, `put_node`, `propose_correction`, `my_queue`).
+## Pointers
 
-## Layout
-
-- `.claude-plugin/` — plugin + marketplace manifests (plugin name: `spor`)
-- `GRAPH.md` — node/edge format spec; the contract shared by the compiler,
-  skills, agents, and distiller prompt
-- `API.md` — the Spor server's public client contract: REST `/v1/*`, MCP
-  `/mcp`, auth, error envelope
-- `QUEUE.md` — design spec for deferred-work capture, the decision queue,
-  and the evolving schema registry (raw-text ingestion, schema-attached
-  code; partially supersedes GRAPH.md when it lands)
-- `REFACTOR.md` — design record for the kernel/shell split and the
-  conformance suite
-- `lib/` — the zero-dependency client core, exactly what local mode runs:
-  `compile.js` and `validate.js` (CLIs), with `graph.js`, `queue.js`,
-  `registry.js`, `resolution.js`, `sandbox.js`, and `commit-inference.js`
-  as façades over pure kernels in `lib/kernel/`; IO lives in `lib/shell/`,
-  seed schemas in `lib/seed/`. The engine half (lenses, routing, workflow
-  runs, rendering) ships with the Spor server.
-- `conformance/` — language-neutral golden cases (inputs → outputs) for the
-  kernel, run by the test suite
-- `hooks/hooks.json` — Claude Code hook wiring (see the table above)
-- `scripts/engines/` — the zero-dep Node hook engines (`session-start`,
-  `prompt-context`, `post-tool`, `distill`, `drain-outbox` for nodes
-  spooled while offline, commit linking)
-- `bin/spor-hook`, `adapters/` — host-agnostic hook dispatcher and the
-  per-host adapter manifests (legacy `bin/substrate-hook` still works)
-- `prompts/client/` — `{{VAR}}` templates for the client's LLM calls
-- `skills/` — `/spor:brief`, `/spor:correct`, `/spor:defer`, `/spor:next`,
-  and `team-graph` (the Cowork-side skill; Cowork has no hooks, so the
-  skill triggers pulls)
-- `agents/backfill.md` — the `spor-backfill` agent
-- `workers/shim` — standalone bootstrap worker for workflow runs; it polls
-  the server's claim API and executes steps, because the server itself
-  never executes effects
-- `test/` — zero-dep `node:test` suite
-
-## Roadmap
-
-Tiered so each step is independently useful. The expensive parts (compiler,
-corrections, distillation, node format) exist; what follows is transport
-and workflow.
-
-### Tier 1 — remote MCP, the spine of team mode
-The server wraps the compiler behind MCP (`query_graph`, `get_node`,
-`put_node`, `propose_correction`, `my_queue`) and REST, with per-identity
-attribution on every write — including distilled nodes — server-side
-transactional writes, and multi-root compile (a local personal graph
-layered on the remote team graph). Claude Code hooks switch to remote mode
-with two env vars. **Cowork has no hook support** (plugin hooks silently
-never fire there), so its path into the graph is the MCP connector plus a
-bundled skill that pulls briefings explicitly. Client contract:
-[API.md](API.md).
-
-### Tier 2 — question routing / the decision queue
-The original Spor thesis materializing: home is a decision queue.
-`question` nodes are filed deliberately (`ask_question` /
-`POST /v1/questions`), with an empty `query_graph` result nudging the
-session to ask. Routing is deterministic: the question goes to the steward
-of the closest relevance-neighborhood node (ties by sorted id; no steward →
-visible to everyone), via `person` nodes with `stewards`/`assigned` edges
-and the `$viewer` binding that maps the caller's identity to its person
-node (never caller-supplied). Delivery is pull-based — `my_queue`,
-`GET /v1/queue`, and session-start's "N questions routed to you" — and the
-answer loop is lineage by construction: a node with an `answers` edge
-retires the question from the queue. Ahead: richer stewardship maps and
-push notification for urgent questions.
-
-### Deliberately deferred
-- Team sync via a shared git remote on `~/.spor` (pull on SessionStart,
-  push after distill): was the interim transport, skipped in favor of going
-  straight to the MCP server. Still works as a manual fallback — the graph
-  home is an ordinary git repo.
-- CRDT backend (Automerge + derived index): the scale-up path, not the
-  entry price. One-fact-per-file + transactional server writes avoids
-  concurrent body edits at team scale.
-- Multi-party consensus/sign-off on decisions: v1 consensus = one steward's
-  decision node + the correction loop.
-- Embedding-based content arm: tf-idf is good enough until graphs get
-  large; the swap-in point is `rankAgainst()` in the compiler.
-
-## Known limitations
-
-- The per-prompt digest compiles over the whole org graph by design.
-  Cross-project nodes in unrelated sessions are usually signal (prior art);
-  if they turn out noisy, the fix is a project-affinity boost in ranking,
-  not a partition.
-- The frontmatter parser is regex-based, not a YAML library: simple
-  scalars, YAML folded multi-line values, and the `- {type: X, to: Y}` edge
-  form only.
-- The prompt-context hook runs under a 15s timeout, so nothing on that path
-  may call an LLM. Briefings are precompiled (they're nodes); prompt-time
-  work is select+inject.
-- `additionalContext` is capped at 10KB; the digest self-caps at 4.5KB.
-- The distiller spawns `claude -p`; the `SPOR_DISTILLING` env var is the
-  recursion guard. Don't remove it.
+- [GRAPH.md](GRAPH.md) — the node and edge format: what a node file looks
+  like, the node types, the typed edges between them.
+- [API.md](API.md) — the team-server contract: the REST and MCP surfaces, the
+  write semantics, identity and auth, and client configuration.
+- [adapters/](adapters/) — supported coding agents and how install works on
+  each, including the `AGENTS.md` floor for hosts without hooks.
