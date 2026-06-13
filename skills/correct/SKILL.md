@@ -67,7 +67,14 @@ date: <today>
 <guidance injected verbatim into every compile of the target>
 ```
 
-4. Verify it applies: recompile the target
-   (`node ${CLAUDE_PLUGIN_ROOT}/lib/compile.js --root <target>` or `--query`)
-   and confirm the pinned/excluded nodes and guidance show up. Then run
-   `node ${CLAUDE_PLUGIN_ROOT}/lib/validate.js` and fix anything it flags.
+4. Verify it applies. `${CLAUDE_PLUGIN_ROOT}` is empty in the Bash tool, so
+   resolve the plugin root from the session-start cache first
+   (issue-cc-skill-plugin-root-unsubstituted):
+   ```bash
+   SPOR_ROOT="$(cat "${SPOR_HOME:-$HOME/.spor}/cache/plugin-root" 2>/dev/null \
+     || cat "$HOME/.substrate/cache/plugin-root" 2>/dev/null)"
+   SPOR_ROOT="${SPOR_ROOT:-$CLAUDE_PLUGIN_ROOT}"
+   ```
+   Recompile the target (`node "$SPOR_ROOT/lib/compile.js" --root <target>`
+   or `--query`) and confirm the pinned/excluded nodes and guidance show up.
+   Then run `node "$SPOR_ROOT/lib/validate.js"` and fix anything it flags.

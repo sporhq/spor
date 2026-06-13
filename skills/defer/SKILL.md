@@ -60,6 +60,13 @@ absent) with id = filename minus `.md`, `type: task`,
 `project: <slug>`, a standalone `summary`, today's `date`, and a
 `derived-from` edge to the node the work was discovered during, if known.
 If the deferral reason is load-bearing ("because the release is Friday"),
-record it in the body. Then run
-`node ${CLAUDE_PLUGIN_ROOT}/lib/validate.js` and fix anything it flags, and
-commit the graph repo if it is one.
+record it in the body. Then validate — `${CLAUDE_PLUGIN_ROOT}` is empty in
+the Bash tool, so resolve the plugin root from the session-start cache first
+(issue-cc-skill-plugin-root-unsubstituted):
+```bash
+SPOR_ROOT="$(cat "${SPOR_HOME:-$HOME/.spor}/cache/plugin-root" 2>/dev/null \
+  || cat "$HOME/.substrate/cache/plugin-root" 2>/dev/null)"
+SPOR_ROOT="${SPOR_ROOT:-$CLAUDE_PLUGIN_ROOT}"
+node "$SPOR_ROOT/lib/validate.js"
+```
+Fix anything it flags, and commit the graph repo if it is one.

@@ -27,9 +27,17 @@ Steps:
      neighborhood. In Cowork, call the `query_graph` MCP tool (with `root_id` for
      a node id, or `query` for free text) — there is no compile.js there.
 
-   **Local mode (personal graph) — `SPOR_SERVER` unset:**
-   - node id: `node ${CLAUDE_PLUGIN_ROOT}/lib/compile.js --root <id> --skeleton`
-   - query: `node ${CLAUDE_PLUGIN_ROOT}/lib/compile.js --query "<text>"`
+   **Local mode (personal graph) — `SPOR_SERVER` unset:** first resolve the
+   plugin root — `${CLAUDE_PLUGIN_ROOT}` is empty in the Bash tool, so read
+   the path the session-start hook cached
+   (issue-cc-skill-plugin-root-unsubstituted):
+   ```bash
+   SPOR_ROOT="$(cat "${SPOR_HOME:-$HOME/.spor}/cache/plugin-root" 2>/dev/null \
+     || cat "$HOME/.substrate/cache/plugin-root" 2>/dev/null)"
+   SPOR_ROOT="${SPOR_ROOT:-$CLAUDE_PLUGIN_ROOT}"
+   ```
+   - node id: `node "$SPOR_ROOT/lib/compile.js" --root <id> --skeleton`
+   - query: `node "$SPOR_ROOT/lib/compile.js" --query "<text>"`
    (The compiler defaults to the global graph at `$SPOR_HOME/nodes`, falling
    back to `~/.spor/nodes` — or a pre-existing `~/.substrate/nodes` when
    `~/.spor` is absent.)

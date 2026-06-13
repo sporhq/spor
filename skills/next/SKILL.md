@@ -33,8 +33,15 @@ In Cowork, call the `my_queue` MCP tool with the same fields.
 
 ## Local mode (personal graph) — `SPOR_SERVER` unset
 
+`${CLAUDE_PLUGIN_ROOT}` is empty in the Bash tool, so first resolve the
+plugin root from the path the session-start hook cached
+(issue-cc-skill-plugin-root-unsubstituted):
+
 ```bash
-node ${CLAUDE_PLUGIN_ROOT}/lib/queue.js            # or --project <slug>, --json
+SPOR_ROOT="$(cat "${SPOR_HOME:-$HOME/.spor}/cache/plugin-root" 2>/dev/null \
+  || cat "$HOME/.substrate/cache/plugin-root" 2>/dev/null)"
+SPOR_ROOT="${SPOR_ROOT:-$CLAUDE_PLUGIN_ROOT}"
+node "$SPOR_ROOT/lib/queue.js"            # or --project <slug>, --json
 ```
 
 (No server means no activity feed, so heat is 0 locally; the other signals
@@ -48,8 +55,8 @@ the signals are advisory; the human picks. If the result carries `muted` or
 parked by a `wake:` date — never silently dropped). Then:
 
 1. **Item picked to DO** → start pre-briefed: run a full root compile for it
-   (/spor:brief `<item-id>`, or locally
-   `node ${CLAUDE_PLUGIN_ROOT}/lib/compile.js --root <item-id>`) and begin
+   (/spor:brief `<item-id>`, or locally with `$SPOR_ROOT` resolved as above:
+   `node "$SPOR_ROOT/lib/compile.js" --root <item-id>`) and begin
    from that briefing.
 2. **Item picked to CLOSE** (or `suggest: close` confirmed) → flip the
    node's `status:` with `set_status` (one call, no revision round-trip;

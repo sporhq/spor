@@ -42,6 +42,20 @@ async function sessionStart(input) {
   const cwd = input.cwd ?? "";
   const slug = u.projectSlug(cwd);
 
+  // Persist the plugin root so skills can locate lib/ from the Bash tool,
+  // where ${CLAUDE_PLUGIN_ROOT} is unset (issue-cc-skill-plugin-root-
+  // unsubstituted). The hooks.json command string is the one place the host
+  // substitutes the root; u.ROOT is that same plugin root resolved from the
+  // engine's own location. Local-mode skill commands read this file. Best
+  // effort — failure is harmless (skills fall back to ${CLAUDE_PLUGIN_ROOT}).
+  try {
+    const cacheDir = path.join(graph, "cache");
+    u.ensureDir(cacheDir);
+    fs.writeFileSync(path.join(cacheDir, "plugin-root"), `${u.ROOT}\n`);
+  } catch {
+    /* best effort */
+  }
+
   // -------------------------------------------------------------------------
   // REMOTE MODE
   // -------------------------------------------------------------------------
