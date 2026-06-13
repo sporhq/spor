@@ -172,6 +172,15 @@ High-weight edges decay slowly across hops; they are what makes structural
 traversal beat similarity search. Prefer one precise high-weight edge over
 three `relates-to`.
 
+A seed (the compile root, or each query-mode content match) always contributes
+its **direct 1-hop lineage** to the structural arm, even when score-decay would
+push a low-weight edge under the traversal threshold
+(issue-cc-digest-omits-task-lineage): a queried node's immediate
+parents/children/related work is the single most relevant context and must not
+be dropped for higher-heat tangential nodes. The guarantee adds only the
+immediate neighbors and never outranks an organic walk hit, so deeper lineage
+still decays normally.
+
 Edges are written in the canonical direction above, but the server's write
 path accepts two normalized forms (API.md §1, registry data on each
 edge schema): **aliases** — same-direction synonyms renamed in place

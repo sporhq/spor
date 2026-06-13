@@ -239,6 +239,64 @@ test("digest gate: minSim of 1 (impossible) gates out an otherwise-relevant quer
   assert.equal(r.relevant, false);
 });
 
+// ---------- direct lineage guarantee (issue-cc-digest-omits-task-lineage) ----------
+
+test("digest: a seed's direct 1-hop lineage is included even when score-decay drops it", () => {
+  // Three nodes match the query (seeds 0.90/0.85/0.80). The third seed
+  // (task-aaa, score 0.80) has a routed-to edge (weight 0.3) to a child that
+  // matches nothing else, so the walk scores it 0.80*0.3 = 0.24 <
+  // STRUCTURAL_THRESHOLD (0.25) and drops it. The direct-lineage guarantee
+  // must surface that immediate child anyway.
+  const g = tmpGraph({
+    "task-aaa.md": `---
+id: task-aaa
+type: task
+project: p
+title: Indexer rewrite vocabulary token alpha
+summary: Indexer rewrite vocabulary token alpha bravo charlie delta.
+date: 2026-06-01
+edges:
+  - {type: routed-to, to: child-tool}
+---
+Indexer rewrite vocabulary token alpha bravo charlie delta.
+`,
+    "task-bbb.md": `---
+id: task-bbb
+type: task
+project: p
+title: Indexer rewrite vocabulary token bravo
+summary: Indexer rewrite vocabulary token bravo charlie delta.
+date: 2026-06-01
+---
+Indexer rewrite vocabulary token bravo charlie delta.
+`,
+    "task-ccc.md": `---
+id: task-ccc
+type: task
+project: p
+title: Indexer rewrite vocabulary token charlie
+summary: Indexer rewrite vocabulary token charlie delta echo.
+date: 2026-06-01
+---
+Indexer rewrite vocabulary token charlie delta echo.
+`,
+    "child-tool.md": `---
+id: child-tool
+type: artifact
+project: p
+title: Zephyr quartz nimbus widget
+summary: Zephyr quartz nimbus widget gadget gizmo.
+date: 2026-06-01
+---
+Zephyr quartz nimbus widget gadget gizmo.
+`,
+  }).load();
+  const r = graph.compile(g, { query: "indexer rewrite vocabulary token charlie delta", digest: true });
+  assert.equal(r.relevant, true);
+  assert.ok(r.text.includes("child-tool"),
+    "the queried seed's direct 1-hop child must appear despite score-decay pruning");
+});
+
 // ---------- supersession fixup + warning ----------
 
 test("supersession: superseded node carries the inline ⚠ SUPERSEDED warning in full compile", () => {
