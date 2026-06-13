@@ -26,8 +26,9 @@ a known graph node (check the session's briefing/digest for its id):
 
 ```bash
 TOP=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-# a committed .spor marker (project: <id>) beats basename inference
-SLUG=$(sed -nE 's/^project:[ \t]*([a-z0-9][a-z0-9-]*)[ \t]*$/\1/p' "$TOP/.spor" 2>/dev/null | head -1)
+# a committed .spor marker (repo: <slug>, legacy project:) beats basename inference
+SLUG=$(sed -nE 's/^repo:[ \t]*([a-z0-9][a-z0-9-]*)[ \t]*$/\1/p' "$TOP/.spor" 2>/dev/null | head -1)
+[ -n "$SLUG" ] || SLUG=$(sed -nE 's/^project:[ \t]*([a-z0-9][a-z0-9-]*)[ \t]*$/\1/p' "$TOP/.spor" 2>/dev/null | head -1)
 [ -n "$SLUG" ] || SLUG=$(basename "$TOP" \
   | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
 curl -sS --max-time 90 -X POST \

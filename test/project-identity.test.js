@@ -46,16 +46,18 @@ Body of ${id}.
 `,
 ];
 
+// Identity node is now a REPO (renamed from the former `type: project`,
+// dec-cc-repo-project-two-layer-identity; re-prefixed proj- -> repo-).
 const PROJ = `---
-id: proj-x
-type: project
-title: Project X
+id: repo-x
+type: repo
+title: Repo X
 summary: Durable identity for the old-name/new-name lineage.
 slugs: [old-name, new-name]
 fingerprints: [remote:github.com/org/x, root:abc123]
 date: 2026-06-12
 ---
-The project formerly known as old-name.
+The repo formerly known as old-name.
 `;
 
 const NOW = Date.parse('2026-06-11T00:00:00Z');
@@ -64,15 +66,15 @@ const NOW = Date.parse('2026-06-11T00:00:00Z');
 
 test('parser: slugs and fingerprints parse as inline lists; buildGraph indexes aliases', () => {
   const g = tmpGraph(Object.fromEntries([
-    ['proj-x.md', PROJ],
+    ['repo-x.md', PROJ],
     task('task-old', 'old-name'),
   ])).load();
-  const p = g.nodes['proj-x'];
+  const p = g.nodes['repo-x'];
   assert.deepEqual(p.slugs, ['old-name', 'new-name']);
   assert.deepEqual(p.fingerprints, ['remote:github.com/org/x', 'root:abc123']);
-  assert.deepEqual(g.projectAliases, { 'proj-x': 'proj-x', 'old-name': 'proj-x', 'new-name': 'proj-x' });
-  assert.equal(graph.resolveProject(g, 'old-name'), 'proj-x');
-  assert.equal(graph.resolveProject(g, 'new-name'), 'proj-x');
+  assert.deepEqual(g.projectAliases, { 'repo-x': 'repo-x', 'old-name': 'repo-x', 'new-name': 'repo-x' });
+  assert.equal(graph.resolveProject(g, 'old-name'), 'repo-x');
+  assert.equal(graph.resolveProject(g, 'new-name'), 'repo-x');
   assert.equal(graph.resolveProject(g, 'unrelated'), 'unrelated');
 });
 
@@ -86,12 +88,12 @@ test('buildGraph: no project nodes -> empty alias map, resolution is identity', 
 
 test('rankQueue: project filter matches every alias the project node owns', () => {
   const g = tmpGraph(Object.fromEntries([
-    ['proj-x.md', PROJ],
+    ['repo-x.md', PROJ],
     task('task-old', 'old-name'),
     task('task-new', 'new-name'),
     task('task-other', 'elsewhere'),
   ])).load();
-  for (const filter of ['new-name', 'old-name', 'proj-x']) {
+  for (const filter of ['new-name', 'old-name', 'repo-x']) {
     const ids = rankQueue(g, { now: NOW, project: filter }).items.map((i) => i.id).sort();
     assert.deepEqual(ids, ['task-new', 'task-old'], `filter ${filter}`);
   }
@@ -111,7 +113,7 @@ test('rankQueue: without a project node the filter stays exact (byte-for-byte to
 
 test('rankQueue: a mute naming any alias hides the whole project class', () => {
   const g = tmpGraph(Object.fromEntries([
-    ['proj-x.md', PROJ],
+    ['repo-x.md', PROJ],
     task('task-old', 'old-name'),
     task('task-new', 'new-name'),
   ])).load();
@@ -127,13 +129,13 @@ const ARCHIVED_PROJ = PROJ.replace('date: 2026-06-12\n', 'status: archived\ndate
 
 test('rankQueue: an archived project drops its items from the global queue for every viewer (counted, not silent)', () => {
   const g = tmpGraph(Object.fromEntries([
-    ['proj-x.md', ARCHIVED_PROJ],
+    ['repo-x.md', ARCHIVED_PROJ],
     task('task-old', 'old-name'),    // archived via the old alias
     task('task-new', 'new-name'),    // archived via the current alias
     task('task-live', 'elsewhere'),  // live, unrelated project
   ])).load();
   assert.ok(graph.isArchivedProject(g, 'old-name'));
-  assert.ok(graph.isArchivedProject(g, 'proj-x'));
+  assert.ok(graph.isArchivedProject(g, 'repo-x'));
   assert.ok(!graph.isArchivedProject(g, 'elsewhere'));
   const r = rankQueue(g, { now: NOW });
   assert.deepEqual(r.items.map((i) => i.id), ['task-live']);
@@ -142,11 +144,11 @@ test('rankQueue: an archived project drops its items from the global queue for e
 
 test('rankQueue: explicitly scoping to the archived project still ranks it (archival hides from the firehose, not from a direct look)', () => {
   const g = tmpGraph(Object.fromEntries([
-    ['proj-x.md', ARCHIVED_PROJ],
+    ['repo-x.md', ARCHIVED_PROJ],
     task('task-old', 'old-name'),
     task('task-new', 'new-name'),
   ])).load();
-  for (const filter of ['old-name', 'new-name', 'proj-x']) {
+  for (const filter of ['old-name', 'new-name', 'repo-x']) {
     const r = rankQueue(g, { now: NOW, project: filter });
     assert.deepEqual(r.items.map((i) => i.id).sort(), ['task-new', 'task-old'], `filter ${filter}`);
     assert.equal(r.archived, undefined, `filter ${filter}: nothing hidden when viewing the project itself`);
@@ -155,7 +157,7 @@ test('rankQueue: explicitly scoping to the archived project still ranks it (arch
 
 test('rankQueue: a live (non-archived) project status behaves byte-for-byte as before', () => {
   const g = tmpGraph(Object.fromEntries([
-    ['proj-x.md', PROJ], // no status
+    ['repo-x.md', PROJ], // no status
     task('task-old', 'old-name'),
   ])).load();
   const r = rankQueue(g, { now: NOW });
@@ -168,12 +170,12 @@ test('rankQueue: a live (non-archived) project status behaves byte-for-byte as b
 
 test('validateGraph: warns on contested and non-kebab slugs', () => {
   const g = tmpGraph(Object.fromEntries([
-    ['proj-x.md', PROJ],
-    ['proj-y.md', PROJ.replace(/proj-x/g, 'proj-y').replace('slugs: [old-name, new-name]', 'slugs: [old-name, Bad_Slug]')],
+    ['repo-x.md', PROJ],
+    ['repo-y.md', PROJ.replace(/repo-x/g, 'repo-y').replace('slugs: [old-name, new-name]', 'slugs: [old-name, Bad_Slug]')],
   ]));
   const r = graph.validateGraph(g.nodesDir);
   assert.deepEqual(r.errors, []);
-  assert.ok(r.warnings.some((w) => w.includes("slug 'old-name' is claimed by both 'proj-x' and 'proj-y'")), r.warnings.join('; '));
+  assert.ok(r.warnings.some((w) => w.includes("slug 'old-name' is claimed by both 'repo-x' and 'repo-y'")), r.warnings.join('; '));
   assert.ok(r.warnings.some((w) => w.includes("slug 'Bad_Slug' is not kebab-case")), r.warnings.join('; '));
 });
 
@@ -187,6 +189,42 @@ test('projectSlug: a .spor marker beats basename inference; invalid values fall 
   assert.equal(u.projectSlug(cwd), path.basename(cwd).toLowerCase().replace(/[^a-z0-9]+/g, '-'));
   fs.rmSync(path.join(cwd, '.spor'));
   assert.equal(u.projectSlug(cwd), path.basename(cwd).toLowerCase().replace(/[^a-z0-9]+/g, '-'));
+});
+
+// ---------- two-layer marker: repo: identity + project: grouping ----------
+// (dec-cc-repo-project-two-layer-identity, dec-cc-active-project-declared-default)
+
+test('marker: repo: names the identity; legacy project: still read as the repo slug; repo: wins', () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-marker2-'));
+  // New format: repo: is the identity.
+  fs.writeFileSync(path.join(cwd, '.spor'), 'repo: my-repo\nproject: my-product\n');
+  assert.equal(u.projectSlug(cwd), 'my-repo');
+  assert.equal(u.projectGrouping(cwd), 'my-product');
+  // repo: wins over a stray project: for identity.
+  fs.writeFileSync(path.join(cwd, '.spor'), 'project: legacy-id\nrepo: real-repo\n');
+  assert.equal(u.projectSlug(cwd), 'real-repo');
+  assert.equal(u.projectGrouping(cwd), 'legacy-id');
+  // Legacy format (no repo:): project: is the repo slug, NOT a grouping.
+  fs.writeFileSync(path.join(cwd, '.spor'), 'project: legacy-repo\n');
+  assert.equal(u.projectSlug(cwd), 'legacy-repo');
+  assert.equal(u.projectGrouping(cwd), null);
+  fs.rmSync(cwd, { recursive: true, force: true });
+});
+
+test('projectGrouping: a nearest-ancestor subtree marker beats the repo root', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-grp-'));
+  const repo = path.join(base, 'mono');
+  const sub = path.join(repo, 'services', 'api');
+  fs.mkdirSync(sub, { recursive: true });
+  gitInit(repo);
+  // No declaration anywhere -> null (caller falls back to the repo's home project).
+  assert.equal(u.projectGrouping(sub), null);
+  // Root declares platform; subtree overrides to its own grouping.
+  fs.writeFileSync(path.join(repo, '.spor'), 'repo: mono\nproject: platform\n');
+  fs.writeFileSync(path.join(sub, '.spor'), 'repo: mono\nproject: payments\n');
+  assert.equal(u.projectGrouping(repo), 'platform');
+  assert.equal(u.projectGrouping(sub), 'payments');
+  fs.rmSync(base, { recursive: true, force: true });
 });
 
 // ---------- monorepo subtrees + git worktrees (issue-cc-project-identity-monorepo-worktree) ----------
@@ -340,7 +378,7 @@ test('session-start local: brief lookup and project count resolve through slug a
   fs.mkdirSync(path.join(home, 'nodes'), { recursive: true });
   const cwd = path.join(root, 'new-name'); // slug = basename
   fs.mkdirSync(cwd);
-  fs.writeFileSync(path.join(home, 'nodes', 'proj-x.md'), PROJ);
+  fs.writeFileSync(path.join(home, 'nodes', 'repo-x.md'), PROJ);
   fs.writeFileSync(path.join(home, 'nodes', 'brief-old-name.md'), OLD_BRIEF);
   fs.writeFileSync(path.join(home, 'nodes', 'task-old.md'), task('task-old', 'old-name')[1]);
   const out = run(
@@ -376,9 +414,9 @@ test('session-start local: an archived project is announced, not briefed', () =>
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-ss-arch-'));
   const home = path.join(root, 'graph');
   fs.mkdirSync(path.join(home, 'nodes'), { recursive: true });
-  const cwd = path.join(root, 'new-name'); // slug new-name -> proj-x (archived)
+  const cwd = path.join(root, 'new-name'); // slug new-name -> repo-x (archived)
   fs.mkdirSync(cwd);
-  fs.writeFileSync(path.join(home, 'nodes', 'proj-x.md'), ARCHIVED_PROJ);
+  fs.writeFileSync(path.join(home, 'nodes', 'repo-x.md'), ARCHIVED_PROJ);
   fs.writeFileSync(path.join(home, 'nodes', 'brief-old-name.md'), OLD_BRIEF);
   fs.writeFileSync(path.join(home, 'nodes', 'task-old.md'), task('task-old', 'old-name')[1]);
   const out = run(
@@ -387,7 +425,7 @@ test('session-start local: an archived project is announced, not briefed', () =>
     freshEnv(home)
   );
   const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
-  assert.match(ctx, /proj-x \(new-name\) is ARCHIVED/);
+  assert.match(ctx, /repo-x \(new-name\) is ARCHIVED/);
   assert.ok(!ctx.includes('Standing project briefing'), 'archived project must not inject a stale brief');
   assert.ok(!ctx.includes('open front:'), 'archived project has no live front to surface');
 });

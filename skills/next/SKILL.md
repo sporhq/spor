@@ -18,15 +18,16 @@ still read.)
 
 ```bash
 TOP=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-# a committed .spor marker (project: <id>) beats basename inference
-SLUG=$(sed -nE 's/^project:[ \t]*([a-z0-9][a-z0-9-]*)[ \t]*$/\1/p' "$TOP/.spor" 2>/dev/null | head -1)
+# a committed .spor marker (repo: <slug>, legacy project:) beats basename inference
+SLUG=$(sed -nE 's/^repo:[ \t]*([a-z0-9][a-z0-9-]*)[ \t]*$/\1/p' "$TOP/.spor" 2>/dev/null | head -1)
+[ -n "$SLUG" ] || SLUG=$(sed -nE 's/^project:[ \t]*([a-z0-9][a-z0-9-]*)[ \t]*$/\1/p' "$TOP/.spor" 2>/dev/null | head -1)
 [ -n "$SLUG" ] || SLUG=$(basename "$TOP" \
   | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
 curl -sS --max-time 6 -H "Authorization: Bearer $SPOR_TOKEN" \
   "${SPOR_SERVER%/}/v1/queue?project=$SLUG&limit=10"
-# org-wide view: drop the project filter. The server resolves slug aliases
-# (project nodes, GRAPH.md "Project identity nodes"), so renamed repos
-# still see their history.
+# The queue ?project= filter is the repo slug. org-wide view: drop the filter.
+# The server resolves slug aliases (repo nodes, GRAPH.md "Repo and project
+# identity"), so renamed repos still see their history.
 ```
 
 In Cowork, call the `my_queue` MCP tool with the same fields.

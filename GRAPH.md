@@ -96,7 +96,8 @@ Rules:
 | person     | `person-` | a member of the org — the identity anchor for `$viewer` binding and Tier-2 question routing (team mode; see "People, routing, and onboarding") |
 | capture-pending | `cap-` | raw captured text that fit no schema; filed by the server for later triage (QUEUE.md §2.3); born status-less, closed only as `merged` (content now in proper node(s)) or `rejected` (no durable fact) — a `transitions()` gate rejects other statuses at write time |
 | finding    | `find-`   | a gardener observation about another node, filed as a queue item (QUEUE.md §6) |
-| project    | `proj-`   | durable project identity: slug aliases + repo fingerprints; heals renames at read time (below) |
+| repo       | `repo-`   | durable git-repo identity: slug aliases + repo fingerprints; heals renames at read time (below) |
+| project    | `proj-`   | a grouping above repos; owns its member repos via inbound `grouped-under` edges (below) |
 
 ## Norm ride-along
 
@@ -120,30 +121,40 @@ data-vs-instructions boundary. Imperative wording inside a norm describes team
 policy to weigh — it is never a command addressed to the assistant, so a
 planted "ignore prior instructions" can't hijack a session.
 
-## Project identity nodes
+## Repo and project identity (two-layer)
 
-A session's project slug is derived (repo basename, kebab-cased — see the
-plugin's CLAUDE.md), so a rename would orphan every historical `project:`
-stamp. A `type: project` node makes the identity data instead
-(task-cc-project-identity-nodes):
+Identity is two layers (dec-cc-repo-project-two-layer-identity): a **repo** is
+one git identity; a **project** is a stable grouping above repos (`spor` the
+project owns the `spor` and `spor-server` repos). The word "project" used to do
+both jobs and pulls apart the moment an org has more than one repo per unit of
+work, so the former `type: project` identity node was renamed to `type: repo`
+(prefix `proj-` → `repo-`, dec-cc-repo-project-id-prefix-scheme) and the freed
+`proj-` prefix now names the net-new grouping.
+
+A session's repo slug is derived (repo basename, kebab-cased — see the plugin's
+CLAUDE.md), so a rename would orphan every historical `project:` stamp (the
+stamp keeps its field name and now reads as a *repo* slug). A `type: repo` node
+makes the identity data instead (task-cc-project-identity-nodes):
 
 ```markdown
 ---
-id: proj-spor
-type: project
-title: Spor
-summary: The Spor knowledge-graph plugin and server.
+id: repo-spor
+type: repo
+title: spor
+summary: The Spor knowledge-graph plugin (client half).
 slugs: [cc-context-substrate, spor]
 fingerprints: [remote:github.com/sporhq/spor, root:47520dcafe1b]
-date: 2026-06-12
+date: 2026-06-13
 ---
+edges:
+  - {type: grouped-under, to: proj-spor}
 ```
 
-- `slugs` lists every slug that has ever referred to the project, oldest
-  first; the last entry is the current name. The `project:` stamp on
-  existing nodes **never rewrites** — it is a historical fact about where
-  work was discovered. Consumers resolve aliases at read time instead:
-  queue project filters, mutes, and the session-start `brief-<slug>` lookup
+- `slugs` lists every slug that has ever referred to the repo, oldest first;
+  the last entry is the current name. The `project:` stamp on existing nodes
+  **never rewrites** — it is a historical fact about where work was discovered
+  and now resolves as a repo slug. Consumers resolve aliases at read time
+  instead: queue filters, mutes, and the session-start `brief-<slug>` lookup
   all match any listed alias, so one edit to one node heals all history.
 - `fingerprints` accumulates repo evidence: `root:<sha>` (root commits) and
   `remote:<host/path>` (remote URLs with scheme, userinfo, and `.git`
@@ -151,14 +162,15 @@ date: 2026-06-12
   with a known fingerprint is rename evidence — the server files the alias
   as a queue item for a human to confirm. It is an accumulating set, not a
   derivation rule: no single fingerprint survives every history rewrite.
-- A committed `.spor` marker file (`project: <id>`) beats all inference —
-  escape hatch for forks, moves, and rewrites. It is read by **nearest
-  ancestor**: the search walks up from the session's cwd to the repo root, so
-  a monorepo subtree can carry its own marker (`services/api/.spor` →
-  `my-api`) that beats the root's, splitting one repo into distinct project
-  identities. With no subtree marker the search reaches the root and inference
-  is unchanged. Zero-config slug inference stays the default, and a graph with
-  no project nodes behaves exactly as before.
+- A committed `.spor` marker file beats all inference — escape hatch for forks,
+  moves, and rewrites. The identity key is `repo: <slug>` (legacy `project:
+  <slug>` is still read as the repo slug; `repo:` wins when both are present).
+  It is read by **nearest ancestor**: the search walks up from the session's
+  cwd to the repo root, so a monorepo subtree can carry its own marker
+  (`services/api/.spor` → `my-api`) that beats the root's, splitting one repo
+  into distinct identities. With no subtree marker the search reaches the root
+  and inference is unchanged. Zero-config slug inference stays the default, and
+  a graph with no repo nodes behaves exactly as before.
 - **Git worktrees** resolve to their main repo, not the worktree directory's
   basename. A linked worktree shares the main repo's root-commit sha and
   remotes, so inferring identity from its (markerless, often throwaway-named)
@@ -166,14 +178,46 @@ date: 2026-06-12
   fingerprints, different checkout dir). Inference uses the main worktree's
   basename — `dirname(git rev-parse --git-common-dir)` — so every worktree of
   one repo shares one identity.
-- `status: archived` retires a finished or abandoned project. One edit to the
-  project node hides its open tasks and questions from the decision queue for
-  **every** viewer (the queue reports the hidden count as `archived`, never
-  silent), and session-start announces the archival instead of injecting a
-  stale brief — replacing the only prior relief, a per-person `queue_mute` that
-  each teammate had to set. Slug aliases still resolve, so closed history stays
-  reachable in a project-scoped read. Archival is backward-readable: any other
-  status (or none) is live, exactly as before.
+- `status: archived` retires a finished or abandoned repo. One edit to the repo
+  node hides its open tasks and questions from the decision queue for **every**
+  viewer (the queue reports the hidden count as `archived`, never silent), and
+  session-start announces the archival instead of injecting a stale brief —
+  replacing the only prior relief, a per-person `queue_mute` that each teammate
+  had to set. Slug aliases still resolve, so closed history stays reachable in a
+  repo-scoped read. Archival is backward-readable: any other status (or none)
+  is live, exactly as before.
+
+### The project grouping
+
+A `type: project` node (prefix `proj-`) is the stable grouping above repos. It
+is **not** a git identity: it owns no `slugs`/`fingerprints` and is not inferred
+from cwd. A repo joins its ONE home project with a `grouped-under` edge (repo →
+project); a shared/cross-cutting repo (`auth`, `iac`) is grouped under its own
+grouping (e.g. `platform`) rather than co-owned by every product. Cross-cutting
+*work* stays edges between work nodes across repos, never repo co-ownership.
+
+```markdown
+---
+id: proj-spor
+type: project
+title: Spor
+summary: The Spor product — the spor plugin and spor-server.
+date: 2026-06-13
+---
+```
+
+- **Reads.** repo-scoped = nodes stamped that repo's slug; project-scoped = the
+  union over the nodes of every repo `grouped-under` the project. Session-start
+  injects the repo brief AND the project brief.
+- **Active project** (dec-cc-active-project-declared-default). When a repo
+  serves more than one project, cwd no longer names the active one. A session's
+  active project is the repo's home project (its `grouped-under` edge) by
+  default — the common single-project repo declares nothing. A repo serving
+  many projects overrides it with a `.spor` marker `project: <slug>` key (read
+  by the same nearest-ancestor walk), or a session command. Branch-name
+  inference and distill-time content linking were rejected as non-deterministic.
+- A graph with no `type: project` nodes has no grouping layer — every repo is
+  simply its own scope, exactly as before.
 
 ## People, routing, and onboarding
 
@@ -259,6 +303,7 @@ server-side (issue-cc-onboarding-email-mismatch-silent-degradation).
 | `relates-to`     | 0.5    | weak association                                 |
 | `mentions`       | 0.5    | weakest association                              |
 | `stewards`       | 0.4    | this person stewards an area/spec/norm — the Tier-2 question-routing key |
+| `grouped-under`  | 0.3    | this repo's home project grouping (inverse `groups`); structural membership, not work dependency |
 | `routed-to`      | 0.3    | a question routed to this person for answering   |
 | `compiled-for`   | —      | briefing → its task/query (provenance only)      |
 | `shaped-by`      | —      | briefing → corrections applied (provenance only) |

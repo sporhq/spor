@@ -2,52 +2,44 @@
 id: schema-project
 type: schema
 kind: node-schema
-schema_version: 2026.06.12.1
+schema_version: 2026.06.13.1
 title: Seed schema for project nodes
-summary: Node schema for the project type — durable project identity owning a slug-alias list and repo fingerprints, so renames are healed by read-time alias resolution instead of orphaning historical project tags. Seed-pack default; a graph-resident schema node for this type overrides it.
-date: 2026-06-12
+summary: Node schema for the project type — the stable grouping ABOVE repos (dec-cc-repo-project-two-layer-identity). A project owns one or more repos, each joined by an inbound `grouped-under` edge; project-scoped reads union the nodes of all member repos. This is the net-new layer; git-repo identity is now `type: repo` (schema-repo). Seed-pack default; a graph-resident schema node for this type overrides it.
+date: 2026-06-13
 ---
 
-Seed schema for the `project` node type, shipped with the plugin as a
-registry default (QUEUE.md §2). A `type: schema` node in the graph with
-`kind: node-schema` and the same `node_type` overrides this entry.
+Seed schema for the `project` node type, shipped with the plugin as a registry
+default (QUEUE.md §2). A `type: schema` node in the graph with `kind:
+node-schema` and the same `node_type` overrides this entry.
 
-A project node makes project identity data instead of a derived convention
-(task-cc-project-identity-nodes). Instances carry two inline-list fields:
+Under the two-layer identity model (dec-cc-repo-project-two-layer-identity)
+the word "project" is split in two. A `repo` (schema-repo, renamed from the
+former `type: project`) is one git identity. A `project` — this type — is the
+stable, product-style grouping above repos: `spor` the project owns the `spor`
+and `spor-server` repos. It is the net-new layer and is NOT a git identity: it
+owns no `slugs`/`fingerprints` and is not inferred from cwd.
 
-- `slugs: [cc-context-substrate, spor]` — every slug that has ever referred
-  to this project, oldest first; the last entry is the current name. The
-  `project:` stamp on existing nodes NEVER rewrites — it is a historical
-  fact about where work was discovered. Consumers resolve any listed alias
-  to this node at read time (queue filters, `brief-<slug>` lookup, digest
-  scoping), so a rename heals all historical associations with one edit
-  to one node.
-- `fingerprints: [remote:github.com/sporhq/spor, root:<sha>]` — accumulated
-  repo evidence (`remote:` host/path with scheme, userinfo, and `.git`
-  stripped; `root:` a root-commit sha). An unknown slug arriving with a
-  matching fingerprint is high-confidence rename evidence; the server files
-  the alias as a queue item for human confirmation. An accumulating set,
-  not a derivation rule — no single fingerprint survives every rewrite.
+**Membership is an edge, not co-ownership.** A repo joins its home project with
+a `grouped-under` edge (repo → project; schema-edge-grouped-under). A repo has
+ONE home project; a shared/cross-cutting repo (`auth`, `iac`) is grouped under
+its own grouping (e.g. `platform`) rather than co-owned by every product.
+Cross-cutting WORK stays edges between work nodes across repos (the existing
+primitive), never repo co-ownership.
 
-An optional `status: archived` retires the whole project at end-of-life
-(issue-cc-project-lifecycle-queue-pollution). One identity-level edit hides
-the project's open tasks/questions from the decision queue for EVERY viewer —
-unlike the per-person `queue_mute`, which a project retirement would otherwise
-need N people to each set. Slug aliases still resolve, so the project's closed
-history stays reachable in a project-scoped read, and session-start announces
-the archival instead of injecting a stale brief. Any other status (or none) is
-live and behaves exactly as before; archival is not gated by a `transitions()`
-status enum, so it stays backward-readable (old clients ignore it).
+**Reads.** repo-scoped = nodes stamped that repo's slug; project-scoped = the
+union over the nodes of every repo `grouped-under` this project. Session-start
+injects the repo brief AND the project brief. The active project for a session
+is the repo's home project by default, overridable by a `.spor` marker
+`project:` key (dec-cc-active-project-declared-default).
 
-`capturable: false`: project identity is created deliberately (by a human or
-the rename-detection loop), never drafted from a capture. Graphs without
-project nodes behave exactly as before — slug inference stays the default,
-and a committed `.spor` marker file (`project: <id>`) beats all inference.
+`capturable: false`: a project grouping is created deliberately by a human,
+never drafted from a capture. Graphs with no project nodes behave exactly as
+before — every repo is simply its own scope and there is no grouping layer.
 
 ```json
 {
   "node_type": "project",
-  "description": "a project — durable identity owning slug aliases and repo fingerprints",
+  "description": "a grouping above repos — owns member repos via inbound grouped-under edges",
   "prefix": [
     "proj-"
   ],

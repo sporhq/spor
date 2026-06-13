@@ -69,13 +69,36 @@ function stripTrailingNewlines(s) {
   return String(s).replace(/\n+$/, "");
 }
 
-// Read a `.spor` marker's project value from a directory, or null. The value
-// must already be canonical (the server's SLUG_RE); a non-matching value is
-// ignored rather than normalized, so a typo degrades to inference instead of
-// minting a new identity.
+// Read a `.spor` marker's REPO slug from a directory, or null. The identity
+// key is `repo:` (dec-cc-repo-project-two-layer-identity); the legacy
+// `project:` key is still read as the repo slug for back-compat — markers
+// written before the rename name the repo under `project:` — and `repo:` wins
+// when both are present. The value must already be canonical (the server's
+// SLUG_RE); a non-matching value is ignored rather than normalized, so a typo
+// degrades to inference instead of minting a new identity.
 function readMarker(dir) {
   try {
     const marker = fs.readFileSync(path.join(dir, ".spor"), "utf8");
+    const repo = marker.match(/^repo:[ \t]*([a-z0-9][a-z0-9-]*)[ \t]*$/m);
+    if (repo) return repo[1];
+    const legacy = marker.match(/^project:[ \t]*([a-z0-9][a-z0-9-]*)[ \t]*$/m);
+    return legacy ? legacy[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+// Read a `.spor` marker's active-PROJECT grouping from a directory, or null
+// (dec-cc-active-project-declared-default). This is only meaningful in the
+// post-rename marker format, where `repo:` names the identity and `project:`
+// names the home/active grouping. If the marker carries no `repo:` key it is
+// legacy and its `project:` value is the REPO slug (read by readMarker), not a
+// grouping, so this returns null to avoid mis-reading a legacy marker. Same
+// canonical-or-ignore rule as readMarker.
+function readMarkerProject(dir) {
+  try {
+    const marker = fs.readFileSync(path.join(dir, ".spor"), "utf8");
+    if (!/^repo:[ \t]*[a-z0-9]/m.test(marker)) return null; // legacy format: project: is the repo slug
     const m = marker.match(/^project:[ \t]*([a-z0-9][a-z0-9-]*)[ \t]*$/m);
     return m ? m[1] : null;
   } catch {
@@ -145,6 +168,31 @@ function projectSlug(cwd, fallback = "project") {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
   return slug || fallback;
+}
+
+// Active-project grouping for a session (dec-cc-active-project-declared-default),
+// or null when the session does not DECLARE one. Read by NEAREST ancestor from
+// the `.spor` marker's `project:` key, exactly like projectSlug reads the repo
+// slug — so a monorepo subtree marker (`services/api/.spor` with `project:
+// platform`) sets the active grouping for that subtree, beating an ancestor
+// marker. null is the common single-project case: the caller falls back to the
+// repo's ONE home project (its `grouped-under` edge), which is graph state, not
+// a cwd fact, so it is resolved by the server/distiller, not here.
+function projectGrouping(cwd) {
+  const root = inferenceRoot(cwd);
+  const seen = new Set();
+  for (let dir = cwd || root || ""; dir; dir = path.dirname(dir)) {
+    if (seen.has(dir)) break;
+    seen.add(dir);
+    const hit = readMarkerProject(dir);
+    if (hit) return hit;
+    if (dir === root || dir === path.dirname(dir)) break;
+  }
+  if (root) {
+    const rootHit = readMarkerProject(root);
+    if (rootHit) return rootHit;
+  }
+  return null;
 }
 
 // Repo fingerprints (task-cc-project-identity-nodes): root-commit shas and
@@ -493,6 +541,7 @@ module.exports = {
   wordCount,
   stripTrailingNewlines,
   projectSlug,
+  projectGrouping,
   repoFingerprints,
   git,
   ensureDir,

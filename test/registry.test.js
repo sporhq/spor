@@ -242,6 +242,10 @@ test("seed pack: edge weights match the historic EDGE_WEIGHTS table exactly", ()
     // The workflow-run rollout added run lineage edges to the seed:
     // a run performs a workflow and is triggered-by its cause.
     "performs": 0.8, "triggered-by": 0.7,
+    // The repo/project two-layer identity (dec-cc-repo-project-two-layer-
+    // identity) added the structural membership edge: a repo is grouped-under
+    // its home project. Weak association weight (structure, not work dependency).
+    "grouped-under": 0.3,
   });
   // provenance-only edges are known but unweighted (historic ?? 0.3 default)
   assert.equal(reg.isKnownEdge("compiled-for"), true);
@@ -258,6 +262,13 @@ test("seed pack: node types, prefixes, ride-along, and traversal match GRAPH.md"
   assert.equal(reg.isKnownType("contraption"), false);
   assert.deepEqual(reg.prefixesFor("artifact"), ["spec-", "art-"]);
   assert.deepEqual(reg.prefixesFor("incident"), ["inc-"]);
+  // Two-layer identity (dec-cc-repo-project-two-layer-identity,
+  // dec-cc-repo-project-id-prefix-scheme): git identity is `repo` (repo-),
+  // the grouping above repos is `project` (proj-, the freed prefix).
+  assert.equal(reg.isKnownType("repo"), true);
+  assert.equal(reg.isKnownType("project"), true);
+  assert.deepEqual(reg.prefixesFor("repo"), ["repo-"]);
+  assert.deepEqual(reg.prefixesFor("project"), ["proj-"]);
   assert.equal(reg.isAlwaysOn("norm"), true);
   assert.equal(reg.isAlwaysOn("decision"), false);
   assert.equal(reg.isTraversable("briefing"), false);

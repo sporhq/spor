@@ -224,20 +224,21 @@ ${body}`;
     return null;
   }
   const count = files.length;
-  // Project identity (task-cc-project-identity-nodes): a resident `type:
-  // project` node whose `slugs:` register (or id) includes this session's
-  // slug widens matching to every alias it owns — historical stamps stay as
-  // written and resolve at read time. One scan collects both the per-file
-  // `project: X` lines (the old grep) and the project nodes; with no project
-  // node claiming the slug the alias set is {slug} and behavior is
-  // byte-identical to the original.
-  const stamps = []; // per file: the exact `project: ` line values it carries
-  const projects = []; // resident project nodes: { id, slugs }
+  // Repo identity (task-cc-project-identity-nodes): a resident `type: repo`
+  // node (renamed from the former `type: project`,
+  // dec-cc-repo-project-two-layer-identity) whose `slugs:` register (or id)
+  // includes this session's slug widens matching to every alias it owns —
+  // historical stamps stay as written and resolve at read time. One scan
+  // collects both the per-file `project: X` stamp lines (the old grep) and the
+  // repo identity nodes; with no repo node claiming the slug the alias set is
+  // {slug} and behavior is byte-identical to the original.
+  const stamps = []; // per file: the exact `project: ` stamp line values it carries
+  const projects = []; // resident repo identity nodes: { id, slugs }
   for (const f of files) {
     try {
       const lines = fs.readFileSync(path.join(nodes, f), "utf8").split("\n");
       stamps.push(lines.filter((l) => l.startsWith("project: ")).map((l) => l.slice(9)));
-      if (lines.includes("type: project")) {
+      if (lines.includes("type: repo")) {
         const id = lines.find((l) => l.startsWith("id: "))?.slice(4).trim() ?? "";
         const m = lines.find((l) => l.startsWith("slugs:"))?.match(/\[([^\]]*)\]/);
         const status = lines.find((l) => l.startsWith("status:"))?.slice(7).trim() ?? "";
@@ -251,8 +252,8 @@ ${body}`;
   const aliases = new Set([slug, ...(owner?.slugs ?? [])]);
   const projCount = stamps.filter((vals) => vals.some((v) => aliases.has(v))).length;
 
-  // Archived project (issue-cc-project-lifecycle-queue-pollution): a resident
-  // `type: project` node with `status: archived` retires the project. Announce
+  // Archived repo (issue-cc-project-lifecycle-queue-pollution): a resident
+  // `type: repo` node with `status: archived` retires it. Announce
   // it and skip the stale brief + the open-front line — the queue already
   // hides its items for everyone, so there's no live front to surface.
   if ((owner?.status || "").toLowerCase() === "archived") {
