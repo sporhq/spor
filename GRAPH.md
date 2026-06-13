@@ -93,6 +93,7 @@ Rules:
 | briefing   | `brief-`  | a compiled briefing (output of this system; never traversed) |
 | correction | `corr-`   | standing fix to a briefing: pin/exclude/guidance (never traversed) |
 | question   | `question-` | a routed ask the graph could not answer (queueable; status `open`/`answered`, gated) |
+| person     | `person-` | a member of the org — the identity anchor for `$viewer` binding and Tier-2 question routing (team mode; see "People, routing, and onboarding") |
 | capture-pending | `cap-` | raw captured text that fit no schema; filed by the server for later triage (QUEUE.md §2.3); born status-less, closed only as `merged` (content now in proper node(s)) or `rejected` (no durable fact) — a `transitions()` gate rejects other statuses at write time |
 | finding    | `find-`   | a gardener observation about another node, filed as a queue item (QUEUE.md §6) |
 | project    | `proj-`   | durable project identity: slug aliases + repo fingerprints; heals renames at read time (below) |
@@ -174,6 +175,74 @@ date: 2026-06-12
   reachable in a project-scoped read. Archival is backward-readable: any other
   status (or none) is live, exactly as before.
 
+## People, routing, and onboarding
+
+Team mode (API.md) adds people to the graph. A `person` node is the org
+member's identity anchor — every authenticated token's canonical subject is a
+`person-` node, and `{name, email}` attribution resolves *from that node at
+read time* (API.md §4). Tier-2 question routing and `$viewer`-scoped views
+(your queue, your mutes, "what am I blocking") all key off the person node the
+caller's token is bound to.
+
+```markdown
+---
+id: person-anthony
+type: person
+title: Anthony Allen
+summary: Maintainer; stewards the schema registry and the hook engines.
+email: losthammer@gmail.com
+queue_mute: [some-noisy-project, task-noisy-job@2026-07-01]
+date: 2026-06-10
+edges:
+  - {type: stewards, to: norm-cc-registry-is-contract}
+  - {type: stewards, to: art-cc-hooks}
+---
+```
+
+- **`email` is the identity attribute, not the key.** The token binds to the
+  *person node id*; `email` is a re-pointable field on the node, so changing it
+  re-points attribution and routing instead of severing them
+  (issue-cc-identity-email-mutable-primary-key). The token's `{name, email}`
+  attribution is read from the bound node, never from a caller parameter
+  (dec-viewer-token-binding, dec-cc-attribution-from-token).
+- **`stewards` edges are the routing key.** A `person → node` `stewards` edge
+  declares ownership of an area, spec, or norm. When a question can't be
+  answered from the graph and is filed (`ask_question` / `POST /v1/questions`),
+  the deterministic router walks `stewards` edges from the question's relevance
+  neighborhood to the closest steward and writes a `routed-to` edge to that
+  person; an unrouted question (no steward matched) surfaces to everyone.
+- **`assigned`** points work (task/issue) at a person; per-person queues filter
+  on it. **`answers`** points any answer node back at the `question-` it
+  resolves — the answer loop is lineage, not messaging, so the asker's next
+  compile pulls the answer through the question's neighborhood.
+- **`queue_mute`** (flat inline list of project slugs or node ids, each with an
+  optional `@YYYY-MM-DD` expiry) is per-viewer presentation only: the queue
+  hides those items for this person and reports how many it hid; they stay live
+  and visible to everyone else (QUEUE.md §4).
+
+### Onboarding a team member
+
+Joining someone to a team graph is three deliberate steps — do all three or
+routing degrades quietly:
+
+1. **Author the `person-<name>` node** (frontmatter above), with `email` set to
+   the address the member commits and authenticates under.
+2. **Add `stewards` edges** from that node to the areas/specs/norms they own.
+   Without at least one steward in a topic's neighborhood, questions there route
+   to no one and fall back to surfacing for everybody — answerable, but not
+   *directed*.
+3. **Mint a token bound to the node:** an admin runs `spor-mint-token --person
+   person-<name>` on the server box, or `POST /v1/admin/tokens {person}` over
+   REST (admin-only; API.md §3/§4). The plaintext token is returned once.
+
+If a member is reading and writing but **never receives routed questions, sees
+an empty personal queue, or has no mutes take effect**, their token did not bind
+to a person node (no node, or a token minted before the node existed). That is
+the failure this section exists to prevent: today it degrades silently — the
+client surfaces no warning when the authenticated identity maps to no person
+node. Surfacing that unbound state in queue and briefing responses is tracked
+server-side (issue-cc-onboarding-email-mismatch-silent-degradation).
+
 ## Edge types and traversal weights
 
 | edge             | weight | meaning                                          |
@@ -185,10 +254,21 @@ date: 2026-06-12
 | `decided-in`     | 0.9    | the choice in this node was made in the target   |
 | `resolves`       | 0.9    | this node fixes/closes the target                |
 | `blocks`         | 0.7    | target cannot proceed until this node does       |
+| `answers`        | 0.7    | this node answers that question (inverse `answered-by`); pulls the answer through the asker's next compile |
+| `assigned`       | 0.5    | work is assigned to this person                  |
 | `relates-to`     | 0.5    | weak association                                 |
 | `mentions`       | 0.5    | weakest association                              |
+| `stewards`       | 0.4    | this person stewards an area/spec/norm — the Tier-2 question-routing key |
+| `routed-to`      | 0.3    | a question routed to this person for answering   |
 | `compiled-for`   | —      | briefing → its task/query (provenance only)      |
 | `shaped-by`      | —      | briefing → corrections applied (provenance only) |
+
+`answers`, `assigned`, `stewards`, and `routed-to` are the person-graph
+edges of Tier-2 question routing; they ship in the seed pack and are
+documented under "People, routing, and onboarding" above. `assigned` and
+`routed-to` point at a `person-` node; `stewards` points from a person to
+the area they own; `answers` points from any answer node back at the
+`question-` it resolves.
 
 High-weight edges decay slowly across hops; they are what makes structural
 traversal beat similarity search. Prefer one precise high-weight edge over
