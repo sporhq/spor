@@ -143,6 +143,14 @@ date: 2026-06-12
   fingerprints, different checkout dir). Inference uses the main worktree's
   basename — `dirname(git rev-parse --git-common-dir)` — so every worktree of
   one repo shares one identity.
+- `status: archived` retires a finished or abandoned project. One edit to the
+  project node hides its open tasks and questions from the decision queue for
+  **every** viewer (the queue reports the hidden count as `archived`, never
+  silent), and session-start announces the archival instead of injecting a
+  stale brief — replacing the only prior relief, a per-person `queue_mute` that
+  each teammate had to set. Slug aliases still resolve, so closed history stays
+  reachable in a project-scoped read. Archival is backward-readable: any other
+  status (or none) is live, exactly as before.
 
 ## Edge types and traversal weights
 

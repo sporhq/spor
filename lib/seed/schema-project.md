@@ -29,6 +29,16 @@ A project node makes project identity data instead of a derived convention
   the alias as a queue item for human confirmation. An accumulating set,
   not a derivation rule — no single fingerprint survives every rewrite.
 
+An optional `status: archived` retires the whole project at end-of-life
+(issue-cc-project-lifecycle-queue-pollution). One identity-level edit hides
+the project's open tasks/questions from the decision queue for EVERY viewer —
+unlike the per-person `queue_mute`, which a project retirement would otherwise
+need N people to each set. Slug aliases still resolve, so the project's closed
+history stays reachable in a project-scoped read, and session-start announces
+the archival instead of injecting a stale brief. Any other status (or none) is
+live and behaves exactly as before; archival is not gated by a `transitions()`
+status enum, so it stays backward-readable (old clients ignore it).
+
 `capturable: false`: project identity is created deliberately (by a human or
 the rename-detection loop), never drafted from a capture. Graphs without
 project nodes behave exactly as before — slug inference stays the default,

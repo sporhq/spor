@@ -212,7 +212,8 @@ ${body}`;
       if (lines.includes("type: project")) {
         const id = lines.find((l) => l.startsWith("id: "))?.slice(4).trim() ?? "";
         const m = lines.find((l) => l.startsWith("slugs:"))?.match(/\[([^\]]*)\]/);
-        projects.push({ id, slugs: (m?.[1] ?? "").split(",").map((s) => s.trim()).filter(Boolean) });
+        const status = lines.find((l) => l.startsWith("status:"))?.slice(7).trim() ?? "";
+        projects.push({ id, slugs: (m?.[1] ?? "").split(",").map((s) => s.trim()).filter(Boolean), status });
       }
     } catch {
       stamps.push([]);
@@ -221,6 +222,16 @@ ${body}`;
   const owner = projects.find((p) => p.id === slug || p.slugs.includes(slug));
   const aliases = new Set([slug, ...(owner?.slugs ?? [])]);
   const projCount = stamps.filter((vals) => vals.some((v) => aliases.has(v))).length;
+
+  // Archived project (issue-cc-project-lifecycle-queue-pollution): a resident
+  // `type: project` node with `status: archived` retires the project. Announce
+  // it and skip the stale brief + the open-front line — the queue already
+  // hides its items for everyone, so there's no live front to surface.
+  if ((owner?.status || "").toLowerCase() === "archived") {
+    return envelope(
+      `A Spor knowledge graph is active: ${count} nodes in ${nodes}. Project ${owner.id} (${slug}) is ARCHIVED — its open work is retired and no longer surfaced in the queue. History stays reachable via /spor:brief; nothing to pick up here. ${USAGE_LOCAL}`
+    );
+  }
 
   // Open-front line: rank this project's queue in-process (no server, so heat
   // is 0 — the other QUEUE.md signals still order it) and surface the single

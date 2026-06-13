@@ -121,6 +121,49 @@ test('rankQueue: a mute naming any alias hides the whole project class', () => {
   assert.equal(r.muted, 2);
 });
 
+// ---------- archived projects (issue-cc-project-lifecycle-queue-pollution) ----------
+
+const ARCHIVED_PROJ = PROJ.replace('date: 2026-06-12\n', 'status: archived\ndate: 2026-06-12\n');
+
+test('rankQueue: an archived project drops its items from the global queue for every viewer (counted, not silent)', () => {
+  const g = tmpGraph(Object.fromEntries([
+    ['proj-x.md', ARCHIVED_PROJ],
+    task('task-old', 'old-name'),    // archived via the old alias
+    task('task-new', 'new-name'),    // archived via the current alias
+    task('task-live', 'elsewhere'),  // live, unrelated project
+  ])).load();
+  assert.ok(graph.isArchivedProject(g, 'old-name'));
+  assert.ok(graph.isArchivedProject(g, 'proj-x'));
+  assert.ok(!graph.isArchivedProject(g, 'elsewhere'));
+  const r = rankQueue(g, { now: NOW });
+  assert.deepEqual(r.items.map((i) => i.id), ['task-live']);
+  assert.equal(r.archived, 2); // both archived-project items hidden, and reported
+});
+
+test('rankQueue: explicitly scoping to the archived project still ranks it (archival hides from the firehose, not from a direct look)', () => {
+  const g = tmpGraph(Object.fromEntries([
+    ['proj-x.md', ARCHIVED_PROJ],
+    task('task-old', 'old-name'),
+    task('task-new', 'new-name'),
+  ])).load();
+  for (const filter of ['old-name', 'new-name', 'proj-x']) {
+    const r = rankQueue(g, { now: NOW, project: filter });
+    assert.deepEqual(r.items.map((i) => i.id).sort(), ['task-new', 'task-old'], `filter ${filter}`);
+    assert.equal(r.archived, undefined, `filter ${filter}: nothing hidden when viewing the project itself`);
+  }
+});
+
+test('rankQueue: a live (non-archived) project status behaves byte-for-byte as before', () => {
+  const g = tmpGraph(Object.fromEntries([
+    ['proj-x.md', PROJ], // no status
+    task('task-old', 'old-name'),
+  ])).load();
+  const r = rankQueue(g, { now: NOW });
+  assert.deepEqual(r.items.map((i) => i.id), ['task-old']);
+  assert.equal(r.archived, undefined);
+  assert.equal(g.archivedProjects.size, 0);
+});
+
 // ---------- validator ----------
 
 test('validateGraph: warns on contested and non-kebab slugs', () => {
@@ -327,6 +370,26 @@ test('session-start local: no project node -> exact-slug behavior unchanged', ()
   const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
   assert.match(ctx, /\(0 tagged project: new-name\)/);
   assert.ok(!ctx.includes('Standing project briefing'), 'alias brief must not leak without a project node');
+});
+
+test('session-start local: an archived project is announced, not briefed', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-ss-arch-'));
+  const home = path.join(root, 'graph');
+  fs.mkdirSync(path.join(home, 'nodes'), { recursive: true });
+  const cwd = path.join(root, 'new-name'); // slug new-name -> proj-x (archived)
+  fs.mkdirSync(cwd);
+  fs.writeFileSync(path.join(home, 'nodes', 'proj-x.md'), ARCHIVED_PROJ);
+  fs.writeFileSync(path.join(home, 'nodes', 'brief-old-name.md'), OLD_BRIEF);
+  fs.writeFileSync(path.join(home, 'nodes', 'task-old.md'), task('task-old', 'old-name')[1]);
+  const out = run(
+    ['session-start', '--host', 'claude-code'],
+    JSON.stringify({ cwd, hook_event_name: 'SessionStart' }),
+    freshEnv(home)
+  );
+  const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /proj-x \(new-name\) is ARCHIVED/);
+  assert.ok(!ctx.includes('Standing project briefing'), 'archived project must not inject a stale brief');
+  assert.ok(!ctx.includes('open front:'), 'archived project has no live front to surface');
 });
 
 // Stub server: records requests; answers the briefing fetch found:false.
