@@ -164,10 +164,40 @@ function makeLogger(file, prefix) {
   return (msg) => appendLine(file, `[${isoSeconds()}] ${prefix}${msg}`);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Parse a Retry-After header to milliseconds. HTTP allows two forms: a
+// non-negative integer of seconds, or an HTTP-date. Returns null when the
+// header is absent or unparseable (caller falls back to exponential backoff).
+function parseRetryAfter(value) {
+  if (value == null || value === "") return null;
+  const secs = Number(value);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const when = Date.parse(value);
+  if (!Number.isNaN(when)) return Math.max(0, when - Date.now());
+  return null;
+}
+
+// Delay before the next retry: honor a server-supplied Retry-After when
+// present, else exponential backoff (250ms · 2^attempt). Always capped so a
+// hostile or huge Retry-After can't blow the caller's wall-clock budget.
+function backoffMs(attempt, retryAfterMs, capMs) {
+  const base = retryAfterMs != null ? retryAfterMs : 250 * 2 ** attempt;
+  return Math.min(base, capMs);
+}
+
 // curl-shaped HTTP: resolves to {http: "200", body: "..."} with "000" on any
 // transport failure (timeout, refused, DNS). Never throws. Like bare curl,
-// redirects are not followed.
-async function curl(url, { method = "GET", headers = {}, body, timeoutMs = 6000, retry = 0 } = {}) {
+// redirects are not followed. Transient failures (transport, 429, 5xx) are
+// retried up to `retry` times; between retries we honor a 429 Retry-After
+// header and otherwise back off exponentially (capped at backoffCapMs). With
+// retry=0 (the session-start hook budget) no backoff ever runs.
+async function curl(
+  url,
+  { method = "GET", headers = {}, body, timeoutMs = 6000, retry = 0, backoffCapMs = 8000 } = {}
+) {
   for (let attempt = 0; ; attempt++) {
     let res;
     try {
@@ -179,12 +209,19 @@ async function curl(url, { method = "GET", headers = {}, body, timeoutMs = 6000,
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch {
-      if (attempt < retry) continue;
+      if (attempt < retry) {
+        await sleep(backoffMs(attempt, null, backoffCapMs));
+        continue;
+      }
       return { http: "000", body: "" };
     }
     const text = await res.text().catch(() => "");
     const transient = res.status === 429 || res.status >= 500;
-    if (transient && attempt < retry) continue;
+    if (transient && attempt < retry) {
+      const retryAfterMs = res.status === 429 ? parseRetryAfter(res.headers.get("retry-after")) : null;
+      await sleep(backoffMs(attempt, retryAfterMs, backoffCapMs));
+      continue;
+    }
     return { http: String(res.status), body: text };
   }
 }
@@ -360,6 +397,8 @@ module.exports = {
   parseJsonStream,
   collectTextFields,
   sha256Head,
+  parseRetryAfter,
+  backoffMs,
   fillTemplate,
   localTitleIndex,
   remoteTitleIndex,

@@ -281,10 +281,19 @@ Non-2xx responses carry the envelope:
 
 Codes and their HTTP statuses: `unauthorized` 401, `not_found` 404,
 `conflict` 409, `transition_denied` 409, `lease_expired` 409,
-`outcome_conflict` 409, `not_ready` 409, `invalid_node` 422, `too_large`
-413, `ingestion_unavailable` 503, `unimplemented` 501, `internal` 500.
-Hooks never parse error bodies — any non-200 means "behave as if the graph
-is empty" (§6).
+`outcome_conflict` 409, `not_ready` 409, `invalid_node` 422, `rate_limited`
+429, `too_large` 413, `ingestion_unavailable` 503, `unimplemented` 501,
+`internal` 500. Hooks never parse error bodies — any non-200 means "behave
+as if the graph is empty" (§6).
+
+A `429 rate_limited` response SHOULD carry a `Retry-After` header (delay
+seconds or an HTTP-date); clients honor it, otherwise backing off
+exponentially, capped, before retrying. Mechanical writers
+(drain-outbox, distill) classify `401`, `400`, `413`, and `422` as
+**permanent** — a revoked token will not un-revoke, so these are
+dead-lettered to `outbox/dead/` with a loud `journal/remote.log` line
+rather than re-POSTed forever; `429` and `5xx` stay transient and are
+retried with backoff.
 
 `GET /v1/export` response headers: `x-substrate-head` carries the graph
 commit, `x-substrate-node-count` the entry count (plus

@@ -56,8 +56,12 @@ async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0) 
         fs.unlinkSync(file);
       } catch {}
       rlog(`drained ${name} (http=${http})`);
-    } else if (http === "400" || http === "413" || http === "422") {
+    } else if (http === "401" || http === "400" || http === "413" || http === "422") {
       // Permanent client error: dead-letter it so it can't starve the drain.
+      // A 401 means the token is revoked/invalid (dec-cc-fail-open-hooks: 4xx
+      // is dead-lettered) — re-POSTing it on every session start and distill
+      // cycle never succeeds, so it gets the same treatment, but louder: the
+      // fix is a new token, not patience.
       try {
         u.ensureDir(path.join(outbox, "dead"));
         fs.renameSync(file, path.join(outbox, "dead", name));
@@ -66,7 +70,14 @@ async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0) 
           fs.unlinkSync(file);
         } catch {}
       }
-      rlog(`dead-lettered ${name} (http=${http}, permanent); kept in outbox/dead/ for inspection`);
+      if (http === "401") {
+        rlog(
+          `dead-lettered ${name} (http=401, revoked/invalid token); ` +
+            `re-mint SPOR_TOKEN and replay outbox/dead/ — auth will not recover on its own`
+        );
+      } else {
+        rlog(`dead-lettered ${name} (http=${http}, permanent); kept in outbox/dead/ for inspection`);
+      }
     } else {
       rlog(`drain failed for ${name} (http=${http}); leaving spooled`);
     }
