@@ -176,6 +176,69 @@ function repoFingerprints(cwd) {
   return out;
 }
 
+// Process-level cached graph load (issue-cc-local-mode-hook-load-latency).
+// loadGraph does a linear per-file scan of every node (300-650ms at 5k nodes,
+// multi-second by 50k) with no cache, and the local hooks reload it from
+// scratch on every invocation — silent latency that never trips the 30s budget
+// because the hooks fail open. This memoizes the loaded graph in-process,
+// keyed by a cheap directory fingerprint (file count + newest mtime), so the
+// SAME process that loads the graph more than once (and any future caller that
+// loops over it) pays the scan once and reuses it while the dir is unchanged.
+// The fingerprint is a stat-per-file walk — orders of magnitude cheaper than
+// reading + parsing every file — and any change to the set or to any file's
+// mtime busts the cache, so a stale graph is never served. Fail-open: if
+// loadGraph throws, the error propagates exactly as a direct call would (the
+// engines wrap their loads in try/catch); a fingerprint failure forces a fresh
+// load rather than serving stale. Returns { graph, loadMs, cached }.
+let _graphCache = null; // { dir, fp, graph }
+function dirFingerprint(dir) {
+  let count = 0;
+  let newest = 0;
+  for (const f of fs.readdirSync(dir)) {
+    if (!f.endsWith(".md")) continue;
+    count++;
+    const m = fs.statSync(path.join(dir, f)).mtimeMs;
+    if (m > newest) newest = m;
+  }
+  return `${count}:${newest}`;
+}
+function loadGraphCached(nodesDir) {
+  const dir = path.resolve(nodesDir);
+  let fp = null;
+  try {
+    fp = dirFingerprint(dir);
+  } catch {
+    /* unreadable dir -> no fingerprint, never cache */
+  }
+  if (fp && _graphCache && _graphCache.dir === dir && _graphCache.fp === fp) {
+    return { graph: _graphCache.graph, loadMs: 0, cached: true };
+  }
+  const t0 = Date.now();
+  const graph = require(path.join(ROOT, "lib", "graph.js")).loadGraph(dir);
+  const loadMs = Date.now() - t0;
+  if (fp) _graphCache = { dir, fp, graph };
+  else _graphCache = null;
+  return { graph, loadMs, cached: false };
+}
+
+// Stamp a load-latency telemetry line into the per-session journal
+// (issue-cc-local-mode-hook-load-latency). This is the missing SIGNAL for
+// silent local-mode latency creep — operators can grep the journal for
+// load_ms over time and gate tier-2 scale work on it. Journal-only by design:
+// the injected additionalContext stays byte-identical (no visible warning), so
+// local mode is unchanged except for this side-channel and the cache above.
+// Best-effort; never blocks or throws.
+function journalLoadMs(graph, session, engine, loadMs, extra = {}) {
+  try {
+    const dir = path.join(graph, "journal");
+    if (!ensureDir(dir)) return;
+    const rec = { ts: jqNow(), engine, session: session || "unknown", load_ms: loadMs, ...extra };
+    appendLine(path.join(dir, "load-latency.jsonl"), JSON.stringify(rec));
+  } catch {
+    /* best-effort telemetry */
+  }
+}
+
 function git(cwd, args, opts = {}) {
   try {
     return execFileSync("git", ["-C", cwd, ...args], {
@@ -435,6 +498,8 @@ module.exports = {
   ensureDir,
   appendLine,
   makeLogger,
+  loadGraphCached,
+  journalLoadMs,
   curl,
   bearer,
   serverBase,

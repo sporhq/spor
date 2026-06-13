@@ -166,7 +166,17 @@ async function promptContext(input) {
   // LOCAL MODE (original behavior — byte-identical to prompt-context.sh)
   // -------------------------------------------------------------------------
   if (!fs.existsSync(path.join(graph, "nodes"))) return null;
+  // Time the compile subprocess and stamp it to the journal
+  // (issue-cc-local-mode-hook-load-latency): lib/compile.js reloads the whole
+  // graph per prompt with no cache, and because hooks fail open the latency
+  // never trips the 30s budget — so the creep is invisible. The stamp is the
+  // missing signal; it is journal-only, so the injected digest stays
+  // byte-identical. Best-effort; never blocks.
+  const t0 = Date.now();
   const digest = localCompile(graph, prompt, null, slug);
+  u.journalLoadMs(graph, input.session_id, "prompt-context", Date.now() - t0, {
+    cached: false,
+  });
   if (!digest) return null;
   return envelope(digest);
 }

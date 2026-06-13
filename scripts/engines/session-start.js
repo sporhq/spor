@@ -262,11 +262,15 @@ ${body}`;
   }
 
   // The in-process graph backs both the open-front line and the no-brief
-  // fallback digest below — load it once. Fail open: a load failure leaves
-  // both empty (the count line still prints).
+  // fallback digest below — load it once, through the cached loader so a
+  // re-load within this process is free and the scan latency gets a journal
+  // stamp (issue-cc-local-mode-hook-load-latency). Fail open: a load failure
+  // leaves both empty (the count line still prints).
   let g = null;
   try {
-    g = require(path.join(u.ROOT, "lib", "graph.js")).loadGraph(nodes);
+    const { graph: loaded, loadMs, cached } = u.loadGraphCached(nodes);
+    g = loaded;
+    u.journalLoadMs(graph, input.session_id, "session-start", loadMs, { nodes: count, cached });
   } catch {
     /* fail open */
   }
