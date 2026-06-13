@@ -8,4 +8,4 @@ Spor graph nodes relevant to this prompt (auto-compiled; node files live in /gra
 - **schema-edge-measures — measures — Meridian-defined edge type** (schema, meridian, 2026-06-10, content match — no lineage, check for prior art): Org-defined edge - key result is measured by this work.
 - **feat-bulk-export — Bulk CSV export** (feature, meridian, 2026-06-10, content match — no lineage, check for prior art): Self-serve bulk export for the shipments dashboard.
 - **team-shipments — Shipments** (team, meridian, 2026-06-10, content match — no lineage, check for prior art): Owns the dashboard and export surfaces.
-- **kr-support-tickets — Export support tickets down 60%** (key-result, meridian, 2026-06-10, content match — no lineage, check for prior art): Ticket volume drop attributable to export templates.
+- **kr-support-tickets — Export support tickets down 60%** (key-result, meridian, 2026-06-10, done, content match — no lineage, check for prior art): Ticket volume drop attributable to export templates.
