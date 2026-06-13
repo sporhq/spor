@@ -1,7 +1,6 @@
 Spor graph nodes relevant to this prompt (auto-compiled; node files live in /graph/pricing/nodes; run /spor:brief for a full briefing):
 
 - **dec-new — Vendor neutral price book pricing** (decision, meridian, 2026-06-09): The price book prices vendor-neutral with composed and plan pricing.
-- **dec-old — Single vendor pricing** (decision, meridian, 2026-06-02): Old single-vendor price book pricing decision, later superseded. ⚠ SUPERSEDED by dec-new — do not follow
 - **task-pricing-rollout — Roll out vendor neutral pricing to the price book** (task, meridian, 2026-06-10): Apply the vendor-neutral pricing decision across the published price book plans, including composed bundles and the plan tier table, so quotes stop drifting from the billing cost spec.
 - **spec-rc — Billing cost spec** (artifact, meridian, 2026-06-01): The revenue versus cost target spec that bounds price book pricing decisions and the usage limits every plan must respect.
 - **q-tier-pricing — Does the plan tier table inherit composed bundle discounts** (question, meridian, 2026-06-10): Open question on whether plan tier table pricing inherits the composed bundle discount structure or prices flat.
@@ -9,3 +8,5 @@ Spor graph nodes relevant to this prompt (auto-compiled; node files live in /gra
 
 Standing corrections:
 > Quote prices from art-catalogue; never recompute price figures inline.
+> The plan tier table question gates the rollout order; the old single-vendor
+> decision keeps misleading sessions and is excluded.

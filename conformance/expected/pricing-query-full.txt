@@ -10,6 +10,11 @@ plan tier table discounts
 
 Quote prices from art-catalogue; never recompute price figures inline.
 
+### corr-pricing-rollout — Pin the tier question, drop the stale vendor decision (2026-06-11)
+
+The plan tier table question gates the rollout order; the old single-vendor
+decision keeps misleading sessions and is excluded.
+
 ## LINEAGE (structural arm: typed-edge walk)
 
 ### q-tier-pricing — Does the plan tier table inherit composed bundle discounts (question, 2026-06-10)
@@ -41,13 +46,6 @@ The price book lists every plan with its usage limits and price.
 
 Price book pricing is vendor neutral: composed bundles price from the
 billing cost spec envelopes, never from a single vendor quote.
-
-### dec-old — Single vendor pricing (decision, 2026-06-02)
-*selected via: supersedes from dec-new, score 0.77*
-
-> ⚠ SUPERSEDED by dec-new. Do not follow; included only so you recognize stale references.
-
-Old single-vendor price book pricing decision, later superseded.
 
 ## OUTSIDE VIEW (content arm — no lineage connection; check for prior art and unowned constraints)
 

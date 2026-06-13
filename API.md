@@ -129,7 +129,7 @@ Sugar over `put_node` for the correction loop. Input:
 
 ```json
 {
-  "target":   "node id or \"global\"",
+  "target":   "node id | \"project:<slug>\" | \"global\"",
   "pin":      ["spec-actor-model"],
   "exclude":  ["art-stale-notes"],
   "guidance": "free text injected into compiles for the target",
@@ -139,7 +139,13 @@ Sugar over `put_node` for the correction loop. Input:
 
 The server generates the `corr-<target>-<n>` id (next free ordinal), builds
 the node per GRAPH.md, and routes it through the same write path. `target`
-must exist or be `global`.
+is one of: an existing **node id** (fires when that node is the compile root
+or a query-matched seed — query/digest mode included, per
+issue-cc-corrections-silent-noop-query-mode); **`project:<slug>`** (fires on
+every compile for that project, slug resolved through project aliases); or
+**`global`** (every compile, graph-wide). A node-id target must exist; the
+`project:`/`global` forms are accepted verbatim. The kernel `compile()`
+honors all three when handed `opts.project` (the session slug).
 
 ### `capture`
 

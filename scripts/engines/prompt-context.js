@@ -14,7 +14,7 @@ function envelope(ctx) {
   return { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: ctx } };
 }
 
-function localCompile(graph, prompt, rlogFile) {
+function localCompile(graph, prompt, rlogFile, project) {
   const r = spawnSync(
     process.execPath,
     [
@@ -25,6 +25,11 @@ function localCompile(graph, prompt, rlogFile) {
       prompt,
       "--digest",
       "--quiet",
+      // The session slug scopes `project:<slug>` corrections (issue-cc-
+      // corrections-silent-noop-query-mode). Absent any such correction the
+      // digest is byte-identical to before, so local mode stays unchanged for
+      // every existing graph.
+      ...(project ? ["--project", project] : []),
     ],
     { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }
   );
@@ -108,6 +113,7 @@ function mergeDigests(team, local) {
 async function promptContext(input) {
   const graph = u.graphHome();
   const prompt = input.prompt ?? "";
+  const slug = u.projectSlug(input.cwd ?? "");
 
   // Skip trivial prompts (slash commands, <6 words) BEFORE any network call.
   if (prompt.startsWith("/")) return null;
@@ -145,7 +151,7 @@ async function promptContext(input) {
     // graph exists.
     let local = "";
     if (fs.existsSync(path.join(graph, "nodes"))) {
-      local = localCompile(graph, prompt, rlogFile);
+      local = localCompile(graph, prompt, rlogFile, slug);
     }
 
     if (!team && !local) return null;
@@ -160,7 +166,7 @@ async function promptContext(input) {
   // LOCAL MODE (original behavior — byte-identical to prompt-context.sh)
   // -------------------------------------------------------------------------
   if (!fs.existsSync(path.join(graph, "nodes"))) return null;
-  const digest = localCompile(graph, prompt, null);
+  const digest = localCompile(graph, prompt, null, slug);
   if (!digest) return null;
   return envelope(digest);
 }

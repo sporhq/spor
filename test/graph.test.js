@@ -288,6 +288,109 @@ test("correction: global correction body line is appended to the digest", () => 
   assert.match(r.text, /Standing corrections:/);
 });
 
+// ---------- correction scope in query/digest mode
+// (issue-cc-corrections-silent-noop-query-mode) ----------
+
+// A corpus with a node-targeted correction (target: dec-new) plus a
+// project-scoped one, to exercise the query-mode and project: scope paths.
+function correctionScopeFixture() {
+  return tmpGraph({
+    "spec-rc.md": `---
+id: spec-rc
+type: artifact
+project: my-project
+title: Reliability cost spec
+summary: The reliability cost spec bounding catalogue pricing and recovery.
+date: 2026-06-01
+---
+Body of the reliability cost spec about pricing envelopes.
+`,
+    "dec-new.md": `---
+id: dec-new
+type: decision
+project: my-project
+title: Provider neutral catalogue pricing
+summary: The catalogue prices provider-neutral with composed and plan pricing.
+date: 2026-06-09
+edges:
+  - {type: constrained-by, to: spec-rc}
+---
+The catalogue is now provider-neutral, removing single-provider lock-in.
+`,
+    "art-stale.md": `---
+id: art-stale
+type: artifact
+project: my-project
+title: Stale pricing notes
+summary: Old catalogue pricing scratch notes that should be excluded.
+date: 2026-04-01
+---
+Old pricing notes about the catalogue, kept only for history.
+`,
+    "corr-dec-new-1.md": `---
+id: corr-dec-new-1
+type: correction
+title: Exclude the stale notes from the pricing neighborhood
+target: dec-new
+exclude: [art-stale]
+date: 2026-06-10
+---
+The stale pricing notes keep misleading sessions; exclude them.
+`,
+    "corr-project-my-project-1.md": `---
+id: corr-project-my-project-1
+type: correction
+title: Project-wide pricing guidance
+target: project:my-project
+date: 2026-06-11
+---
+Project-wide: quote prices only from the published catalogue.
+`,
+  });
+}
+
+test("correction: node-targeted correction fires in query mode when its target is a seed", () => {
+  const g = correctionScopeFixture().load();
+  // query matches dec-new strongly, seeding it; corr-dec-new-1 must then fire.
+  const r = graph.compile(g, { query: "provider neutral catalogue pricing", digest: true });
+  assert.equal(r.relevant, true);
+  assert.ok(!r.text.includes("art-stale"), "node-targeted exclude must apply in query mode");
+  assert.match(r.text, /Standing corrections:/);
+  assert.match(r.text, /stale pricing notes keep misleading/);
+});
+
+test("correction: node-targeted correction is dormant when its target is not in scope", () => {
+  const g = correctionScopeFixture().load();
+  // a query that does not surface dec-new leaves its correction dormant — the
+  // exclude does not fire graph-wide.
+  const r = graph.compile(g, { query: "reliability recovery envelopes spec", digest: true });
+  if (r.relevant) {
+    // art-stale is allowed to appear here precisely because the correction is
+    // scoped to dec-new, which this query did not seed.
+    assert.ok(!r.text.includes("stale pricing notes keep misleading"),
+      "dormant correction body must not render");
+  }
+});
+
+test("correction: project-scoped correction fires only with a matching project", () => {
+  const g = correctionScopeFixture().load();
+  const withProj = graph.compile(g, { query: "provider neutral catalogue pricing", digest: true, project: "my-project" });
+  assert.match(withProj.text, /quote prices only from the published catalogue/);
+  const noProj = graph.compile(g, { query: "provider neutral catalogue pricing", digest: true });
+  assert.ok(!noProj.text.includes("quote prices only from the published catalogue"),
+    "project: correction must not fire without a matching project");
+  const otherProj = graph.compile(g, { query: "provider neutral catalogue pricing", digest: true, project: "different-proj" });
+  assert.ok(!otherProj.text.includes("quote prices only from the published catalogue"),
+    "project: correction must not fire for a different project");
+});
+
+test("correction: full multi-line body renders in the digest footer", () => {
+  const g = pricingFixture().load();
+  const r = graph.compile(g, { rootId: "dec-new", digest: true });
+  // the global correction's full body (single line here) is `> `-prefixed.
+  assert.match(r.text, /> Always surface the actor-model spec and never the stale pricing notes\./);
+});
+
 // ---------- validateNode ----------
 
 test("validateNode: accepts a well-formed node", () => {

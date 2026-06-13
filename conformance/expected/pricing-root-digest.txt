@@ -7,3 +7,5 @@ Spor graph nodes relevant to this prompt (auto-compiled; node files live in /gra
 
 Standing corrections:
 > Quote prices from art-catalogue; never recompute price figures inline.
+> The plan tier table question gates the rollout order; the old single-vendor
+> decision keeps misleading sessions and is excluded.

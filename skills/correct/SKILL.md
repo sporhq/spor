@@ -22,7 +22,7 @@ the `propose_correction` MCP tool, API.md §3); the server generates the
 ```bash
 curl -sS --max-time 6 -X POST \
   -H "Authorization: Bearer $SPOR_TOKEN" -H "Content-Type: application/json" \
-  --data "$(jq -n --arg t '<node-id or global>' --arg g '<guidance>' --arg ti '<one line>' \
+  --data "$(jq -n --arg t '<node-id | project:<slug> | global>' --arg g '<guidance>' --arg ti '<one line>' \
     '{target:$t, pin:[], exclude:[], guidance:$g, title:$ti}')" \
   "${SPOR_SERVER%/}/v1/corrections"
 ```
@@ -40,9 +40,20 @@ Skip the local steps below; you are done once the server returns
 The graph home below is `~/.spor` by default (an existing `~/.substrate` is
 still used when `~/.spor` is absent).
 
-1. Identify the target: the node id the bad briefing was compiled for (check
-   `compiled-for` edges on the briefing node), or `global` for guidance that
-   should apply to every compile in this project.
+1. Identify the target — corrections fire only when their target is in scope
+   for a given compile:
+   - a **node id** (the node the bad briefing was compiled for — check
+     `compiled-for` edges on the briefing node): fires when that node is the
+     compile root or one of the nodes a query matched. This is the right scope
+     for a fix about one specific topic; it now applies in query/digest mode
+     too, not just root-mode briefings
+     (issue-cc-corrections-silent-noop-query-mode).
+   - `project:<slug>`: fires on every compile for that project (the slug
+     resolves through project aliases, so a historical name still matches).
+     Use this for project-wide guidance.
+   - `global`: fires on EVERY compile, for every project and teammate — the
+     broadest scope. Reserve it for graph-wide norms; prefer `project:<slug>`
+     when the guidance is project-specific.
 
 2. Establish what went wrong, from the user or from the conversation:
    - a relevant node was missed → `pin: [that-id]` (verify the id exists in
@@ -58,7 +69,7 @@ still used when `~/.spor` is absent).
 id: corr-<target>-<n>
 type: correction
 title: <one line: what this fixes>
-target: <node-id or global>
+target: <node-id | project:<slug> | global>
 pin: [id, id]
 exclude: [id]
 date: <today>
