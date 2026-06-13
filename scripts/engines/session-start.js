@@ -8,7 +8,6 @@
 const fs = require("fs");
 const path = require("path");
 const u = require("./util");
-const { drainOutbox } = require("./drain-outbox");
 
 const USAGE =
   "Use /spor:brief <query or node-id> for a task-specific briefing, /spor:correct to fix a bad briefing.";
@@ -72,38 +71,46 @@ async function sessionStart(input) {
     u.ensureDir(path.join(graph, "journal"));
     const rlog = u.makeLogger(path.join(graph, "journal", "remote.log"), `session-start ${slug}: `);
 
-    // Drain spooled nodes with a TIGHT budget (2s/file, 1 file, no retries) —
-    // session-start has only ~6s total (§7.1).
-    await drainOutbox(graph, "session-start", 2, 1).catch(() => {});
+    // Drain spooled nodes DETACHED: it is independent of the briefing/queue
+    // fetch and must not add to the response latency. Awaiting it serially
+    // stacked its 2s onto the briefing's 6s and the queue's 3s, blowing the
+    // ~6s session-start budget (§7.1, issue-cc-session-start-serial-timeout-
+    // budget). Detaching it (and the commit catch-up) leaves only the two
+    // server reads on the critical path, which now run concurrently.
+    u.spawnDetached([path.join(__dirname, "drain-outbox.js"), "session-start", "2", "1"]);
 
     // Commit-link catch-up (task-cc-commit-linking): detached, costs nothing.
     if (cwd && fs.existsSync(cwd)) {
       u.spawnDetached([path.join(__dirname, "link-commits.js"), cwd]);
     }
 
-    // Fetch the standing briefing. Budget 6s. Fail open. Repo fingerprints
-    // (root shas + normalized remotes) ride along so the server can learn
-    // them onto the project node and spot renames — an unknown slug with a
-    // known fingerprint files an alias proposal in the queue
-    // (task-cc-project-identity-nodes). Local git calls, ms-cheap, fail-open.
+    // Fetch the standing briefing (6s) and the queue (3s) CONCURRENTLY rather
+    // than serially: they are independent reads, so the critical path is the
+    // slower of the two (~6s), not their sum (~9s). Both fail open. Repo
+    // fingerprints (root shas + normalized remotes) ride the briefing call so
+    // the server can learn them onto the project node and spot renames — an
+    // unknown slug with a known fingerprint files an alias proposal in the
+    // queue (task-cc-project-identity-nodes). Local git calls, ms-cheap, fail-open.
     const fp = cwd && fs.existsSync(cwd) ? u.repoFingerprints(cwd) : [];
-    const brief = await u.curl(
-      `${u.serverBase()}/v1/briefing/${slug}${fp.length ? `?fp=${encodeURIComponent(fp.join(","))}` : ""}`,
-      {
+    const [brief, qresp] = await Promise.all([
+      u.curl(
+        `${u.serverBase()}/v1/briefing/${slug}${fp.length ? `?fp=${encodeURIComponent(fp.join(","))}` : ""}`,
+        {
+          headers: u.bearer(),
+          timeoutMs: 6000,
+        }
+      ),
+      u.curl(`${u.serverBase()}/v1/queue?limit=1`, {
         headers: u.bearer(),
-        timeoutMs: 6000,
-      }
-    );
+        timeoutMs: 3000,
+      }),
+    ]);
     const host = u.serverHost();
 
     // Tier-2: questions routed to this identity + the open front, riding one
     // queue response. Fail open: any failure leaves the lines empty.
     let qline = "";
     let oline = "";
-    const qresp = await u.curl(`${u.serverBase()}/v1/queue?limit=1`, {
-      headers: u.bearer(),
-      timeoutMs: 3000,
-    });
     try {
       const q = JSON.parse(qresp.body);
       const qn = Array.isArray(q.questions) ? q.questions.length : 0;

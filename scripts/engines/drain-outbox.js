@@ -85,3 +85,16 @@ async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0) 
 }
 
 module.exports = { drainOutbox };
+
+// CLI entry so session-start can fire the drain DETACHED (off the response
+// critical path) the same way it fires link-commits.js — argv: tag, perFileSec,
+// maxFiles. The graph home is re-derived from the environment, identical to the
+// in-process call. Fail-open, always exits 0.
+if (require.main === module) {
+  const tag = process.argv[2] || "drain";
+  const maxTimeSec = Number(process.argv[3]) || 30;
+  const maxFiles = Number(process.argv[4]) || 0;
+  drainOutbox(u.graphHome(), tag, maxTimeSec, maxFiles)
+    .catch(() => {})
+    .finally(() => process.exit(0));
+}
