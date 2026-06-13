@@ -253,7 +253,10 @@ anything with a token.
 
 - **Bearer tokens (REST + MCP).** Per-user tokens `spor_pat_…` (legacy
   `sub_pat_…` tokens stay valid, no re-mint required). Minted by a server
-  admin with `spor-mint-token` on the server box. Send
+  admin with `spor-mint-token --person <person-node-id>` on the server box;
+  the token's canonical subject is that **person node**, and its
+  `{name, email}` attribution resolves from the node at read time, so an
+  email change re-points the token instead of severing it. Send
   `Authorization: Bearer <token>` on every request. Tokens grant full
   read/write — the trust model is "everyone on the team can read and write
   the team graph", same as a shared repo. Transport is HTTPS only.
