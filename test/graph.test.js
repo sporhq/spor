@@ -357,6 +357,97 @@ test("scoping: a cross-project content hit is labeled foreign, not hard-filtered
   assert.match(r.text, /dec-theirs.*cross-project/s);
 });
 
+// ---------- norm ride-along scoping + cap (issue-cc-norm-ride-along-unscoped-bloat) ----------
+
+function normFixture() {
+  // Norm summaries use vocabulary DISJOINT from the root so they don't get
+  // pulled into the content/structural arms — they ride along purely on
+  // always_on, which is what the scoping change governs.
+  const norm = (id, project, vocab) => [`${id}.md`, `---
+id: ${id}
+type: norm
+project: ${project}
+title: Standing rule ${id}
+summary: Standing rule about ${vocab}.
+date: 2026-06-01
+---
+Standing rule body about ${vocab}.
+`];
+  return tmpGraph({
+    "dec-root.md": `---
+id: dec-root
+type: decision
+project: mine
+title: Root decision token alpha
+summary: Root decision token alpha bravo charlie delta.
+date: 2026-06-01
+---
+Root decision token alpha bravo charlie delta echo foxtrot.
+`,
+    ...Object.fromEntries([
+      norm("norm-mine-1", "mine", "kilo lima mike"),
+      norm("norm-theirs-1", "theirs", "november oscar papa"),
+      norm("norm-theirs-2", "theirs", "quebec romeo sierra"),
+    ]),
+    "norm-global.md": `---
+id: norm-global
+type: norm
+title: Unstamped global rule
+summary: Unstamped global standing rule about tango uniform victor.
+date: 2026-06-01
+---
+Global rule body about tango uniform victor.
+`,
+  });
+}
+
+test("norms: ride-along is project-scoped — foreign norms drop, global + same-project stay", () => {
+  const g = normFixture().load();
+  const scoped = graph.compile(g, { rootId: "dec-root", digest: false, project: "mine" });
+  const ids = scoped.picks.norms.map((n) => n.id).sort();
+  assert.deepEqual(ids, ["norm-global", "norm-mine-1"],
+    "only the session-project and unstamped norms ride along");
+  // project-blind compile keeps every norm (byte-identical legacy path).
+  const blind = graph.compile(g, { rootId: "dec-root", digest: false });
+  assert.equal(blind.picks.norms.length, 4);
+});
+
+test("norms: the ride-along section is capped instead of byte-truncated downstream", () => {
+  // 12 norms with vocabulary disjoint from the root (so none are consumed by
+  // the content/structural arms) — the ride-along caps at NORM_CAP (8) rather
+  // than dumping all 12 into the body for session-start to silently truncate.
+  const files = {
+    "dec-root.md": `---
+id: dec-root
+type: decision
+project: p
+title: Indexer rewrite token
+summary: Indexer rewrite token alpha bravo charlie.
+date: 2026-06-01
+---
+Indexer rewrite token alpha bravo charlie.
+`,
+  };
+  // each norm uses a unique nonsense vocabulary, none overlapping the root
+  for (let i = 0; i < 12; i++) {
+    files[`norm-n${String(i).padStart(2, "0")}.md`] = `---
+id: norm-n${String(i).padStart(2, "0")}
+type: norm
+title: Norm ${i}
+summary: Standing rule wibble${i} wobble${i} wubble${i}.
+date: 2026-06-01
+---
+Norm body wibble${i}.
+`;
+  }
+  const g = tmpGraph(files).load();
+  const r = graph.compile(g, { rootId: "dec-root", digest: false });
+  assert.equal(r.picks.norms.length, 8, "the ORG NORMS section is capped at NORM_CAP");
+  // deterministic: same input -> same kept set.
+  const again = graph.compile(g, { rootId: "dec-root", digest: false });
+  assert.deepEqual(r.picks.norms.map((n) => n.id), again.picks.norms.map((n) => n.id));
+});
+
 // ---------- supersession fixup + warning ----------
 
 test("supersession: superseded node carries the inline ⚠ SUPERSEDED warning in full compile", () => {
