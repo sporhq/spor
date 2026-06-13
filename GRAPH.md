@@ -128,10 +128,21 @@ date: 2026-06-12
   with a known fingerprint is rename evidence — the server files the alias
   as a queue item for a human to confirm. It is an accumulating set, not a
   derivation rule: no single fingerprint survives every history rewrite.
-- A committed `.spor` marker file at a repo root (`project: <id>`) beats
-  all inference — escape hatch for forks, moves, and rewrites. Zero-config
-  slug inference stays the default, and a graph with no project nodes
-  behaves exactly as before.
+- A committed `.spor` marker file (`project: <id>`) beats all inference —
+  escape hatch for forks, moves, and rewrites. It is read by **nearest
+  ancestor**: the search walks up from the session's cwd to the repo root, so
+  a monorepo subtree can carry its own marker (`services/api/.spor` →
+  `my-api`) that beats the root's, splitting one repo into distinct project
+  identities. With no subtree marker the search reaches the root and inference
+  is unchanged. Zero-config slug inference stays the default, and a graph with
+  no project nodes behaves exactly as before.
+- **Git worktrees** resolve to their main repo, not the worktree directory's
+  basename. A linked worktree shares the main repo's root-commit sha and
+  remotes, so inferring identity from its (markerless, often throwaway-named)
+  directory would mint a wrong slug *and* file false rename evidence (matching
+  fingerprints, different checkout dir). Inference uses the main worktree's
+  basename — `dirname(git rev-parse --git-common-dir)` — so every worktree of
+  one repo shares one identity.
 
 ## Edge types and traversal weights
 

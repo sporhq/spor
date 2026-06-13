@@ -146,6 +146,81 @@ test('projectSlug: a .spor marker beats basename inference; invalid values fall 
   assert.equal(u.projectSlug(cwd), path.basename(cwd).toLowerCase().replace(/[^a-z0-9]+/g, '-'));
 });
 
+// ---------- monorepo subtrees + git worktrees (issue-cc-project-identity-monorepo-worktree) ----------
+
+function gitInit(dir) {
+  const g = (args, cwd = dir) => {
+    const r = spawnSync('git', ['-C', cwd, ...args], {
+      encoding: 'utf8',
+      env: {
+        ...process.env, GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@example.com',
+        GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@example.com',
+      },
+    });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout;
+  };
+  g(['init', '-q']);
+  return g;
+}
+
+test('projectSlug: a nearest-ancestor .spor marker in a monorepo subtree beats the repo root', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-mono-'));
+  const repo = path.join(base, 'My_Monorepo');
+  fs.mkdirSync(repo);
+  const g = gitInit(repo);
+  const sub = path.join(repo, 'services', 'api');
+  fs.mkdirSync(sub, { recursive: true });
+
+  // No marker anywhere: subtree infers the repo-root basename, not the subdir.
+  assert.equal(u.projectSlug(sub), 'my-monorepo');
+
+  // Subtree marker beats inference and does NOT leak up to the repo root.
+  fs.writeFileSync(path.join(sub, '.spor'), 'project: my-api\n');
+  assert.equal(u.projectSlug(sub), 'my-api');
+  assert.equal(u.projectSlug(repo), 'my-monorepo');
+
+  // A root marker still works, and the nearer subtree marker still wins.
+  fs.writeFileSync(path.join(repo, '.spor'), 'project: mono-root\n');
+  assert.equal(u.projectSlug(repo), 'mono-root');
+  assert.equal(u.projectSlug(sub), 'my-api');
+
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+test('projectSlug: a linked git worktree resolves to its main repo, not the worktree basename', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-wt-'));
+  const repo = path.join(base, 'my-service');
+  fs.mkdirSync(repo);
+  const g = gitInit(repo);
+  fs.writeFileSync(path.join(repo, 'f.txt'), 'x');
+  g(['add', 'f.txt']);
+  g(['commit', '-q', '-m', 'root']);
+
+  const wt = path.join(base, 'overnight-checkout-xyz');
+  g(['worktree', 'add', '-q', wt, 'HEAD']);
+
+  // The bogus worktree basename must NOT become the slug — that mints a
+  // wrong identity and (sharing the main repo's fingerprints) files false
+  // rename evidence. It collapses onto the main repo's slug instead.
+  assert.equal(u.projectSlug(wt), 'my-service');
+  // A subdir inside the worktree resolves the same.
+  const wtsub = path.join(wt, 'services', 'api');
+  fs.mkdirSync(wtsub, { recursive: true });
+  assert.equal(u.projectSlug(wtsub), 'my-service');
+
+  // A committed root marker is honored from inside the worktree too.
+  fs.writeFileSync(path.join(repo, '.spor'), 'project: durable-id\n');
+  g(['add', '.spor']);
+  g(['commit', '-q', '-m', 'marker']);
+  g(['worktree', 'remove', '--force', wt]);
+  g(['worktree', 'add', '-q', wt, 'HEAD']);
+  assert.equal(u.projectSlug(wt), 'durable-id');
+
+  g(['worktree', 'remove', '--force', wt]);
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
 // ---------- repo fingerprints ----------
 
 function gitRepo() {

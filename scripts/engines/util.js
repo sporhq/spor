@@ -69,33 +69,78 @@ function stripTrailingNewlines(s) {
   return String(s).replace(/\n+$/, "");
 }
 
+// Read a `.spor` marker's project value from a directory, or null. The value
+// must already be canonical (the server's SLUG_RE); a non-matching value is
+// ignored rather than normalized, so a typo degrades to inference instead of
+// minting a new identity.
+function readMarker(dir) {
+  try {
+    const marker = fs.readFileSync(path.join(dir, ".spor"), "utf8");
+    const m = marker.match(/^project:[ \t]*([a-z0-9][a-z0-9-]*)[ \t]*$/m);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+// The directory whose basename names the project, and the floor for the
+// nearest-ancestor marker search. Plain `cwd` when not a git repo; the git
+// toplevel for a single-repo checkout; and — crucially — the MAIN worktree's
+// directory when `cwd` is inside a linked git worktree
+// (issue-cc-project-identity-monorepo-worktree). A linked worktree's
+// `--show-toplevel` is its own (markerless, bogus-basename) directory, yet it
+// shares the main repo's root-commit sha and remotes; inferring identity from
+// it both mints a wrong slug and makes the server's fingerprint flow file
+// false rename evidence (same fingerprints, different checkout dir). Resolving
+// to the main worktree — `dirname(--git-common-dir)`, which points at the main
+// repo's `.git` even from a linked worktree — collapses every worktree onto
+// the one project identity, so no bogus slug and no false rename. Fail-open:
+// any git failure falls back to `cwd`.
+function inferenceRoot(cwd) {
+  const top = (git(cwd, ["rev-parse", "--show-toplevel"]) ?? "").trim();
+  if (!top) return cwd || "";
+  const common = (git(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]) ?? "").trim();
+  // In a linked worktree git-common-dir is the main repo's `.git`, sitting
+  // one level under the main worktree; in the main checkout it is `<top>/.git`
+  // and dirname() returns `top` unchanged, so the single-repo path is intact.
+  if (common) {
+    const mainTop = path.dirname(common);
+    if (mainTop && mainTop !== top) return mainTop;
+  }
+  return top;
+}
+
 // Project slug (see CLAUDE.md): basename of the git root, normalized to
 // kebab-case. Identity for names that are already kebab-case. A committed
-// `.spor` marker file at the repo root (`project: <id>`) beats all
-// inference — it survives rename, move, fork, and history rewrite
-// (task-cc-project-identity-nodes). The marker value must already be
-// canonical (the server's SLUG_RE); a non-matching value is ignored rather
-// than normalized, so a typo degrades to inference instead of minting a
-// new identity.
+// `.spor` marker file (`project: <id>`) beats all inference — it survives
+// rename, move, fork, and history rewrite (task-cc-project-identity-nodes).
+// The marker is read by NEAREST ancestor: the search walks up from `cwd` to
+// the inference root, so a monorepo subtree can carry its own marker
+// (`services/api/.spor` -> `my-api`) that beats the repo root's, splitting one
+// repo into distinct project identities
+// (issue-cc-project-identity-monorepo-worktree). With no subtree marker the
+// search reaches the root and behavior is unchanged.
 function projectSlug(cwd, fallback = "project") {
-  let top = cwd || "";
-  try {
-    top = execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-  } catch {
-    /* not a git repo: use cwd */
+  const root = inferenceRoot(cwd);
+  // Nearest-ancestor marker: deepest (closest to cwd) `.spor` wins. Walk from
+  // cwd up to and including the inference root; stop at the filesystem root so
+  // a markerless tree is one cheap stat per level. When cwd is below the root
+  // (the normal case) the walk covers the subtree; when it isn't (or git
+  // failed), it still checks cwd and root.
+  const seen = new Set();
+  for (let dir = cwd || root || ""; dir; dir = path.dirname(dir)) {
+    if (seen.has(dir)) break;
+    seen.add(dir);
+    const hit = readMarker(dir);
+    if (hit) return hit;
+    if (dir === root || dir === path.dirname(dir)) break;
   }
-  try {
-    const marker = fs.readFileSync(path.join(top || cwd || "", ".spor"), "utf8");
-    const m = marker.match(/^project:[ \t]*([a-z0-9][a-z0-9-]*)[ \t]*$/m);
-    if (m) return m[1];
-  } catch {
-    /* no marker: infer from the basename */
+  if (root) {
+    const rootHit = readMarker(root);
+    if (rootHit) return rootHit;
   }
   const slug = path
-    .basename(top || cwd || "")
+    .basename(root || cwd || "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");

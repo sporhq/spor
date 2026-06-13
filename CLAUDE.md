@@ -153,9 +153,15 @@ A session's project is `basename $(git rev-parse --show-toplevel)` of its
 cwd (falling back to `basename cwd`), normalized to kebab-case: lowercased,
 runs of non-alphanumerics collapsed to `-`, trimmed (`My_Repo` → `my-repo`,
 `MyProject.AppHost` → `myproject-apphost`; identity for names
-already kebab-case). A committed `.spor` marker file at the repo root
-(`project: <id>`) beats inference; the value must already be canonical —
-a non-matching value is ignored, not normalized. The normalization lives
+already kebab-case). A committed `.spor` marker file (`project: <id>`) beats
+inference, read by NEAREST ancestor (walk cwd → repo root), so a monorepo
+subtree marker (`services/api/.spor`) beats the root's and splits one repo
+into distinct identities; the value must already be canonical — a
+non-matching value is ignored, not normalized. A git **worktree** infers
+from its main repo's basename (`dirname(git rev-parse --git-common-dir)`),
+not the worktree dir, so every worktree of one repo shares one identity and
+the shared fingerprints don't trip false rename detection
+(issue-cc-project-identity-monorepo-worktree). The normalization lives
 in ONE place — `projectSlug()` in `scripts/engines/util.js` — and must
 stay in sync with the server's `SLUG_RE` (`^[a-z0-9][a-z0-9-]*$`, in the
 server repo's `server/rest.js`), which rejects anything non-canonical.
