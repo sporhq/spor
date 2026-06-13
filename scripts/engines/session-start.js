@@ -240,16 +240,24 @@ ${body}`;
     );
   }
 
+  // The in-process graph backs both the open-front line and the no-brief
+  // fallback digest below — load it once. Fail open: a load failure leaves
+  // both empty (the count line still prints).
+  let g = null;
+  try {
+    g = require(path.join(u.ROOT, "lib", "graph.js")).loadGraph(nodes);
+  } catch {
+    /* fail open */
+  }
+
   // Open-front line: rank this project's queue in-process (no server, so heat
   // is 0 — the other QUEUE.md signals still order it) and surface the single
   // top item, mirroring remote mode's open-front line. Fail open: any error
   // (load/rank) leaves the line empty (issue-cc-local-mode-capture-queue-
-  // surfacing-gap). Cheap: one already-loaded-from-disk graph, limit 1.
+  // surfacing-gap). Cheap: one already-loaded graph, limit 1.
   let oline = "";
   try {
-    const graphLib = require(path.join(u.ROOT, "lib", "graph.js"));
     const { rankQueue } = require(path.join(u.ROOT, "lib", "queue.js"));
-    const g = graphLib.loadGraph(nodes);
     const r = rankQueue(g, { project: slug, limit: 1 });
     const item = (r.items || [])[0];
     if (item && item.id) {
@@ -280,6 +288,49 @@ ${body}`;
 ## Standing project briefing (brief-${briefSlug} v${version || "1"}, machine-compiled — correct it with /spor:correct, don't silently work around errors)
 
 ${body}`;
+  } else if (g) {
+    // No standing brief-<slug> node exists. Local mode has no distiller to
+    // author one on the prompt path (no LLM there — that is the SessionEnd
+    // distiller's job), so without this fallback solo users only ever saw the
+    // node count, never the project briefing the README promises
+    // (issue-cc-local-mode-briefing-creation-gap). Compile a project-scoped
+    // digest on the spot from the already-loaded graph: pure tf-idf + graph
+    // walk, no LLM, no write. The "query" is the project's own node titles
+    // (the project's topic surface), so the digest seeds on the densest,
+    // most-connected project nodes. It is clearly labelled auto-compiled and
+    // NOT a standing briefing — running /spor:brief still produces the real
+    // distilled artifact. Fail open: any error or an empty/irrelevant result
+    // just leaves the count line.
+    try {
+      const compile = require(path.join(u.ROOT, "lib", "graph.js")).compile;
+      const rp = (s) => g.projectAliases?.[s] ?? s;
+      const key = rp(slug);
+      const topics = Object.values(g.nodes)
+        .filter((n) => n.type !== "briefing" && n.type !== "schema" && rp(n.project) === key)
+        .map((n) => `${n.title ?? ""} ${n.summary ?? ""}`)
+        .join(" ")
+        .slice(0, 4000); // bounded query text; tf-idf ignores length beyond signal
+      if (topics.trim()) {
+        const r = compile(g, { query: topics, digest: true, project: slug });
+        if (r.relevant && r.text) {
+          // The digest's own header names the nodes dir and /spor:brief; keep
+          // only its node list + corrections, under our own auto-compiled
+          // heading so it reads as a stopgap, not the standing briefing.
+          const lines = r.text.split("\n");
+          const start = lines.findIndex((l) => l.startsWith("- **"));
+          const digestBody = start >= 0 ? lines.slice(start).join("\n").trim() : "";
+          if (digestBody) {
+            ctx += `
+
+## Project digest for ${slug} (auto-compiled on the fly from the local graph — no standing brief-${slug} node yet; run /spor:brief to author one)
+
+${u.byteHead(digestBody, 7000)}`;
+          }
+        }
+      }
+    } catch {
+      /* fail open */
+    }
   }
 
   return envelope(ctx);

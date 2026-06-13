@@ -66,6 +66,77 @@ test('session-start: local briefing in claude-code envelope', () => {
   assert.match(json.hookSpecificOutput.additionalContext, /projx standing briefing body/);
 });
 
+test('session-start: no brief-<slug> node falls back to an auto-compiled project digest', () => {
+  const { home, cwd } = scratch();
+  // project-tagged nodes but NO brief-projx node, and a foreign-project node
+  // so tf-idf is non-degenerate and project scoping is observable.
+  fs.writeFileSync(path.join(home, 'nodes', 'dec-ledger.md'), `---
+id: dec-ledger
+type: decision
+project: projx
+title: Use event sourcing for the ledger
+summary: The ledger service uses event sourcing with a Kafka log for audit.
+date: 2026-06-01
+---
+We chose event sourcing for the ledger to get a replayable audit trail.
+`);
+  fs.writeFileSync(path.join(home, 'nodes', 'task-replay.md'), `---
+id: task-replay
+type: task
+project: projx
+title: Build the ledger replay tool
+summary: Tooling to replay the Kafka event log and rebuild ledger projections.
+date: 2026-06-05
+edges:
+  - {type: derived-from, to: dec-ledger}
+---
+Build a CLI that replays the event-sourced ledger log.
+`);
+  fs.writeFileSync(path.join(home, 'nodes', 'dec-elsewhere.md'), `---
+id: dec-elsewhere
+type: decision
+project: otherproj
+title: Marketing site framework
+summary: Picked Svelte for the unrelated marketing site.
+date: 2026-06-01
+---
+Svelte marketing site decision, nothing to do with the ledger.
+`);
+  const out = run(
+    ['session-start', '--host', 'claude-code'],
+    JSON.stringify({ cwd, hook_event_name: 'SessionStart' }),
+    freshEnv(home)
+  );
+  const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /Project digest for projx \(auto-compiled/);
+  assert.match(ctx, /dec-ledger/);
+  assert.ok(!/Standing project briefing/.test(ctx), 'no standing briefing should be claimed');
+  assert.ok(!/dec-elsewhere/.test(ctx), 'foreign-project node must not leak into the project digest');
+});
+
+test('session-start: a brief-<slug> node still wins over the fallback digest', () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
+  fs.writeFileSync(path.join(home, 'nodes', 'dec-ledger.md'), `---
+id: dec-ledger
+type: decision
+project: projx
+title: Use event sourcing for the ledger
+summary: The ledger service uses event sourcing with a Kafka log for audit.
+date: 2026-06-01
+---
+We chose event sourcing for the ledger.
+`);
+  const out = run(
+    ['session-start', '--host', 'claude-code'],
+    JSON.stringify({ cwd, hook_event_name: 'SessionStart' }),
+    freshEnv(home)
+  );
+  const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /Standing project briefing \(brief-projx v3/);
+  assert.ok(!/Project digest for projx \(auto-compiled/.test(ctx), 'fallback must not fire when a brief exists');
+});
+
 test('envelope echoes the host event name from the payload (gemini BeforeAgent)', () => {
   const { home, cwd } = scratch();
   fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
