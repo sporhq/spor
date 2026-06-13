@@ -230,6 +230,9 @@ endpoint is the REST twin of a core call:
 | `POST /v1/gardener` | ops cron / on demand | run a gardener sweep now; findings filed as queue items → `{filed, resolved, ..., generated_at}` |
 | `GET /v1/lens/{id}/render?format=html\|text\|json` | browsers, teammates without a checkout | run a lens OR workspace node and render its view tree (html default, plain text, or the raw tree as json). Read-only — no action forms; writes stay with `/v1/nodes` and the MCP tools. Accepts `?token=<PAT>` on this route only (browser links can't carry an Authorization header; the request log records the pathname, never the query) |
 | `GET /v1/export` | bootstrap/offline | ustar tarball of `nodes/` for seeding a local read replica (`?gzip=1` compresses); see §5 for the response headers. `curl … \| tar x` reproduces `nodes/` byte-for-byte |
+| `GET /v1/admin/tokens` | offboarding / audit | list PATs → `{tokens: [{hash_prefix, person, name, email, created, expires, expired}], count}` — never plaintext, never full hashes. Admin-only (§4) |
+| `POST /v1/admin/tokens` `{person, expires?}` | onboarding | mint a PAT bound to an existing person node (`expires` is `<N>d` or an ISO date) → 201 `{token, hash_prefix, person, name, email, expires}`; the plaintext `token` is returned **once**. Admin-only |
+| `DELETE /v1/admin/tokens/{hash-prefix}` | offboarding / rotation | revoke the single PAT matching the hash prefix (≥8 hex chars; an ambiguous prefix is a 409) → `{revoked, hash_prefix}`. Admin-only |
 
 Path parameters (node ids, project slugs) must match
 `^[a-z0-9][a-z0-9-]*$`. Request bodies are capped at 1MB
@@ -259,7 +262,20 @@ anything with a token.
   email change re-points the token instead of severing it. Send
   `Authorization: Bearer <token>` on every request. Tokens grant full
   read/write — the trust model is "everyone on the team can read and write
-  the team graph", same as a shared repo. Transport is HTTPS only.
+  the team graph", same as a shared repo. Transport is HTTPS only. A token
+  may carry an expiry (`spor-mint-token --expires <N>d|<date>`, or the REST
+  `expires` field); once past it the token is rejected like a revoked one.
+- **Token lifecycle admin.** Mint, list, and revoke run over REST
+  (`/v1/admin/tokens`, §3) so onboarding/offboarding needs no server-box
+  shell — but every one of those operations is **admin-only**. A caller is an
+  admin iff their person node carries a `stewards` edge to the graph root
+  (`$SPOR_ROOT_ID`, default `org-root`); without it the admin routes return
+  `403 forbidden`. This is the one privileged distinction in the otherwise
+  flat trust model, and the seam the future fine-grained model generalizes.
+  The first admin is bootstrapped on the server box with `spor-mint-token
+  --admin --person <id>` (it writes that `stewards` edge, creating the person
+  node from `--name`/`--email` if needed). Hand-editing the token file stays
+  as the break-glass path.
 - **OAuth 2.1 for MCP connectors** (Cowork/claude.ai, which cannot carry a
   static bearer token): protected-resource metadata discovery (RFC 9728,
   advertised on the `/mcp` 401 via `WWW-Authenticate`), authorization-server
@@ -282,8 +298,8 @@ Non-2xx responses carry the envelope:
 { "error": { "code": "...", "message": "...", "details": [...] } }
 ```
 
-Codes and their HTTP statuses: `unauthorized` 401, `not_found` 404,
-`conflict` 409, `transition_denied` 409, `lease_expired` 409,
+Codes and their HTTP statuses: `unauthorized` 401, `forbidden` 403,
+`not_found` 404, `conflict` 409, `transition_denied` 409, `lease_expired` 409,
 `outcome_conflict` 409, `not_ready` 409, `invalid_node` 422, `rate_limited`
 429, `too_large` 413, `ingestion_unavailable` 503, `unimplemented` 501,
 `internal` 500. Hooks never parse error bodies — any non-200 means "behave

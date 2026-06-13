@@ -56,7 +56,7 @@ async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0) 
         fs.unlinkSync(file);
       } catch {}
       rlog(`drained ${name} (http=${http})`);
-    } else if (http === "401" || http === "400" || http === "413" || http === "422") {
+    } else if (http === "401" || http === "403" || http === "400" || http === "413" || http === "422") {
       // Permanent client error: dead-letter it so it can't starve the drain.
       // A 401 means the token is revoked/invalid (dec-cc-fail-open-hooks: 4xx
       // is dead-lettered) — re-POSTing it on every session start and distill
