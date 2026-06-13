@@ -468,7 +468,38 @@ date: 2026-06-10
   const good = tmpGraph({ ...BASE_NODES, "schema-task.md": TASK_OVERRIDE_MD });
   const vGood = graph.validateGraph(good.nodesDir);
   assert.deepEqual(vGood.errors, []);
-  assert.ok(!vGood.warnings.some((w) => /schema-task/.test(w)), "schema type is known, no warning");
+  assert.ok(!vGood.warnings.some((w) => /unknown type/.test(w)), "schema type is known, no unknown-type warning");
+  // The override is at 2026.06.10.2 but the seed task schema is newer, so the
+  // stale-shadow warning fires (issue-cc-schema-override-seed-shadow).
+  assert.ok(
+    vGood.warnings.some((w) => /schema 'schema-task'.*shadows a newer seed schema/.test(w)),
+    "stale resident override is flagged"
+  );
+});
+
+test("staleOverrides: a resident override below the seed version is flagged; at/above is silent", () => {
+  // Seed task schema version (the bar a resident override must keep up with).
+  const seedTask = graph.seedRegistry().nodeSchemas.get("task").version;
+  const overrideAt = (ver) =>
+    graph.parseFrontmatter(
+      `---\nid: schema-task\ntype: schema\nkind: node-schema\nschema_version: ${ver}\n` +
+        `title: Task override\nsummary: Org task override.\ndate: 2026-06-10\n---\n\nBody.\n\n` +
+        '```json\n{ "node_type": "task", "prefix": ["task-"], "queueable": true }\n```\n',
+      "schema-task.md"
+    );
+
+  // Strictly older than the seed -> shadow warning (graph still wins).
+  const stale = graph.buildRegistry([overrideAt("2026.01.01.1")]);
+  assert.deepEqual(stale.errors, []);
+  assert.equal(stale.registry.nodeSchemas.get("task").source, "graph");
+  assert.ok(
+    stale.registry.staleOverrides().some((w) => /'schema-task'.*shadows a newer seed schema/.test(w)),
+    "older resident override warns"
+  );
+
+  // At the seed version -> no shadow (override is current).
+  const current = graph.buildRegistry([overrideAt(seedTask)]);
+  assert.deepEqual(current.registry.staleOverrides(), [], "current override is silent");
 });
 
 test("validateNode: schema node structural + payload rules", () => {

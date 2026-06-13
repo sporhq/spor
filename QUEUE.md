@@ -142,6 +142,16 @@ is the default and graph-resident schema nodes override/extend it. The
 `schema` node type itself is recognized natively by the core — no
 schema-for-schemas regress.
 
+Resolution is **graph beats seed wholesale, regardless of version**: a
+resident override replaces the seed entry for that type entirely, so a seed
+behavior change (a new `transitions()` gate, a default, a prefix) does *not*
+reach a graph that carries a stale override of the same type until the
+override is bumped in lockstep (issue-cc-schema-override-seed-shadow). To
+keep that shadow from going silent, `validateGraph` emits a warning when a
+graph-resident schema's `schema_version` is **older** than the seed schema
+it overrides — bump the resident in lockstep, or retire it to let the seed
+become the single source again.
+
 `aliases` (same-direction synonyms) and `inverse_label` (the edge's name
 read from the target's side) feed the **write-path normalization table**
 (API.md §1): aliases are renamed in place — the historic Haiku-variant
