@@ -2,7 +2,7 @@
 id: schema-issue
 type: schema
 kind: node-schema
-schema_version: 2026.06.12.1
+schema_version: 2026.06.13.1
 title: Seed schema for issue nodes
 summary: Node schema for the issue type — a defect/finding and its resolution lineage; queueable, so open issues join the decision queue. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -18,6 +18,13 @@ work from the decision queue (issue-cc-issues-not-queueable). Backward-
 readable: the flag changes registry behavior, not node shape, so no upgrade
 chain.
 
+`transitions()` (2026.06.13.1): status is constrained to the issue vocabulary
+(`open`/`active`/`resolved`, or none = live) so the queue-terminal value
+(`resolved`) is not shadowed by synonyms — the same class of drift that left
+captures ranking live under a non-terminal `dismissed`
+(dec-cc-status-enforcement-via-transitions). Write-time gate, backward-readable,
+no upgrade chain.
+
 ```json
 {
   "node_type": "issue",
@@ -26,5 +33,24 @@ chain.
     "issue-"
   ],
   "queueable": true
+}
+```
+
+```js
+// transitions(current, proposed, view) — issue status vocabulary gate
+// (dec-cc-status-enforcement-via-transitions). Runs on every UPDATE in the
+// §2.4 sandbox, JSON boundary, pure. Empty status (status-less = live) and the
+// create path are always allowed; the denial reason names the valid set so a
+// writing agent can correct and retry.
+export function transitions(current, proposed, view) {
+  const VALID = ["open", "active", "resolved"];
+  const next = ((proposed && proposed.status) || "").toLowerCase();
+  if (next === "" || VALID.indexOf(next) !== -1) return { allow: true };
+  return {
+    allow: false,
+    reason: "invalid issue status '" + next + "': valid statuses are open " +
+      "(unaddressed), active (being worked), resolved (fixed) — or none, " +
+      "meaning live. (dec-cc-status-enforcement-via-transitions)",
+  };
 }
 ```

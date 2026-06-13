@@ -56,8 +56,13 @@ parked by a `wake:` date — never silently dropped). Then:
    locally edit the file). If the reason deserves recording, note it in the
    body via `put_node`.
 3. **`capture-pending` item** → read it (`GET /v1/nodes/<id>`), decide what
-   it should have been, write the proper node(s), then mark the pending node
-   resolved with `set_status`.
+   it should have been, write the proper node(s), then close the pending node
+   with `set_status`: `merged` when its content now lives in the node(s) you
+   wrote, or `rejected` when there was no durable fact. Those are the only two
+   terminal statuses the schema's `transitions()` gate accepts — `dismissed`/
+   `resolved`/`closed` are rejected at write time because they are not terminal
+   to the queue and leave the capture ranking live
+   (dec-cc-status-enforcement-via-transitions).
 4. **Item with nothing actionable until a date** (waiting on a measurement
    window, a renewal, an external milestone) → set `wake: YYYY-MM-DD` on the
    node (`put_node`; locally edit the file). The queue parks it as `dormant`

@@ -14,6 +14,7 @@ const path = require("path");
 
 const graph = require(path.join(__dirname, "..", "lib", "graph.js"));
 const registry = require(path.join(__dirname, "..", "lib", "registry.js"));
+const { sandboxFor } = require(path.join(__dirname, "..", "lib", "sandbox.js"));
 
 function tmpGraph(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "substrate-test-"));
@@ -496,4 +497,62 @@ test("no-schema graph behaves exactly as the seed pack (registry default)", () =
   assert.equal(g.registry.edgeWeight("relates-to"), 0.5);
   assert.equal(g.registry.isAlwaysOn("norm"), true);
   assert.equal(g.registry.isTraversable("briefing"), false);
+});
+
+// dec-cc-status-enforcement-via-transitions: the seed capture-pending schema
+// ships a transitions() gate restricting triage to merged/rejected. dismissed
+// (issue-cc-dismissed-status-not-terminal) and the other historical drift
+// values are denied at write time, with an actionable reason for retry.
+test("seed pack: capture-pending transitions() gates triage to merged/rejected", () => {
+  const schema = graph.seedRegistry().nodeSchemas.get("capture-pending");
+  const sb = sandboxFor(schema);
+  assert.deepEqual(sb.names, ["transitions"]);
+  const SLACK = { timeoutMs: 5000 };
+  const gate = (status) =>
+    sb.call("transitions", [{ id: "cap-x", status: "" }, { id: "cap-x", status }, {}], SLACK);
+
+  // allowed: the two terminal verdicts, an empty status (create / re-open),
+  // and case-insensitively.
+  for (const ok of ["merged", "rejected", "", "MERGED", "Rejected"]) {
+    assert.equal(gate(ok).allow, true, `status '${ok}' should be allowed`);
+  }
+  // denied: the historical drift, each with a reason naming the valid set.
+  for (const bad of ["dismissed", "resolved", "closed", "done"]) {
+    const r = gate(bad);
+    assert.equal(r.allow, false, `status '${bad}' should be denied`);
+    assert.match(r.reason, /merged.*rejected|rejected.*merged/s);
+    assert.match(r.reason, new RegExp(bad));
+  }
+
+  // the create path (no current node) is always allowed.
+  assert.equal(sb.call("transitions", [undefined, { id: "cap-x" }, {}], SLACK).allow, true);
+});
+
+// dec-cc-status-enforcement-via-transitions: the core queueable/lifecycle
+// types carry status-vocabulary gates. Each allows its valid set plus an empty
+// status (status-less = live), denies anything else with a reason, and never
+// blocks the create path.
+test("seed pack: core type schemas gate status to their vocabulary", () => {
+  const reg = graph.seedRegistry();
+  const SLACK = { timeoutMs: 5000 };
+  const cases = {
+    task: { ok: ["open", "active", "done", "abandoned", ""], bad: ["dismissed", "resolved", "merged", "wip"] },
+    issue: { ok: ["open", "active", "resolved", ""], bad: ["dismissed", "done", "closed"] },
+    decision: { ok: ["active", "superseded", "rejected", ""], bad: ["dismissed", "done", "resolved"] },
+    question: { ok: ["open", "answered", ""], bad: ["dismissed", "resolved", "closed"] },
+  };
+  for (const [type, { ok, bad }] of Object.entries(cases)) {
+    const sb = sandboxFor(reg.nodeSchemas.get(type));
+    assert.deepEqual(sb.names, ["transitions"], `${type} exports transitions()`);
+    const gate = (status) =>
+      sb.call("transitions", [{ id: `${type}-x`, status: "" }, { id: `${type}-x`, status }, {}], SLACK);
+    for (const s of ok) assert.equal(gate(s).allow, true, `${type}: '${s}' should be allowed`);
+    for (const s of bad) {
+      const r = gate(s);
+      assert.equal(r.allow, false, `${type}: '${s}' should be denied`);
+      assert.match(r.reason, new RegExp(s), `${type}: reason should name the rejected value`);
+    }
+    // create path always allowed.
+    assert.equal(sb.call("transitions", [undefined, { id: `${type}-x` }, {}], SLACK).allow, true);
+  }
 });

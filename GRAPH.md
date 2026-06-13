@@ -84,15 +84,16 @@ Rules:
 
 | type       | prefix    | what it is                                                |
 |------------|-----------|-----------------------------------------------------------|
-| decision   | `dec-`    | a choice that was made, with the why                      |
-| task       | `task-`   | active or planned work                                    |
-| issue      | `issue-`  | a defect/finding and its resolution lineage (queueable: open issues join the decision queue) |
+| decision   | `dec-`    | a choice that was made, with the why (status `active`/`superseded`/`rejected`, gated) |
+| task       | `task-`   | active or planned work (status `open`/`active`/`done`/`abandoned`, gated) |
+| issue      | `issue-`  | a defect/finding and its resolution lineage (queueable: open issues join the decision queue; status `open`/`active`/`resolved`, gated) |
 | incident   | `inc-`    | something that went wrong in operation (queueable: live incidents join the decision queue) |
 | artifact   | `spec-`, `art-` | a document, spec, module, or build product worth referencing |
 | norm       | `norm-`   | a standing convention or constraint (rides along in every compile) |
 | briefing   | `brief-`  | a compiled briefing (output of this system; never traversed) |
 | correction | `corr-`   | standing fix to a briefing: pin/exclude/guidance (never traversed) |
-| capture-pending | `cap-` | raw captured text that fit no schema; filed by the server for later triage (QUEUE.md §2.3) |
+| question   | `question-` | a routed ask the graph could not answer (queueable; status `open`/`answered`, gated) |
+| capture-pending | `cap-` | raw captured text that fit no schema; filed by the server for later triage (QUEUE.md §2.3); born status-less, closed only as `merged` (content now in proper node(s)) or `rejected` (no durable fact) — a `transitions()` gate rejects other statuses at write time |
 | finding    | `find-`   | a gardener observation about another node, filed as a queue item (QUEUE.md §6) |
 | project    | `proj-`   | durable project identity: slug aliases + repo fingerprints; heals renames at read time (below) |
 
