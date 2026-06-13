@@ -237,7 +237,9 @@ ${body}`;
   for (const f of files) {
     try {
       const lines = fs.readFileSync(path.join(nodes, f), "utf8").split("\n");
-      stamps.push(lines.filter((l) => l.startsWith("project: ")).map((l) => l.slice(9)));
+      // The provenance stamp key is `repo:` (task-cc-repo-stamp-field-rename);
+      // legacy `project:` stamps are still counted.
+      stamps.push(lines.filter((l) => l.startsWith("repo: ") || l.startsWith("project: ")).map((l) => l.replace(/^(?:repo|project): /, "")));
       if (lines.includes("type: repo")) {
         const id = lines.find((l) => l.startsWith("id: "))?.slice(4).trim() ?? "";
         const m = lines.find((l) => l.startsWith("slugs:"))?.match(/\[([^\]]*)\]/);
@@ -295,7 +297,7 @@ ${body}`;
     /* fail open */
   }
 
-  let ctx = `A Spor knowledge graph is active: ${count} nodes in ${nodes} (${projCount} tagged project: ${slug}). ${USAGE_LOCAL}${oline}`;
+  let ctx = `A Spor knowledge graph is active: ${count} nodes in ${nodes} (${projCount} tagged repo: ${slug}). ${USAGE_LOCAL}${oline}`;
 
   // brief-<slug> lookup resolves the same aliases: exact slug first, then
   // the owning project node's other slugs newest-first (last entry is the

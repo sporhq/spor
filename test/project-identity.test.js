@@ -191,6 +191,27 @@ test('projectSlug: a .spor marker beats basename inference; invalid values fall 
   assert.equal(u.projectSlug(cwd), path.basename(cwd).toLowerCase().replace(/[^a-z0-9]+/g, '-'));
 });
 
+// ---------- stamp field: repo: with legacy project: (task-cc-repo-stamp-field-rename) ----------
+
+test('parseFrontmatter: repo: stamp populates n.project; legacy project: still read; repo: wins', () => {
+  const mk = (fm) => graph.parseFrontmatter(`---\nid: x\ntype: task\n${fm}\n---\nbody`, 'x.md');
+  assert.equal(mk('repo: spor').project, 'spor');         // new stamp
+  assert.equal(mk('project: spor').project, 'spor');      // legacy stamp
+  assert.equal(mk('repo: spor\nproject: old').project, 'spor'); // repo: wins on both
+});
+
+test('rankQueue: a repo:-stamped node resolves through the same aliases as project:', () => {
+  const repoTask = ['task-repo-stamped.md', `---\nid: task-repo-stamped\ntype: task\nrepo: old-name\ntitle: T\nsummary: A repo-stamped task.\nstatus: open\ndate: 2026-06-01\n---\nbody`];
+  const g = tmpGraph(Object.fromEntries([
+    ['repo-x.md', PROJ],
+    repoTask,
+    task('task-proj-stamped', 'new-name'),
+  ])).load();
+  // filtering by any alias of repo-x surfaces both the repo:- and project:-stamped tasks
+  const ids = rankQueue(g, { now: NOW, project: 'repo-x' }).items.map((i) => i.id).sort();
+  assert.deepEqual(ids, ['task-proj-stamped', 'task-repo-stamped']);
+});
+
 // ---------- two-layer marker: repo: identity + project: grouping ----------
 // (dec-cc-repo-project-two-layer-identity, dec-cc-active-project-declared-default)
 
@@ -390,7 +411,7 @@ test('session-start local: brief lookup and project count resolve through slug a
   assert.match(ctx, /brief-old-name v7/);
   assert.match(ctx, /old-name standing briefing body/);
   // task-old (project: old-name) + brief-old-name count under the new slug
-  assert.match(ctx, /\(2 tagged project: new-name\)/);
+  assert.match(ctx, /\(2 tagged repo: new-name\)/);
 });
 
 test('session-start local: no project node -> exact-slug behavior unchanged', () => {
@@ -406,7 +427,7 @@ test('session-start local: no project node -> exact-slug behavior unchanged', ()
     freshEnv(home)
   );
   const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
-  assert.match(ctx, /\(0 tagged project: new-name\)/);
+  assert.match(ctx, /\(0 tagged repo: new-name\)/);
   assert.ok(!ctx.includes('Standing project briefing'), 'alias brief must not leak without a project node');
 });
 

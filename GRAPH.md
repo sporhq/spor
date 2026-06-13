@@ -132,9 +132,11 @@ work, so the former `type: project` identity node was renamed to `type: repo`
 `proj-` prefix now names the net-new grouping.
 
 A session's repo slug is derived (repo basename, kebab-cased — see the plugin's
-CLAUDE.md), so a rename would orphan every historical `project:` stamp (the
-stamp keeps its field name and now reads as a *repo* slug). A `type: repo` node
-makes the identity data instead (task-cc-project-identity-nodes):
+CLAUDE.md), so a rename would orphan every historical provenance stamp. New
+nodes stamp the slug as `repo:`; pre-rename nodes stamped it `project:`, and
+both are read as the repo slug (`repo:` wins if a node carries both,
+task-cc-repo-stamp-field-rename). A `type: repo` node makes the identity data
+instead (task-cc-project-identity-nodes):
 
 ```markdown
 ---
