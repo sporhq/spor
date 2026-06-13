@@ -110,6 +110,15 @@ their original order), so the briefing degrades by relevance rather than by the
 downstream 7KB session-start body truncation. A project-blind compile keeps
 every norm, exactly as before.
 
+Because a norm rides along with no relevance gate and the team trust model lets
+every writer author one, the briefing renderer treats norm bodies as an
+**injection surface** (issue-cc-norm-always-on-injection): each is quoted as
+untrusted, teammate-authored reference *data* with explicit author attribution
+(unattributed norms are flagged as such), under a one-time banner stating the
+data-vs-instructions boundary. Imperative wording inside a norm describes team
+policy to weigh — it is never a command addressed to the assistant, so a
+planted "ignore prior instructions" can't hijack a session.
+
 ## Project identity nodes
 
 A session's project slug is derived (repo basename, kebab-cased — see the
