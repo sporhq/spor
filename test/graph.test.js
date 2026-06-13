@@ -297,6 +297,66 @@ Zephyr quartz nimbus widget gadget gizmo.
     "the queried seed's direct 1-hop child must appear despite score-decay pruning");
 });
 
+// ---------- project scoping (issue-cc-digest-unscoped-cross-project-ranking) ----------
+
+function crossProjectFixture() {
+  // Filler nodes give the shared "auth deploy migration" vocabulary a non-zero
+  // idf (otherwise terms in every doc weigh nothing). dec-theirs repeats the
+  // query terms once more than dec-mine, so its RAW similarity is marginally
+  // higher — the session-project boost is what flips them.
+  const filler = (id) => [`${id}.md`, `---
+id: ${id}
+type: artifact
+project: filler
+title: Unrelated ${id} widget
+summary: Unrelated ${id} widget gadget gizmo zephyr quartz nimbus.
+date: 2026-06-01
+---
+Unrelated ${id} widget gadget gizmo.
+`];
+  return tmpGraph({
+    "dec-mine.md": `---
+id: dec-mine
+type: decision
+project: mine
+title: Auth deploy migration plan
+summary: Auth deploy migration rollout for the mine team.
+date: 2026-06-01
+---
+Auth deploy migration rollout notes.
+`,
+    "dec-theirs.md": `---
+id: dec-theirs
+type: decision
+project: theirs
+title: Auth deploy migration plan migration deploy
+summary: Auth deploy migration rollout migration deploy for the theirs team.
+date: 2026-06-01
+---
+Auth deploy migration rollout migration deploy notes.
+`,
+    ...Object.fromEntries([filler("art-f1"), filler("art-f2"), filler("art-f3"), filler("art-f4")]),
+  });
+}
+
+test("scoping: same-project content boost outranks a marginally-higher foreign hit", () => {
+  const g = crossProjectFixture().load();
+  // dec-theirs has slightly higher raw similarity (extra shared tokens), but
+  // the session's own project is boosted, so dec-mine leads when project=mine.
+  const scoped = graph.compile(g, { query: "auth deploy migration plan", digest: true, project: "mine" });
+  const blind = graph.compile(g, { query: "auth deploy migration plan", digest: true });
+  const firstId = (txt) => txt.match(/- \*\*([\w-]+)/)[1];
+  assert.equal(firstId(blind.text), "dec-theirs", "project-blind ranking favors the higher raw similarity");
+  assert.equal(firstId(scoped.text), "dec-mine", "session-project boost surfaces the team's own node first");
+});
+
+test("scoping: a cross-project content hit is labeled foreign, not hard-filtered", () => {
+  const g = crossProjectFixture().load();
+  const r = graph.compile(g, { query: "auth deploy migration plan", digest: true, project: "mine" });
+  assert.ok(r.text.includes("dec-theirs"), "the foreign node still surfaces (not hard-filtered)");
+  assert.match(r.text, /dec-theirs.*cross-project/s);
+});
+
 // ---------- supersession fixup + warning ----------
 
 test("supersession: superseded node carries the inline ⚠ SUPERSEDED warning in full compile", () => {

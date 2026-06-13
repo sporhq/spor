@@ -172,6 +172,16 @@ High-weight edges decay slowly across hops; they are what makes structural
 traversal beat similarity search. Prefer one precise high-weight edge over
 three `relates-to`.
 
+When the session's project is known (the compile's `project` option, plumbed
+from the cwd slug), tf-idf relevance **boosts same-project nodes** so the
+session's own context wins ties and edges out marginally-higher foreign hits;
+a strongly-relevant cross-project node still surfaces but is labeled
+`— cross-project` so it reads as another team's prior art rather than
+session-local guidance (issue-cc-digest-unscoped-cross-project-ranking). This
+is a single-org-graph relevance-topology fix — shared vocabulary ("auth",
+"deploy", "migration") otherwise dilutes the gate across teams. A project-blind
+compile (no `project`) ranks every node equally, exactly as before.
+
 A seed (the compile root, or each query-mode content match) always contributes
 its **direct 1-hop lineage** to the structural arm, even when score-decay would
 push a low-weight edge under the traversal threshold
