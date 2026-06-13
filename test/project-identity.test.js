@@ -191,6 +191,41 @@ test('projectSlug: a .spor marker beats basename inference; invalid values fall 
   assert.equal(u.projectSlug(cwd), path.basename(cwd).toLowerCase().replace(/[^a-z0-9]+/g, '-'));
 });
 
+// ---------- project-grouping union reads (task-cc-project-grouping-union-reads) ----------
+
+const repoNode = (id, slug, grouping) => [`${id}.md`,
+  `---\nid: ${id}\ntype: repo\ntitle: ${id}\nsummary: Repo ${slug}.\nslugs: [${slug}]\ndate: 2026-06-01\nedges:\n  - {type: grouped-under, to: ${grouping}}\n---\nbody`];
+const groupingNode = (id) => [`${id}.md`,
+  `---\nid: ${id}\ntype: project\ntitle: ${id}\nsummary: Grouping ${id}.\ndate: 2026-06-01\n---\nbody`];
+
+test('buildGraph: grouped-under edges index a grouping to its member repos', () => {
+  const g = tmpGraph(Object.fromEntries([
+    groupingNode('proj-g'),
+    repoNode('repo-a', 'a', 'proj-g'),
+    repoNode('repo-b', 'b', 'proj-g'),
+    repoNode('repo-solo', 'solo', 'proj-other'),
+  ])).load();
+  assert.deepEqual([...g.groupingRepos['proj-g']].sort(), ['repo-a', 'repo-b']);
+  assert.deepEqual([...g.groupingRepos['proj-other']], ['repo-solo']);
+});
+
+test('rankQueue: a grouping id unions its member repos; a repo slug stays single', () => {
+  const g = tmpGraph(Object.fromEntries([
+    groupingNode('proj-g'),
+    repoNode('repo-a', 'a', 'proj-g'),
+    repoNode('repo-b', 'b', 'proj-g'),
+    task('task-a', 'a'),       // stamped a -> repo-a
+    task('task-b', 'b'),       // stamped b -> repo-b
+    task('task-out', 'elsewhere'),
+  ])).load();
+  // grouping scope unions both member repos
+  const grouped = rankQueue(g, { now: NOW, project: 'proj-g' }).items.map((i) => i.id).sort();
+  assert.deepEqual(grouped, ['task-a', 'task-b']);
+  // a single repo slug stays scoped to that one repo
+  const single = rankQueue(g, { now: NOW, project: 'a' }).items.map((i) => i.id);
+  assert.deepEqual(single, ['task-a']);
+});
+
 // ---------- stamp field: repo: with legacy project: (task-cc-repo-stamp-field-rename) ----------
 
 test('parseFrontmatter: repo: stamp populates n.project; legacy project: still read; repo: wins', () => {
