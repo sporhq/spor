@@ -163,8 +163,23 @@ ${u.byteHead(body, 7000)}`;
       );
     }
 
-    // Server unreachable / non-200 / empty: fail open onto the cache.
-    rlog(`server unreachable (http=${brief.http}); falling back to cache`);
+    // Non-200: fail open onto the cache. Distinguish AUTH failure from
+    // TRANSPORT failure (issue-cc-auth-transport-conflation-silent-loss): a
+    // 401/403 is not an outage — the token is revoked, expired, or mis-pasted,
+    // and re-POSTing it never recovers (the distiller's outbox dead-letters it,
+    // drain-outbox.js). Surfacing it as the same generic "OFFLINE" banner hides
+    // the one fact the user can act on, and silently strands every captured
+    // node. So name the cause and the fix loudly instead of blaming the host.
+    // Fail-open is preserved: we still inject the cache (or nothing) and exit 0.
+    const isAuth = brief.http === "401" || brief.http === "403";
+    if (isAuth) {
+      rlog(`auth failure (http=${brief.http}); token invalid/revoked — surfacing, falling back to cache`);
+    } else {
+      rlog(`server unreachable (http=${brief.http}); falling back to cache`);
+    }
+    const statusLine = isAuth
+      ? `team graph: AUTH FAILED (${host} rejected the token, http ${brief.http}) — your spor token is invalid, revoked, or expired. Re-mint it and update SPOR_TOKEN; until then captures are NOT shipping (they spool to the outbox and dead-letter).`
+      : `team graph: OFFLINE (could not reach ${host}).`;
     if (fs.existsSync(cache)) {
       let raw = "";
       try {
@@ -180,12 +195,18 @@ ${u.byteHead(body, 7000)}`;
           7000
         )
       );
-      const ctx = `team graph: OFFLINE (could not reach ${host}). Showing cached briefing fetched ${fetched || "unknown"} — it may be stale.
+      const ctx = `${statusLine} Showing cached briefing fetched ${fetched || "unknown"} — it may be stale.
 
 ## Standing project briefing (brief-${slug}, cached from the team graph)
 
 ${body}`;
       return envelope(ctx);
+    }
+    // No cache: still surface an auth failure (it is actionable and not an
+    // outage); a pure transport failure with no cache injects nothing, as before.
+    if (isAuth) {
+      rlog("no cache available; surfacing auth failure only");
+      return envelope(statusLine);
     }
     rlog("no cache available; injecting nothing");
     return null;
@@ -241,11 +262,15 @@ ${body}`;
   }
 
   // The in-process graph backs both the open-front line and the no-brief
-  // fallback digest below — load it once. Fail open: a load failure leaves
-  // both empty (the count line still prints).
+  // fallback digest below — load it once, through the cached loader so a
+  // re-load within this process is free and the scan latency gets a journal
+  // stamp (issue-cc-local-mode-hook-load-latency). Fail open: a load failure
+  // leaves both empty (the count line still prints).
   let g = null;
   try {
-    g = require(path.join(u.ROOT, "lib", "graph.js")).loadGraph(nodes);
+    const { graph: loaded, loadMs, cached } = u.loadGraphCached(nodes);
+    g = loaded;
+    u.journalLoadMs(graph, input.session_id, "session-start", loadMs, { nodes: count, cached });
   } catch {
     /* fail open */
   }

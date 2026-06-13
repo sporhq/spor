@@ -181,6 +181,33 @@ async function main() {
   process.stdout.write(JSON.stringify(out) + "\n");
 }
 
-main()
-  .catch(() => {})
-  .finally(() => process.exit(0));
+// Degradation telemetry (issue-cc-fail-open-degradation-telemetry-gap,
+// task-cc-client-hook-operability-diagnostics piece 1): the fail-open contract
+// (dec-cc-fail-open-hooks) says a crashing engine and a quiet success look
+// identical from the outside — a symptom-free hook is also what a black hole
+// looks like. Before honoring that contract (exit 0, no output), append ONE
+// best-effort line to journal/remote.log so an operator can tell a crash apart
+// from healthy silence after the fact. Wrapped so a logging failure can never
+// itself break the exit-0 guarantee.
+function logCrash(err) {
+  try {
+    const event = process.argv[2] || "?";
+    const graph = u.graphHome();
+    u.ensureDir(path.join(graph, "journal"));
+    const log = u.makeLogger(path.join(graph, "journal", "remote.log"), `dispatcher ${event}: `);
+    const msg = (err && (err.stack || err.message)) || String(err);
+    log(`crashed (fail-open, exit 0): ${String(msg).split("\n")[0]}`);
+  } catch {
+    /* logging must never break fail-open */
+  }
+}
+
+// Run only when invoked as the entry point; `require()` (the crash-handler
+// test) just gets logCrash without spawning the dispatcher.
+if (require.main === module) {
+  main()
+    .catch((err) => logCrash(err))
+    .finally(() => process.exit(0));
+}
+
+module.exports = { logCrash };
