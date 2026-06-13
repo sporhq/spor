@@ -15,6 +15,12 @@ const USAGE =
 const USAGE_REMOTE =
   USAGE +
   " When you defer discovered work mid-task (out-of-scope fix, follow-up, dismissed approach), capture it the moment you defer it: /spor:defer <2-3 sentences, what + why> — one call, the server types and links it.";
+// Local mode has no server ingester; /spor:defer writes the node itself.
+// Same standing capture prompt so solo users get the capture-and-resurface
+// flywheel (issue-cc-local-mode-capture-queue-surfacing-gap).
+const USAGE_LOCAL =
+  USAGE +
+  " When you defer discovered work mid-task (out-of-scope fix, follow-up, dismissed approach), capture it the moment you defer it: /spor:defer <2-3 sentences, what + why>. Show what to work on next with /spor:next.";
 
 function envelope(ctx) {
   return { hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: ctx } };
@@ -215,7 +221,29 @@ ${body}`;
   const owner = projects.find((p) => p.id === slug || p.slugs.includes(slug));
   const aliases = new Set([slug, ...(owner?.slugs ?? [])]);
   const projCount = stamps.filter((vals) => vals.some((v) => aliases.has(v))).length;
-  let ctx = `A Spor knowledge graph is active: ${count} nodes in ${nodes} (${projCount} tagged project: ${slug}). ${USAGE}`;
+
+  // Open-front line: rank this project's queue in-process (no server, so heat
+  // is 0 — the other QUEUE.md signals still order it) and surface the single
+  // top item, mirroring remote mode's open-front line. Fail open: any error
+  // (load/rank) leaves the line empty (issue-cc-local-mode-capture-queue-
+  // surfacing-gap). Cheap: one already-loaded-from-disk graph, limit 1.
+  let oline = "";
+  try {
+    const graphLib = require(path.join(u.ROOT, "lib", "graph.js"));
+    const { rankQueue } = require(path.join(u.ROOT, "lib", "queue.js"));
+    const g = graphLib.loadGraph(nodes);
+    const r = rankQueue(g, { project: slug, limit: 1 });
+    const item = (r.items || [])[0];
+    if (item && item.id) {
+      oline = `\nopen front: ${item.id} — ${item.title || ""}${item.why ? ` (${item.why})` : ""}`;
+      if (item.suggest === "close") oline += " — the queue suggests CLOSING it, not doing it";
+      oline += ". Full queue: /spor:next.";
+    }
+  } catch {
+    /* fail open */
+  }
+
+  let ctx = `A Spor knowledge graph is active: ${count} nodes in ${nodes} (${projCount} tagged project: ${slug}). ${USAGE_LOCAL}${oline}`;
 
   // brief-<slug> lookup resolves the same aliases: exact slug first, then
   // the owning project node's other slugs newest-first (last entry is the
