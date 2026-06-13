@@ -17,7 +17,7 @@
         "age_days": 2
       },
       "suggest": "do",
-      "why": "priority p1 (human-set); 2d old"
+      "why": "priority p1 (source unrecorded); 2d old"
     },
     {
       "id": "task-n008",
@@ -36,7 +36,7 @@
         "age_days": 2
       },
       "suggest": "do",
-      "why": "priority p1 (human-set); 2d old"
+      "why": "priority p1 (source unrecorded); 2d old"
     },
     {
       "id": "task-n001",

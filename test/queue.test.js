@@ -185,6 +185,34 @@ test("rankQueue: heat is log-compressed in the blend — raw counts can't drown 
   assert.equal(r.items[1].signals.heat, 50, "signals carry the raw count");
 });
 
+test("rankQueue: priority why-line attributes the source honestly (issue-cc-priority-attribution-gap)", () => {
+  // The why-line used to hardcode "(human-set)" for any priority value, but
+  // `priority:` is writable by any token-holder. An unattributed priority must
+  // not claim to be human; an attributed one shows who set it via which door.
+  const stamped = `---
+id: task-stamped
+type: task
+project: my-project
+title: Title of task-stamped
+summary: Standalone summary for task-stamped used by queue tests.
+status: open
+priority: p1
+priority_by: Dana Ops <dana@example.com> via mcp
+date: 2026-06-01
+---
+Body.
+`;
+  const g = tmpGraph({
+    "task-stamped.md": stamped,
+    ...Object.fromEntries([node("task-bare", "task", { status: "open", priority: "p2" })]),
+  }).load();
+  const r = rankQueue(g, { now: NOW });
+  const byId = Object.fromEntries(r.items.map((i) => [i.id, i]));
+  assert.match(byId["task-stamped"].why, /priority p1 \(set by Dana Ops <dana@example\.com> via mcp\)/);
+  assert.match(byId["task-bare"].why, /priority p2 \(source unrecorded\)/);
+  assert.doesNotMatch(byId["task-bare"].why, /human-set/);
+});
+
 test("rankQueue: heat still orders items — hotter beats colder, no ties introduced", () => {
   const g = tmpGraph(Object.fromEntries([
     node("task-warm", "task", { status: "open" }),
@@ -227,7 +255,7 @@ test("rankQueue: human priority bumps the blend and shows in the why", () => {
   ])).load();
   const r = rankQueue(g, { now: NOW });
   assert.equal(r.items[0].id, "task-p1", "p1 bump (6) beats one blocking edge (3)");
-  assert.match(r.items[0].why, /priority p1 \(human-set\)/);
+  assert.match(r.items[0].why, /priority p1 \(source unrecorded\)/);
   assert.equal(r.items[0].priority, "p1");
 });
 

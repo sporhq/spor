@@ -17,7 +17,7 @@
         "age_days": 42
       },
       "suggest": "do",
-      "why": "priority p2 (human-set); blocks 1 live node; neighborhood active (heat 1); 42d old; 1 open gardener finding: finding-open",
+      "why": "priority p2 (set by Dana Ops <dana@example.com> via mcp); blocks 1 live node; neighborhood active (heat 1); 42d old; 1 open gardener finding: finding-open",
       "findings": [
         "finding-open"
       ]
@@ -58,7 +58,7 @@
         "age_days": 72
       },
       "suggest": "blocked",
-      "why": "priority p1 (human-set); blocked by task-unblocker — do the unblocker first; neighborhood active (heat 2); 72d old",
+      "why": "priority p1 (source unrecorded); blocked by task-unblocker — do the unblocker first; neighborhood active (heat 2); 72d old",
       "blocked_by": [
         "task-unblocker"
       ]

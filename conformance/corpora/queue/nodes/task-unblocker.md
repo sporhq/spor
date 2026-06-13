@@ -6,6 +6,7 @@ title: Land the schema migration
 summary: Migration that the indexer rewrite cannot start without.
 status: open
 priority: p2
+priority_by: Dana Ops <dana@example.com> via mcp
 date: 2026-05-01
 edges:
   - {type: blocks, to: task-blocked}

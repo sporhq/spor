@@ -349,9 +349,15 @@ signals via its schema's `queueSignals()`:
 - **age**, and any org-specific signal the schema's code adds (SLA clocks,
   sprint membership, whatever the org's process actually is).
 
-The queue presents signals *and* the human-set `priority:` field side by
+The queue presents signals *and* the `priority:` field side by
 side, ranked by a default blend the org can replace (the blend itself is
-attached code on a `schema-queue-policy` node). Computed signals are
+attached code on a `schema-queue-policy` node). `priority:` is ordinary
+frontmatter writable by any token-holder, so its source is not assumed to be
+human: when a `priority_by:` stamp is present (acting identity + door, set the
+way `author`/`authored_via` are) the why-line attributes it — `priority p1
+(set by <name> via <door>)`; absent the stamp the why-line says `(source
+unrecorded)` rather than claiming human triage
+(issue-cc-priority-attribution-gap). Computed signals are
 advisory — same posture as the reliability-cost layer: the graph knows
 structural urgency; it does not know business value.
 
