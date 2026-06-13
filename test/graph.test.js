@@ -860,3 +860,47 @@ Body.
   assert.deepEqual(v.errors, []);
   assert.ok(!v.warnings.some((w) => /author/.test(w)));
 });
+
+// Regression: a token equal to an Object.prototype key (constructor, toString,
+// …) must be an ordinary term, not collide with the inherited member. The bug
+// (issue-cc-gardener-near-dup-unnormalized-cosine): tf/df were plain {}, so
+// `m["constructor"] ?? 0` kept a function, the count became a string, the
+// tf-idf weight and the doc norm went NaN, and rankAgainst's denominator
+// fell back to 1 — turning that doc into a raw, unnormalized dot-product
+// scorer that dominated every ranking (the near-dup storm + digest hubs).
+test("proto-key tokens (constructor) don't poison tf-idf norms or cosine bounds", () => {
+  const fx = tmpGraph({
+    "dec-ctor.md": `---
+id: dec-ctor
+type: decision
+title: The Store constructor and its prototype toString valueOf
+summary: A node whose text is full of constructor prototype toString valueOf hasOwnProperty terms.
+date: 2026-06-01
+---
+The constructor runs at boot; the prototype toString and valueOf and constructor again.
+`,
+    "dec-plain.md": `---
+id: dec-plain
+type: decision
+title: Catalogue pricing envelope
+summary: An ordinary decision about pricing and recovery objectives.
+date: 2026-06-02
+---
+Ordinary body about pricing envelopes and recovery.
+`,
+  });
+  const g = fx.load();
+  // every doc norm is a finite, positive number
+  for (const d of g.docs) {
+    assert.ok(Number.isFinite(d.norm), `norm for ${d.id} must be finite, got ${d.norm}`);
+  }
+  // cosine is bounded [0,1] — the proto-key node must not score >1 or dominate
+  const text = "constructor prototype toString store boot";
+  const ranked = graph.rankAgainst(g, text, new Set());
+  for (const r of ranked) {
+    assert.ok(r.sim <= 1.0000001 && r.sim >= 0, `sim for ${r.id} must be in [0,1], got ${r.sim}`);
+  }
+  // and an unrelated query must not be topped by the proto-key node via a raw dot
+  const unrelated = graph.rankAgainst(g, "pricing recovery envelope", new Set());
+  assert.equal(unrelated[0].id, "dec-plain", "the lexically-relevant node wins, not the proto-key node");
+});
