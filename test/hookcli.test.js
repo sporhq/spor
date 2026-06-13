@@ -563,6 +563,75 @@ test('session-start: detached catch-up stamps commits made outside any session',
   }
 });
 
+// A stub server that answers every request with a fixed HTTP status (and a
+// minimal JSON body), for the fail-open banner tests below.
+function statusServer(code) {
+  const http = require('node:http');
+  const srv = http.createServer((req, res) => {
+    req.on('data', () => {});
+    req.on('end', () => {
+      res.writeHead(code, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+  });
+  return new Promise((resolve) => srv.listen(0, '127.0.0.1', () =>
+    resolve({ srv, base: `http://127.0.0.1:${srv.address().port}` })));
+}
+
+// issue-cc-auth-transport-conflation-silent-loss: a 401/403 on the briefing
+// fetch must NOT masquerade as an OFFLINE outage. session-start must name the
+// auth failure (so the user re-mints the token) while still failing open.
+test('session-start: 401 surfaces an AUTH-FAILED banner, not OFFLINE (no cache)', async () => {
+  const { home, cwd } = scratch();
+  fs.rmSync(path.join(home, 'nodes'), { recursive: true });
+  const { srv, base } = await statusServer(401);
+  try {
+    const env = freshEnv(home);
+    env.SPOR_SERVER = base;
+    env.SPOR_TOKEN = 'spor_pat_bad';
+    let out = '';
+    await runAsync2(['session-start', '--host', 'claude-code'],
+      JSON.stringify({ cwd, hook_event_name: 'SessionStart' }), env, (s) => (out += s));
+    const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+    assert.match(ctx, /AUTH FAILED/);
+    assert.match(ctx, /SPOR_TOKEN/);
+    assert.doesNotMatch(ctx, /OFFLINE/);
+    const log = fs.readFileSync(path.join(home, 'journal', 'remote.log'), 'utf8');
+    assert.match(log, /auth failure \(http=401\)/);
+  } finally {
+    srv.close();
+  }
+});
+
+test('session-start: a transport failure (000/dead port) still says OFFLINE, not AUTH', async () => {
+  const { home, cwd } = scratch();
+  // brief cache present so we get a body either way
+  fs.mkdirSync(path.join(home, 'cache'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'cache', 'brief-projx.md'),
+    '<!-- spor cache: brief-projx version=2 fetched=2026-01-01 host=x -->\ncached body\n');
+  const env = freshEnv(home);
+  env.SPOR_SERVER = 'http://127.0.0.1:1'; // dead port
+  env.SPOR_TOKEN = 'spor_pat_test';
+  let out = '';
+  await runAsync2(['session-start', '--host', 'claude-code'],
+    JSON.stringify({ cwd, hook_event_name: 'SessionStart' }), env, (s) => (out += s));
+  const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /OFFLINE/);
+  assert.doesNotMatch(ctx, /AUTH FAILED/);
+});
+
+// async spawn that captures stdout (runAsync above discards it).
+function runAsync2(args, input, env, onData) {
+  const { spawn } = require('node:child_process');
+  return new Promise((resolve, reject) => {
+    const c = spawn('bash', [BIN, ...args], { env, stdio: ['pipe', 'pipe', 'ignore'] });
+    c.stdout.on('data', (d) => onData(String(d)));
+    c.on('error', reject);
+    c.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`exit ${code}`))));
+    c.stdin.end(input);
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Spor rename (SPLIT.md): the SPOR_* env arm, and the substrate-hook stub.
 // ---------------------------------------------------------------------------
