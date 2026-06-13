@@ -632,6 +632,32 @@ function runAsync2(args, input, env, onData) {
   });
 }
 
+// issue-cc-fail-open-degradation-telemetry-gap /
+// task-cc-client-hook-operability-diagnostics piece 1: a crashing engine and a
+// quiet success look identical from outside. The dispatcher's crash handler
+// must append one line to journal/remote.log before honoring the fail-open
+// exit-0 contract, so an operator can tell the two apart after the fact.
+test('dispatcher: logCrash writes one line to remote.log and never throws', () => {
+  const { home } = scratch();
+  const prevHome = process.env.SPOR_HOME;
+  const prevSub = process.env.SUBSTRATE_HOME;
+  process.env.SPOR_HOME = home;
+  delete process.env.SUBSTRATE_HOME;
+  try {
+    const { logCrash } = require('../bin/spor-hook.js');
+    // Must not throw, even on a weird error value.
+    assert.doesNotThrow(() => logCrash(new Error('boom in engine')));
+    assert.doesNotThrow(() => logCrash('a bare string'));
+    const log = fs.readFileSync(path.join(home, 'journal', 'remote.log'), 'utf8');
+    assert.match(log, /dispatcher .*crashed \(fail-open, exit 0\):.*boom in engine/);
+    // Only the first line of a multi-line stack is logged (one line per crash).
+    assert.strictEqual(log.trim().split('\n').length, 2);
+  } finally {
+    if (prevHome === undefined) delete process.env.SPOR_HOME; else process.env.SPOR_HOME = prevHome;
+    if (prevSub !== undefined) process.env.SUBSTRATE_HOME = prevSub;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Spor rename (SPLIT.md): the SPOR_* env arm, and the substrate-hook stub.
 // ---------------------------------------------------------------------------
