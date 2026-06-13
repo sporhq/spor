@@ -48,6 +48,17 @@ graph's git repo. What a client sees:
 Streamable HTTP, implemented with the official SDK. All tool results are
 returned as both human-readable text content and structured JSON.
 
+The server advertises **`instructions`** (the SDK initialize result, surfaced
+by clients as an "MCP Server Instructions" block). It frames the eleven tools
+as an **ORIENT → TRAVERSE → COMMIT** loop rather than eleven independent
+verbs, so an assistant can infer a recursive research chain — e.g. `my_queue`
+→ `query_graph` with `root_id` (deepen) → `render_lens` on a lineage lens →
+`put_node`/`capture` the outcome — instead of reconstructing it from per-tool
+descriptions. `query_graph`'s `root_id` is the recursive-deepen move (walk
+neighbor → neighbor); `render_lens` lineage lenses trace why a node exists,
+and `render_lens` with no `lens_id` returns the lens catalog (the discovery
+step before rendering).
+
 ### `query_graph`
 
 The compiler over the wire. Input:
@@ -190,9 +201,14 @@ graph. Input `{ "lens_id": "lens-...", "params"?: {"project": "wf", "focus":
 "<node-id>", ...} }` → `{ "found": true, "lens_id", "count", "view",
 "node_ids" }`, where `view` is the plain-JSON view tree
 (view/list/group/item/tree/table/text catalog) and the text content is its
-terminal rendering for the model. Unknown `lens_id` errors with the list of
-available lenses; engine failures (missing param, broken blocks) error with
-the message verbatim.
+terminal rendering for the model.
+
+`lens_id` is **optional**: call with no `lens_id` to get the lens catalog —
+a successful `{ "found": true, "catalog": [{"id", "title"}], "lenses": [...],
+"count" }` listing every available lens (the discovery step before you
+render). Unknown `lens_id` still errors, carrying the same `catalog`/`lenses`
+list; engine failures (missing param, broken blocks) error with the message
+verbatim.
 
 ### The MCP-app widget (`ui://spor/view-tree.html`)
 
