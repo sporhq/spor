@@ -228,7 +228,7 @@ async function distill(input) {
   };
 
   let response;
-  const distillCmd = u.envDual("DISTILL_CMD");
+  const distillCmd = u.cfgStr("distill.cmd", "DISTILL_CMD");
   if (distillCmd) {
     backend = `cmd:${distillCmd}`;
     response = u.runBackendCmd(distillCmd, prompt);

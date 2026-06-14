@@ -14,8 +14,31 @@ const ROOT = path.resolve(__dirname, "..", "..");
 
 const home = require(path.join(ROOT, "lib", "shell", "home.js"));
 
+// Active client config for this run (dec-spor-client-config-cascade). The
+// dispatcher builds it once with the session cwd; engines then read settings
+// through the cascade (CLI > env > .spor.json > user > global > defaults). When
+// no config is active — standalone util calls, direct unit tests — every read
+// falls back to the exact env dual-read it replaced, so those paths stay
+// byte-identical (norm-cc-byte-identical-refactor).
+let _config = null;
+function useConfig(opts) {
+  _config = require(path.join(ROOT, "lib", "config.js")).loadConfig(opts);
+  return _config;
+}
+function config() {
+  return _config;
+}
+function clearConfig() {
+  _config = null; // test hook
+}
+// Config-aware string read: the active cascade value, else env dual-read.
+// Returns undefined when neither is set, matching the old envDual() contract.
+function cfgStr(keyPath, envName) {
+  return _config ? _config.get(keyPath) : home.envDual(envName);
+}
+
 function graphHome() {
-  return home.graphHome();
+  return _config ? _config.graphHome() : home.graphHome();
 }
 
 // jq `now | todate`: UTC, second precision, trailing Z.
@@ -383,11 +406,13 @@ async function curl(
 }
 
 function bearer() {
-  return { Authorization: `Bearer ${home.envDual("TOKEN") || ""}` };
+  const v = _config ? _config.get("token") : home.envDual("TOKEN");
+  return { Authorization: `Bearer ${v || ""}` };
 }
 
 function serverBase() {
-  return (home.envDual("SERVER") || "").replace(/\/+$/, "");
+  const v = _config ? _config.get("server") : home.envDual("SERVER");
+  return (v || "").replace(/\/+$/, "");
 }
 
 // `sed -E 's#^https?://##; s#/.*$##'` over the server URL.
@@ -532,6 +557,10 @@ module.exports = {
   ROOT,
   graphHome,
   envDual: home.envDual,
+  useConfig,
+  config,
+  clearConfig,
+  cfgStr,
   jqNow,
   isoMs,
   isoSeconds,

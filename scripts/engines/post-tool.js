@@ -48,7 +48,9 @@ function parseFactList(response) {
 }
 
 async function nudge({ input, graph, slug, session, file, remote }) {
-  if ((u.envDual("NUDGE") ?? "1") === "0") return null;
+  // Nudge on by default; SPOR_NUDGE=0 (env) or nudge.enabled:false (config)
+  // disables. No active config falls back to the exact env dual-read.
+  if (u.config() ? !u.config().getBool("nudge.enabled", true) : (u.envDual("NUDGE") ?? "1") === "0") return null;
   if (process.env.SPOR_DISTILLING || process.env.SUBSTRATE_DISTILLING) return null; // headless calls don't nudge
   if (!file.endsWith(".md")) return null;
   const home = process.env.HOME || require("os").homedir();
@@ -143,7 +145,7 @@ async function nudge({ input, graph, slug, session, file, remote }) {
   };
 
   let response;
-  const nudgeCmd = u.envDual("NUDGE_CMD");
+  const nudgeCmd = u.cfgStr("nudge.cmd", "NUDGE_CMD");
   if (nudgeCmd) {
     backend = `cmd:${nudgeCmd}`;
     response = u.runBackendCmd(nudgeCmd, prompt);

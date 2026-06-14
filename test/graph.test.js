@@ -904,3 +904,84 @@ Ordinary body about pricing envelopes and recovery.
   const unrelated = graph.rankAgainst(g, "pricing recovery envelope", new Set());
   assert.equal(unrelated[0].id, "dec-plain", "the lexically-relevant node wins, not the proto-key node");
 });
+
+// ---------- neighborhood-search project controls (dec-spor-client-config-cascade) ----------
+
+function twoProjectFixture() {
+  return tmpGraph({
+    "dec-a.md": `---
+id: dec-a
+type: decision
+project: alpha
+title: Alpha auth token rotation
+summary: How alpha rotates auth tokens and credentials for deployment pipelines.
+date: 2026-06-01
+---
+Alpha auth token rotation and credential handling.
+`,
+    "dec-b.md": `---
+id: dec-b
+type: decision
+project: beta
+title: Beta auth token rotation
+summary: How beta rotates auth tokens and credentials for deployment pipelines.
+date: 2026-06-01
+---
+Beta auth token rotation and credential handling.
+`,
+    // A decoy in a third project with unrelated vocabulary, so the query terms
+    // carry non-zero IDF (they aren't in every doc) and the gate passes.
+    "dec-c.md": `---
+id: dec-c
+type: decision
+project: gamma
+title: Gamma pricing catalogue
+summary: Gamma catalogue pricing envelopes and recovery objectives for billing.
+date: 2026-06-01
+---
+Gamma catalogue pricing envelopes and billing recovery.
+`,
+  });
+}
+
+test("searchProjects: empty config is a strict no-op (byte-identical)", () => {
+  const g = twoProjectFixture().load();
+  const base = graph.compile(g, { query: "auth token rotation credential", digest: true });
+  const withEmpty = graph.compile(g, {
+    query: "auth token rotation credential", digest: true,
+    searchProjects: { include: [], exclude: [], boost: {} },
+  });
+  assert.equal(withEmpty.text, base.text);
+});
+
+test("searchProjects.exclude hard-drops a project from the digest", () => {
+  const g = twoProjectFixture().load();
+  const r = graph.compile(g, {
+    query: "auth token rotation credential", digest: true,
+    searchProjects: { exclude: ["beta"] },
+  });
+  assert.ok(r.text.includes("dec-a"), "alpha kept");
+  assert.ok(!r.text.includes("dec-b"), "beta excluded entirely");
+});
+
+test("searchProjects.include restricts seeds to the allowlist", () => {
+  const g = twoProjectFixture().load();
+  const r = graph.compile(g, {
+    query: "auth token rotation credential", digest: true,
+    searchProjects: { include: ["alpha"] },
+  });
+  assert.ok(r.text.includes("dec-a"), "alpha included");
+  assert.ok(!r.text.includes("dec-b"), "beta not in the allowlist");
+});
+
+test("searchProjects.boost favors a project in the ranking", () => {
+  const g = twoProjectFixture().load();
+  // Without boost the two tie; with a strong beta boost, beta leads.
+  const r = graph.compile(g, {
+    query: "auth token rotation credential", digest: true,
+    searchProjects: { boost: { beta: 5 } },
+  });
+  const ia = r.text.indexOf("dec-a");
+  const ib = r.text.indexOf("dec-b");
+  assert.ok(ib >= 0 && ib < ia, "boosted beta ranks before alpha");
+});

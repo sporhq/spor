@@ -103,6 +103,13 @@ async function main() {
         } catch {}
       }
     }
+    // Active config (dec-spor-client-config-cascade): a per-repo `enabled:false`
+    // / `mode:off` makes the plugin a no-op in unrelated side projects.
+    let amdCwd = process.cwd();
+    const ci = args.indexOf("--cwd");
+    if (ci >= 0 && args[ci + 1]) amdCwd = args[ci + 1];
+    else if (payload && payload.cwd) amdCwd = payload.cwd;
+    if (!u.useConfig({ cwd: amdCwd }).enabled()) return;
     await agentsMd(payload, args);
     return;
   }
@@ -122,6 +129,22 @@ async function main() {
   }
   if (!payload || typeof payload !== "object") return;
   payload = normalize(payload, host);
+
+  // Active config (dec-spor-client-config-cascade), anchored at the session
+  // cwd so the nearest-ancestor .spor.json is in scope. A per-repo
+  // `enabled:false` / `mode:off` makes every hook a no-op (exit 0, no output)
+  // so an unrelated side project doesn't pollute the shared graph neighborhood;
+  // default-enabled, so a repo without config is byte-identical to before.
+  const cfg = u.useConfig({ cwd: payload.cwd || process.cwd() });
+  if (cfg.warnings.length) {
+    try {
+      const log = u.makeLogger(path.join(u.graphHome(), "journal", "remote.log"), "config: ");
+      for (const w of cfg.warnings) log(w);
+    } catch {
+      /* logging must never break fail-open */
+    }
+  }
+  if (!cfg.enabled()) return;
 
   // Debounced distill: spool the payload and hand off to a per-session
   // watcher (one at a time — the lock holds the watcher's pid; stale locks

@@ -120,6 +120,47 @@ server is ever unreachable, the client fails open — it falls back to a local
 cache or to nothing, never blocking your session. The full contract a client
 programs against is in [API.md](API.md).
 
+## Configuration
+
+Settings can live in config files instead of environment variables, cascading
+from broad to specific so a repo can override your personal defaults. Highest
+precedence wins:
+
+1. CLI flags
+2. environment — `SPOR_*` (legacy `SUBSTRATE_*` still read)
+3. **repo** — `.spor.json` at (or above) the working directory; the nearest one
+   wins, so a monorepo subtree can override its root
+4. **user** — `$SPOR_HOME/config.json`
+5. **global** — `$XDG_CONFIG_HOME/spor/config.json` (`~/.config/spor/config.json`)
+6. built-in defaults
+
+Environment sits above the config files, so existing setups are unchanged;
+add files only when you want them. A `.spor.json` (committable) is for
+settings the whole repo should share — never put a `token` there; it is
+honored only from the environment or your user/global config.
+
+```jsonc
+// .spor.json — committed at a repo root
+{
+  "enabled": false,                 // make the plugin a no-op in this repo:
+                                    // unrelated side projects don't pollute
+                                    // the shared graph (default true)
+  "search": {
+    "minSim": 0.10,                 // raise/lower the relevance gate
+    "projects": {
+      "include": ["spor"],          // restrict candidate ranking to these
+      "exclude": ["personal-blog"], // drop these from ranking entirely
+      "boost":   { "spor": 1.5 }    // favor a project's nodes in ranking
+    }
+  }
+}
+```
+
+Other recognized keys mirror their env var: `server`, `token`, `home`,
+`nodes`, `mode` (`auto`/`local`/`remote`/`off`), and the `distill`, `nudge`,
+and `inferCommits` groups. `spor validate` prints config warnings (an unknown
+key, a secret in a committable config) on stderr.
+
 ## Pointers
 
 - [GRAPH.md](GRAPH.md) — the node and edge format: what a node file looks

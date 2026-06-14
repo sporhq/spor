@@ -173,6 +173,31 @@ substrate→spor rename did exactly this; see brief-spor / brief-spor-server)
 (GRAPH.md "Project identity nodes"); historical `project:` stamps never
 rewrite.
 
+## Client config cascade
+
+Client settings resolve through `lib/config.js`
+(`loadConfig({cwd, env})`), the realization of dec-cc-spor-cli-universal-surface's
+"mode via a lib/config cascade" — see dec-spor-client-config-cascade. Precedence
+high-first: CLI flags > env (`SPOR_*`/`SUBSTRATE_*` via `home.envDual`) > repo
+`.spor.json` (nearest-ancestor walk, deepest wins, secrets stripped) > user
+`$SPOR_HOME/config.json` > global `$XDG_CONFIG_HOME/spor/config.json` >
+built-in defaults. **Env sits above the files on purpose**: with no config
+files present every resolved value equals the prior env-or-hardcoded default,
+so the change is byte-identical (norm-cc-byte-identical-refactor, verified
+against the live graph for compile/validate/digest/skeleton). Engines read it
+through the active config the dispatcher sets per run
+(`u.useConfig`/`u.config()`/`u.cfgStr`); when none is active, every read falls
+back to the exact `envDual` it replaced, so standalone calls and unit tests
+stay byte-identical. `.spor.json` is config, held SEPARATE from the `.spor`
+identity marker (which stays flat `key: value`). New levers beyond env
+migration: per-repo no-op disable (`enabled:false`/`mode:off` → dispatcher
+bails, fail-open) and neighborhood-search project controls
+(`search.minSim`, `search.projects.{include,exclude,boost}`, applied in
+`lib/kernel/graph.js` compile, no-op when empty). Server-side ops vars
+(`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
+`SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard
+(`SPOR_DISTILLING`) are deliberately NOT config — they stay pure env.
+
 ## Design context
 
 The Spor design system — PRODUCT.md (register, users, principles), DESIGN.md

@@ -12,7 +12,9 @@ const { spawnSync } = require("child_process");
 const u = require("./util");
 
 async function inferCommits({ repo, journal, indexFile = "", index = "", slug = "project", session = "unknown" }) {
-  if ((u.envDual("INFER_COMMITS") ?? "0") !== "1") return;
+  // Off by default; SPOR_INFER_COMMITS=1 (env) or inferCommits.enabled:true
+  // (config) turns it on. No active config falls back to the exact env read.
+  if (u.config() ? !u.config().getBool("inferCommits.enabled", false) : (u.envDual("INFER_COMMITS") ?? "0") !== "1") return;
   if (!u.serverBase()) return;
   if (!repo || !journal || !fs.existsSync(journal)) return;
   const top = u.git(repo, ["rev-parse", "--show-toplevel"])?.trim();
