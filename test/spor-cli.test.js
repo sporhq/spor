@@ -167,6 +167,26 @@ test('join writes server+token to user config (never repo)', () => {
   assert.match(r.stdout, /OFFLINE/); // confirmation probe ran
 });
 
+test('disable/enable merge enabled into .spor.json at the cwd', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-scope-'));
+  const r1 = spawnSync(process.execPath, [CLI, 'disable'], { cwd: dir, encoding: 'utf8', env: bare() });
+  assert.strictEqual(r1.status, 0);
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, '.spor.json'), 'utf8')).enabled, false);
+  const r2 = spawnSync(process.execPath, [CLI, 'enable'], { cwd: dir, encoding: 'utf8', env: bare() });
+  assert.strictEqual(r2.status, 0);
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, '.spor.json'), 'utf8')).enabled, true);
+});
+
+test('link writes the .spor marker; rejects a non-canonical slug', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-link-'));
+  const ok = spawnSync(process.execPath, [CLI, 'link', 'my-repo'], { cwd: dir, encoding: 'utf8', env: bare() });
+  assert.strictEqual(ok.status, 0);
+  assert.match(fs.readFileSync(path.join(dir, '.spor'), 'utf8'), /^repo: my-repo$/m);
+  const bad = spawnSync(process.execPath, [CLI, 'link', 'Bad_Slug'], { cwd: dir, encoding: 'utf8', env: bare() });
+  assert.strictEqual(bad.status, 1);
+  assert.match(bad.stderr, /invalid slug/);
+});
+
 test('remote verb fails open against an unreachable server (no stack trace)', () => {
   const r = run(['status'], { SPOR_SERVER: 'http://127.0.0.1:9', SPOR_TOKEN: 't' });
   assert.strictEqual(r.status, 0);

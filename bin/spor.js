@@ -40,6 +40,10 @@ Graph
   add "<text>"         capture a node (local: typed file; remote: /v1/capture)
   next [--project S]   the decision queue (local: lib/queue; remote: /v1/queue)
   get <id>             a node by id (local: file; remote: /v1/nodes/<id>)
+
+Repo scoping
+  disable | enable     turn Spor off/on for this repo (.spor.json)
+  link <slug>          set this repo's canonical project slug (.spor marker)
   compile <args>       full neighborhood / digest (local; byte-identical)
   brief <id>           compile a briefing for a node (alias: compile --root <id>)
   validate             lint the local graph (byte-identical)
@@ -378,6 +382,55 @@ function safeSlug() {
   }
 }
 
+// The git toplevel of the cwd, or cwd itself — where repo-scoped files live.
+function repoRoot() {
+  const r = spawnSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" });
+  const top = (r.stdout || "").trim();
+  return top || process.cwd();
+}
+
+// --- spor enable / disable: per-repo scoping (stops side-project pollution) --
+// Merge { enabled } into the repo's committable .spor.json without hand-editing.
+function cmdScope(enabled) {
+  const root = repoRoot();
+  const file = path.join(root, ".spor.json");
+  let data = {};
+  try {
+    data = JSON.parse(fs.readFileSync(file, "utf8")) || {};
+  } catch {
+    /* absent or malformed — start fresh */
+  }
+  data.enabled = enabled;
+  fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+  out(`${enabled ? "enabled" : "disabled"} Spor for ${root}`);
+  out(`  ${file}${enabled ? "" : " — hooks are now a no-op here; commit it to share the setting"}`);
+  return 0;
+}
+
+// --- spor link <slug>: write the .spor identity marker --------------------
+// Fixes a wrong inferred slug (basename != canonical) deterministically,
+// instead of waiting for the server's fingerprint-alias proposal to be approved.
+function cmdLink(args) {
+  const slug = args.find((a) => !a.startsWith("--")) || safeSlug();
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) {
+    err(`invalid slug '${slug}' — must match ^[a-z0-9][a-z0-9-]*$`);
+    return 1;
+  }
+  const root = repoRoot();
+  const file = path.join(root, ".spor");
+  let lines = [];
+  try {
+    lines = fs.readFileSync(file, "utf8").split("\n");
+  } catch {
+    /* absent */
+  }
+  const kept = lines.filter((l) => l.trim() && !/^repo:/.test(l));
+  fs.writeFileSync(file, [`repo: ${slug}`, ...kept].join("\n") + "\n");
+  out(`linked ${root} to repo: ${slug}`);
+  out(`  ${file} — commit it so every checkout shares this identity`);
+  return 0;
+}
+
 function version() {
   try {
     return require(path.join(ROOT, "package.json")).version || "0.0.0";
@@ -416,6 +469,12 @@ async function main() {
     case "add":
     case "capture":
       return await cmdAdd(cfg, args);
+    case "enable":
+      return cmdScope(true);
+    case "disable":
+      return cmdScope(false);
+    case "link":
+      return cmdLink(args);
     case "next":
     case "queue":
       return await cmdNext(cfg, args);
