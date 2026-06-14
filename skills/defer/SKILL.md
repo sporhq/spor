@@ -52,6 +52,38 @@ Read the response and tell the user what happened, briefly:
 In Cowork, call the `capture` MCP tool directly with the same fields
 (`text`, `project`, `during`) — there is no shell there.
 
+## Declaring a cross-project dependency
+
+When the deferred work is something *another* team/repo must do for the
+current initiative — the kind of cross-cutting dependency that otherwise gets
+discovered late (task-cc-xproject-dependency-loop) — declare it so it surfaces
+in the SERVING team's queue from day one, on both sides. Add two fields to
+`context`:
+
+- `project`: the **serving** project slug (who must do the work), NOT the
+  current session's slug.
+- `blocks`: the node id of the requesting work this dependency blocks (it must
+  already exist — create the requester first if needed).
+- `needed_by`: a `YYYY-MM-DD` deadline. Unlike `wake` (which hides a node until
+  its date), `needed_by` keeps it visible and ramps its queue urgency as the
+  date nears.
+
+```bash
+curl -sS --max-time 90 -X POST \
+  -H "Authorization: Bearer $SPOR_TOKEN" -H "Content-Type: application/json" \
+  --data "$(jq -n --arg t '<the 2-3 sentences>' \
+    '{text: $t, context: {project: "platform", blocks: "task-my-initiative", needed_by: "2026-07-15"}}')" \
+  "${SPOR_SERVER%/}/v1/capture"
+```
+
+The server attaches the `blocks` edge and `needed_by` deterministically (not
+via the model). A missing `blocks` target returns `404`, a non-date
+`needed_by` returns `422` — both before any model call. In Cowork, pass the
+same `blocks`/`needed_by` fields to the `capture` MCP tool. In **local mode**,
+write the node yourself (next section) into the serving project: stamp
+`project: <serving-slug>`, add a `- {type: blocks, to: <requester-id>}` edge,
+and a `needed_by: YYYY-MM-DD` line.
+
 ## Local mode (personal graph) — `SPOR_SERVER` unset
 
 There is no server-side ingester locally, so write the node yourself, the
