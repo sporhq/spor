@@ -34,6 +34,7 @@ Getting started
   init                 create the local graph home (nodes/, git, .gitignore)
   status               resolved mode, graph, project, identity, health
   join <url> <token>   point the client at a graph (writes user config)
+  migrate <url>        push the local graph to a remote you own (solo-remote)
   whoami               who the team graph thinks you are (remote)
 
 Team admin (remote, admin token)
@@ -514,6 +515,88 @@ function repoRoot() {
   return top || process.cwd();
 }
 
+// A git invocation inside a given working tree. Captures output so callers can
+// branch on status/stderr; never throws (a missing git binary surfaces as
+// r.error, handled by hasGit() before we get here).
+function git(cwd, gitArgs, opts = {}) {
+  return spawnSync("git", gitArgs, { cwd, encoding: "utf8", ...opts });
+}
+function hasGit() {
+  return !spawnSync("git", ["--version"]).error;
+}
+
+// --- spor migrate / push: seed the local graph to a user-owned remote -------
+// The solo-remote tier (dec-spor-solo-remote-entry-tier) has the HOSTED server
+// READ a remote graph repo the user owns; migrate is the client side that gets
+// ~/.spor there — pure git plumbing against the graph home. There is no server
+// route for BYO-repo registration, and the GitHub-App write grant of
+// dec-spor-solo-remote-write-credential-custody is unbuilt server-side; both
+// are tracked separately, so this verb stops at "your graph is on your remote".
+function cmdMigrate(cfg, args) {
+  const home = cfg.graphHome();
+  const nodesDir = cfg.nodesDir();
+  if (!fs.existsSync(nodesDir)) {
+    err(`no graph at ${nodesDir} — run 'spor init' first`);
+    return 1;
+  }
+  if (!hasGit()) {
+    err("git not found — migrate needs git on PATH");
+    return 1;
+  }
+  // 1. ensure the graph home is a git repo (idempotent, like cmdInit).
+  if (!fs.existsSync(path.join(home, ".git"))) {
+    const r = git(home, ["init", "-q"]);
+    if (r.status !== 0) {
+      err(`git init failed: ${(r.stderr || "").trim() || "unknown error"}`);
+      return 1;
+    }
+  }
+  // 2. commit any pending graph state so there is something to push.
+  git(home, ["add", "-A"]);
+  const dirty = (git(home, ["status", "--porcelain"]).stdout || "").trim();
+  const hasCommit = git(home, ["rev-parse", "--verify", "-q", "HEAD"]).status === 0;
+  if (dirty || !hasCommit) {
+    let c = git(home, ["commit", "-q", "-m", "spor: graph snapshot"]);
+    // No git identity configured in this environment — fall back so the
+    // housekeeping commit still lands. The user's own identity is preferred
+    // whenever git has one; this only fires when it has none.
+    if (c.status !== 0 && /identity|user\.(email|name)|empty ident/i.test(c.stderr || "")) {
+      c = git(home, ["-c", "user.email=spor@localhost", "-c", "user.name=spor", "commit", "-q", "-m", "spor: graph snapshot"]);
+    }
+    if (c.status !== 0) {
+      err(`could not commit the graph: ${(c.stderr || "").trim() || "nothing to commit"}`);
+      return 1;
+    }
+  }
+  // 3. wire the remote. An explicit URL sets/updates origin; otherwise reuse an
+  //    existing origin, or explain that one is required.
+  const url = args.find((a) => !a.startsWith("--"));
+  const haveOrigin = git(home, ["remote", "get-url", "origin"]).status === 0;
+  if (url) {
+    const r = haveOrigin ? git(home, ["remote", "set-url", "origin", url]) : git(home, ["remote", "add", "origin", url]);
+    if (r.status !== 0) {
+      err(`could not set origin: ${(r.stderr || "").trim()}`);
+      return 1;
+    }
+  } else if (!haveOrigin) {
+    err("usage: spor migrate <remote-url>   (a git remote you own, e.g. git@github.com:you/my-graph.git)");
+    err("  no 'origin' is configured on the graph yet — pass the URL once and it's remembered.");
+    return 1;
+  }
+  const origin = (git(home, ["remote", "get-url", "origin"]).stdout || "").trim();
+  // 4. push the current branch, setting upstream.
+  const branch = (git(home, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout || "").trim() || "main";
+  const p = git(home, ["push", "-u", "origin", branch]);
+  if (p.status !== 0) {
+    err(`push to ${origin} failed: ${(p.stderr || "").trim() || "unknown error"}`);
+    err("  check the remote exists and your credentials/SSH key can write to it.");
+    return 1;
+  }
+  out(`pushed ${nodeCount(nodesDir) ?? 0} nodes (${branch}) to ${origin}`);
+  out(`  next: point a hosted Spor server at this remote, then 'spor join <server> <token>'.`);
+  return 0;
+}
+
 // --- spor enable / disable: per-repo scoping (stops side-project pollution) --
 // Merge { enabled } into the repo's committable .spor.json without hand-editing.
 function cmdScope(enabled) {
@@ -591,6 +674,9 @@ async function main() {
     case "join":
     case "login":
       return await cmdJoin(cfg, args);
+    case "migrate":
+    case "push":
+      return cmdMigrate(cfg, args);
     case "add":
     case "capture":
       return await cmdAdd(cfg, args);

@@ -167,6 +167,55 @@ test('join writes server+token to user config (never repo)', () => {
   assert.match(r.stdout, /OFFLINE/); // confirmation probe ran
 });
 
+test('migrate commits the graph and pushes to a user-owned remote', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-mig-'));
+  const nodes = path.join(home, 'nodes');
+  fs.mkdirSync(nodes, { recursive: true });
+  fs.writeFileSync(path.join(nodes, 'dec-x.md'), `---\nid: dec-x\ntype: decision\nproject: demo\ntitle: t\nsummary: s\ndate: 2026-06-01\n---\nbody\n`);
+  // a bare repo stands in for the remote the user owns (no network)
+  const remote = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-remote-'));
+  spawnSync('git', ['init', '--bare', '-q', remote]);
+  const r = run(['migrate', remote], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /pushed 1 nodes/);
+  // the node landed on the remote's pushed branch
+  const refs = spawnSync('git', ['-C', remote, 'for-each-ref', '--format=%(refname:short)', 'refs/heads'], { encoding: 'utf8' })
+    .stdout.trim().split('\n').filter(Boolean);
+  assert.ok(refs.length >= 1, 'a branch was pushed to the remote');
+  const ls = spawnSync('git', ['-C', remote, 'ls-tree', '-r', '--name-only', refs[0]], { encoding: 'utf8' });
+  assert.match(ls.stdout, /nodes\/dec-x\.md/);
+});
+
+test('migrate remembers origin, so a second run needs no url', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-mig2-'));
+  fs.mkdirSync(path.join(home, 'nodes'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'nodes', 'dec-y.md'), `---\nid: dec-y\ntype: decision\nproject: demo\ntitle: t\nsummary: s\ndate: 2026-06-01\n---\nb\n`);
+  const remote = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-remote2-'));
+  spawnSync('git', ['init', '--bare', '-q', remote]);
+  assert.strictEqual(run(['migrate', remote], { SPOR_HOME: home }).status, 0);
+  // second run with no url reuses the stored origin
+  const r2 = run(['push'], { SPOR_HOME: home });
+  assert.strictEqual(r2.status, 0, r2.stderr);
+  assert.match(r2.stdout, /pushed 1 nodes/);
+});
+
+test('migrate without a url or origin explains it needs one', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-mig3-'));
+  fs.mkdirSync(path.join(home, 'nodes'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'nodes', 'dec-z.md'), `---\nid: dec-z\ntype: decision\nproject: demo\ntitle: t\nsummary: s\ndate: 2026-06-01\n---\nb\n`);
+  const r = run(['migrate'], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /remote-url|origin/);
+});
+
+test('migrate without a graph points at init', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-mig4-'));
+  fs.rmSync(home, { recursive: true, force: true }); // start absent
+  const r = run(['migrate', '/tmp/some-remote'], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /spor init/);
+});
+
 test('disable/enable merge enabled into .spor.json at the cwd', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-scope-'));
   const r1 = spawnSync(process.execPath, [CLI, 'disable'], { cwd: dir, encoding: 'utf8', env: bare() });
