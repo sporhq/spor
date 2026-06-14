@@ -128,6 +128,45 @@ test('get (local) prints the node file; missing node exits 1', () => {
   assert.strictEqual(miss.status, 1);
 });
 
+test('add (local) writes a valid typed node that validate accepts', () => {
+  const { dir, nodes } = fixtureGraph();
+  const r = run(['add', 'Cache the tf-idf norms across compiles for speed', '--type', 'task'], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /added task-/);
+  const written = fs.readdirSync(nodes).filter((f) => f.startsWith('task-') && f !== 'dec-x.md');
+  assert.strictEqual(written.length, 1);
+  // the new graph still validates clean
+  const v = runLib('validate.js', ['--nodes', nodes]);
+  assert.strictEqual(v.status, 0);
+  assert.match(v.stdout, /0 errors/);
+});
+
+test('add (local) uniquifies the id on a repeated title', () => {
+  const { dir, nodes } = fixtureGraph();
+  run(['add', 'same title here', '--type', 'task'], { SPOR_HOME: dir });
+  run(['add', 'same title here', '--type', 'task'], { SPOR_HOME: dir });
+  const ids = fs.readdirSync(nodes).filter((f) => f.startsWith('task-same-title-here'));
+  assert.strictEqual(ids.length, 2, 'second add got a distinct id');
+});
+
+test('add with no text exits 1', () => {
+  const { dir } = fixtureGraph();
+  const r = run(['add'], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /usage/);
+});
+
+test('join writes server+token to user config (never repo)', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-join-'));
+  const r = run(['join', 'http://127.0.0.1:9/', 'tok123'], { SPOR_HOME: home });
+  // status confirmation runs against a dead server => still exits 0 (fail-open)
+  assert.strictEqual(r.status, 0);
+  const cfg = JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8'));
+  assert.strictEqual(cfg.server, 'http://127.0.0.1:9'); // trailing slash trimmed
+  assert.strictEqual(cfg.token, 'tok123');
+  assert.match(r.stdout, /OFFLINE/); // confirmation probe ran
+});
+
 test('remote verb fails open against an unreachable server (no stack trace)', () => {
   const r = run(['status'], { SPOR_SERVER: 'http://127.0.0.1:9', SPOR_TOKEN: 't' });
   assert.strictEqual(r.status, 0);

@@ -33,9 +33,11 @@ Usage: spor <verb> [args]
 Getting started
   init                 create the local graph home (nodes/, git, .gitignore)
   status               resolved mode, graph, project, identity, health
+  join <url> <token>   point the client at a graph (writes user config)
   whoami               who the team graph thinks you are (remote)
 
 Graph
+  add "<text>"         capture a node (local: typed file; remote: /v1/capture)
   next [--project S]   the decision queue (local: lib/queue; remote: /v1/queue)
   get <id>             a node by id (local: file; remote: /v1/nodes/<id>)
   compile <args>       full neighborhood / digest (local; byte-identical)
@@ -47,6 +49,13 @@ Other
   help                 this message
 
 Mode is set by config/env (SPOR_SERVER ⇒ remote). See 'spor status'.`;
+
+// A consumer that closes the pipe early (`spor next | head`) makes stdout emit
+// EPIPE; exit cleanly rather than crash with a stack trace.
+process.stdout.on("error", (e) => {
+  if (e && e.code === "EPIPE") process.exit(0);
+  throw e;
+});
 
 function out(s) {
   process.stdout.write(s + "\n");
@@ -236,6 +245,131 @@ function cmdCompile(cfg, verb, args) {
   return passthrough("compile.js", args);
 }
 
+// --- spor add / capture -------------------------------------------------
+// Local: write a well-formed node so a user never has to learn the frontmatter
+// (issue-cc-local-mode-capture-queue-surfacing-gap). Remote: POST /v1/capture,
+// where the server's ingestion model types it.
+function kebab(s) {
+  return String(s)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48)
+    .replace(/-+$/g, "");
+}
+function optVal(args, name) {
+  const i = args.indexOf(`--${name}`);
+  return i >= 0 && args[i + 1] != null ? args[i + 1] : null;
+}
+function today() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+async function cmdAdd(cfg, args) {
+  const prose = args.find((a) => !a.startsWith("--"));
+  if (!prose) {
+    err('usage: spor add "<text>" [--type T] [--title ...] [--project S]');
+    return 1;
+  }
+  const project = optVal(args, "project") || safeSlug();
+
+  if (cfg.mode() === "remote") {
+    const r = await remote.post(cfg, "/v1/capture", { text: prose, context: { project } });
+    if (r.transport) {
+      err(`offline — capture not shipped (${r.error}). It will be retried by the hooks' outbox in a normal session.`);
+      return 1;
+    }
+    if (!r.ok) {
+      err(`capture error ${r.status}`);
+      return 1;
+    }
+    const ids = (r.json && (r.json.ids || r.json.node_ids)) || [];
+    out(ids.length ? `captured: ${ids.join(", ")}` : `captured (${(r.json && r.json.status) || "ok"})`);
+    return 0;
+  }
+
+  // local: hand the user a typed, validated node file
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const nodesDir = cfg.nodesDir();
+  if (!fs.existsSync(nodesDir)) {
+    err(`no graph at ${nodesDir} — run 'spor init' first`);
+    return 1;
+  }
+  const type = optVal(args, "type") || "task";
+  const title = optVal(args, "title") || prose.split(/\s+/).slice(0, 10).join(" ");
+  const summary = prose.length > 500 ? prose.slice(0, 497) + "..." : prose;
+
+  let g;
+  try {
+    g = graphLib.loadGraph(nodesDir);
+  } catch (e) {
+    err(`could not load graph: ${e.message}`);
+    return 1;
+  }
+  const prefixes = (g.registry && g.registry.prefixesFor(type)) || null;
+  const prefix = prefixes && prefixes[0] ? prefixes[0] : `${type}-`;
+  let id = optVal(args, "id") || `${prefix}${kebab(title) || today()}`;
+  // uniquify against existing files
+  let n = 1;
+  let base = id;
+  while (fs.existsSync(path.join(nodesDir, `${id}.md`))) id = `${base}-${++n}`;
+
+  const md = `---\nid: ${id}\ntype: ${type}\nrepo: ${project}\ntitle: ${title.replace(/\n/g, " ")}\nsummary: ${summary.replace(/\n/g, " ")}\ndate: ${today()}\n---\n\n${prose}\n`;
+  // validate before writing (parse, then the same rules lib/validate enforces)
+  let node;
+  try {
+    node = graphLib.parseFrontmatter(md, `${id}.md`);
+  } catch (e) {
+    err(`invalid node: ${e.message}`);
+    return 1;
+  }
+  const v = graphLib.validateNode(g, node);
+  if (!v.ok) {
+    err(`invalid node:\n  ${v.errors.join("\n  ")}`);
+    return 1;
+  }
+  fs.writeFileSync(path.join(nodesDir, `${id}.md`), md);
+  out(`added ${id} (${type}) to ${nodesDir}`);
+  out(`  edit it to add edges/detail; 'spor next' will surface it.`);
+  return 0;
+}
+
+// --- spor join / login --------------------------------------------------
+// Write server+token to USER config (never a committable repo config), then
+// confirm immediately — the upgrade research found no one-step way to point a
+// client at a graph and know it took.
+async function cmdJoin(cfg, args) {
+  const positional = args.filter((a) => !a.startsWith("--"));
+  const server = optVal(args, "server") || positional[0];
+  const token = optVal(args, "token") || positional[1];
+  if (!server) {
+    err("usage: spor join <server-url> <token>");
+    return 1;
+  }
+  const home = cfg.graphHome();
+  const cfgFile = path.join(home, "config.json");
+  let data = {};
+  try {
+    data = JSON.parse(fs.readFileSync(cfgFile, "utf8")) || {};
+  } catch {
+    /* absent or malformed — start fresh */
+  }
+  data.server = server.replace(/\/+$/, "");
+  if (token) data.token = token;
+  try {
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(cfgFile, JSON.stringify(data, null, 2) + "\n");
+  } catch (e) {
+    err(`could not write ${cfgFile}: ${e.message}`);
+    return 1;
+  }
+  out(`wrote server${token ? " + token" : ""} to ${cfgFile}`);
+  if (!token) out(`note: no token given — set SPOR_TOKEN or 'spor join <server> <token>' to authenticate`);
+  // confirm against the freshly-written config
+  const fresh = loadConfig({ cwd: process.cwd() });
+  return await cmdStatus(fresh);
+}
+
 function safeSlug() {
   try {
     return u.projectSlug(process.cwd());
@@ -276,6 +410,12 @@ async function main() {
       return await cmdStatus(cfg);
     case "whoami":
       return await cmdWhoami(cfg);
+    case "join":
+    case "login":
+      return await cmdJoin(cfg, args);
+    case "add":
+    case "capture":
+      return await cmdAdd(cfg, args);
     case "next":
     case "queue":
       return await cmdNext(cfg, args);
