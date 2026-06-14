@@ -15,9 +15,14 @@ The name is Norwegian — *spor*, the track something leaves.
 Create the graph home (this is yours, kept outside any code repo):
 
 ```bash
-mkdir -p ~/.spor/nodes && git -C ~/.spor init \
-  && printf 'journal/\n' > ~/.spor/.gitignore
+spor init        # creates ~/.spor/nodes, git-inits it, writes .gitignore
 ```
+
+`spor init` is idempotent. `spor status` then tells you the resolved mode,
+graph, project, and (in remote mode) server health and identity — run it any
+time you're unsure whether Spor is active or which graph you're on. (Without
+the `spor` CLI on your PATH the equivalent is
+`mkdir -p ~/.spor/nodes && git -C ~/.spor init && printf 'journal/\n' > ~/.spor/.gitignore`.)
 
 Then install for your agent. In Claude Code:
 

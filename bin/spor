@@ -1,0 +1,6 @@
+#!/bin/sh
+# spor — POSIX shim over the Node CLI (spor.js), so the unified client CLI is
+# one command on PATH. Windows hosts invoke spor.js via node (or spor.cmd).
+# Fail-soft: no node, no output, exit 0 (matches the spor-hook shim).
+command -v node >/dev/null 2>&1 || exit 0
+exec node "$(dirname "$0")/spor.js" "$@"
