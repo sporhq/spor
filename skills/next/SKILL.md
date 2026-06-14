@@ -59,10 +59,16 @@ parked by a `wake:` date — never silently dropped). Then:
    (/spor:brief `<item-id>`, or locally with `$SPOR_ROOT` resolved as above:
    `node "$SPOR_ROOT/lib/compile.js" --root <item-id>`) and begin
    from that briefing.
-2. **Item picked to CLOSE** (or `suggest: close` confirmed) → flip the
-   node's `status:` with `set_status` (one call, no revision round-trip;
-   locally edit the file). If the reason deserves recording, note it in the
-   body via `put_node`.
+2. **Item picked to CLOSE** (or `suggest: close` confirmed) → for a `task`
+   (`done`) or `issue` (`resolved`), the completion-resolver gate requires a
+   durable why ON THE GRAPH first: write a `decision` (the why, for a
+   substantive close) or a brief `artifact` (a few lines of what was done, like
+   a commit message, for a trivial one) carrying a `resolves` edge to the item,
+   THEN flip `status:` with `set_status`. A bare flip with no
+   `decision`/`artifact` resolver is denied at the door
+   (task-cc-terminal-status-requires-resolver). `abandoned` (task) is exempt —
+   won't-do work records nothing, so a plain `set_status` is fine. (Locally,
+   write the resolver node file and add the edge, then edit the status.)
 3. **`capture-pending` item** → read it (`GET /v1/nodes/<id>`), decide what
    it should have been, write the proper node(s), then close the pending node
    with `set_status`: `merged` when its content now lives in the node(s) you

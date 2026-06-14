@@ -85,8 +85,8 @@ Rules:
 | type       | prefix    | what it is                                                |
 |------------|-----------|-----------------------------------------------------------|
 | decision   | `dec-`    | a choice that was made, with the why (status `active`/`superseded`/`rejected`, gated) |
-| task       | `task-`   | active or planned work (status `open`/`active`/`done`/`abandoned`, gated) |
-| issue      | `issue-`  | a defect/finding and its resolution lineage (queueable: open issues join the decision queue; status `open`/`active`/`resolved`, gated) |
+| task       | `task-`   | active or planned work (status `open`/`active`/`done`/`abandoned`, gated; `done` requires a `decision`/`artifact` resolver — see below) |
+| issue      | `issue-`  | a defect/finding and its resolution lineage (queueable: open issues join the decision queue; status `open`/`active`/`resolved`, gated; `resolved` requires a `decision`/`artifact` resolver — see below) |
 | incident   | `inc-`    | something that went wrong in operation (queueable: live incidents join the decision queue) |
 | artifact   | `spec-`, `art-` | a document, spec, module, or build product worth referencing |
 | norm       | `norm-`   | a standing convention or constraint (rides along in every project-relevant compile) |
@@ -98,6 +98,19 @@ Rules:
 | finding    | `find-`   | a gardener observation about another node, filed as a queue item (QUEUE.md §6) |
 | repo       | `repo-`   | durable git-repo identity: slug aliases + repo fingerprints; heals renames at read time (below) |
 | project    | `proj-`   | a grouping above repos; owns its member repos via inbound `grouped-under` edges (below) |
+
+## Completing work needs a durable why (the resolver gate)
+
+A `task` reaching `done`, or an `issue` reaching `resolved`, requires a **live
+inbound `resolves` edge from a `decision` or `artifact` node** — the
+completion-resolver gate in those types' `transitions()`
+(task-cc-terminal-status-requires-resolver). The point is that the outcome
+lives ON THE GRAPH, where the neighborhood can surface it, instead of evaporating
+into a status flip: a heavyweight closure earns a `decision` (the why), a
+trivial one earns a few-line `artifact` (what was done, like a commit message) —
+either satisfies the gate. `abandoned` (task) is exempt: won't-do work produces
+nothing to record. The gate runs at write time on UPDATE only (the create path
+is ungated); it is backward-readable, so existing terminal nodes are untouched.
 
 ## Norm ride-along
 

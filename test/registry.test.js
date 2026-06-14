@@ -577,6 +577,9 @@ test("seed pack: capture-pending transitions() gates triage to merged/rejected",
 test("seed pack: core type schemas gate status to their vocabulary", () => {
   const reg = graph.seedRegistry();
   const SLACK = { timeoutMs: 5000 };
+  // A view that satisfies the completion-resolver gate (task done / issue
+  // resolved), so this case isolates the VOCABULARY gate from the resolver one.
+  const RESOLVED_VIEW = { resolvers: [{ id: "dec-x", type: "decision", status: "active" }] };
   const cases = {
     task: { ok: ["open", "active", "done", "abandoned", ""], bad: ["dismissed", "resolved", "merged", "wip"] },
     issue: { ok: ["open", "active", "resolved", ""], bad: ["dismissed", "done", "closed"] },
@@ -586,8 +589,8 @@ test("seed pack: core type schemas gate status to their vocabulary", () => {
   for (const [type, { ok, bad }] of Object.entries(cases)) {
     const sb = sandboxFor(reg.nodeSchemas.get(type));
     assert.deepEqual(sb.names, ["transitions"], `${type} exports transitions()`);
-    const gate = (status) =>
-      sb.call("transitions", [{ id: `${type}-x`, status: "" }, { id: `${type}-x`, status }, {}], SLACK);
+    const gate = (status, view = RESOLVED_VIEW) =>
+      sb.call("transitions", [{ id: `${type}-x`, status: "" }, { id: `${type}-x`, status }, view], SLACK);
     for (const s of ok) assert.equal(gate(s).allow, true, `${type}: '${s}' should be allowed`);
     for (const s of bad) {
       const r = gate(s);
@@ -595,6 +598,28 @@ test("seed pack: core type schemas gate status to their vocabulary", () => {
       assert.match(r.reason, new RegExp(s), `${type}: reason should name the rejected value`);
     }
     // create path always allowed.
-    assert.equal(sb.call("transitions", [undefined, { id: `${type}-x` }, {}], SLACK).allow, true);
+    assert.equal(sb.call("transitions", [undefined, { id: `${type}-x` }, RESOLVED_VIEW], SLACK).allow, true);
   }
+});
+
+test("seed pack: task done / issue resolved require a decision or artifact resolver", () => {
+  const reg = graph.seedRegistry();
+  const SLACK = { timeoutMs: 5000 };
+  const gateFor = (type, terminal) => {
+    const sb = sandboxFor(reg.nodeSchemas.get(type));
+    return (view) => sb.call("transitions", [{ id: `${type}-x`, status: "active" }, { id: `${type}-x`, status: terminal }, view], SLACK);
+  };
+  for (const [type, terminal] of [["task", "done"], ["issue", "resolved"]]) {
+    const gate = gateFor(type, terminal);
+    const none = gate({ resolvers: [] });
+    assert.equal(none.allow, false, `${type} ${terminal} denied without a resolver`);
+    assert.match(none.reason, /decision or artifact/, `${type}: actionable reason`);
+    assert.equal(gate({ resolvers: [{ id: "task-y", type: "task" }] }).allow, false, `${type}: a non-decision/artifact resolver does not satisfy the gate`);
+    assert.equal(gate({ resolvers: [{ id: "dec-y", type: "decision" }] }).allow, true, `${type}: a decision resolver allows ${terminal}`);
+    assert.equal(gate({ resolvers: [{ id: "art-y", type: "artifact" }] }).allow, true, `${type}: an artifact resolver allows ${terminal}`);
+    assert.equal(gate(undefined).allow, false, `${type}: a missing view is treated as no resolver`);
+  }
+  // `abandoned` (task) is exempt — won't-do work produces nothing to record.
+  const taskGate = gateFor("task", "abandoned");
+  assert.equal(taskGate({ resolvers: [] }).allow, true, "abandoned needs no resolver");
 });

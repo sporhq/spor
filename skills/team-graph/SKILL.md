@@ -63,6 +63,11 @@ to you, and commits it.
 - For a single relationship or a status flip on an EXISTING node, prefer the
   micro-mutations: `add_edge {id, type, to}` and `set_status {id, status}` —
   one call, no `get_node`/revision round-trip, duplicate edges are a no-op.
+  Closing work needs the why on the graph first: a `task` → `done` or `issue`
+  → `resolved` is denied unless a `decision` or `artifact` node `resolves` it
+  (task-cc-terminal-status-requires-resolver). Write that resolver (a few-line
+  artifact is enough for a trivial close) and `add_edge` a `resolves` to the
+  item, THEN `set_status`. `abandoned` (task) is exempt.
 - Don't upload personal scratch — only promote facts the whole team should share.
 
 ## When a briefing or digest was wrong
