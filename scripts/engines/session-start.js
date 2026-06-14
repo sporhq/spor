@@ -25,6 +25,26 @@ function envelope(ctx) {
   return { hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: ctx } };
 }
 
+// Project grouping brief (task-cc-grouping-brief-digest-reads): the briefing
+// response may carry a `project_brief` for the `type: project` grouping this
+// repo is grouped-under (the product layer above the per-repo brief). Format it
+// as an additional block injected alongside the repo brief; "" when absent.
+// Fail-open: any malformed payload yields no block.
+function projectBriefBlock(resp) {
+  try {
+    const pb = resp?.project_brief;
+    if (!pb || !pb.body) return "";
+    const v = pb.version ?? 1;
+    return `
+
+## Standing PRODUCT briefing (${pb.id} v${v}, the grouping above this repo — context spanning every repo in the product)
+
+${u.byteHead(u.stripTrailingNewlines(pb.body), 7000)}`;
+  } catch {
+    return "";
+  }
+}
+
 // Body of a node file = everything after the second '---' line, like
 // `awk 'f{print} /^---$/{c++; if(c==2)f=1}'` (then head -c 7000 and the
 // command-substitution trailing-newline strip).
@@ -153,13 +173,13 @@ async function sessionStart(input) {
 
 ## Standing project briefing (brief-${slug} v${version}, machine-compiled from the team graph — correct it with /spor:correct, don't silently work around errors)
 
-${u.byteHead(body, 7000)}`;
+${u.byteHead(body, 7000)}${projectBriefBlock(resp)}`;
         return envelope(ctx);
       }
       // 200 but no briefing for this project: still note the graph status.
       rlog(`briefing not found for ${slug} (${ncount} nodes)`);
       return envelope(
-        `team graph: ${ncount} nodes @ ${host} (no standing briefing for ${slug} yet). ${USAGE_REMOTE}${qline}${oline}`
+        `team graph: ${ncount} nodes @ ${host} (no standing briefing for ${slug} yet). ${USAGE_REMOTE}${qline}${oline}${projectBriefBlock(resp)}`
       );
     }
 
@@ -359,6 +379,37 @@ ${u.byteHead(digestBody, 7000)}`;
     } catch {
       /* fail open */
     }
+  }
+
+  // Project grouping brief, local mode (task-cc-grouping-brief-digest-reads): if
+  // this repo is grouped-under a `type: project` grouping that has its own
+  // brief-<grouping> node on disk, inject it alongside the repo brief so solo
+  // sessions get the same product-level context remote mode returns. Fail open;
+  // graphs without a grouping brief are byte-identical to before.
+  try {
+    if (g) {
+      const repoKey = g.projectAliases?.[slug] ?? slug;
+      const gr = g.groupingRepos || {};
+      let groupingId = gr[repoKey] ? repoKey : null;
+      if (!groupingId) for (const [gid, set] of Object.entries(gr)) if (set.has(repoKey)) { groupingId = gid; break; }
+      if (groupingId) {
+        const pbFile = path.join(nodes, `brief-${groupingId}.md`);
+        if (fs.existsSync(pbFile)) {
+          const raw = fs.readFileSync(pbFile, "utf8");
+          const pbody = nodeBody(raw);
+          const pver = raw.match(/^version: *(.*)$/m)?.[1] ?? "";
+          if (pbody) {
+            ctx += `
+
+## Standing PRODUCT briefing (brief-${groupingId} v${pver || "1"}, the grouping above brief-${slug} — context spanning every repo in the product)
+
+${pbody}`;
+          }
+        }
+      }
+    }
+  } catch {
+    /* fail open */
   }
 
   return envelope(ctx);

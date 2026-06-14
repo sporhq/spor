@@ -226,6 +226,43 @@ test('rankQueue: a grouping id unions its member repos; a repo slug stays single
   assert.deepEqual(single, ['task-a']);
 });
 
+// ungrouped repo node (no grouped-under edge), unlike the repoNode helper
+const repoSolo = ['repo-solo.md',
+  `---\nid: repo-solo\ntype: repo\ntitle: repo-solo\nsummary: Solo repo.\nslugs: [solo]\ndate: 2026-06-01\n---\nbody`];
+
+test('groupingOf: a member repo and the grouping id both resolve to the grouping; ungrouped -> null (task-cc-grouping-brief-digest-reads)', () => {
+  const g = tmpGraph(Object.fromEntries([
+    groupingNode('proj-g'),
+    repoNode('repo-a', 'a', 'proj-g'),
+    repoNode('repo-b', 'b', 'proj-g'),
+    repoSolo,
+  ])).load();
+  assert.equal(graph.groupingOf(g, 'repo-a'), 'proj-g'); // member repo -> its grouping
+  assert.equal(graph.groupingOf(g, 'repo-b'), 'proj-g');
+  assert.equal(graph.groupingOf(g, 'proj-g'), 'proj-g'); // grouping id maps to itself
+  assert.equal(graph.groupingOf(g, 'repo-solo'), null);  // ungrouped repo
+  assert.equal(graph.groupingOf(g, 'nonexistent'), null);
+});
+
+test('compile boost spans the grouping: a sibling-repo node outranks an equally-relevant foreign one (task-cc-grouping-brief-digest-reads)', () => {
+  const g = tmpGraph(Object.fromEntries([
+    groupingNode('proj-g'),
+    repoNode('repo-a', 'a', 'proj-g'),
+    repoNode('repo-b', 'b', 'proj-g'),
+    repoSolo,
+    task('task-sibling', 'b', ''),   // grouped with the session repo 'a'
+    task('task-foreign', 'solo', ''),
+  ])).load();
+  // Session in repo 'a' (a member of proj-g): the sibling-repo node shares the
+  // grouping so it is boosted (same-project) while the foreign one is not.
+  const r = graph.compile(g, { query: 'Standalone summary task', digest: true, project: 'a' });
+  assert.ok(r.relevant, 'query is relevant');
+  const sib = r.text.indexOf('task-sibling');
+  const frn = r.text.indexOf('task-foreign');
+  assert.ok(sib !== -1, 'sibling-repo node surfaces');
+  assert.ok(frn === -1 || sib < frn, `sibling should outrank foreign: sib=${sib} frn=${frn}`);
+});
+
 // ---------- stamp field: repo: with legacy project: (task-cc-repo-stamp-field-rename) ----------
 
 test('parseFrontmatter: repo: stamp populates n.project; legacy project: still read; repo: wins', () => {
