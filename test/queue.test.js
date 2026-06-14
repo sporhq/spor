@@ -679,3 +679,41 @@ test("needed_by: an unparseable date fails open to no urgency and warns", () => 
   const v = graph.validateGraph(t.nodesDir);
   assert.ok(v.warnings.some((w) => w.includes("needed_by 'soon' is not a parseable date")), v.warnings.join("; "));
 });
+
+// --- cross-project provenance in the why-line (task-cc-xproject-dependency-loop) ---
+// A blocks relationship that crosses a project boundary names the other side
+// and its project; same-project relationships render exactly as before.
+test("provenance: a serving blocker names the cross-project requester it serves", () => {
+  const g = tmpGraph(Object.fromEntries([
+    // task-dep lives in the SERVING project and blocks a requester in another.
+    node("task-dep", "task", { project: "spor", status: "open", edges: [["blocks", "task-req"]] }),
+    node("task-req", "task", { project: "wf", status: "open" }),
+  ])).load();
+  const items = rankQueue(g, { now: NOW }).items;
+  const dep = items.find((i) => i.id === "task-dep");
+  const req = items.find((i) => i.id === "task-req");
+  assert.match(dep.why, /blocks 1 live node across projects: task-req \(wf\)/);
+  assert.match(req.why, /blocked by task-dep \(spor\) — do the unblocker first/);
+});
+
+test("provenance: a same-project blocker renders the bare count and id (unchanged)", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-up", "task", { project: "p1", status: "open", edges: [["blocks", "task-down"]] }),
+    node("task-down", "task", { project: "p1", status: "open" }),
+  ])).load();
+  const items = rankQueue(g, { now: NOW }).items;
+  assert.match(items.find((i) => i.id === "task-up").why, /blocks 1 live node\b/);
+  assert.match(items.find((i) => i.id === "task-down").why, /blocked by task-up — do the unblocker first/);
+  assert.doesNotMatch(items.find((i) => i.id === "task-up").why, /across projects/);
+});
+
+test("provenance: mixed blockers annotate only the cross-project one", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-mixed", "task", { project: "home", status: "open" }),
+    node("task-same", "task", { project: "home", status: "open", edges: [["blocks", "task-mixed"]] }),
+    node("task-ext", "task", { project: "other", status: "open", edges: [["blocks", "task-mixed"]] }),
+  ])).load();
+  // blockers list in node-id sort order: task-ext then task-same.
+  const why = rankQueue(g, { now: NOW }).items.find((i) => i.id === "task-mixed").why;
+  assert.match(why, /blocked by task-ext \(other\), task-same — do the unblocker first/);
+});
