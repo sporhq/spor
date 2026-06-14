@@ -25,7 +25,7 @@ function tmpGraph(files) {
   return { dir, nodesDir, load: () => graph.loadGraph(nodesDir) };
 }
 
-const node = (id, type, { status, project = "my-project", date = "2026-06-01", priority, edges = [] } = {}) => [
+const node = (id, type, { status, project = "my-project", date = "2026-06-01", priority, needed_by, edges = [] } = {}) => [
   `${id}.md`,
   `---
 id: ${id}
@@ -33,7 +33,7 @@ type: ${type}
 project: ${project}
 title: Title of ${id}
 summary: Standalone summary for ${id} used by queue tests.
-${status ? `status: ${status}\n` : ""}${priority ? `priority: ${priority}\n` : ""}date: ${date}
+${status ? `status: ${status}\n` : ""}${priority ? `priority: ${priority}\n` : ""}${needed_by ? `needed_by: ${needed_by}\n` : ""}date: ${date}
 ${edges.length ? `edges:\n${edges.map((e) => `  - {type: ${e[0]}, to: ${e[1]}}`).join("\n")}\n` : ""}---
 Body of ${id}.
 `,
@@ -605,4 +605,77 @@ test("wake: dormant wins over muted in the counts — graph state before persona
   const r = rankQueue(g, { now: NOW, viewer: { queue_mute: ["task-later"] } });
   assert.equal(r.dormant, 1);
   assert.equal(r.muted, undefined);
+});
+
+// --- needed_by: deadline urgency (task-cc-xproject-dependency-loop) ----------
+// NOW is 2026-06-11. The term ramps 0 -> 3 over the 30-day window to the date,
+// then 3 -> 5 once overdue. Absent/unparseable contributes exactly 0, so a node
+// without needed_by scores byte-identically to before the term existed.
+test("needed_by: a node without a deadline carries no needed_by signal", () => {
+  const g = tmpGraph(Object.fromEntries([node("task-plain", "task")])).load();
+  const it = rankQueue(g, { now: NOW }).items[0];
+  assert.equal("needed_by_days" in it.signals, false);
+});
+
+test("needed_by: far-future deadline is visible but contributes no score yet", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-base", "task"),
+    node("task-far", "task", { needed_by: "2026-08-01" }), // 51d out, beyond the 30d window
+  ])).load();
+  const items = rankQueue(g, { now: NOW }).items;
+  const base = items.find((i) => i.id === "task-base");
+  const far = items.find((i) => i.id === "task-far");
+  assert.equal(far.score, base.score);          // urgency 0 beyond the window
+  assert.equal(far.signals.needed_by_days, 51); // but the deadline still shows
+  assert.match(far.why, /needed by 2026-08-01 \(51d\)/);
+});
+
+test("needed_by: due today adds exactly NEAR (3) and ramps linearly mid-window", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-base", "task"),
+    node("task-today", "task", { needed_by: "2026-06-11" }), // d=0
+    node("task-mid", "task", { needed_by: "2026-06-26" }),   // d=15 -> 3*(15/30)=1.5
+  ])).load();
+  const items = rankQueue(g, { now: NOW }).items;
+  const base = items.find((i) => i.id === "task-base").score;
+  const today = items.find((i) => i.id === "task-today");
+  const mid = items.find((i) => i.id === "task-mid").score;
+  assert.equal(Number((today.score - base).toFixed(2)), 3);
+  assert.equal(Number((mid - base).toFixed(2)), 1.5);
+  assert.equal(today.signals.needed_by_days, 0);
+  assert.match(today.why, /needed by 2026-06-11 \(0d\)/);
+});
+
+test("needed_by: overdue caps at NEAR+OVERDUE (5) and renders OVERDUE", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-base", "task"),
+    node("task-late", "task", { needed_by: "2026-05-01" }), // 41d overdue -> capped
+  ])).load();
+  const items = rankQueue(g, { now: NOW }).items;
+  const base = items.find((i) => i.id === "task-base").score;
+  const late = items.find((i) => i.id === "task-late");
+  assert.equal(Number((late.score - base).toFixed(2)), 5);
+  assert.equal(late.signals.needed_by_days, -41);
+  assert.match(late.why, /OVERDUE — needed by 2026-05-01 \(41d ago\)/);
+});
+
+test("needed_by: an overdue deadline outranks an identical fresh task", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-quiet", "task"),
+    node("task-urgent", "task", { needed_by: "2026-05-20" }),
+  ])).load();
+  const ids = rankQueue(g, { now: NOW }).items.map((i) => i.id);
+  assert.deepEqual(ids, ["task-urgent", "task-quiet"]);
+});
+
+test("needed_by: an unparseable date fails open to no urgency and warns", () => {
+  const t = tmpGraph(Object.fromEntries([
+    node("task-bad-due", "task", { needed_by: "soon" }),
+  ]));
+  const g = t.load();
+  const it = rankQueue(g, { now: NOW }).items[0];
+  assert.equal("needed_by_days" in it.signals, false); // no boost, no crash
+  assert.doesNotMatch(it.why, /needed by/);
+  const v = graph.validateGraph(t.nodesDir);
+  assert.ok(v.warnings.some((w) => w.includes("needed_by 'soon' is not a parseable date")), v.warnings.join("; "));
 });

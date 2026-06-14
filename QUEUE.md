@@ -509,8 +509,15 @@ the structural truth:
    core for now — per-schema `queueSignals()` attached code joins via the
    §2.4 sandbox in step 4 alongside `transitions()`. The blend shipped
    opinionated (§8): `priority bump + 3·blocking − 3·blocked_by +
-   min(log₂(1+front), 5) + log₂(1+heat) + age/30 (capped)`, with staleness ≥ 0.5 flipping the item's suggestion to
-   "close". The blocking boost has its inverse
+   min(log₂(1+front), 5) + log₂(1+heat) + age/30 (capped) + neededBy urgency (0-5)`, with staleness ≥ 0.5 flipping the item's suggestion to
+   "close". The `needed_by: YYYY-MM-DD` deadline term is the inverse of
+   `wake`: where `wake` hides a node until its date, `needed_by` keeps it
+   visible from creation and ramps its score linearly over a 30-day window to
+   3 at the date, then on to a hard cap of 5 once overdue — surfacing
+   cross-cutting dependencies in the serving team's queue early
+   (task-cc-xproject-dependency-loop). Kept single-digit so it never dominates
+   (issue-cc-queue-blend-heat-dominance); hard overdue escalation past the cap
+   is the gardener's job (task-cc-dormancy-escalation). The blocking boost has its inverse
    (issue-cc-queue-ranking-asymmetry): an item gated by a live, unresolved
    blocker is penalized per blocker, flips to `suggest: blocked`, names its
    blockers in the why, and — because heat is neighborhood-shared and would
