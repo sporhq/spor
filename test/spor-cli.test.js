@@ -187,6 +187,35 @@ test('link writes the .spor marker; rejects a non-canonical slug', () => {
   assert.match(bad.stderr, /invalid slug/);
 });
 
+test('invite/token require remote mode (local explains why)', () => {
+  const { dir } = fixtureGraph();
+  const inv = run(['invite', '--person', 'person-x'], { SPOR_HOME: dir });
+  assert.strictEqual(inv.status, 1);
+  assert.match(inv.stderr, /team graph/);
+  const tok = run(['token', 'list'], { SPOR_HOME: dir });
+  assert.strictEqual(tok.status, 1);
+  assert.match(tok.stderr, /remote/);
+});
+
+test('invite with neither --person nor --name/--email exits 1 with usage', () => {
+  const r = run(['invite'], { SPOR_SERVER: 'http://127.0.0.1:9', SPOR_TOKEN: 't' });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /usage/);
+});
+
+test('token revoke without a prefix exits 1', () => {
+  const r = run(['token', 'revoke'], { SPOR_SERVER: 'http://127.0.0.1:9', SPOR_TOKEN: 't' });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /usage/);
+});
+
+test('invite fails open against an unreachable server', () => {
+  const r = run(['invite', '--person', 'person-x'], { SPOR_SERVER: 'http://127.0.0.1:9', SPOR_TOKEN: 't' });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /offline/);
+  assert.doesNotMatch(r.stderr, /at Object|Error:/);
+});
+
 test('remote verb fails open against an unreachable server (no stack trace)', () => {
   const r = run(['status'], { SPOR_SERVER: 'http://127.0.0.1:9', SPOR_TOKEN: 't' });
   assert.strictEqual(r.status, 0);

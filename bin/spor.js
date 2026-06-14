@@ -36,6 +36,10 @@ Getting started
   join <url> <token>   point the client at a graph (writes user config)
   whoami               who the team graph thinks you are (remote)
 
+Team admin (remote, admin token)
+  invite --person <id> | --name <n> --email <e>   mint a teammate token
+  token list | token revoke <prefix>              manage tokens
+
 Graph
   add "<text>"         capture a node (local: typed file; remote: /v1/capture)
   next [--project S]   the decision queue (local: lib/queue; remote: /v1/queue)
@@ -152,7 +156,8 @@ async function identity(cfg) {
   if (r.ok && r.json) {
     const p = r.json.person || r.json.id;
     const bound = r.json.bound;
-    if (p) return `${p}${r.json.email ? ` <${r.json.email}>` : ""}${bound === false ? "  ⚠ token maps to NO person node" : ""}`;
+    const admin = r.json.is_admin ? "  (admin)" : "";
+    if (bound && p) return `${p}${r.json.email ? ` <${r.json.email}>` : ""}${admin}`;
     return `⚠ token maps to no person node — routed questions and personal queue will be empty`;
   }
   return `unknown (status ${r.status})`;
@@ -374,6 +379,126 @@ async function cmdJoin(cfg, args) {
   return await cmdStatus(fresh);
 }
 
+// --- spor invite / token: admin onboarding (wraps /v1/admin/tokens) --------
+// Remote + admin only (the server gates on the stewards→root edge). invite
+// mints a person-bound token and prints a paste-ready join line, optionally
+// creating the person node first — closing the blind, out-of-band token
+// hand-off the team-onboarding research flagged.
+function notAdminHint(r) {
+  if (r.status === 403) {
+    err("forbidden — admin privilege required (a stewards→root edge AND a person-bound token).");
+    err("your token may be legacy/email-matched; check 'spor whoami' (is_admin).");
+    return true;
+  }
+  return false;
+}
+
+async function cmdInvite(cfg, args) {
+  if (cfg.mode() !== "remote") {
+    err("invite needs a team graph — set SPOR_SERVER/SPOR_TOKEN (see 'spor join').");
+    return 1;
+  }
+  let person = optVal(args, "person");
+  const name = optVal(args, "name");
+  const email = optVal(args, "email");
+  const expires = optVal(args, "expires");
+
+  // create the person node first when only name/email is given (the mint
+  // endpoint binds to an EXISTING node, it cannot conjure a subject).
+  if (!person) {
+    if (!name || !email) {
+      err("usage: spor invite --person <id> [--expires <Nd>]");
+      err("   or: spor invite --name <name> --email <email> [--id person-x] [--expires <Nd>]");
+      return 1;
+    }
+    person = optVal(args, "id") || `person-${kebab(name)}`;
+    const md = `---\nid: ${person}\ntype: person\ntitle: ${name.replace(/\n/g, " ")}\nsummary: Team member ${name}.\nemail: ${email}\ndate: ${today()}\n---\n\nTeam member ${name} <${email}>.\n`;
+    const pr = await remote.post(cfg, "/v1/nodes", { nodes: [{ node: md, if_exists: "skip" }] });
+    if (pr.transport) {
+      err(`offline — could not reach server (${pr.error})`);
+      return 1;
+    }
+    if (notAdminHint(pr)) return 1;
+    const res0 = pr.json && pr.json.results && pr.json.results[0];
+    if (!pr.ok && !(res0 && res0.ok)) {
+      err(`could not create person node: ${(res0 && res0.message) || pr.status}`);
+      return 1;
+    }
+    out(`person node ${person} ${res0 && res0.status === "skipped" ? "(already existed)" : "created"}`);
+  }
+
+  const r = await remote.post(cfg, "/v1/admin/tokens", { person, ...(expires ? { expires } : {}) });
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (notAdminHint(r)) return 1;
+  if (r.status === 404) {
+    err(`no such person node '${person}' — pass --name/--email to create one`);
+    return 1;
+  }
+  if (!r.ok) {
+    err(`mint failed (${r.status}): ${(r.json && r.json.error && r.json.error.message) || r.text}`);
+    return 1;
+  }
+  const j = r.json;
+  out(`minted token for ${j.person} <${j.email}>${j.expires ? ` (expires ${j.expires})` : ""} [${j.hash_prefix}]`);
+  out(`  give this to the teammate ONCE — it is not recoverable:\n`);
+  out(`  spor join ${remote.base(cfg)} ${j.token}\n`);
+  out(`  revoke later with: spor token revoke ${j.hash_prefix}`);
+  return 0;
+}
+
+async function cmdToken(cfg, args) {
+  if (cfg.mode() !== "remote") {
+    err("token admin needs a team graph (remote mode).");
+    return 1;
+  }
+  const sub = args[0];
+  if (sub === "list") {
+    const r = await remote.get(cfg, "/v1/admin/tokens");
+    if (r.transport) {
+      err(`offline (${r.error})`);
+      return 1;
+    }
+    if (notAdminHint(r)) return 1;
+    if (!r.ok) {
+      err(`error ${r.status}`);
+      return 1;
+    }
+    const toks = (r.json && r.json.tokens) || [];
+    if (!toks.length) {
+      out("no tokens");
+      return 0;
+    }
+    for (const t of toks) {
+      out(`${t.hash_prefix}  ${t.person || t.email || "?"}${t.expired ? "  EXPIRED" : ""}${t.expires ? `  (expires ${t.expires})` : ""}`);
+    }
+    return 0;
+  }
+  if (sub === "revoke") {
+    const prefix = args[1];
+    if (!prefix) {
+      err("usage: spor token revoke <hash-prefix>");
+      return 1;
+    }
+    const r = await remote.del(cfg, `/v1/admin/tokens/${encodeURIComponent(prefix)}`);
+    if (r.transport) {
+      err(`offline (${r.error})`);
+      return 1;
+    }
+    if (notAdminHint(r)) return 1;
+    if (!r.ok) {
+      err(`revoke failed (${r.status}): ${(r.json && r.json.error && r.json.error.message) || r.text}`);
+      return 1;
+    }
+    out(`revoked ${r.json.hash_prefix}${r.json.oauth_grants_revoked ? ` (+${r.json.oauth_grants_revoked} oauth grants)` : ""}`);
+    return 0;
+  }
+  err("usage: spor token list | spor token revoke <hash-prefix>");
+  return 1;
+}
+
 function safeSlug() {
   try {
     return u.projectSlug(process.cwd());
@@ -475,6 +600,10 @@ async function main() {
       return cmdScope(false);
     case "link":
       return cmdLink(args);
+    case "invite":
+      return await cmdInvite(cfg, args);
+    case "token":
+      return await cmdToken(cfg, args);
     case "next":
     case "queue":
       return await cmdNext(cfg, args);
