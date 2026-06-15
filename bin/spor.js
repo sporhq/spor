@@ -54,6 +54,7 @@ Repo scoping
   validate             lint the local graph (byte-identical)
 
 Other
+  cost [--since D]      LLM spend summary from journal/llm-calls (local)
   version              print version
   help                 this message
 
@@ -700,6 +701,8 @@ async function main() {
       return cmdCompile(cfg, verb, args);
     case "validate":
       return passthrough("validate.js", args);
+    case "cost":
+      return passthrough("cost.js", args); // local: LLM spend summary
     default:
       err(`spor: unknown verb '${verb}'. Try 'spor help'.`);
       return 1;

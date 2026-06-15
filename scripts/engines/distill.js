@@ -106,6 +106,11 @@ function parseFactBlocks(response) {
 
 async function distill(input) {
   if (process.env.SPOR_DISTILLING || process.env.SUBSTRATE_DISTILLING) return null;
+  // User kill switch, symmetric with the nudge's SPOR_NUDGE=0 (post-tool.js):
+  // SPOR_DISTILL=0 (env) or distill.enabled:false (config) disables the paid
+  // SessionEnd distill call. No active config falls back to the exact env
+  // dual-read, so unset behavior is byte-identical (default "1").
+  if (u.config() ? !u.config().getBool("distill.enabled", true) : (u.envDual("DISTILL") ?? "1") === "0") return null;
 
   const graph = u.graphHome();
   const nodes = path.join(graph, "nodes");
@@ -207,6 +212,12 @@ async function distill(input) {
   const llmDir = path.join(graph, "journal", "llm-calls");
   const t0 = Date.now();
   let backend = "";
+  // Token usage / cost when the backend reports it (the default claude -p JSON
+  // path does; SPOR_DISTILL_CMD backends cannot over the stdin->stdout text
+  // contract, so they stay null) — task-cc-spor-client-spend-visibility.
+  let usage = null;
+  let cost_usd = null;
+  let model = null;
   const recordLlm = (response, error) => {
     if (!u.ensureDir(llmDir)) return;
     const rec = {
@@ -219,6 +230,9 @@ async function distill(input) {
       session,
       project: slug,
       latency_ms: Date.now() - t0,
+      usage,
+      cost_usd,
+      model,
       prompt,
       vars: { SLUG: slug, DATE: date, INDEX: index, TOUCHED: touched, CONVO: convo },
       response: error === "" ? response : null,
@@ -239,12 +253,16 @@ async function distill(input) {
     }
   } else {
     backend = "cli:claude -p --model haiku";
-    response = u.runClaudeBackend(prompt);
-    if (response === null) {
+    const res = u.runClaudeBackend(prompt);
+    if (res === null) {
       recordLlm("", "claude -p failed");
       log("claude -p failed");
       return null;
     }
+    response = res.text;
+    usage = res.usage;
+    cost_usd = res.cost_usd;
+    model = res.model;
   }
   recordLlm(response, "");
 

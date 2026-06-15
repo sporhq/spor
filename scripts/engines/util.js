@@ -524,17 +524,50 @@ function runBackendCmd(cmd, prompt) {
   return stripTrailingNewlines(r.stdout);
 }
 
-// Default backend: headless `claude -p --model haiku --max-turns 1 <prompt>`.
+// Parse a `claude -p --output-format json` envelope into the response text
+// plus token/cost telemetry (task-cc-spor-client-spend-visibility). The CLI
+// reports `usage` and a CLI-computed `total_cost_usd` (cache-aware actual
+// cost), so the default backend carries exact spend for free. Falls back to
+// the raw stdout as text with null telemetry if the output isn't the expected
+// JSON shape — distillation must never break on a format surprise.
+function parseClaudeResult(stdout) {
+  const text = stripTrailingNewlines(stdout);
+  try {
+    const j = JSON.parse(text);
+    const u = j.usage || {};
+    return {
+      text: typeof j.result === "string" ? j.result : text,
+      usage: {
+        input_tokens: u.input_tokens ?? null,
+        output_tokens: u.output_tokens ?? null,
+        cache_read_input_tokens: u.cache_read_input_tokens ?? null,
+        cache_creation_input_tokens: u.cache_creation_input_tokens ?? null,
+      },
+      cost_usd: typeof j.total_cost_usd === "number" ? j.total_cost_usd : null,
+      model: j.modelUsage ? Object.keys(j.modelUsage)[0] ?? null : null,
+    };
+  } catch {
+    return { text, usage: null, cost_usd: null, model: null };
+  }
+}
+
+// Default backend: headless `claude -p --model haiku --max-turns 1 <prompt>`,
+// JSON output so the call's token usage and cost are recorded. Returns
+// { text, usage, cost_usd, model } or null on process failure.
 function runClaudeBackend(prompt) {
-  const r = spawnSync("claude", ["-p", "--model", "haiku", "--max-turns", "1", prompt], {
-    encoding: "utf8",
-    env: { ...process.env, SPOR_DISTILLING: "1", SUBSTRATE_DISTILLING: "1" },
-    stdio: ["ignore", "pipe", "pipe"],
-    maxBuffer: 16 * 1024 * 1024,
-    shell: process.platform === "win32",
-  });
+  const r = spawnSync(
+    "claude",
+    ["-p", "--model", "haiku", "--max-turns", "1", "--output-format", "json", prompt],
+    {
+      encoding: "utf8",
+      env: { ...process.env, SPOR_DISTILLING: "1", SUBSTRATE_DISTILLING: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+      maxBuffer: 16 * 1024 * 1024,
+      shell: process.platform === "win32",
+    }
+  );
   if (r.status !== 0 || r.error) return null;
-  return stripTrailingNewlines(r.stdout);
+  return parseClaudeResult(r.stdout);
 }
 
 // Detached child that survives the hook process (replaces nohup setsid).
@@ -592,6 +625,7 @@ module.exports = {
   remoteTitleIndex,
   runBackendCmd,
   runClaudeBackend,
+  parseClaudeResult,
   spawnDetached,
   bashRandom,
 };

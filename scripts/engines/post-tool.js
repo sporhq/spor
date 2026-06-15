@@ -124,6 +124,12 @@ async function nudge({ input, graph, slug, session, file, remote }) {
   const llmDir = path.join(graph, "journal", "llm-calls");
   const t0 = Date.now();
   let backend = "";
+  // Token usage / cost when the backend reports it (default claude -p JSON
+  // path; SPOR_NUDGE_CMD backends stay null) —
+  // task-cc-spor-client-spend-visibility.
+  let usage = null;
+  let cost_usd = null;
+  let model = null;
   const recordLlm = (response, error) => {
     if (!u.ensureDir(llmDir)) return;
     const rec = {
@@ -136,6 +142,9 @@ async function nudge({ input, graph, slug, session, file, remote }) {
       session,
       project: slug,
       latency_ms: Date.now() - t0,
+      usage,
+      cost_usd,
+      model,
       prompt,
       vars: { SLUG: slug, FILE: file, INDEX: index, CONTENT: content },
       response: error === "" ? response : null,
@@ -156,12 +165,16 @@ async function nudge({ input, graph, slug, session, file, remote }) {
     }
   } else {
     backend = "cli:claude -p --model haiku";
-    response = u.runClaudeBackend(prompt);
-    if (response === null) {
+    const res = u.runClaudeBackend(prompt);
+    if (res === null) {
       recordLlm("", "claude -p failed");
       u.appendLine(state, `0\t${file}`);
       return null;
     }
+    response = res.text;
+    usage = res.usage;
+    cost_usd = res.cost_usd;
+    model = res.model;
   }
   recordLlm(response, "");
 

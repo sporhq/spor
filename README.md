@@ -12,7 +12,19 @@ The name is Norwegian — *spor*, the track something leaves.
 
 ## Quickstart
 
-Create the graph home (this is yours, kept outside any code repo):
+Install the CLI. It ships as the npm package `@sporhq/spor` and puts two
+commands on your PATH — `spor` (the human CLI) and `spor-hook` (the hook
+dispatcher hosts call):
+
+```bash
+npm install -g @sporhq/spor
+```
+
+Requires Node 18+ and nothing else — the client is zero-dependency. To run
+from a checkout instead (e.g. to hack on it), clone the repo and `npm link`
+from its root; that symlinks the same two commands onto your PATH.
+
+Then create the graph home (this is yours, kept outside any code repo):
 
 ```bash
 spor init        # creates ~/.spor/nodes, git-inits it, writes .gitignore
@@ -165,6 +177,22 @@ Other recognized keys mirror their env var: `server`, `token`, `home`,
 `nodes`, `mode` (`auto`/`local`/`remote`/`off`), and the `distill`, `nudge`,
 and `inferCommits` groups. `spor validate` prints config warnings (an unknown
 key, a secret in a committable config) on stderr.
+
+### LLM spend — visibility and control
+
+The two paid calls the client makes are the SessionEnd distiller and the
+post-tool capture nudge, both on a small, cheap model. Either can be turned
+off, and what you spend is recorded so the "~$0.02 a session" figure above is
+verifiable rather than asserted:
+
+- `SPOR_DISTILL=0` (or `distill.enabled: false`) disables distillation — you
+  keep briefings with no SessionEnd model spend.
+- `SPOR_NUDGE=0` (or `nudge.enabled: false`) disables the capture nudge.
+- Every call appends a row to `$SPOR_HOME/journal/llm-calls/<date>.jsonl` with
+  token usage and the model-reported cost. `spor cost` (`--since YYYY-MM-DD`,
+  `--project <slug>`, `--json`) totals it by source. Custom `SPOR_DISTILL_CMD`
+  /`SPOR_NUDGE_CMD` backends return text only, so their rows count as
+  cost-unknown.
 
 ## Pointers
 
