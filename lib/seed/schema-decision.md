@@ -2,7 +2,7 @@
 id: schema-decision
 type: schema
 kind: node-schema
-schema_version: 2026.06.13.1
+schema_version: 2026.06.15.1
 title: Seed schema for decision nodes
 summary: Node schema for the decision type — a choice that was made, with the why. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -19,13 +19,25 @@ queue-terminal values are not shadowed by synonyms
 approach is filed (the distiller writes it, prompts/client/distill-local.md).
 Write-time gate, backward-readable, no upgrade chain.
 
+`status.non_resolving` (2026.06.15.1): a `rejected` decision — a recorded-then-
+declined choice — resolves nothing, so as a resolver it does not retire its
+targets. This is the registry-declared half of the resolving partition the
+kernel reads off `graph.registry` (dec-spor-definition-of-done-org-policy);
+resolution.js no longer hardcodes the `{rejected, abandoned}` set. Registry
+behavior only, no node-shape change, backward-readable, no upgrade chain.
+
 ```json
 {
   "node_type": "decision",
   "description": "a choice that was made, with the why",
   "prefix": [
     "dec-"
-  ]
+  ],
+  "status": {
+    "non_resolving": [
+      "rejected"
+    ]
+  }
 }
 ```
 

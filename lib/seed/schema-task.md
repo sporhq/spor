@@ -2,7 +2,7 @@
 id: schema-task
 type: schema
 kind: node-schema
-schema_version: 2026.06.14.1
+schema_version: 2026.06.15.1
 title: Seed schema for task nodes
 summary: Node schema for the task type — active or planned work. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -25,6 +25,18 @@ node surfaces in the neighborhood. `abandoned` (won't do) is exempt; nothing
 was produced to record. Both are write-time gates, backward-readable (no
 stored-shape change; existing `done` tasks are untouched), no upgrade chain.
 
+`transitions()` + `status` (2026.06.15.1, dec-spor-definition-of-done-org-policy):
+the completion gate tightens — `done` requires the inbound resolver to be in a
+*resolving* state, not merely present. The host supplies the registry's
+resolving partition on the view as `non_resolving_statuses` (the same
+`status.non_resolving` the kernel's `resolutionMap` reads), and the gate counts a
+decision/artifact resolver only when its status is not named there. So a human
+cannot hand-flip `done` past an in-review change — the write-time mirror of the
+read-time retirement rule. `status.non_resolving: [abandoned]` declares the
+type's half of the partition: an abandoned task resolves nothing. Absent the
+partition on the view (an older server) every resolver counts exactly as before,
+so the gate is backward-readable with no node-shape change and no upgrade chain.
+
 ```json
 {
   "node_type": "task",
@@ -32,7 +44,12 @@ stored-shape change; existing `done` tasks are untouched), no upgrade chain.
   "prefix": [
     "task-"
   ],
-  "queueable": true
+  "queueable": true,
+  "status": {
+    "non_resolving": [
+      "abandoned"
+    ]
+  }
 }
 ```
 
@@ -55,22 +72,32 @@ export function transitions(current, proposed, view) {
     };
   }
   // (2) completion must record a durable outcome on the graph: a decision or
-  // artifact that resolves this task (task-cc-terminal-status-requires-resolver).
-  // `abandoned` is exempt. view.resolvers = live inbound resolves/answers edges
-  // with their source type.
+  // artifact that resolves this task (task-cc-terminal-status-requires-resolver),
+  // AND that resolver must be in a RESOLVING state — not an in-review change
+  // (dec-spor-definition-of-done-org-policy). `abandoned` is exempt.
+  // view.resolvers = live inbound resolves/answers edges with their source type
+  // and status; view.non_resolving_statuses = the registry's resolving partition
+  // the host supplies (the same status.non_resolving the kernel's resolutionMap
+  // reads). A resolver counts unless its status is named non-resolving, so an
+  // older host that omits the partition behaves exactly as before
+  // (backward-readable).
   if (next === "done") {
     const rs = (view && view.resolvers) || [];
+    const nonResolving = (view && view.non_resolving_statuses) || [];
     let ok = false;
     for (let i = 0; i < rs.length; i++) {
-      if (rs[i].type === "decision" || rs[i].type === "artifact") { ok = true; break; }
+      const isChange = rs[i].type === "decision" || rs[i].type === "artifact";
+      const st = ((rs[i] && rs[i].status) || "").toLowerCase();
+      if (isChange && nonResolving.indexOf(st) === -1) { ok = true; break; }
     }
     if (!ok) {
       return {
         allow: false,
-        reason: "done requires a decision or artifact node that resolves this " +
-          "task (an inbound resolves edge) — record the outcome on the graph, " +
-          "even a few lines like a commit message, so it surfaces in the " +
-          "neighborhood; or set abandoned if it won't be done. " +
+        reason: "done requires a decision or artifact node in a RESOLVING state " +
+          "that resolves this task (an inbound resolves edge) — record the " +
+          "outcome on the graph, even a few lines like a commit message, so it " +
+          "surfaces in the neighborhood; a change still in review keeps the task " +
+          "live until it lands. Or set abandoned if it won't be done. " +
           "(task-cc-terminal-status-requires-resolver)",
       };
     }

@@ -277,6 +277,56 @@ test("seed pack: node types, prefixes, ride-along, and traversal match GRAPH.md"
   assert.equal(reg.isTraversable("never-heard-of-it"), true, "unknown types traverse, as before");
 });
 
+test("seed pack: resolving partition reproduces {rejected, abandoned} + artifact stages", () => {
+  // dec-spor-definition-of-done-org-policy: resolution.js no longer owns the
+  // NON_RESOLVING table — it is compiled from each node-schema's
+  // status.non_resolving. The seed must reproduce the historic set exactly,
+  // plus the new artifact delivery non-resolving stages.
+  const reg = graph.seedRegistry();
+  assert.deepEqual([...reg.nonResolvingStatuses()].sort(),
+    ["abandoned", "approved", "in-review", "rejected"]);
+  // withdrawn statuses (the historic set) do not resolve
+  assert.equal(reg.isResolvingStatus("rejected"), false);
+  assert.equal(reg.isResolvingStatus("abandoned"), false);
+  // in-review / approved keep the task live; merged / released retire it
+  assert.equal(reg.isResolvingStatus("in-review"), false);
+  assert.equal(reg.isResolvingStatus("approved"), false);
+  assert.equal(reg.isResolvingStatus("merged"), true);
+  assert.equal(reg.isResolvingStatus("released"), true);
+  // empty / live / done statuses resolve, as before (byte-identical)
+  assert.equal(reg.isResolvingStatus(""), true);
+  assert.equal(reg.isResolvingStatus("active"), true);
+  assert.equal(reg.isResolvingStatus("done"), true);
+  // case-insensitive, matching the kernel's lowercasing
+  assert.equal(reg.isResolvingStatus("In-Review"), false);
+});
+
+test("Registry: an org schema extends the resolving partition (no code change)", () => {
+  const reg = graph.seedRegistry();
+  const ok = reg.add({
+    id: "schema-task", kind: "node-schema", version: "2026.07.01.1", key: "task",
+    payload: { node_type: "task", status: { non_resolving: ["abandoned", "shelved"] } },
+    code: {}, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.equal(ok, true);
+  assert.equal(reg.isResolvingStatus("shelved"), false, "org-added non-resolving status honored");
+  assert.equal(reg.isResolvingStatus("rejected"), false, "other schemas' declarations still union in");
+});
+
+test("parseSchemaNode: rejects a malformed status.non_resolving", () => {
+  const bad = registry.parseSchemaNode({
+    id: "schema-x", kind: "node-schema", schema_version: "2026.06.15.1",
+    body: '```json\n{"node_type":"x","status":{"non_resolving":[1,""]}}\n```',
+  });
+  assert.equal(bad.ok, false);
+  assert.ok(bad.errors.some((e) => /non_resolving must be an array of non-empty strings/.test(e)));
+  const bad2 = registry.parseSchemaNode({
+    id: "schema-y", kind: "node-schema", schema_version: "2026.06.15.1",
+    body: '```json\n{"node_type":"y","status":["nope"]}\n```',
+  });
+  assert.ok(bad2.errors.some((e) => /status must be an object/.test(e)));
+});
+
 test("seed pack: the schema type itself is native — known, prefixed, traversable", () => {
   const reg = graph.seedRegistry();
   assert.equal(reg.isKnownType("schema"), true);
@@ -622,4 +672,20 @@ test("seed pack: task done / issue resolved require a decision or artifact resol
   // `abandoned` (task) is exempt — won't-do work produces nothing to record.
   const taskGate = gateFor("task", "abandoned");
   assert.equal(taskGate({ resolvers: [] }).allow, true, "abandoned needs no resolver");
+
+  // dec-spor-definition-of-done-org-policy: the task done-gate reads the
+  // registry's resolving partition off view.non_resolving_statuses. An in-review
+  // change keeps the task live; a landed (merged) one allows done; an omitted
+  // partition counts every resolver as before (backward-readable).
+  const doneGate = gateFor("task", "done");
+  const partition = [...reg.nonResolvingStatuses()];
+  const inReview = doneGate({ resolvers: [{ id: "art-pr", type: "artifact", status: "in-review" }], non_resolving_statuses: partition });
+  assert.equal(inReview.allow, false, "an in-review resolver does not allow done");
+  assert.match(inReview.reason, /RESOLVING/);
+  assert.equal(doneGate({ resolvers: [{ id: "art-pr", type: "artifact", status: "merged" }], non_resolving_statuses: partition }).allow, true,
+    "a merged resolver allows done");
+  assert.equal(doneGate({ resolvers: [{ id: "dec-y", type: "decision", status: "active" }], non_resolving_statuses: partition }).allow, true,
+    "an active decision resolver allows done (active is resolving)");
+  assert.equal(doneGate({ resolvers: [{ id: "dec-y", type: "decision" }] }).allow, true,
+    "no partition on the view counts every resolver (backward-readable)");
 });
