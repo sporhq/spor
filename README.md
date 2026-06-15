@@ -64,10 +64,13 @@ For the per-host event mapping, fidelity notes, distiller backend, and the
 `AGENTS.md` fallback for hosts with no hook support, see
 [adapters/](adapters/).
 
-To start with a populated graph, point the bundled `spor-backfill` agent at
-your existing sources: it mines git history, design docs, and issue trackers
-into a first graph. Or skip that and just work — distillation grows the graph one session
-at a time.
+To start with a populated graph, ask your agent to run the bundled
+`spor-backfill` agent against your existing sources — in Claude Code:
+*"use the spor-backfill subagent to bootstrap a Spor graph for this repo."*
+It is a **subagent** (invoked through the Task tool, not a `/spor:` slash
+command), so it runs in its own context, mining git history, design docs, and
+issue trackers into a first graph. Or skip that and just work — distillation
+grows the graph one session at a time.
 
 ## What your agent gets, and gives back
 
@@ -88,7 +91,9 @@ The loop runs without you having to drive it:
 You can also ask for any of this directly: an on-demand briefing for a task,
 a correction when a briefing was wrong, a capture of work you're deferring,
 and a ranked queue of what to do next. In Claude Code these surface as
-`/spor:brief`, `/spor:correct`, `/spor:defer`, and `/spor:next`.
+`/spor:brief`, `/spor:correct`, `/spor:defer`, and `/spor:next`. (Graph
+bootstrapping is separate: `spor-backfill` is a *subagent* you invoke by
+asking your agent to use it — it does not appear in the `/spor:` slash menu.)
 
 Corrections are durable. When a briefing includes something stale or misses
 something it should have known, you record the correction once, and every
