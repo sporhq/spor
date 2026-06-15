@@ -282,6 +282,58 @@ test("rankQueue: project filter and limit", () => {
   assert.ok(r.items[0].id.startsWith("task-my-project-"));
 });
 
+// ---------------- assignee filter (assigned / stewards edges) ----------------
+// task-cc-queue-assignee-filtering: the per-person scope the seed assigned/
+// stewards schemas always promised. `assignee` is a person node id; the queue
+// narrows to the union of work assigned to them (work→person `assigned`) and
+// the nodes they steward (person→node `stewards`).
+
+test("rankQueue: assignee scopes the queue to assigned + stewarded work", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-assigned-x", "task", { status: "open", edges: [["assigned", "person-x"]] }),
+    node("task-stewarded-x", "task", { status: "open" }),
+    node("task-assigned-y", "task", { status: "open", edges: [["assigned", "person-y"]] }),
+    node("task-unowned", "task", { status: "open" }),
+    node("person-x", "person", { edges: [["stewards", "task-stewarded-x"]] }),
+    node("person-y", "person", {}),
+  ])).load();
+  const r = rankQueue(g, { now: NOW, assignee: "person-x" });
+  assert.deepEqual(r.items.map((i) => i.id).sort(), ["task-assigned-x", "task-stewarded-x"]);
+  assert.equal(r.count, 2, "count describes this person's queue, not the firehose");
+});
+
+test("rankQueue: an unknown or departed assignee yields an empty queue, not the whole team's", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-1", "task", { status: "open", edges: [["assigned", "person-x"]] }),
+    node("task-2", "task", { status: "open" }),
+  ])).load();
+  const r = rankQueue(g, { now: NOW, assignee: "person-nobody" });
+  assert.deepEqual(r.items, []);
+  assert.equal(r.count, 0);
+});
+
+test("rankQueue: no assignee scopes nothing — assigned edges don't change the unfiltered queue", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-assigned-x", "task", { status: "open", edges: [["assigned", "person-x"]] }),
+    node("task-unowned", "task", { status: "open" }),
+    node("person-x", "person", { edges: [["stewards", "task-unowned"]] }),
+  ])).load();
+  const r = rankQueue(g, { now: NOW });
+  assert.deepEqual(r.items.map((i) => i.id).sort(), ["task-assigned-x", "task-unowned"]);
+  assert.equal(r.count, 2);
+});
+
+test("rankQueue: assignee composes with the project filter", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-alpha", "task", { status: "open", project: "alpha", edges: [["assigned", "person-x"]] }),
+    node("task-beta", "task", { status: "open", project: "beta", edges: [["assigned", "person-x"]] }),
+    node("person-x", "person", {}),
+  ])).load();
+  const r = rankQueue(g, { now: NOW, assignee: "person-x", project: "alpha" });
+  assert.deepEqual(r.items.map((i) => i.id), ["task-alpha"]);
+  assert.equal(r.count, 1);
+});
+
 test("rankQueue: capture-pending nodes queue for triage (seed queueable)", () => {
   const g = tmpGraph(Object.fromEntries([
     node("cap-2026-06-10-1", "capture-pending", {}),

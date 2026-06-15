@@ -295,7 +295,9 @@ edges:
   neighborhood to the closest steward and writes a `routed-to` edge to that
   person; an unrouted question (no steward matched) surfaces to everyone.
 - **`assigned`** points work (task/issue) at a person; per-person queues filter
-  on it. **`answers`** points any answer node back at the `question-` it
+  on it (the queue's `assignee` parameter — `GET /v1/queue?assignee=<person>`,
+  unioned with the person's `stewards` edges; QUEUE.md §5). **`answers`** points
+  any answer node back at the `question-` it
   resolves — the answer loop is lineage, not messaging, so the asker's next
   compile pulls the answer through the question's neighborhood.
 - **`queue_mute`** (flat inline list of project slugs or node ids, each with an

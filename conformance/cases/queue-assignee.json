@@ -1,0 +1,4 @@
+{ "id": "queue-assignee", "kind": "queue", "corpus": "queue-assignee",
+  "input": { "now": "2026-06-12T00:00:00Z", "assignee": "person-dana" },
+  "expected": "queue-assignee.json",
+  "covers": "per-person filter (task-cc-queue-assignee-filtering): assigned arm (work→person) + stewards arm (person→node), liveness still excludes a terminal assigned task, a non-queueable stewarded area never surfaces, other people's and unowned work excluded" }
