@@ -54,6 +54,10 @@ Graph
   add "<text>"         capture a node (local: typed file; remote: /v1/capture)
   next [--project S]   the decision queue (local: lib/queue; remote: /v1/queue)
   get <id>             a node by id (local: file; remote: /v1/nodes/<id>)
+  lens [<id>]          render a saved view (remote). No id => list the lens
+                       catalog; <id> renders it. Flags: --format text|json
+                       (default text), --PARAM VALUE to pass lens params,
+                       --json (machine output of the catalog/JSON tree)
 
 Repo scoping
   disable | enable     turn Spor off/on for this repo (.spor.json)
@@ -279,6 +283,100 @@ async function cmdGet(cfg, args) {
     err(`no such node: ${id}`);
     return 1;
   }
+}
+
+// --- spor lens / render-lens: view a saved lens (REMOTE only) ---------------
+// (task-cc-spor-cli-lens-render) Lens RENDERING lives entirely server-side in
+// the engine half (lib-engine; art-cc-lib-boundary moved it out of the client
+// repo, history-cleaned, to enforce the engine→client-core dependency
+// direction). So this verb is a thin remote client: it discovers lenses via
+// GET /v1/lenses and renders one via GET /v1/lens/<id>/render?format=text|json
+// (API.md §3). No id => the catalog (the discovery step before you render).
+// Like the other remote-only verbs (whoami/invite/token), local mode degrades
+// with one clear line and no crash — there is no local renderer to fall back to.
+async function cmdLens(cfg, args) {
+  if (cfg.mode() !== "remote") {
+    out("lens rendering needs a team graph — lenses are rendered server-side.");
+    out("  set SPOR_SERVER/SPOR_TOKEN (see 'spor join') to view lenses.");
+    return 0;
+  }
+  const wantJson = args.includes("--json");
+  // --format text|json picks the server rendering; --json forces json + raw
+  // machine output (the view tree / catalog), matching the rest of the CLI.
+  let format = optVal(args, "format") || (wantJson ? "json" : "text");
+  if (format !== "text" && format !== "json") {
+    err(`invalid --format '${format}' — use 'text' or 'json'`);
+    return 1;
+  }
+
+  const id = args.find((a) => !a.startsWith("--"));
+
+  // No id => list the catalog (GET /v1/lenses).
+  if (!id) {
+    const r = await remote.get(cfg, "/v1/lenses", { timeoutMs: 6000 });
+    if (r.transport) {
+      err(`offline — could not reach server (${r.error})`);
+      return 1;
+    }
+    if (!r.ok) {
+      err(`lens list error ${r.status}`);
+      return 1;
+    }
+    if (wantJson) {
+      out(JSON.stringify(r.json));
+      return 0;
+    }
+    const lenses = (r.json && r.json.lenses) || [];
+    if (!lenses.length) {
+      out("no lenses in the team graph");
+      return 0;
+    }
+    out("Lenses (render with: spor lens <id>):");
+    for (const l of lenses) {
+      out(`  ${l.id}${l.type && l.type !== "lens" ? `  [${l.type}]` : ""}${l.title ? `  ${l.title}` : ""}`);
+      if (l.summary) out(`      ${l.summary}`);
+    }
+    return 0;
+  }
+
+  // Render one lens. Pass through any --PARAM VALUE flags as lens params
+  // (?key=value), skipping the CLI's own --format/--json. The server discards a
+  // caller-supplied viewer param and binds $viewer from the token, so a
+  // --viewer flag here is harmless (ignored server-side).
+  const RESERVED = new Set(["format", "json"]);
+  const qs = [`format=${encodeURIComponent(format)}`];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (!a.startsWith("--")) continue;
+    const key = a.slice(2);
+    if (RESERVED.has(key)) continue;
+    const val = args[i + 1] != null && !args[i + 1].startsWith("--") ? args[++i] : "";
+    if (val !== "") qs.push(`${encodeURIComponent(key)}=${encodeURIComponent(val)}`);
+  }
+  const r = await remote.get(cfg, `/v1/lens/${encodeURIComponent(id)}/render?${qs.join("&")}`, { timeoutMs: 10000 });
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (r.status === 404) {
+    err(`no lens or workspace '${id}'`);
+    // The 404 body carries the catalog so a caller that guessed an id learns
+    // what it could have asked for (API.md render_lens / issue-cc-lens-discovery).
+    const avail = (r.json && r.json.available) || [];
+    if (avail.length) err(`  available: ${avail.join(", ")}`);
+    else err(`  run 'spor lens' to list available lenses.`);
+    return 1;
+  }
+  if (!r.ok) {
+    // Engine failures (missing param, broken blocks) come back 422 with the
+    // message verbatim — surface it rather than a bare status.
+    const msg = r.json && r.json.error && r.json.error.message;
+    err(`lens render error ${r.status}${msg ? `: ${msg}` : ""}`);
+    return 1;
+  }
+  // text => plain rendering on stdout; json => the raw view tree.
+  out(format === "json" ? (r.json != null ? JSON.stringify(r.json) : r.text) : (r.text != null ? r.text : ""));
+  return 0;
 }
 
 function cmdCompile(cfg, verb, args) {
@@ -1590,6 +1688,9 @@ async function main() {
       return await cmdNext(cfg, args);
     case "get":
       return await cmdGet(cfg, args);
+    case "lens":
+    case "render-lens":
+      return await cmdLens(cfg, args);
     case "compile":
     case "brief":
       return cmdCompile(cfg, verb, args);
