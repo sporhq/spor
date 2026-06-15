@@ -209,26 +209,37 @@ test('buildGraph: grouped-under edges index a grouping to its member repos', () 
   assert.deepEqual([...g.groupingRepos['proj-other']], ['repo-solo']);
 });
 
-test('rankQueue: a grouping id unions its member repos; a repo slug stays single', () => {
+// ungrouped repo node (no grouped-under edge), unlike the repoNode helper
+const repoSolo = ['repo-solo.md',
+  `---\nid: repo-solo\ntype: repo\ntitle: repo-solo\nsummary: Solo repo.\nslugs: [solo]\ndate: 2026-06-01\n---\nbody`];
+
+test('rankQueue: a bare repo slug resolves UP to its grouping; the repo node id pins one repo (dec-spor-queue-slug-resolves-to-grouping)', () => {
   const g = tmpGraph(Object.fromEntries([
     groupingNode('proj-g'),
     repoNode('repo-a', 'a', 'proj-g'),
     repoNode('repo-b', 'b', 'proj-g'),
+    repoSolo,                  // ungrouped repo (slug 'solo')
     task('task-a', 'a'),       // stamped a -> repo-a
     task('task-b', 'b'),       // stamped b -> repo-b
+    task('task-solo', 'solo'),
     task('task-out', 'elsewhere'),
   ])).load();
-  // grouping scope unions both member repos
-  const grouped = rankQueue(g, { now: NOW, project: 'proj-g' }).items.map((i) => i.id).sort();
-  assert.deepEqual(grouped, ['task-a', 'task-b']);
-  // a single repo slug stays scoped to that one repo
-  const single = rankQueue(g, { now: NOW, project: 'a' }).items.map((i) => i.id);
-  assert.deepEqual(single, ['task-a']);
+  const ids = (project) => rankQueue(g, { now: NOW, project }).items.map((i) => i.id).sort();
+  // a grouping id unions its member repos
+  assert.deepEqual(ids('proj-g'), ['task-a', 'task-b']);
+  // a BARE repo slug now resolves up to its home grouping and unions too —
+  // either member slug returns the whole product
+  assert.deepEqual(ids('a'), ['task-a', 'task-b']);
+  assert.deepEqual(ids('b'), ['task-a', 'task-b']);
+  // the repo NODE id is the escape hatch back to single-repo scope
+  assert.deepEqual(ids('repo-a'), ['task-a']);
+  assert.deepEqual(ids('repo-b'), ['task-b']);
+  // an ungrouped repo (by slug or by id) falls back to itself
+  assert.deepEqual(ids('solo'), ['task-solo']);
+  assert.deepEqual(ids('repo-solo'), ['task-solo']);
+  // an unknown slug stays exact (no repo node, no grouping)
+  assert.deepEqual(ids('elsewhere'), ['task-out']);
 });
-
-// ungrouped repo node (no grouped-under edge), unlike the repoNode helper
-const repoSolo = ['repo-solo.md',
-  `---\nid: repo-solo\ntype: repo\ntitle: repo-solo\nsummary: Solo repo.\nslugs: [solo]\ndate: 2026-06-01\n---\nbody`];
 
 test('groupingOf: a member repo and the grouping id both resolve to the grouping; ungrouped -> null (task-cc-grouping-brief-digest-reads)', () => {
   const g = tmpGraph(Object.fromEntries([
@@ -242,6 +253,26 @@ test('groupingOf: a member repo and the grouping id both resolve to the grouping
   assert.equal(graph.groupingOf(g, 'proj-g'), 'proj-g'); // grouping id maps to itself
   assert.equal(graph.groupingOf(g, 'repo-solo'), null);  // ungrouped repo
   assert.equal(graph.groupingOf(g, 'nonexistent'), null);
+});
+
+test('scopeFor: the shared slug->grouping up-resolution every read surface uses (dec-spor-queue-slug-resolves-to-grouping)', () => {
+  const g = tmpGraph(Object.fromEntries([
+    groupingNode('proj-g'),
+    repoNode('repo-a', 'a', 'proj-g'),
+    repoNode('repo-b', 'b', 'proj-g'),
+    repoSolo,
+  ])).load();
+  const set = (p) => { const s = graph.scopeFor(g, p); return s == null ? null : [...s].sort(); };
+  assert.equal(graph.scopeFor(g, null), null);   // no param -> unscoped (global)
+  assert.equal(graph.scopeFor(g, ''), null);
+  assert.deepEqual(set('proj-g'), ['repo-a', 'repo-b']);     // grouping id -> union
+  assert.deepEqual(set('a'), ['repo-a', 'repo-b']);          // bare slug -> up to grouping
+  assert.deepEqual(set('b'), ['repo-a', 'repo-b']);
+  assert.deepEqual(set('repo-a'), ['repo-a']);               // repo NODE id -> single (escape hatch)
+  assert.deepEqual(set('repo-b'), ['repo-b']);
+  assert.deepEqual(set('solo'), ['repo-solo']);              // ungrouped repo, by slug...
+  assert.deepEqual(set('repo-solo'), ['repo-solo']);         // ...or by id -> itself
+  assert.deepEqual(set('nope'), ['nope']);                   // unknown slug -> itself
 });
 
 test('compile boost spans the grouping: a sibling-repo node outranks an equally-relevant foreign one (task-cc-grouping-brief-digest-reads)', () => {

@@ -252,9 +252,16 @@ date: 2026-06-13
 ---
 ```
 
-- **Reads.** repo-scoped = nodes stamped that repo's slug; project-scoped = the
-  union over the nodes of every repo `grouped-under` the project. Session-start
-  injects the repo brief AND the project brief.
+- **Reads.** Every read surface (queue, brief, digest) resolves its scope token
+  through one shared up-resolution step (dec-spor-queue-slug-resolves-to-grouping):
+  a BARE repo slug resolves up to its home-project grouping and reads the union
+  over every repo `grouped-under` it — the intuitive token returns the whole
+  product, matching the project brief session-start already injects. The repo
+  NODE id (`repo-<slug>`) is the escape hatch back to single-repo scope; an exact
+  grouping id (`proj-<slug>`) is used directly; an ungrouped repo (or a slug no
+  repo node claims) falls back to itself. So project-scoped = the grouping union,
+  single-repo-scoped = that one repo via its node id. Session-start injects the
+  repo brief AND the project brief.
 - **Active project** (dec-cc-active-project-declared-default). When a repo
   serves more than one project, cwd no longer names the active one. A session's
   active project is the repo's home project (its `grouped-under` edge) by

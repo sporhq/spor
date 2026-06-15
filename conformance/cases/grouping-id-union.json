@@ -1,0 +1,4 @@
+{ "id": "grouping-id-union", "kind": "queue", "corpus": "grouping",
+  "input": { "now": "2026-06-12T00:00:00Z", "project": "proj-g" },
+  "expected": "grouping-id-union.json",
+  "covers": "dec-spor-queue-slug-resolves-to-grouping: an exact grouping id is used directly — unions the member repos (task-a + task-b)" }

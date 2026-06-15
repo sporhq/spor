@@ -1,0 +1,4 @@
+{ "id": "grouping-ungrouped-slug", "kind": "queue", "corpus": "grouping",
+  "input": { "now": "2026-06-12T00:00:00Z", "project": "solo" },
+  "expected": "grouping-ungrouped-slug.json",
+  "covers": "dec-spor-queue-slug-resolves-to-grouping: an ungrouped repo (no grouped-under edge) falls back to itself (task-solo only)" }

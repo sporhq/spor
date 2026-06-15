@@ -35,8 +35,11 @@ SLUG=$(sed -nE 's/^repo:[ \t]*([a-z0-9][a-z0-9-]*)[ \t]*$/\1/p' "$TOP/.spor" 2>/
   | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
 curl -sS --max-time 6 -H "Authorization: Bearer $SPOR_TOKEN" \
   "${SPOR_SERVER%/}/v1/queue?project=$SLUG&limit=10"
-# The queue ?project= filter is the repo slug. org-wide view: drop the filter.
-# The server resolves slug aliases (repo nodes, GRAPH.md "Repo and project
+# A bare repo slug resolves UP to its home-project grouping and unions the
+# member repos' queues — the intuitive token returns the whole product
+# (dec-spor-queue-slug-resolves-to-grouping). For one repo of a grouped product,
+# pass its repo NODE id (?project=repo-<slug>); for the org-wide view, drop the
+# filter. The server resolves slug aliases (GRAPH.md "Repo and project
 # identity"), so renamed repos still see their history.
 ```
 

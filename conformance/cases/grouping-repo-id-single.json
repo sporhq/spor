@@ -1,0 +1,4 @@
+{ "id": "grouping-repo-id-single", "kind": "queue", "corpus": "grouping",
+  "input": { "now": "2026-06-12T00:00:00Z", "project": "repo-a" },
+  "expected": "grouping-repo-id-single.json",
+  "covers": "dec-spor-queue-slug-resolves-to-grouping: the repo NODE id is the escape hatch — it forces single-repo scope (task-a only), overriding the slug up-resolution" }

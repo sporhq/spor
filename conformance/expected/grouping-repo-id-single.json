@@ -1,0 +1,24 @@
+{
+  "items": [
+    {
+      "id": "task-a",
+      "title": "Task in repo a",
+      "type": "task",
+      "status": "open",
+      "project": "a",
+      "priority": null,
+      "score": 0.37,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 11
+      },
+      "suggest": "do",
+      "why": "11d old"
+    }
+  ],
+  "count": 1
+}

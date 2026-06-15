@@ -397,6 +397,12 @@ The queue is a compile mode, not a new store:
   blend, return ranked items each carrying its one-line *why* ("blocks 3
   open tasks; anchors hot this week"). `assignee` (a person node id) narrows
   the queue to the work that person carries — see "Per-person queues" below.
+- The `project` filter resolves through the one shared up-resolution step every
+  read surface shares (dec-spor-queue-slug-resolves-to-grouping): a BARE repo
+  slug resolves up to its home-project grouping and unions the member repos'
+  queues — the intuitive token returns the whole product; the repo NODE id
+  (`repo-<slug>`) is the escape hatch back to one repo; an exact grouping id
+  (`proj-<slug>`) is used directly; an ungrouped repo falls back to itself.
 - Exposed as `GET /v1/queue` (hooks, session-start "open front" line),
   `my_queue` (the registered MCP stub finally does work — and when Tier 2
   routing lands, routed questions and stewarded items join the same queue),

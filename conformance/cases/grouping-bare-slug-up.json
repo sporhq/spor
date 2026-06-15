@@ -1,0 +1,4 @@
+{ "id": "grouping-bare-slug-up", "kind": "queue", "corpus": "grouping",
+  "input": { "now": "2026-06-12T00:00:00Z", "project": "a" },
+  "expected": "grouping-bare-slug-up.json",
+  "covers": "dec-spor-queue-slug-resolves-to-grouping: a bare repo slug resolves UP to its home-project grouping and unions the member repos (task-a + task-b), not just the one repo" }
