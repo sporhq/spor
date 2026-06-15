@@ -24,6 +24,9 @@ export SPOR_TOKEN=spor_pat_...
 # Distiller backend (prompt on stdin -> response on stdout); without the
 # claude CLI installed, route through opencode itself:
 export SPOR_DISTILL_CMD='opencode run "$(cat)"'
+# Capture-nudge backend — same contract, runs synchronously, so prefer a fast
+# model. SPOR_NUDGE=0 disables it; see adapters/README.md for the bounds.
+export SPOR_NUDGE_CMD='opencode run "$(cat)"'
 ```
 
 ## Behavior mapping

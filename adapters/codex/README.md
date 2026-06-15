@@ -27,11 +27,15 @@ is just a manifest over `bin/spor-hook`.
    # Distiller backend — Codex hosts usually won't have the claude CLI.
    # Contract: prompt on stdin, response on stdout.
    export SPOR_DISTILL_CMD='codex exec -'
+   # Capture-nudge backend — same contract, but it runs synchronously in the
+   # tool loop, so prefer a fast model. SPOR_NUDGE=0 disables it.
+   export SPOR_NUDGE_CMD='codex exec -'
    ```
 
-   (Legacy `SUBSTRATE_*` names are still read.) Without `SPOR_DISTILL_CMD`
-   the distiller defaults to `claude -p --model haiku`, which is fine if the
-   claude CLI is installed.
+   (Legacy `SUBSTRATE_*` names are still read.) Without `SPOR_DISTILL_CMD` /
+   `SPOR_NUDGE_CMD` both default to `claude -p --model haiku`, which is fine if
+   the claude CLI is installed. See [adapters/README.md](../README.md) for the
+   nudge bounds (`SPOR_NUDGE_MAX`, `SPOR_NUDGE_TIMEOUT`).
 
 ## Event mapping
 

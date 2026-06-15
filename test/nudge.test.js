@@ -31,7 +31,7 @@ function scratch() {
   return { root, home, cwd };
 }
 
-function env(home, stub) {
+function env(home, stub, extra = {}) {
   const e = { ...process.env, SUBSTRATE_HOME: home };
   delete e.SUBSTRATE_SERVER;
   delete e.SUBSTRATE_TOKEN;
@@ -44,12 +44,18 @@ function env(home, stub) {
   delete e.SPOR_DISTILL_CMD;
   delete e.SPOR_NUDGE;
   delete e.SPOR_NUDGE_CMD;
+  // Clear the bound knobs too, so a host setting can't derail the defaults a
+  // test relies on (the per-test `extra` sets them explicitly when needed).
+  delete e.SPOR_NUDGE_MAX;
+  delete e.SUBSTRATE_NUDGE_MAX;
+  delete e.SPOR_NUDGE_TIMEOUT;
+  delete e.SUBSTRATE_NUDGE_TIMEOUT;
   if (stub) e.SUBSTRATE_NUDGE_CMD = stub;
   else delete e.SUBSTRATE_NUDGE_CMD;
-  return e;
+  return { ...e, ...extra };
 }
 
-function postTool(home, cwd, stub, { file, content, session = 's1', tool = 'Write' } = {}) {
+function postTool(home, cwd, stub, { file, content, session = 's1', tool = 'Write', extraEnv = {} } = {}) {
   const payload = {
     cwd,
     session_id: session,
@@ -61,7 +67,7 @@ function postTool(home, cwd, stub, { file, content, session = 's1', tool = 'Writ
   };
   const r = spawnSync('bash', [BIN, 'post-tool', '--host', 'claude-code'], {
     input: JSON.stringify(payload),
-    env: env(home, stub),
+    env: env(home, stub, extraEnv),
     encoding: 'utf8',
   });
   assert.strictEqual(r.status, 0, `exit 0 expected (fail-open): ${r.stderr}`);
@@ -135,6 +141,41 @@ test('cap: after 3 fired nudges the classifier stops for the session', () => {
   }
   assert.strictEqual(llmCalls(home).length, 3);
   assert.strictEqual(journal(home).filter((e) => e.tool === 'nudge').length, 3);
+});
+
+test('total cap: SPOR_NUDGE_MAX bounds classifier calls even when none fire', () => {
+  // A docs-heavy session: many distinct .md files that all classify to NOTHING.
+  // The fired cap (≥3) never trips because nothing fires, so the total-call cap
+  // is what bounds spend (task-cc-spor-nudge-productization). With the cap at 2,
+  // only the first 2 files reach the classifier; the 3rd is short-circuited.
+  const { home, cwd } = scratch();
+  for (let i = 0; i < 3; i++) {
+    postTool(home, cwd, NOTHING_STUB, {
+      file: path.join(cwd, `note${i}.md`),
+      content: PROSE,
+      extraEnv: { SPOR_NUDGE_MAX: '2' },
+    });
+  }
+  assert.strictEqual(llmCalls(home).length, 2);
+  assert.strictEqual(journal(home).filter((e) => e.tool === 'nudge').length, 0);
+});
+
+test('timeout: a hung backend is killed and fails open', () => {
+  // SPOR_NUDGE_TIMEOUT bounds a wedged classifier so it can't block the tool
+  // loop. The stub sleeps well past the 400ms cap; spawnSync SIGKILLs it, the
+  // backend returns null, and the nudge fails open (no output, error journaled,
+  // file parked in cooldown so there's no retry storm).
+  const { home, cwd } = scratch();
+  const out = postTool(home, cwd, 'cat >/dev/null; sleep 5; echo NOTHING', {
+    file: path.join(cwd, 'doc.md'),
+    content: PROSE,
+    extraEnv: { SPOR_NUDGE_TIMEOUT: '400' },
+  });
+  assert.strictEqual(out.trim(), '');
+  const calls = llmCalls(home);
+  assert.strictEqual(calls.length, 1);
+  assert.strictEqual(calls[0].response, null);
+  assert.match(calls[0].error, /failed/);
 });
 
 test('prefilter: non-md, graph-home, /nodes/, instruction files, and short prose are skipped', () => {

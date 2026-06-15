@@ -56,3 +56,35 @@ export SPOR_DISTILL_CMD="$HOME/repos/spor/scripts/distill-gemini.sh"
 
 The journal records the backend per call (`journal/llm-calls/`), so distill
 quality stays observable across backends through the same eval loop.
+
+## Capture-nudge backend
+
+The post-tool capture nudge (a Write/Edit of substantial prose to a `.md`
+outside the graph runs a classifier and, if it finds capturable facts, injects
+a capture-or-dismiss nudge) uses the **same backend contract** as the
+distiller — prompt on stdin, response on stdout — but a separate variable so
+you can point the two at different models:
+
+- `SPOR_NUDGE_CMD` — custom classifier command (defaults to `claude -p --model
+  haiku`, same as the distiller). Because the contract is identical,
+  `scripts/distill-gemini.sh` doubles as a nudge backend (it keys off
+  `SPOR_DISTILL_MODEL`, default `gemini-3.5-flash`):
+
+  ```sh
+  export SPOR_NUDGE_CMD="$HOME/repos/spor/scripts/distill-gemini.sh"
+  ```
+
+  This is the recommended latency fix: the nudge runs **synchronously** in the
+  tool loop, and Gemini Flash returns in ~2–7s versus ~17s for a `claude -p`
+  cold boot, with no quality regression (dec-cc-nudge-flash-latency).
+- `SPOR_NUDGE=0` — disable the nudge entirely.
+- `SPOR_NUDGE_MAX` — per-session ceiling on classifier calls (default 20),
+  bounding spend/latency in a docs-heavy session where many `.md` files each
+  classify to nothing. (A separate cap stops after 3 *fired* nudges.)
+- `SPOR_NUDGE_TIMEOUT` — milliseconds before a hung classifier is killed
+  (default 30000), so a wedged backend can't block the tool loop.
+
+(Legacy `SUBSTRATE_*` spellings are still read for all four.) The same
+`SPOR_DISTILLING=1` recursion guard is exported around the call, and the
+journal records each nudge call under `journal/llm-calls/` (source `nudge`)
+through the same eval loop as the distiller.

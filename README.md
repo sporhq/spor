@@ -271,6 +271,16 @@ verifiable rather than asserted:
 - `SPOR_DISTILL=0` (or `distill.enabled: false`) disables distillation — you
   keep briefings with no SessionEnd model spend.
 - `SPOR_NUDGE=0` (or `nudge.enabled: false`) disables the capture nudge.
+- The capture nudge runs synchronously after a `.md` write, so its backend's
+  latency is felt in the tool loop. `SPOR_NUDGE_CMD` (or `nudge.cmd`) points it
+  at a faster classifier — Gemini Flash via the bundled
+  `scripts/distill-gemini.sh` returns in ~2–7s versus ~17s for a `claude -p`
+  cold boot, with no quality regression. Two bounds keep a bad session cheap:
+  `SPOR_NUDGE_MAX` (or `nudge.maxCalls`, default 20) caps classifier calls per
+  session, and `SPOR_NUDGE_TIMEOUT` (or `nudge.timeoutMs`, default 30000ms)
+  kills a hung backend. The distiller has the same `distill.cmd` and
+  `distill.timeoutMs` (`SPOR_DISTILL_TIMEOUT`, default 120000ms) levers. See
+  [adapters/README.md](adapters/README.md) for the backend contract.
 - Every call appends a row to `$SPOR_HOME/journal/llm-calls/<date>.jsonl` with
   token usage and the model-reported cost. `spor cost` (`--since YYYY-MM-DD`,
   `--project <slug>`, `--json`) totals it by source. Custom `SPOR_DISTILL_CMD`
