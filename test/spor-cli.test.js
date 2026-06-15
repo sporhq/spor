@@ -87,6 +87,78 @@ test('status (local) reports local mode and node count', () => {
   assert.strictEqual(r.status, 0);
   assert.match(r.stdout, /mode:\s+local/);
   assert.match(r.stdout, new RegExp(`${nodes.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\(1 nodes\\)`));
+  // The Node prerequisite line is always surfaced (issue-spor-onboarding-no-
+  // node-silent-fail-open) so a box where the hooks silently no-op is greppable.
+  assert.match(r.stdout, /node:\s+\d+\.\d+\.\d+/);
+});
+
+// --- Node prerequisite check (issue-spor-onboarding-no-node-silent-fail-open).
+// The version-check logic is a pure helper (no I/O), so it is unit-tested
+// directly via the bin/spor.js export seam — main() is guarded by require.main.
+const cli = require(CLI);
+
+test('nodeFloor reads the engines.node floor from package.json (not hardcoded)', () => {
+  const pkg = require(path.join(__dirname, '..', 'package.json'));
+  const declared = parseInt(String(pkg.engines.node).match(/\d+/)[0], 10);
+  assert.strictEqual(cli.nodeFloor(), declared);
+});
+
+test('nodeRuntimeCheck: floor satisfied => ok, OK line', () => {
+  const floor = cli.nodeFloor();
+  const c = cli.nodeRuntimeCheck(`${floor}.0.0`);
+  assert.strictEqual(c.ok, true);
+  assert.strictEqual(c.floor, floor);
+  assert.match(c.line, /OK/);
+  // a far-newer interpreter is also fine
+  assert.strictEqual(cli.nodeRuntimeCheck(`${floor + 50}.1.2`).ok, true);
+});
+
+test('nodeRuntimeCheck: below the floor => not ok, loud prereq line', () => {
+  const floor = cli.nodeFloor();
+  const c = cli.nodeRuntimeCheck(`${floor - 1}.9.9`);
+  assert.strictEqual(c.ok, false);
+  assert.match(c.line, /TOO OLD/);
+  assert.match(c.line, new RegExp(`Node ${floor}\\+`));
+  assert.match(c.line, /no-op/);
+});
+
+test('bare "spor install" states the Node requirement', () => {
+  const r = run(['install']);
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, new RegExp(`Requires:\\s+Node ${cli.nodeFloor()}\\+`));
+});
+
+test('spor-hook shim drops a one-time breadcrumb when node is absent', () => {
+  // Drive bin/spor-hook with a PATH that has no `node`, pointed at a scratch
+  // home — never the live graph. Must stay fail-open (exit 0) AND leave a
+  // greppable journal/no-node.warn marker, written at most once.
+  if (process.platform === 'win32') return; // POSIX shim only
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-nonode-'));
+  const shim = path.join(__dirname, '..', 'bin', 'spor-hook');
+  // Build a PATH dir holding ONLY the externals the shim needs (mkdir, date) —
+  // explicitly NOT node — by symlinking the real ones. `printf`/`command` are sh
+  // builtins, so the shim runs end-to-end while `node` is genuinely unreachable.
+  const noNodeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-nopath-'));
+  for (const tool of ['mkdir', 'date']) {
+    const real = (spawnSync('/bin/sh', ['-c', `command -v ${tool}`], { encoding: 'utf8' }).stdout || '').trim();
+    if (real) { try { fs.symlinkSync(real, path.join(noNodeDir, tool)); } catch { /* ignore */ } }
+  }
+  const env = { HOME: home, SPOR_HOME: home, PATH: noNodeDir };
+  // sanity: confirm node really is unreachable on this PATH
+  assert.notStrictEqual(spawnSync('/bin/sh', ['-c', 'command -v node'], { env }).status, 0,
+    'test PATH must not contain node');
+  const r1 = spawnSync('/bin/sh', [shim, 'session-start'], { env, input: '{"cwd":"/tmp"}', encoding: 'utf8' });
+  assert.strictEqual(r1.status, 0, 'shim must fail open (exit 0) with no node');
+  assert.strictEqual(r1.stdout, '', 'no stdout on the no-node path');
+  const warn = path.join(home, 'journal', 'no-node.warn');
+  assert.ok(fs.existsSync(warn), 'breadcrumb written to journal/no-node.warn');
+  const body = fs.readFileSync(warn, 'utf8');
+  assert.match(body, /node not found/);
+  // second invocation is still fail-open and does NOT rewrite the marker (one-time)
+  const mtime1 = fs.statSync(warn).mtimeMs;
+  const r2 = spawnSync('/bin/sh', [shim, 'prompt-context'], { env, input: '{"cwd":"/tmp"}', encoding: 'utf8' });
+  assert.strictEqual(r2.status, 0);
+  assert.strictEqual(fs.statSync(warn).mtimeMs, mtime1, 'breadcrumb is one-time (not rewritten)');
 });
 
 test('whoami in local mode explains there is no server identity', () => {
