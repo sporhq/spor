@@ -1,0 +1,45 @@
+{
+  "items": [
+    {
+      "id": "task-lapsed",
+      "title": "Reassign the stalled migration",
+      "type": "task",
+      "status": "open",
+      "project": "alpha",
+      "priority": null,
+      "score": 0.37,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 11
+      },
+      "suggest": "do",
+      "why": "11d old"
+    },
+    {
+      "id": "task-open",
+      "title": "Pick up the unclaimed chore",
+      "type": "task",
+      "status": "open",
+      "project": "alpha",
+      "priority": null,
+      "score": 0.37,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 11
+      },
+      "suggest": "do",
+      "why": "11d old"
+    }
+  ],
+  "count": 2,
+  "leased": 1,
+  "reserved": 1
+}
