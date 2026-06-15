@@ -392,10 +392,11 @@ and edges see it normally; only queue ranking waits.
 
 The queue is a compile mode, not a new store:
 
-- `rankQueue(graph, {person?, project?})` in the core: collect nodes whose
-  schema says `queueable: true` and status is live, run `queueSignals()`,
+- `rankQueue(graph, {assignee?, project?, ...})` in the core: collect nodes
+  whose schema says `queueable: true` and status is live, run `queueSignals()`,
   blend, return ranked items each carrying its one-line *why* ("blocks 3
-  open tasks; anchors hot this week").
+  open tasks; anchors hot this week"). `assignee` (a person node id) narrows
+  the queue to the work that person carries — see "Per-person queues" below.
 - Exposed as `GET /v1/queue` (hooks, session-start "open front" line),
   `my_queue` (the registered MCP stub finally does work — and when Tier 2
   routing lands, routed questions and stewarded items join the same queue),
@@ -406,8 +407,28 @@ The queue is a compile mode, not a new store:
   Tier-2 routed questions are all queueable schemas. "Home is a decision
   queue" falls out of one mechanism.
 
-Per-person queues need only Tier 2's person nodes and `stewards`/`assigned`
-edge schemas — assignment is an edge like everything else.
+**Per-person queues** (task-cc-queue-assignee-filtering). `rankQueue`'s
+`assignee` parameter — and `GET /v1/queue?assignee=<person-id>` /
+`my_queue {assignee}` (use `assignee=me` to bind to the caller) — scopes the
+ranked queue to the work one person carries: the union of nodes with an
+outbound `assigned` edge to them (work→person) and the nodes they `steward`
+(person→node). Assignment is an edge like everything else (Tier-2's person
+nodes plus the seed `assigned`/`stewards` schemas), so this needed no new
+store — the same blend, signals, and why-lines, narrowed to a person. A
+manager answers "who is carrying what" and "what is X blocked on" by naming
+each person in turn; an unknown or departed person id returns an empty queue,
+never the whole team's work. The filter is a hard scope like `project` (it
+composes with it) and never overrides liveness — a terminal task assigned to
+the person still leaves the queue.
+
+A **grouped** team-capacity view (everyone's open work at once, bucketed by
+owner) is a first-party manager need, not merely a customer illustration —
+the `lens-team-capacity` example (in the meridian fixture corpus) is the
+shape. Shipping it as a live-native default lens is deferred: the lens engine
+groups by a frontmatter field, so a live grouping by the `assigned` *edge*
+awaits group-by-edge-target support; the meridian fixture works because it
+also carries an `owner:` field. Until then the `assignee` filter is the
+shipped per-person surface (iterate it per person for the capacity picture).
 
 ## 6. The gardener
 

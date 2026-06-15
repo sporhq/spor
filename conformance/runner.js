@@ -99,6 +99,7 @@ const KINDS = {
     const g = graphFor(c.corpus);
     return json(kqueue.rankQueue(g, {
       project: c.input.project ?? null,
+      assignee: c.input.assignee ?? null,
       activity: c.input.activity ?? null,
       front: c.input.front ?? null,
       limit: c.input.limit ?? undefined,

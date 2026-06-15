@@ -10,7 +10,9 @@ date: 2026-06-10
 
 Seed schema for the `stewards` edge type (person → node they steward),
 shipped with the plugin as a registry default (QUEUE.md §2). Tier-2
-question routing walks these edges to decide who gets asked what.
+question routing walks these edges to decide who gets asked what, and
+per-person queues filter on them alongside `assigned` (the queue's
+`assignee` parameter — task-cc-queue-assignee-filtering).
 
 ```json
 {

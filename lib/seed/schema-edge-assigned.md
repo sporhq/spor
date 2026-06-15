@@ -11,7 +11,9 @@ date: 2026-06-10
 Seed schema for the `assigned` edge type (work node → person), shipped
 with the plugin as a registry default (QUEUE.md §2). Per-person views
 ("what am I blocking") traverse it from the `$viewer` binding; per-person
-queues will filter on it.
+queues filter on it — the queue's `assignee` parameter
+(`GET /v1/queue?assignee=<person>`), unioned with the person's `stewards`
+edges (task-cc-queue-assignee-filtering).
 
 ```json
 {
