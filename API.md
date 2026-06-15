@@ -172,14 +172,32 @@ Only an unreachable ingestion model is an error (`ingestion_unavailable`).
 ### `my_queue`
 
 The decision queue (QUEUE.md §4/§5). Input `{ "project"?: "slug",
-"limit"?: 20 }` → `{ "items": [{id, title, type, status, priority, score,
-signals: {blocking, heat, staleness, age_days}, suggest: "do|close", why}],
-"count": N, "questions": [] }` — queueable live nodes ranked by the default
-blend, each with a one-line *why*. Items already retired by a live inbound
-resolves/answers edge are excluded whatever their status field reads; open
-gardener findings ride along per item as `findings`. Structured output
-additionally carries `view` — the queue projected into the view-tree catalog
-for the MCP-app widget (below).
+"limit"?: 20, "offset"?: 0 }` → `{ "items": [{id, title, type, status,
+priority, score, signals: {blocking, heat, staleness, age_days}, suggest:
+"do|close", why}], "count": N, "offset": 0, "returned_count": N,
+"total_count": N, "truncated": false, "next_offset": null, "questions": []
+}` — queueable live nodes ranked by the default blend, each with a one-line
+*why*. Items already retired by a live inbound resolves/answers edge are
+excluded whatever their status field reads; open gardener findings ride
+along per item as `findings`. Structured output additionally carries
+`view` — the queue projected into the view-tree catalog for the MCP-app
+widget (below).
+
+**Limit and pagination.** `limit` is the page size (default 20, **max
+100** — values above the max are clamped, not rejected); `offset` skips that
+many items in the ranked order before the page (default 0). The aggregate
+counts (`counts_by_type` / `_project` / `_suggest`, `total_count`) always
+cover the **full** ranked set regardless of the page, so a single call
+answers "how many issues vs tasks" without paging or project-splitting.
+`returned_count` is the size of this page, `truncated` is true when more
+items follow it, and `next_offset` is the offset to pass next to continue
+(null on the last page). Pagination is **offset over a point-in-time ranked
+slice, not a cursor**: the queue re-ranks on every call (heat, age, leases,
+and status all shift), so an offset resumes the same slice only if the
+ranking has not changed between calls — the benign failure mode is an item
+seen twice or skipped once across a re-rank, never a hard error. Walk the
+whole queue by re-calling with `offset = next_offset` until `next_offset` is
+null.
 
 ### `ask_question`
 
@@ -248,7 +266,7 @@ endpoint is the REST twin of a core call:
 | `POST /v1/capture` | distill, /spor:defer | `capture` semantics: `{text, context: {project, during, blocks?, needed_by?}, source?}` → ingestion model + validate + commit → `{status, ids, nodes, summary, warnings}`. `source: "distill"` marks backstop captures in the journal. `context.blocks` (a node id, must exist) and `context.needed_by` (`YYYY-MM-DD`) declare a cross-project dependency (task-cc-xproject-dependency-loop): set `context.project` to the SERVING project and the server attaches a `blocks` edge to the requester + the deadline deterministically (not via the model) onto the primary node. A missing `blocks` target is `404`; a non-date `needed_by` is `422` — both rejected before any model call |
 | `POST /v1/distill/report` | distill | sweep telemetry, journal-only (no store mutation): `{facts, captured?, spooled?, rejected?, project?, session?}` → `{status: "reported"}`; zero-fact sweeps report too |
 | `POST /v1/corrections` | /spor:correct | `propose_correction` semantics → 201 `{status, id, revision, warnings}` |
-| `GET /v1/queue?project=&assignee=&limit=` | /spor:next, session-start | the ranked decision queue: `{items, count, muted?, dormant?, questions, findings, policy?, generated_at}` — items retired by a live resolves/answers edge are excluded; items hidden by the viewer's `queue_mute` or parked by a future `wake:` date (QUEUE.md §4) are counted, never silently dropped; `questions`/`findings` are the routed-to-me-plus-unrouted views for the authenticated identity. `project` resolves through the shared up-resolution (dec-spor-queue-slug-resolves-to-grouping): a bare repo slug unions its home-project grouping's member queues, the repo NODE id (`repo-<slug>`) pins one repo, a grouping id (`proj-<slug>`) is used directly. `assignee=<person-id>` scopes to the work that person carries (their `assigned`/`stewards` edges) — a manager's "who is carrying what"; `assignee=me` binds to the caller (empty if the token maps to no person node) |
+| `GET /v1/queue?project=&assignee=&limit=&offset=` | /spor:next, session-start | the ranked decision queue: `{items, count, offset, returned_count, total_count, truncated, next_offset, counts_by_type, counts_by_project, counts_by_suggest, muted?, dormant?, questions, findings, policy?, generated_at}` — items retired by a live resolves/answers edge are excluded; items hidden by the viewer's `queue_mute` or parked by a future `wake:` date (QUEUE.md §4) are counted, never silently dropped; `questions`/`findings` are the routed-to-me-plus-unrouted views for the authenticated identity. `limit` is the page size (default 20, **max 100**, clamped not rejected) and `offset` skips that many items in the ranked order (default 0); the `counts_*`/`total_count` aggregates always cover the FULL ranked set regardless of the page, so one call answers "how many issues vs tasks" without paging, while `truncated`/`next_offset` let a client walk the rest by re-requesting with `offset=next_offset` until `next_offset` is null. Pagination is offset over a point-in-time ranked slice (the queue re-ranks every call), not a cursor — it resumes the same slice only across an unchanged ranking. `project` resolves through the shared up-resolution (dec-spor-queue-slug-resolves-to-grouping): a bare repo slug unions its home-project grouping's member queues, the repo NODE id (`repo-<slug>`) pins one repo, a grouping id (`proj-<slug>`) is used directly. `assignee=<person-id>` scopes to the work that person carries (their `assigned`/`stewards` edges) — a manager's "who is carrying what"; `assignee=me` binds to the caller (empty if the token maps to no person node) |
 | `POST /v1/questions` `{text, title?, mentions?}` | ask_question's REST twin | file a question node; deterministically routed to the steward of the closest relevance-neighborhood node, unrouted if none → 201 `{status, id, routed_to, via, asker, revision, warnings}` |
 | `POST /v1/gardener` | ops cron / on demand | run a gardener sweep now; findings filed as queue items → `{filed, resolved, ..., generated_at}` |
 | `GET /v1/lens/{id}/render?format=html\|text\|json` | browsers, teammates without a checkout | run a lens OR workspace node and render its view tree (html default, plain text, or the raw tree as json). Read-only — no action forms; writes stay with `/v1/nodes` and the MCP tools. Auth is the caller's bearer header OR a signed read-only **render ticket** for shared links (browser links can't carry an Authorization header): `?ticket=<blob>` is accepted once and exchanged via a 302 for an HttpOnly `spor_render_ticket` cookie (kept out of URLs, logs, and view-to-view hrefs). The ticket binds `$viewer` to the recorded sharer and the render shows a "Viewing as &lt;sharer&gt;" banner. The former `?token=<PAT>` sharing path is **removed** — a shared link can never carry a write-capable credential |
