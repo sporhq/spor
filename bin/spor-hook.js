@@ -15,6 +15,7 @@
 //   spor-hook post-tool      [--host ...]
 //   spor-hook distill        [--host ...] [--debounce SECONDS]
 //   spor-hook agents-md      [--cwd DIR]    # AGENTS.md floor; no stdin
+//   spor-hook doctor         [--cwd DIR]    # client health report; no stdin
 //
 // Fail-open contract (dec-cc-fail-open-hooks): any failure exits 0 with no
 // output — a Spor problem never costs the user their session.
@@ -111,6 +112,23 @@ async function main() {
     else if (payload && payload.cwd) amdCwd = payload.cwd;
     if (!u.useConfig({ cwd: amdCwd }).enabled()) return;
     await agentsMd(payload, args);
+    return;
+  }
+
+  // `spor-hook doctor` (task-cc-client-hook-operability-diagnostics piece 3):
+  // an operator-run diagnostic, not a host hook — it takes no stdin and prints a
+  // human-readable health report. It runs even when the plugin is disabled for
+  // the repo (a disabled plugin is exactly what you'd want doctor to tell you).
+  // Write the report with fs.writeSync(1) so the full body flushes before the
+  // crash handler's process.exit(0) can truncate a piped stdout.
+  if (event === "doctor") {
+    const { doctor } = require("../scripts/engines/doctor");
+    let dCwd = process.cwd();
+    const ci = args.indexOf("--cwd");
+    if (ci >= 0 && args[ci + 1]) dCwd = args[ci + 1];
+    u.useConfig({ cwd: dCwd });
+    const report = await doctor();
+    fs.writeSync(1, report);
     return;
   }
 

@@ -331,6 +331,33 @@ function ensureDir(dir) {
   }
 }
 
+// Count and oldest-mtime (epoch ms) of the *.json files directly in `dir`
+// (non-recursive — outbox/dead/ is a subdir whose name doesn't end in .json, so
+// it never leaks into the parent's count). The shape both the session-start
+// degradation nudge and `spor-hook doctor` read to gauge outbox / dead-letter
+// health (task-cc-client-hook-operability-diagnostics). Fail-open: an
+// unreadable or absent dir is { count: 0, oldestMs: null }.
+function spoolStats(dir) {
+  let count = 0;
+  let oldestMs = null;
+  let files;
+  try {
+    files = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
+  } catch {
+    return { count: 0, oldestMs: null };
+  }
+  for (const f of files) {
+    count++;
+    try {
+      const m = fs.statSync(path.join(dir, f)).mtimeMs;
+      if (oldestMs == null || m < oldestMs) oldestMs = m;
+    } catch {
+      /* a file that vanished mid-scan just doesn't count toward oldest */
+    }
+  }
+  return { count, oldestMs };
+}
+
 // --- local repo map (slug -> checkout path) -------------------------------
 // Which directory a project slug lives in on THIS machine. Per-machine and
 // machine-specific: it is NEVER in the shared graph (every teammate clones to a
@@ -673,6 +700,7 @@ module.exports = {
   repoFingerprints,
   git,
   ensureDir,
+  spoolStats,
   registerRepo,
   forgetRepo,
   appendLine,

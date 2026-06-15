@@ -795,3 +795,129 @@ test('rename: SPOR_DISTILL_CMD replaces the claude backend', () => {
   );
   assert.ok(fs.existsSync(path.join(home, 'nodes', 'dec-test-hookcli.md')), 'distiller (SPOR_DISTILL_CMD) wrote no nodes');
 });
+
+// ---------------------------------------------------------------------------
+// task-cc-client-hook-operability-diagnostics piece 3: `spor-hook doctor`, the
+// client health surface (and piece 2: the session-start degradation nudge).
+// ---------------------------------------------------------------------------
+
+// Drop a dead-lettered capture into outbox/dead/ (the strand the fail-open path
+// leaves behind — what both the nudge and doctor must surface).
+function deadLetter(home, name) {
+  fs.mkdirSync(path.join(home, 'outbox', 'dead'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'outbox', 'dead', name), '{}');
+}
+
+test('doctor (local): reports local mode, node count, and exits 0', () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(path.join(home, 'nodes', 'a.md'), 'title: x\n');
+  const out = run(['doctor', '--cwd', cwd], '', freshEnv(home));
+  assert.match(out, /spor doctor/);
+  assert.match(out, /mode:\s+local/);
+  assert.match(out, /graph:\s+.*\(1 nodes\)/);
+});
+
+test('doctor (remote, 200): names the server, reachable, token valid', async () => {
+  const { home, cwd } = scratch();
+  const { srv, base } = await statusServer(200);
+  try {
+    const env = freshEnv(home);
+    env.SPOR_SERVER = base;
+    env.SPOR_TOKEN = 'spor_pat_good';
+    let out = '';
+    await runAsync2(['doctor', '--cwd', cwd], '', env, (s) => (out += s));
+    assert.match(out, /mode:\s+remote/);
+    assert.match(out, /server:\s+http:\/\/127\.0\.0\.1:/);
+    assert.match(out, /reachable:\s+yes/);
+    assert.match(out, /token:\s+valid/);
+  } finally {
+    srv.close();
+  }
+});
+
+test('doctor (remote, 401): token REJECTED, not an outage', async () => {
+  const { home, cwd } = scratch();
+  const { srv, base } = await statusServer(401);
+  try {
+    const env = freshEnv(home);
+    env.SPOR_SERVER = base;
+    env.SPOR_TOKEN = 'spor_pat_bad';
+    let out = '';
+    await runAsync2(['doctor', '--cwd', cwd], '', env, (s) => (out += s));
+    assert.match(out, /reachable:\s+yes/);
+    assert.match(out, /token:\s+REJECTED \(http 401\)/);
+    assert.doesNotMatch(out, /reachable:\s+NO/);
+  } finally {
+    srv.close();
+  }
+});
+
+test('doctor (remote): surfaces dead-lettered captures with their count', async () => {
+  const { home, cwd } = scratch();
+  deadLetter(home, 'd1.capture.json');
+  deadLetter(home, 'd2.capture.json');
+  const { srv, base } = await statusServer(200);
+  try {
+    const env = freshEnv(home);
+    env.SPOR_SERVER = base;
+    env.SPOR_TOKEN = 'spor_pat_good';
+    let out = '';
+    await runAsync2(['doctor', '--cwd', cwd], '', env, (s) => (out += s));
+    assert.match(out, /dead-letter:\s+2 in outbox\/dead\//);
+    assert.match(out, /PERMANENT rejects/);
+  } finally {
+    srv.close();
+  }
+});
+
+// Piece 2: the session-start nudge rides the SAME channel as the OFFLINE banner.
+test('session-start (remote): a dead-lettered capture surfaces a nudge to run doctor', async () => {
+  const { home, cwd } = scratch();
+  deadLetter(home, 'd1.capture.json');
+  const { srv, base } = await statusServer(200); // 200 + empty body => no-briefing path
+  try {
+    const env = freshEnv(home);
+    env.SPOR_SERVER = base;
+    env.SPOR_TOKEN = 'spor_pat_good';
+    let out = '';
+    await runAsync2(['session-start', '--host', 'claude-code'],
+      JSON.stringify({ cwd, hook_event_name: 'SessionStart' }), env, (s) => (out += s));
+    const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+    assert.match(ctx, /dead-lettered in outbox\/dead\//);
+    assert.match(ctx, /spor-hook doctor/);
+  } finally {
+    srv.close();
+  }
+});
+
+test('session-start (remote): the nudge rides the OFFLINE banner when the server is unreachable', async () => {
+  const { home, cwd } = scratch();
+  deadLetter(home, 'd1.capture.json');
+  const env = freshEnv(home);
+  env.SPOR_SERVER = 'http://127.0.0.1:1'; // dead port, no cache
+  env.SPOR_TOKEN = 'spor_pat_x';
+  let out = '';
+  await runAsync2(['session-start', '--host', 'claude-code'],
+    JSON.stringify({ cwd, hook_event_name: 'SessionStart' }), env, (s) => (out += s));
+  const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /OFFLINE/);
+  assert.match(ctx, /dead-lettered in outbox\/dead\//);
+});
+
+test('session-start (remote): a healthy outbox adds no nudge', async () => {
+  const { home, cwd } = scratch();
+  const { srv, base } = await statusServer(200);
+  try {
+    const env = freshEnv(home);
+    env.SPOR_SERVER = base;
+    env.SPOR_TOKEN = 'spor_pat_good';
+    let out = '';
+    await runAsync2(['session-start', '--host', 'claude-code'],
+      JSON.stringify({ cwd, hook_event_name: 'SessionStart' }), env, (s) => (out += s));
+    const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+    assert.doesNotMatch(ctx, /dead-lettered/);
+    assert.doesNotMatch(ctx, /spooled and undelivered/);
+  } finally {
+    srv.close();
+  }
+});

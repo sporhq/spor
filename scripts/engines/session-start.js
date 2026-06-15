@@ -80,6 +80,37 @@ Auto-registered repo identity for \`${slug}\` (issue-spor-onboard-no-repo-identi
 `;
 }
 
+// Spool depth at which an undelivered outbox is worth a nudge. A handful of
+// files between a distill spool and the next drain is normal; this many means
+// shipping has been failing long enough to flag (task-cc-client-hook-
+// operability-diagnostics piece 2).
+const SPOOL_NUDGE_THRESHOLD = 10;
+
+// One-line client-degradation nudge, injected in the SAME channel as the
+// OFFLINE/AUTH banner (task-cc-client-hook-operability-diagnostics piece 2).
+// The fail-open machinery hides degradation: dead-lettered captures sit unseen
+// in outbox/dead/ and a deep spool means captures aren't shipping. Surface it
+// so the developer knows to look — and where (`spor-hook doctor`). Dead-letters
+// win over spool depth (a permanent reject is the more actionable failure).
+// Leading space + trailing period so it splices cleanly after a status line.
+// Returns "" when healthy; fail-open — any error yields no nudge.
+function degradationNudge(graph) {
+  try {
+    const outbox = path.join(graph, "outbox");
+    const dead = u.spoolStats(path.join(outbox, "dead")).count;
+    if (dead > 0) {
+      return ` ⚠ ${dead} capture${dead === 1 ? "" : "s"} dead-lettered in outbox/dead/ (permanent rejects, usually a bad/expired token) — run 'spor-hook doctor'.`;
+    }
+    const spooled = u.spoolStats(outbox).count;
+    if (spooled >= SPOOL_NUDGE_THRESHOLD) {
+      return ` ⚠ ${spooled} captures spooled and undelivered (the server may have been unreachable) — run 'spor-hook doctor'.`;
+    }
+  } catch {
+    /* fail open — a degraded health surface must never cost the session */
+  }
+  return "";
+}
+
 async function sessionStart(input) {
   const graph = u.graphHome();
   const nodes = path.join(graph, "nodes");
@@ -125,6 +156,13 @@ async function sessionStart(input) {
     u.ensureDir(cacheDir);
     u.ensureDir(path.join(graph, "journal"));
     const rlog = u.makeLogger(path.join(graph, "journal", "remote.log"), `session-start ${slug}: `);
+
+    // Client-degradation nudge (piece 2), computed once and spliced into every
+    // status line below — it is orthogonal to whether THIS fetch succeeds (dead
+    // letters from a past outage outlive a now-healthy server), so it rides the
+    // healthy banner too, not only the OFFLINE/AUTH fallback.
+    const dline = degradationNudge(graph);
+    if (dline) rlog(`degradation nudge surfaced:${dline}`);
 
     // Drain spooled nodes DETACHED: it is independent of the briefing/queue
     // fetch and must not add to the response latency. Awaiting it serially
@@ -208,7 +246,7 @@ async function sessionStart(input) {
           rlog("cache write failed");
         }
         rlog(`briefing ok (v${version}, ${ncount} nodes)`);
-        const ctx = `team graph: ${ncount} nodes @ ${host}. ${USAGE_REMOTE}${qline}${oline}
+        const ctx = `team graph: ${ncount} nodes @ ${host}.${dline} ${USAGE_REMOTE}${qline}${oline}
 
 ## Standing project briefing (brief-${slug} v${version}, machine-compiled from the team graph — correct it with /spor:correct, don't silently work around errors)
 
@@ -218,7 +256,7 @@ ${u.byteHead(body, 7000)}${projectBriefBlock(resp)}`;
       // 200 but no briefing for this project: still note the graph status.
       rlog(`briefing not found for ${slug} (${ncount} nodes)`);
       return envelope(
-        `team graph: ${ncount} nodes @ ${host} (no standing briefing for ${slug} yet). ${USAGE_REMOTE}${qline}${oline}${projectBriefBlock(resp)}`
+        `team graph: ${ncount} nodes @ ${host} (no standing briefing for ${slug} yet).${dline} ${USAGE_REMOTE}${qline}${oline}${projectBriefBlock(resp)}`
       );
     }
 
@@ -236,9 +274,10 @@ ${u.byteHead(body, 7000)}${projectBriefBlock(resp)}`;
     } else {
       rlog(`server unreachable (http=${brief.http}); falling back to cache`);
     }
-    const statusLine = isAuth
-      ? `team graph: AUTH FAILED (${host} rejected the token, http ${brief.http}) — your spor token is invalid, revoked, or expired. Re-mint it and update SPOR_TOKEN; until then captures are NOT shipping (they spool to the outbox and dead-letter).`
-      : `team graph: OFFLINE (could not reach ${host}).`;
+    const statusLine =
+      (isAuth
+        ? `team graph: AUTH FAILED (${host} rejected the token, http ${brief.http}) — your spor token is invalid, revoked, or expired. Re-mint it and update SPOR_TOKEN; until then captures are NOT shipping (they spool to the outbox and dead-letter).`
+        : `team graph: OFFLINE (could not reach ${host}).`) + dline;
     if (fs.existsSync(cache)) {
       let raw = "";
       try {
@@ -265,6 +304,14 @@ ${body}`;
     // outage); a pure transport failure with no cache injects nothing, as before.
     if (isAuth) {
       rlog("no cache available; surfacing auth failure only");
+      return envelope(statusLine);
+    }
+    // A pure transport failure with no cache normally injects nothing — but a
+    // non-empty degradation nudge (dead letters / deep spool) is actionable
+    // regardless of the current outage, so surface the OFFLINE banner + nudge
+    // rather than swallowing the one fact the operator can act on (piece 2).
+    if (dline) {
+      rlog("no cache available; surfacing degradation nudge with OFFLINE banner");
       return envelope(statusLine);
     }
     rlog("no cache available; injecting nothing");

@@ -366,3 +366,22 @@ SPOR_TOKEN=spor_pat_...                # per-user token (§4)
 Failure policy: **fail open, never block** — a hook must never break a
 session; connection refused, timeout, 5xx, and auth failure all collapse to
 "the graph has nothing for you".
+
+Because fail-open hides degradation by design — a crashing engine and a
+quiet success look identical, and stranded captures pile up unseen in
+`outbox/dead/` — the client carries three operability surfaces
+(task-cc-client-hook-operability-diagnostics):
+
+- **Crash telemetry.** The dispatcher's top-level catch appends one line to
+  `journal/remote.log` (`dispatcher <event>: crashed (fail-open, exit 0):
+  …`) before honoring the exit-0 contract, so a crash is distinguishable
+  from healthy silence after the fact.
+- **Session-start nudge.** When `outbox/dead/` is non-empty or the outbox
+  spool exceeds a depth threshold, session-start splices a one-line warning
+  into the same channel as the `OFFLINE`/`AUTH FAILED` banner, pointing at
+  `spor-hook doctor`.
+- **`spor-hook doctor`.** An operator-run, read-only diagnostic (no stdin,
+  exits 0) that reports resolved mode, server reachability, token validity,
+  outbox + dead-letter counts with the oldest file's age, cached-briefing
+  freshness, and the trailing error lines from `journal/remote.log` and
+  `journal/distill.log`.

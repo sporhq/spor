@@ -233,6 +233,22 @@ verifiable rather than asserted:
   /`SPOR_NUDGE_CMD` backends return text only, so their rows count as
   cost-unknown.
 
+### Health and diagnostics
+
+The hooks fail open — they never break a session — which also means a dead
+server or a revoked token degrades quietly. To make that legible, run:
+
+```bash
+spor-hook doctor
+```
+
+It prints a one-shot health report: resolved mode, server reachability and
+token validity, the outbox and dead-letter depth (with the oldest stranded
+capture's age), how fresh the cached briefing is, and the most recent error
+lines from `journal/remote.log` and `journal/distill.log`. When captures
+have been stranded (a dead-letter pile-up or a deep outbox), session-start
+also surfaces a one-line nudge alongside its status banner pointing you here.
+
 ## Pointers
 
 - [GRAPH.md](GRAPH.md) — the node and edge format: what a node file looks
