@@ -228,6 +228,88 @@ test("Registry: queue-policy is a singleton slot with graph-beats-seed precedenc
   assert.equal(reg.isKnownType("queue-policy"), false);
 });
 
+// ---------- the org-defined policy layer (task-cc-policy-layer) ----------
+
+test("parseSchemaNode: policy kind keys by id, requires gate(), validates governs", () => {
+  const make = (id, body) => registry.parseSchemaNode({
+    id, kind: "policy", schema_version: "2026.06.15.1", body,
+  });
+  const ok = make("policy-dod-quorum",
+    '```json\n{"governs": {"types": ["task"], "projects": ["spor"]}}\n```\n\n' +
+    '```js\nexport function gate(c, p, v) { return { allow: true }; }\n```');
+  assert.equal(ok.ok, true, ok.errors.join("; "));
+  assert.equal(ok.schema.kind, "policy");
+  assert.equal(ok.schema.key, "policy-dod-quorum", "policy is keyed by its node id");
+  assert.equal(typeof ok.schema.code.gate, "string");
+  // a policy with no gate() export is inert by construction — reject it.
+  const noGate = make("policy-x", '```json\n{"governs": {"types": ["task"]}}\n```\n\n```js\nexport function other() {}\n```');
+  assert.ok(noGate.errors.some((e) => /gate\(\)/.test(e)));
+  // governs must be an object of string arrays
+  const badGov = make("policy-y", '```json\n{"governs": ["task"]}\n```\n\n```js\nexport function gate() { return {allow:true}; }\n```');
+  assert.ok(badGov.errors.some((e) => /governs must be an object/.test(e)));
+  const badTypes = make("policy-z", '```json\n{"governs": {"types": [1, 2]}}\n```\n\n```js\nexport function gate() { return {allow:true}; }\n```');
+  assert.ok(badTypes.errors.some((e) => /governs\.types must be an array/.test(e)));
+  // governs is OPTIONAL — an org-wide policy omits it (governs everything).
+  const orgWide = make("policy-w", '```json\n{}\n```\n\n```js\nexport function gate() { return {allow:true}; }\n```');
+  assert.equal(orgWide.ok, true, orgWide.errors.join("; "));
+});
+
+test("Registry.policiesFor: governs-traversal selects by type/project, most-specific-first", () => {
+  const reg = new registry.Registry();
+  const policy = (id, governs) => ({
+    id, kind: "policy", version: "2026.06.15.1", key: id,
+    payload: governs ? { governs } : {}, code: { gate: "export function gate(){}" },
+    codeBlocks: [], upgrades: [],
+  });
+  reg.add(policy("policy-org-wide", null), "graph");                                  // governs all
+  reg.add(policy("policy-tasks", { types: ["task"] }), "graph");                      // type-scoped
+  reg.add(policy("policy-spor-tasks", { types: ["task"], projects: ["spor"] }), "graph"); // type+project
+  reg.add(policy("policy-other-proj", { projects: ["meridian"] }), "graph");          // project-scoped, other proj
+
+  // a spor task is governed by org-wide + task + spor-task (NOT the meridian one)
+  const forSporTask = reg.policiesFor({ type: "task", project: "spor" }).map((p) => p.id);
+  assert.deepEqual(forSporTask, ["policy-spor-tasks", "policy-tasks", "policy-org-wide"],
+    "most-specific first: type+project (2) > type (1) > org-wide (0); meridian excluded");
+
+  // a meridian decision is governed by org-wide + the meridian project policy only
+  const forMerDec = reg.policiesFor({ type: "decision", project: "meridian" }).map((p) => p.id);
+  assert.deepEqual(forMerDec.sort(), ["policy-org-wide", "policy-other-proj"]);
+
+  // a node with no project still matches type-only and org-wide policies
+  const noProj = reg.policiesFor({ type: "task" }).map((p) => p.id);
+  assert.deepEqual(noProj.sort(), ["policy-org-wide", "policy-tasks"]);
+});
+
+test("Registry: a policy is keyed by id (many coexist) with graph-beats-seed precedence", () => {
+  const reg = new registry.Registry();
+  const policy = (id, version) => ({
+    id, kind: "policy", version, key: id,
+    payload: {}, code: { gate: "export function gate() {}" }, codeBlocks: [], upgrades: [],
+  });
+  // distinct ids coexist (NOT a singleton, unlike queue-policy)
+  assert.equal(reg.add(policy("policy-a", "2026.06.15.1"), "graph"), true);
+  assert.equal(reg.add(policy("policy-b", "2026.06.15.1"), "graph"), true);
+  assert.equal(reg.policySchemas.size, 2);
+  // same id: graph beats seed even at a lower version
+  assert.equal(reg.add(policy("policy-a", "2026.06.16.1"), "seed"), false, "seed never displaces a graph policy");
+  // within graph, higher version wins for the same id
+  assert.equal(reg.add(policy("policy-a", "2026.06.16.1"), "graph"), true);
+  assert.equal(reg.policySchemas.get("policy-a").version, "2026.06.16.1");
+  // a policy does not register a node TYPE
+  assert.equal(reg.isKnownType("policy-a"), false);
+  // no policies present => policiesFor is [] (the no-policy-node path)
+  assert.deepEqual(new registry.Registry().policiesFor({ type: "task" }), []);
+});
+
+test("seed pack ships NO policy (the no-policy-node default is byte-identical)", () => {
+  // The policy layer is org-AUTHORED data resident in a graph, never a seed
+  // default — so a graph with no policy node sees an empty policy set and every
+  // existing path is unchanged (dec-spor-policy-layer-activate: additive).
+  const reg = graph.seedRegistry();
+  assert.equal(reg.policySchemas.size, 0);
+  assert.deepEqual(reg.policiesFor({ type: "task", project: "spor" }), []);
+});
+
 // ---------- seed pack integrity: expresses GRAPH.md exactly ----------
 
 test("seed pack: edge weights match the historic EDGE_WEIGHTS table exactly", () => {
