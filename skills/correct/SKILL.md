@@ -8,6 +8,13 @@ description: Record a standing correction to a Spor briefing (pin/exclude nodes,
 Corrections are nodes. They persist in the graph and are applied at every
 future compile of their target — a context fix made once applies forever.
 
+**Resolve mode silently.** The Spor status line injected at session start tells
+you which mode you're in (`team graph: …` = remote, `A Spor knowledge graph is
+active: …` = local); use it, or test `[ -n "$SPOR_SERVER" ]` once if it isn't in
+context. Don't echo `SPOR_SERVER`/`SPOR_TOKEN`/`SPOR_HOME` or announce the mode
+to the user unless they ask, and run the local-mode resolution below without
+echoing `$SPOR_ROOT`.
+
 ## Remote mode (team graph) — when `SPOR_SERVER` is set
 
 (Env vars here are the `SPOR_*` family; the legacy `SUBSTRATE_*` names are

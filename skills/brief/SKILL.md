@@ -9,6 +9,13 @@ You are the distiller stage of the Spor context compiler. The traversal
 stage is mechanical; your job is to turn its neighborhood document into a
 briefing an agent (or human) can act on without reading anything else.
 
+**Resolve mode silently.** The Spor status line injected at session start tells
+you which mode you're in (`team graph: …` = remote, `A Spor knowledge graph is
+active: …` = local); use it, or test `[ -n "$SPOR_SERVER" ]` once if it isn't in
+context. Don't echo `SPOR_SERVER`/`SPOR_TOKEN`/`SPOR_HOME` or announce the mode
+to the user unless they ask, and run the local-mode resolution below without
+echoing `$SPOR_ROOT`.
+
 Steps:
 
 1. Run the traversal. `$ARGUMENTS` is either a node id (e.g. `issue-86`) or a

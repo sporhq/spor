@@ -14,6 +14,13 @@ Write 2-3 standalone sentences: WHAT the work is and WHY it was deferred
 concrete names (files, endpoints, node ids). Do not pick node types or ids —
 the server's ingestion model does that against the live schema registry.
 
+**Resolve mode silently.** The Spor status line injected at session start tells
+you which mode you're in (`team graph: …` = remote, `A Spor knowledge graph is
+active: …` = local); use it, or test `[ -n "$SPOR_SERVER" ]` once if it isn't in
+context. Don't echo `SPOR_SERVER`/`SPOR_TOKEN`/`SPOR_HOME` or announce the mode
+to the user unless they ask, and run the local-mode resolution below without
+echoing `$SPOR_ROOT`.
+
 ## Remote mode (team graph) — when `SPOR_SERVER` is set
 
 (Env vars here are the `SPOR_*` family; the legacy `SUBSTRATE_*` names are

@@ -520,7 +520,7 @@ test('session-start local: an archived project is announced, not briefed', () =>
   const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
   assert.match(ctx, /repo-x \(new-name\) is ARCHIVED/);
   assert.ok(!ctx.includes('Standing project briefing'), 'archived project must not inject a stale brief');
-  assert.ok(!ctx.includes('open front:'), 'archived project has no live front to surface');
+  assert.ok(!ctx.includes('next up:'), 'archived project has no live front to surface');
 });
 
 // Stub server: records requests; answers the briefing fetch found:false.

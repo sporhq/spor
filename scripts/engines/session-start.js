@@ -160,7 +160,11 @@ async function sessionStart(input) {
       const item = (q.items || [])[0];
       if (item && item.id) {
         const why = item.why || "";
-        oline = `\nopen front: ${item.id} — ${item.title || ""}${why ? ` (${why})` : ""}`;
+        // Emitted phrasing is deliberately plain ("next up:", not the internal
+        // "open front" coinage) so it doesn't prime the agent to parrot jargon
+        // at the human (issue-cc-skill-queue-jargon-mode-theater). The concept
+        // is still the open front; only the user-facing words changed.
+        oline = `\nnext up: ${item.id} — ${item.title || ""}${why ? ` (${why})` : ""}`;
         if ((item.suggest || "do") === "close") oline += " — the queue suggests CLOSING it, not doing it";
         oline += ". Full queue: /spor:next.";
       }
@@ -328,7 +332,8 @@ ${body}`;
     const r = rankQueue(g, { project: slug, limit: 1 });
     const item = (r.items || [])[0];
     if (item && item.id) {
-      oline = `\nopen front: ${item.id} — ${item.title || ""}${item.why ? ` (${item.why})` : ""}`;
+      // Plain user-facing phrasing — mirror remote mode's "next up:" line.
+      oline = `\nnext up: ${item.id} — ${item.title || ""}${item.why ? ` (${item.why})` : ""}`;
       if (item.suggest === "close") oline += " — the queue suggests CLOSING it, not doing it";
       oline += ". Full queue: /spor:next.";
     }
