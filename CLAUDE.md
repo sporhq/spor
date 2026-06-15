@@ -85,7 +85,15 @@ classifier and, if it finds capturable facts, injects a capture-or-dismiss
 stdout, same contract as `SPOR_DISTILL_CMD`; stubs must `cat >/dev/null`
 first or the prompt pipe SIGPIPEs); `SPOR_NUDGE=0` disables; cooldown
 state is `journal/<session>.nudged`. `scripts/distill-gemini.sh` satisfies the
-contract too (~2-7s vs ~17s for `claude -p` CLI boot). See test/nudge.test.js.
+contract too (~2-7s vs ~17s for `claude -p` CLI boot). The classifier runs
+SYNCHRONOUSLY in the tool loop, so two bounds keep a docs-heavy session cheap:
+`SPOR_NUDGE_MAX` (`nudge.maxCalls`, default 20) caps total classifier calls per
+session — each `.md` is classified at most once and a NOTHING result is free
+against the separate 3-fired-nudge cap, so without this a session that writes
+many `.md` files runs unbounded calls — and `SPOR_NUDGE_TIMEOUT`
+(`nudge.timeoutMs`, default 30000) SIGKILLs a hung backend (the distiller has
+the parallel `SPOR_DISTILL_TIMEOUT`/`distill.timeoutMs`, default 120000). All
+knobs resolve through the config cascade (`u.cfgNum`). See test/nudge.test.js.
 
 Hooks have two modes (API.md §6): the payloads above test LOCAL mode;
 prefix `SPOR_SERVER=http://127.0.0.1:<port> SPOR_TOKEN=<token>` to

@@ -36,6 +36,17 @@ function clearConfig() {
 function cfgStr(keyPath, envName) {
   return _config ? _config.get(keyPath) : home.envDual(envName);
 }
+// Config-aware numeric read with a fallback, for the same cascade. Used for
+// the bound knobs (nudge.maxCalls, nudge.timeoutMs, distill.timeoutMs): the
+// active config's getNum, else the env dual-read parsed as a finite number,
+// else the fallback. A blank or non-numeric value degrades to the fallback.
+function cfgNum(keyPath, envName, fallback) {
+  if (_config) return _config.getNum(keyPath, fallback);
+  const v = home.envDual(envName);
+  if (v === undefined) return fallback;
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : fallback;
+}
 
 function graphHome() {
   return _config ? _config.graphHome() : home.graphHome();
@@ -621,13 +632,17 @@ function remoteTitleIndex(respBody, maxLines = 150) {
 // Run a user-supplied backend command (SPOR_DISTILL_CMD / SPOR_NUDGE_CMD):
 // prompt on stdin -> response on stdout, with the recursion guard in the
 // environment (both spellings, so plugin installs that lag the rename still
-// see it). Returns null on failure.
-function runBackendCmd(cmd, prompt) {
+// see it). Returns null on failure. `timeoutMs` (when > 0) bounds a hung
+// backend so the synchronous nudge/distill call can't block the host past its
+// own budget — SIGKILL because the whole point is to survive a wedged child
+// that would ignore SIGTERM (a killed run lands in r.error and fails open).
+function runBackendCmd(cmd, prompt, { timeoutMs } = {}) {
   const r = spawnSync("sh", ["-c", cmd], {
     input: prompt,
     encoding: "utf8",
     env: { ...process.env, SPOR_DISTILLING: "1", SUBSTRATE_DISTILLING: "1" },
     maxBuffer: 16 * 1024 * 1024,
+    ...(timeoutMs > 0 ? { timeout: timeoutMs, killSignal: "SIGKILL" } : {}),
   });
   if (r.status !== 0 || r.error) return null;
   // RESPONSE=$(...) — command substitution strips trailing newlines.
@@ -663,8 +678,10 @@ function parseClaudeResult(stdout) {
 
 // Default backend: headless `claude -p --model haiku --max-turns 1 <prompt>`,
 // JSON output so the call's token usage and cost are recorded. Returns
-// { text, usage, cost_usd, model } or null on process failure.
-function runClaudeBackend(prompt) {
+// { text, usage, cost_usd, model } or null on process failure. `timeoutMs`
+// (when > 0) SIGKILLs a hung CLI so the call can't block the host past its
+// budget; a killed run lands in r.error and fails open like any other failure.
+function runClaudeBackend(prompt, { timeoutMs } = {}) {
   const r = spawnSync(
     "claude",
     ["-p", "--model", "haiku", "--max-turns", "1", "--output-format", "json", prompt],
@@ -674,6 +691,7 @@ function runClaudeBackend(prompt) {
       stdio: ["ignore", "pipe", "pipe"],
       maxBuffer: 16 * 1024 * 1024,
       shell: process.platform === "win32",
+      ...(timeoutMs > 0 ? { timeout: timeoutMs, killSignal: "SIGKILL" } : {}),
     }
   );
   if (r.status !== 0 || r.error) return null;
@@ -704,6 +722,7 @@ module.exports = {
   config,
   clearConfig,
   cfgStr,
+  cfgNum,
   jqNow,
   isoMs,
   isoSeconds,

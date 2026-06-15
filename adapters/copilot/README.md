@@ -20,8 +20,9 @@ sed "s|__SPOR_ROOT__|$SPOR_ROOT|g" \
 (Per-repo installs go in `.github/hooks/spor.json` — that is also the
 only location the Copilot cloud coding agent loads.) Environment is the
 usual set: `SPOR_SERVER`, `SPOR_TOKEN`, and `SPOR_DISTILL_CMD`
-(e.g. `copilot -p "$(cat)"`) if the claude CLI isn't installed; legacy
-`SUBSTRATE_*` names are still read.
+(e.g. `copilot -p "$(cat)"`) if the claude CLI isn't installed — set
+`SPOR_NUDGE_CMD` to the same value for the capture nudge, or `SPOR_NUDGE=0`
+to skip it; legacy `SUBSTRATE_*` names are still read.
 
 ## Event mapping
 

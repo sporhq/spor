@@ -263,10 +263,15 @@ async function distill(input) {
   };
 
   let response;
+  // Bound a hung distill backend (distill.timeoutMs / SPOR_DISTILL_TIMEOUT,
+  // default 120s — generous: the distill processes a ~24k-char transcript and
+  // runs async on SessionEnd, so it tolerates more than the nudge, but a wedged
+  // CLI should still not hang the SessionEnd hook indefinitely).
+  const timeoutMs = u.cfgNum("distill.timeoutMs", "DISTILL_TIMEOUT", 120000);
   const distillCmd = u.cfgStr("distill.cmd", "DISTILL_CMD");
   if (distillCmd) {
     backend = `cmd:${distillCmd}`;
-    response = u.runBackendCmd(distillCmd, prompt);
+    response = u.runBackendCmd(distillCmd, prompt, { timeoutMs });
     if (response === null) {
       recordLlm("", "distill cmd failed");
       log("distill cmd failed");
@@ -274,7 +279,7 @@ async function distill(input) {
     }
   } else {
     backend = "cli:claude -p --model haiku";
-    const res = u.runClaudeBackend(prompt);
+    const res = u.runClaudeBackend(prompt, { timeoutMs });
     if (res === null) {
       recordLlm("", "claude -p failed");
       log("claude -p failed");

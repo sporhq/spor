@@ -70,7 +70,14 @@ async function nudge({ input, graph, slug, session, file, remote }) {
   if (u.wordCount(content) < 50) return null; // substantial prose only
 
   // Cooldown: classify each file at most once per session; at most 3 FIRED
-  // nudges per session. State lines are "<facts>\t<file>".
+  // nudges per session; and a per-session ceiling on TOTAL classifier calls
+  // (nudge.maxCalls / SPOR_NUDGE_MAX, default 20). State lines are
+  // "<facts>\t<file>" — one per file, written for every outcome including
+  // NOTHING and backend failure, so the line count is exactly the number of
+  // classifier calls made this session. The fired cap (≥3) bounds INJECTED
+  // nudges; the total cap bounds spend/latency in a docs-heavy session where
+  // many .md files each classify to NOTHING (a "0\t" line is free against the
+  // fired cap but still cost a paid call) — task-cc-spor-nudge-productization.
   const state = path.join(graph, "journal", `${session}.nudged`);
   let stateLines = [];
   try {
@@ -78,6 +85,8 @@ async function nudge({ input, graph, slug, session, file, remote }) {
   } catch {}
   if (stateLines.some((l) => l.split("\t").slice(1).join("\t") === file)) return null;
   if (stateLines.filter((l) => Number(l.split("\t")[0]) > 0).length >= 3) return null;
+  const maxCalls = u.cfgNum("nudge.maxCalls", "NUDGE_MAX", 20);
+  if (stateLines.length >= maxCalls) return null;
 
   const nodes = path.join(graph, "nodes");
   let index = "";
@@ -154,10 +163,14 @@ async function nudge({ input, graph, slug, session, file, remote }) {
   };
 
   let response;
+  // Bound a hung backend so the nudge can't block the tool loop past the host's
+  // PostToolUse budget (nudge.timeoutMs / SPOR_NUDGE_TIMEOUT, default 30s — room
+  // for a ~17s claude -p haiku cold boot, well under the host's 60s).
+  const timeoutMs = u.cfgNum("nudge.timeoutMs", "NUDGE_TIMEOUT", 30000);
   const nudgeCmd = u.cfgStr("nudge.cmd", "NUDGE_CMD");
   if (nudgeCmd) {
     backend = `cmd:${nudgeCmd}`;
-    response = u.runBackendCmd(nudgeCmd, prompt);
+    response = u.runBackendCmd(nudgeCmd, prompt, { timeoutMs });
     if (response === null) {
       recordLlm("", "nudge cmd failed");
       u.appendLine(state, `0\t${file}`);
@@ -165,7 +178,7 @@ async function nudge({ input, graph, slug, session, file, remote }) {
     }
   } else {
     backend = "cli:claude -p --model haiku";
-    const res = u.runClaudeBackend(prompt);
+    const res = u.runClaudeBackend(prompt, { timeoutMs });
     if (res === null) {
       recordLlm("", "claude -p failed");
       u.appendLine(state, `0\t${file}`);

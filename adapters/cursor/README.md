@@ -17,8 +17,9 @@ sed "s|__SPOR_ROOT__|$SPOR_ROOT|g" \
 (Or merge into an existing `~/.cursor/hooks.json` / project
 `.cursor/hooks.json`.) Environment is the usual set: `SPOR_SERVER`,
 `SPOR_TOKEN`, and `SPOR_DISTILL_CMD` if the claude CLI isn't installed
-(`cursor-agent -p` works: prompt on stdin, response on stdout); legacy
-`SUBSTRATE_*` names are still read.
+(`cursor-agent -p` works: prompt on stdin, response on stdout) — set
+`SPOR_NUDGE_CMD` to the same value for the capture nudge, or `SPOR_NUDGE=0`
+to skip it; legacy `SUBSTRATE_*` names are still read.
 
 ## Event mapping
 

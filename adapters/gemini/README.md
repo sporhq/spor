@@ -31,6 +31,9 @@ export SPOR_SERVER=https://spor.example.com   # remote mode
 export SPOR_TOKEN=spor_pat_...
 # Distiller backend (prompt on stdin, response on stdout):
 export SPOR_DISTILL_CMD='gemini --model gemini-2.5-flash'
+# Capture-nudge backend (same contract; runs synchronously, so pick a fast
+# model). SPOR_NUDGE=0 disables it; see adapters/README.md for the bounds.
+export SPOR_NUDGE_CMD='gemini --model gemini-2.5-flash'
 ```
 
 (Legacy `SUBSTRATE_*` names are still read.)
