@@ -86,6 +86,20 @@ async function sessionStart(input) {
   const cwd = input.cwd ?? "";
   const slug = u.projectSlug(cwd);
 
+  // Shared graph home (issue-cc-local-mode-graph-sharing-gap,
+  // dec-spor-local-mode-sharing-boundary): when this repo's `.spor` marker bound
+  // a per-repo graph via `graph:` (local mode only), ensure the home carries a
+  // .gitignore so the machine-local/ephemeral state we are about to write into
+  // it (cache/, journal/, config.json, …) never rides the SHARED graph's git
+  // flow. sharedGraphHome() is null in remote mode and for a personal ~/.spor,
+  // so those are untouched. Idempotent + fail-open; runs before the writes below.
+  try {
+    const shared = u.config()?.sharedGraphHome?.();
+    if (shared) u.ensureGraphGitignore(shared);
+  } catch {
+    /* best effort */
+  }
+
   // Persist the plugin root so skills can locate lib/ from the Bash tool,
   // where ${CLAUDE_PLUGIN_ROOT} is unset (issue-cc-skill-plugin-root-
   // unsubstituted). The hooks.json command string is the one place the host

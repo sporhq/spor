@@ -210,6 +210,13 @@ edges:
   into distinct identities. With no subtree marker the search reaches the root
   and inference is unchanged. Zero-config slug inference stays the default, and
   a graph with no repo nodes behaves exactly as before.
+- The same flat marker can also carry a `graph: <path>` key — a per-repo
+  **graph home binding** (NOT identity), for free local-mode graph sharing over
+  plain git. It points the repo at a shared graph home (resolved relative to the
+  marker dir) and overrides `SPOR_HOME` in local mode; a contributor with their
+  own personal `SPOR_HOME` still inherits the shared graph inside the repo. See
+  API.md §6.1 for the full contract (precedence, the generated `.gitignore`, and
+  the distiller's PR-flow behavior).
 - **Git worktrees** resolve to their main repo, not the worktree directory's
   basename. A linked worktree shares the main repo's root-commit sha and
   remotes, so inferring identity from its (markerless, often throwaway-named)

@@ -366,3 +366,36 @@ SPOR_TOKEN=spor_pat_...                # per-user token (§4)
 Failure policy: **fail open, never block** — a hook must never break a
 session; connection refused, timeout, 5xx, and auth failure all collapse to
 "the graph has nothing for you".
+
+### 6.1 Per-repo graph home (local-mode git sharing)
+
+In **local mode** a code repo can bind itself to a specific graph home with a
+`graph: <path>` key in its committed `.spor` marker (the same flat `key: value`
+marker that carries `repo:`/`project:`). This is how a team shares one graph
+for free over plain git, with no server (dec-spor-local-mode-sharing-boundary):
+
+```
+# .spor at the repo root
+repo: my-service
+graph: ../my-team-graph     # path, resolved relative to this marker
+```
+
+Contract:
+
+- **Precedence.** The `graph:` binding **overrides `SPOR_HOME`** — it is the
+  one input above the environment — but loses to an explicit CLI `--home`. A
+  `home` set in `.spor.json` config stays *below* the environment, unchanged; only the
+  `.spor` marker `graph:` key beats env. (A contributor with a personal global
+  `SPOR_HOME` therefore still inherits the shared graph inside a shared-graph
+  repo.)
+- **Resolution.** Relative to the marker's own directory (so a committed
+  relative path is stable regardless of cwd); nearest-ancestor marker carrying
+  a `graph:` key wins.
+- **Mode.** Local mode only. With `SPOR_SERVER` set the server is the graph and
+  the marker is ignored.
+- **Hygiene.** When a marker home is in force the client maintains a
+  `.gitignore` in it covering the machine-local, per-person state
+  (`journal/`, `cache/`, `outbox/`, `auth/`, `config.json`); only the durable
+  `nodes/` and brief `history/` are committed. The SessionEnd distiller leaves
+  distilled nodes **uncommitted** (for the human PR flow) instead of
+  auto-committing when the graph home is the same git repo as the code repo.

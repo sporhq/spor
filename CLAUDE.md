@@ -166,7 +166,9 @@ in ONE place — `projectSlug()` in `scripts/engines/util.js` — and must
 stay in sync with the server's `SLUG_RE` (`^[a-z0-9][a-z0-9-]*$`, in the
 server repo's `server/rest.js`), which rejects anything non-canonical.
 The slug determines which `brief-<slug>` node session-start injects, the
-`project:` stamp on distilled nodes, and journal tagging. Renaming a repo
+`project:` stamp on distilled nodes, and journal tagging. (The same flat
+marker also carries a `graph: <path>` key — the per-repo shared graph **home
+binding**, not a slug; see "Client config cascade".) Renaming a repo
 changes its slug, which used to orphan the old project tag (the 2026-06-12
 substrate→spor rename did exactly this; see brief-spor / brief-spor-server)
 — `type: project` nodes with `slugs:` alias lists heal this at read time
@@ -189,8 +191,25 @@ through the active config the dispatcher sets per run
 (`u.useConfig`/`u.config()`/`u.cfgStr`); when none is active, every read falls
 back to the exact `envDual` it replaced, so standalone calls and unit tests
 stay byte-identical. `.spor.json` is config, held SEPARATE from the `.spor`
-identity marker (which stays flat `key: value`). New levers beyond env
-migration: per-repo no-op disable (`enabled:false`/`mode:off` → dispatcher
+identity marker (which stays flat `key: value`). **Per-repo graph home
+(local-mode git sharing, dec-spor-local-mode-sharing-boundary):** a `graph:
+<path>` key in the flat `.spor` marker binds the repo to a shared graph home
+and is the ONE input that beats env — it **overrides `SPOR_HOME`** (resolved in
+`repoMarkerGraph()`, lib/config.js, merged above env but below an explicit CLI
+`--home`), because the point is that a contributor with a personal global
+`SPOR_HOME` still inherits the *shared* graph inside a shared-graph repo. It is
+a path (not a slug), resolved relative to the marker's own dir so a committed
+`graph: ../team-graph` is cwd-stable; nearest-ancestor with a `graph:` key wins
+(an identity-only deeper marker doesn't shadow it); LOCAL mode only — in remote
+mode the server is the graph, so the marker is ignored. `.spor.json`'s `home`
+stays an ordinary BELOW-env setting; only the marker `graph:` beats env. When a
+marker home is in force, session-start ensures a `.gitignore` there for
+machine-local state (`/journal/ /cache/ /outbox/ /auth/ /config.json`; durable
+`nodes/`+`history/` stay tracked), and the SessionEnd distiller SKIPS its
+auto-commit when the graph home is the same git repo as the code repo (the
+nested-repo case — `Config.sharedGraphHome()` gates the first,
+`graphInsideCodeRepo()` the second; distilled nodes then ride the human PR
+flow). New levers beyond env migration: per-repo no-op disable (`enabled:false`/`mode:off` → dispatcher
 bails, fail-open), neighborhood-search project controls
 (`search.minSim`, `search.projects.{include,exclude,boost}`, applied in
 `lib/kernel/graph.js` compile, no-op when empty), and the `spor dispatch`

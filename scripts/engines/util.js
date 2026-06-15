@@ -331,6 +331,51 @@ function ensureDir(dir) {
   }
 }
 
+// Machine-local / ephemeral state inside a graph home that must NEVER ride a
+// SHARED graph repo's git flow (issue-cc-local-mode-graph-sharing-gap,
+// dec-spor-local-mode-sharing-boundary): journal/cache/outbox are runtime
+// scratch, and auth/ + config.json hold tokens, so this doubles as a
+// secret-leak guard (broader than the decision's "journal/cache/outbox"). The
+// durable graph — nodes/ and history/ — is intentionally NOT ignored. Anchored
+// with a leading slash to the home root so a same-named dir under nodes/ is
+// unaffected.
+const GRAPH_IGNORES = ["/journal/", "/cache/", "/outbox/", "/auth/", "/config.json"];
+
+// Ensure a shared graph home carries a .gitignore covering GRAPH_IGNORES.
+// Idempotent and ADDITIVE: writes the full block (with a header) when absent,
+// else appends only the missing lines — never clobbering a contributor's own
+// entries. Only invoked for marker-resolved shared homes (Config.sharedGraphHome),
+// so a personal ~/.spor is never touched. Best-effort; returns true when it
+// wrote, false otherwise (already complete, or any IO error — fail-open).
+function ensureGraphGitignore(graphHomeDir) {
+  try {
+    if (!graphHomeDir) return false;
+    const file = path.join(graphHomeDir, ".gitignore");
+    let existing = null;
+    try {
+      existing = fs.readFileSync(file, "utf8");
+    } catch {
+      existing = null; // absent
+    }
+    if (existing === null) {
+      if (!ensureDir(graphHomeDir)) return false;
+      const header =
+        "# Spor machine-local / ephemeral state — not part of the shared graph\n" +
+        "# (issue-cc-local-mode-graph-sharing-gap). Safe to edit; spor only appends missing lines.\n";
+      fs.writeFileSync(file, header + GRAPH_IGNORES.join("\n") + "\n");
+      return true;
+    }
+    const present = new Set(existing.split("\n").map((l) => l.trim()));
+    const missing = GRAPH_IGNORES.filter((ig) => !present.has(ig));
+    if (missing.length === 0) return false;
+    const sep = existing === "" || existing.endsWith("\n") ? "" : "\n";
+    fs.appendFileSync(file, sep + missing.join("\n") + "\n");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // --- local repo map (slug -> checkout path) -------------------------------
 // Which directory a project slug lives in on THIS machine. Per-machine and
 // machine-specific: it is NEVER in the shared graph (every teammate clones to a
@@ -673,6 +718,7 @@ module.exports = {
   repoFingerprints,
   git,
   ensureDir,
+  ensureGraphGitignore,
   registerRepo,
   forgetRepo,
   appendLine,

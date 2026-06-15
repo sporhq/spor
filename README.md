@@ -153,10 +153,11 @@ edges to the nodes it relates to; the format is documented in
 ## Team mode
 
 Single-player Spor is the whole client. Team mode is what you reach for when
-the graph should be shared: one graph served to your entire team — the people
-and their agents alike — with per-identity attribution on every node,
+the graph should be shared *live*: one graph served to your entire team — the
+people and their agents alike — with per-identity attribution on every node,
 transactional writes so concurrent work doesn't clobber, and a shared
-decision queue ranked across the team.
+decision queue ranked across the team. (A team can also share a graph for free
+over plain git, with no server — see "Sharing a graph over git" below.)
 
 Team mode adds something a personal graph can't do: when a question can't be
 answered from what's already there, it routes to the person most likely to
@@ -175,6 +176,34 @@ them unset and it runs entirely against your local `$SPOR_HOME`. If the team
 server is ever unreachable, the client fails open — it falls back to a local
 cache or to nothing, never blocking your session. The full contract a client
 programs against is in [API.md](API.md).
+
+## Sharing a graph over git — no server
+
+A team can share one graph for free, with no live server, by treating the
+graph as the ordinary git repo it already is — everyone clones, pulls, and
+pushes it. Point a code repo at a shared graph with a `graph:` line in its
+committed `.spor` marker:
+
+```
+# .spor — committed at the repo root
+repo: my-service
+graph: ../my-team-graph
+```
+
+The path resolves relative to the marker, so the conventional layout is the
+graph as a **sibling** repo (`../my-team-graph`) each teammate clones alongside
+the code. This binding **overrides `SPOR_HOME`**: even a contributor with their
+own personal `~/.spor` inherits the shared graph while working in this repo, so
+prior decisions and dismissed approaches come for free. Distilled nodes land in
+the shared graph as plain markdown and ride your normal PR flow.
+
+Spor keeps the shared graph clean for you: it writes a `.gitignore` covering
+the machine-local, per-person state (`journal/`, `cache/`, `outbox/`, `auth/`,
+`config.json`) so only the durable `nodes/` (and brief `history/`) are
+committed, and the end-of-session distiller leaves nodes uncommitted for your
+PR — rather than auto-committing — when the graph lives inside the code repo
+itself. This is the free tier's sharing model; the live **Team mode** server
+above adds real-time concurrent writes, question routing, and hosted isolation.
 
 ## Configuration
 
