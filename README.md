@@ -40,6 +40,21 @@ the same step. Re-running is idempotent — it refreshes the path and never
 duplicates your other hooks. (In Claude Code you can also install by hand:
 `/plugin marketplace add sporhq/spor` then `/plugin install spor@spor`.)
 
+Upgrading. Bumping the package does **not** refresh what an agent already
+loaded — Claude Code runs its own cached copy of the plugin, so new
+skills/hooks won't appear until that copy is updated. After an npm bump, run:
+
+```bash
+npm install -g @sporhq/spor   # update the package on disk
+spor upgrade                  # refresh every wired host to it, then restart
+```
+
+`spor upgrade` updates Claude Code's plugin (`marketplace update` +
+`plugin update`) and re-points the hook hosts at the new install; pass a host
+(`spor upgrade claude`) to scope it, or `--print` for a dry run. `spor status`
+flags the gap on its own — it shows the loaded plugin version and marks it
+`STALE` when the package on disk is newer.
+
 Then onboard a repo — one command, from inside it:
 
 ```bash
