@@ -219,3 +219,17 @@ verifiable rather than asserted:
   write semantics, identity and auth, and client configuration.
 - [adapters/](adapters/) — supported coding agents and how install works on
   each, including the `AGENTS.md` floor for hosts without hooks.
+
+## License
+
+Spor (this client) is licensed under the [Apache License 2.0](LICENSE) — a
+permissive license with an explicit patent grant. See [NOTICE](NOTICE) for
+attribution.
+
+"Spor" and "sporhq" are trademarks of the project; the Apache License grants no
+rights to the marks. Their use is governed by the [Trademark Policy](TRADEMARKS.md)
+— in short, build "an adapter **for** Spor," not a product **named** Spor.
+
+Contributions are welcome under inbound = outbound (Apache-2.0); see
+[CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and the
+[Code of Conduct](CODE_OF_CONDUCT.md).

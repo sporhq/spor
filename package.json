@@ -2,7 +2,7 @@
   "name": "@sporhq/spor",
   "version": "0.1.1",
   "description": "Spor — a shared memory substrate for teams and agents. Decisions, their reasons, and the traces they leave. Knowledge-graph context compiler: session-start briefings, per-prompt digests, capture at discovery, end-of-session distillation, decision queue.",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "author": "Anthony Allen",
   "homepage": "https://sporhq.io",
   "repository": {
@@ -39,7 +39,9 @@
     "workers/",
     "API.md",
     "GRAPH.md",
-    "QUEUE.md"
+    "QUEUE.md",
+    "NOTICE",
+    "TRADEMARKS.md"
   ],
   "scripts": {
     "test": "node --test test/*.test.js",
