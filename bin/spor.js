@@ -101,7 +101,10 @@ function nodeCount(nodesDir) {
   }
 }
 
-function cmdInit(cfg) {
+// Idempotently create the local graph home (nodes/, git, .gitignore). Returns
+// { home, nodesDir, created } and prints nothing — callers do their own UX.
+// Shared by `spor init` and the `spor dispatch --backfill` onboarding path.
+function ensureGraphHome(cfg) {
   const home = cfg.graphHome();
   const nodesDir = path.join(home, "nodes");
   let created = false;
@@ -122,6 +125,11 @@ function cmdInit(cfg) {
       /* non-fatal */
     }
   }
+  return { home, nodesDir, created };
+}
+
+function cmdInit(cfg) {
+  const { home, nodesDir, created } = ensureGraphHome(cfg);
   out(`${created ? "Created" : "Graph already present at"} ${home}`);
   out(`  nodes:  ${nodesDir} (${nodeCount(nodesDir) ?? 0} nodes)`);
   out(`  mode:   ${cfg.mode()}`);
@@ -1004,6 +1012,45 @@ function shellQuote(s) {
   return /[^\w./:-]/.test(s) ? `'${String(s).replace(/'/g, "'\\''")}'` : s;
 }
 
+// Re-enable Spor for a repo by merging { enabled: true } into its committable
+// .spor.json (and clearing a `mode: off`, which also disables). Used by the
+// --backfill onboarding to repair a repo a prior `spor disable` turned off.
+function enableRepoAt(dir) {
+  const file = path.join(dir, ".spor.json");
+  let data = {};
+  try {
+    data = JSON.parse(fs.readFileSync(file, "utf8")) || {};
+  } catch {
+    /* absent or malformed — start fresh */
+  }
+  data.enabled = true;
+  if (data.mode === "off") delete data.mode;
+  try {
+    fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+  } catch {
+    /* non-fatal */
+  }
+}
+
+// `spor dispatch --backfill` is the onboarding door (task-spor-cli-dispatch-
+// background-agents): set the repo up before launching its backfill agent.
+// Idempotent; prints what it did. The dir-registration happens in cmdDispatch
+// (it applies to every dispatch), this adds the init + enable steps.
+function onboardRepo(cfg, dir) {
+  // Init the local graph home — but only in local mode; remote mode keeps the
+  // graph on the server, so there is nothing to create locally.
+  if (cfg.mode() !== "remote") {
+    const r = ensureGraphHome(cfg);
+    out(r.created ? `initialized graph home at ${r.home}` : `graph home ready: ${r.home}`);
+  }
+  // Re-enable the repo if a prior `spor disable` turned it off, so onboarding a
+  // disabled repo actually works instead of silently launching into a no-op.
+  if (!cfg.enabled()) {
+    enableRepoAt(dir);
+    out(`re-enabled Spor for ${dir}`);
+  }
+}
+
 async function cmdDispatch(cfg, args) {
   const dryRun = args.includes("--print") || args.includes("--dry-run");
   const full = args.includes("--full");
@@ -1089,9 +1136,6 @@ async function cmdDispatch(cfg, args) {
     err(`target dir does not exist: ${res.dir}`);
     return 1;
   }
-  // Learn the mapping from this CLI use too.
-  u.registerRepo(cfg.graphHome(), res.slug, res.dir);
-
   const prompt = brief
     ? `# Spor briefing (compiled for this task — your standing context)\n\n${brief}\n\n---\n\n# Task\n\n${instruction}\n`
     : instruction;
@@ -1106,11 +1150,25 @@ async function cmdDispatch(cfg, args) {
 
   if (dryRun) {
     out(`dir:    ${res.dir}  (slug: ${res.slug}, via ${res.source})`);
+    if (backfill) {
+      const steps = [];
+      if (cfg.mode() !== "remote") steps.push(fs.existsSync(cfg.nodesDir()) ? "graph home ready" : "init graph home");
+      steps.push(`register ${res.slug} → ${res.dir}`);
+      if (!cfg.enabled()) steps.push("re-enable repo (currently disabled)");
+      out(`onboard: ${steps.join("; ")}`);
+    }
     out(`brief:  ${brief ? `${brief.length} bytes` : "(none — graph had nothing relevant, or --no-brief/--backfill)"}`);
     out(`run:    ${claudeBin} ${claudeArgs.slice(0, -1).map(shellQuote).join(" ")} <prompt>`);
     out(`\n--- prompt ---\n${prompt}`);
     return 0;
   }
+
+  // Side effects (real run only — --print writes nothing). --backfill is the
+  // onboarding door, so it sets the repo up (init + enable) first; every
+  // dispatch self-registers the dir it resolved.
+  if (backfill) onboardRepo(cfg, res.dir);
+  u.registerRepo(cfg.graphHome(), res.slug, res.dir);
+  if (backfill) out(`registered ${res.slug} → ${res.dir}; launching the backfill agent…`);
 
   if (claudeBin === "claude" && !hasCmd("claude")) {
     err("claude CLI not on PATH — install Claude Code, then re-run (or 'spor dispatch … --print' to see the prompt).");

@@ -12,14 +12,19 @@ const path = require("node:path");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 
-// Env with no SPOR_*/SUBSTRATE_* leakage; force LOCAL mode (no server). `extra`
-// is applied AFTER the strip, so SPOR_HOME / SPOR_CLAUDE_CMD survive.
+// Env with no SPOR_*/SUBSTRATE_* leakage; force LOCAL mode (no server). Also
+// isolate the config-cascade homes to an empty temp dir so the developer's real
+// ~/.spor/config.json can't leak server+token in and flip a test to remote.
+// `extra` is applied last, so SPOR_HOME / SPOR_CLAUDE_CMD passed by a test win.
+const ISO_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-iso-"));
 function bare(extra = {}) {
   const env = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
     env[k] = v;
   }
+  env.SPOR_HOME = ISO_HOME;
+  env.XDG_CONFIG_HOME = ISO_HOME;
   return Object.assign(env, extra);
 }
 function run(args, env, cwd) {
@@ -136,6 +141,44 @@ test("dispatch --backfill --print: dispatches the /spor:backfill skill, no brief
   assert.strictEqual(r.status, 0);
   assert.match(r.stdout, /name spor-backfill/);
   assert.match(r.stdout, /\/spor:backfill/);
+  assert.match(r.stdout, /onboard: /); // shows the onboarding plan
+});
+
+test("dispatch --backfill --print: previews the init step and writes nothing", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-onb-")); // fresh: no nodes dir
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-onb-repo-"));
+  const r = run(["dispatch", "--backfill", "--dir", repo, "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /onboard: init graph home; register /);
+  assert.ok(!fs.existsSync(path.join(home, "nodes")), "print is a dry run — nothing created");
+  assert.ok(!fs.existsSync(path.join(home, "config.json")), "print wrote no config");
+});
+
+test("dispatch --backfill (local): inits the graph home and registers the repo", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-onb2-")); // fresh, uninitialized
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-onb2-repo-"));
+  const stub = path.join(home, "claude-stub.sh");
+  fs.writeFileSync(stub, "#!/bin/sh\nexit 0\n");
+  fs.chmodSync(stub, 0o755);
+  const r = run(["dispatch", "--backfill", "--dir", repo], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /initialized graph home/);
+  assert.ok(fs.existsSync(path.join(home, "nodes")), "graph home nodes/ created");
+  const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
+  assert.ok(Object.values(cfg.dispatch.repos).includes(repo), "repo dir registered");
+});
+
+test("dispatch --backfill re-enables a previously-disabled repo", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-onb3-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-onb3-repo-"));
+  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: false }) + "\n");
+  const stub = path.join(home, "claude-stub.sh");
+  fs.writeFileSync(stub, "#!/bin/sh\nexit 0\n");
+  fs.chmodSync(stub, 0o755);
+  const r = run(["dispatch", "--backfill"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub }, repo); // cwd = the disabled repo
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /re-enabled Spor/);
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(repo, ".spor.json"), "utf8")).enabled, true);
 });
 
 test("dispatch: unknown slug exits 1 with actionable guidance", () => {

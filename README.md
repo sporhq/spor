@@ -24,21 +24,8 @@ Requires Node 20+ and nothing else — the client is zero-dependency. To run
 from a checkout instead (e.g. to hack on it), clone the repo and `npm link`
 from its root; that symlinks the same two commands onto your PATH.
 
-Then create the graph home (this is yours, kept outside any code repo):
-
-```bash
-spor init        # creates ~/.spor/nodes, git-inits it, writes .gitignore
-```
-
-`spor init` is idempotent. `spor status` then tells you the resolved mode,
-graph, project, and (in remote mode) server health and identity — run it any
-time you're unsure whether Spor is active or which graph you're on. (Without
-the `spor` CLI on your PATH the equivalent is
-`mkdir -p ~/.spor/nodes && git -C ~/.spor init && printf 'journal/\n' > ~/.spor/.gitignore`.)
-
-Then install for your agent. One verb wires up any supported host — it
-resolves the adapter manifest to this checkout and drops it into the host's
-config:
+Wire Spor into your agent. One verb resolves the adapter manifest to this
+install and drops it into the host's config:
 
 ```bash
 spor install claude     # Claude Code (via its plugin CLI — no marketplace browsing)
@@ -50,26 +37,32 @@ spor install            # no host => list the hosts detected on this machine
 per-repo config. `--all` installs every detected host, `--print` is a dry run,
 and `--server <url> --token <tok>` also points the client at a team graph in
 the same step. Re-running is idempotent — it refreshes the path and never
-duplicates your other hooks.
+duplicates your other hooks. (In Claude Code you can also install by hand:
+`/plugin marketplace add sporhq/spor` then `/plugin install spor@spor`.)
 
-In Claude Code you can still install from the marketplace by hand if you
-prefer:
+Then onboard a repo — one command, from inside it:
 
+```bash
+cd ~/my-repo && spor dispatch --backfill
 ```
-/plugin marketplace add sporhq/spor
-/plugin install spor@spor
-```
+
+That does the whole setup in one step: creates your graph home if it doesn't
+exist yet (`~/.spor/nodes`, git-initialised), registers the repo so Spor knows
+where it lives on this machine, makes sure Spor is enabled for it, and launches
+the `/spor:backfill` agent in a Claude Code background session — it mines git
+history, design docs, and issue trackers (edges first) and proposes how to
+group your repos into projects. Watch or attach to it with `claude agents`.
+Re-run it whenever you add a repo, or skip it entirely and just work —
+distillation grows the graph one session at a time.
+
+`spor status` tells you the resolved mode, graph, project, and (on a team
+graph) server health and identity — run it any time you're unsure whether Spor
+is active or which graph you're on. `spor init` does the graph-home setup on
+its own if you'd rather not dispatch anything yet.
 
 For the per-host event mapping, fidelity notes, distiller backend, and the
 `AGENTS.md` fallback for hosts with no hook support, see
 [adapters/](adapters/).
-
-To start with a populated graph, run `/spor:backfill` — the onboarding door. It
-dispatches the heavy mining (git history, design docs, issue trackers, edges
-first) to the bundled `spor-backfill` **subagent**, which runs in its own
-context, and then proposes how to group your repos into projects (re-run it as
-you add repos). Or skip it and just work — distillation grows the graph one
-session at a time.
 
 ## Dispatching background agents
 

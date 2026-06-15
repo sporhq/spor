@@ -12,13 +12,20 @@ const path = require('node:path');
 const CLI = path.join(__dirname, '..', 'bin', 'spor.js');
 const LIB = path.join(__dirname, '..', 'lib');
 
-// Env with no SPOR_*/SUBSTRATE_* leakage from the runner.
+// Env with no SPOR_*/SUBSTRATE_* leakage from the runner. Also isolate the
+// config-cascade homes to an empty temp dir so the developer's real
+// ~/.spor/config.json (which may carry server+token after `spor join`) can't
+// leak in and flip a local-mode test to remote. Tests that need a specific home
+// pass it via `extra`, which wins (applied last).
+const ISO_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-cli-iso-'));
 function bare(extra = {}) {
   const env = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (k.startsWith('SPOR_') || k.startsWith('SUBSTRATE_') || k === 'XDG_CONFIG_HOME') continue;
     env[k] = v;
   }
+  env.SPOR_HOME = ISO_HOME; // user config: ISO_HOME/config.json (absent) -> local mode
+  env.XDG_CONFIG_HOME = ISO_HOME; // global config: ISO_HOME/spor/config.json (absent)
   return Object.assign(env, extra);
 }
 function run(args, env) {
