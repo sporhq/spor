@@ -1,0 +1,170 @@
+// spor dispatch + repos — kick off Claude Code background agents from the CLI
+// (task-spor-cli-dispatch-background-agents). Covers the local slug->path map,
+// briefing compilation, directory resolution (incl. cross-repo via the map),
+// the --print dry run, and a real (stubbed) spawn. Everything runs against a
+// throwaway graph home — never the live graph.
+const test = require("node:test");
+const assert = require("node:assert");
+const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const CLI = path.join(__dirname, "..", "bin", "spor.js");
+
+// Env with no SPOR_*/SUBSTRATE_* leakage; force LOCAL mode (no server). `extra`
+// is applied AFTER the strip, so SPOR_HOME / SPOR_CLAUDE_CMD survive.
+function bare(extra = {}) {
+  const env = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
+    env[k] = v;
+  }
+  return Object.assign(env, extra);
+}
+function run(args, env, cwd) {
+  return spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", env: bare(env), cwd });
+}
+
+// A scratch graph home with two linked nodes under repo `demo`.
+function fixture() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-home-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  fs.writeFileSync(
+    path.join(nodes, "dec-x.md"),
+    `---\nid: dec-x\ntype: decision\nrepo: demo\ntitle: A demo decision about auth token rotation\nsummary: A demo decision describing auth token rotation and credential handling for the pipeline.\ndate: 2026-06-01\n---\nBody about auth token rotation and credential handling.\n`
+  );
+  fs.writeFileSync(
+    path.join(nodes, "task-rotate.md"),
+    `---\nid: task-rotate\ntype: task\nrepo: demo\ntitle: Rotate pipeline auth tokens on a schedule\nsummary: Implement scheduled rotation of auth tokens and credentials in the pipeline.\ndate: 2026-06-02\nedges:\n  - {type: derived-from, to: dec-x}\n---\nImplement scheduled rotation of the auth tokens.\n`
+  );
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-repo-"));
+  return { home, nodes, repo };
+}
+
+test("repos: empty, add, list, rm round-trip; stored in user config.json under dispatch.repos", () => {
+  const { home, repo } = fixture();
+  const env = { SPOR_HOME: home };
+  const cfgFile = path.join(home, "config.json");
+  assert.match(run(["repos"], env).stdout, /no repos mapped yet/);
+
+  assert.strictEqual(run(["repos", "add", "demo", repo], env).status, 0);
+  // the mapping lands in the user config, not a sidecar file
+  assert.ok(!fs.existsSync(path.join(home, "repos.json")), "no sidecar repos.json");
+  assert.strictEqual(JSON.parse(fs.readFileSync(cfgFile, "utf8")).dispatch.repos.demo, repo);
+
+  const list = run(["repos", "list"], env);
+  assert.match(list.stdout, new RegExp(`^demo\\t${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m"));
+
+  assert.strictEqual(run(["repos", "rm", "demo"], env).status, 0);
+  assert.match(run(["repos"], env).stdout, /no repos mapped yet/);
+});
+
+test("repos add preserves other config.json keys (server/token)", () => {
+  const { home, repo } = fixture();
+  const cfgFile = path.join(home, "config.json");
+  fs.writeFileSync(cfgFile, JSON.stringify({ server: "https://example", token: "t0" }) + "\n");
+  assert.strictEqual(run(["repos", "add", "demo", repo], { SPOR_HOME: home }).status, 0);
+  const data = JSON.parse(fs.readFileSync(cfgFile, "utf8"));
+  assert.strictEqual(data.server, "https://example");
+  assert.strictEqual(data.token, "t0");
+  assert.strictEqual(data.dispatch.repos.demo, repo);
+});
+
+test("repos add rejects a non-canonical slug", () => {
+  const { home, repo } = fixture();
+  const r = run(["repos", "add", "Bad_Slug", repo], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /invalid slug/);
+});
+
+test("dispatch free-text --print: resolves cwd dir, compiles a local briefing", () => {
+  const { home, repo } = fixture();
+  const r = run(["dispatch", "auth token rotation credentials", "--dir", repo, "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, new RegExp(`dir:    ${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.match(r.stdout, /via --dir/);
+  assert.match(r.stdout, /brief:  \d+ bytes/); // graph had relevant content
+  assert.match(r.stdout, /# Task\n\nauth token rotation credentials/);
+});
+
+test("dispatch --no-brief: raw task prompt, no briefing block", () => {
+  const { home, repo } = fixture();
+  const r = run(["dispatch", "auth token rotation credentials", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /brief:  \(none/);
+  assert.doesNotMatch(r.stdout, /# Spor briefing/);
+});
+
+test("dispatch <node-id>: auto-detects node mode and resolves the dir cross-repo via the map", () => {
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home }); // demo -> repo
+  // run from somewhere that is NOT the demo repo; the node's repo:demo drives the dir
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cwd-"));
+  const r = run(["dispatch", "dec-x", "--print"], { SPOR_HOME: home }, elsewhere);
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, new RegExp(`dir:    ${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*via config`));
+  assert.match(r.stdout, /name dec-x/);
+  assert.match(r.stdout, /Work on dec-x — A demo decision about auth token rotation/);
+});
+
+test("dispatch --from-queue: dispatches the top-ranked queue item into its repo", () => {
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home }); // both fixture nodes are repo:demo
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cwd-"));
+  const r = run(["dispatch", "--from-queue", "--print"], { SPOR_HOME: home }, elsewhere);
+  assert.strictEqual(r.status, 0);
+  // The top item is one of the fixture nodes, dispatched in node mode and
+  // resolved into demo's dir via the config map (not the unrelated cwd).
+  assert.match(r.stdout, new RegExp(`dir:    ${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*via config`));
+  assert.match(r.stdout, /--name (task-rotate|dec-x)/);
+  assert.match(r.stdout, /# Task\n\nWork on (task-rotate|dec-x)/);
+});
+
+test("dispatch --from-queue: empty queue exits 1", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-empty-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true }); // graph with no queueable work
+  const r = run(["dispatch", "--from-queue", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /queue empty/);
+});
+
+test("dispatch --backfill --print: dispatches the /spor:backfill skill, no briefing", () => {
+  const { home, repo } = fixture();
+  const r = run(["dispatch", "--backfill", "--dir", repo, "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /name spor-backfill/);
+  assert.match(r.stdout, /\/spor:backfill/);
+});
+
+test("dispatch: unknown slug exits 1 with actionable guidance", () => {
+  const { home } = fixture();
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cwd-"));
+  const r = run(["dispatch", "--node", "dec-x", "--slug", "nosuchrepo", "--print"], { SPOR_HOME: home }, elsewhere);
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /don't know where 'nosuchrepo' lives/);
+  assert.match(r.stderr, /spor repos add nosuchrepo/);
+});
+
+// Real spawn through SPOR_CLAUDE_CMD: the launcher must pass --bg + flags and run
+// in the resolved cwd. Posix-only (the stub is a shell script).
+test("dispatch spawns the claude binary with --bg in the target dir", { skip: process.platform === "win32" }, () => {
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const stub = path.join(home, "claude-stub.sh");
+  const outFile = path.join(home, "spawn.out");
+  // cwd on line 1, then each argv element on its own line (the prompt is last
+  // and may add extra lines — fine, we only assert on the leading flags).
+  fs.writeFileSync(stub, `#!/bin/sh\n{ pwd; printf '%s\\n' "$@"; } > "$OUTFILE"\n`);
+  fs.chmodSync(stub, 0o755);
+  const r = run(["dispatch", "dec-x", "--model", "haiku"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile });
+  assert.strictEqual(r.status, 0);
+  const lines = fs.readFileSync(outFile, "utf8").split("\n");
+  const cwd = lines[0];
+  const argv = lines.slice(1);
+  assert.strictEqual(cwd, fs.realpathSync(repo)); // launched in the cross-repo dir
+  assert.strictEqual(argv[0], "--bg");
+  assert.ok(argv.includes("--model") && argv.includes("haiku"));
+  assert.ok(argv.includes("--name") && argv.includes("dec-x"));
+});

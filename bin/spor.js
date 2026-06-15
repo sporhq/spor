@@ -57,6 +57,14 @@ Repo scoping
   brief <id>           compile a briefing for a node (alias: compile --root <id>)
   validate             lint the local graph (byte-identical)
 
+Dispatch (Claude Code background agents)
+  dispatch "<task>"    compile a briefing + launch 'claude --bg' in the repo.
+                       Also: dispatch <node-id> | --node <id> | --from-queue |
+                       --backfill. Flags: --dir P, --full, --no-brief, --model M,
+                       --permission-mode P, --agent A, --name N, --print
+  repos                show the local slug->repo-dir map used to pick the
+                       directory (repos add <slug> <path> | repos rm <slug>)
+
 Other
   cost [--since D]      LLM spend summary from journal/llm-calls (local)
   version              print version
@@ -905,6 +913,262 @@ async function cmdInstall(cfg, args) {
   return rc;
 }
 
+// --- spor dispatch: kick off a Claude Code background agent --------------
+// (task-spor-cli-dispatch-background-agents) Compile a briefing for a task and
+// launch `claude --bg "<prompt>"` in the correct repo. The "correct repo" comes
+// from a per-machine slug->path map stored in the config cascade under
+// `dispatch.repos` (read via cfg.get; written to $SPOR_HOME/config.json) — the
+// shared graph is path-free by design (repo nodes carry slugs/fingerprints,
+// never a local path; teammates clone to different paths), so the map MUST be
+// local. It self-learns from session-start and from `--dir`/`spor repos`.
+
+// Read a single frontmatter scalar from raw node markdown (regex, like the
+// engines' parser — no YAML lib). `repo:` is the current stamp; `project:` legacy.
+function fmField(raw, key) {
+  const m = raw.match(new RegExp(`^${key}: *(.*)$`, "m"));
+  return m ? m[1].trim() : null;
+}
+
+// Resolve a node id to { id, raw, repo, title } or null if it doesn't exist.
+async function resolveNode(cfg, id) {
+  let raw = "";
+  if (cfg.mode() === "remote") {
+    const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 6000 });
+    if (!r.ok) return null;
+    raw = (r.json && r.json.raw) || r.text || "";
+  } else {
+    try {
+      raw = fs.readFileSync(path.join(cfg.nodesDir(), `${id}.md`), "utf8");
+    } catch {
+      return null;
+    }
+  }
+  return { id, raw, repo: fmField(raw, "repo") || fmField(raw, "project"), title: fmField(raw, "title") || "" };
+}
+
+// Compile a briefing: a node id -> its neighborhood; free text -> a digest.
+// Mode-aware, reusing the primitives the /spor:brief skill drives. Default is
+// the compact digest; `full` emits the whole neighborhood. "" = graph had
+// nothing relevant (or the compile failed — fail-soft, dispatch still proceeds).
+async function compileBriefing(cfg, { nodeId, query, full, project }) {
+  if (cfg.mode() === "remote") {
+    if (nodeId) {
+      const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}`, { timeoutMs: 8000 });
+      return r.ok && r.json ? r.json.raw || r.text || "" : "";
+    }
+    const r = await remote.post(cfg, "/v1/digest", project ? { query, project } : { query });
+    return r.ok && r.json && r.json.found !== false ? r.json.text || "" : "";
+  }
+  const args = nodeId ? ["--root", nodeId] : ["--query", query];
+  if (!full) args.push("--digest");
+  if (project) args.push("--project", project);
+  args.push("--quiet"); // suppress the stderr stats / no-graph lines
+  const r = spawnSync(process.execPath, [path.join(ROOT, "lib", "compile.js"), ...args], { encoding: "utf8" });
+  return (r.stdout || "").trim();
+}
+
+// The single highest-ranked open queue item (for --from-queue). Mode-aware,
+// fail-soft (null on any error/empty).
+async function topQueueItem(cfg, slug) {
+  if (cfg.mode() === "remote") {
+    const q = slug ? `?project=${encodeURIComponent(slug)}&limit=1` : "?limit=1";
+    const r = await remote.get(cfg, `/v1/queue${q}`, { timeoutMs: 6000 });
+    return r.ok && r.json ? (r.json.items || [])[0] || null : null;
+  }
+  try {
+    const g = require(path.join(ROOT, "lib", "graph.js")).loadGraph(cfg.nodesDir());
+    const { rankQueue } = require(path.join(ROOT, "lib", "queue.js"));
+    const r = rankQueue(g, slug ? { project: slug, limit: 1 } : { limit: 1 });
+    return (r.items || [])[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+// Resolve the directory to launch in. --dir wins; else a known slug is looked up
+// in the map; else the cwd's repo root. { dir:null } means "slug unknown here".
+function resolveDir(cfg, { dir, slug }) {
+  if (dir) {
+    const abs = path.resolve(dir);
+    return { dir: abs, slug: slug || u.projectSlug(abs), source: "--dir" };
+  }
+  if (slug) {
+    const p = (cfg.get("dispatch.repos", {}) || {})[slug];
+    return p ? { dir: p, slug, source: "config" } : { dir: null, slug, source: "unknown" };
+  }
+  return { dir: repoRoot(), slug: safeSlug(), source: "cwd" };
+}
+
+// Quote an argv element for the --print display only (never used to spawn).
+function shellQuote(s) {
+  return /[^\w./:-]/.test(s) ? `'${String(s).replace(/'/g, "'\\''")}'` : s;
+}
+
+async function cmdDispatch(cfg, args) {
+  const dryRun = args.includes("--print") || args.includes("--dry-run");
+  const full = args.includes("--full");
+  const noBrief = args.includes("--no-brief");
+  const backfill = args.includes("--backfill");
+  const fromQueue = args.includes("--from-queue");
+  const dirOpt = optVal(args, "dir");
+  const model = optVal(args, "model");
+  const permMode = optVal(args, "permission-mode");
+  const agent = optVal(args, "agent");
+  let nodeId = optVal(args, "node");
+  let targetSlug = optVal(args, "slug");
+  let name = optVal(args, "name");
+
+  // Positional task text: everything that isn't a flag or a flag's value.
+  const VALUE_OPTS = new Set(["dir", "node", "slug", "model", "permission-mode", "agent", "name"]);
+  const pos = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith("--")) {
+      if (VALUE_OPTS.has(a.slice(2))) i++;
+      continue;
+    }
+    pos.push(a);
+  }
+  let taskText = pos.join(" ").trim();
+
+  let brief = "";
+  let instruction = "";
+
+  if (fromQueue) {
+    const top = await topQueueItem(cfg, targetSlug);
+    if (!top || !top.id) {
+      err("queue empty — nothing to dispatch");
+      return 1;
+    }
+    nodeId = top.id;
+    targetSlug = targetSlug || top.repo || top.project || null;
+  }
+
+  if (backfill) {
+    // Onboarding a (possibly thin) repo: dispatch the skill; no briefing to compile.
+    instruction = taskText ? `/spor:backfill\n\n${taskText}` : "/spor:backfill";
+    name = name || "spor-backfill";
+  } else if (!nodeId && pos.length === 1 && /^[a-z0-9]+(-[a-z0-9]+)+$/.test(pos[0])) {
+    // Auto-detect: a single hyphenated token that resolves to a node => node mode.
+    const maybe = await resolveNode(cfg, pos[0]);
+    if (maybe) {
+      nodeId = maybe.id;
+      taskText = "";
+    }
+  }
+
+  if (!backfill && nodeId) {
+    const node = await resolveNode(cfg, nodeId);
+    if (!node) {
+      err(`no such node: ${nodeId}`);
+      return 1;
+    }
+    targetSlug = targetSlug || node.repo || null;
+    if (!noBrief) brief = await compileBriefing(cfg, { nodeId, full, project: targetSlug });
+    instruction = `Work on ${nodeId}${node.title ? ` — ${node.title}` : ""}. The compiled Spor briefing above is your standing context.${taskText ? ` ${taskText}` : ""}`;
+    name = name || nodeId;
+  } else if (!backfill) {
+    if (!taskText) {
+      err('usage: spor dispatch "<task>" | --node <id> | --from-queue | --backfill');
+      return 1;
+    }
+    if (!noBrief) brief = await compileBriefing(cfg, { query: taskText, full, project: targetSlug });
+    instruction = taskText;
+    name = name || taskText.split(/\s+/).slice(0, 8).join(" ").slice(0, 60);
+  }
+
+  const res = resolveDir(cfg, { dir: dirOpt, slug: targetSlug });
+  if (!res.dir) {
+    err(`don't know where '${res.slug}' lives on this machine.`);
+    err(`  run 'spor dispatch' from inside that repo once (it self-registers), then re-run, or:`);
+    err(`  spor repos add ${res.slug} <path>`);
+    err(`  or pass --dir <path>.`);
+    return 1;
+  }
+  if (!fs.existsSync(res.dir)) {
+    err(`target dir does not exist: ${res.dir}`);
+    return 1;
+  }
+  // Learn the mapping from this CLI use too.
+  u.registerRepo(cfg.graphHome(), res.slug, res.dir);
+
+  const prompt = brief
+    ? `# Spor briefing (compiled for this task — your standing context)\n\n${brief}\n\n---\n\n# Task\n\n${instruction}\n`
+    : instruction;
+
+  const claudeBin = process.env.SPOR_CLAUDE_CMD || "claude";
+  const claudeArgs = ["--bg"];
+  if (name) claudeArgs.push("--name", name);
+  if (model) claudeArgs.push("--model", model);
+  if (permMode) claudeArgs.push("--permission-mode", permMode);
+  if (agent) claudeArgs.push("--agent", agent);
+  claudeArgs.push(prompt);
+
+  if (dryRun) {
+    out(`dir:    ${res.dir}  (slug: ${res.slug}, via ${res.source})`);
+    out(`brief:  ${brief ? `${brief.length} bytes` : "(none — graph had nothing relevant, or --no-brief/--backfill)"}`);
+    out(`run:    ${claudeBin} ${claudeArgs.slice(0, -1).map(shellQuote).join(" ")} <prompt>`);
+    out(`\n--- prompt ---\n${prompt}`);
+    return 0;
+  }
+
+  if (claudeBin === "claude" && !hasCmd("claude")) {
+    err("claude CLI not on PATH — install Claude Code, then re-run (or 'spor dispatch … --print' to see the prompt).");
+    return 1;
+  }
+  const r = spawnSync(claudeBin, claudeArgs, { cwd: res.dir, stdio: "inherit" });
+  if (r.error) {
+    err(`could not launch ${claudeBin}: ${r.error.message}`);
+    return 1;
+  }
+  return r.status == null ? 1 : r.status;
+}
+
+// --- spor repos: inspect/manage the local slug->path map -----------------
+function cmdRepos(cfg, args) {
+  const home = cfg.graphHome();
+  const sub = args[0];
+  if (!sub || sub === "list") {
+    // Resolved through the config cascade (dispatch.repos), so user, global, and
+    // any repo/env override layers compose; writes land in $SPOR_HOME/config.json.
+    const map = cfg.get("dispatch.repos", {}) || {};
+    const keys = Object.keys(map).sort();
+    if (!keys.length) {
+      out("no repos mapped yet — they self-register as you open sessions, or: spor repos add <slug> <path>");
+      return 0;
+    }
+    for (const k of keys) out(`${k}\t${map[k]}`);
+    return 0;
+  }
+  if (sub === "add" || sub === "set") {
+    const slug = args[1];
+    const p = args[2];
+    if (!slug || !p) {
+      err("usage: spor repos add <slug> <path>");
+      return 1;
+    }
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) {
+      err(`invalid slug '${slug}' — must match ^[a-z0-9][a-z0-9-]*$`);
+      return 1;
+    }
+    const abs = path.resolve(p);
+    u.registerRepo(home, slug, abs);
+    out(`mapped ${slug} -> ${abs}`);
+    return 0;
+  }
+  if (sub === "rm" || sub === "remove" || sub === "forget") {
+    const slug = args[1];
+    if (!slug) {
+      err("usage: spor repos rm <slug>");
+      return 1;
+    }
+    out(u.forgetRepo(home, slug) ? `forgot ${slug}` : `no mapping for ${slug}`);
+    return 0;
+  }
+  err("usage: spor repos [list] | spor repos add <slug> <path> | spor repos rm <slug>");
+  return 1;
+}
+
 function version() {
   try {
     return require(path.join(ROOT, "package.json")).version || "0.0.0";
@@ -967,6 +1231,11 @@ async function main() {
     case "compile":
     case "brief":
       return cmdCompile(cfg, verb, args);
+    case "dispatch":
+    case "bg":
+      return await cmdDispatch(cfg, args);
+    case "repos":
+      return cmdRepos(cfg, args);
     case "validate":
       return passthrough("validate.js", args);
     case "cost":

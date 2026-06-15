@@ -331,6 +331,71 @@ function ensureDir(dir) {
   }
 }
 
+// --- local repo map (slug -> checkout path) -------------------------------
+// Which directory a project slug lives in on THIS machine. Per-machine and
+// machine-specific: it is NEVER in the shared graph (every teammate clones to a
+// different path — repo nodes carry slugs/fingerprints, never a local path).
+// It lives in the client config cascade under `dispatch.repos`
+// (dec-spor-client-config-cascade), so it composes with the env/global/repo
+// override layers and is READ via Config.get('dispatch.repos'). Writes target
+// the USER config ($SPOR_HOME/config.json) — the same machine-local,
+// never-committed file that holds server/token — so they never land in a
+// committable repo .spor.json. Learned passively by session-start and written
+// explicitly by `spor repos`/`spor dispatch`; fail-open throughout.
+function userConfigPath(graphHomeDir) {
+  return path.join(graphHomeDir, "config.json");
+}
+// Read-modify-write $SPOR_HOME/config.json, applying `mutate(repos)` to the
+// nested dispatch.repos object. Preserves every other key. Returns true only
+// when it actually wrote. Refuses to clobber a present-but-malformed config
+// (returns false) so a syntax error never costs the user their settings.
+function editRepoMap(graphHomeDir, mutate) {
+  try {
+    const file = userConfigPath(graphHomeDir);
+    let raw = null;
+    try {
+      raw = fs.readFileSync(file, "utf8");
+    } catch {
+      raw = null; // absent — start fresh
+    }
+    let data = {};
+    if (raw != null) {
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        return false; // malformed — do NOT overwrite
+      }
+      if (data == null || typeof data !== "object" || Array.isArray(data)) data = {};
+    }
+    if (data.dispatch == null || typeof data.dispatch !== "object" || Array.isArray(data.dispatch)) data.dispatch = {};
+    const d = data.dispatch;
+    if (d.repos == null || typeof d.repos !== "object" || Array.isArray(d.repos)) d.repos = {};
+    if (!mutate(d.repos)) return false; // unchanged — skip the write
+    if (!ensureDir(graphHomeDir)) return false;
+    fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+    return true;
+  } catch {
+    return false;
+  }
+}
+// Record slug -> dir (last-writer-wins, so a re-clone or worktree updates it).
+// No-op when unchanged, to avoid rewriting config.json on every session.
+function registerRepo(graphHomeDir, slug, dir) {
+  if (!slug || !dir || !/^[a-z0-9][a-z0-9-]*$/.test(slug)) return false;
+  return editRepoMap(graphHomeDir, (repos) => {
+    if (repos[slug] === dir) return false;
+    repos[slug] = dir;
+    return true;
+  });
+}
+function forgetRepo(graphHomeDir, slug) {
+  return editRepoMap(graphHomeDir, (repos) => {
+    if (!(slug in repos)) return false;
+    delete repos[slug];
+    return true;
+  });
+}
+
 function appendLine(file, line) {
   try {
     fs.appendFileSync(file, line + "\n");
@@ -602,11 +667,14 @@ module.exports = {
   byteTail,
   wordCount,
   stripTrailingNewlines,
+  inferenceRoot,
   projectSlug,
   projectGrouping,
   repoFingerprints,
   git,
   ensureDir,
+  registerRepo,
+  forgetRepo,
   appendLine,
   makeLogger,
   loadGraphCached,

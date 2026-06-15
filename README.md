@@ -71,6 +71,30 @@ context, and then proposes how to group your repos into projects (re-run it as
 you add repos). Or skip it and just work — distillation grows the graph one
 session at a time.
 
+## Dispatching background agents
+
+`spor dispatch` hands a task to Claude Code's background-agent machinery
+(`claude --bg`) with a briefing already compiled in:
+
+```bash
+spor dispatch "wire up token rotation in the pipeline"   # free-text task, briefed
+spor dispatch issue-86                                    # a node id — briefs its neighborhood
+spor dispatch --from-queue                                # the top item from 'spor next'
+spor dispatch --backfill                                  # onboard this repo via /spor:backfill
+spor dispatch <task> --print                              # dry run: show dir, prompt, argv
+```
+
+It compiles the briefing (the same two-arm compiler the `/spor:brief` skill
+drives), prepends it to the prompt, and launches `claude --bg` **in the right
+repo**. Which directory that is comes from a per-machine slug→path map: the
+shared graph is path-free by design (every teammate clones to a different
+path), so the map is local, kept in the config cascade under `dispatch.repos`
+(`spor repos` to inspect; written to `$SPOR_HOME/config.json`). It self-learns
+as you open sessions, so by the time you dispatch a node from another repo,
+Spor already knows where that repo lives. Flags pass through to `claude`
+(`--model`, `--permission-mode`, `--agent`, `--name`); `--full` embeds the whole
+neighborhood and `--no-brief` skips the briefing.
+
 ## What your agent gets, and gives back
 
 The loop runs without you having to drive it:

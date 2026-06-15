@@ -191,9 +191,13 @@ back to the exact `envDual` it replaced, so standalone calls and unit tests
 stay byte-identical. `.spor.json` is config, held SEPARATE from the `.spor`
 identity marker (which stays flat `key: value`). New levers beyond env
 migration: per-repo no-op disable (`enabled:false`/`mode:off` → dispatcher
-bails, fail-open) and neighborhood-search project controls
+bails, fail-open), neighborhood-search project controls
 (`search.minSim`, `search.projects.{include,exclude,boost}`, applied in
-`lib/kernel/graph.js` compile, no-op when empty). Server-side ops vars
+`lib/kernel/graph.js` compile, no-op when empty), and the `spor dispatch`
+slug→local-path map (`dispatch.repos`, a per-machine `{slug: path}` table the
+shared graph can't hold; written to the USER `$SPOR_HOME/config.json` by
+`spor repos`/`session-start`, read via the cascade — never a committable
+`.spor.json`, since paths are machine-specific). Server-side ops vars
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard
 (`SPOR_DISTILLING`) are deliberately NOT config — they stay pure env.

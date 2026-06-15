@@ -100,6 +100,22 @@ async function sessionStart(input) {
     /* best effort */
   }
 
+  // Learn where this slug lives on THIS machine (slug -> checkout path), so
+  // `spor dispatch` can later launch `claude --bg` in the right repo without a
+  // path map in the shared graph (paths differ per teammate; repo nodes carry
+  // slugs/fingerprints, never a local path). inferenceRoot() is the same repo
+  // root projectSlug() derives the slug from, so path and slug stay consistent
+  // and a linked worktree resolves to its main checkout. Pure side effect: never
+  // alters this run's output; fail-open (registerRepo no-ops on a non-canonical
+  // slug or unchanged value). (task-spor-cli-dispatch-background-agents)
+  try {
+    if (cwd && fs.existsSync(cwd)) {
+      u.registerRepo(graph, slug, u.inferenceRoot(cwd) || cwd);
+    }
+  } catch {
+    /* best effort */
+  }
+
   // -------------------------------------------------------------------------
   // REMOTE MODE
   // -------------------------------------------------------------------------
