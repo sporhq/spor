@@ -52,6 +52,17 @@ function graphHome() {
   return _config ? _config.graphHome() : home.graphHome();
 }
 
+// The PERSONAL user-config home — where the machine-local user config.json
+// (server/token + the dispatch.repos slug->path map) is read and written.
+// Anchored at the env/default home, INDEPENDENT of a per-repo `.spor` marker
+// `graph:` override (which redirects only the shared GRAPH, not this
+// machine-local file). Equals graphHome() unless a marker moved the graph
+// (issue-spor-config-desync-shared-graph-home). Standalone fallback matches
+// graphHome()'s, since with no config the two homes coincide.
+function userConfigHome() {
+  return _config ? _config.userConfigHome() : home.graphHome();
+}
+
 // jq `now | todate`: UTC, second precision, trailing Z.
 function jqNow() {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
@@ -744,6 +755,7 @@ function bashRandom() {
 module.exports = {
   ROOT,
   graphHome,
+  userConfigHome,
   envDual: home.envDual,
   useConfig,
   config,

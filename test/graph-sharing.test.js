@@ -102,3 +102,41 @@ test('distill guard: fail-open when a dir is not a git repo, or cwd is empty', (
   assert.strictEqual(graphInsideCodeRepo(plain, code), false);
   assert.strictEqual(graphInsideCodeRepo(code, ''), false);
 });
+
+// --- machine-local user-config home vs the marker-shared graph home
+// (issue-spor-config-desync-shared-graph-home): the engine-side seam
+// session-start writes the dispatch.repos map through. With a marker `graph:`
+// home active, u.graphHome() points at the shared graph but u.userConfigHome()
+// must stay at the personal env home, so passive learning never desyncs.
+
+test('util: userConfigHome stays personal while graphHome follows the marker; standalone they coincide', () => {
+  const env = (e) => {
+    const o = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (k.startsWith('SPOR_') || k.startsWith('SUBSTRATE_') || k === 'XDG_CONFIG_HOME') continue;
+      o[k] = v;
+    }
+    return Object.assign(o, e);
+  };
+  const root = tmp();
+  const code = path.join(root, 'code');
+  fs.mkdirSync(code, { recursive: true });
+  const shared = path.join(root, 'team-graph');
+  const personal = path.join(root, 'personal');
+  fs.writeFileSync(path.join(code, '.spor'), `repo: code\ngraph: ${shared}\n`);
+  try {
+    u.useConfig({ cwd: code, env: env({ SPOR_HOME: personal }) });
+    assert.strictEqual(u.graphHome(), shared); // the GRAPH follows the marker
+    assert.strictEqual(u.userConfigHome(), personal); // machine-local config does NOT
+  } finally {
+    u.clearConfig();
+  }
+  // No active config (standalone util call / unit test): both fall back to the
+  // env home, so the two coincide — byte-identical with no marker in play.
+  process.env.SPOR_HOME = personal;
+  try {
+    assert.strictEqual(u.userConfigHome(), u.graphHome());
+  } finally {
+    delete process.env.SPOR_HOME;
+  }
+});

@@ -415,7 +415,7 @@ async function cmdJoin(cfg, args) {
   }
   let cfgFile;
   try {
-    cfgFile = writeServerToken(cfg.graphHome(), server, token);
+    cfgFile = writeServerToken(cfg.userConfigHome(), server, token);
   } catch (e) {
     err(`could not write config: ${e.message}`);
     return 1;
@@ -1065,7 +1065,7 @@ async function cmdInstall(cfg, args) {
   const token = optVal(args, "token");
   if ((server || token) && !dryRun) {
     try {
-      const f = writeServerToken(cfg.graphHome(), server, token);
+      const f = writeServerToken(cfg.userConfigHome(), server, token);
       out(`wrote ${[server && "server", token && "token"].filter(Boolean).join(" + ")} to ${f}`);
     } catch (e) {
       err(`could not write config: ${e.message}`);
@@ -1461,7 +1461,10 @@ async function cmdDispatch(cfg, args) {
   // onboarding door, so it sets the repo up (init + enable) first; every
   // dispatch self-registers the dir it resolved.
   if (backfill) onboardRepo(cfg, res.dir);
-  u.registerRepo(cfg.graphHome(), res.slug, res.dir);
+  // The slug->path map is machine-local — written to the PERSONAL user config
+  // home, never the (possibly marker-shared) graph home
+  // (issue-spor-config-desync-shared-graph-home).
+  u.registerRepo(cfg.userConfigHome(), res.slug, res.dir);
   if (backfill) out(`registered ${res.slug} → ${res.dir}; launching the backfill agent…`);
 
   if (claudeBin === "claude" && !hasCmd("claude")) {
@@ -1478,7 +1481,11 @@ async function cmdDispatch(cfg, args) {
 
 // --- spor repos: inspect/manage the local slug->path map -----------------
 function cmdRepos(cfg, args) {
-  const home = cfg.graphHome();
+  // The map is machine-local: written to the PERSONAL user config home, never
+  // the (possibly marker-shared) graph home. Reads still go through the cascade
+  // below (cfg.get), whose user layer is anchored at this same home, so writes
+  // round-trip (issue-spor-config-desync-shared-graph-home).
+  const home = cfg.userConfigHome();
   const sub = args[0];
   if (!sub || sub === "list") {
     // Resolved through the config cascade (dispatch.repos), so user, global, and

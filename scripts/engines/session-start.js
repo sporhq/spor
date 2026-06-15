@@ -153,9 +153,12 @@ async function sessionStart(input) {
   // and a linked worktree resolves to its main checkout. Pure side effect: never
   // alters this run's output; fail-open (registerRepo no-ops on a non-canonical
   // slug or unchanged value). (task-spor-cli-dispatch-background-agents)
+  // The slug->path map is machine-local — written to the PERSONAL user config
+  // home, never the (possibly marker-shared) graph home, so it can't desync
+  // from where the cascade reads it back (issue-spor-config-desync-shared-graph-home).
   try {
     if (cwd && fs.existsSync(cwd)) {
-      u.registerRepo(graph, slug, u.inferenceRoot(cwd) || cwd);
+      u.registerRepo(u.userConfigHome(), slug, u.inferenceRoot(cwd) || cwd);
     }
   } catch {
     /* best effort */
