@@ -95,6 +95,29 @@ many `.md` files runs unbounded calls — and `SPOR_NUDGE_TIMEOUT`
 the parallel `SPOR_DISTILL_TIMEOUT`/`distill.timeoutMs`, default 120000). All
 knobs resolve through the config cascade (`u.cfgNum`). See test/nudge.test.js.
 
+The post-tool engine ALSO carries the claim heartbeat ∪ claim-nudge
+(task-cc-claim-nudge-hook, dec-cc-task-claim-lease) — REMOTE-MODE ONLY and a
+NO-LLM boolean lease lookup (a queue read, not a classifier; it stays off the
+LLM path). On every Write/Edit in a team-mode repo it does one
+`GET /v1/queue?project=<slug>&assignee=me` (the assignee read is the
+lease-exempt steward view, so the person's own carried work returns tagged with
+`lease_state`/`lease_by`) and branches: this PERSON holds a live (`in_progress`)
+claim here → `POST /v1/nodes/{id}/renew {session}` for each (the heartbeat,
+piggybacking on write-activity — no new timer, so it's portable across adapters
+that don't fire hooks uniformly), no nudge; this person holds none → nudge ONCE
+per session to claim a top eligible pool item (`GET /v1/queue?project=<slug>`)
+or `/spor:defer`. Person-scoped suppression (a held claim from ANY session,
+including a Tier-2 `reserved` reservation, suppresses), session-scoped heartbeat
+(only the editing session renews, and only Tier-1 leases). Cooldown
+`journal/<session>.claim-nudged`; disable `SPOR_CLAIM_NUDGE=0`
+(`claimNudge.enabled:false`); the lookup/heartbeat curls are bounded by
+`SPOR_CLAIM_NUDGE_TIMEOUT` (`claimNudge.timeoutMs`, default 3000). Fail-open:
+any non-200/unparseable/dead-server lease state → no nudge, exit 0 (never nudge
+during an outage). LOCAL mode is a no-op (returns before any side effect, so
+local output is byte-identical). The branch runs first and its nudge takes the
+single output envelope; the heartbeat branch returns null so a held-claim write
+still falls through to the capture nudge. See test/claim-nudge.test.js.
+
 Hooks have two modes (API.md §6): the payloads above test LOCAL mode;
 prefix `SPOR_SERVER=http://127.0.0.1:<port> SPOR_TOKEN=<token>` to
 test REMOTE mode against a running server (or a dead port for the fail-open

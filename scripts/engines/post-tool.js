@@ -17,6 +17,18 @@ ${facts}
 
 If a finding is durable, capture it NOW — one /spor:defer (or capture tool) call per finding, in your own words with full context. If none are durable, dismiss this consciously and move on. Live capture beats the session-end backstop: you still have the context the distiller won't. (Classifier: source=nudge; disable with SPOR_NUDGE=0.)`;
 
+// task-cc-claim-nudge-hook (dec-cc-task-claim-lease): the static, no-LLM
+// claim nudge injected when you edit a team-mode repo holding no live claim.
+// Offers (never auto-claims) the top eligible items in this project, plus
+// /spor:defer for work that isn't a node yet.
+const CLAIM_NUDGE_CTX = (slug, items) =>
+  `[spor claim nudge] You're editing ${slug} with no task claimed. On a shared project, claiming collapses a task to one owner so teammates don't duplicate your work; the claim is a heartbeat-renewed lease that returns to the pool if you stall.
+
+Top eligible work here:
+${items}
+
+Claim one with /spor:next (or set its status to in_progress), or file the work you're doing now with /spor:defer if it isn't a task yet. (source=claim-nudge; once per session; disable with SPOR_CLAIM_NUDGE=0.)`;
+
 // ===FACT===/===END=== blocks -> numbered single-line facts, capped at 3500
 // bytes (the awk program joined inner lines with single spaces).
 function parseFactList(response) {
@@ -216,6 +228,136 @@ async function nudge({ input, graph, slug, session, file, remote }) {
   };
 }
 
+// task-cc-claim-nudge-hook — the unified post-tool claim branch
+// (dec-cc-task-claim-lease). On every Write/Edit in a team-mode repo it does
+// ONE no-LLM boolean lease lookup (a queue read, not a classifier — stays off
+// the LLM path) and branches:
+//   - this PERSON holds a live (Tier-1) claim in this project -> renew each one
+//     (the heartbeat; piggybacks on the write-activity that already fired the
+//     hook, so no new timer — that is what keeps it portable across adapters
+//     that don't fire hooks uniformly). Renewing is session-scoped: only the
+//     editing session's writes drive it, and the server stamps THIS session as
+//     the renewing session. No nudge.
+//   - no live claim -> nudge ONCE per session to claim a top eligible item or
+//     /spor:defer. Offers, never auto-claims.
+//
+// The lookup is GET /v1/queue?project=<slug>&assignee=me: with assignee set the
+// read is a lease-EXEMPT steward/capacity view (lib/kernel/queue.js), so the
+// person's OWN carried work comes back tagged with lease_state/lease_by even
+// though those items are hidden from teammates. That single response answers
+// both "does this person hold a live claim here?" (person-scoped suppression,
+// across ALL their sessions) and "which live (in_progress) leases to renew."
+//
+// Gating (the capture-nudge lessons): remote/team mode only (a claim is
+// meaningless solo); in a real repo only (needs a project slug from a git
+// root); person-scoped nudge suppression but session-scoped heartbeat;
+// once-per-session cooldown via journal/<session>.claim-nudged; disable with
+// SPOR_CLAIM_NUDGE=0 (claimNudge.enabled:false). FAIL-OPEN: any error, or a
+// lease state we cannot verify (server down, non-200, unparseable), yields NO
+// nudge and exits 0 — never nudge during an outage, never block the tool loop.
+async function claimNudge({ graph, slug, session, cwd, remote }) {
+  // Remote/team mode only — claims are meaningless without a shared server.
+  if (!remote) return null;
+  // Disable lever: SPOR_CLAIM_NUDGE=0 / claimNudge.enabled:false. Like the
+  // other nudge knobs, resolve through the config cascade, falling back to the
+  // exact env dual-read when no config is active (byte-identical standalone).
+  if (u.config() ? !u.config().getBool("claimNudge.enabled", true) : (u.envDual("CLAIM_NUDGE") ?? "1") === "0") return null;
+  // Headless calls (the distiller's claude -p) don't nudge.
+  if (process.env.SPOR_DISTILLING || process.env.SUBSTRATE_DISTILLING) return null;
+  // In-repo only: a real git root must back the slug, else this is a loose
+  // directory and there is no project pool to claim from. (projectSlug falls
+  // back to the cwd basename for a non-repo; the claim model is repo-scoped.)
+  const top = u.git(cwd, ["rev-parse", "--show-toplevel"]);
+  if (!top || !top.trim()) return null;
+
+  // The one no-LLM lookup: the viewer's own carried work in this project. The
+  // bound (claimNudge.timeoutMs / SPOR_CLAIM_NUDGE_TIMEOUT, default 3s) keeps
+  // the curl well under the host's PostToolUse budget; a dead/slow server
+  // returns http "000" and we fail open.
+  const timeoutMs = u.cfgNum("claimNudge.timeoutMs", "CLAIM_NUDGE_TIMEOUT", 3000);
+  const mine = await u.curl(`${u.serverBase()}/v1/queue?project=${encodeURIComponent(slug)}&assignee=me`, {
+    headers: u.bearer(),
+    timeoutMs,
+  });
+  if (mine.http !== "200") return null; // can't verify -> never nudge (fail-open)
+  let myItems;
+  try {
+    myItems = JSON.parse(mine.body).items;
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(myItems)) return null;
+
+  // Person-scoped suppression: any item the person holds (live Tier-1
+  // in_progress OR Tier-2 reserved) means they have a claim in this project
+  // from SOME session — suppress the nudge entirely (kills the multi-session
+  // false positive). Session-scoped heartbeat: renew the LIVE (in_progress)
+  // ones; the editing session's write activity drives the heartbeat and the
+  // server records this session as the renewing one. A Tier-2 reservation is
+  // owner-exclusive but NOT heartbeated, so it suppresses without renewing.
+  const held = myItems.filter((i) => i && i.lease_state && i.id);
+  if (held.length > 0) {
+    for (const i of held.filter((x) => x.lease_state === "in_progress")) {
+      await u.curl(`${u.serverBase()}/v1/nodes/${encodeURIComponent(i.id)}/renew`, {
+        method: "POST",
+        headers: { ...u.bearer(), "content-type": "application/json" },
+        body: JSON.stringify({ session }),
+        timeoutMs,
+      }).catch(() => null);
+    }
+    // Journal the heartbeat so the operability log can correlate write-activity
+    // to renewals; best-effort.
+    u.appendLine(
+      path.join(graph, "journal", `${session}.jsonl`),
+      JSON.stringify({ ts: u.jqNow(), project: slug, tool: "claim-heartbeat", renewed: held.filter((x) => x.lease_state === "in_progress").map((x) => x.id) })
+    );
+    return null; // holds a claim -> never nudge
+  }
+
+  // No live claim. Once-per-session cooldown (mirrors journal/<session>.nudged):
+  // nudge at most once per session, not on every write.
+  const state = path.join(graph, "journal", `${session}.claim-nudged`);
+  if (fs.existsSync(state)) return null;
+
+  // Top eligible items to offer. The full project pool (NOT assignee-scoped, so
+  // teammates' live claims are correctly hidden) — the items anyone here can
+  // grab. Empty pool -> nothing worth nudging about; stay silent.
+  const pool = await u.curl(`${u.serverBase()}/v1/queue?project=${encodeURIComponent(slug)}&limit=3`, {
+    headers: u.bearer(),
+    timeoutMs,
+  });
+  if (pool.http !== "200") return null;
+  let poolItems;
+  try {
+    poolItems = JSON.parse(pool.body).items;
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(poolItems) || poolItems.length === 0) return null;
+  const lines = poolItems
+    .slice(0, 3)
+    .map((i) => `- ${i.id} — ${i.title || ""}${i.why ? ` (${i.why})` : ""}`)
+    .join("\n");
+  if (!lines) return null;
+
+  // Mark the cooldown BEFORE returning so a same-session retry stays silent
+  // even if the consumer ignores this nudge. Best-effort; an unwritable state
+  // file just means a possible second nudge, never a crash.
+  u.ensureDir(path.join(graph, "journal"));
+  u.appendLine(state, u.jqNow());
+  u.appendLine(
+    path.join(graph, "journal", `${session}.jsonl`),
+    JSON.stringify({ ts: u.jqNow(), project: slug, tool: "claim-nudge", offered: poolItems.slice(0, 3).map((i) => i.id) })
+  );
+
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PostToolUse",
+      additionalContext: CLAIM_NUDGE_CTX(slug, lines),
+    },
+  };
+}
+
 async function postTool(input) {
   const graph = u.graphHome();
   const remote = Boolean(u.serverBase());
@@ -243,6 +385,13 @@ async function postTool(input) {
         file: input.tool_input?.file_path ?? null,
       })
     );
+    // Claim heartbeat / nudge (task-cc-claim-nudge-hook) runs FIRST: it's the
+    // cheap no-LLM lease lookup, and its nudge (the no-claim branch) takes
+    // precedence over the LLM capture nudge for the single output envelope. The
+    // heartbeat branch returns null, so a held-claim write still falls through
+    // to the capture nudge. Both branches no-op in local mode. Fail-open.
+    const claim = await claimNudge({ graph, slug, session, cwd, remote }).catch(() => null);
+    if (claim) return claim;
     return (await nudge({ input, graph, slug, session, file, remote }).catch(() => null)) ?? null;
   }
 
@@ -271,4 +420,4 @@ async function postTool(input) {
   return null;
 }
 
-module.exports = { postTool, parseFactList };
+module.exports = { postTool, parseFactList, claimNudge };
