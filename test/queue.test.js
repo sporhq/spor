@@ -339,6 +339,24 @@ test("rankQueue: a rejected or superseded resolver does not retire its target", 
   assert.deepEqual(ids, ["task-x", "task-y"], "withdrawn fixes resolve nothing");
 });
 
+test("rankQueue: an in-review/approved artifact keeps its task live; merged retires it", () => {
+  // dec-spor-definition-of-done-org-policy: a resolver in a non-resolving
+  // delivery stage does not retire its target — the overnight-review smell,
+  // gone without a hand-managed `open` status. The partition is read off the
+  // registry (the artifact schema's status.non_resolving), not a kernel table.
+  const g = tmpGraph(Object.fromEntries([
+    node("task-in-review", "task", { status: "open" }),
+    node("art-pr-1", "artifact", { status: "in-review", edges: [["resolves", "task-in-review"]] }),
+    node("task-approved", "task", { status: "open" }),
+    node("art-pr-2", "artifact", { status: "approved", edges: [["resolves", "task-approved"]] }),
+    node("task-merged", "task", { status: "open" }),
+    node("art-pr-3", "artifact", { status: "merged", edges: [["resolves", "task-merged"]] }),
+  ])).load();
+  const ids = rankQueue(g, { now: NOW }).items.map((i) => i.id).sort();
+  assert.deepEqual(ids, ["task-approved", "task-in-review"],
+    "in-review/approved changes keep their tasks queued; the merged one is retired");
+});
+
 test("rankQueue: an answers edge retires questions only, never a task", () => {
   const g = tmpGraph(Object.fromEntries([
     node("task-z", "task", { status: "open" }),
