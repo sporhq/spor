@@ -921,3 +921,39 @@ test('session-start (remote): a healthy outbox adds no nudge', async () => {
     srv.close();
   }
 });
+
+// Local-mode git-shared graph (issue-cc-local-mode-graph-sharing-gap): a `.spor`
+// marker `graph:` key overrides SPOR_HOME and the home gets a .gitignore.
+test('session-start: a `.spor` graph: marker overrides the env home and writes the shared .gitignore', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'substrate-share-'));
+  const personal = path.join(root, 'personal'); // env SPOR_HOME — must be ignored
+  const shared = path.join(root, 'shared'); // the per-repo graph the marker points at
+  const code = path.join(root, 'code'); // the session cwd (slug "code")
+  fs.mkdirSync(path.join(personal, 'nodes'), { recursive: true });
+  fs.writeFileSync(path.join(personal, 'nodes', 'dec-decoy.md'), '---\nid: dec-decoy\ntype: decision\nproject: other\ntitle: decoy\n---\nbody\n');
+  fs.mkdirSync(path.join(shared, 'nodes'), { recursive: true });
+  fs.writeFileSync(
+    path.join(shared, 'nodes', 'brief-code.md'),
+    '---\nid: brief-code\ntype: briefing\nproject: code\ntitle: Shared briefing for code\nsummary: s\nversion: 9\n---\n\nThe shared-graph briefing body.\n'
+  );
+  fs.mkdirSync(code);
+  fs.writeFileSync(path.join(code, '.spor'), 'repo: code\ngraph: ../shared\n');
+
+  const out = run(
+    ['session-start', '--host', 'claude-code'],
+    JSON.stringify({ cwd: code, hook_event_name: 'SessionStart' }),
+    freshEnv(personal)
+  );
+  const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+  // Briefing came from the SHARED home (the marker), not the personal env home.
+  assert.match(ctx, /brief-code v9/);
+  assert.match(ctx, /shared-graph briefing body/);
+  assert.ok(ctx.includes(path.join(shared, 'nodes')), 'briefing should name the shared nodes dir');
+  // The shared home got a .gitignore covering machine-local state.
+  const gi = fs.readFileSync(path.join(shared, '.gitignore'), 'utf8');
+  for (const ig of ['/journal/', '/cache/', '/outbox/', '/auth/', '/config.json']) {
+    assert.ok(gi.includes(ig), `shared .gitignore missing ${ig}`);
+  }
+  // The personal env home was untouched (no .gitignore generated there).
+  assert.ok(!fs.existsSync(path.join(personal, '.gitignore')), 'personal home must not get a .gitignore');
+});

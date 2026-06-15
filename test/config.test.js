@@ -26,6 +26,11 @@ function write(file, obj) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(obj));
 }
+// A flat `.spor` identity marker (key: value), like projectSlug reads.
+function writeMarker(dir, body) {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, '.spor'), body);
+}
 
 test('defaults: unset values fall through to caller fallback (byte-identical)', () => {
   const dir = tmp();
@@ -122,4 +127,92 @@ test('fail-open: malformed config file is skipped with a warning', () => {
   assert.strictEqual(c.warnings.length, 1);
   assert.match(c.warnings[0], /malformed config/);
   assert.strictEqual(c.enabled(), true); // defaults intact
+});
+
+// --- per-repo `.spor` marker graph home (issue-cc-local-mode-graph-sharing-gap,
+// dec-spor-local-mode-sharing-boundary): free local mode's git-shared graph.
+
+test('marker graph: overrides SPOR_HOME (local), resolved relative to the marker dir', () => {
+  const root = tmp();
+  const repo = path.join(root, 'code');
+  writeMarker(repo, 'repo: code\ngraph: ../team-graph\n');
+  const envHome = path.join(root, 'personal');
+  const c = loadConfig({ cwd: repo, env: bareEnv({ SPOR_HOME: envHome }) });
+  const expected = path.resolve(repo, '../team-graph'); // == <root>/team-graph
+  assert.strictEqual(c.graphHome(), expected); // beats SPOR_HOME
+  assert.strictEqual(c.sharedGraphHome(), expected);
+  assert.strictEqual(c.nodesDir(), path.join(expected, 'nodes'));
+  assert.strictEqual(c.mode(), 'local');
+});
+
+test('marker graph: an absolute path is used as-is', () => {
+  const root = tmp();
+  const repo = path.join(root, 'code');
+  const abs = path.join(root, 'abs-graph');
+  writeMarker(repo, `graph: ${abs}\n`);
+  const c = loadConfig({ cwd: repo, env: bareEnv({ SPOR_HOME: path.join(root, 'env') }) });
+  assert.strictEqual(c.graphHome(), abs);
+});
+
+test('marker graph: deeper graph: binding wins over an ancestor binding', () => {
+  const root = tmp();
+  writeMarker(root, 'graph: root-graph\n');
+  const sub = path.join(root, 'svc');
+  writeMarker(sub, 'graph: sub-graph\n');
+  const c = loadConfig({ cwd: sub, env: bareEnv({ SPOR_HOME: path.join(root, 'env') }) });
+  assert.strictEqual(c.graphHome(), path.join(sub, 'sub-graph'));
+});
+
+test('marker graph: an identity-only deeper marker does NOT shadow an ancestor binding', () => {
+  const root = tmp();
+  writeMarker(root, 'graph: root-graph\n');
+  const sub = path.join(root, 'svc');
+  writeMarker(sub, 'repo: svc\n'); // identity split, no graph: key
+  const c = loadConfig({ cwd: sub, env: bareEnv({ SPOR_HOME: path.join(root, 'env') }) });
+  assert.strictEqual(c.graphHome(), path.join(root, 'root-graph')); // resolved at the root marker dir
+});
+
+test('marker graph: an explicit CLI --home still wins (marker not applied)', () => {
+  const root = tmp();
+  const repo = path.join(root, 'code');
+  writeMarker(repo, 'graph: team-graph\n');
+  const cliHome = path.join(root, 'cli');
+  const c = loadConfig({
+    cwd: repo,
+    env: bareEnv({ SPOR_HOME: path.join(root, 'env') }),
+    cli: { home: cliHome },
+  });
+  assert.strictEqual(c.graphHome(), cliHome);
+  assert.strictEqual(c.sharedGraphHome(), null);
+});
+
+test('marker graph: ignored in remote mode — the server is the graph', () => {
+  const root = tmp();
+  const repo = path.join(root, 'code');
+  writeMarker(repo, 'graph: team-graph\n');
+  const envHome = path.join(root, 'env');
+  const c = loadConfig({ cwd: repo, env: bareEnv({ SPOR_HOME: envHome, SPOR_SERVER: 'https://srv' }) });
+  assert.strictEqual(c.mode(), 'remote');
+  assert.strictEqual(c.graphHome(), envHome); // marker NOT applied
+  assert.strictEqual(c.sharedGraphHome(), null);
+});
+
+test('no graph: marker — home is byte-identical to env, sharedGraphHome is null', () => {
+  const root = tmp();
+  const repo = path.join(root, 'code');
+  writeMarker(repo, 'repo: code\n'); // identity only
+  const envHome = path.join(root, 'env');
+  const c = loadConfig({ cwd: repo, env: bareEnv({ SPOR_HOME: envHome }) });
+  assert.strictEqual(c.graphHome(), envHome);
+  assert.strictEqual(c.sharedGraphHome(), null);
+});
+
+test('.spor.json home stays BELOW env; only the .spor marker graph beats env', () => {
+  const root = tmp();
+  const repo = path.join(root, 'code');
+  write(path.join(repo, '.spor.json'), { home: path.join(root, 'json-home') });
+  const envHome = path.join(root, 'env');
+  const c = loadConfig({ cwd: repo, env: bareEnv({ SPOR_HOME: envHome }) });
+  assert.strictEqual(c.graphHome(), envHome); // env wins over .spor.json home (cascade)
+  assert.strictEqual(c.sharedGraphHome(), null);
 });

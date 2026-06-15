@@ -15,6 +15,27 @@ const u = require("./util");
 const { drainOutbox } = require("./drain-outbox");
 const { inferCommits } = require("./infer-commits");
 
+// True when the graph home and the session cwd resolve to the SAME git repo
+// (same toplevel) — i.e. the graph lives INSIDE the code repo being worked on,
+// the nested-repo hazard of issue-cc-local-mode-graph-sharing-gap /
+// dec-spor-local-mode-sharing-boundary. A per-repo `graph:` marker can point the
+// home at e.g. `.` (the code repo itself); auto-committing nodes/ there would
+// inject distiller commits straight onto the code branch instead of letting them
+// ride the human PR flow. Separate graph repos — the standard standalone home
+// and the sibling / nested-own-repo sharing layouts — return false and commit as
+// before (byte-identical). Fail-open: any git failure returns false.
+function graphInsideCodeRepo(graph, cwd) {
+  if (!cwd) return false;
+  const gTop = (u.git(graph, ["rev-parse", "--show-toplevel"]) || "").trim();
+  const cTop = (u.git(cwd, ["rev-parse", "--show-toplevel"]) || "").trim();
+  if (!gTop || !cTop) return false;
+  try {
+    return fs.realpathSync(gTop) === fs.realpathSync(cTop);
+  } catch {
+    return path.resolve(gTop) === path.resolve(cTop);
+  }
+}
+
 // Claude transcript shape: per-JSONL-line `select(.type=="user" or
 // .type=="assistant") | .type + ": " + <content text>`.
 function claudeConvo(docs) {
@@ -377,14 +398,25 @@ async function distill(input) {
   } catch {}
   if (v.status !== 0 || v.error) log(`validation found errors — review ${nodes}`);
 
-  // Commit the graph if it's a git repo.
+  // Commit the graph if it's a git repo — UNLESS the graph home lives inside the
+  // session's own code repo (the nested-repo hazard, graphInsideCodeRepo). In a
+  // per-repo `graph:` sharing setup pointed at the code repo, auto-committing
+  // would land distiller commits on the code branch; instead leave the nodes as
+  // working-tree changes for the contributor's PR (dec-spor-local-mode-sharing-
+  // boundary: distilled nodes ride the normal PR flow).
   if (fs.existsSync(path.join(graph, ".git")) && written.length > 0) {
-    const add = u.git(graph, ["add", "nodes/"]);
-    const commit =
-      add !== null ? u.git(graph, ["commit", "-qm", `distill: session ${session} (${slug})`]) : null;
-    if (add === null || commit === null) log("graph commit failed");
+    if (graphInsideCodeRepo(graph, cwd)) {
+      log(
+        `graph home is inside the session repo — leaving ${written.length} distilled node(s) uncommitted for the PR flow (dec-spor-local-mode-sharing-boundary)`
+      );
+    } else {
+      const add = u.git(graph, ["add", "nodes/"]);
+      const commit =
+        add !== null ? u.git(graph, ["commit", "-qm", `distill: session ${session} (${slug})`]) : null;
+      if (add === null || commit === null) log("graph commit failed");
+    }
   }
   return null;
 }
 
-module.exports = { distill, normalizeEdges, parseNodeBlocks, parseFactBlocks };
+module.exports = { distill, normalizeEdges, parseNodeBlocks, parseFactBlocks, graphInsideCodeRepo };

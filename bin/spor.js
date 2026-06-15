@@ -20,6 +20,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const https = require("https");
 const { spawnSync } = require("child_process");
 
 const ROOT = path.resolve(__dirname, "..");
@@ -36,6 +37,10 @@ Getting started
   install [host...]    wire spor into an agent: claude codex gemini opencode
                        copilot cursor (no host => list detected). --scope
                        user|repo, --all, --print, --server/--token to configure
+  upgrade [host...]    refresh wired spor to the installed package version after
+                       an npm bump (claude: marketplace+plugin update). No host
+                       => every detected wired host. Also flags a newer release
+                       published to npm. --scope user|repo, --print, --no-net
   status               resolved mode, graph, project, identity, health
   join <url> <token>   point the client at a graph (writes user config)
   migrate <url>        push the local graph to a remote you own (solo-remote)
@@ -162,6 +167,15 @@ async function cmdStatus(cfg) {
     const c = nodeCount(nodesDir);
     if (c == null) out(`graph:    ${nodesDir} (not created — run 'spor init')`);
     else out(`graph:    ${nodesDir} (${c} nodes)`);
+  }
+  // Claude Code loads its OWN copy of the plugin, so a bumped package can leave a
+  // stale plugin running silently (issue-spor-upgrade-no-plugin-refresh). When
+  // the loaded version lags this package's, point the user at 'spor upgrade'.
+  const plugin = claudePluginInfo();
+  if (plugin && plugin.version) {
+    const pkg = version();
+    const stale = plugin.version !== "unknown" && pkg && plugin.version !== pkg;
+    out(`plugin:   spor@spor ${plugin.version} loaded${stale ? `  (STALE — package ${pkg} installed; run 'spor upgrade')` : ""}`);
   }
   for (const w of cfg.warnings) err(`config:   ${w}`);
   return 0;
@@ -701,6 +715,90 @@ function homeDir() {
   return process.env.HOME || process.env.USERPROFILE || os.homedir();
 }
 
+// The Claude Code binary, overridable for tests (a stub fed via SPOR_CLAUDE_CMD,
+// same lever 'spor dispatch' uses). All claude shell-outs route through here.
+function claudeCmd() {
+  return process.env.SPOR_CLAUDE_CMD || "claude";
+}
+
+// The spor plugin Claude Code has LOADED (its own cached copy under
+// ~/.claude/plugins/), parsed from `claude plugin list --json`, or null if the
+// claude CLI is absent / spor isn't installed. Fail-soft and bounded — never
+// throws, prints, or hangs — so it is safe to call on the status path.
+function claudePluginInfo() {
+  const cmd = claudeCmd();
+  if (cmd === "claude" && !hasCmd("claude")) return null;
+  const r = spawnSync(cmd, ["plugin", "list", "--json"], { encoding: "utf8", timeout: 8000 });
+  if (r.status !== 0 || !r.stdout) return null;
+  let arr;
+  try {
+    arr = JSON.parse(r.stdout);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(arr)) return null;
+  const p = arr.find((x) => x && typeof x.id === "string" && x.id.split("@")[0] === "spor");
+  return p ? { version: p.version, scope: p.scope, enabled: p.enabled, installPath: p.installPath } : null;
+}
+
+// Compare two dot-numeric versions (a trailing -prerelease is ignored). -1/0/1.
+function verCmp(a, b) {
+  const parse = (v) => String(v).split("-")[0].split(".").map((n) => parseInt(n, 10) || 0);
+  const pa = parse(a);
+  const pb = parse(b);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d < 0 ? -1 : 1;
+  }
+  return 0;
+}
+
+// The latest @sporhq/spor version published to the public npm registry, or null
+// on any error/timeout/offline — a best-effort hint, never a hard dependency.
+// SPOR_NO_NET skips the network; SPOR_NPM_LATEST overrides the answer (a test
+// hook so the registry check is exercised without a network round-trip).
+async function npmLatest(timeoutMs = 4000) {
+  if (process.env.SPOR_NPM_LATEST) return process.env.SPOR_NPM_LATEST;
+  if (process.env.SPOR_NO_NET) return null;
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => {
+      if (!done) {
+        done = true;
+        resolve(v);
+      }
+    };
+    try {
+      const req = https.get("https://registry.npmjs.org/@sporhq%2Fspor/latest", { headers: { accept: "application/json" } }, (res) => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          return finish(null);
+        }
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (c) => {
+          body += c;
+          if (body.length > 1e6) req.destroy();
+        });
+        res.on("end", () => {
+          try {
+            finish(JSON.parse(body).version || null);
+          } catch {
+            finish(null);
+          }
+        });
+      });
+      req.on("error", () => finish(null));
+      req.setTimeout(timeoutMs, () => {
+        req.destroy();
+        finish(null);
+      });
+    } catch {
+      finish(null);
+    }
+  });
+}
+
 // Options that consume the following token, so positional parsing can skip it.
 const INSTALL_VALUE_OPTS = new Set(["scope", "server", "token"]);
 function positionals(args) {
@@ -787,29 +885,59 @@ function detectHosts() {
   return found;
 }
 
+// Refresh Claude Code's loaded copy of the plugin to match the marketplace
+// source (this checkout / the installed package): 'marketplace update' re-reads
+// the source dir so a bumped package version is picked up, then 'plugin update'
+// swaps the cached copy. Returns 0/1; prints a before→after line. The caller has
+// already ensured the claude CLI exists and the marketplace is registered.
+function refreshClaudePlugin(cmd, cliScope, before) {
+  spawnSync(cmd, ["plugin", "marketplace", "update", "spor"], { encoding: "utf8" });
+  const upd = spawnSync(cmd, ["plugin", "update", "spor", "--scope", cliScope], { stdio: "inherit" });
+  if (upd.status !== 0) {
+    err(`claude plugin update failed (exit ${upd.status == null ? "?" : upd.status})`);
+    return 1;
+  }
+  const after = claudePluginInfo();
+  const pkg = version();
+  if (before && after && before.version !== after.version) {
+    out(`spor plugin: ${before.version} → ${after.version} — restart your Claude Code session to load it.`);
+  } else if (after && after.version === pkg) {
+    out(`spor plugin already current (${after.version}).`);
+  } else {
+    out(`spor plugin refreshed (loaded ${after ? after.version : "?"}, package ${pkg}) — restart your session.`);
+  }
+  return 0;
+}
+
 // Claude Code: shell out to its plugin CLI (the stable contract; settings.json
 // is CLI-owned). The marketplace IS this repo (.claude-plugin/marketplace.json,
-// name "spor"), so 'marketplace add <ROOT>' then 'install spor@spor'.
+// name "spor"), so 'marketplace add <ROOT>' then 'install spor@spor'. If the
+// plugin is ALREADY installed, refresh it (marketplace+plugin update) instead of
+// a no-op install, so re-running 'spor install claude' actually picks up a
+// bumped package (issue-spor-upgrade-no-plugin-refresh).
 function installClaude(scope, dryRun) {
+  const cmd = claudeCmd();
   const cliScope = scope === "repo" ? "project" : "user";
   const addArgs = ["plugin", "marketplace", "add", ROOT];
   const instArgs = ["plugin", "install", "spor@spor", "--scope", cliScope];
   if (dryRun) {
-    out(`would run: claude ${addArgs.join(" ")}`);
-    out(`would run: claude ${instArgs.join(" ")}`);
+    out(`would run: ${cmd} ${addArgs.join(" ")}`);
+    out(`would run: ${cmd} ${instArgs.join(" ")}`);
     return 0;
   }
-  if (!hasCmd("claude")) {
+  if (cmd === "claude" && !hasCmd("claude")) {
     err("claude CLI not on PATH — install Claude Code, then re-run 'spor install claude'.");
     err(`meanwhile, load spor without a marketplace per session:  claude --plugin-dir ${ROOT}`);
     return 1;
   }
-  const add = spawnSync("claude", addArgs, { encoding: "utf8" });
+  const add = spawnSync(cmd, addArgs, { encoding: "utf8" });
   if (add.status !== 0 && !/already|exists|known/i.test((add.stderr || "") + (add.stdout || ""))) {
     err(`claude plugin marketplace add failed: ${(add.stderr || add.stdout || "").trim() || "unknown error"}`);
     return 1;
   }
-  const inst = spawnSync("claude", instArgs, { stdio: "inherit" });
+  const existing = claudePluginInfo();
+  if (existing) return refreshClaudePlugin(cmd, cliScope, existing);
+  const inst = spawnSync(cmd, instArgs, { stdio: "inherit" });
   if (inst.status !== 0) {
     err(`claude plugin install failed (exit ${inst.status == null ? "?" : inst.status})`);
     return 1;
@@ -917,6 +1045,115 @@ async function cmdInstall(cfg, args) {
     else out("  point at a graph:  spor join <server-url> <token>   (or export SPOR_SERVER/SPOR_TOKEN)");
     out("  distiller backend (hosts without the claude CLI) + on-demand MCP access: see adapters/<host>/README.md");
     out("  approve the hooks on first run if the host prompts.");
+  }
+  return rc;
+}
+
+// --- spor upgrade: refresh wired spor to the installed package version -------
+// (issue-spor-upgrade-no-plugin-refresh) An npm bump updates the package on disk
+// but NOT what an agent already loaded: Claude Code runs its OWN cached copy of
+// the plugin, so it keeps running stale skills/hooks until 'plugin update' swaps
+// the copy. The hook hosts (codex/cursor/copilot/gemini/opencode) reference the
+// package by absolute path, so they only go stale if the checkout MOVED — for
+// which re-running the idempotent install refreshes the path. This verb does
+// both in one step and tells the user to restart the session.
+
+// Refresh Claude Code's loaded plugin (marketplace add to register/repoint the
+// source, then the shared marketplace+plugin update). Returns 0/1.
+function upgradeClaude(scope, dryRun) {
+  const cmd = claudeCmd();
+  const cliScope = scope === "repo" ? "project" : "user";
+  const mpAdd = ["plugin", "marketplace", "add", ROOT];
+  const mpUpd = ["plugin", "marketplace", "update", "spor"];
+  const plUpd = ["plugin", "update", "spor", "--scope", cliScope];
+  if (dryRun) {
+    out(`would run: ${cmd} ${mpAdd.join(" ")}`);
+    out(`would run: ${cmd} ${mpUpd.join(" ")}`);
+    out(`would run: ${cmd} ${plUpd.join(" ")}`);
+    return 0;
+  }
+  if (cmd === "claude" && !hasCmd("claude")) {
+    err("claude CLI not on PATH — install Claude Code, then re-run 'spor upgrade'.");
+    return 1;
+  }
+  const before = claudePluginInfo();
+  if (!before) {
+    err("spor isn't installed in Claude Code yet — run 'spor install claude' first.");
+    return 1;
+  }
+  // Re-register the marketplace source first, tolerating "already exists", so a
+  // moved checkout repoints before the update re-reads it.
+  const add = spawnSync(cmd, mpAdd, { encoding: "utf8" });
+  if (add.status !== 0 && !/already|exists|known/i.test((add.stderr || "") + (add.stdout || ""))) {
+    err(`claude plugin marketplace add failed: ${(add.stderr || add.stdout || "").trim() || "unknown error"}`);
+    return 1;
+  }
+  return refreshClaudePlugin(cmd, cliScope, before);
+}
+
+// Is spor actually wired into this host on this machine (vs the host merely being
+// present)? claude: ask its plugin list; hook/plugin hosts: look for the spor
+// marker in the target config. Picks which hosts 'spor upgrade' (no host) touches.
+function hostHasSpor(host, scope) {
+  if (host === "claude") return !!claudePluginInfo();
+  const spec = HOSTS[host];
+  if (!spec) return false;
+  try {
+    return /spor-hook|spor/.test(fs.readFileSync(targetPath(spec, scope), "utf8"));
+  } catch {
+    return false;
+  }
+}
+
+async function cmdUpgrade(cfg, args) {
+  const dryRun = args.includes("--print") || args.includes("--dry-run");
+  let scope = optVal(args, "scope") || "user";
+  if (scope === "project") scope = "repo";
+  if (scope !== "user" && scope !== "repo") {
+    err(`invalid --scope '${scope}' — use 'user' or 'repo'`);
+    return 1;
+  }
+  const pos = positionals(args);
+  const bad = pos.find((a) => !HOSTS[a]);
+  if (bad) {
+    err(`unknown host '${bad}' — known: ${Object.keys(HOSTS).join(", ")}`);
+    return 1;
+  }
+  // Explicit hosts win; otherwise refresh every detected host that has spor wired.
+  let hosts = pos.slice();
+  if (!hosts.length) hosts = detectHosts().filter((h) => hostHasSpor(h, scope));
+  if (!hosts.length) {
+    out("nothing to upgrade — spor isn't wired into any detected host. Run 'spor install <host>'.");
+    return 0;
+  }
+  out(`package: @sporhq/spor ${version()} (this CLI)`);
+  let rc = 0;
+  for (const host of hosts) {
+    let r;
+    if (host === "claude") r = upgradeClaude(scope, dryRun);
+    else {
+      // Re-running install refreshes the absolute __SPOR_ROOT__ path (a no-op
+      // when the path is unchanged; repairs a moved checkout when it is not).
+      const spec = HOSTS[host];
+      r = spec.kind === "plugin" ? installPluginHost(spec, scope, dryRun) : installHookHost(spec, scope, dryRun);
+    }
+    if (r !== 0) rc = r;
+  }
+  if (!dryRun) {
+    out("");
+    out("Restart any running sessions so the refreshed hooks/plugin load.");
+    // The refresh above closes the loaded-vs-installed gap; this closes the
+    // installed-vs-published one — if npm has a newer release, the package on
+    // disk itself is behind, so point the user at the npm bump (then re-upgrade).
+    if (!args.includes("--no-net")) {
+      const latest = await npmLatest();
+      const installed = version();
+      if (latest && verCmp(installed, latest) < 0) {
+        out("");
+        out(`note: a newer @sporhq/spor is published — ${latest} (you have ${installed}).`);
+        out(`  run: npm install -g @sporhq/spor@latest  &&  spor upgrade`);
+      }
+    }
   }
   return rc;
 }
@@ -1140,7 +1377,7 @@ async function cmdDispatch(cfg, args) {
     ? `# Spor briefing (compiled for this task — your standing context)\n\n${brief}\n\n---\n\n# Task\n\n${instruction}\n`
     : instruction;
 
-  const claudeBin = process.env.SPOR_CLAUDE_CMD || "claude";
+  const claudeBin = claudeCmd();
   const claudeArgs = ["--bg"];
   if (name) claudeArgs.push("--name", name);
   if (model) claudeArgs.push("--model", model);
@@ -1258,6 +1495,9 @@ async function main() {
     case "install":
     case "setup":
       return await cmdInstall(cfg, args);
+    case "upgrade":
+    case "update":
+      return await cmdUpgrade(cfg, args);
     case "status":
       return await cmdStatus(cfg);
     case "whoami":

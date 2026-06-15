@@ -391,3 +391,119 @@ test('install --server/--token persists creds to user config', () => {
   assert.strictEqual(cfg.token, 'tok9');
   assert.ok(fs.existsSync(path.join(home, '.codex', 'hooks.json')), 'host still installed');
 });
+
+// --- upgrade (issue-spor-upgrade-no-plugin-refresh) -----------------------
+// A bumped package leaves Claude Code running its own stale copy until the
+// plugin is updated. These exercise the claude CLI shell-outs through a fake
+// `claude` (SPOR_CLAUDE_CMD), the same lever dispatch uses. Posix-only (the
+// stub is a shell script). PKG is this package's version, so the asserts don't
+// hard-code a number that a release bump would break.
+const PKG = require('../package.json').version;
+
+// A fake `claude plugin` CLI. `plugin list --json` echoes the currently-loaded
+// version (from $STATE, defaulting to $STARTVER); `plugin update spor` writes
+// $NEWVER to $STATE (simulating the cache swap). $EMPTY makes list report no
+// spor installed. Returns the stub path.
+function claudeStub(home) {
+  const stub = path.join(home, 'claude-plugin-stub.sh');
+  fs.writeFileSync(stub, [
+    '#!/bin/sh',
+    'if [ -n "$EMPTY" ]; then',
+    '  if [ "$2" = "list" ]; then echo "[]"; fi',
+    '  exit 0',
+    'fi',
+    'ver=$(cat "$STATE" 2>/dev/null || echo "$STARTVER")',
+    'if [ "$2" = "list" ]; then',
+    '  printf \'[{"id":"spor@spor","version":"%s","scope":"user","enabled":true,"installPath":"/x/%s"}]\\n\' "$ver" "$ver"',
+    '  exit 0',
+    'fi',
+    'if [ "$2" = "update" ] && [ "$3" = "spor" ]; then printf \'%s\' "$NEWVER" > "$STATE"; fi',
+    'exit 0',
+  ].join('\n') + '\n');
+  fs.chmodSync(stub, 0o755);
+  return stub;
+}
+
+test('upgrade claude --print shows the three plugin commands, runs nothing', () => {
+  const r = run(['upgrade', 'claude', '--print'], { HOME: scratchHome() });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /would run: claude plugin marketplace add /);
+  assert.match(r.stdout, /would run: claude plugin marketplace update spor/);
+  assert.match(r.stdout, /would run: claude plugin update spor --scope user/);
+});
+
+test('upgrade claude refreshes a stale plugin and reports before → after', { skip: process.platform === 'win32' }, () => {
+  const home = scratchHome();
+  const stub = claudeStub(home);
+  const r = run(['upgrade', 'claude'], { HOME: home, SPOR_CLAUDE_CMD: stub, STATE: path.join(home, 'loaded'), STARTVER: '0.0.1', NEWVER: PKG });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, new RegExp(`spor plugin: 0\\.0\\.1 → ${PKG.replace(/\./g, '\\.')}`));
+  assert.match(r.stdout, /restart your Claude Code session/i);
+  assert.match(r.stdout, /Restart any running sessions/);
+});
+
+test('upgrade claude reports already-current when the loaded version matches', { skip: process.platform === 'win32' }, () => {
+  const home = scratchHome();
+  const stub = claudeStub(home);
+  const r = run(['upgrade', 'claude'], { HOME: home, SPOR_CLAUDE_CMD: stub, STATE: path.join(home, 'loaded'), STARTVER: PKG, NEWVER: PKG });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, new RegExp(`already current \\(${PKG.replace(/\./g, '\\.')}\\)`));
+});
+
+test('upgrade claude errors when spor is not installed in Claude Code', { skip: process.platform === 'win32' }, () => {
+  const home = scratchHome();
+  const stub = claudeStub(home);
+  const r = run(['upgrade', 'claude'], { HOME: home, SPOR_CLAUDE_CMD: stub, EMPTY: '1' });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /run 'spor install claude' first/);
+});
+
+test('install claude self-heals: an already-installed plugin is refreshed, not no-op', { skip: process.platform === 'win32' }, () => {
+  const home = scratchHome();
+  const stub = claudeStub(home);
+  const r = run(['install', 'claude'], { HOME: home, SPOR_CLAUDE_CMD: stub, STATE: path.join(home, 'loaded'), STARTVER: '0.0.1', NEWVER: PKG });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, new RegExp(`spor plugin: 0\\.0\\.1 → ${PKG.replace(/\./g, '\\.')}`));
+});
+
+test('status flags a stale Claude plugin and stays quiet when current', { skip: process.platform === 'win32' }, () => {
+  const { dir } = fixtureGraph();
+  const home = scratchHome();
+  const stub = claudeStub(home);
+  const stale = run(['status'], { SPOR_HOME: dir, SPOR_CLAUDE_CMD: stub, STATE: path.join(home, 'loaded'), STARTVER: '0.0.1', NEWVER: PKG });
+  assert.strictEqual(stale.status, 0);
+  assert.match(stale.stdout, /plugin:\s+spor@spor 0\.0\.1 loaded\s+\(STALE/);
+  assert.match(stale.stdout, /run 'spor upgrade'/);
+  const current = run(['status'], { SPOR_HOME: dir, SPOR_CLAUDE_CMD: stub, STATE: path.join(home, 'loaded2'), STARTVER: PKG, NEWVER: PKG });
+  assert.strictEqual(current.status, 0);
+  assert.match(current.stdout, new RegExp(`plugin:\\s+spor@spor ${PKG.replace(/\./g, '\\.')} loaded`));
+  assert.doesNotMatch(current.stdout, /STALE/);
+});
+
+// The npm-registry "newer version published" check. SPOR_NPM_LATEST overrides
+// the registry answer so this runs offline; the plugin is held current
+// (STARTVER=NEWVER=PKG) so only the npm note is under test.
+test('upgrade flags a newer @sporhq/spor published to npm', { skip: process.platform === 'win32' }, () => {
+  const home = scratchHome();
+  const stub = claudeStub(home);
+  const r = run(['upgrade', 'claude'], { HOME: home, SPOR_CLAUDE_CMD: stub, STATE: path.join(home, 'loaded'), STARTVER: PKG, NEWVER: PKG, SPOR_NPM_LATEST: '99.0.0' });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /newer @sporhq\/spor is published — 99\.0\.0/);
+  assert.match(r.stdout, /npm install -g @sporhq\/spor@latest/);
+});
+
+test('upgrade stays quiet when the installed package is the latest published', { skip: process.platform === 'win32' }, () => {
+  const home = scratchHome();
+  const stub = claudeStub(home);
+  const r = run(['upgrade', 'claude'], { HOME: home, SPOR_CLAUDE_CMD: stub, STATE: path.join(home, 'loaded'), STARTVER: PKG, NEWVER: PKG, SPOR_NPM_LATEST: PKG });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stdout, /newer @sporhq\/spor/);
+});
+
+test('upgrade --no-net skips the registry check entirely', { skip: process.platform === 'win32' }, () => {
+  const home = scratchHome();
+  const stub = claudeStub(home);
+  const r = run(['upgrade', 'claude', '--no-net'], { HOME: home, SPOR_CLAUDE_CMD: stub, STATE: path.join(home, 'loaded'), STARTVER: PKG, NEWVER: PKG, SPOR_NPM_LATEST: '99.0.0' });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stdout, /newer @sporhq\/spor/);
+});

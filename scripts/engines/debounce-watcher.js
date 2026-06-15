@@ -43,6 +43,19 @@ async function runDistill() {
   } catch {
     return;
   }
+  // Activate the client config cascade from the session cwd so this detached
+  // watcher resolves the SAME graph home (and distill settings) the session used
+  // — in particular a per-repo `.spor` `graph:` marker home
+  // (issue-cc-local-mode-graph-sharing-gap). The in-process distill path gets
+  // this from the dispatcher; the watcher is a fresh process with no active
+  // config, so without this the debounced distiller would write to the env/
+  // default home and bypass the shared graph. Fail-open: a config error leaves
+  // the prior env/default resolution.
+  try {
+    require(path.join(__dirname, "util")).useConfig({ cwd: payload.cwd || process.cwd() });
+  } catch {
+    /* fall back to env/default home */
+  }
   const { distill } = require("./distill");
   await distill(payload).catch(() => {});
 }
