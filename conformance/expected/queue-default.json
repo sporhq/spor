@@ -39,7 +39,7 @@
         "age_days": 11
       },
       "suggest": "do",
-      "why": "your active front (40 writes this week); neighborhood active (heat 3); 11d old"
+      "why": "your active front (40 writes in the last 7 days); neighborhood active (heat 3); 11d old"
     },
     {
       "id": "task-blocked",

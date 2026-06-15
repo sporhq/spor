@@ -112,6 +112,25 @@ test('getBool honors the shell "0"/"false" convention', () => {
   assert.strictEqual(cd.getBool('nudge.enabled', true), true); // fallback
 });
 
+test('queue.front: structural defaults, env override, and disable convention', () => {
+  // task-cc-local-front-productionize: the local git-derived front window/toggle
+  // live in the cascade. Defaults are baked into DEFAULTS (not get() fallbacks).
+  const dir = tmp();
+  const cd = loadConfig({ cwd: dir, env: bareEnv({ SPOR_HOME: dir }) });
+  assert.strictEqual(cd.getNum('queue.front.days', 7), 7);
+  assert.strictEqual(cd.getBool('queue.front.enabled', true), true);
+  assert.deepStrictEqual(cd.warnings, []); // `queue` is a known key
+  // env overrides (above the files): SPOR_QUEUE_FRONT=0 disables, _DAYS tunes.
+  const ce = loadConfig({ cwd: dir, env: bareEnv({ SPOR_HOME: dir, SPOR_QUEUE_FRONT: '0', SPOR_QUEUE_FRONT_DAYS: '30' }) });
+  assert.strictEqual(ce.getBool('queue.front.enabled', true), false);
+  assert.strictEqual(ce.getNum('queue.front.days', 7), 30);
+  // repo .spor.json sits below env, above defaults.
+  write(path.join(dir, '.spor.json'), { queue: { front: { days: 14 } } });
+  const cr = loadConfig({ cwd: dir, env: bareEnv({ SPOR_HOME: dir }) });
+  assert.strictEqual(cr.getNum('queue.front.days', 7), 14);
+  assert.strictEqual(cr.getBool('queue.front.enabled', true), true); // still the default
+});
+
 test('unknown top-level key earns a warning but is otherwise ignored', () => {
   const root = tmp();
   write(path.join(root, '.spor.json'), { searhc: { minSim: 0.5 }, enabled: true });

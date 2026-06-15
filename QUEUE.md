@@ -339,11 +339,28 @@ signals via its schema's `queueSignals()`:
   merely retrieved — a single prompt-submit digest lists ~60 — so only
   work-class ops count (issue-cc-heat-amplification and its digest round).
 - **front** — the viewer's own write-class ops on the node (puts, edges,
-  status flips, captures during it) over the last week, identity-scoped
-  from the same journal (`store.writeActivity`). Counts the node itself
-  only — no neighborhood propagation — so provenance hubs can't ride it;
-  capped below the p1 bump so human priority stays supreme
-  (dec-cc-queue-front-from-attribution).
+  status flips, captures during it) over a rolling window (default 7 days),
+  identity-scoped. In **remote** mode the server injects it from the same
+  request journal (`store.writeActivity`). In **local** mode there is no
+  request log, so it is reconstructed from **git history**
+  (`gitFront()` in `lib/queue.js`, task-cc-local-front-productionize): the
+  graph home is a git repo the distiller auto-commits into, the local
+  `git config user.email` is the viewer identity, and a commit that
+  adds/modifies/renames `nodes/<id>.md` is a write-class op on that node.
+  `git log --since=<days> days ago --author=<email> --diff-filter=ACMR
+  --name-only -- nodes/` yields the same `{nodeId: count}` map the server
+  builds; each commit lists a touched file once, so occurrences across the
+  log = the node's write count. Pure deletes (D) are excluded — a removed
+  node isn't live work — and there is no neighborhood spread, matching the
+  server. It is best-effort and fail-open: not a git repo, no commits, or an
+  unset `user.email` yields an empty map (front 0 everywhere, the pre-front
+  ordering). The window and an on/off toggle live in the config cascade
+  (`queue.front.days` / `queue.front.enabled`, env `SPOR_QUEUE_FRONT_DAYS` /
+  `SPOR_QUEUE_FRONT`); the `lib/queue.js` CLI flags `--days` / `--no-front`
+  override them. Counts the node itself only — no neighborhood propagation —
+  so provenance hubs can't ride it; capped below the p1 bump so human
+  priority stays supreme; and the why-line states the actual window
+  ("N writes in the last D days") (dec-cc-queue-front-from-attribution).
 - **staleness** — anchors superseded or gone; high staleness suggests
   closing, not doing.
 - **age**, and any org-specific signal the schema's code adds (SLA clocks,

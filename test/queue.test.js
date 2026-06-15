@@ -438,7 +438,17 @@ test("rankQueue: injected front activity surfaces the viewer's working front", (
   const r = rankQueue(g, { now: NOW, front: { "task-my-front": 7 } });
   assert.equal(r.items[0].id, "task-my-front");
   assert.equal(r.items[0].signals.front, 7);
-  assert.match(r.items[0].why, /your active front \(7 writes this week\)/);
+  assert.match(r.items[0].why, /your active front \(7 writes in the last 7 days\)/);
+});
+
+test("rankQueue: front why-line states the actual window, not a fixed 'this week'", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-windowed", "task", { status: "open" }),
+  ])).load();
+  const r = rankQueue(g, { now: NOW, front: { "task-windowed": 1 }, frontDays: 30 });
+  // singular write + non-default window: pluralization adapts and the literal
+  // window is stated (task-cc-local-front-productionize).
+  assert.match(r.items[0].why, /your active front \(1 write in the last 30 days\)/);
 });
 
 test("rankQueue: front caps below the p1 bump — human priority stays supreme", () => {
