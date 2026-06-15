@@ -136,6 +136,46 @@ a change still in review has not delivered. So:
   exactly as before, so a change still in review keeps its task live without any
   hand-managed `open` status.
 
+## The org-defined policy layer
+
+"What it takes to reach a resolving/done state" beyond the native floor —
+quorum, qualified approvers, agent-vs-human distinctions — lives in **`policy`
+nodes**, a reserved schema kind layered ON TOP of the per-type
+`transitions()` gate (task-cc-policy-layer, dec-spor-policy-layer-activate;
+dec-spor-definition-of-done-org-policy Stage 2). A policy node is an ordinary
+`type: schema` node with `kind: policy`, a `governs` scope block in its fenced
+`json` payload, and an attached fenced `js` block exporting
+`gate(current, proposed, view) -> { allow, reason? }`. The payload declares the
+scope; the gate is the rule. For example, a policy `governs`-ing tasks in
+project `my-team` with a payload `{ "governs": { "types": ["task"], "projects":
+["my-team"] } }` and a `gate` that, on a `done` transition, counts
+`view.approvals` whose `roles` include `reviewer` and denies unless there are at
+least two — the definition-of-done quorum gate.
+
+- **Selection is governs-traversal.** `governs.types` restricts the policy to
+  those node types, `governs.projects` to those project slugs; an absent or
+  empty axis means "any". A node is governed by every policy whose every
+  present axis matches it — so an org-wide policy (no `governs`) and a
+  team-scoped one can both apply, most-specific first.
+- **The gate is AND-ed with `transitions()`, never replaces it.** Every
+  governing policy's `gate()` must also `allow` the write; any deny stops it.
+  A policy can only ADD a constraint — it can never loosen a type's
+  `transitions()` or the native self-approval floor beneath both
+  (dec-cc-policy-floor-now-layer-deferred). Like `transitions()`, the gate is
+  fail-closed (a crashing gate denies) and runs on UPDATE only.
+- **Approvals are review edges.** The gate context carries `view.approvals`:
+  the node's own `reviewed-by`/`approved-by` edges to `person` nodes, each
+  joined to that person's `roles` register, with the node's own author
+  excluded (the self-approval floor — a policy can't be used to launder it).
+  The first concrete rule is the **definition-of-done quorum gate**: a work
+  node's `done` transition additionally requires a quorum of approvals from
+  qualified roles. (The `reviewed-by`/`approved-by` edge types and a native
+  review surface ship with review-as-graph-object; the policy kind, scope
+  selection, and the gate AND are landed now.)
+- **Policy nodes go through the same proposal/activation flow they govern** —
+  a proposed policy is inert until a *different* identity activates it (the
+  native floor protects against self-amendment circularity).
+
 ## Norm ride-along
 
 A `norm` node (any `always_on` type) rides along on every compile — but the
@@ -288,6 +328,7 @@ type: person
 title: Anthony Allen
 summary: Maintainer; stewards the schema registry and the hook engines.
 email: losthammer@gmail.com
+roles: [reviewer, maintainer]
 queue_mute: [some-noisy-project, task-noisy-job@2026-07-01]
 date: 2026-06-10
 edges:
@@ -318,6 +359,12 @@ edges:
   optional `@YYYY-MM-DD` expiry) is per-viewer presentation only: the queue
   hides those items for this person and reports how many it hid; they stay live
   and visible to everyone else (QUEUE.md §4).
+- **`roles`** (flat inline list, e.g. `roles: [reviewer, maintainer]`) is the
+  qualification register the org-defined policy layer reads. A scoped `policy`
+  node's gate counts approvals from persons holding a named role — the
+  definition-of-done quorum gate is the first such rule (see "The org-defined
+  policy layer" below). Declarative data only; absent it, a person holds no
+  roles and the field has no effect.
 
 ### Onboarding a team member
 

@@ -287,12 +287,34 @@ levels, and keeping them distinct is the design:
    gate context so identity-aware rules are expressible.
 
 A wider org-defined **policy layer** — a reserved `policy` kind in the
-schema family whose gate would run on every write AND-ed with the per-type
+schema family whose gate runs on a write AND-ed with the per-type
 `transitions()`, carrying role lists, quorum rules, agent-vs-human
-distinctions, and the queue-blend override as one mechanism — is
-deliberately deferred until a real org rule demands more than the floor
-(dec-cc-policy-floor-now-layer-deferred). The enabling hook (`view.actor`)
-ships now so the layer needs no core change when it comes.
+distinctions, and (eventually) the queue-blend override as one mechanism — was
+deferred until a real org rule demanded more than the floor
+(dec-cc-policy-floor-now-layer-deferred), then activated once one did
+(dec-spor-policy-layer-activate). The first rule it expresses is the
+**definition-of-done quorum gate** (dec-spor-definition-of-done-org-policy
+Stage 2): a `policy` schema node, selected for a node by **governs-traversal**
+(`governs.{types,projects}`; nearest scope wins, an org-wide policy still
+applies), runs `gate(current, proposed, view)` AND-ed with the type's
+`transitions()` — any deny stops the write, so a policy can only ADD a
+constraint, never loosen the gate or the native floor beneath it. The
+quorum gate requires a work node's `done` transition to carry a quorum of
+approvals from qualified roles: `view.approvals` is the node's
+`reviewed-by`/`approved-by` edges to `person` nodes joined to each person's
+`roles` register, with the node's own author excluded (the self-approval floor).
+The enabling hook (`view.actor`) shipped with the floor, so this was net-new
+policy-kind work, not core surgery (GRAPH.md "The org-defined policy layer").
+
+Still on the layer's roadmap, beyond the quorum gate: the agent-vs-human
+claim-eligibility promoted-set (task-cc-claim-eligibility-policy), the
+queue-blend override absorbed as a `policy` rather than the separate
+`queue-policy` singleton (task-cc-schema-queue-policy-override), the seed
+`reviewed-by`/`approved-by` edge types + a native review surface
+(review-as-graph-object, Stage 3, which supplies the approval edges the quorum
+gate counts), and a fuller governs-traversal that walks the project/path
+hierarchy via `governs`/`governed-by` edges rather than matching the flat
+`governs.{types,projects}` scope.
 
 ## 3. The capture flow, end to end
 
