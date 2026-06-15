@@ -251,7 +251,8 @@ endpoint is the REST twin of a core call:
 | `GET /v1/queue?project=&limit=` | /spor:next, session-start | the ranked decision queue: `{items, count, muted?, dormant?, questions, findings, policy?, generated_at}` — items retired by a live resolves/answers edge are excluded; items hidden by the viewer's `queue_mute` or parked by a future `wake:` date (QUEUE.md §4) are counted, never silently dropped; `questions`/`findings` are the routed-to-me-plus-unrouted views for the authenticated identity |
 | `POST /v1/questions` `{text, title?, mentions?}` | ask_question's REST twin | file a question node; deterministically routed to the steward of the closest relevance-neighborhood node, unrouted if none → 201 `{status, id, routed_to, via, asker, revision, warnings}` |
 | `POST /v1/gardener` | ops cron / on demand | run a gardener sweep now; findings filed as queue items → `{filed, resolved, ..., generated_at}` |
-| `GET /v1/lens/{id}/render?format=html\|text\|json` | browsers, teammates without a checkout | run a lens OR workspace node and render its view tree (html default, plain text, or the raw tree as json). Read-only — no action forms; writes stay with `/v1/nodes` and the MCP tools. Accepts `?token=<PAT>` on this route only (browser links can't carry an Authorization header; the request log records the pathname, never the query) |
+| `GET /v1/lens/{id}/render?format=html\|text\|json` | browsers, teammates without a checkout | run a lens OR workspace node and render its view tree (html default, plain text, or the raw tree as json). Read-only — no action forms; writes stay with `/v1/nodes` and the MCP tools. Auth is the caller's bearer header OR a signed read-only **render ticket** for shared links (browser links can't carry an Authorization header): `?ticket=<blob>` is accepted once and exchanged via a 302 for an HttpOnly `spor_render_ticket` cookie (kept out of URLs, logs, and view-to-view hrefs). The ticket binds `$viewer` to the recorded sharer and the render shows a "Viewing as &lt;sharer&gt;" banner. The former `?token=<PAT>` sharing path is **removed** — a shared link can never carry a write-capable credential |
+| `POST /v1/lens/{id}/ticket` `{expires?}` | sharing a view | mint a signed, expiring, read-only render ticket for the lens/workspace, recording the authenticated caller as the sharer → `{ticket, url, lens_id, sharer_person_id, exp}`. `expires` is `<N>d` or an ISO date (default `7d`, max `30d`); the caller must be bound to a person node (else `422 no_person`). The ticket carries no write scope and is honored only on the render route |
 | `GET /v1/export` | bootstrap/offline | ustar tarball of `nodes/` for seeding a local read replica (`?gzip=1` compresses); see §5 for the response headers. `curl … \| tar x` reproduces `nodes/` byte-for-byte |
 | `GET /v1/admin/tokens` | offboarding / audit | list PATs → `{tokens: [{hash_prefix, person, name, email, created, expires, expired}], count}` — never plaintext, never full hashes. Admin-only (§4) |
 | `POST /v1/admin/tokens` `{person, expires?}` | onboarding | mint a PAT bound to an existing person node (`expires` is `<N>d` or an ISO date) → 201 `{token, hash_prefix, person, name, email, expires}`; the plaintext `token` is returned **once**. Admin-only |
@@ -310,6 +311,14 @@ anything with a token.
   `{name, email}` attribution record. Access tokens are `spor_oat_…` (30d;
   legacy `sub_oat_…` accepted); refresh tokens are `spor_ort_…` (90d,
   rotating, single-use). Authorization codes are single-use, 10-minute.
+- **Render tickets (shared lens links).** `POST /v1/lens/{id}/ticket` (§3)
+  mints a signed, expiring, **read-only** ticket carrying `{lens_id,
+  sharer_person_id, exp}` — the credential a *shared* view link carries instead
+  of the sharer's PAT. It binds `$viewer` to the recorded sharer (rendered with
+  a "Viewing as" banner), is honored only on `GET /v1/lens/{id}/render`, and can
+  never authorize a write. Stateless (HMAC over a server-held key — no
+  revocation list, expiry is the bound); per-recipient/revocable grants are a
+  later fine-grained-authz refinement.
 
 Unauthenticated MCP calls are hard-rejected — there is no anonymous author.
 
