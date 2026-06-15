@@ -3,5 +3,29 @@
 # kept so existing hooks configs and adapter manifests that exec this path
 # keep working unchanged. Windows hosts invoke spor-hook.js via node
 # (or spor-hook.cmd) instead. Fail-open: no node, no output, exit 0.
-command -v node >/dev/null 2>&1 || exit 0
-exec node "$(dirname "$0")/spor-hook.js" "$@"
+if command -v node >/dev/null 2>&1; then
+  exec node "$(dirname "$0")/spor-hook.js" "$@"
+fi
+# No Node interpreter — the hook can do nothing (the client is zero-dep *Node*).
+# Stay fail-open (exit 0, no output, no latency on the working path above), but
+# drop a ONE-TIME greppable breadcrumb so the silence is diagnosable instead of
+# invisible (issue-spor-onboarding-no-node-silent-fail-open). Best-effort: every
+# step is guarded and we exit 0 regardless, so this can never break fail-open.
+# Resolve the graph home the way lib/shell/home.js does: $SPOR_HOME, then the
+# legacy $SUBSTRATE_HOME, else ~/.spor (or ~/.substrate if that legacy dir
+# exists). The breadcrumb is written at most once (guarded by its own marker).
+_spor_home="${SPOR_HOME:-${SUBSTRATE_HOME:-}}"
+if [ -z "$_spor_home" ]; then
+  if [ -d "$HOME/.spor" ]; then _spor_home="$HOME/.spor"
+  elif [ -d "$HOME/.substrate" ]; then _spor_home="$HOME/.substrate"
+  else _spor_home="$HOME/.spor"
+  fi
+fi
+_spor_warn="$_spor_home/journal/no-node.warn"
+if [ -n "$HOME" ] && [ ! -f "$_spor_warn" ]; then
+  if mkdir -p "$_spor_home/journal" 2>/dev/null; then
+    printf '%s spor-hook: node not found on PATH — every hook is a silent no-op. Spor needs a Node interpreter (see package.json engines; `spor status` reports the floor). Install Node, then restart your session.\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo now)" >"$_spor_warn" 2>/dev/null || true
+  fi
+fi
+exit 0

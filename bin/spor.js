@@ -168,6 +168,10 @@ async function cmdStatus(cfg) {
     if (c == null) out(`graph:    ${nodesDir} (not created — run 'spor init')`);
     else out(`graph:    ${nodesDir} (${c} nodes)`);
   }
+  // The Node prerequisite (issue-spor-onboarding-no-node-silent-fail-open).
+  // Always surfaced so a box where the hooks silently no-op has a greppable
+  // explanation; loud when the running interpreter is below the engines floor.
+  out(nodeRuntimeCheck().line);
   // Claude Code loads its OWN copy of the plugin, so a bumped package can leave a
   // stale plugin running silently (issue-spor-upgrade-no-plugin-refresh). When
   // the loaded version lags this package's, point the user at 'spor upgrade'.
@@ -741,6 +745,46 @@ function claudePluginInfo() {
   return p ? { version: p.version, scope: p.scope, enabled: p.enabled, installPath: p.installPath } : null;
 }
 
+// The package's declared Node floor — the FIRST integer in package.json's
+// engines.node range (">=20" => 20, ">=20.10.0" => 20, "20.x" => 20). The
+// engines field is the contract (dec-spor-client-node20-floor); read it, never
+// hardcode the number. Returns null if the field is absent/unparseable.
+function nodeFloor() {
+  let spec;
+  try {
+    const pkg = require(path.join(ROOT, "package.json"));
+    spec = pkg && pkg.engines && pkg.engines.node;
+  } catch {
+    return null;
+  }
+  if (!spec) return null;
+  const m = String(spec).match(/\d+/);
+  return m ? parseInt(m[0], 10) : null;
+}
+
+// Is the Node interpreter running this CLI new enough for the package floor?
+// Detection lives HERE (install/status time), never in the hook — the prompt
+// path stays fail-open (dec-cc-fail-open-hooks). bin/spor-hook short-circuits
+// `command -v node || exit 0`, so a box with Claude Code but no/old Node sees
+// every hook silently no-op (issue-spor-onboarding-no-node-silent-fail-open);
+// this is the surface that explains it. Returns { running, floor, ok, line }:
+// `ok` is true when the floor is satisfied (or unknown), `line` is a one-line
+// status/prereq string suitable for `spor status` / `spor install`.
+function nodeRuntimeCheck(running) {
+  const ver = String(running == null ? process.versions.node : running);
+  const floor = nodeFloor();
+  const major = parseInt(ver.split(".")[0], 10);
+  // Floor unknown (or our own version unparseable) => don't claim a problem.
+  if (floor == null || !Number.isFinite(major)) {
+    return { running: ver, floor, ok: true, line: `node:     ${ver}` };
+  }
+  const ok = major >= floor;
+  const line = ok
+    ? `node:     ${ver} (>= ${floor} required, OK)`
+    : `node:     ${ver} — TOO OLD. Spor requires Node ${floor}+. Upgrade Node (e.g. via nvm or your package manager); on the old version every hook silently no-ops.`;
+  return { running: ver, floor, ok, line };
+}
+
 // Compare two dot-numeric versions (a trailing -prerelease is ignored). -1/0/1.
 function verCmp(a, b) {
   const parse = (v) => String(v).split("-")[0].split(".").map((n) => parseInt(n, 10) || 0);
@@ -990,6 +1034,16 @@ function installPluginHost(spec, scope, dryRun) {
 
 async function cmdInstall(cfg, args) {
   const dryRun = args.includes("--print") || args.includes("--dry-run");
+  // Node prerequisite (issue-spor-onboarding-no-node-silent-fail-open). The
+  // hooks fail open on a box with no/old Node (every one silently no-ops), so
+  // make the requirement loud HERE, at wire-up time. A too-old interpreter is a
+  // hard stop — installing the hooks on it just buys silent failure later.
+  const nodeChk = nodeRuntimeCheck();
+  if (!nodeChk.ok && !dryRun) {
+    err(`prerequisite: ${nodeChk.line.replace(/^node:\s*/, "")}`);
+    err(`  Spor's hooks fail open, so on this Node they install but every hook silently no-ops — upgrade Node first.`);
+    return 1;
+  }
   let scope = optVal(args, "scope") || "user";
   if (scope === "project") scope = "repo";
   if (scope !== "user" && scope !== "repo") {
@@ -1025,6 +1079,9 @@ async function cmdInstall(cfg, args) {
     out(`Hosts: ${Object.keys(HOSTS).join(", ")}`);
     out(found.length ? `Detected here: ${found.join(", ")}  (try: spor install ${found.join(" ")})` : "No host config dirs detected yet.");
     out("Claude Code: 'spor install claude' wires the plugin via its CLI — no marketplace browsing.");
+    // The plugin runs on Node; its hooks fail open when Node is absent/too old,
+    // so state the requirement up front (issue-spor-onboarding-no-node-silent-fail-open).
+    out(`Requires: Node ${nodeFloor() || 20}+ on PATH — currently ${nodeChk.line.replace(/^node:\s*/, "")}`);
     return 0;
   }
 
@@ -1544,9 +1601,16 @@ async function main() {
   }
 }
 
-main()
-  .then((code) => process.exit(code || 0))
-  .catch((e) => {
-    err(`spor: ${e && e.message ? e.message : String(e)}`);
-    process.exit(1);
-  });
+// Expose the pure helpers for unit tests (the version-check logic has no I/O),
+// and only run the CLI when invoked directly — requiring this file must not
+// kick off main() and call process.exit under the test runner.
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp };
+
+if (require.main === module) {
+  main()
+    .then((code) => process.exit(code || 0))
+    .catch((e) => {
+      err(`spor: ${e && e.message ? e.message : String(e)}`);
+      process.exit(1);
+    });
+}
