@@ -171,6 +171,21 @@ async function cmdStatus(cfg) {
     const c = nodeCount(nodesDir);
     if (c == null) out(`graph:    ${nodesDir} (not created — run 'spor init')`);
     else out(`graph:    ${nodesDir} (${c} nodes)`);
+    // Split-brain detection (issue-spor-local-mode-claude-ai-mcp-split-brain,
+    // dec-spor-local-mode-split-brain-mitigation). In LOCAL mode, a co-active
+    // claude.ai Spor MCP connector gives the session a SECOND write surface (the
+    // remote team graph) with no signal which a capture lands in: ambient hook
+    // captures go local, agent/MCP-tool captures go remote. Warn so the user can
+    // pick one surface. Detection is best-effort/fail-open; only fires here.
+    if (sporConnectorBound()) {
+      out(``);
+      out(`⚠ SPLIT-BRAIN: a claude.ai Spor MCP connector is also bound on this box.`);
+      out(`  In local mode you have TWO live write surfaces — this local file graph`);
+      out(`  and the remote team graph behind the connector — and captures can split`);
+      out(`  across them (ambient hook captures land local; MCP-tool captures land`);
+      out(`  remote). Pick one surface: set SPOR_SERVER/SPOR_TOKEN to go fully remote,`);
+      out(`  or disable the claude.ai Spor connector to stay fully local.`);
+    }
   }
   // The Node prerequisite (issue-spor-onboarding-no-node-silent-fail-open).
   // Always surfaced so a box where the hooks silently no-op has a greppable
@@ -841,6 +856,30 @@ function claudePluginInfo() {
   if (!Array.isArray(arr)) return null;
   const p = arr.find((x) => x && typeof x.id === "string" && x.id.split("@")[0] === "spor");
   return p ? { version: p.version, scope: p.scope, enabled: p.enabled, installPath: p.installPath } : null;
+}
+
+// Best-effort: is a claude.ai Spor MCP connector bound on this box? A connector
+// added in claude.ai surfaces in Claude Code as the mcp__…_Spor__* tools
+// (art-cc-spor-connector-dual-host), i.e. a SECOND live write surface alongside
+// the local file graph. Claude Code records connected claude.ai connectors in
+// ~/.claude.json's `claudeAiMcpEverConnected` array (entries like
+// "claude.ai Spor"); we key the detection on a Spor-named entry there (matching
+// the pre-rename "Substrate" name too — the connector predates the rename and
+// the array keeps historical entries). This is the only discoverable signal a
+// plain Claude Code box exposes: there is no per-session "currently active"
+// manifest. FAIL-OPEN by contract — any missing/unreadable/unparseable file
+// returns false so `spor status` never emits a false split-brain warning or
+// crashes. SPOR_FAKE_CLAUDE_JSON overrides the path for tests.
+function sporConnectorBound() {
+  try {
+    const p = process.env.SPOR_FAKE_CLAUDE_JSON || path.join(homeDir(), ".claude.json");
+    const j = JSON.parse(fs.readFileSync(p, "utf8"));
+    const ever = j && j.claudeAiMcpEverConnected;
+    if (!Array.isArray(ever)) return false;
+    return ever.some((name) => typeof name === "string" && /\bspor\b|\bsubstrate\b/i.test(name));
+  } catch {
+    return false; // no file, unreadable, or malformed => assume no connector
+  }
 }
 
 // The package's declared Node floor — the FIRST integer in package.json's
@@ -1712,7 +1751,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp };
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound };
 
 if (require.main === module) {
   main()

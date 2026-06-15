@@ -192,6 +192,16 @@ server is ever unreachable, the client fails open — it falls back to a local
 cache or to nothing, never blocking your session. The full contract a client
 programs against is in [API.md](API.md).
 
+> **Split-brain warning (local mode + a claude.ai Spor connector).** If your
+> Claude Code is logged into a claude.ai account that has a **Spor MCP
+> connector**, that connector is live in your sessions too — even in local
+> mode — so you have *two* write surfaces at once: the local `$SPOR_HOME` file
+> graph (skills, CLI, and ambient hook captures) and the remote team graph
+> behind the connector (MCP-tool captures). Captures can split across them
+> with no signal which got which. Pick one surface: either set `SPOR_SERVER`/
+> `SPOR_TOKEN` to go fully remote, or disable the claude.ai Spor connector to
+> stay fully local. `spor status` detects this and warns.
+
 A team graph can also carry **lenses** — saved views (a board, a table, a
 lineage tree) defined as nodes and rendered by the server. View them from the
 shell:
