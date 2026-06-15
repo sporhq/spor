@@ -192,6 +192,21 @@ server is ever unreachable, the client fails open — it falls back to a local
 cache or to nothing, never blocking your session. The full contract a client
 programs against is in [API.md](API.md).
 
+A team graph can also carry **lenses** — saved views (a board, a table, a
+lineage tree) defined as nodes and rendered by the server. View them from the
+shell:
+
+```bash
+spor lens                          # list the available lenses
+spor lens lens-roadmap             # render one to the terminal (text)
+spor lens lens-roadmap --format json   # the raw view tree, for piping
+spor lens lens-roadmap --project wf    # pass a lens parameter
+```
+
+Rendering happens server-side (the same engine as the `render_lens` MCP tool),
+so `spor lens` is a team-mode verb — in local mode it tells you to point at a
+team graph rather than failing.
+
 ## Sharing a graph over git — no server
 
 A team can share one graph for free, with no live server, by treating the

@@ -579,3 +579,167 @@ test('upgrade --no-net skips the registry check entirely', { skip: process.platf
   assert.strictEqual(r.status, 0, r.stderr);
   assert.doesNotMatch(r.stdout, /newer @sporhq\/spor/);
 });
+
+// --- lens / render-lens (task-cc-spor-cli-lens-render) ---------------------
+// Lens rendering lives server-side (art-cc-lib-boundary), so this is a remote
+// verb over GET /v1/lenses (catalog) and GET /v1/lens/<id>/render (view). The
+// stub is an in-process http server shaped like the server's two routes; the
+// CLI must hit the right endpoint and render its output, and degrade cleanly
+// with no server. spawnSync would block the event loop and starve the stub, so
+// these use an async spawn (the hookcli.test.js pattern).
+function lensStubServer() {
+  const http = require('node:http');
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      hits.push({ method: req.method, url: req.url, auth: req.headers.authorization });
+      if (req.method === 'GET' && req.url === '/v1/lenses') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          lenses: [
+            { id: 'lens-roadmap', type: 'lens', title: 'Roadmap board', summary: 'Open decisions by status.' },
+            { id: 'ws-overview', type: 'workspace', title: 'Overview', summary: 'A composed workspace.' },
+          ],
+          count: 2,
+        }));
+        return;
+      }
+      const m = req.url.match(/^\/v1\/lens\/([^/?]+)\/render(?:\?(.*))?$/);
+      if (req.method === 'GET' && m) {
+        const id = decodeURIComponent(m[1]);
+        const qs = new URLSearchParams(m[2] || '');
+        if (id !== 'lens-roadmap') {
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { code: 'not_found', message: `no lens or workspace '${id}'` }, available: ['lens-roadmap', 'ws-overview'] }));
+          return;
+        }
+        if (qs.get('format') === 'json') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ as: 'list', title: 'Roadmap board', items: [], project: qs.get('project') || null }));
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end(`Roadmap board\n  (no items)${qs.get('project') ? `\n  project=${qs.get('project')}` : ''}\n`);
+        return;
+      }
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'not_found', message: 'no route' } }));
+    });
+  });
+  return new Promise((resolve) => srv.listen(0, '127.0.0.1', () =>
+    resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
+}
+
+function runAsyncCli(args, env) {
+  const { spawn } = require('node:child_process');
+  return new Promise((resolve) => {
+    const c = spawn(process.execPath, [CLI, ...args], { env: bare(env), stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    c.stdout.on('data', (d) => (stdout += d));
+    c.stderr.on('data', (d) => (stderr += d));
+    c.on('close', (code) => resolve({ status: code, stdout, stderr }));
+  });
+}
+
+test('lens (remote, no id) lists the catalog from GET /v1/lenses', async () => {
+  const { srv, hits, base } = await lensStubServer();
+  try {
+    const r = await runAsyncCli(['lens'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-l' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /lens-roadmap/);
+    assert.match(r.stdout, /Roadmap board/);
+    assert.match(r.stdout, /ws-overview/);
+    assert.match(r.stdout, /\[workspace\]/); // non-lens type flagged
+    const listHit = hits.find((h) => h.url === '/v1/lenses');
+    assert.ok(listHit, 'hit GET /v1/lenses');
+    assert.strictEqual(listHit.auth, 'Bearer tok-l', 'bearer token sent');
+  } finally {
+    srv.close();
+  }
+});
+
+test('lens <id> renders text via GET /v1/lens/<id>/render?format=text', async () => {
+  const { srv, hits, base } = await lensStubServer();
+  try {
+    const r = await runAsyncCli(['lens', 'lens-roadmap'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-l' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /Roadmap board/);
+    const renderHit = hits.find((h) => /\/v1\/lens\/lens-roadmap\/render/.test(h.url));
+    assert.ok(renderHit, 'hit the render route');
+    assert.match(renderHit.url, /format=text/, 'text format by default');
+  } finally {
+    srv.close();
+  }
+});
+
+test('lens <id> --format json emits the raw view tree', async () => {
+  const { srv, hits, base } = await lensStubServer();
+  try {
+    const r = await runAsyncCli(['lens', 'lens-roadmap', '--format', 'json'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-l' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const tree = JSON.parse(r.stdout); // valid JSON on stdout
+    assert.strictEqual(tree.as, 'list');
+    assert.ok(hits.some((h) => /format=json/.test(h.url)), 'json format requested');
+  } finally {
+    srv.close();
+  }
+});
+
+test('lens <id> --PARAM VALUE passes lens params as query string', async () => {
+  const { srv, hits, base } = await lensStubServer();
+  try {
+    const r = await runAsyncCli(['lens', 'lens-roadmap', '--project', 'wf'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-l' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /project=wf/);
+    const renderHit = hits.find((h) => /\/v1\/lens\/lens-roadmap\/render/.test(h.url));
+    assert.match(renderHit.url, /project=wf/, 'param forwarded as query string');
+  } finally {
+    srv.close();
+  }
+});
+
+test('lens <unknown> exits 1 and surfaces the available catalog from the 404', async () => {
+  const { srv, base } = await lensStubServer();
+  try {
+    const r = await runAsyncCli(['lens', 'lens-nope'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-l' });
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /no lens or workspace 'lens-nope'/);
+    assert.match(r.stderr, /available: .*lens-roadmap/);
+  } finally {
+    srv.close();
+  }
+});
+
+test('lens degrades cleanly in local mode (no server, no crash)', () => {
+  const { dir } = fixtureGraph();
+  const r = run(['lens'], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 0); // not an error — just no server to render
+  assert.match(r.stdout, /needs a team graph/);
+  assert.doesNotMatch(r.stderr, /at Object|Error:/);
+});
+
+test('lens fails open against an unreachable server (no stack trace)', () => {
+  const r = run(['lens'], { SPOR_SERVER: 'http://127.0.0.1:1', SPOR_TOKEN: 't' });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /offline/);
+  assert.doesNotMatch(r.stderr, /at Object|Error:/);
+});
+
+test('render-lens is an alias for lens', async () => {
+  const { srv, hits, base } = await lensStubServer();
+  try {
+    const r = await runAsyncCli(['render-lens'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-l' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(hits.some((h) => h.url === '/v1/lenses'), 'alias hit the catalog route');
+  } finally {
+    srv.close();
+  }
+});
+
+test('lens rejects an invalid --format', () => {
+  const r = run(['lens', 'lens-x', '--format', 'pdf'], { SPOR_SERVER: 'http://127.0.0.1:1', SPOR_TOKEN: 't' });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /invalid --format/);
+});
