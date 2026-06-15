@@ -61,6 +61,25 @@ function nodeBody(raw) {
   return u.stripTrailingNewlines(u.byteHead(awkOut, 7000));
 }
 
+// Durable repo-identity node text (issue-spor-onboard-no-repo-identity-node),
+// mirroring the server's learnFingerprints registration so local and remote
+// produce the same shape. Ungrouped by default — no grouped-under edge; the
+// standing grouping suggester proposes the single home project.
+function repoNodeMarkdown(slug, fp, today) {
+  return `---
+id: repo-${slug}
+type: repo
+title: ${slug}
+summary: Git-repo identity for '${slug}', auto-registered from its fingerprints when the repo first appeared in the local graph. Ungrouped — no home project yet; the grouping suggester proposes a grouped-under home.
+slugs: [${slug}]
+fingerprints: [${fp.join(", ")}]
+date: ${today}
+---
+
+Auto-registered repo identity for \`${slug}\` (issue-spor-onboard-no-repo-identity-node). Created on first sight so the repo is a first-class node: the anchor for rename-healing fingerprint matching and for a \`grouped-under\` home. It starts UNGROUPED by default — repo-scoped reads work on the slug, and the standing grouping suggester proposes its single home project for confirmation. Slug aliases and fingerprints accumulate here across renames and re-clones.
+`;
+}
+
 async function sessionStart(input) {
   const graph = u.graphHome();
   const nodes = path.join(graph, "nodes");
@@ -410,6 +429,26 @@ ${pbody}`;
     }
   } catch {
     /* fail open */
+  }
+
+  // Ensure this repo has a durable identity node once it actually has content
+  // in the graph (issue-spor-onboard-no-repo-identity-node). Mirrors the
+  // server's learnFingerprints in remote mode: a backfilled/distilled repo with
+  // no `type: repo` node yet gets one registered from its git fingerprints, so
+  // it is a first-class node — the anchor for a grouped-under home and for
+  // rename-healing. Gated on projCount>0 (real graph content), no owning repo
+  // node yet, and fingerprints present, so a session in some unrelated checkout
+  // never spawns an identity node. Ungrouped by default; the grouping suggester
+  // proposes the home. Pure side effect, written AFTER the briefing is built so
+  // it never alters this run's output; fail-open — never blocks session-start.
+  try {
+    const fp = cwd && fs.existsSync(cwd) ? u.repoFingerprints(cwd) : [];
+    const repoFile = path.join(nodes, `repo-${slug}.md`);
+    if (!owner && projCount > 0 && fp.length && /^[a-z0-9][a-z0-9-]*$/.test(slug) && !fs.existsSync(repoFile)) {
+      fs.writeFileSync(repoFile, repoNodeMarkdown(slug, fp, new Date().toISOString().slice(0, 10)));
+    }
+  } catch {
+    /* best effort — never block session-start */
   }
 
   return envelope(ctx);

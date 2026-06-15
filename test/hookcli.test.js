@@ -66,6 +66,56 @@ test('session-start: local briefing in claude-code envelope', () => {
   assert.match(json.hookSpecificOutput.additionalContext, /projx standing briefing body/);
 });
 
+test('session-start: a git repo with graph content but no repo node gets an ungrouped identity node (issue-spor-onboard-no-repo-identity-node)', () => {
+  const { home, cwd } = scratch();
+  gitCommit(cwd); // make cwd a real git repo so repoFingerprints() is non-empty
+  // graph content stamped under the slug (projx), but no type:repo node yet
+  fs.writeFileSync(path.join(home, 'nodes', 'task-x.md'), `---
+id: task-x
+type: task
+repo: projx
+title: A task in projx
+summary: Standalone summary giving projx graph content before its identity node exists.
+status: open
+date: 2026-06-15
+---
+Some work in projx.
+`);
+  const repoFile = path.join(home, 'nodes', 'repo-projx.md');
+  assert.ok(!fs.existsSync(repoFile), 'precondition: no repo node yet');
+
+  run(['session-start', '--host', 'claude-code'], JSON.stringify({ cwd, hook_event_name: 'SessionStart' }), freshEnv(home));
+
+  assert.ok(fs.existsSync(repoFile), 'repo identity node was not registered');
+  const raw = fs.readFileSync(repoFile, 'utf8');
+  assert.match(raw, /^type: repo$/m);
+  assert.match(raw, /^slugs: \[projx\]$/m);
+  assert.match(raw, /^fingerprints: \[root:[0-9a-f]{40}.*\]$/m);
+  assert.ok(!/^edges:/m.test(raw), 'new repo must start ungrouped (no edges block)');
+
+  // Idempotent: a second run does not clobber or duplicate it.
+  const before = fs.readFileSync(repoFile, 'utf8');
+  run(['session-start', '--host', 'claude-code'], JSON.stringify({ cwd, hook_event_name: 'SessionStart' }), freshEnv(home));
+  assert.strictEqual(fs.readFileSync(repoFile, 'utf8'), before, 'repo node must not be rewritten on re-run');
+});
+
+test('session-start: a non-git cwd does NOT get a repo identity node (no fingerprints)', () => {
+  const { home, cwd } = scratch(); // cwd is not a git repo
+  fs.writeFileSync(path.join(home, 'nodes', 'task-y.md'), `---
+id: task-y
+type: task
+repo: projx
+title: A task
+summary: projx has content but cwd is not a git repo, so there are no fingerprints to register.
+status: open
+date: 2026-06-15
+---
+body
+`);
+  run(['session-start', '--host', 'claude-code'], JSON.stringify({ cwd, hook_event_name: 'SessionStart' }), freshEnv(home));
+  assert.ok(!fs.existsSync(path.join(home, 'nodes', 'repo-projx.md')), 'no fingerprints => no identity node');
+});
+
 test('session-start: no brief-<slug> node falls back to an auto-compiled project digest', () => {
   const { home, cwd } = scratch();
   // project-tagged nodes but NO brief-projx node, and a foreign-project node
