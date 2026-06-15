@@ -1,5 +1,13 @@
 # Host adapters
 
+> **Installing:** `spor install <host>` (e.g. `spor install codex`) automates
+> the per-host recipe below — it resolves the `__SPOR_ROOT__` placeholder to
+> your checkout and merges the manifest into the host's config (idempotently;
+> `--scope user|repo`, `--all`, `--print`). The manual steps in each adapter's
+> README remain valid for hand-installs or when you want to see exactly what
+> lands where. Claude Code installs via its own plugin CLI (`spor install
+> claude`), not a file drop.
+
 The Spor client is a portable core behind per-host adapters
 (dec-cc-portable-core-adapters):
 

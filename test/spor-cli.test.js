@@ -272,3 +272,115 @@ test('remote verb fails open against an unreachable server (no stack trace)', ()
   assert.match(r.stdout, /OFFLINE/);
   assert.doesNotMatch(r.stderr, /at Object|Error:/); // no crash
 });
+
+// --- install / setup (task-cc-spor-cli-install) --------------------------
+// Every install test points HOME at a scratch dir, so the real ~/.codex,
+// ~/.gemini, ~/.config/opencode etc. are never touched.
+function scratchHome() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'spor-install-'));
+}
+
+test('install with no host lists hosts and writes nothing', () => {
+  const home = scratchHome();
+  const r = run(['install'], { HOME: home });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /Hosts:.*codex/);
+  assert.match(r.stdout, /spor install/);
+  assert.ok(!fs.existsSync(path.join(home, '.codex')), 'discovery touches nothing');
+});
+
+test('install codex resolves the placeholder into ~/.codex/hooks.json', () => {
+  const home = scratchHome();
+  const r = run(['install', 'codex', '--scope', 'user'], { HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const txt = fs.readFileSync(path.join(home, '.codex', 'hooks.json'), 'utf8');
+  assert.doesNotMatch(txt, /__SPOR_ROOT__/, 'placeholder resolved');
+  const j = JSON.parse(txt); // valid JSON
+  const cmd = j.hooks.SessionStart[0].hooks[0].command;
+  assert.match(cmd, /bin\/spor-hook session-start --host codex$/);
+  assert.ok(path.isAbsolute(cmd.split(' ')[0]), 'command points at an absolute checkout path');
+});
+
+test('install is idempotent and preserves foreign hooks + top-level keys', () => {
+  const home = scratchHome();
+  const f = path.join(home, '.codex', 'hooks.json');
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, JSON.stringify({
+    version: 9,
+    hooks: { SessionStart: [{ hooks: [{ type: 'command', command: '/usr/bin/my-own-hook' }] }] },
+  }));
+  run(['install', 'codex'], { HOME: home });
+  run(['install', 'codex'], { HOME: home }); // second run must not duplicate
+  const j = JSON.parse(fs.readFileSync(f, 'utf8'));
+  const ss = j.hooks.SessionStart;
+  assert.strictEqual(ss.filter((e) => JSON.stringify(e).includes('spor-hook')).length, 1, 'one spor entry after two installs');
+  assert.ok(ss.some((e) => JSON.stringify(e).includes('my-own-hook')), 'foreign hook preserved');
+  assert.strictEqual(j.version, 9, 'foreign top-level key preserved');
+});
+
+test('install gemini merges into existing settings without clobbering', () => {
+  const home = scratchHome();
+  const f = path.join(home, '.gemini', 'settings.json');
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, JSON.stringify({ theme: 'dark', mcpServers: { x: { httpUrl: 'http://y' } } }));
+  const r = run(['install', 'gemini'], { HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const j = JSON.parse(fs.readFileSync(f, 'utf8'));
+  assert.strictEqual(j.theme, 'dark');
+  assert.ok(j.mcpServers && j.mcpServers.x, 'foreign settings preserved');
+  assert.match(j.hooks.BeforeAgent[0].hooks[0].command, /spor-hook prompt-context --host gemini/);
+});
+
+test('install opencode places the plugin file (symlink or copy)', () => {
+  const home = scratchHome();
+  const r = run(['install', 'opencode'], { HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const f = path.join(home, '.config', 'opencode', 'plugins', 'spor.js');
+  assert.ok(fs.existsSync(f), 'plugin file present');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'adapters', 'opencode', 'spor.js'), 'utf8');
+  assert.strictEqual(fs.readFileSync(f, 'utf8'), src, 'matches the adapter source (linked or copied)');
+});
+
+test('install --scope repo writes under the cwd, not home', () => {
+  const home = scratchHome();
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-repo-'));
+  const r = spawnSync(process.execPath, [CLI, 'install', 'cursor', '--scope', 'repo'], { cwd: repo, encoding: 'utf8', env: bare({ HOME: home }) });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(path.join(repo, '.cursor', 'hooks.json')), 'repo-scope file under cwd');
+  assert.ok(!fs.existsSync(path.join(home, '.cursor')), 'nothing written to home');
+});
+
+test('install claude --print shows the plugin CLI commands and runs nothing', () => {
+  const r = run(['install', 'claude', '--print'], { HOME: scratchHome() });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /would run: claude plugin marketplace add /);
+  assert.match(r.stdout, /would run: claude plugin install spor@spor --scope user/);
+});
+
+test('install --print is a dry run (writes nothing)', () => {
+  const home = scratchHome();
+  const r = run(['install', 'codex', '--print'], { HOME: home });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /would write .*\.codex.*hooks\.json/);
+  assert.ok(!fs.existsSync(path.join(home, '.codex')), 'dry run wrote nothing');
+});
+
+test('install rejects an unknown host and a bad scope', () => {
+  const home = scratchHome();
+  const h = run(['install', 'bogus'], { HOME: home });
+  assert.strictEqual(h.status, 1);
+  assert.match(h.stderr, /unknown host/);
+  const s = run(['install', 'codex', '--scope', 'nope'], { HOME: home });
+  assert.strictEqual(s.status, 1);
+  assert.match(s.stderr, /invalid --scope/);
+});
+
+test('install --server/--token persists creds to user config', () => {
+  const home = scratchHome();
+  const r = run(['install', 'codex', '--server', 'http://127.0.0.1:9/', '--token', 'tok9'], { HOME: home, SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const cfg = JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8'));
+  assert.strictEqual(cfg.server, 'http://127.0.0.1:9'); // trailing slash trimmed
+  assert.strictEqual(cfg.token, 'tok9');
+  assert.ok(fs.existsSync(path.join(home, '.codex', 'hooks.json')), 'host still installed');
+});

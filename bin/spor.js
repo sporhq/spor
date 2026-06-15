@@ -18,6 +18,7 @@
 // never dumps a stack trace at the user.
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
 
@@ -32,6 +33,9 @@ Usage: spor <verb> [args]
 
 Getting started
   init                 create the local graph home (nodes/, git, .gitignore)
+  install [host...]    wire spor into an agent: claude codex gemini opencode
+                       copilot cursor (no host => list detected). --scope
+                       user|repo, --all, --print, --server/--token to configure
   status               resolved mode, graph, project, identity, health
   join <url> <token>   point the client at a graph (writes user config)
   migrate <url>        push the local graph to a remote you own (solo-remote)
@@ -345,6 +349,24 @@ async function cmdAdd(cfg, args) {
   return 0;
 }
 
+// Persist server/token into the USER config (never a committable repo config).
+// Shared by 'join' and the 'install --server/--token' configure step. Only the
+// keys given are touched, so a token-only update keeps the existing server.
+function writeServerToken(home, server, token) {
+  const cfgFile = path.join(home, "config.json");
+  let data = {};
+  try {
+    data = JSON.parse(fs.readFileSync(cfgFile, "utf8")) || {};
+  } catch {
+    /* absent or malformed — start fresh */
+  }
+  if (server) data.server = server.replace(/\/+$/, "");
+  if (token) data.token = token;
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(cfgFile, JSON.stringify(data, null, 2) + "\n");
+  return cfgFile;
+}
+
 // --- spor join / login --------------------------------------------------
 // Write server+token to USER config (never a committable repo config), then
 // confirm immediately — the upgrade research found no one-step way to point a
@@ -357,21 +379,11 @@ async function cmdJoin(cfg, args) {
     err("usage: spor join <server-url> <token>");
     return 1;
   }
-  const home = cfg.graphHome();
-  const cfgFile = path.join(home, "config.json");
-  let data = {};
+  let cfgFile;
   try {
-    data = JSON.parse(fs.readFileSync(cfgFile, "utf8")) || {};
-  } catch {
-    /* absent or malformed — start fresh */
-  }
-  data.server = server.replace(/\/+$/, "");
-  if (token) data.token = token;
-  try {
-    fs.mkdirSync(home, { recursive: true });
-    fs.writeFileSync(cfgFile, JSON.stringify(data, null, 2) + "\n");
+    cfgFile = writeServerToken(cfg.graphHome(), server, token);
   } catch (e) {
-    err(`could not write ${cfgFile}: ${e.message}`);
+    err(`could not write config: ${e.message}`);
     return 1;
   }
   out(`wrote server${token ? " + token" : ""} to ${cfgFile}`);
@@ -640,6 +652,259 @@ function cmdLink(args) {
   return 0;
 }
 
+// --- spor install / setup: wire spor into a host agent ---------------------
+// dec-cc-portable-core-adapters ships a manifest per host under adapters/<host>/
+// with a __SPOR_ROOT__ placeholder; installing one resolves the placeholder to
+// THIS checkout and drops/merges the manifest into the host's config location.
+// Until now this was a manual sed/ln recipe in each adapter README — this verb
+// is its automation. Claude Code is special: it has no flat hook file, so we
+// shell out to its plugin CLI (this repo IS the marketplace) rather than
+// hand-edit ~/.claude/settings.json, which the CLI owns.
+const HOSTS = {
+  claude: { kind: "claude", label: "Claude Code" },
+  codex: { kind: "hooks", label: "Codex CLI", src: ["adapters", "codex", "hooks.json"], user: [".codex", "hooks.json"], repo: [".codex", "hooks.json"] },
+  cursor: { kind: "hooks", label: "Cursor", src: ["adapters", "cursor", "hooks.json"], user: [".cursor", "hooks.json"], repo: [".cursor", "hooks.json"] },
+  copilot: { kind: "hooks", label: "GitHub Copilot CLI", src: ["adapters", "copilot", "spor.json"], user: [".copilot", "hooks", "spor.json"], repo: [".github", "hooks", "spor.json"] },
+  gemini: { kind: "hooks", label: "Gemini CLI", src: ["adapters", "gemini", "hooks", "hooks.json"], user: [".gemini", "settings.json"], repo: [".gemini", "settings.json"] },
+  opencode: { kind: "plugin", label: "OpenCode", src: ["adapters", "opencode", "spor.js"], user: [".config", "opencode", "plugins", "spor.js"], repo: [".opencode", "plugins", "spor.js"] },
+};
+
+// The config dir whose presence means a host is set up on this machine.
+const HOST_PROBE = {
+  codex: [".codex"],
+  cursor: [".cursor"],
+  copilot: [".copilot"],
+  gemini: [".gemini"],
+  opencode: [".config", "opencode"],
+  claude: [".claude"],
+};
+
+// $HOME first so tests (and conventional overrides) win; os.homedir() is the
+// cross-platform fallback (USERPROFILE on Windows).
+function homeDir() {
+  return process.env.HOME || process.env.USERPROFILE || os.homedir();
+}
+
+// Options that consume the following token, so positional parsing can skip it.
+const INSTALL_VALUE_OPTS = new Set(["scope", "server", "token"]);
+function positionals(args) {
+  const pos = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith("--")) {
+      if (INSTALL_VALUE_OPTS.has(a.slice(2))) i++; // skip its value
+      continue;
+    }
+    pos.push(a);
+  }
+  return pos;
+}
+
+function deepReplace(v, from, to) {
+  if (typeof v === "string") return v.split(from).join(to);
+  if (Array.isArray(v)) return v.map((x) => deepReplace(x, from, to));
+  if (v && typeof v === "object") {
+    const o = {};
+    for (const k of Object.keys(v)) o[k] = deepReplace(v[k], from, to);
+    return o;
+  }
+  return v;
+}
+
+// Parse the manifest template as JSON, THEN substitute the root into string
+// values — so a Windows root with backslashes never has to survive JSON escaping.
+function renderManifest(srcSegs) {
+  const raw = fs.readFileSync(path.join(ROOT, ...srcSegs), "utf8");
+  return deepReplace(JSON.parse(raw), "__SPOR_ROOT__", ROOT);
+}
+
+function readJsonOr(file, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8")) || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+// Merge our hooks.{event:[...]} into an existing host config without clobbering
+// the user's own hooks or top-level keys. Idempotent: prior spor entries (any
+// whose command mentions spor-hook) are dropped first, so re-install refreshes a
+// stale __SPOR_ROOT__ path instead of duplicating.
+function mergeHooks(existing, incoming) {
+  const merged = existing && typeof existing === "object" && !Array.isArray(existing) ? existing : {};
+  for (const k of Object.keys(incoming)) {
+    if (k === "hooks") continue;
+    if (merged[k] === undefined) merged[k] = incoming[k];
+  }
+  merged.hooks = merged.hooks && typeof merged.hooks === "object" ? merged.hooks : {};
+  const inHooks = incoming.hooks || {};
+  for (const event of Object.keys(inHooks)) {
+    const prior = Array.isArray(merged.hooks[event]) ? merged.hooks[event] : [];
+    const kept = prior.filter((e) => !JSON.stringify(e).includes("spor-hook"));
+    merged.hooks[event] = kept.concat(inHooks[event]);
+  }
+  return merged;
+}
+
+function targetPath(spec, scope) {
+  return scope === "repo" ? path.join(repoRoot(), ...spec.repo) : path.join(homeDir(), ...spec.user);
+}
+
+function hasCmd(cmd) {
+  try {
+    return !spawnSync(cmd, ["--version"], { stdio: "ignore" }).error;
+  } catch {
+    return false;
+  }
+}
+
+function detectHosts() {
+  const home = homeDir();
+  const found = [];
+  for (const h of Object.keys(HOST_PROBE)) {
+    if (h === "claude") {
+      if (hasCmd("claude") || fs.existsSync(path.join(home, ".claude"))) found.push(h);
+      continue;
+    }
+    if (fs.existsSync(path.join(home, ...HOST_PROBE[h]))) found.push(h);
+  }
+  return found;
+}
+
+// Claude Code: shell out to its plugin CLI (the stable contract; settings.json
+// is CLI-owned). The marketplace IS this repo (.claude-plugin/marketplace.json,
+// name "spor"), so 'marketplace add <ROOT>' then 'install spor@spor'.
+function installClaude(scope, dryRun) {
+  const cliScope = scope === "repo" ? "project" : "user";
+  const addArgs = ["plugin", "marketplace", "add", ROOT];
+  const instArgs = ["plugin", "install", "spor@spor", "--scope", cliScope];
+  if (dryRun) {
+    out(`would run: claude ${addArgs.join(" ")}`);
+    out(`would run: claude ${instArgs.join(" ")}`);
+    return 0;
+  }
+  if (!hasCmd("claude")) {
+    err("claude CLI not on PATH — install Claude Code, then re-run 'spor install claude'.");
+    err(`meanwhile, load spor without a marketplace per session:  claude --plugin-dir ${ROOT}`);
+    return 1;
+  }
+  const add = spawnSync("claude", addArgs, { encoding: "utf8" });
+  if (add.status !== 0 && !/already|exists|known/i.test((add.stderr || "") + (add.stdout || ""))) {
+    err(`claude plugin marketplace add failed: ${(add.stderr || add.stdout || "").trim() || "unknown error"}`);
+    return 1;
+  }
+  const inst = spawnSync("claude", instArgs, { stdio: "inherit" });
+  if (inst.status !== 0) {
+    err(`claude plugin install failed (exit ${inst.status == null ? "?" : inst.status})`);
+    return 1;
+  }
+  out(`installed spor@spor into Claude Code (scope: ${cliScope}) — no marketplace browsing needed.`);
+  return 0;
+}
+
+// JSON-hook hosts (codex/cursor/copilot/gemini): render + merge into the target.
+function installHookHost(spec, scope, dryRun) {
+  const target = targetPath(spec, scope);
+  const merged = mergeHooks(readJsonOr(target, {}), renderManifest(spec.src));
+  if (dryRun) {
+    out(`would write ${target}:`);
+    out(JSON.stringify(merged, null, 2));
+    return 0;
+  }
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, JSON.stringify(merged, null, 2) + "\n");
+  out(`installed spor for ${spec.label} → ${target}  (scope: ${scope})`);
+  return 0;
+}
+
+// OpenCode has no command hooks — a JS plugin file is symlinked into place so it
+// resolves the core via the link; copy is the Windows/EPERM fallback.
+function installPluginHost(spec, scope, dryRun) {
+  const src = path.join(ROOT, ...spec.src);
+  const target = targetPath(spec, scope);
+  if (dryRun) {
+    out(`would link ${target} -> ${src}`);
+    return 0;
+  }
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  try {
+    fs.rmSync(target, { force: true });
+  } catch {
+    /* nothing there */
+  }
+  let how = "linked";
+  try {
+    fs.symlinkSync(src, target);
+  } catch {
+    fs.copyFileSync(src, target);
+    how = "copied";
+  }
+  out(`installed spor for ${spec.label} → ${target}  (${how}, scope: ${scope})`);
+  if (how === "copied") out(`  note: copied (no symlink here) — export SPOR_ROOT=${ROOT} so the plugin finds its core.`);
+  return 0;
+}
+
+async function cmdInstall(cfg, args) {
+  const dryRun = args.includes("--print") || args.includes("--dry-run");
+  let scope = optVal(args, "scope") || "user";
+  if (scope === "project") scope = "repo";
+  if (scope !== "user" && scope !== "repo") {
+    err(`invalid --scope '${scope}' — use 'user' or 'repo'`);
+    return 1;
+  }
+
+  const pos = positionals(args);
+  const bad = pos.find((a) => !HOSTS[a]);
+  if (bad) {
+    err(`unknown host '${bad}' — known: ${Object.keys(HOSTS).join(", ")}`);
+    return 1;
+  }
+  let hosts = pos.slice();
+  if (args.includes("--all")) hosts = detectHosts();
+
+  // The "configure" half: persist server/token to user config when given.
+  const server = optVal(args, "server");
+  const token = optVal(args, "token");
+  if ((server || token) && !dryRun) {
+    try {
+      const f = writeServerToken(cfg.graphHome(), server, token);
+      out(`wrote ${[server && "server", token && "token"].filter(Boolean).join(" + ")} to ${f}`);
+    } catch (e) {
+      err(`could not write config: ${e.message}`);
+    }
+  }
+
+  if (!hosts.length) {
+    // Discovery mode — show what is installable; touch nothing.
+    const found = detectHosts();
+    out("Usage: spor install <host>... [--scope user|repo] [--all] [--print]");
+    out(`Hosts: ${Object.keys(HOSTS).join(", ")}`);
+    out(found.length ? `Detected here: ${found.join(", ")}  (try: spor install ${found.join(" ")})` : "No host config dirs detected yet.");
+    out("Claude Code: 'spor install claude' wires the plugin via its CLI — no marketplace browsing.");
+    return 0;
+  }
+
+  let rc = 0;
+  for (const host of hosts) {
+    const spec = HOSTS[host];
+    let r;
+    if (spec.kind === "claude") r = installClaude(scope, dryRun);
+    else if (spec.kind === "plugin") r = installPluginHost(spec, scope, dryRun);
+    else r = installHookHost(spec, scope, dryRun);
+    if (r !== 0) rc = r;
+  }
+
+  if (!dryRun && hosts.some((h) => HOSTS[h].kind !== "claude")) {
+    out("");
+    out("next:");
+    if (cfg.mode() === "remote") out(`  remote mode is configured (${remote.base(cfg)}).`);
+    else out("  point at a graph:  spor join <server-url> <token>   (or export SPOR_SERVER/SPOR_TOKEN)");
+    out("  distiller backend (hosts without the claude CLI) + on-demand MCP access: see adapters/<host>/README.md");
+    out("  approve the hooks on first run if the host prompts.");
+  }
+  return rc;
+}
+
 function version() {
   try {
     return require(path.join(ROOT, "package.json")).version || "0.0.0";
@@ -668,6 +933,9 @@ async function main() {
       return 0;
     case "init":
       return cmdInit(cfg);
+    case "install":
+    case "setup":
+      return await cmdInstall(cfg, args);
     case "status":
       return await cmdStatus(cfg);
     case "whoami":

@@ -36,15 +36,32 @@ time you're unsure whether Spor is active or which graph you're on. (Without
 the `spor` CLI on your PATH the equivalent is
 `mkdir -p ~/.spor/nodes && git -C ~/.spor init && printf 'journal/\n' > ~/.spor/.gitignore`.)
 
-Then install for your agent. In Claude Code:
+Then install for your agent. One verb wires up any supported host — it
+resolves the adapter manifest to this checkout and drops it into the host's
+config:
+
+```bash
+spor install claude     # Claude Code (via its plugin CLI — no marketplace browsing)
+spor install codex      # also: gemini, cursor, copilot, opencode
+spor install            # no host => list the hosts detected on this machine
+```
+
+`--scope user` (default) installs for you; `--scope repo` writes a committable
+per-repo config. `--all` installs every detected host, `--print` is a dry run,
+and `--server <url> --token <tok>` also points the client at a team graph in
+the same step. Re-running is idempotent — it refreshes the path and never
+duplicates your other hooks.
+
+In Claude Code you can still install from the marketplace by hand if you
+prefer:
 
 ```
 /plugin marketplace add sporhq/spor
 /plugin install spor@spor
 ```
 
-For every other host — Codex CLI, Gemini CLI, Cursor, Copilot CLI, OpenCode,
-and an `AGENTS.md` fallback for hosts with no hook support — see
+For the per-host event mapping, fidelity notes, distiller backend, and the
+`AGENTS.md` fallback for hosts with no hook support, see
 [adapters/](adapters/).
 
 To start with a populated graph, point the bundled `spor-backfill` agent at
