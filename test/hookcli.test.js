@@ -116,6 +116,33 @@ body
   assert.ok(!fs.existsSync(path.join(home, 'nodes', 'repo-projx.md')), 'no fingerprints => no identity node');
 });
 
+test('session-start: an empty local graph emits the onboarding line, not "0 nodes" (issue-cc-local-mode-session-start-empty-graph-fallback)', () => {
+  const { home, cwd } = scratch(); // nodes/ dir exists but is empty
+  const out = run(
+    ['session-start', '--host', 'claude-code'],
+    JSON.stringify({ cwd, hook_event_name: 'SessionStart' }),
+    freshEnv(home)
+  );
+  const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /No Spor briefing for projx yet/);
+  assert.match(ctx, /\/spor:backfill/);
+  assert.ok(!/0 nodes/.test(ctx), 'must not claim "0 nodes active" during onboarding');
+});
+
+test('session-start: a graph home with no nodes/ dir emits the onboarding line, not silence (the claude --bg backfill repro)', () => {
+  const { cwd } = scratch();
+  const home = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'substrate-nodir-')), 'graph'); // never created → no nodes/ dir
+  const out = run(
+    ['session-start', '--host', 'claude-code'],
+    JSON.stringify({ cwd, hook_event_name: 'SessionStart' }),
+    freshEnv(home)
+  );
+  assert.notStrictEqual(out.trim(), '', 'onboarding home must not be silent');
+  const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /No Spor briefing for projx yet/);
+  assert.match(ctx, /\/spor:backfill/);
+});
+
 test('session-start: no brief-<slug> node falls back to an auto-compiled project digest', () => {
   const { home, cwd } = scratch();
   // project-tagged nodes but NO brief-projx node, and a foreign-project node

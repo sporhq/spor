@@ -272,17 +272,35 @@ ${body}`;
   }
 
   // -------------------------------------------------------------------------
-  // LOCAL MODE (original behavior — byte-identical to session-start.sh)
+  // LOCAL MODE (original behavior — byte-identical to session-start.sh, except
+  // the empty/absent-graph onboarding line below)
   // -------------------------------------------------------------------------
-  if (!fs.existsSync(nodes)) return null;
-
   let files = [];
   try {
     files = fs.readdirSync(nodes).filter((f) => f.endsWith(".md"));
   } catch {
-    return null;
+    /* no nodes/ dir yet (fresh/onboarding home) or unreadable — count stays 0 */
   }
   const count = files.length;
+
+  // Empty or absent local graph — the onboarding moment, e.g. right after
+  // `spor dispatch --backfill` inits the home (it creates an empty nodes/ dir)
+  // or a fresh `spor init`. Remote mode always emits a status line here ("no
+  // standing briefing for <slug> yet"); local mode used to return null (no dir)
+  // or claim "0 nodes active" (empty dir), so the SessionStart hook looked like
+  // it never ran during onboarding — the parity gap reported when SessionStart
+  // appeared dead for `claude --bg` (it fires; source=startup). Emit the parity
+  // line so onboarding is visibly underway and points at the bootstrap path
+  // (issue-cc-local-mode-session-start-empty-graph-fallback). Side effects above
+  // (registerRepo, plugin-root) already ran; the repo-identity write below is
+  // gated on projCount>0, so nothing else is skipped by returning early here.
+  if (count === 0) {
+    return envelope(
+      `No Spor briefing for ${slug} yet — the local graph at ${nodes} is empty. ` +
+        `Bootstrap this repo with /spor:backfill (or 'spor dispatch --backfill'); ` +
+        `knowledge you capture lands here as you work. ${USAGE_LOCAL}`
+    );
+  }
   // Repo identity (task-cc-project-identity-nodes): a resident `type: repo`
   // node (renamed from the former `type: project`,
   // dec-cc-repo-project-two-layer-identity) whose `slugs:` register (or id)
