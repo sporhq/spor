@@ -46,6 +46,27 @@ Gather every `type: repo` and `type: project` node, plus each repo's `slugs`,
 
 The repos with no `grouped-under` edge are the ones to home.
 
+**Bridge older backfills.** A repo backfilled before identity-node
+auto-registration (client ≤ 0.2.2) has `repo:`/`project:` stamps on its work
+nodes but no `type: repo` node — and a home edge has nothing to attach to
+without one. So before grouping, find the distinct stamp slugs that have no
+matching `type: repo` node (no `repo-<slug>` id and not in any `slugs:`
+register) and register an ungrouped identity node for each:
+
+- **Local:** write `$SPOR_HOME/nodes/repo-<slug>.md` — `type: repo`,
+  `title: <slug>`, `slugs: [<slug>]`, today's `date`, no edges — then validate
+  (plugin root resolved as in step d).
+- **Spor MCP tools:** `put_node` the same `type: repo` node.
+
+Register them with **slugs only** — fingerprints accrue automatically when a
+session next runs in each repo (session-start records them). The repo you are
+currently in usually already has its node, since session-start registers it on
+first sight; this step exists so a single `/spor:backfill` run can surface and
+home *all* of a user's already-backfilled repos, not just the current one.
+Announce which identity nodes you registered. (This is mechanical — the slugs
+demonstrably exist in the graph — so it does not need the per-grouping
+confirmation that step c does.)
+
 ### b. Group the ungrouped repos by signal
 
 For each ungrouped repo, find its best home. Signals, strongest first:
