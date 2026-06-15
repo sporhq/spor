@@ -66,6 +66,39 @@ test("repos: empty, add, list, rm round-trip; stored in user config.json under d
   assert.match(run(["repos"], env).stdout, /no repos mapped yet/);
 });
 
+test("repos: with a marker graph: home active, the map writes to the PERSONAL home and reads back (no desync)", () => {
+  // issue-spor-config-desync-shared-graph-home: a `.spor` marker `graph:` key
+  // redirects the GRAPH to a shared home, but the machine-local dispatch.repos
+  // map must stay in the personal $SPOR_HOME/config.json. Before the fix it was
+  // written to the shared home (cfg.graphHome()) but read from the personal one,
+  // so it vanished from the next `spor repos list`.
+  const { repo } = fixture();
+  const personal = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-personal-"));
+  const shared = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-shared-"));
+  // A code repo whose .spor marker binds the shared graph home (absolute path).
+  const code = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-code-"));
+  fs.writeFileSync(path.join(code, ".spor"), `repo: demo\ngraph: ${shared}\n`);
+
+  // Run from inside the marker-bound repo so the cascade resolves the shared
+  // graph home, with SPOR_HOME = the personal home.
+  const env = { SPOR_HOME: personal };
+  assert.strictEqual(run(["repos", "add", "demo", repo], env, code).status, 0);
+
+  // The map landed in the PERSONAL home, NOT the shared graph home.
+  const personalCfg = path.join(personal, "config.json");
+  assert.ok(fs.existsSync(personalCfg), "config.json written to the personal home");
+  assert.strictEqual(JSON.parse(fs.readFileSync(personalCfg, "utf8")).dispatch.repos.demo, repo);
+  assert.ok(!fs.existsSync(path.join(shared, "config.json")), "nothing written to the shared graph home");
+
+  // And it reads back across a reload (the desync the issue describes is gone).
+  const list = run(["repos", "list"], env, code);
+  assert.match(list.stdout, new RegExp(`^demo\\t${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m"));
+
+  // rm round-trips against the same personal home too.
+  assert.strictEqual(run(["repos", "rm", "demo"], env, code).status, 0);
+  assert.match(run(["repos"], env, code).stdout, /no repos mapped yet/);
+});
+
 test("repos add preserves other config.json keys (server/token)", () => {
   const { home, repo } = fixture();
   const cfgFile = path.join(home, "config.json");

@@ -235,3 +235,44 @@ test('.spor.json home stays BELOW env; only the .spor marker graph beats env', (
   assert.strictEqual(c.graphHome(), envHome); // env wins over .spor.json home (cascade)
   assert.strictEqual(c.sharedGraphHome(), null);
 });
+
+// --- machine-local user-config home vs the (marker-shared) graph home
+// (issue-spor-config-desync-shared-graph-home): the user config.json — server,
+// token, and the dispatch.repos slug->path map — is machine-local and must be
+// READ and WRITTEN at the personal env/default home, NEVER the marker-shared
+// graph home. userConfigHome() is the single anchor the WRITE paths use; the
+// cascade reads the user layer from the same place, so they round-trip.
+
+test('userConfigHome stays at the PERSONAL home when a marker graph: redirects the graph', () => {
+  const root = tmp();
+  const repo = path.join(root, 'code');
+  writeMarker(repo, 'repo: code\ngraph: ../team-graph\n');
+  const personal = path.join(root, 'personal');
+  const c = loadConfig({ cwd: repo, env: bareEnv({ SPOR_HOME: personal }) });
+  const shared = path.resolve(repo, '../team-graph');
+  assert.strictEqual(c.graphHome(), shared); // the GRAPH follows the marker
+  assert.strictEqual(c.sharedGraphHome(), shared);
+  assert.strictEqual(c.userConfigHome(), personal); // but machine-local config does NOT
+  assert.notStrictEqual(c.userConfigHome(), c.graphHome());
+});
+
+test('userConfigHome equals graphHome when no marker / override moves the graph (byte-identical)', () => {
+  const root = tmp();
+  const repo = path.join(root, 'code');
+  writeMarker(repo, 'repo: code\n'); // identity only — no graph: key
+  const personal = path.join(root, 'personal');
+  const c = loadConfig({ cwd: repo, env: bareEnv({ SPOR_HOME: personal }) });
+  assert.strictEqual(c.userConfigHome(), personal);
+  assert.strictEqual(c.graphHome(), personal); // they coincide with no marker
+});
+
+test('userConfigHome ignores even an explicit --home / .spor.json home (config is machine-local, env-anchored)', () => {
+  const root = tmp();
+  const repo = path.join(root, 'code');
+  write(path.join(repo, '.spor.json'), { home: path.join(root, 'json-home') });
+  const personal = path.join(root, 'personal');
+  const cliHome = path.join(root, 'cli');
+  const c = loadConfig({ cwd: repo, env: bareEnv({ SPOR_HOME: personal }), cli: { home: cliHome } });
+  assert.strictEqual(c.graphHome(), cliHome); // --home wins for the GRAPH
+  assert.strictEqual(c.userConfigHome(), personal); // but the user config layer is read from here, so writes must land here too
+});
