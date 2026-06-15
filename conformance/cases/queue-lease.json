@@ -1,0 +1,8 @@
+{ "id": "queue-lease", "kind": "queue", "corpus": "queue-lease",
+  "input": { "now": "2026-06-12T00:00:00Z", "viewer": "person-viewer",
+             "leases": {
+               "task-claimed":  { "by": "person-holder", "expires_iso": "2026-06-12T00:45:00Z" },
+               "task-reserved": { "by": "person-holder", "expires_iso": "2026-06-14T00:00:00Z", "reserved": true },
+               "task-lapsed":   { "by": "person-holder", "expires_iso": "2026-06-11T00:00:00Z", "reserved": true } } },
+  "expected": "queue-lease.json",
+  "covers": "claim-lease intersection (task-cc-claim-lease-rankqueue) viewer-relative: a live lease (Tier-1) held by another is owner-exclusive (hidden, counted leased); a lapsed-in-grace reservation (Tier-2) held by another is owner-exclusive (hidden, counted reserved); a grace-exceeded lease (expired past now) escalates to the full pool; an unclaimed task stays actionable" }

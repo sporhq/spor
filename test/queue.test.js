@@ -540,6 +540,208 @@ test("rankQueue: no viewer (or no register) mutes nothing — others see everyth
   assert.equal(r.muted, undefined, "no muted field when nothing hidden");
 });
 
+// ---------------- task claim-lease intersection ----------------
+// dec-cc-task-claim-lease + dec-cc-task-resumption-reservation: rankQueue
+// intersects durable `assigned` edges with an INJECTED, ephemeral lease table
+// (`leases: { nodeId -> { by, expires, reserved? } }`, exactly server/leases.js
+// snapshot()'s shape) at read time. An in-force lease held by ANOTHER viewer is
+// owner-exclusive: hidden from their actionable list and counted (leased /
+// reserved), surfaced in the holder's own queue and in the steward/capacity
+// view (assignee set). Lapsed past `now` -> full pool for everyone. Absent/empty
+// leases -> byte-identical to before (the local-mode-without-server case).
+
+// viewer person nodes for the lease comparand (lease `by` == viewer.id).
+const LEASE_PERSON = (id) => [
+  `${id}.md`,
+  `---
+id: ${id}
+type: person
+project: my-project
+title: Person ${id}
+summary: Person node for claim-lease tests.
+email: ${id}@example.com
+date: 2026-06-01
+---
+Body.
+`,
+];
+
+const LIVE = NOW + 30 * 60 * 1000;   // 30m ahead -> in force at NOW
+const LAPSED = NOW - 60 * 1000;      // 1m past -> not in force at NOW
+
+test("lease: absent or empty leases is byte-identical to no lease table", () => {
+  const files = Object.fromEntries([
+    node("task-a", "task", { status: "open" }),
+    node("task-b", "task", { status: "open", edges: [["assigned", "person-x"]] }),
+    LEASE_PERSON("person-x"),
+  ]);
+  const base = rankQueue(tmpGraph(files).load(), { now: NOW });
+  const withNull = rankQueue(tmpGraph(files).load(), { now: NOW, leases: null });
+  const withEmpty = rankQueue(tmpGraph(files).load(), { now: NOW, leases: {} });
+  assert.deepEqual(withNull, base, "leases:null changes nothing");
+  assert.deepEqual(withEmpty, base, "leases:{} changes nothing");
+  assert.equal(base.leased, undefined);
+  assert.equal(base.reserved, undefined);
+  // no lease_state rides along on any item
+  for (const it of base.items) assert.equal(it.lease_state, undefined);
+});
+
+test("lease: a live lease held by ANOTHER is owner-exclusive — hidden + counted as leased", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-held", "task", { status: "open", edges: [["assigned", "person-x"]] }),
+    node("task-free", "task", { status: "open" }),
+    LEASE_PERSON("person-x"),
+    LEASE_PERSON("person-v"),
+  ])).load();
+  const r = rankQueue(g, {
+    now: NOW,
+    viewer: g.nodes["person-v"],
+    leases: { "task-held": { by: "person-x", expires: LIVE } },
+  });
+  assert.deepEqual(r.items.map((i) => i.id), ["task-free"], "the live-claimed task is hidden from teammate V");
+  assert.equal(r.count, 1, "the hidden item leaves the count");
+  assert.equal(r.leased, 1, "counted, not silent");
+  assert.equal(r.reserved, undefined);
+});
+
+test("lease: a live lease held by the VIEWER stays in their own queue, tagged in_progress", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-mine", "task", { status: "open", edges: [["assigned", "person-v"]] }),
+    LEASE_PERSON("person-v"),
+  ])).load();
+  const r = rankQueue(g, {
+    now: NOW,
+    viewer: g.nodes["person-v"],
+    leases: { "task-mine": { by: "person-v", expires: LIVE } },
+  });
+  assert.deepEqual(r.items.map((i) => i.id), ["task-mine"], "owner keeps their own claimed work");
+  assert.equal(r.leased, undefined, "the owner's own lease is not a demotion");
+  const it = r.items[0];
+  assert.equal(it.lease_state, "in_progress");
+  assert.equal(it.lease_by, "person-v");
+  assert.match(it.why, /in progress \(your claim\)/);
+});
+
+test("lease: a lapsed-in-grace reservation held by ANOTHER is owner-exclusive — counted as reserved", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-resv", "task", { status: "open", edges: [["assigned", "person-x"]] }),
+    LEASE_PERSON("person-x"),
+    LEASE_PERSON("person-v"),
+  ])).load();
+  // Tier-2: a clean SessionEnd converted the active lease into a reservation
+  // whose `expires` is the grace-window edge (still in force at NOW), reserved:true.
+  const r = rankQueue(g, {
+    now: NOW,
+    viewer: g.nodes["person-v"],
+    leases: { "task-resv": { by: "person-x", expires: LIVE, reserved: true } },
+  });
+  assert.deepEqual(r.items.map((i) => i.id), [], "reservation hides the half-done work from teammate V");
+  assert.equal(r.reserved, 1, "Tier-2 demotion counted under reserved, not leased");
+  assert.equal(r.leased, undefined);
+});
+
+test("lease: the reservation owner sees it at the top of their own queue, tagged reserved", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-resv", "task", { status: "open", date: "2026-06-10", edges: [["assigned", "person-v"]] }),
+    LEASE_PERSON("person-v"),
+  ])).load();
+  const r = rankQueue(g, {
+    now: NOW,
+    viewer: g.nodes["person-v"],
+    front: { "task-resv": 5 }, // their front floats it up for free (the design)
+    leases: { "task-resv": { by: "person-v", expires: LIVE, reserved: true } },
+  });
+  assert.deepEqual(r.items.map((i) => i.id), ["task-resv"]);
+  assert.equal(r.reserved, undefined, "the owner's own reservation is not a demotion");
+  const it = r.items[0];
+  assert.equal(it.lease_state, "reserved");
+  assert.match(it.why, /reserved \(your claim\)/);
+});
+
+test("lease: a lease expired past now is NOT in force — full pool for everyone (grace exceeded)", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-lapsed", "task", { status: "open", edges: [["assigned", "person-x"]] }),
+    LEASE_PERSON("person-x"),
+    LEASE_PERSON("person-v"),
+  ])).load();
+  const lease = { "task-lapsed": { by: "person-x", expires: LAPSED, reserved: true } };
+  const teammate = rankQueue(g, { now: NOW, viewer: g.nodes["person-v"], leases: lease });
+  assert.deepEqual(teammate.items.map((i) => i.id), ["task-lapsed"], "escalates back to the teammate's pool");
+  assert.equal(teammate.leased, undefined);
+  assert.equal(teammate.reserved, undefined, "an expired entry demotes nobody");
+  assert.equal(teammate.items[0].lease_state, undefined, "no stale lease tag on an escalated item");
+});
+
+test("lease: viewer-relative — one live lease, hidden from the teammate but kept for the holder", () => {
+  const files = Object.fromEntries([
+    node("task-x", "task", { status: "open", edges: [["assigned", "person-x"]] }),
+    LEASE_PERSON("person-x"),
+    LEASE_PERSON("person-v"),
+  ]);
+  const lease = { "task-x": { by: "person-x", expires: LIVE } };
+  const holder = rankQueue(tmpGraph(files).load(), { now: NOW, viewer: tmpGraph(files).load().nodes["person-x"], leases: lease });
+  const teammate = rankQueue(tmpGraph(files).load(), { now: NOW, viewer: tmpGraph(files).load().nodes["person-v"], leases: lease });
+  assert.deepEqual(holder.items.map((i) => i.id), ["task-x"], "holder sees their own claim");
+  assert.equal(holder.items[0].lease_state, "in_progress");
+  assert.deepEqual(teammate.items.map((i) => i.id), [], "teammate does not");
+  assert.equal(teammate.leased, 1);
+});
+
+test("lease: an anonymous read (no viewer) treats every in-force lease as held by another", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-x", "task", { status: "open", edges: [["assigned", "person-x"]] }),
+    LEASE_PERSON("person-x"),
+  ])).load();
+  const r = rankQueue(g, { now: NOW, leases: { "task-x": { by: "person-x", expires: LIVE } } });
+  assert.deepEqual(r.items.map((i) => i.id), [], "the firehose hides others' live claims");
+  assert.equal(r.leased, 1);
+});
+
+test("lease: the steward/capacity view (assignee set) is lease-exempt — shows the claim, by holder", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-x", "task", { status: "open", edges: [["assigned", "person-x"]] }),
+    LEASE_PERSON("person-x"),
+    LEASE_PERSON("person-mgr"),
+  ])).load();
+  // A manager scoping to person-x's carried work; person-x holds a live lease.
+  const r = rankQueue(g, {
+    now: NOW,
+    assignee: "person-x",
+    viewer: g.nodes["person-mgr"],
+    leases: { "task-x": { by: "person-x", expires: LIVE } },
+  });
+  assert.deepEqual(r.items.map((i) => i.id), ["task-x"], "the capacity view surfaces the claimed work");
+  assert.equal(r.leased, undefined, "no hiding in the steward view");
+  const it = r.items[0];
+  assert.equal(it.lease_state, "in_progress");
+  assert.equal(it.lease_by, "person-x");
+  assert.match(it.why, /in progress by person-x/, "the steward sees who holds it");
+});
+
+test("lease: leased and reserved counts coexist and stack per state", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-live-1", "task", { status: "open", edges: [["assigned", "person-x"]] }),
+    node("task-live-2", "task", { status: "open", edges: [["assigned", "person-x"]] }),
+    node("task-resv-1", "task", { status: "open", edges: [["assigned", "person-x"]] }),
+    node("task-open", "task", { status: "open" }),
+    LEASE_PERSON("person-x"),
+    LEASE_PERSON("person-v"),
+  ])).load();
+  const r = rankQueue(g, {
+    now: NOW,
+    viewer: g.nodes["person-v"],
+    leases: {
+      "task-live-1": { by: "person-x", expires: LIVE },
+      "task-live-2": { by: "person-x", expires: LIVE },
+      "task-resv-1": { by: "person-x", expires: LIVE, reserved: true },
+    },
+  });
+  assert.deepEqual(r.items.map((i) => i.id), ["task-open"], "only the unclaimed task is actionable for V");
+  assert.equal(r.leased, 2);
+  assert.equal(r.reserved, 1);
+  assert.equal(r.count, 1);
+});
+
 // ---------------- queue-policy override (QUEUE.md §4/§8) ----------------
 
 const POLICY = (body, { id = "schema-queue-policy", status = "active", version = "2026.06.11.1" } = {}) => [

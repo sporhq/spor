@@ -95,13 +95,27 @@ const KINDS = {
   },
 
   // queue ranking — JSON out. viewer is a node id resolved in the corpus.
+  // `leases` is the injected ephemeral claim-lease table (task-cc-claim-lease-
+  // rankqueue): the case pins {nodeId -> {by, expires_iso|expires, reserved?}};
+  // `expires_iso` (an ISO string) is parsed to epoch ms here so the fixture
+  // stays clock-pinned and human-readable, exactly as `now` is. Absent -> the
+  // queue is byte-identical to before this input existed.
   queue(c) {
     const g = graphFor(c.corpus);
+    let leases = null;
+    if (c.input.leases) {
+      leases = {};
+      for (const [id, l] of Object.entries(c.input.leases)) {
+        leases[id] = { ...l, expires: l.expires_iso != null ? ms(l.expires_iso) : l.expires };
+        delete leases[id].expires_iso;
+      }
+    }
     return json(kqueue.rankQueue(g, {
       project: c.input.project ?? null,
       assignee: c.input.assignee ?? null,
       activity: c.input.activity ?? null,
       front: c.input.front ?? null,
+      leases,
       limit: c.input.limit ?? undefined,
       viewer: c.input.viewer ? g.nodes[c.input.viewer] : null,
       now: ms(c.input.now),
