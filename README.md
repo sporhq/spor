@@ -20,7 +20,7 @@ dispatcher hosts call):
 npm install -g @sporhq/spor
 ```
 
-Requires Node 18+ and nothing else — the client is zero-dependency. To run
+Requires Node 20+ and nothing else — the client is zero-dependency. To run
 from a checkout instead (e.g. to hack on it), clone the repo and `npm link`
 from its root; that symlinks the same two commands onto your PATH.
 

@@ -48,6 +48,6 @@
     "conformance": "node conformance/runner.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   }
 }
