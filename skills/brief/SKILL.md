@@ -24,15 +24,28 @@ Steps:
    **Remote mode (team graph) — when `SPOR_SERVER` is set:** the compile
    runs on the server. Use its REST twins (API.md §3) instead of the local
    compile.js. (Env vars here are the `SPOR_*` family; the legacy
-   `SUBSTRATE_*` names are still read.)
+   `SUBSTRATE_*` names are still read.) First resolve THIS repo's project slug
+   the same way a session does and send it as `"project"` so the server scopes
+   the compile to your repo — the same-project relevance boost, the grouping
+   union, and the `always_on` norm `applies_to_*` ride-along — instead of
+   running *project-blind* (issue-spor-remote-digest-project-blind). Resolve the
+   plugin root from the session-start cache, then the slug:
+   ```bash
+   SPOR_ROOT="$(cat "${SPOR_HOME:-$HOME/.spor}/cache/plugin-root" 2>/dev/null \
+     || cat "$HOME/.substrate/cache/plugin-root" 2>/dev/null)"
+   SPOR_ROOT="${SPOR_ROOT:-$CLAUDE_PLUGIN_ROOT}"
+   SLUG="$(node -e 'process.stdout.write(require("'"$SPOR_ROOT"'/scripts/engines/util.js").projectSlug(process.cwd()))' 2>/dev/null)"
+   ```
    - free-text query: `POST ${SPOR_SERVER%/}/v1/digest` with
-     `{"query":"<text>"}` (`Authorization: Bearer $SPOR_TOKEN`); the `text`
-     field is the compiled neighborhood. A `{"found":false}` means the team
-     graph has nothing relevant — say so and stop.
+     `{"query":"<text>","project":"<slug>"}` (`Authorization: Bearer
+     $SPOR_TOKEN`); the `text` field is the compiled neighborhood. A
+     `{"found":false}` means the team graph has nothing relevant — say so and
+     stop. (Omit `project` only if the slug couldn't be resolved.)
    - node id: `GET ${SPOR_SERVER%/}/v1/nodes/<id>` for the raw node, and
-     `POST /v1/digest` with the node's title/summary as the query for its
-     neighborhood. In Cowork, call the `query_graph` MCP tool (with `root_id` for
-     a node id, or `query` for free text) — there is no compile.js there.
+     `POST /v1/digest` with the node's title/summary as the query (plus the same
+     `"project":"<slug>"`) for its neighborhood. In Cowork, call the
+     `query_graph` MCP tool (with `root_id` for a node id, or `query` for free
+     text) — there is no compile.js there.
 
    **Local mode (personal graph) — `SPOR_SERVER` unset:** first resolve the
    plugin root — `${CLAUDE_PLUGIN_ROOT}` is empty in the Bash tool, so read
