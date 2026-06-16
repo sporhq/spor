@@ -771,3 +771,58 @@ test("seed pack: task done / issue resolved require a decision or artifact resol
   assert.equal(doneGate({ resolvers: [{ id: "dec-y", type: "decision" }] }).allow, true,
     "no partition on the view counts every resolver (backward-readable)");
 });
+
+// issue-spor-schema-authoring-docs-gap: GRAPH.md ships a complete, copy-pasteable
+// worked example of a custom node schema (the `escalation` type) exercising BOTH
+// attached hooks. This test extracts that example straight out of the doc and
+// runs it through the same registry parser + sandbox the server uses, so the
+// shipped example cannot rot and the documented validate()/transitions() return
+// conventions are verified, not merely asserted in prose.
+function workedExampleFromGraphMd() {
+  const doc = fs.readFileSync(path.join(__dirname, "..", "GRAPH.md"), "utf8");
+  const section = doc.slice(doc.indexOf("## Authoring a custom schema"));
+  // the worked example is the one ````markdown … ```` block in that section
+  // (4-backtick fence wrapping a node whose body has 3-backtick json/js fences).
+  const m = section.match(/````markdown\n([\s\S]*?)\n````/);
+  assert.ok(m, "GRAPH.md must carry the ````markdown worked-example block");
+  return m[1];
+}
+
+test("GRAPH.md worked schema example parses and its hooks run as documented", () => {
+  const md = workedExampleFromGraphMd();
+  const node = graph.parseFrontmatter(md, "schema-escalation.md");
+  const r = registry.parseSchemaNode(node);
+  assert.equal(r.ok, true, r.errors.join("; "));
+  assert.equal(r.schema.kind, "node-schema");
+  assert.equal(r.schema.key, "escalation");
+  assert.deepEqual(r.schema.payload.prefix, ["esc-"]);
+  assert.equal(typeof r.schema.code.validate, "string");
+  assert.equal(typeof r.schema.code.transitions, "string");
+
+  const sb = sandboxFor(r.schema);
+  const SLACK = { timeoutMs: 5000 };
+
+  // validate(node) -> string[] ([] == ok), runs on every write.
+  assert.deepEqual(sb.call("validate", [{ id: "esc-1", severity: "sev1" }], SLACK), [],
+    "a valid severity passes validate()");
+  assert.match(sb.call("validate", [{ id: "esc-1" }], SLACK)[0], /requires a severity/,
+    "a missing severity is rejected");
+  assert.match(sb.call("validate", [{ id: "esc-1", severity: "sev9" }], SLACK)[0], /invalid severity/,
+    "an out-of-vocab severity is rejected");
+
+  // transitions(current, proposed, view) -> { allow, reason? }, update-only.
+  const gate = (status, view = {}) =>
+    sb.call("transitions", [{ id: "esc-1", status: "open" }, { id: "esc-1", status }, view], SLACK);
+  assert.equal(gate("").allow, true, "status-less (live) is allowed");
+  assert.equal(gate("mitigated").allow, true, "a valid status is allowed");
+  assert.equal(gate("bogus").allow, false, "an out-of-vocab status is denied");
+  assert.match(gate("bogus").reason, /bogus/, "the denial names the bad value");
+  assert.equal(gate("closed", { resolvers: [] }).allow, false, "closed needs a resolver");
+  assert.match(gate("closed", { resolvers: [] }).reason, /decision or artifact/);
+  assert.equal(gate("closed", { resolvers: [{ id: "dec-x", type: "decision" }] }).allow, true,
+    "closed allowed once a decision resolver exists");
+  // a status-less write is always allowed by the function; the server further
+  // never even calls transitions() on create (it is update-only — store.js).
+  assert.equal(sb.call("transitions", [undefined, { id: "esc-1" }, {}], SLACK).allow, true,
+    "a status-less create is allowed");
+});

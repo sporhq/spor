@@ -354,17 +354,125 @@ async function cmdLens(cfg, args) {
   return 0;
 }
 
-function cmdCompile(cfg, verb, args) {
+// compile / brief / validate are LOCAL-graph verbs: byte-identical passthrough
+// to lib/compile.js / lib/validate.js, which read $SPOR_HOME/nodes. In REMOTE
+// mode that dir is absent, so the old passthrough exited with a bare
+// "no Spor graph at ~/.spor/nodes" — reads like a broken install
+// (issue-spor-cli-remote-mode-local-verbs). So they branch on mode: dispatch to
+// the server where an equivalent exists (brief/compile, mirroring the
+// /spor:brief skill), fail fast naming the remote path where it does not
+// (validate, compile --skeleton). An explicit --nodes names a local checkout on
+// purpose, so it always takes the local path even under a configured server —
+// which also keeps local-mode output byte-identical (norm-cc-byte-identical-refactor).
+function namesLocalGraph(args) {
+  return args.includes("--nodes");
+}
+
+async function cmdCompile(cfg, verb, args) {
   // brief <id> is sugar for compile --root <id>.
+  let compileArgs = args;
   if (verb === "brief") {
     const id = args[0];
     if (!id) {
       err("usage: spor brief <id>");
       return 1;
     }
-    return passthrough("compile.js", ["--root", id, ...args.slice(1)]);
+    compileArgs = ["--root", id, ...args.slice(1)];
   }
-  return passthrough("compile.js", args);
+  if (cfg.mode() === "remote" && !namesLocalGraph(compileArgs)) {
+    return await compileRemote(cfg, compileArgs);
+  }
+  return passthrough("compile.js", compileArgs);
+}
+
+// The remote arm of compile/brief. Mirrors the /spor:brief skill's remote
+// resolution: a node id -> the raw node plus a title/summary-seeded /v1/digest
+// for its neighborhood; free text -> POST /v1/digest. --skeleton has no server
+// equivalent (it writes a local briefing-node file), so it fails fast. Output
+// matches the local "nothing relevant" contract: exit 0 with empty stdout.
+async function compileRemote(cfg, args) {
+  const root = optVal(args, "root");
+  const query = optVal(args, "query");
+  const project = optVal(args, "project");
+  const outFile = optVal(args, "out");
+  const minSim = optVal(args, "min-sim");
+
+  if (args.includes("--skeleton")) {
+    err("compile --skeleton is local-only — it writes a briefing-node skeleton from a local graph.");
+    err("  in remote mode the server compiles; use 'spor brief <id>' for a node's briefing,");
+    err("  or run in local mode (unset SPOR_SERVER, or pass --nodes <dir>) against a checkout.");
+    return 1;
+  }
+  if (!root && !query) {
+    err('usage: spor compile (--root <id> | --query "text") [--digest] [--project <slug>]');
+    return 1;
+  }
+
+  let text = "";
+  if (root) {
+    const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(root)}`, { timeoutMs: 8000 });
+    if (r.transport) {
+      err(`offline — could not reach server (${r.error})`);
+      return 1;
+    }
+    if (r.status === 404) {
+      err(`no such node: ${root}`);
+      return 1;
+    }
+    if (!r.ok) {
+      err(`error ${r.status}`);
+      return 1;
+    }
+    const raw = (r.json && r.json.raw) || r.text || "";
+    // Seed the neighborhood digest from the node's own title/summary, exactly as
+    // the /spor:brief skill does (the REST /v1/digest is query-mode only — root
+    // compile is not exposed over REST, only via the query_graph MCP tool).
+    const seed = (r.json && (r.json.title || r.json.summary)) || fmField(raw, "title") || fmField(raw, "summary") || root;
+    const d = await remote.post(cfg, "/v1/digest", project ? { query: seed, project } : { query: seed }, { timeoutMs: 8000 });
+    const neighborhood = d.ok && d.json && d.json.found !== false ? d.json.text || "" : "";
+    text = neighborhood ? `${raw}\n\n${neighborhood}` : raw;
+  } else {
+    const body = { query };
+    if (project) body.project = project;
+    if (minSim != null) body.min_sim = parseFloat(minSim);
+    const d = await remote.post(cfg, "/v1/digest", body, { timeoutMs: 8000 });
+    if (d.transport) {
+      err(`offline — could not reach server (${d.error})`);
+      return 1;
+    }
+    if (!d.ok) {
+      err(`digest error ${d.status}`);
+      return 1;
+    }
+    if (!d.json || d.json.found === false) return 0; // nothing relevant — mirror local empty
+    text = d.json.text || "";
+  }
+
+  if (!text) return 0;
+  if (outFile) {
+    try {
+      fs.writeFileSync(outFile, text);
+    } catch (e) {
+      err(`could not write ${outFile}: ${e.message}`);
+      return 1;
+    }
+  } else {
+    out(text);
+  }
+  return 0;
+}
+
+// validate lints a LOCAL graph (lib/validate.js). Remote mode has no
+// whole-graph lint endpoint — the server validates every write per node — so
+// fail fast naming that, unless --nodes points at a local checkout to lint.
+function cmdValidate(cfg, args) {
+  if (cfg.mode() === "remote" && !namesLocalGraph(args)) {
+    err("validate lints a LOCAL graph; in remote mode the server validates every write,");
+    err("  so there is no whole-graph lint over the API. Point --nodes at a local checkout");
+    err("  to lint it, or unset SPOR_SERVER to validate the local graph home.");
+    return 1;
+  }
+  return passthrough("validate.js", args);
 }
 
 // --- spor add / capture -------------------------------------------------
@@ -1858,8 +1966,13 @@ const COMMANDS = {
   },
   compile: {
     group: "Repo scoping", parse: "raw", args: "<args>",
-    summary: "full neighborhood / digest (local; byte-identical)",
-    help: "Compile a node neighborhood or a prompt-time digest from the local graph.\nByte-identical passthrough to lib/compile.js (norm-cc-byte-identical-refactor).",
+    summary: "full neighborhood / digest (local byte-identical; remote via the server)",
+    help:
+      "Compile a node neighborhood or a prompt-time digest. In local mode this is a\n" +
+      "byte-identical passthrough to lib/compile.js (norm-cc-byte-identical-refactor).\n" +
+      "In remote mode it dispatches to the server (--root/--query mirror the\n" +
+      "/spor:brief skill: GET /v1/nodes then POST /v1/digest); --skeleton is local-\n" +
+      "only. An explicit --nodes always names a local checkout, even under a server.",
     options: {
       root: { type: "string", value: "id", desc: "compile a node's neighborhood" },
       query: { type: "string", value: "text", desc: "compile from free-text (query mode)" },
@@ -1877,16 +1990,16 @@ const COMMANDS = {
   brief: {
     group: "Repo scoping", parse: "raw", args: "<id>",
     summary: "compile a briefing for a node (sugar for compile --root <id>)",
-    help: "Compile a briefing for one node — sugar for 'compile --root <id>'. Byte-\nidentical passthrough to lib/compile.js.",
+    help: "Compile a briefing for one node — sugar for 'compile --root <id>'. Local mode\nis a byte-identical passthrough to lib/compile.js; remote mode dispatches to the\nserver (the raw node plus a /v1/digest neighborhood), like the /spor:brief skill.",
     examples: ["spor brief dec-cc-zero-dep-client"],
     run: (cfg, args) => cmdCompile(cfg, "brief", args),
   },
   validate: {
     group: "Repo scoping", parse: "raw", args: "",
     summary: "lint the local graph (byte-identical)",
-    help: "Lint the local graph and exit 1 on errors. Byte-identical passthrough to\nlib/validate.js.",
+    help: "Lint the local graph and exit 1 on errors. Byte-identical passthrough to\nlib/validate.js. Local-only — in remote mode the server validates every write,\nso this fails fast unless --nodes points at a local checkout.",
     options: { nodes: { type: "string", value: "dir", desc: "graph nodes dir to lint" } },
-    run: (cfg, args) => passthrough("validate.js", args),
+    run: (cfg, args) => cmdValidate(cfg, args),
   },
 
   // --- Dispatch ---

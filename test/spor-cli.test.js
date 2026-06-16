@@ -868,3 +868,134 @@ test('lens rejects an invalid --format', () => {
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /invalid --format/);
 });
+
+// --- compile / brief / validate in REMOTE mode -----------------------------
+// (issue-spor-cli-remote-mode-local-verbs) These LOCAL-graph verbs used to run
+// lib/compile.js/lib/validate.js even in remote mode, where $SPOR_HOME/nodes is
+// absent — exiting with a bare "no Spor graph" that read like a broken install.
+// Now brief/compile dispatch to the server (mirroring the /spor:brief skill) and
+// validate/--skeleton fail fast naming the remote path; an explicit --nodes
+// still names a local checkout. Same async-spawn stub pattern as the lens tests.
+function digestStubServer() {
+  const http = require('node:http');
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      const parsed = body ? JSON.parse(body) : null;
+      hits.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: parsed });
+      const nodeM = req.url.match(/^\/v1\/nodes\/([^/?]+)$/);
+      if (req.method === 'GET' && nodeM) {
+        const id = decodeURIComponent(nodeM[1]);
+        if (id !== 'dec-x') {
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { code: 'not_found', message: `no node '${id}'` } }));
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          id, title: 'A demo decision', summary: 'A demo decision summary.',
+          raw: '---\nid: dec-x\ntype: decision\ntitle: A demo decision\n---\n\nRaw node body.\n',
+          revision: 'abc123',
+        }));
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/v1/digest') {
+        // A query with the gibberish gate-miss text returns the empty result.
+        if (parsed && /zzz-nothing/.test(parsed.query || '')) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ found: false }));
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ found: true, text: `DIGEST for: ${(parsed && parsed.query) || ''}` }));
+        return;
+      }
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'not_found', message: 'no route' } }));
+    });
+  });
+  return new Promise((resolve) => srv.listen(0, '127.0.0.1', () =>
+    resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
+}
+
+test('brief <id> (remote) emits the raw node plus a /v1/digest neighborhood', async () => {
+  const { srv, hits, base } = await digestStubServer();
+  try {
+    const r = await runAsyncCli(['brief', 'dec-x'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-b' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /Raw node body\./);          // the raw node
+    assert.match(r.stdout, /DIGEST for: A demo decision/); // title-seeded neighborhood
+    assert.ok(hits.some((h) => h.method === 'GET' && h.url === '/v1/nodes/dec-x'), 'fetched the node');
+    const dig = hits.find((h) => h.url === '/v1/digest');
+    assert.ok(dig, 'compiled a digest');
+    assert.strictEqual(dig.auth, 'Bearer tok-b', 'bearer token sent');
+  } finally {
+    srv.close();
+  }
+});
+
+test('compile --query --digest (remote) posts /v1/digest and prints the text', async () => {
+  const { srv, hits, base } = await digestStubServer();
+  try {
+    const r = await runAsyncCli(['compile', '--query', 'auth token rotation', '--digest'], { SPOR_SERVER: base, SPOR_TOKEN: 't' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /DIGEST for: auth token rotation/);
+    assert.ok(hits.some((h) => h.method === 'POST' && h.url === '/v1/digest'), 'hit the digest route');
+  } finally {
+    srv.close();
+  }
+});
+
+test('compile --query (remote) with a gate-miss prints nothing and exits 0', async () => {
+  const { srv, base } = await digestStubServer();
+  try {
+    const r = await runAsyncCli(['compile', '--query', 'zzz-nothing relevant here'], { SPOR_SERVER: base, SPOR_TOKEN: 't' });
+    assert.strictEqual(r.status, 0, r.stderr);   // mirrors local "nothing relevant"
+    assert.strictEqual(r.stdout, '');
+  } finally {
+    srv.close();
+  }
+});
+
+test('brief <unknown> (remote) exits 1 with a clear not-found, no stack', async () => {
+  const { srv, base } = await digestStubServer();
+  try {
+    const r = await runAsyncCli(['brief', 'dec-nope'], { SPOR_SERVER: base, SPOR_TOKEN: 't' });
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /no such node: dec-nope/);
+    assert.doesNotMatch(r.stderr, /at Object|Error:/);
+  } finally {
+    srv.close();
+  }
+});
+
+test('validate (remote, no --nodes) fails fast naming the remote path, no "no Spor graph"', () => {
+  const r = run(['validate'], { SPOR_SERVER: 'http://127.0.0.1:1', SPOR_TOKEN: 't' });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /validate lints a LOCAL graph/);
+  assert.match(r.stderr, /server validates every write/);
+  assert.doesNotMatch(r.stderr, /no Spor graph/);     // the confusing message is gone
+  assert.doesNotMatch(r.stderr, /at Object|Error:/);
+});
+
+test('validate --nodes <dir> (remote) still lints the named local checkout', () => {
+  const { nodes } = fixtureGraph();
+  const r = run(['validate', '--nodes', nodes], { SPOR_SERVER: 'http://127.0.0.1:1', SPOR_TOKEN: 't' });
+  assert.strictEqual(r.status, 0, r.stderr);          // a named checkout works under a server
+  assert.match(r.stdout, /0 errors/);
+});
+
+test('compile --skeleton (remote) is local-only and fails fast', () => {
+  const r = run(['compile', '--root', 'dec-x', '--skeleton'], { SPOR_SERVER: 'http://127.0.0.1:1', SPOR_TOKEN: 't' });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /--skeleton is local-only/);
+});
+
+test('compile --query (remote) fails open with a clear OFFLINE line, no stack', () => {
+  const r = run(['compile', '--query', 'anything at all here'], { SPOR_SERVER: 'http://127.0.0.1:1', SPOR_TOKEN: 't' });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /offline/);
+  assert.doesNotMatch(r.stderr, /at Object|Error:/);
+});

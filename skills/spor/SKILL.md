@@ -86,15 +86,20 @@ spor add "<2-3 sentences>"     # capture a node (typed file locally; /v1/capture
 # remote (team server) only
 spor lens [<id>]               # list saved views, or render one
 
-# local (personal graph) only
+# dual-mode (local passthrough / remote dispatch to the server)
 spor compile --query "<text>"  # search → compiled neighborhood (--digest for compact)
 spor brief <id>                # a briefing for one node (compile --root <id>)
-spor validate                  # lint the local graph
+
+# local (personal graph) only — fail fast with a redirect in remote mode
+spor validate                  # lint the local graph (server validates per-write remotely)
+spor compile --root <id> --skeleton   # writes a local briefing-node skeleton
 ```
 
-In remote mode the compile/briefing work is what the session hooks already do
-for you automatically; to pull one on demand, use `/spor:brief` (it calls the
-server) rather than `spor compile`.
+`compile`/`brief` are mode-aware: local mode runs the in-repo compiler, remote
+mode dispatches to the server (mirroring `/spor:brief`). Much of this is what
+the session hooks already inject for you automatically; pulling one on demand
+with `spor brief`, `spor compile`, or `/spor:brief` is the same briefing.
+Passing `--nodes <dir>` always targets that local checkout, even under a server.
 
 **In Cowork (Anthropic's chat workspace) and Claude Code with the connector**
 there is no shell and no ambient injection — reach the graph through the

@@ -176,6 +176,153 @@ least two — the definition-of-done quorum gate.
   a proposed policy is inert until a *different* identity activates it (the
   native floor protects against self-amendment circularity).
 
+## Authoring a custom schema
+
+A team extends the ontology by writing a `type: schema` node into its graph (it
+overrides or extends the seed pack; QUEUE.md §2). This section assembles one
+end-to-end — the seed pack documents the JSON payload and the attached code
+separately, but never shows a complete custom type in one piece.
+
+**The constraint model is procedural, not declarative.** A schema's `json`
+payload declares only *registry knobs* — `node_type`, `prefix`, `queueable`,
+`traversable`, `always_on`, `capturable`, an edge `weight`, the
+`status.non_resolving` partition. There is **no declarative field list and no
+status enum.** Custom fields are free-form: any flat frontmatter key the
+regex parser accepts (simple `key: value` scalars, YAML-folded multi-line
+values, `pin:`/`exclude:` inline lists, `- {type: X, to: Y}` edges — and nothing
+fancier) is carried verbatim on the node. What a field MUST contain, and which
+status changes are legal, are enforced **in attached code** — two pure functions
+the server runs on the write path:
+
+- **`validate(node) -> string[]`** — the door. Runs on **every write (create
+  AND update)**. It receives the parsed proposed node and returns an array of
+  human-readable error strings; `[]` means accept. A non-empty array rejects the
+  write (`invalid_node`), each string surfaced to the writer as
+  `<schema-id> validate(): <your message>`. This is where required/typed custom
+  fields are enforced.
+- **`transitions(current, proposed, view) -> { allow, reason? }`** — the status
+  gate. Runs on **update only** (the create path is ungated, so a status-less or
+  any first write is always allowed). `current` is the stored node (or `null` if
+  its file is unparseable), `proposed` is the incoming node, and `view` is a
+  read-only join the server computes for the gate:
+  - `view.targets[id]` — `{ exists, type, status, superseded }` for each node
+    this one points an edge at (outbound);
+  - `view.resolvers` — live **inbound** `resolves`/`answers` edges pointing at
+    this node, each `{ id, type, status }`, already filtered to *resolving*
+    states (a withdrawn or in-review resolver is excluded). This is how a type
+    requires a durable outcome on the graph before going terminal (the resolver
+    gate the seed `task`/`issue` schemas use);
+  - `view.non_resolving_statuses` — the registry's resolving-status partition,
+    if the gate wants to judge resolver states itself;
+  - `view.actor` — `{ name, email, via }`, the authenticated writer (for
+    ownership/role gates);
+  - `view.approvals` — the node's review edges to `person` nodes joined to their
+    `roles` (the quorum-gate input; the writer's own self-approval is excluded).
+  Return `{ allow: true }` to permit, or `{ allow: false, reason: "…" }` to deny
+  with an actionable message.
+
+Both hooks are **sandboxed, pure, and fail-closed**: the server runs them in a
+QuickJS-in-wasm sandbox (`SPOR_SANDBOX=vm` is an ops-only escape hatch) across a
+strict JSON boundary — arguments arrive as plain guest data and only JSON-clonable
+return values cross back, so `require`, `process`, `eval`, the `Function`
+constructor, host prototypes, ambient time/IO, and unbounded loops are all
+unavailable (a runaway hits a fuel/memory interrupt). A hook that throws does not
+wave the write through — it **rejects** it. Write the functions accordingly: no
+external state, no side effects, decide only from the arguments. Two more
+attached exports are recognized: `queueSignals(node, ctx)` (a `{ name: number }`
+map blended into the decision-queue ranking) and named upgrade functions
+referenced from `payload.upgrades` (lazy, forward-only field migrations on a
+`schema_version` bump). The **client** half (hooks, the `spor` CLI, `lib/`) only
+*parses and indexes* this code for the registry knobs — it never executes it;
+the server is the sole executor.
+
+Resolution and rollout: a graph-resident schema always beats the seed pack, and
+within a source the higher CalVer `schema_version` wins, so an override must be
+bumped in lockstep with seed changes or it silently shadows them (`validateGraph`
+warns). A schema node goes through the same propose→activate flow it governs — a
+*different* identity must activate it (or a trusted admin git-writes it `active`);
+bump the CalVer and add an `upgrades` chain only when the change is not
+backward-readable.
+
+A complete worked example — a `escalation` type with a required `severity`
+field (enforced in `validate`) and an `open → mitigated → closed` status machine
+whose terminal `closed` demands a resolver (enforced in `transitions`):
+
+````markdown
+---
+id: schema-escalation
+type: schema
+kind: node-schema
+schema_version: 2026.06.16.1
+title: Custom schema for customer-escalation nodes
+summary: A customer escalation with a severity field and an open/mitigated/closed status machine; closing one requires a decision or artifact that resolves it.
+status: active
+date: 2026-06-16
+---
+
+Escalation nodes track a customer-facing incident from raise to close.
+`severity` is a free-form frontmatter field this schema makes mandatory and
+constrains in `validate()`; the status machine and the close-time resolver gate
+live in `transitions()`. Both are the same procedural model the seed types use —
+there is no declarative field or status enum to fill in.
+
+```json
+{
+  "node_type": "escalation",
+  "description": "a customer-facing escalation and its resolution lineage",
+  "prefix": ["esc-"],
+  "queueable": true
+}
+```
+
+```js
+// validate(node) — runs at the door on EVERY write (create and update). Returns
+// an array of error strings; [] accepts. Enforce the free-form custom field here:
+// the payload declares no field list, so a required/typed field is code.
+export function validate(node) {
+  const errors = [];
+  const VALID_SEVERITY = ["sev1", "sev2", "sev3"];
+  if (!node.severity) {
+    errors.push("escalation requires a severity field (sev1 | sev2 | sev3)");
+  } else if (VALID_SEVERITY.indexOf(String(node.severity)) === -1) {
+    errors.push("invalid severity '" + node.severity + "': use sev1, sev2, or sev3");
+  }
+  return errors;
+}
+
+// transitions(current, proposed, view) — runs on UPDATE only; returns
+// { allow, reason? }. Empty status (status-less = live) is always allowed.
+export function transitions(current, proposed, view) {
+  const VALID = ["open", "mitigated", "closed"];
+  const next = ((proposed && proposed.status) || "").toLowerCase();
+  if (next === "") return { allow: true };
+  if (VALID.indexOf(next) === -1) {
+    return {
+      allow: false,
+      reason: "invalid escalation status '" + next + "': valid statuses are " +
+        "open, mitigated, closed — or none, meaning live",
+    };
+  }
+  // closed must record a durable outcome on the graph: a decision or artifact
+  // that resolves this escalation (an inbound resolves edge). view.resolvers is
+  // already filtered to resolving states, so an in-review fix does not count.
+  if (next === "closed") {
+    const rs = (view && view.resolvers) || [];
+    const ok = rs.some((r) => r.type === "decision" || r.type === "artifact");
+    if (!ok) {
+      return {
+        allow: false,
+        reason: "closed requires a decision or artifact node that resolves this " +
+          "escalation (an inbound resolves edge) — record how it was handled on " +
+          "the graph so the neighborhood can surface it",
+      };
+    }
+  }
+  return { allow: true };
+}
+```
+````
+
 ## Norm ride-along
 
 A `norm` node (any `always_on` type) rides along on every compile — but the

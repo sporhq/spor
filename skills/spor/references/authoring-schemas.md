@@ -70,22 +70,26 @@ A schema may carry fenced `js` blocks exporting **pure** functions, run
 server-side in a sandbox (no I/O, no clock) at the JSON boundary. The one most
 types use:
 
-- `transitions(current, proposed, view)` — gate a status change; return
-  `{allow: true}` or `{allow: false, reason: "..."}`. Make the reason
-  actionable: a writing agent reads it and retries. This is also where you pin
-  a type's legal status set — reject any proposed status outside it. (The task
-  type's gate uses `view.resolvers` and `view.non_resolving_statuses` to check
-  for a resolving `decision`/`artifact` before allowing `done`.)
+- `transitions(current, proposed, view)` — gate a status change; runs on
+  **update only** (the create path is ungated). Return `{allow: true}` or
+  `{allow: false, reason: "..."}`. Make the reason actionable: a writing agent
+  reads it and retries. This is also where you pin a type's legal status set —
+  reject any proposed status outside it. `current` is the stored node (`null` if
+  unparseable), `proposed` the incoming one, and `view` a read-only join the
+  server computes: `view.resolvers` (live inbound `resolves`/`answers` edges,
+  pre-filtered to resolving states), `view.targets`, `view.actor`,
+  `view.approvals`, `view.non_resolving_statuses`. (The task type's gate uses
+  `view.resolvers` to require a resolving `decision`/`artifact` before `done`.)
 
 Two more hooks are supported but unused by the seed types:
 
-- `validate(node, graph)` — extra field checks beyond the base validator (e.g.
-  "a `severity` is required and must be one of …"). Follow the validator's usual
-  convention: return a list of error messages, empty meaning valid. (Arguments
-  you don't use — like `graph` here, or `view` in `transitions` — can be left
-  off the signature.)
-- `queueSignals(node, graph, activity)` — contribute ranking signals to the
-  queue.
+- `validate(node)` — runs at the door on **every write (create and update)**.
+  Extra field checks beyond the base validator (e.g. "a `severity` is required
+  and must be one of …"). Return a list of error message strings, `[]` meaning
+  valid; the server prefixes each with `<schema-id> validate():`. The sandbox
+  passes only the node — there is no second argument.
+- `queueSignals(node, ctx)` — contribute a `{name: number}` map of ranking
+  signals to the decision queue.
 
 To read a real, current attached function, fetch a live schema:
 `spor get schema-task` shows a two-gate `transitions`. (The seed schemas also
