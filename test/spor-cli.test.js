@@ -223,40 +223,41 @@ test('whoami in local mode explains there is no server identity', () => {
 
 // --- Split-brain detection (issue-spor-local-mode-claude-ai-mcp-split-brain,
 // dec-spor-local-mode-split-brain-mitigation). LOCAL mode + a bound claude.ai
-// Spor MCP connector = two write surfaces; `spor status` warns. Detection keys
-// on ~/.claude.json's `claudeAiMcpEverConnected` array, stubbed here via
-// SPOR_FAKE_CLAUDE_JSON. Fail-open: a missing/unreadable file never warns.
-function fakeClaudeJson(connectors) {
-  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'spor-claudejson-')), '.claude.json');
-  fs.writeFileSync(f, JSON.stringify({ claudeAiMcpEverConnected: connectors }));
-  return f;
+// Spor MCP connector = two write surfaces; `spor status` warns. Detection reads
+// the LIVE connector set from `claude mcp list` (NOT the sticky
+// `claudeAiMcpEverConnected` array, which warned forever after the connector was
+// disabled — issue-spor-status-split-brain-warning-false-positive), stubbed here
+// via SPOR_FAKE_MCP_LIST. Fail-open: an absent claude / failed probe never warns.
+function fakeMcpList(connectors) {
+  const body = connectors.map((n) => `${n}: https://example.test/mcp - ✔ Connected`).join('\n');
+  return `Checking MCP server health…\n\n${body}\n`;
 }
 const SPLIT = /SPLIT-BRAIN/;
+// A command name that cannot resolve, so spawnSync errors -> fail-open false.
+const NO_CLAUDE = path.join(os.tmpdir(), 'spor-no-claude-' + Math.random());
 
 test('sporConnectorBound: detects a Spor connector, ignores others, fail-open', () => {
-  const withSpor = fakeClaudeJson(['claude.ai Spotify', 'claude.ai Spor']);
-  process.env.SPOR_FAKE_CLAUDE_JSON = withSpor;
+  process.env.SPOR_FAKE_MCP_LIST = fakeMcpList(['claude.ai Spotify', 'claude.ai Spor']);
   assert.strictEqual(cli.sporConnectorBound(), true);
   // pre-rename "Substrate" connector name also matches
-  process.env.SPOR_FAKE_CLAUDE_JSON = fakeClaudeJson(['claude.ai Substrate']);
+  process.env.SPOR_FAKE_MCP_LIST = fakeMcpList(['claude.ai Substrate']);
   assert.strictEqual(cli.sporConnectorBound(), true);
-  // no Spor connector => false
-  process.env.SPOR_FAKE_CLAUDE_JSON = fakeClaudeJson(['claude.ai Spotify', 'claude.ai Linear']);
+  // only other connectors (Spotify shares a prefix but \b stops it) => false
+  process.env.SPOR_FAKE_MCP_LIST = fakeMcpList(['claude.ai Spotify', 'claude.ai Linear']);
   assert.strictEqual(cli.sporConnectorBound(), false);
-  // unreadable / absent file => fail-open false (no crash)
-  process.env.SPOR_FAKE_CLAUDE_JSON = path.join(os.tmpdir(), 'spor-nope-' + Math.random(), 'x.json');
+  // connector DISABLED => empty live list => false (the regression this fixes)
+  process.env.SPOR_FAKE_MCP_LIST = fakeMcpList([]);
   assert.strictEqual(cli.sporConnectorBound(), false);
-  // malformed json => fail-open false
-  const bad = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'spor-badjson-')), '.claude.json');
-  fs.writeFileSync(bad, 'not json {');
-  process.env.SPOR_FAKE_CLAUDE_JSON = bad;
+  delete process.env.SPOR_FAKE_MCP_LIST;
+  // claude absent / probe fails => fail-open false (no crash)
+  process.env.SPOR_CLAUDE_CMD = NO_CLAUDE;
   assert.strictEqual(cli.sporConnectorBound(), false);
-  delete process.env.SPOR_FAKE_CLAUDE_JSON;
+  delete process.env.SPOR_CLAUDE_CMD;
 });
 
 test('status (local) WARNS of split-brain when a Spor connector is bound', () => {
   const { dir } = fixtureGraph();
-  const r = run(['status'], { SPOR_HOME: dir, SPOR_FAKE_CLAUDE_JSON: fakeClaudeJson(['claude.ai Spor']) });
+  const r = run(['status'], { SPOR_HOME: dir, SPOR_FAKE_MCP_LIST: fakeMcpList(['claude.ai Spor']) });
   assert.strictEqual(r.status, 0);
   assert.match(r.stdout, /mode:\s+local/);
   assert.match(r.stdout, SPLIT);
@@ -265,15 +266,24 @@ test('status (local) WARNS of split-brain when a Spor connector is bound', () =>
 
 test('status (local) does NOT warn when no Spor connector is bound', () => {
   const { dir } = fixtureGraph();
-  const r = run(['status'], { SPOR_HOME: dir, SPOR_FAKE_CLAUDE_JSON: fakeClaudeJson(['claude.ai Spotify']) });
+  const r = run(['status'], { SPOR_HOME: dir, SPOR_FAKE_MCP_LIST: fakeMcpList(['claude.ai Spotify']) });
   assert.strictEqual(r.status, 0);
   assert.doesNotMatch(r.stdout, SPLIT);
 });
 
-test('status (local) does NOT warn / crash when the connector config is unreadable', () => {
+test('status (local) does NOT warn after the connector is disabled (empty live list)', () => {
+  // The reported false positive: a previously-connected Spor connector, now
+  // unbound, must not warn (issue-spor-status-split-brain-warning-false-positive).
   const { dir } = fixtureGraph();
-  const missing = path.join(os.tmpdir(), 'spor-absent-' + Math.random(), '.claude.json');
-  const r = run(['status'], { SPOR_HOME: dir, SPOR_FAKE_CLAUDE_JSON: missing });
+  const r = run(['status'], { SPOR_HOME: dir, SPOR_FAKE_MCP_LIST: fakeMcpList([]) });
+  assert.strictEqual(r.status, 0);
+  assert.doesNotMatch(r.stdout, SPLIT);
+});
+
+test('status (local) does NOT warn / crash when the connector probe fails', () => {
+  const { dir } = fixtureGraph();
+  // No SPOR_FAKE_MCP_LIST; an unresolvable claude cmd => spawn error => fail-open.
+  const r = run(['status'], { SPOR_HOME: dir, SPOR_CLAUDE_CMD: NO_CLAUDE });
   assert.strictEqual(r.status, 0); // fail-open
   assert.doesNotMatch(r.stdout, SPLIT);
 });
@@ -286,7 +296,7 @@ test('status (remote) does NOT warn of split-brain even with a Spor connector', 
     SPOR_HOME: home,
     SPOR_SERVER: 'http://127.0.0.1:9',
     SPOR_TOKEN: 'tok',
-    SPOR_FAKE_CLAUDE_JSON: fakeClaudeJson(['claude.ai Spor']),
+    SPOR_FAKE_MCP_LIST: fakeMcpList(['claude.ai Spor']),
   });
   assert.strictEqual(r.status, 0);
   assert.match(r.stdout, /mode:\s+remote/);
