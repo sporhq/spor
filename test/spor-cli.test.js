@@ -145,6 +145,48 @@ test('status (local) reports local mode and node count', () => {
   assert.match(r.stdout, /node:\s+\d+\.\d+\.\d+/);
 });
 
+// --- dead queue_mute observability on status (issue-spor-local-mode-queue-mute-noop)
+// A graph home that IS a git repo with a pinned user.email, carrying a person
+// node with a queue_mute. The note fires when the box identity binds to no
+// matching (muted) person; it stays quiet when the identity DOES bind to the muter.
+function muteStatusGraph(email) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-cli-mute-'));
+  const nodes = path.join(dir, 'nodes');
+  fs.mkdirSync(nodes, { recursive: true });
+  spawnSync('git', ['init', '-q', dir]);
+  spawnSync('git', ['-C', dir, 'config', 'user.email', email]);
+  spawnSync('git', ['-C', dir, 'config', 'user.name', 'Test']);
+  fs.writeFileSync(path.join(nodes, 'person-me.md'), `---\nid: person-me\ntype: person\ntitle: Me\nsummary: The muter person node.\nemail: me@test.dev\nqueue_mute: [repo-beta]\ndate: 2026-06-01\n---\nBody.\n`);
+  fs.writeFileSync(path.join(nodes, 'task-x.md'), `---\nid: task-x\ntype: task\nproject: repo-alpha\ntitle: A task\nsummary: A task for the mute-status test.\nstatus: open\ndate: 2026-06-01\n---\nBody.\n`);
+  return { dir, nodes };
+}
+
+test('status (local) NOTES a dead queue_mute when the git identity binds to no muter', () => {
+  // The box identity is some-other@test.dev, but the only queue_mute lives on
+  // person-me <me@test.dev> — so the mutes silently do nothing. Status says so.
+  const { dir } = muteStatusGraph('some-other@test.dev');
+  const r = run(['status'], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /note: queue_mute is set on a person node/);
+  assert.match(r.stdout, /some-other@test\.dev/);          // names the resolved identity
+  assert.match(r.stdout, /no matching person node/);
+  assert.match(r.stdout, /mutes are inactive/);
+});
+
+test('status (local) stays QUIET about mutes when the identity binds to the muter', () => {
+  const { dir } = muteStatusGraph('me@test.dev'); // binds to person-me, who holds the mute
+  const r = run(['status'], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 0);
+  assert.doesNotMatch(r.stdout, /queue_mute is set on a person node/);
+});
+
+test('status (local) does NOT emit the mute note when no person carries a queue_mute', () => {
+  const { dir } = fixtureGraph(); // only a decision node — no person, no mute
+  const r = run(['status'], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 0);
+  assert.doesNotMatch(r.stdout, /queue_mute is set/);
+});
+
 // --- Node prerequisite check (issue-spor-onboarding-no-node-silent-fail-open).
 // The version-check logic is a pure helper (no I/O), so it is unit-tested
 // directly via the bin/spor.js export seam — main() is guarded by require.main.
@@ -331,6 +373,73 @@ test('next (local) is byte-identical passthrough to lib/queue.js', () => {
   const viaCli = run(['next', '--nodes', nodes]);
   const viaLib = runLib('queue.js', ['--nodes', nodes]);
   assert.strictEqual(viaCli.stdout, viaLib.stdout);
+});
+
+// A scratch graph with two repo nodes + a task in each, for the --project scope
+// and zero-match-warning tests (issue-spor-next-project-token-not-roundtrippable,
+// task-spor-queue-default-project-config).
+function queueScopeGraph() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-cli-q-'));
+  const nodes = path.join(dir, 'nodes');
+  fs.mkdirSync(nodes, { recursive: true });
+  const w = (id, body) => fs.writeFileSync(path.join(nodes, `${id}.md`), body);
+  w('repo-alpha', `---\nid: repo-alpha\ntype: repo\nslugs: [alpha]\ntitle: Alpha\nsummary: Alpha repo node.\ndate: 2026-06-01\n---\nBody.\n`);
+  w('repo-beta', `---\nid: repo-beta\ntype: repo\nslugs: [beta]\ntitle: Beta\nsummary: Beta repo node.\ndate: 2026-06-01\n---\nBody.\n`);
+  w('task-alpha-1', `---\nid: task-alpha-1\ntype: task\nproject: repo-alpha\ntitle: Alpha task\nsummary: A task stamped to the alpha repo.\nstatus: open\ndate: 2026-06-01\n---\nBody.\n`);
+  w('task-beta-1', `---\nid: task-beta-1\ntype: task\nproject: repo-beta\ntitle: Beta task\nsummary: A task stamped to the beta repo.\nstatus: open\ndate: 2026-06-01\n---\nBody.\n`);
+  return { dir, nodes };
+}
+
+test('next (local) warns on stderr for an unknown --project token, still exits 0', () => {
+  // issue-spor-next-project-token-not-roundtrippable: an unmatched token used to
+  // silently yield count:0. It now warns on stderr and still fails open (exit 0).
+  const { nodes } = queueScopeGraph();
+  const r = run(['next', '--nodes', nodes, '--project', 'zzz-nonexistent']);
+  assert.strictEqual(r.status, 0, 'fail-open: still exits 0');
+  assert.match(r.stderr, /project 'zzz-nonexistent' matched no repo or grouping/);
+  assert.match(r.stderr, /repo-<slug> node id/); // names the valid forms
+  assert.match(r.stdout, /queue empty/);
+});
+
+test('next (local) does NOT warn for a known repo slug / repo id (0.4.x semantics intact)', () => {
+  const { nodes } = queueScopeGraph();
+  // a bare slug up-resolves (deliberate) and is KNOWN -> no warning, alpha only
+  const bySlug = run(['next', '--nodes', nodes, '--project', 'alpha']);
+  assert.strictEqual(bySlug.status, 0, bySlug.stderr);
+  assert.doesNotMatch(bySlug.stderr, /matched no repo or grouping/);
+  assert.match(bySlug.stdout, /task-alpha-1/);
+  assert.doesNotMatch(bySlug.stdout, /task-beta-1/);
+  // a repo NODE id pins the single repo -> known, no warning
+  const byId = run(['next', '--nodes', nodes, '--project', 'repo-beta']);
+  assert.doesNotMatch(byId.stderr, /matched no repo or grouping/);
+  assert.match(byId.stdout, /task-beta-1/);
+  assert.doesNotMatch(byId.stdout, /task-alpha-1/);
+});
+
+test('next (local) queue.project pins the default scope; explicit --project wins', () => {
+  // task-spor-queue-default-project-config: SPOR_QUEUE_PROJECT fills the default
+  // --project when none is given; an explicit flag overrides it.
+  const { nodes } = queueScopeGraph();
+  // pinned default scopes to alpha (no explicit flag)
+  const pinned = run(['next', '--nodes', nodes], { SPOR_QUEUE_PROJECT: 'alpha' });
+  assert.strictEqual(pinned.status, 0, pinned.stderr);
+  assert.match(pinned.stdout, /task-alpha-1/);
+  assert.doesNotMatch(pinned.stdout, /task-beta-1/);
+  // explicit --project beta beats the pinned alpha default
+  const explicit = run(['next', '--nodes', nodes, '--project', 'beta'], { SPOR_QUEUE_PROJECT: 'alpha' });
+  assert.match(explicit.stdout, /task-beta-1/);
+  assert.doesNotMatch(explicit.stdout, /task-alpha-1/);
+});
+
+test('next (local) with no pin and no --project is byte-identical to a bare passthrough', () => {
+  // The unset-default guarantee: a markerless local read injects nothing, so it
+  // matches lib/queue.js directly (no safeSlug() injected for local mode).
+  const { nodes } = queueScopeGraph();
+  const viaCli = run(['next', '--nodes', nodes]);
+  const viaLib = runLib('queue.js', ['--nodes', nodes]);
+  assert.strictEqual(viaCli.stdout, viaLib.stdout);
+  assert.match(viaCli.stdout, /task-alpha-1/);
+  assert.match(viaCli.stdout, /task-beta-1/); // unscoped firehose: both present
 });
 
 test('get (local) prints the node file; missing node exits 1', () => {
@@ -1008,4 +1117,61 @@ test('compile --query (remote) fails open with a clear OFFLINE line, no stack', 
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /offline/);
   assert.doesNotMatch(r.stderr, /at Object|Error:/);
+});
+
+// --- next (remote): queue.project default + best-effort zero-match note -------
+// task-spor-queue-default-project-config (pinned default reaches the server) and
+// issue-spor-next-project-token-not-roundtrippable (a SCOPED read that comes back
+// empty earns a soft stderr note; the cwd-default firehose does not).
+function queueStubServer() {
+  const http = require('node:http');
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    hits.push({ method: req.method, url: req.url, auth: req.headers.authorization });
+    const m = req.url.match(/^\/v1\/queue\?(.*)$/);
+    if (req.method === 'GET' && m) {
+      const qs = new URLSearchParams(m[1]);
+      const project = qs.get('project');
+      // 'empty-scope' returns nothing; anything else returns one item.
+      const items = project === 'empty-scope' ? [] : [{ id: 'task-a', score: 1, suggest: 'do', why: 'queueable and live' }];
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ items, count: items.length }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { code: 'not_found', message: 'no route' } }));
+  });
+  return new Promise((resolve) => srv.listen(0, '127.0.0.1', () =>
+    resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
+}
+
+test('next (remote) queue.project pins the scope sent to /v1/queue; explicit --project wins', async () => {
+  const { srv, hits, base } = await queueStubServer();
+  try {
+    // pinned default reaches the server when no explicit flag is given
+    const pinned = await runAsyncCli(['next'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-q', SPOR_QUEUE_PROJECT: 'proj-pin' });
+    assert.strictEqual(pinned.status, 0, pinned.stderr);
+    assert.ok(hits.some((h) => /project=proj-pin/.test(h.url)), 'pinned scope sent to the server');
+    // explicit --project beats the pinned default
+    const explicit = await runAsyncCli(['next', '--project', 'proj-flag'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-q', SPOR_QUEUE_PROJECT: 'proj-pin' });
+    assert.strictEqual(explicit.status, 0, explicit.stderr);
+    assert.ok(hits.some((h) => /project=proj-flag/.test(h.url)), 'explicit scope overrides the pin');
+  } finally {
+    srv.close();
+  }
+});
+
+test('next (remote) notes a scoped read that returns nothing; an unscoped firehose does not', async () => {
+  const { srv, base } = await queueStubServer();
+  try {
+    // a SCOPED read (explicit --project) that returns count:0 earns the soft note
+    const scoped = await runAsyncCli(['next', '--project', 'empty-scope'], { SPOR_SERVER: base, SPOR_TOKEN: 't' });
+    assert.strictEqual(scoped.status, 0, scoped.stderr);
+    assert.match(scoped.stderr, /project 'empty-scope' returned an empty queue/);
+    // a non-empty scoped read does NOT warn
+    const nonEmpty = await runAsyncCli(['next', '--project', 'proj-ok'], { SPOR_SERVER: base, SPOR_TOKEN: 't' });
+    assert.doesNotMatch(nonEmpty.stderr, /returned an empty queue/);
+  } finally {
+    srv.close();
+  }
 });

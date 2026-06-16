@@ -13,7 +13,7 @@ const os = require("os");
 const path = require("path");
 
 const graph = require(path.join(__dirname, "..", "lib", "graph.js"));
-const { rankQueue } = require(path.join(__dirname, "..", "lib", "queue.js"));
+const { rankQueue, viewerFor } = require(path.join(__dirname, "..", "lib", "queue.js"));
 
 function tmpGraph(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "substrate-test-"));
@@ -998,4 +998,120 @@ test("provenance: mixed blockers annotate only the cross-project one", () => {
   // blockers list in node-id sort order: task-ext then task-same.
   const why = rankQueue(g, { now: NOW }).items.find((i) => i.id === "task-mixed").why;
   assert.match(why, /blocked by task-ext \(other\), task-same — do the unblocker first/);
+});
+
+// ---------------- local viewer binding (issue-spor-local-mode-queue-mute-noop) ----------------
+// viewerFor resolves a git email to its person node so local mode can pass a
+// viewer into rankQueue — the LOCAL analogue of dec-viewer-token-binding (remote
+// derives $viewer from the token). Identity match is trim + case-insensitive on
+// the person node's `email:` field; no email / no match => null (mutes nothing).
+
+const VIEWER_PERSON = (id, email, extra = "") => [
+  `${id}.md`,
+  `---
+id: ${id}
+type: person
+title: Person ${id}
+summary: Person node for viewerFor tests.
+email: ${email}
+${extra}date: 2026-06-01
+---
+Body.
+`,
+];
+
+test("viewerFor: resolves a git email to its person node (case-insensitive, trimmed)", () => {
+  const g = tmpGraph(Object.fromEntries([
+    VIEWER_PERSON("person-me", "Me@Test.Dev"),
+    node("task-x", "task", { status: "open" }),
+  ])).load();
+  assert.equal(viewerFor(g, "me@test.dev").id, "person-me", "case-insensitive match");
+  assert.equal(viewerFor(g, "  me@test.dev  ").id, "person-me", "whitespace trimmed both sides");
+  assert.equal(viewerFor(g, "nobody@test.dev"), null, "no match -> null");
+  assert.equal(viewerFor(g, ""), null, "empty email -> null");
+  assert.equal(viewerFor(g, null), null, "no email -> null");
+});
+
+test("viewerFor: the resolved viewer drives queue_mute end to end (the wiring the bug missed)", () => {
+  const g = tmpGraph(Object.fromEntries([
+    VIEWER_PERSON("person-me", "me@test.dev", "queue_mute: [repo-beta]\n"),
+    node("task-alpha", "task", { status: "open", project: "repo-alpha" }),
+    node("task-beta", "task", { status: "open", project: "repo-beta" }),
+  ])).load();
+  // bound viewer -> beta is hidden + counted; an unbound identity mutes nothing.
+  const bound = rankQueue(g, { now: NOW, viewer: viewerFor(g, "me@test.dev") });
+  assert.deepEqual(bound.items.map((i) => i.id), ["task-alpha"]);
+  assert.equal(bound.muted, 1);
+  const unbound = rankQueue(g, { now: NOW, viewer: viewerFor(g, "someone-else@test.dev") });
+  assert.deepEqual(unbound.items.map((i) => i.id).sort(), ["task-alpha", "task-beta"]);
+  assert.equal(unbound.muted, undefined);
+});
+
+test("viewerFor: a graph with no person nodes resolves to null (byte-identical no-viewer read)", () => {
+  const g = tmpGraph(Object.fromEntries([node("task-x", "task", { status: "open" })])).load();
+  assert.equal(viewerFor(g, "anyone@test.dev"), null);
+});
+
+// ---------------- projectKnown (issue-spor-next-project-token-not-roundtrippable) ----------------
+// A `--project` token is KNOWN when it names a node id, a repo slug alias, or a
+// grouping member/own key; UNKNOWN is scopeFor's fall-back-to-itself case that
+// silently yields count:0. The deliberate bare-slug -> grouping up-resolution
+// stays KNOWN (dec-spor-queue-slug-resolves-to-grouping is untouched).
+
+test("projectKnown: an empty/falsy token is known (the global unscoped read never warns)", () => {
+  const g = tmpGraph(Object.fromEntries([node("task-x", "task", { status: "open" })])).load();
+  assert.equal(graph.projectKnown(g, null), true);
+  assert.equal(graph.projectKnown(g, ""), true);
+  assert.equal(graph.projectKnown(g, undefined), true);
+});
+
+test("projectKnown: a repo node id, its slug alias, and a grouping id are all known", () => {
+  const g = tmpGraph(Object.fromEntries([
+    ["repo-svc.md", `---
+id: repo-svc
+type: repo
+title: Service repo
+summary: A repo node grouped under a project for the projectKnown test.
+slugs: [svc, service]
+date: 2026-06-01
+edges:
+  - {type: grouped-under, to: proj-product}
+---
+Body.
+`],
+    ["proj-product.md", `---
+id: proj-product
+type: project
+title: The product grouping
+summary: A grouping above repos for the projectKnown test.
+date: 2026-06-01
+---
+Body.
+`],
+    node("task-x", "task", { status: "open", project: "repo-svc" }),
+  ])).load();
+  assert.equal(graph.projectKnown(g, "repo-svc"), true, "repo node id");
+  assert.equal(graph.projectKnown(g, "svc"), true, "primary slug alias");
+  assert.equal(graph.projectKnown(g, "service"), true, "secondary slug alias");
+  assert.equal(graph.projectKnown(g, "proj-product"), true, "grouping id");
+  assert.equal(graph.projectKnown(g, "zzz-nonexistent"), false, "an unknown token is not known");
+});
+
+test("projectKnown: an ungrouped repo slug is known (single-repo fall-through), a typo is not", () => {
+  const g = tmpGraph(Object.fromEntries([
+    ["repo-solo.md", `---
+id: repo-solo
+type: repo
+title: Solo repo
+summary: An ungrouped repo node for the projectKnown fall-through test.
+slugs: [solo]
+date: 2026-06-01
+---
+Body.
+`],
+    node("task-x", "task", { status: "open", project: "repo-solo" }),
+  ])).load();
+  assert.equal(graph.projectKnown(g, "repo-solo"), true);
+  assert.equal(graph.projectKnown(g, "solo"), true);
+  assert.equal(graph.projectKnown(g, "sol"), false, "a near-miss typo is unknown");
 });

@@ -187,6 +187,33 @@ test('queue.front: structural defaults, env override, and disable convention', (
   assert.strictEqual(cr.getBool('queue.front.enabled', true), true); // still the default
 });
 
+test('queue.project: resolves through env, legacy SUBSTRATE_*, and .spor.json; absent => caller fallback', () => {
+  // task-spor-queue-default-project-config: a default --project scope for `spor
+  // next` (both modes). Lives under the already-known `queue` key, so no DEFAULTS
+  // entry and no warning; absent it resolves to the caller's fallback (the prior
+  // behavior). An explicit --project still wins at the CLI; this is only the gap-fill.
+  const dir = tmp();
+  const cd = loadConfig({ cwd: dir, env: bareEnv({ SPOR_HOME: dir }) });
+  assert.strictEqual(cd.get('queue.project', null), null); // absent: caller's fallback
+  assert.deepStrictEqual(cd.warnings, []); // `queue` is a known key
+  // env override (SPOR_QUEUE_PROJECT, sits above the files)
+  const ce = loadConfig({ cwd: dir, env: bareEnv({ SPOR_HOME: dir, SPOR_QUEUE_PROJECT: 'proj-x' }) });
+  assert.strictEqual(ce.get('queue.project', null), 'proj-x');
+  // legacy SUBSTRATE_* spelling is honored too (dual-read)
+  const cs = loadConfig({ cwd: dir, env: bareEnv({ SPOR_HOME: dir, SUBSTRATE_QUEUE_PROJECT: 'proj-legacy' }) });
+  assert.strictEqual(cs.get('queue.project', null), 'proj-legacy');
+  // repo .spor.json sits below env, above defaults
+  write(path.join(dir, '.spor.json'), { queue: { project: 'proj-repo' } });
+  const cr = loadConfig({ cwd: dir, env: bareEnv({ SPOR_HOME: dir }) });
+  assert.strictEqual(cr.get('queue.project', null), 'proj-repo');
+  assert.deepStrictEqual(cr.warnings, []); // still a known key, no warning
+  // env still wins over the repo file
+  const cre = loadConfig({ cwd: dir, env: bareEnv({ SPOR_HOME: dir, SPOR_QUEUE_PROJECT: 'proj-env' }) });
+  assert.strictEqual(cre.get('queue.project', null), 'proj-env');
+  // it coexists with queue.front — the `queue` object merges, not replaces
+  assert.strictEqual(cr.getBool('queue.front.enabled', true), true);
+});
+
 test('unknown top-level key earns a warning but is otherwise ignored', () => {
   const root = tmp();
   write(path.join(root, '.spor.json'), { searhc: { minSim: 0.5 }, enabled: true });
