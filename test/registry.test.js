@@ -333,6 +333,10 @@ test("seed pack: edge weights match the historic EDGE_WEIGHTS table exactly", ()
     // reviewed-by/changes-requested-by carry a real verdict (0.5), an open
     // review-requested is routing wiring like routed-to (0.3).
     "reviewed-by": 0.5, "changes-requested-by": 0.5, "review-requested": 0.3,
+    // Agent identity (dec-spor-agent-identity-nodes) added the ownership edge:
+    // an agent is owned-by its person. Structural identity binding, not work
+    // dependency — same low weight as grouped-under (0.3).
+    "owned-by": 0.3,
   });
   // provenance-only edges are known but unweighted (historic ?? 0.3 default)
   assert.equal(reg.isKnownEdge("compiled-for"), true);
@@ -356,6 +360,13 @@ test("seed pack: node types, prefixes, ride-along, and traversal match GRAPH.md"
   assert.equal(reg.isKnownType("project"), true);
   assert.deepEqual(reg.prefixesFor("repo"), ["repo-"]);
   assert.deepEqual(reg.prefixesFor("project"), ["proj-"]);
+  // Agent identity (dec-spor-agent-identity-nodes): a person-owned automation
+  // principal, prefix agent-. Created deliberately (spor agent create), never
+  // from a capture — capturable: false, like person/repo/workflow-run.
+  assert.equal(reg.isKnownType("agent"), true);
+  assert.deepEqual(reg.prefixesFor("agent"), ["agent-"]);
+  assert.equal(reg.isCapturableType("agent"), false);
+  assert.equal(reg.isCapturableEdge("owned-by"), false);
   assert.equal(reg.isAlwaysOn("norm"), true);
   assert.equal(reg.isAlwaysOn("decision"), false);
   assert.equal(reg.isTraversable("briefing"), false);

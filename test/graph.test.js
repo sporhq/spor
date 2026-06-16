@@ -844,6 +844,73 @@ b
   assert.ok(r.errors.some((e) => /correction without target/.test(e)));
 });
 
+// ---------- agent identity (dec-spor-agent-identity-nodes) ----------
+
+test("validateNode: accepts an agent node with spiffe/pubkey/status + owned-by edge", () => {
+  // The seed `agent` type (prefix agent-) carries forward-compat spiffe:/pubkey:
+  // scalars (pubkey may be empty), status: active, and an owned-by edge to its
+  // person — all in regex-parser-supported forms (folded scalars, `- {type,to}`
+  // edges). The frontmatter parser handles them and validateNode passes.
+  const node = graph.parseFrontmatter(`---
+id: agent-anthony-laptop
+type: agent
+title: Anthony's laptop agent
+summary: Dispatched-session principal on Anthony's laptop; owned by person-anthony.
+spiffe: spiffe://spor.sporhq/person/person-anthony/agent/anthony-laptop
+pubkey: ""
+status: active
+date: 2026-06-16
+edges:
+  - {type: owned-by, to: person-anthony}
+---
+b
+`, "agent-anthony-laptop.md");
+  assert.equal(node.type, "agent");
+  assert.equal(node.pubkey, "");
+  assert.equal(node.status, "active");
+  assert.deepEqual(node.edges, [{ type: "owned-by", to: "person-anthony" }]);
+  const r = graph.validateNode(null, node);
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.errors, []);
+});
+
+test("validateGraph: person + agent + owned-by edge lints clean (zero errors/warnings)", () => {
+  const fx = tmpGraph({
+    "person-anthony.md": `---
+id: person-anthony
+type: person
+title: Anthony Allen
+summary: Maintainer; owner of the laptop agent.
+email: losthammer@gmail.com
+date: 2026-06-16
+---
+b
+`,
+    "agent-anthony-laptop.md": `---
+id: agent-anthony-laptop
+type: agent
+title: Anthony's laptop agent
+summary: Dispatched-session principal; owned by person-anthony.
+spiffe: spiffe://spor.sporhq/person/person-anthony/agent/anthony-laptop
+pubkey: ""
+status: active
+date: 2026-06-16
+edges:
+  - {type: owned-by, to: person-anthony}
+---
+b
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.deepEqual(v.errors, []);
+  assert.deepEqual(v.warnings, [], "agent type and owned-by edge are known to the seed registry");
+  assert.equal(v.count, 2);
+  // the owned-by edge resolves at the seed weight (structural identity, 0.3)
+  const reg = graph.seedRegistry();
+  assert.equal(reg.edgeWeight("owned-by"), 0.3);
+  assert.equal(reg.edgeInverses()["owns"], "owned-by", "owns reads back as owned-by");
+});
+
 // ---------- validateGraph ----------
 
 test("validateGraph: clean graph reports zero errors", () => {

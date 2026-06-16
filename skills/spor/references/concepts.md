@@ -23,6 +23,7 @@ the decision queue (QUEUE.md §4).
 | correction | `corr-` | a standing fix to a briefing (pin/exclude/guidance) | `traversable: false`; applied at every future compile of its target |
 | question | `question-` | a routed ask the graph couldn't answer | queueable; status `open`/`answered`; joins the queue until answered |
 | person | `person-` | an org member | anchor for `$viewer` binding and question routing |
+| agent | `agent-` | a person-owned automation principal | a dispatched session's durable identity; owned by a person via `owned-by`; `capturable: false`; carries forward-compat `spiffe:`/`pubkey:` |
 | capture-pending | `cap-` | raw captured text that fit no schema | born status-less; closes only as `merged` or `rejected` |
 | finding | `find-` | a gardener observation (stale anchor, cold work) | filed as a queue item |
 | repo | `repo-` | a durable git-repo identity | carries `slugs:` aliases + `fingerprints:`; heals renames at read time; optional `tags:` are the match key for a norm's `applies_to_tags` |
@@ -55,6 +56,7 @@ are same-direction synonyms renamed at write time.
 | mentions | 0.5 | weakest association | — |
 | stewards | 0.4 | this person stewards the target area/spec/norm | question-routing key |
 | grouped-under | 0.3 | this repo's home project grouping (structural) | inverse `groups` |
+| owned-by | 0.3 | this agent is owned by that person (structural identity) | inverse `owns` |
 | routed-to | 0.3 | this question is routed to that person | — |
 | compiled-for | — | briefing → the task/query it was compiled for | provenance only |
 | shaped-by | — | briefing → the corrections that shaped it | provenance only |
@@ -62,7 +64,7 @@ are same-direction synonyms renamed at write time.
 **Ride-along flags** (set in a schema's JSON payload):
 - `always_on: true` (norm) — injected into every project-relevant compile.
 - `traversable: false` (briefing, correction) — excluded from lineage walks.
-- `capturable: false` (briefing, workflow-run) — never produced by capture.
+- `capturable: false` (briefing, workflow-run, agent) — never produced by capture.
 
 An `always_on` norm rides along project-wide by default, but that scope is the
 whole home-project **grouping** — so under a project that spans heterogeneous
