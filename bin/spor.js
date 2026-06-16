@@ -1084,26 +1084,19 @@ async function cmdAgentCreateLocal(cfg, { label, owner, pubkey }) {
   return 0;
 }
 
-// List agent nodes. Remote: project the audit trail (/v1/changes, which carries
-// each node's type/id/title) and keep the type:agent rows; local: scan the graph
-// home. There is no dedicated node-type list route in the contract, and /v1/changes
-// is the read every remote client already has — newest change per node first, so
-// the first row per id is the live one. Fail-soft on any read error.
+// List agent nodes. Remote: GET /v1/agents (the caller's owned agents — the
+// dedicated route). If that surface isn't deployed (404), fall back to projecting
+// the /v1/changes audit trail and keeping the type:agent rows (newest change per
+// node first, so the first row per id is the live one). Local: scan the graph
+// home. Fail-soft on any read error.
 async function cmdAgentListRemote(cfg) {
-  const q = await remote.get(cfg, "/v1/changes?limit=500", { timeoutMs: 6000 });
-  if (q.transport) {
-    err(`offline — could not reach server (${q.error})`);
+  const a = await remote.get(cfg, "/v1/agents", { timeoutMs: 6000 });
+  if (a.transport) {
+    err(`offline — could not reach server (${a.error})`);
     return 1;
   }
-  if (q.ok && q.json && Array.isArray(q.json.changes)) {
-    const seen = new Set();
-    const rows = [];
-    for (const c of q.json.changes) {
-      if (!c || c.type !== "agent" || c.change === "deleted") continue;
-      if (seen.has(c.id)) continue; // first (newest) wins
-      seen.add(c.id);
-      rows.push(`${c.id}\t${c.title || ""}`);
-    }
+  if (a.ok && a.json && Array.isArray(a.json.agents)) {
+    const rows = a.json.agents.map((ag) => `${ag.id}\t${ag.owner ? `owned-by ${ag.owner}` : (ag.title || "")}\t${ag.status || "active"}`);
     if (!rows.length) {
       out("no agents yet — create one with 'spor agent create <label>'");
       return 0;
@@ -1111,7 +1104,28 @@ async function cmdAgentListRemote(cfg) {
     rows.forEach((l) => out(l));
     return 0;
   }
-  err("could not list agents from this server (no /v1/changes audit route).");
+  // /v1/agents not deployed yet — degrade to the audit-trail projection, which
+  // every remote client already has.
+  if (a.status === 404) {
+    const q = await remote.get(cfg, "/v1/changes?limit=500", { timeoutMs: 6000 });
+    if (q.ok && q.json && Array.isArray(q.json.changes)) {
+      const seen = new Set();
+      const rows = [];
+      for (const c of q.json.changes) {
+        if (!c || c.type !== "agent" || c.change === "deleted") continue;
+        if (seen.has(c.id)) continue; // first (newest) wins
+        seen.add(c.id);
+        rows.push(`${c.id}\t${c.title || ""}`);
+      }
+      if (!rows.length) {
+        out("no agents yet — create one with 'spor agent create <label>'");
+        return 0;
+      }
+      rows.forEach((l) => out(l));
+      return 0;
+    }
+  }
+  err("could not list agents from this server (no /v1/agents or /v1/changes route).");
   err("  list them in local mode against a checkout, or upgrade the server.");
   return 1;
 }
@@ -2106,16 +2120,19 @@ function dispatchAgentId(cfg) {
 
 // Mint a per-session agent-scoped token (dec-spor-session-identity-active-record):
 // carries the agent (spiffe sub), the person (RFC 8693 act.sub), and the session
-// id; audience-restricted, short TTL — the server is the CA. REMOTE only. Returns
-// { ok, token } on success, { absent:true } when the server has no mint surface
-// yet (the spor-server stream is building it — fail soft, dispatch without
-// agent-scoping), or { error } on any other failure (also fail soft).
+// id; audience-restricted, short TTL — the server is the CA. SELF-SERVE and
+// OWNERSHIP-gated, NOT admin-gated: POST /v1/agents/{id}/token authenticated with
+// the dispatcher's normal person token (SPOR_TOKEN); the server checks the caller
+// OWNS agent {id} (the owned-by edge) — so a normal teammate can mint a token for
+// their own machine's agent without being an admin. REMOTE only. Returns
+// { ok, token } on success, { absent:true } when the mint surface isn't deployed
+// yet (404 — the spor-server stream is building it; fail soft, dispatch without
+// agent-scoping), or { error } on any other failure incl. 403/owner-mismatch
+// (also fail soft — warn and dispatch person-scoped, never block).
 async function mintAgentToken(cfg, { agent, session }) {
-  const r = await remote.post(cfg, "/v1/admin/tokens", { agent, session }, { timeoutMs: 6000 });
+  const r = await remote.post(cfg, `/v1/agents/${encodeURIComponent(agent)}/token`, { session }, { timeoutMs: 6000 });
   if (r.transport) return { error: r.error };
-  // 404 (no route) or a 422 the server raises for the unrecognized agent/session
-  // fields on an old token-mint => the agent-scoped mint isn't deployed. Treat as
-  // absent so dispatch falls back cleanly instead of erroring.
+  // 404 = no route (surface not deployed) => absent, dispatch falls back cleanly.
   if (r.status === 404) return { absent: true };
   if (!r.ok) return { error: `HTTP ${r.status}${r.json && r.json.error && r.json.error.code ? ` (${r.json.error.code})` : ""}` };
   const token = r.json && (r.json.token || r.json.access_token);

@@ -151,9 +151,11 @@ test("agent: usage on a bad subcommand / missing label", () => {
 // 2. spor agent create (remote) — fail-soft when the endpoint is absent
 // ===========================================================================
 
-// Stub server answering /v1/me, a configurable /v1/admin/agents, and a
-// /v1/changes audit projection (so `agent list` has something to read).
-function agentStub({ agentsStatus = 201, agentsBody = null, changes = null } = {}) {
+// Stub server answering /v1/me, a configurable /v1/admin/agents, and the agent
+// list surface. `agentsList` (when set) serves GET /v1/agents; otherwise that
+// route 404s and the client falls back to the /v1/changes audit projection
+// (served when `changes` is set), exercising both list paths.
+function agentStub({ agentsStatus = 201, agentsBody = null, agentsList = null, changes = null } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = "";
@@ -163,7 +165,11 @@ function agentStub({ agentsStatus = 201, agentsBody = null, changes = null } = {
       const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
       if (req.url === "/v1/me") return j(200, { person: "person-anthony", email: "a@x.io", bound: true, is_admin: true });
       if (req.url === "/v1/admin/agents" && req.method === "POST") {
-        return j(agentsStatus, agentsBody || { id: "agent-anthony-laptop", owner: "person-anthony", spiffe: "spiffe://spor.acme/person/anthony/agent/anthony-laptop" });
+        return j(agentsStatus, agentsBody || { id: "agent-anthony-laptop", owner: "person-anthony", spiffe: "spiffe://spor.acme/person/anthony/agent/anthony-laptop", status: "active", revision: "r1" });
+      }
+      if (req.url === "/v1/agents" && req.method === "GET") {
+        if (agentsList) return j(200, { agents: agentsList });
+        return j(404, { error: { code: "not_found" } }); // surface not deployed
       }
       if (req.url.startsWith("/v1/changes")) {
         return j(200, { changes: changes || [
@@ -207,9 +213,22 @@ test("agent create (remote): a server without the endpoint (404) fails soft, not
   }
 });
 
-test("agent list (remote): projects /v1/changes and keeps only the type:agent rows", { skip: isWin }, async () => {
+test("agent list (remote): reads GET /v1/agents (the caller's owned agents)", { skip: isWin }, async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-rem3-"));
-  const { srv, base } = await agentStub({});
+  const { srv, hits, base } = await agentStub({ agentsList: [{ id: "agent-anthony-laptop", owner: "person-anthony", status: "active" }] });
+  try {
+    const r = await runAsync(["agent", "list"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /agent-anthony-laptop\towned-by person-anthony\tactive/);
+    assert.ok(hits.some((h) => h.url === "/v1/agents" && h.method === "GET"), "GET /v1/agents");
+  } finally {
+    srv.close();
+  }
+});
+
+test("agent list (remote): falls back to the /v1/changes projection when /v1/agents 404s", { skip: isWin }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-rem3b-"));
+  const { srv, base } = await agentStub({}); // agentsList unset => /v1/agents 404 => /v1/changes
   try {
     const r = await runAsync(["agent", "list"], remoteEnv(home, base));
     assert.strictEqual(r.status, 0, r.stderr);
@@ -233,7 +252,9 @@ function argvStub(dir, outFile) {
 }
 
 // Stub server: /v1/me, GET /v1/nodes/{id}, POST /v1/nodes/{id}/claim (records
-// the session it received), POST /v1/admin/tokens (configurable mint surface).
+// the session it received), and the SELF-SERVE owner-gated per-session mint
+// POST /v1/agents/{id}/token (configurable status; records the agent {id} in the
+// path + the session in the body).
 function dispatchStub({ mintStatus = 201, mintBody = null } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
@@ -250,9 +271,11 @@ function dispatchStub({ mintStatus = 201, mintBody = null } = {}) {
       if (req.method === "POST" && /^\/v1\/nodes\/[^/]+\/claim$/.test(req.url)) {
         return j(200, { ok: true, status: "claimed", lease: { by: "person-anthony", session: JSON.parse(body || "{}").session || null } });
       }
-      if (req.url === "/v1/admin/tokens" && req.method === "POST") {
+      const mintMatch = req.method === "POST" && req.url.match(/^\/v1\/agents\/([^/]+)\/token$/);
+      if (mintMatch) {
+        const agent = decodeURIComponent(mintMatch[1]);
         const p = JSON.parse(body || "{}");
-        return j(mintStatus, mintBody || { token: `agtok_${(p.session || "").slice(0, 8)}`, agent: p.agent, session: p.session });
+        return j(mintStatus, mintBody || { token: `agtok_${(p.session || "").slice(0, 8)}`, agent, session: p.session, expires_at: "2026-06-16T23:59:59Z" });
       }
       return j(404, { error: { code: "not_found" } });
     });
@@ -320,9 +343,12 @@ test("dispatch (remote, real): mints a token, writes a 0600 mcp-config, assemble
     assert.match(conf.mcpServers.spor.url, /\/mcp$/);
     assert.match(conf.mcpServers.spor.headers.Authorization, /^Bearer agtok_/);
 
-    // the mint carried agent + session; the claim was session-bound to the uuid
-    const mint = hits.find((h) => h.url === "/v1/admin/tokens" && h.method === "POST");
-    assert.deepStrictEqual(JSON.parse(mint.body), { agent: "agent-anthony-laptop", session: SID });
+    // the mint hit the self-serve owner-gated route (agent in the path, session
+    // in the body); the claim was session-bound to the uuid
+    const mint = hits.find((h) => h.url === "/v1/agents/agent-anthony-laptop/token" && h.method === "POST");
+    assert.ok(mint, "POSTed to /v1/agents/{id}/token (self-serve, not the admin route)");
+    assert.deepStrictEqual(JSON.parse(mint.body), { session: SID });
+    assert.ok(!hits.some((h) => h.url === "/v1/admin/tokens"), "did NOT use the admin token route");
     const claim = hits.find((h) => /\/claim$/.test(h.url) && h.method === "POST");
     assert.strictEqual(JSON.parse(claim.body).session, SID, "claim is session-bound");
   } finally {
@@ -347,6 +373,26 @@ test("dispatch (remote, real): mint endpoint absent (404) => fails soft, person-
     assert.ok(!argv.includes("--mcp-config"), "no mcp-config when mint is absent");
     assert.ok(!argv.includes("--strict-mcp-config"), "no strict flag when mint is absent");
     assert.ok(!fs.existsSync(path.join(home, "outbox", "dispatch")), "no mcp-config file written");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch (remote, real): mint 403 (caller doesn't own the agent) => fails soft, person-scoped", { skip: isWin }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d4-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d4r-"));
+  const outFile = path.join(home, "argv.out");
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "agent-not-mine" } }) + "\n");
+  const stub = argvStub(home, outFile);
+  const { srv, base } = await dispatchStub({ mintStatus: 403, mintBody: { error: { code: "forbidden", message: "not the owner" } } });
+  try {
+    const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stderr, /could not mint an agent token .* dispatching person-scoped/);
+    const argv = fs.readFileSync(outFile, "utf8").split("\n").slice(1);
+    assert.ok(argv.includes("--session-id"), "session still forced");
+    assert.ok(!argv.includes("--mcp-config"), "no agent-scoping on an owner-mismatch");
   } finally {
     srv.close();
   }
