@@ -99,17 +99,30 @@ re-dispatches a task an agent is already doing. This is **presentation-only and
 Claude-Code-only**: the `my_queue` / `GET /v1/queue` server surface cannot see
 local background agents, so the cross-reference happens here, at present time.
 Best-effort — if the `claude` binary is absent or errors (e.g. in Cowork or a
-plain shell), skip it silently and present the queue as usual.
+plain shell), it is skipped silently and the queue presents as usual.
+
+**The `spor next` CLI does this cross-reference for you**
+(task-spor-cli-in-flight-surface). `spor next --json` (or
+`node "$SPOR_ROOT/bin/spor.js" next --json`, which carries the flag where the
+bare `lib/queue.js --json` does not) stamps each item with an `in_flight`
+boolean — and a `dispatched` summary (`{id, name, state, status, cwd}`) on the
+in-flight ones — by matching live background agents to node ids. Add
+`--hide-dispatched` to drop the in-flight items entirely (it reports a
+`hidden_dispatched` count, never silently). Prefer reading that flag over
+shelling out yourself.
+
+Under the hood (and what to do when you only have the raw `lib/queue.js --json`
+or `GET /v1/queue` output, which don't carry the flag):
 
 ```bash
 claude agents --json 2>/dev/null   # array of {name, kind, state, cwd, ...}
 ```
 
-Treat a queue item as **in flight** when a `kind: "background"` agent has
-`name` equal to the item's id and `state` is not `"done"` (e.g. `working`). For
-those items: badge them "🤖 agent dispatched — in progress" and keep them OUT of
-the top "pick this next" recommendation (the work is already moving; surfacing
-it invites duplication). Mention them so the human can still choose to look —
+A queue item is **in flight** when a `kind: "background"` agent has `name`
+equal to the item's id and `state` is not `"done"` (e.g. `working`). For those
+items: badge them "🤖 agent dispatched — in progress" and keep them OUT of the
+top "pick this next" recommendation (the work is already moving; surfacing it
+invites duplication). Mention them so the human can still choose to look —
 counted, never silently dropped, the same discipline the queue uses for mutes
 and leases. Items with no matching live agent are presented normally.
 
