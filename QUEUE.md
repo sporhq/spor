@@ -306,15 +306,25 @@ approvals from qualified roles: `view.approvals` is the node's
 The enabling hook (`view.actor`) shipped with the floor, so this was net-new
 policy-kind work, not core surgery (GRAPH.md "The org-defined policy layer").
 
+**Review as a graph object** (review-as-graph-object, Stage 3) supplies the
+edges the gate counts. The seed pack ships three review-outcome edge types
+(work node → `person`): `review-requested` (a review is pending of that
+person), `reviewed-by` (they approved — what `view.approvals` carries and the
+quorum counts), and `changes-requested-by` (they asked for changes — carried
+separately as `view.changes_requested`, never an approval). A single edge
+flips type in place across the lifecycle. An open `review-requested` edge
+surfaces the node in that reviewer's `my_queue` `reviews` set, through the same
+per-person routing filter questions and findings use — reviewer *selection* at
+request time and quorum *enforcement* at gate time are distinct points.
+
 Still on the layer's roadmap, beyond the quorum gate: the agent-vs-human
 claim-eligibility promoted-set (task-cc-claim-eligibility-policy), the
 queue-blend override absorbed as a `policy` rather than the separate
-`queue-policy` singleton (task-cc-schema-queue-policy-override), the seed
-`reviewed-by`/`approved-by` edge types + a native review surface
-(review-as-graph-object, Stage 3, which supplies the approval edges the quorum
-gate counts), and a fuller governs-traversal that walks the project/path
-hierarchy via `governs`/`governed-by` edges rather than matching the flat
-`governs.{types,projects}` scope.
+`queue-policy` singleton (task-cc-schema-queue-policy-override), the GitHub
+review/merge reflection adapter that writes these same edges from PR events
+(task-spor-github-review-adapter, Stage 4), and a fuller governs-traversal that
+walks the project/path hierarchy via `governs`/`governed-by` edges rather than
+matching the flat `governs.{types,projects}` scope.
 
 ## 3. The capture flow, end to end
 

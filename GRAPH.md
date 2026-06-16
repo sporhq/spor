@@ -169,9 +169,13 @@ least two — the definition-of-done quorum gate.
   excluded (the self-approval floor — a policy can't be used to launder it).
   The first concrete rule is the **definition-of-done quorum gate**: a work
   node's `done` transition additionally requires a quorum of approvals from
-  qualified roles. (The `reviewed-by`/`approved-by` edge types and a native
-  review surface ship with review-as-graph-object; the policy kind, scope
-  selection, and the gate AND are landed now.)
+  qualified roles. The `review-requested`/`reviewed-by`/`changes-requested-by`
+  edge types ship in the seed pack (review-as-graph-object); a single edge
+  flips type in place across the review lifecycle, `reviewed-by` is what the
+  quorum counts, and an open `review-requested` edge surfaces the node in the
+  named reviewer's queue. The gate context also carries `view.changes_requested`
+  (the `changes-requested-by` edges, same author-excluded shape) so a policy
+  may block `done` while a qualified reviewer's change request is outstanding.
 - **Policy nodes go through the same proposal/activation flow they govern** —
   a proposed policy is inert until a *different* identity activates it (the
   native floor protects against self-amendment circularity).
@@ -564,11 +568,14 @@ server-side (issue-cc-onboarding-email-mismatch-silent-degradation).
 | `blocks`         | 0.7    | target cannot proceed until this node does       |
 | `answers`        | 0.7    | this node answers that question (inverse `answered-by`); pulls the answer through the asker's next compile |
 | `assigned`       | 0.5    | work is assigned to this person                  |
+| `reviewed-by`    | 0.5    | this person reviewed and approved the node — counts toward a policy quorum |
+| `changes-requested-by` | 0.5 | this person reviewed the node and requested changes — not an approval |
 | `relates-to`     | 0.5    | weak association                                 |
 | `mentions`       | 0.5    | weakest association                              |
 | `stewards`       | 0.4    | this person stewards an area/spec/norm — the Tier-2 question-routing key |
 | `grouped-under`  | 0.3    | this repo's home project grouping (inverse `groups`); structural membership, not work dependency |
 | `routed-to`      | 0.3    | a question routed to this person for answering   |
+| `review-requested` | 0.3  | a review of this node is requested of this person (pending) — surfaces in their queue |
 | `compiled-for`   | —      | briefing → its task/query (provenance only)      |
 | `shaped-by`      | —      | briefing → corrections applied (provenance only) |
 
@@ -578,6 +585,16 @@ documented under "People, routing, and onboarding" above. `assigned` and
 `routed-to` point at a `person-` node; `stewards` points from a person to
 the area they own; `answers` points from any answer node back at the
 `question-` it resolves.
+
+`review-requested`, `reviewed-by`, and `changes-requested-by` are the
+review-as-graph-object edges (a work node → a `person-`): a single edge that
+flips type in place across the review lifecycle — `review-requested` while a
+reviewer's verdict is pending (surfaced into their queue), `reviewed-by` once
+they approve (counted by the definition-of-done quorum gate), or
+`changes-requested-by` once they ask for changes. They are the canonical,
+source-blind record a native review surface and the GitHub adapter both write;
+a review *node* is deferred to when Spor owns the thread
+(dec-spor-definition-of-done-org-policy).
 
 High-weight edges decay slowly across hops; they are what makes structural
 traversal beat similarity search. Prefer one precise high-weight edge over
