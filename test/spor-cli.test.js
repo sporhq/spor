@@ -442,6 +442,46 @@ test('next (local) with no pin and no --project is byte-identical to a bare pass
   assert.match(viaCli.stdout, /task-beta-1/); // unscoped firehose: both present
 });
 
+// node-type filter + cross-project firehose (task-cc-queue-filtering-enhancements)
+function queueTypeGraph() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-cli-qt-'));
+  const nodes = path.join(dir, 'nodes');
+  fs.mkdirSync(nodes, { recursive: true });
+  const w = (id, body) => fs.writeFileSync(path.join(nodes, `${id}.md`), body);
+  w('task-1', `---\nid: task-1\ntype: task\nproject: demo\ntitle: A task\nsummary: A queueable task for the type-filter CLI test.\nstatus: open\ndate: 2026-06-01\n---\nBody.\n`);
+  w('issue-1', `---\nid: issue-1\ntype: issue\nproject: demo\ntitle: An issue\nsummary: A queueable issue for the type-filter CLI test.\nstatus: open\ndate: 2026-06-01\n---\nBody.\n`);
+  w('cap-2026-06-10-1', `---\nid: cap-2026-06-10-1\ntype: capture-pending\nproject: demo\ntitle: A pending capture\nsummary: A queueable capture-pending for the type-filter CLI test.\ndate: 2026-06-10\n---\nBody.\n`);
+  return { dir, nodes };
+}
+
+test('next (local) --type whitelists node types, --exclude-type blacklists them', () => {
+  const { nodes } = queueTypeGraph();
+  const incl = run(['next', '--nodes', nodes, '--type', 'task,issue']);
+  assert.strictEqual(incl.status, 0, incl.stderr);
+  assert.match(incl.stdout, /task-1/);
+  assert.match(incl.stdout, /issue-1/);
+  assert.doesNotMatch(incl.stdout, /cap-2026-06-10-1/);
+  const excl = run(['next', '--nodes', nodes, '--exclude-type', 'capture-pending']);
+  assert.match(excl.stdout, /task-1/);
+  assert.doesNotMatch(excl.stdout, /cap-2026-06-10-1/);
+});
+
+test('next (local) --type forwards through to lib/queue.js (byte-identical)', () => {
+  const { nodes } = queueTypeGraph();
+  const viaCli = run(['next', '--nodes', nodes, '--type', 'task']);
+  const viaLib = runLib('queue.js', ['--nodes', nodes, '--type', 'task']);
+  assert.strictEqual(viaCli.stdout, viaLib.stdout);
+});
+
+test('next (local) --all-projects ignores the pinned default scope (firehose)', () => {
+  // SPOR_QUEUE_PROJECT would normally scope to alpha; --all-projects overrides it.
+  const { nodes } = queueScopeGraph();
+  const r = run(['next', '--nodes', nodes, '--all-projects'], { SPOR_QUEUE_PROJECT: 'alpha' });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /task-alpha-1/);
+  assert.match(r.stdout, /task-beta-1/); // both repos present despite the pin
+});
+
 test('query (local) enumerates nodes and edges end-to-end, byte-identical passthrough', () => {
   // A scratch graph with a typed node and a grouped-under edge.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-cli-query-'));
