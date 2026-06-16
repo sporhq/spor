@@ -21,6 +21,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const https = require("https");
+const crypto = require("crypto");
 const { spawnSync } = require("child_process");
 const { parseArgs } = require("util");
 
@@ -945,6 +946,203 @@ async function cmdInvite(cfg, { values }) {
   return 0;
 }
 
+// --- spor agent: a person-owned automation principal ----------------------
+// dec-spor-agent-identity-nodes: an agent is a first-class `type: agent` node
+// owned by a person via an `owned-by` edge, so a dispatched session's writes
+// read "agent on behalf of person" instead of person-direct. One persistent
+// node per machine/install, created once here and reused across dispatches.
+//
+// REMOTE: POST /v1/admin/agents creates the node + owned-by edge through the
+//   server's validated Store door, admin-gated like /v1/admin/people (the
+//   server is the CA, it mints the spiffe). FAIL-SOFT on 404 — the endpoint is
+//   landing in the spor-server stream; an old server gets a clear message, not
+//   a crash.
+// LOCAL: write the agent node + owned-by edge to the graph home via the same
+//   lib/graph validate-before-write path cmdAdd uses; the spiffe is built
+//   client-side from a config `org` (forward-compat shape, unenforced).
+async function cmdAgent(cfg, args) {
+  const sub = args[0];
+  if (sub === "create") {
+    const label = args[1];
+    if (!label || label.startsWith("-")) {
+      err("usage: spor agent create <label> [--owner person-x] [--pubkey <fp>]");
+      return 1;
+    }
+    const owner = optVal(args, "owner");
+    const pubkey = optVal(args, "pubkey") || "";
+    return cfg.mode() === "remote"
+      ? cmdAgentCreateRemote(cfg, { label, owner, pubkey })
+      : cmdAgentCreateLocal(cfg, { label, owner, pubkey });
+  }
+  if (!sub || sub === "list") {
+    return cfg.mode() === "remote" ? cmdAgentListRemote(cfg) : cmdAgentListLocal(cfg);
+  }
+  err("usage: spor agent create <label> [--owner person-x] [--pubkey <fp>] | spor agent list");
+  return 1;
+}
+
+async function cmdAgentCreateRemote(cfg, { label, owner, pubkey }) {
+  const body = { label };
+  if (owner) body.owner = owner;
+  if (pubkey) body.pubkey = pubkey;
+  const r = await remote.post(cfg, "/v1/admin/agents", body);
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (notAdminHint(r)) return 1;
+  if (r.status === 404) {
+    // The endpoint is part of the agent-identity rollout (the spor-server
+    // stream); an older server doesn't have it yet. Fail soft, don't crash.
+    err("this server has no agent-creation endpoint yet (POST /v1/admin/agents).");
+    err("  upgrade the Spor server, or create the agent in local mode against a checkout.");
+    return 1;
+  }
+  if (r.status === 409) {
+    err(`agent already exists: ${(r.json && r.json.error && r.json.error.message) || "duplicate id"}`);
+    return 1;
+  }
+  if (!r.ok) {
+    err(`agent create failed (${r.status}): ${(r.json && r.json.error && r.json.error.message) || r.text}`);
+    return 1;
+  }
+  const j = r.json || {};
+  out(`created agent ${j.id || `agent-${kebab(label)}`}${j.owner ? ` owned by ${j.owner}` : ""}`);
+  if (j.spiffe) out(`  spiffe: ${j.spiffe}`);
+  out(`  dispatch with this agent: spor dispatch … (set dispatch.agent=${j.id || `agent-${kebab(label)}`} to make it this machine's default)`);
+  return 0;
+}
+
+// Build the agent node + owned-by edge locally. Owner defaults to a single
+// person node in the graph when unambiguous (the solo-local common case),
+// else it must be named — the binding is identity-load-bearing, never guessed.
+async function cmdAgentCreateLocal(cfg, { label, owner, pubkey }) {
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const nodesDir = cfg.nodesDir();
+  if (!fs.existsSync(nodesDir)) {
+    err(`no graph at ${nodesDir} — run 'spor init' first`);
+    return 1;
+  }
+  let g;
+  try {
+    g = graphLib.loadGraph(nodesDir);
+  } catch (e) {
+    err(`could not load graph: ${e.message}`);
+    return 1;
+  }
+  let ownerId = owner;
+  if (!ownerId) {
+    const people = Object.values(g.nodes || {}).filter((n) => n.type === "person");
+    if (people.length === 1) {
+      ownerId = people[0].id;
+    } else if (people.length === 0) {
+      err("no person node in the graph to own this agent — pass --owner person-x");
+      err("  (an agent's owner is recorded as an owned-by edge to a person node).");
+      return 1;
+    } else {
+      err(`several person nodes — name the owner with --owner (one of: ${people.map((p) => p.id).slice(0, 6).join(", ")}${people.length > 6 ? ", …" : ""})`);
+      return 1;
+    }
+  } else if (!(g.nodes && g.nodes[ownerId])) {
+    err(`no such person node: ${ownerId}`);
+    return 1;
+  }
+
+  const prefix = (g.registry && g.registry.prefixesFor("agent") || ["agent-"])[0] || "agent-";
+  const id = `${prefix}${kebab(label)}`;
+  if (fs.existsSync(path.join(nodesDir, `${id}.md`))) {
+    err(`agent already exists: ${id}`);
+    return 1;
+  }
+  // Forward-compat spiffe shape (dec-cc-spiffe-forward-compat): recorded, not
+  // verified. <org> from config (default "local") so a solo graph is sensible.
+  const org = cfg.get("org", null) || "local";
+  const personLabel = ownerId.replace(/^person-/, "") || ownerId;
+  const spiffe = `spiffe://spor.${org}/person/${personLabel}/agent/${kebab(label)}`;
+  const md =
+    `---\nid: ${id}\ntype: agent\ntitle: ${label.replace(/\n/g, " ")}\n` +
+    `summary: Automation principal ${label}, owned by ${ownerId} — its dispatched-session writes read "agent on behalf of person".\n` +
+    `spiffe: ${spiffe}\npubkey: ${pubkey.replace(/\n/g, " ")}\nstatus: active\ndate: ${today()}\n` +
+    `edges:\n  - {type: owned-by, to: ${ownerId}}\n---\n\n` +
+    `Person-owned automation principal (dec-spor-agent-identity-nodes). Created by \`spor agent create\`; reused across dispatches as this machine's durable identity.\n`;
+  let node;
+  try {
+    node = graphLib.parseFrontmatter(md, `${id}.md`);
+  } catch (e) {
+    err(`invalid node: ${e.message}`);
+    return 1;
+  }
+  const v = graphLib.validateNode(g, node);
+  if (!v.ok) {
+    err(`invalid agent node:\n  ${v.errors.join("\n  ")}`);
+    return 1;
+  }
+  fs.writeFileSync(path.join(nodesDir, `${id}.md`), md);
+  out(`created agent ${id} owned by ${ownerId}`);
+  out(`  spiffe: ${spiffe}`);
+  out(`  dispatch with this agent: set dispatch.agent=${id} (spor repos config), then 'spor dispatch …'`);
+  return 0;
+}
+
+// List agent nodes. Remote: project the audit trail (/v1/changes, which carries
+// each node's type/id/title) and keep the type:agent rows; local: scan the graph
+// home. There is no dedicated node-type list route in the contract, and /v1/changes
+// is the read every remote client already has — newest change per node first, so
+// the first row per id is the live one. Fail-soft on any read error.
+async function cmdAgentListRemote(cfg) {
+  const q = await remote.get(cfg, "/v1/changes?limit=500", { timeoutMs: 6000 });
+  if (q.transport) {
+    err(`offline — could not reach server (${q.error})`);
+    return 1;
+  }
+  if (q.ok && q.json && Array.isArray(q.json.changes)) {
+    const seen = new Set();
+    const rows = [];
+    for (const c of q.json.changes) {
+      if (!c || c.type !== "agent" || c.change === "deleted") continue;
+      if (seen.has(c.id)) continue; // first (newest) wins
+      seen.add(c.id);
+      rows.push(`${c.id}\t${c.title || ""}`);
+    }
+    if (!rows.length) {
+      out("no agents yet — create one with 'spor agent create <label>'");
+      return 0;
+    }
+    rows.forEach((l) => out(l));
+    return 0;
+  }
+  err("could not list agents from this server (no /v1/changes audit route).");
+  err("  list them in local mode against a checkout, or upgrade the server.");
+  return 1;
+}
+
+function cmdAgentListLocal(cfg) {
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const nodesDir = cfg.nodesDir();
+  if (!fs.existsSync(nodesDir)) {
+    err(`no graph at ${nodesDir} — run 'spor init' first`);
+    return 1;
+  }
+  let g;
+  try {
+    g = graphLib.loadGraph(nodesDir);
+  } catch (e) {
+    err(`could not load graph: ${e.message}`);
+    return 1;
+  }
+  const agents = Object.values(g.nodes || {}).filter((n) => n.type === "agent");
+  if (!agents.length) {
+    out("no agents yet — create one with 'spor agent create <label>'");
+    return 0;
+  }
+  for (const a of agents.sort((x, y) => x.id.localeCompare(y.id))) {
+    const ownedBy = (a.edges || []).find((e) => e.type === "owned-by");
+    const status = a.status || "active";
+    out(`${a.id}\t${ownedBy ? `owned-by ${ownedBy.to}` : "(no owner)"}\t${status}`);
+  }
+  return 0;
+}
+
 async function cmdToken(cfg, args) {
   if (cfg.mode() !== "remote") {
     err("token admin needs a team graph (remote mode).");
@@ -1778,17 +1976,20 @@ async function topQueueItem(cfg, slug) {
 // post-tool heartbeat drives (dec-cc-task-claim-lease, task-cc-claim-nudge-hook).
 // REMOTE-MODE ONLY: a claim is a server-held lease; local mode has no pool or
 // contention (dec-cc-task-claim-lease "Local mode"), so the caller skips it and
-// local dispatch stays byte-identical. No session is bound on purpose — the
-// dispatching CLI session ends immediately, while the launched bg agent (a
-// DIFFERENT session) keeps the lease alive: its post-tool hook renews any
-// in_progress lease the person holds (assignee=me). Leaving the lease
-// person-scoped (session:null) is what lets that cross-session heartbeat work;
-// binding it to this short-lived session would orphan the heartbeat. Returns
-// {ok} on success/idempotent-renew, {conflict, message} when the node is already
-// held (the concurrent-dispatch case this guards), or {error} for any other
-// failure (fail-open: the caller warns and dispatches anyway).
-async function claimDispatch(cfg, nodeId) {
-  const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}/claim`, {}, { timeoutMs: 6000 });
+// local dispatch stays byte-identical. SESSION-BOUND at dispatch
+// (dec-spor-session-identity-active-record): dispatch now FORCES the session id
+// (`--session-id <uuid>`), so it knows the working session up front and binds the
+// lease to it; the launched bg agent runs under that exact session, so its
+// post-tool heartbeat renews the same-session lease (the earlier person-scoped /
+// session:null workaround existed only because the old dispatcher did NOT know
+// the working session — that reason is gone). Omitting `session` leaves the lease
+// person-scoped, the prior behavior. Returns {ok} on success/idempotent-renew,
+// {conflict, message} when the node is already held (the concurrent-dispatch case
+// this guards), or {error} for any other failure (fail-open: the caller warns and
+// dispatches anyway).
+async function claimDispatch(cfg, nodeId, session) {
+  const body = session ? { session } : {};
+  const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}/claim`, body, { timeoutMs: 6000 });
   if (r.ok) return { ok: true, lease: r.json && r.json.lease };
   // 409 = the node can't be claimed right now — almost always a live lease held
   // by ANOTHER person (the concurrent-dispatch conflict this feature exists to
@@ -1884,6 +2085,95 @@ function onboardRepo(cfg, dir) {
   if (!cfg.enabled()) {
     enableRepoAt(dir);
     out(`re-enabled Spor for ${dir}`);
+  }
+}
+
+// --- dispatch agent identity (dec-spor-session-identity-active-record) -----
+// A dispatched session runs AS this machine's agent, carried on a per-session
+// agent-scoped MCP token (env does NOT propagate through `claude --bg`, so
+// identity rides the token in --mcp-config, never env). These three helpers are
+// the verified mechanism; all fail soft so a server without the agent surface,
+// or a machine with no agent configured, degrades to the prior person-scoped
+// dispatch with a clear line.
+
+// This machine's agent node id, or null. A per-machine config key the shared
+// graph can't hold (like dispatch.repos) — SPOR_DISPATCH_AGENT / .spor.json
+// {"dispatch":{"agent":"agent-x"}} / user config. null => dispatch without
+// agent-scoping (graceful, person-attributed as before).
+function dispatchAgentId(cfg) {
+  return cfg.get("dispatch.agent", null) || null;
+}
+
+// Mint a per-session agent-scoped token (dec-spor-session-identity-active-record):
+// carries the agent (spiffe sub), the person (RFC 8693 act.sub), and the session
+// id; audience-restricted, short TTL — the server is the CA. REMOTE only. Returns
+// { ok, token } on success, { absent:true } when the server has no mint surface
+// yet (the spor-server stream is building it — fail soft, dispatch without
+// agent-scoping), or { error } on any other failure (also fail soft).
+async function mintAgentToken(cfg, { agent, session }) {
+  const r = await remote.post(cfg, "/v1/admin/tokens", { agent, session }, { timeoutMs: 6000 });
+  if (r.transport) return { error: r.error };
+  // 404 (no route) or a 422 the server raises for the unrecognized agent/session
+  // fields on an old token-mint => the agent-scoped mint isn't deployed. Treat as
+  // absent so dispatch falls back cleanly instead of erroring.
+  if (r.status === 404) return { absent: true };
+  if (!r.ok) return { error: `HTTP ${r.status}${r.json && r.json.error && r.json.error.code ? ` (${r.json.error.code})` : ""}` };
+  const token = r.json && (r.json.token || r.json.access_token);
+  if (!token) return { absent: true };
+  return { ok: true, token };
+}
+
+// Write the 0600 --mcp-config JSON that gives the bg agent ONLY its own
+// agent-scoped Spor MCP (account connector excluded by --strict-mcp-config,
+// verified #1). Machine-local, gitignored-adjacent path under the user config
+// home's outbox; per-session filename so concurrent dispatches don't collide.
+// Returns the file path. The bg agent reads it on startup AFTER this process
+// exits (claude --bg detaches), so we cannot delete it eagerly — cleanup is a
+// best-effort sweep of stale files here, plus the documented short-TTL token
+// inside it (dec-spor-session-identity-active-record open item).
+function writeDispatchMcpConfig(cfg, { token, session }) {
+  const dir = path.join(cfg.userConfigHome(), "outbox", "dispatch");
+  fs.mkdirSync(dir, { recursive: true });
+  sweepStaleMcpConfigs(dir);
+  const file = path.join(dir, `mcp-${session}.json`);
+  const conf = {
+    mcpServers: {
+      spor: {
+        type: "http",
+        url: `${remote.base(cfg)}/mcp`,
+        headers: { Authorization: `Bearer ${token}` },
+      },
+    },
+  };
+  // 0600: the file holds a live bearer token. Write with the restrictive mode
+  // from the start (mode on an existing file is not reset by writeFileSync, so
+  // create fresh) — chmod after as a belt-and-braces for prior leftovers.
+  fs.writeFileSync(file, JSON.stringify(conf, null, 2) + "\n", { mode: 0o600 });
+  try {
+    fs.chmodSync(file, 0o600);
+  } catch {
+    /* best-effort on platforms without POSIX modes */
+  }
+  return file;
+}
+
+// Best-effort cleanup: remove dispatch mcp-config files older than a day. The
+// tokens inside are short-TTL, but the files linger because claude --bg reads
+// them after we exit; sweep on the next dispatch so they don't accumulate.
+function sweepStaleMcpConfigs(dir) {
+  try {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const f of fs.readdirSync(dir)) {
+      if (!/^mcp-.*\.json$/.test(f)) continue;
+      const p = path.join(dir, f);
+      try {
+        if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p);
+      } catch {
+        /* racing another dispatch — ignore */
+      }
+    }
+  } catch {
+    /* dir vanished or unreadable — nothing to sweep */
   }
 }
 
@@ -2020,13 +2310,26 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // exit / unparseable output => empty => no guard (fail-open); --force overrides.
   const inFlight = nodeId && !backfill ? dispatchedAgents().get(name) || [] : [];
 
+  // Session identity (dec-spor-session-identity-active-record). Force the
+  // session id up front — `--session-id <uuid>` makes the dispatched run's
+  // session deterministic, so the agent-scoped token below can bind it AND the
+  // claim can be session-bound at dispatch (the bg agent's post-tool heartbeat
+  // renews under this same id). SPOR_SESSION_ID pins it for tests/reproducibility.
+  const session = process.env.SPOR_SESSION_ID || crypto.randomUUID();
+  // This machine's agent node — the WHO a dispatched session runs as. Only
+  // meaningful remotely (the server is the CA that mints the agent token); a
+  // local-mode dispatch or an unconfigured machine simply runs person-scoped.
+  const identityAgent = cfg.mode() === "remote" ? dispatchAgentId(cfg) : null;
+
   const claudeBin = claudeCmd();
   const claudeArgs = ["--bg"];
   if (name) claudeArgs.push("--name", name);
   if (model) claudeArgs.push("--model", model);
   if (permMode) claudeArgs.push("--permission-mode", permMode);
   if (agent) claudeArgs.push("--agent", agent);
-  claudeArgs.push(prompt);
+  // Force the session id on every dispatch (local or remote). It is the run leaf
+  // of the agent's identity and what the session-bound claim + heartbeat key on.
+  claudeArgs.push("--session-id", session);
 
   if (dryRun) {
     out(`dir:    ${res.dir}  (slug: ${res.slug}, via ${res.source})`);
@@ -2038,6 +2341,17 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
       out(`onboard: ${steps.join("; ")}`);
     }
     out(`brief:  ${brief ? `${brief.length} bytes` : "(none — graph had nothing relevant, or --no-brief/--backfill)"}`);
+    out(`session: ${session}`);
+    // Identity preview: what the real dispatch would do for agent-scoping. The
+    // token mint + 0600 mcp-config are SIDE EFFECTS, so --print only describes
+    // them (it writes nothing and makes no network call here). Local mode and an
+    // unconfigured machine read "person-scoped" — byte-stable but for the new
+    // session line, which is additive and always present now.
+    if (identityAgent) {
+      out(`agent:  ${identityAgent} (would mint a per-session agent-scoped token + write a 0600 --mcp-config, then add --strict-mcp-config)`);
+    } else if (cfg.mode() === "remote") {
+      out(`agent:  (none configured — set dispatch.agent=agent-<machine> to attribute as agent-on-behalf-of; dispatching person-scoped)`);
+    }
     // Same-machine guard preview (node mode, any mode): a real dispatch would
     // refuse if an agent with this name is already in flight here. Shown only on a
     // hit, so a clean node --print stays byte-identical to before.
@@ -2050,10 +2364,10 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     // Auto-claim preview (remote node dispatch only — local mode has no lease, so
     // nothing is announced there and local --print stays byte-identical).
     if (nodeId && !backfill && cfg.mode() === "remote") {
-      out(`claim:  ${noClaim ? "(--no-claim — lease not established)" : `would establish a lease on ${nodeId} at launch`}`);
+      out(`claim:  ${noClaim ? "(--no-claim — lease not established)" : `would establish a session-bound lease on ${nodeId} at launch`}`);
     }
     if (template != null) out(`template: ${path.resolve(templateOpt)}`);
-    out(`run:    ${claudeBin} ${claudeArgs.slice(0, -1).map(shellQuote).join(" ")} <prompt>`);
+    out(`run:    ${claudeBin} ${claudeArgs.map(shellQuote).join(" ")} <prompt>`);
     out(`\n--- prompt ---\n${prompt}`);
     return 0;
   }
@@ -2082,23 +2396,49 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     err("claude CLI not on PATH — install Claude Code, then re-run (or 'spor dispatch … --print' to see the prompt).");
     return 1;
   }
+
+  // Agent-scoped identity injection (dec-spor-session-identity-active-record,
+  // the VERIFIED mechanism): mint a per-session agent-scoped token, write it into
+  // a 0600 --mcp-config that exposes ONLY the agent's own Spor MCP, and add
+  // --strict-mcp-config so the account connector is excluded by construction. The
+  // server then stamps authored_by_agent + session from that token. FAIL SOFT at
+  // every step — a server without the mint surface, or a transient error, falls
+  // back to the prior person-scoped dispatch with a clear line. Remote + a
+  // configured agent only; local/unconfigured dispatch is byte-identical but for
+  // the always-present --session-id.
+  if (identityAgent) {
+    const mint = await mintAgentToken(cfg, { agent: identityAgent, session });
+    if (mint.ok) {
+      const mcpFile = writeDispatchMcpConfig(cfg, { token: mint.token, session });
+      claudeArgs.push("--mcp-config", mcpFile, "--strict-mcp-config");
+      out(`agent:  ${identityAgent} (session ${session} — writes attributed agent-on-behalf-of-you)`);
+    } else if (mint.absent) {
+      err(`warning: this server can't mint agent-scoped session tokens yet — dispatching person-scoped (session ${session}).`);
+    } else {
+      err(`warning: could not mint an agent token (${mint.error}) — dispatching person-scoped (session ${session}).`);
+    }
+  }
+
   // Establish the claim/lease BEFORE launching (task-spor-dispatch-auto-claim):
   // a node already claimed by someone else is caught here, so we never launch a
   // duplicate agent onto contested work, and the lease is live the moment the
   // agent starts (its post-tool writes then renew it — and seeing its own held
   // claim, it skips the redundant claim-nudge). Remote node-mode only; --no-claim
-  // opts out (dispatch with no lease, the prior behavior).
+  // opts out (dispatch with no lease, the prior behavior). Now SESSION-BOUND
+  // (dec-spor-session-identity-active-record): dispatch forces the session id, so
+  // the lease binds it and the bg agent's same-session heartbeat renews it.
   if (nodeId && !backfill && !noClaim && cfg.mode() === "remote") {
-    const c = await claimDispatch(cfg, nodeId);
+    const c = await claimDispatch(cfg, nodeId, session);
     if (c.conflict) {
       err(`${nodeId} is already claimed — ${c.message}`);
       err(`  not dispatching a duplicate. Re-run with --no-claim to dispatch anyway (no lease),`);
       err(`  or pick another task with 'spor next'.`);
       return 1;
     }
-    if (c.ok) out(`claimed ${nodeId} (lease established; the agent's writes will renew it)`);
+    if (c.ok) out(`claimed ${nodeId} (session-bound lease established; the agent's writes will renew it)`);
     else err(`warning: could not establish a lease on ${nodeId}: ${c.error} — dispatching without a claim`);
   }
+  claudeArgs.push(prompt);
   const r = spawnSync(claudeBin, claudeArgs, { cwd: res.dir, stdio: "inherit" });
   if (r.error) {
     err(`could not launch ${claudeBin}: ${r.error.message}`);
@@ -2281,6 +2621,25 @@ const COMMANDS = {
     help: "List or revoke team tokens. Remote + admin only.\n\n  spor token list              show all tokens (hash prefix, person, expiry)\n  spor token revoke <prefix>   revoke the token with that hash prefix",
     examples: ["spor token list", "spor token revoke a1b2c3"],
     run: (cfg, args) => cmdToken(cfg, args),
+  },
+  agent: {
+    group: "Team admin (remote, admin token)", parse: "raw", args: "create <label> [--owner <id>] [--pubkey <fp>] | list",
+    summary: "person-owned automation principals (dispatch identity)",
+    help:
+      "Create and list agents — first-class `type: agent` nodes owned by a person\n" +
+      "(dec-spor-agent-identity-nodes). A dispatched session runs AS its agent, so its\n" +
+      "writes read \"agent on behalf of person\" rather than person-direct. One durable\n" +
+      "agent per machine/install, reused across dispatches.\n\n" +
+      "  spor agent create <label>     create the agent + its owned-by edge to a person\n" +
+      "      --owner <person-id>       owner (remote: defaults to your person; local:\n" +
+      "                                defaults to the sole person node, else required)\n" +
+      "      --pubkey <fingerprint>    record a public-key fingerprint (forward-compat,\n" +
+      "                                unenforced — may be omitted)\n" +
+      "  spor agent list               list agents and their owners\n\n" +
+      "Remote mode creates through POST /v1/admin/agents (admin-gated, the server mints\n" +
+      "the spiffe). Local mode writes the node + owned-by edge to the graph home.",
+    examples: ["spor agent create anthony-laptop", "spor agent create ci-runner --owner person-anthony", "spor agent list"],
+    run: (cfg, args) => cmdAgent(cfg, args),
   },
 
   // --- Graph ---
