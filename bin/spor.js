@@ -22,65 +22,23 @@ const os = require("os");
 const path = require("path");
 const https = require("https");
 const { spawnSync } = require("child_process");
+const { parseArgs } = require("util");
 
 const ROOT = path.resolve(__dirname, "..");
 const { loadConfig } = require(path.join(ROOT, "lib", "config.js"));
 const remote = require(path.join(ROOT, "lib", "remote.js"));
 const u = require(path.join(ROOT, "scripts", "engines", "util.js"));
 
-const HELP = `spor — Spor client CLI
+// The CLI surface is a single declarative table (COMMANDS, defined below): it is
+// the one source of truth for dispatch, flag parsing (Node's built-in
+// util.parseArgs), and help — top-level AND per-command (`spor <verb> --help`).
+// Adding a verb or a flag means editing one table entry; the help can't drift
+// from the parser because both read the same spec. The header/footer frame the
+// generated top-level listing.
+const HELP_HEADER = `spor — Spor client CLI
 
-Usage: spor <verb> [args]
-
-Getting started
-  init                 create the local graph home (nodes/, git, .gitignore)
-  install [host...]    wire spor into an agent: claude codex gemini opencode
-                       copilot cursor (no host => list detected). --scope
-                       user|repo, --all, --print, --server/--token to configure
-  upgrade [host...]    refresh wired spor to the installed package version after
-                       an npm bump (claude: marketplace+plugin update). No host
-                       => every detected wired host. Also flags a newer release
-                       published to npm. --scope user|repo, --print, --no-net
-  status               resolved mode, graph, project, identity, health
-  join <url> <token>   point the client at a graph (writes user config)
-  migrate <url>        push the local graph to a remote you own (solo-remote)
-  whoami               who the team graph thinks you are (remote)
-
-Team admin (remote, admin token)
-  invite --person <id> | --name <n> --email <e>   mint a teammate token
-  token list | token revoke <prefix>              manage tokens
-
-Graph
-  add "<text>"         capture a node (local: typed file; remote: /v1/capture)
-  next [--project S]   the decision queue (local: lib/queue; remote: /v1/queue)
-  get <id>             a node by id (local: file; remote: /v1/nodes/<id>)
-  lens [<id>]          render a saved view (remote). No id => list the lens
-                       catalog; <id> renders it. Flags: --format text|json
-                       (default text), --PARAM VALUE to pass lens params,
-                       --json (machine output of the catalog/JSON tree)
-
-Repo scoping
-  disable | enable     turn Spor off/on for this repo (.spor.json)
-  link <slug>          set this repo's canonical project slug (.spor marker)
-  compile <args>       full neighborhood / digest (local; byte-identical)
-  brief <id>           compile a briefing for a node (alias: compile --root <id>)
-  validate             lint the local graph (byte-identical)
-
-Dispatch (Claude Code background agents)
-  dispatch "<task>"    compile a briefing + launch 'claude --bg' in the repo.
-                       Also: dispatch <node-id> | --node <id> | --from-queue |
-                       --backfill. Flags: --dir P, --full, --no-brief, --model M,
-                       --permission-mode P, --agent A, --name N, --print,
-                       --template F (own prompt; {{brief}}/{{task}}/{{node}}/
-                       {{title}}/{{slug}}/{{dir}}/{{default}} placeholders)
-  repos                show the local slug->repo-dir map used to pick the
-                       directory (repos add <slug> <path> | repos rm <slug>)
-
-Other
-  cost [--since D]      LLM spend summary from journal/llm-calls (local)
-  version              print version
-  help                 this message
-
+Usage: spor <command> [args]`;
+const HELP_FOOTER = `Run 'spor <command> --help' for a command's flags and detail.
 Mode is set by config/env (SPOR_SERVER ⇒ remote). See 'spor status'.`;
 
 // A consumer that closes the pipe early (`spor next | head`) makes stdout emit
@@ -268,8 +226,8 @@ function renderQueue(q) {
   }
 }
 
-async function cmdGet(cfg, args) {
-  const id = args[0];
+async function cmdGet(cfg, { positionals }) {
+  const id = positionals[0];
   if (!id) {
     err("usage: spor get <id>");
     return 1;
@@ -429,13 +387,13 @@ function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
-async function cmdAdd(cfg, args) {
-  const prose = args.find((a) => !a.startsWith("--"));
+async function cmdAdd(cfg, { values, positionals }) {
+  const prose = positionals[0];
   if (!prose) {
     err('usage: spor add "<text>" [--type T] [--title ...] [--project S]');
     return 1;
   }
-  const project = optVal(args, "project") || safeSlug();
+  const project = values.project || safeSlug();
 
   if (cfg.mode() === "remote") {
     const r = await remote.post(cfg, "/v1/capture", { text: prose, context: { project } });
@@ -459,8 +417,8 @@ async function cmdAdd(cfg, args) {
     err(`no graph at ${nodesDir} — run 'spor init' first`);
     return 1;
   }
-  const type = optVal(args, "type") || "task";
-  const title = optVal(args, "title") || prose.split(/\s+/).slice(0, 10).join(" ");
+  const type = values.type || "task";
+  const title = values.title || prose.split(/\s+/).slice(0, 10).join(" ");
   const summary = prose.length > 500 ? prose.slice(0, 497) + "..." : prose;
 
   let g;
@@ -472,7 +430,7 @@ async function cmdAdd(cfg, args) {
   }
   const prefixes = (g.registry && g.registry.prefixesFor(type)) || null;
   const prefix = prefixes && prefixes[0] ? prefixes[0] : `${type}-`;
-  let id = optVal(args, "id") || `${prefix}${kebab(title) || today()}`;
+  let id = values.id || `${prefix}${kebab(title) || today()}`;
   // uniquify against existing files
   let n = 1;
   let base = id;
@@ -520,10 +478,9 @@ function writeServerToken(home, server, token) {
 // Write server+token to USER config (never a committable repo config), then
 // confirm immediately — the upgrade research found no one-step way to point a
 // client at a graph and know it took.
-async function cmdJoin(cfg, args) {
-  const positional = args.filter((a) => !a.startsWith("--"));
-  const server = optVal(args, "server") || positional[0];
-  const token = optVal(args, "token") || positional[1];
+async function cmdJoin(cfg, { values, positionals }) {
+  const server = values.server || positionals[0];
+  const token = values.token || positionals[1];
   if (!server) {
     err("usage: spor join <server-url> <token>");
     return 1;
@@ -556,15 +513,15 @@ function notAdminHint(r) {
   return false;
 }
 
-async function cmdInvite(cfg, args) {
+async function cmdInvite(cfg, { values }) {
   if (cfg.mode() !== "remote") {
     err("invite needs a team graph — set SPOR_SERVER/SPOR_TOKEN (see 'spor join').");
     return 1;
   }
-  let person = optVal(args, "person");
-  const name = optVal(args, "name");
-  const email = optVal(args, "email");
-  const expires = optVal(args, "expires");
+  let person = values.person;
+  const name = values.name;
+  const email = values.email;
+  const expires = values.expires;
 
   // create the person node first when only name/email is given (the mint
   // endpoint binds to an EXISTING node, it cannot conjure a subject).
@@ -574,7 +531,7 @@ async function cmdInvite(cfg, args) {
       err("   or: spor invite --name <name> --email <email> [--id person-x] [--expires <Nd>]");
       return 1;
     }
-    person = optVal(args, "id") || `person-${kebab(name)}`;
+    person = values.id || `person-${kebab(name)}`;
     const md = `---\nid: ${person}\ntype: person\ntitle: ${name.replace(/\n/g, " ")}\nsummary: Team member ${name}.\nemail: ${email}\ndate: ${today()}\n---\n\nTeam member ${name} <${email}>.\n`;
     const pr = await remote.post(cfg, "/v1/nodes", { nodes: [{ node: md, if_exists: "skip" }] });
     if (pr.transport) {
@@ -694,7 +651,7 @@ function hasGit() {
 // route for BYO-repo registration, and the GitHub-App write grant of
 // dec-spor-solo-remote-write-credential-custody is unbuilt server-side; both
 // are tracked separately, so this verb stops at "your graph is on your remote".
-function cmdMigrate(cfg, args) {
+function cmdMigrate(cfg, { positionals }) {
   const home = cfg.graphHome();
   const nodesDir = cfg.nodesDir();
   if (!fs.existsSync(nodesDir)) {
@@ -732,7 +689,7 @@ function cmdMigrate(cfg, args) {
   }
   // 3. wire the remote. An explicit URL sets/updates origin; otherwise reuse an
   //    existing origin, or explain that one is required.
-  const url = args.find((a) => !a.startsWith("--"));
+  const url = positionals[0];
   const haveOrigin = git(home, ["remote", "get-url", "origin"]).status === 0;
   if (url) {
     const r = haveOrigin ? git(home, ["remote", "set-url", "origin", url]) : git(home, ["remote", "add", "origin", url]);
@@ -780,8 +737,8 @@ function cmdScope(enabled) {
 // --- spor link <slug>: write the .spor identity marker --------------------
 // Fixes a wrong inferred slug (basename != canonical) deterministically,
 // instead of waiting for the server's fingerprint-alias proposal to be approved.
-function cmdLink(args) {
-  const slug = args.find((a) => !a.startsWith("--")) || safeSlug();
+function cmdLink(cfg, { positionals }) {
+  const slug = positionals[0] || safeSlug();
   if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) {
     err(`invalid slug '${slug}' — must match ^[a-z0-9][a-z0-9-]*$`);
     return 1;
@@ -982,20 +939,6 @@ async function npmLatest(timeoutMs = 4000) {
   });
 }
 
-// Options that consume the following token, so positional parsing can skip it.
-const INSTALL_VALUE_OPTS = new Set(["scope", "server", "token"]);
-function positionals(args) {
-  const pos = [];
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a.startsWith("--")) {
-      if (INSTALL_VALUE_OPTS.has(a.slice(2))) i++; // skip its value
-      continue;
-    }
-    pos.push(a);
-  }
-  return pos;
-}
 
 function deepReplace(v, from, to) {
   if (typeof v === "string") return v.split(from).join(to);
@@ -1171,8 +1114,8 @@ function installPluginHost(spec, scope, dryRun) {
   return 0;
 }
 
-async function cmdInstall(cfg, args) {
-  const dryRun = args.includes("--print") || args.includes("--dry-run");
+async function cmdInstall(cfg, { values, positionals: pos }) {
+  const dryRun = !!(values.print || values["dry-run"]);
   // Node prerequisite (issue-spor-onboarding-no-node-silent-fail-open). The
   // hooks fail open on a box with no/old Node (every one silently no-ops), so
   // make the requirement loud HERE, at wire-up time. A too-old interpreter is a
@@ -1183,25 +1126,24 @@ async function cmdInstall(cfg, args) {
     err(`  Spor's hooks fail open, so on this Node they install but every hook silently no-ops — upgrade Node first.`);
     return 1;
   }
-  let scope = optVal(args, "scope") || "user";
+  let scope = values.scope || "user";
   if (scope === "project") scope = "repo";
   if (scope !== "user" && scope !== "repo") {
     err(`invalid --scope '${scope}' — use 'user' or 'repo'`);
     return 1;
   }
 
-  const pos = positionals(args);
   const bad = pos.find((a) => !HOSTS[a]);
   if (bad) {
     err(`unknown host '${bad}' — known: ${Object.keys(HOSTS).join(", ")}`);
     return 1;
   }
   let hosts = pos.slice();
-  if (args.includes("--all")) hosts = detectHosts();
+  if (values.all) hosts = detectHosts();
 
   // The "configure" half: persist server/token to user config when given.
-  const server = optVal(args, "server");
-  const token = optVal(args, "token");
+  const server = values.server;
+  const token = values.token;
   if ((server || token) && !dryRun) {
     try {
       const f = writeServerToken(cfg.userConfigHome(), server, token);
@@ -1301,15 +1243,14 @@ function hostHasSpor(host, scope) {
   }
 }
 
-async function cmdUpgrade(cfg, args) {
-  const dryRun = args.includes("--print") || args.includes("--dry-run");
-  let scope = optVal(args, "scope") || "user";
+async function cmdUpgrade(cfg, { values, positionals: pos }) {
+  const dryRun = !!(values.print || values["dry-run"]);
+  let scope = values.scope || "user";
   if (scope === "project") scope = "repo";
   if (scope !== "user" && scope !== "repo") {
     err(`invalid --scope '${scope}' — use 'user' or 'repo'`);
     return 1;
   }
-  const pos = positionals(args);
   const bad = pos.find((a) => !HOSTS[a]);
   if (bad) {
     err(`unknown host '${bad}' — known: ${Object.keys(HOSTS).join(", ")}`);
@@ -1341,7 +1282,7 @@ async function cmdUpgrade(cfg, args) {
     // The refresh above closes the loaded-vs-installed gap; this closes the
     // installed-vs-published one — if npm has a newer release, the package on
     // disk itself is behind, so point the user at the npm bump (then re-upgrade).
-    if (!args.includes("--no-net")) {
+    if (!values["no-net"]) {
       const latest = await npmLatest();
       const installed = version();
       if (latest && verCmp(installed, latest) < 0) {
@@ -1503,36 +1444,26 @@ function onboardRepo(cfg, dir) {
   }
 }
 
-async function cmdDispatch(cfg, args) {
-  const dryRun = args.includes("--print") || args.includes("--dry-run");
-  const full = args.includes("--full");
-  const noBrief = args.includes("--no-brief");
-  const backfill = args.includes("--backfill");
-  const fromQueue = args.includes("--from-queue");
-  const dirOpt = optVal(args, "dir");
-  const model = optVal(args, "model");
-  const permMode = optVal(args, "permission-mode");
-  const agent = optVal(args, "agent");
+async function cmdDispatch(cfg, { values, positionals: pos }) {
+  const dryRun = !!(values.print || values["dry-run"]);
+  const full = !!values.full;
+  const noBrief = !!values["no-brief"];
+  const backfill = !!values.backfill;
+  const fromQueue = !!values["from-queue"];
+  const dirOpt = values.dir || null;
+  const model = values.model || null;
+  const permMode = values["permission-mode"] || null;
+  const agent = values.agent || null;
   // A user-supplied prompt template (task-spor-dispatch-user-prompt-templates):
   // --template wins, else a personal default in the config cascade
   // (dispatch.template — an absolute path, like dispatch.repos). Empty until we
   // resolve the file below, so an absent option leaves the prompt byte-identical.
-  const templateOpt = optVal(args, "template") || cfg.get("dispatch.template", null);
-  let nodeId = optVal(args, "node");
-  let targetSlug = optVal(args, "slug");
-  let name = optVal(args, "name");
+  const templateOpt = values.template || cfg.get("dispatch.template", null);
+  let nodeId = values.node || null;
+  let targetSlug = values.slug || null;
+  let name = values.name || null;
 
-  // Positional task text: everything that isn't a flag or a flag's value.
-  const VALUE_OPTS = new Set(["dir", "node", "slug", "model", "permission-mode", "agent", "name", "template"]);
-  const pos = [];
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a.startsWith("--")) {
-      if (VALUE_OPTS.has(a.slice(2))) i++;
-      continue;
-    }
-    pos.push(a);
-  }
+  // Positional task text: parseArgs already split flags from positionals.
   let taskText = pos.join(" ").trim();
 
   // Load the template now (before any briefing compile) so a bad path fails fast.
@@ -1736,79 +1667,441 @@ function version() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The command table — the single source of truth for dispatch, parsing, and help
+// ---------------------------------------------------------------------------
+// Each entry declares its group (for the top-level listing), a positional usage
+// hint (`args`), a one-line `summary`, a longer `help` body, an `options` map in
+// util.parseArgs shape (each carrying a help-only `desc`/`value`), optional
+// `examples`, and `aliases`. `parse` picks the front-door behavior:
+//   "strict" — central util.parseArgs validates flags (unknown-flag errors with
+//              a suggestion) and the run() gets { values, positionals }.
+//   "raw"    — run() gets the raw argv array; for commands that own their parsing
+//              (subcommands like token/repos), forward open --PARAM sets (lens),
+//              or must stay byte-identical passthrough to lib/*.js (compile,
+//              validate, next-local, cost). norm-cc-byte-identical-refactor.
+//   "meta"   — listing-only (help/version are intercepted in main before dispatch).
+const SCOPE_OPT = { type: "string", value: "user|repo", desc: "where to write — 'user' (default) or 'repo' (this checkout)" };
+const PRINT_OPT = { type: "boolean", desc: "dry run — show what would change, write nothing" };
+const DRYRUN_OPT = { type: "boolean", desc: "alias for --print" };
+
+const COMMANDS = {
+  // --- Getting started ---
+  init: {
+    group: "Getting started", parse: "strict", args: "", options: {},
+    summary: "create the local graph home (nodes/, git, .gitignore)",
+    help:
+      "Idempotently create the local graph home: a nodes/ directory, a git repo\n" +
+      "to version it, and a .gitignore for machine-local state. Safe to re-run —\n" +
+      "an existing graph is reported, never clobbered.",
+    run: (cfg) => cmdInit(cfg),
+  },
+  install: {
+    group: "Getting started", parse: "strict", args: "[host...]", aliases: ["setup"],
+    summary: "wire spor into an agent (claude codex gemini opencode copilot cursor)",
+    help:
+      "Wire the spor hooks/plugin into one or more host agents. With no host, lists\n" +
+      "the hosts detected on this machine and touches nothing. Claude Code is wired\n" +
+      "via its plugin CLI; the others receive a merged hooks manifest.\n\n" +
+      "--server/--token also persist remote-graph credentials to your user config.",
+    options: {
+      scope: SCOPE_OPT,
+      all: { type: "boolean", desc: "install into every detected host" },
+      print: PRINT_OPT,
+      "dry-run": DRYRUN_OPT,
+      server: { type: "string", value: "url", desc: "persist a team-graph server URL to user config" },
+      token: { type: "string", value: "tok", desc: "persist an auth token to user config" },
+    },
+    examples: ["spor install claude", "spor install codex gemini --scope repo", "spor install --all --print"],
+    run: (cfg, p) => cmdInstall(cfg, p),
+  },
+  upgrade: {
+    group: "Getting started", parse: "strict", args: "[host...]", aliases: ["update"],
+    summary: "refresh wired spor to the installed package version (after an npm bump)",
+    help:
+      "Refresh wired hosts to the package version on disk. A bumped npm package does\n" +
+      "not change what an agent already loaded — Claude Code runs its own cached copy\n" +
+      "until 'plugin update' swaps it. With no host, refreshes every detected host\n" +
+      "that has spor wired. Also flags a newer release published to npm.",
+    options: { scope: SCOPE_OPT, print: PRINT_OPT, "dry-run": DRYRUN_OPT, "no-net": { type: "boolean", desc: "skip the npm 'newer version published' check" } },
+    examples: ["spor upgrade", "spor upgrade claude --print"],
+    run: (cfg, p) => cmdUpgrade(cfg, p),
+  },
+  status: {
+    group: "Getting started", parse: "strict", args: "", options: {},
+    summary: "resolved mode, graph, project, identity, health",
+    help: "Print the resolved mode (local/remote), graph home, project slug, identity,\nand a health probe. In local mode it also warns of a split-brain claude.ai\nSpor MCP connector; it always surfaces the Node prerequisite line.",
+    run: (cfg) => cmdStatus(cfg),
+  },
+  join: {
+    group: "Getting started", parse: "strict", args: "<url> <token>", aliases: ["login"],
+    summary: "point the client at a graph (writes user config)",
+    help: "Write a team-graph server URL and token to your USER config (never a\ncommittable repo config), then confirm the connection immediately. The URL and\ntoken may be given positionally or as --server/--token.",
+    options: {
+      server: { type: "string", value: "url", desc: "server URL (else the first positional)" },
+      token: { type: "string", value: "tok", desc: "auth token (else the second positional)" },
+    },
+    examples: ["spor join https://graph.example.com tok_abc123"],
+    run: (cfg, p) => cmdJoin(cfg, p),
+  },
+  migrate: {
+    group: "Getting started", parse: "strict", args: "<url>", aliases: ["push"],
+    summary: "push the local graph to a remote you own (solo-remote)",
+    help: "Commit the local graph home and push it to a git remote you own (e.g. a\nprivate GitHub repo). The URL is remembered as 'origin', so later pushes need\nno argument. Pure git plumbing — no server route is involved.",
+    options: {},
+    examples: ["spor migrate git@github.com:you/my-graph.git", "spor push"],
+    run: (cfg, p) => cmdMigrate(cfg, p),
+  },
+  whoami: {
+    group: "Getting started", parse: "strict", args: "", options: {},
+    summary: "who the team graph thinks you are (remote)",
+    help: "Echo the identity the server binds to your token (remote mode). In local\nmode it explains there is no server identity.",
+    run: (cfg) => cmdWhoami(cfg),
+  },
+
+  // --- Team admin ---
+  invite: {
+    group: "Team admin (remote, admin token)", parse: "strict",
+    args: "--person <id> | --name <n> --email <e>",
+    summary: "mint a teammate token (creates the person node if needed)",
+    help:
+      "Mint a person-bound token and print a paste-ready 'spor join' line. Remote +\n" +
+      "admin only. Pass --person to bind an existing person node, or --name/--email\n" +
+      "to create the node first.",
+    options: {
+      person: { type: "string", value: "id", desc: "bind to an existing person node" },
+      name: { type: "string", value: "name", desc: "create a person node with this name" },
+      email: { type: "string", value: "email", desc: "the new person's email" },
+      id: { type: "string", value: "id", desc: "explicit id for the created person node" },
+      expires: { type: "string", value: "Nd", desc: "token lifetime, e.g. 30d" },
+    },
+    examples: ["spor invite --person person-jo", "spor invite --name 'Jo Diaz' --email jo@x.io --expires 30d"],
+    run: (cfg, p) => cmdInvite(cfg, p),
+  },
+  token: {
+    group: "Team admin (remote, admin token)", parse: "raw", args: "list | revoke <prefix>",
+    summary: "manage tokens (list, revoke)",
+    help: "List or revoke team tokens. Remote + admin only.\n\n  spor token list              show all tokens (hash prefix, person, expiry)\n  spor token revoke <prefix>   revoke the token with that hash prefix",
+    examples: ["spor token list", "spor token revoke a1b2c3"],
+    run: (cfg, args) => cmdToken(cfg, args),
+  },
+
+  // --- Graph ---
+  add: {
+    group: "Graph", parse: "strict", args: '"<text>"', aliases: ["capture"],
+    summary: "capture a node (local: typed file; remote: /v1/capture)",
+    help:
+      "Capture a node from prose. In remote mode the server's ingestion model types\n" +
+      "and links it; in local mode a well-formed, validated node file is written so\n" +
+      "you never hand-author frontmatter. --type/--title/--id apply to local mode.",
+    options: {
+      type: { type: "string", value: "T", desc: "node type (local only; default: task)" },
+      title: { type: "string", value: "...", desc: "title (default: first 10 words)" },
+      project: { type: "string", value: "S", desc: "project slug (default: inferred from cwd)" },
+      id: { type: "string", value: "id", desc: "explicit node id (local only)" },
+    },
+    examples: ['spor add "Cache tf-idf norms across compiles for speed" --type task'],
+    run: (cfg, p) => cmdAdd(cfg, p),
+  },
+  next: {
+    group: "Graph", parse: "raw", args: "[--project S]", aliases: ["queue"],
+    summary: "the decision queue (local: lib/queue; remote: /v1/queue)",
+    help: "Show the ranked decision queue. Remote mode reads /v1/queue; local mode is a\nbyte-identical passthrough to lib/queue.js, so it also accepts that script's\nflags (--days, --no-front, --limit, --name-only, --nodes).",
+    options: {
+      project: { type: "string", value: "S", desc: "scope to a project slug (default: inferred)" },
+      json: { type: "boolean", desc: "machine-readable JSON output" },
+    },
+    examples: ["spor next", "spor next --project spor --json"],
+    run: (cfg, args) => cmdNext(cfg, args),
+  },
+  get: {
+    group: "Graph", parse: "strict", args: "<id>", options: {},
+    summary: "a node by id (local: file; remote: /v1/nodes/<id>)",
+    help: "Print one node's raw markdown by id. Remote mode reads /v1/nodes/<id>; local\nmode reads the node file. A missing node exits 1.",
+    examples: ["spor get dec-cc-zero-dep-client"],
+    run: (cfg, p) => cmdGet(cfg, p),
+  },
+  lens: {
+    group: "Graph", parse: "raw", args: "[<id>]", aliases: ["render-lens"],
+    summary: "render a saved view (remote)",
+    help:
+      "Render a saved lens (remote only — lenses render server-side). With no id,\n" +
+      "lists the lens catalog; with an id, renders it. Any extra --PARAM VALUE flags\n" +
+      "beyond --format/--json are forwarded to the lens as render parameters.",
+    options: {
+      format: { type: "string", value: "text|json", desc: "server rendering format (default: text)" },
+      json: { type: "boolean", desc: "force JSON: the raw catalog / view tree" },
+    },
+    examples: ["spor lens", "spor lens lens-roadmap", "spor lens lens-roadmap --project spor"],
+    run: (cfg, args) => cmdLens(cfg, args),
+  },
+
+  // --- Repo scoping ---
+  disable: {
+    group: "Repo scoping", parse: "strict", args: "", options: {},
+    summary: "turn Spor off for this repo (.spor.json)",
+    help: "Set { enabled: false } in this repo's committable .spor.json. The hooks then\nno-op here until re-enabled. Commit the file to share the setting.",
+    run: (cfg) => cmdScope(false),
+  },
+  enable: {
+    group: "Repo scoping", parse: "strict", args: "", options: {},
+    summary: "turn Spor back on for this repo (.spor.json)",
+    help: "Set { enabled: true } in this repo's committable .spor.json, undoing a prior\n'spor disable'.",
+    run: (cfg) => cmdScope(true),
+  },
+  link: {
+    group: "Repo scoping", parse: "strict", args: "<slug>", options: {},
+    summary: "set this repo's canonical project slug (.spor marker)",
+    help: "Write a .spor identity marker (repo: <slug>) at the repo root, fixing a wrong\ninferred slug deterministically. The slug must be canonical (^[a-z0-9][a-z0-9-]*$).\nWith no slug it uses the inferred one. Commit the marker to share the identity.",
+    examples: ["spor link my-repo"],
+    run: (cfg, p) => cmdLink(cfg, p),
+  },
+  compile: {
+    group: "Repo scoping", parse: "raw", args: "<args>",
+    summary: "full neighborhood / digest (local; byte-identical)",
+    help: "Compile a node neighborhood or a prompt-time digest from the local graph.\nByte-identical passthrough to lib/compile.js (norm-cc-byte-identical-refactor).",
+    options: {
+      root: { type: "string", value: "id", desc: "compile a node's neighborhood" },
+      query: { type: "string", value: "text", desc: "compile from free-text (query mode)" },
+      project: { type: "string", value: "slug", desc: "session slug (scopes project: corrections)" },
+      nodes: { type: "string", value: "dir", desc: "graph nodes dir (default: $SPOR_HOME/nodes)" },
+      digest: { type: "boolean", desc: "emit a compact prompt-time digest" },
+      skeleton: { type: "boolean", desc: "write a versioned briefing-node skeleton (root mode)" },
+      "min-sim": { type: "string", value: "n", desc: "query-mode relevance gate (default: 0.08)" },
+      out: { type: "string", value: "file", desc: "write to a file instead of stdout" },
+      quiet: { type: "boolean", desc: "suppress the stderr stats / no-graph lines" },
+    },
+    examples: ['spor compile --root dec-x', 'spor compile --query "auth token rotation" --digest'],
+    run: (cfg, args) => cmdCompile(cfg, "compile", args),
+  },
+  brief: {
+    group: "Repo scoping", parse: "raw", args: "<id>",
+    summary: "compile a briefing for a node (sugar for compile --root <id>)",
+    help: "Compile a briefing for one node — sugar for 'compile --root <id>'. Byte-\nidentical passthrough to lib/compile.js.",
+    examples: ["spor brief dec-cc-zero-dep-client"],
+    run: (cfg, args) => cmdCompile(cfg, "brief", args),
+  },
+  validate: {
+    group: "Repo scoping", parse: "raw", args: "",
+    summary: "lint the local graph (byte-identical)",
+    help: "Lint the local graph and exit 1 on errors. Byte-identical passthrough to\nlib/validate.js.",
+    options: { nodes: { type: "string", value: "dir", desc: "graph nodes dir to lint" } },
+    run: (cfg, args) => passthrough("validate.js", args),
+  },
+
+  // --- Dispatch ---
+  dispatch: {
+    group: "Dispatch (Claude Code background agents)", parse: "strict", args: '"<task>" | <node-id>', aliases: ["bg"],
+    summary: "compile a briefing + launch 'claude --bg' in the repo",
+    help:
+      "Compile a briefing for a task and launch a Claude Code background agent in the\n" +
+      "right repo. Give free-text, a <node-id>, --node <id>, --from-queue (the top\n" +
+      "ranked item), or --backfill (onboard/repair a repo). The target dir is the\n" +
+      "slug->path map ('spor repos'), overridable with --dir.\n\n" +
+      "--template supplies your own prompt with {{brief}}/{{task}}/{{node}}/{{title}}/\n" +
+      "{{slug}}/{{dir}}/{{default}} placeholders.",
+    options: {
+      dir: { type: "string", value: "path", desc: "launch directory (overrides the slug map)" },
+      node: { type: "string", value: "id", desc: "dispatch a specific node id" },
+      slug: { type: "string", value: "slug", desc: "target project slug (cross-repo resolution)" },
+      model: { type: "string", value: "M", desc: "claude --model" },
+      "permission-mode": { type: "string", value: "P", desc: "claude --permission-mode" },
+      agent: { type: "string", value: "A", desc: "claude --agent" },
+      name: { type: "string", value: "N", desc: "claude --name (session name)" },
+      template: { type: "string", value: "F", desc: "prompt template file (placeholders above)" },
+      full: { type: "boolean", desc: "full briefing instead of the digest" },
+      "no-brief": { type: "boolean", desc: "raw task prompt, no briefing block" },
+      "from-queue": { type: "boolean", desc: "dispatch the top-ranked queue item" },
+      backfill: { type: "boolean", desc: "onboard/repair this repo (runs /spor:backfill)" },
+      print: { type: "boolean", desc: "dry run — print the prompt, launch nothing" },
+      "dry-run": DRYRUN_OPT,
+    },
+    examples: ['spor dispatch "rotate the pipeline auth tokens" --dir ../api', "spor dispatch dec-x --model haiku", "spor dispatch --from-queue --print"],
+    run: (cfg, p) => cmdDispatch(cfg, p),
+  },
+  repos: {
+    group: "Dispatch (Claude Code background agents)", parse: "raw", args: "[list | add <slug> <path> | rm <slug>]",
+    summary: "the local slug->repo-dir map used to pick the dispatch directory",
+    help: "Show or edit the per-machine slug->repo-dir map dispatch uses to find a repo.\nThe map self-registers as you open sessions.\n\n  spor repos                 list the map\n  spor repos add <slug> <p>  map a slug to a path\n  spor repos rm <slug>       forget a mapping",
+    examples: ["spor repos", "spor repos add api ~/code/api"],
+    run: (cfg, args) => cmdRepos(cfg, args),
+  },
+
+  // --- Other ---
+  cost: {
+    group: "Other", parse: "raw", args: "[--since D]",
+    summary: "LLM spend summary from journal/llm-calls (local)",
+    help: "Summarize recorded LLM spend from journal/llm-calls. Byte-identical\npassthrough to lib/cost.js.",
+    options: {
+      since: { type: "string", value: "YYYY-MM-DD", desc: "include calls on/after this date" },
+      until: { type: "string", value: "YYYY-MM-DD", desc: "include calls on/before this date" },
+      project: { type: "string", value: "slug", desc: "scope to a project" },
+      json: { type: "boolean", desc: "machine-readable JSON output" },
+    },
+    examples: ["spor cost", "spor cost --since 2026-06-01"],
+    run: (cfg, args) => passthrough("cost.js", args),
+  },
+  version: {
+    group: "Other", parse: "meta", args: "", summary: "print version",
+    run: () => 0,
+  },
+  help: {
+    group: "Other", parse: "meta", args: "[<command>]", summary: "this message, or a command's detailed help",
+    run: () => 0,
+  },
+};
+
+const GROUP_ORDER = [
+  "Getting started",
+  "Team admin (remote, admin token)",
+  "Graph",
+  "Repo scoping",
+  "Dispatch (Claude Code background agents)",
+  "Other",
+];
+
+// alias -> canonical verb (every canonical maps to itself).
+const ALIAS_TO_CANON = (() => {
+  const m = {};
+  for (const [name, e] of Object.entries(COMMANDS)) {
+    m[name] = name;
+    for (const a of e.aliases || []) m[a] = name;
+  }
+  return m;
+})();
+function resolveVerb(v) {
+  return Object.prototype.hasOwnProperty.call(ALIAS_TO_CANON, v) ? ALIAS_TO_CANON[v] : null;
+}
+
+// Build the parseArgs options descriptor from a table entry's options, dropping
+// the help-only keys (desc/value) so only {type, short, multiple} reach parseArgs.
+function paOptions(options) {
+  const o = {};
+  for (const [name, spec] of Object.entries(options || {})) {
+    o[name] = { type: spec.type };
+    if (spec.short) o[name].short = spec.short;
+    if (spec.multiple) o[name].multiple = true;
+  }
+  return o;
+}
+
+// Closest candidate by edit distance, for "did you mean --foo?" hints.
+function editDistance(a, b) {
+  const dp = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0));
+  for (let i = 0; i <= a.length; i++) dp[i][0] = i;
+  for (let j = 0; j <= b.length; j++) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i++)
+    for (let j = 1; j <= b.length; j++)
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+  return dp[a.length][b.length];
+}
+function suggest(word, candidates) {
+  let best = null;
+  let bestD = Infinity;
+  for (const c of candidates) {
+    const d = editDistance(word, c);
+    if (d < bestD) {
+      bestD = d;
+      best = c;
+    }
+  }
+  return bestD <= Math.max(2, Math.ceil(word.length / 3)) ? best : null;
+}
+
+// Turn a parseArgs throw into a friendly, no-stack-trace error + a flag hint.
+function parseError(e, entry, verb) {
+  const m = /'(-{1,2}[^']+)'/.exec(e.message || "");
+  if (e.code === "ERR_PARSE_ARGS_UNKNOWN_OPTION" && m) {
+    err(`spor ${verb}: unknown flag '${m[1]}'`);
+    const s = suggest(m[1].replace(/^-+/, ""), Object.keys(entry.options || {}));
+    if (s) err(`  did you mean --${s}?`);
+    err(`  run 'spor ${verb} --help' for the flag list.`);
+    return 1;
+  }
+  err(`spor ${verb}: ${e.message}`);
+  err(`  run 'spor ${verb} --help' for usage.`);
+  return 1;
+}
+
+// The top-level listing, generated from the table so it can't drift.
+function renderTopHelp() {
+  const verbs = Object.keys(COMMANDS);
+  const sigOf = (v) => `${v}${COMMANDS[v].args ? " " + COMMANDS[v].args : ""}`;
+  const width = Math.min(22, Math.max(...verbs.map((v) => sigOf(v).length)));
+  const lines = [HELP_HEADER, ""];
+  for (const group of GROUP_ORDER) {
+    const inGroup = verbs.filter((v) => COMMANDS[v].group === group);
+    if (!inGroup.length) continue;
+    lines.push(group);
+    for (const v of inGroup) lines.push(`  ${sigOf(v).padEnd(width)}  ${COMMANDS[v].summary}`);
+    lines.push("");
+  }
+  lines.push(HELP_FOOTER);
+  return lines.join("\n");
+}
+
+// One command's detailed page (usage, aliases, description, flags, examples).
+function renderCmdHelp(verb) {
+  const e = COMMANDS[verb];
+  const opts = Object.entries(e.options || {});
+  const sig = `spor ${verb}${e.args ? " " + e.args : ""}${opts.length ? " [options]" : ""}`;
+  const lines = [sig, "", e.summary];
+  if (e.aliases && e.aliases.length) lines.push(`Aliases: ${e.aliases.join(", ")}`);
+  if (e.help) lines.push("", e.help);
+  if (opts.length) {
+    const rendered = opts.map(([name, o]) => [`--${name}${o.type === "string" ? ` <${o.value || "value"}>` : ""}`, o.desc || ""]);
+    const w = Math.min(26, Math.max(...rendered.map((r) => r[0].length)));
+    lines.push("", "Options:");
+    for (const [flag, desc] of rendered) lines.push(`  ${flag.padEnd(w)}  ${desc}`);
+  }
+  if (e.examples && e.examples.length) {
+    lines.push("", "Examples:");
+    for (const ex of e.examples) lines.push(`  ${ex}`);
+  }
+  return lines.join("\n");
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const verb = argv.shift();
   const args = argv;
   const cfg = loadConfig({ cwd: process.cwd() });
 
-  switch (verb) {
-    case undefined:
-    case "help":
-    case "-h":
-    case "--help":
-      out(HELP);
-      return 0;
-    case "version":
-    case "--version":
-    case "-v":
-      out(version());
-      return 0;
-    case "init":
-      return cmdInit(cfg);
-    case "install":
-    case "setup":
-      return await cmdInstall(cfg, args);
-    case "upgrade":
-    case "update":
-      return await cmdUpgrade(cfg, args);
-    case "status":
-      return await cmdStatus(cfg);
-    case "whoami":
-      return await cmdWhoami(cfg);
-    case "join":
-    case "login":
-      return await cmdJoin(cfg, args);
-    case "migrate":
-    case "push":
-      return cmdMigrate(cfg, args);
-    case "add":
-    case "capture":
-      return await cmdAdd(cfg, args);
-    case "enable":
-      return cmdScope(true);
-    case "disable":
-      return cmdScope(false);
-    case "link":
-      return cmdLink(args);
-    case "invite":
-      return await cmdInvite(cfg, args);
-    case "token":
-      return await cmdToken(cfg, args);
-    case "next":
-    case "queue":
-      return await cmdNext(cfg, args);
-    case "get":
-      return await cmdGet(cfg, args);
-    case "lens":
-    case "render-lens":
-      return await cmdLens(cfg, args);
-    case "compile":
-    case "brief":
-      return cmdCompile(cfg, verb, args);
-    case "dispatch":
-    case "bg":
-      return await cmdDispatch(cfg, args);
-    case "repos":
-      return cmdRepos(cfg, args);
-    case "validate":
-      return passthrough("validate.js", args);
-    case "cost":
-      return passthrough("cost.js", args); // local: LLM spend summary
-    default:
-      err(`spor: unknown verb '${verb}'. Try 'spor help'.`);
-      return 1;
+  // Top-level help / version are intercepted before table dispatch. `spor help
+  // <command>` prints that command's detailed page.
+  if (verb === undefined || verb === "help" || verb === "-h" || verb === "--help") {
+    const topic = verb === "help" && args[0] ? resolveVerb(args[0]) : null;
+    out(topic && COMMANDS[topic].parse !== "meta" ? renderCmdHelp(topic) : renderTopHelp());
+    return 0;
   }
+  if (verb === "version" || verb === "--version" || verb === "-v") {
+    out(version());
+    return 0;
+  }
+
+  const canon = resolveVerb(verb);
+  if (!canon || COMMANDS[canon].parse === "meta") {
+    err(`spor: unknown verb '${verb}'. Try 'spor help'.`);
+    return 1;
+  }
+  const entry = COMMANDS[canon];
+
+  // `spor <command> --help|-h` => the command's own page.
+  if (args.includes("--help") || args.includes("-h")) {
+    out(renderCmdHelp(canon));
+    return 0;
+  }
+
+  if (entry.parse === "raw") return await entry.run(cfg, args, verb);
+
+  // strict: util.parseArgs is the parser; a parse failure is a friendly error.
+  let parsed;
+  try {
+    parsed = parseArgs({ args, options: paOptions(entry.options), allowPositionals: true, strict: true });
+  } catch (e) {
+    return parseError(e, entry, canon);
+  }
+  return await entry.run(cfg, parsed, verb);
 }
 
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),

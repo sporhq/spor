@@ -67,6 +67,59 @@ test('unknown verb exits 1 with a hint', () => {
   assert.match(r.stderr, /unknown verb/);
 });
 
+// --- table-driven help + parsing (task-cc-spor-cli-flag-parsing-help) -------
+// One COMMANDS table drives dispatch, util.parseArgs flag parsing, and help —
+// top-level AND per-command. These pin the new surfaces.
+
+test('top-level help is generated from the table (grouped, with the footer)', () => {
+  const r = run(['help']);
+  assert.strictEqual(r.status, 0);
+  // groups present
+  assert.match(r.stdout, /Getting started/);
+  assert.match(r.stdout, /Repo scoping/);
+  // a command line and the "--help for detail" footer
+  assert.match(r.stdout, /install \[host\.\.\.\]/);
+  assert.match(r.stdout, /Run 'spor <command> --help'/);
+});
+
+test("'spor <command> --help' prints that command's detailed page", () => {
+  const r = run(['add', '--help']);
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /^spor add /m);     // usage line
+  assert.match(r.stdout, /Aliases: capture/); // alias surfaced
+  assert.match(r.stdout, /Options:/);
+  assert.match(r.stdout, /--type <T>/);       // a flag with its value placeholder
+  // -h is the same as --help, and dispatch (a strict verb) documents its flags
+  const h = run(['dispatch', '-h']);
+  assert.strictEqual(h.status, 0);
+  assert.match(h.stdout, /--from-queue/);
+  assert.match(h.stdout, /--no-brief/);
+});
+
+test("'spor help <command>' is the same as '<command> --help'", () => {
+  const a = run(['help', 'install']);
+  const b = run(['install', '--help']);
+  assert.strictEqual(a.status, 0);
+  assert.strictEqual(a.stdout, b.stdout);
+  // an alias resolves to its canonical page
+  assert.match(run(['help', 'queue']).stdout, /^spor next /m);
+});
+
+test('an unknown flag on a strict command exits 1 with a suggestion, no stack', () => {
+  const r = run(['install', 'codex', '--scpoe', 'user']);
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /unknown flag '--scpoe'/);
+  assert.match(r.stderr, /did you mean --scope\?/);
+  assert.doesNotMatch(r.stderr, /at Object|\bError:/); // friendly, not a throw
+});
+
+test('a flag missing its value is a friendly error, not a crash', () => {
+  const r = run(['add', 'some text', '--type']); // --type needs a value
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /spor add:/);
+  assert.doesNotMatch(r.stderr, /at Object|\bError:/);
+});
+
 test('init creates the local graph home, idempotently', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-home-'));
   fs.rmSync(home, { recursive: true, force: true }); // start absent
