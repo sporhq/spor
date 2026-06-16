@@ -100,6 +100,10 @@ mode dispatches to the server (mirroring `/spor:brief`). Much of this is what
 the session hooks already inject for you automatically; pulling one on demand
 with `spor brief`, `spor compile`, or `/spor:brief` is the same briefing.
 Passing `--nodes <dir>` always targets that local checkout, even under a server.
+In local mode, add `--project <repo-slug>` to scope to a repo: without it
+`compile --root`/`--query` run *project-blind* and the `always_on` norm
+ride-along ignores `applies_to_*` scoping (every norm rides along) — pass it to
+match what a real session in that repo sees. `/spor:brief` does this for you.
 
 **In Cowork (Anthropic's chat workspace) and Claude Code with the connector**
 there is no shell and no ambient injection — reach the graph through the

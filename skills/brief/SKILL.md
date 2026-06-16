@@ -37,14 +37,26 @@ Steps:
    **Local mode (personal graph) — `SPOR_SERVER` unset:** first resolve the
    plugin root — `${CLAUDE_PLUGIN_ROOT}` is empty in the Bash tool, so read
    the path the session-start hook cached
-   (issue-cc-skill-plugin-root-unsubstituted):
+   (issue-cc-skill-plugin-root-unsubstituted) — then resolve THIS repo's
+   project slug the same way a session does, so the compile is scoped to the
+   repo you're in instead of project-blind:
    ```bash
    SPOR_ROOT="$(cat "${SPOR_HOME:-$HOME/.spor}/cache/plugin-root" 2>/dev/null \
      || cat "$HOME/.substrate/cache/plugin-root" 2>/dev/null)"
    SPOR_ROOT="${SPOR_ROOT:-$CLAUDE_PLUGIN_ROOT}"
+   SLUG="$(node -e 'process.stdout.write(require("'"$SPOR_ROOT"'/scripts/engines/util.js").projectSlug(process.cwd()))' 2>/dev/null)"
    ```
-   - node id: `node "$SPOR_ROOT/lib/compile.js" --root <id> --skeleton`
-   - query: `node "$SPOR_ROOT/lib/compile.js" --query "<text>"`
+   - node id: `node "$SPOR_ROOT/lib/compile.js" --root <id> --skeleton ${SLUG:+--project "$SLUG"}`
+   - query: `node "$SPOR_ROOT/lib/compile.js" --query "<text>" ${SLUG:+--project "$SLUG"}`
+
+   **Always pass `--project "$SLUG"`.** Without it, `compile --root`/`--query`
+   run *project-blind* (`sessionProject == null`): the org-norm ride-along then
+   keeps every `always_on` norm and ignores `applies_to_repos`/`applies_to_tags`/
+   `applies_to_projects` scoping entirely — so an unscoped briefing shows norms a
+   real session in this repo would filter out (the `applies_to_*` selectors match
+   the SESSION repo, not the `--root` node's repo). `--project` makes the compile
+   match what session-start actually injects here.
+
    (The compiler defaults to the global graph at `$SPOR_HOME/nodes`, falling
    back to `~/.spor/nodes` — or a pre-existing `~/.substrate/nodes` when
    `~/.spor` is absent.)
