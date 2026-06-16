@@ -244,3 +244,78 @@ test("dispatch spawns the claude binary with --bg in the target dir", { skip: pr
   assert.ok(argv.includes("--model") && argv.includes("haiku"));
   assert.ok(argv.includes("--name") && argv.includes("dec-x"));
 });
+
+// --- user-supplied prompt templates (task-spor-dispatch-user-prompt-templates)
+// `--template F` replaces the default prompt assembly with the file's contents,
+// substituting Handlebars-style {{placeholder}} tokens from the dispatch context.
+const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const promptOf = (stdout) => stdout.slice(stdout.indexOf("--- prompt ---"));
+
+test("dispatch --template (free text): substitutes {{slug}}/{{dir}}/{{task}}/{{brief}}, takes over the default", () => {
+  const { home, repo } = fixture();
+  const tpl = path.join(home, "t.tpl");
+  fs.writeFileSync(tpl, "SLUG={{slug}} DIR={{dir}}\nTASK: {{task}}\nBRIEF>>>{{brief}}<<<\n");
+  const r = run(["dispatch", "auth token rotation credentials", "--dir", repo, "--slug", "demo", "--template", tpl, "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0);
+  const prompt = promptOf(r.stdout);
+  assert.match(prompt, new RegExp(`SLUG=demo DIR=${esc(repo)}`));
+  assert.match(prompt, /TASK: auth token rotation credentials/);
+  // the compiled digest (which mentions the fixture nodes) landed inside the markers
+  assert.match(prompt, /BRIEF>>>[\s\S]*dec-x[\s\S]*<<</);
+  // the built-in wrapper is gone — the template fully controls the prompt
+  assert.doesNotMatch(prompt, /# Spor briefing \(compiled/);
+  // --print announces which template was used
+  assert.match(r.stdout, new RegExp(`template: ${esc(tpl)}`));
+});
+
+test("dispatch --template (node mode): fills {{node}} and {{title}}", () => {
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const tpl = path.join(home, "n.tpl");
+  fs.writeFileSync(tpl, "NODE={{node}}\nTITLE={{title}}\n");
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cwd-"));
+  const r = run(["dispatch", "dec-x", "--template", tpl, "--print"], { SPOR_HOME: home }, elsewhere);
+  assert.strictEqual(r.status, 0);
+  const prompt = promptOf(r.stdout);
+  assert.match(prompt, /NODE=dec-x/);
+  assert.match(prompt, /TITLE=A demo decision about auth token rotation/);
+});
+
+test("dispatch --template: {{default}} embeds the built-in prompt; unknown placeholders warn and blank out", () => {
+  const { home, repo } = fixture();
+  const tpl = path.join(home, "w.tpl");
+  fs.writeFileSync(tpl, "PRE\n{{default}}\nPOST {{bogus}}END\n");
+  const r = run(["dispatch", "auth token rotation credentials", "--dir", repo, "--template", tpl, "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0);
+  const prompt = promptOf(r.stdout);
+  assert.match(prompt, /PRE\n# Spor briefing \(compiled/); // default prompt embedded verbatim
+  assert.match(prompt, /POST END/); // {{bogus}} stripped to ""
+  assert.match(r.stderr, /unknown template placeholder\(s\): bogus/);
+});
+
+test("dispatch: a {{default}}-only template reproduces the default prompt byte-for-byte", () => {
+  const { home, repo } = fixture();
+  const base = run(["dispatch", "auth token rotation credentials", "--dir", repo, "--print"], { SPOR_HOME: home });
+  const tpl = path.join(home, "id.tpl");
+  fs.writeFileSync(tpl, "{{default}}");
+  const withTpl = run(["dispatch", "auth token rotation credentials", "--dir", repo, "--template", tpl, "--print"], { SPOR_HOME: home });
+  assert.strictEqual(promptOf(withTpl.stdout), promptOf(base.stdout));
+});
+
+test("dispatch: dispatch.template config supplies a default template when --template is absent", () => {
+  const { home, repo } = fixture();
+  const tpl = path.join(home, "cfg.tpl");
+  fs.writeFileSync(tpl, "CFGTPL task={{task}}\n");
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { template: tpl } }) + "\n");
+  // cwd = the (markerless) repo so the cascade can't pick up a stray ancestor .spor.json
+  const r = run(["dispatch", "auth token rotation credentials", "--dir", repo, "--print"], { SPOR_HOME: home }, repo);
+  assert.strictEqual(r.status, 0);
+  assert.match(promptOf(r.stdout), /CFGTPL task=auth token rotation credentials/);
+});
+
+test("dispatch --template with an unreadable path exits 1 before compiling", () => {
+  const { home, repo } = fixture();
+  const r = run(["dispatch", "some task text here please", "--dir", repo, "--template", path.join(home, "nope.tpl"), "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /could not read --template/);
+});
