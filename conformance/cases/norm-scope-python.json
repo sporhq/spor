@@ -1,0 +1,4 @@
+{ "id": "norm-scope-python", "kind": "compile", "corpus": "norm-scope",
+  "input": { "rootId": "dec-acme-arch", "digest": false, "project": "acme-py" },
+  "expected": "norm-scope-python.txt",
+  "covers": "applies_to repo/tag-scoped norm ride-along — the python brief carries the uv (tag), acme-wide (grouping) and global norms but NOT the terraform-repo norm (task-cc-norm-ride-along-repo-tag-scope)" }

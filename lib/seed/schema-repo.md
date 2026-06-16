@@ -35,6 +35,19 @@ inline-list fields:
   the alias as a queue item for human confirmation. An accumulating set,
   not a derivation rule — no single fingerprint survives every rewrite.
 
+A repo may also carry an optional free-form `tags` register
+(task-cc-norm-ride-along-repo-tag-scope):
+
+- `tags: [python, backend]` — labels describing this repo, the matching key
+  for a norm's `applies_to_tags` ride-along selector (schema-norm). A norm
+  scoped `applies_to_tags: [python]` rides along into a session's briefing
+  only when this repo (the session's OWN repo) is tagged `python` — so a
+  `uv` norm stays out of a terraform or Go sibling under the same project
+  grouping. An untagged repo matches no tag-scoped norm (strict — repo
+  tagging is the opt-in that turns scoped norms on). Tags are flat strings,
+  consulted only on repo nodes; a graph with no `tags` behaves exactly as
+  before.
+
 An optional `status: archived` retires the whole repo at end-of-life
 (issue-cc-project-lifecycle-queue-pollution). One identity-level edit hides
 the repo's open tasks/questions from the decision queue for EVERY viewer —

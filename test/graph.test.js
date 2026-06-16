@@ -509,6 +509,128 @@ Norm body wibble${i}.
   assert.deepEqual(r.picks.norms.map((n) => n.id), again.picks.norms.map((n) => n.id));
 });
 
+// ---------- repo/tag-scoped norm ride-along (task-cc-norm-ride-along-repo-tag-scope) ----------
+
+function appliesToFixture() {
+  // One project grouping (proj-acme) over three heterogeneous repos: a
+  // python-tagged repo, a terraform-tagged repo, and an UNTAGGED repo. Norm
+  // summaries use vocabulary disjoint from the root so they ride purely on
+  // always_on, not the content/structural arms.
+  const repo = (id, slug, tagsLine) => [`${id}.md`, `---
+id: ${id}
+type: repo
+slugs: [${slug}]
+${tagsLine}title: Repo ${slug}
+summary: Repo identity for ${slug} zulu yankee.
+date: 2026-06-01
+edges:
+  - {type: grouped-under, to: proj-acme}
+---
+Repo ${slug}.
+`];
+  const norm = (id, scopeLine, vocab) => [`${id}.md`, `---
+id: ${id}
+type: norm
+${scopeLine}title: Standing rule ${id}
+summary: Standing rule about ${vocab}.
+date: 2026-06-01
+---
+Standing rule body about ${vocab}.
+`];
+  return tmpGraph({
+    "proj-acme.md": `---
+id: proj-acme
+type: project
+title: Acme product
+summary: Acme product grouping xray whiskey.
+date: 2026-06-01
+---
+Acme grouping.
+`,
+    "dec-root.md": `---
+id: dec-root
+type: decision
+project: acme-py
+title: Root decision token alpha
+summary: Root decision token alpha bravo charlie delta.
+date: 2026-06-01
+---
+Root decision token alpha bravo charlie delta echo foxtrot.
+`,
+    ...Object.fromEntries([
+      repo("repo-acme-py", "acme-py", "tags: [python, backend]\n"),
+      repo("repo-acme-tf", "acme-tf", "tags: [terraform]\n"),
+      repo("repo-acme-go", "acme-go", ""), // untagged
+      norm("norm-uv", "applies_to_tags: [python]\n", "kilo lima mike"),
+      norm("norm-tf", "applies_to_repos: [repo-acme-tf]\n", "november oscar papa"),
+      norm("norm-proj", "applies_to_projects: [proj-acme]\n", "quebec romeo sierra"),
+      norm("norm-global", "", "tango uniform victor"), // unstamped, no applies_to
+    ]),
+  });
+}
+
+test("norms: applies_to_tags rides along only into a repo carrying the tag", () => {
+  const g = appliesToFixture().load();
+  const py = graph.compile(g, { rootId: "dec-root", digest: false, project: "acme-py" });
+  assert.deepEqual(py.picks.norms.map((n) => n.id).sort(),
+    ["norm-global", "norm-proj", "norm-uv"],
+    "python repo: uv (tag) + proj (grouping) + global ride; tf (other repo) does not");
+});
+
+test("norms: applies_to_repos rides along only in the named repo; uv stays out", () => {
+  const g = appliesToFixture().load();
+  const tf = graph.compile(g, { rootId: "dec-root", digest: false, project: "acme-tf" });
+  assert.deepEqual(tf.picks.norms.map((n) => n.id).sort(),
+    ["norm-global", "norm-proj", "norm-tf"],
+    "terraform repo: tf (repo) + proj (grouping) + global ride; uv (python tag) does not");
+});
+
+test("norms: a tag/repo-scoped norm is strictly EXCLUDED in an untagged repo", () => {
+  const g = appliesToFixture().load();
+  const go = graph.compile(g, { rootId: "dec-root", digest: false, project: "acme-go" });
+  assert.deepEqual(go.picks.norms.map((n) => n.id).sort(),
+    ["norm-global", "norm-proj"],
+    "untagged repo: only the grouping-scoped and global norms ride; no tag/repo match");
+});
+
+test("norms: a project-blind compile keeps every norm (applies_to path byte-identical)", () => {
+  const g = appliesToFixture().load();
+  const blind = graph.compile(g, { rootId: "dec-root", digest: false });
+  assert.deepEqual(blind.picks.norms.map((n) => n.id).sort(),
+    ["norm-global", "norm-proj", "norm-tf", "norm-uv"],
+    "no session project -> the legacy ride-everything path, unchanged");
+});
+
+test("norms: a malformed scalar applies_to_tags is treated as absent, not a crash", () => {
+  const g = tmpGraph({
+    "dec-root.md": `---
+id: dec-root
+type: decision
+project: solo
+title: Root token alpha
+summary: Root token alpha bravo charlie.
+date: 2026-06-01
+---
+Root token alpha bravo charlie.
+`,
+    "norm-bad.md": `---
+id: norm-bad
+type: norm
+applies_to_tags: python
+title: Malformed scope
+summary: Standing rule about delta echo foxtrot.
+date: 2026-06-01
+---
+Body about delta echo foxtrot.
+`,
+  }).load();
+  // applies_to_tags is a bare scalar (no brackets) -> parsed as a string ->
+  // treated as ABSENT, so the norm falls through to project-scope and rides
+  // along (unstamped == global). No throw on the un-wrapped kernel path.
+  const r = graph.compile(g, { rootId: "dec-root", digest: false, project: "solo" });
+  assert.deepEqual(r.picks.norms.map((n) => n.id), ["norm-bad"]);
+});
+
 // ---------- supersession fixup + warning ----------
 
 test("supersession: superseded node carries the inline ⚠ SUPERSEDED warning in full compile", () => {
