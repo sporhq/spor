@@ -333,6 +333,55 @@ test('next (local) is byte-identical passthrough to lib/queue.js', () => {
   assert.strictEqual(viaCli.stdout, viaLib.stdout);
 });
 
+test('query (local) enumerates nodes and edges end-to-end, byte-identical passthrough', () => {
+  // A scratch graph with a typed node and a grouped-under edge.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-cli-query-'));
+  const nodes = path.join(dir, 'nodes');
+  fs.mkdirSync(nodes, { recursive: true });
+  fs.writeFileSync(path.join(nodes, 'repo-a.md'), `---
+id: repo-a
+type: repo
+project: demo
+title: Repo A
+summary: A repo grouped under a project.
+edges:
+  - {type: grouped-under, to: proj-rdi}
+date: 2026-06-01
+---
+Body.
+`);
+  fs.writeFileSync(path.join(nodes, 'proj-rdi.md'), `---
+id: proj-rdi
+type: project
+project: demo
+title: Project RDI
+summary: A grouping project.
+date: 2026-06-01
+---
+Body.
+`);
+  // --type --ids selects the repo node.
+  const byType = run(['query', '--type', 'repo', '--ids', '--nodes', nodes]);
+  assert.strictEqual(byType.status, 0, byType.stderr);
+  assert.strictEqual(byType.stdout.trim(), 'repo-a');
+  // --edges --edge-type --to answers "what is grouped under proj-rdi".
+  const edges = run(['query', '--edges', '--edge-type', 'grouped-under', '--to', 'proj-rdi', '--json', '--nodes', nodes]);
+  assert.strictEqual(edges.status, 0, edges.stderr);
+  assert.deepEqual(JSON.parse(edges.stdout), [{ from: 'repo-a', type: 'grouped-under', to: 'proj-rdi' }]);
+  // byte-identical passthrough to lib/query.js (norm-cc-byte-identical-refactor).
+  const viaLib = runLib('query.js', ['--type', 'repo', '--ids', '--nodes', nodes]);
+  assert.strictEqual(byType.stdout, viaLib.stdout);
+});
+
+test('query (remote, no --nodes) fails fast naming the remote path, no "no Spor graph"', () => {
+  const r = run(['query', '--type', 'task'], { SPOR_SERVER: 'http://127.0.0.1:1', SPOR_TOKEN: 't' });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /query enumerates a LOCAL graph/);
+  assert.match(r.stderr, /spor lens/);
+  assert.doesNotMatch(r.stderr, /no Spor graph/);
+  assert.doesNotMatch(r.stderr, /at Object|Error:/);
+});
+
 test('get (local) prints the node file; missing node exits 1', () => {
   const { dir } = fixtureGraph();
   const ok = run(['get', 'dec-x'], { SPOR_NODES: path.join(dir, 'nodes') });

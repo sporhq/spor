@@ -475,6 +475,21 @@ function cmdValidate(cfg, args) {
   return passthrough("validate.js", args);
 }
 
+// query enumerates a LOCAL graph (lib/query.js) — the structured node/edge
+// list that `get`/`next`/`compile --query` are not (task-spor-local-graph-query-
+// verb). It is the local-mode primitive under remote mode's saved render_lens
+// views, so like validate it is local-only: in remote mode there is no local
+// loadGraph, so fail fast naming that unless --nodes points at a local checkout.
+function cmdQuery(cfg, args) {
+  if (cfg.mode() === "remote" && !namesLocalGraph(args)) {
+    err("query enumerates a LOCAL graph; in remote mode the server holds the graph,");
+    err("  so use a saved view instead (spor lens). Point --nodes at a local checkout");
+    err("  to query it, or unset SPOR_SERVER to query the local graph home.");
+    return 1;
+  }
+  return passthrough("query.js", args);
+}
+
 // --- spor add / capture -------------------------------------------------
 // Local: write a well-formed node so a user never has to learn the frontmatter
 // (issue-cc-local-mode-capture-queue-surfacing-gap). Remote: POST /v1/capture,
@@ -1954,6 +1969,39 @@ const COMMANDS = {
     },
     examples: ["spor lens", "spor lens lens-roadmap", "spor lens lens-roadmap --project spor"],
     run: (cfg, args) => cmdLens(cfg, args),
+  },
+  query: {
+    group: "Graph", parse: "raw", args: "[--type T] [--where k=v] [--edges]",
+    summary: "filterable node/edge enumeration (local)",
+    help:
+      "Deterministic, filterable enumeration over the local graph — the structured\n" +
+      "list that `get` (one node), `next` (the ranked queue) and `compile --query`\n" +
+      "(semantic search) are not. Pure, no LLM. Local-only — it reads the local nodes\n" +
+      "dir; in remote mode use the server's saved `render_lens` views instead (point\n" +
+      "--nodes at a local checkout to query one under a server).\n" +
+      "\n" +
+      "Node selection (AND across distinct flags):\n" +
+      "  --type <T>        nodes of that type: (repeatable -> OR within type)\n" +
+      "  --where key=val   match a frontmatter field (repeatable -> AND); a list\n" +
+      "                    field (e.g. tags) matches on membership\n" +
+      "  --id-prefix <p>   ids starting with <p>\n" +
+      "\n" +
+      "Edge emission (switches output from nodes to {from,type,to} edges; the node\n" +
+      "predicates above then restrict each emitted edge's SOURCE):\n" +
+      "  --edges           emit edges instead of nodes\n" +
+      "  --edge-type <T>   filter edges by type\n" +
+      "  --from <id>       out-edges whose source is <id>\n" +
+      "  --to <id>         in-edges whose target is <id>\n" +
+      "\n" +
+      "Projection: default table; --ids (one id per line), --summary (id + summary),\n" +
+      "--full (raw node block), --json (machine output). --nodes <dir> overrides the\n" +
+      "graph dir.",
+    examples: [
+      "spor query --type repo --ids",
+      "spor query --where status=open --type task --json",
+      "spor query --edges --edge-type grouped-under --to proj-rdi",
+    ],
+    run: (cfg, args) => cmdQuery(cfg, args),
   },
 
   // --- Repo scoping ---

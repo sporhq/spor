@@ -93,7 +93,20 @@ spor brief <id>                # a briefing for one node (compile --root <id>)
 # local (personal graph) only — fail fast with a redirect in remote mode
 spor validate                  # lint the local graph (server validates per-write remotely)
 spor compile --root <id> --skeleton   # writes a local briefing-node skeleton
+spor query --type task --where status=open --ids   # structured node/edge enumeration
 ```
+
+`spor query` is the local structured enumeration — the deterministic,
+predicate-filtered list that `get` (one node), `next` (the ranked queue) and
+`compile --query` (semantic search) are not; it is the local-mode primitive
+under what remote mode offers as saved `render_lens` views (use `spor lens`
+there). It AND-combines node predicates — `--type <T>` (repeatable),
+`--where key=value` (repeatable; a list field like `tags` matches on
+membership), `--id-prefix <p>` — and with `--edges` emits `{from,type,to}`
+edges instead, filterable by `--edge-type`, `--from <id>` (out-edges) and
+`--to <id>` (in-edges), e.g. `spor query --edges --edge-type grouped-under
+--to proj-rdi` answers "what is grouped under proj-rdi". Projections: default
+table, `--ids`, `--summary`, `--full`, `--json`.
 
 `compile`/`brief` are mode-aware: local mode runs the in-repo compiler, remote
 mode dispatches to the server (mirroring `/spor:brief`). Much of this is what
