@@ -1004,10 +1004,25 @@ function safeSlug() {
 }
 
 // The git toplevel of the cwd, or cwd itself — where repo-scoped files live.
+// Worktree-local on purpose: cmdScope/cmdLink/targetPath write committable
+// files (.spor.json, .spor, repo-scoped hook config) into the user's CURRENT
+// checkout, so a linked worktree keeps its own dir, not the main one.
 function repoRoot() {
   const r = spawnSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" });
   const top = (r.stdout || "").trim();
   return top || process.cwd();
+}
+
+// The DURABLE repo root for dispatch: like repoRoot(), but inside a linked git
+// worktree it resolves to the MAIN checkout (dirname --git-common-dir), not the
+// ephemeral worktree dir. dispatch persists this dir into the machine-local
+// dispatch.repos slug->path map, so stamping a worktree path would leave a dead
+// mapping the instant the worktree is removed
+// (issue-spor-dispatch-worktree-dir-stamping). This is the same inferenceRoot()
+// session-start already registers with, so the slug (safeSlug -> projectSlug)
+// and the path stay consistent. Byte-identical to repoRoot() outside a worktree.
+function dispatchRoot() {
+  return u.inferenceRoot(process.cwd()) || repoRoot();
 }
 
 // A git invocation inside a given working tree. Captures output so callers can
@@ -1793,7 +1808,10 @@ async function claimDispatch(cfg, nodeId) {
 }
 
 // Resolve the directory to launch in. --dir wins; else a known slug is looked up
-// in the map; else the cwd's repo root. { dir:null } means "slug unknown here".
+// in the map; else the cwd's durable repo root. { dir:null } means "slug unknown
+// here". The cwd fallback uses dispatchRoot() (not repoRoot()) so a dispatch run
+// from inside a linked worktree registers the main checkout, never the ephemeral
+// worktree path (issue-spor-dispatch-worktree-dir-stamping).
 function resolveDir(cfg, { dir, slug }) {
   if (dir) {
     const abs = path.resolve(dir);
@@ -1803,7 +1821,7 @@ function resolveDir(cfg, { dir, slug }) {
     const p = (cfg.get("dispatch.repos", {}) || {})[slug];
     return p ? { dir: p, slug, source: "config" } : { dir: null, slug, source: "unknown" };
   }
-  return { dir: repoRoot(), slug: safeSlug(), source: "cwd" };
+  return { dir: dispatchRoot(), slug: safeSlug(), source: "cwd" };
 }
 
 // Quote an argv element for the --print display only (never used to spawn).

@@ -136,6 +136,66 @@ test("dispatch --no-brief: raw task prompt, no briefing block", () => {
   assert.doesNotMatch(r.stdout, /# Spor briefing/);
 });
 
+// --- worktree-durable dispatch dir (issue-spor-dispatch-worktree-dir-stamping) --
+// A dispatch run from INSIDE a linked git worktree must resolve (and register)
+// the MAIN checkout, not the ephemeral worktree dir — otherwise removing the
+// worktree leaves a dead dispatch.repos mapping that fails the next dispatch with
+// "target dir does not exist". The cwd fallback uses dispatchRoot() (inferenceRoot,
+// = dirname --git-common-dir), the same durable root session-start registers with,
+// rather than repoRoot() (git --show-toplevel, the worktree dir).
+function gitRepoWithWorktree() {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-wt-"));
+  const main = path.join(base, "wt-main-svc");
+  fs.mkdirSync(main);
+  const g = (args, cwd = main) => {
+    const r = spawnSync("git", ["-C", cwd, ...args], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@example.com",
+        GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@example.com",
+      },
+    });
+    assert.strictEqual(r.status, 0, r.stderr);
+    return r.stdout;
+  };
+  g(["init", "-q"]);
+  fs.writeFileSync(path.join(main, "f.txt"), "x");
+  g(["add", "f.txt"]);
+  g(["commit", "-q", "-m", "root"]);
+  const wt = path.join(base, "wt-ephemeral-checkout");
+  g(["worktree", "add", "-q", wt, "HEAD"]);
+  // git reports realpaths (macOS tmp is a /var -> /private/var symlink), so
+  // compare against the resolved paths the CLI will emit.
+  return { base, main: fs.realpathSync(main), wt: fs.realpathSync(wt) };
+}
+
+test("dispatch from inside a git worktree --print: resolves the MAIN checkout, not the worktree", () => {
+  const { base, main, wt } = gitRepoWithWorktree();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-wt-home-"));
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const r = run(["dispatch", "some free text task to dispatch", "--no-brief", "--print"], { SPOR_HOME: home }, wt);
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, new RegExp(`dir:    ${esc(main)} `), "resolved the main checkout");
+  assert.match(r.stdout, /via cwd/);
+  assert.doesNotMatch(r.stdout, new RegExp(esc(wt)), "never the ephemeral worktree path");
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+test("dispatch from inside a git worktree (local, stubbed): registers the MAIN checkout in dispatch.repos", { skip: process.platform === "win32" }, () => {
+  const { base, main, wt } = gitRepoWithWorktree();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-wt-reg-"));
+  const stub = path.join(home, "claude-stub.sh");
+  fs.writeFileSync(stub, "#!/bin/sh\nexit 0\n");
+  fs.chmodSync(stub, 0o755);
+  const r = run(["dispatch", "some free text task to dispatch", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub }, wt);
+  assert.strictEqual(r.status, 0, r.stderr);
+  const mapped = Object.values(JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8")).dispatch.repos);
+  assert.ok(mapped.includes(main), `main checkout registered (got ${JSON.stringify(mapped)})`);
+  assert.ok(!mapped.includes(wt), "ephemeral worktree path NOT registered");
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
 test("dispatch <node-id>: auto-detects node mode and resolves the dir cross-repo via the map", () => {
   const { home, repo } = fixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home }); // demo -> repo
