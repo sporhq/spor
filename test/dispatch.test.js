@@ -17,6 +17,10 @@ const CLI = path.join(__dirname, "..", "bin", "spor.js");
 // isolate the config-cascade homes to an empty temp dir so the developer's real
 // ~/.spor/config.json can't leak server+token in and flip a test to remote.
 // `extra` is applied last, so SPOR_HOME / SPOR_CLAUDE_CMD passed by a test win.
+// Default the in-flight agent list to empty (SPOR_FAKE_AGENTS_JSON="[]") so the
+// same-machine dispatch guard (task-spor-dispatch-same-machine-guard) never
+// shells out to a real `claude agents --json` — keeping these tests hermetic and
+// deterministic; a guard test overrides it via `extra`.
 const ISO_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-iso-"));
 function bare(extra = {}) {
   const env = {};
@@ -26,6 +30,7 @@ function bare(extra = {}) {
   }
   env.SPOR_HOME = ISO_HOME;
   env.XDG_CONFIG_HOME = ISO_HOME;
+  env.SPOR_FAKE_AGENTS_JSON = "[]";
   return Object.assign(env, extra);
 }
 function run(args, env, cwd) {
@@ -403,6 +408,9 @@ function remoteEnv(home, server, extra = {}) {
   env.XDG_CONFIG_HOME = home;
   env.SPOR_SERVER = server;
   env.SPOR_TOKEN = "test-token";
+  // Empty agent list by default (see bare()), so the same-machine guard never
+  // shells out to a real `claude agents --json`; a guard test overrides via extra.
+  env.SPOR_FAKE_AGENTS_JSON = "[]";
   return Object.assign(env, extra);
 }
 
@@ -564,4 +572,120 @@ test("dispatch <node-id> (local): no lease, no claim line — byte-identical", {
   const r = run(["dispatch", "dec-x", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home });
   assert.strictEqual(r.status, 0);
   assert.doesNotMatch(r.stdout, /^claim:/m);
+});
+
+// --- same-machine duplicate-dispatch guard (task-spor-dispatch-same-machine-guard)
+// `spor dispatch` names each background agent after its node id, so a node whose
+// agent is already in flight on THIS machine is a duplicate the auto-claim can't
+// catch (a same-person re-claim is an idempotent renew). dispatchedAgents() —
+// the same NO-LLM, fail-soft cross-reference `spor next --hide-dispatched` uses,
+// fed here via SPOR_FAKE_AGENTS_JSON — gates the launch; --force overrides. The
+// guard is node mode only and runs in BOTH local and remote (it's a local read).
+const inFlightAgent = (name, extra = {}) =>
+  JSON.stringify([{ id: "g1", name, kind: "background", status: "busy", state: "working", cwd: "/x", ...extra }]);
+
+test("dispatch <node-id> (local): a same-named agent already in flight refuses, no launch", { skip: isWin }, () => {
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: inFlightAgent("dec-x") });
+  assert.strictEqual(r.status, 1, r.stderr);
+  assert.match(r.stderr, /dec-x already has a background agent in flight on this machine/);
+  assert.match(r.stderr, /g1 \(working\)/); // the live agent is named
+  assert.match(r.stderr, /--force/); // the override is suggested
+  assert.ok(!fs.existsSync(sentinel), "no duplicate agent was launched");
+});
+
+test("dispatch <node-id> --force (local): launches despite an agent in flight", { skip: isWin }, () => {
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "dec-x", "--no-brief", "--force"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: inFlightAgent("dec-x") });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(sentinel), "the agent launched with --force");
+});
+
+test("dispatch <node-id> (local): a DONE same-named agent is not in flight — dispatch proceeds", { skip: isWin }, () => {
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const agents = inFlightAgent("dec-x", { status: "idle", state: "done" });
+  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: agents });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(sentinel), "a finished agent does not block dispatch");
+});
+
+test("dispatch free-text (local): NOT guarded even if an agent shares the derived name (node mode only)", { skip: isWin }, () => {
+  const { home, repo } = fixture();
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  // free-text name derives from the first words: "alpha beta gamma"
+  const r = run(["dispatch", "alpha beta gamma", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: inFlightAgent("alpha beta gamma") });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(sentinel), "free-text dispatch is not guarded — only node dispatch is");
+});
+
+test("dispatch <node-id> (local): fails soft on unparseable agents output (no guard, dispatches)", { skip: isWin }, () => {
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: "not json at all" });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(sentinel), "unparseable => empty => no guard => dispatch proceeds");
+});
+
+test("dispatch <node-id> --print: previews the in-flight warning; clean when nothing is in flight", () => {
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const r = run(["dispatch", "dec-x", "--no-brief", "--print"], { SPOR_HOME: home, SPOR_FAKE_AGENTS_JSON: inFlightAgent("dec-x") });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /in-flight: dec-x already has 1 agent\(s\) in flight here/);
+  assert.match(r.stdout, /real dispatch would refuse/);
+  // --force flips the preview note
+  const forced = run(["dispatch", "dec-x", "--no-brief", "--print", "--force"], { SPOR_HOME: home, SPOR_FAKE_AGENTS_JSON: inFlightAgent("dec-x") });
+  assert.match(forced.stdout, /--force set, dispatching anyway/);
+  // and a clean run (no agents) prints no in-flight line at all
+  const clean = run(["dispatch", "dec-x", "--no-brief", "--print"], { SPOR_HOME: home, SPOR_FAKE_AGENTS_JSON: "[]" });
+  assert.doesNotMatch(clean.stdout, /in-flight:/);
+});
+
+test("dispatch <node-id> (remote): an in-flight agent refuses BEFORE the claim — no claim POST, no launch", { skip: isWin }, async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(
+      ["dispatch", "task-rotate", "--dir", repo, "--no-brief"],
+      remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: inFlightAgent("task-rotate") })
+    );
+    assert.strictEqual(r.status, 1, r.stderr);
+    assert.match(r.stderr, /already has a background agent in flight/);
+    assert.ok(!claimHit(hits), "the local guard refuses before any claim is POSTed");
+    assert.ok(!fs.existsSync(sentinel), "no duplicate agent was launched");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch <node-id> --force (remote): still auto-claims and launches", { skip: isWin }, async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(
+      ["dispatch", "task-rotate", "--dir", repo, "--no-brief", "--force"],
+      remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: inFlightAgent("task-rotate") })
+    );
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(claimHit(hits), "--force still auto-claims the lease");
+    assert.ok(fs.existsSync(sentinel), "and launches");
+  } finally {
+    srv.close();
+  }
 });
