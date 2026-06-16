@@ -89,6 +89,7 @@ spor dispatch "wire up token rotation in the pipeline"   # free-text task, brief
 spor dispatch issue-86                                    # a node id — briefs its neighborhood
 spor dispatch --from-queue                                # the top item from 'spor next'
 spor dispatch --backfill                                  # onboard this repo via /spor:backfill
+spor dispatch <task> --template prompt.tpl                # launch your own prompt, context injected
 spor dispatch <task> --print                              # dry run: show dir, prompt, argv
 ```
 
@@ -102,6 +103,16 @@ as you open sessions, so by the time you dispatch a node from another repo,
 Spor already knows where that repo lives. Flags pass through to `claude`
 (`--model`, `--permission-mode`, `--agent`, `--name`); `--full` embeds the whole
 neighborhood and `--no-brief` skips the briefing.
+
+**Your own prompt.** By default the briefing is prepended to a built-in prompt
+shell. Pass `--template <file>` (or set a default path in `dispatch.template`)
+to supply your own prompt instead, with Handlebars-style `{{placeholder}}`
+tokens substituted from the dispatch context: `{{brief}}` (the compiled
+briefing, aka `{{briefing}}`/`{{neighbourhood}}`), `{{task}}`, `{{node}}`,
+`{{title}}`, `{{slug}}`, `{{dir}}`, and `{{default}}` (the whole built-in
+prompt, so you can wrap rather than replace it). Unknown placeholders blank out
+with a warning. The template takes over the prompt entirely — you decide where
+the brief and task land.
 
 ## What your agent gets, and gives back
 

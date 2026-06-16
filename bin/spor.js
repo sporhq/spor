@@ -70,7 +70,9 @@ Dispatch (Claude Code background agents)
   dispatch "<task>"    compile a briefing + launch 'claude --bg' in the repo.
                        Also: dispatch <node-id> | --node <id> | --from-queue |
                        --backfill. Flags: --dir P, --full, --no-brief, --model M,
-                       --permission-mode P, --agent A, --name N, --print
+                       --permission-mode P, --agent A, --name N, --print,
+                       --template F (own prompt; {{brief}}/{{task}}/{{node}}/
+                       {{title}}/{{slug}}/{{dir}}/{{default}} placeholders)
   repos                show the local slug->repo-dir map used to pick the
                        directory (repos add <slug> <path> | repos rm <slug>)
 
@@ -1443,6 +1445,25 @@ function shellQuote(s) {
   return /[^\w./:-]/.test(s) ? `'${String(s).replace(/'/g, "'\\''")}'` : s;
 }
 
+// Render a Handlebars-style {{placeholder}} prompt template against a vars map
+// (task-spor-dispatch-user-prompt-templates). Keys match case-insensitively and
+// tolerate inner whitespace ({{ brief }} == {{brief}}); a known key substitutes,
+// an unknown one substitutes to "" and is collected so the caller can warn. This
+// is the same {{VAR}} convention the externalized server prompts use
+// (dec-prompts-externalized-templates) — kept to a zero-dep single pass rather
+// than pulling in Handlebars. The pass is single-shot via a replace callback, so
+// a substituted value that itself contains {{...}} is never re-scanned.
+function renderTemplate(tpl, vars) {
+  const unknown = [];
+  const text = String(tpl).replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (_m, key) => {
+    const k = key.toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(vars, k)) return vars[k];
+    unknown.push(key);
+    return "";
+  });
+  return { text, unknown };
+}
+
 // Re-enable Spor for a repo by merging { enabled: true } into its committable
 // .spor.json (and clearing a `mode: off`, which also disables). Used by the
 // --backfill onboarding to repair a repo a prior `spor disable` turned off.
@@ -1492,12 +1513,17 @@ async function cmdDispatch(cfg, args) {
   const model = optVal(args, "model");
   const permMode = optVal(args, "permission-mode");
   const agent = optVal(args, "agent");
+  // A user-supplied prompt template (task-spor-dispatch-user-prompt-templates):
+  // --template wins, else a personal default in the config cascade
+  // (dispatch.template — an absolute path, like dispatch.repos). Empty until we
+  // resolve the file below, so an absent option leaves the prompt byte-identical.
+  const templateOpt = optVal(args, "template") || cfg.get("dispatch.template", null);
   let nodeId = optVal(args, "node");
   let targetSlug = optVal(args, "slug");
   let name = optVal(args, "name");
 
   // Positional task text: everything that isn't a flag or a flag's value.
-  const VALUE_OPTS = new Set(["dir", "node", "slug", "model", "permission-mode", "agent", "name"]);
+  const VALUE_OPTS = new Set(["dir", "node", "slug", "model", "permission-mode", "agent", "name", "template"]);
   const pos = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -1509,8 +1535,20 @@ async function cmdDispatch(cfg, args) {
   }
   let taskText = pos.join(" ").trim();
 
+  // Load the template now (before any briefing compile) so a bad path fails fast.
+  let template = null;
+  if (templateOpt) {
+    try {
+      template = fs.readFileSync(path.resolve(templateOpt), "utf8");
+    } catch (e) {
+      err(`could not read --template ${templateOpt}: ${e.message}`);
+      return 1;
+    }
+  }
+
   let brief = "";
   let instruction = "";
+  let nodeTitle = "";
 
   if (fromQueue) {
     const top = await topQueueItem(cfg, targetSlug);
@@ -1542,6 +1580,7 @@ async function cmdDispatch(cfg, args) {
       return 1;
     }
     targetSlug = targetSlug || node.repo || null;
+    nodeTitle = node.title || "";
     if (!noBrief) brief = await compileBriefing(cfg, { nodeId, full, project: targetSlug });
     instruction = `Work on ${nodeId}${node.title ? ` — ${node.title}` : ""}. The compiled Spor briefing above is your standing context.${taskText ? ` ${taskText}` : ""}`;
     name = name || nodeId;
@@ -1567,9 +1606,32 @@ async function cmdDispatch(cfg, args) {
     err(`target dir does not exist: ${res.dir}`);
     return 1;
   }
-  const prompt = brief
+  const defaultPrompt = brief
     ? `# Spor briefing (compiled for this task — your standing context)\n\n${brief}\n\n---\n\n# Task\n\n${instruction}\n`
     : instruction;
+
+  // With no template the launched prompt is byte-identical to before. A template
+  // takes over entirely: it decides where the compiled brief, the task, and the
+  // node metadata land (or wraps the whole default via {{default}}).
+  let prompt = defaultPrompt;
+  if (template != null) {
+    const r = renderTemplate(template, {
+      brief, briefing: brief, neighbourhood: brief, neighborhood: brief,
+      task: instruction, instruction,
+      node: nodeId || "", node_id: nodeId || "",
+      title: nodeTitle,
+      slug: res.slug || "", project: res.slug || "", repo: res.slug || "",
+      dir: res.dir || "",
+      default: defaultPrompt,
+    });
+    if (r.unknown.length) {
+      err(
+        `warning: unknown template placeholder(s): ${[...new Set(r.unknown)].join(", ")} ` +
+          `(available: brief, task, node, title, slug, dir, default)`
+      );
+    }
+    prompt = r.text;
+  }
 
   const claudeBin = claudeCmd();
   const claudeArgs = ["--bg"];
@@ -1589,6 +1651,7 @@ async function cmdDispatch(cfg, args) {
       out(`onboard: ${steps.join("; ")}`);
     }
     out(`brief:  ${brief ? `${brief.length} bytes` : "(none — graph had nothing relevant, or --no-brief/--backfill)"}`);
+    if (template != null) out(`template: ${path.resolve(templateOpt)}`);
     out(`run:    ${claudeBin} ${claudeArgs.slice(0, -1).map(shellQuote).join(" ")} <prompt>`);
     out(`\n--- prompt ---\n${prompt}`);
     return 0;
