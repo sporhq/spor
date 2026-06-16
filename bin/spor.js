@@ -262,6 +262,17 @@ async function cmdNext(cfg, args) {
   const inclTypes = collectMulti("type");
   const exclTypes = collectMulti("exclude-type");
 
+  // In-flight agent surface (task-spor-cli-in-flight-surface). `spor next --json`
+  // stamps each item with an `in_flight` flag by cross-referencing the live
+  // background agents (`claude agents --json`); --hide-dispatched drops the items
+  // that already have one. Both are CLIENT-SIDE presentation: the server's queue
+  // can't see local agents, so this is computed here over either render path. The
+  // cross-reference only runs when one of the two flags asks for it, so the
+  // default queue path stays byte-identical (and never shells out to claude).
+  const wantJson = args.includes("--json");
+  const hideDispatched = args.includes("--hide-dispatched");
+  const needAgents = wantJson || hideDispatched;
+
   if (cfg.mode() === "remote") {
     // --all-projects drops the default scope (firehose); an explicit --project
     // still wins over it. Otherwise fall back to the pinned default, then cwd.
@@ -291,7 +302,20 @@ async function cmdNext(cfg, args) {
     if (scoped && count === 0) {
       err(`project '${scoped}' returned an empty queue — check the slug / grouping id (the server scoped to it and found nothing)`);
     }
-    if (args.includes("--json")) {
+    if (needAgents) {
+      const q = r.json || {};
+      const { items, hidden } = annotateInFlight(q.items || [], dispatchedAgents(), hideDispatched);
+      q.items = items;
+      if (typeof q.count === "number") q.count = Math.max(0, q.count - hidden);
+      if (hideDispatched) q.hidden_dispatched = hidden;
+      if (wantJson) {
+        out(JSON.stringify(q));
+        return 0;
+      }
+      renderQueue(q, hidden);
+      return 0;
+    }
+    if (wantJson) {
       out(JSON.stringify(r.json));
       return 0;
     }
@@ -304,19 +328,141 @@ async function cmdNext(cfg, args) {
   // untouched (preserving the local->global default — we never inject safeSlug()
   // locally). --type/--exclude-type ride through; lib/queue.js parses them.
   const localArgs = (!explicit && pinned && !allProjects) ? [...args, "--project", pinned] : args;
-  return passthrough("queue.js", localArgs);
+  // Default path: byte-identical passthrough (no agent cross-reference). Only the
+  // --json / --hide-dispatched view captures queue.js's result to annotate it.
+  if (!needAgents) return passthrough("queue.js", localArgs);
+  return nextLocalInFlight(localArgs, { wantJson, hideDispatched });
 }
 
-function renderQueue(q) {
+// Local in-flight surface (task-spor-cli-in-flight-surface). The default local
+// `next` is a byte-identical passthrough to lib/queue.js; when --json or
+// --hide-dispatched asks for the agent-aware view we run queue.js with --json,
+// capture its ranked result, cross-reference dispatchedAgents(), and re-emit.
+// queue.js's stderr (e.g. the unknown-project note) is inherited so it still
+// surfaces; an unparseable stdout falls back to forwarding it verbatim, so an
+// error path is never swallowed. The flags are presentation-only — strip them
+// before handing argv to queue.js (which doesn't know them) and force --json.
+function nextLocalInFlight(localArgs, { wantJson, hideDispatched }) {
+  const passArgs = localArgs.filter((a) => a !== "--json" && a !== "--hide-dispatched");
+  passArgs.push("--json");
+  const r = spawnSync(process.execPath, [path.join(ROOT, "lib", "queue.js"), ...passArgs], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  const status = r.status == null ? 1 : r.status;
+  let q;
+  try {
+    q = JSON.parse(r.stdout);
+  } catch {
+    if (r.stdout) process.stdout.write(r.stdout); // forward queue.js's own output
+    return status;
+  }
+  const { items, hidden } = annotateInFlight(q.items || [], dispatchedAgents(), hideDispatched);
+  q.items = items;
+  if (typeof q.count === "number") q.count = Math.max(0, q.count - hidden);
+  if (hideDispatched) q.hidden_dispatched = hidden;
+  if (wantJson) {
+    out(JSON.stringify(q, null, 2)); // match queue.js --json (pretty, 2-space)
+    return status;
+  }
+  renderQueueLocalText(q, hidden);
+  return status;
+}
+
+// Mirror lib/queue.js's HUMAN render for the local --hide-dispatched text path
+// (the --json path re-emits queue.js's own object, so only this form is
+// reconstructed). Kept byte-identical to queue.js by a conformance test — if
+// queue.js's line format moves, that test fails and both must move together
+// (norm-cc-byte-identical-refactor). count was already decremented by `hidden`,
+// so the "(N more — raise --limit)" overflow math is unaffected by hiding.
+function renderQueueLocalText(q, hidden = 0) {
+  const items = (q && q.items) || [];
+  if (!items.length) out("queue empty — nothing queueable and live");
+  for (const [i, it] of items.entries()) {
+    out(`${i + 1}. [${it.score}] ${it.id} — ${it.title} (${it.type}${it.status ? `, ${it.status}` : ""}${it.suggest === "close" ? ", suggest: close" : ""})`);
+    out(`   ${it.why}`);
+  }
+  if (q.count > items.length) out(`(${q.count - items.length} more — raise --limit)`);
+  if (q.muted > 0) out(`(${q.muted} muted — your queue_mute)`);
+  if (hidden > 0) out(`(${hidden} in-flight hidden — --hide-dispatched)`);
+}
+
+// Active background agents keyed by node id (task-spor-cli-in-flight-surface).
+// `spor dispatch` names each background agent after the node id it works
+// (cmdDispatch: name = name || nodeId), so `claude agents --json` lets the queue
+// CLI mark which items already have an agent in flight — a NO-LLM, parseable
+// cross-reference that needs no model guidance. Returns Map<node-id, agent[]> of
+// the BACKGROUND agents still active (state !== "done"), each summarized to
+// {id, name, state, status, cwd}. FAIL-SOFT by contract (the feature is a pure
+// enhancement): the claude binary absent / a nonzero exit / a timeout /
+// unparseable output all yield an EMPTY map, never an error — so `spor next
+// --json` still works in Cowork and plain-shell contexts where claude is absent
+// (every item then reads in_flight:false). SPOR_FAKE_AGENTS_JSON injects canned
+// output for tests, mirroring SPOR_FAKE_MCP_LIST; all claude shell-outs route
+// through claudeCmd() so an SPOR_CLAUDE_CMD stub works too.
+function dispatchedAgents() {
+  try {
+    let text = process.env.SPOR_FAKE_AGENTS_JSON;
+    if (text == null) {
+      const cmd = claudeCmd();
+      if (cmd === "claude" && !hasCmd("claude")) return new Map();
+      const r = spawnSync(cmd, ["agents", "--json"], { encoding: "utf8", timeout: 5000 });
+      if (r.status !== 0 || !r.stdout) return new Map();
+      text = r.stdout;
+    }
+    const arr = JSON.parse(text);
+    if (!Array.isArray(arr)) return new Map();
+    const map = new Map();
+    for (const a of arr) {
+      if (!a || a.kind !== "background" || typeof a.name !== "string") continue;
+      if (a.state === "done") continue; // finished — not in flight
+      const list = map.get(a.name) || [];
+      list.push({ id: a.id, name: a.name, state: a.state, status: a.status, cwd: a.cwd });
+      map.set(a.name, list);
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
+// Stamp items[].in_flight from the dispatched-agent map, optionally dropping the
+// in-flight ones (--hide-dispatched). Every kept item gets an in_flight boolean
+// (so the flag is present on all of them — claude absent => uniformly false);
+// an in-flight item also carries a `dispatched` array of agent summaries.
+// Returns the kept items and the count of hidden ones.
+function annotateInFlight(items, agentMap, hide) {
+  const kept = [];
+  let hidden = 0;
+  for (const it of items || []) {
+    const agents = (it && it.id && agentMap.get(it.id)) || null;
+    const inFlight = !!(agents && agents.length);
+    if (inFlight && hide) {
+      hidden++;
+      continue;
+    }
+    if (it && typeof it === "object") {
+      it.in_flight = inFlight;
+      if (inFlight) it.dispatched = agents;
+    }
+    kept.push(it);
+  }
+  return { items: kept, hidden };
+}
+
+function renderQueue(q, hidden = 0) {
   const items = (q && q.items) || [];
   if (!items.length) {
     out("queue empty — nothing queueable and live");
-    return;
+  } else {
+    for (const it of items) {
+      out(`${(it.score ?? 0).toFixed ? it.score.toFixed(2) : it.score}  ${it.suggest || "do"}  ${it.id}`);
+      if (it.why) out(`        ${it.why}`);
+    }
   }
-  for (const it of items) {
-    out(`${(it.score ?? 0).toFixed ? it.score.toFixed(2) : it.score}  ${it.suggest || "do"}  ${it.id}`);
-    if (it.why) out(`        ${it.why}`);
-  }
+  // Never-silent truncation (task-spor-cli-in-flight-surface): report what
+  // --hide-dispatched removed, the way queue.js surfaces the muted count.
+  if (hidden > 0) out(`(${hidden} in-flight hidden — --hide-dispatched)`);
 }
 
 async function cmdGet(cfg, { positionals }) {
@@ -2051,15 +2197,16 @@ const COMMANDS = {
   next: {
     group: "Graph", parse: "raw", args: "[--project S | --all-projects] [--type T] [--exclude-type T]", aliases: ["queue"],
     summary: "the decision queue (local: lib/queue; remote: /v1/queue)",
-    help: "Show the ranked decision queue. Remote mode reads /v1/queue; local mode is a\nbyte-identical passthrough to lib/queue.js, so it also accepts that script's\nflags (--days, --no-front, --limit, --name-only, --nodes).\n\nSCOPE. --project accepts a repo slug (-> its home-project grouping union), a\nrepo-<slug> node id (-> that single repo), or a grouping id (-> the grouping\nunion); an unknown token warns and yields an empty queue. Pin a default scope\nfor both modes with the queue.project config key (SPOR_QUEUE_PROJECT or\n.spor.json {\"queue\":{\"project\":\"...\"}}); an explicit --project still wins.\n--all-projects (alias --all) widens to the whole-graph cross-project firehose,\ndropping the cwd/pinned default scope (an explicit --project still wins over it).\n\nNODE TYPES. --type/--exclude-type whitelist/blacklist node types from the\nranking; both are repeatable and comma-splittable (--type task,issue). Given\nboth, the include set is narrowed and then the excludes are removed (exclude\nwins on overlap). They compose with --project/--all-projects.",
+    help: "Show the ranked decision queue. Remote mode reads /v1/queue; local mode is a\nbyte-identical passthrough to lib/queue.js, so it also accepts that script's\nflags (--days, --no-front, --limit, --name-only, --nodes).\n\nSCOPE. --project accepts a repo slug (-> its home-project grouping union), a\nrepo-<slug> node id (-> that single repo), or a grouping id (-> the grouping\nunion); an unknown token warns and yields an empty queue. Pin a default scope\nfor both modes with the queue.project config key (SPOR_QUEUE_PROJECT or\n.spor.json {\"queue\":{\"project\":\"...\"}}); an explicit --project still wins.\n--all-projects (alias --all) widens to the whole-graph cross-project firehose,\ndropping the cwd/pinned default scope (an explicit --project still wins over it).\n\nNODE TYPES. --type/--exclude-type whitelist/blacklist node types from the\nranking; both are repeatable and comma-splittable (--type task,issue). Given\nboth, the include set is narrowed and then the excludes are removed (exclude\nwins on overlap). They compose with --project/--all-projects.\n\nIN-FLIGHT. --json stamps each item with an `in_flight` flag (and a `dispatched`\nagent summary when true) by cross-referencing live background agents from\n`claude agents --json` — `spor dispatch` names each agent after its node id, so\nan active agent on a queued item is detectable without model guidance.\n--hide-dispatched drops the items that already have an agent in flight. Both are\nclient-side (the server can't see local agents) and fail soft when the claude\nbinary is absent (every item then reads in_flight:false).",
     options: {
       project: { type: "string", value: "S", desc: "scope to a project slug (default: queue.project config, else inferred)" },
       "all-projects": { type: "boolean", desc: "cross-project firehose — drop the default project scope (alias --all)" },
       type: { type: "string", value: "T", desc: "include only these node types (repeatable, comma-ok)" },
       "exclude-type": { type: "string", value: "T", desc: "exclude these node types from the ranking (repeatable, comma-ok)" },
-      json: { type: "boolean", desc: "machine-readable JSON output" },
+      json: { type: "boolean", desc: "machine-readable JSON output (adds the in_flight flag per item)" },
+      "hide-dispatched": { type: "boolean", desc: "drop items that already have a background agent in flight" },
     },
-    examples: ["spor next", "spor next --project spor --json", "spor next --all-projects --type task,issue", "spor next --exclude-type capture-pending"],
+    examples: ["spor next", "spor next --json", "spor next --json --hide-dispatched", "spor next --all-projects --type task,issue", "spor next --exclude-type capture-pending"],
     run: (cfg, args) => cmdNext(cfg, args),
   },
   get: {
