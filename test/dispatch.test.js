@@ -5,7 +5,8 @@
 // throwaway graph home — never the live graph.
 const test = require("node:test");
 const assert = require("node:assert");
-const { spawnSync } = require("node:child_process");
+const { spawnSync, spawn } = require("node:child_process");
+const http = require("node:http");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -318,4 +319,189 @@ test("dispatch --template with an unreadable path exits 1 before compiling", () 
   const r = run(["dispatch", "some task text here please", "--dir", repo, "--template", path.join(home, "nope.tpl"), "--print"], { SPOR_HOME: home });
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /could not read --template/);
+});
+
+// --- remote auto-claim (task-spor-dispatch-auto-claim) ---------------------
+// A node dispatch in REMOTE mode establishes the claim/lease at dispatch time
+// via POST /v1/nodes/{id}/claim, so concurrent dispatch of the same node is
+// refused before a duplicate agent launches. Driven through the real CLI against
+// an in-process stub server; the bg launch is a stub that drops a sentinel file
+// so we can assert whether it ran. Posix-only (the claude stub is a shell
+// script). spawnSync would block the loop and starve the stub, so these spawn
+// async (mirrors test/claim-nudge.test.js).
+const isWin = process.platform === "win32";
+
+// Env that forces REMOTE mode (SPOR_SERVER + token), isolating the config homes
+// so the dev's real ~/.spor can't leak in. `extra` (e.g. SPOR_CLAUDE_CMD) wins.
+function remoteEnv(home, server, extra = {}) {
+  const env = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
+    env[k] = v;
+  }
+  env.SPOR_HOME = home;
+  env.XDG_CONFIG_HOME = home;
+  env.SPOR_SERVER = server;
+  env.SPOR_TOKEN = "test-token";
+  return Object.assign(env, extra);
+}
+
+function runAsync(args, env, cwd) {
+  return new Promise((resolve) => {
+    let out = "", errOut = "";
+    const c = spawn(process.execPath, [CLI, ...args], { env, cwd, stdio: ["ignore", "pipe", "pipe"] });
+    c.stdout.on("data", (d) => (out += d));
+    c.stderr.on("data", (d) => (errOut += d));
+    c.on("close", (code) => resolve({ status: code, stdout: out, stderr: errOut }));
+  });
+}
+
+// Stub server: answers GET /v1/nodes/{id} (so node resolution succeeds, any id),
+// and POST /v1/nodes/{id}/claim with a caller-chosen status/body. Records hits.
+function claimStub({ claimStatus = 200, claimBody = null } = {}) {
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      hits.push({ method: req.method, url: req.url, body });
+      if (req.method === "GET" && /^\/v1\/nodes\/[^/]+$/.test(req.url)) {
+        const id = decodeURIComponent(req.url.split("/").pop());
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ raw: `---\nid: ${id}\ntype: task\nrepo: demo\ntitle: Demo task ${id}\nsummary: A demo task.\ndate: 2026-06-01\n---\nbody\n` }));
+        return;
+      }
+      if (req.method === "POST" && /^\/v1\/nodes\/[^/]+\/claim$/.test(req.url)) {
+        res.writeHead(claimStatus, { "content-type": "application/json" });
+        res.end(JSON.stringify(claimBody || { ok: true, status: "claimed", lease: { by: "person-anthony" } }));
+        return;
+      }
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end("{}");
+    });
+  });
+  return new Promise((resolve) =>
+    srv.listen(0, "127.0.0.1", () => resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` }))
+  );
+}
+
+// A claude stub that records its launch by touching `sentinel`, then exits 0.
+function claudeStub(dir, sentinel) {
+  const stub = path.join(dir, "claude-stub.sh");
+  fs.writeFileSync(stub, `#!/bin/sh\ntouch "${sentinel}"\nexit 0\n`);
+  fs.chmodSync(stub, 0o755);
+  return stub;
+}
+const claimHit = (hits) => hits.find((h) => h.method === "POST" && /\/claim$/.test(h.url));
+
+test("dispatch <node-id> (remote): auto-claims the node, then launches the agent", { skip: isWin }, async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    const claim = claimHit(hits);
+    assert.ok(claim, "POST .../claim was sent");
+    assert.match(claim.url, /^\/v1\/nodes\/task-rotate\/claim$/);
+    assert.match(r.stdout, /claimed task-rotate/);
+    assert.ok(fs.existsSync(sentinel), "the bg agent launched after the claim");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch (remote): a node already claimed by another aborts WITHOUT launching", { skip: isWin }, async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({
+    claimStatus: 409,
+    claimBody: { error: { code: "conflict", message: "claimed by person-bob until 2026-06-16T16:00:00Z" } },
+  });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 1);
+    assert.ok(claimHit(hits), "the claim was attempted");
+    assert.match(r.stderr, /already claimed/);
+    assert.match(r.stderr, /person-bob/); // the holder is surfaced
+    assert.match(r.stderr, /--no-claim/); // and the override is suggested
+    assert.ok(!fs.existsSync(sentinel), "no duplicate agent was launched");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --no-claim (remote): skips the claim entirely and launches", { skip: isWin }, async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief", "--no-claim"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(!claimHit(hits), "no claim attempted with --no-claim");
+    assert.doesNotMatch(r.stdout, /claimed task-rotate/);
+    assert.ok(fs.existsSync(sentinel), "the agent still launched");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch free-text (remote): no node to claim, so no claim is attempted", { skip: isWin }, async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "some free text task here", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(!claimHit(hits), "free-text dispatch claims nothing");
+    assert.ok(fs.existsSync(sentinel), "the agent launched");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch (remote): a claim server error warns but still dispatches (fail-open)", { skip: isWin }, async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ claimStatus: 500, claimBody: { error: { code: "internal", message: "boom" } } });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(claimHit(hits), "the claim was attempted");
+    assert.match(r.stderr, /could not establish a lease/);
+    assert.match(r.stderr, /internal/); // the failure code is surfaced
+    assert.ok(fs.existsSync(sentinel), "dispatch proceeds despite the outage");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --print (remote node): previews the auto-claim and writes nothing", { skip: isWin }, async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
+  try {
+    const r1 = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief", "--print"], remoteEnv(home, base));
+    assert.strictEqual(r1.status, 0, r1.stderr);
+    assert.match(r1.stdout, /claim:  would establish a lease on task-rotate/);
+    assert.ok(!claimHit(hits), "--print is side-effect-free — no claim POSTed");
+
+    const r2 = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief", "--no-claim", "--print"], remoteEnv(home, base));
+    assert.match(r2.stdout, /claim:  \(--no-claim/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch <node-id> (local): no lease, no claim line — byte-identical", { skip: isWin }, async () => {
+  // Local mode has no pool/contention; the auto-claim is a no-op and emits no
+  // claim line, keeping local node dispatch output unchanged.
+  const { home, repo } = fixture();
+  const r = run(["dispatch", "dec-x", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0);
+  assert.doesNotMatch(r.stdout, /^claim:/m);
 });
