@@ -95,6 +95,14 @@ spor validate                  # lint the local graph (server validates per-writ
 spor compile --root <id> --skeleton   # writes a local briefing-node skeleton
 ```
 
+`spor next --project <token>` accepts three forms: a **repo slug** (resolves
+*up* to its home-project grouping and unions the members — the intuitive token),
+a **`repo-<slug>` node id** (pins that single repo — the escape hatch), or a
+**grouping id `proj-<stem>`** (the grouping union). An unknown token warns on
+stderr and yields an empty queue (it still exits 0). Pin a default scope for both
+modes with the `queue.project` config key (`SPOR_QUEUE_PROJECT`, or `.spor.json`
+`{"queue": {"project": "<token>"}}`); an explicit `--project` always wins.
+
 `compile`/`brief` are mode-aware: local mode runs the in-repo compiler, remote
 mode dispatches to the server (mirroring `/spor:brief`). Much of this is what
 the session hooks already inject for you automatically; pulling one on demand

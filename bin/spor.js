@@ -106,6 +106,38 @@ function cmdInit(cfg) {
   return 0;
 }
 
+// Detect the dead-mute condition for `spor status` (issue-spor-local-mode-queue-
+// mute-noop): the local graph carries a `queue_mute` on at least one person node,
+// but this box's git identity binds to NO matching person node, or to one that
+// holds no mute — so the mutes silently do nothing for this viewer. Returns a
+// one-line note, or null when there's nothing to warn about (no mutes anywhere,
+// or the viewer's own mute IS active). Fail-open: any load / git failure returns
+// null (status must never crash). The graph dir is the same nodesDir cmdStatus
+// already resolved; the git identity is read from the dir that holds the nodes,
+// matching lib/queue.js's gitFront/viewerFor wiring.
+function localMuteNoOp(nodesDir) {
+  try {
+    if (!fs.existsSync(nodesDir)) return null;
+    const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+    const queueLib = require(path.join(ROOT, "lib", "queue.js"));
+    const g = graphLib.loadGraph(nodesDir);
+    // Any person node carrying a non-empty queue_mute register?
+    const muters = Object.values(g.nodes).filter(
+      (n) => n.type === "person" && Array.isArray(n.queue_mute) && n.queue_mute.length);
+    if (!muters.length) return null; // no mutes set anywhere — nothing to warn about
+    const email = queueLib.gitIdentityEmail(path.dirname(nodesDir));
+    const viewer = queueLib.viewerFor(g, email);
+    // The viewer resolves to a person who actually carries a mute -> mutes are
+    // live for this box; no note. (Even an all-expired register counts as wired —
+    // the rot is the validator's/kernel's concern, not a binding failure.)
+    if (viewer && Array.isArray(viewer.queue_mute) && viewer.queue_mute.length) return null;
+    const who = email || "unset";
+    return `queue_mute is set on a person node but your git identity (${who}) resolves to ${viewer ? "a person node without a queue_mute" : "no matching person node"} — mutes are inactive`;
+  } catch {
+    return null; // fail-open: never break status on a graph/git error
+  }
+}
+
 async function cmdStatus(cfg) {
   const mode = cfg.mode();
   const home = cfg.graphHome();
@@ -146,6 +178,15 @@ async function cmdStatus(cfg) {
       out(`  remote). Pick one surface: set SPOR_SERVER/SPOR_TOKEN to go fully remote,`);
       out(`  or disable the claude.ai Spor connector to stay fully local.`);
     }
+    // Dead-mute observability (issue-spor-local-mode-queue-mute-noop). Per-viewer
+    // queue_mute is wired locally now (lib/queue.js viewerFor binds the git
+    // identity to its person node), but it is still a no-op when the graph carries
+    // a queue_mute somewhere yet THIS box's git identity resolves to no matching
+    // person node (or a person node that holds no mute) — exactly the silent half
+    // of the issue. Surface it so the condition is observable instead of mystifying.
+    // Best-effort + fail-open: any load/git error skips the note (never crashes status).
+    const muteNote = localMuteNoOp(nodesDir);
+    if (muteNote) out(`note: ${muteNote}`);
   }
   // The Node prerequisite (issue-spor-onboarding-no-node-silent-fail-open).
   // Always surfaced so a box where the hooks silently no-op has a greppable
@@ -192,9 +233,18 @@ async function cmdWhoami(cfg) {
 }
 
 async function cmdNext(cfg, args) {
+  // Default queue scope (task-spor-queue-default-project-config): a
+  // `queue.project` cascade key pins the default --project in BOTH modes, fixing
+  // the asymmetry where remote defaulted to the cwd slug and local to global. An
+  // explicit --project always wins; `pinned` only fills the gap when no flag was
+  // given. Unset => byte-identical to before (remote keeps the cwd default, local
+  // keeps the global default — no safeSlug() injected locally).
+  const pi = args.indexOf("--project");
+  const explicit = pi >= 0 && args[pi + 1] ? args[pi + 1] : null;
+  const pinned = cfg.get("queue.project", null);
+
   if (cfg.mode() === "remote") {
-    const pi = args.indexOf("--project");
-    const slug = pi >= 0 && args[pi + 1] ? args[pi + 1] : safeSlug();
+    const slug = explicit ?? pinned ?? safeSlug();
     const r = await remote.get(cfg, `/v1/queue?project=${encodeURIComponent(slug)}&limit=10`, { timeoutMs: 6000 });
     if (r.transport) {
       err(`offline — could not reach server (${r.error})`);
@@ -204,6 +254,16 @@ async function cmdNext(cfg, args) {
       err(`queue error ${r.status}`);
       return 1;
     }
+    // Best-effort zero-match note (issue-spor-next-project-token-not-roundtrippable):
+    // unknown-token detection is authoritative only locally (where we hold the
+    // graph); remotely we can only observe an empty result for a SCOPED read and
+    // softly say so on stderr. The cwd-default firehose (no explicit/pinned scope)
+    // is deliberately not flagged — an empty default queue is normal, not a typo.
+    const scoped = explicit ?? pinned;
+    const count = (r.json && (r.json.count ?? (Array.isArray(r.json.items) ? r.json.items.length : null)));
+    if (scoped && count === 0) {
+      err(`project '${scoped}' returned an empty queue — check the slug / grouping id (the server scoped to it and found nothing)`);
+    }
     if (args.includes("--json")) {
       out(JSON.stringify(r.json));
       return 0;
@@ -211,7 +271,12 @@ async function cmdNext(cfg, args) {
     renderQueue(r.json);
     return 0;
   }
-  return passthrough("queue.js", args); // local: byte-identical
+  // local: byte-identical passthrough. When no --project was given but a default
+  // is pinned, inject it so the local read inherits the same default scope as
+  // remote; otherwise pass args untouched (preserving the local->global default —
+  // we never inject safeSlug() locally).
+  const localArgs = !explicit && pinned ? [...args, "--project", pinned] : args;
+  return passthrough("queue.js", localArgs);
 }
 
 function renderQueue(q) {
@@ -1926,9 +1991,9 @@ const COMMANDS = {
   next: {
     group: "Graph", parse: "raw", args: "[--project S]", aliases: ["queue"],
     summary: "the decision queue (local: lib/queue; remote: /v1/queue)",
-    help: "Show the ranked decision queue. Remote mode reads /v1/queue; local mode is a\nbyte-identical passthrough to lib/queue.js, so it also accepts that script's\nflags (--days, --no-front, --limit, --name-only, --nodes).",
+    help: "Show the ranked decision queue. Remote mode reads /v1/queue; local mode is a\nbyte-identical passthrough to lib/queue.js, so it also accepts that script's\nflags (--days, --no-front, --limit, --name-only, --nodes).\n\n--project accepts a repo slug (-> its home-project grouping union), a repo-<slug>\nnode id (-> that single repo), or a grouping id (-> the grouping union); an\nunknown token warns and yields an empty queue. Pin a default scope for both modes\nwith the queue.project config key (SPOR_QUEUE_PROJECT or .spor.json\n{\"queue\":{\"project\":\"...\"}}); an explicit --project still wins.",
     options: {
-      project: { type: "string", value: "S", desc: "scope to a project slug (default: inferred)" },
+      project: { type: "string", value: "S", desc: "scope to a project slug (default: queue.project config, else inferred)" },
       json: { type: "boolean", desc: "machine-readable JSON output" },
     },
     examples: ["spor next", "spor next --project spor --json"],
