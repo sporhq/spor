@@ -1892,6 +1892,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   const full = !!values.full;
   const noBrief = !!values["no-brief"];
   const noClaim = !!values["no-claim"];
+  const force = !!values.force;
   const backfill = !!values.backfill;
   const fromQueue = !!values["from-queue"];
   const dirOpt = values.dir || null;
@@ -2008,6 +2009,17 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     prompt = r.text;
   }
 
+  // Same-machine duplicate-dispatch guard (task-spor-dispatch-same-machine-guard).
+  // `spor dispatch` names each background agent after its node id, so an active
+  // agent with this name means this person already has this node in flight on THIS
+  // machine — a duplicate the auto-claim can't catch (a same-person re-claim is an
+  // idempotent renew by design, dec-cc-task-claim-lease). dispatchedAgents() is the
+  // same NO-LLM, fail-soft cross-reference `spor next --hide-dispatched` uses; node
+  // mode only (mirrors the auto-claim's scope), in BOTH local and remote (it's a
+  // local agent read, independent of the graph backend). claude absent / a stale
+  // exit / unparseable output => empty => no guard (fail-open); --force overrides.
+  const inFlight = nodeId && !backfill ? dispatchedAgents().get(name) || [] : [];
+
   const claudeBin = claudeCmd();
   const claudeArgs = ["--bg"];
   if (name) claudeArgs.push("--name", name);
@@ -2026,6 +2038,15 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
       out(`onboard: ${steps.join("; ")}`);
     }
     out(`brief:  ${brief ? `${brief.length} bytes` : "(none — graph had nothing relevant, or --no-brief/--backfill)"}`);
+    // Same-machine guard preview (node mode, any mode): a real dispatch would
+    // refuse if an agent with this name is already in flight here. Shown only on a
+    // hit, so a clean node --print stays byte-identical to before.
+    if (inFlight.length) {
+      out(
+        `in-flight: ${name} already has ${inFlight.length} agent(s) in flight here` +
+          (force ? " — --force set, dispatching anyway" : " — real dispatch would refuse (--force overrides)")
+      );
+    }
     // Auto-claim preview (remote node dispatch only — local mode has no lease, so
     // nothing is announced there and local --print stays byte-identical).
     if (nodeId && !backfill && cfg.mode() === "remote") {
@@ -2035,6 +2056,16 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     out(`run:    ${claudeBin} ${claudeArgs.slice(0, -1).map(shellQuote).join(" ")} <prompt>`);
     out(`\n--- prompt ---\n${prompt}`);
     return 0;
+  }
+
+  // Refuse a same-machine duplicate BEFORE any side effect or claim
+  // (task-spor-dispatch-same-machine-guard): no repo registration, no lease, no
+  // launch for a node already in flight here. --force overrides.
+  if (inFlight.length && !force) {
+    err(`${name} already has a background agent in flight on this machine — not dispatching a duplicate.`);
+    err(`  in flight: ${inFlight.map((a) => `${a.id || "?"}${a.state ? ` (${a.state})` : ""}`).join(", ")}`);
+    err(`  re-run with --force to dispatch anyway, or 'spor next --json' to review what's already running.`);
+    return 1;
   }
 
   // Side effects (real run only — --print writes nothing). --backfill is the
@@ -2409,6 +2440,9 @@ const COMMANDS = {
       "In remote mode a node dispatch auto-claims the task — it establishes the\n" +
       "heartbeat lease at dispatch time, so concurrent dispatch of the same node is\n" +
       "refused (the holder is named). --no-claim opts out (dispatch with no lease).\n\n" +
+      "A node dispatch is also refused if an agent for that node is already in flight\n" +
+      "on THIS machine (each agent is named after its node id) — catches the\n" +
+      "same-person duplicate the lease's idempotent renew can't. --force overrides.\n\n" +
       "--template supplies your own prompt with {{brief}}/{{task}}/{{node}}/{{title}}/\n" +
       "{{slug}}/{{dir}}/{{default}} placeholders.",
     options: {
@@ -2423,6 +2457,7 @@ const COMMANDS = {
       full: { type: "boolean", desc: "full briefing instead of the digest" },
       "no-brief": { type: "boolean", desc: "raw task prompt, no briefing block" },
       "no-claim": { type: "boolean", desc: "don't auto-claim the lease (remote node dispatch)" },
+      force: { type: "boolean", desc: "dispatch even if an agent for this node is already in flight here" },
       "from-queue": { type: "boolean", desc: "dispatch the top-ranked queue item" },
       backfill: { type: "boolean", desc: "onboard/repair this repo (runs /spor:backfill)" },
       print: { type: "boolean", desc: "dry run — print the prompt, launch nothing" },

@@ -104,6 +104,14 @@ Spor already knows where that repo lives. Flags pass through to `claude`
 (`--model`, `--permission-mode`, `--agent`, `--name`); `--full` embeds the whole
 neighborhood and `--no-brief` skips the briefing.
 
+**No accidental duplicates.** A node dispatch won't double up on work already
+underway. In remote mode it auto-claims the task's heartbeat lease at launch, so
+dispatching a node a teammate already holds is refused with the holder named
+(`--no-claim` opts out). And in either mode, dispatching a node that already has
+a background agent in flight *on this machine* — each agent is named after its
+node id — is refused too, catching the same-person duplicate the lease's
+idempotent renew can't. `--force` overrides the local guard.
+
 **Your own prompt.** By default the briefing is prepended to a built-in prompt
 shell. Pass `--template <file>` (or set a default path in `dispatch.template`)
 to supply your own prompt instead, with Handlebars-style `{{placeholder}}`
