@@ -275,12 +275,23 @@ add files only when you want them. A `.spor.json` (committable) is for
 settings the whole repo should share — never put a `token` there; it is
 honored only from the environment or your user/global config.
 
+**Spor is opt-in per repo.** Installing the plugin does not make every repo you
+open participate: a repo is a no-op (no context injected, nothing distilled into
+the shared graph) until it opts in — either it carries a `.spor`/`.spor.json`
+marker, or `enabled` is set anywhere in the cascade (`SPOR_ENABLED=1`, or
+`enabled:true` in user/global config to turn it on everywhere). `spor enable`
+writes the marker below for you; `spor dispatch --backfill` does it as part of
+onboarding. This keeps unrelated side projects out of your team graph even when
+a server is configured globally. Run `spor status` (or `spor-hook doctor`) in a
+repo to see whether it's active.
+
 ```jsonc
 // .spor.json — committed at a repo root
 {
-  "enabled": false,                 // make the plugin a no-op in this repo:
-                                    // unrelated side projects don't pollute
-                                    // the shared graph (default true)
+  "enabled": true,                  // opt this repo in (what `spor enable`
+                                    // writes). Spor is OFF in a repo with no
+                                    // marker; set false to force a no-op even
+                                    // where a marker would otherwise enable it
   "search": {
     "minSim": 0.10,                 // raise/lower the relevance gate
     "projects": {

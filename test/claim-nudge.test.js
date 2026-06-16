@@ -20,6 +20,9 @@ function freshEnv(home, extra = {}) {
     if (k.startsWith('SUBSTRATE_')) delete env[k];
     if (k.startsWith('SPOR_') && k !== 'SPOR_HOME') delete env[k];
   }
+  // Opt the scratch repo in (task-spor-plugin-opt-in-default) so the claim
+  // heartbeat/nudge path runs; the cwd is a git repo but carries no .spor marker.
+  env.SPOR_ENABLED = '1';
   return { ...env, ...extra };
 }
 

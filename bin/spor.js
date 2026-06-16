@@ -111,7 +111,7 @@ async function cmdStatus(cfg) {
   const home = cfg.graphHome();
   const nodesDir = cfg.nodesDir();
   const slug = safeSlug();
-  out(`mode:     ${mode}${cfg.enabled() ? "" : "  (DISABLED here — plugin is a no-op)"}`);
+  out(`mode:     ${mode}${cfg.enabled() ? "" : "  (not enabled here — run 'spor enable' to opt in; hooks are a no-op)"}`);
   out(`project:  ${slug}`);
   if (mode === "remote") {
     const server = remote.base(cfg);
@@ -730,7 +730,7 @@ function cmdScope(enabled) {
   data.enabled = enabled;
   fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
   out(`${enabled ? "enabled" : "disabled"} Spor for ${root}`);
-  out(`  ${file}${enabled ? "" : " — hooks are now a no-op here; commit it to share the setting"}`);
+  out(`  ${file} — hooks are now ${enabled ? "active" : "a no-op"} here; commit it to share the setting`);
   return 0;
 }
 
@@ -1845,8 +1845,8 @@ const COMMANDS = {
   },
   enable: {
     group: "Repo scoping", parse: "strict", args: "", options: {},
-    summary: "turn Spor back on for this repo (.spor.json)",
-    help: "Set { enabled: true } in this repo's committable .spor.json, undoing a prior\n'spor disable'.",
+    summary: "opt this repo in (.spor.json)",
+    help: "Set { enabled: true } in this repo's committable .spor.json. Spor is opt-in\nper repo — a repo with no .spor/.spor.json marker is a no-op — so this is how\nyou turn it on (and how you undo a prior 'spor disable'). Commit the file to\nshare the setting.",
     run: (cfg) => cmdScope(true),
   },
   link: {

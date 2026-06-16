@@ -39,7 +39,10 @@ test('defaults: unset values fall through to caller fallback (byte-identical)', 
   assert.strictEqual(c.getNum('distill.debounce', 900), 900);
   assert.strictEqual(c.get('distill.model', 'haiku'), 'haiku');
   assert.strictEqual(c.mode(), 'local'); // no server
-  assert.strictEqual(c.enabled(), true);
+  // opt-in default (task-spor-plugin-opt-in-default): a markerless cwd with no
+  // enable flag is a no-op. The get() fallbacks above remain byte-identical; the
+  // activation gate is the one deliberate behavior change.
+  assert.strictEqual(c.enabled(), false);
   assert.deepStrictEqual(c.warnings, []);
 });
 
@@ -102,6 +105,59 @@ test('disable mode: enabled:false and mode:off both make enabled() false', () =>
   assert.strictEqual(cb.mode(), 'off');
 });
 
+// --- opt-in activation (task-spor-plugin-opt-in-default): installing the
+// plugin must not make every repo participate. A repo is a no-op until it has a
+// .spor/.spor.json marker OR an explicit enabled flag somewhere in the cascade.
+
+test('opt-in: a markerless repo is a no-op — even in remote mode (the core guarantee)', () => {
+  const root = tmp();
+  const side = path.join(root, 'side-project');
+  fs.mkdirSync(side);
+  const local = loadConfig({ cwd: side, env: bareEnv({ SPOR_HOME: root }) });
+  assert.strictEqual(local.enabled(), false);
+  // a globally-configured server (remote mode) must NOT silently re-enable an
+  // unrelated side project — distilling it into the team graph is the harm.
+  const remote = loadConfig({ cwd: side, env: bareEnv({ SPOR_HOME: root, SPOR_SERVER: 'https://srv' }) });
+  assert.strictEqual(remote.mode(), 'remote');
+  assert.strictEqual(remote.enabled(), false);
+});
+
+test('opt-in: a .spor.json marker (no enabled key) activates the repo', () => {
+  const root = tmp();
+  write(path.join(root, 'repo', '.spor.json'), { search: { minSim: 0.2 } });
+  const c = loadConfig({ cwd: path.join(root, 'repo'), env: bareEnv({ SPOR_HOME: root }) });
+  assert.strictEqual(c.enabled(), true);
+});
+
+test('opt-in: a flat .spor identity marker activates the repo, and an ancestor marker covers a subdir', () => {
+  const root = tmp();
+  writeMarker(path.join(root, 'repo'), 'repo: thing\n');
+  const c = loadConfig({ cwd: path.join(root, 'repo'), env: bareEnv({ SPOR_HOME: root }) });
+  assert.strictEqual(c.enabled(), true);
+  // nearest-ancestor walk: a markerless deep subdir inherits the repo's opt-in
+  const sub = path.join(root, 'repo', 'a', 'b');
+  fs.mkdirSync(sub, { recursive: true });
+  const cs = loadConfig({ cwd: sub, env: bareEnv({ SPOR_HOME: root }) });
+  assert.strictEqual(cs.enabled(), true);
+});
+
+test('opt-in: enabled via the cascade (SPOR_ENABLED env, user config.json) activates a markerless repo', () => {
+  const root = tmp();
+  const side = path.join(root, 'side');
+  fs.mkdirSync(side);
+  // env flag (sits above the config files)
+  const ce = loadConfig({ cwd: side, env: bareEnv({ SPOR_HOME: root, SPOR_ENABLED: '1' }) });
+  assert.strictEqual(ce.enabled(), true);
+  // user config.json flag (read from SPOR_HOME/config.json)
+  write(path.join(root, 'config.json'), { enabled: true });
+  const cu = loadConfig({ cwd: side, env: bareEnv({ SPOR_HOME: root }) });
+  assert.strictEqual(cu.enabled(), true);
+  // an explicit SPOR_ENABLED=0 disables even a marked repo (explicit beats marker)
+  writeMarker(side, 'repo: side\n');
+  const c0 = loadConfig({ cwd: side, env: bareEnv({ SPOR_HOME: root, SPOR_ENABLED: '0' }) });
+  assert.strictEqual(c0.enabled(), false);
+});
+
 test('getBool honors the shell "0"/"false" convention', () => {
   const dir = tmp();
   const c0 = loadConfig({ cwd: dir, env: bareEnv({ SPOR_HOME: dir, SPOR_NUDGE: '0' }) });
@@ -145,7 +201,9 @@ test('fail-open: malformed config file is skipped with a warning', () => {
   const c = loadConfig({ cwd: root, env: bareEnv({ SPOR_HOME: root }) });
   assert.strictEqual(c.warnings.length, 1);
   assert.match(c.warnings[0], /malformed config/);
-  assert.strictEqual(c.enabled(), true); // defaults intact
+  // a malformed .spor.json contributes no values, but its PRESENCE is still an
+  // opt-in marker (task-spor-plugin-opt-in-default), so the repo stays active.
+  assert.strictEqual(c.enabled(), true);
 });
 
 // --- per-repo `.spor` marker graph home (issue-cc-local-mode-graph-sharing-gap,

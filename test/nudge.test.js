@@ -33,6 +33,9 @@ function scratch() {
 
 function env(home, stub, extra = {}) {
   const e = { ...process.env, SUBSTRATE_HOME: home };
+  // Opt the scratch repo in (task-spor-plugin-opt-in-default); the capture-nudge
+  // path only runs when the hook is active for the (markerless) cwd.
+  e.SPOR_ENABLED = '1';
   delete e.SUBSTRATE_SERVER;
   delete e.SUBSTRATE_TOKEN;
   delete e.SUBSTRATE_DISTILLING;
