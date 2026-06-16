@@ -36,7 +36,10 @@ functions**.
 
 - `node_type` / `prefix` — the type and its id prefix(es).
 - `queueable` — may appear in the decision queue.
-- `always_on` — rides along in every project-relevant compile (norms).
+- `always_on` — rides along in every project-relevant compile (norms). A
+  norm INSTANCE can narrow that ride-along to specific repos with flat
+  `applies_to_tags:`/`applies_to_repos:`/`applies_to_projects:` frontmatter
+  keys (not schema flags) — see concepts.md "Ride-along flags".
 - `traversable: false` — excluded from lineage walks (briefings, corrections).
 - `capturable: false` — never produced by the capture/ingest path.
 - `status.non_resolving` — statuses that count as *not* resolving for the

@@ -18,14 +18,14 @@ the decision queue (QUEUE.md §4).
 | issue | `issue-` | a defect and its resolution lineage | status `open`/`active`/`resolved`; queueable |
 | incident | `inc-` | something that went wrong in operation | queueable |
 | artifact | `art-`, `spec-` | a document, spec, module, or build product | optional delivery status `in-review`/`approved`/`merged`/`released` |
-| norm | `norm-` | a standing convention or constraint | `always_on: true` — rides along in every project-relevant compile (capped to the topically relevant subset) |
+| norm | `norm-` | a standing convention or constraint | `always_on: true` — rides along in every project-relevant compile (capped to the topically relevant subset); narrow it to specific repos with `applies_to_tags:`/`applies_to_repos:`/`applies_to_projects:` |
 | briefing | `brief-` | a compiled briefing (output of the system) | `traversable: false` (never walked) and `capturable: false` |
 | correction | `corr-` | a standing fix to a briefing (pin/exclude/guidance) | `traversable: false`; applied at every future compile of its target |
 | question | `question-` | a routed ask the graph couldn't answer | queueable; status `open`/`answered`; joins the queue until answered |
 | person | `person-` | an org member | anchor for `$viewer` binding and question routing |
 | capture-pending | `cap-` | raw captured text that fit no schema | born status-less; closes only as `merged` or `rejected` |
 | finding | `find-` | a gardener observation (stale anchor, cold work) | filed as a queue item |
-| repo | `repo-` | a durable git-repo identity | carries `slugs:` aliases + `fingerprints:`; heals renames at read time |
+| repo | `repo-` | a durable git-repo identity | carries `slugs:` aliases + `fingerprints:`; heals renames at read time; optional `tags:` are the match key for a norm's `applies_to_tags` |
 | project | `proj-` | a stable grouping above repos | owns members via inbound `grouped-under` edges; owns no slugs/fingerprints itself |
 | workflow | `wf-` | a repeatable automation DAG | created `proposed`, inert until activated; queueable |
 | workflow-run | `run-` | one execution of a workflow | queueable when stuck; `capturable: false` |
@@ -64,6 +64,16 @@ are same-direction synonyms renamed at write time.
 - `traversable: false` (briefing, correction) — excluded from lineage walks.
 - `capturable: false` (briefing, workflow-run) — never produced by capture.
 
+An `always_on` norm rides along project-wide by default, but that scope is the
+whole home-project **grouping** — so under a project that spans heterogeneous
+repos (a terraform repo, a Go service, a Python service) a `uv` norm would bleed
+into all three. Narrow it with flat per-instance selectors on the norm node
+(not the schema): `applies_to_tags: [python]` (matched against the session
+repo's `tags:`), `applies_to_repos: [repo-x]`, `applies_to_projects: [proj-y]`.
+A norm that declares any `applies_to_*` and matches none is **excluded** —
+including in a repo with no `tags:` — so repo tagging is the opt-in. A norm with
+none keeps the default project-wide ride-along.
+
 Don't invent edge variants. The automatic distiller sometimes emits forms like
 `related-to`/`supercedes`/`derives-from`; those normalize to the canonical
 spelling on write — they're the *only* accepted non-canonical forms. A genuinely
@@ -99,8 +109,10 @@ One fact per node; if you're writing "and also…", split it.
 
 Server-stamped fields you don't set by hand: `author`, `authored_via`. Other
 type-specific fields exist (`wake:` dormancy date; `commits:` linked git shas;
-`pin:`/`exclude:` on corrections; `slugs:`/`fingerprints:` on repo nodes;
-`roles:`/`queue_mute:` on person nodes) — see GRAPH.md for the complete list.
+`pin:`/`exclude:` on corrections; `slugs:`/`fingerprints:`/`tags:` on repo nodes;
+`applies_to_tags:`/`applies_to_repos:`/`applies_to_projects:` ride-along
+selectors on norms; `roles:`/`queue_mute:` on person nodes) — see GRAPH.md for
+the complete list.
 
 Validate any local node you write: `spor validate` (or
 `node lib/validate.js`), and fix what it flags.

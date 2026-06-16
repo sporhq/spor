@@ -67,6 +67,12 @@ still used when `~/.spor` is absent).
      `~/.spor/nodes/`; if the knowledge isn't a node yet, create that node
      first per the plugin's GRAPH.md, then pin it)
    - an irrelevant/stale node was included → `exclude: [that-id]`
+     - exception: if the irrelevant node is a **norm bleeding in across repos**
+       (e.g. a `uv` norm showing up in a terraform or Go brief under the same
+       project), the durable fix is to scope the norm at its source — add
+       `applies_to_tags:`/`applies_to_repos:`/`applies_to_projects:` to the norm
+       node and `tags:` to the repos (see GRAPH.md / concepts.md) — not a
+       per-briefing `exclude` you'd have to repeat everywhere it bleeds.
    - emphasis/framing was wrong → free-text guidance in the body
 
 3. Write `~/.spor/nodes/corr-<target>-<n>.md` (n = next free integer):
