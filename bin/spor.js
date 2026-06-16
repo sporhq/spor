@@ -1758,6 +1758,40 @@ async function topQueueItem(cfg, slug) {
   }
 }
 
+// Auto-claim a dispatched node so its lease is established at dispatch time
+// (task-spor-dispatch-auto-claim), reusing the same claim/renew lease the
+// post-tool heartbeat drives (dec-cc-task-claim-lease, task-cc-claim-nudge-hook).
+// REMOTE-MODE ONLY: a claim is a server-held lease; local mode has no pool or
+// contention (dec-cc-task-claim-lease "Local mode"), so the caller skips it and
+// local dispatch stays byte-identical. No session is bound on purpose — the
+// dispatching CLI session ends immediately, while the launched bg agent (a
+// DIFFERENT session) keeps the lease alive: its post-tool hook renews any
+// in_progress lease the person holds (assignee=me). Leaving the lease
+// person-scoped (session:null) is what lets that cross-session heartbeat work;
+// binding it to this short-lived session would orphan the heartbeat. Returns
+// {ok} on success/idempotent-renew, {conflict, message} when the node is already
+// held (the concurrent-dispatch case this guards), or {error} for any other
+// failure (fail-open: the caller warns and dispatches anyway).
+async function claimDispatch(cfg, nodeId) {
+  const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}/claim`, {}, { timeoutMs: 6000 });
+  if (r.ok) return { ok: true, lease: r.json && r.json.lease };
+  // 409 = the node can't be claimed right now — almost always a live lease held
+  // by ANOTHER person (the concurrent-dispatch conflict this feature exists to
+  // catch), occasionally a closed/terminal node. Either way don't launch a
+  // duplicate: surface the server's message (it names holder + expiry for the
+  // lease case) and let the caller abort.
+  if (r.status === 409) {
+    const e = (r.json && r.json.error) || {};
+    return { ok: false, conflict: true, code: e.code || "conflict", message: e.message || "already claimed" };
+  }
+  // Anything else (transport down, 5xx, auth, a non-claimable node type) means
+  // we couldn't establish the lease. Fail-open like the rest of the remote path
+  // (dec-cc-fail-open-hooks / the fail-soft briefing compile): warn and dispatch
+  // without a claim rather than blocking on an outage.
+  const code = r.json && r.json.error && r.json.error.code;
+  return { ok: false, error: r.transport ? r.error : `HTTP ${r.status}${code ? ` (${code})` : ""}` };
+}
+
 // Resolve the directory to launch in. --dir wins; else a known slug is looked up
 // in the map; else the cwd's repo root. { dir:null } means "slug unknown here".
 function resolveDir(cfg, { dir, slug }) {
@@ -1839,6 +1873,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   const dryRun = !!(values.print || values["dry-run"]);
   const full = !!values.full;
   const noBrief = !!values["no-brief"];
+  const noClaim = !!values["no-claim"];
   const backfill = !!values.backfill;
   const fromQueue = !!values["from-queue"];
   const dirOpt = values.dir || null;
@@ -1973,6 +2008,11 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
       out(`onboard: ${steps.join("; ")}`);
     }
     out(`brief:  ${brief ? `${brief.length} bytes` : "(none — graph had nothing relevant, or --no-brief/--backfill)"}`);
+    // Auto-claim preview (remote node dispatch only — local mode has no lease, so
+    // nothing is announced there and local --print stays byte-identical).
+    if (nodeId && !backfill && cfg.mode() === "remote") {
+      out(`claim:  ${noClaim ? "(--no-claim — lease not established)" : `would establish a lease on ${nodeId} at launch`}`);
+    }
     if (template != null) out(`template: ${path.resolve(templateOpt)}`);
     out(`run:    ${claudeBin} ${claudeArgs.slice(0, -1).map(shellQuote).join(" ")} <prompt>`);
     out(`\n--- prompt ---\n${prompt}`);
@@ -1992,6 +2032,23 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   if (claudeBin === "claude" && !hasCmd("claude")) {
     err("claude CLI not on PATH — install Claude Code, then re-run (or 'spor dispatch … --print' to see the prompt).");
     return 1;
+  }
+  // Establish the claim/lease BEFORE launching (task-spor-dispatch-auto-claim):
+  // a node already claimed by someone else is caught here, so we never launch a
+  // duplicate agent onto contested work, and the lease is live the moment the
+  // agent starts (its post-tool writes then renew it — and seeing its own held
+  // claim, it skips the redundant claim-nudge). Remote node-mode only; --no-claim
+  // opts out (dispatch with no lease, the prior behavior).
+  if (nodeId && !backfill && !noClaim && cfg.mode() === "remote") {
+    const c = await claimDispatch(cfg, nodeId);
+    if (c.conflict) {
+      err(`${nodeId} is already claimed — ${c.message}`);
+      err(`  not dispatching a duplicate. Re-run with --no-claim to dispatch anyway (no lease),`);
+      err(`  or pick another task with 'spor next'.`);
+      return 1;
+    }
+    if (c.ok) out(`claimed ${nodeId} (lease established; the agent's writes will renew it)`);
+    else err(`warning: could not establish a lease on ${nodeId}: ${c.error} — dispatching without a claim`);
   }
   const r = spawnSync(claudeBin, claudeArgs, { cwd: res.dir, stdio: "inherit" });
   if (r.error) {
@@ -2331,6 +2388,9 @@ const COMMANDS = {
       "right repo. Give free-text, a <node-id>, --node <id>, --from-queue (the top\n" +
       "ranked item), or --backfill (onboard/repair a repo). The target dir is the\n" +
       "slug->path map ('spor repos'), overridable with --dir.\n\n" +
+      "In remote mode a node dispatch auto-claims the task — it establishes the\n" +
+      "heartbeat lease at dispatch time, so concurrent dispatch of the same node is\n" +
+      "refused (the holder is named). --no-claim opts out (dispatch with no lease).\n\n" +
       "--template supplies your own prompt with {{brief}}/{{task}}/{{node}}/{{title}}/\n" +
       "{{slug}}/{{dir}}/{{default}} placeholders.",
     options: {
@@ -2344,6 +2404,7 @@ const COMMANDS = {
       template: { type: "string", value: "F", desc: "prompt template file (placeholders above)" },
       full: { type: "boolean", desc: "full briefing instead of the digest" },
       "no-brief": { type: "boolean", desc: "raw task prompt, no briefing block" },
+      "no-claim": { type: "boolean", desc: "don't auto-claim the lease (remote node dispatch)" },
       "from-queue": { type: "boolean", desc: "dispatch the top-ranked queue item" },
       backfill: { type: "boolean", desc: "onboard/repair this repo (runs /spor:backfill)" },
       print: { type: "boolean", desc: "dry run — print the prompt, launch nothing" },
