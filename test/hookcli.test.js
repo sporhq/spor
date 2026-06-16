@@ -20,6 +20,9 @@ function freshEnv(home) {
     if (k.startsWith('SUBSTRATE_') && k !== 'SUBSTRATE_HOME') delete env[k];
     if (k.startsWith('SPOR_')) delete env[k];
   }
+  // Spor is opt-in per repo (task-spor-plugin-opt-in-default); the scratch cwd
+  // carries no .spor marker, so opt it in via the cascade or every hook no-ops.
+  env.SPOR_ENABLED = '1';
   return env;
 }
 
@@ -251,6 +254,41 @@ test('post-tool: journals the touched file under the session id', () => {
   assert.strictEqual(line.file, '/x/y.js');
   assert.strictEqual(line.project, 'projx');
   assert.strictEqual(line.tool, 'Write');
+});
+
+// --- opt-in gate (task-spor-plugin-opt-in-default): the dispatcher no-ops every
+// hook in a repo that hasn't opted in (no .spor/.spor.json marker, no enable
+// flag), so running an agent in an unrelated repo injects nothing and writes
+// nothing — even with a brief node present and a non-trivial prompt.
+test('opt-in gate: a markerless repo with no enable flag is a full no-op', () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
+  const bare = freshEnv(home);
+  delete bare.SPOR_ENABLED; // remove the opt-in the helper adds
+
+  // session-start and prompt-context emit nothing (exit 0, empty stdout)
+  assert.strictEqual(
+    run(['session-start', '--host', 'claude-code'],
+      JSON.stringify({ cwd, hook_event_name: 'SessionStart' }), bare),
+    '', 'session-start no-ops when not opted in');
+  assert.strictEqual(
+    run(['prompt-context', '--host', 'claude-code'],
+      JSON.stringify({ cwd, prompt: 'six or more words to clear the gate', hook_event_name: 'UserPromptSubmit' }), bare),
+    '', 'prompt-context no-ops when not opted in');
+
+  // post-tool has no side effect: no per-session journal line is written
+  run(['post-tool', '--host', 'claude-code'],
+    JSON.stringify({ cwd, session_id: 'gate-s', tool_name: 'Write',
+      tool_input: { file_path: '/x/y.js' }, hook_event_name: 'PostToolUse' }), bare);
+  assert.ok(!fs.existsSync(path.join(home, 'journal', 'gate-s.jsonl')),
+    'post-tool writes no journal when not opted in');
+
+  // dropping a .spor marker into the cwd flips the SAME bare env on
+  fs.writeFileSync(path.join(cwd, '.spor'), 'repo: projx\n');
+  const out = run(['session-start', '--host', 'claude-code'],
+    JSON.stringify({ cwd, hook_event_name: 'SessionStart' }), bare);
+  assert.match(JSON.parse(out).hookSpecificOutput.additionalContext, /brief-projx/,
+    'a .spor marker opts the repo in');
 });
 
 test('post-tool: codex tool_input.path is normalized to file_path', () => {

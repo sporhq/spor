@@ -475,6 +475,9 @@ function freshEnv(home) {
     if (k.startsWith('SUBSTRATE_')) delete env[k];
     if (k.startsWith('SPOR_') && k !== 'SPOR_HOME') delete env[k];
   }
+  // Opt these scratch repos in (task-spor-plugin-opt-in-default): the identity
+  // tests assert slug/repo-node behavior, which only runs when the hook is active.
+  env.SPOR_ENABLED = '1';
   return env;
 }
 

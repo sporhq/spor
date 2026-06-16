@@ -217,7 +217,11 @@ high-first: CLI flags > env (`SPOR_*`/`SUBSTRATE_*` via `home.envDual`) > repo
 built-in defaults. **Env sits above the files on purpose**: with no config
 files present every resolved value equals the prior env-or-hardcoded default,
 so the change is byte-identical (norm-cc-byte-identical-refactor, verified
-against the live graph for compile/validate/digest/skeleton). Engines read it
+against the live graph for compile/validate/digest/skeleton). The ONE
+deliberate exception is `Config.enabled()`: the plugin is now opt-IN per repo
+(task-spor-plugin-opt-in-default, see "Opt-in activation" below), so a
+markerless, never-enabled repo resolves to a no-op instead of the old
+default-on — every OTHER resolved value stays byte-identical. Engines read it
 through the active config the dispatcher sets per run
 (`u.useConfig`/`u.config()`/`u.cfgStr`); when none is active, every read falls
 back to the exact `envDual` it replaced, so standalone calls and unit tests
@@ -240,8 +244,20 @@ machine-local state (`/journal/ /cache/ /outbox/ /auth/ /config.json`; durable
 auto-commit when the graph home is the same git repo as the code repo (the
 nested-repo case — `Config.sharedGraphHome()` gates the first,
 `graphInsideCodeRepo()` the second; distilled nodes then ride the human PR
-flow). New levers beyond env migration: per-repo no-op disable (`enabled:false`/`mode:off` → dispatcher
-bails, fail-open), neighborhood-search project controls
+flow). **Opt-in activation (task-spor-plugin-opt-in-default):** the plugin is a
+no-op in any repo that hasn't opted in — `Config.enabled()` is true only when
+mode≠`off` AND either (a) an explicit `enabled` flag resolved anywhere in the
+cascade (`enabled:true`/`false` in any config layer, `SPOR_ENABLED` env, or a
+`--enabled` CLI flag — explicit wins, true on / false off) OR (b) a repo-level
+`.spor` or `.spor.json` marker sits in the cwd ancestry (what `spor
+enable`/`link`/`dispatch --backfill` write; `enable` writes `.spor.json
+{enabled:true}`). Default — no flag, no marker — bails fail-open in the
+dispatcher (`bin/spor-hook.js`) so running an agent in an unrelated side
+project never injects context or distills nodes into the shared graph, even in
+remote mode (a globally-set `SPOR_SERVER` resolves the *mode* to remote but
+does NOT imply *enabled*). The presence walk is `repoMarkerPresent()` in
+lib/config.js; this repo ships its own `.spor.json {enabled:true}` to dogfood
+it. Other levers beyond env migration: neighborhood-search project controls
 (`search.minSim`, `search.projects.{include,exclude,boost}`, applied in
 `lib/kernel/graph.js` compile, no-op when empty), and the `spor dispatch`
 slug→local-path map (`dispatch.repos`, a per-machine `{slug: path}` table the

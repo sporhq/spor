@@ -96,7 +96,7 @@ async function doctor() {
   const kv = (label, value) => L.push(`  ${(label + ":").padEnd(13)}${value}`);
 
   L.push("spor doctor — client health");
-  kv("mode", `${mode}${enabled ? "" : "  (DISABLED here — plugin is a no-op for this repo)"}`);
+  kv("mode", `${mode}${enabled ? "" : "  (not enabled here — run 'spor enable' to opt in; hooks are a no-op for this repo)"}`);
   kv("graph home", graph);
 
   if (u.serverBase()) {

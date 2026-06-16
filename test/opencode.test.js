@@ -46,6 +46,9 @@ fs.chmodSync(stub, 0o755);
 process.env.SUBSTRATE_HOME = HOME;
 process.env.SUBSTRATE_DEBOUNCE = '1';
 process.env.SUBSTRATE_DISTILL_CMD = stub;
+// Spor is opt-in per repo (task-spor-plugin-opt-in-default); the stub project
+// dir carries no .spor marker, so opt it in via the cascade or distill no-ops.
+process.env.SPOR_ENABLED = '1';
 delete process.env.SUBSTRATE_SERVER;
 delete process.env.SUBSTRATE_TOKEN;
 delete process.env.SUBSTRATE_DISTILLING;

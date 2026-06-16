@@ -402,6 +402,19 @@ SPOR_SERVER=https://spor.example.com
 SPOR_TOKEN=spor_pat_...                # per-user token (§4)
 ```
 
+**Opt-in activation.** Spor is opt-in per repo: with the plugin installed, the
+hooks are a full no-op (no context injected, nothing distilled) in any repo that
+has not opted in. A repo is active when its mode is not `off` AND either an
+`enabled` flag is set anywhere in the cascade (`enabled:true`/`false` in a config
+layer, `SPOR_ENABLED=1`/`0`, or a CLI `--enabled`) OR a repo-level `.spor` /
+`.spor.json` marker is present in the cwd ancestry — what `spor enable`, `spor
+link`, and `spor dispatch --backfill` write. An explicit flag wins over marker
+presence (so `enabled:false` forces a no-op even where a marker exists). The
+default — no flag, no marker — is OFF, including in remote mode: a globally
+configured `SPOR_SERVER` resolves the *mode* to remote but does not by itself
+*enable* an unrelated repo, so side projects never distill into the team graph.
+`spor status` / `spor-hook doctor` report whether the current repo is active.
+
 Failure policy: **fail open, never block** — a hook must never break a
 session; connection refused, timeout, 5xx, and auth failure all collapse to
 "the graph has nothing for you".

@@ -112,6 +112,9 @@ function env(home, extra) {
   const e = { ...process.env, SPOR_HOME: home };
   for (const k of ['SPOR_SERVER', 'SPOR_TOKEN', 'SPOR_DISTILLING', 'SUBSTRATE_DISTILLING', 'SPOR_DISTILL', 'SUBSTRATE_HOME'])
     delete e[k];
+  // Opt the scratch repo in (task-spor-plugin-opt-in-default): the distill cost
+  // accounting only runs when the hook is active for the repo.
+  e.SPOR_ENABLED = '1';
   // a stub backend that would record an llm-call and write a node if reached
   e.SPOR_DISTILL_CMD = 'cat >/dev/null; echo NOTHING';
   return Object.assign(e, extra || {});
