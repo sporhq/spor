@@ -52,7 +52,8 @@ The server advertises **`instructions`** (the SDK initialize result, surfaced
 by clients as an "MCP Server Instructions" block). It frames the eleven tools
 as an **ORIENT → TRAVERSE → COMMIT** loop rather than eleven independent
 verbs, so an assistant can infer a recursive research chain — e.g. `my_queue`
-→ `query_graph` with `root_id` (deepen) → `render_lens` on a lineage lens →
+(or `recent_changes` for "what happened lately") → `query_graph` with `root_id`
+(deepen) → `render_lens` on a lineage lens →
 `put_node`/`capture` the outcome — instead of reconstructing it from per-tool
 descriptions. `query_graph`'s `root_id` is the recursive-deepen move (walk
 neighbor → neighbor); `render_lens` lineage lenses trace why a node exists,
@@ -234,6 +235,25 @@ render). Unknown `lens_id` still errors, carrying the same `catalog`/`lenses`
 list; engine failures (missing param, broken blocks) error with the message
 verbatim.
 
+### `recent_changes`
+
+The team's recent-activity feed — the temporal entry point the other read
+tools lack (`query_graph` is semantic search, `my_queue` is forward-looking
+open work, `render_lens` renders current state). It answers "what changed /
+what was done in the last N hours", "what did the agents write overnight", and
+"what landed since `<commit>`". Input `{ "since"?, "project"?, "limit"? }` →
+`{ "changes": [{id, change, commit, date, committed_by, type, title,
+authored_via, author}], "count", "head", "since", "project", "generated_at",
+"node_ids" }`. `since` is a 7–40 hex commit sha (changes in `sha..HEAD`) or a
+date/relative phrase git understands (`"12 hours ago"`, `"2026-06-15"`);
+omitted, it returns the most recent changes. `project` scopes to one project's
+nodes (deletions, whose project is gone, are necessarily omitted when scoped).
+Each entry is decorated with the node's CURRENT `authored_via`
+(`capture`/`distill`/`gardener` = machine, else human) — the trust signal the
+rendered digest/briefing hides. The tool returns the changed nodes as data;
+the model writes the prose summary (no LLM on this path). It is the MCP twin of
+`GET /v1/changes` (§3), sharing one core so the two surfaces never drift.
+
 ### The MCP-app widget (`ui://spor/view-tree.html`)
 
 `my_queue` and `render_lens` declare a UI resource via
@@ -263,6 +283,7 @@ endpoint is the REST twin of a core call:
 | `POST /v1/nodes/{id}/status` `{status}` | scripts, mechanical writers | `set_status` semantics (§1): one-scalar update through the `transitions()` gate |
 | `POST /v1/nodes/{id}/commits` `{repo, sha}` | post-tool / link-commits | `link_commit`: append `repo@sha` to the node's `commits:` list (kebab-case repo slug, 7–40 lowercase hex, ≤40 commits per node); idempotent, prefix-aware dedup |
 | `GET /v1/commits/{sha}?repo=` | sessions doing git archaeology | sha → nodes lookup over the `commits:` fields (≥7 hex, abbreviated or full); each match carries `{repo, sha, id, type, title, summary, status, project}` — blame a line, get the why |
+| `GET /v1/changes?since=&project=&limit=` | `recent_changes`'s REST twin; audit review | the remote audit trail: a git-log projection over `nodes/` → `{changes: [{id, change, commit, date, committed_by, type, title, authored_via, author}], count, head, since, generated_at}`, newest change per node first. `since` is a 7–40 hex sha (`sha..HEAD`) or a date/relative phrase git understands (`--since`); an unresolvable sha is `422`. `project` scopes to one project's nodes (deletions are omitted when scoped, their project being gone). `limit` bounds nodes returned (default 100, **max 500**). Each entry's `authored_via` is the current machine-vs-human signal (`capture`/`distill`/`gardener` = machine). Lets a remote client review what agents wrote without the whole `/v1/export` tarball |
 | `POST /v1/capture` | distill, /spor:defer | `capture` semantics: `{text, context: {project, during, blocks?, needed_by?}, source?}` → ingestion model + validate + commit → `{status, ids, nodes, summary, warnings}`. `source: "distill"` marks backstop captures in the journal. `context.blocks` (a node id, must exist) and `context.needed_by` (`YYYY-MM-DD`) declare a cross-project dependency (task-cc-xproject-dependency-loop): set `context.project` to the SERVING project and the server attaches a `blocks` edge to the requester + the deadline deterministically (not via the model) onto the primary node. A missing `blocks` target is `404`; a non-date `needed_by` is `422` — both rejected before any model call |
 | `POST /v1/distill/report` | distill | sweep telemetry, journal-only (no store mutation): `{facts, captured?, spooled?, rejected?, project?, session?}` → `{status: "reported"}`; zero-fact sweeps report too |
 | `POST /v1/corrections` | /spor:correct | `propose_correction` semantics → 201 `{status, id, revision, warnings}` |
