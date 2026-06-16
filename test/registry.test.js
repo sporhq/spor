@@ -328,6 +328,11 @@ test("seed pack: edge weights match the historic EDGE_WEIGHTS table exactly", ()
     // identity) added the structural membership edge: a repo is grouped-under
     // its home project. Weak association weight (structure, not work dependency).
     "grouped-under": 0.3,
+    // Review as a graph object (task-spor-review-as-graph-object,
+    // dec-spor-definition-of-done-org-policy) added the review-outcome edges:
+    // reviewed-by/changes-requested-by carry a real verdict (0.5), an open
+    // review-requested is routing wiring like routed-to (0.3).
+    "reviewed-by": 0.5, "changes-requested-by": 0.5, "review-requested": 0.3,
   });
   // provenance-only edges are known but unweighted (historic ?? 0.3 default)
   assert.equal(reg.isKnownEdge("compiled-for"), true);
