@@ -189,6 +189,21 @@ their original order), so the briefing degrades by relevance rather than by the
 downstream 7KB session-start body truncation. A project-blind compile keeps
 every norm, exactly as before.
 
+Project scope resolves to the whole home-project **grouping union**, so a
+grouping that deliberately spans heterogeneous repos (a terraform IaC repo, a
+Go service, a Python service) would still cross-pollinate norms. A norm may
+**narrow** its ride-along with optional flat `applies_to_*` selectors, matched
+against the session's OWN repo (task-cc-norm-ride-along-repo-tag-scope):
+`applies_to_tags: [python]` (∩ the session repo node's `tags`, schema-repo),
+`applies_to_repos: [repo-x]` (the session repo), `applies_to_projects:
+[proj-y]` (a grouping the session repo belongs to). Matching is OR across axes,
+ANY within an axis — deliberately unlike the policy layer's `governs`
+(AND-across-axes). A norm that declares any `applies_to_*` and matches none is
+**excluded** (strict, including in a repo with no `tags` — repo tagging is the
+opt-in that turns scoped norms on); a norm with none keeps the project-scoped
+behavior above, so a graph using no `applies_to_*` is byte-identical
+(norm-cc-byte-identical-refactor).
+
 Because a norm rides along with no relevance gate and the team trust model lets
 every writer author one, the briefing renderer treats norm bodies as an
 **injection surface** (issue-cc-norm-always-on-injection): each is quoted as

@@ -76,6 +76,7 @@ const KINDS = {
       query: c.input.query ?? null,
       digest: !!c.input.digest,
       minSim: c.input.minSim,
+      project: c.input.project ?? null, // session repo slug; absent -> project-blind, byte-identical
       seedSchemas: seedSchemas(),
     });
     if (r.unknownRoot) return "UNKNOWN ROOT\n";

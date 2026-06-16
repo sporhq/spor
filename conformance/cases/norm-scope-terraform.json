@@ -1,0 +1,4 @@
+{ "id": "norm-scope-terraform", "kind": "compile", "corpus": "norm-scope",
+  "input": { "rootId": "dec-acme-arch", "digest": false, "project": "acme-tf" },
+  "expected": "norm-scope-terraform.txt",
+  "covers": "applies_to repo/tag-scoped norm ride-along — the terraform brief carries the tf-layout (repo), acme-wide (grouping) and global norms but NOT the uv python-tag norm; proves the bleed is gone (task-cc-norm-ride-along-repo-tag-scope)" }
