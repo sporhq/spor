@@ -231,6 +231,34 @@ test("query CLI: --json emits a node array without the internal file field", () 
   assert.equal(arr[0].id, "task-a");
   assert.equal(arr[0].status, "open");
   assert.equal("file" in arr[0], false, "the load-time `file` artifact is stripped");
+  // The regex parser initializes pin/exclude to [] on every node; empty ones are
+  // noise and must be trimmed from JSON output.
+  assert.equal("pin" in arr[0], false, "empty pin is trimmed");
+  assert.equal("exclude" in arr[0], false, "empty exclude is trimmed");
+});
+
+test("query CLI: --json keeps a populated pin/exclude (only empties are trimmed)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-query-pin-"));
+  const nodesDir = path.join(dir, "nodes");
+  fs.mkdirSync(nodesDir, { recursive: true });
+  fs.writeFileSync(path.join(nodesDir, "brief-x.md"), `---
+id: brief-x
+type: briefing
+project: demo
+title: A briefing with a pin
+summary: A briefing node that pins and excludes specific nodes.
+pin: [dec-a, dec-b]
+exclude: [task-stale]
+date: 2026-06-01
+---
+Body of brief-x.
+`);
+  const r = cli(nodesDir, ["--id-prefix", "brief-", "--json"]);
+  assert.equal(r.status, 0, r.stderr);
+  const arr = JSON.parse(r.stdout);
+  assert.equal(arr.length, 1);
+  assert.deepEqual(arr[0].pin, ["dec-a", "dec-b"], "a populated pin survives");
+  assert.deepEqual(arr[0].exclude, ["task-stale"], "a populated exclude survives");
 });
 
 test("query CLI: --edges --json emits {from,type,to} edges", () => {
