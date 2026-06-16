@@ -450,6 +450,27 @@ async function cmdCompile(cfg, verb, args) {
   return passthrough("compile.js", compileArgs);
 }
 
+// Compile a node's remote briefing the way the /spor:brief skill does: the raw
+// node (GET /v1/nodes/<id>) plus a title/summary-seeded /v1/digest for its
+// neighborhood, concatenated. Shared by compileRemote (brief / compile --root)
+// and compileBriefing (dispatch) so the two can't drift — dispatch used to
+// embed only the bare node, a thinner standing context than an interactive
+// brief (issue-spor-dispatch-briefing-omits-neighborhood). Returns
+// {transport,error} | {ok:false,status} | {ok:true,status,text}; the
+// neighborhood is fail-soft (a failed/empty digest just yields the raw node).
+async function remoteNodeBriefing(cfg, { root, project }) {
+  const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(root)}`, { timeoutMs: 8000 });
+  if (r.transport) return { transport: true, error: r.error, text: "" };
+  if (!r.ok) return { ok: false, status: r.status, text: "" };
+  const raw = (r.json && r.json.raw) || r.text || "";
+  // Seed the neighborhood digest from the node's own title/summary (the REST
+  // /v1/digest is query-mode only — root compile is not exposed over REST).
+  const seed = (r.json && (r.json.title || r.json.summary)) || fmField(raw, "title") || fmField(raw, "summary") || root;
+  const d = await remote.post(cfg, "/v1/digest", project ? { query: seed, project } : { query: seed }, { timeoutMs: 8000 });
+  const neighborhood = d.ok && d.json && d.json.found !== false ? d.json.text || "" : "";
+  return { ok: true, status: r.status, text: neighborhood ? `${raw}\n\n${neighborhood}` : raw };
+}
+
 // The remote arm of compile/brief. Mirrors the /spor:brief skill's remote
 // resolution: a node id -> the raw node plus a title/summary-seeded /v1/digest
 // for its neighborhood; free text -> POST /v1/digest. --skeleton has no server
@@ -475,27 +496,20 @@ async function compileRemote(cfg, args) {
 
   let text = "";
   if (root) {
-    const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(root)}`, { timeoutMs: 8000 });
-    if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
+    const b = await remoteNodeBriefing(cfg, { root, project });
+    if (b.transport) {
+      err(`offline — could not reach server (${b.error})`);
       return 1;
     }
-    if (r.status === 404) {
+    if (b.status === 404) {
       err(`no such node: ${root}`);
       return 1;
     }
-    if (!r.ok) {
-      err(`error ${r.status}`);
+    if (!b.ok) {
+      err(`error ${b.status}`);
       return 1;
     }
-    const raw = (r.json && r.json.raw) || r.text || "";
-    // Seed the neighborhood digest from the node's own title/summary, exactly as
-    // the /spor:brief skill does (the REST /v1/digest is query-mode only — root
-    // compile is not exposed over REST, only via the query_graph MCP tool).
-    const seed = (r.json && (r.json.title || r.json.summary)) || fmField(raw, "title") || fmField(raw, "summary") || root;
-    const d = await remote.post(cfg, "/v1/digest", project ? { query: seed, project } : { query: seed }, { timeoutMs: 8000 });
-    const neighborhood = d.ok && d.json && d.json.found !== false ? d.json.text || "" : "";
-    text = neighborhood ? `${raw}\n\n${neighborhood}` : raw;
+    text = b.text;
   } else {
     const body = { query };
     if (project) body.project = project;
@@ -1535,8 +1549,11 @@ async function resolveNode(cfg, id) {
 async function compileBriefing(cfg, { nodeId, query, full, project }) {
   if (cfg.mode() === "remote") {
     if (nodeId) {
-      const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}`, { timeoutMs: 8000 });
-      return r.ok && r.json ? r.json.raw || r.text || "" : "";
+      // Same raw-node + seeded-neighborhood resolution as `spor brief <id>`, so
+      // a dispatched agent's standing context matches an interactive brief
+      // rather than the bare node (issue-spor-dispatch-briefing-omits-neighborhood).
+      const b = await remoteNodeBriefing(cfg, { root: nodeId, project });
+      return b.ok ? b.text : "";
     }
     const r = await remote.post(cfg, "/v1/digest", project ? { query, project } : { query });
     return r.ok && r.json && r.json.found !== false ? r.json.text || "" : "";
