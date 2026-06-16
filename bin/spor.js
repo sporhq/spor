@@ -925,27 +925,39 @@ function claudePluginInfo() {
   return p ? { version: p.version, scope: p.scope, enabled: p.enabled, installPath: p.installPath } : null;
 }
 
-// Best-effort: is a claude.ai Spor MCP connector bound on this box? A connector
-// added in claude.ai surfaces in Claude Code as the mcp__…_Spor__* tools
-// (art-cc-spor-connector-dual-host), i.e. a SECOND live write surface alongside
-// the local file graph. Claude Code records connected claude.ai connectors in
-// ~/.claude.json's `claudeAiMcpEverConnected` array (entries like
-// "claude.ai Spor"); we key the detection on a Spor-named entry there (matching
-// the pre-rename "Substrate" name too — the connector predates the rename and
-// the array keeps historical entries). This is the only discoverable signal a
-// plain Claude Code box exposes: there is no per-session "currently active"
-// manifest. FAIL-OPEN by contract — any missing/unreadable/unparseable file
-// returns false so `spor status` never emits a false split-brain warning or
-// crashes. SPOR_FAKE_CLAUDE_JSON overrides the path for tests.
+// Best-effort: is a claude.ai Spor MCP connector CURRENTLY bound on this box? A
+// connector added in claude.ai surfaces in Claude Code as the mcp__…_Spor__*
+// tools (art-cc-spor-connector-dual-host), i.e. a SECOND live write surface
+// alongside the local file graph. We read the LIVE set from `claude mcp list`
+// (mirroring claudePluginInfo's spawn) and look for a Spor-named connector —
+// matching the pre-rename "Substrate" name too. We deliberately do NOT key on
+// ~/.claude.json's `claudeAiMcpEverConnected`: that array is a sticky historical
+// "ever connected" list that never clears when a connector is disabled or
+// removed, so it warned forever after the user unbound the connector
+// (issue-spor-status-split-brain-warning-false-positive). FAIL-OPEN by contract:
+// claude absent / nonzero exit / timeout / empty output all return false, so
+// `spor status` never emits a false split-brain warning or hangs. The health
+// status (Connected / Needs authentication / Failed) is ignored — any current
+// binding is a configured second write surface. SPOR_FAKE_MCP_LIST injects
+// canned `claude mcp list` output for tests.
 function sporConnectorBound() {
   try {
-    const p = process.env.SPOR_FAKE_CLAUDE_JSON || path.join(homeDir(), ".claude.json");
-    const j = JSON.parse(fs.readFileSync(p, "utf8"));
-    const ever = j && j.claudeAiMcpEverConnected;
-    if (!Array.isArray(ever)) return false;
-    return ever.some((name) => typeof name === "string" && /\bspor\b|\bsubstrate\b/i.test(name));
+    let text = process.env.SPOR_FAKE_MCP_LIST;
+    if (text == null) {
+      const cmd = claudeCmd();
+      if (cmd === "claude" && !hasCmd("claude")) return false;
+      const r = spawnSync(cmd, ["mcp", "list"], { encoding: "utf8", timeout: 8000 });
+      if (r.status !== 0 || !r.stdout) return false;
+      text = r.stdout;
+    }
+    // Each connector is a line like "claude.ai Spor: <url> - <status>". Match the
+    // NAME segment (before the first colon) only, so a "spor" in a URL or status
+    // can't trip it; \b keeps "Spotify"/"Supabase" from matching "spor".
+    return text
+      .split("\n")
+      .some((line) => /\bspor\b|\bsubstrate\b/i.test(line.split(":")[0] || ""));
   } catch {
-    return false; // no file, unreadable, or malformed => assume no connector
+    return false; // claude missing, spawn error, or unparseable => assume none
   }
 }
 
