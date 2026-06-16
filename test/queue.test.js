@@ -366,6 +366,91 @@ date: 2026-06-10
   assert.deepEqual(ids, ["rev-merge-1", "task-x"]);
 });
 
+// ---------------- node-type filter (task-cc-queue-filtering-enhancements) ----------------
+
+test("rankQueue: includeTypes whitelists node types from the ranking", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-1", "task", { status: "open" }),
+    node("issue-1", "issue", { status: "open" }),
+    node("cap-2026-06-10-1", "capture-pending", {}),
+  ])).load();
+  const r = rankQueue(g, { now: NOW, includeTypes: ["task", "issue"] });
+  assert.deepEqual(r.items.map((i) => i.id).sort(), ["issue-1", "task-1"]);
+  // a hard scope filter like project: the count describes the filtered queue,
+  // it is NOT a counted demotion like muted/dormant.
+  assert.equal(r.count, 2);
+  assert.equal(r.muted, undefined);
+});
+
+test("rankQueue: excludeTypes blacklists node types from the ranking", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-1", "task", { status: "open" }),
+    node("issue-1", "issue", { status: "open" }),
+    node("cap-2026-06-10-1", "capture-pending", {}),
+  ])).load();
+  const r = rankQueue(g, { now: NOW, excludeTypes: ["capture-pending"] });
+  assert.deepEqual(r.items.map((i) => i.id).sort(), ["issue-1", "task-1"]);
+  assert.equal(r.count, 2);
+});
+
+test("rankQueue: include and exclude compose — exclude wins on overlap", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-1", "task", { status: "open" }),
+    node("issue-1", "issue", { status: "open" }),
+    node("cap-2026-06-10-1", "capture-pending", {}),
+  ])).load();
+  // include {task, issue} then drop issue -> only task survives
+  const r = rankQueue(g, { now: NOW, includeTypes: ["task", "issue"], excludeTypes: ["issue"] });
+  assert.deepEqual(r.items.map((i) => i.id), ["task-1"]);
+  assert.equal(r.count, 1);
+});
+
+test("rankQueue: type filter composes with the project filter", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-a", "task", { status: "open", project: "alpha" }),
+    node("issue-a", "issue", { status: "open", project: "alpha" }),
+    node("task-b", "task", { status: "open", project: "beta" }),
+  ])).load();
+  const r = rankQueue(g, { now: NOW, project: "alpha", includeTypes: ["task"] });
+  assert.deepEqual(r.items.map((i) => i.id), ["task-a"]);
+});
+
+test("rankQueue: excludeTypes hides proposed-schema queue items too", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-1", "task", { status: "open" }),
+    ["schema-review.md", `---
+id: schema-review
+type: schema
+kind: node-schema
+schema_version: 2026.06.10.1
+status: proposed
+title: Review queue items
+summary: Org-specific review type proposed and awaiting approval.
+date: 2026-06-10
+---
+
+\`\`\`json
+{ "node_type": "review", "prefix": ["rev-"], "queueable": true }
+\`\`\`
+`],
+  ])).load();
+  // the proposed schema is normally a queue item; excluding type "schema" drops it
+  const all = rankQueue(g, { now: NOW }).items.map((i) => i.id).sort();
+  assert.deepEqual(all, ["schema-review", "task-1"]);
+  const r = rankQueue(g, { now: NOW, excludeTypes: ["schema"] });
+  assert.deepEqual(r.items.map((i) => i.id), ["task-1"]);
+});
+
+test("rankQueue: empty/absent type filters are inert (no filtering)", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-1", "task", { status: "open" }),
+    node("issue-1", "issue", { status: "open" }),
+  ])).load();
+  const base = rankQueue(g, { now: NOW }).items.map((i) => i.id).sort();
+  const empties = rankQueue(g, { now: NOW, includeTypes: [], excludeTypes: [] }).items.map((i) => i.id).sort();
+  assert.deepEqual(empties, base, "empty arrays filter nothing");
+});
+
 // ---------------- resolution truth (issue-cc-status-lags-resolution-edges) ----------------
 
 test("rankQueue: a live inbound resolves edge retires an item whatever its status says", () => {

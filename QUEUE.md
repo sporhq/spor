@@ -442,6 +442,17 @@ The queue is a compile mode, not a new store:
   queues — the intuitive token returns the whole product; the repo NODE id
   (`repo-<slug>`) is the escape hatch back to one repo; an exact grouping id
   (`proj-<slug>`) is used directly; an ungrouped repo falls back to itself.
+  **Omitting `project` entirely is the cross-project firehose** (every repo's
+  queue at once); `/spor:next --all-projects` and `my_queue` / `GET /v1/queue`
+  with no `project` reach it.
+- `includeTypes`/`excludeTypes` (task-cc-queue-filtering-enhancements) whitelist
+  or blacklist node types FROM THE RANKING — `GET /v1/queue?type=&exclude_type=`
+  (comma-separated), `my_queue {types, exclude_types}`, and
+  `spor next --type/--exclude-type`. Given both, the include set is narrowed and
+  then the excludes are removed from it (exclude wins on overlap). Like `project`
+  it is a hard scope applied before scoring (the aggregates describe the filtered
+  queue), it composes with `project`/`assignee`, and the type compared is the one
+  the item surfaces as (so excluding `schema` hides schema-approval items too).
 - Exposed as `GET /v1/queue` (hooks, session-start "open front" line),
   `my_queue` (the registered MCP stub finally does work — and when Tier 2
   routing lands, routed questions and stewarded items join the same queue),

@@ -242,10 +242,36 @@ async function cmdNext(cfg, args) {
   const pi = args.indexOf("--project");
   const explicit = pi >= 0 && args[pi + 1] ? args[pi + 1] : null;
   const pinned = cfg.get("queue.project", null);
+  // Cross-project scope (task-cc-queue-filtering-enhancements): --all-projects
+  // (alias --all) widens to the whole-graph firehose by dropping the cwd/pinned
+  // default scope. An explicit --project is more specific and still wins.
+  const allProjects = args.includes("--all-projects") || args.includes("--all");
+  // Node-type allow/deny (task-cc-queue-filtering-enhancements): repeatable +
+  // comma-splittable (--type task --type issue, or --type task,issue). Forwarded
+  // to the server as ?type=/?exclude_type= in remote mode; in local mode the raw
+  // flags pass straight through to lib/queue.js, which speaks the same flags.
+  const collectMulti = (name) => {
+    const out = [];
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === `--${name}` && args[i + 1] != null) {
+        out.push(...args[i + 1].split(",").map((s) => s.trim()).filter(Boolean));
+      }
+    }
+    return out;
+  };
+  const inclTypes = collectMulti("type");
+  const exclTypes = collectMulti("exclude-type");
 
   if (cfg.mode() === "remote") {
-    const slug = explicit ?? pinned ?? safeSlug();
-    const r = await remote.get(cfg, `/v1/queue?project=${encodeURIComponent(slug)}&limit=10`, { timeoutMs: 6000 });
+    // --all-projects drops the default scope (firehose); an explicit --project
+    // still wins over it. Otherwise fall back to the pinned default, then cwd.
+    const scopeSlug = allProjects && !explicit ? null : (explicit ?? pinned ?? safeSlug());
+    const qs = new URLSearchParams();
+    if (scopeSlug) qs.set("project", scopeSlug);
+    qs.set("limit", "10");
+    if (inclTypes.length) qs.set("type", inclTypes.join(","));
+    if (exclTypes.length) qs.set("exclude_type", exclTypes.join(","));
+    const r = await remote.get(cfg, `/v1/queue?${qs.toString()}`, { timeoutMs: 6000 });
     if (r.transport) {
       err(`offline — could not reach server (${r.error})`);
       return 1;
@@ -258,8 +284,9 @@ async function cmdNext(cfg, args) {
     // unknown-token detection is authoritative only locally (where we hold the
     // graph); remotely we can only observe an empty result for a SCOPED read and
     // softly say so on stderr. The cwd-default firehose (no explicit/pinned scope)
-    // is deliberately not flagged — an empty default queue is normal, not a typo.
-    const scoped = explicit ?? pinned;
+    // and an explicit --all-projects are deliberately not flagged — an empty
+    // result there is normal, not a typo.
+    const scoped = (allProjects && !explicit) ? null : (explicit ?? pinned);
     const count = (r.json && (r.json.count ?? (Array.isArray(r.json.items) ? r.json.items.length : null)));
     if (scoped && count === 0) {
       err(`project '${scoped}' returned an empty queue — check the slug / grouping id (the server scoped to it and found nothing)`);
@@ -273,9 +300,10 @@ async function cmdNext(cfg, args) {
   }
   // local: byte-identical passthrough. When no --project was given but a default
   // is pinned, inject it so the local read inherits the same default scope as
-  // remote; otherwise pass args untouched (preserving the local->global default —
-  // we never inject safeSlug() locally).
-  const localArgs = !explicit && pinned ? [...args, "--project", pinned] : args;
+  // remote — UNLESS --all-projects asked for the firehose. Otherwise pass args
+  // untouched (preserving the local->global default — we never inject safeSlug()
+  // locally). --type/--exclude-type ride through; lib/queue.js parses them.
+  const localArgs = (!explicit && pinned && !allProjects) ? [...args, "--project", pinned] : args;
   return passthrough("queue.js", localArgs);
 }
 
@@ -2021,14 +2049,17 @@ const COMMANDS = {
     run: (cfg, p) => cmdAdd(cfg, p),
   },
   next: {
-    group: "Graph", parse: "raw", args: "[--project S]", aliases: ["queue"],
+    group: "Graph", parse: "raw", args: "[--project S | --all-projects] [--type T] [--exclude-type T]", aliases: ["queue"],
     summary: "the decision queue (local: lib/queue; remote: /v1/queue)",
-    help: "Show the ranked decision queue. Remote mode reads /v1/queue; local mode is a\nbyte-identical passthrough to lib/queue.js, so it also accepts that script's\nflags (--days, --no-front, --limit, --name-only, --nodes).\n\n--project accepts a repo slug (-> its home-project grouping union), a repo-<slug>\nnode id (-> that single repo), or a grouping id (-> the grouping union); an\nunknown token warns and yields an empty queue. Pin a default scope for both modes\nwith the queue.project config key (SPOR_QUEUE_PROJECT or .spor.json\n{\"queue\":{\"project\":\"...\"}}); an explicit --project still wins.",
+    help: "Show the ranked decision queue. Remote mode reads /v1/queue; local mode is a\nbyte-identical passthrough to lib/queue.js, so it also accepts that script's\nflags (--days, --no-front, --limit, --name-only, --nodes).\n\nSCOPE. --project accepts a repo slug (-> its home-project grouping union), a\nrepo-<slug> node id (-> that single repo), or a grouping id (-> the grouping\nunion); an unknown token warns and yields an empty queue. Pin a default scope\nfor both modes with the queue.project config key (SPOR_QUEUE_PROJECT or\n.spor.json {\"queue\":{\"project\":\"...\"}}); an explicit --project still wins.\n--all-projects (alias --all) widens to the whole-graph cross-project firehose,\ndropping the cwd/pinned default scope (an explicit --project still wins over it).\n\nNODE TYPES. --type/--exclude-type whitelist/blacklist node types from the\nranking; both are repeatable and comma-splittable (--type task,issue). Given\nboth, the include set is narrowed and then the excludes are removed (exclude\nwins on overlap). They compose with --project/--all-projects.",
     options: {
       project: { type: "string", value: "S", desc: "scope to a project slug (default: queue.project config, else inferred)" },
+      "all-projects": { type: "boolean", desc: "cross-project firehose — drop the default project scope (alias --all)" },
+      type: { type: "string", value: "T", desc: "include only these node types (repeatable, comma-ok)" },
+      "exclude-type": { type: "string", value: "T", desc: "exclude these node types from the ranking (repeatable, comma-ok)" },
       json: { type: "boolean", desc: "machine-readable JSON output" },
     },
-    examples: ["spor next", "spor next --project spor --json"],
+    examples: ["spor next", "spor next --project spor --json", "spor next --all-projects --type task,issue", "spor next --exclude-type capture-pending"],
     run: (cfg, args) => cmdNext(cfg, args),
   },
   get: {

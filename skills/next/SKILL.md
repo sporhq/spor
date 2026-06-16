@@ -45,6 +45,26 @@ curl -sS --max-time 6 -H "Authorization: Bearer $SPOR_TOKEN" \
 
 In Cowork, call the `my_queue` MCP tool with the same fields.
 
+**Scope and filter flags** (task-cc-queue-filtering-enhancements). The queue
+defaults to the session's project; three optional, composable levers widen or
+narrow it. Reach for them when the user asks for a wider/narrower view ("what's
+next across everything", "show me beta's queue", "just the open issues, ignore
+pending captures"):
+
+- **Cross-project firehose** — drop `?project=` entirely (`/v1/queue?limit=10`)
+  to rank every repo's queue at once. CLI: `spor next --all-projects`.
+- **A different project** — `?project=<slug>` (repo slug → grouping union;
+  `repo-<slug>` id → one repo; `proj-<slug>` id → the grouping). CLI:
+  `spor next --project <slug>`.
+- **Node-type allow/deny** — `?type=task,issue` keeps only those types;
+  `?exclude_type=capture-pending` drops them (comma-separated, repeatable,
+  exclude wins on overlap). They apply *before* ranking, so the aggregate counts
+  describe the filtered queue. CLI: `spor next --type task,issue`,
+  `spor next --exclude-type capture-pending`.
+
+The `my_queue` MCP tool takes the same as fields: `project`, `types`,
+`exclude_types` (arrays), plus `limit`/`offset`.
+
 ## Local mode (personal graph) — `SPOR_SERVER` unset
 
 `${CLAUDE_PLUGIN_ROOT}` is empty in the Bash tool, so first resolve the
@@ -56,6 +76,10 @@ SPOR_ROOT="$(cat "${SPOR_HOME:-$HOME/.spor}/cache/plugin-root" 2>/dev/null \
   || cat "$HOME/.substrate/cache/plugin-root" 2>/dev/null)"
 SPOR_ROOT="${SPOR_ROOT:-$CLAUDE_PLUGIN_ROOT}"
 node "$SPOR_ROOT/lib/queue.js" --json      # or --project <slug>, --limit <n>
+# Same scope/filter flags as remote: --type task,issue / --exclude-type
+# capture-pending (whitelist/blacklist node types), and omit --project for the
+# cross-project firehose. (`spor next --all-projects` is the CLI shorthand for
+# dropping the default scope.)
 ```
 
 Use `--json` and compose the human view from it — don't show the bare CLI
@@ -64,6 +88,30 @@ to surface (see Presenting).
 
 (No server means no activity feed, so heat is 0 locally; the other signals
 are identical.)
+
+## In-flight awareness — don't re-pick work an agent is already on (Claude Code only)
+
+`spor dispatch` launches Claude Code background agents named after the node id
+they work (art-res-task-spor-cli-dispatch-background-agents). Before you
+recommend an item, cross-reference live agent state so you don't surface work
+that's already in flight — otherwise whoever triages the queue picks up or
+re-dispatches a task an agent is already doing. This is **presentation-only and
+Claude-Code-only**: the `my_queue` / `GET /v1/queue` server surface cannot see
+local background agents, so the cross-reference happens here, at present time.
+Best-effort — if the `claude` binary is absent or errors (e.g. in Cowork or a
+plain shell), skip it silently and present the queue as usual.
+
+```bash
+claude agents --json 2>/dev/null   # array of {name, kind, state, cwd, ...}
+```
+
+Treat a queue item as **in flight** when a `kind: "background"` agent has
+`name` equal to the item's id and `state` is not `"done"` (e.g. `working`). For
+those items: badge them "🤖 agent dispatched — in progress" and keep them OUT of
+the top "pick this next" recommendation (the work is already moving; surfacing
+it invites duplication). Mention them so the human can still choose to look —
+counted, never silently dropped, the same discipline the queue uses for mutes
+and leases. Items with no matching live agent are presented normally.
 
 ## Presenting and acting
 
