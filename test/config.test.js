@@ -58,6 +58,14 @@ test('env layer overrides config files (env-above-config)', () => {
   assert.strictEqual(c.get('distill.model'), 'haiku-env');
 });
 
+test('env: SPOR_DISPATCH_AGENT maps to dispatch.agent (per-machine dispatch identity)', () => {
+  const dir = tmp();
+  // the documented env knob must resolve dispatch.agent; unset stays null
+  assert.strictEqual(loadConfig({ cwd: dir, env: bareEnv({ SPOR_HOME: dir }) }).get('dispatch.agent', null), null);
+  const c = loadConfig({ cwd: dir, env: bareEnv({ SPOR_HOME: dir, SPOR_DISPATCH_AGENT: 'agent-env-laptop' }) });
+  assert.strictEqual(c.get('dispatch.agent', null), 'agent-env-laptop');
+});
+
 test('dual-read: legacy SUBSTRATE_* honored when SPOR_* absent', () => {
   const dir = tmp();
   const c = loadConfig({ cwd: dir, env: bareEnv({ SPOR_HOME: dir, SUBSTRATE_SERVER: 'https://legacy' }) });

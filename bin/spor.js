@@ -2162,14 +2162,16 @@ function writeDispatchMcpConfig(cfg, { token, session }) {
       },
     },
   };
-  // 0600: the file holds a live bearer token. Write with the restrictive mode
-  // from the start (mode on an existing file is not reset by writeFileSync, so
-  // create fresh) — chmod after as a belt-and-braces for prior leftovers.
-  fs.writeFileSync(file, JSON.stringify(conf, null, 2) + "\n", { mode: 0o600 });
+  // 0600: the file holds a live bearer token. Create with O_EXCL (wx) so a
+  // pre-placed file or symlink at this path is REFUSED rather than written
+  // through, and the file is 0600 from creation (no widen-then-narrow window).
+  // The session-uuid filename makes a real collision a non-issue; a stale
+  // leftover was swept above.
+  const fd = fs.openSync(file, "wx", 0o600);
   try {
-    fs.chmodSync(file, 0o600);
-  } catch {
-    /* best-effort on platforms without POSIX modes */
+    fs.writeSync(fd, JSON.stringify(conf, null, 2) + "\n");
+  } finally {
+    fs.closeSync(fd);
   }
   return file;
 }
