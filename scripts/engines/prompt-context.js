@@ -127,10 +127,20 @@ async function promptContext(input) {
     const rlogFile = path.join(graph, "journal", "remote.log");
     const rlog = u.makeLogger(rlogFile, "prompt-context: ");
 
+    // Send the session project so the SERVER-side compile applies the same
+    // project scoping the local digest already gets — the same-project
+    // relevance boost, the grouping union, and the norm `applies_to_*`
+    // ride-along (issue-spor-remote-digest-project-blind). The remote digest
+    // was project-blind: it posted only `query`, so every compile() session-
+    // project feature silently no-opped in remote mode. `slug` is the same
+    // `projectSlug(cwd)` already fed to the local merge below. Absent a slug
+    // the body is byte-identical to the prior project-blind POST, and an older
+    // server simply ignores the field (it stays the default), so this is safe
+    // either way.
     const resp = await u.curl(`${u.serverBase()}/v1/digest`, {
       method: "POST",
       headers: { ...u.bearer(), "Content-Type": "application/json" },
-      body: JSON.stringify({ query: prompt }),
+      body: JSON.stringify(slug ? { query: prompt, project: slug } : { query: prompt }),
       timeoutMs: 4000,
     });
 

@@ -651,6 +651,37 @@ test('post-tool: remote mode stamps trailered commits, range-scans past a parall
   }
 });
 
+// issue-spor-remote-digest-project-blind: the remote per-prompt digest used to
+// POST only {query}, so the server-side compile ran project-blind and every
+// session-project feature no-opped in remote mode. It now sends the session
+// slug so the server can scope the digest the same way a local session is.
+test('prompt-context: remote mode sends the session project to /v1/digest', async () => {
+  const { home, cwd } = scratch();
+  // pure remote: no local nodes/ dir, so no local-merge compile runs — only the
+  // remote POST we want to inspect.
+  fs.rmSync(path.join(home, 'nodes'), { recursive: true });
+  const { srv, hits, base } = await stubServer();
+  try {
+    const env = freshEnv(home);
+    env.SPOR_SERVER = base;
+    env.SPOR_TOKEN = 'spor_pat_test';
+    await runAsync(
+      ['prompt-context', '--host', 'claude-code'],
+      JSON.stringify({ cwd, prompt: 'six words minimum to pass the gate' }),
+      env
+    );
+    const dig = hits.find((h) => h.method === 'POST' && h.url === '/v1/digest');
+    assert.ok(dig, `posted a digest; hits: ${JSON.stringify(hits.map((h) => h.url))}`);
+    // cwd basename is projx (no marker, not a git repo) -> slug projx.
+    assert.deepStrictEqual(JSON.parse(dig.body), {
+      query: 'six words minimum to pass the gate',
+      project: 'projx',
+    });
+  } finally {
+    srv.close();
+  }
+});
+
 test('session-start: detached catch-up stamps commits made outside any session', async () => {
   const { home, cwd } = scratch();
   const sha = gitCommit(cwd, { trailers: ['task-cl-outside'] });
