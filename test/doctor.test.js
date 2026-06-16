@@ -189,8 +189,12 @@ test('doctor (remote): reports outbox spool + dead-letter depth with oldest age'
     server: 'http://127.0.0.1:9',
     responder: async () => fakeResponse(200, { body: '{}' }),
   });
-  assert.match(out, /outbox:\s+2 spooled \(oldest .*ago\)/);
-  assert.match(out, /dead-letter:\s+1 in outbox\/dead\/ \(oldest .*ago\)/);
+  // A just-created file straddles the now boundary: a hair in the past renders
+  // "Ns ago", a hair in the future (clock/fs-timestamp skew) renders "just now".
+  // Both satisfy the intent (oldest age shown); fmtAge's exact format is pinned
+  // deterministically by the unit test above. Accept either to avoid CI flake.
+  assert.match(out, /outbox:\s+2 spooled \(oldest (?:just now|.*ago)\)/);
+  assert.match(out, /dead-letter:\s+1 in outbox\/dead\/ \(oldest (?:just now|.*ago)\)/);
   assert.match(out, /PERMANENT rejects/);
 });
 
