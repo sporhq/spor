@@ -2010,22 +2010,45 @@ async function compileBriefing(cfg, { nodeId, query, full, project }) {
   return (r.stdout || "").trim();
 }
 
-// The single highest-ranked open queue item (for --from-queue). Mode-aware,
-// fail-soft (null on any error/empty).
+// The highest-ranked open queue item for --from-queue — the first that ISN'T
+// already in flight on THIS machine. Mode-aware, fail-soft (null on any
+// error/empty). This used to take limit=1 blindly, but the queue's lease filter
+// is viewer-relative (lib/kernel/queue.js): a lease held by ANOTHER person is
+// dropped, yet the dispatcher's OWN in-progress claim is kept and floated up by
+// its `front` signal — so the top item was frequently the caller's own active
+// work, which the same-machine guard then refused instead of advancing
+// (task-spor-dispatch-from-queue-skip-in-flight). So pull a page and skip items
+// with a background agent already running here — dispatchedAgents()/
+// annotateInFlight, the same NO-LLM, fail-soft cross-reference the same-machine
+// guard and `spor next --hide-dispatched` use — returning the first not-in-flight
+// item. If EVERY candidate is in flight, fall back to the top one so the caller's
+// guard reports it (rather than a misleading "queue empty"). A page (not just the
+// top) is fetched in BOTH modes; with no agents in flight free[0] is still the
+// top item, so the prior single-pick behavior is preserved.
 async function topQueueItem(cfg, slug) {
+  const LIMIT = 25;
+  let items = [];
   if (cfg.mode() === "remote") {
-    const q = slug ? `?project=${encodeURIComponent(slug)}&limit=1` : "?limit=1";
+    const q = slug ? `?project=${encodeURIComponent(slug)}&limit=${LIMIT}` : `?limit=${LIMIT}`;
     const r = await remote.get(cfg, `/v1/queue${q}`, { timeoutMs: 6000 });
-    return r.ok && r.json ? (r.json.items || [])[0] || null : null;
+    items = r.ok && r.json ? r.json.items || [] : [];
+  } else {
+    try {
+      const g = require(path.join(ROOT, "lib", "graph.js")).loadGraph(cfg.nodesDir());
+      const { rankQueue } = require(path.join(ROOT, "lib", "queue.js"));
+      const r = rankQueue(g, slug ? { project: slug, limit: LIMIT } : { limit: LIMIT });
+      items = r.items || [];
+    } catch {
+      items = [];
+    }
   }
-  try {
-    const g = require(path.join(ROOT, "lib", "graph.js")).loadGraph(cfg.nodesDir());
-    const { rankQueue } = require(path.join(ROOT, "lib", "queue.js"));
-    const r = rankQueue(g, slug ? { project: slug, limit: 1 } : { limit: 1 });
-    return (r.items || [])[0] || null;
-  } catch {
-    return null;
+  if (!items.length) return null;
+  // Skip items already in flight on this machine; advance to the first free one.
+  const { items: free, hidden } = annotateInFlight(items, dispatchedAgents(), true);
+  if (hidden && free.length) {
+    err(`from-queue: skipped ${hidden} item(s) already in flight on this machine; picking ${free[0].id}`);
   }
+  return free[0] || items[0] || null;
 }
 
 // Auto-claim a dispatched node so its lease is established at dispatch time
@@ -2875,7 +2898,8 @@ const COMMANDS = {
     help:
       "Compile a briefing for a task and launch a Claude Code background agent in the\n" +
       "right repo. Give free-text, a <node-id>, --node <id>, --from-queue (the top\n" +
-      "ranked item), or --backfill (onboard/repair a repo). The target dir is the\n" +
+      "ranked item NOT already in flight on this machine), or --backfill (onboard/\n" +
+      "repair a repo). The target dir is the\n" +
       "slug->path map ('spor repos'), overridable with --dir.\n\n" +
       "In remote mode a node dispatch auto-claims the task — it establishes the\n" +
       "heartbeat lease at dispatch time, so concurrent dispatch of the same node is\n" +
@@ -2904,7 +2928,7 @@ const COMMANDS = {
       "no-brief": { type: "boolean", desc: "raw task prompt, no briefing block" },
       "no-claim": { type: "boolean", desc: "don't auto-claim the lease (remote node dispatch)" },
       force: { type: "boolean", desc: "dispatch even if an agent for this node is already in flight here" },
-      "from-queue": { type: "boolean", desc: "dispatch the top-ranked queue item" },
+      "from-queue": { type: "boolean", desc: "dispatch the top-ranked queue item not already in flight here" },
       backfill: { type: "boolean", desc: "onboard/repair this repo (runs /spor:backfill)" },
       print: { type: "boolean", desc: "dry run — print the prompt, launch nothing" },
       "dry-run": DRYRUN_OPT,
