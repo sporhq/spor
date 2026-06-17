@@ -94,6 +94,7 @@ Rules:
 | correction | `corr-`   | standing fix to a briefing: pin/exclude/guidance (never traversed) |
 | question   | `question-` | a routed ask the graph could not answer (queueable; status `open`/`answered`, gated) |
 | person     | `person-` | a member of the org — the identity anchor for `$viewer` binding and Tier-2 question routing (team mode; see "People, routing, and onboarding") |
+| agent      | `agent-`  | a person-owned automation principal — a dispatched session's durable identity, owned by a person via an `owned-by` edge; its writes attribute "agent on behalf of person" (see "Agents") |
 | capture-pending | `cap-` | raw captured text that fit no schema; filed by the server for later triage (QUEUE.md §2.3); born status-less, closed only as `merged` (content now in proper node(s)) or `rejected` (no durable fact) — a `transitions()` gate rejects other statuses at write time |
 | finding    | `find-`   | a gardener observation about another node, filed as a queue item (QUEUE.md §6) |
 | repo       | `repo-`   | durable git-repo identity: slug aliases + repo fingerprints; heals renames at read time (below) |
@@ -555,6 +556,56 @@ client surfaces no warning when the authenticated identity maps to no person
 node. Surfacing that unbound state in queue and briefing responses is tracked
 server-side (issue-cc-onboarding-email-mismatch-silent-degradation).
 
+### Agents (person-owned principals)
+
+An `agent` node (prefix `agent-`) is a person's automation principal — the
+durable identity of a dispatched `claude --bg` session
+(dec-spor-agent-identity-nodes). It generalizes the workflow-run principal: a
+dispatched session is just another principal kind owned by a person, so work it
+creates reads "agent **on behalf of** person" rather than person-direct.
+
+```markdown
+---
+id: agent-anthony-laptop
+type: agent
+title: Anthony's laptop agent
+summary: Dispatched-session principal on Anthony's laptop; owned by person-anthony.
+spiffe: spiffe://spor.sporhq/person/person-anthony/agent/anthony-laptop
+pubkey: ""
+status: active
+date: 2026-06-16
+edges:
+  - {type: owned-by, to: person-anthony}
+---
+```
+
+- **Grain: persistent, one per machine/install.** An agent node is created once
+  (`spor agent create <label>`, or the admin endpoint) and REUSED across every
+  dispatch — NOT one node per session. Each dispatch's Claude Code `session_id`
+  is the ephemeral which-run, recorded as an additive `session:` stamp on the
+  nodes it writes, not as its own node (promote to a `run-<id>` node only if run
+  metadata later needs a home).
+- **`owned-by` is the ownership edge** (agent → person, inverse `owns`). Like
+  `grouped-under` it is a low-weight (0.3) structural identity binding, not a
+  work dependency — the owner is not pulled into the agent's work neighborhoods.
+  Ownership lives on this edge, NOT in frontmatter.
+- **`spiffe:` / `pubkey:` are forward-compat shape, unenforced.** The `spiffe:`
+  URI encodes the binding in its path
+  (`spiffe://spor.<org>/person/<id>/agent/<label>`, extended to
+  `…/session/<uuid>` per dispatch); `pubkey:` records the agent's key
+  fingerprint (may be empty). Both adopt the SHAPE (dec-cc-spiffe-forward-compat)
+  — no signature verification, JWKS, or signed commits ship in this cut.
+- **Attribution stamps (additive).** Work an agent creates keeps `author:` = the
+  owning person (so `$viewer`, routing, history, and the queue are unchanged) and
+  ADDS `authored_by_agent: agent-<id>`, `authored_via: dispatch`, and `session:
+  <id>`. These are token-derived, never from the payload
+  (dec-cc-attribution-from-token); old nodes lack them and read as person-direct.
+  This is purely additive — the stamp itself needs no `schema_version` bump.
+- `capturable: false` (agent node and `owned-by` edge): both are created
+  deliberately, never drafted from a capture or distilled from a transcript —
+  mirroring `person`, `repo`, and `workflow-run`. (So the distiller's emit
+  vocabulary deliberately omits `agent`/`owned-by`.)
+
 ## Edge types and traversal weights
 
 | edge             | weight | meaning                                          |
@@ -574,6 +625,7 @@ server-side (issue-cc-onboarding-email-mismatch-silent-degradation).
 | `mentions`       | 0.5    | weakest association                              |
 | `stewards`       | 0.4    | this person stewards an area/spec/norm — the Tier-2 question-routing key |
 | `grouped-under`  | 0.3    | this repo's home project grouping (inverse `groups`); structural membership, not work dependency |
+| `owned-by`       | 0.3    | this agent is owned by that person (inverse `owns`); structural identity binding, not work dependency |
 | `routed-to`      | 0.3    | a question routed to this person for answering   |
 | `review-requested` | 0.3  | a review of this node is requested of this person (pending) — surfaces in their queue |
 | `compiled-for`   | —      | briefing → its task/query (provenance only)      |

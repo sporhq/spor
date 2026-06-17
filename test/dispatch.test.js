@@ -555,7 +555,7 @@ test("dispatch --print (remote node): previews the auto-claim and writes nothing
   try {
     const r1 = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief", "--print"], remoteEnv(home, base));
     assert.strictEqual(r1.status, 0, r1.stderr);
-    assert.match(r1.stdout, /claim:  would establish a lease on task-rotate/);
+    assert.match(r1.stdout, /claim:  would establish a session-bound lease on task-rotate/);
     assert.ok(!claimHit(hits), "--print is side-effect-free — no claim POSTed");
 
     const r2 = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief", "--no-claim", "--print"], remoteEnv(home, base));
