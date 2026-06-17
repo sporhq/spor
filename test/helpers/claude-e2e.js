@@ -28,12 +28,36 @@ const PLUGIN_ROOT = path.resolve(__dirname, "..", "..");
 // first or the prompt pipe SIGPIPEs.
 const NOTHING_CMD = "cat >/dev/null; echo NOTHING";
 
+// Resolve a SPOR_E2E_CLAUDE override (Rung 1, task-spor-e2e-claude-version-matrix-sandbox)
+// to an existing binary, or null. The override picks WHICH Claude Code version the suite
+// runs against — so a version matrix (CI or local) is just re-running with a different value.
+// Two accepted forms:
+//   - a path (anything with a separator, or that exists as a file) → used as-is if it exists;
+//   - a bare version string (e.g. "2.1.177") → resolved to the native install layout
+//     ~/.local/share/claude/versions/<version> (each version is a standalone binary there;
+//     the active ~/.local/bin/claude is just a symlink to one), so a version can be selected
+//     WITHOUT disturbing the operator's active symlink. Other layouts: pass a full path.
+// The fake serves a dummy key, so any version runs offline — no auth, no real API.
+function resolveClaudeOverride(v) {
+  if (v.includes("/") || v.includes(path.sep) || fs.existsSync(v)) {
+    return fs.existsSync(v) ? v : null;
+  }
+  const native = path.join(os.homedir(), ".local", "share", "claude", "versions", v);
+  return fs.existsSync(native) ? native : null;
+}
+
 // Is the real claude binary usable for E2E? Tests self-skip when it is not: CI runs
 // `npm test` on a runner without claude, and the suite must stay green there. SPOR_E2E=0
-// force-skips even when the binary is present (a fast inner-loop escape hatch).
+// force-skips even when the binary is present (a fast inner-loop escape hatch);
+// SPOR_E2E_CLAUDE=<path|version> runs against a specific Claude Code version instead of PATH.
 let _claudePath;
 function claudePath() {
   if (_claudePath !== undefined) return _claudePath;
+  const override = process.env.SPOR_E2E_CLAUDE;
+  if (override) {
+    _claudePath = resolveClaudeOverride(override);
+    return _claudePath;
+  }
   try {
     _claudePath = execFileSync("bash", ["-lc", "command -v claude"], { encoding: "utf8" }).trim() || null;
   } catch {
@@ -41,9 +65,32 @@ function claudePath() {
   }
   return _claudePath;
 }
+
+// Why the E2E tier should skip, or null when it can run — used as the node:test `skip`
+// reason so a missing/unresolvable binary reads clearly in the output.
+function claudeSkipReason() {
+  if (process.env.SPOR_E2E === "0") return "SPOR_E2E=0";
+  if (!claudePath()) {
+    return process.env.SPOR_E2E_CLAUDE
+      ? `SPOR_E2E_CLAUDE='${process.env.SPOR_E2E_CLAUDE}' did not resolve to an existing claude binary`
+      : "claude binary not on PATH";
+  }
+  return null;
+}
 function claudeAvailable() {
-  if (process.env.SPOR_E2E === "0") return false;
-  return Boolean(claudePath());
+  return claudeSkipReason() === null;
+}
+
+// The resolved binary's `--version` (best-effort) — handy as a one-line diagnostic so a
+// matrix run records which Claude Code version it actually exercised.
+function claudeVersion() {
+  const bin = claudePath();
+  if (!bin) return null;
+  try {
+    return execFileSync(bin, ["--version"], { encoding: "utf8", timeout: 10000 }).trim() || null;
+  } catch {
+    return null;
+  }
 }
 
 // Build one node's markdown from a spec ({ id, type, repo?, title, summary, version?,
@@ -287,6 +334,8 @@ module.exports = {
   NOTHING_CMD,
   claudePath,
   claudeAvailable,
+  claudeSkipReason,
+  claudeVersion,
   makeScratchGraph,
   runClaude,
   waitFor,

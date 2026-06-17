@@ -84,7 +84,12 @@ Anthropic Messages API (`test/helpers/fake-anthropic.js`), replaying genuine
 client paths (norm-qa-replay-genuine-paths) to catch regressions when a new
 Claude Code version ships. `npm run test:e2e` runs just this file; it is part of
 `npm test` but SELF-SKIPS when the `claude` binary is absent (CI runs on a
-runner without it — the suite stays green) or `SPOR_E2E=0`. The driver
+runner without it — the suite stays green) or `SPOR_E2E=0`. Set
+`SPOR_E2E_CLAUDE=<path|version>` to run against a SPECIFIC Claude Code version (a
+full binary path, or a bare version like `2.1.177` resolved under the native
+`~/.local/share/claude/versions/`) — the fake serves a dummy key so any version
+runs offline; this is Rung 1 of the version matrix
+(task-spor-e2e-claude-version-matrix-sandbox). The driver
 (`test/helpers/claude-e2e.js`) replays Tier 0 (spec-correct SSE text) and Tier 1
 (one `tool_use` round-trip); the remote-mode tier (claim nudge, dispatch, agent
 identity) needs a live Spor server and lives in spor-server, which imports the

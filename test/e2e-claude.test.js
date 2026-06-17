@@ -28,7 +28,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { startFakeAnthropic, allInjectedText, toolNames, hasToolResult } = require("./helpers/fake-anthropic");
 const {
-  claudeAvailable,
+  claudeSkipReason,
+  claudeVersion,
   makeScratchGraph,
   runClaude,
   waitFor,
@@ -36,7 +37,12 @@ const {
   llmCalls,
 } = require("./helpers/claude-e2e");
 
-const skip = claudeAvailable() ? false : "claude binary not on PATH (or SPOR_E2E=0)";
+// false → run; a string → node:test skips with that reason (binary absent, SPOR_E2E=0, or
+// an unresolvable SPOR_E2E_CLAUDE override).
+const skip = claudeSkipReason() || false;
+// Record which Claude Code version actually ran — the point of the SPOR_E2E_CLAUDE override
+// (Rung 1, task-spor-e2e-claude-version-matrix-sandbox) is a version matrix, so log it.
+if (!skip) console.error(`# e2e: Claude Code ${claudeVersion() || "(version unknown)"}`);
 
 // A small multi-node corpus tagged to the project slug. The digest is tf-idf, so it needs
 // idf signal: a single-node corpus scores 0 for every term and never clears the relevance
