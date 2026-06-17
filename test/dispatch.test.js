@@ -234,6 +234,67 @@ test("dispatch --from-queue: empty queue exits 1", () => {
   assert.match(r.stderr, /queue empty/);
 });
 
+// --from-queue must SKIP items already in flight on this machine and advance to
+// the next genuinely-free one (task-spor-dispatch-from-queue-skip-in-flight). The
+// queue's lease filter is viewer-relative, so the dispatcher's own in-progress
+// claim floats to the top via its `front` signal; without the skip, --from-queue
+// re-picks that in-flight item and the same-machine guard refuses it. A scratch
+// home with two ranked tasks (task-aaa p1 outranks task-bbb) under repo `demo`.
+function twoTaskFixture() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-fq-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  fs.writeFileSync(
+    path.join(nodes, "task-aaa.md"),
+    `---\nid: task-aaa\ntype: task\nrepo: demo\npriority: p1\ntitle: First ranked task aaa\nsummary: The top-ranked task in this scratch queue, given priority p1 so it outranks task-bbb.\ndate: 2026-06-02\n---\nDo aaa.\n`
+  );
+  fs.writeFileSync(
+    path.join(nodes, "task-bbb.md"),
+    `---\nid: task-bbb\ntype: task\nrepo: demo\ntitle: Second ranked task bbb\nsummary: The runner-up task in this scratch queue, with no priority so it sits below task-aaa.\ndate: 2026-06-02\n---\nDo bbb.\n`
+  );
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-fq-repo-"));
+  return { home, nodes, repo };
+}
+
+test("dispatch --from-queue: skips an item already in flight here, advances to the next", () => {
+  const { home, repo } = twoTaskFixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  // task-aaa (the top item) already has a background agent in flight on this box.
+  const agents = JSON.stringify([{ id: "g1", name: "task-aaa", kind: "background", status: "busy", state: "working", cwd: "/x" }]);
+  const r = run(["dispatch", "--from-queue", "--print"], { SPOR_HOME: home, SPOR_FAKE_AGENTS_JSON: agents });
+  assert.strictEqual(r.status, 0, r.stderr);
+  // It must land on task-bbb, NOT the in-flight task-aaa.
+  assert.match(r.stdout, /--name task-bbb/);
+  assert.match(r.stdout, /Work on task-bbb/);
+  assert.doesNotMatch(r.stdout, /--name task-aaa/);
+  // …and say so on stderr (never-silent: report what was skipped).
+  assert.match(r.stderr, /skipped 1 item\(s\) already in flight on this machine; picking task-bbb/);
+});
+
+test("dispatch --from-queue: nothing in flight picks the top item (unchanged behavior)", () => {
+  const { home, repo } = twoTaskFixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const r = run(["dispatch", "--from-queue", "--print"], { SPOR_HOME: home, SPOR_FAKE_AGENTS_JSON: "[]" });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /--name task-aaa/); // p1 top item
+  assert.doesNotMatch(r.stderr, /skipped/); // no skip note when nothing is in flight
+});
+
+test("dispatch --from-queue: when EVERY candidate is in flight, falls back to top so the guard refuses", { skip: process.platform === "win32" }, () => {
+  const { home, repo } = twoTaskFixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const sentinel = path.join(home, "fq-launched");
+  const stub = claudeStub(home, sentinel);
+  const agents = JSON.stringify([
+    { id: "g1", name: "task-aaa", kind: "background", status: "busy", state: "working", cwd: "/x" },
+    { id: "g2", name: "task-bbb", kind: "background", status: "busy", state: "working", cwd: "/x" },
+  ]);
+  const r = run(["dispatch", "--from-queue", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: agents });
+  assert.strictEqual(r.status, 1, r.stderr);
+  assert.match(r.stderr, /task-aaa already has a background agent in flight on this machine/);
+  assert.ok(!fs.existsSync(sentinel), "no agent launched when all candidates are in flight");
+});
+
 test("dispatch --backfill --print: dispatches the /spor:backfill skill, no briefing", () => {
   const { home, repo } = fixture();
   const r = run(["dispatch", "--backfill", "--dir", repo, "--print"], { SPOR_HOME: home });
