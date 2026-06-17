@@ -13,7 +13,12 @@ const os = require("os");
 const path = require("path");
 
 const graph = require(path.join(__dirname, "..", "lib", "graph.js"));
-const { rankQueue, viewerFor } = require(path.join(__dirname, "..", "lib", "queue.js"));
+const { rankQueue, warmQueueIndex, viewerFor } = require(path.join(__dirname, "..", "lib", "queue.js"));
+
+// The Symbol the queue kernel memoizes its HEAD-pure indexes under
+// (task-cc-rankqueue-memoization). Global registry key, so the test reads the
+// exact slot queue.js sets and graph.js clears.
+const QUEUE_INDEX = Symbol.for("spor.queue.derived-index");
 
 function tmpGraph(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "substrate-test-"));
@@ -1199,4 +1204,105 @@ Body.
   assert.equal(graph.projectKnown(g, "repo-solo"), true);
   assert.equal(graph.projectKnown(g, "solo"), true);
   assert.equal(graph.projectKnown(g, "sol"), false, "a near-miss typo is unknown");
+});
+
+// ---------- memoization of HEAD-pure derived indexes (task-cc-rankqueue-memoization) ----------
+//
+// rankQueue caches resolutionMap, openFindingsMap, blockersIndex, and per-item
+// transitive blockingCount on the resident graph object (Symbol-keyed). The
+// cache is a pure function of HEAD, so the tests assert two things: it is
+// REUSED across calls (populated once), and it never serves a STALE result —
+// applyNode (the in-place write path) and a fresh load both invalidate it. The
+// behavioral oracle is byte-identical output, never the presence of the cache.
+
+test("memoization: rankQueue populates the index once and reuses it across calls", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-unblocker", "task", { status: "open", edges: [["blocks", "task-a"]] }),
+    node("task-a", "task", { status: "open" }),
+  ])).load();
+  assert.equal(g[QUEUE_INDEX], undefined, "a fresh load carries no cache");
+  const r1 = rankQueue(g, { now: NOW });
+  const idx = g[QUEUE_INDEX];
+  assert.ok(idx && idx.blockersOf && idx.resolvedBy && idx.findingsFor, "first call builds the index");
+  assert.ok(idx.blockingCounts.has("task-unblocker"), "per-item blockingCount memoized");
+  // Second call must reuse the SAME index object and return the same ranking.
+  const r2 = rankQueue(g, { now: NOW });
+  assert.equal(g[QUEUE_INDEX], idx, "the cached index object is reused, not rebuilt");
+  assert.deepEqual(r2, r1, "a cached read is byte-identical to the first");
+});
+
+test("memoization: a per-call input change (viewer) reuses the structural cache, output still correct", () => {
+  // The cached maps are independent of now/leases/activity/viewer, so a second
+  // call with a different viewer must reuse the cache yet still apply the mute.
+  const g = tmpGraph(Object.fromEntries([
+    node("task-x", "task", { status: "open" }),
+    [`person-mia.md`, `---\nid: person-mia\ntype: person\nemail: mia@x.io\nqueue_mute: [task-x]\ntitle: Mia\nsummary: A person.\ndate: 2026-06-01\n---\nBody.\n`],
+  ])).load();
+  const open = rankQueue(g, { now: NOW });
+  const idx = g[QUEUE_INDEX];
+  assert.deepEqual(open.items.map((i) => i.id), ["task-x"]);
+  const muted = rankQueue(g, { now: NOW, viewer: g.nodes["person-mia"] });
+  assert.equal(g[QUEUE_INDEX], idx, "structural cache reused for a different viewer");
+  assert.deepEqual(muted.items.map((i) => i.id), [], "mute still applied off the cached maps");
+  assert.equal(muted.muted, 1);
+});
+
+test("memoization: applyNode invalidates a stale blockingCount (status flip retires a blocked node)", () => {
+  const t = tmpGraph(Object.fromEntries([
+    node("task-unblocker", "task", { status: "open", edges: [["blocks", "task-b"]] }),
+    node("task-b", "task", { status: "open" }),
+  ]));
+  const g = t.load();
+  const before = rankQueue(g, { now: NOW }).items.find((i) => i.id === "task-unblocker");
+  assert.equal(before.signals.blocking, 1, "task-b is live, so the unblocker blocks 1");
+  assert.equal(g[QUEUE_INDEX].blockingCounts.get("task-unblocker"), 1, "memoized at 1");
+  // Resolve task-b in place via the incremental write path.
+  graph.applyNode(g, `---\nid: task-b\ntype: task\nproject: my-project\nstatus: resolved\ntitle: Title of task-b\nsummary: Standalone summary for task-b used by queue tests.\ndate: 2026-06-01\n---\nBody.\n`, "task-b.md");
+  assert.equal(g[QUEUE_INDEX], undefined, "applyNode cleared the cache");
+  const after = rankQueue(g, { now: NOW }).items.find((i) => i.id === "task-unblocker");
+  assert.equal(after.signals.blocking, 0, "task-b no longer live — NOT the stale cached 1");
+  // The recomputed value matches a from-scratch reload of the final on-disk state.
+  fs.writeFileSync(path.join(t.nodesDir, "task-b.md"), `---\nid: task-b\ntype: task\nproject: my-project\nstatus: resolved\ntitle: Title of task-b\nsummary: Standalone summary for task-b used by queue tests.\ndate: 2026-06-01\n---\nBody.\n`);
+  const fresh = rankQueue(t.load(), { now: NOW }).items.find((i) => i.id === "task-unblocker");
+  assert.equal(after.signals.blocking, fresh.signals.blocking, "incremental == fresh reload");
+});
+
+test("memoization: applyNode invalidates a stale resolutionMap (a new resolves edge retires a queue item)", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-target", "task", { status: "open" }),
+  ])).load();
+  assert.deepEqual(rankQueue(g, { now: NOW }).items.map((i) => i.id), ["task-target"]);
+  // A decision resolving task-target arrives via the write path.
+  graph.applyNode(g, `---\nid: dec-fix\ntype: decision\nproject: my-project\ntitle: The fix\nsummary: Resolves the task.\ndate: 2026-06-02\nedges:\n  - {type: resolves, to: task-target}\n---\nBody.\n`, "dec-fix.md");
+  const after = rankQueue(g, { now: NOW }).items.map((i) => i.id);
+  assert.deepEqual(after, [], "task-target retired by the live resolves edge — not stale");
+});
+
+test("memoization: applyNode invalidates a stale openFindingsMap (a new finding rides along)", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-flagged", "task", { status: "open" }),
+  ])).load();
+  const before = rankQueue(g, { now: NOW }).items[0];
+  assert.equal(before.findings, undefined, "no findings yet");
+  graph.applyNode(g, `---\nid: finding-1\ntype: finding\nproject: my-project\nstatus: open\ntitle: A gardener finding\nsummary: Something to look at.\ndate: 2026-06-02\nedges:\n  - {type: relates-to, to: task-flagged}\n---\nBody.\n`, "finding-1.md");
+  const after = rankQueue(g, { now: NOW }).items[0];
+  assert.deepEqual(after.findings, ["finding-1"], "the finding now rides along — cache rebuilt");
+});
+
+test("memoization: warmQueueIndex output is byte-identical to a cold rankQueue", () => {
+  const files = Object.fromEntries([
+    node("task-unblocker", "task", { status: "open", priority: "p2", edges: [["blocks", "task-a"], ["blocks", "task-b"]] }),
+    node("task-a", "task", { status: "open" }),
+    node("task-b", "task", { status: "open" }),
+    node("task-c", "task", { status: "open", needed_by: "2026-06-15" }),
+    node("task-done", "task", { status: "resolved" }),
+    node("cap-1", "capture-pending", {}),
+  ]);
+  const cold = rankQueue(tmpGraph(files).load(), { now: NOW });
+  const warmed = tmpGraph(files).load();
+  warmQueueIndex(warmed);
+  assert.ok(warmed[QUEUE_INDEX].blockingCounts.has("task-unblocker"), "warm fills blockingCounts");
+  assert.ok(!warmed[QUEUE_INDEX].blockingCounts.has("task-done"), "warm skips terminal nodes");
+  const hot = rankQueue(warmed, { now: NOW });
+  assert.deepEqual(hot, cold, "warmed read equals the cold read exactly");
 });
