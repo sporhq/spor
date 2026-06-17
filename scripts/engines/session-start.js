@@ -9,8 +9,15 @@ const fs = require("fs");
 const path = require("path");
 const u = require("./util");
 
+// The /spor:spor preload instruction LEADS every usage string (and so every
+// session-start envelope, all modes): Spor's CLI syntax, node/edge format, and
+// MCP/REST surface aren't in the model's training, so any graph operation
+// attempted without first loading the skill tends to invent syntax. Stating it
+// as a standing precondition here is cheaper than the agent rediscovering it
+// per session. Phrased as "before any operation on the graph" to match the
+// skill's own trigger.
 const USAGE =
-  "Use /spor:brief <query or node-id> for a task-specific briefing, /spor:correct to fix a bad briefing.";
+  "Before any operation on the Spor graph (searching/querying, reading or writing nodes, adding edges, capturing, or running spor CLI/MCP tools), load the /spor:spor skill first — it carries the CLI syntax, node/edge format, and tool surface your training doesn't cover. Use /spor:brief <query or node-id> for a task-specific briefing, /spor:correct to fix a bad briefing.";
 const USAGE_REMOTE =
   USAGE +
   " When you defer discovered work mid-task (out-of-scope fix, follow-up, dismissed approach), capture it the moment you defer it: /spor:defer <2-3 sentences, what + why> — one call, the server types and links it.";
