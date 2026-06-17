@@ -147,6 +147,60 @@ test("agent: usage on a bad subcommand / missing label", () => {
   assert.match(b.stderr, /usage: spor agent create <label>/);
 });
 
+// ---------------------------------------------------------------------------
+// spor agent use — the real setter for dispatch.agent (the per-machine default
+// dispatch identity). A LOCAL config write, mode-independent; this is what the
+// create/list hints point to (task-spor-dispatch-agent-flag-disambiguation).
+// ---------------------------------------------------------------------------
+
+test("agent use: writes dispatch.agent to the user config; idempotent re-run is a no-op", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-use-"));
+  const r = run(["agent", "use", "agent-anthony-laptop"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /dispatch\.agent = agent-anthony-laptop/);
+  const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
+  assert.strictEqual(cfg.dispatch.agent, "agent-anthony-laptop");
+  const again = run(["agent", "use", "agent-anthony-laptop"], { SPOR_HOME: home });
+  assert.strictEqual(again.status, 0);
+  assert.match(again.stdout, /already = agent-anthony-laptop/);
+});
+
+test("agent use: preserves other config keys (server/token/repos map)", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-usep-"));
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ server: "http://x", token: "t", dispatch: { repos: { api: "/code/api" } } }) + "\n");
+  run(["agent", "use", "agent-x"], { SPOR_HOME: home });
+  const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
+  assert.strictEqual(cfg.server, "http://x");
+  assert.strictEqual(cfg.token, "t");
+  assert.strictEqual(cfg.dispatch.repos.api, "/code/api");
+  assert.strictEqual(cfg.dispatch.agent, "agent-x");
+});
+
+test("agent use --clear: drops dispatch.agent back to person-scoped", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-usec-"));
+  run(["agent", "use", "agent-x"], { SPOR_HOME: home });
+  const r = run(["agent", "use", "--clear"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /cleared dispatch\.agent/);
+  const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
+  assert.ok(!("agent" in (cfg.dispatch || {})), "dispatch.agent removed");
+});
+
+test("agent use: an invalid agent id is refused, writing nothing", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-usei-"));
+  const r = run(["agent", "use", "Bad Id!"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /invalid agent id/);
+  assert.ok(!fs.existsSync(path.join(home, "config.json")), "nothing written");
+});
+
+test("agent use: missing id prints usage", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-useu-"));
+  const r = run(["agent", "use"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /usage: spor agent use/);
+});
+
 // ===========================================================================
 // 2. spor agent create (remote) — fail-soft when the endpoint is absent
 // ===========================================================================
@@ -309,6 +363,37 @@ test("dispatch (remote) --print: no agent configured => person-scoped notice, se
   } finally {
     srv.close();
   }
+});
+
+test("dispatch (remote) --as: overrides dispatch.agent for one dispatch, marked (via --as)", { skip: isWin }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-das-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-dasr-"));
+  // dispatch.agent default is one agent; --as picks a different one for this run.
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "agent-default" } }) + "\n");
+  const { srv, base } = await dispatchStub();
+  try {
+    const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief", "--print", "--as", "agent-other-machine"], remoteEnv(home, base, { SPOR_SESSION_ID: SID }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /agent:  agent-other-machine \(via --as\)/);
+    assert.doesNotMatch(r.stdout, /agent-default/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch (local) --as: can't take effect (no CA) => note + person-scoped", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-dasl-"));
+  const r = run(["dispatch", "some free text task here", "--dir", repo, "--no-brief", "--print", "--as", "agent-x"], { SPOR_SESSION_ID: SID });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stderr, /--as agent-x ignored in local mode/);
+  assert.doesNotMatch(r.stdout, /^agent:/m);
+});
+
+test("dispatch --as: an invalid agent id is refused before launch", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-dasi-"));
+  const r = run(["dispatch", "some free text task here", "--dir", repo, "--no-brief", "--print", "--as", "Bad!"], { SPOR_SESSION_ID: SID });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /invalid --as agent id/);
 });
 
 test("dispatch (remote, real): mints a token, writes a 0600 mcp-config, assembles the full argv, session-bound claim", { skip: isWin }, async () => {

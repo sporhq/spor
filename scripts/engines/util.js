@@ -490,6 +490,43 @@ function forgetRepo(graphHomeDir, slug) {
   });
 }
 
+// Record this machine's default dispatch identity (`dispatch.agent`) into the
+// SAME user config.json as the repo map — the per-machine key `spor dispatch`
+// reads to attribute a dispatched session "agent on behalf of person". Scalar
+// sibling of registerRepo: agentId is an `agent-...` node id, or null/"" to
+// clear. Returns true only when it actually wrote; refuses to clobber a
+// present-but-malformed config (same fail-safe as editRepoMap).
+function setDispatchAgent(graphHomeDir, agentId) {
+  try {
+    const file = userConfigPath(graphHomeDir);
+    let raw = null;
+    try {
+      raw = fs.readFileSync(file, "utf8");
+    } catch {
+      raw = null; // absent — start fresh
+    }
+    let data = {};
+    if (raw != null) {
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        return false; // malformed — do NOT overwrite
+      }
+      if (data == null || typeof data !== "object" || Array.isArray(data)) data = {};
+    }
+    if (data.dispatch == null || typeof data.dispatch !== "object" || Array.isArray(data.dispatch)) data.dispatch = {};
+    const next = agentId || null;
+    if ((data.dispatch.agent || null) === next) return false; // unchanged — skip the write
+    if (next == null) delete data.dispatch.agent;
+    else data.dispatch.agent = next;
+    if (!ensureDir(graphHomeDir)) return false;
+    fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function appendLine(file, line) {
   try {
     fs.appendFileSync(file, line + "\n");
@@ -780,6 +817,7 @@ module.exports = {
   ensureGraphGitignore,
   registerRepo,
   forgetRepo,
+  setDispatchAgent,
   appendLine,
   makeLogger,
   loadGraphCached,

@@ -977,8 +977,43 @@ async function cmdAgent(cfg, args) {
   if (!sub || sub === "list") {
     return cfg.mode() === "remote" ? cmdAgentListRemote(cfg) : cmdAgentListLocal(cfg);
   }
-  err("usage: spor agent create <label> [--owner person-x] [--pubkey <fp>] | spor agent list");
+  if (sub === "use") {
+    return cmdAgentUse(cfg, { id: args[1] });
+  }
+  err("usage: spor agent create <label> [--owner person-x] [--pubkey <fp>] | spor agent list | spor agent use <agent-id>");
   return 1;
+}
+
+// `spor agent use <agent-id>` — make this agent the machine's default dispatch
+// identity by writing `dispatch.agent` to the USER config.json (the same
+// machine-local, never-committed file as the repo map; per-machine, like
+// dispatch.repos). This is the real setter the create/list hints point to;
+// before it, dispatch.agent was settable only via env or by hand-editing the
+// config. `spor agent use --clear` (or an empty id) drops back to person-scoped
+// dispatch. Not a graph write — purely local config, so it works in both modes.
+function cmdAgentUse(cfg, { id }) {
+  const clear = id === "--clear" || id === "none" || id === "";
+  if (!id) {
+    err("usage: spor agent use <agent-id>   (or: spor agent use --clear)");
+    return 1;
+  }
+  if (!clear && !/^[a-z0-9][a-z0-9-]*$/.test(id)) {
+    err(`invalid agent id '${id}' — must match ^[a-z0-9][a-z0-9-]*$ (e.g. agent-your-machine)`);
+    return 1;
+  }
+  const home = cfg.userConfigHome();
+  const wrote = u.setDispatchAgent(home, clear ? null : id);
+  if (clear) {
+    out(wrote ? "cleared dispatch.agent — dispatches run person-scoped again" : "dispatch.agent was already unset");
+    return 0;
+  }
+  if (wrote) {
+    out(`dispatch.agent = ${id}  (this machine now dispatches as ${id}; ${path.join(home, "config.json")})`);
+  } else {
+    out(`dispatch.agent already = ${id} (no change)`);
+  }
+  out("  attribution is remote-only; override one dispatch with: spor dispatch --as <agent-id>");
+  return 0;
 }
 
 async function cmdAgentCreateRemote(cfg, { label, owner, pubkey }) {
@@ -1009,7 +1044,8 @@ async function cmdAgentCreateRemote(cfg, { label, owner, pubkey }) {
   const j = r.json || {};
   out(`created agent ${j.id || `agent-${kebab(label)}`}${j.owner ? ` owned by ${j.owner}` : ""}`);
   if (j.spiffe) out(`  spiffe: ${j.spiffe}`);
-  out(`  dispatch with this agent: spor dispatch … (set dispatch.agent=${j.id || `agent-${kebab(label)}`} to make it this machine's default)`);
+  out(`  make it this machine's default: spor agent use ${j.id || `agent-${kebab(label)}`}`);
+  out(`  or dispatch as it once: spor dispatch --as ${j.id || `agent-${kebab(label)}`} …`);
   return 0;
 }
 
@@ -1080,7 +1116,8 @@ async function cmdAgentCreateLocal(cfg, { label, owner, pubkey }) {
   fs.writeFileSync(path.join(nodesDir, `${id}.md`), md);
   out(`created agent ${id} owned by ${ownerId}`);
   out(`  spiffe: ${spiffe}`);
-  out(`  dispatch with this agent: set dispatch.agent=${id} (spor repos config), then 'spor dispatch …'`);
+  out(`  make it this machine's default: spor agent use ${id}`);
+  out(`  (note: agent-on-behalf-of attribution applies in remote mode)`);
   return 0;
 }
 
@@ -2207,7 +2244,8 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   const dirOpt = values.dir || null;
   const model = values.model || null;
   const permMode = values["permission-mode"] || null;
-  const agent = values.agent || null;
+  const agent = values.agent || null; // claude --agent (harness agent DEFINITION)
+  const asAgent = values.as || null; // Spor agent IDENTITY override for dispatch.agent
   // A user-supplied prompt template (task-spor-dispatch-user-prompt-templates):
   // --template wins, else a personal default in the config cascade
   // (dispatch.template — an absolute path, like dispatch.repos). Empty until we
@@ -2335,10 +2373,22 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // claim can be session-bound at dispatch (the bg agent's post-tool heartbeat
   // renews under this same id). SPOR_SESSION_ID pins it for tests/reproducibility.
   const session = process.env.SPOR_SESSION_ID || crypto.randomUUID();
-  // This machine's agent node — the WHO a dispatched session runs as. Only
-  // meaningful remotely (the server is the CA that mints the agent token); a
-  // local-mode dispatch or an unconfigured machine simply runs person-scoped.
-  const identityAgent = cfg.mode() === "remote" ? dispatchAgentId(cfg) : null;
+  // This machine's agent node — the WHO a dispatched session runs as. `--as`
+  // overrides the per-machine dispatch.agent default for this one dispatch (its
+  // id format mirrors a node id; a bad/unowned one fails soft at token-mint
+  // below, like the config default). Only meaningful remotely (the server is the
+  // CA that mints the agent token); a local-mode dispatch or an unconfigured
+  // machine simply runs person-scoped.
+  if (asAgent && !/^[a-z0-9][a-z0-9-]*$/.test(asAgent)) {
+    err(`invalid --as agent id '${asAgent}' — must match ^[a-z0-9][a-z0-9-]*$ (e.g. agent-your-machine)`);
+    return 1;
+  }
+  const identityAgent = cfg.mode() === "remote" ? (asAgent || dispatchAgentId(cfg)) : null;
+  // An explicit --as can't take effect in local mode — there is no CA to mint the
+  // agent token. Say so rather than silently dropping it to person-scoped.
+  if (asAgent && cfg.mode() !== "remote") {
+    err(`note: --as ${asAgent} ignored in local mode — agent-on-behalf-of attribution is remote-only`);
+  }
 
   const claudeBin = claudeCmd();
   const claudeArgs = ["--bg"];
@@ -2367,9 +2417,10 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     // unconfigured machine read "person-scoped" — byte-stable but for the new
     // session line, which is additive and always present now.
     if (identityAgent) {
-      out(`agent:  ${identityAgent} (would mint a per-session agent-scoped token + write a 0600 --mcp-config, then add --strict-mcp-config)`);
+      const src = asAgent ? " (via --as)" : "";
+      out(`agent:  ${identityAgent}${src} (would mint a per-session agent-scoped token + write a 0600 --mcp-config, then add --strict-mcp-config)`);
     } else if (cfg.mode() === "remote") {
-      out(`agent:  (none configured — set dispatch.agent=agent-<machine> to attribute as agent-on-behalf-of; dispatching person-scoped)`);
+      out(`agent:  (none configured — 'spor agent use agent-<machine>' or --as to attribute as agent-on-behalf-of; dispatching person-scoped)`);
     }
     // Same-machine guard preview (node mode, any mode): a real dispatch would
     // refuse if an agent with this name is already in flight here. Shown only on a
@@ -2642,7 +2693,7 @@ const COMMANDS = {
     run: (cfg, args) => cmdToken(cfg, args),
   },
   agent: {
-    group: "Team admin (remote, admin token)", parse: "raw", args: "create <label> [--owner <id>] [--pubkey <fp>] | list",
+    group: "Team admin (remote, admin token)", parse: "raw", args: "create <label> [--owner <id>] [--pubkey <fp>] | list | use <agent-id>",
     summary: "person-owned automation principals (dispatch identity)",
     help:
       "Create and list agents — first-class `type: agent` nodes owned by a person\n" +
@@ -2654,10 +2705,15 @@ const COMMANDS = {
       "                                defaults to the sole person node, else required)\n" +
       "      --pubkey <fingerprint>    record a public-key fingerprint (forward-compat,\n" +
       "                                unenforced — may be omitted)\n" +
-      "  spor agent list               list agents and their owners\n\n" +
-      "Remote mode creates through POST /v1/admin/agents (admin-gated, the server mints\n" +
-      "the spiffe). Local mode writes the node + owned-by edge to the graph home.",
-    examples: ["spor agent create anthony-laptop", "spor agent create ci-runner --owner person-anthony", "spor agent list"],
+      "  spor agent list               list agents and their owners\n" +
+      "  spor agent use <agent-id>     make it THIS machine's default dispatch identity\n" +
+      "                                (writes dispatch.agent to your user config; pass\n" +
+      "                                --clear to go back to person-scoped dispatch)\n\n" +
+      "'use' is a local config write, not a graph write — it sets which agent\n" +
+      "`spor dispatch` runs as by default (override one dispatch with 'dispatch --as').\n" +
+      "Create/list run remote (POST /v1/admin/agents, admin-gated, the server mints the\n" +
+      "spiffe); local mode writes the node + owned-by edge to the graph home.",
+    examples: ["spor agent create anthony-laptop", "spor agent use agent-anthony-laptop", "spor agent list"],
     run: (cfg, args) => cmdAgent(cfg, args),
   },
 
@@ -2822,14 +2878,20 @@ const COMMANDS = {
       "on THIS machine (each agent is named after its node id) — catches the\n" +
       "same-person duplicate the lease's idempotent renew can't. --force overrides.\n\n" +
       "--template supplies your own prompt with {{brief}}/{{task}}/{{node}}/{{title}}/\n" +
-      "{{slug}}/{{dir}}/{{default}} placeholders.",
+      "{{slug}}/{{dir}}/{{default}} placeholders.\n\n" +
+      "Two different 'agent' axes, don't confuse them: --as picks the Spor agent\n" +
+      "IDENTITY the dispatch runs AS (attribution 'agent on behalf of person',\n" +
+      "remote-only; defaults to dispatch.agent — set it with 'spor agent use <id>').\n" +
+      "--agent is the unrelated 'claude --agent' passthrough that picks the harness\n" +
+      "agent DEFINITION (subagent personality/toolset) the background session runs.",
     options: {
       dir: { type: "string", value: "path", desc: "launch directory (overrides the slug map)" },
       node: { type: "string", value: "id", desc: "dispatch a specific node id" },
       slug: { type: "string", value: "slug", desc: "target project slug (cross-repo resolution)" },
+      as: { type: "string", value: "agent-id", desc: "Spor agent IDENTITY to run as (overrides dispatch.agent; remote-only)" },
       model: { type: "string", value: "M", desc: "claude --model" },
       "permission-mode": { type: "string", value: "P", desc: "claude --permission-mode" },
-      agent: { type: "string", value: "A", desc: "claude --agent" },
+      agent: { type: "string", value: "A", desc: "claude --agent (harness agent DEFINITION — NOT the Spor identity; see --as)" },
       name: { type: "string", value: "N", desc: "claude --name (session name)" },
       template: { type: "string", value: "F", desc: "prompt template file (placeholders above)" },
       full: { type: "boolean", desc: "full briefing instead of the digest" },

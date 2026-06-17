@@ -376,8 +376,10 @@ anything with a token.
   agent-on-behalf-of-person (§1) — the `person → agent` chain is the audit
   trail. `spor dispatch` mints one per run and injects it into the launched
   background agent (so the agent's own graph writes carry its identity), picking
-  the machine's default agent from the `dispatch.agent` client config
-  (`SPOR_DISPATCH_AGENT`).
+  the machine's default agent from the `dispatch.agent` client config (set with
+  `spor agent use <agent-id>`, or `SPOR_DISPATCH_AGENT`), which `spor dispatch
+  --as <agent-id>` overrides for a single run. (Not to be confused with `spor
+  dispatch --agent`, the unrelated `claude --agent` harness passthrough.)
 - **OAuth 2.1 for MCP connectors** (Cowork/claude.ai, which cannot carry a
   static bearer token): protected-resource metadata discovery (RFC 9728,
   advertised on the `/mcp` 401 via `WWW-Authenticate`), authorization-server
