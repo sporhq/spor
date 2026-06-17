@@ -43,21 +43,21 @@ fs.writeFileSync(path.join(ROOT, 'stub-response.txt'), STUB_RESPONSE);
 fs.writeFileSync(stub, `#!/bin/sh\ncat > /dev/null\ncat "${path.join(ROOT, 'stub-response.txt')}"\n`);
 fs.chmodSync(stub, 0o755);
 
+// Hermetic env: strip EVERY ambient Spor/backend var (both SPOR_* and legacy
+// SUBSTRATE_* spellings, plus API keys) so a configured dev box can't derail the
+// stubbed distiller — remote mode (SPOR_SERVER), the recursion guard
+// (SPOR_DISTILLING), or a real backend command. The suite is green in CI's clean
+// env; this keeps it green on a box that has Spor configured. Then set what the
+// test needs (the plugin pins SUBSTRATE_HOME/DEBOUNCE at import, so set first).
+for (const k of Object.keys(process.env)) if (/^(SPOR_|SUBSTRATE_)/.test(k)) delete process.env[k];
+delete process.env.GEMINI_API_KEY;
+delete process.env.ANTHROPIC_API_KEY;
 process.env.SUBSTRATE_HOME = HOME;
 process.env.SUBSTRATE_DEBOUNCE = '1';
 process.env.SUBSTRATE_DISTILL_CMD = stub;
 // Spor is opt-in per repo (task-spor-plugin-opt-in-default); the stub project
 // dir carries no .spor marker, so opt it in via the cascade or distill no-ops.
 process.env.SPOR_ENABLED = '1';
-delete process.env.SUBSTRATE_SERVER;
-delete process.env.SUBSTRATE_TOKEN;
-delete process.env.SUBSTRATE_DISTILLING;
-// Also clear the current SPOR_* spellings, or an ambient SPOR_SERVER/TOKEN on
-// the host flips the engines into remote mode and the suite fails spuriously.
-delete process.env.SPOR_SERVER;
-delete process.env.SPOR_TOKEN;
-delete process.env.SPOR_DISTILL_CMD;
-delete process.env.SPOR_NUDGE_CMD;
 
 const PLUGIN = path.join(__dirname, '..', 'adapters', 'opencode', 'spor.js');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
