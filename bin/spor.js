@@ -1670,7 +1670,10 @@ function detectHosts() {
 // already ensured the claude CLI exists and the marketplace is registered.
 function refreshClaudePlugin(cmd, cliScope, before) {
   spawnSync(cmd, ["plugin", "marketplace", "update", "spor"], { encoding: "utf8" });
-  const upd = spawnSync(cmd, ["plugin", "update", "spor", "--scope", cliScope], { stdio: "inherit" });
+  // Claude Code resolves an installed plugin by its name@marketplace id (the
+  // install side uses 'spor@spor'); the bare 'spor' is unresolvable and fails
+  // with "Plugin 'spor' not found" (issue-spor-upgrade-wrong-plugin-marketplace-id).
+  const upd = spawnSync(cmd, ["plugin", "update", "spor@spor", "--scope", cliScope], { stdio: "inherit" });
   if (upd.status !== 0) {
     err(`claude plugin update failed (exit ${upd.status == null ? "?" : upd.status})`);
     return 1;
@@ -1855,7 +1858,10 @@ function upgradeClaude(scope, dryRun) {
   const cliScope = scope === "repo" ? "project" : "user";
   const mpAdd = ["plugin", "marketplace", "add", ROOT];
   const mpUpd = ["plugin", "marketplace", "update", "spor"];
-  const plUpd = ["plugin", "update", "spor", "--scope", cliScope];
+  // Plugin id is name@marketplace ('spor@spor'); the bare name doesn't resolve
+  // (issue-spor-upgrade-wrong-plugin-marketplace-id). Keep this dry-run preview
+  // in sync with the real call in refreshClaudePlugin().
+  const plUpd = ["plugin", "update", "spor@spor", "--scope", cliScope];
   if (dryRun) {
     out(`would run: ${cmd} ${mpAdd.join(" ")}`);
     out(`would run: ${cmd} ${mpUpd.join(" ")}`);

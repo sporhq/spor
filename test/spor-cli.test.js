@@ -806,9 +806,12 @@ test('install --server/--token persists creds to user config', () => {
 const PKG = require('../package.json').version;
 
 // A fake `claude plugin` CLI. `plugin list --json` echoes the currently-loaded
-// version (from $STATE, defaulting to $STARTVER); `plugin update spor` writes
-// $NEWVER to $STATE (simulating the cache swap). $EMPTY makes list report no
-// spor installed. Returns the stub path.
+// version (from $STATE, defaulting to $STARTVER); `plugin update spor@spor`
+// writes $NEWVER to $STATE (simulating the cache swap). It models the real
+// claude's name@marketplace contract — a bare `plugin update spor` is rejected
+// with exit 1 (issue-spor-upgrade-wrong-plugin-marketplace-id), so this stub is
+// a true regression guard. $EMPTY makes list report no spor installed. Returns
+// the stub path.
 function claudeStub(home) {
   const stub = path.join(home, 'claude-plugin-stub.sh');
   fs.writeFileSync(stub, [
@@ -822,7 +825,10 @@ function claudeStub(home) {
     '  printf \'[{"id":"spor@spor","version":"%s","scope":"user","enabled":true,"installPath":"/x/%s"}]\\n\' "$ver" "$ver"',
     '  exit 0',
     'fi',
-    'if [ "$2" = "update" ] && [ "$3" = "spor" ]; then printf \'%s\' "$NEWVER" > "$STATE"; fi',
+    'if [ "$2" = "update" ]; then',
+    '  if [ "$3" = "spor@spor" ]; then printf \'%s\' "$NEWVER" > "$STATE"; exit 0; fi',
+    '  echo "Failed to update plugin \\"$3\\": Plugin \\"$3\\" not found" >&2; exit 1',
+    'fi',
     'exit 0',
   ].join('\n') + '\n');
   fs.chmodSync(stub, 0o755);
@@ -834,7 +840,7 @@ test('upgrade claude --print shows the three plugin commands, runs nothing', () 
   assert.strictEqual(r.status, 0);
   assert.match(r.stdout, /would run: claude plugin marketplace add /);
   assert.match(r.stdout, /would run: claude plugin marketplace update spor/);
-  assert.match(r.stdout, /would run: claude plugin update spor --scope user/);
+  assert.match(r.stdout, /would run: claude plugin update spor@spor --scope user/);
 });
 
 test('upgrade claude refreshes a stale plugin and reports before → after', { skip: process.platform === 'win32' }, () => {
