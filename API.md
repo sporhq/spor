@@ -383,8 +383,13 @@ anything with a token.
   background agent (so the agent's own graph writes carry its identity), picking
   the machine's default agent from the `dispatch.agent` client config (set with
   `spor agent use <agent-id>`, or `SPOR_DISPATCH_AGENT`), which `spor dispatch
-  --as <agent-id>` overrides for a single run. (Not to be confused with `spor
-  dispatch --agent`, the unrelated `claude --agent` harness passthrough.) The
+  --as <agent-id>` overrides for a single run. The `<agent-id>` is the agent's
+  `agent-`-prefixed NODE id (what `spor agent list` prints), **not** its bare
+  label — the token endpoint requires the prefix, so the client setters
+  (`spor agent use`, `--as`) reject a prefix-less id with a `did you mean
+  agent-…?` hint rather than persist one every dispatch would 422 on. (Not to be
+  confused with `spor dispatch --agent`, the unrelated `claude --agent` harness
+  passthrough.) The
   token is minted **session-deferred** and bound to the real run session AFTER
   launch (dec-spor-dispatch-bg-session-late-bind): `claude --bg` ignores
   `--session-id` and self-allocates its session, so dispatch reads the real one

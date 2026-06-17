@@ -1020,6 +1020,28 @@ async function cmdAgent(cfg, args) {
   return 1;
 }
 
+// A valid Spor agent id, mirroring the server's token-mint contract EXACTLY
+// (spor-server server/rest.js: `SLUG_RE.test(id) && id.startsWith("agent-")`).
+// The `agent-` prefix is load-bearing: the agent NODE id carries it, but the
+// `spor agent create`/`list` output also prints the bare LABEL, so copying the
+// label into `spor agent use`/`dispatch --as` is an easy slip — and the bare
+// slug passes a plain kebab check while the server's POST /v1/agents/{id}/token
+// 422s on it (invalid_node), silently dropping the dispatch to person-scoped.
+// One predicate, used by every client setter that feeds that endpoint, so the
+// client never accepts an id the server rejects
+// (issue-spor-dispatch-agent-id-prefix-validation-gap).
+function isAgentId(id) {
+  return typeof id === "string" && /^[a-z0-9][a-z0-9-]*$/.test(id) && id.startsWith("agent-");
+}
+
+// When a rejected id is a valid kebab slug that merely DROPPED the `agent-`
+// prefix (the common label-vs-id slip), suggest the prefixed form; else null.
+function agentIdGuess(id) {
+  return typeof id === "string" && /^[a-z0-9][a-z0-9-]*$/.test(id) && !id.startsWith("agent-")
+    ? `agent-${id}`
+    : null;
+}
+
 // `spor agent use <agent-id>` — make this agent the machine's default dispatch
 // identity by writing `dispatch.agent` to the USER config.json (the same
 // machine-local, never-committed file as the repo map; per-machine, like
@@ -1033,8 +1055,10 @@ function cmdAgentUse(cfg, { id }) {
     err("usage: spor agent use <agent-id>   (or: spor agent use --clear)");
     return 1;
   }
-  if (!clear && !/^[a-z0-9][a-z0-9-]*$/.test(id)) {
-    err(`invalid agent id '${id}' — must match ^[a-z0-9][a-z0-9-]*$ (e.g. agent-your-machine)`);
+  if (!clear && !isAgentId(id)) {
+    err(`invalid agent id '${id}' — must be an 'agent-<slug>' kebab id (e.g. agent-your-machine)`);
+    const guess = agentIdGuess(id);
+    if (guess) err(`  did you mean '${guess}'?  ('spor agent list' shows the full id — the 'agent-' prefix is part of it, not the label)`);
     return 1;
   }
   const home = cfg.userConfigHome();
@@ -2477,16 +2501,34 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   const pinnedSession = process.env.SPOR_SESSION_ID || null;
   const mcpKey = crypto.randomUUID();
   // This machine's agent node — the WHO a dispatched session runs as. `--as`
-  // overrides the per-machine dispatch.agent default for this one dispatch (its
-  // id format mirrors a node id; a bad/unowned one fails soft at token-mint
-  // below, like the config default). Only meaningful remotely (the server is the
-  // CA that mints the agent token); a local-mode dispatch or an unconfigured
-  // machine simply runs person-scoped.
-  if (asAgent && !/^[a-z0-9][a-z0-9-]*$/.test(asAgent)) {
-    err(`invalid --as agent id '${asAgent}' — must match ^[a-z0-9][a-z0-9-]*$ (e.g. agent-your-machine)`);
+  // overrides the per-machine dispatch.agent default for this one dispatch. The
+  // id must satisfy the SAME contract the server's token-mint endpoint enforces
+  // (an 'agent-<slug>' kebab id) — an EXPLICIT --as that doesn't is a hard error
+  // here, caught before any side effect rather than as a per-dispatch 422
+  // (issue-spor-dispatch-agent-id-prefix-validation-gap). Only meaningful remotely
+  // (the server is the CA that mints the agent token); a local-mode dispatch or an
+  // unconfigured machine simply runs person-scoped.
+  if (asAgent && !isAgentId(asAgent)) {
+    err(`invalid --as agent id '${asAgent}' — must be an 'agent-<slug>' kebab id (e.g. agent-your-machine)`);
+    const guess = agentIdGuess(asAgent);
+    if (guess) err(`  did you mean '--as ${guess}'?  ('spor agent list' shows the full id — the 'agent-' prefix is part of it, not the label)`);
     return 1;
   }
-  const identityAgent = cfg.mode() === "remote" ? (asAgent || dispatchAgentId(cfg)) : null;
+  let identityAgent = cfg.mode() === "remote" ? (asAgent || dispatchAgentId(cfg)) : null;
+  // A configured `dispatch.agent` (no --as) that isn't a valid agent id — e.g. the
+  // agent's LABEL stored instead of its 'agent-'-prefixed NODE id — would 422 at
+  // token-mint and silently fall back to person-scoped on EVERY dispatch, quietly
+  // defeating agent attribution (issue-spor-dispatch-agent-id-prefix-validation-gap).
+  // Catch it here with an actionable line and run person-scoped, rather than a
+  // round-trip to a 422 that names nothing. Fail-soft (don't block the dispatch):
+  // the explicit --as path already hard-errored above, so this only fires for the
+  // config default.
+  if (identityAgent && !isAgentId(identityAgent)) {
+    err(`warning: configured dispatch.agent '${identityAgent}' is not a valid agent id — dispatching person-scoped.`);
+    const guess = agentIdGuess(identityAgent);
+    err(`  agent ids start with 'agent-'.${guess ? ` fix: spor agent use ${guess}` : ""}  ('spor agent list' shows your agents.)`);
+    identityAgent = null;
+  }
   // An explicit --as can't take effect in local mode — there is no CA to mint the
   // agent token. Say so rather than silently dropping it to person-scoped.
   if (asAgent && cfg.mode() !== "remote") {
@@ -2594,7 +2636,14 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     } else if (mint.absent) {
       err(`warning: this server can't mint agent-scoped session tokens yet — dispatching person-scoped.`);
     } else {
-      err(`warning: could not mint an agent token (${mint.error}) — dispatching person-scoped.`);
+      // Name the offending agent and the fix — a bare "(HTTP 422 …)" tells the
+      // operator nothing about WHICH id is wrong or how to repair it. The format
+      // gate is now caught client-side above, so a 422 here means the id is a
+      // well-formed 'agent-<slug>' the server still rejected (e.g. no such agent /
+      // not owned); point at the list either way
+      // (issue-spor-dispatch-agent-id-prefix-validation-gap).
+      err(`warning: could not mint an agent token for ${identityAgent} (${mint.error}) — dispatching person-scoped.`);
+      err(`  check it exists and you own it: spor agent list  (set this machine's default with: spor agent use <agent-id>)`);
     }
   }
 

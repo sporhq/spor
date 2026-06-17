@@ -194,6 +194,20 @@ test("agent use: an invalid agent id is refused, writing nothing", () => {
   assert.ok(!fs.existsSync(path.join(home, "config.json")), "nothing written");
 });
 
+// The label-vs-id slip (issue-spor-dispatch-agent-id-prefix-validation-gap):
+// `spor agent list` prints both the agent's id (agent-x) and its bare LABEL (x);
+// pasting the label drops the `agent-` prefix the server's token-mint requires.
+// The client must REFUSE the prefix-less slug (not write a dispatch.agent that
+// 422s on every dispatch) and suggest the prefixed form, writing nothing.
+test("agent use: a prefix-less id (the label slip) is refused with a 'did you mean agent-…' hint, writing nothing", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-usepfx-"));
+  const r = run(["agent", "use", "anthony-shark-november"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /invalid agent id 'anthony-shark-november'/);
+  assert.match(r.stderr, /did you mean 'agent-anthony-shark-november'/);
+  assert.ok(!fs.existsSync(path.join(home, "config.json")), "nothing written");
+});
+
 test("agent use: missing id prints usage", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-useu-"));
   const r = run(["agent", "use"], { SPOR_HOME: home });
@@ -407,6 +421,17 @@ test("dispatch --as: an invalid agent id is refused before launch", () => {
   assert.match(r.stderr, /invalid --as agent id/);
 });
 
+// --as must enforce the SAME 'agent-<slug>' contract as the server's token-mint
+// (issue-spor-dispatch-agent-id-prefix-validation-gap): a prefix-less slug is a
+// valid kebab id but the server 422s it, so catch it before launch with a hint.
+test("dispatch --as: a prefix-less id is refused before launch with a 'did you mean' hint", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-daspfx-"));
+  const r = run(["dispatch", "some free text task here", "--dir", repo, "--no-brief", "--print", "--as", "anthony-shark-november"], { SPOR_SESSION_ID: SID });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /invalid --as agent id 'anthony-shark-november'/);
+  assert.match(r.stderr, /did you mean '--as agent-anthony-shark-november'/);
+});
+
 test("dispatch (remote, real): mints a session-DEFERRED token + 0600 mcp-config, NO --session-id, binds the run session after launch", { skip: isWin }, async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d2-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d2r-"));
@@ -498,6 +523,59 @@ test("dispatch (remote, real): mint 403 (caller doesn't own the agent) => fails 
     const argv = fs.readFileSync(outFile, "utf8").split("\n").slice(1);
     assert.ok(!argv.includes("--session-id"), "--session-id is never passed (claude --bg ignores it)");
     assert.ok(!argv.includes("--mcp-config"), "no agent-scoping on an owner-mismatch");
+  } finally {
+    srv.close();
+  }
+});
+
+// The root case (issue-spor-dispatch-agent-id-prefix-validation-gap): a configured
+// dispatch.agent that DROPPED the `agent-` prefix (the label stored instead of the
+// id). Before the fix this 422'd at token-mint on EVERY dispatch and fell back to
+// person-scoped with a non-actionable warning. Now it's caught CLIENT-SIDE before
+// any network: no /v1/agents/{id}/token round-trip, an actionable warning naming
+// the bad value + the fix, and a clean person-scoped launch.
+test("dispatch (remote, real): a prefix-less dispatch.agent fails soft client-side — no mint round-trip, actionable warning, person-scoped", { skip: isWin }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d5-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d5r-"));
+  const outFile = path.join(home, "argv.out");
+  fs.mkdirSync(home, { recursive: true });
+  // The bug-for-bug value from the issue: the LABEL, missing the agent- prefix.
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "anthony-shark-november" } }) + "\n");
+  const stub = argvStub(home, outFile);
+  const { srv, hits, base } = await dispatchStub({ mintStatus: 201 });
+  try {
+    const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    // actionable warning: names the bad value AND the exact fix
+    assert.match(r.stderr, /configured dispatch\.agent 'anthony-shark-november' is not a valid agent id/);
+    assert.match(r.stderr, /spor agent use agent-anthony-shark-november/);
+    // caught client-side: NO token mint round-trip at all (the whole point)
+    assert.ok(!hits.some((h) => /\/token$/.test(h.url)), "no /v1/agents/{id}/token round-trip — caught before the network");
+    // still launched, person-scoped (no agent-scoping flags)
+    const argv = fs.readFileSync(outFile, "utf8").split("\n").slice(1);
+    assert.strictEqual(argv[0], "--bg", "dispatch still launches");
+    assert.ok(!argv.includes("--mcp-config"), "no agent-scoping on an invalid dispatch.agent");
+    assert.ok(!argv.includes("--strict-mcp-config"), "no strict flag either");
+  } finally {
+    srv.close();
+  }
+});
+
+// The same misconfiguration under --print: the preview must report person-scoped
+// (not "would mint a token", which the old preview did — a lie, since the mint
+// 422s), with the actionable warning on stderr.
+test("dispatch (remote, --print): a prefix-less dispatch.agent previews person-scoped + warns", { skip: isWin }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d6-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d6r-"));
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "anthony-shark-november" } }) + "\n");
+  const { srv, base } = await dispatchStub();
+  try {
+    const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief", "--print"], remoteEnv(home, base, { SPOR_SESSION_ID: SID }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stderr, /configured dispatch\.agent 'anthony-shark-november' is not a valid agent id/);
+    assert.match(r.stdout, /agent:  \(none configured/);
+    assert.doesNotMatch(r.stdout, /would mint/);
   } finally {
     srv.close();
   }
