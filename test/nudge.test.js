@@ -32,29 +32,21 @@ function scratch() {
 }
 
 function env(home, stub, extra = {}) {
-  const e = { ...process.env, SUBSTRATE_HOME: home };
-  // Opt the scratch repo in (task-spor-plugin-opt-in-default); the capture-nudge
-  // path only runs when the hook is active for the (markerless) cwd.
+  const e = { ...process.env };
+  // Hermetic env: strip EVERY ambient Spor/backend var (both SPOR_* and legacy
+  // SUBSTRATE_* spellings) so a configured dev box can't derail the stubbed
+  // classifier — remote mode (SPOR_SERVER), the recursion guard (SPOR_DISTILLING),
+  // a real backend command (SPOR_DISTILL_CMD/SPOR_NUDGE_CMD), the nudge knobs, or
+  // an API key. The suite is green in CI's clean env; this keeps it green on a box
+  // that has Spor configured. Each test then sets exactly what it needs (+ `extra`).
+  for (const k of Object.keys(e)) if (/^(SPOR_|SUBSTRATE_)/.test(k)) delete e[k];
+  delete e.GEMINI_API_KEY;
+  delete e.ANTHROPIC_API_KEY;
+  e.SUBSTRATE_HOME = home;
+  // Opt the markerless scratch repo in (task-spor-plugin-opt-in-default); the
+  // capture-nudge path only runs when the hook is active for the cwd.
   e.SPOR_ENABLED = '1';
-  delete e.SUBSTRATE_SERVER;
-  delete e.SUBSTRATE_TOKEN;
-  delete e.SUBSTRATE_DISTILLING;
-  delete e.SUBSTRATE_NUDGE;
-  // Also clear the current SPOR_* spellings, or an ambient SPOR_SERVER/TOKEN
-  // (remote mode) or SPOR_NUDGE/SPOR_NUDGE_CMD on the host derails the stub.
-  delete e.SPOR_SERVER;
-  delete e.SPOR_TOKEN;
-  delete e.SPOR_DISTILL_CMD;
-  delete e.SPOR_NUDGE;
-  delete e.SPOR_NUDGE_CMD;
-  // Clear the bound knobs too, so a host setting can't derail the defaults a
-  // test relies on (the per-test `extra` sets them explicitly when needed).
-  delete e.SPOR_NUDGE_MAX;
-  delete e.SUBSTRATE_NUDGE_MAX;
-  delete e.SPOR_NUDGE_TIMEOUT;
-  delete e.SUBSTRATE_NUDGE_TIMEOUT;
   if (stub) e.SUBSTRATE_NUDGE_CMD = stub;
-  else delete e.SUBSTRATE_NUDGE_CMD;
   return { ...e, ...extra };
 }
 
