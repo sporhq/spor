@@ -46,6 +46,7 @@
   ],
   "scripts": {
     "test": "node --test test/*.test.js",
+    "test:e2e": "node --test test/e2e-claude.test.js",
     "conformance": "node conformance/runner.js"
   },
   "engines": {

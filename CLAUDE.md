@@ -77,6 +77,41 @@ echo '{"cwd": "...", "session_id": "t1", "tool_name": "Edit", "tool_input": {"fi
 echo '{"cwd": "...", "session_id": "t1", "transcript_path": "/tmp/fake.jsonl"}' | bin/spor-hook distill
 ```
 
+Beyond the hand-built-payload contract suite, `test/e2e-claude.test.js`
+(task-spor-e2e-integration-tests) drives the REAL `claude` binary with the
+plugin loaded (`claude --plugin-dir . -p`) against a zero-dep `node:http` fake
+Anthropic Messages API (`test/helpers/fake-anthropic.js`), replaying genuine
+client paths (norm-qa-replay-genuine-paths) to catch regressions when a new
+Claude Code version ships. `npm run test:e2e` runs just this file; it is part of
+`npm test` but SELF-SKIPS when the `claude` binary is absent (CI runs on a
+runner without it — the suite stays green) or `SPOR_E2E=0`. The driver
+(`test/helpers/claude-e2e.js`) replays Tier 0 (spec-correct SSE text) and Tier 1
+(one `tool_use` round-trip); the remote-mode tier (claim nudge, dispatch, agent
+identity) needs a live Spor server and lives in spor-server, which imports the
+fake from here. Three things were paid for and must not be undone:
+- **The oracle is the REQUEST BODIES claude sends + SPOR_HOME side effects, never
+  claude's own response framing** (we script the responses). Hook
+  `additionalContext` (briefing/digest/nudge) lands in the next `POST
+  /v1/messages` as a `<system-reminder>` inside a USER message (not the `system`
+  field) — `allInjectedText()` scans message text. A new CC version breaking the
+  hook contract surfaces there, or in the scratch graph's nodes/cooldowns.
+- **Hermeticity needs a fresh `CLAUDE_CONFIG_DIR` + clean `HOME`**: a configured
+  dev box has the installed `spor@spor` plugin and `SPOR_SERVER`/`SPOR_TOKEN` in
+  `~/.claude/settings.json`, which claude merges into the HOOK env — without
+  isolation the hooks run in REMOTE mode against the LIVE team graph (a
+  write-to-live-graph hazard, norm-cc-scratch-home-for-tests). The curated
+  `env:` we pass replaces (not merges) the environment.
+- **Invoke claude with async `spawn` resolving on `exit`, NOT `spawnSync`**:
+  claude 2.x leaves a persistent background daemon, and `spawnSync` blocks on
+  process-group/stdio teardown the daemon keeps alive — it hangs to its timeout
+  even though `claude -p` itself exited in ~1s. Route stdout/stderr to temp
+  files (not pipes) for the same reason.
+The SSE wire encoder in the fake is pinned to the documented streaming event
+contract; when a new CC version tightens parsing and it breaks, that IS the
+signal. Cap fidelity by stubbing the `SPOR_DISTILL_CMD`/`SPOR_NUDGE_CMD` seams
+so the fake never has to emulate distiller node markdown or the classifier
+verdict. See test/e2e-claude.test.js.
+
 The post-tool engine also carries the capture nudge
 (task-cc-posttool-capture-nudge):
 a Write/Edit of ≥50 words of prose to a `.md` outside the graph runs a Haiku
