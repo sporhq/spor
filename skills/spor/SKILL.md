@@ -85,6 +85,10 @@ spor add "<2-3 sentences>"     # capture a node (typed file locally; /v1/capture
 
 # remote (team server) only
 spor lens [<id>]               # list saved views, or render one
+spor agent create <label>      # create one of your agents — a person-owned principal (`spor agent list`)
+spor dispatch <id>|"<task>"    # run work as a background agent; in team mode its graph writes are
+                               #   attributed "agent on behalf of you" (the machine's default agent =
+                               #   dispatch.agent / SPOR_DISPATCH_AGENT). See API.md §3-§4.
 
 # dual-mode (local passthrough / remote dispatch to the server)
 spor compile --query "<text>"  # search → compiled neighborhood (--digest for compact)

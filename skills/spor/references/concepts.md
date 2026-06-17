@@ -109,7 +109,9 @@ a load-bearing reason exists ("because the release is Friday"), record it here.
 One fact per node; if you're writing "and also…", split it.
 ```
 
-Server-stamped fields you don't set by hand: `author`, `authored_via`. Other
+Server-stamped fields you don't set by hand: `author`, `authored_via` (plus `authored_by_agent` +
+`session`, with `authored_via: dispatch`, on a write made under an agent-scoped
+token — the node reads "agent on behalf of person"). Other
 type-specific fields exist (`wake:` dormancy date; `commits:` linked git shas;
 `pin:`/`exclude:` on corrections; `slugs:`/`fingerprints:`/`tags:` on repo nodes;
 `applies_to_tags:`/`applies_to_repos:`/`applies_to_projects:` ride-along

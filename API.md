@@ -16,8 +16,13 @@ Every mutation is validated, attributed, serialized, and committed to the
 graph's git repo. What a client sees:
 
 - **Attribution**: the server stamps `author: <identity>` and
-  `authored_via: mcp|rest|capture` from the authenticated token — any
-  `author:` supplied in the payload is discarded.
+  `authored_via: mcp|rest|capture|dispatch` from the authenticated token — any
+  `author:` supplied in the payload is discarded. A write under an
+  **agent-scoped token** (§4) additionally stamps `authored_by_agent: <agent-id>`
+  and `session: <id>` and uses `authored_via: dispatch`, while `author:` stays
+  the agent's **owning person** — so the node reads "agent on behalf of person".
+  These ride-along fields are token-derived too; any supplied in the payload are
+  discarded.
 - **Create**: `if_exists: "skip"` → id collision is reported as `skipped`
   (the distiller default); `if_exists: "error"` → id collision is a
   `conflict` error.
@@ -314,6 +319,9 @@ endpoint is the REST twin of a core call:
 | `GET /v1/admin/tokens` | offboarding / audit | list PATs → `{tokens: [{hash_prefix, person, name, email, created, expires, expired}], count}` — never plaintext, never full hashes. Admin-only (§4) |
 | `POST /v1/admin/tokens` `{person, expires?}` | onboarding | mint a PAT bound to an existing person node (`expires` is `<N>d` or an ISO date) → 201 `{token, hash_prefix, person, name, email, expires}`; the plaintext `token` is returned **once**. Admin-only |
 | `DELETE /v1/admin/tokens/{hash-prefix}` | offboarding / rotation | revoke the single PAT matching the hash prefix (≥8 hex chars; an ambiguous prefix is a 409) → `{revoked, hash_prefix}`. Admin-only |
+| `GET /v1/agents` | `spor agent list` | list the agents the caller **owns** → `{agents: [{id, label, owner, spiffe, pubkey, status}], count}`; `?all=1` lists every agent (admin-only) |
+| `POST /v1/admin/agents` `{label, owner?, id?, pubkey?}` | `spor agent create`, onboarding | create a person-owned `agent` node + its `owned-by` edge (`owner` defaults to the caller's person; `id` derives from `label`) → 201 `{id, owner, spiffe, pubkey, status, revision}`. 409 dup id / 422 invalid / 403 non-admin. Admin-only, same `stewards→root` gate as `/v1/admin/tokens` |
+| `POST /v1/agents/{id}/token` `{session, audience?, expires?}` | `spor dispatch` | **self-serve** (NOT admin): mint a short-TTL, per-session token scoped to agent `{id}` → 201 `{token, expires_at, agent, session}`. Authorized iff the caller's person **owns** the agent (its `owned-by` edge) — else `403`; `404` unknown agent; `422` bad/missing `session`. The token carries `{agent, session}` (the person is derived from the `owned-by` edge at verify time); a write under it is stamped agent-on-behalf-of-person (§1). A caller `expires` may only shorten the default TTL, never extend it |
 
 Path parameters (node ids, project slugs) must match
 `^[a-z0-9][a-z0-9-]*$`. Request bodies are capped at 1MB
@@ -357,6 +365,19 @@ anything with a token.
   --admin --person <id>` (it writes that `stewards` edge, creating the person
   node from `--name`/`--email` if needed). Hand-editing the token file stays
   as the break-glass path.
+- **Agent-scoped session tokens.** A person mints a short-lived, per-session
+  token for an `agent` they **own** through the self-serve
+  `POST /v1/agents/{id}/token` (§3) — authorized by ownership (the agent's
+  `owned-by → person` edge), never admin, so a dispatcher needs no special
+  privilege to run their own agents. The token's record carries `{agent,
+  session}` and no person; the owning person (and its `{name, email}`) resolves
+  from the `owned-by` edge at verify time, so a deleted agent or owner makes the
+  token fail closed rather than impersonate. Writes under it are attributed
+  agent-on-behalf-of-person (§1) — the `person → agent` chain is the audit
+  trail. `spor dispatch` mints one per run and injects it into the launched
+  background agent (so the agent's own graph writes carry its identity), picking
+  the machine's default agent from the `dispatch.agent` client config
+  (`SPOR_DISPATCH_AGENT`).
 - **OAuth 2.1 for MCP connectors** (Cowork/claude.ai, which cannot carry a
   static bearer token): protected-resource metadata discovery (RFC 9728,
   advertised on the `/mcp` 401 via `WWW-Authenticate`), authorization-server
