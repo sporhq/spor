@@ -88,8 +88,8 @@ runner without it — the suite stays green) or `SPOR_E2E=0`. Set
 `SPOR_E2E_CLAUDE=<path|version>` to run against a SPECIFIC Claude Code version (a
 full binary path, or a bare version like `2.1.177` resolved under the native
 `~/.local/share/claude/versions/`) — the fake serves a dummy key so any version
-runs offline; this is Rung 1 of the version matrix
-(task-spor-e2e-claude-version-matrix-sandbox). The driver
+runs offline (the version-matrix override,
+task-spor-e2e-claude-version-matrix-sandbox). The driver
 (`test/helpers/claude-e2e.js`) replays Tier 0 (spec-correct SSE text) and Tier 1
 (one `tool_use` round-trip); the remote-mode tier (claim nudge, dispatch, agent
 identity) needs a live Spor server and lives in spor-server, which imports the
@@ -116,6 +116,17 @@ contract; when a new CC version tightens parsing and it breaks, that IS the
 signal. Cap fidelity by stubbing the `SPOR_DISTILL_CMD`/`SPOR_NUDGE_CMD` seams
 so the fake never has to emulate distiller node markdown or the classifier
 verdict. See test/e2e-claude.test.js.
+
+For a clean version MATRIX and full isolation, `test/e2e/Dockerfile` +
+`test/e2e/docker-matrix.sh` run the same suite inside a container with
+a pinned Claude Code version (`npm i -g @anthropic-ai/claude-code@<ver>`): the
+fake API, claude, the plugin, and the scratch graph all live IN the container, so
+`docker run --rm` teardown reaps the claude daemon and any background agents —
+the leak-safe home for a real `claude --bg` dispatch smoke
+(issue-spor-server-dispatch-e2e-bg-agent-leak). Run `test/e2e/docker-matrix.sh
+[VER ...]` (default `latest`); CI runs it on demand + weekly via
+`.github/workflows/e2e-matrix.yaml`. No secrets — the fake's dummy key keeps it
+offline.
 
 The post-tool engine also carries the capture nudge
 (task-cc-posttool-capture-nudge):

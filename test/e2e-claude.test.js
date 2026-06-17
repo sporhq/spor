@@ -41,7 +41,7 @@ const {
 // an unresolvable SPOR_E2E_CLAUDE override).
 const skip = claudeSkipReason() || false;
 // Record which Claude Code version actually ran — the point of the SPOR_E2E_CLAUDE override
-// (Rung 1, task-spor-e2e-claude-version-matrix-sandbox) is a version matrix, so log it.
+// (task-spor-e2e-claude-version-matrix-sandbox) is a version matrix, so log it.
 if (!skip) console.error(`# e2e: Claude Code ${claudeVersion() || "(version unknown)"}`);
 
 // A small multi-node corpus tagged to the project slug. The digest is tf-idf, so it needs

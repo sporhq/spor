@@ -28,7 +28,7 @@ const PLUGIN_ROOT = path.resolve(__dirname, "..", "..");
 // first or the prompt pipe SIGPIPEs.
 const NOTHING_CMD = "cat >/dev/null; echo NOTHING";
 
-// Resolve a SPOR_E2E_CLAUDE override (Rung 1, task-spor-e2e-claude-version-matrix-sandbox)
+// Resolve a SPOR_E2E_CLAUDE override (task-spor-e2e-claude-version-matrix-sandbox)
 // to an existing binary, or null. The override picks WHICH Claude Code version the suite
 // runs against — so a version matrix (CI or local) is just re-running with a different value.
 // Two accepted forms:

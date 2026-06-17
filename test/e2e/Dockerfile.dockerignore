@@ -1,0 +1,11 @@
+# Build-context ignore for test/e2e/Dockerfile (BuildKit reads <dockerfile>.dockerignore).
+# Keep the context to the plugin source + test suite; drop history, machine state, and any
+# worktrees so the image is small and reproducible.
+.git
+.github
+.claude
+.worktrees
+node_modules
+**/node_modules
+*.log
+conformance/**/journal

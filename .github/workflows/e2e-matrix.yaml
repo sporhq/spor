@@ -1,0 +1,23 @@
+name: E2E version matrix
+
+# task-spor-e2e-claude-version-matrix-sandbox. Builds the containerized E2E runner
+# (test/e2e/Dockerfile) and runs the local-mode suite against one or more Claude Code
+# versions. NOT on push — the per-version Docker build + real `claude` run is too heavy for
+# every commit; it runs on demand and weekly to catch new Claude Code releases that break the
+# hook contract. The container is fully self-contained (fake API + dummy key), so no secrets.
+on:
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: "Space-separated Claude Code versions / npm dist-tags (e.g. 'latest 2.1.179')"
+        default: "latest"
+  schedule:
+    - cron: "0 7 * * 1" # Mondays 07:00 UTC
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build + run the E2E matrix
+        run: bash test/e2e/docker-matrix.sh ${{ github.event.inputs.versions || 'latest' }}
