@@ -22,7 +22,11 @@ graph's git repo. What a client sees:
   and `session: <id>` and uses `authored_via: dispatch`, while `author:` stays
   the agent's **owning person** — so the node reads "agent on behalf of person".
   These ride-along fields are token-derived too; any supplied in the payload are
-  discarded.
+  discarded. The `session` is the agent's REAL run session: `spor dispatch` mints
+  the token **session-deferred** (it can't know the session before `claude --bg`
+  self-allocates it) and binds the real one post-launch via `POST /v1/agents/session`
+  (§3, dec-spor-dispatch-bg-session-late-bind) — so writes BEFORE the bind carry no
+  `session` (honest, never a phantom), and writes after trace to the actual run.
 - **Create**: `if_exists: "skip"` → id collision is reported as `skipped`
   (the distiller default); `if_exists: "error"` → id collision is a
   `conflict` error.
@@ -301,8 +305,8 @@ endpoint is the REST twin of a core call:
 | `POST /v1/nodes` | drain-outbox, mechanical writers | `put_node` semantics, batch: `{nodes: [...], if_exists: "skip"}` (entries may be raw strings or `{node, if_exists, revision}`) → `{results: [...]}`, 207 when any entry failed |
 | `POST /v1/nodes/{id}/edges` `{type, to}` | scripts, mechanical writers | `add_edge` semantics (§1): normalize/flip, dedupe, append — no revision echo |
 | `POST /v1/nodes/{id}/status` `{status}` | scripts, mechanical writers | `set_status` semantics (§1): one-scalar update through the `transitions()` gate. Setting a work node to an in-progress status also CLAIMS it (same lease as `/claim` below) |
-| `POST /v1/nodes/{id}/claim` `{session?}` | `claim`/`set_status` MCP tools, `spor dispatch` | take the heartbeat-renewed lease (dec-cc-task-claim-lease): writes the durable `assigned` edge once, attributes to `$viewer` from the token (never an argument), and creates the ephemeral lease → `{ok, status, lease: {node_id, by, expires, expires_at, session, claimed_at}, edge}`. A live lease held by ANOTHER person is `409 conflict` naming the holder + expiry (re-claiming your OWN live claim just renews it). `session` scopes the heartbeat (omit to leave it person-scoped, so any of the claimer's sessions may renew — what `spor dispatch` does, since the launched agent renews from a different session) |
-| `POST /v1/nodes/{id}/renew` `{session?}` | post-tool heartbeat, `renew` MCP tool | bump the live lease's expiry only — no commit; the heartbeat that keeps a claim from lapsing. A lapsed/stolen lease is `409` (names the current holder). Person-scoped: any of the claimer's sessions may renew |
+| `POST /v1/nodes/{id}/claim` `{session?}` | `claim`/`set_status` MCP tools, `spor dispatch` | take the heartbeat-renewed lease (dec-cc-task-claim-lease): writes the durable `assigned` edge once, attributes to `$viewer` from the token (never an argument), and creates the ephemeral lease → `{ok, status, lease: {node_id, by, expires, expires_at, session, claimed_at}, edge}`. A live lease held by ANOTHER person is `409 conflict` naming the holder + expiry (re-claiming your OWN live claim just renews it). `session` scopes the heartbeat (omit to leave it person-scoped, so any of the claimer's sessions may renew — what `spor dispatch` does at the PRE-launch claim, since `claude --bg` self-allocates the run session only at launch; dispatch then renews with the real session once it has read it from `claude agents --json`, dec-spor-dispatch-bg-session-late-bind) |
+| `POST /v1/nodes/{id}/renew` `{session?}` | post-tool heartbeat, `renew` MCP tool, `spor dispatch` | bump the live lease's expiry only — no commit; the heartbeat that keeps a claim from lapsing. A lapsed/stolen lease is `409` (names the current holder). Person-scoped: any of the claimer's sessions may renew; a `session` binds the lease to that run (`spor dispatch` uses this to bind the captured `claude --bg` session post-launch) |
 | `POST /v1/nodes/{id}/release` | `release` MCP tool | drop the lease AND retire the durable `assigned` edge, returning the node to the pool. Idempotent (releasing a node you hold no lease on still succeeds, cleaning up any lingering `assigned` edge of yours); releasing a claim someone else holds is `409` naming the holder |
 | `POST /v1/nodes/{id}/commits` `{repo, sha}` | post-tool / link-commits | `link_commit`: append `repo@sha` to the node's `commits:` list (kebab-case repo slug, 7–40 lowercase hex, ≤40 commits per node); idempotent, prefix-aware dedup |
 | `GET /v1/commits/{sha}?repo=` | sessions doing git archaeology | sha → nodes lookup over the `commits:` fields (≥7 hex, abbreviated or full); each match carries `{repo, sha, id, type, title, summary, status, project}` — blame a line, get the why |
@@ -321,7 +325,8 @@ endpoint is the REST twin of a core call:
 | `DELETE /v1/admin/tokens/{hash-prefix}` | offboarding / rotation | revoke the single PAT matching the hash prefix (≥8 hex chars; an ambiguous prefix is a 409) → `{revoked, hash_prefix}`. Admin-only |
 | `GET /v1/agents` | `spor agent list` | list the agents the caller **owns** → `{agents: [{id, label, owner, spiffe, pubkey, status}], count}`; `?all=1` lists every agent (admin-only) |
 | `POST /v1/admin/agents` `{label, owner?, id?, pubkey?}` | `spor agent create`, onboarding | create a person-owned `agent` node + its `owned-by` edge (`owner` defaults to the caller's person; `id` derives from `label`) → 201 `{id, owner, spiffe, pubkey, status, revision}`. 409 dup id / 422 invalid / 403 non-admin. Admin-only, same `stewards→root` gate as `/v1/admin/tokens` |
-| `POST /v1/agents/{id}/token` `{session, audience?, expires?}` | `spor dispatch` | **self-serve** (NOT admin): mint a short-TTL, per-session token scoped to agent `{id}` → 201 `{token, expires_at, agent, session}`. Authorized iff the caller's person **owns** the agent (its `owned-by` edge) — else `403`; `404` unknown agent; `422` bad/missing `session`. The token carries `{agent, session}` (the person is derived from the `owned-by` edge at verify time); a write under it is stamped agent-on-behalf-of-person (§1). A caller `expires` may only shorten the default TTL, never extend it |
+| `POST /v1/agents/{id}/token` `{session?, audience?, expires?}` | `spor dispatch` | **self-serve** (NOT admin): mint a short-TTL, per-session token scoped to agent `{id}` → 201 `{token, expires_at, agent, session}` (`session: null` when deferred). Authorized iff the caller's person **owns** the agent (its `owned-by` edge) — else `403`; `404` unknown agent; `422` a SUPPLIED `session` that is malformed. `session` is now **OPTIONAL** (deferred binding, dec-spor-dispatch-bg-session-late-bind): `spor dispatch` mints it deferred because `claude --bg` self-allocates the run session only at launch, then binds the real one via `POST /v1/agents/session` below. The token carries `{agent, session?}` (the person is derived from the `owned-by` edge at verify time); a write under it is stamped agent-on-behalf-of-person (§1). A caller `expires` may only shorten the default TTL, never extend it |
+| `POST /v1/agents/session` `{session}` | `spor dispatch` (post-launch) | **late session binding** for a session-deferred agent token (dec-spor-dispatch-bg-session-late-bind). Authenticated by the **agent token itself** (the bearer hash identifies its own record — no agent id in the path, no ownership re-check), so only an agent-scoped token may call it (`403` otherwise). Sets that token's `session` → `200 {ok, agent, session}`. **Write-once**: idempotent on the same value (`{unchanged: true}`), `409 conflict` on a different one (a token's session is provenance, not a mutable field); `422` missing/malformed `session`. Every subsequent write under the token then stamps the bound session |
 
 Path parameters (node ids, project slugs) must match
 `^[a-z0-9][a-z0-9-]*$`. Request bodies are capped at 1MB
@@ -379,7 +384,14 @@ anything with a token.
   the machine's default agent from the `dispatch.agent` client config (set with
   `spor agent use <agent-id>`, or `SPOR_DISPATCH_AGENT`), which `spor dispatch
   --as <agent-id>` overrides for a single run. (Not to be confused with `spor
-  dispatch --agent`, the unrelated `claude --agent` harness passthrough.)
+  dispatch --agent`, the unrelated `claude --agent` harness passthrough.) The
+  token is minted **session-deferred** and bound to the real run session AFTER
+  launch (dec-spor-dispatch-bg-session-late-bind): `claude --bg` ignores
+  `--session-id` and self-allocates its session, so dispatch reads the real one
+  from `claude agents --json` and binds it via `POST /v1/agents/session` (§3) — the
+  one place an agent token's session is set, write-once. The session can't be
+  forged a-priori (it isn't known until the run exists) and can't ride the write
+  payload (token-derived, §1), so the binding is always the actual run.
 - **OAuth 2.1 for MCP connectors** (Cowork/claude.ai, which cannot carry a
   static bearer token): protected-resource metadata discovery (RFC 9728,
   advertised on the `/mcp` 401 via `WWW-Authenticate`), authorization-server

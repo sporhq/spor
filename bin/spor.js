@@ -418,13 +418,49 @@ function dispatchedAgents() {
       if (!a || a.kind !== "background" || typeof a.name !== "string") continue;
       if (a.state === "done") continue; // finished — not in flight
       const list = map.get(a.name) || [];
-      list.push({ id: a.id, name: a.name, state: a.state, status: a.status, cwd: a.cwd });
+      // sessionId + startedAt ride along for post-launch session capture
+      // (dec-spor-dispatch-bg-session-late-bind); the dup-guard ignores them.
+      list.push({ id: a.id, name: a.name, state: a.state, status: a.status, cwd: a.cwd, sessionId: a.sessionId, startedAt: a.startedAt });
       map.set(a.name, list);
     }
     return map;
   } catch {
     return new Map();
   }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Find the FULL run-session id of the agent `spor dispatch` just launched in `dir`
+// (dec-spor-dispatch-bg-session-late-bind). `claude --bg` self-allocates and
+// prints only a SHORT id, but `claude agents --json` reports the full `sessionId`
+// + `cwd` + `startedAt` — the reliable capture path. Match on cwd (the strong
+// signal — we just launched there), then on name when given, then pick the NEWEST
+// (the run we just started). Returns the sessionId or null.
+function newestDispatchedSession(name, dir) {
+  const all = [];
+  for (const arr of dispatchedAgents().values()) for (const a of arr) all.push(a);
+  let cands = all.filter((a) => a.sessionId && (!dir || a.cwd === dir));
+  if (name) {
+    const named = cands.filter((a) => a.name === name);
+    if (named.length) cands = named;
+  }
+  if (!cands.length) return null;
+  cands.sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
+  return cands[0].sessionId;
+}
+
+// Capture the launched run's session, polling briefly while the daemon registers
+// it. SPOR_SESSION_ID pins it (tests/reproducibility) and short-circuits the poll.
+// Returns the sessionId or null (fail-open — the caller degrades to session-null).
+async function captureDispatchSession(name, dir, pinned) {
+  if (pinned) return pinned;
+  for (let i = 0; i < 6; i++) {
+    const sid = newestDispatchedSession(name, dir);
+    if (sid) return sid;
+    await sleep(300);
+  }
+  return null;
 }
 
 // Stamp items[].in_flight from the dispatched-agent map, optionally dropping the
@@ -2056,17 +2092,16 @@ async function topQueueItem(cfg, slug) {
 // post-tool heartbeat drives (dec-cc-task-claim-lease, task-cc-claim-nudge-hook).
 // REMOTE-MODE ONLY: a claim is a server-held lease; local mode has no pool or
 // contention (dec-cc-task-claim-lease "Local mode"), so the caller skips it and
-// local dispatch stays byte-identical. SESSION-BOUND at dispatch
-// (dec-spor-session-identity-active-record): dispatch now FORCES the session id
-// (`--session-id <uuid>`), so it knows the working session up front and binds the
-// lease to it; the launched bg agent runs under that exact session, so its
-// post-tool heartbeat renews the same-session lease (the earlier person-scoped /
-// session:null workaround existed only because the old dispatcher did NOT know
-// the working session — that reason is gone). Omitting `session` leaves the lease
-// person-scoped, the prior behavior. Returns {ok} on success/idempotent-renew,
-// {conflict, message} when the node is already held (the concurrent-dispatch case
-// this guards), or {error} for any other failure (fail-open: the caller warns and
-// dispatches anyway).
+// local dispatch stays byte-identical. PRE-LAUNCH the claim is PERSON-SCOPED
+// (session omitted, dec-spor-dispatch-bg-session-late-bind): `claude --bg`
+// IGNORES `--session-id` and self-allocates its real session, so the working
+// session is NOT knowable up front — binding the lease to a forced uuid was a
+// phantom (issue-spor-dispatch-bg-ignores-forced-session-id). Dispatch instead
+// captures the real session post-launch and binds it via renewDispatch (and the
+// bg agent's own post-tool heartbeat renews the same-session lease thereafter).
+// Returns {ok} on success/idempotent-renew, {conflict, message} when the node is
+// already held (the concurrent-dispatch case this guards), or {error} for any
+// other failure (fail-open: the caller warns and dispatches anyway).
 async function claimDispatch(cfg, nodeId, session) {
   const body = session ? { session } : {};
   const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}/claim`, body, { timeoutMs: 6000 });
@@ -2084,6 +2119,35 @@ async function claimDispatch(cfg, nodeId, session) {
   // we couldn't establish the lease. Fail-open like the rest of the remote path
   // (dec-cc-fail-open-hooks / the fail-soft briefing compile): warn and dispatch
   // without a claim rather than blocking on an outage.
+  const code = r.json && r.json.error && r.json.error.code;
+  return { ok: false, error: r.transport ? r.error : `HTTP ${r.status}${code ? ` (${code})` : ""}` };
+}
+
+// Renew the dispatch lease, binding it to the REAL session captured post-launch
+// (dec-spor-dispatch-bg-session-late-bind). The pre-launch claim was person-scoped;
+// this binds the lease's session to the real `claude --bg` run so the lease and the
+// rebound agent token agree from the start (instead of waiting for the agent's first
+// heartbeat to self-heal it). Best-effort: a lapsed/stolen lease (409) or any other
+// failure is swallowed — the bg agent's heartbeat still renews it. Returns {ok}.
+async function renewDispatch(cfg, nodeId, session) {
+  const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}/renew`, { session }, { timeoutMs: 3000 });
+  return { ok: !!r.ok };
+}
+
+// Late-bind the agent token's run session (dec-spor-dispatch-bg-session-late-bind).
+// The token was minted session-DEFERRED before launch (the session wasn't knowable
+// yet); this reports the REAL session captured from `claude agents --json`,
+// authenticated by the AGENT TOKEN ITSELF (not the person token) so the server can
+// set it on that token's record. Every subsequent write under the token then stamps
+// the real session. Best-effort/fail-open: a server without the route (404), a
+// conflict (409), or any transport error leaves the token session-null (writes carry
+// no session — honest, never a phantom) rather than blocking dispatch. Returns
+// {ok}|{absent}|{conflict}|{error}.
+async function bindAgentSession(cfg, agentToken, session) {
+  const r = await remote.post(cfg, `/v1/agents/session`, { session }, { timeoutMs: 3000, token: agentToken });
+  if (r.ok) return { ok: true };
+  if (r.status === 404) return { ok: false, absent: true };
+  if (r.status === 409) return { ok: false, conflict: true };
   const code = r.json && r.json.error && r.json.error.code;
   return { ok: false, error: r.transport ? r.error : `HTTP ${r.status}${code ? ` (${code})` : ""}` };
 }
@@ -2190,13 +2254,18 @@ function dispatchAgentId(cfg) {
 // OWNERSHIP-gated, NOT admin-gated: POST /v1/agents/{id}/token authenticated with
 // the dispatcher's normal person token (SPOR_TOKEN); the server checks the caller
 // OWNS agent {id} (the owned-by edge) — so a normal teammate can mint a token for
-// their own machine's agent without being an admin. REMOTE only. Returns
-// { ok, token } on success, { absent:true } when the mint surface isn't deployed
-// yet (404 — the spor-server stream is building it; fail soft, dispatch without
-// agent-scoping), or { error } on any other failure incl. 403/owner-mismatch
-// (also fail soft — warn and dispatch person-scoped, never block).
+// their own machine's agent without being an admin. REMOTE only. The token is
+// minted session-DEFERRED (session omitted) when the real session isn't yet known
+// — the standing case, since `claude --bg` allocates it only at launch
+// (dec-spor-dispatch-bg-session-late-bind); dispatch binds the real session
+// afterward via bindAgentSession. The `session` param is kept for a caller that
+// genuinely knows it up front (none today — dispatch always defers). Returns
+// { ok, token } on success, { absent:true }
+// when the mint surface isn't deployed yet (404 — fail soft, dispatch person-
+// scoped), or { error } on any other failure incl. 403/owner-mismatch (also fail
+// soft — warn and dispatch person-scoped, never block).
 async function mintAgentToken(cfg, { agent, session }) {
-  const r = await remote.post(cfg, `/v1/agents/${encodeURIComponent(agent)}/token`, { session }, { timeoutMs: 6000 });
+  const r = await remote.post(cfg, `/v1/agents/${encodeURIComponent(agent)}/token`, session ? { session } : {}, { timeoutMs: 6000 });
   if (r.transport) return { error: r.error };
   // 404 = no route (surface not deployed) => absent, dispatch falls back cleanly.
   if (r.status === 404) return { absent: true };
@@ -2209,16 +2278,17 @@ async function mintAgentToken(cfg, { agent, session }) {
 // Write the 0600 --mcp-config JSON that gives the bg agent ONLY its own
 // agent-scoped Spor MCP (account connector excluded by --strict-mcp-config,
 // verified #1). Machine-local, gitignored-adjacent path under the user config
-// home's outbox; per-session filename so concurrent dispatches don't collide.
-// Returns the file path. The bg agent reads it on startup AFTER this process
-// exits (claude --bg detaches), so we cannot delete it eagerly — cleanup is a
-// best-effort sweep of stale files here, plus the documented short-TTL token
-// inside it (dec-spor-session-identity-active-record open item).
-function writeDispatchMcpConfig(cfg, { token, session }) {
+// home's outbox; per-dispatch filename (`key`, a fresh uuid) so concurrent
+// dispatches don't collide — the session id is no longer known at this point
+// (deferred until post-launch, dec-spor-dispatch-bg-session-late-bind). Returns
+// the file path. The bg agent reads it on startup AFTER this process exits (claude
+// --bg detaches), so we cannot delete it eagerly — cleanup is a best-effort sweep
+// of stale files here, plus the documented short-TTL token inside it.
+function writeDispatchMcpConfig(cfg, { token, key }) {
   const dir = path.join(cfg.userConfigHome(), "outbox", "dispatch");
   fs.mkdirSync(dir, { recursive: true });
   sweepStaleMcpConfigs(dir);
-  const file = path.join(dir, `mcp-${session}.json`);
+  const file = path.join(dir, `mcp-${key}.json`);
   const conf = {
     mcpServers: {
       spor: {
@@ -2231,8 +2301,8 @@ function writeDispatchMcpConfig(cfg, { token, session }) {
   // 0600: the file holds a live bearer token. Create with O_EXCL (wx) so a
   // pre-placed file or symlink at this path is REFUSED rather than written
   // through, and the file is 0600 from creation (no widen-then-narrow window).
-  // The session-uuid filename makes a real collision a non-issue; a stale
-  // leftover was swept above.
+  // The uuid filename makes a real collision a non-issue; a stale leftover was
+  // swept above.
   const fd = fs.openSync(file, "wx", 0o600);
   try {
     fs.writeSync(fd, JSON.stringify(conf, null, 2) + "\n");
@@ -2396,12 +2466,16 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // exit / unparseable output => empty => no guard (fail-open); --force overrides.
   const inFlight = nodeId && !backfill ? dispatchedAgents().get(name) || [] : [];
 
-  // Session identity (dec-spor-session-identity-active-record). Force the
-  // session id up front — `--session-id <uuid>` makes the dispatched run's
-  // session deterministic, so the agent-scoped token below can bind it AND the
-  // claim can be session-bound at dispatch (the bg agent's post-tool heartbeat
-  // renews under this same id). SPOR_SESSION_ID pins it for tests/reproducibility.
-  const session = process.env.SPOR_SESSION_ID || crypto.randomUUID();
+  // Session identity (dec-spor-dispatch-bg-session-late-bind). `claude --bg`
+  // IGNORES `--session-id` and self-allocates its own run session (verified — it
+  // warns and ignores the flag), so we do NOT force one and the session is NOT
+  // knowable up front. The agent token is minted session-DEFERRED; the real
+  // session is captured from `claude agents --json` AFTER launch and bound then
+  // (rebind the token + renew the lease). SPOR_SESSION_ID pins the session for
+  // tests/reproducibility (short-circuits the capture). `mcpKey` names the 0600
+  // --mcp-config file — a fresh uuid, since the session id isn't available here.
+  const pinnedSession = process.env.SPOR_SESSION_ID || null;
+  const mcpKey = crypto.randomUUID();
   // This machine's agent node — the WHO a dispatched session runs as. `--as`
   // overrides the per-machine dispatch.agent default for this one dispatch (its
   // id format mirrors a node id; a bad/unowned one fails soft at token-mint
@@ -2425,9 +2499,8 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   if (model) claudeArgs.push("--model", model);
   if (permMode) claudeArgs.push("--permission-mode", permMode);
   if (agent) claudeArgs.push("--agent", agent);
-  // Force the session id on every dispatch (local or remote). It is the run leaf
-  // of the agent's identity and what the session-bound claim + heartbeat key on.
-  claudeArgs.push("--session-id", session);
+  // NB: no `--session-id` — `claude --bg` ignores it (warns) and manages its own
+  // session; we capture the real one post-launch (dec-spor-dispatch-bg-session-late-bind).
 
   if (dryRun) {
     out(`dir:    ${res.dir}  (slug: ${res.slug}, via ${res.source})`);
@@ -2439,7 +2512,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
       out(`onboard: ${steps.join("; ")}`);
     }
     out(`brief:  ${brief ? `${brief.length} bytes` : "(none — graph had nothing relevant, or --no-brief/--backfill)"}`);
-    out(`session: ${session}`);
+    out(`session: ${pinnedSession || "(allocated by claude --bg at launch, bound after)"}`);
     // Identity preview: what the real dispatch would do for agent-scoping. The
     // token mint + 0600 mcp-config are SIDE EFFECTS, so --print only describes
     // them (it writes nothing and makes no network call here). Local mode and an
@@ -2447,7 +2520,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     // session line, which is additive and always present now.
     if (identityAgent) {
       const src = asAgent ? " (via --as)" : "";
-      out(`agent:  ${identityAgent}${src} (would mint a per-session agent-scoped token + write a 0600 --mcp-config, then add --strict-mcp-config)`);
+      out(`agent:  ${identityAgent}${src} (would mint a session-deferred agent-scoped token + write a 0600 --mcp-config, add --strict-mcp-config, then bind the run session after launch)`);
     } else if (cfg.mode() === "remote") {
       out(`agent:  (none configured — 'spor agent use agent-<machine>' or --as to attribute as agent-on-behalf-of; dispatching person-scoped)`);
     }
@@ -2463,7 +2536,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     // Auto-claim preview (remote node dispatch only — local mode has no lease, so
     // nothing is announced there and local --print stays byte-identical).
     if (nodeId && !backfill && cfg.mode() === "remote") {
-      out(`claim:  ${noClaim ? "(--no-claim — lease not established)" : `would establish a session-bound lease on ${nodeId} at launch`}`);
+      out(`claim:  ${noClaim ? "(--no-claim — lease not established)" : `would establish a lease on ${nodeId} at launch (session bound from the run after launch)`}`);
     }
     if (template != null) out(`template: ${path.resolve(templateOpt)}`);
     out(`run:    ${claudeBin} ${claudeArgs.map(shellQuote).join(" ")} <prompt>`);
@@ -2500,21 +2573,28 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // the VERIFIED mechanism): mint a per-session agent-scoped token, write it into
   // a 0600 --mcp-config that exposes ONLY the agent's own Spor MCP, and add
   // --strict-mcp-config so the account connector is excluded by construction. The
-  // server then stamps authored_by_agent + session from that token. FAIL SOFT at
+  // server then stamps authored_by_agent + session from that token. The token is
+  // minted session-DEFERRED — the run session isn't known until `claude --bg`
+  // self-allocates it, so we bind it AFTER launch (dec-spor-dispatch-bg-session-
+  // late-bind), keeping `agentToken` to authenticate that late bind. FAIL SOFT at
   // every step — a server without the mint surface, or a transient error, falls
   // back to the prior person-scoped dispatch with a clear line. Remote + a
-  // configured agent only; local/unconfigured dispatch is byte-identical but for
-  // the always-present --session-id.
+  // configured agent only; local/unconfigured dispatch is byte-identical.
+  let agentToken = null;
   if (identityAgent) {
-    const mint = await mintAgentToken(cfg, { agent: identityAgent, session });
+    // Always session-DEFERRED — the run session is bound after launch (below),
+    // even when SPOR_SESSION_ID pins it (the pin feeds the capture, not the mint),
+    // so the bind path is uniform.
+    const mint = await mintAgentToken(cfg, { agent: identityAgent });
     if (mint.ok) {
-      const mcpFile = writeDispatchMcpConfig(cfg, { token: mint.token, session });
+      agentToken = mint.token;
+      const mcpFile = writeDispatchMcpConfig(cfg, { token: mint.token, key: mcpKey });
       claudeArgs.push("--mcp-config", mcpFile, "--strict-mcp-config");
-      out(`agent:  ${identityAgent} (session ${session} — writes attributed agent-on-behalf-of-you)`);
+      out(`agent:  ${identityAgent} (writes attributed agent-on-behalf-of-you; run session bound after launch)`);
     } else if (mint.absent) {
-      err(`warning: this server can't mint agent-scoped session tokens yet — dispatching person-scoped (session ${session}).`);
+      err(`warning: this server can't mint agent-scoped session tokens yet — dispatching person-scoped.`);
     } else {
-      err(`warning: could not mint an agent token (${mint.error}) — dispatching person-scoped (session ${session}).`);
+      err(`warning: could not mint an agent token (${mint.error}) — dispatching person-scoped.`);
     }
   }
 
@@ -2523,18 +2603,19 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // duplicate agent onto contested work, and the lease is live the moment the
   // agent starts (its post-tool writes then renew it — and seeing its own held
   // claim, it skips the redundant claim-nudge). Remote node-mode only; --no-claim
-  // opts out (dispatch with no lease, the prior behavior). Now SESSION-BOUND
-  // (dec-spor-session-identity-active-record): dispatch forces the session id, so
-  // the lease binds it and the bg agent's same-session heartbeat renews it.
+  // opts out (dispatch with no lease, the prior behavior). PERSON-SCOPED here
+  // (session omitted, dec-spor-dispatch-bg-session-late-bind): the real session
+  // isn't known until after launch, so we bind it to the lease via renewDispatch
+  // below; until then any of this person's sessions may renew it.
   if (nodeId && !backfill && !noClaim && cfg.mode() === "remote") {
-    const c = await claimDispatch(cfg, nodeId, session);
+    const c = await claimDispatch(cfg, nodeId);
     if (c.conflict) {
       err(`${nodeId} is already claimed — ${c.message}`);
       err(`  not dispatching a duplicate. Re-run with --no-claim to dispatch anyway (no lease),`);
       err(`  or pick another task with 'spor next'.`);
       return 1;
     }
-    if (c.ok) out(`claimed ${nodeId} (session-bound lease established; the agent's writes will renew it)`);
+    if (c.ok) out(`claimed ${nodeId} (lease established; the agent's writes will renew it)`);
     else err(`warning: could not establish a lease on ${nodeId}: ${c.error} — dispatching without a claim`);
   }
   claudeArgs.push(prompt);
@@ -2542,6 +2623,34 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   if (r.error) {
     err(`could not launch ${claudeBin}: ${r.error.message}`);
     return 1;
+  }
+
+  // Late session binding (dec-spor-dispatch-bg-session-late-bind). `claude --bg`
+  // has now self-allocated its run session and registered the agent; read the
+  // REAL session from `claude agents --json` and bind it: (a) rebind the agent
+  // token's session so every subsequent agent write stamps the real run, and
+  // (b) renew the lease to it so lease and token agree (instead of waiting for
+  // the agent's first heartbeat to self-heal). Best-effort throughout — a capture
+  // miss or any bind failure leaves the token session-null (writes carry no
+  // session: honest, never a phantom) and the lease self-healing via heartbeat.
+  // Remote only, and only when there's something to bind (an agent token and/or a
+  // claimed node).
+  const wantBind = cfg.mode() === "remote" && (agentToken || (nodeId && !backfill && !noClaim));
+  if (wantBind) {
+    const realSession = await captureDispatchSession(name, res.dir, pinnedSession);
+    if (realSession) {
+      if (agentToken) {
+        const b = await bindAgentSession(cfg, agentToken, realSession);
+        if (b.ok) out(`session: ${realSession} (bound — the agent's writes trace to this run)`);
+        else if (b.conflict) err(`note: the agent token is already bound to another session — leaving it.`);
+        // absent/transport error: token stays session-deferred (no phantom) — silent, fail-open.
+      } else {
+        out(`session: ${realSession}`);
+      }
+      if (nodeId && !backfill && !noClaim) await renewDispatch(cfg, nodeId, realSession);
+    } else if (agentToken) {
+      err(`note: could not read the run session from 'claude agents' — writes will carry no session stamp (the lease still self-heals).`);
+    }
   }
   return r.status == null ? 1 : r.status;
 }

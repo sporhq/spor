@@ -325,11 +325,21 @@ function dispatchStub({ mintStatus = 201, mintBody = null } = {}) {
       if (req.method === "POST" && /^\/v1\/nodes\/[^/]+\/claim$/.test(req.url)) {
         return j(200, { ok: true, status: "claimed", lease: { by: "person-anthony", session: JSON.parse(body || "{}").session || null } });
       }
+      if (req.method === "POST" && /^\/v1\/nodes\/[^/]+\/renew$/.test(req.url)) {
+        return j(200, { ok: true, lease: { by: "person-anthony", session: JSON.parse(body || "{}").session || null } });
+      }
+      // late session bind (dec-spor-dispatch-bg-session-late-bind): the dispatcher
+      // authenticates with the AGENT token; record + echo the session it bound.
+      if (req.method === "POST" && req.url === "/v1/agents/session") {
+        const p = JSON.parse(body || "{}");
+        return j(200, { ok: true, agent: "agent-anthony-laptop", session: p.session });
+      }
       const mintMatch = req.method === "POST" && req.url.match(/^\/v1\/agents\/([^/]+)\/token$/);
       if (mintMatch) {
         const agent = decodeURIComponent(mintMatch[1]);
         const p = JSON.parse(body || "{}");
-        return j(mintStatus, mintBody || { token: `agtok_${(p.session || "").slice(0, 8)}`, agent, session: p.session, expires_at: "2026-06-16T23:59:59Z" });
+        // session is now OPTIONAL (deferred) — the token id stays stable regardless.
+        return j(mintStatus, mintBody || { token: `agtok_${agent.slice(6, 14)}`, agent, session: p.session || null, expires_at: "2026-06-16T23:59:59Z" });
       }
       return j(404, { error: { code: "not_found" } });
     });
@@ -341,16 +351,16 @@ function dispatchStub({ mintStatus = 201, mintBody = null } = {}) {
 
 const SID = "11111111-2222-3333-4444-555555555555";
 
-test("dispatch (local) --print: forces --session-id and shows the session line", () => {
+test("dispatch (local) --print: shows the pinned session, NO --session-id (claude --bg ignores it)", () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-repo-"));
   const r = run(["dispatch", "some free text task here", "--dir", repo, "--no-brief", "--print"], { SPOR_SESSION_ID: SID });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.match(r.stdout, new RegExp(`session: ${SID}`));
-  assert.match(r.stdout, new RegExp(`--session-id ${SID}`));
+  assert.match(r.stdout, new RegExp(`session: ${SID}`)); // SPOR_SESSION_ID pins it
+  assert.doesNotMatch(r.stdout, /--session-id/); // never forced — --bg self-allocates
   assert.doesNotMatch(r.stdout, /^agent:/m); // local mode => no agent-scoping line
 });
 
-test("dispatch (remote) --print: no agent configured => person-scoped notice, session forced", { skip: isWin }, async () => {
+test("dispatch (remote) --print: no agent configured => person-scoped notice, lease bound after launch", { skip: isWin }, async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d1-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d1r-"));
   const { srv, base } = await dispatchStub();
@@ -358,8 +368,9 @@ test("dispatch (remote) --print: no agent configured => person-scoped notice, se
     const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief", "--print"], remoteEnv(home, base, { SPOR_SESSION_ID: SID }));
     assert.strictEqual(r.status, 0, r.stderr);
     assert.match(r.stdout, /agent:  \(none configured/);
-    assert.match(r.stdout, new RegExp(`--session-id ${SID}`));
-    assert.match(r.stdout, /would establish a session-bound lease/);
+    assert.doesNotMatch(r.stdout, /--session-id/); // never forced
+    assert.match(r.stdout, new RegExp(`session: ${SID}`)); // pinned shows; else "(allocated by claude --bg…)"
+    assert.match(r.stdout, /would establish a lease on dec-x/);
   } finally {
     srv.close();
   }
@@ -396,7 +407,7 @@ test("dispatch --as: an invalid agent id is refused before launch", () => {
   assert.match(r.stderr, /invalid --as agent id/);
 });
 
-test("dispatch (remote, real): mints a token, writes a 0600 mcp-config, assembles the full argv, session-bound claim", { skip: isWin }, async () => {
+test("dispatch (remote, real): mints a session-DEFERRED token + 0600 mcp-config, NO --session-id, binds the run session after launch", { skip: isWin }, async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d2-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d2r-"));
   const outFile = path.join(home, "argv.out");
@@ -405,16 +416,17 @@ test("dispatch (remote, real): mints a token, writes a 0600 mcp-config, assemble
   const stub = argvStub(home, outFile);
   const { srv, hits, base } = await dispatchStub({ mintStatus: 201 });
   try {
+    // SPOR_SESSION_ID pins the captured session, short-circuiting `claude agents --json`.
     const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub }));
     assert.strictEqual(r.status, 0, r.stderr);
-    assert.match(r.stdout, /agent:  agent-anthony-laptop \(session/);
+    assert.match(r.stdout, /agent:  agent-anthony-laptop \(writes attributed/);
+    assert.match(r.stdout, new RegExp(`session: ${SID} \\(bound`)); // late-bound to the real run
 
-    // argv: --bg … --session-id <uuid> --mcp-config <file> --strict-mcp-config <prompt>
+    // argv: --bg … --mcp-config <file> --strict-mcp-config <prompt> — NO --session-id
     const lines = fs.readFileSync(outFile, "utf8").split("\n");
     const argv = lines.slice(1);
     assert.strictEqual(argv[0], "--bg");
-    const si = argv.indexOf("--session-id");
-    assert.ok(si >= 0 && argv[si + 1] === SID, "--session-id forced to the uuid");
+    assert.ok(!argv.includes("--session-id"), "--session-id is never passed (claude --bg ignores it)");
     const mi = argv.indexOf("--mcp-config");
     assert.ok(mi >= 0, "--mcp-config present");
     assert.ok(argv.includes("--strict-mcp-config"), "--strict-mcp-config present");
@@ -428,14 +440,22 @@ test("dispatch (remote, real): mints a token, writes a 0600 mcp-config, assemble
     assert.match(conf.mcpServers.spor.url, /\/mcp$/);
     assert.match(conf.mcpServers.spor.headers.Authorization, /^Bearer agtok_/);
 
-    // the mint hit the self-serve owner-gated route (agent in the path, session
-    // in the body); the claim was session-bound to the uuid
+    // the mint hit the self-serve owner-gated route, SESSION-DEFERRED (empty body)
     const mint = hits.find((h) => h.url === "/v1/agents/agent-anthony-laptop/token" && h.method === "POST");
     assert.ok(mint, "POSTed to /v1/agents/{id}/token (self-serve, not the admin route)");
-    assert.deepStrictEqual(JSON.parse(mint.body), { session: SID });
+    assert.deepStrictEqual(JSON.parse(mint.body), {}, "token minted session-deferred (no session up front)");
     assert.ok(!hits.some((h) => h.url === "/v1/admin/tokens"), "did NOT use the admin token route");
+
+    // the claim is PERSON-SCOPED (no session up front); the real session is bound LATE
     const claim = hits.find((h) => /\/claim$/.test(h.url) && h.method === "POST");
-    assert.strictEqual(JSON.parse(claim.body).session, SID, "claim is session-bound");
+    assert.deepStrictEqual(JSON.parse(claim.body), {}, "claim is person-scoped (session bound later)");
+    // late bind: the token's session rebound via POST /v1/agents/session, and the lease renewed to it
+    const bind = hits.find((h) => h.url === "/v1/agents/session" && h.method === "POST");
+    assert.ok(bind, "POSTed to /v1/agents/session to bind the captured run session");
+    assert.deepStrictEqual(JSON.parse(bind.body), { session: SID }, "the real session is bound to the token");
+    const renew = hits.find((h) => /\/renew$/.test(h.url) && h.method === "POST");
+    assert.ok(renew, "renewed the lease to the captured run session");
+    assert.strictEqual(JSON.parse(renew.body).session, SID, "lease renewed with the real session");
   } finally {
     srv.close();
   }
@@ -454,7 +474,7 @@ test("dispatch (remote, real): mint endpoint absent (404) => fails soft, person-
     assert.strictEqual(r.status, 0, r.stderr);
     assert.match(r.stderr, /can't mint agent-scoped session tokens yet/);
     const argv = fs.readFileSync(outFile, "utf8").split("\n").slice(1);
-    assert.ok(argv.includes("--session-id"), "session still forced");
+    assert.ok(!argv.includes("--session-id"), "--session-id is never passed (claude --bg ignores it)");
     assert.ok(!argv.includes("--mcp-config"), "no mcp-config when mint is absent");
     assert.ok(!argv.includes("--strict-mcp-config"), "no strict flag when mint is absent");
     assert.ok(!fs.existsSync(path.join(home, "outbox", "dispatch")), "no mcp-config file written");
@@ -476,7 +496,7 @@ test("dispatch (remote, real): mint 403 (caller doesn't own the agent) => fails 
     assert.strictEqual(r.status, 0, r.stderr);
     assert.match(r.stderr, /could not mint an agent token .* dispatching person-scoped/);
     const argv = fs.readFileSync(outFile, "utf8").split("\n").slice(1);
-    assert.ok(argv.includes("--session-id"), "session still forced");
+    assert.ok(!argv.includes("--session-id"), "--session-id is never passed (claude --bg ignores it)");
     assert.ok(!argv.includes("--mcp-config"), "no agent-scoping on an owner-mismatch");
   } finally {
     srv.close();
