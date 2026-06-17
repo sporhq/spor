@@ -503,6 +503,56 @@ test("dispatch (remote, real): mint 403 (caller doesn't own the agent) => fails 
   }
 });
 
+// Capture path: with NO SPOR_SESSION_ID, dispatch reads the REAL run session from
+// `claude agents --json` post-launch and binds it (dec-spor-dispatch-bg-session-
+// late-bind). This exercises the actual capture/match logic (newestDispatchedSession:
+// cwd filter, state!=="done" filter, newest-by-startedAt) that the SPOR_SESSION_ID
+// pin short-circuits in every other test. The fake agents list (SPOR_FAKE_AGENTS_JSON)
+// is the same seam the dup-guard uses; --force is needed because that static list
+// represents the POST-launch agent set, which the PRE-launch dup-guard also sees.
+test("dispatch (remote, real): captures the run session from `claude agents --json` and binds it (no SPOR_SESSION_ID)", { skip: isWin }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-cap-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-capr-"));
+  const outFile = path.join(home, "argv.out");
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "agent-anthony-laptop" } }) + "\n");
+  const stub = argvStub(home, outFile);
+  const REAL = "aaaaaaaa-1111-2222-3333-444444444444";
+  // The candidates the capture must pick among. Only the newest, this-repo,
+  // not-done agent should win — the others probe each filter.
+  const agents = JSON.stringify([
+    { id: "other", kind: "background", state: "working", name: "dec-x", cwd: "/some/other/repo", sessionId: "WRONG-other-repo", startedAt: 9999 },
+    { id: "old",   kind: "background", state: "working", name: "dec-x", cwd: repo,                sessionId: "WRONG-older-run",  startedAt: 1000 },
+    { id: "new",   kind: "background", state: "working", name: "dec-x", cwd: repo,                sessionId: REAL,               startedAt: 2000 },
+    { id: "done",  kind: "background", state: "done",    name: "dec-x", cwd: repo,                sessionId: "WRONG-finished",   startedAt: 5000 },
+  ]);
+  const { srv, hits, base } = await dispatchStub({ mintStatus: 201 });
+  try {
+    const r = await runAsync(
+      ["dispatch", "dec-x", "--dir", repo, "--no-brief", "--force"],
+      remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: agents })
+    );
+    assert.strictEqual(r.status, 0, r.stderr);
+    // it reported binding the captured session
+    assert.match(r.stdout, new RegExp(`session: ${REAL} \\(bound`));
+
+    // the token was rebound to the REAL captured session (not a decoy)
+    const bind = hits.find((h) => h.url === "/v1/agents/session" && h.method === "POST");
+    assert.ok(bind, "POSTed /v1/agents/session to bind the captured session");
+    assert.strictEqual(JSON.parse(bind.body).session, REAL, "bound the NEWEST this-repo non-done session");
+
+    // and the lease was renewed to the same captured session
+    const renew = hits.find((h) => /\/renew$/.test(h.url) && h.method === "POST");
+    assert.ok(renew, "renewed the lease");
+    assert.strictEqual(JSON.parse(renew.body).session, REAL, "lease renewed with the captured session");
+
+    // none of the decoys (other-repo / older / done) leaked through
+    assert.ok(!hits.some((h) => h.method === "POST" && /"session":"WRONG/.test(h.body || "")), "no decoy session was bound");
+  } finally {
+    srv.close();
+  }
+});
+
 // ===========================================================================
 // 4. authorship read-out (authorshipLine + renderNorm)
 // ===========================================================================
