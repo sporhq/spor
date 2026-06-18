@@ -2480,13 +2480,32 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     err(`target dir does not exist: ${res.dir}`);
     return 1;
   }
+  // Session project (issue-spor-dispatch-propagate-session-project-to-questions).
+  // The launcher env never reaches a `claude --bg` agent (it self-allocates a
+  // spare worker; dec-spor-session-identity-active-record), and the agent token
+  // carries only {agent, session} — NOT the project. So the only channel the
+  // session project can ride to the bg agent is the prompt itself: state it, and
+  // tell the agent to pass it as ask_question's `project` param when a question
+  // has no clear `mentions:`. The server gives that explicit project precedence
+  // over its mentions/neighborhood derivation, closing the residual mention-less,
+  // no-match case that otherwise mis-stamps the question into the asker's home
+  // project. res.slug is the project this dispatch resolved into (always set —
+  // resolveDir falls back to the cwd slug). Omitted from a --template prompt,
+  // which exposes the same value as {{slug}}/{{project}} and takes over entirely.
+  const sessionNote = res.slug
+    ? `> **Spor session project:** \`${res.slug}\`. If you file a question with ` +
+      `\`ask_question\` (or \`POST /v1/questions\`) that has no clear \`mentions:\`, pass ` +
+      `\`project: "${res.slug}"\` so it is stamped to this project rather than ` +
+      `defaulting to the asker's home project.\n\n`
+    : "";
   const defaultPrompt = brief
-    ? `# Spor briefing (compiled for this task — your standing context)\n\n${brief}\n\n---\n\n# Task\n\n${instruction}\n`
-    : instruction;
+    ? `${sessionNote}# Spor briefing (compiled for this task — your standing context)\n\n${brief}\n\n---\n\n# Task\n\n${instruction}\n`
+    : `${sessionNote}${instruction}`;
 
-  // With no template the launched prompt is byte-identical to before. A template
-  // takes over entirely: it decides where the compiled brief, the task, and the
-  // node metadata land (or wraps the whole default via {{default}}).
+  // With no template the launched prompt adds only the session-project note above
+  // (issue-spor-dispatch-propagate-session-project-to-questions). A template takes
+  // over entirely: it decides where the compiled brief, the task, and the node
+  // metadata land (or wraps the whole default via {{default}}).
   let prompt = defaultPrompt;
   if (template != null) {
     const r = renderTemplate(template, {

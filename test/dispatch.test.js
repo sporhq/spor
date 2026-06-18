@@ -140,6 +140,34 @@ test("dispatch --no-brief: raw task prompt, no briefing block", () => {
   assert.strictEqual(r.status, 0);
   assert.match(r.stdout, /brief:  \(none/);
   assert.doesNotMatch(r.stdout, /# Spor briefing/);
+  // the session-project note rides even a no-brief prompt — it is identity
+  // context, not part of the compiled briefing.
+  assert.match(r.stdout, /Spor session project:/);
+});
+
+// --- session project on dispatch (issue-spor-dispatch-propagate-session-project-to-questions)
+// `claude --bg` drops the launcher env and the agent token carries only
+// {agent, session} (dec-spor-session-identity-active-record), so the session
+// project reaches a dispatched, mention-less ask_question only if dispatch
+// injects it into the prompt and the agent passes it as the `project` param.
+test("dispatch --print: injects the session-project note so a mention-less question can be stamped", () => {
+  const { home, repo } = fixture();
+  const r = run(["dispatch", "ship the widget", "--dir", repo, "--slug", "demo", "--no-brief", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /Spor session project:.*`demo`/, "states the session project");
+  assert.match(r.stdout, /pass `project: "demo"`/, "tells the agent to pass it to ask_question");
+});
+
+test("dispatch --print: the session-project note also rides a briefing prompt, above the briefing", () => {
+  const { home, repo } = fixture();
+  const r = run(["dispatch", "auth token rotation credentials", "--dir", repo, "--slug", "demo", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0);
+  const prompt = r.stdout.slice(r.stdout.indexOf("--- prompt ---"));
+  const noteAt = prompt.indexOf("Spor session project:");
+  const briefAt = prompt.indexOf("# Spor briefing");
+  assert.ok(noteAt >= 0, "note present");
+  assert.ok(briefAt >= 0, "briefing present");
+  assert.ok(noteAt < briefAt, "the note leads the standing context, above the compiled briefing");
 });
 
 // --- worktree-durable dispatch dir (issue-spor-dispatch-worktree-dir-stamping) --
@@ -440,7 +468,10 @@ test("dispatch --template: {{default}} embeds the built-in prompt; unknown place
   const r = run(["dispatch", "auth token rotation credentials", "--dir", repo, "--template", tpl, "--print"], { SPOR_HOME: home });
   assert.strictEqual(r.status, 0);
   const prompt = promptOf(r.stdout);
-  assert.match(prompt, /PRE\n# Spor briefing \(compiled/); // default prompt embedded verbatim
+  // default prompt embedded verbatim — now led by the session-project note
+  // (issue-spor-dispatch-propagate-session-project-to-questions), then the briefing.
+  assert.match(prompt, /PRE\n> \*\*Spor session project:\*\*/);
+  assert.match(prompt, /# Spor briefing \(compiled/);
   assert.match(prompt, /POST END/); // {{bogus}} stripped to ""
   assert.match(r.stderr, /unknown template placeholder\(s\): bogus/);
 });
