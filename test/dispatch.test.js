@@ -566,6 +566,44 @@ test("dispatch <node-id> (remote): auto-claims the node, then launches the agent
   }
 });
 
+// inc-spor-dispatch-duplicate-task-2026-06-18: the claim carries a per-invocation
+// `dispatch` nonce so the server refuses a SECOND concurrent dispatch of the same
+// node — even by the same person, on any machine — instead of treating it as the
+// person-scoped idempotent renew that let two agents launch on one task.
+test("dispatch <node-id> (remote): the claim carries a per-invocation dispatch nonce", { skip: isWin }, async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    const claim = claimHit(hits);
+    assert.ok(claim, "POST .../claim was sent");
+    const body = JSON.parse(claim.body || "{}");
+    assert.ok(body.dispatch && typeof body.dispatch === "string", "the claim body carries a dispatch nonce");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --force (remote): omits the dispatch nonce so a deliberate re-dispatch renews", { skip: isWin }, async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief", "--force"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    const claim = claimHit(hits);
+    assert.ok(claim, "the claim was still attempted");
+    const body = JSON.parse(claim.body || "{}");
+    assert.ok(!("dispatch" in body), "--force omits the nonce so the claim renews instead of conflicting");
+  } finally {
+    srv.close();
+  }
+});
+
 test("dispatch (remote): a node already claimed by another aborts WITHOUT launching", { skip: isWin }, async () => {
   const { home, repo } = fixture();
   const { srv, hits, base } = await claimStub({
