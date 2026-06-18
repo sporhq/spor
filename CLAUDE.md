@@ -41,8 +41,12 @@ client-facing contract is this repo's API.md.
   golden suite.
 - The frontmatter parser is regex-based, not a YAML library. It supports
   simple `key: value`, YAML folded multi-line values (indented
-  continuations), `pin:`/`exclude:` inline lists, and `- {type: X, to: Y}`
-  edges. Don't write nodes with any other YAML constructs.
+  continuations), inline lists for a fixed allowlist of keys
+  (`pin`/`exclude`/`slugs`/`tags`/`skills`/`requires`/… — see the
+  `parseFrontmatter` allowlist), and `- {type: X, to: Y}` edges, which may
+  carry extra flat attributes (`- {type: assigned, to: agent-X, profile:
+  profile-Y}`, preserved on the edge object). Don't write nodes with any
+  other YAML constructs.
 
 ## Verifying changes
 

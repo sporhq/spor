@@ -24,6 +24,8 @@ the decision queue (QUEUE.md §4).
 | question | `question-` | a routed ask the graph couldn't answer | queueable; status `open`/`answered`; joins the queue until answered |
 | person | `person-` | an org member | anchor for `$viewer` binding and question routing |
 | agent | `agent-` | a person-owned automation principal | a dispatched session's durable identity; owned by a person via `owned-by`; `capturable: false`; carries forward-compat `spiffe:`/`pubkey:` |
+| profile | `profile-` | a reusable runtime+capability bundle an agent runs under | `harness`/`model`/`skills`/`plugins`/`mcp`; these runtime fields ARE the dispatch satisfiability spec; `capturable: false` |
+| routine | `routine-` | owner-scoped trigger→action automation | `owned-by` a person; declarative `when → do` rules over graph events; dispatches only the owner's agents, AND-ed with org policy; `capturable: false` |
 | capture-pending | `cap-` | raw captured text that fit no schema | born status-less; closes only as `merged` or `rejected` |
 | finding | `find-` | a gardener observation (stale anchor, cold work) | filed as a queue item |
 | repo | `repo-` | a durable git-repo identity | carries `slugs:` aliases + `fingerprints:`; heals renames at read time; optional `tags:` are the match key for a norm's `applies_to_tags` |
@@ -51,12 +53,13 @@ are same-direction synonyms renamed at write time.
 | performs | 0.8 | this run is an execution of the target workflow | — |
 | blocks | 0.7 | the target can't proceed until this does | inverse `blocked-by` |
 | answers | 0.7 | this answers the target question | inverse `answered-by` |
-| assigned | 0.5 | work assigned to this person | — |
+| assigned | 0.5 | work assigned to this person OR agent (explicit routing; an agent target may carry a `profile:` per-assignment override) | — |
 | relates-to | 0.5 | weak association | alias `related-to` |
 | mentions | 0.5 | weakest association | — |
 | stewards | 0.4 | this person stewards the target area/spec/norm | question-routing key |
 | grouped-under | 0.3 | this repo's home project grouping (structural) | inverse `groups` |
 | owned-by | 0.3 | this agent is owned by that person (structural identity) | inverse `owns` |
+| uses-profile | 0.3 | this agent's default profile (runtime+capability bundle); structural config, overridable per assignment/dispatch | — |
 | routed-to | 0.3 | this question is routed to that person | — |
 | compiled-for | — | briefing → the task/query it was compiled for | provenance only |
 | shaped-by | — | briefing → the corrections that shaped it | provenance only |

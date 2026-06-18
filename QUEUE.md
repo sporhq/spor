@@ -142,6 +142,15 @@ is the default and graph-resident schema nodes override/extend it. The
 `schema` node type itself is recognized natively by the core — no
 schema-for-schemas regress.
 
+Beyond `node-schema`/`edge-schema`, a schema node may carry a non-type `kind`:
+`policy` (the org-defined policy layer, §below), `queue-policy` (the ranking
+override singleton), and `register` — a registry-declared extensible **enum**
+the kernel exposes as a partition (`graph.registry.register(name)` /
+`requiresClasses()`) instead of a hardcoded table. The seed `requires` register
+(`schema-requires`, the work-node risk/permission axis) is the first; an org
+grows the vocabulary by writing a resident `kind: register` schema with the same
+`register:` name (graph beats seed, higher CalVer wins — like every other kind).
+
 Resolution is **graph beats seed wholesale, regardless of version**: a
 resident override replaces the seed entry for that type entirely, so a seed
 behavior change (a new `transitions()` gate, a default, a prefix) does *not*

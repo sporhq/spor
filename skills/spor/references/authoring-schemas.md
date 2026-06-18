@@ -19,6 +19,15 @@ Frontmatter: `id: schema-<type>` (or `schema-edge-<type>`), `type: schema`,
 body holds prose, then a fenced **JSON payload**, then optional fenced **JS
 functions**.
 
+(Two more kinds exist for non-type schemas. `kind: policy` is the org-defined
+policy layer — see GRAPH.md. `kind: register` declares a named, extensible
+**enum** the kernel exposes as a partition rather than a hardcoded table: a
+payload `{ "register": "<name>", "classes": [{ "id": …, "description": … }] }`,
+keyed by register name (graph beats seed, higher CalVer wins). The seed
+`requires` register — the work-node risk/permission axis — is the first; read it
+with `graph.registry.requiresClasses()`. Grow it by writing a resident `kind:
+register` schema with the same `register:` name.)
+
 ### Node schema — JSON payload keys
 
 ```json

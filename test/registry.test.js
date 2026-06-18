@@ -337,6 +337,10 @@ test("seed pack: edge weights match the historic EDGE_WEIGHTS table exactly", ()
     // an agent is owned-by its person. Structural identity binding, not work
     // dependency — same low weight as grouped-under (0.3).
     "owned-by": 0.3,
+    // The agent orchestration layer (dec-spor-agent-orchestration-layer) added
+    // uses-profile: an agent → its default profile (the runtime+capability
+    // bundle it dispatches under). Structural config binding like owned-by (0.3).
+    "uses-profile": 0.3,
   });
   // provenance-only edges are known but unweighted (historic ?? 0.3 default)
   assert.equal(reg.isKnownEdge("compiled-for"), true);
@@ -367,6 +371,20 @@ test("seed pack: node types, prefixes, ride-along, and traversal match GRAPH.md"
   assert.deepEqual(reg.prefixesFor("agent"), ["agent-"]);
   assert.equal(reg.isCapturableType("agent"), false);
   assert.equal(reg.isCapturableEdge("owned-by"), false);
+  // Agent orchestration layer (dec-spor-agent-orchestration-layer): the profile
+  // (runtime+capability bundle, prefix profile-) and routine (owner-scoped
+  // automation, prefix routine-) node types, plus the uses-profile edge. All
+  // created deliberately, never from a capture — capturable: false, like agent.
+  assert.equal(reg.isKnownType("profile"), true);
+  assert.equal(reg.isKnownType("routine"), true);
+  assert.deepEqual(reg.prefixesFor("profile"), ["profile-"]);
+  assert.deepEqual(reg.prefixesFor("routine"), ["routine-"]);
+  assert.equal(reg.isCapturableType("profile"), false);
+  assert.equal(reg.isCapturableType("routine"), false);
+  assert.equal(reg.isKnownEdge("uses-profile"), true);
+  assert.equal(reg.isCapturableEdge("uses-profile"), false);
+  // profile/routine carry no resolving-status declaration, so the partition is
+  // unchanged (asserted exhaustively in the resolving-partition test below).
   assert.equal(reg.isAlwaysOn("norm"), true);
   assert.equal(reg.isAlwaysOn("decision"), false);
   assert.equal(reg.isTraversable("briefing"), false);
@@ -437,6 +455,53 @@ test("seed pack: back-compat constant exports are derived from the seed", () => 
   assert.deepEqual(graph.EDGE_WEIGHTS, graph.seedRegistry().edgeWeights());
   assert.ok(graph.KNOWN_TYPES.has("decision") && graph.KNOWN_TYPES.has("schema"));
   assert.ok(graph.KNOWN_EDGES.has("compiled-for"));
+});
+
+// ---------- register kind: the requires risk-class enum (thread 4) ----------
+
+test("parseSchemaNode: register kind parses to its register name, validates classes", () => {
+  const make = (body) => registry.parseSchemaNode({
+    id: "schema-requires", kind: "register", schema_version: "2026.06.18.1", body,
+  });
+  const ok = make('```json\n{"register":"requires","classes":[{"id":"shell","description":"x"}]}\n```');
+  assert.equal(ok.ok, true, ok.errors.join("; "));
+  assert.equal(ok.schema.kind, "register");
+  assert.equal(ok.schema.key, "requires"); // keyed by register name, not node_type
+  // a register without a name is rejected
+  assert.ok(make('```json\n{"classes":[]}\n```').errors.some((e) => /missing register name/.test(e)));
+  // classes must be { id, description } objects with a non-empty id
+  assert.ok(make('```json\n{"register":"requires","classes":["shell"]}\n```')
+    .errors.some((e) => /classes must be an array of \{ id, description \}/.test(e)));
+  assert.ok(make('```json\n{"register":"requires","classes":[{"description":"no id"}]}\n```')
+    .errors.some((e) => /classes must be an array of \{ id, description \}/.test(e)));
+});
+
+test("seed pack: the requires register declares the seed risk classes", () => {
+  const reg = graph.seedRegistry();
+  assert.deepEqual(reg.registerClasses("requires"),
+    ["shell", "prod-creds", "browser", "network", "human", "filesystem-write", "paid-api"]);
+  assert.deepEqual([...reg.requiresClasses()].sort(),
+    ["browser", "filesystem-write", "human", "network", "paid-api", "prod-creds", "shell"]);
+  // an undeclared register is empty, never throws (a graph with neither the
+  // register nor any requires: fields is unaffected — byte-identical)
+  assert.deepEqual(reg.registerClasses("nope"), []);
+  assert.equal(reg.register("nope"), null);
+  assert.equal(reg.register("requires").description.length > 0, true);
+});
+
+test("Registry: a graph register schema overrides/extends the seed (no code change)", () => {
+  const reg = graph.seedRegistry();
+  const installed = reg.add({
+    id: "schema-requires", kind: "register", version: "2026.07.01.1", key: "requires",
+    payload: { register: "requires", classes: [{ id: "shell", description: "s" }, { id: "gpu", description: "g" }] },
+    code: {}, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.equal(installed, true, "graph beats seed");
+  assert.deepEqual(reg.registerClasses("requires"), ["shell", "gpu"]);
+  assert.equal(reg.requiresClasses().has("gpu"), true);
+  // registers do not leak into the node/edge type vocabularies
+  assert.equal(reg.isKnownType("requires"), false);
+  assert.equal(reg.isKnownEdge("requires"), false);
 });
 
 // ---------- override-vs-seed resolution ----------

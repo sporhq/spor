@@ -58,7 +58,10 @@ Rules:
   omit them.
 - Edges may point at ids that don't exist yet; the compiler skips them. Don't
   delete an edge just because the target is missing — it marks a node worth
-  creating.
+  creating. An edge may also carry extra flat attributes after `to:` —
+  `- {type: assigned, to: agent-X, profile: profile-Y}` — preserved on the edge
+  object (the per-assignment profile override; see "The agent orchestration
+  layer"). Plain `{type, to}` edges are unchanged.
 - `commits` is an optional inline list of repo-qualified git shas
   (`commits: [wf@1a2b3c4d, ...]`, kebab-case repo slug + 7–40 hex) linking
   the node to the code commits that implement it (task-cc-commit-linking).
@@ -95,6 +98,8 @@ Rules:
 | question   | `question-` | a routed ask the graph could not answer (queueable; status `open`/`answered`, gated) |
 | person     | `person-` | a member of the org — the identity anchor for `$viewer` binding and Tier-2 question routing (team mode; see "People, routing, and onboarding") |
 | agent      | `agent-`  | a person-owned automation principal — a dispatched session's durable identity, owned by a person via an `owned-by` edge; its writes attribute "agent on behalf of person" (see "Agents") |
+| profile    | `profile-`| a reusable runtime+capability bundle an agent runs under: `harness`, `model`, `skills`/`plugins`/`mcp`. Its runtime fields ARE the dispatch satisfiability spec; `capturable: false` (see "The agent orchestration layer") |
+| routine    | `routine-`| owner-scoped trigger→action automation (`owned-by` a person): declarative `when → do` rules over graph events that dispatch only the owner's agents, AND-ed with org policy; `capturable: false` (see "The agent orchestration layer") |
 | capture-pending | `cap-` | raw captured text that fit no schema; filed by the server for later triage (QUEUE.md §2.3); born status-less, closed only as `merged` (content now in proper node(s)) or `rejected` (no durable fact) — a `transitions()` gate rejects other statuses at write time |
 | finding    | `find-`   | a gardener observation about another node, filed as a queue item (QUEUE.md §6) |
 | repo       | `repo-`   | durable git-repo identity: slug aliases + repo fingerprints; heals renames at read time (below) |
@@ -606,6 +611,112 @@ edges:
   mirroring `person`, `repo`, and `workflow-run`. (So the distiller's emit
   vocabulary deliberately omits `agent`/`owned-by`.)
 
+## The agent orchestration layer
+
+The layer ABOVE agent identity (dec-spor-agent-orchestration-layer): how work is
+routed to agents, and how per-person automation fires on graph events. The node
+model is `person ──owns──▶ agent ──uses-profile──▶ profile`, with owner-scoped
+`routine` nodes driving automation. It composes with — never bypasses — the org
+policy layer. The schemas ship in the seed pack; the dispatch matcher, the
+routine engine, and the remote fleet scheduler are deferred
+(task-spor-dispatch-capabilities-satisfiability).
+
+### profile — the reusable runtime+capability bundle
+
+A `profile` node (prefix `profile-`) is "the HOW" an agent dispatches under,
+factored out of the agent node so a toolset is reusable across agents and people.
+
+```markdown
+---
+id: profile-docs-writer
+type: profile
+title: Docs-writer profile
+summary: Claude-code on Opus with the writing + spor skills and the spor MCP server.
+harness: claude-code
+model: opus
+skills: [writing, brief]
+plugins: [spor]
+mcp: [spor]
+status: active
+date: 2026-06-18
+---
+```
+
+- `harness:` (`claude-code` | `codex` | `opencode` | …) selects the launcher
+  (dec-cc-portable-core-adapters: claude-code → `claude --bg`, others → their
+  CLIs); `model:` → the harness `--model`; `skills`/`plugins` are preloaded;
+  `mcp` is merged into the strict `--mcp-config` dispatch writes, so the agent's
+  toolset is exactly the profile plus the agent-spor server, nothing ambient
+  (dec-spor-session-identity-active-record).
+- **The runtime fields ARE the satisfiability spec** — there is no separate
+  requirements block (dec-spor-machine-profile-satisfiability). A machine
+  declares ATOMIC capabilities in a machine-local `dispatch.capabilities` map
+  (built like `dispatch.repos`, never committed), and `satisfies(machine,
+  profile)` checks `profile.harness ∈ machine.harnesses ∧ profile.mcp ⊆
+  machine.reachable_mcp ∧ profile.skills ⊆ machine.skills ∧ profile.plugins ⊆
+  machine.plugins ∧ profile ∉ machine.deny`. No satisfying machine → dispatch
+  fails soft and LOUD, leaves the assignment intact, NEVER substitutes a
+  different profile. Forward-compatible with the deferred remote fleet scheduler
+  (each agent publishes its capabilities; same vocabulary).
+- **Reusable + both-scoped, with override.** Profiles are PERSONAL and
+  ORG-PUBLISHED (a curated, vetted toolset), with personal override. Org-published
+  profiles are where this meets policy: a policy can require that work of a risk
+  class go to an agent whose profile is org-approved (curated-toolset-as-governance).
+- `status:` is declarative (`active` default); `capturable: false` (created
+  deliberately, never distilled).
+
+### routine — owner-scoped trigger→action automation
+
+A `routine` node (prefix `routine-`), `owned-by` a person, holds declarative
+`when → do` rules. Triggers are graph events (a status change — e.g. to a
+resolving state, or to `done` — or an edge like `reviewed-by`/
+`changes-requested-by`) with `where:` filters; actions are the bounded verb set
+`create-node` / `assign` (to a SPECIFIC agent, optionally with a `profile:`
+override) / `dispatch` / `set-status` / `reassign` / `escalate`. Because the
+regex frontmatter parser is flat, an instance carries its `rules` as a fenced
+` ```json ` block in its BODY, parsed by the deferred routine engine.
+
+Two invariants (dec-spor-agent-orchestration-layer): (1) **only the owner's
+agents are ever dispatched** — the `person → routine → agent` RFC 8693 act-chain
+is the audit trail; (2) **personal routines accelerate, org policy gates — they
+AND, never bypass** — agent-on-behalf-of-X counts as X for the self-approval ban
+and the definition-of-done quorum, so an owner's reviewer-agent cannot
+auto-approve their implementer-agent's work past the org bar. Per
+dec-spor-orchestration-routine-requires-threads (thread 1) the bounded
+declarative register ships FIRST; attached sandboxed code is a later
+schema-gated escape hatch. The routine ENGINE and its vetting (dry-run, mandatory
+retry budget, self-approval-floor activation review, fire-time org-policy gate —
+thread 2) are deferred, so this seed schema is declarative and UNGATED;
+`capturable: false`.
+
+### Routing is explicit assignment; the profile cascade
+
+Routing is EXPLICIT `assigned` to a SPECIFIC target, not an eligibility match:
+`assigned → person` is human work (the default human pool); `assigned → agent-X`
+makes the task a dispatch candidate (X's profile says how and what it may touch).
+An agent-targeted `assigned` edge may carry an optional `profile:` attribute —
+the durable per-assignment override (`{type: assigned, to: agent-X, profile:
+profile-Y}`, thread 3). Profile precedence, explicit wins: `--profile` dispatch
+flag > assignment-edge `profile:` attribute > the agent's default `uses-profile`
+edge.
+
+### The `requires:` risk-class register
+
+`requires:` is a flat list on a WORK node naming the risk/permission classes the
+work may touch (`requires: [shell, prod-creds]`). It is a **registry-declared
+extensible enum** — a `type: schema` node with `kind: register` and `register:
+requires` (seed: `schema-requires`), so an org grows the vocabulary by editing a
+schema node, never a code change. The kernel exposes it as a partition
+(`graph.registry.requiresClasses()`); it stays policy-free. The register is
+**DISTINCT from machine-satisfiability**: satisfiability asks "can this box LAUNCH
+the profile"; `requires:` asks "what may this work touch", validated against the
+assigned profile (a task's `requires:` must be ⊆ the profile's granted classes,
+else warn/refuse) and gated by org policy via the same governs-traversal the
+definition-of-done quorum uses (dec-spor-orchestration-routine-requires-threads
+thread 4). The seed set is small — `shell`, `prod-creds`, `browser`, `network`,
+`human`, `filesystem-write`, `paid-api`. `human` is unsatisfiable by any agent:
+assign that work to a person.
+
 ## Edge types and traversal weights
 
 | edge             | weight | meaning                                          |
@@ -618,7 +729,7 @@ edges:
 | `resolves`       | 0.9    | this node fixes/closes the target                |
 | `blocks`         | 0.7    | target cannot proceed until this node does       |
 | `answers`        | 0.7    | this node answers that question (inverse `answered-by`); pulls the answer through the asker's next compile |
-| `assigned`       | 0.5    | work is assigned to this person                  |
+| `assigned`       | 0.5    | work is assigned to this person OR agent (the explicit-routing edge; an agent target may carry a `profile:` per-assignment override) |
 | `reviewed-by`    | 0.5    | this person reviewed and approved the node — counts toward a policy quorum |
 | `changes-requested-by` | 0.5 | this person reviewed the node and requested changes — not an approval |
 | `relates-to`     | 0.5    | weak association                                 |
@@ -626,6 +737,7 @@ edges:
 | `stewards`       | 0.4    | this person stewards an area/spec/norm — the Tier-2 question-routing key |
 | `grouped-under`  | 0.3    | this repo's home project grouping (inverse `groups`); structural membership, not work dependency |
 | `owned-by`       | 0.3    | this agent is owned by that person (inverse `owns`); structural identity binding, not work dependency |
+| `uses-profile`   | 0.3    | this agent's default profile (the runtime+capability bundle it dispatches under); structural config binding, overridable per assignment/dispatch |
 | `routed-to`      | 0.3    | a question routed to this person for answering   |
 | `review-requested` | 0.3  | a review of this node is requested of this person (pending) — surfaces in their queue |
 | `compiled-for`   | —      | briefing → its task/query (provenance only)      |

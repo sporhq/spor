@@ -197,6 +197,54 @@ b
   ]);
 });
 
+test("parseFrontmatter: an edge may carry trailing flat attributes (profile: override)", () => {
+  // The profile-bearing assigned → agent edge (dec-spor-orchestration-routine-
+  // requires-threads thread 3). Plain {type,to} edges stay byte-identical; the
+  // extra attribute is folded onto the same edge object, never dropping the edge.
+  const raw = `---
+id: task-r
+type: task
+title: t
+summary: s
+date: 2026-06-18
+edges:
+  - {type: assigned, to: agent-x, profile: profile-y}
+  - {type: blocks, to: task-z}
+---
+b
+`;
+  const n = graph.parseFrontmatter(raw, "task-r.md");
+  assert.deepEqual(n.edges, [
+    { type: "assigned", to: "agent-x", profile: "profile-y" },
+    { type: "blocks", to: "task-z" }, // no-attribute form unchanged
+  ]);
+});
+
+test("parseFrontmatter: skills/plugins/mcp/requires inline lists parse to arrays", () => {
+  const raw = `---
+id: profile-w
+type: profile
+title: t
+summary: s
+harness: claude-code
+model: opus
+skills: [brief, defer]
+plugins: [spor]
+mcp: [spor, github]
+requires: [shell, prod-creds]
+date: 2026-06-18
+---
+b
+`;
+  const n = graph.parseFrontmatter(raw, "profile-w.md");
+  assert.equal(n.harness, "claude-code"); // scalars stay scalars
+  assert.equal(n.model, "opus");
+  assert.deepEqual(n.skills, ["brief", "defer"]);
+  assert.deepEqual(n.plugins, ["spor"]);
+  assert.deepEqual(n.mcp, ["spor", "github"]);
+  assert.deepEqual(n.requires, ["shell", "prod-creds"]);
+});
+
 test("parseFrontmatter: strips surrounding quotes from scalar values", () => {
   const raw = `---
 id: dec-q
