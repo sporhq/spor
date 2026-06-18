@@ -3,6 +3,7 @@
 // and an engine test that drives doctor() against a scratch graph with a stubbed
 // global fetch — no server, no live graph. Black-box CLI coverage (dispatcher
 // wiring, both modes, the session-start nudge) lives in hookcli.test.js.
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');

@@ -3,6 +3,7 @@
 // The classifier is stubbed via SUBSTRATE_NUDGE_CMD (prompt stdin -> response
 // stdout, same contract as SUBSTRATE_DISTILL_CMD). Everything runs against a
 // throwaway SUBSTRATE_HOME in local mode.
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require('node:test');
 const assert = require('node:assert');
 const { spawnSync } = require('node:child_process');

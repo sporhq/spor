@@ -3,6 +3,7 @@
 // briefing compilation, directory resolution (incl. cross-repo via the map),
 // the --print dry run, and a real (stubbed) spawn. Everything runs against a
 // throwaway graph home — never the live graph.
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
 const assert = require("node:assert");
 const { spawnSync, spawn } = require("node:child_process");

@@ -2,6 +2,7 @@
 //   1. parseClaudeResult — claude -p --output-format json envelope -> text+usage
 //   2. lib/cost.js summarize — aggregate journal/llm-calls rows
 //   3. SPOR_DISTILL=0 kill switch — distill short-circuits before the paid call
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require('node:test');
 const assert = require('node:assert');
 const { spawnSync } = require('node:child_process');

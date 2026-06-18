@@ -2,6 +2,7 @@
 // dec-spor-local-mode-sharing-boundary): the shared-home .gitignore helper and
 // the distill auto-commit nested-repo guard. The `.spor` marker -> home
 // precedence lives in config.test.js.
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
