@@ -3,6 +3,7 @@
 // CLI verb (task-spor-dispatch-capabilities-satisfiability,
 // dec-spor-machine-profile-satisfiability). Everything runs against throwaway
 // homes / a synthetic PATH — never the live graph or the dev's real ~/.claude.
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
