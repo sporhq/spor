@@ -2088,26 +2088,37 @@ async function compileBriefing(cfg, { nodeId, query, full, project }) {
 async function topQueueItem(cfg, slug) {
   const LIMIT = 25;
   let items = [];
+  // --from-queue dispatches an AGENT to do work, and questions are human
+  // decisions — not agent-dispatchable (the standing model: agent-actionable
+  // work is a task, not a question; dec-spor-questions-human-not-agent-dispatch).
+  // Exclude them AT THE RANKER (the issue's preferred fix,
+  // issue-spor-dispatch-from-queue-dispatches-questions): excludeTypes/
+  // exclude_type is a hard scope filter applied BEFORE the limit, so the page is
+  // a full LIMIT of actionable candidates rather than LIMIT-minus-questions —
+  // the in-flight skip below then has the whole page to advance through (a page
+  // crowded by top-ranked questions could otherwise starve it). Questions stay
+  // queueable for the HUMAN queue (`spor next`). Sibling of
+  // issue-spor-routed-questions-ignore-wake.
   if (cfg.mode() === "remote") {
-    const q = slug ? `?project=${encodeURIComponent(slug)}&limit=${LIMIT}` : `?limit=${LIMIT}`;
+    const base = `limit=${LIMIT}&exclude_type=question`;
+    const q = slug ? `?project=${encodeURIComponent(slug)}&${base}` : `?${base}`;
     const r = await remote.get(cfg, `/v1/queue${q}`, { timeoutMs: 6000 });
     items = r.ok && r.json ? r.json.items || [] : [];
   } else {
     try {
       const g = require(path.join(ROOT, "lib", "graph.js")).loadGraph(cfg.nodesDir());
       const { rankQueue } = require(path.join(ROOT, "lib", "queue.js"));
-      const r = rankQueue(g, slug ? { project: slug, limit: LIMIT } : { limit: LIMIT });
+      const opts = { limit: LIMIT, excludeTypes: ["question"] };
+      const r = rankQueue(g, slug ? { project: slug, ...opts } : opts);
       items = r.items || [];
     } catch {
       items = [];
     }
   }
   if (!items.length) return null;
-  // --from-queue dispatches an AGENT to do work, and questions are human
-  // decisions — not agent-dispatchable (the standing model: agent-actionable
-  // work is a task, not a question). Questions stay queueable for the HUMAN
-  // queue (`spor next`), but unattended dispatch must never auto-pick one even
-  // when it ranks. (Sibling of issue-spor-routed-questions-ignore-wake.)
+  // Defense-in-depth: drop any question the ranker left in (an older server that
+  // predates / ignores exclude_type), so a question is never dispatched even
+  // against a stale backend. Primary exclusion is at the ranker above.
   items = items.filter((it) => it.type !== "question");
   if (!items.length) return null;
   // Skip items already in flight on this machine; advance to the first free one.

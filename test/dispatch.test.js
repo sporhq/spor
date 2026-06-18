@@ -650,6 +650,50 @@ test("dispatch --print (remote node): previews the auto-claim and writes nothing
   }
 });
 
+// REMOTE --from-queue pushes the question exclusion DOWN to the ranker: the
+// /v1/queue fetch carries exclude_type=question, so the candidate page is a full
+// LIMIT of actionable work rather than LIMIT-minus-questions (a page crowded by
+// top-ranked questions could otherwise starve the in-flight skip). Asserts the
+// request the client actually sends, and that it lands on the returned task.
+// (issue-spor-dispatch-from-queue-dispatches-questions — the preferred fix;
+// the local-mode counterpart is exercised by the excludes-questions test above.)
+test("dispatch --from-queue (remote): queue fetch excludes questions at the ranker (exclude_type=question)", { skip: isWin }, async () => {
+  const { home, repo } = fixture();
+  const queueHits = [];
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      if (req.method === "GET" && req.url.startsWith("/v1/queue")) {
+        queueHits.push(req.url);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ items: [{ id: "task-foo", type: "task", project: "demo", repo: "demo", title: "The actionable task" }] }));
+        return;
+      }
+      if (req.method === "GET" && /^\/v1\/nodes\/[^/]+$/.test(req.url)) {
+        const id = decodeURIComponent(req.url.split("/").pop());
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ raw: `---\nid: ${id}\ntype: task\nrepo: demo\ntitle: The actionable task\nsummary: A demo task.\ndate: 2026-06-01\n---\nbody\n` }));
+        return;
+      }
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end("{}");
+    });
+  });
+  await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  try {
+    run(["repos", "add", "demo", repo], { SPOR_HOME: home }); // map the slug so resolveDir lands the dispatch
+    const r = await runAsync(["dispatch", "--from-queue", "--no-brief", "--print"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(queueHits.length, "GET /v1/queue was sent");
+    assert.match(queueHits[0], /exclude_type=question/);
+    assert.match(r.stdout, /--name task-foo/);
+  } finally {
+    srv.close();
+  }
+});
+
 test("dispatch <node-id> (local): no lease, no claim line — byte-identical", { skip: isWin }, async () => {
   // Local mode has no pool/contention; the auto-claim is a no-op and emits no
   // claim line, keeping local node dispatch output unchanged.
