@@ -117,12 +117,21 @@ changes the description without a deploy.
 ### `add_edge`
 
 Micro-mutation. Input `{ "id": "<node>", "type": "<edge type>",
-"to": "<target>" }` — accepts canonical, alias, and inverse forms; inverse
-forms are flipped onto the target before writing. No revision echo is needed.
-Output `{ "status": "updated|skipped", "id": <node actually modified>,
-"revision", "warnings" }` (`skipped` = edge already present — the call is
-idempotent). Both nodes must exist. The tool description carries the same
-registry-generated vocabulary as `put_node`.
+"to": "<target>", "attrs"?: { "<k>": "<v>" } }` — accepts canonical, alias, and
+inverse forms; inverse forms are flipped onto the target before writing. No
+revision echo is needed. Output `{ "status": "updated|skipped",
+"id": <node actually modified>, "revision", "warnings" }` (`skipped` = edge
+already present — the call is idempotent). Both nodes must exist. The tool
+description carries the same registry-generated vocabulary as `put_node`.
+
+The optional `attrs` carries trailing flat edge attributes — the per-assignment
+`profile:` override on an `assigned → agent` edge is the motivating case. Values
+round-trip only simple `[A-Za-z0-9_-]` tokens (the frontmatter edge grammar);
+richer values need `put_node`, and `type`/`to` are reserved. With `attrs`, a
+duplicate `(type, to)` becomes an **upsert**: same attributes → still `skipped`;
+different attributes → the edge's attribute set is replaced (not merged) in
+place. Omitting `attrs` never touches an existing edge's attributes, so a bare
+`add_edge` is unchanged.
 
 ### `set_status`
 
@@ -303,7 +312,7 @@ endpoint is the REST twin of a core call:
 | `POST /v1/digest` `{query, root?, project?, min_sim?}` | prompt-context, /spor:brief | digest-mode compile → `{found, text}`; `found: false` is a successful empty result. `root` is the structural-walk twin of `query` (the two are mutually exclusive; `root` wins, an unknown id is `422`). Optional `project` is the session slug: the server scopes the compile to it — the same-project relevance boost, the grouping union, and the `always_on` norm `applies_to_*` ride-along — resolving the slug through project-node aliases/groupings inside compile (dec-spor-queue-slug-resolves-to-grouping), exactly as `/v1/queue` does. A bad slug is `422`; **omitting `project` runs the digest project-blind (byte-identical to before)**, so older clients that send only `{query}` are unaffected |
 | `GET /v1/nodes/{id}` | /spor:brief | `get_node` semantics; when a live inbound resolves/answers edge contradicts a still-open status the response carries `resolution`, and open gardener findings about the node ride along as `open_findings` |
 | `POST /v1/nodes` | drain-outbox, mechanical writers | `put_node` semantics, batch: `{nodes: [...], if_exists: "skip"}` (entries may be raw strings or `{node, if_exists, revision}`) → `{results: [...]}`, 207 when any entry failed |
-| `POST /v1/nodes/{id}/edges` `{type, to}` | scripts, mechanical writers | `add_edge` semantics (§1): normalize/flip, dedupe, append — no revision echo |
+| `POST /v1/nodes/{id}/edges` `{type, to, attrs?}` | scripts, mechanical writers | `add_edge` semantics (§1): normalize/flip, dedupe, append — no revision echo. Optional `attrs` adds trailing flat edge attributes (e.g. a per-assignment `profile:` override); re-adding the same edge with different attrs upserts the set |
 | `POST /v1/nodes/{id}/status` `{status}` | scripts, mechanical writers | `set_status` semantics (§1): one-scalar update through the `transitions()` gate. Setting a work node to an in-progress status also CLAIMS it (same lease as `/claim` below) |
 | `POST /v1/nodes/{id}/claim` `{session?}` | `claim`/`set_status` MCP tools, `spor dispatch` | take the heartbeat-renewed lease (dec-cc-task-claim-lease): writes the durable `assigned` edge once, attributes to `$viewer` from the token (never an argument), and creates the ephemeral lease → `{ok, status, lease: {node_id, by, expires, expires_at, session, claimed_at}, edge}`. A live lease held by ANOTHER person is `409 conflict` naming the holder + expiry (re-claiming your OWN live claim just renews it). `session` scopes the heartbeat (omit to leave it person-scoped, so any of the claimer's sessions may renew — what `spor dispatch` does at the PRE-launch claim, since `claude --bg` self-allocates the run session only at launch; dispatch then renews with the real session once it has read it from `claude agents --json`, dec-spor-dispatch-bg-session-late-bind) |
 | `POST /v1/nodes/{id}/renew` `{session?}` | post-tool heartbeat, `renew` MCP tool, `spor dispatch` | bump the live lease's expiry only — no commit; the heartbeat that keeps a claim from lapsing. A lapsed/stolen lease is `409` (names the current holder). Person-scoped: any of the claimer's sessions may renew; a `session` binds the lease to that run (`spor dispatch` uses this to bind the captured `claude --bg` session post-launch) |
