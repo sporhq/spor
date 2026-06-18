@@ -2,6 +2,7 @@
 // against stubbed OpenCode surfaces. The plugin captures SUBSTRATE_HOME and
 // SUBSTRATE_DEBOUNCE at import time, so env is pinned before the import and
 // all tests share one scratch graph.
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');

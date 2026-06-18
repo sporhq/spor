@@ -9,6 +9,7 @@
 //      renderNorm), additive and byte-identical for person-direct nodes.
 // Everything runs against a throwaway graph home and stub servers — never the
 // live graph, never a real `claude --bg`.
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
 const assert = require("node:assert");
 const { spawn, spawnSync } = require("node:child_process");

@@ -7,6 +7,7 @@
 // + remote /v1/queue), and FAILS SOFT when the claude binary is absent. Tests
 // inject the agent list via SPOR_FAKE_AGENTS_JSON (mirroring SPOR_FAKE_MCP_LIST)
 // and run against throwaway graphs / stub servers — never the live graph.
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
 const assert = require("node:assert");
 const { spawnSync } = require("node:child_process");

@@ -4,6 +4,7 @@
 // once. Driven through the real dispatcher (bin/spor-hook post-tool) against an
 // in-process stub server on an ephemeral port. The cwd is a real git repo so
 // the in-repo gate passes; everything writes to a throwaway SPOR_HOME.
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require('node:test');
 const assert = require('node:assert');
 const { spawn, spawnSync } = require('node:child_process');

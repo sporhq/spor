@@ -22,6 +22,7 @@
 // and HOME, so a configured dev box's installed plugin / SPOR_SERVER env can't leak in and
 // the live team graph is never touched (norm-cc-scratch-home-for-tests).
 
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");

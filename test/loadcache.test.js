@@ -1,5 +1,6 @@
 // loadGraphCached + load-latency telemetry (issue-cc-local-mode-hook-load-latency).
 // Pure scratch-dir tests over the real util helper — no server, no live graph.
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');

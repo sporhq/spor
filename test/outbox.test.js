@@ -1,6 +1,7 @@
 // drain-outbox dead-letter policy + u.curl Retry-After/backoff
 // (issue-cc-401-429-contract-gap). Drives the real engines against a scratch
 // graph home with a stubbed global fetch — no server, no live graph.
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');

@@ -4,6 +4,7 @@
 // The sandbox secures EXECUTION (escape, runaway, nondeterminism, leakage);
 // the proposal-flow review gate secures semantics.
 
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const path = require("path");

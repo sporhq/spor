@@ -5,6 +5,7 @@
 // carries the RESOLVER's summary/title so a read surface can show WHAT
 // resolved/answered a node, not just that something did.
 
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { resolutionMap, resolutionOf } = require("../lib/kernel/resolution.js");

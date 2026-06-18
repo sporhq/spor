@@ -2,6 +2,7 @@
 // Local verbs must be byte-identical passthrough to the lib scripts; onboarding
 // verbs (init/status) and fail-open behavior are the new contract. Everything
 // runs against a throwaway graph home — never the live graph.
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require('node:test');
 const assert = require('node:assert');
 const { spawnSync } = require('node:child_process');

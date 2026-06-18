@@ -236,11 +236,18 @@ Omitting both (or passing empty arrays) filters nothing.
 ### `ask_question`
 
 File a question the graph could not answer. Input `{ "text": "<the
-question>", "title"?: "<short title>", "mentions"?: ["<node id>", ...] }`
-(routing considers `mentions` first). The question becomes a durable node,
-deterministically routed to the steward of the closest relevant node
-(unrouted if none matches), and joins the decision queue until answered.
-Answer by writing a node with an `answers` edge to the question.
+question>", "title"?: "<short title>", "mentions"?: ["<node id>", ...],
+"project"?: "<slug>" }` (routing considers `mentions` first). The question
+becomes a durable node, deterministically routed to the steward of the closest
+relevant node (unrouted if none matches), and joins the decision queue until
+answered. Answer by writing a node with an `answers` edge to the question.
+
+By default the question's project is derived from its relevance neighborhood
+(its `mentions`, then the compiler's picks), falling back to the asker's home
+project. An explicit `project` overrides that derivation — pass it for a
+mention-less question whose neighborhood would otherwise yield nothing (a
+dispatched background agent injects its session project here, since the
+launcher environment never reaches it).
 
 ### `run_workflow`
 
@@ -324,7 +331,7 @@ endpoint is the REST twin of a core call:
 | `POST /v1/distill/report` | distill | sweep telemetry, journal-only (no store mutation): `{facts, captured?, spooled?, rejected?, project?, session?}` → `{status: "reported"}`; zero-fact sweeps report too |
 | `POST /v1/corrections` | /spor:correct | `propose_correction` semantics → 201 `{status, id, revision, warnings}` |
 | `GET /v1/queue?project=&assignee=&type=&exclude_type=&limit=&offset=` | /spor:next, session-start | the ranked decision queue: `{items, count, offset, returned_count, total_count, truncated, next_offset, counts_by_type, counts_by_project, counts_by_suggest, muted?, dormant?, questions, asked, findings, pending, reviews, policy?, generated_at}` — items retired by a live resolves/answers edge are excluded; items hidden by the viewer's `queue_mute` or parked by a future `wake:` date (QUEUE.md §4) are counted, never silently dropped; `questions`/`findings`/`pending` are the routed-to-me-plus-unrouted views for the authenticated identity, `asked` is the questions you filed, and `reviews` is the nodes whose review is requested of you (an open `review-requested` edge to your person node — explicitly targeted, no unrouted fallback). `limit` is the page size (default 20, **max 100**, clamped not rejected) and `offset` skips that many items in the ranked order (default 0); the `counts_*`/`total_count` aggregates always cover the FULL ranked set regardless of the page, so one call answers "how many issues vs tasks" without paging, while `truncated`/`next_offset` let a client walk the rest by re-requesting with `offset=next_offset` until `next_offset` is null. Pagination is offset over a point-in-time ranked slice (the queue re-ranks every call), not a cursor — it resumes the same slice only across an unchanged ranking. `project` resolves through the shared up-resolution (dec-spor-queue-slug-resolves-to-grouping): a bare repo slug unions its home-project grouping's member queues, the repo NODE id (`repo-<slug>`) pins one repo, a grouping id (`proj-<slug>`) is used directly; **omitting `project` is the cross-project firehose** (every repo's queue at once). `assignee=<person-id>` scopes to the work that person carries (their `assigned`/`stewards` edges) — a manager's "who is carrying what"; `assignee=me` binds to the caller (empty if the token maps to no person node). `type=`/`exclude_type=` (comma-separated, repeatable) whitelist/blacklist node types from the ranking (exclude wins on overlap) — a hard scope filter applied before scoring, so the aggregates describe the filtered queue (task-cc-queue-filtering-enhancements) |
-| `POST /v1/questions` `{text, title?, mentions?}` | ask_question's REST twin | file a question node; deterministically routed to the steward of the closest relevance-neighborhood node, unrouted if none → 201 `{status, id, routed_to, via, asker, revision, warnings}` |
+| `POST /v1/questions` `{text, title?, mentions?, project?}` | ask_question's REST twin | file a question node; deterministically routed to the steward of the closest relevance-neighborhood node, unrouted if none → 201 `{status, id, project, routed_to, via, asker, revision, warnings}`. `project` is derived from the relevance neighborhood (then the asker's home project) unless an explicit `project` slug overrides it — pass that for a mention-less question (a dispatched agent injects its session project); a malformed slug → 400 |
 | `POST /v1/gardener` | ops cron / on demand | run a gardener sweep now; findings filed as queue items → `{filed, resolved, ..., generated_at}` |
 | `GET /v1/lens/{id}/render?format=html\|text\|json` | browsers, teammates without a checkout | run a lens OR workspace node and render its view tree (html default, plain text, or the raw tree as json). Read-only — no action forms; writes stay with `/v1/nodes` and the MCP tools. Auth is the caller's bearer header OR a signed read-only **render ticket** for shared links (browser links can't carry an Authorization header): `?ticket=<blob>` is accepted once and exchanged via a 302 for an HttpOnly `spor_render_ticket` cookie (kept out of URLs, logs, and view-to-view hrefs). The ticket binds `$viewer` to the recorded sharer and the render shows a "Viewing as &lt;sharer&gt;" banner. The former `?token=<PAT>` sharing path is **removed** — a shared link can never carry a write-capable credential |
 | `POST /v1/lens/{id}/ticket` `{expires?}` | sharing a view | mint a signed, expiring, read-only render ticket for the lens/workspace, recording the authenticated caller as the sharer → `{ticket, url, lens_id, sharer_person_id, exp}`. `expires` is `<N>d` or an ISO date (default `7d`, max `30d`); the caller must be bound to a person node (else `422 no_person`). The ticket carries no write scope and is honored only on the render route |

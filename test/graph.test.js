@@ -5,6 +5,7 @@
 // the digest relevance gate, supersession fixup + the ⚠ warning, correction
 // pin/exclude, and validateNode/validateGraph accept/reject cases.
 
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("fs");

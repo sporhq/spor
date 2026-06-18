@@ -2207,18 +2207,28 @@ async function topQueueItem(cfg, slug) {
 // phantom (issue-spor-dispatch-bg-ignores-forced-session-id). Dispatch instead
 // captures the real session post-launch and binds it via renewDispatch (and the
 // bg agent's own post-tool heartbeat renews the same-session lease thereafter).
+// A per-invocation `dispatch` nonce tags the claim so the server can distinguish
+// a SECOND concurrent dispatch of the same node BY THE SAME PERSON from this
+// person's own idempotent renew (inc-spor-dispatch-duplicate-task-2026-06-18):
+// the lease holder is the person, so without the nonce a same-person re-claim
+// just renews and a duplicate agent launches. With it, a live lease bearing a
+// different nonce is 409 — closing the same-person/cross-machine duplicate the
+// person-scoped lease and the same-machine guard miss.
+//
 // Returns {ok} on success/idempotent-renew, {conflict, message} when the node is
 // already held (the concurrent-dispatch case this guards), or {error} for any
 // other failure (fail-open: the caller warns and dispatches anyway).
-async function claimDispatch(cfg, nodeId, session) {
-  const body = session ? { session } : {};
+async function claimDispatch(cfg, nodeId, session, dispatch) {
+  const body = {};
+  if (session) body.session = session;
+  if (dispatch) body.dispatch = dispatch;
   const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}/claim`, body, { timeoutMs: 6000 });
   if (r.ok) return { ok: true, lease: r.json && r.json.lease };
-  // 409 = the node can't be claimed right now — almost always a live lease held
-  // by ANOTHER person (the concurrent-dispatch conflict this feature exists to
-  // catch), occasionally a closed/terminal node. Either way don't launch a
-  // duplicate: surface the server's message (it names holder + expiry for the
-  // lease case) and let the caller abort.
+  // 409 = the node can't be claimed right now — a live lease held by ANOTHER
+  // person, ANOTHER concurrent dispatch of ours (the dispatch-nonce conflict),
+  // or occasionally a closed/terminal node. Either way don't launch a duplicate:
+  // surface the server's message (it names holder + expiry for the lease case)
+  // and let the caller abort.
   if (r.status === 409) {
     const e = (r.json && r.json.error) || {};
     return { ok: false, conflict: true, code: e.code || "conflict", message: e.message || "already claimed" };
@@ -2539,13 +2549,32 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     err(`target dir does not exist: ${res.dir}`);
     return 1;
   }
+  // Session project (issue-spor-dispatch-propagate-session-project-to-questions).
+  // The launcher env never reaches a `claude --bg` agent (it self-allocates a
+  // spare worker; dec-spor-session-identity-active-record), and the agent token
+  // carries only {agent, session} — NOT the project. So the only channel the
+  // session project can ride to the bg agent is the prompt itself: state it, and
+  // tell the agent to pass it as ask_question's `project` param when a question
+  // has no clear `mentions:`. The server gives that explicit project precedence
+  // over its mentions/neighborhood derivation, closing the residual mention-less,
+  // no-match case that otherwise mis-stamps the question into the asker's home
+  // project. res.slug is the project this dispatch resolved into (always set —
+  // resolveDir falls back to the cwd slug). Omitted from a --template prompt,
+  // which exposes the same value as {{slug}}/{{project}} and takes over entirely.
+  const sessionNote = res.slug
+    ? `> **Spor session project:** \`${res.slug}\`. If you file a question with ` +
+      `\`ask_question\` (or \`POST /v1/questions\`) that has no clear \`mentions:\`, pass ` +
+      `\`project: "${res.slug}"\` so it is stamped to this project rather than ` +
+      `defaulting to the asker's home project.\n\n`
+    : "";
   const defaultPrompt = brief
-    ? `# Spor briefing (compiled for this task — your standing context)\n\n${brief}\n\n---\n\n# Task\n\n${instruction}\n`
-    : instruction;
+    ? `${sessionNote}# Spor briefing (compiled for this task — your standing context)\n\n${brief}\n\n---\n\n# Task\n\n${instruction}\n`
+    : `${sessionNote}${instruction}`;
 
-  // With no template the launched prompt is byte-identical to before. A template
-  // takes over entirely: it decides where the compiled brief, the task, and the
-  // node metadata land (or wraps the whole default via {{default}}).
+  // With no template the launched prompt adds only the session-project note above
+  // (issue-spor-dispatch-propagate-session-project-to-questions). A template takes
+  // over entirely: it decides where the compiled brief, the task, and the node
+  // metadata land (or wraps the whole default via {{default}}).
   let prompt = defaultPrompt;
   if (template != null) {
     const r = renderTemplate(template, {
@@ -2782,11 +2811,16 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // isn't known until after launch, so we bind it to the lease via renewDispatch
   // below; until then any of this person's sessions may renew it.
   if (nodeId && !backfill && !noClaim && cfg.mode() === "remote") {
-    const c = await claimDispatch(cfg, nodeId);
+    // Tag this claim with a per-invocation dispatch nonce so the server refuses a
+    // SECOND concurrent dispatch of the same node — even by this same person, on
+    // any machine (inc-spor-dispatch-duplicate-task-2026-06-18). --force opts out
+    // (omit the nonce) so a deliberate re-dispatch renews instead of conflicting.
+    const dispatchNonce = force ? null : crypto.randomUUID();
+    const c = await claimDispatch(cfg, nodeId, null, dispatchNonce);
     if (c.conflict) {
       err(`${nodeId} is already claimed — ${c.message}`);
-      err(`  not dispatching a duplicate. Re-run with --no-claim to dispatch anyway (no lease),`);
-      err(`  or pick another task with 'spor next'.`);
+      err(`  not dispatching a duplicate. Re-run with --force to dispatch anyway (keeps the lease),`);
+      err(`  --no-claim to dispatch with no lease, or pick another task with 'spor next'.`);
       return 1;
     }
     if (c.ok) out(`claimed ${nodeId} (lease established; the agent's writes will renew it)`);

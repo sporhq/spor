@@ -9,6 +9,7 @@
 // df/N until a full reload resyncs — verified bounded by checking df/N stay
 // exact, so any reload makes the whole index consistent again.
 
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const path = require("path");
