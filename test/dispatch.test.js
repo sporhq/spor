@@ -280,6 +280,30 @@ test("dispatch --from-queue: nothing in flight picks the top item (unchanged beh
   assert.doesNotMatch(r.stderr, /skipped/); // no skip note when nothing is in flight
 });
 
+// --from-queue must never auto-dispatch a QUESTION: questions are human
+// decisions, not agent work (the standing model — agent-actionable work is a
+// task). A p1 question outranks a plain task in the ranked queue, so without the
+// exclusion --from-queue would pick it; it must skip it and pick the task.
+test("dispatch --from-queue: excludes questions (human decisions), picks the task", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-fq-q-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  fs.writeFileSync(
+    path.join(nodes, "question-decide.md"),
+    `---\nid: question-decide\ntype: question\nrepo: demo\npriority: p1\ntitle: A human decision that must never be auto-dispatched\nsummary: A p1 question that outranks the task in the ranked queue; --from-queue must skip it because questions are human decisions, not agent work.\nstatus: open\ndate: 2026-06-02\n---\nWhich vendor should we pick?\n`
+  );
+  fs.writeFileSync(
+    path.join(nodes, "task-work.md"),
+    `---\nid: task-work\ntype: task\nrepo: demo\ntitle: The agent-dispatchable task\nsummary: A plain task --from-queue should land on once the higher-ranked question is excluded from auto-dispatch.\ndate: 2026-06-02\n---\nDo the work.\n`
+  );
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-fq-q-repo-"));
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const r = run(["dispatch", "--from-queue", "--print"], { SPOR_HOME: home, SPOR_FAKE_AGENTS_JSON: "[]" }, fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cwd-")));
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /--name task-work/);
+  assert.doesNotMatch(r.stdout, /question-decide/);
+});
+
 test("dispatch --from-queue: when EVERY candidate is in flight, falls back to top so the guard refuses", { skip: process.platform === "win32" }, () => {
   const { home, repo } = twoTaskFixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });

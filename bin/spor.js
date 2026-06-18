@@ -2103,6 +2103,13 @@ async function topQueueItem(cfg, slug) {
     }
   }
   if (!items.length) return null;
+  // --from-queue dispatches an AGENT to do work, and questions are human
+  // decisions — not agent-dispatchable (the standing model: agent-actionable
+  // work is a task, not a question). Questions stay queueable for the HUMAN
+  // queue (`spor next`), but unattended dispatch must never auto-pick one even
+  // when it ranks. (Sibling of issue-spor-routed-questions-ignore-wake.)
+  items = items.filter((it) => it.type !== "question");
+  if (!items.length) return null;
   // Skip items already in flight on this machine; advance to the first free one.
   const { items: free, hidden } = annotateInFlight(items, dispatchedAgents(), true);
   if (hidden && free.length) {
