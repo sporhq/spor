@@ -396,6 +396,126 @@ test("dispatch spawns the claude binary with --bg in the target dir", { skip: pr
   assert.ok(argv.includes("--name") && argv.includes("dec-x"));
 });
 
+// --- profile satisfiability gate (dec-spor-machine-profile-satisfiability) ---
+// Dispatch resolves the profile it would run under (--profile > assigned->agent
+// edge attr > agent default) and refuses soft-and-loud when THIS machine can't
+// satisfy it, leaving the assignment intact and launching nothing.
+function writeProfile(nodes, id, fields) {
+  fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\ntype: profile\ntitle: ${id}\nsummary: A test profile.\n${fields}\ndate: 2026-06-18\n---\nA test profile.\n`);
+}
+function setCaps(home, capabilities) {
+  const file = path.join(home, "config.json");
+  let data = {};
+  try {
+    data = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    /* fresh */
+  }
+  data.dispatch = data.dispatch || {};
+  data.dispatch.capabilities = capabilities;
+  fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+}
+// A claude stub that records its launch into LAUNCH_MARK, so a test can assert a
+// refused dispatch NEVER launched.
+function recordingStub(home) {
+  const stub = path.join(home, "claude-rec.sh");
+  fs.writeFileSync(stub, `#!/bin/sh\necho launched > "$LAUNCH_MARK"\n`);
+  fs.chmodSync(stub, 0o755);
+  return stub;
+}
+
+test("dispatch --profile: refuses when this machine can't satisfy it; nothing launches, assignment untouched", { skip: process.platform === "win32" }, () => {
+  const { home, nodes, repo } = fixture();
+  writeProfile(nodes, "profile-codex", "harness: codex");
+  setCaps(home, { declared: { harnesses: ["claude-code"] } }); // codex NOT available here
+  const stub = recordingStub(home);
+  const mark = path.join(home, "launched.mark");
+  const r = run(["dispatch", "dec-x", "--dir", repo, "--profile", "profile-codex", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /can't satisfy profile profile-codex/);
+  assert.match(r.stderr, /harness 'codex' not available here \(codex not on PATH\)/);
+  assert.match(r.stderr, /assignment is unchanged/);
+  assert.ok(!fs.existsSync(mark), "claude was never launched");
+});
+
+test("dispatch --profile: a satisfiable profile dispatches normally", { skip: process.platform === "win32" }, () => {
+  const { home, nodes, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  writeProfile(nodes, "profile-cc", "harness: claude-code\nplugins: [spor]");
+  setCaps(home, { declared: { harnesses: ["claude-code"], plugins: ["spor"] } });
+  const stub = recordingStub(home);
+  const mark = path.join(home, "launched.mark");
+  const r = run(["dispatch", "dec-x", "--profile", "profile-cc", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
+  assert.strictEqual(r.status, 0);
+  assert.ok(fs.existsSync(mark), "claude launched for a satisfiable profile");
+});
+
+test("dispatch --profile: an unknown profile id is a hard error before any launch", { skip: process.platform === "win32" }, () => {
+  const { home, repo } = fixture();
+  const stub = recordingStub(home);
+  const mark = path.join(home, "launched.mark");
+  const r = run(["dispatch", "dec-x", "--dir", repo, "--profile", "profile-nope", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /could not load profile profile-nope/);
+  assert.ok(!fs.existsSync(mark));
+});
+
+test("dispatch <node>: the assigned->agent edge profile attr is honored (no --profile)", { skip: process.platform === "win32" }, () => {
+  const { home, nodes, repo } = fixture();
+  writeProfile(nodes, "profile-codex", "harness: codex");
+  // task-rotate is assigned to an agent UNDER profile-codex — unsatisfiable here.
+  fs.writeFileSync(
+    path.join(nodes, "task-rotate.md"),
+    `---\nid: task-rotate\ntype: task\nrepo: demo\ntitle: Rotate tokens\nsummary: Rotate pipeline auth tokens.\ndate: 2026-06-02\nedges:\n  - {type: assigned, to: agent-test, profile: profile-codex}\n---\nBody.\n`
+  );
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const stub = recordingStub(home);
+  const mark = path.join(home, "launched.mark");
+  const r = run(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /can't satisfy profile profile-codex \(via assigned → agent-test\)/);
+  assert.ok(!fs.existsSync(mark));
+});
+
+test("dispatch <node>: falls back to the assigned agent's default uses-profile", { skip: process.platform === "win32" }, () => {
+  const { home, nodes, repo } = fixture();
+  writeProfile(nodes, "profile-codex", "harness: codex");
+  // An agent whose DEFAULT profile (uses-profile) is unsatisfiable here.
+  fs.writeFileSync(
+    path.join(nodes, "agent-test.md"),
+    `---\nid: agent-test\ntype: agent\ntitle: Test agent\nsummary: A test agent.\ndate: 2026-06-18\nedges:\n  - {type: uses-profile, to: profile-codex}\n---\nAgent.\n`
+  );
+  // task-rotate assigned to agent-test with NO per-assignment profile override.
+  fs.writeFileSync(
+    path.join(nodes, "task-rotate.md"),
+    `---\nid: task-rotate\ntype: task\nrepo: demo\ntitle: Rotate tokens\nsummary: Rotate pipeline auth tokens.\ndate: 2026-06-02\nedges:\n  - {type: assigned, to: agent-test}\n---\nBody.\n`
+  );
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const stub = recordingStub(home);
+  const mark = path.join(home, "launched.mark");
+  const r = run(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /can't satisfy profile profile-codex \(via agent-test default\)/);
+  assert.ok(!fs.existsSync(mark));
+});
+
+test("dispatch --print --profile: previews the verdict and writes nothing", { skip: process.platform === "win32" }, () => {
+  const { home, nodes, repo } = fixture();
+  writeProfile(nodes, "profile-codex", "harness: codex");
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const r = run(["dispatch", "dec-x", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0); // --print never fails
+  assert.match(r.stdout, /profile: profile-codex \(via --profile\) — UNSATISFIABLE here/);
+  assert.match(r.stdout, /harness 'codex' not available here/);
+});
+
+test("dispatch: no profile resolved => byte-identical (no profile line)", { skip: process.platform === "win32" }, () => {
+  const { home, repo } = fixture();
+  const r = run(["dispatch", "dec-x", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0);
+  assert.ok(!/profile:/.test(r.stdout), "no profile preview line when none resolves");
+});
+
 // --- user-supplied prompt templates (task-spor-dispatch-user-prompt-templates)
 // `--template F` replaces the default prompt assembly with the file's contents,
 // substituting Handlebars-style {{placeholder}} tokens from the dispatch context.

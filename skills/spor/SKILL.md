@@ -91,7 +91,12 @@ spor dispatch <id>|"<task>"    # run work as a background agent; in team mode it
                                #   attributed "agent on behalf of you" (the machine's default agent =
                                #   dispatch.agent, set by `spor agent use`; --as <agent-id> overrides it
                                #   per dispatch; --agent is the unrelated `claude --agent` passthrough).
-                               #   See API.md §3-§4.
+                               #   --profile <id> pins the profile to run under; if THIS machine can't
+                               #   satisfy it, dispatch refuses loudly and leaves the assignment intact
+                               #   (never substitutes). See API.md §3-§4.
+spor capabilities              # this machine's dispatch capability map (harnesses/MCP/skills/plugins/
+                               #   deny) matched against a profile at dispatch; self-probes each session.
+                               #   probe | set <axis> <v…> | allow-mcp <m…> | deny <profile-id…> | clear
 
 # dual-mode (local passthrough / remote dispatch to the server)
 spor compile --query "<text>"  # search → compiled neighborhood (--digest for compact)

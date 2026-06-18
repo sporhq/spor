@@ -617,9 +617,10 @@ The layer ABOVE agent identity (dec-spor-agent-orchestration-layer): how work is
 routed to agents, and how per-person automation fires on graph events. The node
 model is `person ──owns──▶ agent ──uses-profile──▶ profile`, with owner-scoped
 `routine` nodes driving automation. It composes with — never bypasses — the org
-policy layer. The schemas ship in the seed pack; the dispatch matcher, the
-routine engine, and the remote fleet scheduler are deferred
-(task-spor-dispatch-capabilities-satisfiability).
+policy layer. The schemas ship in the seed pack, and so do the machine-local
+`dispatch.capabilities` map + `satisfies()` matcher + fail-soft dispatch
+(task-spor-dispatch-capabilities-satisfiability); the routine engine and the
+remote fleet scheduler are still deferred.
 
 ### profile — the reusable runtime+capability bundle
 

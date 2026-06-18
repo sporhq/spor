@@ -13,6 +13,10 @@ const { execFileSync, spawnSync, spawn } = require("child_process");
 const ROOT = path.resolve(__dirname, "..", "..");
 
 const home = require(path.join(ROOT, "lib", "shell", "home.js"));
+// The harness vocabulary the capability probe emits — owned by the pure matcher
+// so the probe, the matcher, and the future fleet scheduler agree on one set of
+// names (dec-spor-machine-profile-satisfiability). Never re-hardcode it here.
+const { HARNESS_BINARIES } = require(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
 
 // Active client config for this run (dec-spor-client-config-cascade). The
 // dispatcher builds it once with the session cwd; engines then read settings
@@ -527,6 +531,152 @@ function setDispatchAgent(graphHomeDir, agentId) {
   }
 }
 
+// --- machine capability map (dispatch.capabilities) -----------------------
+// What this BOX can run, the machine-local half of profile satisfiability
+// (dec-spor-machine-profile-satisfiability). A sibling of dispatch.repos under
+// the same never-committed USER config.json: probe-populated and
+// config-overridable, machine-specific exactly as the slug->path map is. The
+// matcher (lib/kernel/satisfiability.js) reads the EFFECTIVE union of the probed
+// and declared sets; here we PROBE the cheap deterministic axes and READ/WRITE
+// the file. Fail-open throughout, like registerRepo.
+
+// A pure, no-spawn `which`: the resolved path of an executable named `cmd` on
+// PATH, or null. Scans $PATH (and $PATHEXT on Windows), stat-ing candidates —
+// no child process, so it is cheap enough for the fail-open session-start
+// side-effect path (spawning `cmd --version` per harness would not be).
+function whichSync(cmd) {
+  if (!cmd || typeof cmd !== "string") return null;
+  const exts =
+    process.platform === "win32"
+      ? ["", ...(process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean)]
+      : [""];
+  const dirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  for (const dir of dirs) {
+    for (const ext of exts) {
+      const candidate = path.join(dir, cmd + ext);
+      try {
+        const st = fs.statSync(candidate);
+        // Windows has no executable bit; POSIX requires one (owner/group/other).
+        if (st.isFile() && (process.platform === "win32" || st.mode & 0o111)) return candidate;
+      } catch {
+        /* not here — keep scanning */
+      }
+    }
+  }
+  return null;
+}
+
+// Harnesses whose launcher binary is on PATH — the primary, most deterministic
+// capability axis (you cannot launch a profile whose harness binary is absent;
+// `spor dispatch` already degrades on exactly this for `claude`). The harness
+// NAMES are the schema-profile vocabulary, read from HARNESS_BINARIES.
+function probeHarnesses() {
+  const found = [];
+  for (const [name, bin] of Object.entries(HARNESS_BINARIES)) {
+    if (whichSync(bin)) found.push(name);
+  }
+  return found;
+}
+
+// Plugins and skills the claude-code harness has installed, read with NO spawn
+// from `~/.claude/plugins/installed_plugins.json` (the manifest Claude Code
+// writes). A plugin's name is the id before '@'; the skills it ships are the
+// subdirs of its installPath/skills/, recorded both bare (`brief`) and
+// namespaced (`spor:brief`) so a profile may reference whichever form. Best
+// effort: a missing/malformed manifest or skills dir yields empty, never throws.
+function probeClaudePluginsSkills() {
+  const out = { plugins: [], skills: [] };
+  try {
+    const hd = process.env.HOME || process.env.USERPROFILE || os.homedir();
+    const manifest = path.join(hd, ".claude", "plugins", "installed_plugins.json");
+    const data = JSON.parse(fs.readFileSync(manifest, "utf8"));
+    const map = data && typeof data.plugins === "object" && data.plugins ? data.plugins : {};
+    const plugins = new Set();
+    const skills = new Set();
+    for (const [key, installs] of Object.entries(map)) {
+      const name = String(key).split("@")[0];
+      if (!name) continue;
+      plugins.add(name);
+      for (const inst of Array.isArray(installs) ? installs : []) {
+        const ip = inst && typeof inst.installPath === "string" ? inst.installPath : null;
+        if (!ip) continue;
+        let entries = [];
+        try {
+          entries = fs.readdirSync(path.join(ip, "skills"), { withFileTypes: true });
+        } catch {
+          entries = [];
+        }
+        for (const e of entries) {
+          if (e.isDirectory()) {
+            skills.add(e.name);
+            skills.add(`${name}:${e.name}`);
+          }
+        }
+      }
+    }
+    out.plugins = [...plugins];
+    out.skills = [...skills];
+  } catch {
+    /* no claude plugin manifest on this box — leave empty */
+  }
+  return out;
+}
+
+// Read-modify-write $SPOR_HOME/config.json, applying `mutate(cap)` to the nested
+// dispatch.capabilities object (creating it). Same fail-safe shape as
+// editRepoMap/setDispatchAgent: preserves every other key, refuses to clobber a
+// present-but-malformed config, returns true only when it actually wrote.
+function editCapabilities(graphHomeDir, mutate) {
+  try {
+    const file = userConfigPath(graphHomeDir);
+    let raw = null;
+    try {
+      raw = fs.readFileSync(file, "utf8");
+    } catch {
+      raw = null; // absent — start fresh
+    }
+    let data = {};
+    if (raw != null) {
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        return false; // malformed — do NOT overwrite
+      }
+      if (data == null || typeof data !== "object" || Array.isArray(data)) data = {};
+    }
+    if (data.dispatch == null || typeof data.dispatch !== "object" || Array.isArray(data.dispatch)) data.dispatch = {};
+    const d = data.dispatch;
+    if (d.capabilities == null || typeof d.capabilities !== "object" || Array.isArray(d.capabilities)) d.capabilities = {};
+    if (!mutate(d.capabilities)) return false; // unchanged — skip the write
+    if (!ensureDir(graphHomeDir)) return false;
+    fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Probe THIS machine's atomic capabilities and cache them under
+// `dispatch.capabilities.probed`. Cheap and deterministic (PATH stat + one JSON
+// read + a few readdirs, no child process, no network), so it is safe on the
+// fail-open session-start side-effect path. The probed sets are written
+// WHOLESALE so an uninstalled harness drops out on the next refresh (no upward
+// drift); user declarations under `dispatch.capabilities.declared` are untouched
+// and survive every refresh (dec-spor-machine-profile-satisfiability). MCP
+// reachability and deny-flags are deliberately NOT probed (a flaky network probe
+// / policy, not capability) — they are declared. No-op when unchanged. Returns
+// the probed map (for `spor capabilities probe`).
+function probeCapabilities(graphHomeDir) {
+  const ps = probeClaudePluginsSkills();
+  const probed = { harnesses: probeHarnesses(), plugins: ps.plugins, skills: ps.skills };
+  editCapabilities(graphHomeDir, (cap) => {
+    if (JSON.stringify(cap.probed || null) === JSON.stringify(probed)) return false;
+    cap.probed = probed;
+    return true;
+  });
+  return probed;
+}
+
 function appendLine(file, line) {
   try {
     fs.appendFileSync(file, line + "\n");
@@ -818,6 +968,9 @@ module.exports = {
   registerRepo,
   forgetRepo,
   setDispatchAgent,
+  whichSync,
+  editCapabilities,
+  probeCapabilities,
   appendLine,
   makeLogger,
   loadGraphCached,

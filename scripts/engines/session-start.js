@@ -171,6 +171,19 @@ async function sessionStart(input) {
     /* best effort */
   }
 
+  // Refresh this machine's dispatch CAPABILITIES (harnesses on PATH, installed
+  // plugins/skills) into the same machine-local config.json — the other half of
+  // profile satisfiability (dec-spor-machine-profile-satisfiability,
+  // task-spor-dispatch-capabilities-satisfiability). Like registerRepo: a pure,
+  // fail-open side effect that never alters this run's output, cheap and no-spawn
+  // (PATH stat + a JSON read), so it stays off the latency budget. It writes only
+  // `dispatch.capabilities.probed`; user declarations under `.declared` survive.
+  try {
+    u.probeCapabilities(u.userConfigHome());
+  } catch {
+    /* best effort */
+  }
+
   // -------------------------------------------------------------------------
   // REMOTE MODE
   // -------------------------------------------------------------------------

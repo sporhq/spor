@@ -318,7 +318,13 @@ it. Other levers beyond env migration: neighborhood-search project controls
 slug→local-path map (`dispatch.repos`, a per-machine `{slug: path}` table the
 shared graph can't hold; written to the USER `$SPOR_HOME/config.json` by
 `spor repos`/`session-start`, read via the cascade — never a committable
-`.spor.json`, since paths are machine-specific). Server-side ops vars
+`.spor.json`, since paths are machine-specific), and its sibling
+`dispatch.capabilities` — the machine-local profile-satisfiability map
+(harnesses/reachable-MCP/skills/plugins + a `deny` policy list) probe-populated
+by `session-start` and declared by `spor capabilities`, in the SAME user
+config.json (`dispatch.capabilities.probed` is refreshed wholesale, `.declared`
+is sticky, `.deny` overrides both; the pure matcher is `lib/kernel/satisfiability.js`,
+task-spor-dispatch-capabilities-satisfiability). Server-side ops vars
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard
 (`SPOR_DISTILLING`) are deliberately NOT config — they stay pure env.
