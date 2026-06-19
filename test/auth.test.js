@@ -354,6 +354,11 @@ test('auth login (device-code) polls, confirms /v1/me, and stores the tenant', a
     assert.strictEqual(s.default, key, 'a fresh login becomes the active tenant');
     // exercised the pending->approved poll loop
     assert.ok(hits.filter((h) => h.url === '/oauth/token').length >= 2);
+    // RFC 8707: the device authorization carries resource=<server> so the issuer can
+    // scope the minted token's aud to the api host (task-spor-app-api-strict-audience-restriction).
+    const da = hits.find((h) => h.url === '/oauth/device_authorization');
+    assert.ok(da, 'a device_authorization request was made');
+    assert.strictEqual(JSON.parse(da.body || '{}').resource, base, 'resource indicator = the server origin');
   } finally {
     srv.close();
   }

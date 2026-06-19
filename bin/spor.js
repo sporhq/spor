@@ -1076,8 +1076,11 @@ async function cmdAuthLogin(cfg, args) {
     out("      logging into one org for now; re-run 'spor auth login --org <other>' for more.");
   }
 
-  // RFC 8628 §3.1 — start the device authorization.
-  const da = await auth.deviceAuthorize(server, { scope });
+  // RFC 8628 §3.1 — start the device authorization. The RFC 8707 `resource` indicator
+  // is the api host this token will call (`server`), so the issuer can scope the minted
+  // token's `aud` to it (task-spor-app-api-strict-audience-restriction). Inert against an
+  // un-armed / self-host issuer, so it is always safe to send.
+  const da = await auth.deviceAuthorize(server, { scope, resource: server });
   if (da.transport) {
     err(`offline — could not reach ${server} (${da.error})`);
     return 1;
