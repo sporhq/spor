@@ -13,7 +13,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const isWin = process.platform === "win32";
@@ -55,6 +55,20 @@ function homeWithCaps() {
     }) + "\n"
   );
   return home;
+}
+
+// A scratch HOME (no ~/.claude manifest) and a harness-free PATH (only git, for
+// config load), so the publish's re-probe (issue-spor-capabilities-publish-
+// manual-no-spor-seed) yields a DETERMINISTIC set on any box: empty
+// harnesses/plugins/skills, with reachable_mcp seeded to [spor] from remote-mode
+// CONFIGURED-ness. Without pinning HOME/PATH the probe would read this box's real
+// harnesses + ~/.claude (a dev box with `claude` installed flips the assertion).
+function cleanProbeEnv() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-caps-cleanhome-"));
+  const pathDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-caps-path-"));
+  const git = (spawnSync("/bin/sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout || "").trim();
+  if (git) { try { fs.symlinkSync(git, path.join(pathDir, "git")); } catch { /* ignore */ } }
+  return { HOME: home, PATH: pathDir };
 }
 
 // Records every request; POST /v1/agents/{id}/capabilities echoes the collapsed caps.
@@ -101,19 +115,42 @@ test("publish (remote, no dispatch.agent): refuses with a `spor agent use` hint"
   }
 });
 
-test("publish (remote): POSTs the effective capabilities to /v1/agents/{id}/capabilities", { skip: isWin }, async () => {
+test("publish (remote): re-probes THIS box then POSTs the effective capabilities to /v1/agents/{id}/capabilities", { skip: isWin }, async () => {
   const home = homeWithCaps();
   const { srv, hits, base } = await capStub();
   try {
-    const r = await runAsync(["capabilities", "publish"], remoteEnv(home, base, { SPOR_DISPATCH_AGENT: "agent-anthony-laptop" }));
+    const r = await runAsync(["capabilities", "publish"], remoteEnv(home, base, { SPOR_DISPATCH_AGENT: "agent-anthony-laptop", ...cleanProbeEnv() }));
     assert.strictEqual(r.status, 0, r.stderr);
     assert.match(r.stdout, /published agent-anthony-laptop to the fleet scheduler/);
     const post = hits.find((h) => h.method === "POST" && h.url === "/v1/agents/agent-anthony-laptop/capabilities");
     assert.ok(post, "POSTed to the agent's capabilities endpoint");
-    // the body is the EFFECTIVE collapse (probed ∪ declared per axis), not the raw map
+    // The body is the EFFECTIVE collapse over a FRESH probe (not the stale fixture
+    // .probed): the harness-free PATH + clean HOME probe to empty harnesses/plugins/
+    // skills, the sticky `declared.skills` survives, and reachable_mcp is the
+    // deterministic [spor] seed remote mode always carries
+    // (issue-spor-capabilities-publish-manual-no-spor-seed).
     assert.deepStrictEqual(JSON.parse(post.body), {
-      harnesses: ["claude-code"], reachable_mcp: [], skills: ["writing"], plugins: ["spor"], deny: [],
+      harnesses: [], reachable_mcp: ["spor"], skills: ["writing"], plugins: [], deny: [],
     });
+  } finally {
+    srv.close();
+  }
+});
+
+test("publish (remote): seeds reachable_mcp:[spor] even when config carried no .probed (the manual/auto parity fix)", { skip: isWin }, async () => {
+  // The regression: a box whose ~/.spor/config.json has NO dispatch.capabilities
+  // (never ran session-start) used to publish a caps set MISSING the spor seed, so
+  // an `mcp:[spor]` profile failed to host-match it. The manual verb now re-probes
+  // with sporReachable, exactly like the session-start auto-publish.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-caps-noprobe-"));
+  const { srv, hits, base } = await capStub();
+  try {
+    const r = await runAsync(["capabilities", "publish"], remoteEnv(home, base, { SPOR_DISPATCH_AGENT: "agent-fresh-box", ...cleanProbeEnv() }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    const post = hits.find((h) => h.method === "POST" && h.url === "/v1/agents/agent-fresh-box/capabilities");
+    assert.ok(post, "POSTed to the agent's capabilities endpoint");
+    const body = JSON.parse(post.body);
+    assert.deepStrictEqual(body.reachable_mcp, ["spor"], "spor MCP seeded by the fresh re-probe");
   } finally {
     srv.close();
   }

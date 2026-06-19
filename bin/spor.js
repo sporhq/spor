@@ -3243,12 +3243,15 @@ function cmdCapabilities(cfg, args) {
 
 // cmdCapabilitiesPublish — push this box's EFFECTIVE capabilities to the team
 // server's fleet scheduler (POST /v1/agents/{id}/capabilities,
-// task-spor-remote-fleet-scheduler). The same effectiveCapabilities() collapse
-// `spor capabilities` and `spor dispatch` read locally is what we publish, so
-// the server's host-match agrees with the local one byte-for-byte. Remote-only,
-// keyed on this machine's dispatch.agent. Fail soft and loud — a missing agent,
-// undeployed surface, or unreachable server prints one clear line and exits
-// non-zero, never throws.
+// task-spor-remote-fleet-scheduler). The published body is the same
+// effectiveCapabilities() collapse `spor capabilities` and `spor dispatch` read
+// locally, but over a FRESH probe taken here (see below): this is the same path
+// the session-start auto-publish runs, so a manual publish and the auto-publish
+// agree — including the deterministic reachable_mcp:[spor] remote-mode seed,
+// which a stale config could otherwise omit (issue-spor-capabilities-publish-
+// manual-no-spor-seed). Remote-only, keyed on this machine's dispatch.agent.
+// Fail soft and loud — a missing agent, undeployed surface, or unreachable
+// server prints one clear line and exits non-zero, never throws.
 async function cmdCapabilitiesPublish(cfg, { json }) {
   if (!remote.isRemote(cfg)) {
     err(
@@ -3265,7 +3268,25 @@ async function cmdCapabilitiesPublish(cfg, { json }) {
     );
     return 1;
   }
-  const eff = sat.effectiveCapabilities(cfg.get("dispatch.capabilities", {}) || {});
+  // Re-probe THIS box before collapsing so the manual publish reflects current
+  // reality — crucially the deterministic reachable_mcp:[spor] seed
+  // (task-spor-mcp-reachability-deterministic-seed): we are remote-gated above,
+  // so the spor MCP is reachable by construction (sporReachable: true). Without
+  // this, a box whose .probed is empty/stale (no prior session-start) would
+  // publish a caps set MISSING the spor seed, and an `mcp:[spor]` profile would
+  // then fail to host-match it (issue-spor-capabilities-publish-manual-no-spor-
+  // seed). Mirrors the session-start auto-publish: probe with sporReachable,
+  // then merge the fresh probe over the in-memory config (loaded before the
+  // probe wrote) so the two publish paths agree byte-for-byte. The probe is
+  // best-effort — on failure we fall back to the in-memory config below.
+  const rawCap = cfg.get("dispatch.capabilities", {}) || {};
+  let probed = null;
+  try {
+    probed = u.probeCapabilities(cfg.userConfigHome(), { sporReachable: true });
+  } catch {
+    /* probe is best-effort; publish what the cascade already holds */
+  }
+  const eff = sat.effectiveCapabilities(probed ? { ...rawCap, probed } : rawCap);
   const r = await remote.post(cfg, `/v1/agents/${encodeURIComponent(agent)}/capabilities`, eff, { timeoutMs: 6000 });
   if (r.transport) {
     err(`could not reach the server: ${r.error}`);
