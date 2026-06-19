@@ -545,6 +545,133 @@ test("dispatch: no profile resolved => byte-identical (no profile line)", { skip
   assert.ok(!/profile:/.test(r.stdout), "no profile preview line when none resolves");
 });
 
+// --- substitution-free re-routing CONSUMER (task-spor-fleet-scheduler-autoroute-
+// dispatch) --- When THIS box can't satisfy the resolved profile, the remote-mode
+// refusal CONSUMES the fleet scheduler (GET /v1/profiles/{id}/hosts): it NAMES the
+// boxes that can run THIS exact profile (re-route there) or, when none can,
+// escalates to the owner — FORK B, never a substitute. Fail-soft: an unreachable
+// scheduler falls back to the generic hint and local mode stays byte-identical.
+const PROFILE_MD = (id, fields) =>
+  `---\nid: ${id}\ntype: profile\ntitle: ${id}\nsummary: A test profile.\n${fields}\ndate: 2026-06-18\n---\nBody.\n`;
+
+// A fake server that serves the profile node and a scriptable /hosts host-match.
+function fleetStub({ hosts, hostsStatus = 200 } = {}) {
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    hits.push({ method: req.method, url: req.url });
+    const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
+    const pm = req.url.match(/^\/v1\/nodes\/([^/?]+)/);
+    if (pm && req.method === "GET") {
+      const id = decodeURIComponent(pm[1]);
+      if (id === "profile-codex") return j(200, { id, raw: PROFILE_MD("profile-codex", "harness: codex") });
+      return j(404, { error: { code: "not_found" } });
+    }
+    const hm = req.url.match(/^\/v1\/profiles\/([^/?]+)\/hosts/);
+    if (hm && req.method === "GET") {
+      if (hostsStatus !== 200) return j(hostsStatus, { error: { code: "not_found", message: "x" } });
+      return j(200, hosts || { profile: decodeURIComponent(hm[1]), satisfiable: [], unsatisfiable: [], counts: {} });
+    }
+    return j(404, { error: { code: "not_found" } });
+  });
+  return new Promise((resolve) => srv.listen(0, "127.0.0.1", () => resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
+}
+const remoteCapEnv = (home, base, extra = {}) => ({
+  SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: "test-token", ...extra,
+});
+// Async runner — the in-process fake server can't answer the child's HTTP
+// request while spawnSync blocks the event loop, so the remote tests spawn
+// async (the same reason capabilities-publish.test.js does).
+function runAsyncDisp(args, env) {
+  return new Promise((resolve) => {
+    let out = "", errOut = "";
+    const c = spawn(process.execPath, [CLI, ...args], { env: bare(env), stdio: ["ignore", "pipe", "pipe"] });
+    c.stdout.on("data", (d) => (out += d));
+    c.stderr.on("data", (d) => (errOut += d));
+    c.on("close", (code) => resolve({ status: code, stdout: out, stderr: errOut }));
+  });
+}
+
+test("dispatch (remote, unsatisfiable): names the fleet hosts that satisfy the profile", { skip: process.platform === "win32" }, async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } }); // codex NOT here
+  const stub = recordingStub(home);
+  const mark = path.join(home, "launched.mark");
+  const { srv, hits, base } = await fleetStub({
+    hosts: {
+      profile: "profile-codex",
+      satisfiable: [
+        { agent: "agent-bob-laptop", owner: "person-bob", age_seconds: 120 },
+        { agent: "agent-carol-ci", owner: "person-carol", age_seconds: 4000 },
+      ],
+      unsatisfiable: [{ agent: "agent-mine", owner: "person-me", age_seconds: 5, reasons: ["harness 'codex' not available here"] }],
+      counts: { satisfiable: 2, unsatisfiable: 1 },
+    },
+  });
+  try {
+    const r = await runAsyncDisp(["dispatch", "do a thing here", "--dir", repo, "--profile", "profile-codex", "--no-brief"],
+      remoteCapEnv(home, base, { SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark }));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /can't satisfy profile profile-codex/);
+    // CONSUMES the scheduler: names the satisfiable hosts as re-route targets…
+    assert.match(r.stderr, /Re-route to a fleet host that satisfies profile-codex/);
+    assert.match(r.stderr, /agent-bob-laptop \(person-bob, 2m ago\)/);
+    assert.match(r.stderr, /agent-carol-ci \(person-carol, 1h ago\)/);
+    assert.match(r.stderr, /it runs THIS profile, never a substitute/);
+    // …and it actually hit the host-match endpoint, launched nothing.
+    assert.ok(hits.some((h) => h.method === "GET" && /^\/v1\/profiles\/profile-codex\/hosts/.test(h.url)), "called /hosts");
+    assert.ok(!fs.existsSync(mark), "claude was never launched");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch (remote, unsatisfiable, no host satisfies): escalates to the owner (FORK B)", { skip: process.platform === "win32" }, async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const { srv, base } = await fleetStub({
+    hosts: { profile: "profile-codex", satisfiable: [], unsatisfiable: [
+      { agent: "agent-a", owner: "person-x", age_seconds: 10, reasons: ["harness 'codex' not available here"] },
+      { agent: "agent-b", owner: "person-y", age_seconds: 20, reasons: ["harness 'codex' not available here"] },
+    ], counts: { satisfiable: 0, unsatisfiable: 2 } },
+  });
+  try {
+    const r = await runAsyncDisp(["dispatch", "do a thing here", "--dir", repo, "--profile", "profile-codex", "--no-brief"], remoteCapEnv(home, base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /NO fleet host currently satisfies profile-codex — escalate to the owner/);
+    assert.match(r.stderr, /2 box\(es\) checked; none satisfy it/);
+    assert.match(r.stderr, /never substituted/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch (remote, unsatisfiable): a scheduler outage falls back to the generic hint (fail-soft)", { skip: process.platform === "win32" }, async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  // The profile node resolves, but the /hosts route 404s (undeployed surface).
+  const { srv, base } = await fleetStub({ hostsStatus: 404 });
+  try {
+    const r = await runAsyncDisp(["dispatch", "do a thing here", "--dir", repo, "--profile", "profile-codex", "--no-brief"], remoteCapEnv(home, base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /can't satisfy profile profile-codex/);
+    // falls back to the original generic re-route hint
+    assert.match(r.stderr, /assignment is unchanged. Re-route to a machine that satisfies it/);
+    assert.doesNotMatch(r.stderr, /Re-route to a fleet host/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch (local, unsatisfiable): byte-identical — no scheduler consult", { skip: process.platform === "win32" }, () => {
+  const { home, nodes, repo } = fixture();
+  writeProfile(nodes, "profile-codex", "harness: codex");
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const r = run(["dispatch", "dec-x", "--dir", repo, "--profile", "profile-codex", "--no-brief"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /assignment is unchanged. Re-route to a machine that satisfies it/);
+  assert.doesNotMatch(r.stderr, /fleet host/); // local mode never consults the scheduler
+});
+
 // --- user-supplied prompt templates (task-spor-dispatch-user-prompt-templates)
 // `--template F` replaces the default prompt assembly with the file's contents,
 // substituting Handlebars-style {{placeholder}} tokens from the dispatch context.

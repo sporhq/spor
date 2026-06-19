@@ -2748,8 +2748,19 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   if (unsatisfiable) {
     err(`cannot dispatch ${nodeId || name} here: this machine can't satisfy profile ${profileCheck.id} (via ${profileCheck.source}).`);
     for (const r of profileCheck.verdict.reasons) err(`  - ${r}`);
-    err(`  the assignment is unchanged. Re-route to a machine that satisfies it, run 'spor capabilities' to`);
-    err(`  declare/repair what's missing here, or pass a different --profile.`);
+    // Substitution-free re-routing CONSUMER (task-spor-fleet-scheduler-autoroute-
+    // dispatch): instead of a dead-end "re-route somewhere" hint, consult the
+    // fleet scheduler (GET /v1/profiles/{id}/hosts, art-spor-remote-fleet-
+    // scheduler-shipped) and NAME the boxes that can satisfy THIS exact profile,
+    // or — when none can — say so and escalate to the owner (FORK B: never
+    // substitute a different profile). Remote-only and FAIL-SOFT: an
+    // unreachable/undeployed scheduler falls through to the generic hint, so the
+    // refusal still works offline and local mode stays byte-identical.
+    const routed = cfg.mode() === "remote" ? await reportFleetHosts(cfg, profileCheck.id) : false;
+    if (!routed) {
+      err(`  the assignment is unchanged. Re-route to a machine that satisfies it, run 'spor capabilities' to`);
+      err(`  declare/repair what's missing here, or pass a different --profile.`);
+    }
     return 1;
   }
 
@@ -2966,6 +2977,18 @@ function cmdCapabilities(cfg, args) {
   // must have run first. Fail soft and loud, never block.
   if (sub === "publish") return cmdCapabilitiesPublish(cfg, { json });
 
+  // hosts <profile-id> [--owner X] [--max-age D] — CONSUME the fleet scheduler:
+  // which boxes satisfy this profile (re-route targets) and which don't, and why
+  // (task-spor-fleet-scheduler-autoroute-dispatch). Remote-only.
+  if (sub === "hosts") {
+    const profileId = rest[1] && !rest[1].startsWith("-") ? rest[1] : null;
+    const flagVal = (name) => {
+      const i = rest.indexOf(name);
+      return i >= 0 && rest[i + 1] && !rest[i + 1].startsWith("-") ? rest[i + 1] : null;
+    };
+    return cmdCapabilitiesHosts(cfg, { profileId, owner: flagVal("--owner"), maxAge: flagVal("--max-age"), json });
+  }
+
   if (sub === "probe") {
     // Seed reachable_mcp:[spor] from CONFIGURED-ness when a Spor server/connector
     // is bound (remote mode) — the spor MCP is reachable by construction, no
@@ -3048,6 +3071,7 @@ function cmdCapabilities(cfg, args) {
 
   err(
     "usage: spor capabilities [list [--json]] | probe | publish | set <axis> <v...> | add <axis> <v...> | rm <axis> <v...>\n" +
+      "       spor capabilities hosts <profile-id> [--owner X] [--max-age D] [--json]\n" +
       "       spor capabilities allow-mcp <name...> | deny <profile-id...> | undeny <profile-id...> | clear\n" +
       `       axes: ${AXES.join(", ")}`
   );
@@ -3110,6 +3134,141 @@ async function cmdCapabilitiesPublish(cfg, { json }) {
   out(`  plugins:       ${(c.plugins || []).join(", ") || "(none)"}`);
   if ((c.deny || []).length) out(`  deny:          ${c.deny.join(", ")}`);
   out(r.json && r.json.changed === false ? "  (caps unchanged — refreshed last-published time)" : "  (caps updated)");
+  return 0;
+}
+
+// Compact relative age from age_seconds (the scheduler's freshness/last-contact
+// proxy) — "12s" / "3m" / "2h" / "5d". Second-precision, like the rest of Spor.
+function relAge(sec) {
+  if (sec == null || typeof sec !== "number" || !isFinite(sec)) return "?";
+  const s = Math.max(0, Math.round(sec));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  if (s < 86400) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86400)}d`;
+}
+
+// fleetHostsForProfile — the client CONSUMER of the remote fleet scheduler's
+// host-match (GET /v1/profiles/{id}/hosts, art-spor-remote-fleet-scheduler-shipped;
+// task-spor-fleet-scheduler-autoroute-dispatch). The server host-matches the
+// profile against every box's published capabilities with the SAME pure
+// satisfies() the client runs locally, so a re-route never substitutes a
+// different profile (dec-spor-machine-profile-satisfiability, FORK B). Returns
+// the parsed { profile, satisfiable, unsatisfiable, counts } on 200, or a
+// FAIL-SOFT shape that never throws: { error } (transport / 4xx-5xx) or
+// { absent:true } (404 — unknown profile or no scheduler surface deployed).
+// `owner` scopes to one person's boxes ('me'/'person-X'); `maxAge` ('30m'/'12h'/
+// '7d'/ms) demotes staler publishes to unsatisfiable.
+async function fleetHostsForProfile(cfg, profileId, { owner, maxAge } = {}) {
+  const qs = [];
+  if (owner) qs.push(`owner=${encodeURIComponent(owner)}`);
+  if (maxAge) qs.push(`max_age=${encodeURIComponent(maxAge)}`);
+  const q = qs.length ? `?${qs.join("&")}` : "";
+  const r = await remote.get(cfg, `/v1/profiles/${encodeURIComponent(profileId)}/hosts${q}`, { timeoutMs: 6000 });
+  if (r.transport) return { error: r.error };
+  if (r.status === 404) return { absent: true };
+  if (!r.ok) {
+    const code = r.json && r.json.error && r.json.error.code;
+    const msg = r.json && r.json.error && r.json.error.message;
+    return { error: `HTTP ${r.status}${code ? ` (${code})` : ""}${msg ? ` — ${msg}` : ""}` };
+  }
+  const j = r.json || {};
+  return {
+    profile: j.profile || profileId,
+    satisfiable: Array.isArray(j.satisfiable) ? j.satisfiable : [],
+    unsatisfiable: Array.isArray(j.unsatisfiable) ? j.unsatisfiable : [],
+    counts: j.counts || null,
+  };
+}
+
+// reportFleetHosts — the dispatch-refusal CONSUMER. On a FORK B refusal (this box
+// can't satisfy the resolved profile), turn the dead-end "re-route somewhere"
+// hint into an actionable one: NAME the boxes that satisfy THIS exact profile
+// (re-route there), or — when none can — say so and escalate to the owner.
+// Prints to stderr (it's part of the refusal). Returns true when it printed a
+// scheduler-derived verdict, false to let the caller fall back to the generic
+// hint (an unreachable / undeployed / unknown-profile scheduler — fail-soft, so
+// the refusal still works offline and local mode stays byte-identical).
+async function reportFleetHosts(cfg, profileId) {
+  let res;
+  try {
+    res = await fleetHostsForProfile(cfg, profileId);
+  } catch {
+    return false;
+  }
+  if (!res || res.absent) return false; // unknown profile / no surface — generic hint fits better
+  if (res.error) {
+    err(`  (fleet scheduler unavailable: ${res.error} — falling back to a generic re-route hint)`);
+    return false;
+  }
+  const ok = res.satisfiable || [];
+  if (ok.length) {
+    err(`  the assignment is unchanged. Re-route to a fleet host that satisfies ${res.profile} (freshest first):`);
+    for (const h of ok.slice(0, 8)) {
+      const meta = [h.owner, `${relAge(h.age_seconds)} ago`].filter(Boolean).join(", ");
+      err(`    - ${h.agent}${meta ? ` (${meta})` : ""}`);
+    }
+    if (ok.length > 8) err(`    … and ${ok.length - 8} more`);
+    err(`  dispatch from one of those boxes — it runs THIS profile, never a substitute.`);
+    return true;
+  }
+  // No host satisfies it — escalate (FORK B), don't downgrade.
+  const checked = (res.unsatisfiable || []).length;
+  err(`  NO fleet host currently satisfies ${res.profile} — escalate to the owner.`);
+  err(`  (${checked} box(es) checked; none satisfy it. The assignment is unchanged — never substituted.)`);
+  return true;
+}
+
+// cmdCapabilitiesHosts — `spor capabilities hosts <profile-id>`, the explicit
+// CONSUMER verb over the fleet scheduler host-match (the standalone twin of the
+// auto-reroute hint dispatch prints). Lists re-route targets (satisfiable,
+// freshest first) and the boxes that can't run it WITH the matcher's reasons.
+// Remote-only; fail-soft.
+async function cmdCapabilitiesHosts(cfg, { profileId, owner, maxAge, json }) {
+  if (!remote.isRemote(cfg)) {
+    err(
+      "spor capabilities hosts is remote-only — set a team server (SPOR_SERVER) first.\n" +
+        "In local mode there is no fleet to match against; capabilities are matched on THIS box at dispatch."
+    );
+    return 1;
+  }
+  if (!profileId) {
+    err("usage: spor capabilities hosts <profile-id> [--owner me|person-X] [--max-age 30m|12h|7d] [--json]");
+    return 1;
+  }
+  const res = await fleetHostsForProfile(cfg, profileId, { owner, maxAge });
+  if (res.error) {
+    err(`could not reach the fleet scheduler: ${res.error}`);
+    return 1;
+  }
+  if (res.absent) {
+    err(`no such profile '${profileId}', or this server has no fleet scheduler surface deployed.`);
+    return 1;
+  }
+  if (json) {
+    out(JSON.stringify(res, null, 2));
+    return 0;
+  }
+  const ok = res.satisfiable || [];
+  const no = res.unsatisfiable || [];
+  out(`profile ${res.profile} — ${ok.length} satisfiable / ${no.length} not (fleet: ${remote.base(cfg)})`);
+  if (ok.length) {
+    out("satisfiable (re-route targets, freshest first):");
+    for (const h of ok) {
+      const meta = [h.owner, `${relAge(h.age_seconds)} ago`].filter(Boolean).join(", ");
+      out(`  ✓ ${h.agent}${meta ? ` (${meta})` : ""}`);
+    }
+  } else {
+    out("satisfiable: (none — escalate to the owner; never substitute a different profile)");
+  }
+  if (no.length) {
+    out("unsatisfiable:");
+    for (const h of no) {
+      const meta = [h.owner, `${relAge(h.age_seconds)} ago`].filter(Boolean).join(", ");
+      out(`  ✗ ${h.agent}${meta ? ` (${meta})` : ""}`);
+      for (const reason of h.reasons || []) out(`      - ${reason}`);
+    }
+  }
   return 0;
 }
 
@@ -3464,7 +3623,7 @@ const COMMANDS = {
   },
   capabilities: {
     group: "Dispatch (Claude Code background agents)", parse: "raw", aliases: ["caps", "profiles"],
-    args: "[list [--json] | probe | publish | set <axis> <v...> | allow-mcp <m...> | deny <profile-id...> | clear]",
+    args: "[list [--json] | probe | publish | hosts <profile-id> | set <axis> <v...> | allow-mcp <m...> | deny <profile-id...> | clear]",
     summary: "this machine's dispatch capability map (profile satisfiability)",
     help:
       "Show or edit the per-machine capability map dispatch matches against an\n" +
@@ -3475,6 +3634,7 @@ const COMMANDS = {
       "  spor capabilities                  show effective capabilities\n" +
       "  spor capabilities probe            re-probe harnesses/plugins/skills now\n" +
       "  spor capabilities publish          push them to the team fleet scheduler (remote)\n" +
+      "  spor capabilities hosts <profile>  which fleet boxes satisfy a profile (remote)\n" +
       "  spor capabilities set <axis> <v…>  declare an axis (replaces)\n" +
       "  spor capabilities add|rm <axis> <v…>  adjust a declared axis\n" +
       "  spor capabilities allow-mcp <name…>   declare a reachable MCP server\n" +
@@ -3486,8 +3646,14 @@ const COMMANDS = {
       "machines. Run `spor agent use <agent-id>` once to set this box's agent first.\n" +
       "Once an agent is set, session-start auto-publishes each session (remote mode),\n" +
       "so manual publish is rarely needed; SPOR_CAPABILITIES_PUBLISH=0 disables it.\n\n" +
+      "hosts is the read side of that scheduler: it host-matches a profile against the\n" +
+      "fleet and lists the boxes that can run it (re-route targets) and those that\n" +
+      "can't, with reasons. `spor dispatch` also prints these automatically when THIS\n" +
+      "box can't satisfy a profile, so you know exactly where to re-route — or that\n" +
+      "none can and the owner must be escalated (FORK B: never a substitute).\n" +
+      "Scope with --owner me|person-X; demote stale publishes with --max-age 30m|12h|7d.\n\n" +
       `  axes: ${sat.CAP_AXES.join(", ")}`,
-    examples: ["spor capabilities", "spor capabilities allow-mcp spor", "spor capabilities publish"],
+    examples: ["spor capabilities", "spor capabilities allow-mcp spor", "spor capabilities publish", "spor capabilities hosts profile-docs-writer"],
     run: (cfg, args) => cmdCapabilities(cfg, args),
   },
 
