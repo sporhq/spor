@@ -1278,6 +1278,84 @@ test("dispatch --from-queue (remote): queue fetch excludes questions at the rank
   }
 });
 
+// --from-queue must HARD-SKIP a held task (dec-spor-dispatch-from-queue-skip-held):
+// the held-task self-limit damps its front and flags it suggest:triage (an open
+// task with a recorded non-resolving outcome, no resolver, no blocker — held on an
+// external gate). It stays demoted-but-dispatchable so a held p1/blocking item can
+// still top the page, but --from-queue dispatches an AGENT to DO work and a held
+// task awaits a triage decision, not re-work — auto-dispatching it re-enters the
+// churn the self-limit broke. The client filter drops it (reading the suggest the
+// ranker set) and advances to the next actionable item, exactly like the blocked
+// defense above. A server returns the held item top-ranked, a plain task below it.
+test("dispatch --from-queue (remote): hard-skips a held task (suggest:triage), advances to the next", { skip: isWin }, async () => {
+  const { home, repo } = fixture();
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      if (req.method === "GET" && req.url.startsWith("/v1/queue")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ items: [
+          { id: "task-held", type: "task", project: "demo", repo: "demo", title: "A held task nothing resolves", suggest: "triage" },
+          { id: "task-do", type: "task", project: "demo", repo: "demo", title: "The actionable task", suggest: "do" },
+        ] }));
+        return;
+      }
+      if (req.method === "GET" && /^\/v1\/nodes\/[^/]+$/.test(req.url)) {
+        const id = decodeURIComponent(req.url.split("/").pop());
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ raw: `---\nid: ${id}\ntype: task\nrepo: demo\ntitle: The actionable task\nsummary: A demo task.\ndate: 2026-06-01\n---\nbody\n` }));
+        return;
+      }
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end("{}");
+    });
+  });
+  await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  try {
+    run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+    const r = await runAsync(["dispatch", "--from-queue", "--no-brief", "--print"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /--name task-do/);
+    assert.doesNotMatch(r.stdout, /task-held/);
+  } finally {
+    srv.close();
+  }
+});
+
+// When every candidate is held, --from-queue picks nothing and exits 1 ("queue
+// empty") — the held task stays visible in `spor next` for a human to triage, but
+// AUTOMATIC dispatch never re-picks it (same shape as the blocked/question drops).
+test("dispatch --from-queue (remote): a held-only queue dispatches nothing (exits 1)", { skip: isWin }, async () => {
+  const { home, repo } = fixture();
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      if (req.method === "GET" && req.url.startsWith("/v1/queue")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ items: [
+          { id: "task-held", type: "task", project: "demo", repo: "demo", title: "The only item, and it is held", suggest: "triage" },
+        ] }));
+        return;
+      }
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end("{}");
+    });
+  });
+  await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  try {
+    run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+    const r = await runAsync(["dispatch", "--from-queue", "--no-brief", "--print"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /queue empty/);
+  } finally {
+    srv.close();
+  }
+});
+
 test("dispatch <node-id> (local): no lease, no claim line — byte-identical", { skip: isWin }, async () => {
   // Local mode has no pool/contention; the auto-claim is a no-op and emits no
   // claim line, keeping local node dispatch output unchanged.

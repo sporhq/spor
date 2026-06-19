@@ -2966,6 +2966,22 @@ async function topQueueItem(cfg, slug) {
   // question defense above.
   items = items.filter((it) => it.suggest !== "blocked" && !(Array.isArray(it.blocked_by) && it.blocked_by.length));
   if (!items.length) return null;
+  // Held-task hard skip (dec-spor-dispatch-from-queue-skip-held, the held-task
+  // self-limit task-spor-queue-front-loop-self-limit-on-held-tasks): the ranker
+  // damps a held task's front to 0 and flags it `suggest:triage` — an OPEN task
+  // carrying a non-resolving outcome with no resolver and no live blocker, i.e.
+  // held on an external gate with nothing to resolve. The damp sinks it below
+  // actionable work but leaves it dispatchable, so a held task still top-ranked
+  // by p1/blocking/heat could be auto-re-picked here — and --from-queue dispatches
+  // an AGENT to DO work, while a held task awaits a TRIAGE decision (resolve / gate
+  // with blocked-by / set wake / abandon), not re-work: dispatching it just writes
+  // another non-resolving outcome and re-enters the churn the self-limit broke.
+  // Skip it, mirroring the blocked filter above. Unlike blocked items it is NOT
+  // hidden from `spor next` (the self-limit shows it, demoted, for human triage),
+  // and an explicit `spor dispatch --node <id>` still sends it — only AUTOMATIC
+  // selection skips it, so a held p1 stays deliberately dispatchable.
+  items = items.filter((it) => it.suggest !== "triage");
+  if (!items.length) return null;
   // Skip items already in flight on this machine; advance to the first free one.
   const { items: free, hidden } = annotateInFlight(items, dispatchedAgents(), true);
   if (hidden && free.length) {
