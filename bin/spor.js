@@ -2945,6 +2945,14 @@ function cmdCapabilities(cfg, args) {
 
   if (sub === "list" || sub === "show") return printList();
 
+  // publish — PUSH this box's effective capabilities to the team server so the
+  // remote fleet scheduler (task-spor-remote-fleet-scheduler) can host-match an
+  // assigned profile against them: the remote twin of the LOCAL match `spor
+  // dispatch` runs. Remote-only (a fleet needs a server); keyed on this
+  // machine's dispatch.agent (the per-machine identity), so `spor agent use`
+  // must have run first. Fail soft and loud, never block.
+  if (sub === "publish") return cmdCapabilitiesPublish(cfg, { json });
+
   if (sub === "probe") {
     // Seed reachable_mcp:[spor] from CONFIGURED-ness when a Spor server/connector
     // is bound (remote mode) — the spor MCP is reachable by construction, no
@@ -3026,11 +3034,70 @@ function cmdCapabilities(cfg, args) {
   }
 
   err(
-    "usage: spor capabilities [list [--json]] | probe | set <axis> <v...> | add <axis> <v...> | rm <axis> <v...>\n" +
+    "usage: spor capabilities [list [--json]] | probe | publish | set <axis> <v...> | add <axis> <v...> | rm <axis> <v...>\n" +
       "       spor capabilities allow-mcp <name...> | deny <profile-id...> | undeny <profile-id...> | clear\n" +
       `       axes: ${AXES.join(", ")}`
   );
   return 1;
+}
+
+// cmdCapabilitiesPublish — push this box's EFFECTIVE capabilities to the team
+// server's fleet scheduler (POST /v1/agents/{id}/capabilities,
+// task-spor-remote-fleet-scheduler). The same effectiveCapabilities() collapse
+// `spor capabilities` and `spor dispatch` read locally is what we publish, so
+// the server's host-match agrees with the local one byte-for-byte. Remote-only,
+// keyed on this machine's dispatch.agent. Fail soft and loud — a missing agent,
+// undeployed surface, or unreachable server prints one clear line and exits
+// non-zero, never throws.
+async function cmdCapabilitiesPublish(cfg, { json }) {
+  if (!remote.isRemote(cfg)) {
+    err(
+      "spor capabilities publish is remote-only — set a team server (SPOR_SERVER) first.\n" +
+        "In local mode there is no fleet to publish to; capabilities are matched on THIS box at dispatch."
+    );
+    return 1;
+  }
+  const agent = dispatchAgentId(cfg);
+  if (!agent) {
+    err(
+      "no dispatch agent configured for this machine — run `spor agent use <agent-id>` first.\n" +
+        "The fleet scheduler keys published capabilities on this box's agent id (dispatch.agent)."
+    );
+    return 1;
+  }
+  const eff = sat.effectiveCapabilities(cfg.get("dispatch.capabilities", {}) || {});
+  const r = await remote.post(cfg, `/v1/agents/${encodeURIComponent(agent)}/capabilities`, eff, { timeoutMs: 6000 });
+  if (r.transport) {
+    err(`could not reach the server: ${r.error}`);
+    return 1;
+  }
+  if (r.status === 404) {
+    err(`publish refused (404): no such agent '${agent}', or this server has no capability surface deployed.`);
+    return 1;
+  }
+  if (r.status === 403) {
+    err(`publish forbidden (403): you must OWN '${agent}' to publish its capabilities (the owned-by edge).`);
+    return 1;
+  }
+  if (!r.ok) {
+    const code = r.json && r.json.error && r.json.error.code;
+    const msg = r.json && r.json.error && r.json.error.message;
+    err(`publish failed: HTTP ${r.status}${code ? ` (${code})` : ""}${msg ? ` — ${msg}` : ""}`);
+    return 1;
+  }
+  if (json) {
+    out(JSON.stringify(r.json, null, 2));
+    return 0;
+  }
+  const c = (r.json && r.json.capabilities) || {};
+  out(`published ${agent} to the fleet scheduler (${remote.base(cfg)})`);
+  out(`  harnesses:     ${(c.harnesses || []).join(", ") || "(none)"}`);
+  out(`  reachable_mcp: ${(c.reachable_mcp || []).join(", ") || "(none)"}`);
+  out(`  skills:        ${(c.skills || []).length}`);
+  out(`  plugins:       ${(c.plugins || []).join(", ") || "(none)"}`);
+  if ((c.deny || []).length) out(`  deny:          ${c.deny.join(", ")}`);
+  out(r.json && r.json.changed === false ? "  (caps unchanged — refreshed last-published time)" : "  (caps updated)");
+  return 0;
 }
 
 function version() {
@@ -3384,7 +3451,7 @@ const COMMANDS = {
   },
   capabilities: {
     group: "Dispatch (Claude Code background agents)", parse: "raw", aliases: ["caps", "profiles"],
-    args: "[list [--json] | probe | set <axis> <v...> | allow-mcp <m...> | deny <profile-id...> | clear]",
+    args: "[list [--json] | probe | publish | set <axis> <v...> | allow-mcp <m...> | deny <profile-id...> | clear]",
     summary: "this machine's dispatch capability map (profile satisfiability)",
     help:
       "Show or edit the per-machine capability map dispatch matches against an\n" +
@@ -3394,13 +3461,18 @@ const COMMANDS = {
       "machine-local config.json, never a committed .spor.json.\n\n" +
       "  spor capabilities                  show effective capabilities\n" +
       "  spor capabilities probe            re-probe harnesses/plugins/skills now\n" +
+      "  spor capabilities publish          push them to the team fleet scheduler (remote)\n" +
       "  spor capabilities set <axis> <v…>  declare an axis (replaces)\n" +
       "  spor capabilities add|rm <axis> <v…>  adjust a declared axis\n" +
       "  spor capabilities allow-mcp <name…>   declare a reachable MCP server\n" +
       "  spor capabilities deny|undeny <profile-id…>  policy opt-out of a profile\n" +
       "  spor capabilities clear            reset declarations + probe cache\n\n" +
+      "publish is the remote twin: it sends this box's effective capabilities to the\n" +
+      "server (keyed on dispatch.agent) so the fleet scheduler can route an assigned\n" +
+      "profile to a box that can satisfy it — substitution-free re-routing across\n" +
+      "machines. Run `spor agent use <agent-id>` once to set this box's agent first.\n\n" +
       `  axes: ${sat.CAP_AXES.join(", ")}`,
-    examples: ["spor capabilities", "spor capabilities allow-mcp spor", "spor capabilities deny profile-prod-deploy"],
+    examples: ["spor capabilities", "spor capabilities allow-mcp spor", "spor capabilities publish"],
     run: (cfg, args) => cmdCapabilities(cfg, args),
   },
 
