@@ -29,6 +29,7 @@ const ROOT = path.resolve(__dirname, "..");
 const { loadConfig } = require(path.join(ROOT, "lib", "config.js"));
 const remote = require(path.join(ROOT, "lib", "remote.js"));
 const u = require(path.join(ROOT, "scripts", "engines", "util.js"));
+const sat = require(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
 
 // The CLI surface is a single declarative table (COMMANDS, defined below): it is
 // the one source of truth for dispatch, flag parsing (Node's built-in
@@ -2051,6 +2052,71 @@ async function resolveNode(cfg, id) {
   return { id, raw, repo: fmField(raw, "repo") || fmField(raw, "project"), title: fmField(raw, "title") || "" };
 }
 
+// Resolve the profile THIS dispatch would run UNDER and check whether this
+// machine can satisfy it (dec-spor-machine-profile-satisfiability, FORK B).
+// Precedence (cascade, explicit wins): --profile flag > the dispatched node's
+// assigned->agent edge `profile:` attribute > that agent's default uses-profile.
+// Returns null when NO profile resolves (no assignment, no profile nodes yet) —
+// the common case, leaving dispatch byte-identical. Otherwise
+// { id, source, found, verdict }: an explicitly-named --profile that can't be
+// loaded sets found:false (a hard error the caller reports); an INFERRED profile
+// that can't be loaded returns null (fail-open — never block on a dangling edge).
+async function resolveDispatchProfile(cfg, { profileFlag, nodeRaw, identityAgent }) {
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const parse = (raw, f) => {
+    try {
+      return graphLib.parseFrontmatter(raw, f);
+    } catch {
+      return null;
+    }
+  };
+  let id = profileFlag || null;
+  let source = profileFlag ? "--profile" : null;
+  const explicit = !!profileFlag;
+
+  if (!id) {
+    // The ASSIGNED agent comes from the dispatched node's `assigned -> agent`
+    // edge — NOT from dispatch.agent (which only ATTRIBUTES the writes). When
+    // several agents are assigned, prefer the edge to the dispatching identity.
+    let assignedAgent = null;
+    const n = nodeRaw ? parse(nodeRaw, "node.md") : null;
+    if (n) {
+      const assigned = (n.edges || []).filter(
+        (e) => e && e.type === "assigned" && typeof e.to === "string" && isAgentId(e.to)
+      );
+      const edge = (identityAgent && assigned.find((e) => e.to === identityAgent)) || assigned[0] || null;
+      if (edge) {
+        assignedAgent = edge.to;
+        // 1. the per-assignment profile override (the edge `profile:` attribute).
+        if (edge.profile) {
+          id = edge.profile;
+          source = `assigned → ${edge.to}`;
+        }
+      }
+    }
+    // 2. else the assigned agent's DEFAULT profile (its uses-profile edge). Only
+    // fetched when the node is genuinely assigned to an agent — never an
+    // unconditional lookup on the common (unassigned / free-text) path.
+    if (!id && assignedAgent) {
+      const an = await resolveNode(cfg, assignedAgent);
+      const a = an && an.raw ? parse(an.raw, "agent.md") : null;
+      const up = a && (a.edges || []).find((e) => e && e.type === "uses-profile" && typeof e.to === "string");
+      if (up) {
+        id = up.to;
+        source = `${assignedAgent} default`;
+      }
+    }
+  }
+
+  if (!id) return null;
+
+  const pnode = await resolveNode(cfg, id);
+  if (!pnode || !pnode.raw) return explicit ? { id, source, found: false, verdict: null } : null;
+  const profile = parse(pnode.raw, "profile.md") || { id };
+  const machine = sat.effectiveCapabilities(cfg.get("dispatch.capabilities", {}) || {});
+  return { id, source, found: true, verdict: sat.satisfies(machine, profile) };
+}
+
 // Compile a briefing: a node id -> its neighborhood; free text -> a digest.
 // Mode-aware, reusing the primitives the /spor:brief skill drives. Default is
 // the compact digest; `full` emits the whole neighborhood. "" = graph had
@@ -2154,18 +2220,28 @@ async function topQueueItem(cfg, slug) {
 // phantom (issue-spor-dispatch-bg-ignores-forced-session-id). Dispatch instead
 // captures the real session post-launch and binds it via renewDispatch (and the
 // bg agent's own post-tool heartbeat renews the same-session lease thereafter).
+// A per-invocation `dispatch` nonce tags the claim so the server can distinguish
+// a SECOND concurrent dispatch of the same node BY THE SAME PERSON from this
+// person's own idempotent renew (inc-spor-dispatch-duplicate-task-2026-06-18):
+// the lease holder is the person, so without the nonce a same-person re-claim
+// just renews and a duplicate agent launches. With it, a live lease bearing a
+// different nonce is 409 — closing the same-person/cross-machine duplicate the
+// person-scoped lease and the same-machine guard miss.
+//
 // Returns {ok} on success/idempotent-renew, {conflict, message} when the node is
 // already held (the concurrent-dispatch case this guards), or {error} for any
 // other failure (fail-open: the caller warns and dispatches anyway).
-async function claimDispatch(cfg, nodeId, session) {
-  const body = session ? { session } : {};
+async function claimDispatch(cfg, nodeId, session, dispatch) {
+  const body = {};
+  if (session) body.session = session;
+  if (dispatch) body.dispatch = dispatch;
   const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}/claim`, body, { timeoutMs: 6000 });
   if (r.ok) return { ok: true, lease: r.json && r.json.lease };
-  // 409 = the node can't be claimed right now — almost always a live lease held
-  // by ANOTHER person (the concurrent-dispatch conflict this feature exists to
-  // catch), occasionally a closed/terminal node. Either way don't launch a
-  // duplicate: surface the server's message (it names holder + expiry for the
-  // lease case) and let the caller abort.
+  // 409 = the node can't be claimed right now — a live lease held by ANOTHER
+  // person, ANOTHER concurrent dispatch of ours (the dispatch-nonce conflict),
+  // or occasionally a closed/terminal node. Either way don't launch a duplicate:
+  // surface the server's message (it names holder + expiry for the lease case)
+  // and let the caller abort.
   if (r.status === 409) {
     const e = (r.json && r.json.error) || {};
     return { ok: false, conflict: true, code: e.code || "conflict", message: e.message || "already claimed" };
@@ -2408,6 +2484,8 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   let nodeId = values.node || null;
   let targetSlug = values.slug || null;
   let name = values.name || null;
+  const profileFlag = values.profile || null;
+  let dispatchNodeRaw = null; // the dispatched node's markdown — read for its assigned->agent profile
 
   // Positional task text: parseArgs already split flags from positionals.
   let taskText = pos.join(" ").trim();
@@ -2456,6 +2534,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
       err(`no such node: ${nodeId}`);
       return 1;
     }
+    dispatchNodeRaw = node.raw || null;
     targetSlug = targetSlug || node.repo || null;
     nodeTitle = node.title || "";
     if (!noBrief) brief = await compileBriefing(cfg, { nodeId, full, project: targetSlug });
@@ -2483,13 +2562,32 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     err(`target dir does not exist: ${res.dir}`);
     return 1;
   }
+  // Session project (issue-spor-dispatch-propagate-session-project-to-questions).
+  // The launcher env never reaches a `claude --bg` agent (it self-allocates a
+  // spare worker; dec-spor-session-identity-active-record), and the agent token
+  // carries only {agent, session} — NOT the project. So the only channel the
+  // session project can ride to the bg agent is the prompt itself: state it, and
+  // tell the agent to pass it as ask_question's `project` param when a question
+  // has no clear `mentions:`. The server gives that explicit project precedence
+  // over its mentions/neighborhood derivation, closing the residual mention-less,
+  // no-match case that otherwise mis-stamps the question into the asker's home
+  // project. res.slug is the project this dispatch resolved into (always set —
+  // resolveDir falls back to the cwd slug). Omitted from a --template prompt,
+  // which exposes the same value as {{slug}}/{{project}} and takes over entirely.
+  const sessionNote = res.slug
+    ? `> **Spor session project:** \`${res.slug}\`. If you file a question with ` +
+      `\`ask_question\` (or \`POST /v1/questions\`) that has no clear \`mentions:\`, pass ` +
+      `\`project: "${res.slug}"\` so it is stamped to this project rather than ` +
+      `defaulting to the asker's home project.\n\n`
+    : "";
   const defaultPrompt = brief
-    ? `# Spor briefing (compiled for this task — your standing context)\n\n${brief}\n\n---\n\n# Task\n\n${instruction}\n`
-    : instruction;
+    ? `${sessionNote}# Spor briefing (compiled for this task — your standing context)\n\n${brief}\n\n---\n\n# Task\n\n${instruction}\n`
+    : `${sessionNote}${instruction}`;
 
-  // With no template the launched prompt is byte-identical to before. A template
-  // takes over entirely: it decides where the compiled brief, the task, and the
-  // node metadata land (or wraps the whole default via {{default}}).
+  // With no template the launched prompt adds only the session-project note above
+  // (issue-spor-dispatch-propagate-session-project-to-questions). A template takes
+  // over entirely: it decides where the compiled brief, the task, and the node
+  // metadata land (or wraps the whole default via {{default}}).
   let prompt = defaultPrompt;
   if (template != null) {
     const r = renderTemplate(template, {
@@ -2566,6 +2664,22 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     err(`note: --as ${asAgent} ignored in local mode — agent-on-behalf-of attribution is remote-only`);
   }
 
+  // Profile satisfiability (dec-spor-machine-profile-satisfiability, FORK B).
+  // Resolve the profile this dispatch runs under (--profile > the node's
+  // assigned->agent profile attr > the agent's default) and decide whether THIS
+  // machine can launch it. The verdict feeds the --print preview below and a
+  // hard refusal before any side effect in the real run. No profile resolved =>
+  // byte-identical to before (the common case until profiles are in use).
+  const profileCheck = await resolveDispatchProfile(cfg, { profileFlag, nodeRaw: dispatchNodeRaw, identityAgent });
+  if (profileCheck && profileCheck.found === false) {
+    // Explicit --profile we couldn't load (absent locally, or unfetchable
+    // remotely). Refuse rather than launch under an unverifiable profile.
+    err(`could not load profile ${profileCheck.id} (from ${profileCheck.source}).`);
+    err(`  check the id with 'spor get ${profileCheck.id}', or drop --profile.`);
+    return 1;
+  }
+  const unsatisfiable = !!(profileCheck && profileCheck.verdict && !profileCheck.verdict.ok);
+
   const claudeBin = claudeCmd();
   const claudeArgs = ["--bg"];
   if (name) claudeArgs.push("--name", name);
@@ -2597,6 +2711,14 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     } else if (cfg.mode() === "remote") {
       out(`agent:  (none configured — 'spor agent use agent-<machine>' or --as to attribute as agent-on-behalf-of; dispatching person-scoped)`);
     }
+    // Profile satisfiability preview (shown only when a profile resolves, so a
+    // profile-free --print stays byte-identical). A real dispatch refuses when
+    // UNSATISFIABLE, leaving the assignment intact.
+    if (profileCheck && profileCheck.verdict) {
+      const v = profileCheck.verdict;
+      out(`profile: ${profileCheck.id} (via ${profileCheck.source}) — ${v.ok ? "satisfiable here" : "UNSATISFIABLE here; real dispatch would refuse"}`);
+      for (const r of v.reasons) out(`  - ${r}`);
+    }
     // Same-machine guard preview (node mode, any mode): a real dispatch would
     // refuse if an agent with this name is already in flight here. Shown only on a
     // hit, so a clean node --print stays byte-identical to before.
@@ -2615,6 +2737,20 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     out(`run:    ${claudeBin} ${claudeArgs.map(shellQuote).join(" ")} <prompt>`);
     out(`\n--- prompt ---\n${prompt}`);
     return 0;
+  }
+
+  // Refuse BEFORE any side effect if this machine can't satisfy the resolved
+  // profile (dec-spor-machine-profile-satisfiability, FORK B): fail soft and
+  // loud, leave the task assigned and its lease/queue state untouched, NEVER
+  // substitute a different profile. The human/routine chose THIS profile; a box
+  // that can't honour it re-routes, it doesn't silently downgrade. No --force
+  // bypass — that would be the silent substitution this rule forbids.
+  if (unsatisfiable) {
+    err(`cannot dispatch ${nodeId || name} here: this machine can't satisfy profile ${profileCheck.id} (via ${profileCheck.source}).`);
+    for (const r of profileCheck.verdict.reasons) err(`  - ${r}`);
+    err(`  the assignment is unchanged. Re-route to a machine that satisfies it, run 'spor capabilities' to`);
+    err(`  declare/repair what's missing here, or pass a different --profile.`);
+    return 1;
   }
 
   // Refuse a same-machine duplicate BEFORE any side effect or claim
@@ -2688,11 +2824,16 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // isn't known until after launch, so we bind it to the lease via renewDispatch
   // below; until then any of this person's sessions may renew it.
   if (nodeId && !backfill && !noClaim && cfg.mode() === "remote") {
-    const c = await claimDispatch(cfg, nodeId);
+    // Tag this claim with a per-invocation dispatch nonce so the server refuses a
+    // SECOND concurrent dispatch of the same node — even by this same person, on
+    // any machine (inc-spor-dispatch-duplicate-task-2026-06-18). --force opts out
+    // (omit the nonce) so a deliberate re-dispatch renews instead of conflicting.
+    const dispatchNonce = force ? null : crypto.randomUUID();
+    const c = await claimDispatch(cfg, nodeId, null, dispatchNonce);
     if (c.conflict) {
       err(`${nodeId} is already claimed — ${c.message}`);
-      err(`  not dispatching a duplicate. Re-run with --no-claim to dispatch anyway (no lease),`);
-      err(`  or pick another task with 'spor next'.`);
+      err(`  not dispatching a duplicate. Re-run with --force to dispatch anyway (keeps the lease),`);
+      err(`  --no-claim to dispatch with no lease, or pick another task with 'spor next'.`);
       return 1;
     }
     if (c.ok) out(`claimed ${nodeId} (lease established; the agent's writes will renew it)`);
@@ -2782,6 +2923,194 @@ function cmdRepos(cfg, args) {
   }
   err("usage: spor repos [list] | spor repos add <slug> <path> | spor repos rm <slug>");
   return 1;
+}
+
+// --- spor capabilities: this machine's dispatch capability map ------------
+// The machine half of profile satisfiability (dec-spor-machine-profile-
+// satisfiability): which harnesses/MCP/skills/plugins THIS box can run, matched
+// against a profile's runtime fields at dispatch. Probe-populated +
+// config-overridable, in the SAME machine-local config.json as dispatch.repos
+// (never a committable .spor.json). Reads resolve through the cascade
+// (dispatch.capabilities); writes target the personal user config home. The
+// probe owns `.probed` (refreshed each session); these verbs own `.declared`
+// (sticky) and `.deny` (policy) — declared AUGMENTS probed, deny overrides both.
+function cmdCapabilities(cfg, args) {
+  const home = cfg.userConfigHome();
+  const json = args.includes("--json");
+  const rest = args.filter((a) => a !== "--json");
+  const sub = rest[0] || "list";
+  const AXES = sat.CAP_AXES; // harnesses, reachable_mcp, skills, plugins
+
+  const printList = () => {
+    const cap = cfg.get("dispatch.capabilities", {}) || {};
+    const eff = sat.effectiveCapabilities(cap);
+    if (json) {
+      out(JSON.stringify(eff, null, 2));
+      return 0;
+    }
+    out(`harnesses:     ${eff.harnesses.join(", ") || "(none — no known harness binary on PATH; spor capabilities probe)"}`);
+    out(`reachable_mcp: ${eff.reachable_mcp.join(", ") || "(none declared — spor capabilities allow-mcp <name>)"}`);
+    out(`skills:        ${eff.skills.length ? eff.skills.join(", ") : "(none)"}`);
+    out(`plugins:       ${eff.plugins.join(", ") || "(none)"}`);
+    out(`deny:          ${eff.deny.length ? eff.deny.join(", ") : "(none)"}`);
+    return 0;
+  };
+
+  if (sub === "list" || sub === "show") return printList();
+
+  // publish — PUSH this box's effective capabilities to the team server so the
+  // remote fleet scheduler (task-spor-remote-fleet-scheduler) can host-match an
+  // assigned profile against them: the remote twin of the LOCAL match `spor
+  // dispatch` runs. Remote-only (a fleet needs a server); keyed on this
+  // machine's dispatch.agent (the per-machine identity), so `spor agent use`
+  // must have run first. Fail soft and loud, never block.
+  if (sub === "publish") return cmdCapabilitiesPublish(cfg, { json });
+
+  if (sub === "probe") {
+    // Seed reachable_mcp:[spor] from CONFIGURED-ness when a Spor server/connector
+    // is bound (remote mode) — the spor MCP is reachable by construction, no
+    // network ping (task-spor-mcp-reachability-deterministic-seed).
+    const probed = u.probeCapabilities(home, { sporReachable: !!cfg.get("server") });
+    out(`probed harnesses: ${probed.harnesses.join(", ") || "(none on PATH)"}`);
+    out(`probed plugins:   ${probed.plugins.join(", ") || "(none)"}`);
+    const sk = probed.skills.filter((s) => !s.includes(":")); // bare names, compact
+    out(`probed skills:    ${probed.skills.length} (${sk.slice(0, 10).join(", ")}${sk.length > 10 ? " …" : ""})`);
+    if (probed.reachable_mcp && probed.reachable_mcp.length) out(`probed reachable_mcp: ${probed.reachable_mcp.join(", ")} (Spor server configured)`);
+    out(`written to dispatch.capabilities.probed in ${path.join(home, "config.json")}`);
+    return 0;
+  }
+
+  // Mutate a sticky DECLARED axis: set replaces, add unions in, rm removes.
+  if (sub === "set" || sub === "add" || sub === "rm" || sub === "remove") {
+    const axis = rest[1];
+    const vals = rest.slice(2).filter(Boolean);
+    if (!AXES.includes(axis) || (sub !== "set" && !vals.length)) {
+      err(`usage: spor capabilities ${sub} <${AXES.join("|")}> <value...>`);
+      return 1;
+    }
+    u.editCapabilities(home, (cap) => {
+      if (cap.declared == null || typeof cap.declared !== "object" || Array.isArray(cap.declared)) cap.declared = {};
+      const cur = Array.isArray(cap.declared[axis]) ? cap.declared[axis] : [];
+      let next;
+      if (sub === "set") next = [...new Set(vals)];
+      else if (sub === "add") next = [...new Set([...cur, ...vals])];
+      else next = cur.filter((x) => !vals.includes(x));
+      if (next.length) cap.declared[axis] = next;
+      else delete cap.declared[axis];
+      return true; // always (re)write — reporting reads the result below
+    });
+    return printList();
+  }
+
+  // allow-mcp / disallow-mcp — sugar for declaring reachable MCP (the axis a
+  // probe can't decide). allow-mcp X == add reachable_mcp X.
+  if (sub === "allow-mcp" || sub === "disallow-mcp") {
+    const vals = rest.slice(1).filter(Boolean);
+    if (!vals.length) {
+      err(`usage: spor capabilities ${sub} <mcp-name...>`);
+      return 1;
+    }
+    return cmdCapabilities(cfg, [sub === "allow-mcp" ? "add" : "rm", "reachable_mcp", ...vals, ...(json ? ["--json"] : [])]);
+  }
+
+  // deny / undeny — a profile id this box must NOT run (policy opt-out), not a
+  // capability. Lives at top-level `deny`, overriding both probed and declared.
+  if (sub === "deny" || sub === "undeny" || sub === "allow") {
+    const vals = rest.slice(1).filter(Boolean);
+    if (!vals.length) {
+      err(`usage: spor capabilities ${sub} <profile-id...>`);
+      return 1;
+    }
+    u.editCapabilities(home, (cap) => {
+      const cur = Array.isArray(cap.deny) ? cap.deny : [];
+      const next = sub === "deny" ? [...new Set([...cur, ...vals])] : cur.filter((x) => !vals.includes(x));
+      if (next.length) cap.deny = next;
+      else delete cap.deny;
+      return true;
+    });
+    return printList();
+  }
+
+  if (sub === "clear" || sub === "reset") {
+    const wrote = u.editCapabilities(home, (cap) => {
+      let changed = false;
+      for (const k of ["probed", "declared", "deny", ...AXES]) {
+        if (k in cap) {
+          delete cap[k];
+          changed = true;
+        }
+      }
+      return changed;
+    });
+    out(wrote ? "capabilities cleared (declarations + probe cache reset)" : "nothing to clear");
+    return 0;
+  }
+
+  err(
+    "usage: spor capabilities [list [--json]] | probe | publish | set <axis> <v...> | add <axis> <v...> | rm <axis> <v...>\n" +
+      "       spor capabilities allow-mcp <name...> | deny <profile-id...> | undeny <profile-id...> | clear\n" +
+      `       axes: ${AXES.join(", ")}`
+  );
+  return 1;
+}
+
+// cmdCapabilitiesPublish — push this box's EFFECTIVE capabilities to the team
+// server's fleet scheduler (POST /v1/agents/{id}/capabilities,
+// task-spor-remote-fleet-scheduler). The same effectiveCapabilities() collapse
+// `spor capabilities` and `spor dispatch` read locally is what we publish, so
+// the server's host-match agrees with the local one byte-for-byte. Remote-only,
+// keyed on this machine's dispatch.agent. Fail soft and loud — a missing agent,
+// undeployed surface, or unreachable server prints one clear line and exits
+// non-zero, never throws.
+async function cmdCapabilitiesPublish(cfg, { json }) {
+  if (!remote.isRemote(cfg)) {
+    err(
+      "spor capabilities publish is remote-only — set a team server (SPOR_SERVER) first.\n" +
+        "In local mode there is no fleet to publish to; capabilities are matched on THIS box at dispatch."
+    );
+    return 1;
+  }
+  const agent = dispatchAgentId(cfg);
+  if (!agent) {
+    err(
+      "no dispatch agent configured for this machine — run `spor agent use <agent-id>` first.\n" +
+        "The fleet scheduler keys published capabilities on this box's agent id (dispatch.agent)."
+    );
+    return 1;
+  }
+  const eff = sat.effectiveCapabilities(cfg.get("dispatch.capabilities", {}) || {});
+  const r = await remote.post(cfg, `/v1/agents/${encodeURIComponent(agent)}/capabilities`, eff, { timeoutMs: 6000 });
+  if (r.transport) {
+    err(`could not reach the server: ${r.error}`);
+    return 1;
+  }
+  if (r.status === 404) {
+    err(`publish refused (404): no such agent '${agent}', or this server has no capability surface deployed.`);
+    return 1;
+  }
+  if (r.status === 403) {
+    err(`publish forbidden (403): you must OWN '${agent}' to publish its capabilities (the owned-by edge).`);
+    return 1;
+  }
+  if (!r.ok) {
+    const code = r.json && r.json.error && r.json.error.code;
+    const msg = r.json && r.json.error && r.json.error.message;
+    err(`publish failed: HTTP ${r.status}${code ? ` (${code})` : ""}${msg ? ` — ${msg}` : ""}`);
+    return 1;
+  }
+  if (json) {
+    out(JSON.stringify(r.json, null, 2));
+    return 0;
+  }
+  const c = (r.json && r.json.capabilities) || {};
+  out(`published ${agent} to the fleet scheduler (${remote.base(cfg)})`);
+  out(`  harnesses:     ${(c.harnesses || []).join(", ") || "(none)"}`);
+  out(`  reachable_mcp: ${(c.reachable_mcp || []).join(", ") || "(none)"}`);
+  out(`  skills:        ${(c.skills || []).length}`);
+  out(`  plugins:       ${(c.plugins || []).join(", ") || "(none)"}`);
+  if ((c.deny || []).length) out(`  deny:          ${c.deny.join(", ")}`);
+  out(r.json && r.json.changed === false ? "  (caps unchanged — refreshed last-published time)" : "  (caps updated)");
+  return 0;
 }
 
 function version() {
@@ -3111,6 +3440,7 @@ const COMMANDS = {
       model: { type: "string", value: "M", desc: "claude --model" },
       "permission-mode": { type: "string", value: "P", desc: "claude --permission-mode" },
       agent: { type: "string", value: "A", desc: "claude --agent (harness agent DEFINITION — NOT the Spor identity; see --as)" },
+      profile: { type: "string", value: "profile-id", desc: "profile to run under; checked against this machine's capabilities (overrides the assigned/default profile)" },
       name: { type: "string", value: "N", desc: "claude --name (session name)" },
       template: { type: "string", value: "F", desc: "prompt template file (placeholders above)" },
       full: { type: "boolean", desc: "full briefing instead of the digest" },
@@ -3131,6 +3461,34 @@ const COMMANDS = {
     help: "Show or edit the per-machine slug->repo-dir map dispatch uses to find a repo.\nThe map self-registers as you open sessions.\n\n  spor repos                 list the map\n  spor repos add <slug> <p>  map a slug to a path\n  spor repos rm <slug>       forget a mapping",
     examples: ["spor repos", "spor repos add api ~/code/api"],
     run: (cfg, args) => cmdRepos(cfg, args),
+  },
+  capabilities: {
+    group: "Dispatch (Claude Code background agents)", parse: "raw", aliases: ["caps", "profiles"],
+    args: "[list [--json] | probe | publish | set <axis> <v...> | allow-mcp <m...> | deny <profile-id...> | clear]",
+    summary: "this machine's dispatch capability map (profile satisfiability)",
+    help:
+      "Show or edit the per-machine capability map dispatch matches against an\n" +
+      "agent's profile (dec-spor-machine-profile-satisfiability). Harnesses, plugins,\n" +
+      "and skills self-probe each session; declare what a probe can't decide (reachable\n" +
+      "MCP, deny-flags). Declared augments probed; deny overrides both. Stored in the\n" +
+      "machine-local config.json, never a committed .spor.json.\n\n" +
+      "  spor capabilities                  show effective capabilities\n" +
+      "  spor capabilities probe            re-probe harnesses/plugins/skills now\n" +
+      "  spor capabilities publish          push them to the team fleet scheduler (remote)\n" +
+      "  spor capabilities set <axis> <v…>  declare an axis (replaces)\n" +
+      "  spor capabilities add|rm <axis> <v…>  adjust a declared axis\n" +
+      "  spor capabilities allow-mcp <name…>   declare a reachable MCP server\n" +
+      "  spor capabilities deny|undeny <profile-id…>  policy opt-out of a profile\n" +
+      "  spor capabilities clear            reset declarations + probe cache\n\n" +
+      "publish is the remote twin: it sends this box's effective capabilities to the\n" +
+      "server (keyed on dispatch.agent) so the fleet scheduler can route an assigned\n" +
+      "profile to a box that can satisfy it — substitution-free re-routing across\n" +
+      "machines. Run `spor agent use <agent-id>` once to set this box's agent first.\n" +
+      "Once an agent is set, session-start auto-publishes each session (remote mode),\n" +
+      "so manual publish is rarely needed; SPOR_CAPABILITIES_PUBLISH=0 disables it.\n\n" +
+      `  axes: ${sat.CAP_AXES.join(", ")}`,
+    examples: ["spor capabilities", "spor capabilities allow-mcp spor", "spor capabilities publish"],
+    run: (cfg, args) => cmdCapabilities(cfg, args),
   },
 
   // --- Other ---

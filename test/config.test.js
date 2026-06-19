@@ -2,6 +2,7 @@
 // (dec-spor-client-config-cascade). Layers, precedence, secret stripping,
 // dual-read, and the byte-identical guarantee (env-above-config) are the
 // contract.
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');

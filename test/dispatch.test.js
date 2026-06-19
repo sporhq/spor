@@ -3,6 +3,7 @@
 // briefing compilation, directory resolution (incl. cross-repo via the map),
 // the --print dry run, and a real (stubbed) spawn. Everything runs against a
 // throwaway graph home — never the live graph.
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
 const assert = require("node:assert");
 const { spawnSync, spawn } = require("node:child_process");
@@ -139,6 +140,34 @@ test("dispatch --no-brief: raw task prompt, no briefing block", () => {
   assert.strictEqual(r.status, 0);
   assert.match(r.stdout, /brief:  \(none/);
   assert.doesNotMatch(r.stdout, /# Spor briefing/);
+  // the session-project note rides even a no-brief prompt — it is identity
+  // context, not part of the compiled briefing.
+  assert.match(r.stdout, /Spor session project:/);
+});
+
+// --- session project on dispatch (issue-spor-dispatch-propagate-session-project-to-questions)
+// `claude --bg` drops the launcher env and the agent token carries only
+// {agent, session} (dec-spor-session-identity-active-record), so the session
+// project reaches a dispatched, mention-less ask_question only if dispatch
+// injects it into the prompt and the agent passes it as the `project` param.
+test("dispatch --print: injects the session-project note so a mention-less question can be stamped", () => {
+  const { home, repo } = fixture();
+  const r = run(["dispatch", "ship the widget", "--dir", repo, "--slug", "demo", "--no-brief", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /Spor session project:.*`demo`/, "states the session project");
+  assert.match(r.stdout, /pass `project: "demo"`/, "tells the agent to pass it to ask_question");
+});
+
+test("dispatch --print: the session-project note also rides a briefing prompt, above the briefing", () => {
+  const { home, repo } = fixture();
+  const r = run(["dispatch", "auth token rotation credentials", "--dir", repo, "--slug", "demo", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0);
+  const prompt = r.stdout.slice(r.stdout.indexOf("--- prompt ---"));
+  const noteAt = prompt.indexOf("Spor session project:");
+  const briefAt = prompt.indexOf("# Spor briefing");
+  assert.ok(noteAt >= 0, "note present");
+  assert.ok(briefAt >= 0, "briefing present");
+  assert.ok(noteAt < briefAt, "the note leads the standing context, above the compiled briefing");
 });
 
 // --- worktree-durable dispatch dir (issue-spor-dispatch-worktree-dir-stamping) --
@@ -396,6 +425,126 @@ test("dispatch spawns the claude binary with --bg in the target dir", { skip: pr
   assert.ok(argv.includes("--name") && argv.includes("dec-x"));
 });
 
+// --- profile satisfiability gate (dec-spor-machine-profile-satisfiability) ---
+// Dispatch resolves the profile it would run under (--profile > assigned->agent
+// edge attr > agent default) and refuses soft-and-loud when THIS machine can't
+// satisfy it, leaving the assignment intact and launching nothing.
+function writeProfile(nodes, id, fields) {
+  fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\ntype: profile\ntitle: ${id}\nsummary: A test profile.\n${fields}\ndate: 2026-06-18\n---\nA test profile.\n`);
+}
+function setCaps(home, capabilities) {
+  const file = path.join(home, "config.json");
+  let data = {};
+  try {
+    data = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    /* fresh */
+  }
+  data.dispatch = data.dispatch || {};
+  data.dispatch.capabilities = capabilities;
+  fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+}
+// A claude stub that records its launch into LAUNCH_MARK, so a test can assert a
+// refused dispatch NEVER launched.
+function recordingStub(home) {
+  const stub = path.join(home, "claude-rec.sh");
+  fs.writeFileSync(stub, `#!/bin/sh\necho launched > "$LAUNCH_MARK"\n`);
+  fs.chmodSync(stub, 0o755);
+  return stub;
+}
+
+test("dispatch --profile: refuses when this machine can't satisfy it; nothing launches, assignment untouched", { skip: process.platform === "win32" }, () => {
+  const { home, nodes, repo } = fixture();
+  writeProfile(nodes, "profile-codex", "harness: codex");
+  setCaps(home, { declared: { harnesses: ["claude-code"] } }); // codex NOT available here
+  const stub = recordingStub(home);
+  const mark = path.join(home, "launched.mark");
+  const r = run(["dispatch", "dec-x", "--dir", repo, "--profile", "profile-codex", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /can't satisfy profile profile-codex/);
+  assert.match(r.stderr, /harness 'codex' not available here \(codex not on PATH\)/);
+  assert.match(r.stderr, /assignment is unchanged/);
+  assert.ok(!fs.existsSync(mark), "claude was never launched");
+});
+
+test("dispatch --profile: a satisfiable profile dispatches normally", { skip: process.platform === "win32" }, () => {
+  const { home, nodes, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  writeProfile(nodes, "profile-cc", "harness: claude-code\nplugins: [spor]");
+  setCaps(home, { declared: { harnesses: ["claude-code"], plugins: ["spor"] } });
+  const stub = recordingStub(home);
+  const mark = path.join(home, "launched.mark");
+  const r = run(["dispatch", "dec-x", "--profile", "profile-cc", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
+  assert.strictEqual(r.status, 0);
+  assert.ok(fs.existsSync(mark), "claude launched for a satisfiable profile");
+});
+
+test("dispatch --profile: an unknown profile id is a hard error before any launch", { skip: process.platform === "win32" }, () => {
+  const { home, repo } = fixture();
+  const stub = recordingStub(home);
+  const mark = path.join(home, "launched.mark");
+  const r = run(["dispatch", "dec-x", "--dir", repo, "--profile", "profile-nope", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /could not load profile profile-nope/);
+  assert.ok(!fs.existsSync(mark));
+});
+
+test("dispatch <node>: the assigned->agent edge profile attr is honored (no --profile)", { skip: process.platform === "win32" }, () => {
+  const { home, nodes, repo } = fixture();
+  writeProfile(nodes, "profile-codex", "harness: codex");
+  // task-rotate is assigned to an agent UNDER profile-codex — unsatisfiable here.
+  fs.writeFileSync(
+    path.join(nodes, "task-rotate.md"),
+    `---\nid: task-rotate\ntype: task\nrepo: demo\ntitle: Rotate tokens\nsummary: Rotate pipeline auth tokens.\ndate: 2026-06-02\nedges:\n  - {type: assigned, to: agent-test, profile: profile-codex}\n---\nBody.\n`
+  );
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const stub = recordingStub(home);
+  const mark = path.join(home, "launched.mark");
+  const r = run(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /can't satisfy profile profile-codex \(via assigned → agent-test\)/);
+  assert.ok(!fs.existsSync(mark));
+});
+
+test("dispatch <node>: falls back to the assigned agent's default uses-profile", { skip: process.platform === "win32" }, () => {
+  const { home, nodes, repo } = fixture();
+  writeProfile(nodes, "profile-codex", "harness: codex");
+  // An agent whose DEFAULT profile (uses-profile) is unsatisfiable here.
+  fs.writeFileSync(
+    path.join(nodes, "agent-test.md"),
+    `---\nid: agent-test\ntype: agent\ntitle: Test agent\nsummary: A test agent.\ndate: 2026-06-18\nedges:\n  - {type: uses-profile, to: profile-codex}\n---\nAgent.\n`
+  );
+  // task-rotate assigned to agent-test with NO per-assignment profile override.
+  fs.writeFileSync(
+    path.join(nodes, "task-rotate.md"),
+    `---\nid: task-rotate\ntype: task\nrepo: demo\ntitle: Rotate tokens\nsummary: Rotate pipeline auth tokens.\ndate: 2026-06-02\nedges:\n  - {type: assigned, to: agent-test}\n---\nBody.\n`
+  );
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const stub = recordingStub(home);
+  const mark = path.join(home, "launched.mark");
+  const r = run(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /can't satisfy profile profile-codex \(via agent-test default\)/);
+  assert.ok(!fs.existsSync(mark));
+});
+
+test("dispatch --print --profile: previews the verdict and writes nothing", { skip: process.platform === "win32" }, () => {
+  const { home, nodes, repo } = fixture();
+  writeProfile(nodes, "profile-codex", "harness: codex");
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const r = run(["dispatch", "dec-x", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0); // --print never fails
+  assert.match(r.stdout, /profile: profile-codex \(via --profile\) — UNSATISFIABLE here/);
+  assert.match(r.stdout, /harness 'codex' not available here/);
+});
+
+test("dispatch: no profile resolved => byte-identical (no profile line)", { skip: process.platform === "win32" }, () => {
+  const { home, repo } = fixture();
+  const r = run(["dispatch", "dec-x", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0);
+  assert.ok(!/profile:/.test(r.stdout), "no profile preview line when none resolves");
+});
+
 // --- user-supplied prompt templates (task-spor-dispatch-user-prompt-templates)
 // `--template F` replaces the default prompt assembly with the file's contents,
 // substituting Handlebars-style {{placeholder}} tokens from the dispatch context.
@@ -439,7 +588,10 @@ test("dispatch --template: {{default}} embeds the built-in prompt; unknown place
   const r = run(["dispatch", "auth token rotation credentials", "--dir", repo, "--template", tpl, "--print"], { SPOR_HOME: home });
   assert.strictEqual(r.status, 0);
   const prompt = promptOf(r.stdout);
-  assert.match(prompt, /PRE\n# Spor briefing \(compiled/); // default prompt embedded verbatim
+  // default prompt embedded verbatim — now led by the session-project note
+  // (issue-spor-dispatch-propagate-session-project-to-questions), then the briefing.
+  assert.match(prompt, /PRE\n> \*\*Spor session project:\*\*/);
+  assert.match(prompt, /# Spor briefing \(compiled/);
   assert.match(prompt, /POST END/); // {{bogus}} stripped to ""
   assert.match(r.stderr, /unknown template placeholder\(s\): bogus/);
 });
@@ -560,6 +712,44 @@ test("dispatch <node-id> (remote): auto-claims the node, then launches the agent
     assert.match(claim.url, /^\/v1\/nodes\/task-rotate\/claim$/);
     assert.match(r.stdout, /claimed task-rotate/);
     assert.ok(fs.existsSync(sentinel), "the bg agent launched after the claim");
+  } finally {
+    srv.close();
+  }
+});
+
+// inc-spor-dispatch-duplicate-task-2026-06-18: the claim carries a per-invocation
+// `dispatch` nonce so the server refuses a SECOND concurrent dispatch of the same
+// node — even by the same person, on any machine — instead of treating it as the
+// person-scoped idempotent renew that let two agents launch on one task.
+test("dispatch <node-id> (remote): the claim carries a per-invocation dispatch nonce", { skip: isWin }, async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    const claim = claimHit(hits);
+    assert.ok(claim, "POST .../claim was sent");
+    const body = JSON.parse(claim.body || "{}");
+    assert.ok(body.dispatch && typeof body.dispatch === "string", "the claim body carries a dispatch nonce");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --force (remote): omits the dispatch nonce so a deliberate re-dispatch renews", { skip: isWin }, async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief", "--force"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    const claim = claimHit(hits);
+    assert.ok(claim, "the claim was still attempted");
+    const body = JSON.parse(claim.body || "{}");
+    assert.ok(!("dispatch" in body), "--force omits the nonce so the claim renews instead of conflicting");
   } finally {
     srv.close();
   }

@@ -8,6 +8,7 @@
 // and review the expected/ diff like source. If it is not intended, the
 // kernel broke its compatibility promise — fix the kernel, not the fixture.
 
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("fs");

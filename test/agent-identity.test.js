@@ -9,6 +9,7 @@
 //      renderNorm), additive and byte-identical for person-direct nodes.
 // Everything runs against a throwaway graph home and stub servers — never the
 // live graph, never a real `claude --bg`.
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
 const assert = require("node:assert");
 const { spawn, spawnSync } = require("node:child_process");
@@ -471,9 +472,12 @@ test("dispatch (remote, real): mints a session-DEFERRED token + 0600 mcp-config,
     assert.deepStrictEqual(JSON.parse(mint.body), {}, "token minted session-deferred (no session up front)");
     assert.ok(!hits.some((h) => h.url === "/v1/admin/tokens"), "did NOT use the admin token route");
 
-    // the claim is PERSON-SCOPED (no session up front); the real session is bound LATE
+    // the claim is PERSON-SCOPED (no session up front); the real session is bound LATE.
+    // It carries the per-invocation dispatch nonce (inc-spor-dispatch-duplicate-task-2026-06-18).
     const claim = hits.find((h) => /\/claim$/.test(h.url) && h.method === "POST");
-    assert.deepStrictEqual(JSON.parse(claim.body), {}, "claim is person-scoped (session bound later)");
+    const claimBody = JSON.parse(claim.body);
+    assert.ok(!("session" in claimBody), "claim is person-scoped (session bound later)");
+    assert.ok(claimBody.dispatch && typeof claimBody.dispatch === "string", "claim carries a per-invocation dispatch nonce");
     // late bind: the token's session rebound via POST /v1/agents/session, and the lease renewed to it
     const bind = hits.find((h) => h.url === "/v1/agents/session" && h.method === "POST");
     assert.ok(bind, "POSTed to /v1/agents/session to bind the captured run session");

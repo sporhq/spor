@@ -318,7 +318,30 @@ it. Other levers beyond env migration: neighborhood-search project controls
 slug→local-path map (`dispatch.repos`, a per-machine `{slug: path}` table the
 shared graph can't hold; written to the USER `$SPOR_HOME/config.json` by
 `spor repos`/`session-start`, read via the cascade — never a committable
-`.spor.json`, since paths are machine-specific). Server-side ops vars
+`.spor.json`, since paths are machine-specific), and its sibling
+`dispatch.capabilities` — the machine-local profile-satisfiability map
+(harnesses/reachable-MCP/skills/plugins + a `deny` policy list) probe-populated
+by `session-start` and declared by `spor capabilities`, in the SAME user
+config.json (`dispatch.capabilities.probed` is refreshed wholesale, `.declared`
+is sticky, `.deny` overrides both; the pure matcher is `lib/kernel/satisfiability.js`,
+task-spor-dispatch-capabilities-satisfiability). The probe seeds
+`reachable_mcp: [spor]` into `.probed` from CONFIGURED-ness — when a Spor
+server/connector is bound (remote mode), the spor MCP is reachable by
+construction, so an `mcp: [spor]` profile satisfies on a fresh dispatched box
+with no manual `allow-mcp` and no flaky network ping; the seed rides `.probed`,
+so it drops out when the server is unconfigured (other MCP reachability stays
+declared, task-spor-mcp-reachability-deterministic-seed). In REMOTE mode, when a
+`dispatch.agent` is configured (`spor agent use`), `session-start` ALSO
+auto-publishes the freshly-probed effective capabilities to the fleet scheduler
+(`POST /v1/agents/{id}/capabilities`) — folding the manual `spor capabilities
+publish` into the probe so the fleet view auto-populates and the box's
+last-contact stays fresh (task-spor-fleet-capabilities-autopublish-session-start).
+It rides the same concurrent batch as the briefing/queue reads (so it adds no
+latency), is bounded (`dispatch.capabilitiesPublishTimeoutMs` /
+`SPOR_CAPABILITIES_PUBLISH_TIMEOUT`, default 3s) and fail-open like the claim
+heartbeat; the `dispatch.agent` requirement is the opt-in (a box that never ran
+`spor agent use` never publishes), and `SPOR_CAPABILITIES_PUBLISH=0`
+(`dispatch.capabilitiesPublish:false`) disables it. Server-side ops vars
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard
 (`SPOR_DISTILLING`) are deliberately NOT config — they stay pure env.

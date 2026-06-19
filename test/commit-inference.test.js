@@ -8,6 +8,7 @@
 // exercises each signal in isolation, the corroboration rule, the configurable
 // threshold, idempotency vs already-linked shas, and the CLI.
 
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const path = require("path");

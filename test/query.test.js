@@ -5,6 +5,7 @@
 // membership), --id-prefix, edge emission (--edges --edge-type --to / --from),
 // the --ids/--summary/--json projections, and the empty-result case.
 
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("fs");

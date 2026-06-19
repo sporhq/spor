@@ -6,6 +6,7 @@
 // staleness "close?" inversion, project filtering, and registry-driven
 // queueability (org schema marks a new type queueable).
 
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("fs");
