@@ -45,16 +45,19 @@ operations.
 For the full node-type and edge-type registries, the node file format, and the
 project-slug rule, read **`references/concepts.md`**.
 
-## Are you local or remote? (resolve it silently)
+## Local or remote? The CLI resolves it — don't branch in prose
 
 Spor runs against your **personal** graph (local mode) or a **team server**
-(remote mode). Tell which from the status line injected at session start:
-`team graph: …` = remote, `A Spor knowledge graph is active: …` = local. If it
-isn't in context, run `spor status` (or test `[ -n "$SPOR_SERVER" ]`). Don't echo
-`SPOR_SERVER`/`SPOR_TOKEN`/`SPOR_HOME` or announce the mode unless the user
-asks — it's plumbing.
+(remote mode), but you don't detect that and fork: **run one `spor <verb>` and
+the CLI self-resolves** enabled → local/remote → tenant per call (the config
+cascade, dec-spor-client-cli-mode-tenant-resolution). So the action skills carry
+no mode branch — no `[ -n "$SPOR_SERVER" ]` test, no raw `curl /v1/*` vs
+`lib/*.js` fork. Don't echo `SPOR_SERVER`/`SPOR_TOKEN`/`SPOR_HOME` or announce
+the mode unless the user asks; if you need to *see* the resolved mode/tenant, run
+`spor status`. (The one branch that remains is **surface, not mode**: in Cowork /
+with the connector there is no shell, so use the MCP tools — see below.)
 
-What actually differs:
+The two modes still differ in what happens underneath, as background:
 
 | | local (`SPOR_SERVER` unset) | remote (`SPOR_SERVER` set) |
 |---|---|---|
@@ -62,10 +65,10 @@ What actually differs:
 | **writing** | you write the node markdown yourself; the distiller commits it | the server's ingestion model types raw text into nodes; writes are attributed to you |
 | **reading** | the `spor` CLI, against your local files | the `spor` CLI, the MCP tools, or their REST twins (API.md §3) |
 
-`spor status` prints the resolved mode, graph home, project, and identity if
-you need to confirm. Settings resolve through a cascade (CLI flag > env >
-repo `.spor.json` > user/global config > defaults), so when in doubt let
-`spor status` report the effective values rather than guessing.
+`spor status` prints the resolved mode, graph home, project, and identity.
+Settings resolve through a cascade (CLI flag > env > repo `.spor.json` >
+user/global config > defaults), so when in doubt let `spor status` report the
+effective values rather than guessing.
 
 ## Reading and writing the graph
 
@@ -77,11 +80,12 @@ outcome back so the next session inherits it.
 the rest are mode-specific (`spor status` confirms which mode you're in):
 
 ```bash
-# either mode
+# either mode (the CLI self-resolves local vs remote per verb)
 spor status                    # resolved mode, graph, project, identity, health
 spor next [--project <slug>]   # the ranked decision queue — "what's next"
 spor get <id>                  # one node by id
 spor add "<2-3 sentences>"     # capture a node (typed file locally; /v1/capture remotely)
+spor correct <target> "<text>" # standing briefing correction (corr file locally; /v1/corrections remotely)
 
 # remote (team server) only
 spor lens [<id>]               # list saved views, or render one

@@ -11,6 +11,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
+const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 
 const auth = require('../lib/auth.js');
@@ -415,6 +416,166 @@ test('auth login against a server with no device endpoints fails clearly (404)',
     const r = await runAsync(['auth', 'login', '--server', base, '--no-open'], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
     assert.strictEqual(r.code, 1);
     assert.match(r.stderr, /device endpoints|device authorization failed/);
+  } finally {
+    srv.close();
+  }
+});
+
+// ===========================================================================
+// `spor auth login --web` — the localhost-loopback flow (auth code + PKCE,
+// task-cc-spor-auth-cli-web-loopback). The fake front door implements the same
+// DCR -> /oauth/authorize -> /oauth/token contract the real server ships; the
+// test plays the BROWSER (GET /oauth/authorize, follow the 302 to the loopback).
+// ===========================================================================
+
+// A bare http.get that does NOT auto-follow redirects, so the test can read the
+// 302 Location (Node's fetch hides it under redirect:'manual'/opaqueredirect).
+function httpGet(url) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(url, (res) => {
+      let body = '';
+      res.on('data', (c) => (body += c));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body }));
+    });
+    req.on('error', reject);
+  });
+}
+
+// The fake front door: RFC 7591 DCR, an auto-approving /oauth/authorize that
+// 302s back to the loopback redirect with code+state, PKCE-verifying token
+// exchange, RFC 7592 unregister, and /v1/me. Records every hit.
+function loopbackServer({ accessToken, refreshToken = 'spor_ort_x' } = {}) {
+  const hits = [];
+  const codes = new Map(); // code -> code_challenge
+  let base = '';
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      const u = new URL(req.url, 'http://127.0.0.1');
+      hits.push({ method: req.method, url: req.url, body });
+      const send = (code, obj, headers = {}) => {
+        res.writeHead(code, { 'content-type': 'application/json', ...headers });
+        res.end(JSON.stringify(obj));
+      };
+      if (req.method === 'POST' && u.pathname === '/oauth/register') {
+        const reg = JSON.parse(body || '{}');
+        const clientId = 'sub_client_test';
+        return send(201, {
+          client_id: clientId,
+          redirect_uris: reg.redirect_uris,
+          token_endpoint_auth_method: 'none',
+          registration_access_token: 'sub_reg_test',
+          registration_client_uri: `${base}/oauth/register/${clientId}`,
+        });
+      }
+      if (req.method === 'DELETE' && u.pathname.startsWith('/oauth/register/')) {
+        res.writeHead(204);
+        return res.end();
+      }
+      if (req.method === 'GET' && u.pathname === '/oauth/authorize') {
+        // auto-approve: mint a code bound to the PKCE challenge, 302 to the loopback
+        const redirectUri = u.searchParams.get('redirect_uri');
+        const st = u.searchParams.get('state');
+        const code = 'sub_code_test';
+        codes.set(code, u.searchParams.get('code_challenge'));
+        const loc = new URL(redirectUri);
+        loc.searchParams.set('code', code);
+        if (st) loc.searchParams.set('state', st);
+        res.writeHead(302, { location: loc.toString() });
+        return res.end();
+      }
+      if (req.method === 'POST' && u.pathname === '/oauth/token') {
+        const q = JSON.parse(body || '{}');
+        if (q.grant_type === 'authorization_code') {
+          const challenge = codes.get(q.code);
+          const digest = crypto.createHash('sha256').update(q.code_verifier || '', 'utf8').digest('base64url');
+          if (!challenge || digest !== challenge) {
+            return send(400, { error: 'invalid_grant', error_description: 'PKCE verification failed' });
+          }
+          return send(200, { access_token: accessToken, token_type: 'Bearer', refresh_token: refreshToken, expires_in: 3600 });
+        }
+        return send(400, { error: 'unsupported_grant_type' });
+      }
+      if (req.method === 'GET' && u.pathname === '/v1/me') {
+        return send(200, { person: 'person-me', name: 'Me', email: 'me@example.io', bound: true });
+      }
+      send(404, {});
+    });
+  });
+  return new Promise((r) =>
+    srv.listen(0, '127.0.0.1', () => {
+      base = `http://127.0.0.1:${srv.address().port}`;
+      r({ srv, hits, base });
+    }),
+  );
+}
+
+test('auth login --web: registers a loopback client, captures the code, exchanges it (PKCE)', async () => {
+  const accessToken = fakeJwt({ org: 'acme', exp: Math.floor(Date.now() / 1000) + 3600 });
+  const { srv, base, hits } = await loopbackServer({ accessToken });
+  try {
+    const home = tmp();
+    const env = bareEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home });
+    const c = spawn(process.execPath, [CLI, 'auth', 'login', '--web', '--server', base, '--no-open'], {
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    let er = '';
+    let drove = false;
+    c.stderr.on('data', (d) => (er += d));
+    c.stdout.on('data', async (d) => {
+      out += d;
+      // Once the CLI is waiting, the authorize URL is fully flushed — play browser.
+      if (!drove && /Waiting for the browser/.test(out)) {
+        drove = true;
+        const m = out.match(/(https?:\/\/[^\s]*\/oauth\/authorize[^\s]*)/);
+        const authResp = await httpGet(m[1]); // GET /oauth/authorize -> 302 to loopback
+        await httpGet(authResp.headers.location); // deliver the code to the CLI listener
+      }
+    });
+    const code = await new Promise((resolve) => c.on('close', resolve));
+    assert.strictEqual(code, 0, er);
+    assert.ok(drove, 'the authorize URL was printed and the browser leg ran');
+    const s = auth.readStore(home);
+    const key = `${base}/acme`;
+    assert.ok(s.tenants[key], 'tenant stored keyed by (server, org)');
+    assert.strictEqual(s.tenants[key].access_token, accessToken);
+    assert.strictEqual(s.tenants[key].refresh_token, 'spor_ort_x');
+    assert.strictEqual(s.tenants[key].person, 'person-me');
+    assert.strictEqual(s.default, key, 'a fresh login becomes the active tenant');
+    // exercised DCR register, the authorize redirect, the code exchange, and cleanup
+    assert.ok(hits.some((h) => h.method === 'POST' && h.url === '/oauth/register'));
+    assert.ok(hits.some((h) => h.method === 'GET' && h.url.startsWith('/oauth/authorize')));
+    assert.ok(hits.some((h) => h.method === 'POST' && h.url === '/oauth/token'));
+    assert.ok(hits.some((h) => h.method === 'DELETE' && h.url.startsWith('/oauth/register/')), 'best-effort unregister');
+    // RFC 8707: the resource indicator (=<server>) rides BOTH the authorize URL and the
+    // token exchange, so the loopback (--web) token also targets api under strict minting
+    // (task-spor-app-api-strict-audience-restriction).
+    const authzHit = hits.find((h) => h.method === 'GET' && h.url.startsWith('/oauth/authorize'));
+    assert.strictEqual(new URL(authzHit.url, 'http://x').searchParams.get('resource'), base, 'authorize carries resource=<server>');
+    const tokenHit = hits.find((h) => h.method === 'POST' && h.url === '/oauth/token');
+    assert.strictEqual(JSON.parse(tokenHit.body || '{}').resource, base, 'token exchange echoes resource=<server>');
+  } finally {
+    srv.close();
+  }
+});
+
+test('auth login --web falls back to the device grant when the server has no DCR', async () => {
+  // deviceServer answers the device endpoints but 404s /oauth/register, so --web
+  // registers, sees 404, and falls back to the device-code flow.
+  const accessToken = fakeJwt({ org: 'acme', exp: Math.floor(Date.now() / 1000) + 3600 });
+  const { srv, base, hits } = await deviceServer({ accessToken, pendingPolls: 0 });
+  try {
+    const home = tmp();
+    const r = await runAsync(['auth', 'login', '--web', '--server', base, '--no-open'], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+    assert.strictEqual(r.code, 0, r.stderr);
+    assert.match(r.stdout, /no loopback\/DCR endpoints/);
+    assert.match(r.stdout, /enter the code:\s+WXYZ-1234/);
+    assert.ok(auth.readStore(home).tenants[`${base}/acme`], 'device fallback stored the tenant');
+    assert.ok(hits.some((h) => h.url === '/oauth/register'), 'it attempted DCR first');
+    assert.ok(hits.some((h) => h.url === '/oauth/device_authorization'), 'then ran the device flow');
   } finally {
     srv.close();
   }
