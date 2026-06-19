@@ -358,6 +358,75 @@ async function claimNudge({ graph, slug, session, cwd, remote }) {
   };
 }
 
+// task-spor-fleet-scheduler-client-heartbeat-tick — the mid-session FLEET
+// liveness tick. The server's heartbeat endpoint (POST /v1/agents/{id}/heartbeat,
+// art-spor-fleet-scheduler-hardening-shipped) refreshes this box's agent
+// `last_seen` WITHOUT re-uploading capabilities, and the fleet scheduler keys its
+// host-match staleness (?max_age, GET /v1/profiles/{id}/hosts) off `last_seen`.
+// Today only session-start refreshes it — the EXPENSIVE way, via a full
+// capabilities re-publish (task-spor-fleet-capabilities-autopublish-session-start)
+// — so a box that publishes once and then runs for hours ages out of host-matches
+// mid-session even though it is alive. This tick keeps last_seen fresh BETWEEN
+// session-starts with the cheap "still here" ping.
+//
+// Like the claim heartbeat above it piggybacks on write-activity (no new timer, so
+// it's portable across adapters that don't fire hooks uniformly), but it is
+// THROTTLED to one ping per dispatch.heartbeatIntervalMs (default 5min) via a
+// per-session cooldown file holding the last-tick epoch (ms) — a held lease must
+// renew on every write, but liveness only needs to beat the staleness window. The
+// cooldown is stamped BEFORE the curl, so a dead/slow server can't make every
+// write pay the (bounded) timeout — at most one attempt per interval. REMOTE mode
+// only and only when a `dispatch.agent` is configured (the SAME opt-in as the
+// session-start auto-publish: a box that never ran `spor agent use` has no fleet
+// identity to keep alive). Fail-open and bounded (dispatch.heartbeatTimeoutMs,
+// default 3s, like the publish curl); ALWAYS returns null — a pure side effect,
+// never the output envelope. Disable with SPOR_HEARTBEAT=0 (dispatch.heartbeat:
+// false). A 404 means caps were never published (publish-before-heartbeat); we
+// journal it and fail open — the next session-start auto-publish re-seeds them.
+async function agentHeartbeat({ graph, session, remote }) {
+  try {
+    if (!remote) return null; // local mode: no fleet, no-op (keeps output byte-identical)
+    const cfg = u.config();
+    if (cfg ? !cfg.getBool("dispatch.heartbeat", true) : (u.envDual("HEARTBEAT") ?? "1") === "0") return null;
+    if (process.env.SPOR_DISTILLING || process.env.SUBSTRATE_DISTILLING) return null; // headless calls don't tick
+    const agent = cfg ? cfg.get("dispatch.agent", null) : u.envDual("DISPATCH_AGENT") || null;
+    if (!agent) return null; // no dispatch identity on this box — nothing to keep alive
+
+    // Throttle: at most one tick per interval, cooldown keyed on the editing
+    // session (mirrors journal/<session>.nudged / .claim-nudged). Stamp the
+    // last-tick epoch BEFORE the curl so an outage can't make every write pay the
+    // bounded timeout.
+    const intervalMs = u.cfgNum("dispatch.heartbeatIntervalMs", "HEARTBEAT_INTERVAL", 300000);
+    const state = path.join(graph, "journal", `${session}.heartbeat`);
+    let last = 0;
+    try {
+      last = Number(fs.readFileSync(state, "utf8").trim()) || 0;
+    } catch {}
+    const now = Date.now();
+    if (now - last < intervalMs) return null;
+    u.ensureDir(path.join(graph, "journal"));
+    try {
+      fs.writeFileSync(state, String(now));
+    } catch {}
+
+    const timeoutMs = u.cfgNum("dispatch.heartbeatTimeoutMs", "HEARTBEAT_TIMEOUT", 3000);
+    const r = await u.curl(`${u.serverBase()}/v1/agents/${encodeURIComponent(agent)}/heartbeat`, {
+      method: "POST",
+      headers: u.bearer(),
+      timeoutMs,
+    });
+    // Journal the tick (best-effort) so the operability log can correlate
+    // write-activity to liveness pings.
+    u.appendLine(
+      path.join(graph, "journal", `${session}.jsonl`),
+      JSON.stringify({ ts: u.jqNow(), tool: "agent-heartbeat", agent, http: r ? r.http : "000" })
+    );
+  } catch {
+    /* fail open — the liveness tick must never cost the tool loop */
+  }
+  return null;
+}
+
 async function postTool(input) {
   const graph = u.graphHome();
   const remote = Boolean(u.serverBase());
@@ -385,6 +454,11 @@ async function postTool(input) {
         file: input.tool_input?.file_path ?? null,
       })
     );
+    // Fleet liveness heartbeat (task-spor-fleet-scheduler-client-heartbeat-tick):
+    // keep this box's agent last_seen fresh mid-session. A throttled, fail-open
+    // side effect that always returns null (never the output envelope), so it
+    // doesn't compete with the claim/capture nudges below; no-op in local mode.
+    await agentHeartbeat({ graph, session, remote }).catch(() => null);
     // Claim heartbeat / nudge (task-cc-claim-nudge-hook) runs FIRST: it's the
     // cheap no-LLM lease lookup, and its nudge (the no-claim branch) takes
     // precedence over the LLM capture nudge for the single output envelope. The
@@ -420,4 +494,4 @@ async function postTool(input) {
   return null;
 }
 
-module.exports = { postTool, parseFactList, claimNudge };
+module.exports = { postTool, parseFactList, claimNudge, agentHeartbeat };

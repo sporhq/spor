@@ -173,6 +173,33 @@ local output is byte-identical). The branch runs first and its nudge takes the
 single output envelope; the heartbeat branch returns null so a held-claim write
 still falls through to the capture nudge. See test/claim-nudge.test.js.
 
+The post-tool engine ALSO carries the FLEET liveness tick
+(task-spor-fleet-scheduler-client-heartbeat-tick) — REMOTE-MODE ONLY and the
+client caller for the server's `POST /v1/agents/{id}/heartbeat`
+(art-spor-fleet-scheduler-hardening-shipped). The fleet scheduler keys its
+host-match staleness (`?max_age` on `GET /v1/profiles/{id}/hosts`) off the agent's
+`last_seen`, which today only the session-start auto-publish refreshes — the
+EXPENSIVE way (a full caps re-publish per session), so a box that publishes once
+and then runs for hours ages out of host-matches mid-session even though it's
+alive. This tick refreshes `last_seen` the CHEAP way: a bodyless POST that
+re-stamps it WITHOUT re-probing or re-uploading capabilities. Like the claim
+heartbeat it piggybacks on write-activity (no new timer, portable across
+adapters), but it's THROTTLED to one ping per `dispatch.heartbeatIntervalMs`
+(`SPOR_HEARTBEAT_INTERVAL`, default 5min) via a per-session cooldown file
+(`journal/<session>.heartbeat`, holding the last-tick epoch ms) — a held lease must
+renew on every write, but liveness only needs to beat the staleness window. Gated
+on a configured `dispatch.agent` (the SAME opt-in as the session-start
+auto-publish — a box that never ran `spor agent use` has no fleet identity to keep
+alive); bounded by `dispatch.heartbeatTimeoutMs` (`SPOR_HEARTBEAT_TIMEOUT`,
+default 3000). The cooldown is stamped BEFORE the curl so a dead/slow server can't
+make every write pay the timeout (at most one attempt per interval). Always
+returns null (a pure side effect, never the output envelope), so it doesn't
+compete with the claim/capture nudges; LOCAL mode is a no-op (byte-identical
+output). Fail-open: any error/non-200 (a 404 means caps were never published —
+publish-before-heartbeat) is journaled (`tool: agent-heartbeat`) and swallowed,
+exit 0. Disable with `SPOR_HEARTBEAT=0` (`dispatch.heartbeat:false`). See
+test/heartbeat.test.js.
+
 Hooks have two modes (API.md §6): the payloads above test LOCAL mode;
 prefix `SPOR_SERVER=http://127.0.0.1:<port> SPOR_TOKEN=<token>` to
 test REMOTE mode against a running server (or a dead port for the fail-open
@@ -341,7 +368,14 @@ latency), is bounded (`dispatch.capabilitiesPublishTimeoutMs` /
 `SPOR_CAPABILITIES_PUBLISH_TIMEOUT`, default 3s) and fail-open like the claim
 heartbeat; the `dispatch.agent` requirement is the opt-in (a box that never ran
 `spor agent use` never publishes), and `SPOR_CAPABILITIES_PUBLISH=0`
-(`dispatch.capabilitiesPublish:false`) disables it. Server-side ops vars
+(`dispatch.capabilitiesPublish:false`) disables it. Between session-starts the
+`post-tool` engine keeps that same `last_seen` fresh the CHEAP way — a throttled
+`POST /v1/agents/{id}/heartbeat` that re-stamps liveness without re-probing or
+re-uploading caps (task-spor-fleet-scheduler-client-heartbeat-tick), gated on the
+SAME `dispatch.agent` opt-in, throttled by `dispatch.heartbeatIntervalMs`
+(`SPOR_HEARTBEAT_INTERVAL`, default 5min), bounded by `dispatch.heartbeatTimeoutMs`
+(`SPOR_HEARTBEAT_TIMEOUT`, default 3s), and disabled by `SPOR_HEARTBEAT=0`
+(`dispatch.heartbeat:false`). Server-side ops vars
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard
 (`SPOR_DISTILLING`) are deliberately NOT config — they stay pure env.
