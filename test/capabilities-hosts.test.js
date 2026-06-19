@@ -53,7 +53,11 @@ function hostsStub({ status = 200, body } = {}) {
     const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
     const m = req.url.match(/^\/v1\/profiles\/([^/?]+)\/hosts/);
     if (m && req.method === "GET") {
-      if (status !== 200) return j(status, { error: { code: status === 404 ? "not_found" : "bad_request", message: "x" } });
+      if (status !== 200) {
+        const codeFor = { 403: "forbidden", 404: "not_found" };
+        const msgFor = { 403: "host visibility is steward-scoped" };
+        return j(status, { error: { code: codeFor[status] || "bad_request", message: msgFor[status] || "x" } });
+      }
       return j(200, body || { profile: decodeURIComponent(m[1]), satisfiable: [], unsatisfiable: [], counts: {} });
     }
     return j(404, { error: { code: "not_found" } });
@@ -154,6 +158,23 @@ test("hosts (remote): a 404 (unknown profile / no surface) fails soft", { skip: 
     const r = await runAsync(["capabilities", "hosts", "profile-nope"], remoteEnv(freshHome(), base));
     assert.strictEqual(r.status, 1);
     assert.match(r.stderr, /no such profile 'profile-nope'/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("hosts (remote): a 403 (steward-scoped) reports an authorization denial, not an outage", { skip: isWin }, async () => {
+  // A member asking for a colleague's boxes is 403 (host visibility is steward-scoped,
+  // API.md §3). It must NOT be misreported as a transport outage
+  // (issue-spor-capabilities-hosts-403-misreported).
+  const { srv, base } = await hostsStub({ status: 403 });
+  try {
+    const r = await runAsync(["capabilities", "hosts", "profile-x", "--owner", "person-bob"], remoteEnv(freshHome(), base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /not authorized to view person-bob's boxes/);
+    assert.match(r.stderr, /steward-scoped/);
+    assert.match(r.stderr, /--owner me/);
+    assert.doesNotMatch(r.stderr, /could not reach the fleet scheduler/);
   } finally {
     srv.close();
   }

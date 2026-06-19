@@ -851,6 +851,26 @@ test("dispatch (remote, unsatisfiable): a scheduler outage falls back to the gen
   }
 });
 
+test("dispatch (remote, unsatisfiable): a 403 (steward-scoped) is reported as an authorization denial, then degrades to the generic hint", { skip: process.platform === "win32" }, async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  // The /hosts route 403s (host visibility is steward-scoped, API.md §3). It must
+  // NOT be reported as a scheduler outage (issue-spor-capabilities-hosts-403-misreported).
+  const { srv, base } = await fleetStub({ hostsStatus: 403 });
+  try {
+    const r = await runAsyncDisp(["dispatch", "do a thing here", "--dir", repo, "--profile", "profile-codex", "--no-brief"], remoteCapEnv(home, base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /can't satisfy profile profile-codex/);
+    assert.match(r.stderr, /not authorized to list fleet hosts for profile-codex/);
+    assert.match(r.stderr, /steward-scoped/);
+    assert.doesNotMatch(r.stderr, /fleet scheduler unavailable/);
+    // still degrades to the original generic re-route hint
+    assert.match(r.stderr, /assignment is unchanged. Re-route to a machine that satisfies it/);
+  } finally {
+    srv.close();
+  }
+});
+
 test("dispatch (local, unsatisfiable): byte-identical — no scheduler consult", { skip: process.platform === "win32" }, () => {
   const { home, nodes, repo } = fixture();
   writeProfile(nodes, "profile-codex", "harness: codex");

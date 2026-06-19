@@ -3318,8 +3318,12 @@ function relAge(sec) {
 // satisfies() the client runs locally, so a re-route never substitutes a
 // different profile (dec-spor-machine-profile-satisfiability, FORK B). Returns
 // the parsed { profile, satisfiable, unsatisfiable, counts } on 200, or a
-// FAIL-SOFT shape that never throws: { error } (transport / 4xx-5xx) or
-// { absent:true } (404 — unknown profile or no scheduler surface deployed).
+// FAIL-SOFT shape that never throws: { error } (transport / 4xx-5xx), { absent:true }
+// (404 — unknown profile or no scheduler surface deployed), or { forbidden:true,
+// message } (403 — host visibility is steward-scoped, so a member asking for a
+// colleague's owner=person-X is denied; API.md §3). The forbidden shape is kept
+// DISTINCT from { error } so a consumer reports an authorization denial as such,
+// never as a transport outage (issue-spor-capabilities-hosts-403-misreported).
 // `owner` scopes to one person's boxes ('me'/'person-X'); `maxAge` ('30m'/'12h'/
 // '7d'/ms) demotes staler publishes to unsatisfiable.
 async function fleetHostsForProfile(cfg, profileId, { owner, maxAge } = {}) {
@@ -3330,6 +3334,10 @@ async function fleetHostsForProfile(cfg, profileId, { owner, maxAge } = {}) {
   const r = await remote.get(cfg, `/v1/profiles/${encodeURIComponent(profileId)}/hosts${q}`, { timeoutMs: 6000 });
   if (r.transport) return { error: r.error };
   if (r.status === 404) return { absent: true };
+  if (r.status === 403) {
+    const msg = r.json && r.json.error && r.json.error.message;
+    return { forbidden: true, message: msg || null };
+  }
   if (!r.ok) {
     const code = r.json && r.json.error && r.json.error.code;
     const msg = r.json && r.json.error && r.json.error.message;
@@ -3360,6 +3368,10 @@ async function reportFleetHosts(cfg, profileId) {
     return false;
   }
   if (!res || res.absent) return false; // unknown profile / no surface — generic hint fits better
+  if (res.forbidden) {
+    err(`  (not authorized to list fleet hosts for ${profileId} — host visibility is steward-scoped; falling back to a generic re-route hint)`);
+    return false;
+  }
   if (res.error) {
     err(`  (fleet scheduler unavailable: ${res.error} — falling back to a generic re-route hint)`);
     return false;
@@ -3400,6 +3412,15 @@ async function cmdCapabilitiesHosts(cfg, { profileId, owner, maxAge, json }) {
     return 1;
   }
   const res = await fleetHostsForProfile(cfg, profileId, { owner, maxAge });
+  if (res.forbidden) {
+    const target = owner && owner !== "me" ? `${owner}'s boxes` : "another member's boxes";
+    err(
+      `not authorized to view ${target} — fleet host visibility is steward-scoped.\n` +
+        "  try --owner me to see your own boxes, or ask an admin (a steward) to view the wider fleet." +
+        (res.message ? `\n  (server: ${res.message})` : "")
+    );
+    return 1;
+  }
   if (res.error) {
     err(`could not reach the fleet scheduler: ${res.error}`);
     return 1;
