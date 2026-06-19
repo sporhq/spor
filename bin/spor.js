@@ -810,18 +810,32 @@ function today() {
 async function cmdAdd(cfg, { values, positionals }) {
   const prose = positionals[0];
   if (!prose) {
-    err('usage: spor add "<text>" [--type T] [--title ...] [--project S]');
+    err('usage: spor add "<text>" [--type T] [--title ...] [--project S] [--during ID] [--blocks ID] [--needed-by YYYY-MM-DD]');
     return 1;
   }
   const project = values.project || safeSlug();
+  // Capture-context fields the /spor:defer skill uses (so it routes through ONE
+  // verb instead of a mode branch): --during is the work this was discovered
+  // during (a provenance edge); --blocks + --needed-by declare a cross-project
+  // dependency (task-cc-xproject-dependency-loop) — set --project to the SERVING
+  // project and the server attaches the blocks edge + deadline deterministically.
+  const during = values.during || null;
+  const blocks = values.blocks || null;
+  const neededBy = values["needed-by"] || null;
 
   if (cfg.mode() === "remote") {
-    const r = await remote.post(cfg, "/v1/capture", { text: prose, context: { project } });
+    const context = { project };
+    if (during) context.during = during;
+    if (blocks) context.blocks = blocks;
+    if (neededBy) context.needed_by = neededBy;
+    const r = await remote.post(cfg, "/v1/capture", { text: prose, context });
     if (r.transport) {
       err(`offline — capture not shipped (${r.error}). It will be retried by the hooks' outbox in a normal session.`);
       return 1;
     }
     if (!r.ok) {
+      // Surface the deterministic cross-project rejections the server makes
+      // before any model call (missing blocks target -> 404, bad date -> 422).
       err(`capture error ${r.status}`);
       return 1;
     }
@@ -856,7 +870,16 @@ async function cmdAdd(cfg, { values, positionals }) {
   let base = id;
   while (fs.existsSync(path.join(nodesDir, `${id}.md`))) id = `${base}-${++n}`;
 
-  const md = `---\nid: ${id}\ntype: ${type}\nrepo: ${project}\ntitle: ${title.replace(/\n/g, " ")}\nsummary: ${summary.replace(/\n/g, " ")}\ndate: ${today()}\n---\n\n${prose}\n`;
+  // Local equivalents of the capture-context fields: --during -> a derived-from
+  // edge (the provenance the distiller would draw), --blocks -> a blocks edge,
+  // --needed-by -> the needed_by deadline field. So the same `spor add` line the
+  // /spor:defer skill runs lands the same lineage locally as remote.
+  const edgeLines = [];
+  if (during) edgeLines.push(`  - {type: derived-from, to: ${during}}`);
+  if (blocks) edgeLines.push(`  - {type: blocks, to: ${blocks}}`);
+  const edgesBlock = edgeLines.length ? `edges:\n${edgeLines.join("\n")}\n` : "";
+  const neededByLine = neededBy ? `needed_by: ${neededBy}\n` : "";
+  const md = `---\nid: ${id}\ntype: ${type}\nrepo: ${project}\ntitle: ${title.replace(/\n/g, " ")}\nsummary: ${summary.replace(/\n/g, " ")}\n${neededByLine}${edgesBlock}date: ${today()}\n---\n\n${prose}\n`;
   // validate before writing (parse, then the same rules lib/validate enforces)
   let node;
   try {
@@ -873,6 +896,100 @@ async function cmdAdd(cfg, { values, positionals }) {
   fs.writeFileSync(path.join(nodesDir, `${id}.md`), md);
   out(`added ${id} (${type}) to ${nodesDir}`);
   out(`  edit it to add edges/detail; 'spor next' will surface it.`);
+  return 0;
+}
+
+// --- spor correct -------------------------------------------------------
+// Record a standing correction to a briefing — the CLI surface for /spor:correct,
+// so the skill routes through ONE verb instead of a remote-curl-vs-local-file
+// mode branch (task-cc-spor-skills-route-through-cli-drop-mode-prose). Remote:
+// POST /v1/corrections (propose_correction's REST twin); the server generates the
+// corr-<target>-<n> id, builds + validates + commits the node. Local: write the
+// corr node file ourselves and validate. Either way the correction fires at every
+// future compile whose scope includes the target (node id | project:<slug> |
+// global), per lib/kernel/graph.js correctionInScope.
+async function cmdCorrect(cfg, { values, positionals }) {
+  const target = positionals[0];
+  const guidance = values.guidance != null ? values.guidance : positionals[1];
+  if (!target) {
+    err('usage: spor correct <target> [guidance] [--pin ID] [--exclude ID] [--title ...]');
+    err("  target is a node id, project:<slug>, or global");
+    return 1;
+  }
+  // --pin/--exclude are repeatable (parseArgs multiple: true -> arrays); a lone
+  // string is normalized to a one-element list. Empty when neither is given.
+  const toList = (v) => (v == null ? [] : Array.isArray(v) ? v : [v]);
+  const pin = toList(values.pin);
+  const exclude = toList(values.exclude);
+  if (!guidance && !pin.length && !exclude.length) {
+    err("a correction needs at least one of: guidance text, --pin, or --exclude");
+    return 1;
+  }
+  const title = values.title || `correction for ${target}`;
+
+  if (cfg.mode() === "remote") {
+    const body = { target, pin, exclude, guidance: guidance || "", title };
+    const r = await remote.post(cfg, "/v1/corrections", body, { timeoutMs: 8000 });
+    if (r.transport) {
+      err(`offline — could not reach server (${r.error})`);
+      return 1;
+    }
+    if (!r.ok) {
+      err(`correction error ${r.status}`);
+      return 1;
+    }
+    const id = (r.json && r.json.id) || "";
+    out(id ? `correction created: ${id}` : `correction created (${(r.json && r.json.status) || "ok"})`);
+    const warnings = (r.json && r.json.warnings) || [];
+    for (const w of warnings) err(`  warning: ${w}`);
+    return 0;
+  }
+
+  // local: write corr-<target>-<n>.md and validate
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const nodesDir = cfg.nodesDir();
+  if (!fs.existsSync(nodesDir)) {
+    err(`no graph at ${nodesDir} — run 'spor init' first`);
+    return 1;
+  }
+  // The target carries a ':' for project: scope, which is not a legal id char —
+  // kebab it into the id stem (project:spor -> project-spor, global -> global).
+  const stem = kebab(target) || "x";
+  let n = 1;
+  let id = `corr-${stem}-${n}`;
+  while (fs.existsSync(path.join(nodesDir, `${id}.md`))) id = `corr-${stem}-${++n}`;
+  const listInline = (a) => `[${a.join(", ")}]`;
+  // Every node needs a standalone summary (validateNode); use the guidance, else
+  // the title. One line, capped well under the frontmatter's comfort zone.
+  const summary = (guidance || title).replace(/\n/g, " ").slice(0, 200);
+  const md =
+    `---\nid: ${id}\ntype: correction\ntitle: ${title.replace(/\n/g, " ")}\n` +
+    `summary: ${summary}\ntarget: ${target}\npin: ${listInline(pin)}\nexclude: ${listInline(exclude)}\n` +
+    `date: ${today()}\n---\n\n${guidance || ""}\n`;
+  let node;
+  try {
+    node = graphLib.parseFrontmatter(md, `${id}.md`);
+  } catch (e) {
+    err(`invalid correction: ${e.message}`);
+    return 1;
+  }
+  let g;
+  try {
+    g = graphLib.loadGraph(nodesDir);
+  } catch (e) {
+    err(`could not load graph: ${e.message}`);
+    return 1;
+  }
+  const v = graphLib.validateNode(g, node);
+  if (!v.ok) {
+    err(`invalid correction:\n  ${v.errors.join("\n  ")}`);
+    return 1;
+  }
+  // pin/exclude must name existing nodes (mirror the server's id-only rule).
+  const missing = [...pin, ...exclude].filter((x) => !fs.existsSync(path.join(nodesDir, `${x}.md`)));
+  for (const m of missing) err(`  warning: pinned/excluded node '${m}' does not exist yet — create it for the correction to take effect`);
+  fs.writeFileSync(path.join(nodesDir, `${id}.md`), md);
+  out(`correction created: ${id} (targets ${target}) in ${nodesDir}`);
   return 0;
 }
 
@@ -4268,14 +4385,24 @@ const COMMANDS = {
     help:
       "Capture a node from prose. In remote mode the server's ingestion model types\n" +
       "and links it; in local mode a well-formed, validated node file is written so\n" +
-      "you never hand-author frontmatter. --type/--title/--id apply to local mode.",
+      "you never hand-author frontmatter. --type/--title/--id apply to local mode.\n\n" +
+      "Capture context (both modes): --during links to the work this was discovered\n" +
+      "during (a derived-from edge). --blocks <id> + --needed-by <date> declare a\n" +
+      "cross-project dependency — set --project to the SERVING project (who must do\n" +
+      "the work) and it surfaces in their queue, ramping urgency as the date nears.",
     options: {
       type: { type: "string", value: "T", desc: "node type (local only; default: task)" },
       title: { type: "string", value: "...", desc: "title (default: first 10 words)" },
-      project: { type: "string", value: "S", desc: "project slug (default: inferred from cwd)" },
+      project: { type: "string", value: "S", desc: "project slug (default: inferred from cwd; the SERVING project for a cross-project dependency)" },
       id: { type: "string", value: "id", desc: "explicit node id (local only)" },
+      during: { type: "string", value: "id", desc: "node this was discovered during (derived-from edge)" },
+      blocks: { type: "string", value: "id", desc: "node id this work blocks (cross-project dependency; target must exist)" },
+      "needed-by": { type: "string", value: "date", desc: "YYYY-MM-DD deadline that ramps queue urgency (pairs with --blocks)" },
     },
-    examples: ['spor add "Cache tf-idf norms across compiles for speed" --type task'],
+    examples: [
+      'spor add "Cache tf-idf norms across compiles for speed" --type task',
+      'spor add "Platform must expose a token-rotation hook" --project platform --blocks task-my-initiative --needed-by 2026-07-15',
+    ],
     run: (cfg, p) => cmdAdd(cfg, p),
   },
   next: {
@@ -4346,6 +4473,30 @@ const COMMANDS = {
       "spor query --edges --edge-type grouped-under --to proj-rdi",
     ],
     run: (cfg, args) => cmdQuery(cfg, args),
+  },
+  correct: {
+    group: "Graph", parse: "strict", args: "<target> [guidance]", aliases: ["propose-correction"],
+    summary: "record a standing briefing correction (local: corr file; remote: /v1/corrections)",
+    help:
+      "Record a correction that fires at every future compile whose scope includes the\n" +
+      "target. The target is a node id (fixes one topic's briefing), project:<slug>\n" +
+      "(every compile for that project), or global (every compile, every project).\n\n" +
+      "Pin a node that was missed (--pin), exclude a stale/irrelevant one (--exclude),\n" +
+      "and/or pass free-text guidance (positional or --guidance). --pin/--exclude are\n" +
+      "repeatable and must name existing nodes. Remote mode POSTs /v1/corrections (the\n" +
+      "server mints the corr-<target>-<n> id); local mode writes the corr node file.",
+    options: {
+      pin: { type: "string", value: "id", desc: "pin a node that was missed (repeatable)", multiple: true },
+      exclude: { type: "string", value: "id", desc: "exclude a stale/irrelevant node (repeatable)", multiple: true },
+      guidance: { type: "string", value: "...", desc: "free-text guidance (else the second positional)" },
+      title: { type: "string", value: "...", desc: "one-line title (default: 'correction for <target>')" },
+    },
+    examples: [
+      'spor correct dec-x "lead with the rollback plan, it is the binding constraint"',
+      "spor correct issue-86 --pin dec-new-policy --exclude dec-stale",
+      'spor correct project:spor "always cite the conformance suite for refactors"',
+    ],
+    run: (cfg, p) => cmdCorrect(cfg, p),
   },
 
   // --- Repo scoping ---
