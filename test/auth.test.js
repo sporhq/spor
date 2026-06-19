@@ -403,6 +403,106 @@ test('auth list / switch / whoami --all / logout operate on the store', async ()
   assert.ok(s.tenants['https://b/beta']);
 });
 
+// A fake server for GET /v1/me/org-choices (task-spor-cli-auth-list-live-
+// membership-requery). `handler(send, req)` shapes the org-choices response;
+// every other route 404s.
+function orgChoicesServer(handler) {
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    hits.push({ method: req.method, url: req.url, auth: req.headers.authorization });
+    const send = (code, obj) => {
+      res.writeHead(code, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(obj));
+    };
+    if (req.method === 'GET' && req.url === '/v1/me/org-choices') return handler(send, req);
+    send(404, {});
+  });
+  return new Promise((r) => srv.listen(0, '127.0.0.1', () => r({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
+}
+const futureJwt = (org) => fakeJwt({ org, exp: Math.floor(Date.now() / 1000) + 3600 });
+
+test('auth list: live org-choices (source:idp) surfaces membership, login hints, other issuers', async () => {
+  const { srv, base, hits } = await orgChoicesServer((send) =>
+    send(200, { source: 'idp', org_choices: [{ slug: 'acme', label: 'Acme' }, { slug: 'beta', label: 'Beta' }] }));
+  try {
+    const home = tmp();
+    // a credential for acme (active), a cached credential on a DIFFERENT issuer,
+    // and NO credential for beta — which the live membership reports.
+    auth.upsertTenant(home, { server: base, org: 'acme', access_token: futureJwt('acme'), person: 'person-a', email: 'a@x.io' });
+    auth.upsertTenant(home, { server: 'https://other.example', org: 'gamma', access_token: 'GT', person: 'person-a' });
+    const r = await runAsync(['auth', 'list'], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+    assert.strictEqual(r.code, 0, r.stderr);
+    assert.match(r.stdout, /\* acme/); // credentialed + active
+    assert.match(r.stdout, /beta.*no credential — run 'spor auth login --org beta'/); // live, no creds
+    assert.match(r.stdout, /gamma/); // other-issuer credential never hidden
+    assert.match(r.stdout, /membership refreshed live/);
+    assert.ok(hits.some((h) => h.url === '/v1/me/org-choices' && /^Bearer /.test(h.auth || '')), 'queried with the active bearer');
+  } finally {
+    srv.close();
+  }
+});
+
+test('auth list: a stored credential the live membership omits is flagged (revoked/stale)', async () => {
+  const { srv, base } = await orgChoicesServer((send) =>
+    send(200, { source: 'idp', org_choices: [{ slug: 'beta' }] })); // acme dropped
+  try {
+    const home = tmp();
+    auth.upsertTenant(home, { server: base, org: 'acme', access_token: futureJwt('acme'), person: 'person-a' });
+    const r = await runAsync(['auth', 'list'], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+    assert.strictEqual(r.code, 0, r.stderr);
+    assert.match(r.stdout, /acme.*not in current membership/);
+    assert.match(r.stdout, /beta.*no credential/);
+  } finally {
+    srv.close();
+  }
+});
+
+test('auth list: 502 membership_requery_failed falls back to the cached listing', async () => {
+  const { srv, base } = await orgChoicesServer((send) =>
+    send(502, { error: { code: 'membership_requery_failed', message: 'idp unreachable' } }));
+  try {
+    const home = tmp();
+    auth.upsertTenant(home, { server: base, org: 'acme', access_token: futureJwt('acme'), person: 'person-a' });
+    const r = await runAsync(['auth', 'list'], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+    assert.strictEqual(r.code, 0, r.stderr);
+    assert.match(r.stdout, /\* acme/);
+    assert.doesNotMatch(r.stdout, /membership refreshed live/); // the live-vs-cached signal
+    assert.doesNotMatch(r.stdout, /no credential/);
+  } finally {
+    srv.close();
+  }
+});
+
+test('auth list: source:bound (single scoped org) falls back to the cached listing', async () => {
+  const { srv, base } = await orgChoicesServer((send) =>
+    send(200, { source: 'bound', org_choices: [{ slug: 'acme', default: true }] }));
+  try {
+    const home = tmp();
+    auth.upsertTenant(home, { server: base, org: 'acme', access_token: futureJwt('acme'), person: 'person-a' });
+    const r = await runAsync(['auth', 'list'], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+    assert.strictEqual(r.code, 0, r.stderr);
+    assert.match(r.stdout, /\* acme/);
+    assert.doesNotMatch(r.stdout, /membership refreshed live/);
+  } finally {
+    srv.close();
+  }
+});
+
+test('auth list: an older server with no org-choices endpoint (404) falls back, byte-identical', async () => {
+  const { srv, base } = await orgChoicesServer((send) => send(404, {}));
+  try {
+    const home = tmp();
+    auth.upsertTenant(home, { server: base, org: 'acme', access_token: futureJwt('acme'), person: 'person-a', email: 'a@x.io' });
+    const r = await runAsync(['auth', 'list'], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+    assert.strictEqual(r.code, 0, r.stderr);
+    // the exact pre-live cached form: "* acme  <base>  person-a <a@x.io>  [valid, ...]"
+    assert.match(r.stdout, new RegExp(`\\* acme {2}${base.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')} {2}person-a <a@x.io> {2}\\[valid`));
+    assert.doesNotMatch(r.stdout, /membership refreshed live/);
+  } finally {
+    srv.close();
+  }
+});
+
 test('auth login against a server with no device endpoints fails clearly (404)', async () => {
   // a bare 404 server stands in for one without the device grant
   const srv = http.createServer((req, res) => {

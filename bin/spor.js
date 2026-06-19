@@ -1450,8 +1450,64 @@ async function loginViaLoopback(cfg, { server, org, scope, noOpen }) {
   });
 }
 
-// `spor auth list` — every stored tenant, which is active, and token health.
-function cmdAuthList(cfg) {
+// One stored-tenant display line, shared by the cached and the live listings.
+// Byte-identical to the inline form `auth list` printed before the live
+// re-query landed (norm-cc-byte-identical-refactor).
+function tenantLine(t, mark) {
+  const idn = t.person ? `  ${t.person}${t.email ? ` <${t.email}>` : ""}` : t.email ? `  <${t.email}>` : "";
+  return `${mark} ${t.org || "(no org)"}  ${t.server}${idn}  [${tokenHealth(t)}]`;
+}
+
+// Render the LIVE org membership for one issuer (GET /v1/me/org-choices,
+// source:idp) joined against the stored tenants. Surfaces three states the
+// cached listing can't: an org you belong to but hold NO credential for yet
+// (a login hint), a stored credential the IdP no longer reports (revoked or
+// stale), and stored credentials on OTHER issuers — out of scope for this
+// single-issuer re-query, but never hidden, since `auth list` must always
+// show every credential the user holds.
+function listLiveMembership(store, srv, choices) {
+  const onSrv = new Map(); // org -> { key, t }, stored tenants on this issuer
+  const other = []; // { key, t } on a different issuer
+  for (const k of Object.keys(store.tenants)) {
+    const t = store.tenants[k];
+    if (auth.normServer(t.server) === srv) onSrv.set(t.org || "", { key: k, t });
+    else other.push({ key: k, t });
+  }
+  const shown = new Set();
+  for (const c of choices) {
+    const org = (c && c.slug) || "";
+    const have = onSrv.get(org);
+    if (have) {
+      shown.add(org);
+      out(tenantLine(have.t, have.key === store.default ? "*" : " "));
+    } else {
+      // belong to the org, no local credential — the genuinely new live signal
+      const label = c && c.label && c.label !== org ? `  (${c.label})` : "";
+      out(`  ${org || "(no org)"}  ${srv}${label}  [no credential — run 'spor auth login --org ${org}']`);
+    }
+  }
+  // Stored credentials on this issuer the live membership did NOT report — the
+  // token still works, but the IdP no longer lists you in that org.
+  for (const [org, { key, t }] of onSrv) {
+    if (shown.has(org)) continue;
+    out(`${tenantLine(t, key === store.default ? "*" : " ")}  (not in current membership)`);
+  }
+  for (const { key, t } of other) out(tenantLine(t, key === store.default ? "*" : " "));
+}
+
+// `spor auth list` — every stored tenant, which is active, and token health,
+// REFRESHED LIVE when the server supports it. A single GET /v1/me/org-choices
+// against the active tenant's issuer enumerates every org the person currently
+// belongs to (task-spor-cli-auth-list-live-membership-requery), so an org
+// added or removed since the last login surfaces without re-authenticating.
+// remote.get resolves the active credential through the cascade and refreshes
+// it transparently on a 401, so a stale-but-refreshable active token still
+// re-queries. Fail-open like the rest of the client (dec-cc-fail-open-hooks):
+// only `source: "idp"` is a true live enumeration — a tenant-`bound`
+// single-org token, a 502 `membership_requery_failed`, an older server with no
+// endpoint (404), and any offline/unparseable response all fall through to the
+// cached store listing, byte-identical to the pre-live behavior.
+async function cmdAuthList(cfg) {
   const store = auth.readStore(cfg.userConfigHome());
   const keys = Object.keys(store.tenants);
   if (!keys.length) {
@@ -1465,14 +1521,24 @@ function cmdAuthList(cfg) {
     out("no stored credentials. Run 'spor auth login' (or 'spor join <url> <token>').");
     return 0;
   }
-  for (const k of keys) {
-    const t = store.tenants[k];
-    const mark = k === store.default ? "*" : " ";
-    const idn = t.person ? `  ${t.person}${t.email ? ` <${t.email}>` : ""}` : t.email ? `  <${t.email}>` : "";
-    out(`${mark} ${t.org || "(no org)"}  ${t.server}${idn}  [${tokenHealth(t)}]`);
+
+  const srv = auth.normServer(remote.base(cfg));
+  let live = null;
+  if (srv) {
+    const r = await remote.get(cfg, "/v1/me/org-choices", { timeoutMs: 5000 });
+    if (r.ok && r.json && r.json.source === "idp" && Array.isArray(r.json.org_choices)) {
+      live = r.json.org_choices;
+    }
+  }
+
+  if (live) {
+    listLiveMembership(store, srv, live);
+  } else {
+    for (const k of keys) out(tenantLine(store.tenants[k], k === store.default ? "*" : " "));
   }
   out(``);
   out(`* = active tenant. Switch with 'spor auth switch <org>'.`);
+  if (live) out(`membership refreshed live from ${srv}.`);
   return 0;
 }
 
@@ -1558,7 +1624,7 @@ async function cmdAuth(cfg, args) {
       return await cmdAuthLogin(cfg, rest);
     case undefined:
     case "list":
-      return cmdAuthList(cfg);
+      return await cmdAuthList(cfg);
     case "switch":
       return cmdAuthSwitch(cfg, rest);
     case "whoami":
@@ -4291,7 +4357,7 @@ const COMMANDS = {
       "                                membership endpoint; falls back to one org)\n" +
       "      --no-open                 do not auto-open a browser\n" +
       "      <url> <token>             paste path — store a pre-minted PAT (like join)\n" +
-      "  spor auth list                stored tenants, which is active, token health\n" +
+      "  spor auth list                tenants + live org membership, active, token health\n" +
       "  spor auth switch <org>        set the active (default) tenant\n" +
       "  spor auth whoami [--all]      identity for the active tenant (or all of them)\n" +
       "  spor auth logout [<org>]      clear one tenant, the active one, or --all\n\n" +
