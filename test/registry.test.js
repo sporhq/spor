@@ -802,7 +802,12 @@ test("seed pack: core type schemas gate status to their vocabulary", () => {
   };
   for (const [type, { ok, bad }] of Object.entries(cases)) {
     const sb = sandboxFor(reg.nodeSchemas.get(type));
-    assert.deepEqual(sb.names, ["transitions"], `${type} exports transitions()`);
+    // Every gated type exports transitions(); task/issue/question additionally
+    // carry the read-time get() enrichment hook (task-spor-schema-get-hook-readtime-
+    // enrichment) — decision does not. Order-independent so a future verb add stays
+    // a one-line change.
+    const expectedExports = type === "decision" ? ["transitions"] : ["transitions", "get"];
+    assert.deepEqual(sb.names.slice().sort(), expectedExports.slice().sort(), `${type} schema exports ${expectedExports.join("+")}`);
     const gate = (status, view = RESOLVED_VIEW) =>
       sb.call("transitions", [{ id: `${type}-x`, status: "" }, { id: `${type}-x`, status }, view], SLACK);
     for (const s of ok) assert.equal(gate(s).allow, true, `${type}: '${s}' should be allowed`);

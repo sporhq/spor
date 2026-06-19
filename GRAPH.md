@@ -238,12 +238,23 @@ return values cross back, so `require`, `process`, `eval`, the `Function`
 constructor, host prototypes, ambient time/IO, and unbounded loops are all
 unavailable (a runaway hits a fuel/memory interrupt). A hook that throws does not
 wave the write through — it **rejects** it. Write the functions accordingly: no
-external state, no side effects, decide only from the arguments. Two more
+external state, no side effects, decide only from the arguments. Three more
 attached exports are recognized: `queueSignals(node, ctx)` (a `{ name: number }`
-map blended into the decision-queue ranking) and named upgrade functions
-referenced from `payload.upgrades` (lazy, forward-only field migrations on a
-`schema_version` bump). The **client** half (hooks, the `spor` CLI, `lib/`) only
-*parses and indexes* this code for the registry knobs — it never executes it;
+map blended into the decision-queue ranking); `get(node, ctx)` — the **read-time
+enrichment** hook, run on `get_node`, returning an object whose keys ride along on
+the read. Where `transitions()` is the write-time gate, `get()` is its read-time
+peer: the server hands it a *bounded one-hop neighborhood* (`ctx.neighbors` — this
+node's inbound + outbound edges each with the neighbor's `{id, edge, dir, type,
+status, title, summary, date, superseded}`, capped — plus `ctx.non_resolving_statuses`
+and `ctx.terminal`), and the hook attaches derived context — e.g. an answered
+`question` surfacing WHAT answered it. It is read-only and **fail-soft** (a throw
+drops the enrichment, never breaks the read; the only hook that fails open rather
+than closed); reserved core keys (`id`/`raw`/`frontmatter`/`revision`) can't be
+clobbered. The seed `question`/`issue`/`task`/`incident` schemas carry one, the
+single mechanism that expresses the resolution ride-along. Finally, named upgrade
+functions referenced from `payload.upgrades` (lazy, forward-only field migrations
+on a `schema_version` bump). The **client** half (hooks, the `spor` CLI, `lib/`)
+only *parses and indexes* this code for the registry knobs — it never executes it;
 the server is the sole executor.
 
 Resolution and rollout: a graph-resident schema always beats the seed pack, and

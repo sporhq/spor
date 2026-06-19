@@ -118,6 +118,15 @@ export function transitions(node, proposed, graph) { ... }
 export function queueSignals(node, graph, activity) {
   return { blocking: ..., heat: ..., staleness: ..., age_days: ... };
 }
+
+// get(node, ctx) — read-time enrichment, run on get_node; the read-time peer of
+// transitions(). The host hands in a bounded one-hop neighborhood (ctx.neighbors,
+// not a live graph), and the returned object's keys ride along on the read.
+// Read-only, fail-soft. Expresses the resolution ride-along on the seed
+// question/issue/task/incident schemas (task-spor-schema-get-hook-readtime-enrichment).
+export function get(node, ctx) {
+  return { resolution: ... };
+}
 ```
 ```
 

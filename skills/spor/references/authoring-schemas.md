@@ -93,19 +93,30 @@ types use:
   `view.approvals`, `view.non_resolving_statuses`. (The task type's gate uses
   `view.resolvers` to require a resolving `decision`/`artifact` before `done`.)
 
-Two more hooks are supported but unused by the seed types:
+Three more hooks are supported:
 
 - `validate(node)` — runs at the door on **every write (create and update)**.
   Extra field checks beyond the base validator (e.g. "a `severity` is required
   and must be one of …"). Return a list of error message strings, `[]` meaning
   valid; the server prefixes each with `<schema-id> validate():`. The sandbox
-  passes only the node — there is no second argument.
+  passes only the node — there is no second argument. (Unused by the seed types.)
 - `queueSignals(node, ctx)` — contribute a `{name: number}` map of ranking
-  signals to the decision queue.
+  signals to the decision queue. (Used by the seed `workflow-run` type to surface
+  stuck runs.)
+- `get(node, ctx)` — **read-time enrichment**, run on `get_node`; the read-time
+  peer of `transitions()`. The server hands in a *bounded one-hop neighborhood*
+  (`ctx.neighbors` — this node's inbound + outbound edges, each with the neighbor's
+  `{id, edge, dir, type, status, title, summary, date, superseded}`, capped — plus
+  `ctx.non_resolving_statuses` and `ctx.terminal`), not a live graph handle, and the
+  object you return rides along on the read (reserved keys `id`/`raw`/`frontmatter`/
+  `revision` can't be clobbered). **Fail-soft**: a throw drops the enrichment rather
+  than failing the read. The seed `question`/`issue`/`task`/`incident` types use it
+  to attach `resolution` — WHAT answered/resolved this node — so an already-terminal
+  item still points at its outcome.
 
 To read a real, current attached function, fetch a live schema:
-`spor get schema-task` shows a two-gate `transitions`. (The seed schemas also
-ship in the plugin's `lib/seed/` if you have a checkout.)
+`spor get schema-task` shows a two-gate `transitions` and a `get` hook. (The seed
+schemas also ship in the plugin's `lib/seed/` if you have a checkout.)
 
 ### A complete example
 
