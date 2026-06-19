@@ -55,11 +55,12 @@ function scratchHome() {
 }
 
 // Minimal /v1/me stub so the join confirm is fast and deterministic instead of
-// hitting the real hosted host.
-function meStub() {
+// hitting the real hosted host. `extra` merges into the echo body (e.g. {org}
+// for the opaque-token keying tests, task-spor-client-me-org-consume).
+function meStub(extra = {}) {
   const srv = http.createServer((req, res) => {
     const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
-    if (req.url === "/v1/me") return j(200, { bound: true, person: "person-test", email: "t@test.dev", is_admin: false });
+    if (req.url === "/v1/me") return j(200, { bound: true, person: "person-test", email: "t@test.dev", is_admin: false, ...extra });
     return j(404, { error: { code: "not_found" } });
   });
   return new Promise((resolve) => srv.listen(0, "127.0.0.1", () => resolve({ srv, base: `http://127.0.0.1:${srv.address().port}` })));
@@ -128,6 +129,41 @@ test("join: no args writes the hosted default tenant and notes the missing token
     assert.strictEqual(t.server, DEFAULT_SERVER, "bare join still onboards to the hosted base");
     assert.ok(!t.access_token, "no token written");
     assert.match(r.stdout, /no token given/);
+  } finally {
+    srv.close();
+  }
+});
+
+// task-spor-client-me-org-consume: an opaque spor_pat_/spor_oat_ token carries no
+// readable `org` claim, so without the /v1/me echo every such tenant on one
+// server collides on key "<server>/". The confirm now falls back to me.org for
+// the (server, org) key, AFTER --org and the JWT claim.
+test("join: opaque token keys by the org echoed from /v1/me (no --org, no JWT claim)", { skip: isWin }, async () => {
+  const home = scratchHome();
+  const { srv, base } = await meStub({ org: "acme" });
+  try {
+    const r = await runAsync(["join", base, "spor_pat_opaque"], baseEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    const store = auth.readStore(home);
+    const t = store.tenants[`${base}/acme`];
+    assert.ok(t, "tenant keyed by (server, org) from the /v1/me echo");
+    assert.strictEqual(t.org, "acme", "echoed org stored on the credential");
+    assert.ok(!store.tenants[`${base}/`], "did not collide on the org-less key");
+  } finally {
+    srv.close();
+  }
+});
+
+test("join: explicit --org wins over the /v1/me org echo", { skip: isWin }, async () => {
+  const home = scratchHome();
+  const { srv, base } = await meStub({ org: "echoed" });
+  try {
+    const r = await runAsync(["join", base, "spor_pat_x", "--org", "chosen"], baseEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    const store = auth.readStore(home);
+    assert.ok(store.tenants[`${base}/chosen`], "keyed by the explicit --org");
+    assert.strictEqual(store.tenants[`${base}/chosen`].org, "chosen");
+    assert.ok(!store.tenants[`${base}/echoed`], "the echo did not override --org");
   } finally {
     srv.close();
   }

@@ -1002,6 +1002,14 @@ async function acquireTenant(cfg, { server, token, org, refresh_token, exp, labe
     if (me.ok && me.json) {
       person = me.json.person || null;
       email = me.json.email || null;
+      // Opaque-token tenants (spor_oat_/spor_pat_) carry no client-readable org,
+      // so jwtOrg() is empty and they would all key to "<server>/" and collide.
+      // The server now echoes the resolved org on /v1/me (task-spor-frontdoor-
+      // me-org-echo) — fall back to it, AFTER --org and the JWT `org` claim, so a
+      // person in >1 org on one opaque server keys distinct credentials.
+      if (!resolvedOrg && typeof me.json.org === "string" && me.json.org) {
+        resolvedOrg = me.json.org;
+      }
       if (me.json.bound === false) {
         out(`⚠ token maps to no person node — routed questions and your personal queue will be empty`);
       }
