@@ -641,6 +641,21 @@ function recordingStub(home) {
   fs.chmodSync(stub, 0o755);
   return stub;
 }
+// A clean HOME (no ~/.claude manifest) + a harness-free PATH (only git, for the
+// config load's git shell-outs), so the satisfiability re-probe `spor dispatch`
+// now runs (task-spor-dispatch-fresh-probe-before-satisfiability) yields a
+// DETERMINISTIC set on ANY box: empty harnesses/plugins/skills, with reachable_mcp
+// seeded to [spor] only in remote mode. Mirrors cleanProbeEnv() in
+// capabilities-publish.test.js — without pinning HOME/PATH the probe reads this
+// box's REAL harnesses (a dev box with `codex` on PATH flips a "harness not
+// available here" assertion) + ~/.claude plugins/skills. Merge into a test's env.
+function cleanProbeEnv() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cleanhome-"));
+  const pathDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-path-"));
+  const git = (spawnSync("/bin/sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout || "").trim();
+  if (git) { try { fs.symlinkSync(git, path.join(pathDir, "git")); } catch { /* ignore */ } }
+  return { HOME: home, PATH: pathDir };
+}
 
 test("dispatch --profile: refuses when this machine can't satisfy it; nothing launches, assignment untouched", { skip: process.platform === "win32" }, () => {
   const { home, nodes, repo } = fixture();
@@ -648,7 +663,7 @@ test("dispatch --profile: refuses when this machine can't satisfy it; nothing la
   setCaps(home, { declared: { harnesses: ["claude-code"] } }); // codex NOT available here
   const stub = recordingStub(home);
   const mark = path.join(home, "launched.mark");
-  const r = run(["dispatch", "dec-x", "--dir", repo, "--profile", "profile-codex", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
+  const r = run(["dispatch", "dec-x", "--dir", repo, "--profile", "profile-codex", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark, ...cleanProbeEnv() });
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /can't satisfy profile profile-codex/);
   assert.match(r.stderr, /harness 'codex' not available here \(codex not on PATH\)/);
@@ -689,7 +704,7 @@ test("dispatch <node>: the assigned->agent edge profile attr is honored (no --pr
   setCaps(home, { declared: { harnesses: ["claude-code"] } });
   const stub = recordingStub(home);
   const mark = path.join(home, "launched.mark");
-  const r = run(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
+  const r = run(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark, ...cleanProbeEnv() });
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /can't satisfy profile profile-codex \(via assigned → agent-test\)/);
   assert.ok(!fs.existsSync(mark));
@@ -711,7 +726,7 @@ test("dispatch <node>: falls back to the assigned agent's default uses-profile",
   setCaps(home, { declared: { harnesses: ["claude-code"] } });
   const stub = recordingStub(home);
   const mark = path.join(home, "launched.mark");
-  const r = run(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
+  const r = run(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark, ...cleanProbeEnv() });
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /can't satisfy profile profile-codex \(via agent-test default\)/);
   assert.ok(!fs.existsSync(mark));
@@ -721,7 +736,7 @@ test("dispatch --print --profile: previews the verdict and writes nothing", { sk
   const { home, nodes, repo } = fixture();
   writeProfile(nodes, "profile-codex", "harness: codex");
   setCaps(home, { declared: { harnesses: ["claude-code"] } });
-  const r = run(["dispatch", "dec-x", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--print"], { SPOR_HOME: home });
+  const r = run(["dispatch", "dec-x", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--print"], { SPOR_HOME: home, ...cleanProbeEnv() });
   assert.strictEqual(r.status, 0); // --print never fails
   assert.match(r.stdout, /profile: profile-codex \(via --profile\) — UNSATISFIABLE here/);
   assert.match(r.stdout, /harness 'codex' not available here/);
@@ -753,6 +768,10 @@ function fleetStub({ hosts, hostsStatus = 200 } = {}) {
     if (pm && req.method === "GET") {
       const id = decodeURIComponent(pm[1]);
       if (id === "profile-codex") return j(200, { id, raw: PROFILE_MD("profile-codex", "harness: codex") });
+      // An mcp:[spor] profile — satisfiable on ANY remote box by construction,
+      // since the fresh re-probe seeds reachable_mcp:[spor] in remote mode
+      // (task-spor-dispatch-fresh-probe-before-satisfiability).
+      if (id === "profile-spor") return j(200, { id, raw: PROFILE_MD("profile-spor", "mcp: [spor]") });
       return j(404, { error: { code: "not_found" } });
     }
     const hm = req.url.match(/^\/v1\/profiles\/([^/?]+)\/hosts/);
@@ -798,7 +817,7 @@ test("dispatch (remote, unsatisfiable): names the fleet hosts that satisfy the p
   });
   try {
     const r = await runAsyncDisp(["dispatch", "do a thing here", "--dir", repo, "--profile", "profile-codex", "--no-brief"],
-      remoteCapEnv(home, base, { SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark }));
+      remoteCapEnv(home, base, { SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark, ...cleanProbeEnv() }));
     assert.strictEqual(r.status, 1);
     assert.match(r.stderr, /can't satisfy profile profile-codex/);
     // CONSUMES the scheduler: names the satisfiable hosts as re-route targets…
@@ -824,7 +843,7 @@ test("dispatch (remote, unsatisfiable, no host satisfies): escalates to the owne
     ], counts: { satisfiable: 0, unsatisfiable: 2 } },
   });
   try {
-    const r = await runAsyncDisp(["dispatch", "do a thing here", "--dir", repo, "--profile", "profile-codex", "--no-brief"], remoteCapEnv(home, base));
+    const r = await runAsyncDisp(["dispatch", "do a thing here", "--dir", repo, "--profile", "profile-codex", "--no-brief"], remoteCapEnv(home, base, cleanProbeEnv()));
     assert.strictEqual(r.status, 1);
     assert.match(r.stderr, /NO fleet host currently satisfies profile-codex — escalate to the owner/);
     assert.match(r.stderr, /2 box\(es\) checked; none satisfy it/);
@@ -840,7 +859,7 @@ test("dispatch (remote, unsatisfiable): a scheduler outage falls back to the gen
   // The profile node resolves, but the /hosts route 404s (undeployed surface).
   const { srv, base } = await fleetStub({ hostsStatus: 404 });
   try {
-    const r = await runAsyncDisp(["dispatch", "do a thing here", "--dir", repo, "--profile", "profile-codex", "--no-brief"], remoteCapEnv(home, base));
+    const r = await runAsyncDisp(["dispatch", "do a thing here", "--dir", repo, "--profile", "profile-codex", "--no-brief"], remoteCapEnv(home, base, cleanProbeEnv()));
     assert.strictEqual(r.status, 1);
     assert.match(r.stderr, /can't satisfy profile profile-codex/);
     // falls back to the original generic re-route hint
@@ -858,7 +877,7 @@ test("dispatch (remote, unsatisfiable): a 403 (steward-scoped) is reported as an
   // NOT be reported as a scheduler outage (issue-spor-capabilities-hosts-403-misreported).
   const { srv, base } = await fleetStub({ hostsStatus: 403 });
   try {
-    const r = await runAsyncDisp(["dispatch", "do a thing here", "--dir", repo, "--profile", "profile-codex", "--no-brief"], remoteCapEnv(home, base));
+    const r = await runAsyncDisp(["dispatch", "do a thing here", "--dir", repo, "--profile", "profile-codex", "--no-brief"], remoteCapEnv(home, base, cleanProbeEnv()));
     assert.strictEqual(r.status, 1);
     assert.match(r.stderr, /can't satisfy profile profile-codex/);
     assert.match(r.stderr, /not authorized to list fleet hosts for profile-codex/);
@@ -875,10 +894,49 @@ test("dispatch (local, unsatisfiable): byte-identical — no scheduler consult",
   const { home, nodes, repo } = fixture();
   writeProfile(nodes, "profile-codex", "harness: codex");
   setCaps(home, { declared: { harnesses: ["claude-code"] } });
-  const r = run(["dispatch", "dec-x", "--dir", repo, "--profile", "profile-codex", "--no-brief"], { SPOR_HOME: home });
+  const r = run(["dispatch", "dec-x", "--dir", repo, "--profile", "profile-codex", "--no-brief"], { SPOR_HOME: home, ...cleanProbeEnv() });
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /assignment is unchanged. Re-route to a machine that satisfies it/);
   assert.doesNotMatch(r.stderr, /fleet host/); // local mode never consults the scheduler
+});
+
+// --- fresh re-probe before the satisfiability check
+// (task-spor-dispatch-fresh-probe-before-satisfiability) --- The satisfiability
+// gate re-probes THIS box (like the session-start auto-publish + manual
+// `spor capabilities publish`) before collapsing capabilities, so a box whose
+// .probed is empty/stale still satisfies an `mcp:[spor]` profile it can run.
+test("dispatch (remote): an mcp:[spor] profile satisfies on a box with EMPTY .probed — the fresh re-probe seeds reachable_mcp:[spor]", { skip: process.platform === "win32" }, async () => {
+  const { home, repo } = fixture();
+  // No prior session-start: .probed is absent and reachable_mcp is UNDECLARED.
+  // Before the fix this collapsed to an empty reachable_mcp and the mcp:[spor]
+  // profile was wrongly UNSATISFIABLE here; the re-probe now seeds it (remote).
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const { srv, base } = await fleetStub();
+  try {
+    const r = await runAsyncDisp(
+      ["dispatch", "do a thing here", "--dir", repo, "--profile", "profile-spor", "--no-brief", "--print"],
+      remoteCapEnv(home, base, cleanProbeEnv())
+    );
+    assert.strictEqual(r.status, 0, r.stderr); // --print never fails
+    assert.match(r.stdout, /profile: profile-spor \(via --profile\) — satisfiable here/);
+    assert.doesNotMatch(r.stdout, /UNSATISFIABLE/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch (local): the same mcp:[spor] profile is UNSATISFIABLE on an empty box — the spor seed is REMOTE-gated (no server bound)", { skip: process.platform === "win32" }, () => {
+  // The gate: the re-probe seeds reachable_mcp:[spor] only when a server is bound
+  // (cfg.mode() === "remote"). In local mode there is no spor MCP by construction,
+  // so an mcp:[spor] profile with no declared reachable_mcp stays unsatisfiable —
+  // the user must declare it (spor capabilities allow-mcp spor).
+  const { home, nodes, repo } = fixture();
+  writeProfile(nodes, "profile-spor", "mcp: [spor]");
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const r = run(["dispatch", "dec-x", "--dir", repo, "--profile", "profile-spor", "--no-brief", "--print"], { SPOR_HOME: home, ...cleanProbeEnv() });
+  assert.strictEqual(r.status, 0); // --print never fails
+  assert.match(r.stdout, /profile: profile-spor \(via --profile\) — UNSATISFIABLE here/);
+  assert.match(r.stdout, /MCP server\(s\) not available here: spor/);
 });
 
 // --- user-supplied prompt templates (task-spor-dispatch-user-prompt-templates)

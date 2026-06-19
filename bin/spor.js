@@ -2113,7 +2113,28 @@ async function resolveDispatchProfile(cfg, { profileFlag, nodeRaw, identityAgent
   const pnode = await resolveNode(cfg, id);
   if (!pnode || !pnode.raw) return explicit ? { id, source, found: false, verdict: null } : null;
   const profile = parse(pnode.raw, "profile.md") || { id };
-  const machine = sat.effectiveCapabilities(cfg.get("dispatch.capabilities", {}) || {});
+  // Re-probe THIS box before collapsing so the verdict reflects current reality —
+  // crucially the deterministic reachable_mcp:[spor] seed
+  // (task-spor-mcp-reachability-deterministic-seed): in remote mode the spor MCP
+  // is reachable BY CONSTRUCTION in a dispatched session, so the probe seeds it
+  // and an `mcp:[spor]` profile host-matches. Without this, a box whose .probed is
+  // empty/stale (no prior session-start) would fail satisfies() for a profile it
+  // can actually run, refusing or degrading the dispatch
+  // (task-spor-dispatch-fresh-probe-before-satisfiability). Mirrors the
+  // session-start auto-publish and the manual `spor capabilities publish`
+  // (issue-spor-capabilities-publish-manual-no-spor-seed): probe with
+  // sporReachable gated on remote mode, then merge the fresh probe over the
+  // in-memory config. Best-effort — on failure fall back to the in-memory config.
+  // Reached only AFTER a profile resolved (the early returns above), so a
+  // profile-free dispatch stays byte-identical with no probe side effect.
+  const rawCap = cfg.get("dispatch.capabilities", {}) || {};
+  let probed = null;
+  try {
+    probed = u.probeCapabilities(cfg.userConfigHome(), { sporReachable: cfg.mode() === "remote" });
+  } catch {
+    /* probe is best-effort; match against what the cascade already holds */
+  }
+  const machine = sat.effectiveCapabilities(probed ? { ...rawCap, probed } : rawCap);
   return { id, source, found: true, verdict: sat.satisfies(machine, profile) };
 }
 
