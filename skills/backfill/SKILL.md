@@ -32,17 +32,20 @@ repos accumulate.
 Gather every `type: repo` and `type: project` node, plus each repo's `slugs`,
 `fingerprints`, and current `grouped-under` edge (if any):
 
+- **With the `spor` CLI** (shell): enumerate the local graph with `spor query`
+  (the CLI resolves the graph home for you) —
+  ```bash
+  spor query --type repo --full        # repo nodes: slugs, fingerprints, grouped-under edge
+  spor query --type project --summary  # the existing groupings
+  spor query --edges --edge-type grouped-under   # who is already homed
+  ```
+  Repo nodes carry `slugs:` and `fingerprints:` and (if homed) a `grouped-under`
+  edge; project nodes are the groupings themselves. (`spor query` enumerates the
+  local graph; against a team server, use the MCP tools below or `spor lens`.)
 - **With the Spor MCP tools** (Cowork, or Claude Code with the connector):
   call `render_lens` with no `lens_id` to list the saved lenses, render the
   project-breakdown one to see existing projects and their members, and
   `query_graph` for repo nodes; `get_node` each repo to read its `fingerprints`.
-- **Local mode** (`SPOR_SERVER` unset): scan the graph home directly —
-  ```bash
-  SPOR_HOME="${SPOR_HOME:-$HOME/.spor}"; [ -d "$SPOR_HOME/nodes" ] || SPOR_HOME="$HOME/.substrate"
-  grep -lE '^type: (repo|project)$' "$SPOR_HOME"/nodes/*.md
-  ```
-  Read each match: repo nodes carry `slugs:` and `fingerprints:` and (if homed)
-  a `grouped-under` edge; project nodes are the groupings themselves.
 
 The repos with no `grouped-under` edge are the ones to home.
 
@@ -53,9 +56,9 @@ without one. So before grouping, find the distinct stamp slugs that have no
 matching `type: repo` node (no `repo-<slug>` id and not in any `slugs:`
 register) and register an ungrouped identity node for each:
 
-- **Local:** write `$SPOR_HOME/nodes/repo-<slug>.md` — `type: repo`,
-  `title: <slug>`, `slugs: [<slug>]`, today's `date`, no edges — then validate
-  (plugin root resolved as in step d).
+- **Shell (local graph):** write `repo-<slug>.md` in the graph's `nodes/` dir
+  (`spor status` prints the resolved graph home) — `type: repo`, `title: <slug>`,
+  `slugs: [<slug>]`, today's `date`, no edges — then `spor validate`.
 - **Spor MCP tools:** `put_node` the same `type: repo` node.
 
 Register them with **slugs only** — fingerprints accrue automatically when a
@@ -108,22 +111,15 @@ A grouping node's id is `proj-<stem>` (the `proj-` grouping prefix); it owns no
 slugs or fingerprints — those live on the repo nodes. The home is a
 `grouped-under` edge written ON the repo node, pointing TO the project.
 
+- **Shell (local graph):** create `proj-<stem>.md` in the graph's `nodes/` dir
+  (`type: project`, `title`, `summary`, today's `date`), and add a
+  `- {type: grouped-under, to: proj-<stem>}` line under each member repo node's
+  `edges:`. Then `spor validate`, fix anything it flags, and commit the graph
+  repo if it is one.
 - **Spor MCP tools:** `put_node` the new `type: project` node (skip if it
   exists), then for each member repo `add_edge {id: "repo-<slug>", type:
   "grouped-under", to: "proj-<stem>"}`. To RE-HOME a repo later, remove the old
   `grouped-under` edge and add the new one — still exactly one home.
-- **Local mode:** create `$SPOR_HOME/nodes/proj-<stem>.md` (`type: project`,
-  `title`, `summary`, today's `date`), and add a
-  `- {type: grouped-under, to: proj-<stem>}` line under each member repo node's
-  `edges:`. Then validate — resolve the plugin root the session-start hook
-  cached (issue-cc-skill-plugin-root-unsubstituted):
-  ```bash
-  SPOR_ROOT="$(cat "${SPOR_HOME:-$HOME/.spor}/cache/plugin-root" 2>/dev/null \
-    || cat "$HOME/.substrate/cache/plugin-root" 2>/dev/null)"
-  SPOR_ROOT="${SPOR_ROOT:-$CLAUDE_PLUGIN_ROOT}"
-  node "$SPOR_ROOT/lib/validate.js"
-  ```
-  Fix anything it flags, and commit the graph repo if it is one.
 
 Report what you grouped, and — just as important — what you left ungrouped and
 why.

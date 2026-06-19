@@ -445,8 +445,18 @@ anything with a token.
   {grant_type: urn:ietf:params:oauth:grant-type:device_code, device_code}` —
   answering `authorization_pending`/`slow_down` until approval, then minting the
   same person-bound, **org-scoped**, refreshable `spor_oat_…`/`spor_ort_…` pair
-  `addGrant` mints. `--web` is a reserved localhost-loopback optimization (falls
-  back to device-code today). `spor auth login <url> <token>` / `spor join <url>
+  `addGrant` mints. `--web` is the localhost-loopback optimization for when a
+  browser is on the same machine (OAuth 2.1 authorization-code + PKCE, RFC 8252):
+  the CLI binds a one-shot `http://127.0.0.1:<port>/callback` listener,
+  anonymously registers a public client for it (`POST /oauth/register`, RFC 7591),
+  opens the browser to `GET /oauth/authorize {response_type=code, client_id,
+  redirect_uri, code_challenge, code_challenge_method=S256, state, scope?}`,
+  captures the redirected `?code` (CSRF-checked against `state`), and exchanges it
+  at `POST /oauth/token {grant_type: authorization_code, code, code_verifier,
+  client_id, redirect_uri}` for the same token pair; it then best-effort
+  unregisters the throwaway client (RFC 7592 `DELETE`). It falls back to the
+  device grant when the front door exposes no loopback/DCR endpoints. `spor auth
+  login <url> <token>` / `spor join <url>
   <token>` is the non-interactive paste path; CI stays `SPOR_TOKEN`. The minted
   credential is stored per-tenant (§6.2).
 - **Render tickets (shared lens links).** `POST /v1/lens/{id}/ticket` (§3)

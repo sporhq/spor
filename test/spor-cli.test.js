@@ -569,6 +569,104 @@ test('add with no text exits 1', () => {
   assert.match(r.stderr, /usage/);
 });
 
+// --- add capture-context fields + correct verb -----------------------------
+// task-cc-spor-skills-route-through-cli-drop-mode-prose: /spor:defer and
+// /spor:correct route through ONE verb each instead of a remote-curl-vs-local-
+// file mode branch. The verbs needed the capture-context fields (--during/
+// --blocks/--needed-by) and a correct verb; these pin both, local + fail-open.
+
+test('add (local) --during/--blocks write edges and --needed-by writes the field', () => {
+  const { dir, nodes } = fixtureGraph();
+  const r = run(
+    ['add', 'Platform must expose a token-rotation hook', '--type', 'task',
+      '--during', 'dec-x', '--blocks', 'dec-x', '--needed-by', '2026-07-15'],
+    { SPOR_HOME: dir },
+  );
+  assert.strictEqual(r.status, 0, r.stderr);
+  const file = fs.readdirSync(nodes).find((f) => f.startsWith('task-platform-must-expose'));
+  assert.ok(file, 'node written');
+  const md = fs.readFileSync(path.join(nodes, file), 'utf8');
+  assert.match(md, /needed_by: 2026-07-15/);
+  assert.match(md, /- \{type: derived-from, to: dec-x\}/);
+  assert.match(md, /- \{type: blocks, to: dec-x\}/);
+  // the enriched node still validates clean
+  const v = runLib('validate.js', ['--nodes', nodes]);
+  assert.strictEqual(v.status, 0, v.stdout);
+  assert.match(v.stdout, /0 errors/);
+});
+
+test('add (local) with no context fields is unchanged (no edges block)', () => {
+  const { dir, nodes } = fixtureGraph();
+  const r = run(['add', 'a plain capture with no lineage', '--type', 'task'], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const file = fs.readdirSync(nodes).find((f) => f.startsWith('task-a-plain-capture'));
+  const md = fs.readFileSync(path.join(nodes, file), 'utf8');
+  assert.doesNotMatch(md, /edges:/);
+  assert.doesNotMatch(md, /needed_by:/);
+});
+
+test('correct (local) writes a valid corr node targeting a node id', () => {
+  const { dir, nodes } = fixtureGraph();
+  const r = run(['correct', 'dec-x', 'lead with the rollback plan'], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /correction created: corr-dec-x-1/);
+  const md = fs.readFileSync(path.join(nodes, 'corr-dec-x-1.md'), 'utf8');
+  assert.match(md, /type: correction/);
+  assert.match(md, /target: dec-x/);
+  assert.match(md, /summary: lead with the rollback plan/); // every node needs a summary
+  assert.match(md, /lead with the rollback plan/);
+  // it validates clean and FIRES in a compile of the target
+  const v = runLib('validate.js', ['--nodes', nodes]);
+  assert.strictEqual(v.status, 0, v.stdout);
+  const compile = runLib('compile.js', ['--root', 'dec-x', '--nodes', nodes]);
+  assert.match(compile.stdout, /CORRECTIONS/);
+  assert.match(compile.stdout, /lead with the rollback plan/);
+});
+
+test('correct (local) handles project:/global targets, --pin/--exclude, and uniquifies', () => {
+  const { dir, nodes } = fixtureGraph();
+  const a = run(['correct', 'project:demo', '--pin', 'dec-x', '--title', 'demo-wide guidance'], { SPOR_HOME: dir });
+  assert.strictEqual(a.status, 0, a.stderr);
+  assert.ok(fs.existsSync(path.join(nodes, 'corr-project-demo-1.md')), 'project: target id is kebabbed');
+  const pmd = fs.readFileSync(path.join(nodes, 'corr-project-demo-1.md'), 'utf8');
+  assert.match(pmd, /target: project:demo/);
+  assert.match(pmd, /pin: \[dec-x\]/);
+  // a second correction on the same node-id target uniquifies (-1, -2)
+  run(['correct', 'dec-x', 'first'], { SPOR_HOME: dir });
+  run(['correct', 'dec-x', 'second'], { SPOR_HOME: dir });
+  assert.ok(fs.existsSync(path.join(nodes, 'corr-dec-x-1.md')));
+  assert.ok(fs.existsSync(path.join(nodes, 'corr-dec-x-2.md')));
+  // global target
+  const g = run(['correct', 'global', 'graph-wide guidance'], { SPOR_HOME: dir });
+  assert.strictEqual(g.status, 0, g.stderr);
+  assert.ok(fs.existsSync(path.join(nodes, 'corr-global-1.md')));
+});
+
+test('correct (local) warns when a pinned node does not exist, still writes', () => {
+  const { dir, nodes } = fixtureGraph();
+  const r = run(['correct', 'dec-x', '--pin', 'dec-missing', 'guidance'], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stderr, /pinned\/excluded node 'dec-missing' does not exist/);
+  assert.ok(fs.existsSync(path.join(nodes, 'corr-dec-x-1.md')));
+});
+
+test('correct with no target, or no guidance/pin/exclude, exits 1 with usage', () => {
+  const { dir } = fixtureGraph();
+  const noTarget = run(['correct'], { SPOR_HOME: dir });
+  assert.strictEqual(noTarget.status, 1);
+  assert.match(noTarget.stderr, /usage: spor correct/);
+  const empty = run(['correct', 'dec-x'], { SPOR_HOME: dir });
+  assert.strictEqual(empty.status, 1);
+  assert.match(empty.stderr, /needs at least one of/);
+});
+
+test('correct (remote) fails open against an unreachable server (no stack trace)', () => {
+  const r = run(['correct', 'dec-x', 'guidance'], { SPOR_SERVER: 'http://127.0.0.1:9', SPOR_TOKEN: 't' });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /offline/);
+  assert.doesNotMatch(r.stderr, /at Object|Error:/);
+});
+
 test('join APPENDS an org-scoped credential to the multi-tenant store (never repo)', () => {
   // join now appends to ~/.spor/auth/credentials.json instead of overwriting a
   // flat config.json (dec-spor-client-cli-mode-tenant-resolution). A dead server

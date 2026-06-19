@@ -14,99 +14,54 @@ Write 2-3 standalone sentences: WHAT the work is and WHY it was deferred
 concrete names (files, endpoints, node ids). Do not pick node types or ids —
 the server's ingestion model does that against the live schema registry.
 
-**Resolve mode silently.** The Spor status line injected at session start tells
-you which mode you're in (`team graph: …` = remote, `A Spor knowledge graph is
-active: …` = local); use it, or test `[ -n "$SPOR_SERVER" ]` once if it isn't in
-context. Don't echo `SPOR_SERVER`/`SPOR_TOKEN`/`SPOR_HOME` or announce the mode
-to the user unless they ask, and run the local-mode resolution below without
-echoing `$SPOR_ROOT`.
+## Capture it
 
-## Remote mode (team graph) — when `SPOR_SERVER` is set
-
-(Env vars here are the `SPOR_*` family; the legacy `SUBSTRATE_*` names are
-still read.)
-
-POST the raw text to `/v1/capture` (the REST twin of the `capture` MCP tool).
-Derive the project slug the same way the hooks do (kebab-cased basename of the
-git toplevel), and pass a `during` node id if the current task corresponds to
-a known graph node (check the session's briefing/digest for its id):
+One command — `spor add` resolves the graph (local vs team), the project slug,
+and your identity on its own, and types the node (remotely the server's
+ingestion model; locally a well-formed, validated file):
 
 ```bash
-TOP=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-# a committed .spor marker (repo: <slug>, legacy project:) beats basename inference
-SLUG=$(sed -nE 's/^repo:[ \t]*([a-z0-9][a-z0-9-]*)[ \t]*$/\1/p' "$TOP/.spor" 2>/dev/null | head -1)
-[ -n "$SLUG" ] || SLUG=$(sed -nE 's/^project:[ \t]*([a-z0-9][a-z0-9-]*)[ \t]*$/\1/p' "$TOP/.spor" 2>/dev/null | head -1)
-[ -n "$SLUG" ] || SLUG=$(basename "$TOP" \
-  | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
-curl -sS --max-time 90 -X POST \
-  -H "Authorization: Bearer $SPOR_TOKEN" -H "Content-Type: application/json" \
-  --data "$(jq -n --arg t '<the 2-3 sentences>' --arg p "$SLUG" \
-    '{text: $t, context: {project: $p}}')" \
-  "${SPOR_SERVER%/}/v1/capture"
-# with a during hint: '{text: $t, context: {project: $p, during: "<node-id>"}}'
+spor add "<the 2-3 sentences>"
 ```
 
-Read the response and tell the user what happened, briefly:
+If this discovery happened while working a known graph node (check the session's
+briefing/digest for its id), link it with `--during <node-id>` — a provenance
+edge so the capture traces back to the work it came from. Don't echo
+`SPOR_SERVER`/`SPOR_TOKEN`/`SPOR_HOME` or announce the mode unless the user asks.
 
-- `"status": "captured"` — report the node id(s) from `ids` and the one-line
-  `summary`. Done.
-- `"status": "pending"` — the text fit no schema; it was preserved as a
-  `cap-…` node for later triage. Say so; nothing is lost.
-- `503 ingestion_unavailable` — the server's ingestion model is down. Offer
-  to retry, or fall back to the local-mode steps below so the fact still
-  lands somewhere durable.
+Read what it prints and tell the user, briefly:
 
-In Cowork, call the `capture` MCP tool directly with the same fields
-(`text`, `project`, `during`) — there is no shell there.
+- `captured: <ids>` — report the node id(s) and what landed. Done.
+- `captured (pending)` — the text fit no schema; it was preserved as a `cap-…`
+  node for later triage. Say so; nothing is lost.
+- an `offline` / `error 503` line — the team graph's ingestion is unreachable or
+  down. The hooks' outbox retries shipped captures in a normal session; offer to
+  retry, or the fact is safe to re-add later.
+
+**In Cowork (no shell)**, call the `capture` MCP tool with the same fields
+(`text`, `project`, `during`, and the `blocks`/`needed_by` below).
 
 ## Declaring a cross-project dependency
 
 When the deferred work is something *another* team/repo must do for the
 current initiative — the kind of cross-cutting dependency that otherwise gets
 discovered late (task-cc-xproject-dependency-loop) — declare it so it surfaces
-in the SERVING team's queue from day one, on both sides. Add two fields to
-`context`:
+in the SERVING team's queue from day one, on both sides:
 
-- `project`: the **serving** project slug (who must do the work), NOT the
+```bash
+spor add "<the 2-3 sentences>" --project <serving-slug> --blocks <requester-id> --needed-by 2026-07-15
+```
+
+- `--project` is the **serving** project slug (who must do the work), NOT the
   current session's slug.
-- `blocks`: the node id of the requesting work this dependency blocks (it must
-  already exist — create the requester first if needed).
-- `needed_by`: a `YYYY-MM-DD` deadline. Unlike `wake` (which hides a node until
-  its date), `needed_by` keeps it visible and ramps its queue urgency as the
-  date nears.
+- `--blocks` is the node id of the requesting work this dependency blocks — it
+  must already exist (create the requester first if needed).
+- `--needed-by` is a `YYYY-MM-DD` deadline. Unlike `wake` (which hides a node
+  until its date), `needed_by` keeps it visible and ramps its queue urgency as
+  the date nears.
 
-```bash
-curl -sS --max-time 90 -X POST \
-  -H "Authorization: Bearer $SPOR_TOKEN" -H "Content-Type: application/json" \
-  --data "$(jq -n --arg t '<the 2-3 sentences>' \
-    '{text: $t, context: {project: "platform", blocks: "task-my-initiative", needed_by: "2026-07-15"}}')" \
-  "${SPOR_SERVER%/}/v1/capture"
-```
-
-The server attaches the `blocks` edge and `needed_by` deterministically (not
-via the model). A missing `blocks` target returns `404`, a non-date
-`needed_by` returns `422` — both before any model call. In Cowork, pass the
-same `blocks`/`needed_by` fields to the `capture` MCP tool. In **local mode**,
-write the node yourself (next section) into the serving project: stamp
-`project: <serving-slug>`, add a `- {type: blocks, to: <requester-id>}` edge,
-and a `needed_by: YYYY-MM-DD` line.
-
-## Local mode (personal graph) — `SPOR_SERVER` unset
-
-There is no server-side ingester locally, so write the node yourself, the
-GRAPH.md way: a `task-<kebab-slug>.md` file in `$SPOR_HOME/nodes/` (default
-`~/.spor/nodes/`; an existing `~/.substrate` is still used when `~/.spor` is
-absent) with id = filename minus `.md`, `type: task`,
-`project: <slug>`, a standalone `summary`, today's `date`, and a
-`derived-from` edge to the node the work was discovered during, if known.
-If the deferral reason is load-bearing ("because the release is Friday"),
-record it in the body. Then validate — `${CLAUDE_PLUGIN_ROOT}` is empty in
-the Bash tool, so resolve the plugin root from the session-start cache first
-(issue-cc-skill-plugin-root-unsubstituted):
-```bash
-SPOR_ROOT="$(cat "${SPOR_HOME:-$HOME/.spor}/cache/plugin-root" 2>/dev/null \
-  || cat "$HOME/.substrate/cache/plugin-root" 2>/dev/null)"
-SPOR_ROOT="${SPOR_ROOT:-$CLAUDE_PLUGIN_ROOT}"
-node "$SPOR_ROOT/lib/validate.js"
-```
-Fix anything it flags, and commit the graph repo if it is one.
+The server attaches the `blocks` edge and `needed_by` deterministically (not via
+the model): a missing `--blocks` target returns `404`, a non-date `--needed-by`
+returns `422` — both before any model call. Locally, the same flags write the
+edge and the `needed_by:` field onto the node directly. In Cowork, pass the same
+`blocks`/`needed_by` fields to the `capture` MCP tool.

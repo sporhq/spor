@@ -810,18 +810,32 @@ function today() {
 async function cmdAdd(cfg, { values, positionals }) {
   const prose = positionals[0];
   if (!prose) {
-    err('usage: spor add "<text>" [--type T] [--title ...] [--project S]');
+    err('usage: spor add "<text>" [--type T] [--title ...] [--project S] [--during ID] [--blocks ID] [--needed-by YYYY-MM-DD]');
     return 1;
   }
   const project = values.project || safeSlug();
+  // Capture-context fields the /spor:defer skill uses (so it routes through ONE
+  // verb instead of a mode branch): --during is the work this was discovered
+  // during (a provenance edge); --blocks + --needed-by declare a cross-project
+  // dependency (task-cc-xproject-dependency-loop) — set --project to the SERVING
+  // project and the server attaches the blocks edge + deadline deterministically.
+  const during = values.during || null;
+  const blocks = values.blocks || null;
+  const neededBy = values["needed-by"] || null;
 
   if (cfg.mode() === "remote") {
-    const r = await remote.post(cfg, "/v1/capture", { text: prose, context: { project } });
+    const context = { project };
+    if (during) context.during = during;
+    if (blocks) context.blocks = blocks;
+    if (neededBy) context.needed_by = neededBy;
+    const r = await remote.post(cfg, "/v1/capture", { text: prose, context });
     if (r.transport) {
       err(`offline — capture not shipped (${r.error}). It will be retried by the hooks' outbox in a normal session.`);
       return 1;
     }
     if (!r.ok) {
+      // Surface the deterministic cross-project rejections the server makes
+      // before any model call (missing blocks target -> 404, bad date -> 422).
       err(`capture error ${r.status}`);
       return 1;
     }
@@ -856,7 +870,16 @@ async function cmdAdd(cfg, { values, positionals }) {
   let base = id;
   while (fs.existsSync(path.join(nodesDir, `${id}.md`))) id = `${base}-${++n}`;
 
-  const md = `---\nid: ${id}\ntype: ${type}\nrepo: ${project}\ntitle: ${title.replace(/\n/g, " ")}\nsummary: ${summary.replace(/\n/g, " ")}\ndate: ${today()}\n---\n\n${prose}\n`;
+  // Local equivalents of the capture-context fields: --during -> a derived-from
+  // edge (the provenance the distiller would draw), --blocks -> a blocks edge,
+  // --needed-by -> the needed_by deadline field. So the same `spor add` line the
+  // /spor:defer skill runs lands the same lineage locally as remote.
+  const edgeLines = [];
+  if (during) edgeLines.push(`  - {type: derived-from, to: ${during}}`);
+  if (blocks) edgeLines.push(`  - {type: blocks, to: ${blocks}}`);
+  const edgesBlock = edgeLines.length ? `edges:\n${edgeLines.join("\n")}\n` : "";
+  const neededByLine = neededBy ? `needed_by: ${neededBy}\n` : "";
+  const md = `---\nid: ${id}\ntype: ${type}\nrepo: ${project}\ntitle: ${title.replace(/\n/g, " ")}\nsummary: ${summary.replace(/\n/g, " ")}\n${neededByLine}${edgesBlock}date: ${today()}\n---\n\n${prose}\n`;
   // validate before writing (parse, then the same rules lib/validate enforces)
   let node;
   try {
@@ -873,6 +896,100 @@ async function cmdAdd(cfg, { values, positionals }) {
   fs.writeFileSync(path.join(nodesDir, `${id}.md`), md);
   out(`added ${id} (${type}) to ${nodesDir}`);
   out(`  edit it to add edges/detail; 'spor next' will surface it.`);
+  return 0;
+}
+
+// --- spor correct -------------------------------------------------------
+// Record a standing correction to a briefing — the CLI surface for /spor:correct,
+// so the skill routes through ONE verb instead of a remote-curl-vs-local-file
+// mode branch (task-cc-spor-skills-route-through-cli-drop-mode-prose). Remote:
+// POST /v1/corrections (propose_correction's REST twin); the server generates the
+// corr-<target>-<n> id, builds + validates + commits the node. Local: write the
+// corr node file ourselves and validate. Either way the correction fires at every
+// future compile whose scope includes the target (node id | project:<slug> |
+// global), per lib/kernel/graph.js correctionInScope.
+async function cmdCorrect(cfg, { values, positionals }) {
+  const target = positionals[0];
+  const guidance = values.guidance != null ? values.guidance : positionals[1];
+  if (!target) {
+    err('usage: spor correct <target> [guidance] [--pin ID] [--exclude ID] [--title ...]');
+    err("  target is a node id, project:<slug>, or global");
+    return 1;
+  }
+  // --pin/--exclude are repeatable (parseArgs multiple: true -> arrays); a lone
+  // string is normalized to a one-element list. Empty when neither is given.
+  const toList = (v) => (v == null ? [] : Array.isArray(v) ? v : [v]);
+  const pin = toList(values.pin);
+  const exclude = toList(values.exclude);
+  if (!guidance && !pin.length && !exclude.length) {
+    err("a correction needs at least one of: guidance text, --pin, or --exclude");
+    return 1;
+  }
+  const title = values.title || `correction for ${target}`;
+
+  if (cfg.mode() === "remote") {
+    const body = { target, pin, exclude, guidance: guidance || "", title };
+    const r = await remote.post(cfg, "/v1/corrections", body, { timeoutMs: 8000 });
+    if (r.transport) {
+      err(`offline — could not reach server (${r.error})`);
+      return 1;
+    }
+    if (!r.ok) {
+      err(`correction error ${r.status}`);
+      return 1;
+    }
+    const id = (r.json && r.json.id) || "";
+    out(id ? `correction created: ${id}` : `correction created (${(r.json && r.json.status) || "ok"})`);
+    const warnings = (r.json && r.json.warnings) || [];
+    for (const w of warnings) err(`  warning: ${w}`);
+    return 0;
+  }
+
+  // local: write corr-<target>-<n>.md and validate
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const nodesDir = cfg.nodesDir();
+  if (!fs.existsSync(nodesDir)) {
+    err(`no graph at ${nodesDir} — run 'spor init' first`);
+    return 1;
+  }
+  // The target carries a ':' for project: scope, which is not a legal id char —
+  // kebab it into the id stem (project:spor -> project-spor, global -> global).
+  const stem = kebab(target) || "x";
+  let n = 1;
+  let id = `corr-${stem}-${n}`;
+  while (fs.existsSync(path.join(nodesDir, `${id}.md`))) id = `corr-${stem}-${++n}`;
+  const listInline = (a) => `[${a.join(", ")}]`;
+  // Every node needs a standalone summary (validateNode); use the guidance, else
+  // the title. One line, capped well under the frontmatter's comfort zone.
+  const summary = (guidance || title).replace(/\n/g, " ").slice(0, 200);
+  const md =
+    `---\nid: ${id}\ntype: correction\ntitle: ${title.replace(/\n/g, " ")}\n` +
+    `summary: ${summary}\ntarget: ${target}\npin: ${listInline(pin)}\nexclude: ${listInline(exclude)}\n` +
+    `date: ${today()}\n---\n\n${guidance || ""}\n`;
+  let node;
+  try {
+    node = graphLib.parseFrontmatter(md, `${id}.md`);
+  } catch (e) {
+    err(`invalid correction: ${e.message}`);
+    return 1;
+  }
+  let g;
+  try {
+    g = graphLib.loadGraph(nodesDir);
+  } catch (e) {
+    err(`could not load graph: ${e.message}`);
+    return 1;
+  }
+  const v = graphLib.validateNode(g, node);
+  if (!v.ok) {
+    err(`invalid correction:\n  ${v.errors.join("\n  ")}`);
+    return 1;
+  }
+  // pin/exclude must name existing nodes (mirror the server's id-only rule).
+  const missing = [...pin, ...exclude].filter((x) => !fs.existsSync(path.join(nodesDir, `${x}.md`)));
+  for (const m of missing) err(`  warning: pinned/excluded node '${m}' does not exist yet — create it for the correction to take effect`);
+  fs.writeFileSync(path.join(nodesDir, `${id}.md`), md);
+  out(`correction created: ${id} (targets ${target}) in ${nodesDir}`);
   return 0;
 }
 
@@ -1066,18 +1183,33 @@ async function cmdAuthLogin(cfg, args) {
   // Default to the hosted Spor front door when no server is named — onboarding
   // parity with `spor join <token>` (task-spor-api-cli-default-server-base).
   const server = auth.normServer(serverFlag || cfg.server() || DEFAULT_SERVER);
-  if (web) {
-    out("note: --web (localhost loopback) is not implemented yet (task-cc-spor-auth-cli-web-loopback);");
-    out("      using the device-code flow — it auto-opens your browser when one is local.");
-  }
   if (all) {
     out("note: --all (one token per org in a single leg) needs the front-door membership");
     out("      endpoint (task-spor-frontdoor-org-membership-enumeration), not yet shipped —");
     out("      logging into one org for now; re-run 'spor auth login --org <other>' for more.");
   }
 
-  // RFC 8628 §3.1 — start the device authorization.
-  const da = await auth.deviceAuthorize(server, { scope });
+  // --web: the localhost-loopback variant (auth code + PKCE), the browser-local
+  // optimization. It falls back to the device grant when the server has no
+  // loopback/DCR support (task-cc-spor-auth-cli-web-loopback).
+  if (web) {
+    const r = await loginViaLoopback(cfg, { server, org, scope, noOpen });
+    if (r !== "fallback") return r;
+    out("note: this server has no loopback/DCR endpoints — using the device-code flow.");
+  }
+
+  return loginViaDevice(cfg, { server, org, scope, noOpen });
+}
+
+// The default interactive flow: the RFC 8628 device authorization grant. Works
+// headless / over SSH — the human approves in a browser on their OWN machine, so
+// no local listener or port-forward is needed. Returns an exit code.
+async function loginViaDevice(cfg, { server, org, scope, noOpen }) {
+  // RFC 8628 §3.1 — start the device authorization. The RFC 8707 `resource` indicator
+  // is the api host this token will call (`server`), so the issuer can scope the minted
+  // token's `aud` to it (task-spor-app-api-strict-audience-restriction). Inert against an
+  // un-armed / self-host issuer, so it is always safe to send.
+  const da = await auth.deviceAuthorize(server, { scope, resource: server });
   if (da.transport) {
     err(`offline — could not reach ${server} (${da.error})`);
     return 1;
@@ -1135,6 +1267,177 @@ async function cmdAuthLogin(cfg, args) {
     err("timed out waiting for approval — run 'spor auth login' again.");
     return 1;
   }
+  const exp =
+    tokens.expires_in != null ? Math.floor(Date.now() / 1000) + Number(tokens.expires_in) : auth.jwtExp(tokens.access_token);
+  return acquireTenant(cfg, {
+    server,
+    token: tokens.access_token,
+    refresh_token: tokens.refresh_token,
+    org,
+    exp,
+    makeDefault: true,
+  });
+}
+
+// The minimal page the loopback redirect lands on: the human reads it in the
+// browser and returns to the terminal. No external assets (the loopback server
+// is one-shot), Connection: close so the browser drops the socket and the CLI
+// process can exit.
+function loopbackPage(ok, detail) {
+  const e = (s) =>
+    String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const title = ok ? "Signed in to Spor" : "Sign-in failed";
+  const body = ok
+    ? "You're signed in. You can close this tab and return to your terminal."
+    : `Sign-in did not complete${detail ? ` (${e(detail)})` : ""}. Return to your terminal and try again.`;
+  return (
+    `<!doctype html><meta charset="utf-8"><title>${e(title)}</title>` +
+    `<body style="font:15px/1.5 system-ui,-apple-system,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;color:#16242b">` +
+    `<h1 style="font-size:1.15rem;margin:0 0 .5rem">${e(title)}</h1><p style="margin:0">${body}</p></body>`
+  );
+}
+
+// `spor auth login --web` — the localhost-loopback variant (OAuth 2.1
+// authorization-code + PKCE, RFC 8252), the browser-local optimization over the
+// device grant. Bind a one-shot 127.0.0.1 listener, anonymously DCR-register a
+// public client for its exact loopback redirect, open the browser to
+// /oauth/authorize, capture the redirected ?code (CSRF-checked against state),
+// and exchange it (+ the PKCE verifier) for the org-scoped token pair. Returns
+// an exit code, or the string "fallback" when the server has no loopback/DCR
+// support (the caller then runs the device grant). task-cc-spor-auth-cli-web-loopback.
+async function loginViaLoopback(cfg, { server, org, scope, noOpen }) {
+  const http = require("http");
+  // PKCE (S256, RFC 7636) + a CSRF state (RFC 6749 §10.12). base64url throughout.
+  const verifier = crypto.randomBytes(32).toString("base64url");
+  const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
+  const state = crypto.randomBytes(16).toString("base64url");
+
+  // 1) Bind the loopback listener FIRST: the redirect_uri must carry the real
+  //    bound port (the front door exact-matches it at /oauth/authorize), and the
+  //    browser may arrive the instant the URL opens.
+  let settle;
+  const captured = new Promise((resolve) => {
+    settle = resolve;
+  });
+  let done = false;
+  const finish = (v) => {
+    if (!done) {
+      done = true;
+      settle(v);
+    }
+  };
+  const srv = http.createServer((req, res) => {
+    let reqUrl;
+    try {
+      reqUrl = new URL(req.url, "http://127.0.0.1");
+    } catch {
+      res.writeHead(400, { connection: "close" });
+      res.end();
+      return;
+    }
+    if (reqUrl.pathname !== "/callback") {
+      res.writeHead(404, { "content-type": "text/plain", connection: "close" });
+      res.end("not found");
+      return;
+    }
+    const qp = reqUrl.searchParams;
+    const oauthErr = qp.get("error");
+    const code = qp.get("code");
+    const stateOk = qp.get("state") === state;
+    const ok = !oauthErr && !!code && stateOk;
+    const detail = oauthErr || (!stateOk ? "state mismatch" : !code ? "no code" : "");
+    res.writeHead(ok ? 200 : 400, { "content-type": "text/html; charset=utf-8", connection: "close" });
+    res.end(loopbackPage(ok, detail));
+    if (oauthErr) finish({ error: oauthErr });
+    else if (!stateOk) finish({ error: "state_mismatch" });
+    else if (code) finish({ code });
+    else finish({ error: "no_code" });
+  });
+  try {
+    await new Promise((resolve, reject) => {
+      srv.once("error", reject);
+      srv.listen(0, "127.0.0.1", resolve);
+    });
+  } catch (e) {
+    err(`could not bind a loopback listener (${e.message}); using the device-code flow.`);
+    return "fallback";
+  }
+  const port = srv.address().port;
+  const redirectUri = `http://127.0.0.1:${port}/callback`;
+
+  // 2) Anonymous DCR — register the public client for this exact redirect.
+  const reg = await auth.registerClient(server, { redirectUris: [redirectUri], clientName: "spor CLI (loopback)" });
+  if (reg.transport) {
+    srv.close();
+    err(`offline — could not reach ${server} (${reg.error})`);
+    return 1;
+  }
+  if (reg.status === 404) {
+    srv.close();
+    return "fallback"; // front door has no DCR endpoint
+  }
+  if (!reg.ok || !reg.json || !reg.json.client_id) {
+    srv.close();
+    const msg = oauthErrMsg(reg.json);
+    err(`client registration failed (${reg.status}${msg ? ` — ${msg}` : ""})`);
+    return 1;
+  }
+  const clientId = reg.json.client_id;
+  const regToken = reg.json.registration_access_token;
+  const regUri = reg.json.registration_client_uri;
+
+  // 3) Build the authorize URL and open the browser.
+  const authUrl = new URL(`${server}/oauth/authorize`);
+  authUrl.searchParams.set("response_type", "code");
+  authUrl.searchParams.set("client_id", clientId);
+  authUrl.searchParams.set("redirect_uri", redirectUri);
+  authUrl.searchParams.set("code_challenge", challenge);
+  authUrl.searchParams.set("code_challenge_method", "S256");
+  authUrl.searchParams.set("state", state);
+  if (scope) authUrl.searchParams.set("scope", scope);
+  // RFC 8707 resource indicator — the api host this token will call (`server`), so
+  // the issuer can scope the minted token's `aud` to it (task-spor-app-api-strict-
+  // audience-restriction). Echoed at the token exchange below. Inert when un-armed.
+  authUrl.searchParams.set("resource", server);
+
+  out(`To sign in, open this URL in a browser on this machine:`);
+  out(`  ${authUrl.toString()}`);
+  out(``);
+  if (!noOpen) tryOpenBrowser(authUrl.toString());
+  out(`Waiting for the browser to complete sign-in (Ctrl-C to cancel)…`);
+
+  // 4) Await the redirect (bounded), then stop listening.
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ error: "timeout" }), 5 * 60_000);
+  });
+  const result = await Promise.race([captured, timeout]);
+  clearTimeout(timer);
+  srv.close();
+
+  // 5) Clean up the throwaway client (best-effort; the grant does not need it).
+  await auth.unregisterClient(regUri, regToken);
+
+  if (result.error) {
+    if (result.error === "timeout") err("timed out waiting for the browser — run 'spor auth login --web' again.");
+    else if (result.error === "access_denied") err("authorization was denied.");
+    else if (result.error === "state_mismatch") err("the redirect failed its CSRF (state) check — login aborted.");
+    else err(`login failed: ${result.error}`);
+    return 1;
+  }
+
+  // 6) Exchange the code (+ PKCE verifier) for the org-scoped token pair.
+  const tok = await auth.exchangeCode(server, { code: result.code, codeVerifier: verifier, clientId, redirectUri, resource: server });
+  if (tok.transport) {
+    err(`offline — token exchange not completed (${tok.error})`);
+    return 1;
+  }
+  if (!tok.ok || !tok.json || !tok.json.access_token) {
+    const msg = oauthErrMsg(tok.json);
+    err(`token exchange failed (${tok.status}${msg ? ` — ${msg}` : ""})`);
+    return 1;
+  }
+  const tokens = tok.json;
   const exp =
     tokens.expires_in != null ? Math.floor(Date.now() / 1000) + Number(tokens.expires_in) : auth.jwtExp(tokens.access_token);
   return acquireTenant(cfg, {
@@ -3982,7 +4285,8 @@ const COMMANDS = {
       "                                prints a code + URL, you approve in any browser)\n" +
       "      --server <url>            the Spor front door (else SPOR_SERVER / active)\n" +
       "      --org <slug>              label/select the org for the stored credential\n" +
-      "      --web                     localhost-loopback variant (falls back to device)\n" +
+      "      --web                     localhost-loopback variant (auth code + PKCE;\n" +
+      "                                falls back to device-code if unsupported)\n" +
       "      --all                     one token per org membership (needs the server\n" +
       "                                membership endpoint; falls back to one org)\n" +
       "      --no-open                 do not auto-open a browser\n" +
@@ -4088,14 +4392,24 @@ const COMMANDS = {
     help:
       "Capture a node from prose. In remote mode the server's ingestion model types\n" +
       "and links it; in local mode a well-formed, validated node file is written so\n" +
-      "you never hand-author frontmatter. --type/--title/--id apply to local mode.",
+      "you never hand-author frontmatter. --type/--title/--id apply to local mode.\n\n" +
+      "Capture context (both modes): --during links to the work this was discovered\n" +
+      "during (a derived-from edge). --blocks <id> + --needed-by <date> declare a\n" +
+      "cross-project dependency — set --project to the SERVING project (who must do\n" +
+      "the work) and it surfaces in their queue, ramping urgency as the date nears.",
     options: {
       type: { type: "string", value: "T", desc: "node type (local only; default: task)" },
       title: { type: "string", value: "...", desc: "title (default: first 10 words)" },
-      project: { type: "string", value: "S", desc: "project slug (default: inferred from cwd)" },
+      project: { type: "string", value: "S", desc: "project slug (default: inferred from cwd; the SERVING project for a cross-project dependency)" },
       id: { type: "string", value: "id", desc: "explicit node id (local only)" },
+      during: { type: "string", value: "id", desc: "node this was discovered during (derived-from edge)" },
+      blocks: { type: "string", value: "id", desc: "node id this work blocks (cross-project dependency; target must exist)" },
+      "needed-by": { type: "string", value: "date", desc: "YYYY-MM-DD deadline that ramps queue urgency (pairs with --blocks)" },
     },
-    examples: ['spor add "Cache tf-idf norms across compiles for speed" --type task'],
+    examples: [
+      'spor add "Cache tf-idf norms across compiles for speed" --type task',
+      'spor add "Platform must expose a token-rotation hook" --project platform --blocks task-my-initiative --needed-by 2026-07-15',
+    ],
     run: (cfg, p) => cmdAdd(cfg, p),
   },
   next: {
@@ -4166,6 +4480,30 @@ const COMMANDS = {
       "spor query --edges --edge-type grouped-under --to proj-rdi",
     ],
     run: (cfg, args) => cmdQuery(cfg, args),
+  },
+  correct: {
+    group: "Graph", parse: "strict", args: "<target> [guidance]", aliases: ["propose-correction"],
+    summary: "record a standing briefing correction (local: corr file; remote: /v1/corrections)",
+    help:
+      "Record a correction that fires at every future compile whose scope includes the\n" +
+      "target. The target is a node id (fixes one topic's briefing), project:<slug>\n" +
+      "(every compile for that project), or global (every compile, every project).\n\n" +
+      "Pin a node that was missed (--pin), exclude a stale/irrelevant one (--exclude),\n" +
+      "and/or pass free-text guidance (positional or --guidance). --pin/--exclude are\n" +
+      "repeatable and must name existing nodes. Remote mode POSTs /v1/corrections (the\n" +
+      "server mints the corr-<target>-<n> id); local mode writes the corr node file.",
+    options: {
+      pin: { type: "string", value: "id", desc: "pin a node that was missed (repeatable)", multiple: true },
+      exclude: { type: "string", value: "id", desc: "exclude a stale/irrelevant node (repeatable)", multiple: true },
+      guidance: { type: "string", value: "...", desc: "free-text guidance (else the second positional)" },
+      title: { type: "string", value: "...", desc: "one-line title (default: 'correction for <target>')" },
+    },
+    examples: [
+      'spor correct dec-x "lead with the rollback plan, it is the binding constraint"',
+      "spor correct issue-86 --pin dec-new-policy --exclude dec-stale",
+      'spor correct project:spor "always cite the conformance suite for refactors"',
+    ],
+    run: (cfg, p) => cmdCorrect(cfg, p),
   },
 
   // --- Repo scoping ---
