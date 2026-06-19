@@ -425,6 +425,195 @@ test("dispatch spawns the claude binary with --bg in the target dir", { skip: pr
   assert.ok(argv.includes("--name") && argv.includes("dec-x"));
 });
 
+// --- worktree isolation (dispatch.worktree) ------------------------------
+// Run the dispatched agent in its own git worktree off the target repo so
+// parallel dispatches never race the shared tree/index. Opt-in; dispatch owns
+// create + setup hook + launch cwd. Posix-only (the claude stub is a shell
+// script and the setup hook is /bin/sh).
+
+// A git-inited target repo with one commit, so `git worktree add ... HEAD` works.
+function gitTargetRepo() {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-wtrepo-"));
+  const g = (args) => {
+    const r = spawnSync("git", ["-C", repo, ...args], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@example.com",
+        GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@example.com",
+      },
+    });
+    assert.strictEqual(r.status, 0, r.stderr);
+    return r.stdout;
+  };
+  g(["init", "-q"]);
+  fs.writeFileSync(path.join(repo, "f.txt"), "x");
+  g(["add", "f.txt"]);
+  g(["commit", "-q", "-m", "root"]);
+  return { repo, real: fs.realpathSync(repo), g };
+}
+// Merge a patch into config.json's `dispatch` block (e.g. { worktree: true }).
+function setDispatch(home, patch) {
+  const file = path.join(home, "config.json");
+  let data = {};
+  try { data = JSON.parse(fs.readFileSync(file, "utf8")); } catch { /* fresh */ }
+  data.dispatch = Object.assign(data.dispatch || {}, patch);
+  fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+}
+// The pwd+argv-capturing claude stub (cwd on line 1, then each argv element).
+function pwdStub(home) {
+  const stub = path.join(home, "claude-stub.sh");
+  fs.writeFileSync(stub, `#!/bin/sh\n{ pwd; printf '%s\\n' "$@"; } > "$OUTFILE"\n`);
+  fs.chmodSync(stub, 0o755);
+  return stub;
+}
+
+test("dispatch --worktree --print: previews the worktree path + branch and creates nothing", () => {
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const r = run(["dispatch", "dec-x", "--no-brief", "--worktree", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  assert.match(r.stdout, new RegExp(`worktree: ${esc(path.join(repo, ".claude", "worktrees", "dec-x"))}\\s+\\(branch dec-x, off HEAD\\)`));
+  assert.match(r.stdout, /no setup hook \(dispatch\.worktreeSetup unset\)/);
+  assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees")), "--print created no worktree");
+});
+
+test("dispatch --worktree (stubbed): creates the worktree + branch and launches IN it, not the main checkout", { skip: process.platform === "win32" }, () => {
+  const { home } = fixture();
+  const { repo, real, g } = gitTargetRepo();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const outFile = path.join(home, "spawn.out");
+  const stub = pwdStub(home);
+  const r = run(["dispatch", "dec-x", "--no-brief", "--worktree"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const wtDir = path.join(repo, ".claude", "worktrees", "dec-x");
+  const cwd = fs.readFileSync(outFile, "utf8").split("\n")[0];
+  assert.strictEqual(cwd, fs.realpathSync(wtDir), "launched inside the worktree");
+  assert.notStrictEqual(cwd, real, "did NOT launch in the main checkout");
+  assert.ok(fs.existsSync(wtDir), "worktree dir exists on disk");
+  assert.match(g(["worktree", "list"]), new RegExp(esc(fs.realpathSync(wtDir))));
+  assert.strictEqual(g(["rev-parse", "--verify", "--quiet", "refs/heads/dec-x"]).trim().length, 40, "branch dec-x created");
+  function esc(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+});
+
+test("dispatch worktree setup hook: runs with cwd=worktree + dispatch context env, before launch", { skip: process.platform === "win32" }, () => {
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  // Hook drops a sentinel (proves cwd=worktree) recording SPOR_MAIN_CHECKOUT +
+  // SPOR_DISPATCH_NODE (proves the context env reached it).
+  const hook = path.join(home, "wt-setup.sh");
+  fs.writeFileSync(hook, `#!/bin/sh\nprintf '%s\\n%s\\n' "$SPOR_MAIN_CHECKOUT" "$SPOR_DISPATCH_NODE" > ./.wt-setup-ran\n`);
+  fs.chmodSync(hook, 0o755);
+  setDispatch(home, { worktree: true, worktreeSetup: hook });
+  const outFile = path.join(home, "spawn.out");
+  const stub = pwdStub(home);
+  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const sentinel = path.join(repo, ".claude", "worktrees", "dec-x", ".wt-setup-ran");
+  assert.ok(fs.existsSync(sentinel), "setup hook ran in the worktree (cwd=worktree)");
+  const [mainCheckout, node] = fs.readFileSync(sentinel, "utf8").split("\n");
+  assert.strictEqual(mainCheckout, repo, "SPOR_MAIN_CHECKOUT reached the hook");
+  assert.strictEqual(node, "dec-x", "SPOR_DISPATCH_NODE reached the hook");
+  assert.match(r.stdout, /setup ran/);
+});
+
+test("dispatch --no-worktree overrides dispatch.worktree=true: launches in the main checkout, no worktree", { skip: process.platform === "win32" }, () => {
+  const { home } = fixture();
+  const { repo, real } = gitTargetRepo();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  setDispatch(home, { worktree: true });
+  const outFile = path.join(home, "spawn.out");
+  const stub = pwdStub(home);
+  const r = run(["dispatch", "dec-x", "--no-brief", "--no-worktree"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const cwd = fs.readFileSync(outFile, "utf8").split("\n")[0];
+  assert.strictEqual(cwd, real, "launched in the main checkout");
+  assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees")), "no worktree created");
+});
+
+test("dispatch worktree setup hook failure: aborts, removes the worktree + branch, launches nothing", { skip: process.platform === "win32" }, () => {
+  const { home } = fixture();
+  const { repo, g } = gitTargetRepo();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const failHook = path.join(home, "fail.sh");
+  fs.writeFileSync(failHook, "#!/bin/sh\nexit 3\n");
+  fs.chmodSync(failHook, 0o755);
+  setDispatch(home, { worktree: true, worktreeSetup: failHook });
+  const mark = path.join(home, "launched.mark");
+  const stub = path.join(home, "rec.sh");
+  fs.writeFileSync(stub, `#!/bin/sh\necho launched > "$LAUNCH_MARK"\n`);
+  fs.chmodSync(stub, 0o755);
+  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
+  assert.notStrictEqual(r.status, 0, "non-zero exit on setup failure");
+  assert.match(r.stderr, /setup hook failed/);
+  assert.ok(!fs.existsSync(mark), "agent never launched");
+  assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees", "dec-x")), "half-prepped worktree removed");
+  // rev-parse --verify --quiet exits non-zero (no output) once the branch is gone
+  // — a raw call, since the asserting g() would throw on that expected miss.
+  const branchCheck = spawnSync("git", ["-C", repo, "rev-parse", "--verify", "--quiet", "refs/heads/dec-x"], { encoding: "utf8" });
+  assert.notStrictEqual(branchCheck.status, 0, "branch removed (rev-parse misses)");
+});
+
+test("dispatch --backfill --print: worktree forced off even with dispatch.worktree=true", () => {
+  const { home, repo } = fixture();
+  setDispatch(home, { worktree: true });
+  const r = run(["dispatch", "--backfill", "--print", "--dir", repo], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stdout, /worktree:/, "backfill onboards the main checkout, never a worktree");
+});
+
+// --- per-target-repo scoping: the TARGET repo's committable .spor.json --------
+// A cross-repo dispatch (standing somewhere else) honors the TARGET repo's own
+// dispatch.worktree[/Setup], since the cfg cascade only sees the dispatcher cwd.
+
+test("dispatch (cross-repo): honors the TARGET repo's .spor.json dispatch.worktree, not the standing config", { skip: process.platform === "win32" }, () => {
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  // The target repo declares it wants isolation; the standing config does NOT.
+  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktree: true } }) + "\n");
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-elsewhere-"));
+  const outFile = path.join(home, "spawn.out");
+  const stub = pwdStub(home);
+  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile }, elsewhere);
+  assert.strictEqual(r.status, 0, r.stderr);
+  const cwd = fs.readFileSync(outFile, "utf8").split("\n")[0];
+  assert.strictEqual(cwd, fs.realpathSync(path.join(repo, ".claude", "worktrees", "dec-x")), "launched in the worktree per target .spor.json");
+});
+
+test("dispatch (cross-repo): a relative dispatch.worktreeSetup in the target .spor.json resolves against the repo", { skip: process.platform === "win32" }, () => {
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  fs.mkdirSync(path.join(repo, "scripts"));
+  fs.writeFileSync(path.join(repo, "scripts", "wt-setup.sh"), "#!/bin/sh\ntouch ./.ran\n");
+  fs.chmodSync(path.join(repo, "scripts", "wt-setup.sh"), 0o755);
+  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktree: true, worktreeSetup: "scripts/wt-setup.sh" } }) + "\n");
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-elsewhere-"));
+  const stub = pwdStub(home);
+  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: path.join(home, "o.out") }, elsewhere);
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(path.join(repo, ".claude", "worktrees", "dec-x", ".ran")), "relative setup hook ran (resolved against the repo dir)");
+});
+
+test("dispatch --no-worktree overrides the target repo's .spor.json dispatch.worktree", { skip: process.platform === "win32" }, () => {
+  const { home } = fixture();
+  const { repo, real } = gitTargetRepo();
+  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktree: true } }) + "\n");
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-elsewhere-"));
+  const outFile = path.join(home, "spawn.out");
+  const stub = pwdStub(home);
+  const r = run(["dispatch", "dec-x", "--no-brief", "--no-worktree"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile }, elsewhere);
+  assert.strictEqual(r.status, 0, r.stderr);
+  const cwd = fs.readFileSync(outFile, "utf8").split("\n")[0];
+  assert.strictEqual(cwd, real, "launched in the main checkout despite the target asking for a worktree");
+  assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees")), "no worktree created");
+});
+
 // --- profile satisfiability gate (dec-spor-machine-profile-satisfiability) ---
 // Dispatch resolves the profile it would run under (--profile > assigned->agent
 // edge attr > agent default) and refuses soft-and-loud when THIS machine can't

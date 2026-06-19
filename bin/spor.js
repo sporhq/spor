@@ -2305,6 +2305,117 @@ function shellQuote(s) {
   return /[^\w./:-]/.test(s) ? `'${String(s).replace(/'/g, "'\\''")}'` : s;
 }
 
+// --- Dispatch worktree isolation -----------------------------------------
+// Run each dispatched agent in its OWN git worktree off the target repo so
+// concurrent dispatches never race the shared working tree/index — the
+// stale-working-tree / shared-checkout-CAS class (issue-spor-live-server-stale-
+// working-tree). Opt-in per repo (dispatch.worktree); dispatch OWNS the
+// lifecycle (create + setup hook + launch cwd) rather than `claude --bg`'s own
+// --worktree, because that is a bare `git worktree add` we can't prep before the
+// agent starts AND the launcher env never reaches the bg agent (it self-allocates
+// a spare worker). So the per-repo setup hook is the only place spor-server-class
+// deps (a node_modules symlink, $SPOR_LIB via the worktree's own
+// .claude/settings.local.json `env`) can be staged. The generic client knows
+// nothing of those — it just runs the configured hook.
+
+// A node id is already a clean branch/dir token; a free-text dispatch name may
+// carry spaces/punctuation that `git worktree add -b` rejects — sanitize to the
+// git-ref-safe subset the worktree dir and its branch both use.
+function worktreeName(name) {
+  return (
+    String(name || "")
+      .trim()
+      .replace(/[^A-Za-z0-9._-]+/g, "-")
+      .replace(/^[-.]+|[-.]+$/g, "")
+      .slice(0, 80) || "dispatch"
+  );
+}
+
+// Where a dispatched worktree lives — mirrors the .claude/worktrees/<name>
+// convention `claude --worktree` itself uses. Pure (no side effect) so the
+// --print preview and the real run agree on the path.
+function dispatchWorktreeDir(repoDir, name) {
+  return path.join(repoDir, ".claude", "worktrees", worktreeName(name));
+}
+
+// Create (or reuse) the dispatch worktree and run the optional setup hook.
+// Branches off LOCAL HEAD, never origin (local main is routinely ahead of
+// origin/main — worktree-base-ref-stale-origin). The setup hook runs with
+// cwd=worktree and the dispatch context in the env; `shell: true` lets the
+// config value be a script path OR an inline command. Returns { dir, branch,
+// reused, setupRan } on success; { error } if the worktree couldn't be made; or
+// { setupError, created, ... } the caller turns into an abort.
+function createDispatchWorktree(repoDir, name, { setup, slug, nodeId } = {}) {
+  const branch = worktreeName(name);
+  const dir = dispatchWorktreeDir(repoDir, name);
+  let reused = false;
+  if (fs.existsSync(dir)) {
+    reused = true; // a prior dispatch (or --force re-run) left it — reuse in place
+  } else {
+    fs.mkdirSync(path.dirname(dir), { recursive: true });
+    // Attach to an existing branch of this name if one survives a removed
+    // worktree; otherwise cut a fresh branch off HEAD.
+    const branchExists =
+      git(repoDir, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).status === 0;
+    const addArgs = branchExists
+      ? ["worktree", "add", dir, branch]
+      : ["worktree", "add", "-b", branch, dir, "HEAD"];
+    const r = git(repoDir, addArgs);
+    if (r.status !== 0) {
+      return { error: (r.stderr || r.stdout || "git worktree add failed").trim() };
+    }
+  }
+  if (setup) {
+    const sr = spawnSync(setup, [], {
+      cwd: dir,
+      stdio: "inherit",
+      shell: true,
+      env: {
+        ...process.env,
+        SPOR_WORKTREE: dir,
+        SPOR_MAIN_CHECKOUT: repoDir,
+        SPOR_DISPATCH_SLUG: slug || "",
+        SPOR_DISPATCH_NODE: nodeId || "",
+      },
+    });
+    if (sr.error) return { dir, branch, reused, created: !reused, setupError: sr.error.message };
+    if (sr.status !== 0) return { dir, branch, reused, created: !reused, setupError: `setup hook exited ${sr.status}` };
+    return { dir, branch, reused, setupRan: true };
+  }
+  return { dir, branch, reused, setupRan: false };
+}
+
+// Best-effort teardown of a worktree WE just created (setup-hook failure path):
+// never strand a half-prepped worktree + branch. A reused worktree is left
+// untouched (it predates this dispatch).
+function removeDispatchWorktree(repoDir, dir, branch) {
+  git(repoDir, ["worktree", "remove", "--force", dir]);
+  if (branch) git(repoDir, ["branch", "-D", branch]);
+}
+
+// Read the TARGET repo's committable .spor.json for its own dispatch.worktree[
+// /Setup]. The standing cfg cascade is anchored at the DISPATCHER's cwd (lib/
+// config.js layer 3 walks up from cwd), not res.dir — so without this a
+// cross-repo --slug/--dir dispatch wouldn't honor the target repo's declared
+// preference. A relative setup path resolves against the repo dir, so a
+// committable marker stays machine-portable (no absolute paths in a shared file).
+// Fail-open: a missing/malformed marker yields {} (no override).
+function targetRepoDispatchCfg(dir) {
+  let d;
+  try {
+    d = (JSON.parse(fs.readFileSync(path.join(dir, ".spor.json"), "utf8")) || {}).dispatch;
+  } catch {
+    return {};
+  }
+  if (!d || typeof d !== "object") return {};
+  const out = {};
+  if (typeof d.worktree === "boolean") out.worktree = d.worktree;
+  if (typeof d.worktreeSetup === "string" && d.worktreeSetup) {
+    out.worktreeSetup = path.isAbsolute(d.worktreeSetup) ? d.worktreeSetup : path.join(dir, d.worktreeSetup);
+  }
+  return out;
+}
+
 // Render a Handlebars-style {{placeholder}} prompt template against a vars map
 // (task-spor-dispatch-user-prompt-templates). Keys match case-insensitively and
 // tolerate inner whitespace ({{ brief }} == {{brief}}); a known key substitutes,
@@ -2562,6 +2673,26 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     err(`target dir does not exist: ${res.dir}`);
     return 1;
   }
+
+  // Worktree isolation. Run the agent in its own worktree off res.dir so parallel
+  // dispatches never collide on the shared tree/index. Resolution, highest wins:
+  //   --no-worktree > --worktree > TARGET repo .spor.json dispatch.worktree >
+  //   standing cfg dispatch.worktree > off.
+  // The TARGET repo's own .spor.json wins over the standing user/global config so
+  // a repo that declares it wants isolation is honored wherever it's dispatched
+  // FROM (the cfg cascade only sees the dispatcher's cwd). Forced off for
+  // --backfill, which sets up the MAIN checkout itself. The setup hook follows
+  // the same target-first precedence; relative paths in the marker resolve
+  // against the repo (the spor-server hook stages the node_modules symlink +
+  // $SPOR_LIB the bare worktree needs).
+  const targetCfg = targetRepoDispatchCfg(res.dir);
+  const worktreeSetup =
+    targetCfg.worktreeSetup != null ? targetCfg.worktreeSetup : cfg.get("dispatch.worktreeSetup", null);
+  const worktreeDefault =
+    targetCfg.worktree != null ? targetCfg.worktree : !!cfg.get("dispatch.worktree", false);
+  const useWorktree =
+    !backfill && (values["no-worktree"] ? false : !!(values.worktree || worktreeDefault));
+
   // Session project (issue-spor-dispatch-propagate-session-project-to-questions).
   // The launcher env never reaches a `claude --bg` agent (it self-allocates a
   // spare worker; dec-spor-session-identity-active-record), and the agent token
@@ -2691,6 +2822,12 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
 
   if (dryRun) {
     out(`dir:    ${res.dir}  (slug: ${res.slug}, via ${res.source})`);
+    if (useWorktree) {
+      out(
+        `worktree: ${dispatchWorktreeDir(res.dir, name)}  (branch ${worktreeName(name)}, off HEAD)` +
+          (worktreeSetup ? `; setup: ${worktreeSetup}` : `; no setup hook (dispatch.worktreeSetup unset)`)
+      );
+    }
     if (backfill) {
       const steps = [];
       if (cfg.mode() !== "remote") steps.push(fs.existsSync(cfg.nodesDir()) ? "graph home ready" : "init graph home");
@@ -2850,8 +2987,34 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     if (c.ok) out(`claimed ${nodeId} (lease established; the agent's writes will renew it)`);
     else err(`warning: could not establish a lease on ${nodeId}: ${c.error} — dispatching without a claim`);
   }
+  // Materialize the worktree just before launch — AFTER every guard/claim, so a
+  // refused dispatch never leaves a worktree behind — and run the agent inside it.
+  // res.dir stays the registered slug->path target (the durable main checkout,
+  // issue-spor-dispatch-worktree-dir-stamping); only the launch cwd moves.
+  let launchDir = res.dir;
+  if (useWorktree) {
+    const wt = createDispatchWorktree(res.dir, name, { setup: worktreeSetup, slug: res.slug, nodeId });
+    if (wt.error) {
+      err(`could not create dispatch worktree under ${res.dir}: ${wt.error}`);
+      err(`  (is ${res.dir} a git repo with at least one commit? or pass --no-worktree.)`);
+      return 1;
+    }
+    if (wt.setupError) {
+      err(`dispatch worktree setup hook failed: ${wt.setupError}`);
+      if (wt.created) {
+        removeDispatchWorktree(res.dir, wt.dir, wt.branch);
+        err(`  removed the half-prepped worktree ${wt.dir}. Fix dispatch.worktreeSetup or pass --no-worktree.`);
+      } else {
+        err(`  left the reused worktree ${wt.dir} in place. Fix dispatch.worktreeSetup or pass --no-worktree.`);
+      }
+      return 1;
+    }
+    launchDir = wt.dir;
+    out(`worktree: ${wt.dir} (branch ${wt.branch}${wt.reused ? ", reused" : ""}${wt.setupRan ? "; setup ran" : ""})`);
+  }
+
   claudeArgs.push(prompt);
-  const r = spawnSync(claudeBin, claudeArgs, { cwd: res.dir, stdio: "inherit" });
+  const r = spawnSync(claudeBin, claudeArgs, { cwd: launchDir, stdio: "inherit" });
   if (r.error) {
     err(`could not launch ${claudeBin}: ${r.error.message}`);
     return 1;
@@ -2869,7 +3032,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // claimed node).
   const wantBind = cfg.mode() === "remote" && (agentToken || (nodeId && !backfill && !noClaim));
   if (wantBind) {
-    const realSession = await captureDispatchSession(name, res.dir, pinnedSession);
+    const realSession = await captureDispatchSession(name, launchDir, pinnedSession);
     if (realSession) {
       if (agentToken) {
         const b = await bindAgentSession(cfg, agentToken, realSession);
@@ -3584,6 +3747,15 @@ const COMMANDS = {
       "A node dispatch is also refused if an agent for that node is already in flight\n" +
       "on THIS machine (each agent is named after its node id) — catches the\n" +
       "same-person duplicate the lease's idempotent renew can't. --force overrides.\n\n" +
+      "--worktree runs the agent in its own git worktree off the repo (branch = the\n" +
+      "node id / sanitized task), so parallel dispatches never race the shared tree/\n" +
+      "index. Make it a repo default with dispatch.worktree — in the TARGET repo's\n" +
+      "committable .spor.json (honored wherever it's dispatched from) or your\n" +
+      "machine-local config. dispatch.worktreeSetup names a hook (script path or\n" +
+      "command; relative paths resolve against the repo) that preps each worktree —\n" +
+      "it runs with cwd=worktree and SPOR_WORKTREE/SPOR_MAIN_CHECKOUT/\n" +
+      "SPOR_DISPATCH_SLUG|NODE in the env (e.g. symlink node_modules, write\n" +
+      ".claude/settings.local.json env). --no-worktree opts a single run out.\n\n" +
       "--template supplies your own prompt with {{brief}}/{{task}}/{{node}}/{{title}}/\n" +
       "{{slug}}/{{dir}}/{{default}} placeholders.\n\n" +
       "Two different 'agent' axes, don't confuse them: --as picks the Spor agent\n" +
@@ -3608,6 +3780,8 @@ const COMMANDS = {
       force: { type: "boolean", desc: "dispatch even if an agent for this node is already in flight here" },
       "from-queue": { type: "boolean", desc: "dispatch the top-ranked queue item not already in flight here" },
       backfill: { type: "boolean", desc: "onboard/repair this repo (runs /spor:backfill)" },
+      worktree: { type: "boolean", desc: "run the agent in its own git worktree (overrides dispatch.worktree)" },
+      "no-worktree": { type: "boolean", desc: "force-disable worktree isolation for this dispatch" },
       print: { type: "boolean", desc: "dry run — print the prompt, launch nothing" },
       "dry-run": DRYRUN_OPT,
     },
