@@ -385,6 +385,7 @@ function renderQueueLocalText(q, hidden = 0) {
   }
   if (q.count > items.length) out(`(${q.count - items.length} more — raise --limit)`);
   if (q.muted > 0) out(`(${q.muted} muted — your queue_mute)`);
+  if (q.blocked > 0) out(`(${q.blocked} blocked — gated by live work, hidden until unblocked)`);
   if (hidden > 0) out(`(${hidden} in-flight hidden — --hide-dispatched)`);
 }
 
@@ -497,6 +498,10 @@ function renderQueue(q, hidden = 0) {
       if (it.why) out(`        ${it.why}`);
     }
   }
+  // Counted, not silent: blocked items are gated out of the actionable queue
+  // (dec-spor-queue-hide-blocked), reported so their disappearance is never
+  // silent. Present only when the server forwards r.blocked; absent => no line.
+  if (q && q.blocked > 0) out(`(${q.blocked} blocked — gated by live work, hidden until unblocked)`);
   // Never-silent truncation (task-spor-cli-in-flight-surface): report what
   // --hide-dispatched removed, the way queue.js surfaces the muted count.
   if (hidden > 0) out(`(${hidden} in-flight hidden — --hide-dispatched)`);
@@ -2120,6 +2125,14 @@ async function topQueueItem(cfg, slug) {
   // predates / ignores exclude_type), so a question is never dispatched even
   // against a stale backend. Primary exclusion is at the ranker above.
   items = items.filter((it) => it.type !== "question");
+  if (!items.length) return null;
+  // Defense-in-depth (dec-spor-queue-hide-blocked): a current ranker drops
+  // blocked items from the page entirely, but a stale server may still return
+  // them demoted (suggest:blocked / blocked_by set). --from-queue dispatches an
+  // AGENT to do work, and a blocked item can't proceed until its unblocker
+  // lands — never dispatch one, even against an old backend. Mirrors the
+  // question defense above.
+  items = items.filter((it) => it.suggest !== "blocked" && !(Array.isArray(it.blocked_by) && it.blocked_by.length));
   if (!items.length) return null;
   // Skip items already in flight on this machine; advance to the first free one.
   const { items: free, hidden } = annotateInFlight(items, dispatchedAgents(), true);

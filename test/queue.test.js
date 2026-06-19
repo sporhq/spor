@@ -91,26 +91,51 @@ test("rankQueue: blocking counts live nodes transitively reachable over blocks e
     node("task-a", "task", { status: "open", edges: [["blocks", "task-b"]] }),
     node("task-b", "task", { status: "open" }),
     node("issue-c", "issue", { status: "resolved" }),
+    // an unblocked peer to compare against — task-a/task-b are live (so the
+    // blocking BFS still counts them) but blocked, so they leave the queue.
+    node("task-peer", "task", { status: "open" }),
   ])).load();
   const r = rankQueue(g, { now: NOW });
   const top = r.items[0];
   assert.equal(top.id, "task-unblocker");
   assert.equal(top.signals.blocking, 2, "task-a + task-b live; resolved issue-c not counted");
   assert.match(top.why, /blocks 2 live nodes/);
+  assert.equal(r.blocked, 2, "the two live-but-blocked nodes are hidden + counted");
   // blend: blocking dominates equal-age peers.
   assert.ok(top.score > r.items[1].score);
 });
 
-// ---------------- blocked demotion (issue-cc-queue-ranking-asymmetry) ----------------
+// ---------------- blocked hide + steward-view demotion ----------------
+// dec-spor-queue-hide-blocked, refining dec-cc-queue-blocked-demotion /
+// issue-cc-queue-ranking-asymmetry: a node with live inbound blockers leaves
+// the ACTIONABLE queue (hidden + counted), so `spor next` doesn't list it and
+// `spor dispatch --from-queue` can't pick it; the capacity/steward read
+// (assignee set) is exempt and still renders it demoted below its unblocker.
 
-test("rankQueue: a blocked item is demoted below its live blocker even when hotter", () => {
+test("rankQueue: a blocked item is hidden from the actionable queue and counted", () => {
   const g = tmpGraph(Object.fromEntries([
     node("task-unblocker", "task", { status: "open", edges: [["blocks", "task-gated"]] }),
     node("task-gated", "task", { status: "open" }),
   ])).load();
-  // heat would rank the gated item far above its unblocker without the cap.
+  // heat would rank the gated item far above its unblocker — but it's blocked,
+  // so it leaves the queue entirely rather than ranking demoted.
   const r = rankQueue(g, { now: NOW, activity: { "task-gated": 50 } });
+  assert.deepEqual(r.items.map((i) => i.id), ["task-unblocker"]);
+  assert.equal(r.blocked, 1, "the gated item is counted, not silently dropped");
+  assert.equal(r.count, 1, "count reflects only the actionable items");
+});
+
+test("rankQueue (steward view): a blocked item renders demoted below its live blocker", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("person-pat", "person", { edges: [["stewards", "task-unblocker"], ["stewards", "task-gated"]] }),
+    node("task-unblocker", "task", { status: "open", edges: [["blocks", "task-gated"]] }),
+    node("task-gated", "task", { status: "open" }),
+  ])).load();
+  // assignee set => capacity/steward read: blocked work is surfaced (not hidden)
+  // and demoted below its unblocker even though heat would rank it far higher.
+  const r = rankQueue(g, { now: NOW, assignee: "person-pat", activity: { "task-gated": 50 } });
   assert.deepEqual(r.items.map((i) => i.id), ["task-unblocker", "task-gated"]);
+  assert.equal(r.blocked, undefined, "steward view exempts blocked work — nothing hidden");
   const gated = r.items[1];
   assert.equal(gated.signals.blocked_by, 1);
   assert.equal(gated.suggest, "blocked");
@@ -119,13 +144,27 @@ test("rankQueue: a blocked item is demoted below its live blocker even when hott
   assert.ok(gated.score < r.items[0].score);
 });
 
-test("rankQueue: blocks-chains cap transitively — unblocker, middle, leaf", () => {
+test("rankQueue: blocked items hide the whole dependency chain except the root unblocker", () => {
   const g = tmpGraph(Object.fromEntries([
     node("task-root", "task", { status: "open", edges: [["blocks", "task-mid"]] }),
     node("task-mid", "task", { status: "open", edges: [["blocks", "task-leaf"]] }),
     node("task-leaf", "task", { status: "open" }),
   ])).load();
+  // task-mid (blocked by root) and task-leaf (blocked by mid) both leave the
+  // queue; only the actionable root remains, the rest counted as blocked.
   const r = rankQueue(g, { now: NOW, activity: { "task-leaf": 40, "task-mid": 20 } });
+  assert.deepEqual(r.items.map((i) => i.id), ["task-root"]);
+  assert.equal(r.blocked, 2);
+});
+
+test("rankQueue (steward view): blocks-chains cap transitively — root, middle, leaf", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("person-pat", "person", { edges: [["stewards", "task-root"], ["stewards", "task-mid"], ["stewards", "task-leaf"]] }),
+    node("task-root", "task", { status: "open", edges: [["blocks", "task-mid"]] }),
+    node("task-mid", "task", { status: "open", edges: [["blocks", "task-leaf"]] }),
+    node("task-leaf", "task", { status: "open" }),
+  ])).load();
+  const r = rankQueue(g, { now: NOW, assignee: "person-pat", activity: { "task-leaf": 40, "task-mid": 20 } });
   assert.deepEqual(r.items.map((i) => i.id), ["task-root", "task-mid", "task-leaf"]);
 });
 
@@ -146,13 +185,27 @@ test("rankQueue: terminal, superseded, or edge-resolved blockers gate nothing", 
   }
 });
 
-test("rankQueue: a non-queueable blocker still demotes and flips the suggestion", () => {
+test("rankQueue: a non-queueable blocker hides the blocked item (default view)", () => {
   const g = tmpGraph(Object.fromEntries([
     node("dec-gate", "decision", { status: "active", edges: [["blocks", "task-gated"]] }),
     node("task-gated", "task", { status: "open" }),
     node("task-peer", "task", { status: "open" }),
   ])).load();
   const r = rankQueue(g, { now: NOW });
+  assert.equal(r.items.find((i) => i.id === "task-gated"), undefined, "blocked by a live decision — hidden");
+  assert.equal(r.blocked, 1);
+  // the unblocked peer is unaffected.
+  assert.equal(r.items.find((i) => i.id === "task-peer").suggest, "do");
+});
+
+test("rankQueue (steward view): a non-queueable blocker still demotes and flips the suggestion", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("person-pat", "person", { edges: [["stewards", "task-gated"], ["stewards", "task-peer"]] }),
+    node("dec-gate", "decision", { status: "active", edges: [["blocks", "task-gated"]] }),
+    node("task-gated", "task", { status: "open" }),
+    node("task-peer", "task", { status: "open" }),
+  ])).load();
+  const r = rankQueue(g, { now: NOW, assignee: "person-pat" });
   const gated = r.items.find((i) => i.id === "task-gated");
   assert.equal(gated.suggest, "blocked");
   assert.deepEqual(gated.blocked_by, ["dec-gate"]);
@@ -1055,13 +1108,17 @@ test("needed_by: an unparseable date fails open to no urgency and warns", () => 
 // --- cross-project provenance in the why-line (task-cc-xproject-dependency-loop) ---
 // A blocks relationship that crosses a project boundary names the other side
 // and its project; same-project relationships render exactly as before.
+// Steward view (assignee) so the BLOCKED requester still renders its why-line:
+// dec-spor-queue-hide-blocked hides blocked work only from the default queue,
+// not from the capacity/steward read.
 test("provenance: a serving blocker names the cross-project requester it serves", () => {
   const g = tmpGraph(Object.fromEntries([
+    node("person-pat", "person", { edges: [["stewards", "task-dep"], ["stewards", "task-req"]] }),
     // task-dep lives in the SERVING project and blocks a requester in another.
     node("task-dep", "task", { project: "spor", status: "open", edges: [["blocks", "task-req"]] }),
     node("task-req", "task", { project: "wf", status: "open" }),
   ])).load();
-  const items = rankQueue(g, { now: NOW }).items;
+  const items = rankQueue(g, { now: NOW, assignee: "person-pat" }).items;
   const dep = items.find((i) => i.id === "task-dep");
   const req = items.find((i) => i.id === "task-req");
   assert.match(dep.why, /blocks 1 live node across projects: task-req \(wf\)/);
@@ -1070,10 +1127,11 @@ test("provenance: a serving blocker names the cross-project requester it serves"
 
 test("provenance: a same-project blocker renders the bare count and id (unchanged)", () => {
   const g = tmpGraph(Object.fromEntries([
+    node("person-pat", "person", { edges: [["stewards", "task-up"], ["stewards", "task-down"]] }),
     node("task-up", "task", { project: "p1", status: "open", edges: [["blocks", "task-down"]] }),
     node("task-down", "task", { project: "p1", status: "open" }),
   ])).load();
-  const items = rankQueue(g, { now: NOW }).items;
+  const items = rankQueue(g, { now: NOW, assignee: "person-pat" }).items;
   assert.match(items.find((i) => i.id === "task-up").why, /blocks 1 live node\b/);
   assert.match(items.find((i) => i.id === "task-down").why, /blocked by task-up — do the unblocker first/);
   assert.doesNotMatch(items.find((i) => i.id === "task-up").why, /across projects/);
@@ -1081,12 +1139,13 @@ test("provenance: a same-project blocker renders the bare count and id (unchange
 
 test("provenance: mixed blockers annotate only the cross-project one", () => {
   const g = tmpGraph(Object.fromEntries([
+    node("person-pat", "person", { edges: [["stewards", "task-mixed"]] }),
     node("task-mixed", "task", { project: "home", status: "open" }),
     node("task-same", "task", { project: "home", status: "open", edges: [["blocks", "task-mixed"]] }),
     node("task-ext", "task", { project: "other", status: "open", edges: [["blocks", "task-mixed"]] }),
   ])).load();
   // blockers list in node-id sort order: task-ext then task-same.
-  const why = rankQueue(g, { now: NOW }).items.find((i) => i.id === "task-mixed").why;
+  const why = rankQueue(g, { now: NOW, assignee: "person-pat" }).items.find((i) => i.id === "task-mixed").why;
   assert.match(why, /blocked by task-ext \(other\), task-same — do the unblocker first/);
 });
 

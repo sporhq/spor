@@ -1,0 +1,46 @@
+{
+  "items": [
+    {
+      "id": "task-unblock",
+      "title": "Land the migration the rewrite waits on",
+      "type": "task",
+      "status": "open",
+      "project": "meridian",
+      "priority": "p2",
+      "score": 13.07,
+      "signals": {
+        "blocking": 1,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 50,
+        "staleness": 0,
+        "age_days": 42
+      },
+      "suggest": "do",
+      "why": "priority p2 (source unrecorded); blocks 1 live node; neighborhood active (heat 50); 42d old"
+    },
+    {
+      "id": "task-gated",
+      "title": "Rewrite the indexer",
+      "type": "task",
+      "status": "open",
+      "project": "meridian",
+      "priority": "p1",
+      "score": 11.07,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 1,
+        "front": 0,
+        "heat": 50,
+        "staleness": 0,
+        "age_days": 72
+      },
+      "suggest": "blocked",
+      "why": "priority p1 (source unrecorded); blocked by task-unblock — do the unblocker first; neighborhood active (heat 50); 72d old",
+      "blocked_by": [
+        "task-unblock"
+      ]
+    }
+  ],
+  "count": 2
+}

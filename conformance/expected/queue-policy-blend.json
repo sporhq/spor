@@ -43,28 +43,6 @@
       ]
     },
     {
-      "id": "task-blocked",
-      "title": "Rewrite the indexer",
-      "type": "task",
-      "status": "open",
-      "project": "alpha",
-      "priority": "p1",
-      "score": 1,
-      "signals": {
-        "blocking": 0,
-        "blocked_by": 1,
-        "front": 0,
-        "heat": 0,
-        "staleness": 0,
-        "age_days": 72
-      },
-      "suggest": "blocked",
-      "why": "priority p1 (source unrecorded); blocked by task-unblocker — do the unblocker first; 72d old",
-      "blocked_by": [
-        "task-unblocker"
-      ]
-    },
-    {
       "id": "task-stale",
       "title": "Tune the legacy cache layer",
       "type": "task",
@@ -179,7 +157,8 @@
       "why": "3d old"
     }
   ],
-  "count": 9,
+  "count": 8,
+  "blocked": 1,
   "policy": {
     "id": "schema-policy",
     "applied": true

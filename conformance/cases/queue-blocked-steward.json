@@ -1,0 +1,4 @@
+{ "id": "queue-blocked-steward", "kind": "queue", "corpus": "queue-blocked",
+  "input": { "now": "2026-06-12T00:00:00Z", "assignee": "person-pat", "activity": { "task-gated": 50 } },
+  "expected": "queue-blocked-steward.json",
+  "covers": "blocked-item exemption under a capacity/steward read (dec-spor-queue-hide-blocked): an assignee scope surfaces blocked work the default queue hides + counts, rendering it demoted below its live blocker with suggest:blocked and blocked_by named (the blocked-by demotion coverage relocated from queue-default)" }

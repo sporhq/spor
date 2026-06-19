@@ -42,28 +42,6 @@
       "why": "your active front (40 writes in the last 7 days); neighborhood active (heat 3); 11d old"
     },
     {
-      "id": "task-blocked",
-      "title": "Rewrite the indexer",
-      "type": "task",
-      "status": "open",
-      "project": "alpha",
-      "priority": "p1",
-      "score": 6.98,
-      "signals": {
-        "blocking": 0,
-        "blocked_by": 1,
-        "front": 0,
-        "heat": 2,
-        "staleness": 0,
-        "age_days": 72
-      },
-      "suggest": "blocked",
-      "why": "priority p1 (source unrecorded); blocked by task-unblocker — do the unblocker first; neighborhood active (heat 2); 72d old",
-      "blocked_by": [
-        "task-unblocker"
-      ]
-    },
-    {
       "id": "task-stale",
       "title": "Tune the legacy cache layer",
       "type": "task",
@@ -140,5 +118,6 @@
       "why": "4d old; unprocessed capture awaiting triage"
     }
   ],
-  "count": 7
+  "count": 6,
+  "blocked": 1
 }
