@@ -1066,16 +1066,28 @@ async function cmdAuthLogin(cfg, args) {
   // Default to the hosted Spor front door when no server is named — onboarding
   // parity with `spor join <token>` (task-spor-api-cli-default-server-base).
   const server = auth.normServer(serverFlag || cfg.server() || DEFAULT_SERVER);
-  if (web) {
-    out("note: --web (localhost loopback) is not implemented yet (task-cc-spor-auth-cli-web-loopback);");
-    out("      using the device-code flow — it auto-opens your browser when one is local.");
-  }
   if (all) {
     out("note: --all (one token per org in a single leg) needs the front-door membership");
     out("      endpoint (task-spor-frontdoor-org-membership-enumeration), not yet shipped —");
     out("      logging into one org for now; re-run 'spor auth login --org <other>' for more.");
   }
 
+  // --web: the localhost-loopback variant (auth code + PKCE), the browser-local
+  // optimization. It falls back to the device grant when the server has no
+  // loopback/DCR support (task-cc-spor-auth-cli-web-loopback).
+  if (web) {
+    const r = await loginViaLoopback(cfg, { server, org, scope, noOpen });
+    if (r !== "fallback") return r;
+    out("note: this server has no loopback/DCR endpoints — using the device-code flow.");
+  }
+
+  return loginViaDevice(cfg, { server, org, scope, noOpen });
+}
+
+// The default interactive flow: the RFC 8628 device authorization grant. Works
+// headless / over SSH — the human approves in a browser on their OWN machine, so
+// no local listener or port-forward is needed. Returns an exit code.
+async function loginViaDevice(cfg, { server, org, scope, noOpen }) {
   // RFC 8628 §3.1 — start the device authorization.
   const da = await auth.deviceAuthorize(server, { scope });
   if (da.transport) {
@@ -1135,6 +1147,173 @@ async function cmdAuthLogin(cfg, args) {
     err("timed out waiting for approval — run 'spor auth login' again.");
     return 1;
   }
+  const exp =
+    tokens.expires_in != null ? Math.floor(Date.now() / 1000) + Number(tokens.expires_in) : auth.jwtExp(tokens.access_token);
+  return acquireTenant(cfg, {
+    server,
+    token: tokens.access_token,
+    refresh_token: tokens.refresh_token,
+    org,
+    exp,
+    makeDefault: true,
+  });
+}
+
+// The minimal page the loopback redirect lands on: the human reads it in the
+// browser and returns to the terminal. No external assets (the loopback server
+// is one-shot), Connection: close so the browser drops the socket and the CLI
+// process can exit.
+function loopbackPage(ok, detail) {
+  const e = (s) =>
+    String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const title = ok ? "Signed in to Spor" : "Sign-in failed";
+  const body = ok
+    ? "You're signed in. You can close this tab and return to your terminal."
+    : `Sign-in did not complete${detail ? ` (${e(detail)})` : ""}. Return to your terminal and try again.`;
+  return (
+    `<!doctype html><meta charset="utf-8"><title>${e(title)}</title>` +
+    `<body style="font:15px/1.5 system-ui,-apple-system,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;color:#16242b">` +
+    `<h1 style="font-size:1.15rem;margin:0 0 .5rem">${e(title)}</h1><p style="margin:0">${body}</p></body>`
+  );
+}
+
+// `spor auth login --web` — the localhost-loopback variant (OAuth 2.1
+// authorization-code + PKCE, RFC 8252), the browser-local optimization over the
+// device grant. Bind a one-shot 127.0.0.1 listener, anonymously DCR-register a
+// public client for its exact loopback redirect, open the browser to
+// /oauth/authorize, capture the redirected ?code (CSRF-checked against state),
+// and exchange it (+ the PKCE verifier) for the org-scoped token pair. Returns
+// an exit code, or the string "fallback" when the server has no loopback/DCR
+// support (the caller then runs the device grant). task-cc-spor-auth-cli-web-loopback.
+async function loginViaLoopback(cfg, { server, org, scope, noOpen }) {
+  const http = require("http");
+  // PKCE (S256, RFC 7636) + a CSRF state (RFC 6749 §10.12). base64url throughout.
+  const verifier = crypto.randomBytes(32).toString("base64url");
+  const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
+  const state = crypto.randomBytes(16).toString("base64url");
+
+  // 1) Bind the loopback listener FIRST: the redirect_uri must carry the real
+  //    bound port (the front door exact-matches it at /oauth/authorize), and the
+  //    browser may arrive the instant the URL opens.
+  let settle;
+  const captured = new Promise((resolve) => {
+    settle = resolve;
+  });
+  let done = false;
+  const finish = (v) => {
+    if (!done) {
+      done = true;
+      settle(v);
+    }
+  };
+  const srv = http.createServer((req, res) => {
+    let reqUrl;
+    try {
+      reqUrl = new URL(req.url, "http://127.0.0.1");
+    } catch {
+      res.writeHead(400, { connection: "close" });
+      res.end();
+      return;
+    }
+    if (reqUrl.pathname !== "/callback") {
+      res.writeHead(404, { "content-type": "text/plain", connection: "close" });
+      res.end("not found");
+      return;
+    }
+    const qp = reqUrl.searchParams;
+    const oauthErr = qp.get("error");
+    const code = qp.get("code");
+    const stateOk = qp.get("state") === state;
+    const ok = !oauthErr && !!code && stateOk;
+    const detail = oauthErr || (!stateOk ? "state mismatch" : !code ? "no code" : "");
+    res.writeHead(ok ? 200 : 400, { "content-type": "text/html; charset=utf-8", connection: "close" });
+    res.end(loopbackPage(ok, detail));
+    if (oauthErr) finish({ error: oauthErr });
+    else if (!stateOk) finish({ error: "state_mismatch" });
+    else if (code) finish({ code });
+    else finish({ error: "no_code" });
+  });
+  try {
+    await new Promise((resolve, reject) => {
+      srv.once("error", reject);
+      srv.listen(0, "127.0.0.1", resolve);
+    });
+  } catch (e) {
+    err(`could not bind a loopback listener (${e.message}); using the device-code flow.`);
+    return "fallback";
+  }
+  const port = srv.address().port;
+  const redirectUri = `http://127.0.0.1:${port}/callback`;
+
+  // 2) Anonymous DCR — register the public client for this exact redirect.
+  const reg = await auth.registerClient(server, { redirectUris: [redirectUri], clientName: "spor CLI (loopback)" });
+  if (reg.transport) {
+    srv.close();
+    err(`offline — could not reach ${server} (${reg.error})`);
+    return 1;
+  }
+  if (reg.status === 404) {
+    srv.close();
+    return "fallback"; // front door has no DCR endpoint
+  }
+  if (!reg.ok || !reg.json || !reg.json.client_id) {
+    srv.close();
+    const msg = oauthErrMsg(reg.json);
+    err(`client registration failed (${reg.status}${msg ? ` — ${msg}` : ""})`);
+    return 1;
+  }
+  const clientId = reg.json.client_id;
+  const regToken = reg.json.registration_access_token;
+  const regUri = reg.json.registration_client_uri;
+
+  // 3) Build the authorize URL and open the browser.
+  const authUrl = new URL(`${server}/oauth/authorize`);
+  authUrl.searchParams.set("response_type", "code");
+  authUrl.searchParams.set("client_id", clientId);
+  authUrl.searchParams.set("redirect_uri", redirectUri);
+  authUrl.searchParams.set("code_challenge", challenge);
+  authUrl.searchParams.set("code_challenge_method", "S256");
+  authUrl.searchParams.set("state", state);
+  if (scope) authUrl.searchParams.set("scope", scope);
+
+  out(`To sign in, open this URL in a browser on this machine:`);
+  out(`  ${authUrl.toString()}`);
+  out(``);
+  if (!noOpen) tryOpenBrowser(authUrl.toString());
+  out(`Waiting for the browser to complete sign-in (Ctrl-C to cancel)…`);
+
+  // 4) Await the redirect (bounded), then stop listening.
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ error: "timeout" }), 5 * 60_000);
+  });
+  const result = await Promise.race([captured, timeout]);
+  clearTimeout(timer);
+  srv.close();
+
+  // 5) Clean up the throwaway client (best-effort; the grant does not need it).
+  await auth.unregisterClient(regUri, regToken);
+
+  if (result.error) {
+    if (result.error === "timeout") err("timed out waiting for the browser — run 'spor auth login --web' again.");
+    else if (result.error === "access_denied") err("authorization was denied.");
+    else if (result.error === "state_mismatch") err("the redirect failed its CSRF (state) check — login aborted.");
+    else err(`login failed: ${result.error}`);
+    return 1;
+  }
+
+  // 6) Exchange the code (+ PKCE verifier) for the org-scoped token pair.
+  const tok = await auth.exchangeCode(server, { code: result.code, codeVerifier: verifier, clientId, redirectUri });
+  if (tok.transport) {
+    err(`offline — token exchange not completed (${tok.error})`);
+    return 1;
+  }
+  if (!tok.ok || !tok.json || !tok.json.access_token) {
+    const msg = oauthErrMsg(tok.json);
+    err(`token exchange failed (${tok.status}${msg ? ` — ${msg}` : ""})`);
+    return 1;
+  }
+  const tokens = tok.json;
   const exp =
     tokens.expires_in != null ? Math.floor(Date.now() / 1000) + Number(tokens.expires_in) : auth.jwtExp(tokens.access_token);
   return acquireTenant(cfg, {
@@ -3982,7 +4161,8 @@ const COMMANDS = {
       "                                prints a code + URL, you approve in any browser)\n" +
       "      --server <url>            the Spor front door (else SPOR_SERVER / active)\n" +
       "      --org <slug>              label/select the org for the stored credential\n" +
-      "      --web                     localhost-loopback variant (falls back to device)\n" +
+      "      --web                     localhost-loopback variant (auth code + PKCE;\n" +
+      "                                falls back to device-code if unsupported)\n" +
       "      --all                     one token per org membership (needs the server\n" +
       "                                membership endpoint; falls back to one org)\n" +
       "      --no-open                 do not auto-open a browser\n" +
