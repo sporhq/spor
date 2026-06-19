@@ -3470,7 +3470,9 @@ const COMMANDS = {
       "publish is the remote twin: it sends this box's effective capabilities to the\n" +
       "server (keyed on dispatch.agent) so the fleet scheduler can route an assigned\n" +
       "profile to a box that can satisfy it — substitution-free re-routing across\n" +
-      "machines. Run `spor agent use <agent-id>` once to set this box's agent first.\n\n" +
+      "machines. Run `spor agent use <agent-id>` once to set this box's agent first.\n" +
+      "Once an agent is set, session-start auto-publishes each session (remote mode),\n" +
+      "so manual publish is rarely needed; SPOR_CAPABILITIES_PUBLISH=0 disables it.\n\n" +
       `  axes: ${sat.CAP_AXES.join(", ")}`,
     examples: ["spor capabilities", "spor capabilities allow-mcp spor", "spor capabilities publish"],
     run: (cfg, args) => cmdCapabilities(cfg, args),

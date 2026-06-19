@@ -330,7 +330,18 @@ server/connector is bound (remote mode), the spor MCP is reachable by
 construction, so an `mcp: [spor]` profile satisfies on a fresh dispatched box
 with no manual `allow-mcp` and no flaky network ping; the seed rides `.probed`,
 so it drops out when the server is unconfigured (other MCP reachability stays
-declared, task-spor-mcp-reachability-deterministic-seed). Server-side ops vars
+declared, task-spor-mcp-reachability-deterministic-seed). In REMOTE mode, when a
+`dispatch.agent` is configured (`spor agent use`), `session-start` ALSO
+auto-publishes the freshly-probed effective capabilities to the fleet scheduler
+(`POST /v1/agents/{id}/capabilities`) — folding the manual `spor capabilities
+publish` into the probe so the fleet view auto-populates and the box's
+last-contact stays fresh (task-spor-fleet-capabilities-autopublish-session-start).
+It rides the same concurrent batch as the briefing/queue reads (so it adds no
+latency), is bounded (`dispatch.capabilitiesPublishTimeoutMs` /
+`SPOR_CAPABILITIES_PUBLISH_TIMEOUT`, default 3s) and fail-open like the claim
+heartbeat; the `dispatch.agent` requirement is the opt-in (a box that never ran
+`spor agent use` never publishes), and `SPOR_CAPABILITIES_PUBLISH=0`
+(`dispatch.capabilitiesPublish:false`) disables it. Server-side ops vars
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard
 (`SPOR_DISTILLING`) are deliberately NOT config — they stay pure env.

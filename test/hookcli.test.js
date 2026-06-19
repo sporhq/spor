@@ -710,6 +710,91 @@ test('session-start: detached catch-up stamps commits made outside any session',
   }
 });
 
+// task-spor-fleet-capabilities-autopublish-session-start: in remote mode with a
+// dispatch.agent configured, session-start folds the manual `spor capabilities
+// publish` into the probe — it POSTs this box's EFFECTIVE capabilities to the
+// fleet scheduler (task-spor-remote-fleet-scheduler) so the fleet view
+// auto-populates and the box's last-contact stays fresh. Bounded + fail-open; the
+// dispatch.agent gate is the opt-in (a box that never ran `spor agent use` never
+// publishes). Oracle = the REQUEST the hook POSTs, not the server's framing.
+test('session-start (remote): auto-publishes this box capabilities when a dispatch.agent is set', async () => {
+  const { home, cwd } = scratch();
+  fs.rmSync(path.join(home, 'nodes'), { recursive: true }); // pure remote, no local merge
+  const { srv, hits, base } = await stubServer();
+  try {
+    const env = freshEnv(home);
+    env.SPOR_SERVER = base;
+    env.SPOR_TOKEN = 'spor_pat_test';
+    env.SPOR_DISPATCH_AGENT = 'agent-anthony-laptop';
+    await runAsync(
+      ['session-start', '--host', 'claude-code'],
+      JSON.stringify({ cwd, hook_event_name: 'SessionStart' }),
+      env
+    );
+    const post = hits.find((h) => h.method === 'POST' && h.url === '/v1/agents/agent-anthony-laptop/capabilities');
+    assert.ok(post, `auto-published caps; hits: ${JSON.stringify(hits.map((h) => `${h.method} ${h.url}`))}`);
+    assert.strictEqual(post.auth, 'Bearer spor_pat_test');
+    // the body is the EFFECTIVE collapse — the five axes, same shape `spor
+    // capabilities publish` sends. harnesses/plugins/skills are machine-specific
+    // (PATH + ~/.claude), so we pin the shape and the one DETERMINISTIC axis:
+    // reachable_mcp carries the remote-mode `spor` seed
+    // (task-spor-mcp-reachability-deterministic-seed).
+    const body = JSON.parse(post.body);
+    assert.deepStrictEqual(Object.keys(body).sort(), ['deny', 'harnesses', 'plugins', 'reachable_mcp', 'skills']);
+    assert.ok(body.reachable_mcp.includes('spor'), `reachable_mcp seeded with spor: ${JSON.stringify(body)}`);
+    const log = fs.readFileSync(path.join(home, 'journal', 'remote.log'), 'utf8');
+    assert.match(log, /capabilities published for agent-anthony-laptop/);
+  } finally {
+    srv.close();
+  }
+});
+
+test('session-start (remote): does NOT auto-publish without a dispatch.agent', async () => {
+  const { home, cwd } = scratch();
+  fs.rmSync(path.join(home, 'nodes'), { recursive: true });
+  const { srv, hits, base } = await stubServer();
+  try {
+    const env = freshEnv(home);
+    env.SPOR_SERVER = base;
+    env.SPOR_TOKEN = 'spor_pat_test';
+    await runAsync(
+      ['session-start', '--host', 'claude-code'],
+      JSON.stringify({ cwd, hook_event_name: 'SessionStart' }),
+      env
+    );
+    assert.ok(
+      !hits.some((h) => /\/capabilities$/.test(h.url)),
+      `no capabilities POST without a dispatch.agent; hits: ${JSON.stringify(hits.map((h) => h.url))}`
+    );
+  } finally {
+    srv.close();
+  }
+});
+
+test('session-start (remote): SPOR_CAPABILITIES_PUBLISH=0 suppresses the auto-publish', async () => {
+  const { home, cwd } = scratch();
+  fs.rmSync(path.join(home, 'nodes'), { recursive: true });
+  const { srv, hits, base } = await stubServer();
+  try {
+    const env = freshEnv(home);
+    env.SPOR_SERVER = base;
+    env.SPOR_TOKEN = 'spor_pat_test';
+    env.SPOR_DISPATCH_AGENT = 'agent-x';
+    env.SPOR_CAPABILITIES_PUBLISH = '0';
+    await runAsync(
+      ['session-start', '--host', 'claude-code'],
+      JSON.stringify({ cwd, hook_event_name: 'SessionStart' }),
+      env
+    );
+    assert.ok(
+      !hits.some((h) => /\/capabilities$/.test(h.url)),
+      `disabled -> no capabilities POST; hits: ${JSON.stringify(hits.map((h) => h.url))}`
+    );
+  } finally {
+    srv.close();
+  }
+});
+
 // A stub server that answers every request with a fixed HTTP status (and a
 // minimal JSON body), for the fail-open banner tests below.
 function statusServer(code) {

@@ -118,6 +118,60 @@ function degradationNudge(graph) {
   return "";
 }
 
+// Auto-publish this box's dispatch capabilities to the fleet scheduler
+// (task-spor-fleet-capabilities-autopublish-session-start), the client half that
+// makes the remote fleet scheduler (task-spor-remote-fleet-scheduler) live: the
+// server host-matches an assigned `type: profile` against every box's published
+// capabilities, so until boxes publish there is nothing to match. Folding the
+// publish into session-start — beside the dispatch.repos / dispatch.capabilities
+// self-registration above — auto-populates the fleet view and keeps each box's
+// last-contact freshness current, no manual `spor capabilities publish` needed.
+//
+// REMOTE mode only (caller-gated) and only when a `dispatch.agent` is configured
+// (`spor agent use`), so a box that hasn't opted into being a dispatch identity
+// never publishes — the same key the manual verb publishes under. The pushed body
+// is the SAME effectiveCapabilities() collapse the manual verb and local dispatch
+// read, with THIS run's freshly-probed sets merged over the (pre-probe) in-memory
+// config so we publish exactly what the probe just wrote. Fail-open and bounded
+// (default 3s, like the claim heartbeat's curls); the caller runs it CONCURRENTLY
+// with the briefing/queue reads so it adds nothing to the session-start critical
+// path. Opt out with SPOR_CAPABILITIES_PUBLISH=0 (dispatch.capabilitiesPublish:
+// false). Always returns null — it never alters this run's output.
+async function publishCapabilities(probed, rlog) {
+  try {
+    const cfg = u.config();
+    // Opt-out lever, resolved through the cascade with the env dual-read fallback
+    // (mirrors claimNudge.enabled / SPOR_CLAIM_NUDGE).
+    if (cfg ? !cfg.getBool("dispatch.capabilitiesPublish", true) : (u.envDual("CAPABILITIES_PUBLISH") ?? "1") === "0") return null;
+    const agent = cfg ? cfg.get("dispatch.agent", null) : u.envDual("DISPATCH_AGENT") || null;
+    if (!agent) return null; // no dispatch identity on this box — nothing to publish
+    const sat = require(path.join(u.ROOT, "lib", "kernel", "satisfiability.js"));
+    // Merge THIS run's fresh probe over the in-memory config (loaded before the
+    // probe wrote) so the published set matches what `spor capabilities` reports.
+    const rawCap = (cfg ? cfg.get("dispatch.capabilities", {}) : {}) || {};
+    const eff = sat.effectiveCapabilities(probed ? { ...rawCap, probed } : rawCap);
+    const timeoutMs = u.cfgNum("dispatch.capabilitiesPublishTimeoutMs", "CAPABILITIES_PUBLISH_TIMEOUT", 3000);
+    const r = await u.curl(`${u.serverBase()}/v1/agents/${encodeURIComponent(agent)}/capabilities`, {
+      method: "POST",
+      headers: { ...u.bearer(), "content-type": "application/json" },
+      body: JSON.stringify(eff),
+      timeoutMs,
+    });
+    if (r.http === "200") {
+      rlog(
+        `capabilities published for ${agent} (harnesses=${eff.harnesses.length} mcp=${eff.reachable_mcp.length} skills=${eff.skills.length} plugins=${eff.plugins.length})`
+      );
+    } else {
+      // Fail-open: a 4xx (no such agent / not owned / surface undeployed) or a
+      // dead/slow server (http 000) never blocks the session; next start retries.
+      rlog(`capabilities publish skipped (http=${r.http})`);
+    }
+  } catch {
+    /* fail open — auto-publish must never cost the session */
+  }
+  return null;
+}
+
 async function sessionStart(input) {
   const graph = u.graphHome();
   const nodes = path.join(graph, "nodes");
@@ -182,8 +236,11 @@ async function sessionStart(input) {
   // `reachable_mcp: [spor]` deterministically — the spor MCP is reachable by
   // construction in a dispatched session, so an `mcp: [spor]` profile satisfies on
   // a fresh box with no manual allow-mcp (task-spor-mcp-reachability-deterministic-seed).
+  // The returned fresh probe is what the REMOTE-mode auto-publish below pushes to
+  // the fleet scheduler (the in-memory config predates this run's probe write).
+  let probedCaps = null;
   try {
-    u.probeCapabilities(u.userConfigHome(), { sporReachable: !!u.serverBase() });
+    probedCaps = u.probeCapabilities(u.userConfigHome(), { sporReachable: !!u.serverBase() });
   } catch {
     /* best effort */
   }
@@ -226,6 +283,11 @@ async function sessionStart(input) {
     // unknown slug with a known fingerprint files an alias proposal in the
     // queue (task-cc-project-identity-nodes). Local git calls, ms-cheap, fail-open.
     const fp = cwd && fs.existsSync(cwd) ? u.repoFingerprints(cwd) : [];
+    // The fleet-capabilities auto-publish (task-spor-fleet-capabilities-autopublish-
+    // session-start) rides this same concurrent batch: bounded (3s) and fail-open,
+    // it overlaps the reads already on the critical path so it adds no latency. Its
+    // result is ignored (publishCapabilities always resolves null); we still await
+    // it here so the POST completes before the process exits.
     const [brief, qresp] = await Promise.all([
       u.curl(
         `${u.serverBase()}/v1/briefing/${slug}${fp.length ? `?fp=${encodeURIComponent(fp.join(","))}` : ""}`,
@@ -238,6 +300,7 @@ async function sessionStart(input) {
         headers: u.bearer(),
         timeoutMs: 3000,
       }),
+      publishCapabilities(probedCaps, rlog),
     ]);
     const host = u.serverHost();
 
