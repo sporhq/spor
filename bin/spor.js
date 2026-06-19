@@ -2946,11 +2946,15 @@ function cmdCapabilities(cfg, args) {
   if (sub === "list" || sub === "show") return printList();
 
   if (sub === "probe") {
-    const probed = u.probeCapabilities(home);
+    // Seed reachable_mcp:[spor] from CONFIGURED-ness when a Spor server/connector
+    // is bound (remote mode) — the spor MCP is reachable by construction, no
+    // network ping (task-spor-mcp-reachability-deterministic-seed).
+    const probed = u.probeCapabilities(home, { sporReachable: !!cfg.get("server") });
     out(`probed harnesses: ${probed.harnesses.join(", ") || "(none on PATH)"}`);
     out(`probed plugins:   ${probed.plugins.join(", ") || "(none)"}`);
     const sk = probed.skills.filter((s) => !s.includes(":")); // bare names, compact
     out(`probed skills:    ${probed.skills.length} (${sk.slice(0, 10).join(", ")}${sk.length > 10 ? " …" : ""})`);
+    if (probed.reachable_mcp && probed.reachable_mcp.length) out(`probed reachable_mcp: ${probed.reachable_mcp.join(", ")} (Spor server configured)`);
     out(`written to dispatch.capabilities.probed in ${path.join(home, "config.json")}`);
     return 0;
   }

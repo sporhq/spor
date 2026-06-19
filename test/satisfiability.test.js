@@ -154,6 +154,41 @@ test("probeCapabilities: refresh is WHOLESALE — an uninstalled harness drops o
   }, { harnessBins: ["claude", "codex"] });
 });
 
+test("probeCapabilities: seeds reachable_mcp:[spor] from CONFIGURED-ness when a server is bound, satisfying an mcp:[spor] profile", { skip: process.platform === "win32" }, () => {
+  withFakeMachine(({ graphHome }) => {
+    const probed = u.probeCapabilities(graphHome, { sporReachable: true });
+    assert.deepStrictEqual(probed.reachable_mcp, ["spor"], "spor seeded into the probed map");
+    const cap = JSON.parse(fs.readFileSync(path.join(graphHome, "config.json"), "utf8")).dispatch.capabilities;
+    assert.deepStrictEqual(cap.probed.reachable_mcp, ["spor"], "rides .probed, not .declared");
+    // It flows through the matcher: a fresh box now satisfies an mcp:[spor] profile.
+    const eff = sat.effectiveCapabilities(cap);
+    assert.ok(sat.satisfies(eff, { id: "profile-x", harness: "claude-code", mcp: ["spor"] }).ok, "mcp:[spor] profile satisfies with no manual allow-mcp");
+  }, { harnessBins: ["claude"] });
+});
+
+test("probeCapabilities: no seed without a server (byte-identical .probed); the seed drops out on refresh, a declared mcp survives", { skip: process.platform === "win32" }, () => {
+  withFakeMachine(({ graphHome }) => {
+    // No server bound → no reachable_mcp key probed (unchanged shape).
+    const off = u.probeCapabilities(graphHome);
+    assert.ok(!("reachable_mcp" in off), "no reachable_mcp probed when no server is configured");
+    // Bind a server → seed appears; also declare a VPN-only MCP (sticky).
+    u.probeCapabilities(graphHome, { sporReachable: true });
+    u.editCapabilities(graphHome, (cap) => {
+      cap.declared = { reachable_mcp: ["mcp-prod"] };
+      return true;
+    });
+    let cap = JSON.parse(fs.readFileSync(path.join(graphHome, "config.json"), "utf8")).dispatch.capabilities;
+    assert.deepStrictEqual(sat.effectiveCapabilities(cap).reachable_mcp, ["spor", "mcp-prod"], "seeded + declared union");
+    // Unconfigure the server → the seed drops out of .probed (no upward drift),
+    // but the declared MCP survives the wholesale refresh.
+    const back = u.probeCapabilities(graphHome, { sporReachable: false });
+    assert.ok(!("reachable_mcp" in back), "spor seed dropped when the server went away");
+    cap = JSON.parse(fs.readFileSync(path.join(graphHome, "config.json"), "utf8")).dispatch.capabilities;
+    assert.deepStrictEqual(cap.declared.reachable_mcp, ["mcp-prod"], "declaration survived");
+    assert.deepStrictEqual(sat.effectiveCapabilities(cap).reachable_mcp, ["mcp-prod"], "only the declared MCP remains reachable");
+  }, { harnessBins: ["claude"] });
+});
+
 // ---- the `spor capabilities` CLI verb ------------------------------------
 
 const ISO_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "spor-cap-iso-"));
@@ -192,6 +227,31 @@ test("spor capabilities: set/add/rm an axis, allow-mcp, deny — round-trip thro
   assert.deepStrictEqual(json.skills, ["brief", "weed"]);
   assert.deepStrictEqual(json.reachable_mcp, ["spor", "mcp-prod"]);
   assert.deepStrictEqual(json.deny, ["profile-prod-deploy"]);
+});
+
+test("spor capabilities probe: SPOR_SERVER set seeds reachable_mcp:[spor]; unset leaves it absent", () => {
+  const baseEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_") || k === "XDG_CONFIG_HOME") continue;
+    baseEnv[k] = v;
+  }
+  const probe = (home, server) => {
+    const env = { ...baseEnv, SPOR_HOME: home, XDG_CONFIG_HOME: ISO_HOME };
+    if (server) env.SPOR_SERVER = server;
+    return spawnSync(process.execPath, [CLI, "capabilities", "probe"], { encoding: "utf8", env });
+  };
+
+  const on = fs.mkdtempSync(path.join(os.tmpdir(), "spor-cap-srv-"));
+  const r = probe(on, "http://127.0.0.1:8787");
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /probed reachable_mcp: spor/);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(on, "config.json"), "utf8")).dispatch.capabilities.probed.reachable_mcp, ["spor"]);
+
+  const off = fs.mkdtempSync(path.join(os.tmpdir(), "spor-cap-srv-"));
+  const r2 = probe(off, null);
+  assert.strictEqual(r2.status, 0);
+  assert.doesNotMatch(r2.stdout, /reachable_mcp/);
+  assert.ok(!("reachable_mcp" in JSON.parse(fs.readFileSync(path.join(off, "config.json"), "utf8")).dispatch.capabilities.probed));
 });
 
 test("spor capabilities: an unknown axis is rejected with usage", () => {

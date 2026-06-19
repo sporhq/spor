@@ -178,8 +178,12 @@ async function sessionStart(input) {
   // fail-open side effect that never alters this run's output, cheap and no-spawn
   // (PATH stat + a JSON read), so it stays off the latency budget. It writes only
   // `dispatch.capabilities.probed`; user declarations under `.declared` survive.
+  // When a Spor server/connector is bound (remote mode), it also seeds
+  // `reachable_mcp: [spor]` deterministically — the spor MCP is reachable by
+  // construction in a dispatched session, so an `mcp: [spor]` profile satisfies on
+  // a fresh box with no manual allow-mcp (task-spor-mcp-reachability-deterministic-seed).
   try {
-    u.probeCapabilities(u.userConfigHome());
+    u.probeCapabilities(u.userConfigHome(), { sporReachable: !!u.serverBase() });
   } catch {
     /* best effort */
   }

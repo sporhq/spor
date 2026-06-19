@@ -324,7 +324,13 @@ shared graph can't hold; written to the USER `$SPOR_HOME/config.json` by
 by `session-start` and declared by `spor capabilities`, in the SAME user
 config.json (`dispatch.capabilities.probed` is refreshed wholesale, `.declared`
 is sticky, `.deny` overrides both; the pure matcher is `lib/kernel/satisfiability.js`,
-task-spor-dispatch-capabilities-satisfiability). Server-side ops vars
+task-spor-dispatch-capabilities-satisfiability). The probe seeds
+`reachable_mcp: [spor]` into `.probed` from CONFIGURED-ness — when a Spor
+server/connector is bound (remote mode), the spor MCP is reachable by
+construction, so an `mcp: [spor]` profile satisfies on a fresh dispatched box
+with no manual `allow-mcp` and no flaky network ping; the seed rides `.probed`,
+so it drops out when the server is unconfigured (other MCP reachability stays
+declared, task-spor-mcp-reachability-deterministic-seed). Server-side ops vars
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard
 (`SPOR_DISTILLING`) are deliberately NOT config — they stay pure env.

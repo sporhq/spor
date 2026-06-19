@@ -16,7 +16,7 @@ const home = require(path.join(ROOT, "lib", "shell", "home.js"));
 // The harness vocabulary the capability probe emits — owned by the pure matcher
 // so the probe, the matcher, and the future fleet scheduler agree on one set of
 // names (dec-spor-machine-profile-satisfiability). Never re-hardcode it here.
-const { HARNESS_BINARIES } = require(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
+const { HARNESS_BINARIES, SPOR_MCP_NAME } = require(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
 
 // Active client config for this run (dec-spor-client-config-cascade). The
 // dispatcher builds it once with the session cwd; engines then read settings
@@ -662,13 +662,23 @@ function editCapabilities(graphHomeDir, mutate) {
 // fail-open session-start side-effect path. The probed sets are written
 // WHOLESALE so an uninstalled harness drops out on the next refresh (no upward
 // drift); user declarations under `dispatch.capabilities.declared` are untouched
-// and survive every refresh (dec-spor-machine-profile-satisfiability). MCP
-// reachability and deny-flags are deliberately NOT probed (a flaky network probe
-// / policy, not capability) — they are declared. No-op when unchanged. Returns
-// the probed map (for `spor capabilities probe`).
-function probeCapabilities(graphHomeDir) {
+// and survive every refresh (dec-spor-machine-profile-satisfiability).
+//
+// `reachable_mcp` is the one axis seeded from CONFIGURED-ness rather than a probe
+// of installed state: when a Spor server/connector is bound (opts.sporReachable,
+// i.e. remote mode), the spor MCP is reachable BY CONSTRUCTION in a dispatched
+// session, so the probe seeds `reachable_mcp: [spor]` deterministically — no
+// network ping, honouring the no-flaky-probe rule while removing the fresh-box
+// friction that left an `mcp: [spor]` profile unsatisfiable until a manual
+// `allow-mcp` (task-spor-mcp-reachability-deterministic-seed). It rides `.probed`
+// (not `.declared`), so it drops out the moment the server is unconfigured. OTHER
+// MCP reachability (e.g. mcp-prod over a VPN) and deny-flags remain DECLARED — a
+// probe still can't decide a flaky network reach or a policy opt-out. No-op when
+// unchanged. Returns the probed map (for `spor capabilities probe`).
+function probeCapabilities(graphHomeDir, opts) {
   const ps = probeClaudePluginsSkills();
   const probed = { harnesses: probeHarnesses(), plugins: ps.plugins, skills: ps.skills };
+  if (opts && opts.sporReachable) probed.reachable_mcp = [SPOR_MCP_NAME];
   editCapabilities(graphHomeDir, (cap) => {
     if (JSON.stringify(cap.probed || null) === JSON.stringify(probed)) return false;
     cap.probed = probed;

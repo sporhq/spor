@@ -657,8 +657,13 @@ date: 2026-06-18
   machine.reachable_mcp ∧ profile.skills ⊆ machine.skills ∧ profile.plugins ⊆
   machine.plugins ∧ profile ∉ machine.deny`. No satisfying machine → dispatch
   fails soft and LOUD, leaves the assignment intact, NEVER substitutes a
-  different profile. Forward-compatible with the deferred remote fleet scheduler
-  (each agent publishes its capabilities; same vocabulary).
+  different profile. The probe seeds `reachable_mcp: [spor]` from CONFIGURED-ness
+  (a bound Spor server/connector, remote mode) rather than a network ping — the
+  agent-spor server is part of every dispatched session's toolset by construction
+  (above), so an `mcp: [spor]` profile satisfies on a fresh box with no manual
+  `allow-mcp` (task-spor-mcp-reachability-deterministic-seed). Forward-compatible
+  with the deferred remote fleet scheduler (each agent publishes its capabilities;
+  same vocabulary).
 - **Reusable + both-scoped, with override.** Profiles are PERSONAL and
   ORG-PUBLISHED (a curated, vetted toolset), with personal override. Org-published
   profiles are where this meets policy: a policy can require that work of a risk
