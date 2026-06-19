@@ -1,0 +1,5 @@
+{ "id": "queue-held", "kind": "queue", "corpus": "queue-held",
+  "input": { "now": "2026-06-19T00:00:00Z",
+             "front": { "task-held": 40, "task-active": 40 } },
+  "expected": "queue-held.json",
+  "covers": "held-task front self-limit (task-spor-queue-front-loop-self-limit-on-held-tasks): an open task with rising front + a non-resolving inbound outcome (artifact via relates-to) + no live blocker damps its front to 0 in the score and suggests triage, not do; a sibling task with equal front but no outcome keeps the full front boost and stays do" }

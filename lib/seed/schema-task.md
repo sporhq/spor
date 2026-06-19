@@ -2,7 +2,7 @@
 id: schema-task
 type: schema
 kind: node-schema
-schema_version: 2026.06.19.1
+schema_version: 2026.06.19.2
 title: Seed schema for task nodes
 summary: Node schema for the task type — active or planned work. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -49,6 +49,20 @@ open status contradicts the edge, an informational ✓ when the task is healthil
 `done` (task-spor-getnode-surface-resolution-on-terminal). The read-time twin of
 the `transitions()` completion gate above; pure, read-only, fail-soft; registry
 behavior only, backward-readable, no upgrade chain.
+
+`get()` (2026.06.19.2): the **held-task churn** note
+(task-spor-queue-front-loop-self-limit-on-held-tasks). When the same read finds
+NO live resolving edge but the task is still open and carries an inbound
+non-resolving outcome (an `artifact`/`decision` linked by any edge but
+`resolves`/`answers`) with no live blocker, it rides along `held` — a `⚠ stays
+queued — close the loop` note naming the four de-queue actions (resolve, gate
+with `blocked-by`, set `wake:`, or `abandon`). This is the read-time twin of the
+queue's `do → triage` flip and front damping (lib/kernel/queue.js) for a task
+held open on an external gate, and the inverse of the definition-of-done gate
+(`done` *requires* a resolving resolver; a *non*-resolving outcome announces the
+task stays live). A pending in-review resolver is excluded — it is a resolution
+in flight, not a held outcome. Pure, read-only, fail-soft; backward-readable, no
+upgrade chain.
 
 ```json
 {
@@ -138,6 +152,22 @@ export function transitions(current, proposed, view) {
 // the node is healthily terminal (task-spor-getnode-surface-resolution-on-terminal).
 // `answers` retires only questions; `resolves` retires any target — the same
 // partition the kernel's resolutionMap applies, so reads stay byte-consistent.
+//
+// (2026.06.19.2, task-spor-queue-front-loop-self-limit-on-held-tasks) The
+// held-task churn note. After the loop above (no live resolving edge retires
+// this task), if the node is still open and carries an inbound NON-resolving
+// outcome (an artifact/decision linked by any edge but resolves/answers) with no
+// live blocker, work was recorded but the loop never closed — the task stays
+// queued forever (dec-cc-queue-front-from-attribution's continuity loop has
+// nothing to resolve). Ride along `held` naming the four de-queue actions: the
+// read-time twin of the queue's do->triage flip (lib/kernel/queue.js), and the
+// inverse of the definition-of-done gate above (done REQUIRES a resolving
+// resolver; a non-resolving outcome announces the task stays live). A pending
+// (in-review) resolver is excluded — a resolves edge is a resolution in flight,
+// not a held outcome. The blocker suppressor is conservative (any inbound
+// non-superseded `blocks` edge, since the hook is not handed the terminal
+// vocabulary): a named gate is a "do the unblocker first" story, not "close the
+// loop", and a stale gate edge is the gardener's inert-gate finding to retire.
 export function get(node, ctx) {
   const neighbors = (ctx && ctx.neighbors) || [];
   const nonResolving = (ctx && ctx.non_resolving_statuses) || [];
@@ -165,6 +195,34 @@ export function get(node, ctx) {
         note: note,
       },
     };
+  }
+  // Held-task churn note: reaching here means no live resolving edge retires this
+  // task. Open task + a recorded non-resolving outcome + no live blocker = held
+  // open with nothing to resolve; surface the four de-queue actions.
+  if (!(ctx && ctx.terminal) && node.type === "task") {
+    var outcomes = [];
+    var blocked = false;
+    for (var j = 0; j < neighbors.length; j++) {
+      var n2 = neighbors[j];
+      if (n2.dir !== "in" || n2.superseded) continue;
+      if (n2.edge === "blocks") { blocked = true; continue; }
+      if (n2.edge === "resolves" || n2.edge === "answers") continue;
+      if (n2.type === "artifact" || n2.type === "decision") outcomes.push(n2.id);
+    }
+    if (outcomes.length && !blocked) {
+      return {
+        held: {
+          outcomes: outcomes,
+          note: "⚠ stays queued — close the loop. " + outcomes.length + " outcome" +
+            (outcomes.length === 1 ? "" : "s") + " (artifact/decision) recorded " +
+            "against this task but nothing resolves it, and nothing blocks it, so " +
+            "the queue keeps re-surfacing it. Resolve it (a decision/artifact with " +
+            "a resolves edge), gate it (a blocked-by edge naming the blocker), " +
+            "defer it (wake: YYYY-MM-DD), or set status: abandoned. See: " +
+            outcomes.join(", ") + ".",
+        },
+      };
+    }
   }
   return {};
 }

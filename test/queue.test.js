@@ -618,6 +618,98 @@ test("rankQueue: front counts the node itself only — no neighborhood spread", 
   assert.equal(hub.signals.front, 0, "provenance hub gets nothing from its spokes");
 });
 
+// ---- held-task front self-limit (task-spor-queue-front-loop-self-limit-on-held-tasks) ----
+
+test("rankQueue (held self-limit): open task with front + a non-resolving outcome + no blocker damps front to 0 and suggests triage", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-held", "task", { status: "open" }),
+    node("art-held", "artifact", { edges: [["relates-to", "task-held"]] }), // non-resolving outcome
+    node("task-active", "task", { status: "open" }),                        // equal front, no outcome
+  ])).load();
+  const r = rankQueue(g, { now: NOW, front: { "task-held": 40, "task-active": 40 } });
+  const held = r.items.find((i) => i.id === "task-held");
+  const active = r.items.find((i) => i.id === "task-active");
+  // the raw count rides on signals.front for the queue-policy seam — only the
+  // SCORE contribution is damped (dec-cc-queue-front-from-attribution).
+  assert.equal(held.signals.front, 40);
+  assert.equal(active.signals.front, 40);
+  assert.ok(active.score - held.score >= 4.9, "front (≤5) is fully damped for the held task");
+  assert.equal(held.suggest, "triage");
+  assert.equal(active.suggest, "do");
+  assert.match(held.why, /close the loop \(resolve, gate with blocked-by, set wake, or abandon\)/);
+  assert.equal(r.items[0].id, "task-active", "the genuinely-worked sibling still floats on its front");
+});
+
+test("rankQueue (held self-limit): a non-resolving decision outcome flips the suggestion too (not only artifacts)", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-d", "task", { status: "open" }),
+    node("dec-side", "decision", { status: "active", edges: [["relates-to", "task-d"]] }),
+  ])).load();
+  const it = rankQueue(g, { now: NOW, front: { "task-d": 40 } }).items.find((i) => i.id === "task-d");
+  assert.equal(it.suggest, "triage");
+  assert.match(it.why, /outcome recorded but nothing resolves it/);
+});
+
+test("rankQueue (held self-limit): no front means no churn to damp — the outcome alone keeps suggest 'do'", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-quiet", "task", { status: "open" }),
+    node("art-quiet", "artifact", { edges: [["relates-to", "task-quiet"]] }),
+  ])).load();
+  const it = rankQueue(g, { now: NOW }).items.find((i) => i.id === "task-quiet"); // no front injected
+  assert.equal(it.signals.front, 0);
+  assert.equal(it.suggest, "do", "front>0 is required for the queue self-limit (the get() hook carries the no-front nudge)");
+});
+
+test("rankQueue (held self-limit): a pending (non-resolving-status) resolver is a resolution in flight, not a held outcome", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-inreview", "task", { status: "open" }),
+    node("art-inreview", "artifact", { status: "in-review", edges: [["resolves", "task-inreview"]] }),
+  ])).load();
+  const it = rankQueue(g, { now: NOW, front: { "task-inreview": 40 } }).items.find((i) => i.id === "task-inreview");
+  // in-review doesn't retire the task (it stays in the queue), and a resolves
+  // edge is excluded from the held-outcome test, so the task is NOT held: front
+  // still boosts it, suggest stays 'do' — you wait for the review to land.
+  assert.ok(it, "in-review resolver does not retire the task");
+  assert.equal(it.suggest, "do");
+  assert.ok(it.score >= 5, "front boost intact for a task awaiting a resolver");
+});
+
+test("rankQueue (held self-limit): an 'active' task keeps its boost — only open/status-less qualify", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-onit", "task", { status: "active" }),
+    node("art-onit", "artifact", { edges: [["relates-to", "task-onit"]] }),
+  ])).load();
+  const it = rankQueue(g, { now: NOW, front: { "task-onit": 40 } }).items.find((i) => i.id === "task-onit");
+  assert.equal(it.suggest, "do");
+  assert.ok(it.score >= 5, "active task keeps its front boost");
+});
+
+test("rankQueue (held self-limit): a superseded outcome records nothing — no triage flip", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-x", "task", { status: "open" }),
+    node("art-old", "artifact", { edges: [["relates-to", "task-x"]] }),
+    node("art-new", "artifact", { edges: [["supersedes", "art-old"]] }),
+  ])).load();
+  const it = rankQueue(g, { now: NOW, front: { "task-x": 40 } }).items.find((i) => i.id === "task-x");
+  assert.equal(it.suggest, "do", "the only outcome is superseded -> not held");
+  assert.ok(it.score >= 5);
+});
+
+test("rankQueue (held self-limit, steward view): a held-signature task with a live blocker suggests 'blocked', not 'triage'", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("person-pat", "person", { edges: [["stewards", "task-gated"], ["stewards", "task-unblock"]] }),
+    node("task-unblock", "task", { status: "open", edges: [["blocks", "task-gated"]] }),
+    node("task-gated", "task", { status: "open" }),
+    node("art-gated", "artifact", { edges: [["relates-to", "task-gated"]] }),
+  ])).load();
+  const gated = rankQueue(g, { now: NOW, assignee: "person-pat", front: { "task-gated": 40 } }).items.find((i) => i.id === "task-gated");
+  // a live blocker disqualifies the held signature (the gate is already named):
+  // suggest 'blocked', and front is NOT damped (held requires no blocker).
+  assert.equal(gated.suggest, "blocked");
+  assert.equal(gated.signals.blocked_by, 1);
+  assert.doesNotMatch(gated.why, /close the loop/);
+});
+
 // ---------------- personal mutes (person queue_mute register) ----------------
 
 const PERSON = (id, mutes) => [

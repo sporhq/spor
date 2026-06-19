@@ -411,6 +411,19 @@ signals via its schema's `queueSignals()`:
   so provenance hubs can't ride it; capped below the p1 bump so human
   priority stays supreme; and the why-line states the actual window
   ("N writes in the last D days") (dec-cc-queue-front-from-attribution).
+  The continuity loop ("work X → X stays on top") terminates by finishing X
+  (a resolves edge retires it) — EXCEPT a task **held open on an external
+  gate**, which has nothing to resolve, so each held pass re-raises front and
+  re-surfaces it. The **held-task self-limit** breaks that loop
+  (task-spor-queue-front-loop-self-limit-on-held-tasks): an OPEN task carrying
+  an inbound non-resolving outcome (an artifact/decision linked by any edge but
+  resolves/answers) with no live resolving edge and no live blocker has its
+  front damped to 0 in the score and its suggestion flipped `do → triage`
+  ("resolve, gate with blocked-by, set wake, or abandon") — the same posture
+  staleness takes (flip the suggestion, don't boost the score). `signals.front`
+  keeps the raw count so a `queue-policy` rank() can re-weight. The read-time
+  twin is the `schema-task` `get()` hook, which rides a `held` note along on
+  `get_node`.
 - **staleness** — anchors superseded or gone; high staleness suggests
   closing, not doing.
 - **age**, and any org-specific signal the schema's code adds (SLA clocks,
@@ -615,7 +628,10 @@ the structural truth:
    §2.4 sandbox in step 4 alongside `transitions()`. The blend shipped
    opinionated (§8): `priority bump + 3·blocking − 3·blocked_by +
    min(log₂(1+front), 5) + log₂(1+heat) + age/30 (capped) + neededBy urgency (0-5)`, with staleness ≥ 0.5 flipping the item's suggestion to
-   "close". The `needed_by: YYYY-MM-DD` deadline term is the inverse of
+   "close" and the held-task self-limit flipping it to "triage" (front damped
+   to 0) for an open task with a recorded non-resolving outcome but no resolver
+   and no blocker (task-spor-queue-front-loop-self-limit-on-held-tasks). The
+   `needed_by: YYYY-MM-DD` deadline term is the inverse of
    `wake`: where `wake` hides a node until its date, `needed_by` keeps it
    visible from creation and ramps its score linearly over a 30-day window to
    3 at the date, then on to a hard cap of 5 once overdue — surfacing

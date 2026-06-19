@@ -859,6 +859,59 @@ test("seed pack: task done / issue resolved require a decision or artifact resol
     "no partition on the view counts every resolver (backward-readable)");
 });
 
+test("seed pack: the task get() hook rides along a held-task churn note (task-spor-queue-front-loop-self-limit-on-held-tasks)", () => {
+  const reg = graph.seedRegistry();
+  const SLACK = { timeoutMs: 5000 };
+  const sb = sandboxFor(reg.nodeSchemas.get("task"));
+  const partition = [...reg.nonResolvingStatuses()];
+  const open = { id: "task-x", type: "task", status: "open" };
+  const callGet = (neighbors, terminal = false) =>
+    sb.call("get", [terminal ? { id: "task-x", type: "task", status: "done" } : open,
+      { terminal, non_resolving_statuses: partition, neighbors }], SLACK);
+
+  // held: an inbound non-resolving outcome (artifact via relates-to), no blocker,
+  // no resolving edge -> the de-queue note rides along, naming the outcome.
+  const held = callGet([{ id: "art-1", edge: "relates-to", dir: "in", type: "artifact", superseded: false }]);
+  assert.ok(held.held, "held ride-along present");
+  assert.deepEqual(held.held.outcomes, ["art-1"]);
+  assert.match(held.held.note, /stays queued — close the loop/);
+  assert.match(held.held.note, /blocked-by/);
+  assert.match(held.held.note, /wake: YYYY-MM-DD/);
+  assert.match(held.held.note, /abandoned/);
+  assert.equal(held.resolution, undefined, "not resolved");
+
+  // a decision outcome qualifies too, and multiple outcomes are listed.
+  const two = callGet([
+    { id: "art-1", edge: "during", dir: "in", type: "artifact", superseded: false },
+    { id: "dec-1", edge: "relates-to", dir: "in", type: "decision", superseded: false },
+  ]);
+  assert.deepEqual(two.held.outcomes, ["art-1", "dec-1"]);
+  assert.match(two.held.note, /2 outcomes/);
+
+  // a LIVE resolving edge wins: resolution rides along, no held note.
+  const resolved = callGet([{ id: "art-r", edge: "resolves", dir: "in", type: "artifact", status: "merged", date: "2026-06-19", summary: "shipped", superseded: false }]);
+  assert.ok(resolved.resolution, "resolving edge yields resolution");
+  assert.equal(resolved.held, undefined, "no held note when resolved");
+
+  // a pending in-review resolver is a resolution in flight, NOT a held outcome:
+  // the non-resolving status skips the resolution loop, and the resolves edge is
+  // excluded from the outcome test -> neither ride-along fires.
+  const pending = callGet([{ id: "art-pr", edge: "resolves", dir: "in", type: "artifact", status: "in-review", superseded: false }]);
+  assert.equal(pending.resolution, undefined, "in-review resolver does not resolve");
+  assert.equal(pending.held, undefined, "in-review resolver is not a held outcome");
+
+  // a live blocker suppresses the held note (the gate is already named).
+  const blocked = callGet([
+    { id: "art-1", edge: "relates-to", dir: "in", type: "artifact", superseded: false },
+    { id: "task-gate", edge: "blocks", dir: "in", type: "task", status: "open", superseded: false },
+  ]);
+  assert.equal(blocked.held, undefined, "a live blocker suppresses the held note");
+
+  // a superseded outcome records nothing; a terminal task is never held.
+  assert.equal(callGet([{ id: "art-old", edge: "relates-to", dir: "in", type: "artifact", superseded: true }]).held, undefined, "superseded outcome -> no held note");
+  assert.equal(callGet([{ id: "art-1", edge: "relates-to", dir: "in", type: "artifact", superseded: false }], true).held, undefined, "terminal task -> no held note");
+});
+
 // issue-spor-schema-authoring-docs-gap: GRAPH.md ships a complete, copy-pasteable
 // worked example of a custom node schema (the `escalation` type) exercising BOTH
 // attached hooks. This test extracts that example straight out of the doc and
