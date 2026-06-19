@@ -761,13 +761,17 @@ async function curl(
   }
 }
 
+// Token + server resolve through the active-tenant selector (Config.token()/
+// server(), dec-spor-client-cli-mode-tenant-resolution) so a multi-tenant box's
+// remote-mode hooks authenticate as the active tenant, not a flat config field.
+// Byte-identical when no credential store / org selector is in play.
 function bearer() {
-  const v = _config ? _config.get("token") : home.envDual("TOKEN");
+  const v = _config ? _config.token() : home.envDual("TOKEN");
   return { Authorization: `Bearer ${v || ""}` };
 }
 
 function serverBase() {
-  const v = _config ? _config.get("server") : home.envDual("SERVER");
+  const v = _config ? _config.server() : home.envDual("SERVER");
   return (v || "").replace(/\/+$/, "");
 }
 

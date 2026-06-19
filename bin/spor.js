@@ -28,6 +28,7 @@ const { parseArgs } = require("util");
 const ROOT = path.resolve(__dirname, "..");
 const { loadConfig, DEFAULT_SERVER } = require(path.join(ROOT, "lib", "config.js"));
 const remote = require(path.join(ROOT, "lib", "remote.js"));
+const auth = require(path.join(ROOT, "lib", "auth.js"));
 const u = require(path.join(ROOT, "scripts", "engines", "util.js"));
 const sat = require(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
 
@@ -901,10 +902,369 @@ function looksLikeToken(s) {
   return /^(spor|sub)_pat_/i.test((s || "").trim());
 }
 
-// --- spor join / login --------------------------------------------------
-// Write server+token to USER config (never a committable repo config), then
-// confirm immediately — the upgrade research found no one-step way to point a
-// client at a graph and know it took.
+// ===========================================================================
+// spor auth — the CLI auth surface (dec-spor-cli-auth-device-grant-front-door,
+// dec-spor-client-cli-mode-tenant-resolution, task-cc-spor-auth-cli-verbs-device-
+// code). Multi-tenant: tokens are org-scoped, so a person in N orgs holds N
+// credentials in the credential store (lib/auth.js). The `auth` verbs populate
+// and select within that store and NEVER clobber a sibling tenant. The flat
+// whoami/login/join verbs are aliases (rename-compat, dec-cc-spor-rename-compat-
+// dual-read); `join` now APPENDS rather than overwriting.
+// ===========================================================================
+
+// Identity probe against a SPECIFIC server+token (the one being joined), which
+// may differ from the active tenant — so it can't go through remote.get(cfg).
+async function fetchMe(server, token) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 5000);
+  try {
+    const res = await fetch(auth.normServer(server) + "/v1/me", {
+      headers: { Authorization: `Bearer ${token || ""}` },
+      signal: ctrl.signal,
+    });
+    const j = await res.json().catch(() => null);
+    return { ok: res.ok, status: res.status, json: j };
+  } catch (e) {
+    return { ok: false, transport: true, error: e && e.message ? e.message : String(e) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Render a server error message from either shape: an RFC-style oauth error
+// ({error:"code", error_description:"..."}) or the generic REST error object
+// ({error:{code, message}}). Avoids "[object Object]" in CLI output.
+function oauthErrMsg(j) {
+  if (!j) return "";
+  const e = j.error;
+  if (typeof e === "string") return j.error_description ? `${e}: ${j.error_description}` : e;
+  if (e && typeof e === "object") return e.message || e.code || "";
+  return j.message || "";
+}
+
+// One-line token health for `auth list`/`whoami --all`.
+function tokenHealth(t) {
+  if (!t || !t.access_token) return "no token";
+  if (t.exp) {
+    const now = Math.floor(Date.now() / 1000);
+    if (t.exp <= now) return t.refresh_token ? "expired (auto-refresh)" : "EXPIRED";
+    const days = Math.round((t.exp - now) / 86400);
+    return days >= 1 ? `valid, ${days}d left` : "valid, <1d left";
+  }
+  return "valid";
+}
+
+// Best-effort browser open for the verification URL. No-op on a headless box
+// (linux with no DISPLAY/WAYLAND) so an SSH session just reads the code. Never
+// throws and never blocks (detached + unref).
+function tryOpenBrowser(url) {
+  try {
+    const { spawn } = require("child_process");
+    let cmd;
+    let args;
+    if (process.platform === "darwin") {
+      cmd = "open";
+      args = [url];
+    } else if (process.platform === "win32") {
+      cmd = "cmd";
+      args = ["/c", "start", "", url];
+    } else {
+      if (!process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) return false; // headless
+      cmd = "xdg-open";
+      args = [url];
+    }
+    const c = spawn(cmd, args, { stdio: "ignore", detached: true });
+    c.on("error", () => {});
+    c.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Confirm a {server, token} against /v1/me, then ADD it to the credential store
+// (never clobbering a sibling tenant). Shared by `auth login` (device + paste)
+// and `join`. Returns an exit code.
+async function acquireTenant(cfg, { server, token, org, refresh_token, exp, label, makeDefault }) {
+  server = auth.normServer(server);
+  if (!server) {
+    err("a server URL is required");
+    return 1;
+  }
+  let person = null;
+  let email = null;
+  let resolvedOrg = org || auth.jwtOrg(token) || "";
+  if (token) {
+    // Confirm against the server the credential is FOR; honor an env SPOR_SERVER
+    // redirect (as the prior cascade-based `join` confirm did) so a single-tenant
+    // env points the probe and tests stay hermetic.
+    const me = await fetchMe(u.envDual("SERVER") || server, token);
+    if (me.ok && me.json) {
+      person = me.json.person || null;
+      email = me.json.email || null;
+      if (me.json.bound === false) {
+        out(`⚠ token maps to no person node — routed questions and your personal queue will be empty`);
+      }
+    } else if (me.status === 401 || me.status === 403) {
+      err(`token rejected by ${server} (${me.status}) — not stored`);
+      return 1;
+    } else if (me.transport) {
+      out(`note: could not reach ${server} to confirm identity (${me.error}); storing anyway`);
+    } else if (me.status && me.status !== 404) {
+      out(`note: could not confirm identity (/v1/me ${me.status}); storing anyway`);
+    }
+  }
+  const exp2 = exp != null ? exp : auth.jwtExp(token);
+  const res = auth.upsertTenant(cfg.userConfigHome(), {
+    server,
+    org: resolvedOrg,
+    access_token: token || "",
+    ...(refresh_token ? { refresh_token } : {}),
+    ...(exp2 ? { exp: exp2 } : {}),
+    ...(person ? { person } : {}),
+    ...(email ? { email } : {}),
+    ...(label ? { label } : {}),
+  }, makeDefault !== undefined ? { makeDefault } : {});
+  const who = person ? ` as ${person}${email ? ` <${email}>` : ""}` : "";
+  out(`stored credential for ${resolvedOrg || "(no org)"} @ ${server}${who}`);
+  out(`  ${auth.credentialsPath(cfg.userConfigHome())}`);
+  if (res.becameDefault) out(`  active tenant: ${res.key}`);
+  else out(`  (run 'spor auth switch ${resolvedOrg || res.key}' to make it active)`);
+  return 0;
+}
+
+// `spor auth login` / flat `spor login` — interactive sign-in, default = the
+// RFC 8628 device authorization grant (works headless / over SSH). Paste-compat:
+// `login <url> <token>` skips the device flow and stores a pasted PAT, exactly
+// like `join` (so the historical `spor login <url> <token>` keeps working).
+async function cmdAuthLogin(cfg, args) {
+  const web = args.includes("--web");
+  const all = args.includes("--all");
+  const noOpen = args.includes("--no-open");
+  const serverFlag = optVal(args, "server");
+  const scope = optVal(args, "scope") || undefined;
+  // --org is lifted to a global flag in main() (it selects a tenant for any
+  // verb); read it from the resolved cascade, falling back to an inline --org.
+  const org = cfg.flagOrg() || optVal(args, "org") || undefined;
+  // bare positionals (not a flag and not a flag's value)
+  const FLAGVAL = new Set(["--server", "--scope", "--org"]);
+  const pos = args.filter((a, i) => !a.startsWith("-") && !(i > 0 && FLAGVAL.has(args[i - 1])));
+
+  // Paste path: `login <url> <token>` (or a single bare URL).
+  if (pos.length && /^https?:\/\//.test(pos[0])) {
+    return acquireTenant(cfg, { server: pos[0], token: pos[1] || "", org, makeDefault: true });
+  }
+
+  // Default to the hosted Spor front door when no server is named — onboarding
+  // parity with `spor join <token>` (task-spor-api-cli-default-server-base).
+  const server = auth.normServer(serverFlag || cfg.server() || DEFAULT_SERVER);
+  if (web) {
+    out("note: --web (localhost loopback) is not implemented yet (task-cc-spor-auth-cli-web-loopback);");
+    out("      using the device-code flow — it auto-opens your browser when one is local.");
+  }
+  if (all) {
+    out("note: --all (one token per org in a single leg) needs the front-door membership");
+    out("      endpoint (task-spor-frontdoor-org-membership-enumeration), not yet shipped —");
+    out("      logging into one org for now; re-run 'spor auth login --org <other>' for more.");
+  }
+
+  // RFC 8628 §3.1 — start the device authorization.
+  const da = await auth.deviceAuthorize(server, { scope });
+  if (da.transport) {
+    err(`offline — could not reach ${server} (${da.error})`);
+    return 1;
+  }
+  if (!da.ok || !da.json || !da.json.device_code) {
+    const msg = oauthErrMsg(da.json);
+    err(`device authorization failed (${da.status}${msg ? ` — ${msg}` : ""})`);
+    if (da.status === 404) {
+      err(`  ${server} has no device endpoints — needs the front-door device grant`);
+      err(`  (task-spor-frontdoor-device-authorization-endpoints). Paste a token instead:`);
+      err(`  spor auth login ${server} <token>`);
+    }
+    return 1;
+  }
+  const d = da.json;
+  const interval = Number(d.interval) > 0 ? Number(d.interval) : 5;
+  const expiresIn = Number(d.expires_in) > 0 ? Number(d.expires_in) : 900;
+  out(`To sign in, open this URL in a browser:`);
+  out(`  ${d.verification_uri_complete || d.verification_uri}`);
+  out(`and enter the code:  ${d.user_code}`);
+  out(``);
+  if (!noOpen) tryOpenBrowser(d.verification_uri_complete || d.verification_uri);
+  out(`Waiting for approval (Ctrl-C to cancel)…`);
+
+  // RFC 8628 §3.4 — poll, honoring interval/slow_down, until approval or expiry.
+  const deadline = Date.now() + expiresIn * 1000;
+  let pollMs = interval * 1000;
+  let tokens = null;
+  while (Date.now() < deadline) {
+    await sleep(pollMs);
+    const r = await auth.devicePoll(server, d.device_code);
+    if (r.ok && r.json && r.json.access_token) {
+      tokens = r.json;
+      break;
+    }
+    const e = r.json && r.json.error;
+    if (e === "authorization_pending") continue;
+    if (e === "slow_down") {
+      pollMs += 5000;
+      continue;
+    }
+    if (e === "access_denied") {
+      err("authorization was denied.");
+      return 1;
+    }
+    if (e === "expired_token") {
+      err("the code expired before approval — run 'spor auth login' again.");
+      return 1;
+    }
+    if (r.transport) continue; // transient network blip — keep polling
+    err(`login failed: ${oauthErrMsg(r.json) || `status ${r.status}`}`);
+    return 1;
+  }
+  if (!tokens) {
+    err("timed out waiting for approval — run 'spor auth login' again.");
+    return 1;
+  }
+  const exp =
+    tokens.expires_in != null ? Math.floor(Date.now() / 1000) + Number(tokens.expires_in) : auth.jwtExp(tokens.access_token);
+  return acquireTenant(cfg, {
+    server,
+    token: tokens.access_token,
+    refresh_token: tokens.refresh_token,
+    org,
+    exp,
+    makeDefault: true,
+  });
+}
+
+// `spor auth list` — every stored tenant, which is active, and token health.
+function cmdAuthList(cfg) {
+  const store = auth.readStore(cfg.userConfigHome());
+  const keys = Object.keys(store.tenants);
+  if (!keys.length) {
+    // migrate-on-read: surface a legacy flat config server+token as the implicit
+    // tenant it resolves to (it will move into the store on the next login/join).
+    const t = cfg.tenant();
+    if (t && t.source === "flat-config" && t.server) {
+      out(`* ${t.org || "(no org)"}  ${t.server}  [legacy flat config — run 'spor auth login' to migrate]`);
+      return 0;
+    }
+    out("no stored credentials. Run 'spor auth login' (or 'spor join <url> <token>').");
+    return 0;
+  }
+  for (const k of keys) {
+    const t = store.tenants[k];
+    const mark = k === store.default ? "*" : " ";
+    const idn = t.person ? `  ${t.person}${t.email ? ` <${t.email}>` : ""}` : t.email ? `  <${t.email}>` : "";
+    out(`${mark} ${t.org || "(no org)"}  ${t.server}${idn}  [${tokenHealth(t)}]`);
+  }
+  out(``);
+  out(`* = active tenant. Switch with 'spor auth switch <org>'.`);
+  return 0;
+}
+
+// `spor auth switch <org>` — set the active (default) tenant.
+function cmdAuthSwitch(cfg, args) {
+  const sel = args.find((a) => !a.startsWith("-"));
+  if (!sel) {
+    err("usage: spor auth switch <org>");
+    return 1;
+  }
+  const r = auth.setDefault(cfg.userConfigHome(), sel);
+  if (r.ambiguous) {
+    err(`'${sel}' matches more than one tenant: ${r.ambiguous.join(", ")}`);
+    err(`  switch by full key, e.g. 'spor auth switch ${r.ambiguous[0]}'`);
+    return 1;
+  }
+  if (!r.ok) {
+    err(`no stored tenant for '${sel}' — 'spor auth list' shows what you have.`);
+    return 1;
+  }
+  out(`active tenant: ${r.key}`);
+  return 0;
+}
+
+// `spor auth whoami [--all]` — identity for the active tenant, or every tenant.
+async function cmdAuthWhoami(cfg, args) {
+  if (args.includes("--all")) {
+    const store = auth.readStore(cfg.userConfigHome());
+    const keys = Object.keys(store.tenants);
+    if (!keys.length) {
+      out("no stored credentials. Run 'spor auth login'.");
+      return 0;
+    }
+    for (const k of keys) {
+      const t = store.tenants[k];
+      const mark = k === store.default ? "*" : " ";
+      out(
+        `${mark} ${t.org || "(no org)"} @ ${t.server}: ${t.person || "(unbound)"}${t.email ? ` <${t.email}>` : ""}  [${tokenHealth(t)}]`,
+      );
+    }
+    return 0;
+  }
+  return cmdWhoami(cfg);
+}
+
+// `spor auth logout [<org> | --all]` — clear one tenant, the active one, or all.
+function cmdAuthLogout(cfg, args) {
+  if (args.includes("--all")) {
+    const n = auth.clearAll(cfg.userConfigHome());
+    out(`cleared ${n} tenant${n === 1 ? "" : "s"}.`);
+    return 0;
+  }
+  const sel = args.find((a) => !a.startsWith("-"));
+  if (!sel) {
+    const store = auth.readStore(cfg.userConfigHome());
+    if (!store.default) {
+      err("no active tenant to log out of — pass an <org>, or 'spor auth logout --all'.");
+      return 1;
+    }
+    const r = auth.removeTenant(cfg.userConfigHome(), store.default);
+    out(`logged out of ${r.key}`);
+    return 0;
+  }
+  const r = auth.removeTenant(cfg.userConfigHome(), sel);
+  if (r.ambiguous) {
+    err(`'${sel}' matches more than one tenant: ${r.ambiguous.join(", ")}`);
+    return 1;
+  }
+  if (!r.ok) {
+    err(`no stored tenant for '${sel}' — 'spor auth list' shows what you have.`);
+    return 1;
+  }
+  out(`logged out of ${r.key}`);
+  return 0;
+}
+
+// `spor auth <sub>` dispatcher (raw-parsed, like `agent`/`token`).
+async function cmdAuth(cfg, args) {
+  const sub = args[0];
+  const rest = args.slice(1);
+  switch (sub) {
+    case "login":
+      return await cmdAuthLogin(cfg, rest);
+    case undefined:
+    case "list":
+      return cmdAuthList(cfg);
+    case "switch":
+      return cmdAuthSwitch(cfg, rest);
+    case "whoami":
+      return await cmdAuthWhoami(cfg, rest);
+    case "logout":
+      return cmdAuthLogout(cfg, rest);
+    default:
+      err("usage: spor auth login [--web] [--org <slug>] [--all] | list | switch <org> | whoami [--all] | logout [<org>|--all]");
+      return 1;
+  }
+}
+
+// --- spor join ----------------------------------------------------------
+// Point the client at a team graph by APPENDING an org-scoped credential to the
+// multi-tenant store (never overwriting a sibling tenant — dec-spor-client-cli-
+// mode-tenant-resolution). The non-interactive paste path; `spor auth login` is
+// the interactive (device-grant) acquirer.
 //
 // The server URL defaults to the hosted Spor base (DEFAULT_SERVER,
 // task-spor-api-cli-default-server-base) when omitted, so onboarding to the
@@ -921,19 +1281,9 @@ async function cmdJoin(cfg, { values, positionals }) {
   if (!token && pos.length) token = pos.shift();
   const usedDefault = !server;
   if (usedDefault) server = DEFAULT_SERVER; // hosted-onboarding default
-  let cfgFile;
-  try {
-    cfgFile = writeServerToken(cfg.userConfigHome(), server, token);
-  } catch (e) {
-    err(`could not write config: ${e.message}`);
-    return 1;
-  }
-  out(`wrote server${token ? " + token" : ""} to ${cfgFile}`);
-  if (usedDefault) out(`  using the hosted Spor default ${server} (pass a URL to point at your own server)`);
+  if (usedDefault) out(`using the hosted Spor default ${server} (pass a URL to point at your own server)`);
   if (!token) out(`note: no token given — set SPOR_TOKEN or 'spor join <server> <token>' to authenticate`);
-  // confirm against the freshly-written config
-  const fresh = loadConfig({ cwd: process.cwd() });
-  return await cmdStatus(fresh);
+  return acquireTenant(cfg, { server, token, org: cfg.flagOrg() || undefined, makeDefault: undefined });
 }
 
 // --- spor invite / token: admin onboarding (wraps /v1/admin/tokens) --------
@@ -3195,7 +3545,7 @@ function cmdCapabilities(cfg, args) {
     // Seed reachable_mcp:[spor] from CONFIGURED-ness when a Spor server/connector
     // is bound (remote mode) — the spor MCP is reachable by construction, no
     // network ping (task-spor-mcp-reachability-deterministic-seed).
-    const probed = u.probeCapabilities(home, { sporReachable: !!cfg.get("server") });
+    const probed = u.probeCapabilities(home, { sporReachable: !!cfg.server() });
     out(`probed harnesses: ${probed.harnesses.join(", ") || "(none on PATH)"}`);
     out(`probed plugins:   ${probed.plugins.join(", ") || "(none)"}`);
     const sk = probed.skills.filter((s) => !s.includes(":")); // bare names, compact
@@ -3591,15 +3941,67 @@ const COMMANDS = {
     run: (cfg) => cmdStatus(cfg),
   },
   join: {
-    group: "Getting started", parse: "strict", args: "[url] <token>", aliases: ["login"],
-    summary: "point the client at a graph (writes user config)",
-    help: "Write a team-graph server URL and token to your USER config (never a\ncommittable repo config), then confirm the connection immediately. The URL and\ntoken may be given positionally or as --server/--token. The URL is optional: omit\nit to onboard to the hosted Spor service (https://api.sporhq.io) — a token-shaped\nfirst positional (spor_pat_…) is read as the token, so 'spor join <token>' works.",
+    group: "Getting started", parse: "strict", args: "[url] <token>",
+    summary: "add an org-scoped credential (paste a token; hosted default)",
+    help:
+      "ADD a team-graph credential to the multi-tenant store (~/.spor/auth/\n" +
+      "credentials.json), keyed by (server, org), and confirm it against /v1/me. A\n" +
+      "person in N orgs holds N credentials; join NEVER overwrites a sibling tenant\n" +
+      "(dec-spor-client-cli-mode-tenant-resolution). The org is read from the token\n" +
+      "(JWT claim) or --org. The URL is optional: omit it to onboard to the hosted\n" +
+      "Spor service (https://api.sporhq.io) — a token-shaped first positional\n" +
+      "(spor_pat_…) is read as the token, so 'spor join <token>' works; an explicit\n" +
+      "URL still wins. For interactive sign-in (no pasted token) use 'spor auth\n" +
+      "login' (device-code). The URL/token are positional or --server/--token.",
     options: {
       server: { type: "string", value: "url", desc: "server URL (else the first positional; default https://api.sporhq.io)" },
       token: { type: "string", value: "tok", desc: "auth token (else the trailing positional)" },
     },
-    examples: ["spor join spor_pat_abc123", "spor join https://graph.example.com spor_pat_abc123"],
+    examples: ["spor join spor_pat_abc123", "spor join https://graph.example.com spor_pat_abc123 --org acme"],
     run: (cfg, p) => cmdJoin(cfg, p),
+  },
+  auth: {
+    group: "Getting started", parse: "raw",
+    args: "<login|list|switch|whoami|logout>",
+    summary: "sign in & manage org-scoped credentials (multi-tenant)",
+    help:
+      "Acquire and manage org-scoped Spor credentials. Server tokens are org-scoped,\n" +
+      "so a person in N orgs holds N credentials in the store (~/.spor/auth/\n" +
+      "credentials.json); these verbs populate and select within it and never clobber\n" +
+      "a sibling tenant (dec-spor-cli-auth-device-grant-front-door).\n\n" +
+      "  spor auth login               interactive sign-in; DEFAULT = the RFC 8628\n" +
+      "                                device authorization grant (works headless/SSH:\n" +
+      "                                prints a code + URL, you approve in any browser)\n" +
+      "      --server <url>            the Spor front door (else SPOR_SERVER / active)\n" +
+      "      --org <slug>              label/select the org for the stored credential\n" +
+      "      --web                     localhost-loopback variant (falls back to device)\n" +
+      "      --all                     one token per org membership (needs the server\n" +
+      "                                membership endpoint; falls back to one org)\n" +
+      "      --no-open                 do not auto-open a browser\n" +
+      "      <url> <token>             paste path — store a pre-minted PAT (like join)\n" +
+      "  spor auth list                stored tenants, which is active, token health\n" +
+      "  spor auth switch <org>        set the active (default) tenant\n" +
+      "  spor auth whoami [--all]      identity for the active tenant (or all of them)\n" +
+      "  spor auth logout [<org>]      clear one tenant, the active one, or --all\n\n" +
+      "Flat 'login'/'whoami'/'join' remain as aliases (dec-cc-spor-rename-compat-dual-read).\n" +
+      "The non-interactive / CI path stays SPOR_TOKEN.",
+    examples: [
+      "spor auth login --server https://graph.example.com",
+      "spor auth switch acme",
+      "spor auth whoami --all",
+      "spor auth logout acme",
+    ],
+    run: (cfg, args) => cmdAuth(cfg, args),
+  },
+  login: {
+    group: "Getting started", parse: "raw", args: "[--web] [--server <url>] [--org <slug>]",
+    summary: "interactive sign-in (device-code) — alias of 'auth login'",
+    help:
+      "Interactive sign-in, defaulting to the RFC 8628 device authorization grant —\n" +
+      "an alias of 'spor auth login' (see that for flags). 'spor login <url> <token>'\n" +
+      "still works as the paste path. The non-interactive path stays SPOR_TOKEN.",
+    examples: ["spor login --server https://graph.example.com", "spor login https://graph.example.com tok_abc123"],
+    run: (cfg, args) => cmdAuthLogin(cfg, args),
   },
   migrate: {
     group: "Getting started", parse: "strict", args: "<url>", aliases: ["push"],
@@ -3610,10 +4012,14 @@ const COMMANDS = {
     run: (cfg, p) => cmdMigrate(cfg, p),
   },
   whoami: {
-    group: "Getting started", parse: "strict", args: "", options: {},
+    group: "Getting started", parse: "raw", args: "[--all]",
     summary: "who the team graph thinks you are (remote)",
-    help: "Echo the identity the server binds to your token (remote mode). In local\nmode it explains there is no server identity.",
-    run: (cfg) => cmdWhoami(cfg),
+    help:
+      "Echo the identity the server binds to your token for the ACTIVE tenant (remote\n" +
+      "mode). In local mode it explains there is no server identity. --all enumerates\n" +
+      "the identity of every stored tenant. Alias of 'spor auth whoami'.",
+    examples: ["spor whoami", "spor whoami --all"],
+    run: (cfg, args) => cmdAuthWhoami(cfg, args),
   },
 
   // --- Team admin ---
@@ -4046,11 +4452,38 @@ function renderCmdHelp(verb) {
   return lines.join("\n");
 }
 
+// `--org <slug>` / `--org=<slug>` is a GLOBAL tenant selector (it picks which
+// stored credential any verb talks to — dec-spor-client-cli-mode-tenant-
+// resolution), lifted out of the per-verb argv so the strict parser never sees
+// it. No existing verb uses --org, so this is safe to strip everywhere; the auth
+// verbs read it back via Config.flagOrg().
+function extractOrgFlag(argv) {
+  const rest = [];
+  let org = null;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--org") {
+      if (argv[i + 1] != null && !argv[i + 1].startsWith("--")) {
+        org = argv[i + 1];
+        i++;
+      }
+      continue;
+    }
+    const m = /^--org=(.*)$/.exec(a);
+    if (m) {
+      org = m[1];
+      continue;
+    }
+    rest.push(a);
+  }
+  return { org, rest };
+}
+
 async function main() {
-  const argv = process.argv.slice(2);
+  const { org: cliOrg, rest: argv } = extractOrgFlag(process.argv.slice(2));
   const verb = argv.shift();
   const args = argv;
-  const cfg = loadConfig({ cwd: process.cwd() });
+  const cfg = loadConfig({ cwd: process.cwd(), cli: cliOrg ? { org: cliOrg } : undefined });
 
   // Top-level help / version are intercepted before table dispatch. `spor help
   // <command>` prints that command's detailed page.

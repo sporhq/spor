@@ -428,6 +428,23 @@ anything with a token.
   `{name, email}` attribution record. Access tokens are `spor_oat_…` (30d;
   legacy `sub_oat_…` accepted); refresh tokens are `spor_ort_…` (90d,
   rotating, single-use). Authorization codes are single-use, 10-minute.
+- **CLI interactive sign-in — the device authorization grant.** `spor auth
+  login` (flat alias `spor login`) defaults to the OAuth 2.0 device
+  authorization grant (RFC 8628), brokered at the Spor front door so it works
+  headless / over SSH (dec-spor-cli-auth-device-grant-front-door). Flow:
+  `POST /oauth/device_authorization {client_id?, scope?}` →
+  `{device_code, user_code, verification_uri, verification_uri_complete,
+  expires_in, interval}`; the CLI prints the URL + code (auto-opening a local
+  browser when one is present), the human approves in any browser (the
+  verification leg runs the same AuthKit login + org resolution as the
+  connector flow), and the CLI polls `POST /oauth/token
+  {grant_type: urn:ietf:params:oauth:grant-type:device_code, device_code}` —
+  answering `authorization_pending`/`slow_down` until approval, then minting the
+  same person-bound, **org-scoped**, refreshable `spor_oat_…`/`spor_ort_…` pair
+  `addGrant` mints. `--web` is a reserved localhost-loopback optimization (falls
+  back to device-code today). `spor auth login <url> <token>` / `spor join <url>
+  <token>` is the non-interactive paste path; CI stays `SPOR_TOKEN`. The minted
+  credential is stored per-tenant (§6.2).
 - **Render tickets (shared lens links).** `POST /v1/lens/{id}/ticket` (§3)
   mints a signed, expiring, **read-only** ticket carrying `{lens_id,
   sharer_person_id, exp}` — the credential a *shared* view link carries instead
@@ -478,6 +495,7 @@ mode, reading `$SPOR_HOME` directly:
 ```
 SPOR_SERVER=https://api.sporhq.io      # hosted Spor REST base (the onboarding default)
 SPOR_TOKEN=spor_pat_...                # per-user token (§4)
+SPOR_ORG=acme                         # select a stored tenant by org (§6.2)
 ```
 
 `spor join <token>` writes both for you, defaulting `SPOR_SERVER` to the hosted
@@ -552,3 +570,37 @@ Contract:
   `nodes/` and brief `history/` are committed. The SessionEnd distiller leaves
   distilled nodes **uncommitted** (for the human PR flow) instead of
   auto-committing when the graph home is the same git repo as the code repo.
+
+### 6.2 Multi-tenant credentials (the credential store + tenant selector)
+
+Server tokens are **org-scoped** (the `org` claim is the routing + isolation
+key), so a person in N orgs holds N credentials. The client is multi-tenant
+(dec-spor-client-cli-mode-tenant-resolution): tokens live in a credential store
+**keyed by `(issuer, org)`** at `$SPOR_HOME/auth/credentials.json` (mode `0600`,
+machine-local — never committed, always in the shared-graph `.gitignore`):
+
+```
+{ "version": 1,
+  "tenants": {
+    "<server>/<org>": { "server": "...", "org": "...", "person": "...",
+                        "email": "...", "access_token": "...",
+                        "refresh_token": "...", "exp": 1234567890 } },
+  "default": "<server>/<org>" }
+```
+
+- **Acquire.** `spor auth login` (device grant, §4) and `spor join <url>
+  <token>` (paste) both **ADD** a tenant — they never overwrite a sibling. The
+  org is read from the token (JWT `org` claim) or `--org`. The first tenant
+  becomes the active default.
+- **Manage.** `spor auth list` (tenants + active + token health), `spor auth
+  switch <org>`, `spor auth whoami [--all]`, `spor auth logout [<org>|--all]`.
+- **Tenant selector** (which credential is active), highest wins:
+  `--org`/`--server` flag > `SPOR_SERVER`(+`SPOR_TOKEN`)/`SPOR_ORG` env > repo
+  `.spor` `org:` marker (committable, nearest-ancestor — the remote-mode sibling
+  of the `graph:` binding in §6.1) > store `default` > legacy flat config.json
+  `server`+`token` (migrated on read) > local.
+- **Refresh.** A 401/403 on a tenant carrying a `refresh_token` transparently
+  refreshes against its issuer (`grant_type=refresh_token`) and retries once.
+- **Byte-identical.** With no credential store and only a flat
+  `server`+`token` or `SPOR_*` env set, every resolved value equals the prior
+  single-tenant behavior (norm-cc-byte-identical-refactor).

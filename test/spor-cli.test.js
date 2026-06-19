@@ -569,15 +569,39 @@ test('add with no text exits 1', () => {
   assert.match(r.stderr, /usage/);
 });
 
-test('join writes server+token to user config (never repo)', () => {
+test('join APPENDS an org-scoped credential to the multi-tenant store (never repo)', () => {
+  // join now appends to ~/.spor/auth/credentials.json instead of overwriting a
+  // flat config.json (dec-spor-client-cli-mode-tenant-resolution). A dead server
+  // means /v1/me can't confirm identity — it stores anyway (fail-open) and exits 0.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-join-'));
   const r = run(['join', 'http://127.0.0.1:9/', 'tok123'], { SPOR_HOME: home });
-  // status confirmation runs against a dead server => still exits 0 (fail-open)
-  assert.strictEqual(r.status, 0);
-  const cfg = JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8'));
-  assert.strictEqual(cfg.server, 'http://127.0.0.1:9'); // trailing slash trimmed
-  assert.strictEqual(cfg.token, 'tok123');
-  assert.match(r.stdout, /OFFLINE/); // confirmation probe ran
+  assert.strictEqual(r.status, 0, r.stderr);
+  const store = JSON.parse(fs.readFileSync(path.join(home, 'auth', 'credentials.json'), 'utf8'));
+  const key = 'http://127.0.0.1:9/'; // <server>/<org>, org empty for an opaque token; trailing slash trimmed off server
+  assert.ok(store.tenants[key], 'tenant keyed by (server, org)');
+  assert.strictEqual(store.tenants[key].server, 'http://127.0.0.1:9');
+  assert.strictEqual(store.tenants[key].access_token, 'tok123');
+  assert.strictEqual(store.default, key, 'first tenant becomes the active default');
+  assert.match(r.stdout, /stored credential/);
+});
+
+test('join APPENDS a second tenant without clobbering the first', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-join2-'));
+  run(['join', 'http://127.0.0.1:9', 'tokA'], { SPOR_HOME: home });
+  const r2 = run(['join', 'http://127.0.0.1:8', 'tokB'], { SPOR_HOME: home });
+  assert.strictEqual(r2.status, 0, r2.stderr);
+  const store = JSON.parse(fs.readFileSync(path.join(home, 'auth', 'credentials.json'), 'utf8'));
+  assert.strictEqual(Object.keys(store.tenants).length, 2, 'both tenants kept');
+  assert.strictEqual(store.tenants['http://127.0.0.1:9/'].access_token, 'tokA');
+  assert.strictEqual(store.tenants['http://127.0.0.1:8/'].access_token, 'tokB');
+  assert.strictEqual(store.default, 'http://127.0.0.1:9/', 'a second join does not steal the active default');
+});
+
+test('credential store file is created 0600', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-join-perm-'));
+  run(['join', 'http://127.0.0.1:9', 'tok'], { SPOR_HOME: home });
+  const mode = fs.statSync(path.join(home, 'auth', 'credentials.json')).mode & 0o777;
+  assert.strictEqual(mode, 0o600);
 });
 
 test('migrate commits the graph and pushes to a user-owned remote', () => {

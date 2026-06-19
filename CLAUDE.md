@@ -379,6 +379,25 @@ SAME `dispatch.agent` opt-in, throttled by `dispatch.heartbeatIntervalMs`
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard
 (`SPOR_DISTILLING`) are deliberately NOT config — they stay pure env.
+**Multi-tenant credentials (dec-spor-client-cli-mode-tenant-resolution, API.md
+§6.2):** server tokens are org-scoped, so the client holds one credential per
+`(issuer, org)` in `$SPOR_HOME/auth/credentials.json` (0600, machine-local —
+`lib/auth.js`, already in the shared-graph `.gitignore` `/auth/`). The active
+tenant resolves through a SELECTOR layered into `lib/config.js`
+(`Config.tenant()/server()/token()`), high-first: `--org`/`--server` flag >
+`SPOR_SERVER`(+`SPOR_TOKEN`)/`SPOR_ORG` env > repo `.spor` `org:` marker
+(`repoMarkerOrg`, the remote-mode sibling of the `graph:` binding) > store
+`default` > legacy flat `config.json` `server`+`token` (migrate-on-read) > local.
+`lib/remote.js` + the hook engines read `server()`/`token()` instead of the raw
+`get("server")`/`get("token")` and transparently refresh a tenant's
+`refresh_token` on a 401; **byte-identical** when no store / org-selector is in
+play (only a flat `server`+`token` or env). The `spor auth` verbs (login [device
+grant, RFC 8628] / list / switch / whoami / logout; flat `login`/`whoami`/`join`
+aliases, `join` APPENDS) populate and select within the store and never clobber
+a sibling tenant. `--org` is a GLOBAL flag lifted out of argv in `bin/spor`
+`main()` so any verb can pick a tenant. The org for a freshly-minted token is the
+JWT `org` claim (opaque-token deployments need `--org`, or the future `/v1/me`
+org echo).
 
 ## Design context
 
