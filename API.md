@@ -476,9 +476,13 @@ spellings are still read — dual-read back-compat window); unset means local
 mode, reading `$SPOR_HOME` directly:
 
 ```
-SPOR_SERVER=https://spor.example.com
+SPOR_SERVER=https://api.sporhq.io      # hosted Spor REST base (the onboarding default)
 SPOR_TOKEN=spor_pat_...                # per-user token (§4)
 ```
+
+`spor join <token>` writes both for you, defaulting `SPOR_SERVER` to the hosted
+base `https://api.sporhq.io`; pass a URL (`spor join <url> <token>`) to point at
+a self-hosted server instead.
 
 **Opt-in activation.** Spor is opt-in per repo: with the plugin installed, the
 hooks are a full no-op (no context injected, nothing distilled) in any repo that

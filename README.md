@@ -198,11 +198,21 @@ answered from what's already there, it routes to the person most likely to
 know, and their answer flows back into the graph as a node — so the next
 person who asks gets it from the graph instead.
 
-A client joins a team graph by pointing at it with two environment variables:
+A client joins a team graph with a token from your team's invite:
 
 ```bash
-export SPOR_SERVER=https://spor.example.com
-export SPOR_TOKEN=...
+spor join spor_pat_...                 # hosted Spor (https://api.sporhq.io)
+```
+
+`spor join` writes the server URL and token to your user config and confirms
+the connection. The URL defaults to the hosted Spor service
+(`https://api.sporhq.io`); pass your own to point elsewhere
+(`spor join https://spor.example.com spor_pat_...`). The equivalent two
+environment variables work too:
+
+```bash
+export SPOR_SERVER=https://api.sporhq.io
+export SPOR_TOKEN=spor_pat_...
 ```
 
 Set those and the client talks to the team graph over REST and MCP; leave

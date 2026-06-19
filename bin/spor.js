@@ -26,7 +26,7 @@ const { spawnSync } = require("child_process");
 const { parseArgs } = require("util");
 
 const ROOT = path.resolve(__dirname, "..");
-const { loadConfig } = require(path.join(ROOT, "lib", "config.js"));
+const { loadConfig, DEFAULT_SERVER } = require(path.join(ROOT, "lib", "config.js"));
 const remote = require(path.join(ROOT, "lib", "remote.js"));
 const u = require(path.join(ROOT, "scripts", "engines", "util.js"));
 const sat = require(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
@@ -893,17 +893,34 @@ function writeServerToken(home, server, token) {
   return cfgFile;
 }
 
+// A positional that looks like an auth token, not a server URL — the prefixes
+// the server mints (spor_pat_…, legacy sub_pat_…). Lets `spor join <token>`
+// onboard to the hosted default in one step without mistaking the token for the
+// server URL. Case-insensitive and tolerant of surrounding whitespace.
+function looksLikeToken(s) {
+  return /^(spor|sub)_pat_/i.test((s || "").trim());
+}
+
 // --- spor join / login --------------------------------------------------
 // Write server+token to USER config (never a committable repo config), then
 // confirm immediately — the upgrade research found no one-step way to point a
 // client at a graph and know it took.
+//
+// The server URL defaults to the hosted Spor base (DEFAULT_SERVER,
+// task-spor-api-cli-default-server-base) when omitted, so onboarding to the
+// hosted service is `spor join <token>` rather than requiring the URL. A first
+// positional that looks like a token (spor_pat_…) is taken as the token, not the
+// server, so the one-arg form is unambiguous; an explicit URL still wins.
 async function cmdJoin(cfg, { values, positionals }) {
-  const server = values.server || positionals[0];
-  const token = values.token || positionals[1];
-  if (!server) {
-    err("usage: spor join <server-url> <token>");
-    return 1;
-  }
+  let server = values.server;
+  let token = values.token;
+  const pos = positionals.slice();
+  // First positional is the server URL unless it is clearly a token (the
+  // one-arg hosted-join form), in which case it falls through to the token slot.
+  if (!server && pos.length && !looksLikeToken(pos[0])) server = pos.shift();
+  if (!token && pos.length) token = pos.shift();
+  const usedDefault = !server;
+  if (usedDefault) server = DEFAULT_SERVER; // hosted-onboarding default
   let cfgFile;
   try {
     cfgFile = writeServerToken(cfg.userConfigHome(), server, token);
@@ -912,6 +929,7 @@ async function cmdJoin(cfg, { values, positionals }) {
     return 1;
   }
   out(`wrote server${token ? " + token" : ""} to ${cfgFile}`);
+  if (usedDefault) out(`  using the hosted Spor default ${server} (pass a URL to point at your own server)`);
   if (!token) out(`note: no token given — set SPOR_TOKEN or 'spor join <server> <token>' to authenticate`);
   // confirm against the freshly-written config
   const fresh = loadConfig({ cwd: process.cwd() });
@@ -1901,7 +1919,7 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
     out("");
     out("next:");
     if (cfg.mode() === "remote") out(`  remote mode is configured (${remote.base(cfg)}).`);
-    else out("  point at a graph:  spor join <server-url> <token>   (or export SPOR_SERVER/SPOR_TOKEN)");
+    else out("  point at a graph:  spor join <token>   (hosted Spor; or 'spor join <url> <token>' / export SPOR_SERVER/SPOR_TOKEN)");
     out("  distiller backend (hosts without the claude CLI) + on-demand MCP access: see adapters/<host>/README.md");
     out("  approve the hooks on first run if the host prompts.");
   }
@@ -3573,14 +3591,14 @@ const COMMANDS = {
     run: (cfg) => cmdStatus(cfg),
   },
   join: {
-    group: "Getting started", parse: "strict", args: "<url> <token>", aliases: ["login"],
+    group: "Getting started", parse: "strict", args: "[url] <token>", aliases: ["login"],
     summary: "point the client at a graph (writes user config)",
-    help: "Write a team-graph server URL and token to your USER config (never a\ncommittable repo config), then confirm the connection immediately. The URL and\ntoken may be given positionally or as --server/--token.",
+    help: "Write a team-graph server URL and token to your USER config (never a\ncommittable repo config), then confirm the connection immediately. The URL and\ntoken may be given positionally or as --server/--token. The URL is optional: omit\nit to onboard to the hosted Spor service (https://api.sporhq.io) — a token-shaped\nfirst positional (spor_pat_…) is read as the token, so 'spor join <token>' works.",
     options: {
-      server: { type: "string", value: "url", desc: "server URL (else the first positional)" },
-      token: { type: "string", value: "tok", desc: "auth token (else the second positional)" },
+      server: { type: "string", value: "url", desc: "server URL (else the first positional; default https://api.sporhq.io)" },
+      token: { type: "string", value: "tok", desc: "auth token (else the trailing positional)" },
     },
-    examples: ["spor join https://graph.example.com tok_abc123"],
+    examples: ["spor join spor_pat_abc123", "spor join https://graph.example.com spor_pat_abc123"],
     run: (cfg, p) => cmdJoin(cfg, p),
   },
   migrate: {
