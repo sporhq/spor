@@ -1093,6 +1093,145 @@ async function cmdCorrect(cfg, { values, positionals }) {
   return 0;
 }
 
+// --- spor priority ------------------------------------------------------
+// The CLI wrapper for the set_priority micro-mutation (task-spor-cli-priority-
+// verb): a thin, mode-aware client of the route the REST POST /v1/nodes/{id}/
+// priority and the MCP set_priority tool already expose, so the shell stops
+// being the one surface where setting a node's priority means a raw curl. The
+// human-override half of the queue blend (dec-cc-opinionated-queue-blend) gets
+// a verb to match add/correct.
+//
+// The p1/p2/p3 + clearing vocabulary is the server's (set_priority in
+// spor-server's rest.js); it is NOT in the schema registry, so it is mirrored
+// here for a fast client-side reject and an identical local-mode write. The
+// canonical value ("" clears, else p1|p2|p3) is what we send/write, so both
+// modes behave the same on `none`/`clear`/`p0`/`""`.
+const PRIORITY_VALUES = new Set(["p1", "p2", "p3"]);
+const PRIORITY_CLEAR = new Set(["", "none", "null", "clear", "0", "p0"]);
+function normalizePriority(raw) {
+  const want = raw == null ? "" : String(raw).trim().toLowerCase();
+  if (PRIORITY_CLEAR.has(want)) return { ok: true, value: "" };
+  if (PRIORITY_VALUES.has(want)) return { ok: true, value: want };
+  return { ok: false };
+}
+
+// Read `git config user.name`/`user.email` from the graph home for the local
+// `priority_by` stamp — the local analogue of the server stamping it from the
+// authenticated token (dec-viewer-token-binding). Best-effort: either piece may
+// be empty, in which case the stamp is omitted (the server omits priority_by
+// when it has no identity too). Mirrors lib/queue.js's gitIdentityEmail read.
+function gitIdentity(repoDir) {
+  const read = (key) => {
+    const r = spawnSync("git", ["-C", repoDir, "config", key], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    return r.status === 0 ? (r.stdout || "").trim() : "";
+  };
+  return { name: read("user.name"), email: read("user.email") };
+}
+
+// Rewrite a node's raw markdown to carry `value` (or clear it when value is ""),
+// stamping priority_by/_at/_via. Byte-mirrors the server's rewritePriority so a
+// local node and a remote one read the same after the mutation; returns the new
+// raw, or null when the frontmatter can't be located.
+function rewritePriority(raw, value, identity, via) {
+  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(raw);
+  if (!m) return null;
+  let fm = m[1];
+  const body = m[2];
+  const stripFmLine = (s, key) => s.replace(new RegExp(`(^|\\n)${key}:[^\\n]*`, "g"), "");
+  for (const k of ["priority", "priority_by", "priority_at", "priority_via"]) fm = stripFmLine(fm, k);
+  fm = fm.replace(/\n+$/, "").replace(/^\n+/, "");
+  const stamps = [];
+  if (value) {
+    stamps.push(`priority: ${value}`);
+    if (identity && identity.name && identity.email) stamps.push(`priority_by: ${identity.name} <${identity.email}>`);
+    stamps.push(`priority_at: ${u.isoMs()}`);
+    stamps.push(`priority_via: ${via}`);
+  }
+  const fmOut = stamps.length ? `${fm}\n${stamps.join("\n")}` : fm;
+  return `---\n${fmOut}\n---\n${body}`;
+}
+
+async function cmdPriority(cfg, { positionals }) {
+  const id = positionals[0];
+  const rawPriority = positionals[1];
+  if (!id || rawPriority == null) {
+    err("usage: spor priority <id> <p1|p2|p3|clear>");
+    err("  set the human-triage priority of a queue item, or clear it (none/clear)");
+    return 1;
+  }
+  const norm = normalizePriority(rawPriority);
+  if (!norm.ok) {
+    err(`priority '${rawPriority}' not allowed — use p1, p2, p3, or none/clear to remove it`);
+    return 1;
+  }
+  const value = norm.value;
+
+  if (cfg.mode() === "remote") {
+    // Send the canonical value the server validates again; it stamps
+    // priority_by/_at/_via (via: rest) from the token, so the body is {priority}.
+    const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/priority`, { priority: value }, { timeoutMs: 8000 });
+    if (r.transport) {
+      err(`offline — could not reach server (${r.error})`);
+      return 1;
+    }
+    if (r.status === 404) {
+      err(`no such node: ${id}`);
+      return 1;
+    }
+    if (!r.ok) {
+      const msg = r.json && r.json.error && r.json.error.message;
+      err(`priority error ${r.status}${msg ? `: ${msg}` : ""}`);
+      return 1;
+    }
+    out(value ? `priority set: ${id} -> ${value}` : `priority cleared: ${id}`);
+    return 0;
+  }
+
+  // local: rewrite the node file's frontmatter in place, mirroring the server's
+  // read-modify-write (no server to POST to). Identity is the git user the way
+  // local $viewer is derived (lib/queue.js viewerFor), the door is `cli`.
+  const nodesDir = cfg.nodesDir();
+  const file = path.join(nodesDir, `${id}.md`);
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    err(`no such node: ${id}`);
+    return 1;
+  }
+  const identity = gitIdentity(path.dirname(nodesDir));
+  const newRaw = rewritePriority(raw, value, identity, "cli");
+  if (newRaw == null) {
+    err(`could not locate frontmatter in ${id}`);
+    return 1;
+  }
+  // validate before writing (same bar as add/correct), so a malformed result
+  // never lands on disk.
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  let g;
+  try {
+    g = graphLib.loadGraph(nodesDir);
+  } catch (e) {
+    err(`could not load graph: ${e.message}`);
+    return 1;
+  }
+  let node;
+  try {
+    node = graphLib.parseFrontmatter(newRaw, `${id}.md`);
+  } catch (e) {
+    err(`invalid node after priority rewrite: ${e.message}`);
+    return 1;
+  }
+  const v = graphLib.validateNode(g, node);
+  if (!v.ok) {
+    err(`invalid node after priority rewrite:\n  ${v.errors.join("\n  ")}`);
+    return 1;
+  }
+  fs.writeFileSync(file, newRaw);
+  out(value ? `priority set: ${id} -> ${value}` : `priority cleared: ${id}`);
+  return 0;
+}
+
 // Persist server/token into the USER config (never a committable repo config).
 // Shared by 'join' and the 'install --server/--token' configure step. Only the
 // keys given are touched, so a token-only update keeps the existing server.
@@ -4687,6 +4826,22 @@ const COMMANDS = {
       'spor correct project:spor "always cite the conformance suite for refactors"',
     ],
     run: (cfg, p) => cmdCorrect(cfg, p),
+  },
+  priority: {
+    group: "Graph", parse: "strict", args: "<id> <p1|p2|p3|clear>", aliases: ["set-priority"],
+    summary: "set a queue item's human-triage priority (local: in-place; remote: /v1/nodes/{id}/priority)",
+    help:
+      "Set (or clear) a node's human-triage priority — the override half of the queue\n" +
+      "blend, where p1/p2/p3 bumps an item above the signal-ranked front. The value is\n" +
+      "p1 (highest), p2, p3, or none/clear to remove it (p0 and an empty value clear\n" +
+      "too). The change is stamped with your identity and the door it came through\n" +
+      "(priority_by/_at/_via) so an agent-set priority is distinguishable from human\n" +
+      "triage. Remote mode POSTs /v1/nodes/{id}/priority (the set_priority micro-\n" +
+      "mutation — one call, no revision round-trip); local mode rewrites the node\n" +
+      "file's frontmatter in place, attributing to your git identity.",
+    options: {},
+    examples: ["spor priority issue-86 p1", "spor priority task-x p3", "spor priority issue-86 clear"],
+    run: (cfg, p) => cmdPriority(cfg, p),
   },
 
   // --- Repo scoping ---
