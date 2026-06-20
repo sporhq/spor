@@ -1393,3 +1393,112 @@ test('next (remote) notes a scoped read that returns nothing; an unscoped fireho
     srv.close();
   }
 });
+
+// --- add (remote) transport-failure spooling --------------------------------
+// issue-spor-add-cli-residual-transport-failure-silent-loss: a one-shot `spor add`
+// has no hook loop, so a transport failure / transient 5xx must SPOOL the capture
+// to the shared outbox (the queue drain-outbox replays) instead of printing a
+// retry promise it can't keep. Permanent 4xx rejects must NOT spool.
+function captureStubServer(handler) {
+  const http = require('node:http');
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      hits.push({ method: req.method, url: req.url, body });
+      handler(req, res, body);
+    });
+  });
+  return new Promise((resolve) => srv.listen(0, '127.0.0.1', () =>
+    resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
+}
+// A bound-then-closed port: connecting to it yields ECONNREFUSED -> remote.post
+// returns {transport:true}, the genuine "server unreachable" case.
+function deadBase() {
+  const http = require('node:http');
+  return new Promise((resolve) => {
+    const srv = http.createServer();
+    srv.listen(0, '127.0.0.1', () => {
+      const base = `http://127.0.0.1:${srv.address().port}`;
+      srv.close(() => resolve(base));
+    });
+  });
+}
+function freshHome() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'spor-add-spool-'));
+}
+function spoolFiles(home) {
+  const dir = path.join(home, 'outbox');
+  return fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('.capture.json')) : [];
+}
+
+test('add (remote) transport failure spools the capture and reports the spool path', async () => {
+  const home = freshHome();
+  const base = await deadBase();
+  const r = await runAsyncCli(['add', 'a durable finding worth keeping past an outage'],
+    { SPOR_SERVER: base, SPOR_TOKEN: 'tok', SPOR_HOME: home });
+  assert.strictEqual(r.status, 1, r.stdout);
+  // accurate message: names the spool location + the real recovery path, NOT a
+  // bare "retried by the hooks" promise a one-shot CLI cannot keep.
+  assert.match(r.stderr, /Spooled to /);
+  assert.match(r.stderr, /spor doctor/);
+  assert.doesNotMatch(r.stderr, /retried by the hooks/);
+  const spooled = spoolFiles(home);
+  assert.strictEqual(spooled.length, 1, 'exactly one capture spooled to the outbox');
+  // the spooled body is the VERBATIM /v1/capture payload, so the drain replays it as-is
+  const payload = JSON.parse(fs.readFileSync(path.join(home, 'outbox', spooled[0]), 'utf8'));
+  assert.strictEqual(payload.text, 'a durable finding worth keeping past an outage');
+  assert.ok(payload.context && typeof payload.context.project === 'string', 'context.project preserved');
+});
+
+test('add (remote) transient 5xx spools the capture for replay', async () => {
+  const home = freshHome();
+  const { srv, base } = await captureStubServer((req, res) => {
+    res.writeHead(503, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { code: 'unavailable' } }));
+  });
+  try {
+    const r = await runAsyncCli(['add', 'capture worth keeping while the server is down'],
+      { SPOR_SERVER: base, SPOR_TOKEN: 'tok', SPOR_HOME: home });
+    assert.strictEqual(r.status, 1, r.stdout);
+    assert.match(r.stderr, /Spooled to /);
+    assert.strictEqual(spoolFiles(home).length, 1, 'a 5xx is retryable -> spooled');
+  } finally {
+    srv.close();
+  }
+});
+
+test('add (remote) permanent 4xx does NOT spool — it is a deterministic reject', async () => {
+  const home = freshHome();
+  const { srv, base } = await captureStubServer((req, res) => {
+    res.writeHead(422, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { code: 'bad_date' } }));
+  });
+  try {
+    const r = await runAsyncCli(['add', 'a capture the server rejects on a bad field', '--needed-by', 'not-a-date'],
+      { SPOR_SERVER: base, SPOR_TOKEN: 'tok', SPOR_HOME: home });
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /capture error 422/);
+    assert.strictEqual(spoolFiles(home).length, 0, 'a permanent 4xx must not spool (would only dead-letter)');
+  } finally {
+    srv.close();
+  }
+});
+
+test('add (remote) happy path captures and spools nothing', async () => {
+  const home = freshHome();
+  const { srv, base } = await captureStubServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ status: 'captured', ids: ['task-fresh-capture'] }));
+  });
+  try {
+    const r = await runAsyncCli(['add', 'a capture that ships cleanly on the first try'],
+      { SPOR_SERVER: base, SPOR_TOKEN: 'tok', SPOR_HOME: home });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /captured: task-fresh-capture/);
+    assert.strictEqual(spoolFiles(home).length, 0, 'a successful capture leaves the outbox empty');
+  } finally {
+    srv.close();
+  }
+});

@@ -868,6 +868,26 @@ function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
+// Spool a failed remote capture body to the SHARED outbox
+// (graphHome/outbox/*.capture.json) — the exact queue session-start's
+// drain-outbox engine replays to /v1/capture. The body is written VERBATIM so the
+// retry re-sends the request that failed; a uuid filename guarantees uniqueness,
+// the ms-epoch prefix keeps rough FIFO order under the drain's lexical sort. Best
+// effort: returns the spool path, or null if even the write failed (so the caller
+// can warn that the capture was genuinely lost rather than promise a retry that
+// won't happen — issue-spor-add-cli-residual-transport-failure-silent-loss).
+function spoolCapture(cfg, body) {
+  try {
+    const dir = path.join(cfg.graphHome(), "outbox");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `cli-${Date.now()}-${crypto.randomUUID()}.capture.json`);
+    fs.writeFileSync(file, JSON.stringify(body));
+    return file;
+  } catch {
+    return null;
+  }
+}
+
 async function cmdAdd(cfg, { values, positionals }) {
   const prose = positionals[0];
   if (!prose) {
@@ -892,9 +912,25 @@ async function cmdAdd(cfg, { values, positionals }) {
     // Capture ingestion runs an LLM server-side (typically >6s), so the default
     // read timeout would abort a healthy request and silently drop the capture —
     // a one-shot CLI has no hook outbox to retry it (issue-spor-add-cli-timeout-silent-loss).
-    const r = await remote.post(cfg, "/v1/capture", { text: prose, context }, { timeoutMs: 30000 });
-    if (r.transport) {
-      err(`offline — capture not shipped (${r.error}). It will be retried by the hooks' outbox in a normal session.`);
+    const body = { text: prose, context };
+    const r = await remote.post(cfg, "/v1/capture", body, { timeoutMs: 30000 });
+    // Transport failure (server unreachable / >30s ingestion abort) or a transient
+    // 5xx: the request never durably landed and a replay can still succeed. A
+    // one-shot `spor add` has no hook loop to retry itself, so DON'T just print a
+    // promise — spool the exact failed body to the shared outbox the session-start
+    // drain replays, turning silent loss into a durable, retried capture
+    // (issue-spor-add-cli-residual-transport-failure-silent-loss). Permanent 4xx
+    // rejections (missing blocks target -> 404, bad date -> 422, bad token -> 401)
+    // would only dead-letter on drain, so they fall through to the error path below.
+    const retryable = r.transport || (typeof r.status === "number" && r.status >= 500);
+    if (retryable) {
+      const reason = r.transport ? r.error : `HTTP ${r.status}`;
+      const spool = spoolCapture(cfg, body);
+      if (spool) {
+        err(`offline — capture not shipped (${reason}). Spooled to ${spool}; it ships on your next Spor session (check with 'spor doctor').`);
+      } else {
+        err(`offline — capture not shipped (${reason}) and could not be spooled — capture lost. Re-run when the server is reachable.`);
+      }
       return 1;
     }
     if (!r.ok) {
