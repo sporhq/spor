@@ -263,6 +263,66 @@ test("dispatch --from-queue: empty queue exits 1", () => {
   assert.match(r.stderr, /queue empty/);
 });
 
+// A node / --from-queue dispatch must run in the TARGET repo so its workspace
+// hooks apply, never silently fall back to the launcher's cwd
+// (issue-spor-dispatch-from-queue-wrong-repo-hooks). The happy path (a node whose
+// repo: stamp is mapped in dispatch.repos) is covered above; these lock the
+// residual hole: a node carrying NO repo/project stamp can't be resolved to a
+// target repo, so the OLD behavior was a silent fallback to the launcher's cwd
+// (applying its hooks to another repo's work). Now it REFUSES instead.
+function stamplessFixture() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-stampless-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  // No repo:/project: frontmatter — nothing identifies the owning repo.
+  fs.writeFileSync(
+    path.join(nodes, "task-orphan.md"),
+    `---\nid: task-orphan\ntype: task\ntitle: An orphan task with no repo or project stamp\nsummary: A queueable task carrying neither a repo nor a project frontmatter field, so dispatch cannot resolve its target repo from the node.\ndate: 2026-06-02\n---\nDo the orphan work.\n`
+  );
+  return { home, nodes };
+}
+
+test("dispatch <node-id> with no repo/project stamp: refuses rather than silently using the launcher cwd", () => {
+  const { home } = stamplessFixture();
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-launcher-"));
+  const r = run(["dispatch", "task-orphan", "--print", "--no-brief"], { SPOR_HOME: home }, elsewhere);
+  assert.strictEqual(r.status, 1, r.stdout);
+  assert.match(r.stderr, /can't tell which repo task-orphan belongs to/);
+  assert.match(r.stderr, /workspace hooks/);
+  // Crucially, it must NOT have silently resolved into the launcher's cwd.
+  assert.doesNotMatch(r.stdout, /dir:.*via cwd/);
+});
+
+test("dispatch --from-queue lands on a stampless node: refuses rather than silently using the launcher cwd", () => {
+  const { home } = stamplessFixture();
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-launcher-"));
+  const r = run(["dispatch", "--from-queue", "--print"], { SPOR_HOME: home }, elsewhere);
+  assert.strictEqual(r.status, 1, r.stdout);
+  assert.match(r.stderr, /can't tell which repo task-orphan belongs to/);
+  assert.doesNotMatch(r.stdout, /dir:.*via cwd/);
+});
+
+test("dispatch <node-id> with no stamp + explicit --dir: the escape hatch lets it through (cwd guard is off)", () => {
+  const { home } = stamplessFixture();
+  const target = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-target-"));
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-launcher-"));
+  const r = run(["dispatch", "task-orphan", "--dir", target, "--print", "--no-brief"], { SPOR_HOME: home }, elsewhere);
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, new RegExp(`dir:    ${target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*via --dir`));
+  assert.doesNotMatch(r.stderr, /can't tell which repo/);
+});
+
+// A FREE-TEXT dispatch (no node) legitimately targets the launcher's cwd — that
+// work IS for the current repo. The guard must not catch it (only node-mode).
+test("dispatch free-text from cwd: still resolves the launcher cwd (guard is node-mode only)", () => {
+  const { home } = stamplessFixture();
+  const launcher = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-launcher-"));
+  const r = run(["dispatch", "some free text work to do here", "--print", "--no-brief"], { SPOR_HOME: home }, launcher);
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, new RegExp(`dir:    ${launcher.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*via cwd`));
+  assert.doesNotMatch(r.stderr, /can't tell which repo/);
+});
+
 // --from-queue must SKIP items already in flight on this machine and advance to
 // the next genuinely-free one (task-spor-dispatch-from-queue-skip-in-flight). The
 // queue's lease filter is viewer-relative, so the dispatcher's own in-progress

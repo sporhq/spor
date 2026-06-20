@@ -3694,6 +3694,27 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     err(`target dir does not exist: ${res.dir}`);
     return 1;
   }
+  // A node / --from-queue dispatch targets a SPECIFIC node that belongs to a
+  // SPECIFIC repo, and the agent must run in THAT repo so its workspace hooks
+  // apply — not the launcher's (issue-spor-dispatch-from-queue-wrong-repo-hooks).
+  // The happy path resolves the target repo from the node's repo/project stamp
+  // through the dispatch.repos map (res.source "config"), and an unknown stamp
+  // already errors loudly above (res.dir null). The remaining hole is a node that
+  // carries NO repo/project stamp: targetSlug stays null, so resolveDir silently
+  // falls back to the launcher's cwd (res.source "cwd") and the launcher's hooks
+  // would run against another repo's work. Refuse it loudly here, mirroring the
+  // unknown-slug error, rather than mis-targeting in silence. An explicit --dir/
+  // --slug moves res.source off "cwd" (the caller pinned it on purpose), and
+  // free-text / --backfill dispatch legitimately targets the cwd (no nodeId), so
+  // both keep working — only a stampless node-mode dispatch is caught.
+  if (nodeId && !backfill && res.source === "cwd") {
+    err(`can't tell which repo ${nodeId} belongs to — it carries no repo/project stamp,`);
+    err(`  so dispatch would fall back to the launcher's cwd (${res.dir}) and apply ITS`);
+    err(`  workspace hooks to another repo's work. Pin the target explicitly:`);
+    err(`  pass --dir <path> (use --dir . if ${nodeId} really is for this repo),`);
+    err(`  or --slug <repo> with 'spor repos add <repo> <path>', or add a repo:/project: stamp to ${nodeId}.`);
+    return 1;
+  }
 
   // Worktree isolation. Run the agent in its own worktree off res.dir so parallel
   // dispatches never collide on the shared tree/index. Resolution, highest wins:
