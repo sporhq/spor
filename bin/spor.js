@@ -828,7 +828,10 @@ async function cmdAdd(cfg, { values, positionals }) {
     if (during) context.during = during;
     if (blocks) context.blocks = blocks;
     if (neededBy) context.needed_by = neededBy;
-    const r = await remote.post(cfg, "/v1/capture", { text: prose, context });
+    // Capture ingestion runs an LLM server-side (typically >6s), so the default
+    // read timeout would abort a healthy request and silently drop the capture —
+    // a one-shot CLI has no hook outbox to retry it (issue-spor-add-cli-timeout-silent-loss).
+    const r = await remote.post(cfg, "/v1/capture", { text: prose, context }, { timeoutMs: 30000 });
     if (r.transport) {
       err(`offline — capture not shipped (${r.error}). It will be retried by the hooks' outbox in a normal session.`);
       return 1;
