@@ -426,6 +426,15 @@ signals via its schema's `queueSignals()`:
   `get_node`.
 - **staleness** — anchors superseded or gone; high staleness suggests
   closing, not doing.
+- **cold_neighbors** — the count of the node's traversable neighbors whose
+  git-derived `updated_at` is newer than its own: a node that went cold while its
+  neighborhood kept moving ("context moved around it"). Fed by the
+  `graph.timestamps` index the caller injects as `timestamps`
+  (task-spor-git-derived-timestamp-index); like `needed_by_days` it rides along
+  ONLY when the index is present and the count is >0, so the queue is
+  byte-identical without it (conformance, the prompt path, a non-git home). It is
+  surfaced (signal + why-line), not yet a score weight — a ranking contribution is
+  a deliberate tuning change deferred to its own task.
 - **age**, and any org-specific signal the schema's code adds (SLA clocks,
   sprint membership, whatever the org's process actually is).
 

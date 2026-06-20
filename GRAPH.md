@@ -49,6 +49,15 @@ Rules:
 - `summary` is mandatory and must stand alone — most consumers only ever see
   the summary.
 - `date` is YYYY-MM-DD (date of the underlying event, not of node creation).
+  System `created_at`/`updated_at` are NOT stored in node bytes — they are
+  derived from the graph repo's git history into an in-memory `graph.timestamps`
+  index at `loadGraph` (the FIRST commit touching `nodes/<id>.md` is `created_at`,
+  the LAST is `updated_at`), so node files stay byte-identical and git stays the
+  single source of truth (dec-spor-git-derived-timestamps). The index is lazy
+  (off the no-LLM prompt path), HEAD-keyed and cached under `cache/`. An optional
+  explicit frontmatter `created_at`/`updated_at` OVERRIDES the git-derived value
+  (the escape hatch for squash/rebase graphs); `date` is the last-resort fallback
+  when git has nothing — it stays distinct from the system `created_at`.
 - `author` and `authored_via` are optional. The remote server (see API.md
   §1) stamps `author: Name <email>` and `authored_via:
   mcp|rest|capture|gardener` from the authenticated identity on every node
