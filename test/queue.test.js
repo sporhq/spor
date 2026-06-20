@@ -695,6 +695,23 @@ test("rankQueue (held self-limit): a superseded outcome records nothing — no t
   assert.ok(it.score >= 5);
 });
 
+test("rankQueue (held self-limit): an inbound resolver of ANOTHER node merely cross-referencing this task is not a held outcome (issue-spor-queue-held-guard-false-positive-referenced-outcome)", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-ready", "task", { status: "open" }),                  // ready, never-worked
+    node("issue-sibling", "issue", { status: "resolved" }),
+    // a sibling's resolution artifact: it RESOLVES issue-sibling and only
+    // cross-references task-ready (the exact shape of the live repro,
+    // art-res-...-500-missing-design-tokens -> drift-monitor).
+    node("art-res-sibling", "artifact", { edges: [["resolves", "issue-sibling"], ["relates-to", "task-ready"]] }),
+  ])).load();
+  const it = rankQueue(g, { now: NOW, front: { "task-ready": 40 } }).items.find((i) => i.id === "task-ready");
+  // The inbound artifact is a finished work product of issue-sibling, not a
+  // non-resolving outcome of task-ready, so the task is NOT held: front boost
+  // intact, suggest stays 'do' — it remains dispatchable via --from-queue.
+  assert.equal(it.suggest, "do", "a referenced resolver of OTHER work must not held-flag ready work");
+  assert.ok(it.score >= 5, "front boost intact — not damped");
+});
+
 test("rankQueue (held self-limit, steward view): a held-signature task with a live blocker suggests 'blocked', not 'triage'", () => {
   const g = tmpGraph(Object.fromEntries([
     node("person-pat", "person", { edges: [["stewards", "task-gated"], ["stewards", "task-unblock"]] }),
