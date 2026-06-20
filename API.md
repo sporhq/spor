@@ -146,6 +146,20 @@ reason, exactly as on a full put. set_status on a `type: schema` node is how
 a human flips `proposed → active` (it carries the same authority as the
 equivalent put).
 
+### `set_priority`
+
+Micro-mutation, the human-override half of the decision queue
+(dec-cc-opinionated-queue-blend). Input `{ "id": "<node>", "priority":
+"<value>" }`, where `<value>` is `p1` (highest), `p2`, `p3`, or a clearing
+form (`none`/`clear`/`""`/`p0`) to remove it. Output `{ "status": "updated",
+"id", "revision", "warnings" }`; an unknown value is `invalid_node` with the
+allowed list in `details`. Like `set_status` it is a server-side
+read-modify-write — no client revision round-trip — and it stamps
+`priority_by` (acting identity), `priority_at`, and `priority_via` (the door)
+so an agent-set priority is distinguishable from human triage
+(issue-cc-priority-attribution-gap). The CLI wrapper is `spor priority <id>
+<p1|p2|p3|clear>`.
+
 ### `propose_correction`
 
 Sugar over `put_node` for the correction loop. Input:
@@ -326,6 +340,7 @@ endpoint is the REST twin of a core call:
 | `POST /v1/nodes` | drain-outbox, mechanical writers | `put_node` semantics, batch: `{nodes: [...], if_exists: "skip"}` (entries may be raw strings or `{node, if_exists, revision}`) → `{results: [...]}`, 207 when any entry failed |
 | `POST /v1/nodes/{id}/edges` `{type, to, attrs?}` | scripts, mechanical writers | `add_edge` semantics (§1): normalize/flip, dedupe, append — no revision echo. Optional `attrs` adds trailing flat edge attributes (e.g. a per-assignment `profile:` override); re-adding the same edge with different attrs upserts the set |
 | `POST /v1/nodes/{id}/status` `{status}` | scripts, mechanical writers | `set_status` semantics (§1): one-scalar update through the `transitions()` gate. Setting a work node to an in-progress status also CLAIMS it (same lease as `/claim` below) |
+| `POST /v1/nodes/{id}/priority` `{priority}` | `spor priority`, queue triage | `set_priority` semantics (§1): one-scalar human-override update — `p1`/`p2`/`p3` or a clearing form (`none`/`clear`/`""`/`p0`). Server-side read-modify-write (no revision), stamping `priority_by`/`priority_at`/`priority_via` for the audit trail (issue-cc-priority-attribution-gap). Unknown value → `invalid_node` with the allowed list |
 | `POST /v1/nodes/{id}/claim` `{session?}` | `claim`/`set_status` MCP tools, `spor dispatch` | take the heartbeat-renewed lease (dec-cc-task-claim-lease): writes the durable `assigned` edge once, attributes to `$viewer` from the token (never an argument), and creates the ephemeral lease → `{ok, status, lease: {node_id, by, expires, expires_at, session, claimed_at}, edge}`. A live lease held by ANOTHER person is `409 conflict` naming the holder + expiry (re-claiming your OWN live claim just renews it). `session` scopes the heartbeat (omit to leave it person-scoped, so any of the claimer's sessions may renew — what `spor dispatch` does at the PRE-launch claim, since `claude --bg` self-allocates the run session only at launch; dispatch then renews with the real session once it has read it from `claude agents --json`, dec-spor-dispatch-bg-session-late-bind) |
 | `POST /v1/nodes/{id}/renew` `{session?}` | post-tool heartbeat, `renew` MCP tool, `spor dispatch` | bump the live lease's expiry only — no commit; the heartbeat that keeps a claim from lapsing. A lapsed/stolen lease is `409` (names the current holder). Person-scoped: any of the claimer's sessions may renew; a `session` binds the lease to that run (`spor dispatch` uses this to bind the captured `claude --bg` session post-launch) |
 | `POST /v1/nodes/{id}/release` | `release` MCP tool | drop the lease AND retire the durable `assigned` edge, returning the node to the pool. Idempotent (releasing a node you hold no lease on still succeeds, cleaning up any lingering `assigned` edge of yours); releasing a claim someone else holds is `409` naming the holder |
