@@ -2,7 +2,7 @@
 id: schema-question
 type: schema
 kind: node-schema
-schema_version: 2026.06.19.1
+schema_version: 2026.06.20.1
 title: Seed schema for question nodes
 summary: Node schema for the question type — a routed ask that the graph could not answer; queueable so open questions join the decision queue, routed-to a steward, answered by nodes carrying answers edges. Seed-pack default; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -26,6 +26,13 @@ vocabulary (`open`/`answered`, or none = live) so the queue-terminal value
 (`answered`) is not shadowed by synonyms
 (dec-cc-status-enforcement-via-transitions). Write-time gate,
 backward-readable, no upgrade chain.
+
+`validate()` (2026.06.20.1, issue-spor-node-create-bypasses-status-vocabulary):
+the status-vocabulary membership check moved to the `validate()` door so it runs
+on **create as well as update** — `transitions()` runs on update only, so a
+question could be BORN with an off-vocabulary status that a later re-validating
+write then rejected. `validate()` and `transitions()` SHARE one `VALID` list (no
+drift). Backward-readable: write-time only, no node-shape change, no upgrade chain.
 
 `get()` (2026.06.19.1): the read-time enrichment hook
 (task-spor-schema-get-hook-readtime-enrichment) — the single mechanism that
@@ -52,21 +59,40 @@ registry behavior only, backward-readable, no upgrade chain.
 ```
 
 ```js
+// The question status vocabulary, shared by validate() (the door, runs on
+// create AND update) and transitions() (update only). Defining it ONCE is what
+// makes the create path and the update path AGREE on the enum
+// (issue-spor-node-create-bypasses-status-vocabulary): the membership check used
+// to live only in the update-path gate, so a question could be BORN with an
+// off-vocabulary status that a later re-validating write then rejected.
+const VALID = ["open", "answered"];
+function statusReason(next) {
+  return "invalid question status '" + next + "': valid statuses are open " +
+    "(awaiting an answer) and answered (an answers edge resolved it; " +
+    "terminal) — or none, meaning live. (dec-cc-status-enforcement-via-transitions)";
+}
+
+// validate(node) — the door, runs on EVERY write (create AND update) in the
+// §2.4 sandbox. Enforce the status-vocabulary MEMBERSHIP here so a question
+// cannot be BORN with an off-vocabulary status that the update-path
+// transitions() gate would later reject
+// (issue-spor-node-create-bypasses-status-vocabulary). Empty status
+// (status-less = live, an open question) is allowed.
+export function validate(node) {
+  const s = ((node && node.status) || "").toLowerCase();
+  if (s === "" || VALID.indexOf(s) !== -1) return [];
+  return [statusReason(s)];
+}
+
 // transitions(current, proposed, view) — question status vocabulary gate
 // (dec-cc-status-enforcement-via-transitions). Runs on every UPDATE in the
-// §2.4 sandbox, JSON boundary, pure. Empty status (status-less = live, an
-// open question) and the create path are always allowed; the denial reason
-// names the valid set so a writing agent can correct and retry.
+// §2.4 sandbox, JSON boundary, pure. Empty status (status-less = live) and the
+// create path are always allowed; the SHARED check above also enforces this on
+// create now, and transitions() keeps it as the update-path guard.
 export function transitions(current, proposed, view) {
-  const VALID = ["open", "answered"];
   const next = ((proposed && proposed.status) || "").toLowerCase();
   if (next === "" || VALID.indexOf(next) !== -1) return { allow: true };
-  return {
-    allow: false,
-    reason: "invalid question status '" + next + "': valid statuses are open " +
-      "(awaiting an answer) and answered (an answers edge resolved it; " +
-      "terminal) — or none, meaning live. (dec-cc-status-enforcement-via-transitions)",
-  };
+  return { allow: false, reason: statusReason(next) };
 }
 ```
 

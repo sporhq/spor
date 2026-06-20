@@ -218,12 +218,22 @@ the server runs on the write path:
   human-readable error strings; `[]` means accept. A non-empty array rejects the
   write (`invalid_node`), each string surfaced to the writer as
   `<schema-id> validate(): <your message>`. This is where required/typed custom
-  fields are enforced.
-- **`transitions(current, proposed, view) -> { allow, reason? }`** — the status
-  gate. Runs on **update only** (the create path is ungated, so a status-less or
-  any first write is always allowed). `current` is the stored node (or `null` if
-  its file is unparseable), `proposed` is the incoming node, and `view` is a
-  read-only join the server computes for the gate:
+  fields — and **status-vocabulary membership** — are enforced. Membership is a
+  property of the node in isolation, so it belongs at the door, where create and
+  update see it alike; the seed `task`/`issue`/`decision`/`question`/
+  `capture-pending` schemas check it here. Putting it ONLY in `transitions()`
+  (update-only) let a node be BORN with an off-vocabulary status that a later
+  re-validating write then rejected (issue-spor-node-create-bypasses-status-
+  vocabulary); `validate()` and `transitions()` share one `VALID` list so the
+  two paths can't drift.
+- **`transitions(current, proposed, view) -> { allow, reason? }`** — the
+  *transition* gate. Runs on **update only** (the create path is ungated by it,
+  so a status-less or any first write passes; status-vocabulary membership is
+  gated separately in `validate()` above, on create too). This is where
+  state-machine legality and the completion-resolver gate live — both properties
+  of the current→proposed *transition*, not of the node alone. `current` is the
+  stored node (or `null` if its file is unparseable), `proposed` is the incoming
+  node, and `view` is a read-only join the server computes for the gate:
   - `view.targets[id]` — `{ exists, type, status, superseded }` for each node
     this one points an edge at (outbound);
   - `view.resolvers` — live **inbound** `resolves`/`answers` edges pointing at
@@ -292,9 +302,11 @@ date: 2026-06-16
 
 Escalation nodes track a customer-facing incident from raise to close.
 `severity` is a free-form frontmatter field this schema makes mandatory and
-constrains in `validate()`; the status machine and the close-time resolver gate
-live in `transitions()`. Both are the same procedural model the seed types use —
-there is no declarative field or status enum to fill in.
+constrains in `validate()`, alongside status-vocabulary membership (the door
+runs on create AND update, so the two paths agree on the enum); the close-time
+resolver gate — a property of the *transition* — lives in `transitions()`
+(update only). Both are the same procedural model the seed types use — there is
+no declarative field or status enum to fill in.
 
 ```json
 {
@@ -306,9 +318,17 @@ there is no declarative field or status enum to fill in.
 ```
 
 ```js
+// The status vocabulary, shared by validate() (membership; create AND update)
+// and transitions() (the close-time gate; update only) so the two paths agree
+// on the enum (issue-spor-node-create-bypasses-status-vocabulary).
+const VALID = ["open", "mitigated", "closed"];
+
 // validate(node) — runs at the door on EVERY write (create and update). Returns
-// an array of error strings; [] accepts. Enforce the free-form custom field here:
-// the payload declares no field list, so a required/typed field is code.
+// an array of error strings; [] accepts. Enforce node-in-isolation properties
+// here: the free-form custom field (no payload field list, so a required/typed
+// field is code) AND status-vocabulary membership — checking membership at the
+// door is what makes create and update agree on the enum (a node can never be
+// born with an off-vocabulary status that the close gate below would reject).
 export function validate(node) {
   const errors = [];
   const VALID_SEVERITY = ["sev1", "sev2", "sev3"];
@@ -317,22 +337,21 @@ export function validate(node) {
   } else if (VALID_SEVERITY.indexOf(String(node.severity)) === -1) {
     errors.push("invalid severity '" + node.severity + "': use sev1, sev2, or sev3");
   }
+  const s = ((node && node.status) || "").toLowerCase();
+  if (s !== "" && VALID.indexOf(s) === -1) {
+    errors.push("invalid escalation status '" + s + "': valid statuses are " +
+      "open, mitigated, closed — or none, meaning live");
+  }
   return errors;
 }
 
 // transitions(current, proposed, view) — runs on UPDATE only; returns
-// { allow, reason? }. Empty status (status-less = live) is always allowed.
+// { allow, reason? }. Gates the *transition*, not membership (validate() owns
+// that): closing requires a durable outcome on the graph. Empty status
+// (status-less = live) is always allowed.
 export function transitions(current, proposed, view) {
-  const VALID = ["open", "mitigated", "closed"];
   const next = ((proposed && proposed.status) || "").toLowerCase();
   if (next === "") return { allow: true };
-  if (VALID.indexOf(next) === -1) {
-    return {
-      allow: false,
-      reason: "invalid escalation status '" + next + "': valid statuses are " +
-        "open, mitigated, closed — or none, meaning live",
-    };
-  }
   // closed must record a durable outcome on the graph: a decision or artifact
   // that resolves this escalation (an inbound resolves edge). view.resolvers is
   // already filtered to resolving states, so an in-review fix does not count.

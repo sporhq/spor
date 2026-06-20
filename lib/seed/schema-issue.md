@@ -2,7 +2,7 @@
 id: schema-issue
 type: schema
 kind: node-schema
-schema_version: 2026.06.19.1
+schema_version: 2026.06.20.1
 title: Seed schema for issue nodes
 summary: Node schema for the issue type — a defect/finding and its resolution lineage; queueable, so open issues join the decision queue. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -17,6 +17,17 @@ visible — without it, triaging a capture into an issue silently removed the
 work from the decision queue (issue-cc-issues-not-queueable). Backward-
 readable: the flag changes registry behavior, not node shape, so no upgrade
 chain.
+
+`validate()` (2026.06.20.1, issue-spor-node-create-bypasses-status-vocabulary):
+the status-vocabulary MEMBERSHIP check moved to the `validate()` door so it runs
+on **create as well as update**. `transitions()` runs on UPDATE only, so its
+vocabulary gate never saw a fresh create — a node could be BORN with an
+off-vocabulary status that no write rejected, until a later re-validating write
+hit the update-path gate and failed `transition_denied`. `validate()` and
+`transitions()` now SHARE one `VALID` list (no drift), so the two paths agree on
+the enum; the `resolved` resolver gate stays in `transitions()` (a *transition*
+property, update only). Backward-readable: write-time only, no node-shape change,
+no upgrade chain.
 
 `transitions()` (2026.06.14.1): two write-time gates. (1) Status is
 constrained to the issue vocabulary (`open`/`active`/`resolved`, or none =
@@ -55,22 +66,44 @@ fail-soft; registry behavior only, backward-readable, no upgrade chain.
 ```
 
 ```js
+// The issue status vocabulary, shared by validate() (membership; the door, runs
+// on create AND update) and transitions() (transition legality + the
+// resolved-resolver gate; update only). Defining it ONCE is what makes the
+// create path and the update path AGREE on the enum
+// (issue-spor-node-create-bypasses-status-vocabulary): the membership check used
+// to live only in the update-path gate, so a node could be BORN with an
+// off-vocabulary status that a later re-validating write then rejected.
+const VALID = ["open", "active", "resolved"];
+function statusReason(next) {
+  return "invalid issue status '" + next + "': valid statuses are open " +
+    "(unaddressed), active (being worked), resolved (fixed) — or none, " +
+    "meaning live. (dec-cc-status-enforcement-via-transitions)";
+}
+
+// validate(node) — the door, runs on EVERY write (create AND update) in the
+// §2.4 sandbox. Enforce status-vocabulary MEMBERSHIP here so an issue cannot be
+// BORN with an off-vocabulary status that the update-path transitions() gate
+// would later reject (issue-spor-node-create-bypasses-status-vocabulary). Empty
+// status (status-less = live) is allowed; the resolved-resolver gate stays in
+// transitions() — a transition concern, update only.
+export function validate(node) {
+  const s = ((node && node.status) || "").toLowerCase();
+  if (s === "" || VALID.indexOf(s) !== -1) return [];
+  return [statusReason(s)];
+}
+
 // transitions(current, proposed, view) — issue status gate. Runs on every
 // UPDATE in the §2.4 sandbox, JSON boundary, pure. Empty status (status-less =
-// live) and the create path are always allowed; denial reasons are actionable
-// so a writing agent can correct and retry.
+// live) is always allowed; denial reasons are actionable so a writing agent can
+// correct and retry. The vocabulary check is SHARED with validate() above
+// (which now also enforces it on create); transitions() keeps it to gate the
+// `resolved` branch below and as the update-path guard.
 export function transitions(current, proposed, view) {
-  const VALID = ["open", "active", "resolved"];
   const next = ((proposed && proposed.status) || "").toLowerCase();
   if (next === "") return { allow: true };
   // (1) vocabulary gate (dec-cc-status-enforcement-via-transitions).
   if (VALID.indexOf(next) === -1) {
-    return {
-      allow: false,
-      reason: "invalid issue status '" + next + "': valid statuses are open " +
-        "(unaddressed), active (being worked), resolved (fixed) — or none, " +
-        "meaning live. (dec-cc-status-enforcement-via-transitions)",
-    };
+    return { allow: false, reason: statusReason(next) };
   }
   // (2) resolution must record a durable outcome on the graph: a decision or
   // artifact that resolves this issue (task-cc-terminal-status-requires-resolver).

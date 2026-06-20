@@ -759,28 +759,37 @@ test("no-schema graph behaves exactly as the seed pack (registry default)", () =
 // ships a transitions() gate restricting triage to merged/rejected. dismissed
 // (issue-cc-dismissed-status-not-terminal) and the other historical drift
 // values are denied at write time, with an actionable reason for retry.
-test("seed pack: capture-pending transitions() gates triage to merged/rejected", () => {
+test("seed pack: capture-pending gates triage to merged/rejected (validate + transitions)", () => {
   const schema = graph.seedRegistry().nodeSchemas.get("capture-pending");
   const sb = sandboxFor(schema);
-  assert.deepEqual(sb.names, ["transitions"]);
+  // validate() now enforces the allowed set at the door (create AND update),
+  // so a capture can't be BORN off-vocabulary (issue-spor-node-create-bypasses-
+  // status-vocabulary); transitions() keeps it as the update-path guard.
+  assert.deepEqual(sb.names.slice().sort(), ["transitions", "validate"]);
   const SLACK = { timeoutMs: 5000 };
   const gate = (status) =>
     sb.call("transitions", [{ id: "cap-x", status: "" }, { id: "cap-x", status }, {}], SLACK);
+  const door = (status) => sb.call("validate", [{ id: "cap-x", status }], SLACK);
 
   // allowed: the two terminal verdicts, an empty status (create / re-open),
-  // and case-insensitively.
+  // and case-insensitively — by BOTH paths.
   for (const ok of ["merged", "rejected", "", "MERGED", "Rejected"]) {
-    assert.equal(gate(ok).allow, true, `status '${ok}' should be allowed`);
+    assert.equal(gate(ok).allow, true, `transitions: status '${ok}' should be allowed`);
+    assert.deepEqual(door(ok), [], `validate: status '${ok}' should be allowed`);
   }
-  // denied: the historical drift, each with a reason naming the valid set.
+  // denied: the historical drift, each with a reason naming the valid set —
+  // now rejected at the door (create) as well as by the update gate.
   for (const bad of ["dismissed", "resolved", "closed", "done"]) {
     const r = gate(bad);
-    assert.equal(r.allow, false, `status '${bad}' should be denied`);
+    assert.equal(r.allow, false, `transitions: status '${bad}' should be denied`);
     assert.match(r.reason, /merged.*rejected|rejected.*merged/s);
     assert.match(r.reason, new RegExp(bad));
+    const v = door(bad);
+    assert.equal(v.length, 1, `validate: status '${bad}' should be rejected on create`);
+    assert.match(v[0], new RegExp(bad));
   }
 
-  // the create path (no current node) is always allowed.
+  // the create path (no current node) is always allowed by transitions().
   assert.equal(sb.call("transitions", [undefined, { id: "cap-x" }, {}], SLACK).allow, true);
 });
 
@@ -802,21 +811,34 @@ test("seed pack: core type schemas gate status to their vocabulary", () => {
   };
   for (const [type, { ok, bad }] of Object.entries(cases)) {
     const sb = sandboxFor(reg.nodeSchemas.get(type));
-    // Every gated type exports transitions(); task/issue/question additionally
-    // carry the read-time get() enrichment hook (task-spor-schema-get-hook-readtime-
-    // enrichment) — decision does not. Order-independent so a future verb add stays
-    // a one-line change.
-    const expectedExports = type === "decision" ? ["transitions"] : ["transitions", "get"];
+    // Every gated type exports validate() (the door, runs on create AND update —
+    // status-vocabulary membership lives here so create and update agree,
+    // issue-spor-node-create-bypasses-status-vocabulary) and transitions() (the
+    // update-path transition gate); task/issue/question additionally carry the
+    // read-time get() enrichment hook (task-spor-schema-get-hook-readtime-
+    // enrichment) — decision does not. Order-independent so a future verb add
+    // stays a one-line change.
+    const expectedExports = type === "decision"
+      ? ["validate", "transitions"]
+      : ["validate", "transitions", "get"];
     assert.deepEqual(sb.names.slice().sort(), expectedExports.slice().sort(), `${type} schema exports ${expectedExports.join("+")}`);
     const gate = (status, view = RESOLVED_VIEW) =>
       sb.call("transitions", [{ id: `${type}-x`, status: "" }, { id: `${type}-x`, status }, view], SLACK);
-    for (const s of ok) assert.equal(gate(s).allow, true, `${type}: '${s}' should be allowed`);
+    const door = (status) => sb.call("validate", [{ id: `${type}-x`, status }], SLACK);
+    for (const s of ok) {
+      assert.equal(gate(s).allow, true, `${type}: '${s}' should be allowed by transitions()`);
+      assert.deepEqual(door(s), [], `${type}: '${s}' should pass validate() (create path)`);
+    }
     for (const s of bad) {
       const r = gate(s);
-      assert.equal(r.allow, false, `${type}: '${s}' should be denied`);
+      assert.equal(r.allow, false, `${type}: '${s}' should be denied by transitions()`);
       assert.match(r.reason, new RegExp(s), `${type}: reason should name the rejected value`);
+      // create-path agreement: validate() rejects the same off-vocabulary status.
+      const v = door(s);
+      assert.equal(v.length, 1, `${type}: '${s}' should be rejected on CREATE by validate()`);
+      assert.match(v[0], new RegExp(s), `${type}: validate() reason names the rejected value`);
     }
-    // create path always allowed.
+    // create path always allowed by transitions() (status-less first write).
     assert.equal(sb.call("transitions", [undefined, { id: `${type}-x` }, RESOLVED_VIEW], SLACK).allow, true);
   }
 });
@@ -942,21 +964,28 @@ test("GRAPH.md worked schema example parses and its hooks run as documented", ()
   const sb = sandboxFor(r.schema);
   const SLACK = { timeoutMs: 5000 };
 
-  // validate(node) -> string[] ([] == ok), runs on every write.
+  // validate(node) -> string[] ([] == ok), runs on every write (create AND
+  // update). Owns the custom field AND status-vocabulary membership, so create
+  // and update agree on the enum (issue-spor-node-create-bypasses-status-vocabulary).
   assert.deepEqual(sb.call("validate", [{ id: "esc-1", severity: "sev1" }], SLACK), [],
-    "a valid severity passes validate()");
+    "a valid severity + status-less passes validate()");
   assert.match(sb.call("validate", [{ id: "esc-1" }], SLACK)[0], /requires a severity/,
     "a missing severity is rejected");
   assert.match(sb.call("validate", [{ id: "esc-1", severity: "sev9" }], SLACK)[0], /invalid severity/,
     "an out-of-vocab severity is rejected");
+  assert.deepEqual(sb.call("validate", [{ id: "esc-1", severity: "sev1", status: "mitigated" }], SLACK), [],
+    "a valid status passes validate()");
+  assert.match(sb.call("validate", [{ id: "esc-1", severity: "sev1", status: "bogus" }], SLACK)[0],
+    /invalid escalation status .*bogus/, "an out-of-vocab status is rejected at the door — on create too");
 
   // transitions(current, proposed, view) -> { allow, reason? }, update-only.
+  // Gates the *transition* (the close-time resolver), NOT membership — that is
+  // validate()'s job now, so an out-of-vocab status passes transitions() here
+  // (it was already rejected at the door) and the close gate is what bites.
   const gate = (status, view = {}) =>
     sb.call("transitions", [{ id: "esc-1", status: "open" }, { id: "esc-1", status }, view], SLACK);
   assert.equal(gate("").allow, true, "status-less (live) is allowed");
   assert.equal(gate("mitigated").allow, true, "a valid status is allowed");
-  assert.equal(gate("bogus").allow, false, "an out-of-vocab status is denied");
-  assert.match(gate("bogus").reason, /bogus/, "the denial names the bad value");
   assert.equal(gate("closed", { resolvers: [] }).allow, false, "closed needs a resolver");
   assert.match(gate("closed", { resolvers: [] }).reason, /decision or artifact/);
   assert.equal(gate("closed", { resolvers: [{ id: "dec-x", type: "decision" }] }).allow, true,

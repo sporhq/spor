@@ -1,7 +1,7 @@
 {
   "errors": [],
   "warnings": [
-    "registry: graph schema 'schema-n003' (issue @ 2026.06.11.1) shadows a newer seed schema (@ 2026.06.19.1) — bump the resident override in lockstep with seed changes, or retire it",
+    "registry: graph schema 'schema-n003' (issue @ 2026.06.11.1) shadows a newer seed schema (@ 2026.06.20.1) — bump the resident override in lockstep with seed changes, or retire it",
     "dec-n077.md: dangling edge supersedes -> gone-b85bc8",
     "dec-n086.md: dangling edge supersedes -> gone-12a8e1",
     "task-n018.md: dangling edge relates-to -> gone-86e01b"
