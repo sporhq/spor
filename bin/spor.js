@@ -282,10 +282,13 @@ async function cmdNext(cfg, args) {
     const scopeSlug = allProjects && !explicit ? null : (explicit ?? pinned ?? safeSlug());
     const qs = new URLSearchParams();
     if (scopeSlug) qs.set("project", scopeSlug);
-    qs.set("limit", "10");
     if (inclTypes.length) qs.set("type", inclTypes.join(","));
     if (exclTypes.length) qs.set("exclude_type", exclTypes.join(","));
-    const r = await remote.get(cfg, `/v1/queue?${qs.toString()}`, { timeoutMs: 6000 });
+    // Page size (task-spor-next-limit-flag): --limit N defaults to DEFAULT_LIMIT
+    // (20), --limit 0 means "all". fetchQueuePaged sets ?limit (+?offset) per page
+    // and walks next_offset to assemble the target, so the limit is never set on
+    // qs here.
+    const r = await fetchQueuePaged(cfg, qs, queueLimitTarget(args));
     if (r.transport) {
       err(`offline — could not reach server (${r.error})`);
       return 1;
@@ -500,6 +503,14 @@ function renderQueue(q, hidden = 0) {
       if (it.why) out(`        ${it.why}`);
     }
   }
+  // Overflow hint (task-spor-next-limit-flag): when the page shows fewer than the
+  // full ranked total, say how many more and how to get them — the remote mirror
+  // of lib/queue.js's "(N more — raise --limit)". count is the full-set total
+  // (the server ranks the whole set and slices only the page); with --limit 0
+  // every item is fetched, so count == items.length and this stays silent.
+  if (q && typeof q.count === "number" && q.count > items.length) {
+    out(`(${q.count - items.length} more — raise --limit, or --limit 0 for all)`);
+  }
   // Counted, not silent: blocked items are gated out of the actionable queue
   // (dec-spor-queue-hide-blocked), reported so their disappearance is never
   // silent. Present only when the server forwards r.blocked; absent => no line.
@@ -507,6 +518,56 @@ function renderQueue(q, hidden = 0) {
   // Never-silent truncation (task-spor-cli-in-flight-surface): report what
   // --hide-dispatched removed, the way queue.js surfaces the muted count.
   if (hidden > 0) out(`(${hidden} in-flight hidden — --hide-dispatched)`);
+}
+
+// --limit parse for `spor next` (task-spor-next-limit-flag). Default is
+// DEFAULT_LIMIT (20 — the same kernel default local mode uses, keeping the two
+// modes symmetric); --limit 0 means "all" (-> Infinity). A non-numeric or
+// negative value falls back to the default rather than rendering an empty or
+// runaway page. Local mode never calls this — it passes --limit straight through
+// to lib/queue.js, which does the identical 0 -> all translation.
+function queueLimitTarget(args) {
+  const { DEFAULT_LIMIT } = require(path.join(ROOT, "lib", "queue.js"));
+  const i = args.indexOf("--limit");
+  if (i < 0 || args[i + 1] == null) return DEFAULT_LIMIT;
+  const n = parseInt(args[i + 1], 10);
+  if (n === 0) return Infinity;
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_LIMIT;
+}
+
+// Page through GET /v1/queue assembling up to `target` items (Infinity = all)
+// (task-spor-next-limit-flag). The server caps each page at 100 (API.md §5) and
+// reads limit 0 as its own default, so "all" — and any finite N>100 — must be
+// assembled client-side: request pages of <=100 over `offset`, following
+// `next_offset` until we have `target` items or the pages run out. The full-set
+// aggregates (count, counts_by_*, questions/findings/…) are identical on every
+// page (the server ranks the whole set and slices only the page), so we keep the
+// FIRST page's envelope and just grow its .items. A finite limit <=100 is a
+// single request — byte-compatible with the old hardcoded read. Returns the
+// failing remote.get result verbatim on transport/HTTP error so the caller's
+// existing checks fire.
+async function fetchQueuePaged(cfg, baseQs, target) {
+  const items = [];
+  let envelope = null;
+  let offset = 0;
+  while (items.length < target) {
+    const want = target === Infinity ? 100 : Math.min(100, target - items.length);
+    const qs = new URLSearchParams(baseQs);
+    qs.set("limit", String(want));
+    qs.set("offset", String(offset));
+    const r = await remote.get(cfg, `/v1/queue?${qs.toString()}`, { timeoutMs: 6000 });
+    if (r.transport || !r.ok) return r;
+    const page = r.json || {};
+    if (!envelope) envelope = page;
+    const pageItems = Array.isArray(page.items) ? page.items : [];
+    items.push(...pageItems);
+    const next = page.next_offset;
+    if (next == null || pageItems.length === 0 || next <= offset) break;
+    offset = next;
+  }
+  envelope = envelope || { items: [], count: 0 };
+  envelope.items = target === Infinity ? items : items.slice(0, target);
+  return { ok: true, json: envelope };
 }
 
 async function cmdGet(cfg, { positionals }) {
@@ -4498,18 +4559,19 @@ const COMMANDS = {
     run: (cfg, p) => cmdAdd(cfg, p),
   },
   next: {
-    group: "Graph", parse: "raw", args: "[--project S | --all-projects] [--type T] [--exclude-type T]", aliases: ["queue"],
+    group: "Graph", parse: "raw", args: "[--project S | --all-projects] [--type T] [--exclude-type T] [--limit N]", aliases: ["queue"],
     summary: "the decision queue (local: lib/queue; remote: /v1/queue)",
-    help: "Show the ranked decision queue. Remote mode reads /v1/queue; local mode is a\nbyte-identical passthrough to lib/queue.js, so it also accepts that script's\nflags (--days, --no-front, --limit, --name-only, --nodes).\n\nSCOPE. --project accepts a repo slug (-> its home-project grouping union), a\nrepo-<slug> node id (-> that single repo), or a grouping id (-> the grouping\nunion); an unknown token warns and yields an empty queue. Pin a default scope\nfor both modes with the queue.project config key (SPOR_QUEUE_PROJECT or\n.spor.json {\"queue\":{\"project\":\"...\"}}); an explicit --project still wins.\n--all-projects (alias --all) widens to the whole-graph cross-project firehose,\ndropping the cwd/pinned default scope (an explicit --project still wins over it).\n\nNODE TYPES. --type/--exclude-type whitelist/blacklist node types from the\nranking; both are repeatable and comma-splittable (--type task,issue). Given\nboth, the include set is narrowed and then the excludes are removed (exclude\nwins on overlap). They compose with --project/--all-projects.\n\nIN-FLIGHT. --json stamps each item with an `in_flight` flag (and a `dispatched`\nagent summary when true) by cross-referencing live background agents from\n`claude agents --json` — `spor dispatch` names each agent after its node id, so\nan active agent on a queued item is detectable without model guidance.\n--hide-dispatched drops the items that already have an agent in flight. Both are\nclient-side (the server can't see local agents) and fail soft when the claude\nbinary is absent (every item then reads in_flight:false).",
+    help: "Show the ranked decision queue. Remote mode reads /v1/queue; local mode is a\nbyte-identical passthrough to lib/queue.js, so it also accepts that script's\nflags (--days, --no-front, --name-only, --nodes).\n\nSCOPE. --project accepts a repo slug (-> its home-project grouping union), a\nrepo-<slug> node id (-> that single repo), or a grouping id (-> the grouping\nunion); an unknown token warns and yields an empty queue. Pin a default scope\nfor both modes with the queue.project config key (SPOR_QUEUE_PROJECT or\n.spor.json {\"queue\":{\"project\":\"...\"}}); an explicit --project still wins.\n--all-projects (alias --all) widens to the whole-graph cross-project firehose,\ndropping the cwd/pinned default scope (an explicit --project still wins over it).\n\nPAGE SIZE. --limit N caps the queue at N items (default 20, both modes);\n--limit 0 shows ALL. Remote mode pages the server at 100 items/request, so\n--limit 0 (or any N>100) is assembled by walking offset across pages; the\naggregate counts always describe the full ranked set regardless of the page.\n\nNODE TYPES. --type/--exclude-type whitelist/blacklist node types from the\nranking; both are repeatable and comma-splittable (--type task,issue). Given\nboth, the include set is narrowed and then the excludes are removed (exclude\nwins on overlap). They compose with --project/--all-projects.\n\nIN-FLIGHT. --json stamps each item with an `in_flight` flag (and a `dispatched`\nagent summary when true) by cross-referencing live background agents from\n`claude agents --json` — `spor dispatch` names each agent after its node id, so\nan active agent on a queued item is detectable without model guidance.\n--hide-dispatched drops the items that already have an agent in flight. Both are\nclient-side (the server can't see local agents) and fail soft when the claude\nbinary is absent (every item then reads in_flight:false).",
     options: {
       project: { type: "string", value: "S", desc: "scope to a project slug (default: queue.project config, else inferred)" },
       "all-projects": { type: "boolean", desc: "cross-project firehose — drop the default project scope (alias --all)" },
       type: { type: "string", value: "T", desc: "include only these node types (repeatable, comma-ok)" },
       "exclude-type": { type: "string", value: "T", desc: "exclude these node types from the ranking (repeatable, comma-ok)" },
+      limit: { type: "string", value: "N", desc: "max items to show (default 20; 0 = all)" },
       json: { type: "boolean", desc: "machine-readable JSON output (adds the in_flight flag per item)" },
       "hide-dispatched": { type: "boolean", desc: "drop items that already have a background agent in flight" },
     },
-    examples: ["spor next", "spor next --json", "spor next --json --hide-dispatched", "spor next --all-projects --type task,issue", "spor next --exclude-type capture-pending"],
+    examples: ["spor next", "spor next --limit 50", "spor next --limit 0", "spor next --json", "spor next --json --hide-dispatched", "spor next --all-projects --type task,issue", "spor next --exclude-type capture-pending"],
     run: (cfg, args) => cmdNext(cfg, args),
   },
   get: {
