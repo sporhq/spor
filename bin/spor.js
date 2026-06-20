@@ -3316,7 +3316,17 @@ function resolveDir(cfg, { dir, slug }) {
   }
   if (slug) {
     const p = (cfg.get("dispatch.repos", {}) || {})[slug];
-    return p ? { dir: p, slug, source: "config" } : { dir: null, slug, source: "unknown" };
+    if (p) return { dir: p, slug, source: "config" };
+    // Unmapped slug — but we may already be STANDING in that repo. If the cwd's
+    // own inferred slug matches the target, resolve to the cwd's durable root
+    // rather than erroring "run from inside that repo" at someone who already is
+    // (issue-spor-dispatch-unmapped-slug-cwd-mismatch). The downstream real-run
+    // self-register (registerRepo) then persists slug->dir so the next dispatch
+    // from anywhere finds it. source "cwd-self" (not "cwd"): the slug DID match,
+    // so this is a deliberate target hit, not the stampless-node silent fallback
+    // the cwd-guard below refuses.
+    if (slug === safeSlug()) return { dir: dispatchRoot(), slug, source: "cwd-self" };
+    return { dir: null, slug, source: "unknown" };
   }
   return { dir: dispatchRoot(), slug: safeSlug(), source: "cwd" };
 }

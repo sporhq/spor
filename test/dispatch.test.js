@@ -463,6 +463,42 @@ test("dispatch: unknown slug exits 1 with actionable guidance", () => {
   assert.match(r.stderr, /spor repos add nosuchrepo/);
 });
 
+// issue-spor-dispatch-unmapped-slug-cwd-mismatch: a node's target slug that is
+// NOT in dispatch.repos but EQUALS the cwd's own inferred slug must resolve to
+// the cwd — you're already standing in the target repo — instead of erroring
+// "run from inside that repo once" at someone who already is. A git-inited dir
+// named `demo` pins its inferred slug to `demo` (= dec-x's `repo:`), with demo
+// left out of dispatch.repos.
+function namedRepo(name) {
+  const dir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-named-")), name);
+  fs.mkdirSync(dir);
+  const r = spawnSync("git", ["-C", dir, "init", "-q"], { encoding: "utf8" });
+  assert.strictEqual(r.status, 0, r.stderr);
+  return { dir, real: fs.realpathSync(dir) };
+}
+
+test("dispatch <node>: an unmapped slug matching the cwd's own slug resolves to the cwd (--print)", () => {
+  const { home } = fixture(); // dec-x carries `repo: demo`, and demo is NOT mapped
+  const { dir } = namedRepo("demo"); // cwd's inferred slug == 'demo' == dec-x's repo
+  const r = run(["dispatch", "dec-x", "--no-brief", "--print"], { SPOR_HOME: home }, dir);
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /\(slug: demo, via cwd-self\)/); // resolved to the cwd, not errored
+  assert.doesNotMatch(r.stderr, /don't know where 'demo' lives/);
+  assert.doesNotMatch(r.stderr, /carries no repo\/project stamp/); // nor the stampless-node guard
+});
+
+test("dispatch <node> (real): an unmapped cwd-matching slug self-registers the repo", { skip: process.platform === "win32" }, () => {
+  const { home } = fixture();
+  const { real } = namedRepo("demo");
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub }, real);
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(sentinel), "the agent launched in the cwd-resolved repo");
+  const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
+  assert.strictEqual(cfg.dispatch.repos.demo, real, "demo self-registered to the cwd's durable root");
+});
+
 // Real spawn through SPOR_CLAUDE_CMD: the launcher must pass --bg + flags and run
 // in the resolved cwd. Posix-only (the stub is a shell script).
 test("dispatch spawns the claude binary with --bg in the target dir", { skip: process.platform === "win32" }, () => {
