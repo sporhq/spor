@@ -2997,7 +2997,7 @@ async function cmdAgentListRemote(cfg) {
       const seen = new Set();
       const rows = [];
       for (const c of q.json.changes) {
-        if (!c || c.type !== "agent" || c.change === "deleted") continue;
+        if (!c || c.type !== "agent" || c.change === "D") continue; // raw git --name-status letter (A/M/D), as the server emits
         if (seen.has(c.id)) continue; // first (newest) wins
         seen.add(c.id);
         rows.push(`${c.id}\t${c.title || ""}`);

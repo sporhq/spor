@@ -241,10 +241,13 @@ function agentStub({ agentsStatus = 201, agentsBody = null, agentsList = null, c
         return j(404, { error: { code: "not_found" } }); // surface not deployed
       }
       if (req.url.startsWith("/v1/changes")) {
+        // `change` is the raw git --name-status LETTER (A/M/D), as GET /v1/changes
+        // emits — not a word — so the deletion filter is "D", not "deleted".
         return j(200, { changes: changes || [
-          { id: "agent-anthony-laptop", change: "added", type: "agent", title: "anthony-laptop" },
-          { id: "task-x", change: "modified", type: "task", title: "Some task" },
-        ], count: 2 });
+          { id: "agent-anthony-laptop", change: "A", type: "agent", title: "anthony-laptop" },
+          { id: "agent-anthony-old", change: "D", type: "agent", title: "anthony-old" },
+          { id: "task-x", change: "M", type: "task", title: "Some task" },
+        ], count: 3 });
       }
       return j(404, { error: { code: "not_found" } });
     });
@@ -303,6 +306,7 @@ test("agent list (remote): falls back to the /v1/changes projection when /v1/age
     assert.strictEqual(r.status, 0, r.stderr);
     assert.match(r.stdout, /agent-anthony-laptop\tanthony-laptop/);
     assert.doesNotMatch(r.stdout, /task-x/); // non-agent rows dropped
+    assert.doesNotMatch(r.stdout, /agent-anthony-old/); // deleted agent (change "D") dropped, not leaked as live
   } finally {
     srv.close();
   }
