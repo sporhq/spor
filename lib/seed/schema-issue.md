@@ -20,14 +20,16 @@ chain.
 
 `validate()` (2026.06.20.1, issue-spor-node-create-bypasses-status-vocabulary):
 the status-vocabulary MEMBERSHIP check moved to the `validate()` door so it runs
-on **create as well as update**. `transitions()` runs on UPDATE only, so its
+on **create as well as update**. `transitions()` then ran on UPDATE only, so its
 vocabulary gate never saw a fresh create — a node could be BORN with an
 off-vocabulary status that no write rejected, until a later re-validating write
 hit the update-path gate and failed `transition_denied`. `validate()` and
 `transitions()` now SHARE one `VALID` list (no drift), so the two paths agree on
-the enum; the `resolved` resolver gate stays in `transitions()` (a *transition*
-property, update only). Backward-readable: write-time only, no node-shape change,
-no upgrade chain.
+the enum; the `resolved` resolver gate stays in `transitions()` — which the host
+now also runs on create (passing `current` = the proposed node, since a create is
+not a transition), so a born-`resolved` issue is gated too
+(issue-spor-node-create-ungated-for-completion-resolver-gate). Backward-readable:
+write-time only, no node-shape change, no upgrade chain.
 
 `transitions()` (2026.06.14.1): two write-time gates. (1) Status is
 constrained to the issue vocabulary (`open`/`active`/`resolved`, or none =
@@ -83,7 +85,7 @@ fail-soft; registry behavior only, backward-readable, no upgrade chain.
 ```js
 // The issue status vocabulary, shared by validate() (membership; the door, runs
 // on create AND update) and transitions() (transition legality + the
-// resolved-resolver gate; update only). Defining it ONCE is what makes the
+// resolved-resolver gate; run on create + update). Defining it ONCE is what makes the
 // create path and the update path AGREE on the enum
 // (issue-spor-node-create-bypasses-status-vocabulary): the membership check used
 // to live only in the update-path gate, so a node could be BORN with an
@@ -100,19 +102,22 @@ function statusReason(next) {
 // BORN with an off-vocabulary status that the update-path transitions() gate
 // would later reject (issue-spor-node-create-bypasses-status-vocabulary). Empty
 // status (status-less = live) is allowed; the resolved-resolver gate stays in
-// transitions() — a transition concern, update only.
+// transitions() — a transition concern the host runs on create + update.
 export function validate(node) {
   const s = ((node && node.status) || "").toLowerCase();
   if (s === "" || VALID.indexOf(s) !== -1) return [];
   return [statusReason(s)];
 }
 
-// transitions(current, proposed, view) — issue status gate. Runs on every
-// UPDATE in the §2.4 sandbox, JSON boundary, pure. Empty status (status-less =
-// live) is always allowed; denial reasons are actionable so a writing agent can
-// correct and retry. The vocabulary check is SHARED with validate() above
-// (which now also enforces it on create); transitions() keeps it to gate the
-// `resolved` branch below and as the update-path guard.
+// transitions(current, proposed, view) — issue status gate. Runs on every write
+// (create AND update) in the §2.4 sandbox, JSON boundary, pure; on create the
+// host passes `current` = the proposed node (a create is not a transition), so
+// the state-framed `resolved` gate below applies to a born-`resolved` issue too
+// (issue-spor-node-create-ungated-for-completion-resolver-gate). Empty status
+// (status-less = live) is always allowed; denial reasons are actionable so a
+// writing agent can correct and retry. The vocabulary check is SHARED with
+// validate() above (which also enforces it on create); transitions() keeps it to
+// gate the `resolved` branch below.
 export function transitions(current, proposed, view) {
   const next = ((proposed && proposed.status) || "").toLowerCase();
   if (next === "") return { allow: true };

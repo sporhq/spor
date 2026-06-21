@@ -128,8 +128,13 @@ lives ON THE GRAPH, where the neighborhood can surface it, instead of evaporatin
 into a status flip: a heavyweight closure earns a `decision` (the why), a
 trivial one earns a few-line `artifact` (what was done, like a commit message) —
 either satisfies the gate. `abandoned` (task) is exempt: won't-do work produces
-nothing to record. The gate runs at write time on UPDATE only (the create path
-is ungated); it is backward-readable, so existing terminal nodes are untouched.
+nothing to record. The gate runs at write time on **both create and update**
+(issue-spor-node-create-ungated-for-completion-resolver-gate): a node may no more
+be BORN terminal without a resolver than flipped there. A create is not a
+transition, so the host calls `transitions()` with `current` = the proposed node —
+state-framed gates like this one apply to the born status, while change-framed
+gates (status-change-requires-author) see no transition. It is backward-readable,
+so existing terminal nodes are untouched.
 
 The resolver must also be in a **resolving** state, not merely present
 (dec-spor-definition-of-done-org-policy). Completion bundled three axes —
@@ -239,13 +244,20 @@ the server runs on the write path:
   vocabulary); `validate()` and `transitions()` share one `VALID` list so the
   two paths can't drift.
 - **`transitions(current, proposed, view) -> { allow, reason? }`** — the
-  *transition* gate. Runs on **update only** (the create path is ungated by it,
-  so a status-less or any first write passes; status-vocabulary membership is
-  gated separately in `validate()` above, on create too). This is where
-  state-machine legality and the completion-resolver gate live — both properties
-  of the current→proposed *transition*, not of the node alone. `current` is the
-  stored node (or `null` if its file is unparseable), `proposed` is the incoming
-  node, and `view` is a read-only join the server computes for the gate:
+  *transition* gate. Runs on **every write (create AND update)**. On UPDATE
+  `current` is the stored node (or `null` if its file is unparseable); on CREATE
+  there is no prior state, so the server passes `current` = the proposed node — a
+  create is *not* a transition. This is where state-machine legality and the
+  completion-resolver gate live. Frame each rule by what it judges:
+  **state-framed** rules read `proposed.status` (the completion-resolver gate, a
+  quorum policy) and so apply to a node's status however it was reached —
+  including a BORN-terminal create, so a task cannot be created `done` nor an
+  issue `resolved` without a resolver
+  (issue-spor-node-create-ungated-for-completion-resolver-gate); **change-framed**
+  rules read `current.status !== proposed.status` (status-change-requires-author,
+  no-reopen) and, seeing `current === proposed` on a create, correctly pass.
+  `proposed` is the incoming node, and `view` is a read-only join the server
+  computes for the gate:
   - `view.targets[id]` — `{ exists, type, status, superseded }` for each node
     this one points an edge at (outbound);
   - `view.resolvers` — live **inbound** `resolves`/`answers` edges pointing at
@@ -316,8 +328,10 @@ Escalation nodes track a customer-facing incident from raise to close.
 `severity` is a free-form frontmatter field this schema makes mandatory and
 constrains in `validate()`, alongside status-vocabulary membership (the door
 runs on create AND update, so the two paths agree on the enum); the close-time
-resolver gate — a property of the *transition* — lives in `transitions()`
-(update only). Both are the same procedural model the seed types use — there is
+resolver gate lives in `transitions()`, which also runs on create (with `current`
+= the proposed node). Because that gate is *state-framed* — it reads
+`proposed.status` — it stops a born-`closed` escalation exactly as it stops a
+close transition. Both are the same procedural model the seed types use — there is
 no declarative field or status enum to fill in.
 
 ```json
@@ -331,8 +345,8 @@ no declarative field or status enum to fill in.
 
 ```js
 // The status vocabulary, shared by validate() (membership; create AND update)
-// and transitions() (the close-time gate; update only) so the two paths agree
-// on the enum (issue-spor-node-create-bypasses-status-vocabulary).
+// and transitions() (the close-time gate; runs on every write) so the two paths
+// agree on the enum (issue-spor-node-create-bypasses-status-vocabulary).
 const VALID = ["open", "mitigated", "closed"];
 
 // validate(node) — runs at the door on EVERY write (create and update). Returns
@@ -357,10 +371,12 @@ export function validate(node) {
   return errors;
 }
 
-// transitions(current, proposed, view) — runs on UPDATE only; returns
-// { allow, reason? }. Gates the *transition*, not membership (validate() owns
-// that): closing requires a durable outcome on the graph. Empty status
-// (status-less = live) is always allowed.
+// transitions(current, proposed, view) — runs on every write; returns
+// { allow, reason? }. On create there is no prior state, so `current` is the
+// proposed node (a create is not a transition). Gates the *transition*, not
+// membership (validate() owns that): closing requires a durable outcome on the
+// graph, and because the check is state-framed (it reads proposed.status) it
+// also stops a born-`closed` create. Empty status (status-less = live) is allowed.
 export function transitions(current, proposed, view) {
   const next = ((proposed && proposed.status) || "").toLowerCase();
   if (next === "") return { allow: true };

@@ -86,12 +86,18 @@ A schema may carry fenced `js` blocks exporting **pure** functions, run
 server-side in a sandbox (no I/O, no clock) at the JSON boundary. The one most
 types use:
 
-- `transitions(current, proposed, view)` — gate a status change; runs on
-  **update only** (the create path is ungated). Return `{allow: true}` or
+- `transitions(current, proposed, view)` — gate a status change; runs on **every
+  write (create AND update)**. On create there is no prior state, so the server
+  passes `current` = the proposed node — a create is *not* a transition, so
+  change-framed rules (`current.status !== proposed.status`) see no change and
+  pass, while state-framed rules (reading `proposed.status`, like a completion
+  gate) still apply to a born status, so a node cannot be created already terminal
+  past its gate. Return `{allow: true}` or
   `{allow: false, reason: "..."}`. Make the reason actionable: a writing agent
   reads it and retries. This is also where you pin a type's legal status set —
   reject any proposed status outside it. `current` is the stored node (`null` if
-  unparseable), `proposed` the incoming one, and `view` a read-only join the
+  unparseable; on create it is the proposed node), `proposed` the incoming one,
+  and `view` a read-only join the
   server computes: `view.resolvers` (live inbound `resolves`/`answers` edges,
   pre-filtered to resolving states), `view.targets`, `view.actor`,
   `view.approvals`, `view.non_resolving_statuses`. (The task type's gate uses
