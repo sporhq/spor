@@ -29,6 +29,15 @@ function useConfig(opts) {
   _config = require(path.join(ROOT, "lib", "config.js")).loadConfig(opts);
   return _config;
 }
+// Adopt an ALREADY-resolved Config as the active cascade. useConfig() builds one
+// from opts (the hook path); the `spor` CLI resolves cfg once in main() and hands
+// the engines that SAME tenant/cwd/marker resolution via this, so an engine read
+// (serverBase/bearer/graphHome) honors a file-config or --org tenant instead of
+// silently falling back to raw env.
+function setConfig(cfg) {
+  _config = cfg;
+  return cfg;
+}
 function config() {
   return _config;
 }
@@ -959,6 +968,7 @@ module.exports = {
   userConfigHome,
   envDual: home.envDual,
   useConfig,
+  setConfig,
   config,
   clearConfig,
   cfgStr,

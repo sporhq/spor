@@ -96,6 +96,48 @@ test('drain unlinks a successfully drained file (200/207)', async () => {
   }
 });
 
+test('drainOutbox returns an {attempted,drained,deadLettered,failed} tally', async () => {
+  // two ship (200), one dead-letters (422), one stays spooled (500).
+  const graph = scratchGraph();
+  spool(graph, 'a.json');
+  spool(graph, 'b.json');
+  spool(graph, 'c.json');
+  spool(graph, 'd.json');
+  const codes = { 'a.json': 200, 'b.json': 200, 'c.json': 422, 'd.json': 500 };
+  // route by the file the body came from — every spool() body is identical, so
+  // key off call order against the lexical sort the drain uses (a,b,c,d).
+  const order = ['a.json', 'b.json', 'c.json', 'd.json'];
+  let i = 0;
+  const s = await withServer(async () => fakeResponse(codes[order[i++]]), () => drainOutbox(graph, 'test', 2, 0));
+  assert.deepStrictEqual(s, { attempted: 4, drained: 2, deadLettered: 1, failed: 1 });
+  assert.ok(live(graph, 'd.json'), 'the 500 stays spooled');
+  assert.ok(dead(graph, 'c.json'), 'the 422 dead-letters');
+});
+
+test('drainOutbox returns a zero tally when there is no server / no outbox', async () => {
+  const graph = scratchGraph();
+  // no SPOR_SERVER set -> early return
+  const realServer = process.env.SPOR_SERVER;
+  delete process.env.SPOR_SERVER;
+  try {
+    assert.deepStrictEqual(await drainOutbox(graph, 'test', 2, 0), { attempted: 0, drained: 0, deadLettered: 0, failed: 0 });
+  } finally {
+    if (realServer === undefined) delete process.env.SPOR_SERVER;
+    else process.env.SPOR_SERVER = realServer;
+  }
+});
+
+test('drainOutbox honors the maxFiles cap and reports only what it attempted', async () => {
+  const graph = scratchGraph();
+  spool(graph, 'a.json');
+  spool(graph, 'b.json');
+  spool(graph, 'c.json');
+  const s = await withServer(async () => fakeResponse(200), () => drainOutbox(graph, 'test', 2, 2));
+  assert.strictEqual(s.attempted, 2, 'the cap stops after 2 files');
+  assert.strictEqual(s.drained, 2);
+  assert.ok(live(graph, 'c.json'), 'the capped-out file stays spooled');
+});
+
 test('parseRetryAfter: numeric seconds, dates, and junk', () => {
   assert.strictEqual(u.parseRetryAfter('2'), 2000);
   assert.strictEqual(u.parseRetryAfter('0'), 0);

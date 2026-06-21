@@ -10,10 +10,14 @@ const fs = require("fs");
 const path = require("path");
 const u = require("./util");
 
+// Returns a { attempted, drained, deadLettered, failed } tally so a caller (the
+// `spor drain` verb) can report the outcome; the detached/session-start callers
+// ignore it. Observable behavior (file moves, journal lines) is unchanged.
 async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0) {
-  if (!u.serverBase()) return;
+  const summary = { attempted: 0, drained: 0, deadLettered: 0, failed: 0 };
+  if (!u.serverBase()) return summary;
   const outbox = path.join(graph, "outbox");
-  if (!fs.existsSync(outbox)) return;
+  if (!fs.existsSync(outbox)) return summary;
 
   u.ensureDir(path.join(graph, "journal"));
   const rlog = u.makeLogger(path.join(graph, "journal", "remote.log"), `${tag} drain: `);
@@ -26,12 +30,11 @@ async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0) 
   try {
     files = fs.readdirSync(outbox).filter((f) => f.endsWith(".json")).sort();
   } catch {
-    return;
+    return summary;
   }
 
-  let drained = 0;
   for (const name of files) {
-    if (maxFiles > 0 && drained >= maxFiles) {
+    if (maxFiles > 0 && summary.attempted >= maxFiles) {
       rlog(`file cap (${maxFiles}) reached; deferring the rest to the next drain`);
       break;
     }
@@ -50,11 +53,12 @@ async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0) 
       timeoutMs: maxTimeSec * 1000,
       retry,
     });
-    drained++;
+    summary.attempted++;
     if (http === "200" || http === "207") {
       try {
         fs.unlinkSync(file);
       } catch {}
+      summary.drained++;
       rlog(`drained ${name} (http=${http})`);
     } else if (http === "401" || http === "403" || http === "400" || http === "413" || http === "422") {
       // Permanent client error: dead-letter it so it can't starve the drain.
@@ -70,6 +74,7 @@ async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0) 
           fs.unlinkSync(file);
         } catch {}
       }
+      summary.deadLettered++;
       if (http === "401") {
         rlog(
           `dead-lettered ${name} (http=401, revoked/invalid token); ` +
@@ -79,9 +84,11 @@ async function drainOutbox(graph, tag = "drain", maxTimeSec = 30, maxFiles = 0) 
         rlog(`dead-lettered ${name} (http=${http}, permanent); kept in outbox/dead/ for inspection`);
       }
     } else {
+      summary.failed++;
       rlog(`drain failed for ${name} (http=${http}); leaving spooled`);
     }
   }
+  return summary;
 }
 
 module.exports = { drainOutbox };

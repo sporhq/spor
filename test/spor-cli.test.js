@@ -1442,7 +1442,7 @@ test('add (remote) transport failure spools the capture and reports the spool pa
   // accurate message: names the spool location + the real recovery path, NOT a
   // bare "retried by the hooks" promise a one-shot CLI cannot keep.
   assert.match(r.stderr, /Spooled to /);
-  assert.match(r.stderr, /spor doctor/);
+  assert.match(r.stderr, /spor drain/);
   assert.doesNotMatch(r.stderr, /retried by the hooks/);
   const spooled = spoolFiles(home);
   assert.strictEqual(spooled.length, 1, 'exactly one capture spooled to the outbox');

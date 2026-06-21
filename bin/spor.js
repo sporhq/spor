@@ -1216,7 +1216,7 @@ async function cmdAdd(cfg, { values, positionals }) {
       const reason = r.transport ? r.error : `HTTP ${r.status}`;
       const spool = spoolCapture(cfg, body);
       if (spool) {
-        err(`offline — capture not shipped (${reason}). Spooled to ${spool}; it ships on your next Spor session (check with 'spor doctor').`);
+        err(`offline — capture not shipped (${reason}). Spooled to ${spool}; run 'spor drain' to ship it (or it drains on your next Spor session).`);
       } else {
         err(`offline — capture not shipped (${reason}) and could not be spooled — capture lost. Re-run when the server is reachable.`);
       }
@@ -1230,6 +1230,11 @@ async function cmdAdd(cfg, { values, positionals }) {
     }
     const ids = (r.json && (r.json.ids || r.json.node_ids)) || [];
     out(ids.length ? `captured: ${ids.join(", ")}` : `captured (${(r.json && r.json.status) || "ok"})`);
+    // Self-heal: a pure-CLI user has no Claude Code session to run the drain, so a
+    // successful capture (proof the server is reachable) is the moment to flush any
+    // backlog the fail-open spool stranded (task-spor-cli-outbox-drain-verb). Only
+    // runs when there IS a spool, is bounded, and never affects the add's success.
+    await opportunisticDrain(cfg);
     return 0;
   }
 
@@ -1286,6 +1291,68 @@ async function cmdAdd(cfg, { values, positionals }) {
   out(`added ${id} (${type}) to ${nodesDir}`);
   out(`  edit it to add edges/detail; 'spor next' will surface it.`);
   return 0;
+}
+
+// --- spor drain ---------------------------------------------------------
+// Flush the fail-open capture spool (graphHome/outbox/*) to the team server — the
+// manual trigger of the same drain-outbox engine session-start fires detached, so
+// a pure-CLI user who never opens a Claude Code session still has a way to ship
+// stranded captures (task-spor-cli-outbox-drain-verb). Remote-only: local mode
+// never spools (captures write straight to the graph), so there is nothing to
+// drain. Setting the active config first makes the engine resolve server/token
+// through the SAME tenant cascade the CLI did (file config, --org), not raw env.
+async function cmdDrain(cfg, { values }) {
+  if (cfg.mode() !== "remote") {
+    out("nothing to drain — local mode has no server to ship to (captures write straight to the graph).");
+    return 0;
+  }
+  u.setConfig(cfg);
+  const graph = cfg.graphHome();
+  const outbox = path.join(graph, "outbox");
+  const before = u.spoolStats(outbox);
+  const deadBefore = u.spoolStats(path.join(outbox, "dead"));
+  if (!before.count) {
+    out("outbox empty — nothing to drain.");
+    if (deadBefore.count) {
+      out(`  ${deadBefore.count} in outbox/dead/ (permanent rejects) — re-mint SPOR_TOKEN, then replay outbox/dead/.`);
+    }
+    return 0;
+  }
+  const timeout = Math.max(1, Number(values.timeout) || 30);
+  const limit = Math.max(0, Number(values.limit) || 0);
+  out(`draining ${before.count} spooled capture${before.count === 1 ? "" : "s"} -> ${u.serverHost()} ...`);
+  const { drainOutbox } = require(path.join(ROOT, "scripts", "engines", "drain-outbox.js"));
+  const s = await drainOutbox(graph, "manual", timeout, limit);
+  const parts = [`drained ${s.drained}/${s.attempted}`];
+  if (s.deadLettered) parts.push(`${s.deadLettered} dead-lettered (permanent reject)`);
+  if (s.failed) parts.push(`${s.failed} left spooled (server unreachable/transient)`);
+  const after = u.spoolStats(outbox);
+  if (after.count && !limit) parts.push(`${after.count} remaining`);
+  out(parts.join("; ") + ".");
+  if (u.spoolStats(path.join(outbox, "dead")).count) {
+    out("  some captures are permanently rejected in outbox/dead/ — re-mint SPOR_TOKEN, then replay them.");
+  }
+  // Exit 1 only when nothing made progress (server unreachable, all left spooled)
+  // so a script can detect a no-op drain; a partial/full ship or a dead-letter is
+  // progress (exit 0). Mirrors cmdAdd, which also exits 1 on a transport failure.
+  return s.drained > 0 || s.deadLettered > 0 ? 0 : 1;
+}
+
+// Best-effort opportunistic drain after a successful remote `spor add`: only when
+// a spool exists, bounded (5s/file, no retry), and swallowing all errors so it
+// never turns the add's success into a failure. Adopts the CLI's resolved cfg as
+// the active cascade so the engine ships through the same tenant the add did.
+async function opportunisticDrain(cfg) {
+  try {
+    const graph = cfg.graphHome();
+    if (!u.spoolStats(path.join(graph, "outbox")).count) return;
+    u.setConfig(cfg);
+    const { drainOutbox } = require(path.join(ROOT, "scripts", "engines", "drain-outbox.js"));
+    const s = await drainOutbox(graph, "cli-add", 5, 0);
+    if (s.drained) out(`  (also flushed ${s.drained} spooled capture${s.drained === 1 ? "" : "s"} from the outbox)`);
+  } catch {
+    /* the add already succeeded — draining the backlog is a bonus, never a gate */
+  }
 }
 
 // --- spor correct -------------------------------------------------------
@@ -5444,6 +5511,28 @@ const COMMANDS = {
       'spor add "Platform must expose a token-rotation hook" --project platform --blocks task-my-initiative --needed-by 2026-07-15',
     ],
     run: (cfg, p) => cmdAdd(cfg, p),
+  },
+  drain: {
+    group: "Graph", parse: "strict", args: "", aliases: ["sync"],
+    summary: "flush spooled captures to the team server (remote)",
+    help:
+      "Ship the fail-open capture spool (graphHome/outbox) to the team server — the\n" +
+      "manual trigger of the same drain a Claude Code session runs at start, for\n" +
+      "pure-CLI users who never open a session and so have no other drain trigger.\n\n" +
+      "When a remote `spor add` can't reach the server (down, or >30s ingestion) it\n" +
+      "spools the capture to the outbox instead of losing it; this replays each one\n" +
+      "to /v1/capture (or /v1/nodes). A SUCCESSFUL remote `spor add` also drains\n" +
+      "opportunistically, so standalone CLI usage self-heals without this verb too.\n\n" +
+      "Remote-only (local mode never spools — captures write straight to the graph).\n" +
+      "Shipped files are removed; permanent 4xx rejects (e.g. a revoked token) move\n" +
+      "to outbox/dead/ for inspection; transient failures stay spooled for the next\n" +
+      "drain. Exits 1 only when nothing could ship (server unreachable).",
+    options: {
+      limit: { type: "string", value: "N", desc: "drain at most N files (default: all)" },
+      timeout: { type: "string", value: "S", desc: "per-file budget in seconds (default: 30)" },
+    },
+    examples: ["spor drain", "spor drain --limit 10", "spor drain --timeout 10"],
+    run: (cfg, p) => cmdDrain(cfg, p),
   },
   next: {
     group: "Graph", parse: "raw", args: "[--project S | --all-projects] [--type T] [--exclude-type T] [--limit N]", aliases: ["queue"],

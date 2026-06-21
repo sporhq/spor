@@ -35,8 +35,8 @@ Read what it prints and tell the user, briefly:
 - `captured (pending)` — the text fit no schema; it was preserved as a `cap-…`
   node for later triage. Say so; nothing is lost.
 - an `offline` / `error 503` line — the team graph's ingestion is unreachable or
-  down. The hooks' outbox retries shipped captures in a normal session; offer to
-  retry, or the fact is safe to re-add later.
+  down. The capture is spooled to the outbox, not lost; it ships on the next Spor
+  session, or run `spor drain` once the server is back to flush it now.
 
 **In Cowork (no shell)**, call the `capture` MCP tool with the same fields
 (`text`, `project`, `during`, and the `blocks`/`needed_by` below).

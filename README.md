@@ -368,6 +368,16 @@ lines from `journal/remote.log` and `journal/distill.log`. When captures
 have been stranded (a dead-letter pile-up or a deep outbox), session-start
 also surfaces a one-line nudge alongside its status banner pointing you here.
 
+When the outbox has stranded captures, flush it on demand with:
+
+```bash
+spor drain
+```
+
+It replays each spooled capture to the team server (the same drain a session
+runs at start), so a pure-CLI user who never opens a session can still ship
+them. A successful remote `spor add` drains opportunistically too.
+
 ## Pointers
 
 - [GRAPH.md](GRAPH.md) — the node and edge format: what a node file looks
