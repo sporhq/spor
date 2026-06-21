@@ -5283,7 +5283,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound };
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, COMMANDS, resolveVerb };
 
 if (require.main === module) {
   main()
