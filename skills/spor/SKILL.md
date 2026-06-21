@@ -110,7 +110,17 @@ spor brief <id>                # a briefing for one node (compile --root <id>)
 spor validate                  # lint the local graph (server validates per-write remotely)
 spor compile --root <id> --skeleton   # writes a local briefing-node skeleton
 spor query --type task --where status=open --ids   # structured node/edge enumeration
+spor analytics --type task,issue      # created-vs-completed metrics from git history
 ```
+
+`spor analytics` folds the graph repo's git history into work-flow metrics:
+created vs. completed work per ISO week, throughput, cycle time, current WIP by
+type, and the oldest-open bottlenecks. Completion time is a node's status-
+*transition* time (when it entered its final terminal run, read from git content
+history), never `updated_at` — so a later edge append can't corrupt the
+"completed last week" signal (dec-spor-git-derived-timestamps). Local-only (the
+git history IS the signal); `--project`/`--type`/`--weeks`/`--json` scope and
+shape it.
 
 `spor query` is the local structured enumeration — the deterministic,
 predicate-filtered list that `get` (one node), `next` (the ranked queue) and

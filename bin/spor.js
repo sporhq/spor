@@ -848,6 +848,20 @@ function cmdQuery(cfg, args) {
   return passthrough("query.js", args);
 }
 
+// analytics folds a LOCAL graph's git history into created-vs-completed metrics
+// (task-spor-work-analytics-consumer). Like query/validate it is local-only: the
+// completion signal IS the graph repo's git content history, which the server
+// owns in remote mode — so fail fast unless --nodes points at a local checkout.
+function cmdAnalytics(cfg, args) {
+  if (cfg.mode() === "remote" && !namesLocalGraph(args)) {
+    err("analytics folds a LOCAL graph's git history; in remote mode the server holds");
+    err("  the graph and its history. Point --nodes at a local checkout to analyze it,");
+    err("  or unset SPOR_SERVER to analyze the local graph home.");
+    return 1;
+  }
+  return passthrough("analytics.js", args);
+}
+
 // --- spor add / capture -------------------------------------------------
 // Local: write a well-formed node so a user never has to learn the frontmatter
 // (issue-cc-local-mode-capture-queue-surfacing-gap). Remote: POST /v1/capture,
@@ -4833,6 +4847,35 @@ const COMMANDS = {
       "spor query --edges --edge-type grouped-under --to proj-rdi",
     ],
     run: (cfg, args) => cmdQuery(cfg, args),
+  },
+  analytics: {
+    group: "Graph", parse: "raw", args: "[--project S] [--type T] [--weeks N] [--json]",
+    summary: "created-vs-completed work metrics (local)",
+    help:
+      "Surface work-flow analytics over the git-derived timestamp index: created vs.\n" +
+      "completed work per ISO week, throughput, cycle time, current WIP by type, and\n" +
+      "the oldest-open bottlenecks. Local-only — it folds the local graph's git\n" +
+      "history (point --nodes at a local checkout to read one under a server).\n" +
+      "\n" +
+      "Completion time is a node's status-TRANSITION time (when it entered its final\n" +
+      "terminal run), derived from git content history — never updated_at, which a\n" +
+      "later edge append would push past completion (dec-spor-git-derived-timestamps).\n" +
+      "Supersession (no status change of its own) falls back to the superseding node's\n" +
+      "creation; a non-git home falls back to frontmatter dates.\n" +
+      "\n" +
+      "  --project <S>   scope to a repo slug / repo-<slug> / grouping id (like `next`)\n" +
+      "  --type <T>      restrict to these node types (repeatable, comma-ok)\n" +
+      "  --weeks <N>     weekly-cohort window length (default 12)\n" +
+      "  --top <N>       bottleneck list length (default 10)\n" +
+      "  --aging <N>     aging-WIP / bottleneck age threshold in days (default 30)\n" +
+      "  --json          machine-readable report\n" +
+      "  --nodes <dir>   read this local graph dir instead of the resolved home",
+    examples: [
+      "spor analytics",
+      "spor analytics --project spor --type task,issue",
+      "spor analytics --weeks 8 --json",
+    ],
+    run: (cfg, args) => cmdAnalytics(cfg, args),
   },
   correct: {
     group: "Graph", parse: "strict", args: "<target> [guidance]", aliases: ["propose-correction"],
