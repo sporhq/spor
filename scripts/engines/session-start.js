@@ -277,9 +277,13 @@ async function sessionStart(input) {
   // The slug->path map is machine-local — written to the PERSONAL user config
   // home, never the (possibly marker-shared) graph home, so it can't desync
   // from where the cascade reads it back (issue-spor-config-desync-shared-graph-home).
+  // `verify`: this is the PASSIVE re-probe, so it must not clobber a correct
+  // existing mapping with the wrong checkout when run from a cross-repo worktree
+  // cwd (issue-spor-dispatch-repos-corruption-worktree-session-start) — it only
+  // fills an unmapped slug or self-heals when this dir genuinely is slug's repo.
   try {
     if (cwd && fs.existsSync(cwd)) {
-      u.registerRepo(u.userConfigHome(), slug, u.inferenceRoot(cwd) || cwd);
+      u.registerRepo(u.userConfigHome(), slug, u.inferenceRoot(cwd) || cwd, { verify: true });
     }
   } catch {
     /* best effort */

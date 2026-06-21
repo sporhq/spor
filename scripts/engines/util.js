@@ -521,10 +521,27 @@ function editRepoMap(graphHomeDir, mutate) {
 }
 // Record slug -> dir (last-writer-wins, so a re-clone or worktree updates it).
 // No-op when unchanged, to avoid rewriting config.json on every session.
-function registerRepo(graphHomeDir, slug, dir) {
+//
+// `opts.verify` is for the passive SESSION-START re-probe: it refuses to CLOBBER
+// an existing-but-different mapping unless `dir` authoritatively IS this slug's
+// repo (its own inferred slug matches). A dispatched agent's session-start runs
+// from its worktree cwd, and a confused/cross-repo cwd could otherwise overwrite
+// a correct slug->path with the WRONG checkout (e.g. spor-server -> the client
+// repo), silently retargeting every later dispatch in that session
+// (issue-spor-dispatch-repos-corruption-worktree-session-start). A brand-new slug
+// still registers (first-contact, including a monorepo subtree slug whose dir is
+// the shared root), and for a normal single-repo checkout a re-clone/move still
+// auto-updates and a corrupted entry self-heals (projectSlug(dir) === slug there).
+// The one case it can't auto-update is a monorepo SUBTREE slug after the repo
+// MOVES — projectSlug(root) is the root slug, not the subtree slug, so it won't
+// clobber; that fails loud at dispatch ("target dir does not exist") and an
+// explicit `spor repos add` repairs it. Explicit callers (`spor repos add`, the
+// dispatch self-register) pass no opts and keep plain last-writer-wins.
+function registerRepo(graphHomeDir, slug, dir, opts = {}) {
   if (!slug || !dir || !/^[a-z0-9][a-z0-9-]*$/.test(slug)) return false;
   return editRepoMap(graphHomeDir, (repos) => {
     if (repos[slug] === dir) return false;
+    if (opts.verify && slug in repos && projectSlug(dir) !== slug) return false;
     repos[slug] = dir;
     return true;
   });

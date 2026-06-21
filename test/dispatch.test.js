@@ -13,6 +13,7 @@ const os = require("node:os");
 const path = require("node:path");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
+const u = require(path.join(__dirname, "..", "scripts", "engines", "util.js"));
 
 // Env with no SPOR_*/SUBSTRATE_* leakage; force LOCAL mode (no server). Also
 // isolate the config-cascade homes to an empty temp dir so the developer's real
@@ -323,6 +324,178 @@ test("dispatch free-text from cwd: still resolves the launcher cwd (guard is nod
   assert.doesNotMatch(r.stderr, /can't tell which repo/);
 });
 
+// --- Corrupt dispatch.repos mapping guard --------------------------------
+// issue-spor-dispatch-repos-corruption-worktree-session-start: a session-start
+// re-probe from a confused worktree cwd can point a slug at the WRONG checkout
+// (e.g. spor-server -> the client repo). A node dispatched there runs against a
+// tree lacking its files and "completes" with zero commits. Dispatch now refuses
+// when a MAP-resolved (source "config") git checkout reports a different slug
+// than the one looked up.
+
+// A real git repo at <base>/<name> with one commit, so projectSlug() derives its
+// slug from the dir basename (the slug convention). Returns the realpath (git and
+// macOS tmp both symlink-resolve, so compare against the resolved path).
+function gitRepoNamed(name) {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-gr-"));
+  const dir = path.join(base, name);
+  fs.mkdirSync(dir);
+  const g = (args) => {
+    const r = spawnSync("git", ["-C", dir, ...args], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@example.com",
+        GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@example.com",
+      },
+    });
+    assert.strictEqual(r.status, 0, r.stderr);
+  };
+  g(["init", "-q"]);
+  fs.writeFileSync(path.join(dir, "f.txt"), "x");
+  g(["add", "f.txt"]);
+  g(["commit", "-q", "-m", "root"]);
+  return { base, dir: fs.realpathSync(dir) };
+}
+
+// A scratch home with one task stamped `repo: <slug>` (so node dispatch resolves
+// the target via the dispatch.repos map for that slug).
+function repoStampedTaskHome(slug) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-corrupt-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  fs.writeFileSync(
+    path.join(nodes, "task-srv.md"),
+    `---\nid: task-srv\ntype: task\nrepo: ${slug}\ntitle: A server-side task that must run in the ${slug} checkout\nsummary: A task stamped repo:${slug} so dispatch resolves its target dir through the dispatch.repos map.\ndate: 2026-06-02\n---\nDo the ${slug} work.\n`
+  );
+  return { home, nodes };
+}
+
+test("dispatch <node>: refuses a corrupt dispatch.repos mapping (slug points at the wrong checkout)", () => {
+  const { home } = repoStampedTaskHome("spor-server");
+  const { base, dir: clientRepo } = gitRepoNamed("spor-client"); // a real but WRONG repo
+  // Corrupt the map exactly as a worktree re-probe would: spor-server -> the client repo.
+  assert.strictEqual(run(["repos", "add", "spor-server", clientRepo], { SPOR_HOME: home }).status, 0);
+  const r = run(["dispatch", "task-srv", "--print", "--no-brief"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1, r.stdout);
+  assert.match(r.stderr, /dispatch\.repos\['spor-server'\] points at .* but that checkout is 'spor-client', not 'spor-server'/);
+  assert.match(r.stderr, /the slug→path map is corrupt/);
+  assert.match(r.stderr, /spor repos add spor-server/);
+  // It must NOT have proceeded to print the dispatch into the wrong checkout.
+  assert.doesNotMatch(r.stdout, /dir:    /);
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+test("dispatch <node>: --force overrides the corrupt-mapping guard (loud, but proceeds)", () => {
+  const { home } = repoStampedTaskHome("spor-server");
+  const { base, dir: clientRepo } = gitRepoNamed("spor-client");
+  run(["repos", "add", "spor-server", clientRepo], { SPOR_HOME: home });
+  const r = run(["dispatch", "task-srv", "--print", "--no-brief", "--force"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stderr, /--force set — dispatching into the mismatched checkout anyway/);
+  assert.match(r.stdout, new RegExp(`dir:    ${clientRepo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*via config`));
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+test("dispatch <node>: a CORRECT git mapping passes the guard (no false positive)", () => {
+  const { home } = repoStampedTaskHome("spor-server");
+  const { base, dir: serverRepo } = gitRepoNamed("spor-server"); // the RIGHT repo
+  run(["repos", "add", "spor-server", serverRepo], { SPOR_HOME: home });
+  const r = run(["dispatch", "task-srv", "--print", "--no-brief"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, new RegExp(`dir:    ${serverRepo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*via config`));
+  assert.doesNotMatch(r.stderr, /map is corrupt/);
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+test("dispatch <node>: a NON-git mapped target is trusted (guard is git-checkout only)", () => {
+  // The map legitimately points slugs at arbitrarily-named dirs; only a real git
+  // checkout has an authoritative slug to validate against, so a non-git target
+  // (here a plain tmp dir whose basename != the slug) must NOT trip the guard.
+  const { home } = repoStampedTaskHome("spor-server");
+  const plain = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-plain-")); // not git, basename != slug
+  run(["repos", "add", "spor-server", plain], { SPOR_HOME: home });
+  const r = run(["dispatch", "task-srv", "--print", "--no-brief"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, new RegExp(`dir:    ${plain.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*via config`));
+  assert.doesNotMatch(r.stderr, /map is corrupt/);
+});
+
+test("dispatch <node>: a monorepo SUBTREE slug mapped to the shared root passes the guard", () => {
+  // issue-cc-project-identity-monorepo-worktree: a subtree marker
+  // (services/api/.spor -> `repo: my-api`) splits one repo into distinct slugs,
+  // and session-start registers the subtree slug -> the shared git ROOT. So
+  // projectSlug(root) != 'my-api' even though the mapping is CORRECT — the guard
+  // must accept it via the subtree-marker scan, not refuse it.
+  const { home } = repoStampedTaskHome("my-api");
+  const { base, dir: root } = gitRepoNamed("platform"); // root slug != the subtree slug
+  const sub = path.join(root, "services", "api");
+  fs.mkdirSync(sub, { recursive: true });
+  fs.writeFileSync(path.join(sub, ".spor"), "repo: my-api\n");
+  run(["repos", "add", "my-api", root], { SPOR_HOME: home });
+  const r = run(["dispatch", "task-srv", "--print", "--no-brief"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, new RegExp(`dir:    ${root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*via config`));
+  assert.doesNotMatch(r.stderr, /map is corrupt/);
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+// --- registerRepo verify mode (the passive session-start re-probe) --------
+// The auto-probe must not CLOBBER a correct mapping with the wrong checkout when
+// run from a cross-repo worktree cwd, but must still fill new slugs and self-heal
+// in the genuine repo (issue-spor-dispatch-repos-corruption-worktree-session-start).
+function readRepos(home) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8")).dispatch.repos || {};
+  } catch {
+    return {};
+  }
+}
+
+test("registerRepo verify: fills an unmapped slug (first contact)", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-rr-"));
+  const { base, dir } = gitRepoNamed("spor-server");
+  assert.strictEqual(u.registerRepo(home, "spor-server", dir, { verify: true }), true);
+  assert.strictEqual(readRepos(home)["spor-server"], dir);
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+test("registerRepo verify: does NOT clobber a correct mapping with a foreign checkout", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-rr-"));
+  const right = gitRepoNamed("spor-server");
+  const wrong = gitRepoNamed("spor-client"); // a foreign repo (projectSlug != spor-server)
+  assert.strictEqual(u.registerRepo(home, "spor-server", right.dir), true); // explicit: establish correct
+  // The passive re-probe tries to point spor-server at the client checkout — refused.
+  assert.strictEqual(u.registerRepo(home, "spor-server", wrong.dir, { verify: true }), false);
+  assert.strictEqual(readRepos(home)["spor-server"], right.dir, "correct mapping preserved");
+  fs.rmSync(right.base, { recursive: true, force: true });
+  fs.rmSync(wrong.base, { recursive: true, force: true });
+});
+
+test("registerRepo verify: self-heals a corrupted mapping from the genuine repo", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-rr-"));
+  const wrong = gitRepoNamed("spor-client");
+  const right = gitRepoNamed("spor-server");
+  // Map is already corrupt: spor-server -> the client checkout.
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { repos: { "spor-server": wrong.dir } } }) + "\n");
+  // A session opening in the genuine spor-server repo heals it (projectSlug(dir) === slug).
+  assert.strictEqual(u.registerRepo(home, "spor-server", right.dir, { verify: true }), true);
+  assert.strictEqual(readRepos(home)["spor-server"], right.dir, "healed to the genuine checkout");
+  fs.rmSync(right.base, { recursive: true, force: true });
+  fs.rmSync(wrong.base, { recursive: true, force: true });
+});
+
+test("registerRepo without verify: keeps last-writer-wins (explicit callers unchanged)", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-rr-"));
+  const right = gitRepoNamed("spor-server");
+  const wrong = gitRepoNamed("spor-client");
+  assert.strictEqual(u.registerRepo(home, "spor-server", right.dir), true);
+  // An EXPLICIT registration (no opts) still overwrites, even to a mismatched dir.
+  assert.strictEqual(u.registerRepo(home, "spor-server", wrong.dir), true);
+  assert.strictEqual(readRepos(home)["spor-server"], wrong.dir, "explicit clobber preserved");
+  fs.rmSync(right.base, { recursive: true, force: true });
+  fs.rmSync(wrong.base, { recursive: true, force: true });
+});
+
 // --from-queue must SKIP items already in flight on this machine and advance to
 // the next genuinely-free one (task-spor-dispatch-from-queue-skip-in-flight). The
 // queue's lease filter is viewer-relative, so the dispatcher's own in-progress
@@ -528,8 +701,13 @@ test("dispatch spawns the claude binary with --bg in the target dir", { skip: pr
 // script and the setup hook is /bin/sh).
 
 // A git-inited target repo with one commit, so `git worktree add ... HEAD` works.
+// The checkout dir is named `demo` so projectSlug() derives the same slug it gets
+// mapped under (the slug convention) — i.e. it passes the corrupt-mapping guard
+// (issue-spor-dispatch-repos-corruption-worktree-session-start).
 function gitTargetRepo() {
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-wtrepo-"));
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-wtrepo-"));
+  const repo = path.join(base, "demo");
+  fs.mkdirSync(repo);
   const g = (args) => {
     const r = spawnSync("git", ["-C", repo, ...args], {
       encoding: "utf8",

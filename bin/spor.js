@@ -4625,6 +4625,42 @@ function resolveDir(cfg, { dir, slug }) {
   return { dir: dispatchRoot(), slug: safeSlug(), source: "cwd" };
 }
 
+// Does the checkout at `dir` legitimately host `slug` — as its own root identity,
+// OR via a monorepo subtree `.spor` marker below it? The corrupt-mapping guard
+// uses this to tell a genuine cross-repo mismatch (spor-server -> the client repo,
+// which hosts NO marker for spor-server) from a LEGITIMATE subtree mapping that
+// session-start itself writes (my-api -> the shared root, where services/api/.spor
+// pins `repo: my-api`, so projectSlug(root) != my-api yet the mapping is correct;
+// issue-cc-project-identity-monorepo-worktree). Only called on the cold mismatch
+// path (projectSlug(dir) already != slug), so the bounded subtree scan never runs
+// on a correct dispatch. Depth-bounded and skips heavy/irrelevant dirs so it stays
+// cheap even on a large tree.
+function dirHostsSlug(dir, slug) {
+  if (u.projectSlug(dir) === slug) return true; // root identity
+  const SKIP = new Set([".git", "node_modules", ".claude", "dist", "build", "coverage", ".next", "vendor", "target"]);
+  const MAX_DEPTH = 3; // services/<area>/.spor is depth 2; a little headroom
+  const stack = [[dir, 0]];
+  while (stack.length) {
+    const [d, depth] = stack.pop();
+    let ents;
+    try {
+      ents = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of ents) {
+      // A flat `.spor` marker pins this subtree's slug — projectSlug walks up to it.
+      if (e.isFile() && e.name === ".spor" && u.projectSlug(d) === slug) return true;
+    }
+    if (depth < MAX_DEPTH) {
+      for (const e of ents) {
+        if (e.isDirectory() && !SKIP.has(e.name)) stack.push([path.join(d, e.name), depth + 1]);
+      }
+    }
+  }
+  return false;
+}
+
 // Quote an argv element for the --print display only (never used to spawn).
 function shellQuote(s) {
   return /[^\w./:-]/.test(s) ? `'${String(s).replace(/'/g, "'\\''")}'` : s;
@@ -4997,6 +5033,33 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   if (!fs.existsSync(res.dir)) {
     err(`target dir does not exist: ${res.dir}`);
     return 1;
+  }
+  // Guard a CORRUPT dispatch.repos mapping (issue-spor-dispatch-repos-corruption-
+  // worktree-session-start). The slug->path map is machine-local and a
+  // session-start re-probe from a confused worktree cwd could have pointed this
+  // slug at the WRONG checkout (e.g. spor-server -> the client repo), so the
+  // agent would run against a tree that lacks the node's files and "complete"
+  // with zero commits. Only the map-resolved branch is suspect (source "config")
+  // — an explicit --dir or a cwd resolution is the caller's own pin and is
+  // trusted. We can only authoritatively name a checkout's identity when it IS a
+  // git work tree (`--is-inside-work-tree` prints the literal "true"/"false", so
+  // match the string — a bare repo prints "false" with exit 0); a non-git target
+  // has no authoritative slug, so we trust the map there (and `spor repos add` to
+  // an arbitrary path stays valid). dirHostsSlug() accepts both the checkout's
+  // own root slug AND a monorepo subtree marker that legitimately pins the slug
+  // (my-api -> the shared root), so only a genuine cross-repo mismatch trips the
+  // guard: refuse loudly with remediation. --force overrides.
+  const dirIsWorkTree = (u.git(res.dir, ["rev-parse", "--is-inside-work-tree"]) || "").trim() === "true";
+  if (res.source === "config" && dirIsWorkTree && !dirHostsSlug(res.dir, res.slug)) {
+    err(`dispatch.repos['${res.slug}'] points at ${res.dir}, but that checkout is '${u.projectSlug(res.dir)}', not '${res.slug}' (and hosts no '${res.slug}' subtree).`);
+    if (!force) {
+      err(`  the slug→path map is corrupt (likely a session-start re-probe from a worktree cwd); dispatching there`);
+      err(`  would run ${nodeId || name} against the wrong repo. Fix it with 'spor repos add ${res.slug} <correct-path>'`);
+      err(`  (or add a '.spor' marker pinning 'repo: ${res.slug}' to that checkout), or pass --dir <path>.`);
+      err(`  re-run with --force to dispatch into the mismatched checkout anyway.`);
+      return 1;
+    }
+    err(`  --force set — dispatching into the mismatched checkout anyway.`);
   }
   // A node / --from-queue dispatch targets a SPECIFIC node that belongs to a
   // SPECIFIC repo, and the agent must run in THAT repo so its workspace hooks
