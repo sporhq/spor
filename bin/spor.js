@@ -2030,6 +2030,127 @@ async function cmdEdge(cfg, { values, positionals }) {
   return 0;
 }
 
+// --- spor claim / renew / extend / release ------------------------------
+// The shell front-door for the heartbeat-renewed task lease (dec-cc-task-claim-
+// lease, task-spor-claim-lease-cli-verbs): the CLI twins of the claim / renew /
+// extend / release MCP tools and the POST /v1/nodes/{id}/{action} REST routes the
+// server already exposes (art-res-task-cc-claim-lease-server). Until now only
+// `spor dispatch` claimed — internally, at launch — so a person working in a
+// terminal had no way to manually take a task, heartbeat it, hand it back, or
+// extend it before a long idle gap. These four verbs close that gap.
+//
+// REMOTE-ONLY by construction: a claim is a server-held lease and local mode has
+// no claim pool or contention (dec-cc-task-claim-lease "Local mode"), so — like
+// lens/run/whoami — local mode degrades with one clear line and no crash rather
+// than faking a lease there. The holder ($viewer) is always the authenticated
+// token, never an argument; the server takes/refreshes/retires the lease and
+// echoes it, and a conflict (a live lease held by someone else, or a
+// lapsed/stolen one) comes back 409 naming the current holder + expiry.
+
+// Parse a human duration (`2h`, `45m`, `30s`, `1d`, or a bare integer of ms) to
+// milliseconds, mirroring the server's eligibility.parseDuration so `spor extend`
+// and the graph-resident claim_ttl policy speak the same dialect. Returns null on
+// a malformed or non-positive value.
+const _DURATION_UNIT_MS = { ms: 1, s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000 };
+function parseDurationMs(v) {
+  if (v == null) return null;
+  const s = String(v).trim().toLowerCase();
+  if (!s) return null;
+  if (/^\d+$/.test(s)) {
+    const n = Number(s);
+    return n > 0 ? n : null;
+  }
+  const m = s.match(/^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d|w)$/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!(n > 0)) return null;
+  // A sub-millisecond fraction (e.g. 0.4ms) rounds to 0 — treat that as invalid
+  // too, so a non-positive duration is always rejected client-side rather than
+  // POSTing {ms:0} for the server to reject.
+  const ms = Math.round(n * _DURATION_UNIT_MS[m[2]]);
+  return ms > 0 ? ms : null;
+}
+
+// One concise line describing a lease (the server's leaseView): expiry, plus the
+// holder when the server names one (always you on a happy-path claim/renew/extend
+// — confirming which identity your token bound to).
+function leaseLine(lease) {
+  if (!lease) return "";
+  const parts = [];
+  if (lease.expires_at) parts.push(`expires ${lease.expires_at}`);
+  if (lease.by) parts.push(`held by ${lease.by}`);
+  return parts.join(", ");
+}
+
+const _LEASE_PAST = { claim: "claimed", renew: "renewed", extend: "extended", release: "released" };
+
+async function cmdLease(cfg, action, { positionals }) {
+  const id = positionals[0];
+  if (!id) {
+    err(`usage: spor ${action} <node-id>${action === "extend" ? " <duration>" : ""}`);
+    if (action === "extend") err("  duration: 2h / 45m / 30s / 1d (or bare milliseconds)");
+    return 1;
+  }
+
+  // Remote-only: local mode has no lease pool, so degrade with one clear line
+  // (like lens/run) rather than faking a claim that means nothing locally.
+  if (cfg.mode() !== "remote") {
+    out(`task claims are a team-graph feature — local mode has no lease pool (dec-cc-task-claim-lease).`);
+    out(`  set SPOR_SERVER/SPOR_TOKEN (see 'spor join') to claim, renew, extend, or release.`);
+    return 0;
+  }
+
+  // extend carries the requested duration; parse it client-side so a malformed
+  // value never reaches the server (the server takes raw `ms`, bounded by the
+  // tenant's claim_ttl_max policy).
+  const body = {};
+  if (action === "extend") {
+    const ms = parseDurationMs(positionals[1]);
+    if (ms == null) {
+      err(positionals[1] == null
+        ? "usage: spor extend <node-id> <duration>  (e.g. 2h, 45m, 30s)"
+        : `bad duration '${positionals[1]}' — use 2h / 45m / 30s / 1d or bare milliseconds`);
+      return 1;
+    }
+    body.ms = ms;
+  }
+
+  const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/${action}`, body, { timeoutMs: 8000 });
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (r.status === 404) {
+    err(`no such node: ${id}`);
+    return 1;
+  }
+  if (r.status === 409) {
+    // already_claimed / lease_lost — the server's message already names the
+    // current holder + expiry, so surface it verbatim.
+    const e = (r.json && r.json.error) || {};
+    err(`cannot ${action} ${id}: ${e.message || "lease conflict"}`);
+    return 1;
+  }
+  if (!r.ok) {
+    const e = (r.json && r.json.error) || {};
+    err(`${action} error ${r.status}${e.message ? `: ${e.message}` : ""}`);
+    if (Array.isArray(e.details)) for (const d of e.details) err(`  ${d}`);
+    return 1;
+  }
+
+  out(`${_LEASE_PAST[action]} ${id}`);
+  if (action === "release") {
+    // release dropped the lease (no lease echoed); note when it also retired a
+    // durable assigned edge (a no-op cleanup reads as "skipped").
+    if (r.json && r.json.edge && r.json.edge !== "skipped") out(`  assigned edge retired`);
+  } else {
+    const line = leaseLine(r.json && r.json.lease);
+    if (line) out(`  lease ${line}`);
+    if (action === "extend" && r.json && r.json.capped_to_max) out(`  (capped to the org maximum)`);
+  }
+  return 0;
+}
+
 // Persist server/token into the USER config (never a committable repo config).
 // Shared by 'join' and the 'install --server/--token' configure step. Only the
 // keys given are touched, so a token-only update keeps the existing server.
@@ -5979,6 +6100,67 @@ const COMMANDS = {
       "spor edge task-x assigned agent-z --attr profile=profile-fast",
     ],
     run: (cfg, p) => cmdEdge(cfg, p),
+  },
+  claim: {
+    group: "Graph", parse: "strict", args: "<node-id>",
+    summary: "take the heartbeat-renewed lease on a task (remote: /v1/nodes/{id}/claim)",
+    help:
+      "Manually claim a task — take the heartbeat-renewed lease that marks it\n" +
+      "yours-in-progress and keeps it out of teammates' actionable queues\n" +
+      "(dec-cc-task-claim-lease). Writes the durable 'assigned' edge once and creates\n" +
+      "the ephemeral server lease (default TTL 45m), attributed to you from your\n" +
+      "token — never an argument. Re-claiming your OWN live claim just renews it; a\n" +
+      "live lease held by someone ELSE is refused naming the holder + expiry. Keep it\n" +
+      "alive with 'spor renew', stretch it with 'spor extend', hand it back with\n" +
+      "'spor release'. Remote-only — local mode has no claim pool, so it no-ops with\n" +
+      "a note.",
+    options: {},
+    examples: ["spor claim task-x"],
+    run: (cfg, p) => cmdLease(cfg, "claim", p),
+  },
+  renew: {
+    group: "Graph", parse: "strict", args: "<node-id>",
+    summary: "heartbeat your live claim, bumping its expiry (remote: /v1/nodes/{id}/renew)",
+    help:
+      "Renew (heartbeat) your live claim on a task — bump the lease expiry so it\n" +
+      "doesn't lapse during a long stretch of work. No commit; the durable 'assigned'\n" +
+      "edge is untouched. While you work in Claude Code the post-tool hook renews\n" +
+      "automatically on write-activity (task-cc-claim-nudge-hook); this is the manual\n" +
+      "equivalent for a plain shell session. A lapsed or stolen lease is refused\n" +
+      "naming the current holder (renew never re-creates a lapsed lease — that's a\n" +
+      "fresh 'spor claim'). Remote-only — local mode has no lease.",
+    options: {},
+    examples: ["spor renew task-x"],
+    run: (cfg, p) => cmdLease(cfg, "renew", p),
+  },
+  extend: {
+    group: "Graph", parse: "strict", args: "<node-id> <duration>",
+    summary: "extend your live claim by a duration, up to the org max (remote: /v1/nodes/{id}/extend)",
+    help:
+      "Extend your live claim on a task by a given duration — for a known long idle\n" +
+      "gap (a meeting, overnight) where the default 45m heartbeat window would lapse.\n" +
+      "The duration is 2h / 45m / 30s / 1d (or a bare integer of milliseconds). The\n" +
+      "new expiry is bounded by the tenant's claim_ttl_max policy: it never shortens a\n" +
+      "lease, and a request past the ceiling is capped to it (reported on the result).\n" +
+      "A lapsed or stolen lease is refused naming the holder. Remote-only — local mode\n" +
+      "has no lease.",
+    options: {},
+    examples: ["spor extend task-x 2h", "spor extend task-x 90m"],
+    run: (cfg, p) => cmdLease(cfg, "extend", p),
+  },
+  release: {
+    group: "Graph", parse: "strict", args: "<node-id>",
+    summary: "hand a task back to the pool, retiring the assigned edge (remote: /v1/nodes/{id}/release)",
+    help:
+      "Release your claim on a task — drop the lease AND retire the durable 'assigned'\n" +
+      "edge, returning the task to the pool so a teammate can pick it up. Idempotent:\n" +
+      "releasing a task you hold no lease on still cleans up any lingering 'assigned'\n" +
+      "edge of yours and succeeds. Releasing a claim SOMEONE ELSE holds is refused\n" +
+      "naming the holder — you can't release another's claim. Remote-only — local mode\n" +
+      "has no lease.",
+    options: {},
+    examples: ["spor release task-x"],
+    run: (cfg, p) => cmdLease(cfg, "release", p),
   },
 
   // --- Repo scoping ---
