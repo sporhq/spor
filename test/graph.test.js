@@ -680,6 +680,67 @@ Body about delta echo foxtrot.
   assert.deepEqual(r.picks.norms.map((n) => n.id), ["norm-bad"]);
 });
 
+test("validateGraph: a norm applies_to_repos/projects naming an absent id warns (typo strict-excludes silently)", () => {
+  // issue-spor-norm-applies-to-unvalidated-silent-exclude: the ride-along is
+  // fail-closed, so a typo'd selector drops the norm from every briefing with
+  // no error. validate must surface it (a warning, like a dangling edge).
+  const norm = (id, scopeLine) => [`${id}.md`, `---
+id: ${id}
+type: norm
+${scopeLine}title: Standing rule ${id}
+summary: Standing rule about ${id} alpha bravo charlie.
+date: 2026-06-01
+---
+Body about ${id} alpha bravo charlie.
+`];
+  const fx = tmpGraph({
+    "proj-acme.md": `---
+id: proj-acme
+type: project
+title: Acme product
+summary: Acme product grouping xray whiskey.
+date: 2026-06-01
+---
+Acme grouping.
+`,
+    "repo-acme-py.md": `---
+id: repo-acme-py
+type: repo
+slugs: [acme-py]
+title: Repo acme-py
+summary: Repo identity for acme-py zulu yankee.
+date: 2026-06-01
+edges:
+  - {type: grouped-under, to: proj-acme}
+---
+Repo acme-py.
+`,
+    ...Object.fromEntries([
+      norm("norm-good-repo", "applies_to_repos: [repo-acme-py]\n"),  // by id
+      norm("norm-good-slug", "applies_to_repos: [acme-py]\n"),        // by slug alias
+      norm("norm-good-proj", "applies_to_projects: [proj-acme]\n"),   // grouping id
+      norm("norm-good-tag", "applies_to_tags: [python]\n"),           // open register, never checked
+      norm("norm-typo-repo", "applies_to_repos: [repo-typpo]\n"),     // typo
+      norm("norm-typo-proj", "applies_to_projects: [proj-typo]\n"),   // typo
+    ]),
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.deepEqual(v.errors, []);
+  assert.ok(
+    v.warnings.some((w) => /norm-typo-repo\.md: applies_to_repos 'repo-typpo' matches no repo or project/.test(w)),
+    "typo'd applies_to_repos warns");
+  assert.ok(
+    v.warnings.some((w) => /norm-typo-proj\.md: applies_to_projects 'proj-typo' matches no repo or project/.test(w)),
+    "typo'd applies_to_projects warns");
+  // the valid selectors (repo id, repo slug, grouping id) and the open-register
+  // tag selector must NOT warn.
+  for (const clean of ["norm-good-repo", "norm-good-slug", "norm-good-proj", "norm-good-tag"]) {
+    assert.ok(
+      !v.warnings.some((w) => w.startsWith(`${clean}.md: applies_to`)),
+      `${clean} must not warn (resolves, or is a tag)`);
+  }
+});
+
 // ---------- supersession fixup + warning ----------
 
 test("supersession: superseded node carries the inline ⚠ SUPERSEDED warning in full compile", () => {
