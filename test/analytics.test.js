@@ -76,6 +76,50 @@ test("foldStatusTransitions: empty / null input -> empty map", () => {
   assert.deepEqual(k.foldStatusTransitions(null, "nodes", isTerm), {});
 });
 
+// ---------- pure kernel: state seeding + range composition (the cache invariant) ----------
+
+test("foldStatusTransitionState: seeding a range onto a base == folding the full history", () => {
+  // A reopen straddling the cache boundary: done at the base head, then
+  // reopened→reclosed in the incremental range — the trickiest composition.
+  const base = [...create("task-a", "open", 1700000000), ...change("task-a", "open", "done", 1700100000)];
+  const range = [
+    ...change("task-a", "done", "open", 1700200000),   // reopened in the new commits
+    ...change("task-a", "open", "done", 1700300000),    // reclosed
+  ];
+  const baseState = k.foldStatusTransitionState(base.join("\n"), "nodes", isTerm);
+  const incr = k.statusTransitionsFromState(
+    k.foldStatusTransitionState(range.join("\n"), "nodes", isTerm, baseState));
+  const full = k.foldStatusTransitions([...base, ...range].join("\n"), "nodes", isTerm);
+  assert.deepEqual(incr, full);
+  assert.equal(incr["task-a"], new Date(1700300000 * 1000).toISOString()); // latest closure
+});
+
+test("foldStatusTransitionState: done→merged across the boundary keeps the original run start", () => {
+  const base = [...create("task-a", "open", 1700000000), ...change("task-a", "open", "done", 1700100000)];
+  const range = change("task-a", "done", "merged", 1700200000); // still terminal -> run unbroken
+  const baseState = k.foldStatusTransitionState(base.join("\n"), "nodes", isTerm);
+  const incr = k.statusTransitionsFromState(
+    k.foldStatusTransitionState(range.join("\n"), "nodes", isTerm, baseState));
+  assert.equal(incr["task-a"], new Date(1700100000 * 1000).toISOString()); // the done time, not merged
+});
+
+test("foldStatusTransitionState: an empty range leaves the seeded base untouched (and unmutated)", () => {
+  const base = [...create("task-a", "open", 1700000000), ...change("task-a", "open", "done", 1700100000)];
+  const baseState = k.foldStatusTransitionState(base.join("\n"), "nodes", isTerm);
+  const before = JSON.stringify(baseState);
+  const incr = k.foldStatusTransitionState("", "nodes", isTerm, baseState); // no new commits
+  assert.deepEqual(k.statusTransitionsFromState(incr), { "task-a": new Date(1700100000 * 1000).toISOString() });
+  assert.equal(JSON.stringify(baseState), before); // the cached base object is never mutated
+});
+
+test("statusTransitionsFromState: only nodes in a terminal run with a runStart appear", () => {
+  const st = {
+    "task-done": { status: "done", terminal: true, runStart: 1700000000000 },
+    "task-open": { status: "open", terminal: false, runStart: null },
+  };
+  assert.deepEqual(k.statusTransitionsFromState(st), { "task-done": new Date(1700000000000).toISOString() });
+});
+
 test("foldStatusTransitions: born terminal (created already done) -> created commit time", () => {
   const log = create("art-x", "done", 1700500000).join("\n");
   assert.equal(k.foldStatusTransitions(log, "nodes", isTerm)["art-x"], new Date(1700500000 * 1000).toISOString());
@@ -354,4 +398,114 @@ test("renderReport: produces a stable human block with the cohort table + covera
   assert.match(text, /created\s+completed/);
   assert.match(text, /throughput:/);
   assert.match(text, /completion source: 1 git status-transition/);
+});
+
+// ---------- integration: the HEAD + terminal-vocabulary keyed closed-at cache ----------
+// (task-spor-analytics-closed-at-cache) — mirrors the timestamps.json cache tests:
+// cold write, exact-HEAD reuse (poison-proof), fast-forward == full, fp invalidation.
+
+const NOW = Date.parse("2026-06-21T00:00:00Z");
+const closedPath = (home) => path.join(home, "cache", "analytics-closed.json");
+const readClosed = (home) => JSON.parse(fs.readFileSync(closedPath(home), "utf8"));
+const FP = resolution.terminalStatuses.join(",");
+
+// A graph with one task closed inside the 12-week window (W20, 2026-05-11).
+function closedGraph() {
+  const home = initGraph();
+  writeNode(home, "task-a", "task", "open");
+  commit(home, "2026-05-04T00:00:00Z", "open A");   // W19
+  writeNode(home, "task-a", "task", "done");
+  commit(home, "2026-05-11T00:00:00Z", "close A");  // W20 — the transition
+  return home;
+}
+
+test("analyze: a cold run writes the HEAD + fp keyed status-transition cache", () => {
+  const home = closedGraph();
+  const g = graphLib.loadGraph(path.join(home, "nodes"));
+  const r = analyticsLib.analyze(g, { now: NOW, weeks: 12 });
+  assert.equal(r.coverage.fromGitTransition, 1);
+
+  assert.ok(fs.existsSync(closedPath(home)));
+  const c = readClosed(home);
+  assert.equal(c.head, execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { encoding: "utf8" }).trim());
+  assert.equal(c.fp, FP);                       // the terminal-vocabulary fingerprint
+  assert.equal(c.state["task-a"].terminal, true); // the per-node fold STATE is cached, not the closed-at output
+  assert.ok(c.state["task-a"].runStart > 0);
+});
+
+test("analyze: an exact-HEAD reload reuses the cache verbatim (no git log -p)", () => {
+  const home = closedGraph();
+  analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 }); // seed
+  // Poison the cached run start to a date OUTSIDE the window; an exact-HEAD hit
+  // must reuse it (so the completion drops out of the window), proving no re-fold.
+  const c = readClosed(home);
+  c.state["task-a"].runStart = Date.parse("2020-01-01T00:00:00Z");
+  fs.writeFileSync(closedPath(home), JSON.stringify(c));
+
+  const r = analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 });
+  assert.equal(r.totals.completed, 0);          // it really used the poisoned cache
+  assert.equal(r.coverage.fromGitTransition, 0);
+});
+
+test("analyze: a terminal-vocabulary fingerprint change forces a full rebuild", () => {
+  const home = closedGraph();
+  analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 }); // seed
+  // Poison BOTH the fp (stale vocabulary) and the state. A reuse would surface the
+  // bogus runStart; a correct fp-driven rebuild ignores it and re-derives from git.
+  const c = readClosed(home);
+  c.fp = "stale-vocabulary";
+  c.state["task-a"].runStart = Date.parse("2020-01-01T00:00:00Z");
+  fs.writeFileSync(closedPath(home), JSON.stringify(c));
+
+  const r = analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 });
+  assert.equal(r.totals.completed, 1);          // rebuilt from git, not the poisoned cache
+  assert.equal(readClosed(home).fp, FP);        // cache re-keyed to the current vocabulary
+});
+
+test("analyze: a fast-forward incremental fold == a full rebuild (byte-identical report)", () => {
+  const home = closedGraph();
+  analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 }); // seed cache at OLD head
+  const oldHead = execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  // New commits after the cached head: a reopen→reclose of A (run reset) + a brand-new closed node.
+  writeNode(home, "task-a", "task", "open");
+  commit(home, "2026-05-18T00:00:00Z", "reopen A");   // W21
+  writeNode(home, "task-a", "task", "done");
+  commit(home, "2026-05-25T00:00:00Z", "reclose A");   // W22
+  writeNode(home, "task-b", "task", "done");
+  commit(home, "2026-06-01T00:00:00Z", "born-done B"); // W23
+
+  const ff = analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 }); // fast-forward
+  const cache = readClosed(home);
+  assert.notEqual(cache.head, oldHead);                 // re-keyed to the new head
+  assert.equal(cache.head, execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { encoding: "utf8" }).trim());
+
+  // Force a full rebuild from scratch at the SAME head and compare the whole report.
+  fs.rmSync(closedPath(home));
+  const full = analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 });
+  assert.deepEqual(ff, full);                            // incremental composition == full fold
+  assert.equal(ff.totals.completed, 2);                 // A (reclosed W22) + B (born-done W23)
+});
+
+test("analyze: a non-ancestor cached head (history rewrite) forces a full rebuild", () => {
+  const home = closedGraph();
+  analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 }); // seed
+  // A cached head that is NOT an ancestor of current, with a bogus state.
+  fs.writeFileSync(closedPath(home), JSON.stringify({
+    head: "0".repeat(40), fp: FP,
+    state: { "task-a": { status: "done", terminal: true, runStart: Date.parse("2020-01-01T00:00:00Z") } },
+  }));
+  const r = analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 });
+  assert.equal(r.totals.completed, 1);                   // rebuilt from git, not the bogus non-ancestor cache
+  assert.equal(readClosed(home).head, execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { encoding: "utf8" }).trim());
+});
+
+test("analyze: a non-git home writes no cache and degrades to the fallback (fail-open)", () => {
+  const home = tmpHome();
+  fs.mkdirSync(path.join(home, "nodes"));
+  writeNode(home, "task-a", "task", "done", "", "2026-06-10");
+  const g = graphLib.loadGraph(path.join(home, "nodes"));
+  const r = analyticsLib.analyze(g, { now: NOW, weeks: 12 });
+  assert.equal(r.totals.completed, 1);
+  assert.equal(r.coverage.fromFallback, 1);             // created_at/.date fallback, not a git transition
+  assert.ok(!fs.existsSync(closedPath(home)));          // no git -> no cache written
 });
