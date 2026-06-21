@@ -1331,7 +1331,10 @@ function runAsync(args, env, cwd) {
 
 // Stub server: answers GET /v1/nodes/{id} (so node resolution succeeds, any id),
 // and POST /v1/nodes/{id}/claim with a caller-chosen status/body. Records hits.
-function claimStub({ claimStatus = 200, claimBody = null } = {}) {
+// `nodeStatus`/`nodeResolution` shape the GET node to exercise the resolved-task
+// guard: a terminal `status:` line and/or the server's `resolution` enrichment
+// (the inbound resolves/answers edge it surfaces, API.md §3).
+function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nodeResolution = null } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = "";
@@ -1340,8 +1343,11 @@ function claimStub({ claimStatus = 200, claimBody = null } = {}) {
       hits.push({ method: req.method, url: req.url, body });
       if (req.method === "GET" && /^\/v1\/nodes\/[^/]+$/.test(req.url)) {
         const id = decodeURIComponent(req.url.split("/").pop());
+        const statusLine = nodeStatus ? `\nstatus: ${nodeStatus}` : "";
+        const node = { raw: `---\nid: ${id}\ntype: task\nrepo: demo${statusLine}\ntitle: Demo task ${id}\nsummary: A demo task.\ndate: 2026-06-01\n---\nbody\n` };
+        if (nodeResolution) node.resolution = nodeResolution;
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ raw: `---\nid: ${id}\ntype: task\nrepo: demo\ntitle: Demo task ${id}\nsummary: A demo task.\ndate: 2026-06-01\n---\nbody\n` }));
+        res.end(JSON.stringify(node));
         return;
       }
       if (req.method === "POST" && /^\/v1\/nodes\/[^/]+\/claim$/.test(req.url)) {
@@ -1747,6 +1753,139 @@ test("dispatch <node-id> --force (remote): still auto-claims and launches", { sk
       ["dispatch", "task-rotate", "--dir", repo, "--no-brief", "--force"],
       remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: inFlightAgent("task-rotate") })
     );
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(claimHit(hits), "--force still auto-claims the lease");
+    assert.ok(fs.existsSync(sentinel), "and launches");
+  } finally {
+    srv.close();
+  }
+});
+
+// --- already-resolved dispatch guard (issue-spor-dispatch-resolved-task-no-guard)
+// Dispatching an agent at a node that is already done — a terminal status, or
+// retired by a live inbound resolves/answers edge — would just redo finished work.
+// Mirrors the in-flight guard: node mode only, both modes, --force overrides. The
+// ranker drops resolved items from --from-queue, so for an auto-pick this is
+// defense-in-depth; for an explicit `--node <id>` it is the primary guard.
+
+// A scratch home with a DONE task (terminal status), an OPEN task retired by a
+// live inbound `resolves` edge from a decision (its status lags the structural
+// truth), and a genuinely-open control. Plus a repo to launch into.
+function resolvedFixture() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-res-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  fs.writeFileSync(
+    path.join(nodes, "task-done.md"),
+    `---\nid: task-done\ntype: task\nrepo: demo\nstatus: done\ntitle: An already-finished task\nsummary: A task that has already been completed and resolved long ago.\ndate: 2026-06-01\n---\nbody\n`
+  );
+  fs.writeFileSync(
+    path.join(nodes, "task-lagging.md"),
+    `---\nid: task-lagging\ntype: task\nrepo: demo\nstatus: open\ntitle: Looks open but a decision resolved it\nsummary: A task whose status still reads open though a live decision resolves it.\ndate: 2026-06-02\n---\nbody\n`
+  );
+  fs.writeFileSync(
+    path.join(nodes, "dec-resolver.md"),
+    `---\nid: dec-resolver\ntype: decision\nrepo: demo\nstatus: active\ntitle: The decision that resolves the lagging task\nsummary: Decided how to handle it; this resolves the lagging task above so it is done.\ndate: 2026-06-03\nedges:\n  - {type: resolves, to: task-lagging}\n---\nbody\n`
+  );
+  fs.writeFileSync(
+    path.join(nodes, "task-live.md"),
+    `---\nid: task-live\ntype: task\nrepo: demo\nstatus: open\ntitle: A genuinely open task\nsummary: A task with no resolver and a non-terminal status, fully dispatchable.\ndate: 2026-06-04\n---\nbody\n`
+  );
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-repo-"));
+  return { home, nodes, repo };
+}
+
+test("dispatch <node-id> (local): a DONE (terminal status) node refuses, no launch", { skip: isWin }, () => {
+  const { home, repo } = resolvedFixture();
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "task-done", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  assert.strictEqual(r.status, 1, r.stderr);
+  assert.match(r.stderr, /task-done is already resolved \(status: done\) — not dispatching/);
+  assert.match(r.stderr, /--force/); // the override is suggested
+  assert.ok(!fs.existsSync(sentinel), "no agent was launched at finished work");
+});
+
+test("dispatch <node-id> (local): a node retired by an inbound resolves edge refuses even with an open status", { skip: isWin }, () => {
+  const { home, repo } = resolvedFixture();
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "task-lagging", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  assert.strictEqual(r.status, 1, r.stderr);
+  assert.match(r.stderr, /task-lagging is already resolved \(resolves edge from dec-resolver/);
+  assert.ok(!fs.existsSync(sentinel), "the status lags but the resolver retires it — no launch");
+});
+
+test("dispatch <node-id> --force (local): launches despite a resolved target", { skip: isWin }, () => {
+  const { home, repo } = resolvedFixture();
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "task-done", "--dir", repo, "--no-brief", "--force"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(sentinel), "the agent launched with --force");
+});
+
+test("dispatch <node-id> (local): a genuinely-open node is NOT guarded — dispatch proceeds", { skip: isWin }, () => {
+  const { home, repo } = resolvedFixture();
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "task-live", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(sentinel), "an open task with no resolver dispatches normally");
+});
+
+test("dispatch <node-id> --print (local): previews the resolved warning; --force flips it; clean run prints none", () => {
+  const { home, repo } = resolvedFixture();
+  const r = run(["dispatch", "task-done", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /resolved: task-done is already resolved \(status: done\)/);
+  assert.match(r.stdout, /real dispatch would refuse/);
+  const forced = run(["dispatch", "task-done", "--dir", repo, "--no-brief", "--print", "--force"], { SPOR_HOME: home });
+  assert.match(forced.stdout, /--force set, dispatching anyway/);
+  const clean = run(["dispatch", "task-live", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home });
+  assert.doesNotMatch(clean.stdout, /resolved:/);
+});
+
+test("dispatch <node-id> (remote): a node the server reports resolved refuses BEFORE the claim — no claim POST, no launch", { skip: isWin }, async () => {
+  const { home, repo } = fixture();
+  // The server's get(node) surfaces the inbound resolver as `resolution` (API.md §3).
+  const { srv, hits, base } = await claimStub({ nodeResolution: { by: "dec-fix", edge: "resolves", title: "The fix that resolved it" } });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 1, r.stderr);
+    assert.match(r.stderr, /task-rotate is already resolved \(resolves edge from dec-fix/);
+    assert.ok(!claimHit(hits), "the resolved guard refuses before any claim is POSTed");
+    assert.ok(!fs.existsSync(sentinel), "no agent was launched at finished work");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch <node-id> (remote): a terminal-status node from the server refuses", { skip: isWin }, async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ nodeStatus: "done" });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 1, r.stderr);
+    assert.match(r.stderr, /task-rotate is already resolved \(status: done\)/);
+    assert.ok(!claimHit(hits), "no claim POST for a resolved node");
+    assert.ok(!fs.existsSync(sentinel), "no launch");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch <node-id> --force (remote): launches despite the server reporting it resolved", { skip: isWin }, async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ nodeStatus: "done" });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief", "--force"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
     assert.strictEqual(r.status, 0, r.stderr);
     assert.ok(claimHit(hits), "--force still auto-claims the lease");
     assert.ok(fs.existsSync(sentinel), "and launches");

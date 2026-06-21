@@ -31,6 +31,11 @@ const remote = require(path.join(ROOT, "lib", "remote.js"));
 const auth = require(path.join(ROOT, "lib", "auth.js"));
 const u = require(path.join(ROOT, "scripts", "engines", "util.js"));
 const sat = require(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
+// Resolution truth (lib/kernel/resolution.js): a node is "done" when it carries a
+// TERMINAL status OR a live inbound resolves/answers edge — the same partition the
+// queue ranker and read surfaces use. The dispatch guard reads it so it never
+// launches an agent at already-finished work (issue-spor-dispatch-resolved-task-no-guard).
+const { isTerminalStatus, resolutionOf } = require(path.join(ROOT, "lib", "kernel", "resolution.js"));
 // renderReport mirrors the analyze/renderReport façade for remote `spor
 // analytics`: the server returns the machine report, the client renders it with
 // the SAME renderer local mode uses, so output matches (task-spor-analytics-
@@ -4316,10 +4321,16 @@ function fmField(raw, key) {
 // Resolve a node id to { id, raw, repo, title } or null if it doesn't exist.
 async function resolveNode(cfg, id) {
   let raw = "";
+  // The server's get(node) hook attaches read-time enrichment as additive
+  // top-level keys (API.md §3): `resolution` is the live inbound resolves/answers
+  // edge (the resolver's id/summary/title), present only when the node is retired
+  // by one. Keep it so the resolved-task guard can refuse without a second fetch.
+  let resolution = null;
   if (cfg.mode() === "remote") {
     const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 6000 });
     if (!r.ok) return null;
     raw = (r.json && r.json.raw) || r.text || "";
+    resolution = (r.json && r.json.resolution) || null;
   } else {
     try {
       raw = fs.readFileSync(path.join(cfg.nodesDir(), `${id}.md`), "utf8");
@@ -4327,7 +4338,33 @@ async function resolveNode(cfg, id) {
       return null;
     }
   }
-  return { id, raw, repo: fmField(raw, "repo") || fmField(raw, "project"), title: fmField(raw, "title") || "" };
+  return { id, raw, repo: fmField(raw, "repo") || fmField(raw, "project"), title: fmField(raw, "title") || "", resolution };
+}
+
+// Is this node ALREADY RESOLVED — so dispatching an agent at it would just redo
+// finished work (issue-spor-dispatch-resolved-task-no-guard)? Two truths, matching
+// the resolution kernel: a TERMINAL status (done/resolved/superseded/…) or a live
+// inbound resolves/answers edge from an un-withdrawn resolver. Read off what
+// resolveNode already fetched — remote mode gets the server's `resolution`
+// enrichment plus the status line for free; local mode reads the status line and,
+// only when it's non-terminal, loads the graph once to check for an inbound
+// resolver. Returns a one-line reason when resolved, else null. Fail-open: any
+// read error yields null (never block a dispatch on an unreadable graph).
+function dispatchResolutionReason(cfg, node) {
+  const status = (fmField(node.raw, "status") || "").toLowerCase();
+  if (isTerminalStatus(status)) return `status: ${status}`;
+  const fromEdge = (r) => `${r.edge || "resolves"} edge from ${r.by}${r.title ? ` — ${r.title}` : ""}`;
+  if (node.resolution && node.resolution.by) return fromEdge(node.resolution);
+  if (cfg.mode() !== "remote") {
+    try {
+      const g = require(path.join(ROOT, "lib", "graph.js")).loadGraph(cfg.nodesDir());
+      const r = resolutionOf(g, node.id);
+      if (r && r.by) return fromEdge(r);
+    } catch {
+      /* fail-open — an unreadable graph never blocks a dispatch */
+    }
+  }
+  return null;
 }
 
 // Resolve the profile THIS dispatch would run UNDER and check whether this
@@ -4976,6 +5013,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   let brief = "";
   let instruction = "";
   let nodeTitle = "";
+  let resolvedReason = null; // set in node mode when the target is already resolved
 
   if (fromQueue) {
     const top = await topQueueItem(cfg, targetSlug);
@@ -5009,6 +5047,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     dispatchNodeRaw = node.raw || null;
     targetSlug = targetSlug || node.repo || null;
     nodeTitle = node.title || "";
+    resolvedReason = dispatchResolutionReason(cfg, node);
     if (!noBrief) brief = await compileBriefing(cfg, { nodeId, full, project: targetSlug });
     instruction = `Work on ${nodeId}${node.title ? ` — ${node.title}` : ""}. The compiled Spor briefing above is your standing context.${taskText ? ` ${taskText}` : ""}`;
     name = name || nodeId;
@@ -5257,6 +5296,16 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     } else if (cfg.mode() === "remote") {
       out(`agent:  (none configured — 'spor agent use agent-<machine>' or --as to attribute as agent-on-behalf-of; dispatching person-scoped)`);
     }
+    // Already-resolved guard preview (node mode, any mode): a real dispatch would
+    // refuse a target that is already done. Shown first — and only on a hit, so a
+    // clean node --print stays byte-identical to before — mirroring the real-run
+    // precedence below (the resolved guard is checked before the profile/in-flight ones).
+    if (resolvedReason) {
+      out(
+        `resolved: ${nodeId} is already resolved (${resolvedReason})` +
+          (force ? " — --force set, dispatching anyway" : " — real dispatch would refuse (--force overrides)")
+      );
+    }
     // Profile satisfiability preview (shown only when a profile resolves, so a
     // profile-free --print stays byte-identical). A real dispatch refuses when
     // UNSATISFIABLE, leaving the assignment intact.
@@ -5283,6 +5332,25 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     out(`run:    ${claudeBin} ${claudeArgs.map(shellQuote).join(" ")} <prompt>`);
     out(`\n--- prompt ---\n${prompt}`);
     return 0;
+  }
+
+  // Refuse an already-RESOLVED target before the lease/claim, repo registration,
+  // worktree, and agent launch — and before the profile host-match call below
+  // (issue-spor-dispatch-resolved-task-no-guard): dispatching an agent at a node
+  // that is already done — a terminal status, or retired by a live inbound
+  // resolves/answers edge — would just redo finished work and write another
+  // outcome onto a closed node. (The briefing compile above already ran, exactly
+  // as it does for the sibling in-flight guard — refusal is post-briefing,
+  // pre-launch.) Mirrors the in-flight same-machine guard (node mode, both modes);
+  // --force overrides, like that guard and the remote-only duplicate-claim guard.
+  // The ranker already drops resolved items from --from-queue (dec-spor-dispatch-
+  // duplicate-dedup-at-capture-source), so for an auto-pick this is defense-in-depth;
+  // for an explicit `--node <id>` it is the primary guard. Checked first among the
+  // real-run guards so a resolved node short-circuits the host-match call and launch.
+  if (resolvedReason && !force) {
+    err(`${nodeId} is already resolved (${resolvedReason}) — not dispatching.`);
+    err(`  re-run with --force to dispatch at it anyway, or pick another task with 'spor next'.`);
+    return 1;
   }
 
   // Refuse BEFORE any side effect if this machine can't satisfy the resolved
@@ -6770,6 +6838,9 @@ const COMMANDS = {
       "A node dispatch is also refused if an agent for that node is already in flight\n" +
       "on THIS machine (each agent is named after its node id) — catches the\n" +
       "same-person duplicate the lease's idempotent renew can't. --force overrides.\n\n" +
+      "And it is refused if the target is already resolved — a terminal status, or\n" +
+      "retired by an inbound resolves/answers edge — so an agent is never sent to redo\n" +
+      "finished work. --force overrides.\n\n" +
       "--worktree runs the agent in its own git worktree off the repo (branch = the\n" +
       "node id / sanitized task), so parallel dispatches never race the shared tree/\n" +
       "index. Make it a repo default with dispatch.worktree — in the TARGET repo's\n" +
@@ -6800,7 +6871,7 @@ const COMMANDS = {
       full: { type: "boolean", desc: "full briefing instead of the digest" },
       "no-brief": { type: "boolean", desc: "raw task prompt, no briefing block" },
       "no-claim": { type: "boolean", desc: "don't auto-claim the lease (remote node dispatch)" },
-      force: { type: "boolean", desc: "dispatch even if an agent for this node is already in flight here" },
+      force: { type: "boolean", desc: "dispatch even if the node is already resolved, or an agent for it is in flight here" },
       "from-queue": { type: "boolean", desc: "dispatch the top-ranked queue item not already in flight here" },
       backfill: { type: "boolean", desc: "onboard/repair this repo (runs /spor:backfill)" },
       worktree: { type: "boolean", desc: "run the agent in its own git worktree (overrides dispatch.worktree)" },
