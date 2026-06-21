@@ -2,7 +2,7 @@
 id: schema-person
 type: schema
 kind: node-schema
-schema_version: 2026.06.15.1
+schema_version: 2026.06.21.1
 title: Seed schema for person nodes
 summary: Node schema for the person type — a member of the org, the anchor for $viewer identity binding and Tier-2 question routing. Seed-pack default; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -34,6 +34,18 @@ require a quorum of approvals from persons holding a named role before a work
 node may reach a resolving/done state. Declarative data only — absent it, a
 person holds no roles and the field has no effect, so this register is purely
 additive (existing person nodes are unchanged).
+
+`github` (2026.06.21.1) is the person node's GitHub-handle register (flat inline
+scalar): `github: octocat`. It is the login→person key the Spor server's GitHub
+review reflection maps by: when a GitHub review or merge is reflected into the
+graph, the event's GitHub login is resolved to the person whose `github` matches
+it (case-insensitively), so an approval lands as a `reviewed-by` edge on the
+right person and the policy-layer quorum gate
+(dec-spor-definition-of-done-org-policy) can count it. `github_login` is accepted
+as an alias, and an operator-supplied login→email map is the fallback when no
+person declares the handle. Declarative data only — absent it, that person is
+simply unresolvable from a GitHub login and the field has no effect, so this
+register is purely additive (existing person nodes are unchanged).
 
 ```json
 {

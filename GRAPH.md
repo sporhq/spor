@@ -539,6 +539,7 @@ type: person
 title: Anthony Allen
 summary: Maintainer; stewards the schema registry and the hook engines.
 email: losthammer@gmail.com
+github: losthammer
 roles: [reviewer, maintainer]
 queue_mute: [some-noisy-project, task-noisy-job@2026-07-01]
 date: 2026-06-10
@@ -576,6 +577,15 @@ edges:
   definition-of-done quorum gate is the first such rule (see "The org-defined
   policy layer" below). Declarative data only; absent it, a person holds no
   roles and the field has no effect.
+- **`github`** (flat inline scalar, e.g. `github: octocat`) is the person's
+  GitHub handle — the login→person key the Spor server's GitHub review
+  reflection maps by. When a GitHub review or merge is reflected into the graph,
+  the event's GitHub login is matched (case-insensitively) to the person whose
+  `github` equals it, so the approval attaches to the right person's review
+  edges and counts toward the policy quorum gate; `github_login` is an accepted
+  alias, and an operator login→email map is the fallback. Declarative data only;
+  absent it, the person can't be resolved from a GitHub login and the field has
+  no effect.
 
 ### Onboarding a team member
 
