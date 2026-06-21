@@ -619,11 +619,16 @@ test("rankQueue: front counts the node itself only — no neighborhood spread", 
 });
 
 // ---- held-task front self-limit (task-spor-queue-front-loop-self-limit-on-held-tasks) ----
+// The held outcome is now a real work product reached by a non-reference edge —
+// `decided-in` (a choice made while doing the task). A bare relates-to/derived-from/
+// mentions REFERENCE no longer counts, and a front that is only a create + a lone
+// `priority:` bump no longer clears the held floor
+// (task-spor-queue-held-guard-residual-reference-and-priority-front).
 
 test("rankQueue (held self-limit): open task with front + a non-resolving outcome + no blocker damps front to 0 and suggests triage", () => {
   const g = tmpGraph(Object.fromEntries([
     node("task-held", "task", { status: "open" }),
-    node("art-held", "artifact", { edges: [["relates-to", "task-held"]] }), // non-resolving outcome
+    node("dec-held", "decision", { status: "active", edges: [["decided-in", "task-held"]] }), // non-resolving outcome of held work
     node("task-active", "task", { status: "open" }),                        // equal front, no outcome
   ])).load();
   const r = rankQueue(g, { now: NOW, front: { "task-held": 40, "task-active": 40 } });
@@ -640,24 +645,56 @@ test("rankQueue (held self-limit): open task with front + a non-resolving outcom
   assert.equal(r.items[0].id, "task-active", "the genuinely-worked sibling still floats on its front");
 });
 
-test("rankQueue (held self-limit): a non-resolving decision outcome flips the suggestion too (not only artifacts)", () => {
+// --- fix (a): a bare reference is NOT a held outcome (task-spor-queue-held-guard-
+// residual-reference-and-priority-front). The exact residual the 194b252 fix left:
+// a ready, never-worked task that some unrelated artifact/decision merely references
+// (relates-to/derived-from/mentions) must NOT held-flag, even with high churn front.
+for (const refEdge of ["relates-to", "derived-from", "mentions"]) {
+  test(`rankQueue (held self-limit): a bare '${refEdge}' reference does NOT count as a held outcome — fix (a)`, () => {
+    const g = tmpGraph(Object.fromEntries([
+      node("task-ref", "task", { status: "open" }),
+      // a non-resolving prior-art artifact that merely references the task
+      node("art-ref", "artifact", { edges: [[refEdge, "task-ref"]] }),
+    ])).load();
+    const it = rankQueue(g, { now: NOW, front: { "task-ref": 40 } }).items.find((i) => i.id === "task-ref");
+    assert.equal(it.suggest, "do", `a ${refEdge} reference must not held-flag ready, never-worked work`);
+    assert.ok(it.score >= 5, "front boost intact — not damped (the reference is not an outcome)");
+    assert.doesNotMatch(it.why, /close the loop/);
+  });
+}
+
+// --- fix (b): front floor — a lone create + a `priority:` bump is metadata, not
+// churn. Even a real (decided-in) outcome must not held-flag a task whose front sits
+// at or below the two-write floor; one write above it does flip.
+test("rankQueue (held self-limit): a real outcome with front at the floor (2) is NOT held — fix (b)", () => {
   const g = tmpGraph(Object.fromEntries([
-    node("task-d", "task", { status: "open" }),
-    node("dec-side", "decision", { status: "active", edges: [["relates-to", "task-d"]] }),
+    node("task-floor", "task", { status: "open", priority: "p2" }),
+    node("dec-floor", "decision", { status: "active", edges: [["decided-in", "task-floor"]] }),
   ])).load();
-  const it = rankQueue(g, { now: NOW, front: { "task-d": 40 } }).items.find((i) => i.id === "task-d");
-  assert.equal(it.suggest, "triage");
+  const it = rankQueue(g, { now: NOW, front: { "task-floor": 2 } }).items.find((i) => i.id === "task-floor");
+  assert.equal(it.signals.front, 2, "raw front rides the signal");
+  assert.equal(it.suggest, "do", "create + a lone priority bump (front 2) is not churn — not held");
+  assert.doesNotMatch(it.why, /close the loop/);
+});
+
+test("rankQueue (held self-limit): a real outcome with front one above the floor (3) IS held", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-churn", "task", { status: "open" }),
+    node("dec-churn", "decision", { status: "active", edges: [["decided-in", "task-churn"]] }),
+  ])).load();
+  const it = rankQueue(g, { now: NOW, front: { "task-churn": 3 } }).items.find((i) => i.id === "task-churn");
+  assert.equal(it.suggest, "triage", "front above the floor + a real outcome = held");
   assert.match(it.why, /outcome recorded but nothing resolves it/);
 });
 
 test("rankQueue (held self-limit): no front means no churn to damp — the outcome alone keeps suggest 'do'", () => {
   const g = tmpGraph(Object.fromEntries([
     node("task-quiet", "task", { status: "open" }),
-    node("art-quiet", "artifact", { edges: [["relates-to", "task-quiet"]] }),
+    node("dec-quiet", "decision", { status: "active", edges: [["decided-in", "task-quiet"]] }),
   ])).load();
   const it = rankQueue(g, { now: NOW }).items.find((i) => i.id === "task-quiet"); // no front injected
   assert.equal(it.signals.front, 0);
-  assert.equal(it.suggest, "do", "front>0 is required for the queue self-limit (the get() hook carries the no-front nudge)");
+  assert.equal(it.suggest, "do", "front above the floor is required for the queue self-limit (the get() hook carries the no-front nudge)");
 });
 
 test("rankQueue (held self-limit): a pending (non-resolving-status) resolver is a resolution in flight, not a held outcome", () => {
@@ -677,7 +714,7 @@ test("rankQueue (held self-limit): a pending (non-resolving-status) resolver is 
 test("rankQueue (held self-limit): an 'active' task keeps its boost — only open/status-less qualify", () => {
   const g = tmpGraph(Object.fromEntries([
     node("task-onit", "task", { status: "active" }),
-    node("art-onit", "artifact", { edges: [["relates-to", "task-onit"]] }),
+    node("dec-onit", "decision", { status: "active", edges: [["decided-in", "task-onit"]] }),
   ])).load();
   const it = rankQueue(g, { now: NOW, front: { "task-onit": 40 } }).items.find((i) => i.id === "task-onit");
   assert.equal(it.suggest, "do");
@@ -687,27 +724,27 @@ test("rankQueue (held self-limit): an 'active' task keeps its boost — only ope
 test("rankQueue (held self-limit): a superseded outcome records nothing — no triage flip", () => {
   const g = tmpGraph(Object.fromEntries([
     node("task-x", "task", { status: "open" }),
-    node("art-old", "artifact", { edges: [["relates-to", "task-x"]] }),
-    node("art-new", "artifact", { edges: [["supersedes", "art-old"]] }),
+    node("dec-old", "decision", { status: "active", edges: [["decided-in", "task-x"]] }),
+    node("art-new", "artifact", { edges: [["supersedes", "dec-old"]] }),
   ])).load();
   const it = rankQueue(g, { now: NOW, front: { "task-x": 40 } }).items.find((i) => i.id === "task-x");
   assert.equal(it.suggest, "do", "the only outcome is superseded -> not held");
   assert.ok(it.score >= 5);
 });
 
-test("rankQueue (held self-limit): an inbound resolver of ANOTHER node merely cross-referencing this task is not a held outcome (issue-spor-queue-held-guard-false-positive-referenced-outcome)", () => {
+test("rankQueue (held self-limit): an inbound resolver of ANOTHER node reached by a non-reference edge is not a held outcome (issue-spor-queue-held-guard-false-positive-referenced-outcome)", () => {
   const g = tmpGraph(Object.fromEntries([
     node("task-ready", "task", { status: "open" }),                  // ready, never-worked
-    node("issue-sibling", "issue", { status: "resolved" }),
-    // a sibling's resolution artifact: it RESOLVES issue-sibling and only
-    // cross-references task-ready (the exact shape of the live repro,
-    // art-res-...-500-missing-design-tokens -> drift-monitor).
-    node("art-res-sibling", "artifact", { edges: [["resolves", "issue-sibling"], ["relates-to", "task-ready"]] }),
+    node("issue-sibling", "issue", { status: "open" }),
+    // a finished work product of issue-sibling: it RESOLVES issue-sibling and is
+    // also decided-in task-ready (a non-reference edge, so it reaches the
+    // resolvesLiveNode guard rather than being dropped as a bare reference).
+    node("dec-res-sibling", "decision", { status: "active", edges: [["resolves", "issue-sibling"], ["decided-in", "task-ready"]] }),
   ])).load();
   const it = rankQueue(g, { now: NOW, front: { "task-ready": 40 } }).items.find((i) => i.id === "task-ready");
-  // The inbound artifact is a finished work product of issue-sibling, not a
-  // non-resolving outcome of task-ready, so the task is NOT held: front boost
-  // intact, suggest stays 'do' — it remains dispatchable via --from-queue.
+  // The inbound node resolves issue-sibling (a live node), so it is a finished
+  // work product of THAT node, not a non-resolving outcome of task-ready: the task
+  // is NOT held, front boost intact, dispatchable via --from-queue.
   assert.equal(it.suggest, "do", "a referenced resolver of OTHER work must not held-flag ready work");
   assert.ok(it.score >= 5, "front boost intact — not damped");
 });
@@ -717,7 +754,7 @@ test("rankQueue (held self-limit, steward view): a held-signature task with a li
     node("person-pat", "person", { edges: [["stewards", "task-gated"], ["stewards", "task-unblock"]] }),
     node("task-unblock", "task", { status: "open", edges: [["blocks", "task-gated"]] }),
     node("task-gated", "task", { status: "open" }),
-    node("art-gated", "artifact", { edges: [["relates-to", "task-gated"]] }),
+    node("dec-gated", "decision", { status: "active", edges: [["decided-in", "task-gated"]] }),
   ])).load();
   const gated = rankQueue(g, { now: NOW, assignee: "person-pat", front: { "task-gated": 40 } }).items.find((i) => i.id === "task-gated");
   // a live blocker disqualifies the held signature (the gate is already named):

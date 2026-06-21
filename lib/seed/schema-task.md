@@ -2,7 +2,7 @@
 id: schema-task
 type: schema
 kind: node-schema
-schema_version: 2026.06.20.1
+schema_version: 2026.06.21.1
 title: Seed schema for task nodes
 summary: Node schema for the task type — active or planned work. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -65,16 +65,27 @@ behavior only, backward-readable, no upgrade chain.
 `get()` (2026.06.19.2): the **held-task churn** note
 (task-spor-queue-front-loop-self-limit-on-held-tasks). When the same read finds
 NO live resolving edge but the task is still open and carries an inbound
-non-resolving outcome (an `artifact`/`decision` linked by any edge but
-`resolves`/`answers`) with no live blocker, it rides along `held` — a `⚠ stays
-queued — close the loop` note naming the four de-queue actions (resolve, gate
-with `blocked-by`, set `wake:`, or `abandon`). This is the read-time twin of the
-queue's `do → triage` flip and front damping (lib/kernel/queue.js) for a task
-held open on an external gate, and the inverse of the definition-of-done gate
-(`done` *requires* a resolving resolver; a *non*-resolving outcome announces the
-task stays live). A pending in-review resolver is excluded — it is a resolution
-in flight, not a held outcome. Pure, read-only, fail-soft; backward-readable, no
-upgrade chain.
+non-resolving outcome (an `artifact`/`decision` work product) with no live
+blocker, it rides along `held` — a `⚠ stays queued — close the loop` note naming
+the four de-queue actions (resolve, gate with `blocked-by`, set `wake:`, or
+`abandon`). This is the read-time twin of the queue's `do → triage` flip and
+front damping (lib/kernel/queue.js) for a task held open on an external gate, and
+the inverse of the definition-of-done gate (`done` *requires* a resolving
+resolver; a *non*-resolving outcome announces the task stays live). A pending
+in-review resolver is excluded — it is a resolution in flight, not a held
+outcome. Pure, read-only, fail-soft; backward-readable, no upgrade chain.
+
+`get()` (2026.06.21.1, task-spor-queue-held-guard-residual-reference-and-priority-
+front): the held-note outcome test narrows to keep step with the queue's
+`hasInboundOutcome` — a `relates-to`/`derived-from`/`mentions` inbound edge is a
+bare reference (a prior-art citation, an "informed by", a passing mention), NOT a
+work product produced while holding the task, so it no longer rides a `held` note.
+This is fix (a) of the residual the 194b252 referenced-resolver fix left: a ready,
+never-worked task that some unrelated artifact merely references no longer reads as
+held. The surviving outcome edge is `decided-in` (a choice reached while doing the
+task). The queue's complementary front-floor guard (fix b) has no twin here — the
+read hook carries no `front` signal — but the edge narrowing keeps get_node and the
+queue consistent. Pure, read-only, fail-soft; backward-readable, no upgrade chain.
 
 ```json
 {
@@ -190,15 +201,20 @@ export function transitions(current, proposed, view) {
 // (2026.06.19.2, task-spor-queue-front-loop-self-limit-on-held-tasks) The
 // held-task churn note. After the loop above (no live resolving edge retires
 // this task), if the node is still open and carries an inbound NON-resolving
-// outcome (an artifact/decision linked by any edge but resolves/answers) with no
-// live blocker, work was recorded but the loop never closed — the task stays
-// queued forever (dec-cc-queue-front-from-attribution's continuity loop has
-// nothing to resolve). Ride along `held` naming the four de-queue actions: the
-// read-time twin of the queue's do->triage flip (lib/kernel/queue.js), and the
-// inverse of the definition-of-done gate above (done REQUIRES a resolving
-// resolver; a non-resolving outcome announces the task stays live). A pending
-// (in-review) resolver is excluded — a resolves edge is a resolution in flight,
-// not a held outcome. The blocker suppressor is conservative (any inbound
+// outcome (an artifact/decision work product) with no live blocker, work was
+// recorded but the loop never closed — the task stays queued forever
+// (dec-cc-queue-front-from-attribution's continuity loop has nothing to resolve).
+// Ride along `held` naming the four de-queue actions: the read-time twin of the
+// queue's do->triage flip (lib/kernel/queue.js), and the inverse of the
+// definition-of-done gate above (done REQUIRES a resolving resolver; a
+// non-resolving outcome announces the task stays live). A pending (in-review)
+// resolver is excluded — a resolves edge is a resolution in flight, not a held
+// outcome. (2026.06.21.1, task-spor-queue-held-guard-residual-reference-and-
+// priority-front, fix a) The outcome test ALSO skips bare-reference edges
+// (relates-to/derived-from/mentions): a referenced artifact/decision is not a
+// work product of held work on this task, so it no longer held-flags ready,
+// never-worked tasks — keeping this hook in lockstep with the queue's
+// hasInboundOutcome narrowing. The blocker suppressor is conservative (any inbound
 // non-superseded `blocks` edge, since the hook is not handed the terminal
 // vocabulary): a named gate is a "do the unblocker first" story, not "close the
 // loop", and a stale gate edge is the gardener's inert-gate finding to retire.
@@ -241,6 +257,11 @@ export function get(node, ctx) {
       if (n2.dir !== "in" || n2.superseded) continue;
       if (n2.edge === "blocks") { blocked = true; continue; }
       if (n2.edge === "resolves" || n2.edge === "answers") continue;
+      // Bare-reference edges are not held outcomes (task-spor-queue-held-guard-
+      // residual-reference-and-priority-front, fix a): a citation or loose
+      // provenance, not a work product produced while holding the task. Keeps this
+      // hook in lockstep with the queue's hasInboundOutcome narrowing.
+      if (n2.edge === "relates-to" || n2.edge === "derived-from" || n2.edge === "mentions") continue;
       if (n2.type === "artifact" || n2.type === "decision") outcomes.push(n2.id);
     }
     if (outcomes.length && !blocked) {

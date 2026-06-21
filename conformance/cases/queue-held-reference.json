@@ -1,0 +1,5 @@
+{ "id": "queue-held-reference", "kind": "queue", "corpus": "queue-held-reference",
+  "input": { "now": "2026-06-21T00:00:00Z",
+             "front": { "task-repro": 2, "task-ref-churn": 40, "task-outcome-floor": 2 } },
+  "expected": "queue-held-reference.json",
+  "covers": "held-guard residual fix (task-spor-queue-held-guard-residual-reference-and-priority-front): a bare relates-to/derived-from reference is NOT a held outcome (fix a) so a referenced task ranks do even with churn-level front (task-ref-churn), and a REAL decided-in outcome whose front sits at the two-write floor (a create + a lone priority bump) is NOT held (fix b) so the live-repro shape (task-repro: relates-to reference + priority bump) and the floor case (task-outcome-floor) both rank do, never triage" }

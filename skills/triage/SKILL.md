@@ -121,8 +121,11 @@ fine.
 **Held tasks — `suggest: triage`.** The queue's *other* disposition flag, a
 sibling to `close`. It fires (the front-loop churn guard,
 `task-spor-queue-front-loop-self-limit-on-held-tasks`) when an OPEN task has
-recent write activity (`front`), no live blocker, AND an inbound **non-resolving
-outcome** — an artifact/decision recorded against it that resolved nothing. That
+recent write activity above a small floor (`front` — more than a lone create + a
+`priority:` bump), no live blocker, AND an inbound **non-resolving outcome** — an
+artifact/decision **work product** recorded against it (reached by a real outcome
+edge like `decided-in`, *not* a bare `relates-to`/`derived-from`/`mentions`
+reference) that resolved nothing. That
 is the structural mark of "work was done on this but nothing closed it": the loop
 that normally settles work ("do X → X earns a resolver → X drops off") fails to
 terminate, so rather than let it churn at the top the queue hands it to a human.
@@ -135,12 +138,15 @@ Decide from the node, not the flag. If none of the four exits honestly fit — t
 task is genuinely ready, unblocked, and never actually churned — the honest move
 is to **start it** (claim/dispatch, which puts it on a real resolver path) or let
 `front` decay (the writes age out of the 7-day window and it returns to `do`);
-don't fake a `wake:` or a resolver to silence it. One structural false positive
-— an inbound artifact that merely *resolves other work* and cross-references the
-task — was fixed in `issue-spor-queue-held-guard-false-positive-referenced-outcome`,
-so a bare reference no longer trips this; a genuine non-resolving outcome still
-does. The one thing triage must not do is leave the flag with no decision — it's
-a question addressed to you.
+don't fake a `wake:` or a resolver to silence it. Two structural false positives
+were fixed so this fires only on genuine churn: an inbound artifact that merely
+*resolves other work* and cross-references the task
+(`issue-spor-queue-held-guard-false-positive-referenced-outcome`), and a bare
+`relates-to`/`derived-from`/`mentions` reference paired with a lone priority-bump's
+front (`task-spor-queue-held-guard-residual-reference-and-priority-front`) — so a
+referenced prior-art artifact no longer trips this; a genuine non-resolving work
+product still does. The one thing triage must not do is leave the flag with no
+decision — it's a question addressed to you.
 
 ## 5. Latent dependencies → record missing `blocks` edges
 

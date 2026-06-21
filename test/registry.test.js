@@ -960,24 +960,35 @@ test("seed pack: the task get() hook rides along a held-task churn note (task-sp
     sb.call("get", [terminal ? { id: "task-x", type: "task", status: "done" } : open,
       { terminal, non_resolving_statuses: partition, neighbors }], SLACK);
 
-  // held: an inbound non-resolving outcome (artifact via relates-to), no blocker,
-  // no resolving edge -> the de-queue note rides along, naming the outcome.
-  const held = callGet([{ id: "art-1", edge: "relates-to", dir: "in", type: "artifact", superseded: false }]);
+  // held: an inbound non-resolving outcome (a decision via decided-in — a choice
+  // reached while doing the task), no blocker, no resolving edge -> the de-queue
+  // note rides along, naming the outcome.
+  const held = callGet([{ id: "dec-1", edge: "decided-in", dir: "in", type: "decision", superseded: false }]);
   assert.ok(held.held, "held ride-along present");
-  assert.deepEqual(held.held.outcomes, ["art-1"]);
+  assert.deepEqual(held.held.outcomes, ["dec-1"]);
   assert.match(held.held.note, /stays queued — close the loop/);
   assert.match(held.held.note, /blocked-by/);
   assert.match(held.held.note, /wake: YYYY-MM-DD/);
   assert.match(held.held.note, /abandoned/);
   assert.equal(held.resolution, undefined, "not resolved");
 
-  // a decision outcome qualifies too, and multiple outcomes are listed.
+  // multiple outcomes are listed (both reached by a non-reference outcome edge).
   const two = callGet([
-    { id: "art-1", edge: "during", dir: "in", type: "artifact", superseded: false },
-    { id: "dec-1", edge: "relates-to", dir: "in", type: "decision", superseded: false },
+    { id: "art-1", edge: "decided-in", dir: "in", type: "artifact", superseded: false },
+    { id: "dec-1", edge: "decided-in", dir: "in", type: "decision", superseded: false },
   ]);
   assert.deepEqual(two.held.outcomes, ["art-1", "dec-1"]);
   assert.match(two.held.note, /2 outcomes/);
+
+  // fix (a) (task-spor-queue-held-guard-residual-reference-and-priority-front): a
+  // bare relates-to/derived-from/mentions REFERENCE is not a work product of held
+  // work on this task, so it does NOT ride a held note — the read-time twin of the
+  // queue's hasInboundOutcome narrowing. (Keeps get_node from flagging ready,
+  // never-worked work that some unrelated artifact merely references.)
+  for (const refEdge of ["relates-to", "derived-from", "mentions"]) {
+    const ref = callGet([{ id: "art-ref", edge: refEdge, dir: "in", type: "artifact", superseded: false }]);
+    assert.equal(ref.held, undefined, `a ${refEdge} reference is not a held outcome`);
+  }
 
   // a LIVE resolving edge wins: resolution rides along, no held note.
   const resolved = callGet([{ id: "art-r", edge: "resolves", dir: "in", type: "artifact", status: "merged", date: "2026-06-19", summary: "shipped", superseded: false }]);
@@ -993,14 +1004,14 @@ test("seed pack: the task get() hook rides along a held-task churn note (task-sp
 
   // a live blocker suppresses the held note (the gate is already named).
   const blocked = callGet([
-    { id: "art-1", edge: "relates-to", dir: "in", type: "artifact", superseded: false },
+    { id: "dec-1", edge: "decided-in", dir: "in", type: "decision", superseded: false },
     { id: "task-gate", edge: "blocks", dir: "in", type: "task", status: "open", superseded: false },
   ]);
   assert.equal(blocked.held, undefined, "a live blocker suppresses the held note");
 
   // a superseded outcome records nothing; a terminal task is never held.
-  assert.equal(callGet([{ id: "art-old", edge: "relates-to", dir: "in", type: "artifact", superseded: true }]).held, undefined, "superseded outcome -> no held note");
-  assert.equal(callGet([{ id: "art-1", edge: "relates-to", dir: "in", type: "artifact", superseded: false }], true).held, undefined, "terminal task -> no held note");
+  assert.equal(callGet([{ id: "dec-old", edge: "decided-in", dir: "in", type: "decision", superseded: true }]).held, undefined, "superseded outcome -> no held note");
+  assert.equal(callGet([{ id: "dec-1", edge: "decided-in", dir: "in", type: "decision", superseded: false }], true).held, undefined, "terminal task -> no held note");
 });
 
 // issue-spor-schema-authoring-docs-gap: GRAPH.md ships a complete, copy-pasteable

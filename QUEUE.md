@@ -416,14 +416,20 @@ signals via its schema's `queueSignals()`:
   gate**, which has nothing to resolve, so each held pass re-raises front and
   re-surfaces it. The **held-task self-limit** breaks that loop
   (task-spor-queue-front-loop-self-limit-on-held-tasks): an OPEN task carrying
-  an inbound non-resolving outcome (an artifact/decision linked by any edge but
-  resolves/answers) with no live resolving edge and no live blocker has its
-  front damped to 0 in the score and its suggestion flipped `do → triage`
-  ("resolve, gate with blocked-by, set wake, or abandon") — the same posture
-  staleness takes (flip the suggestion, don't boost the score). `signals.front`
-  keeps the raw count so a `queue-policy` rank() can re-weight. The read-time
-  twin is the `schema-task` `get()` hook, which rides a `held` note along on
-  `get_node`.
+  an inbound non-resolving outcome (an artifact/decision **work product**) with
+  no live resolving edge and no live blocker has its front damped to 0 in the
+  score and its suggestion flipped `do → triage` ("resolve, gate with
+  blocked-by, set wake, or abandon") — the same posture staleness takes (flip
+  the suggestion, don't boost the score). Two guards keep that flip OFF ready,
+  never-started work (task-spor-queue-held-guard-residual-reference-and-priority-
+  front): the inbound outcome must be a real work product — a bare
+  `relates-to`/`derived-from`/`mentions` REFERENCE (a prior-art citation, an
+  "informed by") does not count (fix a), so the surviving outcome edge is
+  `decided-in`; and front must clear a small floor (a lone create + a `priority:`
+  bump is metadata, not churn — fix b). `signals.front` keeps the raw count so a
+  `queue-policy` rank() can re-weight. The read-time twin is the `schema-task`
+  `get()` hook, which rides a `held` note along on `get_node` (it shares the
+  reference-edge narrowing; it has no `front`, so the floor has no twin there).
 - **staleness** — anchors superseded or gone; high staleness suggests
   closing, not doing.
 - **cold_neighbors** — the count of the node's traversable neighbors whose
@@ -639,7 +645,11 @@ the structural truth:
    min(log₂(1+front), 5) + log₂(1+heat) + age/30 (capped) + neededBy urgency (0-5)`, with staleness ≥ 0.5 flipping the item's suggestion to
    "close" and the held-task self-limit flipping it to "triage" (front damped
    to 0) for an open task with a recorded non-resolving outcome but no resolver
-   and no blocker (task-spor-queue-front-loop-self-limit-on-held-tasks). The
+   and no blocker (task-spor-queue-front-loop-self-limit-on-held-tasks) — where
+   the outcome must be a real work product (not a bare relates-to/derived-from/
+   mentions reference) and the front must clear a two-write floor, so a referenced
+   artifact plus a lone priority bump can't flip ready work
+   (task-spor-queue-held-guard-residual-reference-and-priority-front). The
    `needed_by: YYYY-MM-DD` deadline term is the inverse of
    `wake`: where `wake` hides a node until its date, `needed_by` keeps it
    visible from creation and ramps its score linearly over a 30-day window to

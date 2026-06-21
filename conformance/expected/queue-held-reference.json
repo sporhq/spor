@@ -1,0 +1,62 @@
+{
+  "items": [
+    {
+      "id": "task-ref-churn",
+      "title": "Add a scheduled SHA-drift monitor",
+      "type": "task",
+      "status": "open",
+      "project": "infra",
+      "priority": null,
+      "score": 5.07,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 40,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 2
+      },
+      "suggest": "do",
+      "why": "your active front (40 writes in the last 7 days); 2d old"
+    },
+    {
+      "id": "task-outcome-floor",
+      "title": "Decommission the old hosting router",
+      "type": "task",
+      "status": "open",
+      "project": "infra",
+      "priority": "p2",
+      "score": 4.65,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 2,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 2
+      },
+      "suggest": "do",
+      "why": "priority p2 (source unrecorded); your active front (2 writes in the last 7 days); 2d old"
+    },
+    {
+      "id": "task-repro",
+      "title": "Relocate the canonical registry to the new router",
+      "type": "task",
+      "status": "open",
+      "project": "infra",
+      "priority": "p2",
+      "score": 4.65,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 2,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 2
+      },
+      "suggest": "do",
+      "why": "priority p2 (source unrecorded); your active front (2 writes in the last 7 days); 2d old"
+    }
+  ],
+  "count": 3
+}
