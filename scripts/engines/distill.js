@@ -328,16 +328,25 @@ async function distill(input) {
     let factNo = 0;
     for (const fact of facts) {
       factNo++;
-      // /v1/capture caps text at 4000 chars; truncate defensively. A per-fact
-      // idempotency key closes the same timeout-then-server-completes race the
-      // `spor add` path guards (issue-spor-add-cli-duplicate-on-timeout-drain): a
-      // fact that spools (below) on an aborted-but-landed POST re-ships the SAME
-      // key on drain, so the server dedupes instead of ingesting a second node.
+      // /v1/capture caps text at 4000 chars; truncate defensively. The per-fact
+      // idempotency key is a deterministic hash(session, fact) — the key the
+      // server contract prescribes for live distill POSTs (spor-server
+      // capture.js / rest.js POST /v1/capture). It closes the
+      // timeout-then-server-completes race the `spor add` path guards
+      // (issue-spor-add-cli-duplicate-on-timeout-drain): a fact that spools
+      // (below) on an aborted-but-landed POST re-ships the SAME key on drain, so
+      // the server dedupes instead of ingesting a second node. Hashing on
+      // (session, text) rather than a random UUID ALSO coalesces a re-distill of
+      // the SAME session across separate runs
+      // (task-spor-distiller-idempotency-deterministic-hash) — defense-in-depth
+      // behind the SPOR_DISTILLING recursion guard, the only thing preventing
+      // that re-run today.
+      const text = u.byteHead(fact, 3900);
       const body = JSON.stringify({
-        text: u.byteHead(fact, 3900),
+        text,
         context: { project: slug },
         source: "distill",
-        idempotency_key: crypto.randomUUID(),
+        idempotency_key: crypto.createHash("sha256").update(`${session}\n${text}`).digest("hex"),
       });
       const { http } = await u.curl(`${u.serverBase()}/v1/capture`, {
         method: "POST",

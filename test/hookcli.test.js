@@ -387,6 +387,60 @@ test('distill: non-claude transcript shapes fall back to generic .text extractio
   assert.match(rec.vars.CONVO, /gamma1/);
 });
 
+// task-spor-distiller-idempotency-deterministic-hash: the remote distiller
+// stamps a DETERMINISTIC hash(session, fact) idempotency key onto each
+// /v1/capture POST — the key the server contract prescribes — not a random
+// UUID. Same (session, text) => same key, so a re-distill of one session
+// across separate runs coalesces server-side instead of minting a duplicate,
+// while spool->drain (which replays the baked-in key) still dedupes as before.
+test('distill (remote): stamps a deterministic hash(session, fact) idempotency key', async () => {
+  const crypto = require('node:crypto');
+  const { root, home, cwd } = scratch();
+  fs.rmSync(path.join(home, 'nodes'), { recursive: true }); // pure remote
+  const transcript = path.join(root, 'transcript.jsonl');
+  fs.writeFileSync(transcript, [
+    JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: words(60, 'alpha') }] } }),
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: words(60, 'beta') }] } }),
+  ].join('\n') + '\n');
+  // the remote path parses ===FACT===...===END=== blocks (not the local
+  // ===NODE=== blocks), so the stub backend emits a single fact. The fact is
+  // deliberately >3900 bytes so the `text = u.byteHead(fact, 3900)` truncation
+  // is ACTIVE: the key must be hashed over the SAME truncated bytes that are
+  // sent (a key hashed over the untruncated fact would break spool->drain
+  // dedup), and the oracle below (sha256 of the *sent* text) catches any such
+  // divergence for free.
+  const factText = 'A durable fact the session produced. ' + words(700, 'detail');
+  const stub = path.join(root, 'stub-fact.sh');
+  const resp = path.join(root, 'fact-response.txt');
+  fs.writeFileSync(resp, `===FACT===\n${factText}\n===END===\n`);
+  fs.writeFileSync(stub, `#!/bin/sh\ncat > /dev/null\ncat "${resp}"\n`);
+  fs.chmodSync(stub, 0o755);
+  const { srv, hits, base } = await stubServer();
+  try {
+    const env = freshEnv(home);
+    env.SPOR_SERVER = base;
+    env.SPOR_TOKEN = 'spor_pat_test';
+    env.SPOR_DISTILL_CMD = stub;
+    await runAsync(
+      ['distill', '--host', 'claude-code'],
+      JSON.stringify({ cwd, session_id: 'sess-det', transcript_path: transcript, hook_event_name: 'SessionEnd' }),
+      env
+    );
+    const cap = hits.find((h) => h.url === '/v1/capture');
+    assert.ok(cap, 'the distiller POSTed the fact to /v1/capture');
+    const sent = JSON.parse(cap.body);
+    assert.strictEqual(Buffer.byteLength(sent.text), 3900,
+      'the body text is truncated to the 3900-byte cap (so the hash is over truncated bytes)');
+    const expected = crypto.createHash('sha256').update(`sess-det\n${sent.text}`).digest('hex');
+    assert.strictEqual(sent.idempotency_key, expected,
+      'idempotency_key is sha256(session + "\\n" + sent text) — deterministic, server-prescribed');
+    assert.match(sent.idempotency_key, /^[0-9a-f]{64}$/,
+      'a sha256 hex digest, not a random UUID');
+  } finally {
+    srv.close();
+  }
+});
+
 test('cursor session-start: payload mapped, output is flat {additional_context}', () => {
   const { home, cwd } = scratch();
   fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
