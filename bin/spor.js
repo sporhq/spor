@@ -1100,6 +1100,67 @@ async function runStatus(cfg, runId, wantJson) {
   return 0;
 }
 
+// --- spor share: mint a shareable read-only view link (REMOTE only) ----------
+// (task-spor-share-lens-cli-verb) The shell front-door for POST /v1/lens/{id}/
+// ticket (API.md §3): mint a signed, expiring, read-only render ticket for a
+// lens OR workspace node and print the shareable view link ready to paste. The
+// ticket replaced embedding the sharer's PAT in shared URLs
+// (dec-cc-lens-share-render-tickets): it records the authenticated caller as the
+// sharer, binds $viewer to that recorded identity (the render shows a "Viewing
+// as <sharer>" banner), and carries NO write scope — so a pasted link can never
+// leak a write-capable credential. Like the other render-side verbs (lens/run)
+// the ticket is minted and signed server-side, so this is a thin remote client;
+// local mode degrades with one clear line and no crash.
+//   spor share <lens-id> [--expires <Nd>]  -> POST /v1/lens/{id}/ticket {expires?}
+// --expires ("<N>d" or an ISO date; server default 7d, max 30d) rides the body
+// verbatim so the server stays the single validator of the window — a bad value
+// or an unbound (no-person) token comes back 422 with the why.
+async function cmdShare(cfg, { values, positionals }) {
+  if (cfg.mode() !== "remote") {
+    out("sharing needs a team graph — render tickets are minted server-side.");
+    out("  set SPOR_SERVER/SPOR_TOKEN (see 'spor join') to share a lens.");
+    return 0;
+  }
+  const id = positionals[0];
+  if (!id) {
+    err("usage: spor share <lens-id> [--expires <Nd>]");
+    return 1;
+  }
+  const body = values.expires != null ? { expires: values.expires } : {};
+  const r = await remote.post(cfg, `/v1/lens/${encodeURIComponent(id)}/ticket`, body, { timeoutMs: 8000 });
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (r.status === 404) {
+    err(`no lens or workspace '${id}'`);
+    return 1;
+  }
+  if (!r.ok) {
+    // A 422 carries the load-bearing why — a bad --expires window, or no_person
+    // (the token isn't bound to a person node, so there is no sharer to record).
+    // Surface it verbatim; add a hint for the no_person case.
+    const msg = r.json && r.json.error && r.json.error.message;
+    const code = r.json && r.json.error && r.json.error.code;
+    err(`share error ${r.status}${code ? ` (${code})` : ""}${msg ? `: ${msg}` : ""}`);
+    if (code === "no_person") err("  your token must be bound to a person node to mint a share ticket — check 'spor whoami'.");
+    return 1;
+  }
+  const j = r.json || {};
+  if (values.json) {
+    out(JSON.stringify(j, null, 2));
+    return 0;
+  }
+  out(`Shareable read-only link${j.exp ? ` (expires ${j.exp})` : ""}:`);
+  out(`  ${j.url || "(no url returned)"}`);
+  // The recipient renders the view AS the recorded sharer (the server shows a
+  // "Viewing as <sharer>" banner) — read-only, no sign-in, no write scope.
+  const who = j.sharer_person_id ? ` as ${j.sharer_person_id}` : "";
+  const what = j.lens_id ? ` ${j.lens_id}` : "";
+  out(`Recipients view${what}${who} — read-only, no sign-in, no write access.`);
+  return 0;
+}
+
 // compile / brief / validate are LOCAL-graph verbs: byte-identical passthrough
 // to lib/compile.js / lib/validate.js, which read $SPOR_HOME/nodes. In REMOTE
 // mode that dir is absent, so the old passthrough exited with a bare
@@ -6455,6 +6516,28 @@ const COMMANDS = {
       "spor run status run-release-pipeline-20260620",
     ],
     run: (cfg, p) => cmdRun(cfg, p),
+  },
+  share: {
+    group: "Graph", parse: "strict", args: "<lens-id> [--expires <Nd>]",
+    summary: "mint a shareable read-only view link (remote)",
+    help:
+      "Mint a signed, expiring, read-only render ticket for a lens or workspace node\n" +
+      "and print the shareable view link — ready to paste to a teammate. The shell\n" +
+      "front-door for POST /v1/lens/{id}/ticket.\n\n" +
+      "Sharing replaced embedding the sharer's PAT in the URL\n" +
+      "(dec-cc-lens-share-render-tickets): the ticket records YOU as the sharer, binds\n" +
+      "the viewer to that recorded identity (the render shows a \"Viewing as\" banner),\n" +
+      "and carries NO write scope — so a pasted link can never leak a write-capable\n" +
+      "credential. Remote only: tickets are minted and signed server-side; local mode\n" +
+      "degrades with one line and no crash.\n\n" +
+      "--expires is \"<N>d\" or an ISO date (server default 7d, max 30d). Your token\n" +
+      "must be bound to a person node (the recorded sharer), else the mint is refused.",
+    options: {
+      expires: { type: "string", value: "Nd", desc: "ticket lifetime: <N>d or an ISO date (default 7d, max 30d)" },
+      json: { type: "boolean", desc: "machine-readable JSON output (the raw {ticket, url, ...} envelope)" },
+    },
+    examples: ["spor share lens-roadmap", "spor share lens-roadmap --expires 14d", "spor share workspace-q3 --json"],
+    run: (cfg, p) => cmdShare(cfg, p),
   },
   query: {
     group: "Graph", parse: "raw", args: "[--type T] [--where k=v] [--edges]",
