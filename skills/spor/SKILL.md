@@ -114,6 +114,8 @@ spor claim <node-id>           # manually take the heartbeat-renewed lease on a 
 spor renew <node-id>           # heartbeat your live claim, bumping its expiry (POST .../renew)
 spor extend <node-id> <2h|45m> # stretch your live claim for a long idle gap, up to the org max (.../extend)
 spor release <node-id>         # hand a task back to the pool, retiring the assigned edge (POST .../release)
+spor admin gardener [--json]   # run a gardener sweep now (POST /v1/gardener) — files findings as queue
+                               #   items, resolves its own cleared ones; ops-facing (the `spor admin` surface)
 
 # dual-mode (local passthrough / remote dispatch to the server)
 spor compile --query "<text>"  # search → compiled neighborhood (--digest for compact)

@@ -563,7 +563,8 @@ non-queueable node edged to a superseded target — its own `supersedes`
 edges excluded) and **cold-work** (`in-progress` with no neighborhood
 activity over 14 days). Stale *tasks*, capture-pending nodes, and proposed
 schemas already self-surface in the queue, so no duplicate findings are
-filed for them. Trigger: `POST /v1/gardener` on demand, or
+filed for them. Trigger: `POST /v1/gardener` on demand (the `spor admin
+gardener` CLI verb is the shell front-door), or
 `SPOR_GARDENER_MS` (a server-side env var) for
 an in-process interval (off by default — the schedule is ops' choice). Deferred: "done but contradicted" (needs
 git-history analysis of resolving artifacts).

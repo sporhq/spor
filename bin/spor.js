@@ -3525,6 +3525,69 @@ async function cmdToken(cfg, args) {
   return 1;
 }
 
+// --- spor admin: the ops-facing operations surface ------------------------
+// A parent verb for ops-facing operations kept APART from everyday graph work
+// (the task's framing: the home for stewards-gated ops, alongside IDP management
+// and the like). Today it dispatches one sub-command — `gardener`, the on-demand
+// gardener sweep. REMOTE only: the server owns these operations; local mode has
+// no server-side sweep to trigger.
+async function cmdAdmin(cfg, args) {
+  const sub = args[0];
+  if (sub === "gardener") return cmdAdminGardener(cfg, args.slice(1));
+  if (sub) err(`spor admin: unknown sub-command '${sub}'.`);
+  err("usage: spor admin gardener [--json]");
+  return 1;
+}
+
+// spor admin gardener — run a gardener sweep now (POST /v1/gardener, QUEUE.md
+// §6). The server-side sweep files its observations as ordinary `type: finding`
+// queue items (dec-cc-gardener-files-findings) and resolves its OWN findings
+// whose condition has since cleared — it never mutates human-authored nodes. The
+// response is { checked, filed: [...ids], resolved: [...ids], skipped: [...ids],
+// generated_at }; `filed`/`resolved` are the actionable ids, `skipped` is mostly
+// idempotent re-detections (a "REJECTED" entry there is a gardener bug). REMOTE
+// only — the gardener runs on the server; a sweep can examine the whole graph, so
+// the request gets a generous timeout. The endpoint is authenticated but NOT
+// admin-gated server-side today (any valid team token can trigger it); the 403
+// handling below is forward-compat for a deployment that adds the stewards→root
+// gate — the task's stewards-gated intent, which is a coordinated server change.
+async function cmdAdminGardener(cfg, args) {
+  if (cfg.mode() !== "remote") {
+    err("admin gardener needs a team graph (remote mode) — the server runs the sweep.");
+    return 1;
+  }
+  const json = args.includes("--json");
+  const r = await remote.post(cfg, "/v1/gardener", {}, { timeoutMs: 120000 });
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (notAdminHint(r)) return 1;
+  if (!r.ok) {
+    err(`gardener sweep failed (${r.status}): ${(r.json && r.json.error && r.json.error.message) || r.text}`);
+    return 1;
+  }
+  if (json) {
+    out(JSON.stringify(r.json, null, 2));
+    return 0;
+  }
+  const j = r.json || {};
+  const filed = Array.isArray(j.filed) ? j.filed : [];
+  const resolved = Array.isArray(j.resolved) ? j.resolved : [];
+  const skipped = Array.isArray(j.skipped) ? j.skipped : [];
+  const checked = typeof j.checked === "number" ? j.checked : 0;
+  // skipped is mostly already-open findings (idempotent re-detection); only a
+  // "REJECTED" entry there is worth surfacing — it means the sweep dropped a
+  // finding its own validator rejected (a gardener bug), not a quiet no-op.
+  const rejected = skipped.filter((s) => typeof s === "string" && s.includes("REJECTED"));
+  out(`gardener swept ${checked} node${checked === 1 ? "" : "s"}: ${filed.length} filed, ${resolved.length} resolved, ${skipped.length} unchanged`);
+  for (const id of filed) out(`  filed     ${id}`);
+  for (const id of resolved) out(`  resolved  ${id}`);
+  if (!filed.length && !resolved.length) out("  no new findings filed or resolved this sweep");
+  for (const s of rejected) err(`  REJECTED (gardener bug): ${s}`);
+  return 0;
+}
+
 function safeSlug() {
   try {
     return u.projectSlug(process.cwd());
@@ -6071,6 +6134,24 @@ const COMMANDS = {
       "spiffe); local mode writes the node + owned-by edge to the graph home.",
     examples: ["spor agent create anthony-laptop", "spor agent use agent-anthony-laptop", "spor agent list"],
     run: (cfg, args) => cmdAgent(cfg, args),
+  },
+  admin: {
+    group: "Team admin (remote, admin token)", parse: "raw", args: "gardener [--json]",
+    summary: "ops-facing operations (on-demand gardener sweep)",
+    help:
+      "Ops-facing operations, kept apart from everyday graph work — the home for\n" +
+      "stewards-gated ops. Remote only: the server owns these.\n\n" +
+      "  spor admin gardener           run a gardener sweep now (POST /v1/gardener)\n" +
+      "      --json                    print the raw {checked, filed, resolved, skipped} envelope\n\n" +
+      "The sweep files its observations as `type: finding` queue items\n" +
+      "(dec-cc-gardener-files-findings) and resolves its own findings whose condition\n" +
+      "has cleared — it never mutates human-authored nodes. It can examine the whole\n" +
+      "graph, so an on-demand run may take a little while. The endpoint is\n" +
+      "authenticated but not admin-gated server-side today, so any valid team token\n" +
+      "can run it; a 403 (should a deployment add the gate) means admin privilege is\n" +
+      "required — check 'spor whoami' (is_admin).",
+    examples: ["spor admin gardener", "spor admin gardener --json"],
+    run: (cfg, args) => cmdAdmin(cfg, args),
   },
 
   // --- Graph ---
