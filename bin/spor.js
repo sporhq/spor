@@ -1303,6 +1303,17 @@ function changesLocal(cfg, args) {
 // omitted so it pipes straight into tar (`spor export --gzip | tar xz`); the
 // node count / size / graph head ride STDERR so they never pollute a piped
 // tarball.
+//
+// Two more server export modes ride pass-through flags
+// (task-spor-export-cli-verb-extensions), both REMOTE-ONLY — no local twin:
+//   --history wraps ?history=1, a `git bundle --all` of the graph repo with full
+//     commit provenance (`git clone <bundle> graph`), the customer data-exit path
+//     (issue-cc-v1-export-customer-exit-gap). The server returns the bundle before
+//     the gzip branch, so --gzip is a no-op there (a bundle is already packed).
+//   --auth wraps ?auth=1, the admin-gated (stewards-root) backup that ALSO bundles
+//     auth/*.json so a disaster restore reproduces the credential set, not just
+//     nodes/ (issue-cc-backup-restore-auth-state-loss). The 403 the server raises
+//     for a non-admin caller surfaces through the generic non-200 path below.
 function humanBytes(n) {
   if (n < 1024) return `${n} B`;
   const units = ["KB", "MB", "GB", "TB"];
@@ -1316,16 +1327,48 @@ function humanBytes(n) {
 }
 async function cmdExport(cfg, { values }) {
   const gzip = !!values.gzip;
+  const history = !!values.history;
+  const auth = !!values.auth;
   const outPath = values.out || null;
 
-  let buffer, head, count, skipped;
+  // --history and --auth are distinct, non-composable server modes: the history
+  // bundle is a `git bundle --all` of the repo, whose .gitignore excludes auth/,
+  // so it can never carry the credential files --auth bundles. Asking for both is
+  // a contradiction, not a richer export.
+  if (history && auth) {
+    err("export: --history and --auth are different export modes — pick one (the history bundle excludes auth/ by design; use --auth for a restore bundle).");
+    return 1;
+  }
+  // Both extra modes are remote-only — the git-bundle data-exit path and the
+  // admin-gated auth backup live only on the server. Local mode has just the
+  // nodes/ snapshot tarball (task-spor-export-cli-verb-extensions).
+  if ((history || auth) && cfg.mode() !== "remote") {
+    err(`export: --${history ? "history" : "auth"} is remote-only — set SPOR_SERVER for a team graph (local mode exports the nodes/ snapshot only).`);
+    return 1;
+  }
+  // The server returns the ?history=1 bundle before its gzip branch (a bundle is
+  // already a packfile), so ?gzip=1 is a no-op there — honor that rather than
+  // forwarding it and printing a misleading "(gzip)".
+  const gzipEffective = gzip && !history;
+  if (gzip && history) {
+    err("export: --gzip has no effect with --history (a git bundle is already packed); ignoring it.");
+  }
+
+  let buffer, head, count, skipped, authFiles;
   if (cfg.mode() === "remote") {
-    const r = await remote.download(cfg, `/v1/export${gzip ? "?gzip=1" : ""}`, { timeoutMs: 120000 });
+    const params = [];
+    if (auth) params.push("auth=1");
+    if (history) params.push("history=1");
+    if (gzipEffective) params.push("gzip=1");
+    const qs = params.length ? `?${params.join("&")}` : "";
+    const r = await remote.download(cfg, `/v1/export${qs}`, { timeoutMs: 120000 });
     if (r.transport) {
       err(`offline — could not reach server (${r.error})`);
       return 1;
     }
     if (!r.ok) {
+      // The admin gate (?auth=1, non-steward → 403) and the empty-repo guard
+      // (?history=1, no commits → 409) surface here as the server's own message.
       let msg = "";
       try {
         msg = JSON.parse(r.buffer.toString("utf8")).error.message;
@@ -1337,8 +1380,9 @@ async function cmdExport(cfg, { values }) {
     }
     buffer = r.buffer;
     head = r.headers["x-substrate-head"] || "";
-    count = r.headers["x-substrate-node-count"]; // may be undefined on an older server
+    count = r.headers["x-substrate-node-count"]; // absent on a history bundle / older server
     skipped = r.headers["x-substrate-skipped"];
+    authFiles = r.headers["x-substrate-auth-files"]; // present only on an ?auth=1 export
   } else {
     const nodesDir = cfg.nodesDir();
     if (!fs.existsSync(nodesDir)) {
@@ -1373,10 +1417,16 @@ async function cmdExport(cfg, { values }) {
   }
 
   // Human feedback on stderr (stdout is the data channel when piping).
-  const n = count != null ? `${count} node${count === "1" ? "" : "s"}` : "graph";
+  let label;
+  if (history) {
+    label = "git history bundle"; // a git bundle has no node count
+  } else {
+    const n = count != null ? `${count} node${count === "1" ? "" : "s"}` : "graph";
+    label = n + (authFiles ? ` + ${authFiles} auth file${authFiles === "1" ? "" : "s"}` : "");
+  }
   const dest = outPath || "stdout";
   err(
-    `exported ${n}${gzip ? " (gzip)" : ""} → ${dest} (${humanBytes(buffer.length)})` +
+    `exported ${label}${gzipEffective ? " (gzip)" : ""} → ${dest} (${humanBytes(buffer.length)})` +
       (head ? `  head ${head.slice(0, 12)}` : "")
   );
   if (skipped) err(`  ${skipped} entr${skipped === "1" ? "y" : "ies"} skipped (name too long for the tar field)`);
@@ -6111,8 +6161,8 @@ const COMMANDS = {
     run: (cfg, args) => cmdChanges(cfg, args),
   },
   export: {
-    group: "Graph", parse: "strict", args: "[--gzip] [--out <file>]",
-    summary: "the nodes/ tarball (local: build from graph home; remote: /v1/export)",
+    group: "Graph", parse: "strict", args: "[--gzip] [--history|--auth] [--out <file>]",
+    summary: "the nodes/ tarball, or the --history bundle / --auth restore backup (GET /v1/export)",
     help:
       "Stream the graph's nodes/ as a POSIX ustar tarball — the shell front-door for\n" +
       "GET /v1/export, for seeding a local read replica or bootstrapping a fresh graph\n" +
@@ -6123,20 +6173,34 @@ const COMMANDS = {
       "graph home's nodes/ and gzips via the zlib builtin. `tar x` reproduces nodes/\n" +
       "byte-for-byte in either mode.\n" +
       "\n" +
-      "The tarball is written to --out, or to stdout when omitted so it pipes straight\n" +
-      "into tar (`spor export --gzip | tar xz`); the node count / size / graph head\n" +
-      "ride stderr so they never pollute a piped tarball.\n" +
+      "Two more export modes are REMOTE-ONLY (no local twin) and mutually exclusive:\n" +
+      "  --history  a `git bundle --all` of the graph repo with full commit provenance —\n" +
+      "             the customer data-exit path. `git clone <bundle> graph` reproduces\n" +
+      "             the whole history. (--gzip is a no-op here; a bundle is already packed.)\n" +
+      "  --auth     admin-gated (stewards-root) backup that ALSO bundles auth/*.json so a\n" +
+      "             disaster restore reproduces the credential set, not just nodes/. A\n" +
+      "             non-admin caller gets a 403 from the server.\n" +
+      "\n" +
+      "The output is written to --out, or to stdout when omitted so it pipes straight\n" +
+      "into tar (`spor export --gzip | tar xz`); the node/auth count, size and graph\n" +
+      "head ride stderr so they never pollute a piped tarball.\n" +
       "\n" +
       "  --gzip          gzip-compress the tarball (server-side remote, zlib local)\n" +
+      "  --history       git bundle of the whole repo (remote-only; full provenance)\n" +
+      "  --auth          include auth/*.json for restore (remote-only; admin-gated)\n" +
       "  --out <file>    write to <file> instead of stdout",
     options: {
       gzip: { type: "boolean", desc: "gzip-compress the tarball" },
+      history: { type: "boolean", desc: "git bundle of the whole repo (remote-only)" },
+      auth: { type: "boolean", desc: "include auth/*.json for restore (remote-only, admin-gated)" },
       out: { type: "string", value: "file", desc: "write to <file> instead of stdout" },
     },
     examples: [
       "spor export --out graph-nodes.tar",
       "spor export --gzip --out graph-nodes.tar.gz",
       "spor export --gzip | tar xz",
+      "spor export --history --out graph-history.bundle",
+      "spor export --auth --gzip --out graph-restore.tar.gz",
     ],
     run: (cfg, p) => cmdExport(cfg, p),
   },

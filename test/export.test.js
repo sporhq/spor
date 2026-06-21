@@ -184,7 +184,7 @@ test("export (local) an unwritable --out fails soft with a clear line, no stack"
 
 // Returns a fixed body + scriptable headers/status; records the request path so
 // the ?gzip= passthrough is observable.
-function exportStub({ body = Buffer.from("TAR-BYTES"), headers = {}, status = 200 } = {}) {
+function exportStub({ body = Buffer.from("TAR-BYTES"), headers = {}, status = 200, errBody } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     hits.push({ method: req.method, url: req.url });
@@ -192,7 +192,7 @@ function exportStub({ body = Buffer.from("TAR-BYTES"), headers = {}, status = 20
     if (u.pathname === "/v1/export" && req.method === "GET") {
       if (status !== 200) {
         res.writeHead(status, { "content-type": "application/json" });
-        return res.end(JSON.stringify({ error: { code: "internal", message: "boom" } }));
+        return res.end(JSON.stringify(errBody || { error: { code: "internal", message: "boom" } }));
       }
       res.writeHead(200, { "content-type": "application/x-tar", ...headers });
       return res.end(body);
@@ -266,4 +266,121 @@ test("export (remote) a non-200 surfaces the server error message, exit 1", { sk
   } finally {
     srv.close();
   }
+});
+
+// --- remote mode: --history (git bundle data-exit) --------------------------
+// (task-spor-export-cli-verb-extensions)
+
+test("export (remote) --history forwards ?history=1 and reports a git bundle, no count", { skip: isWin }, async () => {
+  const body = Buffer.from("PACK\x00git-bundle-bytes");
+  const { srv, hits, base } = await exportStub({ body, headers: { "x-substrate-head": "deadbeefcafe0000" } });
+  try {
+    const out = path.join(ISO_HOME, "history.bundle");
+    const r = await runBin(["export", "--history", "--out", out], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(Buffer.compare(fs.readFileSync(out), body) === 0, "bundle body passed through verbatim");
+    assert.match(r.stderr, /exported git history bundle/);
+    assert.doesNotMatch(r.stderr, /\d+ nodes?\b/, "a bundle has no node count"); // not the substring 'node' — Node's own '(node:<pid>)' warnings would match that
+
+    assert.match(r.stderr, /head deadbeefcafe/);
+    assert.ok(hits.find((h) => h.url === "/v1/export?history=1"), "?history=1 forwarded");
+  } finally {
+    srv.close();
+  }
+});
+
+test("export (remote) --gzip with --history is ignored (no ?gzip=1, no '(gzip)'), with a warning", { skip: isWin }, async () => {
+  const { srv, hits, base } = await exportStub({ body: Buffer.from("BUNDLE"), headers: { "x-substrate-head": "abc123def456" } });
+  try {
+    const out = path.join(ISO_HOME, "history2.bundle");
+    const r = await runBin(["export", "--history", "--gzip", "--out", out], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stderr, /--gzip has no effect with --history/);
+    assert.doesNotMatch(r.stderr, /\(gzip\)/, "no misleading (gzip) on a bundle");
+    assert.ok(hits.find((h) => h.url === "/v1/export?history=1"), "history-only, gzip not forwarded");
+    assert.ok(!hits.find((h) => /gzip=1/.test(h.url)), "?gzip=1 NOT forwarded with --history");
+  } finally {
+    srv.close();
+  }
+});
+
+test("export (remote) --history with no commits surfaces the server's 409, exit 1", { skip: isWin }, async () => {
+  const { srv, base } = await exportStub({ status: 409, errBody: { error: { code: "conflict", message: "graph repo has no commits to bundle yet" } } });
+  try {
+    const r = await runBin(["export", "--history"], remoteEnv(base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /export error 409: graph repo has no commits to bundle yet/);
+    assert.doesNotMatch(r.stderr, /at Object|Error:/);
+  } finally {
+    srv.close();
+  }
+});
+
+// --- remote mode: --auth (admin-gated restore backup) -----------------------
+
+test("export (remote) --auth forwards ?auth=1 and reports the auth-file count", { skip: isWin }, async () => {
+  const body = Buffer.from("FULL-TARBALL-WITH-AUTH");
+  const { srv, hits, base } = await exportStub({ body, headers: { "x-substrate-node-count": "9", "x-substrate-auth-files": "3", "x-substrate-head": "0011223344556677" } });
+  try {
+    const out = path.join(ISO_HOME, "restore.tar");
+    const r = await runBin(["export", "--auth", "--out", out], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(Buffer.compare(fs.readFileSync(out), body) === 0);
+    assert.match(r.stderr, /exported 9 nodes \+ 3 auth files/);
+    assert.ok(hits.find((h) => h.url === "/v1/export?auth=1"), "?auth=1 forwarded");
+  } finally {
+    srv.close();
+  }
+});
+
+test("export (remote) --auth --gzip forwards ?auth=1&gzip=1 and reports (gzip)", { skip: isWin }, async () => {
+  const { srv, hits, base } = await exportStub({ body: Buffer.from("GZ"), headers: { "x-substrate-node-count": "1", "x-substrate-auth-files": "1" } });
+  try {
+    const out = path.join(ISO_HOME, "restore.tar.gz");
+    const r = await runBin(["export", "--auth", "--gzip", "--out", out], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stderr, /exported 1 node \+ 1 auth file \(gzip\)/);
+    assert.ok(hits.find((h) => h.url === "/v1/export?auth=1&gzip=1"), "?auth=1&gzip=1 forwarded");
+  } finally {
+    srv.close();
+  }
+});
+
+test("export (remote) --auth as a non-admin surfaces the server's 403, exit 1", { skip: isWin }, async () => {
+  const { srv, base } = await exportStub({ status: 403, errBody: { error: { code: "forbidden", message: "exporting auth state requires admin privilege: a stewards edge to the graph root" } } });
+  try {
+    const r = await runBin(["export", "--auth"], remoteEnv(base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /export error 403: exporting auth state requires admin privilege/);
+    assert.doesNotMatch(r.stderr, /at Object|Error:/);
+  } finally {
+    srv.close();
+  }
+});
+
+// --- guards: remote-only modes, mutual exclusion ----------------------------
+
+test("export (local) --history is rejected as remote-only, exit 1, no stack", () => {
+  const { dir } = fixtureGraph();
+  const r = run(["export", "--history"], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /--history is remote-only/);
+  assert.match(r.stderr, /SPOR_SERVER/);
+  assert.doesNotMatch(r.stderr, /at Object|Error:/);
+});
+
+test("export (local) --auth is rejected as remote-only, exit 1, no stack", () => {
+  const { dir } = fixtureGraph();
+  const r = run(["export", "--auth"], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /--auth is remote-only/);
+  assert.doesNotMatch(r.stderr, /at Object|Error:/);
+});
+
+test("export --history and --auth together is rejected, exit 1", () => {
+  const { dir } = fixtureGraph();
+  const r = run(["export", "--history", "--auth"], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /--history and --auth are different export modes/);
+  assert.doesNotMatch(r.stderr, /at Object|Error:/);
 });

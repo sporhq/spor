@@ -418,7 +418,7 @@ endpoint is the REST twin of a core call:
 | `POST /v1/gardener` | ops cron / on demand | run a gardener sweep now; findings filed as queue items → `{filed, resolved, ..., generated_at}` |
 | `GET /v1/lens/{id}/render?format=html\|text\|json` | browsers, teammates without a checkout | run a lens OR workspace node and render its view tree (html default, plain text, or the raw tree as json). Read-only — no action forms; writes stay with `/v1/nodes` and the MCP tools. Auth is the caller's bearer header OR a signed read-only **render ticket** for shared links (browser links can't carry an Authorization header): `?ticket=<blob>` is accepted once and exchanged via a 302 for an HttpOnly `spor_render_ticket` cookie (kept out of URLs, logs, and view-to-view hrefs). The ticket binds `$viewer` to the recorded sharer and the render shows a "Viewing as &lt;sharer&gt;" banner. The former `?token=<PAT>` sharing path is **removed** — a shared link can never carry a write-capable credential |
 | `POST /v1/lens/{id}/ticket` `{expires?}` | sharing a view | mint a signed, expiring, read-only render ticket for the lens/workspace, recording the authenticated caller as the sharer → `{ticket, url, lens_id, sharer_person_id, exp}`. `expires` is `<N>d` or an ISO date (default `7d`, max `30d`); the caller must be bound to a person node (else `422 no_person`). The ticket carries no write scope and is honored only on the render route |
-| `GET /v1/export` | bootstrap/offline; `spor export` | ustar tarball of `nodes/` for seeding a local read replica (`?gzip=1` compresses); see §5 for the response headers. `curl … \| tar x` reproduces `nodes/` byte-for-byte. The `spor export [--gzip] [--out <file>]` CLI verb is the shell front-door (remote downloads this; local mode builds the same tarball from the graph home) |
+| `GET /v1/export` | bootstrap/offline; `spor export` | ustar tarball of `nodes/` for seeding a local read replica (`?gzip=1` compresses); see §5 for the response headers. `curl … \| tar x` reproduces `nodes/` byte-for-byte. `?history=1` instead streams a `git bundle --all` of the repo (`application/x-git-bundle`, full commit provenance, the customer data-exit path — `git clone <bundle> graph`); `?auth=1` ALSO bundles `auth/*.json` so a disaster restore reproduces the credential set (admin-gated: stewards-root → `403` otherwise). The `spor export [--gzip] [--history\|--auth] [--out <file>]` CLI verb is the shell front-door (remote downloads this; `--gzip`/`--out` also build the same `nodes/` tarball locally, while `--history`/`--auth` are remote-only) |
 | `GET /v1/admin/tokens` | offboarding / audit | list PATs → `{tokens: [{hash_prefix, person, name, email, created, expires, expired}], count}` — never plaintext, never full hashes. Admin-only (§4) |
 | `POST /v1/admin/tokens` `{person, expires?}` | onboarding | mint a PAT bound to an existing person node (`expires` is `<N>d` or an ISO date) → 201 `{token, hash_prefix, person, name, email, expires}`; the plaintext `token` is returned **once**. Admin-only |
 | `DELETE /v1/admin/tokens/{hash-prefix}` | offboarding / rotation | revoke the single PAT matching the hash prefix (≥8 hex chars; an ambiguous prefix is a 409) → `{revoked, hash_prefix}`. Admin-only |
@@ -575,9 +575,12 @@ retried with backoff.
 
 `GET /v1/export` response headers: `x-substrate-head` carries the graph
 commit, `x-substrate-node-count` the entry count (plus
-`x-substrate-skipped` when any entry was omitted). These header names are a
-wire contract and were deliberately **not** renamed in the Spor rename —
-clients should keep reading the `x-substrate-*` spellings.
+`x-substrate-skipped` when any entry was omitted, and `x-substrate-auth-files`
+on an `?auth=1` export — the count of `auth/*.json` files bundled). A
+`?history=1` bundle carries only `x-substrate-head` (a git bundle has no node
+count). These header names are a wire contract and were deliberately **not**
+renamed in the Spor rename — clients should keep reading the `x-substrate-*`
+spellings.
 
 ## 6. Client configuration
 
