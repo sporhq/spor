@@ -4196,7 +4196,16 @@ function cmdCapabilities(cfg, args) {
     return 0;
   };
 
-  if (sub === "list" || sub === "show") return printList();
+  // `show <agent-id>` reads a REMOTE agent's published fleet capabilities (GET
+  // /v1/agents/{id}/capabilities) — the read twin of `publish`
+  // (task-spor-capabilities-read-agent-cli-verb). With no agent id, `show`/`list`
+  // print THIS box's LOCAL effective caps, unchanged (byte-identical). `me`
+  // resolves to this machine's configured dispatch.agent.
+  if (sub === "list" || sub === "show") {
+    const target = sub === "show" && rest[1] && !rest[1].startsWith("-") ? rest[1] : null;
+    if (target) return cmdCapabilitiesShow(cfg, { agentId: target, json });
+    return printList();
+  }
 
   // publish — PUSH this box's effective capabilities to the team server so the
   // remote fleet scheduler (task-spor-remote-fleet-scheduler) can host-match an
@@ -4299,7 +4308,7 @@ function cmdCapabilities(cfg, args) {
   }
 
   err(
-    "usage: spor capabilities [list [--json]] | probe | publish | set <axis> <v...> | add <axis> <v...> | rm <axis> <v...>\n" +
+    "usage: spor capabilities [list [--json]] | show <agent-id> [--json] | probe | publish | set <axis> <v...> | add <axis> <v...> | rm <axis> <v...>\n" +
       "       spor capabilities hosts <profile-id> [--owner X] [--max-age D] [--json]\n" +
       "       spor capabilities allow-mcp <name...> | deny <profile-id...> | undeny <profile-id...> | clear\n" +
       `       axes: ${AXES.join(", ")}`
@@ -4384,6 +4393,102 @@ async function cmdCapabilitiesPublish(cfg, { json }) {
   out(`  plugins:       ${(c.plugins || []).join(", ") || "(none)"}`);
   if ((c.deny || []).length) out(`  deny:          ${c.deny.join(", ")}`);
   out(r.json && r.json.changed === false ? "  (caps unchanged — refreshed last-published time)" : "  (caps updated)");
+  return 0;
+}
+
+// fleetAgentCapabilities — the client READER of one agent's published fleet
+// capabilities (GET /v1/agents/{id}/capabilities, art-spor-remote-fleet-
+// scheduler-shipped; task-spor-capabilities-read-agent-cli-verb). The read twin
+// of `spor capabilities publish` (which POSTs the same endpoint). Returns the
+// parsed { agent, capabilities, published_at, last_seen, published_by, session }
+// on 200, or a FAIL-SOFT shape that never throws — { error } (transport / other
+// non-2xx), { absent:true } (404 — unknown agent, nothing published, or no
+// scheduler surface deployed), or { forbidden:true, message } (403 — readable
+// only by the owner, the agent itself, or an admin; API.md §3). The forbidden
+// shape stays DISTINCT from { error } so a denial reports as authorization, not a
+// transport outage (mirroring fleetHostsForProfile, issue-spor-capabilities-
+// hosts-403-misreported).
+async function fleetAgentCapabilities(cfg, agentId) {
+  const r = await remote.get(cfg, `/v1/agents/${encodeURIComponent(agentId)}/capabilities`, { timeoutMs: 6000 });
+  if (r.transport) return { error: r.error };
+  if (r.status === 404) return { absent: true };
+  if (r.status === 403) {
+    const msg = r.json && r.json.error && r.json.error.message;
+    return { forbidden: true, message: msg || null };
+  }
+  if (!r.ok) {
+    const code = r.json && r.json.error && r.json.error.code;
+    const msg = r.json && r.json.error && r.json.error.message;
+    return { error: `HTTP ${r.status}${code ? ` (${code})` : ""}${msg ? ` — ${msg}` : ""}` };
+  }
+  const j = r.json || {};
+  return {
+    agent: j.agent || agentId,
+    capabilities: j.capabilities || {},
+    published_at: j.published_at || null,
+    last_seen: j.last_seen || null,
+    published_by: j.published_by || null,
+    session: j.session || null,
+  };
+}
+
+// cmdCapabilitiesShow — `spor capabilities show <agent-id>`, the explicit READER
+// over the fleet scheduler: what a SPECIFIC box advertised, without falling back
+// to raw REST (task-spor-capabilities-read-agent-cli-verb). The read twin of
+// `publish` (write) and the per-agent companion to `hosts` (profile→boxes).
+// Remote-only; fail-soft. `me` resolves to this machine's configured
+// dispatch.agent (the `--owner me` convention), letting you verify what the fleet
+// actually stored for THIS box vs what `spor capabilities` computes locally.
+async function cmdCapabilitiesShow(cfg, { agentId, json }) {
+  if (!remote.isRemote(cfg)) {
+    err(
+      "spor capabilities show <agent-id> is remote-only — set a team server (SPOR_SERVER) first.\n" +
+        "  In local mode there is no fleet; `spor capabilities` (no agent) shows THIS box's effective caps."
+    );
+    return 1;
+  }
+  let agent = agentId;
+  if (agent === "me") {
+    agent = dispatchAgentId(cfg);
+    if (!agent) {
+      err(
+        "no dispatch agent configured for this machine — run `spor agent use <agent-id>` first,\n" +
+          "  or pass an explicit agent id: spor capabilities show <agent-id>."
+      );
+      return 1;
+    }
+  }
+  const res = await fleetAgentCapabilities(cfg, agent);
+  if (res.error) {
+    err(`could not reach the fleet scheduler: ${res.error}`);
+    return 1;
+  }
+  if (res.forbidden) {
+    err(
+      `not authorized to read ${agent}'s published capabilities — readable by the owner, the agent itself, or an admin.` +
+        (res.message ? `\n  (server: ${res.message})` : "")
+    );
+    return 1;
+  }
+  if (res.absent) {
+    err(`no capabilities published for '${agent}' (no such agent, nothing published yet, or no fleet scheduler surface deployed).`);
+    return 1;
+  }
+  if (json) {
+    out(JSON.stringify(res, null, 2));
+    return 0;
+  }
+  const c = res.capabilities || {};
+  out(`${res.agent} — published capabilities (fleet: ${remote.base(cfg)})`);
+  out(`  harnesses:     ${(c.harnesses || []).join(", ") || "(none)"}`);
+  out(`  reachable_mcp: ${(c.reachable_mcp || []).join(", ") || "(none)"}`);
+  out(`  skills:        ${(c.skills || []).length}`);
+  out(`  plugins:       ${(c.plugins || []).join(", ") || "(none)"}`);
+  if ((c.deny || []).length) out(`  deny:          ${c.deny.join(", ")}`);
+  if (res.published_at) out(`  published_at:  ${res.published_at} (caps last changed)`);
+  if (res.last_seen) out(`  last_seen:     ${res.last_seen} (last contact)`);
+  if (res.published_by) out(`  published_by:  ${res.published_by}`);
+  if (res.session) out(`  session:       ${res.session}`);
   return 0;
 }
 
@@ -5042,7 +5147,7 @@ const COMMANDS = {
   },
   capabilities: {
     group: "Dispatch (Claude Code background agents)", parse: "raw", aliases: ["caps", "profiles"],
-    args: "[list [--json] | probe | publish | hosts <profile-id> | set <axis> <v...> | allow-mcp <m...> | deny <profile-id...> | clear]",
+    args: "[list [--json] | show <agent-id> | probe | publish | hosts <profile-id> | set <axis> <v...> | allow-mcp <m...> | deny <profile-id...> | clear]",
     summary: "this machine's dispatch capability map (profile satisfiability)",
     help:
       "Show or edit the per-machine capability map dispatch matches against an\n" +
@@ -5050,7 +5155,8 @@ const COMMANDS = {
       "and skills self-probe each session; declare what a probe can't decide (reachable\n" +
       "MCP, deny-flags). Declared augments probed; deny overrides both. Stored in the\n" +
       "machine-local config.json, never a committed .spor.json.\n\n" +
-      "  spor capabilities                  show effective capabilities\n" +
+      "  spor capabilities                  show THIS box's effective capabilities\n" +
+      "  spor capabilities show <agent>     read an agent's PUBLISHED fleet caps (remote)\n" +
       "  spor capabilities probe            re-probe harnesses/plugins/skills now\n" +
       "  spor capabilities publish          push them to the team fleet scheduler (remote)\n" +
       "  spor capabilities hosts <profile>  which fleet boxes satisfy a profile (remote)\n" +
@@ -5065,6 +5171,11 @@ const COMMANDS = {
       "machines. Run `spor agent use <agent-id>` once to set this box's agent first.\n" +
       "Once an agent is set, session-start auto-publishes each session (remote mode),\n" +
       "so manual publish is rarely needed; SPOR_CAPABILITIES_PUBLISH=0 disables it.\n\n" +
+      "show <agent-id> is publish's read twin: it reads back what a SPECIFIC box\n" +
+      "advertised (caps + published_at/last_seen/published_by) without raw REST.\n" +
+      "Readable by the agent's owner, the agent itself, or an admin. Pass `me` to read\n" +
+      "this box's own published record (its dispatch.agent) — to compare what the fleet\n" +
+      "stored against what `spor capabilities` computes locally.\n\n" +
       "hosts is the read side of that scheduler: it host-matches a profile against the\n" +
       "fleet and lists the boxes that can run it (re-route targets) and those that\n" +
       "can't, with reasons. `spor dispatch` also prints these automatically when THIS\n" +
@@ -5072,7 +5183,7 @@ const COMMANDS = {
       "none can and the owner must be escalated (FORK B: never a substitute).\n" +
       "Scope with --owner me|person-X; demote stale publishes with --max-age 30m|12h|7d.\n\n" +
       `  axes: ${sat.CAP_AXES.join(", ")}`,
-    examples: ["spor capabilities", "spor capabilities allow-mcp spor", "spor capabilities publish", "spor capabilities hosts profile-docs-writer"],
+    examples: ["spor capabilities", "spor capabilities allow-mcp spor", "spor capabilities publish", "spor capabilities show agent-anthony-laptop", "spor capabilities hosts profile-docs-writer"],
     run: (cfg, args) => cmdCapabilities(cfg, args),
   },
 
