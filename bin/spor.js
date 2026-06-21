@@ -787,6 +787,143 @@ async function cmdLens(cfg, args) {
   return 0;
 }
 
+// --- spor run: start a workflow run / inspect a run (REMOTE only) -----------
+// (task-spor-workflow-run-cli-verbs) Workflow execution lives entirely server-
+// side in the engine half (the run reducer in lib-engine); the client never
+// runs a workflow locally. So this verb is a thin remote client over two routes
+// (API.md §3), the shell twin of the run_workflow MCP tool:
+//   spor run <workflow-id> [--inputs <json>]  -> POST /v1/workflows/{id}/run
+//   spor run status <run-id>                  -> GET  /v1/runs/{id}
+// Like the other remote-only verbs (lens/whoami/invite), local mode degrades
+// with one clear line and no crash — there is no local run engine to fall back
+// to. `status` is the reserved sub-verb; a workflow id is a `wf-…` slug, so it
+// never collides with it.
+async function cmdRun(cfg, { values, positionals }) {
+  if (cfg.mode() !== "remote") {
+    out("workflow runs need a team graph — the workflow engine runs server-side.");
+    out("  set SPOR_SERVER/SPOR_TOKEN (see 'spor join') to start or inspect runs.");
+    return 0;
+  }
+  const sub = positionals[0];
+  if (!sub) {
+    err("usage: spor run <workflow-id> [--inputs <json>]");
+    err("       spor run status <run-id>");
+    return 1;
+  }
+  if (sub === "status") {
+    const runId = positionals[1];
+    if (!runId) {
+      err("usage: spor run status <run-id>");
+      return 1;
+    }
+    return runStatus(cfg, runId, !!values.json);
+  }
+  return runStart(cfg, sub, values);
+}
+
+// Render a run's per-step states to stdout. Handles BOTH shapes the server
+// returns: the compact run-start summary (`state.steps[id]` is a status STRING,
+// runStateSummary) and the full GET reducer_state (`state.steps[id]` is an
+// object carrying `.status`). A null/absent state prints nothing.
+function renderRunState(state, indent = "  ") {
+  if (!state || typeof state !== "object") return;
+  if (state.status) out(`${indent}state: ${state.status}${state.halt_reason ? ` (halt: ${state.halt_reason})` : ""}`);
+  const steps = state.steps || {};
+  const ids = Object.keys(steps);
+  if (!ids.length) return;
+  out(`${indent}steps:`);
+  for (const id of ids) {
+    const s = steps[id];
+    const status = typeof s === "string" ? s : (s && s.status) || "?";
+    out(`${indent}  ${id}: ${status}`);
+  }
+}
+
+// `spor run <workflow-id> [--inputs <json>]` -> POST /v1/workflows/{id}/run.
+// --inputs is a JSON OBJECT (the ${inputs.x} interpolation values); a non-object
+// or unparseable value is rejected client-side before any request. The server
+// only STARTS the run (creates the workflow-run node + init reducer); workers
+// then claim ready steps over the claim API — this never executes effects.
+async function runStart(cfg, workflowId, values) {
+  let inputs;
+  if (values.inputs != null) {
+    try {
+      inputs = JSON.parse(values.inputs);
+    } catch (e) {
+      err(`--inputs is not valid JSON: ${e.message}`);
+      return 1;
+    }
+    if (inputs == null || typeof inputs !== "object" || Array.isArray(inputs)) {
+      err("--inputs must be a JSON object, e.g. --inputs '{\"ref\":\"v1.2.0\"}'");
+      return 1;
+    }
+  }
+  const body = inputs ? { inputs } : {};
+  const r = await remote.post(cfg, `/v1/workflows/${encodeURIComponent(workflowId)}/run`, body, { timeoutMs: 15000 });
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (r.status === 404) {
+    err(`no such workflow: ${workflowId}`);
+    return 1;
+  }
+  if (!r.ok) {
+    // A 409 (not active / concurrency cap) and a 422 (not a workflow / bad
+    // payload) carry the load-bearing why in the message — surface it verbatim.
+    const msg = r.json && r.json.error && r.json.error.message;
+    const code = r.json && r.json.error && r.json.error.code;
+    err(`run error ${r.status}${code ? ` (${code})` : ""}${msg ? `: ${msg}` : ""}`);
+    return 1;
+  }
+  const j = r.json || {};
+  if (values.json) {
+    out(JSON.stringify(j, null, 2));
+    return 0;
+  }
+  out(`run started: ${j.run_id}`);
+  if (j.workflow) out(`  workflow: ${j.workflow}${j.workflow_version != null ? ` (v${j.workflow_version})` : ""}`);
+  renderRunState(j.state);
+  if (j.run_id) out(`  inspect: spor run status ${j.run_id}`);
+  return 0;
+}
+
+// `spor run status <run-id>` -> GET /v1/runs/{id}: the full run record (status,
+// project, title, initiator, workflow + version, per-step states, timestamps).
+async function runStatus(cfg, runId, wantJson) {
+  const r = await remote.get(cfg, `/v1/runs/${encodeURIComponent(runId)}`, { timeoutMs: 8000 });
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (r.status === 404) {
+    err(`no such run: ${runId}`);
+    return 1;
+  }
+  if (!r.ok) {
+    const msg = r.json && r.json.error && r.json.error.message;
+    const code = r.json && r.json.error && r.json.error.code;
+    err(`run status error ${r.status}${code ? ` (${code})` : ""}${msg ? `: ${msg}` : ""}`);
+    return 1;
+  }
+  const j = r.json || {};
+  if (wantJson) {
+    out(JSON.stringify(j, null, 2));
+    return 0;
+  }
+  out(`run ${j.run_id}${j.status ? ` — ${j.status}` : ""}`);
+  if (j.title) out(`  ${j.title}`);
+  if (j.workflow) out(`  workflow: ${j.workflow}${j.workflow_version != null ? ` (v${j.workflow_version})` : ""}`);
+  if (j.project) out(`  project: ${j.project}`);
+  if (j.initiator) out(`  initiator: ${j.initiator}`);
+  renderRunState(j.state);
+  if (j.timestamps) {
+    if (j.timestamps.started_at) out(`  started: ${j.timestamps.started_at}`);
+    if (j.timestamps.last_event_at) out(`  last event: ${j.timestamps.last_event_at}`);
+  }
+  return 0;
+}
+
 // compile / brief / validate are LOCAL-graph verbs: byte-identical passthrough
 // to lib/compile.js / lib/validate.js, which read $SPOR_HOME/nodes. In REMOTE
 // mode that dir is absent, so the old passthrough exited with a bare
@@ -5362,6 +5499,33 @@ const COMMANDS = {
     },
     examples: ["spor lens", "spor lens lens-roadmap", "spor lens lens-roadmap --project spor"],
     run: (cfg, args) => cmdLens(cfg, args),
+  },
+  run: {
+    group: "Graph", parse: "strict", args: "<workflow-id> [--inputs <json>] | status <run-id>",
+    summary: "start a workflow run / inspect a run (remote)",
+    help:
+      "Start or inspect a workflow run — the shell twin of the run_workflow MCP tool.\n" +
+      "Workflow execution runs server-side (the run engine lives in the engine half),\n" +
+      "so this verb is remote only; local mode degrades with one line and no crash.\n\n" +
+      "  spor run <workflow-id> [--inputs <json>]   start a run on an ACTIVE workflow\n" +
+      "                                             (POST /v1/workflows/{id}/run)\n" +
+      "  spor run status <run-id>                   inspect a run's state + per-step\n" +
+      "                                             status (GET /v1/runs/{id})\n\n" +
+      "--inputs is a JSON OBJECT supplying the workflow's ${inputs.x} values. Starting\n" +
+      "a run only CREATES the workflow-run node and its initial step states — workers\n" +
+      "then claim ready steps over the claim API; it never executes effects. The\n" +
+      "workflow must already be active (a proposed one must be activated by a different\n" +
+      "identity first — the self-approval ban), else the start is refused with the why.",
+    options: {
+      inputs: { type: "string", value: "json", desc: "JSON object of workflow inputs (${inputs.x} interpolation)" },
+      json: { type: "boolean", desc: "machine-readable JSON output (the raw run record)" },
+    },
+    examples: [
+      "spor run wf-release-pipeline",
+      "spor run wf-release-pipeline --inputs '{\"ref\":\"v1.2.0\"}'",
+      "spor run status run-release-pipeline-20260620",
+    ],
+    run: (cfg, p) => cmdRun(cfg, p),
   },
   query: {
     group: "Graph", parse: "raw", args: "[--type T] [--where k=v] [--edges]",
