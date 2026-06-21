@@ -1187,6 +1187,111 @@ async function cmdSchema(cfg, args) {
   return res.code;
 }
 
+// changes — the team's recent-activity feed: "what landed / what did the agents
+// write overnight / what changed since <commit>" (task-spor-changes-cli-verb).
+// The shell front-door the temporal axis lacked (`next` is forward-looking,
+// `compile` is semantic search). Dual-mode like analytics: remote mode wraps GET
+// /v1/changes — the server owns the graph + its git history, and recent_changes
+// is its MCP twin sharing one core (API.md §3); local mode runs the SAME git-log
+// projection over the local nodes dir (lib/changes.js) and renders through the
+// SAME renderer so output matches (norm-spor-cli-mode-parity). --since (sha|date),
+// --project, and --limit narrow the feed in both modes. An explicit --nodes names
+// a local checkout, so it always takes the local path even under a server.
+async function cmdChanges(cfg, args) {
+  if (cfg.mode() === "remote" && !namesLocalGraph(args)) {
+    return await changesRemote(cfg, args);
+  }
+  return changesLocal(cfg, args);
+}
+
+// The remote arm: map the CLI flags to GET /v1/changes query params, fetch the
+// JSON feed, and render it with the SAME renderer the local arm uses. --json
+// prints the server's machine envelope verbatim. A 422 (unresolvable --since sha)
+// is surfaced as a clear single line, mirroring the local bad_since error.
+async function changesRemote(cfg, args) {
+  const since = optVal(args, "since");
+  const project = optVal(args, "project");
+  const limit = optVal(args, "limit");
+  const qs = new URLSearchParams();
+  if (since) qs.set("since", since);
+  if (project) qs.set("project", project);
+  if (limit != null) qs.set("limit", limit);
+  const query = qs.toString();
+  const r = await remote.get(cfg, `/v1/changes${query ? `?${query}` : ""}`, { timeoutMs: 10000 });
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (r.status === 422) {
+    const msg = r.json && r.json.error && r.json.error.message;
+    err(`changes: ${msg || `could not resolve --since '${since}' as a commit`}`);
+    return 1;
+  }
+  if (!r.ok || !r.json) {
+    const msg = r.json && r.json.error && r.json.error.message;
+    err(`changes error ${r.status}${msg ? `: ${msg}` : ""}`);
+    return 1;
+  }
+  if (args.includes("--json")) {
+    out(JSON.stringify(r.json, null, 2));
+    return 0;
+  }
+  const changesLib = require(path.join(ROOT, "lib", "changes.js"));
+  out(changesLib.renderReport(r.json));
+  return 0;
+}
+
+// The local arm: the git-log projection over the local nodes dir (lib/changes.js).
+// --nodes overrides the resolved home; --json stamps generated_at (the kernel
+// stays time-free for deterministic tests). A bad --since sha exits 1 with the
+// kernel's message (the local twin of the server's 422).
+function changesLocal(cfg, args) {
+  const changesLib = require(path.join(ROOT, "lib", "changes.js"));
+  const nodesDir = optVal(args, "nodes") || cfg.nodesDir();
+  const project = optVal(args, "project");
+  // --project resolves the SAME grouping union as `next`/`analytics`
+  // (graphLib.scopeFor/resolveProject): a bare slug -> its home-grouping union, a
+  // repo-<slug>/grouping id pins it — so `changes --project` means one thing
+  // across verbs. Build the keep() predicate from the loaded graph; deletions
+  // (fm=null) drop out under a scope, matching the server. Only loaded when a
+  // project is asked for, so the unscoped feed stays a lightweight git-log read.
+  let keep = null;
+  if (project) {
+    const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+    let g = null;
+    try { g = graphLib.loadGraph(nodesDir); } catch { /* unreadable graph -> no scoping */ }
+    if (g) {
+      if (!graphLib.projectKnown(g, project)) {
+        err(`project '${project}' matched no repo or grouping — changes is empty (try a repo slug, a repo-<slug> node id, or a grouping id)`);
+      }
+      const scope = graphLib.scopeFor(g, project);
+      keep = (fm) => fm != null && scope.has(graphLib.resolveProject(g, fm.project));
+    }
+  }
+  let report;
+  try {
+    report = changesLib.collect({
+      nodesDir,
+      since: optVal(args, "since"),
+      project,
+      limit: optVal(args, "limit"),
+      keep,
+    });
+  } catch (e) {
+    if (e && e.code === "bad_since") {
+      err(`changes: ${e.message}`);
+      return 1;
+    }
+    throw e;
+  }
+  if (args.includes("--json")) {
+    out(JSON.stringify({ ...report, generated_at: new Date().toISOString() }, null, 2));
+    return 0;
+  }
+  out(changesLib.renderReport(report));
+  return 0;
+}
+
 // --- spor add / capture -------------------------------------------------
 // Local: write a well-formed node so a user never has to learn the frontmatter
 // (issue-cc-local-mode-capture-queue-surfacing-gap). Remote: POST /v1/capture,
@@ -5761,6 +5866,37 @@ const COMMANDS = {
       "spor schema --source graph",
     ],
     run: (cfg, args) => cmdSchema(cfg, args),
+  },
+  changes: {
+    group: "Graph", parse: "raw", args: "[--since <sha|date>] [--project S] [--limit N] [--json]",
+    summary: "recent graph activity feed (local: git log; remote: /v1/changes)",
+    help:
+      "Show the team's recent-activity feed — \"what landed / what did the agents\n" +
+      "write overnight / what changed since <commit>\". The temporal entry point the\n" +
+      "other reads lack (`next` is forward-looking open work, `compile` is semantic\n" +
+      "search). Dual-mode: remote mode wraps GET /v1/changes (the server's git-log\n" +
+      "projection over nodes/, the REST twin of the recent_changes MCP tool); local\n" +
+      "mode runs the SAME projection over the local graph's git history and renders\n" +
+      "identically (norm-spor-cli-mode-parity).\n" +
+      "\n" +
+      "One entry per node = its NEWEST change in range, newest-first, each tagged\n" +
+      "machine (capture/distill/gardener) vs human — the trust signal the rendered\n" +
+      "digest hides.\n" +
+      "\n" +
+      "  --since <sha|date>  changes in <sha>..HEAD (7-40 hex sha; unresolvable = error)\n" +
+      "                      or a date/relative phrase git understands ('12 hours ago',\n" +
+      "                      '2026-06-15'); omitted = the most recent changes\n" +
+      "  --project <S>       scope to one project's nodes (deletions omitted when scoped)\n" +
+      "  --limit <N>         max nodes returned (default 100, max 500)\n" +
+      "  --json              machine-readable envelope\n" +
+      "  --nodes <dir>       read this local graph dir instead of the resolved home",
+    examples: [
+      "spor changes",
+      "spor changes --since '12 hours ago'",
+      "spor changes --since a1b2c3d --project spor",
+      "spor changes --limit 20 --json",
+    ],
+    run: (cfg, args) => cmdChanges(cfg, args),
   },
   correct: {
     group: "Graph", parse: "strict", args: "<target> [guidance]", aliases: ["propose-correction"],

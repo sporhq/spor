@@ -113,6 +113,7 @@ spor capabilities              # this machine's dispatch capability map (harness
 spor compile --query "<text>"  # search → compiled neighborhood (--digest for compact)
 spor brief <id>                # a briefing for one node (compile --root <id>)
 spor analytics --type task,issue      # created-vs-completed metrics (local git history / GET /v1/analytics)
+spor changes [--since <sha|date>]     # recent-activity feed: what changed lately (local git log / GET /v1/changes)
 
 # local (personal graph) only — fail fast with a redirect in remote mode
 spor validate                  # lint the local graph (server validates per-write remotely)
