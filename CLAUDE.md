@@ -341,7 +341,14 @@ does NOT imply *enabled*). The presence walk is `repoMarkerPresent()` in
 lib/config.js; this repo ships its own `.spor.json {enabled:true}` to dogfood
 it. Other levers beyond env migration: neighborhood-search project controls
 (`search.minSim`, `search.projects.{include,exclude,boost}`, applied in
-`lib/kernel/graph.js` compile, no-op when empty), and the `spor dispatch`
+`lib/kernel/graph.js` compile, no-op when empty), the path-scoped sub-briefs
+map (`briefs`, a committable relative-subtree-path→brief-id manifest for a
+monorepo; `Config.briefs()`/`briefsBase()` anchor it at the nearest-ancestor
+`.spor.json` carrying the key, and session-start routes cwd to the
+nearest-ancestor area via `u.matchBriefs()` and surfaces the siblings as a
+discovery line — dec-spor-monorepo-path-scoped-briefs; a covered subtree is an
+"area" label on a brief, never a node type, and distilled nodes still stamp
+`project: <repo>`), and the `spor dispatch`
 slug→local-path map (`dispatch.repos`, a per-machine `{slug: path}` table the
 shared graph can't hold; written to the USER `$SPOR_HOME/config.json` by
 `spor repos`/`session-start`, read via the cascade — never a committable

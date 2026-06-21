@@ -68,6 +68,66 @@ function nodeBody(raw) {
   return u.stripTrailingNewlines(u.byteHead(awkOut, 7000));
 }
 
+// Path-scoped sub-briefs for monorepos (dec-spor-monorepo-path-scoped-briefs).
+// A repo's .spor.json may carry a `briefs` map of relative-subtree-path ->
+// brief-id (e.g. {"auth/": "brief-spor-server-auth", "hosting/": "..."}); a
+// monorepo declares one brief per separately-deployable subtree without a third
+// identity type below `repo` — the subtree is an "area", a label on a brief.
+// session-start routes to the NEAREST-ANCESTOR area for cwd and surfaces the
+// SIBLING areas as a discovery line, so a session deep in one subtree gets that
+// area's brief while still learning the others exist — without injecting every
+// body. Returns the block to splice onto the briefing context, or "" when no
+// `briefs` map is configured (byte-identical, norm-cc-byte-identical-refactor)
+// or on any error (fail-open).
+//
+// The active area's body is injected only when its brief is a node file on disk
+// (local mode — a cheap read, the same source the repo brief is read from); in
+// remote mode (no local node files) it degrades to a /spor:brief pointer, the
+// same on-demand pull any brief takes there, so this needs no server work.
+function pathScopedBriefsBlock(cwd, nodesDir) {
+  try {
+    const cfg = u.config();
+    const briefs = cfg ? cfg.briefs() : null;
+    if (!briefs || !Object.keys(briefs).length) return "";
+    // Anchor the relative subtree paths to the repo-root manifest's directory
+    // (the nearest-ancestor .spor.json that carried `briefs`). Fall back to the
+    // git toplevel of cwd — the PHYSICAL checkout root, not inferenceRoot, which
+    // collapses a linked worktree onto its main checkout — then to cwd itself.
+    const base =
+      (cfg && cfg.briefsBase()) ||
+      (u.git(cwd, ["rev-parse", "--show-toplevel"]) || "").trim() ||
+      cwd;
+    const { active, siblings } = u.matchBriefs(briefs, base, cwd);
+    let block = "";
+    if (active) {
+      let body = "";
+      try {
+        const f = path.join(nodesDir, `${active.id}.md`);
+        if (fs.existsSync(f)) body = nodeBody(fs.readFileSync(f, "utf8"));
+      } catch {
+        /* fall through to the pointer line */
+      }
+      if (body) {
+        block += `
+
+## Active area briefing (${active.id}, covering ${active.area}/ — the sub-brief for the subtree you're working in, alongside the repo brief above)
+
+${body}`;
+      } else {
+        block += `\n\nActive area for this subtree: ${active.area} — load its briefing with /spor:brief ${active.id}.`;
+      }
+    }
+    if (siblings.length) {
+      const list = siblings.map((s) => `${s.area} (${s.id})`).join(", ");
+      const lead = active ? "This repo also has path-scoped briefs" : "This repo has path-scoped briefs";
+      block += `\n\n${lead}: ${list} — open one with /spor:brief <id>.`;
+    }
+    return block;
+  } catch {
+    return "";
+  }
+}
+
 // Durable repo-identity node text (issue-spor-onboard-no-repo-identity-node),
 // mirroring the server's learnFingerprints registration so local and remote
 // produce the same shape. Ungrouped by default — no grouped-under edge; the
@@ -354,13 +414,13 @@ async function sessionStart(input) {
 
 ## Standing project briefing (brief-${slug} v${version}, machine-compiled from the team graph — correct it with /spor:correct, don't silently work around errors)
 
-${u.byteHead(body, 7000)}${projectBriefBlock(resp)}`;
+${u.byteHead(body, 7000)}${projectBriefBlock(resp)}${pathScopedBriefsBlock(cwd, nodes)}`;
         return envelope(ctx);
       }
       // 200 but no briefing for this project: still note the graph status.
       rlog(`briefing not found for ${slug} (${ncount} nodes)`);
       return envelope(
-        `team graph: ${ncount} nodes @ ${host} (no standing briefing for ${slug} yet).${dline} ${USAGE_REMOTE}${qline}${oline}${projectBriefBlock(resp)}`
+        `team graph: ${ncount} nodes @ ${host} (no standing briefing for ${slug} yet).${dline} ${USAGE_REMOTE}${qline}${oline}${projectBriefBlock(resp)}${pathScopedBriefsBlock(cwd, nodes)}`
       );
     }
 
@@ -401,7 +461,7 @@ ${u.byteHead(body, 7000)}${projectBriefBlock(resp)}`;
 
 ## Standing project briefing (brief-${slug}, cached from the team graph)
 
-${body}`;
+${body}${pathScopedBriefsBlock(cwd, nodes)}`;
       return envelope(ctx);
     }
     // No cache: still surface an auth failure (it is actionable and not an
@@ -620,6 +680,12 @@ ${pbody}`;
   } catch {
     /* fail open */
   }
+
+  // Path-scoped sub-briefs (dec-spor-monorepo-path-scoped-briefs): route to the
+  // active area for this subtree and surface the siblings. Appended last so it
+  // nests below the repo + product briefs (product > repo > area). "" when the
+  // repo declares no `briefs` map, so a markerless repo is byte-identical.
+  ctx += pathScopedBriefsBlock(cwd, nodes);
 
   // Ensure this repo has a durable identity node once it actually has content
   // in the graph (issue-spor-onboard-no-repo-identity-node). Mirrors the

@@ -317,9 +317,24 @@ repo to see whether it's active.
       "exclude": ["personal-blog"], // drop these from ranking entirely
       "boost":   { "spor": 1.5 }    // favor a project's nodes in ranking
     }
+  },
+  "briefs": {                       // path-scoped sub-briefs for a monorepo:
+    "auth/": "brief-myrepo-auth",   // each subtree -> its own brief node id
+    "frontend-router/": "brief-myrepo-frontend-router"
   }
 }
 ```
+
+**Path-scoped briefs (monorepos).** A repo split into separately-owned subtrees
+can declare one brief per subtree in `briefs` — a relative-path → brief-id map.
+At session start the nearest-ancestor subtree containing your cwd is the *active
+area*: its brief is injected alongside the repo brief, while the sibling areas
+are surfaced as a one-line discovery list (`/spor:brief <id>` to open one)
+without injecting their bodies. A session in no declared subtree (e.g. the repo
+root) just gets the discovery list. This is a routing layer over the existing
+`brief` concept — a covered subtree is an "area", a label on a brief, not a new
+identity type; distilled nodes still stamp the repo. Name siblings
+`brief-<repo>-<area>` so they group.
 
 Other recognized keys mirror their env var: `server`, `token`, `home`,
 `nodes`, `mode` (`auto`/`local`/`remote`/`off`), and the `distill`, `nudge`,

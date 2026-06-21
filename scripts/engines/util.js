@@ -253,6 +253,40 @@ function projectGrouping(cwd) {
   return null;
 }
 
+// Match cwd against a path-scoped briefs map (dec-spor-monorepo-path-scoped-
+// briefs). `briefs` is the relative-subtree-path -> brief-id map declared in a
+// repo's .spor.json; `base` is the directory those relative paths are anchored
+// to (the repo-root manifest's directory); `cwd` is the session directory.
+// Returns { active, siblings }:
+//   active   — the NEAREST-ANCESTOR match: the { area, id } whose subtree is the
+//              deepest prefix containing cwd (deepest wins, mirroring the .spor
+//              marker walk and projectSlug() semantics), or null when cwd is in
+//              no declared subtree (e.g. at the repo root).
+//   siblings — every OTHER declared { area, id }, in declaration order, for the
+//              discovery line session-start surfaces so they stay
+//              /spor:brief-reachable without injecting their bodies.
+// `area` is the path key as a label (trailing slash and leading "./" stripped).
+// Pure + fail-open: a non-object map or malformed entry yields no match.
+function matchBriefs(briefs, base, cwd) {
+  if (!briefs || typeof briefs !== "object" || Array.isArray(briefs)) return { active: null, siblings: [] };
+  const c = path.resolve(cwd || "");
+  const entries = [];
+  for (const [rel, id] of Object.entries(briefs)) {
+    if (typeof rel !== "string" || !id || typeof id !== "string") continue;
+    const area = rel.replace(/^\.\//, "").replace(/\/+$/, "");
+    if (!area) continue; // "", "/", "./" — not a real subtree label, skip
+    const abs = path.resolve(base || c, rel);
+    // cwd is in this subtree when it IS the subtree dir or sits under it; the
+    // trailing separator stops `…/a` from matching a sibling `…/a-b`.
+    const match = c === abs || c.startsWith(abs + path.sep);
+    entries.push({ area, id, depth: abs.length, match });
+  }
+  let active = null;
+  for (const e of entries) if (e.match && (!active || e.depth > active.depth)) active = e;
+  const siblings = entries.filter((e) => e !== active).map((e) => ({ area: e.area, id: e.id }));
+  return { active: active ? { area: active.area, id: active.id } : null, siblings };
+}
+
 // Repo fingerprints (task-cc-project-identity-nodes): root-commit shas and
 // normalized remote URLs, the rename evidence a project node accumulates.
 // Remote normalization strips scheme, userinfo (never ship credentials),
@@ -984,6 +1018,7 @@ module.exports = {
   inferenceRoot,
   projectSlug,
   projectGrouping,
+  matchBriefs,
   repoFingerprints,
   git,
   ensureDir,
