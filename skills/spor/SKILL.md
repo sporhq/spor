@@ -85,6 +85,7 @@ spor status                    # resolved mode, graph, project, identity, health
 spor next [--project <slug>]   # the ranked decision queue — "what's next"
 spor get <id>                  # one node by id
 spor blame <sha> [--repo <s>]  # which nodes reference a git commit (alias: spor commits <sha>)
+spor history <id> [<sha>]      # a node's commit lineage (actor/when/what); <sha> = that revision's diff (local git log / GET /v1/nodes/<id>/history)
 spor schema [<type>]           # introspect the live registry (types/prefixes/weights/flags/gates,
                                #   seed + resident overrides, provenance-tagged) — query this, don't
                                #   read lib/seed/. Remote reflects the server's registry (GET /v1/schema)

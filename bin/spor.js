@@ -693,6 +693,177 @@ async function cmdBlame(cfg, { positionals, values }) {
   return 0;
 }
 
+// --- spor history: per-node git-log lineage --------------------------------
+// (task-spor-history-cli-verb) The shell front-door for a single node's commit
+// history — every revision's actor, time, and what changed — as a `git log`
+// projection over nodes/<id>.md. The frontmatter `author` field re-stamps to the
+// LAST editor on every write, so git history is the only durable record of the
+// full chain of editors; this gives it a read surface short of the whole-corpus
+// `spor export` tarball. Dual-mode like `get`/`blame` (norm-spor-cli-mode-parity):
+// remote dispatches to GET /v1/nodes/{id}/history (the cheap commit list) and
+// GET /v1/nodes/{id}/history/{sha} (the diff sub-fetch); local runs the same
+// git-log projection over the graph home via lib/history.js, the faithful twin of
+// the server's computeNodeHistory / computeNodeHistoryEntry cores. Both render
+// through the shared lib/history.js renderers so output matches across modes.
+async function cmdHistory(cfg, { positionals, values }) {
+  const id = positionals[0];
+  const sha = positionals[1] || null;
+  if (!id) {
+    err("usage: spor history <id> [<sha>] [--limit N] [--json] [--content]");
+    return 1;
+  }
+  const history = require(path.join(ROOT, "lib", "history.js"));
+  // Mirror the server's gates so a bad id/sha fails the same way in both modes.
+  if (!history.isNodeId(id)) {
+    err(`bad node id '${id}' — a kebab-case slug (^[a-z0-9][a-z0-9-]*$).`);
+    return 1;
+  }
+  if (sha && !history.isShaLike(sha)) {
+    err(`bad sha '${sha}' — give 7-40 hex chars (abbreviated or full).`);
+    return 1;
+  }
+  return sha
+    ? await historyEntry(cfg, history, id, sha, values)
+    : await historyList(cfg, history, id, values);
+}
+
+// The person->actor mapping for the local arm: index the local graph's person
+// nodes by email (the twin of the server's in-memory personEmailIndex), so a
+// history entry can point a real actor at their person node. Loading the graph is
+// the accepted local cost for these git-projection verbs (blame does the same); a
+// missing/unreadable graph degrades to no mapping — the actor name/email still
+// renders. Returns a Map (possibly empty), never throws.
+function historyEmailIndex(history, nodesDir) {
+  try {
+    const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+    return history.personEmailIndex(graphLib.loadGraph(nodesDir));
+  } catch {
+    return null;
+  }
+}
+
+// The list arm: a node's ordered commit list (newest first). Remote dispatches
+// GET /v1/nodes/{id}/history?limit=N; local runs the git-log twin. A count of 0
+// (no commit ever touched the path) is the server's 404 — an unknown id — in
+// both modes.
+async function historyList(cfg, history, id, values) {
+  const limit = values.limit;
+  let env;
+  if (cfg.mode() === "remote") {
+    const q = limit != null ? `?limit=${encodeURIComponent(limit)}` : "";
+    const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}/history${q}`, { timeoutMs: 10000 });
+    if (r.transport) {
+      err(`offline — could not reach server (${r.error})`);
+      return 1;
+    }
+    if (r.status === 404) {
+      const msg = r.json && r.json.error && r.json.error.message;
+      err(msg || `node '${id}' has no history (unknown id)`);
+      return 1;
+    }
+    if (r.status === 422) {
+      const msg = r.json && r.json.error && r.json.error.message;
+      err(`invalid request${msg ? ` — ${msg}` : ""}`);
+      return 1;
+    }
+    if (!r.ok || !r.json) {
+      err(`history error ${r.status}`);
+      return 1;
+    }
+    env = r.json;
+  } else {
+    const nodesDir = cfg.nodesDir();
+    if (!fs.existsSync(nodesDir)) {
+      err(`no Spor graph at ${nodesDir} — run 'spor init', or set SPOR_SERVER for a team graph.`);
+      return 1;
+    }
+    try {
+      env = history.collect({ nodesDir, id, limit, emailIdx: historyEmailIndex(history, nodesDir) });
+    } catch (e) {
+      err(`history: ${e.message}`);
+      return 1;
+    }
+    if (env.count === 0) {
+      err(`node '${id}' has no history (unknown id)`);
+      return 1;
+    }
+  }
+  if (values.json) {
+    out(JSON.stringify(env, null, 2));
+    return 0;
+  }
+  out(history.renderList(env));
+  return 0;
+}
+
+// The entry arm: one revision's diff + change type (the "diff sub-fetch"), with
+// --content also printing the full node at that revision. Remote dispatches GET
+// /v1/nodes/{id}/history/{sha}; local runs the git-show twin. Error codes map to
+// the same one-line messages the server raises (commit not found / did not change
+// the node).
+async function historyEntry(cfg, history, id, sha, values) {
+  let entry;
+  if (cfg.mode() === "remote") {
+    const r = await remote.get(
+      cfg,
+      `/v1/nodes/${encodeURIComponent(id)}/history/${encodeURIComponent(sha)}`,
+      { timeoutMs: 10000 }
+    );
+    if (r.transport) {
+      err(`offline — could not reach server (${r.error})`);
+      return 1;
+    }
+    if (r.status === 404) {
+      const msg = r.json && r.json.error && r.json.error.message;
+      err(msg || historyEntryError("bad_sha", id, sha));
+      return 1;
+    }
+    if (r.status === 422) {
+      const msg = r.json && r.json.error && r.json.error.message;
+      err(`invalid request${msg ? ` — ${msg}` : ""}`);
+      return 1;
+    }
+    if (!r.ok || !r.json) {
+      err(`history error ${r.status}`);
+      return 1;
+    }
+    entry = r.json;
+  } else {
+    const nodesDir = cfg.nodesDir();
+    if (!fs.existsSync(nodesDir)) {
+      err(`no Spor graph at ${nodesDir} — run 'spor init', or set SPOR_SERVER for a team graph.`);
+      return 1;
+    }
+    const r = history.collectEntry({ nodesDir, id, sha, emailIdx: historyEmailIndex(history, nodesDir) });
+    if (!r.ok) {
+      err(historyEntryError(r.code, id, sha));
+      return 1;
+    }
+    entry = r.response;
+  }
+  if (values.json) {
+    out(JSON.stringify(entry, null, 2));
+    return 0;
+  }
+  out(history.renderEntry(entry, { content: !!values.content }));
+  return 0;
+}
+
+// Map a local collectEntry() failure code to the same one-line message the server
+// returns for the matching 404/500, so the entry arm reads identically in both
+// modes (norm-spor-cli-mode-parity).
+function historyEntryError(code, id, sha) {
+  switch (code) {
+    case "bad_sha":
+    case "empty":
+      return `commit '${sha}' not found`;
+    case "not_in_history":
+      return `commit '${sha}' did not change node '${id}'`;
+    default:
+      return `could not read revision '${sha}' of '${id}'`;
+  }
+}
+
 // --- spor lens / render-lens: view a saved lens (REMOTE only) ---------------
 // (task-cc-spor-cli-lens-render) Lens RENDERING lives entirely server-side in
 // the engine half (lib-engine; art-cc-lib-boundary moved it out of the client
@@ -5991,6 +6162,39 @@ const COMMANDS = {
     },
     examples: ["spor blame b384469", "spor commits b384469 --repo spor", "spor blame b384469 --json"],
     run: (cfg, p) => cmdBlame(cfg, p),
+  },
+  history: {
+    group: "Graph", parse: "strict", args: "<id> [<sha>] [--limit N]",
+    summary: "a node's commit lineage (local: git log; remote: /v1/nodes/<id>/history)",
+    help:
+      "Show a single node's commit history — every revision's actor, time, and what\n" +
+      "changed — as a `git log` projection over nodes/<id>.md. The frontmatter author\n" +
+      "field re-stamps to the LAST editor on every write, so git history is the only\n" +
+      "durable record of the full chain of editors.\n" +
+      "\n" +
+      "  spor history <id>          the ordered commit list, newest first\n" +
+      "  spor history <id> <sha>    one revision's diff + change type\n" +
+      "\n" +
+      "A server-internal write (boot reconcile / migration) is labeled as such; a real\n" +
+      "actor maps to its person node where one exists. Remote mode reads\n" +
+      "/v1/nodes/<id>/history (the list) and /v1/nodes/<id>/history/<sha> (the diff);\n" +
+      "local mode runs the same git-log projection over the graph home, so output\n" +
+      "matches across modes.\n" +
+      "\n" +
+      "  --limit <N>     max revisions in the list (default 50, max 200)\n" +
+      "  --content       with a <sha>, also print the full node at that revision\n" +
+      "  --json          emit the raw envelope instead of the rendered view",
+    options: {
+      limit: { type: "string", value: "N", desc: "max revisions in the list (default 50, max 200)" },
+      content: { type: "boolean", desc: "with a <sha>, also print the full node at that revision" },
+      json: { type: "boolean", desc: "machine-readable JSON output" },
+    },
+    examples: [
+      "spor history dec-cc-zero-dep-client",
+      "spor history dec-cc-zero-dep-client --limit 10",
+      "spor history dec-cc-zero-dep-client a1b2c3d --content",
+    ],
+    run: (cfg, p) => cmdHistory(cfg, p),
   },
   lens: {
     group: "Graph", parse: "raw", args: "[<id>]", aliases: ["render-lens"],
