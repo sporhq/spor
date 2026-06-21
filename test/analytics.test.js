@@ -161,6 +161,51 @@ test("computeAnalytics: a superseded node completes at the SUPERSEDER's created_
   assert.equal(completedWeek, k.isoWeekKey(mon - DAY));
 });
 
+test("computeAnalytics: a node retired by a resolves/answers edge (status lags open) completes at the RESOLVER's created_at", () => {
+  // task-spor-analytics-resolution-edge-completion: status still reads open, but a
+  // live resolver points at it — count it completed, not WIP, dated at the resolver.
+  const now = Date.parse("2026-06-21T00:00:00Z");
+  const mon = k.weekStartUTC(now);
+  const nodes = { "task-lag": { id: "task-lag", type: "task", status: "open", title: "lagging" } };
+  const timestamps = {
+    "task-lag": { created_at: new Date(mon - 4 * WEEK).toISOString(), updated_at: "z" },
+    "art-fix": { created_at: new Date(mon - DAY).toISOString(), updated_at: "z" }, // resolver, last week
+  };
+  const r = k.computeAnalytics({
+    nodes, timestamps, gitClosed: {}, supersededBy: {}, resolvedBy: { "task-lag": "art-fix" },
+    isTerminal: isTerm, now, weeks: 6,
+  });
+  assert.equal(r.totals.completed, 1);
+  assert.equal(r.wip.open, 0);                       // no longer counted as WIP
+  assert.equal(r.bottlenecks.length, 0);             // and out of the bottleneck list
+  assert.equal(r.coverage.fromResolutionEdge, 1);
+  assert.equal(r.coverage.fromFallback, 1);          // resolution edge IS a fallback (no own git transition)
+  assert.equal(r.coverage.fromGitTransition, 0);
+  // its completion lands in the resolver's week, not its own creation week
+  assert.equal(r.weekly.find((w) => w.completed > 0).week, k.isoWeekKey(mon - DAY));
+});
+
+test("computeAnalytics: a node's own git status-transition wins over a resolution edge", () => {
+  // A node that DID flip terminal keeps its git transition time — the resolver
+  // edge never moves an already-git-dated completion (precedence guard).
+  const now = Date.parse("2026-06-21T00:00:00Z");
+  const mon = k.weekStartUTC(now);
+  const nodes = { "task-d": { id: "task-d", type: "task", status: "done", title: "done" } };
+  const timestamps = {
+    "task-d": { created_at: new Date(mon - 4 * WEEK).toISOString(), updated_at: "z" },
+    "art-fix": { created_at: new Date(mon - 3 * WEEK).toISOString(), updated_at: "z" }, // resolver born earlier
+  };
+  const gitClosed = { "task-d": new Date(mon - DAY).toISOString() }; // own transition last week
+  const r = k.computeAnalytics({
+    nodes, timestamps, gitClosed, supersededBy: {}, resolvedBy: { "task-d": "art-fix" },
+    isTerminal: isTerm, now, weeks: 6,
+  });
+  assert.equal(r.coverage.fromGitTransition, 1);
+  assert.equal(r.coverage.fromResolutionEdge, 0);
+  // completion lands in the git-transition week, not the (earlier) resolver's week
+  assert.equal(r.weekly.find((w) => w.completed > 0).week, k.isoWeekKey(mon - DAY));
+});
+
 test("computeAnalytics: type filter + WIP-by-type + bottlenecks (oldest open first)", () => {
   const now = Date.parse("2026-06-21T00:00:00Z");
   const mon = k.weekStartUTC(now);
@@ -270,6 +315,31 @@ test("analyze: non-git home degrades to frontmatter dates (no throw)", () => {
   // the done node still completes — via the created_at/.date fallback, never updated_at
   assert.equal(r.totals.completed, 1);
   assert.equal(r.coverage.fromFallback, 1);
+});
+
+test("analyze: a resolves edge retires an open target — completed at the resolver's created_at, out of WIP", () => {
+  // task-spor-analytics-resolution-edge-completion: task-lag's status never flips,
+  // but an artifact resolves it — count it completed (in the resolver's week),
+  // not as lingering WIP. The full façade → real-git → resolutionMap path.
+  const home = initGraph();
+  writeNode(home, "task-lag", "task", "open");
+  commit(home, "2026-05-04T00:00:00Z", "create lagging task");                          // W19
+  // an artifact that RESOLVES it, born last week — the task's own status stays open
+  writeNode(home, "art-fix", "artifact", "done", "edges:\n  - {type: resolves, to: task-lag}\n");
+  commit(home, "2026-06-15T00:00:00Z", "resolver lands");                               // W25
+
+  const g = graphLib.loadGraph(path.join(home, "nodes"));
+  const r = analyticsLib.analyze(g, { now: Date.parse("2026-06-21T00:00:00Z"), weeks: 12 });
+  assert.equal(r.wip.open, 0);                                  // task-lag no longer lingers as WIP
+  assert.ok(!r.bottlenecks.some((b) => b.id === "task-lag"));   // and out of the bottleneck list
+  assert.equal(r.coverage.fromResolutionEdge, 1);              // task-lag, dated at the resolver
+  assert.equal(r.coverage.fromGitTransition, 1);              // art-fix, born done
+  // task-lag's completion lands in the resolver's week (W25), not its own creation week (W19)
+  const w25 = r.weekly.find((w) => w.week === "2026-W25");
+  assert.equal(w25.completed, 2);                              // both task-lag and art-fix
+  // the human footnote names the status-lag completions
+  const text = analyticsLib.renderReport(r);
+  assert.match(text, /retired by a live resolves\/answers edge while status still lagged open/);
 });
 
 test("renderReport: produces a stable human block with the cohort table + coverage", () => {
