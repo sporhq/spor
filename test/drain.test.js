@@ -205,3 +205,51 @@ test("add (remote) success with an empty outbox flushes nothing and stays quiet"
     srv.close();
   }
 });
+
+// --- idempotency key survives the timeout → spool → drain race ----------------
+// (issue-spor-add-cli-duplicate-on-timeout-drain). The server dedupes a capture
+// it has already seen by its key, so the ONLY thing the client must guarantee is
+// that the key on the first POST is the SAME key the drain replay re-sends.
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+test("add (remote) stamps a client idempotency key onto the capture POST body", async () => {
+  const { home } = freshHome();
+  const { srv, hits, base } = await stubServer();
+  try {
+    const r = await runAsync(["add", "a capture that carries an idempotency key"],
+      { SPOR_SERVER: base, SPOR_TOKEN: "tok", SPOR_HOME: home });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const cap = hits.find((h) => h.url === "/v1/capture");
+    assert.match(JSON.parse(cap.body).idempotency_key, UUID_RE, "the POST body carries a uuid key");
+  } finally {
+    srv.close();
+  }
+});
+
+test("add timeout spools the key; drain replays the SAME key so the server dedupes", async () => {
+  const { home, outbox } = freshHome();
+  // 1) add against an unreachable server → transport failure → spool. This is the
+  //    "client aborted but the server may have landed it" case the fix targets.
+  const deadServer = await deadBase();
+  const add = await runAsync(["add", "a capture that times out client-side but lands on the server"],
+    { SPOR_SERVER: deadServer, SPOR_TOKEN: "tok", SPOR_HOME: home });
+  assert.strictEqual(add.status, 1, "transport failure exits 1");
+  const spooled = listSpool(outbox);
+  assert.strictEqual(spooled.length, 1, "the failed capture spooled");
+  const spoolKey = JSON.parse(fs.readFileSync(path.join(outbox, spooled[0]), "utf8")).idempotency_key;
+  assert.match(spoolKey, UUID_RE, "the spool file preserves the idempotency key");
+  // 2) drain to a live server → the replay POST must carry the IDENTICAL key, so
+  //    the server recognizes the already-landed capture instead of re-ingesting.
+  const { srv, hits, base } = await stubServer();
+  try {
+    const drain = await runAsync(["drain"], { SPOR_SERVER: base, SPOR_TOKEN: "tok", SPOR_HOME: home });
+    assert.strictEqual(drain.status, 0, drain.stderr);
+    const replay = hits.find((h) => h.url === "/v1/capture");
+    assert.strictEqual(JSON.parse(replay.body).idempotency_key, spoolKey,
+      "drain re-POSTs the identical key — the server dedupes rather than double-writes");
+    assert.strictEqual(listSpool(outbox).length, 0, "the drained capture left the outbox");
+  } finally {
+    srv.close();
+  }
+});

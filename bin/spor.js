@@ -1673,7 +1673,14 @@ async function cmdAdd(cfg, { values, positionals }) {
     // Capture ingestion runs an LLM server-side (typically >6s), so the default
     // read timeout would abort a healthy request and silently drop the capture —
     // a one-shot CLI has no hook outbox to retry it (issue-spor-add-cli-timeout-silent-loss).
-    const body = { text: prose, context };
+    // A client-generated idempotency key closes the timeout-then-server-completes
+    // race (issue-spor-add-cli-duplicate-on-timeout-drain): if this POST aborts at
+    // 30s but the server still finishes ingesting, the body — key included — spools
+    // verbatim and `spor drain` re-POSTs the SAME key, so the server dedupes against
+    // the landed capture instead of ingesting a second node. The key rides the BODY
+    // (the server also accepts it as the `Idempotency-Key` header) precisely so the
+    // verbatim outbox replay carries it for free, no drain-side restore needed.
+    const body = { text: prose, context, idempotency_key: crypto.randomUUID() };
     const r = await remote.post(cfg, "/v1/capture", body, { timeoutMs: 30000 });
     // Transport failure (server unreachable / >30s ingestion abort) or a transient
     // 5xx: the request never durably landed and a replay can still succeed. A

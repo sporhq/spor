@@ -10,6 +10,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { spawnSync } = require("child_process");
 const u = require("./util");
 const { drainOutbox } = require("./drain-outbox");
@@ -327,11 +328,16 @@ async function distill(input) {
     let factNo = 0;
     for (const fact of facts) {
       factNo++;
-      // /v1/capture caps text at 4000 chars; truncate defensively.
+      // /v1/capture caps text at 4000 chars; truncate defensively. A per-fact
+      // idempotency key closes the same timeout-then-server-completes race the
+      // `spor add` path guards (issue-spor-add-cli-duplicate-on-timeout-drain): a
+      // fact that spools (below) on an aborted-but-landed POST re-ships the SAME
+      // key on drain, so the server dedupes instead of ingesting a second node.
       const body = JSON.stringify({
         text: u.byteHead(fact, 3900),
         context: { project: slug },
         source: "distill",
+        idempotency_key: crypto.randomUUID(),
       });
       const { http } = await u.curl(`${u.serverBase()}/v1/capture`, {
         method: "POST",
