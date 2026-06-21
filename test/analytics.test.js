@@ -386,6 +386,30 @@ test("analyze: a resolves edge retires an open target — completed at the resol
   assert.match(text, /retired by a live resolves\/answers edge while status still lagged open/);
 });
 
+test("analyze: a decision settled via its schema-terminal status counts as completed, not WIP", () => {
+  // issue-spor-analytics-completion-ignores-schema-terminal-status: `settled` is
+  // terminal for a decision's OWN lifecycle (schema-decision status.terminal) but
+  // deliberately ABSENT from resolution.js TERMINAL. Analytics unions the registry
+  // partition with the legacy set, so a settled decision leaves WIP/bottlenecks and
+  // lands in a completed cohort at its settle-transition commit — the hardcoded set
+  // alone would strand it open forever.
+  const home = initGraph();
+  writeNode(home, "dec-x", "decision", "active");
+  commit(home, "2026-05-04T00:00:00Z", "record decision");   // W19
+  writeNode(home, "dec-x", "decision", "settled");
+  commit(home, "2026-05-11T00:00:00Z", "settle decision");   // W20 — the transition
+
+  const g = graphLib.loadGraph(path.join(home, "nodes"));
+  assert.ok(g.registry.terminalStatuses().has("settled"), "seed schema-decision declares settled terminal");
+  const r = analyticsLib.analyze(g, { now: NOW, weeks: 12 });
+  assert.equal(r.totals.completed, 1);                       // settled = completed
+  assert.equal(r.wip.open, 0);                               // not lingering WIP
+  assert.ok(!r.bottlenecks.some((b) => b.id === "dec-x"));   // out of the oldest-open list
+  assert.equal(r.coverage.fromGitTransition, 1);            // dated at the settle commit
+  const completedWeek = r.weekly.find((w) => w.completed > 0);
+  assert.equal(completedWeek.week, "2026-W20");
+});
+
 test("renderReport: produces a stable human block with the cohort table + coverage", () => {
   const home = initGraph();
   writeNode(home, "task-a", "task", "open");
@@ -407,7 +431,11 @@ test("renderReport: produces a stable human block with the cohort table + covera
 const NOW = Date.parse("2026-06-21T00:00:00Z");
 const closedPath = (home) => path.join(home, "cache", "analytics-closed.json");
 const readClosed = (home) => JSON.parse(fs.readFileSync(closedPath(home), "utf8"));
-const FP = resolution.terminalStatuses.join(",");
+// The cache fingerprint is the analytics terminal vocabulary: the legacy kernel set
+// UNIONED with the registry's status.terminal partition, sorted+joined — the same
+// union lib/analytics.js keys the cache on
+// (issue-spor-analytics-completion-ignores-schema-terminal-status).
+const FP = [...new Set([...resolution.terminalStatuses, ...graphLib.seedRegistry().terminalStatuses()])].sort().join(",");
 
 // A graph with one task closed inside the 12-week window (W20, 2026-05-11).
 function closedGraph() {

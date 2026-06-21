@@ -451,7 +451,34 @@ test("Registry: an org schema extends the resolving partition (no code change)",
   assert.equal(reg.isResolvingStatus("rejected"), false, "other schemas' declarations still union in");
 });
 
-test("parseSchemaNode: rejects a malformed status.non_resolving", () => {
+test("seed pack: terminal partition exposes schema-only lifecycle-terminal statuses (decision settled)", () => {
+  // issue-spor-analytics-completion-ignores-schema-terminal-status: the registry
+  // partition work-analytics unions with resolution.js's legacy type-blind set, so
+  // a status terminal for a node's OWN lifecycle but deliberately OUT of the kernel
+  // TERMINAL set (decision `settled`) still counts as completion.
+  const reg = graph.seedRegistry();
+  const term = reg.terminalStatuses();
+  assert.equal(term.has("settled"), true, "the schema-only terminal status is exposed");
+  assert.equal(term.has("superseded"), true);
+  assert.equal(term.has("rejected"), true);
+  // distinct from the resolving partition: a settled decision is TERMINAL for its own
+  // lifecycle yet still RESOLVES its targets (only rejected is non-resolving).
+  assert.equal(reg.nonResolvingStatuses().has("settled"), false);
+});
+
+test("Registry: an org schema declares a terminal status (no code change)", () => {
+  const reg = graph.seedRegistry();
+  const ok = reg.add({
+    id: "schema-task", kind: "node-schema", version: "2026.07.01.1", key: "task",
+    payload: { node_type: "task", status: { terminal: ["shelved"] } },
+    code: {}, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.equal(ok, true);
+  assert.equal(reg.terminalStatuses().has("shelved"), true, "org-added terminal status honored");
+  assert.equal(reg.terminalStatuses().has("settled"), true, "other schemas' declarations still union in");
+});
+
+test("parseSchemaNode: rejects a malformed status.non_resolving / status.terminal", () => {
   const bad = registry.parseSchemaNode({
     id: "schema-x", kind: "node-schema", schema_version: "2026.06.15.1",
     body: '```json\n{"node_type":"x","status":{"non_resolving":[1,""]}}\n```',
@@ -463,6 +490,11 @@ test("parseSchemaNode: rejects a malformed status.non_resolving", () => {
     body: '```json\n{"node_type":"y","status":["nope"]}\n```',
   });
   assert.ok(bad2.errors.some((e) => /status must be an object/.test(e)));
+  const bad3 = registry.parseSchemaNode({
+    id: "schema-z", kind: "node-schema", schema_version: "2026.06.21.2",
+    body: '```json\n{"node_type":"z","status":{"terminal":[1,""]}}\n```',
+  });
+  assert.ok(bad3.errors.some((e) => /terminal must be an array of non-empty strings/.test(e)));
 });
 
 test("seed pack: the schema type itself is native — known, prefixed, traversable", () => {

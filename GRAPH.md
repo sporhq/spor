@@ -207,9 +207,14 @@ separately, but never shows a complete custom type in one piece.
 
 **The constraint model is procedural, not declarative.** A schema's `json`
 payload declares only *registry knobs* — `node_type`, `prefix`, `queueable`,
-`traversable`, `always_on`, `capturable`, an edge `weight`, the
-`status.non_resolving` partition. There is **no declarative field list and no
-status enum.** Custom fields are free-form: any flat frontmatter key the
+`traversable`, `always_on`, `capturable`, an edge `weight`, and the two status
+partitions: `status.non_resolving` (resolver semantics — whether a node in this
+status retires the targets it points at) and `status.terminal` (own-lifecycle
+completion — the statuses in which a node of this type is *done*, unioned with the
+kernel's legacy set and read by work-analytics so a schema-only terminal status
+like decision `settled` counts as completed,
+issue-spor-analytics-completion-ignores-schema-terminal-status). There is **no
+declarative field list and no status enum.** Custom fields are free-form: any flat frontmatter key the
 regex parser accepts (simple `key: value` scalars, YAML-folded multi-line
 values, `pin:`/`exclude:` inline lists, `- {type: X, to: Y}` edges — and nothing
 fancier) is carried verbatim on the node. What a field MUST contain, and which

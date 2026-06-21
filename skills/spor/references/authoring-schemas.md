@@ -53,6 +53,10 @@ register` schema with the same `register:` name.)
 - `capturable: false` — never produced by the capture/ingest path.
 - `status.non_resolving` — statuses that count as *not* resolving for the
   completion gate (an `abandoned` task resolves nothing).
+- `status.terminal` — statuses in which a node's OWN lifecycle is complete,
+  read by work-analytics (unioned with the kernel's legacy terminal set). Use it
+  for a status that ends the node's life but is intentionally not a global
+  terminal — e.g. decision `settled`, which still surfaces in briefings.
 
 Note what the payload does **not** hold: there is no field list and no status
 *enum*. Extra frontmatter fields are allowed as-is — a custom `severity:` line

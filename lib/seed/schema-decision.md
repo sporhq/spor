@@ -2,7 +2,7 @@
 id: schema-decision
 type: schema
 kind: node-schema
-schema_version: 2026.06.21.1
+schema_version: 2026.06.21.2
 title: Seed schema for decision nodes
 summary: Node schema for the decision type — a choice that was made, with the why. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -54,6 +54,21 @@ sweep) to read. SNOOZE is the default, SETTLE the permanent escape. Additive/
 backward-readable: one new optional status value + one new optional scalar, no
 node-shape change, no upgrade chain.
 
+`status.terminal` (2026.06.21.2, issue-spor-analytics-completion-ignores-schema-
+terminal-status): the decision type's own-lifecycle terminal vocabulary —
+`superseded`/`rejected`/`settled` — declared on the registry so work-analytics
+counts a decision completed off `graph.registry.terminalStatuses()` (unioned with
+the kernel's legacy type-blind set) rather than a hardcoded table
+(dec-cc-registry-as-data). This is the lifecycle twin of `non_resolving`: that
+partition governs whether a decision retires OTHERS (resolver semantics, only
+`rejected`); this one governs whether the decision's OWN lifecycle is done.
+`settled` is terminal for that lifecycle but is deliberately ABSENT from
+`resolution.js`'s TERMINAL set (queue liveness / briefing surfacing must keep a
+settled decision live, dec-spor-decision-lifecycle-surfacing), so without this
+partition a settled decision lingered in analytics WIP and the oldest-open
+bottleneck list forever. Registry behavior only, no node-shape change,
+backward-readable, no upgrade chain.
+
 ```json
 {
   "node_type": "decision",
@@ -64,6 +79,11 @@ node-shape change, no upgrade chain.
   "status": {
     "non_resolving": [
       "rejected"
+    ],
+    "terminal": [
+      "superseded",
+      "rejected",
+      "settled"
     ]
   }
 }
