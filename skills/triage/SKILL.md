@@ -203,8 +203,9 @@ downstream when done, so it earns the top priority. Blocked dependents need no
 priority — they're hidden until their blocker lands. Standalone high-value items
 that gate nothing sit a tier below the unblockers.
 
-Priority is ordinary frontmatter and (today) has no dedicated CLI verb, so set
-it via `put_node`/the `set_priority` MCP tool (see the cheat-sheet). It blends
+Priority is ordinary frontmatter; set it with the mode-aware `spor priority <id>
+<p1|p2|p3|clear>` verb (remote POSTs `/v1/nodes/{id}/priority`, local rewrites the
+frontmatter in place; in Cowork use the `set_priority` MCP tool). It blends
 into ranking as roughly +6/+3/+1 for p1/p2/p3 on top of the graph signals
 (+3·blocking, −3·blocked_by), and a human `priority:` stays supreme over the
 computed signals — which is exactly why you set it deliberately rather than
@@ -226,17 +227,19 @@ picks to *do* (not the blocked or dormant ones) and offer a briefing on one.
 
 ## Writes cheat-sheet
 
-Reading resolves mode on its own (`spor next`, `spor get`, `spor brief`). The
-*write* verbs below have no `spor` CLI form yet, so in a shell (remote mode) hit
-the REST endpoint against the resolved server; in Cowork use the MCP tool. See
+Reading resolves mode on its own (`spor next`, `spor get`, `spor brief`), and
+`spor priority <id> <p1|p2|p3|clear>` sets priority in either mode. The *other*
+write verbs below have no `spor` CLI form yet, so in a shell (remote mode) hit the
+REST endpoint against the resolved server; in Cowork use the MCP tool. See
 `/spor:spor` + API.md for the authoritative contract.
 
-| Action | REST (shell, remote) | MCP (Cowork) |
+| Action | Shell (CLI verb, or REST in remote mode) | MCP (Cowork) |
 |---|---|---|
-| Read a node (raw + revision + enrichment) | `GET /v1/nodes/<id>` | `get_node` |
+| Read a node (raw + revision + enrichment) | `spor get <id>` (or `GET /v1/nodes/<id>`) | `get_node` |
+| Set priority | `spor priority <id> <p1\|p2\|p3\|clear>` (or `POST /v1/nodes/<id>/priority {priority}`) | `set_priority` |
 | Set status (merged/rejected/resolved/…) | `POST /v1/nodes/<id>/status {status}` | `set_status` |
 | Add edge (supersedes/blocks/relates-to/answers) | `POST /v1/nodes/<id>/edges {type, to}` | `add_edge` |
-| Edit a field (priority, body) | `POST /v1/nodes {nodes:[{node, if_exists:"update", revision}]}` | `put_node` / `set_priority` |
+| Edit a field (body) | `POST /v1/nodes {nodes:[{node, if_exists:"update", revision}]}` | `put_node` |
 | Compile a question's lineage | `spor brief <id>` | `query_graph root_id=<id>` |
 
 Edges normalize/flip/dedupe server-side, so write a `blocks` from the
