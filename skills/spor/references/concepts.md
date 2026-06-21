@@ -15,7 +15,7 @@ the decision queue (QUEUE.md §4).
 |---|---|---|---|
 | decision | `dec-` | a choice that was made, with the why | status `active`/`superseded`/`rejected`/`settled`; a **rejected** decision is a dismissed approach — keep the reason; **settled** = in force but acknowledged as just-context, exempt from the gardener decay-sweep (optional `reviewed_at` ISO scalar snoozes it) |
 | task | `task-` | active or planned work | status `open`/`active`/`done`/`abandoned`; queueable; `done` needs a resolving `decision`/`artifact` (see SKILL routing → /spor:next) |
-| issue | `issue-` | a defect and its resolution lineage | status `open`/`active`/`resolved`; queueable |
+| issue | `issue-` | a defect and its resolution lineage | status `open`/`active`/`resolved`; queueable; `resolved` needs a resolving `decision`/`artifact` (see SKILL routing → /spor:next) |
 | incident | `inc-` | something that went wrong in operation | queueable |
 | artifact | `art-`, `spec-` | a document, spec, module, or build product | optional delivery status `in-review`/`approved`/`merged`/`released` |
 | norm | `norm-` | a standing convention or constraint | `always_on: true` — rides along in every project-relevant compile (capped to the topically relevant subset); narrow it to specific repos with `applies_to_tags:`/`applies_to_repos:`/`applies_to_projects:` |

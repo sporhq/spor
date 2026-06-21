@@ -900,6 +900,22 @@ test("seed pack: task done / issue resolved require a decision or artifact resol
     "an active decision resolver allows done (active is resolving)");
   assert.equal(doneGate({ resolvers: [{ id: "dec-y", type: "decision" }] }).allow, true,
     "no partition on the view counts every resolver (backward-readable)");
+
+  // task-spor-schema-issue-resolved-gate-tightening: the issue resolved-gate now
+  // mirrors task done — it reads the SAME resolving partition off
+  // view.non_resolving_statuses, so an in-review change keeps the issue open, a
+  // landed (merged) one allows resolved, and an omitted partition counts every
+  // resolver as before (backward-readable).
+  const resolvedGate = gateFor("issue", "resolved");
+  const issueInReview = resolvedGate({ resolvers: [{ id: "art-pr", type: "artifact", status: "in-review" }], non_resolving_statuses: partition });
+  assert.equal(issueInReview.allow, false, "an in-review resolver does not allow resolved");
+  assert.match(issueInReview.reason, /RESOLVING/);
+  assert.equal(resolvedGate({ resolvers: [{ id: "art-pr", type: "artifact", status: "merged" }], non_resolving_statuses: partition }).allow, true,
+    "a merged resolver allows resolved");
+  assert.equal(resolvedGate({ resolvers: [{ id: "dec-y", type: "decision", status: "active" }], non_resolving_statuses: partition }).allow, true,
+    "an active decision resolver allows resolved (active is resolving)");
+  assert.equal(resolvedGate({ resolvers: [{ id: "dec-y", type: "decision" }] }).allow, true,
+    "no partition on the view counts every resolver (backward-readable)");
 });
 
 test("seed pack: the task get() hook rides along a held-task churn note (task-spor-queue-front-loop-self-limit-on-held-tasks)", () => {

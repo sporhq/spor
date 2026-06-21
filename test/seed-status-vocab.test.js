@@ -86,11 +86,20 @@ test("seed schema-task: validate() accepts 'done' (vocabulary); completion gate 
   assert.equal(withResolver.allow, true, "done WITH a resolving resolver is allowed by transitions()");
 });
 
-test("seed schema-issue: validate() accepts 'resolved' (vocabulary); resolver gate stays in transitions()", () => {
+test("seed schema-issue: validate() accepts 'resolved' (vocabulary); resolving-resolver gate stays in transitions()", () => {
   assert.deepEqual(callValidate("issue", { id: "issue-x", status: "resolved" }), [], "resolved is a valid issue status");
-  const noResolver = callTransitions("issue", { status: "active" }, { id: "issue-x", status: "resolved" }, { resolvers: [] });
+  // transitions() requires a RESOLVING resolver for resolved, mirroring
+  // schema-task's done gate (task-spor-schema-issue-resolved-gate-tightening,
+  // dec-spor-definition-of-done-org-policy).
+  const noResolver = callTransitions("issue", { status: "active" }, { id: "issue-x", status: "resolved" },
+    { resolvers: [], non_resolving_statuses: ["in-review", "approved"] });
   assert.equal(noResolver.allow, false, "resolved without a resolver is denied by transitions()");
   const withResolver = callTransitions("issue", { status: "active" }, { id: "issue-x", status: "resolved" },
-    { resolvers: [{ id: "dec-x", type: "decision", status: "" }] });
-  assert.equal(withResolver.allow, true, "resolved WITH a resolver is allowed by transitions()");
+    { resolvers: [{ id: "dec-x", type: "decision", status: "" }], non_resolving_statuses: ["in-review", "approved"] });
+  assert.equal(withResolver.allow, true, "resolved WITH a resolving resolver is allowed by transitions()");
+  // a resolver still in review does NOT satisfy the gate — the write-time mirror
+  // of the read-time retirement rule (dec-spor-definition-of-done-org-policy).
+  const inReview = callTransitions("issue", { status: "active" }, { id: "issue-x", status: "resolved" },
+    { resolvers: [{ id: "art-pr", type: "artifact", status: "in-review" }], non_resolving_statuses: ["in-review", "approved"] });
+  assert.equal(inReview.allow, false, "an in-review resolver does not allow resolved");
 });

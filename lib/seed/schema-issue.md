@@ -2,7 +2,7 @@
 id: schema-issue
 type: schema
 kind: node-schema
-schema_version: 2026.06.20.1
+schema_version: 2026.06.21.1
 title: Seed schema for issue nodes
 summary: Node schema for the issue type — a defect/finding and its resolution lineage; queueable, so open issues join the decision queue. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -40,6 +40,21 @@ edge from a `decision` or `artifact` node, read off `view.resolvers`
 was fixed, even in a few lines, where the neighborhood can surface it. (Issues
 have no abandon path; `resolved` is the only terminal, so it is always gated.)
 Both are write-time gates, backward-readable (no stored-shape change), no
+upgrade chain.
+
+`transitions()` + `status` (2026.06.21.1, dec-spor-definition-of-done-org-policy):
+the `resolved` gate tightens to mirror schema-task's `done` gate
+(task-spor-schema-issue-resolved-gate-tightening) — it requires the inbound
+resolver to be in a *resolving* state, not merely present. The host supplies the
+registry's resolving partition on the view as `non_resolving_statuses` (the same
+`status.non_resolving` the kernel's `resolutionMap` reads), and the gate counts a
+decision/artifact resolver only when its status is not named there. So a human
+cannot hand-flip `resolved` past an in-review change — the write-time mirror of
+the read-time retirement rule. Issues declare no `status.non_resolving` of their
+own (the `open`/`active`/`resolved` vocabulary carries no withdrawn or in-review
+state), so the type contributes nothing to the partition; the gate only READS it.
+Absent the partition on the view (an older server) every resolver counts exactly
+as before, so the gate is backward-readable with no node-shape change and no
 upgrade chain.
 
 `get()` (2026.06.19.1): the read-time enrichment hook
@@ -106,20 +121,33 @@ export function transitions(current, proposed, view) {
     return { allow: false, reason: statusReason(next) };
   }
   // (2) resolution must record a durable outcome on the graph: a decision or
-  // artifact that resolves this issue (task-cc-terminal-status-requires-resolver).
+  // artifact that resolves this issue (task-cc-terminal-status-requires-resolver),
+  // AND that resolver must be in a RESOLVING state — not an in-review change
+  // (dec-spor-definition-of-done-org-policy). This mirrors schema-task's `done`
+  // gate (task-spor-schema-issue-resolved-gate-tightening). view.resolvers = live
+  // inbound resolves/answers edges with their source type and status;
+  // view.non_resolving_statuses = the registry's resolving partition the host
+  // supplies (the same status.non_resolving the kernel's resolutionMap reads). A
+  // resolver counts unless its status is named non-resolving, so an older host
+  // that omits the partition behaves exactly as before (backward-readable). Issues
+  // have no abandon path; `resolved` is the only terminal, so it is always gated.
   if (next === "resolved") {
     const rs = (view && view.resolvers) || [];
+    const nonResolving = (view && view.non_resolving_statuses) || [];
     let ok = false;
     for (let i = 0; i < rs.length; i++) {
-      if (rs[i].type === "decision" || rs[i].type === "artifact") { ok = true; break; }
+      const isChange = rs[i].type === "decision" || rs[i].type === "artifact";
+      const st = ((rs[i] && rs[i].status) || "").toLowerCase();
+      if (isChange && nonResolving.indexOf(st) === -1) { ok = true; break; }
     }
     if (!ok) {
       return {
         allow: false,
-        reason: "resolved requires a decision or artifact node that resolves " +
-          "this issue (an inbound resolves edge) — record how it was fixed on " +
-          "the graph, even a few lines, so it surfaces in the neighborhood. " +
-          "(task-cc-terminal-status-requires-resolver)",
+        reason: "resolved requires a decision or artifact node in a RESOLVING " +
+          "state that resolves this issue (an inbound resolves edge) — record " +
+          "how it was fixed on the graph, even a few lines, so it surfaces in " +
+          "the neighborhood; a change still in review keeps the issue open " +
+          "until it lands. (task-cc-terminal-status-requires-resolver)",
       };
     }
   }

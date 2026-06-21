@@ -141,15 +141,18 @@ a change still in review has not delivered. So:
   GitHub reflection adapter and a native Spor review surface write the same
   thing. Who may assert `merged`/`released` (the self-approval trust seam) is
   later-stage policy, not a write gate here.
-- The read-time truth (`resolutionMap`) and the write-time `done`-gate both read
-  this **resolving-status partition off `graph.registry`** — never a hardcoded
+- The read-time truth (`resolutionMap`) and the write-time completion gate (a
+  task reaching `done`, an issue reaching `resolved`) both read this
+  **resolving-status partition off `graph.registry`** — never a hardcoded
   table. The partition is the union of each node-schema's `status.non_resolving`
   list; the seed declares `decision: [rejected]`, `task: [abandoned]`,
   `artifact: [in-review, approved]`, reproducing the prior behavior
-  byte-identically. An org or team retunes the bar by editing a schema node, no
-  code change. A resolver with no delivery stage (the common case) resolves
-  exactly as before, so a change still in review keeps its task live without any
-  hand-managed `open` status.
+  byte-identically (`issue` carries no `status.non_resolving` of its own — its
+  `open`/`active`/`resolved` vocabulary names no withdrawn or in-review state, so
+  the type only READS the partition). An org or team retunes the bar by editing a
+  schema node, no code change. A resolver with no delivery stage (the common
+  case) resolves exactly as before, so a change still in review keeps its task or
+  issue live without any hand-managed `open` status.
 
 ## The org-defined policy layer
 
