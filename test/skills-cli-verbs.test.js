@@ -134,14 +134,15 @@ test('the verb scanner finds invocations in both skills and docs', () => {
 
 // Regression guard for the exact drift that motivated this test: prose must not
 // claim an operation "has no CLI verb" / "no `spor` CLI form" when one now
-// exists. Scoped to the micro-mutation operations that DO have a verb. NOTE:
-// set-status / add-edge are deliberately NOT here — they have no CLI verb yet
-// (task-spor-set-status-edge-cli-verbs), so disclaiming THOSE stays correct.
-// Extend VERB_BACKED_OPS when a new micro-mutation verb ships. This check is
-// line-based (a disclaimer is prose, not a code span) and runs over docs too —
-// verified false-positive-free (the docs carry no such disclaimer lines today).
+// exists. Scoped to the micro-mutation operations that DO have a verb. `edge`
+// covers add_edge (the `spor edge` verb shipped in task-spor-set-status-edge-cli-
+// verbs); remove_edge (DELETE /v1/nodes/{id}/edges) still has no verb, so a
+// withdrawal disclaimer should be phrased without the bare word "edge". Extend
+// VERB_BACKED_OPS when a new micro-mutation verb ships. This check is line-based
+// (a disclaimer is prose, not a code span) and runs over docs too — verified
+// false-positive-free (no skill or doc carries such a disclaimer line today).
 const DISCLAIMER_RE = /no (?:dedicated )?(?:`spor` )?cli (?:verb|form)|has no\b[^.]{0,40}\bcli verb/i;
-const VERB_BACKED_OPS = ['priority'];
+const VERB_BACKED_OPS = ['priority', 'set-status', 'edge'];
 
 test('no skill or doc disclaims a CLI verb that exists', () => {
   // every op we guard must actually resolve, or the guard itself is stale

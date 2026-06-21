@@ -227,18 +227,19 @@ picks to *do* (not the blocked or dormant ones) and offer a briefing on one.
 
 ## Writes cheat-sheet
 
-Reading resolves mode on its own (`spor next`, `spor get`, `spor brief`), and
-`spor priority <id> <p1|p2|p3|clear>` sets priority in either mode. The *other*
-write verbs below have no `spor` CLI form yet, so in a shell (remote mode) hit the
-REST endpoint against the resolved server; in Cowork use the MCP tool. See
+Reading resolves mode on its own (`spor next`, `spor get`, `spor brief`), and the
+precise-write verbs `spor priority`, `spor set-status`, and `spor edge` all work in
+either mode (local: in-place file write; remote: the micro-mutation route). The
+remaining writes below have no `spor` CLI form yet, so in a shell (remote mode) hit
+the REST endpoint against the resolved server; in Cowork use the MCP tool. See
 `/spor:spor` + API.md for the authoritative contract.
 
 | Action | Shell (CLI verb, or REST in remote mode) | MCP (Cowork) |
 |---|---|---|
 | Read a node (raw + revision + enrichment) | `spor get <id>` (or `GET /v1/nodes/<id>`) | `get_node` |
 | Set priority | `spor priority <id> <p1\|p2\|p3\|clear>` (or `POST /v1/nodes/<id>/priority {priority}`) | `set_priority` |
-| Set status (merged/rejected/resolved/…) | `POST /v1/nodes/<id>/status {status}` | `set_status` |
-| Add edge (supersedes/blocks/relates-to/answers) | `POST /v1/nodes/<id>/edges {type, to}` | `add_edge` |
+| Set status (merged/rejected/resolved/…) | `spor set-status <id> <status>` (or `POST /v1/nodes/<id>/status {status}`) | `set_status` |
+| Add edge (supersedes/blocks/relates-to/answers) | `spor edge <id> <type> <to>` (or `POST /v1/nodes/<id>/edges {type, to}`) | `add_edge` |
 | Edit a field (body) | `POST /v1/nodes {nodes:[{node, if_exists:"update", revision}]}` | `put_node` |
 | Compile a question's lineage | `spor brief <id>` | `query_graph root_id=<id>` |
 

@@ -1246,6 +1246,293 @@ async function cmdPriority(cfg, { positionals }) {
   return 0;
 }
 
+// --- spor set-status / spor edge ----------------------------------------
+// The CLI wrappers for the set_status (POST /v1/nodes/{id}/status) and add_edge
+// (POST /v1/nodes/{id}/edges) micro-mutations (task-spor-set-status-edge-cli-
+// verbs): the precise-write counterparts to the prose-only `spor add` capture, so
+// a shell user flips a node's status — which CLAIMS it on an active status
+// (dec-cc-task-claim-lease) — or closes a loop with an edge, without dropping to
+// raw curl. Both have REST + MCP twins (set_status / add_edge) but lacked a verb.
+//
+// Mode-aware like `priority`: remote mode POSTs the micro-mutation route (the
+// server runs the transitions() gate, normalizes the edge, and claims on an
+// active status); local mode does the read-modify-write itself against the node
+// file, mirroring the server's forceStatus / insertEdgeLine so a local node reads
+// the same after the mutation. Local mode has no lease (dec-cc-task-claim-lease
+// "Local mode": no pool or contention), so an active status sets the field
+// without a claim — symmetric with local dispatch skipping the claim.
+const NODE_ID_RE = /^[a-z0-9][a-z0-9-]*$/; // mirrors the server's ID_RE/SLUG_RE
+
+// Rewrite a node's raw markdown to carry `value` as its status, mirroring the
+// server's forceStatus (store.js): strip any existing status line, then append
+// `status: <value>` at the end of the frontmatter block. Returns the new raw, or
+// null when the frontmatter can't be located.
+function rewriteStatus(raw, value) {
+  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(raw);
+  if (!m) return null;
+  let fm = m[1];
+  const body = m[2];
+  fm = fm.replace(/(^|\n)status:[^\n]*/g, "").replace(/\n+$/, "").replace(/^\n+/, "");
+  return `---\n${fm}\nstatus: ${value}\n---\n${body}`;
+}
+
+async function cmdSetStatus(cfg, { positionals }) {
+  const id = positionals[0];
+  const rawStatus = positionals[1];
+  if (!id || rawStatus == null || String(rawStatus).trim() === "") {
+    err("usage: spor set-status <id> <status>");
+    err("  set a node's status; an active status (e.g. active/open/in-progress) also claims it");
+    return 1;
+  }
+  const value = String(rawStatus).trim();
+
+  if (cfg.mode() === "remote") {
+    // The server validates the status against the type's enum + transitions()
+    // gate and, on an active-category status, claims the node (creates/refreshes
+    // the lease) — the response carries the lease so the user learns the outcome.
+    const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/status`, { status: value }, { timeoutMs: 8000 });
+    if (r.transport) {
+      err(`offline — could not reach server (${r.error})`);
+      return 1;
+    }
+    if (r.status === 404) {
+      err(`no such node: ${id}`);
+      return 1;
+    }
+    if (!r.ok) {
+      const e = (r.json && r.json.error) || {};
+      err(`set-status error ${r.status}${e.message ? `: ${e.message}` : ""}`);
+      if (Array.isArray(e.details)) for (const d of e.details) err(`  ${d}`);
+      return 1;
+    }
+    out(`status set: ${id} -> ${value}`);
+    const lease = r.json && r.json.lease;
+    if (lease) {
+      if (lease.error) err(`  note: not claimed (${lease.error}${lease.holder ? `, held by ${lease.holder}` : ""})`);
+      else out(`  claimed${lease.expires_at ? ` (lease expires ${lease.expires_at})` : ""}`);
+    }
+    return 0;
+  }
+
+  // local: rewrite the node file's status frontmatter in place, mirroring the
+  // server's read-modify-write (no server to POST to, no lease to take). When the
+  // type's schema declares a status enum, reject an out-of-vocabulary value the
+  // same way the server's setStatus does (registry is the contract); types whose
+  // vocabulary lives in a sandbox validate() fn aren't enum-checked here, exactly
+  // as the server's membership check skips them.
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const nodesDir = cfg.nodesDir();
+  const file = path.join(nodesDir, `${id}.md`);
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    err(`no such node: ${id}`);
+    return 1;
+  }
+  let g;
+  try {
+    g = graphLib.loadGraph(nodesDir);
+  } catch (e) {
+    err(`could not load graph: ${e.message}`);
+    return 1;
+  }
+  const type = g.nodes[id] && g.nodes[id].type;
+  const schema = type && g.registry.nodeSchemas ? g.registry.nodeSchemas.get(type) : null;
+  const allowed = schema && schema.payload && schema.payload.fields && schema.payload.fields.status && schema.payload.fields.status.enum;
+  if (Array.isArray(allowed) && !allowed.includes(value)) {
+    err(`status '${value}' not allowed for type '${type}' — allowed: ${allowed.join(", ")}`);
+    return 1;
+  }
+  const newRaw = rewriteStatus(raw, value);
+  if (newRaw == null) {
+    err(`could not locate frontmatter in ${id}`);
+    return 1;
+  }
+  let node;
+  try {
+    node = graphLib.parseFrontmatter(newRaw, `${id}.md`);
+  } catch (e) {
+    err(`invalid node after status rewrite: ${e.message}`);
+    return 1;
+  }
+  const v = graphLib.validateNode(g, node);
+  if (!v.ok) {
+    err(`invalid node after status rewrite:\n  ${v.errors.join("\n  ")}`);
+    return 1;
+  }
+  fs.writeFileSync(file, newRaw);
+  out(`status set: ${id} -> ${value}`);
+  return 0;
+}
+
+// Validate + normalize `--attr key=value` pairs to a flat {k: String(v)} map (or
+// null when none), mirroring the server's normalizeEdgeAttrs: only [\w-] tokens
+// round-trip through the frontmatter edge grammar, type/to are structural (not
+// attributes), and empty values are dropped.
+function parseEdgeAttrs(rawList) {
+  const list = rawList == null ? [] : Array.isArray(rawList) ? rawList : [rawList];
+  if (!list.length) return { attrs: null };
+  const out = {};
+  for (const item of list) {
+    const s = String(item);
+    const idx = s.indexOf("=");
+    if (idx < 1) return { error: `--attr must be key=value (got '${item}')` };
+    const k = s.slice(0, idx).trim();
+    const val = s.slice(idx + 1).trim();
+    if (k === "type" || k === "to") return { error: `edge attribute '${k}' is reserved — it names the edge's structure, not an override` };
+    if (!/^[\w-]+$/.test(k)) return { error: `edge attribute key '${k}' must be [A-Za-z0-9_-]` };
+    if (val === "") continue;
+    if (!/^[\w-]+$/.test(val)) return { error: `edge attribute value '${val}' must be [A-Za-z0-9_-] (the frontmatter edge grammar)` };
+    out[k] = val;
+  }
+  return { attrs: Object.keys(out).length ? out : null };
+}
+
+// Render an attribute map to the `, k: v` tail insertEdgeLine appends, byte-
+// matching the server's renderEdgeAttrs (sorted keys, blanks dropped).
+function renderEdgeAttrsTail(attrs) {
+  if (!attrs) return "";
+  return Object.keys(attrs)
+    .filter((k) => attrs[k] != null && attrs[k] !== "")
+    .sort()
+    .map((k) => `, ${k}: ${attrs[k]}`)
+    .join("");
+}
+
+// Append a `  - {type: T, to: TO[, k: v]}` line to a node's frontmatter, mirroring
+// the server's insertEdgeLine: insert after the last existing edge (or after the
+// `edges:` key), creating the block at the end of the frontmatter when absent.
+// Returns the new raw, or null when the frontmatter can't be located.
+function appendEdgeLine(raw, type, to, attrs) {
+  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(raw);
+  if (!m) return null;
+  const body = m[2];
+  const line = `  - {type: ${type}, to: ${to}${renderEdgeAttrsTail(attrs)}}`;
+  const lines = m[1].split("\n");
+  const EDGE_LINE = /^\s*-\s*\{type:/;
+  let edgesKey = -1, lastEdge = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^edges:\s*$/.test(lines[i])) edgesKey = i;
+    if (EDGE_LINE.test(lines[i])) lastEdge = i;
+  }
+  if (edgesKey === -1) lines.push("edges:", line);
+  else lines.splice((lastEdge > edgesKey ? lastEdge : edgesKey) + 1, 0, line);
+  return `---\n${lines.join("\n")}\n---\n${body}`;
+}
+
+async function cmdEdge(cfg, { values, positionals }) {
+  const id = positionals[0];
+  const type = positionals[1];
+  const to = positionals[2];
+  if (!id || !type || !to) {
+    err("usage: spor edge <id> <type> <to> [--attr key=value]");
+    err("  add a typed edge from <id> to <to> (e.g. blocks, resolves, relates-to)");
+    return 1;
+  }
+  const attrsRes = parseEdgeAttrs(values.attr);
+  if (attrsRes.error) {
+    err(attrsRes.error);
+    return 1;
+  }
+  const attrs = attrsRes.attrs;
+
+  if (cfg.mode() === "remote") {
+    const body = { type, to };
+    if (attrs) body.attrs = attrs;
+    const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/edges`, body, { timeoutMs: 8000 });
+    if (r.transport) {
+      err(`offline — could not reach server (${r.error})`);
+      return 1;
+    }
+    if (!r.ok) {
+      const e = (r.json && r.json.error) || {};
+      err(`edge error ${r.status}${e.message ? `: ${e.message}` : ""}`);
+      if (Array.isArray(e.details)) for (const d of e.details) err(`  ${d}`);
+      return 1;
+    }
+    // The server echoes the node actually modified — an inverse form flips the
+    // canonical edge onto the target, so r.id may differ from the id we passed.
+    const echoed = (r.json && r.json.id) || id;
+    const skipped = r.json && r.json.status === "skipped";
+    out(skipped
+      ? `edge already present: ${id} -[${type}]-> ${to}`
+      : `edge added: ${id} -[${type}]-> ${to}${echoed !== id ? ` (stored on ${echoed})` : ""}`);
+    return 0;
+  }
+
+  // local: normalize + validate + append, mirroring store.addEdge — an inverse
+  // form puts the canonical edge on the OTHER node (swap src/target), a rename
+  // canonicalizes, the edge type must be known, both ids well-formed, the source
+  // must exist, and the target must exist (add_edge never creates a dangling
+  // edge). Edge-type tables come from the registry, never a hardcoded list.
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const nodesDir = cfg.nodesDir();
+  let g;
+  try {
+    g = graphLib.loadGraph(nodesDir);
+  } catch (e) {
+    err(`could not load graph: ${e.message}`);
+    return 1;
+  }
+  const reg = g.registry;
+  let srcId = id, edgeType = type, target = to;
+  const inverses = reg.edgeInverses();
+  const renames = reg.edgeRenames();
+  if (inverses[edgeType]) {
+    edgeType = inverses[edgeType];
+    const t = srcId; srcId = target; target = t;
+  } else if (renames[edgeType]) {
+    edgeType = renames[edgeType];
+  }
+  if (!NODE_ID_RE.test(srcId) || !NODE_ID_RE.test(target)) {
+    err(`bad node id ('${srcId}' / '${target}')`);
+    return 1;
+  }
+  if (!reg.isKnownEdge(edgeType)) {
+    err(`unknown edge type '${type}'`);
+    err(`  known edge types: ${[...reg.knownEdgeTypes()].sort().join(", ")}`);
+    return 1;
+  }
+  const file = path.join(nodesDir, `${srcId}.md`);
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    err(`no such node: ${srcId}`);
+    return 1;
+  }
+  if (!g.nodes[target]) {
+    err(`edge target '${target}' does not exist — create it first (add_edge never creates dangling edges)`);
+    return 1;
+  }
+  const existing = (g.nodes[srcId] && g.nodes[srcId].edges) || [];
+  if (existing.some((e) => e.type === edgeType && e.to === target) && !attrs) {
+    out(`edge already present: ${id} -[${type}]-> ${to}`);
+    return 0;
+  }
+  const newRaw = appendEdgeLine(raw, edgeType, target, attrs);
+  if (newRaw == null) {
+    err(`could not locate frontmatter in ${srcId}`);
+    return 1;
+  }
+  let node;
+  try {
+    node = graphLib.parseFrontmatter(newRaw, `${srcId}.md`);
+  } catch (e) {
+    err(`invalid node after edge add: ${e.message}`);
+    return 1;
+  }
+  const v = graphLib.validateNode(g, node);
+  if (!v.ok) {
+    err(`invalid node after edge add:\n  ${v.errors.join("\n  ")}`);
+    return 1;
+  }
+  fs.writeFileSync(file, newRaw);
+  out(`edge added: ${id} -[${type}]-> ${to}${srcId !== id ? ` (stored on ${srcId})` : ""}`);
+  return 0;
+}
+
 // Persist server/token into the USER config (never a committable repo config).
 // Shared by 'join' and the 'install --server/--token' configure step. Only the
 // keys given are touched, so a token-only update keeps the existing server.
@@ -5021,6 +5308,48 @@ const COMMANDS = {
     options: {},
     examples: ["spor priority issue-86 p1", "spor priority task-x p3", "spor priority issue-86 clear"],
     run: (cfg, p) => cmdPriority(cfg, p),
+  },
+  "set-status": {
+    group: "Graph", parse: "strict", args: "<id> <status>", aliases: ["status-set"],
+    summary: "set a node's status, claiming it on an active status (local: in-place; remote: /v1/nodes/{id}/status)",
+    help:
+      "Set a node's status — the precise-write counterpart to the prose-only 'spor\n" +
+      "add'. Setting a work node to an ACTIVE status (active/open/in-progress, or any\n" +
+      "status a schema maps to the active category) also CLAIMS it: the server takes\n" +
+      "the heartbeat lease that keeps the item out of teammates' actionable queues\n" +
+      "(dec-cc-task-claim-lease), and the response reports whether you hold it. A\n" +
+      "terminal status (done/abandoned/resolved/…) leaves any claim untouched —\n" +
+      "release is its own op. Remote mode POSTs /v1/nodes/{id}/status (the set_status\n" +
+      "micro-mutation; the server runs the type's status enum + transitions() gate, so\n" +
+      "e.g. 'done' on a task still needs a resolving decision/artifact); local mode\n" +
+      "rewrites the node file's status in place (no lease — local has no claim pool).",
+    options: {},
+    examples: ["spor set-status task-x active", "spor set-status question-7 answered", "spor set-status issue-9 resolved"],
+    run: (cfg, p) => cmdSetStatus(cfg, p),
+  },
+  edge: {
+    group: "Graph", parse: "strict", args: "<id> <type> <to>", aliases: ["add-edge"],
+    summary: "add a typed edge from a node (local: in-place; remote: /v1/nodes/{id}/edges)",
+    help:
+      "Add a typed edge from <id> to <to> — close a loop with 'resolves', mark a\n" +
+      "dependency with 'blocks'/'blocked-by', or relate two nodes — without a raw\n" +
+      "curl or a whole-node rewrite. The edge type must be known to the registry\n" +
+      "(canonical, a rename alias, or an inverse form, which stores the canonical\n" +
+      "edge on the OTHER node); both ids must already exist (add_edge never creates\n" +
+      "a dangling edge — create the target first). Re-adding an existing edge is an\n" +
+      "idempotent no-op. --attr key=value (repeatable) carries flat edge attributes\n" +
+      "(e.g. a per-assignment 'profile:' override). Remote mode POSTs\n" +
+      "/v1/nodes/{id}/edges (the add_edge micro-mutation); local mode appends the\n" +
+      "edge line to the node file, normalizing and validating it the same way.",
+    options: {
+      attr: { type: "string", value: "key=value", desc: "flat edge attribute (repeatable)", multiple: true },
+    },
+    examples: [
+      "spor edge dec-x resolves task-y",
+      "spor edge task-a blocked-by task-b",
+      "spor edge task-x assigned agent-z --attr profile=profile-fast",
+    ],
+    run: (cfg, p) => cmdEdge(cfg, p),
   },
 
   // --- Repo scoping ---

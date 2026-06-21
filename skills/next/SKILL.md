@@ -102,8 +102,10 @@ one plain sentence of "why this is first" is enough. Then:
    THEN flip `status:` with `set_status`. A bare flip with no
    `decision`/`artifact` resolver is denied at the door
    (task-cc-terminal-status-requires-resolver). `abandoned` (task) is exempt —
-   won't-do work records nothing, so a plain `set_status` is fine. (Locally,
-   write the resolver node file and add the edge, then edit the status.)
+   won't-do work records nothing, so a plain `set_status` is fine. In a shell
+   either mode, `spor edge <resolver> resolves <item>` then `spor set-status
+   <item> <status>` does both writes without curl (locally they rewrite the node
+   files in place; the resolver node itself you still author with `spor add`).
 3. **`capture-pending` item** → read it (`spor get <id>`), decide what
    it should have been, write the proper node(s), then close the pending node
    with `set_status`: `merged` when its content now lives in the node(s) you
