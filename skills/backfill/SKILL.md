@@ -14,8 +14,11 @@ re-runnable — run this again whenever you add a repo.
 If the current repo has little or no graph content yet, offer to backfill it:
 spawn the **spor-backfill subagent** (Task tool, `subagent_type:
 spor:spor-backfill`) pointed at this repo — it mines git history, design docs,
-and issue trackers into typed nodes, edges first. Skip this when the repo is
-already well represented (the enumeration in step 2 tells you what is present).
+and issue trackers into typed nodes, edges first (and, against a gated remote
+graph, resolvers before the terminal nodes they resolve, so a born-`done`/
+`resolved` node isn't rejected by the completion-resolver gate). Skip this when
+the repo is already well represented (the enumeration in step 2 tells you what
+is present).
 The heavy mining always runs in the subagent, never inline in this session.
 
 ## 2. Suggest project groupings

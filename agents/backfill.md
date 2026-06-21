@@ -21,7 +21,13 @@ Method:
 1. Inventory the source first (git log --stat, issue lists, doc indexes) and
    draft the id list BEFORE writing bodies — ids must be predictable so edges
    written in parallel resolve. Check existing nodes to avoid duplicate ids
-   and to find edge targets.
+   and to find edge targets. When you emit through a **gated** path (a remote
+   server's REST/MCP write rather than local file writes), order matters beyond
+   id prediction: a born-terminal node — a `done` task, a `resolved` issue — is
+   rejected unless its resolving `decision`/`artifact` already exists on the
+   graph (the completion-resolver gate, GRAPH.md), so emit each resolver BEFORE
+   the terminal node it resolves, or build the node open→resolve→done. Local
+   file writes (the default below) are ungated and order-free.
 2. Aggregate, don't transcribe. One node per durable fact: a decision with its
    why, an issue with its full resolution lineage (found → fixed-in → verified),
    a spec with its current status. NEVER one node per commit; collapse

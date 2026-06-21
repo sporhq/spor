@@ -136,6 +136,20 @@ state-framed gates like this one apply to the born status, while change-framed
 gates (status-change-requires-author) see no transition. It is backward-readable,
 so existing terminal nodes are untouched.
 
+Because the gate runs per node at write time, **a born-terminal node needs its
+resolver to already exist on the graph**, which has one ordering consequence for
+automated multi-node writers. A batch `POST /v1/nodes` applies its entries
+sequentially — each is fully validated before the next — so a batch that lists a
+born-terminal node BEFORE the `decision`/`artifact` that resolves it is rejected
+(`transition_denied`) on that node, even though the resolver appears later in the
+same batch. The batch path does **not** defer the gate to end-of-batch
+(dec-spor-batch-create-gate-resolver-first-ordering): the contract is
+**resolver-first ordering** — emit each resolver before the terminal node it
+resolves, or build the node open→resolve→done. The normal authoring flow
+(create-open → record outcome → set_status) and `/spor:backfill` (whose
+`spor-backfill` subagent orders resolvers first) both satisfy this by
+construction; local-mode file writes are ungated and so order-free.
+
 The resolver must also be in a **resolving** state, not merely present
 (dec-spor-definition-of-done-org-policy). Completion bundled three axes —
 *recorded* (a why exists), *reviewed*, and *delivered* — and a resolver that is
