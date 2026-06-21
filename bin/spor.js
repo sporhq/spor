@@ -604,6 +604,89 @@ async function cmdGet(cfg, { positionals }) {
   }
 }
 
+// --- spor blame / commits: commit-sha -> nodes reverse lookup ---------------
+// (task-spor-blame-commit-lookup-cli-verb) The shell verb over the commit->node
+// reverse index: which decisions/tasks/issues reference a git commit in their
+// `commits:` field — blame a line, get the why, without curl. Dual-mode like
+// `get` (norm-spor-cli-mode-parity): remote dispatches to GET /v1/commits/{sha}
+// (the server's store.lookupCommit); local scans the graph home with the pure
+// lib/query.js twin. The reverse link was reachable over REST/MCP but had no
+// shell verb (task-cc-commit-linking gave node->commit; this is commit->node).
+// An empty result is VALID (exit 0) — a commit linked to no node — never an error.
+async function cmdBlame(cfg, { positionals, values }) {
+  const raw = positionals[0];
+  if (!raw) {
+    err("usage: spor blame <sha> [--repo <slug>]   (alias: spor commits <sha>)");
+    return 1;
+  }
+  // Mirror the server's gate: lowercase, then 7-40 hex (abbreviated or full).
+  const sha = String(raw).toLowerCase();
+  if (!/^[0-9a-f]{7,40}$/.test(sha)) {
+    err(`bad sha '${raw}' — give 7-40 hex chars (abbreviated or full).`);
+    return 1;
+  }
+  const repo = values.repo || null;
+  if (repo && !/^[a-z0-9][a-z0-9-]*$/.test(repo)) {
+    err(`bad --repo '${repo}' — a kebab-case repo slug (^[a-z0-9][a-z0-9-]*$).`);
+    return 1;
+  }
+
+  let matches;
+  if (cfg.mode() === "remote") {
+    const q = repo ? `?repo=${encodeURIComponent(repo)}` : "";
+    const r = await remote.get(cfg, `/v1/commits/${encodeURIComponent(sha)}${q}`, { timeoutMs: 6000 });
+    if (r.transport) {
+      err(`offline — could not reach server (${r.error})`);
+      return 1;
+    }
+    if (r.status === 422) {
+      const msg = r.json && r.json.error && r.json.error.message;
+      err(`invalid request${msg ? ` — ${msg}` : ""}`);
+      return 1;
+    }
+    if (!r.ok) {
+      err(`error ${r.status}`);
+      return 1;
+    }
+    matches = r.json && Array.isArray(r.json.matches) ? r.json.matches : [];
+  } else {
+    // local: scan the graph home with the pure lib/query.js lookup.
+    const nodesDir = cfg.nodesDir();
+    if (!fs.existsSync(nodesDir)) {
+      err(`no Spor graph at ${nodesDir} — run 'spor init', or set SPOR_SERVER for a team graph.`);
+      return 1;
+    }
+    const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+    const { lookupCommit } = require(path.join(ROOT, "lib", "query.js"));
+    matches = lookupCommit(graphLib.loadGraph(nodesDir), sha, repo);
+  }
+
+  // Stable, mode-symmetric order (node id, then stored sha) — local already
+  // sorts in lookupCommit; sort the server's insertion-order matches the same
+  // way so the human/JSON output is identical regardless of mode.
+  matches.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : a.sha < b.sha ? -1 : a.sha > b.sha ? 1 : 0));
+
+  // Mode-symmetric JSON: the same {sha, repo?, matches} shape in both modes.
+  if (values.json) {
+    out(JSON.stringify({ sha, ...(repo ? { repo } : {}), matches }, null, 2));
+    return 0;
+  }
+  if (!matches.length) {
+    out(`no nodes reference commit ${sha}${repo ? ` in ${repo}` : ""}`);
+    return 0;
+  }
+  out(`${sha} — referenced by ${matches.length} node${matches.length === 1 ? "" : "s"}:`);
+  for (const m of matches) {
+    const meta = [m.type, m.status].filter(Boolean).join(", ");
+    out(`  ${m.id}${meta ? `  [${meta}]` : ""}`);
+    const desc = m.title || m.summary;
+    if (desc) out(`      ${desc}`);
+    const loc = [`${m.repo}@${m.sha}`, m.project ? `project: ${m.project}` : null].filter(Boolean).join(" · ");
+    out(`      ${loc}`);
+  }
+  return 0;
+}
+
 // --- spor lens / render-lens: view a saved lens (REMOTE only) ---------------
 // (task-cc-spor-cli-lens-render) Lens RENDERING lives entirely server-side in
 // the engine half (lib-engine; art-cc-lib-boundary moved it out of the client
@@ -5192,6 +5275,24 @@ const COMMANDS = {
     help: "Print one node's raw markdown by id. Remote mode reads /v1/nodes/<id>; local\nmode reads the node file. A missing node exits 1.",
     examples: ["spor get dec-cc-zero-dep-client"],
     run: (cfg, p) => cmdGet(cfg, p),
+  },
+  blame: {
+    group: "Graph", parse: "strict", args: "<sha> [--repo <slug>]", aliases: ["commits"],
+    summary: "which nodes reference a commit (local: graph scan; remote: /v1/commits/<sha>)",
+    help:
+      "Reverse-lookup a git commit to the decision/task/issue nodes that reference it\n" +
+      "in their commits: field — blame a line, get the why, without curl. The mirror\n" +
+      "of commit-linking (which records node->commit); this is commit->node.\n\n" +
+      "The sha is 7-40 hex chars, abbreviated or full (matched prefix-aware against\n" +
+      "the stored shas). --repo scopes to one repo slug. An empty result is normal\n" +
+      "(a commit linked to no node) and exits 0. Remote mode reads /v1/commits/<sha>;\n" +
+      "local mode scans the graph home. --json emits {sha, repo?, matches}.",
+    options: {
+      repo: { type: "string", value: "slug", desc: "scope to one repo slug" },
+      json: { type: "boolean", desc: "machine-readable JSON output" },
+    },
+    examples: ["spor blame b384469", "spor commits b384469 --repo spor", "spor blame b384469 --json"],
+    run: (cfg, p) => cmdBlame(cfg, p),
   },
   lens: {
     group: "Graph", parse: "raw", args: "[<id>]", aliases: ["render-lens"],

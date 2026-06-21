@@ -13,7 +13,7 @@ const os = require("os");
 const path = require("path");
 
 const graph = require(path.join(__dirname, "..", "lib", "graph.js"));
-const { queryGraph } = require(path.join(__dirname, "..", "lib", "query.js"));
+const { queryGraph, lookupCommit } = require(path.join(__dirname, "..", "lib", "query.js"));
 
 function tmpGraph(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-query-test-"));
@@ -285,4 +285,58 @@ test("query CLI: a missing nodes dir prints a clear message and exits 0", () => 
   const r = cli(path.join(os.tmpdir(), "spor-query-absent-" + Math.random()), ["--ids"]);
   assert.equal(r.status, 0);
   assert.match(r.stderr, /no Spor graph at /);
+});
+
+// ---------------- lookupCommit (the commit->node reverse lookup) ----------------
+// The pure twin of the server's store.lookupCommit, wrapped by `spor blame`
+// (task-spor-blame-commit-lookup-cli-verb). A node carries a commits: repo@sha
+// list; lookupCommit returns the match rows {repo, sha, id, type, ...}.
+const commitNode = (id, type, commits, extra = {}) => [
+  `${id}.md`,
+  `---
+id: ${id}
+type: ${type}
+project: ${extra.project || "demo"}
+title: Title of ${id}
+summary: Summary for ${id}.
+${extra.status ? `status: ${extra.status}\n` : ""}commits: [${commits.join(", ")}]
+date: 2026-06-01
+---
+Body of ${id}.
+`,
+];
+
+test("lookupCommit: matches a commit across nodes, prefix-aware both directions", () => {
+  const g = tmpGraph(Object.fromEntries([
+    commitNode("dec-x", "decision", ["spor@b384469abc1234", "api@deadbeef1234567"]),
+    commitNode("task-y", "task", ["spor@b384469"], { status: "open" }),
+    commitNode("dec-z", "decision", ["spor@cafef00d000000"]),
+  ])).load();
+  // abbreviated query matches both the full and the abbreviated stored sha
+  const m = lookupCommit(g, "b384469");
+  assert.deepEqual(m.map((x) => x.id), ["dec-x", "task-y"]); // sorted by id
+  assert.equal(m[1].status, "open");
+  // a full query matches an abbreviated stored sha (q.startsWith(cs)) but not a
+  // divergent full stored sha
+  const full = lookupCommit(g, "b384469ffffffffff");
+  assert.deepEqual(full.map((x) => x.id), ["task-y"]);
+});
+
+test("lookupCommit: --repo scopes to one repo; lowercases the query", () => {
+  const g = tmpGraph(Object.fromEntries([
+    commitNode("dec-x", "decision", ["spor@b384469abc1234", "api@deadbeef1234567"]),
+    commitNode("task-y", "task", ["spor@b384469"]),
+  ])).load();
+  assert.deepEqual(lookupCommit(g, "b384469", "api").map((x) => x.id), []);
+  assert.deepEqual(lookupCommit(g, "deadbeef", "api").map((x) => x.id), ["dec-x"]);
+  // the query is matched case-insensitively (server lowercases the route param)
+  assert.deepEqual(lookupCommit(g, "B384469").map((x) => x.id), ["dec-x", "task-y"]);
+});
+
+test("lookupCommit: an empty/garbage query and unlinked sha return []", () => {
+  const g = tmpGraph(Object.fromEntries([
+    commitNode("dec-x", "decision", ["spor@b384469abc1234"]),
+  ])).load();
+  assert.deepEqual(lookupCommit(g, ""), []);
+  assert.deepEqual(lookupCommit(g, "0badf00d"), []);
 });

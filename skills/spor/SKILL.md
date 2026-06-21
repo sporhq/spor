@@ -84,6 +84,7 @@ the rest are mode-specific (`spor status` confirms which mode you're in):
 spor status                    # resolved mode, graph, project, identity, health
 spor next [--project <slug>]   # the ranked decision queue — "what's next"
 spor get <id>                  # one node by id
+spor blame <sha> [--repo <s>]  # which nodes reference a git commit (alias: spor commits <sha>)
 spor add "<2-3 sentences>"     # capture a node (typed file locally; /v1/capture remotely)
 spor correct <target> "<text>" # standing briefing correction (corr file locally; /v1/corrections remotely)
 spor priority <id> <p1|p2|p3|clear>  # set/clear queue human-triage priority (local: rewrite frontmatter; remote: /v1/nodes/{id}/priority)
