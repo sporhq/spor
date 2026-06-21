@@ -440,13 +440,13 @@ The run engine's claim/complete API. Full contract and the reference worker
 live with [workers/shim/README.md](workers/shim/README.md); a worker is
 anything with a token.
 
-| Endpoint | Semantics |
-|---|---|
-| `POST /v1/workflows/{id}/run` `{inputs?}` | start a run on an ACTIVE workflow → `{run_id, revision, workflow, workflow_version, state}` |
-| `GET /v1/work?capability=a,b` | claimable steps across live runs, filtered by capability → `{work, count, generated_at}`; approval steps are excluded (they surface in the queue, not as worker-claimable work) |
-| `POST /v1/runs/{id}/steps/{sid}/claim` `{iteration?}` | claim a ready step → `{run_id, step, lease, state}`; a step that isn't claimable is a 409 |
-| `POST /v1/runs/{id}/steps/{sid}/complete` `{lease, status, result?, log?, iteration?}` | report a verdict (`status: succeeded \| failed` only — anything else is 422). An expired/superseded lease is `409 lease_expired`; a same-generation retry that disagrees with the recorded outcome is `409 outcome_conflict` — redo the work under a fresh lease |
-| `GET /v1/runs/{id}` | full run record: `{run_id, status, project, title, initiator, workflow, workflow_version, lineage, state, revision, timestamps?}` |
+| Endpoint | Typical caller | Semantics |
+|---|---|---|
+| `POST /v1/workflows/{id}/run` `{inputs?}` | `spor run`, `run_workflow` MCP tool | start a run on an ACTIVE workflow → `{run_id, revision, workflow, workflow_version, state}` |
+| `GET /v1/work?capability=a,b` | run worker (workers/shim) | claimable steps across live runs, filtered by capability → `{work, count, generated_at}`; approval steps are excluded (they surface in the queue, not as worker-claimable work) |
+| `POST /v1/runs/{id}/steps/{sid}/claim` `{iteration?}` | run worker (workers/shim) | claim a ready step → `{run_id, step, lease, state}`; a step that isn't claimable is a 409 |
+| `POST /v1/runs/{id}/steps/{sid}/complete` `{lease, status, result?, log?, iteration?}` | run worker (workers/shim) | report a verdict (`status: succeeded \| failed` only — anything else is 422). An expired/superseded lease is `409 lease_expired`; a same-generation retry that disagrees with the recorded outcome is `409 outcome_conflict` — redo the work under a fresh lease |
+| `GET /v1/runs/{id}` | `spor run status` | full run record: `{run_id, status, project, title, initiator, workflow, workflow_version, lineage, state, revision, timestamps?}` |
 
 ## 4. Identity and auth
 
