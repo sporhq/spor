@@ -13,7 +13,7 @@ the decision queue (QUEUE.md §4).
 
 | type | id prefix | purpose | notes |
 |---|---|---|---|
-| decision | `dec-` | a choice that was made, with the why | status `active`/`superseded`/`rejected`; a **rejected** decision is a dismissed approach — keep the reason |
+| decision | `dec-` | a choice that was made, with the why | status `active`/`superseded`/`rejected`/`settled`; a **rejected** decision is a dismissed approach — keep the reason; **settled** = in force but acknowledged as just-context, exempt from the gardener decay-sweep (optional `reviewed_at` ISO scalar snoozes it) |
 | task | `task-` | active or planned work | status `open`/`active`/`done`/`abandoned`; queueable; `done` needs a resolving `decision`/`artifact` (see SKILL routing → /spor:next) |
 | issue | `issue-` | a defect and its resolution lineage | status `open`/`active`/`resolved`; queueable |
 | incident | `inc-` | something that went wrong in operation | queueable |

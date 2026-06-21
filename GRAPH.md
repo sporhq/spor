@@ -96,7 +96,7 @@ Rules:
 
 | type       | prefix    | what it is                                                |
 |------------|-----------|-----------------------------------------------------------|
-| decision   | `dec-`    | a choice that was made, with the why (status `active`/`superseded`/`rejected`, gated) |
+| decision   | `dec-`    | a choice that was made, with the why (status `active`/`superseded`/`rejected`/`settled`, gated; `settled` = in force but acknowledged as just-context, exempt from the gardener decay-sweep — optional `reviewed_at` ISO scalar snoozes that sweep) |
 | task       | `task-`   | active or planned work (status `open`/`active`/`done`/`abandoned`, gated; `done` requires a `decision`/`artifact` resolver — see below) |
 | issue      | `issue-`  | a defect/finding and its resolution lineage (queueable: open issues join the decision queue; status `open`/`active`/`resolved`, gated; `resolved` requires a `decision`/`artifact` resolver — see below) |
 | incident   | `inc-`    | something that went wrong in operation (queueable: live incidents join the decision queue) |

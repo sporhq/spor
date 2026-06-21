@@ -827,7 +827,7 @@ test("seed pack: core type schemas gate status to their vocabulary", () => {
   const cases = {
     task: { ok: ["open", "active", "done", "abandoned", ""], bad: ["dismissed", "resolved", "merged", "wip"] },
     issue: { ok: ["open", "active", "resolved", ""], bad: ["dismissed", "done", "closed"] },
-    decision: { ok: ["active", "superseded", "rejected", ""], bad: ["dismissed", "done", "resolved"] },
+    decision: { ok: ["active", "superseded", "rejected", "settled", ""], bad: ["dismissed", "done", "resolved"] },
     question: { ok: ["open", "answered", ""], bad: ["dismissed", "resolved", "closed"] },
   };
   for (const [type, { ok, bad }] of Object.entries(cases)) {

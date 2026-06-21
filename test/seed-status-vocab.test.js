@@ -42,7 +42,7 @@ const callTransitions = (key, cur, prop, view) =>
 const CASES = {
   task: { valid: ["open", "active", "done", "abandoned"], bad: ["in_progress", "doing", "closed", "dismissed", "wip"] },
   issue: { valid: ["open", "active", "resolved"], bad: ["in_progress", "done", "closed", "dismissed", "fixed"] },
-  decision: { valid: ["active", "superseded", "rejected"], bad: ["dismissed", "declined", "open", "done"] },
+  decision: { valid: ["active", "superseded", "rejected", "settled"], bad: ["dismissed", "declined", "open", "done"] },
   question: { valid: ["open", "answered"], bad: ["resolved", "closed", "answered!", "done"] },
   "capture-pending": { valid: ["merged", "rejected"], bad: ["dismissed", "resolved", "closed", "pending", "done"] },
 };

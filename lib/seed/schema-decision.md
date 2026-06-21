@@ -2,7 +2,7 @@
 id: schema-decision
 type: schema
 kind: node-schema
-schema_version: 2026.06.20.1
+schema_version: 2026.06.21.1
 title: Seed schema for decision nodes
 summary: Node schema for the decision type — a choice that was made, with the why. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -33,6 +33,27 @@ kernel reads off `graph.registry` (dec-spor-definition-of-done-org-policy);
 resolution.js no longer hardcodes the `{rejected, abandoned}` set. Registry
 behavior only, no node-shape change, backward-readable, no upgrade chain.
 
+`settled` status + `reviewed_at` snooze stamp (2026.06.21.1,
+task-spor-decision-settled-snooze-status, dec-spor-decision-lifecycle-surfacing):
+a terminal **`settled`** status joins the vocab — "in force, acknowledged as
+just context, exempt from the gardener decision-decay review-sweep,
+permanently." It is RESOLVING (a settled decision still retires the targets it
+resolves — only `rejected` sits in `non_resolving`) and it does NOT touch
+queueability: decisions stay non-queueable (`queueable` is unset; norm-cc-blocks-
+work-only), so `spor next` is byte-identical and `settled` is NOT added to the
+kernel's `resolution.js` TERMINAL set — relevance-surfacing in the
+digest/briefing stays untouched (dec-spor-decision-lifecycle-surfacing: a
+settled decision SHOULD keep appearing when relevant). The companion
+**`reviewed_at`** is an OPTIONAL flat ISO-timestamp scalar (snooze): the
+server gardener stamps it when a human defers a decay-finding, resetting the
+decay clock so the decision re-surfaces only after another cooling window. Like
+the artifact `delivery_*` scalars, the kernel never reads `reviewed_at` — it
+rides along on the node (the regex frontmatter parser already supports flat
+`key: value` scalars) for the server sweep (task-spor-gardener-decision-decay-
+sweep) to read. SNOOZE is the default, SETTLE the permanent escape. Additive/
+backward-readable: one new optional status value + one new optional scalar, no
+node-shape change, no upgrade chain.
+
 ```json
 {
   "node_type": "decision",
@@ -55,12 +76,14 @@ behavior only, no node-shape change, backward-readable, no upgrade chain.
 // (issue-spor-node-create-bypasses-status-vocabulary): the membership check used
 // to live only in the update-path gate, so a decision could be BORN with an
 // off-vocabulary status that a later re-validating write then rejected.
-const VALID = ["active", "superseded", "rejected"];
+const VALID = ["active", "superseded", "rejected", "settled"];
 function statusReason(next) {
   return "invalid decision status '" + next + "': valid statuses are active " +
     "(in force), superseded (replaced by a newer decision), rejected " +
     "(recorded then declined/reversed — also how a dismissed approach is " +
-    "filed) — or none, meaning live. (dec-cc-status-enforcement-via-transitions)";
+    "filed), settled (in force but acknowledged as just-context — exempt from " +
+    "the gardener decision-decay review-sweep, permanently) — or none, meaning " +
+    "live. (dec-cc-status-enforcement-via-transitions)";
 }
 
 // validate(node) — the door, runs on EVERY write (create AND update) in the
