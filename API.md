@@ -355,6 +355,22 @@ as `my_queue`; `types` restricts node types; `weeks`/`top`/`aging` shape the
 window. The MCP twin of `GET /v1/analytics` (§3) over the same `store.analytics`
 core — for the shell-less Cowork audience that can't run the CLI.
 
+### `schema`
+
+Introspect the live schema registry — the contract as data
+(task-spor-schema-introspection-surface; server half
+task-spor-server-schema-endpoint). Input `{ "type"?, "code"? }`. With no `type`
+it returns the full snapshot (the same shape as `GET /v1/schema`: `node_types`,
+`edge_types`, `queue_policy`, `policies`, `registers`, `default_edge_weight`,
+`stale_overrides`, `alias_collisions`), the seed pack merged with graph-resident
+`type: schema` overrides and each entry tagged by `source`
+(`seed`/`graph`/`native`). With `type` it returns just that node/edge type's
+entry. `code: true` embeds each `validate()`/`transitions()`/`get()` hook's
+source. The MCP twin of the `spor schema` CLI and `GET /v1/schema`, sharing one
+`graph.registry.snapshot()` core. Read this instead of reverse-engineering the
+contract from `lib/seed/` files — those miss resident overrides
+(norm-cc-registry-is-contract).
+
 ### The MCP-app widget (`ui://spor/view-tree.html`)
 
 `my_queue` and `render_lens` declare a UI resource via
@@ -375,6 +391,7 @@ endpoint is the REST twin of a core call:
 | Endpoint | Typical caller | Semantics |
 |---|---|---|
 | `GET /v1/status` | session-start, monitoring | `{node_count, projects: {...}, head, uptime, metrics}`; doubles as the health check. `?titles=1` adds `titles: [{id, type, project, title}]` — the one-round-trip graph index the distiller dedups against |
+| `GET /v1/schema` | `spor schema`, agents introspecting the contract | the live schema registry as data (task-spor-schema-introspection-surface; server half task-spor-server-schema-endpoint): `{default_edge_weight, node_types: [{type, description, prefix, always_on, traversable, capturable, queueable, non_resolving, hooks, schema_id, schema_version, source}], edge_types: [{type, description, weight, weight_default, inverse_label, aliases, capturable, hooks, ...}], queue_policy, policies, registers, stale_overrides, alias_collisions}` — the seed pack MERGED with graph-resident `type: schema` overrides, each entry tagged by `source` (`seed`/`graph`/`native`) and the active schema node's id+version. `?code=1` embeds each hook's source under `code: {name: src}` (omitted by default to keep the response lean). The registry IS the contract (norm-cc-registry-is-contract); this read surface closes the failure mode of agents reverse-engineering it from `lib/seed/` files (which miss resident overrides). The REST/MCP twin of the `spor schema` CLI: all three render one `graph.registry.snapshot()` so they never drift |
 | `GET /v1/me` | `spor whoami`/`status`, onboarding | identity echo for the bearer token → `{person, name, email, bound, is_admin, org}`. `bound:false` means the token authenticates but maps to **no person node** (legacy/OAuth, or minted before the node existed), so routed questions and the personal queue will be empty — the client warns on it (the silent identity-degradation signal). `is_admin` reflects the `stewards→root` edge that gates the token-admin surface. `org` is the slug this tenant routes to (`SPOR_ORG`/legacy `SUBSTRATE_ORG`, else `"local"`); it lets a client key its `(issuer, org)` credential store for an **opaque** `spor_oat_`/`spor_pat_` token that carries no readable `org` claim — the client falls back to it after `--org` and the JWT `org` claim (task-spor-frontdoor-me-org-echo). A connector JWT's `org` claim is enforced equal to this echo |
 | `GET /v1/me/org-choices` | `spor auth list` (live membership refresh) | re-queries the IdP's *current* org membership for the held credential's subject and returns `{org_choices: [{slug, label, default?}], source: "idp"\|"bound"}` — `source:"idp"` is a true live enumeration (orgs added/removed since the last login surface without re-authenticating); `source:"bound"` means a single org-scoped token the server couldn't expand (no enumeration). The client treats only `source:"idp"` as live and **fails open** to its cached tenant listing on anything else — `source:"bound"`, a `502 {error.code:"membership_requery_failed"}` (IdP unreachable), a `404` (older server without the endpoint), or any transport/parse error (task-spor-cli-auth-list-live-membership-requery; server half task-spor-frontdoor-held-credential-membership-requery) |
 | `GET /v1/briefing/{project}` | session-start | read the `brief-<project>` node → `{found, version, body, project_brief?, graph_status}`. The slug resolves through project-node aliases (GRAPH.md "Project identity nodes") before lookup. A BARE repo slug also rides up to its home-project grouping: the grouping's `brief-<grouping>` node returns alongside as `project_brief` (the product context spanning sibling repos), matching the shared up-resolution (dec-spor-queue-slug-resolves-to-grouping); passing the repo NODE id (`repo-<slug>`) is the escape hatch that returns only the repo brief, no `project_brief`. Optional `?fp=root:<sha>,remote:<host/path>,...` carries the repo's fingerprints: the server learns them onto the owning project node, and an unknown slug with a known fingerprint files an alias proposal in the queue |

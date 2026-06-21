@@ -1,10 +1,18 @@
 # Spor concepts reference
 
 The full ontology behind the orientation in SKILL.md. The seed pack
-(`lib/seed/`) is the source of truth; an org's graph-resident `type: schema`
-nodes override or extend it. Anything here may be overridden in a given graph
-— check the effective schema in your own graph (`spor get schema-<type>`) when
-exactness matters.
+(`lib/seed/`) is the default; an org's graph-resident `type: schema` nodes
+override or extend it. Anything here may be overridden in a given graph, so
+**don't reverse-engineer the contract from `lib/seed/` files** — that misses
+resident overrides. Introspect the LIVE registry instead:
+
+- `spor schema` — the whole ontology (every node/edge type, prefixes, weights,
+  flags, status partition), seed + resident overrides merged, each entry tagged
+  by provenance (seed / graph / native).
+- `spor schema <type>` — one type in detail, including its
+  `validate()`/`transitions()`/`get()` gate source.
+- `spor schema --json` — the machine snapshot (the same shape the server's
+  `GET /v1/schema` returns). Remote mode reflects the server's live registry.
 
 ## Node types
 

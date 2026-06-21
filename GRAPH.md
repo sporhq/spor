@@ -8,7 +8,11 @@
 > graph-resident `type: schema` node overrides or extends any entry here.
 > This file remains accurate documentation of the seed pack and of the node
 > file format, but when this prose and the registry disagree, the registry
-> wins — see QUEUE.md §2.
+> wins — see QUEUE.md §2. To read the LIVE registry (seed + resident overrides
+> merged, provenance-tagged) rather than this prose, run `spor schema`
+> (`spor schema <type>` for one type's gates) or `GET /v1/schema` — don't
+> reverse-engineer the contract from `lib/seed/` files
+> (task-spor-schema-introspection-surface).
 
 The Spor graph lives OUTSIDE code repos, at `$SPOR_HOME` (the legacy
 `SUBSTRATE_HOME` spelling is still read; default `~/.spor/`, or the legacy

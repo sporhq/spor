@@ -1137,6 +1137,56 @@ async function analyticsRemote(cfg, args) {
   return 0;
 }
 
+// schema introspects the LIVE registry — node/edge types, id prefixes, edge
+// weights, the ride-along flags, the status-resolution partition, and the
+// attached validate()/transitions()/get() gates — merging the seed pack with
+// graph-resident overrides and tagging each entry's provenance
+// (task-spor-schema-introspection-surface). The read surface that closes the
+// failure mode of agents reverse-engineering the contract from lib/seed/ files
+// (norm-cc-registry-is-contract). Unlike query/analytics it is NOT local-only:
+// the registry exists in BOTH modes, so remote mode reflects the SERVER's live
+// registry (its resident overrides) via GET /v1/schema, while local mode (or any
+// --nodes) reads loadGraph().registry directly.
+async function cmdSchema(cfg, args) {
+  // --nodes always names a local checkout (like query/analytics); local mode
+  // reads the local registry. Both are the byte-identical lib/schema.js CLI.
+  if (namesLocalGraph(args) || cfg.mode() !== "remote") {
+    return passthrough("schema.js", args);
+  }
+  // Remote: the live registry (with the server graph's resident overrides) lives
+  // on the server. Render its GET /v1/schema body with the SAME renderer the
+  // local CLI uses (lib/schema.js present()), so output is identical across modes.
+  const schemaLib = require(path.join(ROOT, "lib", "schema.js"));
+  const has = (n) => args.includes(`--${n}`);
+  // first non-flag, non-flag-value token = the optional <type> positional.
+  const flagValIdx = new Set();
+  for (let i = 0; i < args.length; i++) if (args[i] === "--nodes" || args[i] === "--source") flagValIdx.add(i + 1);
+  const type = args.find((a, i) => !a.startsWith("--") && !flagValIdx.has(i)) || null;
+  // ?code=1 only when a detail/--code view needs the hook source, so the common
+  // overview response stays lean (mirrors the local CLI's wantCode).
+  const wantCode = has("code") || type != null;
+  const r = await remote.get(cfg, `/v1/schema${wantCode ? "?code=1" : ""}`, { timeoutMs: 8000 });
+  if (r.transport) {
+    err(`could not reach the server (${r.error}) — schema introspection needs the live registry.`);
+    err(`  Read a local checkout instead:  spor schema --nodes <graph-checkout>/nodes`);
+    return 1;
+  }
+  if (r.status === 404 || r.status === 501) {
+    err(`this server does not expose GET /v1/schema yet (the introspection endpoint).`);
+    err(`  Read a local checkout:    spor schema --nodes <graph-checkout>/nodes`);
+    err(`  Or read one schema node:  spor get schema-<type>`);
+    return 1;
+  }
+  if (!r.ok || !r.json) {
+    err(`schema introspection failed (HTTP ${r.status})${r.json && r.json.error ? ": " + r.json.error : ""}`);
+    return 1;
+  }
+  const only = has("edges") ? "edges" : has("nodes-only") ? "nodes" : null;
+  const res = schemaLib.present(r.json, { type, only, source: optVal(args, "source"), json: has("json") });
+  (res.stderr ? err : out)(res.text);
+  return res.code;
+}
+
 // --- spor add / capture -------------------------------------------------
 // Local: write a well-formed node so a user never has to learn the frontmatter
 // (issue-cc-local-mode-capture-queue-surfacing-gap). Remote: POST /v1/capture,
@@ -5679,6 +5729,38 @@ const COMMANDS = {
       "spor analytics --weeks 8 --json",
     ],
     run: (cfg, args) => cmdAnalytics(cfg, args),
+  },
+  schema: {
+    group: "Graph", parse: "raw", args: "[<type>] [--edges] [--json]",
+    summary: "introspect the live schema registry (local; remote via the server)",
+    help:
+      "Introspect the LIVE schema registry — the contract (norm-cc-registry-is-\n" +
+      "contract): every node and edge type with its id prefixes, edge weights, ride-\n" +
+      "along flags (always_on / traversable / capturable / queueable), the status-\n" +
+      "resolution partition, and the attached validate()/transitions()/get() gates.\n" +
+      "Merges the seed pack with graph-resident `type: schema` overrides and tags each\n" +
+      "entry's provenance (seed / graph / native). Query this instead of reading\n" +
+      "lib/seed/ files directly — those miss graph-resident overrides.\n" +
+      "\n" +
+      "Local mode reads the local graph's registry; remote mode reflects the SERVER's\n" +
+      "live registry (GET /v1/schema). Point --nodes at a local checkout to read one\n" +
+      "under a server.\n" +
+      "\n" +
+      "  <type>            detail for one node/edge type (flags, provenance, and each\n" +
+      "                    validate()/transitions()/get() hook's source)\n" +
+      "  --edges           list edge types only\n" +
+      "  --nodes-only      list node types only\n" +
+      "  --source <s>      filter the lists by provenance (seed | graph | native)\n" +
+      "  --code            include hook source in --json (implied for <type>)\n" +
+      "  --json            machine-readable snapshot\n" +
+      "  --nodes <dir>     read this local graph dir instead of the resolved home",
+    examples: [
+      "spor schema",
+      "spor schema task",
+      "spor schema --edges --json",
+      "spor schema --source graph",
+    ],
+    run: (cfg, args) => cmdSchema(cfg, args),
   },
   correct: {
     group: "Graph", parse: "strict", args: "<target> [guidance]", aliases: ["propose-correction"],

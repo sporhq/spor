@@ -85,6 +85,9 @@ spor status                    # resolved mode, graph, project, identity, health
 spor next [--project <slug>]   # the ranked decision queue — "what's next"
 spor get <id>                  # one node by id
 spor blame <sha> [--repo <s>]  # which nodes reference a git commit (alias: spor commits <sha>)
+spor schema [<type>]           # introspect the live registry (types/prefixes/weights/flags/gates,
+                               #   seed + resident overrides, provenance-tagged) — query this, don't
+                               #   read lib/seed/. Remote reflects the server's registry (GET /v1/schema)
 spor add "<2-3 sentences>"     # capture a node (typed file locally; /v1/capture remotely)
 spor correct <target> "<text>" # standing briefing correction (corr file locally; /v1/corrections remotely)
 spor priority <id> <p1|p2|p3|clear>  # set/clear queue human-triage priority (local: rewrite frontmatter; remote: /v1/nodes/{id}/priority)
@@ -139,6 +142,19 @@ edges instead, filterable by `--edge-type`, `--from <id>` (out-edges) and
 `--to <id>` (in-edges), e.g. `spor query --edges --edge-type grouped-under
 --to proj-rdi` answers "what is grouped under proj-rdi". Projections: default
 table, `--ids`, `--summary`, `--full`, `--json`.
+
+`spor schema` is the contract introspection surface (norm-cc-registry-is-
+contract): it renders the LIVE registry — every node and edge type with its id
+prefixes, edge weights, ride-along flags
+(`always_on`/`traversable`/`capturable`/`queueable`), the status-resolution
+partition, and the attached `validate()`/`transitions()`/`get()` gates —
+**merging the seed pack with graph-resident `type: schema` overrides** and
+tagging each entry's provenance (`seed`/`graph`/`native`). `spor schema <type>`
+shows one type in detail with its gate source; `--edges`/`--nodes-only` narrow
+the lists, `--source seed|graph|native` filters by provenance, `--json` is the
+machine snapshot. Reach for this instead of reading `lib/seed/` files — those
+miss resident overrides. Both modes work: local reads the local registry, remote
+reflects the server's live registry via `GET /v1/schema`.
 
 `spor next --project <token>` accepts three forms: a **repo slug** (resolves
 *up* to its home-project grouping and unions the members — the intuitive token),
