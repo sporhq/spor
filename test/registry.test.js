@@ -350,6 +350,27 @@ test("seed pack: edge weights match the historic EDGE_WEIGHTS table exactly", ()
   assert.equal(reg.edgeWeight("invented-edge"), 0.3);
 });
 
+test("seed pack: edge aliases canonicalize at the write door (edgeRenames)", () => {
+  const reg = graph.seedRegistry();
+  const renames = reg.edgeRenames();
+  // The historic write-path synonyms (GRAPH.md "Edge types").
+  assert.equal(renames["related-to"], "relates-to");
+  assert.equal(renames["derives-from"], "derived-from");
+  assert.equal(renames["supercedes"], "supersedes");
+  // approved-by is the review-approval synonym: the policy gate counts it, so
+  // the write path must accept it and canonicalize to reviewed-by rather than
+  // reject it as unknown (issue-spor-approved-by-edge-unregistered).
+  assert.equal(renames["approved-by"], "reviewed-by");
+  // Model the write door: canonicalize via edgeRenames, then gate on
+  // isKnownEdge. approved-by alone is not a canonical type (isKnownEdge checks
+  // canonical names only), but its rename target is known and keeps weight 0.5.
+  const canon = renames["approved-by"] ?? "approved-by";
+  assert.equal(reg.isKnownEdge(canon), true);
+  assert.equal(reg.edgeWeight(canon), 0.5);
+  // No alias/inverse collisions in the seed pack now that approved-by is wired.
+  assert.deepEqual(reg.aliasCollisions(), []);
+});
+
 test("seed pack: node types, prefixes, ride-along, and traversal match GRAPH.md", () => {
   const reg = graph.seedRegistry();
   for (const t of ["decision", "task", "issue", "incident", "artifact", "norm", "briefing", "correction"]) {

@@ -832,7 +832,8 @@ Edges are written in the canonical direction above, but the server's write
 path accepts two normalized forms (API.md §1, registry data on each
 edge schema): **aliases** — same-direction synonyms renamed in place
 (`related-to` → `relates-to`, `derives-from` → `derived-from`,
-`supercedes` → `supersedes`) — and **inverse labels** — the edge read from
+`supercedes` → `supersedes`, `approved-by` → `reviewed-by`) — and **inverse
+labels** — the edge read from
 the target's side, flipped onto the target node on write (`blocked-by` →
 `blocks`, `answered-by` → `answers`, `superseded-by` → `supersedes`).
 Hand-written nodes should still use the canonical forms.

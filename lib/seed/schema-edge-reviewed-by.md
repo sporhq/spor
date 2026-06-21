@@ -2,10 +2,10 @@
 id: schema-edge-reviewed-by
 type: schema
 kind: edge-schema
-schema_version: 2026.06.16.1
+schema_version: 2026.06.21.1
 title: Seed schema for reviewed-by edges
-summary: Edge schema for the reviewed-by type — this person reviewed and approved the node; the approving outcome of the review-as-graph-object lifecycle that the org-defined policy layer's quorum gate counts. Seed-pack default; a graph-resident schema node overrides it.
-date: 2026-06-16
+summary: Edge schema for the reviewed-by type — this person reviewed and approved the node; the approving outcome of the review-as-graph-object lifecycle that the org-defined policy layer's quorum gate counts. Canonicalizes the `approved-by` synonym at the write door. Seed-pack default; a graph-resident schema node overrides it.
+date: 2026-06-21
 ---
 
 Seed schema for the `reviewed-by` edge type (work node → person), shipped
@@ -23,6 +23,13 @@ require a quorum of approvals from a named role before a work node reaches a
 resolving/`done` state, and self-approval can never launder past the native
 floor.
 
+`approved-by` is a registered **alias**: the write path renames it to
+`reviewed-by` in place (registry `edgeRenames()`, GRAPH.md "Edge types"), so
+an `add_edge`/`put_node` of `approved-by` is accepted and canonicalized rather
+than rejected as an unknown type, and the submit-review flip primitive handles
+an `approved-by` submission identically to a `reviewed-by` one
+(issue-spor-approved-by-edge-unregistered).
+
 Weight is mid (0.5, the `relates-to`/`assigned` tier): an approval is a real
 outcome worth pulling through a briefing, but not a structural dependency.
 
@@ -30,6 +37,7 @@ outcome worth pulling through a briefing, but not a structural dependency.
 {
   "edge_type": "reviewed-by",
   "description": "this person reviewed and approved the node (counts toward a policy quorum)",
-  "weight": 0.5
+  "weight": 0.5,
+  "aliases": ["approved-by"]
 }
 ```
