@@ -31,6 +31,12 @@ const remote = require(path.join(ROOT, "lib", "remote.js"));
 const auth = require(path.join(ROOT, "lib", "auth.js"));
 const u = require(path.join(ROOT, "scripts", "engines", "util.js"));
 const sat = require(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
+// renderReport mirrors the analyze/renderReport façade for remote `spor
+// analytics`: the server returns the machine report, the client renders it with
+// the SAME renderer local mode uses, so output matches (task-spor-analytics-
+// remote-cli-dispatch). Requiring the module only pulls its exports — its CLI
+// block is require.main-guarded.
+const analyticsLib = require(path.join(ROOT, "lib", "analytics.js"));
 
 // The CLI surface is a single declarative table (COMMANDS, defined below): it is
 // the one source of truth for dispatch, flag parsing (Node's built-in
@@ -931,18 +937,67 @@ function cmdQuery(cfg, args) {
   return passthrough("query.js", args);
 }
 
-// analytics folds a LOCAL graph's git history into created-vs-completed metrics
-// (task-spor-work-analytics-consumer). Like query/validate it is local-only: the
-// completion signal IS the graph repo's git content history, which the server
-// owns in remote mode — so fail fast unless --nodes points at a local checkout.
-function cmdAnalytics(cfg, args) {
+// analytics folds a graph's git history into created-vs-completed metrics
+// (task-spor-work-analytics-consumer). Unlike query/validate (no server twin) it
+// is dual-mode: local mode runs the in-repo consumer (lib/analytics.js) over
+// $SPOR_HOME's git history; remote mode dispatches to the server's GET
+// /v1/analytics — the server owns the graph and its history there — and renders
+// the returned report with the SAME renderReport so output matches local
+// (task-spor-analytics-remote-cli-dispatch, norm-spor-cli-mode-parity). An
+// explicit --nodes names a local checkout, so it always takes the local path even
+// under a server (keeping local output byte-identical).
+async function cmdAnalytics(cfg, args) {
   if (cfg.mode() === "remote" && !namesLocalGraph(args)) {
-    err("analytics folds a LOCAL graph's git history; in remote mode the server holds");
-    err("  the graph and its history. Point --nodes at a local checkout to analyze it,");
-    err("  or unset SPOR_SERVER to analyze the local graph home.");
-    return 1;
+    return await analyticsRemote(cfg, args);
   }
   return passthrough("analytics.js", args);
+}
+
+// The remote arm of analytics. Maps the local CLI flags to GET /v1/analytics
+// query params, fetches the JSON (machine) report, and renders it with the local
+// renderReport — mirroring the analyze/renderReport façade so remote output
+// matches local. --json prints the machine report exactly as local does. A
+// zero-match --project scope rides back as the additive `project_warning` field,
+// which we surface on stderr exactly as the local CLI does (and strip from the
+// report so --json stays byte-identical to local).
+async function analyticsRemote(cfg, args) {
+  const qs = new URLSearchParams();
+  const project = optVal(args, "project");
+  if (project) qs.set("project", project);
+  // --type is repeatable + comma-splittable (mirrors lib/analytics.js's multi()).
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--type" && args[i + 1] != null) {
+      for (const t of args[i + 1].split(",").map((s) => s.trim()).filter(Boolean)) qs.append("type", t);
+    }
+  }
+  // weeks/top/aging shape the window exactly as the CLI flags do; an absent flag
+  // falls through to the server's kernel defaults (== the local CLI's defaults).
+  for (const flag of ["weeks", "top", "aging"]) {
+    const v = optVal(args, flag);
+    if (v != null) qs.set(flag, v);
+  }
+  const query = qs.toString();
+  const r = await remote.get(cfg, `/v1/analytics${query ? `?${query}` : ""}`, { timeoutMs: 10000 });
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (!r.ok || !r.json) {
+    const msg = r.json && r.json.error && r.json.error.message;
+    err(`analytics error ${r.status}${msg ? `: ${msg}` : ""}`);
+    return 1;
+  }
+  const report = r.json;
+  if (report.project_warning) {
+    err(report.project_warning); // mirror the local CLI's stderr warning
+    delete report.project_warning; // strip so the report matches local byte-for-byte
+  }
+  if (args.includes("--json")) {
+    out(JSON.stringify(report, null, 2));
+  } else {
+    out(analyticsLib.renderReport(report));
+  }
+  return 0;
 }
 
 // --- spor add / capture -------------------------------------------------
@@ -5343,12 +5398,14 @@ const COMMANDS = {
   },
   analytics: {
     group: "Graph", parse: "raw", args: "[--project S] [--type T] [--weeks N] [--json]",
-    summary: "created-vs-completed work metrics (local)",
+    summary: "created-vs-completed work metrics",
     help:
       "Surface work-flow analytics over the git-derived timestamp index: created vs.\n" +
       "completed work per ISO week, throughput, cycle time, current WIP by type, and\n" +
-      "the oldest-open bottlenecks. Local-only — it folds the local graph's git\n" +
-      "history (point --nodes at a local checkout to read one under a server).\n" +
+      "the oldest-open bottlenecks. Local mode folds the local graph's git history;\n" +
+      "remote mode dispatches to the server's GET /v1/analytics (which owns the graph\n" +
+      "and its history there). Point --nodes at a local checkout to read one under a\n" +
+      "server.\n" +
       "\n" +
       "Completion time is a node's status-TRANSITION time (when it entered its final\n" +
       "terminal run), derived from git content history — never updated_at, which a\n" +
