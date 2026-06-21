@@ -1292,6 +1292,97 @@ function changesLocal(cfg, args) {
   return 0;
 }
 
+// --- spor export: the nodes/ tarball (GET /v1/export) -----------------------
+// (task-spor-export-cli-verb) The shell front-door for /v1/export — the ustar
+// tarball of nodes/ used to seed a local read replica or bootstrap a fresh
+// graph from a snapshot. Without it, users hand-rolled `curl … | tar x`.
+// Dual-mode (norm-spor-cli-mode-parity): remote downloads GET /v1/export
+// (?gzip=1 compresses server-side); local builds the SAME ustar format from the
+// graph home's nodes/ (lib/tar.js, a faithful twin of the server's writer) and
+// gzips via the zlib builtin. The tarball goes to --out, or to stdout when
+// omitted so it pipes straight into tar (`spor export --gzip | tar xz`); the
+// node count / size / graph head ride STDERR so they never pollute a piped
+// tarball.
+function humanBytes(n) {
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(1)} ${units[i]}`;
+}
+async function cmdExport(cfg, { values }) {
+  const gzip = !!values.gzip;
+  const outPath = values.out || null;
+
+  let buffer, head, count, skipped;
+  if (cfg.mode() === "remote") {
+    const r = await remote.download(cfg, `/v1/export${gzip ? "?gzip=1" : ""}`, { timeoutMs: 120000 });
+    if (r.transport) {
+      err(`offline — could not reach server (${r.error})`);
+      return 1;
+    }
+    if (!r.ok) {
+      let msg = "";
+      try {
+        msg = JSON.parse(r.buffer.toString("utf8")).error.message;
+      } catch {
+        /* non-JSON body */
+      }
+      err(`export error ${r.status}${msg ? `: ${msg}` : ""}`);
+      return 1;
+    }
+    buffer = r.buffer;
+    head = r.headers["x-substrate-head"] || "";
+    count = r.headers["x-substrate-node-count"]; // may be undefined on an older server
+    skipped = r.headers["x-substrate-skipped"];
+  } else {
+    const nodesDir = cfg.nodesDir();
+    if (!fs.existsSync(nodesDir)) {
+      err(`no Spor graph at ${nodesDir} — run 'spor init', or set SPOR_SERVER for a team graph.`);
+      return 1;
+    }
+    const tar = require(path.join(ROOT, "lib", "tar.js"));
+    const exported = tar.exportNodesDir(nodesDir);
+    buffer = gzip ? require("zlib").gzipSync(exported.buffer) : exported.buffer;
+    count = String(exported.count);
+    skipped = exported.skipped ? String(exported.skipped) : undefined;
+    // Best-effort graph head, the local twin of x-substrate-head; a non-git home
+    // simply has none.
+    const h = u.git(cfg.graphHome(), ["rev-parse", "HEAD"]);
+    head = h ? h.trim() : "";
+  }
+
+  // Emit: a named file, or stdout when piping. Binary-safe in both arms. The
+  // stdout write awaits its flush callback before we return — main() calls
+  // process.exit(), which can truncate a still-draining pipe otherwise.
+  if (outPath) {
+    try {
+      fs.writeFileSync(outPath, buffer);
+    } catch (e) {
+      err(`export: could not write ${outPath} — ${e.message}`);
+      return 1;
+    }
+  } else {
+    await new Promise((resolve, reject) => {
+      process.stdout.write(buffer, (e) => (e ? reject(e) : resolve()));
+    });
+  }
+
+  // Human feedback on stderr (stdout is the data channel when piping).
+  const n = count != null ? `${count} node${count === "1" ? "" : "s"}` : "graph";
+  const dest = outPath || "stdout";
+  err(
+    `exported ${n}${gzip ? " (gzip)" : ""} → ${dest} (${humanBytes(buffer.length)})` +
+      (head ? `  head ${head.slice(0, 12)}` : "")
+  );
+  if (skipped) err(`  ${skipped} entr${skipped === "1" ? "y" : "ies"} skipped (name too long for the tar field)`);
+  return 0;
+}
+
 // --- spor add / capture -------------------------------------------------
 // Local: write a well-formed node so a user never has to learn the frontmatter
 // (issue-cc-local-mode-capture-queue-surfacing-gap). Remote: POST /v1/capture,
@@ -6018,6 +6109,36 @@ const COMMANDS = {
       "spor changes --limit 20 --json",
     ],
     run: (cfg, args) => cmdChanges(cfg, args),
+  },
+  export: {
+    group: "Graph", parse: "strict", args: "[--gzip] [--out <file>]",
+    summary: "the nodes/ tarball (local: build from graph home; remote: /v1/export)",
+    help:
+      "Stream the graph's nodes/ as a POSIX ustar tarball — the shell front-door for\n" +
+      "GET /v1/export, for seeding a local read replica or bootstrapping a fresh graph\n" +
+      "from a snapshot. Replaces hand-rolling `curl … | tar x`.\n" +
+      "\n" +
+      "Dual-mode (norm-spor-cli-mode-parity): remote downloads GET /v1/export (the\n" +
+      "server compresses when --gzip); local builds the same ustar format from the\n" +
+      "graph home's nodes/ and gzips via the zlib builtin. `tar x` reproduces nodes/\n" +
+      "byte-for-byte in either mode.\n" +
+      "\n" +
+      "The tarball is written to --out, or to stdout when omitted so it pipes straight\n" +
+      "into tar (`spor export --gzip | tar xz`); the node count / size / graph head\n" +
+      "ride stderr so they never pollute a piped tarball.\n" +
+      "\n" +
+      "  --gzip          gzip-compress the tarball (server-side remote, zlib local)\n" +
+      "  --out <file>    write to <file> instead of stdout",
+    options: {
+      gzip: { type: "boolean", desc: "gzip-compress the tarball" },
+      out: { type: "string", value: "file", desc: "write to <file> instead of stdout" },
+    },
+    examples: [
+      "spor export --out graph-nodes.tar",
+      "spor export --gzip --out graph-nodes.tar.gz",
+      "spor export --gzip | tar xz",
+    ],
+    run: (cfg, p) => cmdExport(cfg, p),
   },
   correct: {
     group: "Graph", parse: "strict", args: "<target> [guidance]", aliases: ["propose-correction"],

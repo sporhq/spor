@@ -119,6 +119,7 @@ spor compile --query "<text>"  # search → compiled neighborhood (--digest for 
 spor brief <id>                # a briefing for one node (compile --root <id>)
 spor analytics --type task,issue      # created-vs-completed metrics (local git history / GET /v1/analytics)
 spor changes [--since <sha|date>]     # recent-activity feed: what changed lately (local git log / GET /v1/changes)
+spor export [--gzip] [--out <file>]   # nodes/ ustar tarball: seed a read replica / snapshot (local build / GET /v1/export)
 
 # local (personal graph) only — fail fast with a redirect in remote mode
 spor validate                  # lint the local graph (server validates per-write remotely)
