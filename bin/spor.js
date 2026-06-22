@@ -1296,19 +1296,72 @@ function cmdValidate(cfg, args) {
   return passthrough("validate.js", args);
 }
 
-// query enumerates a LOCAL graph (lib/query.js) — the structured node/edge
-// list that `get`/`next`/`compile --query` are not (task-spor-local-graph-query-
-// verb). It is the local-mode primitive under remote mode's saved render_lens
-// views, so like validate it is local-only: in remote mode there is no local
-// loadGraph, so fail fast naming that unless --nodes points at a local checkout.
-function cmdQuery(cfg, args) {
+// query is the structured node/edge enumeration `get`/`next`/`compile --query`
+// are not (task-spor-local-graph-query-verb). Dual-mode (task-spor-cli-query-
+// remote-mode): local mode is byte-identical passthrough to lib/query.js over the
+// local nodes dir; remote mode runs the SAME query.js over the TEAM graph. There
+// is no server-side structured-enumeration endpoint (the query-like REST surfaces
+// are /v1/digest semantic search and saved lenses, neither a predicate filter),
+// so remote mode fetches the graph the way graph-wide structural sweeps are done
+// (GET /v1/export) and queries it locally — see queryRemote. An explicit --nodes
+// names a local checkout, so it always takes the local path even under a server.
+async function cmdQuery(cfg, args) {
   if (cfg.mode() === "remote" && !namesLocalGraph(args)) {
-    err("query enumerates a LOCAL graph; in remote mode the server holds the graph,");
-    err("  so use a saved view instead (spor lens). Point --nodes at a local checkout");
-    err("  to query it, or unset SPOR_SERVER to query the local graph home.");
-    return 1;
+    return await queryRemote(cfg, args);
   }
   return passthrough("query.js", args);
+}
+
+// The remote arm of query. With no server enumeration endpoint, query the team
+// graph the documented way: download the GET /v1/export tarball — the server's
+// nodes/ reproduced byte-for-byte (the read-replica path, the same the `spor
+// export` verb wraps) — extract it to a temp dir, and run the SAME local query.js
+// over it via --nodes. Output and filtering are byte-identical to a local query
+// because it IS the local code path, just over the freshly-fetched team graph
+// (norm-spor-cli-mode-parity). gzip on the wire (the server compresses ?gzip=1);
+// we gunzip when the magic bytes are present, so an older server that ignores the
+// flag (plain tar) still works. The temp dir is always cleaned up.
+async function queryRemote(cfg, args) {
+  const r = await remote.download(cfg, "/v1/export?gzip=1", { timeoutMs: 120000 });
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (!r.ok) {
+    let msg = "";
+    try {
+      msg = JSON.parse(r.buffer.toString("utf8")).error.message;
+    } catch {
+      /* non-JSON body */
+    }
+    err(`query error ${r.status}${msg ? `: ${msg}` : ""}`);
+    return 1;
+  }
+  let buffer = r.buffer;
+  if (buffer.length > 1 && buffer[0] === 0x1f && buffer[1] === 0x8b) {
+    try {
+      buffer = require("zlib").gunzipSync(buffer);
+    } catch (e) {
+      // A corrupt/truncated body: surface a clean line, not a raw stack trace
+      // (the fail-clean contract the rest of this arm keeps).
+      err(`query error: could not decode the server's export (${e.message})`);
+      return 1;
+    }
+  }
+  const tar = require(path.join(ROOT, "lib", "tar.js"));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "spor-query-"));
+  try {
+    const nodesDir = path.join(tmp, "nodes");
+    fs.mkdirSync(nodesDir, { recursive: true });
+    for (const e of tar.extract(buffer)) {
+      const base = path.basename(e.name); // entries are nodes/<id>.md
+      if (!base.endsWith(".md")) continue;
+      fs.writeFileSync(path.join(nodesDir, base), e.data);
+    }
+    return passthrough("query.js", [...args, "--nodes", nodesDir]);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 }
 
 // analytics folds a graph's git history into created-vs-completed metrics
@@ -6681,13 +6734,14 @@ const COMMANDS = {
   },
   query: {
     group: "Graph", parse: "raw", args: "[--type T] [--where k=v] [--edges]",
-    summary: "filterable node/edge enumeration (local)",
+    summary: "filterable node/edge enumeration",
     help:
-      "Deterministic, filterable enumeration over the local graph — the structured\n" +
-      "list that `get` (one node), `next` (the ranked queue) and `compile --query`\n" +
-      "(semantic search) are not. Pure, no LLM. Local-only — it reads the local nodes\n" +
-      "dir; in remote mode use the server's saved `render_lens` views instead (point\n" +
-      "--nodes at a local checkout to query one under a server).\n" +
+      "Deterministic, filterable enumeration over the graph — the structured list\n" +
+      "that `get` (one node), `next` (the ranked queue) and `compile --query`\n" +
+      "(semantic search) are not. Pure, no LLM. Dual-mode: local mode reads the local\n" +
+      "nodes dir; remote mode runs the SAME enumeration over the TEAM graph (it fetches\n" +
+      "the server's nodes via GET /v1/export, then queries it locally). Point --nodes\n" +
+      "at a local checkout to query one even under a server.\n" +
       "\n" +
       "Node selection (AND across distinct flags):\n" +
       "  --type <T>        nodes of that type: (repeatable -> OR within type)\n" +

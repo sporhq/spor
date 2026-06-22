@@ -43,8 +43,9 @@ Gather every `type: repo` and `type: project` node, plus each repo's `slugs`,
   spor query --edges --edge-type grouped-under   # who is already homed
   ```
   Repo nodes carry `slugs:` and `fingerprints:` and (if homed) a `grouped-under`
-  edge; project nodes are the groupings themselves. (`spor query` enumerates the
-  local graph; against a team server, use the MCP tools below or `spor lens`.)
+  edge; project nodes are the groupings themselves. (`spor query` is dual-mode —
+  it enumerates the local graph, or the team graph against a server; in Cowork /
+  with the connector there is no shell, so use the MCP tools below or `spor lens`.)
 - **With the Spor MCP tools** (Cowork, or Claude Code with the connector):
   call `render_lens` with no `lens_id` to list the saved lenses, render the
   project-breakdown one to see existing projects and their members, and

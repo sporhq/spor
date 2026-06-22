@@ -523,11 +523,14 @@ Body.
   assert.strictEqual(byType.stdout, viaLib.stdout);
 });
 
-test('query (remote, no --nodes) fails fast naming the remote path, no "no Spor graph"', () => {
+test('query (remote, dead server) fails open offline, exit 1, no "no Spor graph" / stack trace', () => {
+  // Dual-mode: remote query dispatches to GET /v1/export and queries the fetched
+  // graph (query-remote.test.js covers the success/parity path); a dead server
+  // surfaces a clean offline line, never a broken-install "no Spor graph" or a
+  // raw stack trace (task-spor-cli-query-remote-mode).
   const r = run(['query', '--type', 'task'], { SPOR_SERVER: 'http://127.0.0.1:1', SPOR_TOKEN: 't' });
   assert.strictEqual(r.status, 1);
-  assert.match(r.stderr, /query enumerates a LOCAL graph/);
-  assert.match(r.stderr, /spor lens/);
+  assert.match(r.stderr, /offline — could not reach server/);
   assert.doesNotMatch(r.stderr, /no Spor graph/);
   assert.doesNotMatch(r.stderr, /at Object|Error:/);
 });

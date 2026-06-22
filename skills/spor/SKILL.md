@@ -123,12 +123,12 @@ spor compile --query "<text>"  # search → compiled neighborhood (--digest for 
 spor brief <id>                # a briefing for one node (compile --root <id>)
 spor analytics --type task,issue      # created-vs-completed metrics (local git history / GET /v1/analytics)
 spor changes [--since <sha|date>]     # recent-activity feed: what changed lately (local git log / GET /v1/changes)
+spor query --type task --where status=open --ids   # structured node/edge enumeration (local nodes dir / GET /v1/export then query locally)
 spor export [--gzip] [--history|--auth] [--out <file>]   # nodes/ ustar tarball (--history: git-bundle data-exit; --auth: admin-gated restore w/ auth files — both remote-only); local build / GET /v1/export
 
 # local (personal graph) only — fail fast with a redirect in remote mode
 spor validate                  # lint the local graph (server validates per-write remotely)
 spor compile --root <id> --skeleton   # writes a local briefing-node skeleton
-spor query --type task --where status=open --ids   # structured node/edge enumeration
 ```
 
 `spor analytics` folds the graph repo's git history into work-flow metrics:
@@ -142,11 +142,14 @@ mode folds the local graph's git history, remote mode dispatches to the server's
 (norm-spor-cli-mode-parity); `--project`/`--type`/`--weeks`/`--json` scope and
 shape it.
 
-`spor query` is the local structured enumeration — the deterministic,
+`spor query` is the structured enumeration — the deterministic,
 predicate-filtered list that `get` (one node), `next` (the ranked queue) and
-`compile --query` (semantic search) are not; it is the local-mode primitive
-under what remote mode offers as saved `render_lens` views (use `spor lens`
-there). It AND-combines node predicates — `--type <T>` (repeatable),
+`compile --query` (semantic search) are not. Dual-mode (norm-spor-cli-mode-
+parity): local mode reads the local nodes dir; remote mode runs the SAME
+enumeration over the TEAM graph — it fetches the server's nodes via `GET
+/v1/export` and queries them locally (the structured-filter sibling of remote
+mode's saved `render_lens` views; use `spor lens` for a saved board/table). It
+AND-combines node predicates — `--type <T>` (repeatable),
 `--where key=value` (repeatable; a list field like `tags` matches on
 membership), `--id-prefix <p>` — and with `--edges` emits `{from,type,to}`
 edges instead, filterable by `--edge-type`, `--from <id>` (out-edges) and
