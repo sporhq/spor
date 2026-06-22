@@ -38,6 +38,26 @@ re-treading dismissed approaches.
    lineage and any `norm-*` nodes are standing rules, not suggestions. Cite the
    node ids you relied on so your reasoning is traceable.
 
+## When the graph can't answer — file a question
+
+A `found: false` is a real gap. If it's something a teammate would know, don't
+let it evaporate — file it as a `question` node with `ask_question` so it routes
+to whoever does:
+
+```json
+{ "text": "Did the OAuth phase B token-rotation hook land?",
+  "mentions": ["dec-cc-authz-rebac-fga"] }
+```
+
+The server routes the question to the steward of the closest node in its
+relevance neighborhood (or leaves it unrouted, visible to everyone, when none
+matches) and attributes it to you. `mentions` is weighed first, so name the
+nodes the question is about; pass `project` to pin a team when a mention-less
+question's neighborhood is empty. Keep `text` to one or two standalone sentences
+— it also becomes the question's summary (capped at 500 chars). An answer is any
+node carrying an `answers` edge to the question; write that node, `add_edge` the
+`answers`, then `set_status` the question to `answered` (terminal).
+
 ## After you make a durable decision
 
 When the work produces a fact a teammate would need next week — a decision (with

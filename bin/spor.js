@@ -1833,6 +1833,116 @@ async function cmdAdd(cfg, { values, positionals }) {
   return 0;
 }
 
+// --- spor ask -----------------------------------------------------------
+// File a question the graph could not answer — the CLI surface for /spor:ask, so
+// the skill routes through ONE verb instead of a remote-curl-vs-local-file mode
+// branch (task-cc-spor-skills-route-through-cli-drop-mode-prose), the same shape
+// as add/correct. Without it a question the digest gate can't answer evaporates
+// instead of becoming a routed node (task-cc-ask-question-skill). Remote: POST
+// /v1/questions (ask_question's REST twin) — the server mints the question id,
+// routes it to the steward of the closest relevance-neighborhood node (unrouted,
+// visible to everyone, when none matches), and attributes it to the token. Local:
+// write the question node file ourselves and validate, so a solo user's question
+// still lands as an open, queueable node that `spor next` surfaces.
+async function cmdAsk(cfg, { values, positionals }) {
+  const text = positionals[0];
+  if (!text) {
+    err('usage: spor ask "<question>" [--title ...] [--mention ID]... [--project S]');
+    return 1;
+  }
+  const toList = (v) => (v == null ? [] : Array.isArray(v) ? v : [v]);
+  const mentions = toList(values.mention);
+  const title = values.title || null;
+  // --project is OPTIONAL on purpose: remote routing derives the project from the
+  // question's relevance neighborhood (then the asker's home project), so only an
+  // explicit --project overrides that — pass it for a mention-less question whose
+  // neighborhood would otherwise yield nothing (API.md POST /v1/questions). Local
+  // mode has no router, so it falls back to the cwd slug to stamp the node's repo.
+  const project = values.project || null;
+
+  if (cfg.mode() === "remote") {
+    const body = { text };
+    if (title) body.title = title;
+    if (mentions.length) body.mentions = mentions;
+    if (project) body.project = project;
+    // Question routing is deterministic server-side (no LLM, unlike capture
+    // ingestion), so the default 8s budget is plenty — match correct/priority,
+    // not add's 30s ingestion timeout. No outbox spool either: the drain replays
+    // only /v1/capture bodies, so a failed question fails open like correct does.
+    const r = await remote.post(cfg, "/v1/questions", body, { timeoutMs: 8000 });
+    if (r.transport) {
+      err(`offline — could not reach server (${r.error})`);
+      return 1;
+    }
+    if (!r.ok) {
+      // The REST endpoint returns the validator's error list — the detail the MCP
+      // tool's opaque "invalid_node" lacked (issue-cc-mcp-ask-question-validation-
+      // opacity); surface message + details so a rejected question is fixable
+      // without a blind retry (e.g. a malformed --project slug -> 400).
+      const e = r.json && r.json.error;
+      const detail = e && Array.isArray(e.details) && e.details.length ? ` (${e.details.join("; ")})` : "";
+      err(`ask error ${r.status}${e && e.message ? `: ${e.message}` : ""}${detail}`);
+      return 1;
+    }
+    const j = r.json || {};
+    out(j.id ? `question filed: ${j.id}` : `question filed (${j.status || "ok"})`);
+    // Report routing so the asker knows who it reached, or that it's unrouted and
+    // visible to everyone (no steward matched its neighborhood).
+    if (j.routed_to) out(`  routed to ${j.routed_to}${j.via ? ` (via ${j.via})` : ""}`);
+    else out(`  unrouted — no steward matched; visible to everyone`);
+    for (const w of (j.warnings || [])) err(`  warning: ${w}`);
+    return 0;
+  }
+
+  // local: hand the user a typed, validated question node file (no router — the
+  // node lands open + queueable, surfaced by `spor next` like any other work).
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const nodesDir = cfg.nodesDir();
+  if (!fs.existsSync(nodesDir)) {
+    err(`no graph at ${nodesDir} — run 'spor init' first`);
+    return 1;
+  }
+  const slug = project || safeSlug();
+  const titleText = title || text.split(/\s+/).slice(0, 10).join(" ");
+  const summary = text.length > 500 ? text.slice(0, 497) + "..." : text;
+
+  let g;
+  try {
+    g = graphLib.loadGraph(nodesDir);
+  } catch (e) {
+    err(`could not load graph: ${e.message}`);
+    return 1;
+  }
+  const prefixes = (g.registry && g.registry.prefixesFor("question")) || null;
+  const prefix = prefixes && prefixes[0] ? prefixes[0] : "question-";
+  let id = values.id || `${prefix}${kebab(titleText) || today()}`;
+  let n = 1;
+  let base = id;
+  while (fs.existsSync(path.join(nodesDir, `${id}.md`))) id = `${base}-${++n}`;
+
+  // --mention -> a mentions edge (the weakest association, the same edge the
+  // server routes off), so the local node carries the same lineage as remote.
+  const edgeLines = mentions.map((m) => `  - {type: mentions, to: ${m}}`);
+  const edgesBlock = edgeLines.length ? `edges:\n${edgeLines.join("\n")}\n` : "";
+  const md = `---\nid: ${id}\ntype: question\nrepo: ${slug}\ntitle: ${titleText.replace(/\n/g, " ")}\nsummary: ${summary.replace(/\n/g, " ")}\nstatus: open\n${edgesBlock}date: ${today()}\n---\n\n${text}\n`;
+  let node;
+  try {
+    node = graphLib.parseFrontmatter(md, `${id}.md`);
+  } catch (e) {
+    err(`invalid question: ${e.message}`);
+    return 1;
+  }
+  const v = graphLib.validateNode(g, node);
+  if (!v.ok) {
+    err(`invalid question:\n  ${v.errors.join("\n  ")}`);
+    return 1;
+  }
+  fs.writeFileSync(path.join(nodesDir, `${id}.md`), md);
+  out(`question filed: ${id} (open) in ${nodesDir}`);
+  out(`  'spor next' will surface it; answer it with a node carrying an answers edge.`);
+  return 0;
+}
+
 // --- spor drain ---------------------------------------------------------
 // Flush the fail-open capture spool (graphHome/outbox/*) to the team server — the
 // manual trigger of the same drain-outbox engine session-start fires detached, so
@@ -6379,6 +6489,36 @@ const COMMANDS = {
       'spor add "Platform must expose a token-rotation hook" --project platform --blocks task-my-initiative --needed-by 2026-07-15',
     ],
     run: (cfg, p) => cmdAdd(cfg, p),
+  },
+  ask: {
+    group: "Graph", parse: "strict", args: '"<question>"', aliases: ["question"],
+    summary: "file a question the graph can't answer (local: question node; remote: /v1/questions)",
+    help:
+      "File a question the graph could not answer, so it becomes a routed node instead\n" +
+      "of evaporating when the digest gate comes back empty. Remote mode POSTs\n" +
+      "/v1/questions (ask_question's REST twin): the server routes the question to the\n" +
+      "steward of the closest node in its relevance neighborhood, leaves it unrouted\n" +
+      "(visible to everyone) when none matches, and attributes it to your token. Local\n" +
+      "mode writes an open, queueable question node file so a solo user's question\n" +
+      "still surfaces in 'spor next'.\n\n" +
+      "--mention names a node the question is about (repeatable); routing considers\n" +
+      "mentions first, and locally each becomes a mentions edge. --project overrides\n" +
+      "the derived project — pass it for a mention-less question whose neighborhood is\n" +
+      "empty. --title/--id apply to the local node.\n\n" +
+      "Answer a question by writing a node with an answers edge to it, then\n" +
+      "'spor set-status <id> answered'.",
+    options: {
+      title: { type: "string", value: "...", desc: "short question title (default: first 10 words)" },
+      mention: { type: "string", value: "id", desc: "a node the question is about (repeatable; routing weighs these first)", multiple: true },
+      project: { type: "string", value: "S", desc: "override the derived project (for a mention-less question)" },
+      id: { type: "string", value: "id", desc: "explicit node id (local only)" },
+    },
+    examples: [
+      'spor ask "Why does the gardener skip resident schema nodes?"',
+      'spor ask "Did the OAuth phase B token-rotation hook land?" --mention dec-cc-authz-rebac-fga',
+      'spor ask "Where do tenant OTEL spans get dropped?" --project spor-server',
+    ],
+    run: (cfg, p) => cmdAsk(cfg, p),
   },
   drain: {
     group: "Graph", parse: "strict", args: "", aliases: ["sync"],

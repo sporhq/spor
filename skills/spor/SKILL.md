@@ -90,6 +90,7 @@ spor schema [<type>]           # introspect the live registry (types/prefixes/we
                                #   seed + resident overrides, provenance-tagged) — query this, don't
                                #   read lib/seed/. Remote reflects the server's registry (GET /v1/schema)
 spor add "<2-3 sentences>"     # capture a node (typed file locally; /v1/capture remotely)
+spor ask "<question>"          # file a question the graph can't answer (open question node locally; routed via /v1/questions remotely)
 spor correct <target> "<text>" # standing briefing correction (corr file locally; /v1/corrections remotely)
 spor priority <id> <p1|p2|p3|clear>  # set/clear queue human-triage priority (local: rewrite frontmatter; remote: /v1/nodes/{id}/priority)
 spor set-status <id> <status>  # flip a node's status — an active status (active/open) also CLAIMS it (local: rewrite frontmatter; remote: /v1/nodes/{id}/status)
@@ -221,6 +222,7 @@ This skill orients; these do the work. Route to them rather than improvising:
 | You want to… | Use | Trigger |
 |---|---|---|
 | File deferred / discovered work, a follow-up, a dismissed approach | **/spor:defer** | "remember / file / defer this", work postponed mid-session |
+| File a question the graph can't answer, so it routes to whoever knows | **/spor:ask** | the briefing/digest came back empty on something a teammate would know |
 | Get a briefing for a task or node before starting | **/spor:brief** | starting non-trivial work; `/spor:brief <query\|id>` |
 | See what to work on next | **/spor:next** | "what's next / my queue / the backlog", triage |
 | Fix a briefing that was wrong, missing, or stale | **/spor:correct** | "the briefing was wrong / missed / included junk" |

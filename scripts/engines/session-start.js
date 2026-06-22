@@ -20,13 +20,16 @@ const USAGE =
   "Before any operation on the Spor graph (searching/querying, reading or writing nodes, adding edges, capturing, or running spor CLI/MCP tools), load the /spor:spor skill first — it carries the CLI syntax, node/edge format, and tool surface your training doesn't cover. Use /spor:brief <query or node-id> for a task-specific briefing, /spor:correct to fix a bad briefing.";
 const USAGE_REMOTE =
   USAGE +
-  " When you defer discovered work mid-task (out-of-scope fix, follow-up, dismissed approach), capture it the moment you defer it: /spor:defer <2-3 sentences, what + why> — one call, the server types and links it.";
+  " When you defer discovered work mid-task (out-of-scope fix, follow-up, dismissed approach), capture it the moment you defer it: /spor:defer <2-3 sentences, what + why> — one call, the server types and links it." +
+  " Graph can't answer? File it with /spor:ask so it routes to whoever knows.";
 // Local mode has no server ingester; /spor:defer writes the node itself.
 // Same standing capture prompt so solo users get the capture-and-resurface
-// flywheel (issue-cc-local-mode-capture-queue-surfacing-gap).
+// flywheel (issue-cc-local-mode-capture-queue-surfacing-gap). /spor:ask likewise
+// writes an open, queueable question node locally (task-cc-ask-question-skill).
 const USAGE_LOCAL =
   USAGE +
-  " When you defer discovered work mid-task (out-of-scope fix, follow-up, dismissed approach), capture it the moment you defer it: /spor:defer <2-3 sentences, what + why>. Show what to work on next with /spor:next.";
+  " When you defer discovered work mid-task (out-of-scope fix, follow-up, dismissed approach), capture it the moment you defer it: /spor:defer <2-3 sentences, what + why>. Show what to work on next with /spor:next." +
+  " Graph can't answer? File it with /spor:ask so it lands in your queue.";
 
 function envelope(ctx) {
   return { hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: ctx } };

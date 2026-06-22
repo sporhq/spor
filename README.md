@@ -140,8 +140,9 @@ The loop runs without you having to drive it:
 
 You can also ask for any of this directly: an on-demand briefing for a task,
 a correction when a briefing was wrong, a capture of work you're deferring,
-and a ranked queue of what to do next. In Claude Code these surface as
-`/spor:brief`, `/spor:correct`, `/spor:defer`, and `/spor:next`, plus
+a question filed when the graph can't answer, and a ranked queue of what to do
+next. In Claude Code these surface as `/spor:brief`, `/spor:correct`,
+`/spor:defer`, `/spor:ask`, and `/spor:next`, plus
 `/spor:backfill` to bootstrap/extend the graph and organize repos into projects.
 (`/spor:backfill` is the discoverable door; the heavy git-history mining still
 runs in the `spor-backfill` subagent it dispatches.)
