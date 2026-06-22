@@ -630,10 +630,10 @@ async function fetchQueuePaged(cfg, baseQs, target) {
   return { ok: true, json: envelope };
 }
 
-async function cmdGet(cfg, { positionals }) {
+async function cmdGet(cfg, { positionals, values }) {
   const id = positionals[0];
   if (!id) {
-    err("usage: spor get <id>");
+    err("usage: spor get <id> [--json]");
     return 1;
   }
   if (cfg.mode() === "remote") {
@@ -650,18 +650,100 @@ async function cmdGet(cfg, { positionals }) {
       err(`error ${r.status}`);
       return 1;
     }
-    out(r.json && r.json.raw ? r.json.raw : r.text);
+    if (!values.json) {
+      out(r.json && r.json.raw ? r.json.raw : r.text);
+      return 0;
+    }
+    // --json: parse the raw with the SAME lib parser as local (parity), take the
+    // server's git-blob-sha revision, and gather inbound edges from the team graph
+    // (the documented graph-wide sweep via GET /v1/export — there is no inbound
+    // endpoint, the same path `spor query --to` walks).
+    const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+    const raw = r.json && r.json.raw;
+    if (typeof raw !== "string") {
+      err(`error: server returned no node body for ${id}`);
+      return 1;
+    }
+    const node = graphLib.parseFrontmatter(raw, `${id}.md`);
+    const fetched = await fetchRemoteExportNodes(cfg, "get");
+    if (fetched.error) return 1; // already reported
+    let inbound;
+    try {
+      inbound = inboundEdges(graphLib.loadGraph(fetched.nodesDir), node.id);
+    } finally {
+      fetched.cleanup();
+    }
+    out(JSON.stringify(getNodeJson(node, inbound, r.json.revision), null, 2));
     return 0;
   }
   // local: read the node file
-  const f = path.join(cfg.nodesDir(), `${id}.md`);
+  const nodesDir = cfg.nodesDir();
+  const f = path.join(nodesDir, `${id}.md`);
+  if (!values.json) {
+    try {
+      out(fs.readFileSync(f, "utf8"));
+      return 0;
+    } catch {
+      err(`no such node: ${id}`);
+      return 1;
+    }
+  }
+  // --json: parse the file, scan the loaded graph for inbound edges, and stamp the
+  // git blob SHA as `revision` — recomputed zero-dep (crypto builtin), byte-
+  // identical to the server's value for the same content (norm-spor-cli-mode-parity).
+  let raw;
   try {
-    out(fs.readFileSync(f, "utf8"));
-    return 0;
+    raw = fs.readFileSync(f);
   } catch {
     err(`no such node: ${id}`);
     return 1;
   }
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const node = graphLib.parseFrontmatter(raw.toString("utf8"), `${id}.md`);
+  const inbound = inboundEdges(graphLib.loadGraph(nodesDir), node.id);
+  out(JSON.stringify(getNodeJson(node, inbound, gitBlobSha(raw)), null, 2));
+  return 0;
+}
+
+// The `spor get --json` shape (issue-spor-cli-get-missing-json-flag): one
+// structured object so scripts stop scraping frontmatter. Built from a node
+// parsed by the SAME lib/graph parser in both modes (norm-spor-cli-mode-parity).
+// Frontmatter = lib/query.js's shared cleanNode projection (drop the load-time
+// `file` artifact + the parser's empty pin/exclude registers) minus what we
+// surface separately (edges, body); the synthesized `project` (from repo:) is
+// kept — every consumer keys on it and the server's frontmatter carries it too.
+function getNodeJson(node, inbound, revision) {
+  const { cleanNode } = require(path.join(ROOT, "lib", "query.js"));
+  const frontmatter = cleanNode(node);
+  delete frontmatter.edges;
+  delete frontmatter.body;
+  return {
+    id: node.id,
+    frontmatter,
+    body: node.body || "",
+    edges: { outbound: node.edges || [], inbound: inbound || [] },
+    revision: revision ?? null,
+  };
+}
+
+// Inbound edges to a node from a loaded graph — every other node's out-edge that
+// points here, as {from, type}. Reuses lib/query.js's --to walk (a node only
+// stores its own out-edges, so inbound is a whole-graph scan).
+function inboundEdges(graph, id) {
+  const { queryGraph } = require(path.join(ROOT, "lib", "query.js"));
+  return queryGraph(graph, { edges: true, to: id }).edges.map((e) => ({ from: e.from, type: e.type }));
+}
+
+// The git blob SHA of a node's bytes — the value the server stores as `revision`
+// (API.md §0) and an update sends back. Pure Node (crypto builtin, zero-dep):
+// sha1 of "blob <len>\0<bytes>", exactly `git hash-object`, so a local --json
+// revision is byte-identical to the server's for the same content (verified
+// against the live graph).
+function gitBlobSha(buf) {
+  const h = require("crypto").createHash("sha1");
+  h.update(`blob ${buf.length}\0`);
+  h.update(buf);
+  return h.digest("hex");
 }
 
 // --- spor blame / commits: commit-sha -> nodes reverse lookup ---------------
@@ -7513,10 +7595,20 @@ const COMMANDS = {
     run: (cfg, args) => cmdNext(cfg, args),
   },
   get: {
-    group: "Graph", parse: "strict", args: "<id>", options: {},
+    group: "Graph", parse: "strict", args: "<id> [--json]",
+    options: {
+      json: { type: "boolean", desc: "structured JSON: frontmatter, edges (inbound+outbound), body, revision" },
+    },
     summary: "a node by id (local: file; remote: /v1/nodes/<id>)",
-    help: "Print one node's raw markdown by id. Remote mode reads /v1/nodes/<id>; local\nmode reads the node file. A missing node exits 1.",
-    examples: ["spor get dec-cc-zero-dep-client"],
+    help:
+      "Print one node's raw markdown by id. Remote mode reads /v1/nodes/<id>; local\n" +
+      "mode reads the node file. A missing node exits 1.\n\n" +
+      "--json emits a structured object — {id, frontmatter, body, edges:{outbound,\n" +
+      "inbound}, revision} — so scripts and tooling stop scraping markdown\n" +
+      "frontmatter. `revision` is the git blob SHA an update sends; inbound edges are\n" +
+      "gathered by scanning the whole graph (remote fetches GET /v1/export), so --json\n" +
+      "is heavier than the plain read. Mode-symmetric (norm-spor-cli-mode-parity).",
+    examples: ["spor get dec-cc-zero-dep-client", "spor get dec-cc-zero-dep-client --json"],
     run: (cfg, p) => cmdGet(cfg, p),
   },
   blame: {
@@ -8339,7 +8431,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, COMMANDS, resolveVerb };
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, COMMANDS, resolveVerb, getNodeJson, gitBlobSha };
 
 if (require.main === module) {
   main()
