@@ -84,9 +84,36 @@ function nodeCount(nodesDir) {
   }
 }
 
-// Idempotently create the local graph home (nodes/, git, .gitignore). Returns
-// { home, nodesDir, created } and prints nothing — callers do their own UX.
-// Shared by `spor init` and the `spor dispatch --backfill` onboarding path.
+// Ensure the graph-home git repo has a committable identity. A fresh box with no
+// global git config would otherwise make the SessionEnd distiller and gardener
+// auto-commits fail ("empty ident name") and leave the local person node with no
+// email source (task-spor-onboard-cli-init-git-identity). The user's own identity
+// (global, system, or local) is ALWAYS preferred — we only set a local fallback
+// for a field git can't resolve, mirroring the spor@localhost fallback the
+// migrate path uses (cmdMigrate). Idempotent and confined to the graph home.
+function ensureGitIdentity(home) {
+  const id = gitIdentity(home);
+  if (!id.name) git(home, ["config", "user.name", "spor"]);
+  if (!id.email) git(home, ["config", "user.email", "spor@localhost"]);
+}
+
+// Lay down an initial commit so future auto-commits have a HEAD to build on (a
+// repo on an unborn branch is what makes the distiller's plain `git commit` fail
+// even once identity is set). Idempotent: a repo that already has HEAD is left
+// untouched. The add is SCOPED to the graph's own files (never `-A`) so it can't
+// sweep unrelated working-tree changes into the commit, and `--allow-empty` means
+// HEAD is born even when there is nothing to stage yet (a fresh home).
+function ensureInitialCommit(home) {
+  if (git(home, ["rev-parse", "--verify", "-q", "HEAD"]).status === 0) return;
+  git(home, ["add", "nodes"]); // nodes/ always exists (ensureGraphHome made it)
+  if (fs.existsSync(path.join(home, ".gitignore"))) git(home, ["add", ".gitignore"]);
+  git(home, ["commit", "-q", "--allow-empty", "-m", "spor: initialize graph"]);
+}
+
+// Idempotently create the local graph home (nodes/, git, .gitignore, a
+// committable identity, and an initial commit). Returns { home, nodesDir,
+// created } and prints nothing — callers do their own UX. Shared by `spor init`
+// and the `spor dispatch --backfill` onboarding path.
 function ensureGraphHome(cfg) {
   const home = cfg.graphHome();
   const nodesDir = path.join(home, "nodes");
@@ -96,9 +123,11 @@ function ensureGraphHome(cfg) {
     created = true;
   }
   // git init (idempotent) so the graph is versioned, like README's bootstrap.
-  if (!fs.existsSync(path.join(home, ".git"))) {
+  let gitReady = fs.existsSync(path.join(home, ".git"));
+  if (!gitReady) {
     const r = spawnSync("git", ["init", "-q"], { cwd: home, stdio: "ignore" });
     if (r.error) err("note: git not found — graph created but not version-controlled");
+    else gitReady = true;
   }
   const gitignore = path.join(home, ".gitignore");
   if (!fs.existsSync(gitignore)) {
@@ -108,6 +137,19 @@ function ensureGraphHome(cfg) {
       /* non-fatal */
     }
   }
+  // A graph that can't commit is a silent onboarding failure: on a box with no
+  // usable git identity the distiller/gardener auto-commits hard-fail ("empty
+  // ident name"), and elsewhere they'd land an unstable machine-derived
+  // `user@host` identity. Pin a committable identity + an initial commit so a
+  // freshly-onboarded ~/.spor can actually persist its nodes. SKIPPED when the
+  // graph home is the code repo itself (the nested `graph:` sharing layout): there
+  // the graph rides the human PR flow, so we must not rewrite the code repo's git
+  // identity or inject a spor commit onto its branch (dec-spor-local-mode-sharing-
+  // boundary), exactly as the distiller's commit step is.
+  if (gitReady && !u.graphInsideCodeRepo(home, process.cwd())) {
+    ensureGitIdentity(home);
+    ensureInitialCommit(home);
+  }
   return { home, nodesDir, created };
 }
 
@@ -116,6 +158,13 @@ function cmdInit(cfg) {
   out(`${created ? "Created" : "Graph already present at"} ${home}`);
   out(`  nodes:  ${nodesDir} (${nodeCount(nodesDir) ?? 0} nodes)`);
   out(`  mode:   ${cfg.mode()}`);
+  // Surface the identity the graph commits as — it seeds the local person node's
+  // email and is what the distiller/gardener auto-commits use. The spor@localhost
+  // fallback means git had no identity; the user can override with `git config`.
+  const id = gitIdentity(home);
+  if (id.name || id.email) {
+    out(`  commits: ${id.name || "spor"} <${id.email || "spor@localhost"}>${id.email === "spor@localhost" ? "  (set 'git config --global user.email you@example.com' to use your own)" : ""}`);
+  }
   out(created ? `\nNext: start a session here, or 'spor next' to see the queue.` : "");
   return 0;
 }

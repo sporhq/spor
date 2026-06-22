@@ -16,26 +16,9 @@ const u = require("./util");
 const { drainOutbox } = require("./drain-outbox");
 const { inferCommits } = require("./infer-commits");
 
-// True when the graph home and the session cwd resolve to the SAME git repo
-// (same toplevel) — i.e. the graph lives INSIDE the code repo being worked on,
-// the nested-repo hazard of issue-cc-local-mode-graph-sharing-gap /
-// dec-spor-local-mode-sharing-boundary. A per-repo `graph:` marker can point the
-// home at e.g. `.` (the code repo itself); auto-committing nodes/ there would
-// inject distiller commits straight onto the code branch instead of letting them
-// ride the human PR flow. Separate graph repos — the standard standalone home
-// and the sibling / nested-own-repo sharing layouts — return false and commit as
-// before (byte-identical). Fail-open: any git failure returns false.
-function graphInsideCodeRepo(graph, cwd) {
-  if (!cwd) return false;
-  const gTop = (u.git(graph, ["rev-parse", "--show-toplevel"]) || "").trim();
-  const cTop = (u.git(cwd, ["rev-parse", "--show-toplevel"]) || "").trim();
-  if (!gTop || !cTop) return false;
-  try {
-    return fs.realpathSync(gTop) === fs.realpathSync(cTop);
-  } catch {
-    return path.resolve(gTop) === path.resolve(cTop);
-  }
-}
+// The nested-repo guard (graph home === code repo) now lives in util so the
+// `spor init` path can share it (task-spor-onboard-cli-init-git-identity).
+const { graphInsideCodeRepo } = u;
 
 // Claude transcript shape: per-JSONL-line `select(.type=="user" or
 // .type=="assistant") | .type + ": " + <content text>`.

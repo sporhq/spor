@@ -135,6 +135,97 @@ test('init creates the local graph home, idempotently', () => {
   assert.match(r2.stdout, /already present/);
 });
 
+// --- init ensures a committable graph: git identity + initial commit ---------
+// (task-spor-onboard-cli-init-git-identity) A fresh ~/.spor must be able to
+// commit, or the SessionEnd distiller and gardener auto-commits silently fail
+// and the local person node has no email source.
+
+// Neutralize the test box's own git identity: point global+system config at a
+// throwaway config so the dev box's ~/.gitconfig can't leak in and mask the
+// fallback. `user.useConfigOnly` stops git from synthesizing an identity from
+// gecos/hostname, so a commit genuinely fails without a configured identity —
+// otherwise the "commit succeeds" assertion is false-green on a box where git
+// can auto-detect one (most dev boxes / CI runners).
+function noGitIdentityEnv() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-gitcfg-'));
+  const cfg = path.join(dir, 'gitconfig');
+  fs.writeFileSync(cfg, '[user]\n\tuseConfigOnly = true\n');
+  const empty = path.join(dir, 'empty');
+  fs.writeFileSync(empty, '');
+  return { GIT_CONFIG_GLOBAL: cfg, GIT_CONFIG_SYSTEM: empty };
+}
+
+test('init sets a fallback identity + initial commit when git has none, so the graph can commit', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-id-'));
+  fs.rmSync(home, { recursive: true, force: true }); // start absent
+  const gitEnv = noGitIdentityEnv();
+  const r = run(['init'], { SPOR_HOME: home, ...gitEnv });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const local = (k) => spawnSync('git', ['-C', home, 'config', '--local', k], { encoding: 'utf8', env: bare(gitEnv) }).stdout.trim();
+  assert.strictEqual(local('user.name'), 'spor', 'fallback user.name set locally');
+  assert.strictEqual(local('user.email'), 'spor@localhost', 'fallback user.email set locally');
+  // HEAD is born (an initial commit) so future auto-commits have a parent
+  const count = spawnSync('git', ['-C', home, 'rev-list', '--count', 'HEAD'], { encoding: 'utf8', env: bare(gitEnv) }).stdout.trim();
+  assert.strictEqual(count, '1', 'exactly one initial commit');
+  // the actual failure mode: a distiller-style plain `git commit` now succeeds
+  fs.writeFileSync(path.join(home, 'nodes', 'dec-q.md'), `---\nid: dec-q\ntype: decision\nproject: demo\ntitle: t\nsummary: s\ndate: 2026-06-01\n---\nb\n`);
+  spawnSync('git', ['-C', home, 'add', '-A'], { env: bare(gitEnv) });
+  const c = spawnSync('git', ['-C', home, 'commit', '-qm', 'distill: session t1'], { encoding: 'utf8', env: bare(gitEnv) });
+  assert.strictEqual(c.status, 0, `plain commit must succeed after init: ${c.stderr}`);
+  // the committing identity is surfaced, with a hint to override the fallback
+  assert.match(r.stdout, /commits:\s+spor <spor@localhost>/);
+  assert.match(r.stdout, /git config --global user\.email/);
+});
+
+test("init prefers the user's own git identity and does not shadow it", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-id2-'));
+  fs.rmSync(home, { recursive: true, force: true });
+  const cfgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-gitcfg2-'));
+  const gcfg = path.join(cfgDir, 'gitconfig');
+  fs.writeFileSync(gcfg, '[user]\n\tname = Real Dev\n\temail = real@dev.example\n');
+  const empty = path.join(cfgDir, 'empty');
+  fs.writeFileSync(empty, '');
+  const gitEnv = { GIT_CONFIG_GLOBAL: gcfg, GIT_CONFIG_SYSTEM: empty };
+  const r = run(['init'], { SPOR_HOME: home, ...gitEnv });
+  assert.strictEqual(r.status, 0, r.stderr);
+  // no local user.* override was written — the real (global) identity stands
+  const localList = spawnSync('git', ['-C', home, 'config', '--local', '--list'], { encoding: 'utf8', env: bare(gitEnv) }).stdout;
+  assert.doesNotMatch(localList, /user\.(name|email)=/, 'must not shadow the user identity');
+  const author = spawnSync('git', ['-C', home, 'log', '--format=%an <%ae>', '-1'], { encoding: 'utf8', env: bare(gitEnv) }).stdout.trim();
+  assert.strictEqual(author, 'Real Dev <real@dev.example>');
+  assert.match(r.stdout, /commits:\s+Real Dev <real@dev\.example>/);
+  assert.doesNotMatch(r.stdout, /git config --global/, 'no fallback hint when git has an identity');
+});
+
+test('init is idempotent — a second run adds no second commit', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-id3-'));
+  fs.rmSync(home, { recursive: true, force: true });
+  const gitEnv = noGitIdentityEnv();
+  assert.strictEqual(run(['init'], { SPOR_HOME: home, ...gitEnv }).status, 0);
+  assert.strictEqual(run(['init'], { SPOR_HOME: home, ...gitEnv }).status, 0);
+  const count = spawnSync('git', ['-C', home, 'rev-list', '--count', 'HEAD'], { encoding: 'utf8', env: bare(gitEnv) }).stdout.trim();
+  assert.strictEqual(count, '1');
+});
+
+test('init refuses to rewrite identity or commit into the code repo when the graph home IS that repo (nested sharing)', () => {
+  // a fresh code repo that doubles as the graph home (a `graph: .` / SPOR_HOME=.
+  // layout, dec-spor-local-mode-sharing-boundary): no commits, no identity.
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-nested-'));
+  fs.mkdirSync(path.join(repo, 'nodes'), { recursive: true });
+  const gitEnv = noGitIdentityEnv(); // no global identity, so the fallback WOULD fire if unguarded
+  const G = (args) => spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', env: bare(gitEnv) });
+  G(['init', '-q']);
+  fs.writeFileSync(path.join(repo, 'secret.env'), 'TOKEN=shhh\n'); // an untracked working-tree file `-A` would have swept in
+  // run `spor init` from INSIDE the repo with the graph home pointed at it
+  const r = spawnSync(process.execPath, [CLI, 'init'], { encoding: 'utf8', cwd: repo, env: bare({ SPOR_HOME: repo, ...gitEnv }) });
+  assert.strictEqual(r.status, 0, r.stderr);
+  // the guard fires: no spor identity written onto the code repo, no spor commit
+  // injected onto its branch (HEAD stays unborn — the human PR flow owns it)
+  assert.strictEqual(G(['config', '--local', 'user.name']).stdout.trim(), '', 'no spor identity on the code repo');
+  assert.strictEqual(G(['config', '--local', 'user.email']).stdout.trim(), '');
+  assert.notStrictEqual(G(['rev-parse', '--verify', '-q', 'HEAD']).status, 0, 'code branch still unborn — no spor commit');
+});
+
 test('status (local) reports local mode and node count', () => {
   const { dir, nodes } = fixtureGraph();
   const r = run(['status'], { SPOR_HOME: dir });

@@ -391,6 +391,27 @@ function git(cwd, args, opts = {}) {
   }
 }
 
+// True when the graph home and the session cwd resolve to the SAME git repo
+// (same toplevel) — i.e. the graph lives INSIDE the code repo being worked on,
+// the nested-repo hazard of issue-cc-local-mode-graph-sharing-gap /
+// dec-spor-local-mode-sharing-boundary. A per-repo `graph:` marker can point the
+// home at e.g. `.` (the code repo itself); auto-committing nodes/ — or rewriting
+// git identity — there would land on the code branch instead of letting the
+// graph ride the human PR flow. Separate graph repos — the standard standalone
+// home and the sibling / nested-own-repo sharing layouts — return false and
+// commit as before (byte-identical). Fail-open: any git failure returns false.
+function graphInsideCodeRepo(graph, cwd) {
+  if (!cwd) return false;
+  const gTop = (git(graph, ["rev-parse", "--show-toplevel"]) || "").trim();
+  const cTop = (git(cwd, ["rev-parse", "--show-toplevel"]) || "").trim();
+  if (!gTop || !cTop) return false;
+  try {
+    return fs.realpathSync(gTop) === fs.realpathSync(cTop);
+  } catch {
+    return path.resolve(gTop) === path.resolve(cTop);
+  }
+}
+
 function ensureDir(dir) {
   try {
     fs.mkdirSync(dir, { recursive: true });
@@ -1038,6 +1059,7 @@ module.exports = {
   matchBriefs,
   repoFingerprints,
   git,
+  graphInsideCodeRepo,
   ensureDir,
   spoolStats,
   ensureGraphGitignore,
