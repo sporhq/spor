@@ -1,434 +1,532 @@
 # Spor
 
-Spor gives your coding agent a memory that outlives the session and crosses
-between sessions and teammates. It is a typed, versioned knowledge graph of
-your work — decisions (including the ones you dismissed), issues, norms,
-specs, tasks — that your agent reads from and writes back to. Conversation
-goes in; briefings come out. When work starts, the session is briefed from
-the graph; when it ends, the transcript is distilled into a node or two and
-paid back in.
+Spor gives coding agents a memory they can carry from one session to the next.
 
-The name is Norwegian — *spor*, the track something leaves.
+It keeps track of the useful things that normally disappear into chat history: decisions, rejected approaches, open questions, project norms, tasks, incidents, and the reasons behind them. When a new session starts, Spor briefs your agent with the relevant parts of that history. When the session ends, useful new context can be written back.
 
-## Quickstart
+The name comes from Norwegian: *spor* means the track something leaves behind.
 
-Install the CLI. It ships as the npm package `@sporhq/spor` and puts two
-commands on your PATH — `spor` (the human CLI) and `spor-hook` (the hook
-dispatcher hosts call):
+## Why use Spor?
+
+Coding agents are good at working inside a single session. The problem is everything before and after that session.
+
+Without shared memory, you keep repeating things like:
+
+* “We already tried that.”
+* “That service has a weird deployment rule.”
+* “This was decided in the last refactor.”
+* “Don’t use that API; it only works in staging.”
+* “The answer is in an old design doc, but I can’t remember which one.”
+
+Spor gives those facts somewhere to live.
+
+It is not just a pile of notes. Spor stores knowledge as a small typed graph, so it can preserve relationships such as:
+
+* this decision supersedes that one
+* this task is blocked by this issue
+* this implementation came from this spec
+* this correction should affect future briefings
+* this rejected idea should not be proposed again next week
+
+That graph can live locally on your machine, or be shared by a team.
+
+## How it works
+
+At a high level, Spor runs a simple loop:
+
+1. **Brief**
+   At the start of a coding session, Spor finds relevant project context and gives it to your agent.
+
+2. **Nudge**
+   While you work, Spor can suggest capturing useful discoveries before they vanish.
+
+3. **Distil**
+   At the end of a session, Spor can turn the important parts of the transcript into one or two durable graph nodes.
+
+4. **Reuse**
+   Future sessions get briefed from the graph instead of starting cold.
+
+You can also ask for things directly, such as a briefing for a task, a correction to stale context, or the next item in the project queue.
+
+## What is a briefing?
+
+A briefing is the packet of context Spor gives your coding agent before it starts work.
+
+It is not a transcript dump. Spor reads the project graph, finds the nodes that look relevant to the current repo and task, and turns them into a short working summary.
+
+A good briefing might include:
+
+* the decisions that still apply
+* old approaches that were rejected
+* open tasks and blockers
+* project-specific conventions
+* related incidents, specs, or design notes
+* corrections that should stop the agent repeating stale advice
+* links back to the graph nodes the briefing came from
+
+For example, before working on auth, a briefing might tell the agent:
+
+```text
+Use the token exchange flow from dec-auth-token-exchange.
+Do not revive the old session-cookie approach; it was rejected in dec-auth-cookie-rejection.
+The current blocker is issue-auth-refresh-race.
+Security review notes are in art-auth-review-2026-06.
+```
+
+The point is to give the agent enough memory to start in the right place, without making you paste old notes into every session.
+
+Briefings can be created automatically at session start, but you can also ask Spor directly.
+
+In agent hosts that support tool mentions, use `@Spor`:
+
+```text
+@Spor brief me before I change the auth middleware
+@Spor what do we already know about the export pipeline?
+@Spor why did we reject the previous queue design?
+@Spor what should I avoid touching in this repo?
+```
+
+You can also use the explicit command:
+
+```text
+/spor:brief
+```
+
+A briefing is itself stored as a graph node, with links back to the nodes it was compiled from. That means it can be reviewed, corrected, versioned, and rebuilt when the graph changes.
+
+## Install
+
+Spor is distributed as an npm package.
 
 ```bash
 npm install -g @sporhq/spor
 ```
 
-Requires Node 20+ and nothing else — the client is zero-dependency. To run
-from a checkout instead (e.g. to hack on it), clone the repo and `npm link`
-from its root; that symlinks the same two commands onto your PATH.
+Requirements:
 
-Wire Spor into your agent. One verb resolves the adapter manifest to this
-install and drops it into the host's config:
+* Node.js 20 or newer
 
-```bash
-spor install claude     # Claude Code (via its plugin CLI — no marketplace browsing)
-spor install codex      # also: gemini, cursor, copilot, opencode
-spor install            # no host => list the hosts detected on this machine
-```
+For local use, Spor runs without:
 
-`--scope user` (default) installs for you; `--scope repo` writes a committable
-per-repo config. `--all` installs every detected host, `--print` is a dry run,
-and `--server <url> --token <tok>` also points the client at a team graph in
-the same step. Re-running is idempotent — it refreshes the path and never
-duplicates your other hooks. (In Claude Code you can also install by hand:
-`/plugin marketplace add sporhq/spor` then `/plugin install spor@spor`.)
+* a database
+* a server, unless you want live team sharing
 
-Upgrading. Bumping the package does **not** refresh what an agent already
-loaded — Claude Code runs its own cached copy of the plugin, so new
-skills/hooks won't appear until that copy is updated. After an npm bump, run:
+The package installs two commands:
+
+* `spor` — the human-facing CLI
+* `spor-hook` — the hook dispatcher used by agent hosts
+
+Check the install with:
 
 ```bash
-npm install -g @sporhq/spor   # update the package on disk
-spor upgrade                  # refresh every wired host to it, then restart
+spor --help
 ```
 
-`spor upgrade` updates Claude Code's plugin (`marketplace update` +
-`plugin update`) and re-points the hook hosts at the new install; pass a host
-(`spor upgrade claude`) to scope it, or `--print` for a dry run. `spor status`
-flags the gap on its own — it shows the loaded plugin version and marks it
-`STALE` when the package on disk is newer.
+## Connect Spor to your agent
 
-Then onboard — from inside the repo, run `/spor:onboard` in your agent:
+Install the adapter for the agent host you use:
 
+```bash
+spor install claude
 ```
+
+Other supported hosts include:
+
+```bash
+spor install codex
+spor install gemini
+spor install cursor
+spor install copilot
+spor install opencode
+```
+
+To see what Spor detects on your machine:
+
+```bash
+spor install
+```
+
+Useful install flags:
+
+```bash
+spor install --all       # install every detected host
+spor install --print     # show what would change, without changing it
+spor install --scope repo
+spor install --scope user
+```
+
+`--scope user` is the default. It installs Spor for you.
+
+`--scope repo` writes configuration that can be committed with a repository.
+
+Re-running `spor install` is safe. It refreshes the Spor paths and does not duplicate existing hooks.
+
+## First-time setup
+
+After installing the adapter, open your coding agent inside a repo and run:
+
+```text
 /spor:onboard
 ```
 
-It's the first-time-setup front door. It reads `spor status`, forks
-personal-local vs team-server, establishes your identity (a person node, and
-this machine's dispatch agent), enables Spor for the repo, asks which sources
-the backfill may read, and hands off to `/spor:backfill` to populate the graph
-from git history, design docs, and issue trackers. It's idempotent — re-run it
-any time to repair a half-set-up box. If you're new to Spor or anything's
-unclear, start here.
+This is the easiest way to start.
 
-Once you're set up, bootstrapping another freshly-cloned repo is one unattended
-command from inside it:
+Onboarding will:
 
-```bash
-cd ~/my-repo && spor dispatch --backfill
+* check your Spor status
+* choose local or team mode
+* set up your identity
+* enable Spor for the current repo
+* ask what sources it may read
+* optionally backfill context from git history, docs, and issue trackers
+
+You can run it again later if setup was interrupted or something feels wrong.
+
+## Using Spor day to day
+
+Once Spor is enabled for a repo, you usually do not need to think about it.
+
+At the start of a session, your agent gets a briefing: a short, task-aware summary of the project memory that matters right now. During the session, Spor can surface related context, answer direct questions through `@Spor`, or suggest captures. At the end, it can distil useful discoveries back into the graph.
+
+In Claude Code, the main commands are:
+
+```text
+/spor:brief      # get a briefing for a task or area
+/spor:correct    # fix stale or wrong context
+/spor:defer      # capture something to return to later
+/spor:ask        # record a question the graph cannot answer
+/spor:next       # show the next useful thing to work on
+/spor:onboard    # first-time setup
+/spor:backfill   # extend the graph from existing sources
 ```
 
-That's the CLI primitive `/spor:onboard` delegates to: it creates your graph
-home if it doesn't exist yet (`~/.spor/nodes`, git-initialised), registers the
-repo so Spor knows where it lives on this machine, makes sure Spor is enabled,
-and launches the `/spor:backfill` agent in a Claude Code background session.
-Watch or attach to it with `claude agents`. It skips the identity, tenant, and
-consent steps `/spor:onboard` covers, so reach for it once those are done — or
-skip onboarding entirely and just work, since distillation grows the graph one
-session at a time.
-
-`spor status` tells you the resolved mode, graph, project, and (on a team
-graph) server health and identity — run it any time you're unsure whether Spor
-is active or which graph you're on. `spor init` does the graph-home setup on
-its own if you'd rather not dispatch anything yet.
-
-For the per-host event mapping, fidelity notes, distiller backend, and the
-`AGENTS.md` fallback for hosts with no hook support, see
-[adapters/](adapters/).
-
-## Dispatching background agents
-
-`spor dispatch` hands a task to Claude Code's background-agent machinery
-(`claude --bg`) with a briefing already compiled in:
+From the shell, `spor status` is the first thing to run when something is unclear:
 
 ```bash
-spor dispatch "wire up token rotation in the pipeline"   # free-text task, briefed
-spor dispatch issue-86                                    # a node id — briefs its neighborhood
-spor dispatch --from-queue                                # the top item from 'spor next'
-spor dispatch --backfill                                  # init + enable + run /spor:backfill (door: /spor:onboard)
-spor dispatch <task> --template prompt.tpl                # launch your own prompt, context injected
-spor dispatch <task> --print                              # dry run: show dir, prompt, argv
+spor status
 ```
 
-It compiles the briefing (the same two-arm compiler the `/spor:brief` skill
-drives), prepends it to the prompt, and launches `claude --bg` **in the right
-repo**. Which directory that is comes from a per-machine slug→path map: the
-shared graph is path-free by design (every teammate clones to a different
-path), so the map is local, kept in the config cascade under `dispatch.repos`
-(`spor repos` to inspect; written to `$SPOR_HOME/config.json`). It self-learns
-as you open sessions, so by the time you dispatch a node from another repo,
-Spor already knows where that repo lives. Flags pass through to `claude`
-(`--model`, `--permission-mode`, `--agent`, `--name`); `--full` embeds the whole
-neighborhood and `--no-brief` skips the briefing.
+It shows the current mode, graph, project, server health, and whether Spor is active in the current repo.
 
-**No accidental duplicates.** A node dispatch won't double up on work already
-underway. In remote mode it auto-claims the task's heartbeat lease at launch, so
-dispatching a node a teammate already holds is refused with the holder named
-(`--no-claim` opts out). And in either mode, dispatching a node that already has
-a background agent in flight *on this machine* — each agent is named after its
-node id — is refused too, catching the same-person duplicate the lease's
-idempotent renew can't. `--force` overrides the local guard.
+## Background agents
 
-**Your own prompt.** By default the briefing is prepended to a built-in prompt
-shell. Pass `--template <file>` (or set a default path in `dispatch.template`)
-to supply your own prompt instead, with Handlebars-style `{{placeholder}}`
-tokens substituted from the dispatch context: `{{brief}}` (the compiled
-briefing, aka `{{briefing}}`/`{{neighbourhood}}`), `{{task}}`, `{{node}}`,
-`{{title}}`, `{{slug}}`, `{{dir}}`, and `{{default}}` (the whole built-in
-prompt, so you can wrap rather than replace it). Unknown placeholders blank out
-with a warning. The template takes over the prompt entirely — you decide where
-the brief and task land.
+Spor can dispatch background work with the right context already attached.
 
-## What your agent gets, and gives back
+```bash
+spor dispatch "wire up token rotation in the pipeline"
+```
 
-The loop runs without you having to drive it:
+You can also dispatch from existing graph nodes or from the queue:
 
-- A project briefing arrives when you begin work, so the session opens
-  knowing what's already been decided.
-- As you type, only what's relevant to the current prompt is pulled in —
-  often nothing, because nothing on the prompt path calls a model, so the
-  briefing lands in milliseconds rather than after a round trip.
-- While you work, Spor nudges you to capture findings worth keeping and links
-  your commits to the nodes they touch.
-- When the session ends, the transcript is distilled into zero to two new
-  nodes — including approaches you tried and rejected, kept on purpose so the
-  team doesn't relitigate them. Distillation runs a small, cheap model and
-  costs about $0.02 a session.
+```bash
+spor dispatch issue-86
+spor dispatch --from-queue
+spor dispatch --backfill
+```
 
-You can also ask for any of this directly: an on-demand briefing for a task,
-a correction when a briefing was wrong, a capture of work you're deferring,
-a question filed when the graph can't answer, and a ranked queue of what to do
-next. In Claude Code these surface as `/spor:brief`, `/spor:correct`,
-`/spor:defer`, `/spor:ask`, and `/spor:next`, plus `/spor:onboard` to set Spor
-up the first time and `/spor:backfill` to bootstrap/extend the graph and
-organize repos into projects. (`/spor:onboard` is the first-time-setup front
-door — identity, mode, consent — and hands off to `/spor:backfill`, whose heavy
-git-history mining runs in the `spor-backfill` subagent it dispatches.)
+When dispatching a node, Spor briefs the agent with the relevant neighbourhood of the graph. It also avoids obvious duplicate work: if the same node is already being worked on locally, or already claimed in team mode, Spor refuses the duplicate dispatch unless you force it.
 
-Corrections are durable. When a briefing includes something stale or misses
-something it should have known, you record the correction once, and every
-future briefing honors it — you don't re-explain it next week. Briefings are
-themselves versioned nodes, each carrying edges back to the sources it was
-built from and the corrections that shaped it. Debug the context, not the
-model.
+To see what would be launched without starting anything:
 
-## Why a graph, and not just retrieval
+```bash
+spor dispatch issue-86 --print
+```
 
-The behavior above rests on a context compiler that was measured against the
-alternatives on the same planning task.
+To provide your own prompt wrapper:
 
-A planner agent fed a compiled briefing of about 0.8k tokens matched a
-144k-token kitchen-sink context at 10/10 task quality — versus 4/10 with no
-context at all — and did it at roughly 2.6× lower cost. Similarity-only
-retrieval (RAG over the top twelve matches) scored 7/10 on that same task: it
-missed a constraint that was only reachable by following lineage edges, the
-kind of link a graph keeps and a flat index does not. And the cost of
-distilling sessions back into the graph turned out to be insensitive to model
-tier — the cheap model writes nodes as well as an expensive one, at about
-$0.02 each.
+```bash
+spor dispatch issue-86 --template prompt.tpl
+```
 
-A graph holds two things a pile of documents cannot: the edges between facts,
-and the facts you decided against.
+Templates can use placeholders such as:
 
-## Storage and ownership
+```text
+{{brief}}
+{{task}}
+{{node}}
+{{title}}
+{{slug}}
+{{dir}}
+{{default}}
+```
 
-There is one graph per person, or one per organization. It lives at
-`$SPOR_HOME` (default `~/.spor/`), outside your code repositories, and is
-itself an ordinary git repo — its history is the history of what the team
-knows, separate from any code branch.
+## Local mode
 
-Because it sits outside your repos, knowledge distilled on a branch that
-never merges still survives, and dismissed ideas are kept deliberately rather
-than lost. Each node is one fact in its own plain-markdown file, with typed
-edges to the nodes it relates to; the format is documented in
-[GRAPH.md](GRAPH.md).
+By default, Spor can run entirely on your machine.
+
+The graph lives outside your code repositories, under:
+
+```bash
+~/.spor/
+```
+
+or another directory if `$SPOR_HOME` is set.
+
+The graph is a normal git repo. Nodes are plain markdown files. This means your project memory has history, diffs, branches, and all the boring-but-useful properties of git.
+
+A local graph is good when:
+
+* you are trying Spor for the first time
+* you want personal memory across projects
+* you do not need live team sharing
+* you prefer to keep everything on your own machine
+
+Because the graph is outside your code repo, context from a branch can survive even if the branch never merges.
 
 ## Team mode
 
-Single-player Spor is the whole client. Team mode is what you reach for when
-the graph should be shared *live*: one graph served to your entire team — the
-people and their agents alike — with per-identity attribution on every node,
-transactional writes so concurrent work doesn't clobber, and a shared
-decision queue ranked across the team. (A team can also share a graph for free
-over plain git, with no server — see "Sharing a graph over git" below.)
+Team mode is for sharing one live graph across people and agents.
 
-Team mode adds something a personal graph can't do: when a question can't be
-answered from what's already there, it routes to the person most likely to
-know, and their answer flows back into the graph as a node — so the next
-person who asks gets it from the graph instead.
-
-A client joins a team graph with a token from your team's invite:
+Join a team graph with an invite token:
 
 ```bash
-spor join spor_pat_...                 # hosted Spor (https://api.sporhq.io)
+spor join spor_pat_...
 ```
 
-`spor join` writes the server URL and token to your user config and confirms
-the connection. The URL defaults to the hosted Spor service
-(`https://api.sporhq.io`); pass your own to point elsewhere
-(`spor join https://spor.example.com spor_pat_...`). The equivalent two
-environment variables work too:
+By default, this points at the hosted Spor service. To use another server:
+
+```bash
+spor join https://spor.example.com spor_pat_...
+```
+
+You can also configure team mode with environment variables:
 
 ```bash
 export SPOR_SERVER=https://api.sporhq.io
 export SPOR_TOKEN=spor_pat_...
 ```
 
-Set those and the client talks to the team graph over REST and MCP; leave
-them unset and it runs entirely against your local `$SPOR_HOME`. If the team
-server is ever unreachable, the client fails open — it falls back to a local
-cache or to nothing, never blocking your session. The full contract a client
-programs against is in [API.md](API.md).
+In team mode, writes are attributed to the person or agent that made them. The server also handles concurrent writes so teammates do not clobber each other.
 
-> **Split-brain warning (local mode + a claude.ai Spor connector).** If your
-> Claude Code is logged into a claude.ai account that has a **Spor MCP
-> connector**, that connector is live in your sessions too — even in local
-> mode — so you have *two* write surfaces at once: the local `$SPOR_HOME` file
-> graph (skills, CLI, and ambient hook captures) and the remote team graph
-> behind the connector (MCP-tool captures). Captures can split across them
-> with no signal which got which. Pick one surface: either set `SPOR_SERVER`/
-> `SPOR_TOKEN` to go fully remote, or disable the claude.ai Spor connector to
-> stay fully local. `spor status` detects this and warns.
+Team mode is useful when:
 
-A team graph can also carry **lenses** — saved views (a board, a table, a
-lineage tree) defined as nodes and rendered by the server. View them from the
-shell:
+* several people work on the same codebase
+* background agents are working alongside humans
+* decisions should be shared immediately
+* open questions should route to the person most likely to know
+* the team wants a shared queue of useful work
 
-```bash
-spor lens                          # list the available lenses
-spor lens lens-roadmap             # render one to the terminal (text)
-spor lens lens-roadmap --format json   # the raw view tree, for piping
-spor lens lens-roadmap --project wf    # pass a lens parameter
-```
+If the team server is unavailable, Spor fails open. It should not block your coding session.
 
-Rendering happens server-side (the same engine as the `render_lens` MCP tool),
-so `spor lens` is a team-mode verb — in local mode it tells you to point at a
-team graph rather than failing.
+## Sharing a graph over git
 
-## Sharing a graph over git — no server
+You can also share a graph without running a server.
 
-A team can share one graph for free, with no live server, by treating the
-graph as the ordinary git repo it already is — everyone clones, pulls, and
-pushes it. Point a code repo at a shared graph with a `graph:` line in its
-committed `.spor` marker:
+Create or clone a graph as a normal git repo, then point your code repo at it with a committed `.spor` marker:
 
-```
-# .spor — committed at the repo root
+```text
+# .spor
 repo: my-service
 graph: ../my-team-graph
 ```
 
-The path resolves relative to the marker, so the conventional layout is the
-graph as a **sibling** repo (`../my-team-graph`) each teammate clones alongside
-the code. This binding **overrides `SPOR_HOME`**: even a contributor with their
-own personal `~/.spor` inherits the shared graph while working in this repo, so
-prior decisions and dismissed approaches come for free. Distilled nodes land in
-the shared graph as plain markdown and ride your normal PR flow.
+The path is resolved relative to the repo marker. A common layout is:
 
-Spor keeps the shared graph clean for you: it writes a `.gitignore` covering
-the machine-local, per-person state (`journal/`, `cache/`, `outbox/`, `auth/`,
-`config.json`) so only the durable `nodes/` (and brief `history/`) are
-committed, and the end-of-session distiller leaves nodes uncommitted for your
-PR — rather than auto-committing — when the graph lives inside the code repo
-itself. This is the free tier's sharing model; the live **Team mode** server
-above adds real-time concurrent writes, question routing, and hosted isolation.
+```text
+my-service/
+my-team-graph/
+```
+
+Everyone clones both repos side by side. Distilled nodes are written as markdown and can go through your normal pull-request flow.
+
+This is simpler than team mode, but it does not provide live concurrent writes, hosted isolation, or question routing.
+
+## What gets stored?
+
+Spor stores small, typed nodes.
+
+Examples include:
+
+* decisions
+* tasks
+* issues
+* incidents
+* specs
+* norms
+* questions
+* corrections
+* people
+* agents
+* projects
+* repositories
+
+Each node is a markdown file with frontmatter and a short body. Nodes can link to other nodes using typed edges.
+
+A simplified decision node looks like this:
+
+```markdown
+---
+id: dec-export-csv-format
+type: decision
+project: meridian
+title: Bulk export uses CSV with a stable column order
+summary: CSV is the first supported bulk export format because customers already use spreadsheet-based workflows.
+status: active
+date: 2026-06-09
+edges:
+  - {type: derived-from, to: spec-export-schema}
+  - {type: supersedes, to: dec-export-json-only}
+---
+
+We chose CSV first because it works with the tools customers already use.
+
+JSON export is still possible later, but it is no longer the first format.
+```
+
+See `GRAPH.md` for the full graph format.
 
 ## Configuration
 
-Settings can live in config files instead of environment variables, cascading
-from broad to specific so a repo can override your personal defaults. Highest
-precedence wins:
+Spor reads configuration from several places. More specific settings win over broader ones.
+
+Precedence order:
 
 1. CLI flags
-2. environment — `SPOR_*` (legacy `SUBSTRATE_*` still read)
-3. **repo** — `.spor.json` at (or above) the working directory; the nearest one
-   wins, so a monorepo subtree can override its root
-4. **user** — `$SPOR_HOME/config.json`
-5. **global** — `$XDG_CONFIG_HOME/spor/config.json` (`~/.config/spor/config.json`)
+2. environment variables such as `SPOR_SERVER`
+3. repo config: `.spor.json`
+4. user config: `$SPOR_HOME/config.json`
+5. global config: `~/.config/spor/config.json`
 6. built-in defaults
 
-Environment sits above the config files, so existing setups are unchanged;
-add files only when you want them. A `.spor.json` (committable) is for
-settings the whole repo should share — never put a `token` there; it is
-honored only from the environment or your user/global config.
-
-**Spor is opt-in per repo.** Installing the plugin does not make every repo you
-open participate: a repo is a no-op (no context injected, nothing distilled into
-the shared graph) until it opts in — either it carries a `.spor`/`.spor.json`
-marker, or `enabled` is set anywhere in the cascade (`SPOR_ENABLED=1`, or
-`enabled:true` in user/global config to turn it on everywhere). `spor enable`
-writes the marker below for you; `/spor:onboard` and `spor dispatch --backfill`
-do it as part of onboarding. This keeps unrelated side projects out of your
-team graph even when a server is configured globally. Run `spor status` (or
-`spor-hook doctor`) in a repo to see whether it's active.
+A repo can opt in with `.spor.json`:
 
 ```jsonc
-// .spor.json — committed at a repo root
 {
-  "enabled": true,                  // opt this repo in (what `spor enable`
-                                    // writes). Spor is OFF in a repo with no
-                                    // marker; set false to force a no-op even
-                                    // where a marker would otherwise enable it
-  "search": {
-    "minSim": 0.10,                 // raise/lower the relevance gate
-    "projects": {
-      "include": ["spor"],          // restrict candidate ranking to these
-      "exclude": ["personal-blog"], // drop these from ranking entirely
-      "boost":   { "spor": 1.5 }    // favor a project's nodes in ranking
-    }
-  },
-  "briefs": {                       // path-scoped sub-briefs for a monorepo:
-    "auth/": "brief-myrepo-auth",   // each subtree -> its own brief node id
-    "frontend-router/": "brief-myrepo-frontend-router"
-  }
+  "enabled": true
 }
 ```
 
-**Path-scoped briefs (monorepos).** A repo split into separately-owned subtrees
-can declare one brief per subtree in `briefs` — a relative-path → brief-id map.
-At session start the nearest-ancestor subtree containing your cwd is the *active
-area*: its brief is injected alongside the repo brief, while the sibling areas
-are surfaced as a one-line discovery list (`/spor:brief <id>` to open one)
-without injecting their bodies. A session in no declared subtree (e.g. the repo
-root) just gets the discovery list. This is a routing layer over the existing
-`brief` concept — a covered subtree is an "area", a label on a brief, not a new
-identity type; distilled nodes still stamp the repo. Name siblings
-`brief-<repo>-<area>` so they group.
+Installing Spor does not automatically enable every repo you open. A repo is inactive until it has a `.spor` or `.spor.json` marker, or until you enable Spor globally.
 
-Other recognized keys mirror their env var: `server`, `token`, `home`,
-`nodes`, `mode` (`auto`/`local`/`remote`/`off`), and the `distill`, `nudge`,
-and `inferCommits` groups. `spor validate` prints config warnings (an unknown
-key, a secret in a committable config) on stderr.
+This avoids leaking side-project context into a team graph by accident.
 
-### LLM spend — visibility and control
+To enable Spor in the current repo:
 
-The two paid calls the client makes are the SessionEnd distiller and the
-post-tool capture nudge, both on a small, cheap model. Either can be turned
-off, and what you spend is recorded so the "~$0.02 a session" figure above is
-verifiable rather than asserted:
+```bash
+spor enable
+```
 
-- `SPOR_DISTILL=0` (or `distill.enabled: false`) disables distillation — you
-  keep briefings with no SessionEnd model spend.
-- `SPOR_NUDGE=0` (or `nudge.enabled: false`) disables the capture nudge.
-- The capture nudge runs synchronously after a `.md` write, so its backend's
-  latency is felt in the tool loop. `SPOR_NUDGE_CMD` (or `nudge.cmd`) points it
-  at a faster classifier — Gemini Flash via the bundled
-  `scripts/distill-gemini.sh` returns in ~2–7s versus ~17s for a `claude -p`
-  cold boot, with no quality regression. Two bounds keep a bad session cheap:
-  `SPOR_NUDGE_MAX` (or `nudge.maxCalls`, default 20) caps classifier calls per
-  session, and `SPOR_NUDGE_TIMEOUT` (or `nudge.timeoutMs`, default 30000ms)
-  kills a hung backend. The distiller has the same `distill.cmd` and
-  `distill.timeoutMs` (`SPOR_DISTILL_TIMEOUT`, default 120000ms) levers. See
-  [adapters/README.md](adapters/README.md) for the backend contract.
-- Every call appends a row to `$SPOR_HOME/journal/llm-calls/<date>.jsonl` with
-  token usage and the model-reported cost. `spor cost` (`--since YYYY-MM-DD`,
-  `--project <slug>`, `--json`) totals it by source. Custom `SPOR_DISTILL_CMD`
-  /`SPOR_NUDGE_CMD` backends return text only, so their rows count as
-  cost-unknown.
+To check what mode and config are active:
 
-### Health and diagnostics
+```bash
+spor status
+```
 
-The hooks fail open — they never break a session — which also means a dead
-server or a revoked token degrades quietly. To make that legible, run:
+To validate config:
+
+```bash
+spor validate
+```
+
+Never commit a team token into `.spor.json`. Use the environment, user config, or global config for secrets.
+
+## LLM usage and cost controls
+
+Spor can make small model calls for two things:
+
+* distilling useful session context at the end of a session
+* nudging you to capture useful findings while you work
+
+You can turn either off:
+
+```bash
+export SPOR_DISTILL=0
+export SPOR_NUDGE=0
+```
+
+You can also point them at a custom backend:
+
+```bash
+export SPOR_DISTILL_CMD=/path/to/distiller
+export SPOR_NUDGE_CMD=/path/to/classifier
+```
+
+The backend contract is simple: prompt on stdin, response on stdout.
+
+Spor records model usage under:
+
+```bash
+$SPOR_HOME/journal/llm-calls/
+```
+
+To inspect spend:
+
+```bash
+spor cost
+spor cost --since 2026-06-01
+spor cost --json
+```
+
+## Health and diagnostics
+
+Spor hooks are designed to fail open. If something goes wrong, your agent session should continue; you may just get less context.
+
+For a health check, run:
 
 ```bash
 spor-hook doctor
 ```
 
-It prints a one-shot health report: resolved mode, server reachability and
-token validity, the outbox and dead-letter depth (with the oldest stranded
-capture's age), how fresh the cached briefing is, and the most recent error
-lines from `journal/remote.log` and `journal/distill.log`. When captures
-have been stranded (a dead-letter pile-up or a deep outbox), session-start
-also surfaces a one-line nudge alongside its status banner pointing you here.
+It reports things like:
 
-When the outbox has stranded captures, flush it on demand with:
+* resolved mode
+* server reachability
+* token validity
+* outbox depth
+* dead-letter depth
+* cached briefing freshness
+* recent hook and distiller errors
+
+If captures are stuck because the team server was unavailable, drain the outbox with:
 
 ```bash
 spor drain
 ```
 
-It replays each spooled capture to the team server (the same drain a session
-runs at start), so a pure-CLI user who never opens a session can still ship
-them. A successful remote `spor add` drains opportunistically too.
+## Upgrading
 
-## Pointers
+Update the npm package:
 
-- [GRAPH.md](GRAPH.md) — the node and edge format: what a node file looks
-  like, the node types, the typed edges between them.
-- [API.md](API.md) — the team-server contract: the REST and MCP surfaces, the
-  write semantics, identity and auth, and client configuration.
-- [adapters/](adapters/) — supported coding agents and how install works on
-  each, including the `AGENTS.md` floor for hosts without hooks.
+```bash
+npm install -g @sporhq/spor
+```
+
+Then refresh installed adapters:
+
+```bash
+spor upgrade
+```
+
+For a specific host:
+
+```bash
+spor upgrade claude
+```
+
+To preview changes:
+
+```bash
+spor upgrade --print
+```
+
+This matters because some hosts cache plugins or hook definitions. Updating the npm package alone may not refresh what the agent has already loaded.
+
+`spor status` will show when a loaded plugin is stale.
+
+## More docs
+
+* `GRAPH.md` — graph format, node types, edges, and schema behaviour
+* `API.md` — REST and MCP server contract
+* `QUEUE.md` — queue, capture, routing, and workflow details
+* `adapters/` — host-specific adapter notes
+* `CONTRIBUTING.md` — contributing guide
+* `SECURITY.md` — security policy
 
 ## License
 
-Spor (this client) is licensed under the [Apache License 2.0](LICENSE) — a
-permissive license with an explicit patent grant. See [NOTICE](NOTICE) for
-attribution.
+Spor is licensed under Apache-2.0. See `LICENSE` and `NOTICE`.
 
-"Spor" and "sporhq" are trademarks of the project; the Apache License grants no
-rights to the marks. Their use is governed by the [Trademark Policy](TRADEMARKS.md)
-— in short, build "an adapter **for** Spor," not a product **named** Spor.
+“Spor” and “sporhq” are project trademarks. The Apache license grants rights to the code, not to the marks. See `TRADEMARKS.md` for details.
 
-Contributions are welcome under inbound = outbound (Apache-2.0); see
-[CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and the
-[Code of Conduct](CODE_OF_CONDUCT.md).
+Contributions are welcome under inbound = outbound Apache-2.0.
+
