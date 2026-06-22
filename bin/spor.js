@@ -3465,11 +3465,11 @@ async function cmdInvite(cfg, { values }) {
 // read "agent on behalf of person" instead of person-direct. One persistent
 // node per machine/install, created once here and reused across dispatches.
 //
-// REMOTE: POST /v1/admin/agents creates the node + owned-by edge through the
-//   server's validated Store door, admin-gated like /v1/admin/people (the
-//   server is the CA, it mints the spiffe). FAIL-SOFT on 404 — the endpoint is
-//   landing in the spor-server stream; an old server gets a clear message, not
-//   a crash.
+// REMOTE: the SELF-SERVE POST /v1/agents creates the node owned by the caller
+//   (no admin gate, owner = your bound person — task-spor-app-agents-self-serve-
+//   create). Creating on behalf of ANOTHER person (--owner person-x) needs the
+//   admin twin POST /v1/admin/agents (admin-gated). FAIL-SOFT on 404 — an old
+//   server lacking the route gets a clear message, not a crash.
 // LOCAL: write the agent node + owned-by edge to the graph home via the same
 //   lib/graph validate-before-write path cmdAdd uses; the spiffe is built
 //   client-side from a config `org` (forward-compat shape, unenforced).
@@ -3493,7 +3493,10 @@ async function cmdAgent(cfg, args) {
   if (sub === "use") {
     return cmdAgentUse(cfg, { id: args[1] });
   }
-  err("usage: spor agent create <label> [--owner person-x] [--pubkey <fp>] | spor agent list | spor agent use <agent-id>");
+  if (sub === "token") {
+    return cmdAgentToken(cfg, args.slice(1));
+  }
+  err("usage: spor agent create <label> [--owner person-x] [--pubkey <fp>] | spor agent list | spor agent use <agent-id> | spor agent token <agent-id> [list|revoke <prefix>]");
   return 1;
 }
 
@@ -3553,20 +3556,37 @@ function cmdAgentUse(cfg, { id }) {
   return 0;
 }
 
+// Create an agent on the team server. By DEFAULT this is the SELF-SERVE POST
+// /v1/agents — the agent is owned by the caller's bound person, no admin needed
+// (task-spor-app-agents-self-serve-create). Passing --owner <person-x> creates
+// on behalf of ANOTHER person, which is the admin twin POST /v1/admin/agents
+// (admin-gated). Both routes share the server's createAgentNode body, so the 201
+// shape ({id, owner, spiffe, …}) and the conflict/validation errors are
+// identical — only the door and the 403 explanation differ.
 async function cmdAgentCreateRemote(cfg, { label, owner, pubkey }) {
+  const onBehalf = !!owner; // --owner names someone other than the caller
+  const apiPath = onBehalf ? "/v1/admin/agents" : "/v1/agents";
   const body = { label };
   if (owner) body.owner = owner;
   if (pubkey) body.pubkey = pubkey;
-  const r = await remote.post(cfg, "/v1/admin/agents", body);
+  const r = await remote.post(cfg, apiPath, body);
   if (r.transport) {
     err(`offline — could not reach server (${r.error})`);
     return 1;
   }
-  if (notAdminHint(r)) return 1;
+  if (r.status === 403) {
+    // Self-serve: a 403 means an unbound caller (no person node to own it) — the
+    // notBoundHint nudge. Admin (--owner): a 403 means the caller isn't an admin.
+    if (onBehalf) { notAdminHint(r); }
+    else {
+      err("forbidden — creating an agent needs a bound person identity to own it.");
+      err("your token maps to no person node; check 'spor whoami' (bound).");
+    }
+    return 1;
+  }
   if (r.status === 404) {
-    // The endpoint is part of the agent-identity rollout (the spor-server
-    // stream); an older server doesn't have it yet. Fail soft, don't crash.
-    err("this server has no agent-creation endpoint yet (POST /v1/admin/agents).");
+    // An older server lacks the self-serve (or admin) creation route. Fail soft.
+    err(`this server has no agent-creation endpoint yet (POST ${apiPath}).`);
     err("  upgrade the Spor server, or create the agent in local mode against a checkout.");
     return 1;
   }
@@ -3579,10 +3599,11 @@ async function cmdAgentCreateRemote(cfg, { label, owner, pubkey }) {
     return 1;
   }
   const j = r.json || {};
-  out(`created agent ${j.id || `agent-${kebab(label)}`}${j.owner ? ` owned by ${j.owner}` : ""}`);
+  const id = j.id || `agent-${kebab(label)}`;
+  out(`created agent ${id}${j.owner ? ` owned by ${j.owner}` : ""}`);
   if (j.spiffe) out(`  spiffe: ${j.spiffe}`);
-  out(`  make it this machine's default: spor agent use ${j.id || `agent-${kebab(label)}`}`);
-  out(`  or dispatch as it once: spor dispatch --as ${j.id || `agent-${kebab(label)}`} …`);
+  out(`  make it this machine's default: spor agent use ${id}`);
+  out(`  mint its standing PAT (SPOR_TOKEN for a headless agent): spor agent token ${id}`);
   return 0;
 }
 
@@ -3728,6 +3749,152 @@ function cmdAgentListLocal(cfg) {
     const status = a.status || "active";
     out(`${a.id}\t${ownedBy ? `owned-by ${ownedBy.to}` : "(no owner)"}\t${status}`);
   }
+  return 0;
+}
+
+// --- spor agent token: standing agent-scoped PATs (over /v1/agents/<id>/token) -
+// task-spor-cli-agent-self-serve-verbs: the CLI front-door for the Claude Code
+// on the Web flow — create an agent, mint its standing PAT, set it as SPOR_TOKEN.
+// A standing PAT is a long-lived agent-scoped spor_pat_ (the STANDING mode of
+// POST /v1/agents/<id>/token, {standing:true} — task-spor-app-standing-agent-pat):
+// same agent-on-behalf-of-owner attribution as a per-session dispatch token, but
+// the 7d session cap lifts to a 1y PAT cap (user-set via --expires, rejected not
+// clamped), listable and revocable as a durable credential. Authorization is
+// OWNERSHIP — the agent's owner mints/lists/revokes its tokens, no admin. Remote
+// only: the server is the token store. Mirrors the `spor token` self-serve verbs.
+async function cmdAgentToken(cfg, args) {
+  if (cfg.mode() !== "remote") {
+    err("agent token needs a team graph (remote mode).");
+    return 1;
+  }
+  const agent = args[0];
+  if (!agent || agent.startsWith("-")) {
+    err("usage: spor agent token <agent-id> [--expires <Nd>] [--label <l>]   mint a standing PAT");
+    err("       spor agent token <agent-id> list                            its standing PATs");
+    err("       spor agent token <agent-id> revoke <hash-prefix>            revoke one");
+    return 1;
+  }
+  // The agent id must satisfy the server's mint contract EXACTLY (an `agent-`
+  // kebab slug) — the same predicate `spor agent use`/`dispatch --as` enforce, so
+  // a label-vs-id slip is caught here with the prefix nudge, never a server 422.
+  if (!isAgentId(agent)) {
+    err(`invalid agent id '${agent}' — must be an 'agent-<slug>' kebab id (e.g. agent-your-machine)`);
+    const guess = agentIdGuess(agent);
+    if (guess) err(`  did you mean '${guess}'?  ('spor agent list' shows the full id — the 'agent-' prefix is part of it, not the label)`);
+    return 1;
+  }
+  const sub = args[1];
+  if (sub === "list") return cmdAgentTokenList(cfg, agent);
+  if (sub === "revoke") return cmdAgentTokenRevoke(cfg, agent, args.slice(2));
+  return cmdAgentTokenMint(cfg, agent, args.slice(1));
+}
+
+// POST /v1/agents/{id}/token {standing:true, expires?, label?} — mint a standing
+// agent PAT, returned in plaintext ONCE. Default + max expiry is 1 year
+// (server-enforced, rejected not clamped); --expires shortens it (`<N>d` or an
+// ISO date); --label tags it for the listing. An OLD server without standing mode
+// still has the route but IGNORES `standing` and mints a SHORT per-session token —
+// detect that (no `standing:true` echoed back) and say so, never present a 7d
+// token as the durable SPOR_TOKEN the caller asked for.
+async function cmdAgentTokenMint(cfg, agent, args) {
+  const expires = optVal(args, "expires");
+  const label = optVal(args, "label");
+  const body = { standing: true, ...(expires ? { expires } : {}), ...(label ? { label } : {}) };
+  const r = await remote.post(cfg, `/v1/agents/${encodeURIComponent(agent)}/token`, body, { timeoutMs: 6000 });
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (r.status === 403) {
+    err(`forbidden — only the owner of ${agent} may mint its tokens.`);
+    err(`  check it exists and you own it: spor agent list`);
+    return 1;
+  }
+  if (r.status === 404) {
+    err(`no such agent '${agent}' — list yours with 'spor agent list', or create it: spor agent create <label>`);
+    return 1;
+  }
+  if (!r.ok) {
+    err(`mint failed (${r.status}): ${(r.json && r.json.error && r.json.error.message) || r.text}`);
+    return 1;
+  }
+  const j = r.json || {};
+  if (j.standing !== true) {
+    // The route exists but the server didn't honor standing mode (pre-standing-PAT
+    // build): it minted a short per-session token instead. Surface it — it works as
+    // SPOR_TOKEN until it ages out — but be honest that it is not durable.
+    err("warning: this server has no standing-PAT support yet — it minted a SHORT");
+    err(`  per-session token${j.expires_at ? ` (expires ${j.expires_at})` : ""}, not a 1-year standing PAT. Upgrade the server.`);
+    if (j.token) out(j.token);
+    return 1;
+  }
+  out(`minted standing PAT for ${j.agent || agent}${j.owner ? ` (owned by ${j.owner})` : ""}${j.label ? ` [${j.label}]` : ""}${j.expires ? ` (expires ${j.expires})` : ""} [${j.hash_prefix}]`);
+  out(`  this is shown ONCE — copy it now, it is not recoverable:\n`);
+  out(`  ${j.token}\n`);
+  out(`  set it as SPOR_TOKEN for a headless agent (e.g. Claude Code on the Web).`);
+  out(`  revoke later with: spor agent token ${j.agent || agent} revoke ${j.hash_prefix}`);
+  return 0;
+}
+
+// GET /v1/agents/{id}/tokens — list this agent's STANDING PATs (short per-session
+// dispatch tokens are excluded server-side; they age out on their own).
+async function cmdAgentTokenList(cfg, agent) {
+  const r = await remote.get(cfg, `/v1/agents/${encodeURIComponent(agent)}/tokens`, { timeoutMs: 6000 });
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (r.status === 403) {
+    err(`forbidden — only the owner of ${agent} may manage its standing tokens.`);
+    return 1;
+  }
+  if (r.status === 404) {
+    err(`no such agent '${agent}' (or this server has no standing-PAT endpoint yet).`);
+    return 1;
+  }
+  if (!r.ok) {
+    err(`error ${r.status}`);
+    return 1;
+  }
+  const toks = (r.json && r.json.tokens) || [];
+  if (!toks.length) {
+    out(`no standing PATs for ${agent} — mint one with 'spor agent token ${agent}'`);
+    return 0;
+  }
+  for (const t of toks) {
+    out(`${t.hash_prefix}  ${t.label || "(no label)"}${t.expired ? "  EXPIRED" : ""}${t.expires ? `  (expires ${t.expires})` : ""}`);
+  }
+  return 0;
+}
+
+// DELETE /v1/agents/{id}/tokens/{prefix} — revoke one of this agent's standing
+// PATs by hash prefix; a prefix that isn't one is a 404 (never a session token or
+// another agent's PAT). Revocable per-environment without touching the owner's
+// other access.
+async function cmdAgentTokenRevoke(cfg, agent, args) {
+  const prefix = args.find((a) => !a.startsWith("-"));
+  if (!prefix) {
+    err(`usage: spor agent token ${agent} revoke <hash-prefix>`);
+    return 1;
+  }
+  const r = await remote.del(cfg, `/v1/agents/${encodeURIComponent(agent)}/tokens/${encodeURIComponent(prefix)}`, { timeoutMs: 6000 });
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (r.status === 403) {
+    err(`forbidden — only the owner of ${agent} may manage its standing tokens.`);
+    return 1;
+  }
+  if (r.status === 404) {
+    err(`no standing PAT of ${agent} matches '${prefix}' (list them: spor agent token ${agent} list).`);
+    return 1;
+  }
+  if (!r.ok) {
+    err(`revoke failed (${r.status}): ${(r.json && r.json.error && r.json.error.message) || r.text}`);
+    return 1;
+  }
+  out(`revoked ${r.json.hash_prefix}${r.json.oauth_grants_revoked ? ` (+${r.json.oauth_grants_revoked} oauth grants)` : ""}`);
   return 0;
 }
 
@@ -6958,27 +7125,36 @@ const COMMANDS = {
     run: (cfg, args) => cmdToken(cfg, args),
   },
   agent: {
-    group: "Team admin (remote, admin token)", parse: "raw", args: "create <label> [--owner <id>] [--pubkey <fp>] | list | use <agent-id>",
-    summary: "person-owned automation principals (dispatch identity)",
+    group: "Dispatch (Claude Code background agents)", parse: "raw", args: "create <label> [--owner <id>] [--pubkey <fp>] | list | use <agent-id> | token <agent-id> [list|revoke <prefix>]",
+    summary: "person-owned automation principals (dispatch identity, standing PATs)",
     help:
       "Create and list agents — first-class `type: agent` nodes owned by a person\n" +
       "(dec-spor-agent-identity-nodes). A dispatched session runs AS its agent, so its\n" +
       "writes read \"agent on behalf of person\" rather than person-direct. One durable\n" +
       "agent per machine/install, reused across dispatches.\n\n" +
       "  spor agent create <label>     create the agent + its owned-by edge to a person\n" +
-      "      --owner <person-id>       owner (remote: defaults to your person; local:\n" +
-      "                                defaults to the sole person node, else required)\n" +
+      "      --owner <person-id>       create it for ANOTHER person (admin); without it\n" +
+      "                                the agent is owned by YOU (self-serve). local mode:\n" +
+      "                                defaults to the sole person node, else required\n" +
       "      --pubkey <fingerprint>    record a public-key fingerprint (forward-compat,\n" +
       "                                unenforced — may be omitted)\n" +
       "  spor agent list               list agents and their owners\n" +
       "  spor agent use <agent-id>     make it THIS machine's default dispatch identity\n" +
       "                                (writes dispatch.agent to your user config; pass\n" +
-      "                                --clear to go back to person-scoped dispatch)\n\n" +
+      "                                --clear to go back to person-scoped dispatch)\n" +
+      "  spor agent token <agent-id>   mint a long-lived STANDING PAT for the agent —\n" +
+      "                                the SPOR_TOKEN a headless agent (Claude Code on\n" +
+      "                                the Web) runs under; shown once\n" +
+      "      --expires <Nd|date>       shorten its lifetime (default + max 1 year)\n" +
+      "      --label <l>               tag it for the listing\n" +
+      "  spor agent token <id> list    list the agent's standing PATs\n" +
+      "  spor agent token <id> revoke <prefix>   revoke one by hash prefix\n\n" +
       "'use' is a local config write, not a graph write — it sets which agent\n" +
       "`spor dispatch` runs as by default (override one dispatch with 'dispatch --as').\n" +
-      "Create/list run remote (POST /v1/admin/agents, admin-gated, the server mints the\n" +
-      "spiffe); local mode writes the node + owned-by edge to the graph home.",
-    examples: ["spor agent create anthony-laptop", "spor agent use agent-anthony-laptop", "spor agent list"],
+      "Create runs self-serve (POST /v1/agents, owner = you; --owner uses the admin\n" +
+      "POST /v1/admin/agents); local mode writes the node + owned-by edge to the graph\n" +
+      "home. 'token' is remote-only (owner-gated standing mode of POST /v1/agents/<id>/token).",
+    examples: ["spor agent create anthony-cc-web", "spor agent token agent-anthony-cc-web --label cc-web", "spor agent use agent-anthony-laptop"],
     run: (cfg, args) => cmdAgent(cfg, args),
   },
   admin: {

@@ -220,11 +220,14 @@ test("agent use: missing id prints usage", () => {
 // 2. spor agent create (remote) — fail-soft when the endpoint is absent
 // ===========================================================================
 
-// Stub server answering /v1/me, a configurable /v1/admin/agents, and the agent
-// list surface. `agentsList` (when set) serves GET /v1/agents; otherwise that
-// route 404s and the client falls back to the /v1/changes audit projection
-// (served when `changes` is set), exercising both list paths.
-function agentStub({ agentsStatus = 201, agentsBody = null, agentsList = null, changes = null } = {}) {
+// Stub server answering /v1/me, the configurable admin + SELF-SERVE create
+// doors, and the agent list surface. `agentsStatus`/`agentsBody` shape POST
+// /v1/admin/agents (the --owner admin path); `selfStatus`/`selfBody` shape the
+// self-serve POST /v1/agents (the default, owner = caller). `agentsList` (when
+// set) serves GET /v1/agents; otherwise that GET 404s and the client falls back
+// to the /v1/changes audit projection (served when `changes` is set), exercising
+// both list paths.
+function agentStub({ agentsStatus = 201, agentsBody = null, selfStatus = 201, selfBody = null, agentsList = null, changes = null } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = "";
@@ -235,6 +238,10 @@ function agentStub({ agentsStatus = 201, agentsBody = null, agentsList = null, c
       if (req.url === "/v1/me") return j(200, { person: "person-anthony", email: "a@x.io", bound: true, is_admin: true });
       if (req.url === "/v1/admin/agents" && req.method === "POST") {
         return j(agentsStatus, agentsBody || { id: "agent-anthony-laptop", owner: "person-anthony", spiffe: "spiffe://spor.acme/person/anthony/agent/anthony-laptop", status: "active", revision: "r1" });
+      }
+      if (req.url === "/v1/agents" && req.method === "POST") {
+        // self-serve create: owner is ALWAYS the caller, never asserted in the body
+        return j(selfStatus, selfBody || { id: "agent-anthony-cc-web", owner: "person-anthony", spiffe: "spiffe://spor.acme/person/anthony/agent/anthony-cc-web", status: "active", revision: "r1" });
       }
       if (req.url === "/v1/agents" && req.method === "GET") {
         if (agentsList) return j(200, { agents: agentsList });
@@ -257,7 +264,7 @@ function agentStub({ agentsStatus = 201, agentsBody = null, agentsList = null, c
   );
 }
 
-test("agent create (remote): POSTs /v1/admin/agents and prints the created id + spiffe", { skip: isWin }, async () => {
+test("agent create (remote): --owner uses the ADMIN POST /v1/admin/agents, not the self-serve door", { skip: isWin }, async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-rem-"));
   const { srv, hits, base } = await agentStub({ agentsStatus: 201 });
   try {
@@ -268,6 +275,7 @@ test("agent create (remote): POSTs /v1/admin/agents and prints the created id + 
     const post = hits.find((h) => h.url === "/v1/admin/agents" && h.method === "POST");
     assert.ok(post, "POSTed to /v1/admin/agents");
     assert.deepStrictEqual(JSON.parse(post.body), { label: "anthony-laptop", owner: "person-anthony" });
+    assert.ok(!hits.some((h) => h.url === "/v1/agents" && h.method === "POST"), "did NOT hit the self-serve door");
   } finally {
     srv.close();
   }
@@ -310,6 +318,217 @@ test("agent list (remote): falls back to the /v1/changes projection when /v1/age
   } finally {
     srv.close();
   }
+});
+
+// ---------------------------------------------------------------------------
+// 2b. spor agent create (remote, self-serve) + standing agent PATs
+// (task-spor-cli-agent-self-serve-verbs)
+// ---------------------------------------------------------------------------
+
+test("agent create (remote, self-serve): no --owner POSTs /v1/agents owned by the caller", { skip: isWin }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-self-"));
+  const { srv, hits, base } = await agentStub({});
+  try {
+    const r = await runAsync(["agent", "create", "anthony-cc-web"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /created agent agent-anthony-cc-web owned by person-anthony/);
+    assert.match(r.stdout, /spiffe: spiffe:\/\/spor\.acme/);
+    assert.match(r.stdout, /spor agent token agent-anthony-cc-web/); // points at the standing-PAT mint
+    const self = hits.find((h) => h.url === "/v1/agents" && h.method === "POST");
+    assert.ok(self, "POSTed to the self-serve /v1/agents");
+    assert.deepStrictEqual(JSON.parse(self.body), { label: "anthony-cc-web" }); // no owner asserted
+    assert.ok(!hits.some((h) => h.url === "/v1/admin/agents"), "did NOT hit the admin door");
+  } finally {
+    srv.close();
+  }
+});
+
+test("agent create (remote, self-serve): an unbound caller (403) is nudged to whoami", { skip: isWin }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-self2-"));
+  const { srv, base } = await agentStub({ selfStatus: 403, selfBody: { error: { code: "forbidden", message: "needs a bound person identity" } } });
+  try {
+    const r = await runAsync(["agent", "create", "x"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /bound person identity/);
+    assert.match(r.stderr, /whoami/);
+  } finally {
+    srv.close();
+  }
+});
+
+// A stub for the standing agent-PAT surface: mint (POST .../token), list (GET
+// .../tokens) and revoke (DELETE .../tokens/{prefix}). `standing:false` models an
+// OLD server that ignores the {standing} flag and mints a short per-session token.
+function agentTokenStub({ standing = true } = {}) {
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      hits.push({ method: req.method, url: req.url, body, auth: req.headers.authorization });
+      const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
+      let m = req.url.match(/^\/v1\/agents\/([^/?]+)\/token$/);
+      if (m && req.method === "POST") {
+        const id = decodeURIComponent(m[1]);
+        if (id === "agent-nope") return j(404, { error: { code: "not_found", message: `no such agent '${id}'` } });
+        if (id === "agent-nottheirs") return j(403, { error: { code: "forbidden", message: "only the owner may mint its tokens" } });
+        const b = body ? JSON.parse(body) : {};
+        if (b.expires === "400d") return j(422, { error: { code: "invalid_node", message: "expires may be at most 1 year out" } });
+        if (!standing) return j(201, { token: "spor_pat_session999", expires_at: "2026-06-29T00:00:00.000Z", agent: id, session: null });
+        return j(201, { token: "spor_pat_standing123", hash_prefix: "1111aaaa2222", agent: id, owner: "person-anthony", label: b.label || null, expires: b.expires ? "2026-09-20" : "2027-06-22", standing: true });
+      }
+      m = req.url.match(/^\/v1\/agents\/([^/?]+)\/tokens$/);
+      if (m && req.method === "GET") {
+        return j(200, { tokens: [{ hash_prefix: "1111aaaa2222", label: "cc-web", standing: true, expires: "2027-06-22", expired: false }], count: 1 });
+      }
+      m = req.url.match(/^\/v1\/agents\/([^/?]+)\/tokens\/([^/?]+)$/);
+      if (m && req.method === "DELETE") {
+        if (decodeURIComponent(m[2]) === "1111aaaa2222") return j(200, { revoked: 1, hash_prefix: "1111aaaa2222", oauth_grants_revoked: 0 });
+        return j(404, { error: { code: "not_found", message: "no such token" } });
+      }
+      j(404, { error: { code: "not_found", message: "no route" } });
+    });
+  });
+  return new Promise((resolve) =>
+    srv.listen(0, "127.0.0.1", () => resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` }))
+  );
+}
+
+test("agent token (remote): mints a standing PAT over POST /v1/agents/{id}/token {standing:true}", { skip: isWin }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-tok-"));
+  const { srv, hits, base } = await agentTokenStub();
+  try {
+    const r = await runAsync(["agent", "token", "agent-anthony-cc-web", "--expires", "90d", "--label", "cc-web"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /spor_pat_standing123/); // the plaintext token, shown once
+    assert.match(r.stdout, /1111aaaa2222/);          // hash prefix
+    assert.match(r.stdout, /SPOR_TOKEN/);            // the headless-agent affordance
+    assert.match(r.stdout, /spor agent token agent-anthony-cc-web revoke 1111aaaa2222/);
+    const hit = hits.find((h) => h.method === "POST" && h.url === "/v1/agents/agent-anthony-cc-web/token");
+    assert.ok(hit, "POSTed the mint");
+    assert.strictEqual(hit.auth, "Bearer test-token");
+    const sent = JSON.parse(hit.body);
+    assert.strictEqual(sent.standing, true); // standing mode requested
+    assert.strictEqual(sent.expires, "90d"); // --expires forwarded verbatim
+    assert.strictEqual(sent.label, "cc-web"); // --label forwarded
+  } finally {
+    srv.close();
+  }
+});
+
+test("agent token (remote): --expires past the 1-year cap surfaces the server 422", { skip: isWin }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-tok2-"));
+  const { srv, base } = await agentTokenStub();
+  try {
+    const r = await runAsync(["agent", "token", "agent-anthony-cc-web", "--expires", "400d"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /1 year/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("agent token (remote): a non-owner is a friendly 403", { skip: isWin }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-tok3-"));
+  const { srv, base } = await agentTokenStub();
+  try {
+    const r = await runAsync(["agent", "token", "agent-nottheirs"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /only the owner of agent-nottheirs/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("agent token (remote): an unknown agent is a friendly 404", { skip: isWin }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-tok4-"));
+  const { srv, base } = await agentTokenStub();
+  try {
+    const r = await runAsync(["agent", "token", "agent-nope"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /no such agent 'agent-nope'/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("agent token (remote): an old server (no standing echo) warns, never presents a durable PAT", { skip: isWin }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-tok5-"));
+  const { srv, base } = await agentTokenStub({ standing: false });
+  try {
+    const r = await runAsync(["agent", "token", "agent-anthony-cc-web"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 1); // not a success — the caller asked for a standing PAT
+    assert.match(r.stderr, /no standing-PAT support/);
+    assert.doesNotMatch(r.stdout, /minted standing PAT/); // not framed as the durable credential
+    assert.doesNotMatch(r.stdout, /revoke/); // no durable-PAT revoke hint (there is no hash_prefix)
+  } finally {
+    srv.close();
+  }
+});
+
+test("agent token list (remote): lists the agent's standing PATs", { skip: isWin }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-tok6-"));
+  const { srv, hits, base } = await agentTokenStub();
+  try {
+    const r = await runAsync(["agent", "token", "agent-anthony-cc-web", "list"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /1111aaaa2222/);
+    assert.match(r.stdout, /cc-web/);
+    assert.ok(hits.some((h) => h.method === "GET" && h.url === "/v1/agents/agent-anthony-cc-web/tokens"), "hit the list GET");
+  } finally {
+    srv.close();
+  }
+});
+
+test("agent token revoke (remote): deletes one by hash prefix", { skip: isWin }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-tok7-"));
+  const { srv, hits, base } = await agentTokenStub();
+  try {
+    const r = await runAsync(["agent", "token", "agent-anthony-cc-web", "revoke", "1111aaaa2222"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /revoked 1111aaaa2222/);
+    assert.ok(hits.some((h) => h.method === "DELETE" && h.url === "/v1/agents/agent-anthony-cc-web/tokens/1111aaaa2222"), "hit the revoke DELETE");
+  } finally {
+    srv.close();
+  }
+});
+
+test("agent token revoke (remote): a prefix that isn't one is a friendly 404", { skip: isWin }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-tok8-"));
+  const { srv, base } = await agentTokenStub();
+  try {
+    const r = await runAsync(["agent", "token", "agent-anthony-cc-web", "revoke", "nottheirs99"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /no standing PAT of agent-anthony-cc-web/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("agent token revoke without a prefix exits 1 with usage", { skip: isWin }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-tok9-"));
+  const { srv, base } = await agentTokenStub();
+  try {
+    const r = await runAsync(["agent", "token", "agent-anthony-cc-web", "revoke"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /usage: spor agent token agent-anthony-cc-web revoke/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("agent token: local mode explains it needs a team graph", () => {
+  const { home } = homeWithPerson();
+  const r = run(["agent", "token", "agent-x"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /remote mode/);
+});
+
+test("agent token: an invalid agent id is rejected with the prefix nudge", () => {
+  const r = run(["agent", "token", "mylabel"], { SPOR_SERVER: "http://127.0.0.1:9", SPOR_TOKEN: "t" });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /invalid agent id 'mylabel'/);
+  assert.match(r.stderr, /did you mean 'agent-mylabel'/);
 });
 
 // ===========================================================================
