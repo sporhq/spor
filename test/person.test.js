@@ -113,9 +113,12 @@ test("person create (local): a leading positional is the name", () => {
 
 test("person create (local): no email and no git identity errors clearly, writes nothing", () => {
   const home = freshHome(null); // git-init'd but no user.email
+  // ensureGraphHome (== spor init) seeds the spor@localhost commit fallback before
+  // the guard reads the identity, so the refusal is the sentinel branch: the
+  // fallback is for auto-commits and must not bind a junk person $viewer node.
   const r = run(["person", "create"], localEnv(home));
   assert.strictEqual(r.status, 1);
-  assert.match(r.stderr, /no email for the person node/);
+  assert.match(r.stderr, /spor@localhost commit fallback/);
   assert.ok(!fs.existsSync(path.join(home, "nodes")) || fs.readdirSync(path.join(home, "nodes")).length === 0);
 });
 

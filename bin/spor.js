@@ -3557,6 +3557,19 @@ async function cmdPersonCreate(cfg, { name, email, id }) {
   const ident = gitIdentity(path.dirname(nodesDir));
   email = (email || ident.email || "").trim();
   name = (name || ident.name || "").trim();
+  // ensureGraphHome (== spor init) seeds `git config user.email = spor@localhost`
+  // when the box has no real identity, so the graph can auto-commit
+  // (ensureGitIdentity). That fallback is for COMMIT-ability only — it must NOT
+  // bind a person node, because the email is the $viewer key the local queue keys
+  // off; a `spor@localhost` binding is junk. Treat the sentinel as no real
+  // identity so the guard below fires (an explicit `--email spor@localhost` is
+  // refused too — there's no legitimate person at that address).
+  const FALLBACK_EMAIL = "spor@localhost";
+  if (email === FALLBACK_EMAIL) {
+    err("no real git identity (found the spor@localhost commit fallback) — set 'git config user.email you@example.com' first; the fallback is for auto-commits and won't bind a person node.");
+    err("  the email is the $viewer key the local queue binds your git identity to; pass --email to override.");
+    return 1;
+  }
   if (!email) {
     err("no email for the person node — pass --email, or set 'git config user.email'.");
     err("  the email is the $viewer key the local queue binds your git identity to; without it the node won't bind.");
