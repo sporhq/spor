@@ -415,7 +415,7 @@ async function distill(input) {
     } else {
       const add = u.git(graph, ["add", "nodes/"]);
       const commit =
-        add !== null ? u.git(graph, ["commit", "-qm", `distill: session ${session} (${slug})`]) : null;
+        add !== null ? u.git(graph, [...u.NO_GPGSIGN, "commit", "-qm", `distill: session ${session} (${slug})`]) : null;
       if (add === null || commit === null) log("graph commit failed");
     }
   }

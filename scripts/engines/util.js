@@ -379,6 +379,15 @@ function journalLoadMs(graph, session, engine, loadMs, extra = {}) {
   }
 }
 
+// Global git flags that force commit signing OFF, spread in BEFORE the `commit`
+// subcommand at every automated-commit site (graph snapshots, the SessionEnd
+// distiller, `spor init`/`migrate`). A user with a global commit.gpgsign=true
+// but no usable signing key/agent would otherwise have these housekeeping
+// commits fail SILENTLY — the workflow reports success but nothing lands in git
+// history (issue-spor-local-commit-gpgsign-silent-failure). The graph home is
+// machine-local plumbing, so signing it buys nothing and only risks that failure.
+const NO_GPGSIGN = ["-c", "commit.gpgsign=false"];
+
 function git(cwd, args, opts = {}) {
   try {
     return execFileSync("git", ["-C", cwd, ...args], {
@@ -1059,6 +1068,7 @@ module.exports = {
   matchBriefs,
   repoFingerprints,
   git,
+  NO_GPGSIGN,
   graphInsideCodeRepo,
   ensureDir,
   spoolStats,

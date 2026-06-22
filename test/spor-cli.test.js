@@ -155,6 +155,24 @@ function noGitIdentityEnv() {
   return { GIT_CONFIG_GLOBAL: cfg, GIT_CONFIG_SYSTEM: empty };
 }
 
+// Force commit signing ON but BROKEN: a global commit.gpgsign=true pointed at a
+// gpg program that does not exist, so a plain `git commit` tries to sign, fails,
+// and ABORTS — exactly what a user with gpgsign=true and no usable key/agent
+// hits (issue-spor-local-commit-gpgsign-silent-failure). A valid identity is set
+// so the ONLY failure mode under test is the signing, not a missing identity.
+function gpgSignFailEnv() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-gpg-'));
+  const cfg = path.join(dir, 'gitconfig');
+  const fakeGpg = path.join(dir, 'no-such-gpg'); // never created -> sign fails
+  fs.writeFileSync(cfg,
+    '[user]\n\tname = Real Dev\n\temail = real@dev.example\n' +
+    '[commit]\n\tgpgsign = true\n' +
+    `[gpg]\n\tprogram = ${fakeGpg}\n`);
+  const empty = path.join(dir, 'empty');
+  fs.writeFileSync(empty, '');
+  return { GIT_CONFIG_GLOBAL: cfg, GIT_CONFIG_SYSTEM: empty };
+}
+
 test('init sets a fallback identity + initial commit when git has none, so the graph can commit', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-id-'));
   fs.rmSync(home, { recursive: true, force: true }); // start absent
@@ -175,6 +193,32 @@ test('init sets a fallback identity + initial commit when git has none, so the g
   // the committing identity is surfaced, with a hint to override the fallback
   assert.match(r.stdout, /commits:\s+spor <spor@localhost>/);
   assert.match(r.stdout, /git config --global user\.email/);
+});
+
+test('init still commits when global commit.gpgsign=true but signing is broken (no usable key)', () => {
+  // issue-spor-local-commit-gpgsign-silent-failure: the housekeeping commit must
+  // bypass GPG signing so it can't fail silently, leaving HEAD unborn while
+  // onboarding reports success.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-gpg-home-'));
+  fs.rmSync(home, { recursive: true, force: true }); // start absent
+  const gitEnv = gpgSignFailEnv();
+  // sanity: in this env a plain (signed) commit genuinely fails, so a green
+  // assertion below proves the bypass, not a no-op env.
+  const probe = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-gpg-probe-'));
+  spawnSync('git', ['-C', probe, 'init', '-q'], { env: bare(gitEnv) });
+  fs.writeFileSync(path.join(probe, 'f'), 'x');
+  spawnSync('git', ['-C', probe, 'add', '-A'], { env: bare(gitEnv) });
+  const bad = spawnSync('git', ['-C', probe, 'commit', '-qm', 'x'], { encoding: 'utf8', env: bare(gitEnv) });
+  assert.notStrictEqual(bad.status, 0, 'sanity: a signed commit must fail in this env');
+
+  const r = run(['init'], { SPOR_HOME: home, ...gitEnv });
+  assert.strictEqual(r.status, 0, r.stderr);
+  // HEAD is born despite the broken signing config — the commit was not lost
+  const count = spawnSync('git', ['-C', home, 'rev-list', '--count', 'HEAD'], { encoding: 'utf8', env: bare(gitEnv) }).stdout.trim();
+  assert.strictEqual(count, '1', 'initial commit lands despite broken gpgsign');
+  // and it is genuinely unsigned — signing was bypassed, not somehow satisfied
+  const sig = spawnSync('git', ['-C', home, 'log', '-1', '--format=%G?'], { encoding: 'utf8', env: bare(gitEnv) }).stdout.trim();
+  assert.strictEqual(sig, 'N', 'commit is unsigned (gpgsign bypassed)');
 });
 
 test("init prefers the user's own git identity and does not shadow it", () => {

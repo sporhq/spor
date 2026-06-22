@@ -107,7 +107,7 @@ function ensureInitialCommit(home) {
   if (git(home, ["rev-parse", "--verify", "-q", "HEAD"]).status === 0) return;
   git(home, ["add", "nodes"]); // nodes/ always exists (ensureGraphHome made it)
   if (fs.existsSync(path.join(home, ".gitignore"))) git(home, ["add", ".gitignore"]);
-  git(home, ["commit", "-q", "--allow-empty", "-m", "spor: initialize graph"]);
+  git(home, [...u.NO_GPGSIGN, "commit", "-q", "--allow-empty", "-m", "spor: initialize graph"]);
 }
 
 // Idempotently create the local graph home (nodes/, git, .gitignore, a
@@ -4426,12 +4426,12 @@ function cmdMigrate(cfg, { positionals }) {
   const dirty = (git(home, ["status", "--porcelain"]).stdout || "").trim();
   const hasCommit = git(home, ["rev-parse", "--verify", "-q", "HEAD"]).status === 0;
   if (dirty || !hasCommit) {
-    let c = git(home, ["commit", "-q", "-m", "spor: graph snapshot"]);
+    let c = git(home, [...u.NO_GPGSIGN, "commit", "-q", "-m", "spor: graph snapshot"]);
     // No git identity configured in this environment — fall back so the
     // housekeeping commit still lands. The user's own identity is preferred
     // whenever git has one; this only fires when it has none.
     if (c.status !== 0 && /identity|user\.(email|name)|empty ident/i.test(c.stderr || "")) {
-      c = git(home, ["-c", "user.email=spor@localhost", "-c", "user.name=spor", "commit", "-q", "-m", "spor: graph snapshot"]);
+      c = git(home, [...u.NO_GPGSIGN, "-c", "user.email=spor@localhost", "-c", "user.name=spor", "commit", "-q", "-m", "spor: graph snapshot"]);
     }
     if (c.status !== 0) {
       err(`could not commit the graph: ${(c.stderr || "").trim() || "nothing to commit"}`);
