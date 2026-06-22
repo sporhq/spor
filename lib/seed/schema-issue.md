@@ -34,7 +34,7 @@ write-time only, no node-shape change, no upgrade chain.
 `transitions()` (2026.06.14.1): two write-time gates. (1) Status is
 constrained to the issue vocabulary (`open`/`active`/`resolved`, or none =
 live) so the queue-terminal value (`resolved`) is not shadowed by synonyms —
-the same class of drift that left captures ranking live under a non-terminal
+the same class of drift that left captures ranking live under a then-non-terminal
 `dismissed` (dec-cc-status-enforcement-via-transitions). (2) `resolved`
 additionally requires a durable outcome ON THE GRAPH: a live inbound `resolves`
 edge from a `decision` or `artifact` node, read off `view.resolvers`

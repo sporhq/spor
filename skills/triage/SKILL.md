@@ -75,8 +75,8 @@ applied (body_full): would push body over the 8192B limit"* — those are repeat
 re-captures that bounced because the target node is already at its size cap, so
 the fact is *already on the graph*. Read one, confirm the target node holds it,
 and `merged` the whole cluster. (`dismissed`/`resolved`/`closed` are rejected at
-write time — they leave the capture ranking live; only `merged`/`rejected` are
-terminal here.)
+write time — they are not capture verdicts; only `merged`/`rejected` are valid
+here.)
 
 ## 3. Duplicates → consolidate with a `supersedes` edge
 

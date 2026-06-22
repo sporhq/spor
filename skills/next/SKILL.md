@@ -111,8 +111,8 @@ one plain sentence of "why this is first" is enough. Then:
    with `set_status`: `merged` when its content now lives in the node(s) you
    wrote, or `rejected` when there was no durable fact. Those are the only two
    terminal statuses the schema's `transitions()` gate accepts — `dismissed`/
-   `resolved`/`closed` are rejected at write time because they are not terminal
-   to the queue and leave the capture ranking live
+   `resolved`/`closed` are rejected at write time because they are not capture
+   verdicts (`dismissed` is the gardener's sticky disposition for findings)
    (dec-cc-status-enforcement-via-transitions).
 4. **Item with nothing actionable until a date** (waiting on a measurement
    window, a renewal, an external milestone) → set `wake: YYYY-MM-DD` on the

@@ -15,9 +15,9 @@ registry default (QUEUE.md §2). A `type: schema` node in the graph with
 `transitions()` (2026.06.13.1): a capture-pending node is born status-less
 (live, awaiting triage) and may close only as `merged` (its content now lives
 in proper node(s)) or `rejected` (no durable fact). Earlier triage drifted
-across `dismissed`/`resolved`/`closed`; `dismissed` in particular is not
-terminal to the queue kernel (lib/kernel/resolution.js), so those captures
-looked triaged yet kept ranking live
+across `dismissed`/`resolved`/`closed` — none of which is a capture verdict:
+`dismissed` is the gardener's sticky disposition for findings (kernel-terminal,
+lib/kernel/resolution.js), not a triage outcome for a raw capture
 (issue-cc-dismissed-status-not-terminal). The gate forbids the drift at write
 time rather than hardcoding a value set; chosen over a declarative status enum
 because the gate is write-time on the current→proposed transition, so it never
@@ -52,8 +52,9 @@ Backward-readable: write-time only, no node-shape change, no upgrade chain.
 //              duplicate/elaboration and leaves the queue.
 //   rejected — no durable fact worth keeping.
 // Any other status (the historical dismissed/resolved/closed drift) is denied:
-// dismissed was never terminal to the queue kernel (lib/kernel/resolution.js),
-// so it produced captures that looked triaged yet kept ranking live
+// none is a capture verdict — `dismissed` is the gardener's sticky disposition
+// for findings (kernel-terminal in lib/kernel/resolution.js), not a triage
+// outcome for a raw capture
 // (issue-cc-dismissed-status-not-terminal, dec-cc-status-enforcement-via-transitions).
 // Defining the allowed set ONCE is what makes the create path and the update
 // path AGREE (issue-spor-node-create-bypasses-status-vocabulary): the membership
@@ -63,8 +64,8 @@ function statusReason(next) {
   return "invalid capture-pending status '" + next + "': a capture closes only " +
     "as 'merged' (its content now lives in proper node(s) — write those nodes " +
     "first, then set merged) or 'rejected' (no durable fact worth keeping). " +
-    "Do not use dismissed/resolved/closed — they are not terminal to the queue " +
-    "and leave the capture ranking live (dec-cc-status-enforcement-via-transitions).";
+    "Do not use dismissed/resolved/closed — they are not capture verdicts " +
+    "(dec-cc-status-enforcement-via-transitions).";
 }
 
 // validate(node) — the door, runs on EVERY write (create AND update) in the
