@@ -5615,10 +5615,11 @@ function enableRepoAt(dir) {
   }
 }
 
-// `spor dispatch --backfill` is the onboarding door (task-spor-cli-dispatch-
-// background-agents): set the repo up before launching its backfill agent.
-// Idempotent; prints what it did. The dir-registration happens in cmdDispatch
-// (it applies to every dispatch), this adds the init + enable steps.
+// `spor dispatch --backfill` is the unattended onboarding primitive behind the
+// /spor:onboard skill (task-spor-cli-dispatch-background-agents): set the repo
+// up before launching its backfill agent. Idempotent; prints what it did. The
+// dir-registration happens in cmdDispatch (it applies to every dispatch), this
+// adds the init + enable steps.
 function onboardRepo(cfg, dir) {
   // Init the local graph home — but only in local mode; remote mode keeps the
   // graph on the server, so there is nothing to create locally.
@@ -8013,8 +8014,9 @@ const COMMANDS = {
     help:
       "Compile a briefing for a task and launch a Claude Code background agent in the\n" +
       "right repo. Give free-text, a <node-id>, --node <id>, --from-queue (the top\n" +
-      "ranked item NOT already in flight on this machine), or --backfill (onboard/\n" +
-      "repair a repo). The target dir is the\n" +
+      "ranked item NOT already in flight on this machine), or --backfill (the\n" +
+      "unattended init + enable + launch-/spor:backfill primitive; first-time setup\n" +
+      "goes through the /spor:onboard skill instead). The target dir is the\n" +
       "slug->path map ('spor repos'), overridable with --dir.\n\n" +
       "In remote mode a node dispatch auto-claims the task — it establishes the\n" +
       "heartbeat lease at dispatch time, so concurrent dispatch of the same node is\n" +
@@ -8057,7 +8059,7 @@ const COMMANDS = {
       "no-claim": { type: "boolean", desc: "don't auto-claim the lease (remote node dispatch)" },
       force: { type: "boolean", desc: "dispatch even if the node is already resolved, or an agent for it is in flight here" },
       "from-queue": { type: "boolean", desc: "dispatch the top-ranked queue item not already in flight here" },
-      backfill: { type: "boolean", desc: "onboard/repair this repo (runs /spor:backfill)" },
+      backfill: { type: "boolean", desc: "init + enable + launch /spor:backfill (the primitive behind /spor:onboard)" },
       worktree: { type: "boolean", desc: "run the agent in its own git worktree (overrides dispatch.worktree)" },
       "no-worktree": { type: "boolean", desc: "force-disable worktree isolation for this dispatch" },
       print: { type: "boolean", desc: "dry run — print the prompt, launch nothing" },

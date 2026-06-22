@@ -55,20 +55,35 @@ spor upgrade                  # refresh every wired host to it, then restart
 flags the gap on its own — it shows the loaded plugin version and marks it
 `STALE` when the package on disk is newer.
 
-Then onboard a repo — one command, from inside it:
+Then onboard — from inside the repo, run `/spor:onboard` in your agent:
+
+```
+/spor:onboard
+```
+
+It's the first-time-setup front door. It reads `spor status`, forks
+personal-local vs team-server, establishes your identity (a person node, and
+this machine's dispatch agent), enables Spor for the repo, asks which sources
+the backfill may read, and hands off to `/spor:backfill` to populate the graph
+from git history, design docs, and issue trackers. It's idempotent — re-run it
+any time to repair a half-set-up box. If you're new to Spor or anything's
+unclear, start here.
+
+Once you're set up, bootstrapping another freshly-cloned repo is one unattended
+command from inside it:
 
 ```bash
 cd ~/my-repo && spor dispatch --backfill
 ```
 
-That does the whole setup in one step: creates your graph home if it doesn't
-exist yet (`~/.spor/nodes`, git-initialised), registers the repo so Spor knows
-where it lives on this machine, makes sure Spor is enabled for it, and launches
-the `/spor:backfill` agent in a Claude Code background session — it mines git
-history, design docs, and issue trackers (edges first) and proposes how to
-group your repos into projects. Watch or attach to it with `claude agents`.
-Re-run it whenever you add a repo, or skip it entirely and just work —
-distillation grows the graph one session at a time.
+That's the CLI primitive `/spor:onboard` delegates to: it creates your graph
+home if it doesn't exist yet (`~/.spor/nodes`, git-initialised), registers the
+repo so Spor knows where it lives on this machine, makes sure Spor is enabled,
+and launches the `/spor:backfill` agent in a Claude Code background session.
+Watch or attach to it with `claude agents`. It skips the identity, tenant, and
+consent steps `/spor:onboard` covers, so reach for it once those are done — or
+skip onboarding entirely and just work, since distillation grows the graph one
+session at a time.
 
 `spor status` tells you the resolved mode, graph, project, and (on a team
 graph) server health and identity — run it any time you're unsure whether Spor
@@ -88,7 +103,7 @@ For the per-host event mapping, fidelity notes, distiller backend, and the
 spor dispatch "wire up token rotation in the pipeline"   # free-text task, briefed
 spor dispatch issue-86                                    # a node id — briefs its neighborhood
 spor dispatch --from-queue                                # the top item from 'spor next'
-spor dispatch --backfill                                  # onboard this repo via /spor:backfill
+spor dispatch --backfill                                  # init + enable + run /spor:backfill (door: /spor:onboard)
 spor dispatch <task> --template prompt.tpl                # launch your own prompt, context injected
 spor dispatch <task> --print                              # dry run: show dir, prompt, argv
 ```
@@ -142,10 +157,11 @@ You can also ask for any of this directly: an on-demand briefing for a task,
 a correction when a briefing was wrong, a capture of work you're deferring,
 a question filed when the graph can't answer, and a ranked queue of what to do
 next. In Claude Code these surface as `/spor:brief`, `/spor:correct`,
-`/spor:defer`, `/spor:ask`, and `/spor:next`, plus
-`/spor:backfill` to bootstrap/extend the graph and organize repos into projects.
-(`/spor:backfill` is the discoverable door; the heavy git-history mining still
-runs in the `spor-backfill` subagent it dispatches.)
+`/spor:defer`, `/spor:ask`, and `/spor:next`, plus `/spor:onboard` to set Spor
+up the first time and `/spor:backfill` to bootstrap/extend the graph and
+organize repos into projects. (`/spor:onboard` is the first-time-setup front
+door — identity, mode, consent — and hands off to `/spor:backfill`, whose heavy
+git-history mining runs in the `spor-backfill` subagent it dispatches.)
 
 Corrections are durable. When a briefing includes something stale or misses
 something it should have known, you record the correction once, and every
@@ -299,10 +315,10 @@ open participate: a repo is a no-op (no context injected, nothing distilled into
 the shared graph) until it opts in — either it carries a `.spor`/`.spor.json`
 marker, or `enabled` is set anywhere in the cascade (`SPOR_ENABLED=1`, or
 `enabled:true` in user/global config to turn it on everywhere). `spor enable`
-writes the marker below for you; `spor dispatch --backfill` does it as part of
-onboarding. This keeps unrelated side projects out of your team graph even when
-a server is configured globally. Run `spor status` (or `spor-hook doctor`) in a
-repo to see whether it's active.
+writes the marker below for you; `/spor:onboard` and `spor dispatch --backfill`
+do it as part of onboarding. This keeps unrelated side projects out of your
+team graph even when a server is configured globally. Run `spor status` (or
+`spor-hook doctor`) in a repo to see whether it's active.
 
 ```jsonc
 // .spor.json — committed at a repo root
