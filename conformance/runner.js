@@ -101,6 +101,15 @@ const KINDS = {
   // `expires_iso` (an ISO string) is parsed to epoch ms here so the fixture
   // stays clock-pinned and human-readable, exactly as `now` is. Absent -> the
   // queue is byte-identical to before this input existed.
+  // `timestamps` is the git-derived per-node index ({id: {created_at,
+  // updated_at}}, ISO strings) the caller injects (graph.timestamps from
+  // loadGraph, task-spor-git-derived-timestamp-index). The fixture corpora are
+  // plain file maps with NO git history, so buildGraph derives no index — the
+  // case PINS it directly (it is an injected rankQueue input, like leases/front,
+  // so the kernel stays clock- and git-agnostic). It feeds the `cold_neighbors`
+  // signal, which is surfaced-not-scored by decision
+  // (task-spor-cold-neighbors-weight-conformance): the goldens lock that it rides
+  // the signal + why-line but adds 0 to the score. Absent -> byte-identical.
   queue(c) {
     const g = graphFor(c.corpus);
     let leases = null;
@@ -117,6 +126,7 @@ const KINDS = {
       activity: c.input.activity ?? null,
       front: c.input.front ?? null,
       leases,
+      timestamps: c.input.timestamps ?? null,
       limit: c.input.limit ?? undefined,
       viewer: c.input.viewer ? g.nodes[c.input.viewer] : null,
       now: ms(c.input.now),

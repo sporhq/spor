@@ -1,0 +1,62 @@
+{
+  "items": [
+    {
+      "id": "task-cold",
+      "title": "Migrate the legacy auth shim",
+      "type": "task",
+      "status": "open",
+      "project": "infra",
+      "priority": null,
+      "score": 3,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 90
+      },
+      "suggest": "do",
+      "why": "90d old"
+    },
+    {
+      "id": "task-equal",
+      "title": "Document the connection-pool sizing",
+      "type": "task",
+      "status": "open",
+      "project": "infra",
+      "priority": null,
+      "score": 3,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 90
+      },
+      "suggest": "do",
+      "why": "90d old"
+    },
+    {
+      "id": "task-warm",
+      "title": "Tune the rate limiter thresholds",
+      "type": "task",
+      "status": "open",
+      "project": "infra",
+      "priority": null,
+      "score": 3,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 90
+      },
+      "suggest": "do",
+      "why": "90d old"
+    }
+  ],
+  "count": 3
+}

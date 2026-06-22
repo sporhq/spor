@@ -1,0 +1,4 @@
+{ "id": "cold-neighbors-absent", "kind": "queue", "corpus": "cold-neighbors",
+  "input": { "now": "2026-04-01T00:00:00Z" },
+  "expected": "cold-neighbors-absent.json",
+  "covers": "byte-identical absence (task-spor-cold-neighbors-weight-conformance): the SAME corpus with NO timestamp index injected — no item carries a cold_neighbors signal or why-line fragment, and every score is identical to cold-neighbors-scored. Pairing the two goldens locks the surfaced-not-scored contract: injecting the index adds the signal + why-line on the cold node and changes nothing else (the conformance/buildGraph path injects none, so this is the prompt-path / non-git-home shape)" }

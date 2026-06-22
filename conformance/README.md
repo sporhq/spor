@@ -19,6 +19,13 @@ artifact (REFACTOR.md §2).
   - `queue-policy` — `queue` plus org schema nodes: attached
     `queueSignals()` code, a `queue-policy` `rank()` override, and a
     proposed schema awaiting approval.
+  - `cold-neighbors` — a cold node in a moving neighborhood, ranked with a
+    pinned git-derived `timestamps` index injected via the case input (the
+    corpora carry no git history). The paired `cold-neighbors-scored` /
+    `cold-neighbors-absent` cases lock that `cold_neighbors` is
+    surfaced-not-scored (dec-spor-cold-neighbors-suggestion-only): injecting
+    the index adds the signal + why-line on the cold node but leaves every
+    score identical (0 weight).
   - `diagnostics` — deliberately broken corpus covering every validator
     error and warning class.
   - `meridian` — the self-contained example org from wf/lenses/examples

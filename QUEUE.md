@@ -439,8 +439,17 @@ signals via its schema's `queueSignals()`:
   (task-spor-git-derived-timestamp-index); like `needed_by_days` it rides along
   ONLY when the index is present and the count is >0, so the queue is
   byte-identical without it (conformance, the prompt path, a non-git home). It is
-  surfaced (signal + why-line), not yet a score weight — a ranking contribution is
-  a deliberate tuning change deferred to its own task.
+  **surfaced-not-scored by decision** (dec-spor-cold-neighbors-suggestion-only,
+  task-spor-cold-neighbors-weight-conformance): it contributes **0** to the
+  default blend (signal + why-line only, the staleness posture), because the
+  direction is ambiguous (cold-with-moving-neighbors argues for revisit *or* for
+  closing) and the count scales with neighbor degree like heat once did, so a
+  default weight needs a chosen sign, log-compression, and empirical validation
+  the client has no harness for — while the server gardener's cold-work finder
+  already escalates genuine cold work as a ride-along finding. The raw count stays
+  on `signals.cold_neighbors` so an org `queue-policy` rank() can weight it; the
+  `conformance/cold-neighbors` goldens lock the 0-weight contract (a future
+  default weight is the change that moves them).
 - **age**, and any org-specific signal the schema's code adds (SLA clocks,
   sprint membership, whatever the org's process actually is).
 
