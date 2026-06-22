@@ -192,6 +192,22 @@ test('projectSlug: a .spor marker beats basename inference; invalid values fall 
   assert.equal(u.projectSlug(cwd), path.basename(cwd).toLowerCase().replace(/[^a-z0-9]+/g, '-'));
 });
 
+// slugify is the ONE normalization projectSlug applies to a basename, exported so
+// an explicit `spor add --project` gets the same canonical form
+// (issue-spor-local-add-ask-project-normalization-edge-validation).
+test('slugify: canonicalizes to the server SLUG_RE form; empty when no alphanumerics', () => {
+  const SLUG_RE = /^[a-z0-9][a-z0-9-]*$/;
+  assert.equal(u.slugify('My_Repo'), 'my-repo');
+  assert.equal(u.slugify('MyProject.AppHost'), 'myproject-apphost');
+  assert.equal(u.slugify('already-kebab'), 'already-kebab'); // identity for canonical input
+  assert.equal(u.slugify('  spaced out  '), 'spaced-out');
+  assert.equal(u.slugify('***'), ''); // no slug characters -> empty (caller rejects)
+  assert.equal(u.slugify(null), '');
+  for (const s of ['My_Repo', 'MyProject.AppHost', 'a/b/c', 'Weird.Slug']) {
+    assert.match(u.slugify(s), SLUG_RE, `slugify(${s}) is canonical`);
+  }
+});
+
 // ---------- project-grouping union reads (task-cc-project-grouping-union-reads) ----------
 
 const repoNode = (id, slug, grouping) => [`${id}.md`,

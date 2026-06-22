@@ -1894,6 +1894,25 @@ function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
+// An id round-trips through the frontmatter edge parser only if it is all [\w-]:
+// lib/kernel/graph.js parseFrontmatter captures an edge `to:` as [\w-]+, so any
+// other character makes the whole "- {type: X, to: Y}" line fail to match and
+// silently vanish on read, breaking the reference without a trace. Edges we write
+// locally (spor add --during/--blocks, spor ask --mention) must reject such ids
+// rather than drop them — remote mode already rejects them server-side
+// (issue-spor-local-add-ask-project-normalization-edge-validation).
+const EDGE_ID_RE = /^[\w-]+$/;
+// First [flag, id] pair whose id won't round-trip, or null when all are clean.
+function firstBadEdgeId(pairs) {
+  for (const [flag, id] of pairs) {
+    if (id != null && !EDGE_ID_RE.test(id)) return { flag, id };
+  }
+  return null;
+}
+function edgeIdErr(bad) {
+  return `invalid ${bad.flag} id "${bad.id}" — node ids may contain only letters, digits, '-' and '_'; this edge would be silently dropped on read.`;
+}
+
 // Spool a failed remote capture body to the SHARED outbox
 // (graphHome/outbox/*.capture.json) — the exact queue session-start's
 // drain-outbox engine replays to /v1/capture. The body is written VERBATIM so the
@@ -1989,6 +2008,25 @@ async function cmdAdd(cfg, { values, positionals }) {
     err(`no graph at ${nodesDir} — run 'spor init' first`);
     return 1;
   }
+  // Reject an edge target id that wouldn't round-trip through the frontmatter
+  // parser before we write the node — otherwise the edge silently vanishes on
+  // the next read (issue-spor-local-add-ask-project-normalization-edge-validation).
+  const badEdge = firstBadEdgeId([["--during", during], ["--blocks", blocks]]);
+  if (badEdge) {
+    err(edgeIdErr(badEdge));
+    return 1;
+  }
+  // Normalize an explicit --project the same way an inferred slug already is
+  // (safeSlug -> projectSlug), so `--project My_Repo` files the node under
+  // `my-repo` instead of stamping the verbatim, non-canonical value the server
+  // would have rejected. safeSlug() is already normalized, so this only bites the
+  // explicit flag; a flag with no slug characters is a hard error, not a silent
+  // empty stamp (issue-spor-local-add-ask-project-normalization-edge-validation).
+  const localProject = values.project ? u.slugify(values.project) : project;
+  if (values.project && !localProject) {
+    err(`invalid --project "${values.project}" — it has no slug characters (expected ^[a-z0-9][a-z0-9-]*$).`);
+    return 1;
+  }
   const type = values.type || "task";
   const title = values.title || prose.split(/\s+/).slice(0, 10).join(" ");
   const summary = prose.length > 500 ? prose.slice(0, 497) + "..." : prose;
@@ -2017,7 +2055,7 @@ async function cmdAdd(cfg, { values, positionals }) {
   if (blocks) edgeLines.push(`  - {type: blocks, to: ${blocks}}`);
   const edgesBlock = edgeLines.length ? `edges:\n${edgeLines.join("\n")}\n` : "";
   const neededByLine = neededBy ? `needed_by: ${neededBy}\n` : "";
-  const md = `---\nid: ${id}\ntype: ${type}\nrepo: ${project}\ntitle: ${title.replace(/\n/g, " ")}\nsummary: ${summary.replace(/\n/g, " ")}\n${neededByLine}${edgesBlock}date: ${today()}\n---\n\n${prose}\n`;
+  const md = `---\nid: ${id}\ntype: ${type}\nrepo: ${localProject}\ntitle: ${title.replace(/\n/g, " ")}\nsummary: ${summary.replace(/\n/g, " ")}\n${neededByLine}${edgesBlock}date: ${today()}\n---\n\n${prose}\n`;
   // validate before writing (parse, then the same rules lib/validate enforces)
   let node;
   try {
@@ -2106,7 +2144,24 @@ async function cmdAsk(cfg, { values, positionals }) {
     err(`no graph at ${nodesDir} — run 'spor init' first`);
     return 1;
   }
-  const slug = project || safeSlug();
+  // Reject a --mention id that wouldn't round-trip through the frontmatter parser
+  // before writing, so the mentions edge can't silently vanish on read
+  // (issue-spor-local-add-ask-project-normalization-edge-validation).
+  const badMention = firstBadEdgeId(mentions.map((m) => ["--mention", m]));
+  if (badMention) {
+    err(edgeIdErr(badMention));
+    return 1;
+  }
+  // Normalize an explicit --project to the canonical slug the cwd fallback
+  // already is (safeSlug -> projectSlug), so `--project My_Repo` stamps `my-repo`
+  // instead of a verbatim, non-canonical value the server would have rejected; a
+  // flag with no slug characters is a hard error, not a silent empty stamp
+  // (issue-spor-local-add-ask-project-normalization-edge-validation).
+  if (project && !u.slugify(project)) {
+    err(`invalid --project "${project}" — it has no slug characters (expected ^[a-z0-9][a-z0-9-]*$).`);
+    return 1;
+  }
+  const slug = project ? u.slugify(project) : safeSlug();
   const titleText = title || text.split(/\s+/).slice(0, 10).join(" ");
   const summary = text.length > 500 ? text.slice(0, 497) + "..." : text;
 

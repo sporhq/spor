@@ -191,6 +191,21 @@ function inferenceRoot(cwd) {
   return top;
 }
 
+// Normalize a raw string to the canonical project slug (the server's SLUG_RE,
+// ^[a-z0-9][a-z0-9-]*$): lowercased, runs of non-alphanumerics collapsed to a
+// single '-', and leading/trailing '-' trimmed. This is the ONE normalization
+// projectSlug() applies to a basename, factored out so a hand-passed slug — an
+// explicit `spor add --project My_Repo` — gets the SAME treatment as an inferred
+// one instead of being stamped verbatim and mis-filing the node
+// (issue-spor-local-add-ask-project-normalization-edge-validation). Empty when
+// the input carries no alphanumerics (the caller decides how to handle that).
+function slugify(raw) {
+  return String(raw == null ? "" : raw)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
 // Project slug (see CLAUDE.md): basename of the git root, normalized to
 // kebab-case. Identity for names that are already kebab-case. A committed
 // `.spor` marker file (`project: <id>`) beats all inference — it survives
@@ -220,11 +235,7 @@ function projectSlug(cwd, fallback = "project") {
     const rootHit = readMarker(root);
     if (rootHit) return rootHit;
   }
-  const slug = path
-    .basename(root || cwd || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+  const slug = slugify(path.basename(root || cwd || ""));
   return slug || fallback;
 }
 
@@ -1063,6 +1074,7 @@ module.exports = {
   wordCount,
   stripTrailingNewlines,
   inferenceRoot,
+  slugify,
   projectSlug,
   projectGrouping,
   matchBriefs,

@@ -160,6 +160,32 @@ test("ask (local) with no question text exits 1 with usage", () => {
   assert.match(r.stderr, /usage: spor ask/);
 });
 
+// issue-spor-local-add-ask-project-normalization-edge-validation: local mode
+// stamped --project verbatim and wrote --mention edges without validation.
+
+test("ask (local) normalizes a non-canonical --project to the canonical slug", () => {
+  const { home, nodes } = fixtureGraph();
+  const r = run(["ask", "why is the slug messy", "--project", "Weird.Slug"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(path.join(nodes, "question-why-is-the-slug-messy.md"), "utf8");
+  assert.match(md, /^repo: weird-slug$/m); // not the verbatim Weird.Slug
+});
+
+test("ask (local) rejects a --mention id that would not round-trip", () => {
+  const { home, nodes } = fixtureGraph();
+  const r = run(["ask", "a question with a broken mention", "--mention", "dec-bad:id", "--project", "demo"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /invalid --mention id "dec-bad:id"/);
+  assert.ok(!fs.readdirSync(nodes).some((f) => f.startsWith("question-a-question-with")), "no node written on a bad mention id");
+});
+
+test("ask (local) rejects a --project with no slug characters", () => {
+  const { home } = fixtureGraph();
+  const r = run(["ask", "a question under a garbage project", "--project", "***"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /invalid --project "\*\*\*"/);
+});
+
 test("ask --help prints the command page (table-driven, alias listed)", () => {
   const r = run(["ask", "--help"]);
   assert.strictEqual(r.status, 0, r.stderr);

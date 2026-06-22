@@ -743,6 +743,56 @@ test('add (local) with no context fields is unchanged (no edges block)', () => {
   assert.doesNotMatch(md, /needed_by:/);
 });
 
+// --- add: --project normalization + edge-id validation ----------------------
+// issue-spor-local-add-ask-project-normalization-edge-validation: local mode
+// stamped --project verbatim (mis-filing the node under a non-canonical slug
+// remote mode would reject) and wrote edge target ids without validation (a
+// non-[\w-] char makes the whole edge line vanish on the next parse). Normalize
+// the explicit --project the same way an inferred slug already is, and reject an
+// edge id that won't round-trip instead of silently dropping it.
+
+test('add (local) normalizes a non-canonical --project to the canonical slug', () => {
+  const { dir, nodes } = fixtureGraph();
+  const r = run(['add', 'a capture filed under a messy project', '--type', 'task', '--project', 'My_Repo'], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const file = fs.readdirSync(nodes).find((f) => f.startsWith('task-a-capture-filed'));
+  const md = fs.readFileSync(path.join(nodes, file), 'utf8');
+  assert.match(md, /^repo: my-repo$/m); // not the verbatim My_Repo
+});
+
+test('add (local) rejects a --during edge id that would not round-trip', () => {
+  const { dir, nodes } = fixtureGraph();
+  const r = run(['add', 'a capture with a broken edge', '--type', 'task', '--during', 'task-foo:bar'], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /invalid --during id "task-foo:bar"/);
+  // and nothing is written — better than a node with a silently dropped edge
+  assert.ok(!fs.readdirSync(nodes).some((f) => f.startsWith('task-a-capture-with')), 'no node written on a bad edge id');
+});
+
+test('add (local) rejects a --blocks edge id that would not round-trip', () => {
+  const { dir } = fixtureGraph();
+  const r = run(['add', 'another broken edge', '--type', 'task', '--blocks', 'dec x'], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /invalid --blocks id "dec x"/);
+});
+
+test('add (local) rejects a --project with no slug characters', () => {
+  const { dir } = fixtureGraph();
+  const r = run(['add', 'a capture under a garbage project', '--type', 'task', '--project', '***'], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /invalid --project "\*\*\*"/);
+});
+
+test('add (local) keeps a clean --during/--blocks id and stays byte-stable', () => {
+  const { dir, nodes } = fixtureGraph();
+  const r = run(['add', 'a clean lineage capture', '--type', 'task', '--during', 'dec-x', '--blocks', 'dec-x'], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const file = fs.readdirSync(nodes).find((f) => f.startsWith('task-a-clean-lineage'));
+  const md = fs.readFileSync(path.join(nodes, file), 'utf8');
+  assert.match(md, /- \{type: derived-from, to: dec-x\}/);
+  assert.match(md, /- \{type: blocks, to: dec-x\}/);
+});
+
 test('correct (local) writes a valid corr node targeting a node id', () => {
   const { dir, nodes } = fixtureGraph();
   const r = run(['correct', 'dec-x', 'lead with the rollback plan'], { SPOR_HOME: dir });
