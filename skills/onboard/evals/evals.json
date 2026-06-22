@@ -1,0 +1,35 @@
+{
+  "skill_name": "onboard",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I just ran npm install -g @sporhq/spor and spor install claude in my terminal, but nothing seems to happen when I work in my repo. How do I actually get this set up?",
+      "expected_output": "Triggers onboard. Runs `spor status` first, detects local vs remote, and walks the right setup branch (init -> person create -> agent create/use -> enable), checking the Node-runtime / plugin-stale lines, then hands off to /spor:backfill.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "My teammate sent me a Spor server URL and said to join the team graph. Can you connect me?",
+      "expected_output": "Triggers onboard, takes the REMOTE branch: spor auth login --server <url> (or spor join), pick the org, then VERIFY the token binds to a person via spor whoami and surface '⚠ token maps to no person' if unbound, then spor enable.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Set up spor for me from scratch on this laptop — I don't have a server, I just want it tracking my own work locally.",
+      "expected_output": "Triggers onboard, takes the LOCAL branch: spor init (check the commits: identity line), spor person create, spor agent create + spor agent use, spor enable, states the local-only data caveat correctly, then hands off to /spor:backfill.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "Can you backfill the git history of this repo into the spor graph and group my repos into projects?",
+      "expected_output": "Should NOT trigger onboard — this is /spor:backfill's job (populate + group), and an identity already exists. onboard is the first-time identity door, not the populate door.",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "What's the difference between a decision node and an artifact node in spor, and when should I use each?",
+      "expected_output": "Should NOT trigger onboard — this is a conceptual question about the ontology, handled by /spor:spor, not a setup task.",
+      "files": []
+    }
+  ]
+}

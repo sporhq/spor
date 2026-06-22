@@ -206,7 +206,7 @@ async function cmdStatus(cfg) {
   const home = cfg.graphHome();
   const nodesDir = cfg.nodesDir();
   const slug = safeSlug();
-  out(`mode:     ${mode}${cfg.enabled() ? "" : "  (not enabled here — run 'spor enable' to opt in; hooks are a no-op)"}`);
+  out(`mode:     ${mode}${cfg.enabled() ? "" : "  (not enabled here — run /spor:onboard to set up, or 'spor enable' to opt in; hooks are a no-op)"}`);
   out(`project:  ${slug}`);
   if (mode === "remote") {
     const server = remote.base(cfg);

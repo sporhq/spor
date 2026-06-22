@@ -515,7 +515,8 @@ ${body}${pathScopedBriefsBlock(cwd, nodes)}`;
   if (count === 0) {
     return envelope(
       `No Spor briefing for ${slug} yet — the local graph at ${nodes} is empty. ` +
-        `Bootstrap this repo with /spor:backfill (or 'spor dispatch --backfill'); ` +
+        `New to Spor? /spor:onboard sets up your identity first; to bootstrap this ` +
+        `repo's graph use /spor:backfill (or 'spor dispatch --backfill'); ` +
         `knowledge you capture lands here as you work. ${USAGE_LOCAL}`
     );
   }
