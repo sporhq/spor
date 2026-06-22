@@ -3459,6 +3459,160 @@ async function cmdInvite(cfg, { values }) {
   return 0;
 }
 
+// --- spor person: the local identity anchor -------------------------------
+// task-spor-onboard-cli-person-node: onboarding's local branch must create the
+// `type: person` node the queue's $viewer binding resolves to, but no client
+// verb did this in local mode — `spor agent create` needs a pre-existing person
+// to own the agent, and `spor invite` (the only person-creating path) is remote
+// + admin-gated. This is the deterministic local door: seed title/email from the
+// graph home's git identity (the SAME read lib/queue.js's gitIdentityEmail uses
+// to bind $viewer, so the node it writes is guaranteed to resolve back), then
+// write it through the same validate-before-write path cmdAgentCreateLocal uses.
+async function cmdPerson(cfg, args) {
+  const sub = args[0];
+  if (sub === "create") {
+    const posName = args[1] && !args[1].startsWith("-") ? args[1] : null;
+    return cmdPersonCreate(cfg, {
+      name: optVal(args, "name") || posName,
+      email: optVal(args, "email"),
+      id: optVal(args, "id"),
+    });
+  }
+  if (!sub || sub === "list") return cmdPersonList(cfg);
+  err("usage: spor person create [<name>] [--email <e>] [--id person-x] | spor person list");
+  return 1;
+}
+
+// Write a `type: person` node to the local graph home, seeding name/email from
+// the graph home's git identity when not given. Idempotent: a re-run that finds
+// a person node already bound to this git identity reports it and exits 0, so the
+// onboarding skill can call it unconditionally.
+async function cmdPersonCreate(cfg, { name, email, id }) {
+  // Person creation in remote mode is server-owned: your own node is minted with
+  // your token, teammates via the admin-gated `spor invite`. Redirect rather than
+  // write a stray local file under a server.
+  if (cfg.mode() === "remote") {
+    err("remote mode — your person node is managed by the team server (see 'spor whoami').");
+    err("  create a teammate's person node with 'spor invite --name <n> --email <e>' (admin).");
+    return 1;
+  }
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const queueLib = require(path.join(ROOT, "lib", "queue.js"));
+  ensureGraphHome(cfg); // bootstrap git + .gitignore + nodes/ (idempotent, == spor init)
+  // Write to the authoritative nodes dir (honors a `nodes`/`--nodes` override) and
+  // seed the git identity from the SAME dir the queue's $viewer binding reads —
+  // path.dirname(nodesDir), per localMuteNoOp / lib/queue.js — so the default
+  // email is guaranteed to resolve back to this node even if the dir is relocated.
+  const nodesDir = cfg.nodesDir();
+  if (!fs.existsSync(nodesDir)) fs.mkdirSync(nodesDir, { recursive: true });
+  const ident = gitIdentity(path.dirname(nodesDir));
+  email = (email || ident.email || "").trim();
+  name = (name || ident.name || "").trim();
+  if (!email) {
+    err("no email for the person node — pass --email, or set 'git config user.email'.");
+    err("  the email is the $viewer key the local queue binds your git identity to; without it the node won't bind.");
+    return 1;
+  }
+  // Title is required; fall back to the email local-part before giving up.
+  if (!name) name = email.split("@")[0] || "";
+  if (!name) {
+    err("no name for the person node — pass --name, or set 'git config user.name'.");
+    return 1;
+  }
+
+  let g;
+  try {
+    g = graphLib.loadGraph(nodesDir);
+  } catch (e) {
+    err(`could not load graph: ${e.message}`);
+    return 1;
+  }
+  // Idempotent: a person node already binding this git identity is success, not a
+  // collision — the onboarding skill calls this unconditionally.
+  const existing = queueLib.viewerFor(g, email);
+  if (existing) {
+    out(`person node ${existing.id} already represents <${email}> — nothing to do`);
+    return 0;
+  }
+
+  const prefix = (g.registry && g.registry.prefixesFor("person") || ["person-"])[0] || "person-";
+  if (id) {
+    // An explicit --id must be a canonical kebab slug under the prefix — the same
+    // shape the server's SLUG_RE enforces (mirrors isAgentId), so a hand-passed id
+    // can't write a non-canonical node file. The default path is always kebab'd.
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(id) || !id.startsWith(prefix)) {
+      err(`person id '${id}' must be a kebab '${prefix}<slug>' id (lowercase a-z, 0-9, -)`);
+      return 1;
+    }
+  } else {
+    id = `${prefix}${kebab(name)}`;
+  }
+  if (fs.existsSync(path.join(nodesDir, `${id}.md`))) {
+    err(`person node already exists: ${id} (pass --id to choose another)`);
+    return 1;
+  }
+
+  // Scrub newlines from both interpolated values so a pathological --name/--email
+  // can't inject an extra frontmatter line (the parser is line-based key: value).
+  const safeName = name.replace(/\n/g, " ");
+  const safeEmail = email.replace(/\n/g, " ");
+  const md =
+    `---\nid: ${id}\ntype: person\ntitle: ${safeName}\n` +
+    `summary: Org member ${safeName} <${safeEmail}> — the local $viewer identity anchor for this graph's queue.\n` +
+    `email: ${safeEmail}\ndate: ${today()}\n---\n\n` +
+    `Org member ${safeName} <${safeEmail}>. Created locally by \`spor person create\`; the git-identity ($viewer) anchor the local queue and queue_mute bind to (lib/queue.js viewerFor).\n`;
+  let node;
+  try {
+    node = graphLib.parseFrontmatter(md, `${id}.md`);
+  } catch (e) {
+    err(`invalid node: ${e.message}`);
+    return 1;
+  }
+  const v = graphLib.validateNode(g, node);
+  if (!v.ok) {
+    err(`invalid person node:\n  ${v.errors.join("\n  ")}`);
+    return 1;
+  }
+  fs.writeFileSync(path.join(nodesDir, `${id}.md`), md);
+  out(`created person ${id} <${email}>`);
+  out(`  next: create this machine's agent identity — spor agent create <label>`);
+  return 0;
+}
+
+// List the local graph's person nodes, marking the one this box's git identity
+// binds to (the $viewer). Local-only — remote identity is 'spor whoami'.
+function cmdPersonList(cfg) {
+  if (cfg.mode() === "remote") {
+    err("remote mode — use 'spor whoami' for your server identity.");
+    return 1;
+  }
+  const nodesDir = cfg.nodesDir();
+  if (!fs.existsSync(nodesDir)) {
+    out("no graph yet — run 'spor person create' (or 'spor init').");
+    return 0;
+  }
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const queueLib = require(path.join(ROOT, "lib", "queue.js"));
+  let g;
+  try {
+    g = graphLib.loadGraph(nodesDir);
+  } catch (e) {
+    err(`could not load graph: ${e.message}`);
+    return 1;
+  }
+  const people = Object.values(g.nodes || {}).filter((n) => n.type === "person");
+  if (!people.length) {
+    out("no person nodes — create one with 'spor person create'.");
+    return 0;
+  }
+  const viewer = queueLib.viewerFor(g, gitIdentity(path.dirname(nodesDir)).email);
+  for (const p of people) {
+    const me = viewer && viewer.id === p.id ? "  ← you (git identity)" : "";
+    out(`${p.id}\t${p.email || "(no email)"}\t${p.title || ""}${me}`);
+  }
+  return 0;
+}
+
 // --- spor agent: a person-owned automation principal ----------------------
 // dec-spor-agent-identity-nodes: an agent is a first-class `type: agent` node
 // owned by a person via an `owned-by` edge, so a dispatched session's writes
@@ -7084,6 +7238,27 @@ const COMMANDS = {
       "the identity of every stored tenant. Alias of 'spor auth whoami'.",
     examples: ["spor whoami", "spor whoami --all"],
     run: (cfg, args) => cmdAuthWhoami(cfg, args),
+  },
+  person: {
+    group: "Getting started", parse: "raw",
+    args: "create [<name>] [--email <e>] [--id person-x] | list",
+    summary: "create your local person node (the $viewer identity anchor)",
+    help:
+      "Create the local `type: person` node the queue binds your git identity to —\n" +
+      "the LOCAL-mode, self-serve counterpart to the remote/admin-gated 'spor invite'.\n" +
+      "An onboarding prerequisite: `spor agent create` needs a person to own the agent,\n" +
+      "and the queue's per-viewer mutes resolve through it.\n\n" +
+      "  spor person create [<name>]   write the node, seeding title/email from the graph\n" +
+      "                                home's git identity (git config user.name/user.email)\n" +
+      "      --email <e>               override the seeded email (the $viewer binding key)\n" +
+      "      --name <n>                override the seeded name (else the leading positional)\n" +
+      "      --id person-x             explicit node id (default person-<kebab(name)>)\n" +
+      "  spor person list              list person nodes, marking your git-identity binding\n\n" +
+      "Idempotent: a re-run that finds a node already bound to your git identity reports\n" +
+      "it and exits 0. Local only — in remote mode your person node is server-managed\n" +
+      "('spor whoami'); create teammates with 'spor invite' (admin).",
+    examples: ["spor person create", "spor person create 'Jo Diaz' --email jo@x.io", "spor person list"],
+    run: (cfg, args) => cmdPerson(cfg, args),
   },
 
   // --- Team admin ---
