@@ -438,9 +438,10 @@ against the session's OWN repo (task-cc-norm-ride-along-repo-tag-scope):
 ANY within an axis — deliberately unlike the policy layer's `governs`
 (AND-across-axes). A norm that declares any `applies_to_*` and matches none is
 **excluded** (strict, including in a repo with no `tags` — repo tagging is the
-opt-in that turns scoped norms on); a norm with none keeps the project-scoped
-behavior above, so a graph using no `applies_to_*` is byte-identical
-(norm-cc-byte-identical-refactor).
+opt-in that turns scoped norms on; set them with `spor repos tag <slug>
+<tag...>` rather than hand-editing the `repo-<slug>` node); a norm with none
+keeps the project-scoped behavior above, so a graph using no `applies_to_*` is
+byte-identical (norm-cc-byte-identical-refactor).
 
 Because a norm rides along with no relevance gate and the team trust model lets
 every writer author one, the briefing renderer treats norm bodies as an

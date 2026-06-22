@@ -1322,10 +1322,28 @@ async function cmdQuery(cfg, args) {
 // we gunzip when the magic bytes are present, so an older server that ignores the
 // flag (plain tar) still works. The temp dir is always cleaned up.
 async function queryRemote(cfg, args) {
+  const fetched = await fetchRemoteExportNodes(cfg, "query");
+  if (fetched.error) return 1; // already reported
+  try {
+    return passthrough("query.js", [...args, "--nodes", fetched.nodesDir]);
+  } finally {
+    fetched.cleanup();
+  }
+}
+
+// Fetch the TEAM graph's nodes the documented graph-wide-sweep way (GET
+// /v1/export — the server's nodes/ reproduced byte-for-byte) and extract them to
+// a temp nodes dir. Shared by the remote arm of `spor query` and `spor repos
+// tags` so both run their local code over a freshly-fetched team graph
+// (norm-spor-cli-mode-parity). gzip on the wire when the server honors it; we
+// gunzip on the magic bytes so an older plain-tar server still works. Returns
+// {nodesDir, cleanup} on success, or {error:true} after printing a `<label>
+// error …` line (the fail-clean contract). The caller MUST call cleanup().
+async function fetchRemoteExportNodes(cfg, label) {
   const r = await remote.download(cfg, "/v1/export?gzip=1", { timeoutMs: 120000 });
   if (r.transport) {
     err(`offline — could not reach server (${r.error})`);
-    return 1;
+    return { error: true };
   }
   if (!r.ok) {
     let msg = "";
@@ -1334,8 +1352,8 @@ async function queryRemote(cfg, args) {
     } catch {
       /* non-JSON body */
     }
-    err(`query error ${r.status}${msg ? `: ${msg}` : ""}`);
-    return 1;
+    err(`${label} error ${r.status}${msg ? `: ${msg}` : ""}`);
+    return { error: true };
   }
   let buffer = r.buffer;
   if (buffer.length > 1 && buffer[0] === 0x1f && buffer[1] === 0x8b) {
@@ -1344,12 +1362,13 @@ async function queryRemote(cfg, args) {
     } catch (e) {
       // A corrupt/truncated body: surface a clean line, not a raw stack trace
       // (the fail-clean contract the rest of this arm keeps).
-      err(`query error: could not decode the server's export (${e.message})`);
-      return 1;
+      err(`${label} error: could not decode the server's export (${e.message})`);
+      return { error: true };
     }
   }
   const tar = require(path.join(ROOT, "lib", "tar.js"));
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "spor-query-"));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `spor-${label}-`));
+  const cleanup = () => fs.rmSync(tmp, { recursive: true, force: true });
   try {
     const nodesDir = path.join(tmp, "nodes");
     fs.mkdirSync(nodesDir, { recursive: true });
@@ -1358,9 +1377,10 @@ async function queryRemote(cfg, args) {
       if (!base.endsWith(".md")) continue;
       fs.writeFileSync(path.join(nodesDir, base), e.data);
     }
-    return passthrough("query.js", [...args, "--nodes", nodesDir]);
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    return { nodesDir, cleanup };
+  } catch (e) {
+    cleanup();
+    throw e;
   }
 }
 
@@ -5758,8 +5778,296 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   return r.status == null ? 1 : r.status;
 }
 
-// --- spor repos: inspect/manage the local slug->path map -----------------
-function cmdRepos(cfg, args) {
+// --- repo-identity tags (task-cc-repos-tag-ergonomic) ---------------------
+// Repo tags are the match key for a norm's `applies_to_tags` ride-along (schema-
+// repo, schema-norm): a norm scoped `applies_to_tags: [python]` rides into a
+// session's briefing only when the session's OWN repo node is tagged `python`,
+// and an UNTAGGED repo strictly EXCLUDES every tag-scoped norm — so unset tags
+// silently disable the feature. Until now the only way to set them was hand-
+// editing the `repo-<slug>` node's frontmatter (local) or a put_node (remote);
+// `spor repos tag`/`untag`/`tags` make tagging a first-class operation, the
+// deliberate opt-in that turns scoped norms on. They write the same inline
+// `tags:` list session-start maintains for slugs/fingerprints — one more repo-
+// identity register beside them — and mirror the slug/fingerprint heal flow
+// rather than inventing a new surface (the node, not the dispatch map, is the
+// store; the dispatch map only locates the checkout for auto-suggest).
+// Slugs share the node-id grammar (the server's SLUG_RE == ID_RE) — reuse the
+// module-level NODE_ID_RE rather than a second const that can drift from it.
+const TAG_RE = /^[a-z0-9][a-z0-9._-]*$/; // a flat label safe for the inline-list grammar
+
+// Normalize raw tag tokens: lowercase, trim, dedupe (order-preserving), reject
+// anything that won't round-trip the inline `[a, b]` list grammar. {tags}|{error}.
+function normalizeTags(rawTags) {
+  const tags = [];
+  const seen = new Set();
+  for (const raw of rawTags) {
+    const tag = String(raw).trim().toLowerCase();
+    if (!tag) continue;
+    if (!TAG_RE.test(tag)) return { error: `invalid tag '${raw}' — tags are lowercase labels matching ${TAG_RE.source} (no spaces, commas, or brackets)` };
+    if (seen.has(tag)) continue;
+    seen.add(tag);
+    tags.push(tag);
+  }
+  return { tags };
+}
+
+// Read the inline `tags:` list off a repo node's raw markdown (frontmatter
+// only), mirroring the kernel's inline-list parse. [] when absent.
+function tagsFromRaw(raw) {
+  const m = /^---\n([\s\S]*?)\n---/.exec(raw);
+  const fm = m ? m[1] : ""; // no frontmatter fence -> no tags (never scan the body)
+  const t = /^tags:\s*\[([^\]]*)\]/m.exec(fm);
+  return t ? t[1].split(",").map((s) => s.trim()).filter(Boolean) : [];
+}
+
+// Rewrite a repo node's raw markdown to carry `tags` as its inline `tags:` list,
+// mirroring rewriteStatus/appendEdgeLine. An empty array removes the field. The
+// line is grouped with the other identity registers (after fingerprints/slugs)
+// when present, else appended to the frontmatter. Returns the new raw, or null
+// when the frontmatter can't be located.
+function rewriteTags(raw, tags) {
+  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(raw);
+  if (!m) return null;
+  const body = m[2];
+  const lines = m[1].split("\n").filter((l) => !/^tags:\s*/.test(l));
+  if (tags.length) {
+    const line = `tags: [${tags.join(", ")}]`;
+    let anchor = -1;
+    for (let i = 0; i < lines.length; i++) if (/^(fingerprints|slugs):\s*/.test(lines[i])) anchor = i;
+    if (anchor === -1) lines.push(line);
+    else lines.splice(anchor + 1, 0, line);
+  }
+  return `---\n${lines.join("\n")}\n---\n${body}`;
+}
+
+// Order-insensitive set equality, so a no-op tag edit skips the write (and, in
+// remote mode, an unnecessary put_node + commit).
+function sameTags(a, b) {
+  if (a.length !== b.length) return false;
+  const s = new Set(a);
+  return b.every((x) => s.has(x));
+}
+
+// Auto-suggest candidate tags from a repo's files on disk — a deliberate hint a
+// human confirms, never an auto-commit (the slug-alias confirmation queue is the
+// model). Cheap: one top-level directory read, exact filenames + the *.tf glob
+// the task calls out. The named three (terraform/python/go) plus a few obvious,
+// unambiguous markers.
+const TAG_DETECTORS = [
+  { tag: "terraform", any: (names) => names.some((n) => n.endsWith(".tf")) },
+  { tag: "python", files: ["pyproject.toml", "uv.lock", "setup.py", "requirements.txt", "Pipfile"] },
+  { tag: "go", files: ["go.mod"] },
+  { tag: "node", files: ["package.json"] },
+  { tag: "rust", files: ["Cargo.toml"] },
+  { tag: "ruby", files: ["Gemfile"] },
+  { tag: "docker", files: ["Dockerfile", "compose.yaml", "docker-compose.yml"] },
+];
+function detectRepoTags(dir) {
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const set = new Set(names);
+  const out = [];
+  for (const d of TAG_DETECTORS) {
+    if (d.any ? d.any(names) : d.files.some((f) => set.has(f))) out.push(d.tag);
+  }
+  return out;
+}
+
+// Where this slug's checkout lives on disk, for auto-suggest: the machine-local
+// dispatch.repos map (the authoritative, other half of `spor repos`) first, else
+// the current repo ROOT — but only when the ROOT'S OWN inferred slug matches, so
+// a monorepo-subtree marker slug (whose root infers a different slug) doesn't
+// scan the wrong directory. null when unknown — suggestion is then skipped.
+function repoDirForSlug(cfg, slug) {
+  const map = cfg.get("dispatch.repos", {}) || {};
+  if (map[slug]) return map[slug];
+  const root = u.inferenceRoot(process.cwd());
+  return root && u.projectSlug(root) === slug ? root : null;
+}
+
+function noRepoNodeMsg(id, slug) {
+  return `no repo identity node '${id}' — it self-registers when you open a session in that repo (or run 'spor backfill'); list them with 'spor repos tags'`;
+}
+function tagSetMsg(id, tags) {
+  return tags.length ? `tags set: ${id} -> [${tags.join(", ")}]` : `tags cleared: ${id}`;
+}
+
+// Read a repo-<slug> node's raw markdown in either mode: remote GETs
+// /v1/nodes/{id} (raw + revision for the optimistic-concurrency update); local
+// reads the node file. {raw, revision?}|{missing:true}|{error}.
+async function readRepoNodeRaw(cfg, slug) {
+  const id = `repo-${slug}`;
+  if (cfg.mode() === "remote") {
+    const g = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 8000 });
+    if (g.transport) return { error: `offline — could not reach server (${g.error})` };
+    if (g.status === 404) return { missing: true };
+    if (!g.ok) return { error: `error ${g.status}` };
+    return { raw: (g.json && g.json.raw) || g.text, revision: g.json && g.json.revision };
+  }
+  const file = path.join(cfg.nodesDir(), `${id}.md`);
+  try {
+    return { raw: fs.readFileSync(file, "utf8") };
+  } catch {
+    return { missing: true };
+  }
+}
+
+// Write a repo-<slug> node's new raw markdown in either mode: remote does the
+// documented whole-node update (put_node, if_exists:update + revision — no
+// dedicated /tags endpoint, consistent with how slug aliases are filed); local
+// validates against the registry (the same bar as priority/set-status) before
+// writing the file. {ok:true}|{error}.
+async function writeRepoNodeRaw(cfg, slug, newRaw, revision) {
+  const id = `repo-${slug}`;
+  if (cfg.mode() === "remote") {
+    const pr = await remote.post(cfg, "/v1/nodes", { nodes: [{ node: newRaw, if_exists: "update", revision }] }, { timeoutMs: 8000 });
+    if (pr.transport) return { error: `offline — could not reach server (${pr.error})` };
+    // A 207 with a failed single-node entry IS a failure here (unlike a multi-node
+    // batch) — gate on the entry's own ok, and surface the server's generic
+    // message plus its granular `details` list (the validator's specifics).
+    const res0 = pr.json && pr.json.results && pr.json.results[0];
+    if (!(res0 && res0.ok)) {
+      const parts = [];
+      if (res0 && res0.message) parts.push(res0.message);
+      if (res0 && Array.isArray(res0.details)) parts.push(...res0.details);
+      return { error: `tag error ${pr.status}${parts.length ? `: ${parts.join("; ")}` : ""}` };
+    }
+    return { ok: true };
+  }
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const nodesDir = cfg.nodesDir();
+  let g;
+  try {
+    g = graphLib.loadGraph(nodesDir);
+  } catch (e) {
+    return { error: `could not load graph: ${e.message}` };
+  }
+  let node;
+  try {
+    node = graphLib.parseFrontmatter(newRaw, `${id}.md`);
+  } catch (e) {
+    return { error: `invalid node after tag edit: ${e.message}` };
+  }
+  const v = graphLib.validateNode(g, node);
+  if (!v.ok) return { error: `invalid node after tag edit:\n  ${v.errors.join("\n  ")}` };
+  fs.writeFileSync(path.join(nodesDir, `${id}.md`), newRaw);
+  return { ok: true };
+}
+
+// Read-modify-write the repo-<slug> node's tags. `computeNext(current)` returns
+// the new tag set ({tags}|{error}); a no-op set skips the write entirely.
+async function mutateRepoTags(cfg, slug, computeNext) {
+  const id = `repo-${slug}`;
+  const r = await readRepoNodeRaw(cfg, slug);
+  if (r.error) {
+    err(r.error);
+    return 1;
+  }
+  if (r.missing) {
+    err(noRepoNodeMsg(id, slug));
+    return 1;
+  }
+  const current = tagsFromRaw(r.raw);
+  const next = computeNext(current);
+  if (next.error) {
+    err(next.error);
+    return 1;
+  }
+  if (sameTags(current, next.tags)) {
+    out(current.length ? `tags unchanged: ${id} -> [${current.join(", ")}]` : `tags unchanged: ${id} (none)`);
+    return 0;
+  }
+  const newRaw = rewriteTags(r.raw, next.tags);
+  if (newRaw == null) {
+    err(`could not locate frontmatter in ${id}`);
+    return 1;
+  }
+  const w = await writeRepoNodeRaw(cfg, slug, newRaw, r.revision);
+  if (w.error) {
+    err(w.error);
+    return 1;
+  }
+  out(tagSetMsg(id, next.tags));
+  return 0;
+}
+
+// `spor repos tag <slug>` with no tags: show current tags and auto-suggest
+// candidates from the checkout on disk, writing NOTHING.
+async function cmdReposTagSuggest(cfg, slug) {
+  const id = `repo-${slug}`;
+  const r = await readRepoNodeRaw(cfg, slug);
+  if (r.error) {
+    err(r.error);
+    return 1;
+  }
+  if (r.missing) {
+    err(noRepoNodeMsg(id, slug));
+    return 1;
+  }
+  const current = tagsFromRaw(r.raw);
+  out(`${id}: ${current.length ? `[${current.join(", ")}]` : "(no tags)"}`);
+  const dir = repoDirForSlug(cfg, slug);
+  if (!dir) {
+    out(`(no checkout mapped for '${slug}' — 'spor repos add ${slug} <path>' to enable tag auto-suggest)`);
+    return 0;
+  }
+  const suggested = detectRepoTags(dir).filter((t) => !current.includes(t));
+  if (!suggested.length) {
+    out(`(no new tag candidates detected in ${dir})`);
+    return 0;
+  }
+  out(`suggested (from ${dir}): ${suggested.join(" ")}`);
+  out(`  apply: spor repos tag ${slug} ${[...current, ...suggested].join(" ")}`);
+  return 0;
+}
+
+// `spor repos tags`: list every repo-identity node with its slugs + tags. Dual-
+// mode — local reads the graph home; remote runs the same enumeration over a
+// freshly-fetched team graph (GET /v1/export), the graph-wide-sweep path `spor
+// query` uses.
+async function cmdReposTagList(cfg) {
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  let nodesDir, cleanup = () => {};
+  if (cfg.mode() === "remote") {
+    const fetched = await fetchRemoteExportNodes(cfg, "repos");
+    if (fetched.error) return 1;
+    nodesDir = fetched.nodesDir;
+    cleanup = fetched.cleanup;
+  } else {
+    nodesDir = cfg.nodesDir();
+  }
+  try {
+    let g;
+    try {
+      g = graphLib.loadGraph(nodesDir);
+    } catch (e) {
+      err(`could not load graph: ${e.message}`);
+      return 1;
+    }
+    const repos = Object.values(g.nodes)
+      .filter((n) => n.type === "repo")
+      .sort((a, b) => a.id.localeCompare(b.id));
+    if (!repos.length) {
+      out("no repo identity nodes yet — they self-register as you open sessions");
+      return 0;
+    }
+    for (const n of repos) {
+      const slugs = Array.isArray(n.slugs) ? n.slugs : [];
+      const tags = Array.isArray(n.tags) ? n.tags : [];
+      out(`${n.id}\tslugs: [${slugs.join(", ")}]\ttags: [${tags.join(", ")}]`);
+    }
+    return 0;
+  } finally {
+    cleanup();
+  }
+}
+
+// --- spor repos: the local slug->path map + repo-identity tags ------------
+async function cmdRepos(cfg, args) {
   // The map is machine-local: written to the PERSONAL user config home, never
   // the (possibly marker-shared) graph home. Reads still go through the cascade
   // below (cfg.get), whose user layer is anchored at this same home, so writes
@@ -5785,7 +6093,7 @@ function cmdRepos(cfg, args) {
       err("usage: spor repos add <slug> <path>");
       return 1;
     }
-    if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) {
+    if (!NODE_ID_RE.test(slug)) {
       err(`invalid slug '${slug}' — must match ^[a-z0-9][a-z0-9-]*$`);
       return 1;
     }
@@ -5803,7 +6111,43 @@ function cmdRepos(cfg, args) {
     out(u.forgetRepo(home, slug) ? `forgot ${slug}` : `no mapping for ${slug}`);
     return 0;
   }
-  err("usage: spor repos [list] | spor repos add <slug> <path> | spor repos rm <slug>");
+  // Repo-identity tags on the repo-<slug> GRAPH node (not the dispatch map).
+  if (sub === "tags") {
+    return await cmdReposTagList(cfg);
+  }
+  if (sub === "tag" || sub === "untag") {
+    const slug = args[1];
+    if (!slug) {
+      err(`usage: spor repos ${sub} <slug> [<tag>...]${sub === "untag" ? "  (no tags clears all)" : ""}`);
+      return 1;
+    }
+    if (!NODE_ID_RE.test(slug)) {
+      err(`invalid slug '${slug}' — must match ^[a-z0-9][a-z0-9-]*$`);
+      return 1;
+    }
+    const rawTags = args.slice(2);
+    if (sub === "tag" && !rawTags.length) {
+      // bare `tag <slug>` => show current + auto-suggest, write nothing
+      return await cmdReposTagSuggest(cfg, slug);
+    }
+    if (sub === "untag" && !rawTags.length) {
+      // bare `untag <slug>` => clear all tags
+      return await mutateRepoTags(cfg, slug, () => ({ tags: [] }));
+    }
+    const norm = normalizeTags(rawTags);
+    if (norm.error) {
+      err(norm.error);
+      return 1;
+    }
+    if (sub === "tag") {
+      // set/replace the repo's tag list with exactly these tags
+      return await mutateRepoTags(cfg, slug, () => ({ tags: norm.tags }));
+    }
+    // untag: drop the named tags from the current list
+    const remove = new Set(norm.tags);
+    return await mutateRepoTags(cfg, slug, (current) => ({ tags: current.filter((t) => !remove.has(t)) }));
+  }
+  err("usage: spor repos [list] | add <slug> <path> | rm <slug> | tags | tag <slug> [tag...] | untag <slug> [tag...]");
   return 1;
 }
 
@@ -7167,10 +7511,25 @@ const COMMANDS = {
     run: (cfg, p) => cmdDispatch(cfg, p),
   },
   repos: {
-    group: "Dispatch (Claude Code background agents)", parse: "raw", args: "[list | add <slug> <path> | rm <slug>]",
-    summary: "the local slug->repo-dir map used to pick the dispatch directory",
-    help: "Show or edit the per-machine slug->repo-dir map dispatch uses to find a repo.\nThe map self-registers as you open sessions.\n\n  spor repos                 list the map\n  spor repos add <slug> <p>  map a slug to a path\n  spor repos rm <slug>       forget a mapping",
-    examples: ["spor repos", "spor repos add api ~/code/api"],
+    group: "Dispatch (Claude Code background agents)", parse: "raw",
+    args: "[list | add <slug> <path> | rm <slug> | tags | tag <slug> [tag...] | untag <slug> [tag...]]",
+    summary: "the local dispatch slug->dir map, plus repo-identity tags in the graph",
+    help:
+      "Two repo registers in one place.\n\n" +
+      "The machine-local slug->repo-dir map dispatch uses to find a repo (self-\n" +
+      "registers as you open sessions, lives in your user config.json):\n" +
+      "  spor repos                 list the map\n" +
+      "  spor repos add <slug> <p>  map a slug to a path\n" +
+      "  spor repos rm <slug>       forget a mapping\n\n" +
+      "Repo-identity TAGS on the repo-<slug> graph node — the match key for a norm's\n" +
+      "applies_to_tags ride-along (schema-repo). An UNTAGGED repo excludes every tag-\n" +
+      "scoped norm, so tagging is the deliberate opt-in that turns them on (dual-mode:\n" +
+      "local rewrites the node file, remote does a put_node update):\n" +
+      "  spor repos tags                   list every repo node with its slugs + tags\n" +
+      "  spor repos tag <slug> <tag...>    set (replace) a repo's tags\n" +
+      "  spor repos tag <slug>             show current tags + auto-suggest from disk\n" +
+      "  spor repos untag <slug> [tag...]  remove tags (no tags clears all)",
+    examples: ["spor repos", "spor repos add api ~/code/api", "spor repos tag spor-server python backend", "spor repos tags"],
     run: (cfg, args) => cmdRepos(cfg, args),
   },
   capabilities: {

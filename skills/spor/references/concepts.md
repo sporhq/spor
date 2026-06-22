@@ -84,8 +84,9 @@ into all three. Narrow it with flat per-instance selectors on the norm node
 (not the schema): `applies_to_tags: [python]` (matched against the session
 repo's `tags:`), `applies_to_repos: [repo-x]`, `applies_to_projects: [proj-y]`.
 A norm that declares any `applies_to_*` and matches none is **excluded** —
-including in a repo with no `tags:` — so repo tagging is the opt-in. A norm with
-none keeps the default project-wide ride-along.
+including in a repo with no `tags:` — so repo tagging is the opt-in (set a
+repo's tags with `spor repos tag <slug> <tag...>`; `spor repos tags` lists
+them). A norm with none keeps the default project-wide ride-along.
 
 Don't invent edge variants. The automatic distiller sometimes emits forms like
 `related-to`/`supercedes`/`derives-from`; those normalize to the canonical
