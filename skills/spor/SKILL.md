@@ -1,51 +1,51 @@
 ---
 name: spor
-description: Load this skill whenever you work with Spor — a project-specific knowledge-graph tool your training does not cover — so you use the right CLI syntax, node and edge format, MCP tools, and REST API instead of rediscovering them each time. Read it before any Spor graph operation — querying or searching the graph, reading or writing nodes, adding edges, capturing or deferring work, running spor CLI commands or Spor MCP tools, working in local vs remote mode, or defining a new node/edge type or schema. Also use it for any conceptual question about Spor (what it is, how it works, the mental model of nodes and edges, what the auto-injected briefing is) and to choose among the /spor commands — defer, brief, next, correct, backfill. When unsure about anything Spor, consult this first rather than guessing.
+description: The operating manual for Spor — a knowledge-graph tool your training does not cover. Load it before any Spor graph operation so you use the right CLI syntax, node and edge format, MCP tools, and REST API instead of rediscovering them: querying or searching the graph, reading or writing nodes, adding edges, capturing or deferring work, running spor CLI commands or Spor MCP tools, working in local vs remote mode, or defining a new node/edge type or schema. It also routes you to the right /spor action skill (defer, brief, next, correct, ask, backfill) for a specific operation, and explains the node/edge mental model when you need it. For FIRST-TIME setup — installing, creating an identity, joining a team graph, or "spor isn't doing anything" — use /spor:onboard instead. When unsure how to operate Spor, consult this before guessing.
 ---
 
-# Orient yourself in Spor
+# Operate Spor
 
-Spor is a typed, versioned **knowledge graph** that holds the durable
-outcomes of work — decisions (including the ones that were dismissed, and
-why), tasks, issues, norms, specs, questions — one fact per node, joined by
-typed edges. It exists because that knowledge otherwise dies in branches, PR
-threads, and chat scrollback: the next session starts cold and the team
-relitigates settled questions. Spor persists it across sessions and
-teammates, indexes it for relevance, **resurfaces deferred work** the moment
-a session touches its neighborhood, and keeps dismissed approaches — the "why
-we didn't" — retrievable.
+Spor is a typed, versioned **knowledge graph** of the durable outcomes of
+work — decisions (including the dismissed ones, and why), tasks, issues, norms,
+specs, questions — one fact per node, joined by typed edges. Your training
+doesn't cover it, so this skill is your standing **operating reference**: the
+CLI verbs, node and edge format, MCP tools, and REST surface, so you use the
+right ones instead of rediscovering them each time.
 
-Much of the time you don't touch it by hand: in Claude Code, hooks compile a
-briefing at session start and a per-prompt digest automatically, and at session
-end a distiller writes new nodes back. But when you need to operate on the graph
-yourself — query or search it, read or write nodes and edges, run a `spor`
-command or a Spor MCP tool, or extend the schema — this skill is your standing
-reference, so you use the right syntax, formats, and tools instead of
-rediscovering them each time. It also explains the model when you (or the user)
-just need to understand Spor, and routes you to the action skills for specific
-operations.
+Most of the time you don't touch the graph by hand — in Claude Code, hooks
+compile a briefing at session start and a per-prompt digest automatically, and a
+distiller writes new nodes back at session end. This skill is for when you
+operate it yourself: query or search, read or write nodes and edges, run a
+`spor` verb or a Spor MCP tool, or extend the schema. For **first-time setup** —
+installing, creating an identity, joining a team graph, or "spor isn't doing
+anything" — stop here and use **/spor:onboard**, the front door.
 
-## The model in one minute
+Work the graph in a loop: **ORIENT → TRAVERSE → COMMIT**. Find where to start,
+walk outward through edges until you have enough context, then write the outcome
+back so the next session inherits it.
+
+## The model, in brief
 
 - **Nodes** are markdown files, one fact each, with a `type` and a kebab-case
   `id` that starts with the type's prefix (`dec-`, `task-`, `issue-`, `norm-`,
-  `spec-`/`art-`, `question-`, …). The `summary` line must stand on its own —
+  `art-`/`spec-`, `question-`, …). The `summary` line must stand on its own —
   most consumers only ever see it.
 - **Edges** are typed and directional, written from the source node's
   perspective: `supersedes`, `blocks`, `resolves`, `derived-from`,
-  `constrained-by`, `governed-by`, `decided-in`, `relates-to`, `mentions`, …
-  They carry the lineage a flat list can't — *why* a node exists and what it
-  depends on. An edge may point at an id that doesn't exist yet; the compiler
-  just skips it (a marker that the node is worth creating).
-- **The ontology is data you can extend.** Those type and edge tables aren't
-  fixed — each type is itself a `type: schema` node (QUEUE.md §2). The seed
-  pack shipped in `lib/seed/` is the default set; a schema node you add to a
-  graph overrides or extends it, so an org can shape its own ontology.
+  `constrained-by`, `governed-by`, `relates-to`, `mentions`, … They carry the
+  lineage a flat list can't — *why* a node exists and what it depends on. An
+  edge may point at an id that doesn't exist yet; the compiler skips it (a marker
+  the node is worth creating).
+- **The ontology is data you can extend.** Each type is itself a `type: schema`
+  node (QUEUE.md §2): the seed pack in `lib/seed/` is the default, and a schema
+  node resident in a graph overrides or extends it. Introspect the live set with
+  `spor schema` — don't reverse-engineer it from `lib/seed/` (that misses
+  resident overrides).
 
-For the full node-type and edge-type registries, the node file format, and the
-project-slug rule, read **`references/concepts.md`**.
+Full node-type and edge-type registries, the node file format, and the
+project-slug rule live in **`references/concepts.md`**.
 
-## Local or remote? The CLI resolves it — don't branch in prose
+## Mode: the CLI resolves it — don't branch in prose
 
 Spor runs against your **personal** graph (local mode) or a **team server**
 (remote mode), but you don't detect that and fork: **run one `spor <verb>` and
@@ -57,7 +57,7 @@ the mode unless the user asks; if you need to *see* the resolved mode/tenant, ru
 `spor status`. (The one branch that remains is **surface, not mode**: in Cowork /
 with the connector there is no shell, so use the MCP tools — see below.)
 
-The two modes still differ in what happens underneath, as background:
+As background, the two modes differ in what happens underneath:
 
 | | local (`SPOR_SERVER` unset) | remote (`SPOR_SERVER` set) |
 |---|---|---|
@@ -70,14 +70,10 @@ Settings resolve through a cascade (CLI flag > env > repo `.spor.json` >
 user/global config > defaults), so when in doubt let `spor status` report the
 effective values rather than guessing.
 
-## Reading and writing the graph
+## CLI reference
 
-Work the graph in a loop: **ORIENT → TRAVERSE → COMMIT**. Find where to start,
-walk outward through edges until you have enough context, then write the
-outcome back so the next session inherits it.
-
-**The `spor` CLI** is the simplest surface. A few verbs work in either mode;
-the rest are mode-specific (`spor status` confirms which mode you're in):
+The `spor` CLI is the simplest surface. A few verbs work in either mode; the
+rest are mode-specific (`spor status` confirms which mode you're in):
 
 ```bash
 # either mode (the CLI self-resolves local vs remote per verb)
@@ -131,77 +127,63 @@ spor validate                  # lint the local graph (server validates per-writ
 spor compile --root <id> --skeleton   # writes a local briefing-node skeleton
 ```
 
-`spor analytics` folds the graph repo's git history into work-flow metrics:
-created vs. completed work per ISO week, throughput, cycle time, current WIP by
-type, and the oldest-open bottlenecks. Completion time is a node's status-
-*transition* time (when it entered its final terminal run, read from git content
-history), never `updated_at` — so a later edge append can't corrupt the
-"completed last week" signal (dec-spor-git-derived-timestamps). Dual-mode: local
-mode folds the local graph's git history, remote mode dispatches to the server's
-`GET /v1/analytics` (which owns the graph there) and renders the same report
-(norm-spor-cli-mode-parity); `--project`/`--type`/`--weeks`/`--json` scope and
-shape it.
+A few of these have enough surface to be worth a sentence:
 
-`spor query` is the structured enumeration — the deterministic,
-predicate-filtered list that `get` (one node), `next` (the ranked queue) and
-`compile --query` (semantic search) are not. Dual-mode (norm-spor-cli-mode-
-parity): local mode reads the local nodes dir; remote mode runs the SAME
-enumeration over the TEAM graph — it fetches the server's nodes via `GET
-/v1/export` and queries them locally (the structured-filter sibling of remote
-mode's saved `render_lens` views; use `spor lens` for a saved board/table). It
-AND-combines node predicates — `--type <T>` (repeatable),
-`--where key=value` (repeatable; a list field like `tags` matches on
-membership), `--id-prefix <p>` — and with `--edges` emits `{from,type,to}`
-edges instead, filterable by `--edge-type`, `--from <id>` (out-edges) and
-`--to <id>` (in-edges), e.g. `spor query --edges --edge-type grouped-under
---to proj-rdi` answers "what is grouped under proj-rdi". Projections: default
-table, `--ids`, `--summary`, `--full`, `--json`.
+- **`spor next --project <token>`** accepts a **repo slug** (resolves *up* to its
+  home-project grouping and unions the members — the intuitive token), a
+  **`repo-<slug>` node id** (pins that single repo), or a **grouping id
+  `proj-<stem>`** (the grouping union). An unknown token warns on stderr and
+  yields an empty queue (still exit 0). Pin a default for both modes with the
+  `queue.project` config key (`SPOR_QUEUE_PROJECT`, or `.spor.json` `{"queue":
+  {"project": "<token>"}}`); an explicit `--project` always wins.
+- **`spor query`** is the structured enumeration `get` (one node), `next` (the
+  ranked queue) and `compile --query` (semantic search) are not. It AND-combines
+  node predicates — `--type <T>` (repeatable), `--where key=value` (repeatable; a
+  list field like `tags` matches on membership), `--id-prefix <p>` — and with
+  `--edges` emits `{from,type,to}` edges instead, filterable by `--edge-type`,
+  `--from <id>` (out-edges) and `--to <id>` (in-edges), e.g. `spor query --edges
+  --edge-type grouped-under --to proj-rdi`. Projections: default table, `--ids`,
+  `--summary`, `--full`, `--json`. Remote mode runs the same enumeration over the
+  TEAM graph (fetched via `GET /v1/export`); use `spor lens` for a saved
+  board/table.
+- **`spor schema`** is the contract introspection surface
+  (norm-cc-registry-is-contract): it renders the LIVE registry — every node and
+  edge type with prefixes, weights, ride-along flags
+  (`always_on`/`traversable`/`capturable`/`queueable`), the status partition, and
+  the attached `validate()`/`transitions()`/`get()` gates — **merging the seed
+  pack with graph-resident `type: schema` overrides** and tagging provenance
+  (`seed`/`graph`/`native`). `spor schema <type>` details one type; `--source
+  seed|graph|native` filters, `--json` is the machine snapshot. Reach for this
+  instead of reading `lib/seed/`.
+- **`spor analytics`** folds the graph repo's git history into work-flow metrics
+  (created vs completed per ISO week, throughput, cycle time, WIP by type,
+  oldest-open bottlenecks). Completion time is a node's status-*transition* time
+  read from git content history, never `updated_at`
+  (dec-spor-git-derived-timestamps). `--project`/`--type`/`--weeks`/`--json`
+  scope and shape it.
+- **`spor compile`/`spor brief`** are mode-aware: local runs the in-repo
+  compiler, remote dispatches to the server (this is what `/spor:brief` pulls).
+  In local mode add `--project <repo-slug>` to scope to a repo — without it
+  `compile --root`/`--query` run *project-blind* and every `always_on` norm rides
+  along regardless of `applies_to_*`. `--nodes <dir>` always targets that local
+  checkout, even under a server.
 
-`spor schema` is the contract introspection surface (norm-cc-registry-is-
-contract): it renders the LIVE registry — every node and edge type with its id
-prefixes, edge weights, ride-along flags
-(`always_on`/`traversable`/`capturable`/`queueable`), the status-resolution
-partition, and the attached `validate()`/`transitions()`/`get()` gates —
-**merging the seed pack with graph-resident `type: schema` overrides** and
-tagging each entry's provenance (`seed`/`graph`/`native`). `spor schema <type>`
-shows one type in detail with its gate source; `--edges`/`--nodes-only` narrow
-the lists, `--source seed|graph|native` filters by provenance, `--json` is the
-machine snapshot. Reach for this instead of reading `lib/seed/` files — those
-miss resident overrides. Both modes work: local reads the local registry, remote
-reflects the server's live registry via `GET /v1/schema`.
+The deeper mode-specific flows — the exact REST calls, and the rule that
+*completing* a task or issue needs a resolving node on the graph first — live in
+the action skills below; reach for those rather than reinventing them.
 
-`spor next --project <token>` accepts three forms: a **repo slug** (resolves
-*up* to its home-project grouping and unions the members — the intuitive token),
-a **`repo-<slug>` node id** (pins that single repo — the escape hatch), or a
-**grouping id `proj-<stem>`** (the grouping union). An unknown token warns on
-stderr and yields an empty queue (it still exits 0). Pin a default scope for both
-modes with the `queue.project` config key (`SPOR_QUEUE_PROJECT`, or `.spor.json`
-`{"queue": {"project": "<token>"}}`); an explicit `--project` always wins.
+## MCP tools (Cowork / connector — no shell)
 
-`compile`/`brief` are mode-aware: local mode runs the in-repo compiler, remote
-mode dispatches to the server (mirroring `/spor:brief`). Much of this is what
-the session hooks already inject for you automatically; pulling one on demand
-with `spor brief`, `spor compile`, or `/spor:brief` is the same briefing.
-Passing `--nodes <dir>` always targets that local checkout, even under a server.
-In local mode, add `--project <repo-slug>` to scope to a repo: without it
-`compile --root`/`--query` run *project-blind* and the `always_on` norm
-ride-along ignores `applies_to_*` scoping (every norm rides along) — pass it to
-match what a real session in that repo sees. `/spor:brief` does this for you.
-
-**In Cowork (Anthropic's chat workspace) and Claude Code with the connector**
-there is no shell and no ambient injection — reach the graph through the
-**Spor MCP tools** instead:
-`query_graph` (ORIENT/TRAVERSE: free-text search, or `root_id` to compile one
-node's neighborhood), `get_node` (raw node + revision), `my_queue` (the ranked
-queue), `render_lens` (a saved board/table/lineage view; no id lists them),
-and to COMMIT: `capture` (raw prose → server types it — reach for this when
-unsure of the shape), or the precise writes `put_node` / `add_edge` /
-`set_status`. Close loops with edges: answer a question with a node carrying an
-`answers` edge; close work with a `resolves` edge from a `decision`/`artifact`.
-
-The deeper, mode-specific flows — the exact REST calls, and the rule that
-*completing* a task or issue needs a resolving node on the graph first — live
-in the action skills below; reach for those rather than reinventing them.
+In Cowork (Anthropic's chat workspace) and Claude Code with the connector there
+is no shell and no ambient injection — reach the graph through the **Spor MCP
+tools** instead: `query_graph` (ORIENT/TRAVERSE: free-text search, or `root_id`
+to compile one node's neighborhood), `get_node` (raw node + revision),
+`my_queue` (the ranked queue), `render_lens` (a saved board/table/lineage view;
+no id lists them), and to COMMIT: `capture` (raw prose → server types it — reach
+for this when unsure of the shape), or the precise writes `put_node` /
+`add_edge` / `set_status`. Close loops with edges: answer a question with a node
+carrying an `answers` edge; close work with a `resolves` edge from a
+`decision`/`artifact`.
 
 ## Adding a node or edge type
 
@@ -209,21 +191,20 @@ Because schemas are themselves nodes, you extend the ontology by **writing a
 node**, not editing code: a `type: schema` node with `kind: node-schema` (or
 `edge-schema`), a CalVer `schema_version`, a fenced-JSON payload, and optional
 sandboxed `validate`/`transitions`/`queueSignals` functions. A resident schema
-overrides its seed equivalent; the server forces new schemas to `proposed` and
-a *different* identity must activate them (no self-approval).
-
-For an org-specific type, that schema node lives *in your graph* and overrides
-the seed default — you don't edit the plugin's source. It's still a contract
-change (every node of that type depends on it), so version it with CalVer and
-keep it backward-readable. Before doing it, read
+overrides its seed equivalent and lives *in your graph* (you don't edit the
+plugin's source); the server forces new schemas to `proposed` and a *different*
+identity must activate them (no self-approval). It's still a contract change, so
+version it with CalVer and keep it backward-readable. Before doing it, read
 **`references/authoring-schemas.md`**.
 
-## Which skill do I use?
+## Which skill do I use
 
-This skill orients; these do the work. Route to them rather than improvising:
+This skill orients and carries the operating reference; these do the work. Route
+to them rather than improvising:
 
 | You want to… | Use | Trigger |
 |---|---|---|
+| First-time setup: identity, mode, join a team graph, "nothing happens" | **/spor:onboard** | installing Spor, creating an identity, "spor isn't doing anything" |
 | File deferred / discovered work, a follow-up, a dismissed approach | **/spor:defer** | "remember / file / defer this", work postponed mid-session |
 | File a question the graph can't answer, so it routes to whoever knows | **/spor:ask** | the briefing/digest came back empty on something a teammate would know |
 | Get a briefing for a task or node before starting | **/spor:brief** | starting non-trivial work; `/spor:brief <query\|id>` |
@@ -232,9 +213,8 @@ This skill orients; these do the work. Route to them rather than improvising:
 | Bootstrap a repo's graph, or group repos into projects | **/spor:backfill** | onboarding a repo, "organize my repos" |
 | Read/write the team graph in Cowork (no hooks there) | **/spor:team-graph** | any graph work in Cowork |
 
-If a request is just "explain Spor" or "which Spor thing do I use for X",
-answer from this skill — in plain language for a newcomer, without dumping the
-whole ontology unless asked.
+If a request is just "which Spor thing do I use for X", answer from this table.
+If it's "how do I get started / set up Spor", that's **/spor:onboard**.
 
 ## Read more
 
