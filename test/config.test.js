@@ -150,6 +150,29 @@ test('opt-in: a flat .spor identity marker activates the repo, and an ancestor m
   assert.strictEqual(cs.enabled(), true);
 });
 
+test('opt-in: a `.spor` DIRECTORY (the graph home) is NOT a repo marker — markerless repos under it stay no-ops (issue-spor-home-dir-marker-opt-in-leak)', () => {
+  const root = tmp();
+  // The default LOCAL graph home `~/.spor` is a DIRECTORY. Place one at the
+  // ancestor of an unrelated side project — exactly the home-dir layout that
+  // made a bare existsSync treat the graph home as a repo opt-in marker and
+  // falsely enable every markerless repo nested under $HOME.
+  const graphHome = path.join(root, '.spor');
+  fs.mkdirSync(graphHome, { recursive: true });
+  const side = path.join(root, 'side-project');
+  fs.mkdirSync(side);
+  const c = loadConfig({ cwd: side, env: bareEnv({ SPOR_HOME: graphHome }) });
+  assert.strictEqual(c.enabled(), false);
+  // remote mode must not re-enable it either (a globally-set SPOR_SERVER only
+  // resolves the MODE, never opt-in — the core guarantee).
+  const remote = loadConfig({ cwd: side, env: bareEnv({ SPOR_HOME: graphHome, SPOR_SERVER: 'https://srv' }) });
+  assert.strictEqual(remote.enabled(), false);
+  // a real flat `.spor` FILE marker at the project still activates it — the
+  // file-vs-directory distinction is what tells the marker from the graph home.
+  writeMarker(side, 'repo: side\n');
+  const enabled = loadConfig({ cwd: side, env: bareEnv({ SPOR_HOME: graphHome }) });
+  assert.strictEqual(enabled.enabled(), true);
+});
+
 test('opt-in: enabled via the cascade (SPOR_ENABLED env, user config.json) activates a markerless repo', () => {
   const root = tmp();
   const side = path.join(root, 'side');
