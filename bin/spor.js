@@ -3455,7 +3455,7 @@ async function cmdInvite(cfg, { values }) {
   out(`minted token for ${j.person} <${j.email}>${j.expires ? ` (expires ${j.expires})` : ""} [${j.hash_prefix}]`);
   out(`  give this to the teammate ONCE — it is not recoverable:\n`);
   out(`  spor join ${remote.base(cfg)} ${j.token}\n`);
-  out(`  revoke later with: spor token revoke ${j.hash_prefix}`);
+  out(`  revoke later with: spor admin token revoke ${j.hash_prefix}`);
   return 0;
 }
 
@@ -3731,54 +3731,165 @@ function cmdAgentListLocal(cfg) {
   return 0;
 }
 
+// --- spor token: self-serve personal access tokens (over /v1/me/tokens) ----
+// task-spor-cli-me-tokens-verbs: the CLI twin of task-spor-app-me-tokens-self-
+// serve, following the `spor agent` self-serve precedent. By DEFAULT every verb
+// is caller-scoped over /v1/me/tokens — you create, list, and revoke your OWN
+// personal access tokens (spor_pat_, for CI and headless use) with no admin
+// privilege. `--all` escalates list/revoke to the team-wide admin view
+// (/v1/admin/tokens, admin-gated), which `spor admin token` reaches by the same
+// path. Remote-only — the server is the token store.
+//
+// A personal access token needs a BOUND person identity (you need a person node
+// to own it); an unbound caller (a legacy by-value or OAuth token mapping to no
+// person node) is a 403 the server explains, relayed here with a 'spor whoami'
+// nudge — the self-serve sibling of notAdminHint.
+function notBoundHint(r) {
+  if (r.status === 403) {
+    err("forbidden — a personal access token needs a bound person identity.");
+    err("your token maps to no person node; check 'spor whoami' (bound).");
+    return true;
+  }
+  return false;
+}
+
 async function cmdToken(cfg, args) {
   if (cfg.mode() !== "remote") {
-    err("token admin needs a team graph (remote mode).");
+    err("token needs a team graph (remote mode).");
     return 1;
   }
+  const all = args.includes("--all");
   const sub = args[0];
-  if (sub === "list") {
-    const r = await remote.get(cfg, "/v1/admin/tokens");
-    if (r.transport) {
-      err(`offline (${r.error})`);
-      return 1;
-    }
-    if (notAdminHint(r)) return 1;
-    if (!r.ok) {
-      err(`error ${r.status}`);
-      return 1;
-    }
-    const toks = (r.json && r.json.tokens) || [];
-    if (!toks.length) {
-      out("no tokens");
-      return 0;
-    }
-    for (const t of toks) {
-      out(`${t.hash_prefix}  ${t.person || t.email || "?"}${t.expired ? "  EXPIRED" : ""}${t.expires ? `  (expires ${t.expires})` : ""}`);
-    }
-    return 0;
-  }
-  if (sub === "revoke") {
-    const prefix = args[1];
-    if (!prefix) {
-      err("usage: spor token revoke <hash-prefix>");
-      return 1;
-    }
-    const r = await remote.del(cfg, `/v1/admin/tokens/${encodeURIComponent(prefix)}`);
-    if (r.transport) {
-      err(`offline (${r.error})`);
-      return 1;
-    }
-    if (notAdminHint(r)) return 1;
-    if (!r.ok) {
-      err(`revoke failed (${r.status}): ${(r.json && r.json.error && r.json.error.message) || r.text}`);
-      return 1;
-    }
-    out(`revoked ${r.json.hash_prefix}${r.json.oauth_grants_revoked ? ` (+${r.json.oauth_grants_revoked} oauth grants)` : ""}`);
-    return 0;
-  }
-  err("usage: spor token list | spor token revoke <hash-prefix>");
+  if (sub === "create") return cmdTokenCreate(cfg, args);
+  if (sub === "list") return all ? cmdTokenListAdmin(cfg) : cmdTokenListSelf(cfg);
+  if (sub === "revoke") return all ? cmdTokenRevokeAdmin(cfg, args) : cmdTokenRevokeSelf(cfg, args);
+  err("usage: spor token create [--expires <Nd>] [--label <l>]   mint your own PAT");
+  err("       spor token list [--all]                            your PATs (--all: team, admin)");
+  err("       spor token revoke <hash-prefix> [--all]            revoke one (--all: team, admin)");
   return 1;
+}
+
+// POST /v1/me/tokens {expires?, label?} — mint a caller-scoped PAT, returned in
+// plaintext ONCE. Default + max expiry is 1 year (server-enforced); --expires
+// shortens it (`<N>d` or an ISO date); --label tags it for the listing.
+async function cmdTokenCreate(cfg, args) {
+  const expires = optVal(args, "expires");
+  const label = optVal(args, "label");
+  const body = { ...(expires ? { expires } : {}), ...(label ? { label } : {}) };
+  const r = await remote.post(cfg, "/v1/me/tokens", body);
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (notBoundHint(r)) return 1;
+  if (!r.ok) {
+    err(`mint failed (${r.status}): ${(r.json && r.json.error && r.json.error.message) || r.text}`);
+    return 1;
+  }
+  const j = r.json;
+  out(`minted personal access token for ${j.person}${j.email ? ` <${j.email}>` : ""}${j.label ? ` [${j.label}]` : ""}${j.expires ? ` (expires ${j.expires})` : ""} [${j.hash_prefix}]`);
+  out(`  this is shown ONCE — copy it now, it is not recoverable:\n`);
+  out(`  ${j.token}\n`);
+  out(`  use it as SPOR_TOKEN, or run: spor join ${remote.base(cfg)} ${j.token}`);
+  out(`  revoke later with: spor token revoke ${j.hash_prefix}`);
+  return 0;
+}
+
+// GET /v1/me/tokens — list the caller's OWN PATs (agent session tokens excluded
+// server-side). person/email are always the caller here, so the label leads.
+async function cmdTokenListSelf(cfg) {
+  const r = await remote.get(cfg, "/v1/me/tokens");
+  if (r.transport) {
+    err(`offline (${r.error})`);
+    return 1;
+  }
+  if (notBoundHint(r)) return 1;
+  if (!r.ok) {
+    err(`error ${r.status}`);
+    return 1;
+  }
+  const toks = (r.json && r.json.tokens) || [];
+  if (!toks.length) {
+    out("no personal access tokens — mint one with 'spor token create'");
+    return 0;
+  }
+  for (const t of toks) {
+    out(`${t.hash_prefix}  ${t.label || "(no label)"}${t.expired ? "  EXPIRED" : ""}${t.expires ? `  (expires ${t.expires})` : ""}`);
+  }
+  return 0;
+}
+
+// DELETE /v1/me/tokens/{prefix} — revoke one of the caller's OWN PATs; a prefix
+// that isn't theirs is a 404 (never another person's token).
+async function cmdTokenRevokeSelf(cfg, args) {
+  const prefix = args.slice(1).find((a) => !a.startsWith("-"));
+  if (!prefix) {
+    err("usage: spor token revoke <hash-prefix>");
+    return 1;
+  }
+  const r = await remote.del(cfg, `/v1/me/tokens/${encodeURIComponent(prefix)}`);
+  if (r.transport) {
+    err(`offline (${r.error})`);
+    return 1;
+  }
+  if (notBoundHint(r)) return 1;
+  if (r.status === 404) {
+    err(`no personal access token of yours matches '${prefix}' (team view: 'spor token revoke ${prefix} --all').`);
+    return 1;
+  }
+  if (!r.ok) {
+    err(`revoke failed (${r.status}): ${(r.json && r.json.error && r.json.error.message) || r.text}`);
+    return 1;
+  }
+  out(`revoked ${r.json.hash_prefix}${r.json.oauth_grants_revoked ? ` (+${r.json.oauth_grants_revoked} oauth grants)` : ""}`);
+  return 0;
+}
+
+// GET /v1/admin/tokens — the team-wide view (admin-gated). The escalated arm of
+// `spor token list --all` and the body of `spor admin token list`.
+async function cmdTokenListAdmin(cfg) {
+  const r = await remote.get(cfg, "/v1/admin/tokens");
+  if (r.transport) {
+    err(`offline (${r.error})`);
+    return 1;
+  }
+  if (notAdminHint(r)) return 1;
+  if (!r.ok) {
+    err(`error ${r.status}`);
+    return 1;
+  }
+  const toks = (r.json && r.json.tokens) || [];
+  if (!toks.length) {
+    out("no tokens");
+    return 0;
+  }
+  for (const t of toks) {
+    out(`${t.hash_prefix}  ${t.person || t.email || "?"}${t.expired ? "  EXPIRED" : ""}${t.expires ? `  (expires ${t.expires})` : ""}`);
+  }
+  return 0;
+}
+
+// DELETE /v1/admin/tokens/{prefix} — revoke ANY token by prefix (admin-gated).
+// The escalated arm of `spor token revoke <prefix> --all` and `spor admin token
+// revoke <prefix>`.
+async function cmdTokenRevokeAdmin(cfg, args) {
+  const prefix = args.slice(1).find((a) => !a.startsWith("-"));
+  if (!prefix) {
+    err("usage: spor token revoke <hash-prefix> --all   (or: spor admin token revoke <hash-prefix>)");
+    return 1;
+  }
+  const r = await remote.del(cfg, `/v1/admin/tokens/${encodeURIComponent(prefix)}`);
+  if (r.transport) {
+    err(`offline (${r.error})`);
+    return 1;
+  }
+  if (notAdminHint(r)) return 1;
+  if (!r.ok) {
+    err(`revoke failed (${r.status}): ${(r.json && r.json.error && r.json.error.message) || r.text}`);
+    return 1;
+  }
+  out(`revoked ${r.json.hash_prefix}${r.json.oauth_grants_revoked ? ` (+${r.json.oauth_grants_revoked} oauth grants)` : ""}`);
+  return 0;
 }
 
 // --- spor admin: the ops-facing operations surface ------------------------
@@ -3790,8 +3901,25 @@ async function cmdToken(cfg, args) {
 async function cmdAdmin(cfg, args) {
   const sub = args[0];
   if (sub === "gardener") return cmdAdminGardener(cfg, args.slice(1));
+  if (sub === "token") return cmdAdminToken(cfg, args.slice(1));
   if (sub) err(`spor admin: unknown sub-command '${sub}'.`);
   err("usage: spor admin gardener [--json]");
+  err("       spor admin token list | spor admin token revoke <hash-prefix>");
+  return 1;
+}
+
+// spor admin token list|revoke — the team-wide token surface under the ops
+// parent (the discoverable home for the `--all` escalation of `spor token`).
+// Remote + admin only; delegates to the shared admin list/revoke arms.
+async function cmdAdminToken(cfg, args) {
+  if (cfg.mode() !== "remote") {
+    err("token admin needs a team graph (remote mode).");
+    return 1;
+  }
+  const sub = args[0];
+  if (sub === "list") return cmdTokenListAdmin(cfg);
+  if (sub === "revoke") return cmdTokenRevokeAdmin(cfg, args);
+  err("usage: spor admin token list | spor admin token revoke <hash-prefix>");
   return 1;
 }
 
@@ -6811,10 +6939,22 @@ const COMMANDS = {
     run: (cfg, p) => cmdInvite(cfg, p),
   },
   token: {
-    group: "Team admin (remote, admin token)", parse: "raw", args: "list | revoke <prefix>",
-    summary: "manage tokens (list, revoke)",
-    help: "List or revoke team tokens. Remote + admin only.\n\n  spor token list              show all tokens (hash prefix, person, expiry)\n  spor token revoke <prefix>   revoke the token with that hash prefix",
-    examples: ["spor token list", "spor token revoke a1b2c3"],
+    group: "Getting started", parse: "raw",
+    args: "create [--expires <Nd>] [--label <l>] | list [--all] | revoke <prefix> [--all]",
+    summary: "self-serve personal access tokens (create, list, revoke your own)",
+    help:
+      "Create, list, and revoke your OWN personal access tokens (spor_pat_) for CI and\n" +
+      "headless use — the self-serve twin of `spor invite` (which mints for others). Every\n" +
+      "verb is caller-scoped over /v1/me/tokens and needs a bound person identity (check\n" +
+      "'spor whoami'). Remote only.\n\n" +
+      "  spor token create             mint a PAT bound to you, shown in plaintext ONCE\n" +
+      "      --expires <Nd|ISO>        lifetime, e.g. 90d (default + max: 1 year)\n" +
+      "      --label <text>            a note to identify it in the listing\n" +
+      "  spor token list               your PATs (hash prefix, label, expiry)\n" +
+      "      --all                     the whole team's tokens (admin; = spor admin token list)\n" +
+      "  spor token revoke <prefix>    revoke one of YOUR PATs by hash prefix\n" +
+      "      --all                     revoke ANY token by prefix (admin; = spor admin token revoke)",
+    examples: ["spor token create --expires 90d --label ci", "spor token list", "spor token revoke a1b2c3"],
     run: (cfg, args) => cmdToken(cfg, args),
   },
   agent: {
@@ -6842,21 +6982,24 @@ const COMMANDS = {
     run: (cfg, args) => cmdAgent(cfg, args),
   },
   admin: {
-    group: "Team admin (remote, admin token)", parse: "raw", args: "gardener [--json]",
-    summary: "ops-facing operations (on-demand gardener sweep)",
+    group: "Team admin (remote, admin token)", parse: "raw", args: "gardener [--json] | token list|revoke <prefix>",
+    summary: "ops-facing operations (gardener sweep, team token admin)",
     help:
       "Ops-facing operations, kept apart from everyday graph work — the home for\n" +
       "stewards-gated ops. Remote only: the server owns these.\n\n" +
       "  spor admin gardener           run a gardener sweep now (POST /v1/gardener)\n" +
-      "      --json                    print the raw {checked, filed, resolved, skipped} envelope\n\n" +
+      "      --json                    print the raw {checked, filed, resolved, skipped} envelope\n" +
+      "  spor admin token list         the whole team's tokens (= spor token list --all)\n" +
+      "  spor admin token revoke <p>   revoke ANY token by hash prefix (= spor token revoke <p> --all)\n\n" +
       "The sweep files its observations as `type: finding` queue items\n" +
       "(dec-cc-gardener-files-findings) and resolves its own findings whose condition\n" +
       "has cleared — it never mutates human-authored nodes. It can examine the whole\n" +
       "graph, so an on-demand run may take a little while. The endpoint is\n" +
       "authenticated but not admin-gated server-side today, so any valid team token\n" +
       "can run it; a 403 (should a deployment add the gate) means admin privilege is\n" +
-      "required — check 'spor whoami' (is_admin).",
-    examples: ["spor admin gardener", "spor admin gardener --json"],
+      "required — check 'spor whoami' (is_admin). The token surface IS admin-gated:\n" +
+      "everyday self-serve token management is 'spor token' (your own PATs).",
+    examples: ["spor admin gardener", "spor admin token list", "spor admin token revoke a1b2c3"],
     run: (cfg, args) => cmdAdmin(cfg, args),
   },
 

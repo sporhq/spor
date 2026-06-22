@@ -796,6 +796,167 @@ test('token revoke without a prefix exits 1', () => {
   assert.match(r.stderr, /usage/);
 });
 
+// --- spor token: self-serve personal access tokens (task-spor-cli-me-tokens-
+// verbs) ---------------------------------------------------------------------
+// By default every verb is caller-scoped over /v1/me/tokens; --all (and the
+// `spor admin token` alias) escalate list/revoke to /v1/admin/tokens. The stub
+// is an in-process http server shaped like BOTH surfaces; the CLI must hit the
+// right endpoint per verb/flag and degrade cleanly. spawnSync would starve the
+// stub, so these use the async runAsyncCli pattern (the lens-test approach).
+function tokenStubServer({ unbound = false } = {}) {
+  const http = require('node:http');
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      const url = req.url;
+      hits.push({ method: req.method, url, auth: req.headers.authorization, body });
+      const json = (code, obj) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
+      const noPerson = { error: { code: 'forbidden', message: 'needs a bound person identity' } };
+      // self-serve surface (/v1/me/tokens)
+      if (url === '/v1/me/tokens' && req.method === 'GET') {
+        if (unbound) return json(403, noPerson);
+        return json(200, { tokens: [{ hash_prefix: 'aaaa1111bbbb', person: 'person-me', label: 'ci', expires: '2027-01-01', expired: false }], count: 1 });
+      }
+      if (url === '/v1/me/tokens' && req.method === 'POST') {
+        if (unbound) return json(403, noPerson);
+        const b = body ? JSON.parse(body) : {};
+        if (b.expires === '400d') return json(422, { error: { code: 'invalid_node', message: 'expires may be at most 1 year out' } });
+        return json(201, { token: 'spor_pat_minted123', hash_prefix: 'cccc2222dddd', person: 'person-me', name: 'Me', email: 'me@x.io', label: b.label || null, expires: b.expires ? '2026-09-20' : '2027-06-22' });
+      }
+      let m = url.match(/^\/v1\/me\/tokens\/([^/?]+)$/);
+      if (m && req.method === 'DELETE') {
+        if (unbound) return json(403, noPerson);
+        if (decodeURIComponent(m[1]) === 'cccc2222dddd') return json(200, { revoked: 1, hash_prefix: 'cccc2222dddd', oauth_grants_revoked: 0 });
+        return json(404, { error: { code: 'not_found', message: 'no such token' } });
+      }
+      // admin surface (--all / spor admin token)
+      if (url === '/v1/admin/tokens' && req.method === 'GET') {
+        return json(200, { tokens: [{ hash_prefix: 'eeee3333ffff', person: 'person-bob', expires: null, expired: false }], count: 1 });
+      }
+      m = url.match(/^\/v1\/admin\/tokens\/([^/?]+)$/);
+      if (m && req.method === 'DELETE') {
+        return json(200, { revoked: 1, hash_prefix: decodeURIComponent(m[1]), oauth_grants_revoked: 2 });
+      }
+      json(404, { error: { code: 'not_found', message: 'no route' } });
+    });
+  });
+  return new Promise((resolve) => srv.listen(0, '127.0.0.1', () =>
+    resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
+}
+
+test('token create mints a caller-scoped PAT over POST /v1/me/tokens', async () => {
+  const { srv, hits, base } = await tokenStubServer();
+  try {
+    const r = await runAsyncCli(['token', 'create', '--expires', '90d', '--label', 'ci'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-me' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /spor_pat_minted123/); // the plaintext token, shown once
+    assert.match(r.stdout, /person-me/);
+    const hit = hits.find((h) => h.method === 'POST' && h.url === '/v1/me/tokens');
+    assert.ok(hit, 'hit POST /v1/me/tokens');
+    assert.strictEqual(hit.auth, 'Bearer tok-me');
+    const sent = JSON.parse(hit.body);
+    assert.strictEqual(sent.expires, '90d'); // --expires forwarded verbatim
+    assert.strictEqual(sent.label, 'ci');    // --label forwarded
+  } finally { srv.close(); }
+});
+
+test('token create surfaces the server 422 (expiry past the 1-year cap)', async () => {
+  const { srv, base } = await tokenStubServer();
+  try {
+    const r = await runAsyncCli(['token', 'create', '--expires', '400d'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-me' });
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /1 year/);
+  } finally { srv.close(); }
+});
+
+test('token list (default) shows the caller OWN PATs from GET /v1/me/tokens', async () => {
+  const { srv, hits, base } = await tokenStubServer();
+  try {
+    const r = await runAsyncCli(['token', 'list'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-me' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /aaaa1111bbbb/);
+    assert.match(r.stdout, /ci/); // the label leads the self listing
+    assert.ok(hits.some((h) => h.method === 'GET' && h.url === '/v1/me/tokens'), 'hit the self endpoint');
+    assert.ok(!hits.some((h) => h.url === '/v1/admin/tokens'), 'did NOT hit the admin endpoint');
+  } finally { srv.close(); }
+});
+
+test('token list --all escalates to the team view GET /v1/admin/tokens', async () => {
+  const { srv, hits, base } = await tokenStubServer();
+  try {
+    const r = await runAsyncCli(['token', 'list', '--all'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-adm' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /eeee3333ffff/);
+    assert.match(r.stdout, /person-bob/);
+    assert.ok(hits.some((h) => h.method === 'GET' && h.url === '/v1/admin/tokens'), 'hit the admin endpoint');
+    assert.ok(!hits.some((h) => h.url === '/v1/me/tokens'), 'did NOT hit the self endpoint');
+  } finally { srv.close(); }
+});
+
+test('token revoke (default) deletes one of the caller OWN PATs', async () => {
+  const { srv, hits, base } = await tokenStubServer();
+  try {
+    const r = await runAsyncCli(['token', 'revoke', 'cccc2222dddd'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-me' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /revoked cccc2222dddd/);
+    assert.ok(hits.some((h) => h.method === 'DELETE' && h.url === '/v1/me/tokens/cccc2222dddd'), 'hit the self DELETE');
+  } finally { srv.close(); }
+});
+
+test('token revoke of a prefix that is not yours is a friendly 404', async () => {
+  const { srv, base } = await tokenStubServer();
+  try {
+    const r = await runAsyncCli(['token', 'revoke', 'nottheirs99'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-me' });
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /no personal access token of yours/);
+    assert.match(r.stderr, /--all/); // points at the team view
+  } finally { srv.close(); }
+});
+
+test('token revoke --all escalates to DELETE /v1/admin/tokens', async () => {
+  const { srv, hits, base } = await tokenStubServer();
+  try {
+    const r = await runAsyncCli(['token', 'revoke', 'eeee3333ffff', '--all'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-adm' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /revoked eeee3333ffff \(\+2 oauth grants\)/);
+    assert.ok(hits.some((h) => h.method === 'DELETE' && h.url === '/v1/admin/tokens/eeee3333ffff'), 'hit the admin DELETE');
+  } finally { srv.close(); }
+});
+
+test('admin token list|revoke is the discoverable alias for the team view', async () => {
+  const { srv, hits, base } = await tokenStubServer();
+  try {
+    let r = await runAsyncCli(['admin', 'token', 'list'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-adm' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /eeee3333ffff/);
+    r = await runAsyncCli(['admin', 'token', 'revoke', 'eeee3333ffff'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-adm' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /revoked eeee3333ffff/);
+    assert.ok(hits.some((h) => h.method === 'GET' && h.url === '/v1/admin/tokens'), 'list hit admin GET');
+    assert.ok(hits.some((h) => h.method === 'DELETE' && h.url === '/v1/admin/tokens/eeee3333ffff'), 'revoke hit admin DELETE');
+  } finally { srv.close(); }
+});
+
+test('token verbs nudge an unbound caller toward spor whoami (403)', async () => {
+  const { srv, base } = await tokenStubServer({ unbound: true });
+  try {
+    const r = await runAsyncCli(['token', 'list'], { SPOR_SERVER: base, SPOR_TOKEN: 'unbound' });
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /bound person identity/);
+    assert.match(r.stderr, /whoami/);
+    assert.doesNotMatch(r.stderr, /at Object|Error:/); // no stack trace
+  } finally { srv.close(); }
+});
+
+test('token create needs remote mode (local explains why)', () => {
+  const { dir } = fixtureGraph();
+  const r = run(['token', 'create'], { SPOR_HOME: dir });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /remote/);
+});
+
 test('invite fails open against an unreachable server', () => {
   const r = run(['invite', '--person', 'person-x'], { SPOR_SERVER: 'http://127.0.0.1:9', SPOR_TOKEN: 't' });
   assert.strictEqual(r.status, 1);

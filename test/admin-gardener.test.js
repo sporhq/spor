@@ -188,5 +188,6 @@ test("admin --help prints the command page without dispatching", { skip: isWin }
   const r = await runAsync(["admin", "--help"], bare({ SPOR_HOME: ISO_HOME }));
   assert.strictEqual(r.status, 0, r.stderr);
   assert.match(r.stdout, /spor admin gardener/);
-  assert.match(r.stdout, /on-demand gardener sweep/);
+  assert.match(r.stdout, /run a gardener sweep now/);
+  assert.match(r.stdout, /spor admin token/); // the team-token admin surface
 });
