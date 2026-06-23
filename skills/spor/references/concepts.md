@@ -31,6 +31,7 @@ the decision queue (QUEUE.md §4).
 | correction | `corr-` | a standing fix to a briefing (pin/exclude/guidance) | `traversable: false`; applied at every future compile of its target |
 | question | `question-` | a routed ask the graph couldn't answer | queueable; status `open`/`answered`; joins the queue until answered |
 | person | `person-` | an org member | anchor for `$viewer` binding and question routing |
+| organization | `org-` | a durable organization identity anchor | `member-of-org` records membership; `stewards` records org-admin authority; `org-root` remains the virtual graph-wide operator anchor; `capturable: false` |
 | agent | `agent-` | a person-owned automation principal | a dispatched session's durable identity; owned by a person via `owned-by`; `capturable: false`; carries forward-compat `spiffe:`/`pubkey:` |
 | profile | `profile-` | a reusable runtime+capability bundle an agent runs under | `harness`/`model`/`skills`/`plugins`/`mcp`; these runtime fields ARE the dispatch satisfiability spec; `capturable: false` |
 | routine | `routine-` | owner-scoped trigger→action automation | `owned-by` a person; declarative `when → do` rules over graph events; dispatches only the owner's agents, AND-ed with org policy; `capturable: false` |
@@ -65,6 +66,7 @@ are same-direction synonyms renamed at write time.
 | relates-to | 0.5 | weak association | alias `related-to` |
 | mentions | 0.5 | weakest association | — |
 | stewards | 0.4 | this person stewards the target area/spec/norm | question-routing key |
+| member-of-org | 0.3 | this person is a member of the target organization | inverse `has-org-member`; structural identity, not admin authority; `capturable: false` |
 | grouped-under | 0.3 | this repo's home project grouping (structural) | inverse `groups` |
 | owned-by | 0.3 | this agent is owned by that person (structural identity) | inverse `owns` |
 | uses-profile | 0.3 | this agent's default profile (runtime+capability bundle); structural config, overridable per assignment/dispatch | — |

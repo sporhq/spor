@@ -1021,6 +1021,45 @@ b
   assert.equal(reg.edgeInverses()["owns"], "owned-by", "owns reads back as owned-by");
 });
 
+// ---------- organization identity (dec-spor-frontdoor-org-admin-graph-authority) ----------
+
+test("validateGraph: organization + person membership/admin relations lint clean", () => {
+  const fx = tmpGraph({
+    "org-acme.md": `---
+id: org-acme
+type: organization
+title: Acme
+summary: Durable identity anchor for the Acme organization.
+slug: acme
+status: active
+date: 2026-06-23
+---
+Acme identity anchor.
+`,
+    "person-ada.md": `---
+id: person-ada
+type: person
+title: Ada Lovelace
+summary: Acme administrator.
+email: ada@acme.com
+status: active
+date: 2026-06-23
+edges:
+  - {type: member-of-org, to: org-acme}
+  - {type: stewards, to: org-acme}
+---
+Acme administrator.
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.deepEqual(v.errors, []);
+  assert.deepEqual(v.warnings, []);
+  assert.equal(v.count, 2);
+  const reg = graph.seedRegistry();
+  assert.equal(reg.edgeWeight("member-of-org"), 0.3);
+  assert.equal(reg.edgeInverses()["has-org-member"], "member-of-org");
+});
+
 // ---------- validateGraph ----------
 
 test("validateGraph: clean graph reports zero errors", () => {

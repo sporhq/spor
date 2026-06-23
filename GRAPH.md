@@ -110,6 +110,7 @@ Rules:
 | correction | `corr-`   | standing fix to a briefing: pin/exclude/guidance (never traversed) |
 | question   | `question-` | a routed ask the graph could not answer (queueable; status `open`/`answered`, gated) |
 | person     | `person-` | a member of the org — the identity anchor for `$viewer` binding and Tier-2 question routing (team mode; see "People, routing, and onboarding") |
+| organization | `org-` | a durable organization identity anchor; people connect with `member-of-org` for membership and `stewards` for org-admin authority (`org-root` remains the virtual graph-wide operator anchor) |
 | agent      | `agent-`  | a person-owned automation principal — a dispatched session's durable identity, owned by a person via an `owned-by` edge; its writes attribute "agent on behalf of person" (see "Agents") |
 | profile    | `profile-`| a reusable runtime+capability bundle an agent runs under: `harness`, `model`, `skills`/`plugins`/`mcp`. Its runtime fields ARE the dispatch satisfiability spec; `capturable: false` (see "The agent orchestration layer") |
 | routine    | `routine-`| owner-scoped trigger→action automation (`owned-by` a person): declarative `when → do` rules over graph events that dispatch only the owner's agents, AND-ed with org policy; `capturable: false` (see "The agent orchestration layer") |
@@ -575,6 +576,13 @@ read time* (API.md §4). Tier-2 question routing and `$viewer`-scoped views
 (your queue, your mutes, "what am I blocking") all key off the person node the
 caller's token is bound to.
 
+On a shared identity front door, organization authority is also graph-native.
+Each org slug has a durable `organization` node (`org-<slug>`, carrying
+`slug: <slug>`). A person's `member-of-org -> org-<slug>` edge records membership;
+an additional `stewards -> org-<slug>` edge records org-admin authority.
+`stewards -> org-root` keeps its distinct graph-wide operator meaning. Provider
+roles, token bits, and email-domain mappings do not confer either relation.
+
 ```markdown
 ---
 id: person-anthony
@@ -833,6 +841,7 @@ assign that work to a person.
 | `relates-to`     | 0.5    | weak association                                 |
 | `mentions`       | 0.5    | weakest association                              |
 | `stewards`       | 0.4    | this person stewards an area/spec/norm — the Tier-2 question-routing key |
+| `member-of-org`  | 0.3    | this person is a member of the target organization (inverse `has-org-member`); structural identity binding, not admin authority |
 | `grouped-under`  | 0.3    | this repo's home project grouping (inverse `groups`); structural membership, not work dependency |
 | `owned-by`       | 0.3    | this agent is owned by that person (inverse `owns`); structural identity binding, not work dependency |
 | `uses-profile`   | 0.3    | this agent's default profile (the runtime+capability bundle it dispatches under); structural config binding, overridable per assignment/dispatch |
@@ -841,11 +850,12 @@ assign that work to a person.
 | `compiled-for`   | —      | briefing → its task/query (provenance only)      |
 | `shaped-by`      | —      | briefing → corrections applied (provenance only) |
 
-`answers`, `assigned`, `stewards`, and `routed-to` are the person-graph
+`answers`, `assigned`, `stewards`, `member-of-org`, and `routed-to` are person-graph
 edges of Tier-2 question routing; they ship in the seed pack and are
 documented under "People, routing, and onboarding" above. `assigned` and
 `routed-to` point at a `person-` node; `stewards` points from a person to
-the area they own; `answers` points from any answer node back at the
+the area or organization they own; `member-of-org` points from a person to an
+`organization` identity anchor; `answers` points from any answer node back at the
 `question-` it resolves.
 
 `review-requested`, `reviewed-by`, and `changes-requested-by` are the

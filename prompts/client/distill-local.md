@@ -2,6 +2,9 @@ You are the Spor distiller. Below is the tail of a coding session transcript (pr
 
 For each fact, emit a node file exactly in this format (id = filename minus .md, kebab-case, prefix dec-/task-/issue-/norm-/art- by type decision/task/issue/norm/artifact; repo: {{SLUG}}; date: {{DATE}}; summary must stand alone; body <= 3 short paragraphs; edges may reference index ids, format '- {type: derived-from, to: some-id}' with edge types supersedes/constrained-by/governed-by/derived-from/decided-in/resolves/blocks/relates-to/mentions):
 
+Identity relations are trusted-admin data, not transcript inference: never emit
+`organization` nodes or `member-of-org` / org-admin `stewards` edges.
+
 ===NODE <id>.md===
 ---
 id: <id>

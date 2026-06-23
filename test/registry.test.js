@@ -322,6 +322,9 @@ test("seed pack: edge weights match the historic EDGE_WEIGHTS table exactly", ()
     // Tier-2 question routing (38428bf) joined the seed after the historic
     // table froze: answers + the person-graph edges.
     "answers": 0.7, "assigned": 0.5, "stewards": 0.4, "routed-to": 0.3,
+    // Front-door organization authority is graph-native: person membership is
+    // structural identity wiring, while stewards remains the admin relation.
+    "member-of-org": 0.3,
     // The workflow-run rollout added run lineage edges to the seed:
     // a run performs a workflow and is triggered-by its cause.
     "performs": 0.8, "triggered-by": 0.7,
@@ -393,6 +396,14 @@ test("seed pack: node types, prefixes, ride-along, and traversal match GRAPH.md"
   assert.deepEqual(reg.prefixesFor("agent"), ["agent-"]);
   assert.equal(reg.isCapturableType("agent"), false);
   assert.equal(reg.isCapturableEdge("owned-by"), false);
+  // Shared front-door identity authority: organizations and membership are
+  // trusted-admin-authored graph facts, never inferred by capture.
+  assert.equal(reg.isKnownType("organization"), true);
+  assert.deepEqual(reg.prefixesFor("organization"), ["org-"]);
+  assert.equal(reg.isCapturableType("organization"), false);
+  assert.equal(reg.isKnownEdge("member-of-org"), true);
+  assert.equal(reg.isCapturableEdge("member-of-org"), false);
+  assert.equal(reg.edgeInverses()["has-org-member"], "member-of-org");
   // Agent orchestration layer (dec-spor-agent-orchestration-layer): the profile
   // (runtime+capability bundle, prefix profile-) and routine (owner-scoped
   // automation, prefix routine-) node types, plus the uses-profile edge. All
