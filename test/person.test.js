@@ -67,21 +67,22 @@ test("person create (local): writes a valid person node that binds the git ident
   const home = freshHome();
   const r = run(["person", "create"], localEnv(home));
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.match(r.stdout, /created person person-jo-diaz <jo@example\.io>/);
+  assert.match(r.stdout, /created person Jo Diaz \(person-871a34c4efe7a5dc\) <jo@example\.io>/);
 
-  const file = path.join(home, "nodes", "person-jo-diaz.md");
+  const file = path.join(home, "nodes", "person-871a34c4efe7a5dc.md");
   assert.ok(fs.existsSync(file), "node file written");
   const g = graphLib.loadGraph(path.join(home, "nodes"));
-  const node = g.nodes["person-jo-diaz"];
+  const node = g.nodes["person-871a34c4efe7a5dc"];
   assert.strictEqual(node.type, "person");
   assert.strictEqual(node.title, "Jo Diaz");
+  assert.strictEqual(node.name, "Jo Diaz");
   assert.strictEqual(node.email, "jo@example.io");
   assert.ok(graphLib.validateNode(g, node).ok, "node validates");
 
   // The whole point: the seeded email resolves back through the SAME viewerFor /
   // gitIdentityEmail path the queue uses to bind $viewer.
   const viewer = queueLib.viewerFor(g, queueLib.gitIdentityEmail(home));
-  assert.ok(viewer && viewer.id === "person-jo-diaz", "git identity binds to the new node");
+  assert.ok(viewer && viewer.id === "person-871a34c4efe7a5dc", "git identity binds to the new node");
 });
 
 test("person create (local): idempotent — a re-run binding the same identity is a no-op success", () => {
@@ -108,7 +109,7 @@ test("person create (local): a leading positional is the name", () => {
   const home = freshHome();
   const r = run(["person", "create", "Pat Lee"], localEnv(home));
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.ok(fs.existsSync(path.join(home, "nodes", "person-pat-lee.md")), r.stdout);
+  assert.ok(fs.existsSync(path.join(home, "nodes", "person-871a34c4efe7a5dc.md")), r.stdout);
 });
 
 test("person create (local): no email and no git identity errors clearly, writes nothing", () => {
@@ -144,17 +145,17 @@ test("person create: remote mode redirects to invite/whoami and writes no local 
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /remote mode/);
   assert.match(r.stderr, /spor invite/);
-  assert.ok(!fs.existsSync(path.join(home, "nodes", "person-jo-diaz.md")), "no local node written in remote mode");
+  assert.ok(!fs.existsSync(path.join(home, "nodes", "person-871a34c4efe7a5dc.md")), "no local node written in remote mode");
 });
 
 test("person list (local): lists people and marks the git-identity binding", () => {
   const home = freshHome();
-  run(["person", "create"], localEnv(home)); // person-jo-diaz binds the git identity
+  run(["person", "create"], localEnv(home)); // opaque id for jo@example.io binds the git identity
   run(["person", "create", "--name", "Other One", "--email", "other@x.io", "--id", "person-other"], localEnv(home));
   const r = run(["person", "list"], localEnv(home));
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.match(r.stdout, /person-jo-diaz\tjo@example\.io\tJo Diaz\s+← you/);
-  assert.match(r.stdout, /person-other\tother@x\.io\tOther One/);
+  assert.match(r.stdout, /Jo Diaz\tjo@example\.io\tperson-871a34c4efe7a5dc\s+← you/);
+  assert.match(r.stdout, /Other One\tother@x\.io\tperson-other/);
   // Only the bound node is marked.
   assert.strictEqual((r.stdout.match(/← you/g) || []).length, 1);
 });

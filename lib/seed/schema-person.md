@@ -12,6 +12,12 @@ Seed schema for the `person` node type, shipped with the plugin as a
 registry default (QUEUE.md §2). A `type: schema` node in the graph with
 `kind: node-schema` and the same `node_type` overrides this entry.
 
+A person node's `name` frontmatter field is the mutable, user-facing display
+label for the person. When a person node is shown to a human, clients should
+render `name || title || email || id`: `name` is preferred, `title` is retained
+as a back-compat fallback for older nodes, and the opaque `person-…` id remains
+the stable machine reference for graph edges, URLs, filters, and token subjects.
+
 A person node's `email` frontmatter field is the identity key: the server
 binds `$viewer` from the authenticated token's email — mapping it to this
 person node — and, when Tier-2 routing lands, uses the same mapping to route

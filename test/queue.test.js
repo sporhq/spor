@@ -1005,7 +1005,8 @@ test("lease: the steward/capacity view (assignee set) is lease-exempt — shows 
   const it = r.items[0];
   assert.equal(it.lease_state, "in_progress");
   assert.equal(it.lease_by, "person-x");
-  assert.match(it.why, /in progress by person-x/, "the steward sees who holds it");
+  assert.equal(it.lease_by_name, "Person person-x");
+  assert.match(it.why, /in progress by Person person-x/, "the steward sees who holds it");
 });
 
 test("lease: leased and reserved counts coexist and stack per state", () => {

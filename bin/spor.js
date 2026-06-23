@@ -278,9 +278,10 @@ async function identity(cfg) {
   if (r.status === 401 || r.status === 403) return `unauthenticated (token rejected)`;
   if (r.ok && r.json) {
     const p = r.json.person || r.json.id;
+    const name = r.json.name || p;
     const bound = r.json.bound;
     const admin = r.json.is_admin ? "  (admin)" : "";
-    if (bound && p) return `${p}${r.json.email ? ` <${r.json.email}>` : ""}${admin}`;
+    if (bound && p) return `${labelledPerson(name, p)}${r.json.email ? ` <${r.json.email}>` : ""}${admin}`;
     return `⚠ token maps to no person node — routed questions and personal queue will be empty`;
   }
   return `unknown (status ${r.status})`;
@@ -1894,6 +1895,26 @@ function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
+function personDisplayName(n, fallback = null) {
+  if (!n || typeof n !== "object") return fallback;
+  return n.name || n.title || n.email || fallback;
+}
+
+function personLabelFromGraph(g, id) {
+  const n = g && g.nodes && g.nodes[id];
+  return n && n.type === "person" ? personDisplayName(n, id) : id;
+}
+
+function personIdForEmail(email) {
+  const e = String(email || "").trim().toLowerCase();
+  if (!e) return null;
+  return `person-${crypto.createHash("sha256").update(e).digest("hex").slice(0, 16)}`;
+}
+
+function labelledPerson(name, id) {
+  return name && id && name !== id ? `${name} (${id})` : (name || id || "");
+}
+
 // An id round-trips through the frontmatter edge parser only if it is all [\w-]:
 // lib/kernel/graph.js parseFrontmatter captures an edge `to:` as [\w-]+, so any
 // other character makes the whole "- {type: X, to: Y}" line fail to match and
@@ -2832,7 +2853,7 @@ function leaseLine(lease) {
   if (!lease) return "";
   const parts = [];
   if (lease.expires_at) parts.push(`expires ${lease.expires_at}`);
-  if (lease.by) parts.push(`held by ${lease.by}`);
+  if (lease.by) parts.push(`held by ${labelledPerson(lease.by_name, lease.by)}`);
   return parts.join(", ");
 }
 
@@ -3607,8 +3628,9 @@ async function cmdInvite(cfg, { values }) {
       err("   or: spor invite --name <name> --email <email> [--id person-x] [--expires <Nd>]");
       return 1;
     }
-    person = values.id || `person-${kebab(name)}`;
-    const md = `---\nid: ${person}\ntype: person\ntitle: ${name.replace(/\n/g, " ")}\nsummary: Team member ${name}.\nemail: ${email}\ndate: ${today()}\n---\n\nTeam member ${name} <${email}>.\n`;
+    person = values.id || personIdForEmail(email);
+    const safeName = name.replace(/\n/g, " ");
+    const md = `---\nid: ${person}\ntype: person\ntitle: ${safeName}\nname: ${safeName}\nsummary: Team member ${safeName}.\nemail: ${email}\ndate: ${today()}\n---\n\nTeam member ${safeName} <${email}>.\n`;
     const pr = await remote.post(cfg, "/v1/nodes", { nodes: [{ node: md, if_exists: "skip" }] });
     if (pr.transport) {
       err(`offline — could not reach server (${pr.error})`);
@@ -3620,7 +3642,7 @@ async function cmdInvite(cfg, { values }) {
       err(`could not create person node: ${(res0 && res0.message) || pr.status}`);
       return 1;
     }
-    out(`person node ${person} ${res0 && res0.status === "skipped" ? "(already existed)" : "created"}`);
+    out(`person node ${labelledPerson(safeName, person)} ${res0 && res0.status === "skipped" ? "(already existed)" : "created"}`);
   }
 
   const r = await remote.post(cfg, "/v1/admin/tokens", { person, ...(expires ? { expires } : {}) });
@@ -3638,7 +3660,7 @@ async function cmdInvite(cfg, { values }) {
     return 1;
   }
   const j = r.json;
-  out(`minted token for ${j.person} <${j.email}>${j.expires ? ` (expires ${j.expires})` : ""} [${j.hash_prefix}]`);
+  out(`minted token for ${labelledPerson(j.name, j.person)} <${j.email}>${j.expires ? ` (expires ${j.expires})` : ""} [${j.hash_prefix}]`);
   out(`  give this to the teammate ONCE — it is not recoverable:\n`);
   out(`  spor join ${remote.base(cfg)} ${j.token}\n`);
   out(`  revoke later with: spor admin token revoke ${j.hash_prefix}`);
@@ -3744,7 +3766,11 @@ async function cmdPersonCreate(cfg, { name, email, id }) {
       return 1;
     }
   } else {
-    id = `${prefix}${kebab(name)}`;
+    id = personIdForEmail(email);
+  }
+  if (!id) {
+    err("could not derive a stable person id from the email — pass --id explicitly");
+    return 1;
   }
   if (fs.existsSync(path.join(nodesDir, `${id}.md`))) {
     err(`person node already exists: ${id} (pass --id to choose another)`);
@@ -3757,6 +3783,7 @@ async function cmdPersonCreate(cfg, { name, email, id }) {
   const safeEmail = email.replace(/\n/g, " ");
   const md =
     `---\nid: ${id}\ntype: person\ntitle: ${safeName}\n` +
+    `name: ${safeName}\n` +
     `summary: Org member ${safeName} <${safeEmail}> — the local $viewer identity anchor for this graph's queue.\n` +
     `email: ${safeEmail}\ndate: ${today()}\n---\n\n` +
     `Org member ${safeName} <${safeEmail}>. Created locally by \`spor person create\`; the git-identity ($viewer) anchor the local queue and queue_mute bind to (lib/queue.js viewerFor).\n`;
@@ -3773,7 +3800,7 @@ async function cmdPersonCreate(cfg, { name, email, id }) {
     return 1;
   }
   fs.writeFileSync(path.join(nodesDir, `${id}.md`), md);
-  out(`created person ${id} <${email}>`);
+  out(`created person ${labelledPerson(safeName, id)} <${email}>`);
   out(`  next: create this machine's agent identity — spor agent create <label>`);
   return 0;
 }
@@ -3807,7 +3834,7 @@ function cmdPersonList(cfg) {
   const viewer = queueLib.viewerFor(g, gitIdentity(path.dirname(nodesDir)).email);
   for (const p of people) {
     const me = viewer && viewer.id === p.id ? "  ← you (git identity)" : "";
-    out(`${p.id}\t${p.email || "(no email)"}\t${p.title || ""}${me}`);
+    out(`${personDisplayName(p, p.id)}\t${p.email || "(no email)"}\t${p.id}${me}`);
   }
   return 0;
 }
@@ -3953,7 +3980,7 @@ async function cmdAgentCreateRemote(cfg, { label, owner, pubkey }) {
   }
   const j = r.json || {};
   const id = j.id || `agent-${kebab(label)}`;
-  out(`created agent ${id}${j.owner ? ` owned by ${j.owner}` : ""}`);
+  out(`created agent ${id}${j.owner ? ` owned by ${labelledPerson(j.owner_name, j.owner)}` : ""}`);
   if (j.spiffe) out(`  spiffe: ${j.spiffe}`);
   out(`  make it this machine's default: spor agent use ${id}`);
   out(`  mint its standing PAT (SPOR_TOKEN for a headless agent): spor agent token ${id}`);
@@ -3987,7 +4014,7 @@ async function cmdAgentCreateLocal(cfg, { label, owner, pubkey }) {
       err("  (an agent's owner is recorded as an owned-by edge to a person node).");
       return 1;
     } else {
-      err(`several person nodes — name the owner with --owner (one of: ${people.map((p) => p.id).slice(0, 6).join(", ")}${people.length > 6 ? ", …" : ""})`);
+      err(`several person nodes — name the owner with --owner (one of: ${people.map((p) => `${personDisplayName(p, p.id)}=${p.id}`).slice(0, 6).join(", ")}${people.length > 6 ? ", …" : ""})`);
       return 1;
     }
   } else if (!(g.nodes && g.nodes[ownerId])) {
@@ -4005,6 +4032,7 @@ async function cmdAgentCreateLocal(cfg, { label, owner, pubkey }) {
   // verified. <org> from config (default "local") so a solo graph is sensible.
   const org = cfg.get("org", null) || "local";
   const personLabel = ownerId.replace(/^person-/, "") || ownerId;
+  const ownerName = personLabelFromGraph(g, ownerId);
   const spiffe = `spiffe://spor.${org}/person/${personLabel}/agent/${kebab(label)}`;
   const md =
     `---\nid: ${id}\ntype: agent\ntitle: ${label.replace(/\n/g, " ")}\n` +
@@ -4025,7 +4053,7 @@ async function cmdAgentCreateLocal(cfg, { label, owner, pubkey }) {
     return 1;
   }
   fs.writeFileSync(path.join(nodesDir, `${id}.md`), md);
-  out(`created agent ${id} owned by ${ownerId}`);
+  out(`created agent ${id} owned by ${labelledPerson(ownerName, ownerId)}`);
   out(`  spiffe: ${spiffe}`);
   out(`  make it this machine's default: spor agent use ${id}`);
   out(`  (note: agent-on-behalf-of attribution applies in remote mode)`);
@@ -4044,7 +4072,7 @@ async function cmdAgentListRemote(cfg) {
     return 1;
   }
   if (a.ok && a.json && Array.isArray(a.json.agents)) {
-    const rows = a.json.agents.map((ag) => `${ag.id}\t${ag.owner ? `owned-by ${ag.owner}` : (ag.title || "")}\t${ag.status || "active"}`);
+    const rows = a.json.agents.map((ag) => `${ag.id}\t${ag.owner ? `owned-by ${labelledPerson(ag.owner_name, ag.owner)}` : (ag.title || "")}\t${ag.status || "active"}`);
     if (!rows.length) {
       out("no agents yet — create one with 'spor agent create <label>'");
       return 0;
@@ -4100,7 +4128,7 @@ function cmdAgentListLocal(cfg) {
   for (const a of agents.sort((x, y) => x.id.localeCompare(y.id))) {
     const ownedBy = (a.edges || []).find((e) => e.type === "owned-by");
     const status = a.status || "active";
-    out(`${a.id}\t${ownedBy ? `owned-by ${ownedBy.to}` : "(no owner)"}\t${status}`);
+    out(`${a.id}\t${ownedBy ? `owned-by ${labelledPerson(personLabelFromGraph(g, ownedBy.to), ownedBy.to)}` : "(no owner)"}\t${status}`);
   }
   return 0;
 }
@@ -4181,7 +4209,7 @@ async function cmdAgentTokenMint(cfg, agent, args) {
     if (j.token) out(j.token);
     return 1;
   }
-  out(`minted standing PAT for ${j.agent || agent}${j.owner ? ` (owned by ${j.owner})` : ""}${j.label ? ` [${j.label}]` : ""}${j.expires ? ` (expires ${j.expires})` : ""} [${j.hash_prefix}]`);
+  out(`minted standing PAT for ${j.agent || agent}${j.owner ? ` (owned by ${labelledPerson(j.owner_name, j.owner)})` : ""}${j.label ? ` [${j.label}]` : ""}${j.expires ? ` (expires ${j.expires})` : ""} [${j.hash_prefix}]`);
   out(`  this is shown ONCE — copy it now, it is not recoverable:\n`);
   out(`  ${j.token}\n`);
   out(`  set it as SPOR_TOKEN for a headless agent (e.g. Claude Code on the Web).`);
@@ -4307,7 +4335,7 @@ async function cmdTokenCreate(cfg, args) {
     return 1;
   }
   const j = r.json;
-  out(`minted personal access token for ${j.person}${j.email ? ` <${j.email}>` : ""}${j.label ? ` [${j.label}]` : ""}${j.expires ? ` (expires ${j.expires})` : ""} [${j.hash_prefix}]`);
+  out(`minted personal access token for ${labelledPerson(j.name, j.person)}${j.email ? ` <${j.email}>` : ""}${j.label ? ` [${j.label}]` : ""}${j.expires ? ` (expires ${j.expires})` : ""} [${j.hash_prefix}]`);
   out(`  this is shown ONCE — copy it now, it is not recoverable:\n`);
   out(`  ${j.token}\n`);
   out(`  use it as SPOR_TOKEN, or run: spor join ${remote.base(cfg)} ${j.token}`);
@@ -4384,7 +4412,7 @@ async function cmdTokenListAdmin(cfg) {
     return 0;
   }
   for (const t of toks) {
-    out(`${t.hash_prefix}  ${t.person || t.email || "?"}${t.expired ? "  EXPIRED" : ""}${t.expires ? `  (expires ${t.expires})` : ""}`);
+    out(`${t.hash_prefix}  ${labelledPerson(t.name, t.person) || t.email || "?"}${t.expired ? "  EXPIRED" : ""}${t.expires ? `  (expires ${t.expires})` : ""}`);
   }
   return 0;
 }
@@ -7063,6 +7091,7 @@ async function fleetAgentCapabilities(cfg, agentId) {
     published_at: j.published_at || null,
     last_seen: j.last_seen || null,
     published_by: j.published_by || null,
+    published_by_name: j.published_by_name || null,
     session: j.session || null,
   };
 }
@@ -7122,7 +7151,7 @@ async function cmdCapabilitiesShow(cfg, { agentId, json }) {
   if ((c.deny || []).length) out(`  deny:          ${c.deny.join(", ")}`);
   if (res.published_at) out(`  published_at:  ${res.published_at} (caps last changed)`);
   if (res.last_seen) out(`  last_seen:     ${res.last_seen} (last contact)`);
-  if (res.published_by) out(`  published_by:  ${res.published_by}`);
+  if (res.published_by) out(`  published_by:  ${labelledPerson(res.published_by_name, res.published_by)}`);
   if (res.session) out(`  session:       ${res.session}`);
   return 0;
 }
@@ -7207,7 +7236,8 @@ async function reportFleetHosts(cfg, profileId) {
   if (ok.length) {
     err(`  the assignment is unchanged. Re-route to a fleet host that satisfies ${res.profile} (freshest first):`);
     for (const h of ok.slice(0, 8)) {
-      const meta = [h.owner, `${relAge(h.age_seconds)} ago`].filter(Boolean).join(", ");
+      const ownerLabel = labelledPerson(h.owner_name, h.owner);
+      const meta = [ownerLabel, `${relAge(h.age_seconds)} ago`].filter(Boolean).join(", ");
       err(`    - ${h.agent}${meta ? ` (${meta})` : ""}`);
     }
     if (ok.length > 8) err(`    … and ${ok.length - 8} more`);
@@ -7266,7 +7296,8 @@ async function cmdCapabilitiesHosts(cfg, { profileId, owner, maxAge, json }) {
   if (ok.length) {
     out("satisfiable (re-route targets, freshest first):");
     for (const h of ok) {
-      const meta = [h.owner, `${relAge(h.age_seconds)} ago`].filter(Boolean).join(", ");
+      const ownerLabel = labelledPerson(h.owner_name, h.owner);
+      const meta = [ownerLabel, `${relAge(h.age_seconds)} ago`].filter(Boolean).join(", ");
       out(`  ✓ ${h.agent}${meta ? ` (${meta})` : ""}`);
     }
   } else {
@@ -7275,7 +7306,8 @@ async function cmdCapabilitiesHosts(cfg, { profileId, owner, maxAge, json }) {
   if (no.length) {
     out("unsatisfiable:");
     for (const h of no) {
-      const meta = [h.owner, `${relAge(h.age_seconds)} ago`].filter(Boolean).join(", ");
+      const ownerLabel = labelledPerson(h.owner_name, h.owner);
+      const meta = [ownerLabel, `${relAge(h.age_seconds)} ago`].filter(Boolean).join(", ");
       out(`  ✗ ${h.agent}${meta ? ` (${meta})` : ""}`);
       for (const reason of h.reasons || []) out(`      - ${reason}`);
     }
@@ -7452,7 +7484,7 @@ const COMMANDS = {
       "                                home's git identity (git config user.name/user.email)\n" +
       "      --email <e>               override the seeded email (the $viewer binding key)\n" +
       "      --name <n>                override the seeded name (else the leading positional)\n" +
-      "      --id person-x             explicit node id (default person-<kebab(name)>)\n" +
+      "      --id person-x             explicit node id (default opaque person-<hash(email)>)\n" +
       "  spor person list              list person nodes, marking your git-identity binding\n\n" +
       "Idempotent: a re-run that finds a node already bound to your git identity reports\n" +
       "it and exits 0. Local only — in remote mode your person node is server-managed\n" +

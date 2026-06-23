@@ -100,7 +100,7 @@ test("history (local) lists revisions newest-first, labels internal, maps the ac
   const createAt = r.stdout.indexOf(shaCreate.slice(0, 7));
   assert.ok(internalAt > -1 && createAt > -1 && internalAt < createAt, "newest-first order");
   assert.match(r.stdout, /server \(internal\)/);
-  assert.match(r.stdout, /Alice <alice@example\.com>\s+\[person-alice\]/);
+  assert.match(r.stdout, /Alice <alice@example\.com>\s+\[Alice@Example\.com\]/);
   assert.match(r.stdout, /chore: internal reconcile of dec-x/);
   assert.match(r.stdout, /\(head /);
 });
@@ -118,6 +118,7 @@ test("history (local) --json is the {id, head, count, history} envelope", () => 
   assert.strictEqual(j.history[0].person, null);
   assert.strictEqual(j.history[1].internal, false);
   assert.strictEqual(j.history[1].person, "person-alice");
+  assert.strictEqual(j.history[1].person_name, "Alice@Example.com");
   assert.strictEqual(j.history[1].actor, "Alice <alice@example.com>");
 });
 
@@ -133,7 +134,7 @@ test("history (local) <sha> shows that revision's change type, diff, and actor",
   const r = run(["history", "dec-x", shaCreate], { SPOR_HOME: dir });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.match(r.stdout, new RegExp(`${shaCreate.slice(0, 7)}\\s+created\\s+dec-x`));
-  assert.match(r.stdout, /Alice <alice@example\.com>\s+\[person-alice\]/);
+  assert.match(r.stdout, /Alice <alice@example\.com>\s+\[Alice@Example\.com\]/);
   assert.match(r.stdout, /\+Body v1\./); // the patch this commit introduced
   assert.doesNotMatch(r.stdout, /--- content @/); // no full content without --content
 });
