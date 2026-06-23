@@ -293,6 +293,48 @@ test('remote.request: 401 on a refreshable tenant refreshes once and retries', a
   }
 });
 
+test('remote.request: expired refreshable tenant refreshes before the first API attempt', async () => {
+  const { srv, base, hits } = await refreshServer();
+  try {
+    const home = tmp();
+    const key = `${base}/acme`;
+    auth.writeStore(home, {
+      tenants: {
+        [key]: { server: base, org: 'acme', access_token: 'STALE', refresh_token: 'RT', exp: Math.floor(Date.now() / 1000) - 1 },
+      },
+      default: key,
+    });
+    const c = loadAt(home);
+    const r = await remote.get(c, '/v1/thing');
+    assert.strictEqual(r.status, 200, JSON.stringify(r));
+    assert.ok(hits.some((h) => h.url === '/oauth/token'), 'refreshed first');
+    assert.ok(!hits.some((h) => h.url === '/v1/thing' && h.bearer === 'STALE'), 'did not spend a request on the expired token');
+    assert.ok(hits.some((h) => h.url === '/v1/thing' && h.bearer === 'FRESH'));
+  } finally {
+    srv.close();
+  }
+});
+
+test('remote.request: refreshable tenant with no cached access token refreshes before the first API attempt', async () => {
+  const { srv, base, hits } = await refreshServer();
+  try {
+    const home = tmp();
+    const key = `${base}/acme`;
+    auth.writeStore(home, {
+      tenants: { [key]: { server: base, org: 'acme', access_token: '', refresh_token: 'RT' } },
+      default: key,
+    });
+    const c = loadAt(home);
+    const r = await remote.get(c, '/v1/thing');
+    assert.strictEqual(r.status, 200, JSON.stringify(r));
+    assert.ok(hits.some((h) => h.url === '/oauth/token'), 'refreshed first');
+    assert.ok(!hits.some((h) => h.url === '/v1/thing' && h.bearer === ''), 'did not spend a request with an empty bearer');
+    assert.ok(hits.some((h) => h.url === '/v1/thing' && h.bearer === 'FRESH'));
+  } finally {
+    srv.close();
+  }
+});
+
 // ===========================================================================
 // `spor auth` CLI verbs (fake device server)
 // ===========================================================================
