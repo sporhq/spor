@@ -109,7 +109,7 @@ Rules:
 | briefing   | `brief-`  | a compiled briefing (output of this system; never traversed) |
 | correction | `corr-`   | standing fix to a briefing: pin/exclude/guidance (never traversed) |
 | question   | `question-` | a routed ask the graph could not answer (queueable; status `open`/`answered`, gated) |
-| person     | `person-` | a member of the org — the identity anchor for `$viewer` binding and Tier-2 question routing (team mode; see "People, routing, and onboarding") |
+| person     | `person-` | a member of the org — mutable display name plus the identity anchor for `$viewer` binding and Tier-2 question routing (team mode; see "People, routing, and onboarding") |
 | organization | `org-` | a durable organization identity anchor; people connect with `member-of-org` for membership and `stewards` for org-admin authority (`org-root` remains the virtual graph-wide operator anchor) |
 | agent      | `agent-`  | a person-owned automation principal — a dispatched session's durable identity, owned by a person via an `owned-by` edge; its writes attribute "agent on behalf of person" (see "Agents") |
 | profile    | `profile-`| a reusable runtime+capability bundle an agent runs under: `harness`, `model`, `skills`/`plugins`/`mcp`. Its runtime fields ARE the dispatch satisfiability spec; `capturable: false` (see "The agent orchestration layer") |
@@ -572,9 +572,12 @@ date: 2026-06-13
 Team mode (API.md) adds people to the graph. A `person` node is the org
 member's identity anchor — every authenticated token's canonical subject is a
 `person-` node, and `{name, email}` attribution resolves *from that node at
-read time* (API.md §4). Tier-2 question routing and `$viewer`-scoped views
-(your queue, your mutes, "what am I blocking") all key off the person node the
-caller's token is bound to.
+read time* (API.md §4). `name` is the mutable user-facing display label; clients
+render `name || title || email || id`, leaving the opaque `person-…` id as the
+stable machine reference for graph edges, URLs, filters, and token subjects.
+Tier-2 question routing and `$viewer`-scoped views (your queue, your mutes,
+"what am I blocking") all key off the person node the caller's token is bound
+to.
 
 On a shared identity front door, organization authority is also graph-native.
 Each org slug has a durable `organization` node (`org-<slug>`, carrying
@@ -587,6 +590,7 @@ roles, token bits, and email-domain mappings do not confer either relation.
 ---
 id: person-anthony
 type: person
+name: Anthony Allen
 title: Anthony Allen
 summary: Maintainer; stewards the schema registry and the hook engines.
 email: losthammer@gmail.com
@@ -643,15 +647,19 @@ edges:
 Joining someone to a team graph is three deliberate steps — do all three or
 routing degrades quietly:
 
-1. **Author the `person-<name>` node** (frontmatter above), with `email` set to
-   the address the member commits and authenticates under.
+1. **Author the `person-…` node** (frontmatter above), using the stable canonical
+   subject chosen by the org. Prefer the CLI/admin minting paths, which default
+   new ids to opaque email-derived subjects instead of mutable display-name
+   slugs. Set `name` to the person's display label and `email` to the address
+   the member commits and authenticates under.
 2. **Add `stewards` edges** from that node to the areas/specs/norms they own.
    Without at least one steward in a topic's neighborhood, questions there route
    to no one and fall back to surfacing for everybody — answerable, but not
    *directed*.
-3. **Mint a token bound to the node:** an admin runs `spor-mint-token --person
-   person-<name>` on the server box, or `POST /v1/admin/tokens {person}` over
-   REST (admin-only; API.md §3/§4). The plaintext token is returned once.
+3. **Mint a token bound to the node:** an admin runs `spor invite --person
+   person-…` / `spor invite --name <name> --email <email>`, or
+   `POST /v1/admin/tokens {person}` over REST (admin-only; API.md §3/§4). The
+   plaintext token is returned once.
 
 If a member is reading and writing but **never receives routed questions, sees
 an empty personal queue, or has no mutes take effect**, their token did not bind

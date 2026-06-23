@@ -2,9 +2,9 @@
 id: schema-person
 type: schema
 kind: node-schema
-schema_version: 2026.06.21.1
+schema_version: 2026.06.23.1
 title: Seed schema for person nodes
-summary: Node schema for the person type — a member of the org, the anchor for $viewer identity binding and Tier-2 question routing. Seed-pack default; a graph-resident schema node for this type overrides it.
+summary: Node schema for the person type — a member of the org, with a mutable display name plus the identity anchor for $viewer binding and Tier-2 question routing. Seed-pack default; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
 ---
 
@@ -12,11 +12,11 @@ Seed schema for the `person` node type, shipped with the plugin as a
 registry default (QUEUE.md §2). A `type: schema` node in the graph with
 `kind: node-schema` and the same `node_type` overrides this entry.
 
-A person node's `name` frontmatter field is the mutable, user-facing display
-label for the person. When a person node is shown to a human, clients should
-render `name || title || email || id`: `name` is preferred, `title` is retained
-as a back-compat fallback for older nodes, and the opaque `person-…` id remains
-the stable machine reference for graph edges, URLs, filters, and token subjects.
+`name` (2026.06.23.1) is the person node's mutable, user-facing display label.
+When a person node is shown to a human, clients should render
+`name || title || email || id`: `name` is preferred, `title` is retained as a
+back-compat fallback for older nodes, and the opaque `person-…` id remains the
+stable machine reference for graph edges, URLs, filters, and token subjects.
 
 A person node's `email` frontmatter field is the identity key: the server
 binds `$viewer` from the authenticated token's email — mapping it to this
@@ -56,9 +56,34 @@ register is purely additive (existing person nodes are unchanged).
 ```json
 {
   "node_type": "person",
-  "description": "a member of the org — identity anchor for $viewer binding and question routing",
+  "description": "a member of the org — mutable display name plus identity anchor for $viewer binding and question routing",
   "prefix": [
     "person-"
-  ]
+  ],
+  "fields": {
+    "name": {
+      "kind": "scalar",
+      "description": "mutable user-facing display label; render fallback is name || title || email || id"
+    },
+    "email": {
+      "kind": "scalar",
+      "description": "identity binding key read from the authenticated token's bound person node"
+    },
+    "queue_mute": {
+      "kind": "inline-list",
+      "description": "per-viewer project/node mute register, optionally expiring entries with @YYYY-MM-DD"
+    },
+    "roles": {
+      "kind": "inline-list",
+      "description": "role-list register consumed by policy quorum gates"
+    },
+    "github": {
+      "kind": "scalar",
+      "aliases": [
+        "github_login"
+      ],
+      "description": "GitHub login to person mapping key for review reflection"
+    }
+  }
 }
 ```

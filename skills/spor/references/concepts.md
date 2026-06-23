@@ -30,7 +30,7 @@ the decision queue (QUEUE.md §4).
 | briefing | `brief-` | a compiled briefing (output of the system) | `traversable: false` (never walked) and `capturable: false` |
 | correction | `corr-` | a standing fix to a briefing (pin/exclude/guidance) | `traversable: false`; applied at every future compile of its target |
 | question | `question-` | a routed ask the graph couldn't answer | queueable; status `open`/`answered`; joins the queue until answered |
-| person | `person-` | an org member | anchor for `$viewer` binding and question routing |
+| person | `person-` | an org member | mutable `name` display label plus anchor for `$viewer` binding and question routing |
 | organization | `org-` | a durable organization identity anchor | `member-of-org` records membership; `stewards` records org-admin authority; `org-root` remains the virtual graph-wide operator anchor; `capturable: false` |
 | agent | `agent-` | a person-owned automation principal | a dispatched session's durable identity; owned by a person via `owned-by`; `capturable: false`; carries forward-compat `spiffe:`/`pubkey:` |
 | profile | `profile-` | a reusable runtime+capability bundle an agent runs under | `harness`/`model`/`skills`/`plugins`/`mcp`; these runtime fields ARE the dispatch satisfiability spec; `capturable: false` |
