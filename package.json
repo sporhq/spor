@@ -1,6 +1,6 @@
 {
   "name": "@sporhq/spor",
-  "version": "0.18.0",
+  "version": "0.18.1",
   "description": "Spor — a shared memory substrate for teams and agents. Decisions, their reasons, and the traces they leave. Knowledge-graph context compiler: session-start briefings, per-prompt digests, capture at discovery, end-of-session distillation, decision queue.",
   "license": "Apache-2.0",
   "author": "Anthony Allen",
