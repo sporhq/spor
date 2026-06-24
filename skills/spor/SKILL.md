@@ -1,6 +1,18 @@
 ---
 name: spor
-description: The operating manual for Spor — a knowledge-graph tool your training does not cover. Load it before any Spor graph operation so you use the right CLI syntax, node and edge format, MCP tools, and REST API instead of rediscovering them: querying or searching the graph, reading or writing nodes, adding edges, capturing or deferring work, running spor CLI commands or Spor MCP tools, working in local vs remote mode, or defining a new node/edge type or schema. It also routes you to the right /spor action skill (defer, brief, next, correct, ask, backfill) for a specific operation, and explains the node/edge mental model when you need it. For FIRST-TIME setup — installing, creating an identity, joining a team graph, or "spor isn't doing anything" — use /spor:onboard instead. When unsure how to operate Spor, consult this before guessing.
+description: >
+  The operating manual for Spor — a knowledge-graph tool your training does not
+  cover. Load it before any Spor graph operation so you use the right CLI
+  syntax, node and edge format, MCP tools, and REST API instead of rediscovering
+  them: querying or searching the graph, reading or writing nodes, adding edges,
+  capturing or deferring work, running spor CLI commands or Spor MCP tools,
+  working in local vs remote mode, or defining a new node/edge type or schema.
+  It also routes you to the right /spor action skill (defer, brief, next,
+  correct, ask, backfill) for a specific operation, and explains the node/edge
+  mental model when you need it. For FIRST-TIME setup — installing, creating an
+  identity, joining a team graph, or "spor isn't doing anything" — use
+  /spor:onboard instead. When unsure how to operate Spor, consult this before
+  guessing.
 ---
 
 # Operate Spor

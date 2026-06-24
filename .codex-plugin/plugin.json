@@ -1,0 +1,40 @@
+{
+  "name": "spor",
+  "version": "0.18.1",
+  "description": "Maintains a typed, versioned knowledge graph and compiles compact briefings from it: session-start injection, per-prompt relevance digests, capture at discovery, end-of-session distillation, decision queue.",
+  "author": {
+    "name": "Spor",
+    "url": "https://github.com/sporhq/spor"
+  },
+  "homepage": "https://sporhq.io",
+  "repository": "https://github.com/sporhq/spor",
+  "license": "Apache-2.0",
+  "keywords": [
+    "knowledge-graph",
+    "context",
+    "memory",
+    "agents",
+    "spor",
+    "provenance"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Spor Context Compiler",
+    "shortDescription": "Graph-backed briefings, captures, and queue triage for Codex.",
+    "longDescription": "Spor keeps durable project context in a typed knowledge graph, then helps Codex brief tasks, capture follow-up work, correct stale context, and work the decision queue.",
+    "developerName": "Spor",
+    "category": "Productivity",
+    "capabilities": [
+      "Knowledge graph",
+      "Task briefings",
+      "Queue triage"
+    ],
+    "websiteURL": "https://sporhq.io",
+    "defaultPrompt": [
+      "Brief this Spor task before I start work.",
+      "Capture this follow-up in the graph.",
+      "Show me what is next in the Spor queue."
+    ],
+    "brandColor": "#3B82F6"
+  }
+}

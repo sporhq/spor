@@ -31,17 +31,21 @@ jobs:
       # Guard: the tag is the release trigger but the version published comes from
       # package.json — fail loudly if they disagree (e.g. tag v0.3.0 vs pkg 0.2.9)
       # rather than silently shipping the wrong number. Also enforce the
-      # package.json <-> .claude-plugin/plugin.json lockstep (dec-spor-client-node20-floor).
+      # package.json <-> plugin manifest lockstep (dec-spor-client-node20-floor).
       - name: Verify tag matches package version
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           PKG="$(node -p "require('./package.json').version")"
-          PLUGIN="$(node -p "require('./.claude-plugin/plugin.json').version")"
+          CLAUDE_PLUGIN="$(node -p "require('./.claude-plugin/plugin.json').version")"
+          CODEX_PLUGIN="$(node -p "require('./.codex-plugin/plugin.json').version")"
           if [ "$TAG" != "$PKG" ]; then
             echo "::error::git tag v$TAG does not match package.json version $PKG"; exit 1
           fi
-          if [ "$PKG" != "$PLUGIN" ]; then
-            echo "::error::package.json ($PKG) and .claude-plugin/plugin.json ($PLUGIN) versions differ"; exit 1
+          if [ "$PKG" != "$CLAUDE_PLUGIN" ]; then
+            echo "::error::package.json ($PKG) and .claude-plugin/plugin.json ($CLAUDE_PLUGIN) versions differ"; exit 1
+          fi
+          if [ "$PKG" != "$CODEX_PLUGIN" ]; then
+            echo "::error::package.json ($PKG) and .codex-plugin/plugin.json ($CODEX_PLUGIN) versions differ"; exit 1
           fi
 
       - run: npm publish  # OIDC trusted publishing; access/provenance from publishConfig

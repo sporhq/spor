@@ -27,6 +27,7 @@
   },
   "files": [
     ".claude-plugin/",
+    ".codex-plugin/",
     "lib/",
     "bin/",
     "scripts/engines/",
