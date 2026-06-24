@@ -66,10 +66,12 @@ async function nudge({ input, graph, slug, session, file, remote }) {
   if (process.env.SPOR_DISTILLING || process.env.SUBSTRATE_DISTILLING) return null; // headless calls don't nudge
   if (!file.endsWith(".md")) return null;
   const home = process.env.HOME || require("os").homedir();
+  const norm = (p) => path.resolve(String(p || "")).replace(/\\/g, "/").toLowerCase();
+  const nfile = norm(file);
   if (
-    file.startsWith(graph + "/") ||
-    file.startsWith(path.join(home, ".claude") + "/") ||
-    file.includes("/nodes/")
+    nfile.startsWith(norm(graph) + "/") ||
+    nfile.startsWith(norm(path.join(home, ".claude")) + "/") ||
+    nfile.includes("/nodes/")
   )
     return null; // graph homes + agent memory
   const base = path.basename(file);

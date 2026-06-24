@@ -248,7 +248,9 @@ function logCrash(err) {
 if (require.main === module) {
   main()
     .catch((err) => logCrash(err))
-    .finally(() => process.exit(0));
+    .finally(() => {
+      process.exitCode = 0;
+    });
 }
 
 module.exports = { logCrash, main };

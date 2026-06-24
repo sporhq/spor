@@ -8,6 +8,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { pathToFileURL } = require('node:url');
 const { writeNodeScript, nodeCommand } = require('./helpers/portable');
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'substrate-opencode-'));
@@ -70,7 +71,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const words = (n, w) => Array.from({ length: n }, (_, i) => `${w}${i}`).join(' ');
 
 async function load(client) {
-  const { SporPlugin } = await import(PLUGIN);
+  const { SporPlugin } = await import(pathToFileURL(PLUGIN).href);
   return SporPlugin({ client, directory: CWD });
 }
 

@@ -5,4 +5,6 @@ const { main, logCrash } = require("./spor-hook.js");
 
 main()
   .catch((err) => logCrash(err))
-  .finally(() => process.exit(0));
+  .finally(() => {
+    process.exitCode = 0;
+  });

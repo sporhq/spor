@@ -40,6 +40,10 @@ function run(args, env, cwd) {
   return spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", env: bare(env), cwd });
 }
 
+function canonPath(p) {
+  return fs.realpathSync(p).replace(/\\/g, "/").toLowerCase();
+}
+
 function noOpClaudeStub(home) {
   return writeSpawnableNodeStub(home, "claude-noop", "process.exit(0);");
 }
@@ -213,12 +217,12 @@ function gitRepoWithWorktree() {
 test("dispatch from inside a git worktree --print: resolves the MAIN checkout, not the worktree", () => {
   const { base, main, wt } = gitRepoWithWorktree();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-wt-home-"));
-  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const r = run(["dispatch", "some free text task to dispatch", "--no-brief", "--print"], { SPOR_HOME: home }, wt);
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.match(r.stdout, new RegExp(`dir:    ${esc(main)} `), "resolved the main checkout");
+  const dirLine = r.stdout.split("\n").find((line) => line.startsWith("dir:"));
+  assert.ok(dirLine && canonPath(dirLine.replace(/^dir:\s+/, "").replace(/\s+\(.*$/, "")) === canonPath(main), "resolved the main checkout");
   assert.match(r.stdout, /via cwd/);
-  assert.doesNotMatch(r.stdout, new RegExp(esc(wt)), "never the ephemeral worktree path");
+  assert.ok(!r.stdout.replace(/\\/g, "/").toLowerCase().includes(canonPath(wt)), "never the ephemeral worktree path");
   fs.rmSync(base, { recursive: true, force: true });
 });
 
@@ -229,8 +233,8 @@ test("dispatch from inside a git worktree (local, stubbed): registers the MAIN c
   const r = run(["dispatch", "some free text task to dispatch", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub }, wt);
   assert.strictEqual(r.status, 0, r.stderr);
   const mapped = Object.values(JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8")).dispatch.repos);
-  assert.ok(mapped.includes(main), `main checkout registered (got ${JSON.stringify(mapped)})`);
-  assert.ok(!mapped.includes(wt), "ephemeral worktree path NOT registered");
+  assert.ok(mapped.some((p) => canonPath(p) === canonPath(main)), `main checkout registered (got ${JSON.stringify(mapped)})`);
+  assert.ok(!mapped.some((p) => canonPath(p) === canonPath(wt)), "ephemeral worktree path NOT registered");
   fs.rmSync(base, { recursive: true, force: true });
 });
 
@@ -668,7 +672,7 @@ test("dispatch <node> (real): an unmapped cwd-matching slug self-registers the r
   assert.strictEqual(r.status, 0, r.stderr);
   assert.ok(fs.existsSync(sentinel), "the agent launched in the cwd-resolved repo");
   const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
-  assert.strictEqual(cfg.dispatch.repos.demo, real, "demo self-registered to the cwd's durable root");
+  assert.strictEqual(canonPath(cfg.dispatch.repos.demo), canonPath(real), "demo self-registered to the cwd's durable root");
 });
 
 // Real spawn through SPOR_CLAUDE_CMD: the launcher must pass --bg + flags and run
@@ -763,9 +767,11 @@ test("dispatch --worktree (stubbed): creates the worktree + branch and launches 
   assert.strictEqual(cwd, fs.realpathSync(wtDir), "launched inside the worktree");
   assert.notStrictEqual(cwd, real, "did NOT launch in the main checkout");
   assert.ok(fs.existsSync(wtDir), "worktree dir exists on disk");
-  assert.match(g(["worktree", "list"]), new RegExp(esc(fs.realpathSync(wtDir))));
+  assert.ok(
+    g(["worktree", "list"]).split("\n").some((line) => canonPath(line.trim().split(/\s+/)[0] || "") === canonPath(wtDir)),
+    "worktree list includes the dispatch worktree"
+  );
   assert.strictEqual(g(["rev-parse", "--verify", "--quiet", "refs/heads/dec-x"]).trim().length, 40, "branch dec-x created");
-  function esc(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 });
 
 test("dispatch worktree setup hook: runs with cwd=worktree + dispatch context env, before launch", () => {

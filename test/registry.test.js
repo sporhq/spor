@@ -1036,7 +1036,7 @@ function workedExampleFromGraphMd() {
   const section = doc.slice(doc.indexOf("## Authoring a custom schema"));
   // the worked example is the one ````markdown … ```` block in that section
   // (4-backtick fence wrapping a node whose body has 3-backtick json/js fences).
-  const m = section.match(/````markdown\n([\s\S]*?)\n````/);
+  const m = section.match(/````markdown\r?\n([\s\S]*?)\r?\n````/);
   assert.ok(m, "GRAPH.md must carry the ````markdown worked-example block");
   return m[1];
 }

@@ -164,7 +164,7 @@ function noGitIdentityEnv() {
 function gpgSignFailEnv() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-gpg-'));
   const cfg = path.join(dir, 'gitconfig');
-  const fakeGpg = path.join(dir, 'no-such-gpg'); // never created -> sign fails
+  const fakeGpg = path.join(dir, 'no-such-gpg').replace(/\\/g, '/'); // never created -> sign fails
   fs.writeFileSync(cfg,
     '[user]\n\tname = Real Dev\n\temail = real@dev.example\n' +
     '[commit]\n\tgpgsign = true\n' +
