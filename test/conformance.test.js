@@ -20,7 +20,7 @@ for (const c of cases()) {
   test(`conformance: ${c.id} (${c.kind})`, () => {
     const file = expectedPath(c);
     assert.ok(fs.existsSync(file), `expected/${c.expected} missing — run conformance/runner.js --update`);
-    const want = fs.readFileSync(file, "utf8");
+    const want = fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n");
     const got = runCase(c);
     assert.equal(got, want, `${c.id} drifted from its golden (covers: ${c.covers ?? "?"})`);
   });

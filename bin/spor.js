@@ -4723,10 +4723,13 @@ function claudeCmd() {
 }
 
 function spawnPortableSync(cmd, args, opts = {}) {
-  return spawnSync(cmd, args, {
-    ...opts,
-    shell: opts.shell ?? process.platform === "win32",
-  });
+  if (process.platform !== "win32" || opts.shell) return spawnSync(cmd, args, opts);
+  const resolved = u.whichSync(cmd) || cmd;
+  if (/\.(?:cmd|bat)$/i.test(resolved)) {
+    const { shell: _shell, ...rest } = opts;
+    return spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", resolved, ...args], rest);
+  }
+  return spawnSync(resolved, args, opts);
 }
 
 // The spor plugin Claude Code has LOADED (its own cached copy under
@@ -8598,9 +8601,11 @@ module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, COMM
 
 if (require.main === module) {
   main()
-    .then((code) => process.exit(code || 0))
+    .then((code) => {
+      process.exitCode = code || 0;
+    })
     .catch((e) => {
       err(`spor: ${e && e.message ? e.message : String(e)}`);
-      process.exit(1);
+      process.exitCode = 1;
     });
 }
