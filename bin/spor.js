@@ -747,6 +747,191 @@ function gitBlobSha(buf) {
   return h.digest("hex");
 }
 
+// --- spor put-node: full validated node writes -----------------------------
+// The shell twin of MCP put_node / REST POST /v1/nodes: write a complete node
+// markdown file (frontmatter + body) through the same create/update collision
+// policy instead of dropping to raw REST from scripts and skills.
+function readPutNodeInput(input) {
+  if (!input || input === "-") {
+    try {
+      return { raw: fs.readFileSync(0, "utf8"), label: "stdin" };
+    } catch (e) {
+      return { error: `could not read stdin: ${e.message}` };
+    }
+  }
+  try {
+    return { raw: fs.readFileSync(input, "utf8"), label: input };
+  } catch (e) {
+    return { error: `could not read ${input}: ${e.message}` };
+  }
+}
+
+function parsePutNode(raw, label) {
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  let first;
+  try {
+    first = graphLib.parseFrontmatter(raw, label || "incoming.md");
+  } catch (e) {
+    return { error: `invalid node: ${e.message}` };
+  }
+  if (!first.id) return { error: "invalid node: missing id" };
+  if (!NODE_ID_RE.test(first.id)) return { error: `bad node id '${first.id}' — expected kebab-case` };
+  try {
+    return { node: graphLib.parseFrontmatter(raw, `${first.id}.md`) };
+  } catch (e) {
+    return { error: `invalid node: ${e.message}` };
+  }
+}
+
+function normalizeIfExists(raw) {
+  const value = raw == null ? "error" : String(raw).trim().toLowerCase();
+  if (["error", "skip", "update"].includes(value)) return { ok: true, value };
+  return { ok: false, error: `--if-exists must be one of: error, skip, update` };
+}
+
+function renderPutNodeResult(res, json) {
+  if (json) {
+    out(JSON.stringify(res || {}, null, 2));
+    return;
+  }
+  const status = (res && res.status) || "ok";
+  const id = res && res.id ? res.id : "(unknown)";
+  const rev = res && res.revision ? ` @ ${res.revision}` : "";
+  out(status === "skipped" ? `put-node skipped: ${id}${rev}` : `put-node ${status}: ${id}${rev}`);
+  for (const w of (res && res.warnings) || []) err(`  warning: ${w}`);
+}
+
+function putNodeEntryError(res0, httpStatus, prefix = "put-node") {
+  const parts = [];
+  if (res0 && res0.message) parts.push(res0.message);
+  if (res0 && res0.code && !parts.includes(res0.code)) parts.push(res0.code);
+  if (res0 && Array.isArray(res0.details)) parts.push(...res0.details);
+  if (res0 && res0.revision) parts.push(`current revision: ${res0.revision}`);
+  return `${prefix} error ${httpStatus}${parts.length ? `: ${parts.join("; ")}` : ""}`;
+}
+
+function copyNodeFilesForValidation(srcNodes, dstNodes, targetId, raw) {
+  fs.mkdirSync(dstNodes, { recursive: true });
+  for (const ent of fs.readdirSync(srcNodes, { withFileTypes: true })) {
+    if (!ent.isFile() || !ent.name.endsWith(".md")) continue;
+    if (ent.name === `${targetId}.md`) continue;
+    fs.copyFileSync(path.join(srcNodes, ent.name), path.join(dstNodes, ent.name));
+  }
+  fs.writeFileSync(path.join(dstNodes, `${targetId}.md`), raw);
+}
+
+function validatePutNodeLocal(nodesDir, node, raw) {
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  let g;
+  try {
+    g = graphLib.loadGraph(nodesDir);
+  } catch (e) {
+    return { error: `could not load graph: ${e.message}` };
+  }
+  const v = graphLib.validateNode(g, node);
+  if (!v.ok) return { error: `invalid node:\n  ${v.errors.join("\n  ")}` };
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "spor-put-node-"));
+  const tmpNodes = path.join(tmp, "nodes");
+  try {
+    copyNodeFilesForValidation(nodesDir, tmpNodes, node.id, raw);
+    const vg = graphLib.validateGraph(tmpNodes);
+    if (vg.errors && vg.errors.length) return { error: `invalid graph after put-node:\n  ${vg.errors.join("\n  ")}` };
+    return { ok: true, warnings: vg.warnings || [] };
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function cmdPutNode(cfg, { values, positionals }) {
+  const input = positionals[0] || "-";
+  const ifExists = normalizeIfExists(values["if-exists"]);
+  if (!ifExists.ok) {
+    err(ifExists.error);
+    return 1;
+  }
+  const policy = ifExists.value;
+  const revision = values.revision || null;
+  if (policy === "update" && !revision) {
+    err("put-node update requires --revision from 'spor get <id> --json'");
+    return 1;
+  }
+  if (policy !== "update" && revision) {
+    err("--revision is only valid with --if-exists update");
+    return 1;
+  }
+
+  const inputRes = readPutNodeInput(input);
+  if (inputRes.error) {
+    err(inputRes.error);
+    return 1;
+  }
+  const raw = inputRes.raw;
+  const parsed = parsePutNode(raw, inputRes.label);
+  if (parsed.error) {
+    err(parsed.error);
+    return 1;
+  }
+  const id = parsed.node.id;
+
+  if (cfg.mode() === "remote") {
+    const entry = { node: raw, if_exists: policy };
+    if (revision) entry.revision = revision;
+    const r = await remote.post(cfg, "/v1/nodes", { nodes: [entry] }, { timeoutMs: 15000 });
+    if (r.transport) {
+      err(`offline — could not reach server (${r.error})`);
+      return 1;
+    }
+    const res0 = r.json && r.json.results && r.json.results[0];
+    if (!(res0 && res0.ok)) {
+      const top = r.json && r.json.error;
+      if (top && !res0) err(`put-node error ${r.status}${top.message ? `: ${top.message}` : ""}`);
+      else err(putNodeEntryError(res0, r.status));
+      return 1;
+    }
+    renderPutNodeResult(res0, !!values.json);
+    return 0;
+  }
+
+  const nodesDir = cfg.nodesDir();
+  if (!fs.existsSync(nodesDir)) {
+    err(`no graph at ${nodesDir} — run 'spor init' first`);
+    return 1;
+  }
+  const file = path.join(nodesDir, `${id}.md`);
+  const exists = fs.existsSync(file);
+  if (policy === "error" && exists) {
+    err(`node already exists: ${id} (use --if-exists update with --revision, or --if-exists skip)`);
+    return 1;
+  }
+  if (policy === "skip" && exists) {
+    const res = { ok: true, status: "skipped", id, revision: gitBlobSha(fs.readFileSync(file)), warnings: [] };
+    renderPutNodeResult(res, !!values.json);
+    return 0;
+  }
+  if (policy === "update") {
+    if (!exists) {
+      err(`no such node: ${id}`);
+      return 1;
+    }
+    const current = gitBlobSha(fs.readFileSync(file));
+    if (current !== revision) {
+      err(`put-node conflict: stale revision for ${id}; current revision: ${current}`);
+      return 1;
+    }
+  }
+
+  const valid = validatePutNodeLocal(nodesDir, parsed.node, raw);
+  if (valid.error) {
+    err(valid.error);
+    return 1;
+  }
+  fs.writeFileSync(file, raw);
+  const res = { ok: true, status: exists ? "updated" : "created", id, revision: gitBlobSha(Buffer.from(raw)), warnings: valid.warnings || [] };
+  renderPutNodeResult(res, !!values.json);
+  return 0;
+}
+
 // --- spor blame / commits: commit-sha -> nodes reverse lookup ---------------
 // (task-spor-blame-commit-lookup-cli-verb) The shell verb over the commit->node
 // reverse index: which decisions/tasks/issues reference a git commit in their
@@ -7776,6 +7961,34 @@ const COMMANDS = {
       "is heavier than the plain read. Mode-symmetric (norm-spor-cli-mode-parity).",
     examples: ["spor get dec-cc-zero-dep-client", "spor get dec-cc-zero-dep-client --json"],
     run: (cfg, p) => cmdGet(cfg, p),
+  },
+  "put-node": {
+    group: "Graph", parse: "strict", args: "[<file>|-]",
+    summary: "write a full node markdown file (local validated write; remote: /v1/nodes)",
+    help:
+      "Create, skip, or update one complete node markdown file (frontmatter + body)\n" +
+      "through the same validated full-node write path as MCP put_node / REST\n" +
+      "POST /v1/nodes. With no file, or with '-', reads the node markdown from stdin.\n\n" +
+      "Collision policy is explicit: --if-exists error (default) rejects an existing\n" +
+      "id, --if-exists skip no-ops on collision, and --if-exists update replaces an\n" +
+      "existing node only when --revision matches the blob SHA you read earlier.\n" +
+      "Get that revision with 'spor get <id> --json'; re-read and retry on conflict.\n\n" +
+      "Remote mode sends one-entry batch put_node to /v1/nodes, so server attribution,\n" +
+      "schema transition gates, edge normalization, and validation all apply. Local\n" +
+      "mode writes nodes/<id>.md after parsing and validating the candidate against a\n" +
+      "temporary graph view, so a malformed full node never lands on disk.",
+    options: {
+      "if-exists": { type: "string", value: "error|skip|update", desc: "collision policy (default: error)" },
+      revision: { type: "string", value: "sha", desc: "required with --if-exists update; from 'spor get <id> --json'" },
+      json: { type: "boolean", desc: "machine-readable result envelope" },
+    },
+    examples: [
+      "spor put-node ./nodes/dec-x.md",
+      "spor get dec-x --json",
+      "spor put-node ./dec-x.md --if-exists update --revision <blob-sha>",
+      "cat ./task-new.md | spor put-node --if-exists error",
+    ],
+    run: (cfg, p) => cmdPutNode(cfg, p),
   },
   blame: {
     group: "Graph", parse: "strict", args: "<sha> [--repo <slug>]", aliases: ["commits"],

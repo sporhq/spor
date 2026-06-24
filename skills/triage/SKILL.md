@@ -246,11 +246,11 @@ the REST endpoint against the resolved server; in Cowork use the MCP tool. See
 | Set priority | `spor priority <id> <p1\|p2\|p3\|clear>` (or `POST /v1/nodes/<id>/priority {priority}`) | `set_priority` |
 | Set status (merged/rejected/resolved/…) | `spor set-status <id> <status>` (or `POST /v1/nodes/<id>/status {status}`) | `set_status` |
 | Add edge (supersedes/blocks/relates-to/answers) | `spor edge <id> <type> <to>` (or `POST /v1/nodes/<id>/edges {type, to}`) | `add_edge` |
-| Edit a field (body) | `POST /v1/nodes {nodes:[{node, if_exists:"update", revision}]}` | `put_node` |
+| Edit a field (body) | `spor put-node <file> --if-exists update --revision <sha>` (or `POST /v1/nodes {nodes:[{node, if_exists:"update", revision}]}`) | `put_node` |
 | Compile a question's lineage | `spor brief <id>` | `query_graph root_id=<id>` |
 
 Edges normalize/flip/dedupe server-side, so write a `blocks` from the
-prerequisite's perspective and let it record the inverse. `put_node` needs
+prerequisite's perspective and let it record the inverse. `spor put-node` / `put_node` needs
 `if_exists:"update"` **and** the current `revision` — without the explicit mode
 it skips an existing node. Status flips run through the schema `transitions()`
 gate (and terminal closes through the completion-resolver gate), so a denied

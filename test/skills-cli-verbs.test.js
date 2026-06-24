@@ -142,7 +142,7 @@ test('the verb scanner finds invocations in both skills and docs', () => {
 // (a disclaimer is prose, not a code span) and runs over docs too — verified
 // false-positive-free (no skill or doc carries such a disclaimer line today).
 const DISCLAIMER_RE = /no (?:dedicated )?(?:`spor` )?cli (?:verb|form)|has no\b[^.]{0,40}\bcli verb/i;
-const VERB_BACKED_OPS = ['priority', 'set-status', 'edge'];
+const VERB_BACKED_OPS = ['priority', 'set-status', 'edge', 'put-node'];
 
 test('no skill or doc disclaims a CLI verb that exists', () => {
   // every op we guard must actually resolve, or the guard itself is stale

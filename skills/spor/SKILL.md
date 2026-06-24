@@ -80,6 +80,9 @@ rest are mode-specific (`spor status` confirms which mode you're in):
 spor status                    # resolved mode, graph, project, identity, health
 spor next [--project <slug>]   # the ranked decision queue — "what's next"
 spor get <id>                  # one node by id
+spor put-node [<file>|-] --if-exists <error|skip|update> [--revision <sha>]
+                               # write a full node markdown file through validated put_node semantics;
+                               # use `spor get <id> --json` first and pass its revision for updates
 spor blame <sha> [--repo <s>]  # which nodes reference a git commit (alias: spor commits <sha>)
 spor history <id> [<sha>]      # a node's commit lineage (actor/when/what); <sha> = that revision's diff (local git log / GET /v1/nodes/<id>/history)
 spor schema [<type>]           # introspect the live registry (types/prefixes/weights/flags/gates,
@@ -161,6 +164,13 @@ A few of these have enough surface to be worth a sentence:
   read from git content history, never `updated_at`
   (dec-spor-git-derived-timestamps). `--project`/`--type`/`--weeks`/`--json`
   scope and shape it.
+- **`spor put-node`** is the shell twin of MCP `put_node` / REST `POST
+  /v1/nodes`: pass a complete node markdown file, or `-`/stdin. Default
+  `--if-exists error` rejects collisions; `--if-exists skip` no-ops on an
+  existing id; `--if-exists update` requires the `revision` from `spor get <id>
+  --json` so updates are optimistic-concurrency checked instead of last-writer
+  wins. Prefer `spor edge`/`spor set-status` for narrow mutations; use
+  `put-node` for full-node artifacts such as briefing versions or body edits.
 - **`spor compile`/`spor brief`** are mode-aware: local runs the in-repo
   compiler, remote dispatches to the server (this is what `/spor:brief` pulls).
   In local mode add `--project <repo-slug>` to scope to a repo — without it
