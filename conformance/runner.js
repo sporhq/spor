@@ -195,7 +195,7 @@ if (require.main === module) {
       console.log(`wrote ${c.id} -> expected/${c.expected} (${got.length} bytes)`);
       continue;
     }
-    const want = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null;
+    const want = fs.existsSync(file) ? fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n") : null;
     if (want === got) {
       console.log(`ok   ${c.id}`);
     } else {
