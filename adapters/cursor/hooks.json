@@ -2,13 +2,13 @@
   "version": 1,
   "hooks": {
     "sessionStart": [
-      { "command": "__SPOR_ROOT__/bin/spor-hook session-start --host cursor", "timeout": 20 }
+      { "command": "node \"__SPOR_ROOT__/bin/spor-hook.js\" session-start --host cursor", "timeout": 20 }
     ],
     "afterFileEdit": [
-      { "command": "__SPOR_ROOT__/bin/spor-hook post-tool --host cursor", "timeout": 10 }
+      { "command": "node \"__SPOR_ROOT__/bin/spor-hook.js\" post-tool --host cursor", "timeout": 10 }
     ],
     "sessionEnd": [
-      { "command": "__SPOR_ROOT__/bin/spor-hook distill --host cursor", "timeout": 300 }
+      { "command": "node \"__SPOR_ROOT__/bin/spor-hook.js\" distill --host cursor", "timeout": 300 }
     ]
   }
 }

@@ -2,8 +2,8 @@
 //
 // OpenCode has no command-hook system; plugins are in-process JS. This one
 // stays a thin shim over the same portable core every other host uses: each
-// hook synthesizes a Claude-shaped payload and shells out to
-// bin/spor-hook, so briefing/digest/journal/distill behavior is
+// hook synthesizes a Claude-shaped payload and launches the Node dispatcher
+// (bin/spor-hook.js), so briefing/digest/journal/distill behavior is
 // identical across hosts.
 //
 //   chat.message        -> session-start briefing (first message of a session)
@@ -18,7 +18,7 @@
 // nothing. Zero dependencies: node builtins only.
 //
 // Install: symlink this file into ~/.config/opencode/plugins/ (the symlink is
-// resolved to find bin/spor-hook), or copy it and set SPOR_ROOT (legacy
+// resolved to find bin/spor-hook.js), or copy it and set SPOR_ROOT (legacy
 // SUBSTRATE_ROOT still read).
 
 import { spawn } from "node:child_process"
@@ -36,18 +36,20 @@ const GRAPH =
     ? join(homedir(), ".spor")
     : join(homedir(), ".substrate"))
 const DEBOUNCE = process.env.SPOR_DEBOUNCE || process.env.SUBSTRATE_DEBOUNCE || "900"
+const EMBEDDED_ROOT = "__SPOR_ROOT__"
 
 function findDispatcher() {
   const candidates = []
-  const root = process.env.SPOR_ROOT || process.env.SUBSTRATE_ROOT
+  const root =
+    process.env.SPOR_ROOT ||
+    process.env.SUBSTRATE_ROOT ||
+    (EMBEDDED_ROOT !== "__SPOR_ROOT__" ? EMBEDDED_ROOT : "")
   if (root) {
-    candidates.push(join(root, "bin", "spor-hook"))
-    candidates.push(join(root, "bin", "substrate-hook"))
+    candidates.push(join(root, "bin", "spor-hook.js"))
   }
   try {
     const here = dirname(realpathSync(fileURLToPath(import.meta.url)))
-    candidates.push(join(here, "..", "..", "bin", "spor-hook"))
-    candidates.push(join(here, "..", "..", "bin", "substrate-hook"))
+    candidates.push(join(here, "..", "..", "bin", "spor-hook.js"))
   } catch {}
   return candidates.find((c) => existsSync(c)) || null
 }
@@ -59,7 +61,7 @@ function run(bin, args, payload, timeoutMs) {
     let done = false
     const finish = (out) => { if (!done) { done = true; resolve(out) } }
     try {
-      const child = spawn("bash", [bin, ...args], { stdio: ["pipe", "pipe", "ignore"] })
+      const child = spawn(process.execPath, [bin, ...args], { stdio: ["pipe", "pipe", "ignore"] })
       let out = ""
       const timer = setTimeout(() => { try { child.kill("SIGKILL") } catch {}; finish("") }, timeoutMs)
       child.stdout.on("data", (d) => { out += d })

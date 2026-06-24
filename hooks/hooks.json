@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/spor-hook session-start --host claude-code",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/spor-hook.js\" session-start --host claude-code",
             "timeout": 20
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/spor-hook prompt-context --host claude-code",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/spor-hook.js\" prompt-context --host claude-code",
             "timeout": 15
           }
         ]
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/spor-hook post-tool --host claude-code",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/spor-hook.js\" post-tool --host claude-code",
             "timeout": 60
           }
         ]
@@ -40,7 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/spor-hook distill --host claude-code",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/spor-hook.js\" distill --host claude-code",
             "async": true,
             "timeout": 300
           }

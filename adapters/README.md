@@ -13,7 +13,7 @@ The Spor client is a portable core behind per-host adapters
 
 - **Core**: the four hook engines in `scripts/` (session-start briefing,
   prompt-context digest, post-tool journal, distill capture) and the
-  `bin/spor-hook` dispatcher that normalizes host payload quirks and
+  `bin/spor-hook.js` dispatcher that normalizes host payload quirks and
   envelope event names. All engines are fail-open: any failure injects
   nothing and exits 0.
 - **Universal surfaces**: the server's MCP endpoint (`/mcp`) and REST

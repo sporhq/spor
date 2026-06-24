@@ -15,12 +15,11 @@ const { spawnSync, spawn } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { runHook, spawnHook } = require('./helpers/portable');
 
 const graph = require(path.join(__dirname, '..', 'lib', 'graph.js'));
 const { rankQueue } = require(path.join(__dirname, '..', 'lib', 'queue.js'));
 const u = require(path.join(__dirname, '..', 'scripts', 'engines', 'util.js'));
-
-const BIN = path.join(__dirname, '..', 'bin', 'spor-hook');
 
 function tmpGraph(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-projid-'));
@@ -499,7 +498,7 @@ function freshEnv(home) {
 }
 
 function run(args, input, env) {
-  const r = spawnSync('bash', [BIN, ...args], { input, env, encoding: 'utf8' });
+  const r = runHook(args, input, env);
   assert.equal(r.status, 0, `exit 0 expected (fail-open): ${r.stderr}`);
   return r.stdout;
 }
@@ -593,10 +592,9 @@ function stubServer() {
 
 function runAsync(args, input, env) {
   return new Promise((resolve, reject) => {
-    const c = spawn('bash', [BIN, ...args], { env, stdio: ['pipe', 'ignore', 'ignore'] });
+    const c = spawnHook(args, input, env, { stdio: ['pipe', 'ignore', 'ignore'] });
     c.on('error', reject);
     c.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`exit ${code}`))));
-    c.stdin.end(input);
   });
 }
 

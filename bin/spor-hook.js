@@ -251,4 +251,4 @@ if (require.main === module) {
     .finally(() => process.exit(0));
 }
 
-module.exports = { logCrash };
+module.exports = { logCrash, main };

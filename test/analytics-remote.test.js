@@ -21,7 +21,6 @@ const { spawn } = require("node:child_process");
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const graphLib = require("../lib/graph.js");
 const analyticsLib = require("../lib/analytics.js");
-const isWin = process.platform === "win32";
 
 // A fixed instant so analyze()'s week bucketing is deterministic across the
 // client process and the in-process oracle.
@@ -122,7 +121,7 @@ function oracle(g, opts) {
 }
 const remoteEnv = (home, base) => baseEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: "test-token" });
 
-test("remote: default render is byte-identical to renderReport over the server's report", { skip: isWin }, async () => {
+test("remote: default render is byte-identical to renderReport over the server's report", async () => {
   const g = scratchGraph();
   const { srv, hits, base } = await analyticsStub(g);
   try {
@@ -137,7 +136,7 @@ test("remote: default render is byte-identical to renderReport over the server's
   }
 });
 
-test("remote: --json emits the machine report, byte-identical to local --json", { skip: isWin }, async () => {
+test("remote: --json emits the machine report, byte-identical to local --json", async () => {
   const g = scratchGraph();
   const { srv, base } = await analyticsStub(g);
   try {
@@ -149,7 +148,7 @@ test("remote: --json emits the machine report, byte-identical to local --json", 
   }
 });
 
-test("remote: maps --type (comma/repeatable) and --weeks/--top/--aging to the query", { skip: isWin }, async () => {
+test("remote: maps --type (comma/repeatable) and --weeks/--top/--aging to the query", async () => {
   const g = scratchGraph();
   const { srv, hits, base } = await analyticsStub(g);
   try {
@@ -169,7 +168,7 @@ test("remote: maps --type (comma/repeatable) and --weeks/--top/--aging to the qu
   }
 });
 
-test("remote: a zero-match --project surfaces the warning on stderr (parity with local), stripped from the report", { skip: isWin }, async () => {
+test("remote: a zero-match --project surfaces the warning on stderr (parity with local), stripped from the report", async () => {
   const g = scratchGraph();
   const { srv, base } = await analyticsStub(g);
   try {
@@ -183,13 +182,13 @@ test("remote: a zero-match --project surfaces the warning on stderr (parity with
   }
 });
 
-test("remote: a dead server fails soft with an offline line, exit 1", { skip: isWin }, async () => {
+test("remote: a dead server fails soft with an offline line, exit 1", async () => {
   const r = await runAsync(["analytics"], remoteEnv(freshHome(), "http://127.0.0.1:1"));
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /offline — could not reach server/);
 });
 
-test("remote: a non-200 (e.g. an older server without the route) reports the error, exit 1", { skip: isWin }, async () => {
+test("remote: a non-200 (e.g. an older server without the route) reports the error, exit 1", async () => {
   // The stub 404s any path but /v1/analytics; point the client at a bogus path by
   // standing up a server that 404s the route to simulate a pre-analytics server.
   const srv = http.createServer((req, res) => {
@@ -207,7 +206,7 @@ test("remote: a non-200 (e.g. an older server without the route) reports the err
   }
 });
 
-test("remote: an explicit --nodes takes the LOCAL path even under a configured server", { skip: isWin }, async () => {
+test("remote: an explicit --nodes takes the LOCAL path even under a configured server", async () => {
   // --nodes names a local checkout on purpose, so it bypasses the server (and keeps
   // local output byte-identical) — mirror cmdCompile/cmdQuery/cmdValidate.
   const g = scratchGraph();

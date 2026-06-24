@@ -10,6 +10,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const { writeFakePathBin } = require("./helpers/portable");
 
 const sat = require(path.join(__dirname, "..", "lib", "kernel", "satisfiability.js"));
 const u = require(path.join(__dirname, "..", "scripts", "engines", "util.js"));
@@ -84,9 +85,7 @@ function withFakeMachine(fn, { harnessBins = ["claude"], plugins = {} } = {}) {
   const bin = path.join(root, "bin");
   fs.mkdirSync(bin, { recursive: true });
   for (const b of harnessBins) {
-    const f = path.join(bin, b);
-    fs.writeFileSync(f, "#!/bin/sh\necho stub\n");
-    fs.chmodSync(f, 0o755);
+    writeFakePathBin(bin, b);
   }
   const home = path.join(root, "home");
   const pluginsDir = path.join(home, ".claude", "plugins");
@@ -107,7 +106,7 @@ function withFakeMachine(fn, { harnessBins = ["claude"], plugins = {} } = {}) {
   }
 }
 
-test("probeCapabilities: detects harnesses on PATH and writes them to .probed", { skip: process.platform === "win32" }, () => {
+test("probeCapabilities: detects harnesses on PATH and writes them to .probed", () => {
   withFakeMachine(({ graphHome }) => {
     const probed = u.probeCapabilities(graphHome);
     assert.deepStrictEqual(probed.harnesses, ["claude-code"]);
@@ -116,7 +115,7 @@ test("probeCapabilities: detects harnesses on PATH and writes them to .probed", 
   }, { harnessBins: ["claude"] });
 });
 
-test("probeCapabilities: reads installed plugins + their skills from the claude manifest", { skip: process.platform === "win32" }, () => {
+test("probeCapabilities: reads installed plugins + their skills from the claude manifest", () => {
   withFakeMachine(({ root, graphHome }) => {
     // Give the spor plugin a skills/ dir so the probe enumerates it.
     const installPath = path.join(root, "home", ".claude", "plugins", "cache", "spor", "spor", "1.0.0");
@@ -135,7 +134,7 @@ test("probeCapabilities: reads installed plugins + their skills from the claude 
   }, { harnessBins: ["claude"], plugins: { "spor@spor": [{ installPath: "x" }] } });
 });
 
-test("probeCapabilities: refresh is WHOLESALE — an uninstalled harness drops out, declarations survive", { skip: process.platform === "win32" }, () => {
+test("probeCapabilities: refresh is WHOLESALE — an uninstalled harness drops out, declarations survive", () => {
   withFakeMachine(({ root, graphHome }) => {
     // First probe sees claude + codex.
     u.probeCapabilities(graphHome);
@@ -145,7 +144,7 @@ test("probeCapabilities: refresh is WHOLESALE — an uninstalled harness drops o
       return true;
     });
     // Now "uninstall" codex: remove its stub from the fake PATH dir.
-    fs.rmSync(path.join(root, "bin", "codex"));
+    fs.rmSync(path.join(root, "bin", process.platform === "win32" ? "codex.cmd" : "codex"));
     const probed = u.probeCapabilities(graphHome);
     assert.deepStrictEqual(probed.harnesses, ["claude-code"], "codex dropped from probe");
     const cfg = JSON.parse(fs.readFileSync(path.join(graphHome, "config.json"), "utf8"));
@@ -154,7 +153,7 @@ test("probeCapabilities: refresh is WHOLESALE — an uninstalled harness drops o
   }, { harnessBins: ["claude", "codex"] });
 });
 
-test("probeCapabilities: seeds reachable_mcp:[spor] from CONFIGURED-ness when a server is bound, satisfying an mcp:[spor] profile", { skip: process.platform === "win32" }, () => {
+test("probeCapabilities: seeds reachable_mcp:[spor] from CONFIGURED-ness when a server is bound, satisfying an mcp:[spor] profile", () => {
   withFakeMachine(({ graphHome }) => {
     const probed = u.probeCapabilities(graphHome, { sporReachable: true });
     assert.deepStrictEqual(probed.reachable_mcp, ["spor"], "spor seeded into the probed map");
@@ -166,7 +165,7 @@ test("probeCapabilities: seeds reachable_mcp:[spor] from CONFIGURED-ness when a 
   }, { harnessBins: ["claude"] });
 });
 
-test("probeCapabilities: no seed without a server (byte-identical .probed); the seed drops out on refresh, a declared mcp survives", { skip: process.platform === "win32" }, () => {
+test("probeCapabilities: no seed without a server (byte-identical .probed); the seed drops out on refresh, a declared mcp survives", () => {
   withFakeMachine(({ graphHome }) => {
     // No server bound → no reachable_mcp key probed (unchanged shape).
     const off = u.probeCapabilities(graphHome);

@@ -22,7 +22,6 @@ const { spawn } = require("node:child_process");
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const { DEFAULT_SERVER } = require(path.join(__dirname, "..", "lib", "config.js"));
 const auth = require(path.join(__dirname, "..", "lib", "auth.js"));
-const isWin = process.platform === "win32";
 const HOSTED_KEY = `${DEFAULT_SERVER}/`; // <server>/<org>, org empty for an opaque PAT
 
 // Strip ambient SPOR_*/SUBSTRATE_* so a configured dev box can't flip the test
@@ -66,7 +65,7 @@ function meStub(extra = {}) {
   return new Promise((resolve) => srv.listen(0, "127.0.0.1", () => resolve({ srv, base: `http://127.0.0.1:${srv.address().port}` })));
 }
 
-test("join: no URL defaults the stored server to the hosted base, with a token", { skip: isWin }, async () => {
+test("join: no URL defaults the stored server to the hosted base, with a token", async () => {
   const home = scratchHome();
   const { srv, base } = await meStub();
   try {
@@ -88,7 +87,7 @@ test("join: no URL defaults the stored server to the hosted base, with a token",
   }
 });
 
-test("join: explicit URL + token still wins (no default applied)", { skip: isWin }, async () => {
+test("join: explicit URL + token still wins (no default applied)", async () => {
   const home = scratchHome();
   const { srv, base } = await meStub();
   try {
@@ -105,7 +104,7 @@ test("join: explicit URL + token still wins (no default applied)", { skip: isWin
   }
 });
 
-test("join: --token flag only defaults the server to the hosted base", { skip: isWin }, async () => {
+test("join: --token flag only defaults the server to the hosted base", async () => {
   const home = scratchHome();
   const { srv, base } = await meStub();
   try {
@@ -119,7 +118,7 @@ test("join: --token flag only defaults the server to the hosted base", { skip: i
   }
 });
 
-test("join: no args writes the hosted default tenant and notes the missing token", { skip: isWin }, async () => {
+test("join: no args writes the hosted default tenant and notes the missing token", async () => {
   const home = scratchHome();
   const { srv, base } = await meStub();
   try {
@@ -138,7 +137,7 @@ test("join: no args writes the hosted default tenant and notes the missing token
 // readable `org` claim, so without the /v1/me echo every such tenant on one
 // server collides on key "<server>/". The confirm now falls back to me.org for
 // the (server, org) key, AFTER --org and the JWT claim.
-test("join: opaque token keys by the org echoed from /v1/me (no --org, no JWT claim)", { skip: isWin }, async () => {
+test("join: opaque token keys by the org echoed from /v1/me (no --org, no JWT claim)", async () => {
   const home = scratchHome();
   const { srv, base } = await meStub({ org: "acme" });
   try {
@@ -154,7 +153,7 @@ test("join: opaque token keys by the org echoed from /v1/me (no --org, no JWT cl
   }
 });
 
-test("join: explicit --org wins over the /v1/me org echo", { skip: isWin }, async () => {
+test("join: explicit --org wins over the /v1/me org echo", async () => {
   const home = scratchHome();
   const { srv, base } = await meStub({ org: "echoed" });
   try {
@@ -169,7 +168,7 @@ test("join: explicit --org wins over the /v1/me org echo", { skip: isWin }, asyn
   }
 });
 
-test("join: --server flag overrides the default", { skip: isWin }, async () => {
+test("join: --server flag overrides the default", async () => {
   const home = scratchHome();
   const { srv, base } = await meStub();
   try {

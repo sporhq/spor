@@ -474,7 +474,7 @@ function dispatchedAgents() {
     if (text == null) {
       const cmd = claudeCmd();
       if (cmd === "claude" && !hasCmd("claude")) return new Map();
-      const r = spawnSync(cmd, ["agents", "--json"], { encoding: "utf8", timeout: 5000 });
+      const r = spawnPortableSync(cmd, ["agents", "--json"], { encoding: "utf8", timeout: 5000 });
       if (r.status !== 0 || !r.stdout) return new Map();
       text = r.stdout;
     }
@@ -4722,6 +4722,13 @@ function claudeCmd() {
   return process.env.SPOR_CLAUDE_CMD || "claude";
 }
 
+function spawnPortableSync(cmd, args, opts = {}) {
+  return spawnSync(cmd, args, {
+    ...opts,
+    shell: opts.shell ?? process.platform === "win32",
+  });
+}
+
 // The spor plugin Claude Code has LOADED (its own cached copy under
 // ~/.claude/plugins/), parsed from `claude plugin list --json`, or null if the
 // claude CLI is absent / spor isn't installed. Fail-soft and bounded — never
@@ -4729,7 +4736,7 @@ function claudeCmd() {
 function claudePluginInfo() {
   const cmd = claudeCmd();
   if (cmd === "claude" && !hasCmd("claude")) return null;
-  const r = spawnSync(cmd, ["plugin", "list", "--json"], { encoding: "utf8", timeout: 8000 });
+  const r = spawnPortableSync(cmd, ["plugin", "list", "--json"], { encoding: "utf8", timeout: 8000 });
   if (r.status !== 0 || !r.stdout) return null;
   let arr;
   try {
@@ -4763,7 +4770,7 @@ function sporConnectorBound() {
     if (text == null) {
       const cmd = claudeCmd();
       if (cmd === "claude" && !hasCmd("claude")) return false;
-      const r = spawnSync(cmd, ["mcp", "list"], { encoding: "utf8", timeout: 8000 });
+      const r = spawnPortableSync(cmd, ["mcp", "list"], { encoding: "utf8", timeout: 8000 });
       if (r.status !== 0 || !r.stdout) return false;
       text = r.stdout;
     }
@@ -4986,7 +4993,7 @@ function installExtras(spec, scope, dryRun) {
 
 function hasCmd(cmd) {
   try {
-    return !spawnSync(cmd, ["--version"], { stdio: "ignore" }).error;
+    return !spawnPortableSync(cmd, ["--version"], { stdio: "ignore" }).error;
   } catch {
     return false;
   }
@@ -5011,11 +5018,11 @@ function detectHosts() {
 // swaps the cached copy. Returns 0/1; prints a before→after line. The caller has
 // already ensured the claude CLI exists and the marketplace is registered.
 function refreshClaudePlugin(cmd, cliScope, before) {
-  spawnSync(cmd, ["plugin", "marketplace", "update", "spor"], { encoding: "utf8" });
+  spawnPortableSync(cmd, ["plugin", "marketplace", "update", "spor"], { encoding: "utf8" });
   // Claude Code resolves an installed plugin by its name@marketplace id (the
   // install side uses 'spor@spor'); the bare 'spor' is unresolvable and fails
   // with "Plugin 'spor' not found" (issue-spor-upgrade-wrong-plugin-marketplace-id).
-  const upd = spawnSync(cmd, ["plugin", "update", "spor@spor", "--scope", cliScope], { stdio: "inherit" });
+  const upd = spawnPortableSync(cmd, ["plugin", "update", "spor@spor", "--scope", cliScope], { stdio: "inherit" });
   if (upd.status !== 0) {
     err(`claude plugin update failed (exit ${upd.status == null ? "?" : upd.status})`);
     return 1;
@@ -5053,14 +5060,14 @@ function installClaude(scope, dryRun) {
     err(`meanwhile, load spor without a marketplace per session:  claude --plugin-dir ${ROOT}`);
     return 1;
   }
-  const add = spawnSync(cmd, addArgs, { encoding: "utf8" });
+  const add = spawnPortableSync(cmd, addArgs, { encoding: "utf8" });
   if (add.status !== 0 && !/already|exists|known/i.test((add.stderr || "") + (add.stdout || ""))) {
     err(`claude plugin marketplace add failed: ${(add.stderr || add.stdout || "").trim() || "unknown error"}`);
     return 1;
   }
   const existing = claudePluginInfo();
   if (existing) return refreshClaudePlugin(cmd, cliScope, existing);
-  const inst = spawnSync(cmd, instArgs, { stdio: "inherit" });
+  const inst = spawnPortableSync(cmd, instArgs, { stdio: "inherit" });
   if (inst.status !== 0) {
     err(`claude plugin install failed (exit ${inst.status == null ? "?" : inst.status})`);
     return 1;
@@ -5105,11 +5112,12 @@ function installPluginHost(spec, scope, dryRun) {
   try {
     fs.symlinkSync(src, target);
   } catch {
-    fs.copyFileSync(src, target);
+    const rendered = fs.readFileSync(src, "utf8").split("__SPOR_ROOT__").join(ROOT);
+    fs.writeFileSync(target, rendered);
     how = "copied";
   }
   out(`installed spor for ${spec.label} → ${target}  (${how}, scope: ${scope})`);
-  if (how === "copied") out(`  note: copied (no symlink here) — export SPOR_ROOT=${ROOT} so the plugin finds its core.`);
+  if (how === "copied") out(`  note: copied (no symlink here) — embedded SPOR_ROOT=${ROOT}.`);
   return 0;
 }
 
@@ -5223,7 +5231,7 @@ function upgradeClaude(scope, dryRun) {
   }
   // Re-register the marketplace source first, tolerating "already exists", so a
   // moved checkout repoints before the update re-reads it.
-  const add = spawnSync(cmd, mpAdd, { encoding: "utf8" });
+  const add = spawnPortableSync(cmd, mpAdd, { encoding: "utf8" });
   if (add.status !== 0 && !/already|exists|known/i.test((add.stderr || "") + (add.stdout || ""))) {
     err(`claude plugin marketplace add failed: ${(add.stderr || add.stdout || "").trim() || "unknown error"}`);
     return 1;
@@ -6487,7 +6495,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   }
 
   claudeArgs.push(prompt);
-  const r = spawnSync(claudeBin, claudeArgs, { cwd: launchDir, stdio: "inherit" });
+  const r = spawnPortableSync(claudeBin, claudeArgs, { cwd: launchDir, stdio: "inherit" });
   if (r.error) {
     err(`could not launch ${claudeBin}: ${r.error.message}`);
     return 1;

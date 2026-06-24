@@ -2,7 +2,7 @@
 
 Codex's hooks are a near-clone of Claude Code's (same JSON-over-stdin payload
 fields, same `hookSpecificOutput.additionalContext` envelope), so this adapter
-is just a manifest over `bin/spor-hook`.
+is just a manifest over `bin/spor-hook.js`.
 
 ## Install
 

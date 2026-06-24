@@ -18,7 +18,6 @@ const http = require("node:http");
 const { spawn } = require("node:child_process");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
-const isWin = process.platform === "win32";
 
 // Env with no SPOR_*/SUBSTRATE_* leakage (a configured dev box must not flip the
 // mode or leak a token), config homes isolated to a temp dir. Mirrors
@@ -80,7 +79,7 @@ const TICKET_BODY = {
 
 // --- remote mode ------------------------------------------------------------
 
-test("share (remote) POSTs /v1/lens/{id}/ticket and renders the link", { skip: isWin }, async () => {
+test("share (remote) POSTs /v1/lens/{id}/ticket and renders the link", async () => {
   const { srv, hits, base } = await ticketStub({ body: TICKET_BODY });
   try {
     const r = await runAsync(["share", "lens-roadmap"], remoteEnv(base));
@@ -98,7 +97,7 @@ test("share (remote) POSTs /v1/lens/{id}/ticket and renders the link", { skip: i
   }
 });
 
-test("share (remote) --expires rides the body verbatim (server validates)", { skip: isWin }, async () => {
+test("share (remote) --expires rides the body verbatim (server validates)", async () => {
   const { srv, hits, base } = await ticketStub({ body: TICKET_BODY });
   try {
     const r = await runAsync(["share", "lens-roadmap", "--expires", "14d"], remoteEnv(base));
@@ -110,7 +109,7 @@ test("share (remote) --expires rides the body verbatim (server validates)", { sk
   }
 });
 
-test("share (remote) --json passes the envelope through verbatim", { skip: isWin }, async () => {
+test("share (remote) --json passes the envelope through verbatim", async () => {
   const { srv, base } = await ticketStub({ body: TICKET_BODY });
   try {
     const r = await runAsync(["share", "lens-roadmap", "--json"], remoteEnv(base));
@@ -121,7 +120,7 @@ test("share (remote) --json passes the envelope through verbatim", { skip: isWin
   }
 });
 
-test("share (remote) url-encodes the lens id in the path", { skip: isWin }, async () => {
+test("share (remote) url-encodes the lens id in the path", async () => {
   const { srv, hits, base } = await ticketStub({ body: TICKET_BODY });
   try {
     const r = await runAsync(["share", "workspace q3"], remoteEnv(base));
@@ -133,7 +132,7 @@ test("share (remote) url-encodes the lens id in the path", { skip: isWin }, asyn
   }
 });
 
-test("share (remote) a 404 names the missing lens, exit 1", { skip: isWin }, async () => {
+test("share (remote) a 404 names the missing lens, exit 1", async () => {
   const { srv, base } = await ticketStub({ status: 404 });
   try {
     const r = await runAsync(["share", "lens-bogus"], remoteEnv(base));
@@ -145,7 +144,7 @@ test("share (remote) a 404 names the missing lens, exit 1", { skip: isWin }, asy
   }
 });
 
-test("share (remote) a 422 no_person surfaces the why plus a person-binding hint, exit 1", { skip: isWin }, async () => {
+test("share (remote) a 422 no_person surfaces the why plus a person-binding hint, exit 1", async () => {
   const { srv, base } = await ticketStub({ status: 422 });
   try {
     const r = await runAsync(["share", "lens-roadmap"], remoteEnv(base));
@@ -158,7 +157,7 @@ test("share (remote) a 422 no_person surfaces the why plus a person-binding hint
   }
 });
 
-test("share (remote) a non-no_person 422 (bad expires) surfaces the why WITHOUT the person hint", { skip: isWin }, async () => {
+test("share (remote) a non-no_person 422 (bad expires) surfaces the why WITHOUT the person hint", async () => {
   const errBody = { error: { code: "invalid_expires", message: "expires exceeds the 30d maximum" } };
   const { srv, base } = await ticketStub({ status: 422, errBody });
   try {
@@ -171,7 +170,7 @@ test("share (remote) a non-no_person 422 (bad expires) surfaces the why WITHOUT 
   }
 });
 
-test("share (remote) a non-200 surfaces the server's message, exit 1", { skip: isWin }, async () => {
+test("share (remote) a non-200 surfaces the server's message, exit 1", async () => {
   const { srv, base } = await ticketStub({ status: 500 });
   try {
     const r = await runAsync(["share", "lens-roadmap"], remoteEnv(base));
@@ -182,7 +181,7 @@ test("share (remote) a non-200 surfaces the server's message, exit 1", { skip: i
   }
 });
 
-test("share (remote) a dead server fails soft with an offline line, no stack", { skip: isWin }, async () => {
+test("share (remote) a dead server fails soft with an offline line, no stack", async () => {
   const r = await runAsync(["share", "lens-roadmap"], remoteEnv("http://127.0.0.1:1"));
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /offline/);
@@ -191,20 +190,20 @@ test("share (remote) a dead server fails soft with an offline line, no stack", {
 
 // --- local mode + usage -----------------------------------------------------
 
-test("share (local) redirects to remote mode, no request, exit 0", { skip: isWin }, async () => {
+test("share (local) redirects to remote mode, no request, exit 0", async () => {
   const r = await runAsync(["share", "lens-roadmap"], bare({ SPOR_HOME: ISO_HOME }));
   assert.strictEqual(r.status, 0, r.stderr);
   assert.match(r.stdout, /sharing needs a team graph/);
   assert.doesNotMatch(r.stderr, /at Object|Error:/);
 });
 
-test("share with no lens id prints usage, exit 1", { skip: isWin }, async () => {
+test("share with no lens id prints usage, exit 1", async () => {
   const r = await runAsync(["share"], remoteEnv("http://127.0.0.1:1"));
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /usage: spor share <lens-id> \[--expires <Nd>\]/);
 });
 
-test("share --help prints the command page without dispatching", { skip: isWin }, async () => {
+test("share --help prints the command page without dispatching", async () => {
   const r = await runAsync(["share", "--help"], bare({ SPOR_HOME: ISO_HOME }));
   assert.strictEqual(r.status, 0, r.stderr);
   assert.match(r.stdout, /spor share/);

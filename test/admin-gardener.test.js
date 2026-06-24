@@ -18,7 +18,6 @@ const http = require("node:http");
 const { spawn } = require("node:child_process");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
-const isWin = process.platform === "win32";
 
 // Env with no SPOR_*/SUBSTRATE_* leakage (a configured dev box must not flip the
 // mode or leak a token), config homes isolated to a temp dir. Mirrors
@@ -77,7 +76,7 @@ const SWEEP_BODY = {
 
 // --- remote mode ------------------------------------------------------------
 
-test("admin gardener (remote) POSTs /v1/gardener and renders the sweep summary", { skip: isWin }, async () => {
+test("admin gardener (remote) POSTs /v1/gardener and renders the sweep summary", async () => {
   const { srv, hits, base } = await gardenerStub({ body: SWEEP_BODY });
   try {
     const r = await runAsync(["admin", "gardener"], remoteEnv(base));
@@ -95,7 +94,7 @@ test("admin gardener (remote) POSTs /v1/gardener and renders the sweep summary",
   }
 });
 
-test("admin gardener (remote) --json passes the envelope through verbatim", { skip: isWin }, async () => {
+test("admin gardener (remote) --json passes the envelope through verbatim", async () => {
   const { srv, base } = await gardenerStub({ body: SWEEP_BODY });
   try {
     const r = await runAsync(["admin", "gardener", "--json"], remoteEnv(base));
@@ -106,7 +105,7 @@ test("admin gardener (remote) --json passes the envelope through verbatim", { sk
   }
 });
 
-test("admin gardener (remote) a quiet sweep says so, no id lines", { skip: isWin }, async () => {
+test("admin gardener (remote) a quiet sweep says so, no id lines", async () => {
   const quiet = { checked: 1, filed: [], resolved: [], skipped: [] };
   const { srv, base } = await gardenerStub({ body: quiet });
   try {
@@ -120,7 +119,7 @@ test("admin gardener (remote) a quiet sweep says so, no id lines", { skip: isWin
   }
 });
 
-test("admin gardener (remote) surfaces a REJECTED finding on stderr but still exits 0", { skip: isWin }, async () => {
+test("admin gardener (remote) surfaces a REJECTED finding on stderr but still exits 0", async () => {
   const body = { checked: 3, filed: [], resolved: [], skipped: ["find-cold-work-task-q (REJECTED: bad edge)"] };
   const { srv, base } = await gardenerStub({ body });
   try {
@@ -132,7 +131,7 @@ test("admin gardener (remote) surfaces a REJECTED finding on stderr but still ex
   }
 });
 
-test("admin gardener (remote) a 403 explains the admin gate, exit 1", { skip: isWin }, async () => {
+test("admin gardener (remote) a 403 explains the admin gate, exit 1", async () => {
   const { srv, base } = await gardenerStub({ status: 403 });
   try {
     const r = await runAsync(["admin", "gardener"], remoteEnv(base));
@@ -144,7 +143,7 @@ test("admin gardener (remote) a 403 explains the admin gate, exit 1", { skip: is
   }
 });
 
-test("admin gardener (remote) a non-200 surfaces the server's message, exit 1", { skip: isWin }, async () => {
+test("admin gardener (remote) a non-200 surfaces the server's message, exit 1", async () => {
   const { srv, base } = await gardenerStub({ status: 500 });
   try {
     const r = await runAsync(["admin", "gardener"], remoteEnv(base));
@@ -155,7 +154,7 @@ test("admin gardener (remote) a non-200 surfaces the server's message, exit 1", 
   }
 });
 
-test("admin gardener (remote) a dead server fails soft with an offline line, no stack", { skip: isWin }, async () => {
+test("admin gardener (remote) a dead server fails soft with an offline line, no stack", async () => {
   const r = await runAsync(["admin", "gardener"], remoteEnv("http://127.0.0.1:1"));
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /offline/);
@@ -164,27 +163,27 @@ test("admin gardener (remote) a dead server fails soft with an offline line, no 
 
 // --- local mode + usage -----------------------------------------------------
 
-test("admin gardener (local) redirects to remote mode, no request, exit 1", { skip: isWin }, async () => {
+test("admin gardener (local) redirects to remote mode, no request, exit 1", async () => {
   const r = await runAsync(["admin", "gardener"], bare({ SPOR_HOME: ISO_HOME }));
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /admin gardener needs a team graph \(remote mode\)/);
   assert.doesNotMatch(r.stderr, /at Object|Error:/);
 });
 
-test("admin with no sub-command prints usage, exit 1", { skip: isWin }, async () => {
+test("admin with no sub-command prints usage, exit 1", async () => {
   const r = await runAsync(["admin"], remoteEnv("http://127.0.0.1:1"));
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /usage: spor admin gardener \[--json\]/);
 });
 
-test("admin with an unknown sub-command names it and prints usage, exit 1", { skip: isWin }, async () => {
+test("admin with an unknown sub-command names it and prints usage, exit 1", async () => {
   const r = await runAsync(["admin", "bogus"], remoteEnv("http://127.0.0.1:1"));
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /unknown sub-command 'bogus'/);
   assert.match(r.stderr, /usage: spor admin gardener/);
 });
 
-test("admin --help prints the command page without dispatching", { skip: isWin }, async () => {
+test("admin --help prints the command page without dispatching", async () => {
   const r = await runAsync(["admin", "--help"], bare({ SPOR_HOME: ISO_HOME }));
   assert.strictEqual(r.status, 0, r.stderr);
   assert.match(r.stdout, /spor admin gardener/);

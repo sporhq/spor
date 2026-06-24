@@ -8,13 +8,13 @@
 // and edits target a `.js` file so the LLM capture nudge never fires.
 const test = require('node:test');
 const assert = require('node:assert');
-const { spawn, spawnSync } = require('node:child_process');
+const { spawnSync } = require('node:child_process');
 const http = require('node:http');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnHook } = require('./helpers/portable');
 
-const BIN = path.join(__dirname, '..', 'bin', 'spor-hook');
 const AGENT = 'agent-test-shark';
 
 function freshEnv(home, extra = {}) {
@@ -84,11 +84,10 @@ function stubServer(status = 200) {
 function runAsync(args, input, env) {
   return new Promise((resolve, reject) => {
     let out = '';
-    const c = spawn('bash', [BIN, ...args], { env, stdio: ['pipe', 'pipe', 'ignore'] });
+    const c = spawnHook(args, input, env, { stdio: ['pipe', 'pipe', 'ignore'] });
     c.stdout.on('data', (d) => (out += d));
     c.on('error', reject);
     c.on('close', (code) => (code === 0 ? resolve(out) : reject(new Error(`exit ${code}`))));
-    c.stdin.end(input);
   });
 }
 

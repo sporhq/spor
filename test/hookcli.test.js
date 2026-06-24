@@ -11,8 +11,8 @@ const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { runHook, spawnHook, writeNodeScript, nodeCommand } = require('./helpers/portable');
 
-const BIN = path.join(__dirname, '..', 'bin', 'spor-hook');
 const LEGACY_BIN = path.join(__dirname, '..', 'bin', 'substrate-hook');
 
 function freshEnv(home) {
@@ -39,7 +39,7 @@ function scratch() {
 }
 
 function run(args, input, env) {
-  const r = spawnSync('bash', [BIN, ...args], { input, env, encoding: 'utf8' });
+  const r = runHook(args, input, env);
   assert.strictEqual(r.status, 0, `exit 0 expected (fail-open): ${r.stderr}`);
   return r.stdout;
 }
@@ -410,12 +410,16 @@ Body of the stub decision.
 `;
 
 function makeStub(root) {
-  const stub = path.join(root, 'stub-distill.sh');
+  const stub = path.join(root, 'stub-distill.js');
   const resp = path.join(root, 'stub-response.txt');
   fs.writeFileSync(resp, STUB_RESPONSE);
-  fs.writeFileSync(stub, `#!/bin/sh\ncat > /dev/null\ncat "${resp}"\n`);
-  fs.chmodSync(stub, 0o755);
-  return stub;
+  writeNodeScript(stub, `
+process.stdin.resume();
+process.stdin.on("end", () => {
+  process.stdout.write(require("node:fs").readFileSync(${JSON.stringify(resp)}, "utf8"));
+});
+`);
+  return nodeCommand(stub);
 }
 
 function words(n, w) {
@@ -486,17 +490,21 @@ test('distill (remote): stamps a deterministic hash(session, fact) idempotency k
   // dedup), and the oracle below (sha256 of the *sent* text) catches any such
   // divergence for free.
   const factText = 'A durable fact the session produced. ' + words(700, 'detail');
-  const stub = path.join(root, 'stub-fact.sh');
+  const stub = path.join(root, 'stub-fact.js');
   const resp = path.join(root, 'fact-response.txt');
   fs.writeFileSync(resp, `===FACT===\n${factText}\n===END===\n`);
-  fs.writeFileSync(stub, `#!/bin/sh\ncat > /dev/null\ncat "${resp}"\n`);
-  fs.chmodSync(stub, 0o755);
+  writeNodeScript(stub, `
+process.stdin.resume();
+process.stdin.on("end", () => {
+  process.stdout.write(require("node:fs").readFileSync(${JSON.stringify(resp)}, "utf8"));
+});
+`);
   const { srv, hits, base } = await stubServer();
   try {
     const env = freshEnv(home);
     env.SPOR_SERVER = base;
     env.SPOR_TOKEN = 'spor_pat_test';
-    env.SPOR_DISTILL_CMD = stub;
+    env.SPOR_DISTILL_CMD = nodeCommand(stub);
     await runAsync(
       ['distill', '--host', 'claude-code'],
       JSON.stringify({ cwd, session_id: 'sess-det', transcript_path: transcript, hook_event_name: 'SessionEnd' }),
@@ -732,12 +740,10 @@ function stubServer() {
 // async spawn — spawnSync would block the event loop and starve the stub
 // server while the hook's curl waits on it.
 function runAsync(args, input, env) {
-  const { spawn } = require('node:child_process');
   return new Promise((resolve, reject) => {
-    const c = spawn('bash', [BIN, ...args], { env, stdio: ['pipe', 'ignore', 'ignore'] });
+    const c = spawnHook(args, input, env, { stdio: ['pipe', 'ignore', 'ignore'] });
     c.on('error', reject);
     c.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`exit ${code}`))));
-    c.stdin.end(input);
   });
 }
 
@@ -984,13 +990,11 @@ test('session-start: a transport failure (000/dead port) still says OFFLINE, not
 
 // async spawn that captures stdout (runAsync above discards it).
 function runAsync2(args, input, env, onData) {
-  const { spawn } = require('node:child_process');
   return new Promise((resolve, reject) => {
-    const c = spawn('bash', [BIN, ...args], { env, stdio: ['pipe', 'pipe', 'ignore'] });
+    const c = spawnHook(args, input, env, { stdio: ['pipe', 'pipe', 'ignore'] });
     c.stdout.on('data', (d) => onData(String(d)));
     c.on('error', reject);
     c.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`exit ${code}`))));
-    c.stdin.end(input);
   });
 }
 
@@ -1052,7 +1056,7 @@ test('rename: SPOR_HOME wins over a stale SUBSTRATE_HOME', () => {
   assert.match(JSON.parse(out).hookSpecificOutput.additionalContext, /brief-projx v3/);
 });
 
-test('rename: the substrate-hook stub still dispatches (back-compat window)', () => {
+test('rename: the substrate-hook stub still dispatches (back-compat window)', { skip: process.platform === 'win32' }, () => {
   const { home, cwd } = scratch();
   fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
   const r = spawnSync('bash', [LEGACY_BIN, 'session-start', '--host', 'claude-code'], {

@@ -18,7 +18,6 @@ const http = require("node:http");
 const { spawnSync, spawn } = require("node:child_process");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
-const isWin = process.platform === "win32";
 
 // Env with no SPOR_*/SUBSTRATE_* leakage (a configured dev box must not flip a
 // local-mode test to remote or leak a token), config homes isolated to a temp
@@ -205,7 +204,7 @@ function commitsStub(matches = []) {
 const remoteEnv = (base, extra = {}) =>
   bare({ SPOR_HOME: ISO_HOME, SPOR_SERVER: base, SPOR_TOKEN: "test-token", ...extra });
 
-test("blame (remote) GETs /v1/commits/<sha> and renders the matches", { skip: isWin }, async () => {
+test("blame (remote) GETs /v1/commits/<sha> and renders the matches", async () => {
   const { srv, hits, base } = await commitsStub([
     { repo: "spor", sha: "b384469abc1234", id: "art-x", type: "artifact", title: "Shipped X", summary: "s", status: null, project: "spor" },
   ]);
@@ -222,7 +221,7 @@ test("blame (remote) GETs /v1/commits/<sha> and renders the matches", { skip: is
   }
 });
 
-test("blame (remote) forwards --repo as ?repo= and emits mode-symmetric --json", { skip: isWin }, async () => {
+test("blame (remote) forwards --repo as ?repo= and emits mode-symmetric --json", async () => {
   const { srv, hits, base } = await commitsStub([
     { repo: "spor", sha: "b384469abc1234", id: "art-x", type: "artifact", title: "Shipped X", summary: "s", status: null, project: "spor" },
     { repo: "api", sha: "b384469abc1234", id: "task-z", type: "task", title: "API task", summary: "s", status: "open", project: "api" },
@@ -241,7 +240,7 @@ test("blame (remote) forwards --repo as ?repo= and emits mode-symmetric --json",
   }
 });
 
-test("blame (remote) an unlinked commit is a valid empty result (exit 0)", { skip: isWin }, async () => {
+test("blame (remote) an unlinked commit is a valid empty result (exit 0)", async () => {
   const { srv, base } = await commitsStub([]);
   try {
     const r = await runAsync(["blame", "0badf00d"], remoteEnv(base));
@@ -252,14 +251,14 @@ test("blame (remote) an unlinked commit is a valid empty result (exit 0)", { ski
   }
 });
 
-test("blame (remote) a dead server fails soft with a transport line, no stack", { skip: isWin }, async () => {
+test("blame (remote) a dead server fails soft with a transport line, no stack", async () => {
   const r = await runAsync(["blame", "b384469"], remoteEnv("http://127.0.0.1:1"));
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /offline/);
   assert.doesNotMatch(r.stderr, /at Object|Error:/);
 });
 
-test("blame (remote) validates the sha client-side before any request", { skip: isWin }, async () => {
+test("blame (remote) validates the sha client-side before any request", async () => {
   const { srv, hits, base } = await commitsStub([]);
   try {
     const r = await runAsync(["blame", "nothex"], remoteEnv(base));

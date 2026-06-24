@@ -21,7 +21,6 @@ const { execFileSync, spawn } = require("node:child_process");
 
 const changesLib = require("../lib/changes.js");
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
-const isWin = process.platform === "win32";
 
 // ---------- scratch git graph ----------
 
@@ -242,7 +241,7 @@ function changesStub({ status = 200, body } = {}) {
 const remoteEnv = (home, base, extra = {}) =>
   baseEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: "test-token", ...extra });
 
-test("changes (remote): GETs /v1/changes with since/project/limit and renders the feed", { skip: isWin }, async () => {
+test("changes (remote): GETs /v1/changes with since/project/limit and renders the feed", async () => {
   const body = {
     changes: [{ id: "task-a", change: "M", commit: "deadbeefcafe", date: "2026-06-21T11:00:00+00:00", committed_by: "Ann <a@x>", type: "task", title: "A task", authored_via: "capture", author: "Ann <a@x>" }],
     count: 1, head: "deadbeefcafe", since: "a1b2c3d", project: "spor", node_ids: ["task-a"],
@@ -263,7 +262,7 @@ test("changes (remote): GETs /v1/changes with since/project/limit and renders th
   } finally { srv.close(); }
 });
 
-test("changes (remote): --json passes the server envelope through verbatim", { skip: isWin }, async () => {
+test("changes (remote): --json passes the server envelope through verbatim", async () => {
   const body = { changes: [{ id: "task-a", change: "A" }], count: 1, head: "abc", since: null, project: null, node_ids: ["task-a"] };
   const { srv, base } = await changesStub({ body });
   try {
@@ -275,7 +274,7 @@ test("changes (remote): --json passes the server envelope through verbatim", { s
   } finally { srv.close(); }
 });
 
-test("changes (remote): a 422 (unresolvable --since) reports a clear line, not an outage", { skip: isWin }, async () => {
+test("changes (remote): a 422 (unresolvable --since) reports a clear line, not an outage", async () => {
   const { srv, base } = await changesStub({ status: 422 });
   try {
     const r = await runAsync(["changes", "--since", "zzzzzzz"], remoteEnv(freshHome(), base));
@@ -285,7 +284,7 @@ test("changes (remote): a 422 (unresolvable --since) reports a clear line, not a
   } finally { srv.close(); }
 });
 
-test("changes (remote): a dead server fails soft with an offline line", { skip: isWin }, async () => {
+test("changes (remote): a dead server fails soft with an offline line", async () => {
   const r = await runAsync(["changes"], remoteEnv(freshHome(), "http://127.0.0.1:1"));
   assert.equal(r.status, 1);
   assert.match(r.stderr, /offline — could not reach server/);
@@ -293,7 +292,7 @@ test("changes (remote): a dead server fails soft with an offline line", { skip: 
 
 // ---------- CLI: local arm ----------
 
-test("changes (local): renders the git-log feed over --nodes", { skip: isWin }, async () => {
+test("changes (local): renders the git-log feed over --nodes", async () => {
   const home = initGraph();
   writeNode(home, "task-a", "task", "authored_via: capture\n");
   commit(home, "2026-06-21T09:00:00Z", "c1");
@@ -303,7 +302,7 @@ test("changes (local): renders the git-log feed over --nodes", { skip: isWin }, 
   assert.match(r.stdout, /added {7}task-a/);
 });
 
-test("changes (local): --project resolves scope via the graph and filters the feed", { skip: isWin }, async () => {
+test("changes (local): --project resolves scope via the graph and filters the feed", async () => {
   // The CLI loads the graph and builds the grouping-resolved keep() predicate
   // (scopeFor/resolveProject) — the SAME resolution `next`/`analytics` use. With
   // no repo/grouping nodes, scopeFor falls to the slug itself, so the feed scopes
@@ -320,7 +319,7 @@ test("changes (local): --project resolves scope via the graph and filters the fe
   assert.doesNotMatch(r.stdout, /task-b/);
 });
 
-test("changes (local): a bad --since sha exits 1 with a clear message", { skip: isWin }, async () => {
+test("changes (local): a bad --since sha exits 1 with a clear message", async () => {
   const home = initGraph();
   writeNode(home, "task-a", "task");
   commit(home, "2026-06-21T09:00:00Z", "c1");

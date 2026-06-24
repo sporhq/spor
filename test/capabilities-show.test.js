@@ -19,7 +19,6 @@ const http = require("node:http");
 const { spawn } = require("node:child_process");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
-const isWin = process.platform === "win32";
 
 // Strip ambient SPOR_*/SUBSTRATE_* so a configured dev box can't flip a test to
 // remote or leak a token (mirrors capabilities-hosts.test.js / dispatch.test.js).
@@ -74,14 +73,14 @@ function showStub({ status = 200, body } = {}) {
 const remoteEnv = (home, base, extra = {}) =>
   baseEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: "test-token", ...extra });
 
-test("show (local mode): refuses remote-only with a clear line", { skip: isWin }, async () => {
+test("show (local mode): refuses remote-only with a clear line", async () => {
   const home = freshHome();
   const r = await runAsync(["capabilities", "show", "agent-bob"], baseEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home }));
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /remote-only/);
 });
 
-test("show (no agent id): falls through to THIS box's local effective caps", { skip: isWin }, async () => {
+test("show (no agent id): falls through to THIS box's local effective caps", async () => {
   // `show`/`list` with no agent id stay the local-box read (byte-identical),
   // working even in local mode — the agent read is the only remote branch.
   const home = freshHome();
@@ -93,7 +92,7 @@ test("show (no agent id): falls through to THIS box's local effective caps", { s
   }
 });
 
-test("show (remote): renders an agent's published caps + timestamps and GETs the right path", { skip: isWin }, async () => {
+test("show (remote): renders an agent's published caps + timestamps and GETs the right path", async () => {
   const { srv, hits, base } = await showStub({
     body: {
       agent: "agent-bob-laptop",
@@ -123,7 +122,7 @@ test("show (remote): renders an agent's published caps + timestamps and GETs the
   }
 });
 
-test("show (remote): --json emits the parsed record", { skip: isWin }, async () => {
+test("show (remote): --json emits the parsed record", async () => {
   const body = { agent: "agent-bob", capabilities: { harnesses: ["codex"] }, published_at: "2026-06-20T00:00:00.000Z", last_seen: "2026-06-20T00:00:00.000Z", published_by: "person-bob" };
   const { srv, base } = await showStub({ body });
   try {
@@ -138,7 +137,7 @@ test("show (remote): --json emits the parsed record", { skip: isWin }, async () 
   }
 });
 
-test("show (remote): `me` resolves to this box's dispatch.agent", { skip: isWin }, async () => {
+test("show (remote): `me` resolves to this box's dispatch.agent", async () => {
   const { srv, hits, base } = await showStub({ body: { agent: "agent-mine", capabilities: {}, published_at: "2026-06-20T00:00:00.000Z" } });
   try {
     const r = await runAsync(["capabilities", "show", "me"], remoteEnv(homeWithAgent("agent-mine"), base));
@@ -150,7 +149,7 @@ test("show (remote): `me` resolves to this box's dispatch.agent", { skip: isWin 
   }
 });
 
-test("show (remote): `me` with no dispatch.agent configured errors with a pointer", { skip: isWin }, async () => {
+test("show (remote): `me` with no dispatch.agent configured errors with a pointer", async () => {
   const { srv, base } = await showStub();
   try {
     const r = await runAsync(["capabilities", "show", "me"], remoteEnv(freshHome(), base));
@@ -162,7 +161,7 @@ test("show (remote): `me` with no dispatch.agent configured errors with a pointe
   }
 });
 
-test("show (remote): a 404 (no caps published / unknown agent) fails soft", { skip: isWin }, async () => {
+test("show (remote): a 404 (no caps published / unknown agent) fails soft", async () => {
   const { srv, base } = await showStub({ status: 404 });
   try {
     const r = await runAsync(["capabilities", "show", "agent-nope"], remoteEnv(freshHome(), base));
@@ -173,7 +172,7 @@ test("show (remote): a 404 (no caps published / unknown agent) fails soft", { sk
   }
 });
 
-test("show (remote): a 403 reports an authorization denial, not a transport outage", { skip: isWin }, async () => {
+test("show (remote): a 403 reports an authorization denial, not a transport outage", async () => {
   // Readable only by the owner / the agent / an admin (API.md §3); a denial must
   // NOT be misreported as an outage (mirrors issue-spor-capabilities-hosts-403-misreported).
   const { srv, base } = await showStub({ status: 403 });
@@ -188,7 +187,7 @@ test("show (remote): a 403 reports an authorization denial, not a transport outa
   }
 });
 
-test("show (remote): a dead server fails soft with a transport line", { skip: isWin }, async () => {
+test("show (remote): a dead server fails soft with a transport line", async () => {
   const r = await runAsync(["capabilities", "show", "agent-bob"], remoteEnv(freshHome(), "http://127.0.0.1:1"));
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /could not reach the fleet scheduler/);

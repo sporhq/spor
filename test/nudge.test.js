@@ -6,12 +6,10 @@
 require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require('node:test');
 const assert = require('node:assert');
-const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-
-const BIN = path.join(__dirname, '..', 'bin', 'spor-hook');
+const { runHook, writeNodeScript, nodeCommand } = require('./helpers/portable');
 
 // 60+ words of finding-shaped prose so the word gate passes.
 const PROSE = Array.from({ length: 8 }, (_, i) =>
@@ -19,9 +17,8 @@ const PROSE = Array.from({ length: 8 }, (_, i) =>
   `proxy already retries idempotent calls twice, so a client retry tripled load.`
 ).join('\n');
 
-const FACT_STUB =
-  'cat >/dev/null; printf "===FACT===\\nThe retry-path approach was dismissed because the proxy already retries idempotent calls.\\n===END===\\n"';
-const NOTHING_STUB = 'cat >/dev/null; echo NOTHING';
+const FACT_RESPONSE =
+  '===FACT===\nThe retry-path approach was dismissed because the proxy already retries idempotent calls.\n===END===\n';
 
 function scratch() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'substrate-nudge-'));
@@ -30,6 +27,38 @@ function scratch() {
   const cwd = path.join(root, 'projx');
   fs.mkdirSync(cwd);
   return { root, home, cwd };
+}
+
+function backend(root, name, body) {
+  return nodeCommand(writeNodeScript(path.join(root, name), body));
+}
+
+function factStub(root) {
+  return backend(root, 'fact-backend.js', `
+process.stdin.resume();
+process.stdin.on("end", () => process.stdout.write(${JSON.stringify(FACT_RESPONSE)}));
+`);
+}
+
+function nothingStub(root) {
+  return backend(root, 'nothing-backend.js', `
+process.stdin.resume();
+process.stdin.on("end", () => process.stdout.write("NOTHING\\n"));
+`);
+}
+
+function failingStub(root) {
+  return backend(root, 'failing-backend.js', `
+process.stdin.resume();
+process.stdin.on("end", () => process.exit(7));
+`);
+}
+
+function hangingStub(root) {
+  return backend(root, 'hanging-backend.js', `
+process.stdin.resume();
+setTimeout(() => process.stdout.write("NOTHING\\n"), 5000);
+`);
 }
 
 function env(home, stub, extra = {}) {
@@ -61,11 +90,7 @@ function postTool(home, cwd, stub, { file, content, session = 's1', tool = 'Writ
       ? { file_path: file, new_string: content }
       : { file_path: file, content },
   };
-  const r = spawnSync('bash', [BIN, 'post-tool', '--host', 'claude-code'], {
-    input: JSON.stringify(payload),
-    env: env(home, stub, extraEnv),
-    encoding: 'utf8',
-  });
+  const r = runHook(['post-tool', '--host', 'claude-code'], JSON.stringify(payload), env(home, stub, extraEnv));
   assert.strictEqual(r.status, 0, `exit 0 expected (fail-open): ${r.stderr}`);
   return r.stdout;
 }
@@ -85,9 +110,9 @@ function llmCalls(home) {
 }
 
 test('prose .md write outside the graph fires a nudge with the extracted fact', () => {
-  const { home, cwd } = scratch();
+  const { root, home, cwd } = scratch();
   const file = path.join(cwd, 'reports', 'findings.md');
-  const out = postTool(home, cwd, FACT_STUB, { file, content: PROSE });
+  const out = postTool(home, cwd, factStub(root), { file, content: PROSE });
   const json = JSON.parse(out);
   assert.strictEqual(json.hookSpecificOutput.hookEventName, 'PostToolUse');
   const ctx = json.hookSpecificOutput.additionalContext;
@@ -109,8 +134,8 @@ test('prose .md write outside the graph fires a nudge with the extracted fact', 
 });
 
 test('NOTHING response nudges nothing but still records the llm call', () => {
-  const { home, cwd } = scratch();
-  const out = postTool(home, cwd, NOTHING_STUB, {
+  const { root, home, cwd } = scratch();
+  const out = postTool(home, cwd, nothingStub(root), {
     file: path.join(cwd, 'notes.md'),
     content: PROSE,
   });
@@ -122,18 +147,18 @@ test('NOTHING response nudges nothing but still records the llm call', () => {
 });
 
 test('cooldown: a file is classified at most once per session', () => {
-  const { home, cwd } = scratch();
+  const { root, home, cwd } = scratch();
   const file = path.join(cwd, 'doc.md');
-  postTool(home, cwd, FACT_STUB, { file, content: PROSE });
-  const again = postTool(home, cwd, FACT_STUB, { file, content: PROSE });
+  postTool(home, cwd, factStub(root), { file, content: PROSE });
+  const again = postTool(home, cwd, factStub(root), { file, content: PROSE });
   assert.strictEqual(again.trim(), '');
   assert.strictEqual(llmCalls(home).length, 1); // second write never reached the classifier
 });
 
 test('cap: after 3 fired nudges the classifier stops for the session', () => {
-  const { home, cwd } = scratch();
+  const { root, home, cwd } = scratch();
   for (let i = 0; i < 4; i++) {
-    postTool(home, cwd, FACT_STUB, { file: path.join(cwd, `doc${i}.md`), content: PROSE });
+    postTool(home, cwd, factStub(root), { file: path.join(cwd, `doc${i}.md`), content: PROSE });
   }
   assert.strictEqual(llmCalls(home).length, 3);
   assert.strictEqual(journal(home).filter((e) => e.tool === 'nudge').length, 3);
@@ -144,9 +169,9 @@ test('total cap: SPOR_NUDGE_MAX bounds classifier calls even when none fire', ()
   // The fired cap (≥3) never trips because nothing fires, so the total-call cap
   // is what bounds spend (task-cc-spor-nudge-productization). With the cap at 2,
   // only the first 2 files reach the classifier; the 3rd is short-circuited.
-  const { home, cwd } = scratch();
+  const { root, home, cwd } = scratch();
   for (let i = 0; i < 3; i++) {
-    postTool(home, cwd, NOTHING_STUB, {
+    postTool(home, cwd, nothingStub(root), {
       file: path.join(cwd, `note${i}.md`),
       content: PROSE,
       extraEnv: { SPOR_NUDGE_MAX: '2' },
@@ -161,8 +186,8 @@ test('timeout: a hung backend is killed and fails open', () => {
   // loop. The stub sleeps well past the 400ms cap; spawnSync SIGKILLs it, the
   // backend returns null, and the nudge fails open (no output, error journaled,
   // file parked in cooldown so there's no retry storm).
-  const { home, cwd } = scratch();
-  const out = postTool(home, cwd, 'cat >/dev/null; sleep 5; echo NOTHING', {
+  const { root, home, cwd } = scratch();
+  const out = postTool(home, cwd, hangingStub(root), {
     file: path.join(cwd, 'doc.md'),
     content: PROSE,
     extraEnv: { SPOR_NUDGE_TIMEOUT: '400' },
@@ -175,7 +200,7 @@ test('timeout: a hung backend is killed and fails open', () => {
 });
 
 test('prefilter: non-md, graph-home, /nodes/, instruction files, and short prose are skipped', () => {
-  const { home, cwd } = scratch();
+  const { root, home, cwd } = scratch();
   const cases = [
     { file: path.join(cwd, 'app.js'), content: PROSE },
     { file: path.join(home, 'cache.md'), content: PROSE },            // under SUBSTRATE_HOME
@@ -184,7 +209,7 @@ test('prefilter: non-md, graph-home, /nodes/, instruction files, and short prose
     { file: path.join(cwd, 'tiny.md'), content: 'too few words here' },
   ];
   for (const c of cases) {
-    const out = postTool(home, cwd, FACT_STUB, c);
+    const out = postTool(home, cwd, factStub(root), c);
     assert.strictEqual(out.trim(), '', `expected no nudge for ${c.file}`);
   }
   assert.strictEqual(llmCalls(home).length, 0); // none reached the classifier
@@ -193,8 +218,8 @@ test('prefilter: non-md, graph-home, /nodes/, instruction files, and short prose
 });
 
 test('Edit new_string is classified like Write content', () => {
-  const { home, cwd } = scratch();
-  const out = postTool(home, cwd, FACT_STUB, {
+  const { root, home, cwd } = scratch();
+  const out = postTool(home, cwd, factStub(root), {
     file: path.join(cwd, 'report.md'),
     content: PROSE,
     tool: 'Edit',
@@ -203,39 +228,35 @@ test('Edit new_string is classified like Write content', () => {
 });
 
 test('SUBSTRATE_NUDGE=0 disables the nudge entirely', () => {
-  const { home, cwd } = scratch();
+  const { root, home, cwd } = scratch();
   const payload = {
     cwd, session_id: 's1', hook_event_name: 'PostToolUse', tool_name: 'Write',
     tool_input: { file_path: path.join(cwd, 'doc.md'), content: PROSE },
   };
-  const e = env(home, FACT_STUB);
+  const e = env(home, factStub(root));
   e.SUBSTRATE_NUDGE = '0';
-  const r = spawnSync('bash', [BIN, 'post-tool', '--host', 'claude-code'], {
-    input: JSON.stringify(payload), env: e, encoding: 'utf8',
-  });
+  const r = runHook(['post-tool', '--host', 'claude-code'], JSON.stringify(payload), e);
   assert.strictEqual(r.status, 0);
   assert.strictEqual(r.stdout.trim(), '');
   assert.strictEqual(llmCalls(home).length, 0);
 });
 
 test('headless guard: SUBSTRATE_DISTILLING suppresses the nudge', () => {
-  const { home, cwd } = scratch();
+  const { root, home, cwd } = scratch();
   const payload = {
     cwd, session_id: 's1', hook_event_name: 'PostToolUse', tool_name: 'Write',
     tool_input: { file_path: path.join(cwd, 'doc.md'), content: PROSE },
   };
-  const e = env(home, FACT_STUB);
+  const e = env(home, factStub(root));
   e.SUBSTRATE_DISTILLING = '1';
-  const r = spawnSync('bash', [BIN, 'post-tool', '--host', 'claude-code'], {
-    input: JSON.stringify(payload), env: e, encoding: 'utf8',
-  });
+  const r = runHook(['post-tool', '--host', 'claude-code'], JSON.stringify(payload), e);
   assert.strictEqual(r.status, 0);
   assert.strictEqual(r.stdout.trim(), '');
 });
 
 test('fail-open: a dying classifier exits 0, no output, error journaled', () => {
-  const { home, cwd } = scratch();
-  const out = postTool(home, cwd, 'cat >/dev/null; exit 7', {
+  const { root, home, cwd } = scratch();
+  const out = postTool(home, cwd, failingStub(root), {
     file: path.join(cwd, 'doc.md'),
     content: PROSE,
   });
@@ -245,7 +266,7 @@ test('fail-open: a dying classifier exits 0, no output, error journaled', () => 
   assert.strictEqual(calls[0].response, null);
   assert.match(calls[0].error, /failed/);
   // The failed file still lands in cooldown state — no retry storm.
-  const again = postTool(home, cwd, FACT_STUB, { file: path.join(cwd, 'doc.md'), content: PROSE });
+  const again = postTool(home, cwd, factStub(root), { file: path.join(cwd, 'doc.md'), content: PROSE });
   assert.strictEqual(again.trim(), '');
   assert.strictEqual(llmCalls(home).length, 1);
 });

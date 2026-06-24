@@ -2,7 +2,7 @@
 id: schema-person
 type: schema
 kind: node-schema
-schema_version: 2026.06.21.1
+schema_version: 2026.06.23.1
 project: meridian
 title: person — Meridian-defined node type
 summary: Org-defined vocabulary - the person type exists only in this fixture's registry, authored by the org itself (a member of the org).

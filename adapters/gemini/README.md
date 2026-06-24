@@ -3,7 +3,7 @@
 Gemini CLI's hooks use the same JSON-over-stdin payloads and the same
 `hookSpecificOutput.additionalContext` envelope as Claude Code (it even ships
 a `CLAUDE_PROJECT_DIR` compatibility alias), so this adapter is a manifest
-over `bin/spor-hook`. The only real differences: the per-prompt event is
+over `bin/spor-hook.js`. The only real differences: the per-prompt event is
 called `BeforeAgent` (the dispatcher echoes that name back in the envelope),
 the post-tool event is `AfterTool`, and timeouts are in milliseconds.
 
@@ -51,7 +51,7 @@ export SPOR_NUDGE_CMD='gemini --model gemini-2.5-flash'
 
 - Gemini transcripts are not Claude's JSONL shape; the distiller falls back
   to a generic extractor (every nested `.text` string).
-- Hook stdout must be pure JSON on Gemini; `bin/spor-hook` already
+- Hook stdout must be pure JSON on Gemini; `bin/spor-hook.js` already
   discards engine stderr and emits either one JSON object or nothing.
 - For on-demand graph access, add the Spor MCP server to settings:
 
@@ -60,4 +60,4 @@ export SPOR_NUDGE_CMD='gemini --model gemini-2.5-flash'
   ```
 
 - `GEMINI.md` users: point `contextFileName` at `AGENTS.md` and run
-  `bin/spor-hook agents-md` to get the standing briefing without hooks.
+  `spor-hook agents-md` to get the standing briefing without hooks.

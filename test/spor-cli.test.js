@@ -9,6 +9,7 @@ const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { writeSpawnableNodeStub } = require('./helpers/portable');
 
 const CLI = path.join(__dirname, '..', 'bin', 'spor.js');
 const LIB = path.join(__dirname, '..', 'lib');
@@ -1181,8 +1182,9 @@ test('install codex resolves the placeholder and installs the backfill custom ag
   assert.doesNotMatch(txt, /__SPOR_ROOT__/, 'placeholder resolved');
   const j = JSON.parse(txt); // valid JSON
   const cmd = j.hooks.SessionStart[0].hooks[0].command;
-  assert.match(cmd, /bin\/spor-hook session-start --host codex$/);
-  assert.ok(path.isAbsolute(cmd.split(' ')[0]), 'command points at an absolute checkout path');
+  assert.match(cmd, /^node ".+bin\/spor-hook\.js" session-start --host codex$/);
+  const hookPath = cmd.match(/^node "(.+)" session-start/)?.[1];
+  assert.ok(hookPath && path.isAbsolute(hookPath), 'command points at an absolute checkout path');
   const agent = fs.readFileSync(path.join(home, '.codex', 'agents', 'spor-backfill.toml'), 'utf8');
   assert.match(agent, /^name = "spor-backfill"$/m);
   assert.match(agent, /^description = "Populate or extend a project's Spor graph/m);
@@ -1217,7 +1219,7 @@ test('install gemini merges into existing settings without clobbering', () => {
   const j = JSON.parse(fs.readFileSync(f, 'utf8'));
   assert.strictEqual(j.theme, 'dark');
   assert.ok(j.mcpServers && j.mcpServers.x, 'foreign settings preserved');
-  assert.match(j.hooks.BeforeAgent[0].hooks[0].command, /spor-hook prompt-context --host gemini/);
+  assert.match(j.hooks.BeforeAgent[0].hooks[0].command, /node ".+spor-hook\.js" prompt-context --host gemini/);
 });
 
 test('install opencode places the plugin file (symlink or copy)', () => {
@@ -1227,7 +1229,9 @@ test('install opencode places the plugin file (symlink or copy)', () => {
   const f = path.join(home, '.config', 'opencode', 'plugins', 'spor.js');
   assert.ok(fs.existsSync(f), 'plugin file present');
   const src = fs.readFileSync(path.join(__dirname, '..', 'adapters', 'opencode', 'spor.js'), 'utf8');
-  assert.strictEqual(fs.readFileSync(f, 'utf8'), src, 'matches the adapter source (linked or copied)');
+  const installed = fs.readFileSync(f, 'utf8');
+  assert.ok(installed === src || installed.includes(`const EMBEDDED_ROOT = ${JSON.stringify(path.join(__dirname, '..'))}`),
+    'matches the adapter source when linked, or embeds the root when copied');
 });
 
 test('install --scope repo writes under the cwd, not home', () => {
@@ -1293,26 +1297,29 @@ const PKG = require('../package.json').version;
 // a true regression guard. $EMPTY makes list report no spor installed. Returns
 // the stub path.
 function claudeStub(home) {
-  const stub = path.join(home, 'claude-plugin-stub.sh');
-  fs.writeFileSync(stub, [
-    '#!/bin/sh',
-    'if [ -n "$EMPTY" ]; then',
-    '  if [ "$2" = "list" ]; then echo "[]"; fi',
-    '  exit 0',
-    'fi',
-    'ver=$(cat "$STATE" 2>/dev/null || echo "$STARTVER")',
-    'if [ "$2" = "list" ]; then',
-    '  printf \'[{"id":"spor@spor","version":"%s","scope":"user","enabled":true,"installPath":"/x/%s"}]\\n\' "$ver" "$ver"',
-    '  exit 0',
-    'fi',
-    'if [ "$2" = "update" ]; then',
-    '  if [ "$3" = "spor@spor" ]; then printf \'%s\' "$NEWVER" > "$STATE"; exit 0; fi',
-    '  echo "Failed to update plugin \\"$3\\": Plugin \\"$3\\" not found" >&2; exit 1',
-    'fi',
-    'exit 0',
-  ].join('\n') + '\n');
-  fs.chmodSync(stub, 0o755);
-  return stub;
+  return writeSpawnableNodeStub(home, 'claude-plugin-stub', `
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+if (process.env.EMPTY) {
+  if (args[0] === "plugin" && args[1] === "list") process.stdout.write("[]\\n");
+  process.exit(0);
+}
+let ver = process.env.STARTVER || "";
+try { ver = fs.readFileSync(process.env.STATE, "utf8") || ver; } catch {}
+if (args[0] === "plugin" && args[1] === "list") {
+  process.stdout.write(JSON.stringify([{ id: "spor@spor", version: ver, scope: "user", enabled: true, installPath: \`/x/\${ver}\` }]) + "\\n");
+  process.exit(0);
+}
+if (args[0] === "plugin" && args[1] === "update") {
+  if (args[2] === "spor@spor") {
+    fs.writeFileSync(process.env.STATE, process.env.NEWVER || "");
+    process.exit(0);
+  }
+  process.stderr.write(\`Failed to update plugin "\${args[2]}": Plugin "\${args[2]}" not found\\n\`);
+  process.exit(1);
+}
+process.exit(0);
+`);
 }
 
 test('upgrade claude --print shows the three plugin commands, runs nothing', () => {
@@ -1323,7 +1330,7 @@ test('upgrade claude --print shows the three plugin commands, runs nothing', () 
   assert.match(r.stdout, /would run: claude plugin update spor@spor --scope user/);
 });
 
-test('upgrade claude refreshes a stale plugin and reports before → after', { skip: process.platform === 'win32' }, () => {
+test('upgrade claude refreshes a stale plugin and reports before → after', () => {
   const home = scratchHome();
   const stub = claudeStub(home);
   const r = run(['upgrade', 'claude'], { HOME: home, SPOR_CLAUDE_CMD: stub, STATE: path.join(home, 'loaded'), STARTVER: '0.0.1', NEWVER: PKG });
@@ -1333,7 +1340,7 @@ test('upgrade claude refreshes a stale plugin and reports before → after', { s
   assert.match(r.stdout, /Restart any running sessions/);
 });
 
-test('upgrade claude reports already-current when the loaded version matches', { skip: process.platform === 'win32' }, () => {
+test('upgrade claude reports already-current when the loaded version matches', () => {
   const home = scratchHome();
   const stub = claudeStub(home);
   const r = run(['upgrade', 'claude'], { HOME: home, SPOR_CLAUDE_CMD: stub, STATE: path.join(home, 'loaded'), STARTVER: PKG, NEWVER: PKG });
@@ -1341,7 +1348,7 @@ test('upgrade claude reports already-current when the loaded version matches', {
   assert.match(r.stdout, new RegExp(`already current \\(${PKG.replace(/\./g, '\\.')}\\)`));
 });
 
-test('upgrade claude errors when spor is not installed in Claude Code', { skip: process.platform === 'win32' }, () => {
+test('upgrade claude errors when spor is not installed in Claude Code', () => {
   const home = scratchHome();
   const stub = claudeStub(home);
   const r = run(['upgrade', 'claude'], { HOME: home, SPOR_CLAUDE_CMD: stub, EMPTY: '1' });
@@ -1349,7 +1356,7 @@ test('upgrade claude errors when spor is not installed in Claude Code', { skip: 
   assert.match(r.stderr, /run 'spor install claude' first/);
 });
 
-test('install claude self-heals: an already-installed plugin is refreshed, not no-op', { skip: process.platform === 'win32' }, () => {
+test('install claude self-heals: an already-installed plugin is refreshed, not no-op', () => {
   const home = scratchHome();
   const stub = claudeStub(home);
   const r = run(['install', 'claude'], { HOME: home, SPOR_CLAUDE_CMD: stub, STATE: path.join(home, 'loaded'), STARTVER: '0.0.1', NEWVER: PKG });
@@ -1357,7 +1364,7 @@ test('install claude self-heals: an already-installed plugin is refreshed, not n
   assert.match(r.stdout, new RegExp(`spor plugin: 0\\.0\\.1 → ${PKG.replace(/\./g, '\\.')}`));
 });
 
-test('status flags a stale Claude plugin and stays quiet when current', { skip: process.platform === 'win32' }, () => {
+test('status flags a stale Claude plugin and stays quiet when current', () => {
   const { dir } = fixtureGraph();
   const home = scratchHome();
   const stub = claudeStub(home);
@@ -1374,7 +1381,7 @@ test('status flags a stale Claude plugin and stays quiet when current', { skip: 
 // The npm-registry "newer version published" check. SPOR_NPM_LATEST overrides
 // the registry answer so this runs offline; the plugin is held current
 // (STARTVER=NEWVER=PKG) so only the npm note is under test.
-test('upgrade flags a newer @sporhq/spor published to npm', { skip: process.platform === 'win32' }, () => {
+test('upgrade flags a newer @sporhq/spor published to npm', () => {
   const home = scratchHome();
   const stub = claudeStub(home);
   const r = run(['upgrade', 'claude'], { HOME: home, SPOR_CLAUDE_CMD: stub, STATE: path.join(home, 'loaded'), STARTVER: PKG, NEWVER: PKG, SPOR_NPM_LATEST: '99.0.0' });
@@ -1383,7 +1390,7 @@ test('upgrade flags a newer @sporhq/spor published to npm', { skip: process.plat
   assert.match(r.stdout, /npm install -g @sporhq\/spor@latest/);
 });
 
-test('upgrade stays quiet when the installed package is the latest published', { skip: process.platform === 'win32' }, () => {
+test('upgrade stays quiet when the installed package is the latest published', () => {
   const home = scratchHome();
   const stub = claudeStub(home);
   const r = run(['upgrade', 'claude'], { HOME: home, SPOR_CLAUDE_CMD: stub, STATE: path.join(home, 'loaded'), STARTVER: PKG, NEWVER: PKG, SPOR_NPM_LATEST: PKG });
@@ -1391,7 +1398,7 @@ test('upgrade stays quiet when the installed package is the latest published', {
   assert.doesNotMatch(r.stdout, /newer @sporhq\/spor/);
 });
 
-test('upgrade --no-net skips the registry check entirely', { skip: process.platform === 'win32' }, () => {
+test('upgrade --no-net skips the registry check entirely', () => {
   const home = scratchHome();
   const stub = claudeStub(home);
   const r = run(['upgrade', 'claude', '--no-net'], { HOME: home, SPOR_CLAUDE_CMD: stub, STATE: path.join(home, 'loaded'), STARTVER: PKG, NEWVER: PKG, SPOR_NPM_LATEST: '99.0.0' });

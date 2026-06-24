@@ -8,6 +8,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { writeNodeScript, nodeCommand } = require('./helpers/portable');
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'substrate-opencode-'));
 const HOME = path.join(ROOT, 'graph');
@@ -39,10 +40,14 @@ date: 2026-06-11
 Body of the stub decision.
 ===END===
 `;
-const stub = path.join(ROOT, 'stub-distill.sh');
+const stub = path.join(ROOT, 'stub-distill.js');
 fs.writeFileSync(path.join(ROOT, 'stub-response.txt'), STUB_RESPONSE);
-fs.writeFileSync(stub, `#!/bin/sh\ncat > /dev/null\ncat "${path.join(ROOT, 'stub-response.txt')}"\n`);
-fs.chmodSync(stub, 0o755);
+writeNodeScript(stub, `
+process.stdin.resume();
+process.stdin.on("end", () => {
+  process.stdout.write(require("node:fs").readFileSync(${JSON.stringify(path.join(ROOT, 'stub-response.txt'))}, "utf8"));
+});
+`);
 
 // Hermetic env: strip EVERY ambient Spor/backend var (both SPOR_* and legacy
 // SUBSTRATE_* spellings, plus API keys) so a configured dev box can't derail the
@@ -55,7 +60,7 @@ delete process.env.GEMINI_API_KEY;
 delete process.env.ANTHROPIC_API_KEY;
 process.env.SUBSTRATE_HOME = HOME;
 process.env.SUBSTRATE_DEBOUNCE = '1';
-process.env.SUBSTRATE_DISTILL_CMD = stub;
+process.env.SUBSTRATE_DISTILL_CMD = nodeCommand(stub);
 // Spor is opt-in per repo (task-spor-plugin-opt-in-default); the stub project
 // dir carries no .spor marker, so opt it in via the cascade or distill no-ops.
 process.env.SPOR_ENABLED = '1';

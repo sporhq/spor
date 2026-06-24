@@ -21,7 +21,6 @@ const zlib = require("node:zlib");
 const { spawnSync, spawn } = require("node:child_process");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
-const isWin = process.platform === "win32";
 
 // Env with no SPOR_*/SUBSTRATE_* leakage (a configured dev box must not flip a
 // local-mode test to remote or leak a token), config homes isolated to a temp
@@ -204,7 +203,7 @@ function exportStub({ body = Buffer.from("TAR-BYTES"), headers = {}, status = 20
 }
 const remoteEnv = (base, extra = {}) => bare({ SPOR_HOME: ISO_HOME, SPOR_SERVER: base, SPOR_TOKEN: "test-token", ...extra });
 
-test("export (remote) GETs /v1/export, writes the body, reports the header count", { skip: isWin }, async () => {
+test("export (remote) GETs /v1/export, writes the body, reports the header count", async () => {
   const body = Buffer.from("USTAR-PAYLOAD-FROM-SERVER");
   const { srv, hits, base } = await exportStub({ body, headers: { "x-substrate-node-count": "42", "x-substrate-head": "abcdef1234567890" } });
   try {
@@ -221,7 +220,7 @@ test("export (remote) GETs /v1/export, writes the body, reports the header count
   }
 });
 
-test("export (remote) --gzip forwards ?gzip=1 and passes the compressed body through", { skip: isWin }, async () => {
+test("export (remote) --gzip forwards ?gzip=1 and passes the compressed body through", async () => {
   const body = Buffer.from([0x1f, 0x8b, 0x08, 0x00]); // gzip magic + junk
   const { srv, hits, base } = await exportStub({ body, headers: { "x-substrate-node-count": "7" } });
   try {
@@ -236,7 +235,7 @@ test("export (remote) --gzip forwards ?gzip=1 and passes the compressed body thr
   }
 });
 
-test("export (remote) to stdout streams the server body verbatim", { skip: isWin }, async () => {
+test("export (remote) to stdout streams the server body verbatim", async () => {
   const body = Buffer.from("STREAMED-TARBALL");
   const { srv, base } = await exportStub({ body, headers: { "x-substrate-node-count": "1" } });
   try {
@@ -249,14 +248,14 @@ test("export (remote) to stdout streams the server body verbatim", { skip: isWin
   }
 });
 
-test("export (remote) a dead server fails soft with a transport line, no stack", { skip: isWin }, async () => {
+test("export (remote) a dead server fails soft with a transport line, no stack", async () => {
   const r = await runBin(["export"], remoteEnv("http://127.0.0.1:1"));
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /offline/);
   assert.doesNotMatch(r.stderr, /at Object|Error:/);
 });
 
-test("export (remote) a non-200 surfaces the server error message, exit 1", { skip: isWin }, async () => {
+test("export (remote) a non-200 surfaces the server error message, exit 1", async () => {
   const { srv, base } = await exportStub({ status: 500 });
   try {
     const r = await runBin(["export"], remoteEnv(base));
@@ -271,7 +270,7 @@ test("export (remote) a non-200 surfaces the server error message, exit 1", { sk
 // --- remote mode: --history (git bundle data-exit) --------------------------
 // (task-spor-export-cli-verb-extensions)
 
-test("export (remote) --history forwards ?history=1 and reports a git bundle, no count", { skip: isWin }, async () => {
+test("export (remote) --history forwards ?history=1 and reports a git bundle, no count", async () => {
   const body = Buffer.from("PACK\x00git-bundle-bytes");
   const { srv, hits, base } = await exportStub({ body, headers: { "x-substrate-head": "deadbeefcafe0000" } });
   try {
@@ -289,7 +288,7 @@ test("export (remote) --history forwards ?history=1 and reports a git bundle, no
   }
 });
 
-test("export (remote) --gzip with --history is ignored (no ?gzip=1, no '(gzip)'), with a warning", { skip: isWin }, async () => {
+test("export (remote) --gzip with --history is ignored (no ?gzip=1, no '(gzip)'), with a warning", async () => {
   const { srv, hits, base } = await exportStub({ body: Buffer.from("BUNDLE"), headers: { "x-substrate-head": "abc123def456" } });
   try {
     const out = path.join(ISO_HOME, "history2.bundle");
@@ -304,7 +303,7 @@ test("export (remote) --gzip with --history is ignored (no ?gzip=1, no '(gzip)')
   }
 });
 
-test("export (remote) --history with no commits surfaces the server's 409, exit 1", { skip: isWin }, async () => {
+test("export (remote) --history with no commits surfaces the server's 409, exit 1", async () => {
   const { srv, base } = await exportStub({ status: 409, errBody: { error: { code: "conflict", message: "graph repo has no commits to bundle yet" } } });
   try {
     const r = await runBin(["export", "--history"], remoteEnv(base));
@@ -318,7 +317,7 @@ test("export (remote) --history with no commits surfaces the server's 409, exit 
 
 // --- remote mode: --auth (admin-gated restore backup) -----------------------
 
-test("export (remote) --auth forwards ?auth=1 and reports the auth-file count", { skip: isWin }, async () => {
+test("export (remote) --auth forwards ?auth=1 and reports the auth-file count", async () => {
   const body = Buffer.from("FULL-TARBALL-WITH-AUTH");
   const { srv, hits, base } = await exportStub({ body, headers: { "x-substrate-node-count": "9", "x-substrate-auth-files": "3", "x-substrate-head": "0011223344556677" } });
   try {
@@ -333,7 +332,7 @@ test("export (remote) --auth forwards ?auth=1 and reports the auth-file count", 
   }
 });
 
-test("export (remote) --auth --gzip forwards ?auth=1&gzip=1 and reports (gzip)", { skip: isWin }, async () => {
+test("export (remote) --auth --gzip forwards ?auth=1&gzip=1 and reports (gzip)", async () => {
   const { srv, hits, base } = await exportStub({ body: Buffer.from("GZ"), headers: { "x-substrate-node-count": "1", "x-substrate-auth-files": "1" } });
   try {
     const out = path.join(ISO_HOME, "restore.tar.gz");
@@ -346,7 +345,7 @@ test("export (remote) --auth --gzip forwards ?auth=1&gzip=1 and reports (gzip)",
   }
 });
 
-test("export (remote) --auth as a non-admin surfaces the server's 403, exit 1", { skip: isWin }, async () => {
+test("export (remote) --auth as a non-admin surfaces the server's 403, exit 1", async () => {
   const { srv, base } = await exportStub({ status: 403, errBody: { error: { code: "forbidden", message: "exporting auth state requires admin privilege: a stewards edge to the graph root" } } });
   try {
     const r = await runBin(["export", "--auth"], remoteEnv(base));

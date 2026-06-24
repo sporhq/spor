@@ -14,6 +14,7 @@ const path = require("node:path");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const u = require(path.join(__dirname, "..", "scripts", "engines", "util.js"));
+const { pathWithOnlyGit, writeSpawnableNodeStub } = require("./helpers/portable");
 
 // Env with no SPOR_*/SUBSTRATE_* leakage; force LOCAL mode (no server). Also
 // isolate the config-cascade homes to an empty temp dir so the developer's real
@@ -37,6 +38,10 @@ function bare(extra = {}) {
 }
 function run(args, env, cwd) {
   return spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", env: bare(env), cwd });
+}
+
+function noOpClaudeStub(home) {
+  return writeSpawnableNodeStub(home, "claude-noop", "process.exit(0);");
 }
 
 // A scratch graph home with two linked nodes under repo `demo`.
@@ -217,12 +222,10 @@ test("dispatch from inside a git worktree --print: resolves the MAIN checkout, n
   fs.rmSync(base, { recursive: true, force: true });
 });
 
-test("dispatch from inside a git worktree (local, stubbed): registers the MAIN checkout in dispatch.repos", { skip: process.platform === "win32" }, () => {
+test("dispatch from inside a git worktree (local, stubbed): registers the MAIN checkout in dispatch.repos", () => {
   const { base, main, wt } = gitRepoWithWorktree();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-wt-reg-"));
-  const stub = path.join(home, "claude-stub.sh");
-  fs.writeFileSync(stub, "#!/bin/sh\nexit 0\n");
-  fs.chmodSync(stub, 0o755);
+  const stub = noOpClaudeStub(home);
   const r = run(["dispatch", "some free text task to dispatch", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub }, wt);
   assert.strictEqual(r.status, 0, r.stderr);
   const mapped = Object.values(JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8")).dispatch.repos);
@@ -566,7 +569,7 @@ test("dispatch --from-queue: excludes questions (human decisions), picks the tas
   assert.doesNotMatch(r.stdout, /question-decide/);
 });
 
-test("dispatch --from-queue: when EVERY candidate is in flight, falls back to top so the guard refuses", { skip: process.platform === "win32" }, () => {
+test("dispatch --from-queue: when EVERY candidate is in flight, falls back to top so the guard refuses", () => {
   const { home, repo } = twoTaskFixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const sentinel = path.join(home, "fq-launched");
@@ -603,9 +606,7 @@ test("dispatch --backfill --print: previews the init step and writes nothing", (
 test("dispatch --backfill (local): inits the graph home and registers the repo", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-onb2-")); // fresh, uninitialized
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-onb2-repo-"));
-  const stub = path.join(home, "claude-stub.sh");
-  fs.writeFileSync(stub, "#!/bin/sh\nexit 0\n");
-  fs.chmodSync(stub, 0o755);
+  const stub = noOpClaudeStub(home);
   const r = run(["dispatch", "--backfill", "--dir", repo], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
   assert.strictEqual(r.status, 0);
   assert.match(r.stdout, /initialized graph home/);
@@ -618,9 +619,7 @@ test("dispatch --backfill re-enables a previously-disabled repo", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-onb3-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-onb3-repo-"));
   fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: false }) + "\n");
-  const stub = path.join(home, "claude-stub.sh");
-  fs.writeFileSync(stub, "#!/bin/sh\nexit 0\n");
-  fs.chmodSync(stub, 0o755);
+  const stub = noOpClaudeStub(home);
   const r = run(["dispatch", "--backfill"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub }, repo); // cwd = the disabled repo
   assert.strictEqual(r.status, 0);
   assert.match(r.stdout, /re-enabled Spor/);
@@ -660,7 +659,7 @@ test("dispatch <node>: an unmapped slug matching the cwd's own slug resolves to 
   assert.doesNotMatch(r.stderr, /carries no repo\/project stamp/); // nor the stampless-node guard
 });
 
-test("dispatch <node> (real): an unmapped cwd-matching slug self-registers the repo", { skip: process.platform === "win32" }, () => {
+test("dispatch <node> (real): an unmapped cwd-matching slug self-registers the repo", () => {
   const { home } = fixture();
   const { real } = namedRepo("demo");
   const sentinel = path.join(home, "g-launched");
@@ -673,16 +672,14 @@ test("dispatch <node> (real): an unmapped cwd-matching slug self-registers the r
 });
 
 // Real spawn through SPOR_CLAUDE_CMD: the launcher must pass --bg + flags and run
-// in the resolved cwd. Posix-only (the stub is a shell script).
-test("dispatch spawns the claude binary with --bg in the target dir", { skip: process.platform === "win32" }, () => {
+// in the resolved cwd.
+test("dispatch spawns the claude binary with --bg in the target dir", () => {
   const { home, repo } = fixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
-  const stub = path.join(home, "claude-stub.sh");
   const outFile = path.join(home, "spawn.out");
   // cwd on line 1, then each argv element on its own line (the prompt is last
   // and may add extra lines — fine, we only assert on the leading flags).
-  fs.writeFileSync(stub, `#!/bin/sh\n{ pwd; printf '%s\\n' "$@"; } > "$OUTFILE"\n`);
-  fs.chmodSync(stub, 0o755);
+  const stub = pwdStub(home);
   const r = run(["dispatch", "dec-x", "--model", "haiku"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile });
   assert.strictEqual(r.status, 0);
   const lines = fs.readFileSync(outFile, "utf8").split("\n");
@@ -697,8 +694,7 @@ test("dispatch spawns the claude binary with --bg in the target dir", { skip: pr
 // --- worktree isolation (dispatch.worktree) ------------------------------
 // Run the dispatched agent in its own git worktree off the target repo so
 // parallel dispatches never race the shared tree/index. Opt-in; dispatch owns
-// create + setup hook + launch cwd. Posix-only (the claude stub is a shell
-// script and the setup hook is /bin/sh).
+// create + setup hook + launch cwd.
 
 // A git-inited target repo with one commit, so `git worktree add ... HEAD` works.
 // The checkout dir is named `demo` so projectSlug() derives the same slug it gets
@@ -736,10 +732,10 @@ function setDispatch(home, patch) {
 }
 // The pwd+argv-capturing claude stub (cwd on line 1, then each argv element).
 function pwdStub(home) {
-  const stub = path.join(home, "claude-stub.sh");
-  fs.writeFileSync(stub, `#!/bin/sh\n{ pwd; printf '%s\\n' "$@"; } > "$OUTFILE"\n`);
-  fs.chmodSync(stub, 0o755);
-  return stub;
+  return writeSpawnableNodeStub(home, "claude-pwd", `
+const fs = require("node:fs");
+fs.writeFileSync(process.env.OUTFILE, [process.cwd(), ...process.argv.slice(2)].join("\\n") + "\\n");
+`);
 }
 
 test("dispatch --worktree --print: previews the worktree path + branch and creates nothing", () => {
@@ -754,7 +750,7 @@ test("dispatch --worktree --print: previews the worktree path + branch and creat
   assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees")), "--print created no worktree");
 });
 
-test("dispatch --worktree (stubbed): creates the worktree + branch and launches IN it, not the main checkout", { skip: process.platform === "win32" }, () => {
+test("dispatch --worktree (stubbed): creates the worktree + branch and launches IN it, not the main checkout", () => {
   const { home } = fixture();
   const { repo, real, g } = gitTargetRepo();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
@@ -772,16 +768,18 @@ test("dispatch --worktree (stubbed): creates the worktree + branch and launches 
   function esc(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 });
 
-test("dispatch worktree setup hook: runs with cwd=worktree + dispatch context env, before launch", { skip: process.platform === "win32" }, () => {
+test("dispatch worktree setup hook: runs with cwd=worktree + dispatch context env, before launch", () => {
   const { home } = fixture();
   const { repo } = gitTargetRepo();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   // Hook drops a sentinel (proves cwd=worktree) recording SPOR_MAIN_CHECKOUT +
   // SPOR_DISPATCH_NODE (proves the context env reached it).
-  const hook = path.join(home, "wt-setup.sh");
-  fs.writeFileSync(hook, `#!/bin/sh\nprintf '%s\\n%s\\n' "$SPOR_MAIN_CHECKOUT" "$SPOR_DISPATCH_NODE" > ./.wt-setup-ran\n`);
-  fs.chmodSync(hook, 0o755);
-  setDispatch(home, { worktree: true, worktreeSetup: hook });
+  const hook = path.join(home, "wt-setup.js");
+  fs.writeFileSync(hook, `
+const fs = require("node:fs");
+fs.writeFileSync(".wt-setup-ran", process.env.SPOR_MAIN_CHECKOUT + "\\n" + process.env.SPOR_DISPATCH_NODE + "\\n");
+`);
+  setDispatch(home, { worktree: true, worktreeSetup: `node ${JSON.stringify(hook)}` });
   const outFile = path.join(home, "spawn.out");
   const stub = pwdStub(home);
   const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile });
@@ -794,7 +792,7 @@ test("dispatch worktree setup hook: runs with cwd=worktree + dispatch context en
   assert.match(r.stdout, /setup ran/);
 });
 
-test("dispatch --no-worktree overrides dispatch.worktree=true: launches in the main checkout, no worktree", { skip: process.platform === "win32" }, () => {
+test("dispatch --no-worktree overrides dispatch.worktree=true: launches in the main checkout, no worktree", () => {
   const { home } = fixture();
   const { repo, real } = gitTargetRepo();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
@@ -808,18 +806,14 @@ test("dispatch --no-worktree overrides dispatch.worktree=true: launches in the m
   assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees")), "no worktree created");
 });
 
-test("dispatch worktree setup hook failure: aborts, removes the worktree + branch, launches nothing", { skip: process.platform === "win32" }, () => {
+test("dispatch worktree setup hook failure: aborts, removes the worktree + branch, launches nothing", () => {
   const { home } = fixture();
   const { repo, g } = gitTargetRepo();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
-  const failHook = path.join(home, "fail.sh");
-  fs.writeFileSync(failHook, "#!/bin/sh\nexit 3\n");
-  fs.chmodSync(failHook, 0o755);
+  const failHook = writeSpawnableNodeStub(home, "fail", "process.exit(3);");
   setDispatch(home, { worktree: true, worktreeSetup: failHook });
   const mark = path.join(home, "launched.mark");
-  const stub = path.join(home, "rec.sh");
-  fs.writeFileSync(stub, `#!/bin/sh\necho launched > "$LAUNCH_MARK"\n`);
-  fs.chmodSync(stub, 0o755);
+  const stub = recordingStub(home);
   const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
   assert.notStrictEqual(r.status, 0, "non-zero exit on setup failure");
   assert.match(r.stderr, /setup hook failed/);
@@ -843,7 +837,7 @@ test("dispatch --backfill --print: worktree forced off even with dispatch.worktr
 // A cross-repo dispatch (standing somewhere else) honors the TARGET repo's own
 // dispatch.worktree[/Setup], since the cfg cascade only sees the dispatcher cwd.
 
-test("dispatch (cross-repo): honors the TARGET repo's .spor.json dispatch.worktree, not the standing config", { skip: process.platform === "win32" }, () => {
+test("dispatch (cross-repo): honors the TARGET repo's .spor.json dispatch.worktree, not the standing config", () => {
   const { home } = fixture();
   const { repo } = gitTargetRepo();
   // The target repo declares it wants isolation; the standing config does NOT.
@@ -858,13 +852,12 @@ test("dispatch (cross-repo): honors the TARGET repo's .spor.json dispatch.worktr
   assert.strictEqual(cwd, fs.realpathSync(path.join(repo, ".claude", "worktrees", "dec-x")), "launched in the worktree per target .spor.json");
 });
 
-test("dispatch (cross-repo): a relative dispatch.worktreeSetup in the target .spor.json resolves against the repo", { skip: process.platform === "win32" }, () => {
+test("dispatch (cross-repo): a relative dispatch.worktreeSetup in the target .spor.json resolves against the repo", () => {
   const { home } = fixture();
   const { repo } = gitTargetRepo();
   fs.mkdirSync(path.join(repo, "scripts"));
-  fs.writeFileSync(path.join(repo, "scripts", "wt-setup.sh"), "#!/bin/sh\ntouch ./.ran\n");
-  fs.chmodSync(path.join(repo, "scripts", "wt-setup.sh"), 0o755);
-  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktree: true, worktreeSetup: "scripts/wt-setup.sh" } }) + "\n");
+  const setup = writeSpawnableNodeStub(path.join(repo, "scripts"), "wt-setup", "require('node:fs').writeFileSync('./.ran', 'ran\\n');");
+  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktree: true, worktreeSetup: path.relative(repo, setup) } }) + "\n");
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-elsewhere-"));
   const stub = pwdStub(home);
@@ -873,7 +866,7 @@ test("dispatch (cross-repo): a relative dispatch.worktreeSetup in the target .sp
   assert.ok(fs.existsSync(path.join(repo, ".claude", "worktrees", "dec-x", ".ran")), "relative setup hook ran (resolved against the repo dir)");
 });
 
-test("dispatch --no-worktree overrides the target repo's .spor.json dispatch.worktree", { skip: process.platform === "win32" }, () => {
+test("dispatch --no-worktree overrides the target repo's .spor.json dispatch.worktree", () => {
   const { home } = fixture();
   const { repo, real } = gitTargetRepo();
   fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktree: true } }) + "\n");
@@ -910,10 +903,9 @@ function setCaps(home, capabilities) {
 // A claude stub that records its launch into LAUNCH_MARK, so a test can assert a
 // refused dispatch NEVER launched.
 function recordingStub(home) {
-  const stub = path.join(home, "claude-rec.sh");
-  fs.writeFileSync(stub, `#!/bin/sh\necho launched > "$LAUNCH_MARK"\n`);
-  fs.chmodSync(stub, 0o755);
-  return stub;
+  return writeSpawnableNodeStub(home, "claude-rec", `
+require("node:fs").writeFileSync(process.env.LAUNCH_MARK, "launched\\n");
+`);
 }
 // A clean HOME (no ~/.claude manifest) + a harness-free PATH (only git, for the
 // config load's git shell-outs), so the satisfiability re-probe `spor dispatch`
@@ -925,13 +917,10 @@ function recordingStub(home) {
 // available here" assertion) + ~/.claude plugins/skills. Merge into a test's env.
 function cleanProbeEnv() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cleanhome-"));
-  const pathDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-path-"));
-  const git = (spawnSync("/bin/sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout || "").trim();
-  if (git) { try { fs.symlinkSync(git, path.join(pathDir, "git")); } catch { /* ignore */ } }
-  return { HOME: home, PATH: pathDir };
+  return { HOME: home, PATH: pathWithOnlyGit() };
 }
 
-test("dispatch --profile: refuses when this machine can't satisfy it; nothing launches, assignment untouched", { skip: process.platform === "win32" }, () => {
+test("dispatch --profile: refuses when this machine can't satisfy it; nothing launches, assignment untouched", () => {
   const { home, nodes, repo } = fixture();
   writeProfile(nodes, "profile-codex", "harness: codex");
   setCaps(home, { declared: { harnesses: ["claude-code"] } }); // codex NOT available here
@@ -945,7 +934,7 @@ test("dispatch --profile: refuses when this machine can't satisfy it; nothing la
   assert.ok(!fs.existsSync(mark), "claude was never launched");
 });
 
-test("dispatch --profile: a satisfiable profile dispatches normally", { skip: process.platform === "win32" }, () => {
+test("dispatch --profile: a satisfiable profile dispatches normally", () => {
   const { home, nodes, repo } = fixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   writeProfile(nodes, "profile-cc", "harness: claude-code\nplugins: [spor]");
@@ -957,7 +946,7 @@ test("dispatch --profile: a satisfiable profile dispatches normally", { skip: pr
   assert.ok(fs.existsSync(mark), "claude launched for a satisfiable profile");
 });
 
-test("dispatch --profile: an unknown profile id is a hard error before any launch", { skip: process.platform === "win32" }, () => {
+test("dispatch --profile: an unknown profile id is a hard error before any launch", () => {
   const { home, repo } = fixture();
   const stub = recordingStub(home);
   const mark = path.join(home, "launched.mark");
@@ -967,7 +956,7 @@ test("dispatch --profile: an unknown profile id is a hard error before any launc
   assert.ok(!fs.existsSync(mark));
 });
 
-test("dispatch <node>: the assigned->agent edge profile attr is honored (no --profile)", { skip: process.platform === "win32" }, () => {
+test("dispatch <node>: the assigned->agent edge profile attr is honored (no --profile)", () => {
   const { home, nodes, repo } = fixture();
   writeProfile(nodes, "profile-codex", "harness: codex");
   // task-rotate is assigned to an agent UNDER profile-codex — unsatisfiable here.
@@ -984,7 +973,7 @@ test("dispatch <node>: the assigned->agent edge profile attr is honored (no --pr
   assert.ok(!fs.existsSync(mark));
 });
 
-test("dispatch <node>: falls back to the assigned agent's default uses-profile", { skip: process.platform === "win32" }, () => {
+test("dispatch <node>: falls back to the assigned agent's default uses-profile", () => {
   const { home, nodes, repo } = fixture();
   writeProfile(nodes, "profile-codex", "harness: codex");
   // An agent whose DEFAULT profile (uses-profile) is unsatisfiable here.
@@ -1006,7 +995,7 @@ test("dispatch <node>: falls back to the assigned agent's default uses-profile",
   assert.ok(!fs.existsSync(mark));
 });
 
-test("dispatch --print --profile: previews the verdict and writes nothing", { skip: process.platform === "win32" }, () => {
+test("dispatch --print --profile: previews the verdict and writes nothing", () => {
   const { home, nodes, repo } = fixture();
   writeProfile(nodes, "profile-codex", "harness: codex");
   setCaps(home, { declared: { harnesses: ["claude-code"] } });
@@ -1016,7 +1005,7 @@ test("dispatch --print --profile: previews the verdict and writes nothing", { sk
   assert.match(r.stdout, /harness 'codex' not available here/);
 });
 
-test("dispatch: no profile resolved => byte-identical (no profile line)", { skip: process.platform === "win32" }, () => {
+test("dispatch: no profile resolved => byte-identical (no profile line)", () => {
   const { home, repo } = fixture();
   const r = run(["dispatch", "dec-x", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home });
   assert.strictEqual(r.status, 0);
@@ -1073,7 +1062,7 @@ function runAsyncDisp(args, env) {
   });
 }
 
-test("dispatch (remote, unsatisfiable): names the fleet hosts that satisfy the profile", { skip: process.platform === "win32" }, async () => {
+test("dispatch (remote, unsatisfiable): names the fleet hosts that satisfy the profile", async () => {
   const { home, repo } = fixture();
   setCaps(home, { declared: { harnesses: ["claude-code"] } }); // codex NOT here
   const stub = recordingStub(home);
@@ -1107,7 +1096,7 @@ test("dispatch (remote, unsatisfiable): names the fleet hosts that satisfy the p
   }
 });
 
-test("dispatch (remote, unsatisfiable, no host satisfies): escalates to the owner (FORK B)", { skip: process.platform === "win32" }, async () => {
+test("dispatch (remote, unsatisfiable, no host satisfies): escalates to the owner (FORK B)", async () => {
   const { home, repo } = fixture();
   setCaps(home, { declared: { harnesses: ["claude-code"] } });
   const { srv, base } = await fleetStub({
@@ -1127,7 +1116,7 @@ test("dispatch (remote, unsatisfiable, no host satisfies): escalates to the owne
   }
 });
 
-test("dispatch (remote, unsatisfiable): a scheduler outage falls back to the generic hint (fail-soft)", { skip: process.platform === "win32" }, async () => {
+test("dispatch (remote, unsatisfiable): a scheduler outage falls back to the generic hint (fail-soft)", async () => {
   const { home, repo } = fixture();
   setCaps(home, { declared: { harnesses: ["claude-code"] } });
   // The profile node resolves, but the /hosts route 404s (undeployed surface).
@@ -1144,7 +1133,7 @@ test("dispatch (remote, unsatisfiable): a scheduler outage falls back to the gen
   }
 });
 
-test("dispatch (remote, unsatisfiable): a 403 (steward-scoped) is reported as an authorization denial, then degrades to the generic hint", { skip: process.platform === "win32" }, async () => {
+test("dispatch (remote, unsatisfiable): a 403 (steward-scoped) is reported as an authorization denial, then degrades to the generic hint", async () => {
   const { home, repo } = fixture();
   setCaps(home, { declared: { harnesses: ["claude-code"] } });
   // The /hosts route 403s (host visibility is steward-scoped, API.md §3). It must
@@ -1164,7 +1153,7 @@ test("dispatch (remote, unsatisfiable): a 403 (steward-scoped) is reported as an
   }
 });
 
-test("dispatch (local, unsatisfiable): byte-identical — no scheduler consult", { skip: process.platform === "win32" }, () => {
+test("dispatch (local, unsatisfiable): byte-identical — no scheduler consult", () => {
   const { home, nodes, repo } = fixture();
   writeProfile(nodes, "profile-codex", "harness: codex");
   setCaps(home, { declared: { harnesses: ["claude-code"] } });
@@ -1179,7 +1168,7 @@ test("dispatch (local, unsatisfiable): byte-identical — no scheduler consult",
 // gate re-probes THIS box (like the session-start auto-publish + manual
 // `spor capabilities publish`) before collapsing capabilities, so a box whose
 // .probed is empty/stale still satisfies an `mcp:[spor]` profile it can run.
-test("dispatch (remote): an mcp:[spor] profile satisfies on a box with EMPTY .probed — the fresh re-probe seeds reachable_mcp:[spor]", { skip: process.platform === "win32" }, async () => {
+test("dispatch (remote): an mcp:[spor] profile satisfies on a box with EMPTY .probed — the fresh re-probe seeds reachable_mcp:[spor]", async () => {
   const { home, repo } = fixture();
   // No prior session-start: .probed is absent and reachable_mcp is UNDECLARED.
   // Before the fix this collapsed to an empty reachable_mcp and the mcp:[spor]
@@ -1199,7 +1188,7 @@ test("dispatch (remote): an mcp:[spor] profile satisfies on a box with EMPTY .pr
   }
 });
 
-test("dispatch (local): the same mcp:[spor] profile is UNSATISFIABLE on an empty box — the spor seed is REMOTE-gated (no server bound)", { skip: process.platform === "win32" }, () => {
+test("dispatch (local): the same mcp:[spor] profile is UNSATISFIABLE on an empty box — the spor seed is REMOTE-gated (no server bound)", () => {
   // The gate: the re-probe seeds reachable_mcp:[spor] only when a server is bound
   // (cfg.mode() === "remote"). In local mode there is no spor MCP by construction,
   // so an mcp:[spor] profile with no declared reachable_mcp stays unsatisfiable —
@@ -1299,7 +1288,6 @@ test("dispatch --template with an unreadable path exits 1 before compiling", () 
 // so we can assert whether it ran. Posix-only (the claude stub is a shell
 // script). spawnSync would block the loop and starve the stub, so these spawn
 // async (mirrors test/claim-nudge.test.js).
-const isWin = process.platform === "win32";
 
 // Env that forces REMOTE mode (SPOR_SERVER + token), isolating the config homes
 // so the dev's real ~/.spor can't leak in. `extra` (e.g. SPOR_CLAUDE_CMD) wins.
@@ -1366,14 +1354,13 @@ function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nod
 
 // A claude stub that records its launch by touching `sentinel`, then exits 0.
 function claudeStub(dir, sentinel) {
-  const stub = path.join(dir, "claude-stub.sh");
-  fs.writeFileSync(stub, `#!/bin/sh\ntouch "${sentinel}"\nexit 0\n`);
-  fs.chmodSync(stub, 0o755);
-  return stub;
+  return writeSpawnableNodeStub(dir, "claude-claim", `
+require("node:fs").writeFileSync(${JSON.stringify(sentinel)}, "launched\\n");
+`);
 }
 const claimHit = (hits) => hits.find((h) => h.method === "POST" && /\/claim$/.test(h.url));
 
-test("dispatch <node-id> (remote): auto-claims the node, then launches the agent", { skip: isWin }, async () => {
+test("dispatch <node-id> (remote): auto-claims the node, then launches the agent", async () => {
   const { home, repo } = fixture();
   const { srv, hits, base } = await claimStub({ claimStatus: 200 });
   const sentinel = path.join(home, "launched");
@@ -1395,7 +1382,7 @@ test("dispatch <node-id> (remote): auto-claims the node, then launches the agent
 // `dispatch` nonce so the server refuses a SECOND concurrent dispatch of the same
 // node — even by the same person, on any machine — instead of treating it as the
 // person-scoped idempotent renew that let two agents launch on one task.
-test("dispatch <node-id> (remote): the claim carries a per-invocation dispatch nonce", { skip: isWin }, async () => {
+test("dispatch <node-id> (remote): the claim carries a per-invocation dispatch nonce", async () => {
   const { home, repo } = fixture();
   const { srv, hits, base } = await claimStub({ claimStatus: 200 });
   const sentinel = path.join(home, "launched");
@@ -1412,7 +1399,7 @@ test("dispatch <node-id> (remote): the claim carries a per-invocation dispatch n
   }
 });
 
-test("dispatch --force (remote): omits the dispatch nonce so a deliberate re-dispatch renews", { skip: isWin }, async () => {
+test("dispatch --force (remote): omits the dispatch nonce so a deliberate re-dispatch renews", async () => {
   const { home, repo } = fixture();
   const { srv, hits, base } = await claimStub({ claimStatus: 200 });
   const sentinel = path.join(home, "launched");
@@ -1429,7 +1416,7 @@ test("dispatch --force (remote): omits the dispatch nonce so a deliberate re-dis
   }
 });
 
-test("dispatch (remote): a node already claimed by another aborts WITHOUT launching", { skip: isWin }, async () => {
+test("dispatch (remote): a node already claimed by another aborts WITHOUT launching", async () => {
   const { home, repo } = fixture();
   const { srv, hits, base } = await claimStub({
     claimStatus: 409,
@@ -1450,7 +1437,7 @@ test("dispatch (remote): a node already claimed by another aborts WITHOUT launch
   }
 });
 
-test("dispatch --no-claim (remote): skips the claim entirely and launches", { skip: isWin }, async () => {
+test("dispatch --no-claim (remote): skips the claim entirely and launches", async () => {
   const { home, repo } = fixture();
   const { srv, hits, base } = await claimStub({ claimStatus: 200 });
   const sentinel = path.join(home, "launched");
@@ -1466,7 +1453,7 @@ test("dispatch --no-claim (remote): skips the claim entirely and launches", { sk
   }
 });
 
-test("dispatch free-text (remote): no node to claim, so no claim is attempted", { skip: isWin }, async () => {
+test("dispatch free-text (remote): no node to claim, so no claim is attempted", async () => {
   const { home, repo } = fixture();
   const { srv, hits, base } = await claimStub({ claimStatus: 200 });
   const sentinel = path.join(home, "launched");
@@ -1481,7 +1468,7 @@ test("dispatch free-text (remote): no node to claim, so no claim is attempted", 
   }
 });
 
-test("dispatch (remote): a claim server error warns but still dispatches (fail-open)", { skip: isWin }, async () => {
+test("dispatch (remote): a claim server error warns but still dispatches (fail-open)", async () => {
   const { home, repo } = fixture();
   const { srv, hits, base } = await claimStub({ claimStatus: 500, claimBody: { error: { code: "internal", message: "boom" } } });
   const sentinel = path.join(home, "launched");
@@ -1498,7 +1485,7 @@ test("dispatch (remote): a claim server error warns but still dispatches (fail-o
   }
 });
 
-test("dispatch --print (remote node): previews the auto-claim and writes nothing", { skip: isWin }, async () => {
+test("dispatch --print (remote node): previews the auto-claim and writes nothing", async () => {
   const { home, repo } = fixture();
   const { srv, hits, base } = await claimStub({ claimStatus: 200 });
   try {
@@ -1521,7 +1508,7 @@ test("dispatch --print (remote node): previews the auto-claim and writes nothing
 // request the client actually sends, and that it lands on the returned task.
 // (issue-spor-dispatch-from-queue-dispatches-questions — the preferred fix;
 // the local-mode counterpart is exercised by the excludes-questions test above.)
-test("dispatch --from-queue (remote): queue fetch excludes questions at the ranker (exclude_type=question)", { skip: isWin }, async () => {
+test("dispatch --from-queue (remote): queue fetch excludes questions at the ranker (exclude_type=question)", async () => {
   const { home, repo } = fixture();
   const queueHits = [];
   const srv = http.createServer((req, res) => {
@@ -1567,7 +1554,7 @@ test("dispatch --from-queue (remote): queue fetch excludes questions at the rank
 // churn the self-limit broke. The client filter drops it (reading the suggest the
 // ranker set) and advances to the next actionable item, exactly like the blocked
 // defense above. A server returns the held item top-ranked, a plain task below it.
-test("dispatch --from-queue (remote): hard-skips a held task (suggest:triage), advances to the next", { skip: isWin }, async () => {
+test("dispatch --from-queue (remote): hard-skips a held task (suggest:triage), advances to the next", async () => {
   const { home, repo } = fixture();
   const srv = http.createServer((req, res) => {
     let body = "";
@@ -1607,7 +1594,7 @@ test("dispatch --from-queue (remote): hard-skips a held task (suggest:triage), a
 // When every candidate is held, --from-queue picks nothing and exits 1 ("queue
 // empty") — the held task stays visible in `spor next` for a human to triage, but
 // AUTOMATIC dispatch never re-picks it (same shape as the blocked/question drops).
-test("dispatch --from-queue (remote): a held-only queue dispatches nothing (exits 1)", { skip: isWin }, async () => {
+test("dispatch --from-queue (remote): a held-only queue dispatches nothing (exits 1)", async () => {
   const { home, repo } = fixture();
   const srv = http.createServer((req, res) => {
     let body = "";
@@ -1636,7 +1623,7 @@ test("dispatch --from-queue (remote): a held-only queue dispatches nothing (exit
   }
 });
 
-test("dispatch <node-id> (local): no lease, no claim line — byte-identical", { skip: isWin }, async () => {
+test("dispatch <node-id> (local): no lease, no claim line — byte-identical", async () => {
   // Local mode has no pool/contention; the auto-claim is a no-op and emits no
   // claim line, keeping local node dispatch output unchanged.
   const { home, repo } = fixture();
@@ -1655,7 +1642,7 @@ test("dispatch <node-id> (local): no lease, no claim line — byte-identical", {
 const inFlightAgent = (name, extra = {}) =>
   JSON.stringify([{ id: "g1", name, kind: "background", status: "busy", state: "working", cwd: "/x", ...extra }]);
 
-test("dispatch <node-id> (local): a same-named agent already in flight refuses, no launch", { skip: isWin }, () => {
+test("dispatch <node-id> (local): a same-named agent already in flight refuses, no launch", () => {
   const { home, repo } = fixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const sentinel = path.join(home, "g-launched");
@@ -1668,7 +1655,7 @@ test("dispatch <node-id> (local): a same-named agent already in flight refuses, 
   assert.ok(!fs.existsSync(sentinel), "no duplicate agent was launched");
 });
 
-test("dispatch <node-id> --force (local): launches despite an agent in flight", { skip: isWin }, () => {
+test("dispatch <node-id> --force (local): launches despite an agent in flight", () => {
   const { home, repo } = fixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const sentinel = path.join(home, "g-launched");
@@ -1678,7 +1665,7 @@ test("dispatch <node-id> --force (local): launches despite an agent in flight", 
   assert.ok(fs.existsSync(sentinel), "the agent launched with --force");
 });
 
-test("dispatch <node-id> (local): a DONE same-named agent is not in flight — dispatch proceeds", { skip: isWin }, () => {
+test("dispatch <node-id> (local): a DONE same-named agent is not in flight — dispatch proceeds", () => {
   const { home, repo } = fixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const sentinel = path.join(home, "g-launched");
@@ -1689,7 +1676,7 @@ test("dispatch <node-id> (local): a DONE same-named agent is not in flight — d
   assert.ok(fs.existsSync(sentinel), "a finished agent does not block dispatch");
 });
 
-test("dispatch free-text (local): NOT guarded even if an agent shares the derived name (node mode only)", { skip: isWin }, () => {
+test("dispatch free-text (local): NOT guarded even if an agent shares the derived name (node mode only)", () => {
   const { home, repo } = fixture();
   const sentinel = path.join(home, "g-launched");
   const stub = claudeStub(home, sentinel);
@@ -1699,7 +1686,7 @@ test("dispatch free-text (local): NOT guarded even if an agent shares the derive
   assert.ok(fs.existsSync(sentinel), "free-text dispatch is not guarded — only node dispatch is");
 });
 
-test("dispatch <node-id> (local): fails soft on unparseable agents output (no guard, dispatches)", { skip: isWin }, () => {
+test("dispatch <node-id> (local): fails soft on unparseable agents output (no guard, dispatches)", () => {
   const { home, repo } = fixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const sentinel = path.join(home, "g-launched");
@@ -1724,7 +1711,7 @@ test("dispatch <node-id> --print: previews the in-flight warning; clean when not
   assert.doesNotMatch(clean.stdout, /in-flight:/);
 });
 
-test("dispatch <node-id> (remote): an in-flight agent refuses BEFORE the claim — no claim POST, no launch", { skip: isWin }, async () => {
+test("dispatch <node-id> (remote): an in-flight agent refuses BEFORE the claim — no claim POST, no launch", async () => {
   const { home, repo } = fixture();
   const { srv, hits, base } = await claimStub({ claimStatus: 200 });
   const sentinel = path.join(home, "launched");
@@ -1743,7 +1730,7 @@ test("dispatch <node-id> (remote): an in-flight agent refuses BEFORE the claim �
   }
 });
 
-test("dispatch <node-id> --force (remote): still auto-claims and launches", { skip: isWin }, async () => {
+test("dispatch <node-id> --force (remote): still auto-claims and launches", async () => {
   const { home, repo } = fixture();
   const { srv, hits, base } = await claimStub({ claimStatus: 200 });
   const sentinel = path.join(home, "launched");
@@ -1795,7 +1782,7 @@ function resolvedFixture() {
   return { home, nodes, repo };
 }
 
-test("dispatch <node-id> (local): a DONE (terminal status) node refuses, no launch", { skip: isWin }, () => {
+test("dispatch <node-id> (local): a DONE (terminal status) node refuses, no launch", () => {
   const { home, repo } = resolvedFixture();
   const sentinel = path.join(home, "g-launched");
   const stub = claudeStub(home, sentinel);
@@ -1806,7 +1793,7 @@ test("dispatch <node-id> (local): a DONE (terminal status) node refuses, no laun
   assert.ok(!fs.existsSync(sentinel), "no agent was launched at finished work");
 });
 
-test("dispatch <node-id> (local): a node retired by an inbound resolves edge refuses even with an open status", { skip: isWin }, () => {
+test("dispatch <node-id> (local): a node retired by an inbound resolves edge refuses even with an open status", () => {
   const { home, repo } = resolvedFixture();
   const sentinel = path.join(home, "g-launched");
   const stub = claudeStub(home, sentinel);
@@ -1816,7 +1803,7 @@ test("dispatch <node-id> (local): a node retired by an inbound resolves edge ref
   assert.ok(!fs.existsSync(sentinel), "the status lags but the resolver retires it — no launch");
 });
 
-test("dispatch <node-id> --force (local): launches despite a resolved target", { skip: isWin }, () => {
+test("dispatch <node-id> --force (local): launches despite a resolved target", () => {
   const { home, repo } = resolvedFixture();
   const sentinel = path.join(home, "g-launched");
   const stub = claudeStub(home, sentinel);
@@ -1825,7 +1812,7 @@ test("dispatch <node-id> --force (local): launches despite a resolved target", {
   assert.ok(fs.existsSync(sentinel), "the agent launched with --force");
 });
 
-test("dispatch <node-id> (local): a genuinely-open node is NOT guarded — dispatch proceeds", { skip: isWin }, () => {
+test("dispatch <node-id> (local): a genuinely-open node is NOT guarded — dispatch proceeds", () => {
   const { home, repo } = resolvedFixture();
   const sentinel = path.join(home, "g-launched");
   const stub = claudeStub(home, sentinel);
@@ -1846,7 +1833,7 @@ test("dispatch <node-id> --print (local): previews the resolved warning; --force
   assert.doesNotMatch(clean.stdout, /resolved:/);
 });
 
-test("dispatch <node-id> (remote): a node the server reports resolved refuses BEFORE the claim — no claim POST, no launch", { skip: isWin }, async () => {
+test("dispatch <node-id> (remote): a node the server reports resolved refuses BEFORE the claim — no claim POST, no launch", async () => {
   const { home, repo } = fixture();
   // The server's get(node) surfaces the inbound resolver as `resolution` (API.md §3).
   const { srv, hits, base } = await claimStub({ nodeResolution: { by: "dec-fix", edge: "resolves", title: "The fix that resolved it" } });
@@ -1863,7 +1850,7 @@ test("dispatch <node-id> (remote): a node the server reports resolved refuses BE
   }
 });
 
-test("dispatch <node-id> (remote): a terminal-status node from the server refuses", { skip: isWin }, async () => {
+test("dispatch <node-id> (remote): a terminal-status node from the server refuses", async () => {
   const { home, repo } = fixture();
   const { srv, hits, base } = await claimStub({ nodeStatus: "done" });
   const sentinel = path.join(home, "launched");
@@ -1879,7 +1866,7 @@ test("dispatch <node-id> (remote): a terminal-status node from the server refuse
   }
 });
 
-test("dispatch <node-id> --force (remote): launches despite the server reporting it resolved", { skip: isWin }, async () => {
+test("dispatch <node-id> --force (remote): launches despite the server reporting it resolved", async () => {
   const { home, repo } = fixture();
   const { srv, hits, base } = await claimStub({ nodeStatus: "done" });
   const sentinel = path.join(home, "launched");

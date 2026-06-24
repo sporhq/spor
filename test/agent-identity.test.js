@@ -17,10 +17,10 @@ const http = require("node:http");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { writeSpawnableNodeStub } = require("./helpers/portable");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const kernel = require("../lib/kernel/graph.js");
-const isWin = process.platform === "win32";
 
 // --- env helpers (mirror dispatch.test.js) --------------------------------
 const ISO = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-iso-"));
@@ -73,7 +73,7 @@ test("agent create (local): writes a valid agent node + owned-by edge to the sol
   const { home, nodes } = homeWithPerson();
   const r = run(["agent", "create", "anthony-laptop"], { SPOR_HOME: home });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.match(r.stdout, /created agent agent-anthony-laptop owned by person-anthony/);
+  assert.match(r.stdout, /created agent agent-anthony-laptop owned by Anthony Allen \(person-anthony\)/);
   const md = fs.readFileSync(path.join(nodes, "agent-anthony-laptop.md"), "utf8");
   assert.match(md, /^type: agent$/m);
   assert.match(md, /^spiffe: spiffe:\/\/spor\.local\/person\/anthony\/agent\/anthony-laptop$/m);
@@ -135,7 +135,7 @@ test("agent list (local): lists agents with owner + status; empty graph says so"
   run(["agent", "create", "anthony-laptop"], { SPOR_HOME: home });
   const r = run(["agent", "list"], { SPOR_HOME: home });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.match(r.stdout, /agent-anthony-laptop\towned-by person-anthony\tactive/);
+  assert.match(r.stdout, /agent-anthony-laptop\towned-by Anthony Allen \(person-anthony\)\tactive/);
 });
 
 test("agent: usage on a bad subcommand / missing label", () => {
@@ -264,7 +264,7 @@ function agentStub({ agentsStatus = 201, agentsBody = null, selfStatus = 201, se
   );
 }
 
-test("agent create (remote): --owner uses the ADMIN POST /v1/admin/agents, not the self-serve door", { skip: isWin }, async () => {
+test("agent create (remote): --owner uses the ADMIN POST /v1/admin/agents, not the self-serve door", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-rem-"));
   const { srv, hits, base } = await agentStub({ agentsStatus: 201 });
   try {
@@ -281,7 +281,7 @@ test("agent create (remote): --owner uses the ADMIN POST /v1/admin/agents, not t
   }
 });
 
-test("agent create (remote): a server without the endpoint (404) fails soft, not a crash", { skip: isWin }, async () => {
+test("agent create (remote): a server without the endpoint (404) fails soft, not a crash", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-rem2-"));
   const { srv, base } = await agentStub({ agentsStatus: 404 });
   try {
@@ -293,7 +293,7 @@ test("agent create (remote): a server without the endpoint (404) fails soft, not
   }
 });
 
-test("agent list (remote): reads GET /v1/agents (the caller's owned agents)", { skip: isWin }, async () => {
+test("agent list (remote): reads GET /v1/agents (the caller's owned agents)", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-rem3-"));
   const { srv, hits, base } = await agentStub({ agentsList: [{ id: "agent-anthony-laptop", owner: "person-anthony", status: "active" }] });
   try {
@@ -306,7 +306,7 @@ test("agent list (remote): reads GET /v1/agents (the caller's owned agents)", { 
   }
 });
 
-test("agent list (remote): falls back to the /v1/changes projection when /v1/agents 404s", { skip: isWin }, async () => {
+test("agent list (remote): falls back to the /v1/changes projection when /v1/agents 404s", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-rem3b-"));
   const { srv, base } = await agentStub({}); // agentsList unset => /v1/agents 404 => /v1/changes
   try {
@@ -325,7 +325,7 @@ test("agent list (remote): falls back to the /v1/changes projection when /v1/age
 // (task-spor-cli-agent-self-serve-verbs)
 // ---------------------------------------------------------------------------
 
-test("agent create (remote, self-serve): no --owner POSTs /v1/agents owned by the caller", { skip: isWin }, async () => {
+test("agent create (remote, self-serve): no --owner POSTs /v1/agents owned by the caller", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-self-"));
   const { srv, hits, base } = await agentStub({});
   try {
@@ -343,7 +343,7 @@ test("agent create (remote, self-serve): no --owner POSTs /v1/agents owned by th
   }
 });
 
-test("agent create (remote, self-serve): an unbound caller (403) is nudged to whoami", { skip: isWin }, async () => {
+test("agent create (remote, self-serve): an unbound caller (403) is nudged to whoami", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-self2-"));
   const { srv, base } = await agentStub({ selfStatus: 403, selfBody: { error: { code: "forbidden", message: "needs a bound person identity" } } });
   try {
@@ -394,7 +394,7 @@ function agentTokenStub({ standing = true } = {}) {
   );
 }
 
-test("agent token (remote): mints a standing PAT over POST /v1/agents/{id}/token {standing:true}", { skip: isWin }, async () => {
+test("agent token (remote): mints a standing PAT over POST /v1/agents/{id}/token {standing:true}", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-tok-"));
   const { srv, hits, base } = await agentTokenStub();
   try {
@@ -416,7 +416,7 @@ test("agent token (remote): mints a standing PAT over POST /v1/agents/{id}/token
   }
 });
 
-test("agent token (remote): --expires past the 1-year cap surfaces the server 422", { skip: isWin }, async () => {
+test("agent token (remote): --expires past the 1-year cap surfaces the server 422", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-tok2-"));
   const { srv, base } = await agentTokenStub();
   try {
@@ -428,7 +428,7 @@ test("agent token (remote): --expires past the 1-year cap surfaces the server 42
   }
 });
 
-test("agent token (remote): a non-owner is a friendly 403", { skip: isWin }, async () => {
+test("agent token (remote): a non-owner is a friendly 403", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-tok3-"));
   const { srv, base } = await agentTokenStub();
   try {
@@ -440,7 +440,7 @@ test("agent token (remote): a non-owner is a friendly 403", { skip: isWin }, asy
   }
 });
 
-test("agent token (remote): an unknown agent is a friendly 404", { skip: isWin }, async () => {
+test("agent token (remote): an unknown agent is a friendly 404", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-tok4-"));
   const { srv, base } = await agentTokenStub();
   try {
@@ -452,7 +452,7 @@ test("agent token (remote): an unknown agent is a friendly 404", { skip: isWin }
   }
 });
 
-test("agent token (remote): an old server (no standing echo) warns, never presents a durable PAT", { skip: isWin }, async () => {
+test("agent token (remote): an old server (no standing echo) warns, never presents a durable PAT", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-tok5-"));
   const { srv, base } = await agentTokenStub({ standing: false });
   try {
@@ -466,7 +466,7 @@ test("agent token (remote): an old server (no standing echo) warns, never presen
   }
 });
 
-test("agent token list (remote): lists the agent's standing PATs", { skip: isWin }, async () => {
+test("agent token list (remote): lists the agent's standing PATs", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-tok6-"));
   const { srv, hits, base } = await agentTokenStub();
   try {
@@ -480,7 +480,7 @@ test("agent token list (remote): lists the agent's standing PATs", { skip: isWin
   }
 });
 
-test("agent token revoke (remote): deletes one by hash prefix", { skip: isWin }, async () => {
+test("agent token revoke (remote): deletes one by hash prefix", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-tok7-"));
   const { srv, hits, base } = await agentTokenStub();
   try {
@@ -493,7 +493,7 @@ test("agent token revoke (remote): deletes one by hash prefix", { skip: isWin },
   }
 });
 
-test("agent token revoke (remote): a prefix that isn't one is a friendly 404", { skip: isWin }, async () => {
+test("agent token revoke (remote): a prefix that isn't one is a friendly 404", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-tok8-"));
   const { srv, base } = await agentTokenStub();
   try {
@@ -505,7 +505,7 @@ test("agent token revoke (remote): a prefix that isn't one is a friendly 404", {
   }
 });
 
-test("agent token revoke without a prefix exits 1 with usage", { skip: isWin }, async () => {
+test("agent token revoke without a prefix exits 1 with usage", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-tok9-"));
   const { srv, base } = await agentTokenStub();
   try {
@@ -537,10 +537,10 @@ test("agent token: an invalid agent id is rejected with the prefix nudge", () =>
 
 // A claude stub that dumps cwd + argv to a file, then exits 0.
 function argvStub(dir, outFile) {
-  const stub = path.join(dir, "claude-argv.sh");
-  fs.writeFileSync(stub, `#!/bin/sh\n{ pwd; printf '%s\\n' "$@"; } > "${outFile}"\nexit 0\n`);
-  fs.chmodSync(stub, 0o755);
-  return stub;
+  return writeSpawnableNodeStub(dir, "claude-argv", `
+const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(outFile)}, [process.cwd(), ...process.argv.slice(2)].join("\\n") + "\\n");
+`);
 }
 
 // Stub server: /v1/me, GET /v1/nodes/{id}, POST /v1/nodes/{id}/claim (records
@@ -598,7 +598,7 @@ test("dispatch (local) --print: shows the pinned session, NO --session-id (claud
   assert.doesNotMatch(r.stdout, /^agent:/m); // local mode => no agent-scoping line
 });
 
-test("dispatch (remote) --print: no agent configured => person-scoped notice, lease bound after launch", { skip: isWin }, async () => {
+test("dispatch (remote) --print: no agent configured => person-scoped notice, lease bound after launch", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d1-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d1r-"));
   const { srv, base } = await dispatchStub();
@@ -614,7 +614,7 @@ test("dispatch (remote) --print: no agent configured => person-scoped notice, le
   }
 });
 
-test("dispatch (remote) --as: overrides dispatch.agent for one dispatch, marked (via --as)", { skip: isWin }, async () => {
+test("dispatch (remote) --as: overrides dispatch.agent for one dispatch, marked (via --as)", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-das-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-dasr-"));
   // dispatch.agent default is one agent; --as picks a different one for this run.
@@ -656,7 +656,7 @@ test("dispatch --as: a prefix-less id is refused before launch with a 'did you m
   assert.match(r.stderr, /did you mean '--as agent-anthony-shark-november'/);
 });
 
-test("dispatch (remote, real): mints a session-DEFERRED token + 0600 mcp-config, NO --session-id, binds the run session after launch", { skip: isWin }, async () => {
+test("dispatch (remote, real): mints a session-DEFERRED token + 0600 mcp-config, NO --session-id, binds the run session after launch", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d2-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d2r-"));
   const outFile = path.join(home, "argv.out");
@@ -683,7 +683,7 @@ test("dispatch (remote, real): mints a session-DEFERRED token + 0600 mcp-config,
     // the mcp-config file is 0600 and carries the agent-scoped bearer
     const mcpFile = argv[mi + 1];
     const st = fs.statSync(mcpFile);
-    assert.strictEqual(st.mode & 0o777, 0o600, "mcp-config is 0600");
+    if (process.platform !== "win32") assert.strictEqual(st.mode & 0o777, 0o600, "mcp-config is 0600");
     const conf = JSON.parse(fs.readFileSync(mcpFile, "utf8"));
     assert.strictEqual(conf.mcpServers.spor.type, "http");
     assert.match(conf.mcpServers.spor.url, /\/mcp$/);
@@ -713,7 +713,7 @@ test("dispatch (remote, real): mints a session-DEFERRED token + 0600 mcp-config,
   }
 });
 
-test("dispatch (remote, real): mint endpoint absent (404) => fails soft, person-scoped, no mcp-config flags", { skip: isWin }, async () => {
+test("dispatch (remote, real): mint endpoint absent (404) => fails soft, person-scoped, no mcp-config flags", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d3-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d3r-"));
   const outFile = path.join(home, "argv.out");
@@ -735,7 +735,7 @@ test("dispatch (remote, real): mint endpoint absent (404) => fails soft, person-
   }
 });
 
-test("dispatch (remote, real): mint 403 (caller doesn't own the agent) => fails soft, person-scoped", { skip: isWin }, async () => {
+test("dispatch (remote, real): mint 403 (caller doesn't own the agent) => fails soft, person-scoped", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d4-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d4r-"));
   const outFile = path.join(home, "argv.out");
@@ -761,7 +761,7 @@ test("dispatch (remote, real): mint 403 (caller doesn't own the agent) => fails 
 // person-scoped with a non-actionable warning. Now it's caught CLIENT-SIDE before
 // any network: no /v1/agents/{id}/token round-trip, an actionable warning naming
 // the bad value + the fix, and a clean person-scoped launch.
-test("dispatch (remote, real): a prefix-less dispatch.agent fails soft client-side — no mint round-trip, actionable warning, person-scoped", { skip: isWin }, async () => {
+test("dispatch (remote, real): a prefix-less dispatch.agent fails soft client-side — no mint round-trip, actionable warning, person-scoped", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d5-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d5r-"));
   const outFile = path.join(home, "argv.out");
@@ -791,7 +791,7 @@ test("dispatch (remote, real): a prefix-less dispatch.agent fails soft client-si
 // The same misconfiguration under --print: the preview must report person-scoped
 // (not "would mint a token", which the old preview did — a lie, since the mint
 // 422s), with the actionable warning on stderr.
-test("dispatch (remote, --print): a prefix-less dispatch.agent previews person-scoped + warns", { skip: isWin }, async () => {
+test("dispatch (remote, --print): a prefix-less dispatch.agent previews person-scoped + warns", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d6-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d6r-"));
   fs.mkdirSync(home, { recursive: true });
@@ -815,7 +815,7 @@ test("dispatch (remote, --print): a prefix-less dispatch.agent previews person-s
 // pin short-circuits in every other test. The fake agents list (SPOR_FAKE_AGENTS_JSON)
 // is the same seam the dup-guard uses; --force is needed because that static list
 // represents the POST-launch agent set, which the PRE-launch dup-guard also sees.
-test("dispatch (remote, real): captures the run session from `claude agents --json` and binds it (no SPOR_SESSION_ID)", { skip: isWin }, async () => {
+test("dispatch (remote, real): captures the run session from `claude agents --json` and binds it (no SPOR_SESSION_ID)", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-cap-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-capr-"));
   const outFile = path.join(home, "argv.out");

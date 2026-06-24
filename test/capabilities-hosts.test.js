@@ -18,7 +18,6 @@ const http = require("node:http");
 const { spawn } = require("node:child_process");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
-const isWin = process.platform === "win32";
 
 // Strip ambient SPOR_*/SUBSTRATE_* so a configured dev box can't flip a test to
 // remote or leak a token (mirrors capabilities-publish.test.js / dispatch.test.js).
@@ -67,13 +66,13 @@ function hostsStub({ status = 200, body } = {}) {
 const remoteEnv = (home, base, extra = {}) =>
   baseEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: "test-token", ...extra });
 
-test("hosts (local mode): refuses remote-only with a clear line", { skip: isWin }, async () => {
+test("hosts (local mode): refuses remote-only with a clear line", async () => {
   const r = await runAsync(["capabilities", "hosts", "profile-x"], baseEnv({ SPOR_HOME: freshHome(), XDG_CONFIG_HOME: freshHome() }));
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /remote-only/);
 });
 
-test("hosts (remote, no profile id): usage error", { skip: isWin }, async () => {
+test("hosts (remote, no profile id): usage error", async () => {
   const { srv, base } = await hostsStub();
   try {
     const r = await runAsync(["capabilities", "hosts"], remoteEnv(freshHome(), base));
@@ -84,7 +83,7 @@ test("hosts (remote, no profile id): usage error", { skip: isWin }, async () => 
   }
 });
 
-test("hosts (remote): lists satisfiable re-route targets + unsatisfiable with reasons", { skip: isWin }, async () => {
+test("hosts (remote): lists satisfiable re-route targets + unsatisfiable with reasons", async () => {
   const { srv, hits, base } = await hostsStub({
     body: {
       profile: "profile-codex",
@@ -111,7 +110,7 @@ test("hosts (remote): lists satisfiable re-route targets + unsatisfiable with re
   }
 });
 
-test("hosts (remote, none satisfiable): says escalate to the owner", { skip: isWin }, async () => {
+test("hosts (remote, none satisfiable): says escalate to the owner", async () => {
   const { srv, base } = await hostsStub({
     body: { profile: "profile-codex", satisfiable: [], unsatisfiable: [{ agent: "agent-a", owner: "person-x", age_seconds: 5, reasons: ["x"] }], counts: { satisfiable: 0, unsatisfiable: 1 } },
   });
@@ -124,7 +123,7 @@ test("hosts (remote, none satisfiable): says escalate to the owner", { skip: isW
   }
 });
 
-test("hosts (remote): --owner and --max-age ride the query string", { skip: isWin }, async () => {
+test("hosts (remote): --owner and --max-age ride the query string", async () => {
   const { srv, hits, base } = await hostsStub({ body: { profile: "profile-x", satisfiable: [], unsatisfiable: [], counts: {} } });
   try {
     const r = await runAsync(["capabilities", "hosts", "profile-x", "--owner", "me", "--max-age", "30m"], remoteEnv(freshHome(), base));
@@ -138,7 +137,7 @@ test("hosts (remote): --owner and --max-age ride the query string", { skip: isWi
   }
 });
 
-test("hosts (remote): --json emits the parsed match", { skip: isWin }, async () => {
+test("hosts (remote): --json emits the parsed match", async () => {
   const body = { profile: "profile-codex", satisfiable: [{ agent: "agent-bob", owner: "person-bob", age_seconds: 1 }], unsatisfiable: [], counts: { satisfiable: 1, unsatisfiable: 0 } };
   const { srv, base } = await hostsStub({ body });
   try {
@@ -152,7 +151,7 @@ test("hosts (remote): --json emits the parsed match", { skip: isWin }, async () 
   }
 });
 
-test("hosts (remote): a 404 (unknown profile / no surface) fails soft", { skip: isWin }, async () => {
+test("hosts (remote): a 404 (unknown profile / no surface) fails soft", async () => {
   const { srv, base } = await hostsStub({ status: 404 });
   try {
     const r = await runAsync(["capabilities", "hosts", "profile-nope"], remoteEnv(freshHome(), base));
@@ -163,7 +162,7 @@ test("hosts (remote): a 404 (unknown profile / no surface) fails soft", { skip: 
   }
 });
 
-test("hosts (remote): a 403 (steward-scoped) reports an authorization denial, not an outage", { skip: isWin }, async () => {
+test("hosts (remote): a 403 (steward-scoped) reports an authorization denial, not an outage", async () => {
   // A member asking for a colleague's boxes is 403 (host visibility is steward-scoped,
   // API.md §3). It must NOT be misreported as a transport outage
   // (issue-spor-capabilities-hosts-403-misreported).
@@ -180,7 +179,7 @@ test("hosts (remote): a 403 (steward-scoped) reports an authorization denial, no
   }
 });
 
-test("hosts (remote): a dead server fails soft with a transport line", { skip: isWin }, async () => {
+test("hosts (remote): a dead server fails soft with a transport line", async () => {
   const r = await runAsync(["capabilities", "hosts", "profile-x"], remoteEnv(freshHome(), "http://127.0.0.1:1"));
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /could not reach the fleet scheduler/);

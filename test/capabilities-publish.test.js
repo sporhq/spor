@@ -13,10 +13,10 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
-const { spawn, spawnSync } = require("node:child_process");
+const { spawn } = require("node:child_process");
+const { pathWithOnlyGit } = require("./helpers/portable");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
-const isWin = process.platform === "win32";
 
 // Strip the ambient SPOR_*/SUBSTRATE_* so a configured dev box can't flip a test
 // to remote or leak a token (mirrors dispatch.test.js / agent-identity.test.js).
@@ -65,10 +65,7 @@ function homeWithCaps() {
 // harnesses + ~/.claude (a dev box with `claude` installed flips the assertion).
 function cleanProbeEnv() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-caps-cleanhome-"));
-  const pathDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-caps-path-"));
-  const git = (spawnSync("/bin/sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout || "").trim();
-  if (git) { try { fs.symlinkSync(git, path.join(pathDir, "git")); } catch { /* ignore */ } }
-  return { HOME: home, PATH: pathDir };
+  return { HOME: home, PATH: pathWithOnlyGit() };
 }
 
 // Records every request; POST /v1/agents/{id}/capabilities echoes the collapsed caps.
@@ -95,14 +92,14 @@ function capStub({ status = 200 } = {}) {
 const remoteEnv = (home, base, extra = {}) =>
   baseEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: "test-token", ...extra });
 
-test("publish (local mode): refuses remote-only with a clear line", { skip: isWin }, async () => {
+test("publish (local mode): refuses remote-only with a clear line", async () => {
   const home = homeWithCaps();
   const r = await runAsync(["capabilities", "publish"], baseEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home }));
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /remote-only/);
 });
 
-test("publish (remote, no dispatch.agent): refuses with a `spor agent use` hint", { skip: isWin }, async () => {
+test("publish (remote, no dispatch.agent): refuses with a `spor agent use` hint", async () => {
   const home = homeWithCaps();
   const { srv, base } = await capStub();
   try {
@@ -115,7 +112,7 @@ test("publish (remote, no dispatch.agent): refuses with a `spor agent use` hint"
   }
 });
 
-test("publish (remote): re-probes THIS box then POSTs the effective capabilities to /v1/agents/{id}/capabilities", { skip: isWin }, async () => {
+test("publish (remote): re-probes THIS box then POSTs the effective capabilities to /v1/agents/{id}/capabilities", async () => {
   const home = homeWithCaps();
   const { srv, hits, base } = await capStub();
   try {
@@ -137,7 +134,7 @@ test("publish (remote): re-probes THIS box then POSTs the effective capabilities
   }
 });
 
-test("publish (remote): seeds reachable_mcp:[spor] even when config carried no .probed (the manual/auto parity fix)", { skip: isWin }, async () => {
+test("publish (remote): seeds reachable_mcp:[spor] even when config carried no .probed (the manual/auto parity fix)", async () => {
   // The regression: a box whose ~/.spor/config.json has NO dispatch.capabilities
   // (never ran session-start) used to publish a caps set MISSING the spor seed, so
   // an `mcp:[spor]` profile failed to host-match it. The manual verb now re-probes
@@ -156,7 +153,7 @@ test("publish (remote): seeds reachable_mcp:[spor] even when config carried no .
   }
 });
 
-test("publish (remote): an undeployed surface (404) fails soft, not a crash", { skip: isWin }, async () => {
+test("publish (remote): an undeployed surface (404) fails soft, not a crash", async () => {
   const home = homeWithCaps();
   const { srv, base } = await capStub({ status: 404 });
   try {
@@ -168,7 +165,7 @@ test("publish (remote): an undeployed surface (404) fails soft, not a crash", { 
   }
 });
 
-test("publish (remote): a dead server fails soft with a transport line", { skip: isWin }, async () => {
+test("publish (remote): a dead server fails soft with a transport line", async () => {
   const home = homeWithCaps();
   // a port nothing is listening on
   const r = await runAsync(["capabilities", "publish"], remoteEnv(home, "http://127.0.0.1:1", { SPOR_DISPATCH_AGENT: "agent-x" }));

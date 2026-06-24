@@ -24,7 +24,6 @@ const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const tar = require("../lib/tar.js");
 const { gitBlobSha, getNodeJson } = require("../bin/spor.js");
 const graphLib = require("../lib/graph.js");
-const isWin = process.platform === "win32";
 
 // Bare env with no SPOR_*/SUBSTRATE_* leakage (a configured dev box must not flip
 // a local-mode test to remote or leak a token); config homes isolated. Mirrors
@@ -144,7 +143,7 @@ test("get (local) --json emits the structured object: frontmatter, body, edges, 
   assert.strictEqual(j.revision, gitBlobSha(fs.readFileSync(path.join(nodes, "dec-x.md"))));
 });
 
-test("get (local) --json revision equals git hash-object", { skip: isWin }, () => {
+test("get (local) --json revision equals git hash-object", () => {
   const { dir, nodes } = fixtureGraph();
   const j = JSON.parse(run(["get", "dec-x", "--json"], { SPOR_HOME: dir }).stdout);
   let viaGit;
@@ -242,7 +241,7 @@ function nodeStub(nodesDir) {
 const remoteEnv = (base, extra = {}) =>
   bare({ SPOR_HOME: ISO_HOME, SPOR_SERVER: base, SPOR_TOKEN: "test-token", ...extra });
 
-test("get (remote) --json reads /v1/nodes/<id> + /v1/export and matches local over the same graph", { skip: isWin }, async () => {
+test("get (remote) --json reads /v1/nodes/<id> + /v1/export and matches local over the same graph", async () => {
   const { dir, nodes } = fixtureGraph();
   const { srv, hits, base } = await nodeStub(nodes);
   try {
@@ -263,7 +262,7 @@ test("get (remote) --json reads /v1/nodes/<id> + /v1/export and matches local ov
   }
 });
 
-test("get (remote) plain (no --json) prints raw markdown and never fetches the export", { skip: isWin }, async () => {
+test("get (remote) plain (no --json) prints raw markdown and never fetches the export", async () => {
   const { nodes } = fixtureGraph();
   const { srv, hits, base } = await nodeStub(nodes);
   try {
@@ -276,7 +275,7 @@ test("get (remote) plain (no --json) prints raw markdown and never fetches the e
   }
 });
 
-test("get (remote) --json on a 404 exits 1 and never fetches the export", { skip: isWin }, async () => {
+test("get (remote) --json on a 404 exits 1 and never fetches the export", async () => {
   const { nodes } = fixtureGraph();
   const { srv, hits, base } = await nodeStub(nodes);
   try {
@@ -289,7 +288,7 @@ test("get (remote) --json on a 404 exits 1 and never fetches the export", { skip
   }
 });
 
-test("get (remote) --json on a dead server fails soft with a transport line, no stack", { skip: isWin }, async () => {
+test("get (remote) --json on a dead server fails soft with a transport line, no stack", async () => {
   const r = await runAsync(["get", "dec-x", "--json"], remoteEnv("http://127.0.0.1:1"));
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /offline/);

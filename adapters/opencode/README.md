@@ -1,8 +1,8 @@
 # OpenCode adapter
 
 OpenCode has no command-hook system — plugins are in-process JS — so this
-adapter is a single zero-dependency plugin file (`spor.js`) that shells
-out to `bin/spor-hook` with Claude-shaped payloads. Same core, same
+adapter is a single zero-dependency plugin file (`spor.js`) that launches
+`bin/spor-hook.js` with Claude-shaped payloads. Same core, same
 fail-open behavior as every other host.
 
 ## Install

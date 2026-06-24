@@ -23,7 +23,6 @@ const { spawn } = require("node:child_process");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const tar = require("../lib/tar.js");
-const isWin = process.platform === "win32";
 
 // Strip ambient SPOR_*/SUBSTRATE_* so a configured dev box can't flip a test to
 // remote or leak a token (mirrors analytics-remote.test.js).
@@ -138,7 +137,7 @@ async function localQuery(nodes, args) {
   return runAsync(["query", ...args, "--nodes", nodes], baseEnv());
 }
 
-test("remote: --type --ids is byte-identical to a local query over the same graph", { skip: isWin }, async () => {
+test("remote: --type --ids is byte-identical to a local query over the same graph", async () => {
   const nodes = scratchNodes();
   const { srv, hits, base } = await exportStub(nodes);
   try {
@@ -155,7 +154,7 @@ test("remote: --type --ids is byte-identical to a local query over the same grap
   }
 });
 
-test("remote: --where AND predicate matches local", { skip: isWin }, async () => {
+test("remote: --where AND predicate matches local", async () => {
   const nodes = scratchNodes();
   const { srv, base } = await exportStub(nodes);
   try {
@@ -169,7 +168,7 @@ test("remote: --where AND predicate matches local", { skip: isWin }, async () =>
   }
 });
 
-test("remote: --edges --edge-type --to --json matches local (and the membership --where on slugs)", { skip: isWin }, async () => {
+test("remote: --edges --edge-type --to --json matches local (and the membership --where on slugs)", async () => {
   const nodes = scratchNodes();
   const { srv, base } = await exportStub(nodes);
   try {
@@ -189,7 +188,7 @@ test("remote: --edges --edge-type --to --json matches local (and the membership 
   }
 });
 
-test("remote: --full reproduces the raw node markdown byte-for-byte (the export round-trip)", { skip: isWin }, async () => {
+test("remote: --full reproduces the raw node markdown byte-for-byte (the export round-trip)", async () => {
   const nodes = scratchNodes();
   const { srv, base } = await exportStub(nodes);
   try {
@@ -203,7 +202,7 @@ test("remote: --full reproduces the raw node markdown byte-for-byte (the export 
   }
 });
 
-test("remote: --json default projection matches local", { skip: isWin }, async () => {
+test("remote: --json default projection matches local", async () => {
   const nodes = scratchNodes();
   const { srv, base } = await exportStub(nodes);
   try {
@@ -216,7 +215,7 @@ test("remote: --json default projection matches local", { skip: isWin }, async (
   }
 });
 
-test("remote: a no-match query prints the local empty contract", { skip: isWin }, async () => {
+test("remote: a no-match query prints the local empty contract", async () => {
   const nodes = scratchNodes();
   const { srv, base } = await exportStub(nodes);
   try {
@@ -230,7 +229,7 @@ test("remote: a no-match query prints the local empty contract", { skip: isWin }
   }
 });
 
-test("remote: an explicit --nodes always takes the LOCAL path (never hits the server)", { skip: isWin }, async () => {
+test("remote: an explicit --nodes always takes the LOCAL path (never hits the server)", async () => {
   const nodes = scratchNodes();
   const { srv, hits, base } = await exportStub(nodes);
   try {
@@ -243,7 +242,7 @@ test("remote: an explicit --nodes always takes the LOCAL path (never hits the se
   }
 });
 
-test("remote: a server error surfaces a clean line (no stack trace)", { skip: isWin }, async () => {
+test("remote: a server error surfaces a clean line (no stack trace)", async () => {
   const nodes = scratchNodes();
   // A server that 500s on /v1/export.
   const srv = http.createServer((req, res) => {
@@ -263,7 +262,7 @@ test("remote: a server error surfaces a clean line (no stack trace)", { skip: is
   }
 });
 
-test("remote: a corrupt gzip body fails clean (no stack trace)", { skip: isWin }, async () => {
+test("remote: a corrupt gzip body fails clean (no stack trace)", async () => {
   // A server that claims gzip (magic bytes) but ships a truncated/garbage stream.
   const srv = http.createServer((req, res) => {
     res.writeHead(200, { "content-type": "application/x-tar" });

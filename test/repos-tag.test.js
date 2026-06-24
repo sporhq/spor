@@ -19,7 +19,6 @@ const { spawn, spawnSync } = require("node:child_process");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const tar = require("../lib/tar.js");
-const isWin = process.platform === "win32";
 
 // Env with no SPOR_*/SUBSTRATE_*/XDG leakage so a configured dev box can't flip a
 // local-mode test to remote or leak a token.
@@ -277,7 +276,7 @@ date: 2026-06-01
 Body about foo.
 `;
 
-test("repos tag (remote) GETs the node then put_node-updates it with the revision", { skip: isWin }, async () => {
+test("repos tag (remote) GETs the node then put_node-updates it with the revision", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-repos-tag-r-"));
   const { srv, hits, base } = await nodeStub({ raw: REPO_RAW, revision: "rev-1" });
   try {
@@ -298,7 +297,7 @@ test("repos tag (remote) GETs the node then put_node-updates it with the revisio
   }
 });
 
-test("repos tag (remote) a no-op set skips the put_node entirely", { skip: isWin }, async () => {
+test("repos tag (remote) a no-op set skips the put_node entirely", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-repos-tag-r-"));
   const tagged = REPO_RAW.replace(/^slugs: \[foo\]$/m, "slugs: [foo]\ntags: [python]");
   const { srv, hits, base } = await nodeStub({ raw: tagged });
@@ -312,7 +311,7 @@ test("repos tag (remote) a no-op set skips the put_node entirely", { skip: isWin
   }
 });
 
-test("repos untag (remote) removes a tag via the same round-trip", { skip: isWin }, async () => {
+test("repos untag (remote) removes a tag via the same round-trip", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-repos-tag-r-"));
   const tagged = REPO_RAW.replace(/^slugs: \[foo\]$/m, "slugs: [foo]\ntags: [python, backend]");
   const { srv, hits, base } = await nodeStub({ raw: tagged });
@@ -327,7 +326,7 @@ test("repos untag (remote) removes a tag via the same round-trip", { skip: isWin
   }
 });
 
-test("repos tag (remote) surfaces a put_node validation failure with the server's message + details", { skip: isWin }, async () => {
+test("repos tag (remote) surfaces a put_node validation failure with the server's message + details", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-repos-tag-r-"));
   const { srv, base } = await nodeStub({ raw: REPO_RAW, postFail: { message: "invalid_node", details: ["repo-foo: bad tags"] } });
   try {
@@ -339,7 +338,7 @@ test("repos tag (remote) surfaces a put_node validation failure with the server'
   }
 });
 
-test("repos tag (remote) maps a GET 404 to a clean 'no repo identity node'", { skip: isWin }, async () => {
+test("repos tag (remote) maps a GET 404 to a clean 'no repo identity node'", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-repos-tag-r-"));
   const { srv, base } = await nodeStub({ getStatus: 404 });
   try {
@@ -351,7 +350,7 @@ test("repos tag (remote) maps a GET 404 to a clean 'no repo identity node'", { s
   }
 });
 
-test("repos tag (remote) fails open against an unreachable server (no stack trace)", { skip: isWin }, async () => {
+test("repos tag (remote) fails open against an unreachable server (no stack trace)", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-repos-tag-r-"));
   const r = await runAsync(["repos", "tag", "foo", "python"], remoteEnv("http://127.0.0.1:1", home));
   assert.strictEqual(r.status, 1);
@@ -378,7 +377,7 @@ function exportStub(nodesDir) {
   return new Promise((resolve) => srv.listen(0, "127.0.0.1", () => resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
 }
 
-test("repos tags (remote) lists repo nodes from the team graph export", { skip: isWin }, async () => {
+test("repos tags (remote) lists repo nodes from the team graph export", async () => {
   const { nodes } = fixtureGraph(); // repo-foo on disk = the server's graph here
   fs.writeFileSync(path.join(nodes, "repo-foo.md"), REPO_RAW.replace(/^slugs: \[foo\]$/m, "slugs: [foo]\ntags: [python, backend]"));
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-repos-tag-r-"));

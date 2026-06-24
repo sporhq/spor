@@ -19,7 +19,6 @@ const http = require("node:http");
 const { spawnSync, spawn } = require("node:child_process");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
-const isWin = process.platform === "win32";
 
 // Env with no SPOR_*/SUBSTRATE_* leakage (a configured dev box must not flip a
 // local-mode test to remote or leak a token), config homes isolated to a temp
@@ -282,7 +281,7 @@ const ENTRY_BODY = {
   id: "dec-x", change: "A", patch: "@@ -0,0 +1 @@\n+Body v1.", content: "---\nid: dec-x\n---\nBody v1.\n",
 };
 
-test("history (remote) GETs /v1/nodes/<id>/history and renders the list", { skip: isWin }, async () => {
+test("history (remote) GETs /v1/nodes/<id>/history and renders the list", async () => {
   const { srv, hits, base } = await historyStub({ list: LIST_BODY });
   try {
     const r = await runAsync(["history", "dec-x"], remoteEnv(base));
@@ -296,7 +295,7 @@ test("history (remote) GETs /v1/nodes/<id>/history and renders the list", { skip
   }
 });
 
-test("history (remote) --limit forwards ?limit and --json passes the envelope through", { skip: isWin }, async () => {
+test("history (remote) --limit forwards ?limit and --json passes the envelope through", async () => {
   const { srv, hits, base } = await historyStub({ list: LIST_BODY });
   try {
     const r = await runAsync(["history", "dec-x", "--limit", "10", "--json"], remoteEnv(base));
@@ -308,7 +307,7 @@ test("history (remote) --limit forwards ?limit and --json passes the envelope th
   }
 });
 
-test("history (remote) <sha> GETs the per-revision route and renders the diff", { skip: isWin }, async () => {
+test("history (remote) <sha> GETs the per-revision route and renders the diff", async () => {
   const { srv, hits, base } = await historyStub({ entry: ENTRY_BODY });
   try {
     const r = await runAsync(["history", "dec-x", "cccccccccccc"], remoteEnv(base));
@@ -321,7 +320,7 @@ test("history (remote) <sha> GETs the per-revision route and renders the diff", 
   }
 });
 
-test("history (remote) an unknown node is a 'no history' miss (exit 1)", { skip: isWin }, async () => {
+test("history (remote) an unknown node is a 'no history' miss (exit 1)", async () => {
   const { srv, base } = await historyStub({ listStatus: 404 });
   try {
     const r = await runAsync(["history", "dec-nope"], remoteEnv(base));
@@ -332,7 +331,7 @@ test("history (remote) an unknown node is a 'no history' miss (exit 1)", { skip:
   }
 });
 
-test("history (remote) <sha> 404 surfaces the server's message", { skip: isWin }, async () => {
+test("history (remote) <sha> 404 surfaces the server's message", async () => {
   const { srv, base } = await historyStub({ entryStatus: 404 });
   try {
     const r = await runAsync(["history", "dec-x", "deadbeef"], remoteEnv(base));
@@ -343,14 +342,14 @@ test("history (remote) <sha> 404 surfaces the server's message", { skip: isWin }
   }
 });
 
-test("history (remote) a dead server fails soft with a transport line, no stack", { skip: isWin }, async () => {
+test("history (remote) a dead server fails soft with a transport line, no stack", async () => {
   const r = await runAsync(["history", "dec-x"], remoteEnv("http://127.0.0.1:1"));
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /offline/);
   assert.doesNotMatch(r.stderr, /at Object|Error:/);
 });
 
-test("history (remote) validates the id client-side before any request", { skip: isWin }, async () => {
+test("history (remote) validates the id client-side before any request", async () => {
   const { srv, hits, base } = await historyStub({ list: LIST_BODY });
   try {
     const r = await runAsync(["history", "Bad_ID"], remoteEnv(base));

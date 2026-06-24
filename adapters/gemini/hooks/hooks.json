@@ -3,14 +3,14 @@
     "SessionStart": [
       {
         "hooks": [
-          { "name": "spor-session-start", "type": "command", "command": "__SPOR_ROOT__/bin/spor-hook session-start --host gemini", "timeout": 20000 }
+          { "name": "spor-session-start", "type": "command", "command": "node \"__SPOR_ROOT__/bin/spor-hook.js\" session-start --host gemini", "timeout": 20000 }
         ]
       }
     ],
     "BeforeAgent": [
       {
         "hooks": [
-          { "name": "spor-prompt-context", "type": "command", "command": "__SPOR_ROOT__/bin/spor-hook prompt-context --host gemini", "timeout": 15000 }
+          { "name": "spor-prompt-context", "type": "command", "command": "node \"__SPOR_ROOT__/bin/spor-hook.js\" prompt-context --host gemini", "timeout": 15000 }
         ]
       }
     ],
@@ -18,14 +18,14 @@
       {
         "matcher": "write_file|replace",
         "hooks": [
-          { "name": "spor-post-tool", "type": "command", "command": "__SPOR_ROOT__/bin/spor-hook post-tool --host gemini", "timeout": 10000 }
+          { "name": "spor-post-tool", "type": "command", "command": "node \"__SPOR_ROOT__/bin/spor-hook.js\" post-tool --host gemini", "timeout": 10000 }
         ]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [
-          { "name": "spor-distill", "type": "command", "command": "__SPOR_ROOT__/bin/spor-hook distill --host gemini", "timeout": 300000 }
+          { "name": "spor-distill", "type": "command", "command": "node \"__SPOR_ROOT__/bin/spor-hook.js\" distill --host gemini", "timeout": 300000 }
         ]
       }
     ]

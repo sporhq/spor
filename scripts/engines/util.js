@@ -977,13 +977,16 @@ function remoteTitleIndex(respBody, maxLines = 150) {
 // own budget — SIGKILL because the whole point is to survive a wedged child
 // that would ignore SIGTERM (a killed run lands in r.error and fails open).
 function runBackendCmd(cmd, prompt, { timeoutMs } = {}) {
-  const r = spawnSync("sh", ["-c", cmd], {
+  const opts = {
     input: prompt,
     encoding: "utf8",
     env: { ...process.env, SPOR_DISTILLING: "1", SUBSTRATE_DISTILLING: "1" },
     maxBuffer: 16 * 1024 * 1024,
     ...(timeoutMs > 0 ? { timeout: timeoutMs, killSignal: "SIGKILL" } : {}),
-  });
+  };
+  const r = process.platform === "win32"
+    ? spawnSync(cmd, { ...opts, shell: true })
+    : spawnSync("sh", ["-c", cmd], opts);
   if (r.status !== 0 || r.error) return null;
   // RESPONSE=$(...) — command substitution strips trailing newlines.
   return stripTrailingNewlines(r.stdout);

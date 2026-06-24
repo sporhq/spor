@@ -5,14 +5,13 @@
 require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require('node:test');
 const assert = require('node:assert');
-const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { runHook, writeNodeScript, nodeCommand } = require('./helpers/portable');
 
 const u = require('../scripts/engines/util.js');
 const { summarize } = require('../lib/cost.js');
-const BIN = path.join(__dirname, '..', 'bin', 'spor-hook');
 
 // ---- 1. parseClaudeResult ----
 test('parseClaudeResult pulls text, usage, cost and model from the JSON envelope', () => {
@@ -117,16 +116,14 @@ function env(home, extra) {
   // accounting only runs when the hook is active for the repo.
   e.SPOR_ENABLED = '1';
   // a stub backend that would record an llm-call and write a node if reached
-  e.SPOR_DISTILL_CMD = 'cat >/dev/null; echo NOTHING';
+  const stub = path.join(home, 'cost-backend.js');
+  writeNodeScript(stub, 'process.stdin.resume(); process.stdin.on("end", () => process.stdout.write("NOTHING\\n"));');
+  e.SPOR_DISTILL_CMD = nodeCommand(stub);
   return Object.assign(e, extra || {});
 }
 
 function runDistill(home, cwd, tx, extra) {
-  const r = spawnSync('bash', [BIN, 'distill'], {
-    input: JSON.stringify({ cwd, session_id: 's1', transcript_path: tx }),
-    env: env(home, extra),
-    encoding: 'utf8',
-  });
+  const r = runHook(['distill'], JSON.stringify({ cwd, session_id: 's1', transcript_path: tx }), env(home, extra));
   assert.strictEqual(r.status, 0, `exit 0 expected (fail-open): ${r.stderr}`);
   return r;
 }
