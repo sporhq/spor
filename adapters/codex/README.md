@@ -7,7 +7,18 @@ is just a manifest over `bin/spor-hook.js`.
 ## Install
 
 1. Clone this repo somewhere stable, e.g. `~/tools/spor`.
-2. Resolve the path placeholder and install the manifest:
+2. Install the Codex plugin, hook manifest, and backfill custom agent:
+
+   ```sh
+   ~/tools/spor/bin/spor install codex
+   ```
+
+   This registers this checkout as the `spor` Codex marketplace, runs
+   `codex plugin add spor@spor`, resolves the hook path placeholder, and keeps
+   the custom agent sourced from `agents/backfill.md`.
+
+3. Manual hook-only install, if you are debugging the adapter without the Codex
+   plugin:
 
    ```sh
    SPOR_ROOT=~/tools/spor
@@ -18,7 +29,8 @@ is just a manifest over `bin/spor-hook.js`.
    (Or merge into an existing `~/.codex/hooks.json` / `[hooks]` table in
    `~/.codex/config.toml`. Per-repo installs go in `<repo>/.codex/hooks.json`.)
 
-3. Add the backfill custom agent:
+4. Add the backfill custom agent manually, only if you skipped
+   `spor install codex`:
 
    ```sh
    mkdir -p ~/.codex/agents
@@ -31,11 +43,8 @@ is just a manifest over `bin/spor-hook.js`.
    } > ~/.codex/agents/spor-backfill.toml
    ```
 
-   `spor install codex` performs both steps automatically and keeps the custom
-   agent sourced from `agents/backfill.md`.
-
-4. Approve the hooks in Codex's `/hooks` trust prompt on first run.
-5. Environment (the same variables on every host):
+5. Approve the hooks in Codex's `/hooks` trust prompt on first run.
+6. Environment (the same variables on every host):
 
    ```sh
    export SPOR_SERVER=https://spor.example.com   # remote mode

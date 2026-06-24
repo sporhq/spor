@@ -1165,6 +1165,35 @@ function scratchHome() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'spor-install-'));
 }
 
+function codexStub(home) {
+  return writeSpawnableNodeStub(home, 'codex-plugin-stub', `
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+if (args.includes("--version")) process.exit(0);
+if (process.env.CODEX_LOG) fs.appendFileSync(process.env.CODEX_LOG, args.join(" ") + "\\n");
+if (args[0] === "plugin" && args[1] === "marketplace" && args[2] === "add") process.exit(0);
+if (args[0] === "plugin" && args[1] === "add" && args[2] === "spor@spor") process.exit(0);
+process.stderr.write("unexpected codex args: " + args.join(" ") + "\\n");
+process.exit(1);
+`);
+}
+
+function codexInstallEnv(home) {
+  return {
+    HOME: home,
+    SPOR_CODEX_CMD: codexStub(home),
+    CODEX_LOG: path.join(home, 'codex-plugin.log'),
+  };
+}
+
+function codexLog(home) {
+  try {
+    return fs.readFileSync(path.join(home, 'codex-plugin.log'), 'utf8');
+  } catch {
+    return '';
+  }
+}
+
 test('install with no host lists hosts and writes nothing', () => {
   const home = scratchHome();
   const r = run(['install'], { HOME: home });
@@ -1176,8 +1205,10 @@ test('install with no host lists hosts and writes nothing', () => {
 
 test('install codex resolves the placeholder and installs the backfill custom agent', () => {
   const home = scratchHome();
-  const r = run(['install', 'codex', '--scope', 'user'], { HOME: home });
+  const r = run(['install', 'codex', '--scope', 'user'], codexInstallEnv(home));
   assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(codexLog(home), /^plugin marketplace add .+$/m);
+  assert.match(codexLog(home), /^plugin add spor@spor$/m);
   const txt = fs.readFileSync(path.join(home, '.codex', 'hooks.json'), 'utf8');
   assert.doesNotMatch(txt, /__SPOR_ROOT__/, 'placeholder resolved');
   const j = JSON.parse(txt); // valid JSON
@@ -1200,13 +1231,15 @@ test('install is idempotent and preserves foreign hooks + top-level keys', () =>
     version: 9,
     hooks: { SessionStart: [{ hooks: [{ type: 'command', command: '/usr/bin/my-own-hook' }] }] },
   }));
-  run(['install', 'codex'], { HOME: home });
-  run(['install', 'codex'], { HOME: home }); // second run must not duplicate
+  const env = codexInstallEnv(home);
+  run(['install', 'codex'], env);
+  run(['install', 'codex'], env); // second run must not duplicate
   const j = JSON.parse(fs.readFileSync(f, 'utf8'));
   const ss = j.hooks.SessionStart;
   assert.strictEqual(ss.filter((e) => JSON.stringify(e).includes('spor-hook')).length, 1, 'one spor entry after two installs');
   assert.ok(ss.some((e) => JSON.stringify(e).includes('my-own-hook')), 'foreign hook preserved');
   assert.strictEqual(j.version, 9, 'foreign top-level key preserved');
+  assert.strictEqual(codexLog(home).match(/^plugin add spor@spor$/gm).length, 2, 'plugin install is re-run idempotently');
 });
 
 test('install gemini merges into existing settings without clobbering', () => {
@@ -1237,11 +1270,12 @@ test('install opencode places the plugin file (symlink or copy)', () => {
 test('install --scope repo writes under the cwd, not home', () => {
   const home = scratchHome();
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-repo-'));
-  const r = spawnSync(process.execPath, [CLI, 'install', 'codex', '--scope', 'repo'], { cwd: repo, encoding: 'utf8', env: bare({ HOME: home }) });
+  const r = spawnSync(process.execPath, [CLI, 'install', 'codex', '--scope', 'repo'], { cwd: repo, encoding: 'utf8', env: bare(codexInstallEnv(home)) });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.ok(fs.existsSync(path.join(repo, '.codex', 'hooks.json')), 'repo-scope hook file under cwd');
   assert.ok(fs.existsSync(path.join(repo, '.codex', 'agents', 'spor-backfill.toml')), 'repo-scope agent file under cwd');
   assert.ok(!fs.existsSync(path.join(home, '.codex')), 'nothing written to home');
+  assert.match(codexLog(home), /^plugin add spor@spor$/m);
 });
 
 test('install claude --print shows the plugin CLI commands and runs nothing', () => {
@@ -1255,6 +1289,8 @@ test('install --print is a dry run (writes nothing)', () => {
   const home = scratchHome();
   const r = run(['install', 'codex', '--print'], { HOME: home });
   assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /would run: codex plugin marketplace add /);
+  assert.match(r.stdout, /would run: codex plugin add spor@spor/);
   assert.match(r.stdout, /would write .*\.codex.*hooks\.json/);
   assert.match(r.stdout, /would write .*\.codex.*agents.*spor-backfill\.toml/);
   assert.match(r.stdout, /^name = "spor-backfill"$/m);
@@ -1273,7 +1309,7 @@ test('install rejects an unknown host and a bad scope', () => {
 
 test('install --server/--token persists creds to user config', () => {
   const home = scratchHome();
-  const r = run(['install', 'codex', '--server', 'http://127.0.0.1:9/', '--token', 'tok9'], { HOME: home, SPOR_HOME: home });
+  const r = run(['install', 'codex', '--server', 'http://127.0.0.1:9/', '--token', 'tok9'], { ...codexInstallEnv(home), SPOR_HOME: home });
   assert.strictEqual(r.status, 0, r.stderr);
   const cfg = JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8'));
   assert.strictEqual(cfg.server, 'http://127.0.0.1:9'); // trailing slash trimmed
@@ -1328,6 +1364,15 @@ test('upgrade claude --print shows the three plugin commands, runs nothing', () 
   assert.match(r.stdout, /would run: claude plugin marketplace add /);
   assert.match(r.stdout, /would run: claude plugin marketplace update spor/);
   assert.match(r.stdout, /would run: claude plugin update spor@spor --scope user/);
+});
+
+test('upgrade codex --print refreshes the plugin install and hook files', () => {
+  const home = scratchHome();
+  const r = run(['upgrade', 'codex', '--print'], { HOME: home });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /would run: codex plugin marketplace add /);
+  assert.match(r.stdout, /would run: codex plugin add spor@spor/);
+  assert.match(r.stdout, /would write .*\.codex.*hooks\.json/);
 });
 
 test('upgrade claude refreshes a stale plugin and reports before → after', () => {

@@ -4870,7 +4870,7 @@ function cmdLink(cfg, { positionals }) {
 const HOSTS = {
   claude: { kind: "claude", label: "Claude Code" },
   codex: {
-    kind: "hooks",
+    kind: "codex",
     label: "Codex CLI",
     src: ["adapters", "codex", "hooks.json"],
     user: [".codex", "hooks.json"],
@@ -4905,6 +4905,12 @@ function homeDir() {
 // same lever 'spor dispatch' uses). All claude shell-outs route through here.
 function claudeCmd() {
   return process.env.SPOR_CLAUDE_CMD || "claude";
+}
+
+// The Codex CLI binary, overridable for tests. Codex owns plugin install state,
+// so all plugin shell-outs route through this seam instead of writing its cache.
+function codexCmd() {
+  return process.env.SPOR_CODEX_CMD || "codex";
 }
 
 function spawnPortableSync(cmd, args, opts = {}) {
@@ -5264,6 +5270,37 @@ function installClaude(scope, dryRun) {
   return 0;
 }
 
+// Codex CLI: install the repo as a Codex plugin via its marketplace commands,
+// then keep the hook manifest + backfill custom agent installed. The plugin
+// manifest intentionally does not carry hooks (Codex plugin validation rejects
+// that field), so both halves matter.
+function installCodex(scope, dryRun) {
+  const cmd = codexCmd();
+  const mpArgs = ["plugin", "marketplace", "add", ROOT];
+  const pluginArgs = ["plugin", "add", "spor@spor"];
+  if (dryRun) {
+    out(`would run: ${cmd} ${mpArgs.join(" ")}`);
+    out(`would run: ${cmd} ${pluginArgs.join(" ")}`);
+    return installHookHost(HOSTS.codex, scope, true);
+  }
+  if (cmd === "codex" && !hasCmd("codex")) {
+    err("codex CLI not on PATH — install Codex, then re-run 'spor install codex'.");
+    return 1;
+  }
+  const mp = spawnPortableSync(cmd, mpArgs, { encoding: "utf8" });
+  if (mp.status !== 0 && !/already|exists|known/i.test((mp.stderr || "") + (mp.stdout || ""))) {
+    err(`codex plugin marketplace add failed: ${(mp.stderr || mp.stdout || "").trim() || "unknown error"}`);
+    return 1;
+  }
+  const plugin = spawnPortableSync(cmd, pluginArgs, { stdio: "inherit" });
+  if (plugin.status !== 0) {
+    err(`codex plugin add failed (exit ${plugin.status == null ? "?" : plugin.status})`);
+    return 1;
+  }
+  out("installed spor@spor into Codex.");
+  return installHookHost(HOSTS.codex, scope, false);
+}
+
 // JSON-hook hosts (codex/cursor/copilot/gemini): render + merge into the target.
 function installHookHost(spec, scope, dryRun) {
   const target = targetPath(spec, scope);
@@ -5366,6 +5403,7 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
     const spec = HOSTS[host];
     let r;
     if (spec.kind === "claude") r = installClaude(scope, dryRun);
+    else if (spec.kind === "codex") r = installCodex(scope, dryRun);
     else if (spec.kind === "plugin") r = installPluginHost(spec, scope, dryRun);
     else r = installHookHost(spec, scope, dryRun);
     if (r !== 0) rc = r;
@@ -5386,10 +5424,12 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
 // (issue-spor-upgrade-no-plugin-refresh) An npm bump updates the package on disk
 // but NOT what an agent already loaded: Claude Code runs its OWN cached copy of
 // the plugin, so it keeps running stale skills/hooks until 'plugin update' swaps
-// the copy. The hook hosts (codex/cursor/copilot/gemini/opencode) reference the
-// package by absolute path, so they only go stale if the checkout MOVED — for
-// which re-running the idempotent install refreshes the path. This verb does
-// both in one step and tells the user to restart the session.
+// the copy. Codex also caches an installed plugin copy, while its hooks still
+// reference this checkout by absolute path. Re-running the idempotent install
+// refreshes Codex's marketplace/plugin cache and rewrites the hook path. The
+// other hook hosts reference the package by absolute path, so they only go stale
+// if the checkout MOVED. This verb does both in one step and tells the user to
+// restart the session.
 
 // Refresh Claude Code's loaded plugin (marketplace add to register/repoint the
 // source, then the shared marketplace+plugin update). Returns 0/1.
@@ -5466,6 +5506,7 @@ async function cmdUpgrade(cfg, { values, positionals: pos }) {
   for (const host of hosts) {
     let r;
     if (host === "claude") r = upgradeClaude(scope, dryRun);
+    else if (host === "codex") r = installCodex(scope, dryRun);
     else {
       // Re-running install refreshes the absolute __SPOR_ROOT__ path (a no-op
       // when the path is unchanged; repairs a moved checkout when it is not).
