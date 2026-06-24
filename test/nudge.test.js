@@ -80,7 +80,7 @@ function env(home, stub, extra = {}) {
   return { ...e, ...extra };
 }
 
-function postTool(home, cwd, stub, { file, content, session = 's1', tool = 'Write', extraEnv = {} } = {}) {
+function postTool(home, cwd, stub, { file, content, session = 's1', tool = 'Write', host = 'claude-code', extraEnv = {} } = {}) {
   const payload = {
     cwd,
     session_id: session,
@@ -90,7 +90,7 @@ function postTool(home, cwd, stub, { file, content, session = 's1', tool = 'Writ
       ? { file_path: file, new_string: content }
       : { file_path: file, content },
   };
-  const r = runHook(['post-tool', '--host', 'claude-code'], JSON.stringify(payload), env(home, stub, extraEnv));
+  const r = runHook(['post-tool', '--host', host], JSON.stringify(payload), env(home, stub, extraEnv));
   assert.strictEqual(r.status, 0, `exit 0 expected (fail-open): ${r.stderr}`);
   return r.stdout;
 }
@@ -131,6 +131,32 @@ test('prose .md write outside the graph fires a nudge with the extracted fact', 
   assert.strictEqual(calls[0].template, 'nudge.md');
   assert.match(calls[0].template_sha, /^[0-9a-f]{12}$/);
   assert.strictEqual(calls[0].vars.FILE, file);
+});
+
+test('codex host defaults the nudge classifier to codex exec on a mini model when no nudge command is configured', () => {
+  const { root, home, cwd } = scratch();
+  const bin = path.join(root, 'bin');
+  fs.mkdirSync(bin);
+  const codex = writeNodeScript(path.join(bin, 'codex'), `
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.CODEX_LOG, args.join(" ") + "\\n");
+process.stdin.resume();
+process.stdin.on("end", () => process.stdout.write(${JSON.stringify(FACT_RESPONSE)}));
+`);
+  const extraEnv = {
+    PATH: `${path.dirname(codex)}${path.delimiter}${process.env.PATH}`,
+    CODEX_LOG: path.join(root, 'codex.log'),
+  };
+  const out = postTool(home, cwd, null, {
+    host: 'codex',
+    file: path.join(cwd, 'reports', 'findings.md'),
+    content: PROSE,
+    extraEnv,
+  });
+  assert.match(JSON.parse(out).hookSpecificOutput.additionalContext, /retry-path/);
+  assert.match(fs.readFileSync(extraEnv.CODEX_LOG, 'utf8'), /^exec --model gpt-5\.4-mini -$/m);
+  assert.strictEqual(llmCalls(home)[0].backend, 'cmd:codex exec --model gpt-5.4-mini -');
 });
 
 test('NOTHING response nudges nothing but still records the llm call', () => {

@@ -422,6 +422,20 @@ process.stdin.on("end", () => {
   return nodeCommand(stub);
 }
 
+function makeCodexStub(root) {
+  const bin = path.join(root, 'bin');
+  fs.mkdirSync(bin);
+  return writeNodeScript(path.join(bin, 'codex'), `
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.CODEX_LOG, args.join(" ") + "\\n");
+process.stdin.resume();
+process.stdin.on("end", () => {
+  process.stdout.write(${JSON.stringify(STUB_RESPONSE)});
+});
+`);
+}
+
 function words(n, w) {
   return Array.from({ length: n }, (_, i) => `${w}${i}`).join(' ');
 }
@@ -465,6 +479,28 @@ test('distill: non-claude transcript shapes fall back to generic .text extractio
   const llmDir = path.join(home, 'journal', 'llm-calls');
   const rec = JSON.parse(fs.readFileSync(path.join(llmDir, fs.readdirSync(llmDir)[0]), 'utf8').trim());
   assert.match(rec.vars.CONVO, /gamma1/);
+});
+
+test('distill: codex host defaults to codex exec when no distill command is configured', () => {
+  const { root, home, cwd } = scratch();
+  const transcript = path.join(root, 'rollout.json');
+  fs.writeFileSync(transcript, JSON.stringify({
+    history: [{ entry: { text: words(50, 'epsilon') } }, { entry: { text: words(50, 'zeta') } }],
+  }));
+  const codex = makeCodexStub(root);
+  const env = freshEnv(home);
+  env.PATH = `${path.dirname(codex)}${path.delimiter}${env.PATH}`;
+  env.CODEX_LOG = path.join(root, 'codex.log');
+  run(
+    ['distill', '--host', 'codex'],
+    JSON.stringify({ cwd, session_id: 'sess-codex-default', transcript_path: transcript, hook_event_name: 'Stop' }),
+    env
+  );
+  assert.ok(fs.existsSync(path.join(home, 'nodes', 'dec-test-hookcli.md')));
+  assert.match(fs.readFileSync(env.CODEX_LOG, 'utf8'), /^exec -$/m);
+  const llmDir = path.join(home, 'journal', 'llm-calls');
+  const rec = JSON.parse(fs.readFileSync(path.join(llmDir, fs.readdirSync(llmDir)[0]), 'utf8').trim());
+  assert.strictEqual(rec.backend, 'cmd:codex exec -');
 });
 
 // task-spor-distiller-idempotency-deterministic-hash: the remote distiller

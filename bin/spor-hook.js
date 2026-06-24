@@ -153,7 +153,7 @@ async function main() {
   // `enabled:false` / `mode:off` makes every hook a no-op (exit 0, no output)
   // so an unrelated side project doesn't pollute the shared graph neighborhood;
   // default-enabled, so a repo without config is byte-identical to before.
-  const cfg = u.useConfig({ cwd: payload.cwd || process.cwd() });
+  const cfg = u.useConfig({ cwd: payload.cwd || process.cwd(), host });
   if (cfg.warnings.length) {
     try {
       const log = u.makeLogger(path.join(u.graphHome(), "journal", "remote.log"), "config: ");

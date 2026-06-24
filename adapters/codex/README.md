@@ -49,18 +49,14 @@ is just a manifest over `bin/spor-hook.js`.
    ```sh
    export SPOR_SERVER=https://spor.example.com   # remote mode
    export SPOR_TOKEN=spor_pat_...
-   # Distiller backend — Codex hosts usually won't have the claude CLI.
-   # Contract: prompt on stdin, response on stdout.
-   export SPOR_DISTILL_CMD='codex exec -'
-   # Capture-nudge backend — same contract, but it runs synchronously in the
-   # tool loop, so prefer a fast model. SPOR_NUDGE=0 disables it.
-   export SPOR_NUDGE_CMD='codex exec -'
+   # Capture-nudge defaults to `codex exec --model gpt-5.4-mini -`; distill
+   # defaults to `codex exec -`. Set SPOR_NUDGE_CMD / SPOR_DISTILL_CMD only to
+   # override those defaults; SPOR_NUDGE=0 disables the nudge.
    ```
 
-   (Legacy `SUBSTRATE_*` names are still read.) Without `SPOR_DISTILL_CMD` /
-   `SPOR_NUDGE_CMD` both default to `claude -p --model haiku`, which is fine if
-   the claude CLI is installed. See [adapters/README.md](../README.md) for the
-   nudge bounds (`SPOR_NUDGE_MAX`, `SPOR_NUDGE_TIMEOUT`).
+   (Legacy `SUBSTRATE_*` names are still read.) See
+   [adapters/README.md](../README.md) for the nudge bounds (`SPOR_NUDGE_MAX`,
+   `SPOR_NUDGE_TIMEOUT`).
 
 ## Event mapping
 

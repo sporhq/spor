@@ -11,6 +11,7 @@ const crypto = require("crypto");
 const { execFileSync, spawnSync, spawn } = require("child_process");
 
 const ROOT = path.resolve(__dirname, "..", "..");
+const CODEX_NUDGE_MODEL = "gpt-5.4-mini";
 
 const home = require(path.join(ROOT, "lib", "shell", "home.js"));
 // The harness vocabulary the capability probe emits — owned by the pure matcher
@@ -25,7 +26,9 @@ const { HARNESS_BINARIES, SPOR_MCP_NAME } = require(path.join(ROOT, "lib", "kern
 // falls back to the exact env dual-read it replaced, so those paths stay
 // byte-identical (norm-cc-byte-identical-refactor).
 let _config = null;
+let _host = null;
 function useConfig(opts) {
+  _host = opts && opts.host ? opts.host : null;
   _config = require(path.join(ROOT, "lib", "config.js")).loadConfig(opts);
   return _config;
 }
@@ -35,6 +38,7 @@ function useConfig(opts) {
 // (serverBase/bearer/graphHome) honors a file-config or --org tenant instead of
 // silently falling back to raw env.
 function setConfig(cfg) {
+  _host = null;
   _config = cfg;
   return cfg;
 }
@@ -42,6 +46,7 @@ function config() {
   return _config;
 }
 function clearConfig() {
+  _host = null;
   _config = null; // test hook
 }
 // Config-aware string read: the active cascade value, else env dual-read.
@@ -59,6 +64,12 @@ function cfgNum(keyPath, envName, fallback) {
   if (v === undefined) return fallback;
   const n = parseFloat(v);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function hostDefaultBackendCmd(kind) {
+  if (_host === "codex" && kind === "nudge") return `codex exec --model ${CODEX_NUDGE_MODEL} -`;
+  if (_host === "codex" && kind === "distill") return "codex exec -";
+  return undefined;
 }
 
 function graphHome() {
@@ -1068,6 +1079,7 @@ module.exports = {
   clearConfig,
   cfgStr,
   cfgNum,
+  hostDefaultBackendCmd,
   jqNow,
   isoMs,
   isoSeconds,

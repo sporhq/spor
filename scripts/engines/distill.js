@@ -252,7 +252,7 @@ async function distill(input) {
   // runs async on SessionEnd, so it tolerates more than the nudge, but a wedged
   // CLI should still not hang the SessionEnd hook indefinitely).
   const timeoutMs = u.cfgNum("distill.timeoutMs", "DISTILL_TIMEOUT", 120000);
-  const distillCmd = u.cfgStr("distill.cmd", "DISTILL_CMD");
+  const distillCmd = u.cfgStr("distill.cmd", "DISTILL_CMD") || u.hostDefaultBackendCmd("distill");
   if (distillCmd) {
     backend = `cmd:${distillCmd}`;
     response = u.runBackendCmd(distillCmd, prompt, { timeoutMs });

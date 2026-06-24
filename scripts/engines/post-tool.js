@@ -181,7 +181,7 @@ async function nudge({ input, graph, slug, session, file, remote }) {
   // PostToolUse budget (nudge.timeoutMs / SPOR_NUDGE_TIMEOUT, default 30s — room
   // for a ~17s claude -p haiku cold boot, well under the host's 60s).
   const timeoutMs = u.cfgNum("nudge.timeoutMs", "NUDGE_TIMEOUT", 30000);
-  const nudgeCmd = u.cfgStr("nudge.cmd", "NUDGE_CMD");
+  const nudgeCmd = u.cfgStr("nudge.cmd", "NUDGE_CMD") || u.hostDefaultBackendCmd("nudge");
   if (nudgeCmd) {
     backend = `cmd:${nudgeCmd}`;
     response = u.runBackendCmd(nudgeCmd, prompt, { timeoutMs });
