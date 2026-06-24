@@ -888,7 +888,7 @@ test('credential store file is created 0600', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-join-perm-'));
   run(['join', 'http://127.0.0.1:9', 'tok'], { SPOR_HOME: home });
   const mode = fs.statSync(path.join(home, 'auth', 'credentials.json')).mode & 0o777;
-  assert.strictEqual(mode, 0o600);
+  if (process.platform !== "win32") assert.strictEqual(mode, 0o600);
 });
 
 test('migrate commits the graph and pushes to a user-owned remote', () => {

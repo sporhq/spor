@@ -26,6 +26,14 @@ function tmpGraph(files) {
   return { dir, nodesDir, load: () => graph.loadGraph(nodesDir) };
 }
 
+test("frontmatter parser accepts CRLF line endings", () => {
+  const raw = "---\r\nid: dec-crlf\r\ntype: decision\r\ntitle: CRLF\r\nsummary: Windows checkout line endings.\r\n---\r\nBody.\r\n";
+  const n = graph.parseFrontmatter(raw, "dec-crlf.md");
+  assert.equal(n.id, "dec-crlf");
+  assert.equal(n.type, "decision");
+  assert.equal(n.body, "Body.");
+});
+
 // A small but format-exercising corpus reused by several tests.
 function pricingFixture() {
   return tmpGraph({

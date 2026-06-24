@@ -4903,7 +4903,7 @@ function renderManifest(srcSegs) {
 }
 
 function readMarkdownAgent(srcSegs) {
-  const raw = fs.readFileSync(path.join(ROOT, ...srcSegs), "utf8");
+  const raw = fs.readFileSync(path.join(ROOT, ...srcSegs), "utf8").replace(/\r\n/g, "\n");
   const m = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
   const meta = {};
   let body = raw;

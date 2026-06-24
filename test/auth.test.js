@@ -141,7 +141,7 @@ test('writeStore: file is 0600', () => {
   const home = tmp();
   auth.upsertTenant(home, { server: 'https://a', org: 'acme', access_token: 'AT' });
   const mode = fs.statSync(auth.credentialsPath(home)).mode & 0o777;
-  assert.strictEqual(mode, 0o600);
+  if (process.platform !== "win32") assert.strictEqual(mode, 0o600);
 });
 
 test('jwt decode helpers', () => {
