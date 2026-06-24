@@ -241,6 +241,82 @@ test('prompt-context: trivial prompts inject nothing', () => {
   assert.strictEqual(out, '');
 });
 
+test('prompt-context: continuation prompts inject nothing before any remote call', async () => {
+  const { home, cwd } = scratch();
+  fs.rmSync(path.join(home, 'nodes'), { recursive: true });
+  const { srv, hits, base } = await stubServer();
+  try {
+    const env = freshEnv(home);
+    env.SPOR_SERVER = base;
+    env.SPOR_TOKEN = 'spor_pat_test';
+    await runAsync(
+      ['prompt-context', '--host', 'claude-code'],
+      JSON.stringify({ cwd, prompt: 'ok lets do that please continue', session_id: 'sess-cont' }),
+      env
+    );
+    assert.deepStrictEqual(hits, [], 'continuation prompt must not spend a digest request');
+  } finally {
+    srv.close();
+  }
+});
+
+test('prompt-context: local digest is compact and repeated follow-up is suppressed', () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(path.join(home, 'nodes', 'dec-widget-cache.md'), `---
+id: dec-widget-cache
+type: decision
+project: projx
+title: Widget thumbnail caching
+summary: Widget thumbnail caching in Redis for the gallery page uses short TTL keys and avoids regenerating thumbnails during repeated browsing.
+date: 2026-06-20
+---
+
+Widget thumbnail caching in Redis for the gallery page uses short TTL keys.
+`);
+  fs.writeFileSync(path.join(home, 'nodes', 'spec-widget-gallery.md'), `---
+id: spec-widget-gallery
+type: artifact
+project: projx
+title: Gallery rendering spec
+summary: Gallery rendering keeps thumbnail cache keys stable so Redis lookups stay cheap during browsing.
+date: 2026-06-19
+---
+
+Gallery rendering keeps thumbnail cache keys stable.
+`);
+  fs.writeFileSync(path.join(home, 'nodes', 'dec-billing-webhooks.md'), `---
+id: dec-billing-webhooks
+type: decision
+project: projx
+title: Billing webhook retries
+summary: Billing webhook retries use idempotency keys and exponential backoff for payment provider callbacks.
+date: 2026-06-18
+---
+
+Billing webhook retries use idempotency keys.
+`);
+  const env = freshEnv(home);
+  const payload = {
+    cwd,
+    session_id: 'sess-repeat',
+    hook_event_name: 'UserPromptSubmit',
+    prompt: 'what is our widget thumbnail caching strategy in redis for gallery page',
+  };
+  const first = run(['prompt-context', '--host', 'codex'], JSON.stringify(payload), env);
+  const ctx = JSON.parse(first).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /^Spor context \(top matches; run \/spor:brief for full\):/);
+  assert.match(ctx, /- dec-widget-cache: Widget thumbnail caching —/);
+  assert.doesNotMatch(ctx, /node files live in/);
+  assert.ok(Buffer.byteLength(ctx, 'utf8') <= 2200, 'prompt digest should be micro-sized');
+
+  const second = run(
+    ['prompt-context', '--host', 'codex'],
+    JSON.stringify({ ...payload, prompt: 'widget thumbnail caching strategy in redis gallery page please continue' }),
+    env
+  );
+  assert.strictEqual(second, '', 'same digest should not be re-injected on an immediate follow-up');
+});
+
 test('post-tool: journals the touched file under the session id', () => {
   const { home, cwd } = scratch();
   run(

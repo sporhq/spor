@@ -18,8 +18,24 @@ is just a manifest over `bin/spor-hook`.
    (Or merge into an existing `~/.codex/hooks.json` / `[hooks]` table in
    `~/.codex/config.toml`. Per-repo installs go in `<repo>/.codex/hooks.json`.)
 
-3. Approve the hooks in Codex's `/hooks` trust prompt on first run.
-4. Environment (the same variables on every host):
+3. Add the backfill custom agent:
+
+   ```sh
+   mkdir -p ~/.codex/agents
+   {
+     printf 'name = "spor-backfill"\n'
+     printf 'description = "Populate or extend a project'\''s Spor graph (its nodes/ dir) from existing sources -- git history, issue/plan docs, specs, or external trackers (GitHub/Jira/Confluence via gh CLI or MCP tools). Use when bootstrapping a graph from scratch or importing a new source into an existing graph."\n'
+     printf 'developer_instructions = """\n'
+     awk 'BEGIN { n = 0 } /^---$/ { n++; next } n >= 2 { print }' "$SPOR_ROOT/agents/backfill.md"
+     printf '"""\n'
+   } > ~/.codex/agents/spor-backfill.toml
+   ```
+
+   `spor install codex` performs both steps automatically and keeps the custom
+   agent sourced from `agents/backfill.md`.
+
+4. Approve the hooks in Codex's `/hooks` trust prompt on first run.
+5. Environment (the same variables on every host):
 
    ```sh
    export SPOR_SERVER=https://spor.example.com   # remote mode

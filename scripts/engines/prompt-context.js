@@ -7,8 +7,12 @@
 
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { spawnSync } = require("child_process");
 const u = require("./util");
+
+const MICRO_MAX_NODES = 5;
+const MICRO_MAX_BYTES = 2200;
 
 function envelope(ctx) {
   return { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: ctx } };
@@ -110,13 +114,112 @@ function mergeDigests(team, local) {
   return out;
 }
 
+const CONTINUATION_WORDS = new Set([
+  "a", "again", "agreed", "ahead", "alright", "and", "awesome", "back", "carry",
+  "continue", "cool", "do", "fine", "go", "going", "good", "great", "it",
+  "keep", "let", "lets", "nice", "ok", "okay", "on", "please", "proceed",
+  "right", "run", "sounds", "sure", "thanks", "thank", "that", "the", "then",
+  "this", "with", "yeah", "yep", "yes", "you", "yup",
+]);
+
+function hasHighSignalToken(prompt) {
+  const s = String(prompt);
+  return /`[^`]+`/.test(s) ||
+    /\b(?:task|issue|dec|art|spec|norm|question|repo|proj|corr)-[a-z0-9][a-z0-9-]*\b/i.test(s) ||
+    /(?:^|\s)(?:\.{1,2}\/|~\/|[A-Za-z]:\\|[A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+)/.test(s) ||
+    /\b[A-Za-z0-9_.-]+\.(?:c|cc|cs|css|go|h|html|java|js|json|jsx|md|py|rb|rs|sh|sql|ts|tsx|yaml|yml)\b/.test(s);
+}
+
+function isContinuationPrompt(prompt) {
+  const s = String(prompt).trim();
+  if (!s || s.startsWith("/") || hasHighSignalToken(s)) return false;
+  const words = (s.toLowerCase().replace(/[’']/g, "").match(/[a-z0-9]+/g) || [])
+    .filter((w) => w !== "ll");
+  if (!words.length || words.length > 10) return false;
+  return words.every((w) => CONTINUATION_WORDS.has(w));
+}
+
+function parseDigest(digest) {
+  const header = [];
+  const nodes = [];
+  const corrections = [];
+  let inCorr = false;
+  for (const line of String(digest).split("\n")) {
+    if (/^Standing corrections:/.test(line)) {
+      inCorr = true;
+      continue;
+    }
+    if (inCorr) {
+      if (line.trim()) corrections.push(line);
+      continue;
+    }
+    if (line.startsWith("- **")) nodes.push(line);
+    else if (!nodes.length && line.trim()) header.push(line);
+  }
+  return { header, nodes, corrections };
+}
+
+function compactNodeLine(line) {
+  const m = line.match(/^- \*\*(.+?) — (.+?)\*\* \((.*?)\): (.*)$/);
+  if (!m) return line;
+  const [, id, title, meta, rest] = m;
+  const warning = rest.match(/ ⚠ .+$/);
+  const summary = warning ? rest.slice(0, warning.index).trim() : rest.trim();
+  const statusMatch = meta.match(/\b(resolved|done|rejected|abandoned|answered)\b/i);
+  const status = statusMatch ? ` (${statusMatch[1].toLowerCase()})` : "";
+  return `- ${id}: ${title}${status} — ${summary}${warning ? warning[0] : ""}`;
+}
+
+function microDigest(digest, maxNodes = MICRO_MAX_NODES, maxBytes = MICRO_MAX_BYTES) {
+  const { nodes, corrections } = parseDigest(digest);
+  if (!nodes.length) return u.byteHead(digest, maxBytes);
+  let out = "Spor context (top matches; run /spor:brief for full):\n";
+  for (const line of nodes.slice(0, maxNodes)) out += `${compactNodeLine(line)}\n`;
+  if (corrections.length) {
+    out += "\nStanding corrections:\n";
+    for (const line of corrections) out += `${line}\n`;
+  }
+  return u.stripTrailingNewlines(u.byteHead(out, maxBytes));
+}
+
+function digestSignature(digest) {
+  const { nodes, corrections } = parseDigest(digest);
+  const basis = nodes.map((l) => l.replace(/: .*/, "")).join("\n") + "\n--\n" + corrections.join("\n");
+  return crypto.createHash("sha256").update(basis || digest, "utf8").digest("hex");
+}
+
+function statePath(graph, input) {
+  const sid = input.session_id || input.sessionId || input.conversation_id || input.conversationId;
+  if (!sid) return null;
+  const h = crypto.createHash("sha256").update(String(sid), "utf8").digest("hex").slice(0, 16);
+  return path.join(graph, "journal", `prompt-context-${h}.json`);
+}
+
+function repeatedFollowup(graph, input, prompt, digest) {
+  const p = statePath(graph, input);
+  if (!p) return false;
+  const sig = digestSignature(digest);
+  let prev = null;
+  try {
+    prev = JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch {}
+  try {
+    u.ensureDir(path.dirname(p));
+    fs.writeFileSync(p, JSON.stringify({ sig, at: new Date().toISOString() }) + "\n");
+  } catch {}
+  return prev && prev.sig === sig && !hasHighSignalToken(prompt) && u.wordCount(prompt) <= 12;
+}
+
 async function promptContext(input) {
   const graph = u.graphHome();
   const prompt = input.prompt ?? "";
   const slug = u.projectSlug(input.cwd ?? "");
 
-  // Skip trivial prompts (slash commands, <6 words) BEFORE any network call.
+  // Skip trivial / continuation prompts BEFORE any network call. The second
+  // gate catches "ok let's do that" follow-ups that carry no new retrieval
+  // signal but can otherwise clear the word floor.
   if (prompt.startsWith("/")) return null;
+  if (isContinuationPrompt(prompt)) return null;
   if (u.wordCount(prompt) < 6) return null;
 
   // -------------------------------------------------------------------------
@@ -169,7 +272,8 @@ async function promptContext(input) {
     // newlines before jq sees it.
     const merged = u.stripTrailingNewlines(u.byteHead(mergeDigests(team, local), 9216));
     if (!/\S/.test(merged)) return null;
-    return envelope(merged);
+    if (repeatedFollowup(graph, input, prompt, merged)) return null;
+    return envelope(microDigest(merged));
   }
 
   // -------------------------------------------------------------------------
@@ -188,7 +292,8 @@ async function promptContext(input) {
     cached: false,
   });
   if (!digest) return null;
-  return envelope(digest);
+  if (repeatedFollowup(graph, input, prompt, digest)) return null;
+  return envelope(microDigest(digest));
 }
 
-module.exports = { promptContext, mergeDigests };
+module.exports = { promptContext, mergeDigests, isContinuationPrompt, microDigest };

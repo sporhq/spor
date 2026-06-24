@@ -1173,7 +1173,7 @@ test('install with no host lists hosts and writes nothing', () => {
   assert.ok(!fs.existsSync(path.join(home, '.codex')), 'discovery touches nothing');
 });
 
-test('install codex resolves the placeholder into ~/.codex/hooks.json', () => {
+test('install codex resolves the placeholder and installs the backfill custom agent', () => {
   const home = scratchHome();
   const r = run(['install', 'codex', '--scope', 'user'], { HOME: home });
   assert.strictEqual(r.status, 0, r.stderr);
@@ -1183,6 +1183,11 @@ test('install codex resolves the placeholder into ~/.codex/hooks.json', () => {
   const cmd = j.hooks.SessionStart[0].hooks[0].command;
   assert.match(cmd, /bin\/spor-hook session-start --host codex$/);
   assert.ok(path.isAbsolute(cmd.split(' ')[0]), 'command points at an absolute checkout path');
+  const agent = fs.readFileSync(path.join(home, '.codex', 'agents', 'spor-backfill.toml'), 'utf8');
+  assert.match(agent, /^name = "spor-backfill"$/m);
+  assert.match(agent, /^description = "Populate or extend a project's Spor graph/m);
+  assert.match(agent, /^developer_instructions = """$/m);
+  assert.match(agent, /You are a Spor backfill agent/);
 });
 
 test('install is idempotent and preserves foreign hooks + top-level keys', () => {
@@ -1228,10 +1233,11 @@ test('install opencode places the plugin file (symlink or copy)', () => {
 test('install --scope repo writes under the cwd, not home', () => {
   const home = scratchHome();
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-repo-'));
-  const r = spawnSync(process.execPath, [CLI, 'install', 'cursor', '--scope', 'repo'], { cwd: repo, encoding: 'utf8', env: bare({ HOME: home }) });
+  const r = spawnSync(process.execPath, [CLI, 'install', 'codex', '--scope', 'repo'], { cwd: repo, encoding: 'utf8', env: bare({ HOME: home }) });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.ok(fs.existsSync(path.join(repo, '.cursor', 'hooks.json')), 'repo-scope file under cwd');
-  assert.ok(!fs.existsSync(path.join(home, '.cursor')), 'nothing written to home');
+  assert.ok(fs.existsSync(path.join(repo, '.codex', 'hooks.json')), 'repo-scope hook file under cwd');
+  assert.ok(fs.existsSync(path.join(repo, '.codex', 'agents', 'spor-backfill.toml')), 'repo-scope agent file under cwd');
+  assert.ok(!fs.existsSync(path.join(home, '.codex')), 'nothing written to home');
 });
 
 test('install claude --print shows the plugin CLI commands and runs nothing', () => {
@@ -1246,6 +1252,8 @@ test('install --print is a dry run (writes nothing)', () => {
   const r = run(['install', 'codex', '--print'], { HOME: home });
   assert.strictEqual(r.status, 0);
   assert.match(r.stdout, /would write .*\.codex.*hooks\.json/);
+  assert.match(r.stdout, /would write .*\.codex.*agents.*spor-backfill\.toml/);
+  assert.match(r.stdout, /^name = "spor-backfill"$/m);
   assert.ok(!fs.existsSync(path.join(home, '.codex')), 'dry run wrote nothing');
 });
 

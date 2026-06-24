@@ -108,7 +108,7 @@ test(
       // (1) SessionStart briefing reached the request, FROM THE SCRATCH GRAPH.
       assert.match(injected, /SPOR_E2E_BRIEF_SENTINEL/, "scratch SessionStart briefing should reach the request");
       // (2) UserPromptSubmit digest reached the request for a relevant prompt.
-      assert.match(injected, /nodes relevant to this prompt/, "a relevant prompt should inject a digest");
+      assert.match(injected, /Spor context \(top matches; run \/spor:brief for full\)/, "a relevant prompt should inject a digest");
       assert.match(injected, /widget thumbnail caching/, "the digest should surface the matching node");
       // (3) Hermeticity: the live team graph banner must NOT appear (no settings.json leak).
       assert.doesNotMatch(injected, /127\.0\.0\.1:8787|team graph:/, "must not leak the live team graph");

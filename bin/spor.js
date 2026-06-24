@@ -4684,7 +4684,16 @@ function cmdLink(cfg, { positionals }) {
 // hand-edit ~/.claude/settings.json, which the CLI owns.
 const HOSTS = {
   claude: { kind: "claude", label: "Claude Code" },
-  codex: { kind: "hooks", label: "Codex CLI", src: ["adapters", "codex", "hooks.json"], user: [".codex", "hooks.json"], repo: [".codex", "hooks.json"] },
+  codex: {
+    kind: "hooks",
+    label: "Codex CLI",
+    src: ["adapters", "codex", "hooks.json"],
+    user: [".codex", "hooks.json"],
+    repo: [".codex", "hooks.json"],
+    extras: [
+      { kind: "codex-agent", src: ["agents", "backfill.md"], user: [".codex", "agents", "spor-backfill.toml"], repo: [".codex", "agents", "spor-backfill.toml"] },
+    ],
+  },
   cursor: { kind: "hooks", label: "Cursor", src: ["adapters", "cursor", "hooks.json"], user: [".cursor", "hooks.json"], repo: [".cursor", "hooks.json"] },
   copilot: { kind: "hooks", label: "GitHub Copilot CLI", src: ["adapters", "copilot", "spor.json"], user: [".copilot", "hooks", "spor.json"], repo: [".github", "hooks", "spor.json"] },
   gemini: { kind: "hooks", label: "Gemini CLI", src: ["adapters", "gemini", "hooks", "hooks.json"], user: [".gemini", "settings.json"], repo: [".gemini", "settings.json"] },
@@ -4886,6 +4895,43 @@ function renderManifest(srcSegs) {
   return deepReplace(JSON.parse(raw), "__SPOR_ROOT__", ROOT);
 }
 
+function readMarkdownAgent(srcSegs) {
+  const raw = fs.readFileSync(path.join(ROOT, ...srcSegs), "utf8");
+  const m = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  const meta = {};
+  let body = raw;
+  if (m) {
+    body = m[2];
+    for (const line of m[1].split("\n")) {
+      const mm = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+      if (mm) meta[mm[1]] = mm[2].trim();
+    }
+  }
+  return { meta, body: body.trim() + "\n" };
+}
+
+function tomlString(s) {
+  return JSON.stringify(String(s));
+}
+
+function tomlMultilineString(s) {
+  const text = String(s).replace(/\r\n/g, "\n").trimEnd();
+  if (text.includes('"""')) return tomlString(text);
+  return `"""\n${text}\n"""`;
+}
+
+function renderCodexAgent(srcSegs) {
+  const { meta, body } = readMarkdownAgent(srcSegs);
+  const name = meta.name || path.basename(srcSegs[srcSegs.length - 1], ".md");
+  const description = meta.description || `Custom agent generated from ${srcSegs.join("/")}.`;
+  return [
+    `name = ${tomlString(name)}`,
+    `description = ${tomlString(description)}`,
+    `developer_instructions = ${tomlMultilineString(body)}`,
+    "",
+  ].join("\n");
+}
+
 function readJsonOr(file, fallback) {
   try {
     return JSON.parse(fs.readFileSync(file, "utf8")) || fallback;
@@ -4916,6 +4962,26 @@ function mergeHooks(existing, incoming) {
 
 function targetPath(spec, scope) {
   return scope === "repo" ? path.join(repoRoot(), ...spec.repo) : path.join(homeDir(), ...spec.user);
+}
+
+function renderInstallExtra(extra) {
+  if (extra.kind === "codex-agent") return renderCodexAgent(extra.src);
+  throw new Error(`unknown install extra kind '${extra.kind}'`);
+}
+
+function installExtras(spec, scope, dryRun) {
+  for (const extra of spec.extras || []) {
+    const target = targetPath(extra, scope);
+    const rendered = renderInstallExtra(extra);
+    if (dryRun) {
+      out(`would write ${target}:`);
+      out(rendered.trimEnd());
+      continue;
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, rendered);
+    out(`installed ${spec.label} extra → ${target}`);
+  }
 }
 
 function hasCmd(cmd) {
@@ -5010,11 +5076,13 @@ function installHookHost(spec, scope, dryRun) {
   if (dryRun) {
     out(`would write ${target}:`);
     out(JSON.stringify(merged, null, 2));
+    installExtras(spec, scope, true);
     return 0;
   }
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.writeFileSync(target, JSON.stringify(merged, null, 2) + "\n");
   out(`installed spor for ${spec.label} → ${target}  (scope: ${scope})`);
+  installExtras(spec, scope, false);
   return 0;
 }
 
