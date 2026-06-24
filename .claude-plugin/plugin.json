@@ -2,7 +2,7 @@
   "name": "spor",
   "displayName": "Spor Context Compiler",
   "description": "Maintains a typed, versioned knowledge graph and compiles compact briefings from it: session-start injection, per-prompt relevance digests, capture at discovery, end-of-session distillation, decision queue.",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "author": {
     "name": "losthammer"
   }
