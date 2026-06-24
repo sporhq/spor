@@ -148,7 +148,43 @@ referenced prior-art artifact no longer trips this; a genuine non-resolving work
 product still does. The one thing triage must not do is leave the flag with no
 decision — it's a question addressed to you.
 
-## 5. Latent dependencies → record missing `blocks` edges
+## 5. Stale briefing findings → recompile the briefing
+
+Gardener findings about briefing freshness are not ordinary "close?" chores.
+If a finding says a `brief-*` node is stale, missing `derived-from`
+provenance, has an input-fingerprint mismatch, or has source-set drift, the
+repair is a new briefing version with current provenance. Do not merely
+acknowledge the finding or mark it handled while the stale briefing remains in
+place — that leaves session-start serving bad context.
+
+Treat the affected briefing as a build artifact and rebuild it:
+
+- Read the finding and the affected `brief-*` node (`spor get <finding-id>` and
+  `spor get <brief-id>`). Check its `compiled-for`, `derived-from`, and
+  `shaped-by` edges so you know what it was meant to brief and which
+  corrections must still apply.
+- Compile/research the current source set for the briefing target. For a
+  root/node briefing, run `spor brief <target-id>` for the human body; in a local
+  graph, `spor compile --root <target-id> --skeleton` can produce the updated
+  provenance skeleton. For a standing project briefing, compile the current
+  repo/product context and honor every standing correction named by `shaped-by`.
+- Write the affected `brief-*` node as the next `version:` with the refreshed
+  body, exact current `derived-from` inputs, preserved `compiled-for`, and any
+  relevant `shaped-by` correction edges. Use `spor put-node <file> --if-exists
+  update --revision <sha>` (or MCP `put_node`) so the update is validated and
+  optimistic-concurrency checked.
+- Verify the condition clears, or is ready for the gardener to auto-resolve:
+  re-read the briefing and, when appropriate, run `spor admin gardener --json`
+  to confirm the stale-briefing finding is no longer filed.
+- Only after the repaired briefing exists should the finding be considered
+  handled. If the finding still fires, keep it open and report what source or
+  correction is still unresolved.
+
+This is intentionally more work than closing a stale anchor: stale briefing
+findings affect future agent context, so triage must leave a fresh `brief-*`
+artifact behind.
+
+## 6. Latent dependencies → record missing `blocks` edges
 
 Find tasks that should carry a `blocks`/`blocked-by` edge but don't — work the
 queue surfaces as actionable that actually can't start until something else
@@ -174,7 +210,7 @@ Record a confirmed one as a `blocks` edge from the prerequisite to the dependent
 (mirroring how an issue records its block). The dependent then leaves the
 actionable queue until its blocker resolves — which is the point.
 
-## 6. Open questions → brief the lineage, then answer
+## 7. Open questions → brief the lineage, then answer
 
 This is where triage earns its keep: the queue's `questions` are decisions
 waiting on a human, and a bare list of them is useless — the reader can't answer
@@ -200,7 +236,7 @@ decide.** For each open question:
 (If `questions` is empty there's nothing to do here — but it's the step most
 often forgotten, so check it every pass.)
 
-## 7. Prioritise → unblockers first
+## 8. Prioritise → unblockers first
 
 Once you understand the dependency shape, set explicit `priority:` (`p1`/`p2`/
 `p3`) so the queue sequences correctly. The highest-leverage move is to **bump
@@ -224,7 +260,7 @@ genuinely ready work, start/claim it or let `front` decay; don't fake a resolver
 to undo it. (A bare reference no longer trips this —
 `issue-spor-queue-held-guard-false-positive-referenced-outcome`.)
 
-## 8. Present the outcome
+## 9. Present the outcome
 
 Talk to a human, in plain language. Lead with what you did and what to pick up
 next, one short reason each. Give a compact before/after (queue size, what
