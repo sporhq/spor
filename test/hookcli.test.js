@@ -425,7 +425,7 @@ process.stdin.on("end", () => {
 function makeCodexStub(root) {
   const bin = path.join(root, 'bin');
   fs.mkdirSync(bin);
-  return writeNodeScript(path.join(bin, 'codex'), `
+  const script = writeNodeScript(path.join(bin, process.platform === 'win32' ? 'codex.js' : 'codex'), `
 const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.CODEX_LOG, args.join(" ") + "\\n");
@@ -434,6 +434,12 @@ process.stdin.on("end", () => {
   process.stdout.write(${JSON.stringify(STUB_RESPONSE)});
 });
 `);
+  if (process.platform === 'win32') {
+    const cmd = path.join(bin, 'codex.cmd');
+    fs.writeFileSync(cmd, `@echo off\r\n"${process.execPath}" "${script}" %*\r\nexit /b %errorlevel%\r\n`);
+    return cmd;
+  }
+  return script;
 }
 
 function words(n, w) {

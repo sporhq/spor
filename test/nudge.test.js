@@ -61,6 +61,17 @@ setTimeout(() => process.stdout.write("NOTHING\\n"), 5000);
 `);
 }
 
+function pathCodexStub(bin, body) {
+  fs.mkdirSync(bin, { recursive: true });
+  const script = writeNodeScript(path.join(bin, process.platform === 'win32' ? 'codex.js' : 'codex'), body);
+  if (process.platform === 'win32') {
+    const cmd = path.join(bin, 'codex.cmd');
+    fs.writeFileSync(cmd, `@echo off\r\n"${process.execPath}" "${script}" %*\r\nexit /b %errorlevel%\r\n`);
+    return cmd;
+  }
+  return script;
+}
+
 function env(home, stub, extra = {}) {
   const e = { ...process.env };
   // Hermetic env: strip EVERY ambient Spor/backend var (both SPOR_* and legacy
@@ -136,8 +147,7 @@ test('prose .md write outside the graph fires a nudge with the extracted fact', 
 test('codex host defaults the nudge classifier to codex exec on a mini model when no nudge command is configured', () => {
   const { root, home, cwd } = scratch();
   const bin = path.join(root, 'bin');
-  fs.mkdirSync(bin);
-  const codex = writeNodeScript(path.join(bin, 'codex'), `
+  const codex = pathCodexStub(bin, `
 const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.CODEX_LOG, args.join(" ") + "\\n");
