@@ -1171,7 +1171,13 @@ const fs = require("node:fs");
 const args = process.argv.slice(2);
 if (args.includes("--version")) process.exit(0);
 if (process.env.CODEX_LOG) fs.appendFileSync(process.env.CODEX_LOG, args.join(" ") + "\\n");
-if (args[0] === "plugin" && args[1] === "marketplace" && args[2] === "add") process.exit(0);
+if (args[0] === "plugin" && args[1] === "marketplace" && args[2] === "add") {
+  if (process.env.CODEX_FAIL_MARKETPLACE) {
+    process.stderr.write(process.env.CODEX_FAIL_MARKETPLACE + "\\n");
+    process.exit(1);
+  }
+  process.exit(0);
+}
 if (args[0] === "plugin" && args[1] === "add" && args[2] === "spor@spor") process.exit(0);
 process.stderr.write("unexpected codex args: " + args.join(" ") + "\\n");
 process.exit(1);
@@ -1207,7 +1213,7 @@ test('install codex resolves the placeholder and installs the backfill custom ag
   const home = scratchHome();
   const r = run(['install', 'codex', '--scope', 'user'], codexInstallEnv(home));
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.match(codexLog(home), /^plugin marketplace add .+$/m);
+  assert.match(codexLog(home), /^plugin marketplace add \.$/m);
   assert.match(codexLog(home), /^plugin add spor@spor$/m);
   const txt = fs.readFileSync(path.join(home, '.codex', 'hooks.json'), 'utf8');
   assert.doesNotMatch(txt, /__SPOR_ROOT__/, 'placeholder resolved');
@@ -1289,7 +1295,7 @@ test('install --print is a dry run (writes nothing)', () => {
   const home = scratchHome();
   const r = run(['install', 'codex', '--print'], { HOME: home });
   assert.strictEqual(r.status, 0);
-  assert.match(r.stdout, /would run: codex plugin marketplace add /);
+  assert.match(r.stdout, /would run: \(cd .+ && codex plugin marketplace add \.\)/);
   assert.match(r.stdout, /would run: codex plugin add spor@spor/);
   assert.match(r.stdout, /would write .*\.codex.*hooks\.json/);
   assert.match(r.stdout, /would write .*\.codex.*agents.*spor-backfill\.toml/);
@@ -1315,6 +1321,15 @@ test('install --server/--token persists creds to user config', () => {
   assert.strictEqual(cfg.server, 'http://127.0.0.1:9'); // trailing slash trimmed
   assert.strictEqual(cfg.token, 'tok9');
   assert.ok(fs.existsSync(path.join(home, '.codex', 'hooks.json')), 'host still installed');
+});
+
+test('install codex stops before hook guidance when marketplace registration fails', () => {
+  const home = scratchHome();
+  const r = run(['install', 'codex'], { ...codexInstallEnv(home), CODEX_FAIL_MARKETPLACE: 'boom' });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /codex plugin marketplace add failed: boom/);
+  assert.doesNotMatch(r.stdout, /^next:/m);
+  assert.ok(!fs.existsSync(path.join(home, '.codex', 'hooks.json')), 'hooks not written after plugin install failure');
 });
 
 // --- upgrade (issue-spor-upgrade-no-plugin-refresh) -----------------------
@@ -1370,7 +1385,7 @@ test('upgrade codex --print refreshes the plugin install and hook files', () => 
   const home = scratchHome();
   const r = run(['upgrade', 'codex', '--print'], { HOME: home });
   assert.strictEqual(r.status, 0);
-  assert.match(r.stdout, /would run: codex plugin marketplace add /);
+  assert.match(r.stdout, /would run: \(cd .+ && codex plugin marketplace add \.\)/);
   assert.match(r.stdout, /would run: codex plugin add spor@spor/);
   assert.match(r.stdout, /would write .*\.codex.*hooks\.json/);
 });

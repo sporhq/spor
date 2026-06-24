@@ -5276,10 +5276,13 @@ function installClaude(scope, dryRun) {
 // that field), so both halves matter.
 function installCodex(scope, dryRun) {
   const cmd = codexCmd();
-  const mpArgs = ["plugin", "marketplace", "add", ROOT];
+  // Use "." from ROOT instead of ROOT itself: Codex's source parser treats npm
+  // scoped absolute paths containing /@scope/name as git owner/repo@ref-ish
+  // input, which fails for local marketplaces (issue-spor-codex-install-npm-scope).
+  const mpArgs = ["plugin", "marketplace", "add", "."];
   const pluginArgs = ["plugin", "add", "spor@spor"];
   if (dryRun) {
-    out(`would run: ${cmd} ${mpArgs.join(" ")}`);
+    out(`would run: (cd ${ROOT} && ${cmd} ${mpArgs.join(" ")})`);
     out(`would run: ${cmd} ${pluginArgs.join(" ")}`);
     return installHookHost(HOSTS.codex, scope, true);
   }
@@ -5287,7 +5290,7 @@ function installCodex(scope, dryRun) {
     err("codex CLI not on PATH — install Codex, then re-run 'spor install codex'.");
     return 1;
   }
-  const mp = spawnPortableSync(cmd, mpArgs, { encoding: "utf8" });
+  const mp = spawnPortableSync(cmd, mpArgs, { encoding: "utf8", cwd: ROOT });
   if (mp.status !== 0 && !/already|exists|known/i.test((mp.stderr || "") + (mp.stdout || ""))) {
     err(`codex plugin marketplace add failed: ${(mp.stderr || mp.stdout || "").trim() || "unknown error"}`);
     return 1;
@@ -5409,7 +5412,7 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
     if (r !== 0) rc = r;
   }
 
-  if (!dryRun && hosts.some((h) => HOSTS[h].kind !== "claude")) {
+  if (!dryRun && rc === 0 && hosts.some((h) => HOSTS[h].kind !== "claude")) {
     out("");
     out("next:");
     if (cfg.mode() === "remote") out(`  remote mode is configured (${remote.base(cfg)}).`);
