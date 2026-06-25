@@ -317,6 +317,72 @@ Billing webhook retries use idempotency keys.
   assert.strictEqual(second, '', 'same digest should not be re-injected on an immediate follow-up');
 });
 
+test('prompt-context: appended <system-reminder> blocks neither defeat the gate nor feed the query (issue-spor-digest-continuation-gate-system-reminder-defeat)', () => {
+  const { home, cwd } = scratch();
+  // A small corpus so tf-idf has non-zero idf (a single node collapses to sim 0).
+  fs.writeFileSync(path.join(home, 'nodes', 'dec-widget-cache.md'), `---
+id: dec-widget-cache
+type: decision
+project: projx
+title: Widget thumbnail caching
+summary: Widget thumbnail caching in Redis for the gallery page uses short TTL keys and avoids regenerating thumbnails during repeated browsing.
+date: 2026-06-20
+---
+
+Widget thumbnail caching in Redis for the gallery page uses short TTL keys.
+`);
+  fs.writeFileSync(path.join(home, 'nodes', 'spec-widget-gallery.md'), `---
+id: spec-widget-gallery
+type: artifact
+project: projx
+title: Gallery rendering spec
+summary: Gallery rendering keeps thumbnail cache keys stable so Redis lookups stay cheap during browsing.
+date: 2026-06-19
+---
+
+Gallery rendering keeps thumbnail cache keys stable.
+`);
+  fs.writeFileSync(path.join(home, 'nodes', 'dec-billing-webhooks.md'), `---
+id: dec-billing-webhooks
+type: decision
+project: projx
+title: Billing webhook retries
+summary: Billing webhook retries use idempotency keys and exponential backoff for payment provider callbacks.
+date: 2026-06-18
+---
+
+Billing webhook retries use idempotency keys.
+`);
+  const env = freshEnv(home);
+
+  // A bare "continue" with an appended reminder whose text strongly matches a
+  // node: the reminder must NOT count toward the gates, nor seed the query.
+  // Without the strip, the 13-word prompt clears the continuation + word-floor
+  // gates and the reminder text retrieves dec-widget-cache.
+  const gated = run(
+    ['prompt-context', '--host', 'codex'],
+    JSON.stringify({
+      cwd, session_id: 'sess-sr-a', hook_event_name: 'UserPromptSubmit',
+      prompt: 'continue\n<system-reminder>widget thumbnail caching strategy in redis for the gallery page</system-reminder>',
+    }),
+    env
+  );
+  assert.strictEqual(gated, '', 'an appended <system-reminder> must not let a continuation prompt fire a digest');
+
+  // Guard against over-stripping: a genuine prompt with a low-signal reminder
+  // appended still retrieves on the real user text (only the reminder is removed).
+  const fired = run(
+    ['prompt-context', '--host', 'codex'],
+    JSON.stringify({
+      cwd, session_id: 'sess-sr-b', hook_event_name: 'UserPromptSubmit',
+      prompt: 'what is our widget thumbnail caching strategy in redis for gallery page\n<system-reminder>Message sent at Tue 2026-06-16 17:35:30 UTC.</system-reminder>',
+    }),
+    env
+  );
+  const ctx = JSON.parse(fired).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /- dec-widget-cache: Widget thumbnail caching —/);
+});
+
 test('post-tool: journals the touched file under the session id', () => {
   const { home, cwd } = scratch();
   run(

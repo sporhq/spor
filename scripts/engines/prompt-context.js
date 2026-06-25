@@ -210,9 +210,20 @@ function repeatedFollowup(graph, input, prompt, digest) {
   return prev && prev.sig === sig && !hasHighSignalToken(prompt) && u.wordCount(prompt) <= 12;
 }
 
+// Claude Code appends `<system-reminder>…</system-reminder>` blocks
+// (scheduled-message timestamps, deferred-tool notices, injected context) to the
+// user's text, and they arrive in the hook's `prompt`. Their words must not feed
+// the trivial-prompt gates or the retrieval query — otherwise a bare "Continue"
+// arrives as 8 words, clears the continuation + word-floor gates, and fires a
+// noise digest (issue-spor-digest-continuation-gate-system-reminder-defeat).
+// Strip them before anything else looks at the prompt.
+function stripSystemReminders(prompt) {
+  return String(prompt).replace(/\n*<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").trim();
+}
+
 async function promptContext(input) {
   const graph = u.graphHome();
-  const prompt = input.prompt ?? "";
+  const prompt = stripSystemReminders(input.prompt ?? "");
   const slug = u.projectSlug(input.cwd ?? "");
 
   // Skip trivial / continuation prompts BEFORE any network call. The second
