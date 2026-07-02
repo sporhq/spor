@@ -14,7 +14,7 @@ shipped with the plugin as a registry default (QUEUE.md §2). It is the
 dec-spor-definition-of-done-org-policy): a resolving artifact (a change/PR)
 or any work node points a `review-requested` edge at each `person` a review
 is wanted from. The server surfaces those nodes into each named reviewer's
-personal queue (`my_queue` `reviews`), the same per-person filter questions
+personal queue (`show_queue` `reviews`), the same per-person filter questions
 and findings route through.
 
 An outcome **flips the edge in place**: an approval rewrites it to

@@ -331,7 +331,7 @@ person), `reviewed-by` (they approved — what `view.approvals` carries and the
 quorum counts), and `changes-requested-by` (they asked for changes — carried
 separately as `view.changes_requested`, never an approval). A single edge
 flips type in place across the lifecycle. An open `review-requested` edge
-surfaces the node in that reviewer's `my_queue` `reviews` set, through the same
+surfaces the node in that reviewer's `show_queue` `reviews` set, through the same
 per-person routing filter questions and findings use — reviewer *selection* at
 request time and quorum *enforcement* at gate time are distinct points.
 
@@ -474,7 +474,7 @@ node id; an optional `@YYYY-MM-DD` makes the mute self-expiring, so
 "sideline this project for now" can't silently rot into a permanent blind
 spot. Muting is per-viewer presentation at queue-compile time, not graph
 state — items stay live and visible to everyone else — and the hidden
-count is reported (`muted: N` on the result, a trailing line on `my_queue`)
+count is reported (`muted: N` on the result, a trailing line on `show_queue`)
 so the queue never silently truncates.
 
 Scheduled dormancy is the graph-state counterpart of the mute: a queueable
@@ -508,18 +508,18 @@ The queue is a compile mode, not a new store:
   (`repo-<slug>`) is the escape hatch back to one repo; an exact grouping id
   (`proj-<slug>`) is used directly; an ungrouped repo falls back to itself.
   **Omitting `project` entirely is the cross-project firehose** (every repo's
-  queue at once); `/spor:next --all-projects` and `my_queue` / `GET /v1/queue`
+  queue at once); `/spor:next --all-projects` and `show_queue` / `GET /v1/queue`
   with no `project` reach it.
 - `includeTypes`/`excludeTypes` (task-cc-queue-filtering-enhancements) whitelist
   or blacklist node types FROM THE RANKING — `GET /v1/queue?type=&exclude_type=`
-  (comma-separated), `my_queue {types, exclude_types}`, and
+  (comma-separated), `show_queue {types, exclude_types}`, and
   `spor next --type/--exclude-type`. Given both, the include set is narrowed and
   then the excludes are removed from it (exclude wins on overlap). Like `project`
   it is a hard scope applied before scoring (the aggregates describe the filtered
   queue), it composes with `project`/`assignee`, and the type compared is the one
   the item surfaces as (so excluding `schema` hides schema-approval items too).
 - Exposed as `GET /v1/queue` (hooks, session-start "open front" line),
-  `my_queue` (the registered MCP stub finally does work — and when Tier 2
+  `show_queue` (the registered MCP stub finally does work — and when Tier 2
   routing lands, routed questions and stewarded items join the same queue),
   and `/spor:next` (presents the queue; picking an item triggers a
   full `--root <task-id>` compile so work starts pre-briefed).
@@ -530,7 +530,7 @@ The queue is a compile mode, not a new store:
 
 **Per-person queues** (task-cc-queue-assignee-filtering). `rankQueue`'s
 `assignee` parameter — and `GET /v1/queue?assignee=<person-id>` /
-`my_queue {assignee}` (use `assignee=me` to bind to the caller) — scopes the
+`show_queue {assignee}` (use `assignee=me` to bind to the caller) — scopes the
 ranked queue to the work one person carries: the union of nodes with an
 outbound `assigned` edge to them (work→person) and the nodes they `steward`
 (person→node). Assignment is an edge like everything else (Tier-2's person
@@ -584,7 +584,7 @@ targets — subject first — form its relevance neighborhood, the first
 stewarded node wins (the server's deterministic Tier-2 routing walk), and
 the route materializes as a `routed-to` edge plus a body note. No steward
 anywhere leaves the finding unrouted. The queue surfaces (`GET /v1/queue`,
-`my_queue`) carry a `findings` field mirroring `questions`: open findings
+`show_queue`) carry a `findings` field mirroring `questions`: open findings
 routed to the authenticated identity plus unrouted ones — a finding routed
 to someone else stays out of your view, so gardener output lands with the
 people who steward what it observed instead of everyone.
@@ -646,7 +646,7 @@ the structural truth:
    in TODOs, that's evidence for a post-tool TODO-comment nudge, not more
    prompt.)
 3. **Queue** — ✅ SHIPPED. `rankQueue()` in the core (`lib/queue.js`, also a
-   CLI for local mode), `GET /v1/queue`, real `my_queue`, `/spor:next`.
+   CLI for local mode), `GET /v1/queue`, real `show_queue`, `/spor:next`.
    The task and capture-pending seed schemas are `queueable: true`; the §4
    signals (blocking / heat / staleness / age) are computed natively in the
    core for now — per-schema `queueSignals()` attached code joins via the
@@ -740,5 +740,5 @@ which held: each landed as one commit on top of the registry.
   computed item list in the sandbox — accepts `[{id, score}]` or an
   `{id: score}` map; unmentioned items keep their default-blend score.
   Fail-soft: a broken policy annotates the result (`policy: {id, applied,
-  error?}` on `/v1/queue` and `my_queue`) and the built-in blend stands; a
+  error?}` on `/v1/queue` and `show_queue`) and the built-in blend stands; a
   proposed policy is inert until approved like any schema node.

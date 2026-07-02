@@ -19,7 +19,7 @@ const LEGACY_END = "<!-- substrate:end -->";
 function toolsLine() {
   const server = u.serverBase();
   const mcp = server ? ` It is reachable over MCP at ${server}/mcp (bearer token).` : "";
-  return `A team knowledge graph (Spor) holds prior decisions, constraints, dismissed approaches, and deferred work.${mcp} Before designing or deciding anything non-trivial, check it (query_graph). When you defer discovered work or make a decision worth keeping, record it (capture — 2-3 sentences; the server types and links it). Ask my_queue what to work on next. When a git commit implements a tracked node (a task, decision, or issue), add a 'Spor: <node-id>' trailer to the commit message, in the final trailer block alongside any Co-Authored-By (no blank line between trailers) — git then records which node the commit serves, and the graph records the commit's sha.`;
+  return `A team knowledge graph (Spor) holds prior decisions, constraints, dismissed approaches, and deferred work.${mcp} Before designing or deciding anything non-trivial, check it (query_graph). When you defer discovered work or make a decision worth keeping, record it (capture — 2-3 sentences; the server types and links it). Ask show_queue what to work on next. When a git commit implements a tracked node (a task, decision, or issue), add a 'Spor: <node-id>' trailer to the commit message, in the final trailer block alongside any Co-Authored-By (no blank line between trailers) — git then records which node the commit serves, and the graph records the commit's sha.`;
 }
 
 // Body after the second '---' line (awk), head -c 7000, $() newline strip.

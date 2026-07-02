@@ -80,7 +80,7 @@ is just a manifest over `bin/spor-hook.js`.
   the distill engine short-circuits on it — so a `codex exec` distiller that
   fires its own Stop hook cannot recurse.
 - MCP: add the Spor server to `~/.codex/config.toml` for on-demand graph
-  access (`query_graph`, `capture`, `my_queue`):
+  access (`query_graph`, `capture`, `show_queue`):
 
   ```toml
   [mcp_servers.spor]

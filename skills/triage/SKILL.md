@@ -42,8 +42,9 @@ finish the whole queue in one sitting — say what you triaged and what's left.
 
 ## 1. Pull the queue and read the landscape
 
-Get it with the queue's own resolver — `spor next --json` (or the `my_queue`
-MCP tool in Cowork). Read the **aggregates**, not just the page: `total_count`,
+Get it with the queue's own resolver — `spor next --json` (or the `show_queue`
+MCP tool in Cowork; omit `assignee` — `assignee: "me"` narrows to directly
+assigned/stewarded work only). Read the **aggregates**, not just the page: `total_count`,
 `counts_by_type`, `counts_by_suggest`, and the side-channels `pending`
 (unprocessed captures), `questions` (routed/unrouted to you), `findings`
 (gardener observations), plus `dormant`/`muted` counts.
@@ -209,6 +210,12 @@ write nothing), then **verify each candidate pair yourself** before recording.
 Record a confirmed one as a `blocks` edge from the prerequisite to the dependent
 (mirroring how an issue records its block). The dependent then leaves the
 actionable queue until its blocker resolves — which is the point.
+
+Once the topology is recorded you can sanity-check it from the top: the
+program/progress view (`render_program` MCP tool, or `GET
+/v1/program/<root-id>` in a shell) walks a root node's gating tree over
+`blocks` edges with resolution-derived progress — a fast way to confirm the
+edges you just wrote hang the work under the right umbrella.
 
 ## 7. Open questions → brief the lineage, then answer
 

@@ -26,8 +26,16 @@ to surface (see Presenting). Don't echo `SPOR_SERVER`/`SPOR_TOKEN`/`SPOR_HOME`
 or announce which mode is running unless the user asks — it's plumbing; if you
 ever need to confirm the resolved mode/scope, `spor status` reports it.
 
-**In Cowork (no shell)**, call the `my_queue` MCP tool instead, with the same
-fields (`project`, `types`, `exclude_types` arrays, `limit`/`offset`).
+**In Cowork (no shell)**, call the `show_queue` MCP tool instead, with the same
+fields (`project`, `types`, `exclude_types` arrays, `limit`/`offset`). Omit
+`assignee` for the ordinary "my queue" answer — `assignee: "me"` narrows to
+directly assigned/stewarded work only, a narrower carrying view. In an
+MCP-Apps host that should attach the interactive queue widget, use
+`render_queue` (same fields; `show_queue` stays the data answer).
+
+(A different question — "how far along is the whole workstream?", progress
+rather than next actions — is the program view: the `render_program` MCP tool
+or `GET /v1/program/<root-id>`; see /spor:spor.)
 
 **Scope and filter flags** (task-cc-queue-filtering-enhancements). The queue
 defaults to this repo's project; three optional, composable levers widen or
@@ -46,7 +54,7 @@ pending captures"):
   (comma-separated, repeatable, exclude wins on overlap). They apply *before*
   ranking, so the aggregate counts describe the filtered queue.
 
-The `my_queue` MCP tool takes the same as fields.
+The `show_queue` MCP tool takes the same fields.
 
 ## In-flight awareness — don't re-pick work an agent is already on (Claude Code only)
 
@@ -62,12 +70,12 @@ boolean — and a `dispatched` summary (`{id, name, state, status, cwd}`) on the
 in-flight ones — by matching live background agents to node ids. Add
 `--hide-dispatched` to drop the in-flight items entirely (it reports a
 `hidden_dispatched` count, never silently). This is best-effort and
-Claude-Code-only: the `my_queue` / server queue can't see local background
+Claude-Code-only: the `show_queue` / server queue can't see local background
 agents, so the flag fails soft (every item reads `in_flight:false`) when the
 `claude` binary is absent (e.g. in Cowork or a plain shell).
 
 Prefer reading that flag over shelling out yourself. When you only have the raw
-`my_queue` output (which doesn't carry the flag), an item is **in flight** when
+`show_queue` output (which doesn't carry the flag), an item is **in flight** when
 a `kind: "background"` agent from `claude agents --json` has `name` equal to the
 item's id and `state` is not `"done"`. For those items: badge them "🤖 agent
 dispatched — in progress" and keep them OUT of the top "pick this next"

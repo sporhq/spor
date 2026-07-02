@@ -200,8 +200,17 @@ In Cowork (Anthropic's chat workspace) and Claude Code with the connector there
 is no shell and no ambient injection — reach the graph through the **Spor MCP
 tools** instead: `query_graph` (ORIENT/TRAVERSE: free-text search, or `root_id`
 to compile one node's neighborhood), `get_node` (raw node + revision),
-`my_queue` (the ranked queue), `render_lens` (a saved board/table/lineage view;
-no id lists them), and to COMMIT: `capture` (raw prose → server types it — reach
+`show_queue` (the ranked queue — omit `assignee` for the ordinary "my queue"
+answer; `assignee: "me"` narrows to directly assigned/stewarded work only),
+`render_queue` (the same queue when an MCP-Apps host should attach the
+interactive widget; `show_queue` stays the data answer), `render_lens` (a saved
+board/table/lineage view; no id lists them), `render_program` (the
+program/progress view for a workstream: given a root node other work `blocks`,
+the gating tree of everything blocking it transitively, with
+resolution-derived progress — "how far along is X?", where `show_queue`
+answers "what's next?"; REST twin `GET /v1/program/{id}`; an empty result
+means nothing carries a `blocks` edge to that root yet), and to COMMIT:
+`capture` (raw prose → server types it — reach
 for this when unsure of the shape), or the precise writes `put_node` /
 `add_edge` / `set_status`. Close loops with edges: answer a question with a node
 carrying an `answers` edge; close work with a `resolves` edge from a

@@ -58,9 +58,9 @@ Streamable HTTP, implemented with the official SDK. All tool results are
 returned as both human-readable text content and structured JSON.
 
 The server advertises **`instructions`** (the SDK initialize result, surfaced
-by clients as an "MCP Server Instructions" block). It frames the eleven tools
-as an **ORIENT → TRAVERSE → COMMIT** loop rather than eleven independent
-verbs, so an assistant can infer a recursive research chain — e.g. `my_queue`
+by clients as an "MCP Server Instructions" block). It frames the tools
+as an **ORIENT → TRAVERSE → COMMIT** loop rather than a flat list of independent
+verbs, so an assistant can infer a recursive research chain — e.g. `show_queue`
 (or `recent_changes` for "what happened lately") → `query_graph` with `root_id`
 (deepen) → `render_lens` on a lineage lens →
 `put_node`/`capture` the outcome — instead of reconstructing it from per-tool
@@ -232,10 +232,12 @@ text fit no schema (or failed validation twice) and was preserved as a
 `cap-…` capture-pending node — ingestion-quality failures never lose text.
 Only an unreachable ingestion model is an error (`ingestion_unavailable`).
 
-### `my_queue`
+### `show_queue`
 
-The decision queue (QUEUE.md §4/§5). Input `{ "project"?: "slug",
-"types"?: ["task"], "exclude_types"?: ["capture-pending"], "limit"?: 20,
+The decision queue (QUEUE.md §4/§5) — the data answer to "show my queue" /
+"what's next" / "the backlog". Input `{ "project"?: "slug",
+"types"?: ["task"], "exclude_types"?: ["capture-pending"], "assignee"?:
+"<person-id>|me", "limit"?: 20,
 "offset"?: 0 }` → `{ "items": [{id, title, type, status,
 priority, score, signals: {blocking, heat, staleness, age_days}, suggest:
 "do|close", why}], "count": N, "offset": 0, "returned_count": N,
@@ -276,6 +278,23 @@ out of scope — the `counts_*`/`total_count` aggregates describe the filtered
 queue, not what the firehose hid. The type compared is the type the item
 surfaces as, so `exclude_types: ["schema"]` also hides schema-approval items.
 Omitting both (or passing empty arrays) filters nothing.
+
+**Per-person scope** (task-cc-queue-assignee-filtering). `assignee` scopes the
+ranked queue to the work one person carries — the union of nodes with an
+`assigned` edge to them and the nodes they `steward`; `assignee: "me"` binds
+to the caller (QUEUE.md §4). This is a **narrower carrying view**, not the
+queue: for the ordinary "my queue" / "what's next" answer, omit `assignee`
+entirely — pass it only when the caller explicitly asks for directly
+assigned or stewarded work.
+
+### `render_queue`
+
+The widget twin of `show_queue`: same input, same queue, but this tool
+declares the view-tree UI resource (below) so an MCP-Apps host reliably
+attaches the interactive queue widget. Semantics, ranking, filters, and
+pagination match `show_queue` exactly — it exists only to make widget
+attachment an explicit choice; `show_queue` remains the data-oriented
+queue tool for hosts (and turns) that just need the answer.
 
 ### `ask_question`
 
@@ -345,7 +364,7 @@ gating tasks). Unknown `id` errors with `{ "found": false, "error":
 ### `recent_changes`
 
 The team's recent-activity feed — the temporal entry point the other read
-tools lack (`query_graph` is semantic search, `my_queue` is forward-looking
+tools lack (`query_graph` is semantic search, `show_queue` is forward-looking
 open work, `render_lens` renders current state). It answers "what changed /
 what was done in the last N hours", "what did the agents write overnight", and
 "what landed since `<commit>`". Input `{ "since"?, "project"?, "limit"? }` →
@@ -374,7 +393,7 @@ oldest-open bottlenecks. **Completion is a node's status-TRANSITION time** (when
 it entered its final terminal run), never `updated_at`, so a later edge append
 can't corrupt the "completed last week" signal (dec-spor-git-derived-timestamps).
 `project` (a repo slug or grouping id) scopes it through the same up-resolution
-as `my_queue`; `types` restricts node types; `weeks`/`top`/`aging` shape the
+as `show_queue`; `types` restricts node types; `weeks`/`top`/`aging` shape the
 window. The MCP twin of `GET /v1/analytics` (§3) over the same `store.analytics`
 core — for the shell-less Cowork audience that can't run the CLI.
 
@@ -396,7 +415,7 @@ contract from `lib/seed/` files — those miss resident overrides
 
 ### The MCP-app widget (`ui://spor/view-tree.html`)
 
-`my_queue`, `render_lens`, and `render_program` declare a UI resource via
+`render_queue`, `render_lens`, and `render_program` declare a UI resource via
 `_meta.ui.resourceUri`: a single trusted interpreter of the view-tree
 component catalog that MCP-apps hosts (Claude, Goose, VS Code) render as an
 interactive iframe — status chips, progress bars, lineage trees, node detail
