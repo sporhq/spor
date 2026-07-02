@@ -319,6 +319,29 @@ render). Unknown `lens_id` still errors, carrying the same `catalog`/`lenses`
 list; engine failures (missing param, broken blocks) error with the message
 verbatim.
 
+### `render_program`
+
+The program/progress view over `blocks` topology — the birds-eye "where do we
+stand" for a large workstream, auto-derived on demand with no lens authoring.
+Input `{ "id": "<root-node-id>", "max_depth"?, "max_nodes"? }` → `{ "found":
+true, "root_id", "progress": {"total", "done", "active", "blocked", "open",
+"pct", "statuses"}, "count", "truncated"?, "view", "node_ids" }`. Given a root
+node (an umbrella task, a milestone — anything other work `blocks`), the
+server walks its gating tree — every node that blocks it, transitively over
+inbound `blocks` edges — and derives each node's bucket from the same truth
+the queue uses: terminal statuses, supersession, and live `resolves`/`answers`
+edges count as **done** (even while the status field lags — the effective
+status then reads `resolved` with a `resolved_by` ride-along); a node gated by
+its own live unresolved blockers is **blocked**; live unblocked work splits
+**active** vs **open**. `view` is the standard view tree (`as: "tree"` with an
+additive `progress` block); the text content is a progress-bar header plus the
+glyphed gating tree. Shared blockers render once and repeat as `repeat: true`
+leaves (counted once); `max_depth`/`max_nodes` caps count skipped branches
+into `truncated`, never silently. A root nothing blocks is a successful empty
+result whose prose says how to model the program (add `blocks` edges from the
+gating tasks). Unknown `id` errors with `{ "found": false, "error":
+"unknown_root" }`. The REST twin is `GET /v1/program/{id}` (§3).
+
 ### `recent_changes`
 
 The team's recent-activity feed — the temporal entry point the other read
@@ -373,7 +396,7 @@ contract from `lib/seed/` files — those miss resident overrides
 
 ### The MCP-app widget (`ui://spor/view-tree.html`)
 
-`my_queue` and `render_lens` declare a UI resource via
+`my_queue`, `render_lens`, and `render_program` declare a UI resource via
 `_meta.ui.resourceUri`: a single trusted interpreter of the view-tree
 component catalog that MCP-apps hosts (Claude, Goose, VS Code) render as an
 interactive iframe — status chips, progress bars, lineage trees, node detail
@@ -421,6 +444,7 @@ endpoint is the REST twin of a core call:
 | `GET /v1/analytics?project=&type=&weeks=&top=&aging=&format=` | remote `spor analytics`, the `analytics` MCP tool | work-flow analytics — the SERVER twin of the local-only `spor analytics` consumer, for a remote/Cowork teammate with no local graph repo to fold (task-spor-server-analytics-surface): created-vs-completed weekly cohorts, throughput, cycle-time median/p90, current WIP by node type, and the oldest-open bottlenecks, computed by the pure analytics kernel over the resident graph + a HEAD-keyed status-transition fold. **Completion is a node's status-TRANSITION time** (when it entered its final terminal run, from git content history), never `updated_at`, so a later edge append can't corrupt the "completed last week" signal (dec-spor-git-derived-timestamps). Default returns the machine (JSON) report `{window, weekly, totals, throughput, cycleTimeDays, wip, bottlenecks, coverage}`; `?format=text` renders the human report. `project` resolves through the shared up-resolution like `/v1/queue` (bare repo slug → grouping union; `repo-<slug>`/`proj-<slug>` id pins) — a zero-match scope rides back as the additive `project_warning` field (text mode prefixes a `# ` line). `type=` (comma-separated, repeatable) restricts node types; `weeks`/`top`/`aging` shape the window (clamped 1–52 / 1–100 / 1–365). A bad slug/type is `422`. The remote arm of `spor analytics` fetches the JSON and renders it with the SAME `renderReport` the local consumer uses, so remote and local output match (norm-spor-cli-mode-parity, task-spor-analytics-remote-cli-dispatch) |
 | `POST /v1/questions` `{text, title?, mentions?, project?}` | ask_question's REST twin | file a question node; deterministically routed to the steward of the closest relevance-neighborhood node, unrouted if none → 201 `{status, id, project, routed_to, via, asker, revision, warnings}`. `project` is derived from the relevance neighborhood (then the asker's home project) unless an explicit `project` slug overrides it — pass that for a mention-less question (a dispatched agent injects its session project); a malformed slug → 400 |
 | `POST /v1/gardener` | ops cron / on demand; `spor admin gardener` | run a gardener sweep now; findings filed as queue items → `{checked, filed, resolved, skipped, generated_at}` (`filed`/`resolved`/`skipped` are id lists, `checked` a count). The `spor admin gardener [--json]` CLI verb is the shell front-door (remote-only — the server owns the gardener); authenticated but **not** admin-gated server-side today (unlike `/v1/backup`), so any valid team token can trigger it — the verb still surfaces a 403 as an admin-privilege (stewards→root) hint for a deployment that adds the gate |
+| `GET /v1/program/{id}?format=json\|text&depth=&max_nodes=` | program oversight, /spor:brief follow-ups | the program/progress view (`render_program`'s REST twin, one kernel behind both doors): the gating tree of everything that `blocks` `{id}` transitively, with resolution-derived progress (`{progress: {total, done, active, blocked, open, pct, statuses}}` on the view root; done = terminal status / supersession / live resolves-answers edge, exactly the queue's truth). JSON view tree by default, `?format=text` for the terminal rendering; `depth`/`max_nodes` bound expansion and count skipped branches into `truncated`, never silently. 404 for an unknown id |
 | `GET /v1/lens/{id}/render?format=html\|text\|json` | browsers, teammates without a checkout | run a lens OR workspace node and render its view tree (html default, plain text, or the raw tree as json). Read-only — no action forms; writes stay with `/v1/nodes` and the MCP tools. Auth is the caller's bearer header OR a signed read-only **render ticket** for shared links (browser links can't carry an Authorization header): `?ticket=<blob>` is accepted once and exchanged via a 302 for an HttpOnly `spor_render_ticket` cookie (kept out of URLs, logs, and view-to-view hrefs). The ticket binds `$viewer` to the recorded sharer and the render shows a "Viewing as &lt;sharer&gt;" banner. The former `?token=<PAT>` sharing path is **removed** — a shared link can never carry a write-capable credential |
 | `POST /v1/lens/{id}/ticket` `{expires?}` | sharing a view; `spor share` | mint a signed, expiring, read-only render ticket for the lens/workspace, recording the authenticated caller as the sharer → `{ticket, url, lens_id, sharer_person_id, exp}`. `expires` is `<N>d` or an ISO date (default `7d`, max `30d`); the caller must be bound to a person node (else `422 no_person`). The ticket carries no write scope and is honored only on the render route. The `spor share <lens-id> [--expires <Nd>]` CLI verb is the shell front-door (remote-only — tickets are minted and signed server-side); it prints the shareable link ready to paste, `--json` for the raw envelope |
 | `GET /v1/export` | bootstrap/offline; `spor export` | ustar tarball of `nodes/` for seeding a local read replica (`?gzip=1` compresses); see §5 for the response headers. `curl … \| tar x` reproduces `nodes/` byte-for-byte. `?history=1` instead streams a `git bundle --all` of the repo (`application/x-git-bundle`, full commit provenance, the customer data-exit path — `git clone <bundle> graph`); `?auth=1` ALSO bundles `auth/*.json` so a disaster restore reproduces the credential set (admin-gated: stewards-root → `403` otherwise). The `spor export [--gzip] [--history\|--auth] [--out <file>]` CLI verb is the shell front-door (remote downloads this; `--gzip`/`--out` also build the same `nodes/` tarball locally, while `--history`/`--auth` are remote-only) |
