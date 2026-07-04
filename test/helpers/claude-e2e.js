@@ -149,8 +149,10 @@ function makeScratchGraph({ slug = "e2eproj", nodes = [] } = {}) {
 // Run `claude --plugin-dir <root> -p <prompt>` against the fake. Async — resolves to
 // { rc, result, stdout, stderr, timedOut }. The session distill/nudge backends are stubbed
 // to NOTHING by default; pass distillCmd/nudgeCmd to script them. `distilling: true` sets
-// the SPOR_DISTILLING recursion guard, which suppresses BOTH the SessionEnd distill and
-// the PostToolUse nudge — use it for tests that exercise neither and want no async noise.
+// the SPOR_DISTILLING recursion guard, which suppresses the SessionEnd distill, the
+// PostToolUse nudge, AND the UserPromptSubmit digest
+// (issue-spor-digest-fires-on-headless-backend-personas) — use it only for tests that
+// exercise none of them and want no async noise.
 //
 // We use async spawn and resolve on the CHILD's `exit`, NOT spawnSync: claude 2.x leaves a
 // persistent background daemon running, and spawnSync blocks on process-group/stdio

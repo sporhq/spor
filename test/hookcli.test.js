@@ -260,6 +260,35 @@ test('prompt-context: continuation prompts inject nothing before any remote call
   }
 });
 
+test('prompt-context: headless backend sessions inject nothing (issue-spor-digest-fires-on-headless-backend-personas)', async () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
+  const { srv, hits, base } = await stubServer();
+  try {
+    for (const marker of ['SPOR_DISTILLING', 'SUBSTRATE_DISTILLING']) {
+      const env = freshEnv(home);
+      env.SPOR_SERVER = base;
+      env.SPOR_TOKEN = 'spor_pat_test';
+      env[marker] = '1';
+      let out = '';
+      await runAsync2(
+        ['prompt-context', '--host', 'claude-code'],
+        JSON.stringify({
+          cwd,
+          session_id: 'sess-headless',
+          prompt: 'You are the Spor capture ingester. Distill the following transcript into typed graph nodes.',
+        }),
+        env,
+        (d) => (out += d)
+      );
+      assert.strictEqual(out, '', `${marker} session must inject no digest`);
+    }
+    assert.deepStrictEqual(hits, [], 'backend-persona prompt must not spend a digest request');
+  } finally {
+    srv.close();
+  }
+});
+
 test('prompt-context: local digest is compact and repeated follow-up is suppressed', () => {
   const { home, cwd } = scratch();
   fs.writeFileSync(path.join(home, 'nodes', 'dec-widget-cache.md'), `---

@@ -215,7 +215,11 @@ real nodes; point `SPOR_HOME` at a scratch dir first.
 End-to-end: `SPOR_DISTILLING=1 claude --plugin-dir . -p "<question only
 the graph can answer>"` from a project directory whose nodes exist in the
 graph. (`SPOR_DISTILLING=1` stops the test session distilling junk into
-the real graph.)
+the real graph.) Note the same marker now also suppresses the
+UserPromptSubmit digest (issue-spor-digest-fires-on-headless-backend-
+personas: backend personas are not user prompts), so this recipe exercises
+the session-start briefing only — test the digest via the `bin/spor-hook
+prompt-context` payload above.
 
 When testing against a scratch graph, set `SPOR_HOME=/tmp/whatever` — never
 test write-paths against your live graph home. The live graph (the one the

@@ -92,14 +92,14 @@ test(
     const g = makeScratchGraph({ slug: "e2eproj", nodes: corpus("e2eproj") });
     const fake = await startFakeAnthropic();
     try {
-      // distilling:true suppresses the async SessionEnd distill (tested separately) so this
-      // run has no background noise.
+      // NOT distilling: the SPOR_DISTILLING guard now also suppresses the prompt digest
+      // (issue-spor-digest-fires-on-headless-backend-personas), which is what this test
+      // asserts. The SessionEnd distill stays inert via the default NOTHING_CMD stub.
       const { rc, stderr } = await runClaude({
         home: g.home,
         cwd: g.cwd,
         baseUrl: fake.url,
         prompt: "what is our widget thumbnail caching strategy in redis for the gallery page",
-        distilling: true,
       });
       assert.strictEqual(rc, 0, `claude should exit 0 (stderr: ${stderr})`);
       assert.ok(fake.requests.some((r) => r.url.startsWith("/v1/messages")), "claude should hit POST /v1/messages");
@@ -128,9 +128,9 @@ test("Tier 0: the digest relevance gate suppresses a digest for an off-topic pro
       cwd: g.cwd,
       baseUrl: fake.url,
       // six+ words (clears the trivial-prompt gate) but lexically unrelated to the corpus,
-      // so it must fall below the --min-sim cosine floor.
+      // so it must fall below the --min-sim cosine floor. NOT distilling: the digest
+      // engine no-ops under SPOR_DISTILLING, which would make this gate test vacuous.
       prompt: "kangaroo trampoline saxophone volcano umbrella espresso",
-      distilling: true,
     });
     assert.strictEqual(rc, 0);
     const injected = allInjectedText(fake.requests);

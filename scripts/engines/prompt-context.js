@@ -222,6 +222,14 @@ function stripSystemReminders(prompt) {
 }
 
 async function promptContext(input) {
+  // Headless backend invocations (the capture ingester, the fact-finder
+  // distiller, the nudge classifier — every spawn site exports the
+  // SPOR_DISTILLING marker, client and server) are not user prompts: a digest
+  // injected there is compile work no human reads, and it polluted the digest
+  // eval set (issue-spor-digest-fires-on-headless-backend-personas). Same
+  // guard post-tool already applies ("headless calls don't nudge").
+  if (process.env.SPOR_DISTILLING || process.env.SUBSTRATE_DISTILLING) return null;
+
   const graph = u.graphHome();
   const prompt = stripSystemReminders(input.prompt ?? "");
   const slug = u.projectSlug(input.cwd ?? "");
