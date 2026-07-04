@@ -414,3 +414,5 @@ private spor-server repo, alongside the one live UI surface (the MCP
 view-tree widget), and governs all Spor UI. Identity in one line:
 evidentiary/calm/precise, cool neutrals, one rationed **glacial teal** accent
 (hue 205) — indigo/violet accents are banned product-wide.
+
+@AGENTS.md

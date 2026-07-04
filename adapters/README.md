@@ -18,7 +18,10 @@ The Spor client is a portable core behind per-host adapters
   nothing and exits 0.
 - **Universal surfaces**: the server's MCP endpoint (`/mcp`) and REST
   (`/v1/*`) work from any host; `spor-hook agents-md` maintains a managed
-  Spor section in `AGENTS.md` as the floor for hook-less hosts.
+  Spor section in `AGENTS.md` (capture-discipline directive + standing
+  briefing) as the floor for hook-less hosts. The committable directive-only
+  form of the same block is `spor agents-md` (written by `spor enable` by
+  default, refreshed by `spor upgrade`) — see `spor help agents-md`.
 - **Adapters**: a manifest per host mapping its event names onto the
   dispatcher.
 

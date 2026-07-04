@@ -4859,6 +4859,57 @@ function cmdLink(cfg, { positionals }) {
   return 0;
 }
 
+// --- spor agents-md: committed capture-discipline directive ----------------
+// (task-spor-agents-md-capture-discipline-directive) Write/refresh the managed
+// AGENTS.md block with the standing user-voice directive to keep the graph
+// current. The 2026-07 retrospective found front-loaded user-voice directives
+// were the one condition that reliably produced unprompted capture (~8/8 vs a
+// ~0-10% baseline), while the hook-injected preamble saying the same thing in
+// system-reminder voice underperformed — so the directive belongs in a
+// COMMITTED instructions file, where it reaches every contributor and every
+// dispatched agent. Default is directive-only: hooked hosts already receive
+// the briefing at session start, and a committed briefing snapshot stales;
+// --briefing restores the full hook-less floor (directive + briefing embed).
+async function cmdAgentsMd(cfg, { values }) {
+  const root = repoRoot();
+  const { writeAgentsBlock } = require(path.join(ROOT, "scripts", "engines", "agents-md.js"));
+  const { file, meta } = await writeAgentsBlock({ cwd: root, briefing: !!values.briefing });
+  out(`updated ${file} (${values.briefing ? meta || "no briefing yet, MCP pointers only" : "capture-discipline directive"})`);
+  // CLAUDE.md rides along via an @AGENTS.md import (Claude Code resolves
+  // @-imports): if the repo has a CLAUDE.md that never mentions AGENTS.md,
+  // Claude Code sessions would miss the directive entirely. Append the import
+  // once; never CREATE a CLAUDE.md (AGENTS.md alone is the portable surface).
+  if (!values["no-claude-md"]) {
+    const claudeMd = path.join(root, "CLAUDE.md");
+    if (fs.existsSync(claudeMd)) {
+      const txt = fs.readFileSync(claudeMd, "utf8");
+      if (!/AGENTS\.md/.test(txt)) {
+        fs.writeFileSync(claudeMd, txt + (txt.endsWith("\n") ? "" : "\n") + "\n@AGENTS.md\n");
+        out(`updated ${claudeMd} (@AGENTS.md import appended)`);
+      }
+    }
+  }
+  out("  commit the file(s) so every contributor and dispatched agent inherits the directive");
+  return 0;
+}
+
+// `spor upgrade` rider: the committed directive tracks the packaged wording —
+// refresh the current repo's managed block IF one exists, preserving whether
+// it embedded a briefing. A repo that never opted into the block is untouched.
+async function refreshAgentsBlockIfManaged(root = repoRoot()) {
+  const file = path.join(root, "AGENTS.md");
+  let existing = "";
+  try {
+    existing = fs.readFileSync(file, "utf8");
+  } catch {
+    return;
+  }
+  if (!existing.includes("<!-- spor:begin -->") && !existing.includes("<!-- substrate:begin -->")) return;
+  const { writeAgentsBlock } = require(path.join(ROOT, "scripts", "engines", "agents-md.js"));
+  await writeAgentsBlock({ cwd: root, briefing: /### Standing project briefing/.test(existing) });
+  out(`refreshed ${file} (managed Spor block — commit if the wording changed)`);
+}
+
 // --- spor install / setup: wire spor into a host agent ---------------------
 // dec-cc-portable-core-adapters ships a manifest per host under adapters/<host>/
 // with a __SPOR_ROOT__ placeholder; installing one resolves the placeholder to
@@ -5519,6 +5570,10 @@ async function cmdUpgrade(cfg, { values, positionals: pos }) {
     if (r !== 0) rc = r;
   }
   if (!dryRun) {
+    // The committed AGENTS.md directive versions with the package — refresh
+    // the current repo's managed block so wording changes actually ship
+    // (task-spor-agents-md-capture-discipline-directive). No-op without one.
+    await refreshAgentsBlockIfManaged();
     out("");
     out("Restart any running sessions so the refreshed hooks/plugin load.");
     // The refresh above closes the loaded-vs-installed gap; this closes the
@@ -8472,10 +8527,40 @@ const COMMANDS = {
     run: (cfg) => cmdScope(false),
   },
   enable: {
-    group: "Repo scoping", parse: "strict", args: "", options: {},
-    summary: "opt this repo in (.spor.json)",
-    help: "Set { enabled: true } in this repo's committable .spor.json. Spor is opt-in\nper repo — a repo with no .spor/.spor.json marker is a no-op — so this is how\nyou turn it on (and how you undo a prior 'spor disable'). Commit the file to\nshare the setting.",
-    run: (cfg) => cmdScope(true),
+    group: "Repo scoping", parse: "strict", args: "",
+    options: { "no-agents": { type: "boolean", desc: "skip writing the AGENTS.md capture-discipline directive" } },
+    summary: "opt this repo in (.spor.json + AGENTS.md directive)",
+    help: "Set { enabled: true } in this repo's committable .spor.json. Spor is opt-in\nper repo — a repo with no .spor/.spor.json marker is a no-op — so this is how\nyou turn it on (and how you undo a prior 'spor disable'). Also writes the\nAGENTS.md capture-discipline directive (see 'spor help agents-md'; skip with\n--no-agents). Commit the files to share the setting.",
+    run: async (cfg, p) => {
+      const rc = cmdScope(true);
+      // Enabling is the moment this repo's work was decided to belong in the
+      // graph — the standing directive rides along by default.
+      if (rc === 0 && !p.values["no-agents"]) await cmdAgentsMd(cfg, { values: {} });
+      return rc;
+    },
+  },
+  "agents-md": {
+    group: "Repo scoping", parse: "strict", args: "", aliases: ["agents"],
+    summary: "write/refresh the committed AGENTS.md graph-upkeep directive",
+    help:
+      "Write (or idempotently refresh) the managed Spor block in AGENTS.md at the\n" +
+      "repo root: standing user-voice instructions to keep the graph current —\n" +
+      "capture discovered work when it appears, file issues before fixing, prefer\n" +
+      "the graph over private auto-memory for durable facts, resolve with\n" +
+      "artifacts, add Spor: commit trailers. Committed, it reaches every\n" +
+      "contributor and dispatched agent; 'spor upgrade' refreshes the wording.\n" +
+      "If a CLAUDE.md exists that never mentions AGENTS.md, an @AGENTS.md import\n" +
+      "is appended so Claude Code sessions inherit the directive too.\n" +
+      "By default the block carries the directive only (hooked hosts get their\n" +
+      "briefing at session start); --briefing also embeds the standing project\n" +
+      "briefing — the floor for hosts without hooks (same block 'spor-hook\n" +
+      "agents-md' maintains from adapter session-start hooks).",
+    options: {
+      briefing: { type: "boolean", desc: "also embed the standing project briefing (hook-less floor)" },
+      "no-claude-md": { type: "boolean", desc: "don't append the @AGENTS.md import to an existing CLAUDE.md" },
+    },
+    examples: ["spor agents-md", "spor agents-md --briefing"],
+    run: (cfg, p) => cmdAgentsMd(cfg, p),
   },
   link: {
     group: "Repo scoping", parse: "strict", args: "<slug>", options: {},
@@ -8854,7 +8939,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, COMMANDS, resolveVerb, getNodeJson, gitBlobSha };
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged };
 
 if (require.main === module) {
   main()
