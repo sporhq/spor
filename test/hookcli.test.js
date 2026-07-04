@@ -1350,6 +1350,91 @@ test('doctor (remote): surfaces dead-lettered captures with their count', async 
   }
 });
 
+// Capture-pipeline health (task-spor-distill-nudge-health-diagnostics): the
+// llm-calls journal scan surfaces a 100%-failure streak in doctor and as a
+// session-start nudge — the outage class the outbox counters can't see.
+function llmCallDay(home, records) {
+  const dir = path.join(home, 'journal', 'llm-calls');
+  fs.mkdirSync(dir, { recursive: true });
+  const u = require('../scripts/engines/util');
+  fs.writeFileSync(
+    path.join(dir, `${u.localDate()}.jsonl`),
+    records.map((r) => JSON.stringify({ id: 'llm-t', ts: new Date().toISOString(), ...r })).join('\n') + '\n'
+  );
+}
+
+test('doctor: a 100%-failure capture streak is flagged FAILING; mixed results show their rate', () => {
+  const { home, cwd } = scratch();
+  llmCallDay(home, [
+    { source: 'distill-remote', error: 'distill cmd failed' },
+    { source: 'distill-remote', error: 'distill cmd failed' },
+    { source: 'distill-remote', error: 'distill cmd failed' },
+    { source: 'nudge', error: null },
+    { source: 'nudge', error: 'nudge cmd failed' },
+  ]);
+  const out = run(['doctor', '--cwd', cwd], '', freshEnv(home));
+  assert.match(out, /distill 7d:\s+FAILING — 3\/3 calls failed/);
+  assert.match(out, /last error: distill cmd failed/);
+  assert.match(out, /nudge 7d:\s+2 calls, 1 failed \(50% ok\)/);
+});
+
+test('doctor: no capture calls in the window reads as idle, not an alarm', () => {
+  const { home, cwd } = scratch();
+  const out = run(['doctor', '--cwd', cwd], '', freshEnv(home));
+  assert.match(out, /distill 7d:\s+no calls in the window — idle/);
+  assert.doesNotMatch(out, /FAILING/);
+});
+
+test('session-start (remote): a capture-pipeline failure streak surfaces the FAILING nudge', async () => {
+  const { home, cwd } = scratch();
+  llmCallDay(home, [
+    { source: 'distill-remote', error: 'distill cmd failed' },
+    { source: 'distill-remote', error: 'distill cmd failed' },
+    { source: 'nudge', error: 'nudge cmd failed' },
+    { source: 'nudge', error: 'nudge cmd failed' },
+    { source: 'nudge', error: 'nudge cmd failed' },
+  ]);
+  const { srv, base } = await statusServer(200);
+  try {
+    const env = freshEnv(home);
+    env.SPOR_SERVER = base;
+    env.SPOR_TOKEN = 'spor_pat_good';
+    let out = '';
+    await runAsync2(['session-start', '--host', 'claude-code'],
+      JSON.stringify({ cwd, hook_event_name: 'SessionStart' }), env, (s) => (out += s));
+    const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+    // nudge trips (3/3 failed); distill stays below the 3-attempt alarm floor
+    assert.match(ctx, /capture pipeline FAILING: nudge 3\/3/);
+    assert.doesNotMatch(ctx, /distill 2\/2/);
+    assert.match(ctx, /spor-hook doctor/);
+  } finally {
+    srv.close();
+  }
+});
+
+test('session-start (remote): a healthy capture history adds no FAILING nudge', async () => {
+  const { home, cwd } = scratch();
+  llmCallDay(home, [
+    { source: 'distill-remote', error: null },
+    { source: 'distill-remote', error: 'distill cmd failed' },
+    { source: 'distill-remote', error: null },
+    { source: 'nudge', error: null },
+  ]);
+  const { srv, base } = await statusServer(200);
+  try {
+    const env = freshEnv(home);
+    env.SPOR_SERVER = base;
+    env.SPOR_TOKEN = 'spor_pat_good';
+    let out = '';
+    await runAsync2(['session-start', '--host', 'claude-code'],
+      JSON.stringify({ cwd, hook_event_name: 'SessionStart' }), env, (s) => (out += s));
+    const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+    assert.doesNotMatch(ctx, /FAILING/);
+  } finally {
+    srv.close();
+  }
+});
+
 // Piece 2: the session-start nudge rides the SAME channel as the OFFLINE banner.
 test('session-start (remote): a dead-lettered capture surfaces a nudge to run doctor', async () => {
   const { home, cwd } = scratch();

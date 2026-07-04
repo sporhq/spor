@@ -164,6 +164,35 @@ async function doctor() {
     kv("graph", n == null ? "not created — run 'spor init'" : `${nodesDir} (${n} nodes)`);
   }
 
+  // Capture-pipeline health (task-spor-distill-nudge-health-diagnostics):
+  // per-pipeline success rates over the trailing window, from the llm-calls
+  // records every distill/nudge backend call writes. A 100%-failure streak —
+  // the silent-outage shape — is flagged loudly; partial failure just shows
+  // its numbers; no calls at all is "idle", not an alarm.
+  const { captureHealth, failingPipelines } = require("./capture-health");
+  const health = captureHealth(graph);
+  const failing = new Set(failingPipelines(health));
+  for (const p of ["distill", "nudge"]) {
+    const s = health[p];
+    const label = `${p} ${health.days}d`;
+    if (s.attempts === 0) {
+      kv(label, "no calls in the window — idle (or the pipeline never fires; check backend config)");
+    } else if (failing.has(p)) {
+      kv(
+        label,
+        `FAILING — ${s.failures}/${s.attempts} calls failed, 0 successes` +
+          ` (last error: ${s.lastErr}); capture is effectively OFF — check the backend cmd/CLI`
+      );
+    } else {
+      const okPct = Math.round(((s.attempts - s.failures) / s.attempts) * 100);
+      kv(
+        label,
+        `${s.attempts} calls, ${s.failures} failed (${okPct}% ok)` +
+          (s.lastOkTs ? `, last success ${fmtAge(Date.parse(s.lastOkTs))}` : "")
+      );
+    }
+  }
+
   // Recent error history from both journals — the after-the-fact crumb the
   // fail-open contract would otherwise hide (piece 1 feeds remote.log crashes).
   const journal = path.join(graph, "journal");

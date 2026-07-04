@@ -175,6 +175,18 @@ function degradationNudge(graph) {
     if (spooled >= SPOOL_NUDGE_THRESHOLD) {
       return ` ⚠ ${spooled} captures spooled and undelivered (the server may have been unreachable) — run 'spor-hook doctor'.`;
     }
+    // Capture-pipeline 100%-failure streak (task-spor-distill-nudge-health-
+    // diagnostics): the outage class the outbox counters can't see — a broken
+    // backend cmd/CLI fails BEFORE anything reaches the outbox (the 2026-06
+    // home-migration outage ran 20 days invisible this way). Computed from the
+    // llm-calls journal, tail-bounded per day file.
+    const { captureHealth, failingPipelines } = require("./capture-health");
+    const health = captureHealth(graph);
+    const failing = failingPipelines(health);
+    if (failing.length) {
+      const n = failing.map((p) => `${p} ${health[p].failures}/${health[p].attempts}`).join(", ");
+      return ` ⚠ Spor capture pipeline FAILING: ${n} backend calls failed over the last ${health.days}d with zero successes — nothing is being captured; run 'spor-hook doctor'.`;
+    }
   } catch {
     /* fail open — a degraded health surface must never cost the session */
   }
