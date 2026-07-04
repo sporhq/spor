@@ -1,7 +1,7 @@
 <!-- spor:begin -->
 ## Spor team graph
 
-A team knowledge graph (Spor) holds prior decisions, constraints, dismissed approaches, and deferred work. It is reachable over MCP at http://127.0.0.1:8787/mcp (bearer token). Before designing or deciding anything non-trivial, check it (query_graph). Ask show_queue what to work on next. When a git commit implements a tracked node (a task, decision, or issue), add a 'Spor: <node-id>' trailer to the commit message, in the final trailer block alongside any Co-Authored-By (no blank line between trailers) — git then records which node the commit serves, and the graph records the commit's sha.
+A team knowledge graph (Spor) holds prior decisions, constraints, dismissed approaches, and deferred work. Before designing or deciding anything non-trivial, check it (query_graph). Ask show_queue what to work on next. When a git commit implements a tracked node (a task, decision, or issue), add a 'Spor: <node-id>' trailer to the commit message, in the final trailer block alongside any Co-Authored-By (no blank line between trailers) — git then records which node the commit serves, and the graph records the commit's sha.
 
 Keep the graph current as you work — do these unprompted:
 

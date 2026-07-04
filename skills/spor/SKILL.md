@@ -209,12 +209,52 @@ program/progress view for a workstream: given a root node other work `blocks`,
 the gating tree of everything blocking it transitively, with
 resolution-derived progress — "how far along is X?", where `show_queue`
 answers "what's next?"; REST twin `GET /v1/program/{id}`; an empty result
-means nothing carries a `blocks` edge to that root yet), and to COMMIT:
+means nothing carries a `blocks` edge to that root yet — see "Grouping work
+under an umbrella node" below for how to model one), and to COMMIT:
 `capture` (raw prose → server types it — reach
 for this when unsure of the shape), or the precise writes `put_node` /
 `add_edge` / `set_status`. Close loops with edges: answer a question with a node
 carrying an `answers` edge; close work with a `resolves` edge from a
 `decision`/`artifact`.
+
+## Grouping work under an umbrella node (programs)
+
+When a workstream outgrows a handful of nodes — a milestone, a refactoring
+program, a launch — group it under an **umbrella node** so the program view
+can render it. There is no `program` node type: the umbrella is an ordinary
+node, almost always a `task` (id like `task-<stem>-program`) whose body says
+what the program is and what "done" means. (`type: project` /
+`grouped-under` is the unrelated repo-identity layer — never use it to group
+work.)
+
+Membership is **`blocks` topology**: each member carries a `blocks` edge TO
+the umbrella — "the umbrella can't finish until this does":
+
+```bash
+spor edge task-api-rate-limit blocks task-platform-hardening-program
+# MCP: add_edge {id: "task-api-rate-limit", type: "blocks", to: "task-platform-hardening-program"}
+```
+
+- Write it from the member's perspective (member `blocks` umbrella). The
+  inverse spelling (`blocked-by` on the umbrella) is accepted and flipped;
+  duplicate edges are a no-op.
+- **Only `blocks` edges count.** The program view walks inbound `blocks`
+  edges transitively and nothing else — members joined by `relates-to`,
+  `mentions`, or `derived-from` are invisible to it (and to the queue's
+  blocked-gating).
+- Nest freely: a workstream hub that `blocks` the program hub hangs its whole
+  subtree under it — the walk is transitive, so one edge per level is enough.
+- The gating is real, not cosmetic: the umbrella leaves the actionable queue
+  until its members land, and closing it at the end still needs a resolver
+  like any task.
+
+Read it back with `render_program` (`{id: "<umbrella-id>"}`; REST `GET
+/v1/program/<id>`): the gating tree with resolution-derived progress, where
+**done** = terminal status, supersession, or a live `resolves`/`answers`
+edge — the queue's truth, even while a status field lags. An empty result
+means nothing `blocks` the root yet — add the member edges above.
+`show_queue` answers "what's next?"; `render_program` answers "how far along
+is the whole thing?".
 
 ## Adding a node or edge type
 

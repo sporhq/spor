@@ -60,7 +60,7 @@ are same-direction synonyms renamed at write time.
 | resolves | 0.9 | this fixes/closes the target | — |
 | triggered-by | 0.7 | this run was triggered by the target | — |
 | performs | 0.8 | this run is an execution of the target workflow | — |
-| blocks | 0.7 | the target can't proceed until this does | inverse `blocked-by` |
+| blocks | 0.7 | the target can't proceed until this does | inverse `blocked-by`; also program membership — member `blocks` umbrella, rendered by `render_program` |
 | answers | 0.7 | this answers the target question | inverse `answered-by` |
 | assigned | 0.5 | work assigned to this person OR agent (explicit routing; an agent target may carry a `profile:` per-assignment override) | — |
 | relates-to | 0.5 | weak association | alias `related-to` |
