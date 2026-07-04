@@ -253,6 +253,33 @@ test('prefilter: non-md, graph-home, /nodes/, instruction files, and short prose
   assert.strictEqual(journal(home).filter((e) => e.file).length, cases.length);
 });
 
+// Auto-memory carve-out (issue-spor-capture-nudge-memory-exclusion-loses-facts):
+// memory files are where durable findings land INSTEAD of the graph, so a
+// memory write routes through the classifier; the rest of ~/.claude (and the
+// MEMORY.md index) stays agent-private.
+test('a ~/.claude memory-file write is classified and can fire a nudge', () => {
+  const { root, home, cwd } = scratch();
+  const file = path.join(root, '.claude', 'projects', '-x-proj', 'memory', 'gotcha-paid-for.md');
+  const out = postTool(home, cwd, factStub(root), { file, content: PROSE, extraEnv: { HOME: root } });
+  const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /capture nudge/);
+  assert.match(ctx, /retry-path/);
+  assert.strictEqual(llmCalls(home).length, 1, 'the memory write reached the classifier');
+});
+
+test('the rest of ~/.claude (and the MEMORY.md index) stays excluded', () => {
+  const { root, home, cwd } = scratch();
+  const cases = [
+    path.join(root, '.claude', 'plans', 'some-plan.md'),                       // non-memory ~/.claude
+    path.join(root, '.claude', 'projects', '-x-proj', 'memory', 'MEMORY.md'),  // the index
+  ];
+  for (const file of cases) {
+    const out = postTool(home, cwd, factStub(root), { file, content: PROSE, extraEnv: { HOME: root } });
+    assert.strictEqual(out.trim(), '', `expected no nudge for ${file}`);
+  }
+  assert.strictEqual(llmCalls(home).length, 0, 'neither reached the classifier');
+});
+
 test('Edit new_string is classified like Write content', () => {
   const { root, home, cwd } = scratch();
   const out = postTool(home, cwd, factStub(root), {

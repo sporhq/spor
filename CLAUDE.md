@@ -136,7 +136,10 @@ The post-tool engine also carries the capture nudge
 (task-cc-posttool-capture-nudge):
 a Write/Edit of ≥50 words of prose to a `.md` outside the graph runs a Haiku
 classifier and, if it finds capturable facts, injects a capture-or-dismiss
-`additionalContext`. Test with `SPOR_NUDGE_CMD` (prompt stdin → response
+`additionalContext`. `~/.claude` is excluded as agent-private EXCEPT its
+auto-memory files (`…/memory/*.md`, minus the MEMORY.md index), which route
+through the classifier — memory writes are where durable findings land
+instead of the graph (issue-spor-capture-nudge-memory-exclusion-loses-facts). Test with `SPOR_NUDGE_CMD` (prompt stdin → response
 stdout, same contract as `SPOR_DISTILL_CMD`; stubs must `cat >/dev/null`
 first or the prompt pipe SIGPIPEs); `SPOR_NUDGE=0` disables; cooldown
 state is `journal/<session>.nudged`. `scripts/distill-gemini.sh` satisfies the

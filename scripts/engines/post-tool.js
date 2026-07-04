@@ -68,12 +68,22 @@ async function nudge({ input, graph, slug, session, file, remote }) {
   const home = process.env.HOME || require("os").homedir();
   const norm = (p) => path.resolve(String(p || "")).replace(/\\/g, "/").toLowerCase();
   const nfile = norm(file);
+  // Auto-memory carve-out (issue-spor-capture-nudge-memory-exclusion-loses-
+  // facts): ~/.claude is excluded as agent-private, but its memory files
+  // (~/.claude/projects/<proj>/memory/*.md) are exactly where durable findings
+  // land INSTEAD of the graph — the 1,120-session retrospective found memory
+  // acting as a graph substitute (0–10% unprompted capture vs 72% when
+  // graph-scoped). A memory write is a signal the agent judged something
+  // durable, so it routes through the classifier like any other prose .md;
+  // the MEMORY.md index (one-line pointers, no facts) still drops via the
+  // instruction-file basename list below.
+  const isMemory = nfile.startsWith(norm(path.join(home, ".claude")) + "/") && /\/memory\/[^/]+\.md$/.test(nfile);
   if (
     nfile.startsWith(norm(graph) + "/") ||
-    nfile.startsWith(norm(path.join(home, ".claude")) + "/") ||
+    (nfile.startsWith(norm(path.join(home, ".claude")) + "/") && !isMemory) ||
     nfile.includes("/nodes/")
   )
-    return null; // graph homes + agent memory
+    return null; // graph homes + agent-private config (memory files excepted)
   const base = path.basename(file);
   if (["CLAUDE.md", "AGENTS.md", "GEMINI.md", "MEMORY.md"].includes(base)) return null;
   const tool = input.tool_name ?? "";
