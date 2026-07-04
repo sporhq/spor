@@ -6,6 +6,8 @@ It keeps track of the useful things that normally disappear into chat history: d
 
 The name comes from Norwegian: *spor* means the track something leaves behind.
 
+📖 **Full documentation: [docs.sporhq.io](https://docs.sporhq.io)** — concepts, getting started, the CLI, the REST API, the MCP surface, and the hosted product.
+
 ## Why use Spor?
 
 Coding agents are good at working inside a single session. The problem is everything before and after that session.
@@ -515,6 +517,7 @@ This matters because some hosts cache plugins or hook definitions. Updating the 
 
 ## More docs
 
+* [docs.sporhq.io](https://docs.sporhq.io) — the full documentation site: concepts, getting started, CLI, REST API, MCP, and the hosted guide
 * `GRAPH.md` — graph format, node types, edges, and schema behaviour
 * `API.md` — REST and MCP server contract
 * `QUEUE.md` — queue, capture, routing, and workflow details
