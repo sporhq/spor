@@ -9,10 +9,13 @@ description: >
   working in local vs remote mode, or defining a new node/edge type or schema.
   It also routes you to the right /spor action skill (defer, brief, next,
   correct, ask, backfill) for a specific operation, and explains the node/edge
-  mental model when you need it. For FIRST-TIME setup — installing, creating an
-  identity, joining a team graph, or "spor isn't doing anything" — use
-  /spor:onboard instead. When unsure how to operate Spor, consult this before
-  guessing.
+  mental model when you need it. In Cowork there are no hooks and no ambient
+  injection, so this is the ONLY context surface there: consult it and query
+  the graph BEFORE designing, deciding, or building anything non-trivial, and
+  use it to record durable outcomes back afterwards. For FIRST-TIME setup —
+  installing, creating an identity, joining a team graph, or "spor isn't doing
+  anything" — use /spor:onboard instead. When unsure how to operate Spor,
+  consult this before guessing.
 ---
 
 # Operate Spor
@@ -212,10 +215,15 @@ answers "what's next?"; REST twin `GET /v1/program/{id}`; an empty result
 means nothing carries a `blocks` edge to that root yet — see "Grouping work
 under an umbrella node" below for how to model one), and to COMMIT:
 `capture` (raw prose → server types it — reach
-for this when unsure of the shape), or the precise writes `put_node` /
-`add_edge` / `set_status`. Close loops with edges: answer a question with a node
+for this when unsure of the shape), the precise writes `put_node` /
+`add_edge` / `set_status`, `ask_question` (file a question the graph can't
+answer so it routes to whoever knows — the Cowork twin of /spor:ask), and
+`propose_correction` (a standing briefing fix — the twin of /spor:correct).
+Close loops with edges: answer a question with a node
 carrying an `answers` edge; close work with a `resolves` edge from a
-`decision`/`artifact`.
+`decision`/`artifact`. The full Cowork workflow — query-first discipline,
+superseded/constraint handling, question routing, write hygiene — is
+**`references/cowork.md`**; read it when working from Cowork or the connector.
 
 ## Grouping work under an umbrella node (programs)
 
@@ -282,7 +290,7 @@ to them rather than improvising:
 | See what to work on next | **/spor:next** | "what's next / my queue / the backlog", triage |
 | Fix a briefing that was wrong, missing, or stale | **/spor:correct** | "the briefing was wrong / missed / included junk" |
 | Bootstrap a repo's graph, or group repos into projects | **/spor:backfill** | onboarding a repo, "organize my repos" |
-| Read/write the team graph in Cowork (no hooks there) | **/spor:team-graph** | any graph work in Cowork |
+| Read/write the team graph in Cowork (no hooks there) | **this skill** — MCP tools + `references/cowork.md` | any graph work in Cowork |
 
 If a request is just "which Spor thing do I use for X", answer from this table.
 If it's "how do I get started / set up Spor", that's **/spor:onboard**.
@@ -291,6 +299,8 @@ If it's "how do I get started / set up Spor", that's **/spor:onboard**.
 
 - **`references/concepts.md`** — full node/edge registries, node file format,
   project-slug convention.
+- **`references/cowork.md`** — the Cowork/connector workflow: query-first
+  discipline, question routing, write hygiene, corrections via MCP.
 - **`references/authoring-schemas.md`** — how to add or change a schema.
 - **README.md** (architecture, roadmap), **GRAPH.md** (node format + seed
   ontology), **QUEUE.md** (capture, queue, schema registry), **API.md** (the

@@ -1,6 +1,6 @@
 ---
 name: next
-description: Present the Spor decision queue — what to work on next, ranked by graph signals (what each item blocks, neighborhood activity, age, staleness) alongside human-set priority. Use when the user asks "what should I work on", "what's next", "show the queue / backlog", or wants to triage deferred work and pending captures.
+description: Present the Spor decision queue — what to work on next, ranked by graph signals (what each item blocks, neighborhood activity, age, staleness) alongside human-set priority. Use when the user asks "what should I work on", "what's next", or "show the queue / backlog". This skill PRESENTS and recommends; when the user wants to actively work or groom the queue — process captures, merge duplicates, record dependencies, set priorities — use /spor:triage instead.
 ---
 
 # What should I work on next?
