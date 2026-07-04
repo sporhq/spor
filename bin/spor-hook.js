@@ -162,7 +162,18 @@ async function main() {
       /* logging must never break fail-open */
     }
   }
-  if (!cfg.enabled()) return;
+  if (!cfg.enabled()) {
+    // A repo disabled purely by the opt-in DEFAULT that this machine has prior
+    // Spor history for gets a one-time discovery hint instead of silence
+    // (issue-spor-opt-in-silent-disable-no-indication) — session-start only,
+    // evidence-gated, once per repo; see scripts/engines/enable-hint.js.
+    if (event === "session-start") {
+      const { enableHint } = require("../scripts/engines/enable-hint");
+      const hint = enableHint(payload);
+      if (hint) emit(hint, payload, host);
+    }
+    return;
+  }
 
   // Debounced distill: spool the payload and hand off to a per-session
   // watcher (one at a time — the lock holds the watcher's pid; stale locks
@@ -204,7 +215,11 @@ async function main() {
   const engine = ENGINES[event]();
   const out = await engine(payload);
   if (!out) return;
+  emit(out, payload, host);
+}
 
+// Write an engine's output envelope to stdout in the host's dialect.
+function emit(out, payload, host) {
   // Cursor speaks a flat snake_case output: {additional_context} only.
   // (jq -c framing: compact JSON with a trailing newline.)
   if (host === "cursor") {

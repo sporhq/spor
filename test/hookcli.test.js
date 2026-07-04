@@ -431,10 +431,11 @@ test('post-tool: journals the touched file under the session id', () => {
 // --- opt-in gate (task-spor-plugin-opt-in-default): the dispatcher no-ops every
 // hook in a repo that hasn't opted in (no .spor/.spor.json marker, no enable
 // flag), so running an agent in an unrelated repo injects nothing and writes
-// nothing — even with a brief node present and a non-trivial prompt.
-test('opt-in gate: a markerless repo with no enable flag is a full no-op', () => {
-  const { home, cwd } = scratch();
-  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
+// nothing. One carve-out (issue-spor-opt-in-silent-disable-no-indication): a
+// repo this machine has PRIOR Spor history for gets a one-time enable hint at
+// session-start instead of weeks of unexplained silence.
+test('opt-in gate: a markerless repo the graph never knew is a full no-op', () => {
+  const { home, cwd } = scratch(); // nodes/ exists but carries nothing for projx
   const bare = freshEnv(home);
   delete bare.SPOR_ENABLED; // remove the opt-in the helper adds
 
@@ -457,10 +458,63 @@ test('opt-in gate: a markerless repo with no enable flag is a full no-op', () =>
 
   // dropping a .spor marker into the cwd flips the SAME bare env on
   fs.writeFileSync(path.join(cwd, '.spor'), 'repo: projx\n');
+  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
   const out = run(['session-start', '--host', 'claude-code'],
     JSON.stringify({ cwd, hook_event_name: 'SessionStart' }), bare);
   assert.match(JSON.parse(out).hookSpecificOutput.additionalContext, /brief-projx/,
     'a .spor marker opts the repo in');
+});
+
+test('opt-in gate: prior Spor history earns a ONE-TIME enable hint at session-start (issue-spor-opt-in-silent-disable-no-indication)', () => {
+  const { home, cwd } = scratch();
+  // evidence: the local graph knows this repo's slug
+  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
+  const bare = freshEnv(home);
+  delete bare.SPOR_ENABLED;
+
+  const payload = JSON.stringify({ cwd, hook_event_name: 'SessionStart' });
+  const first = run(['session-start', '--host', 'claude-code'], payload, bare);
+  const json = JSON.parse(first);
+  assert.strictEqual(json.hookSpecificOutput.hookEventName, 'SessionStart');
+  assert.match(json.hookSpecificOutput.additionalContext, /spor enable/, 'hint names the fix');
+  assert.match(json.hookSpecificOutput.additionalContext, /projx/, 'hint names the repo');
+  assert.doesNotMatch(json.hookSpecificOutput.additionalContext, /standing briefing body/,
+    'the hint is a pointer, not a briefing — the repo stays un-briefed');
+
+  // once per repo: the stamp suppresses every later session-start
+  assert.ok(fs.existsSync(path.join(home, 'journal', 'enable-hint-projx')), 'hint is stamped');
+  assert.strictEqual(run(['session-start', '--host', 'claude-code'], payload, bare), '',
+    'the hint never repeats');
+
+  // the hint is session-start only — other hooks stay silent no-ops
+  assert.strictEqual(
+    run(['prompt-context', '--host', 'claude-code'],
+      JSON.stringify({ cwd, prompt: 'six or more words to clear the gate', hook_event_name: 'UserPromptSubmit' }), bare),
+    '', 'prompt-context never hints');
+});
+
+test('opt-in gate: a cached remote briefing counts as prior history; an explicit opt-out stays silent', () => {
+  const { home, cwd } = scratch();
+  // evidence: remote-mode session-start cached a briefing for this slug
+  fs.mkdirSync(path.join(home, 'cache'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'cache', 'brief-projx.md'),
+    '<!-- spor cache: brief-projx version=3 fetched=2026-06-20T00:00:00Z host=claude-code -->\nbody\n');
+  const payload = JSON.stringify({ cwd, hook_event_name: 'SessionStart' });
+
+  // explicit opt-out (SPOR_ENABLED=0): a deliberate choice — no hint, ever
+  const optedOut = freshEnv(home);
+  optedOut.SPOR_ENABLED = '0';
+  assert.strictEqual(run(['session-start', '--host', 'claude-code'], payload, optedOut), '',
+    'an explicit opt-out must not hint');
+  assert.ok(!fs.existsSync(path.join(home, 'journal', 'enable-hint-projx')),
+    'an explicit opt-out must not stamp');
+
+  // silent default: the cached briefing is evidence enough
+  const bare = freshEnv(home);
+  delete bare.SPOR_ENABLED;
+  const out = run(['session-start', '--host', 'claude-code'], payload, bare);
+  assert.match(JSON.parse(out).hookSpecificOutput.additionalContext, /spor enable/,
+    'a cached remote briefing earns the hint');
 });
 
 test('post-tool: codex tool_input.path is normalized to file_path', () => {
