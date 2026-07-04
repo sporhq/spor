@@ -1,6 +1,6 @@
 {
   "name": "spor",
-  "version": "0.18.5",
+  "version": "0.18.6",
   "description": "Maintains a typed, versioned knowledge graph and compiles compact briefings from it: session-start injection, per-prompt relevance digests, capture at discovery, end-of-session distillation, decision queue.",
   "author": {
     "name": "Spor",
