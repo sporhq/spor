@@ -112,6 +112,21 @@ required; either alone is inert. Author one whenever you fix (or cause) a
 "changed X, forgot the coupled Y" miss — that is the moment the coupling is
 proven.
 
+`spor check` is the boundary-time twin of that nudge: it checks a diff
+(uncommitted by default; `--staged` / `--range a..b` / `--files`) against the
+same coupling norms and reports triggers-touched-but-targets-not — advisory,
+or `--strict` for CI. For mechanical couplings add a **value invariant** the
+checker compares byte-level instead of guessing from touched-ness:
+
+```
+couples_value_a: .nvmrc#v?(\d+)              # <path>#<regex>, first capture = value
+couples_value_b: Dockerfile#FROM node:(\d+)
+```
+
+Agreeing values suppress the "untouched" heuristic; disagreeing values are
+reported even when both files were edited. Both `_a`/`_b` are required and
+ride only on a coupling norm.
+
 Don't invent edge variants. The automatic distiller sometimes emits forms like
 `related-to`/`supercedes`/`derives-from`; those normalize to the canonical
 spelling on write — they're the *only* accepted non-canonical forms. A genuinely

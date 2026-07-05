@@ -138,6 +138,11 @@ spor brief <id>                # a briefing for one node (compile --root <id>)
 spor analytics --type task,issue      # created-vs-completed metrics (local git history / GET /v1/analytics)
 spor changes [--since <sha|date>]     # recent-activity feed: what changed lately (local git log / GET /v1/changes)
 spor query --type task --where status=open --ids   # structured node/edge enumeration (local nodes dir / GET /v1/export then query locally)
+spor check [--staged|--range <a..b>|--files <f...>] [--strict]   # coupling-drift report over a diff: coupling
+                               #   norms (couples_when/couples_also, see concepts.md) whose triggers are
+                               #   touched but targets are not, + couples_value_a/b value-invariant
+                               #   disagreement. Advisory; --strict exits 1 (CI/pre-commit). The diff is
+                               #   always local git; norms are mode-aware (local nodes dir / GET /v1/export)
 spor export [--gzip] [--history|--auth] [--out <file>]   # nodes/ ustar tarball (--history: git-bundle data-exit; --auth: admin-gated restore w/ auth files — both remote-only); local build / GET /v1/export
 
 # local (personal graph) only — fail fast with a redirect in remote mode

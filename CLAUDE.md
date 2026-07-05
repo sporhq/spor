@@ -163,7 +163,10 @@ forget Y" at the moment of the edit. Entries may be repo-qualified
 `<slug>:<glob>` for cross-repo couplings (a qualified trigger fires only in
 that repo and bypasses the norm's scope; an unqualified one follows the
 `applies_to_*`/`project:` scoping). The matcher is `lib/kernel/coupling.js`
-(shared with the future diff-level check verb, task-spor-cli-check-coupling-verb);
+(shared with `spor check`, the boundary-time twin: a diff-level report of
+triggers-touched-but-targets-not plus `couples_value_a/b` value-invariant
+comparison — advisory, `--strict` for CI; lib/check.js, see
+test/check.test.js);
 norms come from the local nodes dir keyed by a readdir+mtime fingerprint
 (local mode, so a freshly authored norm is live on the next tool call) or a
 1h-TTL `cache/coupling.json` snapshot of `GET /v1/export` (remote mode; the

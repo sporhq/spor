@@ -466,6 +466,21 @@ display. Either key alone, a scalar value, or the keys on a non-norm type are
 inert (validate warns). The matcher is `lib/kernel/coupling.js`; a graph with
 no coupling norms is byte-identical.
 
+The boundary-time consumer of the same anchors is **`spor check`**
+(task-spor-cli-check-coupling-verb): given a change set (uncommitted vs HEAD
+by default; `--staged`, `--range a..b`, or `--files`), it reports each
+coupling norm whose triggers are touched while its same-repo targets are not —
+advisory by default, `--strict` exits 1 for CI/pre-commit; targets pinned to
+another repo surface as reminders, never failures. A coupling norm may
+additionally declare a machine-checkable **value invariant** — two scalar
+keys, `couples_value_a:`/`couples_value_b:`, each `<path>#<regex>` (first
+capture group = the value, e.g. `couples_value_a: .nvmrc#v?(\d+)` /
+`couples_value_b: Dockerfile#FROM node:(\d+)`) — and `spor check` compares the
+two extracted values: "these now disagree" beats "you probably forgot", an
+agreeing invariant suppresses the untouched heuristic, and a disagreement
+reports even when both files were touched. A half-declared or malformed pair
+is inert (validate warns).
+
 Because a norm rides along with no relevance gate and the team trust model lets
 every writer author one, the briefing renderer treats norm bodies as an
 **injection surface** (issue-cc-norm-always-on-injection): each is quoted as

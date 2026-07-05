@@ -396,53 +396,10 @@ async function claimNudge({ graph, slug, session, cwd, remote }) {
 // coupling norms yields byte-identical output.
 
 // The norm snapshot both modes read: { norms: [slim coupling norms],
-// repo_tags: {slug: [tags]} } — repo tags feed the applies_to_tags scope.
-const COUPLING_FIELDS = [
-  "id", "type", "title", "project", "status",
-  "couples_when", "couples_also",
-  "applies_to_tags", "applies_to_repos", "applies_to_projects",
-];
-function slimCouplingNorm(n) {
-  const out = {};
-  for (const k of COUPLING_FIELDS) if (n[k] != null) out[k] = n[k];
-  return out;
-}
-
-// Scan node files (any source) for coupling norms + repo tags. `read` returns
-// a file's raw text (or null); the cheap substring prefilter keeps the parse
-// cost to coupling norms and repo nodes only.
-function scanCouplingEntries(read, names) {
-  const { parseFrontmatter } = require(path.join(u.ROOT, "lib", "graph.js"));
-  const norms = [];
-  const repo_tags = {};
-  for (const f of names) {
-    if (!f.endsWith(".md")) continue;
-    const isRepoNode = path.basename(f).startsWith("repo-");
-    let raw;
-    try {
-      raw = read(f);
-    } catch {
-      continue;
-    }
-    if (raw == null) continue;
-    if (!isRepoNode && !raw.includes("couples_when:")) continue;
-    let n;
-    try {
-      n = parseFrontmatter(raw, f);
-    } catch {
-      continue;
-    }
-    if (n.type === "repo") {
-      if (Array.isArray(n.tags)) {
-        const slug = String(n.id ?? path.basename(f, ".md")).replace(/^repo-/, "");
-        repo_tags[slug] = n.tags;
-      }
-      continue;
-    }
-    if (coupling.isCouplingNorm(n)) norms.push(slimCouplingNorm(n));
-  }
-  return { norms, repo_tags };
-}
+// repo_tags: {slug: [tags]} } — repo tags feed the applies_to_tags scope. The
+// scan itself lives in lib/kernel/coupling.js (scanCouplingEntries), shared
+// with the `spor check` verb so the two consumers can't drift.
+const { scanCouplingEntries } = coupling;
 
 // Local mode: the nodes dir is the graph. Rebuilding on every Write/Edit would
 // read every node file, so the snapshot is cached in cache/coupling.json keyed

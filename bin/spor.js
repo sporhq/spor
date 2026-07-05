@@ -1701,6 +1701,140 @@ async function fetchRemoteExportNodes(cfg, label) {
   }
 }
 
+// `spor check` — the coupling-drift report over a diff
+// (task-spor-cli-check-coupling-verb, dec-spor-coupling-norms-declared-first):
+// the boundary-time consumer of the same coupling norms the post-tool nudge
+// serves at edit time (one matcher, lib/kernel/coupling.js). Resolve a change
+// set via LOCAL git (always — the diff is where you run), load the graph's
+// coupling norms (local nodes dir, or the team graph via GET /v1/export in
+// remote mode, the documented graph-wide-sweep path), and report each norm
+// whose `couples_when` triggers are touched while its `couples_also` targets
+// are not — plus value-invariant disagreement for norms carrying
+// couples_value_a/b. Advisory by default (exit 0); --strict exits 1 on
+// findings for CI/pre-commit enforcement.
+async function cmdCheck(cfg, args) {
+  const cwd = process.cwd();
+  const topR = git(cwd, ["rev-parse", "--show-toplevel"]);
+  const top = topR.status === 0 ? topR.stdout.trim() : "";
+  if (!top) {
+    err("check: not inside a git repository (the change set is a git diff)");
+    return 1;
+  }
+  const slug = u.projectSlug(top);
+  const range = optVal(args, "range");
+  const staged = args.includes("--staged");
+  const strict = args.includes("--strict");
+  const json = args.includes("--json");
+  let files = null;
+  const fi = args.indexOf("--files");
+  if (fi >= 0) {
+    files = [];
+    for (let i = fi + 1; i < args.length && !String(args[i]).startsWith("--"); i++) files.push(args[i]);
+    if (!files.length) {
+      err("check: --files needs at least one path");
+      return 1;
+    }
+  }
+  if ((range ? 1 : 0) + (staged ? 1 : 0) + (files ? 1 : 0) > 1) {
+    err("check: --range, --staged, and --files are mutually exclusive");
+    return 1;
+  }
+
+  // The change set, as repo-relative forward-slash paths (git's own spelling).
+  let changed = [];
+  let rightRev = null; // where value invariants read from (--range reads the range's right side)
+  if (files) {
+    changed = files.map((f) => {
+      const abs = path.isAbsolute(f) ? f : path.resolve(cwd, f);
+      return path.relative(top, abs).split(path.sep).join("/");
+    });
+  } else if (range) {
+    const r = git(top, ["diff", "--name-only", range]);
+    if (r.status !== 0) {
+      err(`check: could not resolve --range '${range}' (${(r.stderr || "").trim().split("\n")[0]})`);
+      return 1;
+    }
+    changed = r.stdout.split("\n").filter(Boolean);
+    const i = range.lastIndexOf("..");
+    rightRev = i > 0 ? range.slice(i + 2) || "HEAD" : null;
+  } else if (staged) {
+    const r = git(top, ["diff", "--name-only", "--cached"]);
+    if (r.status !== 0) {
+      err("check: git diff --cached failed");
+      return 1;
+    }
+    changed = r.stdout.split("\n").filter(Boolean);
+  } else {
+    // Default: everything uncommitted vs HEAD (staged + unstaged) plus
+    // untracked files — the mid-session / pre-commit superset, so an unstaged
+    // edit can't silently pass. (The task sketch said "staged by default";
+    // staged-only reports NOTHING for the common unstaged-working-tree case —
+    // false confidence — so the default is the honest superset and --staged is
+    // the narrow pre-commit view.) A repo with no commits yet falls back to
+    // the index.
+    const d = git(top, ["diff", "--name-only", "HEAD"]);
+    if (d.status === 0) changed = d.stdout.split("\n").filter(Boolean);
+    else {
+      const c = git(top, ["diff", "--name-only", "--cached"]);
+      if (c.status === 0) changed = c.stdout.split("\n").filter(Boolean);
+    }
+    const un = git(top, ["ls-files", "--others", "--exclude-standard"]);
+    if (un.status === 0) changed.push(...un.stdout.split("\n").filter(Boolean));
+  }
+  changed = [...new Set(changed)];
+
+  // The coupling norms: local nodes dir, or the team graph via /v1/export.
+  const couplingLib = require(path.join(ROOT, "lib", "kernel", "coupling.js"));
+  const scanDir = (nodesDir) => {
+    let names = [];
+    try {
+      names = fs.readdirSync(nodesDir).sort();
+    } catch {}
+    return couplingLib.scanCouplingEntries((f) => fs.readFileSync(path.join(nodesDir, f), "utf8"), names);
+  };
+  let scan;
+  let cleanupFetched = null;
+  if (cfg.mode() === "remote" && !namesLocalGraph(args)) {
+    const fetched = await fetchRemoteExportNodes(cfg, "check");
+    if (fetched.error) return 1; // already reported (offline / HTTP error)
+    cleanupFetched = fetched.cleanup;
+    scan = scanDir(fetched.nodesDir);
+  } else {
+    const nodesDir = optVal(args, "nodes") || cfg.nodesDir();
+    if (!fs.existsSync(nodesDir)) {
+      err(`no graph at ${nodesDir} — run 'spor init' first`);
+      return 1;
+    }
+    scan = scanDir(nodesDir);
+  }
+  try {
+    const checkLib = require(path.join(ROOT, "lib", "check.js"));
+    const readFile = (rel) => {
+      try {
+        if (rightRev) {
+          const r = git(top, ["show", `${rightRev}:${rel}`]);
+          return r.status === 0 ? r.stdout : null;
+        }
+        return fs.readFileSync(path.join(top, rel), "utf8");
+      } catch {
+        return null;
+      }
+    };
+    const { checked, findings, reminders } = checkLib.runCheck({
+      slug,
+      changed,
+      norms: scan.norms,
+      repoTags: scan.repo_tags[slug] ?? [],
+      readFile,
+    });
+    if (json) out(JSON.stringify({ project: slug, changed, checked, findings, reminders, strict }, null, 2));
+    else out(checkLib.renderReport({ slug, changed, checked, findings, reminders }, { strict }));
+    return strict && findings.length ? 1 : 0;
+  } finally {
+    if (cleanupFetched) cleanupFetched();
+  }
+}
+
 // analytics folds a graph's git history into created-vs-completed metrics
 // (task-spor-work-analytics-consumer). Unlike query/validate (no server twin) it
 // is dual-mode: local mode runs the in-repo consumer (lib/analytics.js) over
@@ -8330,6 +8464,38 @@ const COMMANDS = {
       "spor changes --limit 20 --json",
     ],
     run: (cfg, args) => cmdChanges(cfg, args),
+  },
+  check: {
+    group: "Graph", parse: "raw", args: "[--staged|--range <a..b>|--files <f...>] [--strict] [--json]",
+    summary: "coupling-drift report over a diff — triggers touched, targets not",
+    help:
+      "Check a change set against the graph's COUPLING NORMS (norm nodes carrying\n" +
+      "couples_when/couples_also file globs — GRAPH.md \"coupling anchors\"): report\n" +
+      "each norm whose trigger set is touched while its target set is not — the\n" +
+      "boundary-time twin of the edit-time post-tool coupling nudge, sharing one\n" +
+      "matcher (lib/kernel/coupling.js). A norm carrying a value invariant\n" +
+      "(couples_value_a/b: <path>#<regex>) has its two extracted values compared:\n" +
+      "\"these now disagree\" beats \"you probably forgot\", and an agreeing invariant\n" +
+      "suppresses the untouched heuristic. Targets pinned to another repo are\n" +
+      "surfaced as reminders, never failures (verify them there).\n" +
+      "\n" +
+      "The change set is always LOCAL git; the norms are mode-aware (local graph, or\n" +
+      "the team graph via GET /v1/export in remote mode).\n" +
+      "\n" +
+      "  --staged          check the index only (the pre-commit view); default is\n" +
+      "                    everything uncommitted vs HEAD plus untracked files\n" +
+      "  --range <a..b>    check a commit range (CI; value invariants read the right side)\n" +
+      "  --files <f...>    an explicit file list (paths, repo-relative or absolute)\n" +
+      "  --strict          exit 1 when findings exist (CI / pre-commit enforcement)\n" +
+      "  --json            machine-readable {project, changed, checked, findings}\n" +
+      "  --nodes <dir>     read this local graph dir instead of the resolved home",
+    examples: [
+      "spor check",
+      "spor check --staged --strict",
+      "spor check --range origin/main..HEAD --strict",
+      "spor check --files lib/seed/schema-task.md --json",
+    ],
+    run: (cfg, args) => cmdCheck(cfg, args),
   },
   export: {
     group: "Graph", parse: "strict", args: "[--gzip] [--history|--auth] [--out <file>]",
