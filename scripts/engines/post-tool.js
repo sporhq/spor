@@ -9,6 +9,7 @@ const fs = require("fs");
 const path = require("path");
 const u = require("./util");
 const { linkCommits, trailerNodeIds } = require("./link-commits");
+const coupling = require(path.join(u.ROOT, "lib", "kernel", "coupling.js"));
 
 const NUDGE_CTX = (file, facts) =>
   `[spor capture nudge] The file you just wrote (${file}) contains findings that do not appear to be in the team graph:
@@ -28,6 +29,17 @@ Top eligible work here:
 ${items}
 
 Claim one with /spor:next (or set its status to in_progress), or file the work you're doing now with /spor:defer if it isn't a task yet. (source=claim-nudge; once per session; disable with SPOR_CLAIM_NUDGE=0.)`;
+
+// task-spor-coupling-nudge-posttool (dec-spor-coupling-norms-declared-first):
+// the edit-time coupling nudge, injected when the edited path matches a
+// declared coupling norm's trigger globs. Names the coupled artifacts while
+// the agent still holds the context of the change.
+const COUPLING_NUDGE_CTX = (rel, lines) =>
+  `[spor coupling nudge] You edited ${rel} — coupling norms in the team graph say these artifacts change together:
+
+${lines}
+
+Update the coupled artifacts in this same change, or consciously dismiss with a reason. A target written <repo>:<path> lives in that other repo. (source=coupling-nudge; once per session per norm; disable with SPOR_COUPLING_NUDGE=0.)`;
 
 // ===FACT===/===END=== blocks -> numbered single-line facts, capped at 3500
 // bytes (the awk program joined inner lines with single spaces).
@@ -370,6 +382,213 @@ async function claimNudge({ graph, slug, session, cwd, remote }) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// task-spor-coupling-nudge-posttool (dec-spor-coupling-norms-declared-first):
+// the edit-time COUPLING nudge. When the edited path matches the trigger globs
+// (`couples_when`) of a coupling norm in the graph, inject the norm's coupled
+// targets (`couples_also`) — the "you changed X, don't forget Y" moment,
+// delivered while the agent still holds the context of the change. A pure
+// deterministic glob match (lib/kernel/coupling.js): NO LLM ever, and no
+// network on the match path — the norms come from the local nodes dir (local
+// mode) or a TTL-cached snapshot (remote mode). Once per (session, norm) via
+// journal/<session>.coupling-nudged; disable with SPOR_COUPLING_NUDGE=0
+// (couplingNudge.enabled:false). Fail-open by contract; a graph with no
+// coupling norms yields byte-identical output.
+
+// The norm snapshot both modes read: { norms: [slim coupling norms],
+// repo_tags: {slug: [tags]} } — repo tags feed the applies_to_tags scope.
+const COUPLING_FIELDS = [
+  "id", "type", "title", "project", "status",
+  "couples_when", "couples_also",
+  "applies_to_tags", "applies_to_repos", "applies_to_projects",
+];
+function slimCouplingNorm(n) {
+  const out = {};
+  for (const k of COUPLING_FIELDS) if (n[k] != null) out[k] = n[k];
+  return out;
+}
+
+// Scan node files (any source) for coupling norms + repo tags. `read` returns
+// a file's raw text (or null); the cheap substring prefilter keeps the parse
+// cost to coupling norms and repo nodes only.
+function scanCouplingEntries(read, names) {
+  const { parseFrontmatter } = require(path.join(u.ROOT, "lib", "graph.js"));
+  const norms = [];
+  const repo_tags = {};
+  for (const f of names) {
+    if (!f.endsWith(".md")) continue;
+    const isRepoNode = path.basename(f).startsWith("repo-");
+    let raw;
+    try {
+      raw = read(f);
+    } catch {
+      continue;
+    }
+    if (raw == null) continue;
+    if (!isRepoNode && !raw.includes("couples_when:")) continue;
+    let n;
+    try {
+      n = parseFrontmatter(raw, f);
+    } catch {
+      continue;
+    }
+    if (n.type === "repo") {
+      if (Array.isArray(n.tags)) {
+        const slug = String(n.id ?? path.basename(f, ".md")).replace(/^repo-/, "");
+        repo_tags[slug] = n.tags;
+      }
+      continue;
+    }
+    if (coupling.isCouplingNorm(n)) norms.push(slimCouplingNorm(n));
+  }
+  return { norms, repo_tags };
+}
+
+// Local mode: the nodes dir is the graph. Rebuilding on every Write/Edit would
+// read every node file, so the snapshot is cached in cache/coupling.json keyed
+// by a readdir+mtime fingerprint (the loadGraphCached idea, but durable across
+// hook invocations — each hook is its own process). Stale fingerprint =
+// rebuild; a fresh graph write (e.g. authoring a coupling norm) is picked up
+// on the next tool call, no TTL wait.
+function nodesFingerprint(nodesDir) {
+  let count = 0;
+  let newest = 0;
+  for (const f of fs.readdirSync(nodesDir)) {
+    if (!f.endsWith(".md")) continue;
+    count++;
+    const m = fs.statSync(path.join(nodesDir, f)).mtimeMs;
+    if (m > newest) newest = m;
+  }
+  return `${count}:${newest}`;
+}
+
+function localCouplingData(graph) {
+  const nodesDir = path.join(graph, "nodes");
+  let fp;
+  try {
+    fp = nodesFingerprint(nodesDir);
+  } catch {
+    return null;
+  }
+  const cacheFile = path.join(graph, "cache", "coupling.json");
+  try {
+    const c = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+    if (c && c.fp === fp) return c;
+  } catch {}
+  const data = {
+    v: 1,
+    fp,
+    ...scanCouplingEntries((f) => fs.readFileSync(path.join(nodesDir, f), "utf8"), fs.readdirSync(nodesDir).sort()),
+  };
+  if (u.ensureDir(path.join(graph, "cache"))) {
+    try {
+      fs.writeFileSync(cacheFile, JSON.stringify(data));
+    } catch {}
+  }
+  return data;
+}
+
+// Remote mode: the graph lives on the server; the snapshot refreshes from the
+// documented enumeration surface (GET /v1/export, parsed with lib/tar.js) at
+// most once per hour. The `fetched` stamp is written BEFORE the download (the
+// agentHeartbeat lesson) so a dead/slow server costs at most ONE bounded
+// attempt per TTL — and stale data survives a failed refresh (stale beats
+// none, the cached-title-index rule). Delete cache/coupling.json to force a
+// refresh. A lighter server read than the full export is deferred work.
+const COUPLING_CACHE_TTL_MS = 3600000;
+async function remoteCouplingData(graph) {
+  const cacheFile = path.join(graph, "cache", "coupling.json");
+  let cached = null;
+  try {
+    cached = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+  } catch {}
+  const now = Date.now();
+  if (cached && typeof cached.fetched === "number" && now - cached.fetched < COUPLING_CACHE_TTL_MS) return cached;
+  const stale = cached && Array.isArray(cached.norms) ? cached : { v: 1, norms: [], repo_tags: {} };
+  stale.fetched = now;
+  if (u.ensureDir(path.join(graph, "cache"))) {
+    try {
+      fs.writeFileSync(cacheFile, JSON.stringify(stale));
+    } catch {}
+  }
+  const timeoutMs = u.cfgNum("couplingNudge.timeoutMs", "COUPLING_NUDGE_TIMEOUT", 3000);
+  const remoteLib = require(path.join(u.ROOT, "lib", "remote.js"));
+  const tar = require(path.join(u.ROOT, "lib", "tar.js"));
+  const r = await remoteLib.download(u.config(), "/v1/export", { timeoutMs }).catch(() => null);
+  if (!r || !r.ok || !r.buffer) return stale;
+  let entries;
+  try {
+    entries = tar.extract(r.buffer);
+  } catch {
+    return stale;
+  }
+  const byName = new Map(
+    entries.filter((e) => e.name.endsWith(".md")).map((e) => [path.basename(e.name), e.data.toString("utf8")])
+  );
+  const data = { v: 1, fetched: now, ...scanCouplingEntries((f) => byName.get(f), [...byName.keys()].sort()) };
+  try {
+    fs.writeFileSync(cacheFile, JSON.stringify(data));
+  } catch {}
+  return data;
+}
+
+async function couplingNudge({ input, graph, slug, session, cwd, remote }) {
+  if (u.config() ? !u.config().getBool("couplingNudge.enabled", true) : (u.envDual("COUPLING_NUDGE") ?? "1") === "0") return null;
+  if (process.env.SPOR_DISTILLING || process.env.SUBSTRATE_DISTILLING) return null; // headless calls don't nudge
+  const tool = input.tool_name ?? "";
+  if (!["Write", "Edit", "write", "edit"].includes(tool)) return null;
+  const file = input.tool_input?.file_path ?? "";
+  if (!file) return null;
+  // Graph-home writes (node files, journal) are never repo artifacts.
+  const npath = (p) => path.resolve(String(p || "")).replace(/\\/g, "/");
+  if (npath(file).startsWith(npath(graph) + "/")) return null;
+  // Coupling globs are repo-root-relative: resolve the repo top and the
+  // edited file's path under it; a write outside any repo can't match.
+  const top = u.git(cwd, ["rev-parse", "--show-toplevel"])?.trim();
+  if (!top) return null;
+  const rel = path.relative(top, file).replace(/\\/g, "/");
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+
+  const data = remote ? await remoteCouplingData(graph) : localCouplingData(graph);
+  if (!data || !Array.isArray(data.norms) || data.norms.length === 0) return null;
+  const hits = coupling.matchCouplings(data.norms, {
+    slug,
+    relPath: rel,
+    repoTags: data.repo_tags?.[slug] ?? [],
+  });
+  if (!hits.length) return null;
+
+  // Once per (session, norm): the cooldown file holds one fired norm id per
+  // line, so a norm that already nudged stays silent while a NEW norm hit
+  // later in the session still surfaces.
+  const state = path.join(graph, "journal", `${session}.coupling-nudged`);
+  let fired = [];
+  try {
+    fired = fs.readFileSync(state, "utf8").split("\n").filter(Boolean);
+  } catch {}
+  const fresh = hits.filter((n) => !fired.includes(n.id));
+  if (!fresh.length) return null;
+  u.ensureDir(path.join(graph, "journal"));
+  for (const n of fresh) u.appendLine(state, n.id);
+
+  const lines = fresh
+    .map((n) => {
+      const targets = (Array.isArray(n.couples_also) ? n.couples_also : []).join(", ");
+      return `- ${n.id}${n.title ? ` — ${n.title}` : ""}: also update ${targets}`;
+    })
+    .join("\n");
+  u.appendLine(
+    path.join(graph, "journal", `${session}.jsonl`),
+    JSON.stringify({ ts: u.jqNow(), project: slug, tool: "coupling-nudge", file, norms: fresh.map((n) => n.id) })
+  );
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PostToolUse",
+      additionalContext: COUPLING_NUDGE_CTX(rel, lines),
+    },
+  };
+}
+
 // task-spor-fleet-scheduler-client-heartbeat-tick — the mid-session FLEET
 // liveness tick. The server's heartbeat endpoint (POST /v1/agents/{id}/heartbeat,
 // art-spor-fleet-scheduler-hardening-shipped) refreshes this box's agent
@@ -475,9 +694,17 @@ async function postTool(input) {
     // cheap no-LLM lease lookup, and its nudge (the no-claim branch) takes
     // precedence over the LLM capture nudge for the single output envelope. The
     // heartbeat branch returns null, so a held-claim write still falls through
-    // to the capture nudge. Both branches no-op in local mode. Fail-open.
+    // to the nudges below. Both branches no-op in local mode. Fail-open.
     const claim = await claimNudge({ graph, slug, session, cwd, remote }).catch(() => null);
     if (claim) return claim;
+    // Coupling nudge (task-spor-coupling-nudge-posttool) runs SECOND: a
+    // deterministic declared-coupling hit beats the LLM capture classifier for
+    // the envelope (higher precision, zero spend). Taking the envelope here
+    // does NOT permanently starve the capture nudge — no `.nudged` state line
+    // is written for the file, so its NEXT edit still classifies. Runs in both
+    // modes; a graph with no coupling norms is a no-op.
+    const coupled = await couplingNudge({ input, graph, slug, session, cwd, remote }).catch(() => null);
+    if (coupled) return coupled;
     return (await nudge({ input, graph, slug, session, file, remote }).catch(() => null)) ?? null;
   }
 
@@ -506,4 +733,4 @@ async function postTool(input) {
   return null;
 }
 
-module.exports = { postTool, parseFactList, claimNudge, agentHeartbeat };
+module.exports = { postTool, parseFactList, claimNudge, couplingNudge, agentHeartbeat };

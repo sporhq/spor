@@ -26,7 +26,7 @@ the decision queue (QUEUE.md §4).
 | issue | `issue-` | a defect and its resolution lineage | status `open`/`active`/`resolved`; queueable; `resolved` needs a resolving `decision`/`artifact` (see SKILL routing → /spor:next) |
 | incident | `inc-` | something that went wrong in operation | queueable |
 | artifact | `art-`, `spec-` | a document, spec, module, or build product | optional delivery status `in-review`/`approved`/`merged`/`released` |
-| norm | `norm-` | a standing convention or constraint | `always_on: true` — rides along in every project-relevant compile (capped to the topically relevant subset); narrow it to specific repos with `applies_to_tags:`/`applies_to_repos:`/`applies_to_projects:` |
+| norm | `norm-` | a standing convention or constraint | `always_on: true` — rides along in every project-relevant compile (capped to the topically relevant subset); narrow it to specific repos with `applies_to_tags:`/`applies_to_repos:`/`applies_to_projects:`; `couples_when:`/`couples_also:` file globs make it a coupling norm (edit-time "changed X, don't forget Y" nudge — see below) |
 | briefing | `brief-` | a compiled briefing (output of the system) | `traversable: false` (never walked) and `capturable: false` |
 | correction | `corr-` | a standing fix to a briefing (pin/exclude/guidance) | `traversable: false`; applied at every future compile of its target |
 | question | `question-` | a routed ask the graph couldn't answer | queueable; status `open`/`answered`; joins the queue until answered |
@@ -89,6 +89,28 @@ A norm that declares any `applies_to_*` and matches none is **excluded** —
 including in a repo with no `tags:` — so repo tagging is the opt-in (set a
 repo's tags with `spor repos tag <slug> <tag...>`; `spor repos tags` lists
 them). A norm with none keeps the default project-wide ride-along.
+
+A norm may also declare **coupling anchors** — two flat inline lists that turn
+it into a *coupling norm* ("when X changes, Y must change too"):
+
+```
+couples_when: [lib/seed/**, skills/spor/**]     # trigger file globs
+couples_also: [GRAPH.md, API.md]                 # what changes with them
+```
+
+When a session edits a file matching a trigger, the post-tool hook injects the
+targets as a nudge (once per session per norm, deterministic, no LLM). Globs
+are repo-root-relative: `**` crosses path segments, `*` stays within one, a
+trailing `/` means the whole subtree, and a bare `API.md` anchors at the root.
+An entry may be **repo-qualified** as `<slug>:<glob>` to couple artifacts
+across repos (e.g. `couples_when: [spor-docs:src/content/**]` on a norm
+stamped to another project) — a qualified trigger fires only in that repo and
+bypasses the norm's scope, while unqualified entries follow the norm's
+`applies_to_*`/`project:` scope (unstamped = every repo, the org-wide case:
+`couples_when: [.nvmrc]`, `couples_also: [Dockerfile]`). Both keys are
+required; either alone is inert. Author one whenever you fix (or cause) a
+"changed X, forgot the coupled Y" miss — that is the moment the coupling is
+proven.
 
 Don't invent edge variants. The automatic distiller sometimes emits forms like
 `related-to`/`supercedes`/`derives-from`; those normalize to the canonical

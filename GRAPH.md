@@ -444,6 +444,28 @@ opt-in that turns scoped norms on; set them with `spor repos tag <slug>
 keeps the project-scoped behavior above, so a graph using no `applies_to_*` is
 byte-identical (norm-cc-byte-identical-refactor).
 
+A norm may also declare **coupling anchors**
+(dec-spor-coupling-norms-declared-first): two flat inline lists, `couples_when:`
+(trigger file globs — "when files matching these change") and `couples_also:`
+(the coupled artifacts that should change in the same edit, or be consciously
+dismissed). A norm carrying both becomes a **coupling norm**: the post-tool
+hook glob-matches every Write/Edit's repo-relative path against the trigger
+sets and, on a hit, injects the targets as an edit-time nudge — once per
+session per norm, deterministic, no LLM (task-spor-coupling-nudge-posttool;
+`SPOR_COUPLING_NUDGE=0` disables). The glob dialect is small: `**` crosses
+path segments, `*` stays within one, `?` is one character, a trailing `/`
+means the whole subtree, and a bare `API.md` anchors at the repo root. An
+entry may be **repo-qualified** as `<slug>:<glob>` (or `repo-<slug>:<glob>`)
+so one norm couples artifacts across repos — a qualified trigger fires only in
+that repo and bypasses the norm's scope (the pin IS the scope), while an
+unqualified trigger applies wherever the norm itself applies: its
+`applies_to_*` selectors when declared, else its `project:` stamp (unstamped =
+every repo — the org-wide case, e.g. `couples_when: [.nvmrc]` /
+`couples_also: [Dockerfile]`). Targets may be qualified the same way for
+display. Either key alone, a scalar value, or the keys on a non-norm type are
+inert (validate warns). The matcher is `lib/kernel/coupling.js`; a graph with
+no coupling norms is byte-identical.
+
 Because a norm rides along with no relevance gate and the team trust model lets
 every writer author one, the briefing renderer treats norm bodies as an
 **injection surface** (issue-cc-norm-always-on-injection): each is quoted as

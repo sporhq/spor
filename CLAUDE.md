@@ -153,6 +153,30 @@ many `.md` files runs unbounded calls — and `SPOR_NUDGE_TIMEOUT`
 the parallel `SPOR_DISTILL_TIMEOUT`/`distill.timeoutMs`, default 120000). All
 knobs resolve through the config cascade (`u.cfgNum`). See test/nudge.test.js.
 
+The post-tool engine ALSO carries the coupling nudge
+(task-spor-coupling-nudge-posttool, dec-spor-coupling-norms-declared-first) —
+BOTH modes, deterministic, NO LLM: on every Write/Edit it glob-matches the
+edited repo-relative path against the `couples_when:` triggers of coupling
+norms (norm nodes carrying `couples_when:` + `couples_also:` inline lists, see
+GRAPH.md) and injects the `couples_also:` targets — "you changed X, don't
+forget Y" at the moment of the edit. Entries may be repo-qualified
+`<slug>:<glob>` for cross-repo couplings (a qualified trigger fires only in
+that repo and bypasses the norm's scope; an unqualified one follows the
+`applies_to_*`/`project:` scoping). The matcher is `lib/kernel/coupling.js`
+(shared with the future diff-level check verb, task-spor-cli-check-coupling-verb);
+norms come from the local nodes dir keyed by a readdir+mtime fingerprint
+(local mode, so a freshly authored norm is live on the next tool call) or a
+1h-TTL `cache/coupling.json` snapshot of `GET /v1/export` (remote mode; the
+`fetched` stamp is written BEFORE the download so a dead server costs at most
+one bounded attempt per TTL — `SPOR_COUPLING_NUDGE_TIMEOUT` /
+`couplingNudge.timeoutMs`, default 3000). Once per (session, norm) via
+`journal/<session>.coupling-nudged`; precedence claim-nudge > coupling >
+capture, and a coupling hit taking the envelope does NOT burn the file's one
+capture classification (no `.nudged` line is written, so its next edit still
+classifies). Disable with `SPOR_COUPLING_NUDGE=0`
+(`couplingNudge.enabled:false`); a graph with no coupling norms is
+byte-identical. See test/coupling-nudge.test.js + test/coupling.test.js.
+
 The post-tool engine ALSO carries the claim heartbeat ∪ claim-nudge
 (task-cc-claim-nudge-hook, dec-cc-task-claim-lease) — REMOTE-MODE ONLY and a
 NO-LLM boolean lease lookup (a queue read, not a classifier; it stays off the
