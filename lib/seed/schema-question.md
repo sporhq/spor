@@ -2,7 +2,7 @@
 id: schema-question
 type: schema
 kind: node-schema
-schema_version: 2026.06.20.1
+schema_version: 2026.07.05.1
 title: Seed schema for question nodes
 summary: Node schema for the question type — a routed ask that the graph could not answer; queueable so open questions join the decision queue, routed-to a steward, answered by nodes carrying answers edges. Seed-pack default; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -33,6 +33,19 @@ on **create as well as update** — `transitions()` runs on update only, so a
 question could be BORN with an off-vocabulary status that a later re-validating
 write then rejected. `validate()` and `transitions()` SHARE one `VALID` list (no
 drift). Backward-readable: write-time only, no node-shape change, no upgrade chain.
+
+`validate()` placeholder gate (2026.07.05.1,
+issue-spor-ask-question-template-placeholder-validation): a docs example run
+verbatim minted `question-question` — title, summary, and body all the literal
+string `<question>`, an information-free slug, auto-routed and queued as a real
+ask. The door now rejects any PRESENT text field (`title`/`summary`/`body`)
+whose entire content is one unfilled template token (`<...>`, `{...}`/`{{...}}`,
+or `[...]`), so an unfilled ask fails at write time on every path that runs
+schema hooks (REST, MCP, remote CLI). Absent/empty fields remain the core
+validator's concern; text with real content around a token passes. Slug
+derivation was already content-derived — rejecting the degenerate input is what
+prevents the information-free id. Backward-readable: write-time only, no
+node-shape change, no upgrade chain.
 
 `get()` (2026.06.19.1): the read-time enrichment hook
 (task-spor-schema-get-hook-readtime-enrichment) — the single mechanism that
@@ -72,16 +85,34 @@ function statusReason(next) {
     "terminal) — or none, meaning live. (dec-cc-status-enforcement-via-transitions)";
 }
 
+// One unfilled template token and nothing else: <question>, {slug}, {{text}},
+// [id]. Whole-field match only — real content around a token passes, and
+// ABSENT fields stay the core validator's concern (bare probe nodes must pass).
+const PLACEHOLDER = /^\s*(?:<[^<>]*>|\{\{[^{}]*\}\}|\{[^{}]*\}|\[[^\[\]]*\])\s*$/;
+
 // validate(node) — the door, runs on EVERY write (create AND update) in the
 // §2.4 sandbox. Enforce the status-vocabulary MEMBERSHIP here so a question
 // cannot be BORN with an off-vocabulary status that the update-path
 // transitions() gate would later reject
 // (issue-spor-node-create-bypasses-status-vocabulary). Empty status
-// (status-less = live, an open question) is allowed.
+// (status-less = live, an open question) is allowed. Also reject any present
+// text field that is ONLY an unfilled template placeholder — a docs example
+// run verbatim once minted question-question with title/summary/body all
+// '<question>' (issue-spor-ask-question-template-placeholder-validation).
 export function validate(node) {
+  const errors = [];
   const s = ((node && node.status) || "").toLowerCase();
-  if (s === "" || VALID.indexOf(s) !== -1) return [];
-  return [statusReason(s)];
+  if (s !== "" && VALID.indexOf(s) === -1) errors.push(statusReason(s));
+  const fields = ["title", "summary", "body"];
+  for (let i = 0; i < fields.length; i++) {
+    const v = node && node[fields[i]];
+    if (typeof v === "string" && v.trim() !== "" && PLACEHOLDER.test(v)) {
+      errors.push("question " + fields[i] + " is an unfilled template placeholder ('" +
+        v.trim() + "'): replace it with the actual question text " +
+        "(issue-spor-ask-question-template-placeholder-validation)");
+    }
+  }
+  return errors;
 }
 
 // transitions(current, proposed, view) — question status vocabulary gate

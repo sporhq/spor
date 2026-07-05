@@ -616,6 +616,10 @@ edges:
   the deterministic router walks `stewards` edges from the question's relevance
   neighborhood to the closest steward and writes a `routed-to` edge to that
   person; an unrouted question (no steward matched) surfaces to everyone.
+  The question schema's `validate()` door rejects a title/summary/body that is
+  ONLY an unfilled template token (`<question>`, `{{text}}`, `[id]`) so a docs
+  example run verbatim can't mint an information-free routed ask
+  (issue-spor-ask-question-template-placeholder-validation).
 - **`assigned`** points work (task/issue) at a person; per-person queues filter
   on it (the queue's `assignee` parameter — `GET /v1/queue?assignee=<person>`,
   unioned with the person's `stewards` edges; QUEUE.md §5). **`answers`** points

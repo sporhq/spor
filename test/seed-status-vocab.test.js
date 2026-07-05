@@ -103,3 +103,43 @@ test("seed schema-issue: validate() accepts 'resolved' (vocabulary); resolving-r
     { resolvers: [{ id: "art-pr", type: "artifact", status: "in-review" }], non_resolving_statuses: ["in-review", "approved"] });
   assert.equal(inReview.allow, false, "an in-review resolver does not allow resolved");
 });
+
+// The question placeholder gate (2026.07.05.1,
+// issue-spor-ask-question-template-placeholder-validation): validate() rejects
+// a PRESENT title/summary/body that is ONLY an unfilled template token — the
+// question-question incident, a docs example run verbatim ('<question>' in
+// every text field) that minted an information-free routed ask. Whole-field
+// match only; absent fields and real content around a token still pass.
+test("seed schema-question: validate() rejects unfilled template placeholders in text fields", () => {
+  // the observed incident: every field the literal placeholder
+  const errs = callValidate("question", {
+    id: "question-x", title: "<question>", summary: "<question>", body: "<question>",
+  });
+  assert.equal(errs.length, 3, "each placeholder field is its own error");
+  for (const e of errs) assert.match(e, /unfilled template placeholder/);
+  // every placeholder shape, in any single field
+  for (const p of ["<question>", "{{question}}", "{slug}", "[node-id]", "  <text here>  ", "<>"]) {
+    const one = callValidate("question", { id: "question-x", title: p });
+    assert.equal(one.length, 1, `placeholder title '${p}' must be rejected`);
+  }
+  // placeholder errors and status errors accumulate (validate no longer
+  // short-circuits on the vocabulary check)
+  const both = callValidate("question", { id: "question-x", status: "closed", title: "<question>" });
+  assert.equal(both.length, 2, "off-vocab status AND placeholder title are both reported");
+});
+
+test("seed schema-question: validate() passes real questions, absent fields, and tokens inside real text", () => {
+  // bare probe node (no text fields) — shape requirements are the core
+  // validator's concern, not the schema hook's
+  assert.deepEqual(callValidate("question", { id: "question-x" }), []);
+  // ordinary short question
+  assert.deepEqual(callValidate("question", { id: "question-x", title: "Why OKLCH?" }), []);
+  // a token inside real content is fine
+  assert.deepEqual(callValidate("question", {
+    id: "question-x",
+    title: "Should <question> placeholders be rejected at the door?",
+    body: "The docs show `spor ask \"<question>\"` — should the literal token be valid input?",
+  }), []);
+  // angle brackets as comparison operators, not a placeholder
+  assert.deepEqual(callValidate("question", { id: "question-x", title: "Is n < 5 or n > 9 here?" }), []);
+});
