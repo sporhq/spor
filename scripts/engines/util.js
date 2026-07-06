@@ -65,6 +65,17 @@ function cfgNum(keyPath, envName, fallback) {
   const n = parseFloat(v);
   return Number.isFinite(n) ? n : fallback;
 }
+// Config-aware boolean read, same cascade and the shell "0"/"false"/"" ⇒ false
+// convention as Config.getBool. Standalone (no active config) falls back to the
+// env dual-read, so a direct call is byte-identical to the raw env test it
+// replaces. Fallback returned when neither config nor env is set.
+function cfgBool(keyPath, envName, fallback) {
+  if (_config) return _config.getBool(keyPath, fallback);
+  const v = home.envDual(envName);
+  if (v === undefined) return fallback;
+  const s = String(v).trim().toLowerCase();
+  return !(s === "0" || s === "false" || s === "");
+}
 
 function hostDefaultBackendCmd(kind) {
   if (_host === "codex" && kind === "nudge") return `codex exec --model ${CODEX_NUDGE_MODEL} -`;
@@ -399,6 +410,202 @@ function journalLoadMs(graph, session, engine, loadMs, extra = {}) {
   } catch {
     /* best-effort telemetry */
   }
+}
+
+// Durable journal files that collide with a per-session prune pattern and so
+// must be named-excluded from the sweep. Only load-latency.jsonl needs this: it
+// is a root-level *.jsonl (the append-only load-latency telemetry) that would
+// otherwise be bucketed as a "session" by the .jsonl matcher below. The rest of
+// the durable state — distill.log / remote.log, the llm-calls/ telemetry dir, the
+// pending-distill control file, the .gc-stamp, the enable-hint-* stamps — matches
+// no prune suffix and is skipped structurally (see gcJournal), so it is NOT
+// listed here. Add an entry only when a new durable file would match a suffix.
+const GC_KEEP = new Set(["load-latency.jsonl"]);
+
+// Prune stale per-session subdirectories under journal/pending-nudges/ — the
+// async-classifier pending-result dirs (task-cc-async-classifier-pending-result-
+// injection), keyed by session and otherwise orphaned once that session ends.
+// `liveSessions` is the same concurrently-live set gcJournal derived from the
+// root-level bucket sweep (a session whose OTHER journal artifacts are fresh) —
+// a pending-nudges/<session> dir is exempted if EITHER its own mtime is fresh
+// OR the session is live by that bucket signal, because a detached
+// nudge-worker can be mid-flight (spooled, not yet written back) for a session
+// that hasn't touched this specific directory recently (review finding: relying
+// on the directory's own mtime alone missed a concurrently-live OTHER session).
+function gcPendingNudges(dir, cutoff, session, stat, liveSessions) {
+  let subs;
+  try {
+    subs = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const s of subs) {
+    if (!s.isDirectory()) continue;
+    if (session && s.name === session) continue; // never sweep the live session
+    if (liveSessions && liveSessions.has(s.name)) continue; // concurrently-live elsewhere
+    const full = path.join(dir, s.name);
+    let m;
+    try {
+      m = fs.statSync(full).mtimeMs;
+    } catch {
+      continue;
+    }
+    if (m >= cutoff) continue;
+    try {
+      fs.rmSync(full, { recursive: true, force: true });
+      stat.removed++;
+    } catch {
+      /* a dir that vanished mid-sweep just doesn't count */
+    }
+  }
+}
+
+// Age-bounded garbage collection of the per-session journal artifacts that
+// otherwise accumulate forever (task-spor-client-journal-gc): the
+// <session>.jsonl event logs, the .nudged / .claim-nudged / .coupling-nudged /
+// .heartbeat cooldown markers, the prompt-context-<hash>.json digest caches, and
+// the pending-nudges/<session>/ dirs. Without this a long-lived box grows
+// unbounded disk + inodes in journal/. Throttled to run at most once per
+// gc.intervalMs via a journal/.gc-stamp cooldown (stamped after a successful
+// readdir, before the per-file loop, so a huge first sweep can't repeat every
+// session); entries older than gc.maxAgeMs are removed. Durable state is
+// preserved (GC_KEEP, the llm-calls/ telemetry dir, the enable-hint stamps, and
+// every non-per-session file), and a live session's own files are always kept:
+// the triggering session by name, a CONCURRENTLY-live session by bucketing its
+// files and keeping the whole bucket while its newest artifact is fresh.
+// Side-effect-only and fail-open — it never blocks or throws; returns a small
+// { ran, removed } stat for logging/tests. opts { now, session, maxAgeMs,
+// intervalMs, force } override the resolved config for tests (force bypasses only
+// the throttle, never the enabled/age gates).
+function gcJournal(graph, opts = {}) {
+  const stat = { ran: false, removed: 0 };
+  try {
+    const enabled = _config
+      ? _config.getBool("gc.enabled", true)
+      : (home.envDual("GC") ?? "1") !== "0";
+    if (!enabled) return stat;
+    const dir = path.join(graph, "journal");
+    const now = opts.now ?? Date.now();
+    const intervalMs = opts.intervalMs ?? cfgNum("gc.intervalMs", "GC_INTERVAL", 86400000); // 1d
+    const stamp = path.join(dir, ".gc-stamp");
+    if (!opts.force) {
+      let last = 0;
+      try {
+        last = parseInt(fs.readFileSync(stamp, "utf8"), 10) || 0;
+      } catch {
+        /* no stamp yet — first sweep is due */
+      }
+      if (now - last < intervalMs) return stat; // throttled: not due yet
+    }
+    // Read the directory FIRST. A failure here (absent dir, EACCES, EMFILE) must
+    // NOT consume the interval — return without stamping so the next session
+    // retries, rather than silently skipping a whole interval of cleanup.
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return stat;
+    }
+    // Stamp only now that the dir is readable, and before the (potentially long)
+    // per-file stat/unlink loop, so a huge first sweep can't repeat every session.
+    try {
+      fs.writeFileSync(stamp, `${now}\n`);
+    } catch {
+      /* best-effort — an unwritable stamp just means we re-scan next time */
+    }
+    stat.ran = true;
+    const maxAgeMs = opts.maxAgeMs ?? cfgNum("gc.maxAgeMs", "GC_MAX_AGE", 1209600000); // 14d
+    const cutoff = now - maxAgeMs;
+    const session = opts.session || null;
+    // The live session's own prompt-context digest-dedup cache is named by a hash
+    // of the session id (prompt-context.js statePath), NOT <session>.*, so the
+    // filename bucketing below can't see it. Protect it explicitly: recompute the
+    // hash so a clock step / restored-backup mtime can't reap the RUNNING
+    // session's follow-up-suppression state (review finding).
+    const liveCtx = session
+      ? `prompt-context-${crypto.createHash("sha256").update(String(session), "utf8").digest("hex").slice(0, 16)}.json`
+      : null;
+    // Per-session cooldown/marker suffixes, ordered longest-first for the ones
+    // sharing a tail (…coupling-nudged / …claim-nudged before …nudged) so the
+    // session id is stripped correctly.
+    const SUFFIXES = [".jsonl", ".coupling-nudged", ".claim-nudged", ".nudged", ".heartbeat"];
+
+    // Bucket every per-session file under its session id. A whole bucket is kept
+    // or pruned by its NEWEST mtime, because a write-once cooldown marker's mtime
+    // is not a liveness signal — the session's still-growing <session>.jsonl event
+    // log (or any fresher sibling) is. This shields a CONCURRENTLY-live session on
+    // a shared SPOR_HOME from having its markers reaped mid-life under a low
+    // gc.maxAgeMs (review finding), not just the session that triggered the sweep.
+    const buckets = new Map(); // session -> [full path]
+    const promptCtx = []; // prompt-context-<hash>.json — hash-keyed, can't be bucketed
+    let pending = null; // journal/pending-nudges dir, swept separately
+    for (const ent of entries) {
+      const name = ent.name;
+      if (GC_KEEP.has(name)) continue;
+      if (name.startsWith("enable-hint-")) continue; // per-slug one-time suppression
+      if (ent.isDirectory()) {
+        if (name === "pending-nudges") pending = path.join(dir, name);
+        continue; // llm-calls/ and any other dir is not per-session scratch
+      }
+      if (!ent.isFile()) continue;
+      if (name.startsWith("prompt-context-") && name.endsWith(".json")) {
+        if (name !== liveCtx) promptCtx.push(path.join(dir, name));
+        continue;
+      }
+      const suf = SUFFIXES.find((sfx) => name.endsWith(sfx));
+      if (!suf) continue; // not a per-session artifact — leave it alone
+      const sess = name.slice(0, name.length - suf.length);
+      if (session && sess === session) continue; // the live session, always kept
+      if (!buckets.has(sess)) buckets.set(sess, []);
+      buckets.get(sess).push(path.join(dir, name));
+    }
+
+    // Prune a session bucket only when its newest file is older than the cutoff.
+    // Track which OTHER sessions are concurrently live by this signal, so the
+    // pending-nudges sweep below can extend the same protection to a session's
+    // spool dir even when the dir's own mtime looks stale (review finding).
+    const liveSessions = new Set();
+    for (const [sess, files] of buckets) {
+      let newest = 0;
+      for (const f of files) {
+        try {
+          const m = fs.statSync(f).mtimeMs;
+          if (m > newest) newest = m;
+        } catch {
+          /* a file that vanished mid-sweep doesn't affect the bucket's age */
+        }
+      }
+      if (newest === 0 || newest >= cutoff) {
+        liveSessions.add(sess);
+        continue; // active bucket (or all unreadable)
+      }
+      for (const f of files) {
+        try {
+          fs.unlinkSync(f);
+          stat.removed++;
+        } catch {
+          /* vanished mid-sweep */
+        }
+      }
+    }
+    // Hash-keyed prompt-context caches can't be bucketed by session id; prune by
+    // their own mtime, which repeatedFollowup() rewrites every prompt, so a stale
+    // one is genuinely from an idle/ended session (the live one is exempt above).
+    for (const f of promptCtx) {
+      try {
+        if (fs.statSync(f).mtimeMs < cutoff) {
+          fs.unlinkSync(f);
+          stat.removed++;
+        }
+      } catch {
+        /* vanished / unreadable */
+      }
+    }
+    if (pending) gcPendingNudges(pending, cutoff, session, stat, liveSessions);
+  } catch {
+    /* fail-open — GC must never cost the session */
+  }
+  return stat;
 }
 
 // Global git flags that force commit signing OFF, spread in BEFORE the `commit`
@@ -1079,6 +1286,7 @@ module.exports = {
   clearConfig,
   cfgStr,
   cfgNum,
+  cfgBool,
   hostDefaultBackendCmd,
   jqNow,
   isoMs,
@@ -1110,6 +1318,7 @@ module.exports = {
   makeLogger,
   loadGraphCached,
   journalLoadMs,
+  gcJournal,
   curl,
   bearer,
   serverBase,

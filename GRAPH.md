@@ -622,6 +622,10 @@ Each org slug has a durable `organization` node (`org-<slug>`, carrying
 an additional `stewards -> org-<slug>` edge records org-admin authority.
 `stewards -> org-root` keeps its distinct graph-wide operator meaning. Provider
 roles, token bits, and email-domain mappings do not confer either relation.
+`org-root` is a **virtual** anchor — no node ever carries that id — so the
+graph-wide lint (`spor validate` / `validateGraphFiles`) special-cases
+`stewards -> <rootId>` (default `org-root`, override with `SPOR_ROOT_ID`) and
+never flags it as a dangling edge.
 
 ```markdown
 ---
