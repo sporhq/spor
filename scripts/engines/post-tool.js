@@ -589,17 +589,22 @@ async function couplingNudge({ input, graph, slug, session, cwd, remote }) {
   if (!["Write", "Edit", "write", "edit"].includes(tool)) return null;
   const file = input.tool_input?.file_path ?? "";
   if (!file) return null;
-  // Graph-home writes (node files, journal) are never repo artifacts.
-  const npath = (p) => path.resolve(String(p || "")).replace(/\\/g, "/");
+  // Graph-home writes (node files, journal) are never repo artifacts. Canonicalize
+  // both sides — real-path identity, independent of spelling — so a graph-inside-repo
+  // node write in a short/aliased path is still recognized and skipped here, rather
+  // than slipping past and being resolved back into the repo as a spurious coupling
+  // hit (issue-spor-windows-ci-short-path-mismatch). This is a robust identity check,
+  // distinct from repoRelative's literal-first glob derivation below.
+  const npath = (p) => u.canonPath(p).replace(/\\/g, "/");
   if (npath(file).startsWith(npath(graph) + "/")) return null;
   // Coupling globs are repo-root-relative: resolve the repo top and the
   // edited file's path under it; a write outside any repo can't match.
   const top = u.git(cwd, ["rev-parse", "--show-toplevel"])?.trim();
   if (!top) return null;
-  // Canonicalize both sides before deriving the repo-relative path: on the
-  // windows-latest runner os.tmpdir() is an 8.3 short path (RUNNER~1) while git
-  // returns the long form, and the naive path.relative walks clean out of the
-  // repo (issue-spor-windows-ci-short-path-mismatch).
+  // repoRelative derives the path literal-first and only canonicalizes when the
+  // literal walks out of the repo — the windows-latest short-vs-long-path split
+  // (os.tmpdir()'s RUNNER~1 vs git's long --show-toplevel), where the naive
+  // path.relative walks clean out (issue-spor-windows-ci-short-path-mismatch).
   const rel = u.repoRelative(top, file);
   if (!rel) return null;
 

@@ -672,22 +672,50 @@ function canonPath(p) {
       const real = fs.realpathSync.native(cur);
       return tail.length ? path.join(real, ...tail) : real;
     } catch {
+      // realpath failed for `cur` — a not-yet-created leaf, or an unreadable
+      // (EACCES) / cyclic (ELOOP) component. Walk up to the nearest RESOLVABLE
+      // ancestor and re-attach the tail, so an accessible short-name/symlink
+      // ancestor STILL gets expanded (bailing to the fully-literal path here
+      // would canonicalize nothing and re-expose the short-vs-long gap). At the
+      // filesystem root with nothing resolvable, fall back to path.resolve.
       const parent = path.dirname(cur);
-      if (parent === cur) return abs; // reached the root with nothing resolvable
+      if (parent === cur) return abs;
       tail.unshift(path.basename(cur));
       cur = parent;
     }
   }
 }
 
-// Repo-relative, forward-slash path of `file` under git toplevel `top`, both
-// canonicalized first so a Windows short/long-path mismatch can't walk the
-// result out of the repo (issue-spor-windows-ci-short-path-mismatch). Returns
-// null when the file resolves OUTSIDE the repo (a `..` walk-out or an absolute
-// remainder) — the derivation the post-tool coupling nudge needs. (`spor check`
-// canonicalizes with canonPath directly since --files keeps out-of-repo entries.)
+// Forward-slash path of `file` relative to git toplevel `top`, preferring the
+// LITERAL spelling: plain path.relative on the paths as given. Only when that
+// walks OUT of the repo (a `..`/absolute result) do we canonicalize both sides
+// and retry — that walk-out is exactly the Windows 8.3 short-vs-long split,
+// where os.tmpdir()'s `…\RUNNER~1\…` can't prefix-match git's long
+// --show-toplevel (issue-spor-windows-ci-short-path-mismatch). Literal-first
+// keeps the common path byte-identical (Linux/macOS, matching spellings) and
+// deliberately PRESERVES in-repo symlink spellings — a tracked
+// `frontend -> packages/web` still reads as `frontend/…`, since that literal
+// path never walks out, so a coupling glob authored against the alias keeps
+// matching (only a genuine walk-out triggers canonicalization).
+//   TRADEOFF: an in-repo symlink has two valid spellings and no single
+//   derivation matches both — literal-first favors the alias, so conversely a
+//   glob authored against the RESOLVED subtree (`packages/web/**`) won't match
+//   an edit reached via the alias. That case is rare (a tracked symlinked
+//   subtree AND a coupling glob on it); matching both spellings at once would be
+//   a matcher-level change, left as a follow-up.
+function toRepoRel(top, file) {
+  const lit = path.relative(top, file).split(path.sep).join("/");
+  if (lit === "" || (!lit.startsWith("../") && lit !== ".." && !path.isAbsolute(lit))) return lit;
+  return path.relative(canonPath(top), canonPath(file)).split(path.sep).join("/");
+}
+
+// toRepoRel rejected to null when the file resolves OUTSIDE the repo (a `..`
+// walk-out or an absolute remainder) or onto the repo root itself — the in-repo
+// repo-relative path the post-tool coupling nudge needs. (`spor check` calls
+// toRepoRel directly: a genuinely out-of-repo --files entry stays a `../…` path
+// rather than being dropped.)
 function repoRelative(top, file) {
-  const rel = path.relative(canonPath(top), canonPath(file)).split(path.sep).join("/");
+  const rel = toRepoRel(top, file);
   if (!rel || rel.startsWith("../") || rel === ".." || path.isAbsolute(rel)) return null;
   return rel;
 }
@@ -1348,6 +1376,7 @@ module.exports = {
   NO_GPGSIGN,
   graphInsideCodeRepo,
   canonPath,
+  toRepoRel,
   repoRelative,
   ensureDir,
   spoolStats,

@@ -1746,10 +1746,14 @@ async function cmdCheck(cfg, args) {
   if (files) {
     changed = files.map((f) => {
       const abs = path.isAbsolute(f) ? f : path.resolve(cwd, f);
-      // Canonicalize both sides so a Windows 8.3 short path (os.tmpdir's
-      // RUNNER~1) can't mismatch git's long --show-toplevel and walk the
-      // relative path out of the repo (issue-spor-windows-ci-short-path-mismatch).
-      return path.relative(u.canonPath(top), u.canonPath(abs)).split(path.sep).join("/");
+      // toRepoRel derives the path literal-first, canonicalizing both sides only
+      // when the literal walks out — so a Windows 8.3 short path (os.tmpdir's
+      // RUNNER~1) can't mismatch git's long --show-toplevel and escape the repo,
+      // while an in-repo path keeps its literal spelling
+      // (issue-spor-windows-ci-short-path-mismatch). The same helper the coupling
+      // nudge uses; a genuinely out-of-repo --files entry stays out-of-repo (a
+      // `../…` path) rather than being dropped.
+      return u.toRepoRel(top, abs);
     });
   } else if (range) {
     const r = git(top, ["diff", "--name-only", range]);

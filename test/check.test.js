@@ -217,6 +217,30 @@ test("CLI local: --staged narrows to the index; --files takes an explicit set; -
   assert.equal(JSON.parse(files.stdout).findings.length, 1);
 });
 
+test("CLI local: --files derives repo-relative paths through an aliased cwd (issue-spor-windows-ci-short-path-mismatch)", async (t) => {
+  // Portable stand-in for the windows-latest 8.3 short path: `git rev-parse
+  // --show-toplevel` returns the real path while a symlinked cwd is the alias,
+  // so the naive path.relative(top, resolve(cwd, f)) walks out of the repo and
+  // the `src/**` trigger silently stops matching. toRepoRel's canonicalize-on-
+  // walkout fallback keeps the derived path in-repo.
+  const { home, root } = scratch();
+  const linkRoot = `${root}-link`;
+  try {
+    fs.symlinkSync(root, linkRoot, "dir");
+  } catch {
+    t.skip("symlinks unavailable on this host");
+    return;
+  }
+  writeNorm(home, "norm-c", "couples_when: [src/**]\ncouples_also: [API.md]\n");
+  const env = baseEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_ENABLED: "1" });
+  const cwd = path.join(linkRoot, "projx"); // the alias spelling, vs git's real toplevel
+  const files = await runCli(["check", "--files", "src/whatever.js", "--json"], cwd, env);
+  const j = JSON.parse(files.stdout);
+  assert.deepEqual(j.changed, ["src/whatever.js"]);
+  assert.equal(j.findings.length, 1);
+  assert.equal(j.findings[0].norm, "norm-c");
+});
+
 test("CLI local: --range checks a commit range and reads invariant values from its right side", async () => {
   const { home, cwd, g } = scratch();
   writeNorm(home, "norm-v",
