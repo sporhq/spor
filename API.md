@@ -563,6 +563,23 @@ anything with a token.
   `{name, email}` attribution record. Access tokens are `spor_oat_…` (30d;
   legacy `sub_oat_…` accepted); refresh tokens are `spor_ort_…` (90d,
   rotating, single-use). Authorization codes are single-use, 10-minute.
+- **Connector grant teardown — token-scoped revocation (RFC 7009).**
+  `POST /oauth/revoke` `{token, token_type_hint?}` ends exactly the grant
+  that `token` (access or refresh) belongs to and nothing else — the
+  caller's PATs and any other connector grants for the same identity are
+  untouched. This is the narrow, safe way to disconnect one MCP connector
+  (e.g. removing it from a host's settings), distinct from the identity-wide
+  cascades: `DELETE /v1/me/tokens/{hash-prefix}` (§3) revokes a PAT plus
+  every grant *it* minted, and the admin offboarding cascade revokes
+  *every* grant for a person — using either of those to "clean up one
+  connector" collaterally logs out the identity's other live sessions
+  (issue-spor-teardown-revoke-by-identity-logs-out-operator;
+  dec-spor-pat-revoke-cascade-token-scoped). Like the rest of the
+  `/oauth/*` surface it is unversioned and takes no bearer — public client,
+  the token being revoked is itself the credential. Per RFC 7009 §2.2 the
+  response is always `200` whether or not `token` was known (anything else
+  is an unauthenticated validity oracle), so success never confirms the
+  token existed.
 - **CLI interactive sign-in — the device authorization grant.** `spor auth
   login` (flat alias `spor login`) defaults to the OAuth 2.0 device
   authorization grant (RFC 8628), brokered at the Spor front door so it works
