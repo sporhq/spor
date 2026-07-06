@@ -1161,6 +1161,24 @@ b
   }
 });
 
+test("validateGraph: a non-stewards edge to org-root is still dangling", () => {
+  const fx = tmpGraph({
+    "task-x.md": `---
+id: task-x
+type: task
+title: X
+summary: s
+date: 2026-06-01
+edges:
+  - {type: relates-to, to: org-root}
+---
+b
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.ok(v.warnings.some((w) => /dangling edge relates-to -> org-root/.test(w)));
+});
+
 test("validateGraph: a stewards edge to a non-root id is still dangling", () => {
   const fx = tmpGraph({
     "person-anthony.md": `---
