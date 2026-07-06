@@ -412,6 +412,140 @@ function journalLoadMs(graph, session, engine, loadMs, extra = {}) {
   }
 }
 
+// Durable journal entries the GC sweep must NEVER prune: the two rolling logs,
+// the load-latency + llm-calls telemetry (capture-health reads the trailing
+// window of the latter), the pending-distill control file, and the GC's own
+// throttle stamp. Everything else in the journal root is per-session scratch.
+const GC_KEEP = new Set([
+  "load-latency.jsonl",
+  "distill.log",
+  "remote.log",
+  "pending-distill",
+  ".gc-stamp",
+]);
+
+// Prune stale per-session subdirectories under journal/pending-nudges/ — the
+// async-classifier pending-result dirs (task-cc-async-classifier-pending-result-
+// injection), keyed by session and otherwise orphaned once that session ends.
+function gcPendingNudges(dir, cutoff, session, stat) {
+  let subs;
+  try {
+    subs = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const s of subs) {
+    if (!s.isDirectory()) continue;
+    if (session && s.name === session) continue; // never sweep the live session
+    const full = path.join(dir, s.name);
+    let m;
+    try {
+      m = fs.statSync(full).mtimeMs;
+    } catch {
+      continue;
+    }
+    if (m >= cutoff) continue;
+    try {
+      fs.rmSync(full, { recursive: true, force: true });
+      stat.removed++;
+    } catch {
+      /* a dir that vanished mid-sweep just doesn't count */
+    }
+  }
+}
+
+// Age-bounded garbage collection of the per-session journal artifacts that
+// otherwise accumulate forever (task-spor-client-journal-gc): the
+// <session>.jsonl event logs, the .nudged / .claim-nudged / .coupling-nudged /
+// .heartbeat cooldown markers, the prompt-context-<hash>.json digest caches, and
+// the pending-nudges/<session>/ dirs. Without this a long-lived box grows
+// unbounded disk + inodes in journal/. Throttled to run at most once per
+// gc.intervalMs via a journal/.gc-stamp cooldown, stamped BEFORE the scan so a
+// large first sweep can't repeat every session; entries older than gc.maxAgeMs
+// (by mtime) are removed. Durable state is preserved (GC_KEEP, the llm-calls/
+// telemetry dir, and the per-slug enable-hint stamps), and the live session's
+// own files are always skipped. Side-effect-only and fail-open — it never blocks
+// or throws; returns a small { ran, removed } stat for logging/tests. opts:
+// { now, session, maxAgeMs, intervalMs, force } override the resolved config for
+// tests (force bypasses only the throttle, never the enabled/age gates).
+function gcJournal(graph, opts = {}) {
+  const stat = { ran: false, removed: 0 };
+  try {
+    const enabled = _config
+      ? _config.getBool("gc.enabled", true)
+      : (home.envDual("GC") ?? "1") !== "0";
+    if (!enabled) return stat;
+    const dir = path.join(graph, "journal");
+    if (!fs.existsSync(dir)) return stat;
+    const now = opts.now ?? Date.now();
+    const intervalMs = opts.intervalMs ?? cfgNum("gc.intervalMs", "GC_INTERVAL", 86400000); // 1d
+    const stamp = path.join(dir, ".gc-stamp");
+    if (!opts.force) {
+      let last = 0;
+      try {
+        last = parseInt(fs.readFileSync(stamp, "utf8"), 10) || 0;
+      } catch {
+        /* no stamp yet — first sweep is due */
+      }
+      if (now - last < intervalMs) return stat; // throttled: not due yet
+    }
+    // Stamp BEFORE scanning so a slow/huge sweep can't run on every session.
+    try {
+      fs.writeFileSync(stamp, `${now}\n`);
+    } catch {
+      /* best-effort — an unwritable stamp just means we re-scan next time */
+    }
+    stat.ran = true;
+    const maxAgeMs = opts.maxAgeMs ?? cfgNum("gc.maxAgeMs", "GC_MAX_AGE", 1209600000); // 14d
+    const cutoff = now - maxAgeMs;
+    const session = opts.session || null;
+
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return stat;
+    }
+    for (const ent of entries) {
+      const name = ent.name;
+      if (GC_KEEP.has(name)) continue;
+      if (name === "llm-calls") continue; // date-keyed capture telemetry dir
+      if (name.startsWith("enable-hint-")) continue; // per-slug one-time suppression
+      // Never sweep the live session's own artifacts, even if the clock is skewed.
+      if (session && (name === session || name.startsWith(`${session}.`))) continue;
+      const full = path.join(dir, name);
+      if (name === "pending-nudges" && ent.isDirectory()) {
+        gcPendingNudges(full, cutoff, session, stat);
+        continue;
+      }
+      const prunable =
+        name.endsWith(".jsonl") || // <session>.jsonl (load-latency.jsonl is in GC_KEEP)
+        name.endsWith(".nudged") ||
+        name.endsWith(".claim-nudged") ||
+        name.endsWith(".coupling-nudged") ||
+        name.endsWith(".heartbeat") ||
+        (name.startsWith("prompt-context-") && name.endsWith(".json"));
+      if (!prunable || !ent.isFile()) continue;
+      let m;
+      try {
+        m = fs.statSync(full).mtimeMs;
+      } catch {
+        continue;
+      }
+      if (m >= cutoff) continue;
+      try {
+        fs.unlinkSync(full);
+        stat.removed++;
+      } catch {
+        /* a file that vanished mid-sweep just doesn't count */
+      }
+    }
+  } catch {
+    /* fail-open — GC must never cost the session */
+  }
+  return stat;
+}
+
 // Global git flags that force commit signing OFF, spread in BEFORE the `commit`
 // subcommand at every automated-commit site (graph snapshots, the SessionEnd
 // distiller, `spor init`/`migrate`). A user with a global commit.gpgsign=true
@@ -1122,6 +1256,7 @@ module.exports = {
   makeLogger,
   loadGraphCached,
   journalLoadMs,
+  gcJournal,
   curl,
   bearer,
   serverBase,
