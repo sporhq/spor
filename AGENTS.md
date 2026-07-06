@@ -18,4 +18,11 @@ Keep the graph current as you work — do these unprompted:
   teammate or future session could need, capture it to Spor as well.
 - When tracked work finishes, close the loop: record the resolution (a
   decision or artifact node with a `resolves` edge), not a bare status flip.
+- After a substantial multi-node session (several nodes produced, or a real
+  investigation/build/scoping run), file ONE outcome artifact that links what
+  you produced — a provenance hub, `resolves` what it closed and
+  `relates-to`/`mentions` the rest — so the "what did this accomplish, why do
+  these nodes belong together" record exists without a human asking. Ad-hoc work
+  that never flips a task to done has no other capture trigger; don't leave the
+  connective record unwritten.
 <!-- spor:end -->

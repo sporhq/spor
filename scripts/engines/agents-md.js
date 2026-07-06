@@ -39,7 +39,11 @@ function toolsLine() {
 // mode observed in the 2026-07-04 capture retrospective
 // (art-cc-capture-discipline-results-2): work discovered but never filed,
 // fix-before-issue, decisions kept only in chat, durable facts leaking to
-// private auto-memory, and bare status flips.
+// private auto-memory, bare status flips, and a substantial multi-node session
+// whose connective outcome artifact never got filed until the human asked
+// (issue-spor-session-outcome-artifact-capture-gap) — nothing triggers the
+// session-level provenance hub the way the terminal-status gate triggers a
+// resolver.
 const DIRECTIVE = `Keep the graph current as you work — do these unprompted:
 
 - The moment work is discovered that you won't do right now (an out-of-scope
@@ -54,7 +58,14 @@ const DIRECTIVE = `Keep the graph current as you work — do these unprompted:
   auto-memory or scratch notes. If you are about to "remember" something a
   teammate or future session could need, capture it to Spor as well.
 - When tracked work finishes, close the loop: record the resolution (a
-  decision or artifact node with a \`resolves\` edge), not a bare status flip.`;
+  decision or artifact node with a \`resolves\` edge), not a bare status flip.
+- After a substantial multi-node session (several nodes produced, or a real
+  investigation/build/scoping run), file ONE outcome artifact that links what
+  you produced — a provenance hub, \`resolves\` what it closed and
+  \`relates-to\`/\`mentions\` the rest — so the "what did this accomplish, why do
+  these nodes belong together" record exists without a human asking. Ad-hoc work
+  that never flips a task to done has no other capture trigger; don't leave the
+  connective record unwritten.`;
 
 // Body after the second '---' line (awk), head -c 7000, $() newline strip.
 function nodeBody(raw) {

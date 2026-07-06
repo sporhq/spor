@@ -269,6 +269,40 @@ means nothing `blocks` the root yet — add the member edges above.
 `show_queue` answers "what's next?"; `render_program` answers "how far along
 is the whole thing?".
 
+## COMMIT: close a session with an outcome artifact
+
+Individual nodes capture individual facts; a substantial session also needs the
+**connective** record — the "what did this session accomplish, and why do these
+nodes belong together" hub. Nothing triggers it automatically. The completion
+gate (task-cc-terminal-status-requires-resolver) only demands a resolver when you
+flip a *specific* task or issue to a terminal status, so an
+investigation/scoping/build session that produces several nodes but terminalizes
+none has no capture cue at all — the highest-value connective record is precisely
+the one with no enforcement behind it (issue-spor-session-outcome-artifact-capture-gap).
+
+So make it a **COMMIT-phase beat**: after a substantial multi-node session, file
+ONE `artifact` node whose body says what the work accomplished, carrying edges to
+the nodes it produced — `resolves` to any it closes, `relates-to`/`mentions` the
+rest — a provenance hub, not just the scattered individual nodes. File it before
+the human has to ask.
+
+```bash
+spor put-node - --if-exists skip <<'EOF'    # or MCP put_node + add_edge
+---
+id: art-<stem>-<yyyy-mm-dd>
+type: artifact
+project: <slug>
+title: <what this session accomplished>
+summary: <one standalone sentence — most consumers only see this>
+edges:
+  - {type: resolves, to: <task-or-issue-it-closed>}
+  - {type: relates-to, to: <another-node-it-produced>}
+---
+
+<what was done and why these nodes exist together>
+EOF
+```
+
 ## Adding a node or edge type
 
 Because schemas are themselves nodes, you extend the ontology by **writing a

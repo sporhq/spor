@@ -83,6 +83,13 @@ the node to you, and commits it.
   artifact is enough for a trivial close) and `add_edge` a `resolves` to the
   item, THEN `set_status`. `abandoned` (task) is exempt.
 - Don't upload personal scratch — only promote facts the whole team should share.
+- After a substantial multi-node session, also file the **connective** record:
+  ONE `artifact` node that says what the session accomplished, carrying edges to
+  the nodes it produced (`resolves` what it closed, `relates-to`/`mentions` the
+  rest). Nothing triggers this hub automatically — the completion gate only fires
+  on a terminal status flip, so a session that produces many nodes but
+  terminalizes none has no cue (issue-spor-session-outcome-artifact-capture-gap).
+  Write it before the human asks, not just the scattered individual nodes.
 
 ## When a briefing or digest was wrong
 
