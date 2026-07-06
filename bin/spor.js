@@ -1746,7 +1746,10 @@ async function cmdCheck(cfg, args) {
   if (files) {
     changed = files.map((f) => {
       const abs = path.isAbsolute(f) ? f : path.resolve(cwd, f);
-      return path.relative(top, abs).split(path.sep).join("/");
+      // Canonicalize both sides so a Windows 8.3 short path (os.tmpdir's
+      // RUNNER~1) can't mismatch git's long --show-toplevel and walk the
+      // relative path out of the repo (issue-spor-windows-ci-short-path-mismatch).
+      return path.relative(u.canonPath(top), u.canonPath(abs)).split(path.sep).join("/");
     });
   } else if (range) {
     const r = git(top, ["diff", "--name-only", range]);

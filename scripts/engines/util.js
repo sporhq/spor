@@ -650,6 +650,48 @@ function graphInsideCodeRepo(graph, cwd) {
   }
 }
 
+// Canonicalize a path to its physical long form — resolving Windows 8.3 short
+// names (os.tmpdir() hands out `…\RUNNER~1\…` on the windows-latest CI runner)
+// and macOS /var->/private/var symlinks — so a path built from os.tmpdir() and
+// one from `git rev-parse --show-toplevel` (which returns the long, resolved
+// form) share a common prefix and path.relative() stays INSIDE the repo instead
+// of walking out to `..\..\..\…` (issue-spor-windows-ci-short-path-mismatch).
+// Only realpathSync.native expands 8.3 names (the JS fs.realpathSync only
+// follows symlinks); it needs the path to EXIST, so for a not-yet-created file
+// (a Write's target, or a synthetic hook payload) we canonicalize the nearest
+// existing ancestor and re-attach the remaining tail. Fail-open: an
+// unresolvable path falls back to path.resolve (byte-identical to the old
+// behavior wherever nothing needs canonicalizing — Linux tmp has no short
+// names or symlinks, so realpath is idempotent there).
+function canonPath(p) {
+  const abs = path.resolve(String(p ?? ""));
+  let cur = abs;
+  const tail = [];
+  for (;;) {
+    try {
+      const real = fs.realpathSync.native(cur);
+      return tail.length ? path.join(real, ...tail) : real;
+    } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return abs; // reached the root with nothing resolvable
+      tail.unshift(path.basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+// Repo-relative, forward-slash path of `file` under git toplevel `top`, both
+// canonicalized first so a Windows short/long-path mismatch can't walk the
+// result out of the repo (issue-spor-windows-ci-short-path-mismatch). Returns
+// null when the file resolves OUTSIDE the repo (a `..` walk-out or an absolute
+// remainder) — the derivation the post-tool coupling nudge needs. (`spor check`
+// canonicalizes with canonPath directly since --files keeps out-of-repo entries.)
+function repoRelative(top, file) {
+  const rel = path.relative(canonPath(top), canonPath(file)).split(path.sep).join("/");
+  if (!rel || rel.startsWith("../") || rel === ".." || path.isAbsolute(rel)) return null;
+  return rel;
+}
+
 function ensureDir(dir) {
   try {
     fs.mkdirSync(dir, { recursive: true });
@@ -1305,6 +1347,8 @@ module.exports = {
   git,
   NO_GPGSIGN,
   graphInsideCodeRepo,
+  canonPath,
+  repoRelative,
   ensureDir,
   spoolStats,
   ensureGraphGitignore,

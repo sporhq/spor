@@ -596,8 +596,12 @@ async function couplingNudge({ input, graph, slug, session, cwd, remote }) {
   // edited file's path under it; a write outside any repo can't match.
   const top = u.git(cwd, ["rev-parse", "--show-toplevel"])?.trim();
   if (!top) return null;
-  const rel = path.relative(top, file).replace(/\\/g, "/");
-  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+  // Canonicalize both sides before deriving the repo-relative path: on the
+  // windows-latest runner os.tmpdir() is an 8.3 short path (RUNNER~1) while git
+  // returns the long form, and the naive path.relative walks clean out of the
+  // repo (issue-spor-windows-ci-short-path-mismatch).
+  const rel = u.repoRelative(top, file);
+  if (!rel) return null;
 
   const data = remote ? await remoteCouplingData(graph) : localCouplingData(graph);
   if (!data || !Array.isArray(data.norms) || data.norms.length === 0) return null;
