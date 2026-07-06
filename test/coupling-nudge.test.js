@@ -104,6 +104,34 @@ test("local mode: a matching edit fires the coupling nudge naming the targets", 
   assert.deepStrictEqual(j[0].norms, ["norm-projx-api-docs"]);
 });
 
+test("short-path / symlink parity: a git long-path top vs an aliased cwd still fires (issue-spor-windows-ci-short-path-mismatch)", async (t) => {
+  // Reproduce the windows-latest failure class portably: on CI os.tmpdir() is an
+  // 8.3 short path (…\RUNNER~1\…) while `git rev-parse --show-toplevel` returns
+  // the long form, so path.relative walks clean out of the repo and the nudge
+  // emits nothing. A symlinked cwd creates the same real-vs-alias split (git
+  // resolves to the physical path; the hook payload carries the alias) — the fix
+  // canonicalizes both sides before deriving the repo-relative path.
+  const { root, home } = scratch();
+  const linkRoot = `${root}-link`;
+  try {
+    fs.symlinkSync(root, linkRoot, "dir");
+  } catch {
+    t.skip("symlinks unavailable on this host");
+    return;
+  }
+  const cwd = path.join(linkRoot, "projx"); // basename stays `projx` -> slug projx
+  writeNorm(path.join(home, "nodes"), "norm-projx-api-docs", {
+    title: "src changes update the API docs",
+    extra: "project: projx\n",
+    when: ["src/**"],
+    also: ["API.md"],
+  });
+  const out = await runAsync(["post-tool", "--host", "claude-code"], editPayload(cwd), freshEnv(home));
+  const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /You edited src\/code\.js/);
+  assert.match(ctx, /norm-projx-api-docs/);
+});
+
 test("once per (session, norm): a second matching edit is silent, a NEW norm still fires", async () => {
   const { home, cwd } = scratch();
   const nodes = path.join(home, "nodes");
