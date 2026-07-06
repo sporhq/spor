@@ -176,6 +176,38 @@ SessionEnd distiller is the backstop that still captures it. The default
 synchronous path is byte-identical (the drain and its syscalls are gated on the
 flag). See test/nudge-async.test.js.
 
+The prompt-context engine's digest has the same async pattern as an INTENT GATE
+(issue-spor-user-prompt-submit-digest-noise,
+dec-spor-digest-noise-needs-async-semantic-intent): the digest over-fires on
+high-similarity LEXICAL false-matches that no fire-gate threshold separates
+(the eval, art-spor-digest-noise-eval-2026-06-25 — F1 peaks at the current
+min-sim 0.08), so the residual gate must be semantic, i.e. an LLM call, which
+cannot live on the prompt path. `SPOR_DIGEST_ASYNC=1` (`digest.async`, default
+off) moves it off: UserPromptSubmit runs the deterministic gates + compile
+exactly as before, but instead of injecting it spools the micro-digest
+(`journal/pending-digests/<session>/<hash>.in.json`) to a DETACHED worker
+(`scripts/engines/digest-worker.js`, spawned like nudge-worker.js) that asks a
+backend whether injecting that context would help the prompt's work
+(`prompts/client/digest-intent.md`; backend `SPOR_DIGEST_INTENT_CMD` /
+`digest.intentCmd`, same stdin→stdout contract as `SPOR_NUDGE_CMD`; default
+`claude -p --model haiku`; bounded by `SPOR_DIGEST_INTENT_TIMEOUT` /
+`digest.intentTimeoutMs`, default 30000). Only an explicit UNWARRANTED verdict
+suppresses — a backend failure or unparseable reply still writes the result
+file, so the classifier can only REMOVE noise, never lose a warranted digest.
+The NEXT UserPromptSubmit drains the newest result and injects it with NO LLM
+call (norm-cc-no-llm-prompt-path), consuming superseded snapshots and deduping
+against the last injected signature (`journal/<session>.digest-injected`).
+Spend is capped by `SPOR_DIGEST_INTENT_MAX` (`digest.intentMaxCalls`, default
+20 classifier spawns/session, one line each in
+`journal/<session>.digest-intent`); at the cap — or on any spool/spawn failure
+— the engine falls open to the shipped SYNCHRONOUS injection (and a pending
+result arriving beside a synchronous digest is consumed, not double-injected).
+The default path is byte-identical (spool, drain, and their syscalls are all
+gated on the flag), and the same one-turn-delay tradeoff as the async capture
+nudge applies: a digest for a session's final prompt is dropped. Enabling it by
+default is deliberately deferred until the classifier is scored against the
+eval's `warranted` labels. See test/digest-async.test.js.
+
 The post-tool engine ALSO carries the coupling nudge
 (task-spor-coupling-nudge-posttool, dec-spor-coupling-norms-declared-first) —
 BOTH modes, deterministic, NO LLM: on every Write/Edit it glob-matches the

@@ -317,6 +317,196 @@ ${blocks}
 If a finding is durable, capture it NOW — one /spor:defer (or capture tool) call per finding, in your own words with full context. If none are durable, dismiss this consciously and move on. (Classifier: source=nudge, async; disable with SPOR_NUDGE=0 or SPOR_NUDGE_ASYNC=0.)`;
 }
 
+// dec-spor-digest-noise-needs-async-semantic-intent: the digest over-fires (91%
+// of prompts, ~48% warranting none — art-spor-digest-noise-eval-2026-06-25) on
+// high-similarity LEXICAL false-matches that no fire-gate threshold separates,
+// so the residual gate must be semantic — an LLM call, which cannot live on the
+// 30s prompt path (norm-cc-no-llm-prompt-path). digest.async moves it off:
+// instead of injecting, spool the computed micro-digest and hand it to a
+// DETACHED worker (digest-worker.js) that classifies the prompt's intent; the
+// NEXT UserPromptSubmit drains the verdict-passing result with NO LLM call —
+// the one-turn-delayed injection the decision blesses. Returns "" once the job
+// is spooled; returns the digest UNCHANGED (the shipped synchronous injection)
+// on the per-session spawn cap or any spool/spawn failure — fail-open here
+// means "inject as before", never "silently withhold a digest".
+function spoolDigestIntent(graph, input, slug, prompt, digest) {
+  const session = input.session_id ?? "unknown";
+
+  // Per-session ceiling on classifier spawns (digest.intentMaxCalls /
+  // SPOR_DIGEST_INTENT_MAX): the digest fires on most substantive prompts, so
+  // without a cap a long session pays one backend call per prompt. One state
+  // line per spawn (the digest's signature — free observability).
+  const state = path.join(graph, "journal", `${session}.digest-intent`);
+  let calls = 0;
+  try {
+    calls = fs.readFileSync(state, "utf8").split("\n").filter(Boolean).length;
+  } catch {}
+  if (calls >= u.cfgNum("digest.intentMaxCalls", "DIGEST_INTENT_MAX", 20)) return digest;
+
+  const tplFile = path.join(u.ROOT, "prompts", "client", "digest-intent.md");
+  if (!fs.existsSync(tplFile)) return digest;
+  const vars = { SLUG: slug, PROMPT: prompt, DIGEST: digest };
+  const job = {
+    prompt: u.fillTemplate(u.stripTrailingNewlines(fs.readFileSync(tplFile, "utf8")), vars),
+    tplSha: u.sha256Head(tplFile),
+    session,
+    slug,
+    graph,
+    timeoutMs: u.cfgNum("digest.intentTimeoutMs", "DIGEST_INTENT_TIMEOUT", 30000),
+    cmd: u.cfgStr("digest.intentCmd", "DIGEST_INTENT_CMD") || u.hostDefaultBackendCmd("nudge") || "",
+    vars,
+    digest,
+    sig: digestSignature(digest),
+  };
+
+  const spoolDir = path.join(graph, "journal", "pending-digests", session);
+  if (!u.ensureDir(spoolDir)) return digest;
+  const hash = `${Date.now()}-${u.bashRandom()}`;
+  const inFile = path.join(spoolDir, `${hash}.in.json`);
+  try {
+    fs.writeFileSync(inFile, JSON.stringify({ ...job, hash }));
+  } catch {
+    return digest;
+  }
+  u.appendLine(state, job.sig);
+  u.appendLine(
+    path.join(graph, "journal", `${session}.jsonl`),
+    JSON.stringify({ ts: u.jqNow(), project: slug, tool: "digest-intent-spawn" })
+  );
+  u.spawnDetached([path.join(__dirname, "digest-worker.js"), inFile]);
+  return "";
+}
+
+// The prompt-time drain for digest.async: pick up the worker's pending digest
+// results and inject the newest with NO LLM call. Unlike capture-nudge findings
+// (independent per-file facts), pending digests are competing snapshots of the
+// same session's context — the latest supersedes the rest — so every file is
+// consumed but only the newest injects. `suppress` consumes without injecting
+// (the caller is already injecting a fresh synchronous digest this prompt — the
+// cap/fail-open fallback — and a stale pending one beside it is exactly the
+// noise this gate exists to cut). A drained digest is deduped against the last
+// one injected this session (journal/<session>.digest-injected) so a same-topic
+// prompt run doesn't re-inject identical context every turn.
+function drainPendingDigests(graph, input, slug, { suppress = false } = {}) {
+  const session = input.session_id ?? "unknown";
+  const dir = path.join(graph, "journal", "pending-digests", session);
+  let all;
+  try {
+    all = fs.readdirSync(dir);
+  } catch {
+    return ""; // no spool dir for this session
+  }
+
+  let result = null;
+  for (const f of all.filter((n) => n.endsWith(".out.json")).sort()) {
+    const fp = path.join(dir, f);
+    let r = null;
+    try {
+      r = JSON.parse(fs.readFileSync(fp, "utf8"));
+    } catch {}
+    try {
+      fs.unlinkSync(fp);
+    } catch {}
+    if (r && r.digest) result = r; // sorted ascending — the last valid one is newest
+  }
+
+  // GC orphaned inputs whose detached worker never ran (same bound and same
+  // deliberate no-rmdir as the nudge spool — see drainPendingNudges).
+  try {
+    const now = Date.now();
+    for (const f of all) {
+      if (!f.endsWith(".in.json")) continue;
+      const fp = path.join(dir, f);
+      try {
+        if (now - fs.statSync(fp).mtimeMs > PENDING_ORPHAN_MS) fs.unlinkSync(fp);
+      } catch {}
+    }
+  } catch {}
+
+  if (!result || suppress) return "";
+
+  const injState = path.join(graph, "journal", `${session}.digest-injected`);
+  let lastSig = "";
+  try {
+    const lines = fs.readFileSync(injState, "utf8").split("\n").filter(Boolean);
+    lastSig = lines[lines.length - 1] || "";
+  } catch {}
+  const sig = result.sig || digestSignature(result.digest);
+  if (sig === lastSig) return "";
+  u.appendLine(injState, sig);
+  u.appendLine(
+    path.join(graph, "journal", `${session}.jsonl`),
+    JSON.stringify({ ts: u.jqNow(), project: slug, tool: "digest", async: true })
+  );
+  return result.digest;
+}
+
+// The intent-classifier call itself, run by scripts/engines/digest-worker.js
+// OFF the prompt path. Same backend seam as the capture nudge (prompt on
+// stdin -> verdict on stdout; default `claude -p --model haiku`), recorded to
+// journal/llm-calls as source "digest-intent" for the nightly review loop.
+// Returns "WARRANTED" | "UNWARRANTED" | null (backend failure / unparseable).
+// The verdict only ever REMOVES noise: the worker treats anything but an
+// explicit UNWARRANTED as inject, so a broken backend degrades to the shipped
+// inject-everything behavior instead of silently eating warranted digests.
+function classifyDigestIntent({ prompt, tplSha, session, slug, graph, timeoutMs, cmd, vars }) {
+  const llmDir = path.join(graph, "journal", "llm-calls");
+  const t0 = Date.now();
+  let backend = "";
+  let usage = null;
+  let cost_usd = null;
+  let model = null;
+  const recordLlm = (response, error) => {
+    if (!u.ensureDir(llmDir)) return;
+    const rec = {
+      id: `llm-${Date.now()}-${u.bashRandom()}`,
+      ts: u.isoMs(),
+      source: "digest-intent",
+      backend,
+      template: "digest-intent.md",
+      template_sha: tplSha,
+      session,
+      project: slug,
+      latency_ms: Date.now() - t0,
+      usage,
+      cost_usd,
+      model,
+      prompt,
+      vars,
+      response: error === "" ? response : null,
+      error: error === "" ? null : error,
+    };
+    u.appendLine(path.join(llmDir, `${u.localDate()}.jsonl`), JSON.stringify(rec));
+  };
+
+  let response;
+  if (cmd) {
+    backend = `cmd:${cmd}`;
+    response = u.runBackendCmd(cmd, prompt, { timeoutMs });
+    if (response === null) {
+      recordLlm("", "digest-intent cmd failed");
+      return null;
+    }
+  } else {
+    backend = "cli:claude -p --model haiku";
+    const res = u.runClaudeBackend(prompt, { timeoutMs });
+    if (res === null) {
+      recordLlm("", "claude -p failed");
+      return null;
+    }
+    response = res.text;
+    usage = res.usage;
+    cost_usd = res.cost_usd;
+    model = res.model;
+  }
+  recordLlm(response, "");
+
+  // "WARRANTED" is a substring of "UNWARRANTED" — test the negative first.
+  if (/\bUNWARRANTED\b/.test(response)) return "UNWARRANTED";
+  if (/\bWARRANTED\b/.test(response)) return "WARRANTED";
+  return null;
+}
+
 async function promptContext(input) {
   // Headless backend invocations (the capture ingester, the fact-finder
   // distiller, the nudge classifier — every spawn site exports the
@@ -340,7 +530,25 @@ async function promptContext(input) {
       ? drainPendingNudges(graph, input, slug)
       : "";
 
-  const digest = await computeDigest(input, graph, slug);
+  let digest = await computeDigest(input, graph, slug);
+
+  // digest.async (dec-spor-digest-noise-needs-async-semantic-intent): gate the
+  // digest behind the off-prompt-path intent classifier. The compute above ran
+  // exactly as before; here it is spooled instead of injected (spool returns
+  // the digest unchanged on the spawn cap / spool failure — synchronous
+  // fail-open), and whatever the worker cleared LAST prompt drains in with no
+  // LLM call. Both branches are gated on the flag, so the default path adds no
+  // syscall and stays byte-identical.
+  if (u.cfgBool("digest.async", "DIGEST_ASYNC", false)) {
+    const fresh = digest
+      ? spoolDigestIntent(graph, input, slug, stripSystemReminders(input.prompt ?? ""), digest)
+      : "";
+    // The drain always runs (consuming stale results) — suppressed from
+    // injecting only when a fresh synchronous digest already takes the slot.
+    const pending = drainPendingDigests(graph, input, slug, { suppress: !!fresh });
+    digest = fresh || pending;
+  }
+
   const parts = [pendingNudge, digest].filter(Boolean);
   if (!parts.length) return null;
   // Cap the combined context at the host's 10KB additionalContext ceiling so a
@@ -438,4 +646,12 @@ async function computeDigest(input, graph, slug) {
   return microDigest(digest);
 }
 
-module.exports = { promptContext, mergeDigests, isContinuationPrompt, microDigest, drainPendingNudges };
+module.exports = {
+  promptContext,
+  mergeDigests,
+  isContinuationPrompt,
+  microDigest,
+  drainPendingNudges,
+  drainPendingDigests,
+  classifyDigestIntent,
+};
