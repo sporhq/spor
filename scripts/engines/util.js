@@ -425,7 +425,14 @@ const GC_KEEP = new Set(["load-latency.jsonl"]);
 // Prune stale per-session subdirectories under journal/pending-nudges/ — the
 // async-classifier pending-result dirs (task-cc-async-classifier-pending-result-
 // injection), keyed by session and otherwise orphaned once that session ends.
-function gcPendingNudges(dir, cutoff, session, stat) {
+// `liveSessions` is the same concurrently-live set gcJournal derived from the
+// root-level bucket sweep (a session whose OTHER journal artifacts are fresh) —
+// a pending-nudges/<session> dir is exempted if EITHER its own mtime is fresh
+// OR the session is live by that bucket signal, because a detached
+// nudge-worker can be mid-flight (spooled, not yet written back) for a session
+// that hasn't touched this specific directory recently (review finding: relying
+// on the directory's own mtime alone missed a concurrently-live OTHER session).
+function gcPendingNudges(dir, cutoff, session, stat, liveSessions) {
   let subs;
   try {
     subs = fs.readdirSync(dir, { withFileTypes: true });
@@ -435,6 +442,7 @@ function gcPendingNudges(dir, cutoff, session, stat) {
   for (const s of subs) {
     if (!s.isDirectory()) continue;
     if (session && s.name === session) continue; // never sweep the live session
+    if (liveSessions && liveSessions.has(s.name)) continue; // concurrently-live elsewhere
     const full = path.join(dir, s.name);
     let m;
     try {
@@ -553,7 +561,11 @@ function gcJournal(graph, opts = {}) {
     }
 
     // Prune a session bucket only when its newest file is older than the cutoff.
-    for (const files of buckets.values()) {
+    // Track which OTHER sessions are concurrently live by this signal, so the
+    // pending-nudges sweep below can extend the same protection to a session's
+    // spool dir even when the dir's own mtime looks stale (review finding).
+    const liveSessions = new Set();
+    for (const [sess, files] of buckets) {
       let newest = 0;
       for (const f of files) {
         try {
@@ -563,7 +575,10 @@ function gcJournal(graph, opts = {}) {
           /* a file that vanished mid-sweep doesn't affect the bucket's age */
         }
       }
-      if (newest === 0 || newest >= cutoff) continue; // active bucket (or all unreadable)
+      if (newest === 0 || newest >= cutoff) {
+        liveSessions.add(sess);
+        continue; // active bucket (or all unreadable)
+      }
       for (const f of files) {
         try {
           fs.unlinkSync(f);
@@ -586,7 +601,7 @@ function gcJournal(graph, opts = {}) {
         /* vanished / unreadable */
       }
     }
-    if (pending) gcPendingNudges(pending, cutoff, session, stat);
+    if (pending) gcPendingNudges(pending, cutoff, session, stat, liveSessions);
   } catch {
     /* fail-open — GC must never cost the session */
   }

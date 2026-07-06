@@ -127,6 +127,24 @@ test('keeps a concurrently-live session: a stale marker survives beside a fresh 
   assert.ok(fs.existsSync(path.join(journal, `${other}.jsonl`)));
 });
 
+test('a concurrently-live session also keeps its stale pending-nudges dir (review finding)', () => {
+  const { graph, journal } = scratch();
+  // Session B is concurrently live (fresh .jsonl, protected by the bucket
+  // signal) but its pending-nudges/<B>/ spool dir has not itself been touched
+  // recently (its last async nudge job completed a while ago). A detached
+  // nudge-worker could still be mid-flight for B on a fresh job that simply
+  // hasn't written back yet; relying on the pending dir's OWN mtime alone
+  // would reap it out from under a live session (dec-cc-fail-open-hooks's
+  // "never reap a live session" guarantee must extend to the async spool).
+  const other = 'sess-other-pending';
+  aged(journal, `${other}.jsonl`, 1); // still appending events => live
+  agedDir(path.join(journal, 'pending-nudges'), other, 30); // stale dir mtime
+
+  const stat = u.gcJournal(graph, { force: true, session: 'sess-triggering' });
+  assert.equal(stat.removed, 0, "the live session's pending-nudges dir must not be reaped");
+  assert.ok(fs.existsSync(path.join(journal, 'pending-nudges', other)));
+});
+
 test("protects the live session's hashed prompt-context cache, prunes an ended one", () => {
   const { graph, journal } = scratch();
   const live = 'sess-live-ctx';
