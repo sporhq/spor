@@ -10,7 +10,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const crypto = require('node:crypto');
 
 const u = require('../scripts/engines/util');
 
@@ -44,6 +44,12 @@ function agedDir(base, session, ageDays) {
   return full;
 }
 
+// The prompt-context cache filename for a session (mirrors prompt-context.js statePath).
+function promptCtxName(session) {
+  const h = crypto.createHash('sha256').update(String(session), 'utf8').digest('hex').slice(0, 16);
+  return `prompt-context-${h}.json`;
+}
+
 test('prunes stale per-session artifacts, keeps fresh and durable ones', () => {
   const { graph, journal } = scratch();
   // Stale (30d) per-session artifacts of a DIFFERENT, ended session — prunable.
@@ -72,9 +78,8 @@ test('prunes stale per-session artifacts, keeps fresh and durable ones', () => {
 
   const stat = u.gcJournal(graph, { force: true });
   assert.equal(stat.ran, true);
-  assert.equal(stat.removed, 7, 'six stale files + one stale pending dir');
+  assert.equal(stat.removed, 7, 'five stale session files + one prompt-context + one pending dir');
 
-  // Stale, ended-session artifacts gone.
   for (const n of [`${old}.jsonl`, `${old}.nudged`, `${old}.claim-nudged`, `${old}.coupling-nudged`, `${old}.heartbeat`, 'prompt-context-abc123.json']) {
     assert.equal(fs.existsSync(path.join(journal, n)), false, `${n} should be pruned`);
   }
@@ -92,10 +97,9 @@ test('prunes stale per-session artifacts, keeps fresh and durable ones', () => {
   assert.ok(fs.existsSync(path.join(journal, 'llm-calls', '2026-01-01.jsonl')), 'llm-calls telemetry kept');
 });
 
-test('never sweeps the live session even when its files are stale', () => {
+test('never sweeps the triggering session even when its files are stale', () => {
   const { graph, journal } = scratch();
   const live = 'sess-live';
-  // A stale-mtime file for the CURRENTLY-running session (clock skew / long idle).
   aged(journal, `${live}.jsonl`, 30);
   aged(journal, `${live}.heartbeat`, 30);
   agedDir(path.join(journal, 'pending-nudges'), live, 30);
@@ -107,33 +111,70 @@ test('never sweeps the live session even when its files are stale', () => {
   assert.ok(fs.existsSync(path.join(journal, 'pending-nudges', live)));
 });
 
+test('keeps a concurrently-live session: a stale marker survives beside a fresh .jsonl', () => {
+  const { graph, journal } = scratch();
+  // A session (NOT the one triggering GC) whose write-once .nudged marker is old
+  // but whose event log is fresh — it is still live and must not be reaped.
+  const other = 'sess-other';
+  aged(journal, `${other}.nudged`, 30); // written once, long ago
+  aged(journal, `${other}.claim-nudged`, 30);
+  aged(journal, `${other}.jsonl`, 1); // still appending events => live
+
+  const stat = u.gcJournal(graph, { force: true, session: 'sess-triggering' });
+  assert.equal(stat.removed, 0, 'the whole bucket is protected by its newest file');
+  assert.ok(fs.existsSync(path.join(journal, `${other}.nudged`)));
+  assert.ok(fs.existsSync(path.join(journal, `${other}.claim-nudged`)));
+  assert.ok(fs.existsSync(path.join(journal, `${other}.jsonl`)));
+});
+
+test("protects the live session's hashed prompt-context cache, prunes an ended one", () => {
+  const { graph, journal } = scratch();
+  const live = 'sess-live-ctx';
+  // Backdated well past the cutoff (clock step / restored backup) — must survive.
+  aged(journal, promptCtxName(live), 30);
+  // A different, ended session's stale prompt-context cache — prunable.
+  aged(journal, promptCtxName('sess-gone'), 30);
+
+  const stat = u.gcJournal(graph, { force: true, session: live });
+  assert.equal(stat.removed, 1);
+  assert.ok(fs.existsSync(path.join(journal, promptCtxName(live))), "live session's cache kept");
+  assert.equal(fs.existsSync(path.join(journal, promptCtxName('sess-gone'))), false, 'ended cache pruned');
+});
+
 test('throttles to once per interval via the .gc-stamp cooldown', () => {
   const { graph, journal } = scratch();
   aged(journal, 'sess-a.jsonl', 30);
 
-  // First run (no stamp yet) is due; it stamps and sweeps.
   const first = u.gcJournal(graph, {});
   assert.equal(first.ran, true);
   assert.equal(first.removed, 1);
   assert.ok(fs.existsSync(path.join(journal, '.gc-stamp')));
 
-  // A second stale file, then an immediate re-run — throttled, no sweep.
   aged(journal, 'sess-b.jsonl', 30);
   const second = u.gcJournal(graph, {});
   assert.equal(second.ran, false);
   assert.ok(fs.existsSync(path.join(journal, 'sess-b.jsonl')), 'not swept while throttled');
 
-  // force bypasses the throttle.
   const forced = u.gcJournal(graph, { force: true });
   assert.equal(forced.ran, true);
   assert.equal(forced.removed, 1);
 });
 
-test('respects the age threshold (nothing older than maxAgeMs)', () => {
+test('a readdir failure does not consume the interval (no stamp written)', () => {
+  const { graph, journal } = scratch();
+  // Replace the journal dir with a FILE so readdir throws (ENOTDIR).
+  fs.rmSync(journal, { recursive: true, force: true });
+  fs.writeFileSync(journal, 'not a dir');
+  const stat = u.gcJournal(graph, {});
+  assert.equal(stat.ran, false);
+  // No stamp was written into (the non-existent) journal dir, so nothing swallowed.
+  assert.equal(stat.removed, 0);
+});
+
+test('respects the age threshold (nothing newer than maxAgeMs)', () => {
   const { graph, journal } = scratch();
   aged(journal, 'sess-5d.jsonl', 5);
   aged(journal, 'sess-20d.jsonl', 20);
-  // Custom 10-day cutoff: only the 20d file is stale.
   const stat = u.gcJournal(graph, { force: true, maxAgeMs: 10 * DAY });
   assert.equal(stat.removed, 1);
   assert.ok(fs.existsSync(path.join(journal, 'sess-5d.jsonl')));
