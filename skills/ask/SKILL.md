@@ -23,7 +23,7 @@ One command — `spor ask` resolves the graph (local vs team), the project, and
 your identity on its own:
 
 ```bash
-spor ask "<the question>"
+spor ask "Does spor next accept a repo-<slug> node id, or only a bare slug?"
 ```
 
 If the question is *about* known graph nodes, name them with `--mention <id>`

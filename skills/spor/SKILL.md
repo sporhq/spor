@@ -104,7 +104,7 @@ spor schema [<type>]           # introspect the live registry (types/prefixes/we
                                #   seed + resident overrides, provenance-tagged) — query this, don't
                                #   read lib/seed/. Remote reflects the server's registry (GET /v1/schema)
 spor add "<2-3 sentences>"     # capture a node (typed file locally; /v1/capture remotely)
-spor ask "<question>"          # file a question the graph can't answer (open question node locally; routed via /v1/questions remotely)
+spor ask "Does the queue's assignee filter union stewards edges or only direct assigned edges?"  # file a question the graph can't answer (open question node locally; routed via /v1/questions remotely)
 spor correct <target> "<text>" # standing briefing correction (corr file locally; /v1/corrections remotely)
 spor priority <id> <p1|p2|p3|clear>  # set/clear queue human-triage priority (local: rewrite frontmatter; remote: /v1/nodes/{id}/priority)
 spor set-status <id> <status>  # flip a node's status — an active status (active/open) also CLAIMS it (local: rewrite frontmatter; remote: /v1/nodes/{id}/status)
