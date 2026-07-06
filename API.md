@@ -95,26 +95,6 @@ schema may carry a `get(node, ctx)` hook (GRAPH.md) that attaches derived
 context as extra top-level keys — e.g. `resolution` (what answered/resolved
 this node). These are additive; a client ignores keys it does not know.
 
-### `explore_graph`
-
-Browse/map the team graph's **structure** — a bounded neighborhood as plain
-nodes + typed edges, each node carrying truth flags
-(`superseded`/`resolved`/`blocked`) and a count of further unexpanded
-neighbors (`more`). Input `{ "root_id"?, "query"?, "depth"?, "limit"? }` → the
-view-tree slice (`view`, `node_ids`) plus a text rendering. Call with **no
-arguments** for the birds-eye programs overview — every umbrella root (any
-node other work `blocks`) with resolution-derived completion %, most complete
-first. Pass `root_id` to walk outward from one node (depth 1-2, deterministic,
-no LLM; default depth 1, limit 40 capped at 80); pass `query` instead to seed
-the roots by relevance. The two are mutually exclusive; `root_id` wins when
-both are given, and an unknown `root_id` is an error (`unknown_root`) rather
-than an empty result — the same precedence `/v1/digest`'s `root`/`query` pair
-uses (§3). Re-call with a neighbor's id as `root_id` to expand the frontier —
-the browse/map twin of `query_graph`'s recursive deepen, for structure rather
-than compiled digests. In MCP-Apps hosts this renders the
-interactive graph navigator (lineage bands, expand/re-root, node inspector);
-elsewhere it returns the same slice as text. **MCP-only — no REST twin.**
-
 ### `put_node`
 
 Input:
@@ -205,31 +185,6 @@ read-modify-write — no client revision round-trip — and it stamps
 so an agent-set priority is distinguishable from human triage
 (issue-cc-priority-attribution-gap). The CLI wrapper is `spor priority <id>
 <p1|p2|p3|clear>`.
-
-### `reserve`
-
-The fifth task-lease action (dec-cc-task-resumption-reservation), alongside
-`claim`/`renew`/`extend`/`release` — all five share one ephemeral per-node
-lease table and one REST route family (`POST /v1/nodes/{id}/<action>`, §3).
-Converts your LIVE claim into an owner-exclusive **resumption reservation**
-when a session ends cleanly with the task advanced but unfinished: the
-heartbeat is dropped, `expires` is re-pointed at a grace-window expiry
-(~2 days, tenant policy — a timestamp, not a graph edge), and the durable
-`assigned` edge is kept (so a steward/capacity view still reads "reserved by
-you"). Input `{ "id": "<task node id you hold a claim on>", "session"? }` →
-`{ "ok": true, "status": "reserved", "lease", "grace_window_ms" }`.
-`rankQueue` floats a reservation to the top of the owner's queue while
-dropping it from teammates' actionable lists. Within the grace window the
-reservation still counts as a live lease, so the owner claiming, renewing, or
-extending it drops the `reserved` flag and re-establishes a normal Tier-1
-heartbeat lease; once the grace window lapses the entry is gone (full pool,
-everyone) and `renew`/`extend` return `409 lease_lost` same as any lapsed
-lease — only a fresh `claim` picks the task back up. Reserving itself fails
-`409 lease_lost` (naming the current holder) if you do not hold a live claim
-on the node. The client SessionEnd hook
-(task-cc-client-sessionend-reserve-hook) is the intended caller: it holds the
-transcript, so it is the one thing that can tell "advanced but unfinished"
-(→ reserve) from "finished" (→ release) apart.
 
 ### `propose_correction`
 
@@ -406,18 +361,6 @@ result whose prose says how to model the program (add `blocks` edges from the
 gating tasks). Unknown `id` errors with `{ "found": false, "error":
 "unknown_root" }`. The REST twin is `GET /v1/program/{id}` (§3).
 
-### `apply_lens_action`
-
-App-only execution door for one declarative action on a saved lens's rendered
-item — visible only to MCP-Apps hosts (`_meta.ui.visibility: ["app"]`), not a
-tool a model calls directly. Input `{ "lens_id", "action_id", "target_id",
-"params"? }`. The server re-runs the lens, verifies the target and action are
-still eligible, resolves authenticated-viewer parameter bindings, and passes
-the scalar update through the target node's schema `validate()`/`transitions()`
-gate — the same write discipline as `set_status`, reached through a lens's
-declarative action instead of a direct mutation call. **MCP-only — no REST
-twin.**
-
 ### `recent_changes`
 
 The team's recent-activity feed — the temporal entry point the other read
@@ -482,12 +425,6 @@ additive: hosts without the apps surface ignore `_meta.ui` and show the text
 content. Write-path actions are not emitted; writes stay with the tools
 above.
 
-`hello_mcp_app` is the minimal debug twin: a no-input, no-op tool that
-renders a tiny hello-world widget, used only to check whether a host can
-mount an MCP app resource for the Spor connector at all — it intentionally
-bypasses the queue view-tree renderer and carries no graph semantics of its
-own. **MCP-only — no REST twin.**
-
 ## 3. REST surface (`/v1/*`)
 
 Plain HTTPS + JSON, bearer auth on every route, versioned under `/v1/`. Each
@@ -516,7 +453,6 @@ endpoint is the REST twin of a core call:
 | `POST /v1/nodes/{id}/renew` `{session?}` | post-tool heartbeat, `renew` MCP tool, `spor renew` CLI, `spor dispatch` | bump the live lease's expiry only — no commit; the heartbeat that keeps a claim from lapsing. A lapsed/stolen lease is `409` (names the current holder). Person-scoped: any of the claimer's sessions may renew; a `session` binds the lease to that run (`spor dispatch` uses this to bind the captured `claude --bg` session post-launch) |
 | `POST /v1/nodes/{id}/extend` `{ms, session?}` | `extend` MCP tool, `spor extend` CLI | manually stretch your live lease by `ms` milliseconds for a known long idle gap → `{ok, status, lease, capped_to_max?, claim_ttl_max_ms?}`. Bounded by the tenant's `claim_ttl_max` policy (a request past the ceiling caps to it, flagged `capped_to_max`); never shortens a lease. `ms` must be a positive number (`spor extend <id> <2h|45m|…>` parses the human duration client-side). A lapsed/stolen lease is `409 lease_lost` naming the holder |
 | `POST /v1/nodes/{id}/release` | `release` MCP tool, `spor release` CLI | drop the lease AND retire the durable `assigned` edge, returning the node to the pool. Idempotent (releasing a node you hold no lease on still succeeds, cleaning up any lingering `assigned` edge of yours); releasing a claim someone else holds is `409` naming the holder |
-| `POST /v1/nodes/{id}/reserve` `{session?}` | `reserve` MCP tool, client SessionEnd hook (task-cc-client-sessionend-reserve-hook) | convert your live claim into an owner-exclusive resumption reservation (dec-cc-task-resumption-reservation) when a session ends cleanly with the task advanced but unfinished → `{ok, status: "reserved", lease, grace_window_ms}`. Drops the heartbeat, re-points `expires` at a grace-window expiry (~2 days, tenant policy — a timestamp, not a graph edge), and keeps the durable `assigned` edge so a steward view still reads "reserved by you"; `rankQueue` floats it to the top of the owner's queue while dropping it from teammates' actionable lists until the grace window lapses (full pool, everyone) or the owner claims/renews/extends it within that window (drops the `reserved` flag, back to a normal heartbeat lease). `409 lease_lost` (naming the holder) if you do not hold a live claim |
 | `POST /v1/nodes/{id}/commits` `{repo, sha}` | post-tool / link-commits | `link_commit`: append `repo@sha` to the node's `commits:` list (kebab-case repo slug, 7–40 lowercase hex, ≤40 commits per node); idempotent, prefix-aware dedup |
 | `GET /v1/commits/{sha}?repo=` | `spor blame`/`commits` CLI verb; sessions doing git archaeology | sha → nodes lookup over the `commits:` fields (≥7 hex, abbreviated or full); each match carries `{repo, sha, id, type, title, summary, status, project}` — blame a line, get the why. The `spor blame <sha> [--repo <slug>]` CLI verb (alias `spor commits <sha>`) wraps this remotely and runs the same lookup over the local graph in local mode (`lib/query.js` `lookupCommit`) |
 | `GET /v1/changes?since=&project=&limit=` | `recent_changes`'s REST twin; audit review | the remote audit trail: a git-log projection over `nodes/` → `{changes: [{id, change, commit, date, committed_by, type, title, authored_via, author}], count, head, since, generated_at}`, newest change per node first. `since` is a 7–40 hex sha (`sha..HEAD`) or a date/relative phrase git understands (`--since`); an unresolvable sha is `422`. `project` scopes to one project's nodes (deletions are omitted when scoped, their project being gone). `limit` bounds nodes returned (default 100, **max 500**). Each entry's `authored_via` is the current machine-vs-human signal (`capture`/`distill`/`gardener` = machine). Lets a remote client review what agents wrote without the whole `/v1/export` tarball |
@@ -627,23 +563,6 @@ anything with a token.
   `{name, email}` attribution record. Access tokens are `spor_oat_…` (30d;
   legacy `sub_oat_…` accepted); refresh tokens are `spor_ort_…` (90d,
   rotating, single-use). Authorization codes are single-use, 10-minute.
-- **Connector grant teardown — token-scoped revocation (RFC 7009).**
-  `POST /oauth/revoke` `{token, token_type_hint?}` ends exactly the grant
-  that `token` (access or refresh) belongs to and nothing else — the
-  caller's PATs and any other connector grants for the same identity are
-  untouched. This is the narrow, safe way to disconnect one MCP connector
-  (e.g. removing it from a host's settings), distinct from the identity-wide
-  cascades: `DELETE /v1/me/tokens/{hash-prefix}` (§3) revokes a PAT plus
-  every grant *it* minted, and the admin offboarding cascade revokes
-  *every* grant for a person — using either of those to "clean up one
-  connector" collaterally logs out the identity's other live sessions
-  (issue-spor-teardown-revoke-by-identity-logs-out-operator;
-  dec-spor-pat-revoke-cascade-token-scoped). Like the rest of the
-  `/oauth/*` surface it is unversioned and takes no bearer — public client,
-  the token being revoked is itself the credential. Per RFC 7009 §2.2 the
-  response is always `200` whether or not `token` was known (anything else
-  is an unauthenticated validity oracle), so success never confirms the
-  token existed.
 - **CLI interactive sign-in — the device authorization grant.** `spor auth
   login` (flat alias `spor login`) defaults to the OAuth 2.0 device
   authorization grant (RFC 8628), brokered at the Spor front door so it works

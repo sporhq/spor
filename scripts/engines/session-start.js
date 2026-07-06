@@ -281,19 +281,6 @@ async function sessionStart(input) {
     /* best effort */
   }
 
-  // Periodic journal garbage collection (task-spor-client-journal-gc): prune the
-  // stale per-session artifacts (the <session>.jsonl logs, .nudged/.claim-nudged/
-  // .coupling-nudged/.heartbeat markers, prompt-context caches, pending-nudges
-  // dirs) that otherwise accumulate unbounded in journal/. Session-start is the
-  // natural periodic trigger; the sweep self-throttles (once per gc.intervalMs)
-  // and is fail-open. Runs in both modes — the journal fills in both. The live
-  // session id is passed so its own in-flight files are never swept.
-  try {
-    u.gcJournal(graph, { session: input.session_id });
-  } catch {
-    /* best effort — GC never blocks session-start */
-  }
-
   // Learn where this slug lives on THIS machine (slug -> checkout path), so
   // `spor dispatch` can later launch `claude --bg` in the right repo without a
   // path map in the shared graph (paths differ per teammate; repo nodes carry

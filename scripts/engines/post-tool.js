@@ -120,22 +120,7 @@ async function nudge({ input, graph, slug, session, file, remote }) {
     stateLines = fs.readFileSync(state, "utf8").split("\n").filter(Boolean);
   } catch {}
   if (stateLines.some((l) => l.split("\t").slice(1).join("\t") === file)) return null;
-  // Async mode (task-cc-async-classifier-pending-result-injection) runs the
-  // classifier OFF the tool loop: the outcome isn't known when the hook returns,
-  // so the fired-nudge cap can't be read from `.nudged` (which only ever holds a
-  // `pending\t<file>` reservation there). It's approximated instead by nudges
-  // already INJECTED this session (grows on drain) PLUS results already WAITING
-  // in the spool (workers that finished with facts but haven't been drained
-  // yet). Best-effort — workers complete out of band, so a same-turn burst can
-  // still race ahead of the count — but combined with nudge.maxCalls it keeps
-  // async spend near the synchronous 3-fired early-stop instead of running all
-  // the way to maxCalls. Sync mode is byte-identical: the fired count is the
-  // `<facts>\t<file>` lines with facts > 0, exactly as before.
-  const asyncMode = u.cfgBool("nudge.async", "NUDGE_ASYNC", false);
-  const fired = asyncMode
-    ? injectedNudgeCount(graph, session) + pendingResultCount(graph, session)
-    : stateLines.filter((l) => Number(l.split("\t")[0]) > 0).length;
-  if (fired >= 3) return null;
+  if (stateLines.filter((l) => Number(l.split("\t")[0]) > 0).length >= 3) return null;
   const maxCalls = u.cfgNum("nudge.maxCalls", "NUDGE_MAX", 20);
   if (stateLines.length >= maxCalls) return null;
 
@@ -179,89 +164,14 @@ async function nudge({ input, graph, slug, session, file, remote }) {
     CONTENT: content,
   });
 
-  // Bound a hung backend so the nudge can't block the tool loop past the host's
-  // PostToolUse budget (nudge.timeoutMs / SPOR_NUDGE_TIMEOUT, default 30s — room
-  // for a ~17s claude -p haiku cold boot, well under the host's 60s).
-  const timeoutMs = u.cfgNum("nudge.timeoutMs", "NUDGE_TIMEOUT", 30000);
-  const nudgeCmd = u.cfgStr("nudge.cmd", "NUDGE_CMD") || u.hostDefaultBackendCmd("nudge") || "";
-  const vars = { SLUG: slug, FILE: file, INDEX: index, CONTENT: content };
-  const job = { prompt, tplSha, session, slug, file, graph, timeoutMs, nudgeCmd, vars };
-
-  // ASYNC mode (task-cc-async-classifier-pending-result-injection): don't run
-  // the classifier here — reserve the file (phase-1 cooldown state) and hand
-  // the job to a DETACHED worker so the tool loop returns immediately. The
-  // worker writes a pending-result file (phase-2 completion state) that the
-  // next UserPromptSubmit drains and injects with NO LLM call
-  // (norm-cc-no-llm-prompt-path). One-turn-delayed nudge, spend/latency fully
-  // off the tool loop. Off by default; the shipped synchronous path below is
-  // byte-identical when nudge.async is unset.
-  if (asyncMode) {
-    const spoolDir = path.join(graph, "journal", "pending-nudges", session);
-    if (!u.ensureDir(spoolDir)) return null;
-    const hash = `${Date.now()}-${u.bashRandom()}`;
-    const inFile = path.join(spoolDir, `${hash}.in.json`);
-    // Write the job spool FIRST; only reserve the file once the input is durable.
-    // A transient write failure then leaves the file UN-reserved so a re-edit can
-    // retry, instead of permanently burning its one classification for the
-    // session (the reservation counts toward nudge.maxCalls and trips the
-    // dedup guard). The `pending` sentinel never counts toward the fired cap
-    // (Number("pending") is NaN).
-    try {
-      fs.writeFileSync(inFile, JSON.stringify({ ...job, hash }));
-    } catch {
-      return null;
-    }
-    // Reserve BEFORE the (best-effort) spawn so a re-edit of the same file in
-    // this session can't double-spawn a classifier. If the spawn never lands the
-    // file just stays reserved — fail-open, no injection, no retry storm.
-    u.appendLine(state, `pending\t${file}`);
-    u.appendLine(
-      path.join(graph, "journal", `${session}.jsonl`),
-      JSON.stringify({ ts: u.jqNow(), project: slug, tool: "nudge-async-spawn", file })
-    );
-    u.spawnDetached([path.join(__dirname, "nudge-worker.js"), inFile]);
-    return null;
-  }
-
-  // SYNCHRONOUS path (the shipped bounded approach): classify in the tool loop.
-  const res = classifyForNudge(job);
-  if (res === null) {
-    u.appendLine(state, `0\t${file}`);
-    return null;
-  }
-  u.appendLine(state, `${res.nfacts}\t${file}`);
-  if (res.nfacts < 1) return null;
-
-  // Journal the fired nudge so lib/capture-metrics.js can correlate
-  // nudges -> subsequent captures.
-  u.appendLine(
-    path.join(graph, "journal", `${session}.jsonl`),
-    JSON.stringify({ ts: u.jqNow(), project: slug, tool: "nudge", file, facts: res.nfacts })
-  );
-
-  return {
-    hookSpecificOutput: {
-      hookEventName: "PostToolUse",
-      additionalContext: NUDGE_CTX(file, u.stripTrailingNewlines(res.facts)),
-    },
-  };
-}
-
-// The classifier call itself, shared by the synchronous nudge (in the tool
-// loop) and the async worker (off it). Picks the backend (SPOR_NUDGE_CMD, the
-// codex-host default, or `claude -p --model haiku`), records the call to
-// journal/llm-calls (same shape as distill, for the nightly review loop), and
-// parses the ===FACT=== blocks. Returns { nfacts, facts } — nfacts 0 / facts ""
-// for a NOTHING verdict — or null when the backend process fails (SIGKILLed
-// timeout, non-zero exit). NEVER writes cooldown/journal state: the two callers
-// own that (sync writes `.nudged`; the worker writes the pending-result spool),
-// so the shared piece stays side-effect-free apart from the llm-call record.
-function classifyForNudge({ prompt, tplSha, session, slug, file, graph, timeoutMs, nudgeCmd, vars }) {
+  // Record to journal/llm-calls (same shape as distill) for the nightly
+  // review loop. Best-effort.
   const llmDir = path.join(graph, "journal", "llm-calls");
   const t0 = Date.now();
   let backend = "";
   // Token usage / cost when the backend reports it (default claude -p JSON
-  // path; SPOR_NUDGE_CMD backends stay null) — task-cc-spor-client-spend-visibility.
+  // path; SPOR_NUDGE_CMD backends stay null) —
+  // task-cc-spor-client-spend-visibility.
   let usage = null;
   let cost_usd = null;
   let model = null;
@@ -281,7 +191,7 @@ function classifyForNudge({ prompt, tplSha, session, slug, file, graph, timeoutM
       cost_usd,
       model,
       prompt,
-      vars: vars || { SLUG: slug, FILE: file },
+      vars: { SLUG: slug, FILE: file, INDEX: index, CONTENT: content },
       response: error === "" ? response : null,
       error: error === "" ? null : error,
     };
@@ -289,11 +199,17 @@ function classifyForNudge({ prompt, tplSha, session, slug, file, graph, timeoutM
   };
 
   let response;
+  // Bound a hung backend so the nudge can't block the tool loop past the host's
+  // PostToolUse budget (nudge.timeoutMs / SPOR_NUDGE_TIMEOUT, default 30s — room
+  // for a ~17s claude -p haiku cold boot, well under the host's 60s).
+  const timeoutMs = u.cfgNum("nudge.timeoutMs", "NUDGE_TIMEOUT", 30000);
+  const nudgeCmd = u.cfgStr("nudge.cmd", "NUDGE_CMD") || u.hostDefaultBackendCmd("nudge");
   if (nudgeCmd) {
     backend = `cmd:${nudgeCmd}`;
     response = u.runBackendCmd(nudgeCmd, prompt, { timeoutMs });
     if (response === null) {
       recordLlm("", "nudge cmd failed");
+      u.appendLine(state, `0\t${file}`);
       return null;
     }
   } else {
@@ -301,6 +217,7 @@ function classifyForNudge({ prompt, tplSha, session, slug, file, graph, timeoutM
     const res = u.runClaudeBackend(prompt, { timeoutMs });
     if (res === null) {
       recordLlm("", "claude -p failed");
+      u.appendLine(state, `0\t${file}`);
       return null;
     }
     response = res.text;
@@ -310,39 +227,29 @@ function classifyForNudge({ prompt, tplSha, session, slug, file, graph, timeoutM
   }
   recordLlm(response, "");
 
-  if (response.includes("NOTHING")) return { nfacts: 0, facts: "" };
+  if (response.includes("NOTHING")) {
+    u.appendLine(state, `0\t${file}`);
+    return null;
+  }
+
   const facts = parseFactList(response);
   const nfacts = facts.split("\n").filter((l) => /^[0-9]/.test(l)).length;
-  return { nfacts, facts };
-}
+  u.appendLine(state, `${nfacts}\t${file}`);
+  if (nfacts < 1) return null;
 
-// Count the capture nudges the prompt-context engine has already injected this
-// session (part of async mode's fired-nudge cap). One line per injected file in
-// journal/<session>.nudged-injected; absent file ⇒ 0.
-function injectedNudgeCount(graph, session) {
-  try {
-    return fs
-      .readFileSync(path.join(graph, "journal", `${session}.nudged-injected`), "utf8")
-      .split("\n")
-      .filter(Boolean).length;
-  } catch {
-    return 0;
-  }
-}
+  // Journal the fired nudge so lib/capture-metrics.js can correlate
+  // nudges -> subsequent captures.
+  u.appendLine(
+    path.join(graph, "journal", `${session}.jsonl`),
+    JSON.stringify({ ts: u.jqNow(), project: slug, tool: "nudge", file, facts: nfacts })
+  );
 
-// Count the async classifier RESULTS already waiting in this session's spool
-// (workers that finished with facts but haven't been drained/injected yet) — the
-// other half of async mode's fired-nudge cap, so a same-turn edit burst stops
-// spawning once ~3 have fired even before the next prompt drains them. Absent
-// dir ⇒ 0.
-function pendingResultCount(graph, session) {
-  try {
-    return fs
-      .readdirSync(path.join(graph, "journal", "pending-nudges", session))
-      .filter((f) => f.endsWith(".out.json")).length;
-  } catch {
-    return 0;
-  }
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PostToolUse",
+      additionalContext: NUDGE_CTX(file, u.stripTrailingNewlines(facts)),
+    },
+  };
 }
 
 // task-cc-claim-nudge-hook — the unified post-tool claim branch
@@ -783,4 +690,4 @@ async function postTool(input) {
   return null;
 }
 
-module.exports = { postTool, parseFactList, classifyForNudge, injectedNudgeCount, claimNudge, couplingNudge, agentHeartbeat };
+module.exports = { postTool, parseFactList, claimNudge, couplingNudge, agentHeartbeat };
