@@ -152,6 +152,29 @@ many `.md` files runs unbounded calls — and `SPOR_NUDGE_TIMEOUT`
 (`nudge.timeoutMs`, default 30000) SIGKILLs a hung backend (the distiller has
 the parallel `SPOR_DISTILL_TIMEOUT`/`distill.timeoutMs`, default 120000). All
 knobs resolve through the config cascade (`u.cfgNum`). See test/nudge.test.js.
+`SPOR_NUDGE_ASYNC=1` (`nudge.async`, default off,
+task-cc-async-classifier-pending-result-injection) moves the classifier OFF the
+tool loop entirely: post-tool reserves the file (phase-1 cooldown, a `pending\t`
+line in `.nudged`) and hands the job to a DETACHED worker
+(`scripts/engines/nudge-worker.js`, spawned like `debounce-watcher.js`), so the
+PostToolUse call returns immediately with no injection. The worker runs the same
+`classifyForNudge` and, on facts, drops a phase-2 result file under
+`journal/pending-nudges/<session>/<hash>.out.json`; the NEXT UserPromptSubmit
+DRAINS those files, merges them into ONE capture nudge, and injects it with NO
+LLM call (`drainPendingNudges` in prompt-context.js — a pure file read, so it
+stays clean under norm-cc-no-llm-prompt-path). Injection runs even for a
+trivial/continuation prompt (a pending finding is about a written file, not the
+prompt) but is gated on `nudge.enabled` too (`SPOR_NUDGE=0` suppresses the drain,
+not just the spawn). The 3-fired cap can't be read at spawn (async doesn't know
+outcomes), so it's approximated by injected nudges
+(`journal/<session>.nudged-injected`) PLUS results already waiting in the spool;
+once that hits 3, further spawns are suppressed — a best-effort analog of the
+synchronous 3-fired early-stop, backstopped by the hard `nudge.maxCalls` ceiling.
+Known tradeoff (inherent to one-turn-delay): a finding in a doc written as the
+FINAL action of a session — no subsequent prompt — is never injected; the
+SessionEnd distiller is the backstop that still captures it. The default
+synchronous path is byte-identical (the drain and its syscalls are gated on the
+flag). See test/nudge-async.test.js.
 
 The post-tool engine ALSO carries the coupling nudge
 (task-spor-coupling-nudge-posttool, dec-spor-coupling-norms-declared-first) —

@@ -221,6 +221,102 @@ function stripSystemReminders(prompt) {
   return String(prompt).replace(/\n*<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").trim();
 }
 
+// task-cc-async-classifier-pending-result-injection: the prompt-time half of
+// the async capture nudge. The post-tool worker dropped `<hash>.out.json` files
+// under journal/pending-nudges/<session>/ when a background classification
+// found facts; this drains them, merges them into ONE capture-nudge block, and
+// consumes the files. It is a pure file read — NO LLM call — so it stays clean
+// under norm-cc-no-llm-prompt-path, and it runs regardless of the trivial /
+// continuation gates below (a pending finding is about a file the agent wrote,
+// not about this prompt's relevance). Session-scoped fired cap of 3
+// (journal/<session>.nudged-injected), matching the synchronous nudge's cap;
+// results beyond the cap are consumed and dropped (parity with sync, which
+// stops firing after 3). Fail-open: any error injects nothing.
+const PENDING_ORPHAN_MS = 3600000; // prune an un-consumed `.in.json` after 1h
+function drainPendingNudges(graph, input, slug) {
+  // Resolve the session EXACTLY as post-tool does (input.session_id ?? "unknown")
+  // — the dispatcher already folds cursor/copilot's conversation_id/sessionId
+  // onto session_id, so a divergent fallback here would key the drain dir
+  // differently from the writer and silently lose every async nudge when
+  // session_id is absent.
+  const session = input.session_id ?? "unknown";
+  const dir = path.join(graph, "journal", "pending-nudges", session);
+  let all;
+  try {
+    all = fs.readdirSync(dir);
+  } catch {
+    return ""; // no spool dir for this session
+  }
+  const files = all.filter((f) => f.endsWith(".out.json")).sort();
+
+  const injectedState = path.join(graph, "journal", `${session}.nudged-injected`);
+  let injected = 0;
+  try {
+    injected = fs.readFileSync(injectedState, "utf8").split("\n").filter(Boolean).length;
+  } catch {}
+
+  const results = [];
+  for (const f of files) {
+    const fp = path.join(dir, f);
+    let r = null;
+    try {
+      r = JSON.parse(fs.readFileSync(fp, "utf8"));
+    } catch {}
+    // Consume every drained file whether or not it's injected — an over-cap or
+    // unreadable result must not linger and re-inject on the next prompt.
+    try {
+      fs.unlinkSync(fp);
+    } catch {}
+    if (r && r.file && r.facts && injected + results.length < 3) results.push(r);
+  }
+
+  // GC (bounds the spool leak): prune orphaned inputs whose detached worker
+  // never ran (older than 1h — a worker classifies in seconds). Deliberately do
+  // NOT rmdir an emptied dir: a worker unlinks its `.in.json` at start and
+  // writes its result back seconds later, so the dir is legitimately empty
+  // mid-classification and removing it would race the worker's write out from
+  // under it. An empty dir persists like the other per-session journal files
+  // (.nudged, .jsonl) until a wider journal GC lands.
+  try {
+    const now = Date.now();
+    for (const f of all) {
+      if (!f.endsWith(".in.json")) continue;
+      const fp = path.join(dir, f);
+      try {
+        if (now - fs.statSync(fp).mtimeMs > PENDING_ORPHAN_MS) fs.unlinkSync(fp);
+      } catch {}
+    }
+  } catch {}
+
+  if (!results.length) return "";
+
+  for (const r of results) {
+    u.appendLine(injectedState, r.file);
+    // Journal the fired nudge (async) so lib/capture-metrics.js correlates it to
+    // a subsequent capture, exactly like the synchronous nudge's journal line.
+    u.appendLine(
+      path.join(graph, "journal", `${session}.jsonl`),
+      JSON.stringify({ ts: u.jqNow(), project: slug, tool: "nudge", file: r.file, facts: r.nfacts, async: true })
+    );
+  }
+
+  // Cap the merged fact blocks so the framing — the actionable "capture it NOW"
+  // instruction and the disable hint — always survives (each fact list is
+  // already ≤3500 bytes and up to 3 inject, so the raw join can top 10KB and get
+  // cut mid-instruction by the host's additionalContext ceiling).
+  const blocks = u.byteHead(
+    results
+      .map((r) => `The file you wrote (${r.file}) contains findings that do not appear to be in the team graph:\n\n${u.stripTrailingNewlines(r.facts)}`)
+      .join("\n\n"),
+    7000
+  );
+  return `[spor capture nudge] A background classifier reviewed prose file(s) you wrote earlier this session:
+
+${blocks}
+
+If a finding is durable, capture it NOW — one /spor:defer (or capture tool) call per finding, in your own words with full context. If none are durable, dismiss this consciously and move on. (Classifier: source=nudge, async; disable with SPOR_NUDGE=0 or SPOR_NUDGE_ASYNC=0.)`;
+}
+
 async function promptContext(input) {
   // Headless backend invocations (the capture ingester, the fact-finder
   // distiller, the nudge classifier — every spawn site exports the
@@ -231,15 +327,42 @@ async function promptContext(input) {
   if (process.env.SPOR_DISTILLING || process.env.SUBSTRATE_DISTILLING) return null;
 
   const graph = u.graphHome();
-  const prompt = stripSystemReminders(input.prompt ?? "");
   const slug = u.projectSlug(input.cwd ?? "");
+
+  // Drain any async-nudge results BEFORE the digest gates — a pending finding
+  // must inject on a trivial/continuation prompt too. Gated on nudge.async so
+  // the default (synchronous) path pays no extra syscall and stays
+  // byte-identical, AND on nudge.enabled so SPOR_NUDGE=0 suppresses the drain
+  // exactly as it suppresses the post-tool spawn (never inject a nudge the user
+  // just disabled). No LLM here (norm-cc-no-llm-prompt-path).
+  const pendingNudge =
+    u.cfgBool("nudge.enabled", "NUDGE", true) && u.cfgBool("nudge.async", "NUDGE_ASYNC", false)
+      ? drainPendingNudges(graph, input, slug)
+      : "";
+
+  const digest = await computeDigest(input, graph, slug);
+  const parts = [pendingNudge, digest].filter(Boolean);
+  if (!parts.length) return null;
+  // Cap the combined context at the host's 10KB additionalContext ceiling so a
+  // large merged nudge can't get truncated mid-structure by the host. The
+  // digest-only path is byte-identical: microDigest already self-caps well
+  // under 10KB, so this byteHead is a no-op there.
+  return envelope(u.byteHead(parts.join("\n\n"), 10000));
+}
+
+// The relevance digest, byte-identical to the pre-async behavior: returns the
+// microdigest context string, or "" when a gate suppresses it (the callers
+// combine it with any pending async nudge). Every prior `return null` here is a
+// `return ""`; every `return envelope(x)` is a `return x`.
+async function computeDigest(input, graph, slug) {
+  const prompt = stripSystemReminders(input.prompt ?? "");
 
   // Skip trivial / continuation prompts BEFORE any network call. The second
   // gate catches "ok let's do that" follow-ups that carry no new retrieval
   // signal but can otherwise clear the word floor.
-  if (prompt.startsWith("/")) return null;
-  if (isContinuationPrompt(prompt)) return null;
-  if (u.wordCount(prompt) < 6) return null;
+  if (prompt.startsWith("/")) return "";
+  if (isContinuationPrompt(prompt)) return "";
+  if (u.wordCount(prompt) < 6) return "";
 
   // -------------------------------------------------------------------------
   // REMOTE MODE
@@ -286,19 +409,19 @@ async function promptContext(input) {
       local = localCompile(graph, prompt, rlogFile, slug);
     }
 
-    if (!team && !local) return null;
+    if (!team && !local) return "";
     // MERGED=$(awk ... | head -c 9216) — command substitution strips trailing
     // newlines before jq sees it.
     const merged = u.stripTrailingNewlines(u.byteHead(mergeDigests(team, local), 9216));
-    if (!/\S/.test(merged)) return null;
-    if (repeatedFollowup(graph, input, prompt, merged)) return null;
-    return envelope(microDigest(merged));
+    if (!/\S/.test(merged)) return "";
+    if (repeatedFollowup(graph, input, prompt, merged)) return "";
+    return microDigest(merged);
   }
 
   // -------------------------------------------------------------------------
   // LOCAL MODE (original behavior — byte-identical to prompt-context.sh)
   // -------------------------------------------------------------------------
-  if (!fs.existsSync(path.join(graph, "nodes"))) return null;
+  if (!fs.existsSync(path.join(graph, "nodes"))) return "";
   // Time the compile subprocess and stamp it to the journal
   // (issue-cc-local-mode-hook-load-latency): lib/compile.js reloads the whole
   // graph per prompt with no cache, and because hooks fail open the latency
@@ -310,9 +433,9 @@ async function promptContext(input) {
   u.journalLoadMs(graph, input.session_id, "prompt-context", Date.now() - t0, {
     cached: false,
   });
-  if (!digest) return null;
-  if (repeatedFollowup(graph, input, prompt, digest)) return null;
-  return envelope(microDigest(digest));
+  if (!digest) return "";
+  if (repeatedFollowup(graph, input, prompt, digest)) return "";
+  return microDigest(digest);
 }
 
-module.exports = { promptContext, mergeDigests, isContinuationPrompt, microDigest };
+module.exports = { promptContext, mergeDigests, isContinuationPrompt, microDigest, drainPendingNudges };

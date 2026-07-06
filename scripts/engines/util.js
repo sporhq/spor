@@ -65,6 +65,17 @@ function cfgNum(keyPath, envName, fallback) {
   const n = parseFloat(v);
   return Number.isFinite(n) ? n : fallback;
 }
+// Config-aware boolean read, same cascade and the shell "0"/"false"/"" ⇒ false
+// convention as Config.getBool. Standalone (no active config) falls back to the
+// env dual-read, so a direct call is byte-identical to the raw env test it
+// replaces. Fallback returned when neither config nor env is set.
+function cfgBool(keyPath, envName, fallback) {
+  if (_config) return _config.getBool(keyPath, fallback);
+  const v = home.envDual(envName);
+  if (v === undefined) return fallback;
+  const s = String(v).trim().toLowerCase();
+  return !(s === "0" || s === "false" || s === "");
+}
 
 function hostDefaultBackendCmd(kind) {
   if (_host === "codex" && kind === "nudge") return `codex exec --model ${CODEX_NUDGE_MODEL} -`;
@@ -1079,6 +1090,7 @@ module.exports = {
   clearConfig,
   cfgStr,
   cfgNum,
+  cfgBool,
   hostDefaultBackendCmd,
   jqNow,
   isoMs,
