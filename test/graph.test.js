@@ -1119,6 +1119,65 @@ b
   assert.ok(v.warnings.some((w) => /dangling edge derived-from -> ghost-node/.test(w)));
 });
 
+test("validateGraph: stewards -> org-root is the virtual root anchor, not a dangling edge", () => {
+  const fx = tmpGraph({
+    "person-anthony.md": `---
+id: person-anthony
+type: person
+title: Anthony
+summary: s
+edges:
+  - {type: stewards, to: org-root}
+---
+b
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.deepEqual(v.errors, []);
+  assert.ok(!v.warnings.some((w) => /dangling edge stewards -> org-root/.test(w)));
+});
+
+test("validateGraph: SPOR_ROOT_ID overrides the virtual root anchor id", () => {
+  const fx = tmpGraph({
+    "person-anthony.md": `---
+id: person-anthony
+type: person
+title: Anthony
+summary: s
+edges:
+  - {type: stewards, to: org-root-custom}
+---
+b
+`,
+  });
+  const prior = process.env.SPOR_ROOT_ID;
+  process.env.SPOR_ROOT_ID = "org-root-custom";
+  try {
+    const v = graph.validateGraph(fx.nodesDir);
+    assert.ok(!v.warnings.some((w) => /dangling edge stewards -> org-root-custom/.test(w)));
+  } finally {
+    if (prior === undefined) delete process.env.SPOR_ROOT_ID;
+    else process.env.SPOR_ROOT_ID = prior;
+  }
+});
+
+test("validateGraph: a stewards edge to a non-root id is still dangling", () => {
+  const fx = tmpGraph({
+    "person-anthony.md": `---
+id: person-anthony
+type: person
+title: Anthony
+summary: s
+edges:
+  - {type: stewards, to: some-other-node}
+---
+b
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.ok(v.warnings.some((w) => /dangling edge stewards -> some-other-node/.test(w)));
+});
+
 test("validateGraph: duplicate id is an error", () => {
   const fx = tmpGraph({
     "dup.md": `---
