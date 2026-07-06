@@ -130,12 +130,12 @@ async function waitFor(pred, timeoutMs = 15000) {
 
 // Drop a completed worker result straight into the spool — lets the drain side
 // be tested deterministically without racing detached workers.
-function seedOut(home, session, name, digest, sig) {
+function seedOut(home, session, name, digest, sig, slug) {
   const dir = spoolDir(home, session);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(
     path.join(dir, `${name}.out.json`),
-    JSON.stringify({ digest, sig, verdict: "WARRANTED", ts: "2026-01-01T00:00:00Z" })
+    JSON.stringify({ digest, sig, ...(slug ? { slug } : {}), verdict: "WARRANTED", ts: "2026-01-01T00:00:00Z" })
   );
 }
 
@@ -245,6 +245,55 @@ test("a fresh synchronous digest suppresses a stale pending one (no double injec
   assert.doesNotMatch(ctx, /STALE-DIGEST/);
   assert.strictEqual(outFiles(home).length, 0, "stale pending result consumed");
   assert.strictEqual(journal(home).filter((e) => e.tool === "digest" && e.async).length, 0);
+});
+
+test("verdict parsing: only an unambiguous UNWARRANTED suppresses", () => {
+  const { classifyDigestIntent } = require("../scripts/engines/prompt-context");
+  const { home } = scratch();
+  const cases = [
+    ["UNWARRANTED", "UNWARRANTED"],
+    ["WARRANTED", "WARRANTED"],
+    ["Reply: WARRANTED.", "WARRANTED"],
+    // Both tokens = ambiguous = fail-open (null), never a suppression.
+    ["WARRANTED — definitely not UNWARRANTED", null],
+    ["gibberish", null],
+  ];
+  for (const [reply, want] of cases) {
+    const cmd = nodeCommand(writeNodeScript(path.join(home, `v-${Buffer.from(reply).toString("hex").slice(0, 8)}.js`), `
+process.stdin.resume();
+process.stdin.on("end", () => process.stdout.write(${JSON.stringify(reply)}));
+`));
+    const got = classifyDigestIntent({
+      prompt: "p", tplSha: "t", session: "s", slug: "projx", graph: home,
+      timeoutMs: 10000, cmd, vars: {},
+    });
+    assert.strictEqual(got, want, `reply ${JSON.stringify(reply)}`);
+  }
+});
+
+test("drain drops a pending result spooled for a different project", () => {
+  const { home, cwd } = scratch();
+  seedOut(home, "s1", "1000-x", "OTHER-PROJECT digest", "sig-x", "other-project");
+  assert.strictEqual(promptContext(home, cwd, { prompt: "ok" }).trim(), "", "cross-project context must not inject");
+  assert.strictEqual(outFiles(home).length, 0, "mismatched result still consumed");
+  // A matching-slug result injects normally.
+  seedOut(home, "s1", "2000-y", "SAME-PROJECT digest", "sig-y", "projx");
+  assert.match(JSON.parse(promptContext(home, cwd, { prompt: "ok" })).hookSpecificOutput.additionalContext, /SAME-PROJECT/);
+});
+
+test("a fallback synchronous injection records its signature for the drain dedup", () => {
+  const { root, home, cwd } = scratch();
+  fs.mkdirSync(path.join(home, "journal"), { recursive: true });
+  fs.writeFileSync(path.join(home, "journal", "s1.digest-intent"), Array.from({ length: 20 }, (_, i) => `sig${i}`).join("\n") + "\n");
+  // Cap → synchronous fallback injection of the widget digest.
+  const ctx = JSON.parse(promptContext(home, cwd, { intentCmd: warrantedStub(root) })).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /dec-widget-cache/);
+  const injState = path.join(home, "journal", "s1.digest-injected");
+  assert.ok(fs.existsSync(injState), "fallback injection must record its signature");
+  const sig = fs.readFileSync(injState, "utf8").trim();
+  // A late-landing pending result with the SAME signature must not re-inject.
+  seedOut(home, "s1", "3000-late", "LATE duplicate", sig, "projx");
+  assert.strictEqual(promptContext(home, cwd, { prompt: "ok" }).trim(), "");
 });
 
 test("session_id absent: spool writer and drainer agree on the 'unknown' key", async () => {

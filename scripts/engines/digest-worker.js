@@ -52,7 +52,7 @@ if (verdict !== "UNWARRANTED" && job.digest && job.hash) {
   try {
     fs.writeFileSync(
       tmp,
-      JSON.stringify({ digest: job.digest, sig: job.sig, verdict: verdict ?? "fail-open", ts: u.jqNow() })
+      JSON.stringify({ digest: job.digest, sig: job.sig, slug: job.slug, verdict: verdict ?? "fail-open", ts: u.jqNow() })
     );
     fs.renameSync(tmp, outFile);
   } catch {

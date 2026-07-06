@@ -424,6 +424,11 @@ function drainPendingDigests(graph, input, slug, { suppress = false } = {}) {
   } catch {}
 
   if (!result || suppress) return "";
+  // A pending digest is project-scoped retrieval: if the session moved to a
+  // different project (cwd change under one graph home) between the spool and
+  // this drain, another project's context is exactly the noise this gate cuts —
+  // drop it (already consumed above).
+  if (result.slug && slug && result.slug !== slug) return "";
 
   const injState = path.join(graph, "journal", `${session}.digest-injected`);
   let lastSig = "";
@@ -501,9 +506,14 @@ function classifyDigestIntent({ prompt, tplSha, session, slug, graph, timeoutMs,
   }
   recordLlm(response, "");
 
-  // "WARRANTED" is a substring of "UNWARRANTED" — test the negative first.
-  if (/\bUNWARRANTED\b/.test(response)) return "UNWARRANTED";
-  if (/\bWARRANTED\b/.test(response)) return "WARRANTED";
+  // \b keeps the two tests independent (`\bWARRANTED\b` can't match inside
+  // "UNWARRANTED" — no boundary after the N). Suppression needs an UNAMBIGUOUS
+  // verdict: a reply carrying both tokens ("WARRANTED — not UNWARRANTED") or
+  // neither is null, which the worker fails open to inject.
+  const un = /\bUNWARRANTED\b/.test(response);
+  const w = /\bWARRANTED\b/.test(response);
+  if (un && !w) return "UNWARRANTED";
+  if (w && !un) return "WARRANTED";
   return null;
 }
 
@@ -546,6 +556,13 @@ async function promptContext(input) {
     // The drain always runs (consuming stale results) — suppressed from
     // injecting only when a fresh synchronous digest already takes the slot.
     const pending = drainPendingDigests(graph, input, slug, { suppress: !!fresh });
+    // A fallback synchronous injection still records its signature, so a
+    // late-landing pending result carrying the same digest can't re-inject
+    // identical context on the next prompt.
+    if (fresh) {
+      const session = input.session_id ?? "unknown";
+      u.appendLine(path.join(graph, "journal", `${session}.digest-injected`), digestSignature(fresh));
+    }
     digest = fresh || pending;
   }
 
