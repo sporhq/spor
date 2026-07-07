@@ -2203,6 +2203,166 @@ async function cmdExport(cfg, { values }) {
   return 0;
 }
 
+// --- spor merge: bring another graph's exported nodes into this one ---------
+// (task-spor-cli-merge-verb) The CLI wrapper over POST /v1/merge
+// (dec-spor-graph-merge-endpoint, API.md), replacing the hand-rolled curl+jq
+// the pilot-to-org promotion runbook used until now. REMOTE-ONLY: the endpoint
+// merges another graph's nodes INTO the team graph on the server, so there is
+// no local-mode equivalent to dispatch to (the sanctioned norm-spor-cli-mode-parity
+// divergence — a verb with no equivalent on the other side). Admin-gated
+// (stewards→root) server-side; defaults to `mode: "plan"` per the task's explicit
+// ask — nothing is written until --apply is passed.
+//
+// <source> is a directory of node markdown files (either a nodes/ dir itself, or
+// its parent — the shape `spor export`/`tar x` produces), or a tarball file
+// (gzipped or plain — the same format `spor export [--gzip]` writes), so the
+// natural flow is `spor export --gzip --out pilot.tar.gz` on the pilot graph,
+// then `spor merge pilot.tar.gz` against the org server.
+function loadMergeSourceNodes(source) {
+  let stat;
+  try {
+    stat = fs.statSync(source);
+  } catch (e) {
+    return { error: `could not read ${source} — ${e.message}` };
+  }
+  if (stat.isDirectory()) {
+    const nodesSubdir = path.join(source, "nodes");
+    const base = fs.existsSync(nodesSubdir) && fs.statSync(nodesSubdir).isDirectory() ? nodesSubdir : source;
+    const files = fs.readdirSync(base).filter((f) => f.endsWith(".md"));
+    return { nodes: files.map((f) => fs.readFileSync(path.join(base, f), "utf8")) };
+  }
+  let buf;
+  try {
+    buf = fs.readFileSync(source);
+  } catch (e) {
+    return { error: `could not read ${source} — ${e.message}` };
+  }
+  if (buf.length > 1 && buf[0] === 0x1f && buf[1] === 0x8b) {
+    try {
+      buf = require("zlib").gunzipSync(buf);
+    } catch (e) {
+      return { error: `could not decode ${source} as gzip — ${e.message}` };
+    }
+  }
+  const tar = require(path.join(ROOT, "lib", "tar.js"));
+  const nodes = tar
+    .extract(buf)
+    .filter((e) => path.basename(e.name).endsWith(".md"))
+    .map((e) => e.data.toString("utf8"));
+  return { nodes };
+}
+
+// Render the {mode, counts, imported, deduped, remapped, conflicts, errors,
+// id_map} report the same way whether it came back from a plan or an apply —
+// a human summary of a merge that never guesses at server-internal shape.
+// `refused` is set for a 409 apply refusal: nothing was written despite
+// mode:"apply" in the response, so the trailer must not read as a success.
+function renderMergeReport(report, source, { refused = false } = {}) {
+  const counts = report.counts || {};
+  const mode = report.mode || "plan";
+  const incoming = counts.incoming || 0;
+  out(`merge ${mode}: ${incoming} node${incoming === 1 ? "" : "s"} from ${source}`);
+  out(`  imported   ${counts.imported || 0}`);
+  out(`  deduped    ${counts.deduped || 0}`);
+  out(`  remapped   ${counts.remapped || 0}`);
+  out(`  conflicts  ${counts.conflicts || 0}`);
+  out(`  errors     ${counts.errors || 0}`);
+  const list = (label, arr, describe) => {
+    if (!arr || !arr.length) return;
+    out(`  ${label}:`);
+    for (const e of arr) out(`    ${describe(e)}`);
+  };
+  list("remapped", report.remapped, (e) => `${e.id} -> ${e.new_id || "?"}`);
+  list("conflicts", report.conflicts, (e) => `${e.id}${e.reason ? ` (${e.reason})` : ""}`);
+  list("errors", report.errors, (e) => `${e.id || `#${e.index}`}: ${(e.errors || []).join("; ")}`);
+  if (refused) {
+    out(`nothing written — resolve the conflicts/errors above, or pass --force to import the clean subset anyway`);
+  } else if (mode === "plan") {
+    out(
+      counts.conflicts || counts.errors
+        ? `plan is not clean — resolve the conflicts/errors above (or pass --force to import the clean subset), then re-run with --apply`
+        : `plan is clean — re-run with --apply to write`
+    );
+  } else {
+    out(`applied ${counts.imported || 0} node${(counts.imported || 0) === 1 ? "" : "s"}`);
+  }
+}
+
+async function cmdMerge(cfg, { values, positionals }) {
+  const source = positionals[0];
+  if (!source) {
+    err("usage: spor merge <nodes-dir|tarball> [--apply] [--force] [--trust-attached-code] [--id-map <file>] [--save-id-map <file>] [--json]");
+    return 1;
+  }
+  if (cfg.mode() !== "remote") {
+    err("merge needs a team graph (remote mode) — it merges another graph's nodes INTO the server's graph.");
+    return 1;
+  }
+  const loaded = loadMergeSourceNodes(source);
+  if (loaded.error) {
+    err(`merge: ${loaded.error}`);
+    return 1;
+  }
+  if (!loaded.nodes.length) {
+    err(`merge: no node files found under ${source}`);
+    return 1;
+  }
+
+  let idMap;
+  if (values["id-map"]) {
+    try {
+      idMap = JSON.parse(fs.readFileSync(values["id-map"], "utf8"));
+    } catch (e) {
+      err(`merge: could not read --id-map ${values["id-map"]} — ${e.message}`);
+      return 1;
+    }
+  }
+
+  const apply = !!values.apply;
+  const body = { nodes: loaded.nodes, mode: apply ? "apply" : "plan" };
+  if (idMap) body.id_map = idMap;
+  if (values["trust-attached-code"]) body.trust_attached_code = true;
+  if (values.force) body.force = true;
+
+  const r = await remote.post(cfg, "/v1/merge", body, { timeoutMs: 120000 });
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (notAdminHint(r)) return 1;
+  const json = !!values.json;
+  if (r.status === 409) {
+    const j = r.json || {};
+    if (json) {
+      out(JSON.stringify(j, null, 2));
+    } else {
+      err(`merge: apply refused (409) — the plan is not clean (conflicts or errors remain).`);
+      renderMergeReport(j, source, { refused: true });
+    }
+    return 1;
+  }
+  if (!r.ok || !r.json) {
+    const msg = r.json && r.json.error && r.json.error.message;
+    err(`merge error ${r.status}${msg ? `: ${msg}` : ""}`);
+    return 1;
+  }
+  const report = r.json;
+  if (values["save-id-map"]) {
+    try {
+      fs.writeFileSync(values["save-id-map"], JSON.stringify(report.id_map || {}, null, 2));
+    } catch (e) {
+      err(`merge: could not write --save-id-map ${values["save-id-map"]} — ${e.message}`);
+      return 1;
+    }
+  }
+  if (json) {
+    out(JSON.stringify(report, null, 2));
+  } else {
+    renderMergeReport(report, source);
+  }
+  return 0;
+}
+
 // --- spor add / capture -------------------------------------------------
 // Local: write a well-formed node so a user never has to learn the frontmatter
 // (issue-cc-local-mode-capture-queue-surfacing-gap). Remote: POST /v1/capture,
@@ -8549,6 +8709,57 @@ const COMMANDS = {
       "spor export --auth --gzip --out graph-restore.tar.gz",
     ],
     run: (cfg, p) => cmdExport(cfg, p),
+  },
+  merge: {
+    group: "Team admin (remote, admin token)", parse: "strict",
+    args: "<nodes-dir|tarball> [--apply] [--force] [--trust-attached-code] [--id-map <file>] [--save-id-map <file>] [--json]",
+    summary: "bring another graph's exported nodes into this one (POST /v1/merge)",
+    help:
+      "Bring another graph's exported nodes into the team graph — pilot-to-org\n" +
+      "promotion, or a local dogfood graph into a hosted tenant — replacing the\n" +
+      "hand-rolled curl+jq the runbook used until now. Remote + admin only\n" +
+      "(stewards→root): the endpoint merges INTO the server's graph, so there is\n" +
+      "no local-mode equivalent.\n" +
+      "\n" +
+      "<nodes-dir|tarball> is either a directory of node markdown files (a nodes/\n" +
+      "dir itself, or its parent — the shape `spor export`/`tar x` produces), or a\n" +
+      "tarball file (gzipped or plain, the same format `spor export [--gzip]`\n" +
+      "writes) — so the natural flow is `spor export --gzip --out pilot.tar.gz` on\n" +
+      "the pilot graph, then `spor merge pilot.tar.gz` against the org server.\n" +
+      "\n" +
+      "Defaults to plan mode: every incoming node classifies as imported / deduped\n" +
+      "(attribution-blind, identical content) / remapped (an ordinal id collision,\n" +
+      "rewritten to <id>-<hash> with references fixed up) / conflict (different\n" +
+      "content, a semantic id, or a schema/workflow/stewards edge — never merged\n" +
+      "silently) and NOTHING is written. Pass --apply to write; apply refuses with\n" +
+      "409 if the plan still carries conflicts or errors, unless --force (imports\n" +
+      "the clean subset, leaving references to skipped ids unresolved).\n" +
+      "\n" +
+      "  --apply                 write the merge (default: plan mode only, reports\n" +
+      "                          impact and writes nothing)\n" +
+      "  --force                 apply the clean subset even if conflicts/errors remain\n" +
+      "  --trust-attached-code   let schema/workflow nodes merge verbatim (only for a\n" +
+      "                          whole graph you own — it activates their gate code)\n" +
+      "  --id-map <file>         seed cross-id rewrites from a prior plan's id_map (JSON),\n" +
+      "                          for merging a graph too large for one batch\n" +
+      "  --save-id-map <file>    write this response's id_map to <file>, to feed the\n" +
+      "                          next batch\n" +
+      "  --json                  print the raw merge report",
+    options: {
+      apply: { type: "boolean", desc: "write the merge (default: plan mode, reports impact only)" },
+      force: { type: "boolean", desc: "apply the clean subset even if conflicts/errors remain" },
+      "trust-attached-code": { type: "boolean", desc: "allow schema/workflow nodes to merge verbatim (only for a graph you own)" },
+      "id-map": { type: "string", value: "file", desc: "seed cross-id rewrites from a prior plan's id_map (JSON file)" },
+      "save-id-map": { type: "string", value: "file", desc: "write the response's id_map to <file>, to feed the next batch" },
+      json: { type: "boolean", desc: "print the raw merge report" },
+    },
+    examples: [
+      "spor merge ./pilot-export",
+      "spor merge pilot.tar.gz",
+      "spor merge pilot.tar.gz --apply",
+      "spor merge pilot.tar.gz --id-map batch1.json --save-id-map batch2.json --apply",
+    ],
+    run: (cfg, p) => cmdMerge(cfg, p),
   },
   correct: {
     group: "Graph", parse: "strict", args: "<target> [guidance]", aliases: ["propose-correction"],
