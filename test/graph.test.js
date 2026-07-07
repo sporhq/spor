@@ -222,6 +222,45 @@ b
   assert.deepEqual(n.tags, ["x"]);
 });
 
+test("parseFrontmatter: a flush-left YAML block list (items at the key's own indentation) still parses to an array", () => {
+  // Valid YAML, and a natural style for hand-written or LLM-authored nodes —
+  // the item regex must not require leading whitespace before the dash.
+  const raw = `---
+id: task-c4
+type: task
+title: t
+summary: s
+commits:
+- wf@0123abc
+- spor@deadbeefcafe
+date: 2026-06-01
+---
+b
+`;
+  const n = graph.parseFrontmatter(raw, "task-c4.md");
+  assert.deepEqual(n.commits, ["wf@0123abc", "spor@deadbeefcafe"]);
+});
+
+test("parseFrontmatter: a stray non-item line inside an open block list is ignored, not folded into the array", () => {
+  // Regression guard: appending a stray line onto an in-progress array via
+  // `+=` coerces it (Array.prototype.toString) back into the exact corrupted
+  // string this parser exists to prevent.
+  const raw = `---
+id: task-c5
+type: task
+title: t
+summary: s
+commits:
+  - wf@0123abc
+  bogus continuation line
+date: 2026-06-01
+---
+b
+`;
+  const n = graph.parseFrontmatter(raw, "task-c5.md");
+  assert.deepEqual(n.commits, ["wf@0123abc"]);
+});
+
 test("parseFrontmatter: a non-list key's block-style continuation still folds as a scalar", () => {
   const raw = `---
 id: dec-fold
