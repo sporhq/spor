@@ -1,9 +1,10 @@
 // Periodic journal garbage collection (task-spor-client-journal-gc): the
 // age-bounded sweep of per-session artifacts (<session>.jsonl logs, the
 // .nudged/.claim-nudged/.coupling-nudged/.heartbeat cooldown markers,
-// prompt-context caches, and pending-nudges/<session>/ dirs) that otherwise
-// accumulate unbounded in journal/. Pure scratch-dir tests over u.gcJournal —
-// no server, no live graph — plus a driven session-start smoke.
+// prompt-context caches, and pending-nudges/<session>/ and
+// pending-digests/<session>/ dirs) that otherwise accumulate unbounded in
+// journal/. Pure scratch-dir tests over u.gcJournal — no server, no live
+// graph — plus a driven session-start smoke.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const test = require('node:test');
 const assert = require('node:assert');
@@ -34,7 +35,8 @@ function aged(dir, name, ageDays) {
   return full;
 }
 
-// A per-session subdirectory under pending-nudges/, backdated by `ageDays`.
+// A per-session subdirectory under a spool dir (pending-nudges/ or
+// pending-digests/), backdated by `ageDays`.
 function agedDir(base, session, ageDays) {
   const full = path.join(base, session);
   fs.mkdirSync(full, { recursive: true });
@@ -62,11 +64,14 @@ test('prunes stale per-session artifacts, keeps fresh and durable ones', () => {
   aged(journal, 'prompt-context-abc123.json', 30);
   const pending = path.join(journal, 'pending-nudges');
   agedDir(pending, old, 30);
+  const pendingDigests = path.join(journal, 'pending-digests');
+  agedDir(pendingDigests, old, 30);
 
   // Fresh (1d) artifacts — must survive the 14d cutoff.
   aged(journal, 'sess-fresh.jsonl', 1);
   aged(journal, 'prompt-context-fresh.json', 1);
   agedDir(pending, 'sess-fresh', 1);
+  agedDir(pendingDigests, 'sess-fresh', 1);
 
   // Durable state — never pruned regardless of age.
   aged(journal, 'load-latency.jsonl', 30);
@@ -78,23 +83,41 @@ test('prunes stale per-session artifacts, keeps fresh and durable ones', () => {
 
   const stat = u.gcJournal(graph, { force: true });
   assert.equal(stat.ran, true);
-  assert.equal(stat.removed, 7, 'five stale session files + one prompt-context + one pending dir');
+  assert.equal(stat.removed, 8, 'five stale session files + one prompt-context + one pending-nudges dir + one pending-digests dir');
 
   for (const n of [`${old}.jsonl`, `${old}.nudged`, `${old}.claim-nudged`, `${old}.coupling-nudged`, `${old}.heartbeat`, 'prompt-context-abc123.json']) {
     assert.equal(fs.existsSync(path.join(journal, n)), false, `${n} should be pruned`);
   }
-  assert.equal(fs.existsSync(path.join(pending, old)), false, 'stale pending dir pruned');
+  assert.equal(fs.existsSync(path.join(pending, old)), false, 'stale pending-nudges dir pruned');
+  assert.equal(fs.existsSync(path.join(pendingDigests, old)), false, 'stale pending-digests dir pruned');
 
   // Fresh artifacts survive.
   assert.ok(fs.existsSync(path.join(journal, 'sess-fresh.jsonl')));
   assert.ok(fs.existsSync(path.join(journal, 'prompt-context-fresh.json')));
   assert.ok(fs.existsSync(path.join(pending, 'sess-fresh')));
+  assert.ok(fs.existsSync(path.join(pendingDigests, 'sess-fresh')));
 
   // Durable state survives.
   for (const n of ['load-latency.jsonl', 'distill.log', 'remote.log', 'pending-distill', 'enable-hint-projx']) {
     assert.ok(fs.existsSync(path.join(journal, n)), `${n} must be kept`);
   }
   assert.ok(fs.existsSync(path.join(journal, 'llm-calls', '2026-01-01.jsonl')), 'llm-calls telemetry kept');
+});
+
+test('a concurrently-live session also keeps its stale pending-digests dir', () => {
+  const { graph, journal } = scratch();
+  // Mirrors the pending-nudges review-finding coverage above (util.js
+  // gcSpoolDir is shared by both spool dirs): a session that is concurrently
+  // live by its fresh .jsonl bucket signal must keep its pending-digests/
+  // spool dir even though the dir's own mtime is stale — a detached
+  // digest-worker can still be mid-flight for it.
+  const other = 'sess-other-digest-pending';
+  aged(journal, `${other}.jsonl`, 1); // still appending events => live
+  agedDir(path.join(journal, 'pending-digests'), other, 30); // stale dir mtime
+
+  const stat = u.gcJournal(graph, { force: true, session: 'sess-triggering' });
+  assert.equal(stat.removed, 0, "the live session's pending-digests dir must not be reaped");
+  assert.ok(fs.existsSync(path.join(journal, 'pending-digests', other)));
 });
 
 test('never sweeps the triggering session even when its files are stale', () => {

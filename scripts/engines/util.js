@@ -422,17 +422,19 @@ function journalLoadMs(graph, session, engine, loadMs, extra = {}) {
 // listed here. Add an entry only when a new durable file would match a suffix.
 const GC_KEEP = new Set(["load-latency.jsonl"]);
 
-// Prune stale per-session subdirectories under journal/pending-nudges/ — the
-// async-classifier pending-result dirs (task-cc-async-classifier-pending-result-
-// injection), keyed by session and otherwise orphaned once that session ends.
-// `liveSessions` is the same concurrently-live set gcJournal derived from the
-// root-level bucket sweep (a session whose OTHER journal artifacts are fresh) —
-// a pending-nudges/<session> dir is exempted if EITHER its own mtime is fresh
-// OR the session is live by that bucket signal, because a detached
-// nudge-worker can be mid-flight (spooled, not yet written back) for a session
-// that hasn't touched this specific directory recently (review finding: relying
-// on the directory's own mtime alone missed a concurrently-live OTHER session).
-function gcPendingNudges(dir, cutoff, session, stat, liveSessions) {
+// Prune stale per-session subdirectories under a journal spool dir — shared by
+// journal/pending-nudges/ (the async-classifier pending-result dirs,
+// task-cc-async-classifier-pending-result-injection) and journal/pending-digests/
+// (the async digest-intent-gate spool, dec-spor-digest-async-intent-gate-
+// implementation) — keyed by session and otherwise orphaned once that session
+// ends. `liveSessions` is the same concurrently-live set gcJournal derived from
+// the root-level bucket sweep (a session whose OTHER journal artifacts are
+// fresh) — a spool <session> dir is exempted if EITHER its own mtime is fresh OR
+// the session is live by that bucket signal, because a detached worker can be
+// mid-flight (spooled, not yet written back) for a session that hasn't touched
+// this specific directory recently (review finding: relying on the directory's
+// own mtime alone missed a concurrently-live OTHER session).
+function gcSpoolDir(dir, cutoff, session, stat, liveSessions) {
   let subs;
   try {
     subs = fs.readdirSync(dir, { withFileTypes: true });
@@ -464,11 +466,12 @@ function gcPendingNudges(dir, cutoff, session, stat, liveSessions) {
 // otherwise accumulate forever (task-spor-client-journal-gc): the
 // <session>.jsonl event logs, the .nudged / .claim-nudged / .coupling-nudged /
 // .heartbeat cooldown markers, the prompt-context-<hash>.json digest caches, and
-// the pending-nudges/<session>/ dirs. Without this a long-lived box grows
-// unbounded disk + inodes in journal/. Throttled to run at most once per
-// gc.intervalMs via a journal/.gc-stamp cooldown (stamped after a successful
-// readdir, before the per-file loop, so a huge first sweep can't repeat every
-// session); entries older than gc.maxAgeMs are removed. Durable state is
+// the pending-nudges/<session>/ and pending-digests/<session>/ spool dirs.
+// Without this a long-lived box grows unbounded disk + inodes in journal/.
+// Throttled to run at most once per gc.intervalMs via a journal/.gc-stamp
+// cooldown (stamped after a successful readdir, before the per-file loop, so a
+// huge first sweep can't repeat every session); entries older than gc.maxAgeMs
+// are removed. Durable state is
 // preserved (GC_KEEP, the llm-calls/ telemetry dir, the enable-hint stamps, and
 // every non-per-session file), and a live session's own files are always kept:
 // the triggering session by name, a CONCURRENTLY-live session by bucketing its
@@ -538,13 +541,13 @@ function gcJournal(graph, opts = {}) {
     // gc.maxAgeMs (review finding), not just the session that triggered the sweep.
     const buckets = new Map(); // session -> [full path]
     const promptCtx = []; // prompt-context-<hash>.json — hash-keyed, can't be bucketed
-    let pending = null; // journal/pending-nudges dir, swept separately
+    const spoolDirs = []; // journal/pending-nudges, journal/pending-digests — swept separately
     for (const ent of entries) {
       const name = ent.name;
       if (GC_KEEP.has(name)) continue;
       if (name.startsWith("enable-hint-")) continue; // per-slug one-time suppression
       if (ent.isDirectory()) {
-        if (name === "pending-nudges") pending = path.join(dir, name);
+        if (name === "pending-nudges" || name === "pending-digests") spoolDirs.push(path.join(dir, name));
         continue; // llm-calls/ and any other dir is not per-session scratch
       }
       if (!ent.isFile()) continue;
@@ -601,7 +604,7 @@ function gcJournal(graph, opts = {}) {
         /* vanished / unreadable */
       }
     }
-    if (pending) gcPendingNudges(pending, cutoff, session, stat, liveSessions);
+    for (const spoolDir of spoolDirs) gcSpoolDir(spoolDir, cutoff, session, stat, liveSessions);
   } catch {
     /* fail-open — GC must never cost the session */
   }
