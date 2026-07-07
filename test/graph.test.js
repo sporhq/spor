@@ -186,6 +186,57 @@ b
   assert.deepEqual(n.commits, ["wf@0123abc", "spor@deadbeefcafe"]);
 });
 
+test("parseFrontmatter: commits YAML block list parses to the same array as the inline form", () => {
+  // issue-spor-cli-put-node-block-list-frontmatter: a block list used to fall
+  // through to folded-scalar handling, silently flattening it into a string.
+  const raw = `---
+id: task-c2
+type: task
+title: t
+summary: s
+commits:
+  - wf@0123abc
+  - spor@deadbeefcafe
+date: 2026-06-01
+---
+b
+`;
+  const n = graph.parseFrontmatter(raw, "task-c2.md");
+  assert.deepEqual(n.commits, ["wf@0123abc", "spor@deadbeefcafe"]);
+});
+
+test("parseFrontmatter: empty YAML block list parses to an empty array", () => {
+  const raw = `---
+id: task-c3
+type: task
+title: t
+summary: s
+commits:
+tags: [x]
+date: 2026-06-01
+---
+b
+`;
+  const n = graph.parseFrontmatter(raw, "task-c3.md");
+  assert.deepEqual(n.commits, []);
+  assert.deepEqual(n.tags, ["x"]);
+});
+
+test("parseFrontmatter: a non-list key's block-style continuation still folds as a scalar", () => {
+  const raw = `---
+id: dec-fold
+type: decision
+title: t
+summary: line one
+  line two
+date: 2026-06-01
+---
+b
+`;
+  const n = graph.parseFrontmatter(raw, "dec-fold.md");
+  assert.equal(n.summary, "line one line two");
+});
+
 test("parseFrontmatter: edge lines parse to {type,to} objects", () => {
   const raw = `---
 id: dec-e

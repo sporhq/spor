@@ -75,9 +75,11 @@ Rules:
   `- {type: assigned, to: agent-X, profile: profile-Y}` — preserved on the edge
   object (the per-assignment profile override; see "The agent orchestration
   layer"). Plain `{type, to}` edges are unchanged.
-- `commits` is an optional inline list of repo-qualified git shas
-  (`commits: [wf@1a2b3c4d, ...]`, kebab-case repo slug + 7–40 hex) linking
-  the node to the code commits that implement it (task-cc-commit-linking).
+- `commits` is an optional list of repo-qualified git shas (kebab-case repo
+  slug + 7–40 hex), inline (`commits: [wf@1a2b3c4d, ...]`) or as a YAML block
+  list (`commits:` followed by indented `- wf@1a2b3c4d` lines — both forms
+  parse to the same array), linking the node to the code commits that
+  implement it (task-cc-commit-linking).
   Commits are not nodes — a node-per-commit would mirror `git log` and drown
   the curated graph; the field plus the `Spor: <node-id>`
   commit-message trailer give both directions (node→commit here, commit→node
