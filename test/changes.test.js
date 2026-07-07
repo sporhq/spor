@@ -116,6 +116,40 @@ test("collect: --since as a date phrase filters by commit time", () => {
   assert.deepEqual(r.changes.map((c) => c.id), ["task-new"]);
 });
 
+test("collect: --since <today's bare date> includes a commit from earlier today (boundary is inclusive, not 'now')", () => {
+  // Regression for issue-spor-changes-since-boundary-exclusive: git's approxidate
+  // anchors a bare YYYY-MM-DD to the CURRENT time-of-day, not midnight, so
+  // `--since=<today>` used to compare against "today at process-start time" and
+  // drop anything committed earlier the same day. Commit near midnight UTC today
+  // and query --since with today's bare date; it must still show up.
+  const home = initGraph();
+  writeNode(home, "task-early", "task");
+  const today = new Date().toISOString().slice(0, 10);
+  commit(home, `${today}T00:00:01Z`, "early-today");
+  const r = changesLib.collect({ nodesDir: nodesOf(home), since: today });
+  assert.deepEqual(r.changes.map((c) => c.id), ["task-early"]);
+});
+
+test("collect: --since <bare date> pins UTC midnight regardless of the process's local timezone", () => {
+  // A bare date anchored to the process's LOCAL time (e.g. `${since} 00:00:00`,
+  // parsed in TZ) would shift the boundary by the TZ offset and could still drop
+  // a same-UTC-day commit made before local midnight — the same bug, just
+  // relocated. Run under a non-UTC TZ and confirm a commit shortly after UTC
+  // midnight still matches `--since` = that UTC date.
+  const home = initGraph();
+  writeNode(home, "task-early", "task");
+  commit(home, "2026-07-07T00:00:01Z", "early-utc");
+  const prevTz = process.env.TZ;
+  process.env.TZ = "America/New_York"; // UTC-4/5 — local midnight is hours after UTC midnight
+  let r;
+  try {
+    r = changesLib.collect({ nodesDir: nodesOf(home), since: "2026-07-07" });
+  } finally {
+    if (prevTz === undefined) delete process.env.TZ; else process.env.TZ = prevTz;
+  }
+  assert.deepEqual(r.changes.map((c) => c.id), ["task-early"]);
+});
+
 test("collect: a sha-like --since that doesn't resolve throws bad_since", () => {
   const home = initGraph();
   writeNode(home, "task-a", "task");
