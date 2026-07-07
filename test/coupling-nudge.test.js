@@ -132,6 +132,38 @@ test("short-path / symlink parity: a git long-path top vs an aliased cwd still f
   assert.match(ctx, /norm-projx-api-docs/);
 });
 
+test("symlink-alias parity: a trigger glob authored against the RESOLVED path still fires when edited via the alias (task-spor-coupling-matcher-symlink-alias)", async (t) => {
+  // A tracked in-repo symlinked subtree (`frontend -> packages/web`) gives one
+  // edit two valid repo-relative spellings. The edit itself is reached via the
+  // alias (`frontend/app.js`, no walk-out — literal-first keeps that spelling),
+  // but the norm's couples_when glob is authored against the git-resolved
+  // subtree (`packages/web/**`). Before this fix, only the alias spelling was
+  // ever tested and the nudge stayed silent; now both spellings are tested.
+  const { home, cwd } = scratch();
+  fs.mkdirSync(path.join(cwd, "packages", "web"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "packages", "web", "app.js"), "x");
+  try {
+    fs.symlinkSync(path.join(cwd, "packages", "web"), path.join(cwd, "frontend"), "dir");
+  } catch {
+    t.skip("symlinks unavailable on this host");
+    return;
+  }
+  writeNorm(path.join(home, "nodes"), "norm-projx-web-docs", {
+    title: "web changes update the docs",
+    extra: "project: projx\n",
+    when: ["packages/web/**"],
+    also: ["API.md"],
+  });
+  const out = await runAsync(
+    ["post-tool", "--host", "claude-code"],
+    editPayload(cwd, "s1", "frontend/app.js"),
+    freshEnv(home)
+  );
+  const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /You edited frontend\/app\.js/); // literal-first spelling for the human-facing line
+  assert.match(ctx, /norm-projx-web-docs/);
+});
+
 test("once per (session, norm): a second matching edit is silent, a NEW norm still fires", async () => {
   const { home, cwd } = scratch();
   const nodes = path.join(home, "nodes");

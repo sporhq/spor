@@ -700,12 +700,11 @@ function canonPath(p) {
 // `frontend -> packages/web` still reads as `frontend/…`, since that literal
 // path never walks out, so a coupling glob authored against the alias keeps
 // matching (only a genuine walk-out triggers canonicalization).
-//   TRADEOFF: an in-repo symlink has two valid spellings and no single
-//   derivation matches both — literal-first favors the alias, so conversely a
-//   glob authored against the RESOLVED subtree (`packages/web/**`) won't match
-//   an edit reached via the alias. That case is rare (a tracked symlinked
-//   subtree AND a coupling glob on it); matching both spellings at once would be
-//   a matcher-level change, left as a follow-up.
+//   An in-repo symlink has two valid spellings and this single-value
+//   derivation can only ever return one of them at a time (literal-first
+//   favors the alias). See repoRelativeCandidates below for the matcher-level
+//   fix that hands the coupling matcher BOTH spellings at once
+//   (task-spor-coupling-matcher-symlink-alias).
 function toRepoRel(top, file) {
   const lit = path.relative(top, file).split(path.sep).join("/");
   if (lit === "" || (!lit.startsWith("../") && lit !== ".." && !path.isAbsolute(lit))) return lit;
@@ -721,6 +720,25 @@ function repoRelative(top, file) {
   const rel = toRepoRel(top, file);
   if (!rel || rel.startsWith("../") || rel === ".." || path.isAbsolute(rel)) return null;
   return rel;
+}
+
+// Every valid repo-relative spelling for `file` — the literal (alias) spelling
+// AND the canonical (git-resolved) spelling, deduped, IN-REPO ONLY (empty
+// array when neither stays inside the repo — mirrors repoRelative's null
+// contract for the single-candidate case). For an ordinary file the two
+// spellings coincide and this returns one entry; for a file reached through a
+// tracked in-repo symlink (`frontend -> packages/web`) it returns both
+// `frontend/app.js` and `packages/web/app.js`, so a consumer that tests every
+// candidate (the coupling matcher's couplingHit) matches a glob authored
+// against either side of the symlink (task-spor-coupling-matcher-symlink-alias).
+function repoRelativeCandidates(top, file) {
+  const inRepo = (rel) => rel !== "" && rel !== ".." && !rel.startsWith("../") && !path.isAbsolute(rel);
+  const lit = path.relative(top, file).split(path.sep).join("/");
+  const canon = path.relative(canonPath(top), canonPath(file)).split(path.sep).join("/");
+  const out = [];
+  if (inRepo(lit)) out.push(lit);
+  if (inRepo(canon) && !out.includes(canon)) out.push(canon);
+  return out;
 }
 
 function ensureDir(dir) {
@@ -1381,6 +1399,7 @@ module.exports = {
   canonPath,
   toRepoRel,
   repoRelative,
+  repoRelativeCandidates,
   ensureDir,
   spoolStats,
   ensureGraphGitignore,

@@ -102,3 +102,19 @@ test("matchCouplings returns each hit norm once, non-norms and misses filtered",
   const out = c.matchCouplings(norms, { slug: "projx", relPath: "src/deep/f.js", repoTags: [] });
   assert.deepStrictEqual(out.map((n) => n.id), ["norm-a"]);
 });
+
+test("couplingHit: relPath as an array tests every candidate spelling (task-spor-coupling-matcher-symlink-alias)", () => {
+  // An in-repo symlinked subtree has two valid spellings for the same edit —
+  // the alias (`frontend/app.js`) and the git-resolved path
+  // (`packages/web/app.js`). A caller unsure which one a glob was authored
+  // against passes both; a hit on EITHER counts.
+  const aliasNorm = NORM({ couples_when: ["frontend/**"] });
+  const resolvedNorm = NORM({ couples_when: ["packages/web/**"] });
+  const ctx = { slug: "projx", relPath: ["frontend/app.js", "packages/web/app.js"], repoTags: [] };
+  assert.ok(c.couplingHit(aliasNorm, ctx), "glob on the alias spelling matches");
+  assert.ok(c.couplingHit(resolvedNorm, ctx), "glob on the resolved spelling matches too");
+  // a glob matching neither candidate still misses
+  assert.ok(!c.couplingHit(NORM({ couples_when: ["docs/**"] }), ctx));
+  // a bare string still works (back-compat single-spelling contract)
+  assert.ok(c.couplingHit(aliasNorm, { ...ctx, relPath: "frontend/app.js" }));
+});

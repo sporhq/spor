@@ -1744,16 +1744,18 @@ async function cmdCheck(cfg, args) {
   let changed = [];
   let rightRev = null; // where value invariants read from (--range reads the range's right side)
   if (files) {
-    changed = files.map((f) => {
+    changed = files.flatMap((f) => {
       const abs = path.isAbsolute(f) ? f : path.resolve(cwd, f);
-      // toRepoRel derives the path literal-first, canonicalizing both sides only
-      // when the literal walks out — so a Windows 8.3 short path (os.tmpdir's
-      // RUNNER~1) can't mismatch git's long --show-toplevel and escape the repo,
-      // while an in-repo path keeps its literal spelling
-      // (issue-spor-windows-ci-short-path-mismatch). The same helper the coupling
-      // nudge uses; a genuinely out-of-repo --files entry stays out-of-repo (a
-      // `../…` path) rather than being dropped.
-      return u.toRepoRel(top, abs);
+      // repoRelativeCandidates derives every valid repo-relative spelling
+      // in-repo (literal-first, canonicalizing away from the literal only
+      // when it walks out — issue-spor-windows-ci-short-path-mismatch — or
+      // when an in-repo symlinked subtree gives the file two distinct
+      // spellings — task-spor-coupling-matcher-symlink-alias), so a coupling
+      // glob authored against either side of a tracked symlink still matches.
+      // A genuinely out-of-repo --files entry has no in-repo candidate; fall
+      // back to toRepoRel's single `../…` spelling rather than dropping it.
+      const rels = u.repoRelativeCandidates(top, abs);
+      return rels.length ? rels : [u.toRepoRel(top, abs)];
     });
   } else if (range) {
     const r = git(top, ["diff", "--name-only", range]);

@@ -601,18 +601,24 @@ async function couplingNudge({ input, graph, slug, session, cwd, remote }) {
   // edited file's path under it; a write outside any repo can't match.
   const top = u.git(cwd, ["rev-parse", "--show-toplevel"])?.trim();
   if (!top) return null;
-  // repoRelative derives the path literal-first and only canonicalizes when the
-  // literal walks out of the repo — the windows-latest short-vs-long-path split
-  // (os.tmpdir()'s RUNNER~1 vs git's long --show-toplevel), where the naive
-  // path.relative walks clean out (issue-spor-windows-ci-short-path-mismatch).
-  const rel = u.repoRelative(top, file);
-  if (!rel) return null;
+  // repoRelativeCandidates derives every valid repo-relative spelling of the
+  // edited path: the literal (alias) spelling and the canonical (git-resolved)
+  // spelling, only canonicalizing away from the literal when it walks out of
+  // the repo — the windows-latest short-vs-long-path split (os.tmpdir()'s
+  // RUNNER~1 vs git's long --show-toplevel; issue-spor-windows-ci-short-path-
+  // mismatch) — or when an in-repo symlinked subtree gives the file two
+  // distinct valid spellings (task-spor-coupling-matcher-symlink-alias). The
+  // matcher below tests a norm's triggers against every candidate, so a glob
+  // authored against either spelling still fires.
+  const rels = u.repoRelativeCandidates(top, file);
+  if (!rels.length) return null;
+  const rel = rels[0]; // literal-first, for the human-facing "you edited ..." line
 
   const data = remote ? await remoteCouplingData(graph) : localCouplingData(graph);
   if (!data || !Array.isArray(data.norms) || data.norms.length === 0) return null;
   const hits = coupling.matchCouplings(data.norms, {
     slug,
-    relPath: rel,
+    relPath: rels,
     repoTags: data.repo_tags?.[slug] ?? [],
   });
   if (!hits.length) return null;

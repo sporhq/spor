@@ -241,6 +241,29 @@ test("CLI local: --files derives repo-relative paths through an aliased cwd (iss
   assert.equal(j.findings[0].norm, "norm-c");
 });
 
+test("CLI local: --files through a tracked in-repo symlinked subtree matches a trigger authored against EITHER spelling (task-spor-coupling-matcher-symlink-alias)", async (t) => {
+  const { home, cwd } = scratch();
+  fs.mkdirSync(path.join(cwd, "packages", "web"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "packages", "web", "app.js"), "x\n");
+  try {
+    fs.symlinkSync(path.join(cwd, "packages", "web"), path.join(cwd, "frontend"), "dir");
+  } catch {
+    t.skip("symlinks unavailable on this host");
+    return;
+  }
+  // the norm's trigger is authored against the git-RESOLVED subtree
+  writeNorm(home, "norm-web", "couples_when: [packages/web/**]\ncouples_also: [API.md]\n");
+  const env = baseEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_ENABLED: "1" });
+  // but --files is given the ALIAS spelling, as a caller reaching the file
+  // through the symlinked directory would
+  const r = await runCli(["check", "--files", "frontend/app.js", "--json"], cwd, env);
+  const j = JSON.parse(r.stdout);
+  assert.deepEqual(j.changed.sort(), ["frontend/app.js", "packages/web/app.js"]);
+  assert.equal(j.findings.length, 1);
+  assert.equal(j.findings[0].norm, "norm-web");
+  assert.deepEqual(j.findings[0].triggered, ["packages/web/app.js"]);
+});
+
 test("CLI local: --range checks a commit range and reads invariant values from its right side", async () => {
   const { home, cwd, g } = scratch();
   writeNorm(home, "norm-v",

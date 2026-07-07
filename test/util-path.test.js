@@ -79,3 +79,29 @@ test("canonPath: idempotent on an already-canonical existing path", () => {
   const top = scratch("spor-relpath-");
   assert.equal(u.canonPath(top), top);
 });
+
+test("repoRelativeCandidates: an in-repo symlinked subtree yields BOTH the alias and resolved spellings (task-spor-coupling-matcher-symlink-alias)", () => {
+  const top = scratch("spor-relpath-");
+  fs.mkdirSync(path.join(top, "packages", "web"), { recursive: true });
+  fs.writeFileSync(path.join(top, "packages", "web", "app.js"), "x");
+  try {
+    fs.symlinkSync(path.join(top, "packages", "web"), path.join(top, "frontend"), "dir");
+  } catch {
+    return; // symlinks unavailable on this host
+  }
+  const candidates = u.repoRelativeCandidates(top, path.join(top, "frontend", "app.js"));
+  assert.deepEqual(candidates.sort(), ["frontend/app.js", "packages/web/app.js"].sort());
+});
+
+test("repoRelativeCandidates: an ordinary in-repo file (no symlink) yields one candidate", () => {
+  const top = scratch("spor-relpath-");
+  fs.mkdirSync(path.join(top, "src"), { recursive: true });
+  const file = path.join(top, "src", "code.js");
+  assert.deepEqual(u.repoRelativeCandidates(top, file), ["src/code.js"]);
+});
+
+test("repoRelativeCandidates: a genuinely out-of-repo file yields no candidates", () => {
+  const top = scratch("spor-relpath-");
+  const sibling = scratch("spor-relpath-out-");
+  assert.deepEqual(u.repoRelativeCandidates(top, path.join(sibling, "x.js")), []);
+});
