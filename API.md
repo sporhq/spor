@@ -318,7 +318,7 @@ The decision queue (QUEUE.md §4/§5) — the data answer to "show my queue" /
 "<person-id>|me", "limit"?: 20,
 "offset"?: 0 }` → `{ "items": [{id, title, type, status,
 priority, score, signals: {blocking, heat, staleness, age_days}, suggest:
-"do|close", why}], "count": N, "offset": 0, "returned_count": N,
+"do|dispatch|blocked|triage|close|approve", why}], "count": N, "offset": 0, "returned_count": N,
 "total_count": N, "truncated": false, "next_offset": null, "questions": []
 }` — queueable live nodes ranked by the default blend, each with a one-line
 *why*. Items already retired by a live inbound resolves/answers edge are
