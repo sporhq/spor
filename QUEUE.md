@@ -554,11 +554,13 @@ Readiness leads the why-line when decisive (`agent-ready: …` / `needs human:
 …`), and the envelope gains `counts_by_readiness` ({agent, human, untriaged},
 present only when there is readiness signal or a readiness facet was asked
 for) — the headline "how much of my queue can an agent take right now?" A
-**readiness filter** (`rankQueue({readiness})`, a class or array; `GET
-/v1/queue?readiness=` / `show_queue {readiness}` / `spor next --readiness`,
-comma-separated) narrows the queue to a class as a hard scope like
-`project`/`type` (schema-approval items, outside the classification, are
-excluded). A graph with no readiness data is byte-identical to before — no
+**readiness filter** (`rankQueue({readiness})`, a class or array; today on the
+kernel opt and the local CLI's `--readiness`, comma-separated — the `GET
+/v1/queue?readiness=` param, `show_queue {readiness}`, and remote `spor next
+--readiness` forwarding land with the server render-surfaces slice,
+task-spor-queue-readiness-render-surfaces) narrows the queue to a class as a
+hard scope like `project`/`type` (schema-approval items, outside the
+classification, are excluded). A graph with no readiness data is byte-identical to before — no
 fields, no clause, no count. Hard triage gaps recorded during a make-ready pass
 become explicit `blocks` edges (which correctly remove the item until
 answered); readiness handles the soft/derived side.
