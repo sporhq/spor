@@ -36,6 +36,11 @@ const sat = require(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
 // queue ranker and read surfaces use. The dispatch guard reads it so it never
 // launches an agent at already-finished work (issue-spor-dispatch-resolved-task-no-guard).
 const { isTerminalStatus, resolutionOf } = require(path.join(ROOT, "lib", "kernel", "resolution.js"));
+// Agent-readiness (dec-spor-agent-readiness-derived-classification): the same
+// derivation rankQueue uses per queue item, reused here for ONE node so the
+// dispatch guard (task-spor-dispatch-readiness-guard) shares its classification
+// and reason wording with `spor next` rather than re-deriving it.
+const { deriveReadiness, readinessOf } = require(path.join(ROOT, "lib", "kernel", "queue.js"));
 // renderReport mirrors the analyze/renderReport façade for remote `spor
 // analytics`: the server returns the machine report, the client renders it with
 // the SAME renderer local mode uses, so output matches (task-spor-analytics-
@@ -5918,12 +5923,19 @@ async function resolveNode(cfg, id) {
   // top-level keys (API.md §3): `resolution` is the live inbound resolves/answers
   // edge (the resolver's id/summary/title), present only when the node is retired
   // by one. Keep it so the resolved-task guard can refuse without a second fetch.
+  // `held` (schema-task.md get(), 2026.06.19.2) is the same hook's held-task churn
+  // note — an open task with a recorded non-resolving outcome and no live blocker
+  // — kept for the readiness guard's remote-mode warn (task-spor-dispatch-
+  // readiness-guard): it's already computed server-side, so reusing it costs no
+  // extra round trip.
   let resolution = null;
+  let held = null;
   if (cfg.mode() === "remote") {
     const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 6000 });
     if (!r.ok) return null;
     raw = (r.json && r.json.raw) || r.text || "";
     resolution = (r.json && r.json.resolution) || null;
+    held = (r.json && r.json.held) || null;
   } else {
     try {
       raw = fs.readFileSync(path.join(cfg.nodesDir(), `${id}.md`), "utf8");
@@ -5931,7 +5943,7 @@ async function resolveNode(cfg, id) {
       return null;
     }
   }
-  return { id, raw, repo: fmField(raw, "repo") || fmField(raw, "project"), title: fmField(raw, "title") || "", resolution };
+  return { id, raw, repo: fmField(raw, "repo") || fmField(raw, "project"), title: fmField(raw, "title") || "", resolution, held };
 }
 
 // Is this node ALREADY RESOLVED — so dispatching an agent at it would just redo
@@ -5958,6 +5970,66 @@ function dispatchResolutionReason(cfg, node) {
     }
   }
   return null;
+}
+
+// Agent-readiness dispatch guard (task-spor-dispatch-readiness-guard, dec-spor-
+// agent-readiness-derived-classification): classify what THIS dispatch is about
+// to hand an agent, before launch. `requires: human` is the hard REFUSE case —
+// the risk-class register's first consumer, work no agent can complete
+// regardless of capability, mirroring the profile-satisfiability refusal (no
+// --force bypass, the assignment stays intact). The broader `readiness: human`
+// classification (assigned to a person, a held task, an open neighborhood
+// question, or the item itself being a question/capture) WARNS loudly but does
+// not block the dispatch.
+//
+// LOCAL mode loads the graph and runs the EXACT rankQueue derivation
+// (lib/kernel/queue.js readinessOf) for this one node, front included — the
+// same git-derived signal `spor next` uses. REMOTE mode has no client-side
+// graph, so it approximates with a synthetic one-hop graph fed through the SAME
+// deriveReadiness kernel function (so the reason wording matches the queue
+// exactly): the requires:/readiness: stamps read straight off the node's own
+// frontmatter (exact); an `assigned` edge's target type is inferred from the
+// agent-id naming convention (isAgentId — the same discriminator
+// resolveDispatchProfile already uses for this edge); `held` rides the server's
+// already-shipped get() hook enrichment (schema-task.md, fetched by resolveNode
+// — no extra round trip). Open questions in the 1-hop neighborhood are NOT
+// checked remotely — a second fetch for a warn-only signal isn't worth paying
+// (the get() hook has the identical gap: no front-floor twin either). Returns
+// null on any read error or unknown node — fail-open, never blocks a dispatch
+// on an unreadable graph.
+function dispatchReadinessCheck(cfg, node) {
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  let parsed;
+  try {
+    parsed = graphLib.parseFrontmatter(node.raw, "node.md");
+  } catch {
+    return null;
+  }
+  if (cfg.mode() !== "remote") {
+    try {
+      const g = graphLib.loadGraph(cfg.nodesDir());
+      if (!g.nodes[node.id]) return null;
+      const queueLib = require(path.join(ROOT, "lib", "queue.js"));
+      const days = cfg.getNum("queue.front.days", 7);
+      const frontOn = cfg.getBool("queue.front.enabled", true);
+      const front = frontOn ? queueLib.gitFront(path.dirname(g.nodesDir), path.basename(g.nodesDir), days) : null;
+      return readinessOf(g, node.id, { front });
+    } catch {
+      return null; // fail-open — an unreadable graph never blocks a dispatch
+    }
+  }
+  // Key by the node's OWN frontmatter id (deriveReadiness indexes graph.adj by
+  // `node.id`, i.e. parsed.id here) rather than the requested id — they agree in
+  // the overwhelming case, but keying consistently is what actually matters.
+  const stubId = parsed.id || node.id;
+  const stubNodes = { [stubId]: parsed };
+  for (const e of parsed.edges ?? []) {
+    if (e.type === "assigned" && !stubNodes[e.to]) {
+      stubNodes[e.to] = { type: isAgentId(e.to) ? "agent" : "person" };
+    }
+  }
+  const held = !!(node.held && Array.isArray(node.held.outcomes) && node.held.outcomes.length);
+  return deriveReadiness({ nodes: stubNodes, adj: { [stubId]: [] } }, parsed, held, {}, true);
 }
 
 // Resolve the profile THIS dispatch would run UNDER and check whether this
@@ -6608,6 +6680,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   let instruction = "";
   let nodeTitle = "";
   let resolvedReason = null; // set in node mode when the target is already resolved
+  let readinessCheck = null; // set in node mode: {readiness, reasons} — the agent-readiness guard
 
   if (fromQueue) {
     const top = await topQueueItem(cfg, targetSlug);
@@ -6642,6 +6715,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     targetSlug = targetSlug || node.repo || null;
     nodeTitle = node.title || "";
     resolvedReason = dispatchResolutionReason(cfg, node);
+    readinessCheck = dispatchReadinessCheck(cfg, node);
     if (!noBrief) brief = await compileBriefing(cfg, { nodeId, full, project: targetSlug });
     instruction = `Work on ${nodeId}${node.title ? ` — ${node.title}` : ""}. The compiled Spor briefing above is your standing context.${taskText ? ` ${taskText}` : ""}`;
     name = name || nodeId;
@@ -6853,6 +6927,14 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   }
   const unsatisfiable = !!(profileCheck && profileCheck.verdict && !profileCheck.verdict.ok);
 
+  // Agent-readiness guard inputs (task-spor-dispatch-readiness-guard): computed
+  // once, read by both the --print preview and the real-run refusal/warn below.
+  // `requires: human` (readinessRequiresHuman) is the hard-refuse subset of the
+  // broader `readiness: human` classification (readinessHuman) — see the
+  // real-run guard for the distinction.
+  const readinessHuman = !!(readinessCheck && readinessCheck.readiness === "human");
+  const readinessRequiresHuman = readinessHuman && readinessCheck.reasons.includes("requires human");
+
   const claudeBin = claudeCmd();
   const claudeArgs = ["--bg"];
   if (name) claudeArgs.push("--name", name);
@@ -6900,6 +6982,18 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
           (force ? " — --force set, dispatching anyway" : " — real dispatch would refuse (--force overrides)")
       );
     }
+    // Agent-readiness guard preview (shown only when the node's derived
+    // readiness is decisively human, so a clean/agent-ready/untriaged --print
+    // stays byte-identical). requires:human is the one reason with NO --force
+    // override — the risk-class register, not a capability gap.
+    if (readinessHuman) {
+      out(
+        `readiness: human — ${readinessCheck.reasons.join(", ")}` +
+          (readinessRequiresHuman
+            ? " — real dispatch would REFUSE (no --force override)"
+            : " — real dispatch would warn and proceed")
+      );
+    }
     // Profile satisfiability preview (shown only when a profile resolves, so a
     // profile-free --print stays byte-identical). A real dispatch refuses when
     // UNSATISFIABLE, leaving the assignment intact.
@@ -6945,6 +7039,26 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     err(`${nodeId} is already resolved (${resolvedReason}) — not dispatching.`);
     err(`  re-run with --force to dispatch at it anyway, or pick another task with 'spor next'.`);
     return 1;
+  }
+
+  // Agent-readiness guard (task-spor-dispatch-readiness-guard, dec-spor-agent-
+  // readiness-derived-classification): `requires: human` is the risk-class
+  // register's own declaration that no agent can complete this work, regardless
+  // of capability — a REFUSE before any side effect, with NO --force override
+  // (unlike every other dispatch guard): overriding it would be exactly the
+  // silent substitution the profile-satisfiability rule below also forbids. A
+  // broader `readiness: human` classification (assigned to a person, a held
+  // task, an open neighborhood question, or the item itself a question/capture)
+  // is not a capability gap, so it only WARNS and the dispatch proceeds.
+  if (readinessRequiresHuman) {
+    err(`cannot dispatch ${nodeId || name}: this item requires a human — ${readinessCheck.reasons.join(", ")}.`);
+    err(`  the assignment is unchanged. A human must do this work (or edit the node's 'requires:' list once`);
+    err(`  it no longer needs one), then dispatch again — a readiness stamp alone can't override it.`);
+    return 1;
+  }
+  if (readinessHuman) {
+    err(`warning: ${nodeId || name}'s derived readiness is human, not agent — ${readinessCheck.reasons.join(", ")}.`);
+    err(`  dispatching anyway; 'spor next' shows the same signal if you'd rather triage first.`);
   }
 
   // Refuse BEFORE any side effect if this machine can't satisfy the resolved
@@ -9013,6 +9127,11 @@ const COMMANDS = {
       "And it is refused if the target is already resolved — a terminal status, or\n" +
       "retired by an inbound resolves/answers edge — so an agent is never sent to redo\n" +
       "finished work. --force overrides.\n\n" +
+      "A node dispatch also checks its derived agent-readiness (dec-spor-agent-\n" +
+      "readiness-derived-classification): 'requires: human' work REFUSES outright,\n" +
+      "naming the gap — no --force override, since no agent can do it regardless of\n" +
+      "capability. A broader human classification (assigned to a person, a held\n" +
+      "task, an open neighborhood question) only WARNS; the dispatch proceeds.\n\n" +
       "--worktree runs the agent in its own git worktree off the repo (branch = the\n" +
       "node id / sanitized task), so parallel dispatches never race the shared tree/\n" +
       "index. Make it a repo default with dispatch.worktree — in the TARGET repo's\n" +

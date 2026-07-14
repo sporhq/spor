@@ -1328,8 +1328,11 @@ function runAsync(args, env, cwd) {
 // and POST /v1/nodes/{id}/claim with a caller-chosen status/body. Records hits.
 // `nodeStatus`/`nodeResolution` shape the GET node to exercise the resolved-task
 // guard: a terminal `status:` line and/or the server's `resolution` enrichment
-// (the inbound resolves/answers edge it surfaces, API.md §3).
-function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nodeResolution = null } = {}) {
+// (the inbound resolves/answers edge it surfaces, API.md §3). `nodeRequires`/
+// `nodeHeld` exercise the readiness guard (task-spor-dispatch-readiness-guard):
+// a `requires:` frontmatter line and/or the server's `held` get()-hook
+// enrichment (schema-task.md).
+function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nodeResolution = null, nodeRequires = null, nodeHeld = null } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = "";
@@ -1339,8 +1342,10 @@ function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nod
       if (req.method === "GET" && /^\/v1\/nodes\/[^/]+$/.test(req.url)) {
         const id = decodeURIComponent(req.url.split("/").pop());
         const statusLine = nodeStatus ? `\nstatus: ${nodeStatus}` : "";
-        const node = { raw: `---\nid: ${id}\ntype: task\nrepo: demo${statusLine}\ntitle: Demo task ${id}\nsummary: A demo task.\ndate: 2026-06-01\n---\nbody\n` };
+        const requiresLine = nodeRequires ? `\nrequires: [${nodeRequires}]` : "";
+        const node = { raw: `---\nid: ${id}\ntype: task\nrepo: demo${statusLine}${requiresLine}\ntitle: Demo task ${id}\nsummary: A demo task.\ndate: 2026-06-01\n---\nbody\n` };
         if (nodeResolution) node.resolution = nodeResolution;
+        if (nodeHeld) node.held = nodeHeld;
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(node));
         return;
@@ -1883,6 +1888,145 @@ test("dispatch <node-id> --force (remote): launches despite the server reporting
     assert.strictEqual(r.status, 0, r.stderr);
     assert.ok(claimHit(hits), "--force still auto-claims the lease");
     assert.ok(fs.existsSync(sentinel), "and launches");
+  } finally {
+    srv.close();
+  }
+});
+
+// --- agent-readiness dispatch guard (task-spor-dispatch-readiness-guard,
+// dec-spor-agent-readiness-derived-classification) --- `requires: human` is a
+// hard REFUSE (no --force, the risk-class register itself), a broader derived
+// `readiness: human` (assigned to a person, a held task) only WARNS and the
+// dispatch proceeds. Local mode gets the exact rankQueue derivation (full
+// graph); remote mode approximates it off the node's own frontmatter plus the
+// server's already-shipped get() hook `held` enrichment (see resolveNode).
+
+function readinessFixture() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-rdy-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  fs.writeFileSync(
+    path.join(nodes, "task-needs-human.md"),
+    `---\nid: task-needs-human\ntype: task\nrepo: demo\nstatus: open\nrequires: [human]\ntitle: Work only a human can do\nsummary: A task marked requires human — no agent can complete it regardless of capability.\ndate: 2026-06-01\n---\nbody\n`
+  );
+  fs.writeFileSync(
+    path.join(nodes, "task-assigned-person.md"),
+    `---\nid: task-assigned-person\ntype: task\nrepo: demo\nstatus: open\ntitle: Work assigned to a person\nsummary: A task carrying an assigned edge to a person node, not an agent.\ndate: 2026-06-02\nedges:\n  - {type: assigned, to: person-x}\n---\nbody\n`
+  );
+  fs.writeFileSync(
+    path.join(nodes, "person-x.md"),
+    `---\nid: person-x\ntype: person\nrepo: demo\ntitle: Person X\nsummary: A team member who does work in the demo project.\ndate: 2026-06-01\n---\nbody\n`
+  );
+  fs.writeFileSync(
+    path.join(nodes, "task-agent-ready.md"),
+    `---\nid: task-agent-ready\ntype: task\nrepo: demo\nstatus: open\nreadiness: agent\nreadiness_by: Dana via cli\ntitle: Stamped agent-ready\nsummary: A task explicitly stamped agent-ready, so the guard has nothing to warn about.\ndate: 2026-06-03\n---\nbody\n`
+  );
+  fs.writeFileSync(
+    path.join(nodes, "task-plain.md"),
+    `---\nid: task-plain\ntype: task\nrepo: demo\nstatus: open\ntitle: A plain, untriaged task\nsummary: A task with no readiness signal at all — untriaged, no guard output.\ndate: 2026-06-04\n---\nbody\n`
+  );
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-repo-"));
+  return { home, nodes, repo };
+}
+
+test("dispatch <node-id> (local): requires:human REFUSES, no launch, no claim", () => {
+  const { home, repo } = readinessFixture();
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "task-needs-human", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  assert.strictEqual(r.status, 1, r.stderr);
+  assert.match(r.stderr, /cannot dispatch task-needs-human: this item requires a human — requires human\./);
+  assert.match(r.stderr, /the assignment is unchanged/);
+  assert.doesNotMatch(r.stderr, /--force/, "no --force bypass is offered for the requires:human refusal");
+  assert.ok(!fs.existsSync(sentinel), "no agent was launched at human-only work");
+});
+
+test("dispatch <node-id> --force (local): --force does NOT override the requires:human refusal", () => {
+  const { home, repo } = readinessFixture();
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "task-needs-human", "--dir", repo, "--no-brief", "--force"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  assert.strictEqual(r.status, 1, r.stderr);
+  assert.match(r.stderr, /requires a human/);
+  assert.ok(!fs.existsSync(sentinel), "--force has no effect on the requires:human refusal");
+});
+
+test("dispatch <node-id> (local): assigned-to-person WARNS but still launches", () => {
+  const { home, repo } = readinessFixture();
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "task-assigned-person", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stderr, /warning: task-assigned-person's derived readiness is human, not agent — assigned to person-x\./);
+  assert.ok(fs.existsSync(sentinel), "the warn does not block the dispatch");
+});
+
+test("dispatch <node-id> (local): a readiness:agent-stamped task and a plain untriaged task carry no readiness guard output", () => {
+  const { home, repo } = readinessFixture();
+  for (const id of ["task-agent-ready", "task-plain"]) {
+    const sentinel = path.join(home, `g-launched-${id}`);
+    const stub = claudeStub(home, sentinel);
+    const r = run(["dispatch", id, "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.doesNotMatch(r.stderr, /readiness is human|requires a human/, `${id} must not warn`);
+    assert.ok(fs.existsSync(sentinel));
+  }
+});
+
+test("dispatch <node-id> --print (local): previews the readiness guard; a clean node prints none", () => {
+  const { home, repo } = readinessFixture();
+  const refuse = run(["dispatch", "task-needs-human", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(refuse.status, 0, refuse.stderr);
+  assert.match(refuse.stdout, /readiness: human — requires human — real dispatch would REFUSE \(no --force override\)/);
+  const warn = run(["dispatch", "task-assigned-person", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home });
+  assert.match(warn.stdout, /readiness: human — assigned to person-x — real dispatch would warn and proceed/);
+  const clean = run(["dispatch", "task-plain", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home });
+  assert.doesNotMatch(clean.stdout, /readiness:/);
+});
+
+test("dispatch <node-id> (remote): requires:human REFUSES before the claim — no claim POST, no launch", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ nodeRequires: "human" });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 1, r.stderr);
+    assert.match(r.stderr, /cannot dispatch task-rotate: this item requires a human — requires human\./);
+    assert.ok(!claimHit(hits), "the readiness guard refuses before any claim is POSTed");
+    assert.ok(!fs.existsSync(sentinel), "no agent was launched at human-only work");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch <node-id> (remote): the server's already-shipped held enrichment WARNS but still launches", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ nodeHeld: { outcomes: ["dec-x"], note: "held" } });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stderr, /warning: task-rotate's derived readiness is human, not agent — held task awaiting triage\./);
+    assert.ok(claimHit(hits), "a warn (not a refuse) still proceeds to claim + launch");
+    assert.ok(fs.existsSync(sentinel));
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch <node-id> (remote): no readiness signal at all is byte-identical — no guard output, normal launch", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({});
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.doesNotMatch(r.stderr, /readiness is human|requires a human/);
+    assert.ok(claimHit(hits));
+    assert.ok(fs.existsSync(sentinel));
   } finally {
     srv.close();
   }

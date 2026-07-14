@@ -15,6 +15,7 @@ const path = require("path");
 
 const graph = require(path.join(__dirname, "..", "lib", "graph.js"));
 const { rankQueue, warmQueueIndex, viewerFor } = require(path.join(__dirname, "..", "lib", "queue.js"));
+const { readinessOf } = require(path.join(__dirname, "..", "lib", "kernel", "queue.js"));
 
 // The Symbol the queue kernel memoizes its HEAD-pure indexes under
 // (task-cc-rankqueue-memoization). Global registry key, so the test reads the
@@ -1645,4 +1646,58 @@ test("readiness: an unknown filter class yields an empty queue, never an error",
   const r = rankQueue(g, { now: NOW, readiness: "bogus" });
   assert.deepEqual(r.items, []);
   assert.equal(r.count, 0);
+});
+
+// ---- readinessOf: single-node readiness (task-spor-dispatch-readiness-guard) ----
+// `spor dispatch` needs the same classification for ONE node, outside a ranking
+// pass — readinessOf reuses deriveReadiness (+ the same held/resolvedBy inputs
+// rankQueue computes) so its output matches the queue's item-level fields
+// exactly, with no duplicated classification logic.
+
+test("readinessOf: unknown node id returns null", () => {
+  const g = tmpGraph(Object.fromEntries([node("task-a", "task", { status: "open" })])).load();
+  assert.equal(readinessOf(g, "task-does-not-exist"), null);
+});
+
+test("readinessOf: matches rankQueue's item-level readiness/reasons for requires:human", () => {
+  const g = tmpGraph(Object.fromEntries([raw("task-h", "task", "status: open\nrequires: [human]\n")])).load();
+  const solo = readinessOf(g, "task-h");
+  assert.deepEqual(solo, { readiness: "human", reasons: ["requires human"] });
+  assert.deepEqual(solo, { readiness: rd(g, "task-h").readiness, reasons: rd(g, "task-h").readiness_reasons });
+});
+
+test("readinessOf: matches rankQueue for an untriaged (no-signal) node", () => {
+  const g = tmpGraph(Object.fromEntries([node("task-plain", "task", { status: "open" })])).load();
+  assert.deepEqual(readinessOf(g, "task-plain"), { readiness: "untriaged", reasons: [] });
+});
+
+test("readinessOf: matches rankQueue for assigned->agent and assigned->person", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-to-person", "task", { status: "open", edges: [["assigned", "person-x"]] }),
+    node("task-to-agent", "task", { status: "open", edges: [["assigned", "agent-x"]] }),
+    node("person-x", "person", {}),
+    node("agent-x", "agent", {}),
+  ])).load();
+  assert.deepEqual(readinessOf(g, "task-to-person"), { readiness: "human", reasons: ["assigned to person-x"] });
+  assert.deepEqual(readinessOf(g, "task-to-agent"), { readiness: "agent", reasons: ["assigned to agent agent-x"] });
+});
+
+test("readinessOf: a held task (front over the floor + a non-resolving outcome) classifies human, matching rankQueue's held self-limit", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-held", "task", { status: "open" }),
+    node("dec-held", "decision", { status: "active", edges: [["decided-in", "task-held"]] }),
+  ])).load();
+  const front = { "task-held": 40 };
+  assert.deepEqual(readinessOf(g, "task-held", { front }), { readiness: "human", reasons: ["held task awaiting triage"] });
+  // rankQueue's why-line agrees (the "needs human" clause it leads with).
+  const it = rankQueue(g, { now: NOW, front }).items.find((i) => i.id === "task-held");
+  assert.equal(it.readiness, "human");
+});
+
+test("readinessOf: front at/under the held floor does NOT classify human — matches the held self-limit's floor guard", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-floor", "task", { status: "open" }),
+    node("dec-floor", "decision", { status: "active", edges: [["decided-in", "task-floor"]] }),
+  ])).load();
+  assert.deepEqual(readinessOf(g, "task-floor", { front: { "task-floor": 2 } }), { readiness: "untriaged", reasons: [] });
 });
