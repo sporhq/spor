@@ -1951,6 +1951,44 @@ test("dispatch <node-id> --force (local): --force does NOT override the requires
   assert.ok(!fs.existsSync(sentinel), "--force has no effect on the requires:human refusal");
 });
 
+// issue-spor-dispatch-probe-side-effect-before-refusal: the requires:human
+// refusal must fire BEFORE resolveDispatchProfile/probeCapabilities run, so a
+// refused dispatch persists nothing to local config. Assign the node to an
+// agent under a profile too, so — were the ordering still wrong — profile
+// resolution would run and write a probed capability cache.
+test("dispatch <node-id> (local): requires:human refuses BEFORE profile resolution — no .probed side effect", () => {
+  const { home, nodes, repo } = readinessFixture();
+  writeProfile(nodes, "profile-codex", "harness: codex");
+  fs.writeFileSync(
+    path.join(nodes, "agent-test.md"),
+    `---\nid: agent-test\ntype: agent\ntitle: Test agent\nsummary: A test agent.\ndate: 2026-06-18\nedges:\n  - {type: uses-profile, to: profile-codex}\n---\nAgent.\n`
+  );
+  fs.writeFileSync(
+    path.join(nodes, "task-needs-human-profiled.md"),
+    `---\nid: task-needs-human-profiled\ntype: task\nrepo: demo\nstatus: open\nrequires: [human]\ntitle: Human work also assigned to a profiled agent\nsummary: A requires:human task that ALSO carries an assigned->agent edge with a profile, so profile resolution would run and probe capabilities if the guard didn't refuse first.\ndate: 2026-06-05\nedges:\n  - {type: assigned, to: agent-test}\n---\nbody\n`
+  );
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const cfgFile = path.join(home, "config.json");
+  const r = run(
+    ["dispatch", "task-needs-human-profiled", "--dir", repo, "--no-brief"],
+    { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, ...cleanProbeEnv() }
+  );
+  assert.strictEqual(r.status, 1, r.stderr);
+  assert.match(r.stderr, /cannot dispatch task-needs-human-profiled: this item requires a human/);
+  assert.ok(!fs.existsSync(sentinel), "no agent was launched");
+  let cfg = {};
+  try {
+    cfg = JSON.parse(fs.readFileSync(cfgFile, "utf8"));
+  } catch {
+    /* no config.json at all is also proof of no side effect */
+  }
+  assert.ok(
+    !(cfg.dispatch && cfg.dispatch.capabilities && cfg.dispatch.capabilities.probed),
+    "the refusal must not persist a probed capability cache to local config"
+  );
+});
+
 test("dispatch <node-id> (local): assigned-to-person WARNS but still launches", () => {
   const { home, repo } = readinessFixture();
   const sentinel = path.join(home, "g-launched");

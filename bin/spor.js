@@ -7027,6 +7027,36 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     err(`note: --as ${asAgent} ignored in local mode — agent-on-behalf-of attribution is remote-only`);
   }
 
+  // Agent-readiness guard inputs (task-spor-dispatch-readiness-guard): computed
+  // once, read by both the --print preview and the real-run refusal/warn below.
+  // `requires: human` (readinessRequiresHuman) is the hard-refuse subset of the
+  // broader `readiness: human` classification (readinessHuman) — see the
+  // real-run guard for the distinction. Derived purely from readinessCheck
+  // (already resolved from the node above), so it costs nothing to evaluate
+  // before profile resolution below.
+  const readinessHuman = !!(readinessCheck && readinessCheck.readiness === "human");
+  const readinessRequiresHuman = readinessHuman && readinessCheck.reasons.includes("requires human");
+
+  // Refuse the cheap, node-derived guards BEFORE profile resolution on a REAL run
+  // (issue-spor-dispatch-probe-side-effect-before-refusal): resolveDispatchProfile
+  // below calls probeCapabilities, which PERSISTS a machine-local capability probe
+  // to disk once a profile resolves — a side effect a refused dispatch must not
+  // cause. --print keeps the upfront compute-everything shape (it needs the
+  // profile verdict to preview every guard, this one included), so the early
+  // exit is real-run only; the --print branch below still resolves the profile
+  // and reports each guard's would-refuse verdict for itself.
+  if (!dryRun && resolvedReason && !force) {
+    err(`${nodeId} is already resolved (${resolvedReason}) — not dispatching.`);
+    err(`  re-run with --force to dispatch at it anyway, or pick another task with 'spor next'.`);
+    return 1;
+  }
+  if (!dryRun && readinessRequiresHuman) {
+    err(`cannot dispatch ${nodeId || name}: this item requires a human — ${readinessCheck.reasons.join(", ")}.`);
+    err(`  the assignment is unchanged. A human must do this work (or edit the node's 'requires:' list once`);
+    err(`  it no longer needs one), then dispatch again — a readiness stamp alone can't override it.`);
+    return 1;
+  }
+
   // Profile satisfiability (dec-spor-machine-profile-satisfiability, FORK B).
   // Resolve the profile this dispatch runs under (--profile > the node's
   // assigned->agent profile attr > the agent's default) and decide whether THIS
@@ -7042,14 +7072,6 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     return 1;
   }
   const unsatisfiable = !!(profileCheck && profileCheck.verdict && !profileCheck.verdict.ok);
-
-  // Agent-readiness guard inputs (task-spor-dispatch-readiness-guard): computed
-  // once, read by both the --print preview and the real-run refusal/warn below.
-  // `requires: human` (readinessRequiresHuman) is the hard-refuse subset of the
-  // broader `readiness: human` classification (readinessHuman) — see the
-  // real-run guard for the distinction.
-  const readinessHuman = !!(readinessCheck && readinessCheck.readiness === "human");
-  const readinessRequiresHuman = readinessHuman && readinessCheck.reasons.includes("requires human");
 
   const claudeBin = claudeCmd();
   const claudeArgs = ["--bg"];
@@ -7138,43 +7160,13 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     return 0;
   }
 
-  // Refuse an already-RESOLVED target before the lease/claim, repo registration,
-  // worktree, and agent launch — and before the profile host-match call below
-  // (issue-spor-dispatch-resolved-task-no-guard): dispatching an agent at a node
-  // that is already done — a terminal status, or retired by a live inbound
-  // resolves/answers edge — would just redo finished work and write another
-  // outcome onto a closed node. (The briefing compile above already ran, exactly
-  // as it does for the sibling in-flight guard — refusal is post-briefing,
-  // pre-launch.) Mirrors the in-flight same-machine guard (node mode, both modes);
-  // --force overrides, like that guard and the remote-only duplicate-claim guard.
-  // The ranker already drops resolved items from --from-queue (dec-spor-dispatch-
-  // duplicate-dedup-at-capture-source), so for an auto-pick this is defense-in-depth;
-  // for an explicit `--node <id>` it is the primary guard. Checked first among the
-  // real-run guards so a resolved node short-circuits the host-match call and launch.
-  if (resolvedReason && !force) {
-    err(`${nodeId} is already resolved (${resolvedReason}) — not dispatching.`);
-    err(`  re-run with --force to dispatch at it anyway, or pick another task with 'spor next'.`);
-    return 1;
-  }
-
-  // Agent-readiness guard (task-spor-dispatch-readiness-guard, dec-spor-agent-
-  // readiness-derived-classification): `requires: human` is the risk-class
-  // register's own declaration that no agent can complete this work, regardless
-  // of capability — a REFUSE before any graph write, claim, or launch, with NO
-  // --force override (note: the profile resolution above may already have
-  // persisted a machine-local capability probe cache, a pre-existing ordering —
-  // see issue-spor-dispatch-probe-side-effect-before-refusal)
-  // (unlike every other dispatch guard): overriding it would be exactly the
-  // silent substitution the profile-satisfiability rule below also forbids. A
-  // broader `readiness: human` classification (assigned to a person, a held
-  // task, an open neighborhood question, or the item itself a question/capture)
-  // is not a capability gap, so it only WARNS and the dispatch proceeds.
-  if (readinessRequiresHuman) {
-    err(`cannot dispatch ${nodeId || name}: this item requires a human — ${readinessCheck.reasons.join(", ")}.`);
-    err(`  the assignment is unchanged. A human must do this work (or edit the node's 'requires:' list once`);
-    err(`  it no longer needs one), then dispatch again — a readiness stamp alone can't override it.`);
-    return 1;
-  }
+  // The already-RESOLVED guard and the requires:human agent-readiness guard both
+  // already refused above (before profile resolution) on a real run — nothing
+  // left to check here for those two. The broader `readiness: human`
+  // classification (assigned to a person, a held task, an open neighborhood
+  // question, or the item itself a question/capture) is not a capability gap and
+  // was never a refusal — it only WARNS and the dispatch proceeds, so that check
+  // stays here, after profile resolution, alongside the guards below it.
   if (readinessHuman) {
     err(`warning: ${nodeId || name}'s derived readiness is human, not agent — ${readinessCheck.reasons.join(", ")}.`);
     err(`  dispatching anyway; 'spor next' shows the same signal if you'd rather triage first.`);
