@@ -7217,7 +7217,12 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
       return 1;
     }
     if (c.ok) {
-      claimEstablished = true;
+      // Only mark this as a lease WE established: a --force claim omits the
+      // nonce and RENEWS whatever lease already exists (per the conflict
+      // message above, "keeps the lease") — that may be a live lease held by
+      // an already-running agent from an earlier dispatch. Abort-cleanup below
+      // must never release a lease this invocation didn't freshly create.
+      claimEstablished = !!dispatchNonce;
       out(`claimed ${nodeId} (lease established; the agent's writes will renew it)`);
     } else err(`warning: could not establish a lease on ${nodeId}: ${c.error} — dispatching without a claim`);
   }

@@ -1463,6 +1463,39 @@ test("dispatch --force (remote): omits the dispatch nonce so a deliberate re-dis
   }
 });
 
+test("dispatch --force (remote): a worktree-setup failure does NOT release the pre-existing lease --force just renewed", async () => {
+  // --force omits the dispatch nonce specifically so the claim RENEWS whatever
+  // lease already exists (the conflict-branch message elsewhere promises
+  // "keeps the lease") — that lease may belong to an already-running agent from
+  // an earlier dispatch. If worktree setup then fails, the abort-cleanup added
+  // for issue-spor-dispatch-worktree-setup-wrong-repo-config must not release a
+  // lease this invocation didn't freshly establish.
+  const { repo, g } = gitTargetRepo();
+  const failHook = writeSpawnableNodeStub(repo, "fail-setup", "process.exit(3);");
+  fs.writeFileSync(
+    path.join(repo, ".spor.json"),
+    JSON.stringify({ enabled: true, dispatch: { worktreeSetup: path.relative(repo, failHook) } }) + "\n"
+  );
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-home-"));
+  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
+  const stub = claudeStub(home, path.join(home, "launched"));
+  try {
+    const r = await runAsync(
+      ["dispatch", "task-rotate", "--dir", repo, "--no-brief", "--force", "--worktree"],
+      remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub })
+    );
+    assert.notStrictEqual(r.status, 0, "setup failure aborts the dispatch");
+    assert.match(r.stderr, /setup hook failed/);
+    assert.ok(claimHit(hits), "--force still claimed (renewed) the lease");
+    assert.ok(
+      !hits.some((h) => h.method === "POST" && /\/release$/.test(h.url)),
+      "the --force renewal of a pre-existing lease is never auto-released on a setup failure"
+    );
+  } finally {
+    srv.close();
+  }
+});
+
 test("dispatch (remote): a node already claimed by another aborts WITHOUT launching", async () => {
   const { home, repo } = fixture();
   const { srv, hits, base } = await claimStub({
