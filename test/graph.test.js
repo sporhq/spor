@@ -504,6 +504,74 @@ test("scoping: a cross-project content hit is labeled foreign, not hard-filtered
   assert.match(r.text, /dec-theirs.*cross-project/s);
 });
 
+// ---------- machine authorship marker (task-cc-digest-render-authorship-marker) ----------
+
+function authorshipFixture() {
+  return tmpGraph({
+    "dec-root.md": `---
+id: dec-root
+type: decision
+project: p
+title: Root decision token alpha
+summary: Root decision token alpha bravo charlie delta.
+date: 2026-06-01
+edges:
+  - {type: relates-to, to: dec-captured}
+  - {type: relates-to, to: dec-reviewed}
+---
+Root decision token alpha bravo charlie delta.
+`,
+    "dec-captured.md": `---
+id: dec-captured
+type: decision
+project: p
+title: Haiku-distilled capture token bravo
+summary: Haiku-distilled capture token bravo charlie delta echo.
+date: 2026-06-01
+authored_via: capture
+---
+Distilled from a session transcript, never reviewed by a human.
+`,
+    "dec-reviewed.md": `---
+id: dec-reviewed
+type: decision
+project: p
+title: Human-reviewed decision token charlie
+summary: Human-reviewed decision token charlie delta echo foxtrot.
+date: 2026-06-01
+authored_via: rest
+---
+Written directly by a person through the REST API.
+`,
+  }).load();
+}
+
+test("authorship: a capture-authored node is tagged machine·capture in the full compile", () => {
+  const g = authorshipFixture();
+  const r = graph.compile(g, { rootId: "dec-root", digest: false });
+  assert.match(r.text, /### dec-captured — .*\(decision, 2026-06-01, machine·capture\)/);
+});
+
+test("authorship: an authored_via not in the machine set renders unmarked (rest is human-equivalent)", () => {
+  const g = authorshipFixture();
+  const r = graph.compile(g, { rootId: "dec-root", digest: false });
+  assert.match(r.text, /### dec-reviewed — .*\(decision, 2026-06-01\)\n/);
+  assert.doesNotMatch(r.text, /dec-reviewed.*machine·/);
+});
+
+test("authorship: a node with no authored_via at all renders exactly as before (no tag)", () => {
+  const g = authorshipFixture();
+  const r = graph.compile(g, { rootId: "dec-root", digest: false });
+  assert.doesNotMatch(r.text, /dec-root.*machine·/);
+});
+
+test("authorship: digest bullet lines carry the same machine·<via> marker", () => {
+  const g = authorshipFixture();
+  const r = graph.compile(g, { query: "haiku distilled capture token bravo charlie delta echo", digest: true });
+  assert.equal(r.relevant, true);
+  assert.match(r.text, /\*\*dec-captured — .*\*\* \(decision, p, 2026-06-01, machine·capture\)/);
+});
+
 // ---------- norm injection framing (issue-cc-norm-always-on-injection) ----------
 
 test("norms: a norm body is quoted as untrusted data with author attribution and a boundary banner", () => {
