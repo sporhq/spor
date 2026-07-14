@@ -240,9 +240,10 @@ person`) — there is no gap to close there.
 For each chosen item:
 
 - **Brief it** — `spor brief <id>` (or `query_graph root_id=<id>`) — pulling
-  its lineage, prior art, any existing questions/decisions/constraints, and its
-  current `readiness_reasons` (why the derivation calls it human, or leaves it
-  untriaged).
+  its lineage, prior art, any existing questions/decisions/constraints, and,
+  when it's already human, its current `readiness_reasons` (why the
+  derivation calls it that; an untriaged item carries no reasons — nothing has
+  flagged it either way yet, so read the item cold instead).
 - **Enumerate the gaps**, reading the item as if about to `spor dispatch` it
   cold:
   - **Open questions** — a live `question-` node already in its neighborhood
@@ -255,7 +256,11 @@ For each chosen item:
   - **Missing or unsatisfiable `requires`/profile** — no `requires:` risk-class
     list declared (GRAPH.md "The `requires:` risk-class register"), or the item
     names/needs a profile no machine here can currently satisfy
-    (dec-spor-machine-profile-satisfiability).
+    (dec-spor-machine-profile-satisfiability). Neither moves the readiness
+    classification itself — only `requires: human` does (see below) — but
+    leaving them unset just means `spor dispatch` discovers the gap the hard
+    way, refusing or warning at launch instead of now; declare them while
+    you're already in the item.
 - **Ask each inline**, the same discipline as pass 8: state what's missing and
   why it blocks a cold-start agent, surface the concrete options when the body
   already names a fork, and give your own recommendation when the evidence
@@ -294,7 +299,10 @@ For each chosen item:
   <agent-id> --attr profile=<profile-id>` (the `profile:` attribute is only
   needed when a specific toolset matters, overriding the agent's default
   `uses-profile`) turns the item into a self-contained `spor dispatch <id>`
-  candidate.
+  candidate. Note this edge is the derivation's *other* path to agent
+  classification (alongside the stamp) — so don't add it to merely reserve an
+  item for someone before its gaps are actually closed; that would flip it
+  agent-ready as a side effect.
 
 Don't fake this pass: an item stamped ready with a real gap still open just
 moves the failure from triage time to dispatch time, where it's far more
