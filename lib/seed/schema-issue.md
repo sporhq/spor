@@ -12,6 +12,23 @@ Seed schema for the `issue` node type, shipped with the plugin as a
 registry default (QUEUE.md §2). A `type: schema` node in the graph with
 `kind: node-schema` and the same `node_type` overrides this entry.
 
+`readiness`/`readiness_by`/`readiness_at`/`readiness_via` (field documentation,
+task-spor-readiness-stamp-verb — no schema-version bump: these fields are read
+by the queue kernel's `deriveReadiness` in `lib/kernel/queue.js`, not by this
+schema's own `validate()`/`transitions()`/`get()` hooks, so nothing here
+changes behavior). The agent-readiness manual override
+(dec-spor-agent-readiness-derived-classification): `readiness: agent`,
+stamped by `spor ready <id>` / `POST /v1/nodes/{id}/readiness`, is the ONE
+hand-settable value of the otherwise structurally-derived `agent|human|
+untriaged` classification — mirroring `priority`/`priority_by` in shape
+(`readiness_by`/`_at`/`_via` carry the same identity/timestamp/door
+attribution). There is no hand-settable `readiness: human`: human is always
+derived structurally (`requires: human`, `assigned → person`, held-task state,
+an open question in the neighborhood) and always wins over the stamp, so a
+later human-signal edit still flips a stamped item back. `spor ready <id>
+--needs-input` clears the stamp, demoting back to whatever the structural
+derivation produces. See QUEUE.md for the full derivation.
+
 `queueable: true` (2026.06.12.1): discovered work must stay continuously
 visible — without it, triaging a capture into an issue silently removed the
 work from the decision queue (issue-cc-issues-not-queueable). Backward-

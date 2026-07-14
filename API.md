@@ -206,6 +206,24 @@ so an agent-set priority is distinguishable from human triage
 (issue-cc-priority-attribution-gap). The CLI wrapper is `spor priority <id>
 <p1|p2|p3|clear>`.
 
+### `set_readiness`
+
+Micro-mutation, the agent-readiness manual override
+(dec-spor-agent-readiness-derived-classification), a verbatim sibling of
+`set_priority` above. Input `{ "id": "<node>", "readiness": "<value>" }`,
+where `<value>` is `agent` (the ONE hand-settable value of the otherwise
+structurally-derived `agent|human|untriaged` classification `rankQueue`
+computes) or a clearing form (`none`/`clear`/`""`) to demote the item back off
+agent-ready. There is no hand-settable `readiness: human` — human is always
+derived structurally (`requires: human`, `assigned → person`, held-task state,
+an open neighborhood question) and always wins over the stamp, so a later
+human-signal edit still flips a stamped item back. Output `{ "status":
+"updated", "id", "revision", "warnings" }`; an unknown value is `invalid_node`
+with the allowed value in `details`. Like `set_priority` it is a server-side
+read-modify-write — no client revision round-trip — and it stamps
+`readiness_by` (acting identity), `readiness_at`, and `readiness_via` (the
+door). The CLI wrapper is `spor ready <id> [--needs-input]`.
+
 ### `reserve`
 
 The fifth task-lease action (dec-cc-task-resumption-reservation), alongside
@@ -512,6 +530,7 @@ endpoint is the REST twin of a core call:
 | `DELETE /v1/nodes/{id}/edges` `{type, to}` | scripts, mechanical writers | `remove_edge` semantics (§1): the withdrawal twin of the POST above — drop one typed edge by `{type, to}`, normalize/flip exactly as `add_edge` (an inverse form removes the canonical edge on the *other* node and echoes its id), no revision echo. A missing edge is an idempotent `skipped`. For *withdrawing* a relationship the review flip can't express — a pulled review request, a dismissed review |
 | `POST /v1/nodes/{id}/status` `{status}` | scripts, mechanical writers | `set_status` semantics (§1): one-scalar update through the `transitions()` gate. Setting a work node to an in-progress status also CLAIMS it (same lease as `/claim` below) |
 | `POST /v1/nodes/{id}/priority` `{priority}` | `spor priority`, queue triage | `set_priority` semantics (§1): one-scalar human-override update — `p1`/`p2`/`p3` or a clearing form (`none`/`clear`/`""`/`p0`). Server-side read-modify-write (no revision), stamping `priority_by`/`priority_at`/`priority_via` for the audit trail (issue-cc-priority-attribution-gap). Unknown value → `invalid_node` with the allowed list |
+| `POST /v1/nodes/{id}/readiness` `{readiness}` | `spor ready`, triage make-ready pass | `set_readiness` semantics (§1): one-scalar agent-readiness override — `agent` or a clearing form (`none`/`clear`/`""`) to demote back to derived. No hand-settable `human` value (always structurally derived, always wins). Server-side read-modify-write (no revision), stamping `readiness_by`/`readiness_at`/`readiness_via`. Unknown value → `invalid_node` with the allowed value |
 | `POST /v1/nodes/{id}/claim` `{session?}` | `claim`/`set_status` MCP tools, `spor claim` CLI, `spor dispatch` | take the heartbeat-renewed lease (dec-cc-task-claim-lease): writes the durable `assigned` edge once, attributes to `$viewer` from the token (never an argument), and creates the ephemeral lease → `{ok, status, lease: {node_id, by, expires, expires_at, session, claimed_at}, edge}`. A live lease held by ANOTHER person is `409 conflict` naming the holder + expiry (re-claiming your OWN live claim just renews it). `session` scopes the heartbeat (omit to leave it person-scoped, so any of the claimer's sessions may renew — what `spor claim` and `spor dispatch` do, since `claude --bg` self-allocates the run session only at launch; dispatch then renews with the real session once it has read it from `claude agents --json`, dec-spor-dispatch-bg-session-late-bind) |
 | `POST /v1/nodes/{id}/renew` `{session?}` | post-tool heartbeat, `renew` MCP tool, `spor renew` CLI, `spor dispatch` | bump the live lease's expiry only — no commit; the heartbeat that keeps a claim from lapsing. A lapsed/stolen lease is `409` (names the current holder). Person-scoped: any of the claimer's sessions may renew; a `session` binds the lease to that run (`spor dispatch` uses this to bind the captured `claude --bg` session post-launch) |
 | `POST /v1/nodes/{id}/extend` `{ms, session?}` | `extend` MCP tool, `spor extend` CLI | manually stretch your live lease by `ms` milliseconds for a known long idle gap → `{ok, status, lease, capped_to_max?, claim_ttl_max_ms?}`. Bounded by the tenant's `claim_ttl_max` policy (a request past the ceiling caps to it, flagged `capped_to_max`); never shortens a lease. `ms` must be a positive number (`spor extend <id> <2h|45m|…>` parses the human duration client-side). A lapsed/stolen lease is `409 lease_lost` naming the holder |

@@ -3011,6 +3011,122 @@ async function cmdPriority(cfg, { positionals }) {
   return 0;
 }
 
+// --- spor ready ----------------------------------------------------------
+// The CLI wrapper for the agent-readiness manual override (task-spor-readiness-
+// stamp-verb, slice 2 of dec-spor-agent-readiness-derived-classification): a
+// verbatim sibling of `spor priority` above — writes readiness:/readiness_by:/
+// _at:/_via: frontmatter with provenance, the ONE hand-set piece of the
+// otherwise-derived classification lib/kernel/queue.js's deriveReadiness
+// computes in the rankQueue render pass. `spor ready <id>` stamps `readiness:
+// agent` (agent-ready — rankQueue/show_queue class it agent and offer
+// suggest:dispatch); `--needs-input` clears the stamp — a manual demotion back
+// OFF agent-ready to whatever the structural derivation produces (human, if a
+// requires:human/assigned-person/held/open-question signal already applies;
+// untriaged otherwise — there is no hand-settable `readiness: human` value,
+// since human is derived structurally and a make-ready pass gates hard gaps
+// with explicit `blocks` edges instead, per the decision node). The stamp is an
+// OVERRIDE, not a status: deriveReadiness checks the human conditions BEFORE
+// the readiness:agent stamp, so a later open question or requires:human edit
+// still wins and flips a stamped item back to human.
+
+// Rewrite a node's raw markdown to carry `value` (or clear it when value is
+// ""), stamping readiness_by/_at/_via. Byte-mirrors rewritePriority above so a
+// local node and a remote one read the same after the mutation; returns the
+// new raw, or null when the frontmatter can't be located.
+function rewriteReadiness(raw, value, identity, via) {
+  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(raw);
+  if (!m) return null;
+  let fm = m[1];
+  const body = m[2];
+  const stripFmLine = (s, key) => s.replace(new RegExp(`(^|\\n)${key}:[^\\n]*`, "g"), "");
+  for (const k of ["readiness", "readiness_by", "readiness_at", "readiness_via"]) fm = stripFmLine(fm, k);
+  fm = fm.replace(/\n+$/, "").replace(/^\n+/, "");
+  const stamps = [];
+  if (value) {
+    stamps.push(`readiness: ${value}`);
+    if (identity && identity.name && identity.email) stamps.push(`readiness_by: ${identity.name} <${identity.email}>`);
+    stamps.push(`readiness_at: ${u.isoMs()}`);
+    stamps.push(`readiness_via: ${via}`);
+  }
+  const fmOut = stamps.length ? `${fm}\n${stamps.join("\n")}` : fm;
+  return `---\n${fmOut}\n---\n${body}`;
+}
+
+async function cmdReady(cfg, { values, positionals }) {
+  const id = positionals[0];
+  if (!id) {
+    err("usage: spor ready <id> [--needs-input]");
+    err("  stamp a queue item agent-ready, or demote it back to derived with --needs-input");
+    return 1;
+  }
+  const value = values["needs-input"] ? "" : "agent";
+
+  if (cfg.mode() === "remote") {
+    // Send the canonical value the server validates again; it stamps
+    // readiness_by/_at/_via (via: rest) from the token, so the body is {readiness}.
+    const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/readiness`, { readiness: value }, { timeoutMs: 8000 });
+    if (r.transport) {
+      err(`offline — could not reach server (${r.error})`);
+      return 1;
+    }
+    if (r.status === 404) {
+      err(`no such node: ${id}`);
+      return 1;
+    }
+    if (!r.ok) {
+      const msg = r.json && r.json.error && r.json.error.message;
+      err(`readiness error ${r.status}${msg ? `: ${msg}` : ""}`);
+      return 1;
+    }
+    out(value ? `readiness set: ${id} -> agent` : `readiness cleared: ${id}`);
+    return 0;
+  }
+
+  // local: rewrite the node file's frontmatter in place, mirroring the server's
+  // read-modify-write (no server to POST to). Identity is the git user the way
+  // local $viewer is derived (lib/queue.js viewerFor), the door is `cli`.
+  const nodesDir = cfg.nodesDir();
+  const file = path.join(nodesDir, `${id}.md`);
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    err(`no such node: ${id}`);
+    return 1;
+  }
+  const identity = gitIdentity(path.dirname(nodesDir));
+  const newRaw = rewriteReadiness(raw, value, identity, "cli");
+  if (newRaw == null) {
+    err(`could not locate frontmatter in ${id}`);
+    return 1;
+  }
+  // validate before writing (same bar as add/correct/priority), so a malformed
+  // result never lands on disk.
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  let g;
+  try {
+    g = graphLib.loadGraph(nodesDir);
+  } catch (e) {
+    err(`could not load graph: ${e.message}`);
+    return 1;
+  }
+  let node;
+  try {
+    node = graphLib.parseFrontmatter(newRaw, `${id}.md`);
+  } catch (e) {
+    err(`invalid node after readiness rewrite: ${e.message}`);
+    return 1;
+  }
+  const v = graphLib.validateNode(g, node);
+  if (!v.ok) {
+    err(`invalid node after readiness rewrite:\n  ${v.errors.join("\n  ")}`);
+    return 1;
+  }
+  fs.writeFileSync(file, newRaw);
+  out(value ? `readiness set: ${id} -> agent` : `readiness cleared: ${id}`);
+  return 0;
+}
+
 // --- spor set-status / spor edge ----------------------------------------
 // The CLI wrappers for the set_status (POST /v1/nodes/{id}/status) and add_edge
 // (POST /v1/nodes/{id}/edges) micro-mutations (task-spor-set-status-edge-cli-
@@ -8917,6 +9033,35 @@ const COMMANDS = {
     options: {},
     examples: ["spor priority issue-86 p1", "spor priority task-x p3", "spor priority issue-86 clear"],
     run: (cfg, p) => cmdPriority(cfg, p),
+  },
+  ready: {
+    group: "Graph", parse: "strict", args: "<id> [--needs-input]",
+    summary: "stamp a queue item agent-ready, or demote it back to derived (local: in-place; remote: /v1/nodes/{id}/readiness)",
+    help:
+      "Stamp (or clear) a node's agent-readiness override — the ONE hand-set piece\n" +
+      "of the otherwise-derived classification (dec-spor-agent-readiness-derived-\n" +
+      "classification): rankQueue/show_queue compute `readiness: agent|human|\n" +
+      "untriaged` structurally, and `readiness: agent` (with readiness_by\n" +
+      "provenance) is the only value a human or agent hand-sets.\n\n" +
+      "`spor ready <id>` stamps `readiness: agent` — the item then classifies agent\n" +
+      "and rides suggest:dispatch. `--needs-input` clears the stamp instead: a manual\n" +
+      "demotion back OFF agent-ready to whatever the structural derivation produces\n" +
+      "(human, if a requires:human/assigned-person/held/open-question signal already\n" +
+      "applies; untriaged otherwise). There is no hand-settable `readiness: human`\n" +
+      "value — human is always derived structurally, and a make-ready pass records a\n" +
+      "hard gap as an explicit `blocks` edge instead.\n\n" +
+      "The stamp is an OVERRIDE, not a status: a later open question or requires:human\n" +
+      "edit still wins and flips a stamped item back to human (deriveReadiness checks\n" +
+      "the human conditions before the readiness:agent stamp). The change is stamped\n" +
+      "with your identity and the door it came through (readiness_by/_at/_via),\n" +
+      "mirroring priority/priority_by. Remote mode POSTs /v1/nodes/{id}/readiness (one\n" +
+      "call, no revision round-trip); local mode rewrites the node file's frontmatter\n" +
+      "in place, attributing to your git identity.",
+    options: {
+      "needs-input": { type: "boolean", desc: "demote: clear the agent-ready stamp (falls back to derived classification)" },
+    },
+    examples: ["spor ready task-x", "spor ready task-x --needs-input"],
+    run: (cfg, p) => cmdReady(cfg, p),
   },
   "set-status": {
     group: "Graph", parse: "strict", args: "<id> <status>", aliases: ["status-set"],
