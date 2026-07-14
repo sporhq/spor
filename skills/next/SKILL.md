@@ -87,9 +87,16 @@ matching live agent are presented normally.
 ## Presenting and acting
 
 Present in plain language — you are talking to a human who may be new to Spor.
-Lead with the top one or two items to pick up and a short, plain reason each is
-there ("the oldest still-open piece of work", "it blocks three other tasks",
-"nothing's touched it in months"). **Translate** the signals behind each `why`
+When the envelope carries `counts_by_readiness` (`{agent, human, untriaged}` —
+present only once the graph has readiness signal), lead with it before the
+per-item picks: "N of these are agent-ready right now, M need your input
+first" is the single most useful headline for deciding whether to dispatch or
+triage next. Say nothing about readiness when the field is absent rather than
+inventing a count. Then lead with the top one or two items to pick up and a
+short, plain reason each is there ("the oldest still-open piece of work", "it
+blocks three other tasks", "nothing's touched it in months") — an
+agent-ready item is a strong pick since it needs no further human input before
+`spor dispatch`. **Translate** the signals behind each `why`
 line into ordinary words; do **not** surface the raw `score` or internal
 coinages — *open front*, *heat*, *staleness*, *front* are ranking internals, not
 terms a newcomer knows. Honor `suggest: close` by framing the item as likely
@@ -128,3 +135,8 @@ one plain sentence of "why this is first" is enough. Then:
    and resurfaces it to everyone on that date (QUEUE.md §4). Prefer this
    over a personal `queue_mute` whenever the dormancy is a fact about the
    work rather than a viewer preference.
+5. **Item picked to make agent-ready** (`readiness: human`/`untriaged` because
+   of a real spec gap — open questions, an undecided fork, missing acceptance
+   criteria — rather than just being someone's assigned work) → this isn't a
+   /spor:next action, it's /spor:triage's make-ready pass: point the human
+   there rather than trying to close the gaps inline here.

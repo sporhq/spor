@@ -1,6 +1,6 @@
 ---
 name: triage
-description: Actively WORK the Spor decision queue end-to-end, not just list it — process pending captures, consolidate duplicates, verify close-candidates, record missing blocks/blocked-by dependency edges, brief and answer open questions from their lineage, and set priorities so unblockers surface first. Use whenever the user wants to triage / groom / clean up / process / work through their queue or backlog — "can we triage my queue", "go through the backlog", "what needs attention", "clean up my captures", "merge the duplicates", "sort out dependencies" — even if the word "triage" isn't used. This is the action loop on top of /spor:next (which only PRESENTS the queue); reach for it any time queue cleanup or grooming is implied.
+description: Actively WORK the Spor decision queue end-to-end, not just list it — process pending captures, consolidate duplicates, verify close-candidates, record missing blocks/blocked-by dependency edges, close the agent-readiness gaps that keep an item needs-human so it becomes a clean `spor dispatch` candidate, brief and answer open questions from their lineage, and set priorities so unblockers surface first. Use whenever the user wants to triage / groom / clean up / process / work through their queue or backlog — "can we triage my queue", "go through the backlog", "what needs attention", "clean up my captures", "merge the duplicates", "sort out dependencies", "make this item ready for an agent" — even if the word "triage" isn't used. This is the action loop on top of /spor:next (which only PRESENTS the queue); reach for it any time queue cleanup or grooming is implied.
 ---
 
 # Triage the queue
@@ -8,7 +8,8 @@ description: Actively WORK the Spor decision queue end-to-end, not just list it 
 `/spor:next` *presents* the queue. Triage *works* it: a grooming pass that
 leaves the graph cleaner than it found it — captures resolved, duplicates
 collapsed, false close-flags cleared, real dependencies recorded as edges,
-open questions answered, and priorities set so the highest-leverage work
+agent-readiness gaps closed so more of the queue becomes dispatchable, open
+questions answered, and priorities set so the highest-leverage work
 surfaces first. The point is that a queue nobody grooms slowly fills with
 noise (redundant captures, duplicate issues, stale anchors, unrecorded
 blockers) until its ranking can't be trusted; one disciplined pass restores
@@ -45,7 +46,9 @@ finish the whole queue in one sitting — say what you triaged and what's left.
 Get it with the queue's own resolver — `spor next --json` (or the `show_queue`
 MCP tool in Cowork; omit `assignee` — `assignee: "me"` narrows to directly
 assigned/stewarded work only). Read the **aggregates**, not just the page: `total_count`,
-`counts_by_type`, `counts_by_suggest`, and the side-channels `pending`
+`counts_by_type`, `counts_by_suggest`, `counts_by_readiness` (`{agent, human,
+untriaged}` — present only when the graph has readiness signal; "how much of
+this can a coding agent take right now") and the side-channels `pending`
 (unprocessed captures), `questions` (routed/unrouted to you), `findings`
 (gardener observations), plus `dormant`/`muted` counts.
 
@@ -57,8 +60,11 @@ ranking internals, not terms a human reads. "Blocks three other tasks",
 Respect what the queue already tells you: honor `suggest: close` as "likely
 done/abandonable" (pass 4), mention `muted`/`dormant` in passing (hidden by a
 viewer mute or parked behind a `wake:` date — counted, never silently dropped),
-and skip anything flagged `in_flight` from the top recommendation — an agent is
-already on it; surfacing it invites duplicate work.
+note each item's derived `readiness` where decisive (agent-ready vs needs
+human, carried in its why-line — pass 7 is where a needs-human item with a real
+spec gap, not just someone's assigned work, gets closed out), and skip anything
+flagged `in_flight` from the top recommendation — an agent is already on it;
+surfacing it invites duplicate work.
 
 ## 2. Pending captures → `merged` or `rejected`
 
@@ -217,7 +223,84 @@ program/progress view (`render_program` MCP tool, or `GET
 `blocks` edges with resolution-derived progress — a fast way to confirm the
 edges you just wrote hang the work under the right umbrella.
 
-## 7. Open questions → brief the lineage, then answer
+## 7. Make ready → close the agent-readiness gaps a coding agent would hit
+
+`readiness: agent|human|untriaged` (dec-spor-agent-readiness-derived-classification)
+is a **derived** classification, computed structurally from `requires: human`,
+an `assigned → person` edge, held-task state, and any open question in a 1-hop
+neighborhood (pass 4's `suggest: triage` flag and pass 8's questions are two of
+its own inputs) — never something triage *declares*. This pass is how triage
+*earns* the agent bucket: pick a needs-human/untriaged item, close every gap a
+coding agent would actually hit if dispatched at it cold, and only then stamp
+it. Like pass 8, this is real per-item judgment work — the human picks which
+item(s) to spend it on; don't sweep the whole backlog unprompted. Skip an item
+that's needs-human only because it's someone's assigned work (`assigned →
+person`) — there is no gap to close there.
+
+For each chosen item:
+
+- **Brief it** — `spor brief <id>` (or `query_graph root_id=<id>`) — pulling
+  its lineage, prior art, any existing questions/decisions/constraints, and its
+  current `readiness_reasons` (why the derivation calls it human, or leaves it
+  untriaged).
+- **Enumerate the gaps**, reading the item as if about to `spor dispatch` it
+  cold:
+  - **Open questions** — a live `question-` node already in its neighborhood
+    (the same signal the derivation checks), or a gap you can see needs one
+    filed.
+  - **Undecided forks** — the body names, or implies, an "X vs Y" the item
+    hasn't settled — the same shape as a question, just not yet filed as one.
+  - **Missing acceptance criteria** — the summary says what to build but gives
+    no way to tell a cold-start agent "you're done when…".
+  - **Missing or unsatisfiable `requires`/profile** — no `requires:` risk-class
+    list declared (GRAPH.md "The `requires:` risk-class register"), or the item
+    names/needs a profile no machine here can currently satisfy
+    (dec-spor-machine-profile-satisfiability).
+- **Ask each inline**, the same discipline as pass 8: state what's missing and
+  why it blocks a cold-start agent, surface the concrete options when the body
+  already names a fork, and give your own recommendation when the evidence
+  supports one — the human should be able to answer from your message, not go
+  digging.
+- **Write every answer back before moving on** — nothing here is real until
+  it's on the graph:
+  - A settled fork or filled-in acceptance criteria that closes a real
+    `question-` node → a `decision` (the why) or `artifact` (what was
+    clarified) carrying an `answers` edge, then `set_status <question-id>
+    answered` — pass 8's close-the-loop, same mechanics. A fork or criteria
+    with no separate question node → fold it straight into the item with a
+    body edit (`spor put-node <file> --if-exists update --revision <sha>`).
+  - A gap that genuinely can't be closed by a decision right now — it needs its
+    own prerequisite work first (a missing primitive, an unbuilt profile, an
+    earlier pipeline stage) — is a **hard gate**: file or link that
+    prerequisite and record it as a `blocks` edge from the prerequisite to this
+    item, exactly pass 6's convention (write it from the blocker's
+    perspective; the item drops out of the actionable queue until the real
+    prerequisite lands). This is the honest move where a `readiness` stamp
+    would be a lie — hard gaps are `blocks` edges, readiness only ever covers
+    the soft/derived side.
+  - `requires: human` is a hard gate of a different kind: it isn't liftable by
+    writing nodes. Leave the item human and move to the next one.
+- **Stamp it once every gap is actually closed** — no open questions left in
+  its neighborhood, no undecided forks in the body, acceptance criteria
+  present, `requires:` declared and satisfiable. Run `spor ready <id>` (`POST
+  /v1/nodes/<id>/readiness {readiness: "agent"}` remotely, `set_readiness` in
+  Cowork) — the ONE hand-settable value of the classification, stamped with
+  your identity (`readiness_by`/`_at`/`_via`, mirroring `priority`/
+  `priority_by`). There's no equivalent hand-settable `human` value: human is
+  always derived, so a later open question or `requires: human` edit still
+  wins and flips a stamped item back — the override can't rot the way a pure
+  flag would. `spor ready <id> --needs-input` clears a stamp that turns out
+  premature. Optionally also route WHO does the work: `spor edge <id> assigned
+  <agent-id> --attr profile=<profile-id>` (the `profile:` attribute is only
+  needed when a specific toolset matters, overriding the agent's default
+  `uses-profile`) turns the item into a self-contained `spor dispatch <id>`
+  candidate.
+
+Don't fake this pass: an item stamped ready with a real gap still open just
+moves the failure from triage time to dispatch time, where it's far more
+expensive to catch.
+
+## 8. Open questions → brief the lineage, then answer
 
 This is where triage earns its keep: the queue's `questions` are decisions
 waiting on a human, and a bare list of them is useless — the reader can't answer
@@ -243,7 +326,7 @@ decide.** For each open question:
 (If `questions` is empty there's nothing to do here — but it's the step most
 often forgotten, so check it every pass.)
 
-## 8. Prioritise → unblockers first
+## 9. Prioritise → unblockers first
 
 Once you understand the dependency shape, set explicit `priority:` (`p1`/`p2`/
 `p3`) so the queue sequences correctly. The highest-leverage move is to **bump
@@ -267,28 +350,31 @@ genuinely ready work, start/claim it or let `front` decay; don't fake a resolver
 to undo it. (A bare reference no longer trips this —
 `issue-spor-queue-held-guard-false-positive-referenced-outcome`.)
 
-## 9. Present the outcome
+## 10. Present the outcome
 
 Talk to a human, in plain language. Lead with what you did and what to pick up
 next, one short reason each. Give a compact before/after (queue size, what
-merged/consolidated/linked) so the grooming is legible. End with the honest top
-picks to *do* (not the blocked or dormant ones) and offer a briefing on one.
+merged/consolidated/linked, how many items moved into agent-ready) so the
+grooming is legible. End with the honest top picks to *do* (not the blocked or
+dormant ones) and offer a briefing on one.
 
 ## Writes cheat-sheet
 
 Reading resolves mode on its own (`spor next`, `spor get`, `spor brief`), and the
-precise-write verbs `spor priority`, `spor set-status`, and `spor edge` all work in
-either mode (local: in-place file write; remote: the micro-mutation route). The
-remaining writes below have no `spor` CLI form yet, so in a shell (remote mode) hit
-the REST endpoint against the resolved server; in Cowork use the MCP tool. See
-`/spor:spor` + API.md for the authoritative contract.
+precise-write verbs `spor priority`, `spor ready`, `spor set-status`, and `spor
+edge` all work in either mode (local: in-place file write; remote: the
+micro-mutation route). The remaining writes below have no `spor` CLI form yet,
+so in a shell (remote mode) hit the REST endpoint against the resolved server;
+in Cowork use the MCP tool. See `/spor:spor` + API.md for the authoritative
+contract.
 
 | Action | Shell (CLI verb, or REST in remote mode) | MCP (Cowork) |
 |---|---|---|
 | Read a node (raw + revision + enrichment) | `spor get <id>` (or `GET /v1/nodes/<id>`) | `get_node` |
 | Set priority | `spor priority <id> <p1\|p2\|p3\|clear>` (or `POST /v1/nodes/<id>/priority {priority}`) | `set_priority` |
+| Set agent-readiness (stamp/clear) | `spor ready <id> [--needs-input]` (or `POST /v1/nodes/<id>/readiness {readiness}`) | `set_readiness` |
 | Set status (merged/rejected/resolved/…) | `spor set-status <id> <status>` (or `POST /v1/nodes/<id>/status {status}`) | `set_status` |
-| Add edge (supersedes/blocks/relates-to/answers) | `spor edge <id> <type> <to>` (or `POST /v1/nodes/<id>/edges {type, to}`) | `add_edge` |
+| Add edge (supersedes/blocks/relates-to/answers/assigned) | `spor edge <id> <type> <to> [--attr key=value]` (or `POST /v1/nodes/<id>/edges {type, to, attrs?}`) | `add_edge` |
 | Edit a field (body) | `spor put-node <file> --if-exists update --revision <sha>` (or `POST /v1/nodes {nodes:[{node, if_exists:"update", revision}]}`) | `put_node` |
 | Compile a question's lineage | `spor brief <id>` | `query_graph root_id=<id>` |
 
