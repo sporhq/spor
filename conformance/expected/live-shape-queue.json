@@ -192,5 +192,10 @@
     }
   ],
   "count": 40,
+  "counts_by_readiness": {
+    "agent": 0,
+    "human": 10,
+    "untriaged": 30
+  },
   "blocked": 1
 }

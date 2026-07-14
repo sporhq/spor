@@ -1,54 +1,56 @@
 {
   "items": [
     {
-      "id": "task-lapsed",
-      "title": "Reassign the stalled migration",
+      "id": "task-assigned-agent",
+      "title": "Wire the dispatch guard",
       "type": "task",
       "status": "open",
       "project": "alpha",
       "priority": null,
-      "score": 0.37,
+      "score": 0.33,
       "signals": {
         "blocking": 0,
         "blocked_by": 0,
         "front": 0,
         "heat": 0,
         "staleness": 0,
-        "age_days": 11
+        "age_days": 10
       },
       "suggest": "do",
-      "readiness": "human",
+      "readiness": "agent",
       "readiness_reasons": [
-        "assigned to person-holder"
+        "assigned to agent agent-worker"
       ],
-      "why": "needs human: assigned to person-holder; 11d old"
+      "why": "agent-ready: assigned to agent agent-worker; 10d old"
     },
     {
-      "id": "task-open",
-      "title": "Pick up the unclaimed chore",
+      "id": "task-stamped",
+      "title": "Ship the readiness stamp",
       "type": "task",
       "status": "open",
       "project": "alpha",
       "priority": null,
-      "score": 0.37,
+      "score": 0.33,
       "signals": {
         "blocking": 0,
         "blocked_by": 0,
         "front": 0,
         "heat": 0,
         "staleness": 0,
-        "age_days": 11
+        "age_days": 10
       },
       "suggest": "do",
-      "why": "11d old"
+      "readiness": "agent",
+      "readiness_reasons": [
+        "stamped agent-ready by Anthony Allen via cli"
+      ],
+      "why": "agent-ready: stamped agent-ready by Anthony Allen via cli; 10d old"
     }
   ],
   "count": 2,
   "counts_by_readiness": {
-    "agent": 0,
-    "human": 1,
-    "untriaged": 1
-  },
-  "leased": 1,
-  "reserved": 1
+    "agent": 2,
+    "human": 0,
+    "untriaged": 0
+  }
 }

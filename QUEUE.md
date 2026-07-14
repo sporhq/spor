@@ -528,6 +528,41 @@ The queue is a compile mode, not a new store:
   Tier-2 routed questions are all queueable schemas. "Home is a decision
   queue" falls out of one mechanism.
 
+**Agent-readiness** (dec-spor-agent-readiness-derived-classification). Each
+ranked item carries a **derived** classification `readiness:
+agent|human|untriaged` (plus `readiness_reasons[]`), computed structurally in
+the render pass — no LLM (the `queueSignals` hook can only add numbers to
+score), no graph state (a status overloads the lifecycle vocab; an edge has no
+natural target). It answers "can a coding agent complete this unattended, or
+does a human have to act first?" Derivation, **human wins over agent** so a
+later open question or `requires: human` edit flips a stamped item back:
+- **human** — `requires:` includes `human` (the first consumer of the
+  risk-class register, §schema-requires: work unsatisfiable by any agent) · an
+  `assigned → person` edge (it is that person's work) · held-task state (the
+  front self-limit's `suggest: triage`) · the item is itself an open question
+  or unprocessed capture · an open (live, unanswered) question node in its
+  1-hop neighborhood (a soft spec gap to close first).
+- **agent** — an explicit `readiness: agent` frontmatter stamp with
+  `readiness_by` provenance (mirroring `priority`/`priority_by`, the one
+  hand-set piece — the `spor ready` verb + REST twin, slice 2) · or an
+  `assigned → agent` edge.
+- **untriaged** otherwise — the deliberate third bucket ("nobody has checked
+  the spec"), which rides **no** readiness fields, so the item is
+  byte-identical when no readiness data exists.
+
+Readiness leads the why-line when decisive (`agent-ready: …` / `needs human:
+…`), and the envelope gains `counts_by_readiness` ({agent, human, untriaged},
+present only when there is readiness signal or a readiness facet was asked
+for) — the headline "how much of my queue can an agent take right now?" A
+**readiness filter** (`rankQueue({readiness})`, a class or array; `GET
+/v1/queue?readiness=` / `show_queue {readiness}` / `spor next --readiness`,
+comma-separated) narrows the queue to a class as a hard scope like
+`project`/`type` (schema-approval items, outside the classification, are
+excluded). A graph with no readiness data is byte-identical to before — no
+fields, no clause, no count. Hard triage gaps recorded during a make-ready pass
+become explicit `blocks` edges (which correctly remove the item until
+answered); readiness handles the soft/derived side.
+
 **Per-person queues** (task-cc-queue-assignee-filtering). `rankQueue`'s
 `assignee` parameter — and `GET /v1/queue?assignee=<person-id>` /
 `show_queue {assignee}` (use `assignee=me` to bind to the caller) — scopes the

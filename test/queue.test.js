@@ -1513,3 +1513,120 @@ test("memoization: warmQueueIndex output is byte-identical to a cold rankQueue",
   const hot = rankQueue(warmed, { now: NOW });
   assert.deepEqual(hot, cold, "warmed read equals the cold read exactly");
 });
+
+// ---- Agent-readiness derivation (dec-spor-agent-readiness-derived-classification) ----
+// A queue item carries a derived readiness agent|human|untriaged + reasons,
+// computed structurally in rankQueue. Untriaged rides no fields (byte-identical);
+// counts_by_readiness aggregates; a readiness filter narrows as a hard scope.
+
+// Raw node writer for frontmatter the node() helper doesn't model
+// (readiness/readiness_by/requires).
+const raw = (id, type, front, body = "Body.") => [
+  `${id}.md`,
+  `---\nid: ${id}\ntype: ${type}\nproject: my-project\ntitle: Title of ${id}\nsummary: Standalone summary for ${id}.\ndate: 2026-06-01\n${front}---\n${body}\n`,
+];
+const rd = (g, id) => rankQueue(g, { now: NOW }).items.find((i) => i.id === id);
+
+test("readiness: a bare task with no signal is untriaged and rides no readiness fields (byte-identical)", () => {
+  const g = tmpGraph(Object.fromEntries([node("task-plain", "task", { status: "open" })])).load();
+  const it = rd(g, "task-plain");
+  assert.equal(it.readiness, undefined, "no readiness key on an untriaged item");
+  assert.equal(it.readiness_reasons, undefined, "no reasons key either");
+  assert.equal(rankQueue(g, { now: NOW }).counts_by_readiness, undefined, "no counts when no signal");
+});
+
+test("readiness: requires:human derives human with the reason", () => {
+  const g = tmpGraph(Object.fromEntries([raw("task-h", "task", "status: open\nrequires: [human]\n")])).load();
+  const it = rd(g, "task-h");
+  assert.equal(it.readiness, "human");
+  assert.deepEqual(it.readiness_reasons, ["requires human"]);
+  assert.ok(it.why.startsWith("needs human: requires human"), "the clause leads the why-line");
+});
+
+test("readiness: assigned→person is human, assigned→agent is agent (edge target type decides)", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-to-person", "task", { status: "open", edges: [["assigned", "person-x"]] }),
+    node("task-to-agent", "task", { status: "open", edges: [["assigned", "agent-x"]] }),
+    node("person-x", "person", { status: "active" }),
+    node("agent-x", "agent", { status: "active" }),
+  ])).load();
+  assert.equal(rd(g, "task-to-person").readiness, "human");
+  assert.deepEqual(rd(g, "task-to-person").readiness_reasons, ["assigned to person-x"]);
+  assert.equal(rd(g, "task-to-agent").readiness, "agent");
+  assert.deepEqual(rd(g, "task-to-agent").readiness_reasons, ["assigned to agent agent-x"]);
+});
+
+test("readiness: an agent stamp derives agent with readiness_by provenance", () => {
+  const g = tmpGraph(Object.fromEntries([
+    raw("task-s", "task", "status: open\nreadiness: agent\nreadiness_by: Dana via cli\n"),
+  ])).load();
+  const it = rd(g, "task-s");
+  assert.equal(it.readiness, "agent");
+  assert.deepEqual(it.readiness_reasons, ["stamped agent-ready by Dana via cli"]);
+  assert.ok(it.why.startsWith("agent-ready: stamped agent-ready by Dana via cli"));
+});
+
+test("readiness: human WINS over a co-present agent stamp (derivation-with-override)", () => {
+  const g = tmpGraph(Object.fromEntries([
+    raw("task-o", "task", "status: open\nreadiness: agent\nreadiness_by: Dana\nrequires: [human]\n"),
+  ])).load();
+  const it = rd(g, "task-o");
+  assert.equal(it.readiness, "human", "a later requires:human flips a stamped item back to human");
+  assert.deepEqual(it.readiness_reasons, ["requires human"], "only the human reason, not the stamp");
+});
+
+test("readiness: a question item is human, and an open neighborhood question makes its neighbor human", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-near", "task", { status: "open", edges: [["relates-to", "q-open"]] }),
+    raw("q-open", "question", "status: open\n"),
+  ])).load();
+  assert.equal(rd(g, "q-open").readiness, "human");
+  assert.deepEqual(rd(g, "q-open").readiness_reasons, ["open question awaiting an answer"]);
+  const near = rd(g, "task-near");
+  assert.equal(near.readiness, "human");
+  assert.deepEqual(near.readiness_reasons, ["open question q-open in neighborhood"]);
+});
+
+test("readiness: an ANSWERED neighborhood question no longer forces human", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-near", "task", { status: "open", edges: [["relates-to", "q-ans"]] }),
+    raw("q-ans", "question", "status: open\n"),
+    // an answer node with a live answers edge retires the question
+    raw("ans-1", "answer", "status: active\nedges:\n  - {type: answers, to: q-ans}\n"),
+  ])).load();
+  const near = rd(g, "task-near");
+  assert.equal(near.readiness, undefined, "the resolved question is no longer an open spec gap → untriaged, no field");
+});
+
+test("readiness: counts_by_readiness aggregates the ranked work items and stays consistent with count", () => {
+  const g = tmpGraph(Object.fromEntries([
+    raw("t-agent", "task", "status: open\nreadiness: agent\n"),
+    raw("t-human", "task", "status: open\nrequires: [human]\n"),
+    node("t-untriaged", "task", { status: "open" }),
+  ])).load();
+  const r = rankQueue(g, { now: NOW });
+  assert.deepEqual(r.counts_by_readiness, { agent: 1, human: 1, untriaged: 1 });
+  assert.equal(r.counts_by_readiness.agent + r.counts_by_readiness.human + r.counts_by_readiness.untriaged, r.count);
+});
+
+test("readiness: the filter narrows to a class as a hard scope and still reports counts for the facet", () => {
+  const g = tmpGraph(Object.fromEntries([
+    raw("t-agent", "task", "status: open\nreadiness: agent\n"),
+    raw("t-human", "task", "status: open\nrequires: [human]\n"),
+    node("t-untriaged", "task", { status: "open" }),
+  ])).load();
+  const agentOnly = rankQueue(g, { now: NOW, readiness: "agent" });
+  assert.deepEqual(agentOnly.items.map((i) => i.id), ["t-agent"]);
+  assert.equal(agentOnly.count, 1, "count reflects the filtered set");
+  assert.deepEqual(agentOnly.counts_by_readiness, { agent: 1, human: 0, untriaged: 0 }, "facet count emitted even all-one-class");
+  // array form, multiple classes
+  const both = rankQueue(g, { now: NOW, readiness: ["agent", "untriaged"] });
+  assert.deepEqual(both.items.map((i) => i.id).sort(), ["t-agent", "t-untriaged"]);
+});
+
+test("readiness: an unknown filter class yields an empty queue, never an error", () => {
+  const g = tmpGraph(Object.fromEntries([node("t", "task", { status: "open" })])).load();
+  const r = rankQueue(g, { now: NOW, readiness: "bogus" });
+  assert.deepEqual(r.items, []);
+  assert.equal(r.count, 0);
+});

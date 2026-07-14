@@ -1,0 +1,4 @@
+{ "id": "queue-readiness-filter", "kind": "queue", "corpus": "queue-readiness",
+  "input": { "now": "2026-06-20T00:00:00Z", "readiness": "agent" },
+  "expected": "queue-readiness-filter.json",
+  "covers": "agent-readiness filter (dec-spor-agent-readiness-derived-classification): readiness:agent narrows the queue to the agent-class items as a HARD scope filter (human/untriaged items out of scope, not counted), count reflects the filtered set, and counts_by_readiness is emitted even when it is all one class because a readiness facet was requested" }

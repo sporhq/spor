@@ -17,7 +17,11 @@
         "age_days": 11
       },
       "suggest": "do",
-      "why": "11d old"
+      "readiness": "human",
+      "readiness_reasons": [
+        "assigned to person-dana"
+      ],
+      "why": "needs human: assigned to person-dana; 11d old"
     },
     {
       "id": "task-retention",
@@ -39,5 +43,10 @@
       "why": "11d old"
     }
   ],
-  "count": 2
+  "count": 2,
+  "counts_by_readiness": {
+    "agent": 0,
+    "human": 1,
+    "untriaged": 1
+  }
 }

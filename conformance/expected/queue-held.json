@@ -36,8 +36,17 @@
         "age_days": 2
       },
       "suggest": "triage",
-      "why": "your active front (40 writes in the last 7 days); 2d old; outcome recorded but nothing resolves it — close the loop (resolve, gate with blocked-by, set wake, or abandon)"
+      "readiness": "human",
+      "readiness_reasons": [
+        "held task awaiting triage"
+      ],
+      "why": "needs human: held task awaiting triage; your active front (40 writes in the last 7 days); 2d old; outcome recorded but nothing resolves it — close the loop (resolve, gate with blocked-by, set wake, or abandon)"
     }
   ],
-  "count": 2
+  "count": 2,
+  "counts_by_readiness": {
+    "agent": 0,
+    "human": 1,
+    "untriaged": 1
+  }
 }

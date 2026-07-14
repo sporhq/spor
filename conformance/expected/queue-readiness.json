@@ -1,0 +1,167 @@
+{
+  "items": [
+    {
+      "id": "question-open",
+      "title": "Which retention window do we commit to?",
+      "type": "question",
+      "status": "open",
+      "project": "alpha",
+      "priority": null,
+      "score": 0.33,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 10
+      },
+      "suggest": "do",
+      "readiness": "human",
+      "readiness_reasons": [
+        "open question awaiting an answer"
+      ],
+      "why": "needs human: open question awaiting an answer; 10d old"
+    },
+    {
+      "id": "task-assigned-agent",
+      "title": "Wire the dispatch guard",
+      "type": "task",
+      "status": "open",
+      "project": "alpha",
+      "priority": null,
+      "score": 0.33,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 10
+      },
+      "suggest": "do",
+      "readiness": "agent",
+      "readiness_reasons": [
+        "assigned to agent agent-worker"
+      ],
+      "why": "agent-ready: assigned to agent agent-worker; 10d old"
+    },
+    {
+      "id": "task-near-question",
+      "title": "Implement retention purge",
+      "type": "task",
+      "status": "open",
+      "project": "alpha",
+      "priority": null,
+      "score": 0.33,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 10
+      },
+      "suggest": "do",
+      "readiness": "human",
+      "readiness_reasons": [
+        "open question question-open in neighborhood"
+      ],
+      "why": "needs human: open question question-open in neighborhood; 10d old"
+    },
+    {
+      "id": "task-override",
+      "title": "Stamped but gated on a human act",
+      "type": "task",
+      "status": "open",
+      "project": "alpha",
+      "priority": null,
+      "score": 0.33,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 10
+      },
+      "suggest": "do",
+      "readiness": "human",
+      "readiness_reasons": [
+        "requires human"
+      ],
+      "why": "needs human: requires human; 10d old"
+    },
+    {
+      "id": "task-plain",
+      "title": "Tidy the changelog",
+      "type": "task",
+      "status": "open",
+      "project": "alpha",
+      "priority": null,
+      "score": 0.33,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 10
+      },
+      "suggest": "do",
+      "why": "10d old"
+    },
+    {
+      "id": "task-requires-human",
+      "title": "Delegate the NS records",
+      "type": "task",
+      "status": "open",
+      "project": "alpha",
+      "priority": null,
+      "score": 0.33,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 10
+      },
+      "suggest": "do",
+      "readiness": "human",
+      "readiness_reasons": [
+        "requires human"
+      ],
+      "why": "needs human: requires human; 10d old"
+    },
+    {
+      "id": "task-stamped",
+      "title": "Ship the readiness stamp",
+      "type": "task",
+      "status": "open",
+      "project": "alpha",
+      "priority": null,
+      "score": 0.33,
+      "signals": {
+        "blocking": 0,
+        "blocked_by": 0,
+        "front": 0,
+        "heat": 0,
+        "staleness": 0,
+        "age_days": 10
+      },
+      "suggest": "do",
+      "readiness": "agent",
+      "readiness_reasons": [
+        "stamped agent-ready by Anthony Allen via cli"
+      ],
+      "why": "agent-ready: stamped agent-ready by Anthony Allen via cli; 10d old"
+    }
+  ],
+  "count": 7,
+  "counts_by_readiness": {
+    "agent": 2,
+    "human": 4,
+    "untriaged": 1
+  }
+}

@@ -123,6 +123,9 @@ const KINDS = {
     return json(kqueue.rankQueue(g, {
       project: c.input.project ?? null,
       assignee: c.input.assignee ?? null,
+      // agent-readiness filter (dec-spor-agent-readiness-derived-classification):
+      // a hard scope narrow to agent|human|untriaged. Absent -> byte-identical.
+      readiness: c.input.readiness ?? null,
       activity: c.input.activity ?? null,
       front: c.input.front ?? null,
       leases,

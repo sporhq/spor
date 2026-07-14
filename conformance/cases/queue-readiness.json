@@ -1,0 +1,4 @@
+{ "id": "queue-readiness", "kind": "queue", "corpus": "queue-readiness",
+  "input": { "now": "2026-06-20T00:00:00Z" },
+  "expected": "queue-readiness.json",
+  "covers": "agent-readiness derivation (dec-spor-agent-readiness-derived-classification): agent via readiness:agent stamp (readiness_by provenance) and via assigned→agent edge; human via requires:human, via a question item, and via an open 1-hop neighborhood question; human WINS over a co-present agent stamp (task-override); untriaged rides no readiness fields (byte-identical shape); readiness + readiness_reasons on each decisive item, the leading why-line clause, and the counts_by_readiness envelope aggregate" }

@@ -58,7 +58,11 @@
         "age_days": 4
       },
       "suggest": "do",
-      "why": "4d old; unprocessed capture awaiting triage"
+      "readiness": "human",
+      "readiness_reasons": [
+        "pending capture awaiting triage"
+      ],
+      "why": "needs human: pending capture awaiting triage; 4d old; unprocessed capture awaiting triage"
     },
     {
       "id": "finding-open",
@@ -81,6 +85,11 @@
     }
   ],
   "count": 4,
+  "counts_by_readiness": {
+    "agent": 0,
+    "human": 1,
+    "untriaged": 3
+  },
   "muted": 2,
   "blocked": 1
 }
