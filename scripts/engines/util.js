@@ -737,8 +737,41 @@ function repoRelativeCandidates(top, file) {
   const canon = path.relative(canonPath(top), canonPath(file)).split(path.sep).join("/");
   const out = [];
   if (inRepo(lit)) out.push(lit);
+  else {
+    // The literal spelling walked out of the repo. When that walk-out is only
+    // a BASE-spelling mismatch — the windows-latest 8.3 short-vs-long split
+    // (os.tmpdir()'s RUNNER~1 prefix vs git's long --show-toplevel,
+    // issue-spor-windows-ci-short-path-mismatch), or an aliased mount of the
+    // repo's own ancestry — canonicalizing the WHOLE file path would also
+    // resolve any in-repo symlink and silently lose the alias spelling
+    // (issue-spor-windows-ci-symlink-alias-candidates-lost). Recover it
+    // instead: walk `file`'s ancestors up to the one that IS the repo top
+    // under canonicalization; the tail below that ancestor is the in-repo
+    // part, kept exactly as spelled.
+    const alias = literalTailUnderTop(top, file);
+    if (alias && inRepo(alias)) out.push(alias);
+  }
   if (inRepo(canon) && !out.includes(canon)) out.push(canon);
   return out;
+}
+
+// The literal spelling of `file`'s path BELOW the repo top, tolerating a
+// base-spelling mismatch between the two: ancestors of `file` are compared to
+// `top` by canonical identity (canonPath both sides), while the components
+// below the matching ancestor — the in-repo tail, where a symlink alias may
+// live — are returned exactly as spelled. Null when no ancestor of `file` is
+// the repo top (a genuinely out-of-repo path).
+function literalTailUnderTop(top, file) {
+  const canonTop = canonPath(top);
+  let cur = path.resolve(String(file ?? ""));
+  const tail = [];
+  for (;;) {
+    const parent = path.dirname(cur);
+    if (parent === cur) return null;
+    tail.unshift(path.basename(cur));
+    cur = parent;
+    if (canonPath(cur) === canonTop) return tail.join("/");
+  }
 }
 
 function ensureDir(dir) {

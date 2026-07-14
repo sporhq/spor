@@ -93,6 +93,30 @@ test("repoRelativeCandidates: an in-repo symlinked subtree yields BOTH the alias
   assert.deepEqual(candidates.sort(), ["frontend/app.js", "packages/web/app.js"].sort());
 });
 
+test("repoRelativeCandidates: a base-spelling mismatch keeps BOTH spellings of an in-repo symlink (issue-spor-windows-ci-symlink-alias-candidates-lost)", () => {
+  // The windows-latest failure mode, reproduced portably: `top` is the
+  // canonical spelling (as git returns it) while `file` reaches the repo
+  // through an ALIASED base (standing in for os.tmpdir()'s 8.3 RUNNER~1
+  // prefix), AND the in-repo part goes through a tracked symlinked subtree.
+  // The literal path.relative walks out; full canonicalization would resolve
+  // the in-repo symlink too and lose the alias spelling. Both spellings must
+  // survive.
+  const real = scratch("spor-relpath-");
+  fs.mkdirSync(path.join(real, "packages", "web"), { recursive: true });
+  fs.writeFileSync(path.join(real, "packages", "web", "app.js"), "x");
+  const aliasBase = `${real}-alias`;
+  try {
+    fs.symlinkSync(path.join(real, "packages", "web"), path.join(real, "frontend"), "dir");
+    fs.symlinkSync(real, aliasBase, "dir");
+  } catch {
+    return; // symlinks unavailable on this host
+  }
+  const file = path.join(aliasBase, "frontend", "app.js");
+  assert.match(path.relative(real, file), /^\.\./); // precondition: literal walks out
+  const candidates = u.repoRelativeCandidates(real, file);
+  assert.deepEqual(candidates, ["frontend/app.js", "packages/web/app.js"]);
+});
+
 test("repoRelativeCandidates: an ordinary in-repo file (no symlink) yields one candidate", () => {
   const top = scratch("spor-relpath-");
   fs.mkdirSync(path.join(top, "src"), { recursive: true });
