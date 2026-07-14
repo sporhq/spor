@@ -237,6 +237,17 @@ item(s) to spend it on; don't sweep the whole backlog unprompted. Skip an item
 that's needs-human only because it's someone's assigned work (`assigned →
 person`) — there is no gap to close there.
 
+**Entering this pass, proposing candidates is mandatory — never wait for the
+human to name items** (issue-spor-triage-make-ready-pass-never-triggers: the
+first live run skipped the whole pass because nothing solicited a pick). Pull
+the untriaged and needs-human slices (`spor next --readiness untriaged`,
+`--readiness human`, or the `counts_by_readiness` lead you already have from
+pass 1), present the top ~5 as make-ready candidates — one line each: the item
+and the gap you can already see from its why-line/reasons — and ask which to
+work, recommending the highest-ranked unblockers. Picking stays the human's;
+skipping the proposal is not an option unless both buckets are empty (then say
+so in the outcome).
+
 For each chosen item:
 
 - **Brief it** — `spor brief <id>` (or `query_graph root_id=<id>`) — pulling
