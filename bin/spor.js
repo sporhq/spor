@@ -2907,48 +2907,46 @@ function gitIdentity(repoDir) {
   return { name: read("user.name"), email: read("user.email") };
 }
 
-// Rewrite a node's raw markdown to carry `value` (or clear it when value is ""),
-// stamping priority_by/_at/_via. Byte-mirrors the server's rewritePriority so a
-// local node and a remote one read the same after the mutation; returns the new
-// raw, or null when the frontmatter can't be located.
-function rewritePriority(raw, value, identity, via) {
+// Rewrite a node's raw markdown to carry `value` for `field` (or clear it
+// when value is ""), stamping `<field>_by/_at/_via`. Byte-mirrors the
+// server's rewrite<Field> so a local node and a remote one read the same
+// after the mutation; returns the new raw, or null when the frontmatter
+// can't be located. Shared by `spor priority` and `spor ready`
+// (task-spor-priority-readiness-stamp-helper-dedup) — the only per-field
+// pieces are the field name itself, the allowed-value vocabulary (each
+// verb's own normalize*), and the provenance key prefix this derives from it.
+function rewriteStamp(field, raw, value, identity, via) {
   const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(raw);
   if (!m) return null;
   let fm = m[1];
   const body = m[2];
   const stripFmLine = (s, key) => s.replace(new RegExp(`(^|\\n)${key}:[^\\n]*`, "g"), "");
-  for (const k of ["priority", "priority_by", "priority_at", "priority_via"]) fm = stripFmLine(fm, k);
+  for (const k of [field, `${field}_by`, `${field}_at`, `${field}_via`]) fm = stripFmLine(fm, k);
   fm = fm.replace(/\n+$/, "").replace(/^\n+/, "");
   const stamps = [];
   if (value) {
-    stamps.push(`priority: ${value}`);
-    if (identity && identity.name && identity.email) stamps.push(`priority_by: ${identity.name} <${identity.email}>`);
-    stamps.push(`priority_at: ${u.isoMs()}`);
-    stamps.push(`priority_via: ${via}`);
+    stamps.push(`${field}: ${value}`);
+    if (identity && identity.name && identity.email) stamps.push(`${field}_by: ${identity.name} <${identity.email}>`);
+    stamps.push(`${field}_at: ${u.isoMs()}`);
+    stamps.push(`${field}_via: ${via}`);
   }
   const fmOut = stamps.length ? `${fm}\n${stamps.join("\n")}` : fm;
   return `---\n${fmOut}\n---\n${body}`;
 }
 
-async function cmdPriority(cfg, { positionals }) {
-  const id = positionals[0];
-  const rawPriority = positionals[1];
-  if (!id || rawPriority == null) {
-    err("usage: spor priority <id> <p1|p2|p3|clear>");
-    err("  set the human-triage priority of a queue item, or clear it (none/clear)");
-    return 1;
-  }
-  const norm = normalizePriority(rawPriority);
-  if (!norm.ok) {
-    err(`priority '${rawPriority}' not allowed — use p1, p2, p3, or none/clear to remove it`);
-    return 1;
-  }
-  const value = norm.value;
-
+// The set-a-stamp-field verb core: validate/normalize is caller-specific
+// (each verb has its own allowed-value vocabulary and argument shape), but
+// once a canonical `value` is in hand, `priority` and `ready` share the
+// identical scaffolding this factors out — remote POSTs the micro-mutation
+// route ({[field]: value} to /v1/nodes/{id}/{field}); local mode does
+// get -> rewrite frontmatter -> validate -> write, mirroring the server's
+// read-modify-write (no server to POST to). Identity is the git user the way
+// local $viewer is derived (lib/queue.js viewerFor), the door is `cli`.
+async function stampField(cfg, { id, field, value }) {
   if (cfg.mode() === "remote") {
     // Send the canonical value the server validates again; it stamps
-    // priority_by/_at/_via (via: rest) from the token, so the body is {priority}.
-    const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/priority`, { priority: value }, { timeoutMs: 8000 });
+    // <field>_by/_at/_via (via: rest) from the token.
+    const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/${field}`, { [field]: value }, { timeoutMs: 8000 });
     if (r.transport) {
       err(`offline — could not reach server (${r.error})`);
       return 1;
@@ -2959,16 +2957,13 @@ async function cmdPriority(cfg, { positionals }) {
     }
     if (!r.ok) {
       const msg = r.json && r.json.error && r.json.error.message;
-      err(`priority error ${r.status}${msg ? `: ${msg}` : ""}`);
+      err(`${field} error ${r.status}${msg ? `: ${msg}` : ""}`);
       return 1;
     }
-    out(value ? `priority set: ${id} -> ${value}` : `priority cleared: ${id}`);
+    out(value ? `${field} set: ${id} -> ${value}` : `${field} cleared: ${id}`);
     return 0;
   }
 
-  // local: rewrite the node file's frontmatter in place, mirroring the server's
-  // read-modify-write (no server to POST to). Identity is the git user the way
-  // local $viewer is derived (lib/queue.js viewerFor), the door is `cli`.
   const nodesDir = cfg.nodesDir();
   const file = path.join(nodesDir, `${id}.md`);
   let raw;
@@ -2979,7 +2974,7 @@ async function cmdPriority(cfg, { positionals }) {
     return 1;
   }
   const identity = gitIdentity(path.dirname(nodesDir));
-  const newRaw = rewritePriority(raw, value, identity, "cli");
+  const newRaw = rewriteStamp(field, raw, value, identity, "cli");
   if (newRaw == null) {
     err(`could not locate frontmatter in ${id}`);
     return 1;
@@ -2998,17 +2993,33 @@ async function cmdPriority(cfg, { positionals }) {
   try {
     node = graphLib.parseFrontmatter(newRaw, `${id}.md`);
   } catch (e) {
-    err(`invalid node after priority rewrite: ${e.message}`);
+    err(`invalid node after ${field} rewrite: ${e.message}`);
     return 1;
   }
   const v = graphLib.validateNode(g, node);
   if (!v.ok) {
-    err(`invalid node after priority rewrite:\n  ${v.errors.join("\n  ")}`);
+    err(`invalid node after ${field} rewrite:\n  ${v.errors.join("\n  ")}`);
     return 1;
   }
   fs.writeFileSync(file, newRaw);
-  out(value ? `priority set: ${id} -> ${value}` : `priority cleared: ${id}`);
+  out(value ? `${field} set: ${id} -> ${value}` : `${field} cleared: ${id}`);
   return 0;
+}
+
+async function cmdPriority(cfg, { positionals }) {
+  const id = positionals[0];
+  const rawPriority = positionals[1];
+  if (!id || rawPriority == null) {
+    err("usage: spor priority <id> <p1|p2|p3|clear>");
+    err("  set the human-triage priority of a queue item, or clear it (none/clear)");
+    return 1;
+  }
+  const norm = normalizePriority(rawPriority);
+  if (!norm.ok) {
+    err(`priority '${rawPriority}' not allowed — use p1, p2, p3, or none/clear to remove it`);
+    return 1;
+  }
+  return stampField(cfg, { id, field: "priority", value: norm.value });
 }
 
 // --- spor ready ----------------------------------------------------------
@@ -3029,29 +3040,6 @@ async function cmdPriority(cfg, { positionals }) {
 // the readiness:agent stamp, so a later open question or requires:human edit
 // still wins and flips a stamped item back to human.
 
-// Rewrite a node's raw markdown to carry `value` (or clear it when value is
-// ""), stamping readiness_by/_at/_via. Byte-mirrors rewritePriority above so a
-// local node and a remote one read the same after the mutation; returns the
-// new raw, or null when the frontmatter can't be located.
-function rewriteReadiness(raw, value, identity, via) {
-  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(raw);
-  if (!m) return null;
-  let fm = m[1];
-  const body = m[2];
-  const stripFmLine = (s, key) => s.replace(new RegExp(`(^|\\n)${key}:[^\\n]*`, "g"), "");
-  for (const k of ["readiness", "readiness_by", "readiness_at", "readiness_via"]) fm = stripFmLine(fm, k);
-  fm = fm.replace(/\n+$/, "").replace(/^\n+/, "");
-  const stamps = [];
-  if (value) {
-    stamps.push(`readiness: ${value}`);
-    if (identity && identity.name && identity.email) stamps.push(`readiness_by: ${identity.name} <${identity.email}>`);
-    stamps.push(`readiness_at: ${u.isoMs()}`);
-    stamps.push(`readiness_via: ${via}`);
-  }
-  const fmOut = stamps.length ? `${fm}\n${stamps.join("\n")}` : fm;
-  return `---\n${fmOut}\n---\n${body}`;
-}
-
 async function cmdReady(cfg, { values, positionals }) {
   const id = positionals[0];
   if (!id) {
@@ -3060,71 +3048,7 @@ async function cmdReady(cfg, { values, positionals }) {
     return 1;
   }
   const value = values["needs-input"] ? "" : "agent";
-
-  if (cfg.mode() === "remote") {
-    // Send the canonical value the server validates again; it stamps
-    // readiness_by/_at/_via (via: rest) from the token, so the body is {readiness}.
-    const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/readiness`, { readiness: value }, { timeoutMs: 8000 });
-    if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
-      return 1;
-    }
-    if (r.status === 404) {
-      err(`no such node: ${id}`);
-      return 1;
-    }
-    if (!r.ok) {
-      const msg = r.json && r.json.error && r.json.error.message;
-      err(`readiness error ${r.status}${msg ? `: ${msg}` : ""}`);
-      return 1;
-    }
-    out(value ? `readiness set: ${id} -> agent` : `readiness cleared: ${id}`);
-    return 0;
-  }
-
-  // local: rewrite the node file's frontmatter in place, mirroring the server's
-  // read-modify-write (no server to POST to). Identity is the git user the way
-  // local $viewer is derived (lib/queue.js viewerFor), the door is `cli`.
-  const nodesDir = cfg.nodesDir();
-  const file = path.join(nodesDir, `${id}.md`);
-  let raw;
-  try {
-    raw = fs.readFileSync(file, "utf8");
-  } catch {
-    err(`no such node: ${id}`);
-    return 1;
-  }
-  const identity = gitIdentity(path.dirname(nodesDir));
-  const newRaw = rewriteReadiness(raw, value, identity, "cli");
-  if (newRaw == null) {
-    err(`could not locate frontmatter in ${id}`);
-    return 1;
-  }
-  // validate before writing (same bar as add/correct/priority), so a malformed
-  // result never lands on disk.
-  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
-  let g;
-  try {
-    g = graphLib.loadGraph(nodesDir);
-  } catch (e) {
-    err(`could not load graph: ${e.message}`);
-    return 1;
-  }
-  let node;
-  try {
-    node = graphLib.parseFrontmatter(newRaw, `${id}.md`);
-  } catch (e) {
-    err(`invalid node after readiness rewrite: ${e.message}`);
-    return 1;
-  }
-  const v = graphLib.validateNode(g, node);
-  if (!v.ok) {
-    err(`invalid node after readiness rewrite:\n  ${v.errors.join("\n  ")}`);
-    return 1;
-  }
-  fs.writeFileSync(file, newRaw);
-  out(value ? `readiness set: ${id} -> agent` : `readiness cleared: ${id}`);
-  return 0;
+  return stampField(cfg, { id, field: "readiness", value });
 }
 
 // --- spor set-status / spor edge ----------------------------------------
