@@ -169,18 +169,21 @@ async function sessionEndLease({ graph, slug, session, cwd, remote }) {
   if (ids.size === 0) return; // no claim held this session
 
   const timeoutMs = u.cfgNum("sessionLease.timeoutMs", "SESSION_LEASE_TIMEOUT", 3000);
-  for (const id of ids) {
+  // Each id's GET+POST is independent, so run them concurrently rather than
+  // paying up to N * 2 * timeoutMs sequentially for a session that held
+  // several claims.
+  const convert = async (id) => {
     const get = await u
       .curl(`${u.serverBase()}/v1/nodes/${encodeURIComponent(id)}`, { headers: u.bearer(), timeoutMs })
       .catch(() => null);
-    if (!get || get.http !== "200") continue; // can't verify -> leave the lease alone
+    if (!get || get.http !== "200") return; // can't verify -> leave the lease alone
     let parsed;
     try {
       parsed = JSON.parse(get.body);
     } catch {
-      continue;
+      return;
     }
-    if (typeof parsed.raw !== "string") continue;
+    if (typeof parsed.raw !== "string") return;
     const status = parsed.raw
       .split("\n")
       .find((l) => l.startsWith("status:"))
@@ -205,7 +208,8 @@ async function sessionEndLease({ graph, slug, session, cwd, remote }) {
       journalPath,
       JSON.stringify({ ts: u.jqNow(), project: slug, tool: "session-lease", id, action, http: post ? post.http : "000" })
     );
-  }
+  };
+  await Promise.all([...ids].map(convert));
 }
 
 async function distill(input) {
@@ -219,8 +223,15 @@ async function distill(input) {
 
   // task-cc-client-sessionend-reserve-hook: independent of the LLM
   // distillation below (no-LLM, its own gates) so a disabled/failing
-  // distiller never blocks the lease conversion, and vice versa.
-  await sessionEndLease({ graph, slug, session, cwd, remote }).catch(() => {});
+  // distiller never blocks the lease conversion, and vice versa. Skipped for
+  // a debounce-approximated firing (spor_debounced, set by bin/spor-hook.js
+  // when spooling for Codex/Copilot/OpenCode's turn-scoped quiescence) — that
+  // is NOT a genuine session-end signal, and a mid-session pause trips it just
+  // as easily as a real goodbye, so acting on it risks silently reserving or
+  // releasing a claim that is still actively being worked.
+  if (!input.spor_debounced) {
+    await sessionEndLease({ graph, slug, session, cwd, remote }).catch(() => {});
+  }
 
   // User kill switch, symmetric with the nudge's SPOR_NUDGE=0 (post-tool.js):
   // SPOR_DISTILL=0 (env) or distill.enabled:false (config) disables the paid
