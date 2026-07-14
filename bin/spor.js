@@ -7044,7 +7044,10 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // Agent-readiness guard (task-spor-dispatch-readiness-guard, dec-spor-agent-
   // readiness-derived-classification): `requires: human` is the risk-class
   // register's own declaration that no agent can complete this work, regardless
-  // of capability — a REFUSE before any side effect, with NO --force override
+  // of capability — a REFUSE before any graph write, claim, or launch, with NO
+  // --force override (note: the profile resolution above may already have
+  // persisted a machine-local capability probe cache, a pre-existing ordering —
+  // see issue-spor-dispatch-probe-side-effect-before-refusal)
   // (unlike every other dispatch guard): overriding it would be exactly the
   // silent substitution the profile-satisfiability rule below also forbids. A
   // broader `readiness: human` classification (assigned to a person, a held
