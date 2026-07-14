@@ -873,6 +873,41 @@ test("dispatch (cross-repo): a relative dispatch.worktreeSetup in the target .sp
   assert.ok(fs.existsSync(path.join(repo, ".claude", "worktrees", "dec-x", ".ran")), "relative setup hook ran (resolved against the repo dir)");
 });
 
+test("dispatch (cross-repo): does not apply the LAUNCHER's own .spor.json dispatch.worktreeSetup to the target's worktree", () => {
+  // issue-spor-dispatch-worktree-setup-wrong-repo-config: dispatching from repo
+  // A (which declares its own dispatch.worktreeSetup, relative to A) for a node
+  // targeting repo B used to fall back to the standing cfg — anchored at A's
+  // cwd — and run A's relative script inside B's fresh worktree, where it does
+  // not exist (setup hook exit 127). The target (demo/B) declares no override
+  // of its own, so the fix must resolve the fallback against the TARGET, not
+  // silently inherit A's.
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+
+  const launcher = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-launcher-"));
+  fs.writeFileSync(
+    path.join(launcher, ".spor.json"),
+    JSON.stringify({ enabled: true, dispatch: { worktreeSetup: "scripts/only-in-launcher.sh" } }) + "\n"
+  );
+
+  const outFile = path.join(home, "spawn.out");
+  const stub = pwdStub(home);
+  const r = run(
+    ["dispatch", "dec-x", "--no-brief", "--worktree"],
+    { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile },
+    launcher
+  );
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stderr, /setup hook failed/);
+  const cwd = fs.readFileSync(outFile, "utf8").split("\n")[0];
+  assert.strictEqual(
+    cwd,
+    fs.realpathSync(path.join(repo, ".claude", "worktrees", "dec-x")),
+    "launched in the target's worktree, unaffected by the launcher's foreign setup hook"
+  );
+});
+
 test("dispatch --no-worktree overrides the target repo's .spor.json dispatch.worktree", () => {
   const { home } = fixture();
   const { repo, real } = gitTargetRepo();

@@ -6836,16 +6836,27 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   //   standing cfg dispatch.worktree > off.
   // The TARGET repo's own .spor.json wins over the standing user/global config so
   // a repo that declares it wants isolation is honored wherever it's dispatched
-  // FROM (the cfg cascade only sees the dispatcher's cwd). Forced off for
-  // --backfill, which sets up the MAIN checkout itself. The setup hook follows
-  // the same target-first precedence; relative paths in the marker resolve
-  // against the repo (the spor-server hook stages the node_modules symlink +
-  // $SPOR_LIB the bare worktree needs).
+  // FROM. Forced off for --backfill, which sets up the MAIN checkout itself. The
+  // setup hook follows the same target-first precedence; relative paths in the
+  // marker resolve against the repo (the spor-server hook stages the
+  // node_modules symlink + $SPOR_LIB the bare worktree needs).
+  //
+  // The "standing cfg" fallback must NOT be `cfg` as-is: `cfg` is anchored at
+  // the DISPATCHER's cwd (process.cwd()), so its repo-.spor.json layer is the
+  // LAUNCHER's own repo config, not the target's. Cross-repo dispatch (launch
+  // from repo A for a node targeting repo B) would then apply repo A's
+  // dispatch.worktreeSetup — a path relative to A — inside B's fresh worktree,
+  // where it doesn't exist (issue-spor-dispatch-worktree-setup-wrong-repo-
+  // config). Re-resolving the cascade anchored at res.dir instead fixes this:
+  // it still picks up target's own .spor.json (redundant with targetCfg above,
+  // but harmless) and the location-independent user/global config layers, while
+  // never seeing a foreign repo's .spor.json.
   const targetCfg = targetRepoDispatchCfg(res.dir);
+  const targetStandingCfg = loadConfig({ cwd: res.dir, env: process.env });
   const worktreeSetup =
-    targetCfg.worktreeSetup != null ? targetCfg.worktreeSetup : cfg.get("dispatch.worktreeSetup", null);
+    targetCfg.worktreeSetup != null ? targetCfg.worktreeSetup : targetStandingCfg.get("dispatch.worktreeSetup", null);
   const worktreeDefault =
-    targetCfg.worktree != null ? targetCfg.worktree : !!cfg.get("dispatch.worktree", false);
+    targetCfg.worktree != null ? targetCfg.worktree : !!targetStandingCfg.get("dispatch.worktree", false);
   const useWorktree =
     !backfill && (values["no-worktree"] ? false : !!(values.worktree || worktreeDefault));
 
@@ -7191,6 +7202,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // (session omitted, dec-spor-dispatch-bg-session-late-bind): the real session
   // isn't known until after launch, so we bind it to the lease via renewDispatch
   // below; until then any of this person's sessions may renew it.
+  let claimEstablished = false;
   if (nodeId && !backfill && !noClaim && cfg.mode() === "remote") {
     // Tag this claim with a per-invocation dispatch nonce so the server refuses a
     // SECOND concurrent dispatch of the same node — even by this same person, on
@@ -7204,9 +7216,24 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
       err(`  --no-claim to dispatch with no lease, or pick another task with 'spor next'.`);
       return 1;
     }
-    if (c.ok) out(`claimed ${nodeId} (lease established; the agent's writes will renew it)`);
-    else err(`warning: could not establish a lease on ${nodeId}: ${c.error} — dispatching without a claim`);
+    if (c.ok) {
+      claimEstablished = true;
+      out(`claimed ${nodeId} (lease established; the agent's writes will renew it)`);
+    } else err(`warning: could not establish a lease on ${nodeId}: ${c.error} — dispatching without a claim`);
   }
+  // A worktree-creation/setup-hook failure, or a failure to even launch the
+  // agent process, below aborts the dispatch without ever running an agent —
+  // release the lease claimed just above so it doesn't strand the node
+  // claimed-but-unattended (issue-spor-dispatch-worktree-setup-wrong-repo-
+  // config: the failed attempt used to need a manual `spor release` before a
+  // retry). Best-effort: a release failure here just leaves the existing
+  // "needs a manual spor release" state, no worse than before.
+  const releaseClaimOnAbort = async () => {
+    if (!claimEstablished) return;
+    const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}/release`, {}, { timeoutMs: 6000 });
+    if (r.ok) out(`  released the claim on ${nodeId}`);
+    else err(`  warning: could not release the claim on ${nodeId} — retry with 'spor release ${nodeId}'`);
+  };
   // Materialize the worktree just before launch — AFTER every guard/claim, so a
   // refused dispatch never leaves a worktree behind — and run the agent inside it.
   // res.dir stays the registered slug->path target (the durable main checkout,
@@ -7217,6 +7244,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     if (wt.error) {
       err(`could not create dispatch worktree under ${res.dir}: ${wt.error}`);
       err(`  (is ${res.dir} a git repo with at least one commit? or pass --no-worktree.)`);
+      await releaseClaimOnAbort();
       return 1;
     }
     if (wt.setupError) {
@@ -7227,6 +7255,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
       } else {
         err(`  left the reused worktree ${wt.dir} in place. Fix dispatch.worktreeSetup or pass --no-worktree.`);
       }
+      await releaseClaimOnAbort();
       return 1;
     }
     launchDir = wt.dir;
@@ -7237,6 +7266,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   const r = spawnPortableSync(claudeBin, claudeArgs, { cwd: launchDir, stdio: "inherit" });
   if (r.error) {
     err(`could not launch ${claudeBin}: ${r.error.message}`);
+    await releaseClaimOnAbort();
     return 1;
   }
 
