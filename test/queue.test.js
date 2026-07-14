@@ -1535,12 +1535,14 @@ test("readiness: a bare task with no signal is untriaged and rides no readiness 
   assert.equal(rankQueue(g, { now: NOW }).counts_by_readiness, undefined, "no counts when no signal");
 });
 
-test("readiness: requires:human derives human with the reason", () => {
-  const g = tmpGraph(Object.fromEntries([raw("task-h", "task", "status: open\nrequires: [human]\n")])).load();
-  const it = rd(g, "task-h");
-  assert.equal(it.readiness, "human");
-  assert.deepEqual(it.readiness_reasons, ["requires human"]);
-  assert.ok(it.why.startsWith("needs human: requires human"), "the clause leads the why-line");
+test("readiness: requires:human derives human with the reason (list AND bare-scalar spelling)", () => {
+  for (const spelling of ["requires: [human]\n", "requires: human\n"]) {
+    const g = tmpGraph(Object.fromEntries([raw("task-h", "task", `status: open\n${spelling}`)])).load();
+    const it = rd(g, "task-h");
+    assert.equal(it.readiness, "human", `spelling ${JSON.stringify(spelling)} must classify human (risk-class safety guard)`);
+    assert.deepEqual(it.readiness_reasons, ["requires human"]);
+    assert.ok(it.why.startsWith("needs human: requires human"), "the clause leads the why-line");
+  }
 });
 
 test("readiness: assigned→person is human, assigned→agent is agent (edge target type decides)", () => {
@@ -1598,7 +1600,7 @@ test("readiness: an ANSWERED neighborhood question no longer forces human", () =
   assert.equal(near.readiness, undefined, "the resolved question is no longer an open spec gap → untriaged, no field");
 });
 
-test("readiness: counts_by_readiness aggregates the ranked work items and stays consistent with count", () => {
+test("readiness: counts_by_readiness aggregates the ranked work items (sum == count on a schema-free queue)", () => {
   const g = tmpGraph(Object.fromEntries([
     raw("t-agent", "task", "status: open\nreadiness: agent\n"),
     raw("t-human", "task", "status: open\nrequires: [human]\n"),
@@ -1607,6 +1609,20 @@ test("readiness: counts_by_readiness aggregates the ranked work items and stays 
   const r = rankQueue(g, { now: NOW });
   assert.deepEqual(r.counts_by_readiness, { agent: 1, human: 1, untriaged: 1 });
   assert.equal(r.counts_by_readiness.agent + r.counts_by_readiness.human + r.counts_by_readiness.untriaged, r.count);
+});
+
+test("readiness: a queued proposed-schema item is in count but excluded from counts_by_readiness", () => {
+  const g = tmpGraph(Object.fromEntries([
+    raw("t-agent", "task", "status: open\nreadiness: agent\n"),
+    ["schema-x.md", `---\nid: schema-x\ntype: schema\nkind: node-schema\nproject: my-project\nstatus: proposed\nschema_version: 2026.01.01.1\ntitle: X\nsummary: A proposed schema awaiting approval.\ndate: 2026-06-01\n---\n\`\`\`json\n{"type":"x","id_prefix":"x-"}\n\`\`\`\n`],
+  ])).load();
+  const r = rankQueue(g, { now: NOW });
+  assert.equal(r.count, 2, "count includes the schema-approval item");
+  // Schema-approval items ride their own approve lane, outside the classification,
+  // so the readiness tally sums to count MINUS the queued proposed schema.
+  assert.deepEqual(r.counts_by_readiness, { agent: 1, human: 0, untriaged: 0 });
+  const schemaItem = r.items.find((i) => i.id === "schema-x");
+  assert.equal(schemaItem.readiness, undefined, "no readiness field on a schema-approval item");
 });
 
 test("readiness: the filter narrows to a class as a hard scope and still reports counts for the facet", () => {

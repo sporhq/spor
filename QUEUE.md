@@ -544,7 +544,7 @@ later open question or `requires: human` edit flips a stamped item back:
   1-hop neighborhood (a soft spec gap to close first).
 - **agent** — an explicit `readiness: agent` frontmatter stamp with
   `readiness_by` provenance (mirroring `priority`/`priority_by`, the one
-  hand-set piece — the `spor ready` verb + REST twin, slice 2) · or an
+  hand-set piece — a make-ready stamp verb + REST twin, slice 2) · or an
   `assigned → agent` edge.
 - **untriaged** otherwise — the deliberate third bucket ("nobody has checked
   the spec"), which rides **no** readiness fields, so the item is
