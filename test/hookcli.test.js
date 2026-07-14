@@ -1023,14 +1023,27 @@ test('session-start: detached catch-up stamps commits made outside any session',
       JSON.stringify({ cwd, hook_event_name: 'SessionStart' }),
       env
     );
-    // the catch-up is detached from the hook; poll for its stamp
-    const deadline = Date.now() + 8000;
+    // The catch-up is detached from the hook; poll for its stamp. The deadline
+    // is generous on purpose (the poll exits the moment the stamp lands, so a
+    // healthy run never waits it out): on windows-latest the detached child —
+    // node cold start + a handful of git spawns — takes ~4s on a good run and
+    // blew a previous 8s deadline on a slow one
+    // (issue-spor-windows-ci-detached-catchup-never-stamps).
+    const deadline = Date.now() + 30000;
     let stamp;
     while (!stamp && Date.now() < deadline) {
       stamp = hits.find((h) => h.method === 'POST' && h.url === '/v1/nodes/task-cl-outside/commits');
       if (!stamp) await sleep(100);
     }
-    assert.ok(stamp, `catch-up never stamped; hits: ${JSON.stringify(hits.map((h) => h.url))}`);
+    // On failure, surface the child's own journal — link-commits logs every
+    // stamp attempt to journal/remote.log — so a dead child (empty log) and a
+    // slow one (attempts present) are distinguishable from the CI output alone.
+    let rlog = '';
+    try { rlog = fs.readFileSync(path.join(home, 'journal', 'remote.log'), 'utf8'); } catch {}
+    assert.ok(
+      stamp,
+      `catch-up never stamped; hits: ${JSON.stringify(hits.map((h) => h.url))}; remote.log: ${JSON.stringify(rlog)}`
+    );
     assert.deepStrictEqual(JSON.parse(stamp.body), { repo: 'projx', sha });
   } finally {
     srv.close();
