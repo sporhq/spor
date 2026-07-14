@@ -66,20 +66,43 @@ attribute to you and your queue and question-routing work.
    hand it over; the user then re-runs step 1 with it. Don't paper over it — silent
    identity degradation is exactly the failure this check exists to catch
    (issue-cc-onboarding-email-mismatch-silent-degradation).
-4. **Enable this repo.** `spor enable` writes `.spor.json {enabled: true}` so the
+4. **Ask how assistants should talk to them — the `register` field.** First
+   check `spor get <person-id>` — if the node already carries a `register:`,
+   this step is done (mention it exists and move on; don't re-interview a
+   returning user). Otherwise interview briefly, then **draft the field
+   yourself — never transcribe the user's first answer**. People
+   under-specify this in the moment ("just keep it simple" encodes nothing a
+   model can act on), so extract the substance: what's their role, how
+   technical are they, and what does a useful explanation look like to them —
+   asking for an example of an explanation they liked or hated works well.
+   From that, compose 2–4 directive sentences a model can follow mechanically
+   (vocabulary level, node titles vs raw ids, analogies vs precision, detail
+   depth — e.g. `register: Non-technical founder. Plain everyday language, no
+   graph jargon; use node titles, never raw ids. Analogies over precision.`),
+   read the draft back for approval, and write the approved version to their
+   person node (GRAPH.md "person"): `spor get <person-id> --json` for the
+   revision, add the field, then
+   `spor put-node - --if-exists update --revision <sha>`. The server renders it
+   to every graph-reading assistant (MCP instructions + an Audience note on
+   reads), so a non-technical user gets answers they can actually use — for
+   them this is the highest-value step here
+   (task-spor-viewer-register-adaptation). Presentation only, editable any time
+   by updating their person node; a technical user happy with the default
+   needs no field — skip without ceremony.
+5. **Enable this repo.** `spor enable` writes `.spor.json {enabled: true}` so the
    plugin actually runs here — without a marker every hook no-ops (the opt-in
    default), even in remote mode. Commit the file to share the setting. If the
    inferred project slug is wrong, `spor link <slug>` writes a `.spor` marker.
-5. **(Optional) a dispatch identity**, if the user will run background agents.
+6. **(Optional) a dispatch identity**, if the user will run background agents.
    Two explicit steps: `spor agent create <label>` writes the agent node owned by
    your person, then `spor agent use <agent-id>` makes it **this machine's**
    default — that's what turns on session-start capability auto-publish and the
    liveness heartbeat. Creating does not activate; both are needed. Use the full
    `agent-<slug>` id from `spor agent list`, not the bare label.
-6. **State the data reality correctly.** In remote mode your captures and
+7. **State the data reality correctly.** In remote mode your captures and
    distilled nodes land in the **shared team graph on the server** — visible to
    teammates and attributed to you. It is *not* local-only.
-7. **Hand off to populate the repo:** `/spor:backfill` (mine history, group
+8. **Hand off to populate the repo:** `/spor:backfill` (mine history, group
    repos). Tracker/MCP consent happens there — see step 6 of the local branch,
    which applies equally.
 

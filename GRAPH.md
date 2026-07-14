@@ -640,6 +640,8 @@ email: losthammer@gmail.com
 github: losthammer
 roles: [reviewer, maintainer]
 queue_mute: [some-noisy-project, task-noisy-job@2026-07-01]
+register: Non-technical founder. Plain everyday language, no graph jargon;
+  use node titles, never raw ids. Analogies over precision.
 date: 2026-06-10
 edges:
   - {type: stewards, to: norm-cc-registry-is-contract}
@@ -653,6 +655,14 @@ edges:
   (issue-cc-identity-email-mutable-primary-key). The token's `{name, email}`
   attribution is read from the bound node, never from a caller parameter
   (dec-viewer-token-binding, dec-cc-attribution-from-token).
+- **`register` is the language-register field** (free-text folded scalar): the
+  reader's role and preferred language style. Viewer-facing surfaces (the
+  server's MCP instructions block and the conversational read tools' `Audience
+  note` preamble) render it verbatim so the model adapts how it talks about
+  graph content to this person — a non-technical user gets plain language
+  instead of node-type jargon (task-spor-viewer-register-adaptation).
+  Presentation only: it never changes what is returned. Settable from chat by
+  updating your own person node.
 - **`stewards` edges are the routing key.** A `person → node` `stewards` edge
   declares ownership of an area, spec, or norm. When a question can't be
   answered from the graph and is filed (`ask_question` / `POST /v1/questions`),

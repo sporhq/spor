@@ -2,7 +2,7 @@
 id: schema-person
 type: schema
 kind: node-schema
-schema_version: 2026.06.23.1
+schema_version: 2026.07.14.1
 title: Seed schema for person nodes
 summary: Node schema for the person type — a member of the org, with a mutable display name plus the identity anchor for $viewer binding and Tier-2 question routing. Seed-pack default; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -41,6 +41,25 @@ node may reach a resolving/done state. Declarative data only — absent it, a
 person holds no roles and the field has no effect, so this register is purely
 additive (existing person nodes are unchanged).
 
+`register` (2026.07.14.1) is the person node's language-register field (folded
+scalar, free-text prose): how to communicate with this user — their role and
+preferred language style, e.g. `register: Non-technical founder. Plain
+everyday language, no graph jargon; use node titles, never raw ids.` Consumers
+that render graph content *to* this person (the server's MCP instructions
+block and conversational tool-result preambles; API.md §5) surface it verbatim
+so the model adapts its language to the reader
+(task-spor-viewer-register-adaptation). Free text on purpose — the model
+follows prose directly, so no enum→instruction translation table exists to
+drift. When setting it on a user's behalf, don't transcribe a vague
+preference ("keep it simple") — interview briefly, compose 2–4 directive
+sentences a model can act on (vocabulary level, node titles vs raw ids,
+analogies vs precision, detail depth), and confirm the draft with the user
+before writing. Per-viewer presentation only, read via the same `$viewer` binding as
+`queue_mute`; it never changes what content is returned, only how the
+assistant is told to talk about it. Declarative data only — absent it, nothing
+is injected and the field has no effect, so this register is purely additive
+(existing person nodes are unchanged).
+
 `github` (2026.06.21.1) is the person node's GitHub-handle register (flat inline
 scalar): `github: octocat`. It is the login→person key the Spor server's GitHub
 review reflection maps by: when a GitHub review or merge is reflected into the
@@ -76,6 +95,10 @@ register is purely additive (existing person nodes are unchanged).
     "roles": {
       "kind": "inline-list",
       "description": "role-list register consumed by policy quorum gates"
+    },
+    "register": {
+      "kind": "scalar",
+      "description": "free-text language register — the reader's role and preferred language style, rendered to the model on viewer-facing surfaces"
     },
     "github": {
       "kind": "scalar",

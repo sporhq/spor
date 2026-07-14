@@ -166,8 +166,9 @@ token — the node reads "agent on behalf of person"). Other
 type-specific fields exist (`wake:` dormancy date; `commits:` linked git shas;
 `pin:`/`exclude:` on corrections; `slugs:`/`fingerprints:`/`tags:` on repo nodes;
 `applies_to_tags:`/`applies_to_repos:`/`applies_to_projects:` ride-along
-selectors on norms; `roles:`/`queue_mute:` on person nodes) — see GRAPH.md for
-the complete list.
+selectors on norms; `roles:`/`queue_mute:`/`register:` on person nodes, `register` being the
+free-text "how to talk to this reader" language-style field viewer-facing
+surfaces render verbatim) — see GRAPH.md for the complete list.
 
 Validate any local node you write: `spor validate` (or
 `node lib/validate.js`), and fix what it flags.
