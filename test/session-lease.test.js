@@ -15,7 +15,9 @@ const http = require('node:http');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawnHook } = require('./helpers/portable');
+const { spawnHook, runHook } = require('./helpers/portable');
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function freshEnv(home, extra = {}) {
   const env = { ...process.env, SPOR_HOME: home };
@@ -296,6 +298,35 @@ test('a sibling session\'s heartbeats are never touched (session-scoped, not per
     const out = await runAsync(['distill', '--host', 'claude-code'], sessionEndPayload(cwd, 's1'), env);
     assert.strictEqual(out.trim(), '');
     assert.strictEqual(hits.length, 0, "s1's SessionEnd must not act on s2's held claim");
+  } finally {
+    srv.close();
+  }
+});
+
+// Codex/Copilot/OpenCode approximate "session end" by debouncing a turn-scoped
+// event (Stop/agentStop/session.idle) after N seconds of quiescence — a mid-
+// session pause trips it just as easily as a real goodbye. Reserving/releasing
+// a still-live claim on that false positive would silently strand active work,
+// so the debounced firing (bin/spor-hook.js marks it `spor_debounced`) must
+// skip the lease branch entirely, even though it still runs distillation.
+test('a debounced (quiescence-approximated) firing skips the lease branch entirely', async () => {
+  const { home, cwd } = scratch();
+  seedHeartbeat(home, 'sess-deb', ['task-mine']);
+  const { srv, hits, base } = await stubServer((id) => (id === 'task-mine' ? { raw: 'id: task-mine\nstatus: open\n---\n' } : null));
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    runHook(
+      ['distill', '--host', 'codex', '--debounce', '1'],
+      JSON.stringify({ cwd, session_id: 'sess-deb', hook_event_name: 'Stop' }),
+      env
+    );
+    const pending = path.join(home, 'journal', 'pending-distill', 'sess-deb.json');
+    assert.ok(fs.existsSync(pending), 'payload spooled');
+    // wait for the debounce watcher to fire and clean up its spool
+    for (let i = 0; i < 40 && fs.existsSync(pending); i++) await sleep(250);
+    assert.ok(!fs.existsSync(pending), 'watcher ran (spool cleaned up)');
+    assert.strictEqual(hits.length, 0, 'a debounced firing must never call reserve/release');
+    assert.strictEqual(journal(home, 'sess-deb').filter((e) => e.tool === 'session-lease').length, 0);
   } finally {
     srv.close();
   }
