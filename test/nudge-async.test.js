@@ -145,8 +145,13 @@ test("async: post-tool returns immediately, worker drops a result, next prompt i
   // A spawn was journaled.
   assert.strictEqual(journal(home).filter((e) => e.tool === "nudge-async-spawn").length, 1);
 
-  // Phase-2: the detached worker classifies and drops a result file.
-  assert.ok(await waitFor(() => outFiles(home).length === 1), "worker never wrote a result");
+  // Phase-2: the detached worker classifies and drops a result file. On
+  // failure, surface the recorded llm call (its error field distinguishes a
+  // dead backend from a slow worker — issue-spor-windows-ci-async-nudge-flake).
+  assert.ok(
+    await waitFor(() => outFiles(home).length === 1),
+    `worker never wrote a result; llm-calls: ${JSON.stringify(llmCalls(home))}`
+  );
   // The classifier call was recorded to llm-calls by the worker.
   const calls = llmCalls(home);
   assert.strictEqual(calls.length, 1);
@@ -176,12 +181,25 @@ test("async: post-tool returns immediately, worker drops a result, next prompt i
 });
 
 test("async NOTHING verdict: worker drops no result, prompt injects nothing, file stays reserved", async () => {
-  const { root, home, cwd } = scratch();
-  const file = path.join(cwd, "notes.md");
-  postTool(home, cwd, nothingStub(root), { file, content: PROSE });
-  // Wait for the worker to record its (NOTHING) llm call.
-  assert.ok(await waitFor(() => llmCalls(home).length === 1), "worker never ran");
-  assert.match(llmCalls(home)[0].response, /NOTHING/);
+  // A transiently failed backend spawn on a slow runner (windows-latest:
+  // Defender locks on the freshly-written stub, spawn transients) is recorded
+  // by the worker as error + response:null — the same no-result outcome as a
+  // real NOTHING verdict, but no evidence about the NOTHING path. Retry such
+  // environmental misses in a FRESH scratch (the failed attempt's file stays
+  // reserved, by design) and assert strictly on the run where the stub
+  // actually executed (issue-spor-windows-ci-async-nudge-flake).
+  let root, home, cwd, file, call;
+  for (let attempt = 0; ; attempt++) {
+    ({ root, home, cwd } = scratch());
+    file = path.join(cwd, "notes.md");
+    postTool(home, cwd, nothingStub(root), { file, content: PROSE });
+    // Wait for the worker to record its (NOTHING) llm call.
+    assert.ok(await waitFor(() => llmCalls(home).length === 1), "worker never ran");
+    call = llmCalls(home)[0];
+    if (call.error == null || attempt >= 2) break;
+  }
+  assert.strictEqual(call.error, null, `backend never executed: ${JSON.stringify(call)}`);
+  assert.match(call.response, /NOTHING/);
   assert.strictEqual(outFiles(home).length, 0);
   // Still reserved so a re-edit doesn't reclassify.
   assert.deepStrictEqual(nudgedLines(home), [`pending\t${file}`]);
@@ -192,7 +210,10 @@ test("async merges multiple pending results into one injection", async () => {
   const { root, home, cwd } = scratch();
   const files = [0, 1].map((i) => path.join(cwd, `doc${i}.md`));
   for (const f of files) postTool(home, cwd, factStub(root), { file: f, content: PROSE });
-  assert.ok(await waitFor(() => outFiles(home).length === 2), "both workers should finish");
+  assert.ok(
+    await waitFor(() => outFiles(home).length === 2),
+    `both workers should finish; llm-calls: ${JSON.stringify(llmCalls(home))}`
+  );
   const text = JSON.parse(promptContext(home, cwd, { prompt: "ok" })).hookSpecificOutput.additionalContext;
   // One envelope naming both files.
   assert.match(text, /doc0\.md/);
