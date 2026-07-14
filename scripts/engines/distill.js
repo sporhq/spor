@@ -15,6 +15,7 @@ const { spawnSync } = require("child_process");
 const u = require("./util");
 const { drainOutbox } = require("./drain-outbox");
 const { inferCommits } = require("./infer-commits");
+const resolutionLib = require(path.join(u.ROOT, "lib", "kernel", "resolution.js"));
 
 // The nested-repo guard (graph home === code repo) now lives in util so the
 // `spor init` path can share it (task-spor-onboard-cli-init-git-identity).
@@ -109,24 +110,129 @@ function parseFactBlocks(response) {
   return facts;
 }
 
+// task-cc-client-sessionend-reserve-hook (dec-cc-task-resumption-reservation):
+// the fifth-and-sixth lease actions, called from SessionEnd. Converts every
+// task THIS SESSION held a live Tier-1 lease on — evidenced by its own
+// claim-heartbeat journal lines, the no-LLM per-write renewal the post-tool
+// claim-nudge branch already performs (task-cc-claim-nudge-hook) — into
+// whichever half of the two-tier lease model fits: still open -> an
+// owner-exclusive resumption reservation (`reserve`, advanced but unfinished);
+// gone terminal or closed by a resolver edge -> `release` (drop the lease and
+// the durable `assigned` edge, cleaning up after finished work). A task this
+// session never actually renewed (no edit landed while its lease was live) is
+// left alone entirely — "does nothing when no claim was held" — so its Tier-1
+// lease just expires on its own TTL rather than being touched by a session
+// that did no real work on it.
+//
+// Scoping to THIS session's own heartbeat record — not a fresh person-scoped
+// `assignee=me` queue read — is deliberate: a finished task drops out of the
+// queue entirely (rankQueue only ever lists LIVE nodes, even in the steward
+// view), so that endpoint can't see a task that just went terminal; and a
+// person-scoped read would risk acting on a claim a DIFFERENT concurrent
+// session of the same person is still actively working. The session's own
+// journal has neither problem.
+//
+// Same gating posture as the post-tool claim-nudge branch: remote/team mode
+// only, in a real git repo, fail-open, config-cascade knobs
+// (sessionLease.enabled / SPOR_SESSION_LEASE, default on). No LLM.
+async function sessionEndLease({ graph, slug, session, cwd, remote }) {
+  if (!remote) return; // a lease is meaningless without a shared server
+  if (u.config() ? !u.config().getBool("sessionLease.enabled", true) : (u.envDual("SESSION_LEASE") ?? "1") === "0")
+    return;
+  const top = u.git(cwd, ["rev-parse", "--show-toplevel"]);
+  if (!top || !top.trim()) return; // no repo root -> no project pool to act on
+
+  const journalPath = path.join(graph, "journal", `${session}.jsonl`);
+  let entries = [];
+  try {
+    entries = fs
+      .readFileSync(journalPath, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => {
+        try {
+          return JSON.parse(l);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch {
+    return; // no journal for this session -> no heartbeats -> nothing held
+  }
+  const ids = new Set();
+  for (const e of entries) {
+    if (e.tool === "claim-heartbeat" && Array.isArray(e.renewed)) {
+      for (const id of e.renewed) if (id) ids.add(id);
+    }
+  }
+  if (ids.size === 0) return; // no claim held this session
+
+  const timeoutMs = u.cfgNum("sessionLease.timeoutMs", "SESSION_LEASE_TIMEOUT", 3000);
+  for (const id of ids) {
+    const get = await u
+      .curl(`${u.serverBase()}/v1/nodes/${encodeURIComponent(id)}`, { headers: u.bearer(), timeoutMs })
+      .catch(() => null);
+    if (!get || get.http !== "200") continue; // can't verify -> leave the lease alone
+    let parsed;
+    try {
+      parsed = JSON.parse(get.body);
+    } catch {
+      continue;
+    }
+    if (typeof parsed.raw !== "string") continue;
+    const status = parsed.raw
+      .split("\n")
+      .find((l) => l.startsWith("status:"))
+      ?.slice(7)
+      .trim() ?? "";
+    // Status lags resolution edges (issue-cc-status-lags-resolution-edges):
+    // the `resolution` read-time enrichment (a live inbound resolves/answers
+    // edge) means the task is done even while its status field still reads
+    // open, so either signal counts as finished.
+    const finished = Boolean(parsed.resolution) || resolutionLib.isTerminalStatus(status);
+    const action = finished ? "release" : "reserve";
+    const body = action === "reserve" ? JSON.stringify({ session }) : "{}";
+    const post = await u
+      .curl(`${u.serverBase()}/v1/nodes/${encodeURIComponent(id)}/${action}`, {
+        method: "POST",
+        headers: { ...u.bearer(), "content-type": "application/json" },
+        body,
+        timeoutMs,
+      })
+      .catch(() => null);
+    u.appendLine(
+      journalPath,
+      JSON.stringify({ ts: u.jqNow(), project: slug, tool: "session-lease", id, action, http: post ? post.http : "000" })
+    );
+  }
+}
+
 async function distill(input) {
   if (process.env.SPOR_DISTILLING || process.env.SUBSTRATE_DISTILLING) return null;
+
+  const graph = u.graphHome();
+  const remote = Boolean(u.serverBase());
+  const cwd = input.cwd ?? "";
+  const session = input.session_id ?? "unknown";
+  const slug = u.projectSlug(cwd);
+
+  // task-cc-client-sessionend-reserve-hook: independent of the LLM
+  // distillation below (no-LLM, its own gates) so a disabled/failing
+  // distiller never blocks the lease conversion, and vice versa.
+  await sessionEndLease({ graph, slug, session, cwd, remote }).catch(() => {});
+
   // User kill switch, symmetric with the nudge's SPOR_NUDGE=0 (post-tool.js):
   // SPOR_DISTILL=0 (env) or distill.enabled:false (config) disables the paid
   // SessionEnd distill call. No active config falls back to the exact env
   // dual-read, so unset behavior is byte-identical (default "1").
   if (u.config() ? !u.config().getBool("distill.enabled", true) : (u.envDual("DISTILL") ?? "1") === "0") return null;
 
-  const graph = u.graphHome();
   const nodes = path.join(graph, "nodes");
-  const remote = Boolean(u.serverBase());
   if (!remote && !fs.existsSync(nodes)) return null;
 
-  const cwd = input.cwd ?? "";
-  const session = input.session_id ?? "unknown";
   const transcriptPath = input.transcript_path ?? "";
   if (!transcriptPath || !fs.existsSync(transcriptPath)) return null;
-  const slug = u.projectSlug(cwd);
 
   u.ensureDir(path.join(graph, "journal"));
   const logFile = path.join(graph, "journal", "distill.log");
@@ -422,4 +528,4 @@ async function distill(input) {
   return null;
 }
 
-module.exports = { distill, normalizeEdges, parseNodeBlocks, parseFactBlocks, graphInsideCodeRepo };
+module.exports = { distill, normalizeEdges, parseNodeBlocks, parseFactBlocks, graphInsideCodeRepo, sessionEndLease };
