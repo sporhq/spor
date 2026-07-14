@@ -46,7 +46,7 @@ scalar, free-text prose): how to communicate with this user — their role and
 preferred language style, e.g. `register: Non-technical founder. Plain
 everyday language, no graph jargon; use node titles, never raw ids.` Consumers
 that render graph content *to* this person (the server's MCP instructions
-block and conversational tool-result preambles; API.md §5) surface it verbatim
+block and conversational tool-result preambles; API.md §2) surface it verbatim
 so the model adapts its language to the reader
 (task-spor-viewer-register-adaptation). Free text on purpose — the model
 follows prose directly, so no enum→instruction translation table exists to

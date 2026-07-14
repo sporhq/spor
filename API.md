@@ -69,6 +69,21 @@ neighbor → neighbor); `render_lens` lineage lenses trace why a node exists,
 and `render_lens` with no `lens_id` returns the lens catalog (the discovery
 step before rendering).
 
+**Per-viewer language register** (task-spor-viewer-register-adaptation): when
+the authenticated viewer's person node carries a free-text `register:` field
+(GRAPH.md "person" — role + preferred language style), the server renders it
+on two channels so the host's model adapts how it explains graph content to
+that user. (1) The initialize `instructions` gain a trailing **`AUDIENCE`**
+section quoting the field; (2) the conversational read tools — `query_graph`,
+`get_node`, `explore_graph`, `show_queue` — prepend one line to their TEXT
+content: `Audience note — how to communicate with this user: <register>`.
+Both channels because host support for instructions is uneven. The preamble
+is presentation-only: `structuredContent` is never touched, `isError` results
+are exempt, and content is never filtered or reordered by it. The field is
+capped at 500 chars on render; agent-scoped identities (dispatch tokens) get
+neither channel — the register describes the human reader. Absent the field,
+both channels are byte-identical to before.
+
 ### `query_graph`
 
 The compiler over the wire. Input:
