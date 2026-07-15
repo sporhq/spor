@@ -388,6 +388,11 @@ async function cmdNext(cfg, args) {
       const { items, hidden } = annotateInFlight(q.items || [], dispatchedAgents(), hideDispatched);
       q.items = items;
       if (typeof q.count === "number") q.count = Math.max(0, q.count - hidden);
+      // --hide-dispatched shrinks .items below whatever fetchQueuePaged assembled,
+      // so returned_count (task-spor-next-pagination-metadata-coherence) must
+      // shrink with it too or it stops matching q.items.length in the final
+      // payload actually handed to the caller.
+      if (typeof q.returned_count === "number") q.returned_count = Math.max(0, q.returned_count - hidden);
       if (hideDispatched) q.hidden_dispatched = hidden;
       if (wantJson) {
         out(JSON.stringify(q));
@@ -617,13 +622,19 @@ function queueLimitTarget(args) {
 // `next_offset` until we have `target` items or the pages run out. The full-set
 // aggregates (count, counts_by_*, questions/findings/…) are identical on every
 // page (the server ranks the whole set and slices only the page), so we keep the
-// FIRST page's envelope and just grow its .items. A finite limit <=100 is a
-// single request — byte-compatible with the old hardcoded read. Returns the
+// FIRST page's envelope for those. But `returned_count`/`truncated`/`next_offset`
+// describe a SINGLE page, not the assembled result — those come from the LAST
+// page actually fetched and from the final item count instead
+// (task-spor-next-pagination-metadata-coherence), so a caller assembling all 105
+// items of a 105-item queue sees returned_count:105/truncated:false rather than
+// the first page's stale returned_count:100/truncated:true. A finite limit <=100
+// is a single request — byte-compatible with the old hardcoded read. Returns the
 // failing remote.get result verbatim on transport/HTTP error so the caller's
 // existing checks fire.
 async function fetchQueuePaged(cfg, baseQs, target) {
   const items = [];
   let envelope = null;
+  let lastPage = null;
   let offset = 0;
   while (items.length < target) {
     const want = target === Infinity ? 100 : Math.min(100, target - items.length);
@@ -634,6 +645,7 @@ async function fetchQueuePaged(cfg, baseQs, target) {
     if (r.transport || !r.ok) return r;
     const page = r.json || {};
     if (!envelope) envelope = page;
+    lastPage = page;
     const pageItems = Array.isArray(page.items) ? page.items : [];
     items.push(...pageItems);
     const next = page.next_offset;
@@ -641,7 +653,19 @@ async function fetchQueuePaged(cfg, baseQs, target) {
     offset = next;
   }
   envelope = envelope || { items: [], count: 0 };
-  envelope.items = target === Infinity ? items : items.slice(0, target);
+  // `want` above never asks for more than the remaining budget to `target`, so
+  // `items.length` can never exceed a finite target, and `finalItems === items`
+  // by reference when target is Infinity — finalItems.length always equals
+  // items.length here, never less.
+  const finalItems = target === Infinity ? items : items.slice(0, target);
+  envelope.items = finalItems;
+  envelope.returned_count = finalItems.length;
+  if (lastPage) {
+    // Whether more remains beyond the assembled result is exactly what the
+    // last page fetched said about what comes after IT.
+    envelope.truncated = !!lastPage.truncated;
+    envelope.next_offset = lastPage.truncated ? lastPage.next_offset : null;
+  }
   return { ok: true, json: envelope };
 }
 
