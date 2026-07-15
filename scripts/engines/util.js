@@ -1390,6 +1390,117 @@ function runClaudeBackend(prompt, { timeoutMs } = {}) {
   return parseClaudeResult(r.stdout);
 }
 
+// Shared classifier-backend invocation, used by the capture nudge
+// (post-tool.js's classifyForNudge) and the digest-intent classifier
+// (prompt-context.js's classifyDigestIntent): pick a backend (a configured
+// cmd, else `claude -p --model haiku`), run it bounded by timeoutMs, and
+// record the call to journal/llm-calls in the one shape both sources feed the
+// nightly Haiku-quality review loop with. Returns { response, backend, usage,
+// cost_usd, model } on success, or null on backend failure (still recorded,
+// with `error` set). Callers own all response PARSING (===FACT=== blocks vs
+// WARRANTED/UNWARRANTED) and all cooldown/journal STATE — this function's
+// only side effect is the llm-calls record.
+function runClassifierBackend({ prompt, tplSha, session, project, graph, source, template, timeoutMs, cmd, vars }) {
+  const llmDir = path.join(graph, "journal", "llm-calls");
+  const t0 = Date.now();
+  let backend = "";
+  let usage = null;
+  let cost_usd = null;
+  let model = null;
+  const recordLlm = (response, error) => {
+    if (!ensureDir(llmDir)) return;
+    const rec = {
+      id: `llm-${Date.now()}-${bashRandom()}`,
+      ts: isoMs(),
+      source,
+      backend,
+      template,
+      template_sha: tplSha,
+      session,
+      project,
+      latency_ms: Date.now() - t0,
+      usage,
+      cost_usd,
+      model,
+      prompt,
+      vars,
+      response: error === "" ? response : null,
+      error: error === "" ? null : error,
+    };
+    appendLine(path.join(llmDir, `${localDate()}.jsonl`), JSON.stringify(rec));
+  };
+
+  let response;
+  if (cmd) {
+    backend = `cmd:${cmd}`;
+    response = runBackendCmd(cmd, prompt, { timeoutMs });
+    if (response === null) {
+      recordLlm("", `${source} cmd failed`);
+      return null;
+    }
+  } else {
+    backend = "cli:claude -p --model haiku";
+    const res = runClaudeBackend(prompt, { timeoutMs });
+    if (res === null) {
+      recordLlm("", "claude -p failed");
+      return null;
+    }
+    response = res.text;
+    usage = res.usage;
+    cost_usd = res.cost_usd;
+    model = res.model;
+  }
+  recordLlm(response, "");
+  return { response, backend, usage, cost_usd, model };
+}
+
+// Shared detached-worker main routine, used by nudge-worker.js and
+// digest-worker.js (task-spor-client-classifier-backend-refactor): read the
+// spool INPUT file, delete it immediately (so a duplicate worker can't re-run
+// the same classification), run the caller's `classify(job)`, and — when
+// `buildOutput(job, result)` returns a truthy record — write it atomically
+// (tmp file + rename, so the prompt-time drainer's `*.out.json` glob never
+// sees a half-written file) as `<job.hash>.out.json` beside the input. Always
+// exits 0 (workers are fire-and-forget; a thrown classify() fails open —
+// leaves the file reserved, injects nothing). `buildOutput` returning a
+// falsy value (or a missing `job.hash`) writes nothing.
+function runSpoolWorker(inFile, classify, buildOutput) {
+  if (!inFile) process.exit(0);
+
+  let job;
+  try {
+    job = JSON.parse(fs.readFileSync(inFile, "utf8"));
+  } catch {
+    process.exit(0);
+  }
+  try {
+    fs.unlinkSync(inFile);
+  } catch {}
+
+  let result = null;
+  try {
+    result = classify(job);
+  } catch {
+    /* fail-open: leave the file reserved, inject nothing */
+  }
+
+  const out = buildOutput(job, result);
+  if (out && job.hash) {
+    const outFile = path.join(path.dirname(inFile), `${job.hash}.out.json`);
+    const tmp = `${outFile}.tmp`;
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(out));
+      fs.renameSync(tmp, outFile);
+    } catch {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {}
+    }
+  }
+
+  process.exit(0);
+}
+
 // Detached child that survives the hook process (replaces nohup setsid).
 function spawnDetached(nodeArgs, env = process.env) {
   const child = spawn(process.execPath, nodeArgs, {
@@ -1469,6 +1580,8 @@ module.exports = {
   runBackendCmd,
   runClaudeBackend,
   parseClaudeResult,
+  runClassifierBackend,
+  runSpoolWorker,
   spawnDetached,
   bashRandom,
 };
