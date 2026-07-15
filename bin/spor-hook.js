@@ -12,6 +12,7 @@
 // Usage (from a host's hooks config; see adapters/):
 //   spor-hook session-start  [--host claude-code|codex|gemini|cursor|copilot|opencode]
 //   spor-hook prompt-context [--host ...]
+//   spor-hook pre-tool       [--host ...]
 //   spor-hook post-tool      [--host ...]
 //   spor-hook distill        [--host ...] [--debounce SECONDS]
 //   spor-hook agents-md      [--cwd DIR]    # AGENTS.md floor; no stdin
@@ -27,6 +28,7 @@ const u = require(path.join(__dirname, "..", "scripts", "engines", "util"));
 const ENGINES = {
   "session-start": () => require("../scripts/engines/session-start").sessionStart,
   "prompt-context": () => require("../scripts/engines/prompt-context").promptContext,
+  "pre-tool": () => require("../scripts/engines/pre-tool").preTool,
   "post-tool": () => require("../scripts/engines/post-tool").postTool,
   distill: () => require("../scripts/engines/distill").distill,
 };
