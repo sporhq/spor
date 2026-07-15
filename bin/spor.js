@@ -6344,8 +6344,8 @@ async function resolveDispatchProfile(cfg, { profileFlag, nodeRaw, identityAgent
 async function compileBriefing(cfg, { nodeId, query, full, project }) {
   if (cfg.mode() === "remote") {
     if (nodeId) {
-      // Same raw-node + seeded-neighborhood resolution as `spor brief <id>`, so
-      // a dispatched agent's standing context matches an interactive brief
+      // Same raw-node + root-walk-neighborhood resolution as `spor brief <id>`,
+      // so a dispatched agent's standing context matches an interactive brief
       // rather than the bare node (issue-spor-dispatch-briefing-omits-neighborhood).
       const b = await remoteNodeBriefing(cfg, { root: nodeId, project });
       return b.ok ? b.text : "";

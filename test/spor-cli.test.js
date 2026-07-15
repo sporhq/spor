@@ -1704,6 +1704,19 @@ test('brief <id> (remote) emits the raw node plus a root-walk /v1/digest neighbo
   }
 });
 
+test('brief <id> --project <slug> (remote) forwards project alongside root', async () => {
+  const { srv, hits, base } = await digestStubServer();
+  try {
+    const r = await runAsyncCli(['brief', 'dec-x', '--project', 'demo'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-b' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const dig = hits.find((h) => h.url === '/v1/digest');
+    assert.ok(dig, 'compiled a digest');
+    assert.deepStrictEqual(dig.body, { root: 'dec-x', project: 'demo' });
+  } finally {
+    srv.close();
+  }
+});
+
 test('compile --query --digest (remote) posts /v1/digest and prints the text', async () => {
   const { srv, hits, base } = await digestStubServer();
   try {
