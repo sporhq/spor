@@ -135,6 +135,27 @@ test("--apply heals the stale index: the root ends at main, clean, exit 0", () =
   assert.equal(statusOf(dir), "", "index and working tree both match main");
 });
 
+// Each path's own newest match legitimately differs when the root lags SEVERAL
+// merges: a path the later merges never touched also matches the newer commits.
+// The common base has to be found by re-testing every path per ancestor, or the
+// evidence line disappears in exactly the multi-merge-lag case it exists for.
+test("a root lagging several merges still names the commit it is sitting at", () => {
+  const dir = initRepo();
+  write(dir, "a.js", "a0\n");
+  write(dir, "b.js", "b0\n");
+  const c0 = commit(dir, "init");
+  write(dir, "a.js", "a1\n");
+  commit(dir, "a only"); // b.js's c0 state also matches here — its newest match
+  write(dir, "b.js", "b1\n");
+  commit(dir, "b only");
+  git(dir, "checkout", "-q", c0, "--", "a.js", "b.js"); // index+tree back to c0: the lagging-root shape
+
+  const r = runJson(dir);
+  assert.equal(r.json.verdict, "STALE");
+  assert.deepEqual(r.json.stale.map((s) => s.path).sort(), ["a.js", "b.js"]);
+  assert.equal(r.json.base, c0, "the one ancestor that explains every stale path");
+});
+
 test("a stale root spanning many paths heals every one and names one common base", () => {
   const dir = initRepo();
   write(dir, "a.js", "a0\n");
@@ -520,6 +541,7 @@ test("a group-exec-only file is not 100755 — git reads the owner bit, so we do
 // materializes a tracked symlink as a PLAIN FILE holding the target path, while
 // still recording mode 120000. Deriving 100644 from disk refuses it forever.
 test("with core.symlinks=false a checked-out symlink is a plain file, and still heals", () => {
+  if (process.platform === "win32") return; // building the fixture needs real symlinks first
   const dir = initRepo();
   write(dir, "target.txt", "a\n");
   write(dir, "other.txt", "b\n");
@@ -635,25 +657,27 @@ test("eol=crlf is a round-trip conversion, so a stale path still heals through i
 
 // ---------- a write landing while the heal itself is running ----------
 
-// The checkout runs in 200-path chunks, so with one up-front recheck a path in a
-// later chunk would sit cleared-but-unwritten for the wall-clock of every earlier
-// chunk — plenty of room for a concurrent job's write to land and be overwritten.
-// The recheck is per-chunk, immediately before that chunk's checkout; a
+// The heal writes path by path, so a set of stale paths takes real wall-clock —
+// with any up-front recheck (whole-set or chunked), a path late in the set would
+// sit cleared-but-unwritten for the duration of everything healed before it,
+// plenty of room for a concurrent job's write to land and be overwritten. The
+// recheck is per-path, immediately before that path's own checkout; a
 // post-checkout hook plays the concurrent job deterministically: the FIRST
-// chunk's checkout fires it, and it drops novel content into a SECOND-chunk path.
-test("a write landing between checkout chunks is caught by that chunk's own recheck", () => {
+// path's checkout fires it, and it drops novel content into the LAST path —
+// after that path was classified stale, before its own turn to be written.
+test("a write landing while earlier paths heal is caught by that path's own recheck", () => {
   if (process.platform === "win32") return; // the concurrent writer is a sh hook
   const dir = initRepo();
   const names = [];
-  for (let i = 0; i <= 200; i++) names.push(`f${String(i).padStart(3, "0")}.txt`);
+  for (let i = 0; i < 8; i++) names.push(`f${i}.txt`);
   for (const n of names) write(dir, n, `${n} v0\n`);
   commit(dir, "init");
   casAdvance(dir, () => { for (const n of names) write(dir, n, `${n} v1\n`); });
-  const last = names[names.length - 1]; // sorts into the second chunk (201 = 200 + 1)
+  const last = names[names.length - 1]; // healed last, so its window is widest
   const hook = path.join(dir, ".git", "hooks", "post-checkout");
-  // Fire exactly once: an unguarded hook re-fires on the SECOND chunk's checkout
-  // too, re-creating the WIP right after that checkout destroyed it — and the
-  // aftermath is then indistinguishable from the write having been spared.
+  // Fire exactly once: an unguarded hook re-fires on every later checkout too,
+  // re-creating the WIP right after a checkout destroyed it — and the aftermath
+  // is then indistinguishable from the write having been spared.
   fs.writeFileSync(hook, [
     "#!/bin/sh",
     'if [ ! -e .git/raced-once ]; then',
@@ -668,10 +692,52 @@ test("a write landing between checkout chunks is caught by that chunk's own rech
   const r = runJson(dir, "--apply");
   assert.equal(r.json.verdict, "ROOT-UNSYNCED", "the root is not fully in sync — a write raced the heal");
   assert.equal(r.status, 1);
-  assert.equal(r.json.healed.length, 200, "every path the racer left alone still healed");
+  assert.equal(r.json.healed.length, names.length - 1, "every path the racer left alone still healed");
   assert.equal(r.json.healed.includes(last), false);
   assert.deepEqual(r.json.wip.map((w) => w.path), [last]);
   assert.equal(read(dir, last), "mid-heal WIP\n", "the mid-heal write survives");
+});
+
+// The sharper pin on the same window: the previous test's writer fires between
+// two CHECKOUTS, which any implementation with more than one checkout batch
+// catches. This one fires DURING the last path's own recheck probe — b.txt's
+// clean filter (identity for content, racing side effect) runs inside recheck's
+// hash-object and writes novel bytes into a.txt, which by then has already been
+// healed. Any design that clears paths first and writes them later (one batched
+// checkout, chunked checkouts) has already cleared a.txt and proceeds to
+// overwrite that write; only probe-then-immediately-write-per-path leaves it
+// standing. The filter CONFIG lands only after casAdvance, so the fixture's own
+// commits run with the attribute pointing at a missing filter (a no-op).
+test("a write landing inside the very recheck window survives — the heal is per-path", () => {
+  if (process.platform === "win32") return; // the racing writer is a sh filter
+  const dir = initRepo();
+  write(dir, ".gitattributes", "b.txt filter=racer\n");
+  write(dir, "a.txt", "a v0\n");
+  write(dir, "b.txt", "b v0\n");
+  commit(dir, "init");
+  casAdvance(dir, () => {
+    write(dir, "a.txt", "a v1\n");
+    write(dir, "b.txt", "b v1\n");
+  });
+  // Fires only once a.txt has been healed to v1 — i.e. mid-apply, never during
+  // classification (a.txt is still v0 there) and idempotently never again.
+  write(dir, ".git/racer.sh", [
+    "#!/bin/sh",
+    'if [ "$(cat a.txt 2>/dev/null)" = "a v1" ]; then',
+    "  printf 'mid-heal WIP\\n' > a.txt",
+    "fi",
+    "cat",
+    "",
+  ].join("\n"));
+  git(dir, "config", "filter.racer.clean", "sh .git/racer.sh");
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "ROOT-UNSYNCED", "a write raced the heal, so the root is not in sync");
+  assert.equal(r.status, 1);
+  assert.deepEqual(r.json.healed, ["b.txt"], "the path the racer left alone healed");
+  assert.deepEqual(r.json.wip.map((w) => w.path), ["a.txt"]);
+  assert.equal(read(dir, "a.txt"), "mid-heal WIP\n", "the write that landed mid-recheck survives");
+  assert.equal(read(dir, "b.txt"), "b v1\n");
 });
 
 // ---------- conflicts, which hide their other side in the index ----------

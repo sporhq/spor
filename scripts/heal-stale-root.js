@@ -77,8 +77,10 @@
 //     eye — and it restores committed state rather than destroying new work.
 //   - Nothing locks the tree, so a job writing to a path between this run's
 //     classification and its checkout could still lose that write. The window is
-//     re-probed shut immediately before EACH checkout chunk (see recheck) — one
-//     subprocess spawn wide, per path actually about to be written — not closed.
+//     re-probed shut PER PATH, immediately before that path's own checkout (see
+//     recheck): the last probe of a path and the write that spends its clearance
+//     are adjacent subprocess spawns, with nothing else between — not closed,
+//     but as narrow as a tool without a tree lock can make it.
 //
 // Usage:
 //   node scripts/heal-stale-root.js [--repo <dir>] [--lookback N] [--apply] [--json]
@@ -211,9 +213,25 @@ const splitZ = (out) => (out ? out.split('\0').filter((s) => s !== '') : []);
 // guarantee we should hold a data-loss tool up with.
 const spec = (p) => `:(literal)${p}`;
 
+// Chunk paths for one git invocation: at most `n` entries AND at most ~20KB of
+// path bytes, whichever fills first. The byte cap is for Windows, where the
+// whole argv becomes one CreateProcess command line hard-capped at ~32,767
+// chars — 200 deep-monorepo paths wrapped in `:(literal)` can overrun it, and
+// the spawn failure would end a classification with no verdict at all.
 function chunks(arr, n) {
   const out = [];
-  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  let cur = [];
+  let bytes = 0;
+  for (const p of arr) {
+    if (cur.length && (cur.length >= n || bytes + p.length > 20000)) {
+      out.push(cur);
+      cur = [];
+      bytes = 0;
+    }
+    cur.push(p);
+    bytes += p.length;
+  }
+  if (cur.length) out.push(cur);
   return out;
 }
 
@@ -250,9 +268,16 @@ function inProgressOp(repo) {
   for (const [file, op] of Object.entries(named)) {
     const p = git(repo, ['rev-parse', '--git-path', file]);
     // A probe that cannot answer is not a "no": reading it as one would hand a
-    // mid-merge tree to the checkout.
+    // mid-merge tree to the checkout. That is also why this is NOT existsSync,
+    // which folds every stat error (EACCES, ELOOP, …) into "not there" —
+    // only a missing path proves the marker absent.
     if (p === null) return { unreadable: file };
-    if (fs.existsSync(path.resolve(repo, p.trim()))) return { op };
+    try {
+      fs.statSync(path.resolve(repo, p.trim()));
+      return { op };
+    } catch (e) {
+      if (!e || (e.code !== 'ENOENT' && e.code !== 'ENOTDIR')) return { unreadable: file };
+    }
   }
   return {};
 }
@@ -485,28 +510,36 @@ function classify(repo, entry, headSha, headState, idx, ancestors, fsCaps) {
   }
 
   // Every side is either HEAD's own state or a committed older one: nothing here
-  // is novel, so checking out HEAD discards nothing.
+  // is novel, so checking out HEAD discards nothing. `ev` is the state whose
+  // ancestor match is the evidence (the working tree's, unless only the index
+  // dissents) — commonBase re-tests it against each ancestor.
   const base = curAt || idxAt;
-  return { verdict: 'stale', base, cur, idx: idxNow, why: `matches this path at ${base.slice(0, 7)}` };
+  return { verdict: 'stale', base, cur, idx: idxNow, ev: curAt ? cur : idxNow, why: `matches this path at ${base.slice(0, 7)}` };
 }
 
 // The newest ancestor that explains EVERY stale path. Not required to heal (each
 // path stands on its own evidence); it is the evidence line a human reads — "the
-// root is sitting at <sha>, N paths behind main".
-function commonBase(stale, ancestry) {
-  const bases = stale.map((s) => s.base).filter(Boolean);
-  if (!bases.length) return null;
-  for (const c of ancestry) if (bases.every((b) => b === c)) return c; // newest-first
+// root is sitting at <sha>, N paths behind main". Each path's stored `base` is
+// its own NEWEST match, and those legitimately differ when the root lags several
+// merges (a path untouched by the later merges also matches the newer commits),
+// so the common base is found by re-testing every path's evidence per ancestor,
+// newest first — not by expecting the stored bases to coincide.
+function commonBase(stale, ancestors) {
+  if (!stale.length) return null;
+  for (const a of ancestors) {
+    if (stale.every((s) => same(a.state.has(s.path) ? a.state.get(s.path) : ABSENT, s.ev))) return a.commit;
+  }
   return null;
 }
 
-// Re-probe a chunk of the stale set and keep only the paths still holding
-// exactly what they held when they were cleared — (mode, blob) AND raw bytes, so
-// a racer whose novel content clean-normalizes to the same blob loses clearance
-// too. Anything that moved goes to `raced` as WIP — it narrows each path's
-// clearance→checkout window to one probe, which is the best a tool can do over a
-// tree it does not lock. Returns null when the index cannot be re-read: the
-// caller decides, because mid-heal an exit 2 would be a lie.
+// Re-probe stale paths and keep only those still holding exactly what they held
+// when they were cleared — (mode, blob) AND raw bytes, so a racer whose novel
+// content clean-normalizes to the same blob loses clearance too. Anything that
+// moved goes to `raced` as WIP. The heal calls this with ONE path immediately
+// before that path's own checkout, so the last probe and the write that spends
+// its clearance are adjacent spawns — the best a tool can do over a tree it does
+// not lock. Returns null when the index cannot be re-read: the caller decides,
+// because mid-heal an exit 2 would be a lie.
 function recheck(repo, stale, raced, fsCaps) {
   const idx = indexState(repo, stale.map((s) => s.path));
   if (idx === null) return null;
@@ -523,7 +556,7 @@ function recheck(repo, stale, raced, fsCaps) {
     // states, and worktree states always carry raw — compared on the side, since
     // same() also serves tree and index states, which have no raw bytes to hold.
     if (same(cur, s.cur) && (cur === ABSENT || cur.raw === s.cur.raw) && same(now, s.idx)) fresh.push(s);
-    else raced.push({ path: s.path, why: 'it changed while this run was classifying — another job is writing here' });
+    else raced.push({ path: s.path, why: 'it changed after this run classified it — another job is writing here' });
   }
   return fresh;
 }
@@ -577,26 +610,24 @@ function main() {
   const wip = [];
   for (const e of entries) {
     const c = classify(repo, e, head, headState, idx, ancestors, fsCaps);
-    if (c.verdict === 'stale') stale.push({ path: e.path, base: c.base, cur: c.cur, idx: c.idx, why: c.why });
+    if (c.verdict === 'stale') stale.push({ path: e.path, base: c.base, cur: c.cur, idx: c.idx, ev: c.ev, why: c.why });
     else wip.push({ path: e.path, why: c.why });
   }
 
   if (opts.apply && stale.length) {
-    // Re-verify immediately before writing — per CHUNK, not once for the whole
+    // Re-verify immediately before writing — per PATH, not once for the whole
     // set. Classification costs one git call per ancestor — seconds on a real
     // repo — and the whole premise of this tool is a SHARED root that other jobs
-    // write to. A single up-front recheck would leave a path in the last chunk
-    // sitting un-re-verified for the wall-clock of every earlier chunk's
-    // checkout; its clearance is refreshed one subprocess spawn before the write
-    // that spends it. A path that moved in even that window is not the path we
-    // cleared, so it loses its clearance.
+    // write to. An up-front recheck (even a chunked one) would leave later paths
+    // sitting cleared-but-unwritten for the wall-clock of everything probed and
+    // written before them; here each path's clearance is spent by the very next
+    // spawn. A path that moved in even that window is not the path we cleared,
+    // so it loses its clearance and stays untouched.
     const raced = [];
     const attempted = [];
-    const survivors = [];
     let failed = false;
-    const pending = chunks(stale, 200);
-    for (let i = 0; i < pending.length; i++) {
-      const fresh = recheck(repo, pending[i], raced, fsCaps);
+    for (const s of stale) {
+      const fresh = recheck(repo, [s], raced, fsCaps);
       if (fresh === null) {
         // The index went unreadable under us. Before any write that is a clean
         // exit-2 refusal; after one, exit 2 would lie ("nothing was modified"),
@@ -604,46 +635,56 @@ function main() {
         // un-rechecked remainder keeps its classification but is never written.
         if (!hasWritten) usage('cannot re-read the index before healing');
         process.stderr.write('heal-stale-root: cannot re-read the index mid-heal; root left partially healed\n');
-        survivors.push(...pending.slice(i).flat());
         failed = true;
         break;
       }
-      survivors.push(...fresh);
-      if (!fresh.length) continue;
-      attempted.push(...fresh.map((s) => s.path));
-      hasWritten = true; // git may write some entries before it reports failure
-      if (git(repo, ['checkout', head, '--', ...fresh.map((s) => spec(s.path))]) === null) {
+      if (!fresh.length) continue; // raced away; recheck recorded why
+      attempted.push(s.path);
+      hasWritten = true; // git may write the index entry before it reports failure
+      if (git(repo, ['checkout', head, '--', spec(s.path)]) === null) {
         process.stderr.write('heal-stale-root: git checkout failed; root left partially healed\n');
-        survivors.push(...pending.slice(i + 1).flat());
         failed = true;
         break;
       }
     }
-    stale = survivors;
+    // A raced path lost its clearance: it reports as WIP, not as stale. Paths
+    // after a mid-heal break keep their classification — never written, still
+    // stale evidence.
+    const racedPaths = new Set(raced.map((r) => r.path));
+    stale = stale.filter((s) => !racedPaths.has(s.path));
     const known = wip.concat(raced);
-    const base = commonBase(stale, ancestry);
+    const base = commonBase(stale, ancestors);
 
     // Trust the tree, not our own bookkeeping: re-read status and let what is
-    // actually left say what was healed. This is also why a failed chunk is not
-    // fatal — git updates the entries it managed before it dies, so only the tree
-    // knows what landed.
+    // actually left say what was healed. This is also why a failed checkout is
+    // not fatal — git may update the index entry before it dies, so only the
+    // tree knows what landed.
     const left = trackedModified(repo);
     if (left === null) {
-      // The heal already wrote. Exiting 2 through usage() here would print a
-      // usage banner and no report, telling a caller "you invoked me wrong" about
-      // a run that mutated the shared root — and handing a --json consumer an
-      // empty stdout to parse. Report what was attempted instead: `attempted`, not
-      // `healed`, because which of them landed is exactly what we cannot say.
+      // Nothing written yet (every path raced away before the first checkout)
+      // makes this an honest exit 2; after a write it would be a lie, and
+      // exiting 2 through usage() would also print a usage banner and no report
+      // — telling a caller "you invoked me wrong" about a run that mutated the
+      // shared root, and handing a --json consumer an empty stdout to parse.
+      // Report what was attempted instead: `attempted`, not `healed`, because
+      // which of them landed is exactly what we cannot say.
+      if (!hasWritten) usage('cannot re-read git status — nothing was written, but the root cannot be verified');
       report(opts, {
         verdict: 'UNVERIFIED', head, base, stale, wip: known, healed: [],
         attempted,
         note: 'the heal ran but git status could not be re-read, so what landed is unknown',
       }, 1);
     }
-    const healed = stale.map((s) => s.path).filter((p) => !left.some((e) => e.path === p));
+    // `healed` claims only what this run wrote AND status now shows clean —
+    // an attempted-set filter, so a path some OTHER job cleaned in the window
+    // is never reported as this run's work.
+    const leftPaths = new Set(left.map((e) => e.path));
+    const healed = attempted.filter((p) => !leftPaths.has(p));
+    const tried = new Set(attempted);
     const stillWip = left.map((e) => ({
       path: e.path,
-      why: (known.find((w) => w.path === e.path) || {}).why || `still modified after the heal (${e.xy})`,
+      why: (known.find((w) => w.path === e.path) || {}).why
+        || (tried.has(e.path) ? `still modified after the heal (${e.xy})` : 'the heal stopped before reaching it'),
     }));
     // A checkout that failed leaves the run unable to claim the root is synced,
     // even if what remains looks clean — the verdict and the exit code have to say
@@ -658,7 +699,7 @@ function main() {
 
   report(
     opts,
-    { verdict: wip.length ? 'ROOT-UNSYNCED' : 'STALE', head, base: commonBase(stale, ancestry), stale, wip, healed: [] },
+    { verdict: wip.length ? 'ROOT-UNSYNCED' : 'STALE', head, base: commonBase(stale, ancestors), stale, wip, healed: [] },
     1
   );
 }
@@ -680,8 +721,13 @@ function report(opts, r, code) {
     lines.push(`STALE: ${r.stale.length} path(s) are behind HEAD and safe to heal (re-run with --apply).`);
   } else if (r.verdict === 'UNVERIFIED') {
     lines.push(`UNVERIFIED: ${r.note}. Do NOT reset the root; inspect it by hand.`);
-  } else {
+  } else if (r.wip.length) {
     lines.push(`ROOT-UNSYNCED: ${r.wip.length} path(s) carry uncommitted work — do NOT reset the root.`);
+  } else {
+    // Reachable when a checkout failed but the re-read status shows nothing
+    // modified (git can update the entry before it dies): no WIP to point at,
+    // yet the run cannot vouch for the root either.
+    lines.push('ROOT-UNSYNCED: a heal step failed, so the root cannot be proven in sync — do NOT reset it.');
   }
   if (r.base) lines.push(`stale base: ${r.base.slice(0, 8)} (every stale path matches this path there)`);
   for (const s of r.stale) lines.push(`  ${r.healed.includes(s.path) ? 'healed' : 'stale '}  ${s.path} — ${s.why}`);
