@@ -77,7 +77,12 @@ function buildPool(dir) {
       continue;
     }
 
-    const labels = {};
+    // null-proto: a node id equal to an Object.prototype key ("constructor",
+    // "toString", …) must MISS rather than resolve to the inherited member and
+    // score as a present-but-unlabeled node. Ids are type-prefixed today so this
+    // is unreachable, but it is the bug lib/kernel/graph.js's tf-idf index
+    // already paid for (issue-cc-gardener-near-dup-unnormalized-cosine).
+    const labels = Object.create(null);
     for (const [id, l] of b ?? []) labels[id] = l;
     for (const [id, l] of a ?? []) {
       // Where the arms overlap, keep arm B's label and count the (dis)agreement
@@ -94,7 +99,11 @@ function buildPool(dir) {
       snap_sha: r.snap_sha,
       warranted: j.warranted,
       labels,
-      baselineOrder: (b ?? []).map(([id]) => id),
+      // Arm B's order at label time — the shipped ranker's own output, which
+      // run.js diffs against to report engine drift. null (not []) when arm B
+      // didn't align: there is no order to compare, which is different from
+      // "compared and differed", and conflating them understates the drift stat.
+      baselineOrder: b ? b.map(([id]) => id) : null,
     });
   }
   return { cases: out, stats };
