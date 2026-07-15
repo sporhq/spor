@@ -45,6 +45,7 @@ const CASES = {
   decision: { valid: ["active", "superseded", "rejected", "settled"], bad: ["dismissed", "declined", "open", "done"] },
   question: { valid: ["open", "answered"], bad: ["resolved", "closed", "answered!", "done"] },
   "capture-pending": { valid: ["merged", "rejected"], bad: ["dismissed", "resolved", "closed", "pending", "done"] },
+  correction: { valid: ["active", "applied"], bad: ["dormant", "retired", "done", "resolved"] },
 };
 
 for (const [key, { valid, bad }] of Object.entries(CASES)) {

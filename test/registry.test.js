@@ -345,6 +345,10 @@ test("seed pack: edge weights match the historic EDGE_WEIGHTS table exactly", ()
     // uses-profile: an agent → its default profile (the runtime+capability
     // bundle it dispatches under). Structural config binding like owned-by (0.3).
     "uses-profile": 0.3,
+    // The lens vocabulary (issue-cc-lens-schema-missing-seed) added focuses-on:
+    // a lens → the node it is parameterized on. Lowest weight in the table — a
+    // view watching a node says little about the node's own lineage.
+    "focuses-on": 0.2,
   });
   // provenance-only edges are known but unweighted (historic ?? 0.3 default)
   assert.equal(reg.isKnownEdge("compiled-for"), true);
@@ -418,10 +422,20 @@ test("seed pack: node types, prefixes, ride-along, and traversal match GRAPH.md"
   assert.equal(reg.isCapturableEdge("uses-profile"), false);
   // profile/routine carry no resolving-status declaration, so the partition is
   // unchanged (asserted exhaustively in the resolving-partition test below).
+  // The saved-view vocabulary (issue-cc-lens-schema-missing-seed): a fresh
+  // graph must know the lens type and its focuses-on parameterization edge
+  // without importing a schema node first. Interface, not knowledge — so it is
+  // neither traversed nor draftable from a capture.
+  assert.equal(reg.isKnownType("lens"), true);
+  assert.deepEqual(reg.prefixesFor("lens"), ["lens-"]);
+  assert.equal(reg.isCapturableType("lens"), false);
+  assert.equal(reg.isKnownEdge("focuses-on"), true);
+  assert.equal(reg.isCapturableEdge("focuses-on"), false);
   assert.equal(reg.isAlwaysOn("norm"), true);
   assert.equal(reg.isAlwaysOn("decision"), false);
   assert.equal(reg.isTraversable("briefing"), false);
   assert.equal(reg.isTraversable("correction"), false);
+  assert.equal(reg.isTraversable("lens"), false);
   assert.equal(reg.isTraversable("decision"), true);
   assert.equal(reg.isTraversable("never-heard-of-it"), true, "unknown types traverse, as before");
 });
@@ -959,6 +973,41 @@ test("seed pack: task done / issue resolved require a decision or artifact resol
     "an active decision resolver allows resolved (active is resolving)");
   assert.equal(resolvedGate({ resolvers: [{ id: "dec-y", type: "decision" }] }).allow, true,
     "no partition on the view counts every resolver (backward-readable)");
+});
+
+test("seed pack: the lens validate() gate rejects bodies that would not run", () => {
+  // issue-cc-lens-schema-missing-seed: a fresh graph ships the lens gate, so an
+  // unrunnable view is refused at the write door instead of failing at render.
+  const reg = graph.seedRegistry();
+  const SLACK = { timeoutMs: 5000 };
+  const sb = sandboxFor(reg.nodeSchemas.get("lens"));
+  assert.deepEqual(sb.names, ["validate"], "the lens schema exports validate()");
+  const door = (body) => sb.call("validate", [{ id: "lens-x", body }], SLACK);
+  const QUERY = '## query\n\n```json\n{ "select": { "type": "task" } }\n```\n';
+
+  assert.deepEqual(door(QUERY), [], "a query-only lens is runnable");
+  assert.deepEqual(door(""), ["lens body must carry a '## query' fenced json block"]);
+  assert.match(door('## query\n\n```json\n{ nope\n```\n')[0], /'query' block is not valid JSON/);
+  // render.as=custom without the js block it names would render nothing.
+  const custom = '## render\n\n```json\n{ "as": "custom" }\n```\n';
+  assert.deepEqual(door(QUERY + custom), ["render.as=custom requires a '## custom' js block"]);
+  assert.deepEqual(door(QUERY + custom + '## custom\n\n```js\nexport function render() { return []; }\n```\n'), []);
+
+  // The v2 actions block (dec-ui-actions-as-transitions) is optional, but a
+  // present one must be a well-formed affordance list: the renderer binds
+  // buttons to it, and `set` becomes an ordinary revision-checked node update.
+  const actions = (json) => QUERY + "## actions\n\n```json\n" + json + "\n```\n";
+  assert.deepEqual(door(actions('[{ "id": "start", "label": "Start", "set": { "status": "active" } }]')), []);
+  assert.deepEqual(door(actions('{ "id": "start" }')), ["'actions' block must be a JSON array"]);
+  assert.match(door(actions('[{ "id": "Start", "label": "Start", "set": { "status": "active" } }]'))[0],
+    /actions\[0\]\.id must be a kebab-case string/);
+  assert.ok(door(actions('[{ "id": "a", "label": "A", "set": {} }, { "id": "a", "label": "A", "set": { "status": "x" } }]'))
+    .some((e) => /duplicate action id 'a'/.test(e)), "action ids are unique");
+  // id/type are the node's identity — an action may never rewrite them.
+  assert.ok(door(actions('[{ "id": "rename", "label": "Rename", "set": { "type": "issue" } }]'))
+    .some((e) => /may not change 'type'/.test(e)));
+  assert.ok(door(actions('[{ "id": "x", "label": "X", "set": { "status": "open" }, "sudo": true }]'))
+    .some((e) => /unknown key 'sudo'/.test(e)));
 });
 
 test("seed pack: the task get() hook rides along a held-task churn note (task-spor-queue-front-loop-self-limit-on-held-tasks)", () => {

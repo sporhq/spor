@@ -120,6 +120,7 @@ Rules:
 | finding    | `find-`   | a gardener observation about another node, filed as a queue item (QUEUE.md §6) |
 | repo       | `repo-`   | durable git-repo identity: slug aliases + repo fingerprints; heals renames at read time (below) |
 | project    | `proj-`   | a grouping above repos; owns its member repos via inbound `grouped-under` edges (below) |
+| lens       | `lens-`   | a saved view over the graph — declarative `## query`/`## render` json blocks, an optional sandboxed `## custom` js block, and an optional `## actions` block; `traversable: false` and `capturable: false` (see "Lenses") |
 
 ## Completing work needs a durable why (the resolver gate)
 
@@ -482,6 +483,29 @@ two extracted values: "these now disagree" beats "you probably forgot", an
 agreeing invariant suppresses the untouched heuristic, and a disagreement
 reports even when both files were touched. A half-declared or malformed pair
 is inert (validate warns).
+
+An in-repo tracked symlink (`frontend -> packages/web`) has two valid
+repo-relative spellings for the same file, and the matcher tests a glob
+against every candidate spelling it is HANDED
+(task-spor-coupling-matcher-symlink-alias) — but deriving those candidates is
+one-way: it can turn an alias spelling into its git-resolved canonical form,
+never the reverse. A coupling glob authored against an alias
+(`couples_when: [frontend/**]`) therefore still misses an edit reported only
+under its canonical path (`packages/web/app.js`) — the environment may hand
+the matcher an already-resolved path with no alias spelling left to derive
+from — because discovering which alias points at a given canonical path would
+need a filesystem-wide symlink scan, rejected as too expensive for the
+edit-time hot path (dec-spor-dismiss-reverse-symlink-path-lookup,
+issue-spor-coupling-matcher-reverse-symlink-gap). The declared fix is a
+**coupling alias map**: `.spor.json`'s `coupling.aliases`, a flat `{ "<alias
+prefix>": "<canonical prefix>" }` object (repo-root-relative on both sides,
+e.g. `{ "frontend": "packages/web" }`). Every declared entry is expanded in
+BOTH directions at match time, at zero runtime cost (no scanning) — a path
+under either side also produces the spelling under the other side, for both
+`couples_when` triggers and `couples_also` targets. **Declaring nothing is
+the default posture**, and it keeps the one-way limitation above: only
+author coupling globs against the canonical (git-resolved) spelling of a
+symlinked subtree unless its alias is declared in `coupling.aliases`.
 
 Because a norm rides along with no relevance gate and the team trust model lets
 every writer author one, the briefing renderer treats norm bodies as an
@@ -888,6 +912,43 @@ thread 4). The seed set is small — `shell`, `prod-creds`, `browser`, `network`
 `human`, `filesystem-write`, `paid-api`. `human` is unsatisfiable by any agent:
 assign that work to a person.
 
+## Lenses
+
+A saved view over the graph is itself a graph node (dec-lenses-as-nodes), so it
+is versioned, attributed, shareable, and forkable by copying the node — the same
+inversion the queue makes for prioritization, made for presentation. The seed
+ships the vocabulary (`schema-lens`, `schema-edge-focuses-on`) so a fresh graph
+can author views without importing a schema first; the runner that executes them
+is a server surface (`render_lens`, API.md §2).
+
+A lens body carries fenced blocks:
+
+- `## query` — declarative select/traverse/group/sort, JSON. Required.
+- `## render` — builtin renderer config, JSON. `as: custom` requires a `##
+  custom` block.
+- `## custom` — an optional js escape hatch, executed in the same
+  no-clock/no-randomness sandbox as schema attached code, so a render is a pure
+  function of (graph snapshot, lens node, params, now).
+- `## actions` — optional write affordances `{id, label, on?, set, confirm?}`
+  (dec-ui-actions-as-transitions): `on` selects which rendered items carry the
+  affordance, `set` is a flat object of frontmatter changes (scalars or
+  `"$param"` bindings; never `id`/`type`). Invoking one is exactly one
+  revision-checked node update through the ordinary write path, arbitrated
+  fail-closed by the TARGET schema's `transitions()` gate. The lens declares
+  intent, the renderer surfaces it, the registry decides legality — only trusted
+  renderer hosts turn actions into controls, and the `## custom` sandbox never
+  sees them.
+
+A lens is parameterized by an edge, not config: `{type: focuses-on, to: <node>}`
+points it at the node it watches, and the runner resolves `"$focus"` in the query
+from that edge when no runtime parameter is given. Re-pointing a view is then an
+edge edit, and "which lenses watch this node" is graph traversal.
+
+`traversable: false` keeps lenses out of compiler lineage walks — a lens says
+what someone wants to look at, not what the graph knows. `capturable: false` for
+the reason briefing and correction opt out: a lens is authored deliberately
+against a query language, never drafted from a capture or a distilled transcript.
+
 ## Edge types and traversal weights
 
 | edge             | weight | meaning                                          |
@@ -912,6 +973,7 @@ assign that work to a person.
 | `uses-profile`   | 0.3    | this agent's default profile (the runtime+capability bundle it dispatches under); structural config binding, overridable per assignment/dispatch |
 | `routed-to`      | 0.3    | a question routed to this person for answering   |
 | `review-requested` | 0.3  | a review of this node is requested of this person (pending) — surfaces in their queue |
+| `focuses-on`     | 0.2    | this lens is parameterized on that node (see "Lenses"); a view watching a node says little about the node's own lineage |
 | `compiled-for`   | —      | briefing → its task/query (provenance only)      |
 | `shaped-by`      | —      | briefing → corrections applied (provenance only) |
 
@@ -946,6 +1008,15 @@ session-local guidance (issue-cc-digest-unscoped-cross-project-ranking). This
 is a single-org-graph relevance-topology fix — shared vocabulary ("auth",
 "deploy", "migration") otherwise dilutes the gate across teams. A project-blind
 compile (no `project`) ranks every node equally, exactly as before.
+
+A node whose `authored_via` is `capture`, `distill`, or `gardener` — written
+with no human review at write time — is labeled `machine·<via>` (e.g.
+`machine·capture`) in every compiled digest/briefing line, the same
+machine-vs-human taxonomy `spor changes` already surfaces
+(task-cc-digest-render-authorship-marker). Without it a Haiku-distilled
+capture rendered typographically identical to a human-reviewed decision in
+the ambient session-start context; `mcp`/`rest`/`dispatch` writes and nodes
+with no `authored_via` at all render exactly as before (unmarked).
 
 A seed (the compile root, or each query-mode content match) always contributes
 its **direct 1-hop lineage** to the structural arm, even when score-decay would
@@ -986,10 +1057,27 @@ Free-text guidance, injected verbatim into the compile for the target.
 how humans debug the context instead of the model: fix it once, it applies to
 every future compile.
 
+**Lifecycle** (`status`, 2026.07.15.1, issue-spor-corrections-no-applied-
+lifecycle): `active` (or no `status` at all) is the default and means the
+guidance is still standing — it keeps injecting at every in-scope compile.
+`applied` means a recompile already absorbed the correction's guidance into
+the target's briefing body, so it is retired and stops injecting — otherwise
+an absorbed correction is dead weight that keeps re-injecting into every
+future compile/serve of its target forever. Both the client compile
+(`correctionInScope`/`corrections` in `lib/kernel/graph.js`) and the server's
+serve-time gate (`correctionsForBriefing`/`applyBriefingCorrections`) filter
+out non-`active` corrections — keep the two in sync, held-guard-style. A
+node-targeted correction (`target: <node-id>`, not `global`/`project:<slug>`)
+is flipped to `applied` by the recompile flow that absorbs it (`/spor:brief`
+step 3); `global`/`project:<slug>` corrections are standing, broad-scope
+guidance and are not auto-retired by any single recompile.
+
 ## Briefing nodes
 
 Created by the distiller or `/spor:brief`. Carry `derived-from` edges to
-every source node and `shaped-by` edges to applied corrections, plus a
+every source node and `shaped-by` edges to the corrections that fired for this
+compile (not necessarily `status: applied` yet — a `global`/`project:<slug>`
+correction can `shaped-by` many briefings over its lifetime), plus a
 `version:` integer. On recompile the old version is archived to
 the graph home's `history/` and the version bumps. `brief-project` is the standing
 project briefing injected at session start.
