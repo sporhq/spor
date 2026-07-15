@@ -204,6 +204,73 @@ test("preTool: `sh -c \"cd <main> && git commit ...\"` and `eval \"...\"` wrappe
   fs.rmSync(base, { recursive: true, force: true });
 });
 
+test("preTool: `bash -lc \"...\"` (clustered short flags, -c not first) is denied; a harmless -lc inside the worktree passes", async () => {
+  const { base, main, wt } = scratchWorktree();
+  fs.writeFileSync(path.join(main, "lc1.txt"), "x");
+  const out = await pt.preTool({
+    cwd: wt,
+    tool_name: "Bash",
+    tool_input: { command: `bash -lc "cd ${main} && git add -A && git commit -m x"` },
+  });
+  assert.ok(out);
+  assert.equal(out.hookSpecificOutput.permissionDecision, "deny");
+
+  fs.writeFileSync(path.join(main, "lc2.txt"), "x");
+  const zshOut = await pt.preTool({
+    cwd: wt,
+    tool_name: "Bash",
+    tool_input: { command: `zsh -lc "cd ${main} && git commit -am x"` },
+  });
+  assert.ok(zshOut);
+  assert.equal(zshOut.hookSpecificOutput.permissionDecision, "deny");
+
+  fs.writeFileSync(path.join(wt, "lc3.txt"), "x");
+  const okOut = await pt.preTool({
+    cwd: wt,
+    tool_name: "Bash",
+    tool_input: { command: `bash -lc "git add -A && git commit -m x"` },
+  });
+  assert.equal(okOut, null);
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+test("preTool: `GIT_WORK_TREE=<main> GIT_DIR=<main>/.git git commit` (env-var prefix) is denied; the same prefix inside the worktree passes", async () => {
+  const { base, main, wt } = scratchWorktree();
+  fs.writeFileSync(path.join(main, "env1.txt"), "x");
+  const out = await pt.preTool({
+    cwd: wt,
+    tool_name: "Bash",
+    tool_input: {
+      command: `GIT_WORK_TREE=${main} GIT_DIR=${main}/.git git add -A && GIT_WORK_TREE=${main} GIT_DIR=${main}/.git git commit -m x`,
+    },
+  });
+  assert.ok(out);
+  assert.equal(out.hookSpecificOutput.permissionDecision, "deny");
+
+  fs.writeFileSync(path.join(wt, "env2.txt"), "x");
+  const okOut = await pt.preTool({
+    cwd: wt,
+    tool_name: "Bash",
+    tool_input: { command: `GIT_WORK_TREE=${wt} GIT_DIR=${wt}/.git git add -A && GIT_WORK_TREE=${wt} GIT_DIR=${wt}/.git git commit -m x` },
+  });
+  assert.equal(okOut, null);
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+test("preTool: a quoted commit message that merely looks like an env assignment (FOO=bar as the FIRST word) is not mis-parsed as a temp-env prefix", async () => {
+  const { base, wt } = scratchWorktree();
+  fs.writeFileSync(path.join(wt, "notenv.txt"), "x");
+  // FOO=bar here is a real (harmless) shell env assignment with no command
+  // after it in its own segment — must not throw or falsely deny.
+  const out = await pt.preTool({
+    cwd: wt,
+    tool_name: "Bash",
+    tool_input: { command: `FOO=bar && git add -A && git commit -m x` },
+  });
+  assert.equal(out, null);
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
 test("preTool: a single `&` background separator or `|` pipe still denies (not just `&&`/`||`)", async () => {
   const { base, main, wt } = scratchWorktree();
   fs.writeFileSync(path.join(main, "amp.txt"), "x");

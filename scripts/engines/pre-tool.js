@@ -186,6 +186,46 @@ const GIT_WRITE_SUBCOMMANDS = new Set(["commit", "add", "apply"]);
 // pair from the top-level segment scan entirely.
 const SHELL_DASH_C = new Set(["sh", "bash", "zsh", "dash", "ash"]);
 
+// Locate a `-c`/clustered-short-flag (`-lc`, `-xc`, ...) token in a
+// `bash|zsh|...` invocation's argument list, returning its index or -1.
+// `bash -lc "cmd"` (login shell + inline command) is a common, non-
+// adversarial idiom — a naive `tokens[1] === "-c"` check misses it because
+// the `-c` is clustered with other single-char flags. Per bash's own option
+// parsing, `c` must be the LAST character of a cluster to mean "take the
+// next argv element as the command string" (anything after `c` inside the
+// same token is itself consumed as the command, not a further flag), so the
+// scan stops at the first cluster ending in `c`; a plain positional argument
+// (not starting with `-`) before that means this isn't an inline `-c` call
+// at all, and the scan gives up rather than guessing.
+function findDashC(tokens) {
+  for (let i = 1; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === "--") break;
+    if (t === "-c" || /^-[A-Za-z]*c$/.test(t)) return i;
+    if (!t.startsWith("-")) break;
+  }
+  return -1;
+}
+
+// A leading run of `NAME=value` tokens in a segment is a POSIX temporary
+// environment assignment, scoped to the single command that follows (`FOO=1
+// BAR=2 cmd args`) — most relevantly `GIT_WORK_TREE=<dir> git commit ...`,
+// which relocates git's effective working tree exactly like `--work-tree`
+// but without a recognizable `git` flag to catch. Only LEADING tokens count
+// (an assignment-shaped token elsewhere, e.g. inside a quoted commit
+// message, is never touched — the scan stops at the first token that isn't
+// itself an assignment).
+const ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+function stripEnvAssignments(tokens) {
+  const env = {};
+  let i = 0;
+  for (; i < tokens.length && ENV_ASSIGN_RE.test(tokens[i]); i++) {
+    const eq = tokens[i].indexOf("=");
+    env[tokens[i].slice(0, eq)] = tokens[i].slice(eq + 1);
+  }
+  return { env, rest: tokens.slice(i) };
+}
+
 // Scan a Bash command for a `git commit`/`add`/`apply` whose EFFECTIVE
 // working tree resolves into the shared checkout — tracking `cd` across
 // `&&`/`;`/`||`/newline/grouping-separated segments (the actual bypass: `cd
@@ -214,17 +254,25 @@ function scanBashForViolation(command, cwd, session, depth = 0) {
     topCache.set(effectiveDir, top);
     return top;
   };
-  for (const tokens of segments) {
+  for (const rawTokens of segments) {
+    // Strip a leading `NAME=value` run first — it never changes which
+    // command this segment invokes, only (for `git`) where its effective
+    // work tree resolves; every branch below keys off the same `tokens`.
+    const { env: segEnv, rest: tokens } = stripEnvAssignments(rawTokens);
+    if (!tokens.length) continue; // a bare `FOO=bar` assignment: nothing to check
     if (tokens[0] === "cd") {
       let target = tokens[1];
       if (target === "--") target = tokens[2]; // `cd -- /path`: skip the end-of-options marker
       if (target) dir = path.isAbsolute(target) ? target : path.join(dir, target);
       continue;
     }
-    if (SHELL_DASH_C.has(tokens[0]) && tokens[1] === "-c" && tokens[2]) {
-      const nested = scanBashForViolation(tokens[2], dir, session, depth + 1);
-      if (nested) return nested;
-      continue;
+    if (SHELL_DASH_C.has(tokens[0])) {
+      const dashCIdx = findDashC(tokens);
+      if (dashCIdx !== -1 && tokens[dashCIdx + 1]) {
+        const nested = scanBashForViolation(tokens[dashCIdx + 1], dir, session, depth + 1);
+        if (nested) return nested;
+        continue;
+      }
     }
     if (tokens[0] === "eval" && tokens[1]) {
       const nested = scanBashForViolation(tokens.slice(1).join(" "), dir, session, depth + 1);
@@ -237,6 +285,8 @@ function scanBashForViolation(command, cwd, session, depth = 0) {
     let effectiveDir = dir;
     if (workTree) effectiveDir = path.isAbsolute(workTree) ? workTree : path.join(dir, workTree);
     else if (cDir) effectiveDir = path.isAbsolute(cDir) ? cDir : path.join(dir, cDir);
+    else if (segEnv.GIT_WORK_TREE)
+      effectiveDir = path.isAbsolute(segEnv.GIT_WORK_TREE) ? segEnv.GIT_WORK_TREE : path.join(dir, segEnv.GIT_WORK_TREE);
     const top = resolveTop(effectiveDir);
     if (top && violatesIsolation(top, session))
       return deny(
