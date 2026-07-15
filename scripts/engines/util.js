@@ -629,12 +629,48 @@ function gcJournal(graph, opts = {}) {
 // machine-local plumbing, so signing it buys nothing and only risks that failure.
 const NO_GPGSIGN = ["-c", "commit.gpgsign=false"];
 
+// Git takes its repository LOCATION from the environment before it ever
+// discovers one from the working directory, so an ambient GIT_DIR/GIT_WORK_TREE
+// (a git hook, `git rebase --exec`, a wrapper script that exported one) beats
+// both `-C <dir>` and cwd — the same precedence pre-tool.js already models for
+// the commands it inspects. Every git call in this codebase names its repo by
+// directory, so a leaked var silently retargets it at the ambient repo: `spor
+// dispatch --worktree` then attached the target repo's worktree to the
+// LAUNCHER's repo, checking out the launcher's code at the target's path
+// (issue-spor-dispatch-worktree-wrong-repo-location). Strip those vars from the
+// child env and let the directory be authoritative. Byte-identical when none
+// are set, which is the normal case.
+//
+// Only the three LOCATION vars — deliberately NOT GIT_INDEX_FILE (nor the
+// object-store vars), which don't name a repo. Git sets GIT_INDEX_FILE to a
+// temporary index when it runs the pre-commit hook of a PARTIAL commit (`git
+// commit -- <paths>`), and that index is precisely what's about to be
+// committed: `spor check --staged` runs there by design (see cmdCheck), so
+// stripping it would silently widen `git diff --cached` to the whole index and
+// have --strict fail a commit over a file the user isn't committing.
+const GIT_LOCATION_ENV = ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"];
+function gitEnv(env = process.env) {
+  const out = { ...env };
+  // Windows env names are case-insensitive and `{...process.env}` keeps whatever
+  // spelling the parent used, so `delete out.GIT_DIR` can miss a `git_dir` that
+  // git itself still honors — match case-insensitively there. On POSIX only the
+  // exact spelling is git's, and deleting a look-alike would gratuitously alter
+  // the child's env (the plugin runs natively on Windows, macOS and Linux).
+  const isLocationVar =
+    process.platform === "win32"
+      ? (k) => GIT_LOCATION_ENV.includes(k.toUpperCase())
+      : (k) => GIT_LOCATION_ENV.includes(k);
+  for (const k of Object.keys(out)) if (isLocationVar(k)) delete out[k];
+  return out;
+}
+
 function git(cwd, args, opts = {}) {
   try {
     return execFileSync("git", ["-C", cwd, ...args], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       ...opts,
+      env: gitEnv(opts.env),
     });
   } catch {
     return null;
@@ -1551,6 +1587,7 @@ module.exports = {
   matchBriefs,
   repoFingerprints,
   git,
+  gitEnv,
   NO_GPGSIGN,
   graphInsideCodeRepo,
   canonPath,

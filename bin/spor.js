@@ -5303,9 +5303,11 @@ function dispatchRoot() {
 
 // A git invocation inside a given working tree. Captures output so callers can
 // branch on status/stderr; never throws (a missing git binary surfaces as
-// r.error, handled by hasGit() before we get here).
+// r.error, handled by hasGit() before we get here). The env is scrubbed of the
+// git location vars so `cwd` — not an ambient GIT_DIR — names the repo
+// (u.gitEnv, issue-spor-dispatch-worktree-wrong-repo-location).
 function git(cwd, gitArgs, opts = {}) {
-  return spawnSync("git", gitArgs, { cwd, encoding: "utf8", ...opts });
+  return spawnSync("git", gitArgs, { cwd, encoding: "utf8", ...opts, env: u.gitEnv(opts.env) });
 }
 function hasGit() {
   return !spawnSync("git", ["--version"]).error;
@@ -6935,8 +6937,12 @@ function createDispatchWorktree(repoDir, name, { setup, slug, nodeId } = {}) {
       cwd: dir,
       stdio: "inherit",
       shell: true,
+      // Scrubbed of the git location vars (u.gitEnv): the hook stages the fresh
+      // worktree, so its git must follow cwd rather than an ambient GIT_DIR
+      // inherited from whatever launched dispatch
+      // (issue-spor-dispatch-worktree-wrong-repo-location).
       env: {
-        ...process.env,
+        ...u.gitEnv(),
         SPOR_WORKTREE: dir,
         SPOR_MAIN_CHECKOUT: repoDir,
         SPOR_DISPATCH_SLUG: slug || "",
@@ -7766,7 +7772,11 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   }
 
   claudeArgs.push(prompt);
-  const r = spawnPortableSync(claudeBin, claudeArgs, { cwd: launchDir, stdio: "inherit" });
+  // The agent's git must follow launchDir (its worktree, or the target checkout),
+  // so hand it an env scrubbed of the git location vars — an ambient GIT_DIR
+  // would otherwise point every commit it makes at the LAUNCHER's repo
+  // (issue-spor-dispatch-worktree-wrong-repo-location).
+  const r = spawnPortableSync(claudeBin, claudeArgs, { cwd: launchDir, stdio: "inherit", env: u.gitEnv() });
   if (r.error) {
     err(`could not launch ${claudeBin}: ${r.error.message}`);
     await releaseClaimOnAbort();

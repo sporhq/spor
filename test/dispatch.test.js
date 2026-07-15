@@ -705,9 +705,11 @@ test("dispatch spawns the claude binary with --bg in the target dir", () => {
 // The checkout dir is named `demo` so projectSlug() derives the same slug it gets
 // mapped under (the slug convention) — i.e. it passes the corrupt-mapping guard
 // (issue-spor-dispatch-repos-corruption-worktree-session-start).
-function gitTargetRepo() {
+// `name` names the checkout dir, hence the slug it derives; the GIT_DIR tests
+// pass a distinct one so a launcher repo can't be mistaken for the target.
+function gitTargetRepo(name = "demo") {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-wtrepo-"));
-  const repo = path.join(base, "demo");
+  const repo = path.join(base, name);
   fs.mkdirSync(repo);
   const g = (args) => {
     const r = spawnSync("git", ["-C", repo, ...args], {
@@ -860,6 +862,90 @@ test("dispatch worktree setup hook leaves uncommitted changes then fails: worktr
     40,
     "branch left in place too"
   );
+});
+
+// --- ambient git location env (issue-spor-dispatch-worktree-wrong-repo-location) --
+// Git resolves its repo from GIT_DIR/GIT_WORK_TREE BEFORE it discovers one from
+// the working directory, so a dispatch launched with those vars set — from a git
+// hook, `git rebase --exec`, a wrapper that exported one — used to run every git
+// call against the LAUNCHER's repo no matter which directory it named: the
+// worktree was cut from the launcher's HEAD and registered in the launcher's
+// repo (so the agent found the wrong codebase at the target's path), and the
+// corrupt-mapping guard misread the target's identity and refused a correct map.
+// Dispatch scrubs the location vars now (u.gitEnv), so the directory wins.
+
+test("dispatch --worktree under an ambient GIT_DIR: the worktree belongs to the TARGET repo, not the launcher's", () => {
+  const { home } = fixture();
+  const { repo, g } = gitTargetRepo();
+  const launcher = gitTargetRepo("launcher"); // an unrelated repo, as a git hook's GIT_DIR would name
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const outFile = path.join(home, "spawn.out");
+  const stub = pwdStub(home);
+  const r = run(["dispatch", "dec-x", "--no-brief", "--worktree"], {
+    SPOR_HOME: home,
+    SPOR_CLAUDE_CMD: stub,
+    OUTFILE: outFile,
+    GIT_DIR: path.join(launcher.repo, ".git"),
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const wtDir = path.join(repo, ".claude", "worktrees", "dec-x");
+  assert.ok(slashPath(g(["worktree", "list"])).includes("/.claude/worktrees/dec-x "), "target repo hosts the worktree");
+  assert.ok(
+    !slashPath(launcher.g(["worktree", "list"])).includes("/.claude/worktrees/dec-x "),
+    "launcher's repo hosts NO worktree"
+  );
+  assert.strictEqual(g(["rev-parse", "--verify", "--quiet", "refs/heads/dec-x"]).trim().length, 40, "branch cut in the target");
+  const cwd = fs.readFileSync(outFile, "utf8").split("\n")[0];
+  assert.strictEqual(cwd, fs.realpathSync(wtDir), "launched inside the target's worktree");
+});
+
+test("dispatch --print under an ambient GIT_DIR: reads the TARGET's identity, so the corrupt-map guard does not misfire", () => {
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  const launcher = gitTargetRepo("launcher");
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const r = run(["dispatch", "dec-x", "--no-brief", "--print"], {
+    SPOR_HOME: home,
+    GIT_DIR: path.join(launcher.repo, ".git"),
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stderr, /map is corrupt/, "a correct mapping is not refused");
+  assert.match(r.stdout, /slug: demo, via config/);
+});
+
+test("dispatch worktree setup hook under an ambient GIT_DIR: its git follows the worktree, not the launcher's repo", () => {
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  const launcher = gitTargetRepo("launcher");
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  // The hook records the REPO its own bare `git` call resolves to. It asks for
+  // the common git dir, not --show-toplevel: a bare GIT_DIR (no GIT_WORK_TREE)
+  // leaves git treating cwd as the work tree, so the toplevel looks right even
+  // while every object/ref it reads comes from the launcher's repo.
+  const hook = writeSpawnableNodeStub(
+    home,
+    "wt-gitdir",
+    `
+const { spawnSync } = require("node:child_process");
+const dir = spawnSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { encoding: "utf8" }).stdout || "";
+require("node:fs").writeFileSync(".wt-gitdir", dir.trim() + "\\n");
+`
+  );
+  setDispatch(home, { worktree: true, worktreeSetup: hook });
+  const r = run(["dispatch", "dec-x", "--no-brief"], {
+    SPOR_HOME: home,
+    SPOR_CLAUDE_CMD: noOpClaudeStub(home),
+    GIT_DIR: path.join(launcher.repo, ".git"),
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const wtDir = path.join(repo, ".claude", "worktrees", "dec-x");
+  const gitDir = fs.readFileSync(path.join(wtDir, ".wt-gitdir"), "utf8").trim();
+  assert.strictEqual(
+    slashPath(gitDir),
+    slashPath(path.join(fs.realpathSync(repo), ".git")),
+    "the hook's git reads the TARGET repo"
+  );
+  assert.ok(!slashPath(gitDir).includes("/launcher/"), "not the launcher's repo");
 });
 
 test("dispatch --backfill --print: worktree forced off even with dispatch.worktree=true", () => {
