@@ -1485,6 +1485,78 @@ test("loadGraph: briefing and correction nodes are non-traversable (excluded fro
   assert.ok(!g.docs.some((d) => d.id === "corr-global-1"));
 });
 
+// issue-cc-graph-supersededby-non-traversable: a briefing supersedes edge (both
+// ends non-traversable) must still populate graph.supersededBy, even though
+// neither end ever gets an adjacency entry.
+test("loadGraph: supersededBy indexes a supersedes edge between two non-traversable briefings", () => {
+  const fx = tmpGraph({
+    "brief-old.md": `---
+id: brief-old
+type: briefing
+project: my-project
+title: Old briefing
+summary: An earlier compiled briefing, later superseded.
+version: 1
+---
+Old briefing body.
+`,
+    "brief-new.md": `---
+id: brief-new
+type: briefing
+project: my-project
+title: New briefing
+summary: The current compiled briefing.
+version: 2
+edges:
+  - {type: supersedes, to: brief-old}
+---
+New briefing body.
+`,
+  });
+  const g = fx.load();
+  assert.equal(g.supersededBy["brief-old"], "brief-new");
+  // the walk itself stays untouched: neither briefing ever gets adjacency.
+  assert.equal(g.adj["brief-new"], undefined);
+  assert.equal(g.adj["brief-old"], undefined);
+});
+
+// Regression: widening supersededBy must not let compile()'s "graph fixup"
+// (which injects a superseder alongside an already-selected superseded node)
+// newly render a non-traversable node's OWN section/body into a briefing/
+// digest — the old fixup could never fire for a non-traversable superseder
+// (the old supersededBy gate required BOTH ends traversable), so a rendered
+// section (and its raw, unquoted body) for one must stay impossible. The
+// bare id may still appear in an already-selected node's "⚠ SUPERSEDED by
+// <id>" annotation — consistent with how resolutionWarn already names an
+// arbitrary (unfiltered) resolver id — since that names a fact about the
+// selected node, not a rendering of the superseder's own content.
+test("compile: a non-traversable superseder never gets its own rendered section via the graph-fixup, even though supersededBy now indexes it", () => {
+  const fx = pricingFixture();
+  fs.writeFileSync(path.join(fx.nodesDir, "brief-evil.md"), `---
+id: brief-evil
+type: briefing
+project: my-project
+title: Evil briefing
+summary: A non-traversable node the graph-fixup must never render.
+version: 1
+edges:
+  - {type: supersedes, to: spec-rc}
+---
+UNIQUEMARKERBODY must never leak into compiled output.
+`);
+  const g = fx.load();
+  // sanity: the wider index still records the supersession...
+  assert.equal(g.supersededBy["spec-rc"], "brief-evil");
+  // ...but the compiled neighborhood (spec-rc is a direct lineage neighbor of
+  // dec-new via constrained-by) never renders the non-traversable superseder
+  // as its own section, and its body never leaks.
+  const r = graph.compile(g, { rootId: "dec-new", digest: false });
+  assert.equal(r.relevant, true);
+  assert.match(r.text, /spec-rc/);
+  assert.ok(!r.text.includes("### brief-evil"), "graph-fixup must not render a section for a non-traversable superseder");
+  assert.ok(!r.text.includes("UNIQUEMARKERBODY"), "its body must never leak into the compiled output");
+});
+
 // ---------- attribution fields (API.md §1 / GRAPH.md) ----------
 
 test("validator accepts optional author / authored_via scalar fields", () => {
