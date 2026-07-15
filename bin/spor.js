@@ -5971,24 +5971,6 @@ const MCP_HOSTS = {
   },
 };
 
-// Write `content` to `file` via a tmp-file + rename so a mid-write failure
-// (disk full, permission denied) never leaves a half-written file behind.
-function writeFileAtomic(file, content) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = path.join(path.dirname(file), `.spor-mcp-tmp-${process.pid}-${path.basename(file)}`);
-  fs.writeFileSync(tmp, content);
-  try {
-    fs.renameSync(tmp, file);
-  } catch (e) {
-    try {
-      fs.rmSync(tmp, { force: true });
-    } catch {
-      /* best effort */
-    }
-    throw e;
-  }
-}
-
 // {} when the file is absent; throws a clear error when it exists but can't be
 // read or isn't valid JSON — the caller aborts rather than clobbering it.
 function readJsonStrict(file) {
@@ -6038,7 +6020,7 @@ function writeMcpJson(spec, scope, dryRun, url) {
     return 0;
   }
   try {
-    writeFileAtomic(target, rendered);
+    u.writeFileAtomic(target, rendered, { mkdir: true });
   } catch (e) {
     err(`spor install --mcp: could not write ${target}: ${e.message}`);
     return 1;
@@ -6090,7 +6072,7 @@ function writeMcpToml(spec, scope, dryRun, url) {
     return 0;
   }
   try {
-    writeFileAtomic(target, rendered);
+    u.writeFileAtomic(target, rendered, { mkdir: true });
   } catch (e) {
     err(`spor install --mcp: could not write ${target}: ${e.message}`);
     return 1;

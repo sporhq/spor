@@ -81,9 +81,7 @@ async function linkCommits(repo) {
   if (!failed) {
     // Atomic marker advance (write-then-rename, like marker.$$).
     try {
-      const tmp = `${marker}.${process.pid}`;
-      fs.writeFileSync(tmp, head);
-      fs.renameSync(tmp, marker);
+      u.writeFileAtomic(marker, head);
     } catch {}
   }
 }

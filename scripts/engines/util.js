@@ -14,6 +14,7 @@ const ROOT = path.resolve(__dirname, "..", "..");
 const CODEX_NUDGE_MODEL = "gpt-5.4-mini";
 
 const home = require(path.join(ROOT, "lib", "shell", "home.js"));
+const { writeFileAtomic } = require(path.join(ROOT, "lib", "shell", "atomic-write.js"));
 // The harness vocabulary the capability probe emits — owned by the pure matcher
 // so the probe, the matcher, and the future fleet scheduler agree on one set of
 // names (dec-spor-machine-profile-satisfiability). Never re-hardcode it here.
@@ -1495,14 +1496,10 @@ function runSpoolWorker(inFile, classify, buildOutput) {
   const out = buildOutput(job, result);
   if (out && job.hash) {
     const outFile = path.join(path.dirname(inFile), `${job.hash}.out.json`);
-    const tmp = `${outFile}.tmp`;
     try {
-      fs.writeFileSync(tmp, JSON.stringify(out));
-      fs.renameSync(tmp, outFile);
+      writeFileAtomic(outFile, JSON.stringify(out));
     } catch {
-      try {
-        fs.unlinkSync(tmp);
-      } catch {}
+      /* fail-open: a dropped result file just means no injection next prompt */
     }
   }
 
@@ -1593,4 +1590,5 @@ module.exports = {
   runSpoolWorker,
   spawnDetached,
   bashRandom,
+  writeFileAtomic,
 };
