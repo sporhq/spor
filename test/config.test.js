@@ -190,6 +190,75 @@ test('opt-in: enabled via the cascade (SPOR_ENABLED env, user config.json) activ
   assert.strictEqual(c0.enabled(), false);
 });
 
+// ---------- linked git worktrees (issue-spor-cli-status-worktree-enable-detection) ----------
+
+const { spawnSync } = require('node:child_process');
+
+function gitInit(dir) {
+  const g = (args, cwd = dir) => {
+    const r = spawnSync('git', ['-C', cwd, ...args], {
+      encoding: 'utf8',
+      env: {
+        ...process.env, GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@example.com',
+        GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@example.com',
+      },
+    });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout;
+  };
+  g(['init', '-q']);
+  return g;
+}
+
+test('opt-in: a linked worktree OUTSIDE the repo tree inherits the main checkout\'s enablement, even uncommitted', () => {
+  const root = tmp();
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(repo);
+  const g = gitInit(repo);
+  fs.writeFileSync(path.join(repo, 'f.txt'), 'x');
+  g(['add', 'f.txt']);
+  g(['commit', '-q', '-m', 'root']);
+
+  // A sibling worktree, not nested under `repo` — shares no directory ancestry
+  // with the main checkout at all.
+  const wt = path.join(root, 'sibling-worktree');
+  g(['worktree', 'add', '-q', wt, 'HEAD']);
+
+  // `spor enable` writes .spor.json in the main checkout; here it is left
+  // UNCOMMITTED, like a `spor enable` a user forgot to commit, or ran after the
+  // worktree already existed — the linked worktree's own checked-out tree never
+  // sees it. Before the fix this made the worktree read as disabled.
+  write(path.join(repo, '.spor.json'), { enabled: true });
+
+  const cWt = loadConfig({ cwd: wt, env: bareEnv({ SPOR_HOME: root }) });
+  assert.strictEqual(cWt.enabled(), true);
+  const cMain = loadConfig({ cwd: repo, env: bareEnv({ SPOR_HOME: root }) });
+  assert.strictEqual(cMain.enabled(), true);
+
+  g(['worktree', 'remove', '--force', wt]);
+});
+
+test('opt-in: a linked worktree NESTED under the repo (the spor dispatch / claude --worktree convention) inherits enablement too', () => {
+  const root = tmp();
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(repo);
+  const g = gitInit(repo);
+  fs.writeFileSync(path.join(repo, 'f.txt'), 'x');
+  g(['add', 'f.txt']);
+  g(['commit', '-q', '-m', 'root']);
+
+  const wt = path.join(repo, '.claude', 'worktrees', 'some-branch');
+  fs.mkdirSync(path.dirname(wt), { recursive: true });
+  g(['worktree', 'add', '-q', '-b', 'some-branch', wt, 'HEAD']);
+
+  write(path.join(repo, '.spor.json'), { enabled: true });
+
+  const cWt = loadConfig({ cwd: wt, env: bareEnv({ SPOR_HOME: root }) });
+  assert.strictEqual(cWt.enabled(), true);
+
+  g(['worktree', 'remove', '--force', wt]);
+});
+
 test('getBool honors the shell "0"/"false" convention', () => {
   const dir = tmp();
   const c0 = loadConfig({ cwd: dir, env: bareEnv({ SPOR_HOME: dir, SPOR_NUDGE: '0' }) });
