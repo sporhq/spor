@@ -4591,7 +4591,7 @@ async function resolveAgentIdFromLabel(cfg, label) {
       const g = graphLib.loadGraph(nodesDir);
       agents = Object.values(g.nodes || {}).filter((n) => n.type === "agent");
     }
-    const hits = agents.filter(isMatch);
+    const hits = agents.filter(isMatch).filter((a) => isAgentId(a.id));
     if (!hits.length) return null;
     if (hits.length > 1) return { ambiguous: [...new Set(hits.map((a) => a.id))] };
     return { id: hits[0].id };
