@@ -90,6 +90,10 @@ function runHook(snapDir, home, c) {
       resolve(digest);
     });
     child.on("error", () => resolve(null));
+    // A child that died before reading stdin makes this write EPIPE, and an
+    // unhandled stream 'error' is fatal — `child.on("error")` only covers spawn
+    // itself. A dead engine must score as "no digest", not take down the run.
+    child.stdin.on("error", () => resolve(null));
     child.stdin.write(JSON.stringify({ cwd: `/eval/${c.project_slug || "x"}`, prompt: c.prompt, session_id: c.case_id }));
     child.stdin.end();
   });
@@ -115,8 +119,10 @@ function scoreCase(c, order) {
     emitted: order.length,
     labeledEmitted: labeled.length,
     // Did the ranker reproduce the order it had at label time? Pure diagnostic:
-    // labels join by ID, so drift doesn't invalidate scoring, it just explains it.
-    reproducedBaseline: order.join(",") === c.baselineOrder.join(","),
+    // labels join by ID, so drift doesn't invalidate scoring, it just explains
+    // it. null when arm B has no order to compare against (excluded from the
+    // rate rather than counted as a miss).
+    reproducedBaseline: c.baselineOrder ? order.join(",") === c.baselineOrder.join(",") : null,
   };
 }
 
@@ -126,9 +132,14 @@ function report(results, stats, poolCases) {
   const precs = results.map((r) => r.precision).filter((x) => x != null);
   const emitted = fired.reduce((a, r) => a + r.emitted, 0);
   const labeledEmitted = fired.reduce((a, r) => a + r.labeledEmitted, 0);
-  const reproduced = fired.filter((r) => r.reproducedBaseline).length;
+  const comparable = fired.filter((r) => r.reproducedBaseline != null);
+  const reproduced = comparable.filter((r) => r.reproducedBaseline).length;
+  const overlap = stats.agree + stats.conflict;
 
-  const pct = (x) => (x == null ? "n/a" : (x * 100).toFixed(1) + "%");
+  // A rate with no denominator reads "n/a", never "NaN%" — an empty run (say
+  // --limit 1 onto a case that fires nothing) still prints a usable report.
+  const pct = (x) => (x == null || !Number.isFinite(x) ? "n/a" : (x * 100).toFixed(1) + "%");
+  const ratio = (num, den) => (den > 0 ? num / den : null);
   const n4 = (x) => (x == null ? "n/a" : x.toFixed(4));
 
   console.log(`\n=== rank-eval: ${LABEL} ===`);
@@ -136,16 +147,16 @@ function report(results, stats, poolCases) {
   console.log(`labeled set  : ${poolCases.length} cases (${stats.judged} judged; ` +
     `-${stats.noPrompt} prompt lost to re-extraction, -${stats.misaligned} label/line misaligned, ` +
     `-${stats.noLabels} no digest either arm, -${stats.noReplay} no replay)`);
-  console.log(`label join   : ${stats.agree}/${stats.agree + stats.conflict} arm-overlap agreement ` +
-    `(${pct(stats.agree / (stats.agree + stats.conflict))}) — judge consistency + join sanity check`);
+  console.log(`label join   : ${stats.agree}/${overlap} arm-overlap agreement ` +
+    `(${pct(ratio(stats.agree, overlap))}) — judge consistency + join sanity check`);
   console.log(`scored       : nDCG@${NDCG_K} over ${ndcgs.length} cases, P@${P_K} over ${precs.length} cases`);
   console.log(`--`);
   console.log(`nDCG@${NDCG_K}      : ${n4(mean(ndcgs))}`);
   console.log(`P@${P_K}         : ${n4(mean(precs))}`);
   console.log(`--`);
   console.log(`fired        : ${fired.length}/${results.length}`);
-  console.log(`label cover  : ${labeledEmitted}/${emitted} emitted nodes carry a label (${pct(labeledEmitted / emitted)})`);
-  console.log(`baseline repro: ${reproduced}/${fired.length} cases emit the label-time order (${pct(reproduced / fired.length)})`);
+  console.log(`label cover  : ${labeledEmitted}/${emitted} emitted nodes carry a label (${pct(ratio(labeledEmitted, emitted))})`);
+  console.log(`baseline repro: ${reproduced}/${comparable.length} cases emit the label-time order (${pct(ratio(reproduced, comparable.length))})`);
 
   const warranted = results.filter((r) => r.warranted);
   const wn = warranted.map((r) => r.ndcg).filter((x) => x != null);
@@ -160,7 +171,7 @@ async function main() {
   if (!fs.existsSync(path.join(ENGINE_ROOT, "bin", "spor-hook"))) die(`no hook binary under ${ENGINE_ROOT}`);
 
   const { cases, stats } = buildPool(LABELS_DIR);
-  let set = LIMIT ? cases.slice(0, LIMIT) : cases;
+  const set = LIMIT ? cases.slice(0, LIMIT) : cases;
 
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "rank-eval-home-"));
   const snapRoot = fs.mkdtempSync(path.join(os.tmpdir(), "rank-eval-snaps-"));
