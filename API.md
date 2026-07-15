@@ -318,7 +318,7 @@ The decision queue (QUEUE.md §4/§5) — the data answer to "show my queue" /
 "<person-id>|me", "limit"?: 20,
 "offset"?: 0 }` → `{ "items": [{id, title, type, status,
 priority, score, signals: {blocking, heat, staleness, age_days}, suggest:
-"do|close", why}], "count": N, "offset": 0, "returned_count": N,
+"do|dispatch|blocked|triage|close|approve", why}], "count": N, "offset": 0, "returned_count": N,
 "total_count": N, "truncated": false, "next_offset": null, "questions": []
 }` — queueable live nodes ranked by the default blend, each with a one-line
 *why*. Items already retired by a live inbound resolves/answers edge are
@@ -639,11 +639,15 @@ anything with a token.
   `spor agent use <agent-id>`, or `SPOR_DISPATCH_AGENT`), which `spor dispatch
   --as <agent-id>` overrides for a single run. The `<agent-id>` is the agent's
   `agent-`-prefixed NODE id (what `spor agent list` prints), **not** its bare
-  label — the token endpoint requires the prefix, so the client setters
-  (`spor agent use`, `--as`) reject a prefix-less id with a `did you mean
-  agent-…?` hint rather than persist one every dispatch would 422 on. (Not to be
-  confused with `spor dispatch --agent`, the unrelated `claude --agent` harness
-  passthrough.) The
+  label — the token endpoint requires the prefix, so `dispatch --as` rejects a
+  prefix-less id with a `did you mean agent-…?` hint rather than persist one
+  every dispatch would 422 on. `spor agent use` goes one step further: a
+  prefix-less argument is first resolved against the caller's own agents (their
+  label or a plain `agent-<label>` guess) and normalized to the canonical id
+  before it's written — a re-typed label just works, and only an id that
+  matches none of the caller's agents falls back to the same prefix-hint error.
+  (Not to be confused with `spor dispatch --agent`, the unrelated `claude
+  --agent` harness passthrough.) The
   token is minted **session-deferred** and bound to the real run session AFTER
   launch (dec-spor-dispatch-bg-session-late-bind): `claude --bg` ignores
   `--session-id` and self-allocates its session, so dispatch reads the real one

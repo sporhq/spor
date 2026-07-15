@@ -58,3 +58,15 @@ Recompile the target and confirm the pinned/excluded nodes and guidance show up:
 `spor compile --root <target>` (or `spor brief <target>` for a node id, or
 `spor compile --query "<text>"` for a query-scoped correction). The guidance
 appears under a `## CORRECTIONS` heading in the compiled neighborhood.
+
+## 4. Lifecycle — corrections retire once absorbed
+
+A correction is `status: active` by default and keeps firing at every
+in-scope compile. Once `/spor:brief` persists a new briefing version that has
+absorbed a **node-targeted** correction's guidance into the briefing body
+(`target: <node-id>`, not `global`/`project:<slug>`), that step flips it to
+`status: applied` and it stops injecting — an absorbed correction that kept
+firing forever was exactly the dead weight issue-spor-corrections-no-applied-
+lifecycle fixed. `global`/`project:<slug>` corrections are standing, broad-
+scope guidance and are never auto-retired; if one becomes stale, `spor
+set-status <corr-id> applied` retires it by hand.

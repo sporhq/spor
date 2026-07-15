@@ -49,6 +49,33 @@ test("runCheck: no trigger hit -> nothing; foreign-scoped norm -> nothing", () =
   );
 });
 
+test("runCheck: declared coupling.aliases recover the reverse symlink-alias gap for BOTH triggers and targets (issue-spor-coupling-matcher-reverse-symlink-gap)", () => {
+  const aliases = { frontend: "packages/web" };
+  // trigger side: the norm's glob is authored against the alias, but the
+  // change set (as `git diff --name-only` always reports it) only ever
+  // carries the canonical, git-tracked spelling.
+  const triggerNorm = NORM({ couples_when: ["frontend/**"], couples_also: ["API.md"] });
+  const noAlias = runCheck({ slug: "projx", changed: ["packages/web/app.js"], norms: [triggerNorm] });
+  assert.deepEqual(noAlias.findings, [], "undeclared alias: the documented limitation stands, no trigger hit");
+  const withAlias = runCheck({
+    slug: "projx", changed: ["packages/web/app.js"], norms: [triggerNorm], aliases,
+  });
+  assert.equal(withAlias.findings.length, 1);
+  assert.equal(withAlias.findings[0].kind, "untouched");
+  assert.deepEqual(withAlias.findings[0].triggered, ["packages/web/app.js"]);
+
+  // target side: the trigger fires on the canonical spelling, and the target
+  // was actually touched too but only under its ALIAS spelling — recognized
+  // as satisfied only once the alias is declared.
+  const targetNorm = NORM({ couples_when: ["src/**"], couples_also: ["frontend/**"] });
+  const changed = ["src/a.js", "packages/web/app.js"];
+  const targetUndeclared = runCheck({ slug: "projx", changed, norms: [targetNorm] });
+  assert.equal(targetUndeclared.findings.length, 1, "undeclared alias: target looks untouched");
+  assert.equal(targetUndeclared.findings[0].kind, "untouched");
+  const targetDeclared = runCheck({ slug: "projx", changed, norms: [targetNorm], aliases });
+  assert.deepEqual(targetDeclared.findings, [], "declared alias: the target IS recognized as touched");
+});
+
 test("runCheck: cross-repo targets are reminders, never findings", () => {
   const norms = [NORM({ couples_also: ["other:docs/engines.md"] })];
   const r = runCheck({ slug: "projx", changed: ["src/a.js"], norms });
@@ -259,6 +286,30 @@ test("CLI local: --files through a tracked in-repo symlinked subtree matches a t
   const r = await runCli(["check", "--files", "frontend/app.js", "--json"], cwd, env);
   const j = JSON.parse(r.stdout);
   assert.deepEqual(j.changed.sort(), ["frontend/app.js", "packages/web/app.js"]);
+  assert.equal(j.findings.length, 1);
+  assert.equal(j.findings[0].norm, "norm-web");
+  assert.deepEqual(j.findings[0].triggered, ["packages/web/app.js"]);
+});
+
+test("CLI local: default (git diff) change set reports ONLY the canonical spelling — a declared coupling.aliases map in .spor.json recovers a trigger authored against the alias (issue-spor-coupling-matcher-reverse-symlink-gap)", async () => {
+  // Unlike --files (which re-derives candidate spellings from the literal fs
+  // path), the default/--staged/--range change sets come straight from `git
+  // diff --name-only`, which never reports an alias spelling — no symlink
+  // needs to exist on disk at all to reproduce this gap. Without a declared
+  // alias the norm's alias-authored glob can never match; declaring
+  // `coupling.aliases` in .spor.json recovers it, with no runtime scanning.
+  const { home, cwd, g } = scratch();
+  fs.mkdirSync(path.join(cwd, "packages", "web"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "packages", "web", "app.js"), "1\n");
+  g("add", "-A"); g("commit", "-q", "-m", "add web");
+  writeNorm(home, "norm-web", "couples_when: [frontend/**]\ncouples_also: [API.md]\n");
+  const env = baseEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_ENABLED: "1" });
+  fs.writeFileSync(path.join(cwd, "packages", "web", "app.js"), "2\n");
+  const undeclared = await runCli(["check", "--json"], cwd, env);
+  assert.deepEqual(JSON.parse(undeclared.stdout).findings, [], "no alias declared -> documented limitation");
+  fs.writeFileSync(path.join(cwd, ".spor.json"), JSON.stringify({ coupling: { aliases: { frontend: "packages/web" } } }));
+  const declared = await runCli(["check", "--json"], cwd, env);
+  const j = JSON.parse(declared.stdout);
   assert.equal(j.findings.length, 1);
   assert.equal(j.findings[0].norm, "norm-web");
   assert.deepEqual(j.findings[0].triggered, ["packages/web/app.js"]);

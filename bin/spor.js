@@ -905,6 +905,10 @@ async function cmdPutNode(cfg, { values, positionals }) {
   }
   const file = path.join(nodesDir, `${id}.md`);
   const exists = fs.existsSync(file);
+  if (!exists && id.length > MAX_ID_LENGTH) {
+    err(`bad node id '${id}': ${id.length} chars exceeds ${MAX_ID_LENGTH} (new node ids must be at most ${MAX_ID_LENGTH} chars)`);
+    return 1;
+  }
   if (policy === "error" && exists) {
     err(`node already exists: ${id} (use --if-exists update with --revision, or --if-exists skip)`);
     return 1;
@@ -1515,11 +1519,11 @@ async function cmdCompile(cfg, verb, args) {
 }
 
 // Compile a node's remote briefing the way the /spor:brief skill does: the raw
-// node (GET /v1/nodes/<id>) plus a title/summary-seeded /v1/digest for its
-// neighborhood, concatenated. Shared by compileRemote (brief / compile --root)
-// and compileBriefing (dispatch) so the two can't drift — dispatch used to
-// embed only the bare node, a thinner standing context than an interactive
-// brief (issue-spor-dispatch-briefing-omits-neighborhood). Returns
+// node (GET /v1/nodes/<id>) plus a root-walk /v1/digest for its neighborhood,
+// concatenated. Shared by compileRemote (brief / compile --root) and
+// compileBriefing (dispatch) so the two can't drift — dispatch used to embed
+// only the bare node, a thinner standing context than an interactive brief
+// (issue-spor-dispatch-briefing-omits-neighborhood). Returns
 // {transport,error} | {ok:false,status} | {ok:true,status,text}; the
 // neighborhood is fail-soft (a failed/empty digest just yields the raw node).
 async function remoteNodeBriefing(cfg, { root, project }) {
@@ -1527,17 +1531,18 @@ async function remoteNodeBriefing(cfg, { root, project }) {
   if (r.transport) return { transport: true, error: r.error, text: "" };
   if (!r.ok) return { ok: false, status: r.status, text: "" };
   const raw = (r.json && r.json.raw) || r.text || "";
-  // Seed the neighborhood digest from the node's own title/summary (the REST
-  // /v1/digest is query-mode only — root compile is not exposed over REST).
-  const seed = (r.json && (r.json.title || r.json.summary)) || fmField(raw, "title") || fmField(raw, "summary") || root;
-  const d = await remote.post(cfg, "/v1/digest", project ? { query: seed, project } : { query: seed }, { timeoutMs: 8000 });
+  // /v1/digest {root} runs the server-side structural root-walk (the same path
+  // query_graph(root_id=…) and `compile --root` take), so the neighborhood is
+  // the node's actual lineage instead of a title/summary-seeded free-text
+  // approximation (issue-cc-node-id-briefing-digest-approximation).
+  const d = await remote.post(cfg, "/v1/digest", project ? { root, project } : { root }, { timeoutMs: 8000 });
   const neighborhood = d.ok && d.json && d.json.found !== false ? d.json.text || "" : "";
   return { ok: true, status: r.status, text: neighborhood ? `${raw}\n\n${neighborhood}` : raw };
 }
 
 // The remote arm of compile/brief. Mirrors the /spor:brief skill's remote
-// resolution: a node id -> the raw node plus a title/summary-seeded /v1/digest
-// for its neighborhood; free text -> POST /v1/digest. --skeleton has no server
+// resolution: a node id -> the raw node plus a root-walk /v1/digest for its
+// neighborhood; free text -> POST /v1/digest. --skeleton has no server
 // equivalent (it writes a local briefing-node file), so it fails fast. Output
 // matches the local "nothing relevant" contract: exit 0 with empty stdout.
 async function compileRemote(cfg, args) {
@@ -1840,6 +1845,12 @@ async function cmdCheck(cfg, args) {
       norms: scan.norms,
       repoTags: scan.repo_tags[slug] ?? [],
       readFile,
+      // Declared alias map (issue-spor-coupling-matcher-reverse-symlink-gap):
+      // expands a changed path already reported in its git-resolved form to
+      // any config-declared alias spelling too, so a norm authored against
+      // the alias still triggers/targets — not just the `--files` path,
+      // whose repoRelativeCandidates only recovers a LEXICALLY-present alias.
+      aliases: cfg.getObj("coupling.aliases", {}),
     });
     if (json) out(JSON.stringify({ project: slug, changed, checked, findings, reminders, strict }, null, 2));
     else out(checkLib.renderReport({ slug, changed, checked, findings, reminders }, { strict }));
@@ -2064,6 +2075,114 @@ function changesLocal(cfg, args) {
     return 0;
   }
   out(changesLib.renderReport(report));
+  return 0;
+}
+
+// program — the birds-eye program/progress view over `blocks` topology
+// (task-spor-cli-program-verb): given a root node other work `blocks` (an
+// umbrella task, a milestone), show the gating tree of everything that blocks
+// it with resolution-derived progress. Dual-mode, but NOT byte-shared like
+// changes/analytics: remote mode dispatches to GET /v1/program/{id} and prints
+// the SERVER's own rendering straight through (like `spor lens`), since
+// render_program's view-tree shape is a separate, private server-side kernel;
+// local mode walks the local graph's inbound `blocks` edges itself
+// (lib/program.js) and renders through its own text renderer. An explicit
+// --nodes names a local checkout, so it always takes the local path even under
+// a server.
+// The naive `args.find((a) => !a.startsWith("--"))` (cmdLens's convention) picks
+// up a PRECEDING flag's bare value as the id whenever that flag takes one — and
+// unlike lens's --format (an enum keyword), this verb's --max-depth/--max-nodes/
+// --nodes all take arbitrary values, so `spor program --nodes <dir> <id>` would
+// silently grab <dir> as the id. Skip each value-taking flag's own value instead.
+const PROGRAM_VALUE_FLAGS = new Set(["max-depth", "max-nodes", "nodes"]);
+function programId(args) {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith("--")) {
+      if (PROGRAM_VALUE_FLAGS.has(a.slice(2))) i++; // skip its value, not just the flag
+      continue;
+    }
+    return a;
+  }
+  return null;
+}
+
+async function cmdProgram(cfg, args) {
+  const id = programId(args);
+  if (!id) {
+    err("usage: spor program <id> [--max-depth <n>] [--max-nodes <n>] [--json]");
+    return 1;
+  }
+  if (cfg.mode() === "remote" && !namesLocalGraph(args)) {
+    return await programRemote(cfg, id, args);
+  }
+  return programLocal(cfg, id, args);
+}
+
+// The remote arm: GET /v1/program/{id}, format=json for --json else format=text,
+// and print the server's own body verbatim — no local re-rendering, since the
+// server's view-tree shape belongs to its own (separate) kernel.
+async function programRemote(cfg, id, args) {
+  const wantJson = args.includes("--json");
+  const depth = optVal(args, "max-depth");
+  const maxNodes = optVal(args, "max-nodes");
+  const qs = new URLSearchParams();
+  qs.set("format", wantJson ? "json" : "text");
+  if (depth != null) qs.set("depth", depth);
+  if (maxNodes != null) qs.set("max_nodes", maxNodes);
+  const r = await remote.get(cfg, `/v1/program/${encodeURIComponent(id)}?${qs.toString()}`, { timeoutMs: 10000 });
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (r.status === 404) {
+    err(`program: unknown root '${id}'`);
+    return 1;
+  }
+  if (!r.ok) {
+    const msg = r.json && r.json.error && r.json.error.message;
+    err(`program error ${r.status}${msg ? `: ${msg}` : ""}`);
+    return 1;
+  }
+  out(wantJson ? (r.json != null ? JSON.stringify(r.json) : r.text || "") : r.text != null ? r.text : "");
+  return 0;
+}
+
+// The local arm: the `blocks`-edge gating-tree walk over the local nodes dir
+// (lib/program.js). --nodes overrides the resolved home; --json stamps
+// generated_at (the kernel stays time-free for deterministic tests). An
+// unknown root exits 1 with the same message the remote 404 arm uses.
+// A non-numeric --max-depth/--max-nodes value must fall back to the kernel's
+// own default, not flow through as NaN — `depth >= NaN` is always false, which
+// would silently DISABLE the cap instead of erroring or defaulting.
+function numOpt(args, name) {
+  const v = optVal(args, name);
+  if (v == null || v.trim() === "") return undefined; // Number("") is 0, not NaN — guard it explicitly
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? n : undefined; // negative bounds are nonsensical here too
+}
+
+function programLocal(cfg, id, args) {
+  const programLib = require(path.join(ROOT, "lib", "program.js"));
+  const nodesDir = optVal(args, "nodes") || cfg.nodesDir();
+  const envelope = programLib.collect({
+    nodesDir,
+    rootId: id,
+    maxDepth: numOpt(args, "max-depth"),
+    maxNodes: numOpt(args, "max-nodes"),
+  });
+  if (envelope.found === false) {
+    // Errors stay plain text regardless of --json, matching every other verb's
+    // error path (changes/analytics/lens) and the remote arm's own 404 branch —
+    // --json only shapes the SUCCESS envelope.
+    err(`program: unknown root '${id}'`);
+    return 1;
+  }
+  if (args.includes("--json")) {
+    out(JSON.stringify({ ...envelope, generated_at: new Date().toISOString() }, null, 2));
+    return 0;
+  }
+  out(programLib.renderReport(envelope));
   return 0;
 }
 
@@ -2907,48 +3026,46 @@ function gitIdentity(repoDir) {
   return { name: read("user.name"), email: read("user.email") };
 }
 
-// Rewrite a node's raw markdown to carry `value` (or clear it when value is ""),
-// stamping priority_by/_at/_via. Byte-mirrors the server's rewritePriority so a
-// local node and a remote one read the same after the mutation; returns the new
-// raw, or null when the frontmatter can't be located.
-function rewritePriority(raw, value, identity, via) {
+// Rewrite a node's raw markdown to carry `value` for `field` (or clear it
+// when value is ""), stamping `<field>_by/_at/_via`. Byte-mirrors the
+// server's rewrite<Field> so a local node and a remote one read the same
+// after the mutation; returns the new raw, or null when the frontmatter
+// can't be located. Shared by `spor priority` and `spor ready`
+// (task-spor-priority-readiness-stamp-helper-dedup) — the only per-field
+// pieces are the field name itself, the allowed-value vocabulary (each
+// verb's own normalize*), and the provenance key prefix this derives from it.
+function rewriteStamp(field, raw, value, identity, via) {
   const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(raw);
   if (!m) return null;
   let fm = m[1];
   const body = m[2];
   const stripFmLine = (s, key) => s.replace(new RegExp(`(^|\\n)${key}:[^\\n]*`, "g"), "");
-  for (const k of ["priority", "priority_by", "priority_at", "priority_via"]) fm = stripFmLine(fm, k);
+  for (const k of [field, `${field}_by`, `${field}_at`, `${field}_via`]) fm = stripFmLine(fm, k);
   fm = fm.replace(/\n+$/, "").replace(/^\n+/, "");
   const stamps = [];
   if (value) {
-    stamps.push(`priority: ${value}`);
-    if (identity && identity.name && identity.email) stamps.push(`priority_by: ${identity.name} <${identity.email}>`);
-    stamps.push(`priority_at: ${u.isoMs()}`);
-    stamps.push(`priority_via: ${via}`);
+    stamps.push(`${field}: ${value}`);
+    if (identity && identity.name && identity.email) stamps.push(`${field}_by: ${identity.name} <${identity.email}>`);
+    stamps.push(`${field}_at: ${u.isoMs()}`);
+    stamps.push(`${field}_via: ${via}`);
   }
   const fmOut = stamps.length ? `${fm}\n${stamps.join("\n")}` : fm;
   return `---\n${fmOut}\n---\n${body}`;
 }
 
-async function cmdPriority(cfg, { positionals }) {
-  const id = positionals[0];
-  const rawPriority = positionals[1];
-  if (!id || rawPriority == null) {
-    err("usage: spor priority <id> <p1|p2|p3|clear>");
-    err("  set the human-triage priority of a queue item, or clear it (none/clear)");
-    return 1;
-  }
-  const norm = normalizePriority(rawPriority);
-  if (!norm.ok) {
-    err(`priority '${rawPriority}' not allowed — use p1, p2, p3, or none/clear to remove it`);
-    return 1;
-  }
-  const value = norm.value;
-
+// The set-a-stamp-field verb core: validate/normalize is caller-specific
+// (each verb has its own allowed-value vocabulary and argument shape), but
+// once a canonical `value` is in hand, `priority` and `ready` share the
+// identical scaffolding this factors out — remote POSTs the micro-mutation
+// route ({[field]: value} to /v1/nodes/{id}/{field}); local mode does
+// get -> rewrite frontmatter -> validate -> write, mirroring the server's
+// read-modify-write (no server to POST to). Identity is the git user the way
+// local $viewer is derived (lib/queue.js viewerFor), the door is `cli`.
+async function stampField(cfg, { id, field, value }) {
   if (cfg.mode() === "remote") {
     // Send the canonical value the server validates again; it stamps
-    // priority_by/_at/_via (via: rest) from the token, so the body is {priority}.
-    const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/priority`, { priority: value }, { timeoutMs: 8000 });
+    // <field>_by/_at/_via (via: rest) from the token.
+    const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/${field}`, { [field]: value }, { timeoutMs: 8000 });
     if (r.transport) {
       err(`offline — could not reach server (${r.error})`);
       return 1;
@@ -2959,16 +3076,13 @@ async function cmdPriority(cfg, { positionals }) {
     }
     if (!r.ok) {
       const msg = r.json && r.json.error && r.json.error.message;
-      err(`priority error ${r.status}${msg ? `: ${msg}` : ""}`);
+      err(`${field} error ${r.status}${msg ? `: ${msg}` : ""}`);
       return 1;
     }
-    out(value ? `priority set: ${id} -> ${value}` : `priority cleared: ${id}`);
+    out(value ? `${field} set: ${id} -> ${value}` : `${field} cleared: ${id}`);
     return 0;
   }
 
-  // local: rewrite the node file's frontmatter in place, mirroring the server's
-  // read-modify-write (no server to POST to). Identity is the git user the way
-  // local $viewer is derived (lib/queue.js viewerFor), the door is `cli`.
   const nodesDir = cfg.nodesDir();
   const file = path.join(nodesDir, `${id}.md`);
   let raw;
@@ -2979,7 +3093,7 @@ async function cmdPriority(cfg, { positionals }) {
     return 1;
   }
   const identity = gitIdentity(path.dirname(nodesDir));
-  const newRaw = rewritePriority(raw, value, identity, "cli");
+  const newRaw = rewriteStamp(field, raw, value, identity, "cli");
   if (newRaw == null) {
     err(`could not locate frontmatter in ${id}`);
     return 1;
@@ -2998,17 +3112,33 @@ async function cmdPriority(cfg, { positionals }) {
   try {
     node = graphLib.parseFrontmatter(newRaw, `${id}.md`);
   } catch (e) {
-    err(`invalid node after priority rewrite: ${e.message}`);
+    err(`invalid node after ${field} rewrite: ${e.message}`);
     return 1;
   }
   const v = graphLib.validateNode(g, node);
   if (!v.ok) {
-    err(`invalid node after priority rewrite:\n  ${v.errors.join("\n  ")}`);
+    err(`invalid node after ${field} rewrite:\n  ${v.errors.join("\n  ")}`);
     return 1;
   }
   fs.writeFileSync(file, newRaw);
-  out(value ? `priority set: ${id} -> ${value}` : `priority cleared: ${id}`);
+  out(value ? `${field} set: ${id} -> ${value}` : `${field} cleared: ${id}`);
   return 0;
+}
+
+async function cmdPriority(cfg, { positionals }) {
+  const id = positionals[0];
+  const rawPriority = positionals[1];
+  if (!id || rawPriority == null) {
+    err("usage: spor priority <id> <p1|p2|p3|clear>");
+    err("  set the human-triage priority of a queue item, or clear it (none/clear)");
+    return 1;
+  }
+  const norm = normalizePriority(rawPriority);
+  if (!norm.ok) {
+    err(`priority '${rawPriority}' not allowed — use p1, p2, p3, or none/clear to remove it`);
+    return 1;
+  }
+  return stampField(cfg, { id, field: "priority", value: norm.value });
 }
 
 // --- spor ready ----------------------------------------------------------
@@ -3029,29 +3159,6 @@ async function cmdPriority(cfg, { positionals }) {
 // the readiness:agent stamp, so a later open question or requires:human edit
 // still wins and flips a stamped item back to human.
 
-// Rewrite a node's raw markdown to carry `value` (or clear it when value is
-// ""), stamping readiness_by/_at/_via. Byte-mirrors rewritePriority above so a
-// local node and a remote one read the same after the mutation; returns the
-// new raw, or null when the frontmatter can't be located.
-function rewriteReadiness(raw, value, identity, via) {
-  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(raw);
-  if (!m) return null;
-  let fm = m[1];
-  const body = m[2];
-  const stripFmLine = (s, key) => s.replace(new RegExp(`(^|\\n)${key}:[^\\n]*`, "g"), "");
-  for (const k of ["readiness", "readiness_by", "readiness_at", "readiness_via"]) fm = stripFmLine(fm, k);
-  fm = fm.replace(/\n+$/, "").replace(/^\n+/, "");
-  const stamps = [];
-  if (value) {
-    stamps.push(`readiness: ${value}`);
-    if (identity && identity.name && identity.email) stamps.push(`readiness_by: ${identity.name} <${identity.email}>`);
-    stamps.push(`readiness_at: ${u.isoMs()}`);
-    stamps.push(`readiness_via: ${via}`);
-  }
-  const fmOut = stamps.length ? `${fm}\n${stamps.join("\n")}` : fm;
-  return `---\n${fmOut}\n---\n${body}`;
-}
-
 async function cmdReady(cfg, { values, positionals }) {
   const id = positionals[0];
   if (!id) {
@@ -3060,71 +3167,7 @@ async function cmdReady(cfg, { values, positionals }) {
     return 1;
   }
   const value = values["needs-input"] ? "" : "agent";
-
-  if (cfg.mode() === "remote") {
-    // Send the canonical value the server validates again; it stamps
-    // readiness_by/_at/_via (via: rest) from the token, so the body is {readiness}.
-    const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/readiness`, { readiness: value }, { timeoutMs: 8000 });
-    if (r.transport) {
-      err(`offline — could not reach server (${r.error})`);
-      return 1;
-    }
-    if (r.status === 404) {
-      err(`no such node: ${id}`);
-      return 1;
-    }
-    if (!r.ok) {
-      const msg = r.json && r.json.error && r.json.error.message;
-      err(`readiness error ${r.status}${msg ? `: ${msg}` : ""}`);
-      return 1;
-    }
-    out(value ? `readiness set: ${id} -> agent` : `readiness cleared: ${id}`);
-    return 0;
-  }
-
-  // local: rewrite the node file's frontmatter in place, mirroring the server's
-  // read-modify-write (no server to POST to). Identity is the git user the way
-  // local $viewer is derived (lib/queue.js viewerFor), the door is `cli`.
-  const nodesDir = cfg.nodesDir();
-  const file = path.join(nodesDir, `${id}.md`);
-  let raw;
-  try {
-    raw = fs.readFileSync(file, "utf8");
-  } catch {
-    err(`no such node: ${id}`);
-    return 1;
-  }
-  const identity = gitIdentity(path.dirname(nodesDir));
-  const newRaw = rewriteReadiness(raw, value, identity, "cli");
-  if (newRaw == null) {
-    err(`could not locate frontmatter in ${id}`);
-    return 1;
-  }
-  // validate before writing (same bar as add/correct/priority), so a malformed
-  // result never lands on disk.
-  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
-  let g;
-  try {
-    g = graphLib.loadGraph(nodesDir);
-  } catch (e) {
-    err(`could not load graph: ${e.message}`);
-    return 1;
-  }
-  let node;
-  try {
-    node = graphLib.parseFrontmatter(newRaw, `${id}.md`);
-  } catch (e) {
-    err(`invalid node after readiness rewrite: ${e.message}`);
-    return 1;
-  }
-  const v = graphLib.validateNode(g, node);
-  if (!v.ok) {
-    err(`invalid node after readiness rewrite:\n  ${v.errors.join("\n  ")}`);
-    return 1;
-  }
-  fs.writeFileSync(file, newRaw);
-  out(value ? `readiness set: ${id} -> agent` : `readiness cleared: ${id}`);
-  return 0;
+  return stampField(cfg, { id, field: "readiness", value });
 }
 
 // --- spor set-status / spor edge ----------------------------------------
@@ -3143,6 +3186,16 @@ async function cmdReady(cfg, { values, positionals }) {
 // "Local mode": no pool or contention), so an active status sets the field
 // without a claim — symmetric with local dispatch skipping the claim.
 const NODE_ID_RE = /^[a-z0-9][a-z0-9-]*$/; // mirrors the server's ID_RE/SLUG_RE
+
+// The one id-length invariant (issue-spor-server-node-id-length-unbounded):
+// NODE_ID_RE is shape-only and imposes no cap, mirroring the server's
+// unbounded ID_RE/SLUG_RE. The server enforces MAX_ID_LENGTH (200,
+// server/store-validate.ts) at CREATE for every remote write; local mode
+// writes node files directly, bypassing the server entirely, so it needs
+// the same cap on its own CREATE path (cmdPutNode) to keep a personal graph
+// under the invariant remote graphs already hold. Enforced create-only — a
+// node written before this cap existed must keep reading/routing past it.
+const MAX_ID_LENGTH = 200;
 
 // Rewrite a node's raw markdown to carry `value` as its status, mirroring the
 // server's forceStatus (store.js): strip any existing status line, then append
@@ -4511,6 +4564,63 @@ function agentIdGuess(id) {
     : null;
 }
 
+// Resolve a bare agent LABEL (what `spor agent create`/`spor agent list` print
+// alongside the id) against the caller's own agents, so `spor agent use <label>`
+// is a convenience instead of the prefix-hint error
+// (task-spor-agent-use-label-resolution — the deferred follow-up to
+// isAgentId()/agentIdGuess() above). Remote: GET /v1/agents (already scoped to
+// agents the caller owns; `label` per API.md's documented shape), falling back
+// to the /v1/changes audit projection on a 404 (an old server without the
+// dedicated route) exactly like cmdAgentListRemote does — so `use` never
+// rejects a label `list` can still show. Local: scan the graph's `type: agent`
+// nodes (their frontmatter carries the label as `title`). Matches on whichever
+// of `label`/`title` the source carries, OR the plain `agent-<label>`
+// prefixing, so both a re-typed label and a copy-pasted un-prefixed id
+// resolve. Returns {id} on a unique match, {ambiguous:[...ids]} on more than
+// one, or null on no match — including any lookup failure, since this stays a
+// convenience layered on top of the existing hint, never a hard dependency
+// (the deferral's stated reason for not doing this eagerly: a networked lookup
+// needs offline fail-soft, so any failure here just falls through to the
+// pre-existing invalid-id error).
+async function resolveAgentIdFromLabel(cfg, label) {
+  const guessedId = `agent-${kebab(label)}`;
+  const isMatch = (a) => a && (a.label === label || a.title === label || a.id === guessedId);
+  try {
+    let agents;
+    if (cfg.mode() === "remote") {
+      const r = await remote.get(cfg, "/v1/agents", { timeoutMs: 6000 });
+      if (r.ok && r.json && Array.isArray(r.json.agents)) {
+        agents = r.json.agents;
+      } else if (r.status === 404) {
+        const q = await remote.get(cfg, "/v1/changes?limit=500", { timeoutMs: 6000 });
+        if (!q.ok || !q.json || !Array.isArray(q.json.changes)) return null;
+        const seen = new Set();
+        agents = [];
+        for (const c of q.json.changes) {
+          if (!c || c.type !== "agent" || c.change === "D") continue;
+          if (seen.has(c.id)) continue;
+          seen.add(c.id);
+          agents.push({ id: c.id, title: c.title || "" });
+        }
+      } else {
+        return null;
+      }
+    } else {
+      const nodesDir = cfg.nodesDir();
+      if (!fs.existsSync(nodesDir)) return null;
+      const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+      const g = graphLib.loadGraph(nodesDir);
+      agents = Object.values(g.nodes || {}).filter((n) => n.type === "agent");
+    }
+    const hits = agents.filter(isMatch).filter((a) => isAgentId(a.id));
+    if (!hits.length) return null;
+    if (hits.length > 1) return { ambiguous: [...new Set(hits.map((a) => a.id))] };
+    return { id: hits[0].id };
+  } catch {
+    return null;
+  }
+}
+
 // `spor agent use <agent-id>` — make this agent the machine's default dispatch
 // identity by writing `dispatch.agent` to the USER config.json (the same
 // machine-local, never-committed file as the repo map; per-machine, like
@@ -4518,28 +4628,41 @@ function agentIdGuess(id) {
 // before it, dispatch.agent was settable only via env or by hand-editing the
 // config. `spor agent use --clear` (or an empty id) drops back to person-scoped
 // dispatch. Not a graph write — purely local config, so it works in both modes.
-function cmdAgentUse(cfg, { id }) {
+async function cmdAgentUse(cfg, { id }) {
   const clear = id === "--clear" || id === "none" || id === "";
   if (!id) {
     err("usage: spor agent use <agent-id>   (or: spor agent use --clear)");
     return 1;
   }
+  let resolvedId = id;
+  let fromLabel = false;
   if (!clear && !isAgentId(id)) {
-    err(`invalid agent id '${id}' — must be an 'agent-<slug>' kebab id (e.g. agent-your-machine)`);
-    const guess = agentIdGuess(id);
-    if (guess) err(`  did you mean '${guess}'?  ('spor agent list' shows the full id — the 'agent-' prefix is part of it, not the label)`);
-    return 1;
+    const resolved = await resolveAgentIdFromLabel(cfg, id);
+    if (resolved && resolved.ambiguous) {
+      err(`'${id}' matches more than one of your agents: ${resolved.ambiguous.join(", ")} — pass the full agent id.`);
+      return 1;
+    }
+    if (resolved && resolved.id) {
+      resolvedId = resolved.id;
+      fromLabel = true;
+    } else {
+      err(`invalid agent id '${id}' — must be an 'agent-<slug>' kebab id (e.g. agent-your-machine)`);
+      const guess = agentIdGuess(id);
+      if (guess) err(`  did you mean '${guess}'?  ('spor agent list' shows the full id — the 'agent-' prefix is part of it, not the label)`);
+      return 1;
+    }
   }
   const home = cfg.userConfigHome();
-  const wrote = u.setDispatchAgent(home, clear ? null : id);
+  const wrote = u.setDispatchAgent(home, clear ? null : resolvedId);
+  const labelNote = fromLabel ? ` (resolved from label '${id}')` : "";
   if (clear) {
     out(wrote ? "cleared dispatch.agent — dispatches run person-scoped again" : "dispatch.agent was already unset");
     return 0;
   }
   if (wrote) {
-    out(`dispatch.agent = ${id}  (this machine now dispatches as ${id}; ${path.join(home, "config.json")})`);
+    out(`dispatch.agent = ${resolvedId}${labelNote}  (this machine now dispatches as ${resolvedId}; ${path.join(home, "config.json")})`);
   } else {
-    out(`dispatch.agent already = ${id} (no change)`);
+    out(`dispatch.agent already = ${resolvedId}${labelNote} (no change)`);
   }
   out("  attribution is remote-only; override one dispatch with: spor dispatch --as <agent-id>");
   return 0;
@@ -5824,6 +5947,160 @@ function installPluginHost(spec, scope, dryRun) {
   return 0;
 }
 
+// --- spor install --mcp: auto-write per-host MCP server config -------------
+// (task-cc-spor-cli-install-mcp-automation) v1 only PRINTED the manual recipe
+// each adapter README carries (see "MCP:" sections); --mcp is the opt-in
+// automation of that recipe. Per-host shape varies enough that each gets its
+// own renderer, but all share the same safety bar: read the existing file (if
+// any), touch ONLY the spor entry, and write atomically (tmp + rename) so a
+// write failure never leaves a half-written file. An existing file this can't
+// safely read (bad JSON, unreadable) aborts loudly and changes nothing.
+const MCP_HOSTS = {
+  // Codex has no JSON mcpServers map — it's a TOML table under a DIFFERENT
+  // file than the hooks manifest (~/.codex/config.toml, not hooks.json).
+  codex: { kind: "toml", user: [".codex", "config.toml"], repo: [".codex", "config.toml"] },
+  // Gemini's mcpServers entry lives in the SAME settings.json the hooks do —
+  // installHookHost() has already written/merged it by the time this runs, so
+  // this just adds one more top-level key to that same file.
+  gemini: {
+    kind: "json",
+    user: [".gemini", "settings.json"],
+    repo: [".gemini", "settings.json"],
+    key: "mcpServers",
+    entry: (url) => ({ httpUrl: url, headers: { Authorization: "Bearer $SPOR_TOKEN" } }),
+  },
+  opencode: {
+    kind: "json",
+    user: [".config", "opencode", "opencode.json"],
+    repo: [".opencode", "opencode.json"],
+    key: "mcp",
+    entry: (url) => ({ type: "remote", url, headers: { Authorization: "Bearer {env:SPOR_TOKEN}" } }),
+  },
+  copilot: {
+    kind: "json",
+    user: [".copilot", "mcp-config.json"],
+    repo: [".github", "mcp-config.json"],
+    key: "mcpServers",
+    entry: (url) => ({ type: "http", url, headers: { Authorization: "Bearer $SPOR_TOKEN" } }),
+  },
+};
+
+// {} when the file is absent; throws a clear error when it exists but can't be
+// read or isn't valid JSON — the caller aborts rather than clobbering it.
+function readJsonStrict(file) {
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (e) {
+    if (e.code === "ENOENT") return {};
+    throw new Error(`can't read ${file}: ${e.message}`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`${file} exists but isn't valid JSON — leaving it untouched`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${file} exists but isn't a JSON object — leaving it untouched`);
+  }
+  return parsed;
+}
+
+function writeMcpJson(spec, scope, dryRun, url) {
+  const target = targetPath(spec, scope);
+  let existing;
+  try {
+    existing = readJsonStrict(target);
+  } catch (e) {
+    err(`spor install --mcp: ${e.message}`);
+    return 1;
+  }
+  const merged = { ...existing };
+  const priorGroup = merged[spec.key];
+  // An existing key of the WRONG shape (array, string, null) gets the same
+  // treatment as unparseable top-level JSON: abort, don't discard it — the
+  // contract is "touch ONLY the spor entry", never silently replace data.
+  if (priorGroup !== undefined && (typeof priorGroup !== "object" || priorGroup === null || Array.isArray(priorGroup))) {
+    err(`spor install --mcp: ${target} has a non-object '${spec.key}' — leaving it untouched`);
+    return 1;
+  }
+  merged[spec.key] = priorGroup ? { ...priorGroup } : {};
+  merged[spec.key].spor = spec.entry(url);
+  const rendered = JSON.stringify(merged, null, 2) + "\n";
+  if (dryRun) {
+    out(`would write ${target}:`);
+    out(rendered.trimEnd());
+    return 0;
+  }
+  try {
+    u.writeFileAtomic(target, rendered, { mkdir: true });
+  } catch (e) {
+    err(`spor install --mcp: could not write ${target}: ${e.message}`);
+    return 1;
+  }
+  out(`wrote MCP config for spor → ${target}`);
+  return 0;
+}
+
+function renderCodexMcpSection(url) {
+  return `[mcp_servers.spor]\nurl = ${tomlString(url)}\nbearer_token_env_var = "SPOR_TOKEN"\n`;
+}
+
+// TOML has no zero-dep parser in this repo, so this doesn't parse the file —
+// it locates our OWN `[mcp_servers.spor]` table by its header line and its
+// own prior content (never hand-authored subtables), strips it, and appends a
+// fresh copy. Everything else in the file survives untouched, which is also
+// what makes a second run byte-identical.
+function writeMcpToml(spec, scope, dryRun, url) {
+  const target = targetPath(spec, scope);
+  let existing = "";
+  try {
+    existing = fs.readFileSync(target, "utf8");
+  } catch (e) {
+    if (e.code !== "ENOENT") {
+      err(`spor install --mcp: can't read ${target}: ${e.message}`);
+      return 1;
+    }
+  }
+  const lines = existing.length ? existing.replace(/\r\n/g, "\n").split("\n") : [];
+  const kept = [];
+  let skip = false;
+  for (const line of lines) {
+    if (/^\[mcp_servers\.spor\]\s*$/.test(line.trim())) {
+      skip = true;
+      continue;
+    }
+    // A dotted subtable of our own section (e.g. a hand-added
+    // `[mcp_servers.spor.env]`) must stay skipped along with its parent — only
+    // a header that ISN'T `mcp_servers.spor` (itself or a subtable) ends the skip.
+    if (skip && /^\[/.test(line.trim()) && !/^\[mcp_servers\.spor(\.|\])/.test(line.trim())) skip = false;
+    if (!skip) kept.push(line);
+  }
+  while (kept.length && kept[kept.length - 1] === "") kept.pop();
+  const prefix = kept.length ? kept.join("\n") + "\n\n" : "";
+  const rendered = prefix + renderCodexMcpSection(url);
+  if (dryRun) {
+    out(`would write ${target}:`);
+    out(rendered.trimEnd());
+    return 0;
+  }
+  try {
+    u.writeFileAtomic(target, rendered, { mkdir: true });
+  } catch (e) {
+    err(`spor install --mcp: could not write ${target}: ${e.message}`);
+    return 1;
+  }
+  out(`wrote MCP config for spor → ${target}`);
+  return 0;
+}
+
+function writeMcpConfig(host, scope, dryRun, url) {
+  const spec = MCP_HOSTS[host];
+  if (!spec) return 0;
+  return spec.kind === "toml" ? writeMcpToml(spec, scope, dryRun, url) : writeMcpJson(spec, scope, dryRun, url);
+}
+
 async function cmdInstall(cfg, { values, positionals: pos }) {
   const dryRun = !!(values.print || values["dry-run"]);
   // Node prerequisite (issue-spor-onboarding-no-node-silent-fail-open). The
@@ -5851,6 +6128,13 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
   let hosts = pos.slice();
   if (values.all) hosts = detectHosts();
 
+  // writeAgentsBlock (the --mcp agents-md step below) resolves its server/graph
+  // through scripts/engines/util.js's OWN active-config global, not this cfg
+  // parameter directly — adopt cfg as that global now so it sees the full
+  // cascade (repo .spor org/graph marker, user config.json, --org tenant),
+  // not a raw-env fallback, even when --server/--token isn't passed THIS run.
+  u.setConfig(cfg);
+
   // The "configure" half: persist server/token to user config when given.
   const server = values.server;
   const token = values.token;
@@ -5858,6 +6142,12 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
     try {
       const f = writeServerToken(cfg.userConfigHome(), server, token);
       out(`wrote ${[server && "server", token && "token"].filter(Boolean).join(" + ")} to ${f}`);
+      // Reload so --mcp / the "next:" trailer below see the creds just
+      // written, instead of the pre-write snapshot cfg was constructed from
+      // (Config resolves its cascade once at load time, not per-get).
+      const orgFlag = cfg.flagOrg();
+      cfg = loadConfig({ cwd: process.cwd(), cli: orgFlag ? { org: orgFlag } : undefined });
+      u.setConfig(cfg);
     } catch (e) {
       err(`could not write config: ${e.message}`);
     }
@@ -5866,7 +6156,7 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
   if (!hosts.length) {
     // Discovery mode — show what is installable; touch nothing.
     const found = detectHosts();
-    out("Usage: spor install <host>... [--scope user|repo] [--all] [--print]");
+    out("Usage: spor install <host>... [--scope user|repo] [--all] [--print] [--mcp]");
     out(`Hosts: ${Object.keys(HOSTS).join(", ")}`);
     out(found.length ? `Detected here: ${found.join(", ")}  (try: spor install ${found.join(" ")})` : "No host config dirs detected yet.");
     out("Claude Code: 'spor install claude' wires the plugin via its CLI — no marketplace browsing.");
@@ -5876,15 +6166,69 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
     return 0;
   }
 
+  // --mcp is opt-in auto-write of the per-host MCP server config (v1 only
+  // printed the manual recipe — see MCP_HOSTS above). It needs a resolved
+  // server to point the config at, so fail fast with a clear message rather
+  // than writing a config that points nowhere. Prefer THIS invocation's own
+  // --server (even under --print, where it's never persisted to disk) over
+  // cfg's resolution, so `install <host> --mcp --server <url>` resolves in one
+  // shot without depending on a config reload picking up what was just written.
+  const wantMcp = !!values.mcp;
+  const explicitServer = server ? server.replace(/\/+$/, "") : "";
+  const resolvedServer = explicitServer || remote.base(cfg);
+  const mcpUrl = wantMcp ? `${resolvedServer}/mcp` : "";
+  if (wantMcp && !resolvedServer) {
+    err("spor install --mcp needs a configured server — pass --server/--token (or run 'spor join <token>') first.");
+    return 1;
+  }
+
   let rc = 0;
   for (const host of hosts) {
     const spec = HOSTS[host];
+    // Gemini's mcpServers entry lives in the SAME settings.json its hooks
+    // manifest does (MCP_HOSTS.gemini.user/repo === HOSTS.gemini.user/repo),
+    // so installHookHost() below is about to write that file BEFORE
+    // writeMcpConfig()'s own strict-JSON check ever runs — an existing
+    // malformed settings.json would get silently discarded by
+    // installHookHost's readJsonOr(target, {}) fallback instead of aborting
+    // (the "no partial writes" guarantee --mcp otherwise gives every host).
+    // Pre-validate here, for any host whose hook target and mcp target are
+    // literally the same file, before either write happens.
+    if (wantMcp && !dryRun && MCP_HOSTS[host] && MCP_HOSTS[host].kind !== "toml") {
+      const mcpTarget = targetPath(MCP_HOSTS[host], scope);
+      if (spec.kind === "hooks" && targetPath(spec, scope) === mcpTarget) {
+        try {
+          readJsonStrict(mcpTarget);
+        } catch (e) {
+          err(`spor install --mcp: ${e.message}`);
+          rc = 1;
+          continue;
+        }
+      }
+    }
     let r;
     if (spec.kind === "claude") r = installClaude(scope, dryRun);
     else if (spec.kind === "codex") r = installCodex(scope, dryRun);
     else if (spec.kind === "plugin") r = installPluginHost(spec, scope, dryRun);
     else r = installHookHost(spec, scope, dryRun);
-    if (r !== 0) rc = r;
+    if (r !== 0) {
+      rc = r;
+      continue;
+    }
+    if (wantMcp && MCP_HOSTS[host]) {
+      const mcpRc = writeMcpConfig(host, scope, dryRun, mcpUrl);
+      if (mcpRc !== 0) rc = mcpRc;
+    }
+  }
+
+  if (wantMcp && rc === 0) {
+    if (dryRun) {
+      out("would run: spor-hook agents-md (populates AGENTS.md)");
+    } else {
+      const { writeAgentsBlock } = require(path.join(ROOT, "scripts", "engines", "agents-md.js"));
+      const { file, meta } = await writeAgentsBlock({ cwd: repoRoot(), briefing: true });
+      out(`updated ${file} (${meta || "no briefing yet, MCP pointers only"})`);
+    }
   }
 
   if (!dryRun && rc === 0 && hosts.some((h) => HOSTS[h].kind !== "claude")) {
@@ -5892,7 +6236,12 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
     out("next:");
     if (cfg.mode() === "remote") out(`  remote mode is configured (${remote.base(cfg)}).`);
     else out("  point at a graph:  spor join <token>   (hosted Spor; or 'spor join <url> <token>' / export SPOR_SERVER/SPOR_TOKEN)");
-    out("  distiller backend (hosts without the claude CLI) + on-demand MCP access: see adapters/<host>/README.md");
+    // --mcp only automates the MCP-access half of this reminder (and only for
+    // MCP_HOSTS hosts) — the distiller-backend pointer stays relevant either
+    // way, and a host --mcp doesn't cover (e.g. cursor) still needs the README.
+    out("  distiller backend (hosts without the claude CLI): see adapters/<host>/README.md");
+    const mcpUncovered = hosts.some((h) => HOSTS[h].kind !== "claude" && !(wantMcp && MCP_HOSTS[h]));
+    if (mcpUncovered) out("  on-demand MCP access: see adapters/<host>/README.md" + (wantMcp ? " (--mcp covers codex/gemini/opencode/copilot only)" : ""));
     out("  approve the hooks on first run if the host prompts.");
   }
   return rc;
@@ -6032,7 +6381,8 @@ function fmField(raw, key) {
   return m ? m[1].trim() : null;
 }
 
-// Resolve a node id to { id, raw, repo, title } or null if it doesn't exist.
+// Resolve a node id to { id, raw, repo, title, summary, type, status, date } or
+// null if it doesn't exist.
 async function resolveNode(cfg, id) {
   let raw = "";
   // The server's get(node) hook attaches read-time enrichment as additive
@@ -6059,7 +6409,31 @@ async function resolveNode(cfg, id) {
       return null;
     }
   }
-  return { id, raw, repo: fmField(raw, "repo") || fmField(raw, "project"), title: fmField(raw, "title") || "", resolution, held };
+  // Parse the frontmatter with the real parser (lib/kernel/graph.js), not
+  // fmField: fmField's single-line regex both truncates YAML folded
+  // multi-line values and, unbounded by the closing `---`, can false-match a
+  // body line that happens to start with "key: " — a real risk for
+  // summary/type/status/date, all plausible words in body prose. parsed is
+  // {} on malformed/missing frontmatter, matching fmField's null->"" fallback.
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  let parsed = {};
+  try {
+    parsed = graphLib.parseFrontmatter(raw, `${id}.md`);
+  } catch {
+    /* malformed frontmatter — fields below fall back to "" */
+  }
+  return {
+    id,
+    raw,
+    repo: parsed.repo || parsed.project || null,
+    title: parsed.title || "",
+    summary: parsed.summary || "",
+    type: parsed.type || "",
+    status: parsed.status || "",
+    date: parsed.date || "",
+    resolution,
+    held,
+  };
 }
 
 // Is this node ALREADY RESOLVED — so dispatching an agent at it would just redo
@@ -6241,8 +6615,8 @@ async function resolveDispatchProfile(cfg, { profileFlag, nodeRaw, identityAgent
 async function compileBriefing(cfg, { nodeId, query, full, project }) {
   if (cfg.mode() === "remote") {
     if (nodeId) {
-      // Same raw-node + seeded-neighborhood resolution as `spor brief <id>`, so
-      // a dispatched agent's standing context matches an interactive brief
+      // Same raw-node + root-walk-neighborhood resolution as `spor brief <id>`,
+      // so a dispatched agent's standing context matches an interactive brief
       // rather than the bare node (issue-spor-dispatch-briefing-omits-neighborhood).
       const b = await remoteNodeBriefing(cfg, { root: nodeId, project });
       return b.ok ? b.text : "";
@@ -6795,6 +7169,10 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   let brief = "";
   let instruction = "";
   let nodeTitle = "";
+  let nodeSummary = "";
+  let nodeType = "";
+  let nodeStatus = "";
+  let nodeDate = "";
   let resolvedReason = null; // set in node mode when the target is already resolved
   let readinessCheck = null; // set in node mode: {readiness, reasons} — the agent-readiness guard
 
@@ -6830,6 +7208,10 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     dispatchNodeRaw = node.raw || null;
     targetSlug = targetSlug || node.repo || null;
     nodeTitle = node.title || "";
+    nodeSummary = node.summary || "";
+    nodeType = node.type || "";
+    nodeStatus = node.status || "";
+    nodeDate = node.date || "";
     resolvedReason = dispatchResolutionReason(cfg, node);
     readinessCheck = dispatchReadinessCheck(cfg, node);
     if (!noBrief) brief = await compileBriefing(cfg, { nodeId, full, project: targetSlug });
@@ -6912,16 +7294,27 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   //   standing cfg dispatch.worktree > off.
   // The TARGET repo's own .spor.json wins over the standing user/global config so
   // a repo that declares it wants isolation is honored wherever it's dispatched
-  // FROM (the cfg cascade only sees the dispatcher's cwd). Forced off for
-  // --backfill, which sets up the MAIN checkout itself. The setup hook follows
-  // the same target-first precedence; relative paths in the marker resolve
-  // against the repo (the spor-server hook stages the node_modules symlink +
-  // $SPOR_LIB the bare worktree needs).
+  // FROM. Forced off for --backfill, which sets up the MAIN checkout itself. The
+  // setup hook follows the same target-first precedence; relative paths in the
+  // marker resolve against the repo (the spor-server hook stages the
+  // node_modules symlink + $SPOR_LIB the bare worktree needs).
+  //
+  // The "standing cfg" fallback must NOT be `cfg` as-is: `cfg` is anchored at
+  // the DISPATCHER's cwd (process.cwd()), so its repo-.spor.json layer is the
+  // LAUNCHER's own repo config, not the target's. Cross-repo dispatch (launch
+  // from repo A for a node targeting repo B) would then apply repo A's
+  // dispatch.worktreeSetup — a path relative to A — inside B's fresh worktree,
+  // where it doesn't exist (issue-spor-dispatch-worktree-setup-wrong-repo-
+  // config). Re-resolving the cascade anchored at res.dir instead fixes this:
+  // it still picks up target's own .spor.json (redundant with targetCfg above,
+  // but harmless) and the location-independent user/global config layers, while
+  // never seeing a foreign repo's .spor.json.
   const targetCfg = targetRepoDispatchCfg(res.dir);
+  const targetStandingCfg = loadConfig({ cwd: res.dir, env: process.env });
   const worktreeSetup =
-    targetCfg.worktreeSetup != null ? targetCfg.worktreeSetup : cfg.get("dispatch.worktreeSetup", null);
+    targetCfg.worktreeSetup != null ? targetCfg.worktreeSetup : targetStandingCfg.get("dispatch.worktreeSetup", null);
   const worktreeDefault =
-    targetCfg.worktree != null ? targetCfg.worktree : !!cfg.get("dispatch.worktree", false);
+    targetCfg.worktree != null ? targetCfg.worktree : !!targetStandingCfg.get("dispatch.worktree", false);
   const useWorktree =
     !backfill && (values["no-worktree"] ? false : !!(values.worktree || worktreeDefault));
 
@@ -6956,8 +7349,9 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     const r = renderTemplate(template, {
       brief, briefing: brief, neighbourhood: brief, neighborhood: brief,
       task: instruction, instruction,
-      node: nodeId || "", node_id: nodeId || "",
+      node: nodeId || "", node_id: nodeId || "", id: nodeId || "",
       title: nodeTitle,
+      summary: nodeSummary, type: nodeType, status: nodeStatus, date: nodeDate,
       slug: res.slug || "", project: res.slug || "", repo: res.slug || "",
       dir: res.dir || "",
       default: defaultPrompt,
@@ -6965,7 +7359,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     if (r.unknown.length) {
       err(
         `warning: unknown template placeholder(s): ${[...new Set(r.unknown)].join(", ")} ` +
-          `(available: brief, task, node, title, slug, dir, default)`
+          `(available: brief, task, node, id, title, summary, type, status, date, slug, dir, default)`
       );
     }
     prompt = r.text;
@@ -7027,6 +7421,36 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     err(`note: --as ${asAgent} ignored in local mode — agent-on-behalf-of attribution is remote-only`);
   }
 
+  // Agent-readiness guard inputs (task-spor-dispatch-readiness-guard): computed
+  // once, read by both the --print preview and the real-run refusal/warn below.
+  // `requires: human` (readinessRequiresHuman) is the hard-refuse subset of the
+  // broader `readiness: human` classification (readinessHuman) — see the
+  // real-run guard for the distinction. Derived purely from readinessCheck
+  // (already resolved from the node above), so it costs nothing to evaluate
+  // before profile resolution below.
+  const readinessHuman = !!(readinessCheck && readinessCheck.readiness === "human");
+  const readinessRequiresHuman = readinessHuman && readinessCheck.reasons.includes("requires human");
+
+  // Refuse the cheap, node-derived guards BEFORE profile resolution on a REAL run
+  // (issue-spor-dispatch-probe-side-effect-before-refusal): resolveDispatchProfile
+  // below calls probeCapabilities, which PERSISTS a machine-local capability probe
+  // to disk once a profile resolves — a side effect a refused dispatch must not
+  // cause. --print keeps the upfront compute-everything shape (it needs the
+  // profile verdict to preview every guard, this one included), so the early
+  // exit is real-run only; the --print branch below still resolves the profile
+  // and reports each guard's would-refuse verdict for itself.
+  if (!dryRun && resolvedReason && !force) {
+    err(`${nodeId} is already resolved (${resolvedReason}) — not dispatching.`);
+    err(`  re-run with --force to dispatch at it anyway, or pick another task with 'spor next'.`);
+    return 1;
+  }
+  if (!dryRun && readinessRequiresHuman) {
+    err(`cannot dispatch ${nodeId || name}: this item requires a human — ${readinessCheck.reasons.join(", ")}.`);
+    err(`  the assignment is unchanged. A human must do this work (or edit the node's 'requires:' list once`);
+    err(`  it no longer needs one), then dispatch again — a readiness stamp alone can't override it.`);
+    return 1;
+  }
+
   // Profile satisfiability (dec-spor-machine-profile-satisfiability, FORK B).
   // Resolve the profile this dispatch runs under (--profile > the node's
   // assigned->agent profile attr > the agent's default) and decide whether THIS
@@ -7042,14 +7466,6 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     return 1;
   }
   const unsatisfiable = !!(profileCheck && profileCheck.verdict && !profileCheck.verdict.ok);
-
-  // Agent-readiness guard inputs (task-spor-dispatch-readiness-guard): computed
-  // once, read by both the --print preview and the real-run refusal/warn below.
-  // `requires: human` (readinessRequiresHuman) is the hard-refuse subset of the
-  // broader `readiness: human` classification (readinessHuman) — see the
-  // real-run guard for the distinction.
-  const readinessHuman = !!(readinessCheck && readinessCheck.readiness === "human");
-  const readinessRequiresHuman = readinessHuman && readinessCheck.reasons.includes("requires human");
 
   const claudeBin = claudeCmd();
   const claudeArgs = ["--bg"];
@@ -7138,43 +7554,13 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     return 0;
   }
 
-  // Refuse an already-RESOLVED target before the lease/claim, repo registration,
-  // worktree, and agent launch — and before the profile host-match call below
-  // (issue-spor-dispatch-resolved-task-no-guard): dispatching an agent at a node
-  // that is already done — a terminal status, or retired by a live inbound
-  // resolves/answers edge — would just redo finished work and write another
-  // outcome onto a closed node. (The briefing compile above already ran, exactly
-  // as it does for the sibling in-flight guard — refusal is post-briefing,
-  // pre-launch.) Mirrors the in-flight same-machine guard (node mode, both modes);
-  // --force overrides, like that guard and the remote-only duplicate-claim guard.
-  // The ranker already drops resolved items from --from-queue (dec-spor-dispatch-
-  // duplicate-dedup-at-capture-source), so for an auto-pick this is defense-in-depth;
-  // for an explicit `--node <id>` it is the primary guard. Checked first among the
-  // real-run guards so a resolved node short-circuits the host-match call and launch.
-  if (resolvedReason && !force) {
-    err(`${nodeId} is already resolved (${resolvedReason}) — not dispatching.`);
-    err(`  re-run with --force to dispatch at it anyway, or pick another task with 'spor next'.`);
-    return 1;
-  }
-
-  // Agent-readiness guard (task-spor-dispatch-readiness-guard, dec-spor-agent-
-  // readiness-derived-classification): `requires: human` is the risk-class
-  // register's own declaration that no agent can complete this work, regardless
-  // of capability — a REFUSE before any graph write, claim, or launch, with NO
-  // --force override (note: the profile resolution above may already have
-  // persisted a machine-local capability probe cache, a pre-existing ordering —
-  // see issue-spor-dispatch-probe-side-effect-before-refusal)
-  // (unlike every other dispatch guard): overriding it would be exactly the
-  // silent substitution the profile-satisfiability rule below also forbids. A
-  // broader `readiness: human` classification (assigned to a person, a held
-  // task, an open neighborhood question, or the item itself a question/capture)
-  // is not a capability gap, so it only WARNS and the dispatch proceeds.
-  if (readinessRequiresHuman) {
-    err(`cannot dispatch ${nodeId || name}: this item requires a human — ${readinessCheck.reasons.join(", ")}.`);
-    err(`  the assignment is unchanged. A human must do this work (or edit the node's 'requires:' list once`);
-    err(`  it no longer needs one), then dispatch again — a readiness stamp alone can't override it.`);
-    return 1;
-  }
+  // The already-RESOLVED guard and the requires:human agent-readiness guard both
+  // already refused above (before profile resolution) on a real run — nothing
+  // left to check here for those two. The broader `readiness: human`
+  // classification (assigned to a person, a held task, an open neighborhood
+  // question, or the item itself a question/capture) is not a capability gap and
+  // was never a refusal — it only WARNS and the dispatch proceeds, so that check
+  // stays here, after profile resolution, alongside the guards below it.
   if (readinessHuman) {
     err(`warning: ${nodeId || name}'s derived readiness is human, not agent — ${readinessCheck.reasons.join(", ")}.`);
     err(`  dispatching anyway; 'spor next' shows the same signal if you'd rather triage first.`);
@@ -7275,6 +7661,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // (session omitted, dec-spor-dispatch-bg-session-late-bind): the real session
   // isn't known until after launch, so we bind it to the lease via renewDispatch
   // below; until then any of this person's sessions may renew it.
+  let claimEstablished = false;
   if (nodeId && !backfill && !noClaim && cfg.mode() === "remote") {
     // Tag this claim with a per-invocation dispatch nonce so the server refuses a
     // SECOND concurrent dispatch of the same node — even by this same person, on
@@ -7288,9 +7675,29 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
       err(`  --no-claim to dispatch with no lease, or pick another task with 'spor next'.`);
       return 1;
     }
-    if (c.ok) out(`claimed ${nodeId} (lease established; the agent's writes will renew it)`);
-    else err(`warning: could not establish a lease on ${nodeId}: ${c.error} — dispatching without a claim`);
+    if (c.ok) {
+      // Only mark this as a lease WE established: a --force claim omits the
+      // nonce and RENEWS whatever lease already exists (per the conflict
+      // message above, "keeps the lease") — that may be a live lease held by
+      // an already-running agent from an earlier dispatch. Abort-cleanup below
+      // must never release a lease this invocation didn't freshly create.
+      claimEstablished = !!dispatchNonce;
+      out(`claimed ${nodeId} (lease established; the agent's writes will renew it)`);
+    } else err(`warning: could not establish a lease on ${nodeId}: ${c.error} — dispatching without a claim`);
   }
+  // A worktree-creation/setup-hook failure, or a failure to even launch the
+  // agent process, below aborts the dispatch without ever running an agent —
+  // release the lease claimed just above so it doesn't strand the node
+  // claimed-but-unattended (issue-spor-dispatch-worktree-setup-wrong-repo-
+  // config: the failed attempt used to need a manual `spor release` before a
+  // retry). Best-effort: a release failure here just leaves the existing
+  // "needs a manual spor release" state, no worse than before.
+  const releaseClaimOnAbort = async () => {
+    if (!claimEstablished) return;
+    const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}/release`, {}, { timeoutMs: 6000 });
+    if (r.ok) out(`  released the claim on ${nodeId}`);
+    else err(`  warning: could not release the claim on ${nodeId} — retry with 'spor release ${nodeId}'`);
+  };
   // Materialize the worktree just before launch — AFTER every guard/claim, so a
   // refused dispatch never leaves a worktree behind — and run the agent inside it.
   // res.dir stays the registered slug->path target (the durable main checkout,
@@ -7301,6 +7708,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     if (wt.error) {
       err(`could not create dispatch worktree under ${res.dir}: ${wt.error}`);
       err(`  (is ${res.dir} a git repo with at least one commit? or pass --no-worktree.)`);
+      await releaseClaimOnAbort();
       return 1;
     }
     if (wt.setupError) {
@@ -7311,6 +7719,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
       } else {
         err(`  left the reused worktree ${wt.dir} in place. Fix dispatch.worktreeSetup or pass --no-worktree.`);
       }
+      await releaseClaimOnAbort();
       return 1;
     }
     launchDir = wt.dir;
@@ -7321,6 +7730,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   const r = spawnPortableSync(claudeBin, claudeArgs, { cwd: launchDir, stdio: "inherit" });
   if (r.error) {
     err(`could not launch ${claudeBin}: ${r.error.message}`);
+    await releaseClaimOnAbort();
     return 1;
   }
 
@@ -8258,7 +8668,13 @@ const COMMANDS = {
       "Wire the spor hooks/plugin into one or more host agents. With no host, lists\n" +
       "the hosts detected on this machine and touches nothing. Claude Code is wired\n" +
       "via its plugin CLI; the others receive a merged hooks manifest.\n\n" +
-      "--server/--token also persist remote-graph credentials to your user config.",
+      "--server/--token also persist remote-graph credentials to your user config.\n\n" +
+      "--mcp additionally auto-writes the per-host MCP server config (codex's\n" +
+      "~/.codex/config.toml [mcp_servers.spor]; gemini/opencode/copilot's JSON\n" +
+      "mcpServers entry) — merged into any existing file, idempotent — and runs\n" +
+      "agents-md to populate AGENTS.md, so one command finishes the setup that\n" +
+      "otherwise needed the manual recipe in each adapter's README. Needs a\n" +
+      "configured server (--server/--token or 'spor join').",
     options: {
       scope: SCOPE_OPT,
       all: { type: "boolean", desc: "install into every detected host" },
@@ -8266,8 +8682,9 @@ const COMMANDS = {
       "dry-run": DRYRUN_OPT,
       server: { type: "string", value: "url", desc: "persist a team-graph server URL to user config" },
       token: { type: "string", value: "tok", desc: "persist an auth token to user config" },
+      mcp: { type: "boolean", desc: "also auto-write per-host MCP config + AGENTS.md (codex/gemini/opencode/copilot)" },
     },
-    examples: ["spor install claude", "spor install codex gemini --scope repo", "spor install --all --print"],
+    examples: ["spor install claude", "spor install codex gemini --scope repo", "spor install --all --print", "spor install codex --mcp"],
     run: (cfg, p) => cmdInstall(cfg, p),
   },
   upgrade: {
@@ -8447,7 +8864,10 @@ const COMMANDS = {
       "  spor agent list               list agents and their owners\n" +
       "  spor agent use <agent-id>     make it THIS machine's default dispatch identity\n" +
       "                                (writes dispatch.agent to your user config; pass\n" +
-      "                                --clear to go back to person-scoped dispatch)\n" +
+      "                                --clear to go back to person-scoped dispatch).\n" +
+      "                                A bare label (no 'agent-' prefix) also resolves\n" +
+      "                                against your own agents ('spor agent list')\n" +
+      "                                before falling back to the prefix-hint error.\n" +
       "  spor agent token <agent-id>   mint a long-lived STANDING PAT for the agent —\n" +
       "                                the SPOR_TOKEN a headless agent (Claude Code on\n" +
       "                                the Web) runs under; shown once\n" +
@@ -8866,6 +9286,40 @@ const COMMANDS = {
       "spor changes --limit 20 --json",
     ],
     run: (cfg, args) => cmdChanges(cfg, args),
+  },
+  program: {
+    group: "Graph", parse: "raw", args: "<id> [--max-depth N] [--max-nodes N] [--json]",
+    summary: "birds-eye program/progress view over blocks topology",
+    help:
+      "Show the program/progress view for a workstream: given a root node other\n" +
+      "work `blocks` (an umbrella task, a milestone), the gating tree of everything\n" +
+      "that blocks it — transitively over inbound `blocks` edges — with resolution-\n" +
+      "derived progress. `next` answers \"what's next\"; `program` answers \"how far\n" +
+      "along is the whole thing\". The shell front-door for the render_program MCP\n" +
+      "tool / GET /v1/program/{id} (API.md §3).\n" +
+      "\n" +
+      "A node is `done` when a live resolves/answers edge, a terminal status, or\n" +
+      "supersession retires it (even while the status field lags); `blocked` when a\n" +
+      "live node has its own unresolved live blocker; otherwise `active` (status:\n" +
+      "active) or `open`. Remote mode dispatches to GET /v1/program/{id} and prints\n" +
+      "the server's own rendering straight through; local mode walks the local\n" +
+      "graph's `blocks` edges itself. A shared blocker renders once per occurrence\n" +
+      "but counts once in the totals; an unknown root is an error. A root nothing\n" +
+      "blocks is a successful empty result — add `blocks` edges from the gating\n" +
+      "tasks to model the program (see /spor:spor \"Grouping work under an umbrella\n" +
+      "node\").\n" +
+      "\n" +
+      "  <id>              the root node id (an umbrella task, a milestone)\n" +
+      "  --max-depth <N>   bound how many `blocks` hops out from the root are walked\n" +
+      "  --max-nodes <N>   bound the total distinct nodes visited\n" +
+      "  --json            machine-readable envelope\n" +
+      "  --nodes <dir>     read this local graph dir instead of the resolved home",
+    examples: [
+      "spor program task-platform-hardening-program",
+      "spor program task-platform-hardening-program --max-depth 3",
+      "spor program task-platform-hardening-program --json",
+    ],
+    run: (cfg, args) => cmdProgram(cfg, args),
   },
   check: {
     group: "Graph", parse: "raw", args: "[--staged|--range <a..b>|--files <f...>] [--strict] [--json]",
@@ -9289,8 +9743,10 @@ const COMMANDS = {
       "it runs with cwd=worktree and SPOR_WORKTREE/SPOR_MAIN_CHECKOUT/\n" +
       "SPOR_DISPATCH_SLUG|NODE in the env (e.g. symlink node_modules, write\n" +
       ".claude/settings.local.json env). --no-worktree opts a single run out.\n\n" +
-      "--template supplies your own prompt with {{brief}}/{{task}}/{{node}}/{{title}}/\n" +
-      "{{slug}}/{{dir}}/{{default}} placeholders.\n\n" +
+      "--template supplies your own prompt with {{brief}}/{{task}}/{{node}}/{{id}}/{{title}}/\n" +
+      "{{summary}}/{{type}}/{{status}}/{{date}}/{{slug}}/{{dir}}/{{default}} placeholders\n" +
+      "(the node fields are populated from the dispatched node's frontmatter, blank in\n" +
+      "free-text/--backfill dispatch).\n\n" +
       "Two different 'agent' axes, don't confuse them: --as picks the Spor agent\n" +
       "IDENTITY the dispatch runs AS (attribution 'agent on behalf of person',\n" +
       "remote-only; defaults to dispatch.agent — set it with 'spor agent use <id>').\n" +

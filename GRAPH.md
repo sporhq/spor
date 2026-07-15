@@ -483,6 +483,29 @@ agreeing invariant suppresses the untouched heuristic, and a disagreement
 reports even when both files were touched. A half-declared or malformed pair
 is inert (validate warns).
 
+An in-repo tracked symlink (`frontend -> packages/web`) has two valid
+repo-relative spellings for the same file, and the matcher tests a glob
+against every candidate spelling it is HANDED
+(task-spor-coupling-matcher-symlink-alias) — but deriving those candidates is
+one-way: it can turn an alias spelling into its git-resolved canonical form,
+never the reverse. A coupling glob authored against an alias
+(`couples_when: [frontend/**]`) therefore still misses an edit reported only
+under its canonical path (`packages/web/app.js`) — the environment may hand
+the matcher an already-resolved path with no alias spelling left to derive
+from — because discovering which alias points at a given canonical path would
+need a filesystem-wide symlink scan, rejected as too expensive for the
+edit-time hot path (dec-spor-dismiss-reverse-symlink-path-lookup,
+issue-spor-coupling-matcher-reverse-symlink-gap). The declared fix is a
+**coupling alias map**: `.spor.json`'s `coupling.aliases`, a flat `{ "<alias
+prefix>": "<canonical prefix>" }` object (repo-root-relative on both sides,
+e.g. `{ "frontend": "packages/web" }`). Every declared entry is expanded in
+BOTH directions at match time, at zero runtime cost (no scanning) — a path
+under either side also produces the spelling under the other side, for both
+`couples_when` triggers and `couples_also` targets. **Declaring nothing is
+the default posture**, and it keeps the one-way limitation above: only
+author coupling globs against the canonical (git-resolved) spelling of a
+symlinked subtree unless its alias is declared in `coupling.aliases`.
+
 Because a norm rides along with no relevance gate and the team trust model lets
 every writer author one, the briefing renderer treats norm bodies as an
 **injection surface** (issue-cc-norm-always-on-injection): each is quoted as
@@ -947,6 +970,15 @@ is a single-org-graph relevance-topology fix — shared vocabulary ("auth",
 "deploy", "migration") otherwise dilutes the gate across teams. A project-blind
 compile (no `project`) ranks every node equally, exactly as before.
 
+A node whose `authored_via` is `capture`, `distill`, or `gardener` — written
+with no human review at write time — is labeled `machine·<via>` (e.g.
+`machine·capture`) in every compiled digest/briefing line, the same
+machine-vs-human taxonomy `spor changes` already surfaces
+(task-cc-digest-render-authorship-marker). Without it a Haiku-distilled
+capture rendered typographically identical to a human-reviewed decision in
+the ambient session-start context; `mcp`/`rest`/`dispatch` writes and nodes
+with no `authored_via` at all render exactly as before (unmarked).
+
 A seed (the compile root, or each query-mode content match) always contributes
 its **direct 1-hop lineage** to the structural arm, even when score-decay would
 push a low-weight edge under the traversal threshold
@@ -986,10 +1018,27 @@ Free-text guidance, injected verbatim into the compile for the target.
 how humans debug the context instead of the model: fix it once, it applies to
 every future compile.
 
+**Lifecycle** (`status`, 2026.07.15.1, issue-spor-corrections-no-applied-
+lifecycle): `active` (or no `status` at all) is the default and means the
+guidance is still standing — it keeps injecting at every in-scope compile.
+`applied` means a recompile already absorbed the correction's guidance into
+the target's briefing body, so it is retired and stops injecting — otherwise
+an absorbed correction is dead weight that keeps re-injecting into every
+future compile/serve of its target forever. Both the client compile
+(`correctionInScope`/`corrections` in `lib/kernel/graph.js`) and the server's
+serve-time gate (`correctionsForBriefing`/`applyBriefingCorrections`) filter
+out non-`active` corrections — keep the two in sync, held-guard-style. A
+node-targeted correction (`target: <node-id>`, not `global`/`project:<slug>`)
+is flipped to `applied` by the recompile flow that absorbs it (`/spor:brief`
+step 3); `global`/`project:<slug>` corrections are standing, broad-scope
+guidance and are not auto-retired by any single recompile.
+
 ## Briefing nodes
 
 Created by the distiller or `/spor:brief`. Carry `derived-from` edges to
-every source node and `shaped-by` edges to applied corrections, plus a
+every source node and `shaped-by` edges to the corrections that fired for this
+compile (not necessarily `status: applied` yet — a `global`/`project:<slug>`
+correction can `shaped-by` many briefings over its lifetime), plus a
 `version:` integer. On recompile the old version is archived to
 the graph home's `history/` and the version bumps. `brief-project` is the standing
 project briefing injected at session start.

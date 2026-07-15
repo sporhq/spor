@@ -28,7 +28,7 @@ the decision queue (QUEUE.md §4).
 | artifact | `art-`, `spec-` | a document, spec, module, or build product | optional delivery status `in-review`/`approved`/`merged`/`released` |
 | norm | `norm-` | a standing convention or constraint | `always_on: true` — rides along in every project-relevant compile (capped to the topically relevant subset); narrow it to specific repos with `applies_to_tags:`/`applies_to_repos:`/`applies_to_projects:`; `couples_when:`/`couples_also:` file globs make it a coupling norm (edit-time "changed X, don't forget Y" nudge — see below) |
 | briefing | `brief-` | a compiled briefing (output of the system) | `traversable: false` (never walked) and `capturable: false` |
-| correction | `corr-` | a standing fix to a briefing (pin/exclude/guidance) | `traversable: false`; applied at every future compile of its target |
+| correction | `corr-` | a standing fix to a briefing (pin/exclude/guidance) | `traversable: false`; status `active`/`applied` (default active — fires at every in-scope compile until a recompile absorbs it and retires it to `applied`) |
 | question | `question-` | a routed ask the graph couldn't answer | queueable; status `open`/`answered`; joins the queue until answered |
 | person | `person-` | an org member | mutable `name` display label plus anchor for `$viewer` binding and question routing |
 | organization | `org-` | a durable organization identity anchor | `member-of-org` records membership; `stewards` records org-admin authority; `org-root` remains the virtual graph-wide operator anchor; `capturable: false` |

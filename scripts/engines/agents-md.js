@@ -167,9 +167,7 @@ ${body}`
     out = (existing !== null ? existing + "\n" : "") + block + "\n";
   }
 
-  const tmp = file + `.spor-tmp-${process.pid}`;
-  fs.writeFileSync(tmp, out);
-  fs.renameSync(tmp, file);
+  u.writeFileAtomic(file, out);
   return { file, meta, hadBriefing: !!body };
 }
 

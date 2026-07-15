@@ -11,14 +11,21 @@ const path = require('node:path');
 const u = require('../scripts/engines/util');
 const { drainOutbox } = require('../scripts/engines/drain-outbox');
 
-// A Response shaped like the bits u.curl reads: .status, .text(), .headers.get().
+// A Response shaped like the bits u.curl reads: .status, .text(),
+// .headers.get()/.forEach() (real Headers, mimicked for the response-headers
+// pass-through added by task-spor-distill-conditional-status-fetch).
 function fakeResponse(status, { body = '', headers = {} } = {}) {
   const lower = {};
   for (const k of Object.keys(headers)) lower[k.toLowerCase()] = String(headers[k]);
   return {
     status,
     text: async () => body,
-    headers: { get: (name) => (name.toLowerCase() in lower ? lower[name.toLowerCase()] : null) },
+    headers: {
+      get: (name) => (name.toLowerCase() in lower ? lower[name.toLowerCase()] : null),
+      forEach: (fn) => {
+        for (const [k, v] of Object.entries(lower)) fn(v, k);
+      },
+    },
   };
 }
 
