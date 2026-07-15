@@ -87,6 +87,22 @@
 //          detached worktree instead (norm-spor-orchestrator-cas-merge).
 // Exit 2 = bad invocation / not a git repo / mid-merge or mid-rebase.
 //
+// WIRING — NOT DONE YET, AND DELIBERATELY SO. The consumer is the orchestrator's
+// post-merge root sync (norm-spor-orchestrator-cas-merge), which lives in the
+// spor-orchestrator SKILL at ~/.claude/skills/spor-orchestrator — a personal skill
+// under no version control, so its call site cannot ride this branch or any
+// review. Until someone adds it there, the next CAS merge still leaves the root
+// unsynced by hand. The step is one command, replacing "reset --hard main if the
+// root looks clean":
+//
+//     node scripts/heal-stale-root.js --repo <shared root> --apply || \
+//       echo "ROOT-UNSYNCED: real WIP present — verify in a detached worktree"
+//
+// Exit 0 means the root already matches main. Exit 1 means leave it alone and
+// fall back to today's detached-worktree verification; the report names the paths
+// and why. Nothing else in the repo calls this, by design: it is an ops tool run
+// from a checkout, so it stays out of package.json's `files` alongside release.js.
+//
 // Zero-dependency, plain Node + the git binary — runs anywhere the plugin does.
 
 const fs = require('fs');
