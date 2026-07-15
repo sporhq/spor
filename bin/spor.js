@@ -5933,6 +5933,171 @@ function installPluginHost(spec, scope, dryRun) {
   return 0;
 }
 
+// --- spor install --mcp: auto-write per-host MCP server config -------------
+// (task-cc-spor-cli-install-mcp-automation) v1 only PRINTED the manual recipe
+// each adapter README carries (see "MCP:" sections); --mcp is the opt-in
+// automation of that recipe. Per-host shape varies enough that each gets its
+// own renderer, but all share the same safety bar: read the existing file (if
+// any), touch ONLY the spor entry, and write atomically (tmp + rename) so a
+// write failure never leaves a half-written file. An existing file this can't
+// safely read (bad JSON, unreadable) aborts loudly and changes nothing.
+const MCP_HOSTS = {
+  // Codex has no JSON mcpServers map — it's a TOML table under a DIFFERENT
+  // file than the hooks manifest (~/.codex/config.toml, not hooks.json).
+  codex: { kind: "toml", user: [".codex", "config.toml"], repo: [".codex", "config.toml"] },
+  // Gemini's mcpServers entry lives in the SAME settings.json the hooks do —
+  // installHookHost() has already written/merged it by the time this runs, so
+  // this just adds one more top-level key to that same file.
+  gemini: {
+    kind: "json",
+    user: [".gemini", "settings.json"],
+    repo: [".gemini", "settings.json"],
+    key: "mcpServers",
+    entry: (url) => ({ httpUrl: url, headers: { Authorization: "Bearer $SPOR_TOKEN" } }),
+  },
+  opencode: {
+    kind: "json",
+    user: [".config", "opencode", "opencode.json"],
+    repo: [".opencode", "opencode.json"],
+    key: "mcp",
+    entry: (url) => ({ type: "remote", url, headers: { Authorization: "Bearer {env:SPOR_TOKEN}" } }),
+  },
+  copilot: {
+    kind: "json",
+    user: [".copilot", "mcp-config.json"],
+    repo: [".github", "mcp-config.json"],
+    key: "mcpServers",
+    entry: (url) => ({ type: "http", url, headers: { Authorization: "Bearer $SPOR_TOKEN" } }),
+  },
+};
+
+// Write `content` to `file` via a tmp-file + rename so a mid-write failure
+// (disk full, permission denied) never leaves a half-written file behind.
+function writeFileAtomic(file, content) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = path.join(path.dirname(file), `.spor-mcp-tmp-${process.pid}-${path.basename(file)}`);
+  fs.writeFileSync(tmp, content);
+  try {
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      /* best effort */
+    }
+    throw e;
+  }
+}
+
+// {} when the file is absent; throws a clear error when it exists but can't be
+// read or isn't valid JSON — the caller aborts rather than clobbering it.
+function readJsonStrict(file) {
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (e) {
+    if (e.code === "ENOENT") return {};
+    throw new Error(`can't read ${file}: ${e.message}`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`${file} exists but isn't valid JSON — leaving it untouched`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${file} exists but isn't a JSON object — leaving it untouched`);
+  }
+  return parsed;
+}
+
+function writeMcpJson(spec, scope, dryRun, url) {
+  const target = targetPath(spec, scope);
+  let existing;
+  try {
+    existing = readJsonStrict(target);
+  } catch (e) {
+    err(`spor install --mcp: ${e.message}`);
+    return 1;
+  }
+  const merged = { ...existing };
+  const priorGroup = merged[spec.key];
+  merged[spec.key] = priorGroup && typeof priorGroup === "object" && !Array.isArray(priorGroup) ? { ...priorGroup } : {};
+  merged[spec.key].spor = spec.entry(url);
+  const rendered = JSON.stringify(merged, null, 2) + "\n";
+  if (dryRun) {
+    out(`would write ${target}:`);
+    out(rendered.trimEnd());
+    return 0;
+  }
+  try {
+    writeFileAtomic(target, rendered);
+  } catch (e) {
+    err(`spor install --mcp: could not write ${target}: ${e.message}`);
+    return 1;
+  }
+  out(`wrote MCP config for spor → ${target}`);
+  return 0;
+}
+
+function renderCodexMcpSection(url) {
+  return `[mcp_servers.spor]\nurl = ${tomlString(url)}\nbearer_token_env_var = "SPOR_TOKEN"\n`;
+}
+
+// TOML has no zero-dep parser in this repo, so this doesn't parse the file —
+// it locates our OWN `[mcp_servers.spor]` table by its header line and its
+// own prior content (never hand-authored subtables), strips it, and appends a
+// fresh copy. Everything else in the file survives untouched, which is also
+// what makes a second run byte-identical.
+function writeMcpToml(spec, scope, dryRun, url) {
+  const target = targetPath(spec, scope);
+  let existing = "";
+  try {
+    existing = fs.readFileSync(target, "utf8");
+  } catch (e) {
+    if (e.code !== "ENOENT") {
+      err(`spor install --mcp: can't read ${target}: ${e.message}`);
+      return 1;
+    }
+  }
+  const lines = existing.length ? existing.replace(/\r\n/g, "\n").split("\n") : [];
+  const kept = [];
+  let skip = false;
+  for (const line of lines) {
+    if (/^\[mcp_servers\.spor\]\s*$/.test(line.trim())) {
+      skip = true;
+      continue;
+    }
+    // A dotted subtable of our own section (e.g. a hand-added
+    // `[mcp_servers.spor.env]`) must stay skipped along with its parent — only
+    // a header that ISN'T `mcp_servers.spor` (itself or a subtable) ends the skip.
+    if (skip && /^\[/.test(line.trim()) && !/^\[mcp_servers\.spor(\.|\])/.test(line.trim())) skip = false;
+    if (!skip) kept.push(line);
+  }
+  while (kept.length && kept[kept.length - 1] === "") kept.pop();
+  const prefix = kept.length ? kept.join("\n") + "\n\n" : "";
+  const rendered = prefix + renderCodexMcpSection(url);
+  if (dryRun) {
+    out(`would write ${target}:`);
+    out(rendered.trimEnd());
+    return 0;
+  }
+  try {
+    writeFileAtomic(target, rendered);
+  } catch (e) {
+    err(`spor install --mcp: could not write ${target}: ${e.message}`);
+    return 1;
+  }
+  out(`wrote MCP config for spor → ${target}`);
+  return 0;
+}
+
+function writeMcpConfig(host, scope, dryRun, url) {
+  const spec = MCP_HOSTS[host];
+  if (!spec) return 0;
+  return spec.kind === "toml" ? writeMcpToml(spec, scope, dryRun, url) : writeMcpJson(spec, scope, dryRun, url);
+}
+
 async function cmdInstall(cfg, { values, positionals: pos }) {
   const dryRun = !!(values.print || values["dry-run"]);
   // Node prerequisite (issue-spor-onboarding-no-node-silent-fail-open). The
@@ -5960,6 +6125,13 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
   let hosts = pos.slice();
   if (values.all) hosts = detectHosts();
 
+  // writeAgentsBlock (the --mcp agents-md step below) resolves its server/graph
+  // through scripts/engines/util.js's OWN active-config global, not this cfg
+  // parameter directly — adopt cfg as that global now so it sees the full
+  // cascade (repo .spor org/graph marker, user config.json, --org tenant),
+  // not a raw-env fallback, even when --server/--token isn't passed THIS run.
+  u.setConfig(cfg);
+
   // The "configure" half: persist server/token to user config when given.
   const server = values.server;
   const token = values.token;
@@ -5967,6 +6139,12 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
     try {
       const f = writeServerToken(cfg.userConfigHome(), server, token);
       out(`wrote ${[server && "server", token && "token"].filter(Boolean).join(" + ")} to ${f}`);
+      // Reload so --mcp / the "next:" trailer below see the creds just
+      // written, instead of the pre-write snapshot cfg was constructed from
+      // (Config resolves its cascade once at load time, not per-get).
+      const orgFlag = cfg.flagOrg();
+      cfg = loadConfig({ cwd: process.cwd(), cli: orgFlag ? { org: orgFlag } : undefined });
+      u.setConfig(cfg);
     } catch (e) {
       err(`could not write config: ${e.message}`);
     }
@@ -5975,7 +6153,7 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
   if (!hosts.length) {
     // Discovery mode — show what is installable; touch nothing.
     const found = detectHosts();
-    out("Usage: spor install <host>... [--scope user|repo] [--all] [--print]");
+    out("Usage: spor install <host>... [--scope user|repo] [--all] [--print] [--mcp]");
     out(`Hosts: ${Object.keys(HOSTS).join(", ")}`);
     out(found.length ? `Detected here: ${found.join(", ")}  (try: spor install ${found.join(" ")})` : "No host config dirs detected yet.");
     out("Claude Code: 'spor install claude' wires the plugin via its CLI — no marketplace browsing.");
@@ -5983,6 +6161,22 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
     // so state the requirement up front (issue-spor-onboarding-no-node-silent-fail-open).
     out(`Requires: Node ${nodeFloor() || 20}+ on PATH — currently ${nodeChk.line.replace(/^node:\s*/, "")}`);
     return 0;
+  }
+
+  // --mcp is opt-in auto-write of the per-host MCP server config (v1 only
+  // printed the manual recipe — see MCP_HOSTS above). It needs a resolved
+  // server to point the config at, so fail fast with a clear message rather
+  // than writing a config that points nowhere. Prefer THIS invocation's own
+  // --server (even under --print, where it's never persisted to disk) over
+  // cfg's resolution, so `install <host> --mcp --server <url>` resolves in one
+  // shot without depending on a config reload picking up what was just written.
+  const wantMcp = !!values.mcp;
+  const explicitServer = server ? server.replace(/\/+$/, "") : "";
+  const resolvedServer = explicitServer || remote.base(cfg);
+  const mcpUrl = wantMcp ? `${resolvedServer}/mcp` : "";
+  if (wantMcp && !resolvedServer) {
+    err("spor install --mcp needs a configured server — pass --server/--token (or run 'spor join <token>') first.");
+    return 1;
   }
 
   let rc = 0;
@@ -5993,7 +6187,24 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
     else if (spec.kind === "codex") r = installCodex(scope, dryRun);
     else if (spec.kind === "plugin") r = installPluginHost(spec, scope, dryRun);
     else r = installHookHost(spec, scope, dryRun);
-    if (r !== 0) rc = r;
+    if (r !== 0) {
+      rc = r;
+      continue;
+    }
+    if (wantMcp && MCP_HOSTS[host]) {
+      const mcpRc = writeMcpConfig(host, scope, dryRun, mcpUrl);
+      if (mcpRc !== 0) rc = mcpRc;
+    }
+  }
+
+  if (wantMcp && rc === 0) {
+    if (dryRun) {
+      out("would run: spor-hook agents-md (populates AGENTS.md)");
+    } else {
+      const { writeAgentsBlock } = require(path.join(ROOT, "scripts", "engines", "agents-md.js"));
+      const { file, meta } = await writeAgentsBlock({ cwd: repoRoot(), briefing: true });
+      out(`updated ${file} (${meta || "no briefing yet, MCP pointers only"})`);
+    }
   }
 
   if (!dryRun && rc === 0 && hosts.some((h) => HOSTS[h].kind !== "claude")) {
@@ -6001,7 +6212,12 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
     out("next:");
     if (cfg.mode() === "remote") out(`  remote mode is configured (${remote.base(cfg)}).`);
     else out("  point at a graph:  spor join <token>   (hosted Spor; or 'spor join <url> <token>' / export SPOR_SERVER/SPOR_TOKEN)");
-    out("  distiller backend (hosts without the claude CLI) + on-demand MCP access: see adapters/<host>/README.md");
+    // --mcp only automates the MCP-access half of this reminder (and only for
+    // MCP_HOSTS hosts) — the distiller-backend pointer stays relevant either
+    // way, and a host --mcp doesn't cover (e.g. cursor) still needs the README.
+    out("  distiller backend (hosts without the claude CLI): see adapters/<host>/README.md");
+    const mcpUncovered = hosts.some((h) => HOSTS[h].kind !== "claude" && !(wantMcp && MCP_HOSTS[h]));
+    if (mcpUncovered) out("  on-demand MCP access: see adapters/<host>/README.md" + (wantMcp ? " (--mcp covers codex/gemini/opencode/copilot only)" : ""));
     out("  approve the hooks on first run if the host prompts.");
   }
   return rc;
@@ -8428,7 +8644,13 @@ const COMMANDS = {
       "Wire the spor hooks/plugin into one or more host agents. With no host, lists\n" +
       "the hosts detected on this machine and touches nothing. Claude Code is wired\n" +
       "via its plugin CLI; the others receive a merged hooks manifest.\n\n" +
-      "--server/--token also persist remote-graph credentials to your user config.",
+      "--server/--token also persist remote-graph credentials to your user config.\n\n" +
+      "--mcp additionally auto-writes the per-host MCP server config (codex's\n" +
+      "~/.codex/config.toml [mcp_servers.spor]; gemini/opencode/copilot's JSON\n" +
+      "mcpServers entry) — merged into any existing file, idempotent — and runs\n" +
+      "agents-md to populate AGENTS.md, so one command finishes the setup that\n" +
+      "otherwise needed the manual recipe in each adapter's README. Needs a\n" +
+      "configured server (--server/--token or 'spor join').",
     options: {
       scope: SCOPE_OPT,
       all: { type: "boolean", desc: "install into every detected host" },
@@ -8436,8 +8658,9 @@ const COMMANDS = {
       "dry-run": DRYRUN_OPT,
       server: { type: "string", value: "url", desc: "persist a team-graph server URL to user config" },
       token: { type: "string", value: "tok", desc: "persist an auth token to user config" },
+      mcp: { type: "boolean", desc: "also auto-write per-host MCP config + AGENTS.md (codex/gemini/opencode/copilot)" },
     },
-    examples: ["spor install claude", "spor install codex gemini --scope repo", "spor install --all --print"],
+    examples: ["spor install claude", "spor install codex gemini --scope repo", "spor install --all --print", "spor install codex --mcp"],
     run: (cfg, p) => cmdInstall(cfg, p),
   },
   upgrade: {

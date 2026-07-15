@@ -53,7 +53,8 @@ export SPOR_NUDGE_CMD='gemini --model gemini-2.5-flash'
   to a generic extractor (every nested `.text` string).
 - Hook stdout must be pure JSON on Gemini; `bin/spor-hook.js` already
   discards engine stderr and emits either one JSON object or nothing.
-- For on-demand graph access, add the Spor MCP server to settings:
+- For on-demand graph access, add the Spor MCP server to settings
+  (`spor install gemini --mcp` writes this automatically):
 
   ```json
   { "mcpServers": { "spor": { "httpUrl": "https://spor.example.com/mcp", "headers": { "Authorization": "Bearer $SPOR_TOKEN" } } } }
