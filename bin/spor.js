@@ -6928,10 +6928,32 @@ function createDispatchWorktree(repoDir, name, { setup, slug, nodeId } = {}) {
 
 // Best-effort teardown of a worktree WE just created (setup-hook failure path):
 // never strand a half-prepped worktree + branch. A reused worktree is left
-// untouched (it predates this dispatch).
+// untouched (it predates this dispatch) — the call site checks wt.created
+// before ever calling this.
+//
+// Defense in depth against the issue-spor-orchestrator-cleanup-worktree-leak
+// class of bug (a cleanup routine hard-resetting a DIFFERENT active worktree):
+// this is a destructive removal, so before touching anything it refuses
+// unless (a) `dir` is genuinely a worktree of `repoDir` (its --git-common-dir
+// resolves back to repoDir, the same test inferenceRoot() uses) and (b) it has
+// no uncommitted changes. The one call site today always passes the exact
+// {dir, branch} it just created, so neither check should ever fire in
+// practice — but a future caller mistake, or an external process pointed at
+// the wrong path, must be refused rather than silently forced. Returns
+// { removed: true } or { removed: false, reason }.
 function removeDispatchWorktree(repoDir, dir, branch) {
+  const common = (git(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).stdout || "").trim();
+  const mainCheckout = common ? path.dirname(common) : "";
+  if (!mainCheckout || path.resolve(mainCheckout) !== path.resolve(repoDir)) {
+    return { removed: false, reason: `${dir} is not a worktree of ${repoDir} — refusing to remove` };
+  }
+  const status = git(dir, ["status", "--porcelain"]);
+  if (status.status !== 0 || (status.stdout || "").trim()) {
+    return { removed: false, reason: `${dir} has uncommitted changes — refusing to remove` };
+  }
   git(repoDir, ["worktree", "remove", "--force", dir]);
   if (branch) git(repoDir, ["branch", "-D", branch]);
+  return { removed: true };
 }
 
 // Read the TARGET repo's committable .spor.json for its own dispatch.worktree[
@@ -7702,8 +7724,13 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     if (wt.setupError) {
       err(`dispatch worktree setup hook failed: ${wt.setupError}`);
       if (wt.created) {
-        removeDispatchWorktree(res.dir, wt.dir, wt.branch);
-        err(`  removed the half-prepped worktree ${wt.dir}. Fix dispatch.worktreeSetup or pass --no-worktree.`);
+        const rm = removeDispatchWorktree(res.dir, wt.dir, wt.branch);
+        if (rm.removed) {
+          err(`  removed the half-prepped worktree ${wt.dir}. Fix dispatch.worktreeSetup or pass --no-worktree.`);
+        } else {
+          err(`  could not remove the half-prepped worktree ${wt.dir}: ${rm.reason}`);
+          err(`  clean it up manually, then fix dispatch.worktreeSetup or pass --no-worktree.`);
+        }
       } else {
         err(`  left the reused worktree ${wt.dir} in place. Fix dispatch.worktreeSetup or pass --no-worktree.`);
       }

@@ -832,6 +832,36 @@ test("dispatch worktree setup hook failure: aborts, removes the worktree + branc
   assert.notStrictEqual(branchCheck.status, 0, "branch removed (rev-parse misses)");
 });
 
+// issue-spor-orchestrator-cleanup-worktree-leak: a destructive worktree
+// teardown must never discard uncommitted work, even in this "we just
+// created it" failure path — refuse rather than force past a dirty tree.
+test("dispatch worktree setup hook leaves uncommitted changes then fails: worktree is left in place, not force-removed", () => {
+  const { home } = fixture();
+  const { repo, g } = gitTargetRepo();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const dirtyFailHook = writeSpawnableNodeStub(
+    home,
+    "dirty-fail",
+    'require("node:fs").writeFileSync("uncommitted.txt", "wip"); process.exit(3);'
+  );
+  setDispatch(home, { worktree: true, worktreeSetup: dirtyFailHook });
+  const mark = path.join(home, "launched.mark");
+  const stub = recordingStub(home);
+  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
+  assert.notStrictEqual(r.status, 0, "non-zero exit on setup failure");
+  assert.match(r.stderr, /setup hook failed/);
+  assert.match(r.stderr, /could not remove the half-prepped worktree.*uncommitted changes/s);
+  assert.ok(!fs.existsSync(mark), "agent never launched");
+  const wtDir = path.join(repo, ".claude", "worktrees", "dec-x");
+  assert.ok(fs.existsSync(wtDir), "dirty worktree left in place, not force-removed");
+  assert.ok(fs.existsSync(path.join(wtDir, "uncommitted.txt")), "uncommitted file survives");
+  assert.strictEqual(
+    g(["rev-parse", "--verify", "--quiet", "refs/heads/dec-x"]).trim().length,
+    40,
+    "branch left in place too"
+  );
+});
+
 test("dispatch --backfill --print: worktree forced off even with dispatch.worktree=true", () => {
   const { home, repo } = fixture();
   setDispatch(home, { worktree: true });
