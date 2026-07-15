@@ -2067,6 +2067,114 @@ function changesLocal(cfg, args) {
   return 0;
 }
 
+// program — the birds-eye program/progress view over `blocks` topology
+// (task-spor-cli-program-verb): given a root node other work `blocks` (an
+// umbrella task, a milestone), show the gating tree of everything that blocks
+// it with resolution-derived progress. Dual-mode, but NOT byte-shared like
+// changes/analytics: remote mode dispatches to GET /v1/program/{id} and prints
+// the SERVER's own rendering straight through (like `spor lens`), since
+// render_program's view-tree shape is a separate, private server-side kernel;
+// local mode walks the local graph's inbound `blocks` edges itself
+// (lib/program.js) and renders through its own text renderer. An explicit
+// --nodes names a local checkout, so it always takes the local path even under
+// a server.
+// The naive `args.find((a) => !a.startsWith("--"))` (cmdLens's convention) picks
+// up a PRECEDING flag's bare value as the id whenever that flag takes one — and
+// unlike lens's --format (an enum keyword), this verb's --max-depth/--max-nodes/
+// --nodes all take arbitrary values, so `spor program --nodes <dir> <id>` would
+// silently grab <dir> as the id. Skip each value-taking flag's own value instead.
+const PROGRAM_VALUE_FLAGS = new Set(["max-depth", "max-nodes", "nodes"]);
+function programId(args) {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith("--")) {
+      if (PROGRAM_VALUE_FLAGS.has(a.slice(2))) i++; // skip its value, not just the flag
+      continue;
+    }
+    return a;
+  }
+  return null;
+}
+
+async function cmdProgram(cfg, args) {
+  const id = programId(args);
+  if (!id) {
+    err("usage: spor program <id> [--max-depth <n>] [--max-nodes <n>] [--json]");
+    return 1;
+  }
+  if (cfg.mode() === "remote" && !namesLocalGraph(args)) {
+    return await programRemote(cfg, id, args);
+  }
+  return programLocal(cfg, id, args);
+}
+
+// The remote arm: GET /v1/program/{id}, format=json for --json else format=text,
+// and print the server's own body verbatim — no local re-rendering, since the
+// server's view-tree shape belongs to its own (separate) kernel.
+async function programRemote(cfg, id, args) {
+  const wantJson = args.includes("--json");
+  const depth = optVal(args, "max-depth");
+  const maxNodes = optVal(args, "max-nodes");
+  const qs = new URLSearchParams();
+  qs.set("format", wantJson ? "json" : "text");
+  if (depth != null) qs.set("depth", depth);
+  if (maxNodes != null) qs.set("max_nodes", maxNodes);
+  const r = await remote.get(cfg, `/v1/program/${encodeURIComponent(id)}?${qs.toString()}`, { timeoutMs: 10000 });
+  if (r.transport) {
+    err(`offline — could not reach server (${r.error})`);
+    return 1;
+  }
+  if (r.status === 404) {
+    err(`program: unknown root '${id}'`);
+    return 1;
+  }
+  if (!r.ok) {
+    const msg = r.json && r.json.error && r.json.error.message;
+    err(`program error ${r.status}${msg ? `: ${msg}` : ""}`);
+    return 1;
+  }
+  out(wantJson ? (r.json != null ? JSON.stringify(r.json) : r.text || "") : r.text != null ? r.text : "");
+  return 0;
+}
+
+// The local arm: the `blocks`-edge gating-tree walk over the local nodes dir
+// (lib/program.js). --nodes overrides the resolved home; --json stamps
+// generated_at (the kernel stays time-free for deterministic tests). An
+// unknown root exits 1 with the same message the remote 404 arm uses.
+// A non-numeric --max-depth/--max-nodes value must fall back to the kernel's
+// own default, not flow through as NaN — `depth >= NaN` is always false, which
+// would silently DISABLE the cap instead of erroring or defaulting.
+function numOpt(args, name) {
+  const v = optVal(args, name);
+  if (v == null || v.trim() === "") return undefined; // Number("") is 0, not NaN — guard it explicitly
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? n : undefined; // negative bounds are nonsensical here too
+}
+
+function programLocal(cfg, id, args) {
+  const programLib = require(path.join(ROOT, "lib", "program.js"));
+  const nodesDir = optVal(args, "nodes") || cfg.nodesDir();
+  const envelope = programLib.collect({
+    nodesDir,
+    rootId: id,
+    maxDepth: numOpt(args, "max-depth"),
+    maxNodes: numOpt(args, "max-nodes"),
+  });
+  if (envelope.found === false) {
+    // Errors stay plain text regardless of --json, matching every other verb's
+    // error path (changes/analytics/lens) and the remote arm's own 404 branch —
+    // --json only shapes the SUCCESS envelope.
+    err(`program: unknown root '${id}'`);
+    return 1;
+  }
+  if (args.includes("--json")) {
+    out(JSON.stringify({ ...envelope, generated_at: new Date().toISOString() }, null, 2));
+    return 0;
+  }
+  out(programLib.renderReport(envelope));
+  return 0;
+}
+
 // --- spor export: the nodes/ tarball (GET /v1/export) -----------------------
 // (task-spor-export-cli-verb) The shell front-door for /v1/export — the ustar
 // tarball of nodes/ used to seed a local read replica or bootstrap a fresh
@@ -8817,6 +8925,40 @@ const COMMANDS = {
       "spor changes --limit 20 --json",
     ],
     run: (cfg, args) => cmdChanges(cfg, args),
+  },
+  program: {
+    group: "Graph", parse: "raw", args: "<id> [--max-depth N] [--max-nodes N] [--json]",
+    summary: "birds-eye program/progress view over blocks topology",
+    help:
+      "Show the program/progress view for a workstream: given a root node other\n" +
+      "work `blocks` (an umbrella task, a milestone), the gating tree of everything\n" +
+      "that blocks it — transitively over inbound `blocks` edges — with resolution-\n" +
+      "derived progress. `next` answers \"what's next\"; `program` answers \"how far\n" +
+      "along is the whole thing\". The shell front-door for the render_program MCP\n" +
+      "tool / GET /v1/program/{id} (API.md §3).\n" +
+      "\n" +
+      "A node is `done` when a live resolves/answers edge, a terminal status, or\n" +
+      "supersession retires it (even while the status field lags); `blocked` when a\n" +
+      "live node has its own unresolved live blocker; otherwise `active` (status:\n" +
+      "active) or `open`. Remote mode dispatches to GET /v1/program/{id} and prints\n" +
+      "the server's own rendering straight through; local mode walks the local\n" +
+      "graph's `blocks` edges itself. A shared blocker renders once per occurrence\n" +
+      "but counts once in the totals; an unknown root is an error. A root nothing\n" +
+      "blocks is a successful empty result — add `blocks` edges from the gating\n" +
+      "tasks to model the program (see /spor:spor \"Grouping work under an umbrella\n" +
+      "node\").\n" +
+      "\n" +
+      "  <id>              the root node id (an umbrella task, a milestone)\n" +
+      "  --max-depth <N>   bound how many `blocks` hops out from the root are walked\n" +
+      "  --max-nodes <N>   bound the total distinct nodes visited\n" +
+      "  --json            machine-readable envelope\n" +
+      "  --nodes <dir>     read this local graph dir instead of the resolved home",
+    examples: [
+      "spor program task-platform-hardening-program",
+      "spor program task-platform-hardening-program --max-depth 3",
+      "spor program task-platform-hardening-program --json",
+    ],
+    run: (cfg, args) => cmdProgram(cfg, args),
   },
   check: {
     group: "Graph", parse: "raw", args: "[--staged|--range <a..b>|--files <f...>] [--strict] [--json]",
