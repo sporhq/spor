@@ -460,6 +460,41 @@ test("a stale path carrying an uncommitted chmod +x is refused — the mode ride
   assert.equal(read(dir, "run.sh"), "v0\n", "and the file is left alone entirely");
 });
 
+// core.fileMode=false is the Windows default, and it means git ignores the exec
+// bit entirely: it never reports a chmod as a modification and keeps the mode the
+// index recorded. Reading the bit off disk there invents a difference git does not
+// see — a committed 100755 script checks out as 0644, matches no ancestor, and
+// reads as novel work. Every exec file a merge touched would wedge the sync.
+test("with core.fileMode=false the exec bit is not evidence, so a stale path still heals", () => {
+  const dir = initRepo();
+  write(dir, "run.sh", "v0\n");
+  fs.chmodSync(path.join(dir, "run.sh"), 0o755);
+  commit(dir, "init"); // committed as 100755
+  git(dir, "config", "core.fileMode", "false");
+  casAdvance(dir, () => write(dir, "run.sh", "v1\n"));
+  fs.chmodSync(path.join(dir, "run.sh"), 0o644); // the filesystem "loses" the bit
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "HEALED");
+  assert.equal(r.status, 0);
+  assert.equal(read(dir, "run.sh"), "v1\n");
+});
+
+test("with core.fileMode honored, a stale path whose mode also differs is refused", () => {
+  if (process.platform === "win32") return; // the filesystem cannot honor it there
+  const dir = initRepo();
+  write(dir, "run.sh", "v0\n");
+  commit(dir, "init"); // committed as 100644
+  git(dir, "config", "core.fileMode", "true");
+  casAdvance(dir, () => write(dir, "run.sh", "v1\n"));
+  fs.chmodSync(path.join(dir, "run.sh"), 0o755); // an uncommitted chmod, which git DOES see here
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "ROOT-UNSYNCED");
+  assert.equal(r.status, 1);
+  assert.equal(fs.statSync(path.join(dir, "run.sh")).mode & 0o111, 0o111);
+});
+
 test("a tracked file swapped for a symlink (typechange) is refused", () => {
   if (process.platform === "win32") return; // symlinks need privilege there
   const dir = initRepo();

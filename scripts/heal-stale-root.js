@@ -205,6 +205,12 @@ function same(a, b) {
 
 const isEmptyBlob = (s) => s !== ABSENT && s !== UNKNOWN && s.sha === EMPTY_BLOB;
 
+// The mode of a state, or undefined when there is no state to have one (a path
+// that is ABSENT or unreadable). Both are real cases for a stale path — a file
+// the merge ADDED is absent from the stale tree — so no call site may assume
+// a state object is there to dereference.
+const modeOf = (s) => (s === ABSENT || s === UNKNOWN ? undefined : s.mode);
+
 // ---------- probes ----------
 
 // A merge/rebase/cherry-pick/bisect in progress means the modifications on disk
@@ -292,8 +298,22 @@ function indexState(repo, paths) {
   return { state, unmerged };
 }
 
+// Does this checkout's filesystem carry the exec bit? On Windows — and on any
+// repo configured core.fileMode=false — it does not, and git ignores the bit
+// entirely: it never reports a chmod as a modification and keeps whatever mode
+// the index recorded. Reading the mode off disk there would invent a difference
+// git does not see (a 100755 script checks out as 0644, and every exec file a
+// merge touched would read as novel and wedge the sync forever). So mode is
+// evidence exactly where git treats it as evidence, and nowhere else.
+function fileModeHonored(repo) {
+  const v = git(repo, ['config', '--get', 'core.fileMode']);
+  return v === null ? true : v.trim() !== 'false'; // unset defaults to true
+}
+
 // The working tree's (mode, blob) for a path, as git itself would record it.
-function worktreeState(repo, p) {
+// `recordedMode` is the mode git would keep for a regular file when it is not
+// honoring the filesystem's exec bit (the index's, falling back to HEAD's).
+function worktreeState(repo, p, honorMode = true, recordedMode) {
   let st;
   try {
     st = fs.lstatSync(path.resolve(repo, p));
@@ -321,7 +341,10 @@ function worktreeState(repo, p) {
   // to a committed blob rather than to the raw bytes on disk.
   const out = git(repo, ['hash-object', '--path', p, '--', p]);
   if (out === null) return UNKNOWN; // unreadable file: present, uninspectable
-  return at(st.mode & 0o111 ? '100755' : '100644', out.trim());
+  const mode = honorMode
+    ? (st.mode & 0o111 ? '100755' : '100644')
+    : recordedMode || '100644'; // git keeps the recorded mode; so do we
+  return at(mode, out.trim());
 }
 
 // ---------- classification ----------
@@ -340,7 +363,7 @@ function behindOrHead(value, head, p, ancestors) {
   return null;
 }
 
-function classify(repo, entry, headState, idx, ancestors) {
+function classify(repo, entry, headState, idx, ancestors, honorMode) {
   const { path: p, xy } = entry;
 
   // An unresolved conflict holds its other side ONLY in the index's higher
@@ -368,7 +391,7 @@ function classify(repo, entry, headState, idx, ancestors) {
   if (idxAt === null) {
     return { verdict: 'wip', why: 'the index holds a state committed neither at HEAD nor in its recent ancestry' };
   }
-  const cur = worktreeState(repo, p);
+  const cur = worktreeState(repo, p, honorMode, modeOf(idxNow) || modeOf(head));
   const curAt = behindOrHead(cur, head, p, ancestors);
   if (curAt === null) {
     return { verdict: 'wip', why: 'the working tree holds a state committed neither at HEAD nor in its recent ancestry' };
@@ -400,7 +423,7 @@ function commonBase(stale, ancestry) {
 // held when they were cleared. Anything that moved goes to `raced` as WIP — it
 // narrows the classify→checkout window to one probe, which is the best a tool can
 // do over a tree it does not lock.
-function recheck(repo, stale, raced) {
+function recheck(repo, stale, raced, honorMode) {
   const idx = indexState(repo, stale.map((s) => s.path));
   if (idx === null) usage('cannot re-read the index before healing');
   const fresh = [];
@@ -411,7 +434,8 @@ function recheck(repo, stale, raced) {
     const now = idx.unmerged.has(s.path)
       ? UNKNOWN
       : idx.state.has(s.path) ? idx.state.get(s.path) : ABSENT;
-    if (same(worktreeState(repo, s.path), s.cur) && same(now, s.idx)) fresh.push(s);
+    const cur = worktreeState(repo, s.path, honorMode, modeOf(now) || modeOf(s.cur));
+    if (same(cur, s.cur) && same(now, s.idx)) fresh.push(s);
     else raced.push({ path: s.path, why: 'it changed while this run was classifying — another job is writing here' });
   }
   return fresh;
@@ -438,6 +462,7 @@ function main() {
   // collapsed to "nothing modified" would report IN-SYNC/exit 0 — which licenses
   // the caller to `git reset --hard main` over whatever is actually there. This is
   // the single most load-bearing probe in the tool; it must fail like the rest.
+  const honorMode = fileModeHonored(repo);
   const entries = trackedModified(repo);
   if (entries === null) usage('cannot read git status — refusing to classify');
   if (entries.length === 0) {
@@ -464,7 +489,7 @@ function main() {
   let stale = [];
   const wip = [];
   for (const e of entries) {
-    const c = classify(repo, e, headState, idx, ancestors);
+    const c = classify(repo, e, headState, idx, ancestors, honorMode);
     if (c.verdict === 'stale') stale.push({ path: e.path, base: c.base, cur: c.cur, idx: c.idx, why: c.why });
     else wip.push({ path: e.path, why: c.why });
   }
@@ -475,7 +500,7 @@ function main() {
     // SHARED root that other jobs write to. A path that moved under us in that
     // window is not the path we cleared, so it loses its clearance.
     const raced = [];
-    stale = recheck(repo, stale, raced);
+    stale = recheck(repo, stale, raced, honorMode);
     const known = wip.concat(raced);
     const base = commonBase(stale, ancestry);
     let failed = false;
