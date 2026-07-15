@@ -154,6 +154,12 @@ function parseArgs(argv) {
 
 // ---------- git ----------
 
+// Set once the heal has written anything. After that, exit 2 is a lie — the
+// header promises it means "nothing was modified" — so even a git that will not
+// launch (EAGAIN on a loaded box running five agents) has to leave through a
+// reported verdict.
+let hasWritten = false;
+
 // Returns stdout, or null when git exits non-zero. No caller reads null as an
 // answer: it means "we could not look", which lands on WIP or an exit.
 function git(repo, args, input) {
@@ -164,6 +170,7 @@ function git(repo, args, input) {
   });
   if (r.error) {
     process.stderr.write(`heal-stale-root: cannot run git: ${r.error.message}\n`);
+    if (hasWritten) return null; // the caller reports; it knows what it wrote
     process.exit(2);
   }
   return r.status === 0 ? r.stdout : null;
@@ -298,22 +305,33 @@ function indexState(repo, paths) {
   return { state, unmerged };
 }
 
-// Does this checkout's filesystem carry the exec bit? On Windows — and on any
-// repo configured core.fileMode=false — it does not, and git ignores the bit
-// entirely: it never reports a chmod as a modification and keeps whatever mode
-// the index recorded. Reading the mode off disk there would invent a difference
-// git does not see (a 100755 script checks out as 0644, and every exec file a
-// merge touched would read as novel and wedge the sync forever). So mode is
-// evidence exactly where git treats it as evidence, and nowhere else.
-function fileModeHonored(repo) {
-  const v = git(repo, ['config', '--get', 'core.fileMode']);
-  return v === null ? true : v.trim() !== 'false'; // unset defaults to true
+// What can this checkout's filesystem actually represent? Two git settings say,
+// and both default to FALSE on Windows — the platform this plugin supports
+// natively:
+//   core.fileMode  false → git ignores the exec bit and keeps the recorded mode
+//   core.symlinks  false → git materializes a tracked symlink as a plain file
+//                          holding the target path, and keeps mode 120000
+// Deriving either off disk where git does not would invent a difference git
+// cannot see — a 100755 script reads as 0644, a 120000 link reads as a 100644
+// file — so every such path a merge touched would look novel and wedge the sync
+// forever. Mode is evidence exactly where git treats it as evidence.
+//
+// --type=bool because git accepts 0/off/no/FALSE/'' for false, not just the
+// literal spelling, and git resolves all of them; a string compare would honor a
+// bit git is ignoring.
+function boolConfig(repo, key, dflt) {
+  const v = git(repo, ['config', '--type=bool', '--get', key]);
+  return v === null ? dflt : v.trim() !== 'false'; // unset (exit 1) → the default
 }
+const fsCapabilities = (repo) => ({
+  fileMode: boolConfig(repo, 'core.fileMode', true),
+  symlinks: boolConfig(repo, 'core.symlinks', true),
+});
 
 // The working tree's (mode, blob) for a path, as git itself would record it.
-// `recordedMode` is the mode git would keep for a regular file when it is not
-// honoring the filesystem's exec bit (the index's, falling back to HEAD's).
-function worktreeState(repo, p, honorMode = true, recordedMode) {
+// `recordedMode` is the mode git keeps when the filesystem cannot represent the
+// real one (the index's, falling back to HEAD's).
+function worktreeState(repo, p, fsCaps, recordedMode) {
   let st;
   try {
     st = fs.lstatSync(path.resolve(repo, p));
@@ -341,9 +359,20 @@ function worktreeState(repo, p, honorMode = true, recordedMode) {
   // to a committed blob rather than to the raw bytes on disk.
   const out = git(repo, ['hash-object', '--path', p, '--', p]);
   if (out === null) return UNKNOWN; // unreadable file: present, uninspectable
-  const mode = honorMode
-    ? (st.mode & 0o111 ? '100755' : '100644')
-    : recordedMode || '100644'; // git keeps the recorded mode; so do we
+  let mode;
+  if (!fsCaps.symlinks && recordedMode === '120000') {
+    // A checked-out symlink on a filesystem without them: a plain file holding
+    // the target path, which is byte-identical to what git stored, so only the
+    // mode needs restoring from the record.
+    mode = '120000';
+  } else if (!fsCaps.fileMode) {
+    mode = recordedMode || '100644'; // git keeps the recorded mode; so do we
+  } else {
+    // git reads the OWNER exec bit alone (S_IXUSR). Masking 0o111 would call a
+    // group-exec-only file 100755 while git records 100644, and that invented
+    // difference refuses a healable path.
+    mode = st.mode & 0o100 ? '100755' : '100644';
+  }
   return at(mode, out.trim());
 }
 
@@ -363,7 +392,7 @@ function behindOrHead(value, head, p, ancestors) {
   return null;
 }
 
-function classify(repo, entry, headState, idx, ancestors, honorMode) {
+function classify(repo, entry, headState, idx, ancestors, fsCaps) {
   const { path: p, xy } = entry;
 
   // An unresolved conflict holds its other side ONLY in the index's higher
@@ -391,7 +420,7 @@ function classify(repo, entry, headState, idx, ancestors, honorMode) {
   if (idxAt === null) {
     return { verdict: 'wip', why: 'the index holds a state committed neither at HEAD nor in its recent ancestry' };
   }
-  const cur = worktreeState(repo, p, honorMode, modeOf(idxNow) || modeOf(head));
+  const cur = worktreeState(repo, p, fsCaps, modeOf(idxNow) || modeOf(head));
   const curAt = behindOrHead(cur, head, p, ancestors);
   if (curAt === null) {
     return { verdict: 'wip', why: 'the working tree holds a state committed neither at HEAD nor in its recent ancestry' };
@@ -423,7 +452,7 @@ function commonBase(stale, ancestry) {
 // held when they were cleared. Anything that moved goes to `raced` as WIP — it
 // narrows the classify→checkout window to one probe, which is the best a tool can
 // do over a tree it does not lock.
-function recheck(repo, stale, raced, honorMode) {
+function recheck(repo, stale, raced, fsCaps) {
   const idx = indexState(repo, stale.map((s) => s.path));
   if (idx === null) usage('cannot re-read the index before healing');
   const fresh = [];
@@ -434,7 +463,7 @@ function recheck(repo, stale, raced, honorMode) {
     const now = idx.unmerged.has(s.path)
       ? UNKNOWN
       : idx.state.has(s.path) ? idx.state.get(s.path) : ABSENT;
-    const cur = worktreeState(repo, s.path, honorMode, modeOf(now) || modeOf(s.cur));
+    const cur = worktreeState(repo, s.path, fsCaps, modeOf(now) || modeOf(s.cur));
     if (same(cur, s.cur) && same(now, s.idx)) fresh.push(s);
     else raced.push({ path: s.path, why: 'it changed while this run was classifying — another job is writing here' });
   }
@@ -462,7 +491,7 @@ function main() {
   // collapsed to "nothing modified" would report IN-SYNC/exit 0 — which licenses
   // the caller to `git reset --hard main` over whatever is actually there. This is
   // the single most load-bearing probe in the tool; it must fail like the rest.
-  const honorMode = fileModeHonored(repo);
+  const fsCaps = fsCapabilities(repo);
   const entries = trackedModified(repo);
   if (entries === null) usage('cannot read git status — refusing to classify');
   if (entries.length === 0) {
@@ -489,7 +518,7 @@ function main() {
   let stale = [];
   const wip = [];
   for (const e of entries) {
-    const c = classify(repo, e, headState, idx, ancestors, honorMode);
+    const c = classify(repo, e, headState, idx, ancestors, fsCaps);
     if (c.verdict === 'stale') stale.push({ path: e.path, base: c.base, cur: c.cur, idx: c.idx, why: c.why });
     else wip.push({ path: e.path, why: c.why });
   }
@@ -500,11 +529,12 @@ function main() {
     // SHARED root that other jobs write to. A path that moved under us in that
     // window is not the path we cleared, so it loses its clearance.
     const raced = [];
-    stale = recheck(repo, stale, raced, honorMode);
+    stale = recheck(repo, stale, raced, fsCaps);
     const known = wip.concat(raced);
     const base = commonBase(stale, ancestry);
     let failed = false;
     for (const chunk of chunks(stale.map((s) => s.path), 200)) {
+      hasWritten = true; // git may write some entries before it reports failure
       if (git(repo, ['checkout', head, '--', ...chunk.map(spec)]) === null) {
         process.stderr.write('heal-stale-root: git checkout failed; root left partially healed\n');
         failed = true;
@@ -521,9 +551,11 @@ function main() {
       // The heal already wrote. Exiting 2 through usage() here would print a
       // usage banner and no report, telling a caller "you invoked me wrong" about
       // a run that mutated the shared root — and handing a --json consumer an
-      // empty stdout to parse. Report what was attempted instead.
+      // empty stdout to parse. Report what was attempted instead: `attempted`, not
+      // `healed`, because which of them landed is exactly what we cannot say.
       report(opts, {
         verdict: 'UNVERIFIED', head, base, stale, wip: known, healed: [],
+        attempted: stale.map((s) => s.path),
         note: 'the heal ran but git status could not be re-read, so what landed is unknown',
       }, 1);
     }
@@ -532,10 +564,14 @@ function main() {
       path: e.path,
       why: (known.find((w) => w.path === e.path) || {}).why || `still modified after the heal (${e.xy})`,
     }));
+    // A checkout that failed leaves the run unable to claim the root is synced,
+    // even if what remains looks clean — the verdict and the exit code have to say
+    // the same thing, or the caller reads HEALED and resets on the strength of it.
+    const synced = left.length === 0 && !failed;
     report(
       opts,
-      { verdict: left.length === 0 ? 'HEALED' : 'ROOT-UNSYNCED', head, base, stale, wip: stillWip, healed },
-      left.length === 0 && !failed ? 0 : 1
+      { verdict: synced ? 'HEALED' : 'ROOT-UNSYNCED', head, base, stale, wip: stillWip, healed },
+      synced ? 0 : 1
     );
   }
 

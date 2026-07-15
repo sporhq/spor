@@ -480,6 +480,65 @@ test("with core.fileMode=false the exec bit is not evidence, so a stale path sti
   assert.equal(read(dir, "run.sh"), "v1\n");
 });
 
+// git accepts 0/off/no/FALSE/'' for false, not just the literal spelling, and it
+// resolves every one of them. A string compare against "false" honors an exec bit
+// git is ignoring — the wedge above, re-opened for four spellings out of five.
+for (const spelling of ["0", "off", "no", "FALSE"]) {
+  test(`core.fileMode=${spelling} is false too, so a stale exec file still heals`, () => {
+    const dir = initRepo();
+    write(dir, "run.sh", "v0\n");
+    fs.chmodSync(path.join(dir, "run.sh"), 0o755);
+    commit(dir, "init");
+    git(dir, "config", "core.fileMode", spelling);
+    casAdvance(dir, () => write(dir, "run.sh", "v1\n"));
+    fs.chmodSync(path.join(dir, "run.sh"), 0o644);
+
+    const r = runJson(dir, "--apply");
+    assert.equal(r.json.verdict, "HEALED");
+    assert.equal(r.status, 0);
+  });
+}
+
+// git records 100755 off the OWNER exec bit alone (S_IXUSR). A 0o111 mask calls a
+// group-exec-only file 100755 while git records 100644 — an invented difference
+// that refuses a healable path.
+test("a group-exec-only file is not 100755 — git reads the owner bit, so we do", () => {
+  if (process.platform === "win32") return;
+  const dir = initRepo();
+  write(dir, "f.sh", "v0\n");
+  commit(dir, "init"); // 0644 -> git records 100644
+  casAdvance(dir, () => write(dir, "f.sh", "v1\n"));
+  fs.chmodSync(path.join(dir, "f.sh"), 0o654); // group-exec on, owner-exec off
+  assert.match(git(dir, "ls-files", "-s", "f.sh"), /^100644 /, "git still records 100644");
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "HEALED", "the path is stale and git sees no mode change");
+  assert.equal(r.status, 0);
+});
+
+// core.symlinks=false is the Windows default without Developer Mode: git
+// materializes a tracked symlink as a PLAIN FILE holding the target path, while
+// still recording mode 120000. Deriving 100644 from disk refuses it forever.
+test("with core.symlinks=false a checked-out symlink is a plain file, and still heals", () => {
+  const dir = initRepo();
+  write(dir, "target.txt", "a\n");
+  write(dir, "other.txt", "b\n");
+  fs.symlinkSync("target.txt", path.join(dir, "link"));
+  commit(dir, "init");
+  casAdvance(dir, () => {
+    fs.unlinkSync(path.join(dir, "link"));
+    fs.symlinkSync("other.txt", path.join(dir, "link"));
+  });
+  git(dir, "config", "core.symlinks", "false");
+  fs.unlinkSync(path.join(dir, "link"));
+  fs.writeFileSync(path.join(dir, "link"), "target.txt"); // the blob git stored, as a file
+  assert.equal(fs.lstatSync(path.join(dir, "link")).isSymbolicLink(), false, "the fixture is a plain file");
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "HEALED");
+  assert.equal(r.status, 0);
+});
+
 test("with core.fileMode honored, a stale path whose mode also differs is refused", () => {
   if (process.platform === "win32") return; // the filesystem cannot honor it there
   const dir = initRepo();
