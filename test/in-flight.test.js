@@ -170,7 +170,14 @@ function queueStubServer(items) {
   const srv = http.createServer((req, res) => {
     if (req.method === "GET" && /^\/v1\/queue\?/.test(req.url)) {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ items, count: items.length }));
+      res.end(JSON.stringify({
+        items,
+        count: items.length,
+        total_count: items.length,
+        returned_count: items.length,
+        truncated: false,
+        next_offset: null,
+      }));
       return;
     }
     res.writeHead(404, { "content-type": "application/json" });
@@ -212,6 +219,27 @@ test("remote next --json --hide-dispatched drops in-flight items and decrements 
     assert.deepStrictEqual(q.items.map((it) => it.id), ["task-b"]);
     assert.strictEqual(q.hidden_dispatched, 1);
     assert.strictEqual(q.count, 1);
+  } finally {
+    srv.close();
+  }
+});
+
+// task-spor-next-pagination-metadata-coherence: --hide-dispatched shrinks
+// .items below whatever the (possibly multi-page) assembly produced, so
+// returned_count must shrink with it too or it stops matching q.items.length
+// in the payload actually handed to the caller — the same coherence bug this
+// task fixed for pagination, surfacing via a different code path.
+test("remote next --json --hide-dispatched decrements returned_count to match the hidden-adjusted items", async () => {
+  const items = [
+    { id: "task-a", score: 1, suggest: "do", why: "queueable" },
+    { id: "task-b", score: 0.5, suggest: "do", why: "queueable" },
+  ];
+  const { srv, base } = await queueStubServer(items);
+  try {
+    const r = await runAsync(["next", "--json", "--hide-dispatched"], { SPOR_SERVER: base, SPOR_TOKEN: "t", SPOR_FAKE_AGENTS_JSON: AGENTS() });
+    const q = JSON.parse(r.stdout);
+    assert.strictEqual(q.items.length, 1);
+    assert.strictEqual(q.returned_count, 1, "returned_count matches the hidden-adjusted item count");
   } finally {
     srv.close();
   }

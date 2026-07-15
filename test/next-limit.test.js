@@ -196,3 +196,57 @@ test("remote next --limit N human render reports the overflow with the --limit 0
     srv.close();
   }
 });
+
+// ---- pagination metadata coherence (task-spor-next-pagination-metadata-coherence) ----
+// The assembled JSON envelope must describe the FULL assembled result, not just
+// the first page fetched: returned_count/truncated/next_offset need to match
+// items.length / whether anything remains beyond it, not whatever the first
+// <=100-item page happened to say.
+
+test("remote next --limit 0 with >100 items reports coherent metadata for the FULL assembly", async () => {
+  // Default server page cap (100): a 105-item queue takes 2 pages to assemble.
+  const { srv, base } = await pagingStub(mkItems(105));
+  try {
+    const r = await runAsync(["next", "--limit", "0", "--json"], { SPOR_SERVER: base, SPOR_TOKEN: "t", SPOR_FAKE_AGENTS_JSON: "[]" });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const q = JSON.parse(r.stdout);
+    assert.strictEqual(q.items.length, 105, "every item assembled");
+    assert.strictEqual(q.returned_count, 105, "returned_count matches the assembled item count, not the first page's 100");
+    assert.strictEqual(q.truncated, false, "nothing remains once all 105 are assembled");
+    assert.strictEqual(q.next_offset, null, "no further page to walk");
+  } finally {
+    srv.close();
+  }
+});
+
+test("remote next --limit N>100 reports coherent metadata when more items remain beyond N", async () => {
+  // 200 items total, --limit 150: assembled across 2 pages (100 + 50), 50 more remain.
+  const { srv, base } = await pagingStub(mkItems(200));
+  try {
+    const r = await runAsync(["next", "--limit", "150", "--json"], { SPOR_SERVER: base, SPOR_TOKEN: "t", SPOR_FAKE_AGENTS_JSON: "[]" });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const q = JSON.parse(r.stdout);
+    assert.strictEqual(q.items.length, 150);
+    assert.strictEqual(q.returned_count, 150, "returned_count matches the requested 150, not the first page's 100");
+    assert.strictEqual(q.truncated, true, "50 items remain beyond the requested 150");
+    assert.strictEqual(q.next_offset, 150, "next_offset resumes right after the assembled slice");
+  } finally {
+    srv.close();
+  }
+});
+
+test("remote next --limit N assembled across pages with nothing left reports truncated:false", async () => {
+  // 150 items total, --limit 150 exactly exhausts the queue across 2 pages.
+  const { srv, base } = await pagingStub(mkItems(150));
+  try {
+    const r = await runAsync(["next", "--limit", "150", "--json"], { SPOR_SERVER: base, SPOR_TOKEN: "t", SPOR_FAKE_AGENTS_JSON: "[]" });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const q = JSON.parse(r.stdout);
+    assert.strictEqual(q.items.length, 150);
+    assert.strictEqual(q.returned_count, 150);
+    assert.strictEqual(q.truncated, false, "the 150th item was the last item in the queue");
+    assert.strictEqual(q.next_offset, null);
+  } finally {
+    srv.close();
+  }
+});
