@@ -212,6 +212,53 @@ async function sessionEndLease({ graph, slug, session, cwd, remote }) {
   await Promise.all([...ids].map(convert));
 }
 
+// task-spor-distill-conditional-status-fetch: the fact-finder's dedup index
+// used to re-download the full titles snapshot from /v1/status?titles=1
+// (5-15MB) on every sweep. The server now serves conditional-request
+// semantics there (a weak ETag + a bodyless 304 on a matching
+// If-None-Match, task-cc-tier-2-read-path-scaling) -- this caches the last
+// snapshot alongside its ETag (per server, since one machine can point at
+// different graph homes over time) so a synced graph collapses to a 304 and
+// reuses the cached titles instead. Machine-local runtime state, so it lives
+// under cache/ like the coupling-nudge snapshot (GRAPH_IGNORES).
+function statusTitlesCacheFile(graph) {
+  return path.join(graph, "cache", "status-titles.json");
+}
+async function fetchRemoteTitleIndex(graph, rlog) {
+  const server = u.serverBase();
+  const cacheFile = statusTitlesCacheFile(graph);
+  let cached = null;
+  try {
+    const c = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+    if (c && c.server === server && typeof c.etag === "string" && typeof c.index === "string") cached = c;
+  } catch {}
+  const headers = { ...u.bearer() };
+  if (cached) headers["If-None-Match"] = cached.etag;
+  const resp = await u.curl(`${server}/v1/status?titles=1`, { headers, timeoutMs: 6000 });
+  const head = resp.headers?.["x-substrate-head"] || "";
+  if (resp.http === "304" && cached) {
+    rlog(`index cached (http=304, head=${head})`);
+    return cached.index;
+  }
+  if (resp.http === "200") {
+    const index = u.remoteTitleIndex(resp.body);
+    const etag = resp.headers?.etag;
+    if (etag && u.ensureDir(path.join(graph, "cache"))) {
+      try {
+        fs.writeFileSync(cacheFile, JSON.stringify({ v: 1, server, etag, index, head }));
+      } catch {}
+    }
+    rlog(`index fetched (http=${resp.http})`);
+    return index;
+  }
+  // Stale beats none (the cached-title-index rule, see post-tool.js coupling
+  // nudge): a failed refresh distills against last sweep's snapshot instead
+  // of an empty one, whether the failure is a transport error or an
+  // unexpected status.
+  rlog(`index fetch failed (http=${resp.http}); distilling against ${cached ? "cached" : "empty"} index`);
+  return cached ? cached.index : "";
+}
+
 async function distill(input) {
   if (process.env.SPOR_DISTILLING || process.env.SUBSTRATE_DISTILLING) return null;
 
@@ -293,19 +340,13 @@ async function distill(input) {
     touched = [...new Set(vals)].sort().slice(0, 30).join("\n");
   } catch {}
 
-  // Graph index: locally from node files, remotely from /v1/status?titles=1.
+  // Graph index: locally from node files, remotely from /v1/status?titles=1,
+  // revalidated against a cached ETag so a synced graph collapses the 5-15MB
+  // titles download to a bodyless 304
+  // (task-spor-distill-conditional-status-fetch, task-cc-tier-2-read-path-scaling).
   let index = "";
   if (remote) {
-    const resp = await u.curl(`${u.serverBase()}/v1/status?titles=1`, {
-      headers: u.bearer(),
-      timeoutMs: 6000,
-    });
-    if (resp.http === "200") {
-      index = u.remoteTitleIndex(resp.body);
-      rlog(`index fetched (http=${resp.http})`);
-    } else {
-      rlog(`index fetch failed (http=${resp.http}); distilling against empty index`);
-    }
+    index = await fetchRemoteTitleIndex(graph, rlog);
   } else {
     index = u.localTitleIndex(nodes);
   }

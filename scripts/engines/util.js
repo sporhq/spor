@@ -1166,12 +1166,15 @@ function backoffMs(attempt, retryAfterMs, capMs) {
   return Math.min(base, capMs);
 }
 
-// curl-shaped HTTP: resolves to {http: "200", body: "..."} with "000" on any
-// transport failure (timeout, refused, DNS). Never throws. Like bare curl,
-// redirects are not followed. Transient failures (transport, 429, 5xx) are
-// retried up to `retry` times; between retries we honor a 429 Retry-After
-// header and otherwise back off exponentially (capped at backoffCapMs). With
-// retry=0 (the session-start hook budget) no backoff ever runs.
+// curl-shaped HTTP: resolves to {http: "200", body: "...", headers: {...}}
+// with "000" on any transport failure (timeout, refused, DNS). Never throws.
+// `headers` is a plain lowercased-key object (fetch's Headers normalizes
+// names on iteration) — absent (undefined) on transport failure, since there
+// is no response to read it from. Like bare curl, redirects are not
+// followed. Transient failures (transport, 429, 5xx) are retried up to
+// `retry` times; between retries we honor a 429 Retry-After header and
+// otherwise back off exponentially (capped at backoffCapMs). With retry=0
+// (the session-start hook budget) no backoff ever runs.
 async function curl(
   url,
   { method = "GET", headers = {}, body, timeoutMs = 6000, retry = 0, backoffCapMs = 8000 } = {}
@@ -1200,7 +1203,11 @@ async function curl(
       await sleep(backoffMs(attempt, retryAfterMs, backoffCapMs));
       continue;
     }
-    return { http: String(res.status), body: text };
+    const respHeaders = {};
+    res.headers.forEach((v, k) => {
+      respHeaders[k] = v;
+    });
+    return { http: String(res.status), body: text, headers: respHeaders };
   }
 }
 
