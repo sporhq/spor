@@ -59,6 +59,26 @@ test("captureHealth: a 100%-failure streak with enough attempts is FAILING", () 
   assert.deepStrictEqual(failingPipelines(h), ["distill"]);
 });
 
+test("captureHealth: digest-intent classifier calls count toward the digest pipeline", () => {
+  const home = scratch();
+  fs.writeFileSync(
+    dayFile(home, 0),
+    record({ source: "digest-intent", error: "digest-intent cmd failed" }).repeat(3) +
+      record({ source: "digest-intent" })
+  );
+  const h = captureHealth(home, { now: NOW });
+  assert.strictEqual(h.digest.attempts, 4);
+  assert.strictEqual(h.digest.failures, 3);
+  assert.deepStrictEqual(failingPipelines(h), [], "3/4 failed is not a 100% streak");
+});
+
+test("captureHealth: a 100%-failure digest-intent streak alarms same as distill/nudge", () => {
+  const home = scratch();
+  fs.writeFileSync(dayFile(home, 0), record({ source: "digest-intent", error: "digest-intent cmd failed" }).repeat(3));
+  const h = captureHealth(home, { now: NOW });
+  assert.deepStrictEqual(failingPipelines(h), ["digest"]);
+});
+
 test("captureHealth: under MIN_ATTEMPTS all-failed is idle-ish, not FAILING", () => {
   const home = scratch();
   fs.writeFileSync(dayFile(home, 0), record({ source: "nudge", error: "nudge cmd failed" }).repeat(2));

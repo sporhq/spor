@@ -20,11 +20,17 @@ const WINDOW_DAYS = 7;
 const MIN_ATTEMPTS = 3; // fewer calls than this is "idle", never "failing"
 const TAIL_BYTES = 2 * 1024 * 1024; // per-day-file read bound
 
-// Records carry source: "distill-remote" | "distill-local" | "nudge".
+// Records carry source: "distill-remote" | "distill-local" | "nudge" |
+// "digest-intent" (the async digest-intent classifier, dec-spor-digest-
+// async-intent-gate-implementation — off by default via SPOR_DIGEST_ASYNC,
+// but when it's on a dead SPOR_DIGEST_INTENT_CMD backend fails open to
+// inject-everything with zero operator signal unless this pipeline is
+// watched too, issue-spor-doctor-blind-to-digest-intent).
 function pipelineOf(source) {
   const s = String(source ?? "");
   if (s.startsWith("distill")) return "distill";
   if (s.startsWith("nudge")) return "nudge";
+  if (s.startsWith("digest-intent")) return "digest";
   return null;
 }
 
@@ -35,7 +41,7 @@ function pipelineOf(source) {
 function captureHealth(graph, { days = WINDOW_DAYS, now = new Date() } = {}) {
   const dir = path.join(graph, "journal", "llm-calls");
   const empty = () => ({ attempts: 0, failures: 0, lastOkTs: null, lastErr: null });
-  const stats = { distill: empty(), nudge: empty(), days };
+  const stats = { distill: empty(), nudge: empty(), digest: empty(), days };
   for (let i = 0; i < days; i++) {
     const file = path.join(dir, `${u.localDate(new Date(now.getTime() - i * 86400000))}.jsonl`);
     let raw;
@@ -74,7 +80,7 @@ function captureHealth(graph, { days = WINDOW_DAYS, now = new Date() } = {}) {
 // but doesn't alarm — flaky ≠ dead, and the outage class this exists for
 // (issue-spor-distill-nudge-silent-failure-home-migration) is total.
 function failingPipelines(stats, minAttempts = MIN_ATTEMPTS) {
-  return ["distill", "nudge"].filter(
+  return ["distill", "nudge", "digest"].filter(
     (p) => stats[p].attempts >= minAttempts && stats[p].failures === stats[p].attempts
   );
 }

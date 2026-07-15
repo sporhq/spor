@@ -1398,6 +1398,22 @@ test('doctor: no capture calls in the window reads as idle, not an alarm', () =>
   assert.doesNotMatch(out, /FAILING/);
 });
 
+// issue-spor-doctor-blind-to-digest-intent: doctor also watches the async
+// digest-intent classifier pipeline (SPOR_DIGEST_ASYNC), so a dead
+// SPOR_DIGEST_INTENT_CMD backend surfaces here instead of silently failing
+// open to inject-everything.
+test('doctor: a 100%-failure digest-intent streak is flagged FAILING alongside distill/nudge', () => {
+  const { home, cwd } = scratch();
+  llmCallDay(home, [
+    { source: 'digest-intent', error: 'digest-intent cmd failed' },
+    { source: 'digest-intent', error: 'digest-intent cmd failed' },
+    { source: 'digest-intent', error: 'digest-intent cmd failed' },
+  ]);
+  const out = run(['doctor', '--cwd', cwd], '', freshEnv(home));
+  assert.match(out, /digest 7d:\s+FAILING — 3\/3 calls failed/);
+  assert.match(out, /last error: digest-intent cmd failed/);
+});
+
 test('session-start (remote): a capture-pipeline failure streak surfaces the FAILING nudge', async () => {
   const { home, cwd } = scratch();
   llmCallDay(home, [
@@ -1419,6 +1435,29 @@ test('session-start (remote): a capture-pipeline failure streak surfaces the FAI
     // nudge trips (3/3 failed); distill stays below the 3-attempt alarm floor
     assert.match(ctx, /capture pipeline FAILING: nudge 3\/3/);
     assert.doesNotMatch(ctx, /distill 2\/2/);
+    assert.match(ctx, /spor-hook doctor/);
+  } finally {
+    srv.close();
+  }
+});
+
+test('session-start (remote): a digest-intent failure streak surfaces the FAILING nudge', async () => {
+  const { home, cwd } = scratch();
+  llmCallDay(home, [
+    { source: 'digest-intent', error: 'digest-intent cmd failed' },
+    { source: 'digest-intent', error: 'digest-intent cmd failed' },
+    { source: 'digest-intent', error: 'digest-intent cmd failed' },
+  ]);
+  const { srv, base } = await statusServer(200);
+  try {
+    const env = freshEnv(home);
+    env.SPOR_SERVER = base;
+    env.SPOR_TOKEN = 'spor_pat_good';
+    let out = '';
+    await runAsync2(['session-start', '--host', 'claude-code'],
+      JSON.stringify({ cwd, hook_event_name: 'SessionStart' }), env, (s) => (out += s));
+    const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+    assert.match(ctx, /capture pipeline FAILING: digest 3\/3/);
     assert.match(ctx, /spor-hook doctor/);
   } finally {
     srv.close();
