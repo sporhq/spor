@@ -21,14 +21,12 @@ Steps:
    as `--project` so the compile is scoped to the repo you're in — the
    same-project relevance boost, the grouping union, and the `always_on` norm
    `applies_to_*` ride-along — instead of running *project-blind*
-   (issue-spor-remote-digest-project-blind). `${CLAUDE_PLUGIN_ROOT}` is empty in
-   the Bash tool, so read the plugin root the session-start hook cached
-   (issue-cc-skill-plugin-root-unsubstituted), then derive the slug:
+   (issue-spor-remote-digest-project-blind). `spor status` already resolves the
+   slug the same way session-start does (local vs remote, `.spor` marker
+   overrides, worktree main-repo inference); read it back instead of
+   recomputing it:
    ```bash
-   SPOR_ROOT="$(cat "${SPOR_HOME:-$HOME/.spor}/cache/plugin-root" 2>/dev/null \
-     || cat "$HOME/.substrate/cache/plugin-root" 2>/dev/null)"
-   SPOR_ROOT="${SPOR_ROOT:-$CLAUDE_PLUGIN_ROOT}"
-   SLUG="$(node -e 'process.stdout.write(require("'"$SPOR_ROOT"'/scripts/engines/util.js").projectSlug(process.cwd()))' 2>/dev/null)"
+   SLUG="$(spor status 2>/dev/null | sed -n 's/^project:[[:space:]]*//p')"
    ```
    Then run the one command (the CLI compiles locally or dispatches to the server
    per the resolved mode, just like the `spor brief`/`spor compile` verbs):
