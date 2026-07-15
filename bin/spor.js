@@ -1515,11 +1515,11 @@ async function cmdCompile(cfg, verb, args) {
 }
 
 // Compile a node's remote briefing the way the /spor:brief skill does: the raw
-// node (GET /v1/nodes/<id>) plus a title/summary-seeded /v1/digest for its
-// neighborhood, concatenated. Shared by compileRemote (brief / compile --root)
-// and compileBriefing (dispatch) so the two can't drift — dispatch used to
-// embed only the bare node, a thinner standing context than an interactive
-// brief (issue-spor-dispatch-briefing-omits-neighborhood). Returns
+// node (GET /v1/nodes/<id>) plus a root-walk /v1/digest for its neighborhood,
+// concatenated. Shared by compileRemote (brief / compile --root) and
+// compileBriefing (dispatch) so the two can't drift — dispatch used to embed
+// only the bare node, a thinner standing context than an interactive brief
+// (issue-spor-dispatch-briefing-omits-neighborhood). Returns
 // {transport,error} | {ok:false,status} | {ok:true,status,text}; the
 // neighborhood is fail-soft (a failed/empty digest just yields the raw node).
 async function remoteNodeBriefing(cfg, { root, project }) {
@@ -1527,17 +1527,18 @@ async function remoteNodeBriefing(cfg, { root, project }) {
   if (r.transport) return { transport: true, error: r.error, text: "" };
   if (!r.ok) return { ok: false, status: r.status, text: "" };
   const raw = (r.json && r.json.raw) || r.text || "";
-  // Seed the neighborhood digest from the node's own title/summary (the REST
-  // /v1/digest is query-mode only — root compile is not exposed over REST).
-  const seed = (r.json && (r.json.title || r.json.summary)) || fmField(raw, "title") || fmField(raw, "summary") || root;
-  const d = await remote.post(cfg, "/v1/digest", project ? { query: seed, project } : { query: seed }, { timeoutMs: 8000 });
+  // /v1/digest {root} runs the server-side structural root-walk (the same path
+  // query_graph(root_id=…) and `compile --root` take), so the neighborhood is
+  // the node's actual lineage instead of a title/summary-seeded free-text
+  // approximation (issue-cc-node-id-briefing-digest-approximation).
+  const d = await remote.post(cfg, "/v1/digest", project ? { root, project } : { root }, { timeoutMs: 8000 });
   const neighborhood = d.ok && d.json && d.json.found !== false ? d.json.text || "" : "";
   return { ok: true, status: r.status, text: neighborhood ? `${raw}\n\n${neighborhood}` : raw };
 }
 
 // The remote arm of compile/brief. Mirrors the /spor:brief skill's remote
-// resolution: a node id -> the raw node plus a title/summary-seeded /v1/digest
-// for its neighborhood; free text -> POST /v1/digest. --skeleton has no server
+// resolution: a node id -> the raw node plus a root-walk /v1/digest for its
+// neighborhood; free text -> POST /v1/digest. --skeleton has no server
 // equivalent (it writes a local briefing-node file), so it fails fast. Output
 // matches the local "nothing relevant" contract: exit 0 with empty stdout.
 async function compileRemote(cfg, args) {

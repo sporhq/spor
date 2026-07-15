@@ -1669,6 +1669,11 @@ function digestStubServer() {
           res.end(JSON.stringify({ found: false }));
           return;
         }
+        if (parsed && parsed.root) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ found: true, text: `DIGEST for root: ${parsed.root}` }));
+          return;
+        }
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ found: true, text: `DIGEST for: ${(parsed && parsed.query) || ''}` }));
         return;
@@ -1681,16 +1686,18 @@ function digestStubServer() {
     resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
 }
 
-test('brief <id> (remote) emits the raw node plus a /v1/digest neighborhood', async () => {
+test('brief <id> (remote) emits the raw node plus a root-walk /v1/digest neighborhood', async () => {
   const { srv, hits, base } = await digestStubServer();
   try {
     const r = await runAsyncCli(['brief', 'dec-x'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-b' });
     assert.strictEqual(r.status, 0, r.stderr);
     assert.match(r.stdout, /Raw node body\./);          // the raw node
-    assert.match(r.stdout, /DIGEST for: A demo decision/); // title-seeded neighborhood
+    assert.match(r.stdout, /DIGEST for root: dec-x/); // root-walk neighborhood, not a free-text approximation
     assert.ok(hits.some((h) => h.method === 'GET' && h.url === '/v1/nodes/dec-x'), 'fetched the node');
     const dig = hits.find((h) => h.url === '/v1/digest');
     assert.ok(dig, 'compiled a digest');
+    assert.strictEqual(dig.body.root, 'dec-x', 'posted {root} instead of a title/summary-seeded query');
+    assert.strictEqual(dig.body.query, undefined, 'no free-text query for a node-id briefing');
     assert.strictEqual(dig.auth, 'Bearer tok-b', 'bearer token sent');
   } finally {
     srv.close();
