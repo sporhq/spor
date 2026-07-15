@@ -120,6 +120,7 @@ Rules:
 | finding    | `find-`   | a gardener observation about another node, filed as a queue item (QUEUE.md §6) |
 | repo       | `repo-`   | durable git-repo identity: slug aliases + repo fingerprints; heals renames at read time (below) |
 | project    | `proj-`   | a grouping above repos; owns its member repos via inbound `grouped-under` edges (below) |
+| lens       | `lens-`   | a saved view over the graph — declarative `## query`/`## render` json blocks, an optional sandboxed `## custom` js block, and an optional `## actions` block; `traversable: false` and `capturable: false` (see "Lenses") |
 
 ## Completing work needs a durable why (the resolver gate)
 
@@ -911,6 +912,43 @@ thread 4). The seed set is small — `shell`, `prod-creds`, `browser`, `network`
 `human`, `filesystem-write`, `paid-api`. `human` is unsatisfiable by any agent:
 assign that work to a person.
 
+## Lenses
+
+A saved view over the graph is itself a graph node (dec-lenses-as-nodes), so it
+is versioned, attributed, shareable, and forkable by copying the node — the same
+inversion the queue makes for prioritization, made for presentation. The seed
+ships the vocabulary (`schema-lens`, `schema-edge-focuses-on`) so a fresh graph
+can author views without importing a schema first; the runner that executes them
+is a server surface (`render_lens`, API.md §2).
+
+A lens body carries fenced blocks:
+
+- `## query` — declarative select/traverse/group/sort, JSON. Required.
+- `## render` — builtin renderer config, JSON. `as: custom` requires a `##
+  custom` block.
+- `## custom` — an optional js escape hatch, executed in the same
+  no-clock/no-randomness sandbox as schema attached code, so a render is a pure
+  function of (graph snapshot, lens node, params, now).
+- `## actions` — optional write affordances `{id, label, on?, set, confirm?}`
+  (dec-ui-actions-as-transitions): `on` selects which rendered items carry the
+  affordance, `set` is a flat object of frontmatter changes (scalars or
+  `"$param"` bindings; never `id`/`type`). Invoking one is exactly one
+  revision-checked node update through the ordinary write path, arbitrated
+  fail-closed by the TARGET schema's `transitions()` gate. The lens declares
+  intent, the renderer surfaces it, the registry decides legality — only trusted
+  renderer hosts turn actions into controls, and the `## custom` sandbox never
+  sees them.
+
+A lens is parameterized by an edge, not config: `{type: focuses-on, to: <node>}`
+points it at the node it watches, and the runner resolves `"$focus"` in the query
+from that edge when no runtime parameter is given. Re-pointing a view is then an
+edge edit, and "which lenses watch this node" is graph traversal.
+
+`traversable: false` keeps lenses out of compiler lineage walks — a lens says
+what someone wants to look at, not what the graph knows. `capturable: false` for
+the reason briefing and correction opt out: a lens is authored deliberately
+against a query language, never drafted from a capture or a distilled transcript.
+
 ## Edge types and traversal weights
 
 | edge             | weight | meaning                                          |
@@ -935,6 +973,7 @@ assign that work to a person.
 | `uses-profile`   | 0.3    | this agent's default profile (the runtime+capability bundle it dispatches under); structural config binding, overridable per assignment/dispatch |
 | `routed-to`      | 0.3    | a question routed to this person for answering   |
 | `review-requested` | 0.3  | a review of this node is requested of this person (pending) — surfaces in their queue |
+| `focuses-on`     | 0.2    | this lens is parameterized on that node (see "Lenses"); a view watching a node says little about the node's own lineage |
 | `compiled-for`   | —      | briefing → its task/query (provenance only)      |
 | `shaped-by`      | —      | briefing → corrections applied (provenance only) |
 
