@@ -1962,6 +1962,27 @@ test("dispatch <node-id> (local): a genuinely-open node is NOT guarded — dispa
   assert.ok(fs.existsSync(sentinel), "an open task with no resolver dispatches normally");
 });
 
+test("dispatch <node-id> (local): the resolved-task guard reads the real parser, not a body line that happens to start with 'status:'", () => {
+  // issue-spor-fmfield-multiline-truncation: the guard used to re-derive status
+  // via a single-line regex over the raw node text (unbounded by the closing
+  // `---`), so a body line like "status: done" below a frontmatter with no
+  // status field at all would false-match as terminal and wrongly refuse the
+  // dispatch. It must read the already-parsed frontmatter status instead.
+  const { home, repo } = resolvedFixture();
+  fs.writeFileSync(
+    path.join(home, "nodes", "task-body-status.md"),
+    "---\nid: task-body-status\ntype: task\nrepo: demo\ntitle: A task with no status field\n" +
+      "summary: A task whose frontmatter carries no status field but whose body mentions one.\n" +
+      "date: 2026-06-05\n---\n" +
+      "Follow-up note below.\n\nstatus: done\n\nThat line describes a PAST status update quoted in the body, not this node's frontmatter.\n"
+  );
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "task-body-status", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(sentinel), "the body's 'status:' line must not false-gate the dispatch");
+});
+
 test("dispatch <node-id> --print (local): previews the resolved warning; --force flips it; clean run prints none", () => {
   const { home, repo } = resolvedFixture();
   const r = run(["dispatch", "task-done", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home });

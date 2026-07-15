@@ -6369,13 +6369,6 @@ async function cmdUpgrade(cfg, { values, positionals: pos }) {
 // never a local path; teammates clone to different paths), so the map MUST be
 // local. It self-learns from session-start and from `--dir`/`spor repos`.
 
-// Read a single frontmatter scalar from raw node markdown (regex, like the
-// engines' parser — no YAML lib). `repo:` is the current stamp; `project:` legacy.
-function fmField(raw, key) {
-  const m = raw.match(new RegExp(`^${key}: *(.*)$`, "m"));
-  return m ? m[1].trim() : null;
-}
-
 // Resolve a node id to { id, raw, repo, title, summary, type, status, date } or
 // null if it doesn't exist.
 async function resolveNode(cfg, id) {
@@ -6404,12 +6397,12 @@ async function resolveNode(cfg, id) {
       return null;
     }
   }
-  // Parse the frontmatter with the real parser (lib/kernel/graph.js), not
-  // fmField: fmField's single-line regex both truncates YAML folded
-  // multi-line values and, unbounded by the closing `---`, can false-match a
-  // body line that happens to start with "key: " — a real risk for
-  // summary/type/status/date, all plausible words in body prose. parsed is
-  // {} on malformed/missing frontmatter, matching fmField's null->"" fallback.
+  // Parse the frontmatter with the real parser (lib/kernel/graph.js) — a
+  // single-line regex would truncate YAML folded multi-line values and,
+  // unbounded by the closing `---`, could false-match a body line that
+  // happens to start with "key: " (a real risk for summary/type/status/date,
+  // all plausible words in body prose). parsed is {} on malformed/missing
+  // frontmatter, so fields below fall back to "".
   const graphLib = require(path.join(ROOT, "lib", "graph.js"));
   let parsed = {};
   try {
@@ -6441,7 +6434,7 @@ async function resolveNode(cfg, id) {
 // resolver. Returns a one-line reason when resolved, else null. Fail-open: any
 // read error yields null (never block a dispatch on an unreadable graph).
 function dispatchResolutionReason(cfg, node) {
-  const status = (fmField(node.raw, "status") || "").toLowerCase();
+  const status = (node.status || "").toLowerCase();
   if (isTerminalStatus(status)) return `status: ${status}`;
   const fromEdge = (r) => `${r.edge || "resolves"} edge from ${r.by}${r.title ? ` — ${r.title}` : ""}`;
   if (node.resolution && node.resolution.by) return fromEdge(node.resolution);
