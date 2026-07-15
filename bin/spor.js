@@ -6022,7 +6022,14 @@ function writeMcpJson(spec, scope, dryRun, url) {
   }
   const merged = { ...existing };
   const priorGroup = merged[spec.key];
-  merged[spec.key] = priorGroup && typeof priorGroup === "object" && !Array.isArray(priorGroup) ? { ...priorGroup } : {};
+  // An existing key of the WRONG shape (array, string, null) gets the same
+  // treatment as unparseable top-level JSON: abort, don't discard it — the
+  // contract is "touch ONLY the spor entry", never silently replace data.
+  if (priorGroup !== undefined && (typeof priorGroup !== "object" || priorGroup === null || Array.isArray(priorGroup))) {
+    err(`spor install --mcp: ${target} has a non-object '${spec.key}' — leaving it untouched`);
+    return 1;
+  }
+  merged[spec.key] = priorGroup ? { ...priorGroup } : {};
   merged[spec.key].spor = spec.entry(url);
   const rendered = JSON.stringify(merged, null, 2) + "\n";
   if (dryRun) {
@@ -6182,6 +6189,27 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
   let rc = 0;
   for (const host of hosts) {
     const spec = HOSTS[host];
+    // Gemini's mcpServers entry lives in the SAME settings.json its hooks
+    // manifest does (MCP_HOSTS.gemini.user/repo === HOSTS.gemini.user/repo),
+    // so installHookHost() below is about to write that file BEFORE
+    // writeMcpConfig()'s own strict-JSON check ever runs — an existing
+    // malformed settings.json would get silently discarded by
+    // installHookHost's readJsonOr(target, {}) fallback instead of aborting
+    // (the "no partial writes" guarantee --mcp otherwise gives every host).
+    // Pre-validate here, for any host whose hook target and mcp target are
+    // literally the same file, before either write happens.
+    if (wantMcp && !dryRun && MCP_HOSTS[host] && MCP_HOSTS[host].kind !== "toml") {
+      const mcpTarget = targetPath(MCP_HOSTS[host], scope);
+      if (spec.kind === "hooks" && targetPath(spec, scope) === mcpTarget) {
+        try {
+          readJsonStrict(mcpTarget);
+        } catch (e) {
+          err(`spor install --mcp: ${e.message}`);
+          rc = 1;
+          continue;
+        }
+      }
+    }
     let r;
     if (spec.kind === "claude") r = installClaude(scope, dryRun);
     else if (spec.kind === "codex") r = installCodex(scope, dryRun);

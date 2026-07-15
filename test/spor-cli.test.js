@@ -1506,6 +1506,41 @@ test('install --mcp aborts when the existing config path is unreadable (not just
   assert.ok(fs.statSync(f).isDirectory(), 'left untouched — not replaced with a file');
 });
 
+test('install gemini --mcp aborts on an unparseable existing settings.json, writing nothing (shared hooks+mcp file)', () => {
+  // Gemini's mcpServers entry lives in the SAME settings.json its hooks
+  // manifest does, unlike copilot/opencode (separate mcp-config.json) or
+  // codex (separate config.toml) — so the hook-install write and the mcp
+  // write target one file. Without a pre-check, installHookHost's lenient
+  // readJsonOr(target, {}) would silently discard a malformed existing file
+  // before writeMcpJson's strict check ever got a chance to abort.
+  const home = scratchHome();
+  const cwd = mcpCwd();
+  const f = path.join(home, '.gemini', 'settings.json');
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, '{not valid json');
+  const r = runIn(cwd, ['install', 'gemini', '--mcp', '--server', 'http://127.0.0.1:9', '--token', 'tok9'], { HOME: home, SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /isn't valid JSON/);
+  assert.strictEqual(fs.readFileSync(f, 'utf8'), '{not valid json', 'left untouched — no partial hooks-only write');
+  assert.ok(!fs.existsSync(path.join(cwd, 'AGENTS.md')), 'agents-md skipped after an mcp failure');
+});
+
+test('install --mcp aborts when the existing mcpServers key is a non-object, discarding nothing', () => {
+  // Valid top-level JSON whose group key has the WRONG shape (an array here)
+  // must abort like unparseable JSON does — replacing it with {spor: ...}
+  // would silently discard whatever the user had there.
+  const home = scratchHome();
+  const cwd = mcpCwd();
+  const f = path.join(home, '.copilot', 'mcp-config.json');
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  const original = JSON.stringify({ mcpServers: ['not', 'a', 'map'] }, null, 2) + '\n';
+  fs.writeFileSync(f, original);
+  const r = runIn(cwd, ['install', 'copilot', '--mcp', '--server', 'http://127.0.0.1:9', '--token', 'tok9'], { HOME: home, SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /non-object 'mcpServers'/);
+  assert.strictEqual(fs.readFileSync(f, 'utf8'), original, 'left untouched');
+});
+
 test('install --mcp without a configured server errors and writes nothing', () => {
   const home = scratchHome();
   const cwd = mcpCwd();
