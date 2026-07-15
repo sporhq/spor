@@ -246,11 +246,20 @@ Templates can use placeholders such as:
 {{brief}}
 {{task}}
 {{node}}
+{{id}}
 {{title}}
+{{summary}}
+{{type}}
+{{status}}
+{{date}}
 {{slug}}
 {{dir}}
 {{default}}
 ```
+
+`{{id}}`, `{{summary}}`, `{{type}}`, `{{status}}`, and `{{date}}` come from the
+dispatched node's own frontmatter fields (blank in free-text or `--backfill`
+dispatch, where there is no target node).
 
 ## Local mode
 
