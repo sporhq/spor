@@ -108,10 +108,12 @@ instead of shipped on a hunch.
 
 ## Limits worth knowing before trusting a future run
 
-- **Pooling bias.** Labels exist only for nodes one of the two arms actually
-  showed. A change that surfaces a genuinely better *unlabeled* node scores as
-  neutral, so the eval cannot reward true retrieval improvements — the direction
-  with the most headroom. Re-judging is the only fix.
+- **Pooling bias** (`issue-spor-digest-rank-eval-retrieval-blind`). Labels exist
+  only for nodes one of the two arms actually showed. A change that surfaces a
+  genuinely better *unlabeled* node scores as neutral, so the eval cannot reward
+  true retrieval improvements — the direction with the most headroom. Re-judging
+  over a pooled candidate set is the only fix; another pass over these labels
+  won't do it.
 - **Small n.** 58 warranted cases, ~460 labeled slots. Differences below ~0.01
   nDCG are noise; the capture-pending demote's +0.002 is not a result.
 - **Arm A is a different pipeline.** The server digest adds a team-first merge and
