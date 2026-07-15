@@ -577,10 +577,16 @@ async function couplingNudge({ input, graph, slug, session, cwd, remote }) {
 
   const data = remote ? await remoteCouplingData(graph) : localCouplingData(graph);
   if (!data || !Array.isArray(data.norms) || data.norms.length === 0) return null;
+  // Declared alias map (issue-spor-coupling-matcher-reverse-symlink-gap): when
+  // the edited path arrives already resolved (no alias-derivable spelling),
+  // this expands it to any config-declared alias spelling too, so a trigger
+  // authored against the alias still fires.
+  const aliases = u.cfgObj("coupling.aliases", {});
   const hits = coupling.matchCouplings(data.norms, {
     slug,
     relPath: rels,
     repoTags: data.repo_tags?.[slug] ?? [],
+    aliases,
   });
   if (!hits.length) return null;
 

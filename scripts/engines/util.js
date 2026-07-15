@@ -76,6 +76,14 @@ function cfgBool(keyPath, envName, fallback) {
   const s = String(v).trim().toLowerCase();
   return !(s === "0" || s === "false" || s === "");
 }
+// Config-aware plain-object read — no env fallback (a declared map like
+// `coupling.aliases` has no single-value env spelling): the active cascade's
+// value when it's a plain object, else `fallback`. Standalone (no active
+// config) always returns `fallback`, so a direct call stays byte-identical to
+// "nothing declared" (issue-spor-coupling-matcher-reverse-symlink-gap).
+function cfgObj(keyPath, fallback = {}) {
+  return _config ? _config.getObj(keyPath, fallback) : fallback;
+}
 
 function hostDefaultBackendCmd(kind) {
   if (_host === "codex" && kind === "nudge") return `codex exec --model ${CODEX_NUDGE_MODEL} -`;
@@ -1529,6 +1537,7 @@ module.exports = {
   cfgStr,
   cfgNum,
   cfgBool,
+  cfgObj,
   hostDefaultBackendCmd,
   jqNow,
   isoMs,

@@ -1841,6 +1841,12 @@ async function cmdCheck(cfg, args) {
       norms: scan.norms,
       repoTags: scan.repo_tags[slug] ?? [],
       readFile,
+      // Declared alias map (issue-spor-coupling-matcher-reverse-symlink-gap):
+      // expands a changed path already reported in its git-resolved form to
+      // any config-declared alias spelling too, so a norm authored against
+      // the alias still triggers/targets — not just the `--files` path,
+      // whose repoRelativeCandidates only recovers a LEXICALLY-present alias.
+      aliases: cfg.getObj("coupling.aliases", {}),
     });
     if (json) out(JSON.stringify({ project: slug, changed, checked, findings, reminders, strict }, null, 2));
     else out(checkLib.renderReport({ slug, changed, checked, findings, reminders }, { strict }));

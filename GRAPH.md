@@ -483,6 +483,29 @@ agreeing invariant suppresses the untouched heuristic, and a disagreement
 reports even when both files were touched. A half-declared or malformed pair
 is inert (validate warns).
 
+An in-repo tracked symlink (`frontend -> packages/web`) has two valid
+repo-relative spellings for the same file, and the matcher tests a glob
+against every candidate spelling it is HANDED
+(task-spor-coupling-matcher-symlink-alias) — but deriving those candidates is
+one-way: it can turn an alias spelling into its git-resolved canonical form,
+never the reverse. A coupling glob authored against an alias
+(`couples_when: [frontend/**]`) therefore still misses an edit reported only
+under its canonical path (`packages/web/app.js`) — the environment may hand
+the matcher an already-resolved path with no alias spelling left to derive
+from — because discovering which alias points at a given canonical path would
+need a filesystem-wide symlink scan, rejected as too expensive for the
+edit-time hot path (dec-spor-dismiss-reverse-symlink-path-lookup,
+issue-spor-coupling-matcher-reverse-symlink-gap). The declared fix is a
+**coupling alias map**: `.spor.json`'s `coupling.aliases`, a flat `{ "<alias
+prefix>": "<canonical prefix>" }` object (repo-root-relative on both sides,
+e.g. `{ "frontend": "packages/web" }`). Every declared entry is expanded in
+BOTH directions at match time, at zero runtime cost (no scanning) — a path
+under either side also produces the spelling under the other side, for both
+`couples_when` triggers and `couples_also` targets. **Declaring nothing is
+the default posture**, and it keeps the one-way limitation above: only
+author coupling globs against the canonical (git-resolved) spelling of a
+symlinked subtree unless its alias is declared in `coupling.aliases`.
+
 Because a norm rides along with no relevance gate and the team trust model lets
 every writer author one, the briefing renderer treats norm bodies as an
 **injection surface** (issue-cc-norm-always-on-injection): each is quoted as
