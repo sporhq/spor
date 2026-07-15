@@ -905,6 +905,10 @@ async function cmdPutNode(cfg, { values, positionals }) {
   }
   const file = path.join(nodesDir, `${id}.md`);
   const exists = fs.existsSync(file);
+  if (!exists && id.length > MAX_ID_LENGTH) {
+    err(`bad node id '${id}': ${id.length} chars exceeds ${MAX_ID_LENGTH} (new node ids must be at most ${MAX_ID_LENGTH} chars)`);
+    return 1;
+  }
   if (policy === "error" && exists) {
     err(`node already exists: ${id} (use --if-exists update with --revision, or --if-exists skip)`);
     return 1;
@@ -3182,6 +3186,16 @@ async function cmdReady(cfg, { values, positionals }) {
 // "Local mode": no pool or contention), so an active status sets the field
 // without a claim — symmetric with local dispatch skipping the claim.
 const NODE_ID_RE = /^[a-z0-9][a-z0-9-]*$/; // mirrors the server's ID_RE/SLUG_RE
+
+// The one id-length invariant (issue-spor-server-node-id-length-unbounded):
+// NODE_ID_RE is shape-only and imposes no cap, mirroring the server's
+// unbounded ID_RE/SLUG_RE. The server enforces MAX_ID_LENGTH (200,
+// server/store-validate.ts) at CREATE for every remote write; local mode
+// writes node files directly, bypassing the server entirely, so it needs
+// the same cap on its own CREATE path (cmdPutNode) to keep a personal graph
+// under the invariant remote graphs already hold. Enforced create-only — a
+// node written before this cap existed must keep reading/routing past it.
+const MAX_ID_LENGTH = 200;
 
 // Rewrite a node's raw markdown to carry `value` as its status, mirroring the
 // server's forceStatus (store.js): strip any existing status line, then append

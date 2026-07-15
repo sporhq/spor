@@ -129,6 +129,47 @@ No summary.
   assert.ok(!fs.existsSync(path.join(nodes, "dec-bad.md")));
 });
 
+// MAX_ID_LENGTH (issue-spor-server-node-id-length-unbounded): NODE_ID_RE is
+// shape-only and never bounded length, mirroring the server's unbounded
+// ID_RE/SLUG_RE. Local mode writes node files directly (no server in the
+// loop), so it needs its own CREATE-only cap to keep a personal graph under
+// the same invariant the server now enforces.
+test("put-node (local) rejects a brand-new id past MAX_ID_LENGTH", () => {
+  const { home, nodes } = fixtureGraph();
+  const id = "dec-" + "a".repeat(200); // well past the 200-char cap
+  const file = tmpNodeFile(nodeMd(id));
+  const r = run(["put-node", file], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /exceeds 200/);
+  assert.ok(!fs.existsSync(path.join(nodes, `${id}.md`)));
+});
+
+test("put-node (local) accepts an id at exactly MAX_ID_LENGTH (boundary)", () => {
+  const { home, nodes } = fixtureGraph();
+  const id = "dec-" + "a".repeat(196); // 200 chars total
+  assert.strictEqual(id.length, 200);
+  const file = tmpNodeFile(nodeMd(id));
+  const r = run(["put-node", file], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(readNode(nodes, id), fs.readFileSync(file, "utf8"));
+});
+
+test("put-node (local) keeps updating a pre-existing id already past MAX_ID_LENGTH (grandfathered)", () => {
+  const { home, nodes } = fixtureGraph();
+  const id = "dec-" + "a".repeat(75) + "-" + "b".repeat(75) + "-" + "c".repeat(75);
+  assert.ok(id.length > 200, "fixture must exceed the cap");
+  // installed directly, the way a node written before this invariant existed
+  // would already be resident on disk (bypassing the write door, as adminInstall
+  // does server-side).
+  fs.writeFileSync(path.join(nodes, `${id}.md`), nodeMd(id));
+  const before = gitBlobSha(fs.readFileSync(path.join(nodes, `${id}.md`)));
+
+  const file = tmpNodeFile(nodeMd(id, "Updated title", "Updated summary for the grandfathered over-cap id."));
+  const r = run(["put-node", file, "--if-exists", "update", "--revision", before], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(readNode(nodes, id), /Updated title/);
+});
+
 function putNodeStub({ status = 200, result } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
