@@ -1806,6 +1806,57 @@ b
   assert.ok(v.warnings.some((w) => /dangling edge blocks -> ghost-b/.test(w)));
 });
 
+test("validateGraph: body well under the 8KB cap gets no size warning", () => {
+  const fx = tmpGraph({
+    "art-small.md": `---
+id: art-small
+type: artifact
+title: Small
+summary: s
+date: 2026-06-01
+---
+just a few bytes of body
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.ok(!v.warnings.some((w) => /cap/.test(w)));
+});
+
+test("validateGraph: body approaching the 8KB cap is a warning, not an error", () => {
+  const fx = tmpGraph({
+    "art-log.md": `---
+id: art-log
+type: artifact
+title: Log
+summary: s
+date: 2026-06-01
+---
+${"x".repeat(7500)}
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.deepEqual(v.errors, []);
+  assert.ok(v.warnings.some((w) => /art-log\.md: body is 7500B, approaching the server's 8192B cap/.test(w)));
+  assert.ok(v.warnings.some((w) => /Accreting running-log artifacts/.test(w)));
+});
+
+test("validateGraph: body over the 8KB cap is a distinct warning", () => {
+  const fx = tmpGraph({
+    "art-over.md": `---
+id: art-over
+type: artifact
+title: Over
+summary: s
+date: 2026-06-01
+---
+${"x".repeat(9000)}
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.deepEqual(v.errors, []);
+  assert.ok(v.warnings.some((w) => /art-over\.md: body is 9000B, over the server's 8192B cap/.test(w)));
+});
+
 // ---------- loadGraph wiring ----------
 
 test("loadGraph: briefing and correction nodes are non-traversable (excluded from adjacency)", () => {

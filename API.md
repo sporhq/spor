@@ -36,7 +36,11 @@ graph's git repo. What a client sees:
 - **Validation**: id/filename agreement, kebab-case, type prefix, mandatory
   standalone summary, known node type, `date:` format, edge syntax. Failures
   return the validator's error list verbatim so a calling model can
-  self-correct. Size limits: body ≤ 8KB, summary ≤ 500 chars, ≤ 40 edges.
+  self-correct. Size limits: body ≤ 8KB, summary ≤ 500 chars, ≤ 40 edges. (A
+  node designed to accrete indefinitely — a running-log artifact — hits this
+  wall by construction; GRAPH.md "Accreting running-log artifacts" is the
+  rollover convention for that case, and `spor validate` warns as a node's
+  body nears the cap.)
 - **Edge normalization**: edge types accept canonical names, registry-declared
   **aliases** (renamed in place), and **inverse labels** (the edge read from
   the target's side — `{blocked-by, to: X}` on N is flipped and written to X

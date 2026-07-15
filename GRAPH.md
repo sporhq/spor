@@ -142,6 +142,39 @@ Rules:
 | project    | `proj-`   | a grouping above repos; owns its member repos via inbound `grouped-under` edges (below) |
 | lens       | `lens-`   | a saved view over the graph — declarative `## query`/`## render` json blocks, an optional sandboxed `## custom` js block, and an optional `## actions` block; `traversable: false` and `capturable: false` (see "Lenses") |
 
+## Accreting running-log artifacts
+
+An `artifact` node is sometimes used as a **running log** — one node a session
+appends a data point to over and over, rather than one fact written once
+(task-cc-dogfood-capture-discipline's `art-cc-capture-discipline-results` is the
+prototype: one entry per dogfood session). That pattern collides with the
+server's per-node body cap (API.md §1: body ≤ 8KB) — the log scales for a
+session or two, then every further append is rejected
+(issue-cc-accreting-log-body-cap-collision). The cap itself stays: it is what
+keeps "one fact per node" true for every OTHER node type, and weakening it for
+one pattern would just move the failure mode elsewhere.
+
+The fix is to let the log **roll over**, not to grow one node forever:
+
+- When a running-log artifact is at or near the cap, start a new artifact node
+  for the next stretch of entries — same subject, new id with an incrementing
+  suffix (`art-cc-capture-discipline-results` → `art-cc-capture-discipline-results-2`
+  → `-3`, …) and a title noting it ("part 2 (2026-07 onward)").
+  `spor validate` (and any local-mode `put-node`/`add` write) warns once a
+  node's body passes ~90% of the cap, specifically so there is still room to
+  make this move before a write is rejected outright — don't wait for the
+  hard failure.
+- Link the new part back to the one it continues with a `derived-from` edge
+  (this node was produced from — i.e. continues — the target), and update the
+  earlier part's summary to say it is superseded/continued so a reader
+  landing on it knows to follow the edge forward.
+- Anything that reads "the log" (a task's `derived-from`/`relates-to` edge, a
+  briefing, a human) should expect a chain of parts, not one node — walk
+  `derived-from` to find the latest.
+
+This is the same shape as any other multi-part document; it just needed
+naming so it stops being reinvented ad hoc per artifact.
+
 ## Completing work needs a durable why (the resolver gate)
 
 A `task` reaching `done`, or an `issue` reaching `resolved`, requires a **live
