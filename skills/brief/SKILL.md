@@ -73,13 +73,13 @@ Steps:
    is exactly `<id>` (a node-targeted fix, not `global`/`project:<slug>`) fired
    because *this specific recompile* was its job — its guidance is now baked
    into the briefing body you just wrote, so it has nothing left to do. For
-   each `shaped-by` edge in the skeleton whose correction's `target` equals
-   `<id>`, run `spor set-status <corr-id> applied` so it stops injecting on
-   every future compile of this same target (a stale-forever `corr-` node is
-   exactly the dead weight this step exists to prevent). Leave
-   `global`/`project:<slug>`-scoped corrections alone — those are standing,
-   broad-scope guidance meant to keep firing on every future compile, not a
-   one-shot fix this recompile discharges.
+   each `shaped-by` edge in the skeleton, check the correction's `target`
+   (`spor get <corr-id>`); if it equals `<id>`, run `spor set-status <corr-id>
+   applied` so it stops injecting on every future compile of this same target
+   (a stale-forever `corr-` node is exactly the dead weight this step exists
+   to prevent). Leave `global`/`project:<slug>`-scoped corrections alone —
+   those are standing, broad-scope guidance meant to keep firing on every
+   future compile, not a one-shot fix this recompile discharges.
 
 4. Present the briefing. If the user later says it was wrong or incomplete,
    point them at /spor:correct — corrections fix the compile permanently;
