@@ -184,6 +184,13 @@ async function main() {
     const pend = path.join(graph, "journal", "pending-distill");
     if (!u.ensureDir(pend)) return;
     const pendingFile = path.join(pend, `${session}.json`);
+    // Mark the spooled payload as a debounce-approximated firing (turn-scoped
+    // quiescence on Codex/Copilot/OpenCode, not a genuine host session-end
+    // signal — a mid-session pause can trip it just as easily as a real
+    // goodbye) so the SessionEnd lease branch skips it
+    // (task-cc-client-sessionend-reserve-hook): reserving/releasing a still-
+    // live claim on a false positive would silently strand active work.
+    payload.spor_debounced = true;
     try {
       fs.writeFileSync(pendingFile, JSON.stringify(payload));
     } catch {

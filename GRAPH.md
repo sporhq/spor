@@ -947,6 +947,15 @@ is a single-org-graph relevance-topology fix — shared vocabulary ("auth",
 "deploy", "migration") otherwise dilutes the gate across teams. A project-blind
 compile (no `project`) ranks every node equally, exactly as before.
 
+A node whose `authored_via` is `capture`, `distill`, or `gardener` — written
+with no human review at write time — is labeled `machine·<via>` (e.g.
+`machine·capture`) in every compiled digest/briefing line, the same
+machine-vs-human taxonomy `spor changes` already surfaces
+(task-cc-digest-render-authorship-marker). Without it a Haiku-distilled
+capture rendered typographically identical to a human-reviewed decision in
+the ambient session-start context; `mcp`/`rest`/`dispatch` writes and nodes
+with no `authored_via` at all render exactly as before (unmarked).
+
 A seed (the compile root, or each query-mode content match) always contributes
 its **direct 1-hop lineage** to the structural arm, even when score-decay would
 push a low-weight edge under the traversal threshold

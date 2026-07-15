@@ -873,6 +873,41 @@ test("dispatch (cross-repo): a relative dispatch.worktreeSetup in the target .sp
   assert.ok(fs.existsSync(path.join(repo, ".claude", "worktrees", "dec-x", ".ran")), "relative setup hook ran (resolved against the repo dir)");
 });
 
+test("dispatch (cross-repo): does not apply the LAUNCHER's own .spor.json dispatch.worktreeSetup to the target's worktree", () => {
+  // issue-spor-dispatch-worktree-setup-wrong-repo-config: dispatching from repo
+  // A (which declares its own dispatch.worktreeSetup, relative to A) for a node
+  // targeting repo B used to fall back to the standing cfg — anchored at A's
+  // cwd — and run A's relative script inside B's fresh worktree, where it does
+  // not exist (setup hook exit 127). The target (demo/B) declares no override
+  // of its own, so the fix must resolve the fallback against the TARGET, not
+  // silently inherit A's.
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+
+  const launcher = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-launcher-"));
+  fs.writeFileSync(
+    path.join(launcher, ".spor.json"),
+    JSON.stringify({ enabled: true, dispatch: { worktreeSetup: "scripts/only-in-launcher.sh" } }) + "\n"
+  );
+
+  const outFile = path.join(home, "spawn.out");
+  const stub = pwdStub(home);
+  const r = run(
+    ["dispatch", "dec-x", "--no-brief", "--worktree"],
+    { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile },
+    launcher
+  );
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stderr, /setup hook failed/);
+  const cwd = fs.readFileSync(outFile, "utf8").split("\n")[0];
+  assert.strictEqual(
+    cwd,
+    fs.realpathSync(path.join(repo, ".claude", "worktrees", "dec-x")),
+    "launched in the target's worktree, unaffected by the launcher's foreign setup hook"
+  );
+});
+
 test("dispatch --no-worktree overrides the target repo's .spor.json dispatch.worktree", () => {
   const { home } = fixture();
   const { repo, real } = gitTargetRepo();
@@ -1245,6 +1280,67 @@ test("dispatch --template (node mode): fills {{node}} and {{title}}", () => {
   assert.match(prompt, /TITLE=A demo decision about auth token rotation/);
 });
 
+test("dispatch --template (node mode): fills {{id}}/{{summary}}/{{type}}/{{status}}/{{date}} from the dispatched node's frontmatter", () => {
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const tpl = path.join(home, "f.tpl");
+  fs.writeFileSync(tpl, "ID={{id}}\nSUMMARY={{summary}}\nTYPE={{type}}\nSTATUS={{status}}\nDATE={{date}}\n");
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cwd-"));
+  const r = run(["dispatch", "dec-x", "--template", tpl, "--print"], { SPOR_HOME: home }, elsewhere);
+  assert.strictEqual(r.status, 0);
+  const prompt = promptOf(r.stdout);
+  assert.match(prompt, /ID=dec-x/);
+  assert.match(prompt, /SUMMARY=A demo decision describing auth token rotation and credential handling for the pipeline\./);
+  assert.match(prompt, /TYPE=decision/);
+  assert.match(prompt, /STATUS=\n/); // dec-x fixture carries no status: line — blanks out, not "unknown"
+  assert.match(prompt, /DATE=2026-06-01/);
+});
+
+test("dispatch --template: node fields blank out in free-text dispatch (no target node)", () => {
+  const { home, repo } = fixture();
+  const tpl = path.join(home, "b.tpl");
+  fs.writeFileSync(tpl, "ID={{id}}|SUMMARY={{summary}}|TYPE={{type}}|STATUS={{status}}|DATE={{date}}\n");
+  const r = run(["dispatch", "auth token rotation credentials", "--dir", repo, "--template", tpl, "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0);
+  const prompt = promptOf(r.stdout);
+  assert.match(prompt, /ID=\|SUMMARY=\|TYPE=\|STATUS=\|DATE=/);
+});
+
+test("dispatch --template: {{summary}} preserves a YAML folded multi-line value (not truncated to the first line)", () => {
+  const { home, repo } = fixture();
+  fs.writeFileSync(
+    path.join(home, "nodes", "dec-folded.md"),
+    "---\nid: dec-folded\ntype: decision\nrepo: demo\ntitle: A folded-summary decision\n" +
+      "summary: A summary that folds\n  across a second line\n  and a third line too.\n---\nBody text.\n"
+  );
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const tpl = path.join(home, "fold.tpl");
+  fs.writeFileSync(tpl, "SUMMARY={{summary}}\n");
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cwd-"));
+  const r = run(["dispatch", "dec-folded", "--template", tpl, "--print"], { SPOR_HOME: home }, elsewhere);
+  assert.strictEqual(r.status, 0);
+  const prompt = promptOf(r.stdout);
+  assert.match(prompt, /SUMMARY=A summary that folds across a second line and a third line too\./);
+});
+
+test("dispatch --template: {{status}} does not false-match a body line that happens to start with 'status:'", () => {
+  const { home, repo } = fixture();
+  fs.writeFileSync(
+    path.join(home, "nodes", "dec-nostatus.md"),
+    "---\nid: dec-nostatus\ntype: decision\nrepo: demo\ntitle: A decision with no status field\n" +
+      "summary: A decision whose body happens to mention a status line.\n---\n" +
+      "status: still needs follow-up work per the team.\n"
+  );
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const tpl = path.join(home, "nostatus.tpl");
+  fs.writeFileSync(tpl, "STATUS=[{{status}}]\n");
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cwd-"));
+  const r = run(["dispatch", "dec-nostatus", "--template", tpl, "--print"], { SPOR_HOME: home }, elsewhere);
+  assert.strictEqual(r.status, 0);
+  const prompt = promptOf(r.stdout);
+  assert.match(prompt, /STATUS=\[\]/);
+});
+
 test("dispatch --template: {{default}} embeds the built-in prompt; unknown placeholders warn and blank out", () => {
   const { home, repo } = fixture();
   const tpl = path.join(home, "w.tpl");
@@ -1423,6 +1519,39 @@ test("dispatch --force (remote): omits the dispatch nonce so a deliberate re-dis
     assert.ok(claim, "the claim was still attempted");
     const body = JSON.parse(claim.body || "{}");
     assert.ok(!("dispatch" in body), "--force omits the nonce so the claim renews instead of conflicting");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --force (remote): a worktree-setup failure does NOT release the pre-existing lease --force just renewed", async () => {
+  // --force omits the dispatch nonce specifically so the claim RENEWS whatever
+  // lease already exists (the conflict-branch message elsewhere promises
+  // "keeps the lease") — that lease may belong to an already-running agent from
+  // an earlier dispatch. If worktree setup then fails, the abort-cleanup added
+  // for issue-spor-dispatch-worktree-setup-wrong-repo-config must not release a
+  // lease this invocation didn't freshly establish.
+  const { repo, g } = gitTargetRepo();
+  const failHook = writeSpawnableNodeStub(repo, "fail-setup", "process.exit(3);");
+  fs.writeFileSync(
+    path.join(repo, ".spor.json"),
+    JSON.stringify({ enabled: true, dispatch: { worktreeSetup: path.relative(repo, failHook) } }) + "\n"
+  );
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-home-"));
+  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
+  const stub = claudeStub(home, path.join(home, "launched"));
+  try {
+    const r = await runAsync(
+      ["dispatch", "task-rotate", "--dir", repo, "--no-brief", "--force", "--worktree"],
+      remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub })
+    );
+    assert.notStrictEqual(r.status, 0, "setup failure aborts the dispatch");
+    assert.match(r.stderr, /setup hook failed/);
+    assert.ok(claimHit(hits), "--force still claimed (renewed) the lease");
+    assert.ok(
+      !hits.some((h) => h.method === "POST" && /\/release$/.test(h.url)),
+      "the --force renewal of a pre-existing lease is never auto-released on a setup failure"
+    );
   } finally {
     srv.close();
   }
@@ -1949,6 +2078,44 @@ test("dispatch <node-id> --force (local): --force does NOT override the requires
   assert.strictEqual(r.status, 1, r.stderr);
   assert.match(r.stderr, /requires a human/);
   assert.ok(!fs.existsSync(sentinel), "--force has no effect on the requires:human refusal");
+});
+
+// issue-spor-dispatch-probe-side-effect-before-refusal: the requires:human
+// refusal must fire BEFORE resolveDispatchProfile/probeCapabilities run, so a
+// refused dispatch persists nothing to local config. Assign the node to an
+// agent under a profile too, so — were the ordering still wrong — profile
+// resolution would run and write a probed capability cache.
+test("dispatch <node-id> (local): requires:human refuses BEFORE profile resolution — no .probed side effect", () => {
+  const { home, nodes, repo } = readinessFixture();
+  writeProfile(nodes, "profile-codex", "harness: codex");
+  fs.writeFileSync(
+    path.join(nodes, "agent-test.md"),
+    `---\nid: agent-test\ntype: agent\ntitle: Test agent\nsummary: A test agent.\ndate: 2026-06-18\nedges:\n  - {type: uses-profile, to: profile-codex}\n---\nAgent.\n`
+  );
+  fs.writeFileSync(
+    path.join(nodes, "task-needs-human-profiled.md"),
+    `---\nid: task-needs-human-profiled\ntype: task\nrepo: demo\nstatus: open\nrequires: [human]\ntitle: Human work also assigned to a profiled agent\nsummary: A requires:human task that ALSO carries an assigned->agent edge with a profile, so profile resolution would run and probe capabilities if the guard didn't refuse first.\ndate: 2026-06-05\nedges:\n  - {type: assigned, to: agent-test}\n---\nbody\n`
+  );
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const cfgFile = path.join(home, "config.json");
+  const r = run(
+    ["dispatch", "task-needs-human-profiled", "--dir", repo, "--no-brief"],
+    { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, ...cleanProbeEnv() }
+  );
+  assert.strictEqual(r.status, 1, r.stderr);
+  assert.match(r.stderr, /cannot dispatch task-needs-human-profiled: this item requires a human/);
+  assert.ok(!fs.existsSync(sentinel), "no agent was launched");
+  let cfg = {};
+  try {
+    cfg = JSON.parse(fs.readFileSync(cfgFile, "utf8"));
+  } catch {
+    /* no config.json at all is also proof of no side effect */
+  }
+  assert.ok(
+    !(cfg.dispatch && cfg.dispatch.capabilities && cfg.dispatch.capabilities.probed),
+    "the refusal must not persist a probed capability cache to local config"
+  );
 });
 
 test("dispatch <node-id> (local): assigned-to-person WARNS but still launches", () => {

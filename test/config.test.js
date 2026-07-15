@@ -254,6 +254,16 @@ test('unknown top-level key earns a warning but is otherwise ignored', () => {
   assert.strictEqual(c.getNum('search.minSim', 0.08), 0.08); // typo'd key had no effect
 });
 
+test('SPOR_SESSION_LEASE env resolves through the cascade with no "unknown config key" warning', () => {
+  // Regression: ENV_MAP registered sessionLease.* but KNOWN_KEYS omitted the
+  // "sessionLease" top-level namespace, so setting the env var alone (no repo
+  // config file) tripped the unknown-key sweep on every hook dispatch.
+  const root = tmp();
+  const c = loadConfig({ cwd: root, env: bareEnv({ SPOR_HOME: root, SPOR_SESSION_LEASE: '0' }) });
+  assert.deepStrictEqual(c.warnings, []);
+  assert.strictEqual(c.getBool('sessionLease.enabled', true), false);
+});
+
 test('fail-open: malformed config file is skipped with a warning', () => {
   const root = tmp();
   fs.writeFileSync(path.join(root, '.spor.json'), '{ not json ');
