@@ -209,6 +209,45 @@ test("agent use: a prefix-less id (the label slip) is refused with a 'did you me
   assert.ok(!fs.existsSync(path.join(home, "config.json")), "nothing written");
 });
 
+// task-spor-agent-use-label-resolution: the deferred convenience layered on
+// top of the prefix-hint above — a bare label that DOES match one of the
+// caller's own agents resolves to its full id instead of erroring.
+test("agent use (local): a label matching an existing agent resolves to its full id", () => {
+  const { home } = homeWithPerson();
+  run(["agent", "create", "anthony-shark-november"], { SPOR_HOME: home });
+  const r = run(["agent", "use", "anthony-shark-november"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /dispatch\.agent = agent-anthony-shark-november \(resolved from label 'anthony-shark-november'\)/);
+  const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
+  assert.strictEqual(cfg.dispatch.agent, "agent-anthony-shark-november");
+});
+
+test("agent use (local): a label matching NO agent still falls back to the prefix-hint error", () => {
+  const { home } = homeWithPerson();
+  run(["agent", "create", "someone-else"], { SPOR_HOME: home });
+  const r = run(["agent", "use", "anthony-shark-november"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /invalid agent id 'anthony-shark-november'/);
+  assert.match(r.stderr, /did you mean 'agent-anthony-shark-november'/);
+  assert.ok(!fs.existsSync(path.join(home, "config.json")), "nothing written");
+});
+
+test("agent use (local): a label matching more than one agent is refused as ambiguous, writing nothing", () => {
+  const { home, nodes } = homeWithPerson();
+  fs.writeFileSync(
+    path.join(nodes, "agent-x.md"),
+    `---\nid: agent-x\ntype: agent\ntitle: something-else\nsummary: s.\nstatus: active\ndate: 2026-06-16\nedges:\n  - {type: owned-by, to: person-anthony}\n---\nAgent.\n`
+  );
+  fs.writeFileSync(
+    path.join(nodes, "agent-y.md"),
+    `---\nid: agent-y\ntype: agent\ntitle: x\nsummary: s.\nstatus: active\ndate: 2026-06-16\nedges:\n  - {type: owned-by, to: person-anthony}\n---\nAgent.\n`
+  );
+  const r = run(["agent", "use", "x"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /'x' matches more than one of your agents: agent-x, agent-y/);
+  assert.ok(!fs.existsSync(path.join(home, "config.json")), "nothing written");
+});
+
 test("agent use: missing id prints usage", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-useu-"));
   const r = run(["agent", "use"], { SPOR_HOME: home });
@@ -318,6 +357,61 @@ test("agent list (remote): falls back to the /v1/changes projection when /v1/age
   } finally {
     srv.close();
   }
+});
+
+// task-spor-agent-use-label-resolution: remote-mode label resolution goes
+// through GET /v1/agents (the caller's owned agents), the same route `agent
+// list` reads.
+test("agent use (remote): a label matching one of the caller's agents resolves via GET /v1/agents", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-user-"));
+  const { srv, hits, base } = await agentStub({ agentsList: [{ id: "agent-anthony-shark-november", owner: "person-anthony", title: "anthony-shark-november", status: "active" }] });
+  try {
+    const r = await runAsync(["agent", "use", "anthony-shark-november"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /dispatch\.agent = agent-anthony-shark-november \(resolved from label 'anthony-shark-november'\)/);
+    const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
+    assert.strictEqual(cfg.dispatch.agent, "agent-anthony-shark-november");
+    assert.ok(hits.some((h) => h.url === "/v1/agents" && h.method === "GET"), "GET /v1/agents");
+  } finally {
+    srv.close();
+  }
+});
+
+test("agent use (remote): a label matching none of the caller's agents falls back to the prefix-hint error", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-user2-"));
+  const { srv, base } = await agentStub({ agentsList: [{ id: "agent-someone-else", owner: "person-anthony", title: "someone-else", status: "active" }] });
+  try {
+    const r = await runAsync(["agent", "use", "anthony-shark-november"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /invalid agent id 'anthony-shark-november'/);
+    assert.match(r.stderr, /did you mean 'agent-anthony-shark-november'/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("agent use (remote): a label matching more than one of the caller's agents is refused as ambiguous", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-user4-"));
+  const { srv, base } = await agentStub({
+    agentsList: [
+      { id: "agent-x", owner: "person-anthony", title: "something-else", status: "active" },
+      { id: "agent-y", owner: "person-anthony", title: "x", status: "active" },
+    ],
+  });
+  try {
+    const r = await runAsync(["agent", "use", "x"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /'x' matches more than one of your agents: agent-x, agent-y/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("agent use (remote): an unreachable server falls back to the prefix-hint error rather than hanging or crashing", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-user3-"));
+  const r = await runAsync(["agent", "use", "anthony-shark-november"], remoteEnv(home, "http://127.0.0.1:1"));
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /invalid agent id 'anthony-shark-november'/);
 });
 
 // ---------------------------------------------------------------------------

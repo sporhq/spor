@@ -4543,6 +4543,45 @@ function agentIdGuess(id) {
     : null;
 }
 
+// Resolve a bare agent LABEL (what `spor agent create`/`spor agent list` print
+// alongside the id) against the caller's own agents, so `spor agent use <label>`
+// is a convenience instead of the prefix-hint error
+// (task-spor-agent-use-label-resolution — the deferred follow-up to
+// isAgentId()/agentIdGuess() above). Remote: GET /v1/agents (already scoped to
+// agents the caller owns). Local: scan the graph's `type: agent` nodes. Matches
+// on the node's title (the label as stored) OR the plain `agent-<label>`
+// prefixing, so both a re-typed label and a copy-pasted un-prefixed id resolve.
+// Returns {id} on a unique match, {ambiguous:[...ids]} on more than one, or
+// null on no match — including any lookup failure, since this stays a
+// convenience layered on top of the existing hint, never a hard dependency
+// (the deferral's stated reason for not doing this eagerly: a networked lookup
+// needs offline fail-soft, so any failure here just falls through to the
+// pre-existing invalid-id error).
+async function resolveAgentIdFromLabel(cfg, label) {
+  const guessedId = `agent-${kebab(label)}`;
+  const isMatch = (a) => a && (a.title === label || a.id === guessedId);
+  try {
+    let agents;
+    if (cfg.mode() === "remote") {
+      const r = await remote.get(cfg, "/v1/agents", { timeoutMs: 6000 });
+      if (!r.ok || !r.json || !Array.isArray(r.json.agents)) return null;
+      agents = r.json.agents;
+    } else {
+      const nodesDir = cfg.nodesDir();
+      if (!fs.existsSync(nodesDir)) return null;
+      const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+      const g = graphLib.loadGraph(nodesDir);
+      agents = Object.values(g.nodes || {}).filter((n) => n.type === "agent");
+    }
+    const hits = agents.filter(isMatch);
+    if (!hits.length) return null;
+    if (hits.length > 1) return { ambiguous: [...new Set(hits.map((a) => a.id))] };
+    return { id: hits[0].id };
+  } catch {
+    return null;
+  }
+}
+
 // `spor agent use <agent-id>` — make this agent the machine's default dispatch
 // identity by writing `dispatch.agent` to the USER config.json (the same
 // machine-local, never-committed file as the repo map; per-machine, like
@@ -4550,28 +4589,41 @@ function agentIdGuess(id) {
 // before it, dispatch.agent was settable only via env or by hand-editing the
 // config. `spor agent use --clear` (or an empty id) drops back to person-scoped
 // dispatch. Not a graph write — purely local config, so it works in both modes.
-function cmdAgentUse(cfg, { id }) {
+async function cmdAgentUse(cfg, { id }) {
   const clear = id === "--clear" || id === "none" || id === "";
   if (!id) {
     err("usage: spor agent use <agent-id>   (or: spor agent use --clear)");
     return 1;
   }
+  let resolvedId = id;
+  let fromLabel = false;
   if (!clear && !isAgentId(id)) {
-    err(`invalid agent id '${id}' — must be an 'agent-<slug>' kebab id (e.g. agent-your-machine)`);
-    const guess = agentIdGuess(id);
-    if (guess) err(`  did you mean '${guess}'?  ('spor agent list' shows the full id — the 'agent-' prefix is part of it, not the label)`);
-    return 1;
+    const resolved = await resolveAgentIdFromLabel(cfg, id);
+    if (resolved && resolved.ambiguous) {
+      err(`'${id}' matches more than one of your agents: ${resolved.ambiguous.join(", ")} — pass the full agent id.`);
+      return 1;
+    }
+    if (resolved && resolved.id) {
+      resolvedId = resolved.id;
+      fromLabel = true;
+    } else {
+      err(`invalid agent id '${id}' — must be an 'agent-<slug>' kebab id (e.g. agent-your-machine)`);
+      const guess = agentIdGuess(id);
+      if (guess) err(`  did you mean '${guess}'?  ('spor agent list' shows the full id — the 'agent-' prefix is part of it, not the label)`);
+      return 1;
+    }
   }
   const home = cfg.userConfigHome();
-  const wrote = u.setDispatchAgent(home, clear ? null : id);
+  const wrote = u.setDispatchAgent(home, clear ? null : resolvedId);
+  const labelNote = fromLabel ? ` (resolved from label '${id}')` : "";
   if (clear) {
     out(wrote ? "cleared dispatch.agent — dispatches run person-scoped again" : "dispatch.agent was already unset");
     return 0;
   }
   if (wrote) {
-    out(`dispatch.agent = ${id}  (this machine now dispatches as ${id}; ${path.join(home, "config.json")})`);
+    out(`dispatch.agent = ${resolvedId}${labelNote}  (this machine now dispatches as ${resolvedId}; ${path.join(home, "config.json")})`);
   } else {
-    out(`dispatch.agent already = ${id} (no change)`);
+    out(`dispatch.agent already = ${resolvedId}${labelNote} (no change)`);
   }
   out("  attribution is remote-only; override one dispatch with: spor dispatch --as <agent-id>");
   return 0;
@@ -8506,7 +8558,10 @@ const COMMANDS = {
       "  spor agent list               list agents and their owners\n" +
       "  spor agent use <agent-id>     make it THIS machine's default dispatch identity\n" +
       "                                (writes dispatch.agent to your user config; pass\n" +
-      "                                --clear to go back to person-scoped dispatch)\n" +
+      "                                --clear to go back to person-scoped dispatch).\n" +
+      "                                A bare label (no 'agent-' prefix) also resolves\n" +
+      "                                against your own agents ('spor agent list')\n" +
+      "                                before falling back to the prefix-hint error.\n" +
       "  spor agent token <agent-id>   mint a long-lived STANDING PAT for the agent —\n" +
       "                                the SPOR_TOKEN a headless agent (Claude Code on\n" +
       "                                the Web) runs under; shown once\n" +
