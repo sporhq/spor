@@ -305,6 +305,95 @@ test("stale content older than the lookback window is refused, not healed", () =
   assert.equal(read(dir, "a.js"), "v0\n", "outside the window the guard refuses to heal");
 });
 
+// ---------- probes that fail, rather than answer ----------
+
+test("a file that exists but cannot be read is refused, not mistaken for a deleted one", () => {
+  if (process.platform === "win32") return; // chmod 000 does not withhold read there
+  const dir = initRepo();
+  write(dir, "a.js", "one\n");
+  commit(dir, "init");
+  casAdvance(dir, () => write(dir, "unreadable.js", "added by the merge\n"));
+  // Live content the guard must not clobber, in a file it cannot hash. Read as
+  // "absent" it would match the ancestor that predates the path and be healed —
+  // overwriting what is sitting right here.
+  write(dir, "unreadable.js", "LIVE WORK\n");
+  fs.chmodSync(path.join(dir, "unreadable.js"), 0o000);
+
+  try {
+    const r = runJson(dir, "--apply");
+    assert.equal(r.json.verdict, "ROOT-UNSYNCED");
+    assert.equal(r.status, 1);
+    assert.deepEqual(r.json.healed, []);
+  } finally {
+    fs.chmodSync(path.join(dir, "unreadable.js"), 0o644);
+  }
+  assert.equal(read(dir, "unreadable.js"), "LIVE WORK\n", "the unreadable file is untouched");
+});
+
+test("a directory standing where a tracked file belongs is refused", () => {
+  const dir = initRepo();
+  write(dir, "a.js", "one\n");
+  commit(dir, "init");
+  casAdvance(dir, () => write(dir, "b.js", "added by the merge\n"));
+  fs.mkdirSync(path.join(dir, "b.js")); // not a file: uninspectable, not absent
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "ROOT-UNSYNCED");
+  assert.equal(r.status, 1);
+  assert.equal(fs.statSync(path.join(dir, "b.js")).isDirectory(), true);
+});
+
+// Locks in literal semantics for a wildcard-shaped name. It passes without
+// :(literal) too — git falls back to matching the name exactly because a tree
+// entry of that name exists — so this pins the BEHAVIOUR rather than the fix: if
+// a future change ever fed this tool a path git could not match literally, a
+// glob would silently widen the blast radius of a checkout and this fails.
+test("a glob-shaped filename is matched literally — a stale path never drags a WIP neighbour with it", () => {
+  if (process.platform === "win32") return; // `?` is not a legal filename character
+  const dir = initRepo();
+  write(dir, "a?.js", "q0\n"); // a filename that is also a pathspec wildcard
+  write(dir, "ab.js", "ab0\n"); // the file that wildcard matches
+  commit(dir, "init");
+  casAdvance(dir, () => write(dir, "a?.js", "q1\n"));
+  write(dir, "ab.js", "ab0\nlive work\n");
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.status, 1);
+  assert.deepEqual(r.json.healed, ["a?.js"]);
+  assert.equal(read(dir, "a?.js"), "q1\n", "the stale path healed");
+  assert.equal(read(dir, "ab.js"), "ab0\nlive work\n", "its glob-neighbour's live work survived");
+});
+
+test("a filename that looks like pathspec magic is handled literally", () => {
+  if (process.platform === "win32") return; // `:` is not a legal filename character
+  const dir = initRepo();
+  write(dir, ":colon.js", "c0\n");
+  commit(dir, "init");
+  casAdvance(dir, () => write(dir, ":colon.js", "c1\n"));
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "HEALED");
+  assert.equal(r.status, 0);
+  assert.equal(read(dir, ":colon.js"), "c1\n");
+});
+
+test("paths with spaces and unicode survive the -z status parse", () => {
+  const dir = initRepo();
+  write(dir, "a file with spaces.md", "s0\n");
+  write(dir, "ünïcode/påth.md", "u0\n");
+  commit(dir, "init");
+  casAdvance(dir, () => {
+    write(dir, "a file with spaces.md", "s1\n");
+    write(dir, "ünïcode/påth.md", "u1\n");
+  });
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "HEALED");
+  assert.equal(r.status, 0);
+  assert.equal(read(dir, "a file with spaces.md"), "s1\n");
+  assert.equal(read(dir, "ünïcode/påth.md"), "u1\n");
+});
+
 // ---------- invocation ----------
 
 test("a merge in progress refuses with exit 2", () => {

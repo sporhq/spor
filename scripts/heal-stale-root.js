@@ -88,6 +88,13 @@ const EMPTY_BLOB = 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391';
 
 const ABSENT = null; // no entry for a path in a given tree / index / working tree
 
+// "Something is there, but we could not read what": an unreadable file, a
+// directory where a file belongs, a probe that failed. Distinct from ABSENT,
+// which is positive knowledge that a path is gone — conflating the two would let
+// a failed probe match an ancestor that predates the path and heal a file that is
+// sitting right there with live content in it. UNKNOWN matches nothing, ever.
+const UNKNOWN = Symbol('unknown');
+
 function usage(msg) {
   if (msg) process.stderr.write(`heal-stale-root: ${msg}\n`);
   process.stderr.write(
@@ -132,6 +139,19 @@ function git(repo, args) {
 
 const splitZ = (out) => (out ? out.split('\0').filter((s) => s !== '') : []);
 
+// git status prints literal filenames, but every command we hand them back to
+// reads them as PATHSPECS. A name like `:x` parses as pathspec magic and errors
+// out; a name like `a*.js` or `a?.js` is a wildcard that also matches its
+// neighbours (`git ls-files -- 'a*.js'` returns ab.js too). `:(literal)` says
+// what we mean.
+//
+// Today the wildcard cannot actually mis-heal: every path here comes from git
+// status, so a tree entry of exactly that name always exists, and git then
+// matches it literally rather than globbing (checked on git 2.43 — the glob only
+// takes over when nothing matches the name exactly). That is luck, not a
+// guarantee we should hold a data-loss tool up with.
+const spec = (p) => `:(literal)${p}`;
+
 function chunks(arr, n) {
   const out = [];
   for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
@@ -174,10 +194,13 @@ function trackedModified(repo) {
 // path -> blob sha at `commit`, restricted to `paths`. A submodule or subtree
 // entry is left out: never matchable, so it reads as WIP and blocks the sync
 // rather than being healed blind.
+// Returns null if any probe fails: a half-populated map is worse than none, since
+// a path missing from it reads as ABSENT — positive knowledge we do not have.
 function treeBlobs(repo, commit, paths) {
   const map = new Map();
   for (const chunk of chunks(paths, 200)) {
-    const out = git(repo, ['ls-tree', '-z', '--full-name', commit, '--', ...chunk]);
+    const out = git(repo, ['ls-tree', '-z', '--full-name', commit, '--', ...chunk.map(spec)]);
+    if (out === null) return null;
     for (const rec of splitZ(out)) {
       const tab = rec.indexOf('\t');
       if (tab < 0) continue;
@@ -193,7 +216,8 @@ function treeBlobs(repo, commit, paths) {
 function indexBlobs(repo, paths) {
   const map = new Map();
   for (const chunk of chunks(paths, 200)) {
-    const out = git(repo, ['ls-files', '-s', '-z', '--', ...chunk]);
+    const out = git(repo, ['ls-files', '-s', '-z', '--', ...chunk.map(spec)]);
+    if (out === null) return null; // as in treeBlobs: no map beats a partial one
     for (const rec of splitZ(out)) {
       const tab = rec.indexOf('\t');
       if (tab < 0) continue;
@@ -211,12 +235,14 @@ function worktreeBlob(repo, p) {
   let st;
   try {
     st = fs.lstatSync(path.resolve(repo, p));
-  } catch {
-    return ABSENT; // deleted on disk
+  } catch (e) {
+    // ENOENT is the only error that proves the path is gone; anything else (a
+    // permission error on a parent, say) leaves us ignorant, not informed.
+    return e && e.code === 'ENOENT' ? ABSENT : UNKNOWN;
   }
-  if (!st.isFile() && !st.isSymbolicLink()) return ABSENT;
+  if (!st.isFile() && !st.isSymbolicLink()) return UNKNOWN; // a directory, a socket…
   const out = git(repo, ['hash-object', '--path', p, '--', p]);
-  return out === null ? ABSENT : out.trim();
+  return out === null ? UNKNOWN : out.trim(); // unreadable file: present, uninspectable
 }
 
 // ---------- classification ----------
@@ -226,6 +252,7 @@ function worktreeBlob(repo, p) {
 // of HEAD holds (committed, therefore recoverable)? Returns the explaining
 // ancestor sha, '' for "same as HEAD", or null for novel content.
 function behindOrHead(value, head, p, ancestors) {
+  if (value === UNKNOWN) return null; // present but uninspectable — never discardable
   if (value === head) return '';
   if (value === EMPTY_BLOB && head !== EMPTY_BLOB) return null;
   for (const anc of ancestors) {
@@ -301,6 +328,7 @@ function main() {
   const paths = entries.map((e) => e.path);
   const headBlobs = treeBlobs(repo, head, paths);
   const idxBlobs = indexBlobs(repo, paths);
+  if (headBlobs === null || idxBlobs === null) usage('cannot read HEAD or the index — refusing to classify');
 
   // main's recent ancestry, newest first. First-parent: a stale root is behind the
   // tip's own line of advance, not behind some side branch's private history.
@@ -308,7 +336,11 @@ function main() {
     .split('\n')
     .map((s) => s.trim())
     .filter((c) => c && c !== head);
-  const ancestors = ancestry.map((commit) => ({ commit, blobs: treeBlobs(repo, commit, paths) }));
+  // An ancestor whose tree cannot be read contributes no evidence; dropping it can
+  // only cost a heal, never cause one.
+  const ancestors = ancestry
+    .map((commit) => ({ commit, blobs: treeBlobs(repo, commit, paths) }))
+    .filter((a) => a.blobs !== null);
 
   const stale = [];
   const wip = [];
@@ -321,7 +353,7 @@ function main() {
 
   if (opts.apply && stale.length) {
     for (const chunk of chunks(stale.map((s) => s.path), 200)) {
-      if (git(repo, ['checkout', head, '--', ...chunk]) === null) {
+      if (git(repo, ['checkout', head, '--', ...chunk.map(spec)]) === null) {
         process.stderr.write('heal-stale-root: git checkout failed; root left partially healed\n');
         report(opts, { verdict: 'ROOT-UNSYNCED', head, base, stale, wip, healed: [] }, 1);
       }
