@@ -39,10 +39,14 @@ function toolsLine() {
 // mode observed in the 2026-07-04 capture retrospective
 // (art-cc-capture-discipline-results-2): work discovered but never filed,
 // fix-before-issue, decisions kept only in chat, durable facts leaking to
-// private auto-memory, bare status flips, and a substantial multi-node session
-// whose connective outcome artifact never got filed until the human asked
-// (issue-spor-session-outcome-artifact-capture-gap) — nothing triggers the
-// session-level provenance hub the way the terminal-status gate triggers a
+// private auto-memory, bare status flips, a cohort of work nodes whose build
+// order stayed in prose instead of becoming `blocks` edges
+// (issue-spor-agent-missing-dependency-edges — the gardener's unedged-gate
+// detector catches it, but only on the next sweep and only as advice, so the
+// creation-time guarantee has to live here), and a substantial multi-node
+// session whose connective outcome artifact never got filed until the human
+// asked (issue-spor-session-outcome-artifact-capture-gap) — nothing triggers
+// the session-level provenance hub the way the terminal-status gate triggers a
 // resolver.
 const DIRECTIVE = `Keep the graph current as you work — do these unprompted:
 
@@ -54,6 +58,11 @@ const DIRECTIVE = `Keep the graph current as you work — do these unprompted:
   node is the lineage the fix resolves.
 - Made a decision worth keeping (approach chosen, alternative ruled out,
   gotcha paid for)? Capture it at the moment it is made, not at session end.
+- Filing more than one piece of work at once? If you know the order they must
+  happen in — even if you only said it in prose ("keystone", "do this first",
+  "gated on") — write that order as \`blocks\` edges between them before you move
+  on. The queue takes its dependency signal only from \`blocks\` edges and never
+  from prose, so an unwired cohort surfaces in the wrong order.
 - Durable, team-relevant facts belong in the graph, never only in private
   auto-memory or scratch notes. If you are about to "remember" something a
   teammate or future session could need, capture it to Spor as well.

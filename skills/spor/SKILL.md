@@ -236,6 +236,38 @@ carrying an `answers` edge; close work with a `resolves` edge from a
 superseded/constraint handling, question routing, write hygiene — is
 **`references/cowork.md`**; read it when working from Cowork or the connector.
 
+## Writing a cohort: order goes in edges, not prose
+
+Whenever one sitting produces **more than one work node** — a batch of tasks off
+a decision, a scoped-out feature, a migration broken into steps — the ordering
+you already know is part of the write, not a follow-up. Before you move on, ask
+which of these must land before which, and record each answer as a `blocks` edge
+from the prerequisite to the dependent:
+
+```bash
+spor edge task-relocate-issuer blocks task-tenant-api   # prerequisite blocks dependent
+```
+
+Dependency is the one queue signal that comes only from edges. The ranker blends
+several terms — priority, heat, age, staleness — but the sole thing that demotes
+a blocked item below its unblockers is a live `blocks` edge
+(dec-cc-queue-blocked-demotion); no prose anywhere feeds it. So an ordering
+stated only in a body — "keystone", "do this first", "gated on X" — is invisible
+to `spor next`, which will happily surface the dependent task first
+(issue-spor-agent-missing-dependency-edges). Creation time is the one moment when
+the order is both known and cheap to record. The gardener's unedged-gate detector
+does catch some of what you miss, but only on its next sweep, and only as a
+finding someone still has to action.
+
+Two rules bound it:
+
+- `blocks` is **work-to-work only** (task→task, task→issue). A decision never
+  reaches a terminal status, so a `blocks` edge from one is a permanent false
+  blocker — sequence from a decision with `derived-from`/`relates-to`
+  (norm-cc-blocks-work-only).
+- Only wire real prerequisites. Cohort membership alone is `relates-to`; if the
+  two could proceed in either order, they don't block each other.
+
 ## Grouping work under an umbrella node (programs)
 
 When a workstream outgrows a handful of nodes — a milestone, a refactoring

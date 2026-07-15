@@ -13,6 +13,11 @@ Keep the graph current as you work — do these unprompted:
   node is the lineage the fix resolves.
 - Made a decision worth keeping (approach chosen, alternative ruled out,
   gotcha paid for)? Capture it at the moment it is made, not at session end.
+- Filing more than one piece of work at once? If you know the order they must
+  happen in — even if you only said it in prose ("keystone", "do this first",
+  "gated on") — write that order as `blocks` edges between them before you move
+  on. The queue takes its dependency signal only from `blocks` edges and never
+  from prose, so an unwired cohort surfaces in the wrong order.
 - Durable, team-relevant facts belong in the graph, never only in private
   auto-memory or scratch notes. If you are about to "remember" something a
   teammate or future session could need, capture it to Spor as well.

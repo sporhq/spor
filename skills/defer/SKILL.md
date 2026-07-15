@@ -65,3 +65,32 @@ the model): a missing `--blocks` target returns `404`, a non-date `--needed-by`
 returns `422` — both before any model call. Locally, the same flags write the
 edge and the `needed_by:` field onto the node directly. In Cowork, pass the same
 `blocks`/`needed_by` fields to the `capture` MCP tool.
+
+## Capturing several pieces of work at once
+
+When one deferral splits into several nodes — "these three things, in this
+order" — the ordering is part of the capture, not a follow-up. `spor add` types
+and links each node, but it never infers build order across a batch, and the
+queue takes its dependency signal only from `blocks` edges. Ordering left in the
+prose is invisible to `spor next`, which then surfaces the cohort backwards
+(issue-spor-agent-missing-dependency-edges).
+
+The `--blocks` flag above is not just for cross-project work: it wires the edge
+in the same call whenever the node this one gates already exists. So capture the
+dependent first, then the thing that gates it:
+
+```bash
+spor add "<the dependent work>"                       # -> task-tenant-api
+spor add "<the prerequisite>" --blocks task-tenant-api
+```
+
+Where that doesn't fit — a batch already captured, or an order you only worked
+out afterwards — add the edges directly, from prerequisite to dependent:
+
+```bash
+spor edge <prerequisite-id> blocks <dependent-id>   # or MCP add_edge
+```
+
+Only wire a real gate. `blocks` is work-to-work (task→task, task→issue) and
+never from a decision (norm-cc-blocks-work-only); siblings that could proceed in
+either order need no edge between them.
