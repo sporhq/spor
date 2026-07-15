@@ -256,6 +256,31 @@ test("a staged add of a path absent at HEAD is never healed — the heal would b
   assert.deepEqual(r.json.wip.map((w) => w.path), ["brand-new.js"]);
 });
 
+// git detects renames on the WORKTREE side too, putting the rename letter in the
+// SECOND column and still emitting the extra source-path field: " R g.txt\0f.txt\0".
+// A parser that only consumes the extra field for xy[0] reads `f.txt` as the next
+// status record and reports a path named "xt" — a phantom, in the one report a
+// human reads before authorizing a destructive reset.
+test("a worktree-side rename does not desync the -z parse into a phantom path", () => {
+  const dir = initRepo();
+  write(dir, "f.txt", "content\n");
+  commit(dir, "init");
+  fs.renameSync(path.join(dir, "f.txt"), path.join(dir, "g.txt"));
+  git(dir, "add", "-N", "g.txt"); // intent-to-add: git now reports " R f.txt -> g.txt"
+  // The rename letter must land in the SECOND column — that is the whole point of
+  // the fixture, so assert it against the untrimmed status.
+  assert.match(git(dir, "status", "--porcelain", "-uno"), /^ R f\.txt -> g\.txt$/m,
+    "the fixture really is a worktree-side rename");
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "ROOT-UNSYNCED");
+  assert.equal(r.status, 1);
+  const reported = r.json.wip.map((w) => w.path).concat(r.json.stale.map((s) => s.path));
+  for (const p of reported) {
+    assert.equal(["f.txt", "g.txt"].includes(p), true, `reported a path that is not in the repo: ${p}`);
+  }
+});
+
 test("a staged rename is refused without inspecting content", () => {
   const dir = initRepo();
   write(dir, "a.js", "one\n");
@@ -309,6 +334,10 @@ test("stale content older than the lookback window is refused, not healed", () =
 
 test("a file that exists but cannot be read is refused, not mistaken for a deleted one", () => {
   if (process.platform === "win32") return; // chmod 000 does not withhold read there
+  // …and it does not withhold read from uid 0 either: as root the probe SUCCEEDS,
+  // the file classifies WIP for the ordinary reason, and this test would pass
+  // green without ever exercising the UNKNOWN branch it exists to pin.
+  if (process.getuid && process.getuid() === 0) return;
   const dir = initRepo();
   write(dir, "a.js", "one\n");
   commit(dir, "init");
@@ -392,6 +421,111 @@ test("paths with spaces and unicode survive the -z status parse", () => {
   assert.equal(r.status, 0);
   assert.equal(read(dir, "a file with spaces.md"), "s1\n");
   assert.equal(read(dir, "ünïcode/påth.md"), "u1\n");
+});
+
+// ---------- differences content identity cannot see ----------
+
+test("an uncommitted chmod +x is not 'already at HEAD' — the exec bit survives", () => {
+  if (process.platform === "win32") return; // no exec bit to lose
+  const dir = initRepo();
+  write(dir, "run.sh", "#!/bin/sh\necho hi\n");
+  commit(dir, "init");
+  fs.chmodSync(path.join(dir, "run.sh"), 0o755); // uncommitted, and invisible to the blob
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "ROOT-UNSYNCED");
+  assert.equal(r.status, 1);
+  assert.deepEqual(r.json.healed, []);
+  assert.equal(fs.statSync(path.join(dir, "run.sh")).mode & 0o111, 0o111, "the exec bit survives");
+});
+
+test("a tracked file swapped for a symlink (typechange) is refused", () => {
+  if (process.platform === "win32") return; // symlinks need privilege there
+  const dir = initRepo();
+  write(dir, "target.txt", "payload\n");
+  write(dir, "f.txt", "payload\n"); // same content, so the blob matches through the link
+  commit(dir, "init");
+  fs.unlinkSync(path.join(dir, "f.txt"));
+  fs.symlinkSync("target.txt", path.join(dir, "f.txt"));
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "ROOT-UNSYNCED");
+  assert.equal(r.status, 1);
+  assert.equal(fs.lstatSync(path.join(dir, "f.txt")).isSymbolicLink(), true, "the symlink survives");
+});
+
+test("a stale tracked symlink is compared by its target, so it heals", () => {
+  if (process.platform === "win32") return;
+  const dir = initRepo();
+  write(dir, "a.txt", "a\n");
+  write(dir, "b.txt", "b\n");
+  fs.symlinkSync("a.txt", path.join(dir, "link"));
+  commit(dir, "init");
+  casAdvance(dir, () => {
+    fs.unlinkSync(path.join(dir, "link"));
+    fs.symlinkSync("b.txt", path.join(dir, "link")); // the merge repointed it
+  });
+
+  // git stores the link's TARGET as its blob; hashing the target's CONTENT would
+  // never match, and the guard would wedge on any repo carrying a tracked symlink.
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "HEALED");
+  assert.equal(r.status, 0);
+  assert.equal(fs.readlinkSync(path.join(dir, "link")), "b.txt");
+});
+
+// ---------- conflicts, which hide their other side in the index ----------
+
+// An add/add conflict reads `AA` — no `U` for a letter-based check to catch — and
+// `git stash apply` / `git apply --3way` leave one with NO MERGE_HEAD for the
+// in-progress check to catch either. "theirs" then exists ONLY in index stage 3,
+// where `git checkout HEAD -- n.txt` silently discards it. read-tree builds the
+// state directly, so the fixture is the shape itself rather than a race to
+// provoke it.
+test("an add/add conflict with no MERGE_HEAD is refused, not collapsed to HEAD", () => {
+  const dir = initRepo();
+  write(dir, "seed.txt", "x\n");
+  const base = commit(dir, "init");
+  write(dir, "n.txt", "ours\n");
+  const ours = commit(dir, "ours adds n.txt");
+  git(dir, "checkout", "-q", "-b", "other", base);
+  write(dir, "n.txt", "theirs\n");
+  const theirs = commit(dir, "theirs adds n.txt");
+  git(dir, "checkout", "-q", "main");
+  git(dir, "read-tree", "-m", base, ours, theirs); // unmerged index, worktree untouched
+
+  assert.match(statusOf(dir), /^AA /m, "the fixture really is an unmerged add/add");
+  assert.equal(fs.existsSync(path.join(dir, ".git", "MERGE_HEAD")), false, "and no marker flags it");
+  assert.equal(read(dir, "n.txt"), "ours\n", "the working tree agrees with HEAD, so only the index dissents");
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "ROOT-UNSYNCED");
+  assert.equal(r.status, 1);
+  assert.deepEqual(r.json.healed, []);
+  assert.equal(git(dir, "ls-files", "-u").trim().split("\n").length, 2, "both conflict stages survive");
+});
+
+// ---------- probes that fail must never read as an answer ----------
+
+test("an unreadable git status is refused with exit 2, never reported IN-SYNC", () => {
+  if (process.platform === "win32") return;
+  if (process.getuid && process.getuid() === 0) return; // root reads a chmod-000 index anyway
+  const dir = initRepo();
+  write(dir, "f.txt", "committed\n");
+  commit(dir, "init");
+  write(dir, "f.txt", "GENUINE UNCOMMITTED WIP\n");
+  fs.chmodSync(path.join(dir, ".git", "index"), 0o000); // git status now exits non-zero
+
+  try {
+    const r = run(dir, "--json");
+    // Reporting IN-SYNC here would exit 0, and exit 0 tells the caller "you may
+    // reset --hard": the WIP above dies on a probe failure.
+    assert.equal(r.status, 2, "a status we could not read is not a clean status");
+    assert.doesNotMatch(r.stdout, /IN-SYNC/);
+  } finally {
+    fs.chmodSync(path.join(dir, ".git", "index"), 0o644);
+  }
+  assert.equal(read(dir, "f.txt"), "GENUINE UNCOMMITTED WIP\n");
 });
 
 // ---------- invocation ----------

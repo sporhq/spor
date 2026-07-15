@@ -43,9 +43,17 @@
 // caller falls back to today's behavior: verify in a detached worktree, report
 // ROOT-UNSYNCED). Healing wrongly destroys work that exists nowhere else. Hence:
 // a staged ADD of a path absent at HEAD is never healed (the heal would be a
-// delete, the one irreversible direction); renames, copies, and unmerged paths
-// are WIP by construction; and content that is merely empty is not evidence of a
-// rewind (any truncation would otherwise look stale).
+// delete, the one irreversible direction); renames, copies, typechanges and
+// unmerged paths are WIP by construction; content that is merely empty is not
+// evidence of a rewind (any truncation would otherwise look stale); and a probe
+// that FAILS never reads as an answer — not "the file is gone", not "nothing is
+// modified", not "no merge in progress". Every unknown lands on WIP or exit 2.
+//
+// A COROLLARY worth stating, because it is not obvious: if git calls a path
+// modified while every blob matches HEAD, the difference is one content identity
+// cannot see — an exec bit, a symlink swapped for a file. Such a path is
+// uncommitted BY DEFINITION and is refused, even though it looks like "already at
+// HEAD, nothing to lose".
 //
 // KNOWN RESIDUALS (documented, accepted):
 //   - A file mixing stale content WITH a genuine edit hashes to neither the old
@@ -54,10 +62,15 @@
 //   - A path whose stale content predates the lookback window reads as WIP.
 //     Raising --lookback only strengthens detection; it can never cause a false
 //     heal (matching an older ancestor is still matching a committed blob).
+//   - A merge that changed only a file's MODE leaves a stale path every blob
+//     agrees on, so it is refused per the corollary above: a missed heal.
 //   - A deliberate but uncommitted revert or `rm` of a file whose content still
 //     lives at HEAD is byte-identical to a stale path, and is healed (i.e. put
 //     back). Indistinguishable from the evidence — the same call a human makes by
 //     eye — and it restores committed content rather than destroying new work.
+//   - Nothing locks the tree, so a job writing to a path between this run's
+//     classification and its checkout could still lose that write. The window is
+//     re-probed shut immediately before the checkout (see recheck), not closed.
 //
 // Usage:
 //   node scripts/heal-stale-root.js [--repo <dir>] [--lookback N] [--apply] [--json]
@@ -137,6 +150,16 @@ function git(repo, args) {
   return r.status === 0 ? r.stdout : null;
 }
 
+// As git(), but feeds stdin — used to hash a symlink's target string as git does.
+function gitIn(repo, args, input) {
+  const r = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', input });
+  if (r.error) {
+    process.stderr.write(`heal-stale-root: cannot run git: ${r.error.message}\n`);
+    process.exit(2);
+  }
+  return r.status === 0 ? r.stdout : null;
+}
+
 const splitZ = (out) => (out ? out.split('\0').filter((s) => s !== '') : []);
 
 // git status prints literal filenames, but every command we hand them back to
@@ -160,22 +183,32 @@ function chunks(arr, n) {
 
 // A merge/rebase/cherry-pick/bisect in progress means the modifications on disk
 // are mid-operation state, not a stale ref advance. Nothing here is safe then.
+// A probe that cannot answer returns 'unknown' rather than "no operation": the
+// same failed-probe-reads-as-absence trap the classifier guards against, and just
+// as destructive here — it would hand a mid-merge tree to the checkout.
 function inProgressOp(repo) {
   const marker = (name) => {
     const p = git(repo, ['rev-parse', '--git-path', name]);
-    return p ? fs.existsSync(path.resolve(repo, p.trim())) : false;
+    if (p === null) return 'unknown';
+    return fs.existsSync(path.resolve(repo, p.trim()));
   };
-  if (marker('MERGE_HEAD')) return 'merge';
-  if (marker('rebase-merge') || marker('rebase-apply')) return 'rebase';
-  if (marker('CHERRY_PICK_HEAD')) return 'cherry-pick';
-  if (marker('REVERT_HEAD')) return 'revert';
-  if (marker('BISECT_LOG')) return 'bisect';
+  const named = { MERGE_HEAD: 'merge', 'rebase-merge': 'rebase', 'rebase-apply': 'rebase',
+    CHERRY_PICK_HEAD: 'cherry-pick', REVERT_HEAD: 'revert', BISECT_LOG: 'bisect' };
+  for (const [file, op] of Object.entries(named)) {
+    const m = marker(file);
+    if (m === 'unknown') return `git operation (could not read ${file})`;
+    if (m) return op;
+  }
   return null;
 }
 
-// `git status --porcelain=v1 -z -uno` records are NUL-terminated `XY <path>`;
-// a rename/copy record is followed by a second NUL-terminated field (its source
-// path), so the stream must be walked sequentially rather than split.
+// `git status --porcelain=v1 -z -uno` records are NUL-terminated `XY <path>`.
+// A rename/copy record is followed by a SECOND NUL-terminated field (its source
+// path), so the stream must be walked sequentially rather than split — and the
+// rename letter can sit in EITHER column: git detects worktree-side renames too
+// (`git add -N` then move gives " R new\0old\0"). Testing only xy[0] desyncs the
+// walk, so the source path gets parsed as the next status record and the tool
+// reports a path that does not exist.
 function trackedModified(repo) {
   const out = git(repo, ['status', '--porcelain=v1', '-z', '--untracked-files=no']);
   if (out === null) return null;
@@ -185,10 +218,28 @@ function trackedModified(repo) {
     const rec = fields[i];
     if (rec === '') continue;
     const xy = rec.slice(0, 2);
-    if (xy[0] === 'R' || xy[0] === 'C') i++; // consume the source-path field
+    if ('RC'.includes(xy[0]) || 'RC'.includes(xy[1])) i++; // consume the source-path field
     entries.push({ path: rec.slice(3), xy });
   }
   return entries;
+}
+
+// The paths git holds at a non-zero stage: an unresolved conflict. `git stash
+// apply` and `git apply --3way` leave these with NO MERGE_HEAD, so inProgressOp
+// does not see them, and their status letters are not always U (an add/add
+// conflict reads AA). ls-files -u is the direct question, so ask it rather than
+// inferring from letters.
+function unmergedPaths(repo, paths) {
+  const set = new Set();
+  for (const chunk of chunks(paths, 200)) {
+    const out = git(repo, ['ls-files', '-u', '-z', '--', ...chunk.map(spec)]);
+    if (out === null) return null;
+    for (const rec of splitZ(out)) {
+      const tab = rec.indexOf('\t');
+      if (tab >= 0) set.add(rec.slice(tab + 1));
+    }
+  }
+  return set;
 }
 
 // path -> blob sha at `commit`, restricted to `paths`. A submodule or subtree
@@ -240,7 +291,21 @@ function worktreeBlob(repo, p) {
     // permission error on a parent, say) leaves us ignorant, not informed.
     return e && e.code === 'ENOENT' ? ABSENT : UNKNOWN;
   }
-  if (!st.isFile() && !st.isSymbolicLink()) return UNKNOWN; // a directory, a socket…
+  // git stores a symlink as a blob holding its TARGET PATH, so the committed blob
+  // must be compared against the link itself. `hash-object <link>` follows the
+  // link and hashes the target's CONTENT instead — a sha that can never match, so
+  // every tracked symlink a merge touched would read as WIP and wedge the sync.
+  if (st.isSymbolicLink()) {
+    let target;
+    try {
+      target = fs.readlinkSync(path.resolve(repo, p));
+    } catch {
+      return UNKNOWN;
+    }
+    const out = gitIn(repo, ['hash-object', '--stdin'], target);
+    return out === null ? UNKNOWN : out.trim();
+  }
+  if (!st.isFile()) return UNKNOWN; // a directory, a fifo, a socket…
   const out = git(repo, ['hash-object', '--path', p, '--', p]);
   return out === null ? UNKNOWN : out.trim(); // unreadable file: present, uninspectable
 }
@@ -262,13 +327,20 @@ function behindOrHead(value, head, p, ancestors) {
   return null;
 }
 
-function classify(repo, entry, headBlobs, idxBlobs, ancestors) {
+function classify(repo, entry, headBlobs, idxBlobs, unmerged, ancestors) {
   const { path: p, xy } = entry;
 
-  // Renames, copies and unmerged paths are never the shape a stale ref advance
-  // leaves behind — they are deliberate index state. Refuse without looking.
-  if ('RCU'.includes(xy[0]) || 'RCU'.includes(xy[1])) {
-    return { verdict: 'wip', why: `the index carries a rename/copy/unmerged entry (${xy})` };
+  // An unresolved conflict holds its other side ONLY in the index's higher
+  // stages, which a checkout silently collapses away. Never the shape a stale ref
+  // advance leaves behind.
+  if (unmerged.has(p)) {
+    return { verdict: 'wip', why: `the index holds an unresolved conflict (${xy})` };
+  }
+  // Renames, copies and typechanges are deliberate index/worktree state, and a
+  // typechange (file <-> symlink) is a difference content identity cannot see.
+  // Refuse without looking.
+  if ('RCUT'.includes(xy[0]) || 'RCUT'.includes(xy[1])) {
+    return { verdict: 'wip', why: `the index carries a rename/copy/typechange/unmerged entry (${xy})` };
   }
 
   const head = headBlobs.has(p) ? headBlobs.get(p) : ABSENT;
@@ -283,15 +355,24 @@ function classify(repo, entry, headBlobs, idxBlobs, ancestors) {
   if (idxAt === null) {
     return { verdict: 'wip', why: 'the index holds content committed neither at HEAD nor in its recent ancestry' };
   }
-  const curAt = behindOrHead(worktreeBlob(repo, p), head, p, ancestors);
+  const cur = worktreeBlob(repo, p);
+  const curAt = behindOrHead(cur, head, p, ancestors);
   if (curAt === null) {
     return { verdict: 'wip', why: 'the working tree holds content committed neither at HEAD nor in its recent ancestry' };
   }
 
+  // git called this path modified, yet every blob matches HEAD's: whatever
+  // differs is something content identity cannot see — an executable bit, a
+  // typechange. It is therefore uncommitted BY DEFINITION, and a checkout would
+  // revert it. Content evidence cannot vouch for a non-content difference.
+  if (idxAt === '' && curAt === '') {
+    return { verdict: 'wip', why: 'git reports it modified though every blob matches HEAD — the difference is mode or type, which no content match can vouch for' };
+  }
+
   // Every side is either HEAD's own content or a committed older version of it:
   // nothing on disk is novel, so checking out HEAD discards nothing.
-  const base = curAt || idxAt || '';
-  return { verdict: 'stale', base, why: base ? `content matches this path at ${base.slice(0, 7)}` : 'already at HEAD' };
+  const base = curAt || idxAt;
+  return { verdict: 'stale', base, cur, idx, why: `content matches this path at ${base.slice(0, 7)}` };
 }
 
 // The newest ancestor that explains EVERY stale path. Not required to heal (each
@@ -320,7 +401,12 @@ function main() {
   if (headOut === null) usage('no HEAD commit');
   const head = headOut.trim();
 
-  const entries = trackedModified(repo) || [];
+  // NOT `|| []`: a status probe that failed tells us nothing, and "nothing"
+  // collapsed to "nothing modified" would report IN-SYNC/exit 0 — which licenses
+  // the caller to `git reset --hard main` over whatever is actually there. This is
+  // the single most load-bearing probe in the tool; it must fail like the rest.
+  const entries = trackedModified(repo);
+  if (entries === null) usage('cannot read git status — refusing to classify');
   if (entries.length === 0) {
     report(opts, { verdict: 'IN-SYNC', head, base: null, stale: [], wip: [], healed: [] }, 0);
   }
@@ -328,7 +414,10 @@ function main() {
   const paths = entries.map((e) => e.path);
   const headBlobs = treeBlobs(repo, head, paths);
   const idxBlobs = indexBlobs(repo, paths);
-  if (headBlobs === null || idxBlobs === null) usage('cannot read HEAD or the index — refusing to classify');
+  const unmerged = unmergedPaths(repo, paths);
+  if (headBlobs === null || idxBlobs === null || unmerged === null) {
+    usage('cannot read HEAD, the index, or its conflict stages — refusing to classify');
+  }
 
   // main's recent ancestry, newest first. First-parent: a stale root is behind the
   // tip's own line of advance, not behind some side branch's private history.
@@ -345,26 +434,38 @@ function main() {
   const stale = [];
   const wip = [];
   for (const e of entries) {
-    const c = classify(repo, e, headBlobs, idxBlobs, ancestors);
-    if (c.verdict === 'stale') stale.push({ path: e.path, base: c.base, why: c.why });
+    const c = classify(repo, e, headBlobs, idxBlobs, unmerged, ancestors);
+    if (c.verdict === 'stale') stale.push({ path: e.path, base: c.base, cur: c.cur, idx: c.idx, why: c.why });
     else wip.push({ path: e.path, why: c.why });
   }
   const base = commonBase(stale, ancestry);
 
   if (opts.apply && stale.length) {
-    for (const chunk of chunks(stale.map((s) => s.path), 200)) {
+    // Re-verify immediately before writing. Classification costs one git call per
+    // ancestor — seconds on a real repo — and the whole premise of this tool is a
+    // SHARED root that other jobs write to. A path that moved under us in that
+    // window is not the path we cleared, so it loses its clearance.
+    const raced = [];
+    const fresh = recheck(repo, stale, raced);
+    const written = [];
+    for (const chunk of chunks(fresh.map((s) => s.path), 200)) {
       if (git(repo, ['checkout', head, '--', ...chunk.map(spec)]) === null) {
         process.stderr.write('heal-stale-root: git checkout failed; root left partially healed\n');
-        report(opts, { verdict: 'ROOT-UNSYNCED', head, base, stale, wip, healed: [] }, 1);
+        // Report what was ALREADY written, not an empty list: a caller told
+        // `healed: []` believes the tree is untouched, and acts on that.
+        report(opts, { verdict: 'ROOT-UNSYNCED', head, base, stale, wip: wip.concat(raced), healed: written }, 1);
       }
+      written.push(...chunk);
     }
     // Trust the tree, not our own bookkeeping: re-read status and let what is
     // actually left decide the verdict.
-    const left = trackedModified(repo) || [];
-    const healed = stale.map((s) => s.path).filter((p) => !left.some((e) => e.path === p));
+    const left = trackedModified(repo);
+    if (left === null) usage('cannot re-read git status after the heal — the root state is unverified');
+    const healed = fresh.map((s) => s.path).filter((p) => !left.some((e) => e.path === p));
+    const known = wip.concat(raced);
     const stillWip = left.map((e) => ({
       path: e.path,
-      why: (wip.find((w) => w.path === e.path) || {}).why || `still modified after the heal (${e.xy})`,
+      why: (known.find((w) => w.path === e.path) || {}).why || `still modified after the heal (${e.xy})`,
     }));
     report(
       opts,
@@ -374,6 +475,22 @@ function main() {
   }
 
   report(opts, { verdict: wip.length ? 'ROOT-UNSYNCED' : 'STALE', head, base, stale, wip, healed: [] }, 1);
+}
+
+// Re-probe the stale set and keep only the paths still holding exactly what they
+// held when they were cleared. Anything that moved goes to `raced` as WIP — it
+// narrows the classify→checkout window to one probe, which is the best a tool can
+// do over a tree it does not lock.
+function recheck(repo, stale, raced) {
+  const idxNow = indexBlobs(repo, stale.map((s) => s.path));
+  if (idxNow === null) usage('cannot re-read the index before healing');
+  const fresh = [];
+  for (const s of stale) {
+    const idx = idxNow.has(s.path) ? idxNow.get(s.path) : ABSENT;
+    if (worktreeBlob(repo, s.path) === s.cur && idx === s.idx) fresh.push(s);
+    else raced.push({ path: s.path, why: 'it changed while this run was classifying — another job is writing here' });
+  }
+  return fresh;
 }
 
 function report(opts, r, code) {
