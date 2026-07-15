@@ -10,6 +10,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { loadConfig } = require('../lib/config.js');
+const { gitInit } = require('./helpers/git');
 
 function tmp() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'spor-cfg-'));
@@ -191,24 +192,6 @@ test('opt-in: enabled via the cascade (SPOR_ENABLED env, user config.json) activ
 });
 
 // ---------- linked git worktrees (issue-spor-cli-status-worktree-enable-detection) ----------
-
-const { spawnSync } = require('node:child_process');
-
-function gitInit(dir) {
-  const g = (args, cwd = dir) => {
-    const r = spawnSync('git', ['-C', cwd, ...args], {
-      encoding: 'utf8',
-      env: {
-        ...process.env, GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@example.com',
-        GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@example.com',
-      },
-    });
-    assert.equal(r.status, 0, r.stderr);
-    return r.stdout;
-  };
-  g(['init', '-q']);
-  return g;
-}
 
 test('opt-in: a linked worktree OUTSIDE the repo tree inherits the main checkout\'s enablement, even uncommitted', () => {
   const root = tmp();
