@@ -4548,24 +4548,42 @@ function agentIdGuess(id) {
 // is a convenience instead of the prefix-hint error
 // (task-spor-agent-use-label-resolution — the deferred follow-up to
 // isAgentId()/agentIdGuess() above). Remote: GET /v1/agents (already scoped to
-// agents the caller owns). Local: scan the graph's `type: agent` nodes. Matches
-// on the node's title (the label as stored) OR the plain `agent-<label>`
-// prefixing, so both a re-typed label and a copy-pasted un-prefixed id resolve.
-// Returns {id} on a unique match, {ambiguous:[...ids]} on more than one, or
-// null on no match — including any lookup failure, since this stays a
+// agents the caller owns; `label` per API.md's documented shape), falling back
+// to the /v1/changes audit projection on a 404 (an old server without the
+// dedicated route) exactly like cmdAgentListRemote does — so `use` never
+// rejects a label `list` can still show. Local: scan the graph's `type: agent`
+// nodes (their frontmatter carries the label as `title`). Matches on whichever
+// of `label`/`title` the source carries, OR the plain `agent-<label>`
+// prefixing, so both a re-typed label and a copy-pasted un-prefixed id
+// resolve. Returns {id} on a unique match, {ambiguous:[...ids]} on more than
+// one, or null on no match — including any lookup failure, since this stays a
 // convenience layered on top of the existing hint, never a hard dependency
 // (the deferral's stated reason for not doing this eagerly: a networked lookup
 // needs offline fail-soft, so any failure here just falls through to the
 // pre-existing invalid-id error).
 async function resolveAgentIdFromLabel(cfg, label) {
   const guessedId = `agent-${kebab(label)}`;
-  const isMatch = (a) => a && (a.title === label || a.id === guessedId);
+  const isMatch = (a) => a && (a.label === label || a.title === label || a.id === guessedId);
   try {
     let agents;
     if (cfg.mode() === "remote") {
       const r = await remote.get(cfg, "/v1/agents", { timeoutMs: 6000 });
-      if (!r.ok || !r.json || !Array.isArray(r.json.agents)) return null;
-      agents = r.json.agents;
+      if (r.ok && r.json && Array.isArray(r.json.agents)) {
+        agents = r.json.agents;
+      } else if (r.status === 404) {
+        const q = await remote.get(cfg, "/v1/changes?limit=500", { timeoutMs: 6000 });
+        if (!q.ok || !q.json || !Array.isArray(q.json.changes)) return null;
+        const seen = new Set();
+        agents = [];
+        for (const c of q.json.changes) {
+          if (!c || c.type !== "agent" || c.change === "D") continue;
+          if (seen.has(c.id)) continue;
+          seen.add(c.id);
+          agents.push({ id: c.id, title: c.title || "" });
+        }
+      } else {
+        return null;
+      }
     } else {
       const nodesDir = cfg.nodesDir();
       if (!fs.existsSync(nodesDir)) return null;

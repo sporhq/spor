@@ -377,6 +377,33 @@ test("agent use (remote): a label matching one of the caller's agents resolves v
   }
 });
 
+// GET /v1/agents' documented shape (API.md) carries `label`, not `title` — the
+// stub above uses `title` too (matching the /v1/changes fallback and local
+// graph nodes' frontmatter field), so this test locks in the REAL field name.
+test("agent use (remote): matches on the documented `label` field, not just `title`", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-user5-"));
+  const { srv, base } = await agentStub({ agentsList: [{ id: "agent-x", owner: "person-anthony", label: "myx", status: "active" }] });
+  try {
+    const r = await runAsync(["agent", "use", "myx"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /dispatch\.agent = agent-x \(resolved from label 'myx'\)/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("agent use (remote): a GET /v1/agents 404 (old server) falls back to the /v1/changes projection, same as `agent list`", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-user6-"));
+  const { srv, base } = await agentStub({}); // agentsList unset => /v1/agents 404 => /v1/changes
+  try {
+    const r = await runAsync(["agent", "use", "anthony-laptop"], remoteEnv(home, base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /dispatch\.agent = agent-anthony-laptop \(resolved from label 'anthony-laptop'\)/);
+  } finally {
+    srv.close();
+  }
+});
+
 test("agent use (remote): a label matching none of the caller's agents falls back to the prefix-hint error", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-user2-"));
   const { srv, base } = await agentStub({ agentsList: [{ id: "agent-someone-else", owner: "person-anthony", title: "someone-else", status: "active" }] });
