@@ -589,6 +589,91 @@ test("a stale tracked symlink is compared by its target, so it heals", () => {
   assert.equal(fs.readlinkSync(path.join(dir, "link")), "b.txt");
 });
 
+// ---------- clean filters, which launder novel bytes into old blobs ----------
+
+// The blob sha of a working file goes through the .gitattributes clean filters —
+// that is what makes it comparable to committed blobs at all — so a LOSSY clean
+// filter can normalize genuinely novel bytes down to a stale ancestor's blob.
+// Cleared on that evidence, the checkout would destroy the only copy of them.
+test("raw WIP bytes that a lossy clean filter normalizes to a stale blob are refused", () => {
+  if (process.platform === "win32") return; // the filter is a POSIX sed
+  const dir = initRepo();
+  git(dir, "config", "filter.strip.clean", "sed -e /PRIVATE/d"); // lossy on purpose
+  write(dir, ".gitattributes", "*.txt filter=strip\n");
+  write(dir, "a.txt", "v0\n");
+  commit(dir, "init");
+  casAdvance(dir, () => write(dir, "a.txt", "v1\n"));
+  // Genuine WIP whose CLEANED form equals the stale blob exactly: by filtered
+  // content alone this path is indistinguishable from a stale one.
+  write(dir, "a.txt", "v0\nPRIVATE: live work, committed nowhere\n");
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "ROOT-UNSYNCED");
+  assert.equal(r.status, 1);
+  assert.deepEqual(r.json.healed, []);
+  assert.equal(read(dir, "a.txt"), "v0\nPRIVATE: live work, committed nowhere\n", "the raw bytes survive");
+});
+
+// The other side of that gate: a ROUND-TRIP conversion (eol=crlf keeps LF blobs
+// in the odb and CRLF bytes on disk) makes raw differ from the blob on every
+// file it covers, yet the on-disk bytes are exactly what a checkout of the
+// matched commit writes. Refusing those would wedge the sync on every text file
+// of a Windows checkout — the platform this plugin supports natively.
+test("eol=crlf is a round-trip conversion, so a stale path still heals through it", () => {
+  const dir = initRepo();
+  write(dir, ".gitattributes", "*.txt text eol=crlf\n");
+  write(dir, "a.txt", "v0\r\n"); // CRLF on disk; the committed blob is LF
+  commit(dir, "init");
+  casAdvance(dir, () => write(dir, "a.txt", "v1\r\n"));
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "HEALED");
+  assert.equal(r.status, 0);
+  assert.equal(read(dir, "a.txt"), "v1\r\n", "healed to the merged content, in checkout form");
+  assert.equal(statusOf(dir), "");
+});
+
+// ---------- a write landing while the heal itself is running ----------
+
+// The checkout runs in 200-path chunks, so with one up-front recheck a path in a
+// later chunk would sit cleared-but-unwritten for the wall-clock of every earlier
+// chunk — plenty of room for a concurrent job's write to land and be overwritten.
+// The recheck is per-chunk, immediately before that chunk's checkout; a
+// post-checkout hook plays the concurrent job deterministically: the FIRST
+// chunk's checkout fires it, and it drops novel content into a SECOND-chunk path.
+test("a write landing between checkout chunks is caught by that chunk's own recheck", () => {
+  if (process.platform === "win32") return; // the concurrent writer is a sh hook
+  const dir = initRepo();
+  const names = [];
+  for (let i = 0; i <= 200; i++) names.push(`f${String(i).padStart(3, "0")}.txt`);
+  for (const n of names) write(dir, n, `${n} v0\n`);
+  commit(dir, "init");
+  casAdvance(dir, () => { for (const n of names) write(dir, n, `${n} v1\n`); });
+  const last = names[names.length - 1]; // sorts into the second chunk (201 = 200 + 1)
+  const hook = path.join(dir, ".git", "hooks", "post-checkout");
+  // Fire exactly once: an unguarded hook re-fires on the SECOND chunk's checkout
+  // too, re-creating the WIP right after that checkout destroyed it — and the
+  // aftermath is then indistinguishable from the write having been spared.
+  fs.writeFileSync(hook, [
+    "#!/bin/sh",
+    'if [ ! -e .git/raced-once ]; then',
+    "  : > .git/raced-once",
+    `  printf 'mid-heal WIP\\n' > '${last}'`,
+    "fi",
+    "exit 0",
+    "",
+  ].join("\n"));
+  fs.chmodSync(hook, 0o755);
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "ROOT-UNSYNCED", "the root is not fully in sync — a write raced the heal");
+  assert.equal(r.status, 1);
+  assert.equal(r.json.healed.length, 200, "every path the racer left alone still healed");
+  assert.equal(r.json.healed.includes(last), false);
+  assert.deepEqual(r.json.wip.map((w) => w.path), [last]);
+  assert.equal(read(dir, last), "mid-heal WIP\n", "the mid-heal write survives");
+});
+
 // ---------- conflicts, which hide their other side in the index ----------
 
 // An add/add conflict reads `AA` — no `U` for a letter-based check to catch — and

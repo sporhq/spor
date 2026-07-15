@@ -38,6 +38,15 @@
 // hides the same way. Both sides of every comparison below therefore carry the
 // mode, and a path is only ever cleared when mode AND blob match.
 //
+// …AND RAW BYTES, where the blob alone cannot vouch for them. The blob sha of a
+// working file is computed through the .gitattributes CLEAN filters (that is what
+// makes it comparable to a committed blob at all), so a LOSSY clean filter can
+// normalize novel on-disk bytes to an old committed blob — content that exists
+// nowhere else, wearing a stale path's fingerprint. A heal therefore also
+// requires the raw, unfiltered bytes on disk to be exactly what a checkout of
+// the matched commit would write (its blob with the smudge/eol side applied).
+// A round-trip conversion like eol=crlf passes; anything lossy refuses.
+//
 // This is the working-tree twin of spor-server's commit-time
 // scripts/check-stale-tree-revert.js (dec-spor-stale-tree-revert-commit-guard),
 // which flags the same byte-identical-rewind signature once it has already been
@@ -68,7 +77,8 @@
 //     eye — and it restores committed state rather than destroying new work.
 //   - Nothing locks the tree, so a job writing to a path between this run's
 //     classification and its checkout could still lose that write. The window is
-//     re-probed shut immediately before the checkout (see recheck), not closed.
+//     re-probed shut immediately before EACH checkout chunk (see recheck) — one
+//     subprocess spawn wide, per path actually about to be written — not closed.
 //
 // Usage:
 //   node scripts/heal-stale-root.js [--repo <dir>] [--lookback N] [--apply] [--json]
@@ -163,8 +173,18 @@ let hasWritten = false;
 // Returns stdout, or null when git exits non-zero. No caller reads null as an
 // answer: it means "we could not look", which lands on WIP or an exit.
 function git(repo, args, input) {
+  return gitRun(repo, args, input, 'utf8');
+}
+
+// As git(), but stdout stays a Buffer: committed blob content may be binary,
+// and a utf8 round-trip is lossy on it.
+function gitBuf(repo, args) {
+  return gitRun(repo, args, undefined, 'buffer');
+}
+
+function gitRun(repo, args, input, encoding) {
   const r = spawnSync('git', ['-C', repo, ...args], {
-    encoding: 'utf8',
+    encoding,
     maxBuffer: 64 * 1024 * 1024,
     ...(input === undefined ? {} : { input }),
   });
@@ -328,7 +348,9 @@ const fsCapabilities = (repo) => ({
   symlinks: boolConfig(repo, 'core.symlinks', true),
 });
 
-// The working tree's (mode, blob) for a path, as git itself would record it.
+// The working tree's (mode, blob) for a path, as git itself would record it —
+// plus `raw`, the sha of the bytes actually on disk with no filter applied,
+// which is what the clean-filter gate in classify() and the recheck compare.
 // `recordedMode` is the mode git keeps when the filesystem cannot represent the
 // real one (the index's, falling back to HEAD's).
 function worktreeState(repo, p, fsCaps, recordedMode) {
@@ -352,13 +374,17 @@ function worktreeState(repo, p, fsCaps, recordedMode) {
       return UNKNOWN;
     }
     const out = git(repo, ['hash-object', '--stdin'], target);
-    return out === null ? UNKNOWN : at('120000', out.trim());
+    if (out === null) return UNKNOWN;
+    // No filter ever applies to a link, so its target IS its raw bytes.
+    return { ...at('120000', out.trim()), raw: out.trim() };
   }
   if (!st.isFile()) return UNKNOWN; // a directory, a fifo, a socket…
   // --path makes the .gitattributes clean filters apply, so the sha is comparable
   // to a committed blob rather than to the raw bytes on disk.
   const out = git(repo, ['hash-object', '--path', p, '--', p]);
   if (out === null) return UNKNOWN; // unreadable file: present, uninspectable
+  const raw = git(repo, ['hash-object', '--no-filters', '--', p]);
+  if (raw === null) return UNKNOWN;
   let mode;
   if (!fsCaps.symlinks && recordedMode === '120000') {
     // A checked-out symlink on a filesystem without them: a plain file holding
@@ -373,7 +399,19 @@ function worktreeState(repo, p, fsCaps, recordedMode) {
     // difference refuses a healable path.
     mode = st.mode & 0o100 ? '100755' : '100644';
   }
-  return at(mode, out.trim());
+  return { ...at(mode, out.trim()), raw: raw.trim() };
+}
+
+// The exact bytes `git checkout <commit> -- <path>` would write into the working
+// tree: the committed blob with the smudge/eol side of the filters applied.
+// Reduced to a sha (of the bytes as-is, no clean filter) so the comparison
+// against the on-disk raw sha never decodes binary content and stays agnostic of
+// the repo's object format. null when either probe fails — never read as a match.
+function smudgedSha(repo, commit, p) {
+  const content = gitBuf(repo, ['cat-file', '--filters', `${commit}:${p}`]);
+  if (content === null) return null;
+  const out = git(repo, ['hash-object', '--stdin', '--no-filters'], content);
+  return out === null ? null : out.trim();
 }
 
 // ---------- classification ----------
@@ -392,7 +430,7 @@ function behindOrHead(value, head, p, ancestors) {
   return null;
 }
 
-function classify(repo, entry, headState, idx, ancestors, fsCaps) {
+function classify(repo, entry, headSha, headState, idx, ancestors, fsCaps) {
   const { path: p, xy } = entry;
 
   // An unresolved conflict holds its other side ONLY in the index's higher
@@ -432,6 +470,20 @@ function classify(repo, entry, headState, idx, ancestors, fsCaps) {
     return { verdict: 'wip', why: 'git reports it modified though the index and working tree both match HEAD' };
   }
 
+  // The clean-filter blind spot: `cur.sha` above went through the .gitattributes
+  // clean filters, so when the raw bytes on disk differ from that blob, the match
+  // vouches for the FILTERED content only — a lossy clean filter can normalize
+  // novel bytes to an old committed blob, and the checkout would destroy the one
+  // copy of them. Clear the path only when the raw bytes are exactly what a
+  // checkout of the matched commit would write (round-trip conversions like
+  // eol=crlf pass this; anything lossy does not).
+  if (cur !== ABSENT && cur.raw !== cur.sha) {
+    const smudged = smudgedSha(repo, curAt === '' ? headSha : curAt, p);
+    if (smudged === null || smudged !== cur.raw) {
+      return { verdict: 'wip', why: 'the raw on-disk bytes are not what any committed state checks out as — a clean filter is normalizing novel content' };
+    }
+  }
+
   // Every side is either HEAD's own state or a committed older one: nothing here
   // is novel, so checking out HEAD discards nothing.
   const base = curAt || idxAt;
@@ -448,13 +500,16 @@ function commonBase(stale, ancestry) {
   return null;
 }
 
-// Re-probe the stale set and keep only the paths still holding exactly what they
-// held when they were cleared. Anything that moved goes to `raced` as WIP — it
-// narrows the classify→checkout window to one probe, which is the best a tool can
-// do over a tree it does not lock.
+// Re-probe a chunk of the stale set and keep only the paths still holding
+// exactly what they held when they were cleared — (mode, blob) AND raw bytes, so
+// a racer whose novel content clean-normalizes to the same blob loses clearance
+// too. Anything that moved goes to `raced` as WIP — it narrows each path's
+// clearance→checkout window to one probe, which is the best a tool can do over a
+// tree it does not lock. Returns null when the index cannot be re-read: the
+// caller decides, because mid-heal an exit 2 would be a lie.
 function recheck(repo, stale, raced, fsCaps) {
   const idx = indexState(repo, stale.map((s) => s.path));
-  if (idx === null) usage('cannot re-read the index before healing');
+  if (idx === null) return null;
   const fresh = [];
   for (const s of stale) {
     // Re-test unmergedness too: a job running `git stash apply` in the window
@@ -464,7 +519,10 @@ function recheck(repo, stale, raced, fsCaps) {
       ? UNKNOWN
       : idx.state.has(s.path) ? idx.state.get(s.path) : ABSENT;
     const cur = worktreeState(repo, s.path, fsCaps, modeOf(now) || modeOf(s.cur));
-    if (same(cur, s.cur) && same(now, s.idx)) fresh.push(s);
+    // same() passing means cur and s.cur are both ABSENT or both real worktree
+    // states, and worktree states always carry raw — compared on the side, since
+    // same() also serves tree and index states, which have no raw bytes to hold.
+    if (same(cur, s.cur) && (cur === ABSENT || cur.raw === s.cur.raw) && same(now, s.idx)) fresh.push(s);
     else raced.push({ path: s.path, why: 'it changed while this run was classifying — another job is writing here' });
   }
   return fresh;
@@ -518,29 +576,52 @@ function main() {
   let stale = [];
   const wip = [];
   for (const e of entries) {
-    const c = classify(repo, e, headState, idx, ancestors, fsCaps);
+    const c = classify(repo, e, head, headState, idx, ancestors, fsCaps);
     if (c.verdict === 'stale') stale.push({ path: e.path, base: c.base, cur: c.cur, idx: c.idx, why: c.why });
     else wip.push({ path: e.path, why: c.why });
   }
 
   if (opts.apply && stale.length) {
-    // Re-verify immediately before writing. Classification costs one git call per
-    // ancestor — seconds on a real repo — and the whole premise of this tool is a
-    // SHARED root that other jobs write to. A path that moved under us in that
-    // window is not the path we cleared, so it loses its clearance.
+    // Re-verify immediately before writing — per CHUNK, not once for the whole
+    // set. Classification costs one git call per ancestor — seconds on a real
+    // repo — and the whole premise of this tool is a SHARED root that other jobs
+    // write to. A single up-front recheck would leave a path in the last chunk
+    // sitting un-re-verified for the wall-clock of every earlier chunk's
+    // checkout; its clearance is refreshed one subprocess spawn before the write
+    // that spends it. A path that moved in even that window is not the path we
+    // cleared, so it loses its clearance.
     const raced = [];
-    stale = recheck(repo, stale, raced, fsCaps);
-    const known = wip.concat(raced);
-    const base = commonBase(stale, ancestry);
+    const attempted = [];
+    const survivors = [];
     let failed = false;
-    for (const chunk of chunks(stale.map((s) => s.path), 200)) {
+    const pending = chunks(stale, 200);
+    for (let i = 0; i < pending.length; i++) {
+      const fresh = recheck(repo, pending[i], raced, fsCaps);
+      if (fresh === null) {
+        // The index went unreadable under us. Before any write that is a clean
+        // exit-2 refusal; after one, exit 2 would lie ("nothing was modified"),
+        // so fall through and let the tree say what actually landed. The
+        // un-rechecked remainder keeps its classification but is never written.
+        if (!hasWritten) usage('cannot re-read the index before healing');
+        process.stderr.write('heal-stale-root: cannot re-read the index mid-heal; root left partially healed\n');
+        survivors.push(...pending.slice(i).flat());
+        failed = true;
+        break;
+      }
+      survivors.push(...fresh);
+      if (!fresh.length) continue;
+      attempted.push(...fresh.map((s) => s.path));
       hasWritten = true; // git may write some entries before it reports failure
-      if (git(repo, ['checkout', head, '--', ...chunk.map(spec)]) === null) {
+      if (git(repo, ['checkout', head, '--', ...fresh.map((s) => spec(s.path))]) === null) {
         process.stderr.write('heal-stale-root: git checkout failed; root left partially healed\n');
+        survivors.push(...pending.slice(i + 1).flat());
         failed = true;
         break;
       }
     }
+    stale = survivors;
+    const known = wip.concat(raced);
+    const base = commonBase(stale, ancestry);
 
     // Trust the tree, not our own bookkeeping: re-read status and let what is
     // actually left say what was healed. This is also why a failed chunk is not
@@ -555,7 +636,7 @@ function main() {
       // `healed`, because which of them landed is exactly what we cannot say.
       report(opts, {
         verdict: 'UNVERIFIED', head, base, stale, wip: known, healed: [],
-        attempted: stale.map((s) => s.path),
+        attempted,
         note: 'the heal ran but git status could not be re-read, so what landed is unknown',
       }, 1);
     }
