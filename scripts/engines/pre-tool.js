@@ -235,6 +235,19 @@ function stripEnvAssignments(tokens) {
 // wrappers (unwrapped recursively). `depth` bounds that recursion (a finite
 // command string terminates naturally; this is a backstop against
 // pathological input, not an expected path).
+//
+// Known best-effort gaps, deliberately not chased further (this is a
+// regex-based scanner covering the idioms an honestly-wandering agent would
+// actually type, not a hardened shell interpreter — see the module doc
+// comment): a relative `--work-tree`/`GIT_WORK_TREE` is resolved against the
+// tracked `cd` dir rather than the exact `-C`-adjusted cwd git itself would
+// use; repeated relative `-C` flags on one invocation aren't chain-resolved;
+// and `dir` persists across `||`/`|`/`&`/subshell boundaries the same as
+// `&&`/`;` (a rare false-POSITIVE risk — an unrelated command after a failed
+// `cd` can read as still "inside" the shared checkout — never a false
+// negative). None of these come up in the `cd .. && git ...` /
+// `git -C/--work-tree <path> ...` / `sh -c "..."` forms this guard exists to
+// catch.
 function scanBashForViolation(command, cwd, session, depth = 0) {
   if (!command || depth > 4) return null;
   const segments = segmentsOf(command);
@@ -255,10 +268,16 @@ function scanBashForViolation(command, cwd, session, depth = 0) {
     return top;
   };
   for (const rawTokens of segments) {
+    // `env FOO=bar git ...` is the explicit-command spelling of the same
+    // temp-env idiom `FOO=bar git ...` covers implicitly — peel the leading
+    // `env` token off first so the `NAME=value` run right behind it is
+    // recognized the same way (best-effort: env's OWN flags like `env -i`
+    // aren't parsed, same as any other unrecognized flag elsewhere here).
+    const afterEnvCmd = rawTokens[0] === "env" ? rawTokens.slice(1) : rawTokens;
     // Strip a leading `NAME=value` run first — it never changes which
     // command this segment invokes, only (for `git`) where its effective
     // work tree resolves; every branch below keys off the same `tokens`.
-    const { env: segEnv, rest: tokens } = stripEnvAssignments(rawTokens);
+    const { env: segEnv, rest: tokens } = stripEnvAssignments(afterEnvCmd);
     if (!tokens.length) continue; // a bare `FOO=bar` assignment: nothing to check
     if (tokens[0] === "cd") {
       let target = tokens[1];
@@ -282,11 +301,15 @@ function scanBashForViolation(command, cwd, session, depth = 0) {
     if (tokens[0] !== "git") continue;
     const { subcommand, cDir, workTree } = parseGitInvocation(tokens);
     if (!subcommand || !GIT_WRITE_SUBCOMMANDS.has(subcommand)) continue;
+    // Precedence matches real git: an explicit --work-tree FLAG beats the
+    // GIT_WORK_TREE env var, which in turn beats a bare -C/-C-derived
+    // toplevel (verified empirically: `GIT_WORK_TREE=<a> git -C <b>
+    // rev-parse --show-toplevel` prints <a>, not <b> — env overrides -C).
     let effectiveDir = dir;
     if (workTree) effectiveDir = path.isAbsolute(workTree) ? workTree : path.join(dir, workTree);
-    else if (cDir) effectiveDir = path.isAbsolute(cDir) ? cDir : path.join(dir, cDir);
     else if (segEnv.GIT_WORK_TREE)
       effectiveDir = path.isAbsolute(segEnv.GIT_WORK_TREE) ? segEnv.GIT_WORK_TREE : path.join(dir, segEnv.GIT_WORK_TREE);
+    else if (cDir) effectiveDir = path.isAbsolute(cDir) ? cDir : path.join(dir, cDir);
     const top = resolveTop(effectiveDir);
     if (top && violatesIsolation(top, session))
       return deny(
