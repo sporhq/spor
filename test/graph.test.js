@@ -1059,6 +1059,76 @@ test("correction: full multi-line body renders in the digest footer", () => {
   assert.match(r.text, /> Always surface the actor-model spec and never the stale pricing notes\./);
 });
 
+// ---------- correction lifecycle (issue-spor-corrections-no-applied-lifecycle)
+// ----------
+//
+// A correction fires while status-less or "active"; once "applied" it must
+// stop injecting — the client-compile twin of the server's serve-time gate.
+
+test("correction: status-less (default active) correction fires exactly as before", () => {
+  const g = pricingFixture().load();
+  const r = graph.compile(g, { rootId: "dec-new", digest: false });
+  assert.match(r.text, /spec-actor/);
+  assert.match(r.text, /pinned by corr-global-1/);
+});
+
+test("correction: status: active correction fires exactly like status-less", () => {
+  const fx = pricingFixture();
+  fs.writeFileSync(path.join(fx.nodesDir, "corr-global-1.md"), `---
+id: corr-global-1
+type: correction
+title: Pin actor spec, exclude stale notes
+target: global
+pin: [spec-actor]
+exclude: [art-stale]
+status: active
+date: 2026-06-10
+---
+Always surface the actor-model spec and never the stale pricing notes.
+`);
+  const r = graph.compile(fx.load(), { rootId: "dec-new", digest: false });
+  assert.match(r.text, /spec-actor/);
+  assert.match(r.text, /pinned by corr-global-1/);
+});
+
+test("correction: status: applied correction stops firing (global scope)", () => {
+  const fx = pricingFixture();
+  fs.writeFileSync(path.join(fx.nodesDir, "corr-global-1.md"), `---
+id: corr-global-1
+type: correction
+title: Pin actor spec, exclude stale notes
+target: global
+pin: [spec-actor]
+exclude: [art-stale]
+status: applied
+date: 2026-06-10
+---
+Always surface the actor-model spec and never the stale pricing notes.
+`);
+  const r = graph.compile(fx.load(), { rootId: "dec-new", digest: true });
+  assert.ok(!r.text.includes("pinned by corr-global-1"), "applied correction must not pin");
+  assert.ok(!r.text.includes("Standing corrections:"), "applied correction must not render guidance");
+});
+
+test("correction: status: applied correction stops firing (node-targeted scope)", () => {
+  const fx = correctionScopeFixture();
+  const raw = fs.readFileSync(path.join(fx.nodesDir, "corr-dec-new-1.md"), "utf8");
+  fs.writeFileSync(path.join(fx.nodesDir, "corr-dec-new-1.md"), raw.replace("date: 2026-06-10", "status: applied\ndate: 2026-06-10"));
+  const r = graph.compile(fx.load(), { query: "provider neutral catalogue pricing", digest: true });
+  assert.equal(r.relevant, true);
+  assert.ok(!r.text.includes("Standing corrections:"), "an applied node-targeted correction must not fire at all");
+  assert.ok(!r.text.includes("stale pricing notes keep misleading"), "applied correction body must not render");
+});
+
+test("correction: status: applied correction stops firing (project scope)", () => {
+  const fx = correctionScopeFixture();
+  const raw = fs.readFileSync(path.join(fx.nodesDir, "corr-project-my-project-1.md"), "utf8");
+  fs.writeFileSync(path.join(fx.nodesDir, "corr-project-my-project-1.md"), raw.replace("date: 2026-06-11", "status: applied\ndate: 2026-06-11"));
+  const r = graph.compile(fx.load(), { query: "provider neutral catalogue pricing", digest: true, project: "my-project" });
+  assert.ok(!r.text.includes("quote prices only from the published catalogue"),
+    "applied project-scoped correction must not fire even with a matching project");
+});
+
 // ---------- validateNode ----------
 
 test("validateNode: accepts a well-formed node", () => {

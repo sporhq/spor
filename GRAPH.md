@@ -1018,10 +1018,27 @@ Free-text guidance, injected verbatim into the compile for the target.
 how humans debug the context instead of the model: fix it once, it applies to
 every future compile.
 
+**Lifecycle** (`status`, 2026.07.15.1, issue-spor-corrections-no-applied-
+lifecycle): `active` (or no `status` at all) is the default and means the
+guidance is still standing — it keeps injecting at every in-scope compile.
+`applied` means a recompile already absorbed the correction's guidance into
+the target's briefing body, so it is retired and stops injecting — otherwise
+an absorbed correction is dead weight that keeps re-injecting into every
+future compile/serve of its target forever. Both the client compile
+(`correctionInScope`/`corrections` in `lib/kernel/graph.js`) and the server's
+serve-time gate (`correctionsForBriefing`/`applyBriefingCorrections`) filter
+out non-`active` corrections — keep the two in sync, held-guard-style. A
+node-targeted correction (`target: <node-id>`, not `global`/`project:<slug>`)
+is flipped to `applied` by the recompile flow that absorbs it (`/spor:brief`
+step 3); `global`/`project:<slug>` corrections are standing, broad-scope
+guidance and are not auto-retired by any single recompile.
+
 ## Briefing nodes
 
 Created by the distiller or `/spor:brief`. Carry `derived-from` edges to
-every source node and `shaped-by` edges to applied corrections, plus a
+every source node and `shaped-by` edges to the corrections that fired for this
+compile (not necessarily `status: applied` yet — a `global`/`project:<slug>`
+correction can `shaped-by` many briefings over its lifetime), plus a
 `version:` integer. On recompile the old version is archived to
 the graph home's `history/` and the version bumps. `brief-project` is the standing
 project briefing injected at session start.
