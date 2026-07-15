@@ -439,6 +439,27 @@ test("an uncommitted chmod +x is not 'already at HEAD' — the exec bit survives
   assert.equal(fs.statSync(path.join(dir, "run.sh")).mode & 0o111, 0o111, "the exec bit survives");
 });
 
+// The intersection that a "consult mode only when content evidence is exhausted"
+// guard misses: the CONTENT is genuinely stale (so a content-only comparison
+// finds its ancestor and clears the path), while an uncommitted chmod rides along
+// on the same file and dies in the heal. Identity has to be (mode, blob) for both
+// halves at once, not blob with mode as a fallback.
+test("a stale path carrying an uncommitted chmod +x is refused — the mode rides with the content", () => {
+  if (process.platform === "win32") return; // no exec bit to lose
+  const dir = initRepo();
+  write(dir, "run.sh", "v0\n");
+  commit(dir, "init");
+  casAdvance(dir, () => write(dir, "run.sh", "v1\n")); // content is now genuinely stale
+  fs.chmodSync(path.join(dir, "run.sh"), 0o755); // …and someone made it executable, uncommitted
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "ROOT-UNSYNCED");
+  assert.equal(r.status, 1);
+  assert.deepEqual(r.json.healed, []);
+  assert.equal(fs.statSync(path.join(dir, "run.sh")).mode & 0o111, 0o111, "the exec bit survives");
+  assert.equal(read(dir, "run.sh"), "v0\n", "and the file is left alone entirely");
+});
+
 test("a tracked file swapped for a symlink (typechange) is refused", () => {
   if (process.platform === "win32") return; // symlinks need privilege there
   const dir = initRepo();
