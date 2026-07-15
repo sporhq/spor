@@ -24,9 +24,11 @@ Steps:
    (issue-spor-remote-digest-project-blind). `spor status` already resolves the
    slug the same way session-start does (local vs remote, `.spor` marker
    overrides, worktree main-repo inference); read it back instead of
-   recomputing it:
+   recomputing it. Use `--quiet` so this doesn't pay for the remote health
+   probe / identity lookup (up to several seconds of network round-trip) just
+   to read a locally-resolved field:
    ```bash
-   SLUG="$(spor status 2>/dev/null | sed -n 's/^project:[[:space:]]*//p')"
+   SLUG="$(spor status --quiet 2>/dev/null | sed -n 's/^project:[[:space:]]*//p')"
    ```
    Then run the one command (the CLI compiles locally or dispatches to the server
    per the resolved mode, just like the `spor brief`/`spor compile` verbs):

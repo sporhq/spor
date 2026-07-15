@@ -206,7 +206,8 @@ function localMuteNoOp(nodesDir) {
   }
 }
 
-async function cmdStatus(cfg) {
+async function cmdStatus(cfg, { values }) {
+  const quiet = !!(values && values.quiet);
   const mode = cfg.mode();
   const home = cfg.graphHome();
   const nodesDir = cfg.nodesDir();
@@ -216,17 +217,25 @@ async function cmdStatus(cfg) {
   if (mode === "remote") {
     const server = remote.base(cfg);
     out(`server:   ${server}`);
-    const probe = await remote.get(cfg, "/v1/status", { timeoutMs: 6000 });
-    if (probe.transport) out(`health:   OFFLINE — could not reach server (${probe.error})`);
-    else if (probe.status === 401 || probe.status === 403) out(`health:   AUTH FAILED (${probe.status}) — token invalid, revoked, or expired`);
-    else if (!probe.ok) out(`health:   error ${probe.status}`);
-    else {
-      const n = probe.json && probe.json.node_count;
-      out(`health:   OK${n != null ? ` (${n} nodes)` : ""}`);
+    // --quiet (issue-spor-status-health-probe-latency): skip the round-trips
+    // (up to a 6s health probe + a 5s identity lookup) for callers that only
+    // want the locally-resolved mode/project/graph fields — e.g. skills that
+    // shell out to `spor status` purely to read back the project slug.
+    if (!quiet) {
+      const probe = await remote.get(cfg, "/v1/status", { timeoutMs: 6000 });
+      if (probe.transport) out(`health:   OFFLINE — could not reach server (${probe.error})`);
+      else if (probe.status === 401 || probe.status === 403) out(`health:   AUTH FAILED (${probe.status}) — token invalid, revoked, or expired`);
+      else if (!probe.ok) out(`health:   error ${probe.status}`);
+      else {
+        const n = probe.json && probe.json.node_count;
+        out(`health:   OK${n != null ? ` (${n} nodes)` : ""}`);
+      }
     }
     out(`token:    ${remote.token(cfg) ? "present" : "MISSING"}`);
-    const who = await identity(cfg);
-    out(`identity: ${who}`);
+    if (!quiet) {
+      const who = await identity(cfg);
+      out(`identity: ${who}`);
+    }
   } else {
     const c = nodeCount(nodesDir);
     if (c == null) out(`graph:    ${nodesDir} (not created — run 'spor init')`);
@@ -8686,10 +8695,14 @@ const COMMANDS = {
     run: (cfg, p) => cmdUpgrade(cfg, p),
   },
   status: {
-    group: "Getting started", parse: "strict", args: "", options: {},
+    group: "Getting started", parse: "strict", args: "",
+    options: {
+      quiet: { type: "boolean", short: "q", desc: "skip the remote health probe + identity lookup (local fields only, no network round-trip)" },
+    },
     summary: "resolved mode, graph, project, identity, health",
-    help: "Print the resolved mode (local/remote), graph home, project slug, identity,\nand a health probe. In local mode it also warns of a split-brain claude.ai\nSpor MCP connector; it always surfaces the Node prerequisite line.",
-    run: (cfg) => cmdStatus(cfg),
+    help: "Print the resolved mode (local/remote), graph home, project slug, identity,\nand a health probe. In local mode it also warns of a split-brain claude.ai\nSpor MCP connector; it always surfaces the Node prerequisite line.\n\n--quiet skips the remote health probe and identity lookup (each a network\nround-trip, the health probe up to 6s) — use it when a caller only needs the\nlocally-resolved mode/project/graph fields, e.g. a skill reading back the\nproject slug.",
+    examples: ["spor status", "spor status --quiet"],
+    run: (cfg, p) => cmdStatus(cfg, p),
   },
   join: {
     group: "Getting started", parse: "strict", args: "[url] <token>",

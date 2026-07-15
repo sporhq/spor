@@ -92,7 +92,11 @@ rest are mode-specific (`spor status` confirms which mode you're in):
 
 ```bash
 # either mode (the CLI self-resolves local vs remote per verb)
-spor status                    # resolved mode, graph, project, identity, health
+spor status [--quiet]          # resolved mode, graph, project, identity, health
+                               #   (--quiet skips the remote health probe + identity
+                               #   lookup — up to several seconds of round-trip — when
+                               #   a caller only needs a locally-resolved field like
+                               #   `project:`)
 spor next [--project <slug>]   # the ranked decision queue — "what's next"
 spor get <id>                  # one node by id
 spor put-node [<file>|-] --if-exists <error|skip|update> [--revision <sha>]

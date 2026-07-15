@@ -482,6 +482,58 @@ test('status (remote) does NOT warn of split-brain even with a Spor connector', 
   assert.doesNotMatch(r.stdout, SPLIT);
 });
 
+// --- --quiet skips the remote health probe + identity lookup
+// (issue-spor-status-health-probe-latency): a caller that only wants a
+// locally-resolved field (e.g. the brief skill reading back `project:`)
+// shouldn't pay for the up-to-6s health round-trip.
+test('status (remote) without --quiet includes health/identity lines', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-remote-status-full-'));
+  const r = run(['status'], {
+    SPOR_HOME: home,
+    SPOR_SERVER: 'http://127.0.0.1:9',
+    SPOR_TOKEN: 'tok',
+  });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /mode:\s+remote/);
+  assert.match(r.stdout, /^health:/m);
+  assert.match(r.stdout, /^identity:/m);
+});
+
+test('status (remote) --quiet skips health probe and identity lookup', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-remote-status-quiet-'));
+  const r = run(['status', '--quiet'], {
+    SPOR_HOME: home,
+    SPOR_SERVER: 'http://127.0.0.1:9',
+    SPOR_TOKEN: 'tok',
+  });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /mode:\s+remote/);
+  assert.match(r.stdout, /^project:/m);
+  assert.match(r.stdout, /^token:\s+present/m);
+  assert.doesNotMatch(r.stdout, /^health:/m);
+  assert.doesNotMatch(r.stdout, /^identity:/m);
+});
+
+test('status -q is the short form of --quiet', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-remote-status-q-'));
+  const r = run(['status', '-q'], {
+    SPOR_HOME: home,
+    SPOR_SERVER: 'http://127.0.0.1:9',
+    SPOR_TOKEN: 'tok',
+  });
+  assert.strictEqual(r.status, 0);
+  assert.doesNotMatch(r.stdout, /^health:/m);
+  assert.doesNotMatch(r.stdout, /^identity:/m);
+});
+
+test('status (local) --quiet is a no-op (already no network round-trip)', () => {
+  const { dir } = fixtureGraph();
+  const withQuiet = run(['status', '--quiet'], { SPOR_HOME: dir });
+  const without = run(['status'], { SPOR_HOME: dir });
+  assert.strictEqual(withQuiet.status, 0);
+  assert.strictEqual(withQuiet.stdout, without.stdout);
+});
+
 test('validate is byte-identical passthrough to lib/validate.js', () => {
   const { nodes } = fixtureGraph();
   const viaCli = run(['validate', '--nodes', nodes]);
