@@ -160,10 +160,12 @@ The fix is to let the log **roll over**, not to grow one node forever:
   for the next stretch of entries — same subject, new id with an incrementing
   suffix (`art-cc-capture-discipline-results` → `art-cc-capture-discipline-results-2`
   → `-3`, …) and a title noting it ("part 2 (2026-07 onward)").
-  `spor validate` (and any local-mode `put-node`/`add` write) warns once a
-  node's body passes ~90% of the cap, specifically so there is still room to
-  make this move before a write is rejected outright — don't wait for the
-  hard failure.
+  `spor validate` warns once a node's body passes ~90% of the cap, specifically
+  so there is still room to make this move before a write is rejected outright
+  — don't wait for the hard failure. (The warning is a graph-wide lint pass,
+  not a per-write gate: `spor add`/`put-node` don't check it at write time, so
+  run `spor validate` periodically on a running-log's home graph rather than
+  relying on the write itself to flag it.)
 - Link the new part back to the one it continues with a `derived-from` edge
   (this node was produced from — i.e. continues — the target), and update the
   earlier part's summary to say it is superseded/continued so a reader
