@@ -1280,6 +1280,67 @@ test("dispatch --template (node mode): fills {{node}} and {{title}}", () => {
   assert.match(prompt, /TITLE=A demo decision about auth token rotation/);
 });
 
+test("dispatch --template (node mode): fills {{id}}/{{summary}}/{{type}}/{{status}}/{{date}} from the dispatched node's frontmatter", () => {
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const tpl = path.join(home, "f.tpl");
+  fs.writeFileSync(tpl, "ID={{id}}\nSUMMARY={{summary}}\nTYPE={{type}}\nSTATUS={{status}}\nDATE={{date}}\n");
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cwd-"));
+  const r = run(["dispatch", "dec-x", "--template", tpl, "--print"], { SPOR_HOME: home }, elsewhere);
+  assert.strictEqual(r.status, 0);
+  const prompt = promptOf(r.stdout);
+  assert.match(prompt, /ID=dec-x/);
+  assert.match(prompt, /SUMMARY=A demo decision describing auth token rotation and credential handling for the pipeline\./);
+  assert.match(prompt, /TYPE=decision/);
+  assert.match(prompt, /STATUS=\n/); // dec-x fixture carries no status: line — blanks out, not "unknown"
+  assert.match(prompt, /DATE=2026-06-01/);
+});
+
+test("dispatch --template: node fields blank out in free-text dispatch (no target node)", () => {
+  const { home, repo } = fixture();
+  const tpl = path.join(home, "b.tpl");
+  fs.writeFileSync(tpl, "ID={{id}}|SUMMARY={{summary}}|TYPE={{type}}|STATUS={{status}}|DATE={{date}}\n");
+  const r = run(["dispatch", "auth token rotation credentials", "--dir", repo, "--template", tpl, "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0);
+  const prompt = promptOf(r.stdout);
+  assert.match(prompt, /ID=\|SUMMARY=\|TYPE=\|STATUS=\|DATE=/);
+});
+
+test("dispatch --template: {{summary}} preserves a YAML folded multi-line value (not truncated to the first line)", () => {
+  const { home, repo } = fixture();
+  fs.writeFileSync(
+    path.join(home, "nodes", "dec-folded.md"),
+    "---\nid: dec-folded\ntype: decision\nrepo: demo\ntitle: A folded-summary decision\n" +
+      "summary: A summary that folds\n  across a second line\n  and a third line too.\n---\nBody text.\n"
+  );
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const tpl = path.join(home, "fold.tpl");
+  fs.writeFileSync(tpl, "SUMMARY={{summary}}\n");
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cwd-"));
+  const r = run(["dispatch", "dec-folded", "--template", tpl, "--print"], { SPOR_HOME: home }, elsewhere);
+  assert.strictEqual(r.status, 0);
+  const prompt = promptOf(r.stdout);
+  assert.match(prompt, /SUMMARY=A summary that folds across a second line and a third line too\./);
+});
+
+test("dispatch --template: {{status}} does not false-match a body line that happens to start with 'status:'", () => {
+  const { home, repo } = fixture();
+  fs.writeFileSync(
+    path.join(home, "nodes", "dec-nostatus.md"),
+    "---\nid: dec-nostatus\ntype: decision\nrepo: demo\ntitle: A decision with no status field\n" +
+      "summary: A decision whose body happens to mention a status line.\n---\n" +
+      "status: still needs follow-up work per the team.\n"
+  );
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const tpl = path.join(home, "nostatus.tpl");
+  fs.writeFileSync(tpl, "STATUS=[{{status}}]\n");
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cwd-"));
+  const r = run(["dispatch", "dec-nostatus", "--template", tpl, "--print"], { SPOR_HOME: home }, elsewhere);
+  assert.strictEqual(r.status, 0);
+  const prompt = promptOf(r.stdout);
+  assert.match(prompt, /STATUS=\[\]/);
+});
+
 test("dispatch --template: {{default}} embeds the built-in prompt; unknown placeholders warn and blank out", () => {
   const { home, repo } = fixture();
   const tpl = path.join(home, "w.tpl");

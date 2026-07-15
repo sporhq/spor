@@ -6134,7 +6134,8 @@ function fmField(raw, key) {
   return m ? m[1].trim() : null;
 }
 
-// Resolve a node id to { id, raw, repo, title } or null if it doesn't exist.
+// Resolve a node id to { id, raw, repo, title, summary, type, status, date } or
+// null if it doesn't exist.
 async function resolveNode(cfg, id) {
   let raw = "";
   // The server's get(node) hook attaches read-time enrichment as additive
@@ -6161,7 +6162,31 @@ async function resolveNode(cfg, id) {
       return null;
     }
   }
-  return { id, raw, repo: fmField(raw, "repo") || fmField(raw, "project"), title: fmField(raw, "title") || "", resolution, held };
+  // Parse the frontmatter with the real parser (lib/kernel/graph.js), not
+  // fmField: fmField's single-line regex both truncates YAML folded
+  // multi-line values and, unbounded by the closing `---`, can false-match a
+  // body line that happens to start with "key: " — a real risk for
+  // summary/type/status/date, all plausible words in body prose. parsed is
+  // {} on malformed/missing frontmatter, matching fmField's null->"" fallback.
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  let parsed = {};
+  try {
+    parsed = graphLib.parseFrontmatter(raw, `${id}.md`);
+  } catch {
+    /* malformed frontmatter — fields below fall back to "" */
+  }
+  return {
+    id,
+    raw,
+    repo: parsed.repo || parsed.project || null,
+    title: parsed.title || "",
+    summary: parsed.summary || "",
+    type: parsed.type || "",
+    status: parsed.status || "",
+    date: parsed.date || "",
+    resolution,
+    held,
+  };
 }
 
 // Is this node ALREADY RESOLVED — so dispatching an agent at it would just redo
@@ -6897,6 +6922,10 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   let brief = "";
   let instruction = "";
   let nodeTitle = "";
+  let nodeSummary = "";
+  let nodeType = "";
+  let nodeStatus = "";
+  let nodeDate = "";
   let resolvedReason = null; // set in node mode when the target is already resolved
   let readinessCheck = null; // set in node mode: {readiness, reasons} — the agent-readiness guard
 
@@ -6932,6 +6961,10 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     dispatchNodeRaw = node.raw || null;
     targetSlug = targetSlug || node.repo || null;
     nodeTitle = node.title || "";
+    nodeSummary = node.summary || "";
+    nodeType = node.type || "";
+    nodeStatus = node.status || "";
+    nodeDate = node.date || "";
     resolvedReason = dispatchResolutionReason(cfg, node);
     readinessCheck = dispatchReadinessCheck(cfg, node);
     if (!noBrief) brief = await compileBriefing(cfg, { nodeId, full, project: targetSlug });
@@ -7069,8 +7102,9 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     const r = renderTemplate(template, {
       brief, briefing: brief, neighbourhood: brief, neighborhood: brief,
       task: instruction, instruction,
-      node: nodeId || "", node_id: nodeId || "",
+      node: nodeId || "", node_id: nodeId || "", id: nodeId || "",
       title: nodeTitle,
+      summary: nodeSummary, type: nodeType, status: nodeStatus, date: nodeDate,
       slug: res.slug || "", project: res.slug || "", repo: res.slug || "",
       dir: res.dir || "",
       default: defaultPrompt,
@@ -7078,7 +7112,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     if (r.unknown.length) {
       err(
         `warning: unknown template placeholder(s): ${[...new Set(r.unknown)].join(", ")} ` +
-          `(available: brief, task, node, title, slug, dir, default)`
+          `(available: brief, task, node, id, title, summary, type, status, date, slug, dir, default)`
       );
     }
     prompt = r.text;
@@ -9455,8 +9489,10 @@ const COMMANDS = {
       "it runs with cwd=worktree and SPOR_WORKTREE/SPOR_MAIN_CHECKOUT/\n" +
       "SPOR_DISPATCH_SLUG|NODE in the env (e.g. symlink node_modules, write\n" +
       ".claude/settings.local.json env). --no-worktree opts a single run out.\n\n" +
-      "--template supplies your own prompt with {{brief}}/{{task}}/{{node}}/{{title}}/\n" +
-      "{{slug}}/{{dir}}/{{default}} placeholders.\n\n" +
+      "--template supplies your own prompt with {{brief}}/{{task}}/{{node}}/{{id}}/{{title}}/\n" +
+      "{{summary}}/{{type}}/{{status}}/{{date}}/{{slug}}/{{dir}}/{{default}} placeholders\n" +
+      "(the node fields are populated from the dispatched node's frontmatter, blank in\n" +
+      "free-text/--backfill dispatch).\n\n" +
       "Two different 'agent' axes, don't confuse them: --as picks the Spor agent\n" +
       "IDENTITY the dispatch runs AS (attribution 'agent on behalf of person',\n" +
       "remote-only; defaults to dispatch.agent — set it with 'spor agent use <id>').\n" +
