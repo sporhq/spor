@@ -468,6 +468,33 @@ test("paths with spaces and unicode survive the -z status parse", () => {
   assert.equal(read(dir, "ünïcode/påth.md"), "u1\n");
 });
 
+// issue-spor-heal-stale-root-non-utf8-mangling: a path is a sequence of bytes,
+// not text, and git enforces no encoding on it. This filename's second byte
+// (0xe9) is not valid UTF-8 on its own — decoding the tool's git-status output
+// as utf8 (the bug) folds it to U+FFFD, a string that can never be matched back
+// against the real on-disk path, so the tool refuses forever instead of
+// healing. Only Linux filesystems store raw bytes like this; macOS normalizes
+// to NFD Unicode and Windows filenames are UTF-16, so neither can even create
+// this fixture.
+test("a tracked path with non-UTF-8 bytes in its name heals like any other stale path", () => {
+  if (process.platform !== "linux") return; // only a Linux filesystem accepts raw non-UTF-8 bytes in a name
+  const dir = initRepo();
+  const rawName = Buffer.from([0x66, 0xe9, 0x2e, 0x74, 0x78, 0x74]); // "f\xe9.txt" — \xe9 alone is invalid UTF-8
+  const abs = Buffer.concat([Buffer.from(dir), Buffer.from("/"), rawName]);
+  // `write()` takes the path as a JS string, which cannot represent these
+  // bytes losslessly — write straight to the raw path instead and let
+  // commit()'s `git add -A` (no pathspec argv at all) pick it up off disk.
+  fs.writeFileSync(abs, "v0\n");
+  commit(dir, "init");
+  casAdvance(dir, () => fs.writeFileSync(abs, "v1\n"));
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "HEALED");
+  assert.equal(r.status, 0);
+  assert.equal(fs.readFileSync(abs, "utf8"), "v1\n", "the merged content is restored");
+  assert.equal(statusOf(dir), "", "index and working tree both match main");
+});
+
 // ---------- differences content identity cannot see ----------
 
 test("an uncommitted chmod +x is not 'already at HEAD' — the exec bit survives", () => {

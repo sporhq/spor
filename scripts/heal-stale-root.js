@@ -47,6 +47,20 @@
 // the matched commit would write (its blob with the smudge/eol side applied).
 // A round-trip conversion like eol=crlf passes; anything lossy refuses.
 //
+// PATH BYTES ARE NOT UTF-8. A tracked path is a sequence of bytes with no
+// encoding guarantee — git enforces none, and a legacy or migrated repo can
+// hold latin1, cp1252, or simply invalid byte sequences in a filename. Node's
+// child_process always re-encodes string argv as UTF-8 on the way out, so a
+// path that was lossily decoded on the way in (replacing bad bytes with
+// U+FFFD) can never be told apart from, or handed back to git as, the path it
+// came from — that mismatch reads as WIP forever, wedging the very state this
+// tool exists to unwedge. Every place a path crosses the node/git boundary
+// below therefore carries raw bytes: output that embeds a path is decoded
+// latin1 (a lossless byte<->codepoint mapping, unlike utf8's substitution),
+// and a path is only ever placed in argv when re-encoding it as UTF-8 would
+// reproduce those exact bytes (i.e. it already was valid UTF-8) — otherwise it
+// travels through a file or stdin instead, neither of which re-encodes.
+//
 // This is the working-tree twin of spor-server's commit-time
 // scripts/check-stale-tree-revert.js (dec-spor-stale-tree-revert-commit-guard),
 // which flags the same byte-identical-rewind signature once it has already been
@@ -120,6 +134,7 @@
 // Zero-dependency, plain Node + the git binary — runs anywhere the plugin does.
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
@@ -190,6 +205,36 @@ function gitBuf(repo, args) {
   return gitRun(repo, args, undefined, 'buffer');
 }
 
+// As git(), but for output that EMBEDS PATHS (status/ls-tree/ls-files): decoded
+// latin1, not utf8. latin1 maps every byte 0-255 to its own code unit — lossy
+// in neither direction, unlike utf8 which folds any invalid byte sequence to
+// U+FFFD and can never be told apart from another path that decoded the same
+// way. Every delimiter these formats use (NUL, tab, space) is plain ASCII, so
+// the existing split/slice/indexOf parsing below is byte-for-byte identical
+// under latin1 — only the PATH portion's meaning changes, from "best-effort
+// unicode text" to "exactly the bytes on disk".
+function gitPaths(repo, args, input) {
+  return gitRun(repo, args, input, 'latin1');
+}
+
+// Is `p` (a latin1-decoded path, i.e. its original raw bytes one-to-one) safe
+// to hand back to git as a plain argv string? Node re-encodes argv as UTF-8 no
+// matter what encoding produced the JS string, so the only paths that survive
+// that round trip are ones whose raw bytes already WERE valid UTF-8 — decoding
+// them and letting node re-encode reproduces the identical bytes. Returns the
+// decoded string to embed in argv, or null when the path cannot be expressed
+// there at all (the caller must route it through a file or stdin instead, or
+// refuse). TextDecoder's `fatal` option is the strict validator: unlike
+// Buffer#toString('utf8'), it throws on the very sequences that motivate this
+// whole file rather than silently substituting U+FFFD.
+function utf8OrNull(p) {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(p, 'latin1'));
+  } catch {
+    return null;
+  }
+}
+
 function gitRun(repo, args, input, encoding) {
   const r = spawnSync('git', ['-C', repo, ...args], {
     encoding,
@@ -217,13 +262,21 @@ const splitZ = (out) => (out ? out.split('\0').filter((s) => s !== '') : []);
 // matches it literally rather than globbing (checked on git 2.43 — the glob only
 // takes over when nothing matches the name exactly). That is luck, not a
 // guarantee we should hold a data-loss tool up with.
+//
+// `p` must already be argv-safe (utf8OrNull's non-null result) — this goes
+// straight into a spawn argv, so a raw latin1 byte string here would silently
+// re-encode to the wrong bytes on the way out. Callers that only have a path's
+// latin1 form route it through a pathspec file or stdin instead (see below).
 const spec = (p) => `:(literal)${p}`;
 
 // Chunk paths for one git invocation: at most `n` entries AND at most ~20KB of
 // path bytes, whichever fills first. The byte cap is for Windows, where the
 // whole argv becomes one CreateProcess command line hard-capped at ~32,767
 // chars — 200 deep-monorepo paths wrapped in `:(literal)` can overrun it, and
-// the spawn failure would end a classification with no verdict at all.
+// the spawn failure would end a classification with no verdict at all. `arr`
+// holds latin1-decoded paths (one code unit per raw byte), so `p.length` here
+// is an exact byte count, not the utf8-multibyte-undercounting approximation a
+// plain string length would give.
 function chunks(arr, n) {
   const out = [];
   let cur = [];
@@ -296,7 +349,7 @@ function inProgressOp(repo) {
 // walk, so the source path gets parsed as the next status record and the tool
 // reports a path that does not exist.
 function trackedModified(repo) {
-  const out = git(repo, ['status', '--porcelain=v1', '-z', '--untracked-files=no']);
+  const out = gitPaths(repo, ['status', '--porcelain=v1', '-z', '--untracked-files=no']);
   if (out === null) return null;
   const fields = out.split('\0');
   const entries = [];
@@ -310,22 +363,63 @@ function trackedModified(repo) {
   return entries;
 }
 
+// Splits paths into ones whose raw bytes round-trip through argv (see
+// utf8OrNull) and ones that don't. Only the latter pay for the unrestricted-
+// listing fallback in treeState/indexState below; the former take the same
+// chunked-pathspec route as before this fix, so the common all-UTF-8 case —
+// everything the existing suite exercises — is unaffected in shape or cost.
+function partitionArgvSafe(paths) {
+  const safe = [];
+  const unsafe = [];
+  for (const p of paths) (utf8OrNull(p) === null ? unsafe : safe).push(p);
+  return { safe, unsafe };
+}
+
+// Parses `-z`-terminated `<prefix tokens>\t<path>` records — the shape shared
+// by `ls-tree -z` (mode/type/sha) and `ls-files -s -z` (mode/sha/stage) — into
+// one array. Shared by each function's chunked and unrestricted-fallback
+// listing below, so the two stay behaviorally identical by construction
+// instead of by two hand-kept-in-sync copies.
+function parseTabRecords(out) {
+  const recs = [];
+  for (const rec of splitZ(out)) {
+    const tab = rec.indexOf('\t');
+    if (tab < 0) continue;
+    recs.push({ fields: rec.slice(0, tab).split(/\s+/), path: rec.slice(tab + 1) });
+  }
+  return recs;
+}
+
 // path -> (mode, blob) at `commit`, restricted to `paths`. A submodule or subtree
 // entry is left out: never matchable, so it reads as WIP and blocks the sync
 // rather than being healed blind.
 // Returns null if any probe fails: a half-populated map is worse than none, since
 // a path missing from it reads as ABSENT — positive knowledge we do not have.
+//
+// `ls-tree` has no stdin or pathspec-file form (unlike checkout below), so a
+// path whose raw bytes are not valid UTF-8 cannot be named by pathspec at all
+// — argv would silently re-encode it into different bytes, matching nothing or,
+// worse, matching some other path that happens to decode to the same U+FFFD
+// sequence. Such paths instead pay for ONE unrestricted recursive listing,
+// matched against the wanted set by exact raw-byte equality.
 function treeState(repo, commit, paths) {
   const map = new Map();
-  for (const chunk of chunks(paths, 200)) {
-    const out = git(repo, ['ls-tree', '-z', '--full-name', commit, '--', ...chunk.map(spec)]);
-    if (out === null) return null;
-    for (const rec of splitZ(out)) {
-      const tab = rec.indexOf('\t');
-      if (tab < 0) continue;
-      const [mode, type, sha] = rec.slice(0, tab).split(/\s+/);
-      if (type === 'blob') map.set(rec.slice(tab + 1), at(mode, sha));
+  const { safe, unsafe } = partitionArgvSafe(paths);
+  const absorb = (recs) => {
+    for (const { fields: [mode, type, sha], path: p } of recs) {
+      if (type === 'blob') map.set(p, at(mode, sha));
     }
+  };
+  for (const chunk of chunks(safe, 200)) {
+    const out = gitPaths(repo, ['ls-tree', '-z', '--full-name', commit, '--', ...chunk.map((p) => spec(utf8OrNull(p)))]);
+    if (out === null) return null;
+    absorb(parseTabRecords(out));
+  }
+  if (unsafe.length) {
+    const wanted = new Set(unsafe);
+    const out = gitPaths(repo, ['ls-tree', '-r', '-z', '--full-name', commit]);
+    if (out === null) return null;
+    absorb(parseTabRecords(out).filter((r) => wanted.has(r.path)));
   }
   return map;
 }
@@ -338,20 +432,29 @@ function treeState(repo, commit, paths) {
 // `git stash apply` / `git apply --3way` leave one with no MERGE_HEAD for
 // inProgressOp to catch either. Its other side then exists ONLY in the index, and
 // a checkout silently collapses it away.
+//
+// Same argv-safety split as treeState, and for the same reason: `ls-files` has
+// no stdin/pathspec-file restriction form either.
 function indexState(repo, paths) {
   const state = new Map();
   const unmerged = new Set();
-  for (const chunk of chunks(paths, 200)) {
-    const out = git(repo, ['ls-files', '-s', '-z', '--', ...chunk.map(spec)]);
-    if (out === null) return null; // as in treeState: no map beats a partial one
-    for (const rec of splitZ(out)) {
-      const tab = rec.indexOf('\t');
-      if (tab < 0) continue;
-      const [mode, sha, stage] = rec.slice(0, tab).split(/\s+/);
-      const p = rec.slice(tab + 1);
+  const { safe, unsafe } = partitionArgvSafe(paths);
+  const absorb = (recs) => {
+    for (const { fields: [mode, sha, stage], path: p } of recs) {
       if (stage === '0') state.set(p, at(mode, sha));
       else unmerged.add(p);
     }
+  };
+  for (const chunk of chunks(safe, 200)) {
+    const out = gitPaths(repo, ['ls-files', '-s', '-z', '--', ...chunk.map((p) => spec(utf8OrNull(p)))]);
+    if (out === null) return null; // as in treeState: no map beats a partial one
+    absorb(parseTabRecords(out));
+  }
+  if (unsafe.length) {
+    const wanted = new Set(unsafe);
+    const out = gitPaths(repo, ['ls-files', '-s', '-z']);
+    if (out === null) return null;
+    absorb(parseTabRecords(out).filter((r) => wanted.has(r.path)));
   }
   return { state, unmerged };
 }
@@ -379,6 +482,28 @@ const fsCapabilities = (repo) => ({
   symlinks: boolConfig(repo, 'core.symlinks', true),
 });
 
+// `p` is a latin1-decoded path (raw bytes as code units); fs, like
+// child_process, re-encodes a plain JS string path as UTF-8 on POSIX, so
+// reaching the actual bytes on disk needs a Buffer. `path.resolve` itself is
+// pure string manipulation (splitting/joining on ASCII '/'), so it is safe to
+// run on a latin1 string before this final conversion.
+const resolveBuf = (repo, p) => Buffer.from(path.resolve(repo, p), 'latin1');
+
+// hash-object's `--path <file> -- <file>` form takes the file location as
+// argv — the same argv-re-encoding trap as ls-tree/ls-files pathspecs (see
+// gitPaths above). `--stdin-paths` instead reads the path list from stdin, one
+// path per line, as raw bytes with no re-encoding, and hashes the real file at
+// that path exactly as `--path`/`--no-filters` would (verified against both:
+// same clean sha, same raw sha). Every path goes through this, argv-safe or
+// not — unlike ls-tree/ls-files there is no safe/unsafe split to make here.
+function hashObjectAtPath(repo, p, noFilters) {
+  const input = Buffer.concat([Buffer.from(p, 'latin1'), Buffer.from('\n')]);
+  const args = noFilters
+    ? ['hash-object', '--no-filters', '--stdin-paths']
+    : ['hash-object', '--stdin-paths'];
+  return git(repo, args, input);
+}
+
 // The working tree's (mode, blob) for a path, as git itself would record it —
 // plus `raw`, the sha of the bytes actually on disk with no filter applied,
 // which is what the clean-filter gate in classify() and the recheck compare.
@@ -387,7 +512,7 @@ const fsCapabilities = (repo) => ({
 function worktreeState(repo, p, fsCaps, recordedMode) {
   let st;
   try {
-    st = fs.lstatSync(path.resolve(repo, p));
+    st = fs.lstatSync(resolveBuf(repo, p));
   } catch (e) {
     // ENOENT is the only error that proves the path is gone; anything else (a
     // permission error on a parent, say) leaves us ignorant, not informed.
@@ -400,7 +525,7 @@ function worktreeState(repo, p, fsCaps, recordedMode) {
   if (st.isSymbolicLink()) {
     let target;
     try {
-      target = fs.readlinkSync(path.resolve(repo, p));
+      target = fs.readlinkSync(resolveBuf(repo, p), { encoding: 'buffer' }); // the target itself may hold raw bytes too
     } catch {
       return UNKNOWN;
     }
@@ -410,11 +535,9 @@ function worktreeState(repo, p, fsCaps, recordedMode) {
     return { ...at('120000', out.trim()), raw: out.trim() };
   }
   if (!st.isFile()) return UNKNOWN; // a directory, a fifo, a socket…
-  // --path makes the .gitattributes clean filters apply, so the sha is comparable
-  // to a committed blob rather than to the raw bytes on disk.
-  const out = git(repo, ['hash-object', '--path', p, '--', p]);
+  const out = hashObjectAtPath(repo, p, false); // .gitattributes clean filters applied
   if (out === null) return UNKNOWN; // unreadable file: present, uninspectable
-  const raw = git(repo, ['hash-object', '--no-filters', '--', p]);
+  const raw = hashObjectAtPath(repo, p, true);
   if (raw === null) return UNKNOWN;
   let mode;
   if (!fsCaps.symlinks && recordedMode === '120000') {
@@ -438,8 +561,21 @@ function worktreeState(repo, p, fsCaps, recordedMode) {
 // Reduced to a sha (of the bytes as-is, no clean filter) so the comparison
 // against the on-disk raw sha never decodes binary content and stays agnostic of
 // the repo's object format. null when either probe fails — never read as a match.
+//
+// `<rev>:<path>` has no stdin form (cat-file's --batch family does, but not
+// combined with --filters in a way that is worth the added parsing here — see
+// the traversal note below), so `p` goes into a single argv string and is
+// therefore subject to the same argv-safety rule as ls-tree/ls-files: if it
+// cannot be expressed as a re-encodable UTF-8 string, this probe cannot run at
+// all. That reads as "cannot verify", which is exactly the safe direction —
+// this gate only ever runs when a clean filter is already suspected of
+// laundering novel bytes (classify()'s `cur.raw !== cur.sha` check), so
+// refusing here means refusing a path already flagged as ambiguous, not a
+// healable one.
 function smudgedSha(repo, commit, p) {
-  const content = gitBuf(repo, ['cat-file', '--filters', `${commit}:${p}`]);
+  const argvSafe = utf8OrNull(p);
+  if (argvSafe === null) return null;
+  const content = gitBuf(repo, ['cat-file', '--filters', `${commit}:${argvSafe}`]);
   if (content === null) return null;
   const out = git(repo, ['hash-object', '--stdin', '--no-filters'], content);
   return out === null ? null : out.trim();
@@ -567,6 +703,25 @@ function recheck(repo, stale, raced, fsCaps) {
   return fresh;
 }
 
+// checkout's argv pathspec has the same argv-re-encoding trap as ls-tree's and
+// ls-files's, but checkout alone among them also accepts
+// --pathspec-from-file: the pathspec then travels through a FILE we write
+// ourselves — raw bytes via fs, no argv involvement for the path itself, only
+// for the temp file's own name, which we control and keep plain ASCII. That
+// sidesteps the trap for every path, argv-safe or not, so (unlike
+// ls-tree/ls-files) there is no safe/unsafe split to make here either. One
+// NUL-terminated `:(literal)<path>` entry per call, reusing a single
+// per-process file across the whole heal loop below.
+function checkoutPath(repo, head, pspecFile, p) {
+  const body = Buffer.concat([Buffer.from(':(literal)', 'ascii'), Buffer.from(p, 'latin1'), Buffer.from([0])]);
+  try {
+    fs.writeFileSync(pspecFile, body);
+  } catch {
+    return null; // could not stage the pathspec — the same shape as any other failed probe
+  }
+  return git(repo, ['checkout', head, `--pathspec-from-file=${pspecFile}`, '--pathspec-file-nul']);
+}
+
 // ---------- main ----------
 
 function main() {
@@ -635,25 +790,34 @@ function main() {
     const raced = [];
     const attempted = [];
     let failed = false;
-    for (const s of stale) {
-      const fresh = recheck(repo, [s], raced, fsCaps);
-      if (fresh === null) {
-        // The index went unreadable under us. Before any write that is a clean
-        // exit-2 refusal; after one, exit 2 would lie ("nothing was modified"),
-        // so fall through and let the tree say what actually landed. The
-        // un-rechecked remainder keeps its classification but is never written.
-        if (!hasWritten) usage('cannot re-read the index before healing');
-        process.stderr.write('heal-stale-root: cannot re-read the index mid-heal; root left partially healed\n');
-        failed = true;
-        break;
+    const pspecFile = path.join(os.tmpdir(), `heal-stale-root.${process.pid}.pathspec`);
+    try {
+      for (const s of stale) {
+        const fresh = recheck(repo, [s], raced, fsCaps);
+        if (fresh === null) {
+          // The index went unreadable under us. Before any write that is a clean
+          // exit-2 refusal; after one, exit 2 would lie ("nothing was modified"),
+          // so fall through and let the tree say what actually landed. The
+          // un-rechecked remainder keeps its classification but is never written.
+          if (!hasWritten) usage('cannot re-read the index before healing');
+          process.stderr.write('heal-stale-root: cannot re-read the index mid-heal; root left partially healed\n');
+          failed = true;
+          break;
+        }
+        if (!fresh.length) continue; // raced away; recheck recorded why
+        attempted.push(s.path);
+        hasWritten = true; // git may write the index entry before it reports failure
+        if (checkoutPath(repo, head, pspecFile, s.path) === null) {
+          process.stderr.write('heal-stale-root: git checkout failed; root left partially healed\n');
+          failed = true;
+          break;
+        }
       }
-      if (!fresh.length) continue; // raced away; recheck recorded why
-      attempted.push(s.path);
-      hasWritten = true; // git may write the index entry before it reports failure
-      if (git(repo, ['checkout', head, '--', spec(s.path)]) === null) {
-        process.stderr.write('heal-stale-root: git checkout failed; root left partially healed\n');
-        failed = true;
-        break;
+    } finally {
+      try {
+        fs.unlinkSync(pspecFile);
+      } catch {
+        // best-effort cleanup; a leftover temp file outside the repo is harmless
       }
     }
     // A raced path lost its clearance: it reports as WIP, not as stale. Paths
@@ -713,7 +877,23 @@ function main() {
   );
 }
 
+// `path` fields on the way into report() are latin1-decoded raw bytes (see
+// gitPaths above) — exactly what git and fs need, but not what a human or a
+// JSON consumer expects to read. Convert to the text a plain utf8-decoding
+// git() call would have produced: identical to today for every valid-UTF-8
+// path (everything the existing suite exercises), and U+FFFD for the same
+// bytes that motivated this file — a display nicety, never load-bearing,
+// since every actual decision above this point was made on the raw bytes.
+const displayPath = (p) => Buffer.from(p, 'latin1').toString('utf8');
+
 function report(opts, r, code) {
+  r = {
+    ...r,
+    stale: r.stale.map((s) => ({ ...s, path: displayPath(s.path) })),
+    wip: r.wip.map((w) => ({ ...w, path: displayPath(w.path) })),
+    healed: r.healed.map(displayPath),
+    ...(r.attempted ? { attempted: r.attempted.map(displayPath) } : {}),
+  };
   if (opts.json) {
     // The stale entries carry probe state (cur/idx) that is nobody's business but
     // recheck's; the contract is the path, its base, and why.
