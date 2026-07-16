@@ -210,6 +210,9 @@ for (const host of [
   "017700000001", // octal whole-address form
   "0x007f000001", // hex whole-address form, zero-padded
   "00000000000000000177.0.0.1", // octal octet, zero-padded
+  "127.1.", // trailing root-label dot (WHATWG URL drops exactly one before the IPv4 parse)
+  "0177.0.0.1.", // octal octet, trailing root-label dot
+  "2130706433.", // whole-address decimal form, trailing root-label dot
 ]) {
   test(`agents-md: exotic IPv4 loopback spelling ${host} is omitted from the tools line`, () => {
     const { home, cwd } = scratch();

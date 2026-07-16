@@ -61,7 +61,14 @@ function parseIPv4Segment(str) {
 // SPOR_SERVER might use — not just the canonical 4-octet decimal form.
 // Returns null for anything that isn't a valid IPv4 literal.
 function parseIPv4(str) {
-  const parts = str.split(".");
+  let parts = str.split(".");
+  // WHATWG URL host parsing drops exactly one trailing empty label before
+  // the IPv4 parse (a root-label dot: `127.1.`, `0177.0.0.1.`,
+  // `2130706433.` all resolve to loopback) — without this a fetch/URL call
+  // against SPOR_SERVER would classify the host as loopback while this
+  // string-only parser missed it, letting a machine-local address slip
+  // into the committed tools line.
+  if (parts.length > 1 && parts[parts.length - 1] === "") parts = parts.slice(0, -1);
   const n = parts.length;
   if (n < 1 || n > 4) return null;
   const nums = parts.map(parseIPv4Segment);
