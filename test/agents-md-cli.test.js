@@ -137,6 +137,30 @@ test("agents-md: a loopback SPOR_SERVER is omitted from the tools line", () => {
   assert.doesNotMatch(md, /reachable over MCP/);
 });
 
+test("agents-md: a bracketed IPv6 loopback SPOR_SERVER is omitted from the tools line", () => {
+  const { home, cwd } = scratch();
+  const env = bare(home, { SPOR_SERVER: "http://[::1]:8787" });
+  const r = spawnSync(process.execPath, [CLI, "agents-md"], { encoding: "utf8", cwd, env });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+  assert.doesNotMatch(md, /::1/);
+  assert.doesNotMatch(md, /reachable over MCP/);
+});
+
+// The server can be resolved from config.json rather than raw SPOR_SERVER env
+// (test/spor-cli.test.js "uses an already-configured server" pins that
+// resolution path) — the loopback check must catch it there too, not just
+// when SPOR_SERVER is set directly.
+test("agents-md: a loopback server resolved from config.json is also omitted", () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ server: "http://127.0.0.1:8787", token: "tok" }));
+  const r = run(cwd, home, ["agents-md"]);
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+  assert.doesNotMatch(md, /127\.0\.0\.1/);
+  assert.doesNotMatch(md, /reachable over MCP/);
+});
+
 test("agents-md: a public server URL keeps the tools line", () => {
   const { home, cwd } = scratch();
   const env = bare(home, { SPOR_SERVER: "https://spor.example.com" });

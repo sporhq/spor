@@ -25,19 +25,26 @@ const END = "<!-- spor:end -->";
 const LEGACY_BEGIN = "<!-- substrate:begin -->";
 const LEGACY_END = "<!-- substrate:end -->";
 
-// Loopback/link-local hosts (127.0.0.1, localhost, ::1) are machine-local —
-// baking one into a COMMITTED file leaks a developer's dev-server address to
-// every other contributor (issue-spor-agents-md-local-mcp-leak). Strip the
-// scheme/port/brackets the same way u.serverHost() does, then match.
-function isLocalServer(server) {
-  const host = server.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
-  const hostname = host.replace(/^\[|\]$/g, "").replace(/:\d+$/, "");
+// Loopback hosts (127.0.0.1, localhost, ::1) are machine-local — baking one
+// into a COMMITTED file leaks a developer's dev-server address to every
+// other contributor (issue-spor-agents-md-local-mcp-leak). `host` is
+// u.serverHost()'s output (scheme/path already stripped); peel the
+// bracket/port a hostname carries. Brackets are checked before a bare port
+// strip, and a bare host with more than one colon is left alone, because an
+// unbracketed IPv6 address's colons would otherwise be misread as a port.
+function isLocalServer(host) {
+  const bracketed = host.match(/^\[([^\]]+)\]/);
+  const hostname = bracketed
+    ? bracketed[1]
+    : (host.match(/:/g) || []).length > 1
+      ? host
+      : host.replace(/:\d+$/, "");
   return /^(127(\.\d+){3}|localhost|::1)$/i.test(hostname);
 }
 
 function toolsLine({ noServerLine = false } = {}) {
   const server = u.serverBase();
-  const showServer = server && !noServerLine && !isLocalServer(server);
+  const showServer = server && !noServerLine && !isLocalServer(u.serverHost());
   const mcp = showServer ? ` It is reachable over MCP at ${server}/mcp (bearer token).` : "";
   return `A team knowledge graph (Spor) holds prior decisions, constraints, dismissed approaches, and deferred work.${mcp} Before designing or deciding anything non-trivial, check it (query_graph). Ask show_queue what to work on next. When a git commit implements a tracked node (a task, decision, or issue), add a 'Spor: <node-id>' trailer to the commit message, in the final trailer block alongside any Co-Authored-By (no blank line between trailers) — git then records which node the commit serves, and the graph records the commit's sha.`;
 }
