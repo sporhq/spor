@@ -912,6 +912,29 @@ thread 4). The seed set is small — `shell`, `prod-creds`, `browser`, `network`
 `human`, `filesystem-write`, `paid-api`. `human` is unsatisfiable by any agent:
 assign that work to a person.
 
+### The `terminal-status` register
+
+A second registry-declared enum (seed: `schema-register-terminal-status`,
+`register: terminal-status`) names the **type-blind** status vocabulary that
+retires ANY node from queue liveness (`lib/kernel/queue.js` `isLive`), briefing
+"live work" surfacing (`lib/kernel/graph.js` status tag/warning), and
+coupling-norm matching (`lib/kernel/coupling.js`) — the single source those two
+kernel modules read (`graph.registry.registerClasses("terminal-status")`)
+instead of two separately hardcoded, previously-divergent tables
+(issue-spor-coupling-resolution-terminal-status-divergence). The seed set is
+`abandoned`, `answered`, `closed`, `completed`, `deprecated`, `dismissed`,
+`done`, `merged`, `rejected`, `released`, `resolved`, `retired`, `superseded`.
+It is **DISTINCT** from the per-node-schema `status.non_resolving` and
+`status.terminal` partitions above: a decision's `settled` status is terminal
+for its OWN lifecycle (`status.terminal`, read only by work-analytics) but is
+deliberately absent from this register, so a settled decision keeps surfacing
+as live guidance in queues and briefings (dec-spor-decision-lifecycle-
+surfacing). `lib/kernel/coupling.js` scans node files in the hook tool loop
+without a loaded graph/registry, so it (and any other graph-less caller) reads
+a hardcoded fallback that reproduces this register's seed classes
+byte-identically; a graph-resident override only reaches callers that pass a
+loaded `graph`.
+
 ## Lenses
 
 A saved view over the graph is itself a graph node (dec-lenses-as-nodes), so it
