@@ -28,9 +28,12 @@ const GUARD = path.join(__dirname, "..", "scripts", "heal-stale-root.js");
 function git(dir, ...args) {
   return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 }
-function initRepo() {
+function initRepo(opts = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-heal-"));
-  execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
+  const args = ["init", "-q", "-b", "main"];
+  if (opts.objectFormat) args.push("--object-format", opts.objectFormat);
+  args.push(dir);
+  execFileSync("git", args, { stdio: "ignore" });
   git(dir, "config", "user.email", "t@t");
   git(dir, "config", "user.name", "Test");
   return dir;
@@ -323,6 +326,27 @@ test("emptying a file is not evidence of a rewind, even when an ancestor held it
 
   // The tree is genuinely stale here, but empty content is indistinguishable from
   // a truncation, so the guard refuses it: a missed heal, never a wrong one.
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "ROOT-UNSYNCED");
+  assert.equal(r.status, 1);
+  assert.equal(read(dir, "a.js"), "");
+});
+
+test("the empty-blob guard still holds in a sha256 repo, where the sha1 empty-blob OID never appears", () => {
+  let dir;
+  try {
+    dir = initRepo({ objectFormat: "sha256" });
+  } catch {
+    return; // this git build has no sha256 support; skip rather than fail
+  }
+  write(dir, "a.js", ""); // the ancestor version IS empty
+  commit(dir, "init");
+  casAdvance(dir, () => write(dir, "a.js", "filled in\n"));
+
+  // Were the guard still keyed to the hardcoded sha1 empty-blob OID, it would
+  // never match this repo's sha256 empty blob, so isEmptyBlob would always read
+  // false and the truncation would be misclassified as a stale rewind and healed
+  // away — the data-loss bug this test pins shut.
   const r = runJson(dir, "--apply");
   assert.equal(r.json.verdict, "ROOT-UNSYNCED");
   assert.equal(r.status, 1);

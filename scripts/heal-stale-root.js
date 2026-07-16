@@ -123,11 +123,17 @@ const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
-// The git blob of an empty file. Empty content is weak evidence: a truncated
+// The git blob of an empty file, derived per-repo rather than hardcoded: a
+// SHA-256 repository (--object-format=sha256) hashes the same empty content to
+// a different OID, and a hardcoded SHA-1 literal would never match there,
+// silently disabling this guard. Empty content is weak evidence: a truncated
 // working file would match any ancestor that happened to hold an empty file, so
 // it is never counted as a rewind. Mirrors the same guard in spor-server's
 // check-stale-tree-revert.js.
-const EMPTY_BLOB = 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391';
+function emptyBlobSha(repo) {
+  const out = git(repo, ['hash-object', '--stdin'], '');
+  return out === null ? null : out.trim();
+}
 
 const ABSENT = null; // no entry for a path in a given tree / index / working tree
 
@@ -248,7 +254,7 @@ function same(a, b) {
   return a.mode === b.mode && a.sha === b.sha;
 }
 
-const isEmptyBlob = (s) => s !== ABSENT && s !== UNKNOWN && s.sha === EMPTY_BLOB;
+const isEmptyBlob = (s, emptyBlob) => s !== ABSENT && s !== UNKNOWN && s.sha === emptyBlob;
 
 // The mode of a state, or undefined when there is no state to have one (a path
 // that is ABSENT or unreadable). Both are real cases for a stale path — a file
@@ -445,17 +451,17 @@ function smudgedSha(repo, commit, p) {
 // (nothing to lose), or it is identical to what some first-parent ancestor of
 // HEAD holds (committed, therefore recoverable)? Returns the explaining ancestor
 // sha, '' for "same as HEAD", or null for novel state.
-function behindOrHead(value, head, p, ancestors) {
+function behindOrHead(value, head, p, ancestors, emptyBlob) {
   if (value === UNKNOWN) return null; // present but uninspectable — never discardable
   if (same(value, head)) return '';
-  if (isEmptyBlob(value) && !isEmptyBlob(head)) return null;
+  if (isEmptyBlob(value, emptyBlob) && !isEmptyBlob(head, emptyBlob)) return null;
   for (const anc of ancestors) {
     if (same(anc.state.has(p) ? anc.state.get(p) : ABSENT, value)) return anc.commit;
   }
   return null;
 }
 
-function classify(repo, entry, headSha, headState, idx, ancestors, fsCaps) {
+function classify(repo, entry, headSha, headState, idx, ancestors, fsCaps, emptyBlob) {
   const { path: p, xy } = entry;
 
   // An unresolved conflict holds its other side ONLY in the index's higher
@@ -479,12 +485,12 @@ function classify(repo, entry, headSha, headState, idx, ancestors, fsCaps) {
   }
 
   const idxNow = idx.state.has(p) ? idx.state.get(p) : ABSENT;
-  const idxAt = behindOrHead(idxNow, head, p, ancestors);
+  const idxAt = behindOrHead(idxNow, head, p, ancestors, emptyBlob);
   if (idxAt === null) {
     return { verdict: 'wip', why: 'the index holds a state committed neither at HEAD nor in its recent ancestry' };
   }
   const cur = worktreeState(repo, p, fsCaps, modeOf(idxNow) || modeOf(head));
-  const curAt = behindOrHead(cur, head, p, ancestors);
+  const curAt = behindOrHead(cur, head, p, ancestors, emptyBlob);
   if (curAt === null) {
     return { verdict: 'wip', why: 'the working tree holds a state committed neither at HEAD nor in its recent ancestry' };
   }
@@ -578,6 +584,9 @@ function main() {
   if (headOut === null) usage('no HEAD commit');
   const head = headOut.trim();
 
+  const emptyBlob = emptyBlobSha(repo);
+  if (emptyBlob === null) usage('cannot derive the empty-blob OID — refusing to classify');
+
   // NOT `|| []`: a status probe that failed tells us nothing, and "nothing"
   // collapsed to "nothing modified" would report IN-SYNC/exit 0 — which licenses
   // the caller to `git reset --hard main` over whatever is actually there. This is
@@ -609,7 +618,7 @@ function main() {
   let stale = [];
   const wip = [];
   for (const e of entries) {
-    const c = classify(repo, e, head, headState, idx, ancestors, fsCaps);
+    const c = classify(repo, e, head, headState, idx, ancestors, fsCaps, emptyBlob);
     if (c.verdict === 'stale') stale.push({ path: e.path, base: c.base, cur: c.cur, idx: c.idx, ev: c.ev, why: c.why });
     else wip.push({ path: e.path, why: c.why });
   }
