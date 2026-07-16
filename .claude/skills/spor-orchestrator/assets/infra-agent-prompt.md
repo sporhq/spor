@@ -51,15 +51,19 @@ you work directly on the real checkout at `{{dir}}`.
    gap, a secret you don't have access to — `/spor:defer "<2–3 sentences>"` the
    moment you notice it.
 
-6. **Resolve the node on the graph.** Completing a task needs a resolver node
-   FIRST: write a short `artifact` (what was deployed + verification) or a
-   `decision` (the why, e.g. "accepted the gap for QA-only globex") carrying a
-   `resolves` edge to `{{node}}`, THEN set the node terminal (`task` → `done`).
-   Use the exact node/edge format from `/spor:spor`. This resolved node is the
-   orchestrator's signal that you're finished — don't skip it.
+6. **Commit** the model change to spor-infra with a clear message (the durable
+   IaC record) — BEFORE resolving the node (step 7). You commit on the real
+   checkout — that is expected for this repo.
 
-7. **Commit** the model change to spor-infra with a clear message (the durable
-   IaC record). You commit on the real checkout — that is expected for this repo.
+7. **Resolve the node on the graph — only after step 6's commit is in.**
+   Completing a task needs a resolver node FIRST: write a short `artifact`
+   (what was deployed + verification) or a `decision` (the why, e.g. "accepted
+   the gap for QA-only globex") carrying a `resolves` edge to `{{node}}`, THEN
+   set the node terminal (`task` → `done`). Use the exact node/edge format from
+   `/spor:spor`. This resolved node is the orchestrator's signal that you're
+   finished — it MUST NOT be set while the durable commit is still missing,
+   since a resolved node is what tells the orchestrator it's safe to stop
+   watching this agent.
 
 ## If it won't converge — stop, don't force it
 

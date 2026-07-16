@@ -133,9 +133,12 @@ id, sanitized by dispatch).
    the targeted tests didn't. Run it from the shared root once step 5 confirms
    `IN-SYNC`/`HEALED`; otherwise run it in the throwaway detached worktree from
    step 5 instead, since the shared root can't be trusted to reflect `main` yet.
-   If it's red, you merged a regression — revert the merge (`git update-ref`
-   back to `$OLD`, or `git revert`) and re-dispatch the agent to fix, rather
-   than leaving main broken.
+   If it's red, you merged a regression — revert the merge and re-dispatch the
+   agent to fix, rather than leaving main broken. `git update-ref refs/heads/main
+   "$OLD" "$NEW"` is only safe if `main` is STILL at `$NEW` (re-check
+   `git rev-parse main` first — another committer may have advanced it since
+   your CAS landed); if it moved, use `git revert` instead so you don't clobber
+   their commit.
 
 7. **Clean up — ONLY the exact worktree you just merged.** Never target any
    other worktree, never glob or "clean up everything", and never force past

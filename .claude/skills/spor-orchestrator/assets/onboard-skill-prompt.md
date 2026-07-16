@@ -59,17 +59,19 @@ from that, and breaking either tangles other agents' work:
 5. **Capture stray discoveries.** Anything out of scope you found along the way —
    `/spor:defer "<2–3 sentences: what + why>"` the moment you notice it.
 
-6. **Resolve the node on the graph.** Completing a task needs a resolver node
-   *first* — a bare status flip is rejected by the terminal-status gate. Write a
-   `decision` (the *why*) or short `artifact` (what was done) carrying a
-   `resolves` edge to `{{node}}`, **then** set the node's status to `done` —
-   following the exact format from `/spor:spor`. Use the Spor MCP (`put_node` +
-   `add_edge` + `set_status`) or REST. This resolved node is the orchestrator's
-   signal that you're finished — don't skip it.
+6. **Commit** all your work on this branch with a clear message — BEFORE
+   resolving the node (step 7). Leave the branch merge-ready: everything
+   committed, tests green, `/code-review` clean. Do **not** merge.
 
-7. **Commit** all your work on this branch with a clear message. Leave the branch
-   merge-ready: everything committed, tests green, `/code-review` clean. Do
-   **not** merge.
+7. **Resolve the node on the graph — only after step 6's commit is on the
+   branch.** Completing a task needs a resolver node *first* — a bare status
+   flip is rejected by the terminal-status gate. Write a `decision` (the *why*)
+   or short `artifact` (what was done) carrying a `resolves` edge to
+   `{{node}}`, **then** set the node's status to `done` — following the exact
+   format from `/spor:spor`. Use the Spor MCP (`put_node` + `add_edge` +
+   `set_status`) or REST. This resolved node is the orchestrator's signal that
+   you're finished — it MUST NOT be set while the branch is still empty, since
+   that signal is what tells the orchestrator it's safe to gate and merge.
 
 ## If it won't converge — stop, don't force it
 
