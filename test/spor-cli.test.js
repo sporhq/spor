@@ -1521,17 +1521,21 @@ test('install --mcp uses an already-configured server (no --server/--token neede
   // engines/util.js active-config global, which used to only get set when
   // --server/--token were passed THIS invocation — a pre-existing
   // config.json server was invisible to it (AGENTS.md would omit the MCP
-  // line or read raw env instead of the resolved cfg).
+  // line or read raw env instead of the resolved cfg). A non-loopback host
+  // is used here (unlike the 127.0.0.1:9 fake elsewhere in this file)
+  // because the AGENTS.md assertion below checks the resolved server made
+  // it into the committed tools line, which a loopback host is now
+  // deliberately omitted from (issue-spor-agents-md-local-mcp-leak).
   const home = scratchHome();
   const cwd = mcpCwd();
   fs.mkdirSync(home, { recursive: true });
-  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ server: 'http://127.0.0.1:9', token: 'tok9' }));
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ server: 'http://spor.example.com:9', token: 'tok9' }));
   const r = runIn(cwd, ['install', 'codex', '--mcp'], { ...codexInstallEnv(home), SPOR_HOME: home });
   assert.strictEqual(r.status, 0, r.stderr);
   const toml = fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8');
-  assert.match(toml, /^url = "http:\/\/127\.0\.0\.1:9\/mcp"$/m);
+  assert.match(toml, /^url = "http:\/\/spor\.example\.com:9\/mcp"$/m);
   const agentsMd = fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf8');
-  assert.match(agentsMd, /reachable over MCP at http:\/\/127\.0\.0\.1:9\/mcp/, 'agents-md resolved the pre-configured server, not raw env');
+  assert.match(agentsMd, /reachable over MCP at http:\/\/spor\.example\.com:9\/mcp/, 'agents-md resolved the pre-configured server, not raw env');
 });
 
 test('install --mcp still reminds about the manual README recipe for a host --mcp does not cover', () => {

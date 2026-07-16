@@ -124,6 +124,58 @@ test("agents-md --briefing: embeds the standing briefing (hook-less floor)", () 
   assert.ok(md.includes(`${slug} standing briefing body`));
 });
 
+// issue-spor-agents-md-local-mcp-leak: a machine-local SPOR_SERVER must never
+// be baked into the committed block; a public/hosted server keeps the
+// sentence; --no-server-line suppresses it unconditionally either way.
+test("agents-md: a loopback SPOR_SERVER is omitted from the tools line", () => {
+  const { home, cwd } = scratch();
+  const env = bare(home, { SPOR_SERVER: "http://127.0.0.1:8787" });
+  const r = spawnSync(process.execPath, [CLI, "agents-md"], { encoding: "utf8", cwd, env });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+  assert.doesNotMatch(md, /127\.0\.0\.1/);
+  assert.doesNotMatch(md, /reachable over MCP/);
+});
+
+test("agents-md: a public server URL keeps the tools line", () => {
+  const { home, cwd } = scratch();
+  const env = bare(home, { SPOR_SERVER: "https://spor.example.com" });
+  const r = spawnSync(process.execPath, [CLI, "agents-md"], { encoding: "utf8", cwd, env });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+  assert.match(md, /reachable over MCP at https:\/\/spor\.example\.com\/mcp/);
+});
+
+test("agents-md --no-server-line: suppresses the tools line for any URL", () => {
+  const { home, cwd } = scratch();
+  const env = bare(home, { SPOR_SERVER: "https://spor.example.com" });
+  const r = spawnSync(process.execPath, [CLI, "agents-md", "--no-server-line"], { encoding: "utf8", cwd, env });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+  assert.doesNotMatch(md, /reachable over MCP/);
+  assert.doesNotMatch(md, /spor\.example\.com/);
+});
+
+// Re-running over an AGENTS.md whose committed block already carries a
+// leaked local endpoint must replace it leak-free (append-or-replace marker
+// semantics unchanged; this is the regeneration-heals-a-prior-leak case).
+test("agents-md: regenerating over a previously-leaked block replaces it leak-free", () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(
+    path.join(cwd, "AGENTS.md"),
+    "# theirs\n\n<!-- spor:begin -->\n## Spor team graph\n\n" +
+      "A team knowledge graph (Spor) holds prior decisions. It is reachable over MCP at http://127.0.0.1:8787/mcp (bearer token).\n" +
+      "<!-- spor:end -->\n"
+  );
+  const env = bare(home, { SPOR_SERVER: "http://127.0.0.1:8787" });
+  const r = spawnSync(process.execPath, [CLI, "agents-md"], { encoding: "utf8", cwd, env });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+  assert.match(md, /# theirs/);
+  assert.doesNotMatch(md, /127\.0\.0\.1/);
+  assert.strictEqual(md.match(/<!-- spor:begin -->/g).length, 1);
+});
+
 test("agents-md: 'agents' alias resolves to the same verb", () => {
   const { home, cwd } = scratch();
   const r = run(cwd, home, ["agents"]);

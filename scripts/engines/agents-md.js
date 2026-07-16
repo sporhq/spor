@@ -25,9 +25,20 @@ const END = "<!-- spor:end -->";
 const LEGACY_BEGIN = "<!-- substrate:begin -->";
 const LEGACY_END = "<!-- substrate:end -->";
 
-function toolsLine() {
+// Loopback/link-local hosts (127.0.0.1, localhost, ::1) are machine-local —
+// baking one into a COMMITTED file leaks a developer's dev-server address to
+// every other contributor (issue-spor-agents-md-local-mcp-leak). Strip the
+// scheme/port/brackets the same way u.serverHost() does, then match.
+function isLocalServer(server) {
+  const host = server.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+  const hostname = host.replace(/^\[|\]$/g, "").replace(/:\d+$/, "");
+  return /^(127(\.\d+){3}|localhost|::1)$/i.test(hostname);
+}
+
+function toolsLine({ noServerLine = false } = {}) {
   const server = u.serverBase();
-  const mcp = server ? ` It is reachable over MCP at ${server}/mcp (bearer token).` : "";
+  const showServer = server && !noServerLine && !isLocalServer(server);
+  const mcp = showServer ? ` It is reachable over MCP at ${server}/mcp (bearer token).` : "";
   return `A team knowledge graph (Spor) holds prior decisions, constraints, dismissed approaches, and deferred work.${mcp} Before designing or deciding anything non-trivial, check it (query_graph). Ask show_queue what to work on next. When a git commit implements a tracked node (a task, decision, or issue), add a 'Spor: <node-id>' trailer to the commit message, in the final trailer block alongside any Co-Authored-By (no blank line between trailers) — git then records which node the commit serves, and the graph records the commit's sha.`;
 }
 
@@ -92,7 +103,7 @@ function nodeBody(raw) {
 // Core writer: compose the managed block and splice it into AGENTS.md at the
 // repo root. `briefing: false` skips the standing-briefing fetch/embed
 // entirely (no server round-trip). Returns { file, meta, hadBriefing }.
-async function writeAgentsBlock({ cwd, briefing = true }) {
+async function writeAgentsBlock({ cwd, briefing = true, noServerLine = false }) {
   const graph = u.graphHome();
   const root = u.git(cwd, ["rev-parse", "--show-toplevel"])?.trim() || cwd;
   const slug = u.projectSlug(root);
@@ -130,7 +141,7 @@ async function writeAgentsBlock({ cwd, briefing = true }) {
 
   const directive = `## Spor team graph
 
-${toolsLine()}
+${toolsLine({ noServerLine })}
 
 ${DIRECTIVE}`;
   const section = body

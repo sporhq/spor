@@ -5441,7 +5441,11 @@ function cmdLink(cfg, { positionals }) {
 async function cmdAgentsMd(cfg, { values }) {
   const root = repoRoot();
   const { writeAgentsBlock } = require(path.join(ROOT, "scripts", "engines", "agents-md.js"));
-  const { file, meta } = await writeAgentsBlock({ cwd: root, briefing: !!values.briefing });
+  const { file, meta } = await writeAgentsBlock({
+    cwd: root,
+    briefing: !!values.briefing,
+    noServerLine: !!values["no-server-line"],
+  });
   out(`updated ${file} (${values.briefing ? meta || "no briefing yet, MCP pointers only" : "capture-discipline directive"})`);
   // CLAUDE.md rides along via an @AGENTS.md import (Claude Code resolves
   // @-imports): if the repo has a CLAUDE.md that never mentions AGENTS.md,
@@ -9698,12 +9702,20 @@ const COMMANDS = {
       "By default the block carries the directive only (hooked hosts get their\n" +
       "briefing at session start); --briefing also embeds the standing project\n" +
       "briefing — the floor for hosts without hooks (same block 'spor-hook\n" +
-      "agents-md' maintains from adapter session-start hooks).",
+      "agents-md' maintains from adapter session-start hooks). The tools-line\n" +
+      "sentence pointing at your SPOR_SERVER's MCP endpoint is omitted\n" +
+      "automatically when that server is loopback/link-local (127.0.0.1,\n" +
+      "localhost, ::1) — a machine-local address has no business in a committed\n" +
+      "file; --no-server-line omits it unconditionally, even for a public URL.",
     options: {
       briefing: { type: "boolean", desc: "also embed the standing project briefing (hook-less floor)" },
       "no-claude-md": { type: "boolean", desc: "don't append the @AGENTS.md import to an existing CLAUDE.md" },
+      "no-server-line": {
+        type: "boolean",
+        desc: "omit the 'reachable over MCP at ...' sentence unconditionally (a loopback/link-local SPOR_SERVER is already omitted by default)",
+      },
     },
-    examples: ["spor agents-md", "spor agents-md --briefing"],
+    examples: ["spor agents-md", "spor agents-md --briefing", "spor agents-md --no-server-line"],
     run: (cfg, p) => cmdAgentsMd(cfg, p),
   },
   link: {
