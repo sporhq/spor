@@ -2,7 +2,7 @@
 id: schema-artifact
 type: schema
 kind: node-schema
-schema_version: 2026.06.15.1
+schema_version: 2026.07.16.1
 title: Seed schema for artifact nodes
 summary: Node schema for the artifact type — a document, spec, module, or build product worth referencing, optionally carrying a delivery-stage status when it represents a change. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -48,6 +48,27 @@ stage (the policy kind + the reflection adapter), not here. There is no status
 gate on this type: the stages are optional recognized values, and an artifact
 remains free to be a plain doc with no status.
 
+`status.terminal` (2026.07.16.1, issue-spor-coupling-resolution-terminal-
+status-divergence): the artifact type's own-lifecycle terminal vocabulary —
+`merged`/`released`/`done` — declared on the registry so work-analytics counts
+a delivered or otherwise-finished artifact as completed off
+`graph.registry.terminalStatuses()`, the lifecycle twin of `non_resolving`
+above. `done` joins `merged`/`released` here because artifacts also use it as
+a general non-delivery completion status (a finished doc/spec/build product,
+not a change going through review) — the live graph carries many artifacts at
+each of `done`, `merged`, and `released`. `in-review`/`approved` and any
+unlisted/empty status (the live default: a plain reference doc with no
+status, or one mid-review) are NOT terminal — they, and any other status,
+stay OUT of this partition, so the artifact keeps reading as work in progress.
+Separately, `merged`/`released`/`done` are also part of the type-blind
+`terminal-status` register (GRAPH.md) that `lib/kernel/resolution.js` and
+`lib/kernel/coupling.js` read for queue liveness and briefing surfacing — the
+gap this schema closes is that `released` had NEVER been in either register,
+so a released artifact stayed "live" in queue/briefing surfaces exactly like
+an unfinished one, unlike `merged`/`done` which already retired correctly.
+Registry behavior only, no node-shape change, backward-readable, no upgrade
+chain.
+
 ```json
 {
   "node_type": "artifact",
@@ -60,6 +81,11 @@ remains free to be a plain doc with no status.
     "non_resolving": [
       "in-review",
       "approved"
+    ],
+    "terminal": [
+      "merged",
+      "released",
+      "done"
     ]
   },
   "display": {

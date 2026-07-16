@@ -21,14 +21,14 @@ Steps:
    as `--project` so the compile is scoped to the repo you're in — the
    same-project relevance boost, the grouping union, and the `always_on` norm
    `applies_to_*` ride-along — instead of running *project-blind*
-   (issue-spor-remote-digest-project-blind). `${CLAUDE_PLUGIN_ROOT}` is empty in
-   the Bash tool, so read the plugin root the session-start hook cached
-   (issue-cc-skill-plugin-root-unsubstituted), then derive the slug:
+   (issue-spor-remote-digest-project-blind). `spor status` already resolves the
+   slug the same way session-start does (local vs remote, `.spor` marker
+   overrides, worktree main-repo inference); read it back instead of
+   recomputing it. Use `--quiet` so this doesn't pay for the remote health
+   probe / identity lookup (up to several seconds of network round-trip) just
+   to read a locally-resolved field:
    ```bash
-   SPOR_ROOT="$(cat "${SPOR_HOME:-$HOME/.spor}/cache/plugin-root" 2>/dev/null \
-     || cat "$HOME/.substrate/cache/plugin-root" 2>/dev/null)"
-   SPOR_ROOT="${SPOR_ROOT:-$CLAUDE_PLUGIN_ROOT}"
-   SLUG="$(node -e 'process.stdout.write(require("'"$SPOR_ROOT"'/scripts/engines/util.js").projectSlug(process.cwd()))' 2>/dev/null)"
+   SLUG="$(spor status --quiet 2>/dev/null | sed -n 's/^project:[[:space:]]*//p')"
    ```
    Then run the one command (the CLI compiles locally or dispatches to the server
    per the resolved mode, just like the `spor brief`/`spor compile` verbs):
@@ -69,6 +69,19 @@ Steps:
    graph lives). In **remote/Cowork** mode the server already holds compiled
    briefings, so just present it; persist a node only if the user asks. For
    free-text queries, just present the briefing.
+
+   Once the new version is persisted, retire the corrections it just absorbed
+   (issue-spor-corrections-no-applied-lifecycle): a correction whose `target`
+   is exactly `<id>` (a node-targeted fix, not `global`/`project:<slug>`) fired
+   because *this specific recompile* was its job — its guidance is now baked
+   into the briefing body you just wrote, so it has nothing left to do. For
+   each `shaped-by` edge in the skeleton, check the correction's `target`
+   (`spor get <corr-id>`); if it equals `<id>`, run `spor set-status <corr-id>
+   applied` so it stops injecting on every future compile of this same target
+   (a stale-forever `corr-` node is exactly the dead weight this step exists
+   to prevent). Leave `global`/`project:<slug>`-scoped corrections alone —
+   those are standing, broad-scope guidance meant to keep firing on every
+   future compile, not a one-shot fix this recompile discharges.
 
 4. Present the briefing. If the user later says it was wrong or incomplete,
    point them at /spor:correct — corrections fix the compile permanently;

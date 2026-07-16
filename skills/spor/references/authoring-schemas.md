@@ -23,10 +23,13 @@ functions**.
 policy layer — see GRAPH.md. `kind: register` declares a named, extensible
 **enum** the kernel exposes as a partition rather than a hardcoded table: a
 payload `{ "register": "<name>", "classes": [{ "id": …, "description": … }] }`,
-keyed by register name (graph beats seed, higher CalVer wins). The seed
-`requires` register — the work-node risk/permission axis — is the first; read it
-with `graph.registry.requiresClasses()`. Grow it by writing a resident `kind:
-register` schema with the same `register:` name.)
+keyed by register name (graph beats seed, higher CalVer wins). Two seed
+registers ship today: `requires` — the work-node risk/permission axis, read
+with `graph.registry.requiresClasses()` — and `terminal-status` — the
+type-blind status vocabulary that retires any node from queue liveness,
+briefing surfacing, and coupling-norm matching, read with
+`graph.registry.registerClasses("terminal-status")`. Grow either by writing a
+resident `kind: register` schema with the same `register:` name.)
 
 ### Node schema — JSON payload keys
 

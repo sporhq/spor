@@ -17,50 +17,11 @@
 //
 //   node nudge-worker.js <input-spool.in.json>
 
-const fs = require("fs");
-const path = require("path");
 const u = require("./util");
 const { classifyForNudge } = require("./post-tool");
 
-const inFile = process.argv[2];
-if (!inFile) process.exit(0);
-
-let job;
-try {
-  job = JSON.parse(fs.readFileSync(inFile, "utf8"));
-} catch {
-  process.exit(0);
-}
-// Consume the input immediately so a duplicate worker (belt-and-suspenders)
-// can't re-run the same classification.
-try {
-  fs.unlinkSync(inFile);
-} catch {}
-
-let res = null;
-try {
-  res = classifyForNudge(job);
-} catch {
-  /* fail-open: leave the file reserved, inject nothing */
-}
-
-if (res && res.nfacts >= 1 && res.facts && job.hash) {
-  const outFile = path.join(path.dirname(inFile), `${job.hash}.out.json`);
-  // Write to a temp name then rename so the prompt-time drainer (which globs
-  // `*.out.json`) can never read a half-written file — rename is atomic and the
-  // `.tmp` is invisible to the glob.
-  const tmp = `${outFile}.tmp`;
-  try {
-    fs.writeFileSync(
-      tmp,
-      JSON.stringify({ file: job.file, facts: res.facts, nfacts: res.nfacts, ts: u.jqNow() })
-    );
-    fs.renameSync(tmp, outFile);
-  } catch {
-    try {
-      fs.unlinkSync(tmp);
-    } catch {}
-  }
-}
-
-process.exit(0);
+u.runSpoolWorker(process.argv[2], classifyForNudge, (job, res) =>
+  res && res.nfacts >= 1 && res.facts
+    ? { file: job.file, facts: res.facts, nfacts: res.nfacts, ts: u.jqNow() }
+    : null
+);

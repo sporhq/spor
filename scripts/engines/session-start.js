@@ -176,9 +176,11 @@ function degradationNudge(graph) {
       return ` ⚠ ${spooled} captures spooled and undelivered (the server may have been unreachable) — run 'spor-hook doctor'.`;
     }
     // Capture-pipeline 100%-failure streak (task-spor-distill-nudge-health-
-    // diagnostics): the outage class the outbox counters can't see — a broken
-    // backend cmd/CLI fails BEFORE anything reaches the outbox (the 2026-06
-    // home-migration outage ran 20 days invisible this way). Computed from the
+    // diagnostics, issue-spor-doctor-blind-to-digest-intent): the outage class
+    // the outbox counters can't see — a broken backend cmd/CLI fails BEFORE
+    // anything reaches the outbox (the 2026-06 home-migration outage ran 20
+    // days invisible this way). Covers distill, nudge, and the digest-intent
+    // classifier (capture-health.js's pipelineOf), computed from the
     // llm-calls journal, tail-bounded per day file.
     const { captureHealth, failingPipelines } = require("./capture-health");
     const health = captureHealth(graph);

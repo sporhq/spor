@@ -164,15 +164,17 @@ async function doctor() {
     kv("graph", n == null ? "not created — run 'spor init'" : `${nodesDir} (${n} nodes)`);
   }
 
-  // Capture-pipeline health (task-spor-distill-nudge-health-diagnostics):
-  // per-pipeline success rates over the trailing window, from the llm-calls
-  // records every distill/nudge backend call writes. A 100%-failure streak —
-  // the silent-outage shape — is flagged loudly; partial failure just shows
-  // its numbers; no calls at all is "idle", not an alarm.
+  // Capture-pipeline health (task-spor-distill-nudge-health-diagnostics,
+  // issue-spor-doctor-blind-to-digest-intent): per-pipeline success rates over
+  // the trailing window, from the llm-calls records every distill/nudge/
+  // digest-intent backend call writes. A 100%-failure streak — the silent-
+  // outage shape — is flagged loudly; partial failure just shows its numbers;
+  // no calls at all is "idle", not an alarm (the default-off digest-intent
+  // pipeline is idle on most boxes until SPOR_DIGEST_ASYNC is enabled).
   const { captureHealth, failingPipelines } = require("./capture-health");
   const health = captureHealth(graph);
   const failing = new Set(failingPipelines(health));
-  for (const p of ["distill", "nudge"]) {
+  for (const p of ["distill", "nudge", "digest"]) {
     const s = health[p];
     const label = `${p} ${health.days}d`;
     if (s.attempts === 0) {
