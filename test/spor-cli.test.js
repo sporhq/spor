@@ -1002,6 +1002,27 @@ test('disable/enable merge enabled into .spor.json at the cwd', () => {
   assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, '.spor.json'), 'utf8')).enabled, true);
 });
 
+// Git resolves its repo from GIT_DIR/GIT_WORK_TREE before it ever discovers one
+// from cwd, so an ambient var — a git hook, `git rebase --exec`, a wrapper that
+// exported one — used to make repoRoot() misdirect `spor enable`/`disable` at
+// the AMBIENT repo instead of the cwd's own (issue-spor-gittime-git-env-
+// inheritance). bin/spor.js's git() now spawns through the scrubbed gitSpawn,
+// so cwd's own repo wins.
+test('enable under an ambient GIT_DIR: .spor.json lands in the cwd repo, not the ambient one', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-scope-gitdir-'));
+  spawnSync('git', ['init', '-q'], { cwd: dir });
+  const decoy = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-scope-decoy-'));
+  spawnSync('git', ['init', '-q'], { cwd: decoy });
+  const r = spawnSync(process.execPath, [CLI, 'enable'], {
+    cwd: dir,
+    encoding: 'utf8',
+    env: bare({ GIT_DIR: path.join(decoy, '.git'), GIT_WORK_TREE: decoy }),
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, '.spor.json'), 'utf8')).enabled, true);
+  assert.ok(!fs.existsSync(path.join(decoy, '.spor.json')), 'the ambient repo gets no .spor.json');
+});
+
 test('link writes the .spor marker; rejects a non-canonical slug', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-link-'));
   const ok = spawnSync(process.execPath, [CLI, 'link', 'my-repo'], { cwd: dir, encoding: 'utf8', env: bare() });

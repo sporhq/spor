@@ -8,13 +8,14 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
-const { execFileSync, spawnSync, spawn } = require("child_process");
+const { spawnSync, spawn } = require("child_process");
 
 const ROOT = path.resolve(__dirname, "..", "..");
 const CODEX_NUDGE_MODEL = "gpt-5.4-mini";
 
 const home = require(path.join(ROOT, "lib", "shell", "home.js"));
 const { writeFileAtomic } = require(path.join(ROOT, "lib", "shell", "atomic-write.js"));
+const { gitEnv, gitSpawn } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
 // The harness vocabulary the capability probe emits — owned by the pure matcher
 // so the probe, the matcher, and the future fleet scheduler agree on one set of
 // names (dec-spor-machine-profile-satisfiability). Never re-hardcode it here.
@@ -637,44 +638,14 @@ const NO_GPGSIGN = ["-c", "commit.gpgsign=false"];
 // directory, so a leaked var silently retargets it at the ambient repo: `spor
 // dispatch --worktree` then attached the target repo's worktree to the
 // LAUNCHER's repo, checking out the launcher's code at the target's path
-// (issue-spor-dispatch-worktree-wrong-repo-location). Strip those vars from the
-// child env and let the directory be authoritative. Byte-identical when none
+// (issue-spor-dispatch-worktree-wrong-repo-location). gitEnv (lib/shell/
+// git-exec.js, the one shared definition — bin/spor.js's own git spawn and
+// lib/shell/gittime.js's both build on it too) strips those vars from the
+// child env and lets the directory be authoritative. Byte-identical when none
 // are set, which is the normal case.
-//
-// Only the three LOCATION vars — deliberately NOT GIT_INDEX_FILE (nor the
-// object-store vars), which don't name a repo. Git sets GIT_INDEX_FILE to a
-// temporary index when it runs the pre-commit hook of a PARTIAL commit (`git
-// commit -- <paths>`), and that index is precisely what's about to be
-// committed: `spor check --staged` runs there by design (see cmdCheck), so
-// stripping it would silently widen `git diff --cached` to the whole index and
-// have --strict fail a commit over a file the user isn't committing.
-const GIT_LOCATION_ENV = ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"];
-function gitEnv(env = process.env) {
-  const out = { ...env };
-  // Windows env names are case-insensitive and `{...process.env}` keeps whatever
-  // spelling the parent used, so `delete out.GIT_DIR` can miss a `git_dir` that
-  // git itself still honors — match case-insensitively there. On POSIX only the
-  // exact spelling is git's, and deleting a look-alike would gratuitously alter
-  // the child's env (the plugin runs natively on Windows, macOS and Linux).
-  const isLocationVar =
-    process.platform === "win32"
-      ? (k) => GIT_LOCATION_ENV.includes(k.toUpperCase())
-      : (k) => GIT_LOCATION_ENV.includes(k);
-  for (const k of Object.keys(out)) if (isLocationVar(k)) delete out[k];
-  return out;
-}
-
 function git(cwd, args, opts = {}) {
-  try {
-    return execFileSync("git", ["-C", cwd, ...args], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      ...opts,
-      env: gitEnv(opts.env),
-    });
-  } catch {
-    return null;
-  }
+  const r = gitSpawn(cwd, args, { stdio: ["ignore", "pipe", "ignore"], ...opts });
+  return r.error || r.status !== 0 ? null : r.stdout;
 }
 
 // True when the graph home and the session cwd resolve to the SAME git repo

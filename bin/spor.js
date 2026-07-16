@@ -30,6 +30,7 @@ const { loadConfig, DEFAULT_SERVER } = require(path.join(ROOT, "lib", "config.js
 const remote = require(path.join(ROOT, "lib", "remote.js"));
 const auth = require(path.join(ROOT, "lib", "auth.js"));
 const u = require(path.join(ROOT, "scripts", "engines", "util.js"));
+const { gitSpawn } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
 const sat = require(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
 // Resolution truth (lib/kernel/resolution.js): a node is "done" when it carries a
 // TERMINAL status OR a live inbound resolves/answers edge — the same partition the
@@ -130,7 +131,7 @@ function ensureGraphHome(cfg) {
   // git init (idempotent) so the graph is versioned, like README's bootstrap.
   let gitReady = fs.existsSync(path.join(home, ".git"));
   if (!gitReady) {
-    const r = spawnSync("git", ["init", "-q"], { cwd: home, stdio: "ignore" });
+    const r = gitSpawn(home, ["init", "-q"], { stdio: "ignore" });
     if (r.error) err("note: git not found — graph created but not version-controlled");
     else gitReady = true;
   }
@@ -3049,7 +3050,7 @@ function normalizePriority(raw) {
 // when it has no identity too). Mirrors lib/queue.js's gitIdentityEmail read.
 function gitIdentity(repoDir) {
   const read = (key) => {
-    const r = spawnSync("git", ["-C", repoDir, "config", key], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const r = gitSpawn(repoDir, ["config", key], { stdio: ["ignore", "pipe", "ignore"] });
     return r.status === 0 ? (r.stdout || "").trim() : "";
   };
   return { name: read("user.name"), email: read("user.email") };
@@ -5284,7 +5285,7 @@ function safeSlug() {
 // files (.spor.json, .spor, repo-scoped hook config) into the user's CURRENT
 // checkout, so a linked worktree keeps its own dir, not the main one.
 function repoRoot() {
-  const r = spawnSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" });
+  const r = git(process.cwd(), ["rev-parse", "--show-toplevel"]);
   const top = (r.stdout || "").trim();
   return top || process.cwd();
 }
@@ -5303,14 +5304,15 @@ function dispatchRoot() {
 
 // A git invocation inside a given working tree. Captures output so callers can
 // branch on status/stderr; never throws (a missing git binary surfaces as
-// r.error, handled by hasGit() before we get here). The env is scrubbed of the
-// git location vars so `cwd` — not an ambient GIT_DIR — names the repo
-// (u.gitEnv, issue-spor-dispatch-worktree-wrong-repo-location).
+// r.error, handled by hasGit() before we get here). Env-scrubbed (gitSpawn,
+// lib/shell/git-exec.js — the one definition shared with util.js's git() and
+// gittime.js) so `cwd` — not an ambient GIT_DIR — names the repo
+// (issue-spor-dispatch-worktree-wrong-repo-location).
 function git(cwd, gitArgs, opts = {}) {
-  return spawnSync("git", gitArgs, { cwd, encoding: "utf8", ...opts, env: u.gitEnv(opts.env) });
+  return gitSpawn(cwd, gitArgs, opts);
 }
 function hasGit() {
-  return !spawnSync("git", ["--version"]).error;
+  return !git(process.cwd(), ["--version"]).error;
 }
 
 // --- spor migrate / push: seed the local graph to a user-owned remote -------
