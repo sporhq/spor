@@ -9712,7 +9712,8 @@ const COMMANDS = {
       "briefing — the floor for hosts without hooks (same block 'spor-hook\n" +
       "agents-md' maintains from adapter session-start hooks). The tools-line\n" +
       "sentence pointing at your SPOR_SERVER's MCP endpoint is omitted\n" +
-      "automatically when that server is loopback (127.0.0.1, localhost, ::1)\n" +
+      "automatically when that server is loopback (127.0.0.0/8 in any form,\n" +
+      "localhost, ::1, or an IPv4-mapped/-compatible equivalent)\n" +
       "— a machine-local address has no business in a committed file;\n" +
       "--no-server-line omits it unconditionally, even for a public URL.",
     options: {

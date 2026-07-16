@@ -195,6 +195,71 @@ test("agents-md: a bracketed IPv6 loopback SPOR_SERVER is omitted from the tools
   assert.doesNotMatch(md, /reachable over MCP/);
 });
 
+// issue-spor-agents-md-exotic-loopback-spellings: the original guard
+// string-matched a fixed list of spellings (127.0.0.1, localhost, ::1) and
+// missed every other host that also resolves to loopback — exercise the
+// exotic forms the hardened IP-classifying matcher must now catch.
+for (const host of [
+  "127.1",
+  "127.0.1",
+  "127.0.0.2",
+  "0.0.0.0",
+  "0177.0.0.1", // octal octet (WHATWG URL host parsing: 0177 octal == 127 decimal)
+  "0x7f.0.0.1", // hex octet
+  "0x7f000001", // hex whole-address form
+  "017700000001", // octal whole-address form
+  "0x007f000001", // hex whole-address form, zero-padded
+  "00000000000000000177.0.0.1", // octal octet, zero-padded
+]) {
+  test(`agents-md: exotic IPv4 loopback spelling ${host} is omitted from the tools line`, () => {
+    const { home, cwd } = scratch();
+    const env = bare(home, { SPOR_SERVER: `http://${host}:8787` });
+    const r = spawnSync(process.execPath, [CLI, "agents-md"], { encoding: "utf8", cwd, env });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+    assert.doesNotMatch(md, /reachable over MCP/);
+    assert.ok(!md.includes(host));
+  });
+}
+
+for (const host of [
+  "0000:0000:0000:0000:0000:0000:0000:0001", // fully-expanded ::1
+  "::ffff:127.0.0.1", // IPv4-mapped
+  "::ffff:7f00:1", // IPv4-mapped, hex-group form
+  "::127.0.0.1", // deprecated IPv4-compatible
+]) {
+  test(`agents-md: exotic IPv6 loopback spelling [${host}] is omitted from the tools line`, () => {
+    const { home, cwd } = scratch();
+    const env = bare(home, { SPOR_SERVER: `http://[${host}]:8787` });
+    const r = spawnSync(process.execPath, [CLI, "agents-md"], { encoding: "utf8", cwd, env });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+    assert.doesNotMatch(md, /reachable over MCP/);
+    assert.ok(!md.includes(host));
+  });
+}
+
+test("agents-md: a non-loopback IPv4-mapped IPv6 host keeps the tools line", () => {
+  const { home, cwd } = scratch();
+  const env = bare(home, { SPOR_SERVER: "http://[::ffff:203.0.113.5]:8787" });
+  const r = spawnSync(process.execPath, [CLI, "agents-md"], { encoding: "utf8", cwd, env });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+  assert.match(md, /reachable over MCP/);
+});
+
+// The octal/hex radix parsing must not over-match: an octet that only
+// LOOKS like a leading-zero loopback spelling but decodes to a public
+// address must still show the tools line.
+test("agents-md: a non-loopback octal-looking IPv4 host keeps the tools line", () => {
+  const { home, cwd } = scratch();
+  const env = bare(home, { SPOR_SERVER: "http://0250.0.0.1:8787" }); // octal 0250 == 168, not 127
+  const r = spawnSync(process.execPath, [CLI, "agents-md"], { encoding: "utf8", cwd, env });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+  assert.match(md, /reachable over MCP/);
+});
+
 // The server can be resolved from config.json rather than raw SPOR_SERVER env
 // (test/spor-cli.test.js "uses an already-configured server" pins that
 // resolution path) — the loopback check must catch it there too, not just

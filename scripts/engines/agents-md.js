@@ -25,13 +25,121 @@ const END = "<!-- spor:end -->";
 const LEGACY_BEGIN = "<!-- substrate:begin -->";
 const LEGACY_END = "<!-- substrate:end -->";
 
-// Loopback hosts (127.0.0.1, localhost, ::1) are machine-local — baking one
-// into a COMMITTED file leaks a developer's dev-server address to every
-// other contributor (issue-spor-agents-md-local-mcp-leak). `host` is
-// u.serverHost()'s output (scheme/path already stripped); peel the
-// bracket/port a hostname carries. Brackets are checked before a bare port
-// strip, and a bare host with more than one colon is left alone, because an
-// unbracketed IPv6 address's colons would otherwise be misread as a port.
+// Parse one dotted-decimal segment honoring the WHATWG URL host-parsing
+// radix rules — the same rules the fetch/URL machinery that actually
+// connects to SPOR_SERVER applies to its hostname: a `0x`/`0X` prefix reads
+// as hex, a bare leading `0` (with more digits following) reads as octal,
+// otherwise decimal. Without this, an octal/hex spelling of a loopback
+// octet (`0177`, `0x7f`) parses as its decimal digits instead — a real
+// loopback address that the matcher would then miss. Returns null for
+// anything that isn't a valid, unambiguous segment.
+function parseIPv4Segment(str) {
+  if (!str) return null;
+  let radix = 10;
+  let digits = str;
+  let maxLen = 10;
+  if (/^0[xX]/.test(str)) {
+    radix = 16;
+    digits = str.slice(2);
+    maxLen = 8;
+  } else if (str.length > 1 && str[0] === "0") {
+    radix = 8;
+    digits = str.slice(1);
+    maxLen = 11;
+  }
+  // Insignificant zero-padding doesn't count against maxLen (a bound meant
+  // to keep the parsed value within safe-integer precision) — real URL
+  // host-parsing accepts arbitrarily zero-padded literals.
+  digits = digits.replace(/^0+(?=.)/, "");
+  const validDigits = radix === 16 ? /^[0-9a-f]+$/i : radix === 8 ? /^[0-7]+$/ : /^[0-9]+$/;
+  if (!digits.length || digits.length > maxLen || !validDigits.test(digits)) return null;
+  return parseInt(digits, radix);
+}
+
+// Parse an IPv4 host into its 32-bit value, honoring the inet_aton
+// shorthand forms (`127.1`, `127.0.1`, a bare integer) that a developer's
+// SPOR_SERVER might use — not just the canonical 4-octet decimal form.
+// Returns null for anything that isn't a valid IPv4 literal.
+function parseIPv4(str) {
+  const parts = str.split(".");
+  const n = parts.length;
+  if (n < 1 || n > 4) return null;
+  const nums = parts.map(parseIPv4Segment);
+  if (nums.some((v) => v == null)) return null;
+  for (let i = 0; i < n - 1; i++) {
+    if (nums[i] > 255) return null;
+  }
+  const lastBits = 8 * (5 - n);
+  if (nums[n - 1] > 2 ** lastBits - 1) return null;
+  let value = 0;
+  for (let i = 0; i < n - 1; i++) value = value * 256 + nums[i];
+  value = value * 2 ** lastBits + nums[n - 1];
+  return value > 0xffffffff ? null : value >>> 0;
+}
+
+// A parsed IPv4 address is loopback (127.0.0.0/8) or the "any" address
+// (0.0.0.0) — both are machine-local, never a peer's reachable endpoint.
+function isLoopbackIPv4Value(value) {
+  return (value >>> 24) === 127 || value === 0;
+}
+
+// Expand an IPv6 literal (bare hostname, no brackets) to its 8 16-bit
+// groups, handling "::" compression and a trailing embedded-IPv4 tail
+// (`::ffff:127.0.0.1`, the deprecated `::127.0.0.1`). Returns null if the
+// literal doesn't parse.
+function expandIPv6(addr) {
+  // A trailing dotted-quad (mapped `::ffff:127.0.0.1` or the deprecated
+  // compatible `::127.0.0.1`) rewrites to two hex groups first, so the rest
+  // of the parse only ever deals in plain hex groups. `.*:` is greedy, so it
+  // captures up through the LAST colon — the one separating the embedded
+  // IPv4 from whatever precedes it, "::" compression included.
+  let body = addr;
+  const tail = addr.match(/^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (tail) {
+    const v4 = parseIPv4(tail[2]);
+    if (v4 == null) return null;
+    body = tail[1] + (v4 >>> 16).toString(16) + ":" + (v4 & 0xffff).toString(16);
+  }
+
+  const doubleColon = body.indexOf("::");
+  let groups;
+  if (doubleColon !== -1) {
+    if (body.indexOf("::", doubleColon + 1) !== -1) return null;
+    const left = body.slice(0, doubleColon).split(":").filter(Boolean);
+    const right = body.slice(doubleColon + 2).split(":").filter(Boolean);
+    const missing = 8 - (left.length + right.length);
+    if (missing < 0) return null;
+    groups = [...left, ...Array(missing).fill("0"), ...right];
+  } else {
+    groups = body === "" ? [] : body.split(":");
+  }
+  if (groups.length !== 8 || !groups.every((g) => /^[0-9a-f]{1,4}$/i.test(g))) return null;
+  return groups.map((g) => parseInt(g, 16));
+}
+
+// A parsed IPv6 host is loopback in three forms: the canonical/expanded
+// `::1`, an IPv4-mapped address (`::ffff:a.b.c.d`) whose embedded IPv4 is
+// loopback, or the deprecated all-zero-prefix IPv4-compatible form.
+function isLoopbackIPv6(hostname) {
+  const groups = expandIPv6(hostname);
+  if (!groups) return false;
+  if (groups.slice(0, 7).every((g) => g === 0) && groups[7] === 1) return true;
+  const embeddedIPv4 = (groups[6] << 16) | groups[7];
+  if (groups.slice(0, 5).every((g) => g === 0) && (groups[5] === 0 || groups[5] === 0xffff)) {
+    return isLoopbackIPv4Value(embeddedIPv4 >>> 0);
+  }
+  return false;
+}
+
+// Loopback hosts — 127.0.0.0/8 (any spelling: `127.1`, `127.0.0.2`, …),
+// 0.0.0.0, `localhost`, and ::1 (any spelling: fully-expanded,
+// IPv4-mapped/-compatible) — are machine-local; baking one into a COMMITTED
+// file leaks a developer's dev-server address to every other contributor
+// (issue-spor-agents-md-local-mcp-leak). `host` is u.serverHost()'s output
+// (scheme/path already stripped); peel the bracket/port a hostname carries.
+// Brackets are checked before a bare port strip, and a bare host with more
+// than one colon is left alone, because an unbracketed IPv6 address's
+// colons would otherwise be misread as a port.
 function isLocalServer(host) {
   const bracketed = host.match(/^\[([^\]]+)\]/);
   const hostname = bracketed
@@ -39,7 +147,10 @@ function isLocalServer(host) {
     : (host.match(/:/g) || []).length > 1
       ? host
       : host.replace(/:\d+$/, "");
-  return /^(127(\.\d+){3}|localhost|::1)$/i.test(hostname);
+  if (/^localhost$/i.test(hostname)) return true;
+  if (hostname.includes(":")) return isLoopbackIPv6(hostname);
+  const v4 = parseIPv4(hostname);
+  return v4 != null && isLoopbackIPv4Value(v4);
 }
 
 function toolsLine({ noServerLine = false } = {}) {
