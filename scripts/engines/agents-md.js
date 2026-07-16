@@ -160,9 +160,20 @@ function isLocalServer(host) {
   return v4 != null && isLoopbackIPv4Value(v4);
 }
 
+// One "should this host be suppressed" rule, shared by both places a server
+// host can land in the COMMITTED block (the tools-line sentence and the
+// briefing heading's `meta`) — an explicit --no-server-line always hides it,
+// same as a loopback host does. A second inline spelling of this predicate is
+// exactly how issue-spor-agents-md-briefing-header-leak happened: the caller
+// wired `noServerLine` through, but the briefing-heading computation never
+// consulted it.
+function hideHost(host, noServerLine) {
+  return noServerLine || isLocalServer(host);
+}
+
 function toolsLine({ noServerLine = false } = {}) {
   const server = u.serverBase();
-  const showServer = server && !noServerLine && !isLocalServer(u.serverHost());
+  const showServer = server && !hideHost(u.serverHost(), noServerLine);
   const mcp = showServer ? ` It is reachable over MCP at ${server}/mcp (bearer token).` : "";
   return `A team knowledge graph (Spor) holds prior decisions, constraints, dismissed approaches, and deferred work.${mcp} Before designing or deciding anything non-trivial, check it (query_graph). Ask show_queue what to work on next. When a git commit implements a tracked node (a task, decision, or issue), add a 'Spor: <node-id>' trailer to the commit message, in the final trailer block alongside any Co-Authored-By (no blank line between trailers) — git then records which node the commit serves, and the graph records the commit's sha.`;
 }
@@ -248,10 +259,14 @@ async function writeAgentsBlock({ cwd, briefing = true, noServerLine = false }) 
           body = u.stripTrailingNewlines(u.byteHead((parsed.body ?? "") + "\n", 7000));
           const version = parsed.version ?? 1;
           const host = u.serverHost();
-          // Same loopback guard as toolsLine(): the briefing heading is also
-          // part of the COMMITTED block, so a machine-local host must not
-          // ride along here either (issue-spor-agents-md-local-mcp-leak).
-          meta = isLocalServer(host) ? `brief-${slug} v${version}` : `brief-${slug} v${version} @ ${host}`;
+          // Same hideHost() guard as toolsLine(): the briefing heading is
+          // also part of the COMMITTED block, so a loopback host or an
+          // explicit --no-server-line must suppress it here too
+          // (issue-spor-agents-md-local-mcp-leak,
+          // issue-spor-agents-md-briefing-header-leak).
+          meta = hideHost(host, noServerLine)
+            ? `brief-${slug} v${version}`
+            : `brief-${slug} v${version} @ ${host}`;
         }
       } catch {}
     } else {

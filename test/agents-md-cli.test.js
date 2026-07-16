@@ -172,6 +172,56 @@ test("agents-md --briefing: a loopback SPOR_SERVER is also omitted from the brie
   }
 });
 
+// issue-spor-agents-md-briefing-header-leak: writeAgentsBlock() forwarded
+// `noServerLine` to toolsLine() but never consulted it when composing the
+// "Standing project briefing (...)" heading's `meta` — so `--briefing
+// --no-server-line` against a PUBLIC server still baked `@ <host>` into the
+// committed heading, breaking flag parity with the tools line. In-process so
+// `u.curl` can be stubbed: a real public hostname isn't network-reachable in
+// CI, and this is exactly what lets the test set SPOR_SERVER to a public-
+// looking host while the actual fetch never leaves the process.
+test("agents-md --briefing --no-server-line: suppresses the briefing heading host for a public server too", async () => {
+  const u = require("../scripts/engines/util.js");
+  const { writeAgentsBlock } = require("../scripts/engines/agents-md.js");
+  const { home, cwd } = scratch();
+  const prevEnv = {};
+  for (const k of Object.keys(process.env)) {
+    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_")) {
+      prevEnv[k] = process.env[k];
+      delete process.env[k];
+    }
+  }
+  process.env.SPOR_HOME = home;
+  process.env.SPOR_SERVER = "https://spor.example.com";
+  u.clearConfig();
+  const realCurl = u.curl;
+  u.curl = async () => ({
+    http: "200",
+    body: JSON.stringify({ found: true, body: "remote standing briefing body.", version: 4 }),
+  });
+  try {
+    await writeAgentsBlock({ cwd, briefing: true, noServerLine: true });
+    const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+    assert.match(md, /Standing project briefing/);
+    assert.ok(md.includes("remote standing briefing body."));
+    assert.doesNotMatch(md, /spor\.example\.com/);
+    assert.doesNotMatch(md, /reachable over MCP/);
+
+    // Parity check: WITHOUT --no-server-line, the same public server keeps
+    // showing its host in the heading (this isn't a blanket suppression).
+    fs.rmSync(path.join(cwd, "AGENTS.md"));
+    await writeAgentsBlock({ cwd, briefing: true, noServerLine: false });
+    const md2 = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+    assert.match(md2, /spor\.example\.com/);
+  } finally {
+    u.curl = realCurl;
+    u.clearConfig();
+    delete process.env.SPOR_HOME;
+    delete process.env.SPOR_SERVER;
+    Object.assign(process.env, prevEnv);
+  }
+});
+
 // issue-spor-agents-md-local-mcp-leak: a machine-local SPOR_SERVER must never
 // be baked into the committed block; a public/hosted server keeps the
 // sentence; --no-server-line suppresses it unconditionally either way.
