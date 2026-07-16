@@ -805,6 +805,119 @@ test("staleOverrides: a resident override below the seed version is flagged; at/
   assert.deepEqual(current.registry.staleOverrides(), [], "current override is silent");
 });
 
+// ---------- staleOverrides: order independence (issue-spor-registry-stale-shadow-traversal-bug) ----------
+//
+// staleOverrides() must report a stale shadow only when the FINAL winning
+// entry for a key is older than the best seed entry — derived from end-state,
+// not from add()-time snapshots. So every permutation of Registry.add() order
+// (seed / legacy graph / newer graph winner) must yield the same result.
+
+test("staleOverrides: node-schema order independence — legacy-first and winner-first both end up silent", () => {
+  const nodeSchema = (id, version) => ({
+    id, kind: "node-schema", version, key: "widget",
+    payload: { node_type: "widget" }, code: {}, codeBlocks: [], upgrades: [],
+  });
+  const seed = nodeSchema("schema-widget-seed", "2026.06.10.1");
+  const legacy = nodeSchema("schema-widget-legacy", "2026.01.01.1"); // older than seed
+  const winner = nodeSchema("schema-widget-winner", "2026.06.10.1"); // == seed, so no shadow
+
+  // legacy-first: seed, then the stale legacy override, then its own replacement
+  const legacyFirst = new registry.Registry();
+  legacyFirst.add(seed, "seed");
+  legacyFirst.add(legacy, "graph");
+  legacyFirst.add(winner, "graph");
+  assert.equal(legacyFirst.nodeSchemas.get("widget").id, "schema-widget-winner");
+  assert.deepEqual(legacyFirst.staleOverrides(), [], "legacy-first: final winner matches seed, silent");
+
+  // winner-first: seed, then the eventual winner, then the (losing) legacy entry
+  const winnerFirst = new registry.Registry();
+  winnerFirst.add(seed, "seed");
+  winnerFirst.add(winner, "graph");
+  winnerFirst.add(legacy, "graph");
+  assert.equal(winnerFirst.nodeSchemas.get("widget").id, "schema-widget-winner");
+  assert.deepEqual(winnerFirst.staleOverrides(), [], "winner-first: same final state, same silence");
+});
+
+test("staleOverrides: node-schema true positive survives every add() order", () => {
+  const nodeSchema = (id, version) => ({
+    id, kind: "node-schema", version, key: "widget",
+    payload: { node_type: "widget" }, code: {}, codeBlocks: [], upgrades: [],
+  });
+  const seed = nodeSchema("schema-widget-seed", "2026.06.10.1");
+  const staleWinner = nodeSchema("schema-widget-stale", "2026.01.01.1"); // the FINAL winner, still older than seed
+
+  for (const order of [
+    [["seed", seed], ["graph", staleWinner]],
+    [["graph", staleWinner], ["seed", seed]],
+  ]) {
+    const reg = new registry.Registry();
+    for (const [source, schema] of order) reg.add(schema, source);
+    assert.equal(reg.nodeSchemas.get("widget").id, "schema-widget-stale");
+    const warnings = reg.staleOverrides();
+    assert.equal(warnings.length, 1, `order ${JSON.stringify(order.map((o) => o[0]))}`);
+    assert.match(warnings[0], /'schema-widget-stale'.*widget @ 2026\.01\.01\.1.*shadows a newer seed schema.*2026\.06\.10\.1/);
+  }
+});
+
+test("staleOverrides: a superseded graph entry that lost to a newer graph entry never warns on its own", () => {
+  // Same shape as the node-schema case, but for every kind that participates in
+  // staleOverrides(): edge-schema, queue-policy, policy, register. In each case
+  // seed < legacy(graph) < winner(graph), and the winner should be >= seed, so
+  // the final state is silent regardless of whether the legacy loser is added.
+  const cases = [
+    {
+      label: "edge-schema",
+      make: (id, version) => ({
+        id, kind: "edge-schema", version, key: "gizmo-of",
+        payload: { edge_type: "gizmo-of" }, code: {}, codeBlocks: [], upgrades: [],
+      }),
+      get: (reg) => reg.edgeSchemas.get("gizmo-of"),
+    },
+    {
+      label: "queue-policy",
+      make: (id, version) => ({
+        id, kind: "queue-policy", version, key: "queue-policy",
+        payload: {}, code: { rank: "export function rank() {}" }, codeBlocks: [], upgrades: [],
+      }),
+      get: (reg) => reg.queuePolicy,
+    },
+    {
+      label: "policy",
+      make: (id, version) => ({
+        id, kind: "policy", version, key: id,
+        payload: { governs: {} }, code: { gate: "export function gate() {}" }, codeBlocks: [], upgrades: [],
+      }),
+      get: (reg, id) => reg.policySchemas.get(id),
+    },
+    {
+      label: "register",
+      make: (id, version) => ({
+        id, kind: "register", version, key: "widget-flavors",
+        payload: { register: "widget-flavors", classes: [] }, code: {}, codeBlocks: [], upgrades: [],
+      }),
+      get: (reg) => reg.registers.get("widget-flavors"),
+    },
+  ];
+
+  for (const { label, make, get } of cases) {
+    // policy is keyed by id, so seed/legacy/winner all share the SAME id (as a
+    // real graph override of a seed-shipped schema node would) so they occupy
+    // one slot; for the other kinds id is irrelevant to keying but kept
+    // constant too, for realism.
+    const id = label === "policy" ? "policy-widget-guard" : `schema-${label}`;
+    const seed = make(id, "2026.06.10.1");
+    const legacy = make(id, "2026.01.01.1");
+    const winner = make(id, "2026.06.10.1");
+
+    const reg = new registry.Registry();
+    reg.add(seed, "seed");
+    reg.add(legacy, "graph");
+    reg.add(winner, "graph");
+    assert.equal(get(reg, id).version, "2026.06.10.1", label);
+    assert.deepEqual(reg.staleOverrides(), [], `${label}: superseded legacy entry left no residual warning`);
+  }
+});
+
 test("validateNode: schema node structural + payload rules", () => {
   const n = graph.parseFrontmatter(TASK_OVERRIDE_MD, "schema-task.md");
   assert.equal(graph.validateNode(null, n).ok, true);
