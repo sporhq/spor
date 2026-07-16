@@ -2,7 +2,7 @@
 id: schema-register-terminal-status
 type: schema
 kind: register
-schema_version: 2026.07.16.1
+schema_version: 2026.07.16.2
 title: Seed schema for the type-blind terminal-status register
 summary: Registry-declared extensible enum (kind register) for the type-blind terminal-status vocabulary — the status values that retire ANY node from queue liveness, briefing "live work" surfacing, and coupling-norm matching. The kernel exposes it as a partition (graph.registry.registerClasses("terminal-status")) instead of two divergent hardcoded tables in lib/kernel/resolution.js and lib/kernel/coupling.js. Seed default; a graph-resident register schema for this name overrides/extends it.
 date: 2026-07-16
@@ -41,17 +41,28 @@ coupling.js is ALWAYS in, since it scans node files in the hook tool loop
 without a loaded graph (dec-spor-coupling-norms-declared-first; "the
 consumers of this module run in the hook tool loop without one").
 
-This register is **type-blind** and DISTINCT from both registry partitions a
+This register is **type-blind** and DISTINCT from the registry partitions a
 node-schema declares under `status:` (dec-spor-definition-of-done-org-policy):
-`non_resolving` (does a node, acting as a RESOLVER, retire OTHERS) and
-`terminal` (is a node's OWN lifecycle done, read only by work-analytics —
-issue-spor-analytics-completion-ignores-schema-terminal-status). A decision's
-`settled` status is terminal for that own-lifecycle partition but is
-deliberately ABSENT from this register: queue liveness and briefing surfacing
-must keep a settled decision live (dec-spor-decision-lifecycle-surfacing), so
-this vocabulary stays the narrower, type-blind set — adding a status here
-retires it from queues/briefings/coupling-matching for EVERY node type, so
-only genuinely universal completion words belong.
+`non_resolving` (does a node, acting as a RESOLVER, retire OTHERS), `terminal`
+(is a node's OWN lifecycle done, read only by work-analytics —
+issue-spor-analytics-completion-ignores-schema-terminal-status), and `inert`
+(the PER-TYPE queue-liveness overlay the type-aware
+`isTerminalStatus(status, type, graph)` unions with this register,
+dec-spor-status-inert-third-partition; a schema that declares no `inert`
+inherits its `terminal` set). A decision's `settled` status is terminal for
+the own-lifecycle partition but is deliberately ABSENT from this register AND
+from the decision schema's declared `inert`: queue liveness and briefing
+surfacing must keep a settled decision live
+(dec-spor-decision-lifecycle-surfacing). This vocabulary stays the narrower,
+type-blind set — adding a status here retires it from
+queues/briefings/coupling-matching for EVERY node type, so only genuinely
+universal completion words belong; a type-scoped status belongs in its owning
+schema's `status.inert`/`status.terminal` instead. `released` (an artifact's
+shipped delivery stage) sat here briefly (2026.07.16.1, the divergence fix)
+before the inert partition existed; it moved to schema-artifact's own
+partition in 2026.07.16.2 so a non-artifact marked `released` no longer
+silently dies from the queue
+(task-spor-terminal-status-type-aware-migration).
 
 ```json
 {
@@ -67,7 +78,6 @@ only genuinely universal completion words belong.
     { "id": "done", "description": "a task's terminal status" },
     { "id": "merged", "description": "landed on the default branch — a triaged capture-pending, or an artifact's delivery stage" },
     { "id": "rejected", "description": "recorded then declined/reversed" },
-    { "id": "released", "description": "an artifact's shipped delivery stage" },
     { "id": "resolved", "description": "an issue's terminal status" },
     { "id": "retired", "description": "no longer in force (a coupling norm stops matching)" },
     { "id": "superseded", "description": "replaced by a newer node" }

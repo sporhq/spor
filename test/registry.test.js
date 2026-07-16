@@ -503,6 +503,61 @@ test("Registry: an org schema declares a terminal status (no code change)", () =
   assert.equal(reg.terminalStatuses().has("settled"), true, "other schemas' declarations still union in");
 });
 
+test("seed pack: per-type inert partition — decision is the pinned exception, others inherit terminal", () => {
+  // dec-spor-status-inert-third-partition: inertStatuses(type) is the per-type
+  // queue-liveness overlay the type-aware isTerminalStatus reads. A schema with
+  // no `status.inert` inherits its `status.terminal`; the decision schema
+  // declares inert explicitly because its two sets genuinely differ (`settled`
+  // is terminal but NOT inert, dec-spor-decision-lifecycle-surfacing).
+  const reg = graph.seedRegistry();
+  const dec = reg.inertStatuses("decision");
+  assert.deepEqual([...dec].sort(), ["rejected", "superseded"], "decision declares inert explicitly");
+  assert.equal(dec.has("settled"), false, "settled is terminal but NOT inert — the pinned exception");
+  assert.deepEqual([...reg.inertStatuses("artifact")].sort(), ["done", "merged", "released"],
+    "artifact declares no inert — inherits its terminal set (the inheritance default)");
+  assert.deepEqual([...reg.inertStatuses("correction")].sort(), ["applied"],
+    "correction inherits terminal too");
+  assert.deepEqual([...reg.inertStatuses("task")], [],
+    "a schema declaring neither partition has an empty overlay (type-blind vocabulary only)");
+  assert.deepEqual([...reg.inertStatuses("no-such-type")], [], "unknown type -> empty overlay");
+});
+
+test("Registry: an org schema declares an inert status distinct from terminal (no code change)", () => {
+  const reg = graph.seedRegistry();
+  const ok = reg.add({
+    id: "schema-task", kind: "node-schema", version: "2026.07.01.1", key: "task",
+    payload: { node_type: "task", status: { terminal: ["shelved", "iced"], inert: ["iced"] } },
+    code: {}, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.equal(ok, true);
+  assert.deepEqual([...reg.inertStatuses("task")], ["iced"],
+    "a declared inert set wins over the terminal inheritance");
+  assert.equal(reg.terminalStatuses().has("shelved"), true, "terminal partition unaffected");
+});
+
+test("seed pack: the terminal-status register reproduces resolution.js's fallback byte-identically", () => {
+  // The contract resolution.js documents: TERMINAL_FALLBACK (what a graph-less
+  // caller like coupling.js reads) and the seed register's classes are ONE set,
+  // so the two paths cannot drift (issue-spor-coupling-resolution-terminal-
+  // status-divergence). `released` is deliberately in NEITHER: it is
+  // artifact-scoped via schema-artifact's own partition
+  // (task-spor-terminal-status-type-aware-migration).
+  const resolution = require(path.join(__dirname, "..", "lib", "kernel", "resolution.js"));
+  const reg = graph.seedRegistry();
+  const classes = [...reg.registerClasses("terminal-status")].sort();
+  assert.deepEqual(classes, [...resolution.terminalStatuses],
+    "seed register classes == TERMINAL_FALLBACK (sorted)");
+  assert.equal(classes.includes("released"), false, "released is artifact-scoped, not type-blind");
+});
+
+test("parseSchemaNode: rejects a malformed status.inert", () => {
+  const bad = registry.parseSchemaNode({
+    id: "schema-z", kind: "node-schema", schema_version: "2026.07.16.1",
+    body: '```json\n{"node_type":"z","status":{"inert":[1,""]}}\n```',
+  });
+  assert.ok(bad.errors.some((e) => /inert must be an array of non-empty strings/.test(e)));
+});
+
 test("parseSchemaNode: rejects a malformed status.non_resolving / status.terminal", () => {
   const bad = registry.parseSchemaNode({
     id: "schema-x", kind: "node-schema", schema_version: "2026.06.15.1",

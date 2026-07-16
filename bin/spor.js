@@ -6461,7 +6461,7 @@ async function resolveNode(cfg, id) {
 // read error yields null (never block a dispatch on an unreadable graph).
 function dispatchResolutionReason(cfg, node) {
   const status = (node.status || "").toLowerCase();
-  if (isTerminalStatus(status)) return `status: ${status}`;
+  if (isTerminalStatus(status, node.type || null)) return `status: ${status}`;
   const fromEdge = (r) => `${r.edge || "resolves"} edge from ${r.by}${r.title ? ` — ${r.title}` : ""}`;
   if (node.resolution && node.resolution.by) return fromEdge(node.resolution);
   if (cfg.mode() !== "remote") {
@@ -6472,7 +6472,7 @@ function dispatchResolutionReason(cfg, node) {
       // (issue-spor-coupling-resolution-terminal-status-divergence), which
       // this graph load (needed for the edge-based check below anyway) can
       // now catch before falling through to a dispatch.
-      if (isTerminalStatus(status, g)) return `status: ${status}`;
+      if (isTerminalStatus(status, node.type || null, g)) return `status: ${status}`;
       const r = resolutionOf(g, node.id);
       if (r && r.by) return fromEdge(r);
     } catch {

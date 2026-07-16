@@ -28,8 +28,12 @@ registers ship today: `requires` — the work-node risk/permission axis, read
 with `graph.registry.requiresClasses()` — and `terminal-status` — the
 type-blind status vocabulary that retires any node from queue liveness,
 briefing surfacing, and coupling-norm matching, read with
-`graph.registry.registerClasses("terminal-status")`. Grow either by writing a
-resident `kind: register` schema with the same `register:` name.)
+`graph.registry.registerClasses("terminal-status")` and unioned with each
+type's `status.inert` overlay by the type-aware
+`isTerminalStatus(status, type, graph)`. Grow either by writing a resident
+`kind: register` schema with the same `register:` name — but put a status
+that should retire only ONE type in that schema's `status.inert`/
+`status.terminal`, not in the register, which retires it for every type.)
 
 ### Node schema — JSON payload keys
 
@@ -60,6 +64,16 @@ resident `kind: register` schema with the same `register:` name.)
   read by work-analytics (unioned with the kernel's legacy terminal set). Use it
   for a status that ends the node's life but is intentionally not a global
   terminal — e.g. decision `settled`, which still surfaces in briefings.
+- `status.inert` — statuses in which a node of THIS type is queue-liveness-dead
+  (retired from queues, briefing live-work surfacing, coupling matching), the
+  per-type overlay `isTerminalStatus(status, type, graph)` unions with the
+  type-blind `terminal-status` register. **Declare it only when it differs from
+  `status.terminal`** — a schema with no `inert` set inherits its `terminal`
+  set (dec-spor-status-inert-third-partition). The seed decision schema is the
+  canonical exception: `settled` is terminal (analytics counts it done) but NOT
+  inert (it keeps surfacing as live guidance). Use a per-type declaration —
+  never the type-blind register — for an org status like artifact `released`,
+  so it retires only nodes of its own type.
 
 Note what the payload does **not** hold: there is no field list and no status
 *enum*. Extra frontmatter fields are allowed as-is — a custom `severity:` line

@@ -2,7 +2,7 @@
 id: schema-artifact
 type: schema
 kind: node-schema
-schema_version: 2026.07.16.1
+schema_version: 2026.07.16.2
 title: Seed schema for artifact nodes
 summary: Node schema for the artifact type — a document, spec, module, or build product worth referencing, optionally carrying a delivery-stage status when it represents a change. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -60,12 +60,16 @@ each of `done`, `merged`, and `released`. `in-review`/`approved` and any
 unlisted/empty status (the live default: a plain reference doc with no
 status, or one mid-review) are NOT terminal — they, and any other status,
 stay OUT of this partition, so the artifact keeps reading as work in progress.
-Separately, `merged`/`released`/`done` are also part of the type-blind
-`terminal-status` register (GRAPH.md) that `lib/kernel/resolution.js` and
-`lib/kernel/coupling.js` read for queue liveness and briefing surfacing — the
-gap this schema closes is that `released` had NEVER been in either register,
-so a released artifact stayed "live" in queue/briefing surfaces exactly like
-an unfinished one, unlike `merged`/`done` which already retired correctly.
+Separately, `merged`/`done` are also part of the type-blind `terminal-status`
+register (GRAPH.md) that `lib/kernel/resolution.js` and
+`lib/kernel/coupling.js` read for queue liveness and briefing surfacing.
+`released` is NOT: it is artifact-scoped, reaching queue liveness only
+through this partition — the per-type `status.inert` overlay inherits this
+`terminal` set (no `inert` declared here, the inheritance default of
+dec-spor-status-inert-third-partition), so a released ARTIFACT retires from
+queues and briefings while a non-artifact marked `released` stays live
+(task-spor-terminal-status-type-aware-migration; it sat in the type-blind
+register for one version, 2026.07.16.1, before the inert partition existed).
 Registry behavior only, no node-shape change, backward-readable, no upgrade
 chain.
 

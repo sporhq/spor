@@ -234,13 +234,19 @@ separately, but never shows a complete custom type in one piece.
 
 **The constraint model is procedural, not declarative.** A schema's `json`
 payload declares only *registry knobs* — `node_type`, `prefix`, `queueable`,
-`traversable`, `always_on`, `capturable`, an edge `weight`, and the two status
+`traversable`, `always_on`, `capturable`, an edge `weight`, and the three status
 partitions: `status.non_resolving` (resolver semantics — whether a node in this
-status retires the targets it points at) and `status.terminal` (own-lifecycle
+status retires the targets it points at), `status.terminal` (own-lifecycle
 completion — the statuses in which a node of this type is *done*, unioned with the
 kernel's legacy set and read by work-analytics so a schema-only terminal status
 like decision `settled` counts as completed,
-issue-spor-analytics-completion-ignores-schema-terminal-status). There is **no
+issue-spor-analytics-completion-ignores-schema-terminal-status), and
+`status.inert` (queue-liveness-dead — the per-type overlay the type-aware
+`isTerminalStatus(status, type, graph)` unions with the type-blind
+`terminal-status` register below; a schema that declares no `inert` set
+INHERITS its `terminal` set, so only a schema whose two sets genuinely differ
+declares it — the seed decision schema pins `settled` terminal but NOT inert,
+dec-spor-status-inert-third-partition). There is **no
 declarative field list and no status enum.** Custom fields are free-form: any flat frontmatter key the
 regex parser accepts (simple `key: value` scalars, YAML-folded multi-line
 values, `pin:`/`exclude:` inline lists, `- {type: X, to: Y}` edges — and nothing
@@ -923,17 +929,28 @@ kernel modules read (`graph.registry.registerClasses("terminal-status")`)
 instead of two separately hardcoded, previously-divergent tables
 (issue-spor-coupling-resolution-terminal-status-divergence). The seed set is
 `abandoned`, `answered`, `closed`, `completed`, `deprecated`, `dismissed`,
-`done`, `merged`, `rejected`, `released`, `resolved`, `retired`, `superseded`.
-It is **DISTINCT** from the per-node-schema `status.non_resolving` and
-`status.terminal` partitions above: a decision's `settled` status is terminal
-for its OWN lifecycle (`status.terminal`, read only by work-analytics) but is
-deliberately absent from this register, so a settled decision keeps surfacing
-as live guidance in queues and briefings (dec-spor-decision-lifecycle-
-surfacing). `lib/kernel/coupling.js` scans node files in the hook tool loop
-without a loaded graph/registry, so it (and any other graph-less caller) reads
-a hardcoded fallback that reproduces this register's seed classes
-byte-identically; a graph-resident override only reaches callers that pass a
-loaded `graph`.
+`done`, `merged`, `rejected`, `resolved`, `retired`, `superseded` — only
+genuinely universal completion words; a type-scoped status belongs in its
+owning schema's `status.inert`/`status.terminal` instead (artifact `released`
+lives there, so a non-artifact marked `released` stays live,
+task-spor-terminal-status-type-aware-migration).
+
+The full liveness check is **type-aware**
+(dec-spor-status-inert-third-partition): `isTerminalStatus(status, type,
+graph)` unions this register with the registry's per-type `status.inert`
+overlay (declared, or inherited from `status.terminal`). The union is one-way
+additive — a per-type declaration scopes a status to its own type but can
+never remove a universal word. The register is **DISTINCT** from the
+per-node-schema partitions above: a decision's `settled` status is terminal
+for its OWN lifecycle (`status.terminal`, read by work-analytics) but is
+deliberately absent from this register AND from the decision schema's
+declared `inert`, so a settled decision keeps surfacing as live guidance in
+queues and briefings (dec-spor-decision-lifecycle-surfacing).
+`lib/kernel/coupling.js` scans node files in the hook tool loop without a
+loaded graph/registry, so it (and any other graph-less caller) reads a
+hardcoded fallback that reproduces this register's seed classes
+byte-identically; a graph-resident override — and every per-type overlay —
+only reaches callers that pass a loaded `graph`.
 
 ## Lenses
 

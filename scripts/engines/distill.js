@@ -184,16 +184,17 @@ async function sessionEndLease({ graph, slug, session, cwd, remote }) {
       return;
     }
     if (typeof parsed.raw !== "string") return;
-    const status = parsed.raw
-      .split("\n")
-      .find((l) => l.startsWith("status:"))
-      ?.slice(7)
-      .trim() ?? "";
+    const rawLines = parsed.raw.split("\n");
+    const status = rawLines.find((l) => l.startsWith("status:"))?.slice(7).trim() ?? "";
+    const type = rawLines.find((l) => l.startsWith("type:"))?.slice(5).trim() ?? "";
     // Status lags resolution edges (issue-cc-status-lags-resolution-edges):
     // the `resolution` read-time enrichment (a live inbound resolves/answers
     // edge) means the task is done even while its status field still reads
-    // open, so either signal counts as finished.
-    const finished = Boolean(parsed.resolution) || resolutionLib.isTerminalStatus(status);
+    // open, so either signal counts as finished. The type rides along so the
+    // liveness check is type-aware (per-type inert partition,
+    // dec-spor-status-inert-third-partition); with no graph in hand it still
+    // falls back to the type-blind vocabulary.
+    const finished = Boolean(parsed.resolution) || resolutionLib.isTerminalStatus(status, type || null);
     const action = finished ? "release" : "reserve";
     const body = action === "reserve" ? JSON.stringify({ session }) : "{}";
     const post = await u
