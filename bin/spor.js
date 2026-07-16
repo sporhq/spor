@@ -2613,7 +2613,12 @@ async function cmdAdd(cfg, { values, positionals }) {
   const neededBy = values["needed-by"] || null;
 
   if (cfg.mode() === "remote") {
-    const context = { project };
+    // Mark whether `project` came from a user-declared --project or the ambient
+    // cwd default, so the server can gate its fold-mismatch warning on an actual
+    // declaration instead of false-firing on ordinary cross-repo folds
+    // (task-spor-thread-explicit-project-flag). Rides the same context object
+    // that spools to the outbox, so a `spor drain` replay carries it verbatim.
+    const context = { project, project_explicit: Boolean(values.project) };
     if (during) context.during = during;
     if (blocks) context.blocks = blocks;
     if (neededBy) context.needed_by = neededBy;

@@ -485,7 +485,10 @@ async function distill(input) {
       const text = u.byteHead(fact, 3900);
       const body = JSON.stringify({
         text,
-        context: { project: slug },
+        // Always the ambient cwd slug, never user-declared, so the server's
+        // fold-mismatch warning stays silent on ordinary cross-repo distill
+        // captures (task-spor-thread-explicit-project-flag).
+        context: { project: slug, project_explicit: false },
         source: "distill",
         idempotency_key: crypto.createHash("sha256").update(`${session}\n${text}`).digest("hex"),
       });
