@@ -124,6 +124,54 @@ test("agents-md --briefing: embeds the standing briefing (hook-less floor)", () 
   assert.ok(md.includes(`${slug} standing briefing body`));
 });
 
+// Stub server answering GET /v1/briefing/<slug> with a found:true body, so
+// the REMOTE briefing-embed path (writeAgentsBlock's curl branch) runs.
+function stubBriefingServer(version = 1) {
+  const http = require("node:http");
+  const srv = http.createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ found: true, body: "remote standing briefing body.", version }));
+  });
+  return new Promise((resolve) =>
+    srv.listen(0, "127.0.0.1", () => resolve({ srv, base: `http://127.0.0.1:${srv.address().port}` }))
+  );
+}
+
+// issue-spor-agents-md-local-mcp-leak (review follow-up on this branch's own
+// gate: the toolsLine() fix left a second leak vector untouched): the
+// "Standing project briefing (...)" heading also lands in the COMMITTED
+// block, and its `meta` used to bake in `u.serverHost()` unconditionally —
+// so `--briefing` against a loopback SPOR_SERVER still leaked the dev
+// server's host/port even after the tools-line sentence was fixed.
+//
+// Async `spawn` (not `spawnSync`): the stub server lives in THIS test
+// process, and spawnSync blocks this process's event loop until the child
+// exits, which would deadlock the child's connection back to the stub (same
+// class of gotcha as the claude-binary spawnSync note in CLAUDE.md).
+test("agents-md --briefing: a loopback SPOR_SERVER is also omitted from the briefing heading", async () => {
+  const { home, cwd } = scratch();
+  const { srv, base } = await stubBriefingServer(2);
+  try {
+    const env = bare(home, { SPOR_SERVER: base });
+    const { spawn } = require("node:child_process");
+    const r = await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [CLI, "agents-md", "--briefing"], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+      let stderr = "";
+      child.stderr.on("data", (c) => (stderr += c));
+      child.on("error", reject);
+      child.on("close", (status) => resolve({ status, stderr }));
+    });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+    assert.match(md, /Standing project briefing/);
+    assert.ok(md.includes("remote standing briefing body."));
+    assert.doesNotMatch(md, /127\.0\.0\.1/);
+    assert.doesNotMatch(md, /reachable over MCP/);
+  } finally {
+    srv.close();
+  }
+});
+
 // issue-spor-agents-md-local-mcp-leak: a machine-local SPOR_SERVER must never
 // be baked into the committed block; a public/hosted server keeps the
 // sentence; --no-server-line suppresses it unconditionally either way.

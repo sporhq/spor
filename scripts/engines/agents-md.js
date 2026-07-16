@@ -129,7 +129,11 @@ async function writeAgentsBlock({ cwd, briefing = true, noServerLine = false }) 
           // jq -r emits a trailing newline; head -c counts it; $() strips it.
           body = u.stripTrailingNewlines(u.byteHead((parsed.body ?? "") + "\n", 7000));
           const version = parsed.version ?? 1;
-          meta = `brief-${slug} v${version} @ ${u.serverHost()}`;
+          const host = u.serverHost();
+          // Same loopback guard as toolsLine(): the briefing heading is also
+          // part of the COMMITTED block, so a machine-local host must not
+          // ride along here either (issue-spor-agents-md-local-mcp-leak).
+          meta = isLocalServer(host) ? `brief-${slug} v${version}` : `brief-${slug} v${version} @ ${host}`;
         }
       } catch {}
     } else {
