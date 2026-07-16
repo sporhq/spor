@@ -1578,6 +1578,32 @@ test("readiness: human WINS over a co-present agent stamp (derivation-with-overr
   assert.deepEqual(it.readiness_reasons, ["requires human"], "only the human reason, not the stamp");
 });
 
+test("readiness: an agent-ready item that would otherwise be 'do' suggests DISPATCH (issue-spor-suggest-dispatch-specified-not-emitted)", () => {
+  const g = tmpGraph(Object.fromEntries([
+    raw("task-s", "task", "status: open\nreadiness: agent\nreadiness_by: Dana via cli\n"),
+    node("task-to-agent", "task", { status: "open", edges: [["assigned", "agent-x"]] }),
+    node("agent-x", "agent", { status: "active" }),
+    node("task-plain", "task", { status: "open" }),
+  ])).load();
+  assert.equal(rd(g, "task-s").suggest, "dispatch", "a stamped agent-ready item suggests dispatch, not do");
+  assert.equal(rd(g, "task-to-agent").suggest, "dispatch", "an assigned→agent item suggests dispatch");
+  assert.equal(rd(g, "task-plain").suggest, "do", "an untriaged item stays 'do' — dispatch only upgrades agent-ready");
+});
+
+test("readiness: a triage disposition stays supreme over agent-readiness (dispatch only upgrades 'do')", () => {
+  // Agent-ready but also STALE: closing the loop wins — readiness never overrides
+  // close/blocked/triage/approve, only the plain-actionable 'do' base. A fully-
+  // superseded/missing anchor set flips staleness to close.
+  const g = tmpGraph(Object.fromEntries([
+    raw("task-stale-agent", "task", "status: open\nreadiness: agent\nreadiness_by: Dana\nedges:\n  - {type: derived-from, to: spec-old}\n  - {type: relates-to, to: ghost-gone}\n"),
+    node("spec-old", "artifact", {}),
+    node("spec-new", "artifact", { edges: [["supersedes", "spec-old"]] }),
+  ])).load();
+  const it = rd(g, "task-stale-agent");
+  assert.equal(it.readiness, "agent", "still classified agent-ready");
+  assert.equal(it.suggest, "close", "close wins — the disposition is supreme, not overridden by readiness");
+});
+
 test("readiness: a question item is human, and an open neighborhood question makes its neighbor human", () => {
   const g = tmpGraph(Object.fromEntries([
     node("task-near", "task", { status: "open", edges: [["relates-to", "q-open"]] }),

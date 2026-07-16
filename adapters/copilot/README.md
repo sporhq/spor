@@ -34,7 +34,8 @@ to skip it; legacy `SUBSTRATE_*` names are still read.
 | distill (capture) | `agentStop` + `--debounce 900` | turn-scoped, carries `transcriptPath`; debounced like Codex |
 
 For on-demand graph access, add the Spor MCP server to
-`~/.copilot/mcp-config.json`:
+`~/.copilot/mcp-config.json` (`spor install copilot --mcp` writes this
+automatically):
 
 ```json
 { "mcpServers": { "spor": { "type": "http", "url": "https://spor.example.com/mcp", "headers": { "Authorization": "Bearer $SPOR_TOKEN" } } } }

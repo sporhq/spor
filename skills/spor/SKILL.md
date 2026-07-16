@@ -92,7 +92,11 @@ rest are mode-specific (`spor status` confirms which mode you're in):
 
 ```bash
 # either mode (the CLI self-resolves local vs remote per verb)
-spor status                    # resolved mode, graph, project, identity, health
+spor status [--quiet]          # resolved mode, graph, project, identity, health
+                               #   (--quiet skips the remote health probe + identity
+                               #   lookup — up to several seconds of round-trip — when
+                               #   a caller only needs a locally-resolved field like
+                               #   `project:`)
 spor next [--project <slug>]   # the ranked decision queue — "what's next"
 spor get <id>                  # one node by id
 spor put-node [<file>|-] --if-exists <error|skip|update> [--revision <sha>]
@@ -137,6 +141,8 @@ spor compile --query "<text>"  # search → compiled neighborhood (--digest for 
 spor brief <id>                # a briefing for one node (compile --root <id>)
 spor analytics --type task,issue      # created-vs-completed metrics (local git history / GET /v1/analytics)
 spor changes [--since <sha|date>]     # recent-activity feed: what changed lately (local git log / GET /v1/changes)
+spor program <id> [--max-depth N] [--max-nodes N]   # birds-eye program/progress view over blocks topology
+                               #   (local walk of inbound blocks edges / GET /v1/program/{id}, render_program's CLI twin)
 spor query --type task --where status=open --ids   # structured node/edge enumeration (local nodes dir / GET /v1/export then query locally)
 spor check [--staged|--range <a..b>|--files <f...>] [--strict]   # coupling-drift report over a diff: coupling
                                #   norms (couples_when/couples_also, see concepts.md) whose triggers are
@@ -230,6 +236,38 @@ carrying an `answers` edge; close work with a `resolves` edge from a
 superseded/constraint handling, question routing, write hygiene — is
 **`references/cowork.md`**; read it when working from Cowork or the connector.
 
+## Writing a cohort: order goes in edges, not prose
+
+Whenever one sitting produces **more than one work node** — a batch of tasks off
+a decision, a scoped-out feature, a migration broken into steps — the ordering
+you already know is part of the write, not a follow-up. Before you move on, ask
+which of these must land before which, and record each answer as a `blocks` edge
+from the prerequisite to the dependent:
+
+```bash
+spor edge task-relocate-issuer blocks task-tenant-api   # prerequisite blocks dependent
+```
+
+Dependency is the one queue signal that comes only from edges. The ranker blends
+several terms — priority, heat, age, staleness — but the sole thing that demotes
+a blocked item below its unblockers is a live `blocks` edge
+(dec-cc-queue-blocked-demotion); no prose anywhere feeds it. So an ordering
+stated only in a body — "keystone", "do this first", "gated on X" — is invisible
+to `spor next`, which will happily surface the dependent task first
+(issue-spor-agent-missing-dependency-edges). Creation time is the one moment when
+the order is both known and cheap to record. The gardener's unedged-gate detector
+does catch some of what you miss, but only on its next sweep, and only as a
+finding someone still has to action.
+
+Two rules bound it:
+
+- `blocks` is **work-to-work only** (task→task, task→issue). A decision never
+  reaches a terminal status, so a `blocks` edge from one is a permanent false
+  blocker — sequence from a decision with `derived-from`/`relates-to`
+  (norm-cc-blocks-work-only).
+- Only wire real prerequisites. Cohort membership alone is `relates-to`; if the
+  two could proceed in either order, they don't block each other.
+
 ## Grouping work under an umbrella node (programs)
 
 When a workstream outgrows a handful of nodes — a milestone, a refactoring
@@ -262,12 +300,12 @@ spor edge task-api-rate-limit blocks task-platform-hardening-program
   like any task.
 
 Read it back with `render_program` (`{id: "<umbrella-id>"}`; REST `GET
-/v1/program/<id>`): the gating tree with resolution-derived progress, where
-**done** = terminal status, supersession, or a live `resolves`/`answers`
-edge — the queue's truth, even while a status field lags. An empty result
-means nothing `blocks` the root yet — add the member edges above.
-`show_queue` answers "what's next?"; `render_program` answers "how far along
-is the whole thing?".
+/v1/program/<id>`; shell front-door `spor program <umbrella-id>`): the gating
+tree with resolution-derived progress, where **done** = terminal status,
+supersession, or a live `resolves`/`answers` edge — the queue's truth, even
+while a status field lags. An empty result means nothing `blocks` the root
+yet — add the member edges above. `show_queue` answers "what's next?";
+`render_program`/`spor program` answers "how far along is the whole thing?".
 
 ## COMMIT: close a session with an outcome artifact
 
