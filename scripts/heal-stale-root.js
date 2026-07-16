@@ -790,7 +790,13 @@ function main() {
     const raced = [];
     const attempted = [];
     let failed = false;
-    const pspecFile = path.join(os.tmpdir(), `heal-stale-root.${process.pid}.pathspec`);
+    // A private, randomly-named 0700 dir (fs.mkdtempSync) rather than a
+    // pid-predictable path directly under os.tmpdir(): a fixed name is
+    // guessable by another same-user process, which could pre-plant a
+    // symlink there and have our writeFileSync/git checkout follow it
+    // (code-review finding at the CAS merge gate, issue-spor-heal-stale-root-non-utf8-mangling).
+    const pspecDir = fs.mkdtempSync(path.join(os.tmpdir(), 'heal-stale-root-'));
+    const pspecFile = path.join(pspecDir, 'pathspec');
     try {
       for (const s of stale) {
         const fresh = recheck(repo, [s], raced, fsCaps);
@@ -815,9 +821,9 @@ function main() {
       }
     } finally {
       try {
-        fs.unlinkSync(pspecFile);
+        fs.rmSync(pspecDir, { recursive: true, force: true });
       } catch {
-        // best-effort cleanup; a leftover temp file outside the repo is harmless
+        // best-effort cleanup; a leftover temp dir outside the repo is harmless
       }
     }
     // A raced path lost its clearance: it reports as WIP, not as stale. Paths
