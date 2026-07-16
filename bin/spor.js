@@ -6462,6 +6462,12 @@ function dispatchResolutionReason(cfg, node) {
   if (cfg.mode() !== "remote") {
     try {
       const g = require(path.join(ROOT, "lib", "graph.js")).loadGraph(cfg.nodesDir());
+      // Re-check against the loaded graph's registry — the fallback vocabulary
+      // above may miss a graph-resident terminal-status extension
+      // (issue-spor-coupling-resolution-terminal-status-divergence), which
+      // this graph load (needed for the edge-based check below anyway) can
+      // now catch before falling through to a dispatch.
+      if (isTerminalStatus(status, g)) return `status: ${status}`;
       const r = resolutionOf(g, node.id);
       if (r && r.by) return fromEdge(r);
     } catch {
