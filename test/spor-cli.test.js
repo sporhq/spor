@@ -1313,6 +1313,21 @@ test('install gemini merges into existing settings without clobbering', () => {
   assert.match(j.hooks.BeforeAgent[0].hooks[0].command, /node ".+spor-hook\.js" prompt-context --host gemini/);
 });
 
+test('install gemini aborts on a corrupt existing settings.json, writing nothing (no --mcp)', () => {
+  // issue-spor-gemini-config-clobbered-on-install: installHookHost used to
+  // read the existing target with a lenient readJsonOr(target, {}) fallback,
+  // so a pre-existing but unparseable settings.json got silently discarded
+  // and replaced with spor's default hooks — even with no --mcp in play.
+  const home = scratchHome();
+  const f = path.join(home, '.gemini', 'settings.json');
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, '{not valid json');
+  const r = run(['install', 'gemini'], { HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /isn't valid JSON/);
+  assert.strictEqual(fs.readFileSync(f, 'utf8'), '{not valid json', 'left untouched');
+});
+
 test('install opencode places the plugin file (symlink or copy)', () => {
   const home = scratchHome();
   const r = run(['install', 'opencode'], { HOME: home });

@@ -5752,14 +5752,6 @@ function renderCodexAgent(srcSegs) {
   ].join("\n");
 }
 
-function readJsonOr(file, fallback) {
-  try {
-    return JSON.parse(fs.readFileSync(file, "utf8")) || fallback;
-  } catch {
-    return fallback;
-  }
-}
-
 // Merge our hooks.{event:[...]} into an existing host config without clobbering
 // the user's own hooks or top-level keys. Idempotent: prior spor entries (any
 // whose command mentions spor-hook) are dropped first, so re-install refreshes a
@@ -5924,9 +5916,21 @@ function installCodex(scope, dryRun) {
 }
 
 // JSON-hook hosts (codex/cursor/copilot/gemini): render + merge into the target.
+// Reads the existing target strictly (readJsonStrict, defined below): a file
+// that exists but isn't valid JSON aborts the install for this host instead of
+// being silently clobbered by a permissive fallback — this is the file
+// gemini's --mcp writer (writeMcpConfig) may ALSO target, so this strict read
+// has to run before any write happens (issue-spor-gemini-config-clobbered-on-install).
 function installHookHost(spec, scope, dryRun) {
   const target = targetPath(spec, scope);
-  const merged = mergeHooks(readJsonOr(target, {}), renderManifest(spec.src));
+  let existing;
+  try {
+    existing = readJsonStrict(target);
+  } catch (e) {
+    err(`spor install: ${e.message}`);
+    return 1;
+  }
+  const merged = mergeHooks(existing, renderManifest(spec.src));
   if (dryRun) {
     out(`would write ${target}:`);
     out(JSON.stringify(merged, null, 2));
@@ -6207,26 +6211,11 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
   for (const host of hosts) {
     const spec = HOSTS[host];
     // Gemini's mcpServers entry lives in the SAME settings.json its hooks
-    // manifest does (MCP_HOSTS.gemini.user/repo === HOSTS.gemini.user/repo),
-    // so installHookHost() below is about to write that file BEFORE
-    // writeMcpConfig()'s own strict-JSON check ever runs — an existing
-    // malformed settings.json would get silently discarded by
-    // installHookHost's readJsonOr(target, {}) fallback instead of aborting
-    // (the "no partial writes" guarantee --mcp otherwise gives every host).
-    // Pre-validate here, for any host whose hook target and mcp target are
-    // literally the same file, before either write happens.
-    if (wantMcp && !dryRun && MCP_HOSTS[host] && MCP_HOSTS[host].kind !== "toml") {
-      const mcpTarget = targetPath(MCP_HOSTS[host], scope);
-      if (spec.kind === "hooks" && targetPath(spec, scope) === mcpTarget) {
-        try {
-          readJsonStrict(mcpTarget);
-        } catch (e) {
-          err(`spor install --mcp: ${e.message}`);
-          rc = 1;
-          continue;
-        }
-      }
-    }
+    // manifest does (MCP_HOSTS.gemini.user/repo === HOSTS.gemini.user/repo).
+    // installHookHost() now reads that target via readJsonStrict itself, so
+    // a malformed existing settings.json aborts THERE, before writeMcpConfig()
+    // ever runs — no separate pre-validation needed here
+    // (issue-spor-gemini-config-clobbered-on-install).
     let r;
     if (spec.kind === "claude") r = installClaude(scope, dryRun);
     else if (spec.kind === "codex") r = installCodex(scope, dryRun);
