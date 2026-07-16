@@ -129,3 +129,32 @@ test("repoRelativeCandidates: a genuinely out-of-repo file yields no candidates"
   const sibling = scratch("spor-relpath-out-");
   assert.deepEqual(u.repoRelativeCandidates(top, path.join(sibling, "x.js")), []);
 });
+
+// --- u.gitEnv (issue-spor-dispatch-worktree-wrong-repo-location) -------------
+// Git resolves its repo from GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR before it
+// discovers one from cwd, so those beat the directory every git call here names
+// — gitEnv strips them from the child env. The carve-outs are the point of the
+// list: GIT_INDEX_FILE in particular MUST survive (a partial commit's pre-commit
+// hook names its temp index that way, and `spor check --staged` reads it).
+
+test("gitEnv: strips the repo-location vars so the named directory wins", () => {
+  const out = u.gitEnv({
+    PATH: "/usr/bin",
+    GIT_DIR: "/elsewhere/.git",
+    GIT_WORK_TREE: "/elsewhere",
+    GIT_COMMON_DIR: "/elsewhere/.git",
+  });
+  assert.deepEqual(out, { PATH: "/usr/bin" });
+});
+
+test("gitEnv: KEEPS GIT_INDEX_FILE — a partial commit's pre-commit hook names its temp index there", () => {
+  const out = u.gitEnv({ GIT_DIR: "/elsewhere/.git", GIT_INDEX_FILE: "/repo/.git/next-index.lock" });
+  assert.deepEqual(out, { GIT_INDEX_FILE: "/repo/.git/next-index.lock" });
+});
+
+test("gitEnv: an env with nothing to strip is copied through unchanged", () => {
+  const env = { PATH: "/usr/bin", HOME: "/home/x", GIT_AUTHOR_NAME: "T" };
+  const out = u.gitEnv(env);
+  assert.deepEqual(out, env);
+  assert.notStrictEqual(out, env, "a copy, never the caller's object");
+});

@@ -118,3 +118,40 @@ test("couplingHit: relPath as an array tests every candidate spelling (task-spor
   // a bare string still works (back-compat single-spelling contract)
   assert.ok(c.couplingHit(aliasNorm, { ...ctx, relPath: "frontend/app.js" }));
 });
+
+test("expandAliasCandidates: declared aliases expand both directions; unrelated paths pass through untouched", () => {
+  const aliases = { frontend: "packages/web" };
+  assert.deepStrictEqual(
+    c.expandAliasCandidates(["frontend/app.js"], aliases).sort(),
+    ["frontend/app.js", "packages/web/app.js"]
+  );
+  assert.deepStrictEqual(
+    c.expandAliasCandidates(["packages/web/app.js"], aliases).sort(),
+    ["frontend/app.js", "packages/web/app.js"]
+  );
+  // the bare alias root itself (no trailing segment) also expands
+  assert.deepStrictEqual(c.expandAliasCandidates(["frontend"], aliases).sort(), ["frontend", "packages/web"]);
+  // a path that shares only a PREFIX (not a path-segment boundary) is untouched
+  assert.deepStrictEqual(c.expandAliasCandidates(["frontend-other/x.js"], aliases), ["frontend-other/x.js"]);
+  // no aliases declared -> identity (byte-identical when unset)
+  assert.deepStrictEqual(c.expandAliasCandidates(["frontend/app.js"], {}), ["frontend/app.js"]);
+  assert.deepStrictEqual(c.expandAliasCandidates(["frontend/app.js"], undefined), ["frontend/app.js"]);
+  // unrelated paths never expand
+  assert.deepStrictEqual(c.expandAliasCandidates(["docs/x.md"], aliases), ["docs/x.md"]);
+});
+
+test("couplingHit: a declared alias map resolves the REVERSE gap — a resolved-only path still matches a glob authored against its alias, and vice versa (issue-spor-coupling-matcher-reverse-symlink-gap)", () => {
+  const aliases = { frontend: "packages/web" };
+  const aliasNorm = NORM({ couples_when: ["frontend/**"] });
+  const resolvedNorm = NORM({ couples_when: ["packages/web/**"] });
+  // the caller only has the CANONICAL spelling (no alias derivable, e.g. no
+  // symlink materialized on this filesystem, or a pre-resolved cwd) — without
+  // a declared alias this can never match a glob authored against the alias.
+  const resolvedOnly = { slug: "projx", relPath: "packages/web/app.js", repoTags: [] };
+  assert.ok(!c.couplingHit(aliasNorm, resolvedOnly), "no aliases declared -> the documented limitation stands");
+  assert.ok(c.couplingHit(aliasNorm, { ...resolvedOnly, aliases }), "declared alias recovers the match");
+  // the reverse direction: an alias-only candidate still matches a glob
+  // authored against the canonical spelling.
+  const aliasOnly = { slug: "projx", relPath: "frontend/app.js", repoTags: [] };
+  assert.ok(c.couplingHit(resolvedNorm, { ...aliasOnly, aliases }));
+});

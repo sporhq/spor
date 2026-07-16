@@ -455,63 +455,26 @@ function drainPendingDigests(graph, input, slug, { suppress = false } = {}) {
 // explicit UNWARRANTED as inject, so a broken backend degrades to the shipped
 // inject-everything behavior instead of silently eating warranted digests.
 function classifyDigestIntent({ prompt, tplSha, session, slug, graph, timeoutMs, cmd, vars }) {
-  const llmDir = path.join(graph, "journal", "llm-calls");
-  const t0 = Date.now();
-  let backend = "";
-  let usage = null;
-  let cost_usd = null;
-  let model = null;
-  const recordLlm = (response, error) => {
-    if (!u.ensureDir(llmDir)) return;
-    const rec = {
-      id: `llm-${Date.now()}-${u.bashRandom()}`,
-      ts: u.isoMs(),
-      source: "digest-intent",
-      backend,
-      template: "digest-intent.md",
-      template_sha: tplSha,
-      session,
-      project: slug,
-      latency_ms: Date.now() - t0,
-      usage,
-      cost_usd,
-      model,
-      prompt,
-      vars,
-      response: error === "" ? response : null,
-      error: error === "" ? null : error,
-    };
-    u.appendLine(path.join(llmDir, `${u.localDate()}.jsonl`), JSON.stringify(rec));
-  };
-
-  let response;
-  if (cmd) {
-    backend = `cmd:${cmd}`;
-    response = u.runBackendCmd(cmd, prompt, { timeoutMs });
-    if (response === null) {
-      recordLlm("", "digest-intent cmd failed");
-      return null;
-    }
-  } else {
-    backend = "cli:claude -p --model haiku";
-    const res = u.runClaudeBackend(prompt, { timeoutMs });
-    if (res === null) {
-      recordLlm("", "claude -p failed");
-      return null;
-    }
-    response = res.text;
-    usage = res.usage;
-    cost_usd = res.cost_usd;
-    model = res.model;
-  }
-  recordLlm(response, "");
+  const res = u.runClassifierBackend({
+    prompt,
+    tplSha,
+    session,
+    project: slug,
+    graph,
+    source: "digest-intent",
+    template: "digest-intent.md",
+    timeoutMs,
+    cmd,
+    vars,
+  });
+  if (res === null) return null;
 
   // \b keeps the two tests independent (`\bWARRANTED\b` can't match inside
   // "UNWARRANTED" — no boundary after the N). Suppression needs an UNAMBIGUOUS
   // verdict: a reply carrying both tokens ("WARRANTED — not UNWARRANTED") or
   // neither is null, which the worker fails open to inject.
-  const un = /\bUNWARRANTED\b/.test(response);
-  const w = /\bWARRANTED\b/.test(response);
+  const un = /\bUNWARRANTED\b/.test(res.response);
+  const w = /\bWARRANTED\b/.test(res.response);
   if (un && !w) return "UNWARRANTED";
   if (w && !un) return "WARRANTED";
   return null;

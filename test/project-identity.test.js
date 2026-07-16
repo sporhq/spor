@@ -20,6 +20,7 @@ const { runHook, spawnHook } = require('./helpers/portable');
 const graph = require(path.join(__dirname, '..', 'lib', 'graph.js'));
 const { rankQueue } = require(path.join(__dirname, '..', 'lib', 'queue.js'));
 const u = require(path.join(__dirname, '..', 'scripts', 'engines', 'util.js'));
+const { gitInit } = require('./helpers/git');
 
 function tmpGraph(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-projid-'));
@@ -368,22 +369,6 @@ test('projectGrouping: a nearest-ancestor subtree marker beats the repo root', (
 });
 
 // ---------- monorepo subtrees + git worktrees (issue-cc-project-identity-monorepo-worktree) ----------
-
-function gitInit(dir) {
-  const g = (args, cwd = dir) => {
-    const r = spawnSync('git', ['-C', cwd, ...args], {
-      encoding: 'utf8',
-      env: {
-        ...process.env, GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@example.com',
-        GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@example.com',
-      },
-    });
-    assert.equal(r.status, 0, r.stderr);
-    return r.stdout;
-  };
-  g(['init', '-q']);
-  return g;
-}
 
 test('projectSlug: a nearest-ancestor .spor marker in a monorepo subtree beats the repo root', () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-mono-'));

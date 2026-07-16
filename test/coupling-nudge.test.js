@@ -164,6 +164,41 @@ test("symlink-alias parity: a trigger glob authored against the RESOLVED path st
   assert.match(ctx, /norm-projx-web-docs/);
 });
 
+test("declared coupling.aliases recovers the REVERSE symlink-alias gap: an edit reported only under its canonical path still fires a trigger authored against the alias (issue-spor-coupling-matcher-reverse-symlink-gap)", async () => {
+  // No symlink is materialized on disk at all here — repoRelativeCandidates
+  // has nothing to derive an alias spelling FROM, reproducing the case an
+  // environment hands the hook an already-resolved path. Without a declared
+  // alias the norm (authored against the alias) can never fire; a
+  // `coupling.aliases` map in .spor.json recovers it, no filesystem scan.
+  const { home, cwd } = scratch();
+  fs.mkdirSync(path.join(cwd, "packages", "web"), { recursive: true });
+  writeNorm(path.join(home, "nodes"), "norm-projx-web-docs", {
+    title: "web changes update the docs",
+    extra: "project: projx\n",
+    when: ["frontend/**"],
+    also: ["API.md"],
+  });
+  const env = freshEnv(home);
+  const undeclared = await runAsync(
+    ["post-tool", "--host", "claude-code"],
+    editPayload(cwd, "s1", "packages/web/app.js"),
+    env
+  );
+  assert.strictEqual(undeclared.trim(), "", "no alias declared -> the documented limitation stands");
+  fs.writeFileSync(
+    path.join(cwd, ".spor.json"),
+    JSON.stringify({ coupling: { aliases: { frontend: "packages/web" } } })
+  );
+  const declared = await runAsync(
+    ["post-tool", "--host", "claude-code"],
+    editPayload(cwd, "s2", "packages/web/app.js"),
+    env
+  );
+  const ctx2 = JSON.parse(declared).hookSpecificOutput.additionalContext;
+  assert.match(ctx2, /You edited packages\/web\/app\.js/);
+  assert.match(ctx2, /norm-projx-web-docs/);
+});
+
 test("once per (session, norm): a second matching edit is silent, a NEW norm still fires", async () => {
   const { home, cwd } = scratch();
   const nodes = path.join(home, "nodes");

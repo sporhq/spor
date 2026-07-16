@@ -8,18 +8,13 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { execFileSync } = require('node:child_process');
 
 const u = require('../scripts/engines/util.js');
 const { graphInsideCodeRepo } = require('../scripts/engines/distill.js');
+const { gitInit } = require('./helpers/git');
 
 function tmp() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'spor-share-'));
-}
-function gitInit(dir) {
-  fs.mkdirSync(dir, { recursive: true });
-  execFileSync('git', ['-C', dir, 'init', '-q'], { stdio: 'ignore' });
-  return dir;
 }
 const IGNORES = ['/journal/', '/cache/', '/outbox/', '/auth/', '/config.json'];
 
@@ -73,18 +68,22 @@ test('gitignore: empty value yields no work', () => {
 
 test('distill guard: separate graph & code repos are NOT the same repo (commit proceeds)', () => {
   const root = tmp();
-  const graph = gitInit(path.join(root, 'graph'));
-  const code = gitInit(path.join(root, 'code'));
+  const graph = path.join(root, 'graph');
+  const code = path.join(root, 'code');
+  gitInit(graph);
+  gitInit(code);
   assert.strictEqual(graphInsideCodeRepo(graph, code), false);
 });
 
 test('distill guard: graph home == code repo is flagged (auto-commit suppressed)', () => {
-  const repo = gitInit(path.join(tmp(), 'repo')); // graph: . — home is the code repo
+  const repo = path.join(tmp(), 'repo'); // graph: . — home is the code repo
+  gitInit(repo);
   assert.strictEqual(graphInsideCodeRepo(repo, repo), true);
 });
 
 test('distill guard: graph home is a subdir tracked by the code repo -> same repo', () => {
-  const code = gitInit(path.join(tmp(), 'code'));
+  const code = path.join(tmp(), 'code');
+  gitInit(code);
   const sub = path.join(code, 'graph'); // a plain subdir, no nested .git
   fs.mkdirSync(sub, { recursive: true });
   // Both resolve to the same git toplevel (the code repo).
@@ -92,14 +91,17 @@ test('distill guard: graph home is a subdir tracked by the code repo -> same rep
 });
 
 test('distill guard: a nested graph repo WITH its own .git is its own repo (commit proceeds)', () => {
-  const code = gitInit(path.join(tmp(), 'code'));
-  const nested = gitInit(path.join(code, 'graph')); // own .git inside the code tree
+  const code = path.join(tmp(), 'code');
+  gitInit(code);
+  const nested = path.join(code, 'graph'); // own .git inside the code tree
+  gitInit(nested);
   assert.strictEqual(graphInsideCodeRepo(nested, code), false);
 });
 
 test('distill guard: fail-open when a dir is not a git repo, or cwd is empty', () => {
   const plain = tmp();
-  const code = gitInit(path.join(tmp(), 'code'));
+  const code = path.join(tmp(), 'code');
+  gitInit(code);
   assert.strictEqual(graphInsideCodeRepo(plain, code), false);
   assert.strictEqual(graphInsideCodeRepo(code, ''), false);
 });
