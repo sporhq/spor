@@ -504,6 +504,74 @@ test("scoping: a cross-project content hit is labeled foreign, not hard-filtered
   assert.match(r.text, /dec-theirs.*cross-project/s);
 });
 
+// ---------- machine authorship marker (task-cc-digest-render-authorship-marker) ----------
+
+function authorshipFixture() {
+  return tmpGraph({
+    "dec-root.md": `---
+id: dec-root
+type: decision
+project: p
+title: Root decision token alpha
+summary: Root decision token alpha bravo charlie delta.
+date: 2026-06-01
+edges:
+  - {type: relates-to, to: dec-captured}
+  - {type: relates-to, to: dec-reviewed}
+---
+Root decision token alpha bravo charlie delta.
+`,
+    "dec-captured.md": `---
+id: dec-captured
+type: decision
+project: p
+title: Haiku-distilled capture token bravo
+summary: Haiku-distilled capture token bravo charlie delta echo.
+date: 2026-06-01
+authored_via: capture
+---
+Distilled from a session transcript, never reviewed by a human.
+`,
+    "dec-reviewed.md": `---
+id: dec-reviewed
+type: decision
+project: p
+title: Human-reviewed decision token charlie
+summary: Human-reviewed decision token charlie delta echo foxtrot.
+date: 2026-06-01
+authored_via: rest
+---
+Written directly by a person through the REST API.
+`,
+  }).load();
+}
+
+test("authorship: a capture-authored node is tagged machine·capture in the full compile", () => {
+  const g = authorshipFixture();
+  const r = graph.compile(g, { rootId: "dec-root", digest: false });
+  assert.match(r.text, /### dec-captured — .*\(decision, 2026-06-01, machine·capture\)/);
+});
+
+test("authorship: an authored_via not in the machine set renders unmarked (rest is human-equivalent)", () => {
+  const g = authorshipFixture();
+  const r = graph.compile(g, { rootId: "dec-root", digest: false });
+  assert.match(r.text, /### dec-reviewed — .*\(decision, 2026-06-01\)\n/);
+  assert.doesNotMatch(r.text, /dec-reviewed.*machine·/);
+});
+
+test("authorship: a node with no authored_via at all renders exactly as before (no tag)", () => {
+  const g = authorshipFixture();
+  const r = graph.compile(g, { rootId: "dec-root", digest: false });
+  assert.doesNotMatch(r.text, /dec-root.*machine·/);
+});
+
+test("authorship: digest bullet lines carry the same machine·<via> marker", () => {
+  const g = authorshipFixture();
+  const r = graph.compile(g, { query: "haiku distilled capture token bravo charlie delta echo", digest: true });
+  assert.equal(r.relevant, true);
+  assert.match(r.text, /\*\*dec-captured — .*\*\* \(decision, p, 2026-06-01, machine·capture\)/);
+});
+
 // ---------- norm injection framing (issue-cc-norm-always-on-injection) ----------
 
 test("norms: a norm body is quoted as untrusted data with author attribution and a boundary banner", () => {
@@ -991,6 +1059,76 @@ test("correction: full multi-line body renders in the digest footer", () => {
   assert.match(r.text, /> Always surface the actor-model spec and never the stale pricing notes\./);
 });
 
+// ---------- correction lifecycle (issue-spor-corrections-no-applied-lifecycle)
+// ----------
+//
+// A correction fires while status-less or "active"; once "applied" it must
+// stop injecting — the client-compile twin of the server's serve-time gate.
+
+test("correction: status-less (default active) correction fires exactly as before", () => {
+  const g = pricingFixture().load();
+  const r = graph.compile(g, { rootId: "dec-new", digest: false });
+  assert.match(r.text, /spec-actor/);
+  assert.match(r.text, /pinned by corr-global-1/);
+});
+
+test("correction: status: active correction fires exactly like status-less", () => {
+  const fx = pricingFixture();
+  fs.writeFileSync(path.join(fx.nodesDir, "corr-global-1.md"), `---
+id: corr-global-1
+type: correction
+title: Pin actor spec, exclude stale notes
+target: global
+pin: [spec-actor]
+exclude: [art-stale]
+status: active
+date: 2026-06-10
+---
+Always surface the actor-model spec and never the stale pricing notes.
+`);
+  const r = graph.compile(fx.load(), { rootId: "dec-new", digest: false });
+  assert.match(r.text, /spec-actor/);
+  assert.match(r.text, /pinned by corr-global-1/);
+});
+
+test("correction: status: applied correction stops firing (global scope)", () => {
+  const fx = pricingFixture();
+  fs.writeFileSync(path.join(fx.nodesDir, "corr-global-1.md"), `---
+id: corr-global-1
+type: correction
+title: Pin actor spec, exclude stale notes
+target: global
+pin: [spec-actor]
+exclude: [art-stale]
+status: applied
+date: 2026-06-10
+---
+Always surface the actor-model spec and never the stale pricing notes.
+`);
+  const r = graph.compile(fx.load(), { rootId: "dec-new", digest: true });
+  assert.ok(!r.text.includes("pinned by corr-global-1"), "applied correction must not pin");
+  assert.ok(!r.text.includes("Standing corrections:"), "applied correction must not render guidance");
+});
+
+test("correction: status: applied correction stops firing (node-targeted scope)", () => {
+  const fx = correctionScopeFixture();
+  const raw = fs.readFileSync(path.join(fx.nodesDir, "corr-dec-new-1.md"), "utf8");
+  fs.writeFileSync(path.join(fx.nodesDir, "corr-dec-new-1.md"), raw.replace("date: 2026-06-10", "status: applied\ndate: 2026-06-10"));
+  const r = graph.compile(fx.load(), { query: "provider neutral catalogue pricing", digest: true });
+  assert.equal(r.relevant, true);
+  assert.ok(!r.text.includes("Standing corrections:"), "an applied node-targeted correction must not fire at all");
+  assert.ok(!r.text.includes("stale pricing notes keep misleading"), "applied correction body must not render");
+});
+
+test("correction: status: applied correction stops firing (project scope)", () => {
+  const fx = correctionScopeFixture();
+  const raw = fs.readFileSync(path.join(fx.nodesDir, "corr-project-my-project-1.md"), "utf8");
+  fs.writeFileSync(path.join(fx.nodesDir, "corr-project-my-project-1.md"), raw.replace("date: 2026-06-11", "status: applied\ndate: 2026-06-11"));
+  const r = graph.compile(fx.load(), { query: "provider neutral catalogue pricing", digest: true, project: "my-project" });
+  assert.ok(!r.text.includes("quote prices only from the published catalogue"),
+    "applied project-scoped correction must not fire even with a matching project");
+});
+
 // ---------- validateNode ----------
 
 test("validateNode: accepts a well-formed node", () => {
@@ -1345,6 +1483,78 @@ test("loadGraph: briefing and correction nodes are non-traversable (excluded fro
   assert.equal(g.adj["corr-global-1"], undefined);
   // tf-idf docs exclude corrections/briefings.
   assert.ok(!g.docs.some((d) => d.id === "corr-global-1"));
+});
+
+// issue-cc-graph-supersededby-non-traversable: a briefing supersedes edge (both
+// ends non-traversable) must still populate graph.supersededBy, even though
+// neither end ever gets an adjacency entry.
+test("loadGraph: supersededBy indexes a supersedes edge between two non-traversable briefings", () => {
+  const fx = tmpGraph({
+    "brief-old.md": `---
+id: brief-old
+type: briefing
+project: my-project
+title: Old briefing
+summary: An earlier compiled briefing, later superseded.
+version: 1
+---
+Old briefing body.
+`,
+    "brief-new.md": `---
+id: brief-new
+type: briefing
+project: my-project
+title: New briefing
+summary: The current compiled briefing.
+version: 2
+edges:
+  - {type: supersedes, to: brief-old}
+---
+New briefing body.
+`,
+  });
+  const g = fx.load();
+  assert.equal(g.supersededBy["brief-old"], "brief-new");
+  // the walk itself stays untouched: neither briefing ever gets adjacency.
+  assert.equal(g.adj["brief-new"], undefined);
+  assert.equal(g.adj["brief-old"], undefined);
+});
+
+// Regression: widening supersededBy must not let compile()'s "graph fixup"
+// (which injects a superseder alongside an already-selected superseded node)
+// newly render a non-traversable node's OWN section/body into a briefing/
+// digest — the old fixup could never fire for a non-traversable superseder
+// (the old supersededBy gate required BOTH ends traversable), so a rendered
+// section (and its raw, unquoted body) for one must stay impossible. The
+// bare id may still appear in an already-selected node's "⚠ SUPERSEDED by
+// <id>" annotation — consistent with how resolutionWarn already names an
+// arbitrary (unfiltered) resolver id — since that names a fact about the
+// selected node, not a rendering of the superseder's own content.
+test("compile: a non-traversable superseder never gets its own rendered section via the graph-fixup, even though supersededBy now indexes it", () => {
+  const fx = pricingFixture();
+  fs.writeFileSync(path.join(fx.nodesDir, "brief-evil.md"), `---
+id: brief-evil
+type: briefing
+project: my-project
+title: Evil briefing
+summary: A non-traversable node the graph-fixup must never render.
+version: 1
+edges:
+  - {type: supersedes, to: spec-rc}
+---
+UNIQUEMARKERBODY must never leak into compiled output.
+`);
+  const g = fx.load();
+  // sanity: the wider index still records the supersession...
+  assert.equal(g.supersededBy["spec-rc"], "brief-evil");
+  // ...but the compiled neighborhood (spec-rc is a direct lineage neighbor of
+  // dec-new via constrained-by) never renders the non-traversable superseder
+  // as its own section, and its body never leaks.
+  const r = graph.compile(g, { rootId: "dec-new", digest: false });
+  assert.equal(r.relevant, true);
+  assert.match(r.text, /spec-rc/);
+  assert.ok(!r.text.includes("### brief-evil"), "graph-fixup must not render a section for a non-traversable superseder");
+  assert.ok(!r.text.includes("UNIQUEMARKERBODY"), "its body must never leak into the compiled output");
 });
 
 // ---------- attribution fields (API.md §1 / GRAPH.md) ----------

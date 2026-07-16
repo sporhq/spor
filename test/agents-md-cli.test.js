@@ -85,6 +85,24 @@ test("agents-md: writes the directive block, no briefing embed by default", () =
   assert.match(r.stdout, /capture-discipline directive/);
 });
 
+// The cohort bullet is the creation-time half of the fix for
+// issue-spor-agent-missing-dependency-edges: the gardener's unedged-gate
+// detector only catches an unwired cohort on the next sweep, so this wording is
+// the guarantee. Pin it — a silent drop is invisible everywhere else.
+test("directive: instructs blocks edges for a multi-node cohort", () => {
+  assert.match(DIRECTIVE, /more than one piece of work/);
+  assert.match(DIRECTIVE, /`blocks` edges/);
+});
+
+// This repo dogfoods its own managed block, so the committed AGENTS.md must
+// carry the packaged directive verbatim — otherwise the wording ships to every
+// other repo while our own copy silently rots. Only the directive is compared:
+// the tools line above it varies with whether a server is configured.
+test("directive: this repo's committed AGENTS.md carries the packaged wording", () => {
+  const md = fs.readFileSync(path.join(__dirname, "..", "AGENTS.md"), "utf8");
+  assert.ok(md.includes(DIRECTIVE), "run `spor agents-md` and commit the result");
+});
+
 test("agents-md: idempotent — a second run replaces, never appends", () => {
   const { home, cwd } = scratch();
   fs.writeFileSync(path.join(cwd, "AGENTS.md"), "# hand content\n");

@@ -133,6 +133,77 @@ test("applyNode: rankAgainst over the incrementally-built graph returns the plan
   assert.equal(ranked[0].id, "dec-needle", "the unique-vocabulary needle is top-ranked from the incremental graph");
 });
 
+// issue-cc-graph-supersededby-non-traversable: supersededBy must index a
+// supersedes edge between two non-traversable (briefing) nodes, both when the
+// target already exists and via the dangling-then-created activation path —
+// and must match a from-scratch rebuild exactly, with adjacency still empty
+// on both ends (the walk stays untouched). buildBothWays/NODE() build with an
+// EMPTY seed pack (registry has no `briefing` entry, so an unknown type
+// defaults traversable — see registry.js), which would make "briefing" behave
+// as traversable and defeat the point of this test; these two cases load the
+// REAL seed pack instead so `briefing` is genuinely non-traversable.
+const REAL_SEED = graph.loadSeedSchemas();
+
+test("applyNode: supersededBy indexes a supersedes edge between non-traversable briefings, target pre-existing", () => {
+  const oldText = NODE({ id: "brief-old", type: "briefing", body: "old briefing body" });
+  const newText = NODE({ id: "brief-new", type: "briefing", body: "new briefing body", edges: [{ type: "supersedes", to: "brief-old" }] });
+  const inc = kernel.buildGraph({}, { nodesDir: "/g", seedSchemas: REAL_SEED });
+  kernel.applyNode(inc, oldText, "brief-old.md");
+  kernel.applyNode(inc, newText, "brief-new.md");
+  const full = kernel.buildGraph({ "brief-old.md": oldText, "brief-new.md": newText }, { nodesDir: "/g", seedSchemas: REAL_SEED });
+  assertStructurallyEqual(inc, full);
+  assert.equal(inc.supersededBy["brief-old"], "brief-new");
+  assert.equal(inc.adj["brief-new"], undefined);
+  assert.equal(inc.adj["brief-old"], undefined);
+});
+
+test("applyNode: supersededBy activates via the dangling-then-created path for a non-traversable target", () => {
+  const newText = NODE({ id: "brief-new", type: "briefing", body: "new briefing body", edges: [{ type: "supersedes", to: "brief-old" }] }); // dangling -> brief-old
+  const oldText = NODE({ id: "brief-old", type: "briefing", body: "old briefing body" }); // creates brief-old: must activate supersededBy, not adjacency
+  const inc = kernel.buildGraph({}, { nodesDir: "/g", seedSchemas: REAL_SEED });
+  kernel.applyNode(inc, newText, "brief-new.md");
+  kernel.applyNode(inc, oldText, "brief-old.md");
+  const full = kernel.buildGraph({ "brief-new.md": newText, "brief-old.md": oldText }, { nodesDir: "/g", seedSchemas: REAL_SEED });
+  assertStructurallyEqual(inc, full);
+  assert.equal(inc.supersededBy["brief-old"], "brief-new");
+  assert.equal(inc.adj["brief-new"], undefined);
+  assert.equal(inc.adj["brief-old"], undefined);
+  assert.deepEqual(Object.keys(inc.danglingTo).filter((k) => inc.danglingTo[k]?.length), [], "dangling entry cleared on activation");
+});
+
+// Regression: a traversable AND a non-traversable source both dangle onto the
+// SAME not-yet-existent target with a supersedes edge. The winner on
+// activation must be whichever source was encountered LAST (matching
+// buildGraph's single ordered pass over Object.values(nodes)), not
+// "whichever bucket (danglingTo vs pendingSupersedes) happens to drain
+// second" — an earlier draft of this fix drained danglingTo then
+// pendingSupersedes as two separate passes, which silently made a
+// non-traversable source always win regardless of true encounter order.
+test("applyNode: mixed traversable/non-traversable dangling sources onto the same target resolve supersededBy by true encounter order, not by traversability", () => {
+  const briefText = NODE({ id: "brief-b", type: "briefing", body: "briefing body", edges: [{ type: "supersedes", to: "dec-x" }] }); // dangling, encountered FIRST
+  const decText = NODE({ id: "dec-a", type: "decision", body: "decision body", edges: [{ type: "supersedes", to: "dec-x" }] }); // dangling, encountered SECOND
+  const targetText = NODE({ id: "dec-x", type: "decision", body: "target body" });
+
+  const inc = kernel.buildGraph({}, { nodesDir: "/g", seedSchemas: REAL_SEED });
+  kernel.applyNode(inc, briefText, "brief-b.md");
+  kernel.applyNode(inc, decText, "dec-a.md");
+  kernel.applyNode(inc, targetText, "dec-x.md");
+  const full = kernel.buildGraph(
+    { "brief-b.md": briefText, "dec-a.md": decText, "dec-x.md": targetText },
+    { nodesDir: "/g", seedSchemas: REAL_SEED });
+
+  assertStructurallyEqual(inc, full);
+  // dec-a was encountered after brief-b, so it must win — both incrementally
+  // and in a from-scratch rebuild (order-independent there: buildGraph sees
+  // both edges either way and dec-a is later in Object.values(nodes) order).
+  assert.equal(full.supersededBy["dec-x"], "dec-a", "sanity: full rebuild picks the later source");
+  assert.equal(inc.supersededBy["dec-x"], "dec-a", "incremental must match the full rebuild's winner");
+  // dec-a<->dec-x adjacency still lights up (both traversable); brief-b never
+  // gets adjacency (non-traversable source).
+  assert.ok((inc.adj["dec-a"] || []).some((e) => e.to === "dec-x"), "dec-a<->dec-x adjacency activated");
+  assert.equal(inc.adj["brief-b"], undefined, "brief-b never gets adjacency");
+});
+
 test("applyNode: a schema node signals reloadRequired (registry-altering, not locally patchable)", () => {
   const inc = kernel.buildGraph({}, { nodesDir: "/g", seedSchemas: [] });
   const schemaText = `---\nid: schema-widget\ntype: schema\nkind: node-schema\nschema_version: 2026.06.17.1\nproject: demo\ntitle: Widget type\nsummary: A new node type.\nstatus: active\ndate: 2026-06-17\n---\n\n\`\`\`json\n{ "node_type": "widget", "prefix": ["widget-"], "traversable": true }\n\`\`\`\n`;

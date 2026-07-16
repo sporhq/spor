@@ -47,7 +47,7 @@ export SPOR_NUDGE_CMD='opencode run "$(cat)"'
 - The transcript handed to the distiller is rebuilt from the SDK on each
   idle event, so the debounced distill always sees the full final session.
 - MCP: add the Spor server to `opencode.json` for on-demand graph
-  access:
+  access (`spor install opencode --mcp` writes this automatically):
 
   ```json
   { "mcp": { "spor": { "type": "remote", "url": "https://spor.example.com/mcp", "headers": { "Authorization": "Bearer {env:SPOR_TOKEN}" } } } }

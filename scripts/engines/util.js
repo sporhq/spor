@@ -14,6 +14,7 @@ const ROOT = path.resolve(__dirname, "..", "..");
 const CODEX_NUDGE_MODEL = "gpt-5.4-mini";
 
 const home = require(path.join(ROOT, "lib", "shell", "home.js"));
+const { writeFileAtomic } = require(path.join(ROOT, "lib", "shell", "atomic-write.js"));
 // The harness vocabulary the capability probe emits — owned by the pure matcher
 // so the probe, the matcher, and the future fleet scheduler agree on one set of
 // names (dec-spor-machine-profile-satisfiability). Never re-hardcode it here.
@@ -75,6 +76,14 @@ function cfgBool(keyPath, envName, fallback) {
   if (v === undefined) return fallback;
   const s = String(v).trim().toLowerCase();
   return !(s === "0" || s === "false" || s === "");
+}
+// Config-aware plain-object read — no env fallback (a declared map like
+// `coupling.aliases` has no single-value env spelling): the active cascade's
+// value when it's a plain object, else `fallback`. Standalone (no active
+// config) always returns `fallback`, so a direct call stays byte-identical to
+// "nothing declared" (issue-spor-coupling-matcher-reverse-symlink-gap).
+function cfgObj(keyPath, fallback = {}) {
+  return _config ? _config.getObj(keyPath, fallback) : fallback;
 }
 
 function hostDefaultBackendCmd(kind) {
@@ -620,12 +629,48 @@ function gcJournal(graph, opts = {}) {
 // machine-local plumbing, so signing it buys nothing and only risks that failure.
 const NO_GPGSIGN = ["-c", "commit.gpgsign=false"];
 
+// Git takes its repository LOCATION from the environment before it ever
+// discovers one from the working directory, so an ambient GIT_DIR/GIT_WORK_TREE
+// (a git hook, `git rebase --exec`, a wrapper script that exported one) beats
+// both `-C <dir>` and cwd — the same precedence pre-tool.js already models for
+// the commands it inspects. Every git call in this codebase names its repo by
+// directory, so a leaked var silently retargets it at the ambient repo: `spor
+// dispatch --worktree` then attached the target repo's worktree to the
+// LAUNCHER's repo, checking out the launcher's code at the target's path
+// (issue-spor-dispatch-worktree-wrong-repo-location). Strip those vars from the
+// child env and let the directory be authoritative. Byte-identical when none
+// are set, which is the normal case.
+//
+// Only the three LOCATION vars — deliberately NOT GIT_INDEX_FILE (nor the
+// object-store vars), which don't name a repo. Git sets GIT_INDEX_FILE to a
+// temporary index when it runs the pre-commit hook of a PARTIAL commit (`git
+// commit -- <paths>`), and that index is precisely what's about to be
+// committed: `spor check --staged` runs there by design (see cmdCheck), so
+// stripping it would silently widen `git diff --cached` to the whole index and
+// have --strict fail a commit over a file the user isn't committing.
+const GIT_LOCATION_ENV = ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"];
+function gitEnv(env = process.env) {
+  const out = { ...env };
+  // Windows env names are case-insensitive and `{...process.env}` keeps whatever
+  // spelling the parent used, so `delete out.GIT_DIR` can miss a `git_dir` that
+  // git itself still honors — match case-insensitively there. On POSIX only the
+  // exact spelling is git's, and deleting a look-alike would gratuitously alter
+  // the child's env (the plugin runs natively on Windows, macOS and Linux).
+  const isLocationVar =
+    process.platform === "win32"
+      ? (k) => GIT_LOCATION_ENV.includes(k.toUpperCase())
+      : (k) => GIT_LOCATION_ENV.includes(k);
+  for (const k of Object.keys(out)) if (isLocationVar(k)) delete out[k];
+  return out;
+}
+
 function git(cwd, args, opts = {}) {
   try {
     return execFileSync("git", ["-C", cwd, ...args], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       ...opts,
+      env: gitEnv(opts.env),
     });
   } catch {
     return null;
@@ -1166,12 +1211,15 @@ function backoffMs(attempt, retryAfterMs, capMs) {
   return Math.min(base, capMs);
 }
 
-// curl-shaped HTTP: resolves to {http: "200", body: "..."} with "000" on any
-// transport failure (timeout, refused, DNS). Never throws. Like bare curl,
-// redirects are not followed. Transient failures (transport, 429, 5xx) are
-// retried up to `retry` times; between retries we honor a 429 Retry-After
-// header and otherwise back off exponentially (capped at backoffCapMs). With
-// retry=0 (the session-start hook budget) no backoff ever runs.
+// curl-shaped HTTP: resolves to {http: "200", body: "...", headers: {...}}
+// with "000" on any transport failure (timeout, refused, DNS). Never throws.
+// `headers` is a plain lowercased-key object (fetch's Headers normalizes
+// names on iteration) — absent (undefined) on transport failure, since there
+// is no response to read it from. Like bare curl, redirects are not
+// followed. Transient failures (transport, 429, 5xx) are retried up to
+// `retry` times; between retries we honor a 429 Retry-After header and
+// otherwise back off exponentially (capped at backoffCapMs). With retry=0
+// (the session-start hook budget) no backoff ever runs.
 async function curl(
   url,
   { method = "GET", headers = {}, body, timeoutMs = 6000, retry = 0, backoffCapMs = 8000 } = {}
@@ -1200,7 +1248,11 @@ async function curl(
       await sleep(backoffMs(attempt, retryAfterMs, backoffCapMs));
       continue;
     }
-    return { http: String(res.status), body: text };
+    const respHeaders = {};
+    res.headers.forEach((v, k) => {
+      respHeaders[k] = v;
+    });
+    return { http: String(res.status), body: text, headers: respHeaders };
   }
 }
 
@@ -1383,6 +1435,113 @@ function runClaudeBackend(prompt, { timeoutMs } = {}) {
   return parseClaudeResult(r.stdout);
 }
 
+// Shared classifier-backend invocation, used by the capture nudge
+// (post-tool.js's classifyForNudge) and the digest-intent classifier
+// (prompt-context.js's classifyDigestIntent): pick a backend (a configured
+// cmd, else `claude -p --model haiku`), run it bounded by timeoutMs, and
+// record the call to journal/llm-calls in the one shape both sources feed the
+// nightly Haiku-quality review loop with. Returns { response, backend, usage,
+// cost_usd, model } on success, or null on backend failure (still recorded,
+// with `error` set). Callers own all response PARSING (===FACT=== blocks vs
+// WARRANTED/UNWARRANTED) and all cooldown/journal STATE — this function's
+// only side effect is the llm-calls record.
+function runClassifierBackend({ prompt, tplSha, session, project, graph, source, template, timeoutMs, cmd, vars }) {
+  const llmDir = path.join(graph, "journal", "llm-calls");
+  const t0 = Date.now();
+  let backend = "";
+  let usage = null;
+  let cost_usd = null;
+  let model = null;
+  const recordLlm = (response, error) => {
+    if (!ensureDir(llmDir)) return;
+    const rec = {
+      id: `llm-${Date.now()}-${bashRandom()}`,
+      ts: isoMs(),
+      source,
+      backend,
+      template,
+      template_sha: tplSha,
+      session,
+      project,
+      latency_ms: Date.now() - t0,
+      usage,
+      cost_usd,
+      model,
+      prompt,
+      vars,
+      response: error === "" ? response : null,
+      error: error === "" ? null : error,
+    };
+    appendLine(path.join(llmDir, `${localDate()}.jsonl`), JSON.stringify(rec));
+  };
+
+  let response;
+  if (cmd) {
+    backend = `cmd:${cmd}`;
+    response = runBackendCmd(cmd, prompt, { timeoutMs });
+    if (response === null) {
+      recordLlm("", `${source} cmd failed`);
+      return null;
+    }
+  } else {
+    backend = "cli:claude -p --model haiku";
+    const res = runClaudeBackend(prompt, { timeoutMs });
+    if (res === null) {
+      recordLlm("", "claude -p failed");
+      return null;
+    }
+    response = res.text;
+    usage = res.usage;
+    cost_usd = res.cost_usd;
+    model = res.model;
+  }
+  recordLlm(response, "");
+  return { response, backend, usage, cost_usd, model };
+}
+
+// Shared detached-worker main routine, used by nudge-worker.js and
+// digest-worker.js (task-spor-client-classifier-backend-refactor): read the
+// spool INPUT file, delete it immediately (so a duplicate worker can't re-run
+// the same classification), run the caller's `classify(job)`, and — when
+// `buildOutput(job, result)` returns a truthy record — write it atomically
+// (tmp file + rename, so the prompt-time drainer's `*.out.json` glob never
+// sees a half-written file) as `<job.hash>.out.json` beside the input. Always
+// exits 0 (workers are fire-and-forget; a thrown classify() fails open —
+// leaves the file reserved, injects nothing). `buildOutput` returning a
+// falsy value (or a missing `job.hash`) writes nothing.
+function runSpoolWorker(inFile, classify, buildOutput) {
+  if (!inFile) process.exit(0);
+
+  let job;
+  try {
+    job = JSON.parse(fs.readFileSync(inFile, "utf8"));
+  } catch {
+    process.exit(0);
+  }
+  try {
+    fs.unlinkSync(inFile);
+  } catch {}
+
+  let result = null;
+  try {
+    result = classify(job);
+  } catch {
+    /* fail-open: leave the file reserved, inject nothing */
+  }
+
+  const out = buildOutput(job, result);
+  if (out && job.hash) {
+    const outFile = path.join(path.dirname(inFile), `${job.hash}.out.json`);
+    try {
+      writeFileAtomic(outFile, JSON.stringify(out));
+    } catch {
+      /* fail-open: a dropped result file just means no injection next prompt */
+    }
+  }
+
+  process.exit(0);
+}
+
 // Detached child that survives the hook process (replaces nohup setsid).
 function spawnDetached(nodeArgs, env = process.env) {
   const child = spawn(process.execPath, nodeArgs, {
@@ -1411,6 +1570,7 @@ module.exports = {
   cfgStr,
   cfgNum,
   cfgBool,
+  cfgObj,
   hostDefaultBackendCmd,
   jqNow,
   isoMs,
@@ -1427,6 +1587,7 @@ module.exports = {
   matchBriefs,
   repoFingerprints,
   git,
+  gitEnv,
   NO_GPGSIGN,
   graphInsideCodeRepo,
   canonPath,
@@ -1462,6 +1623,9 @@ module.exports = {
   runBackendCmd,
   runClaudeBackend,
   parseClaudeResult,
+  runClassifierBackend,
+  runSpoolWorker,
   spawnDetached,
   bashRandom,
+  writeFileAtomic,
 };

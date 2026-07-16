@@ -551,7 +551,12 @@ later open question or `requires: human` edit flips a stamped item back:
   byte-identical when no readiness data exists.
 
 Readiness leads the why-line when decisive (`agent-ready: …` / `needs human:
-…`), and the envelope gains `counts_by_readiness` ({agent, human, untriaged},
+…`), and an agent-ready item whose disposition would otherwise be `do` upgrades
+its `suggest` to **`dispatch`** (issue-spor-suggest-dispatch-specified-not-emitted)
+— the "hand this to an agent" signal the widget/render surfaces read. Only the
+plain-actionable `do` base upgrades: the triage dispositions
+(`close`/`blocked`/`triage`, and schema `approve`) stay supreme and are never
+overridden by readiness. The envelope gains `counts_by_readiness` ({agent, human, untriaged},
 present only when there is readiness signal or a readiness facet was asked
 for) — the headline "how much of my queue can an agent take right now?" A
 **readiness filter** (`rankQueue({readiness})`, a class or array; today on the

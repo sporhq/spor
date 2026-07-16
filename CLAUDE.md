@@ -238,6 +238,17 @@ capture classification (no `.nudged` line is written, so its next edit still
 classifies). Disable with `SPOR_COUPLING_NUDGE=0`
 (`couplingNudge.enabled:false`); a graph with no coupling norms is
 byte-identical. See test/coupling-nudge.test.js + test/coupling.test.js.
+Deriving a symlinked subtree's candidate spellings is one-way (alias ->
+canonical, never canonical -> alias — a runtime reverse lookup would need a
+filesystem-wide symlink scan, dismissed as too expensive for the edit-time
+hot path, dec-spor-dismiss-reverse-symlink-path-lookup), so a glob authored
+against an alias still misses an edit reported only in its resolved form
+(issue-spor-coupling-matcher-reverse-symlink-gap). The settled fix is
+`coupling.aliases` in `.spor.json` — a declared `{ "<alias prefix>":
+"<canonical prefix>" }` map, expanded in both directions at zero runtime
+cost by `coupling.js`'s `expandAliasCandidates`, shared by both this nudge
+and `spor check`. Declaring nothing is the default posture and keeps the
+one-way limitation (GRAPH.md documents it).
 
 The post-tool engine ALSO carries the claim heartbeat ∪ claim-nudge
 (task-cc-claim-nudge-hook, dec-cc-task-claim-lease) — REMOTE-MODE ONLY and a

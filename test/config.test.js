@@ -10,6 +10,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { loadConfig } = require('../lib/config.js');
+const { gitInit } = require('./helpers/git');
 
 function tmp() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'spor-cfg-'));
@@ -190,6 +191,57 @@ test('opt-in: enabled via the cascade (SPOR_ENABLED env, user config.json) activ
   assert.strictEqual(c0.enabled(), false);
 });
 
+// ---------- linked git worktrees (issue-spor-cli-status-worktree-enable-detection) ----------
+
+test('opt-in: a linked worktree OUTSIDE the repo tree inherits the main checkout\'s enablement, even uncommitted', () => {
+  const root = tmp();
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(repo);
+  const g = gitInit(repo);
+  fs.writeFileSync(path.join(repo, 'f.txt'), 'x');
+  g(['add', 'f.txt']);
+  g(['commit', '-q', '-m', 'root']);
+
+  // A sibling worktree, not nested under `repo` — shares no directory ancestry
+  // with the main checkout at all.
+  const wt = path.join(root, 'sibling-worktree');
+  g(['worktree', 'add', '-q', wt, 'HEAD']);
+
+  // `spor enable` writes .spor.json in the main checkout; here it is left
+  // UNCOMMITTED, like a `spor enable` a user forgot to commit, or ran after the
+  // worktree already existed — the linked worktree's own checked-out tree never
+  // sees it. Before the fix this made the worktree read as disabled.
+  write(path.join(repo, '.spor.json'), { enabled: true });
+
+  const cWt = loadConfig({ cwd: wt, env: bareEnv({ SPOR_HOME: root }) });
+  assert.strictEqual(cWt.enabled(), true);
+  const cMain = loadConfig({ cwd: repo, env: bareEnv({ SPOR_HOME: root }) });
+  assert.strictEqual(cMain.enabled(), true);
+
+  g(['worktree', 'remove', '--force', wt]);
+});
+
+test('opt-in: a linked worktree NESTED under the repo (the spor dispatch / claude --worktree convention) inherits enablement too', () => {
+  const root = tmp();
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(repo);
+  const g = gitInit(repo);
+  fs.writeFileSync(path.join(repo, 'f.txt'), 'x');
+  g(['add', 'f.txt']);
+  g(['commit', '-q', '-m', 'root']);
+
+  const wt = path.join(repo, '.claude', 'worktrees', 'some-branch');
+  fs.mkdirSync(path.dirname(wt), { recursive: true });
+  g(['worktree', 'add', '-q', '-b', 'some-branch', wt, 'HEAD']);
+
+  write(path.join(repo, '.spor.json'), { enabled: true });
+
+  const cWt = loadConfig({ cwd: wt, env: bareEnv({ SPOR_HOME: root }) });
+  assert.strictEqual(cWt.enabled(), true);
+
+  g(['worktree', 'remove', '--force', wt]);
+});
+
 test('getBool honors the shell "0"/"false" convention', () => {
   const dir = tmp();
   const c0 = loadConfig({ cwd: dir, env: bareEnv({ SPOR_HOME: dir, SPOR_NUDGE: '0' }) });
@@ -252,6 +304,16 @@ test('unknown top-level key earns a warning but is otherwise ignored', () => {
   const c = loadConfig({ cwd: root, env: bareEnv({ SPOR_HOME: root }) });
   assert.ok(c.warnings.some((w) => /unknown config key 'searhc'/.test(w)));
   assert.strictEqual(c.getNum('search.minSim', 0.08), 0.08); // typo'd key had no effect
+});
+
+test('SPOR_SESSION_LEASE env resolves through the cascade with no "unknown config key" warning', () => {
+  // Regression: ENV_MAP registered sessionLease.* but KNOWN_KEYS omitted the
+  // "sessionLease" top-level namespace, so setting the env var alone (no repo
+  // config file) tripped the unknown-key sweep on every hook dispatch.
+  const root = tmp();
+  const c = loadConfig({ cwd: root, env: bareEnv({ SPOR_HOME: root, SPOR_SESSION_LEASE: '0' }) });
+  assert.deepStrictEqual(c.warnings, []);
+  assert.strictEqual(c.getBool('sessionLease.enabled', true), false);
 });
 
 test('fail-open: malformed config file is skipped with a warning', () => {
