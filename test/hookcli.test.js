@@ -826,13 +826,15 @@ test('agents-md: creates and idempotently refreshes the managed section', () => 
 // entry point (agentsMd() in scripts/engines/agents-md.js, driven by a
 // host's session-start hook rather than the `spor agents-md` CLI) must parse
 // and forward --no-server-line too, or a hooked host has no way to suppress
-// a public SPOR_SERVER from the committed tools line.
+// a public SPOR_SERVER from the committed tools line. --directive-only skips
+// the briefing fetch (this runs the hook as a real subprocess, so u.curl
+// can't be stubbed in-process — these tests only need the tools line, not a
+// live/stubbed server).
 test('agents-md as a hook: --no-server-line suppresses the tools line', () => {
   const { home, cwd } = scratch();
-  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
   const env = freshEnv(home);
   env.SPOR_SERVER = 'https://spor.example.com';
-  run(['agents-md', '--cwd', cwd, '--no-server-line'], '', env);
+  run(['agents-md', '--cwd', cwd, '--directive-only', '--no-server-line'], '', env);
   const md = fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf8');
   assert.doesNotMatch(md, /reachable over MCP/);
   assert.doesNotMatch(md, /spor\.example\.com/);
@@ -840,10 +842,9 @@ test('agents-md as a hook: --no-server-line suppresses the tools line', () => {
 
 test('agents-md as a hook: without --no-server-line a public server keeps the tools line', () => {
   const { home, cwd } = scratch();
-  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
   const env = freshEnv(home);
   env.SPOR_SERVER = 'https://spor.example.com';
-  run(['agents-md', '--cwd', cwd], '', env);
+  run(['agents-md', '--cwd', cwd, '--directive-only'], '', env);
   const md = fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf8');
   assert.match(md, /reachable over MCP at https:\/\/spor\.example\.com\/mcp/);
 });
