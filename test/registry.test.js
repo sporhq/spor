@@ -503,6 +503,19 @@ test("Registry: an org schema declares a terminal status (no code change)", () =
   assert.equal(reg.terminalStatuses().has("settled"), true, "other schemas' declarations still union in");
 });
 
+test("seed pack: terminalStatuses(type) is the per-type slice, not the flat cross-type union", () => {
+  // task-spor-analytics-type-aware-inert-partition: work-analytics needs a type's
+  // OWN status.terminal in isolation — artifact's `released` must not leak into
+  // how a task or decision is judged, the bug the type-blind union caused.
+  const reg = graph.seedRegistry();
+  assert.deepEqual([...reg.terminalStatuses("artifact")].sort(), ["done", "merged", "released"]);
+  assert.deepEqual([...reg.terminalStatuses("decision")].sort(), ["rejected", "settled", "superseded"]);
+  assert.equal(reg.terminalStatuses("task").size, 0, "task declares no status.terminal of its own");
+  assert.equal(reg.terminalStatuses("no-such-type").size, 0, "unknown type -> empty, not the union");
+  // the no-arg call is unaffected — still the flat cross-type union
+  assert.equal(reg.terminalStatuses().has("released"), true);
+});
+
 test("seed pack: per-type inert partition — decision is the pinned exception, others inherit terminal", () => {
   // dec-spor-status-inert-third-partition: inertStatuses(type) is the per-type
   // queue-liveness overlay the type-aware isTerminalStatus reads. A schema with

@@ -410,6 +410,41 @@ test("analyze: a decision settled via its schema-terminal status counts as compl
   assert.equal(completedWeek.week, "2026-W20");
 });
 
+test("analyze: a non-artifact carrying `released` stays LIVE (type-aware, not the old flat union)", () => {
+  // task-spor-analytics-type-aware-inert-partition: `released` is declared terminal
+  // only on schema-artifact's OWN status.terminal. A mislabeled task carrying it
+  // must NOT be silently counted complete — matching the type-aware queue.
+  const home = initGraph();
+  writeNode(home, "task-mislabeled", "task", "released");
+  commit(home, "2026-05-04T00:00:00Z", "create mislabeled task");   // W19
+
+  const g = graphLib.loadGraph(path.join(home, "nodes"));
+  const r = analyticsLib.analyze(g, { now: NOW, weeks: 12 });
+  assert.equal(r.totals.completed, 0);
+  assert.equal(r.wip.open, 1);
+  assert.ok(r.bottlenecks.some((b) => b.id === "task-mislabeled"));
+});
+
+test("analyze: an artifact `released` counts completed, dated at its OWN git status-transition", () => {
+  // The type-aware counterpart of the above: for the type that DOES declare
+  // `released` terminal, it must still complete — and with an accurate
+  // git-transition date, not just a fallback (creation-date) one.
+  const home = initGraph();
+  writeNode(home, "art-shipped", "artifact", "in-review");
+  commit(home, "2026-05-04T00:00:00Z", "create artifact in review");   // W19
+  writeNode(home, "art-shipped", "artifact", "released");
+  commit(home, "2026-05-11T00:00:00Z", "release artifact");            // W20 — the transition
+
+  const g = graphLib.loadGraph(path.join(home, "nodes"));
+  const r = analyticsLib.analyze(g, { now: NOW, weeks: 12 });
+  assert.equal(r.totals.completed, 1);
+  assert.equal(r.wip.open, 0);
+  assert.ok(!r.bottlenecks.some((b) => b.id === "art-shipped"));
+  assert.equal(r.coverage.fromGitTransition, 1);           // dated at the release commit, not a fallback
+  const completedWeek = r.weekly.find((w) => w.completed > 0);
+  assert.equal(completedWeek.week, "2026-W20");
+});
+
 test("renderReport: produces a stable human block with the cohort table + coverage", () => {
   const home = initGraph();
   writeNode(home, "task-a", "task", "open");
@@ -431,11 +466,23 @@ test("renderReport: produces a stable human block with the cohort table + covera
 const NOW = Date.parse("2026-06-21T00:00:00Z");
 const closedPath = (home) => path.join(home, "cache", "analytics-closed.json");
 const readClosed = (home) => JSON.parse(fs.readFileSync(closedPath(home), "utf8"));
-// The cache fingerprint is the analytics terminal vocabulary: the legacy kernel set
-// UNIONED with the registry's status.terminal partition, sorted+joined — the same
-// union lib/analytics.js keys the cache on
-// (issue-spor-analytics-completion-ignores-schema-terminal-status).
-const FP = [...new Set([...resolution.terminalStatuses, ...graphLib.seedRegistry().terminalStatuses()])].sort().join(",");
+// The cache fingerprint is the analytics terminal vocabulary: the legacy
+// type-blind kernel set plus a `<type>:<sorted values>` segment per node type
+// declaring its OWN status.terminal (task-spor-analytics-type-aware-inert-
+// partition) — mirroring lib/analytics.js's terminalFingerprint(), built here
+// off the registry's per-type terminalStatuses(type) (not the flat no-arg
+// registry.terminalStatuses() union, which can't distinguish a value moving
+// between two types' declarations).
+const FP = (() => {
+  const reg = graphLib.seedRegistry();
+  const types = [...reg.nodeSchemas.keys()].sort();
+  const parts = [...resolution.terminalStatuses];
+  for (const type of types) {
+    const own = reg.terminalStatuses(type);
+    if (own.size) parts.push(`${type}:${[...own].sort().join("|")}`);
+  }
+  return parts.join(",");
+})();
 
 // A graph with one task closed inside the 12-week window (W20, 2026-05-11).
 function closedGraph() {
