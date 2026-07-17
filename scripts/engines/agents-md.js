@@ -349,14 +349,16 @@ ${body}`
 async function agentsMd(input, args = []) {
   let cwd = "";
   let briefing = true;
+  let noServerLine = false;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--cwd") cwd = args[i + 1] ?? "";
     if (args[i] === "--directive-only") briefing = false;
+    if (args[i] === "--no-server-line") noServerLine = true;
   }
   if (!cwd && input && input.cwd) cwd = input.cwd;
   if (!cwd) cwd = process.cwd();
 
-  const { file, meta } = await writeAgentsBlock({ cwd, briefing });
+  const { file, meta } = await writeAgentsBlock({ cwd, briefing, noServerLine });
   process.stderr.write(
     `updated ${file} (${briefing ? meta || "no briefing yet, MCP pointers only" : "directive only"})\n`
   );

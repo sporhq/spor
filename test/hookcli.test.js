@@ -822,6 +822,32 @@ test('agents-md: creates and idempotently refreshes the managed section', () => 
   assert.strictEqual(md.match(/<!-- spor:begin -->/g).length, 1, 'refresh replaces, not appends');
 });
 
+// issue-spor-agents-md-hook-dispatch-no-server-line-gap: the hook-dispatch
+// entry point (agentsMd() in scripts/engines/agents-md.js, driven by a
+// host's session-start hook rather than the `spor agents-md` CLI) must parse
+// and forward --no-server-line too, or a hooked host has no way to suppress
+// a public SPOR_SERVER from the committed tools line.
+test('agents-md as a hook: --no-server-line suppresses the tools line', () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
+  const env = freshEnv(home);
+  env.SPOR_SERVER = 'https://spor.example.com';
+  run(['agents-md', '--cwd', cwd, '--no-server-line'], '', env);
+  const md = fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf8');
+  assert.doesNotMatch(md, /reachable over MCP/);
+  assert.doesNotMatch(md, /spor\.example\.com/);
+});
+
+test('agents-md as a hook: without --no-server-line a public server keeps the tools line', () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
+  const env = freshEnv(home);
+  env.SPOR_SERVER = 'https://spor.example.com';
+  run(['agents-md', '--cwd', cwd], '', env);
+  const md = fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf8');
+  assert.match(md, /reachable over MCP at https:\/\/spor\.example\.com\/mcp/);
+});
+
 test('agents-md: a pre-rename substrate-marker block is replaced, not duplicated', () => {
   const { home, cwd } = scratch();
   fs.writeFileSync(path.join(home, 'nodes', 'brief-projx.md'), BRIEF);
