@@ -76,6 +76,13 @@ function runJson(dir, ...args) {
   const r = run(dir, "--json", ...args);
   return { ...r, json: JSON.parse(r.stdout) };
 }
+function runWithEnv(dir, env, ...args) {
+  const r = spawnSync(process.execPath, [GUARD, "--repo", dir, ...args], {
+    encoding: "utf8",
+    env: { ...process.env, ...env },
+  });
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+}
 
 // ---------- the clean case ----------
 
@@ -903,6 +910,35 @@ test("an unreadable git status is refused with exit 2, never reported IN-SYNC", 
     fs.chmodSync(path.join(dir, ".git", "index"), 0o644);
   }
   assert.equal(read(dir, "f.txt"), "GENUINE UNCOMMITTED WIP\n");
+});
+
+// ---------- ambient git env (issue-spor-gittime-git-env-inheritance) ----------
+
+test("a bogus ambient GIT_DIR does not misdirect the heal — --repo stays authoritative", () => {
+  const dir = initRepo();
+  write(dir, "a.js", "one\n");
+  commit(dir, "init");
+  casAdvance(dir, () => write(dir, "a.js", "one\ntwo\n"));
+
+  // A decoy repo the ambient env points git at. Confirmed unscrubbed git
+  // resolves GIT_DIR/GIT_WORK_TREE over both `-C <dir>` and a spawn `cwd` of
+  // `dir` — if any spawn here inherited them, every git call would silently
+  // run against the decoy instead of the `--repo` argument.
+  const decoy = initRepo();
+  write(decoy, "b.js", "decoy\n");
+  commit(decoy, "decoy init");
+
+  const r = runWithEnv(
+    dir,
+    { GIT_DIR: path.join(decoy, ".git"), GIT_WORK_TREE: decoy, GIT_COMMON_DIR: path.join(decoy, ".git") },
+    "--json",
+    "--apply"
+  );
+  const json = JSON.parse(r.stdout);
+  assert.equal(r.status, 0);
+  assert.equal(json.verdict, "HEALED");
+  assert.equal(read(dir, "a.js"), "one\ntwo\n"); // healed the real repo, not the decoy
+  assert.equal(read(decoy, "b.js"), "decoy\n"); // decoy untouched
 });
 
 // ---------- invocation ----------

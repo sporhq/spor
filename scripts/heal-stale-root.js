@@ -136,7 +136,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawnSync } = require('child_process');
+const { gitSpawn } = require('../lib/shell/git-exec.js');
 
 // The git blob of an empty file, derived per-repo rather than hardcoded: a
 // SHA-256 repository (--object-format=sha256) hashes the same empty content to
@@ -187,6 +187,12 @@ function parseArgs(argv) {
 
 // ---------- git ----------
 
+// Every spawn below runs through gitSpawn (lib/shell/git-exec.js), the one
+// definition shared with bin/spor.js and scripts/engines/util.js: it scrubs
+// ambient GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR before the child launches, so a
+// leaked var from the caller's environment can't misdirect the heal at the
+// wrong repo (issue-spor-gittime-git-env-inheritance).
+
 // Set once the heal has written anything. After that, exit 2 is a lie — the
 // header promises it means "nothing was modified" — so even a git that will not
 // launch (EAGAIN on a loaded box running five agents) has to leave through a
@@ -236,7 +242,7 @@ function utf8OrNull(p) {
 }
 
 function gitRun(repo, args, input, encoding) {
-  const r = spawnSync('git', ['-C', repo, ...args], {
+  const r = gitSpawn(repo, args, {
     encoding,
     maxBuffer: 64 * 1024 * 1024,
     ...(input === undefined ? {} : { input }),
@@ -731,14 +737,15 @@ function main() {
   // re-encoding trap as every tracked path above (see "PATH BYTES ARE NOT
   // UTF-8" at the top of this file): `git rev-parse --show-toplevel` can print
   // a directory name with no UTF-8 guarantee, and `repo` is then handed back
-  // to git as `-C <repo>` argv on EVERY spawn this tool makes. Unlike
-  // pathspecs (chunks/checkoutPath), `-C` has no stdin/pathspec-file escape
+  // to git as the child process's `cwd` (via lib/shell/git-exec.js's
+  // `gitSpawn`) on EVERY spawn this tool makes. Unlike pathspecs
+  // (chunks/checkoutPath), a process's `cwd` has no stdin/pathspec-file escape
   // hatch — there is no byte-safe way to name a working directory to git at
   // all — so the best this tool can do is read it losslessly (latin1,
   // matching gitPaths) and use it only when those raw bytes round-trip
   // through argv unchanged. When they don't, refuse cleanly up front instead
   // of letting a silent utf8 decode mangle them into a path that no longer
-  // names the real directory (every subsequent `git -C` call would then just
+  // names the real directory (every subsequent git spawn would then just
   // fail to find the repo — not a wrong heal, but a confusing "cannot run
   // git" instead of a clear diagnosis).
   const topRaw = gitPaths(opts.repo, ['rev-parse', '--show-toplevel']);
@@ -753,7 +760,7 @@ function main() {
   // refusing it falsely.
   const repo = utf8OrNull(topRaw.replace(/\r?\n$/, ''));
   if (repo === null) {
-    usage('repo root path is not valid UTF-8 — cannot be passed to git as an argument (no -C stdin/file form exists)');
+    usage('repo root path is not valid UTF-8 — cannot be passed to git as a process cwd (no stdin/file form exists)');
   }
 
   const prog = inProgressOp(repo);
