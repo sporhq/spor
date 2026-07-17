@@ -84,16 +84,21 @@ function parseIPv4(str) {
   return value > 0xffffffff ? null : value >>> 0;
 }
 
-// A parsed IPv4 address is loopback (127.0.0.0/8) or the "any" address
-// (0.0.0.0) — both are machine-local, never a peer's reachable endpoint.
-function isLoopbackIPv4Value(value) {
+// A parsed IPv4 address is machine-local if it's loopback (127.0.0.0/8) or
+// the "any" address (0.0.0.0) — 0.0.0.0 isn't technically a loopback address,
+// but a server bound to it is reachable only from the same machine, so it
+// belongs in this suppression the same as 127.0.0.0/8 does.
+function isMachineLocalIPv4Value(value) {
   return (value >>> 24) === 127 || value === 0;
 }
 
 // Expand an IPv6 literal (bare hostname, no brackets) to its 8 16-bit
 // groups, handling "::" compression and a trailing embedded-IPv4 tail
 // (`::ffff:127.0.0.1`, the deprecated `::127.0.0.1`). Returns null if the
-// literal doesn't parse.
+// literal doesn't parse. When the literal carries a dotted-quad tail, the
+// already-parsed 32-bit value is returned alongside the groups as
+// `embeddedIPv4`, so a caller checking the embedded address doesn't have to
+// re-derive it from the last two hex groups.
 function expandIPv6(addr) {
   // A trailing dotted-quad (mapped `::ffff:127.0.0.1` or the deprecated
   // compatible `::127.0.0.1`) rewrites to two hex groups first, so the rest
@@ -101,10 +106,12 @@ function expandIPv6(addr) {
   // captures up through the LAST colon — the one separating the embedded
   // IPv4 from whatever precedes it, "::" compression included.
   let body = addr;
+  let embeddedIPv4 = null;
   const tail = addr.match(/^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/);
   if (tail) {
     const v4 = parseIPv4(tail[2]);
     if (v4 == null) return null;
+    embeddedIPv4 = v4;
     body = tail[1] + (v4 >>> 16).toString(16) + ":" + (v4 & 0xffff).toString(16);
   }
 
@@ -121,19 +128,23 @@ function expandIPv6(addr) {
     groups = body === "" ? [] : body.split(":");
   }
   if (groups.length !== 8 || !groups.every((g) => /^[0-9a-f]{1,4}$/i.test(g))) return null;
-  return groups.map((g) => parseInt(g, 16));
+  return { groups: groups.map((g) => parseInt(g, 16)), embeddedIPv4 };
 }
 
 // A parsed IPv6 host is loopback in three forms: the canonical/expanded
 // `::1`, an IPv4-mapped address (`::ffff:a.b.c.d`) whose embedded IPv4 is
 // loopback, or the deprecated all-zero-prefix IPv4-compatible form.
 function isLoopbackIPv6(hostname) {
-  const groups = expandIPv6(hostname);
-  if (!groups) return false;
+  const expanded = expandIPv6(hostname);
+  if (!expanded) return false;
+  const { groups, embeddedIPv4 } = expanded;
   if (groups.slice(0, 7).every((g) => g === 0) && groups[7] === 1) return true;
-  const embeddedIPv4 = (groups[6] << 16) | groups[7];
   if (groups.slice(0, 5).every((g) => g === 0) && (groups[5] === 0 || groups[5] === 0xffff)) {
-    return isLoopbackIPv4Value(embeddedIPv4 >>> 0);
+    // A literal without a dotted-quad tail (e.g. the fully-expanded
+    // `0:0:0:0:0:ffff:7f00:1`) still encodes the embedded IPv4 in the last
+    // two groups — fall back to reconstructing it from those.
+    const v4 = embeddedIPv4 != null ? embeddedIPv4 : ((groups[6] << 16) | groups[7]) >>> 0;
+    return isMachineLocalIPv4Value(v4);
   }
   return false;
 }
@@ -157,7 +168,7 @@ function isLocalServer(host) {
   if (/^localhost$/i.test(hostname)) return true;
   if (hostname.includes(":")) return isLoopbackIPv6(hostname);
   const v4 = parseIPv4(hostname);
-  return v4 != null && isLoopbackIPv4Value(v4);
+  return v4 != null && isMachineLocalIPv4Value(v4);
 }
 
 // One "should this host be suppressed" rule, shared by both places a server
