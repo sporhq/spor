@@ -1532,18 +1532,21 @@ test("GRAPH.md worked schema example parses and its hooks run as documented", ()
     "a status-less create is allowed");
 });
 
-// ---------- SLOTS extensibility (task-spor-registry-schema-slots-unification) ----------
+// ---------- SLOTS extensibility (task-spor-registry-schema-slots-unification,
+// task-spor-registry-snapshot-fully-table-driven) ----------
 //
 // The whole point of the shared SLOTS table is that a sixth schema kind is a
 // one-entry addition: KINDS derives from SLOTS, parseSchemaNode routes
-// per-kind key/validate through SLOT lookup, and the Registry constructor
-// initializes its backing fields by iterating SLOTS. This test proves it by
-// pushing a synthetic "widget-schema" slot onto the live SLOTS table and
-// exercising it through parsing, validation, and construction — with no edit
-// to registry.js beyond the SLOTS entry itself. The slot is always removed
-// (try/finally) so it never leaks into other tests sharing this module.
+// per-kind key/validate through SLOT lookup, the Registry constructor
+// initializes its backing fields by iterating SLOTS, and snapshot() folds
+// every slot's rendered entries into the returned object by its snapshotKey.
+// This test proves it by pushing a synthetic "widget-schema" slot onto the
+// live SLOTS table and exercising it through parsing, validation,
+// construction, and introspection — with no edit to registry.js beyond the
+// SLOTS entry itself. The slot is always removed (try/finally) so it never
+// leaks into other tests sharing this module.
 
-test("SLOTS extensibility: a synthetic slot flows through validation, parsing, and construction unedited", () => {
+test("SLOTS extensibility: a synthetic slot flows through validation, parsing, construction, and snapshot() unedited", () => {
   const widgetSlot = {
     kind: "widget-schema", field: "widgetSchemas", singleton: false, snapshotKey: "widget_types",
     key: (payload) => payload.widget_type,
@@ -1589,10 +1592,18 @@ test("SLOTS extensibility: a synthetic slot flows through validation, parsing, a
     assert.equal(reg.widgetSchemas.get("gizmo").id, "schema-widget-gizmo");
 
     // staleOverrides() is fully generic (it just walks SLOTS), so it also
-    // picks up the new slot with no edit; snapshot()'s final assembly is
-    // hand-shaped to the well-known five kinds' consumers and is out of
-    // scope here — the acceptance bar is validation/parsing/construction.
+    // picks up the new slot with no edit.
     assert.deepEqual(reg.staleOverrides(), []);
+
+    // snapshot() folds every slot generically too (task-spor-registry-
+    // snapshot-fully-table-driven): the new kind's snapshotKey shows up in
+    // the returned object with no hand-picked key, rendered via the slot's
+    // own render() fn — this is also what `spor schema --json` and GET
+    // /v1/schema serve verbatim, so the same fix covers both surfaces.
+    const snap = reg.snapshot();
+    assert.deepEqual(snap.widget_types, [
+      { type: "gizmo", schema_id: "schema-widget-gizmo", schema_version: "2026.07.17.1", source: "graph" },
+    ]);
   } finally {
     const i = registry.SLOTS.indexOf(widgetSlot);
     if (i !== -1) registry.SLOTS.splice(i, 1);
