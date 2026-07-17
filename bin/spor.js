@@ -6478,29 +6478,41 @@ async function resolveNode(cfg, id) {
 // below exactly as much as a `true` short-circuits it, or the offline
 // heuristic could silently overrule an authoritative server negative. 2)
 // absent that (no server response in hand, or an older server that doesn't
-// send the key yet), the offline seed-registry check — still type-aware,
-// just blind to graph-resident extensions. 3) the local-mode branch below
-// loads the real graph and re-checks against it, which is strictly more
-// authoritative than either fallback and stays as-is.
+// send the key yet) AND no local graph to consult (remote mode with a plain
+// boolean-less response), the offline seed-registry check — still type-aware,
+// just blind to graph-resident extensions. 3) in LOCAL mode this offline
+// check must NOT short-circuit ahead of the real graph load below: the seed
+// registry alone can't see a graph-resident schema override, so a status the
+// seed pack calls terminal-by-default but a resident override has made live
+// again would otherwise be wrongly reported as already-resolved before the
+// authoritative graph check ever runs (a live node must not be skipped). The
+// offline check is used in local mode only as the fail-open fallback when the
+// graph itself is unreadable.
 function dispatchResolutionReason(cfg, node) {
   const status = (node.status || "").toLowerCase();
   const graphLib = require(path.join(ROOT, "lib", "graph.js"));
-  if (graphLib.isNodeInertOffline(node.inert, status, node.type || null)) return `status: ${status}`;
   const fromEdge = (r) => `${r.edge || "resolves"} edge from ${r.by}${r.title ? ` — ${r.title}` : ""}`;
+  if (node.inert === true) return `status: ${status}`;
+  if (node.inert !== false && cfg.mode() === "remote") {
+    if (graphLib.isTerminalStatusOffline(status, node.type || null)) return `status: ${status}`;
+  }
   if (node.resolution && node.resolution.by) return fromEdge(node.resolution);
   if (cfg.mode() !== "remote") {
     try {
-      const g = require(path.join(ROOT, "lib", "graph.js")).loadGraph(cfg.nodesDir());
-      // Re-check against the loaded graph's registry — the fallback vocabulary
-      // above may miss a graph-resident terminal-status extension
-      // (issue-spor-coupling-resolution-terminal-status-divergence), which
-      // this graph load (needed for the edge-based check below anyway) can
-      // now catch before falling through to a dispatch.
+      const g = graphLib.loadGraph(cfg.nodesDir());
+      // Re-check against the loaded graph's registry — strictly more
+      // authoritative than the offline seed-only check, since it also sees a
+      // graph-resident terminal-status extension or override
+      // (issue-spor-coupling-resolution-terminal-status-divergence).
       if (isTerminalStatus(status, node.type || null, g)) return `status: ${status}`;
       const r = resolutionOf(g, node.id);
       if (r && r.by) return fromEdge(r);
     } catch {
-      /* fail-open — an unreadable graph never blocks a dispatch */
+      // Unreadable graph: fail open to the offline seed-registry check rather
+      // than dropping the type-aware signal entirely — an unreadable graph
+      // must never BLOCK a dispatch, but a genuinely finished node should
+      // still be caught when we can't load the real registry to prove it.
+      if (graphLib.isTerminalStatusOffline(status, node.type || null)) return `status: ${status}`;
     }
   }
   return null;
