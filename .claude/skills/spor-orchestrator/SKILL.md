@@ -38,10 +38,17 @@ node id, compiles the briefing into the agent's prompt, and launches a
    collisions (two agents editing the same module), which is a lighter problem.
 
 2. **The authoritative "done" signal is the node being resolved on the graph,
-   not the agent's process state.** Each delegated agent's contract is to resolve
-   its node *last* (a resolver node + a `resolves` edge, then a terminal status).
-   So an agent that vanished without a resolved node did *not* finish — treat it
-   as failed, never merge it. Trust the graph over the process table.
+   not the agent's process state — except for the one harness that's
+   forbidden from resolving.** A delegated Claude-harness agent's contract is
+   to resolve its own node *last* (a resolver node + a `resolves` edge, then a
+   terminal status), so for those, an agent that vanished without a resolved
+   node did *not* finish — treat it as failed, never merge it. A
+   **Codex-harness implementer is different: its contract explicitly forbids
+   it from writing the graph at all**, including resolving its own node (see
+   "The Codex implementer" below) — so its node stays unresolved even when it
+   finished cleanly, and the orchestrator resolves it after reading a
+   `MERGE-READY` verdict. Outside that one exception, trust the graph over the
+   process table.
 
 3. **You serialize the merge, even though agents work in parallel.** Agents
    implement concurrently in isolated worktrees, but merges go through you one at
@@ -117,7 +124,9 @@ low-blast-radius dev VM, not a general workstation:
 
 ```
 CONCURRENCY = min(5, user's choice)
-running = {}          # node_id -> { agent_name, branch, worktree_path }
+running = {}          # node_id -> { agent_name, branch, worktree_path, kind }
+                       #   kind: 'claude' (self-resolves) | 'codex' (orchestrator
+                       #   resolves, see "The Codex implementer") | 'infra'
 done, escalated = [], []
 
 loop:
@@ -139,6 +148,18 @@ loop:
   # --- supervise: wait for a change, then act ---
   wait_for_change()                       # see Waiting — don't spin
   for node in running whose agent is no longer active:
+      if running[node].kind == 'codex' and not resolved_on_graph(node):
+          report = read_final_report(node)      # agent-report.sh <session-or-job>
+          if report says MERGE-READY:
+              resolve_on_graph(node)             # orchestrator writes the resolver
+                                                  #   node + resolves edge + terminal
+                                                  #   status HERE — before the status
+                                                  #   check below runs, so it sees
+                                                  #   "resolved" not "RECOVER". See
+                                                  #   "The Codex implementer".
+          # else: BLOCKED, or process died with no report — fall through to
+          # recover() below unresolved, exactly like a self-resolving agent.
+
       if resolved_on_graph(node):
           if node.repo == 'spor-infra':
               verify_deploy(node)         # infra self-deployed — see The infra/swamp agent
@@ -184,7 +205,12 @@ spor dispatch --node <id> --worktree --model <sonnet|opus|fable> \
   instructions (see `assets/agent-prompt.md`).
 - Dispatch auto-claims the lease. If it **refuses** (already in flight or held),
   skip that item — something else owns it. Don't `--force` past a live lease.
-- Record `{ node, agent_name (= node id), branch, worktree_path }` in `running`.
+- Record `{ node, agent_name (= node id), branch, worktree_path, kind }` in
+  `running`. `kind` is `'claude'` for `agent-prompt.md`/`infra-agent-prompt.md`
+  (self-resolving) or `'codex'` for `codex-agent-prompt.md` (orchestrator
+  resolves after a `MERGE-READY` report — see "The Codex implementer"). Get
+  this right at dispatch time; it's what tells the supervisor loop not to
+  `RECOVER` a Codex node that's actually done.
 
 ### Right-size the model per item
 
@@ -255,6 +281,14 @@ them):
   resolved on the graph = finished**, even if `state` still says `working` —
   proceed to gate+merge and reap the session with an explicit
   `claude stop <agent>` so it can't linger.
+- **Both scripts only see the Claude side of the fleet.** They read `claude
+  agents --json`, and a Codex-harness implementer (`assets/codex-agent-prompt.md`)
+  isn't a `claude --bg` agent at all — it never appears in that list, session
+  or gone. Feed them a Codex node id and, absent a resolved node, you get
+  `RECOVER` unconditionally — that's not a signal, it's a blind spot. Track a
+  Codex node's completion by watching the process/job you spawned for it and
+  reading its final report, not through these scripts; see "The Codex
+  implementer" below.
 
 To read a finished agent's final report, never `claude logs` (it replays raw
 TUI escape frames — huge and unreadable). Use:
@@ -317,6 +351,13 @@ the move when you're running the full pool and want to stay lean.
 
 ### Recover (agent gone, node not resolved)
 
+This is for **self-resolving** agents (`kind: 'claude'` — code or infra) whose
+own contract was to resolve the node before exiting. For a Codex node, land
+here only *after* you've confirmed via its final report that it did NOT reach
+`MERGE-READY` (BLOCKED, or the process died with no report at all) — a
+`MERGE-READY` Codex node gets orchestrator-resolved per "The Codex implementer"
+below, never routed through Recover.
+
 The agent finished or died without resolving its node, so the work is incomplete
 or it deliberately bailed:
 
@@ -331,6 +372,51 @@ or it deliberately bailed:
   flaky test, lease conflict, dead server), same tier — a bigger model won't
   fix a broken worktree. After two failed attempts, stop and hand the item to
   the user — a task that won't converge shouldn't loop forever.
+
+### The Codex implementer (a self-resolution exception)
+
+`assets/codex-agent-prompt.md` dispatches a **Codex-harness** implementer
+(GPT-5.5 via the `codex` CLI — a different binary from `claude --bg`) for the
+same kind of worktree item a code agent handles. Its contract differs from
+`assets/agent-prompt.md` in exactly one load-bearing way: it is explicitly
+forbidden from writing the graph at all — "Read the graph freely; never write
+it… The orchestrator handles ALL graph updates, including resolving this
+node." So a Codex node that finished cleanly looks, on the graph, identical
+to one that never started: unresolved. That's expected, not a failure
+signal — but it collides head-on with completion-detection paths built for
+**self-resolving** agents: `fleet-status.sh`'s `RECOVER` branch and the
+supervisor loop's default `recover()` fallthrough both read "unresolved" as
+"didn't finish," and neither script can even see a Codex session in the
+first place (they poll `claude agents --json`, which a Codex process never
+enters).
+
+Two things close the gap:
+
+1. **Track which nodes are Codex-dispatched.** Record `kind: 'codex'`
+   alongside the node in `running` at dispatch time (see Dispatch, above).
+   That's what tells the supervisor loop this node's absence from `claude
+   agents --json` — and its unresolved status — means nothing on their own;
+   watch the Codex process/job you spawned for it directly instead of
+   feeding its id to `fleet-status.sh`/`watch-fleet.sh`.
+2. **Resolve before you status-check.** When a tracked Codex process exits,
+   read its final report — same shape as a Claude agent's: ends with
+   `MERGE-READY` or `BLOCKED` and why, plus a `## FINDINGS FOR THE
+   ORCHESTRATOR` block. On `MERGE-READY`: **you** write the resolver node (a
+   `decision` or short `artifact` carrying a `resolves` edge) and flip the
+   node to its terminal status yourself — *before* running `fleet-status.sh`
+   or trusting `watch-fleet.sh` again for that node. Do the resolve first and
+   the very next status check sees a resolved node like any other finished
+   item, falling straight through to the normal gate-and-merge path — no
+   special-casing needed downstream of the resolve. On `BLOCKED`, or if the
+   process died without a final report, that's a genuine non-completion —
+   route it through Recover (above) like any other unresolved node, not this
+   exception.
+
+Never resolve a Codex node preemptively — because it's been running a while,
+or because it isn't in `claude agents --json`, or any signal short of a
+`MERGE-READY` report. Resolving on a guess is exactly the failure mode
+issue-spor-orchestrator-implementer-resolves-before-commit already paid for:
+it must never happen before you know the work is actually done.
 
 ### The infra / swamp agent (the optional 5th slot)
 
@@ -397,12 +483,17 @@ how the fleet's discoveries become durable work instead of evaporating.
 
 ## What each delegated agent does
 
-There are two per-agent workflows, both supplied as the dispatch `--template`:
+There are three per-agent workflows, all supplied as the dispatch `--template`:
 
 - **Code agents** — `assets/agent-prompt.md`: brief → implement in its worktree →
   loop `/code-review` until clean → verify → resolve the node (resolver node +
   `resolves` edge, then terminal status) → commit on its branch (it does **not**
   merge — your merge-subagent does).
+- **Codex implementer** — `assets/codex-agent-prompt.md`: brief (read-only) →
+  implement in its worktree → self-review → verify → commit on its branch,
+  ending with a `MERGE-READY`/`BLOCKED` verdict. It does **not** write the
+  graph at all — not even to resolve its own node; see "The Codex implementer"
+  for the orchestrator-resolves-before-status-check contract this requires.
 - **Infra/swamp agent** — `assets/infra-agent-prompt.md`: brief → change the
   swamp model on the real checkout → **deploy via the `swamp` CLI** → verify →
   resolve the node → commit the model change (it owns the deploy; you don't
@@ -419,5 +510,8 @@ how you schedule, gate, merge, and deploy them.
   constraint that forces some items to run solo.
 - **`assets/agent-prompt.md`** — the code-agent prompt (worktree, CAS-merged by
   you).
+- **`assets/codex-agent-prompt.md`** — the Codex implementer prompt (worktree,
+  CAS-merged by you; forbidden from writing the graph — you resolve its node
+  after a `MERGE-READY` report, see "The Codex implementer").
 - **`assets/infra-agent-prompt.md`** — the infra/swamp-agent prompt (real
   checkout, owns its deploy; one at a time).

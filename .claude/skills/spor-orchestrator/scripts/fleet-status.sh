@@ -11,6 +11,17 @@
 #   graph     — the node's frontmatter status via `spor get`
 #   verdict   — RUNNING / FINISHED (resolved, gate+merge it) / RECOVER
 #               (session gone or idle but node NOT resolved) / DONE
+#
+# Scope: this "unresolved = RECOVER" verdict assumes a SELF-RESOLVING agent —
+# one dispatched with agent-prompt.md/infra-agent-prompt.md, whose own
+# contract is to resolve its node before it exits. A Codex-harness
+# implementer (assets/codex-agent-prompt.md) is explicitly forbidden from
+# resolving its own node — the orchestrator resolves it after reading a
+# MERGE-READY report, BEFORE re-checking here (see SKILL.md "The Codex
+# implementer"). Don't feed this script a Codex node id and trust RECOVER at
+# face value: Codex runs via the `codex` CLI, not `claude --bg`, so it never
+# appears in `claude agents --json` at all — "session gone" is the only
+# verdict this script can ever produce for one, resolved or not.
 set -u
 out=$(claude agents --json 2>/dev/null)
 if [ $# -ge 1 ]; then NODES=("$@"); else

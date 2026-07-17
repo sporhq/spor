@@ -21,6 +21,16 @@
 #   the agent finishes (inc-spor-orchestration-watcher-stuck-state).
 # - An agent can vanish from the list entirely when it exits; treat a node
 #   that WAS seen and is now absent as done.
+#
+# Scope: like fleet-status.sh, this polls `claude agents --json` and treats
+# an unresolved node as not-yet-done — correct only for a SELF-RESOLVING
+# agent (agent-prompt.md/infra-agent-prompt.md). A Codex-harness implementer
+# (assets/codex-agent-prompt.md) never appears in `claude agents --json` (it
+# runs via the `codex` CLI) and is contractually forbidden from resolving its
+# own node, so don't pass this script a Codex node id expecting a meaningful
+# result — track its completion by watching the process/job you spawned for
+# it and reading its final report instead (see SKILL.md "The Codex
+# implementer").
 set -u
 [ $# -ge 1 ] || { echo "usage: watch-fleet.sh <node-id> [...]" >&2; exit 1; }
 NODES=("$@")

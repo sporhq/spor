@@ -16,7 +16,11 @@ Branch: {{node}} — commit here; do not switch or merge branches.
 - **Read the graph freely; never write it.** Read-only graph access for context is
   *encouraged* (see Orient below). What's forbidden is any `spor` command that
   MUTATES state — no node/edge/status writes. The orchestrator handles ALL graph
-  updates, including resolving this node.
+  updates, including resolving this node. This means your node will still show
+  as unresolved when you finish — that's expected, not a failure on your part.
+  The orchestrator resolves it after reading your `MERGE-READY` verdict below,
+  before it runs its own completion checks — say `MERGE-READY` plainly so that
+  check doesn't mistake your finished work for a stalled agent.
 - Read the repo's CLAUDE.md (and any spec it points to) for hard rules before coding,
   and honor them. Write code that reads like the code around it.
 
