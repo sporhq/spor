@@ -1,0 +1,369 @@
+{
+  "note": "Hand adjudication of every lost fact whose session produced a distiller extraction. See measure-async-nudge-loss.js.",
+  "date": "2026-07-17",
+  "adjudicator": "delegated agent (task-spor-measure-async-nudge-session-final-loss)",
+  "covered": 26,
+  "total": 40,
+  "facts": [
+    {
+      "key": "be4c18abeae9",
+      "session": "8ae9563f-48cf-4694-ae71-515d7d65e16d",
+      "file": "/home/exedev/repos/spor-docs/src/content/docs/mcp/tools.md",
+      "fact": "When querying the graph, inbound `resolves` and `answers` edges must be trusted as authoritative over a node's `status` field to prevent reading stale or out-of-sync status properties.",
+      "lexical": 0,
+      "covered": false,
+      "reason": "distiller extracted web-nav/docs-sweep facts; the resolves/answers-over-status rule is absent"
+    },
+    {
+      "key": "4d7fdbf84cd3",
+      "session": "8ae9563f-48cf-4694-ae71-515d7d65e16d",
+      "file": "/home/exedev/repos/spor-docs/src/content/docs/mcp/tools.md",
+      "fact": "The frontmatter `author` field on a node only records the last editor, so the full chain of ownership and revisions must be audited using the `node_history` tool.",
+      "lexical": 0.067,
+      "covered": false,
+      "reason": "distiller lists node_history as a doc tool but never states author = last editor only"
+    },
+    {
+      "key": "583ae34826d0",
+      "session": "a01f925a-867e-45e9-b86c-3868279a07f8",
+      "file": "/home/exedev/repos/spor/lib/seed/schema-question.md",
+      "fact": "The status-vocabulary membership check for questions was moved to `validate()` to run on both node creation and updates, preventing questions from being created with off-vocabulary statuses that only failed on later writes.",
+      "lexical": 0.278,
+      "covered": false,
+      "reason": "distiller covers the placeholder gate, not the status-vocab move into validate()"
+    },
+    {
+      "key": "28151e4333ca",
+      "session": "a01f925a-867e-45e9-b86c-3868279a07f8",
+      "file": "/home/exedev/repos/spor/lib/seed/schema-question.md",
+      "fact": "The question validator in `lib/seed/schema-question.md` now rejects text fields (`title`, `summary`, or `body`) consisting entirely of unfilled template placeholders, preventing documentation examples from creating information-free queue items.",
+      "lexical": 0.429,
+      "covered": true,
+      "reason": "distiller: prevent documentation examples from minting useless placeholder nodes"
+    },
+    {
+      "key": "6de73f8d02fa",
+      "session": "a01f925a-867e-45e9-b86c-3868279a07f8",
+      "file": "/home/exedev/repos/spor/GRAPH.md",
+      "fact": "The question schema's `validate()` function rejects any submission where the title, summary, or body consists entirely of unfilled template placeholders like `<question>`, `{{text}}`, or `[id]`. This prevention mechanism was added under issue-spor-ask-question-template-placeholder-validation to stop verbatim documentation examples from creating empty routed questions.",
+      "lexical": 0.321,
+      "covered": true,
+      "reason": "same placeholder-rejection fact restated by the distiller"
+    },
+    {
+      "key": "1779f406fc6a",
+      "session": "b6a85ebd-a39e-4c8e-a257-dd71292bf41d",
+      "file": "/home/exedev/.claude/projects/-home-exedev-repos-spor/memory/orchestrator-merge-mechanics.md",
+      "fact": "Under the model right-sizing decision (dec-spor-orchestrator-model-right-sizing), the orchestrator dispatches implementers via `spor dispatch --model sonnet|opus|fable` (defaulting to Sonnet and escalating on failure) and restricts the merge subagent to Sonnet. Additionally, a new convention dictates always syncing the shared root after a merge.",
+      "lexical": 0.4,
+      "covered": true,
+      "reason": "distiller records the Sonnet/Opus/Fable dispatch rubric"
+    },
+    {
+      "key": "1ca76d98376a",
+      "session": "a05abb1b-e011-4106-8875-d95ca763ad4f",
+      "file": "/home/exedev/.claude/projects/-home-exedev-repos-spor-infra/memory/api-registry-mirror-now-automated.md",
+      "fact": "The 15-minute API registry mirror cron (`/home/exedev/repos/spor-infra/bin/sync-api-registry.sh`) has been failing since the June 2026 hosting relocation because the required workflows now live in the `spor-server` namespace. The planned fix is to migrate the sync driver to `spor-server` and decommission the `spor-infra` cron.",
+      "lexical": 0.692,
+      "covered": true,
+      "reason": "distiller records the relocation to spor-server and that spor-infra edits are inert"
+    },
+    {
+      "key": "b524a39bc5ae",
+      "session": "b772fe98-d406-4858-8a59-78a5903acd4e",
+      "file": "/home/exedev/repos/spor-server/CONTROL-PLANE.md",
+      "fact": "To avoid managing per-tenant bearer tokens and waking suspended tenants, the production metering collector in `lib/otlp-source.js` pulls metrics directly from the ClickHouse OTLP store instead of polling `/v1/status`. The adapter reads the latest cumulative values from each organisation's newest export batch and throws on empty lookback windows to prevent silent zero errors.",
+      "lexical": 0.237,
+      "covered": true,
+      "reason": "distiller records the ClickHouse-backed per-org metering source"
+    },
+    {
+      "key": "9392cafcca8e",
+      "session": "e6ecfa76-86b9-499c-b7c4-f034021331b0",
+      "file": "/home/exedev/repos/spor-server/.claude/worktrees/task-spor-server-doc-update-post-split-lib-architecture/SERVER.md",
+      "fact": "Post-split, server code must access the external `../spor` client library only through the `server/spor-lib.js` resolver (using `sporLib(name)`), which dynamically checks the `$SPOR_LIB` environment variable, the `@sporhq/spor` npm package, and sibling checkouts. To avoid build-time sibling dependencies, the Docker image build uses `scripts/vendor-lib.sh` to stage a pinned, gitignored copy of the library in `server/vendor/spor-lib/`.",
+      "lexical": 0.472,
+      "covered": true,
+      "reason": "distiller records spor-lib.js env/npm/sibling resolution order"
+    },
+    {
+      "key": "e9e78b4bec04",
+      "session": "b772fe98-d406-4858-8a59-78a5903acd4e",
+      "file": "/home/exedev/.claude/projects/-home-exedev-repos-spor-server/memory/swamp-secret-and-data-read-paths.md",
+      "fact": "The `swamp vault read-secret` command's stdout can fail to authenticate against ClickHouse due to rendering differences, while config-resolved `vault.get()` references function correctly. To avoid auth failures, credential-dependent changes should be verified directly through the deployed path instead of capturing the secret's shell output.",
+      "lexical": 0.091,
+      "covered": false,
+      "reason": "distiller covers metering/OOM; the vault read-secret auth quirk is absent"
+    },
+    {
+      "key": "0b93b9343265",
+      "session": "b772fe98-d406-4858-8a59-78a5903acd4e",
+      "file": "/home/exedev/.claude/projects/-home-exedev-repos-spor-server/memory/swamp-secret-and-data-read-paths.md",
+      "fact": "The `swamp data get clickhouse-query result --json` command only returns query metadata. The actual raw result JSON must instead be read from the local cache directory at `~/.swamp/repos/<repo-uuid>/<namespace>/data/@spor/clickhouse/query/<model-uuid>/result/<version>/raw`.",
+      "lexical": 0.12,
+      "covered": false,
+      "reason": "distiller covers metering; the swamp data cache-dir read path is absent"
+    },
+    {
+      "key": "69e924345861",
+      "session": "53327839-781f-4edc-b724-516136388603",
+      "file": "/home/exedev/repos/spor-infra/docs/spor-web-request-access-funnel.md",
+      "fact": "The activation of the `sporhq.io` request-access funnel is currently blocked because the vaulted Cloudflare tokens `CLOUDFLARE_PAGES_API_TOKEN` and `CLOUDFLARE_API_TOKEN` lack the Workers KV Storage: Edit permission, causing the `ensure-kv` command to fail with HTTP 401.",
+      "lexical": 0.739,
+      "covered": true,
+      "reason": "distiller records the funnel blocked on vaulted Cloudflare tokens"
+    },
+    {
+      "key": "81c4fa05492b",
+      "session": "53327839-781f-4edc-b724-516136388603",
+      "file": "/home/exedev/repos/spor-infra/docs/spor-web-request-access-funnel.md",
+      "fact": "To connect the internet-facing Cloudflare Pages signup form to the non-internet-reachable team graph, the `spor-web` architecture buffers submissions in Workers KV and utilizes a local cron-based drain (`bin/access-request-drain.sh`) to ingest them.",
+      "lexical": 0.333,
+      "covered": true,
+      "reason": "distiller records KV buffering plus the VM-side cron drain"
+    },
+    {
+      "key": "fb13ec74ac76",
+      "session": "013108b7-40a3-46ee-bad8-dbada3038cb9",
+      "file": "/home/exedev/repos/spor-docs/.claude/worktrees/issue-spor-docs-boundary-lint-untracked/CONTRIBUTING.md",
+      "fact": "A documentation convention in `spor-docs` bans private repository names, server deployment internals, configuration variables, and real graph identifiers from all files in the working tree, whether tracked or untracked. This rule is enforced using a machine-readable list of banned terms located at `scripts/boundary-denylist.txt`.",
+      "lexical": 0.1,
+      "covered": true,
+      "reason": "distiller records the untracked-file boundary lint and the CONTRIBUTING update"
+    },
+    {
+      "key": "532559fb52a5",
+      "session": "4efc106d-f055-42aa-b47b-dc8d21febeff",
+      "file": "/home/exedev/.claude/projects/-home-exedev-repos-spor-server/memory/shared-checkout-staged-index-commit-hazard.md",
+      "fact": "On the shared `/home/exedev/repos/spor-server` development environment, parallel agent jobs leave staged changes in the shared git index, creating a risk that a bare `git commit` will sweep in foreign work. Agents must commit using explicit pathspecs (e.g., `git commit <file> -m ...`) to isolate their changes.",
+      "lexical": 0.385,
+      "covered": false,
+      "reason": "distiller covers the disk outage; the shared-index commit hazard is absent"
+    },
+    {
+      "key": "93ebd530eb24",
+      "session": "3bbd6e54-16dc-4e40-9352-3ceaf785f662",
+      "file": "/home/exedev/repos/spor-server/.claude/worktrees/task-spor-server-store-deeper-cluster-ts-extraction/SERVER.md",
+      "fact": "The `store.ts` orchestrator has been partitioned into stateless cluster modules (like `store-persist.ts` and `store-commit.ts`) that accept the `Store` instance as an explicit `self` parameter. To prevent circular runtime dependencies, these modules are restricted from holding state and must only reference the `Store` class via TypeScript `import type` statements.",
+      "lexical": 0.345,
+      "covered": true,
+      "reason": "distiller records the store.ts split and the explicit self parameter"
+    },
+    {
+      "key": "36c637c94f89",
+      "session": "41c9dbae-98de-4614-81d1-60e9f9f71446",
+      "file": "/home/exedev/repos/spor-server/.claude/worktrees/task-spor-document-merge-report-double-counting/SERVER.md",
+      "fact": "In the `spor-server` merge report, the metrics in `counts` can sum past `counts.incoming` because a node being `remapped` is not mutually exclusive with it being `imported` or `deduped`. Developers must reconcile merge outcomes using the specific ID lists in `imported[]`, `deduped[]`, `remapped[]`, `conflicts[]`, and `errors[]` rather than summing the summary counters.",
+      "lexical": 0.536,
+      "covered": true,
+      "reason": "distiller records merge counts summing past incoming via remapped"
+    },
+    {
+      "key": "6bce8897a7ab",
+      "session": "7686f290-c6e8-4a43-9716-c5b89738f12a",
+      "file": "/home/exedev/repos/spor-server/.claude/worktrees/issue-spor-live-metadata-stale-until-restart/SERVER.md",
+      "fact": "The proposed SIGHUP-triggered hot-reloading for MCP tool metadata in `server/mcp.js` and seed schemas in `lib/seed/` (issue-spor-live-metadata-stale-until-restart) was rejected. Even if the server updated its descriptors mid-process, connected MCP hosts cache these definitions for the session, making a manual server restart and host reconnection inherently required.",
+      "lexical": 0.357,
+      "covered": true,
+      "reason": "distiller records that hot-reload was rejected and documented instead"
+    },
+    {
+      "key": "9ac8c9fd4686",
+      "session": "ad0da21b-27dd-45a8-a4da-598d8d619b1e",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/issue-spor-corrections-no-applied-lifecycle/skills/brief/SKILL.md",
+      "fact": "When compiling a briefing, any absorbed node-targeted corrections must be retired by setting their status to `applied` via `spor set-status`. This convention, established for issue-spor-corrections-no-applied-lifecycle, prevents stale, one-shot corrections from continuously injecting into future compiles while keeping global or project-scoped corrections active.",
+      "lexical": 0.192,
+      "covered": true,
+      "reason": "distiller records the active/applied correction lifecycle"
+    },
+    {
+      "key": "37026951c4c9",
+      "session": "ad0da21b-27dd-45a8-a4da-598d8d619b1e",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/issue-spor-corrections-no-applied-lifecycle/skills/correct/SKILL.md",
+      "fact": "Node-targeted corrections are automatically transitioned to `status: applied` once their guidance is absorbed into a briefing via `/spor:brief`. Global and project-scoped corrections do not auto-retire and must be manually retired using `spor set-status <corr-id> applied`.",
+      "lexical": 0.2,
+      "covered": false,
+      "reason": "distiller states the lifecycle but not node-targeted auto-retire vs manual global"
+    },
+    {
+      "key": "57a52c6be526",
+      "session": "85800359-65b4-4a51-8d67-df54609b657d",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/issue-cc-accreting-log-body-cap-collision/API.md",
+      "fact": "Spor enforces size limits of body ≤ 8KB, summary ≤ 500 characters, and ≤ 40 edges on nodes. Running-log nodes that grow indefinitely use the rollover convention documented in `GRAPH.md`, and `spor validate` issues warnings as a node's body approaches the cap.",
+      "lexical": 0.192,
+      "covered": true,
+      "reason": "distiller records the 8192-byte rollover convention"
+    },
+    {
+      "key": "3347fc6ca58e",
+      "session": "fe817b61-2706-47a1-be9a-9bdeae9f368a",
+      "file": "/home/exedev/repos/spor-docs/.claude/worktrees/task-spor-docs-prose-lint-extensions/src/content/docs/contributing/index.md",
+      "fact": "Documentation pull requests must pass validation by `scripts/check-style.sh` (which scans against `scripts/style-denylist.txt`) and `scripts/check-prose.sh` (which strips code and bans exclamation marks or emojis). Contributors are prohibited from modifying these validation scripts or the style denylist within a documentation pull request.",
+      "lexical": 0.458,
+      "covered": true,
+      "reason": "distiller records check-prose.sh run as a trailing step of check-style.sh"
+    },
+    {
+      "key": "1e17547e5bcb",
+      "session": "859ec735-0446-4106-93ea-b47c7fa451d7",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/issue-spor-agent-missing-dependency-edges/skills/defer/SKILL.md",
+      "fact": "The convention `norm-cc-blocks-work-only` dictates that `blocks` edges must only connect work-to-work nodes (such as task to task, or task to issue) and must never originate from a decision node. When a capture is split into multiple nodes, their sequence must be explicitly wired with `blocks` edges to prevent `spor next` from presenting them out of order (`issue-spor-agent-missing-dependency-edges`).",
+      "lexical": 0.231,
+      "covered": false,
+      "reason": "distiller covers cohort-blocks-at-creation, not the work-only/never-from-decision rule"
+    },
+    {
+      "key": "a737108012ba",
+      "session": "859ec735-0446-4106-93ea-b47c7fa451d7",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/issue-spor-agent-missing-dependency-edges/skills/spor/SKILL.md",
+      "fact": "The queue ranker in `spor next` relies exclusively on live `blocks` edges to demote blocked items below their blockers, meaning dependency constraints described only in prose are invisible to the sorting algorithm. To prevent blocked tasks from being prioritized early, dependency edges must be explicitly recorded at creation time.",
+      "lexical": 0.167,
+      "covered": true,
+      "reason": "distiller records that prose ordering does not feed the queue and blocks edges must be written"
+    },
+    {
+      "key": "c1b108f643bc",
+      "session": "e01b9d74-306d-4d4e-86ce-0e68b64fa7bc",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-improve-digest-ranking-relevance/scripts/rank-eval/README.md",
+      "fact": "An evaluation of the `UserPromptSubmit` digest ranker showed that ordering is near its practical ceiling (nDCG@5 of 0.8524 on warranted cases, with a perfect oracle gaining only +0.036), meaning major improvements must come from retrieval rather than re-ranking. As a result, `lib/kernel/graph.js` was left unchanged, as adding query similarity, tuning node-type priors, and adjusting `CONTENT_TOP_K` all failed to beat the baseline.",
+      "lexical": 0.282,
+      "covered": true,
+      "reason": "distiller records the ranker being at a local optimum with headroom in retrieval"
+    },
+    {
+      "key": "5318bde695d3",
+      "session": "ccfe94db-0c2e-4b04-943a-cb7ebbef224f",
+      "file": "/home/exedev/repos/spor-server/.claude/worktrees/task-spor-gardener-coupling-cochange-mining/SERVER.md",
+      "fact": "The co-change mining sweep (`find-cochange-*`) is disabled by default (`SPOR_COCHANGE_MINING=1`) because it relies on lower-precision history-based inference and must shell out to git. To avoid fabricating false couplings, the check is designed to fail closed, yielding an empty history and zero findings if any git error or missing checkout is encountered.",
+      "lexical": 0.375,
+      "covered": true,
+      "reason": "distiller records the opt-in SPOR_COCHANGE_MINING gate and the git shell-out rationale"
+    },
+    {
+      "key": "f5ca5c7284e2",
+      "session": "cfa8c7d9-7b8e-4e23-b7b5-e34fd11f0643",
+      "file": "/home/exedev/repos/spor-infra/.claude/worktrees/task-spor-infra-retire-dormant-tenants-model/docs/tenant-management-model.md",
+      "fact": "The `tenants` model instance was relocated from `spor-infra` to `spor-server` to allow the deploy-drift monitor's tenant auto-discovery to resolve it locally, meaning swamp commands for tenants must be run from `~/repos/spor-server`. The tenant model extension (`extensions/models/spor_tenant.ts`) remains in `spor-infra` and is consumed by `spor-server` via `.swamp-sources.yaml`.",
+      "lexical": 0.304,
+      "covered": true,
+      "reason": "distiller records spor-server as the sole tenant-model authority"
+    },
+    {
+      "key": "b8585fc2ee72",
+      "session": "76850f00-917b-4b48-8090-2ddb46f7f302",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-share-cli-absolute-urls-mcp-role-docs/API.md",
+      "fact": "On MCP-only hosts (`SPOR_HOST_ROLE=mcp`), the `POST /v1/lens/{id}/ticket` endpoint generates relative URLs by default because the MCP host does not serve render HTML, but it will generate absolute URLs if `SPOR_APP_URL` is configured.",
+      "lexical": 0.35,
+      "covered": true,
+      "reason": "distiller records SPOR_APP_URL absolute-URL resolution under the MCP role"
+    },
+    {
+      "key": "db85199ca629",
+      "session": "bb2c62ea-a4de-4274-828b-81173902e0ba",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/issue-spor-coupling-resolution-terminal-status-divergence/lib/seed/schema-register-terminal-status.md",
+      "fact": "To prevent custom user schemas from accidentally dropping default terminal states and un-terminalizing existing resolved nodes, the `terminal-status` register in `lib/kernel/resolution.js` unions user-defined overrides with the fallback seed set instead of performing a complete replacement. This deviates from other registers where custom overrides completely replace the seed's default classes.",
+      "lexical": 0.5,
+      "covered": true,
+      "reason": "distiller records union semantics and the dismissal of full replacement"
+    },
+    {
+      "key": "a6dc93d0eb0f",
+      "session": "699e1db5-0001-477a-a47b-1bbf34737280",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/issue-spor-orchestrator-unversioned-skill/.claude/skills/spor-orchestrator/references/merge.md",
+      "fact": "When syncing the shared root after moving a git reference, agents must not run `git reset --hard main` because it can overwrite parallel jobs' active work-in-progress. Instead, agents must use `node scripts/heal-stale-root.js` to dry-run and surgically apply checkouts, or fall back to verifying the merge in a throwaway detached worktree if the shared root is unsynced.",
+      "lexical": 0.147,
+      "covered": false,
+      "reason": "distiller covers the skill commit/symlink dismissal; the reset --hard hazard is absent"
+    },
+    {
+      "key": "06757699ce74",
+      "session": "fc1c4e58-023d-46d8-8ceb-c1aab84a1630",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-client-send-explicit-project-flag/API.md",
+      "fact": "The client passes `idempotency_key` inside the JSON body of `POST /v1/capture` (matching the `Idempotency-Key` header) so that verbatim outbox replays by `spor drain` carry the key automatically to prevent duplicate ingestions.",
+      "lexical": 0.136,
+      "covered": false,
+      "reason": "distiller covers project_explicit; the idempotency_key body placement is absent"
+    },
+    {
+      "key": "7a92469387b6",
+      "session": "fc1c4e58-023d-46d8-8ceb-c1aab84a1630",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-client-send-explicit-project-flag/API.md",
+      "fact": "To maintain backward compatibility with older clients, an absent `context.project_explicit` flag on `POST /v1/capture` is treated as explicit (defaulting to `true`), meaning only a literal `false` will silence fold-mismatch warnings on cross-project captures.",
+      "lexical": 0.318,
+      "covered": false,
+      "reason": "distiller covers the flag but not the absent-means-true back-compat default"
+    },
+    {
+      "key": "50949d220b4e",
+      "session": "fc1c4e58-023d-46d8-8ceb-c1aab84a1630",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-client-send-explicit-project-flag/API.md",
+      "fact": "Cross-project dependencies declared via `context.blocks` and `context.needed_by` on `POST /v1/capture` are validated prior to any model execution, returning a 404 for a missing target node or a 422 for a non-date deadline.",
+      "lexical": 0,
+      "covered": false,
+      "reason": "distiller covers project_explicit; blocks/needed_by pre-model validation is absent"
+    },
+    {
+      "key": "c437ef024839",
+      "session": "a4b97920-951b-45a3-99e8-bc8c1547cfd9",
+      "file": "/home/exedev/.claude/projects/-home-exedev-repos-spor-server/memory/spor-server-ops.md",
+      "fact": "To prevent a shared-tree startup from resetting other active workspaces, the `SPOR_SERVERCTL_SYNC_HEAD=1` environment variable must only be set conditionally in `$SPOR_HOME/server.env` based on the script's repository directory.",
+      "lexical": 0.5,
+      "covered": true,
+      "reason": "distiller records the conditional SPOR_SERVERCTL_SYNC_HEAD in server.env"
+    },
+    {
+      "key": "2208d8fd6728",
+      "session": "a4b97920-951b-45a3-99e8-bc8c1547cfd9",
+      "file": "/home/exedev/.claude/projects/-home-exedev-repos-spor-server/memory/spor-server-ops.md",
+      "fact": "Operators must manage the server process using the pidfile under the graph home's `journal/` directory instead of using `pgrep`, which risks terminating the launching shell.",
+      "lexical": 0.125,
+      "covered": false,
+      "reason": "distiller covers the deploy checkout; the pidfile-over-pgrep rule is absent"
+    },
+    {
+      "key": "8b8d2bc441b8",
+      "session": "51e542ba-cf16-4aec-bff4-e046f3bc1468",
+      "file": "/home/exedev/repos/spor-docs/.claude/worktrees/task-spor-docs-agents-md-no-server-line-flag/src/content/docs/reference/cli/repo-scoping.md",
+      "fact": "The `spor agents-md` command automatically omits the `SPOR_SERVER` tools-line pointer from the generated `AGENTS.md` block if the server URL is a loopback address to prevent committing machine-local dev configurations to the repository. The `--no-server-line` flag was introduced to allow developers to unconditionally omit this line regardless of the URL.",
+      "lexical": 0.367,
+      "covered": true,
+      "reason": "distiller records loopback-triggered suppression of the server line"
+    },
+    {
+      "key": "c3083264a1f7",
+      "session": "a2d2583a-2ab1-4616-b9ed-2f360a5ba8f5",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/issue-spor-orchestrator-completion-detection-gap/.claude/skills/spor-orchestrator/SKILL.md",
+      "fact": "The spor-orchestrator determines task completion by graph resolution for standard Claude-harness agents, which must resolve their own nodes last, but relies on a `MERGE-READY` verdict to resolve nodes for Codex-harness agents because they are forbidden from writing to the graph.",
+      "lexical": 0.4,
+      "covered": true,
+      "reason": "distiller records graph-resolution vs MERGE-READY completion detection"
+    },
+    {
+      "key": "853de054558a",
+      "session": "c3f05e5d-9d54-4704-bea5-9ee385ad5a85",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-orchestrator-scripts-dependency-resolution/CONTRIBUTING.md",
+      "fact": "The published package enforces a zero-dependency convention, permitting only Node.js built-ins and the host git binary to ensure native execution across Windows, macOS, and Linux. Development and operator tooling located under the .claude/ directory are exempt from this restriction.",
+      "lexical": 0.231,
+      "covered": true,
+      "reason": "distiller records zero-dep scoped to the published tree with .claude exempt"
+    },
+    {
+      "key": "b26c6db7f8b7",
+      "session": "f79e823d-0fcc-4adf-80d9-b4f135ead2d3",
+      "file": "/home/exedev/repos/spor-server/.claude/worktrees/task-spor-server-migration-rerun-docs/SERVER.md",
+      "fact": "Under dec-spor-admin-migration-bypass-accepted-inherent, admin-triggered lazy migrations are permitted to bypass field-level authorization checks on person and agent nodes because admins already possess arbitrary-write privileges and schema authorship is admin-gated. This decision will only be revisited if schema authorship is extended beyond admins.",
+      "lexical": 0.077,
+      "covered": false,
+      "reason": "distiller documents migrationReRun authz but not the admin field-authz bypass"
+    },
+    {
+      "key": "19f63fd13629",
+      "session": "f79e823d-0fcc-4adf-80d9-b4f135ead2d3",
+      "file": "/home/exedev/repos/spor-server/.claude/worktrees/task-spor-server-migration-rerun-docs/SERVER.md",
+      "fact": "To resolve issue-spor-server-write-authz-lazy-migration-403, the second-pass authorization check in server/store-persist.ts ignores changes to schema_version bookkeeping stamps during lazy migrations so that non-admin edits on schema-stale nodes are not incorrectly blocked with a 403 error.",
+      "lexical": 0.091,
+      "covered": true,
+      "reason": "distiller records MIGRATION_STAMP_KEYS exclusion from write checks"
+    }
+  ]
+}
