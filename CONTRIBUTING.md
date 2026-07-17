@@ -23,10 +23,11 @@ appreciated but not required.
 These are hard constraints in this repo — a change that breaks them won't be
 merged:
 
-- **Zero dependencies.** Everything here is plain Node — node builtins and the
-  `git` binary only, no `npm install`. The plugin must run anywhere Claude Code
-  runs, natively on Windows, macOS, and Linux. New runtime dependencies are not
-  accepted.
+- **Zero dependencies.** The published package (see `package.json` `files`) is
+  plain Node — node builtins and the `git` binary only, no `npm install`. The
+  plugin must run anywhere Claude Code runs, natively on Windows, macOS, and
+  Linux. New runtime dependencies are not accepted there. (`.claude/` operator
+  tooling — outside the package — is exempt; see CLAUDE.md.)
 - **No model calls on the prompt path.** The per-prompt hook has a tight time
   budget and must stay select-and-inject (tf-idf + graph walk). LLM work
   belongs in the async end-of-session distiller or in in-session skills.

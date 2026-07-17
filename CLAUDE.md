@@ -24,11 +24,17 @@ client-facing contract is this repo's API.md.
   the skills that encode it in the same change — and only with a CalVer
   `schema_version` bump plus upgrade chain if the change isn't
   backward-readable.
-- **Zero dependencies.** Everything in this repo — `lib/`, the hook engines
-  (`scripts/engines/` + `bin/spor-hook.js`), skills, adapters — is plain
-  Node (no npm install, node builtins + the git binary only). Keep it that
-  way — the plugin must run anywhere Claude Code runs, natively on Windows,
-  macOS, and Linux. Dependencies live only in the private server repo.
+- **Zero dependencies.** The PUBLISHED surface — `lib/`, the hook engines
+  (`scripts/engines/` + `bin/spor-hook.js`), shipped `skills/`, and `adapters/`
+  — is plain Node (no npm install, node builtins + the git binary only). Keep
+  it that way — the plugin must run anywhere Claude Code runs, natively on
+  Windows, macOS, and Linux. Dependencies live only in the private server
+  repo. This rule is scoped to the published tree (see `package.json`
+  `files`); `.claude/` is local-operator tooling (this repo's own dogfooded
+  skills/config, never part of the npm package) and is exempt — bash+jq there
+  is fine as long as each script says so (see
+  `.claude/skills/spor-orchestrator/scripts/`,
+  dec-spor-orchestrator-scripts-scoped-zero-dep-exemption).
 - **No LLM calls on the prompt path.** `UserPromptSubmit` has a 30s budget;
   `scripts/engines/prompt-context.js` must stay select+inject (tf-idf +
   graph walk only). LLM work belongs in the async `SessionEnd` distiller or

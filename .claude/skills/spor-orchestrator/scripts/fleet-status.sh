@@ -1,6 +1,10 @@
 #!/bin/bash
 # fleet-status.sh [<node-id> ...] — one-shot triangulated fleet view.
 #
+# Local-operator tooling: lives under .claude/, outside the published npm
+# package, so it is exempt from the repo's zero-dep plain-Node rule
+# (CLAUDE.md "Hard rules" — Zero dependencies) and may use bash+jq.
+#
 # For each node (default: every currently-listed agent whose name looks like a
 # node id), joins the three signals the supervisor loop cares about:
 #   session   — `claude agents --json` status (bare array; status, not state)

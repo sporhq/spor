@@ -1,6 +1,10 @@
 #!/bin/bash
 # watch-fleet.sh <node-id> [<node-id> ...] — block until any tracked agent finishes.
 #
+# Local-operator tooling: lives under .claude/, outside the published npm
+# package, so it is exempt from the repo's zero-dep plain-Node rule
+# (CLAUDE.md "Hard rules" — Zero dependencies) and may use bash+jq.
+#
 # Exits 0 printing "AGENT_DONE <node> status=<s>" the moment any named agent's
 # status leaves working/busy/starting, or "NODE_RESOLVED <node>" if the node
 # resolved on the graph even while the session lingers (trust the graph over

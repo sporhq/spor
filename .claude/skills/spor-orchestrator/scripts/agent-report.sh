@@ -2,6 +2,10 @@
 # agent-report.sh <session-id> [--findings] — print a dispatched agent's final
 # report without the TUI noise.
 #
+# Local-operator tooling: lives under .claude/, outside the published npm
+# package, so it is exempt from the repo's zero-dep plain-Node rule
+# (CLAUDE.md "Hard rules" — Zero dependencies) and may use bash+jq.
+#
 # `claude logs <id>` replays raw terminal frames (escape codes, spinners) —
 # unreadable and huge. The clean source is the session transcript JSONL under
 # ~/.claude/projects/<munged-cwd>/<session-id>.jsonl: this prints the LAST
