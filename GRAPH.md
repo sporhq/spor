@@ -106,7 +106,7 @@ Rules:
 | task       | `task-`   | active or planned work (status `open`/`active`/`done`/`abandoned`, gated; `done` requires a `decision`/`artifact` resolver — see below) |
 | issue      | `issue-`  | a defect/finding and its resolution lineage (queueable: open issues join the decision queue; status `open`/`active`/`resolved`, gated; `resolved` requires a `decision`/`artifact` resolver — see below) |
 | incident   | `inc-`    | something that went wrong in operation (queueable: live incidents join the decision queue) |
-| artifact   | `spec-`, `art-` | a document, spec, module, or build product worth referencing; when it represents a change it may carry an optional delivery-stage status `in-review`/`approved`/`merged`/`released` — see below |
+| artifact   | `spec-`, `art-` | a document, spec, module, or build product worth referencing; status `in-review`/`approved`/`merged`/`released` (the delivery stages, when it represents a change) or `done`/`active` (a finished/living doc), gated at the `validate()` door; or none, a plain reference doc — see below |
 | norm       | `norm-`   | a standing convention or constraint (rides along in every project-relevant compile) |
 | briefing   | `brief-`  | a compiled briefing (output of this system; never traversed) |
 | correction | `corr-`   | standing fix to a briefing: pin/exclude/guidance (never traversed) |
@@ -162,6 +162,12 @@ a change still in review has not delivered. So:
 - An `artifact` representing a change may carry a delivery-stage status:
   `in-review`/`approved` are **non-resolving** (they keep the resolved target
   live); `merged`/`released`, and any other/empty status, are **resolving**.
+  The full artifact vocabulary is those four stages plus `done` (a finished
+  doc/spec/build product that is not a change) and `active` (a living/current
+  doc), or none — enforced at the schema's `validate()` door on create and
+  update (issue-spor-off-vocab-artifact-statuses). There is no `transitions()`
+  on this type: the stages are not a state machine (a change may be born
+  `merged`), so only membership is gated, never order.
   Plus flat scalar metadata the regex frontmatter parser already supports —
   `delivery_ref` (PR url/commit/tag), `delivery_source` (e.g. `github`),
   `size`, `labels`, `paths` (comma-scalars). The shape is source-blind, so a

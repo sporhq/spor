@@ -25,7 +25,7 @@ the decision queue (QUEUE.md §4).
 | task | `task-` | active or planned work | status `open`/`active`/`done`/`abandoned`; queueable; `done` needs a resolving `decision`/`artifact` (see SKILL routing → /spor:next) |
 | issue | `issue-` | a defect and its resolution lineage | status `open`/`active`/`resolved`; queueable; `resolved` needs a resolving `decision`/`artifact` (see SKILL routing → /spor:next) |
 | incident | `inc-` | something that went wrong in operation | queueable |
-| artifact | `art-`, `spec-` | a document, spec, module, or build product | optional delivery status `in-review`/`approved`/`merged`/`released` |
+| artifact | `art-`, `spec-` | a document, spec, module, or build product | optional status: delivery stages `in-review`/`approved`/`merged`/`released` (when it is a change), or `done`/`active` (a finished/living doc) — gated on membership, not order |
 | norm | `norm-` | a standing convention or constraint | `always_on: true` — rides along in every project-relevant compile (capped to the topically relevant subset); narrow it to specific repos with `applies_to_tags:`/`applies_to_repos:`/`applies_to_projects:`; `couples_when:`/`couples_also:` file globs make it a coupling norm (edit-time "changed X, don't forget Y" nudge — see below) |
 | briefing | `brief-` | a compiled briefing (output of the system) | `traversable: false` (never walked) and `capturable: false` |
 | correction | `corr-` | a standing fix to a briefing (pin/exclude/guidance) | `traversable: false`; status `active`/`applied` (default active — fires at every in-scope compile until a recompile absorbs it and retires it to `applied`) |

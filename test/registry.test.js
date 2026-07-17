@@ -1299,6 +1299,22 @@ test("seed pack: core type schemas gate status to their vocabulary", () => {
     // create path always allowed by transitions() (status-less first write).
     assert.equal(sb.call("transitions", [undefined, { id: `${type}-x` }, RESOLVED_VIEW], SLACK).allow, true);
   }
+
+  // artifact is gated at the door ONLY (issue-spor-off-vocab-artifact-statuses):
+  // no transitions(), because the delivery stages are not a state machine — a
+  // change may be born `merged`. Its vocabulary is the four stages plus the two
+  // non-delivery lifecycle values (`done` finished, `active` living).
+  const art = sandboxFor(reg.nodeSchemas.get("artifact"));
+  assert.deepEqual(art.names, ["validate"], "artifact exports validate() only");
+  const artDoor = (status) => art.call("validate", [{ id: "art-x", status }], SLACK);
+  for (const s of ["in-review", "approved", "merged", "released", "done", "active", ""]) {
+    assert.deepEqual(artDoor(s), [], `artifact: '${s}' should pass validate()`);
+  }
+  for (const s of ["complete", "shipped", "landed", "resolved", "open"]) {
+    const v = artDoor(s);
+    assert.equal(v.length, 1, `artifact: off-vocab '${s}' should be rejected by validate()`);
+    assert.match(v[0], new RegExp(s), "artifact: the reason names the rejected value");
+  }
 });
 
 test("seed pack: task done / issue resolved require a decision or artifact resolver", () => {
