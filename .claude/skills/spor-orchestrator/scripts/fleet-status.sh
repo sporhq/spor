@@ -16,12 +16,17 @@
 # one dispatched with agent-prompt.md/infra-agent-prompt.md, whose own
 # contract is to resolve its node before it exits. A Codex-harness
 # implementer (assets/codex-agent-prompt.md) is explicitly forbidden from
-# resolving its own node — the orchestrator resolves it after reading a
-# MERGE-READY report, BEFORE re-checking here (see SKILL.md "The Codex
-# implementer"). Don't feed this script a Codex node id and trust RECOVER at
-# face value: Codex runs via the `codex` CLI, not `claude --bg`, so it never
-# appears in `claude agents --json` at all — "session gone" is the only
-# verdict this script can ever produce for one, resolved or not.
+# resolving its own node, and it runs via the `codex` CLI (not `claude --bg`)
+# so it never appears in `claude agents --json` at all — its session lookup
+# always comes back empty, which this script's case logic treats the same as
+# "idle"/"gone". Concretely: while the node is still unresolved, that makes
+# every check RECOVER regardless of whether the codex process is still
+# running or already finished — the script cannot tell those apart for a
+# Codex node, so don't trust a RECOVER verdict on one. Once the orchestrator
+# has resolved the node (after reading a MERGE-READY report — see SKILL.md
+# "The Codex implementer" — do that BEFORE re-checking here), this script
+# again reports correctly: `gs=resolved` short-circuits to FINISHED
+# regardless of the (still-empty) session lookup.
 set -u
 out=$(claude agents --json 2>/dev/null)
 if [ $# -ge 1 ]; then NODES=("$@"); else

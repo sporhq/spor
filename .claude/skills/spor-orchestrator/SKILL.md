@@ -124,9 +124,11 @@ low-blast-radius dev VM, not a general workstation:
 
 ```
 CONCURRENCY = min(5, user's choice)
-running = {}          # node_id -> { agent_name, branch, worktree_path, kind }
-                       #   kind: 'claude' (self-resolves) | 'codex' (orchestrator
-                       #   resolves, see "The Codex implementer") | 'infra'
+running = {}          # node_id -> { agent_name, branch, worktree_path, kind, ... }
+                       #   kind: 'claude' (self-resolves — both code and infra
+                       #   dispatches; infra is discriminated separately below by
+                       #   node.repo) | 'codex' (orchestrator resolves, see "The
+                       #   Codex implementer" — also record report_path there)
 done, escalated = [], []
 
 loop:
@@ -149,7 +151,12 @@ loop:
   wait_for_change()                       # see Waiting — don't spin
   for node in running whose agent is no longer active:
       if running[node].kind == 'codex' and not resolved_on_graph(node):
-          report = read_final_report(node)      # agent-report.sh <session-or-job>
+          report = read(running[node].report_path)   # NOT agent-report.sh — that
+                                                       #   only reads claude session
+                                                       #   transcripts; a codex process
+                                                       #   never writes one. Read the
+                                                       #   log file you redirected its
+                                                       #   output to at launch instead.
           if report says MERGE-READY:
               resolve_on_graph(node)             # orchestrator writes the resolver
                                                   #   node + resolves edge + terminal
@@ -392,25 +399,31 @@ enters).
 
 Two things close the gap:
 
-1. **Track which nodes are Codex-dispatched.** Record `kind: 'codex'`
-   alongside the node in `running` at dispatch time (see Dispatch, above).
-   That's what tells the supervisor loop this node's absence from `claude
-   agents --json` — and its unresolved status — means nothing on their own;
-   watch the Codex process/job you spawned for it directly instead of
-   feeding its id to `fleet-status.sh`/`watch-fleet.sh`.
+1. **Track which nodes are Codex-dispatched, and capture their output when
+   you launch them.** Record `kind: 'codex'` alongside the node in `running`
+   at dispatch time (see Dispatch, above). A Codex process isn't a `claude
+   --bg` agent — `agent-report.sh` reads Claude session transcripts under
+   `~/.claude/projects/`, which a `codex` CLI process never writes — so
+   there's no equivalent "give me the final report by id" tool for it. Redirect
+   its output to a log file when you launch it and record that path as
+   `running[node].report_path`; that's what tells the supervisor loop both
+   that this node's absence from `claude agents --json` means nothing on its
+   own, and where to actually find its report once it exits. Watch the
+   process itself finishing (it's a job you started directly), not
+   `fleet-status.sh`/`watch-fleet.sh` — see the Waiting section's scope note.
 2. **Resolve before you status-check.** When a tracked Codex process exits,
-   read its final report — same shape as a Claude agent's: ends with
-   `MERGE-READY` or `BLOCKED` and why, plus a `## FINDINGS FOR THE
-   ORCHESTRATOR` block. On `MERGE-READY`: **you** write the resolver node (a
-   `decision` or short `artifact` carrying a `resolves` edge) and flip the
-   node to its terminal status yourself — *before* running `fleet-status.sh`
-   or trusting `watch-fleet.sh` again for that node. Do the resolve first and
-   the very next status check sees a resolved node like any other finished
-   item, falling straight through to the normal gate-and-merge path — no
-   special-casing needed downstream of the resolve. On `BLOCKED`, or if the
-   process died without a final report, that's a genuine non-completion —
-   route it through Recover (above) like any other unresolved node, not this
-   exception.
+   read its final report from `running[node].report_path` — same shape as a
+   Claude agent's: ends with `MERGE-READY` or `BLOCKED` and why, plus a `##
+   FINDINGS FOR THE ORCHESTRATOR` block. On `MERGE-READY`: **you** write the
+   resolver node (a `decision` or short `artifact` carrying a `resolves`
+   edge) and flip the node to its terminal status yourself — *before*
+   running `fleet-status.sh` or trusting `watch-fleet.sh` again for that
+   node. Do the resolve first and the very next status check sees a resolved
+   node like any other finished item, falling straight through to the normal
+   gate-and-merge path — no special-casing needed downstream of the resolve.
+   On `BLOCKED`, or if the process died without a final report, that's a
+   genuine non-completion — route it through Recover (above) like any other
+   unresolved node, not this exception.
 
 Never resolve a Codex node preemptively — because it's been running a while,
 or because it isn't in `claude agents --json`, or any signal short of a
@@ -473,8 +486,11 @@ Both implementer prompts (`agent-prompt.md`, `codex-agent-prompt.md`) end with a
 Agents do NOT write these to the graph (so the graph isn't flooded with
 uncurated, duplicated defer nodes, and so Codex — which can't write the graph at
 all — can still surface them). **You curate them.** Pull the block with
-`scripts/agent-report.sh <session-id> --findings`. When you read an agent's
-final report (at merge/recover time), triage its FINDINGS: drop dupes/noise,
+`scripts/agent-report.sh <session-id> --findings` for a Claude agent; for a
+Codex node, read `running[node].report_path` directly instead —
+`agent-report.sh` only resolves Claude session transcripts, it has no id to
+look up a Codex process by. When you read an agent's final report (at
+merge/recover time), triage its FINDINGS: drop dupes/noise,
 then `put_node` each keeper as the right type (`issue` for a bug/hazard, `task`
 for a refactor/improvement) linked `relates-to`/`derived-from` the node it came
 from. A "better-approach" finding usually becomes a `task`; a real latent bug an
