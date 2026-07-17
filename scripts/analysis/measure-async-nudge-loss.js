@@ -9,33 +9,37 @@
 // journal/pending-nudges/<session>/*.out.json spools left behind at session end.
 // That method has no denominator: nudge.async is opt-in and DEFAULT OFF
 // (dec-cc-async-classifier-opt-in-default-off), so no graph has ever spooled a
-// result to count. Waiting for spools to accrue would gate the fork on first
+// result to count — zero sessions on this box carry even a phase-1 `pending`
+// reservation. Waiting for spools to accrue would gate the fork on first
 // enabling the mode the fork is about.
 //
 // The loss condition is structural, though, and it is fully observable in the
 // SHIPPED SYNCHRONOUS history. Under async a finding is lost iff its classifier
 // result becomes available with no subsequent UserPromptSubmit in that session
-// to drain it — drainPendingNudges() runs only at prompt time, keyed by session
-// (scripts/engines/prompt-context.js). Both modes run the SAME classifier
-// (classifyForNudge) behind the SAME eligibility gates; async only moves the
-// call off the tool loop. So replaying the recorded verdicts against real
-// session prompt timelines answers exactly what async would have lost.
+// to drain it — drainPendingNudges() runs only at prompt time, keyed by session,
+// and is NOT behind the digest's trivial-prompt gate (prompt-context.js:498-503),
+// so ANY prompt submission drains. Both modes run the same classifier
+// (classifyForNudge) behind the same eligibility gates, so replaying the
+// recorded verdicts against real session prompt timelines answers what async
+// would have lost.
 //
 // The two inputs are read-only:
 //   <graph home>/journal/llm-calls/*.jsonl  every classifier call — session, ts,
 //       file, response. source=nudge is the capture classifier; source=distill*
 //       is the SessionEnd distiller, i.e. the backstop this issue leans on.
 //   <transcripts>/*/<session>.jsonl         Claude Code transcripts: the prompt
-//       timeline oracle. A genuine UserPromptSubmit is a `type: user` entry that
-//       is NOT a tool_result echo (those dominate the file ~40:1) and NOT
-//       injected meta (skill loads, command expansions). See isPromptEntry().
+//       timeline oracle. See isPromptEntry() for what counts and why.
 //
-// Verdicts are parsed with the REAL production parser (parseFactList, imported
-// from the engine) so the measurement tracks shipped behavior instead of a
-// re-implementation that could drift from it.
+// KNOWN FLOOR (do not quote the counts as totals). The synchronous path stops
+// classifying after 3 FIRED nudges in a session (post-tool.js:135-138: sync
+// counts fired findings immediately, async approximates via injected+spooled).
+// The 4th+ prose write of a session was therefore never classified and cannot
+// appear here — and a session-final burst of doc writes is exactly the
+// population this measures. The absolute counts are a lower bound; the RATE is
+// over what was actually classified.
 //
 //   node scripts/analysis/measure-async-nudge-loss.js [--home <dir>]
-//        [--transcripts <dir>] [--json] [--limit-days <n>]
+//        [--transcripts <dir>] [--until <iso>] [--live-window-min <n>] [--json]
 
 const fs = require("fs");
 const path = require("path");
@@ -48,8 +52,14 @@ const { parseFactList } = require("../engines/post-tool.js");
 // lexical score below is only a lower bound — it charges a real capture as a
 // miss whenever the distiller restated the fact in its own words, which is most
 // of the time — so the headline coverage number comes from this census instead.
-// Regenerating it after the classifier corpus grows is a manual pass.
+// It also pins the corpus: its `until` is the default cutoff, so a plain re-run
+// reproduces the committed numbers even though the live journal keeps growing.
 const ADJUDICATION = path.join(__dirname, "adjudication-2026-07-17.json");
+
+// A session whose transcript went quiet less than this before the cutoff may
+// still be running, and a still-open session's finding is not lost — its next
+// prompt simply hasn't happened yet. Those are excluded, not scored.
+const DEFAULT_LIVE_WINDOW_MIN = 60;
 
 // A classifier result is only worth draining when it found ≥1 fact — the async
 // worker writes NO result file for a NOTHING verdict or a backend failure
@@ -63,27 +73,49 @@ function verdictFacts(rec) {
   return { nfacts, facts };
 }
 
+// Injected wrappers that arrive as `type: user` text but are NOT submissions:
+// the harness echoes local-command output and expands slash commands into the
+// transcript without an isMeta flag, so shape is the only thing separating them
+// from a real prompt.
+const INJECTED_WRAPPER = /^\s*<(local-command-stdout|local-command-stderr|command-name|command-message|command-args)>/;
+
 // Is this transcript entry a genuine prompt submission — i.e. would it have
 // fired UserPromptSubmit and drained the spool?
 //
 // Three populations share `type: user` and only the first is a prompt:
 //   - a real submission: `promptSource` is set (typed | sdk | system | queued |
 //     suggestion_accepted). Older transcripts predate the field, so an untagged
-//     plain-text entry counts too.
-//   - a tool_result echo fed back into the loop — never a prompt.
-//   - injected meta (skill bodies, slash-command expansions) — never a prompt.
-// Sidechain (subagent) turns are excluded: a subagent's turn is not a user
-// submission and does not fire the parent session's UserPromptSubmit.
+//     plain-text entry counts too — minus the injected wrappers above, which are
+//     354 of the 521 untagged entries in this corpus and would otherwise score
+//     as phantom drains.
+//   - a tool_result echo fed back into the loop — never a prompt, and it
+//     outnumbers real prompts ~40:1.
+//   - injected meta (skill bodies) — never a prompt.
+// Sidechain (subagent) turns are excluded: a subagent's turn does not fire the
+// parent session's UserPromptSubmit.
 //
-// `strict` narrows to human-typed prompts only — the pessimistic sensitivity
-// bound, since it treats every agent/system-driven turn as a non-drain.
+// VERIFIED against a UserPromptSubmit-only side effect, not assumed: the
+// prompt-context engine stamps journal/prompt-context-<sha256(session)>.json
+// with `at` every time it computes a digest. Across the 274 sessions carrying
+// both a stamp and a transcript, all 274 stamps land within 3s of an entry this
+// predicate accepts, and in 86 of them the ONLY coincident entry is
+// `promptSource: system` — so system-injected turns (and by the same token sdk
+// turns) do fire the hook. That is why `strict` is a sensitivity bound, not the
+// headline: it answers a different question (would a HUMAN have prompted again).
 function isPromptEntry(d, strict) {
   if (d.type !== "user" || d.isSidechain) return false;
-  const content = (d.message || {}).content;
-  if (Array.isArray(content) && content.some((b) => b && b.type === "tool_result")) return false;
+  let content = (d.message || {}).content;
+  if (Array.isArray(content)) {
+    if (content.some((b) => b && b.type === "tool_result")) return false;
+    content = content
+      .filter((b) => b && b.type === "text")
+      .map((b) => b.text || "")
+      .join("");
+  }
+  if (typeof content !== "string" || content === "") return false;
   if (strict) return d.promptSource === "typed";
   if (d.promptSource) return true;
-  return !d.isMeta && content != null;
+  return !d.isMeta && !INJECTED_WRAPPER.test(content);
 }
 
 // session id -> transcript path, across every project dir.
@@ -105,8 +137,8 @@ function indexTranscripts(root) {
     }
     for (const f of files) {
       if (!f.endsWith(".jsonl")) continue;
-      // A session can be resumed into a second project dir; keep the largest
-      // copy so the prompt timeline is the most complete one available.
+      // A session resumed into a second project dir appears twice; keep the
+      // largest copy so the prompt timeline is the most complete one available.
       const fp = path.join(dp, f);
       const id = f.slice(0, -6);
       const prev = index.get(id);
@@ -121,17 +153,19 @@ function indexTranscripts(root) {
   return index;
 }
 
-// Prompt-submission epochs for one session, ascending. Returns null when the
-// transcript is gone (rotated/deleted) — an unknown timeline must never be
+// One session's timeline: prompt-submission epochs (ascending) and the last
+// entry of ANY kind, which is how we tell an ended session from a live one.
+// Returns null when the transcript is gone — an unknown timeline must never be
 // scored as a loss.
-function promptTimeline(file, strict) {
+function sessionTimeline(file, strict) {
   let raw;
   try {
     raw = fs.readFileSync(file, "utf8");
   } catch {
     return null;
   }
-  const out = [];
+  const prompts = [];
+  let lastActivity = 0;
   for (const line of raw.split("\n")) {
     if (!line) continue;
     let d;
@@ -140,11 +174,18 @@ function promptTimeline(file, strict) {
     } catch {
       continue;
     }
-    if (!isPromptEntry(d, strict)) continue;
     const t = Date.parse(d.timestamp);
-    if (!Number.isNaN(t)) out.push(t);
+    if (!Number.isNaN(t) && t > lastActivity) lastActivity = t;
+    if (isPromptEntry(d, strict) && !Number.isNaN(t)) prompts.push(t);
   }
-  return out.sort((a, b) => a - b);
+  prompts.sort((a, b) => a - b);
+  return { prompts, lastActivity };
+}
+
+// Kept for callers that only want the prompt epochs.
+function promptTimeline(file, strict) {
+  const tl = sessionTimeline(file, strict);
+  return tl && tl.prompts;
 }
 
 function readLlmCalls(home) {
@@ -181,15 +222,19 @@ const STOP = new Set(
     .split(" ")
 );
 
-// Crude suffix stripping so `rejects`/`reject` and `placeholders`/`placeholder`
-// match. Without it the two sides of a real capture score as a miss purely on
-// inflection — observed on hand-checked pairs where the distiller plainly did
-// record the same fact in different words.
+// Crude suffix stripping so `rejects`/`reject` and `caches`/`cache` match.
+// Without it the two sides of a real capture score as a miss purely on
+// inflection, and this codebase's core vocabulary (cache, match, hash, class,
+// index) is exactly what inflects. The trailing `e` strip is what makes the
+// -es plurals meet their singular: caches -> cach <- cache.
 function stem(w) {
   return w
-    .replace(/(ies)$/, "y")
-    .replace(/(sses|shes|ches|xes)$/, "")
-    .replace(/(ing|ed|es|s)$/, "");
+    .replace(/ies$/, "y")
+    .replace(/sses$/, "ss")
+    .replace(/([sxz]|[cs]h)es$/, "$1")
+    .replace(/([^s])s$/, "$1")
+    .replace(/(ing|ed)$/, "")
+    .replace(/e$/, "");
 }
 
 // The token class keeps `.`, `/` and `-` so identifiers survive whole
@@ -210,8 +255,6 @@ function contentWords(s) {
 
 // The classifier emits a numbered list, so score each fact SEPARATELY: a finding
 // of 2 facts where the distiller caught 1 is half-captured, not a clean miss.
-// Scoring the joined block (the first cut here) charged the whole finding as
-// uncovered and understated the backstop.
 function splitFacts(facts) {
   const out = [];
   for (const line of String(facts).split("\n")) {
@@ -222,39 +265,61 @@ function splitFacts(facts) {
 }
 
 // Approximate coverage: what share of ONE lost fact's content words the
-// distiller's extraction for that session reproduces. This is lexical, so it is
-// a WEAK LOWER BOUND on real capture, not proof — two texts can state the same
-// fact with little vocabulary in common. Reported across several thresholds, and
-// always alongside the exact backstop-availability numbers, which need no such
-// inference.
-function coverage(fact, distillText) {
+// distiller's extraction for that session reproduces. Lexical, so it is a WEAK
+// LOWER BOUND on real capture, not proof — two texts can state the same fact
+// with little vocabulary in common. Reported across several thresholds, and
+// always alongside the exact backstop numbers, which need no such inference.
+function coverage(fact, distill) {
   const a = contentWords(fact);
   if (!a.size) return 0;
-  const b = contentWords(distillText);
+  const b = distill instanceof Set ? distill : contentWords(distill);
   let hit = 0;
   for (const w of a) if (b.has(w)) hit++;
   return hit / a.size;
 }
 
-const COVERED_AT = 0.6; // ≥60% of a fact's content words present in the distiller's output
+const COVERED_AT = 0.6;
 const THRESHOLDS = [0.3, 0.4, 0.5, 0.6];
 
 function factKey(session, fact) {
   return crypto.createHash("sha256").update(`${session}|${fact}`).digest("hex").slice(0, 12);
 }
 
-// key -> covered?, empty when the census is absent (the exact numbers and the
-// lexical bound still print; only the adjudicated line drops out).
+// The census is the join key for the headline coverage number, so a malformed
+// one must fail loudly: an absent file is fine (the exact numbers and the
+// lexical bound still print), but a parse error that silently returned an empty
+// map would read as "census stale, re-adjudicate 40 facts by hand".
 function loadAdjudication() {
+  let raw;
   try {
-    const doc = JSON.parse(fs.readFileSync(ADJUDICATION, "utf8"));
-    return new Map((doc.facts || []).map((f) => [f.key, !!f.covered]));
-  } catch {
-    return new Map();
+    raw = fs.readFileSync(ADJUDICATION, "utf8");
+  } catch (e) {
+    if (e.code === "ENOENT") return { verdicts: new Map(), until: null };
+    throw e;
   }
+  const doc = JSON.parse(raw); // deliberately unguarded — a typo must not read as staleness
+  return {
+    verdicts: new Map((doc.facts || []).map((f) => [f.key, !!f.covered])),
+    until: doc.until || null,
+  };
 }
 
+const FLAGS = ["--home", "--transcripts", "--until", "--live-window-min"];
+
 function main(argv) {
+  // Silently ignoring a misspelled flag is how a full-corpus number gets quoted
+  // as a windowed one.
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith("--")) continue; // a flag's value
+    if (a === "--json") continue;
+    if (FLAGS.includes(a)) {
+      i++; // skip its value
+      continue;
+    }
+    console.error(`unknown flag: ${a}\nusage: [${FLAGS.join("] [")}] [--json]`);
+    process.exit(2);
+  }
   const arg = (name, dflt) => {
     const i = argv.indexOf(name);
     return i >= 0 && argv[i + 1] ? argv[i + 1] : dflt;
@@ -262,11 +327,24 @@ function main(argv) {
   const home = arg("--home", process.env.SPOR_HOME || path.join(os.homedir(), ".spor"));
   const transcripts = arg("--transcripts", path.join(os.homedir(), ".claude", "projects"));
   const asJson = argv.includes("--json");
+  const census = loadAdjudication();
+  // Pin the corpus to the census's cutoff by default: the journal grows every
+  // session, so an unpinned run re-stales the census within hours and the
+  // headline stops being reproducible.
+  const untilRaw = arg("--until", census.until);
+  const until = untilRaw ? Date.parse(untilRaw) : Date.now();
+  if (Number.isNaN(until)) {
+    console.error(`--until: unparseable timestamp: ${untilRaw}`);
+    process.exit(2);
+  }
+  const liveWindowMs = Number(arg("--live-window-min", DEFAULT_LIVE_WINDOW_MIN)) * 60000;
 
   const recs = readLlmCalls(home);
   const nudges = recs.filter((r) => r.source === "nudge");
-  // The SessionEnd distiller is `distill` locally and `distill-remote` when the
-  // transcript is shipped to a server for ingestion; both are the same backstop.
+  // The SessionEnd distiller records `distill-remote` when it ships the
+  // transcript to a server for ingestion and `distill` when it writes nodes
+  // locally (scripts/engines/distill.js:362); this box is remote, so the corpus
+  // is all `distill-remote`. Both are the same backstop.
   const distills = recs.filter((r) => String(r.source || "").startsWith("distill"));
 
   const distillBySession = new Map();
@@ -278,32 +356,31 @@ function main(argv) {
   }
 
   const index = indexTranscripts(transcripts);
-  // The session running THIS analysis has not ended; its findings are still
-  // drainable, so scoring them as losses would be wrong.
-  const liveSession = process.env.CLAUDE_SESSION_ID || null;
-
   const timelines = new Map();
   const timelineFor = (session, strict) => {
     const key = `${session}|${strict ? 1 : 0}`;
     if (!timelines.has(key)) {
       const f = index.get(session);
-      timelines.set(key, f ? promptTimeline(f, strict) : null);
+      timelines.set(key, f ? sessionTimeline(f, strict) : null);
     }
     return timelines.get(key);
   };
 
   const stats = {
-    calls: nudges.length,
+    calls: 0,
+    afterCutoff: 0,
     errors: 0,
     nothing: 0,
-    findings: 0, // calls that found ≥1 fact (a result file would exist under async)
+    findings: 0,
     factsTotal: 0,
     scored: 0,
     lost: 0,
     lostFacts: 0,
     drained: 0,
+    noSession: 0,
     noTranscript: 0,
-    liveSkipped: 0,
+    badTs: 0,
+    stillLive: 0,
     lostStrict: 0,
     scoredStrict: 0,
     sessions: new Set(),
@@ -312,6 +389,13 @@ function main(argv) {
   const lostRecords = [];
 
   for (const r of nudges) {
+    const at = Date.parse(r.ts); // stamped AFTER the backend returns (util.js
+    // recordLlm), so this is when the worker's result file would exist.
+    if (!Number.isNaN(at) && at > until) {
+      stats.afterCutoff++;
+      continue;
+    }
+    stats.calls++;
     const v = verdictFacts(r);
     if (v === null) {
       stats.errors++;
@@ -324,65 +408,73 @@ function main(argv) {
     stats.findings++;
     stats.factsTotal += v.nfacts;
     if (!r.session) {
-      stats.noTranscript++;
+      stats.noSession++;
       continue;
     }
     stats.sessions.add(r.session);
-    if (liveSession && r.session === liveSession) {
-      stats.liveSkipped++;
+    if (Number.isNaN(at)) {
+      stats.badTs++;
       continue;
     }
     const tl = timelineFor(r.session, false);
     if (tl === null) {
-      // No transcript => the timeline is unknowable. Counted separately and
-      // excluded from the rate rather than guessed either way.
       stats.noTranscript++;
       continue;
     }
-    const at = Date.parse(r.ts); // recorded AFTER the backend returns, so this is
-    // when the worker's result file would exist — the earliest drainable moment.
-    if (Number.isNaN(at)) {
-      stats.noTranscript++;
+    // A session still active near the cutoff has not ended: its spooled result
+    // would drain at its next prompt, which simply hasn't happened yet. Scoring
+    // it as a permanent loss inflates the rate.
+    if (tl.lastActivity > until - liveWindowMs) {
+      stats.stillLive++;
       continue;
     }
     stats.scored++;
-    const drained = tl.some((t) => t > at);
+    // Only prompts at or before the cutoff count, so the answer is stable as the
+    // transcripts keep growing.
+    const drained = tl.prompts.some((t) => t > at && t <= until);
     if (drained) stats.drained++;
     else {
       stats.lost++;
       stats.lostFacts += v.nfacts;
       stats.lostSessions.add(r.session);
-      lostRecords.push({ session: r.session, ts: r.ts, project: r.project, file: (r.vars || {}).FILE, facts: v.facts, nfacts: v.nfacts });
+      lostRecords.push({
+        session: r.session,
+        ts: r.ts,
+        project: r.project,
+        file: (r.vars || {}).FILE,
+        facts: v.facts,
+        nfacts: v.nfacts,
+      });
     }
 
     const tls = timelineFor(r.session, true);
     if (tls !== null) {
       stats.scoredStrict++;
-      if (!tls.some((t) => t > at)) stats.lostStrict++;
+      if (!tls.prompts.some((t) => t > at && t <= until)) stats.lostStrict++;
     }
   }
 
   // Backstop: for each lost finding, did the SessionEnd distiller run for that
   // session, did it extract anything, and does what it extracted look like the
   // same fact? The first two are exact; the third is the lexical lower bound.
-  let backstopRan = 0;
-  let backstopFacts = 0;
+  let backstopRanFindings = 0;
+  let backstopProductiveFindings = 0;
   const coverageSamples = [];
   const coveredAt = Object.fromEntries(THRESHOLDS.map((t) => [t, 0]));
-  let lostFactsScored = 0; // individual facts whose session had a productive distill
+  let lostFactsScored = 0;
   for (const L of lostRecords) {
     const ds = distillBySession.get(L.session) || [];
     if (!ds.length) continue;
-    backstopRan++;
-    const text = ds.map((d) => String(d.response ?? "")).join("\n");
+    backstopRanFindings++;
     const productive = ds.some(
       (d) => !d.error && !String(d.response ?? "").includes("NOTHING") && String(d.response ?? "").trim()
     );
     if (!productive) continue;
-    backstopFacts++;
+    backstopProductiveFindings++;
+    const distillWords = contentWords(ds.map((d) => String(d.response ?? "")).join("\n"));
     for (const fact of splitFacts(L.facts)) {
       lostFactsScored++;
-      const c = coverage(fact, text);
+      const c = coverage(fact, distillWords);
       coverageSamples.push({
         key: factKey(L.session, fact),
         session: L.session,
@@ -393,22 +485,20 @@ function main(argv) {
       for (const t of THRESHOLDS) if (c >= t) coveredAt[t]++;
     }
   }
-  const covered = coveredAt[COVERED_AT];
 
   // Join the census. Facts with no adjudication are reported, not assumed
   // either way — a stale census must never silently shrink the loss.
-  const verdicts = loadAdjudication();
   let adjCovered = 0;
   let adjLost = 0;
   let adjMissing = 0;
   for (const s of coverageSamples) {
-    const v = verdicts.get(s.key);
+    const v = census.verdicts.get(s.key);
     if (v === undefined) adjMissing++;
     else if (v) adjCovered++;
     else adjLost++;
   }
-  // Facts the distiller never had a chance at: its session produced no
-  // extraction at all, so nothing could have covered them.
+  // Facts whose session produced no distiller extraction at all: nothing could
+  // have covered them.
   const noBackstopFacts = stats.lostFacts - lostFactsScored;
   const durablyLost = adjMissing ? null : adjLost + noBackstopFacts;
 
@@ -416,7 +506,10 @@ function main(argv) {
   const out = {
     home,
     transcripts,
+    until: new Date(until).toISOString(),
+    liveWindowMin: liveWindowMs / 60000,
     calls: stats.calls,
+    afterCutoff: stats.afterCutoff,
     errors: stats.errors,
     nothing: stats.nothing,
     findings: stats.findings,
@@ -429,16 +522,21 @@ function main(argv) {
     lossRateStrict: stats.scoredStrict ? stats.lostStrict / stats.scoredStrict : null,
     scoredStrict: stats.scoredStrict,
     lostStrict: stats.lostStrict,
-    noTranscript: stats.noTranscript,
-    liveSkipped: stats.liveSkipped,
+    excluded: {
+      noSession: stats.noSession,
+      noTranscript: stats.noTranscript,
+      badTs: stats.badTs,
+      stillLive: stats.stillLive,
+    },
     sessionsWithFindings: stats.sessions.size,
     sessionsWithLoss: stats.lostSessions.size,
-    backstopRan,
-    backstopFacts,
-    backstopCovered: covered,
-    coverageThreshold: COVERED_AT,
+    backstopRanFindings,
+    backstopProductiveFindings,
     lostFactsScored,
     coveredAt,
+    coverageThreshold: COVERED_AT,
+    adjudicated: { covered: adjCovered, missed: adjLost, unadjudicated: adjMissing },
+    durablyLost,
   };
 
   if (asJson) {
@@ -449,27 +547,35 @@ function main(argv) {
   console.log(`# Async capture-nudge session-final loss — counterfactual replay`);
   console.log(`  graph home:  ${home}`);
   console.log(`  transcripts: ${transcripts}`);
+  console.log(`  corpus:      calls at or before ${new Date(until).toISOString()}`);
+  console.log(`               (${stats.afterCutoff} later calls excluded; sessions active within`);
+  console.log(`               ${liveWindowMs / 60000} min of the cutoff are treated as unfinished)`);
   console.log();
   console.log(`## Classifier calls (source=nudge)`);
-  console.log(`  total calls .................. ${stats.calls}`);
+  console.log(`  calls in corpus .............. ${stats.calls}`);
   console.log(`  backend errors (no result) ... ${stats.errors}`);
   console.log(`  NOTHING verdicts (no result) . ${stats.nothing}`);
   console.log(`  FINDINGS (≥1 fact) ........... ${stats.findings}   [${stats.factsTotal} facts, ${stats.sessions.size} sessions]`);
   console.log();
   console.log(`## Would the async drain have injected it?`);
-  console.log(`  scored (transcript found) .... ${stats.scored}`);
+  console.log(`  scored (ended session) ....... ${stats.scored}`);
   console.log(`  drained (a later prompt) ..... ${stats.drained}  ${pct(stats.drained, stats.scored)}`);
   console.log(`  LOST (no later prompt) ....... ${stats.lost}  ${pct(stats.lost, stats.scored)}   [${stats.lostFacts} facts, ${stats.lostSessions.size} sessions]`);
-  console.log(`  unknown (no transcript) ...... ${stats.noTranscript}  (excluded from the rate)`);
-  console.log(`  live session skipped ......... ${stats.liveSkipped}`);
   console.log();
-  console.log(`  sensitivity — human-typed prompts only (pessimistic bound):`);
+  console.log(`  excluded from the rate:`);
+  console.log(`    session still active at cutoff .. ${stats.stillLive}  (not ended — would still drain)`);
+  console.log(`    transcript missing .............. ${stats.noTranscript}`);
+  console.log(`    journal row without a session ... ${stats.noSession}`);
+  console.log(`    journal row with a bad ts ....... ${stats.badTs}`);
+  console.log();
+  console.log(`  sensitivity — human-typed prompts only (a different question:`);
+  console.log(`  would a HUMAN have prompted again; system/sdk turns verified to fire the hook):`);
   console.log(`    scored ${stats.scoredStrict}, lost ${stats.lostStrict}  ${pct(stats.lostStrict, stats.scoredStrict)}`);
   console.log();
   console.log(`## Does the SessionEnd distiller back it up?`);
   console.log(`  lost findings ................ ${stats.lost}   [${stats.lostFacts} facts]`);
-  console.log(`  distiller ran for session .... ${backstopRan}  ${pct(backstopRan, stats.lost)}`);
-  console.log(`  distiller extracted facts .... ${backstopFacts}  ${pct(backstopFacts, stats.lost)}`);
+  console.log(`  ...whose session ran it ...... ${backstopRanFindings}  ${pct(backstopRanFindings, stats.lost)}  (findings)`);
+  console.log(`  ...and it extracted facts .... ${backstopProductiveFindings}  ${pct(backstopProductiveFindings, stats.lost)}  (findings)`);
   console.log();
   console.log(`  per-fact lexical overlap vs that session's distiller output`);
   console.log(`  (${lostFactsScored} facts from sessions where the distiller DID extract something;`);
@@ -494,8 +600,20 @@ function main(argv) {
   if (durablyLost !== null) {
     console.log(`  DURABLY LOST ................. ${durablyLost}  ${pct(durablyLost, stats.lostFacts)} of lost facts`);
   }
+  console.log();
+  console.log(`  NOTE: a floor, not a total — the sync path stops classifying after 3 fired`);
+  console.log(`  nudges/session, so a session-final 4th+ prose write was never classified.`);
 }
 
 if (require.main === module) main(process.argv.slice(2));
 
-module.exports = { verdictFacts, isPromptEntry, coverage, promptTimeline, splitFacts, stem };
+module.exports = {
+  verdictFacts,
+  isPromptEntry,
+  coverage,
+  contentWords,
+  promptTimeline,
+  sessionTimeline,
+  splitFacts,
+  stem,
+};

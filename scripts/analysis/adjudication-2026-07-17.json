@@ -1,5 +1,7 @@
 {
-  "note": "Hand adjudication of every lost fact whose session produced a distiller extraction. See measure-async-nudge-loss.js.",
+  "note": "Hand adjudication of every lost fact against its own session's SessionEnd distiller extraction: did the distiller capture the same fact? The lexical `cov` score is only a corroborating lower bound — it charges a real capture as a miss whenever the distiller restated the fact in its own words — so `covered` here is the number to quote. Keyed by sha256(session|fact). See measure-async-nudge-loss.js.",
+  "until": "2026-07-17T00:00:00Z",
+  "until_note": "Corpus cutoff this census was adjudicated against; the script defaults to it so a plain re-run reproduces the committed numbers as the live journal grows. Entries outside the current window are retained and simply go unused.",
   "date": "2026-07-17",
   "adjudicator": "delegated agent (task-spor-measure-async-nudge-session-final-loss)",
   "covered": 26,
