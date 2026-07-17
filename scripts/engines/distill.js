@@ -15,7 +15,7 @@ const { spawnSync } = require("child_process");
 const u = require("./util");
 const { drainOutbox } = require("./drain-outbox");
 const { inferCommits } = require("./infer-commits");
-const resolutionLib = require(path.join(u.ROOT, "lib", "kernel", "resolution.js"));
+const graphLib = require(path.join(u.ROOT, "lib", "graph.js"));
 
 // The nested-repo guard (graph home === code repo) now lives in util so the
 // `spor init` path can share it (task-spor-onboard-cli-init-git-identity).
@@ -195,11 +195,18 @@ async function sessionEndLease({ graph, slug, session, cwd, remote }) {
     // the `resolution` read-time enrichment (a live inbound resolves/answers
     // edge) means the task is done even while its status field still reads
     // open, so either signal counts as finished. The type rides along for the
-    // type-aware signature (dec-spor-status-inert-third-partition), but note
-    // this caller has NO graph, so only the type-blind fallback vocabulary
-    // applies — a per-type inert status (artifact `released`) is not visible
-    // here; the server-side lease/queue reads are the type-aware authority.
-    const finished = Boolean(parsed.resolution) || resolutionLib.isTerminalStatus(status, type || null);
+    // type-aware signature (dec-spor-status-inert-third-partition). Same
+    // tiered inert decision as bin/spor.js's dispatchResolutionReason
+    // (issue-spor-type-blind-terminal-status-fallbacks, isNodeInertOffline):
+    // a server-computed `inert` enrichment key when this server sends one is
+    // trusted outright, BOTH values — it already saw the full type-aware
+    // partition, including graph-resident overrides, that this caller can't,
+    // so an authoritative `false` must not be second-guessed by the offline
+    // check below any more than a `true` should be; else the offline
+    // seed-registry check, which is still type-aware (an artifact `released`
+    // IS visible here) but blind to graph-resident extensions — the
+    // server-side lease/queue reads remain the type-aware authority for those.
+    const finished = Boolean(parsed.resolution) || graphLib.isNodeInertOffline(parsed.inert, status, type || null);
     const action = finished ? "release" : "reserve";
     const body = action === "reserve" ? JSON.stringify({ session }) : "{}";
     const post = await u

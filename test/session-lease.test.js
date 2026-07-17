@@ -196,6 +196,97 @@ test('status still open but retired by a live resolves edge -> /release (status 
   }
 });
 
+// issue-spor-type-blind-terminal-status-fallbacks: `released` is terminal for
+// an ARTIFACT only (schema-artifact's own status.terminal/inert partition,
+// not the type-blind TERMINAL_FALLBACK) — a graph-less caller that ignored
+// type used to miss this and leave the lease held. sessionEndLease reads
+// `parsed.frontmatter.type` off the server response, so the offline
+// seed-registry fallback sees it without ever loading a graph.
+test('offline path: artifact status "released" is detected terminal via the seed-registry fallback', async () => {
+  const { home, cwd } = scratch();
+  seedHeartbeat(home, 's1', ['art-shipped']);
+  const { srv, hits, base } = await stubServer((id) =>
+    id === 'art-shipped'
+      ? { raw: 'id: art-shipped\ntype: artifact\nstatus: released\n---\nbody', frontmatter: { type: 'artifact' } }
+      : null
+  );
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    await runAsync(['distill', '--host', 'claude-code'], sessionEndPayload(cwd), env);
+    const release = hits.find((h) => h.method === 'POST' && h.url === '/v1/nodes/art-shipped/release');
+    assert.ok(release, `released artifact must release via the offline fallback; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`);
+  } finally {
+    srv.close();
+  }
+});
+
+// The same "released" status on a NON-artifact type must stay OUT of the
+// type-blind fallback (dec-spor-status-inert-third-partition) — proves the
+// fallback is genuinely type-aware, not just a bigger flat list.
+test('offline path: status "released" on a non-artifact type is NOT terminal', async () => {
+  const { home, cwd } = scratch();
+  seedHeartbeat(home, 's1', ['task-released']);
+  const { srv, hits, base } = await stubServer((id) =>
+    id === 'task-released'
+      ? { raw: 'id: task-released\ntype: task\nstatus: released\n---\nbody', frontmatter: { type: 'task' } }
+      : null
+  );
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    await runAsync(['distill', '--host', 'claude-code'], sessionEndPayload(cwd), env);
+    const reserve = hits.find((h) => h.method === 'POST' && h.url === '/v1/nodes/task-released/reserve');
+    assert.ok(reserve, `a released TASK is not terminal, so it must reserve, not release; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`);
+  } finally {
+    srv.close();
+  }
+});
+
+// The forward-compat leg: a server-computed `inert` enrichment key (once
+// shipped, issue-spor-type-blind-terminal-status-fallbacks) is trusted
+// outright — it can see graph-resident overrides this offline fallback can't,
+// so it must win even over a status/type combo the offline check wouldn't
+// call terminal on its own.
+test('remote-field path: a server-computed `inert: true` releases regardless of the offline vocabulary', async () => {
+  const { home, cwd } = scratch();
+  seedHeartbeat(home, 's1', ['art-org-terminal']);
+  const { srv, hits, base } = await stubServer((id) =>
+    id === 'art-org-terminal'
+      ? { raw: 'id: art-org-terminal\ntype: widget\nstatus: archived\n---\nbody', frontmatter: { type: 'widget' }, inert: true }
+      : null
+  );
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    await runAsync(['distill', '--host', 'claude-code'], sessionEndPayload(cwd), env);
+    const release = hits.find((h) => h.method === 'POST' && h.url === '/v1/nodes/art-org-terminal/release');
+    assert.ok(release, `inert:true must release even on an unrecognized status/type; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`);
+  } finally {
+    srv.close();
+  }
+});
+
+// An explicit server `inert: false` is just as authoritative as `true` — it
+// must win over the offline fallback, not be treated as "unknown" and
+// second-guessed by it. A released ARTIFACT is exactly the status/type combo
+// the offline check alone treats as terminal, so this pins that the server's
+// negative overrules it (the lease stays reserved, not released).
+test('remote-field path: a server-computed `inert: false` reserves even though the offline check alone would release', async () => {
+  const { home, cwd } = scratch();
+  seedHeartbeat(home, 's1', ['art-not-actually-done']);
+  const { srv, hits, base } = await stubServer((id) =>
+    id === 'art-not-actually-done'
+      ? { raw: 'id: art-not-actually-done\ntype: artifact\nstatus: released\n---\nbody', frontmatter: { type: 'artifact' }, inert: false }
+      : null
+  );
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    await runAsync(['distill', '--host', 'claude-code'], sessionEndPayload(cwd), env);
+    const reserve = hits.find((h) => h.method === 'POST' && h.url === '/v1/nodes/art-not-actually-done/reserve');
+    assert.ok(reserve, `inert:false must reserve even though the offline fallback alone would call this terminal; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`);
+  } finally {
+    srv.close();
+  }
+});
+
 test('multiple held tasks -> each gets its own reserve/release call', async () => {
   const { home, cwd } = scratch();
   seedHeartbeat(home, 's1', ['task-a']);

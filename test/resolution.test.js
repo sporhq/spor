@@ -137,3 +137,79 @@ test("isTerminalStatus: passing the graph as the second argument throws (stale-c
   const g = seedGraph();
   assert.throws(() => isTerminalStatus("done", g), TypeError);
 });
+
+// ---------- isTerminalStatusOffline (issue-spor-type-blind-terminal-status-
+// fallbacks) ----------
+//
+// The shell-layer (lib/graph.js) fix for the "graph-less and type-less
+// callers read the fallback vocabulary" limitation documented above: a
+// caller with no loaded graph (distill.js's session-lease cleanup, bin/
+// spor.js's remote dispatch pre-flight) still has the SEED registry
+// available offline, so it can see a per-type declaration like artifact
+// `released` — the exact case the plain type-blind fallback misses.
+
+test("isTerminalStatusOffline: sees a per-type SEED declaration a graph-less caller used to miss (released artifact)", () => {
+  const { isTerminalStatusOffline } = require("../lib/graph.js");
+  assert.equal(isTerminalStatusOffline("released", "artifact"), true,
+    "the seed registry alone is enough to see artifact's own status.terminal/inert partition");
+  assert.equal(isTerminalStatusOffline("released", "task"), false, "released does not leak cross-type");
+  assert.equal(isTerminalStatusOffline("released", "decision"), false);
+});
+
+test("isTerminalStatusOffline: still unions the type-blind register (byte-identical for universal words)", () => {
+  const { isTerminalStatusOffline } = require("../lib/graph.js");
+  assert.equal(isTerminalStatusOffline("done", "task"), true);
+  assert.equal(isTerminalStatusOffline("merged", "capture-pending"), true);
+  assert.equal(isTerminalStatusOffline("closed", null), true, "the legacy off-vocab fallback still applies");
+  assert.equal(isTerminalStatusOffline("settled", "decision"), false, "the pinned non-inert exception still holds");
+  assert.equal(isTerminalStatusOffline("open", "task"), false);
+});
+
+test("isTerminalStatusOffline: matches isTerminalStatus(status, type, graph) against the live seed registry", () => {
+  // Not a coincidence — isTerminalStatusOffline is exactly isTerminalStatus fed
+  // { registry: seedRegistry() }, the same fixture seedGraph() above builds by
+  // hand. Pin the equivalence so the two never silently drift apart.
+  const graphLib = require("../lib/graph.js");
+  const g = seedGraph();
+  for (const [status, type] of [["released", "artifact"], ["released", "task"], ["settled", "decision"], ["done", "task"]]) {
+    assert.equal(graphLib.isTerminalStatusOffline(status, type), isTerminalStatus(status, type, g), `${status}/${type}`);
+  }
+});
+
+// ---------- isNodeInertOffline (issue-spor-type-blind-terminal-status-
+// fallbacks) ----------
+//
+// The full tiered decision: a server-computed `inert` boolean (either value)
+// wins outright over the offline seed-registry fallback — an explicit
+// `false` is just as authoritative as `true`, since the server already
+// evaluated the full type-aware partition (including graph-resident
+// overrides) that the offline check can't see. Only when the caller has no
+// boolean at all (no server response, or an older server) does the offline
+// check run.
+
+test("isNodeInertOffline: an explicit server `true` short-circuits, regardless of status/type", () => {
+  const { isNodeInertOffline } = require("../lib/graph.js");
+  // "archived"/"widget" is not terminal by ANY offline vocabulary — proves the
+  // server verdict, not a lucky offline match, is what wins.
+  assert.equal(isNodeInertOffline(true, "archived", "widget"), true);
+});
+
+test("isNodeInertOffline: an explicit server `false` overrules an offline-terminal status/type", () => {
+  const { isNodeInertOffline } = require("../lib/graph.js");
+  // released/artifact IS terminal per the offline seed-registry check alone
+  // (pinned above) — the server's authoritative false must still win.
+  assert.equal(isNodeInertOffline(false, "released", "artifact"), false,
+    "an authoritative server false must not be second-guessed by the offline heuristic");
+});
+
+test("isNodeInertOffline: no server verdict (null/undefined) falls back to the offline check", () => {
+  const { isNodeInertOffline } = require("../lib/graph.js");
+  assert.equal(isNodeInertOffline(null, "released", "artifact"), true, "falls back and finds it terminal");
+  assert.equal(isNodeInertOffline(undefined, "released", "task"), false, "falls back and finds it live");
+});
+
+test("isNodeInertOffline: a non-boolean explicit value (defensive) is treated as no verdict", () => {
+  const { isNodeInertOffline } = require("../lib/graph.js");
+  assert.equal(isNodeInertOffline("true", "released", "artifact"), true, "falls back to the offline check, which happens to agree here");
+  assert.equal(isNodeInertOffline("true", "released", "task"), false, "falls back to the offline check, not truthy-coerced");
+});

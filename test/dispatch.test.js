@@ -1543,8 +1543,11 @@ function runAsync(args, env, cwd) {
 // (the inbound resolves/answers edge it surfaces, API.md §3). `nodeRequires`/
 // `nodeHeld` exercise the readiness guard (task-spor-dispatch-readiness-guard):
 // a `requires:` frontmatter line and/or the server's `held` get()-hook
-// enrichment (schema-task.md).
-function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nodeResolution = null, nodeRequires = null, nodeHeld = null } = {}) {
+// enrichment (schema-task.md). `nodeType`/`nodeInert` exercise the type-aware
+// resolved-task guard (issue-spor-type-blind-terminal-status-fallbacks): a
+// non-default node type for the offline seed-registry fallback, and the
+// server-computed `inert` enrichment key.
+function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nodeResolution = null, nodeRequires = null, nodeHeld = null, nodeType = "task", nodeInert = null } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = "";
@@ -1555,9 +1558,10 @@ function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nod
         const id = decodeURIComponent(req.url.split("/").pop());
         const statusLine = nodeStatus ? `\nstatus: ${nodeStatus}` : "";
         const requiresLine = nodeRequires ? `\nrequires: [${nodeRequires}]` : "";
-        const node = { raw: `---\nid: ${id}\ntype: task\nrepo: demo${statusLine}${requiresLine}\ntitle: Demo task ${id}\nsummary: A demo task.\ndate: 2026-06-01\n---\nbody\n` };
+        const node = { raw: `---\nid: ${id}\ntype: ${nodeType}\nrepo: demo${statusLine}${requiresLine}\ntitle: Demo task ${id}\nsummary: A demo task.\ndate: 2026-06-01\n---\nbody\n` };
         if (nodeResolution) node.resolution = nodeResolution;
         if (nodeHeld) node.held = nodeHeld;
+        if (typeof nodeInert === "boolean") node.inert = nodeInert;
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(node));
         return;
@@ -2139,6 +2143,86 @@ test("dispatch <node-id> (remote): a terminal-status node from the server refuse
     assert.match(r.stderr, /task-rotate is already resolved \(status: done\)/);
     assert.ok(!claimHit(hits), "no claim POST for a resolved node");
     assert.ok(!fs.existsSync(sentinel), "no launch");
+  } finally {
+    srv.close();
+  }
+});
+
+// issue-spor-type-blind-terminal-status-fallbacks: `released` is terminal
+// for an ARTIFACT only (schema-artifact's own status.terminal/inert
+// partition), not the type-blind fallback vocabulary — the remote pre-flight
+// check has no loaded graph, so it must consult the offline seed-registry
+// fallback (not just the flat cross-type list) to see this.
+test("dispatch <node-id> (remote): a released ARTIFACT refuses via the offline seed-registry fallback", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ nodeType: "artifact", nodeStatus: "released" });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 1, r.stderr);
+    assert.match(r.stderr, /task-rotate is already resolved \(status: released\)/);
+    assert.ok(!claimHit(hits), "no claim POST for a resolved node");
+    assert.ok(!fs.existsSync(sentinel), "no launch");
+  } finally {
+    srv.close();
+  }
+});
+
+// The same "released" status on a task must stay live — proves the fallback
+// is genuinely type-aware, not a bigger flat list that would now also treat
+// every released TASK as done.
+test("dispatch <node-id> (remote): a released TASK (not an artifact) is NOT guarded — dispatch proceeds", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ nodeType: "task", nodeStatus: "released" });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(claimHit(hits), "a released task is not terminal, so the normal claim flow runs");
+    assert.ok(fs.existsSync(sentinel), "and launches");
+  } finally {
+    srv.close();
+  }
+});
+
+// The forward-compat leg: a server-computed `inert: true` (once shipped,
+// issue-spor-type-blind-terminal-status-fallbacks) is trusted outright — it
+// can see graph-resident overrides the offline fallback can't, so it must
+// win even over a status/type combo the offline check wouldn't call terminal.
+test("dispatch <node-id> (remote): a server-computed `inert: true` refuses regardless of the offline vocabulary", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ nodeType: "widget", nodeStatus: "archived", nodeInert: true });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 1, r.stderr);
+    assert.match(r.stderr, /task-rotate is already resolved \(status: archived\)/);
+    assert.ok(!claimHit(hits), "no claim POST for a server-flagged inert node");
+    assert.ok(!fs.existsSync(sentinel), "no launch");
+  } finally {
+    srv.close();
+  }
+});
+
+// An explicit server `inert: false` is just as authoritative as `true` — it
+// must win over the offline fallback, not just be ignored as "unknown". A
+// released ARTIFACT is exactly the status/type combo the offline check
+// treats as terminal on its own (schema-artifact's seed status.terminal),
+// so this pins that the server's negative overrules it rather than being
+// silently outvoted by the offline heuristic.
+test("dispatch <node-id> (remote): a server-computed `inert: false` proceeds even though the offline check alone would refuse", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ nodeType: "artifact", nodeStatus: "released", nodeInert: false });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(claimHit(hits), "a server-flagged NOT-inert node runs the normal claim flow");
+    assert.ok(fs.existsSync(sentinel), "and launches");
   } finally {
     srv.close();
   }

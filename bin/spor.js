@@ -6407,15 +6407,21 @@ async function resolveNode(cfg, id) {
   // note — an open task with a recorded non-resolving outcome and no live blocker
   // — kept for the readiness guard's remote-mode warn (task-spor-dispatch-
   // readiness-guard): it's already computed server-side, so reusing it costs no
-  // extra round trip.
+  // extra round trip. `inert` is the same additive-key contract for a future
+  // server-computed queue-liveness-dead boolean (issue-spor-type-blind-terminal-
+  // status-fallbacks) — a server that hasn't shipped it yet simply omits the
+  // key, so this stays `null` (unknown, not "false") until dispatchResolutionReason
+  // falls back to the offline check below.
   let resolution = null;
   let held = null;
+  let inert = null;
   if (cfg.mode() === "remote") {
     const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 6000 });
     if (!r.ok) return null;
     raw = (r.json && r.json.raw) || r.text || "";
     resolution = (r.json && r.json.resolution) || null;
     held = (r.json && r.json.held) || null;
+    inert = (r.json && typeof r.json.inert === "boolean") ? r.json.inert : null;
   } else {
     try {
       raw = fs.readFileSync(path.join(cfg.nodesDir(), `${id}.md`), "utf8");
@@ -6447,6 +6453,7 @@ async function resolveNode(cfg, id) {
     date: parsed.date || "",
     resolution,
     held,
+    inert,
   };
 }
 
@@ -6459,9 +6466,26 @@ async function resolveNode(cfg, id) {
 // only when it's non-terminal, loads the graph once to check for an inbound
 // resolver. Returns a one-line reason when resolved, else null. Fail-open: any
 // read error yields null (never block a dispatch on an unreadable graph).
+//
+// Type-aware in three tiers (issue-spor-type-blind-terminal-status-fallbacks):
+// this function itself has no loaded graph, so it can't resolve a graph-
+// resident schema override on its own — it prefers whatever already carries
+// that context. 1) `node.inert` — a server-computed enrichment key on the
+// GET /v1/nodes/{id} response (additive, API.md §3); trusted outright, BOTH
+// values, when present (typeof boolean) since the server already evaluated
+// the full type-aware partition, including graph-resident overrides, this
+// function can't see — an explicit `false` must win over the offline check
+// below exactly as much as a `true` short-circuits it, or the offline
+// heuristic could silently overrule an authoritative server negative. 2)
+// absent that (no server response in hand, or an older server that doesn't
+// send the key yet), the offline seed-registry check — still type-aware,
+// just blind to graph-resident extensions. 3) the local-mode branch below
+// loads the real graph and re-checks against it, which is strictly more
+// authoritative than either fallback and stays as-is.
 function dispatchResolutionReason(cfg, node) {
   const status = (node.status || "").toLowerCase();
-  if (isTerminalStatus(status, node.type || null)) return `status: ${status}`;
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  if (graphLib.isNodeInertOffline(node.inert, status, node.type || null)) return `status: ${status}`;
   const fromEdge = (r) => `${r.edge || "resolves"} edge from ${r.by}${r.title ? ` — ${r.title}` : ""}`;
   if (node.resolution && node.resolution.by) return fromEdge(node.resolution);
   if (cfg.mode() !== "remote") {
