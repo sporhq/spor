@@ -495,6 +495,41 @@ test("a tracked path with non-UTF-8 bytes in its name heals like any other stale
   assert.equal(statusOf(dir), "", "index and working tree both match main");
 });
 
+test("a repo root whose real path holds non-UTF-8 bytes is refused, not mangled", () => {
+  if (process.platform !== "linux") return; // only a Linux filesystem accepts raw non-UTF-8 bytes in a name
+
+  // A fresh, uniquely-named container (mkdtempSync, so the leak-guard sweeps
+  // it — see tmp-cleanup — recursively, including the raw-byte child below).
+  // The repo is built as an ordinary ascii-named dir first, then RENAMED to a
+  // raw-byte name via a pure fs syscall (Buffer path) — the only way to
+  // construct this fixture, since naming it through any spawned git/argv call
+  // would hit the exact re-encoding trap under test (confirmed empirically:
+  // Node re-encodes Buffer argv/cwd to UTF-8 too, so even the test harness
+  // cannot spawn against the raw path directly). An ASCII symlink then lets
+  // the harness's own spawn stay argv-safe while git's `-C <symlink>` still
+  // resolves and prints the raw-byte REAL path for --show-toplevel — the
+  // scenario this guards against: an argv-safe --repo input whose resolved
+  // toplevel is not.
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "spor-heal-rawroot-"));
+  const dir = path.join(parent, "repo");
+  fs.mkdirSync(dir);
+  execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
+  git(dir, "config", "user.email", "t@t");
+  git(dir, "config", "user.name", "Test");
+  write(dir, "a.js", "one\n");
+  commit(dir, "init");
+
+  const rawName = Buffer.from([0x66, 0xe9, 0x2e, 0x64]); // "f\xe9.d" — \xe9 alone is invalid UTF-8
+  const rawDir = Buffer.concat([Buffer.from(parent), Buffer.from("/"), rawName]);
+  fs.renameSync(dir, rawDir);
+  const link = path.join(parent, "safelink");
+  fs.symlinkSync(rawDir, link);
+
+  const r = run(link);
+  assert.equal(r.status, 2, "refuses cleanly rather than mangling the root path and misbehaving");
+  assert.match(r.stderr, /not valid UTF-8/);
+});
+
 // ---------- differences content identity cannot see ----------
 
 test("an uncommitted chmod +x is not 'already at HEAD' — the exec bit survives", () => {

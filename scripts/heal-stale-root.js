@@ -727,9 +727,26 @@ function checkoutPath(repo, head, pspecFile, p) {
 function main() {
   const opts = parseArgs(process.argv.slice(2));
 
-  const top = git(opts.repo, ['rev-parse', '--show-toplevel']);
-  if (top === null) usage(`not a git repository: ${opts.repo}`);
-  const repo = top.trim();
+  // The repo root itself is a path FROM git, subject to the same argv
+  // re-encoding trap as every tracked path above (see "PATH BYTES ARE NOT
+  // UTF-8" at the top of this file): `git rev-parse --show-toplevel` can print
+  // a directory name with no UTF-8 guarantee, and `repo` is then handed back
+  // to git as `-C <repo>` argv on EVERY spawn this tool makes. Unlike
+  // pathspecs (chunks/checkoutPath), `-C` has no stdin/pathspec-file escape
+  // hatch — there is no byte-safe way to name a working directory to git at
+  // all — so the best this tool can do is read it losslessly (latin1,
+  // matching gitPaths) and use it only when those raw bytes round-trip
+  // through argv unchanged. When they don't, refuse cleanly up front instead
+  // of letting a silent utf8 decode mangle them into a path that no longer
+  // names the real directory (every subsequent `git -C` call would then just
+  // fail to find the repo — not a wrong heal, but a confusing "cannot run
+  // git" instead of a clear diagnosis).
+  const topRaw = gitPaths(opts.repo, ['rev-parse', '--show-toplevel']);
+  if (topRaw === null) usage(`not a git repository: ${opts.repo}`);
+  const repo = utf8OrNull(topRaw.trim());
+  if (repo === null) {
+    usage('repo root path is not valid UTF-8 — cannot be passed to git as an argument (no -C stdin/file form exists)');
+  }
 
   const prog = inProgressOp(repo);
   if (prog.op) usage(`a ${prog.op} is in progress — resolve it before syncing the root`);
