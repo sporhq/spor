@@ -38,6 +38,13 @@
 // population this measures. The absolute counts are a lower bound; the RATE is
 // over what was actually classified.
 //
+// KNOWN DRIFT. `--until` pins the journal side, but the transcript side lives in
+// ~/.claude/projects, which Claude Code prunes on its own retention schedule.
+// An evicted transcript moves its finding from `scored` into the reported
+// `transcript missing` bucket, so the rate can drift with no flag and the same
+// cutoff — already 41 of 117 findings here. It is reported rather than hidden;
+// pinning it too would mean committing the derived per-session prompt timelines.
+//
 //   node scripts/analysis/measure-async-nudge-loss.js [--home <dir>]
 //        [--transcripts <dir>] [--until <iso>] [--live-window-min <n>] [--json]
 
@@ -73,11 +80,20 @@ function verdictFacts(rec) {
   return { nfacts, facts };
 }
 
-// Injected wrappers that arrive as `type: user` text but are NOT submissions:
-// the harness echoes local-command output and expands slash commands into the
-// transcript without an isMeta flag, so shape is the only thing separating them
-// from a real prompt.
-const INJECTED_WRAPPER = /^\s*<(local-command-stdout|local-command-stderr|command-name|command-message|command-args)>/;
+// Harness ECHOES that arrive as `type: user` text but are not submissions: the
+// output of a local `/`-command or a `!`-bash run, replayed into the transcript
+// with no isMeta flag, so shape is the only thing separating them from a real
+// prompt. Each one admitted is a phantom drain that hides a real loss.
+//
+// `<command-name>` is deliberately NOT here: typing `/clear` or `/spor:defer`
+// IS a submission and DOES drain the spool — drainPendingNudges runs before
+// computeDigest's `prompt.startsWith("/")` gate (prompt-context.js:503-551), so
+// the digest skips a slash command but the nudge drain does not. Excluding it
+// would score up to 128 genuine drains as losses and inflate the headline. Note
+// the prompt-context stamp cannot referee this: a slash command never produces
+// a digest, so it never writes a stamp — the oracle proves accepted entries
+// fire the hook, never that excluded ones don't.
+const HARNESS_ECHO = /^\s*<(local-command-stdout|local-command-stderr|bash-stdout|bash-stderr|bash-input)>/;
 
 // Is this transcript entry a genuine prompt submission — i.e. would it have
 // fired UserPromptSubmit and drained the spool?
@@ -85,9 +101,8 @@ const INJECTED_WRAPPER = /^\s*<(local-command-stdout|local-command-stderr|comman
 // Three populations share `type: user` and only the first is a prompt:
 //   - a real submission: `promptSource` is set (typed | sdk | system | queued |
 //     suggestion_accepted). Older transcripts predate the field, so an untagged
-//     plain-text entry counts too — minus the injected wrappers above, which are
-//     354 of the 521 untagged entries in this corpus and would otherwise score
-//     as phantom drains.
+//     plain-text entry counts too — including a `<command-name>` slash-command
+//     submission, minus the HARNESS_ECHO output replays above.
 //   - a tool_result echo fed back into the loop — never a prompt, and it
 //     outnumbers real prompts ~40:1.
 //   - injected meta (skill bodies) — never a prompt.
@@ -112,10 +127,13 @@ function isPromptEntry(d, strict) {
       .map((b) => b.text || "")
       .join("");
   }
-  if (typeof content !== "string" || content === "") return false;
+  // A tagged submission is a submission whatever its content shape — an
+  // image-only paste still fires the hook and drains. Only the untagged path
+  // needs the shape heuristics below.
   if (strict) return d.promptSource === "typed";
   if (d.promptSource) return true;
-  return !d.isMeta && !INJECTED_WRAPPER.test(content);
+  if (typeof content !== "string" || content === "") return false;
+  return !d.isMeta && !HARNESS_ECHO.test(content);
 }
 
 // session id -> transcript path, across every project dir.
@@ -153,11 +171,17 @@ function indexTranscripts(root) {
   return index;
 }
 
-// One session's timeline: prompt-submission epochs (ascending) and the last
-// entry of ANY kind, which is how we tell an ended session from a live one.
-// Returns null when the transcript is gone — an unknown timeline must never be
-// scored as a loss.
-function sessionTimeline(file, strict) {
+// One session's timeline AS OF `until`: prompt-submission epochs (ascending)
+// and the last entry of ANY kind, which is how we tell an ended session from a
+// live one. Returns null when the transcript is gone — an unknown timeline must
+// never be scored as a loss.
+//
+// Everything here is clamped to the cutoff, including lastActivity. An unclamped
+// lastActivity reads post-cutoff growth, so `claude --resume` on a session that
+// demonstrably ended months ago would reclassify it as "still active at the
+// cutoff" and silently drop an already-scored finding — the committed numbers
+// would stop reproducing, which is exactly what the pin exists to prevent.
+function sessionTimeline(file, strict, until = Infinity) {
   let raw;
   try {
     raw = fs.readFileSync(file, "utf8");
@@ -175,17 +199,12 @@ function sessionTimeline(file, strict) {
       continue;
     }
     const t = Date.parse(d.timestamp);
-    if (!Number.isNaN(t) && t > lastActivity) lastActivity = t;
-    if (isPromptEntry(d, strict) && !Number.isNaN(t)) prompts.push(t);
+    if (Number.isNaN(t) || t > until) continue;
+    if (t > lastActivity) lastActivity = t;
+    if (isPromptEntry(d, strict)) prompts.push(t);
   }
   prompts.sort((a, b) => a - b);
   return { prompts, lastActivity };
-}
-
-// Kept for callers that only want the prompt epochs.
-function promptTimeline(file, strict) {
-  const tl = sessionTimeline(file, strict);
-  return tl && tl.prompts;
 }
 
 function readLlmCalls(home) {
@@ -222,19 +241,25 @@ const STOP = new Set(
     .split(" ")
 );
 
-// Crude suffix stripping so `rejects`/`reject` and `caches`/`cache` match.
+// Crude suffix stripping so `rejects`/`reject` and `cases`/`case` match.
 // Without it the two sides of a real capture score as a miss purely on
-// inflection, and this codebase's core vocabulary (cache, match, hash, class,
-// index) is exactly what inflects. The trailing `e` strip is what makes the
-// -es plurals meet their singular: caches -> cach <- cache.
+// inflection, and this codebase's core vocabulary (case, cache, response,
+// parse, index, class) is exactly what inflects.
+//
+// ORDER IS THE WHOLE TRICK, and getting it wrong is silent. Strip the plural
+// `s` FIRST, then the trailing `e`; both members of a pair then converge on the
+// same stem (cases -> case -> cas <- case). An -es rule that runs before the
+// plural strip double-fires instead — `cases` -> `cas` -> `ca` while `case` ->
+// `cas` — which is the very miss this function exists to prevent, so the test
+// table must include an -se word (case/use/response), not only the -ches/-shes
+// words that survive either ordering.
 function stem(w) {
   return w
     .replace(/ies$/, "y")
-    .replace(/sses$/, "ss")
-    .replace(/([sxz]|[cs]h)es$/, "$1")
-    .replace(/([^s])s$/, "$1")
+    .replace(/sses$/, "ss") // class(es): keep the double-s, don't strip to `clas`
+    .replace(/([^s])s$/, "$1") // plural: cases -> case, rejects -> reject
     .replace(/(ing|ed)$/, "")
-    .replace(/e$/, "");
+    .replace(/e$/, ""); // case -> cas <- cases
 }
 
 // The token class keeps `.`, `/` and `-` so identifiers survive whole
@@ -307,26 +332,40 @@ function loadAdjudication() {
 const FLAGS = ["--home", "--transcripts", "--until", "--live-window-min"];
 
 function main(argv) {
-  // Silently ignoring a misspelled flag is how a full-corpus number gets quoted
-  // as a windowed one.
+  // Parse argv ONCE into a map. Two different models of the same argv — a
+  // validating pre-pass that consumes each flag's value, plus an arg() that
+  // re-scans with indexOf — disagree on `--home --json`: the pre-pass lets
+  // --home eat --json, arg() then returns "--json" as the graph home, and the
+  // run reports an empty corpus at exit 0. Silently ignoring a misspelled flag
+  // is how a full-corpus number gets quoted as a windowed one; a silently empty
+  // corpus is the same failure wearing a different hat.
+  const parsed = new Map();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (!a.startsWith("--")) continue; // a flag's value
-    if (a === "--json") continue;
-    if (FLAGS.includes(a)) {
-      i++; // skip its value
+    if (!a.startsWith("--")) {
+      console.error(`unexpected argument: ${a}`);
+      process.exit(2);
+    }
+    if (a === "--json") {
+      parsed.set(a, true);
       continue;
     }
-    console.error(`unknown flag: ${a}\nusage: [${FLAGS.join("] [")}] [--json]`);
-    process.exit(2);
+    if (!FLAGS.includes(a)) {
+      console.error(`unknown flag: ${a}\nusage: [${FLAGS.join(" <v>] [")} <v>] [--json]`);
+      process.exit(2);
+    }
+    const v = argv[i + 1];
+    if (v === undefined || v.startsWith("--")) {
+      console.error(`${a}: expected a value`);
+      process.exit(2);
+    }
+    parsed.set(a, v);
+    i++;
   }
-  const arg = (name, dflt) => {
-    const i = argv.indexOf(name);
-    return i >= 0 && argv[i + 1] ? argv[i + 1] : dflt;
-  };
+  const arg = (name, dflt) => (parsed.has(name) ? parsed.get(name) : dflt);
   const home = arg("--home", process.env.SPOR_HOME || path.join(os.homedir(), ".spor"));
   const transcripts = arg("--transcripts", path.join(os.homedir(), ".claude", "projects"));
-  const asJson = argv.includes("--json");
+  const asJson = parsed.has("--json");
   const census = loadAdjudication();
   // Pin the corpus to the census's cutoff by default: the journal grows every
   // session, so an unpinned run re-stales the census within hours and the
@@ -337,14 +376,24 @@ function main(argv) {
     console.error(`--until: unparseable timestamp: ${untilRaw}`);
     process.exit(2);
   }
-  const liveWindowMs = Number(arg("--live-window-min", DEFAULT_LIVE_WINDOW_MIN)) * 60000;
+  // Unvalidated, a typo here (`--live-window-min 60min`) yields NaN, every
+  // `lastActivity > until - NaN` is false, and the live-session exclusion this
+  // guard exists to enforce silently switches itself off — moving the headline
+  // with no error.
+  const liveWindowMin = Number(arg("--live-window-min", DEFAULT_LIVE_WINDOW_MIN));
+  if (!Number.isFinite(liveWindowMin) || liveWindowMin < 0) {
+    console.error(`--live-window-min: expected a non-negative number of minutes, got: ${arg("--live-window-min")}`);
+    process.exit(2);
+  }
+  const liveWindowMs = liveWindowMin * 60000;
 
   const recs = readLlmCalls(home);
   const nudges = recs.filter((r) => r.source === "nudge");
   // The SessionEnd distiller records `distill-remote` when it ships the
-  // transcript to a server for ingestion and `distill` when it writes nodes
-  // locally (scripts/engines/distill.js:362); this box is remote, so the corpus
-  // is all `distill-remote`. Both are the same backstop.
+  // transcript to a server for ingestion and `distill-local` when it writes
+  // nodes locally (scripts/engines/distill.js:362); this box is remote, so the
+  // corpus is all `distill-remote`. Both are the same backstop, hence the
+  // prefix match rather than an exact one.
   const distills = recs.filter((r) => String(r.source || "").startsWith("distill"));
 
   const distillBySession = new Map();
@@ -361,7 +410,7 @@ function main(argv) {
     const key = `${session}|${strict ? 1 : 0}`;
     if (!timelines.has(key)) {
       const f = index.get(session);
-      timelines.set(key, f ? sessionTimeline(f, strict) : null);
+      timelines.set(key, f ? sessionTimeline(f, strict, until) : null);
     }
     return timelines.get(key);
   };
@@ -612,7 +661,6 @@ module.exports = {
   isPromptEntry,
   coverage,
   contentWords,
-  promptTimeline,
   sessionTimeline,
   splitFacts,
   stem,

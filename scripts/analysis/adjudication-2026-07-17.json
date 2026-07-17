@@ -1,11 +1,10 @@
 {
-  "note": "Hand adjudication of every lost fact against its own session's SessionEnd distiller extraction: did the distiller capture the same fact? The lexical `cov` score is only a corroborating lower bound — it charges a real capture as a miss whenever the distiller restated the fact in its own words — so `covered` here is the number to quote. Keyed by sha256(session|fact). See measure-async-nudge-loss.js.",
+  "note": "Hand adjudication of every lost fact against its own session’s SessionEnd distiller extraction: did the distiller capture the same fact? Keyed by sha256(session|fact). This file is a LOOKUP TABLE, not a result: the headline coverage number is whatever measure-async-nudge-loss.js computes by joining it over the window in force (it prints the count and flags any unadjudicated fact). The per-fact `lexical` score is a corroborating lower bound only — it charges a real capture as a miss whenever the distiller restated the fact in its own words.",
   "until": "2026-07-17T00:00:00Z",
-  "until_note": "Corpus cutoff this census was adjudicated against; the script defaults to it so a plain re-run reproduces the committed numbers as the live journal grows. Entries outside the current window are retained and simply go unused.",
+  "until_note": "Corpus cutoff this census was adjudicated against; the script defaults to it so a plain re-run reproduces the committed numbers as the live journal grows. Entries outside the window are retained and simply go unused, so the totals here are >= the joined window.",
   "date": "2026-07-17",
   "adjudicator": "delegated agent (task-spor-measure-async-nudge-session-final-loss)",
-  "covered": 26,
-  "total": 40,
+  "adjudicated_facts": 40,
   "facts": [
     {
       "key": "be4c18abeae9",
