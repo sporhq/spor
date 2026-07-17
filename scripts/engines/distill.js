@@ -186,14 +186,19 @@ async function sessionEndLease({ graph, slug, session, cwd, remote }) {
     if (typeof parsed.raw !== "string") return;
     const rawLines = parsed.raw.split("\n");
     const status = rawLines.find((l) => l.startsWith("status:"))?.slice(7).trim() ?? "";
-    const type = rawLines.find((l) => l.startsWith("type:"))?.slice(5).trim() ?? "";
+    // The node's type, preferring the server-parsed frontmatter over the raw
+    // line scan (the scan is a fallback for older servers whose GET /v1/nodes
+    // response predates the frontmatter field).
+    const type = (typeof parsed.frontmatter?.type === "string" && parsed.frontmatter.type) ||
+      (rawLines.find((l) => l.startsWith("type:"))?.slice(5).trim() ?? "");
     // Status lags resolution edges (issue-cc-status-lags-resolution-edges):
     // the `resolution` read-time enrichment (a live inbound resolves/answers
     // edge) means the task is done even while its status field still reads
-    // open, so either signal counts as finished. The type rides along so the
-    // liveness check is type-aware (per-type inert partition,
-    // dec-spor-status-inert-third-partition); with no graph in hand it still
-    // falls back to the type-blind vocabulary.
+    // open, so either signal counts as finished. The type rides along for the
+    // type-aware signature (dec-spor-status-inert-third-partition), but note
+    // this caller has NO graph, so only the type-blind fallback vocabulary
+    // applies — a per-type inert status (artifact `released`) is not visible
+    // here; the server-side lease/queue reads are the type-aware authority.
     const finished = Boolean(parsed.resolution) || resolutionLib.isTerminalStatus(status, type || null);
     const action = finished ? "release" : "reserve";
     const body = action === "reserve" ? JSON.stringify({ session }) : "{}";

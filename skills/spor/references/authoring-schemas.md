@@ -61,9 +61,12 @@ that should retire only ONE type in that schema's `status.inert`/
 - `status.non_resolving` — statuses that count as *not* resolving for the
   completion gate (an `abandoned` task resolves nothing).
 - `status.terminal` — statuses in which a node's OWN lifecycle is complete,
-  read by work-analytics (unioned with the kernel's legacy terminal set). Use it
-  for a status that ends the node's life but is intentionally not a global
-  terminal — e.g. decision `settled`, which still surfaces in briefings.
+  read by work-analytics (unioned with the kernel's legacy terminal set).
+  **Beware: `status.inert` inherits this set when not declared**, so a terminal
+  status also retires the node from queues/briefings by default — a status
+  that ends the node's life but must KEEP surfacing (decision `settled`) needs
+  a narrower explicit `inert` beside it, exactly as the seed decision schema
+  declares.
 - `status.inert` — statuses in which a node of THIS type is queue-liveness-dead
   (retired from queues, briefing live-work surfacing, coupling matching), the
   per-type overlay `isTerminalStatus(status, type, graph)` unions with the
