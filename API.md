@@ -729,8 +729,10 @@ anything with a token.
   mints a signed, expiring, **read-only** ticket carrying `{lens_id,
   sharer_person_id, exp}` — the credential a *shared* view link carries instead
   of the sharer's PAT. It binds `$viewer` to the recorded sharer (rendered with
-  a "Viewing as" banner), is honored only on `GET /v1/lens/{id}/render`, and can
-  never authorize a write. Stateless (HMAC over a server-held key — no
+  a "Viewing as" banner), is honored only on `GET /v1/lens/{id}/render`
+  (directly, or via the app host's `GET /views/{id}` ticket-to-cookie
+  exchange), and can never authorize a write. Stateless (HMAC over a
+  server-held key — no
   revocation list, expiry is the bound); per-recipient/revocable grants are a
   later fine-grained-authz refinement.
 
