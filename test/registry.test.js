@@ -973,6 +973,205 @@ test("staleOverrides: a superseded graph entry that lost to a newer graph entry 
   }
 });
 
+// ---------- inertPartitionMismatches (task-spor-validate-resident-override-inert-mismatch) ----------
+//
+// A resident node-schema override that predates the status.inert partition
+// (dec-spor-status-inert-third-partition) and declares status.terminal
+// without its own status.inert silently INHERITS its whole terminal set into
+// queue-liveness — even for a type whose seed schema deliberately narrows
+// inert below terminal. inertPartitionMismatches() takes the pristine
+// seed-only registry as the comparison baseline.
+
+test("inertPartitionMismatches: a legacy override without inert leaks a seed-excluded status", () => {
+  const widgetSeed = {
+    id: "schema-widget-seed", kind: "node-schema", version: "2026.06.10.1", key: "widget",
+    payload: { node_type: "widget", status: { terminal: ["archived", "voided"], inert: ["voided"] } },
+    code: {}, codeBlocks: [], upgrades: [],
+  };
+  const seedOnly = new registry.Registry();
+  seedOnly.add(widgetSeed, "seed");
+
+  const legacyOverride = {
+    id: "schema-widget-override", kind: "node-schema", version: "2026.06.10.1", key: "widget",
+    payload: { node_type: "widget", status: { terminal: ["archived", "voided"] } }, // no inert declared
+    code: {}, codeBlocks: [], upgrades: [],
+  };
+  const reg = new registry.Registry();
+  reg.add(widgetSeed, "seed");
+  reg.add(legacyOverride, "graph");
+
+  const warnings = reg.inertPartitionMismatches(seedOnly);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /'schema-widget-override'.*widget.*declares status\.terminal without status\.inert/);
+  assert.match(warnings[0], /archived/);
+  assert.match(warnings[0], /dec-spor-status-inert-third-partition/);
+});
+
+test("inertPartitionMismatches: silent when the override declares its own inert, matching or not", () => {
+  const widgetSeed = {
+    id: "schema-widget-seed", kind: "node-schema", version: "2026.06.10.1", key: "widget",
+    payload: { node_type: "widget", status: { terminal: ["archived", "voided"], inert: ["voided"] } },
+    code: {}, codeBlocks: [], upgrades: [],
+  };
+  const seedOnly = new registry.Registry();
+  seedOnly.add(widgetSeed, "seed");
+
+  // Explicitly reproduces the seed's own partition.
+  const faithful = new registry.Registry();
+  faithful.add(widgetSeed, "seed");
+  faithful.add({
+    id: "schema-widget-faithful", kind: "node-schema", version: "2026.06.10.1", key: "widget",
+    payload: { node_type: "widget", status: { terminal: ["archived", "voided"], inert: ["voided"] } },
+    code: {}, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.deepEqual(faithful.inertPartitionMismatches(seedOnly), [], "override explicitly declaring inert is deliberate, not a hazard");
+
+  // Declares its own (different) inert — still deliberate, not silent inheritance.
+  const divergent = new registry.Registry();
+  divergent.add(widgetSeed, "seed");
+  divergent.add({
+    id: "schema-widget-divergent", kind: "node-schema", version: "2026.06.10.1", key: "widget",
+    payload: { node_type: "widget", status: { terminal: ["archived", "voided"], inert: ["archived", "voided"] } },
+    code: {}, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.deepEqual(divergent.inertPartitionMismatches(seedOnly), [], "a declared inert is never flagged, even if it widens the set");
+});
+
+test("inertPartitionMismatches: silent when the override's terminal doesn't exceed the seed's inert", () => {
+  const widgetSeed = {
+    id: "schema-widget-seed", kind: "node-schema", version: "2026.06.10.1", key: "widget",
+    payload: { node_type: "widget", status: { terminal: ["archived", "voided"], inert: ["voided"] } },
+    code: {}, codeBlocks: [], upgrades: [],
+  };
+  const seedOnly = new registry.Registry();
+  seedOnly.add(widgetSeed, "seed");
+
+  const reg = new registry.Registry();
+  reg.add(widgetSeed, "seed");
+  reg.add({
+    id: "schema-widget-override", kind: "node-schema", version: "2026.06.10.1", key: "widget",
+    payload: { node_type: "widget", status: { terminal: ["voided"] } }, // no inert, but terminal <= seed inert already
+    code: {}, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.deepEqual(reg.inertPartitionMismatches(seedOnly), []);
+});
+
+test("inertPartitionMismatches: silent for a type whose seed doesn't partition terminal/inert differently", () => {
+  const gizmoSeed = {
+    id: "schema-gizmo-seed", kind: "node-schema", version: "2026.06.10.1", key: "gizmo",
+    payload: { node_type: "gizmo", status: { terminal: ["archived"] } }, // no inert -> inherits terminal, same set
+    code: {}, codeBlocks: [], upgrades: [],
+  };
+  const seedOnly = new registry.Registry();
+  seedOnly.add(gizmoSeed, "seed");
+
+  const reg = new registry.Registry();
+  reg.add(gizmoSeed, "seed");
+  reg.add({
+    id: "schema-gizmo-override", kind: "node-schema", version: "2026.06.10.1", key: "gizmo",
+    payload: { node_type: "gizmo", status: { terminal: ["archived"] } },
+    code: {}, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.deepEqual(reg.inertPartitionMismatches(seedOnly), [], "seed's own terminal == inert here — nothing to leak");
+});
+
+test("inertPartitionMismatches: a status the override newly introduces (unknown to the seed) is never named", () => {
+  // Only statuses the SEED itself carves out of inert (terminal-minus-inert)
+  // can be silently resurrected by an override's inheritance default — a
+  // status the override introduces that the seed never opined on at all is
+  // not "kept out of inert by the seed" and must not be reported as such.
+  const widgetSeed = {
+    id: "schema-widget-seed", kind: "node-schema", version: "2026.06.10.1", key: "widget",
+    payload: { node_type: "widget", status: { terminal: ["archived", "voided"], inert: ["voided"] } },
+    code: {}, codeBlocks: [], upgrades: [],
+  };
+  const seedOnly = new registry.Registry();
+  seedOnly.add(widgetSeed, "seed");
+
+  const reg = new registry.Registry();
+  reg.add(widgetSeed, "seed");
+  reg.add({
+    id: "schema-widget-override", kind: "node-schema", version: "2026.06.10.1", key: "widget",
+    payload: { node_type: "widget", status: { terminal: ["voided", "frobnicated"] } }, // frobnicated: unknown to seed
+    code: {}, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.deepEqual(reg.inertPartitionMismatches(seedOnly), [],
+    "no warning — the override didn't leak 'archived' (the seed's own terminal-minus-inert status), only added a status the seed never declared");
+});
+
+test("inertPartitionMismatches: silent when no override exists for the type", () => {
+  const seedOnly = graph.seedRegistry();
+  assert.deepEqual(seedOnly.inertPartitionMismatches(seedOnly), [], "a pure seed registry has no graph-sourced entries to check");
+});
+
+test("validateGraph: a resident schema-decision override retiring settled is flagged (not an error)", () => {
+  // The real hazard this task guards against: a legacy resident override for
+  // schema-decision that declares status.terminal (mirroring the seed) but
+  // never learned about status.inert, so `settled` — terminal but NOT inert
+  // per the seed's pinned exception (dec-spor-decision-lifecycle-surfacing) —
+  // silently becomes queue-liveness-dead under the override.
+  const fx = tmpGraph({
+    ...BASE_NODES,
+    "schema-decision.md": `---
+id: schema-decision
+type: schema
+kind: node-schema
+schema_version: 2026.07.16.1
+title: Decision override
+summary: RESIDENT decision override predating the inert partition.
+date: 2026-06-10
+---
+
+\`\`\`json
+{
+  "node_type": "decision",
+  "prefix": ["dec-"],
+  "status": {
+    "non_resolving": ["rejected"],
+    "terminal": ["superseded", "rejected", "settled"]
+  }
+}
+\`\`\`
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.deepEqual(v.errors, []);
+  assert.ok(
+    v.warnings.some((w) => /'schema-decision'.*declares status\.terminal without status\.inert.*settled.*dec-spor-status-inert-third-partition/.test(w)),
+    "the resident decision override is flagged for silently inheriting settled into inert"
+  );
+
+  // And the properly-partitioned form (the actual seed shape) is silent.
+  const good = tmpGraph({
+    ...BASE_NODES,
+    "schema-decision.md": `---
+id: schema-decision
+type: schema
+kind: node-schema
+schema_version: 2026.07.16.1
+title: Decision override
+summary: RESIDENT decision override matching the seed partition.
+date: 2026-06-10
+---
+
+\`\`\`json
+{
+  "node_type": "decision",
+  "prefix": ["dec-"],
+  "status": {
+    "non_resolving": ["rejected"],
+    "terminal": ["superseded", "rejected", "settled"],
+    "inert": ["superseded", "rejected"]
+  }
+}
+\`\`\`
+`,
+  });
+  const vGood = graph.validateGraph(good.nodesDir);
+  assert.deepEqual(vGood.errors, []);
+  assert.ok(!vGood.warnings.some((w) => /declares status\.terminal without status\.inert/.test(w)));
+});
+
 test("validateNode: schema node structural + payload rules", () => {
   const n = graph.parseFrontmatter(TASK_OVERRIDE_MD, "schema-task.md");
   assert.equal(graph.validateNode(null, n).ok, true);
