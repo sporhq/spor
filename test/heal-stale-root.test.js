@@ -530,6 +530,31 @@ test("a repo root whose real path holds non-UTF-8 bytes is refused, not mangled"
   assert.match(r.stderr, /not valid UTF-8/);
 });
 
+test("a repo root ending in a multi-byte UTF-8 character is not falsely refused", () => {
+  // Regression: the root path is read losslessly via latin1 (gitPaths), one
+  // code unit per raw byte, then validated as UTF-8 — but the validation used
+  // to run JS's `.trim()` directly on that latin1 string first. `.trim()`
+  // strips any Unicode-whitespace CODE POINT, including U+00A0 (NBSP); byte
+  // 0xA0 is latin1's decode of U+00A0, and 0xA0 is also the ordinary
+  // continuation byte of many common 2-byte UTF-8 characters — "à" encodes as
+  // 0xC3 0xA0. A repo root ending in "à" (or any character sharing that last
+  // byte) had its real trailing byte silently stripped as if it were
+  // whitespace, corrupting a perfectly valid UTF-8 path into an incomplete
+  // sequence and refusing it.
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "spor-heal-utf8root-"));
+  const dir = path.join(parent, "repo-à"); // "à" = 0xC3 0xA0; last byte 0xA0
+  fs.mkdirSync(dir);
+  execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
+  git(dir, "config", "user.email", "t@t");
+  git(dir, "config", "user.name", "Test");
+  write(dir, "a.js", "one\n");
+  commit(dir, "init");
+
+  const r = runJson(dir);
+  assert.equal(r.json.verdict, "IN-SYNC");
+  assert.equal(r.status, 0);
+});
+
 // ---------- differences content identity cannot see ----------
 
 test("an uncommitted chmod +x is not 'already at HEAD' — the exec bit survives", () => {

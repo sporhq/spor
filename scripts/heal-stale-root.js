@@ -743,7 +743,15 @@ function main() {
   // git" instead of a clear diagnosis).
   const topRaw = gitPaths(opts.repo, ['rev-parse', '--show-toplevel']);
   if (topRaw === null) usage(`not a git repository: ${opts.repo}`);
-  const repo = utf8OrNull(topRaw.trim());
+  // Strip only git's own trailing line terminator, not a JS `.trim()`: `topRaw`
+  // is latin1-decoded (one code unit per raw byte), and `.trim()` strips any
+  // Unicode-whitespace CODE POINT — including U+00A0, which is exactly what
+  // byte 0xA0 decodes to under latin1. That byte is a common UTF-8
+  // continuation byte (e.g. "à" = 0xC3 0xA0), so a root path ending in such a
+  // character would have its real last byte stripped as if it were
+  // whitespace, corrupting a valid UTF-8 path into an incomplete sequence and
+  // refusing it falsely.
+  const repo = utf8OrNull(topRaw.replace(/\r?\n$/, ''));
   if (repo === null) {
     usage('repo root path is not valid UTF-8 — cannot be passed to git as an argument (no -C stdin/file form exists)');
   }
