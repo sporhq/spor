@@ -1531,3 +1531,78 @@ test("GRAPH.md worked schema example parses and its hooks run as documented", ()
   assert.equal(sb.call("transitions", [undefined, { id: "esc-1" }, {}], SLACK).allow, true,
     "a status-less create is allowed");
 });
+
+// ---------- SLOTS extensibility (task-spor-registry-schema-slots-unification) ----------
+//
+// The whole point of the shared SLOTS table is that a sixth schema kind is a
+// one-entry addition: KINDS derives from SLOTS, parseSchemaNode routes
+// per-kind key/validate through SLOT lookup, and the Registry constructor
+// initializes its backing fields by iterating SLOTS. This test proves it by
+// pushing a synthetic "widget-schema" slot onto the live SLOTS table and
+// exercising it through parsing, validation, and construction — with no edit
+// to registry.js beyond the SLOTS entry itself. The slot is always removed
+// (try/finally) so it never leaks into other tests sharing this module.
+
+test("SLOTS extensibility: a synthetic slot flows through validation, parsing, and construction unedited", () => {
+  const widgetSlot = {
+    kind: "widget-schema", field: "widgetSchemas", singleton: false, snapshotKey: "widget_types",
+    key: (payload) => payload.widget_type,
+    validate: (payload) => {
+      const errors = [];
+      if (typeof payload.widget_type !== "string" || !payload.widget_type) {
+        errors.push(`widget-schema payload missing widget_type`);
+      }
+      return errors;
+    },
+    render: (s) => ({ type: s.key, schema_id: s.id, schema_version: s.version, source: s.source }),
+  };
+
+  registry.SLOTS.push(widgetSlot);
+  try {
+    // KINDS is derived from SLOTS, so the new kind is now legal, and
+    // parseSchemaNode routes its key extraction + validation through the
+    // slot's own key()/validate() — no if/else branch was added for it.
+    const parsed = registry.parseSchemaNode({
+      id: "schema-widget-gizmo", kind: "widget-schema", schema_version: "2026.07.17.1",
+      body: '```json\n{"widget_type": "gizmo"}\n```',
+    });
+    assert.equal(parsed.ok, true, parsed.errors.join("; "));
+    assert.equal(parsed.schema.key, "gizmo");
+
+    // The kind check rejects a bad widget_type via the slot's own validate().
+    const bad = registry.parseSchemaNode({
+      id: "schema-widget-bad", kind: "widget-schema", schema_version: "2026.07.17.1",
+      body: "```json\n{}\n```",
+    });
+    assert.equal(bad.ok, false);
+    assert.ok(bad.errors.some((e) => /widget-schema payload missing widget_type/.test(e)));
+
+    // The Registry constructor initialized `widgetSchemas` from SLOTS alone —
+    // no constructor edit was needed for this test to see the field exist.
+    const reg = new registry.Registry();
+    assert.ok(reg.widgetSchemas instanceof Map, "constructor initialized the backing field from SLOTS");
+    assert.equal(reg.widgetSchemas.size, 0);
+
+    // add() installs into the new slot with the same graph-beats-seed
+    // precedence as every other kind, driven by the shared SLOTS table.
+    assert.equal(reg.add(parsed.schema, "graph"), true);
+    assert.equal(reg.widgetSchemas.get("gizmo").id, "schema-widget-gizmo");
+
+    // staleOverrides() is fully generic (it just walks SLOTS), so it also
+    // picks up the new slot with no edit; snapshot()'s final assembly is
+    // hand-shaped to the well-known five kinds' consumers and is out of
+    // scope here — the acceptance bar is validation/parsing/construction.
+    assert.deepEqual(reg.staleOverrides(), []);
+  } finally {
+    const i = registry.SLOTS.indexOf(widgetSlot);
+    if (i !== -1) registry.SLOTS.splice(i, 1);
+  }
+
+  // Confirm the teardown actually restored module state for later tests.
+  assert.equal(registry.SLOTS.some((s) => s.kind === "widget-schema"), false);
+  assert.equal(registry.parseSchemaNode({
+    id: "schema-widget-after", kind: "widget-schema", schema_version: "2026.07.17.1",
+    body: '```json\n{"widget_type": "gizmo"}\n```',
+  }).errors.some((e) => /kind 'widget-schema' must be one of/.test(e)), true,
+    "the synthetic kind is gone again after cleanup");
+});
