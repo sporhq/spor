@@ -25,6 +25,7 @@ const path = require("path");
 
 const graph = require(path.join(__dirname, "..", "lib", "graph.js"));
 const { sandboxFor } = require(path.join(__dirname, "..", "lib", "sandbox.js"));
+const { STATUS_VOCAB } = require(path.join(__dirname, "helpers", "status-vocab.js"));
 
 const SLACK = { timeoutMs: 5000 };
 
@@ -39,25 +40,18 @@ const callTransitions = (key, cur, prop, view) =>
 
 // The simple vocabulary types: validate() rejects exactly the off-vocabulary
 // statuses, accepts every valid one and the status-less (live) case.
-const CASES = {
-  task: { valid: ["open", "active", "done", "abandoned"], bad: ["in_progress", "doing", "closed", "dismissed", "wip"] },
-  issue: { valid: ["open", "active", "resolved"], bad: ["in_progress", "done", "closed", "dismissed", "fixed"] },
-  decision: { valid: ["active", "superseded", "rejected", "settled"], bad: ["dismissed", "declined", "open", "done"] },
-  question: { valid: ["open", "answered"], bad: ["resolved", "closed", "answered!", "done"] },
-  "capture-pending": { valid: ["merged", "rejected"], bad: ["dismissed", "resolved", "closed", "pending", "done"] },
-  correction: { valid: ["active", "applied"], bad: ["dormant", "retired", "done", "resolved"] },
-};
+const { artifact: ARTIFACT_CASE, ...CASES } = STATUS_VOCAB;
 
 // artifact is validate()-ONLY: the type has no transitions() gate (the delivery
 // stages are not a state machine — a change may be born `merged`), so it cannot
 // join the CASES loop above, which asserts the two paths agree. Its door is the
 // only status gate it has (issue-spor-off-vocab-artifact-statuses).
-const ARTIFACT_VALID = ["in-review", "approved", "merged", "released", "done", "active"];
-// The exact off-vocabulary statuses the live-graph census found (13 complete,
-// 6 shipped, 1 landed, 1 resolved, 1 open) — the drift this door exists to stop
-// recurring. They read as neither live nor terminal, so the artifacts carrying
-// them never retired from queue liveness.
-const ARTIFACT_BAD = ["complete", "shipped", "landed", "resolved", "open", "wip", "abandoned"];
+// The off-vocabulary statuses below include the exact ones the live-graph
+// census found (13 complete, 6 shipped, 1 landed, 1 resolved, 1 open) — the
+// drift this door exists to stop recurring. They read as neither live nor
+// terminal, so the artifacts carrying them never retired from queue liveness.
+const ARTIFACT_VALID = ARTIFACT_CASE.valid;
+const ARTIFACT_BAD = ARTIFACT_CASE.bad;
 
 test("seed schema-artifact: validate() accepts status-less + every valid status", () => {
   assert.deepEqual(callValidate("artifact", { id: "art-x" }), [], "status-less (a plain reference doc) must pass");
