@@ -16,6 +16,7 @@ const path = require("path");
 const graph = require(path.join(__dirname, "..", "lib", "graph.js"));
 const registry = require(path.join(__dirname, "..", "lib", "registry.js"));
 const { sandboxFor } = require(path.join(__dirname, "..", "lib", "sandbox.js"));
+const { STATUS_VOCAB } = require(path.join(__dirname, "helpers", "status-vocab.js"));
 
 function tmpGraph(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "substrate-test-"));
@@ -1231,13 +1232,14 @@ test("seed pack: capture-pending gates triage to merged/rejected (validate + tra
 
   // allowed: the two terminal verdicts, an empty status (create / re-open),
   // and case-insensitively — by BOTH paths.
-  for (const ok of ["merged", "rejected", "", "MERGED", "Rejected"]) {
+  const capturePending = STATUS_VOCAB["capture-pending"];
+  for (const ok of [...capturePending.valid, "", "MERGED", "Rejected"]) {
     assert.equal(gate(ok).allow, true, `transitions: status '${ok}' should be allowed`);
     assert.deepEqual(door(ok), [], `validate: status '${ok}' should be allowed`);
   }
   // denied: the historical drift, each with a reason naming the valid set —
   // now rejected at the door (create) as well as by the update gate.
-  for (const bad of ["dismissed", "resolved", "closed", "done"]) {
+  for (const bad of capturePending.bad) {
     const r = gate(bad);
     assert.equal(r.allow, false, `transitions: status '${bad}' should be denied`);
     assert.match(r.reason, /merged.*rejected|rejected.*merged/s);
@@ -1261,12 +1263,12 @@ test("seed pack: core type schemas gate status to their vocabulary", () => {
   // A view that satisfies the completion-resolver gate (task done / issue
   // resolved), so this case isolates the VOCABULARY gate from the resolver one.
   const RESOLVED_VIEW = { resolvers: [{ id: "dec-x", type: "decision", status: "active" }] };
-  const cases = {
-    task: { ok: ["open", "active", "done", "abandoned", ""], bad: ["dismissed", "resolved", "merged", "wip"] },
-    issue: { ok: ["open", "active", "resolved", ""], bad: ["dismissed", "done", "closed"] },
-    decision: { ok: ["active", "superseded", "rejected", "settled", ""], bad: ["dismissed", "done", "resolved"] },
-    question: { ok: ["open", "answered", ""], bad: ["dismissed", "resolved", "closed"] },
-  };
+  const cases = Object.fromEntries(
+    ["task", "issue", "decision", "question"].map((type) => [
+      type,
+      { ok: [...STATUS_VOCAB[type].valid, ""], bad: STATUS_VOCAB[type].bad },
+    ])
+  );
   for (const [type, { ok, bad }] of Object.entries(cases)) {
     const sb = sandboxFor(reg.nodeSchemas.get(type));
     // Every gated type exports validate() (the door, runs on create AND update —
@@ -1307,10 +1309,10 @@ test("seed pack: core type schemas gate status to their vocabulary", () => {
   const art = sandboxFor(reg.nodeSchemas.get("artifact"));
   assert.deepEqual(art.names, ["validate"], "artifact exports validate() only");
   const artDoor = (status) => art.call("validate", [{ id: "art-x", status }], SLACK);
-  for (const s of ["in-review", "approved", "merged", "released", "done", "active", ""]) {
+  for (const s of [...STATUS_VOCAB.artifact.valid, ""]) {
     assert.deepEqual(artDoor(s), [], `artifact: '${s}' should pass validate()`);
   }
-  for (const s of ["complete", "shipped", "landed", "resolved", "open"]) {
+  for (const s of STATUS_VOCAB.artifact.bad) {
     const v = artDoor(s);
     assert.equal(v.length, 1, `artifact: off-vocab '${s}' should be rejected by validate()`);
     assert.match(v[0], new RegExp(s), "artifact: the reason names the rejected value");
