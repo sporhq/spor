@@ -15,6 +15,7 @@ const { spawnSync } = require("child_process");
 const u = require("./util");
 const { drainOutbox } = require("./drain-outbox");
 const { inferCommits } = require("./infer-commits");
+const graphLib = require(path.join(u.ROOT, "lib", "graph.js"));
 
 // The nested-repo guard (graph home === code repo) now lives in util so the
 // `spor init` path can share it (task-spor-onboard-cli-init-git-identity).
@@ -109,24 +110,200 @@ function parseFactBlocks(response) {
   return facts;
 }
 
+// task-cc-client-sessionend-reserve-hook (dec-cc-task-resumption-reservation):
+// the fifth-and-sixth lease actions, called from SessionEnd. Converts every
+// task THIS SESSION held a live Tier-1 lease on — evidenced by its own
+// claim-heartbeat journal lines, the no-LLM per-write renewal the post-tool
+// claim-nudge branch already performs (task-cc-claim-nudge-hook) — into
+// whichever half of the two-tier lease model fits: still open -> an
+// owner-exclusive resumption reservation (`reserve`, advanced but unfinished);
+// gone terminal or closed by a resolver edge -> `release` (drop the lease and
+// the durable `assigned` edge, cleaning up after finished work). A task this
+// session never actually renewed (no edit landed while its lease was live) is
+// left alone entirely — "does nothing when no claim was held" — so its Tier-1
+// lease just expires on its own TTL rather than being touched by a session
+// that did no real work on it.
+//
+// Scoping to THIS session's own heartbeat record — not a fresh person-scoped
+// `assignee=me` queue read — is deliberate: a finished task drops out of the
+// queue entirely (rankQueue only ever lists LIVE nodes, even in the steward
+// view), so that endpoint can't see a task that just went terminal; and a
+// person-scoped read would risk acting on a claim a DIFFERENT concurrent
+// session of the same person is still actively working. The session's own
+// journal has neither problem.
+//
+// Same gating posture as the post-tool claim-nudge branch: remote/team mode
+// only, in a real git repo, fail-open, config-cascade knobs
+// (sessionLease.enabled / SPOR_SESSION_LEASE, default on). No LLM.
+async function sessionEndLease({ graph, slug, session, cwd, remote }) {
+  if (!remote) return; // a lease is meaningless without a shared server
+  if (u.config() ? !u.config().getBool("sessionLease.enabled", true) : (u.envDual("SESSION_LEASE") ?? "1") === "0")
+    return;
+  const top = u.git(cwd, ["rev-parse", "--show-toplevel"]);
+  if (!top || !top.trim()) return; // no repo root -> no project pool to act on
+
+  const journalPath = path.join(graph, "journal", `${session}.jsonl`);
+  let entries = [];
+  try {
+    entries = fs
+      .readFileSync(journalPath, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => {
+        try {
+          return JSON.parse(l);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch {
+    return; // no journal for this session -> no heartbeats -> nothing held
+  }
+  const ids = new Set();
+  for (const e of entries) {
+    if (e.tool === "claim-heartbeat" && Array.isArray(e.renewed)) {
+      for (const id of e.renewed) if (id) ids.add(id);
+    }
+  }
+  if (ids.size === 0) return; // no claim held this session
+
+  const timeoutMs = u.cfgNum("sessionLease.timeoutMs", "SESSION_LEASE_TIMEOUT", 3000);
+  // Each id's GET+POST is independent, so run them concurrently rather than
+  // paying up to N * 2 * timeoutMs sequentially for a session that held
+  // several claims.
+  const convert = async (id) => {
+    const get = await u
+      .curl(`${u.serverBase()}/v1/nodes/${encodeURIComponent(id)}`, { headers: u.bearer(), timeoutMs })
+      .catch(() => null);
+    if (!get || get.http !== "200") return; // can't verify -> leave the lease alone
+    let parsed;
+    try {
+      parsed = JSON.parse(get.body);
+    } catch {
+      return;
+    }
+    if (typeof parsed.raw !== "string") return;
+    const rawLines = parsed.raw.split("\n");
+    const status = rawLines.find((l) => l.startsWith("status:"))?.slice(7).trim() ?? "";
+    // The node's type, preferring the server-parsed frontmatter over the raw
+    // line scan (the scan is a fallback for older servers whose GET /v1/nodes
+    // response predates the frontmatter field).
+    const type = (typeof parsed.frontmatter?.type === "string" && parsed.frontmatter.type) ||
+      (rawLines.find((l) => l.startsWith("type:"))?.slice(5).trim() ?? "");
+    // Status lags resolution edges (issue-cc-status-lags-resolution-edges):
+    // the `resolution` read-time enrichment (a live inbound resolves/answers
+    // edge) means the task is done even while its status field still reads
+    // open, so either signal counts as finished. The type rides along for the
+    // type-aware signature (dec-spor-status-inert-third-partition). Same
+    // tiered inert decision as bin/spor.js's dispatchResolutionReason
+    // (issue-spor-type-blind-terminal-status-fallbacks, isNodeInertOffline):
+    // a server-computed `inert` enrichment key when this server sends one is
+    // trusted outright, BOTH values — it already saw the full type-aware
+    // partition, including graph-resident overrides, that this caller can't,
+    // so an authoritative `false` must not be second-guessed by the offline
+    // check below any more than a `true` should be; else the offline
+    // seed-registry check, which is still type-aware (an artifact `released`
+    // IS visible here) but blind to graph-resident extensions — the
+    // server-side lease/queue reads remain the type-aware authority for those.
+    const finished = Boolean(parsed.resolution) || graphLib.isNodeInertOffline(parsed.inert, status, type || null);
+    const action = finished ? "release" : "reserve";
+    const body = action === "reserve" ? JSON.stringify({ session }) : "{}";
+    const post = await u
+      .curl(`${u.serverBase()}/v1/nodes/${encodeURIComponent(id)}/${action}`, {
+        method: "POST",
+        headers: { ...u.bearer(), "content-type": "application/json" },
+        body,
+        timeoutMs,
+      })
+      .catch(() => null);
+    u.appendLine(
+      journalPath,
+      JSON.stringify({ ts: u.jqNow(), project: slug, tool: "session-lease", id, action, http: post ? post.http : "000" })
+    );
+  };
+  await Promise.all([...ids].map(convert));
+}
+
+// task-spor-distill-conditional-status-fetch: the fact-finder's dedup index
+// used to re-download the full titles snapshot from /v1/status?titles=1
+// (5-15MB) on every sweep. The server now serves conditional-request
+// semantics there (a weak ETag + a bodyless 304 on a matching
+// If-None-Match, task-cc-tier-2-read-path-scaling) -- this caches the last
+// snapshot alongside its ETag (per server, since one machine can point at
+// different graph homes over time) so a synced graph collapses to a 304 and
+// reuses the cached titles instead. Machine-local runtime state, so it lives
+// under cache/ like the coupling-nudge snapshot (GRAPH_IGNORES).
+function statusTitlesCacheFile(graph) {
+  return path.join(graph, "cache", "status-titles.json");
+}
+async function fetchRemoteTitleIndex(graph, rlog) {
+  const server = u.serverBase();
+  const cacheFile = statusTitlesCacheFile(graph);
+  let cached = null;
+  try {
+    const c = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+    if (c && c.server === server && typeof c.etag === "string" && typeof c.index === "string") cached = c;
+  } catch {}
+  const headers = { ...u.bearer() };
+  if (cached) headers["If-None-Match"] = cached.etag;
+  const resp = await u.curl(`${server}/v1/status?titles=1`, { headers, timeoutMs: 6000 });
+  const head = resp.headers?.["x-substrate-head"] || "";
+  if (resp.http === "304" && cached) {
+    rlog(`index cached (http=304, head=${head})`);
+    return cached.index;
+  }
+  if (resp.http === "200") {
+    const index = u.remoteTitleIndex(resp.body);
+    const etag = resp.headers?.etag;
+    if (etag && u.ensureDir(path.join(graph, "cache"))) {
+      try {
+        fs.writeFileSync(cacheFile, JSON.stringify({ v: 1, server, etag, index, head }));
+      } catch {}
+    }
+    rlog(`index fetched (http=${resp.http})`);
+    return index;
+  }
+  // Stale beats none (the cached-title-index rule, see post-tool.js coupling
+  // nudge): a failed refresh distills against last sweep's snapshot instead
+  // of an empty one, whether the failure is a transport error or an
+  // unexpected status.
+  rlog(`index fetch failed (http=${resp.http}); distilling against ${cached ? "cached" : "empty"} index`);
+  return cached ? cached.index : "";
+}
+
 async function distill(input) {
   if (process.env.SPOR_DISTILLING || process.env.SUBSTRATE_DISTILLING) return null;
+
+  const graph = u.graphHome();
+  const remote = Boolean(u.serverBase());
+  const cwd = input.cwd ?? "";
+  const session = input.session_id ?? "unknown";
+  const slug = u.projectSlug(cwd);
+
+  // task-cc-client-sessionend-reserve-hook: independent of the LLM
+  // distillation below (no-LLM, its own gates) so a disabled/failing
+  // distiller never blocks the lease conversion, and vice versa. Skipped for
+  // a debounce-approximated firing (spor_debounced, set by bin/spor-hook.js
+  // when spooling for Codex/Copilot/OpenCode's turn-scoped quiescence) — that
+  // is NOT a genuine session-end signal, and a mid-session pause trips it just
+  // as easily as a real goodbye, so acting on it risks silently reserving or
+  // releasing a claim that is still actively being worked.
+  if (!input.spor_debounced) {
+    await sessionEndLease({ graph, slug, session, cwd, remote }).catch(() => {});
+  }
+
   // User kill switch, symmetric with the nudge's SPOR_NUDGE=0 (post-tool.js):
   // SPOR_DISTILL=0 (env) or distill.enabled:false (config) disables the paid
   // SessionEnd distill call. No active config falls back to the exact env
   // dual-read, so unset behavior is byte-identical (default "1").
   if (u.config() ? !u.config().getBool("distill.enabled", true) : (u.envDual("DISTILL") ?? "1") === "0") return null;
 
-  const graph = u.graphHome();
   const nodes = path.join(graph, "nodes");
-  const remote = Boolean(u.serverBase());
   if (!remote && !fs.existsSync(nodes)) return null;
 
-  const cwd = input.cwd ?? "";
-  const session = input.session_id ?? "unknown";
   const transcriptPath = input.transcript_path ?? "";
   if (!transcriptPath || !fs.existsSync(transcriptPath)) return null;
-  const slug = u.projectSlug(cwd);
 
   u.ensureDir(path.join(graph, "journal"));
   const logFile = path.join(graph, "journal", "distill.log");
@@ -176,19 +353,13 @@ async function distill(input) {
     touched = [...new Set(vals)].sort().slice(0, 30).join("\n");
   } catch {}
 
-  // Graph index: locally from node files, remotely from /v1/status?titles=1.
+  // Graph index: locally from node files, remotely from /v1/status?titles=1,
+  // revalidated against a cached ETag so a synced graph collapses the 5-15MB
+  // titles download to a bodyless 304
+  // (task-spor-distill-conditional-status-fetch, task-cc-tier-2-read-path-scaling).
   let index = "";
   if (remote) {
-    const resp = await u.curl(`${u.serverBase()}/v1/status?titles=1`, {
-      headers: u.bearer(),
-      timeoutMs: 6000,
-    });
-    if (resp.http === "200") {
-      index = u.remoteTitleIndex(resp.body);
-      rlog(`index fetched (http=${resp.http})`);
-    } else {
-      rlog(`index fetch failed (http=${resp.http}); distilling against empty index`);
-    }
+    index = await fetchRemoteTitleIndex(graph, rlog);
   } else {
     index = u.localTitleIndex(nodes);
   }
@@ -327,7 +498,10 @@ async function distill(input) {
       const text = u.byteHead(fact, 3900);
       const body = JSON.stringify({
         text,
-        context: { project: slug },
+        // Always the ambient cwd slug, never user-declared, so the server's
+        // fold-mismatch warning stays silent on ordinary cross-repo distill
+        // captures (task-spor-thread-explicit-project-flag).
+        context: { project: slug, project_explicit: false },
         source: "distill",
         idempotency_key: crypto.createHash("sha256").update(`${session}\n${text}`).digest("hex"),
       });
@@ -422,4 +596,4 @@ async function distill(input) {
   return null;
 }
 
-module.exports = { distill, normalizeEdges, parseNodeBlocks, parseFactBlocks, graphInsideCodeRepo };
+module.exports = { distill, normalizeEdges, parseNodeBlocks, parseFactBlocks, graphInsideCodeRepo, sessionEndLease };

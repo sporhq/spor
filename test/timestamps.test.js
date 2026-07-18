@@ -205,6 +205,42 @@ test("loadGraph: explicit frontmatter created_at overrides the git-derived value
   assert.equal(g.timestamps["task-a"].updated_at, ISO("2026-01-10T00:00:00Z")); // updated still git-derived
 });
 
+// Git resolves its repo from GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR before it ever
+// discovers one from `-C repoDir`, so an ambient var — a git hook, `git rebase
+// --exec`, a wrapper script that exported one — used to misdirect gittime's git
+// spawns at a wholly different repo no matter which directory loadGraph named
+// (issue-spor-gittime-git-env-inheritance). gitSpawn (lib/shell/git-exec.js)
+// scrubs those vars now, so the named directory wins.
+test("loadGraph: an ambient GIT_DIR pointing at a DIFFERENT repo does not misdirect the timestamp fold", () => {
+  const home = initGraph();
+  node(home, "task-a", "task");
+  commit(home, "2026-01-10T00:00:00Z", "create A");
+
+  // An unrelated repo, carrying a node with the SAME id but a different
+  // history, as the ambient var would name if it leaked through.
+  const decoy = initGraph();
+  node(decoy, "task-a", "task");
+  commit(decoy, "2020-06-01T00:00:00Z", "decoy create A");
+
+  const saved = {
+    GIT_DIR: process.env.GIT_DIR,
+    GIT_WORK_TREE: process.env.GIT_WORK_TREE,
+    GIT_COMMON_DIR: process.env.GIT_COMMON_DIR,
+  };
+  process.env.GIT_DIR = path.join(decoy, ".git");
+  process.env.GIT_WORK_TREE = decoy;
+  try {
+    const g = graphLib.loadGraph(path.join(home, "nodes"));
+    // resolves from `home` (the named repo), never the ambient decoy
+    assert.equal(g.timestamps["task-a"].created_at, ISO("2026-01-10T00:00:00Z"));
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});
+
 test("loadGraph: a non-git home -> graph.timestamps is null (fail-open)", () => {
   const home = tmpHome();
   fs.mkdirSync(path.join(home, "nodes"));

@@ -39,7 +39,7 @@
         "staleness": 0,
         "age_days": 10
       },
-      "suggest": "do",
+      "suggest": "dispatch",
       "readiness": "agent",
       "readiness_reasons": [
         "assigned to agent agent-worker"
@@ -150,7 +150,7 @@
         "staleness": 0,
         "age_days": 10
       },
-      "suggest": "do",
+      "suggest": "dispatch",
       "readiness": "agent",
       "readiness_reasons": [
         "stamped agent-ready by Anthony Allen via cli"

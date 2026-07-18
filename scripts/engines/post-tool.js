@@ -232,8 +232,8 @@ async function nudge({ input, graph, slug, session, file, remote }) {
   u.appendLine(state, `${res.nfacts}\t${file}`);
   if (res.nfacts < 1) return null;
 
-  // Journal the fired nudge so lib/capture-metrics.js can correlate
-  // nudges -> subsequent captures.
+  // Journal the fired nudge so spor-server's lib-engine/capture-metrics.js can
+  // correlate nudges -> subsequent captures.
   u.appendLine(
     path.join(graph, "journal", `${session}.jsonl`),
     JSON.stringify({ ts: u.jqNow(), project: slug, tool: "nudge", file, facts: res.nfacts })
@@ -248,70 +248,31 @@ async function nudge({ input, graph, slug, session, file, remote }) {
 }
 
 // The classifier call itself, shared by the synchronous nudge (in the tool
-// loop) and the async worker (off it). Picks the backend (SPOR_NUDGE_CMD, the
-// codex-host default, or `claude -p --model haiku`), records the call to
-// journal/llm-calls (same shape as distill, for the nightly review loop), and
-// parses the ===FACT=== blocks. Returns { nfacts, facts } — nfacts 0 / facts ""
-// for a NOTHING verdict — or null when the backend process fails (SIGKILLed
-// timeout, non-zero exit). NEVER writes cooldown/journal state: the two callers
-// own that (sync writes `.nudged`; the worker writes the pending-result spool),
-// so the shared piece stays side-effect-free apart from the llm-call record.
+// loop) and the async worker (off it). Runs the shared backend selection +
+// llm-calls recording (util.runClassifierBackend — task-spor-client-
+// classifier-backend-refactor) and parses the ===FACT=== blocks. Returns
+// { nfacts, facts } — nfacts 0 / facts "" for a NOTHING verdict — or null when
+// the backend process fails (SIGKILLed timeout, non-zero exit). NEVER writes
+// cooldown/journal state: the two callers own that (sync writes `.nudged`;
+// the worker writes the pending-result spool), so this stays side-effect-free
+// apart from the llm-call record.
 function classifyForNudge({ prompt, tplSha, session, slug, file, graph, timeoutMs, nudgeCmd, vars }) {
-  const llmDir = path.join(graph, "journal", "llm-calls");
-  const t0 = Date.now();
-  let backend = "";
-  // Token usage / cost when the backend reports it (default claude -p JSON
-  // path; SPOR_NUDGE_CMD backends stay null) — task-cc-spor-client-spend-visibility.
-  let usage = null;
-  let cost_usd = null;
-  let model = null;
-  const recordLlm = (response, error) => {
-    if (!u.ensureDir(llmDir)) return;
-    const rec = {
-      id: `llm-${Date.now()}-${u.bashRandom()}`,
-      ts: u.isoMs(),
-      source: "nudge",
-      backend,
-      template: "nudge.md",
-      template_sha: tplSha,
-      session,
-      project: slug,
-      latency_ms: Date.now() - t0,
-      usage,
-      cost_usd,
-      model,
-      prompt,
-      vars: vars || { SLUG: slug, FILE: file },
-      response: error === "" ? response : null,
-      error: error === "" ? null : error,
-    };
-    u.appendLine(path.join(llmDir, `${u.localDate()}.jsonl`), JSON.stringify(rec));
-  };
+  const res = u.runClassifierBackend({
+    prompt,
+    tplSha,
+    session,
+    project: slug,
+    graph,
+    source: "nudge",
+    template: "nudge.md",
+    timeoutMs,
+    cmd: nudgeCmd,
+    vars: vars || { SLUG: slug, FILE: file },
+  });
+  if (res === null) return null;
 
-  let response;
-  if (nudgeCmd) {
-    backend = `cmd:${nudgeCmd}`;
-    response = u.runBackendCmd(nudgeCmd, prompt, { timeoutMs });
-    if (response === null) {
-      recordLlm("", "nudge cmd failed");
-      return null;
-    }
-  } else {
-    backend = "cli:claude -p --model haiku";
-    const res = u.runClaudeBackend(prompt, { timeoutMs });
-    if (res === null) {
-      recordLlm("", "claude -p failed");
-      return null;
-    }
-    response = res.text;
-    usage = res.usage;
-    cost_usd = res.cost_usd;
-    model = res.model;
-  }
-  recordLlm(response, "");
-
-  if (response.includes("NOTHING")) return { nfacts: 0, facts: "" };
-  const facts = parseFactList(response);
+  if (res.response.includes("NOTHING")) return { nfacts: 0, facts: "" };
+  const facts = parseFactList(res.response);
   const nfacts = facts.split("\n").filter((l) => /^[0-9]/.test(l)).length;
   return { nfacts, facts };
 }
@@ -616,10 +577,16 @@ async function couplingNudge({ input, graph, slug, session, cwd, remote }) {
 
   const data = remote ? await remoteCouplingData(graph) : localCouplingData(graph);
   if (!data || !Array.isArray(data.norms) || data.norms.length === 0) return null;
+  // Declared alias map (issue-spor-coupling-matcher-reverse-symlink-gap): when
+  // the edited path arrives already resolved (no alias-derivable spelling),
+  // this expands it to any config-declared alias spelling too, so a trigger
+  // authored against the alias still fires.
+  const aliases = u.cfgObj("coupling.aliases", {});
   const hits = coupling.matchCouplings(data.norms, {
     slug,
     relPath: rels,
     repoTags: data.repo_tags?.[slug] ?? [],
+    aliases,
   });
   if (!hits.length) return null;
 

@@ -85,6 +85,24 @@ test("agents-md: writes the directive block, no briefing embed by default", () =
   assert.match(r.stdout, /capture-discipline directive/);
 });
 
+// The cohort bullet is the creation-time half of the fix for
+// issue-spor-agent-missing-dependency-edges: the gardener's unedged-gate
+// detector only catches an unwired cohort on the next sweep, so this wording is
+// the guarantee. Pin it — a silent drop is invisible everywhere else.
+test("directive: instructs blocks edges for a multi-node cohort", () => {
+  assert.match(DIRECTIVE, /more than one piece of work/);
+  assert.match(DIRECTIVE, /`blocks` edges/);
+});
+
+// This repo dogfoods its own managed block, so the committed AGENTS.md must
+// carry the packaged directive verbatim — otherwise the wording ships to every
+// other repo while our own copy silently rots. Only the directive is compared:
+// the tools line above it varies with whether a server is configured.
+test("directive: this repo's committed AGENTS.md carries the packaged wording", () => {
+  const md = fs.readFileSync(path.join(__dirname, "..", "AGENTS.md"), "utf8");
+  assert.ok(md.includes(DIRECTIVE), "run `spor agents-md` and commit the result");
+});
+
 test("agents-md: idempotent — a second run replaces, never appends", () => {
   const { home, cwd } = scratch();
   fs.writeFileSync(path.join(cwd, "AGENTS.md"), "# hand content\n");
@@ -104,6 +122,248 @@ test("agents-md --briefing: embeds the standing briefing (hook-less floor)", () 
   assert.ok(md.includes(DIRECTIVE), "directive rides along with the briefing");
   assert.match(md, /Standing project briefing/);
   assert.ok(md.includes(`${slug} standing briefing body`));
+});
+
+// Stub server answering GET /v1/briefing/<slug> with a found:true body, so
+// the REMOTE briefing-embed path (writeAgentsBlock's curl branch) runs.
+function stubBriefingServer(version = 1) {
+  const http = require("node:http");
+  const srv = http.createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ found: true, body: "remote standing briefing body.", version }));
+  });
+  return new Promise((resolve) =>
+    srv.listen(0, "127.0.0.1", () => resolve({ srv, base: `http://127.0.0.1:${srv.address().port}` }))
+  );
+}
+
+// issue-spor-agents-md-local-mcp-leak (review follow-up on this branch's own
+// gate: the toolsLine() fix left a second leak vector untouched): the
+// "Standing project briefing (...)" heading also lands in the COMMITTED
+// block, and its `meta` used to bake in `u.serverHost()` unconditionally —
+// so `--briefing` against a loopback SPOR_SERVER still leaked the dev
+// server's host/port even after the tools-line sentence was fixed.
+//
+// Async `spawn` (not `spawnSync`): the stub server lives in THIS test
+// process, and spawnSync blocks this process's event loop until the child
+// exits, which would deadlock the child's connection back to the stub (same
+// class of gotcha as the claude-binary spawnSync note in CLAUDE.md).
+test("agents-md --briefing: a loopback SPOR_SERVER is also omitted from the briefing heading", async () => {
+  const { home, cwd } = scratch();
+  const { srv, base } = await stubBriefingServer(2);
+  try {
+    const env = bare(home, { SPOR_SERVER: base });
+    const { spawn } = require("node:child_process");
+    const r = await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [CLI, "agents-md", "--briefing"], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+      let stderr = "";
+      child.stderr.on("data", (c) => (stderr += c));
+      child.on("error", reject);
+      child.on("close", (status) => resolve({ status, stderr }));
+    });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+    assert.match(md, /Standing project briefing/);
+    assert.ok(md.includes("remote standing briefing body."));
+    assert.doesNotMatch(md, /127\.0\.0\.1/);
+    assert.doesNotMatch(md, /reachable over MCP/);
+  } finally {
+    srv.close();
+  }
+});
+
+// issue-spor-agents-md-briefing-header-leak: writeAgentsBlock() forwarded
+// `noServerLine` to toolsLine() but never consulted it when composing the
+// "Standing project briefing (...)" heading's `meta` — so `--briefing
+// --no-server-line` against a PUBLIC server still baked `@ <host>` into the
+// committed heading, breaking flag parity with the tools line. In-process so
+// `u.curl` can be stubbed: a real public hostname isn't network-reachable in
+// CI, and this is exactly what lets the test set SPOR_SERVER to a public-
+// looking host while the actual fetch never leaves the process.
+test("agents-md --briefing --no-server-line: suppresses the briefing heading host for a public server too", async () => {
+  const u = require("../scripts/engines/util.js");
+  const { writeAgentsBlock } = require("../scripts/engines/agents-md.js");
+  const { home, cwd } = scratch();
+  const prevEnv = {};
+  for (const k of Object.keys(process.env)) {
+    if (k.startsWith("SPOR_") || k.startsWith("SUBSTRATE_")) {
+      prevEnv[k] = process.env[k];
+      delete process.env[k];
+    }
+  }
+  process.env.SPOR_HOME = home;
+  process.env.SPOR_SERVER = "https://spor.example.com";
+  u.clearConfig();
+  const realCurl = u.curl;
+  u.curl = async () => ({
+    http: "200",
+    body: JSON.stringify({ found: true, body: "remote standing briefing body.", version: 4 }),
+  });
+  try {
+    await writeAgentsBlock({ cwd, briefing: true, noServerLine: true });
+    const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+    assert.match(md, /Standing project briefing/);
+    assert.ok(md.includes("remote standing briefing body."));
+    assert.doesNotMatch(md, /spor\.example\.com/);
+    assert.doesNotMatch(md, /reachable over MCP/);
+
+    // Parity check: WITHOUT --no-server-line, the same public server keeps
+    // showing its host in the heading (this isn't a blanket suppression).
+    fs.rmSync(path.join(cwd, "AGENTS.md"));
+    await writeAgentsBlock({ cwd, briefing: true, noServerLine: false });
+    const md2 = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+    assert.match(md2, /spor\.example\.com/);
+  } finally {
+    u.curl = realCurl;
+    u.clearConfig();
+    delete process.env.SPOR_HOME;
+    delete process.env.SPOR_SERVER;
+    Object.assign(process.env, prevEnv);
+  }
+});
+
+// issue-spor-agents-md-local-mcp-leak: a machine-local SPOR_SERVER must never
+// be baked into the committed block; a public/hosted server keeps the
+// sentence; --no-server-line suppresses it unconditionally either way.
+test("agents-md: a loopback SPOR_SERVER is omitted from the tools line", () => {
+  const { home, cwd } = scratch();
+  const env = bare(home, { SPOR_SERVER: "http://127.0.0.1:8787" });
+  const r = spawnSync(process.execPath, [CLI, "agents-md"], { encoding: "utf8", cwd, env });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+  assert.doesNotMatch(md, /127\.0\.0\.1/);
+  assert.doesNotMatch(md, /reachable over MCP/);
+});
+
+test("agents-md: a bracketed IPv6 loopback SPOR_SERVER is omitted from the tools line", () => {
+  const { home, cwd } = scratch();
+  const env = bare(home, { SPOR_SERVER: "http://[::1]:8787" });
+  const r = spawnSync(process.execPath, [CLI, "agents-md"], { encoding: "utf8", cwd, env });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+  assert.doesNotMatch(md, /::1/);
+  assert.doesNotMatch(md, /reachable over MCP/);
+});
+
+// issue-spor-agents-md-exotic-loopback-spellings: the original guard
+// string-matched a fixed list of spellings (127.0.0.1, localhost, ::1) and
+// missed every other host that also resolves to loopback — exercise the
+// exotic forms the hardened IP-classifying matcher must now catch.
+for (const host of [
+  "127.1",
+  "127.0.1",
+  "127.0.0.2",
+  "0.0.0.0",
+  "0177.0.0.1", // octal octet (WHATWG URL host parsing: 0177 octal == 127 decimal)
+  "0x7f.0.0.1", // hex octet
+  "0x7f000001", // hex whole-address form
+  "017700000001", // octal whole-address form
+  "0x007f000001", // hex whole-address form, zero-padded
+  "00000000000000000177.0.0.1", // octal octet, zero-padded
+  "127.1.", // trailing root-label dot (WHATWG URL drops exactly one before the IPv4 parse)
+  "0177.0.0.1.", // octal octet, trailing root-label dot
+  "2130706433.", // whole-address decimal form, trailing root-label dot
+]) {
+  test(`agents-md: exotic IPv4 loopback spelling ${host} is omitted from the tools line`, () => {
+    const { home, cwd } = scratch();
+    const env = bare(home, { SPOR_SERVER: `http://${host}:8787` });
+    const r = spawnSync(process.execPath, [CLI, "agents-md"], { encoding: "utf8", cwd, env });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+    assert.doesNotMatch(md, /reachable over MCP/);
+    assert.ok(!md.includes(host));
+  });
+}
+
+for (const host of [
+  "0000:0000:0000:0000:0000:0000:0000:0001", // fully-expanded ::1
+  "::ffff:127.0.0.1", // IPv4-mapped
+  "::ffff:7f00:1", // IPv4-mapped, hex-group form
+  "::127.0.0.1", // deprecated IPv4-compatible
+]) {
+  test(`agents-md: exotic IPv6 loopback spelling [${host}] is omitted from the tools line`, () => {
+    const { home, cwd } = scratch();
+    const env = bare(home, { SPOR_SERVER: `http://[${host}]:8787` });
+    const r = spawnSync(process.execPath, [CLI, "agents-md"], { encoding: "utf8", cwd, env });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+    assert.doesNotMatch(md, /reachable over MCP/);
+    assert.ok(!md.includes(host));
+  });
+}
+
+test("agents-md: a non-loopback IPv4-mapped IPv6 host keeps the tools line", () => {
+  const { home, cwd } = scratch();
+  const env = bare(home, { SPOR_SERVER: "http://[::ffff:203.0.113.5]:8787" });
+  const r = spawnSync(process.execPath, [CLI, "agents-md"], { encoding: "utf8", cwd, env });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+  assert.match(md, /reachable over MCP/);
+});
+
+// The octal/hex radix parsing must not over-match: an octet that only
+// LOOKS like a leading-zero loopback spelling but decodes to a public
+// address must still show the tools line.
+test("agents-md: a non-loopback octal-looking IPv4 host keeps the tools line", () => {
+  const { home, cwd } = scratch();
+  const env = bare(home, { SPOR_SERVER: "http://0250.0.0.1:8787" }); // octal 0250 == 168, not 127
+  const r = spawnSync(process.execPath, [CLI, "agents-md"], { encoding: "utf8", cwd, env });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+  assert.match(md, /reachable over MCP/);
+});
+
+// The server can be resolved from config.json rather than raw SPOR_SERVER env
+// (test/spor-cli.test.js "uses an already-configured server" pins that
+// resolution path) — the loopback check must catch it there too, not just
+// when SPOR_SERVER is set directly.
+test("agents-md: a loopback server resolved from config.json is also omitted", () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ server: "http://127.0.0.1:8787", token: "tok" }));
+  const r = run(cwd, home, ["agents-md"]);
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+  assert.doesNotMatch(md, /127\.0\.0\.1/);
+  assert.doesNotMatch(md, /reachable over MCP/);
+});
+
+test("agents-md: a public server URL keeps the tools line", () => {
+  const { home, cwd } = scratch();
+  const env = bare(home, { SPOR_SERVER: "https://spor.example.com" });
+  const r = spawnSync(process.execPath, [CLI, "agents-md"], { encoding: "utf8", cwd, env });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+  assert.match(md, /reachable over MCP at https:\/\/spor\.example\.com\/mcp/);
+});
+
+test("agents-md --no-server-line: suppresses the tools line for any URL", () => {
+  const { home, cwd } = scratch();
+  const env = bare(home, { SPOR_SERVER: "https://spor.example.com" });
+  const r = spawnSync(process.execPath, [CLI, "agents-md", "--no-server-line"], { encoding: "utf8", cwd, env });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+  assert.doesNotMatch(md, /reachable over MCP/);
+  assert.doesNotMatch(md, /spor\.example\.com/);
+});
+
+// Re-running over an AGENTS.md whose committed block already carries a
+// leaked local endpoint must replace it leak-free (append-or-replace marker
+// semantics unchanged; this is the regeneration-heals-a-prior-leak case).
+test("agents-md: regenerating over a previously-leaked block replaces it leak-free", () => {
+  const { home, cwd } = scratch();
+  fs.writeFileSync(
+    path.join(cwd, "AGENTS.md"),
+    "# theirs\n\n<!-- spor:begin -->\n## Spor team graph\n\n" +
+      "A team knowledge graph (Spor) holds prior decisions. It is reachable over MCP at http://127.0.0.1:8787/mcp (bearer token).\n" +
+      "<!-- spor:end -->\n"
+  );
+  const env = bare(home, { SPOR_SERVER: "http://127.0.0.1:8787" });
+  const r = spawnSync(process.execPath, [CLI, "agents-md"], { encoding: "utf8", cwd, env });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(path.join(cwd, "AGENTS.md"), "utf8");
+  assert.match(md, /# theirs/);
+  assert.doesNotMatch(md, /127\.0\.0\.1/);
+  assert.strictEqual(md.match(/<!-- spor:begin -->/g).length, 1);
 });
 
 test("agents-md: 'agents' alias resolves to the same verb", () => {

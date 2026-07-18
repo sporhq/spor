@@ -25,6 +25,7 @@ const path = require("path");
 
 const graph = require(path.join(__dirname, "..", "lib", "graph.js"));
 const { sandboxFor } = require(path.join(__dirname, "..", "lib", "sandbox.js"));
+const { STATUS_VOCAB } = require(path.join(__dirname, "helpers", "status-vocab.js"));
 
 const SLACK = { timeoutMs: 5000 };
 
@@ -39,13 +40,53 @@ const callTransitions = (key, cur, prop, view) =>
 
 // The simple vocabulary types: validate() rejects exactly the off-vocabulary
 // statuses, accepts every valid one and the status-less (live) case.
-const CASES = {
-  task: { valid: ["open", "active", "done", "abandoned"], bad: ["in_progress", "doing", "closed", "dismissed", "wip"] },
-  issue: { valid: ["open", "active", "resolved"], bad: ["in_progress", "done", "closed", "dismissed", "fixed"] },
-  decision: { valid: ["active", "superseded", "rejected", "settled"], bad: ["dismissed", "declined", "open", "done"] },
-  question: { valid: ["open", "answered"], bad: ["resolved", "closed", "answered!", "done"] },
-  "capture-pending": { valid: ["merged", "rejected"], bad: ["dismissed", "resolved", "closed", "pending", "done"] },
-};
+const { artifact: ARTIFACT_CASE, ...CASES } = STATUS_VOCAB;
+
+// artifact is validate()-ONLY: the type has no transitions() gate (the delivery
+// stages are not a state machine — a change may be born `merged`), so it cannot
+// join the CASES loop above, which asserts the two paths agree. Its door is the
+// only status gate it has (issue-spor-off-vocab-artifact-statuses).
+// The off-vocabulary statuses below include the exact ones the live-graph
+// census found (13 complete, 6 shipped, 1 landed, 1 resolved, 1 open) — the
+// drift this door exists to stop recurring. They read as neither live nor
+// terminal, so the artifacts carrying them never retired from queue liveness.
+const ARTIFACT_VALID = ARTIFACT_CASE.valid;
+const ARTIFACT_BAD = ARTIFACT_CASE.bad;
+
+test("seed schema-artifact: validate() accepts status-less + every valid status", () => {
+  assert.deepEqual(callValidate("artifact", { id: "art-x" }), [], "status-less (a plain reference doc) must pass");
+  assert.deepEqual(callValidate("artifact", { id: "art-x", status: "" }), [], "empty status must pass");
+  for (const s of ARTIFACT_VALID) {
+    assert.deepEqual(callValidate("artifact", { id: "art-x", status: s }), [], `valid status '${s}' must pass`);
+    assert.deepEqual(callValidate("artifact", { id: "art-x", status: s.toUpperCase() }), [], `'${s.toUpperCase()}' must pass`);
+  }
+});
+
+test("seed schema-artifact: validate() rejects the off-vocabulary statuses the census found", () => {
+  for (const s of ARTIFACT_BAD) {
+    const errs = callValidate("artifact", { id: "art-x", status: s });
+    assert.equal(errs.length, 1, `validate() must reject off-vocab '${s}'`);
+    assert.match(errs[0], /invalid artifact status/i);
+    assert.match(errs[0], new RegExp(s), "the reason names the rejected value");
+  }
+});
+
+// `active` is the load-bearing case: 79 live-graph artifacts and 37 in the
+// conformance corpus carry it (living/current reference docs). It is admitted,
+// not normalized — an edge write re-validates the whole node, so rejecting it
+// would 422 every future mutation of those nodes.
+test("seed schema-artifact: 'active' and 'done' are in-vocabulary (non-delivery lifecycle values)", () => {
+  assert.deepEqual(callValidate("artifact", { id: "art-x", status: "active" }), [],
+    "active (a living doc) must pass — the conformance corpus and live graph depend on it");
+  assert.deepEqual(callValidate("artifact", { id: "art-x", status: "done" }), [],
+    "done (a finished doc) must pass — it is already declared terminal for this type");
+});
+
+test("seed schema-artifact: the type is gated on membership only — no transitions() hook", () => {
+  const sb = sandboxFor(schemaFor("artifact"));
+  assert.deepEqual(sb.names, ["validate"],
+    "artifact exports validate() only: the stages are not a state machine, so nothing gates ORDER");
+});
 
 for (const [key, { valid, bad }] of Object.entries(CASES)) {
   test(`seed schema-${key}: validate() accepts status-less + every valid status (create path)`, () => {

@@ -25,10 +25,10 @@ the decision queue (QUEUE.md §4).
 | task | `task-` | active or planned work | status `open`/`active`/`done`/`abandoned`; queueable; `done` needs a resolving `decision`/`artifact` (see SKILL routing → /spor:next) |
 | issue | `issue-` | a defect and its resolution lineage | status `open`/`active`/`resolved`; queueable; `resolved` needs a resolving `decision`/`artifact` (see SKILL routing → /spor:next) |
 | incident | `inc-` | something that went wrong in operation | queueable |
-| artifact | `art-`, `spec-` | a document, spec, module, or build product | optional delivery status `in-review`/`approved`/`merged`/`released` |
+| artifact | `art-`, `spec-` | a document, spec, module, or build product | optional status: delivery stages `in-review`/`approved`/`merged`/`released` (when it is a change), or `done`/`active` (a finished/living doc) — gated on membership, not order |
 | norm | `norm-` | a standing convention or constraint | `always_on: true` — rides along in every project-relevant compile (capped to the topically relevant subset); narrow it to specific repos with `applies_to_tags:`/`applies_to_repos:`/`applies_to_projects:`; `couples_when:`/`couples_also:` file globs make it a coupling norm (edit-time "changed X, don't forget Y" nudge — see below) |
 | briefing | `brief-` | a compiled briefing (output of the system) | `traversable: false` (never walked) and `capturable: false` |
-| correction | `corr-` | a standing fix to a briefing (pin/exclude/guidance) | `traversable: false`; applied at every future compile of its target |
+| correction | `corr-` | a standing fix to a briefing (pin/exclude/guidance) | `traversable: false`; status `active`/`applied` (default active — fires at every in-scope compile until a recompile absorbs it and retires it to `applied`) |
 | question | `question-` | a routed ask the graph couldn't answer | queueable; status `open`/`answered`; joins the queue until answered |
 | person | `person-` | an org member | mutable `name` display label plus anchor for `$viewer` binding and question routing |
 | organization | `org-` | a durable organization identity anchor | `member-of-org` records membership; `stewards` records org-admin authority; `org-root` remains the virtual graph-wide operator anchor; `capturable: false` |
@@ -41,6 +41,7 @@ the decision queue (QUEUE.md §4).
 | project | `proj-` | a stable grouping above repos | owns members via inbound `grouped-under` edges; owns no slugs/fingerprints itself |
 | workflow | `wf-` | a repeatable automation DAG | created `proposed`, inert until activated; queueable |
 | workflow-run | `run-` | one execution of a workflow | queueable when stuck; `capturable: false` |
+| lens | `lens-` | a saved view over the graph (`render_lens`) | body carries a required `## query` json block plus optional `## render`/`## custom`/`## actions` blocks; parameterized by a `focuses-on` edge (`"$focus"`); `traversable: false` and `capturable: false` |
 
 ## Edge types
 
@@ -71,13 +72,14 @@ are same-direction synonyms renamed at write time.
 | owned-by | 0.3 | this agent is owned by that person (structural identity) | inverse `owns` |
 | uses-profile | 0.3 | this agent's default profile (runtime+capability bundle); structural config, overridable per assignment/dispatch | — |
 | routed-to | 0.3 | this question is routed to that person | — |
+| focuses-on | 0.2 | this lens is parameterized on that node (resolves `"$focus"` in its query) | `capturable: false` |
 | compiled-for | — | briefing → the task/query it was compiled for | provenance only |
 | shaped-by | — | briefing → the corrections that shaped it | provenance only |
 
 **Ride-along flags** (set in a schema's JSON payload):
 - `always_on: true` (norm) — injected into every project-relevant compile.
-- `traversable: false` (briefing, correction) — excluded from lineage walks.
-- `capturable: false` (briefing, workflow-run, agent) — never produced by capture.
+- `traversable: false` (briefing, correction, lens) — excluded from lineage walks.
+- `capturable: false` (briefing, workflow-run, agent, lens) — never produced by capture.
 
 An `always_on` norm rides along project-wide by default, but that scope is the
 whole home-project **grouping** — so under a project that spans heterogeneous

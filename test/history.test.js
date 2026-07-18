@@ -228,6 +228,28 @@ test("history (local) works when the graph home is nested inside a larger git re
   assert.doesNotMatch(entry.stdout, /node absent at this revision/);
 });
 
+// Git resolves its repo from GIT_DIR/GIT_WORK_TREE before it ever discovers one
+// from `-C repoDir`, so an ambient var — a git hook, `git rebase --exec`, a
+// wrapper that exported one — used to misdirect this history read at a wholly
+// different repo no matter which SPOR_HOME named
+// (issue-spor-gittime-git-env-inheritance). lib/history.js now spawns through
+// the scrubbed gitSpawn, so the named graph home wins.
+test("history (local) under an ambient GIT_DIR: reads the named graph home, not the ambient repo", () => {
+  const { dir, shaCreate, shaInternal } = fixtureGraph();
+  const decoy = fs.mkdtempSync(path.join(os.tmpdir(), "spor-history-decoy-"));
+  gitc(decoy, ["init", "-q"]);
+  gitc(decoy, ["config", "user.name", "D"]);
+  gitc(decoy, ["config", "user.email", "d@d.d"]);
+  fs.writeFileSync(path.join(decoy, "f.txt"), "x");
+  gitc(decoy, ["add", "-A"]);
+  gitc(decoy, ["commit", "-qm", "decoy commit"]);
+
+  const r = run(["history", "dec-x"], { SPOR_HOME: dir, GIT_DIR: path.join(decoy, ".git"), GIT_WORK_TREE: decoy });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /dec-x — 2 revisions/);
+  assert.ok(r.stdout.includes(shaCreate.slice(0, 7)) && r.stdout.includes(shaInternal.slice(0, 7)));
+});
+
 test("history (local) with no graph home points at init, no stack", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-history-nohome-"));
   fs.rmSync(home, { recursive: true, force: true }); // start absent

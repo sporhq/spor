@@ -16,6 +16,7 @@ const path = require("path");
 const graph = require(path.join(__dirname, "..", "lib", "graph.js"));
 const registry = require(path.join(__dirname, "..", "lib", "registry.js"));
 const { sandboxFor } = require(path.join(__dirname, "..", "lib", "sandbox.js"));
+const { STATUS_VOCAB } = require(path.join(__dirname, "helpers", "status-vocab.js"));
 
 function tmpGraph(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "substrate-test-"));
@@ -345,6 +346,10 @@ test("seed pack: edge weights match the historic EDGE_WEIGHTS table exactly", ()
     // uses-profile: an agent → its default profile (the runtime+capability
     // bundle it dispatches under). Structural config binding like owned-by (0.3).
     "uses-profile": 0.3,
+    // The lens vocabulary (issue-cc-lens-schema-missing-seed) added focuses-on:
+    // a lens → the node it is parameterized on. Lowest weight in the table — a
+    // view watching a node says little about the node's own lineage.
+    "focuses-on": 0.2,
   });
   // provenance-only edges are known but unweighted (historic ?? 0.3 default)
   assert.equal(reg.isKnownEdge("compiled-for"), true);
@@ -418,10 +423,20 @@ test("seed pack: node types, prefixes, ride-along, and traversal match GRAPH.md"
   assert.equal(reg.isCapturableEdge("uses-profile"), false);
   // profile/routine carry no resolving-status declaration, so the partition is
   // unchanged (asserted exhaustively in the resolving-partition test below).
+  // The saved-view vocabulary (issue-cc-lens-schema-missing-seed): a fresh
+  // graph must know the lens type and its focuses-on parameterization edge
+  // without importing a schema node first. Interface, not knowledge — so it is
+  // neither traversed nor draftable from a capture.
+  assert.equal(reg.isKnownType("lens"), true);
+  assert.deepEqual(reg.prefixesFor("lens"), ["lens-"]);
+  assert.equal(reg.isCapturableType("lens"), false);
+  assert.equal(reg.isKnownEdge("focuses-on"), true);
+  assert.equal(reg.isCapturableEdge("focuses-on"), false);
   assert.equal(reg.isAlwaysOn("norm"), true);
   assert.equal(reg.isAlwaysOn("decision"), false);
   assert.equal(reg.isTraversable("briefing"), false);
   assert.equal(reg.isTraversable("correction"), false);
+  assert.equal(reg.isTraversable("lens"), false);
   assert.equal(reg.isTraversable("decision"), true);
   assert.equal(reg.isTraversable("never-heard-of-it"), true, "unknown types traverse, as before");
 });
@@ -487,6 +502,74 @@ test("Registry: an org schema declares a terminal status (no code change)", () =
   assert.equal(ok, true);
   assert.equal(reg.terminalStatuses().has("shelved"), true, "org-added terminal status honored");
   assert.equal(reg.terminalStatuses().has("settled"), true, "other schemas' declarations still union in");
+});
+
+test("seed pack: terminalStatuses(type) is the per-type slice, not the flat cross-type union", () => {
+  // task-spor-analytics-type-aware-inert-partition: work-analytics needs a type's
+  // OWN status.terminal in isolation — artifact's `released` must not leak into
+  // how a task or decision is judged, the bug the type-blind union caused.
+  const reg = graph.seedRegistry();
+  assert.deepEqual([...reg.terminalStatuses("artifact")].sort(), ["done", "merged", "released"]);
+  assert.deepEqual([...reg.terminalStatuses("decision")].sort(), ["rejected", "settled", "superseded"]);
+  assert.equal(reg.terminalStatuses("task").size, 0, "task declares no status.terminal of its own");
+  assert.equal(reg.terminalStatuses("no-such-type").size, 0, "unknown type -> empty, not the union");
+  // the no-arg call is unaffected — still the flat cross-type union
+  assert.equal(reg.terminalStatuses().has("released"), true);
+});
+
+test("seed pack: per-type inert partition — decision is the pinned exception, others inherit terminal", () => {
+  // dec-spor-status-inert-third-partition: inertStatuses(type) is the per-type
+  // queue-liveness overlay the type-aware isTerminalStatus reads. A schema with
+  // no `status.inert` inherits its `status.terminal`; the decision schema
+  // declares inert explicitly because its two sets genuinely differ (`settled`
+  // is terminal but NOT inert, dec-spor-decision-lifecycle-surfacing).
+  const reg = graph.seedRegistry();
+  const dec = reg.inertStatuses("decision");
+  assert.deepEqual([...dec].sort(), ["rejected", "superseded"], "decision declares inert explicitly");
+  assert.equal(dec.has("settled"), false, "settled is terminal but NOT inert — the pinned exception");
+  assert.deepEqual([...reg.inertStatuses("artifact")].sort(), ["done", "merged", "released"],
+    "artifact declares no inert — inherits its terminal set (the inheritance default)");
+  assert.deepEqual([...reg.inertStatuses("correction")].sort(), ["applied"],
+    "correction inherits terminal too");
+  assert.deepEqual([...reg.inertStatuses("task")], [],
+    "a schema declaring neither partition has an empty overlay (type-blind vocabulary only)");
+  assert.deepEqual([...reg.inertStatuses("no-such-type")], [], "unknown type -> empty overlay");
+});
+
+test("Registry: an org schema declares an inert status distinct from terminal (no code change)", () => {
+  const reg = graph.seedRegistry();
+  const ok = reg.add({
+    id: "schema-task", kind: "node-schema", version: "2026.07.01.1", key: "task",
+    payload: { node_type: "task", status: { terminal: ["shelved", "iced"], inert: ["iced"] } },
+    code: {}, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.equal(ok, true);
+  assert.deepEqual([...reg.inertStatuses("task")], ["iced"],
+    "a declared inert set wins over the terminal inheritance");
+  assert.equal(reg.terminalStatuses().has("shelved"), true, "terminal partition unaffected");
+});
+
+test("seed pack: the terminal-status register reproduces resolution.js's fallback byte-identically", () => {
+  // The contract resolution.js documents: TERMINAL_FALLBACK (what a graph-less
+  // caller like coupling.js reads) and the seed register's classes are ONE set,
+  // so the two paths cannot drift (issue-spor-coupling-resolution-terminal-
+  // status-divergence). `released` is deliberately in NEITHER: it is
+  // artifact-scoped via schema-artifact's own partition
+  // (task-spor-terminal-status-type-aware-migration).
+  const resolution = require(path.join(__dirname, "..", "lib", "kernel", "resolution.js"));
+  const reg = graph.seedRegistry();
+  const classes = [...reg.registerClasses("terminal-status")].sort();
+  assert.deepEqual(classes, [...resolution.terminalStatuses],
+    "seed register classes == TERMINAL_FALLBACK (sorted)");
+  assert.equal(classes.includes("released"), false, "released is artifact-scoped, not type-blind");
+});
+
+test("parseSchemaNode: rejects a malformed status.inert", () => {
+  const bad = registry.parseSchemaNode({
+    id: "schema-z", kind: "node-schema", schema_version: "2026.07.16.1",
+    body: '```json\n{"node_type":"z","status":{"inert":[1,""]}}\n```',
+  });
+  assert.ok(bad.errors.some((e) => /inert must be an array of non-empty strings/.test(e)));
 });
 
 test("parseSchemaNode: rejects a malformed status.non_resolving / status.terminal", () => {
@@ -791,6 +874,318 @@ test("staleOverrides: a resident override below the seed version is flagged; at/
   assert.deepEqual(current.registry.staleOverrides(), [], "current override is silent");
 });
 
+// ---------- staleOverrides: order independence (issue-spor-registry-stale-shadow-traversal-bug) ----------
+//
+// staleOverrides() must report a stale shadow only when the FINAL winning
+// entry for a key is older than the best seed entry — derived from end-state,
+// not from add()-time snapshots. So every permutation of Registry.add() order
+// (seed / legacy graph / newer graph winner) must yield the same result.
+
+test("staleOverrides: node-schema order independence — legacy-first and winner-first both end up silent", () => {
+  const nodeSchema = (id, version) => ({
+    id, kind: "node-schema", version, key: "widget",
+    payload: { node_type: "widget" }, code: {}, codeBlocks: [], upgrades: [],
+  });
+  const seed = nodeSchema("schema-widget-seed", "2026.06.10.1");
+  const legacy = nodeSchema("schema-widget-legacy", "2026.01.01.1"); // older than seed
+  const winner = nodeSchema("schema-widget-winner", "2026.06.10.1"); // == seed, so no shadow
+
+  // legacy-first: seed, then the stale legacy override, then its own replacement
+  const legacyFirst = new registry.Registry();
+  legacyFirst.add(seed, "seed");
+  legacyFirst.add(legacy, "graph");
+  legacyFirst.add(winner, "graph");
+  assert.equal(legacyFirst.nodeSchemas.get("widget").id, "schema-widget-winner");
+  assert.deepEqual(legacyFirst.staleOverrides(), [], "legacy-first: final winner matches seed, silent");
+
+  // winner-first: seed, then the eventual winner, then the (losing) legacy entry
+  const winnerFirst = new registry.Registry();
+  winnerFirst.add(seed, "seed");
+  winnerFirst.add(winner, "graph");
+  winnerFirst.add(legacy, "graph");
+  assert.equal(winnerFirst.nodeSchemas.get("widget").id, "schema-widget-winner");
+  assert.deepEqual(winnerFirst.staleOverrides(), [], "winner-first: same final state, same silence");
+});
+
+test("staleOverrides: node-schema true positive survives every add() order", () => {
+  const nodeSchema = (id, version) => ({
+    id, kind: "node-schema", version, key: "widget",
+    payload: { node_type: "widget" }, code: {}, codeBlocks: [], upgrades: [],
+  });
+  const seed = nodeSchema("schema-widget-seed", "2026.06.10.1");
+  const staleWinner = nodeSchema("schema-widget-stale", "2026.01.01.1"); // the FINAL winner, still older than seed
+
+  for (const order of [
+    [["seed", seed], ["graph", staleWinner]],
+    [["graph", staleWinner], ["seed", seed]],
+  ]) {
+    const reg = new registry.Registry();
+    for (const [source, schema] of order) reg.add(schema, source);
+    assert.equal(reg.nodeSchemas.get("widget").id, "schema-widget-stale");
+    const warnings = reg.staleOverrides();
+    assert.equal(warnings.length, 1, `order ${JSON.stringify(order.map((o) => o[0]))}`);
+    assert.match(warnings[0], /'schema-widget-stale'.*widget @ 2026\.01\.01\.1.*shadows a newer seed schema.*2026\.06\.10\.1/);
+  }
+});
+
+test("staleOverrides: a superseded graph entry that lost to a newer graph entry never warns on its own", () => {
+  // Same shape as the node-schema case, but for every kind that participates in
+  // staleOverrides(): edge-schema, queue-policy, policy, register. In each case
+  // seed < legacy(graph) < winner(graph), and the winner should be >= seed, so
+  // the final state is silent regardless of whether the legacy loser is added.
+  const cases = [
+    {
+      label: "edge-schema",
+      make: (id, version) => ({
+        id, kind: "edge-schema", version, key: "gizmo-of",
+        payload: { edge_type: "gizmo-of" }, code: {}, codeBlocks: [], upgrades: [],
+      }),
+      get: (reg) => reg.edgeSchemas.get("gizmo-of"),
+    },
+    {
+      label: "queue-policy",
+      make: (id, version) => ({
+        id, kind: "queue-policy", version, key: "queue-policy",
+        payload: {}, code: { rank: "export function rank() {}" }, codeBlocks: [], upgrades: [],
+      }),
+      get: (reg) => reg.queuePolicy,
+    },
+    {
+      label: "policy",
+      make: (id, version) => ({
+        id, kind: "policy", version, key: id,
+        payload: { governs: {} }, code: { gate: "export function gate() {}" }, codeBlocks: [], upgrades: [],
+      }),
+      get: (reg, id) => reg.policySchemas.get(id),
+    },
+    {
+      label: "register",
+      make: (id, version) => ({
+        id, kind: "register", version, key: "widget-flavors",
+        payload: { register: "widget-flavors", classes: [] }, code: {}, codeBlocks: [], upgrades: [],
+      }),
+      get: (reg) => reg.registers.get("widget-flavors"),
+    },
+  ];
+
+  for (const { label, make, get } of cases) {
+    // policy is keyed by id, so seed/legacy/winner all share the SAME id (as a
+    // real graph override of a seed-shipped schema node would) so they occupy
+    // one slot; for the other kinds id is irrelevant to keying but kept
+    // constant too, for realism.
+    const id = label === "policy" ? "policy-widget-guard" : `schema-${label}`;
+    const seed = make(id, "2026.06.10.1");
+    const legacy = make(id, "2026.01.01.1");
+    const winner = make(id, "2026.06.10.1");
+
+    const reg = new registry.Registry();
+    reg.add(seed, "seed");
+    reg.add(legacy, "graph");
+    reg.add(winner, "graph");
+    assert.equal(get(reg, id).version, "2026.06.10.1", label);
+    assert.deepEqual(reg.staleOverrides(), [], `${label}: superseded legacy entry left no residual warning`);
+  }
+});
+
+// ---------- inertPartitionMismatches (task-spor-validate-resident-override-inert-mismatch) ----------
+//
+// A resident node-schema override that predates the status.inert partition
+// (dec-spor-status-inert-third-partition) and declares status.terminal
+// without its own status.inert silently INHERITS its whole terminal set into
+// queue-liveness — even for a type whose seed schema deliberately narrows
+// inert below terminal. inertPartitionMismatches() takes the pristine
+// seed-only registry as the comparison baseline.
+
+test("inertPartitionMismatches: a legacy override without inert leaks a seed-excluded status", () => {
+  const widgetSeed = {
+    id: "schema-widget-seed", kind: "node-schema", version: "2026.06.10.1", key: "widget",
+    payload: { node_type: "widget", status: { terminal: ["archived", "voided"], inert: ["voided"] } },
+    code: {}, codeBlocks: [], upgrades: [],
+  };
+  const seedOnly = new registry.Registry();
+  seedOnly.add(widgetSeed, "seed");
+
+  const legacyOverride = {
+    id: "schema-widget-override", kind: "node-schema", version: "2026.06.10.1", key: "widget",
+    payload: { node_type: "widget", status: { terminal: ["archived", "voided"] } }, // no inert declared
+    code: {}, codeBlocks: [], upgrades: [],
+  };
+  const reg = new registry.Registry();
+  reg.add(widgetSeed, "seed");
+  reg.add(legacyOverride, "graph");
+
+  const warnings = reg.inertPartitionMismatches(seedOnly);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /'schema-widget-override'.*widget.*declares status\.terminal without status\.inert/);
+  assert.match(warnings[0], /archived/);
+  assert.match(warnings[0], /dec-spor-status-inert-third-partition/);
+});
+
+test("inertPartitionMismatches: silent when the override declares its own inert, matching or not", () => {
+  const widgetSeed = {
+    id: "schema-widget-seed", kind: "node-schema", version: "2026.06.10.1", key: "widget",
+    payload: { node_type: "widget", status: { terminal: ["archived", "voided"], inert: ["voided"] } },
+    code: {}, codeBlocks: [], upgrades: [],
+  };
+  const seedOnly = new registry.Registry();
+  seedOnly.add(widgetSeed, "seed");
+
+  // Explicitly reproduces the seed's own partition.
+  const faithful = new registry.Registry();
+  faithful.add(widgetSeed, "seed");
+  faithful.add({
+    id: "schema-widget-faithful", kind: "node-schema", version: "2026.06.10.1", key: "widget",
+    payload: { node_type: "widget", status: { terminal: ["archived", "voided"], inert: ["voided"] } },
+    code: {}, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.deepEqual(faithful.inertPartitionMismatches(seedOnly), [], "override explicitly declaring inert is deliberate, not a hazard");
+
+  // Declares its own (different) inert — still deliberate, not silent inheritance.
+  const divergent = new registry.Registry();
+  divergent.add(widgetSeed, "seed");
+  divergent.add({
+    id: "schema-widget-divergent", kind: "node-schema", version: "2026.06.10.1", key: "widget",
+    payload: { node_type: "widget", status: { terminal: ["archived", "voided"], inert: ["archived", "voided"] } },
+    code: {}, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.deepEqual(divergent.inertPartitionMismatches(seedOnly), [], "a declared inert is never flagged, even if it widens the set");
+});
+
+test("inertPartitionMismatches: silent when the override's terminal doesn't exceed the seed's inert", () => {
+  const widgetSeed = {
+    id: "schema-widget-seed", kind: "node-schema", version: "2026.06.10.1", key: "widget",
+    payload: { node_type: "widget", status: { terminal: ["archived", "voided"], inert: ["voided"] } },
+    code: {}, codeBlocks: [], upgrades: [],
+  };
+  const seedOnly = new registry.Registry();
+  seedOnly.add(widgetSeed, "seed");
+
+  const reg = new registry.Registry();
+  reg.add(widgetSeed, "seed");
+  reg.add({
+    id: "schema-widget-override", kind: "node-schema", version: "2026.06.10.1", key: "widget",
+    payload: { node_type: "widget", status: { terminal: ["voided"] } }, // no inert, but terminal <= seed inert already
+    code: {}, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.deepEqual(reg.inertPartitionMismatches(seedOnly), []);
+});
+
+test("inertPartitionMismatches: silent for a type whose seed doesn't partition terminal/inert differently", () => {
+  const gizmoSeed = {
+    id: "schema-gizmo-seed", kind: "node-schema", version: "2026.06.10.1", key: "gizmo",
+    payload: { node_type: "gizmo", status: { terminal: ["archived"] } }, // no inert -> inherits terminal, same set
+    code: {}, codeBlocks: [], upgrades: [],
+  };
+  const seedOnly = new registry.Registry();
+  seedOnly.add(gizmoSeed, "seed");
+
+  const reg = new registry.Registry();
+  reg.add(gizmoSeed, "seed");
+  reg.add({
+    id: "schema-gizmo-override", kind: "node-schema", version: "2026.06.10.1", key: "gizmo",
+    payload: { node_type: "gizmo", status: { terminal: ["archived"] } },
+    code: {}, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.deepEqual(reg.inertPartitionMismatches(seedOnly), [], "seed's own terminal == inert here — nothing to leak");
+});
+
+test("inertPartitionMismatches: a status the override newly introduces (unknown to the seed) is never named", () => {
+  // Only statuses the SEED itself carves out of inert (terminal-minus-inert)
+  // can be silently resurrected by an override's inheritance default — a
+  // status the override introduces that the seed never opined on at all is
+  // not "kept out of inert by the seed" and must not be reported as such.
+  const widgetSeed = {
+    id: "schema-widget-seed", kind: "node-schema", version: "2026.06.10.1", key: "widget",
+    payload: { node_type: "widget", status: { terminal: ["archived", "voided"], inert: ["voided"] } },
+    code: {}, codeBlocks: [], upgrades: [],
+  };
+  const seedOnly = new registry.Registry();
+  seedOnly.add(widgetSeed, "seed");
+
+  const reg = new registry.Registry();
+  reg.add(widgetSeed, "seed");
+  reg.add({
+    id: "schema-widget-override", kind: "node-schema", version: "2026.06.10.1", key: "widget",
+    payload: { node_type: "widget", status: { terminal: ["voided", "frobnicated"] } }, // frobnicated: unknown to seed
+    code: {}, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.deepEqual(reg.inertPartitionMismatches(seedOnly), [],
+    "no warning — the override didn't leak 'archived' (the seed's own terminal-minus-inert status), only added a status the seed never declared");
+});
+
+test("inertPartitionMismatches: silent when no override exists for the type", () => {
+  const seedOnly = graph.seedRegistry();
+  assert.deepEqual(seedOnly.inertPartitionMismatches(seedOnly), [], "a pure seed registry has no graph-sourced entries to check");
+});
+
+test("validateGraph: a resident schema-decision override retiring settled is flagged (not an error)", () => {
+  // The real hazard this task guards against: a legacy resident override for
+  // schema-decision that declares status.terminal (mirroring the seed) but
+  // never learned about status.inert, so `settled` — terminal but NOT inert
+  // per the seed's pinned exception (dec-spor-decision-lifecycle-surfacing) —
+  // silently becomes queue-liveness-dead under the override.
+  const fx = tmpGraph({
+    ...BASE_NODES,
+    "schema-decision.md": `---
+id: schema-decision
+type: schema
+kind: node-schema
+schema_version: 2026.07.16.1
+title: Decision override
+summary: RESIDENT decision override predating the inert partition.
+date: 2026-06-10
+---
+
+\`\`\`json
+{
+  "node_type": "decision",
+  "prefix": ["dec-"],
+  "status": {
+    "non_resolving": ["rejected"],
+    "terminal": ["superseded", "rejected", "settled"]
+  }
+}
+\`\`\`
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.deepEqual(v.errors, []);
+  assert.ok(
+    v.warnings.some((w) => /'schema-decision'.*declares status\.terminal without status\.inert.*settled.*dec-spor-status-inert-third-partition/.test(w)),
+    "the resident decision override is flagged for silently inheriting settled into inert"
+  );
+
+  // And the properly-partitioned form (the actual seed shape) is silent.
+  const good = tmpGraph({
+    ...BASE_NODES,
+    "schema-decision.md": `---
+id: schema-decision
+type: schema
+kind: node-schema
+schema_version: 2026.07.16.1
+title: Decision override
+summary: RESIDENT decision override matching the seed partition.
+date: 2026-06-10
+---
+
+\`\`\`json
+{
+  "node_type": "decision",
+  "prefix": ["dec-"],
+  "status": {
+    "non_resolving": ["rejected"],
+    "terminal": ["superseded", "rejected", "settled"],
+    "inert": ["superseded", "rejected"]
+  }
+}
+\`\`\`
+`,
+  });
+  const vGood = graph.validateGraph(good.nodesDir);
+  assert.deepEqual(vGood.errors, []);
+  assert.ok(!vGood.warnings.some((w) => /declares status\.terminal without status\.inert/.test(w)));
+});
+
 test("validateNode: schema node structural + payload rules", () => {
   const n = graph.parseFrontmatter(TASK_OVERRIDE_MD, "schema-task.md");
   assert.equal(graph.validateNode(null, n).ok, true);
@@ -837,13 +1232,14 @@ test("seed pack: capture-pending gates triage to merged/rejected (validate + tra
 
   // allowed: the two terminal verdicts, an empty status (create / re-open),
   // and case-insensitively — by BOTH paths.
-  for (const ok of ["merged", "rejected", "", "MERGED", "Rejected"]) {
+  const capturePending = STATUS_VOCAB["capture-pending"];
+  for (const ok of [...capturePending.valid, "", "MERGED", "Rejected"]) {
     assert.equal(gate(ok).allow, true, `transitions: status '${ok}' should be allowed`);
     assert.deepEqual(door(ok), [], `validate: status '${ok}' should be allowed`);
   }
   // denied: the historical drift, each with a reason naming the valid set —
   // now rejected at the door (create) as well as by the update gate.
-  for (const bad of ["dismissed", "resolved", "closed", "done"]) {
+  for (const bad of capturePending.bad) {
     const r = gate(bad);
     assert.equal(r.allow, false, `transitions: status '${bad}' should be denied`);
     assert.match(r.reason, /merged.*rejected|rejected.*merged/s);
@@ -867,12 +1263,12 @@ test("seed pack: core type schemas gate status to their vocabulary", () => {
   // A view that satisfies the completion-resolver gate (task done / issue
   // resolved), so this case isolates the VOCABULARY gate from the resolver one.
   const RESOLVED_VIEW = { resolvers: [{ id: "dec-x", type: "decision", status: "active" }] };
-  const cases = {
-    task: { ok: ["open", "active", "done", "abandoned", ""], bad: ["dismissed", "resolved", "merged", "wip"] },
-    issue: { ok: ["open", "active", "resolved", ""], bad: ["dismissed", "done", "closed"] },
-    decision: { ok: ["active", "superseded", "rejected", "settled", ""], bad: ["dismissed", "done", "resolved"] },
-    question: { ok: ["open", "answered", ""], bad: ["dismissed", "resolved", "closed"] },
-  };
+  const cases = Object.fromEntries(
+    ["task", "issue", "decision", "question"].map((type) => [
+      type,
+      { ok: [...STATUS_VOCAB[type].valid, ""], bad: STATUS_VOCAB[type].bad },
+    ])
+  );
   for (const [type, { ok, bad }] of Object.entries(cases)) {
     const sb = sandboxFor(reg.nodeSchemas.get(type));
     // Every gated type exports validate() (the door, runs on create AND update —
@@ -904,6 +1300,22 @@ test("seed pack: core type schemas gate status to their vocabulary", () => {
     }
     // create path always allowed by transitions() (status-less first write).
     assert.equal(sb.call("transitions", [undefined, { id: `${type}-x` }, RESOLVED_VIEW], SLACK).allow, true);
+  }
+
+  // artifact is gated at the door ONLY (issue-spor-off-vocab-artifact-statuses):
+  // no transitions(), because the delivery stages are not a state machine — a
+  // change may be born `merged`. Its vocabulary is the four stages plus the two
+  // non-delivery lifecycle values (`done` finished, `active` living).
+  const art = sandboxFor(reg.nodeSchemas.get("artifact"));
+  assert.deepEqual(art.names, ["validate"], "artifact exports validate() only");
+  const artDoor = (status) => art.call("validate", [{ id: "art-x", status }], SLACK);
+  for (const s of [...STATUS_VOCAB.artifact.valid, ""]) {
+    assert.deepEqual(artDoor(s), [], `artifact: '${s}' should pass validate()`);
+  }
+  for (const s of STATUS_VOCAB.artifact.bad) {
+    const v = artDoor(s);
+    assert.equal(v.length, 1, `artifact: off-vocab '${s}' should be rejected by validate()`);
+    assert.match(v[0], new RegExp(s), "artifact: the reason names the rejected value");
   }
 });
 
@@ -959,6 +1371,41 @@ test("seed pack: task done / issue resolved require a decision or artifact resol
     "an active decision resolver allows resolved (active is resolving)");
   assert.equal(resolvedGate({ resolvers: [{ id: "dec-y", type: "decision" }] }).allow, true,
     "no partition on the view counts every resolver (backward-readable)");
+});
+
+test("seed pack: the lens validate() gate rejects bodies that would not run", () => {
+  // issue-cc-lens-schema-missing-seed: a fresh graph ships the lens gate, so an
+  // unrunnable view is refused at the write door instead of failing at render.
+  const reg = graph.seedRegistry();
+  const SLACK = { timeoutMs: 5000 };
+  const sb = sandboxFor(reg.nodeSchemas.get("lens"));
+  assert.deepEqual(sb.names, ["validate"], "the lens schema exports validate()");
+  const door = (body) => sb.call("validate", [{ id: "lens-x", body }], SLACK);
+  const QUERY = '## query\n\n```json\n{ "select": { "type": "task" } }\n```\n';
+
+  assert.deepEqual(door(QUERY), [], "a query-only lens is runnable");
+  assert.deepEqual(door(""), ["lens body must carry a '## query' fenced json block"]);
+  assert.match(door('## query\n\n```json\n{ nope\n```\n')[0], /'query' block is not valid JSON/);
+  // render.as=custom without the js block it names would render nothing.
+  const custom = '## render\n\n```json\n{ "as": "custom" }\n```\n';
+  assert.deepEqual(door(QUERY + custom), ["render.as=custom requires a '## custom' js block"]);
+  assert.deepEqual(door(QUERY + custom + '## custom\n\n```js\nexport function render() { return []; }\n```\n'), []);
+
+  // The v2 actions block (dec-ui-actions-as-transitions) is optional, but a
+  // present one must be a well-formed affordance list: the renderer binds
+  // buttons to it, and `set` becomes an ordinary revision-checked node update.
+  const actions = (json) => QUERY + "## actions\n\n```json\n" + json + "\n```\n";
+  assert.deepEqual(door(actions('[{ "id": "start", "label": "Start", "set": { "status": "active" } }]')), []);
+  assert.deepEqual(door(actions('{ "id": "start" }')), ["'actions' block must be a JSON array"]);
+  assert.match(door(actions('[{ "id": "Start", "label": "Start", "set": { "status": "active" } }]'))[0],
+    /actions\[0\]\.id must be a kebab-case string/);
+  assert.ok(door(actions('[{ "id": "a", "label": "A", "set": {} }, { "id": "a", "label": "A", "set": { "status": "x" } }]'))
+    .some((e) => /duplicate action id 'a'/.test(e)), "action ids are unique");
+  // id/type are the node's identity — an action may never rewrite them.
+  assert.ok(door(actions('[{ "id": "rename", "label": "Rename", "set": { "type": "issue" } }]'))
+    .some((e) => /may not change 'type'/.test(e)));
+  assert.ok(door(actions('[{ "id": "x", "label": "X", "set": { "status": "open" }, "sudo": true }]'))
+    .some((e) => /unknown key 'sudo'/.test(e)));
 });
 
 test("seed pack: the task get() hook rides along a held-task churn note (task-spor-queue-front-loop-self-limit-on-held-tasks)", () => {
@@ -1085,4 +1532,90 @@ test("GRAPH.md worked schema example parses and its hooks run as documented", ()
   // never even calls transitions() on create (it is update-only — store.js).
   assert.equal(sb.call("transitions", [undefined, { id: "esc-1" }, {}], SLACK).allow, true,
     "a status-less create is allowed");
+});
+
+// ---------- SLOTS extensibility (task-spor-registry-schema-slots-unification,
+// task-spor-registry-snapshot-fully-table-driven) ----------
+//
+// The whole point of the shared SLOTS table is that a sixth schema kind is a
+// one-entry addition: KINDS derives from SLOTS, parseSchemaNode routes
+// per-kind key/validate through SLOT lookup, the Registry constructor
+// initializes its backing fields by iterating SLOTS, and snapshot() folds
+// every slot's rendered entries into the returned object by its snapshotKey.
+// This test proves it by pushing a synthetic "widget-schema" slot onto the
+// live SLOTS table and exercising it through parsing, validation,
+// construction, and introspection — with no edit to registry.js beyond the
+// SLOTS entry itself. The slot is always removed (try/finally) so it never
+// leaks into other tests sharing this module.
+
+test("SLOTS extensibility: a synthetic slot flows through validation, parsing, construction, and snapshot() unedited", () => {
+  const widgetSlot = {
+    kind: "widget-schema", field: "widgetSchemas", singleton: false, snapshotKey: "widget_types",
+    key: (payload) => payload.widget_type,
+    validate: (payload) => {
+      const errors = [];
+      if (typeof payload.widget_type !== "string" || !payload.widget_type) {
+        errors.push(`widget-schema payload missing widget_type`);
+      }
+      return errors;
+    },
+    render: (s) => ({ type: s.key, schema_id: s.id, schema_version: s.version, source: s.source }),
+  };
+
+  registry.SLOTS.push(widgetSlot);
+  try {
+    // KINDS is derived from SLOTS, so the new kind is now legal, and
+    // parseSchemaNode routes its key extraction + validation through the
+    // slot's own key()/validate() — no if/else branch was added for it.
+    const parsed = registry.parseSchemaNode({
+      id: "schema-widget-gizmo", kind: "widget-schema", schema_version: "2026.07.17.1",
+      body: '```json\n{"widget_type": "gizmo"}\n```',
+    });
+    assert.equal(parsed.ok, true, parsed.errors.join("; "));
+    assert.equal(parsed.schema.key, "gizmo");
+
+    // The kind check rejects a bad widget_type via the slot's own validate().
+    const bad = registry.parseSchemaNode({
+      id: "schema-widget-bad", kind: "widget-schema", schema_version: "2026.07.17.1",
+      body: "```json\n{}\n```",
+    });
+    assert.equal(bad.ok, false);
+    assert.ok(bad.errors.some((e) => /widget-schema payload missing widget_type/.test(e)));
+
+    // The Registry constructor initialized `widgetSchemas` from SLOTS alone —
+    // no constructor edit was needed for this test to see the field exist.
+    const reg = new registry.Registry();
+    assert.ok(reg.widgetSchemas instanceof Map, "constructor initialized the backing field from SLOTS");
+    assert.equal(reg.widgetSchemas.size, 0);
+
+    // add() installs into the new slot with the same graph-beats-seed
+    // precedence as every other kind, driven by the shared SLOTS table.
+    assert.equal(reg.add(parsed.schema, "graph"), true);
+    assert.equal(reg.widgetSchemas.get("gizmo").id, "schema-widget-gizmo");
+
+    // staleOverrides() is fully generic (it just walks SLOTS), so it also
+    // picks up the new slot with no edit.
+    assert.deepEqual(reg.staleOverrides(), []);
+
+    // snapshot() folds every slot generically too (task-spor-registry-
+    // snapshot-fully-table-driven): the new kind's snapshotKey shows up in
+    // the returned object with no hand-picked key, rendered via the slot's
+    // own render() fn — this is also what `spor schema --json` and GET
+    // /v1/schema serve verbatim, so the same fix covers both surfaces.
+    const snap = reg.snapshot();
+    assert.deepEqual(snap.widget_types, [
+      { type: "gizmo", schema_id: "schema-widget-gizmo", schema_version: "2026.07.17.1", source: "graph" },
+    ]);
+  } finally {
+    const i = registry.SLOTS.indexOf(widgetSlot);
+    if (i !== -1) registry.SLOTS.splice(i, 1);
+  }
+
+  // Confirm the teardown actually restored module state for later tests.
+  assert.equal(registry.SLOTS.some((s) => s.kind === "widget-schema"), false);
+  assert.equal(registry.parseSchemaNode({
+    id: "schema-widget-after", kind: "widget-schema", schema_version: "2026.07.17.1",
+    body: '```json\n{"widget_type": "gizmo"}\n```',
+  }).errors.some((e) => /kind 'widget-schema' must be one of/.test(e)), true,
+    "the synthetic kind is gone again after cleanup");
 });

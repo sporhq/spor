@@ -12,6 +12,7 @@
 // Usage (from a host's hooks config; see adapters/):
 //   spor-hook session-start  [--host claude-code|codex|gemini|cursor|copilot|opencode]
 //   spor-hook prompt-context [--host ...]
+//   spor-hook pre-tool       [--host ...]
 //   spor-hook post-tool      [--host ...]
 //   spor-hook distill        [--host ...] [--debounce SECONDS]
 //   spor-hook agents-md      [--cwd DIR]    # AGENTS.md floor; no stdin
@@ -27,6 +28,7 @@ const u = require(path.join(__dirname, "..", "scripts", "engines", "util"));
 const ENGINES = {
   "session-start": () => require("../scripts/engines/session-start").sessionStart,
   "prompt-context": () => require("../scripts/engines/prompt-context").promptContext,
+  "pre-tool": () => require("../scripts/engines/pre-tool").preTool,
   "post-tool": () => require("../scripts/engines/post-tool").postTool,
   distill: () => require("../scripts/engines/distill").distill,
 };
@@ -184,6 +186,13 @@ async function main() {
     const pend = path.join(graph, "journal", "pending-distill");
     if (!u.ensureDir(pend)) return;
     const pendingFile = path.join(pend, `${session}.json`);
+    // Mark the spooled payload as a debounce-approximated firing (turn-scoped
+    // quiescence on Codex/Copilot/OpenCode, not a genuine host session-end
+    // signal — a mid-session pause can trip it just as easily as a real
+    // goodbye) so the SessionEnd lease branch skips it
+    // (task-cc-client-sessionend-reserve-hook): reserving/releasing a still-
+    // live claim on a false positive would silently strand active work.
+    payload.spor_debounced = true;
     try {
       fs.writeFileSync(pendingFile, JSON.stringify(payload));
     } catch {

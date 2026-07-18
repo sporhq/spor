@@ -12,7 +12,7 @@ type: <type>
 repo: {{SLUG}}
 title: <title>
 summary: <one-two sentences>
-status: <active|rejected|open|resolved, if meaningful>
+status: <omit unless meaningful; must be valid for the type — decision: active|rejected; task: open|active; issue: open|active|resolved; artifact: active; norm: active>
 date: {{DATE}}
 edges:
   - {type: <edge-type>, to: <existing-node-id>}

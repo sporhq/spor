@@ -2,7 +2,7 @@
 id: schema-decision
 type: schema
 kind: node-schema
-schema_version: 2026.06.21.2
+schema_version: 2026.07.16.1
 title: Seed schema for decision nodes
 summary: Node schema for the decision type — a choice that was made, with the why. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -69,6 +69,20 @@ partition a settled decision lingered in analytics WIP and the oldest-open
 bottleneck list forever. Registry behavior only, no node-shape change,
 backward-readable, no upgrade chain.
 
+`status.inert` (2026.07.16.1, dec-spor-status-inert-third-partition,
+task-spor-terminal-status-type-aware-migration): the decision type is the
+pinned EXCEPTION to the inert-inherits-terminal default. A schema that declares
+no `inert` set inherits its `terminal` set as the per-type queue-liveness-dead
+overlay the type-aware `isTerminalStatus(status, type, graph)` reads — but for
+decisions the two partitions genuinely differ: `settled` is terminal
+(own-lifecycle complete, analytics counts it done) yet must NOT be inert (a
+settled decision keeps surfacing as live guidance in queues and briefings,
+dec-spor-decision-lifecycle-surfacing). Declaring `inert: [superseded,
+rejected]` blocks the inheritance of `settled` while changing nothing else —
+both values are already in the type-blind terminal-status register the overlay
+unions with, so decision liveness stays byte-identical. Registry behavior
+only, no node-shape change, backward-readable, no upgrade chain.
+
 ```json
 {
   "node_type": "decision",
@@ -84,6 +98,10 @@ backward-readable, no upgrade chain.
       "superseded",
       "rejected",
       "settled"
+    ],
+    "inert": [
+      "superseded",
+      "rejected"
     ]
   }
 }

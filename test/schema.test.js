@@ -220,6 +220,45 @@ test("filterBySource: restricts entries to a provenance", () => {
   assert.deepEqual(schemaLib.filterBySource(snap, "native").node_types.map((n) => n.type), ["schema"]);
 });
 
+// SLOTS extensibility (task-spor-filter-by-source-table-driven, sibling of the
+// registry.test.js SLOTS-extensibility test): filterBySource derives its key
+// set by walking the shared SLOTS table (lib/kernel/registry.js), not a
+// hand-picked list, so a sixth slot — array or singleton — is filtered with
+// NO edit to lib/schema.js. Pushes one of each shape onto the live SLOTS
+// table, exercises filterBySource, and always removes them (try/finally) so
+// they never leak into other tests sharing the registry module.
+test("filterBySource: a synthetic sixth SLOTS entry (array + singleton) is filtered generically", () => {
+  const registry = require(path.join(__dirname, "..", "lib", "kernel", "registry.js"));
+  const arraySlot = {
+    kind: "widget-schema", field: "widgetSchemas", singleton: false, snapshotKey: "widget_types",
+    key: (payload) => payload.widget_type,
+    render: (s) => ({ type: s.key, source: s.source }),
+  };
+  const singletonSlot = {
+    kind: "gizmo-policy", field: "gizmoPolicy", singleton: true, snapshotKey: "gizmo_policy",
+    key: () => "gizmo-policy",
+    render: (s) => ({ source: s.source }),
+  };
+  registry.SLOTS.push(arraySlot, singletonSlot);
+  try {
+    const snap = graph.seedRegistry().snapshot();
+    snap.widget_types = [{ type: "a", source: "seed" }, { type: "b", source: "graph" }];
+    snap.gizmo_policy = { source: "graph" };
+
+    const graphOnly = schemaLib.filterBySource(snap, "graph");
+    assert.deepEqual(graphOnly.widget_types, [{ type: "b", source: "graph" }]);
+    assert.deepEqual(graphOnly.gizmo_policy, { source: "graph" });
+
+    const seedOnly = schemaLib.filterBySource(snap, "seed");
+    assert.deepEqual(seedOnly.widget_types, [{ type: "a", source: "seed" }]);
+    assert.equal(seedOnly.gizmo_policy, null, "singleton slot not matching the source filters to null");
+  } finally {
+    registry.SLOTS.splice(registry.SLOTS.indexOf(arraySlot), 1);
+    registry.SLOTS.splice(registry.SLOTS.indexOf(singletonSlot), 1);
+  }
+  assert.equal(registry.SLOTS.some((s) => s.kind === "widget-schema" || s.kind === "gizmo-policy"), false);
+});
+
 // ---------------- the lib/schema.js CLI (exit codes) ----------------
 
 test("CLI: overview exits 0, unknown type exits 1", () => {

@@ -482,6 +482,58 @@ test('status (remote) does NOT warn of split-brain even with a Spor connector', 
   assert.doesNotMatch(r.stdout, SPLIT);
 });
 
+// --- --quiet skips the remote health probe + identity lookup
+// (issue-spor-status-health-probe-latency): a caller that only wants a
+// locally-resolved field (e.g. the brief skill reading back `project:`)
+// shouldn't pay for the up-to-6s health round-trip.
+test('status (remote) without --quiet includes health/identity lines', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-remote-status-full-'));
+  const r = run(['status'], {
+    SPOR_HOME: home,
+    SPOR_SERVER: 'http://127.0.0.1:9',
+    SPOR_TOKEN: 'tok',
+  });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /mode:\s+remote/);
+  assert.match(r.stdout, /^health:/m);
+  assert.match(r.stdout, /^identity:/m);
+});
+
+test('status (remote) --quiet skips health probe and identity lookup', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-remote-status-quiet-'));
+  const r = run(['status', '--quiet'], {
+    SPOR_HOME: home,
+    SPOR_SERVER: 'http://127.0.0.1:9',
+    SPOR_TOKEN: 'tok',
+  });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /mode:\s+remote/);
+  assert.match(r.stdout, /^project:/m);
+  assert.match(r.stdout, /^token:\s+present/m);
+  assert.doesNotMatch(r.stdout, /^health:/m);
+  assert.doesNotMatch(r.stdout, /^identity:/m);
+});
+
+test('status -q is the short form of --quiet', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-remote-status-q-'));
+  const r = run(['status', '-q'], {
+    SPOR_HOME: home,
+    SPOR_SERVER: 'http://127.0.0.1:9',
+    SPOR_TOKEN: 'tok',
+  });
+  assert.strictEqual(r.status, 0);
+  assert.doesNotMatch(r.stdout, /^health:/m);
+  assert.doesNotMatch(r.stdout, /^identity:/m);
+});
+
+test('status (local) --quiet is a no-op (already no network round-trip)', () => {
+  const { dir } = fixtureGraph();
+  const withQuiet = run(['status', '--quiet'], { SPOR_HOME: dir });
+  const without = run(['status'], { SPOR_HOME: dir });
+  assert.strictEqual(withQuiet.status, 0);
+  assert.strictEqual(withQuiet.stdout, without.stdout);
+});
+
 test('validate is byte-identical passthrough to lib/validate.js', () => {
   const { nodes } = fixtureGraph();
   const viaCli = run(['validate', '--nodes', nodes]);
@@ -950,6 +1002,27 @@ test('disable/enable merge enabled into .spor.json at the cwd', () => {
   assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, '.spor.json'), 'utf8')).enabled, true);
 });
 
+// Git resolves its repo from GIT_DIR/GIT_WORK_TREE before it ever discovers one
+// from cwd, so an ambient var — a git hook, `git rebase --exec`, a wrapper that
+// exported one — used to make repoRoot() misdirect `spor enable`/`disable` at
+// the AMBIENT repo instead of the cwd's own (issue-spor-gittime-git-env-
+// inheritance). bin/spor.js's git() now spawns through the scrubbed gitSpawn,
+// so cwd's own repo wins.
+test('enable under an ambient GIT_DIR: .spor.json lands in the cwd repo, not the ambient one', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-scope-gitdir-'));
+  spawnSync('git', ['init', '-q'], { cwd: dir });
+  const decoy = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-scope-decoy-'));
+  spawnSync('git', ['init', '-q'], { cwd: decoy });
+  const r = spawnSync(process.execPath, [CLI, 'enable'], {
+    cwd: dir,
+    encoding: 'utf8',
+    env: bare({ GIT_DIR: path.join(decoy, '.git'), GIT_WORK_TREE: decoy }),
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, '.spor.json'), 'utf8')).enabled, true);
+  assert.ok(!fs.existsSync(path.join(decoy, '.spor.json')), 'the ambient repo gets no .spor.json');
+});
+
 test('link writes the .spor marker; rejects a non-canonical slug', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-link-'));
   const ok = spawnSync(process.execPath, [CLI, 'link', 'my-repo'], { cwd: dir, encoding: 'utf8', env: bare() });
@@ -1261,6 +1334,21 @@ test('install gemini merges into existing settings without clobbering', () => {
   assert.match(j.hooks.BeforeAgent[0].hooks[0].command, /node ".+spor-hook\.js" prompt-context --host gemini/);
 });
 
+test('install gemini aborts on a corrupt existing settings.json, writing nothing (no --mcp)', () => {
+  // issue-spor-gemini-config-clobbered-on-install: installHookHost used to
+  // read the existing target with a lenient readJsonOr(target, {}) fallback,
+  // so a pre-existing but unparseable settings.json got silently discarded
+  // and replaced with spor's default hooks — even with no --mcp in play.
+  const home = scratchHome();
+  const f = path.join(home, '.gemini', 'settings.json');
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, '{not valid json');
+  const r = run(['install', 'gemini'], { HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /isn't valid JSON/);
+  assert.strictEqual(fs.readFileSync(f, 'utf8'), '{not valid json', 'left untouched');
+});
+
 test('install opencode places the plugin file (symlink or copy)', () => {
   const home = scratchHome();
   const r = run(['install', 'opencode'], { HOME: home });
@@ -1330,6 +1418,250 @@ test('install codex stops before hook guidance when marketplace registration fai
   assert.match(r.stderr, /codex plugin marketplace add failed: boom/);
   assert.doesNotMatch(r.stdout, /^next:/m);
   assert.ok(!fs.existsSync(path.join(home, '.codex', 'hooks.json')), 'hooks not written after plugin install failure');
+});
+
+// --- install --mcp (task-cc-spor-cli-install-mcp-automation) ---------------
+// v1 only PRINTED the manual per-host MCP recipe (see each adapter's README);
+// --mcp is the opt-in automation of it, plus running agents-md so AGENTS.md is
+// populated in the same command. Every test pins its own scratch HOME +
+// SPOR_HOME + cwd — --mcp also writes AGENTS.md at the repo root, so an
+// unscoped cwd would land in this checkout's real AGENTS.md.
+function mcpCwd() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'spor-mcp-cwd-'));
+}
+function runIn(cwd, args, env) {
+  return spawnSync(process.execPath, [CLI, ...args], { cwd, encoding: 'utf8', env: bare(env) });
+}
+
+test('install codex --mcp writes ~/.codex/config.toml [mcp_servers.spor]', () => {
+  const home = scratchHome();
+  const cwd = mcpCwd();
+  const r = runIn(cwd, ['install', 'codex', '--mcp', '--server', 'http://127.0.0.1:9/', '--token', 'tok9'], { ...codexInstallEnv(home), SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const toml = fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8');
+  assert.match(toml, /^\[mcp_servers\.spor\]$/m);
+  assert.match(toml, /^url = "http:\/\/127\.0\.0\.1:9\/mcp"$/m);
+  assert.match(toml, /^bearer_token_env_var = "SPOR_TOKEN"$/m);
+  assert.match(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf8'), /<!-- spor:begin -->/);
+});
+
+test('install codex --mcp preserves unrelated config.toml content and is idempotent', () => {
+  const home = scratchHome();
+  const cwd = mcpCwd();
+  const f = path.join(home, '.codex', 'config.toml');
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, '[some_other_table]\nfoo = "bar"\n');
+  const env = { ...codexInstallEnv(home), SPOR_HOME: home };
+  const args = ['install', 'codex', '--mcp', '--server', 'http://127.0.0.1:9', '--token', 'tok9'];
+  const r1 = runIn(cwd, args, env);
+  assert.strictEqual(r1.status, 0, r1.stderr);
+  const once = fs.readFileSync(f, 'utf8');
+  assert.match(once, /^\[some_other_table\]$/m, 'foreign table preserved');
+  assert.match(once, /^foo = "bar"$/m);
+  assert.match(once, /^\[mcp_servers\.spor\]$/m);
+  const r2 = runIn(cwd, args, env); // second run must be byte-identical
+  assert.strictEqual(r2.status, 0, r2.stderr);
+  assert.strictEqual(fs.readFileSync(f, 'utf8'), once, 'idempotent re-install');
+});
+
+test('install gemini --mcp merges mcpServers.spor without clobbering foreign settings', () => {
+  const home = scratchHome();
+  const cwd = mcpCwd();
+  const f = path.join(home, '.gemini', 'settings.json');
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, JSON.stringify({ theme: 'dark', mcpServers: { other: { httpUrl: 'http://y' } } }));
+  const r = runIn(cwd, ['install', 'gemini', '--mcp', '--server', 'http://127.0.0.1:9', '--token', 'tok9'], { HOME: home, SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const j = JSON.parse(fs.readFileSync(f, 'utf8'));
+  assert.strictEqual(j.theme, 'dark', 'foreign top-level key preserved');
+  assert.ok(j.mcpServers.other, 'foreign mcp server preserved');
+  assert.deepStrictEqual(j.mcpServers.spor, { httpUrl: 'http://127.0.0.1:9/mcp', headers: { Authorization: 'Bearer $SPOR_TOKEN' } });
+  assert.ok(j.hooks && j.hooks.BeforeAgent, 'hooks still merged in the same install');
+});
+
+test('install opencode --mcp writes opencode.json mcp.spor, merges foreign content, and is idempotent', () => {
+  const home = scratchHome();
+  const cwd = mcpCwd();
+  const f = path.join(home, '.config', 'opencode', 'opencode.json');
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, JSON.stringify({ theme: 'dark', mcp: { other: { type: 'local' } } }));
+  const env = { HOME: home, SPOR_HOME: home };
+  const args = ['install', 'opencode', '--mcp', '--server', 'http://127.0.0.1:9', '--token', 'tok9'];
+  const r1 = runIn(cwd, args, env);
+  assert.strictEqual(r1.status, 0, r1.stderr);
+  const once = fs.readFileSync(f, 'utf8');
+  const j = JSON.parse(once);
+  assert.strictEqual(j.theme, 'dark', 'foreign top-level key preserved');
+  assert.ok(j.mcp.other, 'foreign mcp server preserved');
+  assert.deepStrictEqual(j.mcp.spor, { type: 'remote', url: 'http://127.0.0.1:9/mcp', headers: { Authorization: 'Bearer {env:SPOR_TOKEN}' } });
+  const r2 = runIn(cwd, args, env); // second run must be byte-identical
+  assert.strictEqual(r2.status, 0, r2.stderr);
+  assert.strictEqual(fs.readFileSync(f, 'utf8'), once, 'idempotent re-install');
+});
+
+test('install copilot --mcp writes mcp-config.json mcpServers.spor, merges foreign content, and is idempotent', () => {
+  const home = scratchHome();
+  const cwd = mcpCwd();
+  const f = path.join(home, '.copilot', 'mcp-config.json');
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, JSON.stringify({ mcpServers: { other: { type: 'http', url: 'http://y' } } }));
+  const env = { HOME: home, SPOR_HOME: home };
+  const args = ['install', 'copilot', '--mcp', '--server', 'http://127.0.0.1:9', '--token', 'tok9'];
+  const r1 = runIn(cwd, args, env);
+  assert.strictEqual(r1.status, 0, r1.stderr);
+  const once = fs.readFileSync(f, 'utf8');
+  const j = JSON.parse(once);
+  assert.ok(j.mcpServers.other, 'foreign mcp server preserved');
+  assert.deepStrictEqual(j.mcpServers.spor, { type: 'http', url: 'http://127.0.0.1:9/mcp', headers: { Authorization: 'Bearer $SPOR_TOKEN' } });
+  const r2 = runIn(cwd, args, env); // second run must be byte-identical
+  assert.strictEqual(r2.status, 0, r2.stderr);
+  assert.strictEqual(fs.readFileSync(f, 'utf8'), once, 'idempotent re-install');
+});
+
+test('install codex --mcp strips a hand-added subtable of our own section along with it', () => {
+  // Regression: the TOML section-stripper used to treat ANY `[...]` header as
+  // ending our `[mcp_servers.spor]` block, so a subtable like
+  // `[mcp_servers.spor.env]` would wrongly survive, orphaned, past a freshly
+  // appended replacement block.
+  const home = scratchHome();
+  const cwd = mcpCwd();
+  const f = path.join(home, '.codex', 'config.toml');
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, '[mcp_servers.spor]\nurl = "http://old/mcp"\n\n[mcp_servers.spor.env]\nFOO = "bar"\n\n[other_table]\nx = 1\n');
+  const r = runIn(cwd, ['install', 'codex', '--mcp', '--server', 'http://127.0.0.1:9', '--token', 'tok9'], { ...codexInstallEnv(home), SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const toml = fs.readFileSync(f, 'utf8');
+  assert.doesNotMatch(toml, /\[mcp_servers\.spor\.env\]/, 'the subtable of our own section is stripped, not orphaned');
+  assert.match(toml, /^\[other_table\]$/m, 'an unrelated table survives');
+  assert.match(toml, /^x = 1$/m);
+  assert.match(toml, /^url = "http:\/\/127\.0\.0\.1:9\/mcp"$/m);
+});
+
+test('install --mcp uses an already-configured server (no --server/--token needed this run)', () => {
+  // Regression: writeAgentsBlock resolves its server through the scripts/
+  // engines/util.js active-config global, which used to only get set when
+  // --server/--token were passed THIS invocation — a pre-existing
+  // config.json server was invisible to it (AGENTS.md would omit the MCP
+  // line or read raw env instead of the resolved cfg). A non-loopback host
+  // is used here (unlike the 127.0.0.1:9 fake elsewhere in this file)
+  // because the AGENTS.md assertion below checks the resolved server made
+  // it into the committed tools line, which a loopback host is now
+  // deliberately omitted from (issue-spor-agents-md-local-mcp-leak).
+  const home = scratchHome();
+  const cwd = mcpCwd();
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ server: 'http://spor.example.com:9', token: 'tok9' }));
+  const r = runIn(cwd, ['install', 'codex', '--mcp'], { ...codexInstallEnv(home), SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const toml = fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8');
+  assert.match(toml, /^url = "http:\/\/spor\.example\.com:9\/mcp"$/m);
+  const agentsMd = fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf8');
+  assert.match(agentsMd, /reachable over MCP at http:\/\/spor\.example\.com:9\/mcp/, 'agents-md resolved the pre-configured server, not raw env');
+});
+
+test('install --mcp still reminds about the manual README recipe for a host --mcp does not cover', () => {
+  const home = scratchHome();
+  const cwd = mcpCwd();
+  const r = runIn(cwd, ['install', 'codex', 'cursor', '--mcp', '--server', 'http://127.0.0.1:9', '--token', 'tok9'], { ...codexInstallEnv(home), SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(path.join(home, '.codex', 'config.toml')), 'codex got its mcp config');
+  assert.match(r.stdout, /distiller backend \(hosts without the claude CLI\): see adapters\/<host>\/README\.md/, 'distiller reminder is unconditional');
+  assert.match(r.stdout, /on-demand MCP access: see adapters\/<host>\/README\.md/, 'cursor still needs the manual recipe --mcp does not automate');
+});
+
+test('install --mcp aborts on an unparseable existing config, writing nothing', () => {
+  const home = scratchHome();
+  const cwd = mcpCwd();
+  const f = path.join(home, '.copilot', 'mcp-config.json');
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, '{not valid json');
+  const r = runIn(cwd, ['install', 'copilot', '--mcp', '--server', 'http://127.0.0.1:9', '--token', 'tok9'], { HOME: home, SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /isn't valid JSON/);
+  assert.strictEqual(fs.readFileSync(f, 'utf8'), '{not valid json', 'left untouched');
+  assert.ok(!fs.existsSync(path.join(cwd, 'AGENTS.md')), 'agents-md skipped after an mcp failure');
+});
+
+test('install --mcp aborts when the existing config path is unreadable (not just unparseable)', () => {
+  // A well-formed-vs-malformed JSON distinction isn't the only "can't safely
+  // touch this" case — an existing path this can't read at all (e.g. it's a
+  // directory) must abort the same way, not treat it as absent and clobber it.
+  // Uses copilot, whose mcp-config.json is a SEPARATE file from its hooks
+  // manifest, so the scenario exercises only the new --mcp write path.
+  const home = scratchHome();
+  const cwd = mcpCwd();
+  const f = path.join(home, '.copilot', 'mcp-config.json');
+  fs.mkdirSync(f, { recursive: true }); // a directory sits where the file should be
+  const r = runIn(cwd, ['install', 'copilot', '--mcp', '--server', 'http://127.0.0.1:9', '--token', 'tok9'], { HOME: home, SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /can't read/);
+  assert.ok(fs.statSync(f).isDirectory(), 'left untouched — not replaced with a file');
+});
+
+test('install gemini --mcp aborts on an unparseable existing settings.json, writing nothing (shared hooks+mcp file)', () => {
+  // Gemini's mcpServers entry lives in the SAME settings.json its hooks
+  // manifest does, unlike copilot/opencode (separate mcp-config.json) or
+  // codex (separate config.toml) — so the hook-install write and the mcp
+  // write target one file. Without a pre-check, installHookHost's lenient
+  // readJsonOr(target, {}) would silently discard a malformed existing file
+  // before writeMcpJson's strict check ever got a chance to abort.
+  const home = scratchHome();
+  const cwd = mcpCwd();
+  const f = path.join(home, '.gemini', 'settings.json');
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, '{not valid json');
+  const r = runIn(cwd, ['install', 'gemini', '--mcp', '--server', 'http://127.0.0.1:9', '--token', 'tok9'], { HOME: home, SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /isn't valid JSON/);
+  assert.strictEqual(fs.readFileSync(f, 'utf8'), '{not valid json', 'left untouched — no partial hooks-only write');
+  assert.ok(!fs.existsSync(path.join(cwd, 'AGENTS.md')), 'agents-md skipped after an mcp failure');
+});
+
+test('install --mcp aborts when the existing mcpServers key is a non-object, discarding nothing', () => {
+  // Valid top-level JSON whose group key has the WRONG shape (an array here)
+  // must abort like unparseable JSON does — replacing it with {spor: ...}
+  // would silently discard whatever the user had there.
+  const home = scratchHome();
+  const cwd = mcpCwd();
+  const f = path.join(home, '.copilot', 'mcp-config.json');
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  const original = JSON.stringify({ mcpServers: ['not', 'a', 'map'] }, null, 2) + '\n';
+  fs.writeFileSync(f, original);
+  const r = runIn(cwd, ['install', 'copilot', '--mcp', '--server', 'http://127.0.0.1:9', '--token', 'tok9'], { HOME: home, SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /non-object 'mcpServers'/);
+  assert.strictEqual(fs.readFileSync(f, 'utf8'), original, 'left untouched');
+});
+
+test('install --mcp without a configured server errors and writes nothing', () => {
+  const home = scratchHome();
+  const cwd = mcpCwd();
+  const r = runIn(cwd, ['install', 'codex', '--mcp'], { ...codexInstallEnv(home), SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /needs a configured server/);
+  assert.ok(!fs.existsSync(path.join(home, '.codex', 'config.toml')));
+});
+
+test('install without --mcp writes no MCP config and no AGENTS.md (v1 default unchanged)', () => {
+  const home = scratchHome();
+  const cwd = mcpCwd();
+  const r = runIn(cwd, ['install', 'codex', '--server', 'http://127.0.0.1:9', '--token', 'tok9'], { ...codexInstallEnv(home), SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(!fs.existsSync(path.join(home, '.codex', 'config.toml')), 'no MCP config written by default');
+  assert.ok(!fs.existsSync(path.join(cwd, 'AGENTS.md')), 'no AGENTS.md written by default');
+  assert.match(r.stdout, /see adapters\/<host>\/README\.md/);
+});
+
+test('install --mcp --print previews the MCP config and agents-md without writing', () => {
+  const home = scratchHome();
+  const cwd = mcpCwd();
+  const r = runIn(cwd, ['install', 'codex', '--mcp', '--print', '--server', 'http://127.0.0.1:9', '--token', 'tok9'], { ...codexInstallEnv(home), SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /would write .*config\.toml/);
+  assert.match(r.stdout, /\[mcp_servers\.spor\]/);
+  assert.match(r.stdout, /would run: spor-hook agents-md/);
+  assert.ok(!fs.existsSync(path.join(home, '.codex', 'config.toml')), 'dry run wrote nothing');
+  assert.ok(!fs.existsSync(path.join(cwd, 'AGENTS.md')), 'dry run wrote nothing');
 });
 
 // --- upgrade (issue-spor-upgrade-no-plugin-refresh) -----------------------
@@ -1669,6 +2001,11 @@ function digestStubServer() {
           res.end(JSON.stringify({ found: false }));
           return;
         }
+        if (parsed && parsed.root) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ found: true, text: `DIGEST for root: ${parsed.root}` }));
+          return;
+        }
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ found: true, text: `DIGEST for: ${(parsed && parsed.query) || ''}` }));
         return;
@@ -1681,17 +2018,32 @@ function digestStubServer() {
     resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
 }
 
-test('brief <id> (remote) emits the raw node plus a /v1/digest neighborhood', async () => {
+test('brief <id> (remote) emits the raw node plus a root-walk /v1/digest neighborhood', async () => {
   const { srv, hits, base } = await digestStubServer();
   try {
     const r = await runAsyncCli(['brief', 'dec-x'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-b' });
     assert.strictEqual(r.status, 0, r.stderr);
     assert.match(r.stdout, /Raw node body\./);          // the raw node
-    assert.match(r.stdout, /DIGEST for: A demo decision/); // title-seeded neighborhood
+    assert.match(r.stdout, /DIGEST for root: dec-x/); // root-walk neighborhood, not a free-text approximation
     assert.ok(hits.some((h) => h.method === 'GET' && h.url === '/v1/nodes/dec-x'), 'fetched the node');
     const dig = hits.find((h) => h.url === '/v1/digest');
     assert.ok(dig, 'compiled a digest');
+    assert.strictEqual(dig.body.root, 'dec-x', 'posted {root} instead of a title/summary-seeded query');
+    assert.strictEqual(dig.body.query, undefined, 'no free-text query for a node-id briefing');
     assert.strictEqual(dig.auth, 'Bearer tok-b', 'bearer token sent');
+  } finally {
+    srv.close();
+  }
+});
+
+test('brief <id> --project <slug> (remote) forwards project alongside root', async () => {
+  const { srv, hits, base } = await digestStubServer();
+  try {
+    const r = await runAsyncCli(['brief', 'dec-x', '--project', 'demo'], { SPOR_SERVER: base, SPOR_TOKEN: 'tok-b' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const dig = hits.find((h) => h.url === '/v1/digest');
+    assert.ok(dig, 'compiled a digest');
+    assert.deepStrictEqual(dig.body, { root: 'dec-x', project: 'demo' });
   } finally {
     srv.close();
   }

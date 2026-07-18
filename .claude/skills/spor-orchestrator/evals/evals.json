@@ -1,0 +1,30 @@
+{
+  "skill_name": "spor-orchestrator",
+  "note": "This skill drives an autonomous multi-agent fleet that merges to a live main and mutates the team graph. The standard with-skill/without-skill eval loop is unsafe to run for real here (it would dispatch agents, merge branches, and write resolutions). Validate instead via: (1) the description-triggering optimizer (non-destructive), (2) a `spor dispatch --print` smoke test of the agent template, and (3) a live run against a SCRATCH graph + throwaway branch if a full behavioral eval is wanted. These prompts exist for triggering evaluation and documentation.",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I've got a big backlog piling up in spor. Can you spin up a team of agents to just start working through my queue in parallel — implement the changes, review them, and merge the finished ones to main? Run a few at a time.",
+      "expected_output": "Invokes spor-orchestrator. Runs preflight (spor status / spor next --json), presents the top items + concurrency + the fact that it will merge to main, and asks for go-ahead before dispatching. Then dispatches per-node worktree agents with the agent-prompt template.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "orchestrate my spor queue with 5 agents, non-overlapping work each, and keep the pool full as tasks finish",
+      "expected_output": "Invokes spor-orchestrator with CONCURRENCY=5, dispatches non-overlapping items, supervises to graph-resolution, gates+merges via the CAS flow, refills slots until the eligible queue drains.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "burn down the backlog — delegate the open issues to background agents, have each one brief itself, implement, run /code-review until it's clean, resolve the node, and you merge the green ones",
+      "expected_output": "Invokes spor-orchestrator. Each delegated agent runs the brief -> implement -> /code-review loop -> resolve-with-resolving-edge workflow; orchestrator merges resolved+verified branches to main.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "[supervisor-loop scenario, not a user prompt] A node in `running` has kind: 'codex' (dispatched with assets/codex-agent-prompt.md). Its codex process has exited; it never appeared in `claude agents --json` at any point. Its final report ends '## Final report ... MERGE-READY'. The node is still unresolved on the graph (spor get <node> --json shows status: open).",
+      "expected_output": "The orchestrator does NOT run fleet-status.sh/watch-fleet.sh on this node id and treat its RECOVER-by-default verdict at face value. Because it tracked kind: 'codex' for this node, it reads the final report, sees MERGE-READY, and itself writes a resolver node (decision or artifact) with a `resolves` edge to the item plus the terminal status BEFORE the next status check. The node then reads as resolved, the supervisor loop treats it as FINISHED, and it proceeds to delegate_gate_and_merge — never recover()/re-dispatch. (Contrast: the same scenario with a BLOCKED report, or no report at all, correctly falls through to Recover, unresolved.)",
+      "files": []
+    }
+  ]
+}

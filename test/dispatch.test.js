@@ -705,9 +705,11 @@ test("dispatch spawns the claude binary with --bg in the target dir", () => {
 // The checkout dir is named `demo` so projectSlug() derives the same slug it gets
 // mapped under (the slug convention) — i.e. it passes the corrupt-mapping guard
 // (issue-spor-dispatch-repos-corruption-worktree-session-start).
-function gitTargetRepo() {
+// `name` names the checkout dir, hence the slug it derives; the GIT_DIR tests
+// pass a distinct one so a launcher repo can't be mistaken for the target.
+function gitTargetRepo(name = "demo") {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-wtrepo-"));
-  const repo = path.join(base, "demo");
+  const repo = path.join(base, name);
   fs.mkdirSync(repo);
   const g = (args) => {
     const r = spawnSync("git", ["-C", repo, ...args], {
@@ -832,6 +834,120 @@ test("dispatch worktree setup hook failure: aborts, removes the worktree + branc
   assert.notStrictEqual(branchCheck.status, 0, "branch removed (rev-parse misses)");
 });
 
+// issue-spor-orchestrator-cleanup-worktree-leak: a destructive worktree
+// teardown must never discard uncommitted work, even in this "we just
+// created it" failure path — refuse rather than force past a dirty tree.
+test("dispatch worktree setup hook leaves uncommitted changes then fails: worktree is left in place, not force-removed", () => {
+  const { home } = fixture();
+  const { repo, g } = gitTargetRepo();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const dirtyFailHook = writeSpawnableNodeStub(
+    home,
+    "dirty-fail",
+    'require("node:fs").writeFileSync("uncommitted.txt", "wip"); process.exit(3);'
+  );
+  setDispatch(home, { worktree: true, worktreeSetup: dirtyFailHook });
+  const mark = path.join(home, "launched.mark");
+  const stub = recordingStub(home);
+  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
+  assert.notStrictEqual(r.status, 0, "non-zero exit on setup failure");
+  assert.match(r.stderr, /setup hook failed/);
+  assert.match(r.stderr, /could not remove the half-prepped worktree.*uncommitted changes/s);
+  assert.ok(!fs.existsSync(mark), "agent never launched");
+  const wtDir = path.join(repo, ".claude", "worktrees", "dec-x");
+  assert.ok(fs.existsSync(wtDir), "dirty worktree left in place, not force-removed");
+  assert.ok(fs.existsSync(path.join(wtDir, "uncommitted.txt")), "uncommitted file survives");
+  assert.strictEqual(
+    g(["rev-parse", "--verify", "--quiet", "refs/heads/dec-x"]).trim().length,
+    40,
+    "branch left in place too"
+  );
+});
+
+// --- ambient git location env (issue-spor-dispatch-worktree-wrong-repo-location) --
+// Git resolves its repo from GIT_DIR/GIT_WORK_TREE BEFORE it discovers one from
+// the working directory, so a dispatch launched with those vars set — from a git
+// hook, `git rebase --exec`, a wrapper that exported one — used to run every git
+// call against the LAUNCHER's repo no matter which directory it named: the
+// worktree was cut from the launcher's HEAD and registered in the launcher's
+// repo (so the agent found the wrong codebase at the target's path), and the
+// corrupt-mapping guard misread the target's identity and refused a correct map.
+// Dispatch scrubs the location vars now (u.gitEnv), so the directory wins.
+
+test("dispatch --worktree under an ambient GIT_DIR: the worktree belongs to the TARGET repo, not the launcher's", () => {
+  const { home } = fixture();
+  const { repo, g } = gitTargetRepo();
+  const launcher = gitTargetRepo("launcher"); // an unrelated repo, as a git hook's GIT_DIR would name
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const outFile = path.join(home, "spawn.out");
+  const stub = pwdStub(home);
+  const r = run(["dispatch", "dec-x", "--no-brief", "--worktree"], {
+    SPOR_HOME: home,
+    SPOR_CLAUDE_CMD: stub,
+    OUTFILE: outFile,
+    GIT_DIR: path.join(launcher.repo, ".git"),
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const wtDir = path.join(repo, ".claude", "worktrees", "dec-x");
+  assert.ok(slashPath(g(["worktree", "list"])).includes("/.claude/worktrees/dec-x "), "target repo hosts the worktree");
+  assert.ok(
+    !slashPath(launcher.g(["worktree", "list"])).includes("/.claude/worktrees/dec-x "),
+    "launcher's repo hosts NO worktree"
+  );
+  assert.strictEqual(g(["rev-parse", "--verify", "--quiet", "refs/heads/dec-x"]).trim().length, 40, "branch cut in the target");
+  const cwd = fs.readFileSync(outFile, "utf8").split("\n")[0];
+  assert.strictEqual(cwd, fs.realpathSync(wtDir), "launched inside the target's worktree");
+});
+
+test("dispatch --print under an ambient GIT_DIR: reads the TARGET's identity, so the corrupt-map guard does not misfire", () => {
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  const launcher = gitTargetRepo("launcher");
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const r = run(["dispatch", "dec-x", "--no-brief", "--print"], {
+    SPOR_HOME: home,
+    GIT_DIR: path.join(launcher.repo, ".git"),
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stderr, /map is corrupt/, "a correct mapping is not refused");
+  assert.match(r.stdout, /slug: demo, via config/);
+});
+
+test("dispatch worktree setup hook under an ambient GIT_DIR: its git follows the worktree, not the launcher's repo", () => {
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  const launcher = gitTargetRepo("launcher");
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  // The hook records the REPO its own bare `git` call resolves to. It asks for
+  // the common git dir, not --show-toplevel: a bare GIT_DIR (no GIT_WORK_TREE)
+  // leaves git treating cwd as the work tree, so the toplevel looks right even
+  // while every object/ref it reads comes from the launcher's repo.
+  const hook = writeSpawnableNodeStub(
+    home,
+    "wt-gitdir",
+    `
+const { spawnSync } = require("node:child_process");
+const dir = spawnSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { encoding: "utf8" }).stdout || "";
+require("node:fs").writeFileSync(".wt-gitdir", dir.trim() + "\\n");
+`
+  );
+  setDispatch(home, { worktree: true, worktreeSetup: hook });
+  const r = run(["dispatch", "dec-x", "--no-brief"], {
+    SPOR_HOME: home,
+    SPOR_CLAUDE_CMD: noOpClaudeStub(home),
+    GIT_DIR: path.join(launcher.repo, ".git"),
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const wtDir = path.join(repo, ".claude", "worktrees", "dec-x");
+  const gitDir = fs.readFileSync(path.join(wtDir, ".wt-gitdir"), "utf8").trim();
+  assert.strictEqual(
+    slashPath(gitDir),
+    slashPath(path.join(fs.realpathSync(repo), ".git")),
+    "the hook's git reads the TARGET repo"
+  );
+  assert.ok(!slashPath(gitDir).includes("/launcher/"), "not the launcher's repo");
+});
+
 test("dispatch --backfill --print: worktree forced off even with dispatch.worktree=true", () => {
   const { home, repo } = fixture();
   setDispatch(home, { worktree: true });
@@ -871,6 +987,41 @@ test("dispatch (cross-repo): a relative dispatch.worktreeSetup in the target .sp
   const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: path.join(home, "o.out") }, elsewhere);
   assert.strictEqual(r.status, 0, r.stderr);
   assert.ok(fs.existsSync(path.join(repo, ".claude", "worktrees", "dec-x", ".ran")), "relative setup hook ran (resolved against the repo dir)");
+});
+
+test("dispatch (cross-repo): does not apply the LAUNCHER's own .spor.json dispatch.worktreeSetup to the target's worktree", () => {
+  // issue-spor-dispatch-worktree-setup-wrong-repo-config: dispatching from repo
+  // A (which declares its own dispatch.worktreeSetup, relative to A) for a node
+  // targeting repo B used to fall back to the standing cfg — anchored at A's
+  // cwd — and run A's relative script inside B's fresh worktree, where it does
+  // not exist (setup hook exit 127). The target (demo/B) declares no override
+  // of its own, so the fix must resolve the fallback against the TARGET, not
+  // silently inherit A's.
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+
+  const launcher = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-launcher-"));
+  fs.writeFileSync(
+    path.join(launcher, ".spor.json"),
+    JSON.stringify({ enabled: true, dispatch: { worktreeSetup: "scripts/only-in-launcher.sh" } }) + "\n"
+  );
+
+  const outFile = path.join(home, "spawn.out");
+  const stub = pwdStub(home);
+  const r = run(
+    ["dispatch", "dec-x", "--no-brief", "--worktree"],
+    { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile },
+    launcher
+  );
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stderr, /setup hook failed/);
+  const cwd = fs.readFileSync(outFile, "utf8").split("\n")[0];
+  assert.strictEqual(
+    cwd,
+    fs.realpathSync(path.join(repo, ".claude", "worktrees", "dec-x")),
+    "launched in the target's worktree, unaffected by the launcher's foreign setup hook"
+  );
 });
 
 test("dispatch --no-worktree overrides the target repo's .spor.json dispatch.worktree", () => {
@@ -1245,6 +1396,67 @@ test("dispatch --template (node mode): fills {{node}} and {{title}}", () => {
   assert.match(prompt, /TITLE=A demo decision about auth token rotation/);
 });
 
+test("dispatch --template (node mode): fills {{id}}/{{summary}}/{{type}}/{{status}}/{{date}} from the dispatched node's frontmatter", () => {
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const tpl = path.join(home, "f.tpl");
+  fs.writeFileSync(tpl, "ID={{id}}\nSUMMARY={{summary}}\nTYPE={{type}}\nSTATUS={{status}}\nDATE={{date}}\n");
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cwd-"));
+  const r = run(["dispatch", "dec-x", "--template", tpl, "--print"], { SPOR_HOME: home }, elsewhere);
+  assert.strictEqual(r.status, 0);
+  const prompt = promptOf(r.stdout);
+  assert.match(prompt, /ID=dec-x/);
+  assert.match(prompt, /SUMMARY=A demo decision describing auth token rotation and credential handling for the pipeline\./);
+  assert.match(prompt, /TYPE=decision/);
+  assert.match(prompt, /STATUS=\n/); // dec-x fixture carries no status: line — blanks out, not "unknown"
+  assert.match(prompt, /DATE=2026-06-01/);
+});
+
+test("dispatch --template: node fields blank out in free-text dispatch (no target node)", () => {
+  const { home, repo } = fixture();
+  const tpl = path.join(home, "b.tpl");
+  fs.writeFileSync(tpl, "ID={{id}}|SUMMARY={{summary}}|TYPE={{type}}|STATUS={{status}}|DATE={{date}}\n");
+  const r = run(["dispatch", "auth token rotation credentials", "--dir", repo, "--template", tpl, "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0);
+  const prompt = promptOf(r.stdout);
+  assert.match(prompt, /ID=\|SUMMARY=\|TYPE=\|STATUS=\|DATE=/);
+});
+
+test("dispatch --template: {{summary}} preserves a YAML folded multi-line value (not truncated to the first line)", () => {
+  const { home, repo } = fixture();
+  fs.writeFileSync(
+    path.join(home, "nodes", "dec-folded.md"),
+    "---\nid: dec-folded\ntype: decision\nrepo: demo\ntitle: A folded-summary decision\n" +
+      "summary: A summary that folds\n  across a second line\n  and a third line too.\n---\nBody text.\n"
+  );
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const tpl = path.join(home, "fold.tpl");
+  fs.writeFileSync(tpl, "SUMMARY={{summary}}\n");
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cwd-"));
+  const r = run(["dispatch", "dec-folded", "--template", tpl, "--print"], { SPOR_HOME: home }, elsewhere);
+  assert.strictEqual(r.status, 0);
+  const prompt = promptOf(r.stdout);
+  assert.match(prompt, /SUMMARY=A summary that folds across a second line and a third line too\./);
+});
+
+test("dispatch --template: {{status}} does not false-match a body line that happens to start with 'status:'", () => {
+  const { home, repo } = fixture();
+  fs.writeFileSync(
+    path.join(home, "nodes", "dec-nostatus.md"),
+    "---\nid: dec-nostatus\ntype: decision\nrepo: demo\ntitle: A decision with no status field\n" +
+      "summary: A decision whose body happens to mention a status line.\n---\n" +
+      "status: still needs follow-up work per the team.\n"
+  );
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const tpl = path.join(home, "nostatus.tpl");
+  fs.writeFileSync(tpl, "STATUS=[{{status}}]\n");
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cwd-"));
+  const r = run(["dispatch", "dec-nostatus", "--template", tpl, "--print"], { SPOR_HOME: home }, elsewhere);
+  assert.strictEqual(r.status, 0);
+  const prompt = promptOf(r.stdout);
+  assert.match(prompt, /STATUS=\[\]/);
+});
+
 test("dispatch --template: {{default}} embeds the built-in prompt; unknown placeholders warn and blank out", () => {
   const { home, repo } = fixture();
   const tpl = path.join(home, "w.tpl");
@@ -1331,8 +1543,11 @@ function runAsync(args, env, cwd) {
 // (the inbound resolves/answers edge it surfaces, API.md §3). `nodeRequires`/
 // `nodeHeld` exercise the readiness guard (task-spor-dispatch-readiness-guard):
 // a `requires:` frontmatter line and/or the server's `held` get()-hook
-// enrichment (schema-task.md).
-function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nodeResolution = null, nodeRequires = null, nodeHeld = null } = {}) {
+// enrichment (schema-task.md). `nodeType`/`nodeInert` exercise the type-aware
+// resolved-task guard (issue-spor-type-blind-terminal-status-fallbacks): a
+// non-default node type for the offline seed-registry fallback, and the
+// server-computed `inert` enrichment key.
+function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nodeResolution = null, nodeRequires = null, nodeHeld = null, nodeType = "task", nodeInert = null } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = "";
@@ -1343,9 +1558,10 @@ function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nod
         const id = decodeURIComponent(req.url.split("/").pop());
         const statusLine = nodeStatus ? `\nstatus: ${nodeStatus}` : "";
         const requiresLine = nodeRequires ? `\nrequires: [${nodeRequires}]` : "";
-        const node = { raw: `---\nid: ${id}\ntype: task\nrepo: demo${statusLine}${requiresLine}\ntitle: Demo task ${id}\nsummary: A demo task.\ndate: 2026-06-01\n---\nbody\n` };
+        const node = { raw: `---\nid: ${id}\ntype: ${nodeType}\nrepo: demo${statusLine}${requiresLine}\ntitle: Demo task ${id}\nsummary: A demo task.\ndate: 2026-06-01\n---\nbody\n` };
         if (nodeResolution) node.resolution = nodeResolution;
         if (nodeHeld) node.held = nodeHeld;
+        if (typeof nodeInert === "boolean") node.inert = nodeInert;
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(node));
         return;
@@ -1423,6 +1639,39 @@ test("dispatch --force (remote): omits the dispatch nonce so a deliberate re-dis
     assert.ok(claim, "the claim was still attempted");
     const body = JSON.parse(claim.body || "{}");
     assert.ok(!("dispatch" in body), "--force omits the nonce so the claim renews instead of conflicting");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --force (remote): a worktree-setup failure does NOT release the pre-existing lease --force just renewed", async () => {
+  // --force omits the dispatch nonce specifically so the claim RENEWS whatever
+  // lease already exists (the conflict-branch message elsewhere promises
+  // "keeps the lease") — that lease may belong to an already-running agent from
+  // an earlier dispatch. If worktree setup then fails, the abort-cleanup added
+  // for issue-spor-dispatch-worktree-setup-wrong-repo-config must not release a
+  // lease this invocation didn't freshly establish.
+  const { repo, g } = gitTargetRepo();
+  const failHook = writeSpawnableNodeStub(repo, "fail-setup", "process.exit(3);");
+  fs.writeFileSync(
+    path.join(repo, ".spor.json"),
+    JSON.stringify({ enabled: true, dispatch: { worktreeSetup: path.relative(repo, failHook) } }) + "\n"
+  );
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-home-"));
+  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
+  const stub = claudeStub(home, path.join(home, "launched"));
+  try {
+    const r = await runAsync(
+      ["dispatch", "task-rotate", "--dir", repo, "--no-brief", "--force", "--worktree"],
+      remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub })
+    );
+    assert.notStrictEqual(r.status, 0, "setup failure aborts the dispatch");
+    assert.match(r.stderr, /setup hook failed/);
+    assert.ok(claimHit(hits), "--force still claimed (renewed) the lease");
+    assert.ok(
+      !hits.some((h) => h.method === "POST" && /\/release$/.test(h.url)),
+      "the --force renewal of a pre-existing lease is never auto-released on a setup failure"
+    );
   } finally {
     srv.close();
   }
@@ -1833,6 +2082,27 @@ test("dispatch <node-id> (local): a genuinely-open node is NOT guarded — dispa
   assert.ok(fs.existsSync(sentinel), "an open task with no resolver dispatches normally");
 });
 
+test("dispatch <node-id> (local): the resolved-task guard reads the real parser, not a body line that happens to start with 'status:'", () => {
+  // issue-spor-fmfield-multiline-truncation: the guard used to re-derive status
+  // via a single-line regex over the raw node text (unbounded by the closing
+  // `---`), so a body line like "status: done" below a frontmatter with no
+  // status field at all would false-match as terminal and wrongly refuse the
+  // dispatch. It must read the already-parsed frontmatter status instead.
+  const { home, repo } = resolvedFixture();
+  fs.writeFileSync(
+    path.join(home, "nodes", "task-body-status.md"),
+    "---\nid: task-body-status\ntype: task\nrepo: demo\ntitle: A task with no status field\n" +
+      "summary: A task whose frontmatter carries no status field but whose body mentions one.\n" +
+      "date: 2026-06-05\n---\n" +
+      "Follow-up note below.\n\nstatus: done\n\nThat line describes a PAST status update quoted in the body, not this node's frontmatter.\n"
+  );
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "task-body-status", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(sentinel), "the body's 'status:' line must not false-gate the dispatch");
+});
+
 test("dispatch <node-id> --print (local): previews the resolved warning; --force flips it; clean run prints none", () => {
   const { home, repo } = resolvedFixture();
   const r = run(["dispatch", "task-done", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home });
@@ -1873,6 +2143,86 @@ test("dispatch <node-id> (remote): a terminal-status node from the server refuse
     assert.match(r.stderr, /task-rotate is already resolved \(status: done\)/);
     assert.ok(!claimHit(hits), "no claim POST for a resolved node");
     assert.ok(!fs.existsSync(sentinel), "no launch");
+  } finally {
+    srv.close();
+  }
+});
+
+// issue-spor-type-blind-terminal-status-fallbacks: `released` is terminal
+// for an ARTIFACT only (schema-artifact's own status.terminal/inert
+// partition), not the type-blind fallback vocabulary — the remote pre-flight
+// check has no loaded graph, so it must consult the offline seed-registry
+// fallback (not just the flat cross-type list) to see this.
+test("dispatch <node-id> (remote): a released ARTIFACT refuses via the offline seed-registry fallback", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ nodeType: "artifact", nodeStatus: "released" });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 1, r.stderr);
+    assert.match(r.stderr, /task-rotate is already resolved \(status: released\)/);
+    assert.ok(!claimHit(hits), "no claim POST for a resolved node");
+    assert.ok(!fs.existsSync(sentinel), "no launch");
+  } finally {
+    srv.close();
+  }
+});
+
+// The same "released" status on a task must stay live — proves the fallback
+// is genuinely type-aware, not a bigger flat list that would now also treat
+// every released TASK as done.
+test("dispatch <node-id> (remote): a released TASK (not an artifact) is NOT guarded — dispatch proceeds", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ nodeType: "task", nodeStatus: "released" });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(claimHit(hits), "a released task is not terminal, so the normal claim flow runs");
+    assert.ok(fs.existsSync(sentinel), "and launches");
+  } finally {
+    srv.close();
+  }
+});
+
+// The forward-compat leg: a server-computed `inert: true` (once shipped,
+// issue-spor-type-blind-terminal-status-fallbacks) is trusted outright — it
+// can see graph-resident overrides the offline fallback can't, so it must
+// win even over a status/type combo the offline check wouldn't call terminal.
+test("dispatch <node-id> (remote): a server-computed `inert: true` refuses regardless of the offline vocabulary", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ nodeType: "widget", nodeStatus: "archived", nodeInert: true });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 1, r.stderr);
+    assert.match(r.stderr, /task-rotate is already resolved \(status: archived\)/);
+    assert.ok(!claimHit(hits), "no claim POST for a server-flagged inert node");
+    assert.ok(!fs.existsSync(sentinel), "no launch");
+  } finally {
+    srv.close();
+  }
+});
+
+// An explicit server `inert: false` is just as authoritative as `true` — it
+// must win over the offline fallback, not just be ignored as "unknown". A
+// released ARTIFACT is exactly the status/type combo the offline check
+// treats as terminal on its own (schema-artifact's seed status.terminal),
+// so this pins that the server's negative overrules it rather than being
+// silently outvoted by the offline heuristic.
+test("dispatch <node-id> (remote): a server-computed `inert: false` proceeds even though the offline check alone would refuse", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ nodeType: "artifact", nodeStatus: "released", nodeInert: false });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(claimHit(hits), "a server-flagged NOT-inert node runs the normal claim flow");
+    assert.ok(fs.existsSync(sentinel), "and launches");
   } finally {
     srv.close();
   }
@@ -1949,6 +2299,44 @@ test("dispatch <node-id> --force (local): --force does NOT override the requires
   assert.strictEqual(r.status, 1, r.stderr);
   assert.match(r.stderr, /requires a human/);
   assert.ok(!fs.existsSync(sentinel), "--force has no effect on the requires:human refusal");
+});
+
+// issue-spor-dispatch-probe-side-effect-before-refusal: the requires:human
+// refusal must fire BEFORE resolveDispatchProfile/probeCapabilities run, so a
+// refused dispatch persists nothing to local config. Assign the node to an
+// agent under a profile too, so — were the ordering still wrong — profile
+// resolution would run and write a probed capability cache.
+test("dispatch <node-id> (local): requires:human refuses BEFORE profile resolution — no .probed side effect", () => {
+  const { home, nodes, repo } = readinessFixture();
+  writeProfile(nodes, "profile-codex", "harness: codex");
+  fs.writeFileSync(
+    path.join(nodes, "agent-test.md"),
+    `---\nid: agent-test\ntype: agent\ntitle: Test agent\nsummary: A test agent.\ndate: 2026-06-18\nedges:\n  - {type: uses-profile, to: profile-codex}\n---\nAgent.\n`
+  );
+  fs.writeFileSync(
+    path.join(nodes, "task-needs-human-profiled.md"),
+    `---\nid: task-needs-human-profiled\ntype: task\nrepo: demo\nstatus: open\nrequires: [human]\ntitle: Human work also assigned to a profiled agent\nsummary: A requires:human task that ALSO carries an assigned->agent edge with a profile, so profile resolution would run and probe capabilities if the guard didn't refuse first.\ndate: 2026-06-05\nedges:\n  - {type: assigned, to: agent-test}\n---\nbody\n`
+  );
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const cfgFile = path.join(home, "config.json");
+  const r = run(
+    ["dispatch", "task-needs-human-profiled", "--dir", repo, "--no-brief"],
+    { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, ...cleanProbeEnv() }
+  );
+  assert.strictEqual(r.status, 1, r.stderr);
+  assert.match(r.stderr, /cannot dispatch task-needs-human-profiled: this item requires a human/);
+  assert.ok(!fs.existsSync(sentinel), "no agent was launched");
+  let cfg = {};
+  try {
+    cfg = JSON.parse(fs.readFileSync(cfgFile, "utf8"));
+  } catch {
+    /* no config.json at all is also proof of no side effect */
+  }
+  assert.ok(
+    !(cfg.dispatch && cfg.dispatch.capabilities && cfg.dispatch.capabilities.probed),
+    "the refusal must not persist a probed capability cache to local config"
+  );
 });
 
 test("dispatch <node-id> (local): assigned-to-person WARNS but still launches", () => {

@@ -23,10 +23,17 @@ functions**.
 policy layer — see GRAPH.md. `kind: register` declares a named, extensible
 **enum** the kernel exposes as a partition rather than a hardcoded table: a
 payload `{ "register": "<name>", "classes": [{ "id": …, "description": … }] }`,
-keyed by register name (graph beats seed, higher CalVer wins). The seed
-`requires` register — the work-node risk/permission axis — is the first; read it
-with `graph.registry.requiresClasses()`. Grow it by writing a resident `kind:
-register` schema with the same `register:` name.)
+keyed by register name (graph beats seed, higher CalVer wins). Two seed
+registers ship today: `requires` — the work-node risk/permission axis, read
+with `graph.registry.requiresClasses()` — and `terminal-status` — the
+type-blind status vocabulary that retires any node from queue liveness,
+briefing surfacing, and coupling-norm matching, read with
+`graph.registry.registerClasses("terminal-status")` and unioned with each
+type's `status.inert` overlay by the type-aware
+`isTerminalStatus(status, type, graph)`. Grow either by writing a resident
+`kind: register` schema with the same `register:` name — but put a status
+that should retire only ONE type in that schema's `status.inert`/
+`status.terminal`, not in the register, which retires it for every type.)
 
 ### Node schema — JSON payload keys
 
@@ -54,9 +61,22 @@ register` schema with the same `register:` name.)
 - `status.non_resolving` — statuses that count as *not* resolving for the
   completion gate (an `abandoned` task resolves nothing).
 - `status.terminal` — statuses in which a node's OWN lifecycle is complete,
-  read by work-analytics (unioned with the kernel's legacy terminal set). Use it
-  for a status that ends the node's life but is intentionally not a global
-  terminal — e.g. decision `settled`, which still surfaces in briefings.
+  read by work-analytics (unioned with the kernel's legacy terminal set).
+  **Beware: `status.inert` inherits this set when not declared**, so a terminal
+  status also retires the node from queues/briefings by default — a status
+  that ends the node's life but must KEEP surfacing (decision `settled`) needs
+  a narrower explicit `inert` beside it, exactly as the seed decision schema
+  declares.
+- `status.inert` — statuses in which a node of THIS type is queue-liveness-dead
+  (retired from queues, briefing live-work surfacing, coupling matching), the
+  per-type overlay `isTerminalStatus(status, type, graph)` unions with the
+  type-blind `terminal-status` register. **Declare it only when it differs from
+  `status.terminal`** — a schema with no `inert` set inherits its `terminal`
+  set (dec-spor-status-inert-third-partition). The seed decision schema is the
+  canonical exception: `settled` is terminal (analytics counts it done) but NOT
+  inert (it keeps surfacing as live guidance). Use a per-type declaration —
+  never the type-blind register — for an org status like artifact `released`,
+  so it retires only nodes of its own type.
 
 Note what the payload does **not** hold: there is no field list and no status
 *enum*. Extra frontmatter fields are allowed as-is — a custom `severity:` line

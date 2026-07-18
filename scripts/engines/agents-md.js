@@ -25,9 +25,167 @@ const END = "<!-- spor:end -->";
 const LEGACY_BEGIN = "<!-- substrate:begin -->";
 const LEGACY_END = "<!-- substrate:end -->";
 
-function toolsLine() {
+// Parse one dotted-decimal segment honoring the WHATWG URL host-parsing
+// radix rules — the same rules the fetch/URL machinery that actually
+// connects to SPOR_SERVER applies to its hostname: a `0x`/`0X` prefix reads
+// as hex, a bare leading `0` (with more digits following) reads as octal,
+// otherwise decimal. Without this, an octal/hex spelling of a loopback
+// octet (`0177`, `0x7f`) parses as its decimal digits instead — a real
+// loopback address that the matcher would then miss. Returns null for
+// anything that isn't a valid, unambiguous segment.
+function parseIPv4Segment(str) {
+  if (!str) return null;
+  let radix = 10;
+  let digits = str;
+  let maxLen = 10;
+  if (/^0[xX]/.test(str)) {
+    radix = 16;
+    digits = str.slice(2);
+    maxLen = 8;
+  } else if (str.length > 1 && str[0] === "0") {
+    radix = 8;
+    digits = str.slice(1);
+    maxLen = 11;
+  }
+  // Insignificant zero-padding doesn't count against maxLen (a bound meant
+  // to keep the parsed value within safe-integer precision) — real URL
+  // host-parsing accepts arbitrarily zero-padded literals.
+  digits = digits.replace(/^0+(?=.)/, "");
+  const validDigits = radix === 16 ? /^[0-9a-f]+$/i : radix === 8 ? /^[0-7]+$/ : /^[0-9]+$/;
+  if (!digits.length || digits.length > maxLen || !validDigits.test(digits)) return null;
+  return parseInt(digits, radix);
+}
+
+// Parse an IPv4 host into its 32-bit value, honoring the inet_aton
+// shorthand forms (`127.1`, `127.0.1`, a bare integer) that a developer's
+// SPOR_SERVER might use — not just the canonical 4-octet decimal form.
+// Returns null for anything that isn't a valid IPv4 literal.
+function parseIPv4(str) {
+  let parts = str.split(".");
+  // WHATWG URL host parsing drops exactly one trailing empty label before
+  // the IPv4 parse (a root-label dot: `127.1.`, `0177.0.0.1.`,
+  // `2130706433.` all resolve to loopback) — without this a fetch/URL call
+  // against SPOR_SERVER would classify the host as loopback while this
+  // string-only parser missed it, letting a machine-local address slip
+  // into the committed tools line.
+  if (parts.length > 1 && parts[parts.length - 1] === "") parts = parts.slice(0, -1);
+  const n = parts.length;
+  if (n < 1 || n > 4) return null;
+  const nums = parts.map(parseIPv4Segment);
+  if (nums.some((v) => v == null)) return null;
+  for (let i = 0; i < n - 1; i++) {
+    if (nums[i] > 255) return null;
+  }
+  const lastBits = 8 * (5 - n);
+  if (nums[n - 1] > 2 ** lastBits - 1) return null;
+  let value = 0;
+  for (let i = 0; i < n - 1; i++) value = value * 256 + nums[i];
+  value = value * 2 ** lastBits + nums[n - 1];
+  return value > 0xffffffff ? null : value >>> 0;
+}
+
+// A parsed IPv4 address is machine-local if it's loopback (127.0.0.0/8) or
+// the "any" address (0.0.0.0) — 0.0.0.0 isn't technically a loopback address,
+// but a server bound to it is reachable only from the same machine, so it
+// belongs in this suppression the same as 127.0.0.0/8 does.
+function isMachineLocalIPv4Value(value) {
+  return (value >>> 24) === 127 || value === 0;
+}
+
+// Expand an IPv6 literal (bare hostname, no brackets) to its 8 16-bit
+// groups, handling "::" compression and a trailing embedded-IPv4 tail
+// (`::ffff:127.0.0.1`, the deprecated `::127.0.0.1`). Returns null if the
+// literal doesn't parse. When the literal carries a dotted-quad tail, the
+// already-parsed 32-bit value is returned alongside the groups as
+// `embeddedIPv4`, so a caller checking the embedded address doesn't have to
+// re-derive it from the last two hex groups.
+function expandIPv6(addr) {
+  // A trailing dotted-quad (mapped `::ffff:127.0.0.1` or the deprecated
+  // compatible `::127.0.0.1`) rewrites to two hex groups first, so the rest
+  // of the parse only ever deals in plain hex groups. `.*:` is greedy, so it
+  // captures up through the LAST colon — the one separating the embedded
+  // IPv4 from whatever precedes it, "::" compression included.
+  let body = addr;
+  let embeddedIPv4 = null;
+  const tail = addr.match(/^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (tail) {
+    const v4 = parseIPv4(tail[2]);
+    if (v4 == null) return null;
+    embeddedIPv4 = v4;
+    body = tail[1] + (v4 >>> 16).toString(16) + ":" + (v4 & 0xffff).toString(16);
+  }
+
+  const doubleColon = body.indexOf("::");
+  let groups;
+  if (doubleColon !== -1) {
+    if (body.indexOf("::", doubleColon + 1) !== -1) return null;
+    const left = body.slice(0, doubleColon).split(":").filter(Boolean);
+    const right = body.slice(doubleColon + 2).split(":").filter(Boolean);
+    const missing = 8 - (left.length + right.length);
+    if (missing < 0) return null;
+    groups = [...left, ...Array(missing).fill("0"), ...right];
+  } else {
+    groups = body === "" ? [] : body.split(":");
+  }
+  if (groups.length !== 8 || !groups.every((g) => /^[0-9a-f]{1,4}$/i.test(g))) return null;
+  return { groups: groups.map((g) => parseInt(g, 16)), embeddedIPv4 };
+}
+
+// A parsed IPv6 host is loopback in three forms: the canonical/expanded
+// `::1`, an IPv4-mapped address (`::ffff:a.b.c.d`) whose embedded IPv4 is
+// loopback, or the deprecated all-zero-prefix IPv4-compatible form.
+function isLoopbackIPv6(hostname) {
+  const expanded = expandIPv6(hostname);
+  if (!expanded) return false;
+  const { groups, embeddedIPv4 } = expanded;
+  if (groups.slice(0, 7).every((g) => g === 0) && groups[7] === 1) return true;
+  if (groups.slice(0, 5).every((g) => g === 0) && (groups[5] === 0 || groups[5] === 0xffff)) {
+    // A literal without a dotted-quad tail (e.g. the fully-expanded
+    // `0:0:0:0:0:ffff:7f00:1`) still encodes the embedded IPv4 in the last
+    // two groups — fall back to reconstructing it from those.
+    const v4 = embeddedIPv4 != null ? embeddedIPv4 : ((groups[6] << 16) | groups[7]) >>> 0;
+    return isMachineLocalIPv4Value(v4);
+  }
+  return false;
+}
+
+// Loopback hosts — 127.0.0.0/8 (any spelling: `127.1`, `127.0.0.2`, …),
+// 0.0.0.0, `localhost`, and ::1 (any spelling: fully-expanded,
+// IPv4-mapped/-compatible) — are machine-local; baking one into a COMMITTED
+// file leaks a developer's dev-server address to every other contributor
+// (issue-spor-agents-md-local-mcp-leak). `host` is u.serverHost()'s output
+// (scheme/path already stripped); peel the bracket/port a hostname carries.
+// Brackets are checked before a bare port strip, and a bare host with more
+// than one colon is left alone, because an unbracketed IPv6 address's
+// colons would otherwise be misread as a port.
+function isLocalServer(host) {
+  const bracketed = host.match(/^\[([^\]]+)\]/);
+  const hostname = bracketed
+    ? bracketed[1]
+    : (host.match(/:/g) || []).length > 1
+      ? host
+      : host.replace(/:\d+$/, "");
+  if (/^localhost$/i.test(hostname)) return true;
+  if (hostname.includes(":")) return isLoopbackIPv6(hostname);
+  const v4 = parseIPv4(hostname);
+  return v4 != null && isMachineLocalIPv4Value(v4);
+}
+
+// One "should this host be suppressed" rule, shared by both places a server
+// host can land in the COMMITTED block (the tools-line sentence and the
+// briefing heading's `meta`) — an explicit --no-server-line always hides it,
+// same as a loopback host does. A second inline spelling of this predicate is
+// exactly how issue-spor-agents-md-briefing-header-leak happened: the caller
+// wired `noServerLine` through, but the briefing-heading computation never
+// consulted it.
+function hideHost(host, noServerLine) {
+  return noServerLine || isLocalServer(host);
+}
+
+function toolsLine({ noServerLine = false } = {}) {
   const server = u.serverBase();
-  const mcp = server ? ` It is reachable over MCP at ${server}/mcp (bearer token).` : "";
+  const showServer = server && !hideHost(u.serverHost(), noServerLine);
+  const mcp = showServer ? ` It is reachable over MCP at ${server}/mcp (bearer token).` : "";
   return `A team knowledge graph (Spor) holds prior decisions, constraints, dismissed approaches, and deferred work.${mcp} Before designing or deciding anything non-trivial, check it (query_graph). Ask show_queue what to work on next. When a git commit implements a tracked node (a task, decision, or issue), add a 'Spor: <node-id>' trailer to the commit message, in the final trailer block alongside any Co-Authored-By (no blank line between trailers) — git then records which node the commit serves, and the graph records the commit's sha.`;
 }
 
@@ -39,10 +197,14 @@ function toolsLine() {
 // mode observed in the 2026-07-04 capture retrospective
 // (art-cc-capture-discipline-results-2): work discovered but never filed,
 // fix-before-issue, decisions kept only in chat, durable facts leaking to
-// private auto-memory, bare status flips, and a substantial multi-node session
-// whose connective outcome artifact never got filed until the human asked
-// (issue-spor-session-outcome-artifact-capture-gap) — nothing triggers the
-// session-level provenance hub the way the terminal-status gate triggers a
+// private auto-memory, bare status flips, a cohort of work nodes whose build
+// order stayed in prose instead of becoming `blocks` edges
+// (issue-spor-agent-missing-dependency-edges — the gardener's unedged-gate
+// detector catches it, but only on the next sweep and only as advice, so the
+// creation-time guarantee has to live here), and a substantial multi-node
+// session whose connective outcome artifact never got filed until the human
+// asked (issue-spor-session-outcome-artifact-capture-gap) — nothing triggers
+// the session-level provenance hub the way the terminal-status gate triggers a
 // resolver.
 const DIRECTIVE = `Keep the graph current as you work — do these unprompted:
 
@@ -54,6 +216,11 @@ const DIRECTIVE = `Keep the graph current as you work — do these unprompted:
   node is the lineage the fix resolves.
 - Made a decision worth keeping (approach chosen, alternative ruled out,
   gotcha paid for)? Capture it at the moment it is made, not at session end.
+- Filing more than one piece of work at once? If you know the order they must
+  happen in — even if you only said it in prose ("keystone", "do this first",
+  "gated on") — write that order as \`blocks\` edges between them before you move
+  on. The queue takes its dependency signal only from \`blocks\` edges and never
+  from prose, so an unwired cohort surfaces in the wrong order.
 - Durable, team-relevant facts belong in the graph, never only in private
   auto-memory or scratch notes. If you are about to "remember" something a
   teammate or future session could need, capture it to Spor as well.
@@ -83,7 +250,7 @@ function nodeBody(raw) {
 // Core writer: compose the managed block and splice it into AGENTS.md at the
 // repo root. `briefing: false` skips the standing-briefing fetch/embed
 // entirely (no server round-trip). Returns { file, meta, hadBriefing }.
-async function writeAgentsBlock({ cwd, briefing = true }) {
+async function writeAgentsBlock({ cwd, briefing = true, noServerLine = false }) {
   const graph = u.graphHome();
   const root = u.git(cwd, ["rev-parse", "--show-toplevel"])?.trim() || cwd;
   const slug = u.projectSlug(root);
@@ -102,7 +269,15 @@ async function writeAgentsBlock({ cwd, briefing = true }) {
           // jq -r emits a trailing newline; head -c counts it; $() strips it.
           body = u.stripTrailingNewlines(u.byteHead((parsed.body ?? "") + "\n", 7000));
           const version = parsed.version ?? 1;
-          meta = `brief-${slug} v${version} @ ${u.serverHost()}`;
+          const host = u.serverHost();
+          // Same hideHost() guard as toolsLine(): the briefing heading is
+          // also part of the COMMITTED block, so a loopback host or an
+          // explicit --no-server-line must suppress it here too
+          // (issue-spor-agents-md-local-mcp-leak,
+          // issue-spor-agents-md-briefing-header-leak).
+          meta = hideHost(host, noServerLine)
+            ? `brief-${slug} v${version}`
+            : `brief-${slug} v${version} @ ${host}`;
         }
       } catch {}
     } else {
@@ -121,7 +296,7 @@ async function writeAgentsBlock({ cwd, briefing = true }) {
 
   const directive = `## Spor team graph
 
-${toolsLine()}
+${toolsLine({ noServerLine })}
 
 ${DIRECTIVE}`;
   const section = body
@@ -167,23 +342,23 @@ ${body}`
     out = (existing !== null ? existing + "\n" : "") + block + "\n";
   }
 
-  const tmp = file + `.spor-tmp-${process.pid}`;
-  fs.writeFileSync(tmp, out);
-  fs.renameSync(tmp, file);
+  u.writeFileAtomic(file, out);
   return { file, meta, hadBriefing: !!body };
 }
 
 async function agentsMd(input, args = []) {
   let cwd = "";
   let briefing = true;
+  let noServerLine = false;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--cwd") cwd = args[i + 1] ?? "";
     if (args[i] === "--directive-only") briefing = false;
+    if (args[i] === "--no-server-line") noServerLine = true;
   }
   if (!cwd && input && input.cwd) cwd = input.cwd;
   if (!cwd) cwd = process.cwd();
 
-  const { file, meta } = await writeAgentsBlock({ cwd, briefing });
+  const { file, meta } = await writeAgentsBlock({ cwd, briefing, noServerLine });
   process.stderr.write(
     `updated ${file} (${briefing ? meta || "no briefing yet, MCP pointers only" : "directive only"})\n`
   );
