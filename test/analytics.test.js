@@ -595,6 +595,30 @@ test("analyze: a retype-only commit (status untouched) invalidates the cached fo
   assert.equal(completedWeek.week, "2026-W20");            // the actual release commit, not the retype week
 });
 
+test("analyze: an UNCOMMITTED retype (HEAD unchanged) also invalidates an exact-HEAD cache hit", () => {
+  // The exact-HEAD fast path (deriveStatusTransitions's first branch) is keyed
+  // only on git HEAD, but graph.nodes reads the WORKING TREE (readGraphFiles),
+  // not HEAD's committed content — so a retype edited on disk without a new
+  // commit leaves `head` unchanged while graph.nodes[id].type has already moved.
+  // Without the retype check gating the exact-HEAD branch too, this would reuse
+  // cached.state verbatim and never notice.
+  const home = initGraph();
+  writeNode(home, "task-mistyped", "task", "in-review");
+  commit(home, "2026-05-04T00:00:00Z", "create task in review");            // W19
+  writeNode(home, "task-mistyped", "task", "released");
+  commit(home, "2026-05-11T00:00:00Z", "mark released (not task-terminal)"); // W20
+  analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 }); // seed cache: not terminal
+
+  // Retype on disk WITHOUT committing: HEAD stays exactly where the cache left it.
+  writeNode(home, "task-mistyped", "artifact", "released");
+  const headBefore = execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+  const r = analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 });
+  assert.equal(execFileSync("git", ["-C", home, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), headBefore); // still uncommitted
+  assert.equal(r.totals.completed, 1);              // `released` IS artifact-terminal under the new (uncommitted) type
+  assert.equal(r.coverage.fromGitTransition, 1);    // dated at the release commit, not a created_at fallback
+});
+
 test("analyze: a non-ancestor cached head (history rewrite) forces a full rebuild", () => {
   const home = closedGraph();
   analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 }); // seed
