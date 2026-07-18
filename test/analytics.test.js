@@ -561,6 +561,40 @@ test("analyze: a fast-forward incremental fold == a full rebuild (byte-identical
   assert.equal(ff.totals.completed, 2);                 // A (reclosed W22) + B (born-done W23)
 });
 
+test("analyze: a retype-only commit (status untouched) invalidates the cached fold — incremental == cold rebuild", () => {
+  // issue-spor-analytics-type-modification-cache-invalidation: `released` is
+  // declared terminal only on schema-artifact's OWN status.terminal — a task
+  // reaching `released` stays live, so its fold never enters a terminal run.
+  // Retyping it to artifact afterward WITHOUT touching status crosses that
+  // type-scoped vocabulary: a cold rebuild (which always evaluates every status
+  // delta against the node's CURRENT type) correctly dates its completion at the
+  // original `released` commit, but foldStatusTransitionState only re-evaluates a
+  // node's terminal flag on a ±status: delta — a type-only commit flushes as
+  // "unchanged", so a naive incremental read keeps the stale non-terminal state
+  // and falls back to a created_at-dated completion instead (still counted
+  // "completed" since the outer retired check is independently type-aware, but
+  // dated and bucketed wrong — the divergence the acceptance invariant catches).
+  const home = initGraph();
+  writeNode(home, "task-mistyped", "task", "in-review");
+  commit(home, "2026-05-04T00:00:00Z", "create task in review");            // W19
+  writeNode(home, "task-mistyped", "task", "released");
+  commit(home, "2026-05-11T00:00:00Z", "mark released (not task-terminal)"); // W20
+  analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 }); // seed cache: not terminal yet
+
+  // Retype-only commit: `type:` changes, `status:` line untouched.
+  writeNode(home, "task-mistyped", "artifact", "released");
+  commit(home, "2026-06-01T00:00:00Z", "correct the type: this is really an artifact"); // W23, no ±status: lines
+
+  const incremental = analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 });
+  fs.rmSync(closedPath(home));
+  const cold = analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 });
+  assert.deepEqual(incremental, cold);                    // the acceptance invariant: incremental == cold rebuild
+  assert.equal(cold.totals.completed, 1);                 // `released` IS artifact-terminal — completed
+  assert.equal(cold.coverage.fromGitTransition, 1);        // dated at the release commit, not a created_at fallback
+  const completedWeek = cold.weekly.find((w) => w.completed > 0);
+  assert.equal(completedWeek.week, "2026-W20");            // the actual release commit, not the retype week
+});
+
 test("analyze: a non-ancestor cached head (history rewrite) forces a full rebuild", () => {
   const home = closedGraph();
   analyticsLib.analyze(graphLib.loadGraph(path.join(home, "nodes")), { now: NOW, weeks: 12 }); // seed
