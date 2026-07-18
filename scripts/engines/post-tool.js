@@ -232,8 +232,8 @@ async function nudge({ input, graph, slug, session, file, remote }) {
   u.appendLine(state, `${res.nfacts}\t${file}`);
   if (res.nfacts < 1) return null;
 
-  // Journal the fired nudge so lib/capture-metrics.js can correlate
-  // nudges -> subsequent captures.
+  // Journal the fired nudge so spor-server's lib-engine/capture-metrics.js can
+  // correlate nudges -> subsequent captures.
   u.appendLine(
     path.join(graph, "journal", `${session}.jsonl`),
     JSON.stringify({ ts: u.jqNow(), project: slug, tool: "nudge", file, facts: res.nfacts })
