@@ -1850,10 +1850,10 @@ function lensStubServer() {
     resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
 }
 
-function runAsyncCli(args, env) {
+function runAsyncCli(args, env, cwd) {
   const { spawn } = require('node:child_process');
   return new Promise((resolve) => {
-    const c = spawn(process.execPath, [CLI, ...args], { env: bare(env), stdio: ['ignore', 'pipe', 'pipe'] });
+    const c = spawn(process.execPath, [CLI, ...args], { env: bare(env), cwd, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
     c.stdout.on('data', (d) => (stdout += d));
     c.stderr.on('data', (d) => (stderr += d));
@@ -2167,6 +2167,44 @@ test('next (remote) notes a scoped read that returns nothing; an unscoped fireho
     assert.doesNotMatch(nonEmpty.stderr, /returned an empty queue/);
   } finally {
     srv.close();
+  }
+});
+
+// issue-spor-next-worktree-empty-queue: a flagless `spor next` run from inside a
+// linked git worktree used to risk scoping to the worktree's own (bogus,
+// markerless) basename instead of the main checkout's — a mismatch that would
+// send the server a `?project=` value matching no repo and come back empty. The
+// scopeSlug fallback (bin/spor.js cmdNext -> safeSlug() -> u.projectSlug() ->
+// u.inferenceRoot()) already resolves a linked worktree to its main checkout
+// (issue-cc-project-identity-monorepo-worktree), so this locks that parity in at
+// the CLI level: the actual ?project= sent to /v1/queue must be identical from
+// both checkouts.
+test('next (remote) from a linked git worktree sends the same ?project= scope as the main checkout', async () => {
+  const { gitInit } = require('./helpers/git');
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-cli-wt-'));
+  const repo = path.join(base, 'my-nextrepo');
+  const g = gitInit(repo);
+  fs.writeFileSync(path.join(repo, 'f.txt'), 'x');
+  g(['add', 'f.txt']);
+  g(['commit', '-q', '-m', 'root']);
+  // A worktree dir whose basename must NOT leak into the sent scope.
+  const wt = path.join(base, 'ephemeral-worktree-xyz');
+  g(['worktree', 'add', '-q', wt, 'HEAD']);
+
+  const { srv, hits, base: url } = await queueStubServer();
+  try {
+    const main = await runAsyncCli(['next'], { SPOR_SERVER: url, SPOR_TOKEN: 't' }, repo);
+    assert.strictEqual(main.status, 0, main.stderr);
+    const fromWorktree = await runAsyncCli(['next'], { SPOR_SERVER: url, SPOR_TOKEN: 't' }, wt);
+    assert.strictEqual(fromWorktree.status, 0, fromWorktree.stderr);
+
+    const projectsSent = hits.filter((h) => /^\/v1\/queue\?/.test(h.url)).map((h) => new URLSearchParams(h.url.split('?')[1]).get('project'));
+    assert.deepStrictEqual(projectsSent, ['my-nextrepo', 'my-nextrepo'], 'main checkout and worktree scope identically to the main repo slug');
+    assert.ok(!projectsSent.includes('ephemeral-worktree-xyz'), 'the worktree basename never leaks into the scope');
+  } finally {
+    srv.close();
+    g(['worktree', 'remove', '--force', wt]);
+    fs.rmSync(base, { recursive: true, force: true });
   }
 });
 
