@@ -22,7 +22,7 @@ const os = require("os");
 const path = require("path");
 const https = require("https");
 const crypto = require("crypto");
-const { spawnSync } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 const { parseArgs } = require("util");
 
 const ROOT = path.resolve(__dirname, "..");
@@ -31,6 +31,8 @@ const remote = require(path.join(ROOT, "lib", "remote.js"));
 const auth = require(path.join(ROOT, "lib", "auth.js"));
 const u = require(path.join(ROOT, "scripts", "engines", "util.js"));
 const { gitSpawn } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
+const dispatchRuns = require(path.join(ROOT, "lib", "shell", "agent-dispatch-runner.js"));
+const dispatchHarnesses = require(path.join(ROOT, "lib", "shell", "dispatch-harnesses.js"));
 const sat = require(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
 // Resolution truth (lib/kernel/resolution.js): a node is "done" when it carries a
 // TERMINAL status OR a live inbound resolves/answers edge — the same partition the
@@ -386,7 +388,7 @@ async function cmdNext(cfg, args) {
     }
     if (needAgents) {
       const q = r.json || {};
-      const { items, hidden } = annotateInFlight(q.items || [], dispatchedAgents(), hideDispatched);
+      const { items, hidden } = annotateInFlight(q.items || [], dispatchedAgents(cfg), hideDispatched);
       q.items = items;
       if (typeof q.count === "number") q.count = Math.max(0, q.count - hidden);
       // --hide-dispatched shrinks .items below whatever fetchQueuePaged assembled,
@@ -418,7 +420,7 @@ async function cmdNext(cfg, args) {
   // Default path: byte-identical passthrough (no agent cross-reference). Only the
   // --json / --hide-dispatched view captures queue.js's result to annotate it.
   if (!needAgents) return passthrough("queue.js", localArgs);
-  return nextLocalInFlight(localArgs, { wantJson, hideDispatched });
+  return nextLocalInFlight(cfg, localArgs, { wantJson, hideDispatched });
 }
 
 // Local in-flight surface (task-spor-cli-in-flight-surface). The default local
@@ -429,7 +431,7 @@ async function cmdNext(cfg, args) {
 // surfaces; an unparseable stdout falls back to forwarding it verbatim, so an
 // error path is never swallowed. The flags are presentation-only — strip them
 // before handing argv to queue.js (which doesn't know them) and force --json.
-function nextLocalInFlight(localArgs, { wantJson, hideDispatched }) {
+function nextLocalInFlight(cfg, localArgs, { wantJson, hideDispatched }) {
   const passArgs = localArgs.filter((a) => a !== "--json" && a !== "--hide-dispatched");
   passArgs.push("--json");
   const r = spawnSync(process.execPath, [path.join(ROOT, "lib", "queue.js"), ...passArgs], {
@@ -444,7 +446,7 @@ function nextLocalInFlight(localArgs, { wantJson, hideDispatched }) {
     if (r.stdout) process.stdout.write(r.stdout); // forward queue.js's own output
     return status;
   }
-  const { items, hidden } = annotateInFlight(q.items || [], dispatchedAgents(), hideDispatched);
+  const { items, hidden } = annotateInFlight(q.items || [], dispatchedAgents(cfg), hideDispatched);
   q.items = items;
   if (typeof q.count === "number") q.count = Math.max(0, q.count - hidden);
   if (hideDispatched) q.hidden_dispatched = hidden;
@@ -488,27 +490,43 @@ function renderQueueLocalText(q, hidden = 0) {
 // (every item then reads in_flight:false). SPOR_FAKE_AGENTS_JSON injects canned
 // output for tests, mirroring SPOR_FAKE_MCP_LIST; all claude shell-outs route
 // through claudeCmd() so an SPOR_CLAUDE_CMD stub works too.
-function dispatchedAgents() {
+function dispatchedAgents(cfg) {
   try {
-    let text = process.env.SPOR_FAKE_AGENTS_JSON;
-    if (text == null) {
-      const cmd = claudeCmd();
-      if (cmd === "claude" && !hasCmd("claude")) return new Map();
-      const r = spawnPortableSync(cmd, ["agents", "--json"], { encoding: "utf8", timeout: 5000 });
-      if (r.status !== 0 || !r.stdout) return new Map();
-      text = r.stdout;
-    }
-    const arr = JSON.parse(text);
-    if (!Array.isArray(arr)) return new Map();
     const map = new Map();
-    for (const a of arr) {
-      if (!a || a.kind !== "background" || typeof a.name !== "string") continue;
-      if (a.state === "done") continue; // finished — not in flight
-      const list = map.get(a.name) || [];
-      // sessionId + startedAt ride along for post-launch session capture
-      // (dec-spor-dispatch-bg-session-late-bind); the dup-guard ignores them.
-      list.push({ id: a.id, name: a.name, state: a.state, status: a.status, cwd: a.cwd, sessionId: a.sessionId, startedAt: a.startedAt });
-      map.set(a.name, list);
+    const add = (name, summary) => {
+      const list = map.get(name) || [];
+      list.push(summary);
+      map.set(name, list);
+    };
+    const home = cfg && typeof cfg.userConfigHome === "function" ? cfg.userConfigHome() : u.userConfigHome();
+    for (const adapter of dispatchHarnesses.harnesses()) {
+      const discovery = adapter.activeDiscovery || {};
+      if (discovery.kind === "run-records") {
+        for (const a of dispatchRuns.activeRuns(home)) {
+          if (a && a.harness === adapter.id && typeof a.name === "string") add(a.name, a);
+        }
+        continue;
+      }
+      if (discovery.kind !== "cli-json") continue;
+      let text = process.env.SPOR_FAKE_AGENTS_JSON;
+      if (text == null) {
+        const cmd = adapter.command();
+        if (cmd === "claude" && !hasCmd(cmd)) continue;
+        const r = spawnPortableSync(cmd, discovery.args, { encoding: "utf8", timeout: 5000 });
+        if (r.status !== 0 || !r.stdout) continue;
+        text = r.stdout;
+      }
+      let arr;
+      try { arr = JSON.parse(text); } catch { continue; }
+      if (!Array.isArray(arr)) continue;
+      for (const a of arr) {
+        if (!a || a.kind !== "background" || typeof a.name !== "string") continue;
+        if (a.state === "done") continue;
+        add(a.name, {
+          id: a.id, name: a.name, harness: adapter.id, state: a.state,
+          status: a.status, cwd: a.cwd, sessionId: a.sessionId, startedAt: a.startedAt,
+        });
+      }
     }
     return map;
   } catch {
@@ -524,9 +542,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // + `cwd` + `startedAt` — the reliable capture path. Match on cwd (the strong
 // signal — we just launched there), then on name when given, then pick the NEWEST
 // (the run we just started). Returns the sessionId or null.
-function newestDispatchedSession(name, dir) {
+function newestDispatchedSession(cfg, name, dir) {
   const all = [];
-  for (const arr of dispatchedAgents().values()) for (const a of arr) all.push(a);
+  for (const arr of dispatchedAgents(cfg).values()) {
+    for (const a of arr) if (!a.harness || a.harness === "claude-code") all.push(a);
+  }
   let cands = all.filter((a) => a.sessionId && (!dir || a.cwd === dir));
   if (name) {
     const named = cands.filter((a) => a.name === name);
@@ -540,10 +560,10 @@ function newestDispatchedSession(name, dir) {
 // Capture the launched run's session, polling briefly while the daemon registers
 // it. SPOR_SESSION_ID pins it (tests/reproducibility) and short-circuits the poll.
 // Returns the sessionId or null (fail-open — the caller degrades to session-null).
-async function captureDispatchSession(name, dir, pinned) {
+async function captureDispatchSession(cfg, name, dir, pinned) {
   if (pinned) return pinned;
   for (let i = 0; i < 6; i++) {
-    const sid = newestDispatchedSession(name, dir);
+    const sid = newestDispatchedSession(cfg, name, dir);
     if (sid) return sid;
     await sleep(300);
   }
@@ -5534,13 +5554,13 @@ function homeDir() {
 // The Claude Code binary, overridable for tests (a stub fed via SPOR_CLAUDE_CMD,
 // same lever 'spor dispatch' uses). All claude shell-outs route through here.
 function claudeCmd() {
-  return process.env.SPOR_CLAUDE_CMD || "claude";
+  return dispatchHarnesses.getHarness("claude-code").command();
 }
 
 // The Codex CLI binary, overridable for tests. Codex owns plugin install state,
 // so all plugin shell-outs route through this seam instead of writing its cache.
 function codexCmd() {
-  return process.env.SPOR_CODEX_CMD || "codex";
+  return dispatchHarnesses.getHarness("codex").command();
 }
 
 function spawnPortableSync(cmd, args, opts = {}) {
@@ -6584,7 +6604,7 @@ function dispatchReadinessCheck(cfg, node) {
 // assigned->agent edge `profile:` attribute > that agent's default uses-profile.
 // Returns null when NO profile resolves (no assignment, no profile nodes yet) —
 // the common case, leaving dispatch byte-identical. Otherwise
-// { id, source, found, verdict }: an explicitly-named --profile that can't be
+// { id, source, found, profile, verdict }: an explicitly-named --profile that can't be
 // loaded sets found:false (a hard error the caller reports); an INFERRED profile
 // that can't be loaded returns null (fail-open — never block on a dangling edge).
 async function resolveDispatchProfile(cfg, { profileFlag, nodeRaw, identityAgent }) {
@@ -6661,7 +6681,7 @@ async function resolveDispatchProfile(cfg, { profileFlag, nodeRaw, identityAgent
     /* probe is best-effort; match against what the cascade already holds */
   }
   const machine = sat.effectiveCapabilities(probed ? { ...rawCap, probed } : rawCap);
-  return { id, source, found: true, verdict: sat.satisfies(machine, profile) };
+  return { id, source, found: true, profile, verdict: sat.satisfies(machine, profile) };
 }
 
 // Compile a briefing: a node id -> its neighborhood; free text -> a digest.
@@ -6764,7 +6784,7 @@ async function topQueueItem(cfg, slug) {
   items = items.filter((it) => it.suggest !== "triage");
   if (!items.length) return null;
   // Skip items already in flight on this machine; advance to the first free one.
-  const { items: free, hidden } = annotateInFlight(items, dispatchedAgents(), true);
+  const { items: free, hidden } = annotateInFlight(items, dispatchedAgents(cfg), true);
   if (hidden && free.length) {
     err(`from-queue: skipped ${hidden} item(s) already in flight on this machine; picking ${free[0].id}`);
   }
@@ -7210,6 +7230,94 @@ function sweepStaleMcpConfigs(dir) {
   }
 }
 
+const DISPATCH_RUNNER = path.join(ROOT, "lib", "shell", "agent-dispatch-runner.js");
+
+function writePrivate(file, text) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const fd = fs.openSync(file, "wx", 0o600);
+  try {
+    fs.writeSync(fd, text);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+async function launchSupervisedHarness(cfg, {
+  adapter, command, args, cwd, name, nodeId, prompt, server, childToken, mcpToken, bindToken,
+  renewToken, renewNode,
+}) {
+  const runId = crypto.randomUUID();
+  const p = dispatchRuns.runPaths(cfg.userConfigHome(), runId);
+  const runArgs = args.map((a) => a === "__SPOR_REPORT_PATH__" ? p.report : a);
+  const now = new Date().toISOString();
+  const record = {
+    run_id: runId,
+    node_id: nodeId || null,
+    name,
+    harness: adapter.id,
+    state: "launching",
+    cwd,
+    created_at: now,
+    log_path: p.log,
+    report_path: p.report,
+  };
+  writePrivate(p.prompt, prompt);
+  writePrivate(p.job, JSON.stringify({
+    run_id: runId,
+    harness: adapter.id,
+    command,
+    args: runArgs,
+    cwd,
+    record_path: p.record,
+    prompt_path: p.prompt,
+    log_path: p.log,
+    report_path: p.report,
+    server: server || null,
+    renew_node: renewNode || null,
+  }, null, 2) + "\n");
+  dispatchRuns.atomicJson(p.record, record);
+
+  const runnerEnv = u.gitEnv();
+  for (const key of [
+    "SPOR_DISPATCH_CHILD_TOKEN", "SPOR_DISPATCH_MCP_TOKEN",
+    "SPOR_DISPATCH_BIND_TOKEN", "SPOR_DISPATCH_RENEW_TOKEN",
+  ]) delete runnerEnv[key];
+  if (childToken) runnerEnv.SPOR_DISPATCH_CHILD_TOKEN = childToken;
+  if (mcpToken) runnerEnv.SPOR_DISPATCH_MCP_TOKEN = mcpToken;
+  if (bindToken) runnerEnv.SPOR_DISPATCH_BIND_TOKEN = bindToken;
+  if (renewToken) runnerEnv.SPOR_DISPATCH_RENEW_TOKEN = renewToken;
+  let child;
+  let spawnError = null;
+  try {
+    child = spawn(process.execPath, [DISPATCH_RUNNER, p.job], {
+      detached: true,
+      stdio: "ignore",
+      env: runnerEnv,
+      windowsHide: true,
+    });
+    child.on("error", (e) => { spawnError = e; });
+    child.unref();
+    if (child.pid) dispatchRuns.atomicJson(p.record, { ...record, runner_pid: child.pid });
+  } catch (e) {
+    spawnError = e;
+  }
+
+  for (let i = 0; i < 20 && !spawnError; i++) {
+    const state = dispatchRuns.readJson(p.record);
+    if (state && state.state === "failed_launch") {
+      return { ok: false, error: state.error || `${adapter.label} process failed to launch`, runId, paths: p };
+    }
+    if (state && state.state !== "launching") return { ok: true, state, runId, paths: p };
+    await sleep(50);
+  }
+  if (spawnError) {
+    for (const f of [p.job, p.prompt]) try { fs.unlinkSync(f); } catch {}
+    return { ok: false, error: spawnError.message, runId, paths: p };
+  }
+  const state = dispatchRuns.readJson(p.record) || record;
+  return { ok: true, state, runId, paths: p };
+}
+
 async function cmdDispatch(cfg, { values, positionals: pos }) {
   const dryRun = !!(values.print || values["dry-run"]);
   const full = !!values.full;
@@ -7221,6 +7329,8 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   const dirOpt = values.dir || null;
   const model = values.model || null;
   const permMode = values["permission-mode"] || null;
+  const sandbox = values.sandbox || null;
+  const approvalPolicy = values["approval-policy"] || null;
   const agent = values.agent || null; // claude --agent (harness agent DEFINITION)
   const asAgent = values.as || null; // Spor agent IDENTITY override for dispatch.agent
   // A user-supplied prompt template (task-spor-dispatch-user-prompt-templates):
@@ -7456,7 +7566,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // mode only (mirrors the auto-claim's scope), in BOTH local and remote (it's a
   // local agent read, independent of the graph backend). claude absent / a stale
   // exit / unparseable output => empty => no guard (fail-open); --force overrides.
-  const inFlight = nodeId && !backfill ? dispatchedAgents().get(name) || [] : [];
+  const inFlight = nodeId && !backfill ? dispatchedAgents(cfg).get(name) || [] : [];
 
   // Session identity (dec-spor-dispatch-bg-session-late-bind). `claude --bg`
   // IGNORES `--session-id` and self-allocates its own run session (verified — it
@@ -7548,15 +7658,37 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     return 1;
   }
   const unsatisfiable = !!(profileCheck && profileCheck.verdict && !profileCheck.verdict.ok);
-
-  const claudeBin = claudeCmd();
-  const claudeArgs = ["--bg"];
-  if (name) claudeArgs.push("--name", name);
-  if (model) claudeArgs.push("--model", model);
-  if (permMode) claudeArgs.push("--permission-mode", permMode);
-  if (agent) claudeArgs.push("--agent", agent);
+  const profileRuntime = (profileCheck && profileCheck.profile) || {};
+  const harness = profileRuntime.harness || "claude-code";
+  const harnessAdapter = dispatchHarnesses.getHarness(harness);
+  const effectiveModel = model || profileRuntime.model || null;
+  const harnessBin = harnessAdapter ? harnessAdapter.command() : null;
   // NB: no `--session-id` — `claude --bg` ignores it (warns) and manages its own
   // session; we capture the real one post-launch (dec-spor-dispatch-bg-session-late-bind).
+  const previewArgs = harnessAdapter ? harnessAdapter.buildArgs({
+    name,
+    model: effectiveModel,
+    permissionMode: permMode,
+    agent,
+    sandbox: sandbox || "workspace-write",
+    approvalPolicy: approvalPolicy || "never",
+    reportPath: "__SPOR_REPORT_PATH__",
+    sporMcp: null,
+  }) : [];
+  const supportedHarness = !!harnessAdapter;
+  if (!supportedHarness && !dryRun) {
+    err(`cannot dispatch ${nodeId || name}: profile ${profileCheck && profileCheck.id ? profileCheck.id : "(unknown)"} selects unsupported harness '${harness}'.`);
+    err(`  this client has adapters for ${dispatchHarnesses.harnesses().map((a) => a.id).join(", ")}; the assignment is unchanged.`);
+    return 1;
+  }
+  const invalidHarnessOptions = harnessAdapter && harnessAdapter.validateOptions({
+    permissionMode: permMode, agent, sandbox, approvalPolicy,
+  });
+  if (invalidHarnessOptions) {
+    err(invalidHarnessOptions.message);
+    err(`  ${invalidHarnessOptions.hint}`);
+    return 1;
+  }
 
   if (dryRun) {
     out(`dir:    ${res.dir}  (slug: ${res.slug}, via ${res.source})`);
@@ -7574,7 +7706,8 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
       out(`onboard: ${steps.join("; ")}`);
     }
     out(`brief:  ${brief ? `${brief.length} bytes` : "(none — graph had nothing relevant, or --no-brief/--backfill)"}`);
-    out(`session: ${pinnedSession || "(allocated by claude --bg at launch, bound after)"}`);
+    if (profileCheck) out(`harness: ${harness} (profile ${profileCheck.id})`);
+    out(`session: ${pinnedSession || (harnessAdapter ? harnessAdapter.sessionPreview : "(unsupported harness)")}`);
     // Identity preview: what the real dispatch would do for agent-scoping. The
     // token mint + 0600 mcp-config are SIDE EFFECTS, so --print only describes
     // them (it writes nothing and makes no network call here). Local mode and an
@@ -7582,7 +7715,11 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     // session line, which is additive and always present now.
     if (identityAgent) {
       const src = asAgent ? " (via --as)" : "";
-      out(`agent:  ${identityAgent}${src} (would mint a session-deferred agent-scoped token + write a 0600 --mcp-config, add --strict-mcp-config, then bind the run session after launch)`);
+      out(
+        harnessAdapter && harnessAdapter.identityMode === "env-mcp"
+          ? `agent:  ${identityAgent}${src} (would mint a session-deferred agent token, inject it through env-backed Spor MCP config, then bind the Codex thread after launch)`
+          : `agent:  ${identityAgent}${src} (would mint a session-deferred agent-scoped token + write a 0600 --mcp-config, add --strict-mcp-config, then bind the run session after launch)`
+      );
     } else if (cfg.mode() === "remote") {
       out(`agent:  (none configured — 'spor agent use agent-<machine>' or --as to attribute as agent-on-behalf-of; dispatching person-scoped)`);
     }
@@ -7631,7 +7768,10 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
       out(`claim:  ${noClaim ? "(--no-claim — lease not established)" : `would establish a lease on ${nodeId} at launch (session bound from the run after launch)`}`);
     }
     if (template != null) out(`template: ${path.resolve(templateOpt)}`);
-    out(`run:    ${claudeBin} ${claudeArgs.map(shellQuote).join(" ")} <prompt>`);
+    if (!supportedHarness) out(`run:    (unsupported harness '${harness}')`);
+    else if (harnessAdapter.launchMode === "supervised-jsonl") {
+      out(`run:    ${harnessBin} ${previewArgs.map((a) => a === "__SPOR_REPORT_PATH__" ? "<report-path>" : shellQuote(a)).join(" ")}  # prompt on stdin`);
+    } else out(`run:    ${harnessBin} ${previewArgs.map(shellQuote).join(" ")} <prompt>`);
     out(`\n--- prompt ---\n${prompt}`);
     return 0;
   }
@@ -7693,8 +7833,9 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   u.registerRepo(cfg.userConfigHome(), res.slug, res.dir);
   if (backfill) out(`registered ${res.slug} → ${res.dir}; launching the backfill agent…`);
 
-  if (claudeBin === "claude" && !hasCmd("claude")) {
-    err("claude CLI not on PATH — install Claude Code, then re-run (or 'spor dispatch … --print' to see the prompt).");
+  const defaultHarnessBin = harnessAdapter.command({});
+  if (harnessBin === defaultHarnessBin && !hasCmd(defaultHarnessBin)) {
+    err(`${harnessAdapter.missingBinary}, then re-run (or 'spor dispatch … --print' to see the prompt).`);
     return 1;
   }
 
@@ -7710,6 +7851,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // back to the prior person-scoped dispatch with a clear line. Remote + a
   // configured agent only; local/unconfigured dispatch is byte-identical.
   let agentToken = null;
+  let agentMcpFile = null;
   if (identityAgent) {
     // Always session-DEFERRED — the run session is bound after launch (below),
     // even when SPOR_SESSION_ID pins it (the pin feeds the capture, not the mint),
@@ -7717,8 +7859,9 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     const mint = await mintAgentToken(cfg, { agent: identityAgent });
     if (mint.ok) {
       agentToken = mint.token;
-      const mcpFile = writeDispatchMcpConfig(cfg, { token: mint.token, key: mcpKey });
-      claudeArgs.push("--mcp-config", mcpFile, "--strict-mcp-config");
+      if (harnessAdapter.identityMode === "mcp-file") {
+        agentMcpFile = writeDispatchMcpConfig(cfg, { token: mint.token, key: mcpKey });
+      }
       out(`agent:  ${identityAgent} (writes attributed agent-on-behalf-of-you; run session bound after launch)`);
     } else if (mint.absent) {
       err(`warning: this server can't mint agent-scoped session tokens yet — dispatching person-scoped.`);
@@ -7813,14 +7956,61 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     out(`worktree: ${wt.dir} (branch ${wt.branch}${wt.reused ? ", reused" : ""}${wt.setupRan ? "; setup ran" : ""})`);
   }
 
-  claudeArgs.push(prompt);
+  if (harnessAdapter.launchMode === "supervised-jsonl") {
+    const personToken = cfg.mode() === "remote" ? remote.token(cfg) : "";
+    const mcpToken = agentToken || personToken;
+    const wantsSporMcp = harnessAdapter.identityMode === "env-mcp" && cfg.mode() === "remote" && (
+      !!identityAgent || (Array.isArray(profileRuntime.mcp) && profileRuntime.mcp.includes("spor"))
+    );
+    const args = harnessAdapter.buildArgs({
+      model: effectiveModel,
+      sandbox: sandbox || "workspace-write",
+      approvalPolicy: approvalPolicy || "never",
+      reportPath: "__SPOR_REPORT_PATH__",
+      sporMcp: wantsSporMcp && mcpToken ? { url: `${remote.base(cfg)}/mcp` } : null,
+    });
+    const launched = await launchSupervisedHarness(cfg, {
+      adapter: harnessAdapter,
+      command: harnessBin,
+      args,
+      cwd: launchDir,
+      name,
+      nodeId,
+      prompt,
+      server: cfg.mode() === "remote" ? remote.base(cfg) : null,
+      childToken: agentToken,
+      mcpToken: wantsSporMcp ? mcpToken : null,
+      bindToken: agentToken,
+      renewToken: agentToken || personToken,
+      renewNode: nodeId && !backfill && !noClaim ? nodeId : null,
+    });
+    if (!launched.ok) {
+      err(`could not launch ${harnessBin}: ${launched.error}`);
+      await releaseClaimOnAbort();
+      return 1;
+    }
+    out(`run:     ${launched.runId} (${harnessAdapter.label} supervisor ${launched.state.state || "launching"})`);
+    out(`log:     ${launched.paths.log}`);
+    out(`report:  ${launched.paths.report}`);
+    if (launched.state.session_id) out(`session: ${launched.state.session_id}`);
+    return 0;
+  }
+
+  const nativeArgs = harnessAdapter.buildArgs({
+    name,
+    model: effectiveModel,
+    permissionMode: permMode,
+    agent,
+    mcpConfig: agentMcpFile,
+    prompt,
+  });
   // The agent's git must follow launchDir (its worktree, or the target checkout),
   // so hand it an env scrubbed of the git location vars — an ambient GIT_DIR
   // would otherwise point every commit it makes at the LAUNCHER's repo
   // (issue-spor-dispatch-worktree-wrong-repo-location).
-  const r = spawnPortableSync(claudeBin, claudeArgs, { cwd: launchDir, stdio: "inherit", env: u.gitEnv() });
+  const r = spawnPortableSync(harnessBin, nativeArgs, { cwd: launchDir, stdio: "inherit", env: u.gitEnv() });
   if (r.error) {
-    err(`could not launch ${claudeBin}: ${r.error.message}`);
+    err(`could not launch ${harnessBin}: ${r.error.message}`);
     await releaseClaimOnAbort();
     return 1;
   }
@@ -7837,7 +8027,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // claimed node).
   const wantBind = cfg.mode() === "remote" && (agentToken || (nodeId && !backfill && !noClaim));
   if (wantBind) {
-    const realSession = await captureDispatchSession(name, launchDir, pinnedSession);
+    const realSession = await captureDispatchSession(cfg, name, launchDir, pinnedSession);
     if (realSession) {
       if (agentToken) {
         const b = await bindAgentSession(cfg, agentToken, realSession);
@@ -8943,7 +9133,7 @@ const COMMANDS = {
     run: (cfg, args) => cmdToken(cfg, args),
   },
   agent: {
-    group: "Dispatch (Claude Code background agents)", parse: "raw", args: "create <label> [--owner <id>] [--pubkey <fp>] | list | use <agent-id> | token <agent-id> [list|revoke <prefix>]",
+    group: "Dispatch (background agents)", parse: "raw", args: "create <label> [--owner <id>] [--pubkey <fp>] | list | use <agent-id> | token <agent-id> [list|revoke <prefix>]",
     summary: "person-owned automation principals (dispatch identity, standing PATs)",
     help:
       "Create and list agents — first-class `type: agent` nodes owned by a person\n" +
@@ -9815,11 +10005,13 @@ const COMMANDS = {
 
   // --- Dispatch ---
   dispatch: {
-    group: "Dispatch (Claude Code background agents)", parse: "strict", args: '"<task>" | <node-id>', aliases: ["bg"],
-    summary: "compile a briefing + launch 'claude --bg' in the repo",
+    group: "Dispatch (background agents)", parse: "strict", args: '"<task>" | <node-id>', aliases: ["bg"],
+    summary: "compile a briefing + launch the profile-selected harness",
     help:
-      "Compile a briefing for a task and launch a Claude Code background agent in the\n" +
-      "right repo. Give free-text, a <node-id>, --node <id>, --from-queue (the top\n" +
+      "Compile a briefing for a task and launch a background agent in the right repo.\n" +
+      "A resolved profile selects its harness (claude-code or codex); with no profile,\n" +
+      "dispatch preserves the legacy Claude Code path. Give free-text, a <node-id>,\n" +
+      "--node <id>, --from-queue (the top\n" +
       "ranked item NOT already in flight on this machine), or --backfill (the\n" +
       "unattended init + enable + launch-/spor:backfill primitive; first-time setup\n" +
       "goes through the /spor:onboard skill instead). The target dir is the\n" +
@@ -9861,11 +10053,13 @@ const COMMANDS = {
       node: { type: "string", value: "id", desc: "dispatch a specific node id" },
       slug: { type: "string", value: "slug", desc: "target project slug (cross-repo resolution)" },
       as: { type: "string", value: "agent-id", desc: "Spor agent IDENTITY to run as (overrides dispatch.agent; remote-only)" },
-      model: { type: "string", value: "M", desc: "claude --model" },
+      model: { type: "string", value: "M", desc: "harness model override (otherwise profile.model)" },
       "permission-mode": { type: "string", value: "P", desc: "claude --permission-mode" },
+      sandbox: { type: "string", value: "S", desc: "codex exec --sandbox (default: workspace-write)" },
+      "approval-policy": { type: "string", value: "P", desc: "codex exec --ask-for-approval (default: never)" },
       agent: { type: "string", value: "A", desc: "claude --agent (harness agent DEFINITION — NOT the Spor identity; see --as)" },
       profile: { type: "string", value: "profile-id", desc: "profile to run under; checked against this machine's capabilities (overrides the assigned/default profile)" },
-      name: { type: "string", value: "N", desc: "claude --name (session name)" },
+      name: { type: "string", value: "N", desc: "dispatch run name (passed to Claude; tracked locally for Codex)" },
       template: { type: "string", value: "F", desc: "prompt template file (placeholders above)" },
       full: { type: "boolean", desc: "full briefing instead of the digest" },
       "no-brief": { type: "boolean", desc: "raw task prompt, no briefing block" },
@@ -9882,7 +10076,7 @@ const COMMANDS = {
     run: (cfg, p) => cmdDispatch(cfg, p),
   },
   repos: {
-    group: "Dispatch (Claude Code background agents)", parse: "raw",
+    group: "Dispatch (background agents)", parse: "raw",
     args: "[list | add <slug> <path> | rm <slug> | tags | tag <slug> [tag...] | untag <slug> [tag...]]",
     summary: "the local dispatch slug->dir map, plus repo-identity tags in the graph",
     help:
@@ -9904,7 +10098,7 @@ const COMMANDS = {
     run: (cfg, args) => cmdRepos(cfg, args),
   },
   capabilities: {
-    group: "Dispatch (Claude Code background agents)", parse: "raw", aliases: ["caps", "profiles"],
+    group: "Dispatch (background agents)", parse: "raw", aliases: ["caps", "profiles"],
     args: "[list [--json] | show <agent-id> | probe | publish | hosts <profile-id> | set <axis> <v...> | allow-mcp <m...> | deny <profile-id...> | clear]",
     summary: "this machine's dispatch capability map (profile satisfiability)",
     help:
@@ -9974,7 +10168,7 @@ const GROUP_ORDER = [
   "Team admin (remote, admin token)",
   "Graph",
   "Repo scoping",
-  "Dispatch (Claude Code background agents)",
+  "Dispatch (background agents)",
   "Other",
 ];
 

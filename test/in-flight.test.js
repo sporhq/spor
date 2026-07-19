@@ -1,6 +1,6 @@
 // spor next — the in-flight agent surface (task-spor-cli-in-flight-surface).
 // `spor next --json` stamps each queue item with an `in_flight` flag by
-// cross-referencing live background agents from `claude agents --json`
+// cross-referencing live background agents from every dispatch harness
 // (`spor dispatch` names each agent after its node id); --hide-dispatched drops
 // the items that already have one. The cross-reference is CLIENT-SIDE (the
 // server can't see local agents), runs over both render paths (local passthrough
@@ -86,7 +86,7 @@ test("local next --json stamps in_flight + a dispatched summary on the matched i
   assert.strictEqual(byId["task-b"].in_flight, false);
   // the dispatched agent rides along on the in-flight item, not on the idle one
   assert.deepStrictEqual(byId["task-a"].dispatched, [
-    { id: "aa11", name: "task-a", state: "working", status: "busy", cwd: "/x" },
+    { id: "aa11", name: "task-a", harness: "claude-code", state: "working", status: "busy", cwd: "/x" },
   ]);
   assert.ok(!("dispatched" in byId["task-b"]), "no dispatched array on an idle item");
 });
@@ -99,6 +99,31 @@ test("local next --json: a DONE background agent does not count as in-flight", (
   const byId = Object.fromEntries(q.items.map((it) => [it.id, it]));
   assert.strictEqual(byId["task-a"].in_flight, true, "working agent counts");
   assert.strictEqual(byId["task-b"].in_flight, false, "done agent does not");
+});
+
+test("local next --json unions supervised Codex run records without requiring Claude", () => {
+  const { nodes } = fixture();
+  const codex = JSON.stringify([{
+    id: "run-codex-1",
+    run_id: "run-codex-1",
+    name: "task-b",
+    node: "task-b",
+    harness: "codex",
+    state: "running",
+    status: "busy",
+    cwd: "/codex-worktree",
+    sessionId: "thread-codex-1",
+    log_path: "/tmp/codex.log",
+    report_path: "/tmp/codex.report.md",
+  }]);
+  const r = run(["next", "--json", "--nodes", nodes], {
+    SPOR_CLAUDE_CMD: "/nonexistent/claude-xyz",
+    SPOR_FAKE_DISPATCH_RUNS_JSON: codex,
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const item = JSON.parse(r.stdout).items.find((entry) => entry.id === "task-b");
+  assert.strictEqual(item.in_flight, true);
+  assert.deepStrictEqual(item.dispatched, [JSON.parse(codex)[0]]);
 });
 
 test("local next --json: an INTERACTIVE agent named like a node is ignored (background only)", () => {

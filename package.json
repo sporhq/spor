@@ -49,6 +49,7 @@
     "release": "node scripts/release.js",
     "test": "node --require ./test/helpers/tmp-cleanup.js --test test/*.test.js",
     "test:e2e": "node --require ./test/helpers/tmp-cleanup.js --test test/e2e-claude.test.js",
+    "test:e2e:codex": "node --require ./test/helpers/tmp-cleanup.js --test test/e2e-codex-dispatch.test.js",
     "conformance": "node conformance/runner.js"
   },
   "engines": {
