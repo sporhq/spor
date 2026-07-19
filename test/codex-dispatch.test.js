@@ -97,7 +97,9 @@ process.stdin.on("end", () => {
     cwd: process.cwd(),
     prompt,
     sporToken: process.env.SPOR_TOKEN || null,
+    substrateToken: process.env.SUBSTRATE_TOKEN || null,
     mcpToken: process.env.SPOR_DISPATCH_MCP_TOKEN || null,
+    internalChildToken: process.env.SPOR_DISPATCH_CHILD_TOKEN || null,
   }, null, 2));
   process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "codex-thread-fixture" }) + "\\n");
   setTimeout(() => process.exit(${exitCode}), ${delayMs});
@@ -247,7 +249,7 @@ test("remote Codex dispatch binds the thread, renews the lease, and keeps its be
         SPOR_HOME: home,
         XDG_CONFIG_HOME: home,
         SPOR_SERVER: base,
-        SPOR_TOKEN: "person-token",
+        SUBSTRATE_TOKEN: "person-token",
         SPOR_CODEX_CMD: stub,
         OUTFILE: outfile,
       }
@@ -255,7 +257,9 @@ test("remote Codex dispatch binds the thread, renews the lease, and keeps its be
     assert.strictEqual(result.status, 0, result.stderr);
     const invocation = await waitFor(() => fs.existsSync(outfile) && JSON.parse(fs.readFileSync(outfile, "utf8")));
     assert.strictEqual(invocation.sporToken, "agent-secret-token");
+    assert.strictEqual(invocation.substrateToken, "agent-secret-token");
     assert.strictEqual(invocation.mcpToken, "agent-secret-token");
+    assert.strictEqual(invocation.internalChildToken, null);
     assert.ok(invocation.args.some((arg) => /bearer_token_env_var/.test(arg)));
     assert.ok(!invocation.args.some((arg) => arg.includes("agent-secret-token")), "bearer never enters argv");
 
