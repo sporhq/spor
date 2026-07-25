@@ -116,6 +116,53 @@ test("transcriptOutcome: a session that completed EARLIER turns and then died mi
   assert.strictEqual(o.termination_signal, "mid-turn");
 });
 
+test("transcriptOutcome: session bookkeeping written AFTER the final turn does not fake a vanish", () => {
+  // The harness appends metadata records freely once the turn is over. These
+  // are the real trailing types seen on the dev box (queue-operation and
+  // pr-link even carry timestamps, so "has a timestamp" cannot separate them);
+  // before the turn-record allowlist they pushed the end-of-turn marker out of
+  // the trailing window and reported 52 cleanly-finished sessions as vanished.
+  const text = [
+    JSON.stringify({ type: "assistant", timestamp: "2026-07-18T10:25:00Z" }),
+    JSON.stringify({ type: "system", subtype: "stop_hook_summary", timestamp: "2026-07-18T10:25:36Z" }),
+    JSON.stringify(CLEAN_END),
+    JSON.stringify({ type: "queue-operation", timestamp: "2026-07-18T10:25:38Z", operation: "drain" }),
+    JSON.stringify({ type: "bridge-session" }),
+    JSON.stringify({ type: "ai-title", title: "some session" }),
+    JSON.stringify({ type: "mode", mode: "default" }),
+    JSON.stringify({ type: "permission-mode", permissionMode: "bypassPermissions" }),
+    JSON.stringify({ type: "pr-link", timestamp: "2026-07-18T10:25:40Z", url: "https://example.invalid/pr/1" }),
+  ].join("\n");
+  const o = runner.transcriptOutcome(text);
+  assert.strictEqual(o.state, "done");
+  assert.strictEqual(o.termination_class, "completed");
+});
+
+test("transcriptOutcome: a NEW turn that starts after a clean one and never answers is still vanished", () => {
+  // The counterpart guard: user input after the marker is a turn that genuinely
+  // began and never finished, so the allowlist must not launder it into 'done'.
+  const text = [
+    JSON.stringify({ type: "assistant", timestamp: "2026-07-18T10:25:00Z" }),
+    JSON.stringify(CLEAN_END),
+    JSON.stringify({ type: "user", timestamp: "2026-07-18T10:30:00Z", message: { role: "user", content: "one more thing" } }),
+    JSON.stringify({ type: "attachment", timestamp: "2026-07-18T10:30:01Z" }),
+  ].join("\n");
+  const o = runner.transcriptOutcome(text);
+  assert.strictEqual(o.state, "vanished");
+  assert.strictEqual(o.termination_signal, "mid-turn");
+});
+
+test("transcriptOutcome: a transcript of pure bookkeeping has no turn state to read", () => {
+  const text = [
+    JSON.stringify({ type: "custom-title", title: "x" }),
+    JSON.stringify({ type: "agent-name", name: "y" }),
+    JSON.stringify({ type: "permission-mode", permissionMode: "default" }),
+  ].join("\n");
+  const o = runner.transcriptOutcome(text);
+  assert.strictEqual(o.state, "vanished");
+  assert.strictEqual(o.termination_signal, "empty-transcript");
+});
+
 test("transcriptOutcome: an agent that merely DISCUSSED credit exhaustion and finished cleanly is not an environment failure", () => {
   const text = [
     JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "the Fable run died: out of usage credits" }] } }),
