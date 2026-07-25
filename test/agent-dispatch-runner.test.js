@@ -80,6 +80,41 @@ test("early child exit during a large prompt records a terminal failure instead 
   assert.ok(record.finished_at, "the run reached a terminal journal state");
 });
 
+// inc-spor-dispatch-session-vanished-2026-07-18: an observed exit still has to
+// retain WHY, and separate the environment's failures from the work's.
+test("supervisor finalization classifies every terminal state, and keeps the reason", async () => {
+  const ok = await runJob(jobFixture("process.exit(0);", "p\n").job);
+  assert.strictEqual(ok, 0);
+
+  const failed = jobFixture("process.exit(3);", "p\n");
+  await runJob(failed.job);
+  const failedRec = readJson(failed.record);
+  assert.strictEqual(failedRec.termination_class, "failed");
+  assert.match(failedRec.termination_reason, /exited 3/);
+
+  const missing = jobFixture("process.exit(0);", "p\n");
+  fs.unlinkSync(path.join(missing.dir, "run.prompt"));
+  assert.strictEqual(await runJob(missing.job), 2);
+  const missingRec = readJson(missing.record);
+  assert.strictEqual(missingRec.state, "failed_launch");
+  assert.strictEqual(missingRec.termination_class, "launch");
+  assert.ok(missingRec.termination_reason);
+});
+
+test("a supervised child killed by provider credit exhaustion is an ENVIRONMENT failure, not a failed implementation", async () => {
+  const fixture = jobFixture(`
+const fs = require("node:fs");
+fs.writeSync(2, "API Error: your account is out of usage credits\\n");
+process.exit(1);
+`, "p\n");
+  await runJob(fixture.job);
+  const record = readJson(fixture.record);
+  assert.strictEqual(record.state, "failed");
+  assert.strictEqual(record.termination_class, "environment");
+  assert.strictEqual(record.termination_signal, "credit-exhausted");
+  assert.match(record.termination_reason, /out of usage credits/);
+});
+
 test("runJob drains child stdio, parses the final session event, and flushes the journal before returning", async () => {
   const fixture = jobFixture(`
 const fs = require("node:fs");

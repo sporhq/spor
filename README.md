@@ -261,6 +261,20 @@ Templates can use placeholders such as:
 dispatched node's own frontmatter fields (blank in free-text or `--backfill`
 dispatch, where there is no target node).
 
+A dispatched agent detaches into its harness, so `spor dispatch` records every
+run it launches and `spor runs` reports how each one ended:
+
+```bash
+spor runs
+spor runs --node issue-86
+```
+
+Each run resolves to a terminal state — `done`, `failed`, `vanished` (it stopped
+mid-turn), or `failed_launch` — with the reason, a class that keeps environment
+failures such as provider credit exhaustion separate from failures of the work
+itself, and a pointer to the transcript to read. Terminal records age out after
+`dispatch.runRetentionMs` (default 14 days).
+
 ## Local mode
 
 By default, Spor can run entirely on your machine.

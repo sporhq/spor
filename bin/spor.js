@@ -477,6 +477,28 @@ function renderQueueLocalText(q, hidden = 0) {
   if (hidden > 0) out(`(${hidden} in-flight hidden — --hide-dispatched)`);
 }
 
+// Enumerate one cli-json harness's background agents: {ok, agents}. `ok` answers
+// "could I ask at all?" — a binary that's absent, exits nonzero, or prints
+// garbage says NOTHING about liveness, and run reconciliation
+// (inc-spor-dispatch-session-vanished-2026-07-18) must not read that silence as
+// "every run is dead". SPOR_FAKE_AGENTS_JSON is the same test seam as before.
+function enumerateHarnessAgents(adapter) {
+  const discovery = adapter.activeDiscovery || {};
+  if (discovery.kind !== "cli-json") return { ok: false, agents: [] };
+  let text = process.env.SPOR_FAKE_AGENTS_JSON;
+  if (text == null) {
+    const cmd = adapter.command();
+    if (cmd === "claude" && !hasCmd(cmd)) return { ok: false, agents: [] };
+    const r = spawnPortableSync(cmd, discovery.args, { encoding: "utf8", timeout: 5000 });
+    if (r.status !== 0 || !r.stdout) return { ok: false, agents: [] };
+    text = r.stdout;
+  }
+  let arr;
+  try { arr = JSON.parse(text); } catch { return { ok: false, agents: [] }; }
+  if (!Array.isArray(arr)) return { ok: false, agents: [] };
+  return { ok: true, agents: arr };
+}
+
 // Active background agents keyed by node id (task-spor-cli-in-flight-surface).
 // `spor dispatch` names each background agent after the node id it works
 // (cmdDispatch: name = name || nodeId), so `claude agents --json` lets the queue
@@ -508,17 +530,8 @@ function dispatchedAgents(cfg) {
         continue;
       }
       if (discovery.kind !== "cli-json") continue;
-      let text = process.env.SPOR_FAKE_AGENTS_JSON;
-      if (text == null) {
-        const cmd = adapter.command();
-        if (cmd === "claude" && !hasCmd(cmd)) continue;
-        const r = spawnPortableSync(cmd, discovery.args, { encoding: "utf8", timeout: 5000 });
-        if (r.status !== 0 || !r.stdout) continue;
-        text = r.stdout;
-      }
-      let arr;
-      try { arr = JSON.parse(text); } catch { continue; }
-      if (!Array.isArray(arr)) continue;
+      const { ok, agents: arr } = enumerateHarnessAgents(adapter);
+      if (!ok) continue;
       for (const a of arr) {
         if (!a || a.kind !== "background" || typeof a.name !== "string") continue;
         if (a.state === "done") continue;
@@ -7255,12 +7268,14 @@ async function launchSupervisedHarness(cfg, {
     node_id: nodeId || null,
     name,
     harness: adapter.id,
+    launch_mode: adapter.launchMode,
     state: "launching",
     cwd,
     created_at: now,
     log_path: p.log,
     report_path: p.report,
   };
+  dispatchRuns.pruneRuns(cfg.userConfigHome(), { maxAgeMs: cfg.getNum("dispatch.runRetentionMs", 1209600000) });
   writePrivate(p.prompt, prompt);
   writePrivate(p.job, JSON.stringify({
     run_id: runId,
@@ -7316,6 +7331,52 @@ async function launchSupervisedHarness(cfg, {
   }
   const state = dispatchRuns.readJson(p.record) || record;
   return { ok: true, state, runId, paths: p };
+}
+
+// --- spor runs (inc-spor-dispatch-session-vanished-2026-07-18) --------------
+// The queryable terminal record for dispatched runs. Reading it RECONCILES
+// first: a native-background run's exit is invisible to the launcher, so its
+// outcome is derived here from the harness's live-agent list plus the run's own
+// transcript, and written back — after which the run has a durable terminal
+// state, a classification, a reason, and a diagnostic pointer, whatever
+// happened to it. No LLM and no network: a live-agent listing, a directory
+// read, and a bounded transcript tail.
+function cmdRuns(cfg, { values, positionals: pos }) {
+  const home = cfg.userConfigHome();
+  let enumerated = false;
+  const agents = [];
+  for (const adapter of dispatchHarnesses.harnesses()) {
+    if ((adapter.activeDiscovery || {}).kind !== "cli-json") continue;
+    const e = enumerateHarnessAgents(adapter);
+    if (!e.ok) continue;
+    enumerated = true;
+    // A finished agent the harness still lists is NOT live — reconciling it is
+    // the whole point, so it must not hold its run open (same `done` filter the
+    // in-flight surface applies).
+    for (const a of e.agents) if (a && a.kind === "background" && a.state !== "done") agents.push(a);
+  }
+  const records = dispatchRuns.reconcileRuns(home, { agents, enumerated });
+  const limit = Math.max(1, parseInt(values.limit, 10) || 20); // a bad --limit falls back to the default, never to 1
+  const runs = dispatchRuns.listRuns(home, { records, node: values.node || null, runId: pos[0] || null, limit });
+  if (values.json) {
+    out(JSON.stringify({ reconciled: enumerated, count: runs.length, runs }, null, 2));
+    return 0;
+  }
+  if (!runs.length) {
+    out("no dispatch runs recorded" + (values.node || pos[0] ? " for that filter" : "") + ".");
+    return 0;
+  }
+  if (!enumerated) err("note: could not list live background agents — run states may be stale (nothing was reconciled).");
+  for (const r of runs) {
+    const cls = r.termination_class ? ` — ${r.termination_class}${r.termination_signal ? `/${r.termination_signal}` : ""}` : "";
+    out(`${r.run_id.slice(0, 8)}  ${r.state}${cls}  ${r.node_id || r.name || "(free-text)"}  ${r.harness}  ${r.created_at || ""}`);
+    if (r.termination_reason) out(`  why:        ${r.termination_reason}`);
+    if (r.cwd) out(`  cwd:        ${r.cwd}`);
+    if (r.session_id) out(`  session:    ${r.session_id}`);
+    if (r.transcript_path) out(`  transcript: ${r.transcript_path}`);
+    if (r.log_path) out(`  log:        ${r.log_path}`);
+  }
+  return 0;
 }
 
 async function cmdDispatch(cfg, { values, positionals: pos }) {
@@ -8004,16 +8065,42 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     mcpConfig: agentMcpFile,
     prompt,
   });
+  // A durable run record for the NATIVE-background launch
+  // (inc-spor-dispatch-session-vanished-2026-07-18). `claude --bg` hands the
+  // child to its own daemon and returns, so this launcher never observes the
+  // child's exit, and `claude agents --json` lists only LIVE agents — a run that
+  // finished and a run that died look identical afterwards, which is precisely
+  // how the 2026-07-18 Sonnet dispatches "vanished". Write the record at every
+  // boundary we DO observe (launch, launcher exit, session bind); `spor runs`
+  // classifies the terminal outcome later from the harness's own transcript.
+  dispatchRuns.pruneRuns(cfg.userConfigHome(), { maxAgeMs: cfg.getNum("dispatch.runRetentionMs", 1209600000) });
+  const nativeRun = dispatchRuns.beginNativeRun(cfg.userConfigHome(), {
+    harness: harnessAdapter.id, name, nodeId, cwd: launchDir, model: effectiveModel || null,
+  });
   // The agent's git must follow launchDir (its worktree, or the target checkout),
   // so hand it an env scrubbed of the git location vars — an ambient GIT_DIR
   // would otherwise point every commit it makes at the LAUNCHER's repo
   // (issue-spor-dispatch-worktree-wrong-repo-location).
   const r = spawnPortableSync(harnessBin, nativeArgs, { cwd: launchDir, stdio: "inherit", env: u.gitEnv() });
   if (r.error) {
+    dispatchRuns.updateRun(nativeRun, {
+      state: "failed_launch", termination_class: "launch", termination_signal: "launch-failed",
+      termination_reason: r.error.message, error: r.error.message, finished_at: new Date().toISOString(),
+    });
     err(`could not launch ${harnessBin}: ${r.error.message}`);
     await releaseClaimOnAbort();
     return 1;
   }
+  const launcherOk = r.status === 0;
+  dispatchRuns.updateRun(nativeRun, launcherOk
+    ? { state: "running", launched_at: new Date().toISOString(), launcher_exit: 0 }
+    : {
+        state: "failed_launch", launcher_exit: r.status == null ? null : r.status,
+        termination_class: "launch", termination_signal: "launcher-nonzero",
+        termination_reason: `${harnessBin} exited ${r.status == null ? "abnormally" : r.status} without leaving a background agent`,
+        finished_at: new Date().toISOString(),
+      });
+  out(`run:     ${nativeRun.runId} (${harnessAdapter.label}; 'spor runs' for its outcome)`);
 
   // Late session binding (dec-spor-dispatch-bg-session-late-bind). `claude --bg`
   // has now self-allocated its run session and registered the agent; read the
@@ -8028,6 +8115,10 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   const wantBind = cfg.mode() === "remote" && (agentToken || (nodeId && !backfill && !noClaim));
   if (wantBind) {
     const realSession = await captureDispatchSession(cfg, name, launchDir, pinnedSession);
+    // Record the session whether or not the bind itself succeeds: it is the
+    // pointer `spor runs` follows to the harness transcript that holds this
+    // run's terminal reason.
+    if (realSession) dispatchRuns.updateRun(nativeRun, { session_id: realSession, bound_at: new Date().toISOString() });
     if (realSession) {
       if (agentToken) {
         const b = await bindAgentSession(cfg, agentToken, realSession);
@@ -10074,6 +10165,39 @@ const COMMANDS = {
     },
     examples: ['spor dispatch "rotate the pipeline auth tokens" --dir ../api', "spor dispatch dec-x --model haiku", "spor dispatch --from-queue --print"],
     run: (cfg, p) => cmdDispatch(cfg, p),
+  },
+  runs: {
+    group: "Dispatch (background agents)", parse: "strict", args: "[<run-id>]",
+    summary: "what happened to the runs this machine dispatched",
+    help:
+      "The durable record of every background agent dispatched from this machine —\n" +
+      "how each run ENDED, and where to look (inc-spor-dispatch-session-vanished-\n" +
+      "2026-07-18).\n\n" +
+      "A Claude Code dispatch detaches into the harness daemon, so the launcher\n" +
+      "never sees the child exit and 'claude agents' lists only what is still\n" +
+      "running: without this record a finished run and a dead one are\n" +
+      "indistinguishable afterwards. Reading this reconciles first — every run the\n" +
+      "harness no longer reports live is resolved against its own transcript and\n" +
+      "stamped with a terminal state, a classification, a reason, and a transcript\n" +
+      "pointer:\n\n" +
+      "  done       the session ended its turn cleanly\n" +
+      "  failed     it ended for a recognized reason (see the class)\n" +
+      "  vanished   it stopped mid-turn with no end-of-turn marker — the reason\n" +
+      "             names the last record and the transcript to read\n" +
+      "  failed_launch  the harness never started\n\n" +
+      "The classification separates causes that must not be conflated:\n" +
+      "environment (provider credit exhaustion, usage limits, rate limits, rejected\n" +
+      "auth — re-dispatch with headroom), launch, failed, completed, unknown.\n\n" +
+      "A run still inside its first minute, or one whose harness could not be\n" +
+      "queried at all, is left alone rather than declared dead. Terminal records\n" +
+      "age out after dispatch.runRetentionMs (default 14d).",
+    options: {
+      node: { type: "string", value: "id", desc: "only runs dispatched for this node id" },
+      limit: { type: "string", value: "N", desc: "how many runs to show (default 20)" },
+      json: { type: "boolean", desc: "machine-readable JSON (the raw run records)" },
+    },
+    examples: ["spor runs", "spor runs --node issue-x", "spor runs --json"],
+    run: (cfg, p) => cmdRuns(cfg, p),
   },
   repos: {
     group: "Dispatch (background agents)", parse: "raw",
