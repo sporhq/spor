@@ -191,14 +191,31 @@ test("transcriptOutcome: an unreadable/empty transcript still yields a terminal 
 
 // --- liveness + finalization ----------------------------------------------
 
-test("isRunLive: matches a bound session by id, an unbound one by checkout, and rejects a pre-launch agent", () => {
+test("isRunLive: matches a bound session by id, an unbound one by launch NAME, and rejects a pre-launch agent", () => {
   const bound = { session_id: "s1", cwd: "/w", created_at: "2026-07-18T10:00:00.000Z" };
   assert.ok(runner.isRunLive(bound, [{ sessionId: "s1", cwd: "/other" }]));
   assert.ok(!runner.isRunLive(bound, [{ sessionId: "s2", cwd: "/w" }]));
-  const unbound = { cwd: "/w", created_at: "2026-07-18T10:00:00.000Z" };
-  assert.ok(runner.isRunLive(unbound, [{ cwd: "/w", startedAt: Date.parse("2026-07-18T10:00:05.000Z") }]));
-  assert.ok(!runner.isRunLive(unbound, [{ cwd: "/w", startedAt: Date.parse("2026-07-18T09:00:00.000Z") }]));
+  const unbound = { name: "task-a", cwd: "/w", created_at: "2026-07-18T10:00:00.000Z" };
+  assert.ok(runner.isRunLive(unbound, [{ name: "task-a", cwd: "/w", startedAt: Date.parse("2026-07-18T10:00:05.000Z") }]));
+  assert.ok(!runner.isRunLive(unbound, [{ name: "task-a", cwd: "/w", startedAt: Date.parse("2026-07-18T09:00:00.000Z") }]));
+  assert.ok(!runner.isRunLive(unbound, [{ name: "task-a", cwd: "/elsewhere", startedAt: Date.parse("2026-07-18T10:00:05.000Z") }]));
   assert.ok(!runner.isRunLive(unbound, []));
+});
+
+test("isRunLive: a SIBLING agent sharing the checkout never holds an unbound run open", () => {
+  // issue-spor-dispatch-run-liveness-same-cwd-misattribution: two `--no-worktree`
+  // dispatches into one repo share a cwd, so co-location is not evidence about
+  // THIS run. task-a is dead; task-b is very much alive in the same directory.
+  const dead = { name: "task-a", cwd: "/repo", created_at: "2026-07-18T10:00:00.000Z" };
+  const sibling = { name: "task-b", cwd: "/repo", sessionId: "s-b", startedAt: Date.parse("2026-07-18T10:00:05.000Z") };
+  assert.ok(!runner.isRunLive(dead, [sibling]), "a sibling in the same checkout is not this run");
+  // …and the sibling's own record is still correctly live.
+  assert.ok(runner.isRunLive({ name: "task-b", cwd: "/repo", created_at: "2026-07-18T10:00:00.000Z" }, [sibling]));
+});
+
+test("isRunLive: a run with no identity at all is never inferred alive from co-location", () => {
+  const anonymous = { cwd: "/repo", created_at: "2026-07-18T10:00:00.000Z" };
+  assert.ok(!runner.isRunLive(anonymous, [{ name: "task-b", cwd: "/repo", startedAt: Date.parse("2026-07-18T10:00:05.000Z") }]));
 });
 
 test("finalizeRun: a live run, an already-terminal run, and a run inside its grace window are left alone", () => {
@@ -221,29 +238,47 @@ test("finalizeRun: a child that exited BEFORE session binding is terminal, and s
   assert.ok(patch.finished_at, "a terminal record always carries when it ended");
 });
 
-test("finalizeRun: an unbound run is still resolved from the newest transcript in its checkout", () => {
+test("finalizeRun: a BOUND run is resolved from its own transcript, named by its session id", () => {
   const configDir = scratch("spor-runs-cc-");
   const cwd = "/tmp/spor-runs-demo";
   const file = writeTranscript(configDir, cwd, "sid-late", [TOOL_RESULT, CLEAN_END]);
   const patch = runner.finalizeRun(
-    { state: "running", cwd, created_at: "2026-07-18T10:00:00.000Z" },
+    { state: "running", cwd, session_id: "sid-late", created_at: "2026-07-18T10:00:00.000Z" },
     { alive: false, env: { CLAUDE_CONFIG_DIR: configDir }, now: () => "2026-07-18T10:10:00.000Z" }
   );
   assert.strictEqual(patch.state, "done");
   assert.strictEqual(patch.transcript_path, file, "the record points at the transcript it was read from");
 });
 
-test("finalizeRun: a transcript written BEFORE the run started belongs to an earlier session, not this run", () => {
+test("finalizeRun: an unbound run NEVER borrows a transcript from its checkout", () => {
+  // issue-spor-dispatch-run-liveness-same-cwd-misattribution, harm 2: a project
+  // dir is one CHECKOUT. This transcript belongs to whoever else ran here — it
+  // postdates the launch and would have been adopted as newest-in-dir. A record
+  // that confidently points at the wrong transcript is worse than no record.
   const configDir = scratch("spor-runs-cc-");
-  const cwd = "/tmp/spor-runs-stale";
-  const file = writeTranscript(configDir, cwd, "sid-old", [TOOL_RESULT, CLEAN_END]);
-  const old = Date.parse("2026-07-18T08:00:00.000Z") / 1000;
-  fs.utimesSync(file, old, old);
+  const cwd = "/tmp/spor-runs-shared";
+  writeTranscript(configDir, cwd, "sid-of-a-different-run", [TOOL_RESULT, CLEAN_END]);
   const patch = runner.finalizeRun(
-    { state: "running", cwd, created_at: "2026-07-18T10:00:00.000Z" },
+    { state: "running", name: "task-a", cwd, created_at: "2026-07-18T10:00:00.000Z" },
     { alive: false, env: { CLAUDE_CONFIG_DIR: configDir }, now: () => "2026-07-18T10:10:00.000Z" }
   );
-  assert.strictEqual(patch.termination_signal, "session-unbound", "an older transcript is not adopted as this run's");
+  assert.strictEqual(patch.state, "vanished", "it is terminal — never left hanging");
+  assert.strictEqual(patch.termination_signal, "session-unbound");
+  assert.ok(!patch.transcript_path, "no transcript is attributed without identity");
+  assert.match(patch.termination_reason, /how it ended is unknown/);
+});
+
+test("finalizeRun: a bound run whose transcript is missing says so, and does not fall back to a sibling's", () => {
+  const configDir = scratch("spor-runs-cc-");
+  const cwd = "/tmp/spor-runs-gone";
+  writeTranscript(configDir, cwd, "sid-of-a-different-run", [TOOL_RESULT, CLEAN_END]);
+  const patch = runner.finalizeRun(
+    { state: "running", cwd, session_id: "sid-mine", created_at: "2026-07-18T10:00:00.000Z" },
+    { alive: false, env: { CLAUDE_CONFIG_DIR: configDir }, now: () => "2026-07-18T10:10:00.000Z" }
+  );
+  assert.strictEqual(patch.termination_signal, "no-transcript");
+  assert.ok(!patch.transcript_path);
+  assert.match(patch.termination_reason, /sid-mine/);
 });
 
 // --- reconciliation over the record store ---------------------------------
@@ -273,6 +308,35 @@ test("reconcileRuns: resolves dead native runs, keeps live ones, and never touch
   assert.strictEqual(byId.get("sup-1").state, "running");
   // Durable: the derived outcome is written back, not just returned.
   assert.strictEqual(runRecords(home).find((r) => r.run_id === dead.runId).state, "vanished");
+});
+
+test("reconcileRuns: two concurrent dispatches in ONE checkout resolve independently", () => {
+  // The `--no-worktree` shape from issue-spor-dispatch-run-liveness-same-cwd-
+  // misattribution: both runs share a cwd and neither bound a session. The dead
+  // one must reach a terminal state even though its sibling is alive beside it,
+  // and it must not be handed the sibling's transcript as its evidence.
+  const home = scratch("spor-runs-store-");
+  const configDir = scratch("spor-runs-cc-");
+  const cwd = "/tmp/spor-runs-shared-checkout";
+  // The only transcript here belongs to the LIVE sibling.
+  const siblingTranscript = writeTranscript(configDir, cwd, "sid-live-sibling", [TOOL_RESULT, CLEAN_END]);
+  const dead = runner.beginNativeRun(home, { harness: "claude-code", name: "issue-dead", nodeId: "issue-dead", cwd, now: () => "2026-07-18T10:00:00.000Z" });
+  runner.updateRun(dead, { state: "running" });
+  const live = runner.beginNativeRun(home, { harness: "claude-code", name: "issue-live", nodeId: "issue-live", cwd, now: () => "2026-07-18T10:00:00.000Z" });
+  runner.updateRun(live, { state: "running" });
+
+  const out = runner.reconcileRuns(home, {
+    agents: [{ name: "issue-live", cwd, kind: "background", startedAt: Date.parse("2026-07-18T10:00:05.000Z") }],
+    env: { CLAUDE_CONFIG_DIR: configDir },
+    now: () => "2026-07-18T10:10:00.000Z",
+  });
+  const byId = new Map(out.map((r) => [r.run_id, r]));
+  assert.strictEqual(byId.get(live.runId).state, "running", "the live sibling is still live");
+  const d = byId.get(dead.runId);
+  assert.ok(runner.TERMINAL_STATES.has(d.state), "the dead run reaches a terminal state regardless of its sibling");
+  assert.strictEqual(d.termination_signal, "session-unbound");
+  assert.notStrictEqual(d.transcript_path, siblingTranscript, "and is never handed the sibling's transcript");
+  assert.ok(!d.transcript_path);
 });
 
 test("reconcileRuns: a harness that could not be listed reconciles NOTHING (stale child state is not death)", () => {
@@ -357,8 +421,12 @@ test("spor runs: a credit-dead run reads as an ENVIRONMENT failure with the prov
   const configDir = scratch("spor-runs-cc-");
   cli(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const stub = writeSpawnableNodeStub(home, "claude-ok", "process.exit(0);");
-  cli(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, CLAUDE_CONFIG_DIR: configDir });
+  // A LOCAL-mode dispatch binds its session too, so the run has the identity
+  // that ties it to its own transcript (rather than to whatever else ran in
+  // this checkout) — issue-spor-dispatch-run-liveness-same-cwd-misattribution.
+  cli(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, CLAUDE_CONFIG_DIR: configDir, SPOR_SESSION_ID: "sid-credit" });
   const rec = runRecords(home)[0];
+  assert.strictEqual(rec.session_id, "sid-credit", "local mode records the run's session identity");
   runner.atomicJson(runner.runPaths(home, rec.run_id).record, { ...rec, created_at: "2026-07-18T10:00:00.000Z" });
   writeTranscript(configDir, rec.cwd, "sid-credit", [
     { type: "assistant", timestamp: "2026-07-18T10:01:00Z", message: { content: [{ type: "text", text: "starting" }] } },
@@ -372,6 +440,31 @@ test("spor runs: a credit-dead run reads as an ENVIRONMENT failure with the prov
   assert.strictEqual(run.termination_signal, "credit-exhausted");
   assert.match(run.termination_reason, /out of usage credits/);
   assert.ok(run.transcript_path, "and a pointer to the evidence");
+});
+
+test("dispatch: a SIBLING agent's session is never adopted as this run's identity", () => {
+  // issue-spor-dispatch-run-liveness-same-cwd-misattribution, at the capture
+  // step: during the poll window our own agent is often unregistered while a
+  // sibling in the same checkout already is. Binding "newest in this directory"
+  // would stamp the run with the sibling's session — and every later inference
+  // (liveness, transcript) would then be about the wrong run.
+  const { home, repo } = fixture();
+  const stub = writeSpawnableNodeStub(home, "claude-ok", "process.exit(0);");
+  cli(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const base = { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub };
+
+  // Learn the checkout this dispatch actually launches into…
+  cli(["dispatch", "dec-x", "--no-brief"], base);
+  const cwd = runRecords(home)[0].cwd;
+
+  // …then dispatch again while a DIFFERENT agent is live in that same checkout.
+  const sibling = JSON.stringify([
+    { kind: "background", name: "some-other-node", sessionId: "sid-of-the-sibling", cwd, state: "running", startedAt: Date.now() },
+  ]);
+  cli(["dispatch", "dec-x", "--no-brief"], { ...base, SPOR_FAKE_AGENTS_JSON: sibling });
+  for (const rec of runRecords(home)) {
+    assert.notStrictEqual(rec.session_id, "sid-of-the-sibling", "a sibling's session is not this run's identity");
+  }
 });
 
 test("dispatch: a PRE-LAUNCH refusal stays an explicit refusal — non-zero, a reason, and no phantom run record", () => {

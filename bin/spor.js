@@ -561,10 +561,15 @@ function newestDispatchedSession(cfg, name, dir) {
     for (const a of arr) if (!a.harness || a.harness === "claude-code") all.push(a);
   }
   let cands = all.filter((a) => a.sessionId && (!dir || a.cwd === dir));
-  if (name) {
-    const named = cands.filter((a) => a.name === name);
-    if (named.length) cands = named;
-  }
+  // A launch name is an exact identity, so REQUIRE it rather than preferring it.
+  // Several dispatches share one checkout (every `--no-worktree` dispatch into
+  // the same repo does), so "newest in this directory" can be a sibling's
+  // session — and during the poll window our own agent is often not registered
+  // yet while a sibling already is, which is exactly when the fallback fires and
+  // stamps the run with someone else's session
+  // (issue-spor-dispatch-run-liveness-same-cwd-misattribution). Returning null
+  // just keeps polling until ours appears; an honest miss beats a wrong id.
+  if (name) cands = cands.filter((a) => a.name === name);
   if (!cands.length) return null;
   cands.sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
   return cands[0].sessionId;
@@ -8112,13 +8117,22 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // session: honest, never a phantom) and the lease self-healing via heartbeat.
   // Remote only, and only when there's something to bind (an agent token and/or a
   // claimed node).
+  //
+  // The capture itself now runs in BOTH modes, because the session id is the
+  // only thing that ties a run to its own transcript: a project dir is one
+  // CHECKOUT, and every `--no-worktree` dispatch into the same repo shares it,
+  // so without this a run can only be identified by co-location — which is how
+  // a live sibling agent held a dead run open and donated it a transcript
+  // (issue-spor-dispatch-run-liveness-same-cwd-misattribution). Only the
+  // remote-side binding below stays remote-only. Best-effort: a capture miss
+  // leaves the record honestly session-less rather than guessing.
+  const realSession = launcherOk ? await captureDispatchSession(cfg, name, launchDir, pinnedSession) : null;
+  // Record the session whether or not the remote bind succeeds: it is the
+  // pointer `spor runs` follows to the harness transcript that holds this
+  // run's terminal reason.
+  if (realSession) dispatchRuns.updateRun(nativeRun, { session_id: realSession, bound_at: new Date().toISOString() });
   const wantBind = cfg.mode() === "remote" && (agentToken || (nodeId && !backfill && !noClaim));
   if (wantBind) {
-    const realSession = await captureDispatchSession(cfg, name, launchDir, pinnedSession);
-    // Record the session whether or not the bind itself succeeds: it is the
-    // pointer `spor runs` follows to the harness transcript that holds this
-    // run's terminal reason.
-    if (realSession) dispatchRuns.updateRun(nativeRun, { session_id: realSession, bound_at: new Date().toISOString() });
     if (realSession) {
       if (agentToken) {
         const b = await bindAgentSession(cfg, agentToken, realSession);
@@ -10183,8 +10197,13 @@ const COMMANDS = {
       "  done       the session ended its turn cleanly\n" +
       "  failed     it ended for a recognized reason (see the class)\n" +
       "  vanished   it stopped mid-turn with no end-of-turn marker — the reason\n" +
-      "             names the last record and the transcript to read\n" +
+      "             names the last record and the transcript to read — or it left\n" +
+      "             nothing that can be attributed to it\n" +
       "  failed_launch  the harness never started\n\n" +
+      "Evidence is only ever this run's own: a transcript is matched by the\n" +
+      "session the run bound, never by the directory it ran in, since several\n" +
+      "dispatches can share one checkout. A run that never bound a session is\n" +
+      "still made terminal, and says that its ending is unknown.\n\n" +
       "The classification separates causes that must not be conflated:\n" +
       "environment (provider credit exhaustion, usage limits, rate limits, rejected\n" +
       "auth — re-dispatch with headroom), launch, failed, completed, unknown.\n\n" +

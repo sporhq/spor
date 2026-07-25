@@ -270,10 +270,13 @@ spor runs --node issue-86
 ```
 
 Each run resolves to a terminal state — `done`, `failed`, `vanished` (it stopped
-mid-turn), or `failed_launch` — with the reason, a class that keeps environment
-failures such as provider credit exhaustion separate from failures of the work
-itself, and a pointer to the transcript to read. Terminal records age out after
-`dispatch.runRetentionMs` (default 14 days).
+mid-turn, or it ended in a way nothing can be attributed to), or `failed_launch`
+— with the reason, and a class that keeps environment failures such as provider
+credit exhaustion separate from failures of the work itself. A run that bound a
+session also carries a pointer to its transcript; one that never bound a session
+says so rather than borrowing a transcript from whatever else ran in that
+checkout. Terminal records age out after `dispatch.runRetentionMs` (default 14
+days).
 
 ## Local mode
 
