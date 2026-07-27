@@ -7024,7 +7024,7 @@ function dispatchWorktreeDir(repoDir, name) {
 // config value be a script path OR an inline command. Returns { dir, branch,
 // reused, setupRan } on success; { error } if the worktree couldn't be made; or
 // { setupError, created, ... } the caller turns into an abort.
-function createDispatchWorktree(repoDir, name, { setup, slug, nodeId } = {}) {
+function createDispatchWorktree(repoDir, name, { slug, nodeId } = {}) {
   const branch = worktreeName(name);
   const dir = dispatchWorktreeDir(repoDir, name);
   let reused = false;
@@ -7044,6 +7044,22 @@ function createDispatchWorktree(repoDir, name, { setup, slug, nodeId } = {}) {
       return { error: (r.stderr || r.stdout || "git worktree add failed").trim() };
     }
   }
+  // Resolve dispatch.worktreeSetup from the WORKTREE'S OWN checkout, never the
+  // main checkout's live .spor.json (issue-spor-dispatch-worktree-config-live-
+  // file-race). `git worktree add ... HEAD` above cuts `dir` from HEAD, but the
+  // main checkout's working tree/index routinely lags HEAD (a stale index is
+  // the normal post-merge state after a CAS `update-ref`, per
+  // dec-spor-docs-worktree-setup-hook-dirty-checkout-race) — reading the
+  // config from `repoDir` at this point can silently miss a just-merged
+  // worktreeSetup with no error. `dir` always reflects the exact commit the
+  // worktree was cut from (or, on reuse, whatever commit it already has
+  // checked out — still more accurate than the main checkout's live state),
+  // and a relative worktreeSetup path resolves against `dir` too, so the
+  // script itself comes from the same checkout, not a possibly-stale sibling
+  // in the main tree.
+  const cfg = targetRepoDispatchCfg(dir);
+  const standingCfg = loadConfig({ cwd: dir, env: process.env });
+  const setup = cfg.worktreeSetup != null ? cfg.worktreeSetup : standingCfg.get("dispatch.worktreeSetup", null);
   if (setup) {
     const sr = spawnSync(setup, [], {
       cwd: dir,
@@ -7644,6 +7660,12 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // never seeing a foreign repo's .spor.json.
   const targetCfg = targetRepoDispatchCfg(res.dir);
   const targetStandingCfg = loadConfig({ cwd: res.dir, env: process.env });
+  // `worktreeSetup` here is a --print PREVIEW ONLY (line ~7855 below), read
+  // from the main checkout's live files since no worktree exists yet to read
+  // it from. The REAL dispatch never uses this value: createDispatchWorktree
+  // re-resolves dispatch.worktreeSetup from the freshly-created worktree's own
+  // checkout instead, so a stale/dirty main index at dispatch time can't
+  // silently no-op the hook (issue-spor-dispatch-worktree-config-live-file-race).
   const worktreeSetup =
     targetCfg.worktreeSetup != null ? targetCfg.worktreeSetup : targetStandingCfg.get("dispatch.worktreeSetup", null);
   const worktreeDefault =
@@ -8070,7 +8092,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // issue-spor-dispatch-worktree-dir-stamping); only the launch cwd moves.
   let launchDir = res.dir;
   if (useWorktree) {
-    const wt = createDispatchWorktree(res.dir, name, { setup: worktreeSetup, slug: res.slug, nodeId });
+    const wt = createDispatchWorktree(res.dir, name, { slug: res.slug, nodeId });
     if (wt.error) {
       err(`could not create dispatch worktree under ${res.dir}: ${wt.error}`);
       err(`  (is ${res.dir} a git repo with at least one commit? or pass --no-worktree.)`);

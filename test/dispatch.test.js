@@ -977,10 +977,16 @@ test("dispatch (cross-repo): honors the TARGET repo's .spor.json dispatch.worktr
 
 test("dispatch (cross-repo): a relative dispatch.worktreeSetup in the target .spor.json resolves against the repo", () => {
   const { home } = fixture();
-  const { repo } = gitTargetRepo();
+  const { repo, g } = gitTargetRepo();
   fs.mkdirSync(path.join(repo, "scripts"));
   const setup = writeSpawnableNodeStub(path.join(repo, "scripts"), "wt-setup", "require('node:fs').writeFileSync('./.ran', 'ran\\n');");
   fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktree: true, worktreeSetup: path.relative(repo, setup) } }) + "\n");
+  // Committed, not just written to disk: the worktree is cut from HEAD, so
+  // worktreeSetup and the script it names must be resolved from the commit,
+  // not the main checkout's live working tree
+  // (issue-spor-dispatch-worktree-config-live-file-race).
+  g(["add", "scripts/wt-setup.js", ".spor.json"]);
+  g(["commit", "-q", "-m", "add worktree setup hook"]);
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-elsewhere-"));
   const stub = pwdStub(home);
@@ -1037,6 +1043,51 @@ test("dispatch --no-worktree overrides the target repo's .spor.json dispatch.wor
   const cwd = fs.readFileSync(outFile, "utf8").split("\n")[0];
   assert.strictEqual(cwd, real, "launched in the main checkout despite the target asking for a worktree");
   assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees")), "no worktree created");
+});
+
+// issue-spor-dispatch-worktree-config-live-file-race: `git worktree add ...
+// HEAD` cuts the worktree from the committed HEAD, but a stale/dirty main
+// checkout — the routine post-merge state left by a CAS `git update-ref`
+// (dec-spor-docs-worktree-setup-hook-dirty-checkout-race) — used to make
+// dispatch read dispatch.worktreeSetup from the LIVE working-tree file
+// instead, silently missing a just-merged hook with no error. Reproduce that
+// exact shape: HEAD already carries worktreeSetup, but the live .spor.json on
+// disk is reverted to the PRIOR commit's content (no worktreeSetup) without
+// touching the ref — a `git status` shows the checkout as dirty relative to
+// HEAD, same as an unflushed CAS merge.
+test("dispatch worktree setup hook: fires from a STALE/dirty main checkout, resolved from HEAD not the live file", () => {
+  const { home } = fixture();
+  const { repo, g } = gitTargetRepo();
+  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktree: true } }) + "\n");
+  g(["add", ".spor.json"]);
+  g(["commit", "-q", "-m", "enable worktree isolation"]);
+  const preSetupSha = g(["rev-parse", "HEAD"]).trim();
+
+  fs.mkdirSync(path.join(repo, "scripts"));
+  writeSpawnableNodeStub(path.join(repo, "scripts"), "wt-setup", "require('node:fs').writeFileSync('./.ran', 'ran\\n');");
+  fs.writeFileSync(
+    path.join(repo, ".spor.json"),
+    JSON.stringify({ enabled: true, dispatch: { worktree: true, worktreeSetup: "scripts/wt-setup.js" } }) + "\n"
+  );
+  g(["add", "scripts/wt-setup.js", ".spor.json"]);
+  g(["commit", "-q", "-m", "add worktree setup hook"]);
+
+  // Revert the live checkout to the pre-setup-hook commit's content, WITHOUT
+  // moving the branch ref back — HEAD still names the commit with the hook.
+  fs.writeFileSync(path.join(repo, ".spor.json"), g(["show", `${preSetupSha}:.spor.json`]));
+  fs.rmSync(path.join(repo, "scripts"), { recursive: true, force: true });
+  assert.match(g(["status", "--porcelain"]), /\.spor\.json/, "main checkout is dirty relative to HEAD");
+
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const outFile = path.join(home, "spawn.out");
+  const stub = pwdStub(home);
+  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /setup ran/);
+  assert.ok(
+    fs.existsSync(path.join(repo, ".claude", "worktrees", "dec-x", ".ran")),
+    "setup hook ran, resolved from the worktree's HEAD checkout despite the dirty main checkout"
+  );
 });
 
 // --- profile satisfiability gate (dec-spor-machine-profile-satisfiability) ---
