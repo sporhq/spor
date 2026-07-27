@@ -1,0 +1,14 @@
+{"type":"custom-title","sessionId":"00000000-0000-0000-0000-000000000000","title":"[redacted]"}
+{"type":"agent-name","sessionId":"00000000-0000-0000-0000-000000000000","name":"[redacted]"}
+{"type":"mode","sessionId":"00000000-0000-0000-0000-000000000000","mode":"normal"}
+{"type":"permission-mode","sessionId":"00000000-0000-0000-0000-000000000000","permissionMode":"bypassPermissions"}
+{"type":"file-history-snapshot"}
+{"type":"file-history-snapshot"}
+{"type":"user","timestamp":"2026-07-25T10:57:38.211Z","version":"2.1.220","sessionId":"00000000-0000-0000-0000-000000000000","cwd":"/workspace/demo-repo","gitBranch":"demo-branch","message":{"role":"user","content":"[redacted]"}}
+{"type":"attachment","timestamp":"2026-07-25T10:57:38.211Z","version":"2.1.220","sessionId":"00000000-0000-0000-0000-000000000000","cwd":"/workspace/demo-repo","gitBranch":"demo-branch"}
+{"type":"attachment","timestamp":"2026-07-25T10:57:38.211Z","version":"2.1.220","sessionId":"00000000-0000-0000-0000-000000000000","cwd":"/workspace/demo-repo","gitBranch":"demo-branch"}
+{"type":"attachment","timestamp":"2026-07-25T10:57:38.211Z","version":"2.1.220","sessionId":"00000000-0000-0000-0000-000000000000","cwd":"/workspace/demo-repo","gitBranch":"demo-branch"}
+{"type":"assistant","timestamp":"2026-07-25T10:57:39.687Z","version":"2.1.220","sessionId":"00000000-0000-0000-0000-000000000000","cwd":"/workspace/demo-repo","gitBranch":"demo-branch","message":{"role":"assistant","content":[{"type":"text"}]}}
+{"type":"system","subtype":"stop_hook_summary","timestamp":"2026-07-25T10:57:41.106Z","version":"2.1.220","hookCount":1,"sessionId":"00000000-0000-0000-0000-000000000000","cwd":"/workspace/demo-repo","gitBranch":"demo-branch"}
+{"type":"system","subtype":"turn_duration","timestamp":"2026-07-25T10:57:41.112Z","version":"2.1.220","durationMs":2811,"messageCount":6,"sessionId":"00000000-0000-0000-0000-000000000000","cwd":"/workspace/demo-repo","gitBranch":"demo-branch"}
+{"type":"last-prompt","sessionId":"00000000-0000-0000-0000-000000000000","lastPrompt":"[redacted]"}

@@ -1,0 +1,27 @@
+[
+  {
+    "file": "done-2.1.198-trailing-bookkeeping.jsonl",
+    "expected": { "state": "done", "termination_class": "completed", "termination_signal": "turn-complete" },
+    "note": "A real session on Claude Code 2.1.198 whose harness appended several bookkeeping records (queue-operation, ai-title, mode, permission-mode) AFTER the clean end-of-turn marker — exactly the shape that, before the TURN_RECORD_TYPES allowlist, misread 52 real cleanly-finished sessions as vanished (inc-spor-dispatch-session-vanished-2026-07-18)."
+  },
+  {
+    "file": "done-2.1.220-trailing-bookkeeping.jsonl",
+    "expected": { "state": "done", "termination_class": "completed", "termination_signal": "turn-complete" },
+    "note": "The same trailing-bookkeeping-after-marker shape on a newer Claude Code version (2.1.220), which spells its bookkeeping differently (custom-title/agent-name instead of 2.1.198's ai-title) — a real, checked-in example of the exact kind of format drift a synthetic fixture can't surface."
+  },
+  {
+    "file": "vanished-2.1.201-mid-assistant-turn.jsonl",
+    "expected": { "state": "vanished", "termination_class": "unknown", "termination_signal": "mid-turn" },
+    "note": "A real session (from a Task-tool subagent transcript, same JSONL record shape) that stops right after an assistant text record with no end-of-turn marker — a genuine vanish, not a synthetic stand-in."
+  },
+  {
+    "file": "vanished-2.1.197-slash-command-only.jsonl",
+    "expected": { "state": "vanished", "termination_class": "unknown", "termination_signal": "mid-turn" },
+    "note": "A real, minimal session on an older Claude Code version (2.1.197): a couple of local-command records and nothing that counts as a completed turn. Small and easy to audit by hand."
+  },
+  {
+    "file": "vanished-empty-bridge-session-only.jsonl",
+    "expected": { "state": "vanished", "termination_class": "unknown", "termination_signal": "empty-transcript" },
+    "note": "A real transcript that never got past a single bridge-session bookkeeping record — the CLI exited before any turn began. Covers the empty-transcript edge deterministically rather than only via the synthetic '' case."
+  }
+]

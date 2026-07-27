@@ -1,0 +1,9 @@
+{"type":"mode","sessionId":"00000000-0000-0000-0000-000000000000","mode":"normal"}
+{"type":"permission-mode","sessionId":"00000000-0000-0000-0000-000000000000","permissionMode":"default"}
+{"type":"system","subtype":"local_command","timestamp":"2026-07-01T18:10:40.658Z","version":"2.1.197","sessionId":"00000000-0000-0000-0000-000000000000","cwd":"/workspace/demo-repo","gitBranch":"demo-branch","content":"[redacted]"}
+{"type":"system","subtype":"local_command","timestamp":"2026-07-01T18:10:40.658Z","version":"2.1.197","sessionId":"00000000-0000-0000-0000-000000000000","cwd":"/workspace/demo-repo","gitBranch":"demo-branch","content":"[redacted]"}
+{"type":"last-prompt","sessionId":"00000000-0000-0000-0000-000000000000","lastPrompt":"[redacted]"}
+{"type":"file-history-snapshot"}
+{"type":"user","timestamp":"2026-07-01T18:10:44.632Z","version":"2.1.197","sessionId":"00000000-0000-0000-0000-000000000000","cwd":"/workspace/demo-repo","gitBranch":"demo-branch","message":{"role":"user","content":"[redacted]"}}
+{"type":"user","timestamp":"2026-07-01T18:10:44.631Z","version":"2.1.197","sessionId":"00000000-0000-0000-0000-000000000000","cwd":"/workspace/demo-repo","gitBranch":"demo-branch","message":{"role":"user","content":"[redacted]"}}
+{"type":"user","timestamp":"2026-07-01T18:10:44.631Z","version":"2.1.197","sessionId":"00000000-0000-0000-0000-000000000000","cwd":"/workspace/demo-repo","gitBranch":"demo-branch","message":{"role":"user","content":"[redacted]"}}
