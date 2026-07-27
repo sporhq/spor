@@ -1547,7 +1547,7 @@ function runAsync(args, env, cwd) {
 // resolved-task guard (issue-spor-type-blind-terminal-status-fallbacks): a
 // non-default node type for the offline seed-registry fallback, and the
 // server-computed `inert` enrichment key.
-function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nodeResolution = null, nodeRequires = null, nodeHeld = null, nodeType = "task", nodeInert = null } = {}) {
+function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nodeResolution = null, nodeRequires = null, nodeHeld = null, nodeType = "task", nodeInert = null, releaseStatus = 200 } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = "";
@@ -1571,6 +1571,11 @@ function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nod
         res.end(JSON.stringify(claimBody || { ok: true, status: "claimed", lease: { by: "person-anthony" } }));
         return;
       }
+      if (req.method === "POST" && /^\/v1\/nodes\/[^/]+\/release$/.test(req.url)) {
+        res.writeHead(releaseStatus, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: releaseStatus === 200 }));
+        return;
+      }
       res.writeHead(404, { "content-type": "application/json" });
       res.end("{}");
     });
@@ -1587,6 +1592,14 @@ require("node:fs").writeFileSync(${JSON.stringify(sentinel)}, "launched\\n");
 `);
 }
 const claimHit = (hits) => hits.find((h) => h.method === "POST" && /\/claim$/.test(h.url));
+const releaseHit = (hits) => hits.find((h) => h.method === "POST" && /\/release$/.test(h.url));
+
+// A claude stub that exits non-zero without ever touching `sentinel` — the
+// harness ran but never left a background agent behind (e.g. bad args, a
+// crash before self-daemonizing).
+function claudeBoomStub(dir) {
+  return writeSpawnableNodeStub(dir, "claude-boom", "process.exit(7);");
+}
 
 test("dispatch <node-id> (remote): auto-claims the node, then launches the agent", async () => {
   const { home, repo } = fixture();
@@ -1672,6 +1685,58 @@ test("dispatch --force (remote): a worktree-setup failure does NOT release the p
       !hits.some((h) => h.method === "POST" && /\/release$/.test(h.url)),
       "the --force renewal of a pre-existing lease is never auto-released on a setup failure"
     );
+  } finally {
+    srv.close();
+  }
+});
+
+// issue-spor-dispatch-failed-launch-leaks-claim: `claude --bg` exiting
+// non-zero means it never left a background agent behind — no run will ever
+// attend this node — so the lease this dispatch just established must be
+// released, exactly like the spawn-error and worktree-setup-failure aborts
+// above.
+test("dispatch (remote): a harness that exits non-zero without leaving an agent releases the claim it established", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
+  const stub = claudeBoomStub(home);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.notStrictEqual(r.status, 0, "the non-zero launcher exit is surfaced, not swallowed");
+    assert.ok(claimHit(hits), "the claim was established");
+    const release = releaseHit(hits);
+    assert.ok(release, "the freshly-established claim was released");
+    assert.match(release.url, /^\/v1\/nodes\/task-rotate\/release$/);
+    assert.match(r.stdout, /released the claim/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch (remote): a SUCCESSFUL native launch keeps its lease — no release is sent", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ claimStatus: 200 });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(claimHit(hits), "the claim was established");
+    assert.ok(fs.existsSync(sentinel), "the bg agent launched");
+    assert.ok(!releaseHit(hits), "a successful launch never releases its own lease — the heartbeat contract owns it from here");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch (remote): a harness release call fails open — the launch failure exit code still surfaces", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ claimStatus: 200, releaseStatus: 500 });
+  const stub = claudeBoomStub(home);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.notStrictEqual(r.status, 0);
+    assert.ok(releaseHit(hits), "the release was still attempted");
+    assert.match(r.stderr, /could not release the claim/);
   } finally {
     srv.close();
   }

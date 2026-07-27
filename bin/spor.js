@@ -8139,6 +8139,15 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
         finished_at: new Date().toISOString(),
       });
   out(`run:     ${nativeRun.runId} (${harnessAdapter.label}; 'spor runs' for its outcome)`);
+  if (!launcherOk) {
+    // A non-zero exit here means the harness never left a background agent
+    // behind — the same "no agent will ever attend this node" case the
+    // spawn-error branch above already aborts on, so it needs the same
+    // releaseClaimOnAbort() so the claim doesn't strand the node.
+    err(`${harnessBin} exited ${r.status == null ? "abnormally" : r.status} without leaving a background agent`);
+    await releaseClaimOnAbort();
+    return r.status == null ? 1 : r.status;
+  }
 
   // Late session binding (dec-spor-dispatch-bg-session-late-bind). `claude --bg`
   // has now self-allocated its run session and registered the agent; read the
@@ -8159,7 +8168,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // (issue-spor-dispatch-run-liveness-same-cwd-misattribution). Only the
   // remote-side binding below stays remote-only. Best-effort: a capture miss
   // leaves the record honestly session-less rather than guessing.
-  const realSession = launcherOk ? await captureDispatchSession(cfg, name, launchDir, pinnedSession) : null;
+  const realSession = await captureDispatchSession(cfg, name, launchDir, pinnedSession);
   // Record the session whether or not the remote bind succeeds: it is the
   // pointer `spor runs` follows to the harness transcript that holds this
   // run's terminal reason.
