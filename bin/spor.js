@@ -7366,6 +7366,7 @@ async function launchSupervisedHarness(cfg, {
     prompt_path: p.prompt,
     log_path: p.log,
     report_path: p.report,
+    scratch_path: p.scratch,
     server: server || null,
     renew_node: renewNode || null,
   }, null, 2) + "\n");

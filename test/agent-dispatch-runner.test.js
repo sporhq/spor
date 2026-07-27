@@ -15,7 +15,7 @@ const {
 } = require("../lib/shell/agent-dispatch-runner.js");
 const { writeSpawnableNodeStub } = require("./helpers/portable.js");
 
-function jobFixture(scriptBody, prompt) {
+function jobFixture(scriptBody, prompt, { scratchPath } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-runner-test-"));
   const command = writeSpawnableNodeStub(dir, "agent-child", scriptBody);
   const record = path.join(dir, "run.run.json");
@@ -43,6 +43,7 @@ function jobFixture(scriptBody, prompt) {
     prompt_path: promptPath,
     log_path: log,
     report_path: report,
+    ...(scratchPath ? { scratch_path: scratchPath } : {}),
   });
   return { dir, job, log, record };
 }
@@ -132,4 +133,95 @@ fs.writeSync(2, "STDERR-AT-STREAM-TAIL\\n");
   assert.match(log, /"thread_id":"thread-at-stream-tail"/);
   assert.match(log, /STDERR-AT-STREAM-TAIL/);
   assert.ok(log.length > 4 * 1024 * 1024, "the complete buffered stream is durable at return");
+});
+
+// --- nested Codex-from-Codex sandbox isolation ------------------------------
+// (task-spor-nested-codex-dispatch-sandbox-isolation,
+// dec-spor-nested-codex-supervisor-provisions-codex-home)
+
+function withEnv(key, value, fn) {
+  const had = Object.prototype.hasOwnProperty.call(process.env, key);
+  const prior = process.env[key];
+  if (value === undefined) delete process.env[key];
+  else process.env[key] = value;
+  return Promise.resolve().then(fn).finally(() => {
+    if (had) process.env[key] = prior;
+    else delete process.env[key];
+  });
+}
+
+test("a nested dispatch under a read-only CODEX_HOME starts successfully in an isolated writable one, and the real home is never written to", async (t) => {
+  if (process.platform === "win32") return; // chmod-based read-only has no meaning there
+  if (process.getuid && process.getuid() === 0) return; // root writes through any permission bits
+
+  const realHome = fs.mkdtempSync(path.join(os.tmpdir(), "spor-codex-real-home-"));
+  fs.writeFileSync(path.join(realHome, "auth.json"), '{"token":"real-secret"}\n');
+  fs.writeFileSync(path.join(realHome, "config.toml"), "model = \"o-real\"\n");
+  const before = fs.readdirSync(realHome).sort();
+  fs.chmodSync(realHome, 0o500); // read + execute only — no new files can land here
+  t.after(() => { try { fs.chmodSync(realHome, 0o700); } catch { /* best-effort */ } });
+
+  const scratchPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "spor-codex-scratch-parent-")), "run.scratch");
+  const fixture = jobFixture(`
+const fs = require("node:fs");
+fs.writeFileSync(process.env.OUTFILE, JSON.stringify({
+  codexHome: process.env.CODEX_HOME || null,
+  hasState: fs.existsSync(require("node:path").join(process.env.CODEX_HOME || "", "state")),
+  auth: fs.readFileSync(require("node:path").join(process.env.CODEX_HOME, "auth.json"), "utf8"),
+}));
+process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "nested-thread" }) + "\\n");
+`, "p\n", { scratchPath });
+  const outfile = path.join(fixture.dir, "invocation.json");
+
+  await withEnv("CODEX_HOME", realHome, async () => {
+    process.env.OUTFILE = outfile;
+    try {
+      const code = await runJob(fixture.job);
+      assert.strictEqual(code, 0);
+    } finally {
+      delete process.env.OUTFILE;
+    }
+  });
+
+  const record = readJson(fixture.record);
+  assert.strictEqual(record.state, "done");
+
+  const invocation = JSON.parse(fs.readFileSync(outfile, "utf8"));
+  assert.notStrictEqual(invocation.codexHome, realHome, "the child ran under an isolated CODEX_HOME, not the read-only real one");
+  assert.strictEqual(invocation.codexHome, scratchPath);
+  assert.strictEqual(invocation.hasState, true, "the isolated home carries its own state/ dir");
+  assert.strictEqual(invocation.auth, '{"token":"real-secret"}\n', "auth is read-only PROJECTED from the real home, not absent");
+
+  // The real home was never written to: same file list, same content.
+  assert.deepStrictEqual(fs.readdirSync(realHome).sort(), before);
+  fs.chmodSync(realHome, 0o700); // restore before reading, for the content check below
+  assert.strictEqual(fs.readFileSync(path.join(realHome, "auth.json"), "utf8"), '{"token":"real-secret"}\n');
+
+  // Temporary state does not outlive the run.
+  assert.strictEqual(fs.existsSync(scratchPath), false, "the isolated CODEX_HOME is cleaned up once the run finishes");
+});
+
+test("an ordinary (writable) CODEX_HOME passes straight through — no isolation, no new directory", async () => {
+  const realHome = fs.mkdtempSync(path.join(os.tmpdir(), "spor-codex-writable-home-"));
+  const scratchPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "spor-codex-scratch-parent-")), "run.scratch");
+  const fixture = jobFixture(`
+const fs = require("node:fs");
+fs.writeFileSync(process.env.OUTFILE, JSON.stringify({ codexHome: process.env.CODEX_HOME || null }));
+process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "writable-thread" }) + "\\n");
+`, "p\n", { scratchPath });
+  const outfile = path.join(fixture.dir, "invocation.json");
+
+  await withEnv("CODEX_HOME", realHome, async () => {
+    process.env.OUTFILE = outfile;
+    try {
+      const code = await runJob(fixture.job);
+      assert.strictEqual(code, 0);
+    } finally {
+      delete process.env.OUTFILE;
+    }
+  });
+
+  const invocation = JSON.parse(fs.readFileSync(outfile, "utf8"));
+  assert.strictEqual(invocation.codexHome, realHome, "CODEX_HOME is passed through unchanged when the real home is writable");
+  assert.strictEqual(fs.existsSync(scratchPath), false, "nothing is provisioned for the byte-identical non-nested path");
 });

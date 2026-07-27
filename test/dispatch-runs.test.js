@@ -560,6 +560,44 @@ test("reconcileRuns: a supervised run whose child is ALSO already gone reports n
   assert.strictEqual(out[0].child_reaped, undefined);
 });
 
+// task-spor-nested-codex-dispatch-sandbox-isolation: a run's scratch dir (an
+// isolated CODEX_HOME, for Codex) must not be ripped out from under a child
+// that may still be alive — `reapOrphanChild` only sends SIGTERM and returns,
+// it does not wait for the exit.
+test("reconcileRuns: a reaped orphan's scratch dir is left alone THIS pass — its just-signaled child may still be alive", async () => {
+  const home = scratch("spor-runs-store-");
+  const child = liveChild();
+  try {
+    await new Promise((resolve) => child.once("spawn", resolve));
+    const childTicks = runner.processStartTicks(child.pid);
+    const runId = "sup-orphan-scratch";
+    const p = runner.runPaths(home, runId);
+    fs.mkdirSync(p.scratch, { recursive: true });
+    fs.writeFileSync(path.join(p.scratch, "auth.json"), "{}\n");
+    supervisedRecord(home, runId, {
+      runner_pid: deadPid(),
+      child_pid: child.pid,
+      ...(childTicks != null ? { child_started_ticks: childTicks } : {}),
+    });
+    const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:10:00.000Z" });
+    assert.strictEqual(out[0].child_reaped, true);
+    assert.ok(fs.existsSync(p.scratch), "not removed this pass — pruneRuns is the backstop, not a race with the child's own exit");
+  } finally {
+    try { child.kill("SIGKILL"); } catch { /* already gone, that's the point */ }
+  }
+});
+
+test("reconcileRuns: a supervised run with no live child to reap has its scratch dir cleaned up immediately", () => {
+  const home = scratch("spor-runs-store-");
+  const runId = "sup-both-gone-scratch";
+  const p = runner.runPaths(home, runId);
+  fs.mkdirSync(p.scratch, { recursive: true });
+  supervisedRecord(home, runId, { runner_pid: deadPid(), child_pid: deadPid() });
+  const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:10:00.000Z" });
+  assert.strictEqual(out[0].child_reaped, undefined);
+  assert.strictEqual(fs.existsSync(p.scratch), false, "no live child was signaled, so the scratch dir is removed right away");
+});
+
 test("reconcileRuns: a recycled child_pid is never signaled — identity mismatch leaves the unrelated process alone", async () => {
   if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
   const home = scratch("spor-runs-store-");

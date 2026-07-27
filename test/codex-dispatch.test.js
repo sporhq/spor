@@ -13,7 +13,7 @@ const os = require("node:os");
 const path = require("node:path");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
-const { getHarness, harnesses } = require("../lib/shell/dispatch-harnesses.js");
+const { getHarness, harnesses, codexPrepareRun } = require("../lib/shell/dispatch-harnesses.js");
 const { writeSpawnableNodeStub } = require("./helpers/portable.js");
 
 function cleanEnv(extra = {}) {
@@ -243,6 +243,34 @@ test("a supervised run whose supervisor is KILLED mid-run is reconciled to a ter
     JSON.parse(fs.readFileSync(recordPath, "utf8")).state, "vanished",
     "and the terminal outcome is durable, not just printed"
   );
+});
+
+// task-spor-nested-codex-dispatch-sandbox-isolation: a failure PARTWAY through
+// provisioning the isolated CODEX_HOME (e.g. one projected file copies, the
+// next doesn't) must not leave a half-written scratch dir — with a real
+// credential copy inside it — sitting around for the supervisor's own
+// catch-and-swallow to only clean up on the 14-day prune sweep.
+test("codexPrepareRun cleans up a partially-provisioned scratch dir when projection fails partway", () => {
+  if (process.platform === "win32") return; // chmod-based read-only has no meaning there
+  if (process.getuid && process.getuid() === 0) return; // root writes through any permission bits
+
+  const realHome = fs.mkdtempSync(path.join(os.tmpdir(), "spor-codex-real-home-partial-"));
+  fs.writeFileSync(path.join(realHome, "auth.json"), '{"token":"real-secret"}\n');
+  fs.writeFileSync(path.join(realHome, "config.toml"), "model = \"o-real\"\n");
+  fs.chmodSync(realHome, 0o500);
+
+  const scratchDir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "spor-codex-scratch-partial-")), "run.scratch");
+  // Force config.toml's copy to fail after auth.json's has already succeeded:
+  // pre-seat a DIRECTORY at the destination copyFileSync would otherwise
+  // write a file to.
+  fs.mkdirSync(path.join(scratchDir, "config.toml"), { recursive: true });
+
+  try {
+    assert.throws(() => codexPrepareRun({ env: { CODEX_HOME: realHome }, scratchDir }));
+    assert.strictEqual(fs.existsSync(scratchDir), false, "the partial provisioning attempt is fully rolled back, including the already-copied auth.json");
+  } finally {
+    fs.chmodSync(realHome, 0o700);
+  }
 });
 
 test("Codex adapter rejects Claude-only options before launch", () => {
