@@ -242,6 +242,96 @@ test('opt-in: a linked worktree NESTED under the repo (the spor dispatch / claud
   g(['worktree', 'remove', '--force', wt]);
 });
 
+// ---------- opts.boundary (issue-spor-dispatch-worktree-config-live-file-race) ----------
+// The repo-file layers ancestor-walk, which is exactly wrong for a dispatch
+// worktree nested at <repo>/.claude/worktrees/<name>: the walk climbs back into
+// the main checkout and reads its LIVE, possibly uncommitted .spor.json — the
+// one file the worktree's config must never be resolved from. `boundary` fences
+// every repo-file marker walk at a directory; env/user/global layers still apply.
+test('boundary: fences the repo-file walks at a directory — above it is invisible, at it is visible', () => {
+  const root = tmp();
+  const repo = path.join(root, 'repo');
+  const nested = path.join(repo, '.claude', 'worktrees', 'wt');
+  fs.mkdirSync(nested, { recursive: true });
+
+  // Only the ANCESTOR (main checkout) declares config.
+  write(path.join(repo, '.spor.json'), { enabled: true, distill: { model: 'from-main-checkout' } });
+
+  // No boundary: the ancestor walk finds it (today's behavior, unchanged).
+  const open = loadConfig({ cwd: nested, env: bareEnv({ SPOR_HOME: root }) });
+  assert.strictEqual(open.get('distill.model'), 'from-main-checkout');
+  assert.strictEqual(open.enabled(), true);
+
+  // Boundary at the nested dir: the ancestor's file is invisible — no value, and
+  // no marker to opt the repo in.
+  const fenced = loadConfig({ cwd: nested, env: bareEnv({ SPOR_HOME: root }), boundary: nested });
+  assert.strictEqual(fenced.get('distill.model', 'haiku'), 'haiku');
+  assert.strictEqual(fenced.enabled(), false);
+
+  // A file AT the boundary is visible (the boundary dir itself is included).
+  write(path.join(nested, '.spor.json'), { enabled: true, distill: { model: 'from-worktree' } });
+  const own = loadConfig({ cwd: nested, env: bareEnv({ SPOR_HOME: root }), boundary: nested });
+  assert.strictEqual(own.get('distill.model'), 'from-worktree');
+  assert.strictEqual(own.enabled(), true);
+
+  // The env / user / global layers are NOT fenced — only the repo-file layers.
+  const userHome = path.join(root, 'userhome');
+  write(path.join(userHome, 'config.json'), { dispatch: { worktreeSetup: '/machine/local.sh' } });
+  const withUser = loadConfig({ cwd: nested, env: bareEnv({ SPOR_HOME: userHome }), boundary: nested });
+  assert.strictEqual(withUser.get('dispatch.worktreeSetup'), '/machine/local.sh');
+  const withEnv = loadConfig({
+    cwd: nested,
+    env: bareEnv({ SPOR_HOME: root, SPOR_DISTILL_MODEL: 'from-env' }),
+    boundary: nested,
+  });
+  assert.strictEqual(withEnv.get('distill.model'), 'from-env');
+});
+
+test('boundary: also fences the flat .spor marker walks (graph binding, org, opt-in presence)', () => {
+  const root = tmp();
+  const repo = path.join(root, 'repo');
+  const nested = path.join(repo, '.claude', 'worktrees', 'wt');
+  fs.mkdirSync(nested, { recursive: true });
+  writeMarker(repo, 'project: demo\ngraph: ../team-graph\norg: acme\n');
+
+  const open = loadConfig({ cwd: nested, env: bareEnv({ SPOR_HOME: root }) });
+  assert.strictEqual(open.sharedGraphHome(), path.join(root, 'team-graph'));
+  assert.strictEqual(open.enabled(), true); // the ancestor marker is the opt-in
+
+  const fenced = loadConfig({ cwd: nested, env: bareEnv({ SPOR_HOME: root }), boundary: nested });
+  assert.strictEqual(fenced.sharedGraphHome(), null);
+  assert.strictEqual(fenced.graphHome(), root); // SPOR_HOME, not the ancestor binding
+  assert.strictEqual(fenced.enabled(), false);
+});
+
+test('boundary: skips the linked-worktree main-checkout fallback (the whole point)', () => {
+  // markerSearchDirs also probes gitMainRoot() for a linked worktree — a second
+  // route back into the main checkout's live files, which the boundary must
+  // close along with the ancestor walk.
+  const root = tmp();
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(repo);
+  const g = gitInit(repo);
+  fs.writeFileSync(path.join(repo, 'f.txt'), 'x');
+  g(['add', 'f.txt']);
+  g(['commit', '-q', '-m', 'root']);
+
+  const wt = path.join(repo, '.claude', 'worktrees', 'some-branch');
+  fs.mkdirSync(path.dirname(wt), { recursive: true });
+  g(['worktree', 'add', '-q', '-b', 'some-branch', wt, 'HEAD']);
+
+  // Uncommitted in the main checkout, so the worktree's own tree never has it.
+  write(path.join(repo, '.spor.json'), { enabled: true, distill: { model: 'from-main-checkout' } });
+
+  const open = loadConfig({ cwd: wt, env: bareEnv({ SPOR_HOME: root }) });
+  assert.strictEqual(open.get('distill.model'), 'from-main-checkout');
+
+  const fenced = loadConfig({ cwd: wt, env: bareEnv({ SPOR_HOME: root }), boundary: wt });
+  assert.strictEqual(fenced.get('distill.model', 'haiku'), 'haiku');
+
+  g(['worktree', 'remove', '--force', wt]);
+});
+
 test('getBool honors the shell "0"/"false" convention', () => {
   const dir = tmp();
   const c0 = loadConfig({ cwd: dir, env: bareEnv({ SPOR_HOME: dir, SPOR_NUDGE: '0' }) });

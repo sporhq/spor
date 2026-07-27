@@ -7057,8 +7057,20 @@ function createDispatchWorktree(repoDir, name, { slug, nodeId } = {}) {
   // and a relative worktreeSetup path resolves against `dir` too, so the
   // script itself comes from the same checkout, not a possibly-stale sibling
   // in the main tree.
+  //
+  // `boundary: dir` is what makes that hold for the STANDING cascade too. A
+  // dispatch worktree nests at `<repoDir>/.claude/worktrees/<name>`, so
+  // loadConfig's ordinary repo-file ancestor walk would climb straight back
+  // into `repoDir` and read the main checkout's live, possibly uncommitted
+  // `.spor.json` — reintroducing the very race by the back door. The boundary
+  // fences every repo-file marker walk at the worktree root (see
+  // lib/config.js markerSearchDirs). Only the REPO-FILE layers are fenced:
+  // env, the user `$SPOR_HOME/config.json`, and the global config still apply,
+  // so a machine-local `dispatch.worktreeSetup` keeps working — that one isn't
+  // the main checkout's file. targetRepoDispatchCfg reads exactly
+  // `<dir>/.spor.json` with no walk at all, so it needs no fence.
   const cfg = targetRepoDispatchCfg(dir);
-  const standingCfg = loadConfig({ cwd: dir, env: process.env });
+  const standingCfg = loadConfig({ cwd: dir, env: process.env, boundary: dir });
   const setup = cfg.worktreeSetup != null ? cfg.worktreeSetup : standingCfg.get("dispatch.worktreeSetup", null);
   if (setup) {
     const sr = spawnSync(setup, [], {

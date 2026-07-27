@@ -1090,6 +1090,46 @@ test("dispatch worktree setup hook: fires from a STALE/dirty main checkout, reso
   );
 });
 
+// The MIRROR of the test above (issue-spor-dispatch-worktree-config-live-file-
+// race, the residual hole): reading the worktree's config must not leak back
+// into the main checkout the OTHER way either. A dispatch worktree nests at
+// <repo>/.claude/worktrees/<name>, so loadConfig's repo-file ancestor walk
+// climbs straight back into <repo> and picks up its LIVE, UNCOMMITTED
+// .spor.json — the exact source the fix must never read. Here HEAD carries no
+// worktreeSetup at all, while the dirty main checkout declares one pointing at
+// an equally-uncommitted script: dispatch must run NO hook (before the
+// boundary fence it ran the main checkout's value against the worktree, where
+// the script doesn't exist, and aborted with `setup hook exited 127`).
+test("dispatch worktree setup hook: does NOT pick up the main checkout's uncommitted .spor.json via the ancestor walk", () => {
+  const { home } = fixture();
+  const { repo, g } = gitTargetRepo();
+  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktree: true } }) + "\n");
+  g(["add", ".spor.json"]);
+  g(["commit", "-q", "-m", "enable worktree isolation"]);
+
+  // Uncommitted on both counts: the hook declaration AND the script it names.
+  // HEAD — what the worktree is cut from — has neither.
+  fs.mkdirSync(path.join(repo, "scripts"));
+  writeSpawnableNodeStub(path.join(repo, "scripts"), "wt-setup", "require('node:fs').writeFileSync('./.ran', 'ran\\n');");
+  fs.writeFileSync(
+    path.join(repo, ".spor.json"),
+    JSON.stringify({ enabled: true, dispatch: { worktree: true, worktreeSetup: "scripts/wt-setup.js" } }) + "\n"
+  );
+  assert.match(g(["status", "--porcelain"]), /\.spor\.json/, "main checkout is dirty relative to HEAD");
+
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const outFile = path.join(home, "spawn.out");
+  const stub = pwdStub(home);
+  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const wtDir = path.join(repo, ".claude", "worktrees", "dec-x");
+  assert.doesNotMatch(r.stderr, /setup hook/, "no setup-hook failure");
+  assert.doesNotMatch(r.stdout, /setup ran/, "no setup hook ran");
+  assert.ok(!fs.existsSync(path.join(wtDir, ".ran")), "the main checkout's uncommitted hook did not run");
+  // Dispatch proceeded hookless, launching in the worktree as usual.
+  assert.strictEqual(fs.readFileSync(outFile, "utf8").split("\n")[0], fs.realpathSync(wtDir));
+});
+
 // --- profile satisfiability gate (dec-spor-machine-profile-satisfiability) ---
 // Dispatch resolves the profile it would run under (--profile > assigned->agent
 // edge attr > agent default) and refuses soft-and-loud when THIS machine can't
@@ -1721,6 +1761,13 @@ test("dispatch --force (remote): a worktree-setup failure does NOT release the p
     path.join(repo, ".spor.json"),
     JSON.stringify({ enabled: true, dispatch: { worktreeSetup: path.relative(repo, failHook) } }) + "\n"
   );
+  // COMMITTED, so the worktree cut from HEAD carries both the declaration and
+  // the script. The worktree resolves its own checkout with the main checkout
+  // fenced off (issue-spor-dispatch-worktree-config-live-file-race), so an
+  // uncommitted hook here would simply never run — and this test is about the
+  // lease bookkeeping AFTER a setup failure, not about where config comes from.
+  g(["add", "-A"]);
+  g(["commit", "-q", "-m", "add failing worktree setup hook"]);
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-home-"));
   const { srv, hits, base } = await claimStub({ claimStatus: 200 });
   const stub = claudeStub(home, path.join(home, "launched"));
