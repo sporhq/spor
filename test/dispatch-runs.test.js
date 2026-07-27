@@ -630,6 +630,58 @@ test("reconcileRuns: a long run STILL WRITING to its log is alive however old it
   assert.strictEqual(runner.lastActivityAt(rec), anHourBefore * 1000);
 });
 
+// --- supervisor identity (issue-spor-dispatch-supervisor-identity-stale-timeout) ---
+// A silent run whose pid still answers is ambiguous evidence: it could be our
+// supervisor wedged on a long network call, or the same pid reused by an
+// unrelated process. Recording the kernel start-time tick count at launch
+// resolves the ambiguity directly, so these tests exercise identity match and
+// mismatch — the timeout heuristic above stays only as the no-evidence fallback.
+
+test("finalizeSupervisedRun: a confirmed identity match is NEVER closed for silence, however long", () => {
+  const startTicks = runner.processStartTicks(process.pid);
+  assert.ok(Number.isFinite(startTicks), "the test process itself must yield a real tick count on this platform");
+  const home = scratch("spor-runs-store-");
+  supervisedRecord(home, "sup-identity-match", { runner_pid: process.pid, runner_started_ticks: startTicks });
+  // Ten days of silence — far past staleMs — but identity is confirmed, so the
+  // freshness ceiling never even applies.
+  const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-28T10:00:00.000Z" });
+  assert.strictEqual(out[0].state, "running", "identity match overrides the silence heuristic entirely");
+});
+
+test("finalizeSupervisedRun: an identity MISMATCH closes the run immediately, no silence required", () => {
+  const startTicks = runner.processStartTicks(process.pid);
+  assert.ok(Number.isFinite(startTicks), "the test process itself must yield a real tick count on this platform");
+  const home = scratch("spor-runs-store-");
+  // The recorded tick count does not match this pid's ACTUAL start time — the
+  // pid was reused by a different process than the one we launched.
+  const rec = supervisedRecord(home, "sup-identity-mismatch", { runner_pid: process.pid, runner_started_ticks: startTicks + 999999 });
+  fs.mkdirSync(path.dirname(rec.log_path), { recursive: true });
+  fs.writeFileSync(rec.log_path, JSON.stringify({ type: "item.completed" }) + "\n");
+  // Barely past the registration grace window, well short of staleMs.
+  const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:01:30.000Z" });
+  assert.strictEqual(out[0].state, "vanished");
+  assert.strictEqual(out[0].termination_signal, "supervisor-pid-reused");
+  assert.match(out[0].termination_reason, /kernel start-time no longer matches/);
+});
+
+test("finalizeSupervisedRun: identity unknown (no recorded tick count) still falls back to the silence heuristic", () => {
+  // An older record predating this feature, or a non-Linux host, carries no
+  // `runner_started_ticks` — the pid-reuse guard must still degrade gracefully
+  // to the freshness ceiling rather than believing an unreused pid forever.
+  const home = scratch("spor-runs-store-");
+  supervisedRecord(home, "sup-no-identity", { runner_pid: process.pid });
+  const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-20T10:00:00.000Z" });
+  assert.strictEqual(out[0].state, "vanished");
+  assert.strictEqual(out[0].termination_signal, "supervisor-stale");
+});
+
+test("processStartTicks: a dead pid, and a non-integer pid, both yield null", () => {
+  assert.strictEqual(runner.processStartTicks(deadPid()), null);
+  assert.strictEqual(runner.processStartTicks(-1), null);
+  assert.strictEqual(runner.processStartTicks(0), null);
+  assert.strictEqual(runner.processStartTicks(1.5), null);
+});
+
 test("finalizeSupervisedRun: only the log's TAIL is evidence — a recovered mid-run error is not the cause of death", () => {
   // An agent that hit a rate limit hours and thousands of events earlier and
   // carried on did not die of it; filing that as the reason sends a real crash

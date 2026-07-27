@@ -7349,7 +7349,17 @@ async function launchSupervisedHarness(cfg, {
     });
     child.on("error", (e) => { spawnError = e; });
     child.unref();
-    if (child.pid) dispatchRuns.atomicJson(p.record, { ...record, runner_pid: child.pid });
+    if (child.pid) {
+      // The tick count pins WHICH process pid `child.pid` is right now, so a
+      // later pid-alive check that finds a different process (the kernel
+      // reused the pid) can be told apart from a genuinely long-lived
+      // supervisor (issue-spor-dispatch-supervisor-identity-stale-timeout).
+      const startTicks = dispatchRuns.processStartTicks(child.pid);
+      dispatchRuns.atomicJson(p.record, {
+        ...record, runner_pid: child.pid,
+        ...(startTicks != null ? { runner_started_ticks: startTicks } : {}),
+      });
+    }
   } catch (e) {
     spawnError = e;
   }
