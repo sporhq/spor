@@ -313,8 +313,9 @@ them):
   Codex node's completion with `spor runs --node <id> --json` instead (poll it
   — its `state` reaches a terminal value `done`/`failed`/`vanished`/
   `failed_launch` on its own once the Codex supervisor exits, no session list
-  to consult), and read its final report from the `.report_path` that call
-  returns, not through these scripts; see "The Codex implementer" below.
+  to consult), and read its final report from the `.runs[0].report_path` that
+  call returns (the JSON shape is `{reconciled, count, runs}`), not through
+  these scripts; see "The Codex implementer" below.
 
 To read a finished agent's final report, never `claude logs` (it replays raw
 TUI escape frames — huge and unreadable). Use:
@@ -442,7 +443,7 @@ Two things close the gap:
    its report landed.** Record `kind: 'codex'` alongside the node in
    `running` at dispatch time (see Dispatch, above), plus the `report_path`
    line `spor dispatch` printed at launch (or fetch it any time afterward with
-   `spor runs --node <id> --json` → `.report_path`) — that's what tells the
+   `spor runs --node <id> --json` → `.runs[0].report_path`) — that's what tells the
    supervisor loop both that this node's absence from `claude agents --json`
    means nothing on its own, and where to actually find its report once it
    exits. Poll `spor runs --node <id> --json` for completion (its `state`

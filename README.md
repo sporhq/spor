@@ -344,7 +344,7 @@ other dispatch:
 
 ```bash
 spor runs --node issue-86            # human-readable: state, why, log path
-spor runs --node issue-86 --json     # add .report_path for the final message
+spor runs --node issue-86 --json     # add .runs[0].report_path for the final message
 ```
 
 ## Local mode
