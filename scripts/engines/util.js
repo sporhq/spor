@@ -196,6 +196,28 @@ function readMarkerProject(dir) {
   }
 }
 
+// Structural fallback for the `.claude/worktrees/<name>` dispatch convention
+// (bin/spor.js dispatchWorktreeDir, and the same layout Claude Code's own
+// worktree isolation uses): the directory holding `.claude/worktrees/<name>`,
+// derived from the PATH alone, no git involved. This is what inferenceRoot()
+// falls back on when git itself can't resolve the worktree at all — a linked
+// worktree whose admin state (`.git/worktrees/<name>`) was pruned or removed
+// out from under a still-running session, e.g. by a concurrent orchestrator
+// cleanup (issue-spor-capture-worktree-repo-stamp-task-id). When git fails
+// that completely, `--show-toplevel` returns nothing and cwd IS the worktree
+// dir — a bogus, node-id-shaped basename — so without this, projectSlug()
+// mints the dispatched task's id as the project slug instead of the repo's.
+// Returns null when cwd carries no such segment (the ordinary case).
+function structuralWorktreeRoot(cwd) {
+  const parts = path.resolve(String(cwd || "")).split(path.sep);
+  for (let i = 1; i < parts.length - 1; i++) {
+    if (parts[i] === ".claude" && parts[i + 1] === "worktrees") {
+      return parts.slice(0, i).join(path.sep) || path.sep;
+    }
+  }
+  return null;
+}
+
 // The directory whose basename names the project, and the floor for the
 // nearest-ancestor marker search. Plain `cwd` when not a git repo; the git
 // toplevel for a single-repo checkout; and — crucially — the MAIN worktree's
@@ -207,12 +229,27 @@ function readMarkerProject(dir) {
 // false rename evidence (same fingerprints, different checkout dir). Resolving
 // to the main worktree — `dirname(--git-common-dir)`, which points at the main
 // repo's `.git` even from a linked worktree — collapses every worktree onto
-// the one project identity, so no bogus slug and no false rename. Fail-open:
-// any git failure falls back to `cwd`.
+// the one project identity, so no bogus slug and no false rename.
+//
+// Both rev-parse queries ride ONE spawn (`--show-toplevel` then
+// `--git-common-dir`, one line each — the same trick pre-tool.js's
+// detectWorktreeSession uses) rather than two separate ones: a dispatched
+// worktree can be torn down by a concurrent orchestrator cleanup at any
+// moment (removeDispatchWorktree), and two independent spawns leave a window
+// where the first succeeds and the second observes the now-pruned worktree —
+// silently discarding the main-checkout resolution mid-call
+// (issue-spor-capture-worktree-repo-stamp-task-id). One spawn makes that
+// interleaving impossible.
+//
+// Fail-open, but not blindly to `cwd`: when git can't resolve the worktree at
+// all (both lines empty — a totally broken/orphaned admin dir), cwd's own
+// basename is the worktree's node-id-shaped directory name, not a repo name,
+// so structuralWorktreeRoot() recovers the enclosing checkout from the path
+// convention before falling back to raw cwd.
 function inferenceRoot(cwd) {
-  const top = (git(cwd, ["rev-parse", "--show-toplevel"]) ?? "").trim();
-  if (!top) return cwd || "";
-  const common = (git(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]) ?? "").trim();
+  const raw = git(cwd, ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"]) ?? "";
+  const [top, common] = raw.trim().split("\n").map((l) => l.trim());
+  if (!top) return structuralWorktreeRoot(cwd) || cwd || "";
   // In a linked worktree git-common-dir is the main repo's `.git`, sitting
   // one level under the main worktree; in the main checkout it is `<top>/.git`
   // and dirname() returns `top` unchanged, so the single-repo path is intact.

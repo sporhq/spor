@@ -2316,3 +2316,45 @@ test('add (remote) happy path captures and spools nothing', async () => {
     srv.close();
   }
 });
+
+// issue-spor-capture-worktree-repo-stamp-task-id: a `spor add`/`/spor:defer`
+// run from inside a dispatched `.claude/worktrees/<node-id>` worktree whose
+// git admin dir was pruned by a concurrent orchestrator cleanup must still
+// stamp the real repo slug as context.project — never the worktree's own
+// node-id-shaped directory name (u.projectSlug -> u.inferenceRoot, see the
+// projectSlug unit coverage in test/project-identity.test.js for the pruned-
+// admin-dir mechanics this locks in at the CLI level).
+test('add (remote) from a dispatched worktree with a pruned git admin dir still sends the real repo slug', async () => {
+  const home = freshHome();
+  const { gitInit } = require('./helpers/git');
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-add-wt-'));
+  const repo = path.join(base, 'spor');
+  const g = gitInit(repo);
+  fs.writeFileSync(path.join(repo, 'f.txt'), 'x');
+  g(['add', 'f.txt']);
+  g(['commit', '-q', '-m', 'root']);
+
+  const nodeId = 'task-some-dispatched-node-id';
+  const wt = path.join(repo, '.claude', 'worktrees', nodeId);
+  fs.mkdirSync(path.dirname(wt), { recursive: true });
+  g(['worktree', 'add', '-q', '-b', nodeId, wt, 'HEAD']);
+  // Simulate a concurrent orchestrator cleanup pruning this worktree's admin
+  // state while the dispatched session is still alive inside it.
+  fs.rmSync(path.join(repo, '.git', 'worktrees', nodeId), { recursive: true, force: true });
+
+  const { srv, hits, base: url } = await captureStubServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ status: 'captured', ids: ['task-fresh-capture'] }));
+  });
+  try {
+    const r = await runAsyncCli(['add', 'a finding captured mid-dispatch from a pruned worktree'],
+      { SPOR_SERVER: url, SPOR_TOKEN: 'tok', SPOR_HOME: home }, wt);
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /captured: task-fresh-capture/);
+    const payload = JSON.parse(hits[0].body);
+    assert.strictEqual(payload.context.project, 'spor', 'the main repo slug, not the worktree\'s node-id basename');
+  } finally {
+    srv.close();
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});

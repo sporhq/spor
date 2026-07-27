@@ -427,6 +427,46 @@ test('projectSlug: a linked git worktree resolves to its main repo, not the work
   fs.rmSync(base, { recursive: true, force: true });
 });
 
+// issue-spor-capture-worktree-repo-stamp-task-id: a dispatched agent's linked
+// worktree can have its admin state (`.git/worktrees/<name>`) pruned or
+// removed by a concurrent orchestrator cleanup while the session is still
+// running inside it. When that happens `git rev-parse --show-toplevel` fails
+// OUTRIGHT (not "not a worktree", but "not a git repository at all"), so the
+// git-common-dir resolution above never even runs — without a fallback, cwd
+// IS the worktree dir, and its basename (the dispatched task's node id, per
+// the `.claude/worktrees/<node-id>` convention) becomes the "project" slug
+// stamped on every node the session captures from then on.
+test('projectSlug: a worktree whose git admin dir was pruned out from under it still resolves to the main repo, not its own node-id-shaped basename', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-wt-orphan-'));
+  const repo = path.join(base, 'spor');
+  fs.mkdirSync(repo);
+  const g = gitInit(repo);
+  fs.writeFileSync(path.join(repo, 'f.txt'), 'x');
+  g(['add', 'f.txt']);
+  g(['commit', '-q', '-m', 'root']);
+
+  // The exact dispatch layout: nested at <repo>/.claude/worktrees/<node-id>.
+  const nodeId = 'issue-some-dispatched-task-id';
+  const wt = path.join(repo, '.claude', 'worktrees', nodeId);
+  fs.mkdirSync(path.dirname(wt), { recursive: true });
+  g(['worktree', 'add', '-q', '-b', nodeId, wt, 'HEAD']);
+  assert.equal(u.projectSlug(wt), 'spor', 'sanity: resolves correctly while the worktree is intact');
+
+  // Simulate a concurrent cleanup pruning this worktree's admin dir while the
+  // session is still alive in it — `git worktree remove` from elsewhere, or
+  // `git worktree prune`, without the session's own checkout being touched.
+  fs.rmSync(path.join(repo, '.git', 'worktrees', nodeId), { recursive: true, force: true });
+
+  // git is now totally broken from inside `wt` (not just worktree-blind) —
+  // the node-id-shaped basename must still NOT become the slug.
+  assert.equal(u.projectSlug(wt), 'spor');
+  const wtsub = path.join(wt, 'lib');
+  fs.mkdirSync(wtsub, { recursive: true });
+  assert.equal(u.projectSlug(wtsub), 'spor');
+
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
 // ---------- repo fingerprints ----------
 
 function gitRepo() {
