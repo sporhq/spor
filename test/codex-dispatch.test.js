@@ -215,10 +215,13 @@ test("a supervised run whose supervisor is KILLED mid-run is reconciled to a ter
   });
   assert.ok(recordPath, "the supervisor reported its child running");
   const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
-  assert.ok(
-    Number.isFinite(record.runner_started_ticks),
-    "a real launch stamps the supervisor's kernel start-time tick count (issue-spor-dispatch-supervisor-identity-stale-timeout)"
-  );
+  if (process.platform === "linux") {
+    // processStartTicks is Linux-only (/proc); elsewhere it stays null by design.
+    assert.ok(
+      Number.isFinite(record.runner_started_ticks),
+      "a real launch stamps the supervisor's kernel start-time tick count (issue-spor-dispatch-supervisor-identity-stale-timeout)"
+    );
+  }
   for (const pid of [record.runner_pid, record.child_pid]) {
     try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
   }

@@ -638,6 +638,7 @@ test("reconcileRuns: a long run STILL WRITING to its log is alive however old it
 // mismatch — the timeout heuristic above stays only as the no-evidence fallback.
 
 test("finalizeSupervisedRun: a confirmed identity match is NEVER closed for silence, however long", () => {
+  if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
   const startTicks = runner.processStartTicks(process.pid);
   assert.ok(Number.isFinite(startTicks), "the test process itself must yield a real tick count on this platform");
   const home = scratch("spor-runs-store-");
@@ -649,6 +650,7 @@ test("finalizeSupervisedRun: a confirmed identity match is NEVER closed for sile
 });
 
 test("finalizeSupervisedRun: an identity MISMATCH closes the run immediately, no silence required", () => {
+  if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
   const startTicks = runner.processStartTicks(process.pid);
   assert.ok(Number.isFinite(startTicks), "the test process itself must yield a real tick count on this platform");
   const home = scratch("spor-runs-store-");
