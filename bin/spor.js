@@ -549,13 +549,13 @@ function dispatchedAgents(cfg) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Find the FULL run-session id of the agent `spor dispatch` just launched in `dir`
-// (dec-spor-dispatch-bg-session-late-bind). `claude --bg` self-allocates and
-// prints only a SHORT id, but `claude agents --json` reports the full `sessionId`
-// + `cwd` + `startedAt` — the reliable capture path. Match on cwd (the strong
-// signal — we just launched there), then on name when given, then pick the NEWEST
-// (the run we just started). Returns the sessionId or null.
-function newestDispatchedSession(cfg, name, dir) {
+// The candidate agents `spor dispatch` could have just launched in `dir`
+// (dec-spor-dispatch-bg-session-late-bind), newest first. `claude --bg`
+// self-allocates and prints only a SHORT id, but `claude agents --json`
+// reports the full `sessionId` + `cwd` + `startedAt` — the reliable capture
+// path. Match on cwd (the strong signal — we just launched there), then on
+// name when given.
+function dispatchedSessionCandidates(cfg, name, dir) {
   const all = [];
   for (const arr of dispatchedAgents(cfg).values()) {
     for (const a of arr) if (!a.harness || a.harness === "claude-code") all.push(a);
@@ -567,25 +567,44 @@ function newestDispatchedSession(cfg, name, dir) {
   // session — and during the poll window our own agent is often not registered
   // yet while a sibling already is, which is exactly when the fallback fires and
   // stamps the run with someone else's session
-  // (issue-spor-dispatch-run-liveness-same-cwd-misattribution). Returning null
+  // (issue-spor-dispatch-run-liveness-same-cwd-misattribution). An empty result
   // just keeps polling until ours appears; an honest miss beats a wrong id.
   if (name) cands = cands.filter((a) => a.name === name);
-  if (!cands.length) return null;
   cands.sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
-  return cands[0].sessionId;
+  return cands;
 }
 
 // Capture the launched run's session, polling briefly while the daemon registers
-// it. SPOR_SESSION_ID pins it (tests/reproducibility) and short-circuits the poll.
-// Returns the sessionId or null (fail-open — the caller degrades to session-null).
+// it. Returns the sessionId or null (fail-open — the caller degrades to session-null).
+//
+// `pinned` (SPOR_SESSION_ID) exists for tests/reproducibility and used to
+// short-circuit the poll unconditionally — but an ambient env var is not proof
+// it names THIS launch's session; left exported in a real shell it would
+// otherwise stamp a dispatched run with the CALLER's own session and transcript
+// (issue-spor-dispatch-ambient-session-id-borrows-caller-transcript). So the pin
+// is now verified INSIDE the same poll used for ordinary discovery, not checked
+// once up front: registration lags the launch by an uncertain amount (the whole
+// reason the poll loop exists), so a single pre-loop check would see an empty
+// candidate set on every real dispatch and rubber-stamp the pin before the real,
+// contradicting session had a chance to register. Each iteration: candidates
+// found and the pin is among them => confirmed, return it; candidates found and
+// the pin is NOT among them => proven wrong, drop it and return the newest
+// discovered session instead (never the pin); no candidates yet => keep
+// waiting. If the whole poll never finds any candidate, discovery had nothing
+// to contradict the pin with, so it falls back to trusting it (the fast path
+// tests rely on, where no agent is ever faked into existence).
 async function captureDispatchSession(cfg, name, dir, pinned) {
-  if (pinned) return pinned;
   for (let i = 0; i < 6; i++) {
-    const sid = newestDispatchedSession(cfg, name, dir);
-    if (sid) return sid;
+    const cands = dispatchedSessionCandidates(cfg, name, dir);
+    if (cands.length) {
+      if (!pinned) return cands[0].sessionId;
+      if (cands.some((a) => a.sessionId === pinned)) return pinned;
+      err(`warning: SPOR_SESSION_ID (${pinned}) does not match the launched agent's session — ignoring the pin.`);
+      return cands[0].sessionId;
+    }
     await sleep(300);
   }
-  return null;
+  return pinned || null;
 }
 
 // Stamp items[].in_flight from the dispatched-agent map, optionally dropping the

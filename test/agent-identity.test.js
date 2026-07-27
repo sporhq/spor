@@ -979,6 +979,79 @@ test("dispatch (remote, real): captures the run session from `claude agents --js
   }
 });
 
+// A `claude` stub whose "agents --json" answer changes over calls: it reports
+// NOTHING for the first `emptyCalls` invocations (simulating the real launched
+// agent not having registered with the daemon yet — the exact race the poll
+// loop exists to ride out), then reports `agentsJson` from then on. Any other
+// invocation (the `--bg` launch itself) just exits 0. Distinguishing "agents
+// --json" from other subcommands mirrors dispatchHarnesses' activeDiscovery
+// args, so this drives the SAME code path enumerateHarnessAgents does against
+// a real claude binary — SPOR_FAKE_AGENTS_JSON would instead answer identically
+// on every call, which can't reproduce a registration-lag race.
+function delayedAgentsStub(dir, counterFile, emptyCalls, agentsJson) {
+  return writeSpawnableNodeStub(dir, "claude-delayed-agents", `
+const fs = require("node:fs");
+const argv = process.argv.slice(2);
+if (argv.includes("agents") && argv.includes("--json")) {
+  let n = 0;
+  try { n = parseInt(fs.readFileSync(${JSON.stringify(counterFile)}, "utf8"), 10) || 0; } catch {}
+  fs.writeFileSync(${JSON.stringify(counterFile)}, String(n + 1));
+  process.stdout.write(n < ${JSON.stringify(emptyCalls)} ? "[]" : ${JSON.stringify(agentsJson)});
+}
+process.exit(0);
+`);
+}
+
+// issue-spor-dispatch-ambient-session-id-borrows-caller-transcript: an ambient
+// SPOR_SESSION_ID (e.g. a caller's own session, leaked into the env a real
+// dispatch runs under) must never be trusted once discovery PROVES it isn't the
+// launched agent's session — even when the real agent only shows up in `claude
+// agents --json` a couple of poll iterations after launch, not instantly. A
+// one-shot check taken before the poll starts would see nothing yet and
+// rubber-stamp the pin; verification has to live INSIDE the poll to catch this.
+test("dispatch (remote, real): a SPOR_SESSION_ID that doesn't match the launched agent is ignored, even if the real agent registers a couple of poll ticks late", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-pinmismatch-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-pinmismatchr-"));
+  const counterFile = path.join(home, "agents-calls.count");
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "agent-anthony-laptop" } }) + "\n");
+  const REAL = "aaaaaaaa-1111-2222-3333-444444444444";
+  const CALLER_PIN = "ffffffff-0000-0000-0000-ffffffffffff"; // an unrelated live session, e.g. the caller's own
+  const agents = JSON.stringify([
+    { id: "new", kind: "background", state: "working", name: "dec-x", cwd: repo, sessionId: REAL, startedAt: 2000 },
+  ]);
+  // The pre-launch dup-guard also calls "agents --json" once before the launch
+  // even happens, so the empty answer must outlast that call too — 2 empty
+  // calls (dup-guard + the poll's first tick) before the real agent "appears".
+  const stub = delayedAgentsStub(home, counterFile, 2, agents);
+  const { srv, hits, base } = await dispatchStub({ mintStatus: 201 });
+  try {
+    // remoteEnv/localEnv default SPOR_FAKE_AGENTS_JSON to "[]" so ordinary tests
+    // never spawn a real "agents --json" process — but that same seam would
+    // short-circuit THIS test's delayed stub, so drop it and let discovery
+    // actually invoke delayedAgentsStub.
+    const env = remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub, SPOR_SESSION_ID: CALLER_PIN });
+    delete env.SPOR_FAKE_AGENTS_JSON;
+    const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], env);
+    assert.strictEqual(r.status, 0, r.stderr);
+    // it really did take more than one poll tick to appear
+    const calls = parseInt(fs.readFileSync(counterFile, "utf8"), 10);
+    assert.ok(calls >= 3, `expected the real agent to register after the first poll tick (saw ${calls} "agents --json" calls)`);
+    // the pin's mismatch is called out, and the REAL discovered session wins —
+    // never the caller's pinned session/transcript
+    assert.match(r.stderr, /SPOR_SESSION_ID.*does not match the launched agent's session/);
+    assert.match(r.stdout, new RegExp(`session: ${REAL} \\(bound`));
+    assert.doesNotMatch(r.stdout, new RegExp(CALLER_PIN));
+
+    const bind = hits.find((h) => h.url === "/v1/agents/session" && h.method === "POST");
+    assert.ok(bind, "POSTed /v1/agents/session to bind the captured session");
+    assert.strictEqual(JSON.parse(bind.body).session, REAL, "bound the discovered session, not the mismatched pin");
+    assert.ok(!hits.some((h) => h.method === "POST" && (h.body || "").includes(CALLER_PIN)), "the caller's pinned session never reached the server");
+  } finally {
+    srv.close();
+  }
+});
+
 // ===========================================================================
 // 4. authorship read-out (authorshipLine + renderNorm)
 // ===========================================================================
