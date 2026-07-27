@@ -261,7 +261,9 @@ Templates can use placeholders such as:
 dispatched node's own frontmatter fields (blank in free-text or `--backfill`
 dispatch, where there is no target node).
 
-A dispatched agent detaches into its harness, so `spor dispatch` records every
+A dispatched agent runs beyond the launcher's own lifetime — a Claude Code
+agent detaches into its own background-agent daemon, a Codex agent into a
+supervisor Spor owns (more on that below) — so `spor dispatch` records every
 run it launches and `spor runs` reports how each one ended:
 
 ```bash
@@ -272,11 +274,78 @@ spor runs --node issue-86
 Each run resolves to a terminal state — `done`, `failed`, `vanished` (it stopped
 mid-turn, or it ended in a way nothing can be attributed to), or `failed_launch`
 — with the reason, and a class that keeps environment failures such as provider
-credit exhaustion separate from failures of the work itself. A run that bound a
-session also carries a pointer to its transcript; one that never bound a session
-says so rather than borrowing a transcript from whatever else ran in that
-checkout. Terminal records age out after `dispatch.runRetentionMs` (default 14
-days).
+credit exhaustion separate from failures of the work itself. A Claude Code run
+that bound a session also carries a pointer to its transcript; a Codex run's
+equivalent evidence is its own log instead. One that never bound a session says
+so rather than borrowing a transcript from whatever else ran in that checkout.
+Terminal records age out after `dispatch.runRetentionMs` (default 14 days).
+
+### Choosing a harness
+
+By default, `spor dispatch` launches a Claude Code agent (`claude --bg`). To
+dispatch under a different coding-agent CLI — Codex is also supported — resolve
+a **profile**: a node that bundles a harness, model, and toolset.
+
+```bash
+spor dispatch issue-86 --profile profile-codex-sol
+```
+
+A profile looks like this:
+
+```markdown
+---
+id: profile-codex-sol
+type: profile
+title: Codex / gpt-5.6-sol
+summary: Codex harness running gpt-5.6-sol — general-purpose dispatch profile.
+status: active
+harness: codex
+model: gpt-5.6-sol
+mcp: [spor]
+---
+```
+
+Profiles are authored deliberately rather than captured from a transcript —
+write one yourself with `spor put-node`, or reuse one your team has published.
+An `agent` node can also carry a default profile (a `uses-profile` edge), so
+its dispatches pick a harness without a flag every time; `--profile` on the
+command line always wins over that default.
+
+Before launching anything, dispatch checks whether **this machine** can
+actually run the resolved profile — is the `codex` CLI on PATH, are the right
+MCP servers reachable, and so on (see `spor capabilities`). If it can't,
+dispatch refuses outright rather than silently falling back to Claude Code; in
+team mode it also names any other machine in the fleet that can run it.
+
+Codex-specific flags (`--sandbox`, `--approval-policy`) and Claude-specific
+ones (`--permission-mode`, `--agent`) are mutually exclusive — passing the
+wrong one for the resolved harness is a hard error, so a dispatch can't launch
+half-configured for the wrong CLI.
+
+Claude Code dispatch detaches into Claude Code's own background-agent daemon —
+the launcher exits immediately, and `spor dispatch` can only reconcile what
+happened to it afterwards from the harness's own session transcript. Codex
+dispatch instead runs under a small supervisor Spor itself owns: it launches
+`codex exec` in the background, streams its progress into a private log, and
+captures the run's final message to a report file. At launch it prints where
+everything lives:
+
+```text
+run:     3f9a2c1e-... (Codex supervisor running)
+log:     ~/.spor/journal/dispatch/3f9a2c1e-....log
+report:  ~/.spor/journal/dispatch/3f9a2c1e-....report.md
+session: 019f7a51-...
+```
+
+`log` is the full JSONL progress stream; `report` is Codex's final message —
+the thing to read for "what did it conclude". Both paths, plus the run's
+outcome, are also recorded durably and can be looked up later, same as any
+other dispatch:
+
+```bash
+spor runs --node issue-86            # human-readable: state, why, log path
+spor runs --node issue-86 --json     # add .report_path for the final message
+```
 
 ## Local mode
 

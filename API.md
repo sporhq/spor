@@ -698,7 +698,15 @@ anything with a token.
   from `claude agents --json` and binds it via `POST /v1/agents/session` (§3) — the
   one place an agent token's session is set, write-once. The session can't be
   forged a-priori (it isn't known until the run exists) and can't ride the write
-  payload (token-derived, §1), so the binding is always the actual run.
+  payload (token-derived, §1), so the binding is always the actual run. A
+  **Codex**-harness dispatch follows the same late-bind contract from its own
+  supervisor process instead: it reads the session id off the `thread.started`
+  event in the run's supervised JSONL log rather than `claude agents --json`,
+  then binds it the same way. Token transport also differs per harness —
+  Claude Code gets a strict `--mcp-config` file, Codex gets the token via an
+  env var its own config references (`--config
+  mcp_servers.spor.bearer_token_env_var=SPOR_DISPATCH_MCP_TOKEN`) — but both
+  land at the same self-serve mint/bind pair above.
 - **OAuth 2.1 for MCP connectors** (Cowork/claude.ai, which cannot carry a
   static bearer token): protected-resource metadata discovery (RFC 9728,
   advertised on the `/mcp` 401 via `WWW-Authenticate`), authorization-server

@@ -128,7 +128,8 @@ running = {}          # node_id -> { agent_name, branch, worktree_path, kind, ..
                        #   kind: 'claude' (self-resolves — both code and infra
                        #   dispatches; infra is discriminated separately below by
                        #   node.repo) | 'codex' (orchestrator resolves, see "The
-                       #   Codex implementer" — also record report_path there)
+                       #   Codex implementer" — dispatch itself prints the
+                       #   report_path to record there, no manual redirection)
 done, escalated = [], []
 
 loop:
@@ -155,8 +156,12 @@ loop:
                                                        #   only reads claude session
                                                        #   transcripts; a codex process
                                                        #   never writes one. Read the
-                                                       #   log file you redirected its
-                                                       #   output to at launch instead.
+                                                       #   report_path `spor dispatch`
+                                                       #   itself printed at launch time
+                                                       #   instead (its Codex supervisor
+                                                       #   writes Codex's final message
+                                                       #   there — see "The Codex
+                                                       #   implementer").
           if report says MERGE-READY:
               resolve_on_graph(node)             # orchestrator writes the resolver
                                                   #   node + resolves edge + terminal
@@ -198,20 +203,32 @@ spor dispatch --node <id> --worktree --model <sonnet|opus|fable> \
 - `--node <id>` runs the item *you* chose (so you control non-overlap). Use
   `--from-queue` instead if you just want the top not-in-flight item and don't
   need custom selection — it applies the same skip logic.
+- For a **Codex** implementer instead of Claude, add `--profile <codex-profile-id>`
+  (e.g. `--profile profile-codex-sol`) and point `--template` at
+  `assets/codex-agent-prompt.md` — see "The Codex implementer" below for the
+  full command and how completion differs.
 - `--worktree` isolates the checkout; the branch is the node id.
-- `--permission-mode bypassPermissions` is **required** for unattended agents: a
-  detached `claude --bg` agent has no human to answer permission prompts, so the
-  default mode leaves it **stuck/blocked** the first time it wants to write, run a
-  test, or commit — the whole point of the agent is to do those without asking.
-  `bypassPermissions` is the right call on an **isolated dev VM** dedicated to
-  this work (no blast radius). If you're somewhere with real blast radius, use
-  `--permission-mode acceptEdits` plus a pre-approved tool allowlist in the repo's
-  `.claude/settings.json` instead — but never leave a background agent on the
-  interactive default, or it will silently hang on the first prompt.
+- `--permission-mode bypassPermissions` is **required** for an unattended Claude
+  agent: a detached `claude --bg` agent has no human to answer permission
+  prompts, so the default mode leaves it **stuck/blocked** the first time it
+  wants to write, run a test, or commit — the whole point of the agent is to do
+  those without asking. `bypassPermissions` is the right call on an **isolated
+  dev VM** dedicated to this work (no blast radius). If you're somewhere with
+  real blast radius, use `--permission-mode acceptEdits` plus a pre-approved
+  tool allowlist in the repo's `.claude/settings.json` instead — but never
+  leave a background agent on the interactive default, or it will silently
+  hang on the first prompt. **This flag is Claude-only** — a Codex profile
+  dispatch already runs unattended by default (`--sandbox workspace-write
+  --approval-policy never`); passing `--permission-mode` to it is a hard error
+  (the harness adapters validate that Claude- and Codex-specific flags aren't
+  mixed), so just omit it for Codex dispatches.
 - The template injects the compiled briefing **and** the agent's loop
-  instructions (see `assets/agent-prompt.md`).
-- Dispatch auto-claims the lease. If it **refuses** (already in flight or held),
-  skip that item — something else owns it. Don't `--force` past a live lease.
+  instructions (see `assets/agent-prompt.md` / `assets/codex-agent-prompt.md`).
+- Dispatch auto-claims the lease. If it **refuses** (already in flight or held,
+  or — for a `--profile` dispatch — because this machine can't satisfy the
+  profile, e.g. no `codex` CLI on PATH), skip that item — something else owns
+  it, or this box isn't the right one to run it. Don't `--force` past a live
+  lease.
 - Record `{ node, agent_name (= node id), branch, worktree_path, kind }` in
   `running`. `kind` is `'claude'` for `agent-prompt.md`/`infra-agent-prompt.md`
   (self-resolving) or `'codex'` for `codex-agent-prompt.md` (orchestrator
@@ -293,9 +310,11 @@ them):
   isn't a `claude --bg` agent at all — it never appears in that list, session
   or gone. Feed them a Codex node id and, absent a resolved node, you get
   `RECOVER` unconditionally — that's not a signal, it's a blind spot. Track a
-  Codex node's completion by watching the process/job you spawned for it and
-  reading its final report, not through these scripts; see "The Codex
-  implementer" below.
+  Codex node's completion with `spor runs --node <id> --json` instead (poll it
+  — its `state` reaches a terminal value `done`/`failed`/`vanished`/
+  `failed_launch` on its own once the Codex supervisor exits, no session list
+  to consult), and read its final report from the `.report_path` that call
+  returns, not through these scripts; see "The Codex implementer" below.
 
 To read a finished agent's final report, never `claude logs` (it replays raw
 TUI escape frames — huge and unreadable). Use:
@@ -383,38 +402,56 @@ or it deliberately bailed:
 ### The Codex implementer (a self-resolution exception)
 
 `assets/codex-agent-prompt.md` dispatches a **Codex-harness** implementer
-(GPT-5.5 via the `codex` CLI — a different binary from `claude --bg`) for the
-same kind of worktree item a code agent handles. Its contract differs from
-`assets/agent-prompt.md` in exactly one load-bearing way: it is explicitly
-forbidden from writing the graph at all — "Read the graph freely; never write
-it… The orchestrator handles ALL graph updates, including resolving this
-node." So a Codex node that finished cleanly looks, on the graph, identical
-to one that never started: unresolved. That's expected, not a failure
-signal — but it collides head-on with completion-detection paths built for
-**self-resolving** agents: `fleet-status.sh`'s `RECOVER` branch and the
-supervisor loop's default `recover()` fallthrough both read "unresolved" as
-"didn't finish," and neither script can even see a Codex session in the
-first place (they poll `claude agents --json`, which a Codex process never
-enters).
+(via the `codex` CLI — a different binary from `claude --bg`) for the same
+kind of worktree item a code agent handles. Launch it with `spor dispatch`
+exactly like a Claude agent, just with a Codex profile instead of a Claude
+model:
+
+```bash
+spor dispatch --node <id> --worktree --profile profile-codex-sol \
+  --template ~/.claude/skills/spor-orchestrator/assets/codex-agent-prompt.md
+```
+
+(Swap `profile-codex-sol` for whichever Codex profile you want — `--model`
+still overrides the profile's model if you need to right-size it, same as for
+Claude. Don't add `--permission-mode`/`--agent`; those are Claude-only flags
+and the dispatch will refuse. Don't add `--sandbox`/`--approval-policy`
+either unless you deliberately want something other than the unattended
+default `workspace-write`/`never`.) This is the supported path — there is no
+separate raw `codex exec` invocation to hand-roll or output stream to
+redirect yourself; `spor dispatch` launches Codex under its own supervisor,
+which handles the sandboxing, JSONL logging, and final-report capture for
+you, and prints the run/log/report paths the moment it launches (see
+"How Codex dispatch differs" in the main README if you want the mechanics).
+
+Its contract differs from `assets/agent-prompt.md` in exactly one load-bearing
+way: it is explicitly forbidden from writing the graph at all — "Read the
+graph freely; never write it… The orchestrator handles ALL graph updates,
+including resolving this node." So a Codex node that finished cleanly looks,
+on the graph, identical to one that never started: unresolved. That's
+expected, not a failure signal — but it collides head-on with
+completion-detection paths built for **self-resolving** agents:
+`fleet-status.sh`'s `RECOVER` branch and the supervisor loop's default
+`recover()` fallthrough both read "unresolved" as "didn't finish," and
+neither script can even see a Codex session in the first place (they poll
+`claude agents --json`, which a Codex process never enters).
 
 Two things close the gap:
 
-1. **Track which nodes are Codex-dispatched, and capture their output when
-   you launch them.** Record `kind: 'codex'` alongside the node in `running`
-   at dispatch time (see Dispatch, above). A Codex process isn't a `claude
-   --bg` agent — `agent-report.sh` reads Claude session transcripts under
-   `~/.claude/projects/`, which a `codex` CLI process never writes — so
-   there's no equivalent "give me the final report by id" tool for it. Redirect
-   its output to a log file when you launch it and record that path as
-   `running[node].report_path`; that's what tells the supervisor loop both
-   that this node's absence from `claude agents --json` means nothing on its
-   own, and where to actually find its report once it exits. Watch the
-   process itself finishing (it's a job you started directly), not
+1. **Track which nodes are Codex-dispatched, and record where dispatch says
+   its report landed.** Record `kind: 'codex'` alongside the node in
+   `running` at dispatch time (see Dispatch, above), plus the `report_path`
+   line `spor dispatch` printed at launch (or fetch it any time afterward with
+   `spor runs --node <id> --json` → `.report_path`) — that's what tells the
+   supervisor loop both that this node's absence from `claude agents --json`
+   means nothing on its own, and where to actually find its report once it
+   exits. Poll `spor runs --node <id> --json` for completion (its `state`
+   goes terminal on its own once the Codex supervisor exits), not
    `fleet-status.sh`/`watch-fleet.sh` — see the Waiting section's scope note.
-2. **Resolve before you status-check.** When a tracked Codex process exits,
-   read its final report from `running[node].report_path` — same shape as a
-   Claude agent's: ends with `MERGE-READY` or `BLOCKED` and why, plus a `##
-   FINDINGS FOR THE ORCHESTRATOR` block. On `MERGE-READY`: **you** write the
+2. **Resolve before you status-check.** When a tracked Codex run's state goes
+   terminal, read its final report from `running[node].report_path` — same
+   shape as a Claude agent's: ends with `MERGE-READY` or `BLOCKED` and why,
+   plus a `## FINDINGS FOR THE ORCHESTRATOR` block. On `MERGE-READY`: **you** write the
    resolver node (a `decision` or short `artifact` carrying a `resolves`
    edge) and flip the node to its terminal status yourself — *before*
    running `fleet-status.sh` or trusting `watch-fleet.sh` again for that
