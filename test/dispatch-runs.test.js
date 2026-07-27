@@ -865,6 +865,26 @@ test("spor runs: a launched agent that left no transcript ends up queryable as v
   assert.strictEqual(runRecords(home)[0].state, "vanished", "the outcome is durable, not just printed");
 });
 
+test("spor runs (text): a reaped orphaned child is legible without --json", async () => {
+  const home = scratch("spor-runs-store-");
+  const child = liveChild();
+  try {
+    await new Promise((resolve) => child.once("spawn", resolve));
+    const childTicks = runner.processStartTicks(child.pid);
+    supervisedRecord(home, "sup-orphan-child-text", {
+      runner_pid: deadPid(),
+      child_pid: child.pid,
+      ...(childTicks != null ? { child_started_ticks: childTicks } : {}),
+    });
+    const r = cli(["runs"], { SPOR_HOME: home });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /reaped:     an orphaned harness child was terminated at reconciliation/);
+    assert.ok(await waitUntilDead(child.pid), "the orphaned child was actually terminated");
+  } finally {
+    try { child.kill("SIGKILL"); } catch { /* already gone, that's the point */ }
+  }
+});
+
 test("spor runs --json: 'reconciled' is false only when a NATIVE run was actually left unresolved", () => {
   // A Codex-only box has no `claude` to enumerate, and supervised runs never
   // needed that listing — reporting reconciled:false there would tell a caller

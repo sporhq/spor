@@ -7494,6 +7494,7 @@ function cmdRuns(cfg, { values, positionals: pos }) {
     const cls = r.termination_class ? ` — ${r.termination_class}${r.termination_signal ? `/${r.termination_signal}` : ""}` : "";
     out(`${r.run_id.slice(0, 8)}  ${r.state}${cls}  ${r.node_id || r.name || "(free-text)"}  ${r.harness}  ${r.created_at || ""}`);
     if (r.termination_reason) out(`  why:        ${r.termination_reason}`);
+    if (r.child_reaped) out(`  reaped:     an orphaned harness child was terminated at reconciliation`);
     if (r.cwd) out(`  cwd:        ${r.cwd}`);
     if (r.session_id) out(`  session:    ${r.session_id}`);
     if (r.transcript_path) out(`  transcript: ${r.transcript_path}`);
