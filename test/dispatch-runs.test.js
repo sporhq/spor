@@ -444,6 +444,42 @@ test("reconcileRuns: a QUICK re-dispatch, both still unbound, does not let the o
   assert.strictEqual(f.termination_signal, "session-unbound");
 });
 
+test("reconcileRuns: a same-name TERMINAL or cross-harness record never outranks a genuinely-live native run for ownership of its own agent", () => {
+  // The owner tie-break only needs to arbitrate between records that would
+  // otherwise both consume the ownership map — a supervised-jsonl record
+  // reconciles off its own pid (never off `agents`), and an already-terminal
+  // record's own `finalizeRun` short-circuits before ever consulting `scoped`.
+  // Neither benefits from winning a tie-break, but letting either win one
+  // wrongly DENIES the shared name+cwd agent to a currently-alive native
+  // record — worse than the residual same-mode ambiguity, since here there
+  // was never an actual second live native dispatch to be ambiguous about.
+  const home = scratch("spor-runs-store-");
+  const configDir = scratch("spor-runs-cc-");
+  const cwd = "/tmp/spor-runs-cross-mode-steal";
+  const first = runner.beginNativeRun(home, { harness: "claude-code", name: "issue-x", nodeId: "issue-x", cwd, now: () => "2026-07-18T10:00:00.000Z" });
+  runner.updateRun(first, { state: "running" });
+  // A same-name, same-cwd SUPERVISED-JSONL record, created later than `first`
+  // but still within the 60s grace window of the one live agent below — if it
+  // were eligible to win the tie-break (later `created_at`), it would steal
+  // that agent from `first` despite never itself consulting `agents` at all.
+  runner.atomicJson(runner.runPaths(home, "sup-cross-1").record, {
+    run_id: "sup-cross-1", node_id: "issue-x", name: "issue-x", harness: "codex",
+    launch_mode: "supervised-jsonl", state: "running", cwd,
+    runner_pid: 999999999, // guaranteed-dead pid — its own outcome isn't the point here
+    created_at: "2026-07-18T10:00:30.000Z",
+  });
+  const out = runner.reconcileRuns(home, {
+    // The ONLY live agent, genuinely `first`'s own: started 5s after `first`
+    // was created (well within grace), and 25s before the supervised record
+    // above — also well within ITS 60s grace window, which is the whole hazard.
+    agents: [{ name: "issue-x", cwd, kind: "background", startedAt: Date.parse("2026-07-18T10:00:05.000Z") }],
+    env: { CLAUDE_CONFIG_DIR: configDir },
+    now: () => "2026-07-18T10:10:00.000Z", // past `first`'s own 60s grace window
+  });
+  const byId = new Map(out.map((r) => [r.run_id, r]));
+  assert.strictEqual(byId.get(first.runId).state, "running", "the genuinely-live native run keeps its own agent as evidence");
+});
+
 test("reconcileRuns: a harness that could not be listed reconciles NOTHING (stale child state is not death)", () => {
   const home = scratch("spor-runs-store-");
   const rec = runner.beginNativeRun(home, { harness: "claude-code", name: "n", nodeId: "issue-x", cwd: "/tmp/nope", now: () => "2026-07-18T10:00:00.000Z" });
