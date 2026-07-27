@@ -7,7 +7,7 @@
 require("./helpers/tmp-cleanup"); // scratch-home leak guard
 const test = require("node:test");
 const assert = require("node:assert");
-const { spawnSync } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -62,6 +62,23 @@ function runRecords(home) {
 // a liveness probe.
 function deadPid() {
   return spawnSync(process.execPath, ["-e", ""], { stdio: "ignore" }).pid;
+}
+
+// A genuinely long-lived process to stand in for an un-detached harness child
+// left running after its supervisor is gone (issue-spor-dispatch-vanished-
+// supervisor-orphan-child). Callers are responsible for making sure it ends
+// up dead one way or another.
+function liveChild() {
+  return spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+}
+
+async function waitUntilDead(pid, timeoutMs = 2000) {
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    if (!runner.pidAlive(pid)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return !runner.pidAlive(pid);
 }
 
 // A supervised record as `launchSupervisedHarness` leaves it, aged past the
@@ -505,6 +522,64 @@ test("reconcileRuns: a supervised run whose supervisor was killed mid-run is clo
   assert.match(out[0].termination_reason, /never recorded an outcome/);
   assert.ok(out[0].finished_at, "and it carries when it was closed");
   assert.strictEqual(runRecords(home)[0].state, "vanished", "the outcome is durable, not just returned");
+});
+
+// --- orphaned child reaping (issue-spor-dispatch-vanished-supervisor-orphan-child) ---
+// The harness child a supervised run launches is spawned WITHOUT `detached`, so
+// a pid-targeted kill of just the supervisor leaves it running, unsupervised —
+// reconciliation must notice via the recorded `child_pid` and end it, not just
+// stamp the run vanished while the process keeps going.
+
+test("reconcileRuns: a live orphaned child is reaped when its dead supervisor's run is stamped vanished", async () => {
+  const home = scratch("spor-runs-store-");
+  const child = liveChild();
+  try {
+    await new Promise((resolve) => child.once("spawn", resolve));
+    const childTicks = runner.processStartTicks(child.pid);
+    supervisedRecord(home, "sup-orphan-child", {
+      runner_pid: deadPid(),
+      child_pid: child.pid,
+      ...(childTicks != null ? { child_started_ticks: childTicks } : {}),
+    });
+    assert.ok(runner.pidAlive(child.pid), "the child is genuinely alive before reconciliation");
+    const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:10:00.000Z" });
+    assert.strictEqual(out[0].state, "vanished");
+    assert.strictEqual(out[0].child_reaped, true);
+    assert.ok(await waitUntilDead(child.pid), "the orphaned child was actually terminated, not just marked in the record");
+    assert.strictEqual(runRecords(home)[0].child_reaped, true, "the reap is durable, not just returned");
+  } finally {
+    try { child.kill("SIGKILL"); } catch { /* already gone, that's the point */ }
+  }
+});
+
+test("reconcileRuns: a supervised run whose child is ALSO already gone reports no reap (nothing to clean up)", () => {
+  const home = scratch("spor-runs-store-");
+  supervisedRecord(home, "sup-both-gone", { runner_pid: deadPid(), child_pid: deadPid() });
+  const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:10:00.000Z" });
+  assert.strictEqual(out[0].state, "vanished");
+  assert.strictEqual(out[0].child_reaped, undefined);
+});
+
+test("reconcileRuns: a recycled child_pid is never signaled — identity mismatch leaves the unrelated process alone", async () => {
+  if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
+  const home = scratch("spor-runs-store-");
+  const unrelated = liveChild();
+  try {
+    await new Promise((resolve) => unrelated.once("spawn", resolve));
+    const actualTicks = runner.processStartTicks(unrelated.pid);
+    assert.ok(Number.isFinite(actualTicks));
+    supervisedRecord(home, "sup-child-reused", {
+      runner_pid: deadPid(),
+      child_pid: unrelated.pid,
+      child_started_ticks: actualTicks + 999999, // the recorded pid is not THIS process
+    });
+    const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:10:00.000Z" });
+    assert.strictEqual(out[0].state, "vanished");
+    assert.strictEqual(out[0].child_reaped, undefined, "a pid-reuse mismatch is not evidence to kill anything");
+    assert.ok(runner.pidAlive(unrelated.pid), "the unrelated process holding the recycled pid was never touched");
+  } finally {
+    try { unrelated.kill("SIGKILL"); } catch { /* already gone */ }
+  }
 });
 
 test("reconcileRuns: a supervisor that never reported its child is a failed LAUNCH, not a vanish", () => {
