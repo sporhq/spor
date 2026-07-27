@@ -45,10 +45,15 @@ from that, and breaking either tangles other agents' work:
    plainly in your final report rather than claiming success.
 
 4. **Review, right-sized — one pass, FOREGROUND, escalate only on signal.** With
-   the gates green, run `/code-review` over your diff (`git diff main...HEAD`) at
-   **medium** effort — fewer, higher-confidence findings, which is right for a
-   scoped, test-fenced change. A context-free fresh reader is exactly what you
-   want here. **Run it in the foreground and wait for it inline — do NOT background
+   the gates green, get a fresh-context review of your diff (`git diff
+   main...HEAD`) at **medium** effort — fewer, higher-confidence findings, which
+   is right for a scoped, test-fenced change. A context-free fresh reader is
+   exactly what you want here. NOTE: the `/code-review` skill is NOT
+   model-invocable in a dispatched session (`disable-model-invocation`) — do not
+   try it and do not burn turns discovering that; spawn a **foreground
+   `general-purpose` Agent-tool subagent** with your diff and a
+   correctness-focused review prompt instead (every fleet agent before you
+   converged on exactly this shape). **Run it in the foreground and wait for it inline — do NOT background
    it, spawn a monitor, or end your turn "waiting for the review to finish".** A
    backgrounded review with no one to wake you is the stall that leaves your work
    uncommitted and your node falsely resolved; every step of this workflow runs in
@@ -81,7 +86,7 @@ from that, and breaking either tangles other agents' work:
    orchestrator's "this branch is merge-ready" signal, so it MUST NOT be set while
    the branch is still empty or the worktree dirty. Leave the branch merge-ready:
    everything committed, working tree clean, tests green, your right-sized
-   `/code-review` clean (no actionable findings). Do **not** merge.
+   review clean (no actionable findings). Do **not** merge.
 
 7. **Resolve the node on the graph — the LAST thing you do, only after step 6's
    commit is on the branch and the tree is clean.** Completing a task or issue
@@ -110,7 +115,7 @@ that's the designed path, not a failure on your part.
 ## Final report
 
 End with: the node id, what you changed, confirmation that tests pass and your
-right-sized `/code-review` is clean (note the effort you used and why, if you
+right-sized review is clean (note the effort you used and why, if you
 escalated), and the id of the resolver node you wrote (or, if you stopped, what's
 blocking and what you deferred).
 

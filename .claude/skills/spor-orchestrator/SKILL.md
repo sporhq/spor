@@ -497,6 +497,19 @@ from. A "better-approach" finding usually becomes a `task`; a real latent bug an
 `issue`. Mention notable ones in your status line so the user can veto. This is
 how the fleet's discoveries become durable work instead of evaporating.
 
+**Then make the keepers agent-ready, not just filed.** A filed finding lands
+`untriaged` and sits outside the dispatchable pool until someone grooms it — so
+apply the /spor:triage make-ready discipline at filing time, while the context
+is fresh and free: write the body so a cold-start agent could take it (name the
+file/function, the fix shape if it's known, and acceptance criteria), then stamp
+it `spor ready <id>`. Stamped keepers join the queue as first-class dispatch
+candidates — refill slots with them in the SAME run when they don't collide
+with active agents. Do NOT stamp the ones that are genuinely gated: a finding
+that needs a policy/design decision, one blocked on other queued work (record
+the `blocks` edge instead), or one timed on an external event (deploy, human
+sign-off) stays unstamped — a false ready stamp just moves the failure to
+dispatch time.
+
 ## What each delegated agent does
 
 There are three per-agent workflows, all supplied as the dispatch `--template`:
