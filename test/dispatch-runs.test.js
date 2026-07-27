@@ -245,6 +245,19 @@ test("isRunLive: a run with no identity at all is never inferred alive from co-l
   assert.ok(!runner.isRunLive(anonymous, [{ name: "task-b", cwd: "/repo", startedAt: Date.parse("2026-07-18T10:00:05.000Z") }]));
 });
 
+test("isRunLive: RE-DISPATCHING the same node into the same checkout never keeps the prior unbound run alive", () => {
+  // issue-spor-dispatch-unbound-run-identity-not-unique: a launch NAME is
+  // derived from the node id, so it is REUSED across re-dispatches — unlike a
+  // session id it is not unique. dead-run's own agent vanished long ago; a
+  // LATER re-dispatch of the SAME node (same name, same cwd) is now live. The
+  // later agent must never be read as evidence that the EARLIER run is alive.
+  const first = { name: "issue-x", cwd: "/repo", created_at: "2026-07-18T10:00:00.000Z" };
+  const second = { name: "issue-x", cwd: "/repo", created_at: "2026-07-18T10:15:00.000Z" };
+  const laterAgent = { name: "issue-x", cwd: "/repo", startedAt: Date.parse("2026-07-18T10:15:03.000Z") };
+  assert.ok(!runner.isRunLive(first, [laterAgent]), "the earlier, dead run is not resurrected by a later same-named agent");
+  assert.ok(runner.isRunLive(second, [laterAgent]), "…while the run that agent actually belongs to reads live");
+});
+
 test("finalizeRun: a live run, an already-terminal run, and a run inside its grace window are left alone", () => {
   const now = () => "2026-07-18T10:00:30.000Z";
   const rec = { state: "running", cwd: "/w", created_at: "2026-07-18T10:00:00.000Z" };
@@ -366,6 +379,69 @@ test("reconcileRuns: two concurrent dispatches in ONE checkout resolve independe
   assert.strictEqual(d.termination_signal, "session-unbound");
   assert.notStrictEqual(d.transcript_path, siblingTranscript, "and is never handed the sibling's transcript");
   assert.ok(!d.transcript_path);
+});
+
+test("reconcileRuns: RE-DISPATCHING the same node into the same checkout never keeps the prior unbound run alive", () => {
+  // issue-spor-dispatch-unbound-run-identity-not-unique: unlike the "two
+  // concurrent dispatches" case above (different names), a re-dispatch of the
+  // SAME node into the SAME checkout launches an agent under the SAME launch
+  // name (cmdDispatch derives it from the node id). The first run's session
+  // never bound and its agent is long gone by the time the second launches;
+  // the second run's own live agent must not be read as the first run's
+  // evidence of life just because it shares that name and cwd.
+  const home = scratch("spor-runs-store-");
+  const configDir = scratch("spor-runs-cc-");
+  const cwd = "/tmp/spor-runs-redispatch";
+  const secondTranscript = writeTranscript(configDir, cwd, "sid-second-run", [TOOL_RESULT, CLEAN_END]);
+  const first = runner.beginNativeRun(home, { harness: "claude-code", name: "issue-x", nodeId: "issue-x", cwd, now: () => "2026-07-18T10:00:00.000Z" });
+  runner.updateRun(first, { state: "running" });
+  const second = runner.beginNativeRun(home, { harness: "claude-code", name: "issue-x", nodeId: "issue-x", cwd, now: () => "2026-07-18T10:20:00.000Z" });
+  runner.updateRun(second, { state: "running", session_id: "sid-second-run" });
+
+  const out = runner.reconcileRuns(home, {
+    agents: [{ sessionId: "sid-second-run", name: "issue-x", cwd, kind: "background", startedAt: Date.parse("2026-07-18T10:20:05.000Z") }],
+    env: { CLAUDE_CONFIG_DIR: configDir },
+    now: () => "2026-07-18T10:30:00.000Z",
+  });
+  const byId = new Map(out.map((r) => [r.run_id, r]));
+  assert.strictEqual(byId.get(second.runId).state, "running", "the re-dispatched (later) run is still live");
+  const f = byId.get(first.runId);
+  assert.ok(runner.TERMINAL_STATES.has(f.state), "the earlier run reaches a terminal state despite sharing name+cwd with the later one");
+  assert.strictEqual(f.termination_signal, "session-unbound");
+  assert.notStrictEqual(f.transcript_path, secondTranscript, "and is never handed the later run's transcript");
+  assert.ok(!f.transcript_path);
+});
+
+test("reconcileRuns: a QUICK re-dispatch, both still unbound, does not let the older run borrow the newer one's liveness", () => {
+  // issue-spor-dispatch-unbound-run-identity-not-unique: the grace window that
+  // covers the harness's own registration lag is symmetric around EACH
+  // record's created_at, so a re-dispatch only 15s later — well INSIDE that
+  // window on both sides — would otherwise satisfy the OLDER record's
+  // identity test too, from the SAME live agent. Unlike the original
+  // unbounded bug this wouldn't even self-correct with time: created_at and
+  // startedAt are fixed, so the older record would stay wrongly non-terminal
+  // for as long as the newer run's own agent keeps running. Only the more
+  // recently launched record may claim a shared name+cwd agent.
+  const home = scratch("spor-runs-store-");
+  const configDir = scratch("spor-runs-cc-");
+  const cwd = "/tmp/spor-runs-quick-redispatch";
+  const first = runner.beginNativeRun(home, { harness: "claude-code", name: "issue-x", nodeId: "issue-x", cwd, now: () => "2026-07-18T10:00:00.000Z" });
+  runner.updateRun(first, { state: "running" });
+  const second = runner.beginNativeRun(home, { harness: "claude-code", name: "issue-x", nodeId: "issue-x", cwd, now: () => "2026-07-18T10:00:15.000Z" });
+  runner.updateRun(second, { state: "running" });
+
+  const out = runner.reconcileRuns(home, {
+    // Only the SECOND run's own agent is alive — but its startedAt sits
+    // within the 60s grace window of BOTH records' created_at.
+    agents: [{ name: "issue-x", cwd, kind: "background", startedAt: Date.parse("2026-07-18T10:00:16.000Z") }],
+    env: { CLAUDE_CONFIG_DIR: configDir },
+    now: () => "2026-07-18T10:05:00.000Z", // past the FIRST record's own 60s grace window
+  });
+  const byId = new Map(out.map((r) => [r.run_id, r]));
+  assert.strictEqual(byId.get(second.runId).state, "running", "the newer run correctly reads live");
+  const f = byId.get(first.runId);
+  assert.ok(runner.TERMINAL_STATES.has(f.state), "the older run reaches a terminal state even though the live agent falls within ITS OWN grace window too");
+  assert.strictEqual(f.termination_signal, "session-unbound");
 });
 
 test("reconcileRuns: a harness that could not be listed reconciles NOTHING (stale child state is not death)", () => {

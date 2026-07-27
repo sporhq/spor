@@ -555,7 +555,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // reports the full `sessionId` + `cwd` + `startedAt` — the reliable capture
 // path. Match on cwd (the strong signal — we just launched there), then on
 // name when given.
-function dispatchedSessionCandidates(cfg, name, dir) {
+//
+// A launch name is derived from the node id (or truncated task text), so it
+// is REUSED by every re-dispatch of that node into the same dir — it is not
+// unique across runs (issue-spor-dispatch-unbound-run-identity-not-unique). A
+// stale agent from an EARLIER dispatch of the same node can still be listed
+// (a slow-to-finish or zombie entry) and would otherwise look like a valid
+// candidate the moment this poll starts, before our own agent has even
+// registered. `since` (this launch's own record.created_at) filters those
+// out: nothing that started before we launched can be the run we just
+// started, so only a genuinely NEW agent counts as a candidate.
+function dispatchedSessionCandidates(cfg, name, dir, since = 0) {
   const all = [];
   for (const arr of dispatchedAgents(cfg).values()) {
     for (const a of arr) if (!a.harness || a.harness === "claude-code") all.push(a);
@@ -570,12 +580,15 @@ function dispatchedSessionCandidates(cfg, name, dir) {
   // (issue-spor-dispatch-run-liveness-same-cwd-misattribution). An empty result
   // just keeps polling until ours appears; an honest miss beats a wrong id.
   if (name) cands = cands.filter((a) => a.name === name);
+  if (since) cands = cands.filter((a) => (Number(a.startedAt) || 0) >= since);
   cands.sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
   return cands;
 }
 
 // Capture the launched run's session, polling briefly while the daemon registers
 // it. Returns the sessionId or null (fail-open — the caller degrades to session-null).
+//
+// `since` bounds candidates to this launch (see dispatchedSessionCandidates).
 //
 // `pinned` (SPOR_SESSION_ID) exists for tests/reproducibility and used to
 // short-circuit the poll unconditionally — but an ambient env var is not proof
@@ -593,9 +606,9 @@ function dispatchedSessionCandidates(cfg, name, dir) {
 // waiting. If the whole poll never finds any candidate, discovery had nothing
 // to contradict the pin with, so it falls back to trusting it (the fast path
 // tests rely on, where no agent is ever faked into existence).
-async function captureDispatchSession(cfg, name, dir, pinned) {
+async function captureDispatchSession(cfg, name, dir, pinned, since = 0) {
   for (let i = 0; i < 6; i++) {
-    const cands = dispatchedSessionCandidates(cfg, name, dir);
+    const cands = dispatchedSessionCandidates(cfg, name, dir, since);
     if (cands.length) {
       if (!pinned) return cands[0].sessionId;
       if (cands.some((a) => a.sessionId === pinned)) return pinned;
@@ -8187,7 +8200,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // (issue-spor-dispatch-run-liveness-same-cwd-misattribution). Only the
   // remote-side binding below stays remote-only. Best-effort: a capture miss
   // leaves the record honestly session-less rather than guessing.
-  const realSession = await captureDispatchSession(cfg, name, launchDir, pinnedSession);
+  const realSession = await captureDispatchSession(cfg, name, launchDir, pinnedSession, Date.parse(nativeRun.record.created_at) || 0);
   // Record the session whether or not the remote bind succeeds: it is the
   // pointer `spor runs` follows to the harness transcript that holds this
   // run's terminal reason.

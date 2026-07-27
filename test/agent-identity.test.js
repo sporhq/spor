@@ -945,12 +945,19 @@ test("dispatch (remote, real): captures the run session from `claude agents --js
   const stub = argvStub(home, outFile);
   const REAL = "aaaaaaaa-1111-2222-3333-444444444444";
   // The candidates the capture must pick among. Only the newest, this-repo,
-  // not-done agent should win — the others probe each filter.
+  // not-done agent should win — the others probe each filter. "old" predates
+  // this dispatch's own launch (an EARLIER run of the same name+cwd — the
+  // reusable-name scenario, issue-spor-dispatch-unbound-run-identity-not-
+  // unique) so it must lose even though it shares name+cwd with "new"; "new"
+  // is stamped well into the future so it reliably clears the "since this
+  // launch" floor regardless of how long test setup takes.
+  const past = Date.now() - 3600000;
+  const future = Date.now() + 3600000;
   const agents = JSON.stringify([
-    { id: "other", kind: "background", state: "working", name: "dec-x", cwd: "/some/other/repo", sessionId: "WRONG-other-repo", startedAt: 9999 },
-    { id: "old",   kind: "background", state: "working", name: "dec-x", cwd: repo,                sessionId: "WRONG-older-run",  startedAt: 1000 },
-    { id: "new",   kind: "background", state: "working", name: "dec-x", cwd: repo,                sessionId: REAL,               startedAt: 2000 },
-    { id: "done",  kind: "background", state: "done",    name: "dec-x", cwd: repo,                sessionId: "WRONG-finished",   startedAt: 5000 },
+    { id: "other", kind: "background", state: "working", name: "dec-x", cwd: "/some/other/repo", sessionId: "WRONG-other-repo", startedAt: future },
+    { id: "old",   kind: "background", state: "working", name: "dec-x", cwd: repo,                sessionId: "WRONG-older-run",  startedAt: past },
+    { id: "new",   kind: "background", state: "working", name: "dec-x", cwd: repo,                sessionId: REAL,               startedAt: future },
+    { id: "done",  kind: "background", state: "done",    name: "dec-x", cwd: repo,                sessionId: "WRONG-finished",   startedAt: future },
   ]);
   const { srv, hits, base } = await dispatchStub({ mintStatus: 201 });
   try {
@@ -974,6 +981,42 @@ test("dispatch (remote, real): captures the run session from `claude agents --js
 
     // none of the decoys (other-repo / older / done) leaked through
     assert.ok(!hits.some((h) => h.method === "POST" && /"session":"WRONG/.test(h.body || "")), "no decoy session was bound");
+  } finally {
+    srv.close();
+  }
+});
+
+// issue-spor-dispatch-unbound-run-identity-not-unique: a launch NAME is
+// derived from the node id, so re-dispatching the SAME node into the SAME
+// checkout produces a candidate that matches on name+cwd exactly like the
+// run just launched would — the only thing telling them apart is that the
+// stale one started BEFORE this launch even began. Session capture must
+// reject it rather than adopting it the instant it sees ANY same-name
+// candidate, which is what an unbounded "newest so far" pick would do.
+test("dispatch (remote, real): a STALE same-name agent from an EARLIER dispatch is never captured as this run's session", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-stale-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-staler-"));
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "agent-anthony-laptop" } }) + "\n");
+  const stub = argvStub(home, path.join(home, "argv.out"));
+  // Only a STALE candidate exists — same name, same cwd, but its startedAt
+  // predates this dispatch's own launch, exactly as an earlier, still-
+  // registered (or zombie) agent from a prior dispatch of the same node
+  // would look. No "real" candidate for THIS launch ever appears.
+  const agents = JSON.stringify([
+    { id: "stale", kind: "background", state: "working", name: "dec-x", cwd: repo, sessionId: "WRONG-earlier-run", startedAt: Date.now() - 3600000 },
+  ]);
+  const { srv, hits, base } = await dispatchStub({ mintStatus: 201 });
+  try {
+    const r = await runAsync(
+      ["dispatch", "dec-x", "--dir", repo, "--no-brief", "--force"],
+      remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: agents })
+    );
+    assert.strictEqual(r.status, 0, r.stderr);
+    // no session was captured — the honest miss, never the stale decoy
+    assert.doesNotMatch(r.stdout, /session: WRONG-earlier-run/);
+    assert.match(r.stderr, /could not read the run session/);
+    assert.ok(!hits.some((h) => h.method === "POST" && (h.body || "").includes("WRONG-earlier-run")), "the stale earlier-run session never reached the server");
   } finally {
     srv.close();
   }
@@ -1018,7 +1061,7 @@ test("dispatch (remote, real): a SPOR_SESSION_ID that doesn't match the launched
   const REAL = "aaaaaaaa-1111-2222-3333-444444444444";
   const CALLER_PIN = "ffffffff-0000-0000-0000-ffffffffffff"; // an unrelated live session, e.g. the caller's own
   const agents = JSON.stringify([
-    { id: "new", kind: "background", state: "working", name: "dec-x", cwd: repo, sessionId: REAL, startedAt: 2000 },
+    { id: "new", kind: "background", state: "working", name: "dec-x", cwd: repo, sessionId: REAL, startedAt: Date.now() + 3600000 },
   ]);
   // The pre-launch dup-guard also calls "agents --json" once before the launch
   // even happens, so the empty answer must outlast that call too — 2 empty
