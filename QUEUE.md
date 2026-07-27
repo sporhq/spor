@@ -635,11 +635,33 @@ Two gate checks joined the sweep with the edge-write UX work
 (issue-cc-edge-write-ux-friction):
 
 - **inert-gate** — a `blocks` edge whose source has reached a terminal
-  status while its target is still live. The gate has cleared but the
-  graph still says "blocked": the finding (on the target's side,
+  status while its target is still live, claimed by no one, and not itself
+  a *program* (more than one node hanging beneath it in the membership
+  tree `render_program` walks). The gate has cleared but the graph still
+  says "blocked": the finding (on the target's side,
   `find-inert-gate-<source>-<target>`) says the target can proceed — drop
   the edge or pick up the work. This is the "the blocker was already done"
-  discovery made manually during dogfooding, mechanized.
+  discovery made manually during dogfooding, mechanized. It carries a
+  mechanical `remove_edge` remedy, so a batch `resolve_finding` can drop
+  the stale edge without a human re-deriving the fix
+  (issue-spor-gardener-mechanical-remediation-gap).
+- **gates-cleared** — the same cleared-gate situation, but on a dependent
+  that *heads a program*: every member in its `blocks` tree has landed,
+  nothing live blocks it anywhere in that tree, and nobody has claimed it.
+  Firing one inert-gate per membership edge would hand a batch
+  `resolve_finding` a `remove_edge` remedy for edges that are the
+  program's own progress record — `render_program` reads exactly those
+  inbound `blocks` edges to render the gating tree, so mechanically
+  dropping them would silently erase a finished program's membership.
+  Instead the gardener files ONE `find-gates-cleared-<target>` finding on
+  the umbrella itself, naming its members, and deliberately gives it **no
+  remedy**: resolve_finding refuses the kind outright, so closing the
+  umbrella out (a resolver plus a terminal-status flip) or picking up
+  whatever closing work remains is a human judgment call, not a mechanical
+  fix (issue-spor-inert-gate-remedy-destroys-program-topology,
+  dec-spor-finished-program-files-one-non-mechanical-gates-cleared-finding).
+  A program with anything still live anywhere in its tree is suppressed
+  outright — neither finding fires until every level has cleared.
 - **unedged-gate** — a live decision whose body uses gate vocabulary
   (`gate`/`gated`/`blocks`/`blocked`) and literally mentions two or more
   *live, queueable* node ids, none of which are connected to another
