@@ -392,3 +392,31 @@ test("a supervised Codex launch failure releases the lease established by this d
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+test("a supervisor that exits before reporting anything stamps failed_launch, distinct from a child-launch failure (task-spor-dispatch-supervisor-test-seam)", () => {
+  // Unlike the missing-codex-binary case above (the runner starts fine and
+  // writes failed_launch itself when IT fails to spawn the child), this
+  // simulates the runner process itself dying on startup — a startup crash or
+  // OOM before it can write anything at all. SPOR_DISPATCH_RUNNER_CMD swaps
+  // out the whole supervisor invocation so this is reproducible without
+  // waiting for a real crash.
+  const { home, repo } = fixture();
+  const crashedRunner = writeSpawnableNodeStub(home, "runner-crash", "process.exit(1);");
+  const result = run(
+    ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--no-brief"],
+    { SPOR_HOME: home, SPOR_CODEX_CMD: codexStub(home), SPOR_DISPATCH_RUNNER_CMD: crashedRunner }
+  );
+  assert.strictEqual(result.status, 1);
+  assert.match(result.stderr, /could not launch .*: the Codex supervisor exited with code 1 before reporting its child started/);
+
+  const runDir = path.join(home, "journal", "dispatch");
+  const recordFile = fs.readdirSync(runDir).find((f) => f.endsWith(".run.json"));
+  assert.ok(recordFile, "the launcher still leaves a durable run record");
+  const record = JSON.parse(fs.readFileSync(path.join(runDir, recordFile), "utf8"));
+  assert.strictEqual(record.state, "failed_launch");
+  assert.strictEqual(record.termination_signal, "supervisor-exited-early");
+  assert.match(record.termination_reason, /exited with code 1 before reporting its child started/);
+
+  // the ephemeral job/prompt files are cleaned up alongside the abandoned run
+  assert.ok(!fs.readdirSync(runDir).some((f) => /\.job\.json$|\.prompt$/.test(f)));
+});

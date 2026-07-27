@@ -7310,6 +7310,20 @@ function sweepStaleMcpConfigs(dir) {
 
 const DISPATCH_RUNNER = path.join(ROOT, "lib", "shell", "agent-dispatch-runner.js");
 
+// Test seam: SPOR_DISPATCH_RUNNER_CMD substitutes the whole supervisor
+// process (normally `node agent-dispatch-runner.js <job>`) with an arbitrary
+// spawnable command that receives the job file path as its only argument —
+// the runner-process analogue of the harness-level SPOR_CODEX_CMD/
+// SPOR_CLAUDE_CMD seams. Lets a test pin a supervisor that crashes on
+// startup, exercising launchSupervisedHarness's supervisor-exited-early
+// branch deterministically instead of relying on a real startup crash/OOM to
+// happen to occur (task-spor-dispatch-supervisor-test-seam). Unset (the
+// default) reproduces the exact prior invocation.
+function dispatchRunnerCommand(env = process.env) {
+  const override = env.SPOR_DISPATCH_RUNNER_CMD;
+  return override ? { cmd: override, args: [] } : { cmd: process.execPath, args: [DISPATCH_RUNNER] };
+}
+
 function writePrivate(file, text) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const fd = fs.openSync(file, "wx", 0o600);
@@ -7369,7 +7383,8 @@ async function launchSupervisedHarness(cfg, {
   let child;
   let spawnError = null;
   try {
-    child = spawn(process.execPath, [DISPATCH_RUNNER, p.job], {
+    const runner = dispatchRunnerCommand();
+    child = spawn(runner.cmd, [...runner.args, p.job], {
       detached: true,
       stdio: "ignore",
       env: runnerEnv,
