@@ -57,6 +57,33 @@ function runRecords(home) {
   return runner.readRunRecords(home);
 }
 
+// A pid that is genuinely gone: spawnSync returns only after the child has been
+// waited for, so this is a dead AND reaped pid, not a zombie that still answers
+// a liveness probe.
+function deadPid() {
+  return spawnSync(process.execPath, ["-e", ""], { stdio: "ignore" }).pid;
+}
+
+// A supervised record as `launchSupervisedHarness` leaves it, aged past the
+// registration grace window.
+function supervisedRecord(home, runId, extra = {}) {
+  const p = runner.runPaths(home, runId);
+  const record = {
+    run_id: runId,
+    node_id: `issue-${runId}`,
+    harness: "codex",
+    launch_mode: "supervised-jsonl",
+    state: "running",
+    cwd: "/tmp/spor-runs-supervised",
+    created_at: "2026-07-18T10:00:00.000Z",
+    log_path: p.log,
+    report_path: p.report,
+    ...extra,
+  };
+  runner.atomicJson(p.record, record);
+  return record;
+}
+
 // One JSONL transcript under a scratch CLAUDE_CONFIG_DIR, at the path the
 // harness itself uses: projects/<cwd with non-alphanumerics dashed>/<sid>.jsonl.
 function writeTranscript(configDir, cwd, sessionId, lines) {
@@ -283,7 +310,7 @@ test("finalizeRun: a bound run whose transcript is missing says so, and does not
 
 // --- reconciliation over the record store ---------------------------------
 
-test("reconcileRuns: resolves dead native runs, keeps live ones, and never touches supervised records", () => {
+test("reconcileRuns: resolves dead native runs, keeps live ones, and leaves a live supervisor's run alone", () => {
   const home = scratch("spor-runs-store-");
   const configDir = scratch("spor-runs-cc-");
   const cwd = "/tmp/spor-runs-recon";
@@ -292,9 +319,10 @@ test("reconcileRuns: resolves dead native runs, keeps live ones, and never touch
   runner.updateRun(dead, { state: "running", session_id: "sid-dead" });
   const live = runner.beginNativeRun(home, { harness: "claude-code", name: "n-live", nodeId: "issue-live", cwd, now: () => "2026-07-18T10:00:00.000Z" });
   runner.updateRun(live, { state: "running", session_id: "sid-live" });
-  // A supervised record: its own runner owns finalization, so reconciliation
-  // must leave it exactly as found.
-  runner.atomicJson(runner.runPaths(home, "sup-1").record, { run_id: "sup-1", harness: "codex", launch_mode: "supervised-jsonl", state: "running", created_at: "2026-07-18T10:00:00.000Z" });
+  // A supervised record whose supervisor is still up: its own runner owns
+  // finalization, so reconciliation must leave it exactly as found. Its liveness
+  // is its supervisor's pid, never the native agent list — which is empty of it.
+  runner.atomicJson(runner.runPaths(home, "sup-1").record, { run_id: "sup-1", harness: "codex", launch_mode: "supervised-jsonl", state: "running", runner_pid: process.pid, created_at: "2026-07-18T10:00:00.000Z" });
 
   const out = runner.reconcileRuns(home, {
     agents: [{ sessionId: "sid-live", cwd, kind: "background" }],
@@ -308,6 +336,7 @@ test("reconcileRuns: resolves dead native runs, keeps live ones, and never touch
   assert.strictEqual(byId.get("sup-1").state, "running");
   // Durable: the derived outcome is written back, not just returned.
   assert.strictEqual(runRecords(home).find((r) => r.run_id === dead.runId).state, "vanished");
+  assert.strictEqual(runRecords(home).find((r) => r.run_id === "sup-1").state, "running", "a healthy supervised run is never prematurely finalized");
 });
 
 test("reconcileRuns: two concurrent dispatches in ONE checkout resolve independently", () => {
@@ -346,6 +375,199 @@ test("reconcileRuns: a harness that could not be listed reconciles NOTHING (stal
   const out = runner.reconcileRuns(home, { agents: [], enumerated: false, now: () => "2026-07-18T11:00:00.000Z" });
   assert.strictEqual(out[0].state, "running");
   assert.strictEqual(runRecords(home)[0].state, "running", "nothing written back");
+});
+
+// --- the supervised path (issue-spor-dispatch-supervised-runs-never-reconciled)
+// A Codex dispatch is supervised by a DETACHED process of ours. When it dies
+// before finalizing, nothing else ever will — so reconciliation must close the
+// run from the evidence the adapter declares (its supervisor's pid and its own
+// log), never from the native agent list, which knows nothing about it.
+
+test("reconcileRuns: a supervised run whose supervisor was killed mid-run is closed, not left running", () => {
+  const home = scratch("spor-runs-store-");
+  supervisedRecord(home, "sup-killed", { runner_pid: deadPid() });
+  const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:10:00.000Z" });
+  assert.strictEqual(out[0].state, "vanished");
+  assert.strictEqual(out[0].termination_class, "unknown");
+  assert.strictEqual(out[0].termination_signal, "supervisor-gone");
+  assert.match(out[0].termination_reason, /never recorded an outcome/);
+  assert.ok(out[0].finished_at, "and it carries when it was closed");
+  assert.strictEqual(runRecords(home)[0].state, "vanished", "the outcome is durable, not just returned");
+});
+
+test("reconcileRuns: a supervisor that never reported its child is a failed LAUNCH, not a vanish", () => {
+  const home = scratch("spor-runs-store-");
+  // Still at `launching`: the supervisor died between the record being opened
+  // and the harness child starting — including the case where the supervisor
+  // itself never came up and no pid was ever recorded.
+  supervisedRecord(home, "sup-never", { state: "launching", runner_pid: deadPid() });
+  supervisedRecord(home, "sup-nopid", { state: "launching", runner_pid: undefined });
+  const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:10:00.000Z" });
+  for (const r of out) {
+    assert.strictEqual(r.state, "failed_launch", r.run_id);
+    assert.strictEqual(r.termination_class, "launch");
+    assert.strictEqual(r.termination_signal, "supervisor-never-started");
+  }
+  assert.match(out.find((r) => r.run_id === "sup-never").termination_reason, /pid \d+/);
+});
+
+test("reconcileRuns: a dead supervisor's LOG supplies the reason, so a credit-dead Codex run reads as environment", () => {
+  const home = scratch("spor-runs-store-");
+  const rec = supervisedRecord(home, "sup-credit", { runner_pid: deadPid() });
+  fs.mkdirSync(path.dirname(rec.log_path), { recursive: true });
+  fs.writeFileSync(rec.log_path, [
+    JSON.stringify({ type: "thread.started", thread_id: "th-1" }),
+    JSON.stringify({ type: "error", message: "stream error: your credit balance is too low to continue" }),
+  ].join("\n") + "\n");
+  const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:10:00.000Z" });
+  assert.strictEqual(out[0].state, "failed", "a known cause is a failure, not an unexplained vanish");
+  assert.strictEqual(out[0].termination_class, "environment", "not a capability or implementation failure");
+  assert.strictEqual(out[0].termination_signal, "credit-exhausted");
+  assert.match(out[0].termination_reason, /credit balance is too low/);
+});
+
+test("reconcileRuns: a supervised run inside the grace window, or already terminal, is left alone", () => {
+  const home = scratch("spor-runs-store-");
+  supervisedRecord(home, "sup-fresh", { state: "launching", created_at: "2026-07-18T10:09:30.000Z" });
+  supervisedRecord(home, "sup-done", { state: "done", runner_pid: deadPid(), termination_signal: "supervised-exit" });
+  const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:10:00.000Z" });
+  const byId = new Map(out.map((r) => [r.run_id, r]));
+  assert.strictEqual(byId.get("sup-fresh").state, "launching", "the supervisor is still being given time to report");
+  assert.strictEqual(byId.get("sup-done").termination_signal, "supervised-exit", "an observed outcome is never overwritten");
+});
+
+test("reconcileRuns: supervised runs reconcile even when the native agent listing FAILED", () => {
+  // A Codex-only box has no `claude` to enumerate, and a supervised run's
+  // liveness never depended on that listing — so `enumerated: false` must not
+  // strand it. The native run beside it still waits for trustworthy evidence.
+  const home = scratch("spor-runs-store-");
+  supervisedRecord(home, "sup-orphan", { runner_pid: deadPid() });
+  const native = runner.beginNativeRun(home, { harness: "claude-code", name: "n", nodeId: "issue-n", cwd: "/tmp/nope", now: () => "2026-07-18T10:00:00.000Z" });
+  runner.updateRun(native, { state: "running" });
+  const out = runner.reconcileRuns(home, { agents: [], enumerated: false, now: () => "2026-07-18T10:10:00.000Z" });
+  const byId = new Map(out.map((r) => [r.run_id, r]));
+  assert.strictEqual(byId.get("sup-orphan").state, "vanished");
+  assert.strictEqual(byId.get(native.runId).state, "running", "stale native state is still not death");
+});
+
+test("reconcileRuns: a record in neither launch mode is passed through untouched", () => {
+  const home = scratch("spor-runs-store-");
+  runner.atomicJson(runner.runPaths(home, "sup-alien").record, {
+    run_id: "sup-alien", harness: "future", launch_mode: "something-new", state: "running", created_at: "2026-07-18T10:00:00.000Z",
+  });
+  const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:10:00.000Z" });
+  assert.strictEqual(out[0].state, "running", "a mode whose evidence we do not know is never guessed at");
+});
+
+test("reconcileRuns: a supervisor that finalizes mid-reconcile KEEPS its observed outcome", () => {
+  // The supervisor owns the record and can finalize at any instant — including
+  // between this reconciler's read and its write, which is exactly when its pid
+  // stops answering. An outcome the supervisor OBSERVED (with the exit code and
+  // session only it saw) must never be overwritten by a derived vanish.
+  const home = scratch("spor-runs-store-");
+  const rec = supervisedRecord(home, "sup-race", { runner_pid: deadPid() });
+  const p = runner.runPaths(home, "sup-race");
+  let ticks = 0;
+  const now = () => {
+    // The second `now()` is the patch's finished_at — i.e. after the verdict was
+    // computed from the stale read, before it is written back.
+    if (++ticks === 2) runner.atomicJson(p.record, { ...rec, state: "done", exit_code: 0, session_id: "codex-thread-1", termination_signal: "supervised-exit" });
+    return "2026-07-18T10:10:00.000Z";
+  };
+  const out = runner.reconcileRuns(home, { agents: [], now });
+  assert.strictEqual(out[0].state, "done", "the observed outcome survives");
+  assert.strictEqual(out[0].termination_signal, "supervised-exit");
+  const onDisk = runRecords(home)[0];
+  assert.strictEqual(onDisk.state, "done");
+  assert.strictEqual(onDisk.session_id, "codex-thread-1", "and its evidence is not dropped");
+  assert.strictEqual(onDisk.exit_code, 0);
+});
+
+test("reconcileRuns: a pid that answers but has gone SILENT for a day is read as reuse, not as life", () => {
+  // A bare pid is not identity. Pid spaces recycle (32768 wide in many
+  // containers), and pruneRuns only sweeps TERMINAL records — so without a
+  // backstop a recycled pid holds a record `running` forever, which is the very
+  // thing this issue exists to make impossible.
+  const home = scratch("spor-runs-store-");
+  supervisedRecord(home, "sup-reused", { runner_pid: process.pid });
+  const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-20T10:00:00.000Z" });
+  assert.strictEqual(out[0].state, "vanished");
+  assert.strictEqual(out[0].termination_signal, "supervisor-stale");
+  assert.match(out[0].termination_reason, /written nothing for 48h/);
+  // …and the same live pid on a young run is still believed.
+  const fresh = scratch("spor-runs-store-");
+  supervisedRecord(fresh, "sup-young", { runner_pid: process.pid });
+  const kept = runner.reconcileRuns(fresh, { agents: [], now: () => "2026-07-18T10:10:00.000Z" });
+  assert.strictEqual(kept[0].state, "running");
+});
+
+test("reconcileRuns: a long run STILL WRITING to its log is alive however old it is", () => {
+  // The backstop must not close a legitimately long dispatch: doing so would
+  // both lie in the record and drop the run out of activeRuns, releasing the
+  // same-machine guard that stops a second agent launching into its worktree.
+  // Freshness — not age — is what separates a working run from a recycled pid.
+  const home = scratch("spor-runs-store-");
+  const rec = supervisedRecord(home, "sup-longhaul", { runner_pid: process.pid });
+  fs.mkdirSync(path.dirname(rec.log_path), { recursive: true });
+  fs.writeFileSync(rec.log_path, JSON.stringify({ type: "item.completed" }) + "\n");
+  // Two days into the run, but it wrote an hour ago.
+  const anHourBefore = Date.parse("2026-07-20T09:00:00.000Z") / 1000;
+  fs.utimesSync(rec.log_path, anHourBefore, anHourBefore);
+  const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-20T10:00:00.000Z" });
+  assert.strictEqual(out[0].state, "running", "a run that is still producing output is never closed");
+  assert.strictEqual(runner.lastActivityAt(rec), anHourBefore * 1000);
+});
+
+test("finalizeSupervisedRun: only the log's TAIL is evidence — a recovered mid-run error is not the cause of death", () => {
+  // An agent that hit a rate limit hours and thousands of events earlier and
+  // carried on did not die of it; filing that as the reason sends a real crash
+  // to the wrong triage (and a credit-dead run must still BE classified, which
+  // is why the window is wider than transcriptOutcome's 5 filtered records).
+  const home = scratch("spor-runs-store-");
+  const rec = supervisedRecord(home, "sup-recovered", { runner_pid: deadPid() });
+  fs.mkdirSync(path.dirname(rec.log_path), { recursive: true });
+  fs.writeFileSync(rec.log_path, [
+    JSON.stringify({ type: "error", message: "rate_limit_error — retrying" }),
+    ...Array.from({ length: 40 }, (_, i) => JSON.stringify({ type: "item.completed", n: i })),
+  ].join("\n") + "\n");
+  const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:10:00.000Z" });
+  assert.strictEqual(out[0].state, "vanished", "an unexplained death stays unexplained");
+  assert.strictEqual(out[0].termination_signal, "supervisor-gone");
+  // …but a signal near the end still survives a trailing stack trace and summary.
+  const dead = scratch("spor-runs-store-");
+  const late = supervisedRecord(dead, "sup-late-signal", { runner_pid: deadPid() });
+  fs.mkdirSync(path.dirname(late.log_path), { recursive: true });
+  fs.writeFileSync(late.log_path, [
+    ...Array.from({ length: 40 }, (_, i) => JSON.stringify({ type: "item.completed", n: i })),
+    "stream error: your credit balance is too low",
+    ...Array.from({ length: 8 }, (_, i) => `    at frame ${i} (codex.js:${i})`),
+    JSON.stringify({ type: "turn.failed" }),
+  ].join("\n") + "\n");
+  const closed = runner.reconcileRuns(dead, { agents: [], now: () => "2026-07-18T10:10:00.000Z" });
+  assert.strictEqual(closed[0].termination_signal, "credit-exhausted");
+  assert.strictEqual(runner.lastLines("a\n\nb\nc\n", 2), "b\nc");
+});
+
+test("closeRun: stamps an open record and refuses to overwrite one already terminal", () => {
+  const home = scratch("spor-runs-store-");
+  const p = runner.runPaths(home, "sup-close");
+  supervisedRecord(home, "sup-close", { state: "launching" });
+  const closed = runner.closeRun(p.record, runner.launchFailure("the supervisor never came up", "supervisor-spawn-failed", () => "2026-07-18T10:00:01.000Z"));
+  assert.strictEqual(closed.state, "failed_launch");
+  assert.strictEqual(closed.termination_signal, "supervisor-spawn-failed");
+  assert.strictEqual(closed.error, "the supervisor never came up");
+  // A supervisor that finalized between the read and the write keeps its own
+  // observed outcome.
+  runner.closeRun(p.record, runner.launchFailure("racing loser", "supervisor-exited-early"));
+  assert.strictEqual(runRecords(home)[0].termination_signal, "supervisor-spawn-failed");
+  // …and a state that moved on underneath the caller invalidates its verdict: a
+  // record now `running` did NOT fail to launch.
+  const moved = scratch("spor-runs-store-");
+  supervisedRecord(moved, "sup-moved", { state: "running" });
+  const unchanged = runner.closeRun(runner.runPaths(moved, "sup-moved").record, runner.launchFailure("never came up"), "launching");
+  assert.strictEqual(unchanged.state, "running");
+  assert.strictEqual(runRecords(moved)[0].state, "running", "nothing was written");
+  assert.strictEqual(runner.closeRun(path.join(home, "journal", "dispatch", "nope.run.json"), { state: "done" }), null);
 });
 
 test("pruneRuns: ages out terminal records only — an unresolved run is never swept", () => {
@@ -400,6 +622,27 @@ test("spor runs: a launched agent that left no transcript ends up queryable as v
   assert.match(r.stdout, /vanished — unknown\/session-unbound/);
   assert.match(r.stdout, /why: {8}the run never bound a session/);
   assert.strictEqual(runRecords(home)[0].state, "vanished", "the outcome is durable, not just printed");
+});
+
+test("spor runs --json: 'reconciled' is false only when a NATIVE run was actually left unresolved", () => {
+  // A Codex-only box has no `claude` to enumerate, and supervised runs never
+  // needed that listing — reporting reconciled:false there would tell a caller
+  // to distrust states that were in fact just resolved.
+  const home = scratch("spor-runs-store-");
+  supervisedRecord(home, "sup-only", { runner_pid: deadPid() });
+  // Unparseable agent output is the "could not ask at all" case (enumerated: false).
+  const blind = { SPOR_HOME: home, SPOR_FAKE_AGENTS_JSON: "not json" };
+  const supervisedOnly = JSON.parse(cli(["runs", "--json"], blind).stdout);
+  assert.strictEqual(supervisedOnly.reconciled, true, "nothing was left unresolved");
+  assert.strictEqual(supervisedOnly.runs[0].state, "vanished");
+
+  // Add a non-terminal NATIVE run: now the failed listing really does leave
+  // something unresolved, and the caller must be told.
+  const native = runner.beginNativeRun(home, { harness: "claude-code", name: "n", nodeId: "issue-n", cwd: "/tmp/nope", now: () => "2026-07-18T10:00:00.000Z" });
+  runner.updateRun(native, { state: "running" });
+  const withNative = cli(["runs", "--json"], blind);
+  assert.strictEqual(JSON.parse(withNative.stdout).reconciled, false);
+  assert.match(cli(["runs"], blind).stderr, /native run states may be stale/);
 });
 
 test("spor runs: an agent the harness still lists as 'done' does not hold its run open", () => {

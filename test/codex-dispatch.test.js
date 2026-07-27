@@ -117,6 +117,14 @@ async function waitFor(read, { timeoutMs = 5000, intervalMs = 25 } = {}) {
   return null;
 }
 
+// The detached stub writes this file WHILE we poll for it, so a torn read is
+// expected under load — retry instead of failing the test on partial JSON.
+function awaitJson(file) {
+  return waitFor(() => {
+    try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; }
+  });
+}
+
 test("dispatch harness registry exposes one uniform adapter contract", () => {
   assert.deepStrictEqual(harnesses().map((adapter) => adapter.id), ["claude-code", "codex"]);
   for (const adapter of harnesses()) {
@@ -157,7 +165,7 @@ test("Codex adapter launches detached, captures JSONL session, prompt, cwd, and 
   assert.ok(Date.now() - started < 2000, "dispatch returns after the launch handshake");
   assert.match(result.stdout, /Codex supervisor (running|done)/);
 
-  const invocation = await waitFor(() => fs.existsSync(outfile) && JSON.parse(fs.readFileSync(outfile, "utf8")));
+  const invocation = await awaitJson(outfile);
   assert.ok(invocation, "the detached stub ran");
   assert.strictEqual(invocation.cwd, repo);
   assert.deepStrictEqual(invocation.args.slice(0, 6), [
@@ -183,6 +191,51 @@ test("Codex adapter launches detached, captures JSONL session, prompt, cwd, and 
   assert.strictEqual(finished.session_id, "codex-thread-fixture");
   assert.strictEqual(finished.exit_code, 0);
   assert.strictEqual(fs.readFileSync(finished.report_path, "utf8"), "stub final report\n");
+});
+
+test("a supervised run whose supervisor is KILLED mid-run is reconciled to a terminal state by 'spor runs'", async () => {
+  // issue-spor-dispatch-supervised-runs-never-reconciled: the supervisor is
+  // detached, so if it dies before finalizing, nothing else ever stamps the
+  // record — the run reported `running` forever. SIGKILL is the real shape of
+  // that crash: no chance to write anything.
+  const { home, repo } = fixture();
+  const stub = codexStub(home, { delayMs: 30000 });
+  const result = run(
+    ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--no-brief"],
+    { SPOR_HOME: home, SPOR_CODEX_CMD: stub, OUTFILE: path.join(home, "codex-killed.json") }
+  );
+  assert.strictEqual(result.status, 0, result.stderr);
+
+  const runDir = path.join(home, "journal", "dispatch");
+  const recordPath = await waitFor(() => {
+    const file = fs.existsSync(runDir) && fs.readdirSync(runDir).find((f) => f.endsWith(".run.json"));
+    if (!file) return null;
+    const record = JSON.parse(fs.readFileSync(path.join(runDir, file), "utf8"));
+    return record.state === "running" && record.runner_pid && record.child_pid ? path.join(runDir, file) : null;
+  });
+  assert.ok(recordPath, "the supervisor reported its child running");
+  const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  for (const pid of [record.runner_pid, record.child_pid]) {
+    try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+  }
+  const gone = await waitFor(() => {
+    try { process.kill(record.runner_pid, 0); return null; } catch { return true; }
+  });
+  assert.ok(gone, "the supervisor is really dead before reconciliation is asked about it");
+  // Age it past the registration grace window — the supervisor is normally given
+  // a beat to report before absence counts as death.
+  fs.writeFileSync(recordPath, JSON.stringify({ ...record, created_at: "2026-07-18T10:00:00.000Z" }, null, 2) + "\n");
+
+  const shown = run(["runs", "--json"], { SPOR_HOME: home });
+  assert.strictEqual(shown.status, 0, shown.stderr);
+  const reconciled = JSON.parse(shown.stdout).runs[0];
+  assert.strictEqual(reconciled.state, "vanished");
+  assert.strictEqual(reconciled.termination_signal, "supervisor-gone");
+  assert.match(reconciled.termination_reason, /never recorded an outcome/);
+  assert.strictEqual(
+    JSON.parse(fs.readFileSync(recordPath, "utf8")).state, "vanished",
+    "and the terminal outcome is durable, not just printed"
+  );
 });
 
 test("Codex adapter rejects Claude-only options before launch", () => {
@@ -255,7 +308,7 @@ test("remote Codex dispatch binds the thread, renews the lease, and keeps its be
       }
     );
     assert.strictEqual(result.status, 0, result.stderr);
-    const invocation = await waitFor(() => fs.existsSync(outfile) && JSON.parse(fs.readFileSync(outfile, "utf8")));
+    const invocation = await awaitJson(outfile);
     assert.strictEqual(invocation.sporToken, "agent-secret-token");
     assert.strictEqual(invocation.substrateToken, "agent-secret-token");
     assert.strictEqual(invocation.mcpToken, "agent-secret-token");

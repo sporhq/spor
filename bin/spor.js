@@ -7330,22 +7330,45 @@ async function launchSupervisedHarness(cfg, {
     if (state && state.state !== "launching") return { ok: true, state, runId, paths: p };
     await sleep(50);
   }
-  if (spawnError) {
+  // The record is already open at `launching`, and a supervisor that never
+  // started will never close it — so the launcher closes it here, or the run
+  // reads as live until reconciliation ages it out
+  // (issue-spor-dispatch-supervised-runs-never-reconciled).
+  const abandon = (signal, reason, error = reason) => {
     for (const f of [p.job, p.prompt]) try { fs.unlinkSync(f); } catch {}
-    return { ok: false, error: spawnError.message, runId, paths: p };
+    dispatchRuns.closeRun(p.record, dispatchRuns.launchFailure(reason, signal), "launching");
+    return { ok: false, error, runId, paths: p };
+  };
+  if (spawnError) {
+    // The caller's message keeps the bare spawn error it always reported; the
+    // record keeps the self-contained sentence, since nothing else explains it.
+    return abandon("supervisor-spawn-failed", `the ${adapter.label} supervisor could not be started: ${spawnError.message}`, spawnError.message);
   }
   const state = dispatchRuns.readJson(p.record) || record;
+  // The supervisor came up but is already gone with nothing recorded — it died
+  // before it could report either the child starting or its own launch failure.
+  // `child.exitCode`/`signalCode` are the honest test: a detached child stays
+  // reaped-and-tracked by this process, so a bare pid probe would read a zombie
+  // as alive.
+  if (state.state === "launching" && child && (child.exitCode !== null || child.signalCode !== null)) {
+    const how = child.signalCode ? `on ${child.signalCode}` : `with code ${child.exitCode}`;
+    return abandon("supervisor-exited-early", `the ${adapter.label} supervisor exited ${how} before reporting its child started`);
+  }
   return { ok: true, state, runId, paths: p };
 }
 
 // --- spor runs (inc-spor-dispatch-session-vanished-2026-07-18) --------------
 // The queryable terminal record for dispatched runs. Reading it RECONCILES
-// first: a native-background run's exit is invisible to the launcher, so its
-// outcome is derived here from the harness's live-agent list plus the run's own
-// transcript, and written back — after which the run has a durable terminal
+// first: a dispatched run's ending is invisible to the launcher, so its outcome
+// is derived here — a native-background run from the harness's live-agent list
+// plus its own transcript, a supervised one from its supervisor process plus
+// its own log — and written back, after which the run has a durable terminal
 // state, a classification, a reason, and a diagnostic pointer, whatever
 // happened to it. No LLM and no network: a live-agent listing, a directory
-// read, and a bounded transcript tail.
+// read, a pid probe, and a bounded file tail.
+//
+// Only the live-agent listing can fail, and it is only the native path's
+// evidence — hence `enumerated` gating that path alone.
 function cmdRuns(cfg, { values, positionals: pos }) {
   const home = cfg.userConfigHome();
   let enumerated = false;
@@ -7361,17 +7384,24 @@ function cmdRuns(cfg, { values, positionals: pos }) {
     for (const a of e.agents) if (a && a.kind === "background" && a.state !== "done") agents.push(a);
   }
   const records = dispatchRuns.reconcileRuns(home, { agents, enumerated });
+  // `reconciled` is the honest claim "every run here was resolved against live
+  // evidence". A failed agent listing only strands NATIVE runs, and only if any
+  // non-terminal one exists — supervised runs never needed that listing, so a
+  // Codex-only box reports reconciled even with no `claude` to enumerate.
+  const nativeStale = !enumerated && records.some(
+    (r) => r.launch_mode === "native-background" && !dispatchRuns.TERMINAL_STATES.has(r.state)
+  );
   const limit = Math.max(1, parseInt(values.limit, 10) || 20); // a bad --limit falls back to the default, never to 1
   const runs = dispatchRuns.listRuns(home, { records, node: values.node || null, runId: pos[0] || null, limit });
   if (values.json) {
-    out(JSON.stringify({ reconciled: enumerated, count: runs.length, runs }, null, 2));
+    out(JSON.stringify({ reconciled: !nativeStale, count: runs.length, runs }, null, 2));
     return 0;
   }
   if (!runs.length) {
     out("no dispatch runs recorded" + (values.node || pos[0] ? " for that filter" : "") + ".");
     return 0;
   }
-  if (!enumerated) err("note: could not list live background agents — run states may be stale (nothing was reconciled).");
+  if (nativeStale) err("note: could not list live background agents — native run states may be stale (they were not reconciled).");
   for (const r of runs) {
     const cls = r.termination_class ? ` — ${r.termination_class}${r.termination_signal ? `/${r.termination_signal}` : ""}` : "";
     out(`${r.run_id.slice(0, 8)}  ${r.state}${cls}  ${r.node_id || r.name || "(free-text)"}  ${r.harness}  ${r.created_at || ""}`);
