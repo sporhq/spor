@@ -19,7 +19,7 @@ const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 const zlib = require("node:zlib");
-const { spawn } = require("node:child_process");
+const { spawn, execFileSync } = require("node:child_process");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const tar = require("../lib/tar.js");
@@ -300,4 +300,121 @@ test("tar.extract over a gunzipped export equals the plain export", () => {
   const { buffer } = tar.exportNodesDir(nodes);
   const round = tar.extract(zlib.gunzipSync(zlib.gzipSync(buffer)));
   assert.strictEqual(round.length, 4);
+});
+
+// ---------------- lib/tar.js: ustar prefix split for long node ids (task-spor-client-tar-ustar-limit-check) ----------------
+//
+// lib/tar.js had the SAME hand-rolled-ustar bug the server fixed in ca04032
+// (issue-spor-server-export-ustar-limit): a `nodes/<id>.md` path over the
+// 100-byte name field was silently skipped, surfacing only a count. Ported the
+// same fix — split at a "/" boundary into the ustar `prefix` (<=155 bytes) +
+// `name` (<=100 bytes) fields — so a local export rescues the same long ids
+// the server now does, and stays byte-for-byte interchangeable with it
+// (norm-spor-cli-mode-parity).
+
+// The pre-fix tarHeader wrote only the 100-byte name field and never touched
+// the prefix region — reproduced here so the new tarHeader can be asserted
+// BYTE-IDENTICAL to it for every short path.
+function legacyTarHeader(name, size, mtime) {
+  const buf = Buffer.alloc(512);
+  buf.write(name, 0, 100, "utf8");
+  buf.write("0000644\0", 100);
+  buf.write("0000000\0", 108);
+  buf.write("0000000\0", 116);
+  buf.write(size.toString(8).padStart(11, "0") + "\0", 124);
+  buf.write(mtime.toString(8).padStart(11, "0") + "\0", 136);
+  buf.write("        ", 148);
+  buf.write("0", 156);
+  buf.write("ustar\0", 257);
+  buf.write("00", 263);
+  let sum = 0;
+  for (const b of buf) sum += b;
+  buf.write(sum.toString(8).padStart(6, "0") + "\0 ", 148);
+  return buf;
+}
+
+test("tar.tarHeader is byte-identical to the pre-fix writer for ordinary short paths", () => {
+  for (const name of ["nodes/dec-new-thing.md", "nodes/issue-agent-origin.md"]) {
+    assert.deepEqual(tar.tarHeader(name, 123, 1750000000), legacyTarHeader(name, 123, 1750000000), name);
+  }
+});
+
+test("tar.splitUstarName splits a long path at the nodes/ boundary, and reports null when unsplittable", () => {
+  assert.deepEqual(tar.splitUstarName("nodes/short-id.md"), { prefix: "", name: "nodes/short-id.md" });
+  const longButSplittable = `nodes/${"z".repeat(96)}.md`; // 105 bytes total, but 99 once "nodes/" is split off
+  assert.deepEqual(tar.splitUstarName(longButSplittable), { prefix: "nodes", name: `${"z".repeat(96)}.md` });
+  const unsplittable = `nodes/${"z".repeat(150)}.md`; // over 100 bytes even after the "nodes/" split
+  assert.equal(tar.splitUstarName(unsplittable), null);
+  // A leading "/" is never a usable split point (an empty prefix means "no
+  // prefix used" on reconstruction, not a real empty-string component) and
+  // must terminate rather than loop forever re-finding index 0.
+  assert.equal(tar.splitUstarName(`/${"z".repeat(150)}.md`), null);
+});
+
+// The regression test the task calls for: a long id round-trips through a
+// REAL `tar` binary, not just our own extract().
+test("export (local): a long node id survives the ustar prefix split through a real tar binary", () => {
+  const home = freshHome();
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const longId = `issue-${"z".repeat(90)}`; // "nodes/<id>.md" is 105 bytes: over 100, but splittable
+  const body = `---
+id: ${longId}
+type: issue
+project: demo
+title: A gardener-style finding with a long generated id
+summary: Exercises the ustar prefix split for a path over the 100-byte name field.
+status: open
+date: 2026-07-27
+---
+
+Body for the long-id export test.
+`;
+  fs.writeFileSync(path.join(nodes, `${longId}.md`), body);
+
+  const exported = tar.exportNodesDir(nodes);
+  assert.strictEqual(exported.skipped, 0, "the long id must be rescued, not skipped");
+  assert.strictEqual(exported.count, 1);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-tar-longid-"));
+  try {
+    const tarPath = path.join(dir, "export.tar");
+    fs.writeFileSync(tarPath, exported.buffer);
+    execFileSync("tar", ["-xf", tarPath, "-C", dir]);
+    const extracted = fs.readFileSync(path.join(dir, "nodes", `${longId}.md`), "utf8");
+    assert.strictEqual(extracted, body, "real tar reconstructs the full path and content byte-for-byte");
+
+    // Our own extract() must agree with what real tar produced: the prefix
+    // field is rejoined into the full name, not just the truncated 100-byte
+    // field.
+    const entries = tar.extract(exported.buffer);
+    assert.strictEqual(entries.length, 1);
+    assert.strictEqual(entries[0].name, `nodes/${longId}.md`);
+    assert.strictEqual(entries[0].data.toString("utf8"), body);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("export (local): a pathologically long id with no viable split is still skipped (never corrupted)", () => {
+  const home = freshHome();
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const unsplittableId = `issue-${"z".repeat(150)}`; // "<id>.md" alone is already over 100 bytes
+  fs.writeFileSync(path.join(nodes, `${unsplittableId}.md`), `---
+id: ${unsplittableId}
+type: issue
+summary: A pathologically long id that ustar cannot represent.
+status: open
+---
+
+Body.
+`);
+  fs.writeFileSync(path.join(nodes, "dec-a.md"), "---\nid: dec-a\ntype: decision\nsummary: A decision.\n---\nBody.\n");
+
+  const exported = tar.exportNodesDir(nodes);
+  assert.strictEqual(exported.skipped, 1);
+  assert.strictEqual(exported.count, 1, "the representable node still exports");
+  const entries = tar.extract(exported.buffer);
+  assert.deepStrictEqual(entries.map((e) => e.name), ["nodes/dec-a.md"]);
 });
