@@ -263,7 +263,16 @@ For each chosen item:
   - **Undecided forks** — the body names, or implies, an "X vs Y" the item
     hasn't settled — the same shape as a question, just not yet filed as one.
   - **Missing acceptance criteria** — the summary says what to build but gives
-    no way to tell a cold-start agent "you're done when…".
+    no way to tell a cold-start agent "you're done when…". For a spor-docs
+    (public docs) target that calls for a worked example, never phrase it as
+    "copied from a real node" alone — a literal-minded agent will paste real
+    ids, and that directly conflicts with spor-docs' boundary lint
+    (`scripts/check-boundary.sh` / `boundary-denylist.txt`, CI-enforced),
+    which rejects real graph identifiers in public docs. Say what's actually
+    meant: copy the *shape* (frontmatter keys, edge types, field set) from a
+    real node, then render it with the docs site's fictional example
+    identities (the tidefall scenario) — grounded in something real without
+    leaking a real id (task-spor-docs-mirroring-acceptance-phrasing).
   - **Missing or unsatisfiable `requires`/profile** — no `requires:` risk-class
     list declared (GRAPH.md "The `requires:` risk-class register"), or the item
     names/needs a profile no machine here can currently satisfy
