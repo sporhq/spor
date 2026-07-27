@@ -7384,15 +7384,18 @@ function cmdRuns(cfg, { values, positionals: pos }) {
     for (const a of e.agents) if (a && a.kind === "background" && a.state !== "done") agents.push(a);
   }
   const records = dispatchRuns.reconcileRuns(home, { agents, enumerated });
-  // `reconciled` is the honest claim "every run here was resolved against live
-  // evidence". A failed agent listing only strands NATIVE runs, and only if any
-  // non-terminal one exists — supervised runs never needed that listing, so a
-  // Codex-only box reports reconciled even with no `claude` to enumerate.
-  const nativeStale = !enumerated && records.some(
-    (r) => r.launch_mode === "native-background" && !dispatchRuns.TERMINAL_STATES.has(r.state)
-  );
   const limit = Math.max(1, parseInt(values.limit, 10) || 20); // a bad --limit falls back to the default, never to 1
   const runs = dispatchRuns.listRuns(home, { records, node: values.node || null, runId: pos[0] || null, limit });
+  // `reconciled` is the honest claim "every run here was resolved against live
+  // evidence" — HERE meaning the runs THIS CALL is actually returning, so a
+  // `--node`/runId-filtered query is judged only by what it shows, not by an
+  // unrelated stale native run elsewhere in the store that isn't even in `runs`.
+  // A failed agent listing only strands NATIVE runs, and only if any non-terminal
+  // one is among the ones shown — supervised runs never needed that listing, so
+  // a Codex-only box reports reconciled even with no `claude` to enumerate.
+  const nativeStale = !enumerated && runs.some(
+    (r) => r.launch_mode === "native-background" && !dispatchRuns.TERMINAL_STATES.has(r.state)
+  );
   if (values.json) {
     out(JSON.stringify({ reconciled: !nativeStale, count: runs.length, runs }, null, 2));
     return 0;
