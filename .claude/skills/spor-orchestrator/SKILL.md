@@ -70,17 +70,47 @@ node id, compiles the briefing into the agent's prompt, and launches a
 ## Local-dev posture (deliberate, not portable)
 
 This skill's live location is `~/.claude/skills/spor-orchestrator/`; this
-directory in the repo is the versioned source of truth. Keep them in sync by
-pointing the live location at this one:
+directory in the repo is the versioned source of truth. Make the live location a
+**symlink** to this one, so there is only ever one copy to edit:
 
 ```bash
-rm -rf ~/.claude/skills/spor-orchestrator
-ln -s <repo>/.claude/skills/spor-orchestrator ~/.claude/skills/spor-orchestrator
+cd <repo> && .claude/skills/spor-orchestrator/scripts/link-live-skill.sh   # dry run
+cd <repo> && .claude/skills/spor-orchestrator/scripts/link-live-skill.sh --apply
 ```
 
-Run that once (after this change first lands, or on a fresh machine); after
-that, edit the repo copy and the symlink picks it up immediately — never
-hand-edit the live copy directly, or the two diverge again.
+Unlike every other script here, invoke this one by its **repo** path, not the
+`~/.claude/skills/spor-orchestrator/...` path used elsewhere in this file:
+before the link exists those are two different directories, and running the live
+copy would ask it to replace itself. (It detects that and refuses, but the repo
+path is the one that works.) Run it once — after this change first lands, or on
+a fresh machine; it is idempotent, so re-running later is a cheap `IN-SYNC`
+check. After that, edit the repo copy and the symlink picks it up immediately —
+never hand-edit the live copy directly, or the two diverge again.
+
+The script exists because the naive `rm -rf` + `ln -s` it replaces is only safe
+by luck. It refuses, rather than guessing, when either precondition is missing:
+
+- **The live directory's content differs from the repo copy.** That difference
+  may be un-upstreamed hand-edits, and linking deletes them. Reconcile them into
+  the repo copy first (`diff -rq`, then edit the repo side), then re-run. It
+  also always keeps a timestamped backup of any real directory it replaces —
+  under `~/.claude/`, never inside `~/.claude/skills/`, since a copy left there
+  is a second skill directory declaring the same name.
+- **A fleet is up.** `scripts/watch-fleet.sh` and `scripts/fleet-status.sh` are
+  load-bearing while agents are running, and their behavior is not identical
+  across versions — do the swap after the run drains. (A dispatched agent
+  running the script does not count itself.)
+
+The two refusals override **separately** — `--force-diverged` and
+`--force-fleet` (`--force` is both) — because forcing past a fleet that you know
+is finishing must not silently switch off the guard standing between
+un-upstreamed hand-edits and deletion.
+
+It also refuses to link the live path at a **worktree** copy of the repo: a
+worktree is removed after its merge (`references/merge.md` step 7), which would
+leave the orchestrator's own skill a dangling symlink. Run it from the shared
+checkout.
+
 (`spor-orchestrator-workspace/`, if present alongside the live skill
 directory, is scratch/snapshot space from past editing sessions — it is not
 part of the versioned skill and stays local.)
