@@ -375,19 +375,36 @@ async function claimNudge({ graph, slug, session, cwd, remote }) {
   // owner-exclusive but NOT heartbeated, so it suppresses without renewing.
   const held = myItems.filter((i) => i && i.lease_state && i.id);
   if (held.length > 0) {
-    for (const i of held.filter((x) => x.lease_state === "in_progress")) {
-      await u.curl(`${u.serverBase()}/v1/nodes/${encodeURIComponent(i.id)}/renew`, {
+    // Renewing is one request per held node when there's only one, but a
+    // multi-claim holder used to fan the SAME number of parallel POSTs out on
+    // every single write — the exact burst task-spor-bulk-claim-renew-apis
+    // shipped POST /v1/queue/renew to eliminate. Batch to one round-trip once
+    // there's more than one node to renew; the explicit `ids` arm renews
+    // exactly this working set and forwards `session` unchanged, same contract
+    // as the singular door (server/leases.js renewAll).
+    const inProgress = held.filter((x) => x.lease_state === "in_progress");
+    if (inProgress.length > 1) {
+      await u.curl(`${u.serverBase()}/v1/queue/renew`, {
         method: "POST",
         headers: { ...u.bearer(), "content-type": "application/json" },
-        body: JSON.stringify({ session }),
+        body: JSON.stringify({ ids: inProgress.map((x) => x.id), session }),
         timeoutMs,
       }).catch(() => null);
+    } else {
+      for (const i of inProgress) {
+        await u.curl(`${u.serverBase()}/v1/nodes/${encodeURIComponent(i.id)}/renew`, {
+          method: "POST",
+          headers: { ...u.bearer(), "content-type": "application/json" },
+          body: JSON.stringify({ session }),
+          timeoutMs,
+        }).catch(() => null);
+      }
     }
     // Journal the heartbeat so the operability log can correlate write-activity
     // to renewals; best-effort.
     u.appendLine(
       path.join(graph, "journal", `${session}.jsonl`),
-      JSON.stringify({ ts: u.jqNow(), project: slug, tool: "claim-heartbeat", renewed: held.filter((x) => x.lease_state === "in_progress").map((x) => x.id) })
+      JSON.stringify({ ts: u.jqNow(), project: slug, tool: "claim-heartbeat", renewed: inProgress.map((x) => x.id) })
     );
     return null; // holds a claim -> never nudge
   }

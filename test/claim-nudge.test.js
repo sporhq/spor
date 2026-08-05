@@ -71,6 +71,14 @@ function stubServer(queueFor) {
         res.end(JSON.stringify({ ok: true, status: 'renewed' }));
         return;
       }
+      if (req.method === 'POST' && req.url === '/v1/queue/renew') {
+        const ids = (() => {
+          try { return JSON.parse(body).ids || []; } catch { return []; }
+        })();
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, status: 'renewed', count: ids.length, renewed: ids, leases: [], failed: [] }));
+        return;
+      }
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end('{}');
     });
@@ -182,6 +190,35 @@ test('live claim held by this person -> renew (heartbeat) fires, no nudge', asyn
     assert.deepStrictEqual(hb[0].renewed, ['task-mine']);
     // no cooldown file (the nudge branch was never reached)
     assert.ok(!fs.existsSync(path.join(home, 'journal', 's1.claim-nudged')));
+  } finally {
+    srv.close();
+  }
+});
+
+test('multiple live claims held -> one batched POST /v1/queue/renew, not N single renews', async () => {
+  const { home, cwd } = scratch();
+  const { srv, hits, base } = await stubServer((url) =>
+    isAssigneeMe(url)
+      ? { items: [
+          { id: 'task-mine', title: 'Mine', lease_state: 'in_progress', lease_by: 'person-t' },
+          { id: 'task-mine-2', title: 'Mine 2', lease_state: 'in_progress', lease_by: 'person-t' },
+        ] }
+      : { items: [{ id: 'task-alpha', title: 'Alpha' }] }
+  );
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    const out = await runAsync(['post-tool', '--host', 'claude-code'], editPayload(cwd), env);
+    assert.strictEqual(out.trim(), '', 'a held-claim write must not nudge');
+    // exactly one batched renew, no per-node renews
+    const bulk = hits.filter((h) => h.method === 'POST' && h.url === '/v1/queue/renew');
+    assert.strictEqual(bulk.length, 1, `expected exactly one bulk renew; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`);
+    assert.deepStrictEqual(JSON.parse(bulk[0].body), { ids: ['task-mine', 'task-mine-2'], session: 's1' });
+    assert.ok(!hits.some((h) => h.method === 'POST' && /^\/v1\/nodes\//.test(h.url)), 'no per-node renew fired alongside the batch');
+    // no claim-nudge journaled; a claim-heartbeat line names both nodes
+    assert.strictEqual(journal(home).filter((e) => e.tool === 'claim-nudge').length, 0);
+    const hb = journal(home).filter((e) => e.tool === 'claim-heartbeat');
+    assert.strictEqual(hb.length, 1);
+    assert.deepStrictEqual(hb[0].renewed, ['task-mine', 'task-mine-2']);
   } finally {
     srv.close();
   }
