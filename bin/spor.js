@@ -3305,6 +3305,100 @@ function rewriteStatus(raw, value) {
   return `---\n${fm}\nstatus: ${value}\n---\n${body}`;
 }
 
+// --- resolve-time ancestry warning (task-spor-client-resolve-time-ancestry-
+// gate) --------------------------------------------------------------------
+// The client-side twin of dec-spor-merge-verification-lands-server-side-as-a-
+// gardener-check's set_status warning: that warning is a no-op wherever the
+// SERVER has no checkout mapped (SPOR_REPOS empty — the hosted tenant every
+// fleet agent's `spor set-status` writes to), but the CLIENT is always
+// running from inside a checkout. Same warn-never-block, third-state-oracle
+// posture, scoped down to just this node's own `commits:` stamps (no
+// resolver fan-out — the server sweep already covers that ground) and the
+// `dispatch.repos` map (the client's SPOR_REPOS) instead of a server-side
+// checkout.
+//
+// This exact 4-value set — not the broader registry terminal-status union
+// resolution.js's terminalStatuses() computes — is deliberate, mirroring the
+// server's lib-engine/kernel/merge-verify.js COMPLETION_STATUSES byte for
+// byte: a merge claim is only implied by done/resolved/completed/merged.
+// rejected/abandoned are absent because dropped work has no obligation to
+// have landed anywhere; a type-scoped completion word like decision's
+// `settled` or artifact's `released` is deliberately NOT a merge claim
+// either — same reasoning, kept in lockstep with the server twin rather than
+// independently derived from the registry.
+const ANCESTRY_COMPLETION_STATUSES = new Set(["done", "resolved", "completed", "merged"]);
+const ANCESTRY_TRUNK_REFS = ["main", "master", "origin/main", "origin/master"];
+
+// `git -C <dir> <args>` -> ok (exit 0) | not-ok (any other exit, a spawn
+// failure, or the timeout firing) — never throws.
+function gitProbeOk(dir, args) {
+  const r = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", timeout: 5000 });
+  return !r.error && r.status === 0;
+}
+
+// isLandedLocally(dir, sha) -> {known, landed} — the same third state as the
+// server's makeAncestryOracle: known:false means unverifiable (sha absent
+// from the checkout, no trunk ref resolves, or git errored) and must never
+// be read as "unlanded"; only known:true, landed:false is evidence-backed.
+function isLandedLocally(dir, sha) {
+  if (!gitProbeOk(dir, ["rev-parse", "--verify", "--quiet", `${sha}^{commit}`])) return { known: false, landed: null };
+  const trunks = ANCESTRY_TRUNK_REFS.filter((ref) => gitProbeOk(dir, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]));
+  if (!trunks.length) return { known: false, landed: null };
+  const answered = [];
+  for (const ref of trunks) {
+    const r = spawnSync("git", ["-C", dir, "merge-base", "--is-ancestor", sha, ref], { encoding: "utf8", timeout: 5000 });
+    if (!r.error && r.status === 0) return { known: true, landed: true };
+    if (!r.error && r.status === 1) { answered.push(ref); continue; }
+    return { known: false, landed: null }; // an errored trunk could be the one that says yes
+  }
+  return { known: true, landed: false };
+}
+
+// resolveAncestryWarning(cfg, id, status, commits) -> string|null. Advisory
+// only, silent (never an error) on anything unverifiable: a non-completion
+// status, no commits: stamps, a malformed stamp, an unmapped repo, or an
+// unreadable checkout. Only a definitive "known and not landed" ever warns.
+function resolveAncestryWarning(cfg, id, status, commits) {
+  if (!ANCESTRY_COMPLETION_STATUSES.has(String(status || "").trim().toLowerCase())) return null;
+  const stamps = Array.isArray(commits) ? commits : [];
+  if (!stamps.length) return null;
+  const unlanded = [];
+  for (const stamp of stamps) {
+    const s = String(stamp);
+    const at = s.indexOf("@");
+    if (at <= 0 || at === s.length - 1) continue; // malformed repo@sha — silent
+    const dir = repoDirForSlug(cfg, s.slice(0, at));
+    if (!dir) continue; // repo not in dispatch.repos — silent
+    const v = isLandedLocally(dir, s.slice(at + 1));
+    if (v.known && v.landed === false) unlanded.push(s);
+  }
+  if (!unlanded.length) return null;
+  const plural = unlanded.length === 1 ? "" : "s";
+  return `${id} is now ${status}, but ${unlanded.length} commit${plural} it rests on ` +
+    `(${unlanded.join(", ")}) ${unlanded.length === 1 ? "is" : "are"} on no trunk branch in the ` +
+    `local checkout — the work may still be on an unmerged branch.`;
+}
+
+// Fetch the commits: stamps for `id` for a REMOTE ancestry check. The status
+// POST response carries no node body (API.md: {status, id, revision,
+// warnings}), so this is one extra GET — paid only for a completion status,
+// never for the common in-progress/active case. Fails silently to []: an
+// unreachable server or unparseable body must not turn an advisory check
+// into a broken status write.
+async function fetchCommitsForAncestryCheck(cfg, id) {
+  try {
+    const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 5000 });
+    if (r.transport || !r.ok) return [];
+    const raw = r.json && r.json.raw;
+    if (typeof raw !== "string") return [];
+    const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+    const node = graphLib.parseFrontmatter(raw, `${id}.md`);
+    return Array.isArray(node.commits) ? node.commits : [];
+  } catch {
+    return [];
+  }
+}
+
 async function cmdSetStatus(cfg, { positionals }) {
   const id = positionals[0];
   const rawStatus = positionals[1];
@@ -3339,6 +3433,15 @@ async function cmdSetStatus(cfg, { positionals }) {
     if (lease) {
       if (lease.error) err(`  note: not claimed (${lease.error}${lease.holder ? `, held by ${lease.holder}` : ""})`);
       else out(`  claimed${lease.expires_at ? ` (lease expires ${lease.expires_at})` : ""}`);
+    }
+    if (ANCESTRY_COMPLETION_STATUSES.has(value.toLowerCase())) {
+      try {
+        const commits = await fetchCommitsForAncestryCheck(cfg, id);
+        const warning = resolveAncestryWarning(cfg, id, value, commits);
+        if (warning) err(`  warning: ${warning}`);
+      } catch {
+        // advisory only — a git/network hiccup must not fail a status write that already landed
+      }
     }
     return 0;
   }
@@ -3392,6 +3495,12 @@ async function cmdSetStatus(cfg, { positionals }) {
   }
   fs.writeFileSync(file, newRaw);
   out(`status set: ${id} -> ${value}`);
+  try {
+    const warning = resolveAncestryWarning(cfg, id, value, node.commits);
+    if (warning) err(`  warning: ${warning}`);
+  } catch {
+    // advisory only — a git hiccup must not fail a status write that already landed
+  }
   return 0;
 }
 

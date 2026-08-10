@@ -85,6 +85,54 @@ function validateGraph(nodes) {
 
 const remoteEnv = (base, extra = {}) => bare({ SPOR_SERVER: base, SPOR_TOKEN: "test-token", ...extra });
 
+// A scratch git checkout with a commit ON `main` (landed) and a commit on an
+// unmerged branch left checked out at HEAD (unlanded) — the fixture for the
+// resolve-time ancestry-gate tests below (task-spor-client-resolve-time-
+// ancestry-gate).
+function ancestryRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-sse-ancestry-"));
+  const git = (args) => {
+    const r = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+    assert.strictEqual(r.status, 0, `git ${args.join(" ")} failed: ${r.stderr}`);
+    return r.stdout;
+  };
+  assert.strictEqual(spawnSync("git", ["init", "-q", dir]).status, 0, "git init failed");
+  git(["checkout", "-q", "-b", "main"]);
+  git(["config", "user.email", "t@example.com"]);
+  git(["config", "user.name", "T"]);
+  fs.writeFileSync(path.join(dir, "a.txt"), "a");
+  git(["add", "a.txt"]);
+  git(["commit", "-q", "-m", "landed"]);
+  const landed = git(["rev-parse", "HEAD"]).trim();
+  git(["checkout", "-q", "-b", "feature"]);
+  fs.writeFileSync(path.join(dir, "b.txt"), "b");
+  git(["add", "b.txt"]);
+  git(["commit", "-q", "-m", "unlanded"]);
+  const unlanded = git(["rev-parse", "HEAD"]).trim();
+  assert.notStrictEqual(landed, unlanded, "fixture sanity: distinct commits");
+  assert.match(landed, /^[0-9a-f]{40}$/, "fixture sanity: landed is a real sha");
+  assert.match(unlanded, /^[0-9a-f]{40}$/, "fixture sanity: unlanded is a real sha");
+  return { dir, landed, unlanded };
+}
+
+function writeAncestryTask(nodes, id, commits) {
+  fs.writeFileSync(path.join(nodes, `${id}.md`), `---
+id: ${id}
+type: task
+project: demo
+title: A demo task with commit stamps
+summary: A demo task carrying commits: stamps for the ancestry-gate test.
+date: 2026-06-01
+commits: [${commits.join(", ")}]
+---
+Body about the ancestry task.
+`);
+}
+
+function mapRepo(home, slug, dir) {
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { repos: { [slug]: dir } } }) + "\n");
+}
+
 // ---------------- set-status: local mode ----------------
 
 test("set-status (local) rewrites the status field and validates clean", () => {
@@ -122,6 +170,71 @@ test("set-status (local) with no status exits 1 with usage", () => {
   const r = run(["set-status", "task-x"], { SPOR_HOME: home });
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /usage: spor set-status/);
+});
+
+// ---------------- set-status: resolve-time ancestry gate (local) ----------------
+// task-spor-client-resolve-time-ancestry-gate: the client-side twin of the
+// server's resolve-time merge-verification warning, so the check still fires
+// wherever the server has no checkout mapped (the hosted tenant) — the client
+// always has the one it's running from.
+
+test("set-status (local) stays silent flipping terminal on a LANDED commit", () => {
+  const { home, nodes } = fixtureGraph();
+  const repo = ancestryRepo();
+  writeAncestryTask(nodes, "task-a", [`demo-repo@${repo.landed}`]);
+  mapRepo(home, "demo-repo", repo.dir);
+  const r = run(["set-status", "task-a", "done"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(r.stderr, "");
+});
+
+test("set-status (local) warns flipping terminal on an UNLANDED commit", () => {
+  const { home, nodes } = fixtureGraph();
+  const repo = ancestryRepo();
+  writeAncestryTask(nodes, "task-a", [`demo-repo@${repo.unlanded}`]);
+  mapRepo(home, "demo-repo", repo.dir);
+  const r = run(["set-status", "task-a", "done"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /status set: task-a -> done/);
+  assert.match(r.stderr, new RegExp(`warning:.*task-a is now done.*demo-repo@${repo.unlanded}.*on no trunk branch`));
+});
+
+test("set-status (local) stays silent on a commit whose repo isn't in dispatch.repos", () => {
+  const { home, nodes } = fixtureGraph();
+  const repo = ancestryRepo();
+  writeAncestryTask(nodes, "task-a", [`demo-repo@${repo.unlanded}`]);
+  // no mapRepo() call — the slug is unmapped
+  const r = run(["set-status", "task-a", "done"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(r.stderr, "");
+});
+
+test("set-status (local) stays silent on a malformed commits: stamp", () => {
+  const { home, nodes } = fixtureGraph();
+  const repo = ancestryRepo();
+  writeAncestryTask(nodes, "task-a", ["not-a-valid-stamp"]);
+  mapRepo(home, "demo-repo", repo.dir);
+  const r = run(["set-status", "task-a", "done"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(r.stderr, "");
+});
+
+test("set-status (local) is byte-identical to the pre-gate behavior when no commits: stamps are present", () => {
+  const { home } = fixtureGraph(); // task-x carries no commits: field
+  const r = run(["set-status", "task-x", "done"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(r.stdout, "status set: task-x -> done\n");
+  assert.strictEqual(r.stderr, "");
+});
+
+test("set-status (local) does not run the ancestry check on a non-terminal status", () => {
+  const { home, nodes } = fixtureGraph();
+  const repo = ancestryRepo();
+  writeAncestryTask(nodes, "task-a", [`demo-repo@${repo.unlanded}`]);
+  mapRepo(home, "demo-repo", repo.dir);
+  const r = run(["set-status", "task-a", "active"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(r.stderr, "");
 });
 
 // ---------------- set-status: remote mode ----------------
@@ -219,6 +332,115 @@ test("set-status (remote) fails open against an unreachable server (no stack tra
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /offline/);
   assert.doesNotMatch(r.stderr, /at Object|Error:/);
+});
+
+// ---------------- set-status: resolve-time ancestry gate (remote) ----------------
+// The primary motivating case (task-spor-client-resolve-time-ancestry-gate): the
+// hosted tenant's server has no SPOR_REPOS mapped, so its own warning never
+// fires — but the client is running from inside a real checkout, so it fetches
+// the node's `commits:` stamps with one extra GET and checks them itself.
+
+function ancestryRemoteStub(rawById) {
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      hits.push({ method: req.method, url: req.url, body });
+      const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
+      const sm = req.url.match(/^\/v1\/nodes\/([^/]+)\/status$/);
+      if (sm && req.method === "POST") {
+        return j(200, { status: "updated", id: decodeURIComponent(sm[1]), revision: "abc123", warnings: [] });
+      }
+      const gm = req.url.match(/^\/v1\/nodes\/([^/]+)$/);
+      if (gm && req.method === "GET") {
+        const raw = rawById[decodeURIComponent(gm[1])];
+        if (raw == null) return j(404, { error: { code: "not_found" } });
+        return j(200, { raw, revision: "abc123" });
+      }
+      return j(404, { error: { code: "not_found" } });
+    });
+  });
+  return new Promise((resolve) => srv.listen(0, "127.0.0.1", () => resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
+}
+
+function ancestryRawNode(id, commits) {
+  return `---\nid: ${id}\ntype: task\nproject: demo\ntitle: A demo task\nsummary: A demo task carrying commits: stamps for the remote ancestry-gate test.\ndate: 2026-06-01\ncommits: [${commits.join(", ")}]\n---\nBody.\n`;
+}
+
+test("set-status (remote) warns on an unlanded commit via the client's own checkout (server has no SPOR_REPOS)", async () => {
+  const repo = ancestryRepo();
+  const raw = ancestryRawNode("task-r", [`demo-repo@${repo.unlanded}`]);
+  const { srv, hits, base } = await ancestryRemoteStub({ "task-r": raw });
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-sse-remote-"));
+  mapRepo(home, "demo-repo", repo.dir);
+  try {
+    const r = await runAsync(["set-status", "task-r", "done"], remoteEnv(base, { SPOR_HOME: home }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /status set: task-r -> done/);
+    assert.match(r.stderr, new RegExp(`warning:.*task-r is now done.*demo-repo@${repo.unlanded}.*on no trunk branch`));
+    assert.ok(hits.some((h) => h.method === "GET" && h.url === "/v1/nodes/task-r"), "fetched the node body to read its commits: stamps");
+  } finally {
+    srv.close();
+  }
+});
+
+test("set-status (remote) stays silent flipping terminal on a landed commit", async () => {
+  const repo = ancestryRepo();
+  const raw = ancestryRawNode("task-r", [`demo-repo@${repo.landed}`]);
+  const { srv, base } = await ancestryRemoteStub({ "task-r": raw });
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-sse-remote-"));
+  mapRepo(home, "demo-repo", repo.dir);
+  try {
+    const r = await runAsync(["set-status", "task-r", "done"], remoteEnv(base, { SPOR_HOME: home }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.strictEqual(r.stderr, "");
+  } finally {
+    srv.close();
+  }
+});
+
+test("set-status (remote) is byte-identical to the pre-gate behavior when no commits: stamps are present", async () => {
+  const raw = ancestryRawNode("task-r", []);
+  const { srv, base } = await ancestryRemoteStub({ "task-r": raw });
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-sse-remote-"));
+  try {
+    const r = await runAsync(["set-status", "task-r", "done"], remoteEnv(base, { SPOR_HOME: home }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.strictEqual(r.stdout, "status set: task-r -> done\n");
+    assert.strictEqual(r.stderr, "");
+  } finally {
+    srv.close();
+  }
+});
+
+test("set-status (remote) degrades silently when the extra node-body GET fails", async () => {
+  // ancestryRemoteStub 404s any id it wasn't given a raw body for — the GET
+  // fails, but the status write already succeeded and must not be undone.
+  const { srv, base } = await ancestryRemoteStub({});
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-sse-remote-"));
+  try {
+    const r = await runAsync(["set-status", "task-r", "done"], remoteEnv(base, { SPOR_HOME: home }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /status set: task-r -> done/);
+    assert.strictEqual(r.stderr, "");
+  } finally {
+    srv.close();
+  }
+});
+
+test("set-status (remote) does not fetch the node body on a non-terminal status", async () => {
+  const raw = ancestryRawNode("task-r", ["demo-repo@deadbeef"]);
+  const { srv, hits, base } = await ancestryRemoteStub({ "task-r": raw });
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-sse-remote-"));
+  try {
+    const r = await runAsync(["set-status", "task-r", "active"], remoteEnv(base, { SPOR_HOME: home }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.strictEqual(r.stderr, "");
+    assert.ok(!hits.some((h) => h.method === "GET"), "no extra GET on a non-terminal status");
+  } finally {
+    srv.close();
+  }
 });
 
 // ---------------- edge: local mode ----------------
