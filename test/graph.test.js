@@ -468,6 +468,23 @@ b
   assert.equal(n.status, "open");
 });
 
+test("parseFrontmatter: a comment line inside an edges block is tolerated, not thrown on (pre-existing flow-form leniency)", () => {
+  const raw = `---
+id: dec-e
+type: decision
+title: t
+summary: s
+date: 2026-06-01
+edges:
+  # existing note
+  - {type: relates-to, to: dec-other}
+---
+b
+`;
+  const n = graph.parseFrontmatter(raw, "dec-e.md");
+  assert.deepEqual(n.edges, [{ type: "relates-to", to: "dec-other" }]);
+});
+
 test("parseFrontmatter: skills/plugins/mcp/requires inline lists parse to arrays", () => {
   const raw = `---
 id: profile-w
