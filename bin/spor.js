@@ -3434,6 +3434,8 @@ async function cmdSetStatus(cfg, { positionals }) {
       if (lease.error) err(`  note: not claimed (${lease.error}${lease.holder ? `, held by ${lease.holder}` : ""})`);
       else out(`  claimed${lease.expires_at ? ` (lease expires ${lease.expires_at})` : ""}`);
     }
+    const warnings = (r.json && r.json.warnings) || [];
+    for (const w of warnings) err(`  warning: ${w}`);
     if (ANCESTRY_COMPLETION_STATUSES.has(value.toLowerCase())) {
       try {
         const commits = await fetchCommitsForAncestryCheck(cfg, id);

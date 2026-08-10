@@ -241,7 +241,7 @@ test("set-status (local) does not run the ancestry check on a non-terminal statu
 
 // POST /v1/nodes/{id}/status echoes a set_status result; on an active status it
 // rides along a lease (the claim), mirroring the server.
-function statusStub({ status = 200, errCode = "invalid_node", message = "x", details = [], lease } = {}) {
+function statusStub({ status = 200, errCode = "invalid_node", message = "x", details = [], lease, warnings = [] } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = "";
@@ -253,7 +253,7 @@ function statusStub({ status = 200, errCode = "invalid_node", message = "x", det
       if (m && req.method === "POST") {
         if (status !== 200) return j(status, { error: { code: errCode, message, details } });
         const id = decodeURIComponent(m[1]);
-        const out = { status: "updated", id, revision: "abc123", warnings: [] };
+        const out = { status: "updated", id, revision: "abc123", warnings };
         if (lease !== undefined) out.lease = lease;
         return j(200, out);
       }
@@ -322,6 +322,30 @@ test("set-status (remote) maps a 404 to a clean 'no such node'", async () => {
     const r = await runAsync(["set-status", "task-gone", "active"], remoteEnv(base));
     assert.strictEqual(r.status, 1);
     assert.match(r.stderr, /no such node: task-gone/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("set-status (remote) prints each server-computed warning to stderr, matching spor correct's format", async () => {
+  const { srv, base } = await statusStub({ warnings: ["commit abc123 is not on any known trunk", "another advisory"] });
+  try {
+    const r = await runAsync(["set-status", "task-x", "active"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /status set: task-x -> active/);
+    assert.match(r.stderr, /  warning: commit abc123 is not on any known trunk/);
+    assert.match(r.stderr, /  warning: another advisory/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("set-status (remote) prints nothing extra to stderr when warnings is absent or empty", async () => {
+  const { srv, base } = await statusStub({}); // warnings: [] by default
+  try {
+    const r = await runAsync(["set-status", "task-x", "active"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.doesNotMatch(r.stderr, /warning:/);
   } finally {
     srv.close();
   }
