@@ -76,14 +76,23 @@ accepts exactly **two** terminal statuses, and nothing else:
   existing one). Write the proper node(s) first if needed, then merge.
 - **`rejected`** — there was no durable fact to keep.
 
-Watch for **redundant clusters**: several near-identical captures from one
-session. A reliable tell is an ingestion note like *"elaboration of `<id>` not
-applied (body_full): would push body over the 8192B limit"* — those are repeated
-re-captures that bounced because the target node is already at its size cap, so
-the fact is *already on the graph*. Read one, confirm the target node holds it,
-and `merged` the whole cluster. (`dismissed`/`resolved`/`closed` are rejected at
-write time — they are not capture verdicts; only `merged`/`rejected` are valid
-here.)
+(`dismissed`/`resolved`/`closed` are rejected at write time — they are not
+capture verdicts; only `merged`/`rejected` are valid here.)
+
+The server auto-spills an elaboration that would push its target past the
+8192B body cap: it mints the continuation itself (an `art-<stem>-<n>`
+artifact, `derived-from` the part it continues), folds there, and leaves the
+original writable — no hand-rolled `-2` node needed
+(dec-spor-capture-fold-auto-spill-continuation). So a `body_full` ingestion
+note — *"elaboration of `<id>` not applied (body_full): would push body over
+the 8192B limit"* — no longer means "already on the graph, just bulk-merge
+it." It occurs only in two residual cases, where the spill itself can't land:
+the elaboration is too large to fit even a fresh, empty continuation part, or
+the continuation id would be too long to mint. Either way the capture falls
+back to capture-pending instead of being silently dropped, so treat each one
+as a real decision, not noise: read it, and either write (or extend) a node
+that actually holds the content and `merged`, or `rejected` if there's truly
+nothing durable left to keep.
 
 ## 3. Duplicates → consolidate with a `supersedes` edge
 
