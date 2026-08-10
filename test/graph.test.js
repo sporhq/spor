@@ -319,6 +319,155 @@ b
   ]);
 });
 
+// issue-spor-graph-frontmatter-edge-silent-drop: block-form edges and the
+// "target:" key used to be silently dropped (accepted write, no edges, no
+// warning). Settled scope: accept and normalize both, and reject loudly
+// (not silently) anything that still can't be understood as an edge.
+test("parseFrontmatter: flow-form edge accepts 'target:' as an alias for 'to:'", () => {
+  const raw = `---
+id: dec-e
+type: decision
+title: t
+summary: s
+date: 2026-06-01
+edges:
+  - {type: relates-to, target: dec-other}
+---
+b
+`;
+  const n = graph.parseFrontmatter(raw, "dec-e.md");
+  assert.deepEqual(n.edges, [{ type: "relates-to", to: "dec-other" }]);
+});
+
+test("parseFrontmatter: block-form edge ('- type: X' then indented 'to: Y') round-trips like flow-form", () => {
+  const raw = `---
+id: art-e
+type: artifact
+title: t
+summary: s
+date: 2026-08-08
+edges:
+  - type: relates-to
+    to: task-appsenior-setup-streak-widget-employees-406
+---
+b
+`;
+  const n = graph.parseFrontmatter(raw, "art-e.md");
+  assert.deepEqual(n.edges, [{ type: "relates-to", to: "task-appsenior-setup-streak-widget-employees-406" }]);
+});
+
+test("parseFrontmatter: block-form edge accepts 'target:' as an alias for 'to:'", () => {
+  const raw = `---
+id: art-e
+type: artifact
+title: t
+summary: s
+date: 2026-08-08
+edges:
+  - type: relates-to
+    target: task-appsenior-setup-streak-widget-employees-406
+---
+b
+`;
+  const n = graph.parseFrontmatter(raw, "art-e.md");
+  assert.deepEqual(n.edges, [{ type: "relates-to", to: "task-appsenior-setup-streak-widget-employees-406" }]);
+});
+
+test("parseFrontmatter: block-form edges support multiple entries and a trailing flat attribute", () => {
+  const raw = `---
+id: task-e
+type: task
+title: t
+summary: s
+date: 2026-08-08
+edges:
+  - type: assigned
+    to: agent-x
+    profile: profile-y
+  - type: blocks
+    to: task-z
+---
+b
+`;
+  const n = graph.parseFrontmatter(raw, "task-e.md");
+  assert.deepEqual(n.edges, [
+    { type: "assigned", to: "agent-x", profile: "profile-y" },
+    { type: "blocks", to: "task-z" },
+  ]);
+});
+
+test("parseFrontmatter: block-form and flow-form edges may mix under one 'edges:' key", () => {
+  const raw = `---
+id: task-e
+type: task
+title: t
+summary: s
+date: 2026-08-08
+edges:
+  - type: relates-to
+    to: dec-a
+  - {type: blocks, to: task-z}
+---
+b
+`;
+  const n = graph.parseFrontmatter(raw, "task-e.md");
+  assert.deepEqual(n.edges, [
+    { type: "relates-to", to: "dec-a" },
+    { type: "blocks", to: "task-z" },
+  ]);
+});
+
+test("parseFrontmatter: a block-form edge entry that never resolves a 'to'/'target' throws, naming the entry", () => {
+  const raw = `---
+id: task-e
+type: task
+title: t
+summary: s
+date: 2026-08-08
+edges:
+  - type: relates-to
+---
+b
+`;
+  assert.throws(() => graph.parseFrontmatter(raw, "task-e.md"), /unparseable edge entry/);
+});
+
+test("parseFrontmatter: an unparseable line inside a block-form edges list throws instead of silently dropping", () => {
+  const raw = `---
+id: task-e
+type: task
+title: t
+summary: s
+date: 2026-08-08
+edges:
+  - type: relates-to
+    to: dec-a
+  - this is not a key: value line at all {{{
+---
+b
+`;
+  assert.throws(() => graph.parseFrontmatter(raw, "task-e.md"), /unparseable edge entry/);
+});
+
+test("parseFrontmatter: a block-form edges list flushes when a later top-level key follows it (not just at EOF)", () => {
+  const raw = `---
+id: art-e
+type: artifact
+title: t
+summary: s
+date: 2026-08-08
+edges:
+  - type: relates-to
+    to: dec-a
+status: open
+---
+b
+`;
+  const n = graph.parseFrontmatter(raw, "art-e.md");
+  assert.deepEqual(n.edges, [{ type: "relates-to", to: "dec-a" }]);
+  assert.equal(n.status, "open");
+});
+
 test("parseFrontmatter: skills/plugins/mcp/requires inline lists parse to arrays", () => {
   const raw = `---
 id: profile-w
