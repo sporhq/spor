@@ -313,13 +313,29 @@ in a tight loop. **Use the shipped helpers — do not hand-roll the poll:**
 
 ```bash
 # Block until any tracked agent finishes (run via Bash run_in_background: true;
-# its exit re-invokes you). Prints AGENT_DONE <node> or NODE_RESOLVED <node>.
+# its exit re-invokes you). Prints AGENT_DONE <node>, NODE_RESOLVED <node>, or
+# AGENT_STALLED <node> idle_secs=<n> session=<sid> — a busy agent whose session
+# transcript hasn't moved for WATCH_STALL seconds (default 1800 = 30min).
 ~/.claude/skills/spor-orchestrator/scripts/watch-fleet.sh <node-id> [<node-id> ...]
 
 # One-shot triangulated view: session status × graph status × verdict
 # (RUNNING / FINISHED — gate+merge it / RECOVER — session gone, node unresolved).
 ~/.claude/skills/spor-orchestrator/scripts/fleet-status.sh [<node-id> ...]
 ```
+
+**On `AGENT_STALLED`, inspect before intervening — it's a notification, not a
+verdict.** The transcript-mtime proxy can't distinguish a wedged agent from one
+legitimately awaiting a long background task. The paid-for case (2026-08-05): an
+implementer launched `node --test` as a background task, the test hung with an
+open server listener (`--test-timeout=0` never fires), and the agent waited 44
+minutes for a completion notification that could never come. The fix was to
+kill ONLY the hung child processes — the background task then completed and the
+agent resumed on its own. So on a stall: check the agent's child processes
+(`ps --ppid <pid>` — near-zero CPU over a long elapsed time = hung child) and
+its last transcript message; kill a hung child rather than the agent when
+that's the diagnosis; re-arm with a longer `WATCH_STALL` (or `WATCH_STALL=0`)
+if the wait is genuine (e.g. a docker matrix run). Escalate to Recover only if
+the agent itself is dead or looping.
 
 The gotchas the scripts encode (so a hand-rolled replacement doesn't re-pay
 them):
