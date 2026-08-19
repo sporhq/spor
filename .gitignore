@@ -1,0 +1,6 @@
+# Machine-local operator state — never source of truth.
+# .claude/settings.json holds this box's harness config (worktree bgIsolation
+# for the orchestrator's in-place bg jobs); the dogfooded skills stay tracked.
+.claude/settings.json
+# Playwright CLI page-snapshot scratch from browser-driven sessions.
+.playwright-cli/
