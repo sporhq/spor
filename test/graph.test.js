@@ -1728,7 +1728,10 @@ b
   assert.ok(v.warnings.some((w) => /unknown edge type 'invented-edge'/.test(w)));
 });
 
-test("validateGraph: a block-form edge entry that never resolves a 'to'/'target' warns loudly, naming the entry (not silently dropped)", () => {
+// Severity note (dec-spor-buildgraph-per-node-fault-isolation): this is an
+// ERROR, not a warning, because the loader now SKIPS such a file rather than
+// refusing to boot on it — so the lint is the only gate left that can fail.
+test("validateGraph: a block-form edge entry that never resolves a 'to'/'target' errors loudly, naming the entry (not silently dropped)", () => {
   const fx = tmpGraph({
     "task-e.md": `---
 id: task-e
@@ -1743,11 +1746,13 @@ b
 `,
   });
   const v = graph.validateGraph(fx.nodesDir);
-  assert.deepEqual(v.errors, []); // the lenient re-parse warns, it never throws/errors
-  assert.ok(v.warnings.some((w) => /unparseable edge entry/.test(w) && /task-e\.md/.test(w)));
+  // the lenient re-parse records it and keeps going — it never throws — but the
+  // record is an exit-1 error: the loader drops this file from the graph.
+  assert.ok(v.errors.some((e) => /unparseable edge entry/.test(e) && /task-e\.md/.test(e)));
+  assert.ok(v.errors.some((e) => /SKIPPED by the loader/.test(e)));
 });
 
-test("validateGraph: an unparseable line inside a block-form edges list warns instead of silently dropping", () => {
+test("validateGraph: an unparseable line inside a block-form edges list errors instead of silently dropping", () => {
   const fx = tmpGraph({
     "task-e.md": `---
 id: task-e
@@ -1773,9 +1778,9 @@ b
 `,
   });
   const v = graph.validateGraph(fx.nodesDir);
-  assert.deepEqual(v.errors, []);
-  assert.ok(v.warnings.some((w) => /unparseable edge entry "not a key line at all"/.test(w)));
-  // the well-formed entry before the bad line still parses
+  assert.ok(v.errors.some((e) => /unparseable edge entry "not a key line at all"/.test(e)));
+  // the well-formed entry before the bad line still parses, and the re-parse
+  // keeps checking the rest of the file rather than bailing at the fault
   assert.ok(!v.warnings.some((w) => /dangling edge relates-to -> dec-a/.test(w)));
 });
 
@@ -2150,4 +2155,110 @@ test("compile: a digest still compiles over a graph with a skipped node", () => 
   const { value: g } = captureStderr(() => faultFixture().load());
   const r = graph.compile(g, { query: "rate limiting edge proxy enforcement", digest: true });
   assert.ok(r.text.includes("dec-good-a"));
+});
+
+// The other deliberate parse fault: a file with no frontmatter block at all.
+test("loadGraph: a file with no frontmatter is skipped like any other parse fault", () => {
+  const fx = tmpGraph({
+    "dec-good-a.md": `---
+id: dec-good-a
+type: decision
+project: my-project
+title: Good A
+summary: A healthy node beside a file that has no frontmatter at all.
+---
+Body.
+`,
+    "dec-headless.md": "Just prose. No frontmatter block.\n",
+  });
+  const { value: g, stderr } = captureStderr(() => fx.load());
+  assert.ok(g.nodes["dec-good-a"]);
+  assert.equal(g.skipped.length, 1);
+  assert.equal(g.skipped[0].file, "dec-headless.md");
+  assert.match(g.skipped[0].error, /no frontmatter/);
+  assert.match(stderr, /dec-headless\.md/);
+});
+
+// The sharp edge of the trade, pinned deliberately: a skipped `type: schema`
+// node takes its registry override with it, so the graph loads under the SEED
+// ontology instead. Registry.isTraversable defaults unknown types to
+// traversable, so a dropped `traversable: false` override doesn't merely lose
+// a setting — it puts previously-excluded nodes back in the briefing walk.
+// That is exactly why the skip is named on stderr rather than swallowed.
+test("loadGraph: a skipped schema node loses its registry override (named, not silent)", () => {
+  const schemaBody = (extraEdgeLine) => `---
+id: schema-node-briefing
+type: schema
+kind: node-schema
+schema_version: 2026.06.10.3
+title: Briefing override
+summary: A resident override making briefing nodes traversable.
+date: 2026-06-10
+status: active${extraEdgeLine}
+---
+
+\`\`\`json
+{ "node_type": "briefing", "prefix": ["brief-"], "traversable": true, "capturable": false }
+\`\`\`
+`;
+  const nodes = (schema) => ({
+    "schema-node-briefing.md": schema,
+    "brief-a.md": `---
+id: brief-a
+type: briefing
+project: my-project
+title: A briefing
+summary: A briefing node, traversable only under the resident override.
+version: 1
+---
+Briefing body.
+`,
+  });
+  // Healthy override: the briefing is traversable, so it earns a search doc.
+  const { value: good } = captureStderr(() => tmpGraph(nodes(schemaBody(""))).load());
+  assert.ok(good.docs.some((d) => d.id === "brief-a"), "override in force");
+  // Same graph, override file corrupted: it is skipped, and the seed's
+  // traversable:false for briefings is what the graph loads under.
+  const broken = schemaBody("\nedges:\n  - this is not an edge entry");
+  const { value: bad, stderr } = captureStderr(() => tmpGraph(nodes(broken)).load());
+  assert.equal(bad.skipped[0].file, "schema-node-briefing.md");
+  assert.ok(!bad.docs.some((d) => d.id === "brief-a"), "override lost with the skipped schema node");
+  assert.match(stderr, /schema-node-briefing\.md/);
+});
+
+// Isolation covers MALFORMED FILES, not a broken parser: a bug in
+// parseFrontmatter must still crash rather than skip every node and hand back
+// an empty-but-valid graph that fail-open hooks would report as "nothing".
+test("buildGraph: a non-parse error from the parser propagates instead of being skipped", () => {
+  const kernel = require(path.join(__dirname, "..", "lib", "kernel", "graph.js"));
+  const files = {
+    // A Proxy that throws a TypeError the moment the parser reads the text —
+    // standing in for a parser regression, which carries no sporParse tag.
+    "dec-boom.md": new Proxy({}, { get() { throw new TypeError("parser regression"); } }),
+  };
+  assert.throws(() => kernel.buildGraph(files, { nodesDir: "/g", seedSchemas: [] }), /parser regression/);
+});
+
+// applyNode is the server's incremental twin of a rebuild, so repairing a
+// skipped file must retire its skip record too — otherwise the graph keeps
+// reporting corruption against a node that is now present.
+test("applyNode: writing a repaired node clears its entry from graph.skipped", () => {
+  const kernel = require(path.join(__dirname, "..", "lib", "kernel", "graph.js"));
+  const { value: g } = captureStderr(() => faultFixture().load());
+  assert.equal(g.skipped.length, 1);
+  const fixed = `---
+id: dec-corrupt
+type: decision
+project: my-project
+title: Corrupt node, repaired
+summary: The same node, rewritten with a parseable edges block.
+edges:
+  - {type: relates-to, to: dec-good-a}
+---
+Body.
+`;
+  const r = kernel.applyNode(g, fixed, "dec-corrupt.md");
+  assert.equal(r.mode, "create");
+  assert.ok(g.nodes["dec-corrupt"]);
+  assert.deepEqual(g.skipped, []);
 });

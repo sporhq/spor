@@ -798,7 +798,10 @@ date: 2026-06-10
   assert.ok(g.docs.some((d) => d.id === "schema-edge-relates-to"), "schema node participates in the content arm");
 });
 
-test("loadGraph: a malformed schema node throws (same strictness as malformed frontmatter)", () => {
+// A schema node that PARSES but carries an invalid payload is still fatal — the
+// registry is the contract, so a half-built one is worse than no boot. (Only
+// per-file PARSE faults are isolated: dec-spor-buildgraph-per-node-fault-isolation.)
+test("loadGraph: a schema node with an invalid payload throws (the registry is the contract)", () => {
   const fx = tmpGraph({
     ...BASE_NODES,
     "schema-broken.md": `---

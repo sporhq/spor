@@ -105,8 +105,11 @@ Rules:
   refuse a whole graph's boot. Every skip is named on stderr
   (`spor: SKIPPED unparseable node file <path>: <why>`) and listed on
   `graph.skipped`; an edge pointing at a skipped node simply dangles. Treat the
-  warning as corruption to fix, not noise to live with — `spor validate`
-  re-parses the same files leniently and names the offending line.
+  warning as corruption to fix, not noise to live with: `spor validate` is the
+  gate, and reports the same files as an **error** (exit 1), naming the
+  offending line — a node the loader drops is missing from every briefing,
+  digest and queue, so a lint that passed would be a lie. Isolation covers
+  malformed FILES only; a bug in the parser itself still throws.
 
 ## Node types and id prefixes
 
