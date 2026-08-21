@@ -1,5 +1,7 @@
 {
   "errors": [
+    "bad-edge-line.md: unparseable edge entry \"not a key line at all\" — this file is SKIPPED by the loader",
+    "bad-edge-missingto.md: unparseable edge entry {\"type\":\"relates-to\"} — this file is SKIPPED by the loader",
     "bad-missing.md: missing title",
     "bad-missing.md: missing summary",
     "bad-noframe.md: no frontmatter",
@@ -17,10 +19,10 @@
     "warn-unknown.md: dangling edge relates-to -> ghost-node"
   ],
   "byType": {
-    "task": 3,
+    "task": 5,
     "schema": 1,
     "correction": 1,
     "flurble": 1
   },
-  "count": 6
+  "count": 8
 }

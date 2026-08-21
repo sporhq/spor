@@ -1,4 +1,4 @@
 { "id": "diagnostics-validate", "kind": "validate", "corpus": "diagnostics",
   "input": {},
   "expected": "diagnostics-validate.json",
-  "covers": "every error class (no frontmatter, missing fields, id!=filename, duplicate id, correction sans target, unparseable schema) and warning class (unknown type, unknown edge, dangling edge, missing date)" }
+  "covers": "every error class (no frontmatter, missing fields, id!=filename, duplicate id, correction sans target, unparseable schema, unparseable edge entry — both the block-form missing-to/target shape and a garbage line inside an edges list, dec-spor-buildgraph-per-node-fault-isolation's error-not-warning severity) and warning class (unknown type, unknown edge, dangling edge, missing date)" }
