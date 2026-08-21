@@ -263,13 +263,45 @@ LLM path). On every Write/Edit in a team-mode repo it does one
 `GET /v1/queue?project=<slug>&assignee=me` (the assignee read is the
 lease-exempt steward view, so the person's own carried work returns tagged with
 `lease_state`/`lease_by`) and branches: this PERSON holds a live (`in_progress`)
-claim here → `POST /v1/nodes/{id}/renew {session}` for each (the heartbeat,
+claim here → ONE `POST /v1/queue/renew` with an EMPTY body (the heartbeat,
 piggybacking on write-activity — no new timer, so it's portable across adapters
 that don't fire hooks uniformly), no nudge; this person holds none → nudge ONCE
 per session to claim a top eligible pool item (`GET /v1/queue?project=<slug>`)
-or `/spor:defer`. Person-scoped suppression (a held claim from ANY session,
-including a Tier-2 `reserved` reservation, suppresses), session-scoped heartbeat
-(only the editing session renews, and only Tier-1 leases). Cooldown
+or `/spor:defer`. That renew is deliberately `renewAll`'s BLANKET arm —
+`ids` omitted, and `session` omitted too
+(dec-spor-heartbeat-adopts-blanket-renew-arm): the named-`ids` arm and the
+singular `/v1/nodes/{id}/renew` both AUTO-RECLAIM a lapsed lease, which is right
+for a caller who names a node and wrong for a background beat that would then
+silently re-take work another actor released; and in the blanket arm `session`
+is a FILTER, so sending it would skip the leases claimed outside a session
+(`spor claim`, `spor dispatch`'s pre-launch claim) and let them lapse. The
+trade the blanket arm accepts is the mirror one — a lapsed node silently drops
+out of the working set — so the heartbeat journal line carries `renewed` (what
+the server confirmed) and `dropped` (held work this beat SAW but did not
+renew — the GET→POST race, or a node held live by someone else), and the
+SessionEnd reserve/release hook replays both in order (`distill.js`
+sessionEndLease) so it never `reserve`s — and thereby auto-reclaims — a node the
+beat reported letting go. Note `renewed` is what the server confirmed only when
+it answered: on any non-200 the beat keeps the optimistic list rather than
+dropping a live lease out of SessionEnd's reach on a blip. The residual: a lease
+that vanishes from the project lookup ENTIRELY between beats (the ordinary
+45m lapse, or a `spor release` from another terminal) is never reported as
+dropped, so SessionEnd still `reserve`s it and the server auto-reclaims — which
+IS the decided behavior for a named call by the session that worked the node
+(dec-spor-lease-auto-reclaim-and-deadline-exposure exists for exactly the
+lapsed-long-session case), but it means the no-reclaim guarantee is the
+heartbeat's, not the whole client's. Person-scoped suppression (a held claim from ANY
+session, including a Tier-2 `reserved` reservation, suppresses); the beat renews
+the person's live Tier-1 leases. Two costs ride with the arm, both accepted with
+it: the beat is NOT project-scoped (the enumerate arm takes no project, while
+the lookup above is project-scoped — so the journal is narrowed back to this
+project's held work, but a write in ANY opted-in repo renews the person's leases
+everywhere, and a lease nobody releases — a `claude --bg` agent killed before
+SessionEnd — stops self-healing back into the pool at its TTL while its owner
+keeps working elsewhere); and the arm never re-stamps `live.session` (it selects
+on it), so lease session bindings go stale rather than following the last
+editing session, which is what the server's `skipped_other_session` drift signal
+keys on. Cooldown
 `journal/<session>.claim-nudged`; disable `SPOR_CLAIM_NUDGE=0`
 (`claimNudge.enabled:false`); the lookup/heartbeat curls are bounded by
 `SPOR_CLAIM_NUDGE_TIMEOUT` (`claimNudge.timeoutMs`, default 3000). Fail-open:

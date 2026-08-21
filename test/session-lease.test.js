@@ -60,12 +60,15 @@ function scratch() {
 // Seed this session's journal with a claim-heartbeat line, exactly what the
 // post-tool claim-nudge branch writes on every renew (task-cc-claim-nudge-hook)
 // -- the evidence sessionEndLease reads to find what THIS session held.
-function seedHeartbeat(home, session, renewed) {
+function seedHeartbeat(home, session, renewed, dropped) {
   const dir = path.join(home, 'journal');
   fs.mkdirSync(dir, { recursive: true });
   fs.appendFileSync(
     path.join(dir, `${session}.jsonl`),
-    JSON.stringify({ ts: '2026-01-01T00:00:00Z', project: 'projx', tool: 'claim-heartbeat', renewed }) + '\n'
+    JSON.stringify({
+      ts: '2026-01-01T00:00:00Z', project: 'projx', tool: 'claim-heartbeat', renewed,
+      ...(dropped ? { dropped } : {}),
+    }) + '\n'
   );
 }
 
@@ -153,6 +156,43 @@ test('still-open held task -> converts to a Tier-2 reservation via /reserve', as
     assert.deepStrictEqual(JSON.parse(reserve.body), { session: 's1' });
     const rec = journal(home).find((e) => e.tool === 'session-lease');
     assert.deepStrictEqual(rec && { id: rec.id, action: rec.action }, { id: 'task-mine', action: 'reserve' });
+  } finally {
+    srv.close();
+  }
+});
+
+// dec-spor-heartbeat-adopts-blanket-renew-arm: the blanket beat never re-claims
+// a lease that lapsed, so a later beat reports the node as `dropped`. Since
+// `reserve` AUTO-RECLAIMS an unheld node, replaying only `renewed` would hand
+// that node straight back the silent re-claim the arm was chosen to avoid.
+test('a node a later heartbeat dropped is left alone (no reserve re-claims it)', async () => {
+  const { home, cwd } = scratch();
+  seedHeartbeat(home, 's1', ['task-mine', 'task-lapsed']);
+  seedHeartbeat(home, 's1', ['task-mine'], ['task-lapsed']);
+  const { srv, hits, base } = await stubServer((id) => ({ raw: `id: ${id}\nstatus: open\n---\nbody` }));
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    await runAsync(['distill', '--host', 'claude-code'], sessionEndPayload(cwd), env);
+    assert.ok(hits.some((h) => h.url === '/v1/nodes/task-mine/reserve'), 'the still-held node still reserves');
+    assert.ok(
+      !hits.some((h) => h.url.startsWith('/v1/nodes/task-lapsed')),
+      `a dropped node is never touched; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`
+    );
+  } finally {
+    srv.close();
+  }
+});
+
+// ...and a node re-claimed after a drop rejoins the set on the next beat.
+test('a dropped node re-renewed by a later heartbeat is held again', async () => {
+  const { home, cwd } = scratch();
+  seedHeartbeat(home, 's1', ['task-mine'], ['task-mine']);
+  seedHeartbeat(home, 's1', ['task-mine']);
+  const { srv, hits, base } = await stubServer((id) => ({ raw: `id: ${id}\nstatus: open\n---\nbody` }));
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    await runAsync(['distill', '--host', 'claude-code'], sessionEndPayload(cwd), env);
+    assert.ok(hits.some((h) => h.url === '/v1/nodes/task-mine/reserve'), 'the re-claimed node reserves');
   } finally {
     srv.close();
   }

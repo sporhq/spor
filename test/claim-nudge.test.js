@@ -54,7 +54,16 @@ function scratch() {
 // Stub server: records hits, and answers GET /v1/queue from `queueFor(url)` and
 // POST /v1/nodes/{id}/renew with 200 {status:"renewed"}. `queueFor` returns the
 // {items:[...]} object for a given request url (assignee=me vs the pool query).
-function stubServer(queueFor) {
+// POST /v1/queue/renew models renewAll's two arms: an explicit `ids` list is
+// echoed back, an OMITTED one enumerates — by default every in_progress item
+// `queueFor` reports for assignee=me, exactly what the real enumerate arm would
+// find for a single-project holder. `renewAllIds` overrides that enumeration to
+// stage a lease that lapsed out of the set (the blanket arm never reclaims).
+function stubServer(queueFor, renewAllIds) {
+  const enumerate = renewAllIds ||
+    (() => ((queueFor('/v1/queue?project=projx&assignee=me').items) || [])
+      .filter((i) => i.lease_state === 'in_progress')
+      .map((i) => i.id));
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = '';
@@ -73,7 +82,9 @@ function stubServer(queueFor) {
       }
       if (req.method === 'POST' && req.url === '/v1/queue/renew') {
         const ids = (() => {
-          try { return JSON.parse(body).ids || []; } catch { return []; }
+          let parsed;
+          try { parsed = JSON.parse(body || '{}'); } catch { return []; }
+          return Array.isArray(parsed.ids) ? parsed.ids : enumerate();
         })();
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: true, status: 'renewed', count: ids.length, renewed: ids, leases: [], failed: [] }));
@@ -166,7 +177,7 @@ test('cooldown: a second write in the same session does not nudge again', async 
   }
 });
 
-test('live claim held by this person -> renew (heartbeat) fires, no nudge', async () => {
+test('live claim held by this person -> blanket renew (heartbeat) fires, no nudge', async () => {
   const { home, cwd } = scratch();
   const { srv, hits, base } = await stubServer((url) =>
     isAssigneeMe(url)
@@ -179,10 +190,14 @@ test('live claim held by this person -> renew (heartbeat) fires, no nudge', asyn
     const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
     const out = await runAsync(['post-tool', '--host', 'claude-code'], editPayload(cwd), env);
     assert.strictEqual(out.trim(), '', 'a held-claim write must not nudge');
-    // the heartbeat renewed exactly the live item, carrying the session id
-    const renew = hits.find((h) => h.method === 'POST' && h.url === '/v1/nodes/task-mine/renew');
-    assert.ok(renew, `expected a renew POST; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`);
-    assert.deepStrictEqual(JSON.parse(renew.body), { session: 's1' });
+    // one blanket renew — no ids, no session (in the enumerate arm `session` is
+    // a FILTER, and a lease claimed outside a session would be skipped by it),
+    // and never the singular door, whose auto-reclaim a heartbeat must not use
+    // (dec-spor-heartbeat-adopts-blanket-renew-arm)
+    const bulk = hits.filter((h) => h.method === 'POST' && h.url === '/v1/queue/renew');
+    assert.strictEqual(bulk.length, 1, `expected one blanket renew; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`);
+    assert.deepStrictEqual(JSON.parse(bulk[0].body), {});
+    assert.ok(!hits.some((h) => h.method === 'POST' && /^\/v1\/nodes\//.test(h.url)), 'no per-node renew fired');
     // no claim-nudge journaled; a claim-heartbeat line was
     assert.strictEqual(journal(home).filter((e) => e.tool === 'claim-nudge').length, 0);
     const hb = journal(home).filter((e) => e.tool === 'claim-heartbeat');
@@ -195,7 +210,7 @@ test('live claim held by this person -> renew (heartbeat) fires, no nudge', asyn
   }
 });
 
-test('multiple live claims held -> one batched POST /v1/queue/renew, not N single renews', async () => {
+test('multiple live claims held -> one blanket POST /v1/queue/renew, not N single renews', async () => {
   const { home, cwd } = scratch();
   const { srv, hits, base } = await stubServer((url) =>
     isAssigneeMe(url)
@@ -209,16 +224,92 @@ test('multiple live claims held -> one batched POST /v1/queue/renew, not N singl
     const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
     const out = await runAsync(['post-tool', '--host', 'claude-code'], editPayload(cwd), env);
     assert.strictEqual(out.trim(), '', 'a held-claim write must not nudge');
-    // exactly one batched renew, no per-node renews
+    // exactly one blanket renew, no per-node renews
     const bulk = hits.filter((h) => h.method === 'POST' && h.url === '/v1/queue/renew');
     assert.strictEqual(bulk.length, 1, `expected exactly one bulk renew; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`);
-    assert.deepStrictEqual(JSON.parse(bulk[0].body), { ids: ['task-mine', 'task-mine-2'], session: 's1' });
+    assert.deepStrictEqual(JSON.parse(bulk[0].body), {});
     assert.ok(!hits.some((h) => h.method === 'POST' && /^\/v1\/nodes\//.test(h.url)), 'no per-node renew fired alongside the batch');
     // no claim-nudge journaled; a claim-heartbeat line names both nodes
     assert.strictEqual(journal(home).filter((e) => e.tool === 'claim-nudge').length, 0);
     const hb = journal(home).filter((e) => e.tool === 'claim-heartbeat');
     assert.strictEqual(hb.length, 1);
     assert.deepStrictEqual(hb[0].renewed, ['task-mine', 'task-mine-2']);
+  } finally {
+    srv.close();
+  }
+});
+
+test('a held lease the blanket beat did not renew is journaled as dropped, never re-claimed', async () => {
+  const { home, cwd } = scratch();
+  // the person's queue still shows both as in_progress (the read is a snapshot),
+  // but the server's enumerate arm only renews one — the other lapsed or was
+  // taken, and the blanket arm never re-acquires it.
+  const { srv, hits, base } = await stubServer(
+    (url) =>
+      isAssigneeMe(url)
+        ? { items: [
+            { id: 'task-mine', title: 'Mine', lease_state: 'in_progress', lease_by: 'person-t' },
+            { id: 'task-lapsed', title: 'Lapsed', lease_state: 'in_progress', lease_by: 'person-t' },
+          ] }
+        : { items: [{ id: 'task-alpha', title: 'Alpha' }] },
+    () => ['task-mine']
+  );
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    const out = await runAsync(['post-tool', '--host', 'claude-code'], editPayload(cwd), env);
+    assert.strictEqual(out.trim(), '');
+    // no singular renew chased the lapsed node (that door reclaims)
+    assert.ok(!hits.some((h) => h.method === 'POST' && /^\/v1\/nodes\//.test(h.url)), 'a dropped lease is not re-claimed');
+    const hb = journal(home).filter((e) => e.tool === 'claim-heartbeat');
+    assert.strictEqual(hb.length, 1);
+    assert.deepStrictEqual(hb[0].renewed, ['task-mine']);
+    assert.deepStrictEqual(hb[0].dropped, ['task-lapsed']);
+  } finally {
+    srv.close();
+  }
+});
+
+// Fail-open on the beat itself: the lookup succeeded, the renew did not (a
+// dead/older server, a 404, an unreadable body). The hook still exits 0 with no
+// output and journals the optimistic set, so SessionEnd keeps its evidence of
+// what this session held rather than losing a live lease to a blip.
+test('a renew the server refuses -> no output, exit 0, journal keeps the held set', async () => {
+  const { home, cwd } = scratch();
+  const { srv, hits, base } = await stubServer((url) =>
+    isAssigneeMe(url)
+      ? { items: [{ id: 'task-mine', title: 'Mine', lease_state: 'in_progress', lease_by: 'person-t' }] }
+      : { items: [{ id: 'task-alpha', title: 'Alpha' }] }
+  );
+  try {
+    // swap in a handler with no bulk-renew route, so the POST 404s the way an
+    // older server (or a deploy skew) would
+    srv.removeAllListeners('request');
+    srv.on('request', (req, res) => {
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        hits.push({ method: req.method, url: req.url, body });
+        if (req.method === 'GET' && req.url.startsWith('/v1/queue')) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(isAssigneeMe(req.url)
+            ? { items: [{ id: 'task-mine', title: 'Mine', lease_state: 'in_progress', lease_by: 'person-t' }] }
+            : { items: [{ id: 'task-alpha', title: 'Alpha' }] }));
+          return;
+        }
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end('{}');
+      });
+    });
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    const out = await runAsync(['post-tool', '--host', 'claude-code'], editPayload(cwd), env);
+    assert.strictEqual(out.trim(), '');
+    // the beat was really attempted — without this the assertions below would
+    // pass just as well against a build that never issued the renew at all
+    assert.ok(hits.some((h) => h.method === 'POST' && h.url === '/v1/queue/renew'), 'the beat fired');
+    const hb = journal(home).filter((e) => e.tool === 'claim-heartbeat');
+    assert.strictEqual(hb.length, 1);
+    assert.deepStrictEqual(hb[0].renewed, ['task-mine']);
+    assert.ok(!('dropped' in hb[0]), 'an unanswered beat is not reported as a drop');
   } finally {
     srv.close();
   }

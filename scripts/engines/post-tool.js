@@ -369,42 +369,78 @@ async function claimNudge({ graph, slug, session, cwd, remote }) {
   // Person-scoped suppression: any item the person holds (live Tier-1
   // in_progress OR Tier-2 reserved) means they have a claim in this project
   // from SOME session — suppress the nudge entirely (kills the multi-session
-  // false positive). Session-scoped heartbeat: renew the LIVE (in_progress)
-  // ones; the editing session's write activity drives the heartbeat and the
-  // server records this session as the renewing one. A Tier-2 reservation is
-  // owner-exclusive but NOT heartbeated, so it suppresses without renewing.
+  // false positive). The heartbeat then renews the LIVE (in_progress) work:
+  // this session's write activity is the beat, but WHAT it renews is the
+  // person's own working set, not this session's slice of it (see the blanket
+  // arm below). A Tier-2 reservation is owner-exclusive but NOT heartbeated,
+  // so it suppresses without renewing.
   const held = myItems.filter((i) => i && i.lease_state && i.id);
   if (held.length > 0) {
-    // Renewing is one request per held node when there's only one, but a
-    // multi-claim holder used to fan the SAME number of parallel POSTs out on
-    // every single write — the exact burst task-spor-bulk-claim-renew-apis
-    // shipped POST /v1/queue/renew to eliminate. Batch to one round-trip once
-    // there's more than one node to renew; the explicit `ids` arm renews
-    // exactly this working set and forwards `session` unchanged, same contract
-    // as the singular door (server/leases.js renewAll).
+    // ONE round-trip for the whole working set, through renewAll's BLANKET
+    // arm — `ids` OMITTED (dec-spor-heartbeat-adopts-blanket-renew-arm). That
+    // arm's contract is exactly a heartbeat's: enumerate the live Tier-1
+    // leases this person actually holds and renew them, never re-acquiring one
+    // that lapsed or was taken (server/leases.js renewAll, and `renew`'s SWEEP
+    // note). The named-`ids` arm and the singular door both AUTO-RECLAIM a
+    // lapsed lease (dec-spor-lease-auto-reclaim-and-deadline-exposure) — right
+    // for a caller who names a node, wrong for a background beat that would
+    // then silently take back work another actor released, writing a durable
+    // `assigned` edge nobody asked for.
+    //
+    // Two consequences of the blanket arm, both deliberate:
+    //   - `session` is NOT sent. In this arm it is a FILTER, not the singular
+    //     door's assignment, and a lease claimed outside a session (`spor
+    //     claim`, or `spor dispatch`'s pre-launch person-scoped claim) carries
+    //     `session: null` — filtering on it would skip exactly those and let
+    //     them lapse mid-session. Person-scoped renewal matches what the
+    //     project-scoped lookup above already suppresses the nudge on.
+    //   - It renews the person's leases in EVERY project, not just this one;
+    //     the enumerate arm takes no project scope. The lookup above stays
+    //     project-scoped, so the journal below (which SessionEnd reads to
+    //     reserve/release what this session held — distill.js sessionEndLease)
+    //     is narrowed back to the work this repo's queue actually reported.
     const inProgress = held.filter((x) => x.lease_state === "in_progress");
-    if (inProgress.length > 1) {
-      await u.curl(`${u.serverBase()}/v1/queue/renew`, {
-        method: "POST",
-        headers: { ...u.bearer(), "content-type": "application/json" },
-        body: JSON.stringify({ ids: inProgress.map((x) => x.id), session }),
-        timeoutMs,
-      }).catch(() => null);
-    } else {
-      for (const i of inProgress) {
-        await u.curl(`${u.serverBase()}/v1/nodes/${encodeURIComponent(i.id)}/renew`, {
+    let renewed = inProgress.map((x) => x.id);
+    if (inProgress.length > 0) {
+      const hb = await u
+        .curl(`${u.serverBase()}/v1/queue/renew`, {
           method: "POST",
           headers: { ...u.bearer(), "content-type": "application/json" },
-          body: JSON.stringify({ session }),
+          body: "{}",
           timeoutMs,
-        }).catch(() => null);
+        })
+        .catch(() => null);
+      // Narrow to what the server CONFIRMED, when it told us: a blanket beat
+      // no longer reclaims, so a node can drop out of the set and the journal
+      // must not claim a renewal that didn't happen. An unreadable/unavailable
+      // answer keeps the optimistic list — the pre-blanket behavior — rather
+      // than dropping a live lease out of SessionEnd's reach on a blip.
+      if (hb && hb.http === "200") {
+        try {
+          const body = JSON.parse(hb.body);
+          if (Array.isArray(body.renewed)) {
+            const confirmed = new Set(body.renewed);
+            renewed = renewed.filter((id) => confirmed.has(id));
+          }
+        } catch {
+          /* unparseable -> keep the optimistic list */
+        }
       }
     }
     // Journal the heartbeat so the operability log can correlate write-activity
-    // to renewals; best-effort.
+    // to renewals; best-effort. `dropped` names held work this beat did NOT
+    // renew — the lapsed-or-taken outcome the blanket arm accepts in exchange
+    // for never re-claiming — so a silent drop leaves a trace.
+    const dropped = inProgress.map((x) => x.id).filter((id) => !renewed.includes(id));
     u.appendLine(
       path.join(graph, "journal", `${session}.jsonl`),
-      JSON.stringify({ ts: u.jqNow(), project: slug, tool: "claim-heartbeat", renewed: inProgress.map((x) => x.id) })
+      JSON.stringify({
+        ts: u.jqNow(),
+        project: slug,
+        tool: "claim-heartbeat",
+        renewed,
+        ...(dropped.length ? { dropped } : {}),
+      })
     );
     return null; // holds a claim -> never nudge
   }

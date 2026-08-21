@@ -160,11 +160,22 @@ async function sessionEndLease({ graph, slug, session, cwd, remote }) {
   } catch {
     return; // no journal for this session -> no heartbeats -> nothing held
   }
+  // Replayed in journal ORDER, because a heartbeat line is a point-in-time
+  // reading, not a cumulative one: `renewed` adds a node this beat confirmed,
+  // `dropped` REMOVES one it no longer holds. The blanket heartbeat never
+  // re-acquires a lapsed lease (dec-spor-heartbeat-adopts-blanket-renew-arm),
+  // so without honoring `dropped` the union would still carry a node that went
+  // back to the pool mid-session — and `reserve` below AUTO-RECLAIMS an unheld
+  // node (dec-spor-lease-auto-reclaim-and-deadline-exposure), quietly taking it
+  // back off the pool for a two-day grace window. That is exactly the silent
+  // re-claim the heartbeat's arm was chosen to avoid; SessionEnd must not
+  // reintroduce it a beat later. A node claimed again after a drop simply
+  // re-enters via the next beat's `renewed`.
   const ids = new Set();
   for (const e of entries) {
-    if (e.tool === "claim-heartbeat" && Array.isArray(e.renewed)) {
-      for (const id of e.renewed) if (id) ids.add(id);
-    }
+    if (e.tool !== "claim-heartbeat") continue;
+    if (Array.isArray(e.renewed)) for (const id of e.renewed) if (id) ids.add(id);
+    if (Array.isArray(e.dropped)) for (const id of e.dropped) if (id) ids.delete(id);
   }
   if (ids.size === 0) return; // no claim held this session
 
