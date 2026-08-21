@@ -2758,12 +2758,17 @@ async function cmdAdd(cfg, { values, positionals }) {
     }
     const ids = (r.json && (r.json.ids || r.json.node_ids)) || [];
     out(ids.length ? `captured: ${ids.join(", ")}` : `captured (${(r.json && r.json.status) || "ok"})`);
-    out(writeTargetLine(cfg));
     // Self-heal: a pure-CLI user has no Claude Code session to run the drain, so a
     // successful capture (proof the server is reachable) is the moment to flush any
     // backlog the fail-open spool stranded (task-spor-cli-outbox-drain-verb). Only
     // runs when there IS a spool, is bounded, and never affects the add's success.
+    // Run this BEFORE the banner write: stdout EPIPE exits the process (see the
+    // handler near the top of this file), so a consumer that only wants the first
+    // line (`spor add ... | head -n1`) must not be able to cut the process off
+    // before the drain has had a chance to run (codex merge-gate finding,
+    // task-spor-cli-write-banner-mode-echo).
     await opportunisticDrain(cfg);
+    out(writeTargetLine(cfg));
     return 0;
   }
 
