@@ -283,6 +283,177 @@ async function fetchRemoteTitleIndex(graph, rlog) {
   return cached ? cached.index : "";
 }
 
+// issue-spor-async-nudge-session-final-loss: the SessionEnd half of the async
+// capture-nudge. A background nudge-worker classifies a written file OFF the
+// tool loop and drops a `<hash>.out.json` result under
+// journal/pending-nudges/<session>/ for the NEXT UserPromptSubmit to drain
+// (prompt-context.js's drainPendingNudges) — but a finding produced by the
+// session's FINAL action has no next prompt to drive that drain, so it sits
+// stranded in the spool forever. This drains the ENDING session's leftover
+// results and writes each straight through the capture path (local: a
+// validated node file, no LLM needed — the worker's classifier already
+// verified these facts; remote: POST /v1/capture, spooling to the outbox on
+// transport failure exactly like the LLM distiller's own per-fact loop
+// below).
+//
+// Independent of the LLM distill() call — same posture as sessionEndLease —
+// so a disabled/failing distiller (distill.enabled:false, or a dead backend)
+// never stops an already-classified finding from landing; it needs no LLM
+// call of its own. Unlike sessionEndLease this DOES run on a
+// debounce-approximated firing (input.spor_debounced): capturing a finding is
+// idempotent — the source .out.json is consumed either way — and doing it a
+// beat early for a turn-scoped host (Codex/Copilot/OpenCode) can only reduce
+// loss, never mis-act on a lease someone else is mid-editing the way an
+// unwarranted reclaim could.
+//
+// Consume/supersede semantics mirror drainPendingNudges exactly: every
+// `.out.json` seen is deleted whether or not it ends up captured (an
+// unreadable or already-injected result must not linger), and a finding
+// already recorded in <session>.nudged-injected — drained and injected
+// in-session, or a rare race with a concurrent prompt-time drain — is
+// skipped, never double-captured. Gated on nudge.async (default off) so the
+// shipped synchronous path stays byte-identical: no config read touches the
+// filesystem when it's unset, and a sync-mode session never has a
+// pending-nudges spool to find in the first place. ALSO gated on
+// nudge.enabled, mirroring drainPendingNudges's double-gate exactly
+// (prompt-context.js) — SPOR_NUDGE=0 must suppress this drain the same way it
+// suppresses the prompt-time one, so a user who disabled nudges mid-session
+// never gets an old pending finding captured behind their back.
+async function sessionEndPendingNudges({ graph, slug, session, remote }) {
+  if (!u.cfgBool("nudge.enabled", "NUDGE", true)) return;
+  if (!u.cfgBool("nudge.async", "NUDGE_ASYNC", false)) return;
+
+  const dir = path.join(graph, "journal", "pending-nudges", session);
+  let all;
+  try {
+    all = fs.readdirSync(dir);
+  } catch {
+    return; // no spool dir for this session
+  }
+  const files = all.filter((f) => f.endsWith(".out.json")).sort();
+  if (!files.length) return;
+
+  let alreadyInjected = new Set();
+  try {
+    alreadyInjected = new Set(
+      fs
+        .readFileSync(path.join(graph, "journal", `${session}.nudged-injected`), "utf8")
+        .split("\n")
+        .filter(Boolean)
+    );
+  } catch {}
+
+  const results = [];
+  for (const f of files) {
+    const fp = path.join(dir, f);
+    let r = null;
+    try {
+      r = JSON.parse(fs.readFileSync(fp, "utf8"));
+    } catch {}
+    // Consume every drained file whether or not it ends up captured, exactly
+    // like drainPendingNudges — an unreadable or already-injected result must
+    // not linger and get re-read by a future sweep.
+    try {
+      fs.unlinkSync(fp);
+    } catch {}
+    if (r && r.file && r.facts && !alreadyInjected.has(r.file)) results.push(r);
+  }
+  if (!results.length) return;
+
+  const rlog = u.makeLogger(path.join(graph, "journal", "remote.log"), `nudge-sessionend ${slug}: `);
+
+  for (const r of results) {
+    const facts = u.stripTrailingNewlines(r.facts);
+    const text = `Classifier-verified findings from ${r.file}, captured at session end because the session had no further prompt to drain them:\n\n${facts}`;
+
+    if (remote) {
+      const body = JSON.stringify({
+        text: u.byteHead(text, 3900),
+        // Always the ambient session slug, never user-declared — same
+        // posture as the LLM distiller's per-fact capture loop below.
+        context: { project: slug, project_explicit: false },
+        source: "nudge-sessionend",
+        idempotency_key: crypto.createHash("sha256").update(`${session}\n${r.file}\n${facts}`).digest("hex"),
+      });
+      const post = await u
+        .curl(`${u.serverBase()}/v1/capture`, {
+          method: "POST",
+          headers: { ...u.bearer(), "Content-Type": "application/json" },
+          body,
+          timeoutMs: 30000,
+        })
+        .catch(() => null);
+      if (post && post.http === "200") {
+        rlog(`captured session-final finding from ${r.file}`);
+      } else if (post && ["400", "413", "422"].includes(post.http)) {
+        rlog(`session-final finding from ${r.file} rejected (http=${post.http})`);
+      } else {
+        u.ensureDir(path.join(graph, "outbox"));
+        try {
+          fs.writeFileSync(
+            path.join(graph, "outbox", `${session}-${Math.floor(Date.now() / 1000)}-${u.bashRandom()}.capture.json`),
+            body
+          );
+        } catch {}
+        rlog(`session-final finding from ${r.file} spooled to outbox (http=${post ? post.http : "000"})`);
+      }
+      continue;
+    }
+
+    // LOCAL MODE: write a validated node file directly — no LLM needed, the
+    // async classifier already verified these facts. Same minimal heuristic
+    // shape as `spor add`'s local path (bin/spor.js cmdAdd): a type-prefixed
+    // id, title/summary from the finding text, machine authorship stamped so
+    // briefings render it as such.
+    const logFile = path.join(graph, "journal", "distill.log");
+    const nodesDir = path.join(graph, "nodes");
+    if (!fs.existsSync(nodesDir)) {
+      u.appendLine(logFile, `  session-final capture from ${r.file} dropped: no local graph at ${nodesDir}`);
+      continue;
+    }
+    let g;
+    try {
+      g = graphLib.loadGraph(nodesDir);
+    } catch (e) {
+      u.appendLine(logFile, `  session-final capture from ${r.file} dropped: loadGraph failed: ${e.message}`);
+      continue;
+    }
+    const type = "task";
+    const prefixes = (g.registry && g.registry.prefixesFor(type)) || null;
+    const prefix = prefixes && prefixes[0] ? prefixes[0] : `${type}-`;
+    const stem = u.slugify(path.basename(r.file, path.extname(r.file))) || "capture";
+    let id = `${prefix}nudge-sessionend-${stem}`;
+    const base = id;
+    let n = 1;
+    while (fs.existsSync(path.join(nodesDir, `${id}.md`))) id = `${base}-${++n}`;
+    const title = `Session-final capture-nudge findings from ${r.file}`.slice(0, 120);
+    const firstFact = facts.split("\n")[0] || title;
+    const summary = firstFact.length > 497 ? `${firstFact.slice(0, 497)}...` : firstFact;
+    const md = `---\nid: ${id}\ntype: ${type}\nrepo: ${slug}\ntitle: ${title.replace(/\n/g, " ")}\nsummary: ${summary.replace(
+      /\n/g,
+      " "
+    )}\ndate: ${u.localDate()}\nauthored_via: capture\n---\n\n${text}\n`;
+    let node;
+    try {
+      node = graphLib.parseFrontmatter(md, `${id}.md`);
+    } catch (e) {
+      u.appendLine(logFile, `  session-final capture from ${r.file} dropped: parseFrontmatter failed: ${e.message}`);
+      continue;
+    }
+    const v = graphLib.validateNode(g, node);
+    if (!v.ok) {
+      u.appendLine(logFile, `  session-final capture invalid, skipped: ${v.errors.join("; ")}`);
+      continue;
+    }
+    try {
+      fs.writeFileSync(path.join(nodesDir, `${id}.md`), md);
+      u.appendLine(logFile, `  wrote ${path.join(nodesDir, `${id}.md`)} (session-final nudge capture)`);
+    } catch (e) {
+      u.appendLine(logFile, `  session-final capture from ${r.file} dropped: write failed: ${e.message}`);
+    }
+  }
+}
+
 async function distill(input) {
   if (process.env.SPOR_DISTILLING || process.env.SUBSTRATE_DISTILLING) return null;
 
@@ -303,6 +474,11 @@ async function distill(input) {
   if (!input.spor_debounced) {
     await sessionEndLease({ graph, slug, session, cwd, remote }).catch(() => {});
   }
+
+  // See sessionEndPendingNudges above for why this runs unconditionally
+  // (including on a debounce-approximated firing) and ahead of the
+  // distill.enabled kill switch below.
+  await sessionEndPendingNudges({ graph, slug, session, remote }).catch(() => {});
 
   // User kill switch, symmetric with the nudge's SPOR_NUDGE=0 (post-tool.js):
   // SPOR_DISTILL=0 (env) or distill.enabled:false (config) disables the paid
@@ -607,4 +783,12 @@ async function distill(input) {
   return null;
 }
 
-module.exports = { distill, normalizeEdges, parseNodeBlocks, parseFactBlocks, graphInsideCodeRepo, sessionEndLease };
+module.exports = {
+  distill,
+  normalizeEdges,
+  parseNodeBlocks,
+  parseFactBlocks,
+  graphInsideCodeRepo,
+  sessionEndLease,
+  sessionEndPendingNudges,
+};

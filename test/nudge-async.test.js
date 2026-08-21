@@ -11,7 +11,7 @@ const assert = require("node:assert");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { runHook, writeNodeScript, nodeCommand } = require("./helpers/portable");
+const { runHook, spawnHook, writeNodeScript, nodeCommand } = require("./helpers/portable");
 
 const PROSE = Array.from({ length: 8 }, (_, i) =>
   `Finding ${i}: the retry path in server X was dismissed because the upstream ` +
@@ -301,4 +301,187 @@ test("pending nudge injects even when the digest gate would suppress (trivial pr
   // pending nudge still injects.
   const text = JSON.parse(promptContext(home, cwd, { prompt: "ok" })).hookSpecificOutput.additionalContext;
   assert.match(text, /capture nudge/);
+});
+
+// issue-spor-async-nudge-session-final-loss: the SessionEnd half. A finding
+// classified as the session's LAST action has no next UserPromptSubmit to run
+// drainPendingNudges, so it would otherwise sit stranded in the spool forever.
+// SessionEnd (bin/spor-hook distill) must drain it and write it through the
+// capture path directly, with no further LLM call.
+
+function sessionEndPayload(cwd, session = "s1") {
+  return JSON.stringify({ cwd, session_id: session, hook_event_name: "SessionEnd" });
+}
+
+function nodeFiles(home) {
+  try {
+    return fs.readdirSync(path.join(home, "nodes")).filter((f) => f.endsWith(".md"));
+  } catch {
+    return [];
+  }
+}
+
+// async spawn — spawnSync would block the event loop and starve an in-process
+// stub server while the hook's curl waits on it (same rationale as the other
+// suites' runAsync helpers).
+function runAsync(args, input, env) {
+  return new Promise((resolve, reject) => {
+    const c = spawnHook(args, input, env, { stdio: ["pipe", "ignore", "ignore"] });
+    c.on("error", reject);
+    c.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`exit ${code}`))));
+  });
+}
+
+function stubCaptureServer() {
+  const http = require("node:http");
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      hits.push({ method: req.method, url: req.url, body });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", ids: ["task-stub"] }));
+    });
+  });
+  return new Promise((resolve) =>
+    srv.listen(0, "127.0.0.1", () => resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` }))
+  );
+}
+
+test("SessionEnd: a session-final async nudge finding lands durably with no subsequent prompt (local mode)", async () => {
+  const { root, home, cwd } = scratch();
+  const file = path.join(cwd, "reports", "findings.md");
+  postTool(home, cwd, factStub(root), { file, content: PROSE });
+  assert.ok(await waitFor(() => outFiles(home).length === 1), "worker never wrote a result");
+
+  // No subsequent UserPromptSubmit — go straight to SessionEnd. Disable the
+  // LLM distiller (SPOR_DISTILL=0) so this exercises the nudge-drain branch in
+  // isolation, exactly like session-lease.test.js isolates sessionEndLease.
+  const out = runHook(["distill", "--host", "claude-code"], sessionEndPayload(cwd), env(home, null, { SPOR_DISTILL: "0" }));
+  assert.strictEqual(out.status, 0, out.stderr);
+
+  // Consumed from the spool...
+  assert.strictEqual(outFiles(home).length, 0, "the stranded result is drained at session end");
+  // ...and written through the capture path as a durable node.
+  const written = nodeFiles(home);
+  assert.strictEqual(written.length, 1, `expected exactly one captured node; found: ${JSON.stringify(written)}`);
+  const md = fs.readFileSync(path.join(home, "nodes", written[0]), "utf8");
+  assert.match(md, /^id: task-nudge-sessionend-/m);
+  assert.match(md, /authored_via: capture/);
+  assert.match(md, /The retry-path approach was dismissed/);
+  assert.match(md, /findings\.md/);
+});
+
+test("SessionEnd: a finding already recorded in <session>.nudged-injected is not double-captured", async () => {
+  const { home, cwd } = scratch();
+  const file = path.join(cwd, "doc.md");
+  seedOut(home, "s1", "r0", file, "1. a finding already injected in-session");
+  fs.mkdirSync(path.join(home, "journal"), { recursive: true });
+  fs.writeFileSync(path.join(home, "journal", "s1.nudged-injected"), `${file}\n`);
+
+  const out = runHook(["distill", "--host", "claude-code"], sessionEndPayload(cwd), env(home, null, { SPOR_DISTILL: "0" }));
+  assert.strictEqual(out.status, 0, out.stderr);
+
+  // Consumed (never left to linger)...
+  assert.strictEqual(outFiles(home).length, 0);
+  // ...but NOT captured a second time.
+  assert.strictEqual(nodeFiles(home).length, 0);
+});
+
+test("SessionEnd: SPOR_NUDGE=0 suppresses the drain exactly like the prompt-time one", () => {
+  const { home, cwd } = scratch();
+  const file = path.join(cwd, "doc.md");
+  seedOut(home, "s1", "r0", file);
+
+  const out = runHook(
+    ["distill", "--host", "claude-code"],
+    sessionEndPayload(cwd),
+    env(home, null, { SPOR_DISTILL: "0", SPOR_NUDGE: "0" })
+  );
+  assert.strictEqual(out.status, 0, out.stderr);
+  assert.strictEqual(outFiles(home).length, 1, "a disabled nudge must not drain a pending result at session end either");
+  assert.strictEqual(nodeFiles(home).length, 0);
+});
+
+test("SessionEnd: nudge.async off leaves the spool untouched (byte-identical default path)", () => {
+  const { home, cwd } = scratch();
+  const file = path.join(cwd, "doc.md");
+  seedOut(home, "s1", "r0", file);
+
+  const e = { ...process.env };
+  for (const k of Object.keys(e)) if (/^(SPOR_|SUBSTRATE_)/.test(k)) delete e[k];
+  delete e.GEMINI_API_KEY;
+  delete e.ANTHROPIC_API_KEY;
+  e.SUBSTRATE_HOME = home;
+  e.SPOR_ENABLED = "1";
+  e.SPOR_DISTILL = "0"; // nudge.async deliberately NOT set
+
+  const out = runHook(["distill", "--host", "claude-code"], sessionEndPayload(cwd), e);
+  assert.strictEqual(out.status, 0, out.stderr);
+  assert.strictEqual(outFiles(home).length, 1, "the spool is untouched when nudge.async is unset");
+  assert.strictEqual(nodeFiles(home).length, 0);
+});
+
+test("SessionEnd: SPOR_DISTILLING recursion guard still short-circuits the nudge drain", () => {
+  const { home, cwd } = scratch();
+  const file = path.join(cwd, "doc.md");
+  seedOut(home, "s1", "r0", file);
+
+  const out = runHook(
+    ["distill", "--host", "claude-code"],
+    sessionEndPayload(cwd),
+    env(home, null, { SPOR_DISTILL: "0", SPOR_DISTILLING: "1" })
+  );
+  assert.strictEqual(out.status, 0, out.stderr);
+  assert.strictEqual(outFiles(home).length, 1, "the recursion guard skips the drain too — nothing consumed");
+  assert.strictEqual(nodeFiles(home).length, 0);
+});
+
+test("SessionEnd (remote): posts an undrained finding to /v1/capture", async () => {
+  const { home, cwd } = scratch();
+  fs.rmSync(path.join(home, "nodes"), { recursive: true }); // pure remote, same gate as distill's own remote tests
+  const file = path.join(cwd, "notes.md");
+  seedOut(home, "s1", "r0", file, "1. a session-final finding");
+
+  const { srv, hits, base } = await stubCaptureServer();
+  try {
+    const e = env(home, null, {
+      SPOR_SERVER: base,
+      SPOR_TOKEN: "spor_pat_test",
+      SPOR_DISTILL: "0",
+      SPOR_SESSION_LEASE: "0",
+    });
+    await runAsync(["distill", "--host", "claude-code"], sessionEndPayload(cwd), e);
+    const cap = hits.find((h) => h.url === "/v1/capture");
+    assert.ok(cap, `expected a /v1/capture POST; hits: ${JSON.stringify(hits.map((h) => h.method + " " + h.url))}`);
+    const sent = JSON.parse(cap.body);
+    assert.strictEqual(sent.source, "nudge-sessionend");
+    assert.strictEqual(sent.context.project_explicit, false);
+    assert.match(sent.text, /a session-final finding/);
+    assert.match(sent.text, /notes\.md/);
+    assert.match(sent.idempotency_key, /^[0-9a-f]{64}$/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("SessionEnd (remote): a transport failure spools the finding to the outbox", async () => {
+  const { home, cwd } = scratch();
+  fs.rmSync(path.join(home, "nodes"), { recursive: true });
+  const file = path.join(cwd, "notes.md");
+  seedOut(home, "s1", "r0", file, "1. a session-final finding");
+
+  const e = env(home, null, {
+    SPOR_SERVER: "http://127.0.0.1:1", // nothing listening -> transport failure
+    SPOR_TOKEN: "spor_pat_test",
+    SPOR_DISTILL: "0",
+    SPOR_SESSION_LEASE: "0",
+  });
+  await runAsync(["distill", "--host", "claude-code"], sessionEndPayload(cwd), e);
+  const outbox = fs.existsSync(path.join(home, "outbox")) ? fs.readdirSync(path.join(home, "outbox")) : [];
+  assert.strictEqual(outbox.length, 1, `expected one spooled capture; found: ${JSON.stringify(outbox)}`);
+  const spooled = JSON.parse(fs.readFileSync(path.join(home, "outbox", outbox[0]), "utf8"));
+  assert.strictEqual(spooled.source, "nudge-sessionend");
+  assert.match(spooled.text, /a session-final finding/);
 });
