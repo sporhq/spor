@@ -1641,6 +1641,166 @@ b
   assert.ok(v.warnings.some((w) => /unknown edge type 'invented-edge'/.test(w)));
 });
 
+// task-spor-validate-linter-block-form-edges: validateGraph's own lenient
+// re-parse used to only recognize flow-form "to:" edges, so block-form and
+// "target:"-keyed edges silently counted as zero edges here even though
+// parseFrontmatter (the write path, dec-spor-frontmatter-edge-accept-
+// normalize-reject-loud) accepts both. Bring the linter's edge recognition
+// in line — each shape below must feed the SAME downstream checks (dangling/
+// unknown-type warnings) as an ordinary flow-form edge does.
+
+test("validateGraph: a block-form edge is recognized identically to flow-form (dangling-edge warning fires)", () => {
+  const fx = tmpGraph({
+    "art-e.md": `---
+id: art-e
+type: artifact
+title: T
+summary: s
+date: 2026-08-08
+edges:
+  - type: relates-to
+    to: ghost-node
+---
+b
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.deepEqual(v.errors, []);
+  assert.ok(v.warnings.some((w) => /dangling edge relates-to -> ghost-node/.test(w)));
+});
+
+test("validateGraph: a flow-form edge using 'target:' is recognized identically to 'to:'", () => {
+  const fx = tmpGraph({
+    "dec-e.md": `---
+id: dec-e
+type: decision
+title: T
+summary: s
+date: 2026-08-08
+edges:
+  - {type: relates-to, target: ghost-node}
+---
+b
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.deepEqual(v.errors, []);
+  assert.ok(v.warnings.some((w) => /dangling edge relates-to -> ghost-node/.test(w)));
+});
+
+test("validateGraph: a block-form edge using 'target:' is recognized identically to 'to:'", () => {
+  const fx = tmpGraph({
+    "art-e.md": `---
+id: art-e
+type: artifact
+title: T
+summary: s
+date: 2026-08-08
+edges:
+  - type: relates-to
+    target: ghost-node
+---
+b
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.deepEqual(v.errors, []);
+  assert.ok(v.warnings.some((w) => /dangling edge relates-to -> ghost-node/.test(w)));
+});
+
+test("validateGraph: an unknown edge type still warns under block-form", () => {
+  const fx = tmpGraph({
+    "art-e.md": `---
+id: art-e
+type: artifact
+title: T
+summary: s
+date: 2026-08-08
+edges:
+  - type: invented-edge
+    to: art-e
+---
+b
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.deepEqual(v.errors, []);
+  assert.ok(v.warnings.some((w) => /unknown edge type 'invented-edge'/.test(w)));
+});
+
+test("validateGraph: a block-form edge entry that never resolves a 'to'/'target' warns loudly, naming the entry (not silently dropped)", () => {
+  const fx = tmpGraph({
+    "task-e.md": `---
+id: task-e
+type: task
+title: T
+summary: s
+date: 2026-08-08
+edges:
+  - type: relates-to
+---
+b
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.deepEqual(v.errors, []); // the lenient re-parse warns, it never throws/errors
+  assert.ok(v.warnings.some((w) => /unparseable edge entry/.test(w) && /task-e\.md/.test(w)));
+});
+
+test("validateGraph: an unparseable line inside a block-form edges list warns instead of silently dropping", () => {
+  const fx = tmpGraph({
+    "task-e.md": `---
+id: task-e
+type: task
+title: T
+summary: s
+date: 2026-08-08
+edges:
+  - type: relates-to
+    to: dec-a
+  not a key line at all
+---
+b
+`,
+    "dec-a.md": `---
+id: dec-a
+type: decision
+title: A
+summary: s
+date: 2026-08-08
+---
+b
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.deepEqual(v.errors, []);
+  assert.ok(v.warnings.some((w) => /unparseable edge entry "not a key line at all"/.test(w)));
+  // the well-formed entry before the bad line still parses
+  assert.ok(!v.warnings.some((w) => /dangling edge relates-to -> dec-a/.test(w)));
+});
+
+test("validateGraph: block-form and flow-form edges may mix under one 'edges:' key, both recognized", () => {
+  const fx = tmpGraph({
+    "task-e.md": `---
+id: task-e
+type: task
+title: T
+summary: s
+date: 2026-08-08
+edges:
+  - type: relates-to
+    to: ghost-a
+  - {type: blocks, to: ghost-b}
+---
+b
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir);
+  assert.deepEqual(v.errors, []);
+  assert.ok(v.warnings.some((w) => /dangling edge relates-to -> ghost-a/.test(w)));
+  assert.ok(v.warnings.some((w) => /dangling edge blocks -> ghost-b/.test(w)));
+});
+
 // ---------- loadGraph wiring ----------
 
 test("loadGraph: briefing and correction nodes are non-traversable (excluded from adjacency)", () => {
