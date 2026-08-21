@@ -637,21 +637,26 @@ Two gate checks joined the sweep with the edge-write UX work
 - **inert-gate** — a `blocks` edge whose source has reached a terminal
   status while its target is still live, claimed by no one, and not itself
   a *program* (more than one node hanging beneath it in the membership
-  tree `render_program` walks). The gate has cleared but the graph still
-  says "blocked": the finding (on the target's side,
-  `find-inert-gate-<source>-<target>`) says the target can proceed — drop
-  the edge or pick up the work. This is the "the blocker was already done"
-  discovery made manually during dogfooding, mechanized. It carries a
+  tree `render_program` walks — per node, preferring inbound
+  `member-of-program` edges where any are declared and falling back to
+  inbound `blocks` where none are, dec-spor-program-membership-per-node-preference;
+  `member-of-program` ships as a graph-resident schema node pending
+  activation, so this fallback is today's live behavior). The gate has
+  cleared but the graph still says "blocked": the finding (on the target's
+  side, `find-inert-gate-<source>-<target>`) says the target can proceed —
+  drop the edge or pick up the work. This is the "the blocker was already
+  done" discovery made manually during dogfooding, mechanized. It carries a
   mechanical `remove_edge` remedy, so a batch `resolve_finding` can drop
   the stale edge without a human re-deriving the fix
   (issue-spor-gardener-mechanical-remediation-gap).
 - **gates-cleared** — the same cleared-gate situation, but on a dependent
-  that *heads a program*: every member in its `blocks` tree has landed,
-  nothing live blocks it anywhere in that tree, and nobody has claimed it.
+  that *heads a program*: every member in its membership tree has landed,
+  nothing live gates it anywhere in that tree, and nobody has claimed it.
   Firing one inert-gate per membership edge would hand a batch
   `resolve_finding` a `remove_edge` remedy for edges that are the
   program's own progress record — `render_program` reads exactly those
-  inbound `blocks` edges to render the gating tree, so mechanically
+  edges (explicit inbound `member-of-program` per node, or inbound `blocks`
+  where none are declared) to render the gating tree, so mechanically
   dropping them would silently erase a finished program's membership.
   Instead the gardener files ONE `find-gates-cleared-<target>` finding on
   the umbrella itself, naming its members, and deliberately gives it **no

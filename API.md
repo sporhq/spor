@@ -134,7 +134,8 @@ nodes + typed edges, each node carrying truth flags
 neighbors (`more`). Input `{ "root_id"?, "query"?, "depth"?, "limit"? }` → the
 view-tree slice (`view`, `node_ids`) plus a text rendering. Call with **no
 arguments** for the birds-eye programs overview — every umbrella root (any
-node other work `blocks`) with resolution-derived completion %, most complete
+node other work `blocks` or declares a `member-of-program` edge to) with
+resolution-derived completion %, most complete
 first. Pass `root_id` to walk outward from one node (depth 1-2, deterministic,
 no LLM; default depth 1, limit 40 capped at 80); pass `query` instead to seed
 the roots by relevance. The two are mutually exclusive; `root_id` wins when
@@ -438,26 +439,38 @@ verbatim.
 
 ### `render_program`
 
-The program/progress view over `blocks` topology — the birds-eye "where do we
-stand" for a large workstream, auto-derived on demand with no lens authoring.
-Input `{ "id": "<root-node-id>", "max_depth"?, "max_nodes"? }` → `{ "found":
-true, "root_id", "progress": {"total", "done", "active", "blocked", "open",
-"pct", "statuses"}, "count", "truncated"?, "view", "node_ids" }`. Given a root
-node (an umbrella task, a milestone — anything other work `blocks`), the
-server walks its gating tree — every node that blocks it, transitively over
-inbound `blocks` edges — and derives each node's bucket from the same truth
-the queue uses: terminal statuses, supersession, and live `resolves`/`answers`
-edges count as **done** (even while the status field lags — the effective
-status then reads `resolved` with a `resolved_by` ride-along); a node gated by
-its own live unresolved blockers is **blocked**; live unblocked work splits
+The program/progress view over program-membership topology — the birds-eye
+"where do we stand" for a large workstream, auto-derived on demand with no
+lens authoring. Input `{ "id": "<root-node-id>", "max_depth"?, "max_nodes"? }`
+→ `{ "found": true, "root_id", "progress": {"total", "done", "active",
+"blocked", "open", "pct", "statuses"}, "count", "truncated"?, "view",
+"node_ids" }`. Given a root node (an umbrella task, a milestone — anything
+other work joins), the server walks its membership tree: **per node**, it
+prefers inbound `member-of-program` edges where any are declared (the
+all-or-nothing preference, dec-spor-program-membership-per-node-preference)
+and falls back to inbound `blocks` edges where none are declared (the
+original blocks-topology inference, unchanged) — so an unmigrated or
+partially migrated program keeps rendering, and a half-migrated umbrella
+never silently shrinks. `member-of-program`
+(dec-spor-program-membership-dedicated-edge-type) is additive with `blocks`
+— `blocks` keeps meaning only gating, `member-of-program` records pure
+topology — and ships as a graph-resident schema node
+(`schema-edge-member-of-program`), pending activation like any resident
+schema; check `spor schema member-of-program` for its live status rather than
+assuming. Each node's bucket then derives from the same truth the queue uses:
+terminal statuses, supersession, and live `resolves`/`answers` edges count as
+**done** (even while the status field lags — the effective status then reads
+`resolved` with a `resolved_by` ride-along); a node gated by its own live
+unresolved `blocks` predecessors is **blocked**; live unblocked work splits
 **active** vs **open**. `view` is the standard view tree (`as: "tree"` with an
 additive `progress` block); the text content is a progress-bar header plus the
-glyphed gating tree. Shared blockers render once and repeat as `repeat: true`
+glyphed gating tree. Shared members render once and repeat as `repeat: true`
 leaves (counted once); `max_depth`/`max_nodes` caps count skipped branches
-into `truncated`, never silently. A root nothing blocks is a successful empty
-result whose prose says how to model the program (add `blocks` edges from the
-gating tasks). Unknown `id` errors with `{ "found": false, "error":
-"unknown_root" }`. The REST twin is `GET /v1/program/{id}` (§3).
+into `truncated`, never silently. A root with no members is a successful
+empty result whose prose says how to model the program (add `member-of-program`
+or `blocks` edges from the member tasks). Unknown `id` errors with `{ "found":
+false, "error": "unknown_root" }`. The REST twin is `GET /v1/program/{id}`
+(§3).
 
 ### `apply_lens_action`
 
@@ -598,7 +611,7 @@ agent subject sees no graph content; a coarse read-only/CI flag is not a bypass.
 | `GET /v1/metrics/capture?since=` | the cross-author capture-discipline eval harvest (task-spor-tenant-capture-metrics-export) | capture-discipline aggregates for an **opted-in** deployment — the same kernel the dogfood CLI runs (`lib-engine/kernel/capture-metrics.js`), computed server-side over the resident graph plus the FULL request journal (every rotated `server.log` segment). Three gates stack (dec-spor-tenant-metrics-aggregates-only): the per-machine opt-in env `SPOR_METRICS_EXPORT` (unset → the route 404s, so a never-opted tenant shows no surface), admin auth (stewards→root, 403), and **unconditional redaction** — the body carries counts/rates only: by-identity keys are stable per-tenant pseudonyms (`author-<hash12>`, salted at `cache/metrics-salt` so per-author trends survive across windows), closure entries keep `{edge, latency_days}` but drop node ids, and id lists reduce to `open_count`/`slug_smell_count`. No journal lines, node bodies, or capture prose ever exit. `?since=YYYY-MM-DD` bounds the window (malformed → `422`) |
 | `POST /v1/questions` `{text, title?, mentions?, project?}` | ask_question's REST twin | file a question node; deterministically routed to the steward of the closest relevance-neighborhood node, unrouted if none → 201 `{status, id, project, routed_to, via, asker, revision, warnings}`. `project` is derived from the relevance neighborhood (then the asker's home project) unless an explicit `project` slug overrides it — pass that for a mention-less question (a dispatched agent injects its session project); a malformed slug → 400 |
 | `POST /v1/gardener` | ops cron / on demand; `spor admin gardener` | run a gardener sweep now; findings filed as queue items → `{checked, filed, resolved, skipped, generated_at}` (`filed`/`resolved`/`skipped` are id lists, `checked` a count). The `spor admin gardener [--json]` CLI verb is the shell front-door (remote-only — the server owns the gardener); authenticated but **not** admin-gated server-side today (unlike `/v1/backup`), so any valid team token can trigger it — the verb still surfaces a 403 as an admin-privilege (stewards→root) hint for a deployment that adds the gate |
-| `GET /v1/program/{id}?format=json\|text&depth=&max_nodes=` | program oversight, /spor:brief follow-ups | the program/progress view (`render_program`'s REST twin, one kernel behind both doors): the gating tree of everything that `blocks` `{id}` transitively, with resolution-derived progress (`{progress: {total, done, active, blocked, open, pct, statuses}}` on the view root; done = terminal status / supersession / live resolves-answers edge, exactly the queue's truth). JSON view tree by default, `?format=text` for the terminal rendering; `depth`/`max_nodes` bound expansion and count skipped branches into `truncated`, never silently. 404 for an unknown id |
+| `GET /v1/program/{id}?format=json\|text&depth=&max_nodes=` | program oversight, /spor:brief follow-ups | the program/progress view (`render_program`'s REST twin, one kernel behind both doors): the membership tree of everything gating `{id}`, preferring inbound `member-of-program` edges per node and falling back to inbound `blocks` where none are declared (see `render_program`, §2, for the per-node preference and the pending-activation caveat), with resolution-derived progress (`{progress: {total, done, active, blocked, open, pct, statuses}}` on the view root; done = terminal status / supersession / live resolves-answers edge, exactly the queue's truth). JSON view tree by default, `?format=text` for the terminal rendering; `depth`/`max_nodes` bound expansion and count skipped branches into `truncated`, never silently. 404 for an unknown id |
 | `GET /v1/lens/{id}/render?format=html\|text\|json` | browsers, teammates without a checkout | run a lens OR workspace node and render its view tree (html default, plain text, or the raw tree as json). Read-only — no action forms; writes stay with `/v1/nodes` and the MCP tools. Auth is the caller's bearer header OR a signed read-only **render ticket** for shared links (browser links can't carry an Authorization header): `?ticket=<blob>` is accepted once and exchanged via a 302 for an HttpOnly `spor_render_ticket` cookie (kept out of URLs, logs, and view-to-view hrefs). The ticket binds `$viewer` to the recorded sharer and the render shows a "Viewing as &lt;sharer&gt;" banner. The former `?token=<PAT>` sharing path is **removed** — a shared link can never carry a write-capable credential |
 | `POST /v1/lens/{id}/ticket` `{expires?}` | sharing a view; `spor share` | mint a signed, expiring, read-only render ticket for the lens/workspace, recording the authenticated caller as the sharer → `{ticket, url, lens_id, sharer_person_id, exp}`. `expires` is `<N>d` or an ISO date (default `7d`, max `30d`); the caller must be bound to a person node (else `422 no_person`). The ticket carries no write scope and is honored only on the render route (directly, or via the app host's ticket exchange below). The minted `url` depends on host role: an MCP-only host (`SPOR_HOST_ROLE=mcp`) with `SPOR_APP_URL` set mints an **absolute** `${SPOR_APP_URL}/views/{id}?ticket=...` — the app host's own render page, since the MCP host itself 404s on HTML renders; unset, it falls back to today's relative shape; every other role keeps its existing `oauth.baseUrl(request.raw)`-based absolute `/v1/lens/{id}/render?ticket=...`. On the app host, `GET /views/{id}` accepts that `?ticket=` exactly once: it is exchanged via a 302 into an HttpOnly `spor_render_ticket` cookie (stripped from the URL, kept out of logs and view-to-view hrefs) and replayed to api as the credential on the render fetch — but a **live app-host session outranks the ticket**: if the visitor is already signed in, their own session is used and the ticket cookie is ignored, so a shared link can never pin a signed-in user's view to the sharer's `$viewer`. The `spor share <lens-id> [--expires <Nd>]` CLI verb is the shell front-door (remote-only — tickets are minted and signed server-side); it prints the shareable link ready to paste, `--json` for the raw envelope |
 | `POST /v1/merge` `{nodes: [...], mode?: "plan"\|"apply", id_map?: {...}, trust_attached_code?: bool, force?: bool}` | admin promoting one graph into another — pilot-to-org, or a local dogfood graph into a hosted tenant | bring another graph's exported node files (`nodes`: an array of raw node markdown strings) into this one without the failure mode of the naive `GET /v1/export \| POST /v1/nodes --if-exists skip` — silently DROPPING every colliding node while imported edges that pointed at it re-bind to this graph's unrelated same-named node (ordinal id schemes like `cap-<date>-<n>` collide across any two independently started graphs). **Admin-gated** (stewards→root, else `403 forbidden`): `mode:"apply"` writes through the same trusted bulk-import door the server uses internally, which preserves each incoming node's original attribution (a merge moves history, it does not re-author it) and skips the `transitions()`/policy gates (content validation still runs per node; create-only, one deferred commit). Every incoming node classifies as **imported** (id unknown here), **deduped** (id collides, content identical — attribution-blind, this graph's copy wins), **remapped** (id collides, content differs, and the id's final dash-segment is all-digits/*ordinal* — rewritten to `<id>-<sha256(content)[:7]>`, with every reference to the old id across the incoming batch rewritten to match), or **conflict** (id collides with different content and a *semantic* id; a `person` node's email already bound to a different id; or a `schema`/`workflow`/`workflow-run` node or a `stewards`-to-this-graph's-root edge — none of these ever merge silently). Conflicts are reported for manual triage and never written; the schema/workflow class is the one skippable via `trust_attached_code: true` (only for a whole graph you own). `mode:"plan"` (the default) runs the same classification and validation and returns the report without writing anything; `mode:"apply"` **refuses with `409 conflict`** (nothing written) whenever the plan still carries conflicts or validation errors, unless `force: true` — which imports the clean subset and knowingly leaves any reference to a skipped id unresolved. `id_map` (`{"old-id": "new-id"}`) seeds cross-id rewrites; feed a plan's own `id_map` back into the next request when a graph is too large for one batch (plan every batch first to build the complete map, then apply each). Response: `{mode, counts: {incoming, imported, deduped, remapped, conflicts, errors}, imported, deduped, remapped, conflicts, errors, id_map, results?, generated_at}` — `imported`/`deduped`/`remapped`/`conflicts` are arrays of `{id, new_id?, title?, reason?}`; `errors` is `{id, index?, errors: [...]}` (unparseable/invalid entries); `results` (apply mode only) carries the import door's per-entry write verdicts. Deterministic and idempotent — re-running an identical merge dedups everything the first run imported, safe after a partial failure. Called directly today (bearer admin token + `curl`); a CLI wrapper defaulting to plan mode is tracked separately (task-spor-cli-merge-verb) |
