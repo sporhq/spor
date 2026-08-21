@@ -2034,3 +2034,120 @@ test("searchProjects.boost favors a project in the ranking", () => {
   const ib = r.text.indexOf("dec-b");
   assert.ok(ib >= 0 && ib < ia, "boosted beta ranks before alpha");
 });
+
+// ---------- per-node fault isolation (dec-spor-buildgraph-per-node-fault-isolation) ----------
+//
+// One corrupt node file must not refuse the boot of the whole graph: buildGraph
+// parses each file in its own try/catch, skips a fault, records it on
+// graph.skipped, and loadGraph turns each entry into a named stderr warning.
+
+// Capture stderr around a load so the "loud" half is asserted, not assumed.
+function captureStderr(fn) {
+  const orig = process.stderr.write;
+  const out = [];
+  process.stderr.write = (chunk) => { out.push(String(chunk)); return true; };
+  try { return { value: fn(), stderr: out.join("") }; } finally { process.stderr.write = orig; }
+}
+
+// The bad node uses an edge entry the write-path parser rejects loudly
+// (dec-spor-frontmatter-edge-accept-normalize-reject-loud) — the newly
+// triggerable fault this isolation exists for.
+const BAD_EDGE_NODE = `---
+id: dec-corrupt
+type: decision
+project: my-project
+title: Corrupt node
+summary: A node whose edges block contains an entry that cannot be parsed.
+edges:
+  - {type: relates-to, to: dec-good-a}
+  - this is not an edge entry
+---
+Body.
+`;
+
+function faultFixture() {
+  return tmpGraph({
+    "dec-good-a.md": `---
+id: dec-good-a
+type: decision
+project: my-project
+title: Good A
+summary: A healthy node that must survive a sibling's parse fault.
+edges:
+  - {type: relates-to, to: dec-good-b}
+---
+Rate limiting is enforced at the edge proxy.
+`,
+    "dec-good-b.md": `---
+id: dec-good-b
+type: decision
+project: my-project
+title: Good B
+summary: A second healthy node, reachable from the first.
+---
+Token rotation happens nightly.
+`,
+    "dec-corrupt.md": BAD_EDGE_NODE,
+  });
+}
+
+test("loadGraph: one unparseable node is skipped and the rest of the graph still loads", () => {
+  const { value: g } = captureStderr(() => faultFixture().load());
+  assert.ok(g.nodes["dec-good-a"], "healthy node loaded");
+  assert.ok(g.nodes["dec-good-b"], "second healthy node loaded");
+  assert.equal(g.nodes["dec-corrupt"], undefined, "the corrupt node contributes nothing");
+  // the surviving graph is fully built, not a stub: adjacency and tf-idf docs.
+  assert.ok(g.adj["dec-good-a"].some((e) => e.to === "dec-good-b"));
+  assert.equal(g.docs.length, 2);
+  assert.equal(g.N, 2);
+});
+
+test("buildGraph: a skipped node is named on graph.skipped with its parse error", () => {
+  const { value: g } = captureStderr(() => faultFixture().load());
+  assert.equal(g.skipped.length, 1);
+  assert.equal(g.skipped[0].file, "dec-corrupt.md");
+  assert.match(g.skipped[0].error, /unparseable edge entry/);
+});
+
+test("loadGraph: a skipped node produces a loud stderr warning naming the file", () => {
+  const { stderr } = captureStderr(() => faultFixture().load());
+  assert.match(stderr, /SKIPPED unparseable node file/);
+  assert.match(stderr, /dec-corrupt\.md/);
+  assert.match(stderr, /unparseable edge entry/);
+});
+
+test("loadGraph: a healthy graph records no skips and warns nothing", () => {
+  const { value: g, stderr } = captureStderr(() => pricingFixture().load());
+  assert.deepEqual(g.skipped, []);
+  assert.equal(stderr, "");
+});
+
+// A surviving node's edge INTO a skipped node must behave exactly like an edge
+// onto a node that was never written: dangling, not a crash and not adjacency.
+test("loadGraph: an edge pointing at a skipped node is treated as dangling", () => {
+  const fx = tmpGraph({
+    "dec-good-a.md": `---
+id: dec-good-a
+type: decision
+project: my-project
+title: Good A
+summary: A healthy node that points at the corrupt one.
+edges:
+  - {type: relates-to, to: dec-corrupt}
+---
+Body.
+`,
+    "dec-corrupt.md": BAD_EDGE_NODE,
+  });
+  const { value: g } = captureStderr(() => fx.load());
+  assert.equal(g.adj["dec-good-a"], undefined, "no adjacency onto a node that isn't there");
+  assert.ok(g.danglingTo["dec-corrupt"].some((e) => e.from === "dec-good-a"));
+});
+
+// compile() must run over the survivors — "the rest of the graph loads" means
+// usable, not merely constructed.
+test("compile: a digest still compiles over a graph with a skipped node", () => {
+  const { value: g } = captureStderr(() => faultFixture().load());
+  const r = graph.compile(g, { query: "rate limiting edge proxy enforcement", digest: true });
+  assert.ok(r.text.includes("dec-good-a"));
+});

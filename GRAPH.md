@@ -97,6 +97,16 @@ Rules:
   work instead of in one person's calendar. Everything else (compiles,
   briefings, edges) sees a dormant node normally.
 - One fact per node. If you're writing "also" a lot, split it.
+- A node file the parser cannot read is **skipped, not fatal**
+  (dec-spor-buildgraph-per-node-fault-isolation). `loadGraph` isolates each
+  file's parse: a fault leaves that node out of the graph entirely — no node,
+  no edges, no search doc, and no registry override if it was a `type: schema`
+  node — and the rest of the graph loads normally, so one corrupt file can't
+  refuse a whole graph's boot. Every skip is named on stderr
+  (`spor: SKIPPED unparseable node file <path>: <why>`) and listed on
+  `graph.skipped`; an edge pointing at a skipped node simply dangles. Treat the
+  warning as corruption to fix, not noise to live with — `spor validate`
+  re-parses the same files leniently and names the offending line.
 
 ## Node types and id prefixes
 
