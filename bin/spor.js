@@ -77,6 +77,18 @@ function err(s) {
   process.stderr.write(s + "\n");
 }
 
+// Echo which write target a mutating verb resolved to — remote server or local
+// graph home — right under its confirmation line, so a write is never
+// ambiguous about where it landed (task-spor-cli-write-banner-mode-echo). The
+// motivating incident: an agent verifying local put-node behavior had
+// SPOR_SERVER set in its env, silently resolved remote, and wrote a junk node
+// to the live team graph. This is the ONE sanctioned mode difference under
+// norm-spor-cli-mode-parity — every other banner line stays identical across
+// modes; only this line names the resolved target.
+function writeTargetLine(cfg) {
+  return cfg.mode() === "remote" ? `  -> remote ${remote.base(cfg)}` : `  -> local ${cfg.graphHome()}`;
+}
+
 // Byte-identical passthrough to a lib/*.js script: inherit stdio, same argv,
 // propagate the exit code. Output is identical to invoking the script directly.
 function passthrough(script, args) {
@@ -898,7 +910,7 @@ function normalizeIfExists(raw) {
   return { ok: false, error: `--if-exists must be one of: error, skip, update` };
 }
 
-function renderPutNodeResult(res, json) {
+function renderPutNodeResult(cfg, res, json) {
   if (json) {
     out(JSON.stringify(res || {}, null, 2));
     return;
@@ -907,6 +919,7 @@ function renderPutNodeResult(res, json) {
   const id = res && res.id ? res.id : "(unknown)";
   const rev = res && res.revision ? ` @ ${res.revision}` : "";
   out(status === "skipped" ? `put-node skipped: ${id}${rev}` : `put-node ${status}: ${id}${rev}`);
+  out(writeTargetLine(cfg));
   for (const w of (res && res.warnings) || []) err(`  warning: ${w}`);
 }
 
@@ -1012,7 +1025,7 @@ async function cmdPutNode(cfg, { values, positionals }) {
       else err(putNodeEntryError(res0, r.status));
       return 1;
     }
-    renderPutNodeResult(res0, !!values.json);
+    renderPutNodeResult(cfg, res0, !!values.json);
     return 0;
   }
 
@@ -1029,7 +1042,7 @@ async function cmdPutNode(cfg, { values, positionals }) {
   }
   if (policy === "skip" && exists) {
     const res = { ok: true, status: "skipped", id, revision: gitBlobSha(fs.readFileSync(file)), warnings: [] };
-    renderPutNodeResult(res, !!values.json);
+    renderPutNodeResult(cfg, res, !!values.json);
     return 0;
   }
   if (policy === "update") {
@@ -1051,7 +1064,7 @@ async function cmdPutNode(cfg, { values, positionals }) {
   }
   fs.writeFileSync(file, raw);
   const res = { ok: true, status: exists ? "updated" : "created", id, revision: gitBlobSha(Buffer.from(raw)), warnings: valid.warnings || [] };
-  renderPutNodeResult(res, !!values.json);
+  renderPutNodeResult(cfg, res, !!values.json);
   return 0;
 }
 
@@ -2745,6 +2758,7 @@ async function cmdAdd(cfg, { values, positionals }) {
     }
     const ids = (r.json && (r.json.ids || r.json.node_ids)) || [];
     out(ids.length ? `captured: ${ids.join(", ")}` : `captured (${(r.json && r.json.status) || "ok"})`);
+    out(writeTargetLine(cfg));
     // Self-heal: a pure-CLI user has no Claude Code session to run the drain, so a
     // successful capture (proof the server is reachable) is the moment to flush any
     // backlog the fail-open spool stranded (task-spor-cli-outbox-drain-verb). Only
@@ -2822,7 +2836,8 @@ async function cmdAdd(cfg, { values, positionals }) {
     return 1;
   }
   fs.writeFileSync(path.join(nodesDir, `${id}.md`), md);
-  out(`added ${id} (${type}) to ${nodesDir}`);
+  out(`added ${id} (${type})`);
+  out(writeTargetLine(cfg));
   out(`  edit it to add edges/detail; 'spor next' will surface it.`);
   return 0;
 }
@@ -2880,6 +2895,7 @@ async function cmdAsk(cfg, { values, positionals }) {
     }
     const j = r.json || {};
     out(j.id ? `question filed: ${j.id}` : `question filed (${j.status || "ok"})`);
+    out(writeTargetLine(cfg));
     // Report routing so the asker knows who it reached, or that it's unrouted and
     // visible to everyone (no steward matched its neighborhood).
     if (j.routed_to) out(`  routed to ${j.routed_to}${j.via ? ` (via ${j.via})` : ""}`);
@@ -2949,7 +2965,8 @@ async function cmdAsk(cfg, { values, positionals }) {
     return 1;
   }
   fs.writeFileSync(path.join(nodesDir, `${id}.md`), md);
-  out(`question filed: ${id} (open) in ${nodesDir}`);
+  out(`question filed: ${id} (open)`);
+  out(writeTargetLine(cfg));
   out(`  'spor next' will surface it; answer it with a node carrying an answers edge.`);
   return 0;
 }
@@ -3057,6 +3074,7 @@ async function cmdCorrect(cfg, { values, positionals }) {
     }
     const id = (r.json && r.json.id) || "";
     out(id ? `correction created: ${id}` : `correction created (${(r.json && r.json.status) || "ok"})`);
+    out(writeTargetLine(cfg));
     const warnings = (r.json && r.json.warnings) || [];
     for (const w of warnings) err(`  warning: ${w}`);
     return 0;
@@ -3106,7 +3124,8 @@ async function cmdCorrect(cfg, { values, positionals }) {
   const missing = [...pin, ...exclude].filter((x) => !fs.existsSync(path.join(nodesDir, `${x}.md`)));
   for (const m of missing) err(`  warning: pinned/excluded node '${m}' does not exist yet — create it for the correction to take effect`);
   fs.writeFileSync(path.join(nodesDir, `${id}.md`), md);
-  out(`correction created: ${id} (targets ${target}) in ${nodesDir}`);
+  out(`correction created: ${id} (targets ${target})`);
+  out(writeTargetLine(cfg));
   return 0;
 }
 
@@ -3199,6 +3218,7 @@ async function stampField(cfg, { id, field, value }) {
       return 1;
     }
     out(value ? `${field} set: ${id} -> ${value}` : `${field} cleared: ${id}`);
+    out(writeTargetLine(cfg));
     return 0;
   }
 
@@ -3241,6 +3261,7 @@ async function stampField(cfg, { id, field, value }) {
   }
   fs.writeFileSync(file, newRaw);
   out(value ? `${field} set: ${id} -> ${value}` : `${field} cleared: ${id}`);
+  out(writeTargetLine(cfg));
   return 0;
 }
 
@@ -3443,6 +3464,7 @@ async function cmdSetStatus(cfg, { positionals }) {
       return 1;
     }
     out(`status set: ${id} -> ${value}`);
+    out(writeTargetLine(cfg));
     const lease = r.json && r.json.lease;
     if (lease) {
       if (lease.error) err(`  note: not claimed (${lease.error}${lease.holder ? `, held by ${lease.holder}` : ""})`);
@@ -3511,6 +3533,7 @@ async function cmdSetStatus(cfg, { positionals }) {
   }
   fs.writeFileSync(file, newRaw);
   out(`status set: ${id} -> ${value}`);
+  out(writeTargetLine(cfg));
   try {
     const warning = resolveAncestryWarning(cfg, id, value, node.commits);
     if (warning) err(`  warning: ${warning}`);
@@ -3612,6 +3635,7 @@ async function cmdEdge(cfg, { values, positionals }) {
     out(skipped
       ? `edge already present: ${id} -[${type}]-> ${to}`
       : `edge added: ${id} -[${type}]-> ${to}${echoed !== id ? ` (stored on ${echoed})` : ""}`);
+    out(writeTargetLine(cfg));
     return 0;
   }
 
@@ -3663,6 +3687,7 @@ async function cmdEdge(cfg, { values, positionals }) {
   const existing = (g.nodes[srcId] && g.nodes[srcId].edges) || [];
   if (existing.some((e) => e.type === edgeType && e.to === target) && !attrs) {
     out(`edge already present: ${id} -[${type}]-> ${to}`);
+    out(writeTargetLine(cfg));
     return 0;
   }
   const newRaw = appendEdgeLine(raw, edgeType, target, attrs);
@@ -3684,6 +3709,7 @@ async function cmdEdge(cfg, { values, positionals }) {
   }
   fs.writeFileSync(file, newRaw);
   out(`edge added: ${id} -[${type}]-> ${to}${srcId !== id ? ` (stored on ${srcId})` : ""}`);
+  out(writeTargetLine(cfg));
   return 0;
 }
 

@@ -223,8 +223,17 @@ test("set-status (local) is byte-identical to the pre-gate behavior when no comm
   const { home } = fixtureGraph(); // task-x carries no commits: field
   const r = run(["set-status", "task-x", "done"], { SPOR_HOME: home });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.strictEqual(r.stdout, "status set: task-x -> done\n");
+  assert.strictEqual(r.stdout, `status set: task-x -> done\n  -> local ${home}\n`);
   assert.strictEqual(r.stderr, "");
+});
+
+// task-spor-cli-write-banner-mode-echo: the resolved write target line, so a
+// local write is never mistaken for one that landed on a remote server.
+test("set-status (local) banners the resolved local graph home", () => {
+  const { home } = fixtureGraph();
+  const r = run(["set-status", "task-x", "active"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(r.stdout, `status set: task-x -> active\n  -> local ${home}\n`);
 });
 
 test("set-status (local) does not run the ancestry check on a non-terminal status", () => {
@@ -431,8 +440,24 @@ test("set-status (remote) is byte-identical to the pre-gate behavior when no com
   try {
     const r = await runAsync(["set-status", "task-r", "done"], remoteEnv(base, { SPOR_HOME: home }));
     assert.strictEqual(r.status, 0, r.stderr);
-    assert.strictEqual(r.stdout, "status set: task-r -> done\n");
+    assert.strictEqual(r.stdout, `status set: task-r -> done\n  -> remote ${base}\n`);
     assert.strictEqual(r.stderr, "");
+  } finally {
+    srv.close();
+  }
+});
+
+// task-spor-cli-write-banner-mode-echo: the resolved write target line, so a
+// remote write is never mistaken for one that landed on the local graph home.
+test("set-status (remote) banners the resolved remote server", async () => {
+  const raw = ancestryRawNode("task-r", []);
+  const { srv, base } = await ancestryRemoteStub({ "task-r": raw });
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-sse-remote-"));
+  try {
+    const r = await runAsync(["set-status", "task-r", "active"], remoteEnv(base, { SPOR_HOME: home }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /status set: task-r -> active/);
+    assert.match(r.stdout, new RegExp(`  -> remote ${base}\\n`));
   } finally {
     srv.close();
   }

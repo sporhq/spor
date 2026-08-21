@@ -82,6 +82,30 @@ test("put-node (local) creates a new node from a markdown file and validates cle
   assert.match(v.stdout, /0 errors/);
 });
 
+// task-spor-cli-write-banner-mode-echo: the resolved write target line, so a
+// local write is never mistaken for one that landed on a remote server. The
+// motivating incident: an agent verifying local put-node behavior had
+// SPOR_SERVER set in its env, so the write silently resolved remote and
+// landed on the live team graph.
+test("put-node (local) banners the resolved local graph home", () => {
+  const { home } = fixtureGraph();
+  const file = tmpNodeFile(nodeMd("dec-banner"));
+  const r = run(["put-node", file], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(r.stdout, `put-node created: dec-banner @ ${gitBlobSha(fs.readFileSync(file))}\n  -> local ${home}\n`);
+});
+
+// --json output stays machine-parseable — the banner is a human-readable line,
+// not part of the structured result.
+test("put-node (local) --json omits the write-target banner", () => {
+  const { home } = fixtureGraph();
+  const file = tmpNodeFile(nodeMd("dec-json"));
+  const r = run(["put-node", file, "--json"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stdout, /-> local/);
+  assert.deepStrictEqual(JSON.parse(r.stdout).status, "created");
+});
+
 test("put-node (local) skips an existing node with --if-exists skip", () => {
   const { home, nodes } = fixtureGraph();
   const before = readNode(nodes, "dec-old");
@@ -158,6 +182,20 @@ test("put-node (remote) POSTs a one-entry put_node batch with policy and revisio
     const post = hits.find((h) => h.method === "POST" && h.url === "/v1/nodes");
     assert.ok(post, "POST /v1/nodes");
     assert.deepStrictEqual(JSON.parse(post.body), { nodes: [{ node: raw, if_exists: "update", revision: "rev-1" }] });
+  } finally {
+    srv.close();
+  }
+});
+
+// task-spor-cli-write-banner-mode-echo: the remote counterpart of the local
+// banner test above — the resolved server, not the graph home, on a remote write.
+test("put-node (remote) banners the resolved remote server", async () => {
+  const file = tmpNodeFile(nodeMd("dec-remote"));
+  const { srv, base } = await putNodeStub();
+  try {
+    const r = await runAsync(["put-node", file, "--if-exists", "update", "--revision", "rev-1"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.strictEqual(r.stdout, `put-node updated: dec-remote @ rev-2\n  -> remote ${base}\n`);
   } finally {
     srv.close();
   }
