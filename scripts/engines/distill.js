@@ -170,13 +170,11 @@ async function sessionEndLease({ graph, slug, session, cwd, remote }) {
   // back off the pool for a two-day grace window. That is exactly the silent
   // re-claim the heartbeat's arm was chosen to avoid; SessionEnd must not
   // reintroduce it a beat later. A node claimed again after a drop simply
-  // re-enters via the next beat's `renewed`.
-  const ids = new Set();
-  for (const e of entries) {
-    if (e.tool !== "claim-heartbeat") continue;
-    if (Array.isArray(e.renewed)) for (const id of e.renewed) if (id) ids.add(id);
-    if (Array.isArray(e.dropped)) for (const id of e.dropped) if (id) ids.delete(id);
-  }
+  // re-enters via the next beat's `renewed`. u.readHeartbeatHeldIds is the
+  // shared reader for post-tool.js's u.appendHeartbeatRecord writer
+  // (task-spor-heartbeat-journal-protocol-shape-guard) — don't re-inline this
+  // replay loop, or a field rename on one side can silently break the other.
+  const ids = u.readHeartbeatHeldIds(entries);
   if (ids.size === 0) return; // no claim held this session
 
   const timeoutMs = u.cfgNum("sessionLease.timeoutMs", "SESSION_LEASE_TIMEOUT", 3000);

@@ -1195,6 +1195,43 @@ function makeLogger(file, prefix) {
   return (msg) => appendLine(file, `[${isoSeconds()}] ${prefix}${msg}`);
 }
 
+// The claim-heartbeat journal record: a protocol, not just an operability log,
+// shared between post-tool.js's claim-heartbeat branch (writer) and
+// distill.js's sessionEndLease (reader, replayed in journal order — see
+// task-spor-heartbeat-journal-protocol-shape-guard). Both ends go through
+// these two functions so a field rename on either side breaks the shape test
+// in test/heartbeat-journal-shape.test.js instead of silently diverging.
+const HEARTBEAT_TOOL = "claim-heartbeat";
+
+function appendHeartbeatRecord(journalPath, { project, renewed, dropped }) {
+  appendLine(
+    journalPath,
+    JSON.stringify({
+      ts: jqNow(),
+      project,
+      tool: HEARTBEAT_TOOL,
+      renewed,
+      ...(dropped && dropped.length ? { dropped } : {}),
+    })
+  );
+}
+
+// Replays a session's claim-heartbeat entries in journal ORDER into the set of
+// node ids this session currently holds a live lease on: `renewed` ADDS an id
+// this beat confirmed, `dropped` REMOVES one it no longer holds — a
+// point-in-time reading, not a cumulative one (see distill.js sessionEndLease
+// for why order matters: a node dropped mid-session must not linger in the
+// set just because an earlier beat renewed it).
+function readHeartbeatHeldIds(entries) {
+  const ids = new Set();
+  for (const e of entries) {
+    if (!e || e.tool !== HEARTBEAT_TOOL) continue;
+    if (Array.isArray(e.renewed)) for (const id of e.renewed) if (id) ids.add(id);
+    if (Array.isArray(e.dropped)) for (const id of e.dropped) if (id) ids.delete(id);
+  }
+  return ids;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1613,6 +1650,9 @@ module.exports = {
   probeCapabilities,
   appendLine,
   makeLogger,
+  HEARTBEAT_TOOL,
+  appendHeartbeatRecord,
+  readHeartbeatHeldIds,
   loadGraphCached,
   journalLoadMs,
   gcJournal,

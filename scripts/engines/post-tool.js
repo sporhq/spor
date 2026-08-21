@@ -430,18 +430,13 @@ async function claimNudge({ graph, slug, session, cwd, remote }) {
     // Journal the heartbeat so the operability log can correlate write-activity
     // to renewals; best-effort. `dropped` names held work this beat did NOT
     // renew — the lapsed-or-taken outcome the blanket arm accepts in exchange
-    // for never re-claiming — so a silent drop leaves a trace.
+    // for never re-claiming — so a silent drop leaves a trace. This record's
+    // shape is a protocol distill.js's sessionEndLease replays in order
+    // (task-spor-heartbeat-journal-protocol-shape-guard) — write it through
+    // u.appendHeartbeatRecord, not an ad-hoc JSON.stringify, so both ends stay
+    // in sync.
     const dropped = inProgress.map((x) => x.id).filter((id) => !renewed.includes(id));
-    u.appendLine(
-      path.join(graph, "journal", `${session}.jsonl`),
-      JSON.stringify({
-        ts: u.jqNow(),
-        project: slug,
-        tool: "claim-heartbeat",
-        renewed,
-        ...(dropped.length ? { dropped } : {}),
-      })
-    );
+    u.appendHeartbeatRecord(path.join(graph, "journal", `${session}.jsonl`), { project: slug, renewed, dropped });
     return null; // holds a claim -> never nudge
   }
 
