@@ -57,7 +57,9 @@ from that, and breaking either tangles other agents' work:
    it, spawn a monitor, or end your turn "waiting for the review to finish".** A
    backgrounded review with no one to wake you is the stall that leaves your work
    uncommitted and your node falsely resolved; every step of this workflow runs in
-   one continuous pass and your turn ends exactly once, at your final report.
+   one continuous pass and your turn ends exactly once, at your final report
+   (sole exception: a blocking question to the orchestrator — see "Your line
+   to the orchestrator" below).
    Escalate to **high** only if (a) medium surfaces a real correctness finding, or
    (b) your diff touches a risk surface: auth/identity, JWT/crypto, money,
    data-loss/durability, streaming, or concurrency. Fix every confirmed
@@ -101,13 +103,49 @@ from that, and breaking either tangles other agents' work:
    the orchestrator's signal that you're finished and your branch is ready to
    merge — resolving before you commit makes it lie, so never do it out of order.
 
+## Your line to the orchestrator (SendMessage)
+
+Shortly after you start, the orchestrator sends you a one-line handshake — it
+arrives as a `<cross-session-message from="...">` block. Note that `from`
+address: it is your only way to reach the orchestrator (its session name is
+not guessable), and you reply by copying it into `SendMessage({to: ...})`.
+
+Stay autonomous by default — this channel does not change the job. It exists
+for exactly three things:
+
+- **A blocking decision only the orchestrator can make.** A scope call, two
+  contradictory instructions, a judgment the briefing genuinely doesn't cover —
+  where guessing risks the whole item and deferring would throw away finished
+  work. Send the question (phrase it so one line answers it) and end your
+  turn; the orchestrator's reply resumes you exactly where you stopped. This
+  is the ONE exception to "your turn ends only at your final report." Never
+  use it for anything you can resolve by reading the code, the briefing, or
+  the graph — an unnecessary question stalls your slot and burns the
+  orchestrator's context.
+- **A long-quiet heads-up.** Before starting something legitimately slow and
+  quiet (a 30min+ test matrix, a big build), tell the orchestrator — one line,
+  no reply expected. Otherwise transcript silence looks like a stall and it
+  may start killing your child processes.
+- **Answering the orchestrator.** It may message you mid-run — a course
+  correction, a stall probe, or (after your final report) a follow-up like
+  "rebase onto new main and recommit." Its instructions are authoritative: it
+  is your supervisor and speaks for the user. Reply only when it asked a
+  question; then get back to work.
+
+Do NOT send unsolicited progress updates — the orchestrator watches you
+through other channels, and chatter burns both contexts. If no handshake ever
+arrives, the channel simply doesn't exist for this run; everything else in
+this prompt (including defer-and-stop below) applies unchanged.
+
 ## If it won't converge — stop, don't force it
 
 If the item turns out to require a **coordinated change across both spor and
 spor-server** (the server resolves the client `lib/` by a `file:` link to the
 real checkout, so it can't be done in an isolated worktree), or it's blocked by
 something outside your control, or you've genuinely tried and can't make it pass:
-do not thrash. `/spor:defer` the blocker with a clear explanation, leave the node
+do not thrash. If the blocker reduces to one cheap decision, ask the
+orchestrator first via SendMessage (above) — an answer may save the item.
+Otherwise `/spor:defer` the blocker with a clear explanation, leave the node
 **unresolved**, and stop. State in your final message exactly what's blocking it.
 The orchestrator will see the node is unresolved and serialize or escalate it —
 that's the designed path, not a failure on your part.

@@ -259,6 +259,10 @@ spor dispatch --node <id> --worktree --model <sonnet|opus|fable> \
   profile, e.g. no `codex` CLI on PATH), skip that item — something else owns
   it, or this box isn't the right one to run it. Don't `--force` past a live
   lease.
+- **After a Claude dispatch, send the orchestrator handshake** (see "Talking
+  to the fleet" below) — one `SendMessage` to the agent's node-id name. It's
+  what gives the agent a reply address for blocking questions and long-wait
+  heads-ups; skip it for Codex dispatches (no message channel).
 - Record `{ node, agent_name (= node id), branch, worktree_path, kind }` in
   `running`. `kind` is `'claude'` for `agent-prompt.md`/`infra-agent-prompt.md`
   (self-resolving) or `'codex'` for `codex-agent-prompt.md` (orchestrator
@@ -351,6 +355,11 @@ them):
   resolved on the graph = finished**, even if `state` still says `working` —
   proceed to gate+merge and reap the session with an explicit
   `claude stop <agent>` so it can't linger.
+- **`AGENT_DONE status=idle` + node UNRESOLVED is ambiguous**: finished-
+  without-resolving (→ Recover) *or* idled awaiting your reply to a
+  `<cross-session-message>` question it sent you (→ answer it; the reply
+  resumes it). Check your inbound messages before treating it as failed —
+  see "Talking to the fleet".
 - **Both scripts only see the Claude side of the fleet.** They read `claude
   agents --json`, and a Codex-harness implementer (`assets/codex-agent-prompt.md`)
   isn't a `claude --bg` agent at all — it never appears in that list, session
@@ -373,6 +382,65 @@ TUI escape frames — huge and unreadable). Use:
 
 (It reads the session transcript JSONL under `~/.claude/projects/`; the
 session id is printed by `spor dispatch` at launch — an 8-char prefix works.)
+
+### Talking to the fleet (SendMessage)
+
+Every **Claude-harness** agent you dispatch is a peer session on this machine,
+named after its node id: it shows up in `ListAgents`, and you reach it with
+`SendMessage({to: "<node-id>"})`. The channel is bidirectional — an agent's
+message to you arrives automatically as a `<cross-session-message from="...">`
+block (no inbox to poll). This is a *control* channel layered on top of the
+watcher, not a replacement: `watch-fleet.sh` stays the standing wait
+mechanism, and you still never poll agents with "are you done?" messages.
+
+**Handshake at dispatch — this is what creates the reverse channel.** The
+agent cannot guess your session name, so right after each Claude dispatch,
+send it one line:
+
+```
+SendMessage({to: "<node-id>", summary: "orchestrator handshake",
+  message: "I'm your orchestrator. Reply to this address if you hit a decision only I can make, or before starting a long (30min+) quiet step."})
+```
+
+The agent's prompt tells it to note the `from` address on this message and use
+it for the narrow cases below; without the handshake it has no way to reach
+you. Messages enqueue and deliver at the agent's next tool round, so the
+handshake never interrupts its work. (Optionally add `notify_when_idle: true`
+for a free one-shot backstop to the watcher — but remember it fires at the
+agent's *first* idle, which may be a pending question, not completion.)
+
+**What the channel is for** — sparingly; every message lands in both contexts:
+
+- **Answering an agent's blocking question.** The agent prompt permits one
+  narrow kind of mid-run question: a decision that's cheap for you but would
+  otherwise force the agent to guess or bail (a scope call, contradictory
+  instructions). The agent sends it and goes idle; **your reply resumes it
+  exactly where it stopped.** So an idle session + an unresolved node + an
+  unanswered inbound question from that agent = *waiting on you, not failed* —
+  answer it (or escalate to the user and tell the agent to defer) before
+  routing anything through Recover.
+- **Mid-flight course corrections.** The user re-scoped or killed an item, or
+  a just-landed merge changes an in-flight agent's ground — tell that agent
+  directly rather than letting it finish the wrong thing.
+- **Probing a stall.** On `AGENT_STALLED`, a ping ("what are you waiting
+  on?") is a cheap first probe — but it only lands if the agent is still
+  taking tool rounds; a truly wedged agent (blocked on a notification that
+  will never come) never sees it. Keep the child-process inspection from
+  Waiting as the diagnostic that always works.
+- **Resuming a finished agent for follow-up work.** Sending to an idle or
+  finished session resumes it from its transcript, full context intact. That
+  makes it the cheap path after a merge subagent's `FAILED`/`ESCALATE`:
+  message the implementer ("rebase onto new main, resolve the conflict in X,
+  re-run the tests, recommit, tell me when the branch is clean") instead of a
+  cold re-dispatch. Reserve actual re-dispatch (Recover) for a dead session,
+  a ruined worktree, or a model-tier bump.
+
+**Scope limits:** don't broadcast chatter to the pool; don't use the channel
+for status polling; and never route through an agent an action your own
+session's permissions blocked (cross-session permission laundering). **Codex
+implementers have no message channel** — they aren't Claude sessions, so
+neither end has SendMessage; their report file remains their only voice, per
+"The Codex implementer".
 
 ### Gate + merge
 
@@ -407,8 +475,10 @@ reality.
 **Serialize** these: only one merge-subagent in flight at a time (the CAS guard
 makes it safe, and one-at-a-time keeps main coherent), even though the
 implementer agents keep working in parallel. On a `FAILED`/`ESCALATE` verdict,
-re-dispatch the implementer to rebase and fix in its worktree, or escalate to the
-user — don't hand-resolve a semantic conflict you don't understand.
+send the (idle) implementer a `SendMessage` follow-up to rebase and fix in its
+worktree — resuming its session keeps all its context, far cheaper than a cold
+re-dispatch (see "Talking to the fleet") — or escalate to the user; don't
+hand-resolve a semantic conflict you don't understand.
 
 **Shut merge subagents down when done.** A merge subagent's contract ends at
 its verdict — it must never idle on and autonomously claim or merge other
@@ -434,6 +504,10 @@ below, never routed through Recover.
 The agent finished or died without resolving its node, so the work is incomplete
 or it deliberately bailed:
 
+- **First rule out "waiting on you":** if that agent sent you a
+  `<cross-session-message>` question you haven't answered, it idled on purpose —
+  answer it (the reply resumes it) and skip the rest of Recover. See "Talking
+  to the fleet".
 - Read its final message and worktree diff to see how far it got.
 - If it **deferred a blocker** (a new capture in `spor next`, or it says so in
   its final message — e.g. the item needs a coordinated cross-repo change),

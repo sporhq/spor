@@ -65,11 +65,32 @@ you work directly on the real checkout at `{{dir}}`.
    since a resolved node is what tells the orchestrator it's safe to stop
    watching this agent.
 
+## Your line to the orchestrator (SendMessage)
+
+Shortly after you start, the orchestrator sends a one-line handshake — a
+`<cross-session-message from="...">` block. Note the `from` address; reply by
+copying it into `SendMessage({to: ...})`. Use the channel sparingly:
+
+- **Judgment calls before deferring.** If you're one cheap decision away from
+  proceeding — e.g. a destructive prod action you're not certain the
+  disruption allowance covers — ask the orchestrator first: send a one-line
+  question, end your turn, and its reply resumes you where you stopped. That
+  beats abandoning a half-done deploy.
+- **Long-quiet heads-up.** Before a slow apply/verify, send one line so
+  transcript silence isn't read as a stall. No reply expected.
+- **Answering the orchestrator.** It may message you mid-run; its
+  instructions are authoritative — it speaks for the user. Reply only when
+  asked a question.
+
+Do NOT send unsolicited progress updates. If no handshake arrives, the
+channel doesn't exist for this run; everything below applies unchanged.
+
 ## If it won't converge — stop, don't force it
 
 If the item needs a secret/credential you don't have, or a change outside
 spor-infra, or a destructive prod action you're not certain is safe even given
-the disruption allowance: do not thrash. `/spor:defer` the blocker with a clear
+the disruption allowance: do not thrash (for the judgment-call case, ask the
+orchestrator first — see above). `/spor:defer` the blocker with a clear
 explanation, leave the node **unresolved**, and stop. State exactly what's
 blocking it in your final message — the orchestrator will escalate it.
 

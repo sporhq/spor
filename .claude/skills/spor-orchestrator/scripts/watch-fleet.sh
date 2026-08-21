@@ -24,6 +24,10 @@
 #   the agent finishes (inc-spor-orchestration-watcher-stuck-state).
 # - An agent can vanish from the list entirely when it exits; treat a node
 #   that WAS seen and is now absent as done.
+# - AGENT_DONE status=idle with the node UNRESOLVED is ambiguous: the agent
+#   may have idled awaiting the orchestrator's SendMessage reply to a blocking
+#   question (a reply resumes it), not failed — check inbound cross-session
+#   messages before routing to Recover (SKILL.md "Talking to the fleet").
 # - AGENT_STALLED is a NOTIFICATION, not a verdict: the transcript-mtime proxy
 #   can't tell a wedged agent from one legitimately awaiting a long background
 #   task (the 2026-08-05 hung-test deadlock looked exactly like the latter —

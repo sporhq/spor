@@ -12,6 +12,11 @@
 #   verdict   — RUNNING / FINISHED (resolved, gate+merge it) / RECOVER
 #               (session gone or idle but node NOT resolved) / DONE
 #
+# A RECOVER verdict (session idle, node unresolved) can also mean the agent
+# idled awaiting the orchestrator's SendMessage reply to a blocking question —
+# a reply resumes it. Check inbound cross-session messages before recovering
+# (SKILL.md "Talking to the fleet").
+#
 # Scope: this "unresolved = RECOVER" verdict assumes a SELF-RESOLVING agent —
 # one dispatched with agent-prompt.md/infra-agent-prompt.md, whose own
 # contract is to resolve its node before it exits. A Codex-harness
