@@ -45,7 +45,10 @@ the decision queue (QUEUE.md §4).
 
 ## Edge types
 
-One file per type at `lib/seed/schema-edge-<type>.md`. Written **source →
+One file per type at `lib/seed/schema-edge-<type>.md` — except a
+graph-resident edge schema, which lives as a `type: schema` node in the graph
+instead (e.g. `member-of-program`, below, defined by
+`schema-edge-member-of-program`, not a seed file). Written **source →
 target**. `weight` sets how much the edge decays across compile hops (high =
 structural). `inverse_label` is how the edge reads from the target's side;
 inverse forms are accepted on write and **flipped onto the target**. `aliases`
@@ -61,7 +64,8 @@ are same-direction synonyms renamed at write time.
 | resolves | 0.9 | this fixes/closes the target | — |
 | triggered-by | 0.7 | this run was triggered by the target | — |
 | performs | 0.8 | this run is an execution of the target workflow | — |
-| blocks | 0.7 | the target can't proceed until this does | inverse `blocked-by`; also program membership — member `blocks` umbrella, rendered by `render_program` |
+| blocks | 0.7 | the target can't proceed until this does | inverse `blocked-by`; also the fallback program-membership inference where a node declares no `member-of-program` edges, rendered by `render_program` |
+| member-of-program | 0.7 | this is a member of the target program umbrella (pure topology, independent of gating) | inverse `has-program-member`; `capturable: false`; preferred per-node over the `blocks` fallback above; graph-resident schema, check `spor schema member-of-program` for activation status |
 | answers | 0.7 | this answers the target question | inverse `answered-by` |
 | assigned | 0.5 | work assigned to this person OR agent (explicit routing; an agent target may carry a `profile:` per-assignment override) | — |
 | relates-to | 0.5 | weak association | alias `related-to` |

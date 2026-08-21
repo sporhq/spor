@@ -5,6 +5,12 @@ For each fact, emit a node file exactly in this format (id = filename minus .md,
 Identity relations are trusted-admin data, not transcript inference: never emit
 `organization` nodes or `member-of-org` / org-admin `stewards` edges.
 
+`member-of-program` (program membership, independent of `blocks` gating) is
+`capturable: false` — never emit it. If the session groups work under a
+program umbrella, emit `blocks` only, exactly as for any other prerequisite; a
+person wires `member-of-program` explicitly when they mean to declare
+membership, not gating.
+
 ===NODE <id>.md===
 ---
 id: <id>

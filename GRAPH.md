@@ -1019,6 +1019,7 @@ against a query language, never drafted from a capture or a distilled transcript
 | `decided-in`     | 0.9    | the choice in this node was made in the target   |
 | `resolves`       | 0.9    | this node fixes/closes the target                |
 | `blocks`         | 0.7    | target cannot proceed until this node does       |
+| `member-of-program` | 0.7 | this node is a member of the target program umbrella (inverse `has-program-member`); pure topology, independent of gating; `capturable: false` |
 | `answers`        | 0.7    | this node answers that question (inverse `answered-by`); pulls the answer through the asker's next compile |
 | `assigned`       | 0.5    | work is assigned to this person OR agent (the explicit-routing edge; an agent target may carry a `profile:` per-assignment override) |
 | `reviewed-by`    | 0.5    | this person reviewed and approved the node — counts toward a policy quorum |
@@ -1035,6 +1036,29 @@ against a query language, never drafted from a capture or a distilled transcript
 | `focuses-on`     | 0.2    | this lens is parameterized on that node (see "Lenses"); a view watching a node says little about the node's own lineage |
 | `compiled-for`   | —      | briefing → its task/query (provenance only)      |
 | `shaped-by`      | —      | briefing → corrections applied (provenance only) |
+
+`member-of-program` is the dedicated program-membership edge
+(dec-spor-program-membership-dedicated-edge-type), written from the member's
+perspective like `blocks`: `member -> umbrella`. It is **additive with `blocks`,
+never a replacement**: `blocks` keeps meaning only gating (this node gates the
+umbrella's completion), while `member-of-program` records pure topology (this
+node belongs to the program) — a member usually carries both, but a
+non-gating member carries only this edge, and a prerequisite that gates the
+umbrella without being part of its program carries only `blocks`, a
+distinction blocks-topology inference alone could never draw. Readers
+(`render_program`, the gardener's program-completion pass) prefer these edges
+**per node**: at a node with any inbound `member-of-program` edges, those are
+its members; at a node with none, its members are still inferred from inbound
+`blocks` (today's behavior, unchanged), so an unmigrated or partially migrated
+program keeps rendering. The preference is all-or-nothing at a node — declare
+every member of an umbrella in one write, or the undeclared rest read as
+"blocking but outside the program" rather than silently dropping. It ships as
+a graph-resident schema node (`schema-edge-member-of-program`), not the seed
+pack, so it needs a *different* identity to activate it (the standing
+propose→activate flow above) before writes of this edge type validate; check
+`spor schema member-of-program` for its live status rather than assuming.
+`capturable: false` — the distiller and capture nudge never emit it; only a
+person or an agent working the program explicitly wires membership.
 
 `answers`, `assigned`, `stewards`, `member-of-org`, and `routed-to` are person-graph
 edges of Tier-2 question routing; they ship in the seed pack and are
@@ -1093,8 +1117,9 @@ edge schema): **aliases** — same-direction synonyms renamed in place
 `supercedes` → `supersedes`, `approved-by` → `reviewed-by`) — and **inverse
 labels** — the edge read from
 the target's side, flipped onto the target node on write (`blocked-by` →
-`blocks`, `answered-by` → `answers`, `superseded-by` → `supersedes`).
-Hand-written nodes should still use the canonical forms.
+`blocks`, `answered-by` → `answers`, `superseded-by` → `supersedes`,
+`has-program-member` → `member-of-program`). Hand-written nodes should still
+use the canonical forms.
 
 ## Correction nodes
 

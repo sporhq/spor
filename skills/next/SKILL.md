@@ -35,7 +35,11 @@ MCP-Apps host that should attach the interactive queue widget, use
 
 (A different question — "how far along is the whole workstream?", progress
 rather than next actions — is the program view: the `render_program` MCP tool
-or `GET /v1/program/<root-id>`; see /spor:spor.)
+or `GET /v1/program/<root-id>`; see /spor:spor. Membership under that umbrella
+is normally the dedicated `member-of-program` edge, written `member ->
+umbrella`, with `blocks` staying pure gating — see /spor:spor and GRAPH.md's
+edge-vocabulary entry for the additive semantics and the per-node fallback to
+`blocks`-only programs.)
 
 **Scope and filter flags** (task-cc-queue-filtering-enhancements). The queue
 defaults to this repo's project; three optional, composable levers widen or

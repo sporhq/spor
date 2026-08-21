@@ -228,9 +228,20 @@ actionable queue until its blocker resolves — which is the point.
 
 Once the topology is recorded you can sanity-check it from the top: the
 program/progress view (`render_program` MCP tool, or `GET
-/v1/program/<root-id>` in a shell) walks a root node's gating tree over
-`blocks` edges with resolution-derived progress — a fast way to confirm the
-edges you just wrote hang the work under the right umbrella.
+/v1/program/<root-id>` in a shell) walks a root node's gating tree —
+preferring, per node, its inbound `member-of-program` edges when it has any,
+and otherwise its inbound `blocks` edges (today's inference) — with
+resolution-derived progress. `blocks` is what you just recorded above, and it
+keeps meaning only gating; if the node you're hanging under an umbrella is
+also a genuine PROGRAM MEMBER (not just a prerequisite), also record
+`member-of-program` from the member to the umbrella (`spor edge <member>
+member-of-program <umbrella>`) so it renders precisely instead of by
+inference. Migrate an umbrella's membership all at once — declaring one
+member and leaving the rest to fall back on `blocks` makes those others read
+as "blocking but outside the program" rather than silently staying members.
+(`member-of-program` is a graph-resident schema pending activation in some
+graphs — `spor schema member-of-program` shows whether writes of it validate
+yet in yours; see /spor:spor.)
 
 ## 7. Make ready → close the agent-readiness gaps a coding agent would hit
 

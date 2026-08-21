@@ -278,34 +278,65 @@ what the program is and what "done" means. (`type: project` /
 `grouped-under` is the unrelated repo-identity layer — never use it to group
 work.)
 
-Membership is **`blocks` topology**: each member carries a `blocks` edge TO
-the umbrella — "the umbrella can't finish until this does":
+Membership and gating are two independent facts about a member
+(dec-spor-program-membership-dedicated-edge-type):
+
+- **`blocks`** — "the umbrella can't finish until this does" — a real
+  prerequisite, same as any other `blocks` edge. It keeps meaning only
+  gating, nothing else.
+- **`member-of-program`** — "this node belongs to the program" — pure
+  topology, written the same direction as `blocks` (member → umbrella). It
+  ships as a graph-resident schema (`schema-edge-member-of-program`), which
+  needs a *different* identity to activate before writes of this edge type
+  validate — check `spor schema member-of-program` for its live status rather
+  than assuming it's already active in your graph:
 
 ```bash
 spor edge task-api-rate-limit blocks task-platform-hardening-program
-# MCP: add_edge {id: "task-api-rate-limit", type: "blocks", to: "task-platform-hardening-program"}
+spor edge task-api-rate-limit member-of-program task-platform-hardening-program
+# MCP: add_edge {id: "task-api-rate-limit", type: "member-of-program", to: "task-platform-hardening-program"}
 ```
 
-- Write it from the member's perspective (member `blocks` umbrella). The
-  inverse spelling (`blocked-by` on the umbrella) is accepted and flipped;
+A member usually carries both — it's a member AND it gates the umbrella's
+completion. They can also diverge: a member that doesn't gate carries only
+`member-of-program`; a prerequisite that gates the umbrella without being
+part of its program carries only `blocks` — a distinction `blocks`-topology
+alone can't draw. Where no member declares `member-of-program` at all, the
+program still works exactly as it always has:
+
+- Write both from the member's perspective (member → umbrella). The inverse
+  spellings (`blocked-by`, `has-program-member`) are accepted and flipped;
   duplicate edges are a no-op.
-- **Only `blocks` edges count.** The program view walks inbound `blocks`
-  edges transitively and nothing else — members joined by `relates-to`,
-  `mentions`, or `derived-from` are invisible to it (and to the queue's
-  blocked-gating).
-- Nest freely: a workstream hub that `blocks` the program hub hangs its whole
-  subtree under it — the walk is transitive, so one edge per level is enough.
-- The gating is real, not cosmetic: the umbrella leaves the actionable queue
-  until its members land, and closing it at the end still needs a resolver
-  like any task.
+- **The program view prefers `member-of-program` PER NODE, falling back to
+  `blocks` where a node declares none.** A node with any inbound
+  `member-of-program` edges takes those as its members; a node with none
+  falls back to inbound `blocks` (the original inference) — so an
+  unmigrated, or only partially migrated, program keeps rendering. Members
+  joined by `relates-to`, `mentions`, or `derived-from` are invisible to
+  either walk (and to the queue's blocked-gating).
+- **The fallback is all-or-nothing at a node.** Declare every member of an
+  umbrella's `member-of-program` edges in the same pass — a half-migrated
+  umbrella (one declared member, four still only `blocks`-inferred) doesn't
+  quietly drop the other four; they render as prerequisites *outside* the
+  program instead, which is the honest reading but a surprise if you meant
+  to migrate them too.
+- Nest freely: a workstream hub that `blocks`/`member-of-program`s the
+  program hub hangs its whole subtree under it — the walk is transitive, so
+  one edge per level is enough.
+- Gating stays real regardless of membership: the umbrella leaves the
+  actionable queue only while a live `blocks` edge into it is unresolved, and
+  closing it at the end still needs a resolver like any task.
+- `member-of-program` is `capturable: false` — the distiller and capture
+  nudge never emit it; wire it explicitly when you group work.
 
 Read it back with `render_program` (`{id: "<umbrella-id>"}`; REST `GET
-/v1/program/<id>`; shell front-door `spor program <umbrella-id>`): the gating
-tree with resolution-derived progress, where **done** = terminal status,
-supersession, or a live `resolves`/`answers` edge — the queue's truth, even
-while a status field lags. An empty result means nothing `blocks` the root
-yet — add the member edges above. `show_queue` answers "what's next?";
-`render_program`/`spor program` answers "how far along is the whole thing?".
+/v1/program/<id>`; shell front-door `spor program <umbrella-id>`): the
+membership/gating tree with resolution-derived progress, where **done** =
+terminal status, supersession, or a live `resolves`/`answers` edge — the
+queue's truth, even while a status field lags. An empty result means nothing
+`blocks`/`member-of-program`s the root yet — add the member edges above.
+`show_queue` answers "what's next?"; `render_program`/`spor program` answers
+"how far along is the whole thing?".
 
 ## COMMIT: close a session with an outcome artifact
 
