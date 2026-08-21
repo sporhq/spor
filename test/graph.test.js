@@ -2179,6 +2179,48 @@ Body.
   assert.match(stderr, /dec-headless\.md/);
 });
 
+// issue-spor-buildgraph-idless-node-undefined-key: a file that PARSES but
+// carries no `id` used to land under the literal key "undefined", so a second
+// id-less file silently replaced the first. Both must instead be isolated as
+// parse faults, and neither may leave a "undefined" node behind.
+test("loadGraph: two id-less files are both skipped, neither collides under an 'undefined' key", () => {
+  const fx = tmpGraph({
+    "dec-good-a.md": `---
+id: dec-good-a
+type: decision
+project: my-project
+title: Good A
+summary: A healthy node beside two files that never got an id.
+---
+Body.
+`,
+    "dec-idless-one.md": `---
+type: decision
+project: my-project
+title: Idless One
+summary: A node that parses fine but never declares an id.
+---
+First idless body.
+`,
+    "dec-idless-two.md": `---
+type: decision
+project: my-project
+title: Idless Two
+summary: A second node that parses fine but never declares an id.
+---
+Second idless body.
+`,
+  });
+  const { value: g, stderr } = captureStderr(() => fx.load());
+  assert.ok(g.nodes["dec-good-a"], "healthy node loaded");
+  assert.equal(g.nodes["undefined"], undefined, "no phantom node stored under the literal key \"undefined\"");
+  assert.equal(g.skipped.length, 2);
+  assert.ok(g.skipped.some((s) => s.file === "dec-idless-one.md" && /missing or empty id/.test(s.error)));
+  assert.ok(g.skipped.some((s) => s.file === "dec-idless-two.md" && /missing or empty id/.test(s.error)));
+  assert.match(stderr, /dec-idless-one\.md/);
+  assert.match(stderr, /dec-idless-two\.md/);
+});
+
 // The sharp edge of the trade, pinned deliberately: a skipped `type: schema`
 // node takes its registry override with it, so the graph loads under the SEED
 // ontology instead. Registry.isTraversable defaults unknown types to
