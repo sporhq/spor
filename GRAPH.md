@@ -109,7 +109,14 @@ Rules:
   gate, and reports the same files as an **error** (exit 1), naming the
   offending line — a node the loader drops is missing from every briefing,
   digest and queue, so a lint that passed would be a lie. Isolation covers
-  malformed FILES only; a bug in the parser itself still throws.
+  malformed FILES only; a bug in the parser itself still throws. The same
+  isolation also covers a file `readdirSync` lists but `readFileSync` then
+  fails to read at all — EACCES, or an ENOENT race against a live graph home
+  the server/gardener writes concurrently
+  (issue-spor-read-graph-files-single-file-abort) — which rides the same
+  `graph.skipped` record under a distinct stderr wording
+  (`spor: SKIPPED unreadable node file <path>: <why>`, since the file never
+  reached the parser).
 
 ## Node types and id prefixes
 

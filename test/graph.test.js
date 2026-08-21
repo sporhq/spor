@@ -2221,6 +2221,101 @@ Second idless body.
   assert.match(stderr, /dec-idless-two\.md/);
 });
 
+// A THIRD deliberate fault, one layer below parsing: a file readdirSync lists
+// but readFileSync then fails to read at all — EACCES, or an ENOENT race
+// against a live graph home the server/gardener writes concurrently
+// (issue-spor-read-graph-files-single-file-abort). This must not abort the
+// whole load any more than an unparseable node does; it rides the same
+// graph.skipped record and stderr warning.
+// chmod 0o000 only withholds read on POSIX for a non-root uid (see
+// test/heal-stale-root.test.js's identical guard): on Windows it does not
+// block readFileSync, and root ignores permission bits entirely — either
+// way the file would read fine and the test would pass green without
+// exercising the skip path it exists to pin.
+function skipUnlessChmodWithholdsRead(t) {
+  if (process.platform === "win32") { t.skip("chmod 000 does not withhold read on Windows"); return true; }
+  if (process.getuid && process.getuid() === 0) { t.skip("root ignores permission bits"); return true; }
+  return false;
+}
+
+test("loadGraph: an unreadable node file is skipped and the rest of the graph still loads", (t) => {
+  if (skipUnlessChmodWithholdsRead(t)) return;
+  const fx = tmpGraph({
+    "dec-good-a.md": `---
+id: dec-good-a
+type: decision
+project: my-project
+title: Good A
+summary: A healthy node beside a file that cannot be read at all.
+---
+Body.
+`,
+    "dec-unreadable.md": `---
+id: dec-unreadable
+type: decision
+project: my-project
+title: Unreadable
+summary: This node's file is chmod 000'd before load, simulating EACCES.
+---
+Body.
+`,
+  });
+  const badPath = path.join(fx.nodesDir, "dec-unreadable.md");
+  fs.chmodSync(badPath, 0o000);
+  try {
+    const { value: g, stderr } = captureStderr(() => fx.load());
+    assert.ok(g.nodes["dec-good-a"], "healthy node loaded");
+    assert.equal(g.nodes["dec-unreadable"], undefined, "the unreadable node contributes nothing");
+    assert.equal(g.skipped.length, 1);
+    assert.equal(g.skipped[0].file, "dec-unreadable.md");
+    assert.match(g.skipped[0].error, /EACCES|permission denied/i);
+    assert.match(stderr, /SKIPPED unreadable node file/);
+    assert.match(stderr, /dec-unreadable\.md/);
+  } finally {
+    fs.chmodSync(badPath, 0o644); // tmp-cleanup must be able to remove it
+  }
+});
+
+// shell.readGraphFiles itself: without an onSkip callback a read failure
+// still throws exactly as before — callers that haven't opted in (the seed
+// pack, `spor validate`'s re-parse) keep their original fail-loud behavior.
+test("readGraphFiles: throws on a read failure when no onSkip is given", (t) => {
+  if (skipUnlessChmodWithholdsRead(t)) return;
+  const shell = require(path.join(__dirname, "..", "lib", "shell", "files.js"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "substrate-test-"));
+  const badPath = path.join(dir, "dec-unreadable.md");
+  fs.writeFileSync(badPath, "---\nid: dec-unreadable\n---\nBody.\n");
+  fs.chmodSync(badPath, 0o000);
+  try {
+    assert.throws(() => shell.readGraphFiles(dir), /EACCES|permission denied/i);
+  } finally {
+    fs.chmodSync(badPath, 0o644);
+  }
+});
+
+// With onSkip given, the same failure is reported instead of thrown, and the
+// file is simply absent from the result (parity with a parse-skipped file).
+test("readGraphFiles: with onSkip, a read failure is reported and the file omitted", (t) => {
+  if (skipUnlessChmodWithholdsRead(t)) return;
+  const shell = require(path.join(__dirname, "..", "lib", "shell", "files.js"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "substrate-test-"));
+  fs.writeFileSync(path.join(dir, "dec-good.md"), "---\nid: dec-good\n---\nBody.\n");
+  const badPath = path.join(dir, "dec-unreadable.md");
+  fs.writeFileSync(badPath, "---\nid: dec-unreadable\n---\nBody.\n");
+  fs.chmodSync(badPath, 0o000);
+  try {
+    const skips = [];
+    const files = shell.readGraphFiles(dir, { onSkip: (s) => skips.push(s) });
+    assert.ok(Object.prototype.hasOwnProperty.call(files, "dec-good.md"));
+    assert.ok(!Object.prototype.hasOwnProperty.call(files, "dec-unreadable.md"));
+    assert.equal(skips.length, 1);
+    assert.equal(skips[0].file, "dec-unreadable.md");
+    assert.match(skips[0].error, /EACCES|permission denied/i);
+  } finally {
+    fs.chmodSync(badPath, 0o644);
+  }
+});
+
 // The sharp edge of the trade, pinned deliberately: a skipped `type: schema`
 // node takes its registry override with it, so the graph loads under the SEED
 // ontology instead. Registry.isTraversable defaults unknown types to
