@@ -175,3 +175,59 @@ test("put-node (remote) surfaces a batch validation failure with details", async
     srv.close();
   }
 });
+
+// dec-spor-buildgraph-per-node-fault-isolation: the local put-node gate lints
+// the WHOLE graph, so once the loader started SKIPPING a malformed node file
+// instead of refusing to boot on it, an unrelated corrupt sibling would have
+// locked the entire local graph read-only — with a banner naming a node the
+// write never touched. Pre-existing skips are carried as warnings instead.
+test("put-node (local): an unrelated unparseable node file does not block the write", () => {
+  const { home, nodes } = fixtureGraph();
+  fs.writeFileSync(
+    path.join(nodes, "dec-corrupt.md"),
+    `---
+id: dec-corrupt
+type: decision
+project: demo
+title: Corrupt
+summary: A pre-existing node whose block-form edge entry never resolves a target.
+date: 2026-06-01
+edges:
+  - type: relates-to
+---
+Body.
+`
+  );
+  const file = tmpNodeFile(nodeMd("dec-fresh"));
+  const r = run(["put-node", file], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /put-node created: dec-fresh/);
+  assert.strictEqual(readNode(nodes, "dec-fresh"), fs.readFileSync(file, "utf8"));
+  // the corruption is carried, not swallowed: named on stderr, both by the
+  // loader's own skip warning and as a pre-existing lint error.
+  assert.match(r.stderr, /SKIPPED unparseable node file .*dec-corrupt\.md/);
+  assert.match(r.stderr, /warning: pre-existing: dec-corrupt\.md: unparseable edge entry/);
+  // and `spor validate` still fails on it — the lint is the gate, not the writer.
+  assert.strictEqual(validateGraph(nodes).status, 1);
+});
+
+// The complement: a fault in the node BEING WRITTEN still refuses the write.
+test("put-node (local): an unparseable incoming node is still rejected", () => {
+  const { home, nodes } = fixtureGraph();
+  const file = tmpNodeFile(`---
+id: dec-bad
+type: decision
+project: demo
+title: Bad
+summary: An incoming node whose block-form edge entry never resolves a target.
+date: 2026-06-01
+edges:
+  - type: relates-to
+---
+Body.
+`);
+  const r = run(["put-node", file], { SPOR_HOME: home });
+  assert.notStrictEqual(r.status, 0);
+  assert.match(r.stderr, /unparseable edge entry/);
+  assert.ok(!fs.existsSync(path.join(nodes, "dec-bad.md")), "nothing written");
+});

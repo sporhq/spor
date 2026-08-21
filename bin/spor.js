@@ -945,8 +945,22 @@ function validatePutNodeLocal(nodesDir, node, raw) {
   try {
     copyNodeFilesForValidation(nodesDir, tmpNodes, node.id, raw);
     const vg = graphLib.validateGraph(tmpNodes);
-    if (vg.errors && vg.errors.length) return { error: `invalid graph after put-node:\n  ${vg.errors.join("\n  ")}` };
-    return { ok: true, warnings: vg.warnings || [] };
+    // Pre-existing corruption in OTHER node files must not refuse this write
+    // (dec-spor-buildgraph-per-node-fault-isolation). The loader survives a
+    // malformed sibling by skipping it, so the writer has to as well — this
+    // gate lints the WHOLE graph, so without the split one unrelated bad file
+    // would lock the entire local graph read-only, and the "invalid graph
+    // after put-node" banner would name a node this write never touched.
+    // Errors on the file being WRITTEN still block (including the case where
+    // the target was itself the skipped file and the new bytes are no better),
+    // and the demoted ones ride along as warnings so the corruption stays
+    // visible; `spor validate` is where it is an exit-1 problem.
+    const carried = (g.skipped || []).map((sk) => sk.file).filter((f) => f !== `${node.id}.md`);
+    const preExisting = (e) => carried.some((f) => String(e).startsWith(`${f}: `));
+    const blocking = (vg.errors || []).filter((e) => !preExisting(e));
+    if (blocking.length) return { error: `invalid graph after put-node:\n  ${blocking.join("\n  ")}` };
+    const carriedErrors = (vg.errors || []).filter(preExisting).map((e) => `pre-existing: ${e}`);
+    return { ok: true, warnings: [...(vg.warnings || []), ...carriedErrors] };
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
