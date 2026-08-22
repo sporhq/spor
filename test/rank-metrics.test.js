@@ -6,7 +6,7 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const m = require("../scripts/rank-eval/metrics.js");
-const { microIds, fullIds, zip } = require("../scripts/rank-eval/labels.js");
+const { microIds, fullIds, zip, mergePooledLabels } = require("../scripts/rank-eval/labels.js");
 
 const close = (a, b, msg) => assert.ok(Math.abs(a - b) < 1e-9, `${msg}: ${a} !== ${b}`);
 
@@ -79,6 +79,44 @@ test("microIds / fullIds: parse each arm's render format, anchored at line start
   // the formats must not cross-match, or labels would zip onto the wrong arm
   assert.deepStrictEqual(fullIds(micro), []);
   assert.deepStrictEqual(microIds(full), []);
+});
+
+test("mergePooledLabels: fills in ids the original arms never covered, never overrides an original label", () => {
+  const cases = [{ case_id: "c1", labels: { a: "relevant" } }];
+  const pooled = mergePooledLabels(cases, new Map([["c1", { a: "noise", z: "tangential" }]]));
+  // a's ORIGINAL label wins over the pooled re-judging pass's; z is new.
+  // (labels is a null-prototype object — see labels.js — so spread it into a
+  // plain object before deepStrictEqual, which compares prototypes too.)
+  assert.deepStrictEqual({ ...pooled[0].labels }, { a: "relevant", z: "tangential" });
+  // a case with no pooled entry is untouched.
+  assert.deepStrictEqual({ ...mergePooledLabels(cases, new Map())[0].labels }, { a: "relevant" });
+});
+
+test("retrieval-blindness fix (issue-spor-digest-rank-eval-retrieval-blind): a candidate " +
+  "surfacing a node absent from both original arms scores NEUTRAL against the arms-only " +
+  "label pool, and ABOVE the arms-only baseline once a pooled re-judging pass labels it", () => {
+  const labels = { a: "relevant", b: "tangential" }; // the original two-arm pool
+  const baselineOrder = ["a", "b"]; // the shipped ranker's own order
+  const candidateOrder = ["z", "a", "b"]; // a candidate retriever that ALSO surfaces z
+
+  // BEFORE pooling: z carries no label, so ndcgAt silently drops it from the
+  // gain sum (by design — an unlabeled id can't be scored). The candidate's
+  // retrieval win is therefore invisible: it scores IDENTICALLY to baseline,
+  // which is the bug this issue is about.
+  assert.strictEqual(m.ndcgAt(candidateOrder, labels, 5), m.ndcgAt(baselineOrder, labels, 5));
+
+  // AFTER pooling: a re-judging pass finds z genuinely relevant and labels it
+  // by node id (mergePooledLabels never touches a's/b's original labels).
+  const pooled = mergePooledLabels(
+    [{ case_id: "c", labels }],
+    new Map([["c", { z: "relevant" }]])
+  )[0].labels;
+  assert.deepStrictEqual({ ...pooled }, { a: "relevant", b: "tangential", z: "relevant" });
+
+  const baselineNdcg = m.ndcgAt(baselineOrder, pooled, 5);
+  const candidateNdcg = m.ndcgAt(candidateOrder, pooled, 5);
+  assert.ok(candidateNdcg > baselineNdcg,
+    `candidate (${candidateNdcg}) should score above baseline (${baselineNdcg}) once the retrieved node is labeled`);
 });
 
 test("zip: refuses to align when the counts disagree", () => {

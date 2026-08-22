@@ -20,6 +20,9 @@ history the labels were taken against (`~/repos/bcdr-substrate`).
 ```bash
 node scripts/rank-eval/run.js --labels ~/repos/spor-server/evals/digest-intent-2026-07-06
 node scripts/rank-eval/run.js --labels <dir> --engine-root <other-checkout> --label variant --json out.json
+# score against the committed pooled labels (see "Retrieval pooling" below) —
+# this is how every baseline number in this file is now reported:
+node scripts/rank-eval/run.js --labels <dir> --pooled-labels scripts/rank-eval/pooled-labels/labels.jsonl
 ```
 
 `--engine-root` points at any checkout of this repo, so a candidate engine is
@@ -62,21 +65,117 @@ The **ideal ranking is the whole labeled pool**, not just what the engine emitte
 so leaving a known-relevant node out is penalized — the metric sees retrieval,
 not only ordering.
 
+## Retrieval pooling (issue-spor-digest-rank-eval-retrieval-blind)
+
+The original two-arm label pool (arm A `actual`, arm B `current`) still has a
+blind spot the metric can't see past: a label exists only for a node one of
+those two arms actually showed. A candidate retriever that surfaces a
+genuinely better node **neither arm ever showed the judge** emits an id with no
+label — `ndcgAt` correctly skips unlabeled ids rather than scoring them as
+noise, but that means the retrieval win is invisible: the candidate scores
+*identically* to a baseline that never surfaced the node at all, not higher.
+`test/rank-metrics.test.js` has a unit test that pins this down precisely (both
+the bug, against the arms-only pool, and the fix, against the pooled one).
+
+**The fix is a re-judging pass over a POOLED candidate set**, not another pass
+over the existing labels (they only ever describe what the two original arms
+showed). `run.js --pool` runs the shipped engine plus four deliberately-different
+retrieval variants against every case — each tweaks one retrieval lever via the
+`CAND_*` env passthrough onto an `opts` field `compile()`/`structuralWalk()` now
+accept (`contentTopK`, `querySeeds`, `maxHops`; byte-identical to the shipped
+constants when unset, so this is not a kernel behavior change):
+
+| variant | lever | why it surfaces different nodes |
+|---|---|---|
+| `content-widened` | `CONTENT_TOP_K` 4 → 8 | more lexical-similarity picks |
+| `structural-only` | `CONTENT_TOP_K` → 0 | content arm off; an approximation, since the seeds themselves are still top content hits |
+| `wider-walk` | `QUERY_SEEDS` 3→6, `MAX_HOPS` 3→4 | a genuinely different structural candidate SET |
+| `narrow-walk` | `QUERY_SEEDS`→1, `MAX_HOPS`→1 | thins the structural set enough that nodes the shipped walk's 5-node cap crowded out can reach the top 5 |
+
+(The first two rarely matter in practice — the microDigest window is only 5
+nodes and structural hits usually fill it, so a content-arm tweak alone rarely
+changes what's *in* the top 5, matching "no lever beat the baseline" below. The
+walk-shape variants are what actually swap which nodes compete for those
+slots.)
+
+Every candidate id no existing label covers — from any of the five arms
+(shipped + 4 variants) — is dumped to `--pool-out`
+(`scripts/rank-eval/pooled-labels/candidates.jsonl` by default) with the node's
+title/summary and the case's prompt + preceding context, the same material the
+original judge saw. `pool-judge.js` then re-judges every candidate, **keyed by
+node id** (not position — the positional-join fragility "THE JOIN" above
+describes doesn't apply to a fresh judging pass that already has ids), using
+the same relevant/tangential/noise rubric, batched one LLM call per case:
+
+```bash
+node scripts/rank-eval/run.js --labels <dir> --pool
+node scripts/rank-eval/pool-judge.js --candidates scripts/rank-eval/pooled-labels/candidates.jsonl \
+  --out scripts/rank-eval/pooled-labels/labels.jsonl
+```
+
+`pool-judge.js` needs no raw `ANTHROPIC_API_KEY` — its default backend is the
+same headless `claude -p --model haiku` invocation the rest of the plugin's LLM
+call sites use (`--cmd` swaps in a different backend, same stdin/stdout
+contract as `SPOR_NUDGE_CMD`). `mergePooledLabels` (`labels.js`) merges the
+result into each case's label pool — filling in ids the original arms never
+covered, never overriding an original label — and `--pooled-labels
+<labels.jsonl>` on a plain (non-`--pool`) run scores against it, which is how
+every number in this file is now reported.
+
+The committed pooled label set (`scripts/rank-eval/pooled-labels/`) is
+`candidates.jsonl` (the 100-candidate dump across 60 of the 77 cases — 17 cases'
+five arms agreed on everything already labeled), `labels.jsonl` (100 fresh
+id-keyed labels: 23 relevant, 46 tangential, 31 noise), and `provenance.json`
+(judge model, date, case/candidate counts). Snapshot materialization stayed
+bounded-batch throughout (the disk-exhaustion guard from
+`art-res-inc-spor-dev-box-disk-full-2026-06-17` — see "INODE SAFETY" in
+`run.js` — is untouched by pooling; it just runs more hook invocations per
+batch).
+
 ## What it measured
 
-Baseline, the shipped ranker (77 cases; nDCG over 68, P@3 over 51):
+Baseline, the shipped ranker, against the **original arms-only labels** (77
+cases; nDCG over 68, P@3 over 51) — this is the measurement
+`dec-spor-digest-ranking-at-practical-ceiling` and the lever table below are
+based on:
 
 | | nDCG@5 | P@3 |
 |---|---|---|
 | all cases | 0.7815 | 0.7190 |
 | warranted only (n=58) | 0.8524 | 0.7200 |
 
+Re-reported against the **pooled labels** (`scripts/rank-eval/pooled-labels/`,
+2026-08-22) — the comparable floor for future retrieval changes
+(`node scripts/rank-eval/run.js --labels <dir> --pooled-labels
+scripts/rank-eval/pooled-labels/labels.jsonl`):
+
+| | nDCG@5 | P@3 |
+|---|---|---|
+| all cases | 0.7226 | 0.6918 |
+| warranted only (n=58) | 0.7990 | — |
+
+The pooled score is **lower**, not higher, than the arms-only one — expected,
+not a regression: pooling doesn't just add new relevant nodes to reward, it
+also gives some of the shipped ranker's own previously-unlabeled emissions a
+real (often `tangential`/`noise`) label for the first time, so emissions that
+used to be silently free of penalty (unlabeled, filtered out of the gain sum)
+now count against it. Label coverage of emitted nodes moved from 99.7% to
+100.0%. This is the more honest number; treat the arms-only 0.7815/0.8524 as
+the historical figure the ceiling argument below was made against, not a
+target to reproduce. (The LLM judge is not perfectly deterministic case-to-case
+— re-running `pool-judge.js` from scratch will land within roughly ±0.01 of
+these figures, not reproduce them bit-for-bit; the numbers here are pinned to
+the exact committed `labels.jsonl`.)
+
 **Warranted-only is the metric that matters.** On `warranted: false` cases the
 whole pool is noise by construction — the prompt merited no digest — so no
 re-ranking can score there. Those cases measure the *intent gate*, which is a
 different piece of work.
 
-The ceiling, and every lever tried (see the decision node for the full argument):
+The ceiling, and every lever tried, all measured against the **original
+arms-only labels** (see the decision node for the full argument — a future
+re-run of this table against the pooled labels would need to redo the lever
+sweep, which this issue was not scoped to do):
 
 | variant | nDCG@5 (all) | nDCG@5 (warranted) |
 |---|---|---|
@@ -90,8 +189,11 @@ The ceiling, and every lever tried (see the decision node for the full argument)
 
 A **perfect oracle** re-ranker gains only +0.036 on warranted cases: the ordering
 is already near its ceiling, and 3× more of the loss (0.1115) is retrieval —
-which nodes get selected at all — which pooled labels cannot score, since a node
-neither arm surfaced has no label.
+which nodes get selected at all. At the time this table was measured, a node
+neither arm surfaced had no label and pooled labels couldn't score it either —
+that gap is what "Retrieval pooling" above now closes, though the lever sweep
+itself was measured before the fix and hasn't been redone against pooled
+labels (see "Limits" below).
 
 No lever beat the baseline. Adding query similarity to the ordering *hurts
 monotonically*, which refutes the hypothesis this task was filed on ("the content
@@ -102,18 +204,28 @@ blind arm degrades a better structural signal — the same result
 `art-experiment-scale` found when structure-blind RAG missed a lineage-only
 constraint entirely.
 
-So `lib/kernel/graph.js` is deliberately **unchanged**. The harness is the
-deliverable: any future ranking idea can be scored against real labels in ~30s
-instead of shipped on a hunch.
+So `lib/kernel/graph.js`'s shipped ranking behavior is deliberately
+**unchanged** (the `contentTopK`/`querySeeds`/`maxHops` opts it gained for the
+pooling harness are eval-only levers, byte-identical to the shipped constants
+whenever a real caller leaves them unset). The harness is the deliverable: any
+future ranking idea can be scored against real labels in ~30s instead of
+shipped on a hunch.
 
 ## Limits worth knowing before trusting a future run
 
-- **Pooling bias** (`issue-spor-digest-rank-eval-retrieval-blind`). Labels exist
-  only for nodes one of the two arms actually showed. A change that surfaces a
-  genuinely better *unlabeled* node scores as neutral, so the eval cannot reward
-  true retrieval improvements — the direction with the most headroom. Re-judging
-  over a pooled candidate set is the only fix; another pass over these labels
-  won't do it.
+- **Pooling bias — RESOLVED** (`issue-spor-digest-rank-eval-retrieval-blind`).
+  Labels used to exist only for nodes one of the two original arms actually
+  showed, so a change that surfaced a genuinely better *unlabeled* node scored
+  as neutral — the eval couldn't reward true retrieval improvements, the
+  direction with the most headroom. `run.js --pool` + `pool-judge.js` now
+  re-judge a pooled candidate set from four deliberately-different retrieval
+  variants, keyed by node id, and the committed
+  `scripts/rank-eval/pooled-labels/` set + `--pooled-labels` scoring close the
+  gap (see "Retrieval pooling" above). The residual: pooling covers only the
+  five variants actually run — a retriever using a genuinely different
+  *mechanism* (not a lever tweak on this same compiler) can still surface an
+  unlabeled node, so this narrows the blind spot rather than eliminating the
+  category.
 - **Small n.** 58 warranted cases, ~460 labeled slots. Differences below ~0.01
   nDCG are noise; the capture-pending demote's +0.002 is not a result.
 - **Arm A is a different pipeline.** The server digest adds a team-first merge and

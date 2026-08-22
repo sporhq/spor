@@ -96,6 +96,9 @@ function buildPool(dir) {
       case_id: j.case_id,
       project_slug: c.project_slug,
       prompt: c.prompt,
+      // Kept only for the pooling re-judging pass (pool-judge.js), which needs
+      // the same "preceding conversation" context the original judge saw.
+      preceding_context: c.preceding_context,
       snap_sha: r.snap_sha,
       warranted: j.warranted,
       labels,
@@ -109,4 +112,28 @@ function buildPool(dir) {
   return { cases: out, stats };
 }
 
-module.exports = { buildPool, microIds, fullIds, zip };
+// Merge a pooled, ID-KEYED re-judging pass (scripts/rank-eval/pool-judge.js)
+// into each case's original two-arm labels (issue-spor-digest-rank-eval-
+// retrieval-blind). Pooled labels only FILL IN ids the original arms never
+// surfaced — they never override an original label, since the paired
+// comparison judge that produced those is the higher-fidelity pass and the
+// point of pooling is to lift previously-null ids out of "can't be scored",
+// not to re-litigate ids already labeled.
+//
+// `pooledByCase` is a Map: case_id -> { node_id: relevance }. Returns a NEW
+// array of cases (originals untouched) so callers can freely re-run scoring
+// against either the original or the pooled label set.
+function mergePooledLabels(cases, pooledByCase) {
+  return cases.map((c) => {
+    const extra = pooledByCase.get(c.case_id);
+    if (!extra) return c;
+    const labels = Object.create(null);
+    Object.assign(labels, c.labels);
+    for (const [id, label] of Object.entries(extra)) {
+      if (labels[id] == null) labels[id] = label;
+    }
+    return { ...c, labels };
+  });
+}
+
+module.exports = { buildPool, microIds, fullIds, zip, mergePooledLabels };

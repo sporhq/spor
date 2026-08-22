@@ -1,0 +1,10 @@
+{
+  "model": "cli:claude -p --model haiku",
+  "date": "2026-08-22",
+  "source_candidates": "scripts/rank-eval/pooled-labels/candidates.jsonl",
+  "candidates": 100,
+  "cases": 60,
+  "cases_judged": 60,
+  "cases_failed": 0,
+  "labels_written": 100
+}
