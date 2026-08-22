@@ -2673,6 +2673,13 @@ function edgeIdErr(bad) {
   return `invalid ${bad.flag} id "${bad.id}" — node ids may contain only letters, digits, '-' and '_'; this edge would be silently dropped on read.`;
 }
 
+// A caller-supplied --dedupe-key must satisfy the server's idempotency-key
+// grammar VERBATIM (server/idempotency.js KEY_RE): the server treats a key it
+// can't parse as no key at all and runs the capture UNGUARDED, so a typo'd key
+// would silently buy nothing while the caller believes it is deduped. Reject it
+// here instead, loudly, before the POST (task-spor-add-dedupe-key-first-class).
+const DEDUPE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
+
 // Spool a failed remote capture body to the SHARED outbox
 // (graphHome/outbox/*.capture.json) — the exact queue session-start's
 // drain-outbox engine replays to /v1/capture. The body is written VERBATIM so the
@@ -2696,7 +2703,7 @@ function spoolCapture(cfg, body) {
 async function cmdAdd(cfg, { values, positionals }) {
   const prose = positionals[0];
   if (!prose) {
-    err('usage: spor add "<text>" [--type T] [--title ...] [--project S] [--during ID] [--blocks ID] [--needed-by YYYY-MM-DD]');
+    err('usage: spor add "<text>" [--type T] [--title ...] [--project S] [--during ID] [--blocks ID] [--needed-by YYYY-MM-DD] [--dedupe-key KEY]');
     return 1;
   }
   const project = values.project || safeSlug();
@@ -2708,6 +2715,18 @@ async function cmdAdd(cfg, { values, positionals }) {
   const during = values.during || null;
   const blocks = values.blocks || null;
   const neededBy = values["needed-by"] || null;
+  // --dedupe-key: the caller's OWN stable name for this capture, promoted to the
+  // request's idempotency key so a retry of the same logical capture replays the
+  // original instead of minting a second node. Caller-supplied only, never derived
+  // from the text (dec at triage 2026-08-22): a content hash would silently collapse
+  // two genuinely distinct captures that happen to share prose, which is worse than
+  // the duplication it prevents. The caller that needs this — a cron monitor filing
+  // a once-per-onset alert — already knows its stable marker and passes it.
+  const dedupeKey = values["dedupe-key"] || null;
+  if (dedupeKey && !DEDUPE_KEY_RE.test(dedupeKey)) {
+    err(`invalid --dedupe-key "${dedupeKey}" — a dedupe key must start with a letter or digit and use only letters, digits, '.', '_' and '-' (max 200 chars).`);
+    return 1;
+  }
 
   if (cfg.mode() === "remote") {
     // Mark whether `project` came from a user-declared --project or the ambient
@@ -2729,7 +2748,14 @@ async function cmdAdd(cfg, { values, positionals }) {
     // the landed capture instead of ingesting a second node. The key rides the BODY
     // (the server also accepts it as the `Idempotency-Key` header) precisely so the
     // verbatim outbox replay carries it for free, no drain-side restore needed.
-    const body = { text: prose, context, idempotency_key: crypto.randomUUID() };
+    //
+    // A caller-supplied --dedupe-key takes that slot instead of the random UUID
+    // (task-spor-add-dedupe-key-first-class). The default UUID only dedupes ONE
+    // process's own retry cycle (it dies with the process unless the body spooled);
+    // a caller-chosen key dedupes across INVOCATIONS, which is what a cron monitor
+    // re-filing the same onset on the next tick needs — same key, same window, the
+    // original capture replays and no second node is minted.
+    const body = { text: prose, context, idempotency_key: dedupeKey || crypto.randomUUID() };
     const r = await remote.post(cfg, "/v1/capture", body, { timeoutMs: 30000 });
     // Transport failure (server unreachable / >30s ingestion abort) or a transient
     // 5xx: the request never durably landed and a replay can still succeed. A
@@ -2757,7 +2783,14 @@ async function cmdAdd(cfg, { values, positionals }) {
       return 1;
     }
     const ids = (r.json && (r.json.ids || r.json.node_ids)) || [];
-    out(ids.length ? `captured: ${ids.join(", ")}` : `captured (${(r.json && r.json.status) || "ok"})`);
+    // `idempotent_replay` means the server matched this key to a capture it had
+    // already committed and handed back the original ids without re-ingesting. Say
+    // so rather than printing a bare "captured": for a --dedupe-key caller that IS
+    // the success signal (the guard worked), and printing it as a fresh capture
+    // would hide exactly the duplicate-suppression the key was passed to get.
+    const replayed = Boolean(r.json && r.json.idempotent_replay);
+    const suffix = replayed ? " (idempotent replay — the original capture, no new node)" : "";
+    out(ids.length ? `captured: ${ids.join(", ")}${suffix}` : `captured (${(r.json && r.json.status) || "ok"})${suffix}`);
     // Self-heal: a pure-CLI user has no Claude Code session to run the drain, so a
     // successful capture (proof the server is reachable) is the moment to flush any
     // backlog the fail-open spool stranded (task-spor-cli-outbox-drain-verb). Only
@@ -2773,6 +2806,16 @@ async function cmdAdd(cfg, { values, positionals }) {
   }
 
   // local: hand the user a typed, validated node file
+  //
+  // --dedupe-key has nothing to guard here: the node file is written synchronously
+  // by this process, so there is no in-flight request that can land server-side
+  // while the client reports failure — the race the key exists for is a REMOTE
+  // transport race. Say so on stderr rather than accepting the flag silently: a
+  // caller that believes it is deduped and isn't is exactly the failure this
+  // feature was added to remove. The capture itself still proceeds.
+  if (dedupeKey) {
+    err("note: --dedupe-key is a remote-mode guard (it rides the capture idempotency key); local mode writes the node synchronously, so there is no retry race to dedupe — the flag is ignored.");
+  }
   const graphLib = require(path.join(ROOT, "lib", "graph.js"));
   const nodesDir = cfg.nodesDir();
   if (!fs.existsSync(nodesDir)) {
@@ -9597,7 +9640,14 @@ const COMMANDS = {
       "Capture context (both modes): --during links to the work this was discovered\n" +
       "during (a derived-from edge). --blocks <id> + --needed-by <date> declare a\n" +
       "cross-project dependency — set --project to the SERVING project (who must do\n" +
-      "the work) and it surfaces in their queue, ramping urgency as the date nears.",
+      "the work) and it surfaces in their queue, ramping urgency as the date nears.\n\n" +
+      "--dedupe-key <key> (remote) names this capture so a re-run of the same logical\n" +
+      "capture replays the original instead of filing a duplicate: it becomes the\n" +
+      "request's idempotency key, and within the server's idempotency window a repeat\n" +
+      "returns the original node ids and prints '(idempotent replay)'. Give it a key\n" +
+      "that is stable for the thing being captured and unique across different things\n" +
+      "(e.g. 'cron-monitor.harvest-stall.2026-08-22T06-34-14Z'); it is never derived\n" +
+      "from the text. Ignored in local mode (no transport race to guard).",
     options: {
       type: { type: "string", value: "T", desc: "node type (local only; default: task)" },
       title: { type: "string", value: "...", desc: "title (default: first 10 words)" },
@@ -9606,10 +9656,12 @@ const COMMANDS = {
       during: { type: "string", value: "id", desc: "node this was discovered during (derived-from edge)" },
       blocks: { type: "string", value: "id", desc: "node id this work blocks (cross-project dependency; target must exist)" },
       "needed-by": { type: "string", value: "date", desc: "YYYY-MM-DD deadline that ramps queue urgency (pairs with --blocks)" },
+      "dedupe-key": { type: "string", value: "key", desc: "caller-chosen idempotency key: a repeat within the server's window replays the original capture instead of duplicating it (remote only)" },
     },
     examples: [
       'spor add "Cache tf-idf norms across compiles for speed" --type task',
       'spor add "Platform must expose a token-rotation hook" --project platform --blocks task-my-initiative --needed-by 2026-07-15',
+      'spor add "harvest-usage-traces has failed 3 ticks running" --dedupe-key cron-monitor.harvest-failure.2026-08-22T06-34-14Z',
     ],
     run: (cfg, p) => cmdAdd(cfg, p),
   },

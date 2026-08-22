@@ -253,3 +253,119 @@ test("add timeout spools the key; drain replays the SAME key so the server dedup
     srv.close();
   }
 });
+
+// --- caller-supplied --dedupe-key --------------------------------------------
+// (task-spor-add-dedupe-key-first-class). The random UUID above only dedupes ONE
+// process's own retry cycle; --dedupe-key lets a caller that re-files the same
+// logical capture across INVOCATIONS (a cron monitor re-alerting on the same
+// onset) name it, so the server replays the original instead of duplicating.
+// Oracle is the same: the key the server actually receives, on the first POST
+// and on every replay of the spooled body.
+
+test("add --dedupe-key sends the caller's key as the idempotency key, not a uuid", async () => {
+  const { home } = freshHome();
+  const { srv, hits, base } = await stubServer();
+  try {
+    const r = await runAsync(["add", "an alert filed with a caller-chosen dedupe key",
+      "--dedupe-key", "cron-monitor.harvest-failure.2026-08-22T06-34-14Z"],
+      { SPOR_SERVER: base, SPOR_TOKEN: "tok", SPOR_HOME: home });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const cap = hits.find((h) => h.url === "/v1/capture");
+    assert.strictEqual(JSON.parse(cap.body).idempotency_key,
+      "cron-monitor.harvest-failure.2026-08-22T06-34-14Z",
+      "the caller's key takes the idempotency slot verbatim");
+  } finally {
+    srv.close();
+  }
+});
+
+test("add --dedupe-key rejects a key the server would silently ignore, before any POST", async () => {
+  const { home } = freshHome();
+  const base = await deadBase(); // dead — proves the rejection happens client-side
+  // ':' is outside the server's key grammar (server/idempotency.js KEY_RE), so an
+  // unvalidated key would run the capture UNGUARDED while the caller believes it
+  // is deduped — the exact silent failure this flag exists to remove.
+  const r = await runAsync(["add", "an alert whose dedupe key has a colon in it",
+    "--dedupe-key", "cron-monitor:harvest:2026-08-22T06:34:14Z"],
+    { SPOR_SERVER: base, SPOR_TOKEN: "tok", SPOR_HOME: home });
+  assert.strictEqual(r.status, 1, "an unusable key is a hard error");
+  assert.match(r.stderr, /invalid --dedupe-key/);
+  assert.strictEqual(listSpool(path.join(home, "outbox")).length, 0,
+    "a rejected key never spools — nothing was attempted");
+});
+
+test("add --dedupe-key: a spooled capture drains with the caller's key intact", async () => {
+  const { home, outbox } = freshHome();
+  const deadServer = await deadBase();
+  const key = "cron-monitor.wake-count.2026-08-22T06-34-14Z";
+  const add = await runAsync(["add", "an alert that failed to ship on the first tick", "--dedupe-key", key],
+    { SPOR_SERVER: deadServer, SPOR_TOKEN: "tok", SPOR_HOME: home });
+  assert.strictEqual(add.status, 1, "transport failure exits 1");
+  const spooled = listSpool(outbox);
+  assert.strictEqual(spooled.length, 1, "the failed capture spooled");
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(outbox, spooled[0]), "utf8")).idempotency_key, key,
+    "the spool file carries the caller's key");
+  const { srv, hits, base } = await stubServer();
+  try {
+    const drain = await runAsync(["drain"], { SPOR_SERVER: base, SPOR_TOKEN: "tok", SPOR_HOME: home });
+    assert.strictEqual(drain.status, 0, drain.stderr);
+    assert.strictEqual(JSON.parse(hits.find((h) => h.url === "/v1/capture").body).idempotency_key, key,
+      "cmdDrain replays the caller's key — the server replays rather than double-files");
+  } finally {
+    srv.close();
+  }
+});
+
+test("add --dedupe-key: the opportunistic drain also replays the caller's key", async () => {
+  const { home, outbox } = freshHome();
+  // A previously-stranded alert sits in the outbox; the next successful add flushes
+  // it (opportunisticDrain). That replay must carry the stranded body's OWN key.
+  spool(outbox, `cli-1-${"a".repeat(8)}.capture.json`,
+    { text: "a stranded alert", context: { project: "demo" }, idempotency_key: "cron-monitor.stall.2026-08-21T00-00-00Z" });
+  const { srv, hits, base } = await stubServer();
+  try {
+    const r = await runAsync(["add", "the next tick's alert", "--dedupe-key", "cron-monitor.stall.2026-08-22T00-00-00Z"],
+      { SPOR_SERVER: base, SPOR_TOKEN: "tok", SPOR_HOME: home });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /also flushed 1 spooled capture/);
+    const keys = hits.filter((h) => h.url === "/v1/capture").map((h) => JSON.parse(h.body).idempotency_key);
+    assert.deepStrictEqual(keys.sort(),
+      ["cron-monitor.stall.2026-08-21T00-00-00Z", "cron-monitor.stall.2026-08-22T00-00-00Z"],
+      "each capture ships under its own caller key");
+    assert.strictEqual(listSpool(outbox).length, 0);
+  } finally {
+    srv.close();
+  }
+});
+
+test("add --dedupe-key: a server replay is reported as a replay, not a fresh capture", async () => {
+  const { home } = freshHome();
+  // The server answers a key it has already committed with the ORIGINAL ids plus
+  // idempotent_replay — the signal that the guard worked. Printing that as an
+  // ordinary "captured" would hide exactly the duplicate-suppression asked for.
+  const { srv, base } = await stubServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ status: "captured", ids: ["issue-original"], idempotent_replay: true }));
+  });
+  try {
+    const r = await runAsync(["add", "the same alert, re-filed on the next tick", "--dedupe-key", "cron-monitor.failure.2026-08-22Z"],
+      { SPOR_SERVER: base, SPOR_TOKEN: "tok", SPOR_HOME: home });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /captured: issue-original .*idempotent replay/,
+      "the original node id comes back, flagged as a replay");
+  } finally {
+    srv.close();
+  }
+});
+
+test("add --dedupe-key (local mode) says the flag is inert and still writes the node", () => {
+  const { home } = freshHome();
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const r = run(["add", "a locally written capture that passed a dedupe key", "--dedupe-key", "some.stable.key"],
+    { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stderr, /--dedupe-key is a remote-mode guard/,
+    "silently accepting it would leave the caller believing in a guard that isn't there");
+  assert.ok(fs.readdirSync(path.join(home, "nodes")).some((f) => f.endsWith(".md")),
+    "the capture itself still happened");
+});
