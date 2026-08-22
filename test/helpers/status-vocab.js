@@ -6,9 +6,16 @@
 //
 // Deliberately NOT derived from lib/seed/: reading the seed schemas back here
 // would make these tests tautological — a bug in a schema's validate() gate
-// and the test that's supposed to catch it would drift together. `valid` need
-// not be exhaustive (some consumers only probe a subset); `bad` is the union of
-// off-vocabulary statuses every consumer needs rejected.
+// and the test that's supposed to catch it would drift together. `bad` is the
+// union of off-vocabulary statuses every consumer needs rejected, and need not
+// be exhaustive of every possible invalid string.
+//
+// `valid`, by contrast, IS now required to be the exact, exhaustive set of
+// each type's declared status.vocabulary — test/status-vocab-registry-
+// crosscheck.test.js (task-spor-assert-hand-lists-against-declarative-vocab)
+// diffs it against graph.registry.statusVocabulary(type) in both directions
+// and fails loudly, naming the stale side, on any divergence. Add a status to
+// a seed schema's vocabulary and its `valid` entry here in the same change.
 const STATUS_VOCAB = {
   task: {
     valid: ["open", "active", "done", "abandoned"],
