@@ -132,18 +132,30 @@ low-blast-radius dev VM, not a general workstation:
 
 ## Preflight (once, before launching anything)
 
-1. `spor status` — confirm **remote mode**, your identity, and the project.
+1. **Skill drift check** — from the repo checkout, run the dry-run guard
+   (no `--apply`):
+   ```bash
+   cd <repo> && .claude/skills/spor-orchestrator/scripts/link-live-skill.sh   # dry run
+   ```
+   `IN-SYNC`/`clean`/`absent` with exit 0 means the live copy is still the
+   symlink (or matches byte-for-byte) — proceed. A `DIVERGED` line means the
+   live directory has been replaced by a real, hand-edited copy again — the
+   exact fork "Local-dev posture" above exists to prevent, and the whole point
+   of catching it here: you may be running from a stale skill right now. Stop
+   and reconcile before dispatching anything. `FLEET UP` alone (no `DIVERGED`)
+   just means another run is still live — not drift; note it and continue.
+2. `spor status` — confirm **remote mode**, your identity, and the project.
    Remote mode is what gives you the auto-claim lease and the team-wide
    dup-guard. In local mode there is no lease; fall back to strict
    orchestrator-side non-overlap and say so to the user.
-2. Confirm a dispatch identity is set (`spor agent use <agent-id>`; visible in
+3. Confirm a dispatch identity is set (`spor agent use <agent-id>`; visible in
    `spor status`). Dispatches attribute to that agent.
-3. `spor repos` — confirm the slug→path map resolves the target repo(s) so
+4. `spor repos` — confirm the slug→path map resolves the target repo(s) so
    dispatch lands in the right directory.
-4. Pull the queue: `spor next --json` (widen with `--all-projects` or
+5. Pull the queue: `spor next --json` (widen with `--all-projects` or
    `--project <token>` if the user wants more than this repo). It comes already
    filtered, ranked, and annotated with `in_flight` — don't re-derive that.
-5. **Present the plan and get a go-ahead before launching.** Show the user the
+6. **Present the plan and get a go-ahead before launching.** Show the user the
    top items you intend to delegate, the concurrency (≤5), and — stated plainly —
    that you will **merge to main autonomously** after each item passes the gate.
    Merging to shared main is high-consequence; the user invoked this workflow,
