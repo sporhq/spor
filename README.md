@@ -320,7 +320,14 @@ team mode it also names any other machine in the fleet that can run it.
 Codex-specific flags (`--sandbox`, `--approval-policy`) and Claude-specific
 ones (`--permission-mode`, `--agent`) are mutually exclusive — passing the
 wrong one for the resolved harness is a hard error, so a dispatch can't launch
-half-configured for the wrong CLI.
+half-configured for the wrong CLI. The one exception: `--permission-mode
+bypassPermissions` against a Codex profile has a real Codex equivalent
+("run fully unattended"), so instead of erroring it translates to `--sandbox
+danger-full-access --approval-policy never` (an explicit `--sandbox`/
+`--approval-policy` you also pass wins over that default) and prints a loud
+warning naming the translation — so an orchestrator or script that passes the
+same bypass flag to every dispatch regardless of harness keeps working.
+Every other permission-mode value still hard-errors against Codex.
 
 Claude Code dispatch detaches into Claude Code's own background-agent daemon —
 the launcher exits immediately, and `spor dispatch` can only reconcile what

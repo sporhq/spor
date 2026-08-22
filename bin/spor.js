@@ -8090,6 +8090,22 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   const harnessAdapter = dispatchHarnesses.getHarness(harness);
   const effectiveModel = model || profileRuntime.model || null;
   const harnessBin = harnessAdapter ? harnessAdapter.command() : null;
+  // Validate BEFORE building any argv (preview or real) — a translated option
+  // (today: Codex + --permission-mode bypassPermissions) changes what argv
+  // buildArgs should see, so effectiveSandbox/effectiveApprovalPolicy below
+  // must be resolved first and threaded through every buildArgs call site.
+  const harnessOptionsCheck = harnessAdapter && harnessAdapter.validateOptions({
+    permissionMode: permMode, agent, sandbox, approvalPolicy,
+  });
+  if (harnessOptionsCheck && harnessOptionsCheck.message) {
+    err(harnessOptionsCheck.message);
+    err(`  ${harnessOptionsCheck.hint}`);
+    return 1;
+  }
+  if (harnessOptionsCheck && harnessOptionsCheck.warning) err(harnessOptionsCheck.warning);
+  const translated = harnessOptionsCheck && harnessOptionsCheck.translate;
+  const effectiveSandbox = (translated && translated.sandbox) || sandbox || "workspace-write";
+  const effectiveApprovalPolicy = (translated && translated.approvalPolicy) || approvalPolicy || "never";
   // NB: no `--session-id` — `claude --bg` ignores it (warns) and manages its own
   // session; we capture the real one post-launch (dec-spor-dispatch-bg-session-late-bind).
   const previewArgs = harnessAdapter ? harnessAdapter.buildArgs({
@@ -8097,8 +8113,8 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     model: effectiveModel,
     permissionMode: permMode,
     agent,
-    sandbox: sandbox || "workspace-write",
-    approvalPolicy: approvalPolicy || "never",
+    sandbox: effectiveSandbox,
+    approvalPolicy: effectiveApprovalPolicy,
     reportPath: "__SPOR_REPORT_PATH__",
     sporMcp: null,
   }) : [];
@@ -8106,14 +8122,6 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   if (!supportedHarness && !dryRun) {
     err(`cannot dispatch ${nodeId || name}: profile ${profileCheck && profileCheck.id ? profileCheck.id : "(unknown)"} selects unsupported harness '${harness}'.`);
     err(`  this client has adapters for ${dispatchHarnesses.harnesses().map((a) => a.id).join(", ")}; the assignment is unchanged.`);
-    return 1;
-  }
-  const invalidHarnessOptions = harnessAdapter && harnessAdapter.validateOptions({
-    permissionMode: permMode, agent, sandbox, approvalPolicy,
-  });
-  if (invalidHarnessOptions) {
-    err(invalidHarnessOptions.message);
-    err(`  ${invalidHarnessOptions.hint}`);
     return 1;
   }
 
@@ -8391,8 +8399,8 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     );
     const args = harnessAdapter.buildArgs({
       model: effectiveModel,
-      sandbox: sandbox || "workspace-write",
-      approvalPolicy: approvalPolicy || "never",
+      sandbox: effectiveSandbox,
+      approvalPolicy: effectiveApprovalPolicy,
       reportPath: "__SPOR_REPORT_PATH__",
       sporMcp: wantsSporMcp && mcpToken ? { url: `${remote.base(cfg)}/mcp` } : null,
     });

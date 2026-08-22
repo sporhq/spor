@@ -278,12 +278,100 @@ test("Codex adapter rejects Claude-only options before launch", () => {
   const outfile = path.join(home, "should-not-launch");
   const stub = codexStub(home);
   const result = run(
-    ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--permission-mode", "bypassPermissions", "--no-brief"],
+    ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--permission-mode", "acceptEdits", "--no-brief"],
     { SPOR_HOME: home, SPOR_CODEX_CMD: stub, OUTFILE: outfile }
   );
   assert.strictEqual(result.status, 1);
   assert.match(result.stderr, /flag is Claude Code-specific/);
   assert.ok(!fs.existsSync(outfile));
+});
+
+test("Codex adapter still rejects --agent regardless of --permission-mode", () => {
+  const { home, repo } = fixture();
+  const outfile = path.join(home, "should-not-launch");
+  const stub = codexStub(home);
+  const result = run(
+    ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--agent", "reviewer", "--permission-mode", "bypassPermissions", "--no-brief"],
+    { SPOR_HOME: home, SPOR_CODEX_CMD: stub, OUTFILE: outfile }
+  );
+  assert.strictEqual(result.status, 1);
+  assert.match(result.stderr, /--agent.*Claude Code-specific/);
+  assert.ok(!fs.existsSync(outfile));
+});
+
+// issue-spor-codex-dispatch-permission-bypass-error: --permission-mode
+// bypassPermissions is the one Claude-only value with a real Codex
+// equivalent (run fully unattended), so it TRANSLATES with a loud warning
+// instead of hard-erroring, while every other permission-mode value keeps
+// failing (covered above).
+test("Codex dispatch translates --permission-mode bypassPermissions instead of hard-erroring", async () => {
+  const { home, repo } = fixture();
+  const outfile = path.join(home, "codex-bypass-invocation.json");
+  const stub = codexStub(home);
+  const result = run(
+    ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--permission-mode", "bypassPermissions", "--no-brief"],
+    { SPOR_HOME: home, SPOR_CODEX_CMD: stub, OUTFILE: outfile }
+  );
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.match(result.stderr, /warning:.*bypassPermissions.*translating.*danger-full-access.*never/s);
+
+  const invocation = await awaitJson(outfile);
+  assert.ok(invocation, "the Codex stub launched despite --permission-mode bypassPermissions");
+  assert.deepStrictEqual(invocation.args.slice(0, 6), [
+    "--ask-for-approval", "never", "exec", "--json", "--sandbox", "danger-full-access",
+  ]);
+});
+
+test("Codex dispatch preview (--print) shows the translated bypassPermissions argv and warning", () => {
+  const { home, repo } = fixture();
+  const result = run(
+    ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--permission-mode", "bypassPermissions", "--no-brief", "--print"],
+    { SPOR_HOME: home }
+  );
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.match(result.stderr, /warning:.*bypassPermissions/);
+  assert.match(result.stdout, /codex --ask-for-approval never exec --json --sandbox danger-full-access/);
+});
+
+test("an explicit --sandbox alongside --permission-mode bypassPermissions is respected, not overridden", async () => {
+  const { home, repo } = fixture();
+  const outfile = path.join(home, "codex-bypass-explicit-sandbox.json");
+  const stub = codexStub(home);
+  const result = run(
+    [
+      "dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex",
+      "--permission-mode", "bypassPermissions", "--sandbox", "workspace-write", "--no-brief",
+    ],
+    { SPOR_HOME: home, SPOR_CODEX_CMD: stub, OUTFILE: outfile }
+  );
+  assert.strictEqual(result.status, 0, result.stderr);
+
+  const invocation = await awaitJson(outfile);
+  assert.ok(invocation);
+  assert.deepStrictEqual(invocation.args.slice(0, 6), [
+    "--ask-for-approval", "never", "exec", "--json", "--sandbox", "workspace-write",
+  ]);
+});
+
+test("Claude Code dispatch --permission-mode behavior is unchanged", () => {
+  const { home, repo } = fixture();
+  fs.writeFileSync(path.join(home, "nodes", "profile-claude.md"), `---
+id: profile-claude
+type: profile
+title: Claude Code test profile
+summary: A profile selecting Claude Code for the dispatch test.
+harness: claude-code
+date: 2026-07-19
+---
+Claude Code test profile.
+`);
+  const result = run(
+    ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-claude", "--permission-mode", "bypassPermissions", "--no-brief", "--print"],
+    { SPOR_HOME: home }
+  );
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /warning:.*bypassPermissions/);
+  assert.match(result.stdout, /--permission-mode bypassPermissions/);
 });
 
 test("remote Codex dispatch binds the thread, renews the lease, and keeps its bearer out of durable state", async () => {
