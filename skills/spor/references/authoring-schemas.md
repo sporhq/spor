@@ -46,7 +46,12 @@ that should retire only ONE type in that schema's `status.inert`/
   "always_on": false,
   "traversable": true,
   "capturable": true,
-  "status": { "non_resolving": ["abandoned"] }
+  "status": {
+    "non_resolving": ["abandoned"],
+    "vocabulary": ["open", "active", "done", "abandoned"],
+    "completion": "done",
+    "resolver_required": true
+  }
 }
 ```
 
@@ -77,6 +82,25 @@ that should retire only ONE type in that schema's `status.inert`/
   inert (it keeps surfacing as live guidance). Use a per-type declaration —
   never the type-blind register — for an org status like artifact `released`,
   so it retires only nodes of its own type.
+- `status.vocabulary` / `status.completion` / `status.resolver_required` — the
+  **completion policy**, declared for READERS
+  (task-spor-registry-declarative-terminal-status-policy). `vocabulary` is the
+  closed status enum your `validate()` gates membership on; `completion` is the
+  single SUCCESS terminal value (task `done`, issue `resolved`, question
+  `answered` — not the whole `terminal` set, which also holds `abandoned` and
+  friends); `resolver_required: true` says reaching it also needs a live
+  resolving `decision`/`artifact`. **These declare, they do not enforce** — your
+  hooks are still the only write door. They exist so read surfaces (the
+  gardener's finding remedies, `spor schema`) can name the right terminal status
+  without parsing hook source, instead of falling back to a generic `resolved`
+  your own door then refuses
+  (issue-spor-gardener-terminal-status-fallback-off-vocab). Declare a
+  `vocabulary` with NO `completion` when your terminal values are several
+  distinct outcomes rather than one success (decision
+  settled/superseded/rejected) — the absence is how a reader learns there is no
+  mechanical close for this type. Keep them TRUE to the hooks: the seed pack's
+  `test/seed-declarative-status-policy.test.js` drives every schema's hooks
+  through the sandbox and fails on disagreement.
 
 Note what the payload does **not** hold: there is no field list and no status
 *enum*. Extra frontmatter fields are allowed as-is — a custom `severity:` line

@@ -2,7 +2,7 @@
 id: schema-question
 type: schema
 kind: node-schema
-schema_version: 2026.07.05.1
+schema_version: 2026.08.22.1
 title: Seed schema for question nodes
 summary: Node schema for the question type — a routed ask that the graph could not answer; queueable so open questions join the decision queue, routed-to a steward, answered by nodes carrying answers edges. Seed-pack default; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -60,6 +60,18 @@ task-spor-getnode-surface-resolution-on-terminal first shipped against. Pure,
 read-only, fail-soft (a crashing hook is dropped, never breaks the read);
 registry behavior only, backward-readable, no upgrade chain.
 
+`status` (2026.08.22.1, task-spor-registry-declarative-terminal-status-policy):
+the status vocabulary `validate()` enforces is now also DECLARED as registry
+data (`status.vocabulary`), alongside `status.completion: answered` — the
+single success terminal value a mechanical "make the record honest" remedy
+should name. No `resolver_required`: a question's `answered` carries no
+completion-resolver gate (any live `answers` edge, from any type, suffices),
+which is exactly the asymmetry with task/issue this declaration makes readable
+instead of hand-mirrored. Enforcement is unchanged — the hook is still the
+write door; `test/seed-declarative-status-policy.test.js` drives it through the
+sandbox and fails if the hook and this payload disagree. Backward-readable:
+declaration only, no stored-shape change, no upgrade chain.
+
 ```json
 {
   "node_type": "question",
@@ -67,7 +79,14 @@ registry behavior only, backward-readable, no upgrade chain.
   "prefix": [
     "question-"
   ],
-  "queueable": true
+  "queueable": true,
+  "status": {
+    "vocabulary": [
+      "open",
+      "answered"
+    ],
+    "completion": "answered"
+  }
 }
 ```
 

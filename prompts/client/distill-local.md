@@ -18,7 +18,7 @@ type: <type>
 repo: {{SLUG}}
 title: <title>
 summary: <one-two sentences>
-status: <omit unless meaningful; must be valid for the type — decision: active|rejected; task: open|active; issue: open|active|resolved; artifact: active; norm: active>
+status: <omit unless meaningful; never a completion status (the type's status.completion — task done, issue resolved, question answered): those are gated on a resolver already being on the graph, so distilling one loses the node at the write door; must be valid for the type — decision: active|rejected; task: open|active; issue: open|active|resolved; artifact: active; norm: active>
 date: {{DATE}}
 edges:
   - {type: <edge-type>, to: <existing-node-id>}

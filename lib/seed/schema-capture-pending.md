@@ -2,7 +2,7 @@
 id: schema-capture-pending
 type: schema
 kind: node-schema
-schema_version: 2026.06.20.1
+schema_version: 2026.08.22.1
 title: Seed schema for capture-pending nodes
 summary: Node schema for the capture-pending type — raw captured text that fit no schema; filed by the server for later triage. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -32,6 +32,17 @@ could be BORN with an off-vocabulary status that a later re-validating write the
 rejected. `validate()` and `transitions()` SHARE one allowed set (no drift).
 Backward-readable: write-time only, no node-shape change, no upgrade chain.
 
+`status` (2026.08.22.1, task-spor-registry-declarative-terminal-status-policy):
+the status vocabulary `validate()` enforces is now also DECLARED as registry
+data (`status.vocabulary`). Deliberately NO `status.completion`: `merged` and
+`rejected` are the two opposite verdicts of capture triage, not one success
+value — and the generic `resolved` a reader used to fall back to is off this
+vocabulary, so the remedy it produced could never be written
+(issue-spor-gardener-terminal-status-fallback-off-vocab). Enforcement is
+unchanged — the hook is still the write door;
+`test/seed-declarative-status-policy.test.js` pins the two together.
+Backward-readable: declaration only, no stored-shape change, no upgrade chain.
+
 ```json
 {
   "node_type": "capture-pending",
@@ -40,7 +51,13 @@ Backward-readable: write-time only, no node-shape change, no upgrade chain.
     "cap-"
   ],
   "capturable": false,
-  "queueable": true
+  "queueable": true,
+  "status": {
+    "vocabulary": [
+      "merged",
+      "rejected"
+    ]
+  }
 }
 ```
 

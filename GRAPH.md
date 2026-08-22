@@ -302,8 +302,8 @@ separately, but never shows a complete custom type in one piece.
 
 **The constraint model is procedural, not declarative.** A schema's `json`
 payload declares only *registry knobs* — `node_type`, `prefix`, `queueable`,
-`traversable`, `always_on`, `capturable`, an edge `weight`, and the three status
-partitions: `status.non_resolving` (resolver semantics — whether a node in this
+`traversable`, `always_on`, `capturable`, an edge `weight`, the completion
+policy (below), and the three status partitions: `status.non_resolving` (resolver semantics — whether a node in this
 status retires the targets it points at), `status.terminal` (own-lifecycle
 completion — the statuses in which a node of this type is *done*, unioned with the
 kernel's legacy set and read by work-analytics so a schema-only terminal status
@@ -314,8 +314,33 @@ issue-spor-analytics-completion-ignores-schema-terminal-status), and
 `terminal-status` register below; a schema that declares no `inert` set
 INHERITS its `terminal` set, so only a schema whose two sets genuinely differ
 declares it — the seed decision schema pins `settled` terminal but NOT inert,
-dec-spor-status-inert-third-partition). There is **no
-declarative field list and no status enum.** Custom fields are free-form: any flat frontmatter key the
+dec-spor-status-inert-third-partition).
+
+**The completion policy — declared for readers, still enforced by code**
+(task-spor-registry-declarative-terminal-status-policy). Three further `status`
+keys say, as registry data, what the hooks below enforce: `status.vocabulary`
+(the closed status enum the type's own `validate()` gates membership on),
+`status.completion` (the single SUCCESS terminal value — task `done`, issue
+`resolved`, question `answered` — as distinct from `status.terminal`, which is
+the full set *including* the give-up outcomes `abandoned`/`superseded`/
+`rejected`), and `status.resolver_required` (whether reaching that value also
+demands a live resolving `decision`/`artifact`, the completion-resolver
+invariant). **Declaring them gates nothing** — the hooks are still the only
+write door, and this is exactly why they are not a field list or an enforced
+enum. They exist so a READER can name the right terminal status without
+parsing hook source: the gardener's finding remedies used to keep hand-written
+tables of "task → done, everything else → resolved" and shipped remedies whose
+`set_status` the door then refused
+(issue-spor-gardener-terminal-status-fallback-off-vocab). A type whose terminal
+values are several distinct OUTCOMES rather than one success (decision
+settled/superseded/rejected, artifact merged/released/done, capture-pending
+merged/rejected) declares a `vocabulary` and NO `completion` — that absence is
+the machine-readable form of "there is no mechanical close here". Declaration
+and hook are pinned together by `test/seed-declarative-status-policy.test.js`,
+which drives every seed schema's hooks through the sandbox and fails if the two
+disagree; read the live values with `spor schema <type>`.
+
+Otherwise there is **no declarative field list and no status enum.** Custom fields are free-form: any flat frontmatter key the
 regex parser accepts (simple `key: value` scalars, YAML-folded multi-line
 values, `pin:`/`exclude:` inline lists, `- {type: X, to: Y}` edges — and nothing
 fancier) is carried verbatim on the node. What a field MUST contain, and which

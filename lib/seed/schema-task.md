@@ -2,7 +2,7 @@
 id: schema-task
 type: schema
 kind: node-schema
-schema_version: 2026.06.21.1
+schema_version: 2026.08.22.1
 title: Seed schema for task nodes
 summary: Node schema for the task type — active or planned work. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -107,6 +107,22 @@ task). The queue's complementary front-floor guard (fix b) has no twin here — 
 read hook carries no `front` signal — but the edge narrowing keeps get_node and the
 queue consistent. Pure, read-only, fail-soft; backward-readable, no upgrade chain.
 
+`status` (2026.08.22.1, task-spor-registry-declarative-terminal-status-policy):
+the completion policy the hooks below enforce is now also DECLARED as registry
+data — `status.vocabulary` (the closed enum `validate()` gates membership on),
+`status.completion` (`done`, the single SUCCESS terminal value, as opposed to
+the give-up outcome `abandoned`), and `status.resolver_required: true` (that
+value additionally needs a live resolving `decision`/`artifact`, the
+`transitions()` gate above). Nothing here changes enforcement — the hooks are
+still the write door, and the declaration alone gates nothing. It exists so
+READ surfaces stop hand-mirroring hook source: the gardener's finding remedies
+derived `TERMINAL_STATUS_BY_TYPE`/`RESOLVER_REQUIRED_TERMINAL` from
+hand-maintained tables that could (and did) name a status the door then
+refused (issue-spor-gardener-terminal-status-fallback-off-vocab). The two are
+pinned together by `test/seed-declarative-status-policy.test.js`, which drives these
+hooks through the sandbox and fails if they and this payload disagree.
+Backward-readable: declaration only, no stored-shape change, no upgrade chain.
+
 ```json
 {
   "node_type": "task",
@@ -118,7 +134,15 @@ queue consistent. Pure, read-only, fail-soft; backward-readable, no upgrade chai
   "status": {
     "non_resolving": [
       "abandoned"
-    ]
+    ],
+    "vocabulary": [
+      "open",
+      "active",
+      "done",
+      "abandoned"
+    ],
+    "completion": "done",
+    "resolver_required": true
   }
 }
 ```

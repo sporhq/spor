@@ -2,7 +2,7 @@
 id: schema-issue
 type: schema
 kind: node-schema
-schema_version: 2026.06.21.1
+schema_version: 2026.08.22.1
 title: Seed schema for issue nodes
 summary: Node schema for the issue type — a defect/finding and its resolution lineage; queueable, so open issues join the decision queue. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -88,6 +88,21 @@ open status contradicts the edge, an informational ✓ when the issue is healthi
 `resolved` (task-spor-getnode-surface-resolution-on-terminal). Pure, read-only,
 fail-soft; registry behavior only, backward-readable, no upgrade chain.
 
+`status` (2026.08.22.1, task-spor-registry-declarative-terminal-status-policy):
+the completion policy the hooks below enforce is now also DECLARED as registry
+data — `status.vocabulary` (the closed enum `validate()` gates membership on),
+`status.completion` (`resolved`, the single success terminal value), and
+`status.resolver_required: true` (that value additionally needs a live
+resolving `decision`/`artifact`, the `transitions()` gate above). Enforcement
+is unchanged — the hooks are still the write door, and the declaration alone
+gates nothing; it exists so READ surfaces (the gardener's finding remedies,
+`spor schema`) stop hand-mirroring hook source and naming a status the door
+then refuses (issue-spor-gardener-terminal-status-fallback-off-vocab). The two
+are pinned together by `test/seed-declarative-status-policy.test.js`, which
+drives these hooks through the sandbox and fails if they and this payload
+disagree. Backward-readable: declaration only, no stored-shape change, no
+upgrade chain.
+
 ```json
 {
   "node_type": "issue",
@@ -95,7 +110,16 @@ fail-soft; registry behavior only, backward-readable, no upgrade chain.
   "prefix": [
     "issue-"
   ],
-  "queueable": true
+  "queueable": true,
+  "status": {
+    "vocabulary": [
+      "open",
+      "active",
+      "resolved"
+    ],
+    "completion": "resolved",
+    "resolver_required": true
+  }
 }
 ```
 

@@ -2,7 +2,7 @@
 id: schema-decision
 type: schema
 kind: node-schema
-schema_version: 2026.07.16.1
+schema_version: 2026.08.22.1
 title: Seed schema for decision nodes
 summary: Node schema for the decision type — a choice that was made, with the why. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -83,6 +83,20 @@ both values are already in the type-blind terminal-status register the overlay
 unions with, so decision liveness stays byte-identical. Registry behavior
 only, no node-shape change, backward-readable, no upgrade chain.
 
+`status` (2026.08.22.1, task-spor-registry-declarative-terminal-status-policy):
+the status vocabulary `validate()` enforces is now also DECLARED as registry
+data (`status.vocabulary`). Deliberately NO `status.completion`: a decision's
+terminal values are three DIFFERENT outcomes (`settled` in force, `superseded`
+replaced, `rejected` dismissed), not one success, so no single status can be
+recommended mechanically — and a reader that assumed the generic `resolved`
+got a remedy this type's own door always refused
+(issue-spor-gardener-terminal-status-fallback-off-vocab). Declaring the
+vocabulary without a completion is how that "there is no mechanical close
+here" fact becomes derivable instead of a hand-maintained exclusion list.
+Enforcement is unchanged — the hook is still the write door;
+`test/seed-declarative-status-policy.test.js` pins the two together.
+Backward-readable: declaration only, no stored-shape change, no upgrade chain.
+
 ```json
 {
   "node_type": "decision",
@@ -93,6 +107,12 @@ only, no node-shape change, backward-readable, no upgrade chain.
   "status": {
     "non_resolving": [
       "rejected"
+    ],
+    "vocabulary": [
+      "active",
+      "superseded",
+      "rejected",
+      "settled"
     ],
     "terminal": [
       "superseded",

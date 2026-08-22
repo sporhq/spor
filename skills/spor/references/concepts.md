@@ -22,8 +22,8 @@ the decision queue (QUEUE.md §4).
 | type | id prefix | purpose | notes |
 |---|---|---|---|
 | decision | `dec-` | a choice that was made, with the why | status `active`/`superseded`/`rejected`/`settled`; a **rejected** decision is a dismissed approach — keep the reason; **settled** = in force but acknowledged as just-context, exempt from the gardener decay-sweep (optional `reviewed_at` ISO scalar snoozes it) |
-| task | `task-` | active or planned work | status `open`/`active`/`done`/`abandoned`; queueable; `done` needs a resolving `decision`/`artifact` (see SKILL routing → /spor:next) |
-| issue | `issue-` | a defect and its resolution lineage | status `open`/`active`/`resolved`; queueable; `resolved` needs a resolving `decision`/`artifact` (see SKILL routing → /spor:next) |
+| task | `task-` | active or planned work | status `open`/`active`/`done`/`abandoned`; queueable; `done` (the type's declared completion status) needs a resolving `decision`/`artifact` (see SKILL routing → /spor:next) |
+| issue | `issue-` | a defect and its resolution lineage | status `open`/`active`/`resolved`; queueable; `resolved` (the type's declared completion status) needs a resolving `decision`/`artifact` (see SKILL routing → /spor:next) |
 | incident | `inc-` | something that went wrong in operation | queueable |
 | artifact | `art-`, `spec-` | a document, spec, module, or build product | optional status: delivery stages `in-review`/`approved`/`merged`/`released` (when it is a change), or `done`/`active` (a finished/living doc) — gated on membership, not order |
 | norm | `norm-` | a standing convention or constraint | `always_on: true` — rides along in every project-relevant compile (capped to the topically relevant subset); narrow it to specific repos with `applies_to_tags:`/`applies_to_repos:`/`applies_to_projects:`; `couples_when:`/`couples_also:` file globs make it a coupling norm (edit-time "changed X, don't forget Y" nudge — see below) |
@@ -153,7 +153,7 @@ type: decision                   # required; a type in the registry
 project: meridian                # the repo/project slug (legacy spelling: repo:)
 title: Export defaults to CSV    # required; a one-line human title
 summary: One or two sentences that stand entirely on their own.  # required
-status: active                   # optional; the legal set is enforced by the type's schema, not listed here
+status: active                   # optional; the legal set is enforced by the type's schema (read it with `spor schema <type>`: `statuses:` is the vocabulary, `completion:` the value that closes the work)
 date: 2026-06-09                 # required; the EVENT date (not creation date), YYYY-MM-DD
 edges:
   - {type: derived-from, to: spec-export-schema}

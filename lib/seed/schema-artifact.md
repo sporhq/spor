@@ -2,7 +2,7 @@
 id: schema-artifact
 type: schema
 kind: node-schema
-schema_version: 2026.07.17.1
+schema_version: 2026.08.22.1
 title: Seed schema for artifact nodes
 summary: Node schema for the artifact type — a document, spec, module, or build product worth referencing, optionally carrying a delivery-stage status when it represents a change. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -116,6 +116,18 @@ back), so there is nothing to gate on ORDER. Membership is a property of the
 node in isolation, which is exactly what belongs at the `validate()` door.
 Write-time only, no stored-shape change, backward-readable, no upgrade chain.
 
+`status` (2026.08.22.1, task-spor-registry-declarative-terminal-status-policy):
+the status vocabulary `validate()` enforces is now also DECLARED as registry
+data (`status.vocabulary`). Deliberately NO `status.completion`: the delivery
+stages are not a state machine and `merged`/`released`/`done` are distinct
+landing outcomes, so no single value is THE mechanical close — and the generic
+`resolved` a reader used to fall back to is off this vocabulary entirely
+(issue-spor-gardener-terminal-status-fallback-off-vocab). Enforcement is
+unchanged — `validate()` is still the only status gate this type has;
+`test/seed-declarative-status-policy.test.js` pins the hook and this payload
+together. Backward-readable: declaration only, no stored-shape change, no
+upgrade chain.
+
 ```json
 {
   "node_type": "artifact",
@@ -128,6 +140,14 @@ Write-time only, no stored-shape change, backward-readable, no upgrade chain.
     "non_resolving": [
       "in-review",
       "approved"
+    ],
+    "vocabulary": [
+      "in-review",
+      "approved",
+      "merged",
+      "released",
+      "done",
+      "active"
     ],
     "terminal": [
       "merged",

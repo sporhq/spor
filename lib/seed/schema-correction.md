@@ -2,7 +2,7 @@
 id: schema-correction
 type: schema
 kind: node-schema
-schema_version: 2026.07.15.1
+schema_version: 2026.08.22.1
 title: Seed schema for correction nodes
 summary: Node schema for the correction type — standing fix to a briefing: pin/exclude/guidance; never traversed. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -36,6 +36,15 @@ write-time gate only, no node-shape change, no upgrade chain — a correction
 with no `status:` field resolves to `active` and behaves byte-identically to
 before this change.
 
+`status` (2026.08.22.1, task-spor-registry-declarative-terminal-status-policy):
+the status vocabulary `validate()` enforces is now also DECLARED as registry
+data (`status.vocabulary`). Deliberately NO `status.completion`: `applied` is
+stamped by the recompile that ABSORBS the correction, not by a human closing
+work, so recommending it as a mechanical remedy would assert an absorption that
+never happened. Enforcement is unchanged — the hook is still the write door;
+`test/seed-declarative-status-policy.test.js` pins the two together.
+Backward-readable: declaration only, no stored-shape change, no upgrade chain.
+
 ```json
 {
   "node_type": "correction",
@@ -46,6 +55,10 @@ before this change.
   "traversable": false,
   "capturable": false,
   "status": {
+    "vocabulary": [
+      "active",
+      "applied"
+    ],
     "terminal": [
       "applied"
     ]

@@ -564,6 +564,58 @@ test("seed pack: the terminal-status register reproduces resolution.js's fallbac
   assert.equal(classes.includes("released"), false, "released is artifact-scoped, not type-blind");
 });
 
+test("parseSchemaNode: rejects a malformed completion policy", () => {
+  // task-spor-registry-declarative-terminal-status-policy: the declaration is
+  // only useful to a reader if it cannot be self-contradictory — a completion
+  // outside the vocabulary it belongs to, or a resolver gate with no value to
+  // gate, would advertise a door that does not exist.
+  const parse = (id, payload) => registry.parseSchemaNode({
+    id, kind: "node-schema", schema_version: "2026.08.22.1",
+    body: "```json\n" + JSON.stringify(payload) + "\n```",
+  });
+  assert.ok(parse("schema-v", { node_type: "v", status: { vocabulary: [1, ""] } })
+    .errors.some((e) => /vocabulary must be an array of non-empty strings/.test(e)));
+  assert.ok(parse("schema-c", { node_type: "c", status: { completion: "" } })
+    .errors.some((e) => /completion must be a non-empty string/.test(e)));
+  assert.ok(parse("schema-n", { node_type: "n", status: { completion: "shipped" } })
+    .errors.some((e) => /completion requires a status.vocabulary it belongs to/.test(e)));
+  assert.ok(parse("schema-o", { node_type: "o", status: { vocabulary: ["open", "shut"], completion: "done" } })
+    .errors.some((e) => /completion 'done' is not in status.vocabulary/.test(e)));
+  assert.ok(parse("schema-r", { node_type: "r", status: { completion: "done", resolver_required: "yes" } })
+    .errors.some((e) => /resolver_required must be a boolean/.test(e)));
+  assert.ok(parse("schema-g", { node_type: "g", status: { resolver_required: true } })
+    .errors.some((e) => /resolver_required requires a status.completion to gate/.test(e)));
+  // the well-formed shape parses clean, and case-insensitively
+  const ok = parse("schema-k", {
+    node_type: "k",
+    status: { vocabulary: ["open", "Done"], completion: "done", resolver_required: true },
+  });
+  assert.equal(ok.ok, true, ok.errors.join("; "));
+});
+
+test("seed pack: the completion policy is readable off the registry, per type", () => {
+  // The surface spor-server's gardener derives TERMINAL_STATUS_BY_TYPE and
+  // RESOLVER_REQUIRED_TERMINAL from, replacing three hand-maintained tables
+  // (task-spor-registry-declarative-terminal-status-policy).
+  const reg = graph.seedRegistry();
+  assert.equal(reg.completionStatus("task"), "done");
+  assert.equal(reg.completionStatus("issue"), "resolved");
+  assert.equal(reg.completionStatus("question"), "answered");
+  assert.equal(reg.requiresCompletionResolver("task"), true);
+  assert.equal(reg.requiresCompletionResolver("question"), false);
+  // several distinct outcomes, no single success -> no mechanical close
+  assert.equal(reg.completionStatus("decision"), null);
+  assert.equal(reg.completionStatus("artifact"), null);
+  // the closed vocabularies, and the open-vocabulary types that declare none
+  assert.deepEqual([...reg.statusVocabulary("task")], ["open", "active", "done", "abandoned"]);
+  assert.equal(reg.statusVocabulary("decision").has("resolved"), false,
+    "the generic terminal fallback is off decision's vocabulary — why it has no mechanical remedy");
+  assert.equal(reg.statusVocabulary("norm").size, 0, "norm gates no status vocabulary");
+  assert.equal(reg.statusVocabulary("no-such-type").size, 0, "unknown type -> empty, never a throw");
+  assert.equal(reg.completionStatus("no-such-type"), null);
+  assert.equal(reg.requiresCompletionResolver("no-such-type"), false);
+});
+
 test("parseSchemaNode: rejects a malformed status.inert", () => {
   const bad = registry.parseSchemaNode({
     id: "schema-z", kind: "node-schema", schema_version: "2026.07.16.1",
