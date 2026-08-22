@@ -176,12 +176,72 @@ test("history (local) rejects a bad id and a bad sha client-side", () => {
   assert.match(badSha.stderr, /bad sha 'zzz'/);
 });
 
+// The git >= 2.55 regression guard. collectEntry used to key membership on the
+// `--format` header, which only worked because git suppressed the header along
+// with the empty diff when the pathspec matched nothing; 2.55 prints it, so an
+// untouched commit came back as a real revision (exit 0, change: null). NOTE this
+// test only DISCRIMINATES on git >= 2.55 — on 2.54 and older both the header and
+// the row are absent, so a revert of that predicate stays green locally. The
+// merge-shaped test below is the version-independent half of the guard.
 test("history (local) <sha> that didn't touch the node is reported, exit 1", () => {
   const { dir, shaInternal } = fixtureGraph();
   // the internal commit revised dec-x, not person-bob — so it's not in bob's lineage
   const r = run(["history", "person-bob", shaInternal], { SPOR_HOME: dir });
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, new RegExp(`commit '${shaInternal}' did not change node 'person-bob'`));
+});
+
+// A merge whose conflict resolution differs from BOTH parents is the only shape
+// where git's combined diff reports a two-letter status ("MM"), and `git log --
+// nodes/dec-x.md` DOES list it (not TREESAME to either parent). So the entry arm
+// must accept it and label it M — the pre-fix matcher (/^[AMD]\t/ || /^R\d+\t/)
+// missed "MM" and reported the revision with change: null while the list arm
+// showed it, an arm-to-arm disagreement. Version-independent: this fails on every
+// git if the name-status letter set narrows again.
+function fixtureMergeGraph() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-history-merge-"));
+  const nodes = path.join(dir, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const decX = path.join(nodes, "dec-x.md");
+  const node = (summary, body) => `---\nid: dec-x\ntype: decision\nstatus: open\nsummary: ${summary}\n---\n${body}\n`;
+  const at = (iso) => ({ GIT_AUTHOR_NAME: "Alice", GIT_AUTHOR_EMAIL: "alice@example.com", GIT_COMMITTER_NAME: "Alice", GIT_COMMITTER_EMAIL: "alice@example.com", GIT_AUTHOR_DATE: iso, GIT_COMMITTER_DATE: iso });
+
+  gitc(dir, ["init", "-q", "-b", "main"]);
+  gitc(dir, ["config", "user.name", "Alice"]);
+  gitc(dir, ["config", "user.email", "alice@example.com"]);
+  fs.writeFileSync(decX, node("Base.", "Body base."));
+  gitc(dir, ["add", "-A"]);
+  gitc(dir, ["commit", "-qm", "feat: create dec-x"], at("2026-06-01T10:00:00Z"));
+
+  gitc(dir, ["checkout", "-q", "-b", "side"]);
+  fs.writeFileSync(decX, node("Side.", "Body side."));
+  gitc(dir, ["add", "-A"]);
+  gitc(dir, ["commit", "-qm", "feat: revise dec-x on side"], at("2026-06-02T10:00:00Z"));
+
+  gitc(dir, ["checkout", "-q", "main"]);
+  fs.writeFileSync(decX, node("Main.", "Body main."));
+  gitc(dir, ["add", "-A"]);
+  gitc(dir, ["commit", "-qm", "feat: revise dec-x on main"], at("2026-06-02T11:00:00Z"));
+
+  // conflicts by construction; resolve to a THIRD content so the merge differs
+  // from both parents and git reports it in the combined diff.
+  spawnSync("git", ["-C", dir, "merge", "-q", "side"], { encoding: "utf8" });
+  fs.writeFileSync(decX, node("Merged.", "Body merged."));
+  gitc(dir, ["add", "-A"]);
+  gitc(dir, ["commit", "-qm", "merge: reconcile dec-x"], at("2026-06-03T10:00:00Z"));
+  return { dir, shaMerge: gitc(dir, ["rev-parse", "HEAD"]).trim() };
+}
+
+test("history (local) a conflict-resolving merge is a revision, labelled M, in both arms", () => {
+  const { dir, shaMerge } = fixtureMergeGraph();
+  const entry = run(["history", "dec-x", shaMerge, "--json"], { SPOR_HOME: dir });
+  assert.strictEqual(entry.status, 0, entry.stderr);
+  const j = JSON.parse(entry.stdout);
+  assert.strictEqual(j.sha, shaMerge);
+  assert.strictEqual(j.change, "M"); // "MM" combined row -> M, not null
+  // and the list arm agrees the merge is in dec-x's lineage
+  const list = JSON.parse(run(["history", "dec-x", "--json"], { SPOR_HOME: dir }).stdout);
+  assert.ok(list.history.some((h) => h.sha === shaMerge), "merge listed by the list arm");
 });
 
 test("history (local) an unresolvable but well-formed sha is 'not found', exit 1", () => {
