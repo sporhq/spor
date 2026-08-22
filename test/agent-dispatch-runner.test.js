@@ -116,6 +116,26 @@ process.exit(1);
   assert.match(record.termination_reason, /out of usage credits/);
 });
 
+// issue-spor-dispatch-observed-exit-unbounded-tail-classification: the
+// observed-exit path must classify only the log's TRAILING window, exactly
+// like the derived (supervisor-gone) path — an early, recovered-from rate
+// limit must not overshadow a genuine failure the run went on to hit.
+test("an observed exit does not let an early, recovered-from rate limit overshadow a later genuine failure", async () => {
+  const fixture = jobFixture(`
+const fs = require("node:fs");
+fs.writeSync(2, "API Error: rate_limit_error, retrying\\n");
+for (let i = 0; i < 200; i++) fs.writeSync(1, "resumed after backoff, run " + i + "\\n");
+fs.writeSync(2, "Tests failed: 3 failing, 0 passing\\n");
+process.exit(1);
+`, "p\n");
+  await runJob(fixture.job);
+  const record = readJson(fixture.record);
+  assert.strictEqual(record.state, "failed");
+  assert.strictEqual(record.termination_class, "failed", "the recovered-from rate limit must not be read as this run's cause of death");
+  assert.strictEqual(record.termination_signal, "nonzero-exit");
+  assert.match(record.termination_reason, /exited 1/);
+});
+
 test("runJob drains child stdio, parses the final session event, and flushes the journal before returning", async () => {
   const fixture = jobFixture(`
 const fs = require("node:fs");
