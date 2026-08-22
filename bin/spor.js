@@ -3398,9 +3398,16 @@ const NODE_ID_RE = /^[a-z0-9][a-z0-9-]*$/; // mirrors the server's ID_RE/SLUG_RE
 // unbounded ID_RE/SLUG_RE. The server enforces MAX_ID_LENGTH (200,
 // server/store-validate.ts) at CREATE for every remote write; local mode
 // writes node files directly, bypassing the server entirely, so it needs
-// the same cap on its own CREATE path (cmdPutNode) to keep a personal graph
-// under the invariant remote graphs already hold. Enforced create-only — a
-// node written before this cap existed must keep reading/routing past it.
+// the same cap on its own CREATE path to keep a personal graph under the
+// invariant remote graphs already hold. Enforced create-only — a node
+// written before this cap existed must keep reading/routing past it.
+//
+// Scope, precisely: cmdPutNode is the door this guards. Several other local
+// doors still mint node files with unbounded ids — among them `spor add`/
+// `spor ask` (values.id or a kebab of the title), `spor agent` and `spor
+// person create` (prefix + kebab of the label), and `spor correct` (a kebab
+// of the target id) — so the local invariant is not yet complete; remote
+// mode is, since the server gate sits under all of them.
 const MAX_ID_LENGTH = 200;
 
 // Rewrite a node's raw markdown to carry `value` as its status, mirroring the

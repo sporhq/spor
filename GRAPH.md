@@ -162,10 +162,17 @@ The fix is to let the log **roll over**, not to grow one node forever:
   → `-3`, …) and a title noting it ("part 2 (2026-07 onward)").
   `spor validate` warns once a node's body passes ~90% of the cap, specifically
   so there is still room to make this move before a write is rejected outright
-  — don't wait for the hard failure. (The warning is a graph-wide lint pass,
-  not a per-write gate: `spor add`/`put-node` don't check it at write time, so
-  run `spor validate` periodically on a running-log's home graph rather than
-  relying on the write itself to flag it.)
+  — don't wait for the hard failure. (That early warning belongs to `spor
+  validate` — including the SessionEnd distiller's own lint pass, which logs it
+  to `journal/distill.log` — and it is not a per-write gate: `spor add` doesn't
+  check it at all, and the graph-wide lint `spor put-node` runs *before* the
+  write it gates deliberately does not ask for it — nor does the server
+  gardener's sweep — because on a finished node "approaching the cap" is advice
+  nobody can act on. So run `spor validate` periodically on a running log's
+  home graph rather than relying on the write itself to flag it. A body already
+  OVER the cap is a different matter and warns everywhere: the server
+  re-validates on every write, so an
+  over-cap node is frozen until it is split.)
 - Link the new part back to the one it continues with a `derived-from` edge
   (this node was produced from — i.e. continues — the target), and update the
   earlier part's summary to say it is superseded/continued so a reader

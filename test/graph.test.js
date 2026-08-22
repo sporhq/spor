@@ -1822,7 +1822,30 @@ just a few bytes of body
   assert.ok(!v.warnings.some((w) => /cap/.test(w)));
 });
 
-test("validateGraph: body approaching the 8KB cap is a warning, not an error", () => {
+// The near-cap band is OPT-IN (nearBodyCap): on a finished node "approaching
+// the cap" is advice nobody can act on, and since
+// dec-spor-gardener-runs-graph-wide-lint the gardener files a queue finding per
+// lint warning — so the default-off path is what keeps a large terminal node
+// from parking a permanently unresolvable finding.
+test("validateGraph: body approaching the 8KB cap is a warning under nearBodyCap, not an error", () => {
+  const fx = tmpGraph({
+    "art-log.md": `---
+id: art-log
+type: artifact
+title: Log
+summary: s
+date: 2026-06-01
+---
+${"x".repeat(7500)}
+`,
+  });
+  const v = graph.validateGraph(fx.nodesDir, { nearBodyCap: true });
+  assert.deepEqual(v.errors, []);
+  assert.ok(v.warnings.some((w) => /art-log\.md: body is 7500B, approaching the server's 8192B cap/.test(w)));
+  assert.ok(v.warnings.some((w) => /Accreting running-log artifacts/.test(w)));
+});
+
+test("validateGraph: the approaching-the-cap warning is silent by DEFAULT (the gardener/put-node sweep)", () => {
   const fx = tmpGraph({
     "art-log.md": `---
 id: art-log
@@ -1836,8 +1859,7 @@ ${"x".repeat(7500)}
   });
   const v = graph.validateGraph(fx.nodesDir);
   assert.deepEqual(v.errors, []);
-  assert.ok(v.warnings.some((w) => /art-log\.md: body is 7500B, approaching the server's 8192B cap/.test(w)));
-  assert.ok(v.warnings.some((w) => /Accreting running-log artifacts/.test(w)));
+  assert.ok(!v.warnings.some((w) => /approaching the server's 8192B cap/.test(w)));
 });
 
 test("validateGraph: body over the 8KB cap is a distinct warning", () => {
@@ -1852,9 +1874,13 @@ date: 2026-06-01
 ${"x".repeat(9000)}
 `,
   });
+  // over-cap is unconditional: the server re-validates on every write, so an
+  // over-cap resident node is frozen until it is split — actionable everywhere.
   const v = graph.validateGraph(fx.nodesDir);
   assert.deepEqual(v.errors, []);
   assert.ok(v.warnings.some((w) => /art-over\.md: body is 9000B, over the server's 8192B cap/.test(w)));
+  const optedIn = graph.validateGraph(fx.nodesDir, { nearBodyCap: true });
+  assert.ok(optedIn.warnings.some((w) => /art-over\.md: body is 9000B, over the server's 8192B cap/.test(w)));
 });
 
 // ---------- loadGraph wiring ----------

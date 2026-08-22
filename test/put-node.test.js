@@ -194,6 +194,32 @@ test("put-node (local) keeps updating a pre-existing id already past MAX_ID_LENG
   assert.match(readNode(nodes, id), /Updated title/);
 });
 
+// The graph-wide lint that gates a write must not hand the writer advice about
+// nodes this write never touched. `spor put-node` lints the WHOLE graph, so before
+// the near-cap band became opt-in (nearBodyCap) every large unrelated node in
+// the graph printed an "approaching the cap" line on every single write.
+test("put-node (local) does not report an unrelated node's near-the-body-cap warning", () => {
+  const { home, nodes } = fixtureGraph();
+  fs.writeFileSync(
+    path.join(nodes, "art-log.md"),
+    `---
+id: art-log
+type: artifact
+project: demo
+title: Log
+summary: A running log that sits inside the near-cap warning band.
+date: 2026-06-01
+---
+${"x".repeat(7500)}
+`,
+  );
+  const file = tmpNodeFile(nodeMd("dec-unrelated"));
+  const r = run(["put-node", file], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const all = r.stdout + r.stderr;
+  assert.ok(!/approaching the server's 8192B cap/.test(all), all);
+});
+
 function putNodeStub({ status = 200, result } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
