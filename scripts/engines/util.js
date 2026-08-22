@@ -1066,10 +1066,29 @@ function whichSync(cmd) {
 // capability axis (you cannot launch a profile whose harness binary is absent;
 // `spor dispatch` already degrades on exactly this for `claude`). The harness
 // NAMES are the schema-profile vocabulary, read from HARNESS_BINARIES.
-function probeHarnesses() {
+function probeHarnesses(cfg) {
+  // A harness counts as present when its launcher is reachable AT ALL — the
+  // bare name on PATH, or the explicit `dispatch.bin.<harness>` /
+  // SPOR_<X>_CMD override a box uses when its install prefix never reaches a
+  // non-interactive PATH (task-spor-dispatch-adapters-opencode-copilot).
+  // Without this the probe would report the harness missing and dispatch would
+  // refuse on satisfiability BEFORE the launcher it was told about is ever
+  // tried. Required lazily so the hook hot path doesn't load the adapter
+  // registry it never uses; with no override configured the answer is the same
+  // whichSync() this always returned.
+  //
+  // The cascade is PASSED IN, not read from the module-level active config:
+  // the `spor` CLI resolves a Config per command and never installs it here,
+  // so reading `config()` would silently see null on exactly the CLI paths
+  // that matter (dispatch, capabilities) and drop the config route — leaving
+  // dispatch to refuse on satisfiability for a launcher it had been told
+  // about. Falls back to the active config for the hook engines, which do
+  // install one.
+  const { harnessAvailable } = require(path.join(ROOT, "lib", "shell", "dispatch-harnesses.js"));
+  const resolved = cfg || config();
   const found = [];
-  for (const [name, bin] of Object.entries(HARNESS_BINARIES)) {
-    if (whichSync(bin)) found.push(name);
+  for (const name of Object.keys(HARNESS_BINARIES)) {
+    if (harnessAvailable(name, { cfg: resolved, which: whichSync })) found.push(name);
   }
   return found;
 }
@@ -1173,7 +1192,8 @@ function editCapabilities(graphHomeDir, mutate) {
 // unchanged. Returns the probed map (for `spor capabilities probe`).
 function probeCapabilities(graphHomeDir, opts) {
   const ps = probeClaudePluginsSkills();
-  const probed = { harnesses: probeHarnesses(), plugins: ps.plugins, skills: ps.skills };
+  // `opts.cfg` is the caller's resolved cascade — see probeHarnesses.
+  const probed = { harnesses: probeHarnesses(opts && opts.cfg), plugins: ps.plugins, skills: ps.skills };
   if (opts && opts.sporReachable) probed.reachable_mcp = [SPOR_MCP_NAME];
   editCapabilities(graphHomeDir, (cap) => {
     if (JSON.stringify(cap.probed || null) === JSON.stringify(probed)) return false;

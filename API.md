@@ -723,14 +723,21 @@ anything with a token.
   one place an agent token's session is set, write-once. The session can't be
   forged a-priori (it isn't known until the run exists) and can't ride the write
   payload (token-derived, §1), so the binding is always the actual run. A
-  **Codex**-harness dispatch follows the same late-bind contract from its own
-  supervisor process instead: it reads the session id off the `thread.started`
-  event in the run's supervised JSONL log rather than `claude agents --json`,
-  then binds it the same way. Token transport also differs per harness —
-  Claude Code gets a strict `--mcp-config` file, Codex gets the token via an
-  env var its own config references (`--config
-  mcp_servers.spor.bearer_token_env_var=SPOR_DISPATCH_MCP_TOKEN`) — but both
-  land at the same self-serve mint/bind pair above.
+  **supervised**-harness dispatch (Codex, OpenCode, GitHub Copilot CLI) follows
+  the same late-bind contract from its own supervisor process instead: it reads
+  the session id out of the run's supervised JSONL log rather than
+  `claude agents --json` — Codex off its `thread.started` event, OpenCode off
+  the `sessionID` every event carries, Copilot off the `sessionId` on its
+  terminal `result` event (so a Copilot run binds only at exit, still before its
+  record goes terminal) — then binds it the same way. Token transport also
+  differs per harness: Claude Code gets a strict `--mcp-config` file, Codex gets
+  the token via an env var its own config references (`--config
+  mcp_servers.spor.bearer_token_env_var=SPOR_DISPATCH_MCP_TOKEN`), and OpenCode
+  and Copilot — neither of which can be handed an MCP server on the command line
+  without publishing the bearer to argv — get the agent-scoped token as
+  `SPOR_TOKEN` in the run's environment, so the `spor` CLI inside the run is
+  agent-attributed with no injected MCP. All of them land at the same self-serve
+  mint/bind pair above.
 - **OAuth 2.1 for MCP connectors** (Cowork/claude.ai, which cannot carry a
   static bearer token): protected-resource metadata discovery (RFC 9728,
   advertised on the `/mcp` 401 via `WWW-Authenticate`), authorization-server

@@ -126,7 +126,12 @@ function awaitJson(file) {
 }
 
 test("dispatch harness registry exposes one uniform adapter contract", () => {
-  assert.deepStrictEqual(harnesses().map((adapter) => adapter.id), ["claude-code", "codex"]);
+  // The registry is open by design (dec-spor-dispatch-harness-adapter-contract):
+  // new harnesses are ADDITIVE entries, so this asserts the two this file owns
+  // are present and unchanged rather than that they are the only ones. The
+  // whole-registry shape is asserted in opencode-copilot-dispatch.test.js.
+  const ids = harnesses().map((adapter) => adapter.id);
+  assert.deepStrictEqual(ids.slice(0, 2), ["claude-code", "codex"]);
   for (const adapter of harnesses()) {
     assert.strictEqual(typeof adapter.command, "function", `${adapter.id} resolves a binary`);
     assert.strictEqual(typeof adapter.buildArgs, "function", `${adapter.id} builds argv`);
@@ -134,7 +139,7 @@ test("dispatch harness registry exposes one uniform adapter contract", () => {
     assert.ok(adapter.activeDiscovery && adapter.activeDiscovery.kind, `${adapter.id} declares active-run discovery`);
     assert.ok(["native-background", "supervised-jsonl"].includes(adapter.launchMode));
   }
-  assert.strictEqual(getHarness("opencode"), null, "unsupported harnesses never silently substitute");
+  assert.strictEqual(getHarness("gemini"), null, "unsupported harnesses never silently substitute");
 });
 
 test("Codex profile dry-run uses adapter argv and model precedence", () => {

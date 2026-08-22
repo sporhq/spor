@@ -494,12 +494,17 @@ function renderQueueLocalText(q, hidden = 0) {
 // garbage says NOTHING about liveness, and run reconciliation
 // (inc-spor-dispatch-session-vanished-2026-07-18) must not read that silence as
 // "every run is dead". SPOR_FAKE_AGENTS_JSON is the same test seam as before.
-function enumerateHarnessAgents(adapter) {
+function enumerateHarnessAgents(adapter, cfg = null) {
   const discovery = adapter.activeDiscovery || {};
   if (discovery.kind !== "cli-json") return { ok: false, agents: [] };
   let text = process.env.SPOR_FAKE_AGENTS_JSON;
   if (text == null) {
-    const cmd = adapter.command();
+    // Resolve through the cascade like the dispatch launcher does, so a box
+    // whose launcher lives at `dispatch.bin.<harness>` rather than on PATH is
+    // still enumerable — otherwise the in-flight surface would go permanently
+    // blank on exactly the machines that key exists to serve
+    // (task-spor-dispatch-adapters-opencode-copilot).
+    const cmd = adapter.command(process.env, cfg);
     if (cmd === "claude" && !hasCmd(cmd)) return { ok: false, agents: [] };
     const r = spawnPortableSync(cmd, discovery.args, { encoding: "utf8", timeout: 5000 });
     if (r.status !== 0 || !r.stdout) return { ok: false, agents: [] };
@@ -542,7 +547,7 @@ function dispatchedAgents(cfg) {
         continue;
       }
       if (discovery.kind !== "cli-json") continue;
-      const { ok, agents: arr } = enumerateHarnessAgents(adapter);
+      const { ok, agents: arr } = enumerateHarnessAgents(adapter, cfg);
       if (!ok) continue;
       for (const a of arr) {
         if (!a || a.kind !== "background" || typeof a.name !== "string") continue;
@@ -6960,7 +6965,7 @@ async function resolveDispatchProfile(cfg, { profileFlag, nodeRaw, identityAgent
   const rawCap = cfg.get("dispatch.capabilities", {}) || {};
   let probed = null;
   try {
-    probed = u.probeCapabilities(cfg.userConfigHome(), { sporReachable: cfg.mode() === "remote" });
+    probed = u.probeCapabilities(cfg.userConfigHome(), { sporReachable: cfg.mode() === "remote", cfg });
   } catch {
     /* probe is best-effort; match against what the cascade already holds */
   }
@@ -7568,13 +7573,25 @@ function writePrivate(file, text) {
   }
 }
 
+// One argv entry as `--print` should show it: the launcher-supplied
+// placeholders read as what they stand for, everything else shell-quoted.
+function renderLaunchArg(arg) {
+  if (arg === dispatchHarnesses.REPORT_PLACEHOLDER) return "<report-path>";
+  if (arg === dispatchHarnesses.CWD_PLACEHOLDER) return "<dir>";
+  return shellQuote(arg);
+}
+
 async function launchSupervisedHarness(cfg, {
   adapter, command, args, cwd, name, nodeId, prompt, server, childToken, mcpToken, bindToken,
   renewToken, renewNode,
 }) {
   const runId = crypto.randomUUID();
   const p = dispatchRuns.runPaths(cfg.userConfigHome(), runId);
-  const runArgs = args.map((a) => a === "__SPOR_REPORT_PATH__" ? p.report : a);
+  const runArgs = args.map((a) => {
+    if (a === dispatchHarnesses.REPORT_PLACEHOLDER) return p.report;
+    if (a === dispatchHarnesses.CWD_PLACEHOLDER) return cwd;
+    return a;
+  });
   const now = new Date().toISOString();
   const record = {
     run_id: runId,
@@ -7695,7 +7712,7 @@ function cmdRuns(cfg, { values, positionals: pos }) {
   const agents = [];
   for (const adapter of dispatchHarnesses.harnesses()) {
     if ((adapter.activeDiscovery || {}).kind !== "cli-json") continue;
-    const e = enumerateHarnessAgents(adapter);
+    const e = enumerateHarnessAgents(adapter, cfg);
     if (!e.ok) continue;
     enumerated = true;
     // A finished agent the harness still lists is NOT live — reconciling it is
@@ -8089,7 +8106,11 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   const harness = profileRuntime.harness || "claude-code";
   const harnessAdapter = dispatchHarnesses.getHarness(harness);
   const effectiveModel = model || profileRuntime.model || null;
-  const harnessBin = harnessAdapter ? harnessAdapter.command() : null;
+  // Explicit-first launcher resolution (task-spor-dispatch-adapters-opencode-
+  // copilot): the adapter consults its env override and `dispatch.bin.<harness>`
+  // through the cascade before falling back to the bare name. With neither set
+  // this is the same string it always returned.
+  const harnessBin = harnessAdapter ? harnessAdapter.command(process.env, cfg) : null;
   // Validate BEFORE building any argv (preview or real) — a translated option
   // (today: Codex + --permission-mode bypassPermissions) changes what argv
   // buildArgs should see, so effectiveSandbox/effectiveApprovalPolicy below
@@ -8115,7 +8136,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     agent,
     sandbox: effectiveSandbox,
     approvalPolicy: effectiveApprovalPolicy,
-    reportPath: "__SPOR_REPORT_PATH__",
+    reportPath: dispatchHarnesses.REPORT_PLACEHOLDER,
     sporMcp: null,
   }) : [];
   const supportedHarness = !!harnessAdapter;
@@ -8150,11 +8171,11 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     // session line, which is additive and always present now.
     if (identityAgent) {
       const src = asAgent ? " (via --as)" : "";
-      out(
-        harnessAdapter && harnessAdapter.identityMode === "env-mcp"
-          ? `agent:  ${identityAgent}${src} (would mint a session-deferred agent token, inject it through env-backed Spor MCP config, then bind the Codex thread after launch)`
-          : `agent:  ${identityAgent}${src} (would mint a session-deferred agent-scoped token + write a 0600 --mcp-config, add --strict-mcp-config, then bind the run session after launch)`
-      );
+      // The note is DECLARED by the adapter rather than branched on here, so a
+      // new harness describes its own identity mechanism instead of falling
+      // through to whichever branch it least resembles.
+      const claudeNote = dispatchHarnesses.getHarness("claude-code").identityNote;
+      out(`agent:  ${identityAgent}${src} ${(harnessAdapter && harnessAdapter.identityNote) || claudeNote}`);
     } else if (cfg.mode() === "remote") {
       out(`agent:  (none configured — 'spor agent use agent-<machine>' or --as to attribute as agent-on-behalf-of; dispatching person-scoped)`);
     }
@@ -8205,7 +8226,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     if (template != null) out(`template: ${path.resolve(templateOpt)}`);
     if (!supportedHarness) out(`run:    (unsupported harness '${harness}')`);
     else if (harnessAdapter.launchMode === "supervised-jsonl") {
-      out(`run:    ${harnessBin} ${previewArgs.map((a) => a === "__SPOR_REPORT_PATH__" ? "<report-path>" : shellQuote(a)).join(" ")}  # prompt on stdin`);
+      out(`run:    ${harnessBin} ${previewArgs.map(renderLaunchArg).join(" ")}  # prompt on stdin`);
     } else out(`run:    ${harnessBin} ${previewArgs.map(shellQuote).join(" ")} <prompt>`);
     out(`\n--- prompt ---\n${prompt}`);
     return 0;
@@ -8268,9 +8289,16 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   u.registerRepo(cfg.userConfigHome(), res.slug, res.dir);
   if (backfill) out(`registered ${res.slug} → ${res.dir}; launching the backfill agent…`);
 
-  const defaultHarnessBin = harnessAdapter.command({});
-  if (harnessBin === defaultHarnessBin && !hasCmd(defaultHarnessBin)) {
-    err(`${harnessAdapter.missingBinary}, then re-run (or 'spor dispatch … --print' to see the prompt).`);
+  // Preflight only the PATH route — a launcher naming no directory, whether it
+  // is the adapter default or an explicitly configured bare name. A launcher
+  // given as a PATH is left to the launch, whose own `could not launch <path>:
+  // ENOENT` already names the exact path that was tried, and which releases the
+  // claim this dispatch established; refusing it earlier would skip that.
+  const binary = dispatchHarnesses.describeHarnessBin(harnessAdapter, { env: process.env, cfg });
+  if (binary.onPath && !hasCmd(binary.command)) {
+    err(binary.explicit
+      ? `${binary.command} not found on PATH (${binary.source} names it) — install it, or give ${binary.source} an absolute path.`
+      : `${harnessAdapter.missingBinary}, then re-run (or 'spor dispatch … --print' to see the prompt).`);
     return 1;
   }
 
@@ -8401,7 +8429,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
       model: effectiveModel,
       sandbox: effectiveSandbox,
       approvalPolicy: effectiveApprovalPolicy,
-      reportPath: "__SPOR_REPORT_PATH__",
+      reportPath: dispatchHarnesses.REPORT_PLACEHOLDER,
       sporMcp: wantsSporMcp && mcpToken ? { url: `${remote.base(cfg)}/mcp` } : null,
     });
     const launched = await launchSupervisedHarness(cfg, {
@@ -8967,7 +8995,7 @@ function cmdCapabilities(cfg, args) {
     // Seed reachable_mcp:[spor] from CONFIGURED-ness when a Spor server/connector
     // is bound (remote mode) — the spor MCP is reachable by construction, no
     // network ping (task-spor-mcp-reachability-deterministic-seed).
-    const probed = u.probeCapabilities(home, { sporReachable: !!cfg.server() });
+    const probed = u.probeCapabilities(home, { sporReachable: !!cfg.server(), cfg });
     out(`probed harnesses: ${probed.harnesses.join(", ") || "(none on PATH)"}`);
     out(`probed plugins:   ${probed.plugins.join(", ") || "(none)"}`);
     const sk = probed.skills.filter((s) => !s.includes(":")); // bare names, compact
@@ -9093,7 +9121,7 @@ async function cmdCapabilitiesPublish(cfg, { json }) {
   const rawCap = cfg.get("dispatch.capabilities", {}) || {};
   let probed = null;
   try {
-    probed = u.probeCapabilities(cfg.userConfigHome(), { sporReachable: true });
+    probed = u.probeCapabilities(cfg.userConfigHome(), { sporReachable: true, cfg });
   } catch {
     /* probe is best-effort; publish what the cascade already holds */
   }
