@@ -33,19 +33,21 @@
 # again reports correctly: `gs=resolved` short-circuits to FINISHED
 # regardless of the (still-empty) session lookup.
 set -u
-out=$(claude agents --json 2>/dev/null)
+source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
+
+out=$(fleet_agents_array "$(claude agents --json 2>/dev/null)")
 if [ $# -ge 1 ]; then NODES=("$@"); else
-  mapfile -t NODES < <(printf '%s' "$out" | jq -r '(.agents? // .) | .[]? | (.name // empty) | strings | select(test("^(task|issue|inc|question)-"))')
+  mapfile -t NODES < <(printf '%s' "$out" | jq -r '.[]? | (.name // empty) | strings | select(test("^(task|issue|inc|question)-"))')
 fi
 printf '%-70s %-10s %-10s %s\n' NODE SESSION GRAPH VERDICT
 for n in "${NODES[@]}"; do
-  st=$(printf '%s' "$out" | jq -r --arg n "$n" '(.agents? // .) | .[]? | select(.name==$n) | .status' 2>/dev/null | head -1)
+  st=$(fleet_agent_status "$out" "$n")
   gs=$(spor get "$n" --json 2>/dev/null | jq -r '.frontmatter.status // "open"')
   case "$gs" in
     resolved|done|answered)
       case "$st" in ""|idle) v=FINISHED ;; *) v="FINISHED (session still $st — reap with: claude stop)";; esac ;;
     *)
-      case "$st" in working|busy|starting) v=RUNNING ;; *) v="RECOVER (session ${st:-gone}, node $gs)";; esac ;;
+      if fleet_status_active "$st"; then v=RUNNING; else v="RECOVER (session ${st:-gone}, node $gs)"; fi ;;
   esac
   printf '%-70s %-10s %-10s %s\n' "$n" "${st:-—}" "$gs" "$v"
 done

@@ -16,12 +16,15 @@
 # Run it via the Bash tool with run_in_background: true; its exit re-invokes
 # the orchestrator. Poll cadence 90s, ~45min ceiling.
 #
-# Paid-for gotchas encoded here:
+# Paid-for gotchas, centralized in lib.sh so fleet-status.sh and
+# link-live-skill.sh share the same fix instead of drifting:
 # - `claude agents --json` emits a BARE ARRAY (defend against a future
-#   {agents:[...]} wrapper with `.agents? // .`). A wrong shape here fails
-#   SILENT — the 2026-07-16 watcher looped to timeout while 4 agents sat idle.
+#   {agents:[...]} wrapper with `.agents? // .`, see fleet_agents_array). A
+#   wrong shape here fails SILENT — the 2026-07-16 watcher looped to timeout
+#   while 4 agents sat idle.
 # - Watch `status`, never `state` alone — `state` sticks at "working" after
-#   the agent finishes (inc-spor-orchestration-watcher-stuck-state).
+#   the agent finishes (inc-spor-orchestration-watcher-stuck-state; see
+#   fleet_status_active).
 # - An agent can vanish from the list entirely when it exits; treat a node
 #   that WAS seen and is now absent as done.
 # - AGENT_DONE status=idle with the node UNRESOLVED is ambiguous: the agent
@@ -48,6 +51,8 @@
 # it and reading its final report instead (see SKILL.md "The Codex
 # implementer").
 set -u
+source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
+
 [ $# -ge 1 ] || { echo "usage: watch-fleet.sh <node-id> [...]" >&2; exit 1; }
 NODES=("$@")
 INTERVAL="${WATCH_INTERVAL:-90}"
@@ -57,12 +62,12 @@ declare -A seen
 declare -A tpath
 for i in $(seq 1 "$ROUNDS"); do
   sleep "$INTERVAL"
-  out=$(claude agents --json 2>/dev/null)
+  out=$(fleet_agents_array "$(claude agents --json 2>/dev/null)")
   for n in "${NODES[@]}"; do
-    st=$(printf '%s' "$out" | jq -r --arg n "$n" '(.agents? // .) | .[]? | select(.name==$n) | .status' 2>/dev/null | head -1)
+    st=$(fleet_agent_status "$out" "$n")
     if [ -n "$st" ]; then
       seen[$n]=1
-      case "$st" in working|busy|starting) ;; *) echo "AGENT_DONE $n status=$st"; exit 0 ;; esac
+      fleet_status_active "$st" || { echo "AGENT_DONE $n status=$st"; exit 0; }
     elif [ "${seen[$n]:-}" = "1" ]; then
       echo "AGENT_DONE $n status=gone"; exit 0
     fi
@@ -73,10 +78,10 @@ for i in $(seq 1 "$ROUNDS"); do
   # notification appends a JSONL line, so a live agent touches it constantly.
   if [ "$STALL" -gt 0 ]; then
     for n in "${NODES[@]}"; do
-      row=$(printf '%s' "$out" | jq -r --arg n "$n" '(.agents? // .) | .[]? | select(.name==$n) | "\(.status) \(.sessionId // .id)"' 2>/dev/null | head -1)
+      row=$(printf '%s' "$out" | jq -r --arg n "$n" '.[]? | select(.name==$n) | "\(.status) \(.sessionId // .id)"' 2>/dev/null | head -1)
       [ -n "$row" ] || continue
       st=${row%% *}; sid=${row#* }
-      case "$st" in working|busy|starting) ;; *) continue ;; esac
+      fleet_status_active "$st" || continue
       if [ -z "${tpath[$n]:-}" ]; then
         tpath[$n]=$(find "$HOME/.claude/projects" -maxdepth 2 -name "$sid.jsonl" 2>/dev/null | head -1)
       fi
@@ -99,12 +104,12 @@ for i in $(seq 1 "$ROUNDS"); do
   for n in "${NODES[@]}"; do
     [ "${seen[$n]:-}" = "1" ] || continue
     printf '%s\n' "$inflight" | grep -qxF -- "$n" && continue
-    cur=$(printf '%s' "$out" | jq -r --arg n "$n" '(.agents? // .) | .[]? | select(.name==$n) | .status' 2>/dev/null | head -1)
-    case "$cur" in working|busy|starting) continue ;; esac   # still committing — wait
+    cur=$(fleet_agent_status "$out" "$n")
+    fleet_status_active "$cur" && continue   # still committing — wait
     st=$(spor get "$n" --json 2>/dev/null | jq -r '.frontmatter.status // empty')
     case "$st" in resolved|done|answered) echo "NODE_RESOLVED $n status=$st"; exit 0 ;; esac
   done
 done
 echo "TIMEOUT after $((INTERVAL * ROUNDS / 60))min — current fleet:"
-claude agents --json 2>/dev/null | jq -r '(.agents? // .) | .[]? | "\(.name)  status=\(.status // "?")"'
+fleet_agents_array "$(claude agents --json 2>/dev/null)" | jq -r '.[]? | "\(.name)  status=\(.status // "?")"'
 exit 2

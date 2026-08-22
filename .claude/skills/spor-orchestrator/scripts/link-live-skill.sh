@@ -32,6 +32,7 @@
 # same name collides with the one we just linked.
 # HEADER_END (--help prints down to here)
 set -u
+source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
 SRC=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 DEST="${SPOR_ORCHESTRATOR_LIVE:-$HOME/.claude/skills/spor-orchestrator}"
@@ -114,14 +115,14 @@ fi
 # Exclude THIS session by sessionId: a dispatched agent running this script is
 # itself a busy background agent, and self-blocking would push the operator
 # toward a force flag for no reason.
-agents_json=$(claude agents --json 2>/dev/null)
+agents_json=$(fleet_agents_array "$(claude agents --json 2>/dev/null)")
 # `$me == ""` disables the exclusion entirely: with no session id to match, the
 # `// ""` fallback would otherwise equate every entry MISSING a sessionId with
 # "self" and drop a real fleet on the floor.
-active=$(printf '%s' "$agents_json" | jq -r --arg me "${CLAUDE_CODE_SESSION_ID:-}" '
-  (.agents? // .) | .[]? | select(.kind == "background")
+active=$(printf '%s' "$agents_json" | jq -r --arg me "${CLAUDE_CODE_SESSION_ID:-}" --arg re "$SPOR_FLEET_ACTIVE_STATUS_RE" '
+  .[]? | select(.kind == "background")
   | select($me == "" or (.sessionId // "") != $me)
-  | select((.status // "") | test("^(working|busy|starting)$")) | .name // .id' 2>/dev/null)
+  | select((.status // "") | test($re)) | .name // .id' 2>/dev/null)
 jq_rc=$?
 if [ -n "$active" ]; then
   echo "FLEET UP — background agents still running:"
