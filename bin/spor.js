@@ -7734,6 +7734,7 @@ function cmdRuns(cfg, { values, positionals: pos }) {
     if (r.session_id) out(`  session:    ${r.session_id}`);
     if (r.transcript_path) out(`  transcript: ${r.transcript_path}`);
     if (r.log_path) out(`  log:        ${r.log_path}`);
+    if (r.report_path) out(`  report:     ${r.report_path}`);
   }
   return 0;
 }

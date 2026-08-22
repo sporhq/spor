@@ -923,6 +923,14 @@ test("spor runs (text): a reaped orphaned child is legible without --json", asyn
   }
 });
 
+test("spor runs (text): report_path is legible without --json", () => {
+  const home = scratch("spor-runs-store-");
+  const rec = supervisedRecord(home, "sup-report-text", { runner_pid: deadPid(), child_pid: deadPid() });
+  const r = cli(["runs"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, new RegExp(`  report:     ${rec.report_path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+});
+
 test("spor runs --json: 'reconciled' is false only when a NATIVE run was actually left unresolved", () => {
   // A Codex-only box has no `claude` to enumerate, and supervised runs never
   // needed that listing — reporting reconciled:false there would tell a caller
