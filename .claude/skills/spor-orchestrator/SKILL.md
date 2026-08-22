@@ -143,7 +143,12 @@ low-blast-radius dev VM, not a general workstation:
    exact fork "Local-dev posture" above exists to prevent, and the whole point
    of catching it here: you may be running from a stale skill right now. Stop
    and reconcile before dispatching anything. `FLEET UP` alone (no `DIVERGED`)
-   just means another run is still live — not drift; note it and continue.
+   still exits non-zero (`BLOCKED on active fleet` — the same guard also
+   protects `--apply`, so a plain dry run doesn't get a pass) but is not
+   drift: it just means another run's watcher scripts are still live. Read
+   the printed line rather than trusting the exit code here, and continue —
+   don't chase it with `--force-fleet`, which is for actually applying the
+   link, not for this read-only check.
 2. `spor status` — confirm **remote mode**, your identity, and the project.
    Remote mode is what gives you the auto-claim lease and the team-wide
    dup-guard. In local mode there is no lease; fall back to strict
