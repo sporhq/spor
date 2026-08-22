@@ -970,6 +970,49 @@ test("a bogus ambient GIT_INDEX_FILE does not misdirect classification — the r
   assert.equal(read(dir, "a.js"), "one\ntwo\n"); // healed against the real index, not the decoy's conflict
 });
 
+test("a bogus ambient GIT_OBJECT_DIRECTORY does not misdirect object reads — the real objects stay authoritative", () => {
+  // The follow-up to the two tests above (issue-spor-heal-stale-root-wider-git-
+  // env-scrub): `git rev-parse --local-env-vars` lists a wider class of
+  // repo-local vars beyond GIT_INDEX_FILE that can equally misdirect this
+  // tool's reads. GIT_OBJECT_DIRECTORY is the one called out by name in that
+  // issue — point it at an empty decoy object store: if any spawn here
+  // inherited it, every blob/tree/commit lookup the classifier depends on
+  // would fail to resolve against `dir`'s own `.git/objects` instead of
+  // quietly succeeding.
+  const dir = initRepo();
+  write(dir, "a.js", "one\n");
+  commit(dir, "init");
+  casAdvance(dir, () => write(dir, "a.js", "one\ntwo\n"));
+
+  const decoyObjects = fs.mkdtempSync(path.join(os.tmpdir(), "spor-heal-decoyobj-"));
+
+  const r = runWithEnv(dir, { GIT_OBJECT_DIRECTORY: decoyObjects }, "--json", "--apply");
+  const json = JSON.parse(r.stdout);
+  assert.equal(r.status, 0);
+  assert.equal(json.verdict, "HEALED");
+  assert.equal(read(dir, "a.js"), "one\ntwo\n"); // healed against the real objects, not the empty decoy
+});
+
+test("GIT_LOCAL_ENV_VARS covers every var the live git reports via --local-env-vars", () => {
+  // Pins the sanitizer's list against reality: if a future git adds a new
+  // repo-local env var, this fails loudly instead of the new var silently
+  // riding through unscrubbed (the exact gap this issue closes for the vars
+  // git already had).
+  const { GIT_LOCAL_ENV_VARS } = require(GUARD);
+  const dir = initRepo();
+  const live = execFileSync("git", ["-C", dir, "rev-parse", "--local-env-vars"], { encoding: "utf8" })
+    .trim()
+    .split("\n")
+    .filter(Boolean);
+  assert.ok(live.length > 0, "sanity: git reported no local env vars at all");
+  for (const v of live) {
+    assert.ok(
+      GIT_LOCAL_ENV_VARS.includes(v),
+      `git now reports ${v} via --local-env-vars; add it to GIT_LOCAL_ENV_VARS in scripts/heal-stale-root.js`
+    );
+  }
+});
+
 // ---------- invocation ----------
 
 test("a merge in progress refuses with exit 2", () => {

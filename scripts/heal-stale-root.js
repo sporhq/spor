@@ -193,20 +193,47 @@ function parseArgs(argv) {
 // leaked var from the caller's environment can't misdirect the heal at the
 // wrong repo (issue-spor-gittime-git-env-inheritance).
 //
-// gitSpawn deliberately LEAVES GIT_INDEX_FILE alone — `spor check --staged`
-// needs it to read a pre-commit hook's partial-commit index. This tool has no
-// such use case: every status/checkout call below must read and write the
-// real `.git/index`, so an inherited GIT_INDEX_FILE would silently classify
-// paths against, and check out into, an unrelated index file — the same
-// vulnerability class as an inherited GIT_DIR, just past gitSpawn's scrub.
-// Strip it here, one level up.
-function envWithoutIndexFile(env = process.env) {
+// gitSpawn deliberately scrubs only GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR —
+// GIT_INDEX_FILE is LEFT ALONE because `spor check --staged` needs it to read
+// a pre-commit hook's partial-commit index. This tool has no such use case,
+// and neither does it have a use case for any of the OTHER repo-local vars
+// `git rev-parse --local-env-vars` enumerates (GIT_OBJECT_DIRECTORY,
+// GIT_ALTERNATE_OBJECT_DIRECTORIES, GIT_GRAFT_FILE, GIT_SHALLOW_FILE, …): every
+// status/ls-tree/cat-file/checkout call below must read and write the real
+// `.git` — an inherited var from any of them would silently misdirect object
+// lookups, grafts, or shallow-history reads exactly as an inherited GIT_DIR
+// misdirects the whole repo, just past gitSpawn's deliberately narrow scrub.
+// Strip the full class here, one level up. GIT_LOCAL_ENV_VARS is pinned (not
+// probed live) so a hostile/misconfigured `git` on PATH can't shrink the list
+// out from under this tool; test/heal-stale-root.test.js re-derives the live
+// set via `git rev-parse --local-env-vars` and asserts it is a subset of this
+// pin, so a future git adding a new one fails that test loudly instead of
+// silently leaking through.
+const GIT_LOCAL_ENV_VARS = [
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_CONFIG',
+  'GIT_CONFIG_COUNT',
+  'GIT_CONFIG_PARAMETERS',
+  'GIT_COMMON_DIR',
+  'GIT_DIR',
+  'GIT_GRAFT_FILE',
+  'GIT_IMPLICIT_WORK_TREE',
+  'GIT_INDEX_FILE',
+  'GIT_NO_REPLACE_OBJECTS',
+  'GIT_OBJECT_DIRECTORY',
+  'GIT_PREFIX',
+  'GIT_REPLACE_REF_BASE',
+  'GIT_SHALLOW_FILE',
+  'GIT_WORK_TREE',
+];
+
+function envWithoutRepoLocalVars(env = process.env) {
   const out = { ...env };
-  const isIndexFileVar =
+  const isRepoLocalVar =
     process.platform === 'win32'
-      ? (k) => k.toUpperCase() === 'GIT_INDEX_FILE'
-      : (k) => k === 'GIT_INDEX_FILE';
-  for (const k of Object.keys(out)) if (isIndexFileVar(k)) delete out[k];
+      ? (k) => GIT_LOCAL_ENV_VARS.includes(k.toUpperCase())
+      : (k) => GIT_LOCAL_ENV_VARS.includes(k);
+  for (const k of Object.keys(out)) if (isRepoLocalVar(k)) delete out[k];
   return out;
 }
 
@@ -262,7 +289,7 @@ function gitRun(repo, args, input, encoding) {
   const r = gitSpawn(repo, args, {
     encoding,
     maxBuffer: 64 * 1024 * 1024,
-    env: envWithoutIndexFile(),
+    env: envWithoutRepoLocalVars(),
     ...(input === undefined ? {} : { input }),
   });
   if (r.error) {
@@ -981,4 +1008,11 @@ function report(opts, r, code) {
   process.exit(code);
 }
 
-main();
+if (require.main === module) main();
+
+// Exported for test/heal-stale-root.test.js only (this file is always invoked
+// as `node scripts/heal-stale-root.js …`, per its own header — never required
+// elsewhere, so the guard above never changes CLI behavior): lets the suite
+// pin GIT_LOCAL_ENV_VARS against a live `git rev-parse --local-env-vars`
+// without spawning a whole decoy repo per var.
+module.exports = { GIT_LOCAL_ENV_VARS, envWithoutRepoLocalVars };
