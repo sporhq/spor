@@ -24,6 +24,7 @@ const path = require("path");
 
 const graph = require(path.join(__dirname, "..", "lib", "graph.js"));
 const { sandboxFor } = require(path.join(__dirname, "..", "lib", "sandbox.js"));
+const { Registry } = require(path.join(__dirname, "..", "lib", "kernel", "registry.js"));
 
 const PROMPT_PATH = path.join(__dirname, "..", "prompts", "client", "distill-local.md");
 const SLACK = { timeoutMs: 5000 };
@@ -67,6 +68,31 @@ test("distill-local.md status offer: every (type, status) pair passes that type'
     assert.deepEqual(
       errors, [],
       `distill-local.md offers '${type}: ${status}' but schema-${type}'s validate() rejects it: ${errors.join("; ")}`
+    );
+  }
+});
+
+// The prompt's own prose rule (line 21: "never a completion status ... those
+// are gated on a resolver already being on the graph") is enforced only by a
+// human reading it. This pins that rule against the declarative registry
+// surface (task-spor-registry-declarative-terminal-status-policy) instead: a
+// type's status.completion is the one success value gated on a resolver, so
+// an offered status equal to it would distill a node that is born already
+// "done" and lose it at the completion-resolver write door.
+test("distill-local.md status offer: no offered status is that type's declared status.completion", () => {
+  const promptText = fs.readFileSync(PROMPT_PATH, "utf8");
+  const pairs = parseStatusOffer(promptText);
+
+  const reg = new Registry();
+  for (const s of graph.loadSeedSchemas()) reg.add(s, "seed");
+
+  for (const { type, status } of pairs) {
+    const completion = reg.completionStatus(type);
+    if (completion == null) continue; // this type has no single mechanical completion status
+    assert.notEqual(
+      status.toLowerCase(), completion,
+      `distill-local.md offers '${type}: ${status}', but '${completion}' is ${type}'s declared status.completion — ` +
+      `distilling it violates the prose rule directly above the status-offer line`
     );
   }
 });
