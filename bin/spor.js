@@ -2722,13 +2722,24 @@ async function cmdAdd(cfg, { values, positionals }) {
   // two genuinely distinct captures that happen to share prose, which is worse than
   // the duplication it prevents. The caller that needs this — a cron monitor filing
   // a once-per-onset alert — already knows its stable marker and passes it.
-  const dedupeKey = values["dedupe-key"] || null;
-  if (dedupeKey && !DEDUPE_KEY_RE.test(dedupeKey)) {
-    err(`invalid --dedupe-key "${dedupeKey}" — a dedupe key must start with a letter or digit and use only letters, digits, '.', '_' and '-' (max 200 chars).`);
-    return 1;
-  }
+  // Keyed on PRESENCE, not truthiness: `--dedupe-key ""` (an unset shell variable
+  // in the caller's command line) must reach the validation below and be rejected,
+  // not fall back to the random UUID — a silent fallback is precisely the "caller
+  // believes it is deduped and isn't" failure this flag exists to remove.
+  const dedupeKeyGiven = values["dedupe-key"] !== undefined;
+  const dedupeKey = dedupeKeyGiven ? String(values["dedupe-key"]) : null;
 
   if (cfg.mode() === "remote") {
+    // Validate only where the key does something. The server treats a key outside
+    // its grammar as NO key and runs the capture unguarded, so a bad key here is a
+    // hard error rather than a silent downgrade — but local mode ignores the flag
+    // entirely (see below), and failing a local capture over an inert flag would
+    // lose the text itself. Same placement rule as --during/--blocks, whose id
+    // validation also lives in the branch that acts on them.
+    if (dedupeKeyGiven && !DEDUPE_KEY_RE.test(dedupeKey)) {
+      err(`invalid --dedupe-key "${dedupeKey}" — a dedupe key must start with a letter or digit and use only letters, digits, '.', '_' and '-' (max 200 chars).`);
+      return 1;
+    }
     // Mark whether `project` came from a user-declared --project or the ambient
     // cwd default, so the server can gate its fold-mismatch warning on an actual
     // declaration instead of false-firing on ordinary cross-repo folds
@@ -2812,8 +2823,11 @@ async function cmdAdd(cfg, { values, positionals }) {
   // while the client reports failure — the race the key exists for is a REMOTE
   // transport race. Say so on stderr rather than accepting the flag silently: a
   // caller that believes it is deduped and isn't is exactly the failure this
-  // feature was added to remove. The capture itself still proceeds.
-  if (dedupeKey) {
+  // feature was added to remove. The capture itself still proceeds — including
+  // for a key the remote branch would have rejected: the value is never read
+  // here, so refusing to write the node would lose the capture over a flag that
+  // does nothing.
+  if (dedupeKeyGiven) {
     err("note: --dedupe-key is a remote-mode guard (it rides the capture idempotency key); local mode writes the node synchronously, so there is no retry race to dedupe — the flag is ignored.");
   }
   const graphLib = require(path.join(ROOT, "lib", "graph.js"));

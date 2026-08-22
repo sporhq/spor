@@ -358,6 +358,19 @@ test("add --dedupe-key: a server replay is reported as a replay, not a fresh cap
   }
 });
 
+test("add --dedupe-key rejects an EMPTY key rather than falling back to the uuid", async () => {
+  const { home } = freshHome();
+  const base = await deadBase();
+  // `--dedupe-key "$KEY"` with $KEY unset is the realistic way a caller loses its
+  // guard. Falling back to the per-invocation uuid here would look like success
+  // while every tick filed a fresh node — the duplication the flag exists to stop.
+  const r = await runAsync(["add", "an alert whose dedupe key expanded to nothing", "--dedupe-key", ""],
+    { SPOR_SERVER: base, SPOR_TOKEN: "tok", SPOR_HOME: home });
+  assert.strictEqual(r.status, 1, "an empty key is a hard error, not a silent downgrade");
+  assert.match(r.stderr, /invalid --dedupe-key/);
+  assert.strictEqual(listSpool(path.join(home, "outbox")).length, 0);
+});
+
 test("add --dedupe-key (local mode) says the flag is inert and still writes the node", () => {
   const { home } = freshHome();
   fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
@@ -368,4 +381,18 @@ test("add --dedupe-key (local mode) says the flag is inert and still writes the 
     "silently accepting it would leave the caller believing in a guard that isn't there");
   assert.ok(fs.readdirSync(path.join(home, "nodes")).some((f) => f.endsWith(".md")),
     "the capture itself still happened");
+});
+
+test("add --dedupe-key (local mode) does not fail the capture over a key it never reads", () => {
+  const { home } = freshHome();
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  // Local mode ignores the flag, so validating it here would drop the alert TEXT
+  // over a flag that does nothing — e.g. the same cron script running on a box
+  // where no server is configured, passing a colon-bearing key.
+  const r = run(["add", "an alert filed on a box with no server configured", "--dedupe-key", "cron.stall.2026-08-22T06:34:14Z"],
+    { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stderr, /--dedupe-key is a remote-mode guard/);
+  assert.ok(fs.readdirSync(path.join(home, "nodes")).some((f) => f.endsWith(".md")),
+    "the capture landed despite a key the remote branch would reject");
 });
