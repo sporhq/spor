@@ -484,7 +484,7 @@ test('status (remote) does NOT warn of split-brain even with a Spor connector', 
 
 // --- --quiet skips the remote health probe + identity lookup
 // (issue-spor-status-health-probe-latency): a caller that only wants a
-// locally-resolved field (e.g. the brief skill reading back `project:`)
+// locally-resolved field (e.g. the brief skill reading back `repo:`)
 // shouldn't pay for the up-to-6s health round-trip.
 test('status (remote) without --quiet includes health/identity lines', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-remote-status-full-'));
@@ -508,7 +508,7 @@ test('status (remote) --quiet skips health probe and identity lookup', () => {
   });
   assert.strictEqual(r.status, 0);
   assert.match(r.stdout, /mode:\s+remote/);
-  assert.match(r.stdout, /^project:/m);
+  assert.match(r.stdout, /^repo:/m);
   assert.match(r.stdout, /^token:\s+present/m);
   assert.doesNotMatch(r.stdout, /^health:/m);
   assert.doesNotMatch(r.stdout, /^identity:/m);

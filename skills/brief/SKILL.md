@@ -28,7 +28,7 @@ Steps:
    probe / identity lookup (up to several seconds of network round-trip) just
    to read a locally-resolved field:
    ```bash
-   SLUG="$(spor status --quiet 2>/dev/null | sed -n 's/^project:[[:space:]]*//p')"
+   SLUG="$(spor status --quiet 2>/dev/null | sed -n 's/^repo:[[:space:]]*//p')"
    ```
    Then run the one command (the CLI compiles locally or dispatches to the server
    per the resolved mode, just like the `spor brief`/`spor compile` verbs):
