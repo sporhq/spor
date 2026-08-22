@@ -10527,6 +10527,13 @@ const COMMANDS = {
       "{{summary}}/{{type}}/{{status}}/{{date}}/{{slug}}/{{dir}}/{{default}} placeholders\n" +
       "(the node fields are populated from the dispatched node's frontmatter, blank in\n" +
       "free-text/--backfill dispatch).\n\n" +
+      "A template written for one isolation mode can mismatch the other: a prompt that\n" +
+      "promises an isolated worktree (branch-per-agent, someone else merges) misleads an\n" +
+      "agent run with --no-worktree straight into the shared checkout, and vice versa.\n" +
+      "Write or pick a template that matches the flag you pass — this repo's own\n" +
+      "spor-orchestrator skill ships both a worktree variant (assets/agent-prompt.md) and\n" +
+      "a --no-worktree variant (assets/agent-prompt-inplace.md, asserting shared-checkout\n" +
+      "discipline instead of isolation) as a template pair to model this split on.\n\n" +
       "Two different 'agent' axes, don't confuse them: --as picks the Spor agent\n" +
       "IDENTITY the dispatch runs AS (attribution 'agent on behalf of person',\n" +
       "remote-only; defaults to dispatch.agent — set it with 'spor agent use <id>').\n" +

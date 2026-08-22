@@ -1590,6 +1590,40 @@ test("dispatch --template with an unreadable path exits 1 before compiling", () 
   assert.match(r.stderr, /could not read --template/);
 });
 
+// --- issue-spor-dispatch-no-worktree-template-mismatch ---------------------
+// The spor-orchestrator's per-role templates render cleanly for the flag they
+// document, and the worktree vs. --no-worktree variants assert OPPOSITE
+// isolation contracts — the exact mismatch the issue reports (a --no-worktree
+// dispatch handed the worktree-isolation template).
+const ORCH_ASSETS = path.join(__dirname, "..", ".claude", "skills", "spor-orchestrator", "assets");
+
+test("dispatch --template (real asset): agent-prompt.md renders with --worktree, no unknown placeholders, promises worktree isolation", () => {
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const tpl = path.join(ORCH_ASSETS, "agent-prompt.md");
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cwd-"));
+  const r = run(["dispatch", "dec-x", "--worktree", "--template", tpl, "--print"], { SPOR_HOME: home }, elsewhere);
+  assert.strictEqual(r.status, 0);
+  assert.doesNotMatch(r.stderr, /unknown template placeholder/);
+  const prompt = promptOf(r.stdout);
+  assert.match(prompt, /You are running in an isolated git worktree/);
+  assert.doesNotMatch(prompt, /shared-checkout discipline/);
+});
+
+test("dispatch --template (real asset): agent-prompt-inplace.md renders with --no-worktree, no unknown placeholders, asserts shared-checkout discipline instead of worktree isolation", () => {
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const tpl = path.join(ORCH_ASSETS, "agent-prompt-inplace.md");
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cwd-"));
+  const r = run(["dispatch", "dec-x", "--no-worktree", "--template", tpl, "--print"], { SPOR_HOME: home }, elsewhere);
+  assert.strictEqual(r.status, 0);
+  assert.doesNotMatch(r.stderr, /unknown template placeholder/);
+  const prompt = promptOf(r.stdout);
+  assert.match(prompt, /shared-checkout discipline/);
+  assert.match(prompt, /SPOR_MAIN_CHECKOUT/);
+  assert.doesNotMatch(prompt, /You are running in an isolated git worktree/);
+});
+
 // --- remote auto-claim (task-spor-dispatch-auto-claim) ---------------------
 // A node dispatch in REMOTE mode establishes the claim/lease at dispatch time
 // via POST /v1/nodes/{id}/claim, so concurrent dispatch of the same node is

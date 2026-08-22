@@ -281,11 +281,16 @@ spor dispatch --node <id> --worktree --model <sonnet|opus|fable> \
   what gives the agent a reply address for blocking questions and long-wait
   heads-ups; skip it for Codex dispatches (no message channel).
 - Record `{ node, agent_name (= node id), branch, worktree_path, kind }` in
-  `running`. `kind` is `'claude'` for `agent-prompt.md`/`infra-agent-prompt.md`
-  (self-resolving) or `'codex'` for `codex-agent-prompt.md` (orchestrator
-  resolves after a `MERGE-READY` report — see "The Codex implementer"). Get
-  this right at dispatch time; it's what tells the supervisor loop not to
-  `RECOVER` a Codex node that's actually done.
+  `running`. `kind` is `'claude'` for `agent-prompt.md`/`infra-agent-prompt.md`/
+  `agent-prompt-inplace.md` (self-resolving) or `'codex'` for
+  `codex-agent-prompt.md` (orchestrator resolves after a `MERGE-READY` report —
+  see "The Codex implementer"). Get this right at dispatch time; it's what
+  tells the supervisor loop not to `RECOVER` a Codex node that's actually done.
+- **Dispatching `--no-worktree` for a non-infra item?** Swap the template for
+  `assets/agent-prompt-inplace.md` (see "Solo / in-place dispatch" below) —
+  `assets/agent-prompt.md` promises an isolated worktree that isn't there, and
+  the mismatch is exactly what leaves the agent inventing its own worktree
+  mid-run (issue-spor-dispatch-no-worktree-template-mismatch).
 
 ### Right-size the model per item
 
@@ -644,6 +649,38 @@ spor dispatch --node <infra-id> --no-worktree --permission-mode bypassPermission
   agent will `/spor:defer` and leave the node unresolved if it hits that, which is
   your signal to escalate.
 
+### Solo / in-place dispatch (`--no-worktree`, non-infra)
+
+Not every `--no-worktree` item is infra. A one-off solo dispatch — debugging in
+place, a repo you don't want to cut a worktree in, a quick change you're
+watching live — still needs a template that matches the flag
+(issue-spor-dispatch-no-worktree-template-mismatch): `assets/agent-prompt.md`
+promises an isolated worktree and a branch for you to CAS-merge, neither of
+which exists when the agent lands directly in the shared checkout.
+
+```bash
+spor dispatch --node <id> --no-worktree --model <sonnet|opus|fable> \
+  --permission-mode bypassPermissions \
+  --template ~/.claude/skills/spor-orchestrator/assets/agent-prompt-inplace.md
+```
+
+- The in-place template (`assets/agent-prompt-inplace.md`) drops the
+  isolated-worktree assertions and instead asserts **shared-checkout
+  discipline**: pathspec-scoped commits, no `git stash`, no `reset --hard`/
+  `checkout -- <path>` on work it didn't author this session. It tells the
+  agent to set `SPOR_MAIN_CHECKOUT` itself if it needs it — no
+  `dispatch.worktreeSetup` hook runs for a `--no-worktree` dispatch, so there
+  is no `SPOR_WORKTREE` to promise.
+- Like the code-agent template, it self-resolves (`kind: 'claude'`) — the
+  agent writes its own resolver + commits directly to whatever branch was
+  already checked out. **There is no branch for you to merge**: its commit(s)
+  on that branch are the deliverable, so treat the resolved node as done, not
+  as "ready to gate+merge".
+- Unlike the infra slot this isn't swamp-specific, but the same one-checkout
+  caution applies: don't run two shared-checkout agents against the same
+  repo concurrently unless you're confident their edits can't collide — there
+  is no worktree isolation protecting them from each other.
+
 ## Reporting
 
 Keep the user oriented without spamming the channel: one line per merge (node +
@@ -687,7 +724,7 @@ dispatch time.
 
 ## What each delegated agent does
 
-There are three per-agent workflows, all supplied as the dispatch `--template`:
+There are four per-agent workflows, all supplied as the dispatch `--template`:
 
 - **Code agents** — `assets/agent-prompt.md`: brief → implement in its worktree →
   loop `/code-review` until clean → verify → resolve the node (resolver node +
@@ -702,6 +739,12 @@ There are three per-agent workflows, all supplied as the dispatch `--template`:
   swamp model on the real checkout → **deploy via the `swamp` CLI** → verify →
   resolve the node → commit the model change (it owns the deploy; you don't
   merge).
+- **Solo / in-place agent** — `assets/agent-prompt-inplace.md`: brief →
+  implement directly on the shared checkout, under shared-checkout discipline
+  (no worktree assumptions) → loop `/code-review` until clean → verify →
+  resolve the node → commit on whatever branch was already checked out (it
+  owns that commit directly — there is no branch for you to merge). See
+  "Solo / in-place dispatch" above.
 
 Edit those files to tune what each kind of agent does; edit this SKILL.md to tune
 how you schedule, gate, merge, and deploy them.
@@ -719,3 +762,6 @@ how you schedule, gate, merge, and deploy them.
   after a `MERGE-READY` report, see "The Codex implementer").
 - **`assets/infra-agent-prompt.md`** — the infra/swamp-agent prompt (real
   checkout, owns its deploy; one at a time).
+- **`assets/agent-prompt-inplace.md`** — the solo/in-place code-agent prompt
+  (`--no-worktree`, shared-checkout discipline instead of worktree isolation,
+  no branch for you to merge; see "Solo / in-place dispatch").
