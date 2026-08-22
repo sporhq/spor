@@ -941,6 +941,35 @@ test("a bogus ambient GIT_DIR does not misdirect the heal — --repo stays autho
   assert.equal(read(decoy, "b.js"), "decoy\n"); // decoy untouched
 });
 
+test("a bogus ambient GIT_INDEX_FILE does not misdirect classification — the real index stays authoritative", () => {
+  // Unlike GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR, gitSpawn (lib/shell/git-exec.js)
+  // deliberately LEAVES GIT_INDEX_FILE alone for `spor check --staged`'s sake —
+  // so this tool has to scrub it itself (issue-spor-heal-stale-root-git-index-
+  // file-inheritance). Confirm it by pointing the ambient env at a decoy index
+  // holding an UNRESOLVED CONFLICT for the stale path: if any spawn here
+  // inherited it, classify()'s `idx.unmerged` check would read that conflict
+  // and refuse to heal a path that is, in the real index, cleanly stale.
+  const dir = initRepo();
+  write(dir, "a.js", "one\n");
+  commit(dir, "init");
+  const blobSha = git(dir, "rev-parse", "HEAD:a.js").trim();
+  casAdvance(dir, () => write(dir, "a.js", "one\ntwo\n"));
+
+  const decoyIndex = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "spor-heal-decoyidx-")), "index");
+  const stageLines = [1, 2, 3].map((stage) => `100644 ${blobSha} ${stage}\ta.js\n`).join("");
+  execFileSync("git", ["-C", dir, "update-index", "--index-info"], {
+    input: stageLines,
+    env: { ...process.env, GIT_INDEX_FILE: decoyIndex },
+    stdio: ["pipe", "ignore", "ignore"],
+  });
+
+  const r = runWithEnv(dir, { GIT_INDEX_FILE: decoyIndex }, "--json", "--apply");
+  const json = JSON.parse(r.stdout);
+  assert.equal(r.status, 0);
+  assert.equal(json.verdict, "HEALED");
+  assert.equal(read(dir, "a.js"), "one\ntwo\n"); // healed against the real index, not the decoy's conflict
+});
+
 // ---------- invocation ----------
 
 test("a merge in progress refuses with exit 2", () => {

@@ -192,6 +192,23 @@ function parseArgs(argv) {
 // ambient GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR before the child launches, so a
 // leaked var from the caller's environment can't misdirect the heal at the
 // wrong repo (issue-spor-gittime-git-env-inheritance).
+//
+// gitSpawn deliberately LEAVES GIT_INDEX_FILE alone — `spor check --staged`
+// needs it to read a pre-commit hook's partial-commit index. This tool has no
+// such use case: every status/checkout call below must read and write the
+// real `.git/index`, so an inherited GIT_INDEX_FILE would silently classify
+// paths against, and check out into, an unrelated index file — the same
+// vulnerability class as an inherited GIT_DIR, just past gitSpawn's scrub.
+// Strip it here, one level up.
+function envWithoutIndexFile(env = process.env) {
+  const out = { ...env };
+  const isIndexFileVar =
+    process.platform === 'win32'
+      ? (k) => k.toUpperCase() === 'GIT_INDEX_FILE'
+      : (k) => k === 'GIT_INDEX_FILE';
+  for (const k of Object.keys(out)) if (isIndexFileVar(k)) delete out[k];
+  return out;
+}
 
 // Set once the heal has written anything. After that, exit 2 is a lie — the
 // header promises it means "nothing was modified" — so even a git that will not
@@ -245,6 +262,7 @@ function gitRun(repo, args, input, encoding) {
   const r = gitSpawn(repo, args, {
     encoding,
     maxBuffer: 64 * 1024 * 1024,
+    env: envWithoutIndexFile(),
     ...(input === undefined ? {} : { input }),
   });
   if (r.error) {
