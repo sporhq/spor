@@ -76,6 +76,18 @@ test("effectiveCapabilities: garbage / empty input yields empty axes, never thro
   }
 });
 
+// task-spor-dispatch-adapter-follow-up-batch: HARNESS_BINARIES used to list
+// gemini/cursor with no dispatch adapter behind them, so `spor capabilities`
+// could report a harness satisfiable (the bare binary merely happened to be
+// on PATH) that `spor dispatch` then refused outright (getHarness() === null).
+// The two registries must name exactly the same harnesses.
+test("HARNESS_BINARIES lists exactly the harnesses the dispatch adapter registry can launch", () => {
+  const { harnesses } = require(path.join(__dirname, "..", "lib", "shell", "dispatch-harnesses.js"));
+  const adapterIds = harnesses().map((a) => a.id).sort();
+  assert.deepStrictEqual(Object.keys(sat.HARNESS_BINARIES).sort(), adapterIds);
+  assert.deepStrictEqual(Object.keys(sat.HARNESS_BIN_ENV).sort(), adapterIds);
+});
+
 // ---- the probe (util.probeCapabilities) ----------------------------------
 
 // Build a fake PATH dir with executable stub(s), and a fake HOME holding a

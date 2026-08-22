@@ -4,7 +4,13 @@
 // (task-spor-dispatch-adapters-opencode-copilot). Like the Codex twin, this
 // consumes the operator's existing Copilot authentication and may call the live
 // model service, so `npm test` skips it and `npm run test:e2e:copilot` opts in.
-// Verified against GitHub Copilot CLI 1.0.75.
+// No version is pinned here — Copilot auto-updates itself outside CI (observed
+// mid-development: 1.0.75 -> 1.0.80 with no operator action, before the adapter
+// added `--no-auto-update` to its dispatch argv), so a comment naming a version
+// goes stale the next time the CLI updates on its own. `e2e.announce()` records
+// what actually ran instead: it prints `# e2e: copilot <version> (<cmd>)` to
+// stderr at the start of the suite — read that line for the version a given
+// run was verified against.
 require("./helpers/tmp-cleanup");
 const test = require("node:test");
 const assert = require("node:assert");

@@ -354,6 +354,27 @@ test('nodeRuntimeCheck: below the floor => not ok, loud prereq line', () => {
   assert.match(c.line, /no-op/);
 });
 
+// task-spor-dispatch-adapter-follow-up-batch: hasCmd()'s `<cmd> --version`
+// probe used to spawn with no timeout, so a hung launcher (a broken wrapper
+// script, a shim waiting on something that never answers) hung install/dispatch
+// preflight forever instead of reporting the binary unusable. Called directly
+// via the bin/spor.js export seam (no CLI child needed) with a stub that never
+// exits, so a regression here would hang the test itself rather than fail it
+// cleanly — bounded by the test runner's own timeout as a backstop.
+test('hasCmd: a launcher that never exits times out instead of hanging forever', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-hascmd-hang-'));
+  const stub = writeSpawnableNodeStub(dir, 'never-exits', 'setTimeout(() => {}, 60000);');
+  const started = Date.now();
+  assert.strictEqual(cli.hasCmd(stub), false);
+  assert.ok(Date.now() - started < 10000, 'bounded well under the hung launcher\'s own 60s lifetime');
+});
+
+test('hasCmd: a normal --version-answering binary is still reported present', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-hascmd-ok-'));
+  const stub = writeSpawnableNodeStub(dir, 'answers', 'process.exit(0);');
+  assert.strictEqual(cli.hasCmd(stub), true);
+});
+
 test('bare "spor install" states the Node requirement', () => {
   const r = run(['install']);
   assert.strictEqual(r.status, 0);
@@ -1302,6 +1323,26 @@ test('install codex resolves the placeholder and installs the backfill custom ag
   assert.match(agent, /You are a Spor backfill agent/);
 });
 
+// task-spor-dispatch-adapter-follow-up-batch: `spor install codex`/`spor
+// upgrade codex` used to shell out via codexCmd() with no config cascade at
+// all, so a box configured ONLY through `dispatch.bin.codex` (no
+// SPOR_CODEX_CMD env — exactly how the cascade is meant to be used, since the
+// key is machine-local like dispatch.repos) got working `spor dispatch` but a
+// plugin install that silently tried the bare 'codex' name instead.
+test('install codex honors dispatch.bin.codex from the config cascade, not just SPOR_CODEX_CMD', () => {
+  const home = scratchHome();
+  const stub = codexStub(home);
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ dispatch: { bin: { codex: stub } } }));
+  const r = run(['install', 'codex', '--scope', 'user'], {
+    HOME: home,
+    SPOR_HOME: home,
+    CODEX_LOG: path.join(home, 'codex-plugin.log'),
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(codexLog(home), /^plugin marketplace add \.$/m);
+  assert.match(codexLog(home), /^plugin add spor@spor$/m);
+});
+
 test('install is idempotent and preserves foreign hooks + top-level keys', () => {
   const home = scratchHome();
   const f = path.join(home, '.codex', 'hooks.json');
@@ -1378,6 +1419,7 @@ test('install claude --print shows the plugin CLI commands and runs nothing', ()
   assert.match(r.stdout, /would run: claude plugin marketplace add /);
   assert.match(r.stdout, /would run: claude plugin install spor@spor --scope user/);
 });
+
 
 test('install --print is a dry run (writes nothing)', () => {
   const home = scratchHome();

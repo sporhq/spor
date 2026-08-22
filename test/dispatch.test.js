@@ -696,6 +696,26 @@ test("dispatch spawns the claude binary with --bg in the target dir", () => {
   assert.ok(argv.includes("--name") && argv.includes("dec-x"));
 });
 
+// task-spor-dispatch-adapter-follow-up-batch: the native `claude --bg` launch
+// used to hand the child `env: u.gitEnv()` with no PWD override, so the child
+// inherited the LAUNCHER's $PWD instead of the resolved launch dir — the same
+// stale-$PWD trap opencodePrepareRun exists to close for the supervised
+// launch path (a spawn's cwd moves getcwd() but never updates the inherited
+// PWD). Unify: the native launch must pin PWD the same way.
+test("dispatch native launch pins $PWD to the launch dir, not the launcher's inherited PWD", () => {
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const outFile = path.join(home, "spawn.out");
+  const stub = pwdEnvStub(home);
+  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const [cwd, pwd] = fs.readFileSync(outFile, "utf8").split("\n");
+  const expected = fs.realpathSync(repo);
+  assert.strictEqual(cwd, expected, "getcwd() follows the launch dir");
+  assert.strictEqual(pwd, expected, "$PWD agrees with getcwd(), not the launcher's own cwd");
+  assert.notStrictEqual(pwd, process.cwd(), "sanity: the launcher's own cwd differs from the launch dir");
+});
+
 // --- worktree isolation (dispatch.worktree) ------------------------------
 // Run the dispatched agent in its own git worktree off the target repo so
 // parallel dispatches never race the shared tree/index. Opt-in; dispatch owns
@@ -742,6 +762,17 @@ function pwdStub(home) {
   return writeSpawnableNodeStub(home, "claude-pwd", `
 const fs = require("node:fs");
 fs.writeFileSync(process.env.OUTFILE, [process.cwd(), ...process.argv.slice(2)].join("\\n") + "\\n");
+`);
+}
+
+// Like pwdStub, but also records the inherited $PWD env var (cwd on line 1,
+// PWD on line 2) — a spawn's `cwd` moves getcwd() but never updates the
+// inherited PWD on its own, so this is the only way to observe whether the
+// launcher pinned it.
+function pwdEnvStub(home) {
+  return writeSpawnableNodeStub(home, "claude-pwd-env", `
+const fs = require("node:fs");
+fs.writeFileSync(process.env.OUTFILE, [process.cwd(), process.env.PWD || ""].join("\\n") + "\\n");
 `);
 }
 

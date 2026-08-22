@@ -261,7 +261,7 @@ async function cmdStatus(cfg, { values }) {
     // remote team graph) with no signal which a capture lands in: ambient hook
     // captures go local, agent/MCP-tool captures go remote. Warn so the user can
     // pick one surface. Detection is best-effort/fail-open; only fires here.
-    if (sporConnectorBound()) {
+    if (sporConnectorBound(cfg)) {
       out(``);
       out(`⚠ SPLIT-BRAIN: a claude.ai Spor MCP connector is also bound on this box.`);
       out(`  In local mode you have TWO live write surfaces — this local file graph`);
@@ -287,7 +287,7 @@ async function cmdStatus(cfg, { values }) {
   // Claude Code loads its OWN copy of the plugin, so a bumped package can leave a
   // stale plugin running silently (issue-spor-upgrade-no-plugin-refresh). When
   // the loaded version lags this package's, point the user at 'spor upgrade'.
-  const plugin = claudePluginInfo();
+  const plugin = claudePluginInfo(cfg);
   if (plugin && plugin.version) {
     const pkg = version();
     const stale = plugin.version !== "unknown" && pkg && plugin.version !== pkg;
@@ -5841,15 +5841,22 @@ function homeDir() {
 }
 
 // The Claude Code binary, overridable for tests (a stub fed via SPOR_CLAUDE_CMD,
-// same lever 'spor dispatch' uses). All claude shell-outs route through here.
-function claudeCmd() {
-  return dispatchHarnesses.getHarness("claude-code").command();
+// same lever 'spor dispatch' uses) or by `dispatch.bin.claude-code` in the
+// config cascade. `cfg` is optional so every existing bare call keeps resolving
+// env-then-PATH exactly as before; pass it through wherever a Config is already
+// in hand so a box configured only via the cascade (no env var) gets the SAME
+// launcher for plugin management as `spor dispatch` already uses (these
+// shell-outs used to skip the cascade entirely — task-spor-dispatch-adapter-
+// follow-up-batch). All claude shell-outs route through here.
+function claudeCmd(cfg = null) {
+  return dispatchHarnesses.getHarness("claude-code").command(process.env, cfg);
 }
 
-// The Codex CLI binary, overridable for tests. Codex owns plugin install state,
-// so all plugin shell-outs route through this seam instead of writing its cache.
-function codexCmd() {
-  return dispatchHarnesses.getHarness("codex").command();
+// The Codex CLI binary, overridable for tests or `dispatch.bin.codex`, same
+// cascade as claudeCmd() above. Codex owns plugin install state, so all plugin
+// shell-outs route through this seam instead of writing its cache.
+function codexCmd(cfg = null) {
+  return dispatchHarnesses.getHarness("codex").command(process.env, cfg);
 }
 
 function spawnPortableSync(cmd, args, opts = {}) {
@@ -5866,8 +5873,8 @@ function spawnPortableSync(cmd, args, opts = {}) {
 // ~/.claude/plugins/), parsed from `claude plugin list --json`, or null if the
 // claude CLI is absent / spor isn't installed. Fail-soft and bounded — never
 // throws, prints, or hangs — so it is safe to call on the status path.
-function claudePluginInfo() {
-  const cmd = claudeCmd();
+function claudePluginInfo(cfg = null) {
+  const cmd = claudeCmd(cfg);
   if (cmd === "claude" && !hasCmd("claude")) return null;
   const r = spawnPortableSync(cmd, ["plugin", "list", "--json"], { encoding: "utf8", timeout: 8000 });
   if (r.status !== 0 || !r.stdout) return null;
@@ -5897,11 +5904,11 @@ function claudePluginInfo() {
 // status (Connected / Needs authentication / Failed) is ignored — any current
 // binding is a configured second write surface. SPOR_FAKE_MCP_LIST injects
 // canned `claude mcp list` output for tests.
-function sporConnectorBound() {
+function sporConnectorBound(cfg = null) {
   try {
     let text = process.env.SPOR_FAKE_MCP_LIST;
     if (text == null) {
-      const cmd = claudeCmd();
+      const cmd = claudeCmd(cfg);
       if (cmd === "claude" && !hasCmd("claude")) return false;
       const r = spawnPortableSync(cmd, ["mcp", "list"], { encoding: "utf8", timeout: 8000 });
       if (r.status !== 0 || !r.stdout) return false;
@@ -6118,7 +6125,11 @@ function installExtras(spec, scope, dryRun) {
 
 function hasCmd(cmd) {
   try {
-    return !spawnPortableSync(cmd, ["--version"], { stdio: "ignore" }).error;
+    // Bounded: an unresponsive launcher (a hung shim, a broken wrapper script)
+    // must not hang dispatch/install preflight forever — spawnSync's timeout
+    // kills the child and sets .error, which the `!` below already treats as
+    // "not available".
+    return !spawnPortableSync(cmd, ["--version"], { stdio: "ignore", timeout: 5000 }).error;
   } catch {
     return false;
   }
@@ -6142,7 +6153,7 @@ function detectHosts() {
 // the source dir so a bumped package version is picked up, then 'plugin update'
 // swaps the cached copy. Returns 0/1; prints a before→after line. The caller has
 // already ensured the claude CLI exists and the marketplace is registered.
-function refreshClaudePlugin(cmd, cliScope, before) {
+function refreshClaudePlugin(cmd, cliScope, before, cfg = null) {
   spawnPortableSync(cmd, ["plugin", "marketplace", "update", "spor"], { encoding: "utf8" });
   // Claude Code resolves an installed plugin by its name@marketplace id (the
   // install side uses 'spor@spor'); the bare 'spor' is unresolvable and fails
@@ -6152,7 +6163,7 @@ function refreshClaudePlugin(cmd, cliScope, before) {
     err(`claude plugin update failed (exit ${upd.status == null ? "?" : upd.status})`);
     return 1;
   }
-  const after = claudePluginInfo();
+  const after = claudePluginInfo(cfg);
   const pkg = version();
   if (before && after && before.version !== after.version) {
     out(`spor plugin: ${before.version} → ${after.version} — restart your Claude Code session to load it.`);
@@ -6170,8 +6181,8 @@ function refreshClaudePlugin(cmd, cliScope, before) {
 // plugin is ALREADY installed, refresh it (marketplace+plugin update) instead of
 // a no-op install, so re-running 'spor install claude' actually picks up a
 // bumped package (issue-spor-upgrade-no-plugin-refresh).
-function installClaude(scope, dryRun) {
-  const cmd = claudeCmd();
+function installClaude(scope, dryRun, cfg = null) {
+  const cmd = claudeCmd(cfg);
   const cliScope = scope === "repo" ? "project" : "user";
   const addArgs = ["plugin", "marketplace", "add", ROOT];
   const instArgs = ["plugin", "install", "spor@spor", "--scope", cliScope];
@@ -6190,8 +6201,8 @@ function installClaude(scope, dryRun) {
     err(`claude plugin marketplace add failed: ${(add.stderr || add.stdout || "").trim() || "unknown error"}`);
     return 1;
   }
-  const existing = claudePluginInfo();
-  if (existing) return refreshClaudePlugin(cmd, cliScope, existing);
+  const existing = claudePluginInfo(cfg);
+  if (existing) return refreshClaudePlugin(cmd, cliScope, existing, cfg);
   const inst = spawnPortableSync(cmd, instArgs, { stdio: "inherit" });
   if (inst.status !== 0) {
     err(`claude plugin install failed (exit ${inst.status == null ? "?" : inst.status})`);
@@ -6205,8 +6216,8 @@ function installClaude(scope, dryRun) {
 // then keep the hook manifest + backfill custom agent installed. The plugin
 // manifest intentionally does not carry hooks (Codex plugin validation rejects
 // that field), so both halves matter.
-function installCodex(scope, dryRun) {
-  const cmd = codexCmd();
+function installCodex(scope, dryRun, cfg = null) {
+  const cmd = codexCmd(cfg);
   // Use "." from ROOT instead of ROOT itself: Codex's source parser treats npm
   // scoped absolute paths containing /@scope/name as git owner/repo@ref-ish
   // input, which fails for local marketplaces (issue-spor-codex-install-npm-scope).
@@ -6537,8 +6548,8 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
     // ever runs — no separate pre-validation needed here
     // (issue-spor-gemini-config-clobbered-on-install).
     let r;
-    if (spec.kind === "claude") r = installClaude(scope, dryRun);
-    else if (spec.kind === "codex") r = installCodex(scope, dryRun);
+    if (spec.kind === "claude") r = installClaude(scope, dryRun, cfg);
+    else if (spec.kind === "codex") r = installCodex(scope, dryRun, cfg);
     else if (spec.kind === "plugin") r = installPluginHost(spec, scope, dryRun);
     else r = installHookHost(spec, scope, dryRun);
     if (r !== 0) {
@@ -6590,8 +6601,8 @@ async function cmdInstall(cfg, { values, positionals: pos }) {
 
 // Refresh Claude Code's loaded plugin (marketplace add to register/repoint the
 // source, then the shared marketplace+plugin update). Returns 0/1.
-function upgradeClaude(scope, dryRun) {
-  const cmd = claudeCmd();
+function upgradeClaude(scope, dryRun, cfg = null) {
+  const cmd = claudeCmd(cfg);
   const cliScope = scope === "repo" ? "project" : "user";
   const mpAdd = ["plugin", "marketplace", "add", ROOT];
   const mpUpd = ["plugin", "marketplace", "update", "spor"];
@@ -6609,7 +6620,7 @@ function upgradeClaude(scope, dryRun) {
     err("claude CLI not on PATH — install Claude Code, then re-run 'spor upgrade'.");
     return 1;
   }
-  const before = claudePluginInfo();
+  const before = claudePluginInfo(cfg);
   if (!before) {
     err("spor isn't installed in Claude Code yet — run 'spor install claude' first.");
     return 1;
@@ -6621,14 +6632,14 @@ function upgradeClaude(scope, dryRun) {
     err(`claude plugin marketplace add failed: ${(add.stderr || add.stdout || "").trim() || "unknown error"}`);
     return 1;
   }
-  return refreshClaudePlugin(cmd, cliScope, before);
+  return refreshClaudePlugin(cmd, cliScope, before, cfg);
 }
 
 // Is spor actually wired into this host on this machine (vs the host merely being
 // present)? claude: ask its plugin list; hook/plugin hosts: look for the spor
 // marker in the target config. Picks which hosts 'spor upgrade' (no host) touches.
-function hostHasSpor(host, scope) {
-  if (host === "claude") return !!claudePluginInfo();
+function hostHasSpor(host, scope, cfg = null) {
+  if (host === "claude") return !!claudePluginInfo(cfg);
   const spec = HOSTS[host];
   if (!spec) return false;
   try {
@@ -6653,7 +6664,7 @@ async function cmdUpgrade(cfg, { values, positionals: pos }) {
   }
   // Explicit hosts win; otherwise refresh every detected host that has spor wired.
   let hosts = pos.slice();
-  if (!hosts.length) hosts = detectHosts().filter((h) => hostHasSpor(h, scope));
+  if (!hosts.length) hosts = detectHosts().filter((h) => hostHasSpor(h, scope, cfg));
   if (!hosts.length) {
     out("nothing to upgrade — spor isn't wired into any detected host. Run 'spor install <host>'.");
     return 0;
@@ -6662,8 +6673,8 @@ async function cmdUpgrade(cfg, { values, positionals: pos }) {
   let rc = 0;
   for (const host of hosts) {
     let r;
-    if (host === "claude") r = upgradeClaude(scope, dryRun);
-    else if (host === "codex") r = installCodex(scope, dryRun);
+    if (host === "claude") r = upgradeClaude(scope, dryRun, cfg);
+    else if (host === "codex") r = installCodex(scope, dryRun, cfg);
     else {
       // Re-running install refreshes the absolute __SPOR_ROOT__ path (a no-op
       // when the path is unchanged; repairs a moved checkout when it is not).
@@ -8482,8 +8493,12 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   // The agent's git must follow launchDir (its worktree, or the target checkout),
   // so hand it an env scrubbed of the git location vars — an ambient GIT_DIR
   // would otherwise point every commit it makes at the LAUNCHER's repo
-  // (issue-spor-dispatch-worktree-wrong-repo-location).
-  const r = spawnPortableSync(harnessBin, nativeArgs, { cwd: launchDir, stdio: "inherit", env: u.gitEnv() });
+  // (issue-spor-dispatch-worktree-wrong-repo-location). PWD gets the same
+  // treatment as the supervised launch's cwd-agreeing env (opencodePrepareRun):
+  // a spawn's `cwd` moves the child's real working directory but leaves the
+  // INHERITED `PWD` pointing at the launcher's — pin it to launchDir so the two
+  // launch modes agree instead of disagreeing about which env var is authoritative.
+  const r = spawnPortableSync(harnessBin, nativeArgs, { cwd: launchDir, stdio: "inherit", env: { ...u.gitEnv(), PWD: launchDir } });
   if (r.error) {
     dispatchRuns.updateRun(nativeRun, {
       state: "failed_launch", termination_class: "launch", termination_signal: "launch-failed",
@@ -10911,7 +10926,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged };
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged };
 
 if (require.main === module) {
   main()

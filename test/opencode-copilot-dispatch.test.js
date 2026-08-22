@@ -205,11 +205,11 @@ test("each new adapter builds the documented headless argv and keeps the prompt 
   assert.deepStrictEqual(getHarness("opencode").buildArgs({}), ["run", "--format", "json", "--auto", "--dir", CWD]);
   assert.deepStrictEqual(
     getHarness("copilot").buildArgs({ model: "m", reportPath: "/r.md", prompt: "secret briefing" }),
-    ["--output-format", "json", "--allow-all", "--no-ask-user", "--no-color", "--model", "m"]
+    ["--output-format", "json", "--allow-all", "--no-ask-user", "--no-color", "--no-auto-update", "--model", "m"]
   );
   assert.deepStrictEqual(
     getHarness("copilot").buildArgs({}),
-    ["--output-format", "json", "--allow-all", "--no-ask-user", "--no-color"]
+    ["--output-format", "json", "--allow-all", "--no-ask-user", "--no-color", "--no-auto-update"]
   );
   for (const id of ["opencode", "copilot"]) {
     const args = getHarness(id).buildArgs({ prompt: "secret briefing", reportPath: "/r.md" });
