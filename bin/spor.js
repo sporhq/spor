@@ -2070,6 +2070,15 @@ async function analyticsRemote(cfg, args) {
 // registry (its resident overrides) via GET /v1/schema, while local mode (or any
 // --nodes) reads loadGraph().registry directly.
 async function cmdSchema(cfg, args) {
+  // Reserved subcommands checked ahead of the <type> positional: the packaged
+  // candidate schema pack (task-spor-resident-schema-adoption-upgrade-path).
+  // No node/edge type may be named `candidates` or `adopt`; the positional
+  // grammar is otherwise unchanged.
+  const flagValIdx = new Set();
+  for (let i = 0; i < args.length; i++) if (args[i] === "--nodes" || args[i] === "--source") flagValIdx.add(i + 1);
+  const first = args.find((a, i) => !a.startsWith("--") && !flagValIdx.has(i)) || null;
+  if (first === "candidates") return cmdSchemaCandidates(cfg, args);
+  if (first === "adopt") return cmdSchemaAdopt(cfg, args);
   // --nodes always names a local checkout (like query/analytics); local mode
   // reads the local registry. Both are the byte-identical lib/schema.js CLI.
   if (namesLocalGraph(args) || cfg.mode() !== "remote") {
@@ -2081,9 +2090,7 @@ async function cmdSchema(cfg, args) {
   const schemaLib = require(path.join(ROOT, "lib", "schema.js"));
   const has = (n) => args.includes(`--${n}`);
   // first non-flag, non-flag-value token = the optional <type> positional.
-  const flagValIdx = new Set();
-  for (let i = 0; i < args.length; i++) if (args[i] === "--nodes" || args[i] === "--source") flagValIdx.add(i + 1);
-  const type = args.find((a, i) => !a.startsWith("--") && !flagValIdx.has(i)) || null;
+  const type = first;
   // ?code=1 only when a detail/--code view needs the hook source, so the common
   // overview response stays lean (mirrors the local CLI's wantCode).
   const wantCode = has("code") || type != null;
@@ -2106,7 +2113,226 @@ async function cmdSchema(cfg, args) {
   const only = has("edges") ? "edges" : has("nodes-only") ? "nodes" : null;
   const res = schemaLib.present(r.json, { type, only, source: optVal(args, "source"), json: has("json") });
   (res.stderr ? err : out)(res.text);
+  // Overview footer: packaged candidate schemas not in this registry — the
+  // same line the local lib/schema.js CLI appends (mode parity). Fail-soft:
+  // the footer never breaks introspection.
+  if (!type && !has("json") && !res.stderr) {
+    try {
+      const candLib = require(path.join(ROOT, "lib", "candidates.js"));
+      const f = candLib.footerLine(candLib.loadCandidates(), r.json);
+      if (f) out("\n" + f);
+    } catch {
+      /* ignore */
+    }
+  }
   return res.code;
+}
+
+// The resident copy of a candidate schema in the ACTIVE graph. Local mode (or
+// --nodes) reads nodes/<id>.md; remote mode GETs /v1/nodes/{id} (404 = not
+// adopted). Returns { resident: node|null, raw?, revision? } or { error }.
+async function fetchResidentSchema(cfg, args, id) {
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  if (namesLocalGraph(args) || cfg.mode() !== "remote") {
+    const nodesDir = optVal(args, "nodes") || cfg.nodesDir();
+    const file = path.join(nodesDir, `${id}.md`);
+    let raw;
+    try {
+      raw = fs.readFileSync(file, "utf8");
+    } catch {
+      return { resident: null };
+    }
+    try {
+      return { resident: graphLib.parseFrontmatter(raw, `${id}.md`), raw, revision: gitBlobSha(Buffer.from(raw)) };
+    } catch (e) {
+      return { error: `resident ${id} is unparseable: ${e.message}` };
+    }
+  }
+  const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 6000 });
+  if (r.transport) return { error: `offline — could not reach server (${r.error})` };
+  if (r.status === 404) return { resident: null };
+  if (!r.ok || !r.json || typeof r.json.raw !== "string") return { error: `error ${r.status} reading ${id} from the server` };
+  try {
+    return { resident: graphLib.parseFrontmatter(r.json.raw, `${id}.md`), raw: r.json.raw, revision: r.json.revision || null };
+  } catch (e) {
+    return { error: `resident ${id} is unparseable: ${e.message}` };
+  }
+}
+
+// spor schema candidates — the packaged candidate pack's read surface
+// (task-spor-resident-schema-adoption-upgrade-path): every candidate with its
+// adoption state against the ACTIVE graph. Dual-mode like the rest of schema.
+async function cmdSchemaCandidates(cfg, args) {
+  const candLib = require(path.join(ROOT, "lib", "candidates.js"));
+  let cands;
+  try {
+    cands = candLib.loadCandidates();
+  } catch (e) {
+    err(String((e && e.message) || e));
+    return 1;
+  }
+  const json = args.includes("--json");
+  if (!cands.length) {
+    out(json ? "[]" : "no candidate schemas ship with this package");
+    return 0;
+  }
+  const rows = [];
+  for (const c of cands) {
+    const rres = await fetchResidentSchema(cfg, args, c.id);
+    if (rres.error) {
+      err(rres.error);
+      return 1;
+    }
+    rows.push({ c, st: candLib.candidateState(c, rres.resident) });
+  }
+  if (json) {
+    out(
+      JSON.stringify(
+        rows.map(({ c, st }) => ({
+          id: c.id,
+          kind: c.kind,
+          type: c.declaredType,
+          package_version: c.version,
+          state: st.state,
+          resident_version: st.resident_version || null,
+          resident_status: st.resident_status || null,
+        })),
+        null,
+        2
+      )
+    );
+    return 0;
+  }
+  const pkgVersion = require(path.join(ROOT, "package.json")).version;
+  out(`Candidate schemas shipped with @sporhq/spor ${pkgVersion} (inert until adopted into a graph):`);
+  for (const { c, st } of rows) {
+    out(`  ${c.id}  ${c.kind}:${c.declaredType}  ${c.version}`);
+    out(`    ${candLib.stateLine(c, st)}`);
+  }
+  return 0;
+}
+
+// spor schema adopt <id> — copy a packaged candidate into the active graph as
+// a graph-resident schema node, through the validated full-node write path
+// (never a raw file drop), preserving the propose→activate flow: a fresh
+// adopt lands `status: proposed`; --activate writes `active` (the CLI form of
+// GRAPH.md's trusted-admin escape — in team mode a server activation-policy
+// rejection is surfaced as-is). Idempotent and CalVer-aware on re-run: a
+// resident at or past the packaged version is a no-op; a pristine older copy
+// (canonical hash still equals its adopted_sha stamp) upgrades in place with
+// its status preserved; a diverged or unstamped resident refuses without
+// --force. See lib/candidates.js for the provenance-stamp contract.
+async function cmdSchemaAdopt(cfg, args) {
+  const candLib = require(path.join(ROOT, "lib", "candidates.js"));
+  const has = (n) => args.includes(`--${n}`);
+  const flagValIdx = new Set();
+  for (let i = 0; i < args.length; i++) if (args[i] === "--nodes" || args[i] === "--source") flagValIdx.add(i + 1);
+  const pos = args.filter((a, i) => !a.startsWith("--") && !flagValIdx.has(i));
+  const id = pos[1] || null; // pos[0] is the reserved word "adopt"
+  if (!id) {
+    err("usage: spor schema adopt <schema-id> [--activate] [--force]");
+    return 1;
+  }
+  let cands;
+  try {
+    cands = candLib.loadCandidates();
+  } catch (e) {
+    err(String((e && e.message) || e));
+    return 1;
+  }
+  // Accept the schema node id or the type it declares (adopt member-of-program).
+  const cand = cands.find((c) => c.id === id || c.declaredType === id);
+  if (!cand) {
+    err(`no packaged candidate '${id}'${cands.length ? ` — available: ${cands.map((c) => c.id).join(", ")}` : " (this package ships none)"}`);
+    return 1;
+  }
+
+  const local = namesLocalGraph(args) || cfg.mode() !== "remote";
+  const nodesDir = local ? optVal(args, "nodes") || cfg.nodesDir() : null;
+  const targetLine = local && optVal(args, "nodes") ? `  -> local ${nodesDir}` : writeTargetLine(cfg);
+
+  const rres = await fetchResidentSchema(cfg, args, cand.id);
+  if (rres.error) {
+    err(rres.error);
+    return 1;
+  }
+  const st = candLib.candidateState(cand, rres.resident);
+
+  if (st.state === "superseded-by-seed") {
+    err(`${cand.id} now ships in the seed pack — the registry already has it${st.resident_version ? "; retire the resident copy instead (status: retired)" : ""}`);
+    return 1;
+  }
+  if (st.state === "current") {
+    out(`up to date: ${cand.id} @ ${st.resident_version}${st.resident_status ? ` (status: ${st.resident_status})` : ""}`);
+    out(targetLine);
+    if (has("activate") && st.resident_status && st.resident_status !== "active") {
+      err(`  note: --activate does not flip an already-adopted schema; change its status through the write surface (spor put-node / set_status)`);
+    }
+    return 0;
+  }
+  if ((st.state === "diverged" || st.state === "unstamped") && !has("force")) {
+    err(`${cand.id}: ${candLib.stateLine(cand, st)}`);
+    err(`  the resident copy is not a pristine adoption of a packaged candidate; --force overwrites it with the packaged ${cand.version}`);
+    return 1;
+  }
+
+  const creating = st.state === "not-adopted";
+  // Preserve the resident's status across an upgrade (an active schema stays
+  // active — re-proposal ceremony belongs to non-backward-readable bumps,
+  // which already demand the CalVer bump + upgrades chain); --activate is the
+  // explicit trusted-admin lever in both directions.
+  const status = has("activate") ? "active" : (rres.resident && rres.resident.status) || "proposed";
+  const pkgVersion = require(path.join(ROOT, "package.json")).version;
+  const raw = candLib.adoptMarkdown(cand, { status, pkgVersion });
+  const verb = creating ? "adopted" : "upgraded";
+
+  if (!local) {
+    const entry = { node: raw, if_exists: creating ? "error" : "update" };
+    if (!creating) entry.revision = rres.revision;
+    const r = await remote.post(cfg, "/v1/nodes", { nodes: [entry] }, { timeoutMs: 15000 });
+    if (r.transport) {
+      err(`offline — could not reach server (${r.error})`);
+      return 1;
+    }
+    const res0 = r.json && r.json.results && r.json.results[0];
+    if (!(res0 && res0.ok)) {
+      const top = r.json && r.json.error;
+      if (top && !res0) err(`adopt error ${r.status}${top.message ? `: ${top.message}` : ""}`);
+      else err(putNodeEntryError(res0, r.status, "adopt"));
+      return 1;
+    }
+    out(`${verb}: ${cand.id} @ ${cand.version} (status: ${status})${res0.revision ? ` rev ${res0.revision}` : ""}`);
+    out(targetLine);
+    return 0;
+  }
+
+  if (!fs.existsSync(nodesDir)) {
+    err(`no graph at ${nodesDir} — run 'spor init' first`);
+    return 1;
+  }
+  const parsed = parsePutNode(raw, `${cand.id}.md`);
+  if (parsed.error) {
+    err(parsed.error);
+    return 1;
+  }
+  const file = path.join(nodesDir, `${cand.id}.md`);
+  if (!creating) {
+    const current = gitBlobSha(fs.readFileSync(file));
+    if (current !== rres.revision) {
+      err(`adopt conflict: ${cand.id} changed since it was read — re-run`);
+      return 1;
+    }
+  }
+  const valid = validatePutNodeLocal(nodesDir, parsed.node, raw);
+  if (valid.error) {
+    err(valid.error);
+    return 1;
+  }
+  fs.writeFileSync(file, raw);
+  out(`${verb}: ${cand.id} @ ${cand.version} (status: ${status}) rev ${gitBlobSha(Buffer.from(raw))}`);
+  out(targetLine);
+  for (const w of valid.warnings || []) err(`  warning: ${w}`);
+  return 0;
 }
 
 // changes — the team's recent-activity feed: "what landed / what did the agents
@@ -10045,7 +10271,7 @@ const COMMANDS = {
     run: (cfg, args) => cmdAnalytics(cfg, args),
   },
   schema: {
-    group: "Graph", parse: "raw", args: "[<type>] [--edges] [--json]",
+    group: "Graph", parse: "raw", args: "[<type>|candidates|adopt <id>] [--edges] [--json]",
     summary: "introspect the live schema registry (local; remote via the server)",
     help:
       "Introspect the LIVE schema registry — the contract (norm-cc-registry-is-\n" +
@@ -10067,12 +10293,24 @@ const COMMANDS = {
       "  --source <s>      filter the lists by provenance (seed | graph | native)\n" +
       "  --code            include hook source in --json (implied for <type>)\n" +
       "  --json            machine-readable snapshot\n" +
-      "  --nodes <dir>     read this local graph dir instead of the resolved home",
+      "  --nodes <dir>     read this local graph dir instead of the resolved home\n" +
+      "\n" +
+      "Candidate pack (rollout-stage schemas that ship with the package but stay\n" +
+      "inert until a graph adopts them as graph-resident schema nodes):\n" +
+      "  candidates        list packaged candidates with their adoption state\n" +
+      "  adopt <id>        write a candidate into the active graph through the\n" +
+      "                    validated node surface (status: proposed; --activate\n" +
+      "                    writes active — the trusted-admin lever for solo/local\n" +
+      "                    graphs). Re-run after a package upgrade: a pristine\n" +
+      "                    older copy upgrades in place, a locally modified one\n" +
+      "                    refuses without --force.",
     examples: [
       "spor schema",
       "spor schema task",
       "spor schema --edges --json",
       "spor schema --source graph",
+      "spor schema candidates",
+      "spor schema adopt schema-edge-member-of-program --activate",
     ],
     run: (cfg, args) => cmdSchema(cfg, args),
   },

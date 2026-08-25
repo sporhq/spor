@@ -195,6 +195,40 @@ async function doctor() {
     }
   }
 
+  // Packaged candidate schemas (task-spor-resident-schema-adoption-upgrade-
+  // path): rollout-stage schemas that ship with the package but stay inert
+  // until adopted into the graph — the doctor line closes the "upgraded the
+  // package, spor schema shows nothing" confusion. Read-only and fail-soft
+  // like everything here: an unreachable server or unparseable resident is
+  // reported as indeterminate, never thrown.
+  try {
+    const candLib = require(path.join(u.ROOT, "lib", "candidates.js"));
+    const graphLib = require(path.join(u.ROOT, "lib", "graph.js"));
+    for (const cand of candLib.loadCandidates()) {
+      let line;
+      try {
+        let resident = null;
+        if (u.serverBase()) {
+          const probe = await u.curl(`${u.serverBase()}/v1/nodes/${encodeURIComponent(cand.id)}`, {
+            headers: u.bearer(),
+            timeoutMs: 3000,
+          });
+          if (probe.http === "200") resident = graphLib.parseFrontmatter(JSON.parse(probe.body).raw, `${cand.id}.md`);
+          else if (probe.http !== "404") throw new Error(`http ${probe.http}`);
+        } else {
+          const file = path.join(graph, "nodes", `${cand.id}.md`);
+          if (fs.existsSync(file)) resident = graphLib.parseFrontmatter(fs.readFileSync(file, "utf8"), `${cand.id}.md`);
+        }
+        line = candLib.stateLine(cand, candLib.candidateState(cand, resident));
+      } catch (e) {
+        line = `could not determine adoption state (${(e && e.message) || e})`;
+      }
+      kv("candidate", `${cand.id} — ${line}`);
+    }
+  } catch {
+    /* no candidates, or the pack failed to load — stay silent */
+  }
+
   // Recent error history from both journals — the after-the-fact crumb the
   // fail-open contract would otherwise hide (piece 1 feeds remote.log crashes).
   const journal = path.join(graph, "journal");

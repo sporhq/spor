@@ -286,10 +286,12 @@ Membership and gating are two independent facts about a member
   gating, nothing else.
 - **`member-of-program`** — "this node belongs to the program" — pure
   topology, written the same direction as `blocks` (member → umbrella). It
-  ships as a graph-resident schema (`schema-edge-member-of-program`), which
-  needs a *different* identity to activate before writes of this edge type
-  validate — check `spor schema member-of-program` for its live status rather
-  than assuming it's already active in your graph:
+  ships as a graph-resident schema (`schema-edge-member-of-program`),
+  delivered by the package's candidate pack: if your graph doesn't have it,
+  `spor schema adopt schema-edge-member-of-program` writes it in (`status:
+  proposed`; `--activate` for a solo/local graph — team graphs need a
+  *different* identity to activate). Check `spor schema member-of-program`
+  for its live status rather than assuming it's already active in your graph:
 
 ```bash
 spor edge task-api-rate-limit blocks task-platform-hardening-program

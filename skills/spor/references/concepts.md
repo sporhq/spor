@@ -65,7 +65,7 @@ are same-direction synonyms renamed at write time.
 | triggered-by | 0.7 | this run was triggered by the target | — |
 | performs | 0.8 | this run is an execution of the target workflow | — |
 | blocks | 0.7 | the target can't proceed until this does | inverse `blocked-by`; also the fallback program-membership inference where a node declares no `member-of-program` edges, rendered by `render_program` |
-| member-of-program | 0.7 | this is a member of the target program umbrella (pure topology, independent of gating) | inverse `has-program-member`; `capturable: false`; preferred per-node over the `blocks` fallback above; graph-resident schema, check `spor schema member-of-program` for activation status |
+| member-of-program | 0.7 | this is a member of the target program umbrella (pure topology, independent of gating) | inverse `has-program-member`; `capturable: false`; preferred per-node over the `blocks` fallback above; graph-resident schema shipped as a packaged candidate (`spor schema adopt schema-edge-member-of-program` if your graph lacks it), check `spor schema member-of-program` for activation status |
 | answers | 0.7 | this answers the target question | inverse `answered-by` |
 | assigned | 0.5 | work assigned to this person OR agent (explicit routing; an agent target may carry a `profile:` per-assignment override) | — |
 | relates-to | 0.5 | weak association | alias `related-to` |

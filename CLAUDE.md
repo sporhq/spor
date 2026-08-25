@@ -23,7 +23,12 @@ client-facing contract is this repo's API.md.
   GRAPH.md's documentation of it, the distiller prompts in `prompts/`, and
   the skills that encode it in the same change — and only with a CalVer
   `schema_version` bump plus upgrade chain if the change isn't
-  backward-readable.
+  backward-readable. Rollout-stage schemas that should ship with the package
+  but NOT be active-everywhere-instantly go in `lib/seed/candidates/` (the
+  candidate pack, `lib/candidates.js`): inert until `spor schema adopt`
+  writes them into a graph as resident schema nodes with
+  `adopted_from`/`adopted_sha` provenance stamps; promote to `lib/seed/`
+  once stabilized (GRAPH.md "Resolution and rollout").
 - **Zero dependencies.** The PUBLISHED surface — `lib/`, the hook engines
   (`scripts/engines/` + `bin/spor-hook.js`), shipped `skills/`, and `adapters/`
   — is plain Node (no npm install, node builtins + the git binary only). Keep

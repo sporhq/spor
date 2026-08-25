@@ -239,9 +239,10 @@ member-of-program <umbrella>`) so it renders precisely instead of by
 inference. Migrate an umbrella's membership all at once — declaring one
 member and leaving the rest to fall back on `blocks` makes those others read
 as "blocking but outside the program" rather than silently staying members.
-(`member-of-program` is a graph-resident schema pending activation in some
-graphs — `spor schema member-of-program` shows whether writes of it validate
-yet in yours; see /spor:spor.)
+(`member-of-program` is a graph-resident schema pending adoption/activation in
+some graphs — `spor schema member-of-program` shows whether writes of it
+validate yet in yours, and `spor schema adopt schema-edge-member-of-program`
+writes it into a graph that lacks it; see /spor:spor.)
 
 ## 7. Make ready → close the agent-readiness gaps a coding agent would hit
 

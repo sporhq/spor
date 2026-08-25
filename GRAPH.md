@@ -425,6 +425,20 @@ warns). A schema node goes through the same propose→activate flow it governs �
 bump the CalVer and add an `upgrades` chain only when the change is not
 backward-readable.
 
+Rollout-stage schemas the *product* ships ride the **candidate pack**
+(`lib/seed/candidates/`): full schema-node markdown that travels with the npm
+package but never enters the registry until a graph adopts it as a
+graph-resident node — `spor schema candidates` lists each candidate's adoption
+state, `spor schema adopt <id>` writes it through the validated node surface
+(`status: proposed`; `--activate` is the trusted-admin form for solo/local
+graphs), stamping `adopted_from`/`adopted_sha` provenance. Re-running adopt
+after a package upgrade is CalVer-aware and idempotent: a pristine older copy
+(canonical hash — `schema_version` + body — still matching its stamp) upgrades
+in place with its status preserved; a locally modified or unstamped resident
+refuses without `--force`. When a candidate stabilizes it is promoted into the
+seed pack at a release; the resident copy then shadows the seed (the
+stale-override warning above) and should be retired (`status: retired`).
+
 A complete worked example — a `escalation` type with a required `severity`
 field (enforced in `validate`) and an `open → mitigated → closed` status machine
 whose terminal `closed` demands a resolver (enforced in `transitions`):
@@ -1128,9 +1142,12 @@ program keeps rendering. The preference is all-or-nothing at a node — declare
 every member of an umbrella in one write, or the undeclared rest read as
 "blocking but outside the program" rather than silently dropping. It ships as
 a graph-resident schema node (`schema-edge-member-of-program`), not the seed
-pack, so it needs a *different* identity to activate it (the standing
-propose→activate flow above) before writes of this edge type validate; check
-`spor schema member-of-program` for its live status rather than assuming.
+pack — delivered as a packaged candidate (`spor schema adopt
+schema-edge-member-of-program` writes it into a graph that doesn't have it
+yet; see "Resolution and rollout" above) — so it needs activation (a
+*different* identity in team graphs; `--activate` in solo/local ones) before
+writes of this edge type validate; check `spor schema member-of-program` for
+its live status rather than assuming.
 `capturable: false` — the distiller and capture nudge never emit it; only a
 person or an agent working the program explicitly wires membership.
 
