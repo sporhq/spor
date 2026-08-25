@@ -28,7 +28,7 @@ const path = require("node:path");
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const dispatchHarnesses = require("../lib/shell/dispatch-harnesses.js");
 const { getHarness, harnesses } = dispatchHarnesses;
-const { writeSpawnableNodeStub, pathWithOnlyGit } = require("./helpers/portable.js");
+const { writeSpawnableNodeStub, pathWithOnlyGit, pathWithOnlyGitAndNode } = require("./helpers/portable.js");
 
 function cleanEnv(extra = {}) {
   const env = {};
@@ -336,7 +336,11 @@ test("a dispatch whose launcher is only in the config cascade is NOT refused on 
 
   const result = run(
     ["dispatch", `task-${harness}`, "--dir", repo, "--profile", `profile-${harness}`, "--no-brief"],
-    { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGit(), OUTFILE: outfile }
+    // pathWithOnlyGitAndNode, not pathWithOnlyGit: the launcher must stay
+    // unresolvable on PATH (that is the point of the test) but the stub it
+    // launches is an env-node shebang script, which on the CI runner cannot
+    // find node beside git (issue-spor-dispatch-test-ci-node-shebang-path).
+    { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode(), OUTFILE: outfile }
   );
   assert.strictEqual(result.status, 0, `${result.stderr}\n${result.stdout}`);
   assert.doesNotMatch(result.stderr, /can't satisfy profile/);

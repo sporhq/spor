@@ -1,6 +1,7 @@
 "use strict";
 
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 
@@ -70,6 +71,31 @@ function pathWithOnlyGit() {
   return git ? path.dirname(git) : process.env.PATH || "";
 }
 
+// PATH for tests that must hide every real launcher from resolution while
+// still letting a `#!/usr/bin/env node` stub execute: git's dir plus a
+// scratch dir holding ONLY a `node` link to the running interpreter. Needed
+// because pathWithOnlyGit() alone is environment-dependent — on a dev box
+// node often sits beside git in /usr/bin so shebangs resolve anyway, but on
+// the CI runner node lives in the hostedtoolcache dir and a detached stub
+// dies instantly (issue-spor-dispatch-test-ci-node-shebang-path). On Windows
+// the stubs are .cmd wrappers naming process.execPath absolutely, so the
+// node entry is unnecessary but harmless.
+function pathWithOnlyGitAndNode() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-nodebin-"));
+  const target = path.join(dir, process.platform === "win32" ? "node.exe" : "node");
+  try {
+    fs.symlinkSync(process.execPath, target);
+  } catch {
+    try {
+      fs.copyFileSync(process.execPath, target);
+      fs.chmodSync(target, 0o755);
+    } catch {
+      /* fall through — callers get git-only PATH, same as before */
+    }
+  }
+  return `${pathWithOnlyGit()}${path.delimiter}${dir}`;
+}
+
 module.exports = {
   ROOT,
   HOOK_JS,
@@ -80,4 +106,5 @@ module.exports = {
   writeSpawnableNodeStub,
   writeFakePathBin,
   pathWithOnlyGit,
+  pathWithOnlyGitAndNode,
 };
