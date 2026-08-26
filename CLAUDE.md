@@ -558,7 +558,34 @@ re-uploading caps (task-spor-fleet-scheduler-client-heartbeat-tick), gated on th
 SAME `dispatch.agent` opt-in, throttled by `dispatch.heartbeatIntervalMs`
 (`SPOR_HEARTBEAT_INTERVAL`, default 5min), bounded by `dispatch.heartbeatTimeoutMs`
 (`SPOR_HEARTBEAT_TIMEOUT`, default 3s), and disabled by `SPOR_HEARTBEAT=0`
-(`dispatch.heartbeat:false`). Server-side ops vars
+(`dispatch.heartbeat:false`).
+**The work loop (task-spor-work-loop):** `spor work` is the pull-based
+continuous worker over the queue — poll, dispatch, await the TERMINAL state,
+repeat — and is a GENERALIZATION of `spor dispatch --from-queue`, never a second
+dispatcher: selection is the shared `dispatchableQueuePage()` and every launch
+goes through `cmdDispatch` (so all its guards, the auto-claim, worktree
+isolation, the supervisor, the run record and the terminal-state contract apply
+unchanged and can never drift). The loop machine is `lib/shell/work-loop.js`,
+dependency-injected so it drives with a fake clock/queue/dispatcher; `cmdWork`
+in `bin/spor.js` is the wiring. Two things it owns beyond dispatch: a slot frees
+only when the RUN RECORD goes terminal (not when a launcher returns), and any
+item that was refused — or whose run ended WITHOUT resolving, which hands the
+lease back and returns it to the pool — cools off for `work.retryAfterMs` so the
+worker walks down the queue instead of re-dispatching one node every poll. The
+refusal REASON is the refusal's own first stderr line, captured through the
+`ERR_TEE` sink in `bin/spor.js` rather than by teaching a dozen guard sites to
+report themselves twice; `cmdDispatch`'s optional third arg (`ctx.onLaunch`)
+reports the run id the exit code can't carry. It never passes `--force` (a loop
+that forces past the duplicate/resolved guards is the runaway a pull worker must
+not be), and a worker never claims a `readiness: human` item even though
+one-shot dispatch only warns on the non-`requires:human` half (WORKERS.md §3).
+Knobs: `work.concurrency` (1), `work.intervalMs` (30s), `work.maxIntervalMs`
+(the idle backoff ceiling, 5min), `work.retryAfterMs` (10min),
+`work.project` (falls back to `queue.project`). Status is machine-local under
+`journal/work/<worker>.work.json`, read back by `spor work --status [--json]` (a
+worker whose pid is gone reads STALE, never running). v1 is BARE — dispatch-only;
+task-spor-work-gate-pipeline layers gates in between claim and resolve. See
+test/work-loop.test.js. Server-side ops vars
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard
 (`SPOR_DISTILLING`) are deliberately NOT config — they stay pure env.

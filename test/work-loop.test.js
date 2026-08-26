@@ -1,0 +1,494 @@
+// `spor work` — the pull-based continuous worker loop over the queue
+// (task-spor-work-loop). Two layers:
+//
+//   1. the LOOP itself (lib/shell/work-loop.js), driven with a fake clock, a
+//      fake queue and a fake dispatcher — slot accounting, terminal-state
+//      harvesting, refusal cooldowns, backoff, the stop paths, and the status
+//      store;
+//   2. the CLI wiring, end to end against a real (declared, fake) harness in a
+//      scratch graph home — never the live graph (norm-cc-scratch-home-for-tests).
+//
+// The one thing these must keep proving is that the loop adds NO eligibility
+// rule of its own beyond "not human-readiness, not already in flight here":
+// every refusal is `spor dispatch`'s, reached by calling it.
+require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
+const test = require("node:test");
+const assert = require("node:assert");
+const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const CLI = path.join(__dirname, "..", "bin", "spor.js");
+const workLoop = require("../lib/shell/work-loop.js");
+const { writeSpawnableNodeStub, pathWithOnlyGitAndNode } = require("./helpers/portable");
+
+// ---------------------------------------------------------------- the loop --
+
+// A driver that runs the loop with no real clock, no real queue and no real
+// dispatch: `queue` is the page each poll returns, `dispatch` decides ok/refused
+// per item, and every launched run stays non-terminal until `finish()` says so.
+function harness({ queue = [], dispatch = () => ({ ok: true }), onTick = () => {}, opts = {}, maxPasses = 20 } = {}) {
+  const state = {
+    clock: 1_700_000_000_000,
+    sleeps: [],
+    dispatched: [],
+    polls: 0,
+    runs: new Map(), // run_id -> record ({terminal:false} until finish() says otherwise)
+    log: [],
+    published: [],
+  };
+  const control = { stopping: false, reason: null, wake: () => {} };
+  let seq = 0;
+  const deps = {
+    now: () => state.clock,
+    log: (l) => state.log.push(l),
+    publish: (s) => state.published.push(JSON.parse(JSON.stringify(s))),
+    candidates: async () => {
+      state.polls += 1;
+      const page = typeof queue === "function" ? queue(state) : queue;
+      if (page === null) throw new Error("queue unreachable");
+      return page;
+    },
+    dispatch: async (item) => {
+      const verdict = dispatch(item, state);
+      if (!verdict || !verdict.ok) return { ok: false, reason: (verdict && verdict.reason) || "refused" };
+      const runId = `run-${++seq}`;
+      state.runs.set(runId, { run_id: runId, node_id: item.id, state: "running", harness: "fake" });
+      state.dispatched.push({ id: item.id, run_id: runId });
+      return { ok: true, run: { run_id: runId, harness: "fake", launch_mode: "supervised-jsonl" } };
+    },
+    pollRuns: async (ids) =>
+      ids.map((id) => {
+        const rec = state.runs.get(id);
+        return { run_id: id, terminal: !!(rec && rec.terminal), record: rec };
+      }),
+    // The sleep is where the fake world moves: a test's onTick decides what
+    // happened while the worker waited (a run finished, a stop was requested).
+    // Driving it from here keeps every case deterministic — a real timer would
+    // never fire, since the loop only ever awaits already-resolved promises.
+    sleep: async (ms) => {
+      state.sleeps.push(ms);
+      state.clock += ms;
+      onTick(state, state.sleeps.length);
+      if (state.sleeps.length >= maxPasses) {
+        control.stopping = true;
+        control.reason = control.reason || "stopped by the test driver";
+      }
+    },
+  };
+  state.finish = (runId, patch) => {
+    const rec = state.runs.get(runId) || { run_id: runId };
+    state.runs.set(runId, { ...rec, terminal: true, state: "done", ...patch });
+  };
+  state.finishAll = (patch) => {
+    for (const id of state.runs.keys()) if (!state.runs.get(id).terminal) state.finish(id, patch);
+  };
+  state.run = () =>
+    workLoop.runWorkLoop({
+      opts: { workerId: "worker-test", pid: 4242, intervalMs: 1000, maxIntervalMs: 16000, retryAfterMs: 10000, ...opts },
+      control,
+      deps,
+    });
+  state.control = control;
+  return state;
+}
+
+test("a slot is held until the RUN goes terminal, then refilled from the queue", async () => {
+  const h = harness({
+    // A claimed item leaves the pool, as the real queue's lease filter makes it.
+    queue: (state) => {
+      const taken = new Set(state.dispatched.map((d) => d.id));
+      return [{ id: "task-a", readiness: "agent" }, { id: "task-b", readiness: "agent" }].filter((i) => !taken.has(i.id));
+    },
+    opts: { concurrency: 1, max: 2 },
+    // Nothing finishes on the first wait, so the second item must NOT start.
+    onTick: (state, pass) => {
+      if (pass >= 2) state.finish("run-1", { terminal_state: "resolved", terminal_enforced: true, resolved_by: "dec-done" });
+    },
+  });
+  const status = await h.run();
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-a", "task-b"], "the second item waits for the first slot to free");
+  assert.strictEqual(status.dispatched, 2);
+  assert.strictEqual(status.outcomes.resolved, 1);
+});
+
+test("a run that ends WITHOUT resolving cools its node off — the pool gets it back, this worker does not spin on it", async () => {
+  const h = harness({
+    // The item returns to the pool the moment its lease is released, exactly
+    // as the terminal-state contract intends (it now carries a report).
+    queue: [{ id: "task-a" }],
+    opts: { concurrency: 1, retryAfterMs: 60000 },
+    maxPasses: 4,
+    onTick: (state) =>
+      state.finishAll({ terminal_state: "reported", terminal_enforced: true, report_node_id: "art-dispatch-report-a-9f8e7d6c" }),
+  });
+  const status = await h.run();
+  assert.strictEqual(status.dispatched, 1, "one attempt, not one per poll");
+  assert.strictEqual(status.skipped.length, 1);
+  assert.strictEqual(status.skipped[0].id, "task-a");
+  assert.match(status.skipped[0].reason, /ended reported \(report art-dispatch-report-a-9f8e7d6c\)/);
+});
+
+test("a run whose record has vanished frees its slot, with no verdict invented for it", async () => {
+  const h = harness({
+    queue: [{ id: "task-a" }, { id: "task-b" }],
+    opts: { concurrency: 1, max: 2 },
+    maxPasses: 5,
+    // The store no longer holds the run: terminal, but with nothing to judge.
+    onTick: (state) => state.finishAll({ state: "missing", terminal_state: undefined }),
+  });
+  const status = await h.run();
+  assert.strictEqual(status.dispatched, 2, "the slot is freed, so the queue keeps moving");
+  assert.deepStrictEqual(status.outcomes, { resolved: 0, reported: 0, failed: 0, unenforced: 0 }, "a missing record is not evidence of any outcome");
+  assert.strictEqual(status.recent[0].terminal_state, null);
+  assert.ok(status.skipped.some((s) => s.id === "task-a"), "and the node cools off like any other unresolved run");
+});
+
+test("concurrency N fills N slots in one pass and never exceeds them", async () => {
+  const h = harness({
+    queue: [
+      { id: "task-a", readiness: "agent" },
+      { id: "task-b", readiness: "agent" },
+      { id: "task-c", readiness: "agent" },
+    ],
+    opts: { concurrency: 2 },
+    maxPasses: 3,
+  });
+  const status = await h.run();
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-a", "task-b"]);
+  assert.strictEqual(status.active.length, 2, "both runs are still in flight when the worker stops");
+  assert.strictEqual(status.dispatched, 2);
+});
+
+test("the outcome is READ off the run record — an unenforced verdict is counted apart", async () => {
+  const h = harness({
+    queue: [{ id: "task-a" }],
+    opts: { concurrency: 1, max: 1 },
+    maxPasses: 4,
+    onTick: (state) =>
+      state.finishAll({
+        terminal_state: "reported",
+        terminal_enforced: false,
+        report_node_id: "art-dispatch-report-a-1234abcd",
+        terminal_note: "no team graph configured",
+      }),
+  });
+  const status = await h.run();
+  assert.strictEqual(status.outcomes.reported, 1);
+  assert.strictEqual(status.outcomes.unenforced, 1, "an unenforced verdict must not read as a verified one");
+  assert.strictEqual(status.outcomes.resolved, 0);
+  assert.strictEqual(status.recent[0].report_node_id, "art-dispatch-report-a-1234abcd");
+  assert.strictEqual(status.recent[0].node_id, "task-a");
+});
+
+test("a refused item is skipped with its own reason, the loop advances, and it cools off", async () => {
+  const h = harness({
+    queue: [{ id: "task-refused" }, { id: "task-ok" }],
+    dispatch: (item) =>
+      item.id === "task-refused"
+        ? { ok: false, reason: "cannot dispatch task-refused here: this machine can't satisfy profile profile-gpu" }
+        : { ok: true },
+    opts: { concurrency: 1, max: 1 },
+    maxPasses: 3,
+  });
+  const status = await h.run();
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-ok"], "a refusal advances down the page, it does not stop the pass");
+  assert.strictEqual(status.skipped.length, 1);
+  assert.match(status.skipped[0].reason, /can't satisfy profile profile-gpu/);
+  assert.strictEqual(status.skipped[0].id, "task-refused");
+});
+
+test("a cooled-off item is not re-attempted until its retry window passes", async () => {
+  let attempts = 0;
+  const h = harness({
+    queue: [{ id: "task-refused" }],
+    dispatch: () => {
+      attempts += 1;
+      return { ok: false, reason: "refused" };
+    },
+    opts: { concurrency: 1, retryAfterMs: 5000 },
+    maxPasses: 4, // sleeps of 1s, 2s, 4s, 8s => the clock passes 5s on the third
+  });
+  await h.run();
+  assert.strictEqual(attempts, 2, "one attempt, then one more only after the cooldown expired");
+});
+
+test("a human-readiness item is never a candidate — a worker does not claim what needs a person", async () => {
+  const h = harness({
+    queue: [{ id: "task-human", readiness: "human", readiness_reasons: ["requires human"] }, { id: "task-agent", readiness: "agent" }],
+    opts: { concurrency: 2 },
+    maxPasses: 2,
+  });
+  await h.run();
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-agent"]);
+});
+
+test("backoff doubles over idle passes and resets the moment work is dispatched", async () => {
+  let pass = 0;
+  const h = harness({
+    queue: () => (++pass === 4 ? [{ id: "task-late" }] : []),
+    opts: { concurrency: 1 },
+    maxPasses: 6,
+  });
+  await h.run();
+  // idle, idle, idle -> 1s, 2s, 4s; the pass that dispatches goes back to 1s.
+  assert.deepStrictEqual(h.sleeps.slice(0, 4), [1000, 2000, 4000, 1000]);
+});
+
+test("backoff is capped, and an unreachable queue backs off instead of crashing the worker", async () => {
+  const h = harness({ queue: () => null, opts: { concurrency: 1 }, maxPasses: 7 });
+  const status = await h.run();
+  assert.deepStrictEqual(h.sleeps, [1000, 2000, 4000, 8000, 16000, 16000, 16000], "capped at maxIntervalMs");
+  assert.strictEqual(status.dispatched, 0);
+  assert.strictEqual(status.stopped_at != null, true, "a dead server ends in a clean stop, never a throw");
+});
+
+test("--max stops the worker once it has dispatched that many, after they finish", async () => {
+  const h = harness({
+    queue: [{ id: "a" }, { id: "b" }, { id: "c" }],
+    opts: { concurrency: 3, max: 2 },
+    maxPasses: 6,
+    onTick: (state) => state.finishAll({ terminal_state: "failed", terminal_enforced: true }),
+  });
+  const status = await h.run();
+  assert.strictEqual(status.dispatched, 2);
+  assert.match(status.stop_reason, /--max/);
+  assert.strictEqual(status.outcomes.failed, 2);
+});
+
+test("--once dispatches one pass, drains it, and stops without picking up more", async () => {
+  let pass = 0;
+  const h = harness({
+    queue: () => {
+      pass += 1;
+      return [{ id: `task-${pass}` }];
+    },
+    opts: { concurrency: 1, once: true },
+    maxPasses: 6,
+    onTick: (state) => state.finishAll({ terminal_state: "resolved", terminal_enforced: true }),
+  });
+  const status = await h.run();
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-1"], "--once never starts a second round");
+  assert.match(status.stop_reason, /--once/);
+  assert.strictEqual(status.outcomes.resolved, 1);
+});
+
+test("--once with an empty queue exits immediately rather than waiting a poll interval", async () => {
+  const h = harness({ queue: [], opts: { concurrency: 1, once: true }, maxPasses: 5 });
+  const status = await h.run();
+  assert.deepStrictEqual(h.sleeps, [], "nothing to do and nothing in flight: no sleep at all");
+  assert.strictEqual(status.dispatched, 0);
+});
+
+test("a stop request ends the loop and leaves in-flight runs recorded, not abandoned silently", async () => {
+  const h = harness({
+    queue: [{ id: "task-a" }],
+    opts: { concurrency: 1 },
+    maxPasses: 8,
+    onTick: (state) => {
+      state.control.stopping = true;
+      state.control.reason = "stopped on SIGTERM";
+      state.control.wake();
+    },
+  });
+  const status = await h.run();
+  assert.strictEqual(status.stop_reason, "stopped on SIGTERM");
+  assert.strictEqual(status.active.length, 1, "the detached run is still named on the status so it can be followed");
+  assert.strictEqual(status.state, "stopped");
+  assert.strictEqual(h.sleeps.length, 1, "the stop lands at the next boundary, not after another full pass");
+});
+
+test("nextBackoffMs: never below the interval, never above the ceiling, immune to nonsense", () => {
+  assert.strictEqual(workLoop.nextBackoffMs(1000, 8000, 0), 1000);
+  assert.strictEqual(workLoop.nextBackoffMs(1000, 8000, 3), 8000);
+  assert.strictEqual(workLoop.nextBackoffMs(1000, 8000, 999), 8000, "a huge miss count saturates, it does not overflow");
+  assert.strictEqual(workLoop.nextBackoffMs(0, 0, 0), 30000, "a nonsense interval falls back to the default rather than spinning");
+  assert.strictEqual(workLoop.nextBackoffMs(5000, 1000, 0), 5000, "a ceiling below the interval is raised to it");
+});
+
+test("selectWorkCandidates: excludes in-flight, human-readiness and cooling-off items, keeping queue order", () => {
+  const items = [{ id: "a" }, { id: "b", readiness: "human" }, { id: "c" }, { id: "d" }];
+  const got = workLoop.selectWorkCandidates(items, {
+    active: new Set(["c"]),
+    skipped: new Map([["d", { until: 500 }]]),
+    now: 100,
+  });
+  assert.deepStrictEqual(got.map((i) => i.id), ["a"]);
+  // …and an EXPIRED cooldown is a candidate again.
+  const later = workLoop.selectWorkCandidates(items, { skipped: new Map([["d", { until: 500 }]]), now: 900 });
+  assert.deepStrictEqual(later.map((i) => i.id), ["a", "c", "d"]);
+});
+
+test("refusalReason takes the refusal's own first line, bounded", () => {
+  assert.strictEqual(workLoop.refusalReason(["  first line ", "remediation"]), "first line");
+  assert.strictEqual(workLoop.refusalReason([], "fallback"), "fallback");
+  assert.strictEqual(workLoop.refusalReason(["x".repeat(500)]).length, 300);
+});
+
+// --------------------------------------------------------- the status store --
+
+test("status store: round-trips, marks a dead worker stale, and ages records out", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-status-"));
+  const live = { worker_id: "aaaa", pid: 111, state: "polling", started_at: "2026-08-26T10:00:00.000Z", updated_at: "2026-08-26T10:00:00.000Z" };
+  const dead = { worker_id: "bbbb", pid: 222, state: "waiting", started_at: "2026-08-26T09:00:00.000Z", updated_at: "2026-08-26T09:00:00.000Z" };
+  const stopped = { worker_id: "cccc", pid: 333, state: "stopped", started_at: "2026-08-26T08:00:00.000Z", stopped_at: "2026-08-26T08:30:00.000Z" };
+  for (const s of [live, dead, stopped]) assert.strictEqual(workLoop.writeWorkerStatus(home, s), true);
+
+  const now = () => Date.parse("2026-08-26T11:00:00.000Z");
+  const read = workLoop.readWorkerStatuses(home, { alive: (pid) => pid === 111, now });
+  const byId = new Map(read.map((r) => [r.worker_id, r]));
+  assert.strictEqual(byId.get("aaaa").live, true);
+  assert.strictEqual(byId.get("aaaa").stale, false);
+  assert.strictEqual(byId.get("bbbb").stale, true, "a worker whose process is gone must not read as running");
+  assert.strictEqual(byId.get("cccc").stale, false, "a cleanly stopped worker is stopped, not stale");
+  assert.deepStrictEqual(read.map((r) => r.worker_id), ["aaaa", "bbbb", "cccc"], "newest first");
+
+  // Well past the retention window: the finished records are removed, the live one stays.
+  const later = () => Date.parse("2026-09-26T11:00:00.000Z");
+  const pruned = workLoop.readWorkerStatuses(home, { alive: (pid) => pid === 111, now: later });
+  assert.deepStrictEqual(pruned.map((r) => r.worker_id), ["aaaa"]);
+  assert.strictEqual(fs.readdirSync(workLoop.workDir(home)).length, 1);
+});
+
+test("status store: a mangled record is skipped, not fatal, and a missing dir reads empty", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-status-bad-"));
+  assert.deepStrictEqual(workLoop.readWorkerStatuses(home), []);
+  fs.mkdirSync(workLoop.workDir(home), { recursive: true });
+  fs.writeFileSync(path.join(workLoop.workDir(home), "half.work.json"), "{not json");
+  workLoop.writeWorkerStatus(home, { worker_id: "good", pid: process.pid, started_at: "2026-08-26T10:00:00.000Z" });
+  assert.deepStrictEqual(workLoop.readWorkerStatuses(home).map((r) => r.worker_id), ["good"]);
+});
+
+// ------------------------------------------------------------------- the CLI --
+
+const HARNESS = "workfake";
+
+function cleanEnv(extra = {}) {
+  const env = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (key.startsWith("SPOR_") || key.startsWith("SUBSTRATE_") || key === "XDG_CONFIG_HOME") continue;
+    env[key] = value;
+  }
+  return { ...env, SPOR_FAKE_AGENTS_JSON: "[]", ...extra };
+}
+
+function cli(args, env, cwd) {
+  return spawnSync(process.execPath, [CLI, ...args], { cwd, env: cleanEnv(env), encoding: "utf8", timeout: 60000 });
+}
+
+// A scratch graph home whose queue holds one agent-ready task, one that
+// requires a human, and one already resolved — plus a profile selecting a fake
+// harness this machine declares. The point is that `spor work` picks exactly
+// the first, with dispatch's own guards deciding the rest.
+function cliFixture({ declaration = true } = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-home-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-repo-"));
+  const node = (id, extra, body) =>
+    fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\ntype: task\nrepo: demo\n${extra}date: 2026-08-20\n---\n${body}\n`);
+  node("task-ready", "title: Add bounded retry to the sync worker\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: open\nedges:\n  - {type: assigned, to: agent-workbox, profile: profile-work}\n", "Add bounded retry to the sync worker.");
+  node("task-needs-human", "title: Decide the retention policy for sync worker logs\nsummary: Decide how long the sync worker keeps its logs, a policy call with legal input.\nstatus: open\nrequires: [human]\n", "Needs a person.");
+  node("task-done", "title: Ship the sync worker skeleton\nsummary: The sync worker skeleton shipped, with its first end-to-end run recorded.\nstatus: done\n", "Already done.");
+  fs.writeFileSync(path.join(nodes, "agent-workbox.md"), `---\nid: agent-workbox\ntype: agent\ntitle: The work loop test box\nsummary: An agent identity for the work-loop test fixture, owned by the test person.\ndate: 2026-08-20\n---\nTest agent.\n`);
+  fs.writeFileSync(path.join(nodes, "profile-work.md"), `---\nid: profile-work\ntype: profile\ntitle: Work loop test profile\nsummary: A profile selecting the fake harness the work-loop test declares locally.\nharness: ${HARNESS}\ndate: 2026-08-20\n---\nTest profile.\n`);
+
+  const stub = writeSpawnableNodeStub(home, "work-stub", `
+const fs = require("node:fs");
+let prompt = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (c) => { prompt += c; });
+process.stdin.on("end", () => {
+  fs.appendFileSync(process.env.WORK_OUTFILE, JSON.stringify({ cwd: process.cwd(), prompt }) + "\\n");
+  process.stdout.write(JSON.stringify({ kind: "message", message: { text: "fake worker report" } }) + "\\n");
+  process.exit(0);
+});
+`);
+  const cfg = { dispatch: { repos: { demo: repo } } };
+  if (declaration) {
+    cfg.dispatch.harness = {
+      [HARNESS]: { command: stub, args: ["--dir={cwd}"], label: "Work Fake", report: { from: "lastText", text: "message.text" } },
+    };
+  }
+  fs.writeFileSync(path.join(home, "config.json"), `${JSON.stringify(cfg, null, 2)}\n`);
+  return { home, repo, nodes, outfile: path.join(home, "invocations.jsonl") };
+}
+
+test("spor work --print previews scope, pacing and candidates, and launches nothing", () => {
+  const { home, outfile } = cliFixture();
+  const r = cli(["work", "--print"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^project: \(all projects\)$/m);
+  assert.match(r.stdout, /concurrency 1, interval 30s, backoff to 300s/);
+  assert.match(r.stdout, /-> task-ready/);
+  assert.doesNotMatch(r.stdout, /task-needs-human/, "a human-readiness item is never a candidate");
+  assert.doesNotMatch(r.stdout, /task-done/, "a resolved item is not in the live queue at all");
+  assert.ok(!fs.existsSync(outfile), "nothing was launched");
+});
+
+test("spor work --once --max 1 dispatches through the real guards, waits for the run, and reports the outcome", async () => {
+  const { home, repo, outfile } = cliFixture();
+  const r = cli(
+    ["work", "--once", "--max", "1", "--interval", "1", "--no-brief"],
+    { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() }
+  );
+  assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
+  assert.match(r.stdout, /work: dispatched task-ready/);
+  assert.match(r.stdout, /work: task-ready finished/);
+  assert.match(r.stdout, /dispatched 1;/);
+
+  const invocations = fs.readFileSync(outfile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.strictEqual(invocations.length, 1, "exactly one launch, into the mapped repo");
+  assert.strictEqual(invocations[0].cwd, repo);
+  assert.match(invocations[0].prompt, /task-ready/);
+
+  // The run record carries the outcome dimension, and the loop read it rather
+  // than inventing one: local mode can never be `resolved` (nothing to verify).
+  const runsJson = cli(["runs", "--json"], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  const runs = JSON.parse(runsJson.stdout).runs;
+  assert.strictEqual(runs.length, 1);
+  assert.strictEqual(runs[0].node_id, "task-ready");
+  assert.strictEqual(runs[0].terminal_enforced, false, "local mode has no graph to verify against");
+
+  const status = JSON.parse(cli(["work", "--status", "--json"], { SPOR_HOME: home, XDG_CONFIG_HOME: home }).stdout);
+  assert.strictEqual(status.count, 1);
+  const w = status.workers[0];
+  assert.strictEqual(w.dispatched, 1);
+  assert.strictEqual(w.active.length, 0, "the slot was freed when the run went terminal");
+  assert.strictEqual(w.recent[0].node_id, "task-ready");
+  assert.strictEqual(w.recent[0].run_id, runs[0].run_id);
+  assert.match(w.stop_reason, /--max|--once/);
+  assert.strictEqual(w.stale, false, "a worker that stopped cleanly is stopped, not stale");
+});
+
+test("a dispatch refusal is recorded with its own reason and the worker stops instead of spinning", () => {
+  // No declaration for the harness the profile selects: this machine cannot
+  // launch it, so `spor dispatch` refuses — and the loop must record WHY
+  // rather than retry it in a tight loop.
+  const { home, outfile } = cliFixture({ declaration: false });
+  const r = cli(
+    ["work", "--once", "--interval", "1", "--no-brief"],
+    { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() }
+  );
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /work: skipping task-ready — /);
+  assert.match(r.stdout, /dispatched 0;/);
+  assert.ok(!fs.existsSync(outfile), "a refused item is never launched");
+
+  const status = JSON.parse(cli(["work", "--status", "--json"], { SPOR_HOME: home, XDG_CONFIG_HOME: home }).stdout);
+  const skipped = status.workers[0].skipped;
+  assert.strictEqual(skipped.length, 1);
+  assert.strictEqual(skipped[0].id, "task-ready");
+  assert.match(skipped[0].reason, /task-ready/, "the refusal's own first line is the reason");
+  assert.ok(Date.parse(skipped[0].until) > Date.now(), "and it is cooling off, not dropped");
+});
+
+test("spor work --status with nothing recorded says so, in both renderings", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-empty-"));
+  const text = cli(["work", "--status"], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.strictEqual(text.status, 0);
+  assert.match(text.stdout, /no spor work loops recorded/);
+  const json = cli(["work", "--status", "--json"], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.deepStrictEqual(JSON.parse(json.stdout), { count: 0, workers: [] });
+});

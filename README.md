@@ -308,6 +308,59 @@ reaching the graph is not.
 `spor runs` prints the outcome (tagging `(unenforced)`), the note, and the report
 artifact id; `spor runs --json` carries the same fields on each record.
 
+### Working the queue continuously
+
+`spor dispatch` does one item. `spor work` does them all: it polls the queue,
+takes the items this machine may actually run, dispatches each one under its
+routed profile, waits for its **terminal state**, and goes round again.
+
+```bash
+spor work                                   # work the whole queue, one run at a time
+spor work --project spor --concurrency 2    # two runs in flight, scoped to one project
+spor work --once --print                    # show scope, pacing and candidates; launch nothing
+```
+
+It is pull, not push: nothing schedules a worker, it takes work. That is safe
+because the claim is a server-held lease with a per-launch nonce — two workers
+racing for one node end with one claim and one refusal, and a worker that dies
+drops its lease by lapsing. Capabilities stay machine-local facts and the fleet
+scheduler stays advisory, so a worker that cannot reach the scheduler degrades
+to "work the queue with what I have" rather than stopping.
+
+It adds no guards of its own. Every launch goes through the same code path as
+`spor dispatch --node <id>`, so already-resolved, `requires: human`, a profile
+this box cannot satisfy (never substituted), a profile that tries to declare
+what to execute, the same-machine duplicate guard, the auto-claim, worktree
+isolation and the terminal-state contract all apply exactly as they do one-shot.
+Selection is the same filtered page `--from-queue` picks its one item from,
+minus anything whose derived readiness is `human` — a worker never claims work
+meant for a person — and minus anything already in flight on this machine. An
+item that is refused, or whose run ended without resolving it, is remembered
+with the reason and retried after `--retry-after` instead of being re-attempted
+on the next poll.
+
+A slot frees when the **run record** goes terminal, not when a launcher returns
+— by then the outcome contract has filed the report and released or held the
+lease. Stopping (`SIGINT`/`SIGTERM`, or `--once`/`--max`) stops picking up new
+work; runs already in flight are detached, keep going, and self-report through
+`spor runs`.
+
+Run it as a service and read it back:
+
+```bash
+spor work --status          # every worker on this box: slots, outcomes, what it is skipping and why
+spor work --status --json
+```
+
+Records live under the machine-local journal; a worker whose process is gone
+reads as stale, never as running. The `work.*` config keys (`concurrency`,
+`intervalMs`, `maxIntervalMs`, `retryAfterMs`, `project`) let a unit file be a
+bare `spor work`.
+
+v1 runs bare by design — dispatch-only, no gates. The deterministic gate
+pipeline layers in between claim and resolve when a factory definition
+resolves, so adoption has no cliff.
+
 ### Choosing a harness
 
 By default, `spor dispatch` launches a Claude Code agent (`claude --bg`). To
