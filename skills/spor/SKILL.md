@@ -400,6 +400,7 @@ to them rather than improvising:
 | See what to work on next | **/spor:next** | "what's next / my queue / the backlog", triage |
 | Fix a briefing that was wrong, missing, or stale | **/spor:correct** | "the briefing was wrong / missed / included junk" |
 | Bootstrap a repo's graph, or group repos into projects | **/spor:backfill** | onboarding a repo, "organize my repos" |
+| Define what has to be true before agent work counts as done | **/spor:factory** | "set up a factory / quality gates", "why did the last three fail review" |
 | Read/write the team graph in Cowork (no hooks there) | **this skill** — MCP tools + `references/cowork.md` | any graph work in Cowork |
 
 If a request is just "which Spor thing do I use for X", answer from this table.

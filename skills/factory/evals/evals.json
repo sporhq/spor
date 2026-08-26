@@ -1,0 +1,41 @@
+{
+  "skill_name": "factory",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "My agents keep breaking checkout and I only find out when a customer emails us. I want them to have to prove they haven't broken it before their work counts as done.",
+      "expected_output": "Triggers factory, creation flow in the PRODUCT register: interviews for acceptance criteria (what must never break, the customer journey, the five-minute manual check), reads the repo (CI config, test dirs, CLAUDE.md) and the graph (norms, profiles, capabilities) BEFORE proposing, echoes an ordered pipeline for confirmation, then emits factory/gate/profile nodes via spor put-node after adopting schema-factory + schema-gate. Seeds a test-writer lane item because no black-box suite exists. Never runs a gate; hands off `spor work --factory <id>`.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Set up a gate pipeline for this repo: npm test from main, then a codex adversarial review with two fix cycles, and my approval on anything under lib/auth.",
+      "expected_output": "Triggers factory, creation flow in the ENGINEER register: proposes densely, emits a factory node whose JSON payload has the three gates in order (command / agent-review with cycles 2 / human keyed on a declared risk class covering lib/auth), declares protected_paths only alongside a test_lane_profile, and checks the review profile exists and is satisfiable (spor capabilities) before routing to it.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Why did the last three items fail the review gate? The reviews feel way too strict.",
+      "expected_output": "Triggers factory, MAINTENANCE flow: queries the art-gate-* artifact facts off the graph and quotes the actual findings rather than guessing, classifies the failures (real defects vs missing context vs miscalibrated severity vs unreadable verdict), then proposes the smallest evidence-backed edit — usually sharpening the gate's instructions — as a decision node carrying relates-to edges to the evidence, plus a revision-checked put-node on the factory. Never edits the definition silently.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "Run the acceptance suite against my branch and tell me whether it passes.",
+      "expected_output": "Should NOT trigger factory as a way to run anything — this skill authors data only. Running gates is `spor work`'s job (or just running the suite). If factory is loaded it should refuse the enforcement request and say where enforcement lives.",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "What's the difference between a decision node and an artifact node in spor?",
+      "expected_output": "Should NOT trigger factory — a conceptual question about the graph ontology, which is /spor:spor's references/concepts.md.",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "Can you defer this — we should really add rate limiting to the API before launch.",
+      "expected_output": "Should NOT trigger factory — that is /spor:defer capturing discovered work, not compiling a factory definition.",
+      "files": []
+    }
+  ]
+}

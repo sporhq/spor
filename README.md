@@ -200,6 +200,7 @@ In Claude Code, the main commands are:
 /spor:next       # show the next useful thing to work on
 /spor:onboard    # first-time setup
 /spor:backfill   # extend the graph from existing sources
+/spor:factory    # compile a factory: what has to be true before work counts as done
 ```
 
 From the shell, `spor status` is the first thing to run when something is unclear:
@@ -396,6 +397,14 @@ apart):
 Every gate outcome is written to the graph as a fact linked to the work item,
 and a factory that does not validate refuses to start the worker rather than
 letting it run ungated. [WORKERS.md](WORKERS.md) §10 is the full contract.
+
+You do not have to hand-write the definition. `/spor:factory` is the compiler:
+it interviews you — product questions if you are the owner, pipeline questions
+if you are the engineer — reads your CI config, suites and graph, proposes a
+pipeline, and emits the factory, its gates and the profiles they route to as
+nodes. It also maintains one from its own telemetry ("why did the last three
+fail review"), and seeds a test-writer lane when there is no acceptance suite
+to gate on yet. It authors data only; enforcement stays in `spor work`.
 
 ### Choosing a harness
 

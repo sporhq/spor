@@ -513,6 +513,16 @@ the two shapes identically**: a reference is unwrapped into exactly the object a
 inline gate would have been, with keys written beside the `ref` overriding it.
 The only visible difference is the provenance stamped on the recorded outcome.
 
+Writing one by hand is not the only door: the reference client ships a
+factory-builder skill (`/spor:factory`, `skills/factory/`) that compiles a
+definition from an operator interview plus a read of the repo, the graph and
+the machine's capabilities, and maintains it afterwards from the `art-gate-*`
+facts §10.6 leaves behind. It authors DATA only — the nodes below — and never
+enforces anything, which is the same split this section exists to keep: skills
+compile factories, code enforces them
+(dec-spor-software-factory-substrate). A third-party client needs no such
+skill; the node shapes here are the whole contract.
+
 A definition that cannot be read, or that does not validate, **refuses to start
 the worker** (exit 1, naming every problem). A mistyped factory must never
 produce a worker that silently accepts everything, so the validation is
