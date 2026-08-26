@@ -740,7 +740,33 @@ anything with a token.
   without publishing the bearer to argv — get the agent-scoped token as
   `SPOR_TOKEN` in the run's environment, so the `spor` CLI inside the run is
   agent-attributed with no injected MCP. All of them land at the same self-serve
-  mint/bind pair above.
+  mint/bind pair above. A **declared** harness (below) is `env-token` too, and
+  binds off whatever JSON path its declaration names.
+- **Declared custom harnesses — the graph names it, the machine binds it**
+  (task-spor-dispatch-declarative-custom-harness). A `profile` may select a
+  harness this client ships no adapter for; the profile then carries **only**
+  `harness: <id>`, and the id is bound to something executable by a
+  MACHINE-LOCAL declaration in the client config cascade,
+  `dispatch.harness.<id>` (machine-specific like `dispatch.bin.<harness>` and
+  `dispatch.repos`, so it belongs in the user `$SPOR_HOME/config.json`, never a
+  committable `.spor.json`). The declaration carries `command`, an `args`
+  template (`{cwd}` / `{report}` / `{model}` tokens), a `label`, report recovery
+  (`report: "lastText"` with a `report.text` JSON path into the harness's event
+  stream, or `report: "file"` when the harness writes the report itself at the
+  `{report}` path), and an optional `session` JSON path for the late-bind above.
+  Everything else is FIXED by v1 scope and naming it is an error: launch mode is
+  supervised-jsonl, the prompt goes on stdin, identity is `env-token`.
+  **A graph write must never define what a machine executes**, and that is
+  enforced on both sides: a profile node carrying any launch-defining field
+  (`command`, `args`, `argv`, `bin`, `exec`, `entrypoint`, `env`, `report`,
+  `session`, `launch_mode`, `identity_mode`) is refused outright by `spor
+  dispatch` rather than honoured or silently ignored, and a machine with no
+  local binding for the id fails satisfiability — refusing loudly, leaving the
+  assignment and its lease untouched, and (in team mode) naming the fleet hosts
+  that CAN run it. The capability probe adds valid declared ids to
+  `machine.harnesses`, so `spor capabilities` and the fleet publish above
+  reflect them; a declaration whose `command` does not resolve is not reported
+  as available.
 - **OAuth 2.1 for MCP connectors** (Cowork/claude.ai, which cannot carry a
   static bearer token): protected-resource metadata discovery (RFC 9728,
   advertised on the `/mcp` 401 via `WWW-Authenticate`), authorization-server

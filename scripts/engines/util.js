@@ -1084,10 +1084,18 @@ function probeHarnesses(cfg) {
   // dispatch to refuse on satisfiability for a launcher it had been told
   // about. Falls back to the active config for the hook engines, which do
   // install one.
-  const { harnessAvailable } = require(path.join(ROOT, "lib", "shell", "dispatch-harnesses.js"));
+  const { harnessAvailable, declaredHarnessIds } = require(path.join(ROOT, "lib", "shell", "dispatch-harnesses.js"));
   const resolved = cfg || config();
   const found = [];
-  for (const name of Object.keys(HARNESS_BINARIES)) {
+  // Built-ins first, in their shipped order; then this machine's own
+  // `dispatch.harness.<id>` bindings (task-spor-dispatch-declarative-custom-
+  // harness), so `spor capabilities` reflects a declared harness and an org
+  // profile naming one satisfies only on the boxes whose OWNER bound it. Each
+  // is checked the same way — the declared command must exist where it says,
+  // or resolve on PATH if it is a bare name — so declaring a harness whose
+  // launcher is absent does NOT report it available. A machine with no
+  // declarations answers exactly what it always did.
+  for (const name of Object.keys(HARNESS_BINARIES).concat(declaredHarnessIds(resolved))) {
     if (harnessAvailable(name, { cfg: resolved, which: whichSync })) found.push(name);
   }
   return found;

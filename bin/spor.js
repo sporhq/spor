@@ -538,7 +538,7 @@ function dispatchedAgents(cfg) {
       map.set(name, list);
     };
     const home = cfg && typeof cfg.userConfigHome === "function" ? cfg.userConfigHome() : u.userConfigHome();
-    for (const adapter of dispatchHarnesses.harnesses()) {
+    for (const adapter of dispatchHarnesses.harnesses({ cfg })) {
       const discovery = adapter.activeDiscovery || {};
       if (discovery.kind === "run-records") {
         for (const a of dispatchRuns.activeRuns(home)) {
@@ -7812,10 +7812,16 @@ function writePrivate(file, text) {
 
 // One argv entry as `--print` should show it: the launcher-supplied
 // placeholders read as what they stand for, everything else shell-quoted.
+function substitutePlaceholders(arg, { report, cwd }) {
+  let out = String(arg);
+  if (out.includes(dispatchHarnesses.REPORT_PLACEHOLDER)) out = out.split(dispatchHarnesses.REPORT_PLACEHOLDER).join(report);
+  if (out.includes(dispatchHarnesses.CWD_PLACEHOLDER)) out = out.split(dispatchHarnesses.CWD_PLACEHOLDER).join(cwd);
+  return out;
+}
+
 function renderLaunchArg(arg) {
-  if (arg === dispatchHarnesses.REPORT_PLACEHOLDER) return "<report-path>";
-  if (arg === dispatchHarnesses.CWD_PLACEHOLDER) return "<dir>";
-  return shellQuote(arg);
+  const rendered = substitutePlaceholders(arg, { report: "<report-path>", cwd: "<dir>" });
+  return rendered === arg ? shellQuote(arg) : rendered;
 }
 
 async function launchSupervisedHarness(cfg, {
@@ -7824,11 +7830,11 @@ async function launchSupervisedHarness(cfg, {
 }) {
   const runId = crypto.randomUUID();
   const p = dispatchRuns.runPaths(cfg.userConfigHome(), runId);
-  const runArgs = args.map((a) => {
-    if (a === dispatchHarnesses.REPORT_PLACEHOLDER) return p.report;
-    if (a === dispatchHarnesses.CWD_PLACEHOLDER) return cwd;
-    return a;
-  });
+  // Substring substitution, not equality: an in-code adapter always emits a
+  // placeholder as a WHOLE argv entry (so this is byte-identical for them), but
+  // a declared harness's argv template is hand-authored and may legitimately
+  // embed one — `--dir={cwd}` is a single argument to plenty of CLIs.
+  const runArgs = args.map((a) => substitutePlaceholders(a, { report: p.report, cwd }));
   const now = new Date().toISOString();
   const record = {
     run_id: runId,
@@ -7852,6 +7858,10 @@ async function launchSupervisedHarness(cfg, {
     cwd,
     record_path: p.record,
     prompt_path: p.prompt,
+    // Present only for a DECLARED harness (dispatch.harness.<id>): the
+    // supervisor has no registry entry to look up, so it rebuilds the adapter
+    // from exactly the declaration this launch resolved.
+    ...(adapter.declaration ? { harness_declaration: adapter.declaration } : {}),
     log_path: p.log,
     report_path: p.report,
     scratch_path: p.scratch,
@@ -8363,7 +8373,32 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
   const unsatisfiable = !!(profileCheck && profileCheck.verdict && !profileCheck.verdict.ok);
   const profileRuntime = (profileCheck && profileCheck.profile) || {};
   const harness = profileRuntime.harness || "claude-code";
-  const harnessAdapter = dispatchHarnesses.getHarness(harness);
+  // A graph write must never define what a machine executes
+  // (task-spor-dispatch-declarative-custom-harness). A profile selects a
+  // harness by NAME; the command, argv, environment and report/session
+  // recovery behind that name are bound machine-locally. A profile carrying
+  // any of those is refused outright — in --print too, so a preview never
+  // shows a launch the real run would reject.
+  const graphLaunch = sat.graphLaunchFields(profileRuntime);
+  if (graphLaunch.length) {
+    err(`cannot dispatch ${nodeId || name}: profile ${profileCheck && profileCheck.id ? profileCheck.id : harness} declares ${graphLaunch.map((k) => `'${k}'`).join(", ")}.`);
+    err(`  a graph write must never define what a machine executes — a profile names a harness, and this`);
+    err(`  machine binds what that name runs ('${sat.DECLARED_HARNESS_CONFIG_KEY}.<id>' in $SPOR_HOME/config.json).`);
+    err(`  remove ${graphLaunch.length > 1 ? "those fields" : "that field"} from the profile node; the assignment is unchanged.`);
+    return 1;
+  }
+  // Built-in adapter first; failing that, this machine's own declaration for
+  // the id. A declaration that exists but is unusable is reported as ITS OWN
+  // error rather than as "unsupported harness" — the operator wrote something,
+  // and needs to know what is wrong with it.
+  const harnessResolution = dispatchHarnesses.resolveHarness(harness, { cfg });
+  const harnessAdapter = harnessResolution.adapter;
+  if (harnessResolution.error && !dryRun) {
+    err(`cannot dispatch ${nodeId || name}: this machine's declaration for harness '${harness}' is unusable.`);
+    err(`  ${harnessResolution.error}`);
+    err(`  fix it in $SPOR_HOME/config.json; the assignment is unchanged.`);
+    return 1;
+  }
   const effectiveModel = model || profileRuntime.model || null;
   // Explicit-first launcher resolution (task-spor-dispatch-adapters-opencode-
   // copilot): the adapter consults its env override and `dispatch.bin.<harness>`
@@ -8399,9 +8434,19 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     sporMcp: null,
   }) : [];
   const supportedHarness = !!harnessAdapter;
-  if (!supportedHarness && !dryRun) {
+  // An UNSATISFIABLE profile is refused further down by the satisfiability path
+  // instead, even when the harness is also unsupported here — that refusal
+  // names the missing atom AND re-routes to a fleet host that has it, which is
+  // strictly more useful for the case the two overlap on: a declared harness
+  // nobody bound on THIS box (task-spor-dispatch-declarative-custom-harness).
+  // This branch keeps the case satisfiability cannot catch — a harness DECLARED
+  // as a capability (`spor capabilities set harnesses …`) that this client
+  // still has no adapter or binding for.
+  if (!supportedHarness && !dryRun && !unsatisfiable) {
     err(`cannot dispatch ${nodeId || name}: profile ${profileCheck && profileCheck.id ? profileCheck.id : "(unknown)"} selects unsupported harness '${harness}'.`);
-    err(`  this client has adapters for ${dispatchHarnesses.harnesses().map((a) => a.id).join(", ")}; the assignment is unchanged.`);
+    err(`  this client has adapters for ${dispatchHarnesses.harnesses({ cfg }).map((a) => a.id).join(", ")}; the assignment is unchanged.`);
+    err(`  a harness with no built-in adapter runs only where its owner bound it — declare`);
+    err(`  '${sat.DECLARED_HARNESS_CONFIG_KEY}.${harness}' (command, args, report, session) in $SPOR_HOME/config.json.`);
     return 1;
   }
 
@@ -8483,7 +8528,8 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
       out(`claim:  ${noClaim ? "(--no-claim — lease not established)" : `would establish a lease on ${nodeId} at launch (session bound from the run after launch)`}`);
     }
     if (template != null) out(`template: ${path.resolve(templateOpt)}`);
-    if (!supportedHarness) out(`run:    (unsupported harness '${harness}')`);
+    if (harnessResolution.error) out(`run:    (declaration for harness '${harness}' is unusable: ${harnessResolution.error})`);
+    else if (!supportedHarness) out(`run:    (unsupported harness '${harness}')`);
     else if (harnessAdapter.launchMode === "supervised-jsonl") {
       out(`run:    ${harnessBin} ${previewArgs.map(renderLaunchArg).join(" ")}  # prompt on stdin`);
     } else out(`run:    ${harnessBin} ${previewArgs.map(shellQuote).join(" ")} <prompt>`);

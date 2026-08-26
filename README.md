@@ -381,6 +381,58 @@ override the same thing per harness and win over the config file. An explicit
 launcher is used verbatim and is never quietly swapped for something on `PATH`;
 with none set, the bare name resolves on `PATH` as before.
 
+**Declaring a harness Spor has no adapter for.** A profile can name a harness
+this client ships no adapter for at all — a team's modified Claude Code build,
+an internal wrapper. The graph carries only the *name*; the machine binds what
+that name runs, in the same machine-local config:
+
+```json
+{
+  "dispatch": {
+    "harness": {
+      "oxalpha": {
+        "command": "/opt/ox/bin/ox",
+        "args": ["run", "--jsonl", "--dir={cwd}", "--model={model}"],
+        "label": "Ox Alpha",
+        "report": { "from": "lastText", "text": "message.text" },
+        "session": "session.id"
+      }
+    }
+  }
+}
+```
+
+A profile then selects it with nothing but `harness: oxalpha`. That split is
+the point: **a graph write must never define what a machine executes.** A
+profile carrying a `command`, `args`, `env` or any other launch-defining field
+is refused outright rather than honoured, and a machine that never declared the
+id refuses the dispatch and leaves the item assigned — so an org can publish a
+profile naming `oxalpha` and only the boxes whose owner bound that id will take
+the work. `spor capabilities` lists a declared harness alongside the built-in
+ones, and, in team mode, publishes it to the fleet so re-routing can find it.
+
+What the declaration may set, and nothing else:
+
+* `command` — the launcher: an absolute path, or a bare name resolved on `PATH`.
+* `args` — the argv template. `{cwd}` becomes the run's directory, `{report}`
+  the run's report path, `{model}` the resolved model — an entry naming a model
+  that did not resolve is dropped whole, so write `--model={model}` rather than
+  two separate entries.
+* `label` — what `spor dispatch` and `spor runs` call it.
+* `report` — how the run's final message is recovered: `"lastText"` (the
+  default) keeps the last string found at the `report.text` JSON path in the
+  harness's own event stream, and `"file"` means the harness writes the report
+  itself at the `{report}` path you passed it.
+* `session` — the JSON path (or paths) carrying the harness's session id, so
+  the run can be bound to its agent session. Optional; without it the run
+  simply is not bound.
+
+Everything else is fixed, and naming it is an error: a declared harness always
+runs under the supervisor below, always takes its prompt on **stdin** (so a
+compiled briefing never lands in a process listing), and always gets its
+agent-scoped token as `SPOR_TOKEN` in the run's environment. A malformed
+declaration is refused by name — Spor never falls back to guessing.
+
 Claude Code dispatch detaches into Claude Code's own background-agent daemon —
 the launcher exits immediately, and `spor dispatch` can only reconcile what
 happened to it afterwards from the harness's own session transcript. Every
