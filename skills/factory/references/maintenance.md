@@ -28,10 +28,14 @@ spor query --edges --edge-type relates-to --to task-<stem>
 
 Two more surfaces worth reading before concluding anything:
 
-- the **escalations and approvals** the gates filed. A failed pipeline files a
-  `requires: [human]` item that `blocks` the work item (§10.7); those are the
-  refusals a person was actually asked to judge:
-  `spor query --type task --where requires=human --summary`.
+- the **escalations and approvals** the gates filed — a cycle-cap escalation or
+  an armed human gate's approval item, each `requires: [human]` and `blocks`
+  the work item (§10.4, §10.5); those are the refusals a person was actually
+  asked to judge: `spor query --type task --where requires=human --summary`.
+  A protected-path **test-change lane** item also `blocks` the work item, but
+  is routed to a worker profile, not a person — it does NOT carry `requires:
+  [human]`, so it will not show up in that query; find those instead via
+  `spor query --edges --edge-type blocks --to task-<stem>`.
 - the **rolled-back items** — a refused claim has its completion status rolled
   back to `open` while its resolving edge stands, which `spor get` flags with a
   ⚠. An item in that state is a refusal nobody has adjudicated yet.

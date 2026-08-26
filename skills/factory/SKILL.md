@@ -135,7 +135,9 @@ factory that does not validate **refuses to start the worker**, which is the
 right failure but a rude way to discover a typo:
 
 - every `{"ref": "gate-…"}` points at a `type: gate` node that exists;
-- every agent-review gate has a `profile`, and that profile node exists;
+- every agent-review gate has a `profile` (the runner checks the field is
+  present, not that a matching profile node exists — a typo there is not
+  caught until dispatch, so double-check it yourself, e.g. `spor get <profile>`);
 - `protected_paths` is declared **only** with a `test_lane_profile` to route to;
 - every risk class a human gate names is declared in `risk_classes`;
 - gate ids are unique and kebab-case.
