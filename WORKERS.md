@@ -701,9 +701,20 @@ Two durable records make it recoverable by any later worker on the box:
   `spor work --status` already reads a worker whose pid is gone as STALE.
 
 A gate-armed worker joins the two at each pass, **before** taking new work: a
-slot — `gating` or `active` — held by a worker that is not live, whose run
-record is terminal, carries a claim worth gating (§10.2), and has no settled
-`gate_state`, is adopted and re-gated.
+slot held by a worker that is not live, whose run record is terminal, carries a
+claim worth gating (§10.2), and has no settled `gate_state`, is adopted and
+re-gated.
+
+Which slots count is a question of **provenance**, and the two lists differ. A
+`gating` slot only ever exists on a gate-armed worker, so it is owed a verdict
+by construction. An `active` slot exists on **every** worker, bare ones
+included — and a bare worker (no factory: the shipped default, and the whole
+"adoption has no cliff" guarantee) was never owed a gate at all. So an `active`
+slot counts only when that dead worker's own status record says it ran
+gate-armed, which its `gates` tally records iff a factory resolved. Without that
+scoping a gate-armed worker would retroactively judge a bare worker's runs — and
+on a refusal file a `blocks` edge and roll back the status of an item a person
+may have deliberately closed.
 
 **A resumed pipeline re-runs its gates from the first one.** `gate_state` is one
 word about the whole pipeline; there is no per-gate progress record, so the
@@ -726,6 +737,29 @@ worked down over passes rather than spawning a pipeline per orphan at once, and
 it sits under the same wind-down guards as a dispatch — a worker past its
 `--max`, or draining a `--once` run, leaves the orphans for the next worker,
 which is exactly what they are for.
+
+**The run record has no lock**, and one race is worth stating outright rather
+than implying it away. The gate stamp is written out of band by the worker,
+while the two in-process writers (a supervisor finishing its terminal-state
+contract, a native launcher binding a session) write the *whole* record from an
+in-memory copy. `carryGateFields` re-reads the `gate_*` namespace before those
+writes, which closes the ordinary ordering — but a supervisor that READ before a
+settle and RENAMED after it reverts a settled `failed`/`blocked` back to
+`running`. Two things bound that, and neither is "it cannot happen":
+
+- **the consequence is duplicated work, not a laundered verdict.** Every gate
+  fact is written to the graph *before* the pipeline settles, and fact ids are
+  deterministic; the refusal's durable half — the `blocks` edge and the status
+  rollback (§10.7) — is on the graph and no run-record write touches it. A
+  reverted record makes a later worker re-run the pipeline and re-record the
+  same nodes: a wasted suite run or review dispatch, and no wrong answer;
+- **a verify-and-reapply pass closes it in practice.** After writing a
+  `gate_state` the worker reads the record back, and a value that is not the one
+  it just wrote means something clobbered it — so it writes again, boundedly (an
+  unbounded retry against a contended file is a spin, and giving up simply
+  re-offers the run to the resume scan). The settled-verdict guard runs on every
+  attempt, so a clobber that turns out to be *another worker legitimately
+  settling first* is yielded to rather than fought.
 
 **Two workers on one box** are kept off a single orphan by two independent
 exclusions, because they see each other through two files that both lag: run ids

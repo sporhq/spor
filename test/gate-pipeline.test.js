@@ -695,7 +695,9 @@ const ORPHAN_RECORD = { run_id: "run-orphan", node_id: "task-orphan", state: "do
 test("orphanedGateRuns joins the dead workers' slots to the run journal, and no live worker's", () => {
   const records = new Map([["run-orphan", ORPHAN_RECORD]]);
   const slot = { run_id: "run-orphan", node_id: "task-orphan", harness: "fake" };
-  const dead = (extra = {}) => ({ worker_id: "w1", live: false, gating: [slot], active: [], ...extra });
+  // `gates` is the gate-armed marker: the worker status file carries that tally
+  // if and only if the worker ran with a factory.
+  const dead = (extra = {}) => ({ worker_id: "w1", live: false, gates: { passed: 0, failed: 0, blocked: 0 }, gating: [slot], active: [], ...extra });
 
   assert.deepStrictEqual(
     workLoop.orphanedGateRuns([dead()], { records }).map((o) => [o.run_id, o.node_id]),
@@ -710,8 +712,8 @@ test("orphanedGateRuns joins the dead workers' slots to the run journal, and no 
     "a run a live worker is already gating is not an orphan, whoever else once held it"
   );
 
-  // An ACTIVE slot counts too: a worker killed with runs in flight never
-  // reaches the harvest that would have started their gates.
+  // A GATE-ARMED worker's ACTIVE slot counts too: one killed with runs in
+  // flight never reaches the harvest that would have started their gates.
   assert.strictEqual(workLoop.orphanedGateRuns([dead({ gating: [], active: [slot] })], { records }).length, 1);
 
   // A settled verdict is not an orphan; an unsettled stamp is.
@@ -746,6 +748,42 @@ test("orphanedGateRuns joins the dead workers' slots to the run journal, and no 
     1,
     "…but the same claim from a worker that is GONE is exactly what a resume is for"
   );
+});
+
+// `active` is populated by EVERY worker, bare ones included — and a bare worker
+// (no factory, the shipped default) was never owed a gate at all. Adopting its
+// runs would let a gate-armed worker retroactively judge work nobody meant to
+// gate, and on a refusal file a `blocks` edge and roll back the status of an
+// item a person may have deliberately closed.
+test("a dead BARE worker's runs are never adopted — a gate is only ever imposed on work that was owed one", () => {
+  const records = new Map([["run-orphan", ORPHAN_RECORD]]);
+  const slot = { run_id: "run-orphan", node_id: "task-orphan", harness: "fake" };
+  const armed = { passed: 0, failed: 0, blocked: 0 };
+
+  // Same dead worker, same terminal run, same gateable claim — the ONLY
+  // difference is whether that worker itself ran gate-armed.
+  assert.deepStrictEqual(
+    workLoop.orphanedGateRuns([{ worker_id: "bare", live: false, gating: [], active: [slot] }], { records }),
+    [],
+    "a bare worker's run was never owed a gate"
+  );
+  assert.strictEqual(
+    workLoop.orphanedGateRuns([{ worker_id: "armed", live: false, gates: armed, gating: [], active: [slot] }], { records }).length,
+    1,
+    "…and a gate-armed worker's run was"
+  );
+
+  // A `gating` slot is self-evidencing — it could not exist without a pipeline
+  // — so it is honored even if the tally is missing from a mangled record.
+  assert.strictEqual(
+    workLoop.orphanedGateRuns([{ worker_id: "odd", live: false, gating: [slot], active: [] }], { records }).length,
+    1
+  );
+
+  // resumableSlots is the whole rule, in isolation.
+  assert.deepStrictEqual(workLoop.resumableSlots({ gates: armed, gating: [slot], active: [slot] }).length, 2);
+  assert.deepStrictEqual(workLoop.resumableSlots({ gating: [], active: [slot] }), []);
+  assert.deepStrictEqual(workLoop.resumableSlots(null), []);
 });
 
 // A resumed pipeline RE-RUNS its gates from the first one, and a fix cycle
@@ -997,6 +1035,62 @@ test("a gate stamp only ever writes its own namespace, and survives the writers 
   assert.strictEqual(after.contract_pending, false, "the supervisor's own patch still lands");
   assert.strictEqual(after.gate_state, "running", "and the out-of-band gate stamp survives it");
   assert.strictEqual(after.gate_worker, "w1");
+});
+
+// `carryGateFields` closes the ordinary ordering, but neither writer holds a
+// lock: a supervisor that READ before a settle and RENAMED after it reverts the
+// verdict to whatever its stale copy held. The consequence is bounded (the gate
+// FACTS and the graph demotion have already landed, so a revert costs a re-run,
+// not correctness) — and a verify-and-reapply pass closes it in practice.
+test("a settle that gets clobbered by a concurrent whole-record write is re-applied, and yields to a real verdict", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-race-"));
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  const runId = "33333333-4444-5555-6666-777777777777";
+  const paths = dispatchRuns.runPaths(home, runId);
+  const base = { run_id: runId, node_id: "task-x", state: "done", terminal_state: "resolved", terminal_enforced: true, gate_state: "running" };
+  // A supervisor whose rename straddles the settle: it puts its own stale copy
+  // back on disk, reverting the verdict to `running`.
+  const clobber = (extra = {}) => dispatchRuns.atomicJson(paths.record, { ...base, gate_state: "running", ...extra });
+
+  dispatchRuns.atomicJson(paths.record, base);
+  let reads = 0;
+  const flaky = (file) => {
+    reads += 1;
+    if (reads === 1) {
+      clobber({ terminal_note: "the supervisor's stale copy" });
+      return dispatchRuns.readJson(file);
+    }
+    return dispatchRuns.readJson(file);
+  };
+  const settled = dispatchRuns.stampGateState(home, runId, { gate_state: "failed", gate_reason: "the suite fails" }, { readBack: flaky });
+  assert.strictEqual(settled.gate_state, "failed");
+  assert.strictEqual(reads, 2, "the clobbered write is noticed and re-applied, then verified");
+  const onDisk = dispatchRuns.readJson(paths.record);
+  assert.strictEqual(onDisk.gate_state, "failed", "the verdict is what is on disk");
+  assert.strictEqual(onDisk.terminal_note, "the supervisor's stale copy", "and the supervisor's own write is not undone");
+
+  // Retries are BOUNDED — a permanently contended file must not spin.
+  dispatchRuns.atomicJson(paths.record, base);
+  let spins = 0;
+  const never = (file) => {
+    spins += 1;
+    clobber();
+    return dispatchRuns.readJson(file);
+  };
+  dispatchRuns.stampGateState(home, runId, { gate_state: "failed" }, { verifyAttempts: 2, readBack: never });
+  assert.strictEqual(spins, 2, "it gives up rather than spinning; the resume scan re-offers the run");
+
+  // And if the clobber was ANOTHER worker legitimately settling first, the
+  // retry yields to that verdict instead of fighting for the last word.
+  dispatchRuns.atomicJson(paths.record, base);
+  const raced = (file) => {
+    dispatchRuns.atomicJson(paths.record, { ...base, gate_state: "blocked" }); // the other worker lands
+    return dispatchRuns.readJson(file);
+  };
+  const yielded = dispatchRuns.stampGateState(home, runId, { gate_state: "failed" }, { readBack: raced });
+  assert.strictEqual(yielded.gate_state, "blocked", "a settled verdict is final, whoever wrote it");
+  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_state, "blocked");
 });
 
 // ------------------------------------------- the approval oracle + gate ids --
