@@ -511,7 +511,36 @@ server/connector is bound (remote mode), the spor MCP is reachable by
 construction, so an `mcp: [spor]` profile satisfies on a fresh dispatched box
 with no manual `allow-mcp` and no flaky network ping; the seed rides `.probed`,
 so it drops out when the server is unconfigured (other MCP reachability stays
-declared, task-spor-mcp-reachability-deterministic-seed). In REMOTE mode, when a
+declared, task-spor-mcp-reachability-deterministic-seed).
+**Declared custom harnesses (task-spor-dispatch-declarative-custom-harness):**
+a profile may name a harness with NO in-code adapter; the graph then carries
+only `harness: <id>` and a MACHINE-LOCAL `dispatch.harness.<id>` declaration
+binds that id to what it runs — `{command, args, label, report, session}`,
+normalized by `normalizeHarnessDeclaration` in `lib/shell/dispatch-harnesses.js`
+and synthesized into an ordinary registry-shaped adapter (`declaredAdapter`), so
+the launcher, the supervisor, `--print` and run discovery gain no
+"is this declared?" branch. Everything outside those five keys is FIXED by v1
+scope and naming it is a refusal: supervised-jsonl, prompt on stdin,
+`identityMode: env-token`. The argv template takes `{cwd}`/`{report}`/`{model}`
+tokens (a `{model}` entry is dropped whole when no model resolves, so the
+normalizer refuses a standalone `{model}` and one sharing an entry with a path
+token); the launcher's placeholder substitution is SUBSTRING only for a declared
+harness and stays whole-entry equality for the built-ins
+(norm-cc-byte-identical-refactor — substring would also rewrite a placeholder
+appearing in a graph-supplied `profile.model`). The supervisor rebuilds the
+adapter from `job.harness_declaration`, never from config, so a config edit
+mid-run can't change how a live stream is read. **A graph write must never
+define what a machine executes**, enforced both ways: a profile node carrying
+any of `sat.GRAPH_LAUNCH_FIELDS` (command/args/argv/bin/exec/entrypoint/env/
+report/session/launch_mode/identity_mode) is REFUSED by `spor dispatch`, and a
+machine with no binding for the id fails satisfiability (refuses loudly, leaves
+the assignment and lease intact, names the missing declaration). The same rule
+covers a write a TEAMMATE could land: `dispatch.harness` and `dispatch.bin` are
+stripped from a committable repo `.spor.json` with a warning
+(`REPO_FORBIDDEN_PATHS`, lib/config.js) — they resolve only from env, the user
+`$SPOR_HOME/config.json`, or the global one. The probe adds valid declared ids
+to `machine.harnesses`, so `spor capabilities` and the fleet publish reflect
+them. See test/declared-harness-dispatch.test.js. In REMOTE mode, when a
 `dispatch.agent` is configured (`spor agent use`), `session-start` ALSO
 auto-publishes the freshly-probed effective capabilities to the fleet scheduler
 (`POST /v1/agents/{id}/capabilities`) — folding the manual `spor capabilities
