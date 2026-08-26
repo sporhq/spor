@@ -28,7 +28,7 @@ const { writeSpawnableNodeStub, pathWithOnlyGitAndNode } = require("./helpers/po
 // A driver that runs the loop with no real clock, no real queue and no real
 // dispatch: `queue` is the page each poll returns, `dispatch` decides ok/refused
 // per item, and every launched run stays non-terminal until `finish()` says so.
-function harness({ queue = [], dispatch = () => ({ ok: true }), onTick = () => {}, opts = {}, maxPasses = 20 } = {}) {
+function harness({ queue = [], dispatch = () => ({ ok: true }), pollRuns = null, onTick = () => {}, opts = {}, maxPasses = 20 } = {}) {
   const state = {
     clock: 1_700_000_000_000,
     sleeps: [],
@@ -59,10 +59,12 @@ function harness({ queue = [], dispatch = () => ({ ok: true }), onTick = () => {
       return { ok: true, run: { run_id: runId, harness: "fake", launch_mode: "supervised-jsonl" } };
     },
     pollRuns: async (ids) =>
-      ids.map((id) => {
-        const rec = state.runs.get(id);
-        return { run_id: id, terminal: !!(rec && rec.terminal), record: rec };
-      }),
+      pollRuns
+        ? pollRuns(ids, state)
+        : ids.map((id) => {
+            const rec = state.runs.get(id);
+            return { run_id: id, terminal: !!(rec && rec.terminal), record: rec };
+          }),
     // The sleep is where the fake world moves: a test's onTick decides what
     // happened while the worker waited (a run finished, a stop was requested).
     // Driving it from here keeps every case deterministic — a real timer would
@@ -143,6 +145,32 @@ test("a run whose record has vanished frees its slot, with no verdict invented f
   assert.deepStrictEqual(status.outcomes, { resolved: 0, reported: 0, failed: 0, unenforced: 0 }, "a missing record is not evidence of any outcome");
   assert.strictEqual(status.recent[0].terminal_state, null);
   assert.ok(status.skipped.some((s) => s.id === "task-a"), "and the node cools off like any other unresolved run");
+});
+
+test("a watchdog give-up refills the slot but cools the node for as long as the run was followed", async () => {
+  // Giving up on FOLLOWING a run is not evidence the run stopped, so the node
+  // must not return as a candidate on the ordinary refusal window — a
+  // local-mode worker has no lease to stop it putting a second agent on work
+  // the first may still be doing. pollWorkRuns reports this as terminal with
+  // no verdict plus an explicit longer `cool_ms`.
+  const h = harness({
+    queue: (state) => {
+      const taken = new Set(state.dispatched.map((d) => d.id));
+      return [{ id: "task-a" }, { id: "task-b" }].filter((i) => !taken.has(i.id));
+    },
+    opts: { concurrency: 1, retryAfterMs: 1000 },
+    maxPasses: 3,
+    pollRuns: (ids, state) =>
+      ids.map((id) => ({ run_id: id, terminal: true, cool_ms: 3600000, record: { ...state.runs.get(id), state: "running" } })),
+  });
+  const status = await h.run();
+  assert.strictEqual(status.dispatched, 2, "the slot IS refilled — a run we can no longer follow must not hold it forever");
+  const cooled = status.skipped.find((x) => x.id === "task-a");
+  assert.ok(cooled, "the node we gave up following is cooled off");
+  assert.ok(
+    Date.parse(cooled.until) - Date.parse(cooled.at) >= 3600000,
+    "for the window the harvester asked for, not the short refusal window"
+  );
 });
 
 test("concurrency N fills N slots in one pass and never exceeds them", async () => {
@@ -371,20 +399,28 @@ test("runHarvest: a record that is gone is terminal with no verdict — a slot i
   assert.deepStrictEqual(workLoop.runHarvest(null, { terminalStates: TERMINAL }), { terminal: true, why: "missing" });
 });
 
-test("runHarvest: a supervised record whose OUTCOME is still provisional is not harvested yet", () => {
+test("runHarvest: a supervised record whose OUTCOME is still provisional is not harvested yet — but the hold is BOUNDED", () => {
   // agent-dispatch-runner writes the terminal `state` synchronously with an
   // unenforced placeholder, then merges the verified verdict up to three HTTP
   // round-trips later. Harvesting in that window records a run that RESOLVED
   // its target as an unenforced `reported` and cools the node off.
-  const pending = { run_id: "r", state: "done", contract_pending: true, runner_pid: 99, runner_started_ticks: 7 };
+  const closedAt = Date.parse("2026-08-26T10:00:00.000Z");
+  const pending = { run_id: "r", state: "done", contract_pending: true, runner_pid: 99, runner_started_ticks: 7, finished_at: new Date(closedAt).toISOString() };
   const aliveSupervisor = (pid, ticks) => pid === 99 && ticks === 7;
-  assert.strictEqual(workLoop.runHarvest(pending, { terminalStates: TERMINAL, alive: aliveSupervisor }).terminal, false);
-  // …but a supervisor that DIED mid-contract leaves the provisional reading as
-  // the only reading there will ever be, so the slot is freed on it.
-  assert.strictEqual(workLoop.runHarvest(pending, { terminalStates: TERMINAL, alive: () => false }).terminal, true);
+  const at = (ms) => ({ terminalStates: TERMINAL, alive: aliveSupervisor, now: () => closedAt + ms, contractGraceMs: 60000 });
+  assert.strictEqual(workLoop.runHarvest(pending, at(2000)).why, "contract-pending");
+  // A supervisor killed inside that window leaves contract_pending set FOREVER
+  // and its pid can be recycled, so the hold expires with the contract's own
+  // worst case — this is the one hold --run-max could never free.
+  assert.strictEqual(workLoop.runHarvest(pending, at(90000)).why, "state", "the hold expires; the provisional reading is then the honest one");
+  // A supervisor that is simply gone frees it immediately.
+  assert.strictEqual(workLoop.runHarvest(pending, { ...at(2000), alive: () => false }).why, "state");
+  // A record with no readable close time is never held (our writer always
+  // stamps one; anything else must not be able to hold a slot).
+  assert.strictEqual(workLoop.runHarvest({ ...pending, finished_at: null }, at(0)).why, "state");
   // …and once the contract has landed, the flag is cleared and it harvests.
   const settled = { ...pending, contract_pending: false, terminal_state: "resolved", terminal_enforced: true };
-  assert.strictEqual(workLoop.runHarvest(settled, { terminalStates: TERMINAL, alive: aliveSupervisor }).why, "state");
+  assert.strictEqual(workLoop.runHarvest(settled, at(2000)).why, "state");
 });
 
 test("runHarvest: a non-terminal run is followed until the watchdog age, then let go with no claim about it", () => {
@@ -578,9 +614,14 @@ test("a numeric option that is not a number is refused, never silently replaced"
   // become an unbounded worker.
   const bad = cli(["work", "--max", "abc", "--print"], env);
   assert.strictEqual(bad.status, 1);
-  assert.match(bad.stderr, /--max abc — expected a number >= 0/);
+  assert.match(bad.stderr, /--max abc — expected a number between 0 and \d+/);
   assert.strictEqual(cli(["work", "--concurrency", "0", "--print"], env).status, 1, "a zero concurrency is a mistake, not a default");
   assert.strictEqual(cli(["work", "--interval", "-5", "--print"], env).status, 1, "a negative interval is a mistake, not a 1s spin");
+  // setTimeout clamps anything over 2**31-1 ms to 1ms, so an unbounded value
+  // is a SPIN, not a long wait — and work.intervalMs sitting beside a flag in
+  // seconds makes it an easy slip.
+  assert.strictEqual(cli(["work", "--interval", "3000000", "--print"], env).status, 1, "an out-of-range interval is refused, not clamped into a spin");
+  assert.strictEqual(cli(["work", "--max", "", "--print"], env).status, 1, "an empty --max is a mistake, not 'run forever'");
   // Every problem is reported in one run, not one per re-run.
   const both = cli(["work", "--max", "x", "--interval", "y", "--print"], env);
   assert.match(both.stderr, /--max x/);

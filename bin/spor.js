@@ -8990,7 +8990,14 @@ function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, warn = () => {} } = {}) {
       // The record is still non-terminal, so `spor runs` keeps reconciling it;
       // this worker simply stops holding a slot for it, and says so.
       warn(`work: giving up following run ${String(id).slice(0, 8)} (${record.node_id || record.name || "?"}) — it has not reached a terminal state in ${Math.round(maxAgeMs / 3600000)}h ('spor runs' still tracks it).`);
-      return { run_id: id, terminal: true, record: { ...record, terminal_note: `this worker stopped following the run after ${Math.round(maxAgeMs / 3600000)}h without a terminal state` } };
+      return {
+        run_id: id, terminal: true,
+        // Giving up on FOLLOWING a run says nothing about whether it stopped,
+        // so the node is cooled for at least as long as we followed it rather
+        // than for the ordinary refusal window.
+        cool_ms: maxAgeMs,
+        record: { ...record, terminal_note: `this worker stopped following the run after ${Math.round(maxAgeMs / 3600000)}h without a terminal state` },
+      };
     }
     if (!enumerated && record && record.launch_mode === "native-background" && !verdict.terminal) {
       // The same caveat `spor runs` prints: a native run's state can only be
@@ -9101,21 +9108,30 @@ async function cmdWork(cfg, { values }) {
   // `--retry-after 0` would quietly become ten minutes. `bad` collects the
   // problems so one run reports all of them.
   const bad = [];
-  const num = (flag, raw, { min, fallback }) => {
-    if (raw == null) return fallback;
-    const v = Number(raw);
-    if (!Number.isFinite(v) || v < min) {
-      bad.push(`--${flag} ${raw} — expected a number >= ${min}`);
-      return fallback;
+  // The ceiling is not decoration: these become setTimeout delays, and Node
+  // CLAMPS anything over 2**31-1 ms to 1ms — so `--interval 3000000` (an easy
+  // slip when the config key beside it, work.intervalMs, is in MILLISECONDS)
+  // would turn a monthly poll into a thousand-per-second spin. The config
+  // fallback goes through the same range, since it reaches setTimeout by the
+  // same route.
+  const num = (flag, raw, { min, max, fallback }) => {
+    const clamp = (v) => Math.min(max, Math.max(min, v));
+    const safeFallback = Number.isFinite(Number(fallback)) ? clamp(Number(fallback)) : min;
+    if (raw == null) return safeFallback;
+    const v = String(raw).trim() === "" ? NaN : Number(raw);
+    if (!Number.isFinite(v) || v < min || v > max) {
+      bad.push(`--${flag} ${raw === "" ? "(empty)" : raw} — expected a number between ${min} and ${max}`);
+      return safeFallback;
     }
     return v;
   };
-  const concurrency = Math.max(1, num("concurrency", values.concurrency, { min: 1, fallback: cfg.getNum("work.concurrency", workLoop.WORK_DEFAULTS.concurrency) }));
-  const intervalMs = num("interval", values.interval, { min: 1, fallback: cfg.getNum("work.intervalMs", workLoop.WORK_DEFAULTS.intervalMs) / 1000 }) * 1000;
-  const maxIntervalMs = num("max-interval", values["max-interval"], { min: 1, fallback: cfg.getNum("work.maxIntervalMs", workLoop.WORK_DEFAULTS.maxIntervalMs) / 1000 }) * 1000;
-  const retryAfterMs = num("retry-after", values["retry-after"], { min: 0, fallback: cfg.getNum("work.retryAfterMs", workLoop.WORK_DEFAULTS.retryAfterMs) / 1000 }) * 1000;
-  const runMaxMs = num("run-max", values["run-max"], { min: 0, fallback: cfg.getNum("work.runMaxMs", workLoop.WORK_DEFAULTS.runMaxMs) / 3600000 }) * 3600000;
-  const max = num("max", values.max, { min: 0, fallback: 0 });
+  const DAY_S = 86400;
+  const concurrency = num("concurrency", values.concurrency, { min: 1, max: 1000, fallback: cfg.getNum("work.concurrency", workLoop.WORK_DEFAULTS.concurrency) });
+  const intervalMs = num("interval", values.interval, { min: 1, max: DAY_S, fallback: cfg.getNum("work.intervalMs", workLoop.WORK_DEFAULTS.intervalMs) / 1000 }) * 1000;
+  const maxIntervalMs = num("max-interval", values["max-interval"], { min: 1, max: DAY_S, fallback: cfg.getNum("work.maxIntervalMs", workLoop.WORK_DEFAULTS.maxIntervalMs) / 1000 }) * 1000;
+  const retryAfterMs = num("retry-after", values["retry-after"], { min: 0, max: 30 * DAY_S, fallback: cfg.getNum("work.retryAfterMs", workLoop.WORK_DEFAULTS.retryAfterMs) / 1000 }) * 1000;
+  const runMaxMs = num("run-max", values["run-max"], { min: 0, max: 720, fallback: cfg.getNum("work.runMaxMs", workLoop.WORK_DEFAULTS.runMaxMs) / 3600000 }) * 3600000;
+  const max = num("max", values.max, { min: 0, max: 1000000, fallback: 0 });
   if (bad.length) {
     for (const b of bad) err(`spor work: ${b}`);
     return 1;
@@ -9187,6 +9203,16 @@ async function cmdWork(cfg, { values }) {
   };
   for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => onSignal(sig));
 
+  // Latched: a persistently unreadable harness listing warns about each held
+  // run ONCE, not once per poll — the same sentence `spor runs` prints once per
+  // invocation, not 11k lines a day into a service log.
+  const warned = new Set();
+  const warn = (line) => {
+    if (warned.has(line)) return;
+    warned.add(line);
+    err(line);
+  };
+
   out(`work: worker ${workerId.slice(0, 8)} — ${slug || "all projects"}, concurrency ${concurrency}, poll ${intervalMs / 1000}s${max ? `, stopping after ${max} dispatch(es)` : ""}`);
   out(`work: status at ${workLoop.workerStatusPath(home, workerId)}  ('spor work --status')`);
   const final = await workLoop.runWorkLoop({
@@ -9201,7 +9227,7 @@ async function cmdWork(cfg, { values }) {
     deps: {
       candidates,
       dispatch: (item) => dispatchWorkItem(cfg, item, passthrough),
-      pollRuns: (ids) => pollWorkRuns(cfg, ids, { maxAgeMs: runMaxMs, warn: (line) => err(line) }),
+      pollRuns: (ids) => pollWorkRuns(cfg, ids, { maxAgeMs: runMaxMs, warn }),
       publish: (status) => workLoop.writeWorkerStatus(home, status),
       log: (line) => out(line),
       sleep: (ms) =>

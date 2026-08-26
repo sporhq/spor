@@ -582,8 +582,11 @@ record goes terminal SYNCHRONOUSLY carrying a provisional unenforced outcome and
 the verified verdict merges in up to three bounded round-trips later
 (`closeWithOutcome`), so harvesting on `state` alone would file a run that
 RESOLVED its target as an unenforced `reported` and cool the node off; the flag
-is cleared by the contract write, and a supervisor that died mid-contract (pid
-gone, identity-checked) harvests on the provisional reading. The mirror hazard
+is cleared by the contract write, and the hold is doubly bounded — it lasts only
+while the supervisor is demonstrably alive (pid identity-checked) AND inside
+`contractGraceMs` (60s, the contract's own worst case), because a supervisor
+killed mid-contract leaves the flag set forever and a recycled pid satisfies the
+bare probe a non-Linux host degrades to. The mirror hazard
 is a slot held FOREVER: a native-background run whose harness can no longer be
 enumerated never goes terminal at all, so `work.runMaxMs` (`--run-max`, default
 24h) is the watchdog and the un-enumerable case is warned about rather than
