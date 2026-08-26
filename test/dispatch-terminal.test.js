@@ -187,38 +187,44 @@ test("local mode and free-text dispatch are unenforced, with the reason on the r
   assert.match(free.terminal_note, /free-text dispatch/);
 });
 
-test("a target retired by STATUS is unenforced — but its report is still filed, without a false 'did not resolve' claim", async () => {
-  const written = [];
+test("a decision retired by STATUS resolves once its own status reaches its terminal partition", async () => {
+  // decision has no `get()` resolution hook (unlike task/issue/question/incident),
+  // so its completion is judged against the registry's status.terminal partition
+  // instead (task-spor-dispatch-terminal-resolution-all-types) — `settled` for a
+  // decision, read off the seed registry, never a hardcoded per-type table.
   const t = transport({
     "GET /v1/nodes/dec-x": { ok: true, status: 200, json: { id: "dec-x", type: "decision", status: "settled" } },
-    "POST /v1/nodes": { ok: true, status: 200, json: { results: [{ ok: true, status: "created" }] } },
   });
   const patch = await terminal.applyTerminalContract({
     ...BASE, nodeId: "dec-x", releaseNode: "dec-x", state: "done",
-    reportText: "I settled the decision; here are the tradeoffs and the rationale.",
-    request: async (req) => { if (req.path === "/v1/nodes") written.push(req.body.nodes[0].node); return t.call(req); },
+    reportText: "I settled the decision; here are the tradeoffs and the rationale.", request: t.call,
   });
-  assert.strictEqual(patch.terminal_enforced, false);
-  assert.notStrictEqual(patch.terminal_state, "resolved");
-  // The work reaches the graph — losing it to the 14-day run-journal prune is a
-  // strictly worse trade than the false claim this scoping exists to prevent.
-  assert.strictEqual(patch.report_node_id, terminal.reportArtifactId("dec-x", BASE.runId));
-  assert.strictEqual(written.length, 1);
-  assert.match(written[0], /tradeoffs and the rationale/);
-  assert.doesNotMatch(written[0], /without resolving it|without a resolving edge/);
-  assert.match(written[0], /NOT verified/);
-  // A lease we cannot judge is not ours to hand back on a guess.
-  assert.ok(!t.calls.some((c) => /\/release$/.test(c.path)));
+  assert.strictEqual(patch.terminal_state, "resolved");
+  assert.strictEqual(patch.terminal_enforced, true);
+  assert.match(patch.terminal_note, /status 'settled' is terminal for 'decision' nodes/);
+  // Verified done the same way an edge-verified type is: nothing filed, nothing
+  // released — the durable `assigned` edge is left as the record.
+  assert.deepStrictEqual(t.calls.map((c) => c.method), ["GET"]);
   assert.ok(!("lease_released" in patch));
-  assert.match(patch.terminal_note, /completion is a status rather than a resolving edge/);
 });
 
-test("a filed report always reads `reported`, even when the run crashed and the target is out of scope", async () => {
-  // The invariant a consumer keys on: report_node_id present => reported. Without
-  // it, identical evidence gives a `task` `reported` and a `decision` `failed`
-  // purely by target type, and `spor runs` prints "failed" over an artifact id.
+test("a capture-pending retired by STATUS (merged) also resolves via the universal completion words, no per-type declaration needed", async () => {
   const t = transport({
-    "GET /v1/nodes/dec-x": { ok: true, status: 200, json: { id: "dec-x", type: "decision" } },
+    "GET /v1/nodes/cap-x": { ok: true, status: 200, json: { id: "cap-x", type: "capture-pending", status: "merged" } },
+  });
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, nodeId: "cap-x", releaseNode: "cap-x", state: "done", reportText: "Triaged into proper nodes.", request: t.call,
+  });
+  assert.strictEqual(patch.terminal_state, "resolved");
+  assert.strictEqual(patch.terminal_enforced, true);
+});
+
+test("a filed report reads `reported`, fully enforced, for a status-only type whose status has not yet gone terminal", async () => {
+  // The invariant a consumer keys on: report_node_id present => reported. And,
+  // since every dispatchable type is now judged one way or the other, this is
+  // fully ENFORCED — not the old degraded unjudgeable reading.
+  const t = transport({
+    "GET /v1/nodes/dec-x": { ok: true, status: 200, json: { id: "dec-x", type: "decision", status: "active" } },
     "POST /v1/nodes": { ok: true, status: 200, json: { results: [{ ok: true, status: "created" }] } },
   });
   const patch = await terminal.applyTerminalContract({
@@ -226,21 +232,40 @@ test("a filed report always reads `reported`, even when the run crashed and the 
     reportText: "Got most of the way; the final check failed.", request: t.call,
   });
   assert.strictEqual(patch.terminal_state, "reported");
-  assert.strictEqual(patch.terminal_enforced, false);
+  assert.strictEqual(patch.terminal_enforced, true);
   assert.strictEqual(patch.report_node_id, terminal.reportArtifactId("dec-x", BASE.runId));
-  assert.ok(!t.calls.some((c) => /\/release$/.test(c.path)));
+  assert.strictEqual(patch.lease_released, true);
 });
 
-test("an out-of-scope target with no report files nothing and says why", async () => {
+test("a status-only type with no report and a non-terminal status fails, fully enforced, and releases the lease", async () => {
   const t = transport({
-    "GET /v1/nodes/find-x": { ok: true, status: 200, json: { id: "find-x", type: "finding" } },
+    "GET /v1/nodes/find-x": { ok: true, status: 200, json: { id: "find-x", type: "finding", status: "open" } },
   });
   const patch = await terminal.applyTerminalContract({
     ...BASE, nodeId: "find-x", releaseNode: "find-x", state: "failed", reportText: "", request: t.call,
   });
-  assert.strictEqual(patch.terminal_enforced, false);
   assert.strictEqual(patch.terminal_state, "failed");
+  assert.strictEqual(patch.terminal_enforced, true);
+  assert.strictEqual(patch.lease_released, true);
   assert.ok(!t.calls.some((c) => c.path === "/v1/nodes"));
+  assert.match(patch.terminal_note, /has not reached a terminal 'finding' status/);
+});
+
+test("a question with no answers edge is still judged by the edge, not by status, even though it needs no completion-resolver", async () => {
+  // question attaches the same `get()` resolution hook as task/issue/incident,
+  // so it stays edge-verified even though its own `answered` completion carries
+  // no write-time resolver requirement — the two registry signals genuinely
+  // diverge for this one type.
+  const t = transport({
+    "GET /v1/nodes/question-x": { ok: true, status: 200, json: { id: "question-x", type: "question", status: "answered" } },
+    "POST /v1/nodes": { ok: true, status: 200, json: { results: [{ ok: true, status: "created" }] } },
+  });
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, nodeId: "question-x", releaseNode: "question-x", state: "done",
+    reportText: "Answered it inline.", request: t.call,
+  });
+  assert.strictEqual(patch.terminal_state, "reported");
+  assert.strictEqual(patch.terminal_enforced, true);
 });
 
 test("an out-of-scope report artifact still parses and links the target", () => {
