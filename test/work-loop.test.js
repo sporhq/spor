@@ -214,6 +214,31 @@ test("a cooled-off item is not re-attempted until its retry window passes", asyn
   assert.strictEqual(attempts, 2, "one attempt, then one more only after the cooldown expired");
 });
 
+test("the cooldown table is bounded, and evicts the LEAST-recently-refused, not the most-refused", async () => {
+  // A plain Map.set on an existing key keeps its original insertion position,
+  // so the item refused most often would be first out — the opposite of what
+  // the cap is for. Re-cooling must move an item to the back of the queue.
+  const wanted = workLoop.SKIP_CAP + 5;
+  let pass = 0;
+  const h = harness({
+    // Pass 1 cools off item 0. Later passes present fresh items, and item 0
+    // again — its cooldown is refreshed each time it is retried and refused.
+    queue: () => {
+      pass += 1;
+      return pass === 1 ? [{ id: "task-sticky" }] : [{ id: "task-sticky" }, { id: `task-${pass}` }];
+    },
+    dispatch: () => ({ ok: false, reason: "refused" }),
+    opts: { concurrency: 1, retryAfterMs: 0 }, // 0 = always retryable, so every pass re-refuses it
+    maxPasses: wanted,
+  });
+  const status = await h.run();
+  assert.ok(status.skipped.length <= workLoop.SKIP_CAP, `bounded at ${workLoop.SKIP_CAP}, got ${status.skipped.length}`);
+  assert.ok(
+    status.skipped.some((x) => x.id === "task-sticky"),
+    "the item refused on every pass is the most recently refused, so it must be the LAST thing evicted"
+  );
+});
+
 test("a human-readiness item is never a candidate — a worker does not claim what needs a person", async () => {
   const h = harness({
     queue: [{ id: "task-human", readiness: "human", readiness_reasons: ["requires human"] }, { id: "task-agent", readiness: "agent" }],
@@ -320,10 +345,58 @@ test("selectWorkCandidates: excludes in-flight, human-readiness and cooling-off 
   assert.deepStrictEqual(later.map((i) => i.id), ["a", "c", "d"]);
 });
 
-test("refusalReason takes the refusal's own first line, bounded", () => {
-  assert.strictEqual(workLoop.refusalReason(["  first line ", "remediation"]), "first line");
+test("refusalReason takes the REFUSAL, not the warning that preceded it or the remediation after it", () => {
+  // Every dispatch refusal can be preceded by non-fatal asides (an unmintable
+  // agent token, an ignored --as) and is followed by indented remediation.
+  assert.strictEqual(
+    workLoop.refusalReason([
+      "warning: this server can't mint agent-scoped session tokens yet — dispatching person-scoped.",
+      "note: --as agent-x ignored in local mode",
+      "task-a is already claimed — held by someone else",
+      "  not dispatching a duplicate. Re-run with --force to dispatch anyway,",
+    ]),
+    "task-a is already claimed — held by someone else"
+  );
+  // With nothing but asides, say the aside rather than nothing at all.
+  assert.match(workLoop.refusalReason(["warning: only a warning"]), /only a warning/);
   assert.strictEqual(workLoop.refusalReason([], "fallback"), "fallback");
   assert.strictEqual(workLoop.refusalReason(["x".repeat(500)]).length, 300);
+});
+
+// ------------------------------------------------------------ runHarvest --
+
+const TERMINAL = new Set(["done", "failed", "failed_launch", "vanished"]);
+
+test("runHarvest: a record that is gone is terminal with no verdict — a slot is never held for a record nothing will write", () => {
+  assert.deepStrictEqual(workLoop.runHarvest(null, { terminalStates: TERMINAL }), { terminal: true, why: "missing" });
+});
+
+test("runHarvest: a supervised record whose OUTCOME is still provisional is not harvested yet", () => {
+  // agent-dispatch-runner writes the terminal `state` synchronously with an
+  // unenforced placeholder, then merges the verified verdict up to three HTTP
+  // round-trips later. Harvesting in that window records a run that RESOLVED
+  // its target as an unenforced `reported` and cools the node off.
+  const pending = { run_id: "r", state: "done", contract_pending: true, runner_pid: 99, runner_started_ticks: 7 };
+  const aliveSupervisor = (pid, ticks) => pid === 99 && ticks === 7;
+  assert.strictEqual(workLoop.runHarvest(pending, { terminalStates: TERMINAL, alive: aliveSupervisor }).terminal, false);
+  // …but a supervisor that DIED mid-contract leaves the provisional reading as
+  // the only reading there will ever be, so the slot is freed on it.
+  assert.strictEqual(workLoop.runHarvest(pending, { terminalStates: TERMINAL, alive: () => false }).terminal, true);
+  // …and once the contract has landed, the flag is cleared and it harvests.
+  const settled = { ...pending, contract_pending: false, terminal_state: "resolved", terminal_enforced: true };
+  assert.strictEqual(workLoop.runHarvest(settled, { terminalStates: TERMINAL, alive: aliveSupervisor }).why, "state");
+});
+
+test("runHarvest: a non-terminal run is followed until the watchdog age, then let go with no claim about it", () => {
+  const started = Date.parse("2026-08-26T10:00:00.000Z");
+  const running = { run_id: "r", state: "running", launch_mode: "native-background", created_at: new Date(started).toISOString() };
+  const opts = (nowMs, maxAgeMs) => ({ terminalStates: TERMINAL, now: () => nowMs, maxAgeMs });
+  assert.strictEqual(workLoop.runHarvest(running, opts(started + 3600000, 86400000)).terminal, false, "an hour in, it is simply still running");
+  const gaveUp = workLoop.runHarvest(running, opts(started + 90000000, 86400000));
+  assert.deepStrictEqual(gaveUp, { terminal: true, why: "watchdog" });
+  // With no ceiling configured the slot is held indefinitely — the watchdog is
+  // the only thing that can free a native run whose harness stopped answering.
+  assert.strictEqual(workLoop.runHarvest(running, opts(started + 90000000, 0)).terminal, false);
 });
 
 // --------------------------------------------------------- the status store --
@@ -349,6 +422,17 @@ test("status store: round-trips, marks a dead worker stale, and ages records out
   const pruned = workLoop.readWorkerStatuses(home, { alive: (pid) => pid === 111, now: later });
   assert.deepStrictEqual(pruned.map((r) => r.worker_id), ["aaaa"]);
   assert.strictEqual(fs.readdirSync(workLoop.workDir(home)).length, 1);
+});
+
+test("status store: a recycled pid does not resurrect a killed worker", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-pid-"));
+  // SIGKILLed: no stopped_at. Its pid is later reused by something unrelated,
+  // so a bare pid probe would report it running — with occupied slots — forever.
+  workLoop.writeWorkerStatus(home, { worker_id: "killed", pid: 4242, started_ticks: 111, started_at: "2026-08-26T10:00:00.000Z", updated_at: "2026-08-26T10:00:00.000Z" });
+  const alive = (pid, ticks) => pid === 4242 && (ticks == null || ticks === 999); // pid alive, but a DIFFERENT process
+  const read = workLoop.readWorkerStatuses(home, { alive, now: () => Date.parse("2026-08-26T10:05:00.000Z") });
+  assert.strictEqual(read[0].live, false);
+  assert.strictEqual(read[0].stale, true);
 });
 
 test("status store: a mangled record is skipped, not fatal, and a missing dir reads empty", () => {
@@ -417,13 +501,16 @@ process.stdin.on("end", () => {
 
 test("spor work --print previews scope, pacing and candidates, and launches nothing", () => {
   const { home, outfile } = cliFixture();
-  const r = cli(["work", "--print"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile });
+  const r = cli(["work", "--print"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.match(r.stdout, /^project: \(all projects\)$/m);
   assert.match(r.stdout, /concurrency 1, interval 30s, backoff to 300s/);
   assert.match(r.stdout, /-> task-ready/);
+  // The one that matters: `task-needs-human` IS in the live queue (it is open
+  // and unresolved — `spor next` shows it), and it is the loop's own readiness
+  // filter that keeps a worker off it.
+  assert.match(cli(["next", "--limit", "20"], { SPOR_HOME: home, XDG_CONFIG_HOME: home }).stdout, /task-needs-human/);
   assert.doesNotMatch(r.stdout, /task-needs-human/, "a human-readiness item is never a candidate");
-  assert.doesNotMatch(r.stdout, /task-done/, "a resolved item is not in the live queue at all");
   assert.ok(!fs.existsSync(outfile), "nothing was launched");
 });
 
@@ -482,6 +569,26 @@ test("a dispatch refusal is recorded with its own reason and the worker stops in
   assert.strictEqual(skipped[0].id, "task-ready");
   assert.match(skipped[0].reason, /task-ready/, "the refusal's own first line is the reason");
   assert.ok(Date.parse(skipped[0].until) > Date.now(), "and it is cooling off, not dropped");
+});
+
+test("a numeric option that is not a number is refused, never silently replaced", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-opts-"));
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode() };
+  // The dangerous one: `--max $N` with an unset variable must not quietly
+  // become an unbounded worker.
+  const bad = cli(["work", "--max", "abc", "--print"], env);
+  assert.strictEqual(bad.status, 1);
+  assert.match(bad.stderr, /--max abc — expected a number >= 0/);
+  assert.strictEqual(cli(["work", "--concurrency", "0", "--print"], env).status, 1, "a zero concurrency is a mistake, not a default");
+  assert.strictEqual(cli(["work", "--interval", "-5", "--print"], env).status, 1, "a negative interval is a mistake, not a 1s spin");
+  // Every problem is reported in one run, not one per re-run.
+  const both = cli(["work", "--max", "x", "--interval", "y", "--print"], env);
+  assert.match(both.stderr, /--max x/);
+  assert.match(both.stderr, /--interval y/);
+  // An explicit 0 where 0 is meaningful is HONORED, not treated as absent.
+  const zero = cli(["work", "--retry-after", "0", "--print"], env);
+  assert.strictEqual(zero.status, 0, zero.stderr);
+  assert.match(zero.stdout, /retry refused after 0s/);
 });
 
 test("spor work --status with nothing recorded says so, in both renderings", () => {

@@ -8955,7 +8955,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
 // something resolves it against the harness's live-agent list plus its own
 // transcript. Supervised runs need none of that (their supervisor closes the
 // record itself), so a box with no enumerable harness still follows them.
-function pollWorkRuns(cfg, runIds) {
+function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, warn = () => {} } = {}) {
   const home = cfg.userConfigHome();
   const wanted = new Set(runIds || []);
   if (!wanted.size) return [];
@@ -8971,21 +8971,35 @@ function pollWorkRuns(cfg, runIds) {
   const records = dispatchRuns.reconcileRuns(home, { agents, enumerated });
   const found = new Map();
   for (const r of records) if (r && wanted.has(r.run_id)) found.set(r.run_id, r);
-  // Answer for EVERY id asked about, including one the store no longer holds
-  // (aged out by dispatch.runRetentionMs under a long-lived worker, or removed
-  // by hand). A slot whose run record has vanished can never be observed going
-  // terminal, so reporting nothing for it would hold that slot for the life of
-  // the worker. It is terminal with no VERDICT — a missing record is not
-  // evidence of failure — which frees the slot, records the gap, and cools the
-  // node off like any other run that did not resolve.
+  // Answer for EVERY id asked about, including one the store no longer holds:
+  // a slot whose run record has vanished can never be observed going terminal,
+  // so reporting nothing for it would hold that slot for the life of the
+  // worker. workLoop.runHarvest owns the rule; this only names what it decided.
+  const alive = (pid, ticks) =>
+    dispatchRuns.pidAlive(pid) && (ticks == null || dispatchRuns.processStartTicks(pid) === ticks);
   return [...wanted].map((id) => {
-    const record = found.get(id);
-    if (record) return { run_id: id, terminal: dispatchRuns.TERMINAL_STATES.has(record.state), record };
-    return {
-      run_id: id,
-      terminal: true,
-      record: { run_id: id, state: "missing", terminal_note: "the run record is gone — this worker can no longer follow the run ('spor runs' aged it out, or it was removed)" },
-    };
+    const record = found.get(id) || null;
+    const verdict = workLoop.runHarvest(record, { terminalStates: dispatchRuns.TERMINAL_STATES, alive, maxAgeMs });
+    if (verdict.why === "missing") {
+      return {
+        run_id: id, terminal: true,
+        record: { run_id: id, state: "missing", terminal_note: "the run record is gone — this worker can no longer follow the run ('spor runs' aged it out, or it was removed)" },
+      };
+    }
+    if (verdict.why === "watchdog") {
+      // The record is still non-terminal, so `spor runs` keeps reconciling it;
+      // this worker simply stops holding a slot for it, and says so.
+      warn(`work: giving up following run ${String(id).slice(0, 8)} (${record.node_id || record.name || "?"}) — it has not reached a terminal state in ${Math.round(maxAgeMs / 3600000)}h ('spor runs' still tracks it).`);
+      return { run_id: id, terminal: true, record: { ...record, terminal_note: `this worker stopped following the run after ${Math.round(maxAgeMs / 3600000)}h without a terminal state` } };
+    }
+    if (!enumerated && record && record.launch_mode === "native-background" && !verdict.terminal) {
+      // The same caveat `spor runs` prints: a native run's state can only be
+      // resolved against the harness's live-agent listing, and this call could
+      // not read one. The slot is held (correctly — nothing says the run is
+      // over), but a worker that quietly stops dispatching must say why.
+      warn("work: could not list live background agents — a native run's state may be stale, so its slot stays held ('spor runs' reports the same).");
+    }
+    return { run_id: id, terminal: verdict.terminal, record };
   });
 }
 
@@ -9007,6 +9021,10 @@ async function dispatchWorkItem(cfg, item, passthrough) {
       { onLaunch: (l) => launches.push(l) }
     );
   } catch (e) {
+    // A throw AFTER the launch (the post-launch session capture and bind are
+    // network calls) still means an agent is running and holding a lease —
+    // report the run rather than recording a skip for work that is under way.
+    if (launches.length) return { ok: true, run: launches[0] };
     return { ok: false, reason: `dispatch failed: ${e && e.message ? e.message : String(e)}` };
   } finally {
     ERR_TEE = previousTee;
@@ -9028,8 +9046,16 @@ async function dispatchWorkItem(cfg, item, passthrough) {
 // builder skill needs: what every worker on this box is doing, has done, and
 // is deliberately not doing. Reads the machine-local records only — never the
 // graph, never the network.
+// A worker process is only THIS worker if the pid is alive AND was started at
+// the same moment — the run store's pid-reuse guard, applied to worker records.
+function workerAlive(pid, ticks) {
+  if (!dispatchRuns.pidAlive(pid)) return false;
+  if (ticks == null) return true; // an older record with no identity stamp: the pid probe is all there is
+  return dispatchRuns.processStartTicks(pid) === ticks;
+}
+
 function cmdWorkStatus(cfg, { json }) {
-  const workers = workLoop.readWorkerStatuses(cfg.userConfigHome(), { alive: dispatchRuns.pidAlive });
+  const workers = workLoop.readWorkerStatuses(cfg.userConfigHome(), { alive: workerAlive });
   if (json) {
     out(JSON.stringify({ count: workers.length, workers }, null, 2));
     return 0;
@@ -9069,11 +9095,31 @@ async function cmdWork(cfg, { values }) {
   // inherently single-repo, and each item is dispatched into ITS own repo
   // through the slug->path map.
   const slug = values.project || cfg.get("work.project", null) || cfg.get("queue.project", null) || null;
-  const concurrency = Math.max(1, parseInt(values.concurrency, 10) || cfg.getNum("work.concurrency", workLoop.WORK_DEFAULTS.concurrency));
-  const intervalMs = Math.max(1, parseFloat(values.interval) || cfg.getNum("work.intervalMs", workLoop.WORK_DEFAULTS.intervalMs) / 1000) * 1000;
-  const maxIntervalMs = Math.max(1, parseFloat(values["max-interval"]) || cfg.getNum("work.maxIntervalMs", workLoop.WORK_DEFAULTS.maxIntervalMs) / 1000) * 1000;
-  const retryAfterMs = Math.max(0, parseFloat(values["retry-after"]) || cfg.getNum("work.retryAfterMs", workLoop.WORK_DEFAULTS.retryAfterMs) / 1000) * 1000;
-  const max = Math.max(0, parseInt(values.max, 10) || 0);
+  // Numeric options are REJECTED, not silently replaced, when they aren't a
+  // number in range: an unattended `spor work --max $N` with a typo'd $N would
+  // otherwise quietly become an unbounded worker, and an explicit
+  // `--retry-after 0` would quietly become ten minutes. `bad` collects the
+  // problems so one run reports all of them.
+  const bad = [];
+  const num = (flag, raw, { min, fallback }) => {
+    if (raw == null) return fallback;
+    const v = Number(raw);
+    if (!Number.isFinite(v) || v < min) {
+      bad.push(`--${flag} ${raw} — expected a number >= ${min}`);
+      return fallback;
+    }
+    return v;
+  };
+  const concurrency = Math.max(1, num("concurrency", values.concurrency, { min: 1, fallback: cfg.getNum("work.concurrency", workLoop.WORK_DEFAULTS.concurrency) }));
+  const intervalMs = num("interval", values.interval, { min: 1, fallback: cfg.getNum("work.intervalMs", workLoop.WORK_DEFAULTS.intervalMs) / 1000 }) * 1000;
+  const maxIntervalMs = num("max-interval", values["max-interval"], { min: 1, fallback: cfg.getNum("work.maxIntervalMs", workLoop.WORK_DEFAULTS.maxIntervalMs) / 1000 }) * 1000;
+  const retryAfterMs = num("retry-after", values["retry-after"], { min: 0, fallback: cfg.getNum("work.retryAfterMs", workLoop.WORK_DEFAULTS.retryAfterMs) / 1000 }) * 1000;
+  const runMaxMs = num("run-max", values["run-max"], { min: 0, fallback: cfg.getNum("work.runMaxMs", workLoop.WORK_DEFAULTS.runMaxMs) / 3600000 }) * 3600000;
+  const max = num("max", values.max, { min: 0, fallback: 0 });
+  if (bad.length) {
+    for (const b of bad) err(`spor work: ${b}`);
+    return 1;
+  }
 
   // Passed straight through to every dispatch this loop makes. Deliberately NOT
   // --force: a loop that forces past the duplicate/resolved guards is exactly
@@ -9082,12 +9128,19 @@ async function cmdWork(cfg, { values }) {
   for (const k of ["profile", "model", "as", "agent", "template", "dir", "permission-mode", "sandbox", "approval-policy"]) {
     if (values[k]) passthrough[k] = values[k];
   }
-  for (const k of ["worktree", "no-worktree", "no-brief", "full", "no-claim"]) {
+  // NOT --no-claim either: the lease is the ONLY thing that keeps two pull
+  // workers off one node (dec-cc-task-claim-lease), so a loop that dispatches
+  // without one is exactly the collision this design rules out. A human aiming
+  // one agent at one node can still opt out with `spor dispatch --no-claim`.
+  for (const k of ["worktree", "no-worktree", "no-brief", "full"]) {
     if (values[k]) passthrough[k] = true;
   }
 
   const candidates = async () => {
-    const page = await dispatchableQueuePage(cfg, slug);
+    // Page deeper than the default when the cap is high: the page is filtered
+    // again below (in-flight) and again by the loop (readiness, cooldowns), so
+    // a page the size of the cap could not fill it.
+    const page = await dispatchableQueuePage(cfg, slug, Math.max(25, concurrency * 4));
     // Items already being worked by an agent on THIS box — this loop's earlier
     // runs, a hand-run `spor dispatch`, another loop — are not candidates. The
     // same-machine guard would refuse them anyway; skipping them here keeps a
@@ -9098,7 +9151,7 @@ async function cmdWork(cfg, { values }) {
 
   if (values.print || values["dry-run"]) {
     out(`project: ${slug || "(all projects)"}`);
-    out(`loop:    concurrency ${concurrency}, interval ${intervalMs / 1000}s, backoff to ${maxIntervalMs / 1000}s, retry refused after ${retryAfterMs / 1000}s${max ? `, stop after ${max}` : ""}`);
+    out(`loop:    concurrency ${concurrency}, interval ${intervalMs / 1000}s, backoff to ${maxIntervalMs / 1000}s, retry refused after ${retryAfterMs / 1000}s, stop following a run after ${runMaxMs / 3600000}h${max ? `, stop after ${max}` : ""}`);
     out(`status:  ${workLoop.workDir(cfg.userConfigHome())}`);
     const cands = workLoop.selectWorkCandidates(await candidates(), {});
     if (!cands.length) out("queue:   nothing dispatchable right now");
@@ -9114,6 +9167,10 @@ async function cmdWork(cfg, { values }) {
 
   const home = cfg.userConfigHome();
   const workerId = crypto.randomUUID();
+  // Sweep aged-out worker records now: pruning otherwise only happens inside a
+  // `--status` read, so a box running `spor work --once` on a cron and never
+  // reading the status back would accumulate one record per invocation forever.
+  workLoop.readWorkerStatuses(home, { alive: workerAlive });
   const control = { stopping: false, reason: null, wake: () => {} };
   // A service manager stops a worker with a signal, so a signal must reach the
   // loop mid-backoff rather than at the end of it: wake() collapses the pending
@@ -9122,7 +9179,10 @@ async function cmdWork(cfg, { values }) {
     if (control.stopping) process.exit(130);
     control.stopping = true;
     control.reason = `stopped on ${sig}`;
-    err(`work: ${sig} — not picking up new work. In-flight runs keep going and self-report ('spor runs').`);
+    // Straight to stderr, NOT through err(): a signal arriving mid-dispatch
+    // would otherwise land in that dispatch's captured lines and could become
+    // the item's recorded skip reason.
+    process.stderr.write(`work: ${sig} — not picking up new work. In-flight runs keep going and self-report ('spor runs').\n`);
     control.wake();
   };
   for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => onSignal(sig));
@@ -9130,12 +9190,18 @@ async function cmdWork(cfg, { values }) {
   out(`work: worker ${workerId.slice(0, 8)} — ${slug || "all projects"}, concurrency ${concurrency}, poll ${intervalMs / 1000}s${max ? `, stopping after ${max} dispatch(es)` : ""}`);
   out(`work: status at ${workLoop.workerStatusPath(home, workerId)}  ('spor work --status')`);
   const final = await workLoop.runWorkLoop({
-    opts: { workerId, project: slug, concurrency, intervalMs, maxIntervalMs, retryAfterMs, max, once: !!values.once },
+    opts: {
+      workerId, project: slug, concurrency, intervalMs, maxIntervalMs, retryAfterMs, max, once: !!values.once,
+      // The pid-reuse guard for this record: a SIGKILLed worker leaves no
+      // stopped_at, and a bare pid probe would read its recycled pid as this
+      // worker still running (the same identity check the run store makes).
+      startedTicks: dispatchRuns.processStartTicks(process.pid),
+    },
     control,
     deps: {
       candidates,
       dispatch: (item) => dispatchWorkItem(cfg, item, passthrough),
-      pollRuns: (ids) => pollWorkRuns(cfg, ids),
+      pollRuns: (ids) => pollWorkRuns(cfg, ids, { maxAgeMs: runMaxMs, warn: (line) => err(line) }),
       publish: (status) => workLoop.writeWorkerStatus(home, status),
       log: (line) => out(line),
       sleep: (ms) =>
@@ -11241,11 +11307,18 @@ const COMMANDS = {
       "human (a worker never claims those) and minus anything already in flight here.\n" +
       "A refused item is remembered with the refusal's own reason and retried after\n" +
       "--retry-after, so the loop moves down the queue instead of re-refusing one item.\n\n" +
-      "TERMINAL, NOT LAUNCHED. A slot frees when the RUN RECORD goes terminal — by\n" +
-      "then the outcome contract has filed the report and released or held the lease\n" +
-      "— never when a launcher returns. Stopping (SIGINT/SIGTERM, or --once/--max)\n" +
-      "stops PICKING UP work; runs already in flight are detached, keep going, and\n" +
-      "self-report ('spor runs').\n\n" +
+      "TERMINAL, NOT LAUNCHED. A slot frees when the RUN RECORD goes terminal AND its\n" +
+      "outcome is settled — by then the terminal-state contract has filed the report\n" +
+      "and released or held the lease — never when a launcher returns. Stopping\n" +
+      "(SIGINT/SIGTERM, or --once/--max) stops PICKING UP work; runs already in flight\n" +
+      "are detached, keep going, and self-report ('spor runs'). There is no --no-claim:\n" +
+      "the lease is what keeps two workers off one node, so a loop always takes it.\n\n" +
+      "A native-background harness (claude --bg) is the weak spot: its termination is\n" +
+      "not deterministically observable (dec-spor-dispatch-terminal-states-supervised-\n" +
+      "first), so a slot is freed from the harness's own live-agent listing, and if\n" +
+      "that listing cannot be read the slot stays held and the worker says so. --run-max\n" +
+      "(default 24h) is the backstop that stops following such a run. A supervised\n" +
+      "harness (Codex, OpenCode, Copilot, a declared one) has none of this.\n\n" +
       "RUN IT AS A SERVICE. 'spor work --status' (add --json) reads back every\n" +
       "worker on this box: state, slots, dispatch count, verified outcomes, what it\n" +
       "is deliberately skipping and why. Records live under the machine-local\n" +
@@ -11261,6 +11334,7 @@ const COMMANDS = {
       interval: { type: "string", value: "S", desc: "seconds between polls (default 30)" },
       "max-interval": { type: "string", value: "S", desc: "backoff ceiling in seconds when idle (default 300)" },
       "retry-after": { type: "string", value: "S", desc: "seconds before retrying a refused item (default 600)" },
+      "run-max": { type: "string", value: "H", desc: "hours to follow one run before freeing its slot (default 24)" },
       max: { type: "string", value: "N", desc: "stop after N dispatches (default: run forever)" },
       once: { type: "boolean", desc: "one selection pass, wait for those runs, exit" },
       status: { type: "boolean", desc: "read back this machine's workers instead of running one" },
@@ -11278,7 +11352,6 @@ const COMMANDS = {
       "no-worktree": { type: "boolean", desc: "force-disable worktree isolation" },
       "no-brief": { type: "boolean", desc: "raw task prompts, no briefing block" },
       full: { type: "boolean", desc: "full briefing instead of the digest" },
-      "no-claim": { type: "boolean", desc: "don't auto-claim the lease (remote node dispatch)" },
       print: { type: "boolean", desc: "dry run — show the scope, the pacing and the candidates; launch nothing" },
       "dry-run": DRYRUN_OPT,
     },

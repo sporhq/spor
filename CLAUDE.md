@@ -568,14 +568,29 @@ isolation, the supervisor, the run record and the terminal-state contract apply
 unchanged and can never drift). The loop machine is `lib/shell/work-loop.js`,
 dependency-injected so it drives with a fake clock/queue/dispatcher; `cmdWork`
 in `bin/spor.js` is the wiring. Two things it owns beyond dispatch: a slot frees
-only when the RUN RECORD goes terminal (not when a launcher returns), and any
-item that was refused — or whose run ended WITHOUT resolving, which hands the
+only when the RUN RECORD goes terminal AND its outcome is settled — never when a
+launcher returns — and any item that was refused — or whose run ended WITHOUT resolving, which hands the
 lease back and returns it to the pool — cools off for `work.retryAfterMs` so the
 worker walks down the queue instead of re-dispatching one node every poll. The
 refusal REASON is the refusal's own first stderr line, captured through the
 `ERR_TEE` sink in `bin/spor.js` rather than by teaching a dozen guard sites to
-report themselves twice; `cmdDispatch`'s optional third arg (`ctx.onLaunch`)
-reports the run id the exit code can't carry. It never passes `--force` (a loop
+report themselves twice (the first UNINDENTED, non-`warning:`/`note:` line, since
+a refusal is routinely preceded by an aside and followed by indented
+remediation); `cmdDispatch`'s optional third arg (`ctx.onLaunch`) reports the run
+id the exit code can't carry. "Settled" is `contract_pending` — a supervised
+record goes terminal SYNCHRONOUSLY carrying a provisional unenforced outcome and
+the verified verdict merges in up to three bounded round-trips later
+(`closeWithOutcome`), so harvesting on `state` alone would file a run that
+RESOLVED its target as an unenforced `reported` and cool the node off; the flag
+is cleared by the contract write, and a supervisor that died mid-contract (pid
+gone, identity-checked) harvests on the provisional reading. The mirror hazard
+is a slot held FOREVER: a native-background run whose harness can no longer be
+enumerated never goes terminal at all, so `work.runMaxMs` (`--run-max`, default
+24h) is the watchdog and the un-enumerable case is warned about rather than
+hidden. There is deliberately no `--no-claim` passthrough (the lease is the only
+thing keeping two pull workers off one node), and numeric options are REFUSED
+rather than silently replaced (`--max $UNSET` must not become an unbounded
+worker). It never passes `--force` (a loop
 that forces past the duplicate/resolved guards is the runaway a pull worker must
 not be), and a worker never claims a `readiness: human` item even though
 one-shot dispatch only warns on the non-`requires:human` half (WORKERS.md §3).

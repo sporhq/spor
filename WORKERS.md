@@ -403,10 +403,14 @@ violation — new fields may be added additively.
 | `report_path` | string | supervised runs only — where the harness's own final-message text landed, if any |
 | `child_reaped` | bool | optional — an orphaned harness child was terminated at reconciliation time |
 
-Fields like `runner_pid`, `child_pid`, `runner_started_ticks`, and
-`child_started_ticks` also ride on supervised records; they are internal
-process-identity bookkeeping for reconciliation (guarding against pid reuse)
-and are not meaningful to an external consumer.
+Fields like `runner_pid`, `child_pid`, `runner_started_ticks`,
+`child_started_ticks`, and `contract_pending` also ride on supervised records;
+they are internal bookkeeping — process identity for reconciliation (guarding
+against pid reuse), and, for `contract_pending`, whether the outcome dimension
+on a just-closed record is still the provisional placeholder rather than the
+settled verdict (a record goes terminal synchronously, and §6 runs a beat
+later). They are not meaningful to an external consumer, which should poll for
+`terminal_state` rather than trying to interpret them.
 
 **Outcome dimension** (present once §6 has run against this record; a
 record still `launching`/`running` has none of these yet):

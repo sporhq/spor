@@ -339,11 +339,20 @@ item that is refused, or whose run ended without resolving it, is remembered
 with the reason and retried after `--retry-after` instead of being re-attempted
 on the next poll.
 
-A slot frees when the **run record** goes terminal, not when a launcher returns
-— by then the outcome contract has filed the report and released or held the
-lease. Stopping (`SIGINT`/`SIGTERM`, or `--once`/`--max`) stops picking up new
-work; runs already in flight are detached, keep going, and self-report through
-`spor runs`.
+A slot frees when the **run record** goes terminal and its outcome is settled,
+not when a launcher returns — by then the terminal-state contract has filed the
+report and released or held the lease. There is no `--no-claim` here: the lease
+is what keeps two workers off one node, so a loop always takes it. Stopping
+(`SIGINT`/`SIGTERM`, or `--once`/`--max`) stops picking up new work; runs
+already in flight are detached, keep going, and self-report through `spor runs`.
+
+A native-background harness (`claude --bg`) is the weak spot, for the same
+reason its outcome is unenforced: its termination is not deterministically
+observable, so a slot is freed from the harness's own live-agent listing. If
+that listing cannot be read, the slot stays held and the worker says so;
+`--run-max` (default 24 hours) is the backstop that stops following such a run.
+A supervised harness — Codex, OpenCode, Copilot CLI, or a declared one — has
+none of this.
 
 Run it as a service and read it back:
 
