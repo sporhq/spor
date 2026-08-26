@@ -593,17 +593,51 @@ enumerated never goes terminal at all, so `work.runMaxMs` (`--run-max`, default
 hidden. There is deliberately no `--no-claim` passthrough (the lease is the only
 thing keeping two pull workers off one node), and numeric options are REFUSED
 rather than silently replaced (`--max $UNSET` must not become an unbounded
-worker). It never passes `--force` (a loop
+worker). The LOOP never passes `--force` (a loop
 that forces past the duplicate/resolved guards is the runaway a pull worker must
-not be), and a worker never claims a `readiness: human` item even though
+not be — the gate pipeline's bounded fix cycle below is the single deliberate
+exception), and a worker never claims a `readiness: human` item even though
 one-shot dispatch only warns on the non-`requires:human` half (WORKERS.md §3).
 Knobs: `work.concurrency` (1), `work.intervalMs` (30s), `work.maxIntervalMs`
 (the idle backoff ceiling, 5min), `work.retryAfterMs` (10min),
 `work.project` (falls back to `queue.project`). Status is machine-local under
 `journal/work/<worker>.work.json`, read back by `spor work --status [--json]` (a
-worker whose pid is gone reads STALE, never running). v1 is BARE — dispatch-only;
-task-spor-work-gate-pipeline layers gates in between claim and resolve. See
-test/work-loop.test.js. Server-side ops vars
+worker whose pid is gone reads STALE, never running). See test/work-loop.test.js.
+**The gate pipeline (task-spor-work-gate-pipeline):** the loop still runs BARE
+by default — with no factory declared nothing changes — but `work.factory`
+(`--factory <id>`) points it at a graph-resident `type: factory` node
+(candidate schemas `schema-factory`/`schema-gate`, adopted, never seed) whose
+ORDERED gate list is enforced IN CODE between the claim and the resolve, never
+handed to an orchestrator agent as prose (dec-spor-software-factory-substrate).
+The vocabulary is pure (`lib/kernel/gates.js`: parse the definition, fold inline
+and `{ref: gate-<id>}` gates into ONE list the runner cannot tell apart, match
+declared globs, read a review verdict); the execution is
+`lib/shell/gate-runner.js`, dependency-injected like the loop. Three kinds.
+**command** runs the declared suite from the TRUSTED ref — a throwaway worktree
+at the implementer's commit with every declared protected path forced back to
+`trusted_ref`'s copy — and a change that TOUCHED a protected path fails CLOSED,
+unrun and unretried, filing the test change as its own item under the declared
+`test_lane_profile` (a different lane: same entity, same misunderstanding). It
+judges COMMITTED work only — uncommitted TRACKED changes (or an unreadable `git
+status`) refuse the gate, while untracked suite residue is ignored. **agent-review**
+dispatches a profile-routed (cross-model) review through the same `cmdDispatch`
+path, waits for its terminal state, and parses a fenced-JSON findings verdict in
+code — unreadable, undispatchable or report-less is a FAILURE, never a pass (so
+the profile must be a SUPERVISED harness: the report is the verdict channel) —
+then loops implementer fix cycles up to the declared `cycles` cap (the ONE place
+the worker passes `--force`: the node reads resolved because the run resolved
+it) before escalating with a `requires: [human]` queue item. **human** arms on
+declared risk classes, files an approval item and BLOCKS the resolve until a
+live RESOLVING EDGE (approved — a bare status flip is not an approval) or any
+other terminal status (refused) answers it, reporting `blocked` at `approval_timeout_ms` rather than deciding for the
+person. Every gate outcome is a deterministic, idempotent `art-gate-*` artifact
+carrying `relates-to` the work item (never `resolves` — a gate records, it does
+not retire). Only a CLAIM is gated (`shouldGate`: a verified `resolved`, or an
+UNENFORCED `reported` where nothing could check it), the gated item HOLDS its
+slot until the pipeline settles, a failed/blocked pipeline cools the node, and a
+factory that does not validate REFUSES to start the worker rather than running it
+ungated. WORKERS.md §10 is the contract; see test/gates.test.js +
+test/gate-pipeline.test.js. Server-side ops vars
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard
 (`SPOR_DISTILLING`) are deliberately NOT config — they stay pure env.

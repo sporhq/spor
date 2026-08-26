@@ -439,6 +439,22 @@ refuses without `--force`. When a candidate stabilizes it is promoted into the
 seed pack at a release; the resident copy then shadows the seed (the
 stale-override warning above) and should be retired (`status: retired`).
 
+Three candidates ship today: `schema-edge-member-of-program` (program
+membership as its own edge type) and the pair the **software-factory gate
+pipeline** reads — `schema-factory` and `schema-gate`
+(task-spor-work-gate-pipeline). A `type: factory` node declares, in a fenced
+JSON payload, the ordered gate list a worker enforces between claim and resolve
+(`spor work --factory <id>`), plus the trusted ref its acceptance suite is taken
+from, the protected test paths that fail a gate CLOSED, the separate
+test-change lane those route to, and the named risk classes a human gate keys
+on. A `type: gate` node is ONE such gate standing alone, so an org vets a
+`gate-security-review` once and every factory references it by id — inline and
+referenced gates are the same object to the runner. Both are `capturable:
+false` (the distiller never drafts one: a factory changes what a worker will
+accept, so it is written deliberately) and both arrive by adoption rather than
+in the seed, for the same reason. WORKERS.md §10 documents the runtime
+contract; the payload keys are documented on the candidate nodes themselves.
+
 A complete worked example — a `escalation` type with a required `severity`
 field (enforced in `validate`) and an `open → mitigated → closed` status machine
 whose terminal `closed` demands a resolver (enforced in `transitions`):

@@ -456,3 +456,159 @@ A worker (and its launcher, if separate) is a conforming Spor worker when it:
       show for it (§6)
 - [ ] never claims a `readiness: human` item (§3), and never routes a
       mention-less question without stamping the session's project (§4)
+
+## 10. The gate pipeline — enforcement between the claim and the resolve
+
+Everything above says how a worker reports what it did. This section says how a
+**factory** decides whether that is good enough
+(task-spor-work-gate-pipeline, dec-spor-software-factory-substrate). The rule
+it exists to keep is one sentence: **gates are enforced in code by the runner,
+never handed to an orchestrator agent as prose instructions.** A prompt that
+asks an agent to "run the review and act on it" is not a gate — it is a
+suggestion with a plausible-looking transcript.
+
+It is entirely OPT-IN. `spor work` with no factory declared runs exactly as §1-§9
+describe. Point it at one — `spor work --factory <id>`, or the `work.factory`
+config key — and the declared gates run between the run ending and the item
+counting as done. There is no adoption cliff in either direction.
+
+### 10.1 The factory definition is graph data
+
+A `type: factory` node (candidate schema `schema-factory`; `spor schema adopt
+schema-factory`) carries a fenced JSON payload:
+
+```json
+{
+  "factory": "spor-default",
+  "trusted_ref": "main",
+  "protected_paths": ["test/**", "conformance/**"],
+  "test_lane_profile": "profile-test-writer",
+  "risk_classes": { "touches:auth": ["lib/auth.js", "**/auth/**"] },
+  "gates": [
+    {"id": "acceptance", "kind": "command", "command": "npm test", "timeout_ms": 900000},
+    {"ref": "gate-adversarial-review", "cycles": 2},
+    {"id": "security-approval", "kind": "human", "risk": ["touches:auth"]}
+  ]
+}
+```
+
+`gates` is ORDERED, and each entry is either written inline or referenced as a
+shareable `type: gate` node (`schema-gate`) — org governance vets a
+`gate-security-review` once and every factory references it. **The runner treats
+the two shapes identically**: a reference is unwrapped into exactly the object an
+inline gate would have been, with keys written beside the `ref` overriding it.
+The only visible difference is the provenance stamped on the recorded outcome.
+
+A definition that cannot be read, or that does not validate, **refuses to start
+the worker** (exit 1, naming every problem). A mistyped factory must never
+produce a worker that silently accepts everything, so the validation is
+deliberately strict: an unknown gate kind, a command gate with no command, an
+agent-review gate with no profile, a reference the graph cannot supply, a
+duplicate gate id, `protected_paths` with no `test_lane_profile` to route to,
+and a human gate naming a risk class the factory never declared are all fatal.
+
+### 10.2 What gets gated
+
+Two run outcomes, and only two (`shouldGate`, lib/shell/work-loop.js):
+
+- **`resolved`** — the run wrote a resolver and §6 verified the edge on the
+  graph. That verified claim is precisely what the gates test.
+- **an unenforced `reported`** — a run whose claim nobody could check at all
+  (local-mode dispatch, an unreachable server, a native-background launch).
+  The gates are then the only check there is, so skipping them would make
+  gating quietly mode-dependent.
+
+An ENFORCED `reported` run self-declares *not* done (the item is already back in
+the pool carrying its report) and a `failed` run produced nothing to gate.
+
+A gated item **keeps its worker slot** until the pipeline settles — a slot frees
+on a settled outcome, and a gate verdict is part of that outcome. A failed or
+blocked pipeline cools the item off for `work.retryAfterMs`, so the worker walks
+on down the queue instead of re-dispatching what its own gate just refused.
+
+### 10.3 Command gates — the trusted-ref suite, and the protected-path lane
+
+"Tests are more accurate than the code under test" only holds while the thing
+under test cannot rewrite its own judge. So a command gate:
+
+1. reads the change under judgement from the run's own working tree —
+   `merge-base(trusted_ref, HEAD)..HEAD`, **committed work only** (uncommitted
+   changes to TRACKED files refuse the gate rather than being judged: the tree
+   the gate would take is then not the tree the agent produced. Untracked
+   residue — a coverage dir, a build artifact a suite left behind — is ignored,
+   since the gate builds its own tree from the commit. A `git status` that
+   cannot be read is itself a refusal, never a clean tree);
+2. **fails CLOSED** if that change touches any declared protected test path —
+   the suite is not run at all, no fix cycle is offered, and the test change is
+   filed as its own queue item naming the `test_lane_profile` (a different lane,
+   which a `spor work --profile <lane>` worker or a person picks up). Same
+   entity, same misunderstanding: the lane that writes the test may not be the
+   lane that writes the code;
+3. otherwise materializes a throwaway git worktree at the implementer's commit
+   and **forces every protected path back to the trusted ref's copy** (files the
+   branch added under a protected path are removed), then runs the declared
+   command there.
+
+Step 3 is belt and braces — step 2 already refuses a branch that touched those
+paths — and that is the point: the guarantee that the suite is the trusted ref's
+copy does not rest on the check having run.
+
+### 10.4 Agent-review gates — a verdict that is read, not asserted
+
+The runner composes the review dispatch itself: a free-text launch under the
+gate's declared `profile` (cross-model by convention; the machine's own declared
+harness binding still decides what actually executes — a graph write never
+defines what a box runs), with a fixed prompt that ends:
+
+```json
+{"verdict": "pass" | "changes_requested", "findings": [{"severity": "...", "file": "...", "summary": "..."}]}
+```
+
+The runner then parses that block **in code** from the run's final report.
+Fail-closed throughout: a review that could not be dispatched, that never
+finished, that left no report to read (an agent-review gate must therefore route
+to a SUPERVISED harness — a native-background launch has no report channel), or
+whose verdict is unparseable or unrecognized is a gate FAILURE. An unread review
+is not an approval.
+
+On `changes_requested` with cycles left, the runner dispatches an implementer
+**fix cycle** — the findings and the evidence, at the same node, in the same
+tree — waits for it to reach a terminal state, re-reads the diff, and re-runs
+the gate. This is the one place the worker passes `--force`: the node reads
+resolved because the run resolved it, and the runner knows why it is going back.
+The declared `cycles` cap bounds it; at the cap the gate **escalates** by filing
+a `requires: [human]` queue item carrying the cycle history, and stops.
+
+### 10.5 Human gates — approval keyed on declared risk
+
+A human gate declares the `risk` classes that ARM it (a gate declaring none is
+unconditional). If the change touched none of them, the gate is `skipped` and
+recorded as such. If it did, the runner files an approval item — `requires:
+[human]`, so no worker can ever claim it — naming the risk classes and the exact
+paths, and **blocks the resolve** while polling it:
+
+- the item gains a **live resolving edge** → **approved**, the gate passes.
+  Only that; a bare status flip is not an approval, which is the same rule §6
+  applies to a worker's own claim of completion;
+- it reaches any other terminal status (`abandoned`, `closed`, `superseded`, …)
+  → **refused**, the gate fails; the approval item itself is the human record,
+  so nothing further is filed;
+- nobody answers inside `approval_timeout_ms` (default 24h) → the pipeline
+  reports **blocked**, the approval item stands, and the worker moves on rather
+  than deciding on the person's behalf.
+
+### 10.6 Every gate outcome is a graph fact
+
+Each gate — passed, skipped, failed, fail-closed or blocking — writes one
+artifact node `art-gate-<gate>-<stem>-<short-run-id>`, carrying `relates-to` the
+work item (and the escalation, where there is one), the verdict, the cycle
+history and the evidence. Deterministic and idempotent, exactly like the
+dispatch report (§7): the same gate recorded twice for one run is one node.
+
+`relates-to`, never `resolves` — a gate outcome records what the runner
+enforced; it does not retire anything. A graph that refuses the write does not
+change the verdict (the enforcement is not the bookkeeping), and the runner says
+so rather than claiming a fact it could not write.
+
+`spor work --status` reads the same story back per worker: what is gating now,
+the passed/failed/blocked tally, and the reason a gated item was cooled off.

@@ -35,6 +35,8 @@ const dispatchRuns = require(path.join(ROOT, "lib", "shell", "agent-dispatch-run
 const dispatchHarnesses = require(path.join(ROOT, "lib", "shell", "dispatch-harnesses.js"));
 const sat = require(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
 const workLoop = require(path.join(ROOT, "lib", "shell", "work-loop.js"));
+const gatesKernel = require(path.join(ROOT, "lib", "kernel", "gates.js"));
+const gateRunner = require(path.join(ROOT, "lib", "shell", "gate-runner.js"));
 // Resolution truth (lib/kernel/resolution.js): a node is "done" when it carries a
 // TERMINAL status OR a live inbound resolves/answers edge — the same partition the
 // queue ranker and read surfaces use. The dispatch guard reads it so it never
@@ -9016,17 +9018,36 @@ function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, warn = () => {} } = {}) {
 // captured via ERR_TEE — a guard that already explains itself to the operator
 // should not have to explain itself twice.
 async function dispatchWorkItem(cfg, item, passthrough) {
+  return dispatchThrough(cfg, { ...passthrough, node: item.id }, []);
+}
+
+// The shared body of the above and of the gate pipeline's review/fix launches
+// (task-spor-work-gate-pipeline): one dispatch through the real code path,
+// reporting the run it started or the refusal's own reason.
+//
+// SERIALIZED, because the refusal-reason capture is a GLOBAL sink (ERR_TEE):
+// a gate pipeline runs as a detached promise beside the loop, so without this
+// its review/fix launch could swap the sink mid-flight and file another
+// dispatch's refusal under the wrong item. The lock is held only until a
+// launch returns (seconds), never for the life of a run.
+let DISPATCH_LOCK = Promise.resolve();
+function dispatchThrough(cfg, values, positionals = []) {
+  const run = DISPATCH_LOCK.then(() => dispatchThroughLocked(cfg, values, positionals));
+  DISPATCH_LOCK = run.then(
+    () => {},
+    () => {}
+  );
+  return run;
+}
+
+async function dispatchThroughLocked(cfg, values, positionals = []) {
   const launches = [];
   const lines = [];
   const previousTee = ERR_TEE;
   ERR_TEE = lines;
   let code;
   try {
-    code = await cmdDispatch(
-      cfg,
-      { values: { ...passthrough, node: item.id }, positionals: [] },
-      { onLaunch: (l) => launches.push(l) }
-    );
+    code = await cmdDispatch(cfg, { values, positionals }, { onLaunch: (l) => launches.push(l) });
   } catch (e) {
     // A throw AFTER the launch (the post-launch session capture and bind are
     // network calls) still means an agent is running and holding a lease —
@@ -9080,18 +9101,465 @@ function cmdWorkStatus(cfg, { json }) {
         `resolved ${o.resolved || 0} reported ${o.reported || 0} failed ${o.failed || 0}` +
         `${o.unenforced ? ` (${o.unenforced} unenforced)` : ""}`
     );
+    if (w.gates) out(`  gates:    ${w.factory || "(factory)"} — passed ${w.gates.passed || 0}, failed ${w.gates.failed || 0}, blocked ${w.gates.blocked || 0}`);
     for (const a of w.active || []) out(`  active:   ${a.node_id || "(free-text)"}  run ${String(a.run_id).slice(0, 8)}  ${a.harness || ""}  since ${a.started_at}`);
+    for (const g of w.gating || []) out(`  gating:   ${g.node_id}  run ${String(g.run_id).slice(0, 8)}  since ${g.started_at}`);
     for (const r of (w.recent || []).slice(0, 5)) {
       out(
         `  done:     ${r.node_id || "(free-text)"}  ${r.terminal_state || r.state || "?"}` +
           `${r.terminal_state && !r.terminal_enforced ? " (unenforced)" : ""}` +
-          `${r.resolved_by ? ` by ${r.resolved_by}` : ""}${r.report_node_id ? ` — report ${r.report_node_id}` : ""}`
+          `${r.resolved_by ? ` by ${r.resolved_by}` : ""}${r.report_node_id ? ` — report ${r.report_node_id}` : ""}` +
+          `${r.gate ? `  gates ${r.gate}` : ""}`
       );
+      if (r.gate && r.gate !== "passed" && r.gate_reason) out(`            ${r.gate_reason}`);
     }
     for (const s of (w.skipped || []).slice(0, 5)) out(`  skipped:  ${s.id} — ${s.reason} (retry after ${s.until})`);
     if (w.next_poll_at && !w.stopped_at) out(`  next poll: ${w.next_poll_at}`);
   }
   return 0;
+}
+
+// --- the gate pipeline wiring (task-spor-work-gate-pipeline) ---------------
+// The factory definition is graph DATA (kernel/gates.js parses it); the gates
+// are enforced here, in code, between the claim and the resolve. Everything
+// below is the shell half — git plumbing, dispatch, graph writes — handed to
+// lib/shell/gate-runner.js as injected deps so the pipeline itself stays
+// drivable with fakes.
+
+// Read a `type: factory` node and every shareable `type: gate` node it
+// references, and fold them into one validated definition. Errors are FATAL to
+// the worker (cmdWork refuses to start): an operator who declared gates and
+// mistyped them must not get a silently ungated worker — that is the one
+// failure mode enforcement-in-code exists to remove.
+async function loadFactoryDefinition(cfg, id) {
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const parse = (raw, file) => {
+    try {
+      return graphLib.parseFrontmatter(raw, file);
+    } catch {
+      return {};
+    }
+  };
+  const node = await resolveNode(cfg, id);
+  if (!node || !node.raw) {
+    return { factory: null, errors: [`factory definition '${id}' could not be read from the graph`] };
+  }
+  const parsed = parse(node.raw, `${id}.md`);
+  if ((parsed.type || "") !== "factory") {
+    return {
+      factory: null,
+      errors: [
+        `'${id}' is a '${parsed.type || "?"}' node, not a 'type: factory' definition` +
+          ` (the factory schema ships as a candidate — 'spor schema adopt schema-factory')`,
+      ],
+    };
+  }
+  const errors = [];
+  const gateNodes = new Map();
+  for (const ref of gatesKernel.factoryRefs(parsed.body || "")) {
+    const gn = await resolveNode(cfg, ref);
+    if (!gn || !gn.raw) continue; // resolveGates reports the missing reference itself
+    const pg = parse(gn.raw, `${ref}.md`);
+    if ((pg.type || "") !== "gate") {
+      errors.push(`referenced gate '${ref}' is a '${pg.type || "?"}' node, not a 'type: gate' node`);
+      continue;
+    }
+    const payload = gatesKernel.fencedJson(pg.body || "");
+    if (!payload.ok) {
+      errors.push(`referenced gate '${ref}': ${payload.error}`);
+      continue;
+    }
+    gateNodes.set(ref, payload.payload);
+  }
+  const res = gatesKernel.parseFactory(parsed.body || "", { gateNodes, id });
+  return { factory: res.factory, errors: [...new Set([...errors, ...res.errors])] };
+}
+
+// The git plumbing for a command gate — reading the change under judgement,
+// materializing the trusted-ref tree, running the suite — lives in
+// lib/shell/gate-runner.js beside the pipeline it serves (and is unit-tested
+// against a real temp repo there).
+const { gateChangeSet, prepareGateTree, runGateCommand } = gateRunner;
+
+// Follow a gate's own dispatched run (a review, a fix cycle) to its terminal
+// state. Bounded — a review that never ends must fail its gate rather than hold
+// the worker's slot for the life of the process.
+async function awaitGateRun(cfg, runId, { timeoutMs, pollMs = 5000, warn = () => {}, sleep, now = () => Date.now() }) {
+  const deadline = now() + timeoutMs;
+  for (;;) {
+    let verdict = null;
+    try {
+      verdict = pollWorkRuns(cfg, [runId], { maxAgeMs: 0, warn })[0];
+    } catch (e) {
+      return { ok: false, reason: `the run record could not be read: ${e.message}` };
+    }
+    if (verdict && verdict.terminal) return { ok: true, record: verdict.record };
+    const at = now();
+    if (at >= deadline) {
+      return { ok: false, reason: `the run did not reach a terminal state within ${Math.round(timeoutMs / 60000)}m ('spor runs' still follows it)`, record: verdict && verdict.record };
+    }
+    await sleep(Math.min(pollMs, Math.max(1000, deadline - at)));
+  }
+}
+
+// A dispatched run's own final report text — the channel a review gate's
+// structured verdict comes back on. Supervised launches write it; a native
+// background launch does not, which is why an agent-review gate must be routed
+// to a supervised profile (the gate says so when the text is missing).
+function gateRunReportText(record) {
+  const file = record && record.report_path;
+  if (!file) return "";
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+// Write a gate's node — a fact, an escalation, an approval — through the same
+// validated door `spor put-node` uses, idempotently (a deterministic id written
+// twice is one node, never two).
+async function writeGateNode(cfg, id, markdown) {
+  if (cfg.mode() === "remote") {
+    const r = await remote.post(cfg, "/v1/nodes", { nodes: [{ node: markdown, if_exists: "skip" }] }, { timeoutMs: 15000 });
+    if (r.transport) return { ok: false, reason: `offline — ${r.error}` };
+    const res0 = r.json && r.json.results && r.json.results[0];
+    if (res0 && (res0.ok === true || res0.status === "skipped" || res0.status === "created")) return { ok: true, id };
+    return { ok: false, reason: putNodeEntryError(res0, r.status, "gate") };
+  }
+  const dir = cfg.nodesDir();
+  try {
+    if (!fs.existsSync(dir)) return { ok: false, reason: `no graph at ${dir} — run 'spor init' first` };
+    const file = path.join(dir, `${id}.md`);
+    if (fs.existsSync(file)) {
+      // if_exists: skip, with the ONE distinction the remote door also draws:
+      // the same id carrying DIFFERENT content is not this write landing, it is
+      // a collision — and for an approval item, silently adopting one would let
+      // an already-answered item pass a gate nobody looked at.
+      const same = fs.readFileSync(file, "utf8") === markdown;
+      return same ? { ok: true, id, existing: true } : { ok: false, id, existing: true, reason: `${id} already exists with different content — refusing to adopt another gate's node` };
+    }
+    // The same validation the local `put-node` door runs: a malformed gate node
+    // written straight to disk would break loadGraph for everything downstream.
+    const parsed = parsePutNode(markdown, `${id}.md`);
+    if (parsed.error) return { ok: false, reason: parsed.error };
+    const valid = validatePutNodeLocal(dir, parsed.node, markdown);
+    if (valid.error) return { ok: false, reason: valid.error };
+    fs.writeFileSync(file, markdown);
+    return { ok: true, id };
+  } catch (e) {
+    return { ok: false, reason: e.message };
+  }
+}
+
+function gateStem(nodeId) {
+  return String(nodeId || "item")
+    .replace(/^[a-z]+-/, "")
+    .replace(/[^a-z0-9]+/gi, "-")
+    .replace(/^-+|-+$/g, "")
+    .toLowerCase()
+    .slice(0, 30)
+    .replace(/-+$/, "") || "item";
+}
+
+function gateShortRun(runId) {
+  return String(runId || "").replace(/[^a-z0-9]/gi, "").slice(0, 8).toLowerCase() || "unknown";
+}
+
+// The id suffix and the two body-safety helpers are the gate runner's, so the
+// facts it mints and the work nodes minted here can never drift apart.
+const { gateIdSuffix, fenceSafe, capBytes: gateCapBytes, NODE_BODY_CAP_BYTES } = gateRunner;
+
+// One work-node template for the three items a gate can file. All three are
+// ordinary queue items — an escalation and an approval carry `requires: [human]`
+// so no worker (this one included) can ever claim them, which is what makes
+// "escalates to a human" true rather than decorative.
+function buildGateWorkNode({ id, title, summary, body, project, date, edges = [], requiresHuman = false, profile = null }) {
+  // The frontmatter parser is line-based: a title or summary carrying a newline
+  // (a git message, a suite's first failing line) would truncate the node. Flatten
+  // and cap both, the same discipline the dispatch report artifact keeps.
+  const flat = (text, cap) => {
+    const t = String(text || "").replace(/\s+/g, " ").trim();
+    return t.length > cap ? `${t.slice(0, cap - 1)}…` : t;
+  };
+  const lines = [
+    "---",
+    `id: ${id}`,
+    "type: task",
+    ...(project ? [`project: ${project}`] : []),
+    `title: ${flat(title, 120)}`,
+    `summary: ${flat(summary, 460)}`,
+    `date: ${date}`,
+    ...(requiresHuman ? ["requires: [human]"] : []),
+    ...(profile ? [`profile: ${profile}`] : []),
+    ...(edges.length ? ["edges:", ...edges.map((e) => `  - {type: ${e.type}, to: ${e.to}}`)] : []),
+    "---",
+    "",
+    body,
+    "",
+  ];
+  // The server rejects a node whose BODY exceeds 8192 bytes outright, and these
+  // bodies are unbounded by construction — 20 findings, a suite tail, one line
+  // per protected path. An escalation nobody could file is a gate refusal
+  // nobody is told about, so the body is trimmed here rather than lost there.
+  return gateCapBytes(lines.join("\n"), NODE_BODY_CAP_BYTES - 512);
+}
+
+// How an approval item is READ (WORKERS.md §10.5). Deliberately not the
+// dispatch guard's "is this resolved?" reading, whose terminal-status branch
+// counts every retiring status — `closed`, `superseded`, `abandoned` — as
+// resolved. That polarity is right for "would dispatching this redo finished
+// work" and exactly wrong here, where it would turn a dismissal into an
+// approval. So: a live inbound RESOLVING edge approves; any other terminal
+// status is a refusal; anything else is still pending.
+async function gateApprovalState(cfg, id) {
+  const node = await resolveNode(cfg, id);
+  if (!node) return { state: "pending" };
+  const status = (node.status || "").toLowerCase();
+  if (node.resolution && node.resolution.by) return { state: "approved", by: node.resolution.by };
+  if (cfg.mode() !== "remote") {
+    // Local mode has no server-side `resolution` enrichment; read the same
+    // inbound-resolver join off the loaded graph (the resolution kernel), which
+    // also sees a graph-resident schema's non-resolving statuses.
+    try {
+      const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+      const g = graphLib.loadGraph(cfg.nodesDir());
+      const r = resolutionOf(g, id);
+      if (r && r.by) return { state: "approved", by: r.by };
+      const n = g.nodes[id];
+      if (n && isTerminalStatus(n.status, n.type, g)) return { state: "rejected", by: status };
+      return { state: "pending" };
+    } catch {
+      // An unreadable graph is not an approval.
+      return { state: "pending" };
+    }
+  }
+  // Remote: the server already told us there is no resolver, so a terminal
+  // status can only be a non-resolving one.
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  // The TIERED rule (dec-spor-offline-inert-tiered-fallback): a server-computed
+  // `inert` is authoritative BOTH ways, and only a server that said nothing
+  // falls through to the offline seed check. Written as `inert === true || …`
+  // an explicit `false` would be overruled by a seed pack that has not seen this
+  // graph's resident schema — refusing an approval the person is still owed.
+  if (graphLib.isNodeInertOffline(node.inert, status, node.type || null)) {
+    return { state: "rejected", by: status };
+  }
+  return { state: "pending" };
+}
+
+// The deps one gate pipeline runs on: git plumbing against THIS run's tree,
+// dispatches through the real `spor dispatch`, and graph writes through the
+// validated node door.
+function makeGateDeps(cfg, { record, entry, factory, slug, passthrough, warn, sleep, log, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, stopping = () => false }) {
+  const date = () => new Date().toISOString().slice(0, 10);
+  const stem = gateStem(entry.node_id);
+  const short = gateShortRun(entry.run_id);
+  let change = null;
+
+  const review = async ({ gate, cycle }) => {
+    if (!change) return { ok: false, reason: "the change under review could not be read" };
+    const prompt = [
+      `You are the '${gate.id}' review gate for Spor work item ${entry.node_id}.`,
+      `Review the change \`git diff ${change.base}..${change.head}\` in ${change.cwd} — that diff, nothing else.`,
+      gate.instructions || "Look for correctness defects: does this change do what the work item asked, and does it break anything?",
+      "",
+      "Do NOT edit any file, and do NOT resolve, close, or write any Spor node: you are a gate, not an implementer.",
+      "",
+      "End your final message with your verdict as a fenced json block, exactly this shape:",
+      "```json",
+      '{"verdict": "pass" | "changes_requested", "findings": [{"severity": "blocking|major|minor", "file": "path", "summary": "what is wrong"}]}',
+      "```",
+      'Use "pass" only when nothing blocking remains. An unreadable verdict counts as changes_requested.',
+    ].join("\n");
+    const launched = await dispatchThrough(
+      cfg,
+      { ...passthrough, profile: gate.profile, dir: change.cwd, "no-brief": true, "no-worktree": true, name: `gate-${gate.id}-${short}-${cycle}` },
+      [prompt]
+    );
+    if (!launched.ok) return { ok: false, reason: `the review under ${gate.profile} could not be dispatched: ${launched.reason}` };
+    const done = await awaitGateRun(cfg, launched.run.run_id, { timeoutMs: gate.awaitMs, warn, sleep });
+    if (!done.ok) return { ok: false, reason: done.reason };
+    const text = gateRunReportText(done.record);
+    if (!text.trim()) {
+      return {
+        ok: false,
+        reason:
+          `the review run under ${gate.profile} left no final report to read a verdict from` +
+          ` (an agent-review gate must route to a SUPERVISED harness — a native background launch has no report channel)`,
+      };
+    }
+    return { ok: true, text, runId: launched.run.run_id };
+  };
+
+  const fix = async ({ gate, cycle, findings, detail, evidence }) => {
+    // The one place the worker deliberately passes --force. The loop never
+    // does (a loop that forces past the resolved/duplicate guards is the
+    // runaway a pull worker must not be), but here the runner KNOWS why the
+    // node reads resolved — its own gate just refused that resolution — and the
+    // cycle cap bounds how often this can happen before a person is asked.
+    const prompt = [
+      `The '${gate.id}' gate refused your resolution of ${entry.node_id}.`,
+      "",
+      detail || "",
+      "",
+      findings && findings.length ? `Findings:\n${gatesKernel.renderFindings(findings)}` : "",
+      evidence ? `Evidence:\n${String(evidence).slice(0, 4000)}` : "",
+      "",
+      "Fix the cause in the same worktree and commit. The gate will re-run against the trusted ref's copy of the",
+      "acceptance suite, so do not edit protected test paths — a change that touches them fails the gate closed.",
+    ]
+      .filter((l) => l !== "")
+      .join("\n");
+    const launched = await dispatchThrough(
+      cfg,
+      { ...passthrough, node: entry.node_id, dir: change ? change.cwd : undefined, force: true, "no-worktree": true, name: `fix-${gate.id}-${short}-${cycle}` },
+      [prompt]
+    );
+    if (!launched.ok) return { ok: false, reason: launched.reason };
+    // The operator's own ceiling on how long this box follows a run (--run-max),
+    // not a second hardcoded day: a fix cycle holds a gating slot exactly as a
+    // dispatched run holds an active one.
+    const done = await awaitGateRun(cfg, launched.run.run_id, { timeoutMs: runMaxMs, warn, sleep });
+    if (!done.ok) return { ok: false, reason: done.reason };
+    return { ok: true, runId: launched.run.run_id, record: done.record };
+  };
+
+  return {
+    now: () => Date.now(),
+    sleep,
+    // A worker asked to stop does not keep a human gate waiting: the pipeline
+    // reports it BLOCKED (the approval item stands, unanswered) rather than
+    // pretending to a verdict nobody gave.
+    stopping,
+    changedPaths: async ({ trustedRef }) => {
+      change = null;
+      const c = gateChangeSet(record, trustedRef);
+      if (!c.ok) return c;
+      change = c;
+      return c;
+    },
+    runSuite: async ({ gate, trustedRef, protectedPaths }) => {
+      if (!change) return { ok: false, reason: "the change under judgement could not be read" };
+      const tree = prepareGateTree(change, { trustedRef, protectedPaths });
+      if (!tree.ok) return tree;
+      try {
+        return await runGateCommand(gate, tree.dir);
+      } finally {
+        // AFTER the await, not after the call: runGateCommand is async, so a
+        // bare `return` here would tear the worktree down under a running suite.
+        tree.cleanup();
+      }
+    },
+    review,
+    fix,
+    recordFact: ({ id, markdown }) => writeGateNode(cfg, id, markdown),
+    fileTestLaneItem: async ({ gate, paths, profile }) => {
+      const id = `task-test-lane-${stem}-${short}-${gateIdSuffix("test-lane", gate.id, entry.node_id, entry.run_id)}`;
+      const body = [
+        `The implementer's branch for ${entry.node_id} changed protected test path(s):`,
+        "",
+        paths.slice(0, 50).map((p) => `- \`${p}\``).join("\n") + (paths.length > 50 ? `\n- …and ${paths.length - 50} more` : ""),
+        "",
+        `The \`${gate.id}\` command gate therefore failed CLOSED — the acceptance suite is never run from a`,
+        "branch that edits it, because the same entity writing the test and the code under test carries the",
+        "same misunderstanding into both (dec-spor-software-factory-substrate).",
+        "",
+        `Make the test change here instead, in the separate lane: run it under \`${profile}\`, e.g.`,
+        "",
+        `    spor dispatch ${id} --profile ${profile}`,
+        "",
+        `(or point a worker at the lane: \`spor work --profile ${profile}\`.) Once the test change lands on the`,
+        `trusted ref, re-dispatch ${entry.node_id} and its gate runs against the new trusted suite.`,
+      ].join("\n");
+      return writeGateNode(
+        cfg,
+        id,
+        buildGateWorkNode({
+          id,
+          title: `Test-change lane — ${entry.node_id} edited protected test paths`,
+          summary: `The gated change for ${entry.node_id} touched ${paths.length} protected test path(s); the test change belongs in the ${profile} lane, not the implementer's branch.`,
+          body,
+          project: slug,
+          date: date(),
+          profile,
+          edges: [{ type: "relates-to", to: entry.node_id }, ...(profile ? [{ type: "relates-to", to: profile }] : [])],
+        })
+      );
+    },
+    fileHumanItem: async ({ gate, classes }) => {
+      const id = `task-approve-${gate.id.slice(0, 24)}-${stem}-${short}-${gateIdSuffix("approve", gate.id, entry.node_id, entry.run_id)}`.toLowerCase();
+      const body = [
+        `The \`${gate.id}\` human gate is armed for ${entry.node_id}: the change touches` +
+          (classes.length ? ` the declared risk class(es) ${classes.map((c) => `\`${c.class}\``).join(", ")}.` : " work this factory always has a person approve."),
+        "",
+        ...(classes.length
+          ? classes.map((c) => `- \`${c.class}\`: ${c.paths.slice(0, 8).map((p) => `\`${p}\``).join(", ")}${c.paths.length > 8 ? ` (+${c.paths.length - 8} more)` : ""}`)
+          : []),
+        "",
+        gate.instructions || "Review the change and decide whether it may stand.",
+        "",
+        `The worker is BLOCKED on this: ${entry.node_id} is not treated as done until this item is answered.`,
+        "",
+        "To APPROVE, resolve this item — capture the decision and point it here:",
+        "",
+        `    spor add "Approved the ${gate.id} gate on ${entry.node_id} — <why>"`,
+        `    spor edge <the-new-node-id> resolves ${id}`,
+        "",
+        "To REFUSE:",
+        "",
+        `    spor set-status ${id} abandoned`,
+      ].join("\n");
+      return writeGateNode(
+        cfg,
+        id,
+        buildGateWorkNode({
+          id,
+          title: `Approval — ${gate.id} gate on ${entry.node_id}`,
+          summary: `A person must approve the ${gate.id} gate for ${entry.node_id}${classes.length ? ` (risk: ${classes.map((c) => c.class).join(", ")})` : ""}; the worker blocks its resolve until this is answered.`,
+          body,
+          project: slug,
+          date: date(),
+          requiresHuman: true,
+          edges: [{ type: "relates-to", to: entry.node_id }],
+        })
+      );
+    },
+    checkApproval: ({ id }) => gateApprovalState(cfg, id),
+    escalate: async ({ gate, attempts, detail, evidence, findings }) => {
+      const id = `task-gate-${gate.id.slice(0, 24)}-${stem}-${short}-${gateIdSuffix("escalate", gate.id, entry.node_id, entry.run_id)}`.toLowerCase();
+      const cycles = attempts.length;
+      const body = [
+        `The \`${gate.kind}\` gate \`${gate.id}\` refused ${entry.node_id} and its fix cycles are spent`,
+        `(${cycles} attempt${cycles === 1 ? "" : "s"}, cap ${gate.cycles}). A person decides what happens next —`,
+        "the worker has stopped re-dispatching it.",
+        "",
+        detail ? `Last outcome: ${detail}` : "",
+        "",
+        ...(findings && findings.length ? ["Findings:", "", gatesKernel.renderFindings(findings), ""] : []),
+        ...(evidence ? ["Evidence:", "", "```", fenceSafe(String(evidence).slice(0, 3000)), "```", ""] : []),
+        ...(cycles > 1 ? ["Cycles:", ...attempts.map((a, i) => `${i + 1}. ${a.verdict} — ${String(a.detail || "").slice(0, 200)}`), ""] : []),
+        `The run's own record is \`${entry.run_id}\` ('spor runs ${entry.run_id}').`,
+      ]
+        .filter((l) => l !== "")
+        .join("\n");
+      return writeGateNode(
+        cfg,
+        id,
+        buildGateWorkNode({
+          id,
+          title: `Gate escalation — ${gate.id} refused ${entry.node_id}`,
+          summary: `The ${gate.id} ${gate.kind} gate refused ${entry.node_id} after ${cycles} cycle(s); it needs a person${detail ? `: ${String(detail).slice(0, 200)}` : "."}`,
+          body,
+          project: slug,
+          date: date(),
+          requiresHuman: true,
+          edges: [{ type: "relates-to", to: entry.node_id }],
+        })
+      );
+    },
+    log,
+  };
 }
 
 async function cmdWork(cfg, { values }) {
@@ -9137,6 +9605,24 @@ async function cmdWork(cfg, { values }) {
     return 1;
   }
 
+  // The GATE PIPELINE (task-spor-work-gate-pipeline), opt-in and graph-resident:
+  // with no factory declared the loop runs exactly as it shipped. A declared one
+  // that cannot be read or does not validate REFUSES to start the worker —
+  // gates are enforcement, and the one thing a mistyped definition must never
+  // produce is a worker that silently accepts everything.
+  const factoryId = values.factory || cfg.get("work.factory", null) || null;
+  let factory = null;
+  if (factoryId) {
+    const loaded = await loadFactoryDefinition(cfg, factoryId);
+    if (!loaded.factory) {
+      err(`spor work: the factory definition '${factoryId}' cannot be used:`);
+      for (const e of loaded.errors) err(`  ${e}`);
+      err("  a worker does not run ungated on a definition it could not read — fix the factory node, or drop --factory/work.factory.");
+      return 1;
+    }
+    factory = loaded.factory;
+  }
+
   // Passed straight through to every dispatch this loop makes. Deliberately NOT
   // --force: a loop that forces past the duplicate/resolved guards is exactly
   // the runaway a pull worker must not be.
@@ -9169,6 +9655,16 @@ async function cmdWork(cfg, { values }) {
     out(`project: ${slug || "(all projects)"}`);
     out(`loop:    concurrency ${concurrency}, interval ${intervalMs / 1000}s, backoff to ${maxIntervalMs / 1000}s, retry refused after ${retryAfterMs / 1000}s, stop following a run after ${runMaxMs / 3600000}h${max ? `, stop after ${max}` : ""}`);
     out(`status:  ${workLoop.workDir(cfg.userConfigHome())}`);
+    if (factory) {
+      out(`factory: ${factoryId} — trusted ref ${factory.trustedRef}${factory.protectedPaths.length ? `, protected ${factory.protectedPaths.join(" ")} -> ${factory.testLaneProfile}` : ""}`);
+      for (const g of factory.gates) {
+        const how =
+          g.kind === "command" ? `\`${g.command}\`` : g.kind === "agent-review" ? `review under ${g.profile}` : `approval${g.risk.length ? ` when ${g.risk.join("/")}` : " (always)"}`;
+        out(`  gate ${g.id}  ${g.kind}  ${how}${g.cycles ? `  (up to ${g.cycles} fix cycle${g.cycles === 1 ? "" : "s"})` : ""}${g.source !== "inline" ? `  [${g.source}]` : ""}`);
+      }
+    } else {
+      out(`factory: none — the loop runs bare (declare one with --factory <id> or work.factory)`);
+    }
     const cands = workLoop.selectWorkCandidates(await candidates(), {});
     if (!cands.length) out("queue:   nothing dispatchable right now");
     else {
@@ -9217,7 +9713,7 @@ async function cmdWork(cfg, { values }) {
   out(`work: status at ${workLoop.workerStatusPath(home, workerId)}  ('spor work --status')`);
   const final = await workLoop.runWorkLoop({
     opts: {
-      workerId, project: slug, concurrency, intervalMs, maxIntervalMs, retryAfterMs, max, once: !!values.once,
+      workerId, project: slug, concurrency, intervalMs, maxIntervalMs, retryAfterMs, max, once: !!values.once, factory: factoryId,
       // The pid-reuse guard for this record: a SIGKILLed worker leaves no
       // stopped_at, and a bare pid probe would read its recycled pid as this
       // worker still running (the same identity check the run store makes).
@@ -9230,6 +9726,33 @@ async function cmdWork(cfg, { values }) {
       pollRuns: (ids) => pollWorkRuns(cfg, ids, { maxAgeMs: runMaxMs, warn }),
       publish: (status) => workLoop.writeWorkerStatus(home, status),
       log: (line) => out(line),
+      // Present only when a factory resolved, so a bare worker's deps — and its
+      // behavior — are byte-identical to what shipped.
+      ...(factory
+        ? {
+            gate: (entry, record) =>
+              gateRunner.runGatePipeline({
+                item: { ...entry, project: slug },
+                factory,
+                log: (line) => out(line),
+                deps: makeGateDeps(cfg, {
+                  record,
+                  entry,
+                  factory,
+                  slug,
+                  passthrough,
+                  warn,
+                  runMaxMs,
+                  log: (line) => out(line),
+                  stopping: () => !!control.stopping,
+                  // A plain timer, NOT the loop's wakeable sleep: that one has a
+                  // single wake slot the loop owns, and a gate sharing it would
+                  // silently cancel the loop's own backoff.
+                  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+                }),
+              }),
+          }
+        : {}),
       sleep: (ms) =>
         new Promise((resolve) => {
           const done = () => {
@@ -9246,6 +9769,9 @@ async function cmdWork(cfg, { values }) {
   });
   const o = final.outcomes;
   out(`work: ${final.stop_reason}. dispatched ${final.dispatched}; resolved ${o.resolved}, reported ${o.reported}, failed ${o.failed}${o.unenforced ? ` (${o.unenforced} unenforced)` : ""}.`);
+  if (final.gates) {
+    out(`work: gates — passed ${final.gates.passed}, failed ${final.gates.failed}, blocked ${final.gates.blocked} (factory ${factoryId}).`);
+  }
   if (final.active.length) out(`work: ${final.active.length} run(s) still in flight — 'spor runs' follows them to their terminal state.`);
   return 0;
 }
@@ -11351,11 +11877,29 @@ const COMMANDS = {
       "journal; a worker whose process is gone reads as stale, never as running.\n" +
       "Tune with the work.* config keys (concurrency, intervalMs, maxIntervalMs,\n" +
       "retryAfterMs, project) so the unit file can be a bare 'spor work'.\n\n" +
-      "v1 runs BARE by design: dispatch-only, no gates. The deterministic gate\n" +
-      "pipeline (task-spor-work-gate-pipeline) layers in between claim and resolve\n" +
-      "when a factory definition resolves, so adoption has no cliff.",
+      "GATES (task-spor-work-gate-pipeline). With no factory declared the loop runs\n" +
+      "BARE — dispatch-only, exactly as it shipped. Point --factory (or work.factory)\n" +
+      "at a 'type: factory' node and its ordered gate list is ENFORCED in code between\n" +
+      "the claim and the resolve: a run that came back 'resolved' holds its slot while\n" +
+      "the pipeline runs, and a gate that refuses cools the item off instead of\n" +
+      "counting it done. Three gate kinds, inline in the factory node or referenced as\n" +
+      "shareable 'type: gate' nodes (the runner treats them identically):\n\n" +
+      "  command       runs the declared suite from the TRUSTED ref, never the\n" +
+      "                implementer branch's copy of the tests; a branch that touched a\n" +
+      "                declared protected test path fails CLOSED, unrun, and the test\n" +
+      "                change is routed to a separate lane under another profile\n" +
+      "  agent-review  dispatches a profile-routed (cross-model) review, parses its\n" +
+      "                structured findings verdict IN CODE — an unreadable verdict is\n" +
+      "                never a pass — loops implementer fix cycles up to the declared\n" +
+      "                cap, then escalates by filing a human queue item\n" +
+      "  human         keyed on declared risk classes; files an approval item and\n" +
+      "                BLOCKS the resolve until a person answers it\n\n" +
+      "Every gate outcome is written as a graph fact linked to the work item. A\n" +
+      "factory that cannot be read, or does not validate, REFUSES to start the worker\n" +
+      "rather than running it ungated. See WORKERS.md §10.",
     options: {
       project: { type: "string", value: "S", desc: "scope to a project slug (default: work.project/queue.project, else the whole queue)" },
+      factory: { type: "string", value: "factory-id", desc: "the graph-resident factory definition whose gates every run must pass (default: work.factory; absent = bare loop)" },
       concurrency: { type: "string", value: "N", desc: "how many runs to keep in flight (default 1)" },
       interval: { type: "string", value: "S", desc: "seconds between polls (default 30)" },
       "max-interval": { type: "string", value: "S", desc: "backoff ceiling in seconds when idle (default 300)" },
@@ -11381,7 +11925,7 @@ const COMMANDS = {
       print: { type: "boolean", desc: "dry run — show the scope, the pacing and the candidates; launch nothing" },
       "dry-run": DRYRUN_OPT,
     },
-    examples: ["spor work", "spor work --project spor --concurrency 2", "spor work --once --max 1 --print", "spor work --status --json"],
+    examples: ["spor work", "spor work --project spor --concurrency 2", "spor work --factory factory-spor-default", "spor work --once --max 1 --print", "spor work --status --json"],
     run: (cfg, p) => cmdWork(cfg, p),
   },
   runs: {
@@ -11693,7 +12237,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged };
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode };
 
 if (require.main === module) {
   main()

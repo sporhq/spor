@@ -366,9 +366,36 @@ reads as stale, never as running. The `work.*` config keys (`concurrency`,
 `intervalMs`, `maxIntervalMs`, `retryAfterMs`, `project`) let a unit file be a
 bare `spor work`.
 
-v1 runs bare by design — dispatch-only, no gates. The deterministic gate
-pipeline layers in between claim and resolve when a factory definition
-resolves, so adoption has no cliff.
+### Gates — what has to be true before work counts as done
+
+A worker with no factory declared runs bare: dispatch, await, repeat. Point it
+at a **factory definition** — a `type: factory` node in the graph — and its
+ordered gate list is enforced, in code, between the claim and the resolve.
+
+```bash
+spor schema adopt schema-factory            # the factory/gate schemas ship as candidates
+spor work --factory factory-spor-default    # (or set work.factory)
+spor work --print --factory factory-spor-default   # see the gates without launching anything
+```
+
+Three kinds of gate, written inline in the factory or referenced as shareable
+`type: gate` nodes an org vets once and reuses (the runner cannot tell them
+apart):
+
+- **command** — runs the declared acceptance suite from the **trusted ref**,
+  never the implementer branch's copy of the tests. A change that touched a
+  declared protected test path fails **closed**, unrun, and the test change is
+  filed for a separate lane under a different profile.
+- **agent-review** — dispatches a profile-routed, cross-model review and parses
+  its structured findings verdict in code. An unreadable verdict is a failure,
+  never a pass. Failures loop implementer fix cycles up to a declared cap, then
+  escalate by filing an item a person has to answer.
+- **human** — armed by declared risk classes (`touches:auth`, …); files an
+  approval item and blocks the resolve until someone answers it.
+
+Every gate outcome is written to the graph as a fact linked to the work item,
+and a factory that does not validate refuses to start the worker rather than
+letting it run ungated. [WORKERS.md](WORKERS.md) §10 is the full contract.
 
 ### Choosing a harness
 

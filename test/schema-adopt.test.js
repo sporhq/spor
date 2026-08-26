@@ -146,9 +146,13 @@ test("schema adopt --activate (local) registers the type and clears the overview
   // Before adoption the overview footers the unadopted candidate (both the
   // spor CLI and the direct lib/schema.js CLI — mode-parity bytes).
   let r = run(["schema"], { SPOR_HOME: home });
-  assert.match(r.stdout, /1 candidate schema ships with this package but is not in this registry — see: spor schema candidates/);
+  // Count-agnostic: the pack grows (schema-factory/schema-gate joined it with
+  // task-spor-work-gate-pipeline), and this test is about the FOOTER, not the
+  // size of the pack.
+  assert.match(r.stdout, /\d+ candidate schemas? ships? with this package but (is|are) not in this registry — see: spor schema candidates/);
+  const before = Number(r.stdout.match(/(\d+) candidate schemas? ship/)[1]);
   const direct = spawnSync(process.execPath, [SCHEMA_CLI, "--nodes", nodes], { encoding: "utf8", env: bare() });
-  assert.match(direct.stdout, /candidate schema ships with this package/);
+  assert.match(direct.stdout, /candidate schemas? ships? with this package/);
 
   r = run(["schema", "adopt", MOP.id, "--activate"], { SPOR_HOME: home });
   assert.strictEqual(r.status, 0, r.stderr);
@@ -160,7 +164,8 @@ test("schema adopt --activate (local) registers the type and clears the overview
 
   r = run(["schema"], { SPOR_HOME: home });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.ok(!/candidate schema/.test(r.stdout), "footer gone once the type is registered");
+  const after = r.stdout.match(/(\d+) candidate schemas? ship/);
+  assert.strictEqual(after ? Number(after[1]) : 0, before - 1, "the adopted type drops out of the footer");
 });
 
 test("schema adopt (local) is idempotent — a current resident is a no-op", () => {
