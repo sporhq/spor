@@ -7820,7 +7820,7 @@ function renderLaunchArg(arg) {
 
 async function launchSupervisedHarness(cfg, {
   adapter, command, args, cwd, name, nodeId, prompt, server, childToken, mcpToken, bindToken,
-  renewToken, renewNode,
+  renewToken, renewNode, releaseNode, project,
 }) {
   const runId = crypto.randomUUID();
   const p = dispatchRuns.runPaths(cfg.userConfigHome(), runId);
@@ -7857,6 +7857,15 @@ async function launchSupervisedHarness(cfg, {
     scratch_path: p.scratch,
     server: server || null,
     renew_node: renewNode || null,
+    // The terminal-state contract's inputs (task-spor-dispatch-terminal-states-
+    // contract): the node to verify a resolving edge on and file the report
+    // against, the project to stamp that report artifact with, and — separately
+    // — the lease this invocation established and may therefore hand back. A
+    // `--force` re-dispatch renews someone else's live lease, so `renew_node`
+    // is deliberately NOT the release gate.
+    node_id: nodeId || null,
+    release_node: releaseNode || null,
+    project: project || null,
   }, null, 2) + "\n");
   dispatchRuns.atomicJson(p.record, record);
 
@@ -7982,6 +7991,19 @@ function cmdRuns(cfg, { values, positionals: pos }) {
   for (const r of runs) {
     const cls = r.termination_class ? ` — ${r.termination_class}${r.termination_signal ? `/${r.termination_signal}` : ""}` : "";
     out(`${r.run_id.slice(0, 8)}  ${r.state}${cls}  ${r.node_id || r.name || "(free-text)"}  ${r.harness}  ${r.created_at || ""}`);
+    // The OUTCOME, kept visibly apart from the process `state` above: what the
+    // run did to the graph, and whether anyone verified it
+    // (task-spor-dispatch-terminal-states-contract). `unenforced` is a
+    // first-class label, never omitted — a best-effort classification must not
+    // read like a checked one.
+    if (r.terminal_state) {
+      out(`  outcome:    ${r.terminal_state}${r.terminal_enforced ? "" : " (unenforced)"}${r.resolved_by ? ` by ${r.resolved_by}` : ""}`);
+      if (r.terminal_note) out(`  note:       ${r.terminal_note}`);
+      if (r.report_node_id) out(`  artifact:   ${r.report_node_id}`);
+      if (r.lease_released === false && r.terminal_enforced && r.node_id) {
+        out(`  lease:      still held — release it with 'spor release ${r.node_id}'`);
+      }
+    }
     if (r.termination_reason) out(`  why:        ${r.termination_reason}`);
     if (r.child_reaped) out(`  reaped:     an orphaned harness child was terminated at reconciliation`);
     if (r.cwd) out(`  cwd:        ${r.cwd}`);
@@ -8683,6 +8705,8 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
       bindToken: agentToken,
       renewToken: agentToken || personToken,
       renewNode: nodeId && !backfill && !noClaim ? nodeId : null,
+      releaseNode: claimEstablished ? nodeId : null,
+      project: res.slug || null,
     });
     if (!launched.ok) {
       err(`could not launch ${harnessBin}: ${launched.error}`);
@@ -8729,6 +8753,12 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     dispatchRuns.updateRun(nativeRun, {
       state: "failed_launch", termination_class: "launch", termination_signal: "launch-failed",
       termination_reason: r.error.message, error: r.error.message, finished_at: new Date().toISOString(),
+      // A terminal record must always carry an outcome
+      // (task-spor-dispatch-terminal-states-contract). Nothing here was checked
+      // against the graph — no agent ever ran — so it is unenforced, and the
+      // lease is handed back by releaseClaimOnAbort() below rather than by the
+      // contract.
+      ...dispatchRuns.unenforcedOutcome("failed_launch", "the harness process could not be started, so nothing was verified against the graph"),
     });
     err(`could not launch ${harnessBin}: ${r.error.message}`);
     await releaseClaimOnAbort();
@@ -8742,6 +8772,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
         termination_class: "launch", termination_signal: "launcher-nonzero",
         termination_reason: `${harnessBin} exited ${r.status == null ? "abnormally" : r.status} without leaving a background agent`,
         finished_at: new Date().toISOString(),
+        ...dispatchRuns.unenforcedOutcome("failed_launch", "the harness left no background agent, so nothing was verified against the graph"),
       });
   out(`run:     ${nativeRun.runId} (${harnessAdapter.label}; 'spor runs' for its outcome)`);
   if (!launcherOk) {
