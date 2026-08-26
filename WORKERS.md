@@ -429,6 +429,20 @@ A record with `terminal_state` unset (or `state` still non-terminal) has not
 finished; poll or watch the record file rather than assuming absence means
 failure.
 
+**Gate dimension** (gate-armed workers only, §10 — absent everywhere else, and
+written only after the outcome dimension exists):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `gate_state` | string | `"running"` \| `"interrupted"` \| `"passed"` \| `"failed"` \| `"blocked"` — the last thing a gate pipeline said about this run. The three verdicts are SETTLED; the other two mean a pipeline started and never reported, which is what a later worker resumes from (§10.8) |
+| `gate_worker` | string | the worker id that last touched it |
+| `gate_at` | ISO 8601 | when that stamp was written |
+| `gate_reason` | string | optional — the settled verdict's one-line reason |
+
+A consumer reading `gate_state` as a verdict must check it is one of the three
+settled values: `running` under a worker that is gone is a claim nobody
+finished judging, not a pass.
+
 **Retention.** Terminal records age out after `dispatch.runRetentionMs`
 (default 14 days — a config-cascade key, set in `.spor.json` or
 `$SPOR_HOME/config.json`; there is no env-var override) — read a record's
@@ -522,9 +536,14 @@ An ENFORCED `reported` run self-declares *not* done (the item is already back in
 the pool carrying its report) and a `failed` run produced nothing to gate.
 
 A gated item **keeps its worker slot** until the pipeline settles — a slot frees
-on a settled outcome, and a gate verdict is part of that outcome. A failed or
-blocked pipeline cools the item off for `work.retryAfterMs`, so the worker walks
-on down the queue instead of re-dispatching what its own gate just refused.
+on a settled outcome, and a gate verdict is part of that outcome. Its node is
+also **out of candidate selection** for as long as it is gating — for every
+worker on the box, not just the one holding it (§10.8): gating is unfinished
+work, so a free slot never re-dispatches the item a gate is still judging. A
+failed or blocked pipeline cools the item off for
+`work.retryAfterMs`, so the worker walks on down the queue instead of
+re-dispatching what its own gate just refused — and demotes it on the graph
+(§10.7), because a cooldown is machine-local and a refusal must not be.
 
 ### 10.3 Command gates — the trusted-ref suite, and the protected-path lane
 
@@ -612,3 +631,112 @@ so rather than claiming a fact it could not write.
 
 `spor work --status` reads the same story back per worker: what is gating now,
 the passed/failed/blocked tally, and the reason a gated item was cooled off.
+
+### 10.7 A refusal is graph state, not a machine-local cooldown
+
+The gate necessarily runs AFTER the run wrote its resolver, so a refused claim
+is one the graph is *already carrying as finished* — a `resolved` run means §6
+verified the resolving edge. Cooling the node off is machine-local and says
+nothing to any other reader. So a failed or blocked pipeline also **demotes the
+item on the graph**, in two parts that do different jobs:
+
+- the person's item the gate filed — escalation, approval, or test-change lane —
+  carries **`blocks`** onto the work item, not `relates-to`. **This is the
+  fail-closed half**: it is a live `requires: [human]` queue item that names the
+  work item as its dependent, so the refusal is a graph fact any reader can
+  follow and the person's own queue surfaces it. It is written into that node at
+  file time, so the dependency lands in one validated write and can never be
+  half-applied;
+- the work item's own **completion status is rolled back** to `open`, so the
+  status-derived surfaces stop reporting the refused claim as finished — `spor
+  get`'s ⚠ for an open status contradicting a resolving edge, work analytics,
+  and `spor work --status`. Only a claim of completion is touched (the type's
+  declared `status.completion`, e.g. a task's `done`): an item that never left
+  the queue is left exactly as it is, and a deliberately `abandoned` one is never
+  reopened — a gate refuses "this is finished", it does not reverse a person's
+  decision to drop the work.
+
+What the rollback deliberately does **not** do is put the item back in the
+queue. Queue liveness is derived from the resolving **edge**, not the status
+(`lib/kernel/queue.js` retires a node with a live inbound `resolves`/`answers`
+regardless of what `status` says), and this runner never retracts an edge: the
+client has no edge-removal door, and the resolver node is the agent's own
+durable record of what it did — deleting the link would destroy evidence in
+order to express a verdict. That is the right shape for a refusal: the item must
+NOT come back round to a worker behind a person's back. The escalation is the
+live item now; a person who agrees with the gate retires the resolver themselves.
+
+A **passing** gate never re-flips the status either. Writing `done` would be the
+runner asserting completion, and a gate records what was enforced — it does not
+retire anything. So an item demoted by one cycle and approved in a later one is
+closed out by the person who approved it (the schema's read hook already flags
+the open-status-with-a-resolving-edge state with a ⚠).
+
+Fail-soft, like the fact write: a graph that refuses the demotion does not turn
+a refusal into a pass. The runner says what it could not do — on the gate fact
+(`Demotion: …`), in the log line, and as `demoted`/`demote_reason` on the
+worker's `recent` entry.
+
+### 10.8 An interrupted pipeline is resumed, not lost
+
+A dispatched run is a detached process that owns its own terminal contract, so a
+worker that stops leaves it to finish and self-report (§1). A **gate pipeline is
+different**: it is the one piece of work the worker PROCESS owns, so a worker
+that is stopped or killed abandons it — and the run it was judging is already
+terminal and (for a `resolved` one) already out of every queue, so no candidate
+poll would ever come back to it. Left there, the claim stands permanently
+un-judged, which is the single outcome a factory exists to prevent.
+
+Two durable records make it recoverable by any later worker on the box:
+
+- each pipeline stamps **`gate_state`** on its run record — `running` when it
+  starts, `interrupted` when a stop abandons it, and the settled verdict
+  (`passed`/`failed`/`blocked`) when it reports. A settled verdict is FINAL for
+  that run: nothing may overwrite it, so a duplicate pipeline (see below) can
+  never launder a `failed` into a `passed`, and a stop cannot reopen one. On the
+  way out of the loop the worker makes one last pass over its pipelines, so a
+  verdict that landed while it was stopping is recorded rather than thrown away
+  for the next worker to re-derive;
+- the per-worker status file already records which slots that worker held, and
+  `spor work --status` already reads a worker whose pid is gone as STALE.
+
+A gate-armed worker joins the two at each pass, **before** taking new work: a
+slot — `gating` or `active` — held by a worker that is not live, whose run
+record is terminal, carries a claim worth gating (§10.2), and has no settled
+`gate_state`, is adopted and re-gated.
+
+**A resumed pipeline re-runs its gates from the first one.** `gate_state` is one
+word about the whole pipeline; there is no per-gate progress record, so the
+suite runs again, the review is dispatched again, and the fix loop is re-entered
+from cycle 0. The fact *nodes* are idempotent (deterministic ids), so the graph
+record does not double — but the side effects are not, and one of them matters:
+a fix cycle dispatches an implementer at the node with `--force` and
+`--no-worktree`, into the run's own checkout, and the abandoned pipeline may
+have left exactly such an agent running (it is a detached process that outlived
+its worker). So an orphan whose **node still has a non-terminal run record is
+deferred**, not adopted — the next pass takes it once that agent's run is
+terminal. A record aged past the worker's own watchdog ceiling is not evidence
+of a live agent, so it cannot defer an orphan forever.
+
+Scoping the candidate set to slots a work loop actually held is what keeps this
+from becoming "gate every run ever dispatched on this box": a hand-run `spor
+dispatch`, or a run from a worker that had no factory, was never owed a gate and
+is never resumed. Resumption is bounded by the free slots, so a backlog is
+worked down over passes rather than spawning a pipeline per orphan at once, and
+it sits under the same wind-down guards as a dispatch — a worker past its
+`--max`, or draining a `--once` run, leaves the orphans for the next worker,
+which is exactly what they are for.
+
+**Two workers on one box** are kept off a single orphan by two independent
+exclusions, because they see each other through two files that both lag: run ids
+in a live worker's own published slots, and run records already claimed
+`running` by a live `gate_worker` (stamped *before* the slot is published, so it
+is the earlier signal). The residual is a genuine read-read race — both scanning
+before either writes — which cannot be closed without a cross-process lock, so
+its *damage* is bounded instead: the gate facts are idempotent, and a settled
+`gate_state` is final, so a duplicate pipeline can never overwrite the winner's
+`failed` with its own `passed`. A live worker's gating nodes are also subtracted
+from every worker's candidate poll, so a second worker does not *dispatch* the
+node a first is gating (a gated run is terminal, so the in-flight agent guard
+cannot see it, and an unenforced `reported` one has already handed its lease
+back).

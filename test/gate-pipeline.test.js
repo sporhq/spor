@@ -4,11 +4,15 @@
 //
 //   1. the PIPELINE (lib/shell/gate-runner.js) driven with fakes: all three gate
 //      kinds, inline and referenced, the fix-cycle loop, the cycle-cap
-//      escalation, and the graph fact every outcome leaves behind;
+//      escalation, the graph fact every outcome leaves behind, and the
+//      DEMOTION a refusal writes (§10.7 — a refused claim must stop reading
+//      done everywhere, not just in this box's cooldown map);
 //   2. the COMMAND GATE's git plumbing against a REAL throwaway repo — the one
 //      test that has to be real, because the claim being made is "the suite that
 //      runs is the trusted ref's copy, never the implementer branch's";
-//   3. the LOOP's slot accounting around a gate pipeline, and the standing
+//   3. the LOOP's slot accounting around a gate pipeline — including that a
+//      gating item is out of candidate selection, and that a pipeline a dead
+//      worker abandoned is RESUMED rather than lost (§10.8) — plus the standing
 //      guarantee that a worker with no factory behaves exactly as it did before;
 //   4. the CLI end to end in a scratch graph home — a declared factory refuses
 //      to start a worker if it does not validate, and a real dispatch's gate
@@ -47,8 +51,8 @@ const BASE = {
 // A fake world: what the diff says, what the suite does, what a review answers,
 // what the graph accepts. Every write is captured so the tests can assert on
 // the FACTS, which is the deliverable, not just on the verdict.
-function fakes({ changed = ["lib/x.js"], suite = () => ({ ok: true }), review = () => ({ ok: true, text: '```json\n{"verdict":"pass"}\n```' }), fix = () => ({ ok: true }), approval = () => ({ state: "approved", by: "person-a" }), writes = null } = {}) {
-  const seen = { facts: [], lane: [], human: [], escalations: [], suites: [], reviews: [], fixes: [], approvals: 0, slept: 0 };
+function fakes({ changed = ["lib/x.js"], suite = () => ({ ok: true }), review = () => ({ ok: true, text: '```json\n{"verdict":"pass"}\n```' }), fix = () => ({ ok: true }), approval = () => ({ state: "approved", by: "person-a" }), demote = () => ({ ok: true, demoted: true, note: "task-demo rolled back done -> open" }), writes = null } = {}) {
+  const seen = { facts: [], lane: [], human: [], escalations: [], demotions: [], suites: [], reviews: [], fixes: [], approvals: 0, slept: 0 };
   let clock = 1_700_000_000_000;
   const deps = {
     now: () => clock,
@@ -88,6 +92,10 @@ function fakes({ changed = ["lib/x.js"], suite = () => ({ ok: true }), review = 
     escalate: async (args) => {
       seen.escalations.push(args);
       return { ok: true, id: `task-gate-${args.gate.id}` };
+    },
+    demote: async (args) => {
+      seen.demotions.push(args);
+      return demote(args, seen);
     },
   };
   return { deps, seen };
@@ -291,6 +299,89 @@ test("a graph that refuses the fact write does not change the verdict — the en
   const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
   assert.strictEqual(res.state, "passed");
   assert.deepStrictEqual(res.facts, [], "and it does not claim a fact it could not write");
+});
+
+// ------------------------------------------------ a refusal DEMOTES the item --
+// The gate necessarily runs AFTER the run wrote its resolver, so a refused
+// claim is one the graph is already carrying as finished. A machine-local
+// cooldown does not touch that — every other reader would go on calling it done
+// — so the refusal has to become graph state.
+
+test("a FAILED gate demotes the work item on the graph, naming the escalation that now blocks it", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", cycles: 0 }] });
+  const { deps, seen } = fakes({ suite: () => ({ ok: false, code: 1, output: "1 failing" }) });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(seen.demotions.length, 1, "a refusal that lives only in this box's cooldown map is not enforcement");
+  assert.strictEqual(seen.demotions[0].item.node_id, "task-demo");
+  assert.strictEqual(seen.demotions[0].state, "failed");
+  assert.strictEqual(
+    seen.demotions[0].blockerId,
+    "task-gate-acceptance",
+    "the demotion names the escalation, so it is filed BEFORE the item is demoted — never a demoted item with nothing to point at"
+  );
+  assert.strictEqual(res.demoted, true);
+  assert.strictEqual(res.demote_reason, null);
+  // And the gate's own fact records the demotion, so the graph carries the
+  // whole story rather than half of it.
+  assert.match(seen.facts[0].markdown, /Demotion: task-demo rolled back done -> open/);
+});
+
+test("a BLOCKED human gate demotes too — an unanswered approval is not an approval", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "security", kind: "human", risk: ["touches:auth"], approval_timeout_ms: 0 }] });
+  const { deps, seen } = fakes({ changed: ["lib/auth.js"], approval: () => ({ state: "pending" }) });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "blocked");
+  assert.strictEqual(seen.demotions.length, 1);
+  assert.strictEqual(seen.demotions[0].state, "blocked");
+  assert.strictEqual(seen.demotions[0].blockerId, "task-approve-x", "the approval item is the blocker");
+  assert.strictEqual(res.demoted, true);
+});
+
+test("a PASSING pipeline demotes nothing — a gate records what was enforced, it never retires or reopens", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+  const { deps, seen } = fakes();
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.deepStrictEqual(seen.demotions, []);
+  assert.strictEqual(res.demoted, undefined, "and a pass carries no demotion dimension at all");
+});
+
+test("a demotion the graph refuses is REPORTED, not swallowed — and never turns a refusal into a pass", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", cycles: 0 }] });
+  const { deps, seen } = fakes({
+    suite: () => ({ ok: false, code: 1 }),
+    demote: () => ({ ok: false, reason: "offline — could not reach server" }),
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed", "the enforcement is the verdict, not the bookkeeping");
+  assert.strictEqual(res.demoted, false);
+  assert.match(res.demote_reason, /offline/);
+  assert.match(seen.facts[0].markdown, /Demotion: the item could not be demoted on the graph \(offline/);
+});
+
+test("an escalation that could not be filed still demotes, and the note never implies a blocker that does not exist", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", cycles: 0 }] });
+  const { deps, seen } = fakes({
+    suite: () => ({ ok: false, code: 1 }),
+    demote: ({ blockerId }) => ({ ok: true, demoted: true, note: blockerId ? `blocked by ${blockerId}` : "nothing blocks task-demo" }),
+  });
+  deps.escalate = async () => ({ ok: false, reason: "the graph refused the write" });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(res.escalated_to, null, "nothing was filed");
+  assert.strictEqual(seen.demotions.length, 1, "the status rollback is still worth doing without a blocker");
+  assert.strictEqual(seen.demotions[0].blockerId, null);
+  assert.match(seen.facts[0].markdown, /Demotion: nothing blocks task-demo/);
+});
+
+test("a pipeline with no demote dep at all still settles — the step is optional, like every other write", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", cycles: 0 }] });
+  const { deps } = fakes({ suite: () => ({ ok: false, code: 1 }) });
+  delete deps.demote;
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(res.demoted, false);
 });
 
 // ------------------------------------------------ the command gate, for real --
@@ -557,6 +648,357 @@ test("only a claimed completion is gated: an enforced 'reported' run is not, an 
   assert.strictEqual(workLoop.shouldGate({}), false);
 });
 
+// A gating item is UNFINISHED work: its node is not a candidate. Without this
+// the second free slot re-dispatches the very item the first gate is judging —
+// and for a `resolved` run there is no cooldown standing in the way, because a
+// resolved item is supposed to have left the queue by itself.
+test("a GATING item is not a candidate: a free slot never re-dispatches what this worker's own gate is still judging", async () => {
+  const state = { clock: 1_700_000_000_000, runs: new Map(), dispatched: [], gateCalls: 0, ticks: 0 };
+  const control = { stopping: false, reason: null, wake: () => {} };
+  let seq = 0;
+  const deps = {
+    now: () => state.clock,
+    log: () => {},
+    publish: () => {},
+    candidates: async () => [{ id: "task-a" }],
+    dispatch: async (item) => {
+      const runId = `run-${++seq}`;
+      state.dispatched.push(item.id);
+      state.runs.set(runId, { run_id: runId, node_id: item.id, state: "done", terminal_state: "resolved", terminal_enforced: true });
+      return { ok: true, run: { run_id: runId, harness: "fake" } };
+    },
+    pollRuns: async (ids) => ids.map((id) => ({ run_id: id, terminal: true, record: state.runs.get(id) })),
+    // A pipeline that never settles — a human gate waiting on a person.
+    gate: () => {
+      state.gateCalls += 1;
+      return new Promise(() => {});
+    },
+    sleep: async (ms) => {
+      state.clock += ms;
+      if ((state.ticks += 1) >= 4) control.stopping = true;
+    },
+  };
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 2, intervalMs: 1000 }, deps, control });
+  assert.deepStrictEqual(state.dispatched, ["task-a"], "one dispatch, not one per free slot");
+  assert.strictEqual(state.gateCalls, 1, "and one gate pipeline, not a second racing the first");
+  assert.strictEqual(status.gating.length, 1);
+});
+
+// ------------------------------------------- interrupted pipelines, resumed --
+// A gate pipeline is the ONE piece of work the worker PROCESS owns, so a worker
+// that dies mid-pipeline abandons it — and the run it was judging is already
+// terminal and already out of the queue, so no candidate poll would ever come
+// back to it. "Re-gates on the next run" has to be something a worker does.
+
+const ORPHAN_RECORD = { run_id: "run-orphan", node_id: "task-orphan", state: "done", terminal_state: "resolved", terminal_enforced: true, finished_at: "2026-08-26T00:00:00.000Z" };
+
+test("orphanedGateRuns joins the dead workers' slots to the run journal, and no live worker's", () => {
+  const records = new Map([["run-orphan", ORPHAN_RECORD]]);
+  const slot = { run_id: "run-orphan", node_id: "task-orphan", harness: "fake" };
+  const dead = (extra = {}) => ({ worker_id: "w1", live: false, gating: [slot], active: [], ...extra });
+
+  assert.deepStrictEqual(
+    workLoop.orphanedGateRuns([dead()], { records }).map((o) => [o.run_id, o.node_id]),
+    [["run-orphan", "task-orphan"]]
+  );
+
+  // A LIVE worker owns its own slots — two workers must not both resume one.
+  assert.deepStrictEqual(workLoop.orphanedGateRuns([{ ...dead(), live: true }], { records }), []);
+  assert.deepStrictEqual(
+    workLoop.orphanedGateRuns([dead(), { worker_id: "w2", live: true, gating: [slot], active: [] }], { records }),
+    [],
+    "a run a live worker is already gating is not an orphan, whoever else once held it"
+  );
+
+  // An ACTIVE slot counts too: a worker killed with runs in flight never
+  // reaches the harvest that would have started their gates.
+  assert.strictEqual(workLoop.orphanedGateRuns([dead({ gating: [], active: [slot] })], { records }).length, 1);
+
+  // A settled verdict is not an orphan; an unsettled stamp is.
+  for (const gate_state of ["passed", "failed", "blocked"]) {
+    assert.deepStrictEqual(workLoop.orphanedGateRuns([dead()], { records: new Map([["run-orphan", { ...ORPHAN_RECORD, gate_state }]]) }), []);
+  }
+  for (const gate_state of ["running", "interrupted"]) {
+    assert.strictEqual(workLoop.orphanedGateRuns([dead()], { records: new Map([["run-orphan", { ...ORPHAN_RECORD, gate_state }]]) }).length, 1, gate_state);
+  }
+
+  // Nothing to gate, nothing to resume: a pruned record, a run with no claim,
+  // and a run past the worker's own ceiling on how long it follows one.
+  assert.deepStrictEqual(workLoop.orphanedGateRuns([dead()], { records: new Map() }), []);
+  assert.deepStrictEqual(
+    workLoop.orphanedGateRuns([dead()], { records: new Map([["run-orphan", { ...ORPHAN_RECORD, terminal_state: "reported", terminal_enforced: true }]]) }),
+    [],
+    "an enforced 'reported' run self-declares not-done — there is no claim to gate"
+  );
+  assert.deepStrictEqual(
+    workLoop.orphanedGateRuns([dead()], { records, now: () => Date.parse("2026-09-30T00:00:00.000Z"), maxAgeMs: 86400000 }),
+    []
+  );
+
+  // A run record already claimed `running` by a worker that is STILL LIVE is
+  // that worker's, even though nothing has settled: a worker stamps the record
+  // before it publishes its slot, so this is the earlier of the two signals
+  // that keep two workers off one orphan.
+  const claimed = new Map([["run-orphan", { ...ORPHAN_RECORD, gate_state: "running", gate_worker: "w9" }]]);
+  assert.deepStrictEqual(workLoop.orphanedGateRuns([dead(), { worker_id: "w9", live: true, gating: [], active: [] }], { records: claimed }), []);
+  assert.strictEqual(
+    workLoop.orphanedGateRuns([dead(), { worker_id: "w9", live: false, gating: [], active: [] }], { records: claimed }).length,
+    1,
+    "…but the same claim from a worker that is GONE is exactly what a resume is for"
+  );
+});
+
+// A resumed pipeline RE-RUNS its gates from the first one, and a fix cycle
+// dispatches an implementer with --force --no-worktree into the run's own
+// checkout. The abandoned pipeline's fix agent is DETACHED and outlived the
+// worker that started it, so adopting while it works would put two agents in
+// one checkout — the hazard worktree isolation exists to remove.
+test("an orphan whose node still has a live run is DEFERRED, not adopted — never two agents in one checkout", () => {
+  const TERMINAL = new Set(["done", "failed", "failed_launch", "vanished"]);
+  const dead = { worker_id: "w1", live: false, gating: [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake" }], active: [] };
+  const withFix = (state) =>
+    new Map([
+      ["run-orphan", ORPHAN_RECORD],
+      // The fix cycle the abandoned pipeline dispatched at the same node.
+      ["run-fix", { run_id: "run-fix", node_id: "task-orphan", state, created_at: new Date().toISOString() }],
+    ]);
+
+  assert.deepStrictEqual(
+    workLoop.orphanedGateRuns([dead], { records: withFix("running"), terminalStates: TERMINAL }),
+    [],
+    "a live agent at that node defers the resume"
+  );
+  assert.strictEqual(
+    workLoop.orphanedGateRuns([dead], { records: withFix("done"), terminalStates: TERMINAL }).length,
+    1,
+    "deferred, not dropped: once that agent's run is terminal the orphan is adopted"
+  );
+  // A record aged past the worker's own watchdog ceiling is not evidence of a
+  // live agent — that is precisely the record runHarvest gives up on — so it
+  // must not defer the orphan forever.
+  const stale = new Map([
+    ["run-orphan", ORPHAN_RECORD],
+    ["run-fix", { run_id: "run-fix", node_id: "task-orphan", state: "running", created_at: "2020-01-01T00:00:00.000Z" }],
+  ]);
+  assert.strictEqual(workLoop.orphanedGateRuns([dead], { records: stale, terminalStates: TERMINAL, maxAgeMs: 86400000 }).length, 1);
+});
+
+test("gatingNodeIds names what LIVE workers are gating — the cross-worker half of the candidate exclusion", () => {
+  const ids = workLoop.gatingNodeIds([
+    { worker_id: "a", live: true, gating: [{ run_id: "r1", node_id: "task-a" }], active: [{ run_id: "r9", node_id: "task-active" }] },
+    { worker_id: "b", live: false, gating: [{ run_id: "r2", node_id: "task-b" }] },
+    { worker_id: "c", live: true, gating: [] },
+    null,
+  ]);
+  // A live worker's gating node only. A DEAD worker's is not excluded — that
+  // one is an orphan to be resumed, not work in progress — and `active` is
+  // already covered by the in-flight agent guard.
+  assert.deepStrictEqual([...ids], ["task-a"]);
+  assert.deepStrictEqual([...workLoop.gatingNodeIds(null)], []);
+});
+
+test("a worker RESUMES an unfinished gate pipeline before taking new work, and stamps the verdict on the run record", async () => {
+  const marks = [];
+  const h = loopHarness({ queue: [], gate: () => ({ state: "failed", reason: "the acceptance suite still fails" }), maxPasses: 6 });
+  h.deps.markGate = (runId, patch) => marks.push({ run_id: runId, ...patch });
+  // The real scan stops offering a run once a LIVE worker stamps it `running`.
+  h.deps.pendingGates = async () =>
+    marks.some((m) => m.gate_state === "running") ? [] : [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake", record: ORPHAN_RECORD }];
+
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w2", concurrency: 1, intervalMs: 1000 }, deps: h.deps, control: h.control });
+  assert.strictEqual(h.state.gateCalls.length, 1, "the abandoned pipeline is picked up, not left standing forever");
+  assert.strictEqual(h.state.gateCalls[0].entry.node_id, "task-orphan");
+  assert.strictEqual(status.gates.failed, 1);
+  assert.deepStrictEqual(status.gating, []);
+  assert.strictEqual(status.recent[0].node_id, "task-orphan");
+  assert.strictEqual(status.recent[0].gate, "failed", "and the resumed run gets its verdict on the status surface");
+  assert.strictEqual(status.skipped[0].id, "task-orphan", "a refused resume cools the node like any other");
+  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["running", "failed"]);
+  assert.strictEqual(marks[0].gate_worker, "w2");
+  assert.ok(marks.every((m) => m.gate_at), "every stamp is dated");
+});
+
+test("resumption is bounded by the free slots, comes AHEAD of new work, and stops when the worker winds down", async () => {
+  const state = { clock: 1_700_000_000_000, ticks: 0, dispatched: 0, gated: [] };
+  const control = { stopping: false, reason: null, wake: () => {} };
+  const orphan = (n) => ({ run_id: `run-orphan-${n}`, node_id: `task-orphan-${n}`, harness: "fake", record: { ...ORPHAN_RECORD, run_id: `run-orphan-${n}`, node_id: `task-orphan-${n}` } });
+  const deps = {
+    now: () => state.clock,
+    log: () => {},
+    publish: () => {},
+    candidates: async () => [{ id: "task-a" }],
+    dispatch: async () => {
+      state.dispatched += 1;
+      return { ok: true, run: { run_id: "run-new", harness: "fake" } };
+    },
+    pollRuns: async (ids) => ids.map((id) => ({ run_id: id, terminal: true, record: { run_id: id, node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true } })),
+    // Three orphans on offer, on every pass, forever.
+    pendingGates: async () => [orphan(1), orphan(2), orphan(3)],
+    gate: (entry) => {
+      state.gated.push(entry.node_id);
+      return { state: "passed" };
+    },
+    sleep: async (ms) => {
+      state.clock += ms;
+      if ((state.ticks += 1) >= 6) control.stopping = true; // a backstop; --once should end this first
+    },
+  };
+  await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 2, intervalMs: 1000, once: true }, deps, control });
+  // Pass 1 has two free slots: both go to orphans, ahead of the queue —
+  // finishing what this box already promised to judge outranks starting
+  // something else. The third waits for a slot; a DRAINING pass (--once, past
+  // its first) takes on nothing new, so it waits for the next worker instead.
+  assert.deepStrictEqual(state.gated, ["task-orphan-1", "task-orphan-2"]);
+  assert.strictEqual(state.dispatched, 0, "the free slots went to the unfinished gates, not to new work");
+});
+
+test("a stop folds in the verdicts that DID land before abandoning the rest", async () => {
+  // The loop has SEVERAL exits, and the one a signal actually takes is not the
+  // stop-condition step: `control.stopping` is set by a handler at any instant,
+  // and a stop that lands during slot-filling breaks out at the end of the pass
+  // — after that pass's settle has already run. A pipeline that reported in
+  // that window has a verdict, and abandoning it so the next worker re-runs the
+  // whole thing (a suite, a review dispatch, a fix cycle) is pure waste. So the
+  // final fold lives on the way OUT of the loop, where every exit reaches it.
+  const marks = [];
+  const state = { clock: 1_700_000_000_000, ticks: 0 };
+  const control = { stopping: false, reason: null, wake: () => {} };
+  const settle = new Map(); // run_id -> resolve
+  const deps = {
+    now: () => state.clock,
+    log: () => {},
+    publish: () => {},
+    candidates: async () => {
+      // A pass with a free slot reaches the queue poll — and this is where the
+      // SIGTERM lands, mid-pass, with one pipeline's verdict arriving with it.
+      if (settle.has("run-task-a") && !control.stopping) {
+        settle.get("run-task-a")({ state: "failed", reason: "the suite fails" });
+        await new Promise((r) => setImmediate(r)); // let the verdict reach its job handle
+        control.stopping = true;
+      }
+      return [{ id: "task-a" }, { id: "task-b" }];
+    },
+    dispatch: async (item) => ({ ok: true, run: { run_id: `run-${item.id}`, harness: "fake" } }),
+    pollRuns: async (ids) =>
+      ids.map((id) => ({ run_id: id, terminal: true, record: { run_id: id, node_id: id.replace("run-", ""), state: "done", terminal_state: "resolved", terminal_enforced: true } })),
+    gate: (entry) => new Promise((resolve) => settle.set(entry.run_id, resolve)),
+    markGate: (runId, patch) => marks.push({ run_id: runId, ...patch }),
+    sleep: async (ms) => {
+      state.clock += ms;
+      state.ticks += 1;
+      await new Promise((r) => setImmediate(r)); // the pipelines start in a microtask
+      if (state.ticks > 5) control.stopping = true; // a backstop, never reached
+    },
+  };
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 3, intervalMs: 1000 }, deps, control });
+  assert.strictEqual(status.gates.failed, 1, "a verdict that exists is recorded, not thrown away for the next worker to re-run");
+  assert.deepStrictEqual(status.gating.map((g) => g.node_id), ["task-b"], "and only the pipeline that never reported is abandoned");
+  assert.deepStrictEqual(
+    marks.filter((m) => m.run_id === "run-task-a").map((m) => m.gate_state),
+    ["running", "failed"],
+    "the settled run is stamped with its verdict, never 'interrupted'"
+  );
+  assert.deepStrictEqual(
+    marks.filter((m) => m.run_id === "run-task-b").map((m) => m.gate_state),
+    ["running", "interrupted"],
+    "and the one that never reported is left in the state the next worker resumes from"
+  );
+});
+
+test("a stop marks its abandoned pipelines INTERRUPTED — the state the next worker resumes from", async () => {
+  const marks = [];
+  const state = { clock: 1_700_000_000_000, ticks: 0 };
+  const control = { stopping: false, reason: null, wake: () => {} };
+  const deps = {
+    now: () => state.clock,
+    log: () => {},
+    publish: () => {},
+    candidates: async () => [{ id: "task-a" }],
+    dispatch: async () => ({ ok: true, run: { run_id: "run-1", harness: "fake" } }),
+    pollRuns: async (ids) => ids.map((id) => ({ run_id: id, terminal: true, record: { run_id: id, node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true } })),
+    gate: () => new Promise(() => {}),
+    markGate: (runId, patch) => marks.push({ run_id: runId, ...patch }),
+    sleep: async (ms) => {
+      state.clock += ms;
+      if ((state.ticks += 1) >= 2) control.stopping = true;
+    },
+  };
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000 }, deps, control });
+  assert.strictEqual(status.gating.length, 1, "the slot stays in the published record — it is what the next worker joins on");
+  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["running", "interrupted"]);
+});
+
+test("the resume scan reads back what the run journal and the worker status files actually store", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-resume-"));
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  const runId = "11111111-2222-3333-4444-555555555555";
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, {
+    run_id: runId, node_id: "task-orphan", state: "done", terminal_state: "resolved", terminal_enforced: true, created_at: new Date().toISOString(),
+  });
+  // A worker record with a pid that is gone: STALE, never running (the same
+  // reading `spor work --status` gives an operator).
+  workLoop.writeWorkerStatus(home, {
+    worker_id: "dead", pid: 999999, started_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+    active: [], gating: [{ run_id: runId, node_id: "task-orphan", harness: "fake", started_at: new Date().toISOString() }],
+  });
+  const scan = () =>
+    workLoop.orphanedGateRuns(workLoop.readWorkerStatuses(home, { alive: () => false }), {
+      records: new Map(dispatchRuns.readRunRecords(home).map((r) => [r.run_id, r])),
+    });
+  assert.deepStrictEqual(scan().map((o) => o.node_id), ["task-orphan"]);
+
+  // …and once a pipeline settles, the stamp takes it out of the scan for good.
+  assert.ok(dispatchRuns.stampGateState(home, runId, { gate_state: "passed", gate_at: new Date().toISOString() }));
+  assert.deepStrictEqual(scan(), []);
+  assert.strictEqual(dispatchRuns.stampGateState(home, "no-such-run", { gate_state: "passed" }), null);
+
+  // A SETTLED verdict is final for this run. Two workers can, in a narrow
+  // window, both adopt one orphan; without this the loser's later `passed`
+  // would overwrite the winner's refusal — a refusal laundered into an
+  // approval, the one direction this feature must never fail in.
+  const refused = dispatchRuns.stampGateState(home, runId, { gate_state: "failed", gate_reason: "the suite fails" });
+  assert.strictEqual(refused.gate_state, "passed", "the settled verdict stands");
+  assert.strictEqual(refused.gate_reason, undefined);
+  assert.strictEqual(
+    dispatchRuns.stampGateState(home, runId, { gate_state: "interrupted" }).gate_state,
+    "passed",
+    "and a stop cannot reopen one either"
+  );
+  assert.strictEqual(dispatchRuns.stampGateState(home, runId, { terminal_state: "failed" }), null, "a patch with nothing of its own writes nothing at all");
+});
+
+test("a gate stamp only ever writes its own namespace, and survives the writers that own the record", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-stamp-"));
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  const runId = "22222222-3333-4444-5555-666666666666";
+  const paths = dispatchRuns.runPaths(home, runId);
+  const base = { run_id: runId, node_id: "task-x", state: "done", terminal_state: "resolved", terminal_enforced: true, contract_pending: true };
+  dispatchRuns.atomicJson(paths.record, base);
+
+  // The process and outcome dimensions (§8) are not reachable from a gate
+  // stamp, whatever a caller passes.
+  const stamped = dispatchRuns.stampGateState(home, runId, { gate_state: "running", gate_worker: "w1", terminal_state: "failed", state: "vanished" });
+  assert.deepStrictEqual(
+    [stamped.terminal_state, stamped.state, stamped.gate_state, stamped.gate_worker],
+    ["resolved", "done", "running", "w1"]
+  );
+
+  // …and the reverse: a supervised record goes terminal carrying a PROVISIONAL
+  // `contract_pending` outcome, and the loop harvests (and starts gating) it
+  // once the contract grace elapses. The supervisor's own later write comes
+  // from an IN-MEMORY copy that predates the stamp, so without carrying the
+  // namespace across it would silently erase the gate verdict this feature
+  // promises is durable.
+  const handle = { paths, record: { ...base } };
+  dispatchRuns.updateRun(handle, { terminal_note: "verified on the graph", contract_pending: false });
+  const after = dispatchRuns.readJson(paths.record);
+  assert.strictEqual(after.contract_pending, false, "the supervisor's own patch still lands");
+  assert.strictEqual(after.gate_state, "running", "and the out-of-band gate stamp survives it");
+  assert.strictEqual(after.gate_worker, "w1");
+});
+
 // ------------------------------------------- the approval oracle + gate ids --
 
 const sporCli = require("../bin/spor.js");
@@ -593,6 +1035,113 @@ test("an approval item approves ONLY on a resolving edge — every other termina
   const approved = await sporCli.gateApprovalState(cfg, "task-approve-y");
   assert.strictEqual(approved.state, "approved");
   assert.strictEqual(approved.by, "dec-approved-it");
+});
+
+// The demotion's own write door. Only a claim of COMPLETION is rolled back: a
+// gate refuses "this is finished", it never reopens a person's decision to drop
+// the work — and it never touches the resolving EDGE, which is the agent's own
+// record of what it did and the evidence the escalation asks a person to judge.
+test("a refused item's COMPLETION status is rolled back — and nothing else is", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-demote-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const write = (id, status, extra = "") =>
+    fs.writeFileSync(
+      path.join(nodes, `${id}.md`),
+      `---\nid: ${id}\ntype: task\ntitle: Add bounded retry to the sync worker\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: ${status}\n${extra}date: 2026-08-26\n---\n\nBody.\n`
+    );
+  const statusOf = (id) => /^status: (.+)$/m.exec(fs.readFileSync(path.join(nodes, `${id}.md`), "utf8"))[1];
+
+  // The whole point: the run wrote a resolver, so the graph reads DONE. The
+  // gate refused it, and the graph must stop saying so.
+  write("task-done", "done");
+  fs.writeFileSync(
+    path.join(nodes, "dec-resolver.md"),
+    "---\nid: dec-resolver\ntype: decision\ntitle: Added bounded retry\nsummary: Added bounded retry with backoff to the sync worker, so a transient failure retries instead of dropping.\ndate: 2026-08-26\nedges:\n  - {type: resolves, to: task-done}\n---\n\nBody.\n"
+  );
+  const demoted = await sporCli.gateDemoteItem(cfg, "task-done", { blockerId: "task-gate-acceptance" });
+  assert.strictEqual(demoted.ok, true);
+  assert.strictEqual(demoted.demoted, true);
+  assert.match(demoted.note, /task-done rolled back done -> open; task-gate-acceptance now blocks task-done/);
+  assert.strictEqual(statusOf("task-done"), "open");
+  assert.ok(fs.existsSync(path.join(nodes, "dec-resolver.md")), "the resolver node is left standing — it is the evidence, not the verdict");
+  assert.match(fs.readFileSync(path.join(nodes, "dec-resolver.md"), "utf8"), /type: resolves/, "and its edge is never retracted (this client has no edge-removal door)");
+
+  // Nothing to roll back: the ordinary local-mode case, where the run only ever
+  // `reported` and the item never left the queue at all.
+  write("task-open", "open");
+  const open = await sporCli.gateDemoteItem(cfg, "task-open", { blockerId: "task-gate-acceptance" });
+  assert.deepStrictEqual([open.ok, open.demoted], [true, false]);
+  assert.match(open.note, /not a claim of completion/, "a do-nothing demotion still SAYS so — a silent one reads exactly like a working one");
+  assert.strictEqual(statusOf("task-open"), "open");
+
+  // A person's decision to DROP the work is not a claim of completion.
+  write("task-abandoned", "abandoned");
+  const abandoned = await sporCli.gateDemoteItem(cfg, "task-abandoned");
+  assert.deepStrictEqual([abandoned.ok, abandoned.demoted], [true, false], "a gate never reopens what a person deliberately dropped");
+  assert.strictEqual(statusOf("task-abandoned"), "abandoned");
+
+  // And a node it cannot read is a reported failure, not a silent no-op.
+  const missing = await sporCli.gateDemoteItem(cfg, "task-nope");
+  assert.strictEqual(missing.ok, false);
+  assert.match(missing.reason, /could not be re-read/);
+
+  // The escalation write can fail (an offline graph, an id collision), and the
+  // demotion still runs — but it must not imply a blocker that does not exist.
+  write("task-done-2", "done");
+  fs.writeFileSync(
+    path.join(nodes, "dec-resolver-2.md"),
+    "---\nid: dec-resolver-2\ntype: decision\ntitle: Added bounded retry again\nsummary: Added bounded retry with backoff to the second sync worker, so a transient failure retries instead of dropping.\ndate: 2026-08-26\nedges:\n  - {type: resolves, to: task-done-2}\n---\n\nBody.\n"
+  );
+  const unblocked = await sporCli.gateDemoteItem(cfg, "task-done-2");
+  assert.deepStrictEqual([unblocked.ok, unblocked.demoted], [true, true]);
+  assert.match(unblocked.note, /nothing blocks task-done-2/, "the note says the blocker is missing rather than implying one");
+  assert.strictEqual(statusOf("task-done-2"), "open");
+});
+
+// The gate's demotion writes through the SAME local door `spor set-status`
+// uses. That door reads a type's status enum from two different declaration
+// sites — the declarative `status.vocabulary` (task/issue/question) and the
+// older `fields.status.enum` (workflow/workflow-run, which declare only that) —
+// and reading either one alone silently disarms the check for every type using
+// the other.
+test("the shared local status door reads BOTH status-enum declaration sites, so neither type family goes unchecked", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-setstatus-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+
+  // `task` declares status.vocabulary.
+  fs.writeFileSync(
+    path.join(nodes, "task-vocab.md"),
+    "---\nid: task-vocab\ntype: task\ntitle: Add bounded retry to the sync worker\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: open\ndate: 2026-08-26\n---\n\nBody.\n"
+  );
+  // `workflow-run` declares fields.status.enum and NO status.vocabulary.
+  fs.writeFileSync(
+    path.join(nodes, "run-enum.md"),
+    "---\nid: run-enum\ntype: workflow-run\ntitle: A workflow run\nsummary: One run of the demo workflow, recorded so the status door has a fields.status.enum type to gate.\nstatus: running\ndate: 2026-08-26\n---\n\nBody.\n"
+  );
+
+  for (const [id, bogus, good] of [["task-vocab", "totally-bogus", "done"], ["run-enum", "totally-bogus", "succeeded"]]) {
+    const refused = sporCli.setStatusLocal(cfg, id, bogus);
+    assert.strictEqual(refused.ok, false, `${id}: an off-vocabulary status must be refused, not written`);
+    assert.match(refused.reason, /not allowed for type/);
+    assert.strictEqual(sporCli.setStatusLocal(cfg, id, good).ok, true, `${id}: and a declared one still lands`);
+    assert.match(fs.readFileSync(path.join(nodes, `${id}.md`), "utf8"), new RegExp(`^status: ${good}$`, "m"));
+  }
+
+  // Membership is a VERBATIM compare: every declared value is lowercase, so a
+  // shouted one is refused rather than passing the check and being written
+  // through unchanged.
+  assert.strictEqual(sporCli.setStatusLocal(cfg, "task-vocab", "DONE").ok, false);
+
+  // A type that declares neither is unconstrained, exactly as before.
+  fs.writeFileSync(
+    path.join(nodes, "norm-free.md"),
+    "---\nid: norm-free\ntype: norm\ntitle: A norm with no status enum\nsummary: A norm node, whose type declares no status vocabulary at all, so any status value is accepted.\nstatus: active\ndate: 2026-08-26\n---\n\nBody.\n"
+  );
+  assert.strictEqual(sporCli.setStatusLocal(cfg, "norm-free", "whatever").ok, true);
 });
 
 test("a gate-filed WORK NODE is fence-safe and fits the server's body cap", () => {
@@ -841,7 +1390,7 @@ test("end to end: an armed human gate files a requires:[human] approval item and
   assert.ok(approval, `expected an approval item, saw ${fs.readdirSync(nodes)}`);
   const body = fs.readFileSync(path.join(nodes, approval), "utf8");
   assert.match(body, /requires: \[human\]/);
-  assert.match(body, /- \{type: relates-to, to: task-ready\}/);
+  assert.match(body, /- \{type: blocks, to: task-ready\}/, "an unanswered approval BLOCKS the gated item on the graph, not just in this box's cooldown map");
   assert.match(body, /touches:lib/, "the item names the risk class that armed the gate");
   assert.match(body, /spor set-status .* abandoned/, "and how to refuse it");
   // Blocked is not approved: the item is cooled, not treated as done.
@@ -856,12 +1405,17 @@ test("end to end: a failing gate cools the item, files an escalation, and says s
   const r = cli(["work", "--once", "--max", "1", "--interval", "1", "--no-brief", "--no-worktree", "--factory", "factory-demo"], env);
   assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
   assert.match(r.stdout, /work: gates — passed 0, failed 1/);
+  // The demotion is really wired through the CLI, not just through the fakes:
+  // the escalation the gate filed now blocks the gated item on the graph. (The
+  // fixture's item never went to a completion status, so there is no status to
+  // roll back — the `blocks` half is the whole demotion here.)
+  assert.match(r.stdout, /gate acceptance failed on task-ready.*now blocks task-ready/);
   const filed = fs.readdirSync(nodes);
   const escalation = filed.find((f) => f.startsWith("task-gate-acceptance-ready-"));
   assert.ok(escalation, `expected a human escalation item, saw ${filed}`);
   const body = fs.readFileSync(path.join(nodes, escalation), "utf8");
   assert.match(body, /requires: \[human\]/, "the escalation is a person's item — no worker can claim it");
-  assert.match(body, /- \{type: relates-to, to: task-ready\}/);
+  assert.match(body, /- \{type: blocks, to: task-ready\}/, "the refusal is durable graph state: the escalation blocks the gated item");
 
   const status = cli(["work", "--status"], env);
   assert.match(status.stdout, /gates:\s+factory-demo — passed 0, failed 1/);

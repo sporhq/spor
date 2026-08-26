@@ -634,9 +634,29 @@ person. Every gate outcome is a deterministic, idempotent `art-gate-*` artifact
 carrying `relates-to` the work item (never `resolves` — a gate records, it does
 not retire). Only a CLAIM is gated (`shouldGate`: a verified `resolved`, or an
 UNENFORCED `reported` where nothing could check it), the gated item HOLDS its
-slot until the pipeline settles, a failed/blocked pipeline cools the node, and a
+slot until the pipeline settles (and its node is out of candidate selection for
+EVERY worker on the box while it does, so a free slot never re-dispatches what a
+gate is judging), and a
 factory that does not validate REFUSES to start the worker rather than running it
-ungated. WORKERS.md §10 is the contract; see test/gates.test.js +
+ungated. A failed/blocked pipeline does more than cool the node — a cooldown is
+machine-local and the gate runs AFTER the resolver exists, so the refusal is
+also written as GRAPH state (§10.7) in two parts: the `requires: [human]` item
+it files carries `blocks` onto the work item (the fail-closed half — a live
+queue item naming its dependent), and the item's own COMPLETION status is rolled
+back to `open`, which is what stops the STATUS-derived surfaces (`spor get`'s ⚠,
+analytics, `--status`) calling it done. It never re-enters the queue: liveness
+comes from the resolving EDGE, which this client cannot retract and which is the
+evidence the escalation asks a person to judge — and a refused item must not
+come back round to a worker anyway. Only a completion is rolled back (never an
+`abandoned` item), and a passing gate never re-flips it.
+And because a gate pipeline is the one piece of work the worker PROCESS owns, a
+killed worker's unfinished pipelines are RESUMED (§10.8): each stamps
+`gate_state` on its run record (settled verdicts are final, and the two in-process
+record writers carry the namespace across), and a later gate-armed worker joins
+that to the stale worker status files and re-gates the orphans before taking new
+work — DEFERRING any whose node still has a live run, since a resumed pipeline
+re-runs from gate 0 and its fix cycle would put a second agent in one checkout.
+WORKERS.md §10 is the contract; see test/gates.test.js +
 test/gate-pipeline.test.js. Server-side ops vars
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard

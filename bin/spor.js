@@ -3808,12 +3808,36 @@ async function cmdSetStatus(cfg, { positionals }) {
     return 0;
   }
 
-  // local: rewrite the node file's status frontmatter in place, mirroring the
-  // server's read-modify-write (no server to POST to, no lease to take). When the
-  // type's schema declares a status enum, reject an out-of-vocabulary value the
-  // same way the server's setStatus does (registry is the contract); types whose
-  // vocabulary lives in a sandbox validate() fn aren't enum-checked here, exactly
-  // as the server's membership check skips them.
+  // local: the shared write body below, then this command's own reporting.
+  const wrote = setStatusLocal(cfg, id, value);
+  if (!wrote.ok) {
+    err(wrote.reason);
+    return 1;
+  }
+  out(`status set: ${id} -> ${value}`);
+  out(writeTargetLine(cfg));
+  try {
+    const warning = resolveAncestryWarning(cfg, id, value, wrote.node.commits);
+    if (warning) err(`  warning: ${warning}`);
+  } catch {
+    // advisory only — a git hiccup must not fail a status write that already landed
+  }
+  return 0;
+}
+
+// The LOCAL status write, shared by `spor set-status` and the gate pipeline's
+// demotion (gateWriteStatus) so the validated door exists once: rewrite the
+// node file's status frontmatter in place, mirroring the server's
+// read-modify-write (no server to POST to, no lease to take). When the type's
+// schema declares a status enum, reject an out-of-vocabulary value the same way
+// the server's setStatus does (registry is the contract, via
+// `statusVocabulary`); types whose vocabulary lives in a sandbox validate() fn
+// aren't enum-checked here, exactly as the server's membership check skips them.
+//
+// Returns {ok, node} or {ok: false, reason} — reporting belongs to the caller,
+// since one of them is a CLI command and the other is a fail-soft step inside a
+// worker loop. `graph` lets a caller that already loaded one pass it in.
+function setStatusLocal(cfg, id, value, { graph = null } = {}) {
   const graphLib = require(path.join(ROOT, "lib", "graph.js"));
   const nodesDir = cfg.nodesDir();
   const file = path.join(nodesDir, `${id}.md`);
@@ -3821,50 +3845,45 @@ async function cmdSetStatus(cfg, { positionals }) {
   try {
     raw = fs.readFileSync(file, "utf8");
   } catch {
-    err(`no such node: ${id}`);
-    return 1;
+    return { ok: false, reason: `no such node: ${id}` };
   }
-  let g;
-  try {
-    g = graphLib.loadGraph(nodesDir);
-  } catch (e) {
-    err(`could not load graph: ${e.message}`);
-    return 1;
+  let g = graph;
+  if (!g) {
+    try {
+      g = graphLib.loadGraph(nodesDir);
+    } catch (e) {
+      return { ok: false, reason: `could not load graph: ${e.message}` };
+    }
   }
   const type = g.nodes[id] && g.nodes[id].type;
+  // The status enum lives in TWO declaration sites and a type may use either:
+  // the declarative completion policy's `status.vocabulary` (task, issue,
+  // question — what `registry.statusVocabulary` reads) and the older
+  // `fields.status.enum` (workflow, workflow-run — which declare ONLY that).
+  // Reading one alone silently disarms the check for every type that uses the
+  // other, so take the UNION. Membership stays a VERBATIM compare, as it always
+  // was: every declared value is lowercase, so `DONE` is refused rather than
+  // passing the check and then being written through unchanged.
+  const allowed = new Set();
   const schema = type && g.registry.nodeSchemas ? g.registry.nodeSchemas.get(type) : null;
-  const allowed = schema && schema.payload && schema.payload.fields && schema.payload.fields.status && schema.payload.fields.status.enum;
-  if (Array.isArray(allowed) && !allowed.includes(value)) {
-    err(`status '${value}' not allowed for type '${type}' — allowed: ${allowed.join(", ")}`);
-    return 1;
+  const fieldEnum = schema && schema.payload && schema.payload.fields && schema.payload.fields.status && schema.payload.fields.status.enum;
+  if (Array.isArray(fieldEnum)) for (const s of fieldEnum) allowed.add(s);
+  if (type) for (const s of g.registry.statusVocabulary(type)) allowed.add(s);
+  if (allowed.size && !allowed.has(String(value))) {
+    return { ok: false, reason: `status '${value}' not allowed for type '${type}' — allowed: ${[...allowed].join(", ")}` };
   }
   const newRaw = rewriteStatus(raw, value);
-  if (newRaw == null) {
-    err(`could not locate frontmatter in ${id}`);
-    return 1;
-  }
+  if (newRaw == null) return { ok: false, reason: `could not locate frontmatter in ${id}` };
   let node;
   try {
     node = graphLib.parseFrontmatter(newRaw, `${id}.md`);
   } catch (e) {
-    err(`invalid node after status rewrite: ${e.message}`);
-    return 1;
+    return { ok: false, reason: `invalid node after status rewrite: ${e.message}` };
   }
   const v = graphLib.validateNode(g, node);
-  if (!v.ok) {
-    err(`invalid node after status rewrite:\n  ${v.errors.join("\n  ")}`);
-    return 1;
-  }
+  if (!v.ok) return { ok: false, reason: `invalid node after status rewrite:\n  ${v.errors.join("\n  ")}` };
   fs.writeFileSync(file, newRaw);
-  out(`status set: ${id} -> ${value}`);
-  out(writeTargetLine(cfg));
-  try {
-    const warning = resolveAncestryWarning(cfg, id, value, node.commits);
-    if (warning) err(`  warning: ${warning}`);
-  } catch {
-    // advisory only — a git hiccup must not fail a status write that already landed
-  }
-  return 0;
+  return { ok: true, node };
 }
 
 // Validate + normalize `--attr key=value` pairs to a flat {k: String(v)} map (or
@@ -9112,6 +9131,9 @@ function cmdWorkStatus(cfg, { json }) {
           `${r.gate ? `  gates ${r.gate}` : ""}`
       );
       if (r.gate && r.gate !== "passed" && r.gate_reason) out(`            ${r.gate_reason}`);
+      // The fail-soft half of a refusal: the verdict stands either way, but an
+      // operator has to know the item is still reading DONE on the graph.
+      if (r.demote_reason) out(`            not demoted on the graph: ${r.demote_reason}`);
     }
     for (const s of (w.skipped || []).slice(0, 5)) out(`  skipped:  ${s.id} — ${s.reason} (retry after ${s.until})`);
     if (w.next_poll_at && !w.stopped_at) out(`  next poll: ${w.next_poll_at}`);
@@ -9348,6 +9370,123 @@ async function gateApprovalState(cfg, id) {
   return { state: "pending" };
 }
 
+// --- demoting a refused item (WORKERS.md §10.7) ----------------------------
+// A gate runs AFTER the run wrote its resolver, so a refused claim is one the
+// graph is already carrying as finished. Cooling the node off is machine-local;
+// every other reader would go on reading it as done. Demotion is how a refusal
+// becomes graph state:
+//
+//   1. the person's item the gate filed (escalation, approval, test-change
+//      lane) carries `blocks` onto the work item — written into that node at
+//      file time, so the dependency lands in ONE validated write and cannot be
+//      half-applied;
+//   2. the work item's own COMPLETION status is rolled back here, so no read
+//      surface reports the gated claim as finished while the gate says it is
+//      not. `spor get` then shows the ⚠ the schema's read hook already emits
+//      for an open status contradicting a resolving edge.
+//
+// The resolving EDGE is deliberately NOT retracted. This client has no
+// edge-removal door at all, and the resolver node is the agent's own durable
+// record of what it did — deleting the link would destroy evidence to express a
+// verdict. The escalation is what tells a person to judge it, and a person who
+// agrees with the gate retires the resolver themselves.
+//
+// A PASSING gate never re-flips the status either: writing `done` would be the
+// runner asserting completion, and a gate records what was enforced — it does
+// not retire anything (dec-spor-gates-enforced-in-code-factory-is-data).
+
+// The statuses a gate may roll BACK: a claim of COMPLETION. Deliberately not
+// the give-up words (`abandoned`, `rejected`, `dismissed`, `closed`, …) — a
+// gate refuses a claim that the work is finished; it never reopens a decision a
+// person made to drop the work. The type's own declared `status.completion`
+// wins wherever the registry is readable (registry is the contract); this is
+// the fallback for a remote graph whose registry this client cannot load.
+const GATE_COMPLETION_FALLBACK = new Set(["done", "resolved", "completed", "answered"]);
+// What a rolled-back item reads instead. `open` is the live entry value of
+// every queueable type's vocabulary (task, issue, question); a type whose
+// vocabulary refuses it fails the write, which is reported, not swallowed.
+const GATE_DEMOTED_STATUS = "open";
+
+// Roll one item's completion status back. {ok, demoted, note} — `demoted:false`
+// with `ok:true` is the ordinary case where there was nothing to roll back (the
+// item never went to a completion status, which is every local-mode
+// `reported` run).
+async function gateDemoteItem(cfg, id, { blockerId = null } = {}) {
+  const blocked = blockerId
+    ? `${blockerId} now blocks ${id}`
+    : `nothing blocks ${id} — the gate could not file the item that would have`;
+  const node = await resolveNode(cfg, id);
+  if (!node) return { ok: false, reason: `${id} could not be re-read, so its status could not be rolled back` };
+  const status = String(node.status || "").trim().toLowerCase();
+  // Every path below returns a NOTE saying what happened, including the
+  // do-nothing ones. A demotion that silently did nothing reads exactly like
+  // one that worked, and this feature exists to stop refusals going quiet.
+  if (!status) return { ok: true, demoted: false, note: `${id} carries no status to roll back; ${blocked}` };
+
+  // The type's own declared completion value, whenever the registry is here to
+  // be read. Remotely it is not (a local nodes dir, if any, is a DIFFERENT
+  // graph), so the fallback set stands in.
+  let completion = null;
+  let graph = null;
+  if (cfg.mode() !== "remote") {
+    try {
+      const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+      graph = graphLib.loadGraph(cfg.nodesDir());
+      // The declared completion policy, through the registry's own accessor
+      // (registry is the contract) rather than a second hand-rolled reach into
+      // the schema payload.
+      if (node.type) completion = graph.registry.completionStatus(node.type);
+    } catch {
+      graph = null; // an unreadable graph falls through to the fallback set
+    }
+  }
+  const isCompletion = completion ? status === completion : GATE_COMPLETION_FALLBACK.has(status);
+  if (!isCompletion || status === GATE_DEMOTED_STATUS) {
+    return { ok: true, demoted: false, note: `${id} reads '${status}', which is not a claim of completion — nothing to roll back; ${blocked}` };
+  }
+
+  const wrote = await gateWriteStatus(cfg, id, GATE_DEMOTED_STATUS, graph);
+  if (!wrote.ok) return { ok: false, reason: wrote.reason };
+  return {
+    ok: true,
+    demoted: true,
+    note: `${id} rolled back ${status} -> ${GATE_DEMOTED_STATUS}; ${blocked}`,
+  };
+}
+
+// The status write itself, through the same doors `spor set-status` uses but
+// without its CLI chatter (`setStatusLocal` is the shared local body, so the
+// two cannot drift).
+//
+// Remotely, the endpoint CLAIMS a node it moves to an active status. The gate
+// is not claiming anything — the whole point of the demotion is that a PERSON
+// must now judge the item — so a lease this write incidentally established is
+// handed straight back. Only one this call established: a `lease.error` means
+// someone else holds it, and releasing that would strand whoever does.
+async function gateWriteStatus(cfg, id, value, graph = null) {
+  if (cfg.mode() === "remote") {
+    const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/status`, { status: value }, { timeoutMs: 8000 });
+    if (r.transport) return { ok: false, reason: `offline — ${r.error}` };
+    if (!r.ok) {
+      const e = (r.json && r.json.error) || {};
+      return { ok: false, reason: `status ${r.status}${e.message ? `: ${e.message}` : ""}` };
+    }
+    const lease = r.json && r.json.lease;
+    if (lease && !lease.error) {
+      // Best effort: a release that fails leaves a lease that lapses on its own
+      // TTL, which is no worse than not trying — and must never turn a landed
+      // demotion into a reported failure.
+      try {
+        await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/release`, {}, { timeoutMs: 6000 });
+      } catch {
+        /* the lease lapses */
+      }
+    }
+    return { ok: true };
+  }
+  return setStatusLocal(cfg, id, value, { graph });
+}
+
 // The deps one gate pipeline runs on: git plumbing against THIS run's tree,
 // dispatches through the real `spor dispatch`, and graph writes through the
 // validated node door.
@@ -9483,7 +9622,11 @@ function makeGateDeps(cfg, { record, entry, factory, slug, passthrough, warn, sl
           project: slug,
           date: date(),
           profile,
-          edges: [{ type: "relates-to", to: entry.node_id }, ...(profile ? [{ type: "relates-to", to: profile }] : [])],
+          // `blocks`, not `relates-to`: the gated item cannot legitimately
+          // stand until the test change lands in its own lane, and that
+          // dependency has to be readable by everyone, not just this box's
+          // cooldown map.
+          edges: [{ type: "blocks", to: entry.node_id }, ...(profile ? [{ type: "relates-to", to: profile }] : [])],
         })
       );
     },
@@ -9500,6 +9643,9 @@ function makeGateDeps(cfg, { record, entry, factory, slug, passthrough, warn, sl
         gate.instructions || "Review the change and decide whether it may stand.",
         "",
         `The worker is BLOCKED on this: ${entry.node_id} is not treated as done until this item is answered.`,
+        `This item \`blocks\` ${entry.node_id} on the graph, and if that item had already been flipped to a`,
+        "completion status the worker rolled it back — a gate records what was enforced, it never asserts",
+        `completion, so approving here does not re-flip it. Close the loop on ${entry.node_id} yourself.`,
         "",
         "To APPROVE, resolve this item — capture the decision and point it here:",
         "",
@@ -9521,11 +9667,15 @@ function makeGateDeps(cfg, { record, entry, factory, slug, passthrough, warn, sl
           project: slug,
           date: date(),
           requiresHuman: true,
-          edges: [{ type: "relates-to", to: entry.node_id }],
+          // `blocks`: an unanswered approval is not an approval, so the gated
+          // item is not done — and that must be true on the graph, not only in
+          // this worker's cooldown map.
+          edges: [{ type: "blocks", to: entry.node_id }],
         })
       );
     },
     checkApproval: ({ id }) => gateApprovalState(cfg, id),
+    demote: ({ blockerId }) => gateDemoteItem(cfg, entry.node_id, { blockerId }),
     escalate: async ({ gate, attempts, detail, evidence, findings }) => {
       const id = `task-gate-${gate.id.slice(0, 24)}-${stem}-${short}-${gateIdSuffix("escalate", gate.id, entry.node_id, entry.run_id)}`.toLowerCase();
       const cycles = attempts.length;
@@ -9533,6 +9683,10 @@ function makeGateDeps(cfg, { record, entry, factory, slug, passthrough, warn, sl
         `The \`${gate.kind}\` gate \`${gate.id}\` refused ${entry.node_id} and its fix cycles are spent`,
         `(${cycles} attempt${cycles === 1 ? "" : "s"}, cap ${gate.cycles}). A person decides what happens next —`,
         "the worker has stopped re-dispatching it.",
+        "",
+        `This item \`blocks\` ${entry.node_id} on the graph, and if that item had already been flipped to a`,
+        "completion status the worker rolled it back. The run's resolver is left standing: it is the record of",
+        "what the agent did, and retiring it (or letting it stand) is the judgement this item is asking for.",
         "",
         detail ? `Last outcome: ${detail}` : "",
         "",
@@ -9554,7 +9708,10 @@ function makeGateDeps(cfg, { record, entry, factory, slug, passthrough, warn, sl
           project: slug,
           date: date(),
           requiresHuman: true,
-          edges: [{ type: "relates-to", to: entry.node_id }],
+          // `blocks`: the escalation is what the gated item now waits on, and
+          // the graph has to say so — a refusal that lives only in one box's
+          // cooldown map leaves every other reader calling the item done.
+          edges: [{ type: "blocks", to: entry.node_id }],
         })
       );
     },
@@ -9638,6 +9795,10 @@ async function cmdWork(cfg, { values }) {
     if (values[k]) passthrough[k] = true;
   }
 
+  // Read before `candidates` closes over it: `--print` calls that closure
+  // before the loop starts, so this cannot be declared further down.
+  const home = cfg.userConfigHome();
+
   const candidates = async () => {
     // Page deeper than the default when the cap is high: the page is filtered
     // again below (in-flight) and again by the loop (readiness, cooldowns), so
@@ -9648,7 +9809,16 @@ async function cmdWork(cfg, { values }) {
     // same-machine guard would refuse them anyway; skipping them here keeps a
     // refusal (and a cooldown entry) out of the status surface for something
     // that is simply already being done.
-    return annotateInFlight(page, dispatchedAgents(cfg), true).items;
+    const items = annotateInFlight(page, dispatchedAgents(cfg), true).items;
+    if (!factory) return items;
+    // ...and neither are items ANOTHER live worker on this box is gating. The
+    // loop already subtracts its OWN gating slots, but nothing else would stop
+    // a second worker here: a gated run is terminal, so it has no live agent
+    // for the in-flight guard to see, and an unenforced `reported` one has
+    // already handed its lease back. Both workers would then dispatch the node
+    // the first one's gate is still judging.
+    const gating = workLoop.gatingNodeIds(workLoop.readWorkerStatuses(home, { alive: workerAlive }));
+    return gating.size ? items.filter((it) => !gating.has(it.id)) : items;
   };
 
   if (values.print || values["dry-run"]) {
@@ -9677,7 +9847,6 @@ async function cmdWork(cfg, { values }) {
     return 0;
   }
 
-  const home = cfg.userConfigHome();
   const workerId = crypto.randomUUID();
   // Sweep aged-out worker records now: pruning otherwise only happens inside a
   // `--status` read, so a box running `spor work --once` on a cron and never
@@ -9730,6 +9899,32 @@ async function cmdWork(cfg, { values }) {
       // behavior — are byte-identical to what shipped.
       ...(factory
         ? {
+            // The durable half of the gate verdict, and the scan that reads it
+            // back (WORKERS.md §10.8). A gate pipeline is the one piece of work
+            // this PROCESS owns, so a worker that dies mid-pipeline leaves a
+            // terminal run standing with an un-judged claim — and that run is
+            // already out of the queue, so no candidate poll would ever return
+            // to it. The pair of durable records this box already keeps (the
+            // per-worker status files + the run journal) is what makes it
+            // recoverable by any later worker.
+            markGate: (runId, patch) => dispatchRuns.stampGateState(home, runId, patch),
+            pendingGates: () => {
+              const statuses = workLoop.readWorkerStatuses(home, { alive: workerAlive });
+              // The cheap half of the join first. On a busy box the run journal
+              // is thousands of files (14-day retention) and the answer is
+              // almost always "no orphans", so reading it every poll to learn
+              // that would be the loop's dominant cost. No dead worker holding
+              // a slot ⇒ nothing to resume, without touching the journal.
+              if (!statuses.some((w) => !w.live && ((w.gating || []).length || (w.active || []).length))) return [];
+              return workLoop.orphanedGateRuns(statuses, {
+                records: new Map(dispatchRuns.readRunRecords(home).map((r) => [r.run_id, r])),
+                // The run store owns the terminal vocabulary; the scan needs it
+                // to tell a node an agent may still be working from one that is
+                // genuinely idle (a resumed pipeline re-dispatches fix cycles).
+                terminalStates: dispatchRuns.TERMINAL_STATES,
+                maxAgeMs: runMaxMs,
+              });
+            },
             gate: (entry, record) =>
               gateRunner.runGatePipeline({
                 item: { ...entry, project: slug },
@@ -12237,7 +12432,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode };
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, setStatusLocal };
 
 if (require.main === module) {
   main()
