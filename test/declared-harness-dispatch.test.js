@@ -251,6 +251,15 @@ test("a malformed declaration is refused loudly, naming the key and what is allo
     "a file-report declaration that never tells the harness where to write is always empty"
   );
   assert.match(bad({ command: "/x", session: 7 }), /must be a JSON path/);
+  // The {model} spellings that fail SILENTLY at launch if they are not refused
+  // here: a standalone token leaves `--model` to swallow the next argument,
+  // and one sharing an entry with {cwd}/{report} takes that path with it when
+  // no model resolves.
+  assert.match(bad({ command: "/x", args: ["--model", "{model}", "--json"] }), /must be inlined into the flag that carries it/);
+  assert.match(
+    bad({ command: "/x", args: ["--out={report}-{model}"], report: "file" }),
+    /mixes \{model\} with \{cwd\}\/\{report\}/
+  );
   assert.match(normalizeHarnessDeclaration("Ox Alpha", { command: "/x" }).error, /not a usable harness id/);
 });
 
@@ -408,9 +417,10 @@ test("a declared harness dry-run previews the bound command, argv and session pa
   );
   assert.strictEqual(result.status, 0, result.stderr);
   assert.match(result.stdout, new RegExp(`harness: ${HARNESS}`));
-  assert.match(result.stdout, /run:\s+\/opt\/ox\/bin\/ox run --jsonl --dir=<dir>/);
+  // An EMBEDDED placeholder is rendered and then shell-quoted — the preview
+  // line is something people paste, so it must not come back unquoted.
+  assert.match(result.stdout, /run:\s+\/opt\/ox\/bin\/ox run --jsonl '--dir=<dir>' '--model=profile-model'/);
   assert.match(result.stdout, /# prompt on stdin/);
-  assert.match(result.stdout, /--model=profile-model/);
   assert.doesNotMatch(result.stdout, /__SPOR_/, "the preview renders placeholders readably");
   assert.match(result.stdout, /session: \(read from the declared session\.id JSON path/);
 });
@@ -488,4 +498,94 @@ test("spor capabilities reflects a locally declared harness id", () => {
   const list = run(["capabilities", "--json"], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
   assert.strictEqual(list.status, 0, list.stderr);
   assert.ok(JSON.parse(list.stdout).harnesses.includes(HARNESS));
+});
+
+test("a harness id that names an Object.prototype member is refused, not resolved", () => {
+  // Harness ids reach resolution from GRAPH data, so a plain bracket lookup
+  // into the adapter registry would answer `Object.prototype`'s own members —
+  // a truthy non-adapter that crashes the dispatch on its first method call
+  // instead of being refused as the unknown harness it is.
+  const cfg = fakeCfg({ dispatch: { harness: { [HARNESS]: declarationFor("/opt/ox/bin/ox") } } });
+  for (const id of ["constructor", "toString", "hasOwnProperty", "__proto__"]) {
+    assert.strictEqual(dispatchHarnesses.getHarness(id), null, `${id} is not an adapter`);
+    assert.strictEqual(resolveHarness(id, { cfg }).adapter, null, `${id} resolves to nothing`);
+  }
+  const { home, repo } = fixture({ declaration: declarationFor("/opt/ox/bin/ox") });
+  fs.writeFileSync(path.join(home, "nodes", "profile-declared.md"), `---
+id: profile-declared
+type: profile
+title: Prototype-member harness
+summary: A profile naming an Object.prototype member as its harness.
+harness: constructor
+date: 2026-08-26
+---
+Prototype-member harness.
+`);
+  const result = run(
+    ["dispatch", "task-declared", "--dir", repo, "--profile", "profile-declared", "--no-brief"],
+    { SPOR_HOME: home, XDG_CONFIG_HOME: home }
+  );
+  assert.strictEqual(result.status, 1, result.stdout);
+  assert.doesNotMatch(result.stderr, /is not a function/, "it refuses, it does not crash");
+  assert.ok(!fs.existsSync(path.join(home, "journal", "dispatch")), "nothing is launched");
+});
+
+test("the declaration, not dispatch.bin, decides what a declared harness launches", () => {
+  // Otherwise the probe could report the harness available on the strength of
+  // a launcher the dispatch never tries — the box advertises to the fleet a
+  // capability every dispatch would then refuse.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-declared-precedence-"));
+  const real = writeSpawnableNodeStub(dir, "ox", "process.exit(0);");
+  const cfg = fakeCfg({
+    dispatch: { harness: { [HARNESS]: declarationFor(path.join(dir, "absent")) }, bin: { [HARNESS]: real } },
+  });
+  assert.strictEqual(resolveHarness(HARNESS, { cfg }).adapter.command({}, cfg), path.join(dir, "absent"));
+  assert.strictEqual(
+    dispatchHarnesses.describeHarnessBin(resolveHarness(HARNESS, { cfg }).adapter, { env: {}, cfg }).command,
+    path.join(dir, "absent")
+  );
+  assert.strictEqual(
+    dispatchHarnesses.harnessAvailable(HARNESS, { env: {}, cfg, which: () => real }),
+    false,
+    "availability answers the command the launch will run, not a dispatch.bin override it ignores"
+  );
+});
+
+test("a committable repo .spor.json can NEVER bind what this machine executes", () => {
+  // The other half of "a graph write must never define what a machine
+  // executes": a write anyone can land in a repo must not either. Cloning a
+  // repo — or pulling a PR branch into one — would otherwise be enough to
+  // choose the command a later dispatch on this box runs, and (with a
+  // dispatch.agent set) to get that harness id auto-published to the fleet.
+  const { loadConfig } = require("../lib/config.js");
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-declared-repolayer-"));
+  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({
+    enabled: true,
+    dispatch: {
+      harness: { evil: { command: "/bin/echo", args: ["run", "--dir={cwd}"] } },
+      bin: { codex: "/bin/echo" },
+      repos: { demo: repo },
+    },
+  }, null, 2) + "\n");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-declared-repolayer-home-"));
+  const cfg = loadConfig({ cwd: repo, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  assert.strictEqual(cfg.get("dispatch.harness"), undefined, "the declaration is dropped");
+  assert.strictEqual(cfg.get("dispatch.bin"), undefined, "so is the launcher override");
+  assert.deepStrictEqual(cfg.get("dispatch.repos"), { demo: repo }, "the rest of dispatch config is untouched");
+  assert.strictEqual(resolveHarness("evil", { cfg }).adapter, null);
+  assert.deepStrictEqual(dispatchHarnesses.declaredHarnessIds(cfg), []);
+  assert.ok(cfg.warnings.some((w) => /dispatch\.harness/.test(w)), "and it says so rather than dropping it silently");
+  assert.ok(cfg.warnings.some((w) => /dispatch\.bin/.test(w)));
+});
+
+test("--print surfaces an unusable declaration instead of previewing a launch that cannot happen", () => {
+  const { home, repo } = fixture({ declaration: { command: "/opt/ox", reprot: "lastText" } });
+  const result = run(
+    ["dispatch", "task-declared", "--dir", repo, "--profile", "profile-declared", "--no-brief", "--print"],
+    { SPOR_HOME: home, XDG_CONFIG_HOME: home }
+  );
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.match(result.stdout, new RegExp(`declaration for harness '${HARNESS}' is unusable`));
+  assert.match(result.stdout, /unknown key\(s\) reprot/);
+  assert.ok(!fs.existsSync(path.join(home, "journal", "dispatch")), "a preview writes nothing");
 });

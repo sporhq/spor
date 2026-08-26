@@ -747,9 +747,12 @@ anything with a token.
   harness this client ships no adapter for; the profile then carries **only**
   `harness: <id>`, and the id is bound to something executable by a
   MACHINE-LOCAL declaration in the client config cascade,
-  `dispatch.harness.<id>` (machine-specific like `dispatch.bin.<harness>` and
-  `dispatch.repos`, so it belongs in the user `$SPOR_HOME/config.json`, never a
-  committable `.spor.json`). The declaration carries `command`, an `args`
+  `dispatch.harness.<id>` — machine-specific like `dispatch.bin.<harness>` and
+  `dispatch.repos`, and read ONLY from the user `$SPOR_HOME/config.json` or the
+  global one: both `dispatch.harness` and `dispatch.bin` are stripped from a
+  committable repo `.spor.json` with a warning (`REPO_FORBIDDEN_PATHS`,
+  lib/config.js), the way a repo-level `token` is, so a repo write is no more
+  able to choose what this box executes than a graph write is. The declaration carries `command`, an `args`
   template (`{cwd}` / `{report}` / `{model}` tokens), a `label`, report recovery
   (`report: "lastText"` with a `report.text` JSON path into the harness's event
   stream, or `report: "file"` when the harness writes the report itself at the

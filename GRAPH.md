@@ -951,6 +951,19 @@ date: 2026-06-18
   `mcp` is merged into the strict `--mcp-config` dispatch writes, so the agent's
   toolset is exactly the profile plus the agent-spor server, nothing ambient
   (dec-spor-session-identity-active-record).
+- **The graph names the harness; the MACHINE binds what that name runs**
+  (task-spor-dispatch-declarative-custom-harness). `harness:` may name a
+  launcher the client ships no in-code adapter for — a team's modified build,
+  an internal wrapper — in which case the profile still carries nothing but the
+  id, and each machine that should run it declares `dispatch.harness.<id>`
+  ({`command`, `args`, `label`, `report`, `session`}) in its own
+  `$SPOR_HOME/config.json`. **A graph write must never define what a machine
+  executes:** a profile carrying `command`, `args`, `argv`, `bin`, `exec`,
+  `entrypoint`, `env`, `report`, `session`, `launch_mode` or `identity_mode` is
+  REFUSED by `spor dispatch`, not honoured and not silently ignored. So an org
+  can publish a profile naming an unadapted harness and only the boxes whose
+  OWNER bound that id will take the work (a machine with no binding fails
+  satisfiability below).
 - **The runtime fields ARE the satisfiability spec** — there is no separate
   requirements block (dec-spor-machine-profile-satisfiability). A machine
   declares ATOMIC capabilities in a machine-local `dispatch.capabilities` map

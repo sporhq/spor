@@ -31,6 +31,17 @@ already supports:
   dispatch writes so the agent's toolset is exactly the profile plus the
   agent-spor server, nothing ambient (dec-spor-session-identity-active-record).
 
+`harness:` may name a launcher the client ships no in-code adapter for; the
+machine then binds that id to a command in its own
+`dispatch.harness.<id>` config (task-spor-dispatch-declarative-custom-harness).
+The corollary is a field-contract rule: **a profile carries only the NAME of a
+harness, never what it executes.** `command`, `args`, `argv`, `bin`, `exec`,
+`entrypoint`, `env`, `report`, `session`, `launch_mode` and `identity_mode` are
+refused by `spor dispatch` when a profile carries them — a graph write must
+never define what a machine executes. This is a dispatch-time refusal rather
+than a `validate()` gate (such a node is still readable and well-formed), so
+the vocabulary above is documentation of the contract, not a new write gate.
+
 **These runtime fields ARE the satisfiability spec** — there is no separate
 requirements block (dec-spor-machine-profile-satisfiability, FORK A). A machine
 declares ATOMIC capabilities in a machine-local `dispatch.capabilities` map, and

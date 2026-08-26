@@ -370,7 +370,8 @@ interactive shell, so a CLI installed under a prefix that only an interactive
 shell sees (a common Homebrew setup) resolves when you check it by hand and
 resolves to nothing when Spor launches it. Point Spor at the binary directly
 rather than relying on `PATH`, in `~/.spor/config.json` — machine-specific, like
-`dispatch.repos`, so it never belongs in a committable `.spor.json`:
+`dispatch.repos`, so it never belongs in a committable `.spor.json` (and is
+dropped with a warning if it turns up in one):
 
 ```json
 { "dispatch": { "bin": { "opencode": "/home/linuxbrew/.linuxbrew/bin/opencode" } } }
@@ -410,6 +411,12 @@ id refuses the dispatch and leaves the item assigned — so an org can publish a
 profile naming `oxalpha` and only the boxes whose owner bound that id will take
 the work. `spor capabilities` lists a declared harness alongside the built-in
 ones, and, in team mode, publishes it to the fleet so re-routing can find it.
+
+The same rule holds for a write anyone else could land in your repo:
+`dispatch.harness` (and `dispatch.bin`) are dropped with a warning if they
+appear in a committable `.spor.json`, so cloning a repo — or pulling a PR
+branch into one — can never choose a command this box will run. They are read
+only from your own `~/.spor/config.json` (or the global one).
 
 What the declaration may set, and nothing else:
 

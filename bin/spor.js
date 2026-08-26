@@ -7812,16 +7812,39 @@ function writePrivate(file, text) {
 
 // One argv entry as `--print` should show it: the launcher-supplied
 // placeholders read as what they stand for, everything else shell-quoted.
-function substitutePlaceholders(arg, { report, cwd }) {
+// Resolve the launcher-supplied placeholders in one argv entry.
+//
+// `embedded` is the DECLARED-harness mode: a hand-authored argv template may
+// legitimately put a placeholder inside a larger argument (`--dir={cwd}` is a
+// single argument to plenty of CLIs), so substitution is by substring. Every
+// in-code adapter emits a placeholder as a WHOLE entry, and they keep the
+// original equality test — not merely because it is equivalent for them, but
+// because substring substitution would ALSO rewrite a placeholder appearing in
+// a value the adapter did not put there (a graph-supplied `profile.model`
+// spelling `__SPOR_CWD__` verbatim), which is a path disclosure the equality
+// test cannot produce (norm-cc-byte-identical-refactor).
+function substitutePlaceholders(arg, { report, cwd, embedded = false }) {
+  if (!embedded) {
+    if (arg === dispatchHarnesses.REPORT_PLACEHOLDER) return report;
+    if (arg === dispatchHarnesses.CWD_PLACEHOLDER) return cwd;
+    return arg;
+  }
   let out = String(arg);
   if (out.includes(dispatchHarnesses.REPORT_PLACEHOLDER)) out = out.split(dispatchHarnesses.REPORT_PLACEHOLDER).join(report);
   if (out.includes(dispatchHarnesses.CWD_PLACEHOLDER)) out = out.split(dispatchHarnesses.CWD_PLACEHOLDER).join(cwd);
   return out;
 }
 
-function renderLaunchArg(arg) {
-  const rendered = substitutePlaceholders(arg, { report: "<report-path>", cwd: "<dir>" });
-  return rendered === arg ? shellQuote(arg) : rendered;
+// One argv entry as `--print` should show it. A whole-entry placeholder reads
+// as what it stands for, unquoted — that is the shipped preview. An EMBEDDED
+// one (declared harnesses only) is rendered and then shell-quoted like any
+// other argument: the preview line is something people paste, so `--dir=<dir>`
+// must not come back unquoted just because it contains a substitution.
+function renderLaunchArg(arg, { embedded = false } = {}) {
+  const whole = substitutePlaceholders(arg, { report: "<report-path>", cwd: "<dir>" });
+  if (whole !== arg) return whole;
+  if (!embedded) return shellQuote(arg);
+  return shellQuote(substitutePlaceholders(arg, { report: "<report-path>", cwd: "<dir>", embedded: true }));
 }
 
 async function launchSupervisedHarness(cfg, {
@@ -7830,11 +7853,8 @@ async function launchSupervisedHarness(cfg, {
 }) {
   const runId = crypto.randomUUID();
   const p = dispatchRuns.runPaths(cfg.userConfigHome(), runId);
-  // Substring substitution, not equality: an in-code adapter always emits a
-  // placeholder as a WHOLE argv entry (so this is byte-identical for them), but
-  // a declared harness's argv template is hand-authored and may legitimately
-  // embed one — `--dir={cwd}` is a single argument to plenty of CLIs.
-  const runArgs = args.map((a) => substitutePlaceholders(a, { report: p.report, cwd }));
+  const embedded = !!adapter.declaration;
+  const runArgs = args.map((a) => substitutePlaceholders(a, { report: p.report, cwd, embedded }));
   const now = new Date().toISOString();
   const record = {
     run_id: runId,
@@ -8531,7 +8551,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }) {
     if (harnessResolution.error) out(`run:    (declaration for harness '${harness}' is unusable: ${harnessResolution.error})`);
     else if (!supportedHarness) out(`run:    (unsupported harness '${harness}')`);
     else if (harnessAdapter.launchMode === "supervised-jsonl") {
-      out(`run:    ${harnessBin} ${previewArgs.map(renderLaunchArg).join(" ")}  # prompt on stdin`);
+      out(`run:    ${harnessBin} ${previewArgs.map((a) => renderLaunchArg(a, { embedded: !!harnessAdapter.declaration })).join(" ")}  # prompt on stdin`);
     } else out(`run:    ${harnessBin} ${previewArgs.map(shellQuote).join(" ")} <prompt>`);
     out(`\n--- prompt ---\n${prompt}`);
     return 0;
