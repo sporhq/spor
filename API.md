@@ -8,7 +8,10 @@ at `/mcp`) for model-driven clients — Cowork, claude.ai connectors,
 in-session tool calls. Both doors require bearer auth (§4), are thin adapters
 over the same core, and a tool call and its REST twin return byte-identical
 payloads. Companion specs: [GRAPH.md](GRAPH.md) (node/edge format),
-[QUEUE.md](QUEUE.md) (capture, decision queue, schema registry).
+[QUEUE.md](QUEUE.md) (capture, decision queue, schema registry),
+[WORKERS.md](WORKERS.md) (the worker protocol — claim/brief/work/report/
+resolve, lease semantics, and the terminal-state contract dispatched agents
+are built from).
 
 ## 1. Write semantics (both surfaces)
 

@@ -675,6 +675,9 @@ This matters because some hosts cache plugins or hook definitions. Updating the 
 * `GRAPH.md` — graph format, node types, edges, and schema behaviour
 * `API.md` — REST and MCP server contract
 * `QUEUE.md` — queue, capture, routing, and workflow details
+* `WORKERS.md` — the worker protocol: claim/brief/work/report/resolve, lease
+  semantics, agent identity, and the terminal-state contract — for
+  implementing a Spor factory worker without this client
 * `adapters/` — host-specific adapter notes
 * `CONTRIBUTING.md` — contributing guide
 * `SECURITY.md` — security policy
