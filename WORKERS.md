@@ -21,7 +21,7 @@ Companion specs: [GRAPH.md](GRAPH.md) (node/edge format), [API.md](API.md)
 A worker is any process that, over one unit of work:
 
 1. **claims** a node from the queue (§3),
-2. **reads** the compiled context for it (§5),
+2. **reads** the compiled context for it (§4),
 3. **does the work** — out of this protocol's scope; write code, run tests,
    whatever the task requires,
 4. **reports** back onto the graph in exactly one of three terminal shapes
@@ -269,8 +269,10 @@ released lease with no report to show for it.
 **What "enforced" means, and where it doesn't apply yet.** `terminal_state`
 is only as trustworthy as `terminal_enforced` says it is
 (dec-spor-dispatch-terminal-states-supervised-first): it is `true` only when
-the graph was actually re-read and the report actually filed against a
-reachable server. Every other case — no team graph configured (local-mode
+the graph was actually re-read against a reachable server — and, for a
+target with no resolving edge, the report actually filed there too (a
+`resolved` verdict needs only the re-read; nothing is filed once a resolving
+edge is already found). Every other case — no team graph configured (local-mode
 dispatch), a free-text dispatch with no target node, an unreachable server,
 an out-of-scope target type (above), or (v1) a **native-background** launch
 whose termination this runner cannot deterministically observe — stamps
@@ -390,7 +392,7 @@ violation — new fields may be added additively.
 | `finished_at` | ISO 8601 | when the record went terminal |
 | `exit_code` | int \| null | supervised runs only |
 | `signal` | string \| null | supervised runs only — the OS signal, if any |
-| `termination_class` | string | a broad bucket: `"completed"`, `"environment"` (credit/rate/auth exhaustion — re-dispatchable, not a real failure), `"launch"`, or `"unknown"` — an open vocabulary; do not exhaustively `switch` on it |
+| `termination_class` | string | a broad bucket: `"completed"`, `"environment"` (credit/rate/auth exhaustion — re-dispatchable, not a real failure), `"launch"`, `"failed"` (a supervised child that launched but exited nonzero for no recognized environment reason), or `"unknown"` — an open vocabulary; do not exhaustively `switch` on it |
 | `termination_signal` | string | a short machine tag within the class, e.g. `"supervised-exit"`, `"nonzero-exit"`, `"credit-exhausted"`, `"supervisor-gone"`, `"launch-failed"` |
 | `termination_reason` | string | a human-readable one-line explanation (≤ 300 chars) |
 | `error` | string | optional — the raw underlying error message, when there was one |
@@ -415,7 +417,7 @@ record still `launching`/`running` has none of these yet):
 | `terminal_enforced` | bool | whether this was a *verified* verdict (re-read against a reachable graph) or a best-effort classification — **gate on this before trusting `terminal_state` as ground truth** |
 | `resolved_by` | string | present only when `terminal_state === "resolved"` — the resolver node's id |
 | `resolved_edge` | string | present only when resolved — `"resolves"` or `"answers"` |
-| `report_node_id` | string | present iff `terminal_state === "reported"` — the filed artifact's id (§7) |
+| `report_node_id` | string | present only when a report was actually filed — its presence always implies `terminal_state === "reported"`, but an unenforced `reported` record (§6) may have none (§7) |
 | `lease_released` | bool | optional — `true`/`false` reports whether a release attempt succeeded; **omitted** (not `false`) when no lease was this run's to release at all |
 | `terminal_note` | string | a human-readable explanation of the outcome, always present once this dimension exists |
 
