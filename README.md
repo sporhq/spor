@@ -422,9 +422,12 @@ What the declaration may set, and nothing else:
 
 * `command` — the launcher: an absolute path, or a bare name resolved on `PATH`.
 * `args` — the argv template. `{cwd}` becomes the run's directory, `{report}`
-  the run's report path, `{model}` the resolved model — an entry naming a model
-  that did not resolve is dropped whole, so write `--model={model}` rather than
-  two separate entries.
+  the run's report path, `{model}` the resolved model. An entry carrying
+  `{model}` is dropped **whole** when no model resolves, so it has to be the
+  flag itself — `--model={model}`, or `--model=anthropic/{model}` — never a
+  bare value after a separate `--model`, which would leave that flag to swallow
+  the next argument. A declaration that gets this wrong is refused, not
+  launched.
 * `label` — what `spor dispatch` and `spor runs` call it.
 * `report` — how the run's final message is recovered: `"lastText"` (the
   default) keeps the last string found at the `report.text` JSON path in the

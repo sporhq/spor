@@ -228,6 +228,21 @@ test("report and session recovery follow the declared JSON paths", () => {
   // so the supervisor's hook is absent and it reads the file back instead.
   const file = normalizeHarnessDeclaration(HARNESS, declarationFor("/x", { args: ["--out={report}"], report: "file" }));
   assert.strictEqual(declaredAdapter(file.declaration).reportFromEvent, undefined);
+
+  // The supervisor rebuilds an adapter from the job file, so a shape the
+  // normalizer could never have produced must be REJECTED rather than read as
+  // whatever it most resembles — an unrecognized `report.from` silently
+  // meaning "file" is a run that ends clean and reports nothing.
+  const base = normalizeHarnessDeclaration(HARNESS, declarationFor("/x")).declaration;
+  assert.strictEqual(declaredAdapter({ ...base, report: { from: "weird" } }), null);
+  assert.strictEqual(declaredAdapter({ ...base, report: [] }), null);
+  assert.strictEqual(declaredAdapter({ ...base, report: { from: "lastText" } }), null, "lastText with no paths");
+  assert.strictEqual(declaredAdapter({ ...base, session: "session.id" }), null, "session must already be a list");
+  assert.strictEqual(declaredAdapter({ ...base, args: undefined }), null);
+  assert.strictEqual(declaredAdapter({ ...base, id: "" }), null);
+  for (const shape of [null, undefined, {}, [], "x", 7]) {
+    assert.strictEqual(declaredAdapter(shape), null, `${JSON.stringify(shape)} is not an adapter`);
+  }
 });
 
 test("a malformed declaration is refused loudly, naming the key and what is allowed", () => {
@@ -255,7 +270,19 @@ test("a malformed declaration is refused loudly, naming the key and what is allo
   // here: a standalone token leaves `--model` to swallow the next argument,
   // and one sharing an entry with {cwd}/{report} takes that path with it when
   // no model resolves.
-  assert.match(bad({ command: "/x", args: ["--model", "{model}", "--json"] }), /must be inlined into the flag that carries it/);
+  // Every VALUE spelling, not just the bare token: each is dropped whole when
+  // no model resolves, leaving `--model` to eat the next argument.
+  for (const value of ["{model}", " {model}", "anthropic/{model}", "{model}-latest"]) {
+    assert.match(
+      bad({ command: "/x", args: ["--model", value, "--json"] }),
+      /must inline \{model\} into the flag that carries it/,
+      `${JSON.stringify(value)} must be refused`
+    );
+  }
+  assert.ok(
+    normalizeHarnessDeclaration(HARNESS, { command: "/x", args: ["--model=anthropic/{model}"] }).ok,
+    "a flag-shaped entry carrying the token is fine — dropping it removes a complete option"
+  );
   assert.match(
     bad({ command: "/x", args: ["--out={report}-{model}"], report: "file" }),
     /mixes \{model\} with \{cwd\}\/\{report\}/
