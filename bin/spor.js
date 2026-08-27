@@ -9164,8 +9164,7 @@ function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, warn = () => {} } = {}) {
   // a slot whose run record has vanished can never be observed going terminal,
   // so reporting nothing for it would hold that slot for the life of the
   // worker. workLoop.runHarvest owns the rule; this only names what it decided.
-  const alive = (pid, ticks) =>
-    dispatchRuns.pidAlive(pid) && (ticks == null || dispatchRuns.processStartTicks(pid) === ticks);
+  const alive = (pid, ticks) => dispatchRuns.isSameSupervisor(pid, ticks).reallyAlive;
   return [...wanted].map((id) => {
     const record = found.get(id) || null;
     const verdict = workLoop.runHarvest(record, { terminalStates: dispatchRuns.TERMINAL_STATES, alive, maxAgeMs });
