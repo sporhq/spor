@@ -8084,8 +8084,8 @@ async function launchSupervisedHarness(cfg, {
   // reading a not-yet-updated exitCode as "still alive".
   if (signal.kind === "channel-closed" && child.exitCode === null && child.signalCode === null) {
     await new Promise((resolve) => {
-      child.once("close", resolve);
-      setTimeout(resolve, 500);
+      const timer = setTimeout(resolve, 500);
+      child.once("close", () => { clearTimeout(timer); resolve(); });
     });
   }
   const state = dispatchRuns.readJson(p.record) || record;
