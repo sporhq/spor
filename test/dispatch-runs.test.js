@@ -797,6 +797,76 @@ test("processStartTicks: a dead pid, and a non-integer pid, both yield null", ()
   assert.strictEqual(runner.processStartTicks(1.5), null);
 });
 
+// --- EPERM tolerance (issue-spor-dispatch-supervisor-liveness-check-divergence) ---
+// `process.kill(pid, 0)` throws ESRCH when there is no such pid, but EPERM
+// when the pid exists and we simply lack permission to signal it (e.g. it now
+// belongs to root after a reuse). A bare `pidAlive` collapsed both into
+// "dead" — the wrong answer to a liveness question — and `terminalOutcomeBackfill`
+// used exactly that bare check while `finalizeSupervisedRun` used the
+// ticks-based identity check, so the two disagreed on the same question.
+// `process.kill` is mocked directly (synchronously, restored in `finally`)
+// since there is no portable way to make a REAL pid answer EPERM without root.
+
+test("supervisorAliveProbe: EPERM (pid exists, no permission to signal) reads alive; ESRCH reads dead", () => {
+  const originalKill = process.kill;
+  try {
+    process.kill = () => { const err = new Error("no permission"); err.code = "EPERM"; throw err; };
+    assert.strictEqual(runner.supervisorAliveProbe(process.pid), true, "EPERM means the pid exists — that is alive, not dead");
+    process.kill = () => { const err = new Error("no such process"); err.code = "ESRCH"; throw err; };
+    assert.strictEqual(runner.supervisorAliveProbe(process.pid), false);
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
+test("isSameSupervisor: EPERM plus a MATCHING kernel start-time is still our supervisor, e.g. root-owned after a privilege drop", () => {
+  if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
+  const startTicks = runner.processStartTicks(process.pid);
+  assert.ok(Number.isFinite(startTicks), "the test process itself must yield a real tick count on this platform");
+  const originalKill = process.kill;
+  try {
+    process.kill = () => { const err = new Error("no permission"); err.code = "EPERM"; throw err; };
+    const evidence = runner.isSameSupervisor(process.pid, startTicks);
+    assert.strictEqual(evidence.reallyAlive, true, "EPERM must not read as dead once identity is verified");
+    assert.strictEqual(evidence.identityKnown, true);
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
+test("isSameSupervisor: EPERM plus a MISMATCHED kernel start-time is a recycled pid, not our supervisor, however alive it answers", () => {
+  if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
+  const startTicks = runner.processStartTicks(process.pid);
+  assert.ok(Number.isFinite(startTicks), "the test process itself must yield a real tick count on this platform");
+  const originalKill = process.kill;
+  try {
+    process.kill = () => { const err = new Error("no permission"); err.code = "EPERM"; throw err; };
+    const evidence = runner.isSameSupervisor(process.pid, startTicks + 999999);
+    assert.strictEqual(evidence.reallyAlive, false, "a confirmed identity mismatch is a reused pid regardless of EPERM");
+    assert.strictEqual(evidence.identityKnown, true);
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
+test("terminalOutcomeBackfill: holds off only while the pid is VERIFIABLY still our supervisor (EPERM included) — a recycled pid is repaired instead of held open forever", () => {
+  if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
+  const startTicks = runner.processStartTicks(process.pid);
+  assert.ok(Number.isFinite(startTicks), "the test process itself must yield a real tick count on this platform");
+  const originalKill = process.kill;
+  try {
+    process.kill = () => { const err = new Error("no permission"); err.code = "EPERM"; throw err; };
+    const stillOurs = { run_id: "sup-eperm-match", state: "vanished", launch_mode: "supervised-jsonl", runner_pid: process.pid, runner_started_ticks: startTicks };
+    assert.strictEqual(runner.terminalOutcomeBackfill(stillOurs), null, "the supervisor is genuinely still alive (EPERM-unowned) and may still be mid-contract");
+    const recycled = { run_id: "sup-eperm-mismatch", state: "vanished", launch_mode: "supervised-jsonl", runner_pid: process.pid, runner_started_ticks: startTicks + 999999 };
+    const backfilled = runner.terminalOutcomeBackfill(recycled);
+    assert.ok(backfilled, "a pid that answers EPERM but no longer matches our recorded identity is not our supervisor — repair the record");
+    assert.strictEqual(backfilled.terminal_enforced, false);
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
 test("finalizeSupervisedRun: only the log's TAIL is evidence — a recovered mid-run error is not the cause of death", () => {
   // An agent that hit a rate limit hours and thousands of events earlier and
   // carried on did not die of it; filing that as the reason sends a real crash

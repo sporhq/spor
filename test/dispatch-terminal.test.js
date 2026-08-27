@@ -11,7 +11,7 @@ const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 
 const terminal = require("../lib/shell/dispatch-terminal.js");
 const runner = require("../lib/shell/agent-dispatch-runner.js");
@@ -21,6 +21,15 @@ const RUNNER = path.join(__dirname, "..", "lib", "shell", "agent-dispatch-runner
 
 function scratch(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+// A pid that is genuinely gone: spawnSync only returns once the child has been
+// waited for. Fixtures below need this, not a low, hardcoded pid like `2` —
+// on Linux that is `kthreadd`, a real, permanently-running, root-owned kernel
+// thread, so isSameSupervisor correctly reads it as alive (EPERM, not ESRCH)
+// rather than as the dead placeholder these tests want.
+function deadPid() {
+  return spawnSync(process.execPath, ["-e", ""], { stdio: "ignore" }).pid;
 }
 
 // A recording transport: `plan` maps "<METHOD> <path-prefix>" to the verdict
@@ -453,7 +462,7 @@ test("a supervised run whose supervisor died reconciles unenforced too", () => {
   fs.mkdirSync(dir, { recursive: true });
   runner.atomicJson(path.join(dir, "s1.run.json"), {
     run_id: "s1", node_id: "task-x", harness: "codex", launch_mode: "supervised-jsonl",
-    state: "running", cwd: home, runner_pid: 2, created_at: new Date(Date.now() - 600000).toISOString(),
+    state: "running", cwd: home, runner_pid: deadPid(), created_at: new Date(Date.now() - 600000).toISOString(),
   });
   const [record] = runner.reconcileRuns(home, { agents: [], enumerated: true });
   assert.ok(runner.TERMINAL_STATES.has(record.state));
@@ -472,7 +481,7 @@ test("an already-terminal record with no outcome is backfilled unenforced on the
   // terminal record, so without the backfill nothing would ever repair this.
   runner.atomicJson(path.join(dir, "b1.run.json"), {
     run_id: "b1", node_id: "task-x", harness: "codex", launch_mode: "supervised-jsonl",
-    state: "failed_launch", cwd: home, runner_pid: 2,
+    state: "failed_launch", cwd: home, runner_pid: deadPid(),
     created_at: new Date(Date.now() - 600000).toISOString(), finished_at: new Date().toISOString(),
   });
   const [record] = runner.reconcileRuns(home, { agents: [], enumerated: true });
@@ -489,7 +498,7 @@ test("the backfill never overwrites an outcome the supervisor already recorded",
   fs.mkdirSync(dir, { recursive: true });
   runner.atomicJson(path.join(dir, "b2.run.json"), {
     run_id: "b2", node_id: "task-x", harness: "codex", launch_mode: "supervised-jsonl",
-    state: "done", cwd: home, runner_pid: 2, terminal_state: "resolved", terminal_enforced: true,
+    state: "done", cwd: home, runner_pid: deadPid(), terminal_state: "resolved", terminal_enforced: true,
     resolved_by: "dec-y", created_at: new Date(Date.now() - 600000).toISOString(),
   });
   const [record] = runner.reconcileRuns(home, { agents: [], enumerated: true });
