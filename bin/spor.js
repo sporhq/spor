@@ -9393,6 +9393,41 @@ async function loadFactoryDefinition(cfg, id) {
   const resErrors = res.errors.filter(
     (e) => ![...explainedRefs].some((ref) => e.includes(`referenced gate '${ref}' could not be read from the graph`))
   );
+  // Satisfiability-style precheck (task-spor-agent-review-gate-satisfiability-
+  // precheck): an agent-review gate's structured verdict is read off the
+  // dispatched run's own final report (gateRunReportText below), and only a
+  // SUPERVISED harness writes one — a native-background launch (`claude --bg`
+  // with no profile override) has no report channel at all. Today that
+  // mismatch surfaces only once a worker actually claims the item, dispatches
+  // the review, and gets back no text to parse — after the item already reads
+  // demoted-and-escalated on the graph. Catch it here instead, the same moment
+  // every other factory-shape mistake is caught, so a misrouted gate refuses
+  // the worker at load time rather than at the claim's expense. Run-time stays
+  // the backstop (bin/spor.js gateRunReportText's own error) for whatever this
+  // precheck cannot see — a dangling profile, a machine-declared harness this
+  // box has no binding for.
+  if (res.factory) {
+    for (const gate of res.factory.gates) {
+      if (gate.kind !== "agent-review") continue;
+      const pn = await resolveNode(cfg, gate.profile);
+      if (!pn || !pn.raw) continue; // an unreadable/missing profile is a dispatch-time refusal, not this precheck's job
+      const profile = parse(pn.raw, `${gate.profile}.md`);
+      if (!profile || profile.type !== "profile") continue;
+      // Mirrors resolveDispatchProfile's own default (dispatch --profile path):
+      // an unset harness runs claude --bg, so the gap is silent (and fatal to
+      // an agent-review gate) unless a profile explicitly names a supervised one.
+      const harness = (typeof profile.harness === "string" && profile.harness) || "claude-code";
+      const resolved = dispatchHarnesses.resolveHarness(harness, { cfg });
+      if (resolved.adapter && resolved.adapter.launchMode === "native-background") {
+        errors.push(
+          `gate '${gate.id}': agent-review gate routes to profile '${gate.profile}', whose harness '${harness}' launches` +
+            ` native-background and has no report channel — an agent-review gate's verdict is read from the run's final` +
+            ` report, which only a SUPERVISED harness writes; route '${gate.profile}' to a supervised harness (codex,` +
+            ` opencode, copilot, or a machine-declared one) instead.`
+        );
+      }
+    }
+  }
   return { factory: errors.length ? null : res.factory, errors: [...new Set([...errors, ...resErrors])] };
 }
 

@@ -1587,6 +1587,43 @@ test("a factory id that is not a factory node says so, and points at the candida
   assert.match(missing.stderr, /could not be read from the graph/);
 });
 
+// task-spor-agent-review-gate-satisfiability-precheck: an agent-review gate's
+// verdict is read off the dispatched run's own final report, which only a
+// SUPERVISED harness writes — a native-background launch (claude --bg, the
+// default when a profile names no harness at all) has none. That mismatch
+// used to surface only once a worker claimed the item and the review came
+// back with nothing to parse; it must now refuse the worker at LOAD time.
+test("an agent-review gate routed to a native-background profile refuses the worker at load time", () => {
+  for (const [front, label] of [
+    ["type: profile\ntitle: Native background profile\nsummary: A profile that names no harness at all.\n", "unset harness (defaults to claude-code)"],
+    ["type: profile\ntitle: Explicit claude-code profile\nsummary: A profile that explicitly names the native-background built-in.\nharness: claude-code\n", "explicit claude-code"],
+  ]) {
+    const { home, nodes } = cliFixture({
+      factoryPayload: { ...OK_FACTORY, gates: [...OK_FACTORY.gates, { id: "review", kind: "agent-review", profile: "profile-native" }] },
+    });
+    fs.writeFileSync(path.join(nodes, "profile-native.md"), `---\nid: profile-native\n${front}date: 2026-08-26\n---\nTest profile.\n`);
+    const r = cli(["work", "--once", "--factory", "factory-demo"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode() });
+    assert.strictEqual(r.status, 1, `${label}: ${r.stdout}`);
+    assert.match(r.stderr, /gate 'review': agent-review gate routes to profile 'profile-native'/, label);
+    assert.match(r.stderr, /launches native-background and has no report channel/, label);
+    assert.match(r.stderr, /only a SUPERVISED harness writes/, label);
+    assert.match(r.stderr, /does not run ungated/, label);
+  }
+});
+
+test("an agent-review gate routed to a supervised (declared) harness loads cleanly", () => {
+  // profile-gate (written by cliFixture) declares the fake harness the fixture
+  // registers in dispatch.harness — always launchMode supervised-jsonl by v1
+  // scope (lib/shell/dispatch-harnesses.js declaredAdapter) — so it must NOT
+  // trip the native-background precheck.
+  const { home } = cliFixture({
+    factoryPayload: { ...OK_FACTORY, gates: [...OK_FACTORY.gates, { id: "review", kind: "agent-review", profile: "profile-gate" }] },
+  });
+  const r = cli(["work", "--print", "--factory", "factory-demo"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode() });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /gate review {2}agent-review {2}review under profile-gate/);
+});
+
 test("end to end: a dispatched run is gated, and the gate outcome lands in the graph as a fact on the item", () => {
   const { home, repo, nodes, outfile } = cliFixture({ factoryPayload: OK_FACTORY });
   const r = cli(
