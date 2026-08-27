@@ -1597,6 +1597,13 @@ test("an agent-review gate routed to a native-background profile refuses the wor
   for (const [front, label] of [
     ["type: profile\ntitle: Native background profile\nsummary: A profile that names no harness at all.\n", "unset harness (defaults to claude-code)"],
     ["type: profile\ntitle: Explicit claude-code profile\nsummary: A profile that explicitly names the native-background built-in.\nharness: claude-code\n", "explicit claude-code"],
+    // gate.profile pointing at a real node that is NOT `type: profile` (a
+    // mistyped id, or a profile authored with no `type:` line at all) must
+    // still be caught: neither resolveDispatchProfile nor spor dispatch's own
+    // harness resolution checks the node's type, so this precheck must not
+    // either — a `type:` mismatch here would silently fall back to run-time-
+    // only detection for a plausible authoring mistake.
+    ["type: task\ntitle: Not actually a profile node\nsummary: A node with the right id but the wrong type, and no harness field.\n", "wrong node type, no type:profile gate"],
   ]) {
     const { home, nodes } = cliFixture({
       factoryPayload: { ...OK_FACTORY, gates: [...OK_FACTORY.gates, { id: "review", kind: "agent-review", profile: "profile-native" }] },

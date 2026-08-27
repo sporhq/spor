@@ -9411,8 +9411,14 @@ async function loadFactoryDefinition(cfg, id) {
       if (gate.kind !== "agent-review") continue;
       const pn = await resolveNode(cfg, gate.profile);
       if (!pn || !pn.raw) continue; // an unreadable/missing profile is a dispatch-time refusal, not this precheck's job
+      // Read `.harness` the same way resolveDispatchProfile does — off
+      // whatever frontmatter is there, with NO `type: profile` gate. Neither
+      // resolveDispatchProfile nor spor dispatch's own harness resolution
+      // checks the node's type, so requiring one here would under-cover a
+      // mistyped gate.profile (a real node id, wrong type, or a profile
+      // authored without an explicit `type:` line) — exactly the authoring
+      // mistake this precheck exists to catch before a worker claims work on it.
       const profile = parse(pn.raw, `${gate.profile}.md`);
-      if (!profile || profile.type !== "profile") continue;
       // Mirrors resolveDispatchProfile's own default (dispatch --profile path):
       // an unset harness runs claude --bg, so the gap is silent (and fatal to
       // an agent-review gate) unless a profile explicitly names a supervised one.
