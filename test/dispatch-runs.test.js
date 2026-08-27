@@ -867,6 +867,74 @@ test("terminalOutcomeBackfill: holds off only while the pid is VERIFIABLY still 
   }
 });
 
+// activeRuns() and the `alive()` predicate bin/spor.js hands to
+// workLoop.runHarvest (exported there as `runSupervisorAlive`) were the two
+// remaining bare-`pidAlive()` consumers of the same divergence class
+// (task-spor-dispatch-pidalive-remaining-call-sites) — a permission-restricted
+// recycled pid used to read as "not active"/"not alive" there even though it
+// is EPERM, not ESRCH. Both now go through the shared `isSameSupervisor`.
+
+test("activeRuns: EPERM (pid exists, no permission to signal) still counts as active — not the false-negative bare pidAlive gave", () => {
+  const home = scratch("spor-active-runs-eperm-");
+  const dir = path.join(home, "journal", "dispatch");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "r1.run.json"), JSON.stringify({ run_id: "r1", state: "running", runner_pid: process.pid, name: "demo" }));
+  const originalKill = process.kill;
+  try {
+    process.kill = () => { const err = new Error("no permission"); err.code = "EPERM"; throw err; };
+    const active = runner.activeRuns(home, {});
+    assert.deepStrictEqual(active.map((r) => r.run_id), ["r1"], "EPERM means the supervisor pid exists — that is alive, not dead");
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
+test("activeRuns: EPERM plus a MISMATCHED kernel start-time is a recycled pid, dropped from the active set", () => {
+  if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
+  const home = scratch("spor-active-runs-mismatch-");
+  const dir = path.join(home, "journal", "dispatch");
+  fs.mkdirSync(dir, { recursive: true });
+  const startTicks = runner.processStartTicks(process.pid);
+  assert.ok(Number.isFinite(startTicks), "the test process itself must yield a real tick count on this platform");
+  fs.writeFileSync(
+    path.join(dir, "r1.run.json"),
+    JSON.stringify({ run_id: "r1", state: "running", runner_pid: process.pid, runner_started_ticks: startTicks + 999999, name: "demo" })
+  );
+  const originalKill = process.kill;
+  try {
+    process.kill = () => { const err = new Error("no permission"); err.code = "EPERM"; throw err; };
+    const active = runner.activeRuns(home, {});
+    assert.deepStrictEqual(active, [], "a confirmed identity mismatch is a reused pid, not our supervisor — must not read as active however alive it answers");
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
+test("runSupervisorAlive (bin/spor.js's alive() for workLoop.runHarvest): EPERM does not read as dead", () => {
+  const sporjs = require("../bin/spor.js");
+  const originalKill = process.kill;
+  try {
+    process.kill = () => { const err = new Error("no permission"); err.code = "EPERM"; throw err; };
+    assert.strictEqual(sporjs.runSupervisorAlive(process.pid, null), true, "EPERM means the pid exists — alive, not dead, same as isSameSupervisor");
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
+test("runSupervisorAlive (bin/spor.js's alive() for workLoop.runHarvest): EPERM plus a MISMATCHED kernel start-time is not our supervisor", () => {
+  if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
+  const sporjs = require("../bin/spor.js");
+  const startTicks = runner.processStartTicks(process.pid);
+  assert.ok(Number.isFinite(startTicks), "the test process itself must yield a real tick count on this platform");
+  const originalKill = process.kill;
+  try {
+    process.kill = () => { const err = new Error("no permission"); err.code = "EPERM"; throw err; };
+    assert.strictEqual(sporjs.runSupervisorAlive(process.pid, startTicks + 999999), false, "a confirmed identity mismatch is a reused pid regardless of EPERM");
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
 // terminalOutcomeBackfill used to hold off repair on `isSameSupervisor(...)
 // .reallyAlive` alone, with no fallback for the identity-UNKNOWN case (no
 // recorded `runner_started_ticks` — an older record, or a non-Linux host):

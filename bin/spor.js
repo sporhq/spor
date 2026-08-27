@@ -9138,6 +9138,19 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
 // worktree isolation, the supervisor, the run record, the terminal-state
 // contract — apply unchanged and can never drift from the one-shot path.
 
+// The `alive(pid, ticks)` predicate workLoop.runHarvest uses to decide
+// whether a `contract_pending` run's supervisor is still trusted to close it
+// (the bounded hold in runHarvest's contract-pending branch) — routed through
+// the shared, EPERM-tolerant isSameSupervisor rather than a bare pidAlive, the
+// same divergence class already unified for terminalOutcomeBackfill and
+// finalizeSupervisedRun (issue-spor-dispatch-supervisor-liveness-check-
+// divergence). Extracted to a named export so the EPERM/identity-unknown
+// behavior is pinned directly rather than only indirectly, through a live
+// dispatch.
+function runSupervisorAlive(pid, ticks) {
+  return dispatchRuns.isSameSupervisor(pid, ticks).reallyAlive;
+}
+
 // Which of this worker's runs are over, and what they did to the graph.
 // RECONCILE first, exactly as `spor runs` does: a native-background run's
 // ending is invisible to its launcher, so its record only goes terminal when
@@ -9164,10 +9177,9 @@ function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, warn = () => {} } = {}) {
   // a slot whose run record has vanished can never be observed going terminal,
   // so reporting nothing for it would hold that slot for the life of the
   // worker. workLoop.runHarvest owns the rule; this only names what it decided.
-  const alive = (pid, ticks) => dispatchRuns.isSameSupervisor(pid, ticks).reallyAlive;
   return [...wanted].map((id) => {
     const record = found.get(id) || null;
-    const verdict = workLoop.runHarvest(record, { terminalStates: dispatchRuns.TERMINAL_STATES, alive, maxAgeMs });
+    const verdict = workLoop.runHarvest(record, { terminalStates: dispatchRuns.TERMINAL_STATES, alive: runSupervisorAlive, maxAgeMs });
     if (verdict.why === "missing") {
       return {
         run_id: id, terminal: true,
@@ -12758,7 +12770,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, setStatusLocal, makeGateDeps };
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, setStatusLocal, makeGateDeps, runSupervisorAlive };
 
 if (require.main === module) {
   main()
