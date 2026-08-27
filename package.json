@@ -52,7 +52,8 @@
     "test:e2e:codex": "node --require ./test/helpers/tmp-cleanup.js --test test/e2e-codex-dispatch.test.js",
     "test:e2e:opencode": "node --require ./test/helpers/tmp-cleanup.js --test test/e2e-opencode-dispatch.test.js",
     "test:e2e:copilot": "node --require ./test/helpers/tmp-cleanup.js --test test/e2e-copilot-dispatch.test.js",
-    "conformance": "node conformance/runner.js"
+    "conformance": "node conformance/runner.js",
+    "eval:skills": "node scripts/run-skill-evals.js"
   },
   "engines": {
     "node": ">=20"

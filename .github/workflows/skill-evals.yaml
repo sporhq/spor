@@ -1,0 +1,28 @@
+name: skill evals
+
+# task-spor-skill-evals-in-ci. Runs scripts/run-skill-evals.js: each shipped skill's
+# evals/evals.json prompts against the real `claude` binary + a real model call, checking
+# trigger accuracy (does the Skill fire exactly when its description says it should). NOT
+# on push/PR — each case is a real, billed model call, too slow/costly for every commit
+# (mirrors e2e-matrix.yaml's on-demand + scheduled cadence). Needs an ANTHROPIC_API_KEY
+# repo secret; the script self-skips cleanly (exit 0) without one — see CONTRIBUTING.md
+# "Skill eval suites".
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * 1" # Mondays 09:00 UTC
+
+jobs:
+  skill-evals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm install -g @anthropic-ai/claude-code
+      - run: npm run eval:skills
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

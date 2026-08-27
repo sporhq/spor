@@ -49,6 +49,42 @@ npm run conformance # the byte-identical golden suite
 Both must pass. Add tests for new behavior, and keep new code in the style of
 the code around it.
 
+## Skill eval suites
+
+Some shipped skills carry an `evals/evals.json` (currently `skills/factory/` and
+`skills/onboard/`) — trigger-accuracy test cases authored via `/skill-creator`
+(its own format: `{skill_name, evals: [{id, prompt, expected_output, files}]}`,
+documented in that plugin's `references/schemas.md`). This is **not** the
+`claude plugin eval` CLI's `case.yaml`/`prompt.md` format — that feature is
+early-access, needs an undocumented enablement setting, and would need every
+case rewritten to adopt.
+
+Two things check these suites, at different costs:
+
+- **Manifest validity** (`test/skill-evals-manifest.test.js`, part of `npm
+  test`, runs on every PR/push): a fast, zero-cost structural check — valid
+  JSON, `skill_name` matching the directory and `SKILL.md` frontmatter, unique
+  ids, non-empty `prompt`/`expected_output`, and any `files` reference actually
+  existing. Catches a manifest silently rotting (a rename, a typo, a dangling
+  file) immediately.
+- **Trigger-accuracy run** (`scripts/run-skill-evals.js`, wired to
+  `.github/workflows/skill-evals.yaml` on a weekly schedule + manual
+  `workflow_dispatch`, **not** per-PR): drives the real `claude` binary with
+  this plugin loaded against each eval's `prompt` and checks whether the
+  `Skill` tool fires exactly when the case expects it to (a case's
+  `expected_output` starting with "Should NOT trigger" is a negative case).
+  Each case is one real, billed model call, so it runs on a schedule rather
+  than every push. It needs an `ANTHROPIC_API_KEY` repository secret; without
+  one configured it logs a message and exits 0 rather than failing the job.
+  `test/skill-evals-runner.test.js` covers the harness itself (spawn,
+  stream-json parsing, tool-use detection) against the fake Anthropic API used
+  elsewhere in this suite, so that logic is verified without spending real API
+  budget — only the scheduled workflow spends money, and only once the secret
+  exists.
+
+Adding a new skill's `evals/evals.json`? Follow the existing two as the
+template; both checks above pick it up automatically (no registration step).
+
 ## Reporting bugs and ideas
 
 Open an issue at <https://github.com/sporhq/spor/issues>. For anything that
