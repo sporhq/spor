@@ -867,6 +867,39 @@ test("terminalOutcomeBackfill: holds off only while the pid is VERIFIABLY still 
   }
 });
 
+// terminalOutcomeBackfill used to hold off repair on `isSameSupervisor(...)
+// .reallyAlive` alone, with no fallback for the identity-UNKNOWN case (no
+// recorded `runner_started_ticks` — an older record, or a non-Linux host):
+// a terminal record whose recorded pid was recycled into a permission-
+// restricted (or simply still-alive) unrelated process could be held
+// un-repaired indefinitely. `finalizeSupervisedRun` already had a staleMs
+// fallback for exactly this case; these two cover
+// `terminalOutcomeBackfill` now sharing it via `supervisorStillWatching`.
+test("terminalOutcomeBackfill: identity unverifiable (no recorded tick count) but the record is FRESH — held off, same as a verified match", () => {
+  const record = {
+    run_id: "sup-no-identity-fresh",
+    state: "vanished",
+    launch_mode: "supervised-jsonl",
+    runner_pid: process.pid,
+    created_at: "2026-07-18T10:00:00.000Z",
+  };
+  const result = runner.terminalOutcomeBackfill(record, { now: () => "2026-07-18T10:30:00.000Z", staleMs: 86400000 });
+  assert.strictEqual(result, null, "identity can't be verified, but this record is only 30m past its last sign of life — well inside the 24h staleness ceiling, so it stays held open");
+});
+
+test("terminalOutcomeBackfill: identity unverifiable (no recorded tick count) AND stale — repaired instead of held open forever", () => {
+  const record = {
+    run_id: "sup-no-identity-stale",
+    state: "vanished",
+    launch_mode: "supervised-jsonl",
+    runner_pid: process.pid,
+    created_at: "2026-07-18T10:00:00.000Z",
+  };
+  const result = runner.terminalOutcomeBackfill(record, { now: () => "2026-07-20T10:00:00.000Z", staleMs: 86400000 });
+  assert.ok(result, "identity can't be verified and this record has gone silent for 2 days past the 24h ceiling — the staleMs fallback must repair it, not hold it open forever just because the (unrelated) pid still answers");
+  assert.strictEqual(result.terminal_enforced, false);
+});
+
 test("finalizeSupervisedRun: only the log's TAIL is evidence — a recovered mid-run error is not the cause of death", () => {
   // An agent that hit a rate limit hours and thousands of events earlier and
   // carried on did not die of it; filing that as the reason sends a real crash
