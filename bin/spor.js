@@ -7888,6 +7888,61 @@ function renderLaunchArg(arg, { embedded = false } = {}) {
   return shellQuote(substitutePlaceholders(arg, { report: "<report-path>", cwd: "<dir>", embedded: true }));
 }
 
+// The supervisor→launcher launch handshake (task-spor-dispatch-launch-
+// handshake): the launcher gives the spawned supervisor a dedicated pipe (fd
+// 3, wired via SPOR_DISPATCH_HANDSHAKE_FD) that the supervisor writes one
+// JSON line to the moment it KNOWS whether the harness child started — not
+// when the run record happens to catch up. This resolves as soon as that
+// line arrives (or the channel closes, or the supervisor's own spawn errors),
+// so launch success/failure is SIGNALED, not inferred from a fixed poll
+// window racing an unrelated async write (dec-spor-dispatch-terminal-state-
+// outcome-layer's provisional record write is a good-enough safety net, but a
+// timing coincidence is not a contract). `timeoutMs` is a genuine last-resort
+// bound for a supervisor that never signals at all — not a poll interval.
+function awaitLaunchHandshake(stream, timeoutMs) {
+  return new Promise((resolve) => {
+    if (!stream) { resolve({ kind: "no-channel" }); return; }
+    let buf = "";
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      stream.removeListener("data", onData);
+      stream.removeListener("end", onClosed);
+      stream.removeListener("close", onClosed);
+      stream.removeListener("error", onClosed);
+      try { stream.destroy(); } catch { /* already gone */ }
+      resolve(result);
+    };
+    const onData = (chunk) => {
+      buf += chunk.toString("utf8");
+      const nl = buf.indexOf("\n");
+      if (nl === -1) return;
+      let msg = null;
+      try { msg = JSON.parse(buf.slice(0, nl)); } catch { /* falls through to "unusable" */ }
+      if (msg && typeof msg === "object") finish({ kind: "signal", ok: !!msg.ok, error: msg.error || null });
+      else finish({ kind: "unusable" });
+    };
+    // The channel closing with no line ever parsed means the supervisor died
+    // (or never wired the handshake, e.g. a test-seam override) before it
+    // could signal either way — the caller falls back to the honest process
+    // check for that case, exactly as it did before this handshake existed.
+    const onClosed = () => finish({ kind: "channel-closed" });
+    // Deliberately left ref'd: this wait is the launcher's whole reason to
+    // stay alive right now (the CLI process has nothing else pending, since
+    // the spawned child itself was already unref'd) — an unref'd timer/stream
+    // here would let the event loop drain and the process exit with an
+    // unresolved `await`, silently treating a still-pending handshake as
+    // success.
+    const timer = setTimeout(() => finish({ kind: "timeout" }), timeoutMs);
+    stream.on("data", onData);
+    stream.on("end", onClosed);
+    stream.on("close", onClosed);
+    stream.on("error", onClosed);
+  });
+}
+
 async function launchSupervisedHarness(cfg, {
   adapter, command, args, cwd, name, nodeId, prompt, server, childToken, mcpToken, bindToken,
   renewToken, renewNode, releaseNode, project,
@@ -7949,17 +8004,28 @@ async function launchSupervisedHarness(cfg, {
   if (mcpToken) runnerEnv.SPOR_DISPATCH_MCP_TOKEN = mcpToken;
   if (bindToken) runnerEnv.SPOR_DISPATCH_BIND_TOKEN = bindToken;
   if (renewToken) runnerEnv.SPOR_DISPATCH_RENEW_TOKEN = renewToken;
+  // fd 3 is the handshake channel (see awaitLaunchHandshake above); told apart
+  // from the ordinary stdio fds by the env var so a supervisor that doesn't
+  // know about it (an old build, or a test-seam override) simply never writes
+  // there instead of writing garbage to whatever fd 3 happens to be.
+  runnerEnv.SPOR_DISPATCH_HANDSHAKE_FD = "3";
   let child;
   let spawnError = null;
+  // Resolved the instant the supervisor process itself fails to spawn (a
+  // failure of `spawn(runner.cmd, ...)`, distinct from the harness child IT
+  // spawns) — a permanent listener so a later `error` on this child, after the
+  // handshake wait below has moved on, never becomes an unhandled-error crash.
+  let notifySpawnError = () => {};
+  const spawnErrorPromise = new Promise((resolve) => { notifySpawnError = resolve; });
   try {
     const runner = dispatchRunnerCommand();
     child = spawn(runner.cmd, [...runner.args, p.job], {
       detached: true,
-      stdio: "ignore",
+      stdio: ["ignore", "ignore", "ignore", "pipe"],
       env: runnerEnv,
       windowsHide: true,
     });
-    child.on("error", (e) => { spawnError = e; });
+    child.on("error", (e) => { spawnError = e; notifySpawnError(e); });
     child.unref();
     if (child.pid) {
       // The tick count pins WHICH process pid `child.pid` is right now, so a
@@ -7976,14 +8042,6 @@ async function launchSupervisedHarness(cfg, {
     spawnError = e;
   }
 
-  for (let i = 0; i < 20 && !spawnError; i++) {
-    const state = dispatchRuns.readJson(p.record);
-    if (state && state.state === "failed_launch") {
-      return { ok: false, error: state.error || `${adapter.label} process failed to launch`, runId, paths: p };
-    }
-    if (state && state.state !== "launching") return { ok: true, state, runId, paths: p };
-    await sleep(50);
-  }
   // The record is already open at `launching`, and a supervisor that never
   // started will never close it — so the launcher closes it here, or the run
   // reads as live until reconciliation ages it out
@@ -7998,12 +8056,39 @@ async function launchSupervisedHarness(cfg, {
     // record keeps the self-contained sentence, since nothing else explains it.
     return abandon("supervisor-spawn-failed", `the ${adapter.label} supervisor could not be started: ${spawnError.message}`, spawnError.message);
   }
+
+  const signal = await Promise.race([
+    awaitLaunchHandshake(child.stdio && child.stdio[3], cfg.getNum("dispatch.launchHandshakeTimeoutMs", 5000)),
+    spawnErrorPromise.then((e) => ({ kind: "spawn-error", error: e })),
+  ]);
+  if (signal.kind === "spawn-error") {
+    return abandon("supervisor-spawn-failed", `the ${adapter.label} supervisor could not be started: ${signal.error.message}`, signal.error.message);
+  }
+  if (signal.kind === "signal") {
+    if (signal.ok === false) {
+      // The supervisor said so directly — no need to also wait on the record
+      // write the terminal-state contract makes beside it.
+      return { ok: false, error: signal.error || `${adapter.label} process failed to launch`, runId, paths: p };
+    }
+    const state = dispatchRuns.readJson(p.record) || record;
+    return { ok: true, state, runId, paths: p };
+  }
+  // "channel-closed" / "timeout" / "unusable" / "no-channel": the supervisor
+  // never confirmed the launch over the handshake at all — fall back to the
+  // honest process check. `child.exitCode`/`signalCode` are the honest test: a
+  // detached child stays reaped-and-tracked by this process, so a bare pid
+  // probe would read a zombie as alive. A crashed supervisor closes its fd 3
+  // as PART OF exiting, so "channel-closed" can win this race before Node has
+  // finished setting exitCode/signalCode — give the child's own `close` a
+  // short, bounded beat to land (it always follows stdio closing) rather than
+  // reading a not-yet-updated exitCode as "still alive".
+  if (signal.kind === "channel-closed" && child.exitCode === null && child.signalCode === null) {
+    await new Promise((resolve) => {
+      child.once("close", resolve);
+      setTimeout(resolve, 500);
+    });
+  }
   const state = dispatchRuns.readJson(p.record) || record;
-  // The supervisor came up but is already gone with nothing recorded — it died
-  // before it could report either the child starting or its own launch failure.
-  // `child.exitCode`/`signalCode` are the honest test: a detached child stays
-  // reaped-and-tracked by this process, so a bare pid probe would read a zombie
-  // as alive.
   if (state.state === "launching" && child && (child.exitCode !== null || child.signalCode !== null)) {
     const how = child.signalCode ? `on ${child.signalCode}` : `with code ${child.exitCode}`;
     return abandon("supervisor-exited-early", `the ${adapter.label} supervisor exited ${how} before reporting its child started`);

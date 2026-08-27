@@ -541,3 +541,43 @@ test("a supervisor that exits before reporting anything stamps failed_launch, di
   // the ephemeral job/prompt files are cleaned up alongside the abandoned run
   assert.ok(!fs.readdirSync(runDir).some((f) => /\.job\.json$|\.prompt$/.test(f)));
 });
+
+test("a launch failure is reported off the supervisor's own handshake, not inferred from how long the run record takes to update it (task-spor-dispatch-launch-handshake)", () => {
+  // The bug this regression test pins: launchSupervisedHarness used to poll
+  // the run record for a fixed 20 x 50ms and infer "launched" from silence.
+  // Any delay in the record's own write — an async terminal-state write, a
+  // slow disk, anything — could silently outlast that window and read as a
+  // false success. This stub writes the handshake signal immediately but
+  // deliberately delays the record's own `failed_launch` write far past the
+  // OLD poll window, to prove the launcher's verdict now comes from the
+  // handshake channel, not from racing that write.
+  const { home, repo } = fixture();
+  const slowRunner = writeSpawnableNodeStub(home, "runner-slow-record", `
+const fs = require("node:fs");
+const fd = Number(process.env.SPOR_DISPATCH_HANDSHAKE_FD);
+try {
+  fs.writeSync(fd, JSON.stringify({ ok: false, error: "the codex binary does not exist (stub)" }) + "\\n");
+} catch {}
+try { fs.closeSync(fd); } catch {}
+const job = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+// Simulate the async terminal-state contract call this record write used to
+// be gated behind — well past the old fixed poll window (1000ms).
+setTimeout(() => {
+  fs.writeFileSync(job.record_path, JSON.stringify({
+    state: "failed_launch", error: "the codex binary does not exist (stub, delayed write)",
+  }, null, 2));
+}, 2000);
+`);
+  const started = Date.now();
+  const result = run(
+    ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--no-brief"],
+    { SPOR_HOME: home, SPOR_CODEX_CMD: codexStub(home), SPOR_DISPATCH_RUNNER_CMD: slowRunner }
+  );
+  const elapsed = Date.now() - started;
+  assert.strictEqual(result.status, 1);
+  // The message came off the handshake — the delayed record write hasn't
+  // happened yet at this point, so a record-derived message would differ (or
+  // still read `launching`).
+  assert.match(result.stderr, /could not launch .*: the codex binary does not exist \(stub\)/);
+  assert.ok(elapsed < 1500, `expected the handshake to resolve well under the delayed record write, took ${elapsed}ms`);
+});
