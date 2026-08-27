@@ -8066,9 +8066,15 @@ async function launchSupervisedHarness(cfg, {
   }
   if (signal.kind === "signal") {
     if (signal.ok === false) {
-      // The supervisor said so directly — no need to also wait on the record
-      // write the terminal-state contract makes beside it.
-      return { ok: false, error: signal.error || `${adapter.label} process failed to launch`, runId, paths: p };
+      // The supervisor said so directly — no need to wait on the record write
+      // the terminal-state contract makes beside it. But some failures (an
+      // invalid job file, an unrecognized harness adapter) are caught before
+      // the supervisor ever touches the record at all, so it would otherwise
+      // sit at `launching` forever; abandon() closes it here too. `closeRun`
+      // guards on `fromState`/TERMINAL_STATES, so this is a harmless no-op on
+      // the paths where the supervisor's own contract also closes it.
+      const msg = signal.error || `${adapter.label} process failed to launch`;
+      return abandon("supervisor-reported-failure", `the ${adapter.label} supervisor reported a launch failure: ${msg}`, msg);
     }
     const state = dispatchRuns.readJson(p.record) || record;
     return { ok: true, state, runId, paths: p };
