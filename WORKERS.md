@@ -603,10 +603,9 @@ under test cannot rewrite its own judge. So a command gate:
    cannot be read is itself a refusal, never a clean tree);
 2. **fails CLOSED** if that change touches any declared protected test path —
    the suite is not run at all, no fix cycle is offered, and the test change is
-   filed as its own queue item naming the `test_lane_profile` (a different lane,
-   which a `spor work --profile <lane>` worker or a person picks up). Same
-   entity, same misunderstanding: the lane that writes the test may not be the
-   lane that writes the code;
+   filed as its own queue item naming the `test_lane_profile` (a different
+   lane). Same entity, same misunderstanding: the lane that writes the test may
+   not be the lane that writes the code;
 3. otherwise materializes a throwaway git worktree at the implementer's commit
    and **forces every protected path back to the trusted ref's copy** (files the
    branch added under a protected path are removed), then runs the declared
@@ -615,6 +614,20 @@ under test cannot rewrite its own judge. So a command gate:
 Step 3 is belt and braces — step 2 already refuses a branch that touched those
 paths — and that is the point: the guarantee that the suite is the trusted ref's
 copy does not rest on the check having run.
+
+**The lane item routes itself** (task-spor-test-change-lane-auto-routing): the
+filed item carries the lane as `profile:` frontmatter (`buildGateWorkNode`), and
+`spor work`'s own candidate selection reads that field back — every queue item
+`dispatchableQueuePage`/`rankQueue` returns surfaces its `profile:` frontmatter
+verbatim when set, and `dispatchWorkItem` passes it through as if `--profile
+<lane>` had been given for that one dispatch. So a plain `spor work` (no
+`--profile`) still only picks up the lane item on a box that can satisfy that
+profile — everywhere else it refuses loudly and cools off, same as an explicit
+`--profile` targeting an unsatisfiable profile would, leaving it for a `spor
+work --profile <lane>` worker (or a person) to take. An explicit
+`--profile`/`work.profile` on the worker itself still wins over the item's own
+frontmatter, mirroring `resolveDispatchProfile`'s existing --profile-beats-
+inferred precedence for a node's `assigned -> agent` edge.
 
 ### 10.4 Agent-review gates — a verdict that is read, not asserted
 

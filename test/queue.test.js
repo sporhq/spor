@@ -1727,3 +1727,28 @@ test("readinessOf: front at/under the held floor does NOT classify human — mat
   ])).load();
   assert.deepEqual(readinessOf(g, "task-floor", { front: { "task-floor": 2 } }), { readiness: "untriaged", reasons: [] });
 });
+
+test("rankQueue: an item's `profile:` frontmatter surfaces on the ranked item verbatim (task-spor-test-change-lane-auto-routing)", () => {
+  const g = tmpGraph({
+    "task-lane.md": `---
+id: task-lane
+type: task
+project: my-project
+title: Test-change lane item
+summary: Standalone summary for task-lane used by queue tests.
+status: open
+date: 2026-06-01
+profile: profile-test-writer
+---
+Body of task-lane.
+`,
+    ...Object.fromEntries([node("task-plain", "task", { status: "open" })]),
+  }).load();
+  const r = rankQueue(g, { now: NOW });
+  const lane = r.items.find((i) => i.id === "task-lane");
+  const plain = r.items.find((i) => i.id === "task-plain");
+  assert.equal(lane.profile, "profile-test-writer");
+  // Byte-identical for a node with no `profile:` frontmatter: the key is
+  // omitted entirely, not present as null/undefined.
+  assert.equal("profile" in plain, false);
+});

@@ -607,6 +607,91 @@ test("a dispatch refusal is recorded with its own reason and the worker stops in
   assert.ok(Date.parse(skipped[0].until) > Date.now(), "and it is cooling off, not dropped");
 });
 
+// A scratch graph home whose queue holds exactly one item that names its
+// worker profile via `profile:` frontmatter alone — no `assigned -> agent`
+// edge at all, the exact shape `buildGateWorkNode`'s test-change lane item
+// takes (task-spor-test-change-lane-auto-routing, WORKERS.md §10.3). The
+// point is that a PLAIN `spor work` (no `--profile`) still routes it.
+function laneFixture({ declaration = true } = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-lane-home-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-lane-repo-"));
+  fs.writeFileSync(
+    path.join(nodes, "task-lane.md"),
+    `---\nid: task-lane\ntype: task\nrepo: demo\ntitle: Move the retention-policy test into its own file\nsummary: A protected test path changed on the implementer's branch; the change belongs in its own lane.\nstatus: open\nprofile: profile-work\ndate: 2026-08-20\n---\nTest-change lane item.\n`
+  );
+  fs.writeFileSync(
+    path.join(nodes, "profile-work.md"),
+    `---\nid: profile-work\ntype: profile\ntitle: Work loop test profile\nsummary: A profile selecting the fake harness the work-loop test declares locally.\nharness: ${HARNESS}\ndate: 2026-08-20\n---\nTest profile.\n`
+  );
+
+  const stub = writeSpawnableNodeStub(home, "work-lane-stub", `
+const fs = require("node:fs");
+let prompt = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (c) => { prompt += c; });
+process.stdin.on("end", () => {
+  fs.appendFileSync(process.env.WORK_OUTFILE, JSON.stringify({ cwd: process.cwd(), prompt }) + "\\n");
+  process.stdout.write(JSON.stringify({ kind: "message", message: { text: "fake worker report" } }) + "\\n");
+  process.exit(0);
+});
+`);
+  const cfg = { dispatch: { repos: { demo: repo } } };
+  if (declaration) {
+    cfg.dispatch.harness = {
+      [HARNESS]: { command: stub, args: ["--dir={cwd}"], label: "Work Lane Fake", report: { from: "lastText", text: "message.text" } },
+    };
+  }
+  fs.writeFileSync(path.join(home, "config.json"), `${JSON.stringify(cfg, null, 2)}\n`);
+  return { home, repo, nodes, outfile: path.join(home, "invocations.jsonl") };
+}
+
+test("spor work auto-routes a queue item's `profile:` frontmatter — no manual --profile targeting needed (task-spor-test-change-lane-auto-routing)", () => {
+  const { home, repo, outfile } = laneFixture();
+  const r = cli(
+    ["work", "--once", "--max", "1", "--interval", "1", "--no-brief"],
+    { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() }
+  );
+  assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
+  assert.match(r.stdout, /work: dispatched task-lane/);
+
+  const invocations = fs.readFileSync(outfile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.strictEqual(invocations.length, 1, "the item with no assigned edge at all still launched, routed by its frontmatter alone");
+  assert.strictEqual(invocations[0].cwd, repo);
+});
+
+test("spor work refuses a lane item it cannot satisfy — same as an explicit --profile would, never silently dropped or run bare", () => {
+  const { home, outfile } = laneFixture({ declaration: false });
+  const r = cli(
+    ["work", "--once", "--interval", "1", "--no-brief"],
+    { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() }
+  );
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /work: skipping task-lane — /);
+  const status = JSON.parse(cli(["work", "--status", "--json"], { SPOR_HOME: home, XDG_CONFIG_HOME: home }).stdout);
+  assert.match(status.workers[0].skipped[0].reason, /profile-work/, "the refusal names the routed profile, not a generic skip");
+  assert.ok(!fs.existsSync(outfile), "never launched under an unsatisfiable profile");
+});
+
+// An explicit --profile on the worker itself still wins over the item's own
+// frontmatter (mirrors resolveDispatchProfile's --profile-beats-inferred
+// precedence for a node's assigned->agent edge, bin/spor.js).
+test("an explicit --profile on the worker overrides an item's own `profile:` frontmatter", () => {
+  const { home, outfile } = laneFixture({ declaration: false });
+  // profile-other resolves to nothing on disk, so passing it makes dispatch
+  // refuse loudly on THAT id — proof the item's own profile-work was never
+  // consulted once --profile was given explicitly.
+  const r = cli(
+    ["work", "--once", "--interval", "1", "--no-brief", "--profile", "profile-other"],
+    { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() }
+  );
+  assert.strictEqual(r.status, 0, r.stderr);
+  const status = JSON.parse(cli(["work", "--status", "--json"], { SPOR_HOME: home, XDG_CONFIG_HOME: home }).stdout);
+  assert.match(status.workers[0].skipped[0].reason, /profile-other/);
+  assert.ok(!fs.existsSync(outfile));
+});
+
 test("a numeric option that is not a number is refused, never silently replaced", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-opts-"));
   const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode() };

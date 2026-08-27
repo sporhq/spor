@@ -9215,8 +9215,23 @@ function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, warn = () => {} } = {}) {
 // it was refused. The refusal reason is the refusal's own first stderr line,
 // captured via ERR_TEE — a guard that already explains itself to the operator
 // should not have to explain itself twice.
+//
+// Auto-route by `profile:` frontmatter (task-spor-test-change-lane-auto-
+// routing): the gate pipeline's test-change lane item names the lane profile
+// this way (§10.3, buildGateWorkNode), and until now nothing read it — only an
+// operator running `spor work --profile <lane>` (or `spor dispatch --profile`)
+// by hand ever picked it up. `dispatchableQueuePage` surfaces that field
+// verbatim (rankQueue), so an item carrying it is routed exactly as if
+// `--profile <that>` had been passed for THIS dispatch — unless the worker's
+// own `--profile`/`work.profile` already pins one, which wins (the same
+// explicit-beats-inferred precedence `resolveDispatchProfile` applies to the
+// node's `assigned -> agent` edge). A box that cannot satisfy the routed
+// profile refuses the dispatch loudly, same as an explicit `--profile` would —
+// the item cools off and stays for a worker that can.
 async function dispatchWorkItem(cfg, item, passthrough) {
-  return dispatchThrough(cfg, { ...passthrough, node: item.id }, []);
+  const values = { ...passthrough, node: item.id };
+  if (!values.profile && item.profile) values.profile = item.profile;
+  return dispatchThrough(cfg, values, []);
 }
 
 // The shared body of the above and of the gate pipeline's review/fix launches
