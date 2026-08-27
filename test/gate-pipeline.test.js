@@ -818,7 +818,21 @@ test("an orphan whose node still has a live run is DEFERRED, not adopted — nev
     ["run-orphan", ORPHAN_RECORD],
     ["run-fix", { run_id: "run-fix", node_id: "task-orphan", state: "running", created_at: "2020-01-01T00:00:00.000Z" }],
   ]);
-  assert.strictEqual(workLoop.orphanedGateRuns([dead], { records: stale, terminalStates: TERMINAL, maxAgeMs: 86400000 }).length, 1);
+  // Pin `now` to ORPHAN_RECORD's own finished_at rather than the real wall
+  // clock: this assertion means to test the run-fix record aging out of
+  // busyNodes (its `created_at` is 2020, always stale), not ORPHAN_RECORD's
+  // own age against maxAgeMs's watchdog on line ~458 — using real Date.now()
+  // made this fail once real-world time drifted more than a day past
+  // ORPHAN_RECORD.finished_at (2026-08-26), which is exactly what happened.
+  assert.strictEqual(
+    workLoop.orphanedGateRuns([dead], {
+      records: stale,
+      terminalStates: TERMINAL,
+      maxAgeMs: 86400000,
+      now: () => Date.parse(ORPHAN_RECORD.finished_at),
+    }).length,
+    1
+  );
 });
 
 test("gatingNodeIds names what LIVE workers are gating — the cross-worker half of the candidate exclusion", () => {
