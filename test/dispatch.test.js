@@ -1326,8 +1326,12 @@ function fleetStub({ hosts, hostsStatus = 200 } = {}) {
   });
   return new Promise((resolve) => srv.listen(0, "127.0.0.1", () => resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
 }
+// SPOR_ALLOW_PERSON_TOKEN=1: none of these tests configure a dispatch agent
+// (they're not exercising identity/mint — that's agent-identity.test.js), so
+// default the new hard-fail's escape hatch on to keep the guard under test
+// reachable; `extra` can still override it.
 const remoteCapEnv = (home, base, extra = {}) => ({
-  SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: "test-token", ...extra,
+  SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: "test-token", SPOR_ALLOW_PERSON_TOKEN: "1", ...extra,
 });
 // Async runner — the in-process fake server can't answer the child's HTTP
 // request while spawnSync blocks the event loop, so the remote tests spawn
@@ -1679,6 +1683,11 @@ function remoteEnv(home, server, extra = {}) {
   // Empty agent list by default (see bare()), so the same-machine guard never
   // shells out to a real `claude agents --json`; a guard test overrides via extra.
   env.SPOR_FAKE_AGENTS_JSON = "[]";
+  // None of these tests configure a dispatch agent — they exercise OTHER guards
+  // (claim, readiness, resolution, satisfiability), not identity/mint (that's
+  // agent-identity.test.js) — so default the hard-fail's escape hatch on to keep
+  // those guards reachable; `extra` can still override it.
+  env.SPOR_ALLOW_PERSON_TOKEN = "1";
   return Object.assign(env, extra);
 }
 

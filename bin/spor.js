@@ -5215,8 +5215,9 @@ async function resolveAgentIdFromLabel(cfg, label) {
 // machine-local, never-committed file as the repo map; per-machine, like
 // dispatch.repos). This is the real setter the create/list hints point to;
 // before it, dispatch.agent was settable only via env or by hand-editing the
-// config. `spor agent use --clear` (or an empty id) drops back to person-scoped
-// dispatch. Not a graph write — purely local config, so it works in both modes.
+// config. `spor agent use --clear` (or an empty id) drops the machine's agent
+// identity — a remote dispatch then hard-fails unless --allow-person-token is
+// also set. Not a graph write — purely local config, so it works in both modes.
 async function cmdAgentUse(cfg, { id }) {
   const clear = id === "--clear" || id === "none" || id === "";
   if (!id) {
@@ -5245,7 +5246,7 @@ async function cmdAgentUse(cfg, { id }) {
   const wrote = u.setDispatchAgent(home, clear ? null : resolvedId);
   const labelNote = fromLabel ? ` (resolved from label '${id}')` : "";
   if (clear) {
-    out(wrote ? "cleared dispatch.agent — dispatches run person-scoped again" : "dispatch.agent was already unset");
+    out(wrote ? "cleared dispatch.agent — a remote dispatch now hard-fails unless --allow-person-token is set" : "dispatch.agent was already unset");
     return 0;
   }
   if (wrote) {
@@ -7728,15 +7729,18 @@ function onboardRepo(cfg, dir) {
 // --- dispatch agent identity (dec-spor-session-identity-active-record) -----
 // A dispatched session runs AS this machine's agent, carried on a per-session
 // agent-scoped MCP token (env does NOT propagate through `claude --bg`, so
-// identity rides the token in --mcp-config, never env). These three helpers are
-// the verified mechanism; all fail soft so a server without the agent surface,
-// or a machine with no agent configured, degrades to the prior person-scoped
-// dispatch with a clear line.
+// identity rides the token in --mcp-config, never env). These helpers report
+// what they found or minted; the CALLER (cmdDispatch) decides what to do with
+// a miss — per dec-spor-worker-strictness-split-interactive-lenient that is a
+// HARD FAIL by default (no agent configured, or minting failed), never a
+// silent degrade to person-scoped attribution, unless the caller opted into
+// --allow-person-token / dispatch.allowPersonToken.
 
 // This machine's agent node id, or null. A per-machine config key the shared
 // graph can't hold (like dispatch.repos) — SPOR_DISPATCH_AGENT / .spor.json
-// {"dispatch":{"agent":"agent-x"}} / user config. null => dispatch without
-// agent-scoping (graceful, person-attributed as before).
+// {"dispatch":{"agent":"agent-x"}} / user config. null => no agent identity to
+// dispatch under (the caller decides whether that's a hard-fail or, with
+// --allow-person-token, a graceful person-attributed dispatch as before).
 function dispatchAgentId(cfg) {
   return cfg.get("dispatch.agent", null) || null;
 }
@@ -7753,10 +7757,10 @@ function dispatchAgentId(cfg) {
 // (dec-spor-dispatch-bg-session-late-bind); dispatch binds the real session
 // afterward via bindAgentSession. The `session` param is kept for a caller that
 // genuinely knows it up front (none today — dispatch always defers). Returns
-// { ok, token } on success, { absent:true }
-// when the mint surface isn't deployed yet (404 — fail soft, dispatch person-
-// scoped), or { error } on any other failure incl. 403/owner-mismatch (also fail
-// soft — warn and dispatch person-scoped, never block).
+// { ok, token } on success, { absent:true } when the mint surface isn't deployed
+// yet (404), or { error } on any other failure incl. 403/owner-mismatch — both
+// misses are reported to the caller, which hard-fails by default
+// (--allow-person-token opts back into the old fail-soft, warn-and-proceed).
 async function mintAgentToken(cfg, { agent, session }) {
   const r = await remote.post(cfg, `/v1/agents/${encodeURIComponent(agent)}/token`, session ? { session } : {}, { timeoutMs: 6000 });
   if (r.transport) return { error: r.error };
@@ -8215,6 +8219,12 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   const approvalPolicy = values["approval-policy"] || null;
   const agent = values.agent || null; // claude --agent (harness agent DEFINITION)
   const asAgent = values.as || null; // Spor agent IDENTITY override for dispatch.agent
+  // The escape hatch for dec-spor-worker-strictness-split-interactive-lenient:
+  // by default a remote dispatch with no agent identity (below) hard-fails
+  // rather than silently attributing agent writes to the person. This flag (or
+  // its standing config twin) restores the old fail-soft, for solo/local use
+  // where nobody has run `spor agent use` and that's fine.
+  const allowPersonToken = !!values["allow-person-token"] || cfg.getBool("dispatch.allowPersonToken", false);
   // A user-supplied prompt template (task-spor-dispatch-user-prompt-templates):
   // --template wins, else a personal default in the config cascade
   // (dispatch.template — an absolute path, like dispatch.repos). Empty until we
@@ -8483,15 +8493,24 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   let identityAgent = cfg.mode() === "remote" ? (asAgent || dispatchAgentId(cfg)) : null;
   // A configured `dispatch.agent` (no --as) that isn't a valid agent id — e.g. the
   // agent's LABEL stored instead of its 'agent-'-prefixed NODE id — would 422 at
-  // token-mint and silently fall back to person-scoped on EVERY dispatch, quietly
-  // defeating agent attribution (issue-spor-dispatch-agent-id-prefix-validation-gap).
-  // Catch it here with an actionable line and run person-scoped, rather than a
-  // round-trip to a 422 that names nothing. Fail-soft (don't block the dispatch):
-  // the explicit --as path already hard-errored above, so this only fires for the
-  // config default.
+  // token-mint (issue-spor-dispatch-agent-id-prefix-validation-gap). Catch it here
+  // with an actionable line rather than a round-trip to a 422 that names nothing.
+  // Per dec-spor-worker-strictness-split-interactive-lenient this now HARD-FAILS
+  // on a real run — a dispatch that can't resolve an agent identity must not
+  // silently attribute agent writes to the person — unless --allow-person-token
+  // (or dispatch.allowPersonToken) opts back into the old fail-soft. --print stays
+  // a preview regardless (never fails here; the preview line below still shows
+  // "person-scoped"). The explicit --as path already hard-errored above, so this
+  // only fires for the config default.
   if (identityAgent && !isAgentId(identityAgent)) {
-    err(`warning: configured dispatch.agent '${identityAgent}' is not a valid agent id — dispatching person-scoped.`);
     const guess = agentIdGuess(identityAgent);
+    if (!dryRun && !allowPersonToken) {
+      err(`cannot dispatch ${nodeId || name}: configured dispatch.agent '${identityAgent}' is not a valid agent id.`);
+      err(`  agent ids start with 'agent-'.${guess ? ` fix: spor agent use ${guess}` : ""}  ('spor agent list' shows your agents.)`);
+      err(`  pass --allow-person-token to dispatch person-scoped instead (dispatch.allowPersonToken to make it standing).`);
+      return 1;
+    }
+    err(`warning: configured dispatch.agent '${identityAgent}' is not a valid agent id — dispatching person-scoped${allowPersonToken ? " (--allow-person-token)" : ""}.`);
     err(`  agent ids start with 'agent-'.${guess ? ` fix: spor agent use ${guess}` : ""}  ('spor agent list' shows your agents.)`);
     identityAgent = null;
   }
@@ -8499,6 +8518,18 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   // agent token. Say so rather than silently dropping it to person-scoped.
   if (asAgent && cfg.mode() !== "remote") {
     err(`note: --as ${asAgent} ignored in local mode — agent-on-behalf-of attribution is remote-only`);
+  }
+  // No agent identity to dispatch under at all (no --as, no dispatch.agent
+  // configured) — the other half of the same hard-fail: a remote dispatch with
+  // nothing to mint a token FOR is exactly as much a silent person-attribution
+  // as a mint failure, so it gets the same escape hatch. Local mode has no CA to
+  // mint against in the first place and stays byte-identical (never reaches here
+  // with identityAgent unset — see above).
+  if (!dryRun && cfg.mode() === "remote" && !identityAgent && !allowPersonToken) {
+    err(`cannot dispatch ${nodeId || name}: no dispatch agent configured for this machine.`);
+    err(`  fix: spor agent use <agent-id>  ('spor agent create <label>' first if you have none yet; 'spor agent list' shows them.)`);
+    err(`  or pass --allow-person-token to dispatch person-scoped anyway (dispatch.allowPersonToken makes it standing).`);
+    return 1;
   }
 
   // Agent-readiness guard inputs (task-spor-dispatch-readiness-guard): computed
@@ -8656,7 +8687,12 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
       const claudeNote = dispatchHarnesses.getHarness("claude-code").identityNote;
       out(`agent:  ${identityAgent}${src} ${(harnessAdapter && harnessAdapter.identityNote) || claudeNote}`);
     } else if (cfg.mode() === "remote") {
-      out(`agent:  (none configured — 'spor agent use agent-<machine>' or --as to attribute as agent-on-behalf-of; dispatching person-scoped)`);
+      out(
+        `agent:  (none configured — 'spor agent use agent-<machine>' or --as to attribute as agent-on-behalf-of)` +
+          (allowPersonToken
+            ? " — dispatching person-scoped (--allow-person-token)"
+            : " — real dispatch would REFUSE (pass --allow-person-token to dispatch person-scoped anyway)")
+      );
     }
     // Already-resolved guard preview (node mode, any mode): a real dispatch would
     // refuse a target that is already done. Shown first — and only on a hit, so a
@@ -8789,10 +8825,14 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   // server then stamps authored_by_agent + session from that token. The token is
   // minted session-DEFERRED — the run session isn't known until `claude --bg`
   // self-allocates it, so we bind it AFTER launch (dec-spor-dispatch-bg-session-
-  // late-bind), keeping `agentToken` to authenticate that late bind. FAIL SOFT at
-  // every step — a server without the mint surface, or a transient error, falls
-  // back to the prior person-scoped dispatch with a clear line. Remote + a
-  // configured agent only; local/unconfigured dispatch is byte-identical.
+  // late-bind), keeping `agentToken` to authenticate that late bind. Per
+  // dec-spor-worker-strictness-split-interactive-lenient a mint failure now HARD
+  // FAILS — a server without the mint surface, or a transient minting error, must
+  // not silently attribute the dispatched agent's writes to the person — unless
+  // --allow-person-token (or dispatch.allowPersonToken) opts back into the old
+  // fail-soft. Nothing has claimed a lease or launched anything yet, so a hard
+  // fail here leaves no cleanup behind. Remote + a configured agent only;
+  // local/unconfigured dispatch never reaches this block.
   let agentToken = null;
   let agentMcpFile = null;
   if (identityAgent) {
@@ -8806,16 +8846,24 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
         agentMcpFile = writeDispatchMcpConfig(cfg, { token: mint.token, key: mcpKey });
       }
       out(`agent:  ${identityAgent} (writes attributed agent-on-behalf-of-you; run session bound after launch)`);
-    } else if (mint.absent) {
-      err(`warning: this server can't mint agent-scoped session tokens yet — dispatching person-scoped.`);
-    } else {
+    } else if (!allowPersonToken) {
       // Name the offending agent and the fix — a bare "(HTTP 422 …)" tells the
       // operator nothing about WHICH id is wrong or how to repair it. The format
-      // gate is now caught client-side above, so a 422 here means the id is a
+      // gate is caught client-side above, so a 422 here means the id is a
       // well-formed 'agent-<slug>' the server still rejected (e.g. no such agent /
       // not owned); point at the list either way
       // (issue-spor-dispatch-agent-id-prefix-validation-gap).
-      err(`warning: could not mint an agent token for ${identityAgent} (${mint.error}) — dispatching person-scoped.`);
+      err(
+        `cannot dispatch ${nodeId || name}: could not mint an agent-scoped token for ${identityAgent}` +
+          `${mint.absent ? " (this server can't mint agent-scoped session tokens yet)" : ` (${mint.error})`}.`
+      );
+      err(`  check it exists and you own it: spor agent list  (fix: spor agent use <agent-id>)`);
+      err(`  pass --allow-person-token to dispatch person-scoped anyway (dispatch.allowPersonToken makes it standing).`);
+      return 1;
+    } else if (mint.absent) {
+      err(`warning: this server can't mint agent-scoped session tokens yet — dispatching person-scoped (--allow-person-token).`);
+    } else {
+      err(`warning: could not mint an agent token for ${identityAgent} (${mint.error}) — dispatching person-scoped (--allow-person-token).`);
       err(`  check it exists and you own it: spor agent list  (set this machine's default with: spor agent use <agent-id>)`);
     }
   }
@@ -9986,7 +10034,7 @@ async function cmdWork(cfg, { values }) {
   // workers off one node (dec-cc-task-claim-lease), so a loop that dispatches
   // without one is exactly the collision this design rules out. A human aiming
   // one agent at one node can still opt out with `spor dispatch --no-claim`.
-  for (const k of ["worktree", "no-worktree", "no-brief", "full"]) {
+  for (const k of ["worktree", "no-worktree", "no-brief", "full", "allow-person-token"]) {
     if (values[k]) passthrough[k] = true;
   }
 
@@ -11298,7 +11346,9 @@ const COMMANDS = {
       "  spor agent list               list agents and their owners\n" +
       "  spor agent use <agent-id>     make it THIS machine's default dispatch identity\n" +
       "                                (writes dispatch.agent to your user config; pass\n" +
-      "                                --clear to go back to person-scoped dispatch).\n" +
+      "                                --clear to drop it — dispatch then refuses remote\n" +
+      "                                launches unless --allow-person-token opts back into\n" +
+      "                                the person-scoped fallback).\n" +
       "                                A bare label (no 'agent-' prefix) also resolves\n" +
       "                                against your own agents ('spor agent list')\n" +
       "                                before falling back to the prefix-hint error.\n" +
@@ -12241,6 +12291,7 @@ const COMMANDS = {
       full: { type: "boolean", desc: "full briefing instead of the digest" },
       "no-brief": { type: "boolean", desc: "raw task prompt, no briefing block" },
       "no-claim": { type: "boolean", desc: "don't auto-claim the lease (remote node dispatch)" },
+      "allow-person-token": { type: "boolean", desc: "fall back to a person-scoped token when no agent is configured or minting fails (default: hard-fail; also dispatch.allowPersonToken)" },
       force: { type: "boolean", desc: "dispatch even if the node is already resolved, or an agent for it is in flight here" },
       "from-queue": { type: "boolean", desc: "dispatch the top-ranked queue item not already in flight here" },
       backfill: { type: "boolean", desc: "init + enable + launch /spor:backfill (the primitive behind /spor:onboard)" },
@@ -12340,6 +12391,7 @@ const COMMANDS = {
       "no-worktree": { type: "boolean", desc: "force-disable worktree isolation" },
       "no-brief": { type: "boolean", desc: "raw task prompts, no briefing block" },
       full: { type: "boolean", desc: "full briefing instead of the digest" },
+      "allow-person-token": { type: "boolean", desc: "fall back to a person-scoped token when no agent is configured or minting fails (default: hard-fail; also dispatch.allowPersonToken)" },
       print: { type: "boolean", desc: "dry run — show the scope, the pacing and the candidates; launch nothing" },
       "dry-run": DRYRUN_OPT,
     },

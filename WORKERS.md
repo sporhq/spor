@@ -51,6 +51,20 @@ person" (API.md §1). This is the token a worker process should hold — never
 a person's own account-scoped token or connector session, which would
 attribute the work to the human instead of the agent that did it.
 
+**No agent identity resolves, or minting one fails?** Per
+dec-spor-worker-strictness-split-interactive-lenient this now HARD-FAILS,
+naming the fix (`spor agent use <agent-id>`) — never a silent fall back to a
+person-scoped token, which is exactly the human step agent attribution exists
+to keep out of the loop. Unlike the readiness-gap split in §3, this one isn't
+locked to a surface: both `spor dispatch` and the autonomous `spor work` loop
+refuse by default, and both accept the SAME explicit escape hatch —
+`--allow-person-token` (or the standing `dispatch.allowPersonToken` config
+key) — with a loud warning on every fallback launch it permits. The escape
+hatch exists for solo/local use where nobody has bothered to mint a machine
+identity and that's a deliberate choice, not an accident; leaving it unset is
+what keeps an unattended worker from ever silently misattributing agent work
+to the person that happens to own its token.
+
 **Two token shapes**, both minted by the same endpoint:
 
 - **Per-session** (default): a short-TTL token for one run. `session` may be

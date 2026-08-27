@@ -668,7 +668,7 @@ fs.writeFileSync(${JSON.stringify(outFile)}, [process.cwd(), ...process.argv.sli
 // the session it received), and the SELF-SERVE owner-gated per-session mint
 // POST /v1/agents/{id}/token (configurable status; records the agent {id} in the
 // path + the session in the body).
-function dispatchStub({ mintStatus = 201, mintBody = null } = {}) {
+function dispatchStub({ mintStatus = 201, mintBody = null, queueItem = null } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = "";
@@ -677,6 +677,7 @@ function dispatchStub({ mintStatus = 201, mintBody = null } = {}) {
       hits.push({ method: req.method, url: req.url, body });
       const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
       if (req.url === "/v1/me") return j(200, { person: "person-anthony", bound: true, is_admin: true });
+      if (queueItem && req.method === "GET" && req.url.startsWith("/v1/queue")) return j(200, { items: [queueItem] });
       if (req.method === "GET" && /^\/v1\/nodes\/[^/]+$/.test(req.url)) {
         const id = decodeURIComponent(req.url.split("/").pop());
         return j(200, { raw: `---\nid: ${id}\ntype: task\nrepo: demo\ntitle: Demo ${id}\nsummary: A demo task.\ndate: 2026-06-01\n---\nbody\n` });
@@ -719,7 +720,7 @@ test("dispatch (local) --print: shows the pinned session, NO --session-id (claud
   assert.doesNotMatch(r.stdout, /^agent:/m); // local mode => no agent-scoping line
 });
 
-test("dispatch (remote) --print: no agent configured => person-scoped notice, lease bound after launch", async () => {
+test("dispatch (remote) --print: no agent configured => person-scoped notice flagging the real-run refusal, lease bound after launch", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d1-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d1r-"));
   const { srv, base } = await dispatchStub();
@@ -727,12 +728,88 @@ test("dispatch (remote) --print: no agent configured => person-scoped notice, le
     const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief", "--print"], remoteEnv(home, base, { SPOR_SESSION_ID: SID }));
     assert.strictEqual(r.status, 0, r.stderr);
     assert.match(r.stdout, /agent:  \(none configured/);
+    assert.match(r.stdout, /real dispatch would REFUSE/);
     assert.doesNotMatch(r.stdout, /--session-id/); // never forced
     assert.match(r.stdout, new RegExp(`session: ${SID}`)); // pinned shows; else "(allocated by claude --bg…)"
     assert.match(r.stdout, /would establish a lease on dec-x/);
   } finally {
     srv.close();
   }
+});
+
+// dec-spor-worker-strictness-split-interactive-lenient, the core of this item: a
+// REAL remote dispatch with no agent identity at all (no --as, no dispatch.agent)
+// must HARD-FAIL rather than silently attribute the dispatched agent's writes to
+// the person — naming `spor agent use` as the fix and --allow-person-token as the
+// escape hatch. Nothing is claimed or launched.
+test("dispatch (remote, real): no agent configured => hard-fails, names 'spor agent use' and --allow-person-token, nothing launched", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d1c-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d1cr-"));
+  const outFile = path.join(home, "argv.out");
+  fs.mkdirSync(home, { recursive: true });
+  const stub = argvStub(home, outFile);
+  const { srv, hits, base } = await dispatchStub();
+  try {
+    const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /cannot dispatch dec-x: no dispatch agent configured for this machine/);
+    assert.match(r.stderr, /spor agent use/);
+    assert.match(r.stderr, /--allow-person-token/);
+    assert.ok(!fs.existsSync(outFile), "nothing launched");
+    assert.ok(!hits.some((h) => /\/claim$/.test(h.url)), "no claim established — nothing left to clean up");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch (remote, real) --allow-person-token: no agent configured => fails soft as before, person-scoped launch", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d1d-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d1dr-"));
+  const outFile = path.join(home, "argv.out");
+  fs.mkdirSync(home, { recursive: true });
+  const stub = argvStub(home, outFile);
+  const { srv, base } = await dispatchStub();
+  try {
+    const r = await runAsync(
+      ["dispatch", "dec-x", "--dir", repo, "--no-brief", "--allow-person-token"],
+      remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub })
+    );
+    assert.strictEqual(r.status, 0, r.stderr);
+    const argv = fs.readFileSync(outFile, "utf8").split("\n").slice(1);
+    assert.strictEqual(argv[0], "--bg", "dispatch still launches");
+    assert.ok(!argv.includes("--mcp-config"), "no agent-scoping — person-scoped");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch (remote, real) dispatch.allowPersonToken config: no agent configured => fails soft without the CLI flag", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d1e-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d1er-"));
+  const outFile = path.join(home, "argv.out");
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { allowPersonToken: true } }) + "\n");
+  const stub = argvStub(home, outFile);
+  const { srv, base } = await dispatchStub();
+  try {
+    const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(fs.existsSync(outFile), "launched person-scoped, via dispatch.allowPersonToken");
+  } finally {
+    srv.close();
+  }
+});
+
+// Local mode has no CA to mint against in the first place — the hard-fail is
+// remote-only, and a local dispatch with no agent configured stays exactly as
+// it always has (byte-identical).
+test("dispatch (local, real): no agent identity concept at all — never hard-fails", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-dlocal-"));
+  const outFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-dlocalh-")), "argv.out");
+  const stub = argvStub(path.dirname(outFile), outFile);
+  const r = run(["dispatch", "some free text task here", "--dir", repo, "--no-brief"], { SPOR_CLAUDE_CMD: stub, SPOR_SESSION_ID: SID });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(outFile), "local dispatch still launches with no agent configured");
 });
 
 test("dispatch (remote) --as: overrides dispatch.agent for one dispatch, marked (via --as)", async () => {
@@ -834,7 +911,11 @@ test("dispatch (remote, real): mints a session-DEFERRED token + 0600 mcp-config,
   }
 });
 
-test("dispatch (remote, real): mint endpoint absent (404) => fails soft, person-scoped, no mcp-config flags", async () => {
+// dec-spor-worker-strictness-split-interactive-lenient: a mint failure on a
+// REAL run now HARD-FAILS by default — no launch, no lease, no side effect
+// left to clean up. --allow-person-token (below) is the escape hatch that
+// restores the old fail-soft.
+test("dispatch (remote, real): mint endpoint absent (404) => hard-fails, names 'spor agent use' and --allow-person-token, nothing launched", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d3-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d3r-"));
   const outFile = path.join(home, "argv.out");
@@ -844,8 +925,31 @@ test("dispatch (remote, real): mint endpoint absent (404) => fails soft, person-
   const { srv, base } = await dispatchStub({ mintStatus: 404 });
   try {
     const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /cannot dispatch dec-x: could not mint an agent-scoped token for agent-anthony-laptop \(this server can't mint agent-scoped session tokens yet\)/);
+    assert.match(r.stderr, /spor agent use/);
+    assert.match(r.stderr, /--allow-person-token/);
+    assert.ok(!fs.existsSync(outFile), "nothing launched");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch (remote, real) --allow-person-token: mint endpoint absent (404) => fails soft as before, person-scoped, no mcp-config flags", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d3b-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d3br-"));
+  const outFile = path.join(home, "argv.out");
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "agent-anthony-laptop" } }) + "\n");
+  const stub = argvStub(home, outFile);
+  const { srv, base } = await dispatchStub({ mintStatus: 404 });
+  try {
+    const r = await runAsync(
+      ["dispatch", "dec-x", "--dir", repo, "--no-brief", "--allow-person-token"],
+      remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub })
+    );
     assert.strictEqual(r.status, 0, r.stderr);
-    assert.match(r.stderr, /can't mint agent-scoped session tokens yet/);
+    assert.match(r.stderr, /can't mint agent-scoped session tokens yet.*--allow-person-token/);
     const argv = fs.readFileSync(outFile, "utf8").split("\n").slice(1);
     assert.ok(!argv.includes("--session-id"), "--session-id is never passed (claude --bg ignores it)");
     assert.ok(!argv.includes("--mcp-config"), "no mcp-config when mint is absent");
@@ -856,7 +960,7 @@ test("dispatch (remote, real): mint endpoint absent (404) => fails soft, person-
   }
 });
 
-test("dispatch (remote, real): mint 403 (caller doesn't own the agent) => fails soft, person-scoped", async () => {
+test("dispatch (remote, real): mint 403 (caller doesn't own the agent) => hard-fails, nothing launched", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d4-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d4r-"));
   const outFile = path.join(home, "argv.out");
@@ -866,8 +970,30 @@ test("dispatch (remote, real): mint 403 (caller doesn't own the agent) => fails 
   const { srv, base } = await dispatchStub({ mintStatus: 403, mintBody: { error: { code: "forbidden", message: "not the owner" } } });
   try {
     const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /cannot dispatch dec-x: could not mint an agent-scoped token for agent-not-mine/);
+    assert.match(r.stderr, /--allow-person-token/);
+    assert.ok(!fs.existsSync(outFile), "nothing launched");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch (remote, real) --allow-person-token: mint 403 (caller doesn't own the agent) => fails soft as before, person-scoped", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d4b-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d4br-"));
+  const outFile = path.join(home, "argv.out");
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "agent-not-mine" } }) + "\n");
+  const stub = argvStub(home, outFile);
+  const { srv, base } = await dispatchStub({ mintStatus: 403, mintBody: { error: { code: "forbidden", message: "not the owner" } } });
+  try {
+    const r = await runAsync(
+      ["dispatch", "dec-x", "--dir", repo, "--no-brief", "--allow-person-token"],
+      remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub })
+    );
     assert.strictEqual(r.status, 0, r.stderr);
-    assert.match(r.stderr, /could not mint an agent token .* dispatching person-scoped/);
+    assert.match(r.stderr, /could not mint an agent token .* dispatching person-scoped \(--allow-person-token\)/);
     const argv = fs.readFileSync(outFile, "utf8").split("\n").slice(1);
     assert.ok(!argv.includes("--session-id"), "--session-id is never passed (claude --bg ignores it)");
     assert.ok(!argv.includes("--mcp-config"), "no agent-scoping on an owner-mismatch");
@@ -876,13 +1002,35 @@ test("dispatch (remote, real): mint 403 (caller doesn't own the agent) => fails 
   }
 });
 
+// The standing config twin of --allow-person-token (dispatch.allowPersonToken):
+// a machine that wants the old fail-soft on every dispatch, not just this one.
+test("dispatch (remote, real) dispatch.allowPersonToken config: mint failure fails soft without the CLI flag", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d4c-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d4cr-"));
+  const outFile = path.join(home, "argv.out");
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(
+    path.join(home, "config.json"),
+    JSON.stringify({ dispatch: { agent: "agent-not-mine", allowPersonToken: true } }) + "\n"
+  );
+  const stub = argvStub(home, outFile);
+  const { srv, base } = await dispatchStub({ mintStatus: 403, mintBody: { error: { code: "forbidden", message: "not the owner" } } });
+  try {
+    const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(fs.existsSync(outFile), "launched person-scoped, via dispatch.allowPersonToken");
+  } finally {
+    srv.close();
+  }
+});
+
 // The root case (issue-spor-dispatch-agent-id-prefix-validation-gap): a configured
 // dispatch.agent that DROPPED the `agent-` prefix (the label stored instead of the
-// id). Before the fix this 422'd at token-mint on EVERY dispatch and fell back to
-// person-scoped with a non-actionable warning. Now it's caught CLIENT-SIDE before
-// any network: no /v1/agents/{id}/token round-trip, an actionable warning naming
-// the bad value + the fix, and a clean person-scoped launch.
-test("dispatch (remote, real): a prefix-less dispatch.agent fails soft client-side — no mint round-trip, actionable warning, person-scoped", async () => {
+// id) is caught CLIENT-SIDE before any network — no /v1/agents/{id}/token
+// round-trip. Per dec-spor-worker-strictness-split-interactive-lenient a real run
+// now HARD-FAILS on this (the config is simply broken and no agent identity is
+// available), rather than silently launching person-scoped.
+test("dispatch (remote, real): a prefix-less dispatch.agent hard-fails client-side — no mint round-trip, nothing launched", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d5-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d5r-"));
   const outFile = path.join(home, "argv.out");
@@ -893,13 +1041,36 @@ test("dispatch (remote, real): a prefix-less dispatch.agent fails soft client-si
   const { srv, hits, base } = await dispatchStub({ mintStatus: 201 });
   try {
     const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub }));
-    assert.strictEqual(r.status, 0, r.stderr);
-    // actionable warning: names the bad value AND the exact fix
-    assert.match(r.stderr, /configured dispatch\.agent 'anthony-shark-november' is not a valid agent id/);
+    assert.strictEqual(r.status, 1);
+    // actionable error: names the bad value AND the exact fix, and the escape hatch
+    assert.match(r.stderr, /cannot dispatch dec-x: configured dispatch\.agent 'anthony-shark-november' is not a valid agent id/);
     assert.match(r.stderr, /spor agent use agent-anthony-shark-november/);
+    assert.match(r.stderr, /--allow-person-token/);
     // caught client-side: NO token mint round-trip at all (the whole point)
     assert.ok(!hits.some((h) => /\/token$/.test(h.url)), "no /v1/agents/{id}/token round-trip — caught before the network");
-    // still launched, person-scoped (no agent-scoping flags)
+    assert.ok(!fs.existsSync(outFile), "nothing launched");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch (remote, real) --allow-person-token: a prefix-less dispatch.agent fails soft as before, person-scoped", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d5b-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d5br-"));
+  const outFile = path.join(home, "argv.out");
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "anthony-shark-november" } }) + "\n");
+  const stub = argvStub(home, outFile);
+  const { srv, hits, base } = await dispatchStub({ mintStatus: 201 });
+  try {
+    const r = await runAsync(
+      ["dispatch", "dec-x", "--dir", repo, "--no-brief", "--allow-person-token"],
+      remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub })
+    );
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stderr, /configured dispatch\.agent 'anthony-shark-november' is not a valid agent id/);
+    assert.match(r.stderr, /dispatching person-scoped \(--allow-person-token\)/);
+    assert.ok(!hits.some((h) => /\/token$/.test(h.url)), "no /v1/agents/{id}/token round-trip — caught before the network");
     const argv = fs.readFileSync(outFile, "utf8").split("\n").slice(1);
     assert.strictEqual(argv[0], "--bg", "dispatch still launches");
     assert.ok(!argv.includes("--mcp-config"), "no agent-scoping on an invalid dispatch.agent");
@@ -909,10 +1080,10 @@ test("dispatch (remote, real): a prefix-less dispatch.agent fails soft client-si
   }
 });
 
-// The same misconfiguration under --print: the preview must report person-scoped
-// (not "would mint a token", which the old preview did — a lie, since the mint
-// 422s), with the actionable warning on stderr.
-test("dispatch (remote, --print): a prefix-less dispatch.agent previews person-scoped + warns", async () => {
+// The same misconfiguration under --print: a preview never fails (side-effect-free
+// by design), so it still reports person-scoped — but now also flags that a real
+// dispatch would refuse unless --allow-person-token is passed.
+test("dispatch (remote, --print): a prefix-less dispatch.agent previews person-scoped, warns, and flags the real-run refusal", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d6-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d6r-"));
   fs.mkdirSync(home, { recursive: true });
@@ -923,6 +1094,7 @@ test("dispatch (remote, --print): a prefix-less dispatch.agent previews person-s
     assert.strictEqual(r.status, 0, r.stderr);
     assert.match(r.stderr, /configured dispatch\.agent 'anthony-shark-november' is not a valid agent id/);
     assert.match(r.stdout, /agent:  \(none configured/);
+    assert.match(r.stdout, /real dispatch would REFUSE/);
     assert.doesNotMatch(r.stdout, /would mint/);
   } finally {
     srv.close();
@@ -1094,6 +1266,43 @@ test("dispatch (remote, real): a SPOR_SESSION_ID that doesn't match the launched
     srv.close();
   }
 });
+
+// ===========================================================================
+// 3b. spor work inherits the identity hard-fail (dec-spor-worker-strictness-
+//     split-interactive-lenient) — every launch it makes goes through the same
+//     cmdDispatch code path, so this is the end-to-end wiring check, not a
+//     re-test of every mint scenario already covered above.
+// ===========================================================================
+
+test("spor work --once (remote): no agent configured => the dispatch hard-fails, the loop records the refusal and dispatches nothing", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-w1-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-w1r-"));
+  fs.mkdirSync(home, { recursive: true });
+  const { srv, base } = await dispatchStub({ queueItem: { id: "task-foo", type: "task", project: "demo", repo: "demo", title: "The actionable task" } });
+  try {
+    run(["repos", "add", "demo", repo], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+    const r = await runAsync(
+      ["work", "--once", "--max", "1", "--interval", "1", "--no-brief"],
+      remoteEnv(home, base, { SPOR_SESSION_ID: SID })
+    );
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /work: skipping task-foo —/);
+    assert.match(r.stdout, /dispatched 0;/);
+    const status = JSON.parse(run(["work", "--status", "--json"], { SPOR_HOME: home, XDG_CONFIG_HOME: home }).stdout);
+    const skipped = status.workers[0].skipped;
+    assert.strictEqual(skipped.length, 1);
+    assert.strictEqual(skipped[0].id, "task-foo");
+    assert.match(skipped[0].reason, /no dispatch agent configured for this machine/, "the loop's skip reason IS the hard-fail's own message");
+  } finally {
+    srv.close();
+  }
+});
+
+// The --allow-person-token PASSTHROUGH itself (cmdWork's `passthrough` object,
+// bin/spor.js) is exercised directly at the dispatch level above (identical CLI
+// flag, identical cmdDispatch call) — a full native-background spor-work run
+// here would need to wait out the harness's live-agent reconciliation cadence
+// for very little extra signal, so this stays a dispatch-level check.
 
 // ===========================================================================
 // 4. authorship read-out (authorshipLine + renderNorm)

@@ -502,6 +502,7 @@ test("a supervised Codex launch failure releases the lease established by this d
         SPOR_SERVER: base,
         SPOR_TOKEN: "person-token",
         SPOR_CODEX_CMD: path.join(home, "missing-codex-binary"),
+        SPOR_ALLOW_PERSON_TOKEN: "1", // this test exercises the launch-failure release, not identity/mint
       }
     );
     assert.strictEqual(result.status, 1);
