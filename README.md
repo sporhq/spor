@@ -193,11 +193,13 @@ At the start of a session, your agent gets a briefing: a short, task-aware summa
 In Claude Code, the main commands are:
 
 ```text
+/spor:spor       # the operating manual — load before any graph operation
 /spor:brief      # get a briefing for a task or area
 /spor:correct    # fix stale or wrong context
 /spor:defer      # capture something to return to later
 /spor:ask        # record a question the graph cannot answer
 /spor:next       # show the next useful thing to work on
+/spor:triage     # actively work the queue: dedupe, groom, close readiness gaps
 /spor:onboard    # first-time setup
 /spor:backfill   # extend the graph from existing sources
 /spor:factory    # compile a factory: what has to be true before work counts as done
