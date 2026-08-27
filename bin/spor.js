@@ -8167,6 +8167,16 @@ function cmdRuns(cfg, { values, positionals: pos }) {
       }
     }
     if (r.termination_reason) out(`  why:        ${r.termination_reason}`);
+    // The gate pipeline's own state on THIS run, when a factory-armed worker
+    // gated it (task-spor-work-gate-pipeline). `gate_fix_run_id` names a fix
+    // cycle this run's pipeline dispatched — surfaced whenever it is set, not
+    // only on 'interrupted': it is exactly the run a stop leaves orphaned, and
+    // 'spor runs <that id>' is how a human (or a restarted 'spor work') finds
+    // out whether it is still going.
+    if (r.gate_state) out(`  gate:       ${r.gate_state}${r.gate_reason ? ` — ${r.gate_reason}` : ""}`);
+    if (r.gate_fix_run_id) {
+      out(`  fix cycle:  run ${String(r.gate_fix_run_id).slice(0, 8)} — 'spor runs ${r.gate_fix_run_id}' follows it${r.gate_state === "interrupted" ? " (left running by a stopped worker)" : ""}`);
+    }
     if (r.child_reaped) out(`  reaped:     an orphaned harness child was terminated at reconciliation`);
     if (r.cwd) out(`  cwd:        ${r.cwd}`);
     if (r.session_id) out(`  session:    ${r.session_id}`);
@@ -9193,7 +9203,8 @@ function workerAlive(pid, ticks) {
 }
 
 function cmdWorkStatus(cfg, { json }) {
-  const workers = workLoop.readWorkerStatuses(cfg.userConfigHome(), { alive: workerAlive });
+  const home = cfg.userConfigHome();
+  const workers = workLoop.readWorkerStatuses(home, { alive: workerAlive });
   if (json) {
     out(JSON.stringify({ count: workers.length, workers }, null, 2));
     return 0;
@@ -9213,7 +9224,23 @@ function cmdWorkStatus(cfg, { json }) {
     );
     if (w.gates) out(`  gates:    ${w.factory || "(factory)"} — passed ${w.gates.passed || 0}, failed ${w.gates.failed || 0}, blocked ${w.gates.blocked || 0}`);
     for (const a of w.active || []) out(`  active:   ${a.node_id || "(free-text)"}  run ${String(a.run_id).slice(0, 8)}  ${a.harness || ""}  since ${a.started_at}`);
-    for (const g of w.gating || []) out(`  gating:   ${g.node_id}  run ${String(g.run_id).slice(0, 8)}  since ${g.started_at}`);
+    for (const g of w.gating || []) {
+      out(`  gating:   ${g.node_id}  run ${String(g.run_id).slice(0, 8)}  since ${g.started_at}`);
+      // A fix cycle a stopped worker's pipeline left running is a durable
+      // fact on the RUN RECORD (gate_fix_run_id, stamped the moment the fix
+      // was dispatched — see makeGateDeps' `fix`), not on this status file, so
+      // read it back here: an operator staring at a stale/stopped worker's
+      // `gating` slot needs the child run's id, not just the parent's.
+      let gateRecord = null;
+      try {
+        gateRecord = dispatchRuns.readJson(dispatchRuns.runPaths(home, g.run_id).record);
+      } catch {
+        /* the gating line above still stands without it */
+      }
+      if (gateRecord && gateRecord.gate_fix_run_id) {
+        out(`            fix cycle in flight: run ${String(gateRecord.gate_fix_run_id).slice(0, 8)} — 'spor runs ${gateRecord.gate_fix_run_id}' follows it`);
+      }
+    }
     for (const r of (w.recent || []).slice(0, 5)) {
       out(
         `  done:     ${r.node_id || "(free-text)"}  ${r.terminal_state || r.state || "?"}` +
@@ -9613,8 +9640,14 @@ async function gateWriteStatus(cfg, id, value, graph = null) {
 
 // The deps one gate pipeline runs on: git plumbing against THIS run's tree,
 // dispatches through the real `spor dispatch`, and graph writes through the
-// validated node door.
-function makeGateDeps(cfg, { record, entry, factory, slug, passthrough, warn, sleep, log, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, stopping = () => false }) {
+// validated node door. `dispatch` and `home` are overridable ONLY so a test
+// can fake the launch without spawning a real agent; the real caller (cmdWork)
+// never passes either, so it gets the live `dispatchThrough` and this box's
+// config home, byte-identical to before either param existed.
+function makeGateDeps(
+  cfg,
+  { record, entry, factory, slug, passthrough, warn, sleep, log, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, stopping = () => false, dispatch = dispatchThrough, home = cfg.userConfigHome() }
+) {
   const date = () => new Date().toISOString().slice(0, 10);
   const stem = gateStem(entry.node_id);
   const short = gateShortRun(entry.run_id);
@@ -9635,7 +9668,7 @@ function makeGateDeps(cfg, { record, entry, factory, slug, passthrough, warn, sl
       "```",
       'Use "pass" only when nothing blocking remains. An unreadable verdict counts as changes_requested.',
     ].join("\n");
-    const launched = await dispatchThrough(
+    const launched = await dispatch(
       cfg,
       { ...passthrough, profile: gate.profile, dir: change.cwd, "no-brief": true, "no-worktree": true, name: `gate-${gate.id}-${short}-${cycle}` },
       [prompt]
@@ -9674,12 +9707,25 @@ function makeGateDeps(cfg, { record, entry, factory, slug, passthrough, warn, sl
     ]
       .filter((l) => l !== "")
       .join("\n");
-    const launched = await dispatchThrough(
+    const launched = await dispatch(
       cfg,
       { ...passthrough, node: entry.node_id, dir: change ? change.cwd : undefined, force: true, "no-worktree": true, name: `fix-${gate.id}-${short}-${cycle}` },
       [prompt]
     );
     if (!launched.ok) return { ok: false, reason: launched.reason };
+    // The fix cycle's own run is DETACHED — it outlives this worker process,
+    // and the await below can run for up to `runMaxMs` (a day by default). If
+    // this worker is stopped while that await is still pending, nothing else
+    // ever learns which run it left in flight: the pipeline's own run record
+    // (`entry.run_id`) is what the loop marks `interrupted` on exit
+    // (work-loop.js runWorkLoop), so stamping the fix run's id onto it NOW —
+    // before the long wait, not after — is what makes that interrupted record
+    // name the orphan rather than just say "something was running"
+    // (issue-spor-work-stop-abandons-inflight-gates). `stampGateState` only
+    // ever writes `gate_*` fields and never clobbers a settled verdict, so this
+    // can't race the loop's own interrupted/passed/failed stamp into anything
+    // wrong — worst case is a stale id on a pipeline that has already settled.
+    dispatchRuns.stampGateState(home, entry.run_id, { gate_fix_run_id: launched.run.run_id, gate_fix_at: new Date().toISOString() });
     // The operator's own ceiling on how long this box follows a run (--run-max),
     // not a second hardcoded day: a fix cycle holds a gating slot exactly as a
     // dispatched run holds an active one.
@@ -10092,6 +10138,34 @@ async function cmdWork(cfg, { values }) {
     out(`work: gates — passed ${final.gates.passed}, failed ${final.gates.failed}, blocked ${final.gates.blocked} (factory ${factoryId}).`);
   }
   if (final.active.length) out(`work: ${final.active.length} run(s) still in flight — 'spor runs' follows them to their terminal state.`);
+  // A signal-driven stop has to actually END this process. runWorkLoop itself
+  // returns promptly on a stop — it never awaits a gate pipeline's own promise
+  // (work-loop.js's stop-condition step) — but an ABANDONED pipeline's
+  // in-process wait (a fix cycle's or review's awaitGateRun poll, a command
+  // gate's suite timer) is a live Node timer this process still holds, and
+  // Node does not exit while one is pending: without this, a "stopped" worker
+  // would keep running — silently, doing nothing new, but still a live
+  // process — for up to that gate's own timeout (a day, for a fix cycle)
+  // instead of actually stopping (issue-spor-work-stop-abandons-inflight-
+  // gates). The dispatched runs this worker started (including any fix
+  // cycle's) are detached OS processes and keep going unaffected by this
+  // process exiting — that is the whole point of `gate_fix_run_id` durably
+  // naming one (makeGateDeps' `fix`, above): nothing here waits for them, and
+  // nothing needs to.
+  if (control.stopping) {
+    // `out()` writes are fire-and-forget, and process.stdout.write to a pipe
+    // is asynchronous — exiting right after queuing the lines above (the
+    // abandoned-pipeline notice, the fix-cycle run id) can truncate exactly
+    // the diagnostic output this feature exists to produce. This codebase
+    // already knows and guards against the same hazard (cmdExport awaits a
+    // flush callback before its caller's process.exit, bin/spor.js's `export`
+    // handler); a zero-byte write's callback fires only once every
+    // already-queued write ahead of it has drained (a Writable stream
+    // processes writes strictly in order), so this waits out `out()`'s queue
+    // without emitting anything new.
+    await new Promise((resolve) => process.stdout.write("", resolve));
+    process.exit(0);
+  }
   return 0;
 }
 
@@ -12556,7 +12630,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, setStatusLocal };
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, setStatusLocal, makeGateDeps };
 
 if (require.main === module) {
   main()

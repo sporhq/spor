@@ -445,6 +445,8 @@ written only after the outcome dimension exists):
 | `gate_worker` | string | the worker id that last touched it |
 | `gate_at` | ISO 8601 | when that stamp was written |
 | `gate_reason` | string | optional — the settled verdict's one-line reason |
+| `gate_fix_run_id` | string | optional — the run id of the most recent fix cycle this pipeline dispatched at the same node, stamped the moment it was dispatched (not when it finishes). If a stop lands while that fix cycle is still going, this field is what turns "the pipeline was abandoned" into "here is the run to go check" — a fix cycle's own dispatched run is detached and keeps going regardless (§10.7), and this is the only durable pointer to it. `spor runs`/`spor work --status` surface it. |
+| `gate_fix_at` | ISO 8601 | when `gate_fix_run_id` was stamped |
 
 A consumer reading `gate_state` as a verdict must check it is one of the three
 settled values: `running` under a worker that is gone is a claim nobody

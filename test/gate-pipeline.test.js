@@ -23,7 +23,7 @@ const assert = require("node:assert");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { spawnSync, execFileSync } = require("node:child_process");
+const { spawn, spawnSync, execFileSync } = require("node:child_process");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const gates = require("../lib/kernel/gates.js");
@@ -1311,6 +1311,88 @@ test("writing a gate node twice is one node — but the same id with DIFFERENT c
   assert.strictEqual(bad.ok, false);
 });
 
+// --------------------------------------------------- stop-during-fix-cycle --
+// issue-spor-work-stop-abandons-inflight-gates: a fix cycle's own run is
+// DETACHED and can be dispatched for up to a day (runMaxMs) before its
+// makeGateDeps `fix` closure's awaitGateRun ever gives up on it — so a worker
+// stopped while that await is in flight abandons the whole pipeline with no
+// record of which child run it left running. The fix stamps `gate_fix_run_id`
+// onto the PIPELINE's own run record the moment the fix cycle is dispatched —
+// before the long wait, not after — so an interrupted record already names
+// the orphan by the time any stop could land.
+test("a fix cycle's run id is stamped onto the pipeline's own run BEFORE the long await, not after", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-fix-orphan-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+
+  const runId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, {
+    run_id: runId, node_id: "task-fix-me", state: "done", terminal_state: "resolved", terminal_enforced: true,
+    created_at: new Date().toISOString(), gate_state: "running", gate_worker: "w1", gate_at: new Date().toISOString(),
+  });
+
+  const dispatchCalls = [];
+  const deps = sporCli.makeGateDeps(cfg, {
+    record: { node_id: "task-fix-me", cwd: home },
+    entry: { run_id: runId, node_id: "task-fix-me", project: null },
+    factory: { id: "factory-test" },
+    slug: null,
+    passthrough: {},
+    warn: () => {},
+    log: () => {},
+    runMaxMs: 200, // the fix's own awaitGateRun gives up quickly — nothing here waits on the run terminating
+    stopping: () => false,
+    home,
+    dispatch: async (_cfg, values) => {
+      dispatchCalls.push(values);
+      // A run record that reads NON-terminal, exactly like a real fix-cycle
+      // dispatch's supervised run while its harness is still working — this is
+      // what keeps awaitGateRun actually polling (not resolving on its very
+      // first check) so there is a real mid-flight window to observe.
+      dispatchRuns.atomicJson(dispatchRuns.runPaths(home, "fix-run-orphan").record, {
+        run_id: "fix-run-orphan", node_id: "task-fix-me", state: "running", created_at: new Date().toISOString(),
+      });
+      return { ok: true, run: { run_id: "fix-run-orphan", harness: "fake" } };
+    },
+    // A plain timer so awaitGateRun's own poll loop can actually reach its
+    // (short) deadline instead of hanging the test.
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  });
+
+  const fixOutcome = deps.fix({ gate: { id: "acceptance" }, cycle: 0, findings: [], detail: "the suite fails", evidence: "" });
+  // Give the dispatch + stamp their microtasks — this is the moment a stop
+  // would land in real life, well before the fix cycle's own run ever
+  // terminates: fixOutcome is still pending, its awaitGateRun still polling a
+  // run record that reads "running" until the short runMaxMs gives up on it.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.ok(dispatchCalls.length, "the fix cycle was actually dispatched by this point");
+
+  const midFlight = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  assert.strictEqual(midFlight.gate_fix_run_id, "fix-run-orphan", "the fix cycle's run id lands on the PIPELINE's own run before its await settles");
+  assert.ok(midFlight.gate_fix_at, "and it is dated");
+  assert.strictEqual(dispatchCalls[0].node, "task-fix-me");
+  assert.strictEqual(dispatchCalls[0].force, true);
+
+  // Simulate the stop: work-loop.js's runWorkLoop marks the pipeline's own run
+  // interrupted on the way out (lib/shell/work-loop.js, the final `if
+  // (status.gating.length)` block) — via the exact same stampGateState door.
+  const interrupted = dispatchRuns.stampGateState(home, runId, { gate_state: "interrupted" });
+  assert.strictEqual(interrupted.gate_state, "interrupted");
+  assert.strictEqual(
+    interrupted.gate_fix_run_id,
+    "fix-run-orphan",
+    "the interrupted record still names the orphaned fix-cycle run — what a restarted 'spor work' or a human ('spor runs') finds it by"
+  );
+
+  // Let the fix's own promise settle (a missing run record reads as terminal
+  // with no verdict — awaitGateRun does not hang on it) so the test leaves no
+  // dangling handle. Its outcome is irrelevant to what this test checks: the
+  // stamp above already landed before this point, which is the whole claim.
+  await fixOutcome;
+});
+
 // ------------------------------------------------------------------- the CLI --
 
 const HARNESS = "gatefake";
@@ -1536,4 +1618,144 @@ test("end to end: a failing gate cools the item, files an escalation, and says s
   const status = cli(["work", "--status"], env);
   assert.match(status.stdout, /gates:\s+factory-demo — passed 0, failed 1/);
   assert.match(status.stdout, /skipped:\s+task-ready — gate pipeline failed/);
+});
+
+// end to end: SIGTERM mid fix-cycle (issue-spor-work-stop-abandons-inflight-
+// gates). A real `spor work` process, no --once — it must keep running until
+// stopped. The declared harness answers a plain dispatch immediately but HANGS
+// on a fix-cycle dispatch (recognized by its prompt), so the worker gets stuck
+// mid-`awaitGateRun` exactly like an implementer that is still working when a
+// service manager sends SIGTERM. Two things this must be true of: the worker
+// actually EXITS on the first signal instead of sitting on the abandoned
+// pipeline's own live timer, and the run record it leaves behind names the
+// fix-cycle run it walked away from.
+test("a single SIGTERM mid fix-cycle stops the worker promptly and leaves a durable record naming the orphaned run", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-stop-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const repo = repoWithBranch({ weakenTest: false, regress: false }); // benign diff — the command below fails regardless of it
+  const write = (id, front, body) => fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\n${front}date: 2026-08-26\n---\n${body}\n`);
+  write(
+    "task-ready",
+    "type: task\nrepo: demo\ntitle: Add bounded retry to the sync worker\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: open\nedges:\n  - {type: assigned, to: agent-gatebox, profile: profile-gate}\n",
+    "Add bounded retry to the sync worker."
+  );
+  write("agent-gatebox", "type: agent\ntitle: The gate test box\nsummary: An agent identity for the gate-pipeline test fixture.\n", "Test agent.");
+  write("profile-gate", `type: profile\ntitle: Gate test profile\nsummary: A profile selecting the fake harness the gate-pipeline test declares locally.\nharness: ${HARNESS}\n`, "Test profile.");
+  write(
+    "factory-demo",
+    "type: factory\ntitle: The demo factory\nsummary: The gate pipeline the demo project enforces between claim and resolve.\nstatus: active\n",
+    [
+      "```json",
+      JSON.stringify({
+        factory: "demo", trusted_ref: "main", protected_paths: ["test/**"], test_lane_profile: "profile-test-writer",
+        // Always fails, regardless of the diff — this only exists to force
+        // exactly one fix-cycle dispatch, never to be satisfied.
+        gates: [{ id: "acceptance", kind: "command", command: `"${process.execPath}" -e "process.exit(1)"`, cycles: 1 }],
+      }),
+      "```",
+    ].join("\n")
+  );
+
+  const outfile = path.join(home, "invocations.jsonl");
+  // A plain dispatch (the initial claim) answers immediately, as every other
+  // fixture's stub does. A FIX-CYCLE dispatch — its prompt names the gate that
+  // refused the resolution (makeGateDeps' `fix`, bin/spor.js) — never answers:
+  // it self-exits after a few seconds purely so this test does not leak a
+  // process, but that is well past when this test has already killed the
+  // worker and made its assertions.
+  const stub = writeSpawnableNodeStub(
+    home,
+    "gate-stub",
+    `
+const fs = require("node:fs");
+let prompt = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (c) => { prompt += c; });
+process.stdin.on("end", () => {
+  fs.appendFileSync(process.env.GATE_OUTFILE, JSON.stringify({ cwd: process.cwd(), prompt }) + "\\n");
+  if (prompt.includes("gate refused your resolution")) { setTimeout(() => process.exit(0), 5000); return; }
+  process.stdout.write(JSON.stringify({ kind: "message", message: { text: "fake worker report" } }) + "\\n");
+  process.exit(0);
+});
+`
+  );
+  fs.writeFileSync(
+    path.join(home, "config.json"),
+    `${JSON.stringify(
+      {
+        dispatch: {
+          repos: { demo: repo },
+          harness: { [HARNESS]: { command: stub, args: ["--dir={cwd}"], label: "Gate Fake", report: { from: "lastText", text: "message.text" } } },
+        },
+      },
+      null,
+      2
+    )}\n`
+  );
+
+  const env = cleanEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home, GATE_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() });
+  const child = spawn(process.execPath, [CLI, "work", "--interval", "1", "--no-brief", "--no-worktree", "--factory", "factory-demo"], { env, stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  child.stdout.on("data", (c) => (stdout += c));
+  let stderr = "";
+  child.stderr.on("data", (c) => (stderr += c));
+
+  try {
+    // Wait for the fix cycle to actually be dispatched (two harness
+    // invocations recorded: the initial claim, then the fix).
+    const deadline = Date.now() + 20000;
+    for (;;) {
+      const n = fs.existsSync(outfile) ? fs.readFileSync(outfile, "utf8").split("\n").filter(Boolean).length : 0;
+      if (n >= 2) break;
+      if (Date.now() > deadline) throw new Error(`timed out waiting for the fix cycle to dispatch.\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    // ...and that the pipeline's own run record already names it — the stamp
+    // this feature adds, landing well before this worker is ever asked to stop.
+    const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+    let named = null;
+    for (;;) {
+      const records = dispatchRuns.readRunRecords(home).filter((r) => r.node_id === "task-ready");
+      named = records.find((r) => r.gate_fix_run_id);
+      if (named) break;
+      if (Date.now() > deadline) throw new Error(`timed out waiting for gate_fix_run_id to be stamped.\nrecords: ${JSON.stringify(records)}\nstdout:\n${stdout}`);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    const fixRunId = named.gate_fix_run_id;
+
+    child.kill("SIGTERM");
+    // "close", not "exit" — "exit" can fire before the child's stdio pipes have
+    // finished delivering their buffered data to this process (Node's own
+    // docs), and the assertion right below reads the accumulated `stdout`.
+    const exitCode = await new Promise((resolve) => {
+      const t = setTimeout(() => resolve(null), 15000);
+      child.on("close", (code) => {
+        clearTimeout(t);
+        resolve(code);
+      });
+    });
+    assert.strictEqual(exitCode, 0, `a single SIGTERM must actually end the worker, even mid fix-cycle, not leave it running on the abandoned pipeline's own timer.\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+    assert.match(stdout, new RegExp(`gate pipeline abandoned by the stop.*fix cycle \\(run ${fixRunId.slice(0, 8)}\\)`), "the abandon log names the orphaned fix-cycle run");
+
+    // The durable record: interrupted, and still naming the run it left going.
+    const finalRecord = dispatchRuns.readRunRecords(home).find((r) => r.run_id === named.run_id);
+    assert.strictEqual(finalRecord.gate_state, "interrupted");
+    assert.strictEqual(finalRecord.gate_fix_run_id, fixRunId, "the interrupted record still names the orphaned fix-cycle run");
+
+    // A restarted `spor runs` surfaces both — the pipeline's own interrupted
+    // state and the fix cycle it named — without needing --json.
+    const runs = cli(["runs"], env);
+    assert.match(runs.stdout, /gate:\s+interrupted/);
+    assert.match(runs.stdout, new RegExp(`fix cycle:\\s+run ${fixRunId.slice(0, 8)}`));
+  } finally {
+    // Best-effort cleanup: the fix-cycle harness self-exits after 5s regardless,
+    // but do not leave the worker (if somehow still alive) or its child around
+    // for the rest of the suite.
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  }
 });
