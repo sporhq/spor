@@ -48,7 +48,7 @@ function detectTrigger(stdout, targetSkillId) {
       for (const item of content) {
         if (item.type !== "tool_use") continue;
         if (item.name === "Skill") {
-          return JSON.stringify(item.input || {}).includes(targetSkillId);
+          return (item.input || {}).skill === targetSkillId;
         }
         return false;
       }
