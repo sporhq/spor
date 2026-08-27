@@ -7064,6 +7064,17 @@ async function resolveNode(cfg, id) {
 // authoritative graph check ever runs (a live node must not be skipped). The
 // offline check is used in local mode only as the fail-open fallback when the
 // graph itself is unreadable.
+//
+// CONTRACT — this function's polarity is "would dispatching this redo
+// finished work", NOT "was this approved": its terminal-status branch treats
+// EVERY retiring status (done/resolved/superseded/closed/abandoned/…) as
+// already-resolved, on purpose — a dismissed or superseded node is exactly as
+// unfinished-work-avoiding as a resolved one. That is the WRONG read for an
+// approval gate, where a dismissal must not come back as an approval. Do not
+// reuse this function (or its terminal-status/resolution logic) for an
+// approval-polarity check — use gateApprovalState (below), which draws that
+// distinction on purpose: a live resolving edge is approved, any other
+// terminal status is rejected, anything else is pending.
 function dispatchResolutionReason(cfg, node) {
   const status = (node.status || "").toLowerCase();
   const graphLib = require(path.join(ROOT, "lib", "graph.js"));
