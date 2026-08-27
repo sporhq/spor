@@ -50,6 +50,22 @@ test('detectTrigger returns null (inconclusive) on a transcript with no result a
   assert.strictEqual(detectTrigger(JSON.stringify({ type: 'system', subtype: 'init' }), 'spor:factory'), null);
 });
 
+test('detectTrigger requires an exact skill match — the expected id being a strict prefix of the fired skill is not a trigger', () => {
+  // Pins the fix in a3b1365: detectTrigger() used to check
+  // JSON.stringify(item.input).includes(targetSkillId), which false-positives whenever the
+  // *expected* id is a substring of the *fired* skill's id (e.g. expected "spor:brief" is a
+  // prefix of a fired "spor:brief-extra" — the stringified input contains "spor:brief-extra",
+  // which itself contains "spor:brief"). The field compare must be exact, not containment.
+  const stdout = [
+    JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Skill', input: { skill: 'spor:brief-extra' } }] },
+    }),
+    JSON.stringify({ type: 'result' }),
+  ].join('\n');
+  assert.strictEqual(detectTrigger(stdout, 'spor:brief'), false);
+});
+
 test('runCase against the real claude binary: a scripted Skill tool_use is detected as a trigger', { skip }, async () => {
   const scratch = makeScratchGraph({ slug: 'skill-eval-runner-e2e' });
   const fake = await startFakeAnthropic({
