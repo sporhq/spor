@@ -1275,6 +1275,50 @@ test("dispatch <node>: falls back to the assigned agent's default uses-profile",
   assert.ok(!fs.existsSync(mark));
 });
 
+// task-spor-test-change-lane-auto-routing: --from-queue must resolve a
+// picked item's profile even with NO assigned->agent edge to read it from —
+// exactly the shape the gate pipeline's test-change lane item takes
+// (buildGateWorkNode, WORKERS.md §10.3), which carries `profile:` as plain
+// frontmatter and nothing else.
+test("dispatch --from-queue: an item's own `profile:` frontmatter routes it, with no --profile flag and no assigned edge", () => {
+  const { home, nodes, repo } = fixture();
+  writeProfile(nodes, "profile-codex", "harness: codex");
+  // Replace the fixture's task-rotate with one carrying ONLY `profile:`
+  // frontmatter — dec-x (a decision) is not queueable, so this is the sole
+  // candidate --from-queue can pick.
+  fs.writeFileSync(
+    path.join(nodes, "task-rotate.md"),
+    `---\nid: task-rotate\ntype: task\nrepo: demo\ntitle: Rotate tokens\nsummary: Rotate pipeline auth tokens.\ndate: 2026-06-02\nprofile: profile-codex\n---\nBody.\n`
+  );
+  setCaps(home, { declared: { harnesses: ["claude-code"] } }); // codex NOT available here
+  const stub = recordingStub(home);
+  const mark = path.join(home, "launched.mark");
+  const r = run(["dispatch", "--from-queue", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark, ...cleanProbeEnv() });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /can't satisfy profile profile-codex \(via --profile\)/);
+  assert.ok(!fs.existsSync(mark), "never launched under an unsatisfiable auto-routed profile");
+});
+
+test("dispatch --from-queue: an explicit --profile still wins over the item's own `profile:` frontmatter", () => {
+  const { home, nodes, repo } = fixture();
+  writeProfile(nodes, "profile-codex", "harness: codex");
+  writeProfile(nodes, "profile-cc", "harness: claude-code\nplugins: [spor]");
+  fs.writeFileSync(
+    path.join(nodes, "task-rotate.md"),
+    `---\nid: task-rotate\ntype: task\nrepo: demo\ntitle: Rotate tokens\nsummary: Rotate pipeline auth tokens.\ndate: 2026-06-02\nprofile: profile-codex\n---\nBody.\n`
+  );
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  setCaps(home, { declared: { harnesses: ["claude-code"], plugins: ["spor"] } }); // codex NOT available; claude-code is
+  const stub = recordingStub(home);
+  const mark = path.join(home, "launched.mark");
+  const r = run(
+    ["dispatch", "--from-queue", "--profile", "profile-cc", "--no-brief"],
+    { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark, ...cleanProbeEnv() }
+  );
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(mark), "the explicit --profile satisfied here, so it launched — the item's own unsatisfiable profile-codex was never consulted");
+});
+
 test("dispatch --print --profile: previews the verdict and writes nothing", () => {
   const { home, nodes, repo } = fixture();
   writeProfile(nodes, "profile-codex", "harness: codex");

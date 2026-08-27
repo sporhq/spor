@@ -617,17 +617,26 @@ copy does not rest on the check having run.
 
 **The lane item routes itself** (task-spor-test-change-lane-auto-routing): the
 filed item carries the lane as `profile:` frontmatter (`buildGateWorkNode`), and
-`spor work`'s own candidate selection reads that field back — every queue item
-`dispatchableQueuePage`/`rankQueue` returns surfaces its `profile:` frontmatter
-verbatim when set, and `dispatchWorkItem` passes it through as if `--profile
-<lane>` had been given for that one dispatch. So a plain `spor work` (no
-`--profile`) still only picks up the lane item on a box that can satisfy that
-profile — everywhere else it refuses loudly and cools off, same as an explicit
-`--profile` targeting an unsatisfiable profile would, leaving it for a `spor
-work --profile <lane>` worker (or a person) to take. An explicit
-`--profile`/`work.profile` on the worker itself still wins over the item's own
-frontmatter, mirroring `resolveDispatchProfile`'s existing --profile-beats-
-inferred precedence for a node's `assigned -> agent` edge.
+every queue item `dispatchableQueuePage`/`rankQueue` returns surfaces its
+`profile:` frontmatter verbatim when set. Both dispatch entry points read it
+back and pass it through as if `--profile <lane>` had been given for that one
+dispatch, unless an explicit `--profile` on the CLI already pins one (which
+wins — the same explicit-beats-inferred precedence `resolveDispatchProfile`
+applies to a node's `assigned -> agent` edge):
+
+- `spor work`'s continuous loop (`dispatchWorkItem`) — so a plain `spor work`
+  (no `--profile`) only picks up the lane item on a box that can satisfy that
+  profile, and refuses loudly and cools off everywhere else, same as an
+  explicit `--profile` targeting an unsatisfiable profile would;
+- `spor dispatch --from-queue`'s one-shot "take the top item" — without this
+  the lane item (which carries no `assigned -> agent` edge for
+  `resolveDispatchProfile` to fall back to) would dispatch with **no profile
+  check at all**, silently defeating the separation the lane exists to
+  enforce.
+
+Either way the item is left for a `spor work --profile <lane>` worker, a
+`spor dispatch --profile <lane>` run, or a person to take once a box that
+satisfies the profile picks it up.
 
 ### 10.4 Agent-review gates — a verdict that is read, not asserted
 

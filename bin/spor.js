@@ -8244,7 +8244,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   let nodeId = values.node || null;
   let targetSlug = values.slug || null;
   let name = values.name || null;
-  const profileFlag = values.profile || null;
+  let profileFlag = values.profile || null;
   let dispatchNodeRaw = null; // the dispatched node's markdown — read for its assigned->agent profile
 
   // Positional task text: parseArgs already split flags from positionals.
@@ -8279,6 +8279,13 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     }
     nodeId = top.id;
     targetSlug = targetSlug || top.repo || top.project || null;
+    // Auto-route by the item's own `profile:` frontmatter (task-spor-test-
+    // change-lane-auto-routing) — the same one-line fallback `spor work`'s
+    // dispatchWorkItem applies, so `--from-queue`'s "pick the top item and
+    // dispatch it" doesn't quietly skip profile resolution for an item with
+    // no `assigned -> agent` edge (resolveDispatchProfile finds nothing to
+    // resolve without one). An explicit --profile still wins.
+    if (!profileFlag && top.profile) profileFlag = top.profile;
   }
 
   if (backfill) {
@@ -9223,11 +9230,12 @@ function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, warn = () => {} } = {}) {
 // by hand ever picked it up. `dispatchableQueuePage` surfaces that field
 // verbatim (rankQueue), so an item carrying it is routed exactly as if
 // `--profile <that>` had been passed for THIS dispatch — unless the worker's
-// own `--profile`/`work.profile` already pins one, which wins (the same
-// explicit-beats-inferred precedence `resolveDispatchProfile` applies to the
-// node's `assigned -> agent` edge). A box that cannot satisfy the routed
-// profile refuses the dispatch loudly, same as an explicit `--profile` would —
-// the item cools off and stays for a worker that can.
+// own `--profile` (the loop's `passthrough`, sourced from the CLI flag only —
+// there is no `work.profile` config-cascade key) already pins one, which
+// wins (the same explicit-beats-inferred precedence `resolveDispatchProfile`
+// applies to the node's `assigned -> agent` edge). A box that cannot satisfy
+// the routed profile refuses the dispatch loudly, same as an explicit
+// `--profile` would — the item cools off and stays for a worker that can.
 async function dispatchWorkItem(cfg, item, passthrough) {
   const values = { ...passthrough, node: item.id };
   if (!values.profile && item.profile) values.profile = item.profile;
