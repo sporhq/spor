@@ -9369,8 +9369,16 @@ async function gateApprovalState(cfg, id) {
     // inbound-resolver join off the loaded graph (the resolution kernel), which
     // also sees a graph-resident schema's non-resolving statuses.
     try {
-      const graphLib = require(path.join(ROOT, "lib", "graph.js"));
-      const g = graphLib.loadGraph(cfg.nodesDir());
+      // Cached, not a raw loadGraph: this is called on the gate's poll
+      // interval for up to approvalTimeoutMs (a day by default, ~1440 polls
+      // at the 60s floor) from one live worker process, and the overwhelming
+      // majority of polls find the graph unchanged
+      // (task-spor-gate-approval-poll-graph-load). u.loadGraphCached is the
+      // same process-lifetime, mtime-fingerprinted memo the local-mode hooks
+      // already use for the equivalent per-invocation load
+      // (issue-cc-local-mode-hook-load-latency) — reused here rather than
+      // grown a second time.
+      const { graph: g } = u.loadGraphCached(cfg.nodesDir());
       const r = resolutionOf(g, id);
       if (r && r.by) return { state: "approved", by: r.by };
       const n = g.nodes[id];
