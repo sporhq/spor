@@ -1325,6 +1325,34 @@ test("writing a gate node twice is one node — but the same id with DIFFERENT c
   assert.strictEqual(bad.ok, false);
 });
 
+test("issue-spor-gate-node-refile-date-collision: re-filing the same gate fact across a date boundary no-ops, it does not collide", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gatewrite-date-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const node = (date) =>
+    `---\nid: art-gate-demo-y-abcdef12\ntype: artifact\ntitle: Gate demo\nsummary: The demo gate passed on the change under judgement, and this records it.\ndate: ${date}\n---\n\nBody.\n`;
+  const first = await sporCli.writeGateNode(cfg, "art-gate-demo-y-abcdef12", node("2026-08-26"));
+  assert.strictEqual(first.ok, true);
+  // Same fact, minted the next day (a resumed pipeline or a re-gated run
+  // picking the same deterministic id back up past midnight) — this must
+  // read as the SAME fact, not a collision with different content.
+  const nextDay = await sporCli.writeGateNode(cfg, "art-gate-demo-y-abcdef12", node("2026-08-27"));
+  assert.deepStrictEqual([nextDay.ok, nextDay.existing], [true, true]);
+  // The on-disk node still carries the date it was FIRST written with — a
+  // later date-only re-file is a no-op, not an update.
+  assert.match(fs.readFileSync(path.join(home, "nodes", "art-gate-demo-y-abcdef12.md"), "utf8"), /date: 2026-08-26/);
+
+  // A genuinely different outcome on a different date is still a real
+  // collision — the date normalization must not swallow real drift.
+  const realCollision = await sporCli.writeGateNode(
+    cfg,
+    "art-gate-demo-y-abcdef12",
+    `---\nid: art-gate-demo-y-abcdef12\ntype: artifact\ntitle: Gate demo\nsummary: Something else entirely happened here, and it is not the same fact at all.\ndate: 2026-08-27\n---\n\nBody.\n`
+  );
+  assert.strictEqual(realCollision.ok, false);
+  assert.match(realCollision.reason, /already exists with different content/);
+});
+
 // --------------------------------------------------- stop-during-fix-cycle --
 // issue-spor-work-stop-abandons-inflight-gates: a fix cycle's own run is
 // DETACHED and can be dispatched for up to a day (runMaxMs) before its

@@ -9389,6 +9389,21 @@ function gateRunReportText(record) {
   }
 }
 
+// Gate nodes mint `date:` from `new Date()` at write time (WORKERS.md §10.7),
+// so the SAME outcome re-filed for the SAME run across a date boundary (a
+// resumed pipeline, a re-gated dispatch) carries a different `date:` line
+// even though nothing about the fact changed. The idempotency compare below
+// must not treat that as a content collision — so it normalizes the
+// frontmatter `date:` line away before comparing, leaving every other field
+// (including a genuinely different verdict/summary) fully significant.
+function stripFrontmatterDate(markdown) {
+  const text = String(markdown || "");
+  if (!text.startsWith("---\n")) return text;
+  const end = text.indexOf("\n---", 4);
+  if (end === -1) return text;
+  return text.slice(0, end).replace(/^date: .*$/m, "date:") + text.slice(end);
+}
+
 // Write a gate's node — a fact, an escalation, an approval — through the same
 // validated door `spor put-node` uses, idempotently (a deterministic id written
 // twice is one node, never two).
@@ -9408,8 +9423,10 @@ async function writeGateNode(cfg, id, markdown) {
       // if_exists: skip, with the ONE distinction the remote door also draws:
       // the same id carrying DIFFERENT content is not this write landing, it is
       // a collision — and for an approval item, silently adopting one would let
-      // an already-answered item pass a gate nobody looked at.
-      const same = fs.readFileSync(file, "utf8") === markdown;
+      // an already-answered item pass a gate nobody looked at. The compare
+      // ignores `date:` drift (see stripFrontmatterDate) so it stays keyed on
+      // the fact itself, not the calendar day it was re-filed on.
+      const same = stripFrontmatterDate(fs.readFileSync(file, "utf8")) === stripFrontmatterDate(markdown);
       return same ? { ok: true, id, existing: true } : { ok: false, id, existing: true, reason: `${id} already exists with different content — refusing to adopt another gate's node` };
     }
     // The same validation the local `put-node` door runs: a malformed gate node
