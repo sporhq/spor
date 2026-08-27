@@ -82,10 +82,17 @@ ranked, live queue for a project. Each item's `readiness` field
 (`agent`/`human`/`untriaged`) says whether it is meant for an autonomous
 worker at all — `readiness: human` always wins over any stamp (a `requires:
 human` node, an explicit assignment, held-task churn, an open neighborhood
-question) and a worker should never claim it. `suggest` on each item
-(`do`/`dispatch`/`blocked`/`triage`/`close`/`approve`) is a further hint;
-`blocked` means a live `blocks` edge still gates it — claiming it is legal
-but the item cannot resolve until its blocker does.
+question). Strictness here splits by surface
+(dec-spor-worker-strictness-split-interactive-lenient): an **autonomous
+worker** — an unattended loop picking its own work from the pool, such as
+`spor work` — **must not claim** a `readiness: human` item; it skips it in
+selection and moves on. An **explicit human-initiated dispatch** — a person
+naming this exact node, such as `spor dispatch <id>` — **may**: it warns and
+proceeds, since a person choosing to point an agent at flagged work is
+itself the human step the readiness gap exists to route through. `suggest`
+on each item (`do`/`dispatch`/`blocked`/`triage`/`close`/`approve`) is a
+further hint; `blocked` means a live `blocks` edge still gates it — claiming
+it is legal but the item cannot resolve until its blocker does.
 
 **Claim.** Take the heartbeat-renewed lease before starting work:
 
@@ -468,8 +475,10 @@ A worker (and its launcher, if separate) is a conforming Spor worker when it:
 - [ ] **releases the lease only after the report write is confirmed** — a
       refused write leaves the lease held, never released with nothing to
       show for it (§6)
-- [ ] never claims a `readiness: human` item (§3), and never routes a
-      mention-less question without stamping the session's project (§4)
+- [ ] never routes a mention-less question without stamping the session's
+      project (§4)
+- [ ] if autonomous (picking its own work from the pool, not dispatched at a
+      named node by a person), never claims a `readiness: human` item (§3)
 
 ## 10. The gate pipeline — enforcement between the claim and the resolve
 
