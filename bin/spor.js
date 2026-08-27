@@ -9176,25 +9176,50 @@ async function loadFactoryDefinition(cfg, id) {
       ],
     };
   }
+  // status defaults to active (GRAPH.md "Correction nodes" lifecycle
+  // convention); anything else (retired, proposed, ...) must not enforce.
+  if (parsed.status && parsed.status !== "active") {
+    return {
+      factory: null,
+      errors: [`'${id}' is '${parsed.status}', not 'status: active' — a retired or proposed factory never enforces`],
+    };
+  }
   const errors = [];
   const gateNodes = new Map();
+  const explainedRefs = new Set(); // refs whose problem we already reported below
   for (const ref of gatesKernel.factoryRefs(parsed.body || "")) {
     const gn = await resolveNode(cfg, ref);
     if (!gn || !gn.raw) continue; // resolveGates reports the missing reference itself
     const pg = parse(gn.raw, `${ref}.md`);
     if ((pg.type || "") !== "gate") {
       errors.push(`referenced gate '${ref}' is a '${pg.type || "?"}' node, not a 'type: gate' node`);
+      explainedRefs.add(ref);
+      continue;
+    }
+    if (pg.status && pg.status !== "active") {
+      errors.push(`referenced gate '${ref}' is '${pg.status}', not 'status: active' — a retired or proposed gate never enforces`);
+      explainedRefs.add(ref);
       continue;
     }
     const payload = gatesKernel.fencedJson(pg.body || "");
     if (!payload.ok) {
       errors.push(`referenced gate '${ref}': ${payload.error}`);
+      explainedRefs.add(ref);
       continue;
     }
     gateNodes.set(ref, payload.payload);
   }
   const res = gatesKernel.parseFactory(parsed.body || "", { gateNodes, id });
-  return { factory: res.factory, errors: [...new Set([...errors, ...res.errors])] };
+  // A ref we already explained above (wrong type, retired, bad payload) is left
+  // out of gateNodes on purpose, which makes resolveGates raise its own generic
+  // "could not be read from the graph" for the same ref — accurate for an
+  // actually-missing node, but misleading here. Drop that duplicate rather than
+  // relying on it: the null-factory decision is ours (errors.length), not a
+  // side effect of resolveGates independently agreeing.
+  const resErrors = res.errors.filter(
+    (e) => ![...explainedRefs].some((ref) => e.includes(`referenced gate '${ref}' could not be read from the graph`))
+  );
+  return { factory: errors.length ? null : res.factory, errors: [...new Set([...errors, ...resErrors])] };
 }
 
 // The git plumbing for a command gate — reading the change under judgement,

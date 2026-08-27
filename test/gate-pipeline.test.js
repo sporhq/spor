@@ -1330,7 +1330,7 @@ function cli(args, env, cwd) {
 
 // A scratch graph home holding one ready task, a fake harness profile, and a
 // factory definition (plus one shareable gate node it references).
-function cliFixture({ factoryPayload, gatePayload = null } = {}) {
+function cliFixture({ factoryPayload, gatePayload = null, factoryStatus = "active", gateStatus = "active" } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-home-"));
   const nodes = path.join(home, "nodes");
   fs.mkdirSync(nodes, { recursive: true });
@@ -1346,14 +1346,14 @@ function cliFixture({ factoryPayload, gatePayload = null } = {}) {
   if (factoryPayload) {
     write(
       "factory-demo",
-      "type: factory\ntitle: The demo factory\nsummary: The gate pipeline the demo project enforces between claim and resolve.\nstatus: active\n",
+      `type: factory\ntitle: The demo factory\nsummary: The gate pipeline the demo project enforces between claim and resolve.\nstatus: ${factoryStatus}\n`,
       ["```json", JSON.stringify(factoryPayload, null, 2), "```"].join("\n")
     );
   }
   if (gatePayload) {
     write(
       "gate-shared",
-      "type: gate\ntitle: A shared gate\nsummary: A shareable gate node the demo factory references by id.\nstatus: active\n",
+      `type: gate\ntitle: A shared gate\nsummary: A shareable gate node the demo factory references by id.\nstatus: ${gateStatus}\n`,
       ["```json", JSON.stringify(gatePayload, null, 2), "```"].join("\n")
     );
   }
@@ -1427,6 +1427,28 @@ test("a factory that does not validate REFUSES to start the worker — it never 
     assert.match(r.stderr, /does not run ungated/);
     assert.ok(!fs.existsSync(outfile), "and nothing was dispatched");
   }
+});
+
+test("a retired factory refuses to start the worker instead of silently continuing to enforce", () => {
+  const { home } = cliFixture({ factoryPayload: OK_FACTORY, factoryStatus: "retired" });
+  const r = cli(["work", "--once", "--factory", "factory-demo"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode() });
+  assert.strictEqual(r.status, 1, r.stdout);
+  assert.match(r.stderr, /'factory-demo' is 'retired', not 'status: active'/);
+});
+
+test("a retired gate referenced by an active factory is a load-time validation failure", () => {
+  const { home } = cliFixture({
+    factoryPayload: { ...OK_FACTORY, gates: [...OK_FACTORY.gates, { ref: "gate-shared" }] },
+    gatePayload: { id: "adversarial", kind: "agent-review", profile: "profile-review", cycles: 2 },
+    gateStatus: "retired",
+  });
+  const r = cli(["work", "--once", "--factory", "factory-demo"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode() });
+  assert.strictEqual(r.status, 1, r.stdout);
+  assert.match(r.stderr, /referenced gate 'gate-shared' is 'retired', not 'status: active'/);
+  // The status error is the whole story — no misleading "could not be read"
+  // duplicate from the gate resolver, which would send an operator debugging
+  // the wrong thing (issue-spor-factory-definition-status-ignored review).
+  assert.doesNotMatch(r.stderr, /could not be read from the graph/);
 });
 
 test("a factory id that is not a factory node says so, and points at the candidate schema", () => {

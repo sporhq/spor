@@ -540,6 +540,15 @@ agent-review gate with no profile, a reference the graph cannot supply, a
 duplicate gate id, `protected_paths` with no `test_lane_profile` to route to,
 and a human gate naming a risk class the factory never declared are all fatal.
 
+**`status` is enforced too**, not just read: the factory node itself, and every
+`type: gate` node it references, must be `status: active` (or carry no
+`status` at all — GRAPH.md's default-active convention) or the worker refuses
+to start, naming the offending node and its status. Retiring a factory or a
+shared gate by flipping its status to `retired` (or leaving it `proposed`) is
+therefore enough on its own to decommission it — an operator does not also
+have to go remove it from every `--factory`/`work.factory` reference or gate
+list by hand.
+
 ### 10.2 What gets gated
 
 Two run outcomes, and only two (`shouldGate`, lib/shell/work-loop.js):
