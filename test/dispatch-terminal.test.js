@@ -187,6 +187,116 @@ test("local mode and free-text dispatch are unenforced, with the reason on the r
   assert.match(free.terminal_note, /free-text dispatch/);
 });
 
+// task-spor-work-local-mode-resolver-check: local mode has no server to ask,
+// but it does have the run's own graph on disk — read straight off it before
+// falling back to unenforced, so local `spor work` gating is as precise as
+// remote's.
+function localNode(id, type, { status, edges = [] } = {}) {
+  return [
+    `${id}.md`,
+    [
+      "---",
+      `id: ${id}`,
+      `type: ${type}`,
+      "project: demo",
+      `title: Title of ${id}`,
+      `summary: Standalone summary for ${id} used by local-resolution tests.`,
+      ...(status ? [`status: ${status}`] : []),
+      "date: 2026-08-01",
+      ...(edges.length ? ["edges:", ...edges.map((e) => `  - {type: ${e[0]}, to: ${e[1]}}`)] : []),
+      "---",
+      "",
+      `Body of ${id}.`,
+      "",
+    ].join("\n"),
+  ];
+}
+
+function localNodesDir(files) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-terminal-local-"));
+  const nodesDir = path.join(dir, "nodes");
+  fs.mkdirSync(nodesDir, { recursive: true });
+  for (const [name, content] of Object.entries(files)) fs.writeFileSync(path.join(nodesDir, name), content);
+  return nodesDir;
+}
+
+test("local mode: a live resolving edge on the LOCAL graph classifies resolved, no server call needed", async () => {
+  const nodesDir = localNodesDir(Object.fromEntries([
+    localNode("task-x", "task", { status: "active" }),
+    localNode("dec-fix", "decision", { status: "settled", edges: [["resolves", "task-x"]] }),
+  ]));
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, base: null, nodesDir, nodeId: "task-x", releaseNode: "task-x", state: "done",
+    reportText: "I fixed it.",
+  });
+  assert.strictEqual(patch.terminal_state, "resolved");
+  assert.strictEqual(patch.terminal_enforced, true);
+  assert.strictEqual(patch.resolved_by, "dec-fix");
+  assert.strictEqual(patch.resolved_edge, "resolves");
+  assert.match(patch.terminal_note, /verified on the local graph/);
+  assert.strictEqual(patch.lease_released, undefined); // a resolved node is never released
+});
+
+test("local mode: no resolving edge on the local graph still falls back to unenforced reported, never resolved", async () => {
+  const nodesDir = localNodesDir(Object.fromEntries([
+    localNode("task-x", "task", { status: "active" }),
+  ]));
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, base: null, nodesDir, nodeId: "task-x", releaseNode: "task-x", state: "done",
+  });
+  assert.strictEqual(patch.terminal_state, "reported");
+  assert.strictEqual(patch.terminal_enforced, false);
+  assert.notStrictEqual(patch.terminal_state, "resolved");
+});
+
+test("local mode: a decision retired by its own terminal STATUS also resolves off the local graph", async () => {
+  const nodesDir = localNodesDir(Object.fromEntries([
+    localNode("dec-x", "decision", { status: "settled" }),
+  ]));
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, base: null, nodesDir, nodeId: "dec-x", releaseNode: "dec-x", state: "done",
+  });
+  assert.strictEqual(patch.terminal_state, "resolved");
+  assert.strictEqual(patch.terminal_enforced, true);
+  assert.match(patch.terminal_note, /status 'settled' is terminal/);
+});
+
+test("local mode: a capture-pending retired by STATUS (merged) also resolves via the universal completion words, no per-type declaration needed", async () => {
+  // schema-capture-pending deliberately declares no status.terminal of its
+  // own (its "merged"/"rejected" verdicts live only in the type-blind
+  // universal vocabulary) — this is the local-graph mirror of the equivalent
+  // remote-mode test above, over graph.registry.terminalStatuses() instead
+  // of the seed-only offline check.
+  const nodesDir = localNodesDir(Object.fromEntries([
+    localNode("cap-x", "capture-pending", { status: "merged" }),
+  ]));
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, base: null, nodesDir, nodeId: "cap-x", releaseNode: "cap-x", state: "done",
+  });
+  assert.strictEqual(patch.terminal_state, "resolved");
+  assert.strictEqual(patch.terminal_enforced, true);
+  assert.match(patch.terminal_note, /status 'merged' is terminal/);
+});
+
+test("local mode: a missing/unreadable graph home fails closed to unenforced instead of throwing", async () => {
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, base: null, nodesDir: "/no/such/spor/nodes/dir", nodeId: "task-x", state: "done",
+  });
+  assert.strictEqual(patch.terminal_enforced, false);
+  assert.notStrictEqual(patch.terminal_state, "resolved");
+});
+
+test("local mode: an unknown node id in the local graph falls back to unenforced rather than resolved", async () => {
+  const nodesDir = localNodesDir(Object.fromEntries([
+    localNode("task-other", "task", { status: "active" }),
+  ]));
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, base: null, nodesDir, nodeId: "task-x", state: "done",
+  });
+  assert.strictEqual(patch.terminal_enforced, false);
+  assert.notStrictEqual(patch.terminal_state, "resolved");
+});
+
 test("a decision retired by STATUS resolves once its own status reaches its terminal partition", async () => {
   // decision has no `get()` resolution hook (unlike task/issue/question/incident),
   // so its completion is judged against the registry's status.terminal partition

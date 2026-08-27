@@ -7944,7 +7944,7 @@ function awaitLaunchHandshake(stream, timeoutMs) {
 }
 
 async function launchSupervisedHarness(cfg, {
-  adapter, command, args, cwd, name, nodeId, prompt, server, childToken, mcpToken, bindToken,
+  adapter, command, args, cwd, name, nodeId, prompt, server, localNodesDir, childToken, mcpToken, bindToken,
   renewToken, renewNode, releaseNode, project,
 }) {
   const runId = crypto.randomUUID();
@@ -7982,6 +7982,13 @@ async function launchSupervisedHarness(cfg, {
     report_path: p.report,
     scratch_path: p.scratch,
     server: server || null,
+    // Present only when there is no server (task-spor-work-local-mode-
+    // resolver-check): local dispatch has no `/v1/nodes/{id}` to verify a
+    // resolution against, but it does have this run's own local graph home,
+    // resolved by the LAUNCHER the same way `spor get`/`spor next` would —
+    // not re-derived by the detached supervisor from its own cwd, which may
+    // differ from the launching one.
+    local_nodes_dir: server ? null : localNodesDir || null,
     renew_node: renewNode || null,
     // The terminal-state contract's inputs (task-spor-dispatch-terminal-states-
     // contract): the node to verify a resolving edge on and file the report
@@ -8914,6 +8921,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
       nodeId,
       prompt,
       server: cfg.mode() === "remote" ? remote.base(cfg) : null,
+      localNodesDir: cfg.mode() === "remote" ? null : cfg.nodesDir(),
       childToken: agentToken,
       mcpToken: wantsSporMcp ? mcpToken : null,
       bindToken: agentToken,
