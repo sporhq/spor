@@ -909,6 +909,22 @@ already fails an implementer's protected-path edit CLOSED at claim time, so in
 the ordinary case this is a no-op restoring what was never touched — the point
 is that the guarantee does not rest on that earlier check having run.
 
+That restore only rewrites the candidate worktree's WORKING DIRECTORY, though
+— it creates no commit — so the sha `buildCandidate` produced still names the
+pre-restoration tree. Landing that sha unchanged would ship exactly the
+tampered edits the restore exists to strip, behind a suite that ran on (and
+passed against) the *restored* tree
+(issue-spor-integration-landed-sha-pre-restoration). So when the restore
+changes anything, the stage re-commits the restored tree — amending the
+candidate's own tip commit, which keeps its parents intact under every
+strategy — and lands *that* sha instead (`reconcileCandidateSha` in
+integration-runner.js). Belt-and-braces, same rationale as §10.3's own step 3:
+this does not depend on the command gate's protected-path check having caught
+the touch in the first place, and it never depends on suite success either —
+the invariant is enforced on the tree that gets landed, not inferred from a
+green run. A no-op restore costs nothing: the working tree already equals the
+candidate sha's tree, so there is nothing to amend.
+
 **The candidate suite runs on the merged tree**, full, every landing — never a
 slow tier skipped here and deferred to a service after the merge (the
 "replace your CI" observation dec-spor-factory-integration-step is built on: by

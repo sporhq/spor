@@ -10211,7 +10211,17 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
     acquireLease: () => acquireIntegrationLease(cfg, home, top || (record && record.cwd), { slug }),
     releaseLease: (token) => releaseIntegrationLease(cfg, token),
     buildCandidate: async ({ head, targetRef, strategy }) => integrationRunner.buildCandidateTree({ top, head, targetRef, strategy }),
-    forceProtected: ({ dir }) => gateRunner.forceProtectedPaths({ top, dir, trustedRef: factory.trustedRef, protectedPaths: factory.protectedPaths }),
+    forceProtected: ({ dir, sha }) => {
+      const forced = gateRunner.forceProtectedPaths({ top, dir, trustedRef: factory.trustedRef, protectedPaths: factory.protectedPaths });
+      if (!forced.ok) return forced;
+      // The restore above only touches the candidate worktree's WORKING
+      // DIRECTORY — `sha` still names the pre-restoration commit. Landing it
+      // as-is would ship the tampered protected-path edits the restore is
+      // meant to strip (issue-spor-integration-landed-sha-pre-restoration), so
+      // re-commit when the restore actually changed anything and land that
+      // sha instead; a no-op restore returns `sha` unchanged.
+      return integrationRunner.reconcileCandidateSha({ dir, sha });
+    },
     runSuite: ({ dir }) => gateRunner.runGateCommand({ id: "integration", command: integration.command, timeoutMs: integration.timeoutMs }, dir),
     land: (args) => integrationRunner.landCandidate(args),
     fix,

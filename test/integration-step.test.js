@@ -29,6 +29,7 @@ const { spawnSync, execFileSync } = require("node:child_process");
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const gates = require("../lib/kernel/gates.js");
 const integrationRunner = require("../lib/shell/integration-runner.js");
+const gateRunner = require("../lib/shell/gate-runner.js");
 const { writeSpawnableNodeStub, pathWithOnlyGitAndNode } = require("./helpers/portable");
 
 // ---------------------------------------------------------------- parsing --
@@ -250,6 +251,36 @@ test("a graph that refuses the fact write does not change the verdict — the en
   assert.strictEqual(res.state, "passed", "a landing that could not be recorded is still a landing");
 });
 
+// issue-spor-integration-landed-sha-pre-restoration: forceProtected may hand
+// back a DIFFERENT sha than the one buildCandidate produced (a re-commit of
+// the restored tree) — the stage must land THAT sha, not the pre-restoration
+// one, and must pass it through even when nothing needed restoring.
+test("the sha forceProtected returns is the sha that gets landed, not the pre-restoration build sha", async () => {
+  const { deps, seen } = integrationFakes({
+    forceProtected: () => ({ ok: true, sha: "restoredsha" }),
+    land: (args, s) => {
+      s.landArgs = args;
+      return { ok: true, sha: args.sha, detail: "landed" };
+    },
+  });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.strictEqual(seen.landArgs.sha, "restoredsha", "the restored/re-committed sha is what gets landed");
+});
+
+test("a forceProtected that reports no restoration falls back to the build's own sha", async () => {
+  const { deps, seen } = integrationFakes({
+    forceProtected: () => ({ ok: true }), // no `sha` field — nothing was restored
+    land: (args, s) => {
+      s.landArgs = args;
+      return { ok: true, sha: args.sha, detail: "landed" };
+    },
+  });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.strictEqual(seen.landArgs.sha, "candidatesha", "no restoration -> land the build's own sha unchanged");
+});
+
 // ---------------------------------------------------- the git plumbing, for real --
 
 function git(dir, ...args) {
@@ -355,6 +386,130 @@ test("landCandidate CAS-lands locally with git update-ref, and reports a LOST RA
   assert.strictEqual(raced.race, true);
   assert.match(raced.reason, /moved to/);
   built2.cleanup();
+});
+
+// issue-spor-integration-landed-sha-pre-restoration: forceProtectedPaths only
+// rewrites the candidate worktree's WORKING DIRECTORY — buildCandidateTree's
+// own `sha` still names the pre-restoration commit. This pins the actual bug:
+// without reconcileCandidateSha, `built.sha`'s tree still carries the
+// branch's tampered protected-path edit even after forceProtectedPaths "fixed"
+// the working directory.
+test("REGRESSION: buildCandidateTree's own sha is NOT updated by forceProtectedPaths — the working tree and the sha diverge until reconciled", () => {
+  const dir = integrationRepo();
+  const head = git(dir, "rev-parse", "branch").trim();
+  const built = integrationRunner.buildCandidateTree({ top: dir, head, targetRef: "main", strategy: "merge" });
+  assert.strictEqual(built.ok, true, built.reason);
+  try {
+    const forced = gateRunner.forceProtectedPaths({ top: dir, dir: built.dir, trustedRef: "main", protectedPaths: ["test/**"] });
+    assert.strictEqual(forced.ok, true, forced.reason);
+    // The working directory is fixed...
+    assert.match(fs.readFileSync(path.join(built.dir, "test", "acceptance.js"), "utf8"), /add is broken/);
+    // ...but the commit buildCandidateTree already produced is untouched: its
+    // tree still carries the branch's tampered copy. This is the exact
+    // divergence the bug landed.
+    assert.match(git(dir, "show", `${built.sha}:test/acceptance.js`), /process\.exit\(0\)/, "the pre-restoration sha still carries the tampered file");
+  } finally {
+    built.cleanup();
+  }
+});
+
+test("reconcileCandidateSha re-commits the restored tree and lands THAT sha — never the pre-restoration one", () => {
+  const dir = integrationRepo();
+  const head = git(dir, "rev-parse", "branch").trim();
+  for (const strategy of ["merge", "squash", "rebase"]) {
+    const built = integrationRunner.buildCandidateTree({ top: dir, head, targetRef: "main", strategy });
+    assert.strictEqual(built.ok, true, `${strategy}: ${built.reason}`);
+    try {
+      const forced = gateRunner.forceProtectedPaths({ top: dir, dir: built.dir, trustedRef: "main", protectedPaths: ["test/**"] });
+      assert.strictEqual(forced.ok, true, `${strategy}: ${forced.reason}`);
+
+      const reconciled = integrationRunner.reconcileCandidateSha({ dir: built.dir, sha: built.sha });
+      assert.strictEqual(reconciled.ok, true, `${strategy}: ${reconciled.reason}`);
+      assert.strictEqual(reconciled.amended, true, `${strategy}: something was restored, so a re-commit is expected`);
+      assert.notStrictEqual(reconciled.sha, built.sha, `${strategy}: the reconciled sha must differ from the pre-restoration one`);
+
+      // The reconciled sha's tree — not the original build sha's — carries the
+      // restored protected file, and still carries the branch's own honest work.
+      assert.match(git(dir, "show", `${reconciled.sha}:test/acceptance.js`), /add is broken/, `${strategy}: reconciled sha carries the trusted suite`);
+      assert.match(git(dir, "show", `${reconciled.sha}:lib/sub.js`), /a - b/, `${strategy}: reconciled sha still carries the branch's own work`);
+
+      // The candidate worktree's own HEAD now points at the reconciled sha —
+      // this is what a caller landing straight from `dir`'s HEAD would ship.
+      assert.strictEqual(git(built.dir, "rev-parse", "HEAD").trim(), reconciled.sha, `${strategy}: the candidate worktree's HEAD is the reconciled sha`);
+
+      // Landing the reconciled sha (not built.sha) is what a real caller does.
+      const landed = integrationRunner.landCandidate({ top: dir, dir: built.dir, sha: reconciled.sha, expectedSha: built.expectedSha, targetRef: "main", mode: "local" });
+      assert.strictEqual(landed.ok, true, `${strategy}: ${landed.reason}`);
+      assert.match(git(dir, "show", `${git(dir, "rev-parse", "main").trim()}:test/acceptance.js`), /add is broken/, `${strategy}: main now carries the trusted suite, not the tampered one`);
+
+      // Reset main back for the next strategy in this loop.
+      git(dir, "update-ref", "refs/heads/main", built.expectedSha);
+    } finally {
+      built.cleanup();
+    }
+  }
+});
+
+test("reconcileCandidateSha is a no-op when nothing needed restoring — the common case", () => {
+  const dir = integrationRepo();
+  const head = git(dir, "rev-parse", "branch").trim();
+  const built = integrationRunner.buildCandidateTree({ top: dir, head, targetRef: "main", strategy: "merge" });
+  try {
+    // No protected paths declared -> forceProtectedPaths is a no-op.
+    const forced = gateRunner.forceProtectedPaths({ top: dir, dir: built.dir, trustedRef: "main", protectedPaths: [] });
+    assert.strictEqual(forced.ok, true);
+    const reconciled = integrationRunner.reconcileCandidateSha({ dir: built.dir, sha: built.sha });
+    assert.strictEqual(reconciled.ok, true, reconciled.reason);
+    assert.strictEqual(reconciled.amended, false);
+    assert.strictEqual(reconciled.sha, built.sha, "nothing changed, so the original build sha is landed unchanged");
+  } finally {
+    built.cleanup();
+  }
+});
+
+// Drives runIntegrationStage with REAL git plumbing end to end, composing
+// forceProtected exactly the way bin/spor.js's makeIntegrationDeps does
+// (forceProtectedPaths, then reconcileCandidateSha) — the one seam the faked
+// "stage" tests above and the direct git-plumbing tests above don't exercise
+// together: the actual composed dependency the worker runs in production.
+test("runIntegrationStage, wired with the real composed forceProtected dep, lands the RESTORED tree — a protected-path tamper never reaches the target ref", async () => {
+  const dir = integrationRepo();
+  const head = git(dir, "rev-parse", "branch").trim();
+  const targetRef = "main";
+  const factory = {
+    id: "factory-regression",
+    integration: { targetRef, mode: "local", command: "true", strategy: "merge", serialize: "repo", cycles: 0, timeoutMs: 900000 },
+    trustedRef: targetRef,
+    protectedPaths: ["test/**"],
+  };
+  const item = { node_id: "task-demo", run_id: "run-abcdef12", project: "demo" };
+  const deps = {
+    now: () => 1_700_000_000_000,
+    changedTree: async () => ({ ok: true, top: dir, head, cwd: dir }),
+    acquireLease: async () => null,
+    releaseLease: async () => {},
+    buildCandidate: async ({ head: h, targetRef: t, strategy: s }) => integrationRunner.buildCandidateTree({ top: dir, head: h, targetRef: t, strategy: s }),
+    // The exact composition bin/spor.js's forceProtected dep uses.
+    forceProtected: ({ dir: candidateDir, sha }) => {
+      const forced = gateRunner.forceProtectedPaths({ top: dir, dir: candidateDir, trustedRef: factory.trustedRef, protectedPaths: factory.protectedPaths });
+      if (!forced.ok) return forced;
+      return integrationRunner.reconcileCandidateSha({ dir: candidateDir, sha });
+    },
+    runSuite: async () => ({ ok: true }),
+    land: async (args) => integrationRunner.landCandidate(args),
+    fix: async () => ({ ok: false, reason: "no fix cycles declared in this test" }),
+    escalate: async () => ({ ok: true, id: "task-integration-escalate-x" }),
+    demote: async () => ({ ok: true, demoted: false }),
+    recordFact: async () => ({ ok: true }),
+    cleanupImplementer: async () => {},
+  };
+
+  const res = await integrationRunner.runIntegrationStage({ item, factory, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  const landedSha = git(dir, "rev-parse", targetRef).trim();
+  assert.match(git(dir, "show", `${landedSha}:test/acceptance.js`), /add is broken/, "the landed commit carries the trusted suite, not the branch's tampered protected-path edit");
+  assert.doesNotMatch(git(dir, "show", `${landedSha}:test/acceptance.js`), /process\.exit\(0\)/);
+  assert.match(git(dir, "show", `${landedSha}:lib/sub.js`), /a - b/, "the branch's own, non-protected work still landed");
 });
 
 test("squash and rebase strategies both produce a candidate that descends cleanly from the target ref", () => {
