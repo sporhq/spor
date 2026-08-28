@@ -625,6 +625,37 @@ test("a BLOCKED gate (waiting on a person) also cools the item, and a thrown pip
   assert.match(status.recent[0].gate_reason, /git exploded/);
 });
 
+test("a PARKED integration (propose mode) frees the slot exactly like any other settled verdict — no special-casing needed (task-spor-integration-propose-mode)", async () => {
+  const { deps, control, state } = loopHarness({
+    queue: [{ id: "task-a" }],
+    gate: () => ({ state: "parked", reason: "integration proposed: opened PR #42", escalated_to: "task-integration-proposed-x" }),
+  });
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, max: 1 }, deps, control });
+  assert.strictEqual(state.gateCalls.length, 1);
+  assert.strictEqual(status.gates.parked, 1);
+  assert.deepStrictEqual(status.gating, [], "the slot is freed the moment the pipeline settles, not held for a pending PR review");
+  assert.strictEqual(status.recent[0].gate, "parked");
+  assert.strictEqual(status.recent[0].escalated_to, "task-integration-proposed-x");
+  // The slot really was held WHILE parking — same evidence the PASS test above
+  // checks — proving nothing here special-cases "parked" into skipping the hold.
+  const held = state.published.some((p) => p.gating && p.gating.length === 1);
+  assert.ok(held, "the item occupied a slot while its pipeline settled");
+});
+
+test("deps.checkProposals runs once per pass when present (propose mode), and is never called when absent — a bare/local/push factory's loop is unchanged", async () => {
+  const { deps, control } = loopHarness({ queue: [{ id: "task-a" }] });
+  let calls = 0;
+  deps.checkProposals = async () => {
+    calls += 1;
+  };
+  await workLoop.runWorkLoop({ opts: { workerId: "w", once: true, intervalMs: 1000 }, deps, control });
+  assert.ok(calls >= 1, "checkProposals runs at least once per pass when the deps hook is present");
+
+  const bare = loopHarness({ queue: [{ id: "task-a" }] });
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", once: true, intervalMs: 1000 }, deps: bare.deps, control: bare.control });
+  assert.strictEqual(status.dispatched, 1, "no checkProposals dep -> the loop runs exactly as before this hook existed");
+});
+
 test("only a claimed completion is gated: an enforced 'reported' run is not, an UNENFORCED one is", async () => {
   const enforcedReported = loopHarness({
     queue: [{ id: "task-a" }],
@@ -1206,6 +1237,108 @@ test("a refused item's COMPLETION status is rolled back — and nothing else is"
   assert.deepStrictEqual([unblocked.ok, unblocked.demoted], [true, true]);
   assert.match(unblocked.note, /nothing blocks task-done-2/, "the note says the blocker is missing rather than implying one");
   assert.strictEqual(statusOf("task-done-2"), "open");
+});
+
+// gatePromoteItem is gateDemoteItem's mirror (task-spor-integration-propose-
+// mode): once a PR lands, the completion a park() rolled back is restored.
+test("gatePromoteItem restores a demoted item's completion status — the type's own declared value, not a hardcoded 'done'", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-promote-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const write = (id, type, status) =>
+    fs.writeFileSync(
+      path.join(nodes, `${id}.md`),
+      `---\nid: ${id}\ntype: ${type}\ntitle: Something\nsummary: A one-sentence summary that stands on its own for ${id}.\nstatus: ${status}\ndate: 2026-08-26\n---\n\nBody.\n`
+    );
+  const statusOf = (id) => /^status: (.+)$/m.exec(fs.readFileSync(path.join(nodes, `${id}.md`), "utf8"))[1];
+
+  // The ordinary case: a task park() demoted to 'open' restores to 'done'.
+  write("task-parked", "task", "open");
+  const promoted = await sporCli.gatePromoteItem(cfg, "task-parked");
+  assert.deepStrictEqual([promoted.ok, promoted.restored], [true, true]);
+  assert.strictEqual(statusOf("task-parked"), "done");
+
+  // An issue restores to 'resolved', not 'done' — the type's own vocabulary,
+  // read through the LOCAL registry.
+  write("issue-parked", "issue", "open");
+  const issuePromoted = await sporCli.gatePromoteItem(cfg, "issue-parked");
+  assert.deepStrictEqual([issuePromoted.ok, issuePromoted.restored], [true, true]);
+  assert.strictEqual(statusOf("issue-parked"), "resolved");
+
+  // A node NOT sitting at the demoted status is left alone — a person may
+  // have moved on from it since, and there is no way to tell that apart from
+  // a bare status field.
+  write("task-abandoned", "task", "abandoned");
+  const untouched = await sporCli.gatePromoteItem(cfg, "task-abandoned");
+  assert.deepStrictEqual([untouched.ok, untouched.restored], [true, false]);
+  assert.strictEqual(statusOf("task-abandoned"), "abandoned");
+
+  const missing = await sporCli.gatePromoteItem(cfg, "task-nope");
+  assert.strictEqual(missing.ok, false);
+});
+
+// The retry-convergence bug an adversarial review caught: checkProposal
+// (integration-runner.js) writes the LANDED fact — which carries a `resolves`
+// edge onto the tracking item — BEFORE calling `restore`, because
+// task-cc-terminal-status-requires-resolver means the resolver has to exist
+// before the tracking item's own status can validly flip terminal. That
+// means a live resolving edge can exist for a beat (or, if `restore` then
+// fails, indefinitely) before the tracking item is genuinely closed. Reading
+// that edge as "already settled" (the ordinary gateApprovalState polarity)
+// would let a failed restore attempt never retry — checkProposals must key
+// its skip decision on the tracking item's own STATUS, and `restoreProposal`
+// must close the tracking item even on a retry where gatePromoteItem finds
+// the work item ALREADY promoted (restored: false is not nothing-to-do).
+test("a proposal whose restore failed once is retried, not permanently stuck — blockerAlreadyClosed reads STATUS, not the resolving edge", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-proposal-retry-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const write = (id, front, body = "Body.") => fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\n${front}date: 2026-08-26\n---\n${body}\n`);
+  const statusOf = (id) => /^status: (.+)$/m.exec(fs.readFileSync(path.join(nodes, `${id}.md`), "utf8"))[1];
+
+  write("task-proposed", "type: task\ntitle: Add bounded retry\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: open\n");
+  write("task-integration-proposed-x", "type: task\ntitle: PR pending review\nsummary: The integration stage opened a PR for task-proposed; it lands automatically once the PR merges.\nstatus: open\nrequires: [human]\n");
+
+  // Simulate exactly what checkProposal does the FIRST time: the landed fact
+  // (carrying the resolving edge) lands, but restore fails right after —
+  // e.g. a transient write error — so the tracking item's own status never
+  // flips. gateWriteStatus/setStatusLocal is the low-level door; write the
+  // fact by hand the same way checkProposal's real recordFact dep would.
+  write(
+    "art-merge-proposed-run1-landed-deadbeef",
+    "type: artifact\ntitle: Integration landed\nsummary: The integration stage landed task-proposed via a merged PR.\nedges:\n  - {type: relates-to, to: task-proposed}\n  - {type: resolves, to: task-integration-proposed-x}\n"
+  );
+
+  // The resolving edge already exists, but the tracking item's STATUS is
+  // still 'open' — blockerAlreadyClosed must say so is NOT closed (unlike the
+  // resolving-edge-based gateApprovalState, which would already read
+  // "approved" here).
+  assert.strictEqual(await sporCli.blockerAlreadyClosed(cfg, "task-integration-proposed-x"), false);
+  const approvalState = await sporCli.gateApprovalState(cfg, "task-integration-proposed-x");
+  assert.strictEqual(approvalState.state, "approved", "the edge alone WOULD read approved — exactly the false signal blockerAlreadyClosed must not use");
+
+  // A retry pass: restoreProposal must still close the tracking item even
+  // though the work item is (in this run) not yet promoted either.
+  const first = await sporCli.restoreProposal(cfg, { blockerId: "task-integration-proposed-x", nodeId: "task-proposed" });
+  assert.strictEqual(first.ok, true);
+  assert.strictEqual(statusOf("task-proposed"), "done");
+  assert.strictEqual(statusOf("task-integration-proposed-x"), "done");
+  assert.strictEqual(await sporCli.blockerAlreadyClosed(cfg, "task-integration-proposed-x"), true);
+
+  // And the SAME retry-convergence claim for the harder case: the work item
+  // was ALREADY promoted by a prior attempt, but that attempt's own close
+  // write failed, leaving the tracking item stranded open. gatePromoteItem
+  // alone would report `restored: false` here (nothing to promote) — the fix
+  // is that restoreProposal closes the tracking item anyway.
+  write("task-proposed-2", "type: task\ntitle: Add bounded retry\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: done\n");
+  write("task-integration-proposed-y", "type: task\ntitle: PR pending review\nsummary: The integration stage opened a PR for task-proposed-2; it lands automatically once the PR merges.\nstatus: open\nrequires: [human]\n");
+  const alreadyPromoted = await sporCli.gatePromoteItem(cfg, "task-proposed-2");
+  assert.deepStrictEqual([alreadyPromoted.ok, alreadyPromoted.restored], [true, false], "already at the completion value — nothing for THIS call to promote");
+  const second = await sporCli.restoreProposal(cfg, { blockerId: "task-integration-proposed-y", nodeId: "task-proposed-2" });
+  assert.strictEqual(second.ok, true);
+  assert.strictEqual(statusOf("task-integration-proposed-y"), "done", "closed even though restored:false — this is what makes the retry converge");
 });
 
 // The gate's demotion writes through the SAME local door `spor set-status`

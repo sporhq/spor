@@ -9330,7 +9330,12 @@ function cmdWorkStatus(cfg, { json }) {
         `resolved ${o.resolved || 0} reported ${o.reported || 0} failed ${o.failed || 0}` +
         `${o.unenforced ? ` (${o.unenforced} unenforced)` : ""}`
     );
-    if (w.gates) out(`  gates:    ${w.factory || "(factory)"} — passed ${w.gates.passed || 0}, failed ${w.gates.failed || 0}, blocked ${w.gates.blocked || 0}`);
+    if (w.gates)
+      out(
+        `  gates:    ${w.factory || "(factory)"} — passed ${w.gates.passed || 0}, failed ${w.gates.failed || 0}, blocked ${w.gates.blocked || 0}${
+          w.gates.parked ? `, parked ${w.gates.parked}` : ""
+        }`
+      );
     for (const a of w.active || []) out(`  active:   ${a.node_id || "(free-text)"}  run ${String(a.run_id).slice(0, 8)}  ${a.harness || ""}  since ${a.started_at}`);
     for (const g of w.gating || []) {
       out(`  gating:   ${g.node_id}  run ${String(g.run_id).slice(0, 8)}  since ${g.started_at}`);
@@ -9719,6 +9724,9 @@ async function gateApprovalState(cfg, id) {
 // wins wherever the registry is readable (registry is the contract); this is
 // the fallback for a remote graph whose registry this client cannot load.
 const GATE_COMPLETION_FALLBACK = new Set(["done", "resolved", "completed", "answered"]);
+// gatePromoteItem's remote-mode inverse of the set above: which completion
+// value a given TYPE reads, when there is no local registry to ask.
+const GATE_TYPE_COMPLETION_FALLBACK = { issue: "resolved", incident: "resolved", question: "answered", task: "done" };
 // What a rolled-back item reads instead. `open` is the live entry value of
 // every queueable type's vocabulary (task, issue, question); a type whose
 // vocabulary refuses it fails the write, which is reported, not swallowed.
@@ -9802,6 +9810,46 @@ async function gateWriteStatus(cfg, id, value, graph = null) {
     return { ok: true };
   }
   return setStatusLocal(cfg, id, value, { graph });
+}
+
+// The mirror of gateDemoteItem, for propose mode's later half
+// (task-spor-integration-propose-mode): once checkProposal confirms a PR
+// merged, the resolution the item's own dispatched run already wrote finally
+// stands — restore the completion status park() rolled back, so every read
+// surface goes back to reporting the item as finished.
+//
+// Only ever restores a status this mechanism could plausibly have rolled back
+// (GATE_DEMOTED_STATUS). A node a person independently moved on from since —
+// abandoned it, or re-dispatched it and it is genuinely `open` for an
+// unrelated reason — is left alone: there is no way to tell those apart from
+// a bare status field, and the safe direction is "do nothing" rather than
+// guess a completion the item may no longer deserve.
+async function gatePromoteItem(cfg, id) {
+  const node = await resolveNode(cfg, id);
+  if (!node) return { ok: false, reason: `${id} could not be re-read, so its status could not be restored` };
+  const status = String(node.status || "").trim().toLowerCase();
+  if (status !== GATE_DEMOTED_STATUS) {
+    return { ok: true, restored: false, note: `${id} reads '${status || "(none)"}', not '${GATE_DEMOTED_STATUS}' — nothing to restore` };
+  }
+  let completion = null;
+  let graph = null;
+  if (cfg.mode() !== "remote") {
+    try {
+      const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+      graph = graphLib.loadGraph(cfg.nodesDir());
+      if (node.type) completion = graph.registry.completionStatus(node.type);
+    } catch {
+      graph = null; // an unreadable graph falls through to the fallback guess below
+    }
+  }
+  // The remote-mode fallback guess (no local registry to ask): mirrors
+  // GATE_COMPLETION_FALLBACK's own type coverage, not just the two types
+  // gateDemoteItem's caller happens to see most — a demoted `question`
+  // restores to `answered`, never a task's `done`.
+  const target = completion || GATE_TYPE_COMPLETION_FALLBACK[node.type] || "done";
+  const wrote = await gateWriteStatus(cfg, id, target, graph);
+  if (!wrote.ok) return { ok: false, reason: wrote.reason };
+  return { ok: true, restored: true, note: `${id} restored ${GATE_DEMOTED_STATUS} -> ${target}` };
 }
 
 // The deps one gate pipeline runs on: git plumbing against THIS run's tree,
@@ -10158,6 +10206,100 @@ async function releaseIntegrationLease(cfg, token) {
   releaseLocalIntegrationLease(token);
 }
 
+// task-spor-integration-propose-mode: the `gh` CLI is the v1 backend for
+// opening pull requests — a declared capability the machine must satisfy,
+// refused loudly rather than substituted (the same rule a declared harness a
+// machine cannot run already gets). `cmdWork` checks this once at startup
+// (loud and early); `proposeIntegrationPR` checks it again per call so a
+// direct caller of makeIntegrationDeps (a test, a future entry point) gets
+// the same refusal rather than a raw ENOENT.
+function runGh(args, opts = {}) {
+  return spawnPortableSync("gh", args, { encoding: "utf8", timeout: 20000, ...opts });
+}
+
+// The github.com `owner/repo` slug `gh --repo` needs, read from the `origin`
+// remote — the same remote the candidate build's push-mode landing already
+// assumes (splitRemoteRef's default). Null for anything that is not a
+// github.com URL (ssh or https): `gh` only ever targets github.com, so a
+// non-GitHub remote cannot open a PR through it regardless of what strategy
+// the graph declares.
+function ghRepoSlug(top) {
+  const url = (git(top, ["remote", "get-url", "origin"]).stdout || "").trim();
+  const m = url.match(/github\.com[:/]+([^/]+)\/(.+?)(?:\.git)?$/);
+  return m ? `${m[1]}/${m[2]}` : null;
+}
+
+// Open (or update) the PR that carries `head` onto `targetRef`, from the
+// implementer's OWN branch — never the throwaway candidate merge commit,
+// which only ever proved merging would be green. Idempotent across a fix
+// cycle: a re-run pushes the branch's new tip and reuses whatever PR is
+// already open for it rather than erroring on a duplicate.
+function proposeIntegrationPR({ top, head, targetRef }) {
+  if (!hasCmd("gh")) return { ok: false, reason: "the 'gh' CLI is not on PATH — propose mode needs it to open pull requests" };
+  const repo = ghRepoSlug(top);
+  if (!repo) return { ok: false, reason: `could not resolve a github.com 'owner/repo' from ${top}'s 'origin' remote — propose mode needs a GitHub remote` };
+  const { remote: remoteName, branch: baseBranch } = integrationRunner.splitRemoteRef(targetRef);
+  const branchName = (git(top, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout || "").trim();
+  if (!branchName || branchName === "HEAD") return { ok: false, reason: `could not read the branch name to propose from — ${top} is in detached HEAD` };
+
+  const push = git(top, ["push", "-u", remoteName, `${head}:refs/heads/${branchName}`]);
+  if (push.status !== 0) {
+    return { ok: false, reason: (push.stderr || "").trim().split("\n").filter(Boolean).pop() || "git push failed" };
+  }
+
+  const existing = runGh(["pr", "view", branchName, "--repo", repo, "--json", "number,url,state"], { cwd: top });
+  if (existing.status === 0 && existing.stdout) {
+    try {
+      const j = JSON.parse(existing.stdout);
+      if (j && j.number && String(j.state || "").toUpperCase() === "OPEN") {
+        return { ok: true, number: j.number, url: j.url, repo, branch: branchName, targetRef, detail: `PR #${j.number} already open (${j.url}) — updated with ${head.slice(0, 8)}` };
+      }
+    } catch {
+      /* unparseable is not evidence a PR exists — fall through to create one */
+    }
+  }
+
+  const create = runGh(
+    [
+      "pr", "create", "--repo", repo, "--base", baseBranch, "--head", branchName,
+      "--title", `Integration: ${branchName}`,
+      "--body", `Opened by the spor work integration stage (\`propose\` mode) for \`${branchName}\` onto \`${baseBranch}\`.`,
+    ],
+    { cwd: top }
+  );
+  if (create.status !== 0) {
+    return { ok: false, reason: (create.stderr || create.stdout || "").trim().split("\n").filter(Boolean).pop() || "gh pr create failed" };
+  }
+  const url = (create.stdout || "").trim().split("\n").filter(Boolean).pop() || "";
+  const num = (url.match(/\/pull\/(\d+)/) || [])[1];
+  if (!num) return { ok: false, reason: `gh pr create did not report a pull request number/url (got: ${url || "nothing"})` };
+  return { ok: true, number: Number(num), url, repo, branch: branchName, targetRef, detail: `opened PR #${num} (${url}) for ${head.slice(0, 8)} onto ${targetRef}` };
+}
+
+// The PR's current state, for checkProposals below — {ok, state: "open" |
+// "closed", merged, mergeCommitSha, mergedBy} | {ok:false, reason}. GitHub's
+// own three-way state (OPEN/CLOSED/MERGED) collapses to a boolean here: a
+// merge IS a closure, and `checkProposal` (integration-runner.js) only ever
+// asks "still open, or closed — and if closed, how".
+function ghPrStatus({ repo, number }) {
+  if (!hasCmd("gh")) return { ok: false, reason: "the 'gh' CLI is not on PATH" };
+  if (!repo || !number) return { ok: false, reason: "no pull request repo/number recorded for this proposal" };
+  const r = runGh(["pr", "view", String(number), "--repo", repo, "--json", "state,mergedAt,mergeCommit,mergedBy"]);
+  if (r.status !== 0) return { ok: false, reason: (r.stderr || r.stdout || "gh pr view failed").trim().split("\n").filter(Boolean).pop() || "gh pr view failed" };
+  let j = null;
+  try {
+    j = JSON.parse(r.stdout);
+  } catch {
+    return { ok: false, reason: "gh pr view returned unparseable JSON" };
+  }
+  const state = String((j && j.state) || "").toUpperCase();
+  if (state === "OPEN") return { ok: true, state: "open" };
+  if (state === "MERGED") {
+    return { ok: true, state: "closed", merged: true, mergeCommitSha: (j.mergeCommit && j.mergeCommit.oid) || null, mergedBy: (j.mergedBy && j.mergedBy.login) || null };
+  }
+  return { ok: true, state: "closed", merged: false };
+}
+
 // The deps one integration stage runs on — the shell half of
 // integration-runner.js's pure orchestration, mirroring makeGateDeps above.
 // Only ever constructed when `factory.integration` resolved, so a bare
@@ -10175,6 +10317,8 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
         ? `the integration stage could not merge your branch onto \`${integration.targetRef}\` — it conflicts.`
         : kind === "suite"
         ? `the integration stage's candidate suite (\`${integration.command}\`) failed on the merged tree.`
+        : kind === "propose"
+        ? `the integration stage could not open a pull request for your change onto \`${integration.targetRef}\`.`
         : `the integration stage could not land your change onto \`${integration.targetRef}\`.`;
     const prompt = [
       `The integration stage refused to land ${entry.node_id} onto \`${integration.targetRef}\` (\`${integration.mode}\` mode, \`${integration.strategy}\` strategy).`,
@@ -10224,6 +10368,57 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
     },
     runSuite: ({ dir }) => gateRunner.runGateCommand({ id: "integration", command: integration.command, timeoutMs: integration.timeoutMs }, dir),
     land: (args) => integrationRunner.landCandidate(args),
+    propose: ({ head, targetRef }) => proposeIntegrationPR({ top, head, targetRef }),
+    parkForReview: async ({ proposal }) => {
+      const id = `task-integration-proposed-${stem}-${short}-${gateIdSuffix("integration-park", "integration", entry.node_id, entry.run_id)}`.toLowerCase();
+      const body = [
+        `The integration stage opened a pull request for ${entry.node_id} instead of landing it directly — this`,
+        `factory declares \`propose\` mode, which never mutates \`${integration.targetRef}\` itself.`,
+        "",
+        `Pull request: ${proposal.url || (proposal.number ? `#${proposal.number}` : "(unknown)")}`,
+        "",
+        "No worker will re-dispatch this item while this tracking item is open, and none will poll it either —",
+        "the next 'spor work' pass on this box checks the pull request itself and, once it lands, writes the",
+        "landed fact, resolves this item, and restores the work item's own resolution automatically. Nothing",
+        "further is needed here beyond reviewing and merging the pull request on GitHub.",
+        "",
+        `The run's own record is \`${entry.run_id}\` ('spor runs ${entry.run_id}').`,
+      ].join("\n");
+      const written = await writeGateNode(
+        cfg,
+        id,
+        buildGateWorkNode({
+          id,
+          title: `Integration proposed — PR pending review for ${entry.node_id}`,
+          summary: `The integration stage opened ${proposal.url || `PR #${proposal.number}`} for ${entry.node_id}; it lands automatically once the PR merges.`,
+          body,
+          project: slug,
+          date: date(),
+          requiresHuman: true,
+          edges: [{ type: "blocks", to: entry.node_id }],
+        })
+      );
+      if (written.ok) {
+        // Stamped BEFORE gate_state becomes "parked" (the caller writes that
+        // right after this pipeline settles) — a proposal's own open/landed/
+        // closed lifecycle can never live in a stamp AFTER settlement
+        // (stampGateState refuses to touch a record whose gate_state already
+        // reads a SETTLED_GATE_STATES value), so every field checkProposals
+        // needs later is captured here, in the one window before it does.
+        dispatchRuns.stampGateState(home, entry.run_id, {
+          gate_proposal_number: proposal.number || null,
+          gate_proposal_repo: proposal.repo || null,
+          gate_proposal_url: proposal.url || null,
+          gate_proposal_branch: proposal.branch || null,
+          gate_proposal_target_ref: integration.targetRef,
+          gate_proposal_strategy: integration.strategy,
+          gate_proposal_blocker: id,
+          gate_proposal_project: slug || null,
+          gate_proposal_factory: factory.id || null,
+        });
+      }
+      return written;
+    },
     fix,
     recordFact: ({ id, markdown }) => writeGateNode(cfg, id, markdown),
     cleanupImplementer: async () => {
@@ -10297,6 +10492,107 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   return { ...intResult, gates: gateResult.gates, facts: [...(gateResult.facts || []), ...(intResult.facts || [])] };
 }
 
+// task-spor-integration-propose-mode: the LATER half of propose mode's
+// lifecycle, run once per 'spor work' pass (never inside the run that opened
+// the PR — that run already parked and freed its slot; see runIntegrationStage's
+// `park()`). Scans this box's own run journal for parked proposals — the
+// `gate_proposal_*` fields parkForReview stamped, keyed off `gate_state:
+// "parked"` — and checks each pull request via `gh`.
+//
+// A proposal whose tracking item is no longer pending (approved by a landed
+// fact this box, another pass, or another machine sharing this graph already
+// wrote — or rejected by a person who intervened) is someone else's settled
+// outcome and is skipped without spending a `gh` call: gateApprovalState reads
+// the graph, which is the one place two machines checking the same PR agree.
+// Whether the tracking item park() filed has already reached a terminal
+// status — checked directly on the STATUS FIELD, deliberately NOT via
+// gateApprovalState's resolving-edge read. checkProposal writes the landed
+// fact (which carries the `resolves` edge onto this item) BEFORE calling
+// `restore` — task-cc-terminal-status-requires-resolver means the resolver
+// has to exist before the item's own status can validly flip terminal — so a
+// live resolving edge can exist for a beat (or, if `restore` then fails,
+// indefinitely) before the item is genuinely closed. Reading that edge as
+// "settled" would let a failed restore attempt never retry: the work item's
+// completion status would stay rolled back forever with nothing left to
+// re-check. An unreadable node is not evidence of closure either — a graph
+// blip must not stop checkProposals from trying again next pass.
+async function blockerAlreadyClosed(cfg, id) {
+  const node = await resolveNode(cfg, id);
+  if (!node) return false;
+  const status = String(node.status || "").trim().toLowerCase();
+  if (!status) return false;
+  if (cfg.mode() !== "remote") {
+    try {
+      const { graph: g } = u.loadGraphCached(cfg.nodesDir());
+      return isTerminalStatus(status, node.type, g);
+    } catch {
+      return false;
+    }
+  }
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  return graphLib.isTerminalStatusOffline(status, node.type || null);
+}
+
+// checkProposal's `restore` dep, real: promotes the work item's own status
+// back, then closes the tracking item — extracted to a NAMED function (rather
+// than an inline closure) so this exact retry-convergence behavior is
+// directly testable, not only reachable through a real `gh` call.
+//
+// Closes the tracking item whenever the work item's own status could be
+// EVALUATED (`promoted.ok`), not only when THIS call was the one that
+// actually flipped it — `restored: false` with `ok: true` means "already at
+// the completion value" (a previous pass promoted it but then failed to
+// close the tracking item, e.g. a transient write failure), which is still
+// success, not nothing-to-do: skipping the close in that case is exactly
+// what would strand the tracking item open forever, since a later pass's
+// blockerAlreadyClosed check (below) would keep finding it non-terminal and
+// keep retrying — this is what actually makes those retries converge.
+async function restoreProposal(cfg, { blockerId, nodeId }) {
+  const promoted = await gatePromoteItem(cfg, nodeId);
+  if (!promoted.ok) return promoted;
+  const closed = await gateWriteStatus(cfg, blockerId, "done");
+  if (!closed.ok) return { ok: true, restored: promoted.restored, note: `${promoted.note}; ${blockerId} could not be closed (${closed.reason})` };
+  return promoted;
+}
+
+async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {} } = {}) {
+  const records = dispatchRuns.readRunRecords(home).filter((r) => r.gate_state === "parked" && r.gate_proposal_number && r.gate_proposal_blocker);
+  for (const r of records) {
+    let closed = false;
+    try {
+      closed = await blockerAlreadyClosed(cfg, r.gate_proposal_blocker);
+    } catch {
+      closed = false; // an unreadable graph is not evidence this is settled
+    }
+    if (closed) continue;
+    const proposal = {
+      nodeId: r.node_id,
+      runId: r.run_id,
+      project: r.gate_proposal_project || null,
+      number: r.gate_proposal_number,
+      repo: r.gate_proposal_repo,
+      url: r.gate_proposal_url,
+      branch: r.gate_proposal_branch,
+      targetRef: r.gate_proposal_target_ref,
+      strategy: r.gate_proposal_strategy,
+      blockerId: r.gate_proposal_blocker,
+      factory: r.gate_proposal_factory,
+    };
+    try {
+      await integrationRunner.checkProposal(proposal, {
+        deps: {
+          prStatus: (p) => ghPrStatus(p),
+          recordFact: ({ id, markdown }) => writeGateNode(cfg, id, markdown),
+          restore: (args) => restoreProposal(cfg, args),
+        },
+        log,
+      });
+    } catch (e) {
+      log(`work: checking the proposal for ${r.node_id} failed (${(e && e.message) || e})`);
+    }
+  }
+}
+
 async function cmdWork(cfg, { values }) {
   if (values.status) return cmdWorkStatus(cfg, { json: !!values.json });
 
@@ -10356,6 +10652,15 @@ async function cmdWork(cfg, { values }) {
       return 1;
     }
     factory = loaded.factory;
+    // task-spor-integration-propose-mode: `gh` is a declared capability, not
+    // an implicit one — refuse loudly at startup, the same place a factory
+    // that cannot be read is already refused, rather than let the first
+    // parked item silently never open its PR.
+    if (factory.integration && factory.integration.mode === "propose" && !hasCmd("gh")) {
+      err(`spor work: factory '${factoryId}' declares integration mode 'propose', but the 'gh' CLI is not on PATH.`);
+      err("  propose mode opens pull requests through gh — install it (https://cli.github.com), or declare 'local'/'push' instead.");
+      return 1;
+    }
   }
 
   // Passed straight through to every dispatch this loop makes. Deliberately NOT
@@ -10517,6 +10822,14 @@ async function cmdWork(cfg, { values }) {
                 // silently cancel the loop's own backoff.
                 sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
               }),
+            // task-spor-integration-propose-mode: only present under propose
+            // mode, so every OTHER factory's loop is byte-identical to before
+            // this existed. Runs once per pass, outside the slot/concurrency
+            // accounting — it never opens a candidate worktree or a run, just
+            // reads this box's own run journal and a handful of `gh` calls.
+            ...(factory.integration && factory.integration.mode === "propose"
+              ? { checkProposals: () => checkProposals(cfg, { home, log: (line) => out(line) }) }
+              : {}),
           }
         : {}),
       sleep: (ms) =>
@@ -10536,7 +10849,11 @@ async function cmdWork(cfg, { values }) {
   const o = final.outcomes;
   out(`work: ${final.stop_reason}. dispatched ${final.dispatched}; resolved ${o.resolved}, reported ${o.reported}, failed ${o.failed}${o.unenforced ? ` (${o.unenforced} unenforced)` : ""}.`);
   if (final.gates) {
-    out(`work: gates — passed ${final.gates.passed}, failed ${final.gates.failed}, blocked ${final.gates.blocked} (factory ${factoryId}).`);
+    out(
+      `work: gates — passed ${final.gates.passed}, failed ${final.gates.failed}, blocked ${final.gates.blocked}${
+        final.gates.parked ? `, parked ${final.gates.parked}` : ""
+      } (factory ${factoryId}).`
+    );
   }
   if (final.active.length) out(`work: ${final.active.length} run(s) still in flight — 'spor runs' follows them to their terminal state.`);
   // A signal-driven stop has to actually END this process. runWorkLoop itself
@@ -13035,7 +13352,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive };
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, restoreProposal, checkProposals, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive };
 
 if (require.main === module) {
   main()

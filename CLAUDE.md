@@ -685,12 +685,22 @@ makes the race rare rather than load-bearing is best-effort and fail-open:
 remote mode reuses the SAME server-held claim/lease door dispatch uses
 (`claimDispatch`) against a synthetic per-repo lock node; local mode falls
 back to a machine-local lockfile (dec-cc-task-claim-lease "Local mode" has no
-server pool to lean on there). `mode: propose` (an opened PR) is parsed and
-validated but explicitly refuses to load in v1 — too large a surface for this
-pass; `mode: local` and `mode: push` are the full v1 scope. Every landing or
-failure is an idempotent `art-merge-…` graph fact, the integration stage's
-twin of a gate's `art-gate-…` fact; a failure demotes the item exactly as a
-failed gate does (§10.7). See test/integration-step.test.js.
+server pool to lean on there). `mode: propose`
+(task-spor-integration-propose-mode) is the fourth: it never mutates
+`target_ref` — it opens a PR from the implementer's own branch through the
+`gh` CLI (a declared capability; `spor work` refuses loudly at startup if it
+is absent) and PARKS the item (demoted on the graph, a tracking item filed,
+the work-loop slot freed immediately — never held polling for a review that
+can take days, unlike a `human` gate's in-process approval wait). A LATER,
+separate per-pass hook (`deps.checkProposals`, wired only under propose mode)
+polls the PR via `gh` and, once it merges, writes a second `art-merge-…` fact
+that RESOLVES the tracking item and restores the work item's own resolution
+(`gatePromoteItem`, demote's mirror); a PR closed unmerged is recorded and
+left for a person, same as a rejected `human`-gate approval. See WORKERS.md
+§10.9 "Propose mode". Every landing OR proposal is an idempotent
+`art-merge-…` graph fact, the integration stage's twin of a gate's
+`art-gate-…` fact; a failure (or a closed-unmerged PR) demotes the item
+exactly as a failed gate does (§10.7). See test/integration-step.test.js.
 Server-side ops vars
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard

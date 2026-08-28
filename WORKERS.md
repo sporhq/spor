@@ -871,11 +871,10 @@ stage, run only after every declared gate has passed:
 - **`target_ref`** — what "landed" means; defaults to the factory's own
   `trusted_ref`.
 - **`mode`** — `local` CAS's a local ref with `git update-ref`; `push` pushes
-  to a remote, whose own non-fast-forward rejection *is* the compare-and-swap.
-  `mode: propose` (an opened PR, composed with a `human` gate) is parsed and
-  validated but explicitly refuses to load in v1 — a factory that declares it
-  gets a load-time error naming exactly that, the same register as every other
-  authoring mistake in §10.1, not a silent no-op.
+  to a remote, whose own non-fast-forward rejection *is* the compare-and-swap;
+  `propose` (task-spor-integration-propose-mode) opens a pull request instead
+  of mutating `target_ref` at all, for orgs whose policy forbids a worker
+  pushing straight onto it — see "Propose mode" below.
 - **`command`** — the FULL suite, run on the merged CANDIDATE tree, never a
   "fast tier" deferred to a service after landing (the run's own agent context
   is what fixes a break, and it is only still around *before* the merge).
@@ -959,13 +958,17 @@ completion status is rolled back if it claimed one — the run's resolver
 already declared every gate passed, so the ONLY thing an integration failure
 disputes is whether the change ever reached the target ref.
 
-**Cleanup runs only on a landing.** The candidate worktree is always removed,
-win or lose (it is throwaway by construction); the implementer's own dispatch
-worktree and branch are removed only once their work has actually landed —
-using the same worktree-of-this-repo safety check `spor dispatch`'s own
-teardown uses, so a checkout that is not genuinely a dispatch worktree of the
-repo in question, or one with uncommitted changes some *other* process left,
-is refused rather than force-removed.
+**Cleanup runs on a landing OR a proposal.** The candidate worktree is always
+removed, win or lose (it is throwaway by construction); the implementer's own
+dispatch worktree and branch are removed once their work has either actually
+landed or been proposed — a `propose`-mode PR is already durable on the
+remote once opened, so there is nothing left for the dispatch worktree to
+hold — using the same worktree-of-this-repo safety check `spor dispatch`'s
+own teardown uses, so a checkout that is not genuinely a dispatch worktree of
+the repo in question, or one with uncommitted changes some *other* process
+left, is refused rather than force-removed. Only an outright failure (a
+conflict or a suite that never resolves, a PR that never opens) leaves the
+dispatch worktree standing, exactly as before.
 
 Everything here is drivable with fakes, mirroring the gate pipeline's own
 testing discipline: `lib/shell/integration-runner.js` exports the pure
@@ -974,3 +977,94 @@ orchestration (`runIntegrationStage`) separately from the git plumbing
 sequencing and the race-retry bound are tested without a git checkout, and the
 merge/conflict/CAS semantics are tested against a real throwaway repo without
 faking git. See test/integration-step.test.js.
+
+#### Propose mode — PR-landing for orgs whose policy requires review
+
+`mode: propose` (task-spor-integration-propose-mode) runs the SAME candidate
+build, protected-path restore, and full suite every other mode runs — the
+whole point of running it pre-PR is that the PR is known-green the moment it
+opens, the same evidence a human reviewer would otherwise have to wait on CI
+for. Only the landing STEP itself differs: where `local`/`push` call
+`deps.land` (a CAS mutating `target_ref`), propose calls `deps.propose`, which
+**never touches `target_ref` at all** — it pushes the implementer's OWN branch
+(`tree.head`, unmerged; never the throwaway candidate commit, which only ever
+proved merging would be green) and opens a PR against it through the `gh` CLI,
+the v1 backend. `gh` is a declared capability, not an implicit one: `spor
+work` refuses to start, loudly, at the same load-time check an unreadable
+factory already gets, if a factory declares `propose` and the machine has no
+`gh` on PATH — never a silent fallback to another mode. A re-run (a fix cycle,
+or a resumed pipeline) reuses whatever PR is already open for the branch
+rather than erroring on a duplicate.
+
+**Opening the PR PARKS the item — it does not resolve it, and it frees the
+slot immediately.** This is deliberately NOT the `human` gate's shape (§10.2's
+`runOneGate`, human case): that gate polls a graph approval in-process, for up
+to `approval_timeout_ms` (a day by default), holding a work-loop concurrency
+slot the whole time — fine for an approval a person answers within a shift,
+wrong for a PR review that can legitimately take days, where holding a slot
+that long would starve the loop's throughput for nothing. So propose mode's
+"parking" reuses only the GRAPH-STATE half of a blocked/failed gate's
+demotion (§10.7: a tracking item is filed carrying `blocks` onto the work
+item, and the work item's own completion status is rolled back if it claimed
+one) — never the in-process poll. The pipeline returns a THIRD settled state,
+`parked` (alongside `passed`/`failed`/`blocked`, all in
+`gates.SETTLED_GATE_STATES` — this run's pipeline is genuinely done; a
+resumed orphan re-running it from gate 0 would open a duplicate PR), and the
+work-loop slot frees on that return exactly like any other settled verdict —
+no special-casing needed in the loop itself (see the "PARKED... frees the
+slot" test in test/gate-pipeline.test.js, which is the same assertion the
+PASS/BLOCKED tests beside it already make).
+
+**Composing with a `human` gate never double-files an approval.** A `human`
+gate (§10.2) is a GATE — it runs, and is judged, BEFORE integration ever
+starts (§10.1's ordered gate list), and its own approval item is a wholly
+separate graph node from anything propose mode files. Propose mode's own
+tracking item is filed by a DIFFERENT dep (`parkForReview`, not
+`fileHumanItem`) and is never routed through `checkApproval`'s polling loop —
+it is answered by a PULL REQUEST landing on GitHub, not a graph resolving
+edge a person writes by hand. A factory can declare both: a `human` gate that
+arms on some risk class judges the CHANGE itself pre-integration (an internal
+"should we even try to land this" call), and `propose` mode's own PR is the
+org's independent, external review-and-merge gate on the same change
+afterward. Neither one knows the other exists, and neither files into the
+other's item.
+
+**Resolving is a SEPARATE later pass — `checkProposal`, never a resume of
+this run.** Because a parked run's `gate_state` is settled, its own pipeline
+can never be re-entered to ask "did the PR land yet" (`stampGateState`
+refuses to touch a record once its `gate_state` reads a
+`SETTLED_GATE_STATES` value — the correct behavior for THIS run, wrong for
+the proposal's own separate lifecycle). So every field a later check needs —
+the PR's number/repo/url/branch, and the tracking item's own id — is stamped
+onto the run record ONCE, by `parkForReview`, in the one window before
+settlement closes it. `spor work`'s loop calls a NEW optional per-pass hook,
+`deps.checkProposals` (present only under a factory whose integration
+declares `propose` — absent, a bare/local/push factory's loop is
+byte-identical to before this existed), which scans this box's own run
+journal for `gate_state: "parked"` records, skips any whose tracking item is
+no longer pending (`gateApprovalState` reads the GRAPH, not a local flag — the
+one place two machines, or two passes, checking the same PR agree), and for
+the rest calls `gh pr view` through `integration-runner.js`'s pure
+`checkProposal`:
+
+- **Still open** — a no-op; nothing is written, nothing checked again until
+  the next pass.
+- **Merged** — writes a SECOND `art-merge-…` fact for the same run (a
+  `-landed-` phase segment distinguishes its id from the earlier `-proposed-`
+  one, so the two never collide under the same-id-same-content rule a gate
+  fact write already enforces) carrying a `resolves` edge onto the tracking
+  item — the PR landing IS what resolves it, the one point in this whole
+  pipeline where an integration fact retires something rather than merely
+  recording it — then restores the work item's own completion status
+  (`gatePromoteItem`, the exact mirror of `gateDemoteItem`: only ever
+  restores a status this mechanism could plausibly have rolled back, leaving
+  alone a node a person independently moved on from since) and closes the
+  tracking item.
+- **Closed without merging** — writes a fact recording it, but restores
+  nothing and leaves the tracking item open: the PR was rejected on GitHub's
+  own review surface, and — same as a `human` gate's own rejected approval —
+  a person decides what happens next, not the worker.
+
+See the "propose mode" and "checkProposal" sections of
+test/integration-step.test.js, and the two propose-specific tests in
+test/gate-pipeline.test.js.

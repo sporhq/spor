@@ -90,10 +90,18 @@ test("an invalid integration block REFUSES the whole factory to load — the sam
   }
 });
 
-test("mode: propose is parsed but explicitly refused — v1 scope, not silently accepted or silently dropped", () => {
+test("mode: propose loads — PR-landing for orgs whose policy requires review (task-spor-integration-propose-mode)", () => {
   const { factory, errors } = factoryOf({ ...BASE, integration: { mode: "propose", command: "npm test" } });
-  assert.strictEqual(factory, null);
-  assert.ok(errors.some((e) => /'propose' is not yet implemented/.test(e)));
+  assert.deepStrictEqual(errors, []);
+  assert.deepStrictEqual(factory.integration, {
+    targetRef: "main",
+    mode: "propose",
+    command: "npm test",
+    strategy: "merge",
+    serialize: "repo",
+    cycles: 0,
+    timeoutMs: 900000,
+  });
 });
 
 // ------------------------------------------------------------- the stage, faked --
@@ -106,11 +114,13 @@ function integrationFakes({
   forceProtected = () => ({ ok: true }),
   suite = () => ({ ok: true }),
   land = () => ({ ok: true, sha: "candidatesha", detail: "landed" }),
+  propose = () => ({ ok: true, number: 42, url: "https://github.com/demo/repo/pull/42", repo: "demo/repo", branch: "task-demo", targetRef: "main", detail: "opened PR #42" }),
+  parkForReview = () => ({ ok: true, id: "task-integration-proposed-x" }),
   fix = () => ({ ok: true }),
   escalate = () => ({ ok: true, id: "task-integration-escalate-x" }),
   demote = () => ({ ok: true, demoted: true, note: "task-demo rolled back done -> open" }),
 } = {}) {
-  const seen = { builds: 0, suites: 0, lands: 0, fixes: [], escalations: [], demotions: [], facts: [], cleanups: 0, leaseAcquired: 0, leaseReleased: 0 };
+  const seen = { builds: 0, suites: 0, lands: 0, proposals: 0, parks: [], fixes: [], escalations: [], demotions: [], facts: [], cleanups: 0, leaseAcquired: 0, leaseReleased: 0 };
   let buildCalls = 0;
   const deps = {
     now: () => 1_700_000_000_000,
@@ -143,6 +153,14 @@ function integrationFakes({
     land: async (args) => {
       seen.lands += 1;
       return land(args, seen);
+    },
+    propose: async (args) => {
+      seen.proposals += 1;
+      return propose(args, seen);
+    },
+    parkForReview: async (args) => {
+      seen.parks.push(args);
+      return parkForReview(args, seen);
     },
     fix: async (args) => {
       seen.fixes.push(args);
@@ -279,6 +297,117 @@ test("a forceProtected that reports no restoration falls back to the build's own
   const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps });
   assert.strictEqual(res.state, "passed");
   assert.strictEqual(seen.landArgs.sha, "candidatesha", "no restoration -> land the build's own sha unchanged");
+});
+
+// --------------------------------------------- propose mode (task-spor-integration-propose-mode) --
+
+const FACTORY_PROPOSE = { id: "factory-demo", integration: { targetRef: "main", mode: "propose", command: "npm test", strategy: "merge", serialize: "repo", cycles: 2, timeoutMs: 900000 } };
+
+test("propose mode opens a PR instead of landing: deps.land is NEVER called, target_ref is never touched", async () => {
+  const { deps, seen } = integrationFakes();
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_PROPOSE, deps });
+  assert.strictEqual(res.state, "parked");
+  assert.strictEqual(seen.proposals, 1);
+  assert.strictEqual(seen.lands, 0, "propose mode must never call the CAS-landing dep");
+});
+
+test("propose mode parks the item: it demotes on the graph, files a tracking item, and records a 'proposed' fact carrying the PR url — but does not escalate", async () => {
+  const { deps, seen } = integrationFakes();
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_PROPOSE, deps });
+  assert.strictEqual(res.state, "parked");
+  assert.strictEqual(res.escalated_to, "task-integration-proposed-x");
+  assert.strictEqual(seen.parks.length, 1, "a tracking item is filed exactly once");
+  assert.strictEqual(seen.escalations.length, 0, "parking is not an escalation — nothing failed yet");
+  assert.strictEqual(seen.demotions.length, 1, "the item is demoted, same graph-state fact a blocked gate leaves");
+  assert.strictEqual(seen.cleanedImplementer, true, "the branch is already pushed for the PR — the dispatch worktree is still cleaned up");
+  assert.strictEqual(seen.facts.length, 1);
+  assert.match(seen.facts[0].id, /^art-merge-demo-runabcde-proposed-[0-9a-f]{8}$/, "propose-mode facts are phase-qualified, unlike local/push's bare id");
+  assert.match(seen.facts[0].markdown, /pending review/);
+  assert.match(seen.facts[0].markdown, /https:\/\/github\.com\/demo\/repo\/pull\/42/, "the PR url is recorded on the fact");
+  assert.match(seen.facts[0].markdown, /- \{type: relates-to, to: task-integration-proposed-x\}/, "proposing only RELATES to the tracking item — nothing resolves yet");
+});
+
+test("a candidate suite failure in propose mode routes through the SAME fix-cycle machinery, and proposing after the fix parks it", async () => {
+  const { deps, seen } = integrationFakes({ suite: (() => {
+    let calls = 0;
+    return () => (calls++ === 0 ? { ok: false, reason: "npm test exited 1", output: "1 failing" } : { ok: true });
+  })() });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_PROPOSE, deps });
+  assert.strictEqual(res.state, "parked");
+  assert.strictEqual(seen.fixes.length, 1);
+  assert.strictEqual(seen.fixes[0].kind, "suite");
+  assert.strictEqual(seen.proposals, 1, "the PR is only opened once the candidate suite is actually green");
+});
+
+test("propose failing to open a PR routes through the fix-cycle cap, then FAILS and escalates — never silently parks a proposal that never happened", async () => {
+  const { deps, seen } = integrationFakes({ propose: () => ({ ok: false, reason: "gh: authentication required" }) });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_PROPOSE, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(seen.fixes.every((f) => f.kind === "propose"), true);
+  assert.strictEqual(seen.escalations.length, 1);
+  assert.strictEqual(seen.parks.length, 0, "a proposal that never opened is not parked");
+});
+
+// --------------------------------------- checkProposal — the LATER half, once a PR settles --
+
+function checkProposalFakes({ prStatus = () => ({ ok: true, state: "open" }), recordFact = () => ({ ok: true }), restore = () => ({ ok: true, restored: true, note: "task-demo restored open -> done" }) } = {}) {
+  const seen = { facts: [], restores: [] };
+  const deps = {
+    now: () => 1_700_000_000_000,
+    prStatus: async (p) => prStatus(p),
+    recordFact: async ({ id, markdown }) => {
+      seen.facts.push({ id, markdown });
+      return recordFact({ id, markdown });
+    },
+    restore: async (args) => {
+      seen.restores.push(args);
+      return restore(args);
+    },
+  };
+  return { deps, seen };
+}
+
+const PROPOSAL = { nodeId: "task-demo", runId: "run-abcdef12", project: "demo", number: 42, repo: "demo/repo", url: "https://github.com/demo/repo/pull/42", branch: "task-demo", targetRef: "main", strategy: "merge", blockerId: "task-integration-proposed-x", factory: "factory-demo" };
+
+test("checkProposal: the PR is still open — no-op, nothing is written, nothing is restored", async () => {
+  const { deps, seen } = checkProposalFakes();
+  const res = await integrationRunner.checkProposal(PROPOSAL, { deps });
+  assert.deepStrictEqual(res, { checked: true, settled: false });
+  assert.strictEqual(seen.facts.length, 0);
+  assert.strictEqual(seen.restores.length, 0);
+});
+
+test("checkProposal: the PR MERGED — writes a landed fact that RESOLVES the tracking item, and restores the work item's own resolution", async () => {
+  const { deps, seen } = checkProposalFakes({ prStatus: () => ({ ok: true, state: "closed", merged: true, mergeCommitSha: "deadbeef1234", mergedBy: "reviewer" }) });
+  const res = await integrationRunner.checkProposal(PROPOSAL, { deps });
+  assert.strictEqual(res.settled, true);
+  assert.strictEqual(res.state, "landed");
+  assert.strictEqual(res.restored, true);
+  assert.strictEqual(seen.facts.length, 1);
+  assert.match(seen.facts[0].id, /^art-merge-demo-runabcde-landed-[0-9a-f]{8}$/, "a DIFFERENT id than the 'proposed' fact — same run, second phase");
+  assert.match(seen.facts[0].markdown, /- \{type: resolves, to: task-integration-proposed-x\}/, "landing is what actually resolves the tracking item");
+  assert.match(seen.facts[0].markdown, /merged by reviewer as deadbeef/);
+  assert.strictEqual(seen.restores.length, 1);
+  assert.strictEqual(seen.restores[0].blockerId, "task-integration-proposed-x");
+  assert.strictEqual(seen.restores[0].nodeId, "task-demo");
+});
+
+test("checkProposal: the PR was CLOSED without merging — records it, but does not restore anything (a person decides)", async () => {
+  const { deps, seen } = checkProposalFakes({ prStatus: () => ({ ok: true, state: "closed", merged: false }) });
+  const res = await integrationRunner.checkProposal(PROPOSAL, { deps });
+  assert.strictEqual(res.settled, true);
+  assert.strictEqual(res.state, "closed");
+  assert.strictEqual(seen.facts.length, 1);
+  assert.match(seen.facts[0].id, /^art-merge-demo-runabcde-closed-[0-9a-f]{8}$/);
+  assert.match(seen.facts[0].markdown, /closed without merging/);
+  assert.strictEqual(seen.restores.length, 0, "closed-without-merging never restores the item's resolution");
+});
+
+test("checkProposal: an unreadable PR status is reported, not treated as settled", async () => {
+  const { deps } = checkProposalFakes({ prStatus: () => ({ ok: false, reason: "gh: rate limited" }) });
+  const res = await integrationRunner.checkProposal(PROPOSAL, { deps });
+  assert.strictEqual(res.checked, false);
+  assert.match(res.reason, /rate limited/);
 });
 
 // ---------------------------------------------------- the git plumbing, for real --
