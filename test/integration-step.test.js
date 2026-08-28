@@ -30,7 +30,7 @@ const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const gates = require("../lib/kernel/gates.js");
 const integrationRunner = require("../lib/shell/integration-runner.js");
 const gateRunner = require("../lib/shell/gate-runner.js");
-const { writeSpawnableNodeStub, pathWithOnlyGitAndNode } = require("./helpers/portable");
+const { writeSpawnableNodeStub, pathWithOnlyGitAndNode, writeFakePathBin } = require("./helpers/portable");
 
 // ---------------------------------------------------------------- parsing --
 
@@ -408,6 +408,154 @@ test("checkProposal: an unreadable PR status is reported, not treated as settled
   const res = await integrationRunner.checkProposal(PROPOSAL, { deps });
   assert.strictEqual(res.checked, false);
   assert.match(res.reason, /rate limited/);
+});
+
+// GAP 2 (cross-model review at the merge gate): the landed fact IS the
+// resolver — it carries the `resolves` edge onto the tracking item — so
+// task-cc-terminal-status-requires-resolver means `restore` must never run
+// when recordFact failed to land it. The OLD code called `deps.restore`
+// unconditionally regardless of whether the fact write above succeeded,
+// which could promote the work item and close the tracking item with NO
+// resolver ever recorded on the graph. This pins the gate, and the retry
+// convergence once recordFact stops failing.
+test("checkProposal: a MERGED PR whose landed fact fails to record does NOT call restore this pass — it leaves the proposal parked for a retry", async () => {
+  const { deps, seen } = checkProposalFakes({
+    prStatus: () => ({ ok: true, state: "closed", merged: true, mergeCommitSha: "deadbeef1234", mergedBy: "reviewer" }),
+    recordFact: () => ({ ok: false, reason: "graph offline" }),
+  });
+  const res = await integrationRunner.checkProposal(PROPOSAL, { deps });
+  assert.strictEqual(res.checked, true);
+  assert.strictEqual(res.settled, false, "not settled — no resolver ever landed on the graph");
+  assert.strictEqual(res.state, "landed");
+  assert.strictEqual(res.fact, null);
+  assert.strictEqual(res.restored, false);
+  assert.match(res.restore_reason, /landed fact could not be recorded/);
+  assert.strictEqual(seen.facts.length, 1, "recordFact was attempted");
+  assert.strictEqual(seen.restores.length, 0, "restore must NEVER be called when the landed fact could not be recorded");
+});
+
+test("checkProposal: a MERGED PR whose recordFact fails ONCE converges on the next pass once recordFact succeeds — record-then-restore completes", async () => {
+  // Pass 1: recordFact fails, exactly like the test above.
+  const { deps: deps1, seen: seen1 } = checkProposalFakes({
+    prStatus: () => ({ ok: true, state: "closed", merged: true, mergeCommitSha: "deadbeef1234", mergedBy: "reviewer" }),
+    recordFact: () => ({ ok: false, reason: "graph offline" }),
+  });
+  const first = await integrationRunner.checkProposal(PROPOSAL, { deps: deps1 });
+  assert.strictEqual(first.settled, false);
+  assert.strictEqual(seen1.restores.length, 0);
+
+  // Pass 2 (a fresh checkProposals scan, same proposal — real callers key the
+  // retry on the tracking item's own status staying open, which pass 1 never
+  // touched): recordFact now succeeds, so this pass both records the fact
+  // AND restores — nothing was left half-done by the failed first attempt.
+  const { deps: deps2, seen: seen2 } = checkProposalFakes({
+    prStatus: () => ({ ok: true, state: "closed", merged: true, mergeCommitSha: "deadbeef1234", mergedBy: "reviewer" }),
+  });
+  const second = await integrationRunner.checkProposal(PROPOSAL, { deps: deps2 });
+  assert.strictEqual(second.checked, true);
+  assert.strictEqual(second.settled, true);
+  assert.strictEqual(second.state, "landed");
+  assert.ok(second.fact, "the landed fact is recorded this pass");
+  assert.strictEqual(second.restored, true);
+  assert.strictEqual(seen2.facts.length, 1);
+  assert.strictEqual(seen2.restores.length, 1, "restore runs exactly once, only once the resolver actually landed");
+  assert.strictEqual(seen2.restores[0].blockerId, PROPOSAL.blockerId);
+  assert.strictEqual(seen2.restores[0].nodeId, PROPOSAL.nodeId);
+});
+
+// ------------------------------------ GAP 1 — the park() orphan, end to end --
+//
+// issue-spor-integration-park-orphan: parkForReview (bin/spor.js's real
+// makeIntegrationDeps) used to stamp gate_proposal_number/gate_proposal_blocker
+// on the run record ONLY when the tracking-node write itself succeeded. A PR
+// is already open by the time parkForReview runs (deps.propose opened it
+// first) — so a transient failure writing the tracking node permanently
+// orphaned an already-opened PR: checkProposals required BOTH stamped fields
+// to ever look at it again. This drives the REAL bin/spor.js functions
+// (parkForReview via makeIntegrationDeps, and checkProposals) against a
+// scratch graph home and a real run journal — a chmod'd nodes dir stands in
+// for "the graph write transiently failed", exactly as other suites in this
+// repo already simulate a write failure (see agent-dispatch-runner.test.js).
+test("issue-spor-integration-park-orphan: a failed tracking-node write still stamps gate_proposal_number, and a later checkProposals pass heals the tracking item and completes the FULL lifecycle once the PR is merged", async (t) => {
+  if (process.platform === "win32") return; // chmod-based read-only has no meaning there
+  if (process.getuid && process.getuid() === 0) return; // root writes through any permission bits
+
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-park-orphan-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const write = (id, front) => fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\n${front}date: 2026-08-26\n---\n\nBody.\n`);
+  const statusOf = (id) => /^status: (.+)$/m.exec(fs.readFileSync(path.join(nodes, `${id}.md`), "utf8"))[1];
+
+  write("task-proposed", "type: task\ntitle: Add bounded retry\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: open\n");
+
+  const entry = { node_id: "task-proposed", run_id: "11111111-2222-3333-4444-000000000001" };
+  const factory = { id: "factory-demo", integration: { targetRef: "main", mode: "propose", strategy: "merge" } };
+  const proposal = { number: 7, url: "https://github.com/demo/repo/pull/7", repo: "demo/repo", branch: "task-proposed" };
+
+  // The dispatch run record parkForReview stamps onto — created the same way
+  // a real dispatched run's record exists by the time integration runs.
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, entry.run_id).record, {
+    run_id: entry.run_id, node_id: entry.node_id, state: "done", terminal_state: "resolved", terminal_enforced: true,
+  });
+
+  const deps = sporCli.makeIntegrationDeps(cfg, {
+    record: { cwd: home }, entry, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home,
+  });
+  const expectedId = sporCli.proposalTrackingId(entry.node_id, entry.run_id);
+
+  // Force the tracking-node write to genuinely fail — leaving NO file behind
+  // (unlike a same-id content collision, which would leave a real, if wrong,
+  // node standing) — while the run's OWN journal write path is untouched.
+  fs.chmodSync(nodes, 0o500);
+  t.after(() => { try { fs.chmodSync(nodes, 0o700); } catch { /* best-effort */ } });
+  const filed = await deps.parkForReview({ proposal });
+  fs.chmodSync(nodes, 0o700);
+
+  assert.strictEqual(filed.ok, false, "the tracking-node write really failed");
+  assert.strictEqual(filed.id, expectedId, "the deterministic id is reported even on failure");
+  assert.strictEqual(fs.existsSync(path.join(nodes, `${expectedId}.md`)), false, "nothing was actually written — the orphan this bug produces");
+
+  // THE FIX: gate_proposal_number (and the rest) are stamped on the run
+  // record regardless of the write's own outcome.
+  const record = dispatchRuns.readRunRecords(home).find((r) => r.run_id === entry.run_id);
+  assert.strictEqual(record.gate_proposal_number, 7);
+  assert.strictEqual(record.gate_proposal_blocker, expectedId);
+
+  // What the pipeline's caller stamps right after park() settles.
+  dispatchRuns.stampGateState(home, entry.run_id, { gate_state: "parked", gate_at: new Date().toISOString() });
+
+  // A fake `gh` standing in for the real CLI — reports the PR as already
+  // MERGED, so this single checkProposals pass both heals the orphaned
+  // tracking item AND completes its lifecycle, proving the healed item is a
+  // real, usable graph node and not just a discoverability fix.
+  const ghDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-fake-gh-"));
+  const stateFile = path.join(ghDir, "state.json");
+  fs.writeFileSync(stateFile, JSON.stringify({ state: "MERGED", mergedAt: "2026-08-27T00:00:00Z", mergeCommit: { oid: "deadbeefcafe" }, mergedBy: { login: "reviewer" } }));
+  writeFakePathBin(ghDir, "gh", `if [ "$1" = "--version" ]; then echo "gh version 2.0.0"; exit 0; fi\ncat "${stateFile}"\n`);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${ghDir}${path.delimiter}${originalPath}`;
+  t.after(() => { process.env.PATH = originalPath; });
+
+  await sporCli.checkProposals(cfg, { home, log: () => {} });
+
+  assert.strictEqual(fs.existsSync(path.join(nodes, `${expectedId}.md`)), true, "checkProposals healed the missing tracking item");
+  assert.strictEqual(statusOf("task-proposed"), "done", "and the FULL lifecycle converges in the SAME pass: the PR had already merged");
+  assert.strictEqual(statusOf(expectedId), "done", "the healed tracking item is closed too");
+  const facts = fs.readdirSync(nodes).filter((f) => f.startsWith("art-merge-"));
+  assert.strictEqual(facts.length, 1, `expected one integration fact, saw ${fs.readdirSync(nodes)}`);
+  assert.match(fs.readFileSync(path.join(nodes, facts[0]), "utf8"), new RegExp(`- \\{type: resolves, to: ${expectedId}\\}`));
+
+  // A second checkProposals pass is a safe no-op — the tracking item is now
+  // terminal, so it is skipped without spending another `gh` call or trying
+  // to heal an item that already exists with different (now `done`) content.
+  await sporCli.checkProposals(cfg, { home, log: () => {} });
+  assert.strictEqual(statusOf(expectedId), "done");
+  assert.strictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("art-merge-")).length, 1, "no duplicate fact from the second pass");
 });
 
 // ---------------------------------------------------- the git plumbing, for real --

@@ -10300,6 +10300,47 @@ function ghPrStatus({ repo, number }) {
   return { ok: true, state: "closed", merged: false };
 }
 
+// The deterministic id of the tracking item park() files for a propose-mode
+// proposal — pulled out so it can be RECOMPUTED from a run record alone
+// (node_id/run_id are the only inputs), which is what lets checkProposals
+// heal one whose original tracking-node write never landed
+// (issue-spor-integration-park-orphan) without needing the id to have been
+// stamped successfully in the first place.
+function proposalTrackingId(nodeId, runId) {
+  return `task-integration-proposed-${gateStem(nodeId)}-${gateShortRun(runId)}-${gateIdSuffix("integration-park", "integration", nodeId, runId)}`.toLowerCase();
+}
+
+// The tracking item's own content — extracted so parkForReview's first write
+// attempt and checkProposals' healing path (below) build BYTE-IDENTICAL
+// markdown for the same inputs. writeGateNode's same-id dedup rule treats any
+// content difference as a real collision, not a safe idempotent retry, so the
+// two call sites must never drift apart.
+function buildProposalTrackingNode({ id, nodeId, runId, targetRef, proposal, project, date }) {
+  const body = [
+    `The integration stage opened a pull request for ${nodeId} instead of landing it directly — this`,
+    `factory declares \`propose\` mode, which never mutates \`${targetRef}\` itself.`,
+    "",
+    `Pull request: ${proposal.url || (proposal.number ? `#${proposal.number}` : "(unknown)")}`,
+    "",
+    "No worker will re-dispatch this item while this tracking item is open, and none will poll it either —",
+    "the next 'spor work' pass on this box checks the pull request itself and, once it lands, writes the",
+    "landed fact, resolves this item, and restores the work item's own resolution automatically. Nothing",
+    "further is needed here beyond reviewing and merging the pull request on GitHub.",
+    "",
+    `The run's own record is \`${runId}\` ('spor runs ${runId}').`,
+  ].join("\n");
+  return buildGateWorkNode({
+    id,
+    title: `Integration proposed — PR pending review for ${nodeId}`,
+    summary: `The integration stage opened ${proposal.url || `PR #${proposal.number}`} for ${nodeId}; it lands automatically once the PR merges.`,
+    body,
+    project,
+    date,
+    requiresHuman: true,
+    edges: [{ type: "blocks", to: nodeId }],
+  });
+}
+
 // The deps one integration stage runs on — the shell half of
 // integration-runner.js's pure orchestration, mirroring makeGateDeps above.
 // Only ever constructed when `factory.integration` resolved, so a bare
@@ -10370,54 +10411,39 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
     land: (args) => integrationRunner.landCandidate(args),
     propose: ({ head, targetRef }) => proposeIntegrationPR({ top, head, targetRef }),
     parkForReview: async ({ proposal }) => {
-      const id = `task-integration-proposed-${stem}-${short}-${gateIdSuffix("integration-park", "integration", entry.node_id, entry.run_id)}`.toLowerCase();
-      const body = [
-        `The integration stage opened a pull request for ${entry.node_id} instead of landing it directly — this`,
-        `factory declares \`propose\` mode, which never mutates \`${integration.targetRef}\` itself.`,
-        "",
-        `Pull request: ${proposal.url || (proposal.number ? `#${proposal.number}` : "(unknown)")}`,
-        "",
-        "No worker will re-dispatch this item while this tracking item is open, and none will poll it either —",
-        "the next 'spor work' pass on this box checks the pull request itself and, once it lands, writes the",
-        "landed fact, resolves this item, and restores the work item's own resolution automatically. Nothing",
-        "further is needed here beyond reviewing and merging the pull request on GitHub.",
-        "",
-        `The run's own record is \`${entry.run_id}\` ('spor runs ${entry.run_id}').`,
-      ].join("\n");
+      const id = proposalTrackingId(entry.node_id, entry.run_id);
       const written = await writeGateNode(
         cfg,
         id,
-        buildGateWorkNode({
-          id,
-          title: `Integration proposed — PR pending review for ${entry.node_id}`,
-          summary: `The integration stage opened ${proposal.url || `PR #${proposal.number}`} for ${entry.node_id}; it lands automatically once the PR merges.`,
-          body,
-          project: slug,
-          date: date(),
-          requiresHuman: true,
-          edges: [{ type: "blocks", to: entry.node_id }],
-        })
+        buildProposalTrackingNode({ id, nodeId: entry.node_id, runId: entry.run_id, targetRef: integration.targetRef, proposal, project: slug, date: date() })
       );
-      if (written.ok) {
-        // Stamped BEFORE gate_state becomes "parked" (the caller writes that
-        // right after this pipeline settles) — a proposal's own open/landed/
-        // closed lifecycle can never live in a stamp AFTER settlement
-        // (stampGateState refuses to touch a record whose gate_state already
-        // reads a SETTLED_GATE_STATES value), so every field checkProposals
-        // needs later is captured here, in the one window before it does.
-        dispatchRuns.stampGateState(home, entry.run_id, {
-          gate_proposal_number: proposal.number || null,
-          gate_proposal_repo: proposal.repo || null,
-          gate_proposal_url: proposal.url || null,
-          gate_proposal_branch: proposal.branch || null,
-          gate_proposal_target_ref: integration.targetRef,
-          gate_proposal_strategy: integration.strategy,
-          gate_proposal_blocker: id,
-          gate_proposal_project: slug || null,
-          gate_proposal_factory: factory.id || null,
-        });
-      }
-      return written;
+      // Stamped BEFORE gate_state becomes "parked" (the caller writes that
+      // right after this pipeline settles) — a proposal's own open/landed/
+      // closed lifecycle can never live in a stamp AFTER settlement
+      // (stampGateState refuses to touch a record whose gate_state already
+      // reads a SETTLED_GATE_STATES value), so every field checkProposals
+      // needs later is captured here, in the one window before it does.
+      //
+      // Stamped UNCONDITIONALLY — not gated on `written.ok`
+      // (issue-spor-integration-park-orphan). The pull request already exists
+      // by the time this runs (deps.propose already opened it), so
+      // gate_proposal_number is the durable fact "there is a PR to check",
+      // and it must never become unreachable just because the tracking-node
+      // write above hit a transient failure. `id` is deterministic
+      // (proposalTrackingId), so checkProposals can always find/recompute it
+      // and heal a tracking item that never actually landed on the graph.
+      dispatchRuns.stampGateState(home, entry.run_id, {
+        gate_proposal_number: proposal.number || null,
+        gate_proposal_repo: proposal.repo || null,
+        gate_proposal_url: proposal.url || null,
+        gate_proposal_branch: proposal.branch || null,
+        gate_proposal_target_ref: integration.targetRef,
+        gate_proposal_strategy: integration.strategy,
+        gate_proposal_blocker: id,
+        gate_proposal_project: slug || null,
+        gate_proposal_factory: factory.id || null,
+      });
+      return { ...written, id };
     },
     fix,
     recordFact: ({ id, markdown }) => writeGateNode(cfg, id, markdown),
@@ -10555,12 +10581,52 @@ async function restoreProposal(cfg, { blockerId, nodeId }) {
   return promoted;
 }
 
+// issue-spor-integration-park-orphan: parkForReview stamps gate_proposal_*
+// unconditionally once a PR opens (makeIntegrationDeps above), independent of
+// whether the tracking-node write itself landed — so a transient failure
+// there must not permanently orphan an already-opened PR. This is the healing
+// half: recreate the tracking item, byte-for-byte identical to what
+// parkForReview would have written (buildProposalTrackingNode is the SAME
+// builder both call), if it is not already sitting on the graph. Only
+// attempts the write when the node is confirmed ABSENT — never when it
+// merely reads differently than a freshly-built "just opened" node would
+// (e.g. it already progressed to `status: done` via restore()) — a
+// same-id-different-content write in that case would be a real collision,
+// not a heal, and writeGateNode would (correctly) refuse it.
+async function healProposalTracking(cfg, r) {
+  const id = r.gate_proposal_blocker || proposalTrackingId(r.node_id, r.run_id);
+  const existing = await resolveNode(cfg, id);
+  if (existing) return { id, healed: false, ok: true };
+  const proposal = { number: r.gate_proposal_number, url: r.gate_proposal_url };
+  const markdown = buildProposalTrackingNode({
+    id,
+    nodeId: r.node_id,
+    runId: r.run_id,
+    targetRef: r.gate_proposal_target_ref,
+    proposal,
+    project: r.gate_proposal_project || null,
+    date: new Date().toISOString().slice(0, 10),
+  });
+  const written = await writeGateNode(cfg, id, markdown);
+  return { id, healed: !!(written && written.ok), ok: !!(written && written.ok), reason: written && written.reason };
+}
+
 async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {} } = {}) {
-  const records = dispatchRuns.readRunRecords(home).filter((r) => r.gate_state === "parked" && r.gate_proposal_number && r.gate_proposal_blocker);
+  // Requires only gate_proposal_number — NOT gate_proposal_blocker too — so a
+  // proposal whose tracking-node write failed (leaving the blocker field
+  // stamped but the node itself missing, or on an older run record from
+  // before both fields were stamped together) is still discovered rather than
+  // silently skipped forever.
+  const records = dispatchRuns.readRunRecords(home).filter((r) => r.gate_state === "parked" && r.gate_proposal_number);
   for (const r of records) {
+    const healed = await healProposalTracking(cfg, r);
+    if (!healed.ok) {
+      log(`work: the integration proposal tracking item for ${r.node_id} could not be healed (${healed.reason || "no response"}) — will retry next pass`);
+      continue; // no tracking item to check/demote against yet — try again next pass
+    }
     let closed = false;
     try {
-      closed = await blockerAlreadyClosed(cfg, r.gate_proposal_blocker);
+      closed = await blockerAlreadyClosed(cfg, healed.id);
     } catch {
       closed = false; // an unreadable graph is not evidence this is settled
     }
@@ -10575,7 +10641,7 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
       branch: r.gate_proposal_branch,
       targetRef: r.gate_proposal_target_ref,
       strategy: r.gate_proposal_strategy,
-      blockerId: r.gate_proposal_blocker,
+      blockerId: healed.id,
       factory: r.gate_proposal_factory,
     };
     try {
@@ -13352,7 +13418,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, restoreProposal, checkProposals, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive };
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive };
 
 if (require.main === module) {
   main()

@@ -1037,15 +1037,26 @@ refuses to touch a record once its `gate_state` reads a
 the proposal's own separate lifecycle). So every field a later check needs —
 the PR's number/repo/url/branch, and the tracking item's own id — is stamped
 onto the run record ONCE, by `parkForReview`, in the one window before
-settlement closes it. `spor work`'s loop calls a NEW optional per-pass hook,
+settlement closes it. That stamp is UNCONDITIONAL — it happens whether or not
+`parkForReview`'s own tracking-node write actually landed on the graph
+(issue-spor-integration-park-orphan): the pull request already exists by the
+time `parkForReview` runs, so `gate_proposal_number` is the durable fact
+"there is a PR to check," and a transient graph-write failure must never make
+that fact unreachable. `spor work`'s loop calls a NEW optional per-pass hook,
 `deps.checkProposals` (present only under a factory whose integration
 declares `propose` — absent, a bare/local/push factory's loop is
 byte-identical to before this existed), which scans this box's own run
-journal for `gate_state: "parked"` records, skips any whose tracking item is
-no longer pending (`gateApprovalState` reads the GRAPH, not a local flag — the
-one place two machines, or two passes, checking the same PR agree), and for
-the rest calls `gh pr view` through `integration-runner.js`'s pure
-`checkProposal`:
+journal for `gate_state: "parked"` records carrying `gate_proposal_number`
+(not also requiring the tracking-item field, for the same orphan reason),
+HEALS the tracking item first if it is missing (`healProposalTracking`
+recreates it, byte-for-byte identical to what `parkForReview` would have
+written — `buildProposalTrackingNode` is the one builder both call, so the
+two can never drift into a same-id content collision — and only when the node
+is confirmed absent, never merely reading differently because it already
+progressed to `done`), skips any whose tracking item is no longer pending
+(`gateApprovalState` reads the GRAPH, not a local flag — the one place two
+machines, or two passes, checking the same PR agree), and for the rest calls
+`gh pr view` through `integration-runner.js`'s pure `checkProposal`:
 
 - **Still open** — a no-op; nothing is written, nothing checked again until
   the next pass.
@@ -1059,7 +1070,15 @@ the rest calls `gh pr view` through `integration-runner.js`'s pure
   (`gatePromoteItem`, the exact mirror of `gateDemoteItem`: only ever
   restores a status this mechanism could plausibly have rolled back, leaving
   alone a node a person independently moved on from since) and closes the
-  tracking item.
+  tracking item. That restore is GATED on the fact write actually succeeding:
+  task-cc-terminal-status-requires-resolver means the resolver has to exist
+  before the tracking item's own status can validly flip terminal, so if the
+  landed fact could not be recorded, `checkProposal` returns without calling
+  `restore` at all — the tracking item stays open, which is exactly what
+  makes the next `spor work` pass retry it (`blockerAlreadyClosed` keys on the
+  tracking item's own STATUS, never the resolving edge). The fact's id is
+  deterministic, so that retry's write is a safe no-op if it turns out to have
+  landed the first time despite reporting failure.
 - **Closed without merging** — writes a fact recording it, but restores
   nothing and leaves the tracking item open: the PR was rejected on GitHub's
   own review surface, and — same as a `human` gate's own rejected approval —
