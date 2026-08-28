@@ -935,6 +935,49 @@ test("runSupervisorAlive (bin/spor.js's alive() for workLoop.runHarvest): EPERM 
   }
 });
 
+// workerAlive() (bin/spor.js's alive() for `spor work --status`'s
+// readWorkerStatuses) was the last bare-pidAlive()-plus-hand-rolled-ticks-
+// comparison consumer of the same divergence class
+// (task-spor-work-status-workeralive-eperm-liveness) — a worker pid owned by
+// another UID (root-recycled) used to misreport as stale even though the
+// kernel answers EPERM, not ESRCH. Now routed through the shared
+// isSameSupervisor identity check, same as activeRuns/runSupervisorAlive.
+
+test("workerAlive (bin/spor.js's alive() for `spor work --status`): EPERM does not read as dead", () => {
+  const sporjs = require("../bin/spor.js");
+  const originalKill = process.kill;
+  try {
+    process.kill = () => { const err = new Error("no permission"); err.code = "EPERM"; throw err; };
+    assert.strictEqual(sporjs.workerAlive(process.pid, null), true, "EPERM means the pid exists — alive, not dead, same as isSameSupervisor");
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
+test("workerAlive (bin/spor.js's alive() for `spor work --status`): EPERM plus a MISMATCHED kernel start-time is not this worker", () => {
+  if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
+  const sporjs = require("../bin/spor.js");
+  const startTicks = runner.processStartTicks(process.pid);
+  assert.ok(Number.isFinite(startTicks), "the test process itself must yield a real tick count on this platform");
+  const originalKill = process.kill;
+  try {
+    process.kill = () => { const err = new Error("no permission"); err.code = "EPERM"; throw err; };
+    assert.strictEqual(sporjs.workerAlive(process.pid, startTicks + 999999), false, "a confirmed identity mismatch is a reused pid regardless of EPERM");
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
+test("workerAlive (bin/spor.js's alive() for `spor work --status`): a live pid with no recorded ticks (older record) still reads alive — identity-unknown falls back to the pid probe, not to dead", () => {
+  const sporjs = require("../bin/spor.js");
+  assert.strictEqual(sporjs.workerAlive(process.pid, null), true);
+});
+
+test("workerAlive (bin/spor.js's alive() for `spor work --status`): a genuinely dead pid reads dead", () => {
+  const sporjs = require("../bin/spor.js");
+  assert.strictEqual(sporjs.workerAlive(999999999, null), false); // guaranteed-dead pid
+});
+
 // terminalOutcomeBackfill used to hold off repair on `isSameSupervisor(...)
 // .reallyAlive` alone, with no fallback for the identity-UNKNOWN case (no
 // recorded `runner_started_ticks` — an older record, or a non-Linux host):

@@ -9296,11 +9296,17 @@ async function dispatchThroughLocked(cfg, values, positionals = []) {
 // is deliberately not doing. Reads the machine-local records only — never the
 // graph, never the network.
 // A worker process is only THIS worker if the pid is alive AND was started at
-// the same moment — the run store's pid-reuse guard, applied to worker records.
+// the same moment — the run store's pid-reuse guard, applied to worker
+// records. Routed through the shared, EPERM-tolerant isSameSupervisor rather
+// than bare pidAlive() plus a hand-rolled ticks comparison — the same
+// divergence class already unified for activeRuns/runHarvest
+// (issue-spor-dispatch-supervisor-liveness-check-divergence): a worker pid
+// owned by another UID (root-recycled) used to misreport as stale here, and
+// the identity fallback for a ticks-less record ("no stamp: the pid probe is
+// all there is") is exactly `isSameSupervisor`'s own identityKnown=false
+// behavior, so no separate ticks branch is needed.
 function workerAlive(pid, ticks) {
-  if (!dispatchRuns.pidAlive(pid)) return false;
-  if (ticks == null) return true; // an older record with no identity stamp: the pid probe is all there is
-  return dispatchRuns.processStartTicks(pid) === ticks;
+  return dispatchRuns.isSameSupervisor(pid, ticks).reallyAlive;
 }
 
 function cmdWorkStatus(cfg, { json }) {
@@ -12793,7 +12799,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, setStatusLocal, makeGateDeps, runSupervisorAlive };
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, setStatusLocal, makeGateDeps, runSupervisorAlive, workerAlive };
 
 if (require.main === module) {
   main()
