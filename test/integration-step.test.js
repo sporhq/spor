@@ -30,7 +30,7 @@ const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const gates = require("../lib/kernel/gates.js");
 const integrationRunner = require("../lib/shell/integration-runner.js");
 const gateRunner = require("../lib/shell/gate-runner.js");
-const { writeSpawnableNodeStub, pathWithOnlyGitAndNode, writeFakePathBin } = require("./helpers/portable");
+const { writeSpawnableNodeStub, pathWithOnlyGitAndNode, writeFakePathBin, pathWithOnlyGit } = require("./helpers/portable");
 
 // ---------------------------------------------------------------- parsing --
 
@@ -348,6 +348,122 @@ test("propose failing to open a PR routes through the fix-cycle cap, then FAILS 
   assert.strictEqual(seen.parks.length, 0, "a proposal that never opened is not parked");
 });
 
+// ------------------------- proposeIntegrationPR: reuse keys on (head, base) --
+//
+// task-spor-integration-propose-mode base-check gap (cross-model review):
+// proposeIntegrationPR used to look up an existing PR by BRANCH NAME alone
+// (`gh pr view <branch>`), so a stale or coincidentally same-named open PR to
+// a DIFFERENT base could be adopted — and checkProposal would later trust
+// GitHub's own merged/closed report by PR number alone, with no base
+// cross-check, potentially resolving the work item as "landed on targetRef"
+// when the change never reached it. These drive the REAL bin/spor.js
+// `proposeIntegrationPR` against a real throwaway git repo, with `gh` faked
+// via the same writeFakePathBin fixture pattern the park-orphan test above
+// uses, and `git push` short-circuited (there is no real GitHub to push to)
+// while every other git command still runs for real.
+function proposeRepo(branchName) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-propose-repo-"));
+  execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
+  git(dir, "config", "user.email", "t@t");
+  git(dir, "config", "user.name", "Test");
+  fs.writeFileSync(path.join(dir, "f.txt"), "base\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "base");
+  git(dir, "remote", "add", "origin", "https://github.com/demo/repo.git");
+  git(dir, "checkout", "-q", "-b", branchName);
+  fs.writeFileSync(path.join(dir, "f.txt"), "base\nbranch work\n");
+  git(dir, "commit", "-qam", "branch work");
+  return dir;
+}
+
+// A fake bin dir shadowing both `git` (real, except `push` is short-circuited
+// to a no-op success — nothing here actually reaches GitHub) and `gh` (fully
+// faked per-test via `listJson`/`create`). Every invocation of either is
+// appended to a shared calls log so a test can assert what was (or was NOT)
+// asked for, not just the final return value.
+function proposeFakeBin({ listJson, createOut = "https://github.com/demo/repo/pull/99\n", createRefused = null }) {
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-propose-bin-"));
+  const callsFile = path.join(binDir, "calls.log");
+  const realGit = path.join(pathWithOnlyGit(), "git");
+  writeFakePathBin(binDir, "git", `echo "git $*" >> "${callsFile}"\nif [ "$1" = "push" ]; then exit 0; fi\nexec "${realGit}" "$@"\n`);
+  writeFakePathBin(
+    binDir,
+    "gh",
+    [
+      `echo "gh $*" >> "${callsFile}"`,
+      `if [ "$1" = "--version" ]; then echo "gh version 2.0.0"; exit 0; fi`,
+      `if [ "$1" = "pr" ] && [ "$2" = "list" ]; then printf '%s' '${listJson}'; exit 0; fi`,
+      createRefused
+        ? `if [ "$1" = "pr" ] && [ "$2" = "create" ]; then echo "${createRefused}" >&2; exit 1; fi`
+        : `if [ "$1" = "pr" ] && [ "$2" = "create" ]; then printf '%s' '${createOut}'; exit 0; fi`,
+      `echo "unexpected gh invocation: $*" >&2`,
+      `exit 1`,
+    ].join("\n")
+  );
+  return { binDir, callsFile };
+}
+
+function withFakeBin(binDir, fn) {
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${binDir}${path.delimiter}${originalPath}`;
+  try {
+    return fn();
+  } finally {
+    process.env.PATH = originalPath;
+  }
+}
+
+test("proposeIntegrationPR: reuse keys on the (head, base) PAIR — an open same-head PR to a DIFFERENT base is ignored, and a fresh PR is opened against targetRef", () => {
+  const sporCli = require("../bin/spor.js");
+  const dir = proposeRepo("task-demo-a");
+  const head = git(dir, "rev-parse", "HEAD").trim();
+  // A same-head PR is open, but onto `release` — someone else's proposal
+  // (or a stale one from a prior targetRef), never the target of THIS run.
+  const listJson = JSON.stringify([{ number: 11, url: "https://github.com/demo/repo/pull/11", state: "OPEN", baseRefName: "release" }]);
+  const { binDir, callsFile } = proposeFakeBin({ listJson });
+
+  const res = withFakeBin(binDir, () => sporCli.proposeIntegrationPR({ top: dir, head, targetRef: "main" }));
+
+  assert.strictEqual(res.ok, true, res.reason);
+  assert.strictEqual(res.number, 99, "the different-base PR (#11) is NEVER adopted — a fresh PR is opened instead");
+  assert.match(res.url, /\/pull\/99$/);
+  assert.strictEqual(res.branch, "task-demo-a");
+  const calls = fs.readFileSync(callsFile, "utf8");
+  assert.match(calls, /gh pr list .*--head task-demo-a --base main /, "the lookup is keyed on the (head, base) pair, not head alone");
+  assert.match(calls, /gh pr create .*--base main --head task-demo-a/, "the fresh PR targets the real targetRef");
+});
+
+test("proposeIntegrationPR: an open PR whose base already matches targetRef is adopted — no new PR is created", () => {
+  const sporCli = require("../bin/spor.js");
+  const dir = proposeRepo("task-demo-b");
+  const head = git(dir, "rev-parse", "HEAD").trim();
+  const listJson = JSON.stringify([{ number: 11, url: "https://github.com/demo/repo/pull/11", state: "OPEN", baseRefName: "main" }]);
+  const { binDir, callsFile } = proposeFakeBin({ listJson, createRefused: "pr create should not have been called — a matching-base PR was already open" });
+
+  const res = withFakeBin(binDir, () => sporCli.proposeIntegrationPR({ top: dir, head, targetRef: "main" }));
+
+  assert.strictEqual(res.ok, true, res.reason);
+  assert.strictEqual(res.number, 11, "the matching-base PR is adopted");
+  assert.match(res.detail, /already open/);
+  const calls = fs.readFileSync(callsFile, "utf8");
+  assert.doesNotMatch(calls, /gh pr create/, "no new PR is opened when an existing one already targets targetRef");
+});
+
+test("proposeIntegrationPR: gh's own exact-duplicate refusal on create surfaces verbatim as the stage failure", () => {
+  const sporCli = require("../bin/spor.js");
+  const dir = proposeRepo("task-demo-c");
+  const head = git(dir, "rev-parse", "HEAD").trim();
+  // No open PR at this (head, base) pair is found (e.g. it is not OPEN
+  // anymore from gh's point of view), but gh still refuses to create —
+  // exactly gh's real behavior for an exact head+base duplicate.
+  const { binDir } = proposeFakeBin({ listJson: "[]", createRefused: "GraphQL: A pull request already exists for demo:task-demo-c." });
+
+  const res = withFakeBin(binDir, () => sporCli.proposeIntegrationPR({ top: dir, head, targetRef: "main" }));
+
+  assert.strictEqual(res.ok, false);
+  assert.match(res.reason, /A pull request already exists for demo:task-demo-c\./);
+});
+
 // --------------------------------------- checkProposal — the LATER half, once a PR settles --
 
 function checkProposalFakes({ prStatus = () => ({ ok: true, state: "open" }), recordFact = () => ({ ok: true }), restore = () => ({ ok: true, restored: true, note: "task-demo restored open -> done" }) } = {}) {
@@ -378,7 +494,7 @@ test("checkProposal: the PR is still open — no-op, nothing is written, nothing
 });
 
 test("checkProposal: the PR MERGED — writes a landed fact that RESOLVES the tracking item, and restores the work item's own resolution", async () => {
-  const { deps, seen } = checkProposalFakes({ prStatus: () => ({ ok: true, state: "closed", merged: true, mergeCommitSha: "deadbeef1234", mergedBy: "reviewer" }) });
+  const { deps, seen } = checkProposalFakes({ prStatus: () => ({ ok: true, state: "closed", merged: true, mergeCommitSha: "deadbeef1234", mergedBy: "reviewer", baseRefName: "main" }) });
   const res = await integrationRunner.checkProposal(PROPOSAL, { deps });
   assert.strictEqual(res.settled, true);
   assert.strictEqual(res.state, "landed");
@@ -410,6 +526,34 @@ test("checkProposal: an unreadable PR status is reported, not treated as settled
   assert.match(res.reason, /rate limited/);
 });
 
+// task-spor-integration-propose-mode base-check gap (cross-model review): a
+// merged PR is keyed by NUMBER alone in GitHub's own report — it says nothing
+// about which base it merged onto. A retargeted (or coincidentally reused)
+// PR number reporting "merged" onto a base OTHER than this proposal's
+// targetRef must never resolve/restore the work item: the change never
+// reached targetRef, so falsely closing the tracking item would report work
+// as landed when it was not. Same fail-safe direction as GAP 2 below — stay
+// parked, never falsely resolve.
+test("checkProposal: a MERGED PR whose base does not match targetRef does NOT restore/resolve — stays parked with a base-mismatch note", async () => {
+  const { deps, seen } = checkProposalFakes({
+    prStatus: () => ({ ok: true, state: "closed", merged: true, mergeCommitSha: "deadbeef1234", mergedBy: "reviewer", baseRefName: "release" }),
+  });
+  const res = await integrationRunner.checkProposal(PROPOSAL, { deps });
+  assert.strictEqual(res.checked, true);
+  assert.strictEqual(res.settled, false, "a base mismatch is never a settled outcome — it needs a person");
+  assert.strictEqual(res.state, "base-mismatch");
+  assert.strictEqual(res.baseRefName, "release");
+  assert.strictEqual(res.expectedBase, "main");
+  assert.strictEqual(seen.restores.length, 0, "restore must NEVER be called on a base mismatch");
+  assert.strictEqual(seen.facts.length, 1, "a loud note is still recorded so a person or later pass can intervene");
+  assert.ok(res.fact, "the mismatch fact id is reported");
+  assert.match(seen.facts[0].markdown, /- \{type: relates-to, to: task-integration-proposed-x\}/, "a base mismatch only RELATES to the tracking item — it never resolves it");
+  assert.doesNotMatch(seen.facts[0].markdown, /type: resolves/);
+  assert.match(seen.facts[0].markdown, /PR #42/);
+  assert.match(seen.facts[0].markdown, /`release`/, "the actual (wrong) base is named");
+  assert.match(seen.facts[0].markdown, /`main`/, "the expected targetRef is named");
+});
+
 // GAP 2 (cross-model review at the merge gate): the landed fact IS the
 // resolver — it carries the `resolves` edge onto the tracking item — so
 // task-cc-terminal-status-requires-resolver means `restore` must never run
@@ -420,7 +564,7 @@ test("checkProposal: an unreadable PR status is reported, not treated as settled
 // convergence once recordFact stops failing.
 test("checkProposal: a MERGED PR whose landed fact fails to record does NOT call restore this pass — it leaves the proposal parked for a retry", async () => {
   const { deps, seen } = checkProposalFakes({
-    prStatus: () => ({ ok: true, state: "closed", merged: true, mergeCommitSha: "deadbeef1234", mergedBy: "reviewer" }),
+    prStatus: () => ({ ok: true, state: "closed", merged: true, mergeCommitSha: "deadbeef1234", mergedBy: "reviewer", baseRefName: "main" }),
     recordFact: () => ({ ok: false, reason: "graph offline" }),
   });
   const res = await integrationRunner.checkProposal(PROPOSAL, { deps });
@@ -437,7 +581,7 @@ test("checkProposal: a MERGED PR whose landed fact fails to record does NOT call
 test("checkProposal: a MERGED PR whose recordFact fails ONCE converges on the next pass once recordFact succeeds — record-then-restore completes", async () => {
   // Pass 1: recordFact fails, exactly like the test above.
   const { deps: deps1, seen: seen1 } = checkProposalFakes({
-    prStatus: () => ({ ok: true, state: "closed", merged: true, mergeCommitSha: "deadbeef1234", mergedBy: "reviewer" }),
+    prStatus: () => ({ ok: true, state: "closed", merged: true, mergeCommitSha: "deadbeef1234", mergedBy: "reviewer", baseRefName: "main" }),
     recordFact: () => ({ ok: false, reason: "graph offline" }),
   });
   const first = await integrationRunner.checkProposal(PROPOSAL, { deps: deps1 });
@@ -449,7 +593,7 @@ test("checkProposal: a MERGED PR whose recordFact fails ONCE converges on the ne
   // touched): recordFact now succeeds, so this pass both records the fact
   // AND restores — nothing was left half-done by the failed first attempt.
   const { deps: deps2, seen: seen2 } = checkProposalFakes({
-    prStatus: () => ({ ok: true, state: "closed", merged: true, mergeCommitSha: "deadbeef1234", mergedBy: "reviewer" }),
+    prStatus: () => ({ ok: true, state: "closed", merged: true, mergeCommitSha: "deadbeef1234", mergedBy: "reviewer", baseRefName: "main" }),
   });
   const second = await integrationRunner.checkProposal(PROPOSAL, { deps: deps2 });
   assert.strictEqual(second.checked, true);
@@ -535,7 +679,7 @@ test("issue-spor-integration-park-orphan: a failed tracking-node write still sta
   // real, usable graph node and not just a discoverability fix.
   const ghDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-fake-gh-"));
   const stateFile = path.join(ghDir, "state.json");
-  fs.writeFileSync(stateFile, JSON.stringify({ state: "MERGED", mergedAt: "2026-08-27T00:00:00Z", mergeCommit: { oid: "deadbeefcafe" }, mergedBy: { login: "reviewer" } }));
+  fs.writeFileSync(stateFile, JSON.stringify({ state: "MERGED", mergedAt: "2026-08-27T00:00:00Z", mergeCommit: { oid: "deadbeefcafe" }, mergedBy: { login: "reviewer" }, baseRefName: "main" }));
   writeFakePathBin(ghDir, "gh", `if [ "$1" = "--version" ]; then echo "gh version 2.0.0"; exit 0; fi\ncat "${stateFile}"\n`);
   const originalPath = process.env.PATH;
   process.env.PATH = `${ghDir}${path.delimiter}${originalPath}`;

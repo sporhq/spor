@@ -10247,11 +10247,27 @@ function proposeIntegrationPR({ top, head, targetRef }) {
     return { ok: false, reason: (push.stderr || "").trim().split("\n").filter(Boolean).pop() || "git push failed" };
   }
 
-  const existing = runGh(["pr", "view", branchName, "--repo", repo, "--json", "number,url,state"], { cwd: top });
+  // Reuse keys on the (head, base) PAIR, never branch name alone
+  // (task-spor-integration-propose-mode base-check gap): a same-named branch
+  // can carry an open PR to a DIFFERENT base — a stale proposal left over
+  // from a prior targetRef, or someone else's PR against the same branch
+  // name. Adopting that one would hand checkProposal a PR whose merge (if it
+  // ever happens) never reaches THIS run's actual targetRef. `gh pr list
+  // --base` already filters server-side to the exact pair; the `baseRefName`
+  // equality check below is defense in depth against a `gh` version or test
+  // fixture that doesn't filter. A same-head PR to a different base is left
+  // untouched (not closed, not superseded — it is someone else's PR) and a
+  // fresh PR is opened against targetRef instead; GitHub allows one PR per
+  // (head, base) pair, so this never collides with the ignored PR.
+  const existing = runGh(
+    ["pr", "list", "--repo", repo, "--head", branchName, "--base", baseBranch, "--state", "open", "--json", "number,url,state,baseRefName"],
+    { cwd: top }
+  );
   if (existing.status === 0 && existing.stdout) {
     try {
-      const j = JSON.parse(existing.stdout);
-      if (j && j.number && String(j.state || "").toUpperCase() === "OPEN") {
+      const list = JSON.parse(existing.stdout);
+      const j = Array.isArray(list) ? list[0] : null;
+      if (j && j.number && String(j.state || "").toUpperCase() === "OPEN" && j.baseRefName === baseBranch) {
         return { ok: true, number: j.number, url: j.url, repo, branch: branchName, targetRef, detail: `PR #${j.number} already open (${j.url}) — updated with ${head.slice(0, 8)}` };
       }
     } catch {
@@ -10277,14 +10293,19 @@ function proposeIntegrationPR({ top, head, targetRef }) {
 }
 
 // The PR's current state, for checkProposals below — {ok, state: "open" |
-// "closed", merged, mergeCommitSha, mergedBy} | {ok:false, reason}. GitHub's
-// own three-way state (OPEN/CLOSED/MERGED) collapses to a boolean here: a
-// merge IS a closure, and `checkProposal` (integration-runner.js) only ever
-// asks "still open, or closed — and if closed, how".
+// "closed", merged, mergeCommitSha, mergedBy, baseRefName} | {ok:false,
+// reason}. GitHub's own three-way state (OPEN/CLOSED/MERGED) collapses to a
+// boolean here: a merge IS a closure, and `checkProposal` (integration-
+// runner.js) only ever asks "still open, or closed — and if closed, how".
+// `baseRefName` is reported unconditionally (not just when merged) so
+// checkProposal can cross-check it against the proposal's own targetRef
+// before ever treating a merge as landing there — GitHub's merged/closed
+// report is keyed by PR NUMBER alone and says nothing about which base it
+// actually merged onto (task-spor-integration-propose-mode base-check gap).
 function ghPrStatus({ repo, number }) {
   if (!hasCmd("gh")) return { ok: false, reason: "the 'gh' CLI is not on PATH" };
   if (!repo || !number) return { ok: false, reason: "no pull request repo/number recorded for this proposal" };
-  const r = runGh(["pr", "view", String(number), "--repo", repo, "--json", "state,mergedAt,mergeCommit,mergedBy"]);
+  const r = runGh(["pr", "view", String(number), "--repo", repo, "--json", "state,mergedAt,mergeCommit,mergedBy,baseRefName"]);
   if (r.status !== 0) return { ok: false, reason: (r.stderr || r.stdout || "gh pr view failed").trim().split("\n").filter(Boolean).pop() || "gh pr view failed" };
   let j = null;
   try {
@@ -10293,11 +10314,19 @@ function ghPrStatus({ repo, number }) {
     return { ok: false, reason: "gh pr view returned unparseable JSON" };
   }
   const state = String((j && j.state) || "").toUpperCase();
-  if (state === "OPEN") return { ok: true, state: "open" };
+  const baseRefName = (j && j.baseRefName) || null;
+  if (state === "OPEN") return { ok: true, state: "open", baseRefName };
   if (state === "MERGED") {
-    return { ok: true, state: "closed", merged: true, mergeCommitSha: (j.mergeCommit && j.mergeCommit.oid) || null, mergedBy: (j.mergedBy && j.mergedBy.login) || null };
+    return {
+      ok: true,
+      state: "closed",
+      merged: true,
+      mergeCommitSha: (j.mergeCommit && j.mergeCommit.oid) || null,
+      mergedBy: (j.mergedBy && j.mergedBy.login) || null,
+      baseRefName,
+    };
   }
-  return { ok: true, state: "closed", merged: false };
+  return { ok: true, state: "closed", merged: false, baseRefName };
 }
 
 // The deterministic id of the tracking item park() files for a propose-mode
@@ -13418,7 +13447,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive };
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, proposeIntegrationPR, ghPrStatus };
 
 if (require.main === module) {
   main()
