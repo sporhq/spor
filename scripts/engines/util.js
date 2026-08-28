@@ -1203,6 +1203,11 @@ function probeCapabilities(graphHomeDir, opts) {
   // `opts.cfg` is the caller's resolved cascade — see probeHarnesses.
   const probed = { harnesses: probeHarnesses(opts && opts.cfg), plugins: ps.plugins, skills: ps.skills };
   if (opts && opts.sporReachable) probed.reachable_mcp = [SPOR_MCP_NAME];
+  // gh — the v1 backend a propose-mode factory's integration stage needs to
+  // open pull requests (task-spor-propose-gh-capability-satisfiability). A
+  // plain PATH stat, same cost class as the harness probe above (no spawn),
+  // so it is always cheap enough for this fail-open session-start path.
+  probed.gh = whichSync("gh") != null;
   editCapabilities(graphHomeDir, (cap) => {
     if (JSON.stringify(cap.probed || null) === JSON.stringify(probed)) return false;
     cap.probed = probed;

@@ -1101,13 +1101,13 @@ test('session-start (remote): auto-publishes this box capabilities when a dispat
     const post = hits.find((h) => h.method === 'POST' && h.url === '/v1/agents/agent-anthony-laptop/capabilities');
     assert.ok(post, `auto-published caps; hits: ${JSON.stringify(hits.map((h) => `${h.method} ${h.url}`))}`);
     assert.strictEqual(post.auth, 'Bearer spor_pat_test');
-    // the body is the EFFECTIVE collapse — the five axes, same shape `spor
-    // capabilities publish` sends. harnesses/plugins/skills are machine-specific
-    // (PATH + ~/.claude), so we pin the shape and the one DETERMINISTIC axis:
-    // reachable_mcp carries the remote-mode `spor` seed
-    // (task-spor-mcp-reachability-deterministic-seed).
+    // the body is the EFFECTIVE collapse — the four CAP_AXES sets plus `deny`
+    // and the boolean `gh` fact, same shape `spor capabilities publish` sends.
+    // harnesses/plugins/skills/gh are machine-specific (PATH + ~/.claude), so
+    // we pin the shape and the one DETERMINISTIC axis: reachable_mcp carries
+    // the remote-mode `spor` seed (task-spor-mcp-reachability-deterministic-seed).
     const body = JSON.parse(post.body);
-    assert.deepStrictEqual(Object.keys(body).sort(), ['deny', 'harnesses', 'plugins', 'reachable_mcp', 'skills']);
+    assert.deepStrictEqual(Object.keys(body).sort(), ['deny', 'gh', 'harnesses', 'plugins', 'reachable_mcp', 'skills']);
     assert.ok(body.reachable_mcp.includes('spor'), `reachable_mcp seeded with spor: ${JSON.stringify(body)}`);
     const log = fs.readFileSync(path.join(home, 'journal', 'remote.log'), 'utf8');
     assert.match(log, /capabilities published for agent-anthony-laptop/);
