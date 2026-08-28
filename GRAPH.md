@@ -449,11 +449,17 @@ from, the protected test paths that fail a gate CLOSED, the separate
 test-change lane those route to, and the named risk classes a human gate keys
 on. A `type: gate` node is ONE such gate standing alone, so an org vets a
 `gate-security-review` once and every factory references it by id — inline and
-referenced gates are the same object to the runner. Both are `capturable:
-false` (the distiller never drafts one: a factory changes what a worker will
-accept, so it is written deliberately) and both arrive by adoption rather than
-in the seed, for the same reason. WORKERS.md §10 documents the runtime
-contract; the payload keys are documented on the candidate nodes themselves.
+referenced gates are the same object to the runner. The same payload may also
+declare an optional `integration` block — the merge-queue landing stage that
+runs once every gate has passed (dec-spor-factory-integration-step): it is
+deliberately NOT a fourth gate kind (a gate judges the branch; integration
+mutates the target ref and serializes across workers), so it is its own key
+beside `gates`, parsed the same fail-closed way. Both `gate` and `factory` are
+`capturable: false` (the distiller never drafts one: a factory changes what a
+worker will accept, so it is written deliberately) and both arrive by adoption
+rather than in the seed, for the same reason. WORKERS.md §10 documents the
+runtime contract; the payload keys are documented on the candidate nodes
+themselves.
 
 A complete worked example — a `escalation` type with a required `severity`
 field (enforced in `validate`) and an `open → mitigated → closed` status machine

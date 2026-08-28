@@ -657,7 +657,41 @@ that to the stale worker status files and re-gates the orphans before taking new
 work — DEFERRING any whose node still has a live run, since a resumed pipeline
 re-runs from gate 0 and its fix cycle would put a second agent in one checkout.
 WORKERS.md §10 is the contract; see test/gates.test.js +
-test/gate-pipeline.test.js. Server-side ops vars
+test/gate-pipeline.test.js.
+**The integration step (task-spor-factory-integration-step, WORKERS.md §10.9,
+dec-spor-factory-integration-step):** a factory's optional `integration:` block
+is the merge-queue landing stage `spor work` runs after every declared gate has
+passed — deliberately NOT a fourth gate kind (a gate judges the branch;
+integration mutates the target ref and serializes across workers), so it is
+parsed beside `gates` in `lib/kernel/gates.js` (`parseIntegration`) and enforced
+by `lib/shell/integration-runner.js` (`runIntegrationStage`), folded into the
+SAME `deps.gate` promise the gate pipeline already returns (`bin/spor.js`
+`runGateAndIntegration`) so the loop's slot-holding/cooldown/resume machinery
+needs no changes and a factory declaring no integration block is
+byte-identical to before this stage existed. It builds a throwaway candidate
+worktree at `merge(target_ref, branch)` per the declared `strategy`
+(merge/squash/rebase), forces every declared protected path back to the
+trusted ref's copy in that candidate tree (the SAME guarantee and matcher a
+command gate's tree gets, `gate-runner.js`'s shared `forceProtectedPaths`),
+runs the full declared suite there, and lands via compare-and-swap — local
+mode is `git update-ref target new old`, push mode is a `git push` whose own
+non-fast-forward rejection IS the CAS. A merge conflict or a candidate-suite
+failure is a FIX-CYCLE event, routed through the exact cycle-cap ->
+human-escalation machinery a failing gate already uses; a LOST CAS race
+rebuilds the candidate against the ref's new tip and retries automatically,
+bounded separately (`RACE_RETRY_CAP`) and never charged against the fix-cycle
+cap, since losing a race is nobody's mistake. The `serialize: repo` lease that
+makes the race rare rather than load-bearing is best-effort and fail-open:
+remote mode reuses the SAME server-held claim/lease door dispatch uses
+(`claimDispatch`) against a synthetic per-repo lock node; local mode falls
+back to a machine-local lockfile (dec-cc-task-claim-lease "Local mode" has no
+server pool to lean on there). `mode: propose` (an opened PR) is parsed and
+validated but explicitly refuses to load in v1 — too large a surface for this
+pass; `mode: local` and `mode: push` are the full v1 scope. Every landing or
+failure is an idempotent `art-merge-…` graph fact, the integration stage's
+twin of a gate's `art-gate-…` fact; a failure demotes the item exactly as a
+failed gate does (§10.7). See test/integration-step.test.js.
+Server-side ops vars
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard
 (`SPOR_DISTILLING`) are deliberately NOT config — they stay pure env.

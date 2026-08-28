@@ -2,13 +2,14 @@
 id: schema-factory
 type: schema
 kind: node-schema
-schema_version: 2026.08.26.1
+schema_version: 2026.08.28.1
 title: Software-factory definition
-summary: A factory definition — the ordered gate list a worker enforces between claim and resolve, plus the trusted ref, protected test paths, test-change lane and risk classes those gates key on. Candidate pack; adopt it into a graph to use `spor work --factory`.
+summary: A factory definition — the ordered gate list a worker enforces between claim and resolve, plus the trusted ref, protected test paths, test-change lane, risk classes those gates key on, and an optional integration (merge-queue landing) stage. Candidate pack; adopt it into a graph to use `spor work --factory`.
 date: 2026-08-26
 edges:
   - {type: derived-from, to: dec-spor-software-factory-substrate}
   - {type: relates-to, to: task-spor-work-gate-pipeline}
+  - {type: derived-from, to: dec-spor-factory-integration-step}
 ---
 
 A `factory` node is a team's bespoke factory as DATA (dec-spor-software-factory-

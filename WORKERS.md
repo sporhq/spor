@@ -840,3 +840,121 @@ from every worker's candidate poll, so a second worker does not *dispatch* the
 node a first is gating (a gated run is terminal, so the in-flight agent guard
 cannot see it, and an unenforced `reported` one has already handed its lease
 back).
+
+### 10.9 The integration step — a code-enforced merge queue after every gate passes
+
+Every gate above judges the implementer's **branch**. Something still has to
+land it: dec-spor-factory-integration-step is the observation that a resolved,
+gate-passed branch is not the same thing as shipped work, and that the
+"someone runs the CAS merge by hand" step the spor-orchestrator skill performs
+today is the last *instructed, not enforced* link in the factory line. The
+`integration:` block closes it — a declarative merge queue the runner enforces
+in code, never a prompt asking an agent to "merge when ready."
+
+It is OPT-IN, exactly like the gate list: a factory that declares no
+`integration:` block resolves work exactly as §10.1-§10.8 describe — there is
+no adoption cliff here either. Declare one and it becomes the pipeline's LAST
+stage, run only after every declared gate has passed:
+
+```json
+{
+  "integration": {
+    "target_ref": "main",
+    "mode": "local",
+    "command": "npm test",
+    "strategy": "merge",
+    "serialize": "repo"
+  }
+}
+```
+
+- **`target_ref`** — what "landed" means; defaults to the factory's own
+  `trusted_ref`.
+- **`mode`** — `local` CAS's a local ref with `git update-ref`; `push` pushes
+  to a remote, whose own non-fast-forward rejection *is* the compare-and-swap.
+  `mode: propose` (an opened PR, composed with a `human` gate) is parsed and
+  validated but explicitly refuses to load in v1 — a factory that declares it
+  gets a load-time error naming exactly that, the same register as every other
+  authoring mistake in §10.1, not a silent no-op.
+- **`command`** — the FULL suite, run on the merged CANDIDATE tree, never a
+  "fast tier" deferred to a service after landing (the run's own agent context
+  is what fixes a break, and it is only still around *before* the merge).
+- **`strategy`** — `merge` | `squash` | `rebase`, how the candidate tree is
+  built.
+- **`serialize`** — the lease's scope; `repo` is the only value today (the
+  merge queue is per-repo, not per-machine or per-org).
+
+**The run holds its slot through integration.** The runner folds the
+integration stage into the SAME promise `deps.gate` already returns (§10.2), so
+every mechanic §10.2-§10.8 already describes — slot-holding, candidate
+exclusion, cooldown on a refusal, resumption of an abandoned pipeline — applies
+to integration with no separate machinery and no separate code path in the
+loop itself. A factory with gates but no integration block is byte-identical
+to what shipped before this stage existed.
+
+**The candidate build.** A throwaway worktree at `merge(target_ref, branch)`
+per the declared strategy — `merge` lands the branch onto the target,
+`rebase` replays the branch's own commits onto it, `squash` folds the branch
+into one commit on top of it. **A merge conflict is a fix-cycle event, not a
+terminal error** — it is fed back to the same implementer, through the same
+cycle-cap-then-escalate machinery §10.3's protected-path lane and §10.4's
+review loop already use, because "the branch needs a rebase" is exactly the
+kind of thing the implementer's own context is best placed to fix.
+
+**Protected paths are forced, again.** The candidate tree gets the SAME
+guarantee a command gate's tree gets (§10.3): every declared `protected_paths`
+glob is forced back to the trusted ref's own copy before the suite runs, using
+the identical matcher (`forceProtectedPaths`, shared by both). A command gate
+already fails an implementer's protected-path edit CLOSED at claim time, so in
+the ordinary case this is a no-op restoring what was never touched — the point
+is that the guarantee does not rest on that earlier check having run.
+
+**The candidate suite runs on the merged tree**, full, every landing — never a
+slow tier skipped here and deferred to a service after the merge (the
+"replace your CI" observation dec-spor-factory-integration-step is built on: by
+the time a post-merge check reports, the agent that could fix it is gone). A
+failure is fed into the same fix-cycle machinery a conflict is.
+
+**Landing is compare-and-swap**, and losing the race is nobody's mistake. Local
+mode's `git update-ref target_ref new_sha old_sha` refuses if the ref moved
+since the candidate was built; push mode's rejection of a non-fast-forward push
+is the same guarantee over a remote ref. Either way, a **lost race rebuilds the
+candidate against the ref's new tip and reruns** — automatically, bounded by a
+small retry ceiling against the pathological case of a target that never stops
+moving, and *never* charged against the fix-cycle cap: the implementer did
+nothing wrong, another landing simply won first. This is what makes the
+`serialize: repo` lease an optimization rather than a correctness requirement
+— N workers on M machines racing the SAME target ref is made *rare* by the
+lease (a server-held claim in remote mode, reusing dec-cc-task-claim-lease's
+own door against a synthetic per-repo lock node; a machine-local lockfile,
+scoped to the repo's own path, when there is no server to hold one against —
+local mode has no lease pool at all, per §"Local mode" in
+dec-cc-task-claim-lease) and made *harmless* by the CAS regardless. Every
+failure acquiring the lease is fail-open: a note is logged and the stage
+proceeds without one, the same posture every other best-effort dep in this
+pipeline takes.
+
+**Every landing or failure is a graph fact** (`art-merge-…`), the integration
+stage's twin of §10.6's `art-gate-…` facts — same idempotent id scheme, same
+`relates-to` (never `resolves`) edge onto the work item. A failure that
+exhausts its fix cycles **demotes the item exactly as a failed gate does**
+(§10.7): an escalation is filed, it `blocks` the work item, and the item's
+completion status is rolled back if it claimed one — the run's resolver
+already declared every gate passed, so the ONLY thing an integration failure
+disputes is whether the change ever reached the target ref.
+
+**Cleanup runs only on a landing.** The candidate worktree is always removed,
+win or lose (it is throwaway by construction); the implementer's own dispatch
+worktree and branch are removed only once their work has actually landed —
+using the same worktree-of-this-repo safety check `spor dispatch`'s own
+teardown uses, so a checkout that is not genuinely a dispatch worktree of the
+repo in question, or one with uncommitted changes some *other* process left,
+is refused rather than force-removed.
+
+Everything here is drivable with fakes, mirroring the gate pipeline's own
+testing discipline: `lib/shell/integration-runner.js` exports the pure
+orchestration (`runIntegrationStage`) separately from the git plumbing
+(`buildCandidateTree`, `landCandidate`) it is wired to, so the fix-cycle
+sequencing and the race-retry bound are tested without a git checkout, and the
+merge/conflict/CAS semantics are tested against a real throwaway repo without
+faking git. See test/integration-step.test.js.

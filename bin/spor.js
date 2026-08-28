@@ -37,6 +37,7 @@ const sat = require(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
 const workLoop = require(path.join(ROOT, "lib", "shell", "work-loop.js"));
 const gatesKernel = require(path.join(ROOT, "lib", "kernel", "gates.js"));
 const gateRunner = require(path.join(ROOT, "lib", "shell", "gate-runner.js"));
+const integrationRunner = require(path.join(ROOT, "lib", "shell", "integration-runner.js"));
 // Resolution truth (lib/kernel/resolution.js): a node is "done" when it carries a
 // TERMINAL status OR a live inbound resolves/answers edge — the same partition the
 // queue ranker and read surfaces use. The dispatch guard reads it so it never
@@ -10054,6 +10055,238 @@ function makeGateDeps(
   };
 }
 
+// --- the integration stage's serialize:repo lease (dec-spor-factory-
+// integration-step) ------------------------------------------------------
+// The declared lease scope is one repo: N workers on M machines should not all
+// build a candidate against the same target ref at once. Correctness never
+// rests on this — git's own compare-and-swap (update-ref / a push's non-fast-
+// forward rejection) is what makes a LOST race safe regardless (the decision's
+// own framing: "makes the CAS race rare rather than load-bearing") — so every
+// failure here is FAIL-OPEN: an unavailable lease logs a note and the stage
+// proceeds without one, exactly like every other best-effort dep in this file.
+//
+// Remote mode reuses the SAME server-held claim/lease dispatch uses
+// (claimDispatch, above), against a synthetic per-repo lock node minted the
+// first time it is needed. Local mode has no lease pool at all (dec-cc-task-
+// claim-lease "Local mode"), so it falls back to a machine-local lockfile
+// scoped to the repo's own path — the one thing this lease can still
+// coordinate offline: two `spor work` loops on the SAME box.
+const INTEGRATION_LEASE_STALE_MS = 30 * 60 * 1000; // older than any real integration pass could legitimately run
+const INTEGRATION_LEASE_WAIT_MS = 20000; // how long to wait for a busy lease before proceeding without one
+const INTEGRATION_LEASE_POLL_MS = 1000;
+
+function integrationLeaseKey(top) {
+  return crypto.createHash("sha256").update(path.resolve(top || "")).digest("hex").slice(0, 16);
+}
+
+async function acquireLocalIntegrationLease(home, top, { sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
+  const dir = path.join(home, "journal", "integration-lease");
+  const file = path.join(dir, `${integrationLeaseKey(top)}.lock`);
+  const deadline = Date.now() + INTEGRATION_LEASE_WAIT_MS;
+  for (;;) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(file, JSON.stringify({ pid: process.pid, started_ticks: dispatchRuns.processStartTicks(process.pid), at: new Date().toISOString() }), { flag: "wx" });
+      return { kind: "lockfile", file };
+    } catch (e) {
+      if (e.code !== "EEXIST") return null; // an unwritable journal is not worth blocking integration over
+    }
+    let stale = false;
+    try {
+      const held = JSON.parse(fs.readFileSync(file, "utf8"));
+      const age = Date.now() - (Date.parse(held.at || "") || 0);
+      stale = age > INTEGRATION_LEASE_STALE_MS || !workerAlive(held.pid, held.started_ticks);
+    } catch {
+      stale = true; // an unreadable lock file cannot be honored as a live one
+    }
+    if (stale) {
+      try {
+        fs.rmSync(file, { force: true });
+      } catch {
+        /* a concurrent racer may have already cleared it */
+      }
+      continue;
+    }
+    if (Date.now() >= deadline) return null;
+    await sleep(INTEGRATION_LEASE_POLL_MS);
+  }
+}
+
+function releaseLocalIntegrationLease(token) {
+  if (!token || token.kind !== "lockfile") return;
+  try {
+    fs.rmSync(token.file, { force: true });
+  } catch {
+    /* it lapses on its own next stale check */
+  }
+}
+
+async function acquireIntegrationLease(cfg, home, top, { slug } = {}) {
+  if (cfg.mode() !== "remote") return acquireLocalIntegrationLease(home, top);
+  const id = `lock-integration-${gateStem(slug || path.basename(top || "repo"))}`;
+  const markdown = [
+    "---",
+    `id: ${id}`,
+    "type: artifact",
+    `title: Integration lease — ${id}`,
+    "summary: The serialize:repo lease the integration stage holds while landing a candidate onto its target ref.",
+    "---",
+    "",
+    "Coordination node only — carries no durable fact of its own.",
+    "",
+  ].join("\n");
+  try {
+    await writeGateNode(cfg, id, markdown);
+    const claimed = await claimDispatch(cfg, id, null, `integration-${crypto.randomUUID()}`);
+    if (claimed.ok) return { kind: "remote", id };
+    return null; // held by another worker, or the claim door errored — proceed without the lease
+  } catch {
+    return null;
+  }
+}
+
+async function releaseIntegrationLease(cfg, token) {
+  if (!token) return;
+  if (token.kind === "remote") {
+    try {
+      await remote.post(cfg, `/v1/nodes/${encodeURIComponent(token.id)}/release`, {}, { timeoutMs: 6000 });
+    } catch {
+      /* lapses on its own TTL */
+    }
+    return;
+  }
+  releaseLocalIntegrationLease(token);
+}
+
+// The deps one integration stage runs on — the shell half of
+// integration-runner.js's pure orchestration, mirroring makeGateDeps above.
+// Only ever constructed when `factory.integration` resolved, so a bare
+// factory (or one with no integration block) never touches any of this.
+function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, warn, sleep, log, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, dispatch = dispatchThrough, home = cfg.userConfigHome() }) {
+  const integration = factory.integration;
+  const date = () => new Date().toISOString().slice(0, 10);
+  const stem = gateStem(entry.node_id);
+  const short = gateShortRun(entry.run_id);
+  let top = null;
+
+  const fix = async ({ cycle, kind, detail, evidence }) => {
+    const why =
+      kind === "conflict"
+        ? `the integration stage could not merge your branch onto \`${integration.targetRef}\` — it conflicts.`
+        : kind === "suite"
+        ? `the integration stage's candidate suite (\`${integration.command}\`) failed on the merged tree.`
+        : `the integration stage could not land your change onto \`${integration.targetRef}\`.`;
+    const prompt = [
+      `The integration stage refused to land ${entry.node_id} onto \`${integration.targetRef}\` (\`${integration.mode}\` mode, \`${integration.strategy}\` strategy).`,
+      "",
+      why,
+      "",
+      detail || "",
+      "",
+      evidence ? `Evidence:\n${String(evidence).slice(0, 4000)}` : "",
+      "",
+      kind === "conflict"
+        ? `Merge or rebase onto the current \`${integration.targetRef}\` yourself in this checkout, resolve the conflict, and commit.`
+        : "Fix the cause in this checkout and commit.",
+      "The stage will rebuild the candidate and re-run the full suite, so do not edit protected test paths — a change",
+      "that touches them fails the acceptance gate closed, separately from this stage.",
+    ]
+      .filter((l) => l !== "")
+      .join("\n");
+    const launched = await dispatch(cfg, { ...passthrough, node: entry.node_id, dir: record ? record.cwd : undefined, force: true, "no-worktree": true, name: `integration-fix-${short}-${cycle}` }, [prompt]);
+    if (!launched.ok) return { ok: false, reason: launched.reason };
+    dispatchRuns.stampGateState(home, entry.run_id, { gate_fix_run_id: launched.run.run_id, gate_fix_at: new Date().toISOString() });
+    const done = await awaitGateRun(cfg, launched.run.run_id, { timeoutMs: runMaxMs, warn, sleep });
+    if (!done.ok) return { ok: false, reason: done.reason };
+    return { ok: true, runId: launched.run.run_id, record: done.record };
+  };
+
+  return {
+    now: () => Date.now(),
+    changedTree: async () => {
+      const c = gateRunner.gateChangeSet(record, integration.targetRef);
+      if (c.ok) top = c.top;
+      return c;
+    },
+    acquireLease: () => acquireIntegrationLease(cfg, home, top || (record && record.cwd), { slug }),
+    releaseLease: (token) => releaseIntegrationLease(cfg, token),
+    buildCandidate: async ({ head, targetRef, strategy }) => integrationRunner.buildCandidateTree({ top, head, targetRef, strategy }),
+    forceProtected: ({ dir }) => gateRunner.forceProtectedPaths({ top, dir, trustedRef: factory.trustedRef, protectedPaths: factory.protectedPaths }),
+    runSuite: ({ dir }) => gateRunner.runGateCommand({ id: "integration", command: integration.command, timeoutMs: integration.timeoutMs }, dir),
+    land: (args) => integrationRunner.landCandidate(args),
+    fix,
+    recordFact: ({ id, markdown }) => writeGateNode(cfg, id, markdown),
+    cleanupImplementer: async () => {
+      const dir = record && record.cwd;
+      if (!dir) return;
+      const common = (git(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).stdout || "").trim();
+      const repoDir = common ? path.dirname(common) : null;
+      if (!repoDir || path.resolve(repoDir) === path.resolve(dir)) return; // the main checkout, not a dispatch worktree — nothing to remove
+      removeDispatchWorktree(repoDir, dir, path.basename(dir));
+    },
+    demote: ({ blockerId }) => gateDemoteItem(cfg, entry.node_id, { blockerId }),
+    escalate: async ({ attempts, detail, evidence }) => {
+      const id = `task-integration-${stem}-${short}-${gateIdSuffix("integration-escalate", "integration", entry.node_id, entry.run_id)}`.toLowerCase();
+      // A lost CAS race is nobody's fix cycle (integration-runner.js never
+      // charges it against the cap), so it must not be counted as one here —
+      // an escalation reading "5 attempts, cap 0" after 5 races and zero real
+      // fixes would mislead whoever triages it about what actually happened.
+      const raced = attempts.filter((a) => a.verdict === "race").length;
+      const cycles = attempts.length - raced;
+      const why = cycles
+        ? `its fix cycles are spent (${cycles} attempt${cycles === 1 ? "" : "s"}, cap ${integration.cycles})`
+        : `it lost the landing race ${raced} time${raced === 1 ? "" : "s"} in a row`;
+      const body = [
+        `The integration stage could not land ${entry.node_id} onto \`${integration.targetRef}\` — ${why}. A person`,
+        "decides what happens next — the worker has stopped retrying it.",
+        "",
+        `This item \`blocks\` ${entry.node_id} on the graph, and if that item had already been flipped to a`,
+        "completion status the worker rolled it back. Every declared gate already passed; only the merge-queue",
+        "landing itself is unresolved. The run's resolver is left standing.",
+        "",
+        detail ? `Last outcome: ${detail}` : "",
+        "",
+        ...(evidence ? ["Evidence:", "", "```", fenceSafe(String(evidence).slice(0, 3000)), "```", ""] : []),
+        ...(attempts.length > 1 ? ["Attempts:", ...attempts.map((a, i) => `${i + 1}. ${a.verdict} — ${String(a.detail || "").slice(0, 200)}`), ""] : []),
+        `The run's own record is \`${entry.run_id}\` ('spor runs ${entry.run_id}').`,
+      ]
+        .filter((l) => l !== "")
+        .join("\n");
+      return writeGateNode(
+        cfg,
+        id,
+        buildGateWorkNode({
+          id,
+          title: `Integration escalation — could not land ${entry.node_id}`,
+          summary: `The integration stage could not land ${entry.node_id} onto ${integration.targetRef} after ${attempts.length} attempt(s); it needs a person${detail ? `: ${String(detail).slice(0, 200)}` : "."}`,
+          body,
+          project: slug,
+          date: date(),
+          requiresHuman: true,
+          edges: [{ type: "blocks", to: entry.node_id }],
+        })
+      );
+    },
+    log,
+  };
+}
+
+// Run the gate pipeline and, if every declared gate passed and the factory
+// declares an integration block, follow it with the integration stage — the
+// two folded into ONE promise so work-loop.js's slot-holding, cooldown, and
+// resume machinery (which all key on `deps.gate`'s single settled verdict)
+// need no changes at all (dec-spor-factory-integration-step: "the run HOLDS
+// ITS SLOT through integration"). With no integration declared, this returns
+// the gate pipeline's own result untouched — byte-identical to before this
+// stage existed.
+async function runGateAndIntegration(cfg, entry, record, ctx) {
+  const item = { ...entry, project: ctx.slug };
+  const gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: makeGateDeps(cfg, { ...ctx, record, entry }) });
+  if (gateResult.state !== "passed" || !ctx.factory.integration) return gateResult;
+  const intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, deps: makeIntegrationDeps(cfg, { ...ctx, record, entry }) });
+  return { ...intResult, gates: gateResult.gates, facts: [...(gateResult.facts || []), ...(intResult.facts || [])] };
+}
+
 async function cmdWork(cfg, { values }) {
   if (values.status) return cmdWorkStatus(cfg, { json: !!values.json });
 
@@ -10261,25 +10494,18 @@ async function cmdWork(cfg, { values }) {
               });
             },
             gate: (entry, record) =>
-              gateRunner.runGatePipeline({
-                item: { ...entry, project: slug },
+              runGateAndIntegration(cfg, entry, record, {
                 factory,
+                slug,
+                passthrough,
+                warn,
+                runMaxMs,
                 log: (line) => out(line),
-                deps: makeGateDeps(cfg, {
-                  record,
-                  entry,
-                  factory,
-                  slug,
-                  passthrough,
-                  warn,
-                  runMaxMs,
-                  log: (line) => out(line),
-                  stopping: () => !!control.stopping,
-                  // A plain timer, NOT the loop's wakeable sleep: that one has a
-                  // single wake slot the loop owns, and a gate sharing it would
-                  // silently cancel the loop's own backoff.
-                  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-                }),
+                stopping: () => !!control.stopping,
+                // A plain timer, NOT the loop's wakeable sleep: that one has a
+                // single wake slot the loop owns, and a gate sharing it would
+                // silently cancel the loop's own backoff.
+                sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
               }),
           }
         : {}),
@@ -12799,7 +13025,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, setStatusLocal, makeGateDeps, runSupervisorAlive, workerAlive };
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive };
 
 if (require.main === module) {
   main()
