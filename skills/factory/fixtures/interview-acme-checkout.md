@@ -80,8 +80,9 @@ and the pipeline mechanics are proposed rather than asked.
    onto `main` (`mode: local`) rather than wait for a person; the merged tree
    gets `npm test` run on it again first, and a conflict or that re-run failing
    gets one implementer fix cycle before it comes to you the same way a failed
-   review would. `mode: propose` (open a PR instead) is not available yet — the
-   owner did not ask for it, and it would not have been offered.
+   review would. `mode: propose` (open a PR instead, for orgs whose policy
+   forbids a direct land) was not offered — the owner asked to "just ship it",
+   not to route it through a PR.
 
 ## What was emitted (step 5)
 

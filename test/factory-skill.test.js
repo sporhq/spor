@@ -169,10 +169,11 @@ test("the emitted integration block parses with the runner's own vocabulary", ()
     cycles: 1,
     timeoutMs: 900000,
   });
-  // mode: propose is refused at load time (task-spor-integration-propose-mode)
-  // — the skill must never teach an operator to emit it.
-  const { errors } = gates.parseIntegration({ integration: { mode: "propose", command: "npm test" } });
-  assert.ok(errors.some((e) => /propose.*not yet implemented/.test(e)), "propose mode is refused, confirming the skill is right to steer around it");
+  // mode: propose now parses (task-spor-integration-propose-mode landed PR-
+  // landing via gh) — the skill's emitted vocabulary must match the runner's.
+  const { integration, errors } = gates.parseIntegration({ integration: { mode: "propose", command: "npm test" } });
+  assert.deepStrictEqual(errors, [], "propose mode is a live, parseable integration mode");
+  assert.strictEqual(integration.mode, "propose");
 });
 
 test("nothing the skill emitted dangles: every ref and every routed profile exists", () => {

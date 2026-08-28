@@ -40,7 +40,7 @@
     {
       "id": 7,
       "prompt": "Once an agent's work passes review, I don't want to be the one who has to push it out — just land it on main automatically.",
-      "expected_output": "Triggers factory. Asks whether other gates already exist or are still needed (review, approval) before proposing an `integration:` block, states plainly that it re-runs the full suite on the merged result and that a conflict or that re-run failing is a fix-cycle event, and proposes `mode: local` (or `push` if there's a remote-policy reason) — never `mode: propose`, which it should say is not implemented yet. Waits for confirmation before emitting; the block lands inside the factory node's JSON payload, not a separate node.",
+      "expected_output": "Triggers factory. Asks whether other gates already exist or are still needed (review, approval) before proposing an `integration:` block, states plainly that it re-runs the full suite on the merged result and that a conflict or that re-run failing is a fix-cycle event, and proposes `mode: local` (or `push` if there's a remote-policy reason) — not `mode: propose`, since the operator asked to land it directly rather than route it through a pull request. Waits for confirmation before emitting; the block lands inside the factory node's JSON payload, not a separate node.",
       "files": []
     }
   ]

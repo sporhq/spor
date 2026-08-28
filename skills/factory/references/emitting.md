@@ -188,13 +188,16 @@ Keys (`lib/kernel/gates.js parseIntegration` is the authority):
 
 - **`target_ref`** — what "landed" means; defaults to the factory's own
   `trusted_ref`, so state that default rather than always writing it.
-- **`mode`** — `local` (CAS a local ref with `git update-ref`) or `push`
-  (push to a remote, whose own non-fast-forward rejection *is* the
-  compare-and-swap). **Never emit `mode: propose`** — it parses but is refused
-  at load time in v1 (a factory declaring it gets a load-time error, not a
-  silent no-op); if the operator wants a PR-based flow, say it is coming and
-  leave `integration:` out for now, or ask whether `local`/`push` plus a
-  `human` gate earlier in `gates` covers what they actually want.
+- **`mode`** — `local` (CAS a local ref with `git update-ref`), `push` (push
+  to a remote, whose own non-fast-forward rejection *is* the
+  compare-and-swap), or `propose` (open a pull request via the `gh` CLI from
+  the gate-passed branch and park the item for review, rather than mutating
+  `target_ref` directly — for orgs whose policy forbids a worker pushing
+  straight onto the target ref). The candidate suite still runs pre-PR under
+  `propose`, so a PR only ever opens known-green. `propose` needs the `gh`
+  CLI on PATH on every box that runs `spor work` — the worker refuses to
+  start otherwise, so ask the operator to confirm it is installed
+  (https://cli.github.com) before emitting it.
 - **`command`** (required) — the FULL suite, run again on the merged
   candidate tree, never a fast subset deferred to CI after landing. Reuse the
   same command interview question 1 already settled unless they name a
@@ -275,8 +278,9 @@ the error rather than retrying: a 422 on a factory is almost always a body over
 not parse `gates` or `integration` the way the runner does. `spor work
 --factory factory-<id> --print` does: it loads and validates the definition
 the same way the real loop would, prints the resolved pipeline, and dispatches
-nothing — so a bad `integration:` block (`mode: propose` included) surfaces
-there as a load error before anyone hands the factory off.
+nothing — so a bad `integration:` block surfaces there as a load error before
+anyone hands the factory off, and (for `mode: propose`) a missing `gh` on
+PATH surfaces as a refusal to start rather than a silent no-op.
 
 ## Writing from Cowork or the connector
 

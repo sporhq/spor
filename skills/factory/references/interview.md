@@ -59,8 +59,11 @@ owner, and every answer is evidence you carry verbatim into the nodes you emit.
    the merged result before anything lands. If they want a person to press the
    button first, that is the human gate from question 6, not this one — leave
    `integration:` out and say resolve-without-merge stays how it works today.
-   Do not offer "opens a pull request for me" yet — v1 only lands directly or
-   pushes; say a PR-based flow is coming and is not available now.
+   If policy requires a pull request instead of a direct land, offer
+   `mode: propose`: it still runs the full suite pre-PR, then opens a PR (via
+   `gh`) and parks the item for review rather than pushing straight onto the
+   target ref — and note that it needs the `gh` CLI on PATH wherever the
+   worker runs.
 
 **What not to ask them**: which harness, what timeout, how many fix cycles,
 what glob covers auth, whether to inline or reference a gate. Decide those,
@@ -82,15 +85,16 @@ state them in the proposal in one plain line each, and let them push back.
    `gate-security-review` — is a `type: gate` node; a one-off is inline. The
    runner cannot tell the difference.
 7. Merge queue: land automatically once gates pass? If so — `target_ref`
-   (defaults to `trusted_ref`), `mode` (`local` CAS via `git update-ref`, or
-   `push` to a remote whose non-fast-forward rejection is the CAS — `propose`
-   parses but refuses to load in v1, so do not emit it), the FULL `command` to
-   run on the merged candidate tree (not a fast subset — this is the same
-   suite question as #1, asked again because the runner runs it a second time,
-   post-merge), `strategy` (`merge` | `squash` | `rebase`, default `merge`),
-   and `cycles` (fix cycles on a merge conflict or a candidate-suite failure,
-   separate from any gate's own `cycles`). `serialize` is always `repo` — there
-   is nothing to ask.
+   (defaults to `trusted_ref`), `mode` (`local` CAS via `git update-ref`,
+   `push` to a remote whose non-fast-forward rejection is the CAS, or
+   `propose` to open a pull request via `gh` and park the item for review
+   instead of mutating `target_ref` — needs `gh` on PATH wherever the worker
+   runs), the FULL `command` to run on the merged candidate tree (not a fast
+   subset — this is the same suite question as #1, asked again because the
+   runner runs it a second time, post-merge), `strategy` (`merge` | `squash` |
+   `rebase`, default `merge`), and `cycles` (fix cycles on a merge conflict or
+   a candidate-suite failure, separate from any gate's own `cycles`).
+   `serialize` is always `repo` — there is nothing to ask.
 
 ## Translating a product answer into a gate
 
@@ -101,7 +105,8 @@ state them in the proposal in one plain line each, and let them push back.
 | "I don't want an agent marking its own homework" | `protected_paths` over the suite + a `test_lane_profile` | that a change touching a test fails closed and files a separate item — it is not merely a warning |
 | "Have someone smart double-check it" | an `agent-review` gate routed to a cross-model profile | that a review is a second opinion, not a proof, and an unreadable verdict counts as a failure |
 | "It should be fast" | nothing — a preference, not a gate | that gates cost time by construction, and the lever is `cycles` and how many gates, not a faster gate |
-| "Once it's clean it should just ship" | an `integration:` block, `mode: local` or `mode: push` | that it re-runs the FULL suite on the merged result before landing, that a conflict or that re-run failing feeds the same fix-cycle machinery as any other gate, and that a PR-first flow (`mode: propose`) is not available yet |
+| "Once it's clean it should just ship" | an `integration:` block, `mode: local` or `mode: push` | that it re-runs the FULL suite on the merged result before landing, and that a conflict or that re-run failing feeds the same fix-cycle machinery as any other gate |
+| "It should ship, but through a PR someone reviews" | an `integration:` block, `mode: propose` | that it still runs the full suite pre-PR, then opens a PR via `gh` and parks the item for review rather than landing directly — and that `gh` must be on PATH wherever the worker runs |
 | "I want to open the PR myself" | nothing — omit `integration:` | that a gate-passed branch still resolves the work without merging it; landing stays a manual step until they say otherwise |
 
 ## What a first factory should look like

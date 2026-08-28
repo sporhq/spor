@@ -121,9 +121,14 @@ If they want an `integration:` block too, say what it is not: not a fourth
 gate, but a merge-queue stage that runs once, last, after every gate passes —
 it mutates `target_ref`, re-runs the full suite on the merged result, and a
 conflict or that re-run failing is a fix-cycle event like any other gate.
-`mode: propose` (open a PR instead of landing) is not implemented yet; offer
-`local` or `push`, or leave `integration:` out entirely and say
-resolve-without-merge stays how it works today.
+Offer `local` or `push`, or — for orgs whose policy forbids a worker pushing
+straight onto the target ref — `propose`: the candidate suite still runs
+pre-PR, but landing means opening a pull request (via `gh`) from the
+gate-passed branch and parking the item for review rather than mutating
+`target_ref` directly; `propose` needs the `gh` CLI on PATH on every box that
+runs `spor work` (a preflight refuses to start otherwise). Leaving
+`integration:` out entirely keeps resolve-without-merge working as it does
+today.
 
 ### 5. Emit the nodes
 
@@ -150,10 +155,12 @@ right failure but a rude way to discover a typo:
 - `protected_paths` is declared **only** with a `test_lane_profile` to route to;
 - every risk class a human gate names is declared in `risk_classes`;
 - gate ids are unique and kebab-case;
-- if you wrote an `integration:` block: `mode` is `local` or `push` (never
-  `propose` — it fails to load), `command` is set, `strategy` is one of
-  `merge`/`squash`/`rebase`, and `serialize` is `repo`. `spor work --factory
-  factory-<id> --print` loads and validates it without dispatching anything.
+- if you wrote an `integration:` block: `mode` is `local`, `push`, or
+  `propose`, `command` is set, `strategy` is one of `merge`/`squash`/`rebase`,
+  and `serialize` is `repo` — and if `mode` is `propose`, the `gh` CLI must be
+  on PATH wherever `spor work` runs, or the worker refuses to start. `spor
+  work --factory factory-<id> --print` loads and validates it without
+  dispatching anything.
 
 ### 5b. Seed the test-writer lane when there is no suite
 
