@@ -156,6 +156,65 @@ Five things a factory must satisfy or it refuses to start the worker:
    that can never arm reads exactly like an approved one;
 5. gate ids are unique and kebab-case.
 
+## 3b. The integration block — merge-queue landing (optional)
+
+Only emit this if the operator asked for automatic landing (interview
+question 7). Absent is not a lesser factory — it is today's default,
+resolve-without-merge, unchanged. It is **not a gate**: it runs once, last,
+after every declared gate has passed, and it is the one part of this payload
+that mutates `target_ref` rather than just judging a branch — so state that
+plainly before you write it.
+
+It lives beside `gates` in the same factory JSON payload, never as its own
+node:
+
+```json
+{
+  "factory": "<team-or-product>",
+  "trusted_ref": "main",
+  "gates": [ "..." ],
+  "integration": {
+    "target_ref": "main",
+    "mode": "local",
+    "command": "npm test",
+    "strategy": "merge",
+    "serialize": "repo",
+    "cycles": 1
+  }
+}
+```
+
+Keys (`lib/kernel/gates.js parseIntegration` is the authority):
+
+- **`target_ref`** — what "landed" means; defaults to the factory's own
+  `trusted_ref`, so state that default rather than always writing it.
+- **`mode`** — `local` (CAS a local ref with `git update-ref`) or `push`
+  (push to a remote, whose own non-fast-forward rejection *is* the
+  compare-and-swap). **Never emit `mode: propose`** — it parses but is refused
+  at load time in v1 (a factory declaring it gets a load-time error, not a
+  silent no-op); if the operator wants a PR-based flow, say it is coming and
+  leave `integration:` out for now, or ask whether `local`/`push` plus a
+  `human` gate earlier in `gates` covers what they actually want.
+- **`command`** (required) — the FULL suite, run again on the merged
+  candidate tree, never a fast subset deferred to CI after landing. Reuse the
+  same command interview question 1 already settled unless they name a
+  different one.
+- **`strategy`** — `merge` | `squash` | `rebase` (default `merge`) — how the
+  candidate tree is built from `target_ref` + the branch.
+- **`serialize`** — must be `"repo"`, the only declared lease scope. Do not
+  ask the operator about this; just write it (or omit it — it is the default).
+- **`cycles`** (default 0) — fix cycles on a merge conflict or a
+  candidate-suite failure, fed through the same fix-cycle machinery a failing
+  gate uses. This is a separate counter from any gate's own `cycles`.
+- **`timeout_ms`** (default 900000) — the candidate suite's timeout.
+
+State back to the operator, in one line each: it re-runs the full suite a
+second time on the merged result (so a green gate run does not skip it), a
+conflict or that re-run failing is a fix-cycle event exactly like a failed
+gate — not a silent drop — and every landing or failure writes an `art-merge-`
+fact, the integration stage's twin of a gate's `art-gate-` fact
+(WORKERS.md §10.9, `references/maintenance.md`).
+
 ## 4. The test-writer lane
 
 When step 2 of the creation flow found no acceptance suite, the operator's
@@ -211,6 +270,13 @@ spor query --type gate --ids      # every ref resolves
 A remote graph validates per write, so a rejected `put-node` is the lint. Read
 the error rather than retrying: a 422 on a factory is almost always a body over
 8192 bytes (trim the prose, not the payload) or a summary over 500 characters.
+
+`spor validate` only checks that the body has a fenced `json` payload — it does
+not parse `gates` or `integration` the way the runner does. `spor work
+--factory factory-<id> --print` does: it loads and validates the definition
+the same way the real loop would, prints the resolved pipeline, and dispatches
+nothing — so a bad `integration:` block (`mode: propose` included) surfaces
+there as a load error before anyone hands the factory off.
 
 ## Writing from Cowork or the connector
 

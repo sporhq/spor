@@ -22,7 +22,8 @@ on the suite that exists while the missing one is seeded as its own lane item.
 3. parses the emitted factory with the runner's own vocabulary
    (`lib/kernel/gates.js parseFactory`), resolving the referenced gate node the
    way the worker does — zero errors, the declared gates in order, the trusted
-   ref, the protected paths, the test lane and the risk classes;
+   ref, the protected paths, the test lane, the risk classes, and the
+   `integration:` block (`parseIntegration`);
 4. checks the invariants the skill promises and the runner would otherwise
    discover at worker-start: every referenced gate and every routed profile
    exists as a node in the emitted set, and no profile carries a

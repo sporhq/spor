@@ -1,8 +1,8 @@
 # The interview
 
-Six questions decide a factory. They do not change with the operator; only the
-language does. Ask a few at a time, reflect the answers back in your own words,
-and stop asking anything the repo or the graph already answered.
+Seven questions decide a factory. They do not change with the operator; only
+the language does. Ask a few at a time, reflect the answers back in your own
+words, and stop asking anything the repo or the graph already answered.
 
 | # | What it decides | Emits |
 |---|---|---|
@@ -12,6 +12,7 @@ and stop asking anything the repo or the graph already answered.
 | 4 | Whether an agent may edit the checks | `protected_paths` + `test_lane_profile` |
 | 5 | What a second reader should hunt for | an `agent-review` gate, its `profile` and `cycles` |
 | 6 | What a person must see before it ships | a `human` gate and the `risk_classes` that arm it |
+| 7 | What happens once everything above passes | an `integration:` block (merge-queue landing), or nothing — resolve-without-merge stays the default |
 
 ## Reading the register
 
@@ -51,6 +52,15 @@ owner, and every answer is evidence you carry verbatim into the nodes you emit.
    detection at all) or something denser.
 6. **"Who else should look at an agent's work — and what would they be looking
    for?"** — an agent-review gate's `instructions`, in their words.
+7. **"Once something passes all of that, should it go live by itself, or do
+   you want to be the one who pushes it out?"** — decides whether to emit an
+   `integration:` block at all. "By itself" is a real merge-queue landing, not
+   a suggestion — say that plainly, and that it runs the full suite again on
+   the merged result before anything lands. If they want a person to press the
+   button first, that is the human gate from question 6, not this one — leave
+   `integration:` out and say resolve-without-merge stays how it works today.
+   Do not offer "opens a pull request for me" yet — v1 only lands directly or
+   pushes; say a PR-based flow is coming and is not available now.
 
 **What not to ask them**: which harness, what timeout, how many fix cycles,
 what glob covers auth, whether to inline or reference a gate. Decide those,
@@ -71,6 +81,16 @@ state them in the proposal in one plain line each, and let them push back.
 6. Inline or shareable? A gate more than one factory will use — a
    `gate-security-review` — is a `type: gate` node; a one-off is inline. The
    runner cannot tell the difference.
+7. Merge queue: land automatically once gates pass? If so — `target_ref`
+   (defaults to `trusted_ref`), `mode` (`local` CAS via `git update-ref`, or
+   `push` to a remote whose non-fast-forward rejection is the CAS — `propose`
+   parses but refuses to load in v1, so do not emit it), the FULL `command` to
+   run on the merged candidate tree (not a fast subset — this is the same
+   suite question as #1, asked again because the runner runs it a second time,
+   post-merge), `strategy` (`merge` | `squash` | `rebase`, default `merge`),
+   and `cycles` (fix cycles on a merge conflict or a candidate-suite failure,
+   separate from any gate's own `cycles`). `serialize` is always `repo` — there
+   is nothing to ask.
 
 ## Translating a product answer into a gate
 
@@ -81,6 +101,8 @@ state them in the proposal in one plain line each, and let them push back.
 | "I don't want an agent marking its own homework" | `protected_paths` over the suite + a `test_lane_profile` | that a change touching a test fails closed and files a separate item — it is not merely a warning |
 | "Have someone smart double-check it" | an `agent-review` gate routed to a cross-model profile | that a review is a second opinion, not a proof, and an unreadable verdict counts as a failure |
 | "It should be fast" | nothing — a preference, not a gate | that gates cost time by construction, and the lever is `cycles` and how many gates, not a faster gate |
+| "Once it's clean it should just ship" | an `integration:` block, `mode: local` or `mode: push` | that it re-runs the FULL suite on the merged result before landing, that a conflict or that re-run failing feeds the same fix-cycle machinery as any other gate, and that a PR-first flow (`mode: propose`) is not available yet |
+| "I want to open the PR myself" | nothing — omit `integration:` | that a gate-passed branch still resolves the work without merging it; landing stays a manual step until they say otherwise |
 
 ## What a first factory should look like
 
@@ -94,6 +116,10 @@ complete one that scares them off:
 - a **human** gate only where they named something they want to see — armed on
   risk classes, never unconditional, unless they truly want to approve
   everything (say what that costs: every change waits for them).
+- **no `integration:` block**, unless they explicitly asked for automatic
+  landing — it is the one piece of this pipeline that mutates the target ref
+  on its own, so it is opt-in even more deliberately than the gates are.
+  Resolve-without-merge (today's default) is a fine first factory.
 
 Everything else is a maintenance-flow edit once there is telemetry to argue
 from.

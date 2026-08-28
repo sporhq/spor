@@ -56,6 +56,12 @@ and the pipeline mechanics are proposed rather than asked.
 > "Someone who'd catch it quietly losing an order. Not someone arguing about
 > naming."
 
+> **Q7. Once something passes all of that, should it go live by itself, or do
+> you want to be the one who pushes it out?**
+>
+> "If it passed the review and, when it's money stuff, I've okayed it — just
+> ship it. I don't want to be the release button for every little thing."
+
 ## The proposal that was confirmed (step 4)
 
 1. **Acceptance** — run what CI runs (`npm test`) from `main`'s copy, never the
@@ -70,6 +76,12 @@ and the pipeline mechanics are proposed rather than asked.
 5. Plus: nothing today covers "someone can't pay" end to end, so that criterion
    is seeded as its own item for the test-writer lane — in the owner's words —
    and the command gate is left on `npm test` until that suite lands.
+6. **Land it automatically** (Q7) — once the gates above pass, CAS the result
+   onto `main` (`mode: local`) rather than wait for a person; the merged tree
+   gets `npm test` run on it again first, and a conflict or that re-run failing
+   gets one implementer fix cycle before it comes to you the same way a failed
+   review would. `mode: propose` (open a PR instead) is not available yet — the
+   owner did not ask for it, and it would not have been offered.
 
 ## What was emitted (step 5)
 
@@ -78,7 +90,7 @@ and the pipeline mechanics are proposed rather than asked.
 | `gate-adversarial-review` | shareable: Q6 applies to every Acme repo, so it is a `type: gate` node other factories reference |
 | `profile-codex-review` | the cross-model lane that gate routes to |
 | `profile-acme-test-writer` | the lane a protected-path hit routes to, and the one that writes the seeded suite |
-| `factory-acme-checkout` | the ordered pipeline, trusted ref, protected paths and the `touches:payments` risk class |
+| `factory-acme-checkout` | the ordered pipeline, trusted ref, protected paths, the `touches:payments` risk class, and the `integration:` block from Q7 |
 | `task-acme-checkout-acceptance-suite` | the missing black-box suite, carrying Q1-Q3 verbatim as its spec |
 
 Nothing was turned on: `spor work --factory factory-acme-checkout` is the

@@ -36,6 +36,12 @@
       "prompt": "Can you defer this — we should really add rate limiting to the API before launch.",
       "expected_output": "Should NOT trigger factory — that is /spor:defer capturing discovered work, not compiling a factory definition.",
       "files": []
+    },
+    {
+      "id": 7,
+      "prompt": "Once an agent's work passes review, I don't want to be the one who has to push it out — just land it on main automatically.",
+      "expected_output": "Triggers factory. Asks whether other gates already exist or are still needed (review, approval) before proposing an `integration:` block, states plainly that it re-runs the full suite on the merged result and that a conflict or that re-run failing is a fix-cycle event, and proposes `mode: local` (or `push` if there's a remote-policy reason) — never `mode: propose`, which it should say is not implemented yet. Waits for confirmation before emitting; the block lands inside the factory node's JSON payload, not a separate node.",
+      "files": []
     }
   ]
 }

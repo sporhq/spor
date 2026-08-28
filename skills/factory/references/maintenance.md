@@ -3,8 +3,12 @@
 Every gate the runner enforced left a fact behind: one artifact node per gate
 per run, `art-gate-<gate>-<stem>-<short-run-id>-…`, carrying `relates-to` the
 work item, the verdict, the cycle history and the evidence (WORKERS.md §10.6).
-So the maintenance questions are **queries**, and every proposed change to a
-factory is argued from nodes you can name.
+A factory with an `integration:` block gets the same discipline at its last
+stage: every landing or landing failure is `art-merge-<stem>-<short-run-id>-…`,
+the same idempotent shape and the same `relates-to` (never `resolves`) edge
+onto the work item (WORKERS.md §10.9). So the maintenance questions are
+**queries**, and every proposed change to a factory is argued from nodes you
+can name.
 
 The rule: **never a silent edit**. A factory is what a team means by done;
 changing it without stating what stops being caught is how a gate quietly
@@ -15,7 +19,9 @@ becomes decoration.
 ```bash
 spor query --type artifact --id-prefix art-gate- --summary       # every gate outcome
 spor query --type artifact --id-prefix art-gate-review --summary # one gate's history
+spor query --type artifact --id-prefix art-merge- --summary      # every integration landing/failure
 spor get art-gate-<...>                                          # the verdict + evidence
+spor get art-merge-<...>                                         # a landing's conflict/suite evidence
 spor work --status                                               # what is gating now, and why an item cooled off
 spor changes                                                     # recent graph activity around them
 ```
@@ -59,6 +65,28 @@ Two more surfaces worth reading before concluding anything:
      instead; a flaky suite reads as a strict factory from the outside.
 3. Report the classification with the node ids behind it, then propose.
 
+## "It passed review but never landed"
+
+Only relevant when the factory declares `integration:`. Pull the `art-merge-*`
+facts for the item and read what stage it stopped at — the block runs once,
+last, so a gate-passed item that never landed failed *after* every gate:
+
+- **a merge conflict** — the same fix-cycle machinery as a failing gate; if it
+  keeps recurring against the same target ref, the branch is stale by the time
+  it gets there, which is a dispatch-cadence question, not a factory one.
+- **the candidate suite failed** — the merged tree broke something the
+  branch's own suite run did not catch, which is the integration step doing
+  its job (WORKERS.md §10.9 exists precisely because a gate-passed branch is
+  not the same thing as shipped work); read the failure like any command-gate
+  fact.
+- **a lost CAS race** — logged and retried automatically, never charged
+  against `cycles`; if the `art-merge-*` history shows several of these in a
+  row, the target ref is under heavy contention, which is a `serialize`/lease
+  question, not a review-strictness one.
+- **exhausted its `cycles`** — demoted exactly like a failed gate: an
+  escalation was filed, it `blocks` the work item, and the item's completion
+  status was rolled back. Find it with the same rolled-back-item query above.
+
 ## "The reviews are too strict"
 
 Answer with evidence, in this order, and prefer the smallest edit the evidence
@@ -90,8 +118,8 @@ something to point at.
 1. **The decision**, carrying the evidence: a `type: decision` node whose body
    says what the telemetry showed (node ids, quoted findings), what changed in
    the definition, and what the factory no longer refuses as a result. Edge it
-   `relates-to` the factory and `relates-to` each `art-gate-*` fact you argued
-   from.
+   `relates-to` the factory and `relates-to` each `art-gate-*`/`art-merge-*`
+   fact you argued from.
 
 2. **The factory revision**, optimistic-concurrency checked:
 

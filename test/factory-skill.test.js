@@ -153,6 +153,28 @@ test("the emitted factory parses with the runner's own vocabulary", () => {
   assert.strictEqual(review.profile, "profile-codex-review");
 });
 
+test("the emitted integration block parses with the runner's own vocabulary", () => {
+  // The skill's whole integration-interview payoff: the block it teaches an
+  // operator to answer for (task-spor-factory-skill-integration-block) must be
+  // exactly what lib/kernel/gates.js parseIntegration accepts, never a shape
+  // that merely looks right.
+  const { factory } = resolveEmittedFactory();
+  assert.ok(factory.integration, "the fixture's Q7 answer ('just ship it') emits an integration block");
+  assert.deepStrictEqual(factory.integration, {
+    targetRef: "main",
+    mode: "local",
+    command: "npm test",
+    strategy: "merge",
+    serialize: "repo",
+    cycles: 1,
+    timeoutMs: 900000,
+  });
+  // mode: propose is refused at load time (task-spor-integration-propose-mode)
+  // — the skill must never teach an operator to emit it.
+  const { errors } = gates.parseIntegration({ integration: { mode: "propose", command: "npm test" } });
+  assert.ok(errors.some((e) => /propose.*not yet implemented/.test(e)), "propose mode is refused, confirming the skill is right to steer around it");
+});
+
 test("nothing the skill emitted dangles: every ref and every routed profile exists", () => {
   const { byId, factory } = resolveEmittedFactory();
   const have = (id) => byId.has(id);

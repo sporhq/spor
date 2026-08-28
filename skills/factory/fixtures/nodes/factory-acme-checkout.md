@@ -30,6 +30,12 @@ that today, which is why `task-acme-checkout-acceptance-suite` exists — the
 command gate stays on `npm test` until that suite lands, because a gate
 pointing at a command that does not exist fails every item for the wrong reason.
 
+Once every gate above passes — including the owner's own approval on anything
+that touches money — the owner does not want to be the release button (Q7):
+work lands itself onto `main`, re-running `npm test` on the merged result
+first, with one fix cycle before a conflict or that re-run failing comes back
+to them the same way a failed review would.
+
 ```json
 {
   "factory": "acme-checkout",
@@ -43,6 +49,14 @@ pointing at a command that does not exist fails every item for the wrong reason.
     {"id": "acceptance", "kind": "command", "command": "npm test", "timeout_ms": 900000},
     {"ref": "gate-adversarial-review", "cycles": 1},
     {"id": "payments-approval", "kind": "human", "risk": ["touches:payments"], "instructions": "Anything that takes money. Copy and blog changes do not arm this."}
-  ]
+  ],
+  "integration": {
+    "target_ref": "main",
+    "mode": "local",
+    "command": "npm test",
+    "strategy": "merge",
+    "serialize": "repo",
+    "cycles": 1
+  }
 }
 ```

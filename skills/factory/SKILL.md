@@ -56,7 +56,8 @@ ask an operator a question the repo or the graph already answers.
 Read the room first. A **non-technical owner** ("I want my agents to stop
 breaking checkout") gets product questions; an **engineer** ("I want a codex
 review gate with two fix cycles") gets pipeline questions and denser proposals.
-The underlying questions are the same six; only the language changes.
+The underlying questions are the same seven — including whether gate-passed
+work should land itself, the `integration:` block — only the language changes.
 
 The acceptance-criteria interview is the non-technical operator's whole factory
 job made first-class: **human judgment defines what correct looks like**, and
@@ -116,6 +117,14 @@ Say plainly what each kind cannot do:
 - a **human** gate is the only one that can say "I don't like this", and it
   costs the person's time on every armed change.
 
+If they want an `integration:` block too, say what it is not: not a fourth
+gate, but a merge-queue stage that runs once, last, after every gate passes —
+it mutates `target_ref`, re-runs the full suite on the merged result, and a
+conflict or that re-run failing is a fix-cycle event like any other gate.
+`mode: propose` (open a PR instead of landing) is not implemented yet; offer
+`local` or `push`, or leave `integration:` out entirely and say
+resolve-without-merge stays how it works today.
+
 ### 5. Emit the nodes
 
 In this order, so nothing dangles: **schemas → profiles → gates → factory →
@@ -140,7 +149,11 @@ right failure but a rude way to discover a typo:
   caught until dispatch, so double-check it yourself, e.g. `spor get <profile>`);
 - `protected_paths` is declared **only** with a `test_lane_profile` to route to;
 - every risk class a human gate names is declared in `risk_classes`;
-- gate ids are unique and kebab-case.
+- gate ids are unique and kebab-case;
+- if you wrote an `integration:` block: `mode` is `local` or `push` (never
+  `propose` — it fails to load), `command` is set, `strategy` is one of
+  `merge`/`squash`/`rebase`, and `serialize` is `repo`. `spor work --factory
+  factory-<id> --print` loads and validates it without dispatching anything.
 
 ### 5b. Seed the test-writer lane when there is no suite
 
@@ -174,10 +187,12 @@ either direction.
 
 ## Maintenance flow
 
-Every gate outcome is already a graph fact (`art-gate-*`, WORKERS.md §10.6), so
-"why did the last three fail review" is a **query**, not a guess, and "the
-reviews are too strict" is a definition edit proposed **with that evidence
-attached** — never a silent one. The queries, the read-back, and the
+Every gate outcome is already a graph fact (`art-gate-*`, WORKERS.md §10.6),
+and — for a factory with an `integration:` block — every landing or landing
+failure is too (`art-merge-*`, WORKERS.md §10.9), so "why did the last three
+fail review" or "why isn't finished work landing" is a **query**, not a guess,
+and "the reviews are too strict" is a definition edit proposed **with that
+evidence attached** — never a silent one. The queries, the read-back, and the
 propose-an-edit protocol are in **`references/maintenance.md`**.
 
 ## Refusals
