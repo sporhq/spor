@@ -7283,7 +7283,44 @@ async function compileBriefing(cfg, { nodeId, query, full, project }) {
 // can never drift on what is dispatchable — the loop adds no eligibility rule
 // of its own beyond what it can see here (task-spor-work-loop). Mode-aware and
 // fail-soft: [] on any error or empty queue.
-async function dispatchableQueuePage(cfg, slug, LIMIT = 25) {
+// `eligible` is the caller's page-level filter (work-loop's pageEligible plus
+// whatever the caller knows about its own slots: the readiness floor, the
+// accept policy, the factory's repo scope, an item already in flight or
+// cooling off here). When one is given and NOTHING on the page passes it, the
+// page is REFETCHED wider — doubling to PAGE_LIMIT_CAP — until something does
+// or the queue runs out. Without that, the policy filter runs after a
+// fixed-size fetch, so a page filled by items this worker may not take
+// (untriaged ones under the default `accept: ready`, a sibling repo's under a
+// scoped factory) starves an eligible item ranked below it FOREVER: every poll
+// refetches the same page. The queue has no offset, so widening is the whole
+// re-page — at most three extra reads, and paid only by a pass that would
+// otherwise have dispatched nothing at all. In local mode those reads share
+// ONE graph load (the expensive half); remote mode pays a bounded GET each.
+const PAGE_LIMIT_CAP = 200;
+async function dispatchableQueuePage(cfg, slug, LIMIT = 25, { eligible = null, maxLimit = PAGE_LIMIT_CAP } = {}) {
+  // Memo for THIS call only, so a widened local-mode read re-ranks the graph
+  // it already loaded instead of re-reading every node file per step; the next
+  // poll starts fresh and sees new nodes.
+  const ctx = {};
+  let limit = Math.max(1, LIMIT);
+  let items;
+  for (;;) {
+    const raw = await fetchQueuePage(cfg, slug, limit, ctx);
+    // A widened fetch that comes back EMPTY where a narrower one did not is a
+    // blip (a server that went away mid-widening), not an emptier queue: keep
+    // the page we already have, so this pass still records its skips.
+    if (items && items.length && !raw.length) break;
+    items = winnowQueuePage(raw);
+    if (!eligible) break;
+    if (items.some((it) => eligible(it))) break;
+    // A short page is the whole queue: there is nothing deeper to widen into.
+    if (raw.length < limit || limit >= maxLimit) break;
+    limit = Math.min(limit * 2, maxLimit);
+  }
+  return items;
+}
+
+async function fetchQueuePage(cfg, slug, LIMIT, ctx = {}) {
   let items = [];
   // --from-queue dispatches an AGENT to do work, and questions are human
   // decisions — not agent-dispatchable (the standing model: agent-actionable
@@ -7303,7 +7340,8 @@ async function dispatchableQueuePage(cfg, slug, LIMIT = 25) {
     items = r.ok && r.json ? r.json.items || [] : [];
   } else {
     try {
-      const g = require(path.join(ROOT, "lib", "graph.js")).loadGraph(cfg.nodesDir());
+      if (!ctx.graph) ctx.graph = require(path.join(ROOT, "lib", "graph.js")).loadGraph(cfg.nodesDir());
+      const g = ctx.graph;
       const { rankQueue } = require(path.join(ROOT, "lib", "queue.js"));
       const opts = { limit: LIMIT, excludeTypes: ["question"] };
       const r = rankQueue(g, slug ? { project: slug, ...opts } : opts);
@@ -7312,6 +7350,14 @@ async function dispatchableQueuePage(cfg, slug, LIMIT = 25) {
       items = [];
     }
   }
+  return items;
+}
+
+// The hard exclusions applied to whatever the ranker returned — classes an
+// AGENT must never be picked for, all of them defense-in-depth against a
+// backend that ignores the scope filters above.
+function winnowQueuePage(page) {
+  let items = page || [];
   if (!items.length) return [];
   // Defense-in-depth: drop any question the ranker left in (an older server that
   // predates / ignores exclude_type), so a question is never dispatched even
@@ -9367,7 +9413,17 @@ function cmdWorkStatus(cfg, { json }) {
       // operator has to know the item is still reading DONE on the graph.
       if (r.demote_reason) out(`            not demoted on the graph: ${r.demote_reason}`);
     }
-    for (const s of (w.skipped || []).slice(0, 5)) out(`  skipped:  ${s.id} — ${s.reason} (retry after ${s.until})`);
+    // One pass can cool off a whole page of items (a queue of untriaged work
+    // under the default accept policy, a sibling repo's items under a scoped
+    // factory), so listing the first five and stopping told an operator that
+    // five were skipped. The list stays capped — a status read is a glance, and
+    // --json carries every entry — but the REST is counted, by reason.
+    const skips = w.skipped || [];
+    const shown = workLoop.SKIP_LOG_CAP;
+    for (const s of skips.slice(0, shown)) out(`  skipped:  ${s.id} — ${s.reason} (retry after ${s.until})`);
+    if (skips.length > shown) {
+      out(`  skipped:  +${skips.length - shown} more — ${workLoop.summarizeSkips(skips.slice(shown).map((s) => s.reason))} ('spor work --status --json' lists them all)`);
+    }
     if (w.next_poll_at && !w.stopped_at) out(`  next poll: ${w.next_poll_at}`);
   }
   return 0;
@@ -10848,7 +10904,35 @@ async function cmdWork(cfg, { values }) {
   // before the loop starts, so this cannot be declared further down.
   const home = cfg.userConfigHome();
 
-  const candidates = async () => {
+  const candidates = async ({ cooling = null } = {}) => {
+    // Items already being worked by an agent on THIS box — this loop's earlier
+    // runs, a hand-run `spor dispatch`, another loop — are not candidates. The
+    // same-machine guard would refuse them anyway; skipping them here keeps a
+    // refusal (and a cooldown entry) out of the status surface for something
+    // that is simply already being done.
+    const agents = dispatchedAgents(cfg);
+    // ...and neither are items ANOTHER live worker on this box is gating. The
+    // loop already subtracts its OWN gating slots, but nothing else would stop
+    // a second worker here: a gated run is terminal, so it has no live agent
+    // for the in-flight guard to see, and an unenforced `reported` one has
+    // already handed its lease back. Both workers would then dispatch the node
+    // the first one's gate is still judging.
+    const gating = factory ? workLoop.gatingNodeIds(workLoop.readWorkerStatuses(home, { alive: workerAlive })) : null;
+    // What makes an item worth a slot THIS pass, evaluated ON THE PAGE so the
+    // fetch can widen past a page that holds none (the starvation the fixed
+    // page size otherwise makes permanent — see dispatchableQueuePage). The
+    // loop's cooldowns are part of it (`cooling`, passed in per pass): a
+    // deterministic refusal — a profile this box cannot satisfy — cools the
+    // same item forever, so without this the page would stop widening at that
+    // item and everything ranked below it would starve exactly as before. A
+    // page whose only eligible items are cooling is a pass with nothing to
+    // dispatch, which is precisely when a deeper read is free.
+    const scope = gatesKernel.repoScope(factoryRepos);
+    const eligible = (it) =>
+      !(agents.get(it.id) || []).length &&
+      !(gating && gating.has(it.id)) &&
+      !(cooling && cooling(it.id)) &&
+      workLoop.pageEligible(it, { accept, repos: factoryRepos, scope });
     // Page deeper than the default when the cap is high: the page is filtered
     // again below (in-flight) and again by the loop (readiness, cooldowns), so
     // a page the size of the cap could not fill it.
@@ -10856,21 +10940,9 @@ async function cmdWork(cfg, { values }) {
     // ranked across the whole scope token, so a grouping's sibling repos can
     // otherwise fill the page and starve a worker that has eligible work
     // further down.
-    const page = await dispatchableQueuePage(cfg, slug, Math.max(factoryRepos.length ? 50 : 25, concurrency * 4));
-    // Items already being worked by an agent on THIS box — this loop's earlier
-    // runs, a hand-run `spor dispatch`, another loop — are not candidates. The
-    // same-machine guard would refuse them anyway; skipping them here keeps a
-    // refusal (and a cooldown entry) out of the status surface for something
-    // that is simply already being done.
-    const items = annotateInFlight(page, dispatchedAgents(cfg), true).items;
-    if (!factory) return items;
-    // ...and neither are items ANOTHER live worker on this box is gating. The
-    // loop already subtracts its OWN gating slots, but nothing else would stop
-    // a second worker here: a gated run is terminal, so it has no live agent
-    // for the in-flight guard to see, and an unenforced `reported` one has
-    // already handed its lease back. Both workers would then dispatch the node
-    // the first one's gate is still judging.
-    const gating = workLoop.gatingNodeIds(workLoop.readWorkerStatuses(home, { alive: workerAlive }));
+    const page = await dispatchableQueuePage(cfg, slug, Math.max(factoryRepos.length ? 50 : 25, concurrency * 4), { eligible });
+    const items = annotateInFlight(page, agents, true).items;
+    if (!gating) return items;
     return gating.size ? items.filter((it) => !gating.has(it.id)) : items;
   };
 
@@ -10899,7 +10971,13 @@ async function cmdWork(cfg, { values }) {
         out(`  ${i < concurrency ? "->" : "  "} ${it.id}  ${it.readiness || "untriaged"}  ${it.title || it.summary || ""}`.slice(0, 160));
       }
     }
-    for (const { it, reason } of policySkips) out(`  skip ${it.id}  ${it.readiness || "untriaged"}  ${reason}`.slice(0, 160));
+    // Same treatment as the loop's own log and `--status`: a widened page can
+    // hold hundreds of skips, and a preview that scrolls them all off the
+    // screen hides its own answer.
+    for (const { it, reason } of policySkips.slice(0, workLoop.SKIP_LOG_CAP)) out(`  skip ${it.id}  ${it.readiness || "untriaged"}  ${reason}`.slice(0, 160));
+    if (policySkips.length > workLoop.SKIP_LOG_CAP) {
+      out(`  ...and ${policySkips.length - workLoop.SKIP_LOG_CAP} more skipped — ${workLoop.summarizeSkips(policySkips.slice(workLoop.SKIP_LOG_CAP).map((p) => p.reason))}`);
+    }
     out(`\nnothing was launched (--print). Each item would go through 'spor dispatch --node <id>', whose guards decide.`);
     return 0;
   }

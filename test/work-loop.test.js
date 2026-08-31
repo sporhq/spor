@@ -45,8 +45,13 @@ function harness({ queue = [], dispatch = () => ({ ok: true }), pollRuns = null,
     now: () => state.clock,
     log: (l) => state.log.push(l),
     publish: (s) => state.published.push(JSON.parse(JSON.stringify(s))),
-    candidates: async () => {
+    candidates: async (hint) => {
       state.polls += 1;
+      // The loop hands its live cooldowns to the page fetch (the real wiring
+      // is bin/spor.js's `candidates({ cooling })`), so a queue fn can answer
+      // differently once an item is cooling — which is how a widening page is
+      // modelled here.
+      state.cooling = (hint && hint.cooling) || null;
       const page = typeof queue === "function" ? queue(state) : queue;
       if (page === null) throw new Error("queue unreachable");
       // Items are agent-ready unless a test says otherwise: the default accept
@@ -269,6 +274,36 @@ test("the cooldown table is bounded, and evicts the LEAST-recently-refused, not 
     status.skipped.some((x) => x.id === "task-sticky"),
     "the item refused on every pass is the most recently refused, so it must be the LAST thing evicted"
   );
+});
+
+test("a page full of policy skips never evicts a REFUSAL cooldown — the cheap entries go first", async () => {
+  // The cap is 50 while a widened page can carry 200 policy skips, so an
+  // oldest-first eviction would drop the refusal cooldown that made the page
+  // widen in the first place — and the refuser would be re-dispatched every
+  // other poll, invisibly (it no longer reads as cooling in --status).
+  // A policy skip costs nothing to recompute; a refusal cooldown is the only
+  // thing keeping a failed dispatch from being run again.
+  let pass = 0;
+  const h = harness({
+    queue: () => {
+      pass += 1;
+      const page = [{ id: "task-refuses", readiness: "agent" }];
+      // Pass 2 onward: a wide page of untriaged items, more than the cap.
+      if (pass > 1) for (let i = 0; i < workLoop.SKIP_CAP * 3; i++) page.push({ id: `task-untriaged-${pass}-${i}`, readiness: "untriaged" });
+      return page;
+    },
+    dispatch: () => ({ ok: false, reason: "cannot dispatch task-refuses here: this machine can't satisfy profile profile-gpu" }),
+    opts: { concurrency: 1, retryAfterMs: 600000 },
+    maxPasses: 4,
+  });
+  const status = await h.run();
+  const refusals = h.log.filter((l) => l.includes("skipping task-refuses"));
+  assert.strictEqual(refusals.length, 1, `the refusal is attempted ONCE, not once every other poll: ${refusals.length}`);
+  assert.ok(status.skipped.length <= workLoop.SKIP_CAP, `still bounded at ${workLoop.SKIP_CAP}`);
+  const kept = status.skipped.find((x) => x.id === "task-refuses");
+  assert.ok(kept, "the refusal cooldown survived a page of policy skips");
+  assert.strictEqual(kept.kind, "refusal");
+  assert.ok(status.skipped.some((x) => x.kind === "policy"), "policy skips are still recorded — they are just the first to go");
 });
 
 test("a human-readiness item is never a candidate — a worker does not claim what needs a person", async () => {
@@ -963,6 +998,173 @@ test("a numeric option that is not a number is refused, never silently replaced"
   const zero = cli(["work", "--retry-after", "0", "--print"], env);
   assert.strictEqual(zero.status, 0, zero.stderr);
   assert.match(zero.stdout, /retry refused after 0s/);
+});
+
+// A queue whose whole first page is items the default policy may not take:
+// 30 p1-priority untriaged captures ranked ABOVE one agent-ready task. This is
+// the starvation shape the review found — the accept filter ran after a
+// fixed-size fetch, so the ready item (rank 31) was never on the page.
+function starvedFixture() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-starve-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const write = (id, front, body) => fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\n${front}date: 2026-08-20\n---\n${body}\n`);
+  for (let i = 1; i <= 30; i++) {
+    const n = String(i).padStart(2, "0");
+    write(
+      `task-untriaged-${n}`,
+      `type: task\nrepo: demo\ntitle: Untriaged capture number ${n}\nsummary: A captured cleanup number ${n} nobody has triaged or stamped agent-ready yet.\nstatus: open\npriority: p1\n`,
+      "Untriaged capture."
+    );
+  }
+  write("agent-workbox", "type: agent\ntitle: The work loop test box\nsummary: An agent identity for the starvation fixture, owned by the test person.\n", "Test agent.");
+  write(
+    "task-ready",
+    "type: task\nrepo: demo\ntitle: Add bounded retry to the sync worker\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: open\nedges:\n  - {type: assigned, to: agent-workbox}\n",
+    "Ready."
+  );
+  return { home, nodes };
+}
+
+test("an agent-ready item ranked BELOW a full page of untriaged ones is still reached — the page widens instead of starving", () => {
+  const { home } = starvedFixture();
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode() };
+
+  // The starvation is real: the one agent-ready item is ranked past the
+  // 25-item page a poll reads. Asserted on the RANK the queue prints, not on a
+  // line offset — `spor next` prints two lines per item, so a line index would
+  // pass at rank 13 and stop exercising the widening without anyone noticing.
+  const rank = Number((cli(["next", "--limit", "40"], env).stdout.match(/^(\d+)\. .*task-ready/m) || [])[1]);
+  assert.ok(rank > 25, `task-ready must rank past the first page, got rank ${rank}`);
+
+  const r = cli(["work", "--print"], env);
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /-> task-ready/, "the fetch widens past a page of un-dispatchable items");
+  assert.match(r.stdout, /queue:   1 candidate\(s\)/);
+
+  // ...and the widening is CONDITIONAL: under --accept open the first page
+  // already holds candidates, so the page is taken as-is (the top-ranked
+  // untriaged item, not the one 31 rows down).
+  const open = cli(["work", "--print", "--accept", "open"], env);
+  assert.strictEqual(open.status, 0, open.stderr);
+  assert.match(open.stdout, /-> task-untriaged-\d\d/);
+});
+
+test("a deterministically-refusing item does not pin the page width — the cooldown is part of what the fetch widens past", async () => {
+  // The starvation one hop deeper: the page stops widening at the first
+  // ELIGIBLE item, so an item that refuses every time (a profile this box
+  // cannot satisfy) would hold the page at its own rank forever while it
+  // cools, and everything below it would never be fetched.
+  const page = [];
+  for (let i = 0; i < 3; i++) page.push({ id: `task-untriaged-${i}`, readiness: "untriaged" });
+  page.push({ id: "task-refuses", readiness: "agent" });
+  const deeper = { id: "task-ready", readiness: "agent" };
+  const widths = [];
+  const h = harness({
+    // A stand-in for the real page fetch: `task-ready` is only returned when
+    // the caller looks past the items it cannot use.
+    queue: (state) => {
+      const cooling = state.cooling || (() => false);
+      const usable = page.filter((it) => it.readiness === "agent" && !cooling(it.id));
+      widths.push(usable.length ? "narrow" : "wide");
+      return usable.length ? page : [...page, deeper];
+    },
+    dispatch: (item) => (item.id === "task-refuses" ? { ok: false, reason: "cannot dispatch task-refuses here: this machine can't satisfy profile profile-x" } : { ok: true }),
+    opts: { concurrency: 1, max: 1 },
+    onTick: (state) => state.finishAll({ terminal_state: "resolved", terminal_enforced: true }),
+  });
+  const status = await h.run();
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-ready"], "the refusal cools off and the deeper item is then reached");
+  assert.deepStrictEqual(widths, ["narrow", "wide"], "the first pass stopped at the refusing item; the second looked past it");
+  assert.strictEqual(status.skipped.find((sk) => sk.id === "task-refuses").reason, "cannot dispatch task-refuses here: this machine can't satisfy profile profile-x");
+});
+
+test("summarizeSkips aggregates by REASON CLASS, so one item's specifics never fragment the count", () => {
+  const reasons = [
+    ...Array(18).fill("not agent-ready; work.accept ready"),
+    "outside the factory's repo scope (repo demo; this factory judges demo-server)",
+    "outside the factory's repo scope (repo other; this factory judges demo-server)",
+  ];
+  assert.strictEqual(workLoop.summarizeSkips(reasons), "18 not agent-ready, 2 outside the factory's repo scope");
+  // The per-item detail a refusal carries is what the class strips: the repo
+  // named in a scope skip, the node named in a dispatch refusal.
+  assert.strictEqual(workLoop.skipClass("outside the factory's repo scope (repo demo; this factory judges demo-server)"), "outside the factory's repo scope");
+  assert.strictEqual(workLoop.skipClass("not agent-ready; work.accept ready"), "not agent-ready");
+  // A dispatch refusal leads with the node id, so classifying by the raw first
+  // segment would give every refused item a class of its own — the exact
+  // fragmentation an aggregate exists to avoid.
+  assert.strictEqual(
+    workLoop.summarizeSkips([
+      "cannot dispatch task-a here: this machine can't satisfy profile profile-x (via assigned)",
+      "cannot dispatch task-b here: this machine can't satisfy profile profile-x (via assigned)",
+    ]),
+    "2 this machine can't satisfy profile profile-x"
+  );
+  assert.strictEqual(workLoop.skipClass("cannot dispatch task-a: this item requires a human — no owner"), "this item requires a human — no owner");
+  // Distinct classes are bounded, with the tail counted rather than dropped.
+  assert.strictEqual(workLoop.summarizeSkips(["a", "a", "b", "c", "d", "e"]), "2 a, 1 b, 1 c, 2 other");
+  assert.strictEqual(workLoop.summarizeSkips([]), "");
+});
+
+test("the loop names the first few skips and AGGREGATES the rest, rather than one log line per untriaged item per poll", async () => {
+  // The widened page (above) can hand a pass far more skips than the cooldown
+  // map remembers, so an uncoalesced log re-prints every evicted one every 30s.
+  const queue = [];
+  for (let i = 0; i < 12; i++) queue.push({ id: `task-untriaged-${i}`, readiness: "untriaged" });
+  queue.push({ id: "task-ready", readiness: "agent" });
+  const h = harness({ queue, opts: { concurrency: 1, max: 1 }, onTick: (state) => state.finishAll({ terminal_state: "resolved", terminal_enforced: true }) });
+  const status = await h.run();
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-ready"]);
+  const named = h.log.filter((l) => /^work: skipping task-untriaged-/.test(l));
+  assert.strictEqual(named.length, workLoop.SKIP_LOG_CAP, "the individually-named skips are capped");
+  assert.ok(
+    h.log.some((l) => l === `work: ...and 7 more skipped this pass — 7 not agent-ready ('spor work --status' lists them, newest first)`),
+    h.log.join("\n")
+  );
+  // The COUNT is capped, never the record: every skip still cooled off, and
+  // the status surface carries them all.
+  assert.strictEqual(status.skipped.length, 12);
+});
+
+test("spor work --status counts the skips it does not list, instead of stopping silently at five", () => {
+  // The human renderer is the DEFAULT surface: showing five of 25 told an
+  // operator that five items were skipped (the review's second finding).
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-skips-"));
+  const skipped = [];
+  for (let i = 0; i < 25; i++) {
+    skipped.push({
+      id: `task-untriaged-${String(i).padStart(2, "0")}`,
+      reason: i < 20 ? "not agent-ready; work.accept ready" : `outside the factory's repo scope (repo demo-${i}; this factory judges demo-server)`,
+      at: `2026-08-31T10:${String(59 - i).padStart(2, "0")}:00.000Z`,
+      until: "2026-08-31T11:30:00.000Z",
+    });
+  }
+  workLoop.writeWorkerStatus(home, {
+    worker_id: "11111111-2222-3333-4444-555555555555",
+    pid: 999999,
+    state: "polling",
+    project: "demo",
+    accept: "ready",
+    concurrency: 1,
+    dispatched: 0,
+    outcomes: { resolved: 0, reported: 0, failed: 0 },
+    active: [],
+    gating: [],
+    recent: [],
+    skipped,
+    started_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    stopped_at: new Date().toISOString(),
+    stop_reason: "one pass (--once)",
+  });
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home };
+  const text = cli(["work", "--status"], env);
+  assert.strictEqual(text.status, 0, text.stderr);
+  assert.strictEqual((text.stdout.match(/^  skipped:  task-untriaged-/gm) || []).length, 5, "the list itself stays a glance");
+  assert.match(text.stdout, /^  skipped:  \+20 more — 15 not agent-ready, 5 outside the factory's repo scope \('spor work --status --json' lists them all\)$/m);
+  // --json is unchanged: it carries every entry, in full detail.
+  const json = cli(["work", "--status", "--json"], env);
+  assert.strictEqual(JSON.parse(json.stdout).workers[0].skipped.length, 25);
 });
 
 test("spor work --status with nothing recorded says so, in both renderings", () => {

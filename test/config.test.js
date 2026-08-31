@@ -406,6 +406,25 @@ test('SPOR_SESSION_LEASE env resolves through the cascade with no "unknown confi
   assert.strictEqual(c.getBool('sessionLease.enabled', true), false);
 });
 
+test('work.* resolves through the cascade with no "unknown config key" warning', () => {
+  // The same regression as sessionLease above, one namespace later: ENV_MAP
+  // registered SPOR_WORK_ACCEPT -> work.accept (task-spor-work-accept-policy)
+  // but KNOWN_KEYS omitted the "work" top-level namespace, so the pull
+  // worker's own settings were reported as an ignored unknown key while being
+  // honored — the most misleading shape a warning can take.
+  const root = tmp();
+  const env = loadConfig({ cwd: root, env: bareEnv({ SPOR_HOME: root, SPOR_WORK_ACCEPT: 'open' }) });
+  assert.deepStrictEqual(env.warnings, []);
+  assert.strictEqual(env.get('work.accept', 'ready'), 'open');
+  // ...and from a config file, where the whole `work` object lands at once.
+  const filed = tmp();
+  write(path.join(filed, '.spor.json'), { work: { accept: 'open', factory: 'factory-x', concurrency: 2 }, enabled: true });
+  const c = loadConfig({ cwd: filed, env: bareEnv({ SPOR_HOME: filed }) });
+  assert.deepStrictEqual(c.warnings, []);
+  assert.strictEqual(c.get('work.factory', null), 'factory-x');
+  assert.strictEqual(c.getNum('work.concurrency', 1), 2);
+});
+
 test('fail-open: malformed config file is skipped with a warning', () => {
   const root = tmp();
   fs.writeFileSync(path.join(root, '.spor.json'), '{ not json ');

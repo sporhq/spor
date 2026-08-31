@@ -121,6 +121,26 @@ part of this knob — no policy value makes a worker claim a
 default `ready`); an unknown value refuses to start the worker rather than
 silently falling back. `spor work --print` shows the effective policy.
 
+**The page widens rather than starving.** Selection reads a fixed-size ranked
+page, and the policy (and a factory's repo scope, §10.6) filters what comes
+back — so a page filled entirely by items this worker may not take would hide
+an eligible one ranked below it on every poll, forever. When nothing on the
+page is dispatchable by this worker — un-consented, out of scope, already in
+flight here, or cooling off after a refusal — the fetch is repeated with the
+limit doubled, up to 200, until something is or the queue is exhausted. The
+cooldowns count, deliberately: an item that refuses deterministically (a
+profile this box cannot satisfy) would otherwise pin the page at its own rank
+forever. A pass that finds a candidate on the first page pays nothing extra,
+and in local mode a widened read re-ranks the graph it already loaded. The
+skips themselves stay visible: the first five of a pass are named individually
+on stdout and the rest are aggregated by reason (`...and 31 more skipped this
+pass — 31 not agent-ready`); `spor work --status` and `--print` do the same,
+with `--status --json` carrying every entry. The cooldowns a worker remembers
+are bounded, and when it must forget one it forgets a policy or scope skip
+before a refusal — the first is recomputed from the next page for free, while
+the second is the only thing keeping a dispatch that already failed from being
+run again.
+
 `suggest`
 on each item (`do`/`dispatch`/`blocked`/`triage`/`close`/`approve`) is a
 further hint; `blocked` means a live `blocks` edge still gates it — claiming
