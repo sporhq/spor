@@ -103,7 +103,25 @@ worker** — an unattended loop picking its own work from the pool, such as
 selection and moves on. An **explicit human-initiated dispatch** — a person
 naming this exact node, such as `spor dispatch <id>` — **may**: it warns and
 proceeds, since a person choosing to point an agent at flagged work is
-itself the human step the readiness gap exists to route through. `suggest`
+itself the human step the readiness gap exists to route through.
+
+**Acceptance policy** (`work.accept` / `--accept` / `SPOR_WORK_ACCEPT`;
+dec-spor-work-accept-policy-configurable). On top of that floor, an
+autonomous worker's pickup is configurable. `ready` — the **default** — is
+explicit consent: it dispatches only items whose derived readiness is
+`agent` (a person's `spor ready <id>` stamp, or an `assigned -> agent`
+routing), so on a team nothing runs on a worker box without that green
+light; an `untriaged` item is skipped with a visible reason (`not
+agent-ready; work.accept ready`) on the worker's stdout and in `spor work
+--status`, never silently hidden. `open` opts back into the original looser
+pickup: everything except `readiness: human`. The human floor above is not
+part of this knob — no policy value makes a worker claim a
+`readiness: human` item. Resolution is the ordinary config cascade
+(`--accept` > `SPOR_WORK_ACCEPT` > repo `.spor.json` > user config >
+default `ready`); an unknown value refuses to start the worker rather than
+silently falling back. `spor work --print` shows the effective policy.
+
+`suggest`
 on each item (`do`/`dispatch`/`blocked`/`triage`/`close`/`approve`) is a
 further hint; `blocked` means a live `blocks` edge still gates it — claiming
 it is legal but the item cannot resolve until its blocker does.

@@ -9,8 +9,9 @@
 //      scratch graph home — never the live graph (norm-cc-scratch-home-for-tests).
 //
 // The one thing these must keep proving is that the loop adds NO eligibility
-// rule of its own beyond "not human-readiness, not already in flight here":
-// every refusal is `spor dispatch`'s, reached by calling it.
+// rule of its own beyond "not human-readiness, accepted by the work.accept
+// policy, not already in flight here": every refusal is `spor dispatch`'s,
+// reached by calling it.
 require("./helpers/tmp-cleanup"); // scratch-home leak guard (issue-spor-test-mkdtemp-inode-exhaustion)
 const test = require("node:test");
 const assert = require("node:assert");
@@ -48,7 +49,10 @@ function harness({ queue = [], dispatch = () => ({ ok: true }), pollRuns = null,
       state.polls += 1;
       const page = typeof queue === "function" ? queue(state) : queue;
       if (page === null) throw new Error("queue unreachable");
-      return page;
+      // Items are agent-ready unless a test says otherwise: the default accept
+      // policy is `ready` (explicit consent), and most of these tests are about
+      // slot accounting, not the policy — the policy has its own tests below.
+      return page.map((it) => (it && it.id ? { readiness: "agent", ...it } : it));
     },
     dispatch: async (item) => {
       const verdict = dispatch(item, state);
@@ -361,7 +365,12 @@ test("nextBackoffMs: never below the interval, never above the ceiling, immune t
 });
 
 test("selectWorkCandidates: excludes in-flight, human-readiness and cooling-off items, keeping queue order", () => {
-  const items = [{ id: "a" }, { id: "b", readiness: "human" }, { id: "c" }, { id: "d" }];
+  const items = [
+    { id: "a", readiness: "agent" },
+    { id: "b", readiness: "human" },
+    { id: "c", readiness: "agent" },
+    { id: "d", readiness: "agent" },
+  ];
   const got = workLoop.selectWorkCandidates(items, {
     active: new Set(["c"]),
     skipped: new Map([["d", { until: 500 }]]),
@@ -371,6 +380,69 @@ test("selectWorkCandidates: excludes in-flight, human-readiness and cooling-off 
   // …and an EXPIRED cooldown is a candidate again.
   const later = workLoop.selectWorkCandidates(items, { skipped: new Map([["d", { until: 500 }]]), now: 900 });
   assert.deepStrictEqual(later.map((i) => i.id), ["a", "c", "d"]);
+});
+
+test("selectWorkCandidates: the DEFAULT policy is explicit consent — untriaged is skipped, visibly", () => {
+  // dec-spor-work-accept-policy-configurable: with nothing configured, only an
+  // item a person stamped agent-ready is a candidate. An untriaged item — a
+  // missing readiness field included — is skipped through onSkip so the loop
+  // can say so, never silently dropped.
+  const items = [{ id: "a", readiness: "agent" }, { id: "b", readiness: "untriaged" }, { id: "c" }];
+  const skips = [];
+  const got = workLoop.selectWorkCandidates(items, { onSkip: (it, reason) => skips.push([it.id, reason]) });
+  assert.deepStrictEqual(got.map((i) => i.id), ["a"]);
+  assert.deepStrictEqual(skips, [
+    ["b", "not agent-ready; work.accept ready"],
+    ["c", "not agent-ready; work.accept ready"],
+  ]);
+  // `open` restores the original pickup: everything except readiness:human.
+  const open = workLoop.selectWorkCandidates(items, { accept: "open", onSkip: () => assert.fail("open skips nothing on policy") });
+  assert.deepStrictEqual(open.map((i) => i.id), ["a", "b", "c"]);
+  // The human floor is NOT part of the knob: refused under EVERY policy, and
+  // never reported as a policy skip (it is not one — WORKERS.md §3).
+  for (const accept of workLoop.WORK_ACCEPT_POLICIES) {
+    const withHuman = workLoop.selectWorkCandidates([{ id: "h", readiness: "human" }, { id: "a", readiness: "agent" }], {
+      accept,
+      onSkip: (it) => assert.notStrictEqual(it.id, "h", "a human item is the floor, not a policy skip"),
+    });
+    assert.deepStrictEqual(withHuman.map((i) => i.id), ["a"], `human refused under '${accept}'`);
+  }
+  // An item already cooling off is not re-reported every pass: the cooldown
+  // check runs before the policy check.
+  const cooling = [];
+  workLoop.selectWorkCandidates([{ id: "b" }], {
+    skipped: new Map([["b", { until: 500 }]]),
+    now: 100,
+    onSkip: (it) => cooling.push(it.id),
+  });
+  assert.deepStrictEqual(cooling, [], "a cooling policy skip stays quiet until its cooldown expires");
+});
+
+test("the loop under the default policy: an untriaged item is cooled off with the reason on stdout and in the status", async () => {
+  const h = harness({
+    queue: [{ id: "task-untriaged", readiness: "untriaged" }, { id: "task-ready", readiness: "agent" }],
+    opts: { concurrency: 1, max: 1 },
+    onTick: (state) => state.finishAll({ terminal_state: "resolved", terminal_enforced: true }),
+  });
+  const status = await h.run();
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-ready"], "only the stamped item is dispatched");
+  assert.strictEqual(status.accept, "ready", "the status surface names the effective policy");
+  assert.strictEqual(status.skipped.length, 1);
+  assert.strictEqual(status.skipped[0].id, "task-untriaged");
+  assert.strictEqual(status.skipped[0].reason, "not agent-ready; work.accept ready");
+  assert.ok(h.log.some((l) => l.includes("skipping task-untriaged — not agent-ready; work.accept ready")), h.log.join("\n"));
+});
+
+test("the loop under --accept open takes the untriaged item; human is still refused", async () => {
+  const h = harness({
+    queue: [{ id: "task-untriaged", readiness: "untriaged" }, { id: "task-human", readiness: "human" }],
+    opts: { concurrency: 1, max: 1, accept: "open" },
+    onTick: (state) => state.finishAll({ terminal_state: "resolved", terminal_enforced: true }),
+  });
+  const status = await h.run();
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-untriaged"]);
+  assert.strictEqual(status.accept, "open");
+  assert.strictEqual(status.skipped.length, 0, "an accepted item is not a skip, and human is the floor, not a skip");
 });
 
 test("refusalReason takes the REFUSAL, not the warning that preceded it or the remediation after it", () => {
@@ -510,6 +582,9 @@ function cliFixture({ declaration = true } = {}) {
     fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\ntype: task\nrepo: demo\n${extra}date: 2026-08-20\n---\n${body}\n`);
   node("task-ready", "title: Add bounded retry to the sync worker\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: open\nedges:\n  - {type: assigned, to: agent-workbox, profile: profile-work}\n", "Add bounded retry to the sync worker.");
   node("task-needs-human", "title: Decide the retention policy for sync worker logs\nsummary: Decide how long the sync worker keeps its logs, a policy call with legal input.\nstatus: open\nrequires: [human]\n", "Needs a person.");
+  // Open, unassigned, no readiness stamp: derived UNTRIAGED. The default
+  // accept policy must skip it — visibly — and `--accept open` must take it.
+  node("task-untriaged", "title: Tidy up the sync worker imports\nsummary: A captured cleanup nobody has triaged or stamped agent-ready yet.\nstatus: open\n", "Untriaged capture.");
   node("task-done", "title: Ship the sync worker skeleton\nsummary: The sync worker skeleton shipped, with its first end-to-end run recorded.\nstatus: done\n", "Already done.");
   fs.writeFileSync(path.join(nodes, "agent-workbox.md"), `---\nid: agent-workbox\ntype: agent\ntitle: The work loop test box\nsummary: An agent identity for the work-loop test fixture, owned by the test person.\ndate: 2026-08-20\n---\nTest agent.\n`);
   fs.writeFileSync(path.join(nodes, "profile-work.md"), `---\nid: profile-work\ntype: profile\ntitle: Work loop test profile\nsummary: A profile selecting the fake harness the work-loop test declares locally.\nharness: ${HARNESS}\ndate: 2026-08-20\n---\nTest profile.\n`);
@@ -540,6 +615,7 @@ test("spor work --print previews scope, pacing and candidates, and launches noth
   const r = cli(["work", "--print"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.match(r.stdout, /^project: \(all projects\)$/m);
+  assert.match(r.stdout, /^accept:  ready — only items explicitly stamped agent-ready/m, "the effective policy is printed beside the scope");
   assert.match(r.stdout, /concurrency 1, interval 30s, backoff to 300s/);
   assert.match(r.stdout, /-> task-ready/);
   // The one that matters: `task-needs-human` IS in the live queue (it is open
@@ -547,7 +623,34 @@ test("spor work --print previews scope, pacing and candidates, and launches noth
   // filter that keeps a worker off it.
   assert.match(cli(["next", "--limit", "20"], { SPOR_HOME: home, XDG_CONFIG_HOME: home }).stdout, /task-needs-human/);
   assert.doesNotMatch(r.stdout, /task-needs-human/, "a human-readiness item is never a candidate");
+  // The untriaged item is not a candidate under the default policy — and it is
+  // shown as a policy skip, not silently absent.
+  assert.doesNotMatch(r.stdout, /-> task-untriaged/, "an untriaged item is not a candidate by default");
+  assert.match(r.stdout, /skip task-untriaged\s+untriaged\s+not agent-ready; work\.accept ready/);
   assert.ok(!fs.existsSync(outfile), "nothing was launched");
+
+  // `--accept open` opts back into the original pickup: the untriaged item is
+  // a candidate again, and human is still refused (the floor, not the policy).
+  const open = cli(["work", "--print", "--accept", "open"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() });
+  assert.strictEqual(open.status, 0, open.stderr);
+  assert.match(open.stdout, /^accept:  open — any queue item except readiness:human/m);
+  assert.match(open.stdout, /task-untriaged/);
+  assert.doesNotMatch(open.stdout, /skip task-untriaged/);
+  assert.doesNotMatch(open.stdout, /task-needs-human/, "human-readiness stays out under every policy");
+});
+
+test("an unknown accept policy refuses to start the worker — flag or config, never a silent fallback", () => {
+  const { home, outfile } = cliFixture();
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() };
+  const flag = cli(["work", "--once", "--accept", "yolo"], env);
+  assert.strictEqual(flag.status, 1);
+  assert.match(flag.stderr, /--accept yolo — expected one of: ready, open/);
+  // The same posture when the bad value arrives through the cascade
+  // (SPOR_WORK_ACCEPT / work.accept), which an unattended unit file would use.
+  const viaEnv = cli(["work", "--once"], { ...env, SPOR_WORK_ACCEPT: "anything" });
+  assert.strictEqual(viaEnv.status, 1);
+  assert.match(viaEnv.stderr, /work\.accept anything — expected one of: ready, open/);
+  assert.ok(!fs.existsSync(outfile), "nothing was launched under a refused policy");
 });
 
 test("spor work --once --max 1 dispatches through the real guards, waits for the run, and reports the outcome", async () => {
@@ -601,10 +704,13 @@ test("a dispatch refusal is recorded with its own reason and the worker stops in
 
   const status = JSON.parse(cli(["work", "--status", "--json"], { SPOR_HOME: home, XDG_CONFIG_HOME: home }).stdout);
   const skipped = status.workers[0].skipped;
-  assert.strictEqual(skipped.length, 1);
-  assert.strictEqual(skipped[0].id, "task-ready");
-  assert.match(skipped[0].reason, /task-ready/, "the refusal's own first line is the reason");
-  assert.ok(Date.parse(skipped[0].until) > Date.now(), "and it is cooling off, not dropped");
+  // Two skips: the dispatch refusal under test, plus the fixture's untriaged
+  // item cooled off by the default accept policy.
+  const refused = skipped.find((s) => s.id === "task-ready");
+  assert.ok(refused, JSON.stringify(skipped));
+  assert.match(refused.reason, /task-ready/, "the refusal's own first line is the reason");
+  assert.ok(Date.parse(refused.until) > Date.now(), "and it is cooling off, not dropped");
+  assert.strictEqual(skipped.find((s) => s.id === "task-untriaged").reason, "not agent-ready; work.accept ready");
 });
 
 // A scratch graph home whose queue holds exactly one item that names its
@@ -619,7 +725,7 @@ function laneFixture({ declaration = true } = {}) {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-lane-repo-"));
   fs.writeFileSync(
     path.join(nodes, "task-lane.md"),
-    `---\nid: task-lane\ntype: task\nrepo: demo\ntitle: Move the retention-policy test into its own file\nsummary: A protected test path changed on the implementer's branch; the change belongs in its own lane.\nstatus: open\nprofile: profile-work\ndate: 2026-08-20\n---\nTest-change lane item.\n`
+    `---\nid: task-lane\ntype: task\nrepo: demo\ntitle: Move the retention-policy test into its own file\nsummary: A protected test path changed on the implementer's branch; the change belongs in its own lane.\nstatus: open\nreadiness: agent\nprofile: profile-work\ndate: 2026-08-20\n---\nTest-change lane item.\n`
   );
   fs.writeFileSync(
     path.join(nodes, "profile-work.md"),

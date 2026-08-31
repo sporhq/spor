@@ -517,7 +517,10 @@ function loopHarness({ queue = [], gate = null, terminalState = "resolved", enfo
     now: () => state.clock,
     log: (l) => state.log.push(l),
     publish: (s) => state.published.push(JSON.parse(JSON.stringify(s))),
-    candidates: async () => queue,
+    // Agent-ready by default: the loop's `ready` accept policy would otherwise
+    // skip these bare fixtures, and gating — not acceptance — is what these
+    // tests are about (the policy has its own tests in work-loop.test.js).
+    candidates: async () => queue.map((it) => (it && it.id ? { readiness: "agent", ...it } : it)),
     dispatch: async (item) => {
       const runId = `run-${++seq}`;
       state.runs.set(runId, {
@@ -691,7 +694,7 @@ test("a GATING item is not a candidate: a free slot never re-dispatches what thi
     now: () => state.clock,
     log: () => {},
     publish: () => {},
-    candidates: async () => [{ id: "task-a" }],
+    candidates: async () => [{ id: "task-a", readiness: "agent" }],
     dispatch: async (item) => {
       const runId = `run-${++seq}`;
       state.dispatched.push(item.id);
@@ -909,7 +912,7 @@ test("resumption is bounded by the free slots, comes AHEAD of new work, and stop
     now: () => state.clock,
     log: () => {},
     publish: () => {},
-    candidates: async () => [{ id: "task-a" }],
+    candidates: async () => [{ id: "task-a", readiness: "agent" }],
     dispatch: async () => {
       state.dispatched += 1;
       return { ok: true, run: { run_id: "run-new", harness: "fake" } };
@@ -959,7 +962,7 @@ test("a stop folds in the verdicts that DID land before abandoning the rest", as
         await new Promise((r) => setImmediate(r)); // let the verdict reach its job handle
         control.stopping = true;
       }
-      return [{ id: "task-a" }, { id: "task-b" }];
+      return [{ id: "task-a", readiness: "agent" }, { id: "task-b", readiness: "agent" }];
     },
     dispatch: async (item) => ({ ok: true, run: { run_id: `run-${item.id}`, harness: "fake" } }),
     pollRuns: async (ids) =>
@@ -996,7 +999,7 @@ test("a stop marks its abandoned pipelines INTERRUPTED — the state the next wo
     now: () => state.clock,
     log: () => {},
     publish: () => {},
-    candidates: async () => [{ id: "task-a" }],
+    candidates: async () => [{ id: "task-a", readiness: "agent" }],
     dispatch: async () => ({ ok: true, run: { run_id: "run-1", harness: "fake" } }),
     pollRuns: async (ids) => ids.map((id) => ({ run_id: id, terminal: true, record: { run_id: id, node_id: "task-a", state: "done", terminal_state: "resolved", terminal_enforced: true } })),
     gate: () => new Promise(() => {}),

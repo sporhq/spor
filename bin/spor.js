@@ -9326,6 +9326,7 @@ function cmdWorkStatus(cfg, { json }) {
     const o = w.outcomes || {};
     out(
       `${String(w.worker_id).slice(0, 8)}  ${state}  ${w.project || "(all projects)"}  ` +
+        `${w.accept ? `accept ${w.accept}  ` : ""}` +
         `${(w.active || []).length}/${w.concurrency} slots  dispatched ${w.dispatched || 0}  ` +
         `resolved ${o.resolved || 0} reported ${o.reported || 0} failed ${o.failed || 0}` +
         `${o.unenforced ? ` (${o.unenforced} unenforced)` : ""}`
@@ -9609,7 +9610,12 @@ const { gateIdSuffix, fenceSafe, capBytes: gateCapBytes, NODE_BODY_CAP_BYTES } =
 // One work-node template for the three items a gate can file. All three are
 // ordinary queue items — an escalation and an approval carry `requires: [human]`
 // so no worker (this one included) can ever claim them, which is what makes
-// "escalates to a human" true rather than decorative.
+// "escalates to a human" true rather than decorative. The one item that IS for
+// a worker — the test-change lane item — is stamped `readiness: agent`:
+// without the stamp it would derive UNTRIAGED and the default accept policy
+// (work.accept ready, dec-spor-work-accept-policy-configurable) would leave it
+// unworked forever. The consent the stamp records is real, just upstream: the
+// operator declared the lane's profile in the factory definition.
 function buildGateWorkNode({ id, title, summary, body, project, date, edges = [], requiresHuman = false, profile = null }) {
   // The frontmatter parser is line-based: a title or summary carrying a newline
   // (a git message, a suite's first failing line) would truncate the node. Flatten
@@ -9626,7 +9632,7 @@ function buildGateWorkNode({ id, title, summary, body, project, date, edges = []
     `title: ${flat(title, 120)}`,
     `summary: ${flat(summary, 460)}`,
     `date: ${date}`,
-    ...(requiresHuman ? ["requires: [human]"] : []),
+    ...(requiresHuman ? ["requires: [human]"] : ["readiness: agent"]),
     ...(profile ? [`profile: ${profile}`] : []),
     ...(edges.length ? ["edges:", ...edges.map((e) => `  - {type: ${e.type}, to: ${e.to}}`)] : []),
     "---",
@@ -10726,6 +10732,20 @@ async function cmdWork(cfg, { values }) {
   const retryAfterMs = num("retry-after", values["retry-after"], { min: 0, max: 30 * DAY_S, fallback: cfg.getNum("work.retryAfterMs", workLoop.WORK_DEFAULTS.retryAfterMs) / 1000 }) * 1000;
   const runMaxMs = num("run-max", values["run-max"], { min: 0, max: 720, fallback: cfg.getNum("work.runMaxMs", workLoop.WORK_DEFAULTS.runMaxMs) / 3600000 }) * 3600000;
   const max = num("max", values.max, { min: 0, max: 1000000, fallback: 0 });
+  // The acceptance policy (task-spor-work-accept-policy): which readiness
+  // classifications this loop may pick up. `ready` (the default) dispatches
+  // only items a person explicitly stamped agent-ready; `open` restores the
+  // original looser pickup (everything except readiness:human — that floor is
+  // WORKERS.md §3's and no policy value moves it). Resolution: --accept >
+  // SPOR_WORK_ACCEPT > repo .spor.json > user config > default — the flag is
+  // checked here, everything else rides the ordinary cascade. An unknown value
+  // REFUSES to start the worker, same posture as the numeric options above: a
+  // typo'd policy on an unattended box must not silently become either one.
+  const acceptRaw = values.accept != null ? values.accept : cfg.get("work.accept", workLoop.WORK_DEFAULTS.accept);
+  const accept = String(acceptRaw).trim().toLowerCase();
+  if (!workLoop.WORK_ACCEPT_POLICIES.includes(accept)) {
+    bad.push(`${values.accept != null ? "--accept" : "work.accept"} ${String(acceptRaw).trim() === "" ? "(empty)" : acceptRaw} — expected one of: ${workLoop.WORK_ACCEPT_POLICIES.join(", ")}`);
+  }
   if (bad.length) {
     for (const b of bad) err(`spor work: ${b}`);
     return 1;
@@ -10801,6 +10821,7 @@ async function cmdWork(cfg, { values }) {
 
   if (values.print || values["dry-run"]) {
     out(`project: ${slug || "(all projects)"}`);
+    out(`accept:  ${accept} — ${accept === "open" ? "any queue item except readiness:human (untriaged included)" : "only items explicitly stamped agent-ready (--accept open for the looser pickup)"}`);
     out(`loop:    concurrency ${concurrency}, interval ${intervalMs / 1000}s, backoff to ${maxIntervalMs / 1000}s, retry refused after ${retryAfterMs / 1000}s, stop following a run after ${runMaxMs / 3600000}h${max ? `, stop after ${max}` : ""}`);
     out(`status:  ${workLoop.workDir(cfg.userConfigHome())}`);
     if (factory) {
@@ -10813,7 +10834,8 @@ async function cmdWork(cfg, { values }) {
     } else {
       out(`factory: none — the loop runs bare (declare one with --factory <id> or work.factory)`);
     }
-    const cands = workLoop.selectWorkCandidates(await candidates(), {});
+    const policySkips = [];
+    const cands = workLoop.selectWorkCandidates(await candidates(), { accept, onSkip: (it, reason) => policySkips.push({ it, reason }) });
     if (!cands.length) out("queue:   nothing dispatchable right now");
     else {
       out(`queue:   ${cands.length} candidate(s); this pass would take the first ${Math.min(concurrency, cands.length)}`);
@@ -10821,6 +10843,7 @@ async function cmdWork(cfg, { values }) {
         out(`  ${i < concurrency ? "->" : "  "} ${it.id}  ${it.readiness || "untriaged"}  ${it.title || it.summary || ""}`.slice(0, 160));
       }
     }
+    for (const { it, reason } of policySkips) out(`  skip ${it.id}  ${it.readiness || "untriaged"}  ${reason}`.slice(0, 160));
     out(`\nnothing was launched (--print). Each item would go through 'spor dispatch --node <id>', whose guards decide.`);
     return 0;
   }
@@ -10856,11 +10879,11 @@ async function cmdWork(cfg, { values }) {
     err(line);
   };
 
-  out(`work: worker ${workerId.slice(0, 8)} — ${slug || "all projects"}, concurrency ${concurrency}, poll ${intervalMs / 1000}s${max ? `, stopping after ${max} dispatch(es)` : ""}`);
+  out(`work: worker ${workerId.slice(0, 8)} — ${slug || "all projects"}, accept ${accept}, concurrency ${concurrency}, poll ${intervalMs / 1000}s${max ? `, stopping after ${max} dispatch(es)` : ""}`);
   out(`work: status at ${workLoop.workerStatusPath(home, workerId)}  ('spor work --status')`);
   const final = await workLoop.runWorkLoop({
     opts: {
-      workerId, project: slug, concurrency, intervalMs, maxIntervalMs, retryAfterMs, max, once: !!values.once, factory: factoryId,
+      workerId, project: slug, accept, concurrency, intervalMs, maxIntervalMs, retryAfterMs, max, once: !!values.once, factory: factoryId,
       // The pid-reuse guard for this record: a SIGKILLed worker leaves no
       // stopped_at, and a bare pid probe would read its recycled pid as this
       // worker still running (the same identity check the run store makes).
@@ -13059,6 +13082,15 @@ const COMMANDS = {
       "that dies drops its lease by lapsing. Capabilities stay machine-local facts\n" +
       "and the fleet scheduler stays advisory, so an offline worker degrades to\n" +
       "'work the queue with what I have' instead of stopping.\n\n" +
+      "WHAT IT ACCEPTS. --accept (work.accept / SPOR_WORK_ACCEPT) sets the\n" +
+      "acceptance policy: 'ready' — the DEFAULT — dispatches only items a person\n" +
+      "explicitly stamped agent-ready ('spor ready <id>', or an assigned->agent\n" +
+      "routing), so on a team nothing lands on a worker box without that green\n" +
+      "light; untriaged items are skipped with a visible reason ('spor work\n" +
+      "--status'). 'open' opts back into the looser pickup: everything except\n" +
+      "readiness:human. That human floor is not part of the knob — no policy makes\n" +
+      "a worker claim a human-readiness item (WORKERS.md §3). An unknown value\n" +
+      "refuses to start the worker.\n\n" +
       "IT ADDS NO GUARDS. Every launch goes through 'spor dispatch --node <id>', so\n" +
       "already-resolved, requires:human, profile-unsatisfiable-here (never\n" +
       "substituted), graph-declared launch fields, the same-machine duplicate guard,\n" +
@@ -13084,8 +13116,9 @@ const COMMANDS = {
       "worker on this box: state, slots, dispatch count, verified outcomes, what it\n" +
       "is deliberately skipping and why. Records live under the machine-local\n" +
       "journal; a worker whose process is gone reads as stale, never as running.\n" +
-      "Tune with the work.* config keys (concurrency, intervalMs, maxIntervalMs,\n" +
-      "retryAfterMs, project) so the unit file can be a bare 'spor work'.\n\n" +
+      "Tune with the work.* config keys (accept, concurrency, intervalMs,\n" +
+      "maxIntervalMs, retryAfterMs, project) so the unit file can be a bare\n" +
+      "'spor work'.\n\n" +
       "GATES (task-spor-work-gate-pipeline). With no factory declared the loop runs\n" +
       "BARE — dispatch-only, exactly as it shipped. Point --factory (or work.factory)\n" +
       "at a 'type: factory' node and its ordered gate list is ENFORCED in code between\n" +
@@ -13108,6 +13141,7 @@ const COMMANDS = {
       "rather than running it ungated. See WORKERS.md §10.",
     options: {
       project: { type: "string", value: "S", desc: "scope to a project slug (default: work.project/queue.project, else the whole queue)" },
+      accept: { type: "string", value: "P", desc: "acceptance policy: 'ready' dispatches only items explicitly stamped agent-ready (default; also work.accept/SPOR_WORK_ACCEPT); 'open' takes anything except readiness:human" },
       factory: { type: "string", value: "factory-id", desc: "the graph-resident factory definition whose gates every run must pass (default: work.factory; absent = bare loop)" },
       concurrency: { type: "string", value: "N", desc: "how many runs to keep in flight (default 1)" },
       interval: { type: "string", value: "S", desc: "seconds between polls (default 30)" },

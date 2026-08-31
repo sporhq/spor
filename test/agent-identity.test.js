@@ -1278,7 +1278,7 @@ test("spor work --once (remote): no agent configured => the dispatch hard-fails,
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-w1-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-w1r-"));
   fs.mkdirSync(home, { recursive: true });
-  const { srv, base } = await dispatchStub({ queueItem: { id: "task-foo", type: "task", project: "demo", repo: "demo", title: "The actionable task" } });
+  const { srv, base } = await dispatchStub({ queueItem: { id: "task-foo", type: "task", project: "demo", repo: "demo", title: "The actionable task", readiness: "agent" } });
   try {
     run(["repos", "add", "demo", repo], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
     const r = await runAsync(
