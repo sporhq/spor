@@ -40,6 +40,7 @@ to them the same way a failed review would.
 {
   "factory": "acme-checkout",
   "trusted_ref": "main",
+  "repos": ["acme-checkout"],
   "protected_paths": ["test/**", "e2e/**"],
   "test_lane_profile": "profile-acme-test-writer",
   "risk_classes": {

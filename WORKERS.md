@@ -538,6 +538,7 @@ schema-factory`) carries a fenced JSON payload:
 {
   "factory": "spor-default",
   "trusted_ref": "main",
+  "repos": ["spor"],
   "protected_paths": ["test/**", "conformance/**"],
   "test_lane_profile": "profile-test-writer",
   "risk_classes": { "touches:auth": ["lib/auth.js", "**/auth/**"] },
@@ -548,6 +549,51 @@ schema-factory`) carries a fenced JSON payload:
   ]
 }
 ```
+
+**`repos` is the scope a factory may judge, and the worker's `--project` is
+not** (issue-spor-work-scope-union-factory-mismatch). A queue scope token is
+deliberately union-y — a bare repo slug resolves UP to its home-project
+grouping and unions the members, which is the right read for a human — so
+`spor work --factory factory-x --project my-repo` is handed the SIBLING repos'
+items too, and a command gate and an integration command authored for one
+checkout would run against them anyway (agreeing only by luck, when the two
+repos happen to build the same way). So:
+
+- The declared `repos` bound what the pipeline gates. An item whose own repo
+  stamp is not one of them is **skipped with the reason on stdout and in
+  `--status`**, never gated — the same visible-skip treatment a policy skip
+  gets, and never a silent drop.
+- Undeclared, the factory NODE's own `repo:` stamp is the scope — a factory
+  authored for one repo says so by living in it. A factory with neither is
+  UNSCOPED and behaves exactly as it did before this field existed.
+- An item carrying no repo stamp at all is outside every declared scope: a
+  worker that cannot tell which repo an item belongs to must not run a
+  repo-specific suite against it. Historical stamps under a repo's `slugs:`
+  aliases are compared RAW, so an alias-stamped item is skipped rather than
+  mis-gated — name the alias in `repos` to admit it.
+- `repos` is a scope, not a page filter: with a single declared repo and no
+  explicit `--project`, the worker's queue scope DEFAULTS to that repo's slug
+  (union semantics and all — a wide read costs one filtered candidate, while a
+  wrong-narrow token would cost the work).
+- `"repos": []` is an error, not "judge everything": an empty scope reads
+  exactly like the bug it exists to fix.
+- A `repo-<slug>` node id is accepted and admits items stamped `<slug>`; the
+  reverse is not, because a repo genuinely named `repo-tools` is a different
+  repo from `tools` and admitting it would fail OPEN.
+- **Resumption is scoped by factory, not by repo** (§10.8): an orphaned
+  pipeline never passes through candidate selection, so a worker adopts one
+  only when the dead worker's own factory id matches its own. An orphan left
+  by another factory is named on stderr and left for a worker armed with that
+  factory — the same argument that keeps a gate-armed worker off a BARE
+  worker's runs.
+- A scoped worker that discards a whole queue page says so once, rather than
+  idling indistinguishably from an empty queue; in local mode a declared repo
+  that names nothing in the graph is warned about at startup.
+- Under a multi-repo factory the item's repo and the worker's scope token are
+  different things, and every node the pipeline writes — the `art-gate-*` /
+  `art-merge-*` facts, the escalation, the test-change-lane item, the approval
+  item, the proposal tracker — is filed under the ITEM's, so a project-scoped
+  queue shows the work it belongs to.
 
 `gates` is ORDERED, and each entry is either written inline or referenced as a
 shareable `type: gate` node (`schema-gate`) — org governance vets a
@@ -572,7 +618,8 @@ produce a worker that silently accepts everything, so the validation is
 deliberately strict: an unknown gate kind, a command gate with no command, an
 agent-review gate with no profile, a reference the graph cannot supply, a
 duplicate gate id, `protected_paths` with no `test_lane_profile` to route to,
-and a human gate naming a risk class the factory never declared are all fatal.
+and a human gate naming a risk class the factory never declared are all fatal,
+as is a `repos` list that names no repo.
 
 **`status` is enforced too**, not just read: the factory node itself, and every
 `type: gate` node it references, must be `status: active` (or carry no

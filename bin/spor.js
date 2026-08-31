@@ -9333,9 +9333,9 @@ function cmdWorkStatus(cfg, { json }) {
     );
     if (w.gates)
       out(
-        `  gates:    ${w.factory || "(factory)"} — passed ${w.gates.passed || 0}, failed ${w.gates.failed || 0}, blocked ${w.gates.blocked || 0}${
-          w.gates.parked ? `, parked ${w.gates.parked}` : ""
-        }`
+        `  gates:    ${w.factory || "(factory)"}${(w.repos || []).length ? ` [judges ${w.repos.join(", ")}]` : ""} — passed ${w.gates.passed || 0}, failed ${
+          w.gates.failed || 0
+        }, blocked ${w.gates.blocked || 0}${w.gates.parked ? `, parked ${w.gates.parked}` : ""}`
       );
     for (const a of w.active || []) out(`  active:   ${a.node_id || "(free-text)"}  run ${String(a.run_id).slice(0, 8)}  ${a.harness || ""}  since ${a.started_at}`);
     for (const g of w.gating || []) {
@@ -9441,7 +9441,10 @@ async function loadFactoryDefinition(cfg, id) {
     }
     gateNodes.set(ref, payload.payload);
   }
-  const res = gatesKernel.parseFactory(parsed.body || "", { gateNodes, id });
+  // The node's own project stamp is the factory's DEFAULT repo scope when its
+  // payload declares no `repos` (issue-spor-work-scope-union-factory-mismatch)
+  // — a factory authored for one repo says so by living in it.
+  const res = gatesKernel.parseFactory(parsed.body || "", { gateNodes, id, project: parsed.project || null });
   // A ref we already explained above (wrong type, retired, bad payload) is left
   // out of gateNodes on purpose, which makes resolveGates raise its own generic
   // "could not be read from the graph" for the same ref — accurate for an
@@ -10546,10 +10549,20 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
 // the gate pipeline's own result untouched — byte-identical to before this
 // stage existed.
 async function runGateAndIntegration(cfg, entry, record, ctx) {
-  const item = { ...entry, project: ctx.slug };
-  const gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: makeGateDeps(cfg, { ...ctx, record, entry }) });
+  // The item's OWN repo stamp when the slot carried one, falling back to the
+  // worker's scope token. Under a multi-repo factory those differ, and an
+  // `art-gate-*`/`art-merge-*` fact filed under the wrong repo is mis-filed in
+  // every project-scoped surface there is (review finding 4).
+  const item = { ...entry, project: entry.project || ctx.slug || null };
+  // ...and the deps inherit it as their `slug`, so the ESCALATION, the test-lane
+  // item, the approval item, the proposal tracker and its `gate_proposal_project`
+  // are all filed under the item's repo as well. Filing the fail-closed half of
+  // a refusal (§10.7) under the worker's scope token would hide it from exactly
+  // the project-scoped queue a person would look in.
+  const dctx = { ...ctx, slug: item.project || ctx.slug || null, record, entry };
+  const gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: makeGateDeps(cfg, dctx) });
   if (gateResult.state !== "passed" || !ctx.factory.integration) return gateResult;
-  const intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, deps: makeIntegrationDeps(cfg, { ...ctx, record, entry }) });
+  const intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, deps: makeIntegrationDeps(cfg, dctx) });
   return { ...intResult, gates: gateResult.gates, facts: [...(gateResult.facts || []), ...(intResult.facts || [])] };
 }
 
@@ -10700,8 +10713,11 @@ async function cmdWork(cfg, { values }) {
   // Scope: an explicit --project, else the queue.project pin the rest of the
   // read surface already honors, else the whole queue — a worker box is not
   // inherently single-repo, and each item is dispatched into ITS own repo
-  // through the slug->path map.
-  const slug = values.project || cfg.get("work.project", null) || cfg.get("queue.project", null) || null;
+  // through the slug->path map. A factory can narrow the DEFAULT below, but
+  // the scope token never bounds what a gate may judge: the factory's own
+  // declared repo scope does (issue-spor-work-scope-union-factory-mismatch).
+  const explicitSlug = values.project || cfg.get("work.project", null) || cfg.get("queue.project", null) || null;
+  let slug = explicitSlug;
   // Numeric options are REJECTED, not silently replaced, when they aren't a
   // number in range: an unattended `spor work --max $N` with a typo'd $N would
   // otherwise quietly become an unbounded worker, and an explicit
@@ -10777,6 +10793,41 @@ async function cmdWork(cfg, { values }) {
       return 1;
     }
   }
+  // The factory's repo scope (issue-spor-work-scope-union-factory-mismatch).
+  // Two distinct jobs, and only the second is load-bearing:
+  //   - the queue SCOPE TOKEN, which just decides how wide a page we read. A
+  //     single-repo factory with no explicit --project defaults it to that
+  //     repo's slug — the token an operator would type, union semantics and
+  //     all — rather than reading every project's queue and discarding most
+  //     of it. Deliberately NOT the `repo-<slug>` node-id form: that pins a
+  //     single repo only when such a node EXISTS, and silently yields an
+  //     empty queue when it doesn't, which is a stalled worker with no
+  //     message. A too-wide token costs a filtered candidate; a wrong-narrow
+  //     one costs the work.
+  //   - the GUARD below, which is what actually bounds the factory: whatever
+  //     the token unions in, only items stamped with a repo this factory
+  //     declares are candidates. That is the fix — the scope token is a
+  //     read hint, the declared repos are the contract.
+  const factoryRepos = (factory && factory.repos) || [];
+  if (!explicitSlug && factoryRepos.length === 1) slug = factoryRepos[0];
+  // A declared repo that names nothing in this graph is the quiet failure mode
+  // of the whole feature: every item is out of scope, so the worker reads an
+  // empty page (or filters the whole one away) and idles with nothing to say.
+  // In LOCAL mode the graph is right here — say so at startup, where an
+  // operator is watching. A WARNING, not a refusal: a remote graph, or a repo
+  // whose identity node does not exist yet, is not a typo. Remote mode has no
+  // cheap equivalent, and falls back to the loop's own scope-starvation notice.
+  if (factoryRepos.length && cfg.mode() === "local") {
+    try {
+      const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+      const g = graphLib.loadGraph(cfg.nodesDir());
+      for (const r of factoryRepos) {
+        if (!graphLib.projectKnown(g, r)) err(`warning: factory '${factoryId}' declares repo '${r}', which names no repo or project in this graph — items stamped with it will never be found.`);
+      }
+    } catch {
+      /* an unreadable graph is the queue read's problem to report, not this check's */
+    }
+  }
 
   // Passed straight through to every dispatch this loop makes. Deliberately NOT
   // --force: a loop that forces past the duplicate/resolved guards is exactly
@@ -10801,7 +10852,11 @@ async function cmdWork(cfg, { values }) {
     // Page deeper than the default when the cap is high: the page is filtered
     // again below (in-flight) and again by the loop (readiness, cooldowns), so
     // a page the size of the cap could not fill it.
-    const page = await dispatchableQueuePage(cfg, slug, Math.max(25, concurrency * 4));
+    // Page deeper when a factory scope will discard part of it: the queue is
+    // ranked across the whole scope token, so a grouping's sibling repos can
+    // otherwise fill the page and starve a worker that has eligible work
+    // further down.
+    const page = await dispatchableQueuePage(cfg, slug, Math.max(factoryRepos.length ? 50 : 25, concurrency * 4));
     // Items already being worked by an agent on THIS box — this loop's earlier
     // runs, a hand-run `spor dispatch`, another loop — are not candidates. The
     // same-machine guard would refuse them anyway; skipping them here keeps a
@@ -10826,6 +10881,7 @@ async function cmdWork(cfg, { values }) {
     out(`status:  ${workLoop.workDir(cfg.userConfigHome())}`);
     if (factory) {
       out(`factory: ${factoryId} — trusted ref ${factory.trustedRef}${factory.protectedPaths.length ? `, protected ${factory.protectedPaths.join(" ")} -> ${factory.testLaneProfile}` : ""}`);
+      out(`  judges: ${factoryRepos.length ? `repo(s) ${factoryRepos.join(", ")} — items stamped with any other repo are skipped` : "any repo (no 'repos' declared and no project stamp on the factory node)"}`);
       for (const g of factory.gates) {
         const how =
           g.kind === "command" ? `\`${g.command}\`` : g.kind === "agent-review" ? `review under ${g.profile}` : `approval${g.risk.length ? ` when ${g.risk.join("/")}` : " (always)"}`;
@@ -10835,7 +10891,7 @@ async function cmdWork(cfg, { values }) {
       out(`factory: none — the loop runs bare (declare one with --factory <id> or work.factory)`);
     }
     const policySkips = [];
-    const cands = workLoop.selectWorkCandidates(await candidates(), { accept, onSkip: (it, reason) => policySkips.push({ it, reason }) });
+    const cands = workLoop.selectWorkCandidates(await candidates(), { accept, repos: factoryRepos, onSkip: (it, reason) => policySkips.push({ it, reason }) });
     if (!cands.length) out("queue:   nothing dispatchable right now");
     else {
       out(`queue:   ${cands.length} candidate(s); this pass would take the first ${Math.min(concurrency, cands.length)}`);
@@ -10880,10 +10936,11 @@ async function cmdWork(cfg, { values }) {
   };
 
   out(`work: worker ${workerId.slice(0, 8)} — ${slug || "all projects"}, accept ${accept}, concurrency ${concurrency}, poll ${intervalMs / 1000}s${max ? `, stopping after ${max} dispatch(es)` : ""}`);
+  if (factoryRepos.length) out(`work: factory ${factoryId} judges repo(s) ${factoryRepos.join(", ")} — items from any other repo are skipped, not gated`);
   out(`work: status at ${workLoop.workerStatusPath(home, workerId)}  ('spor work --status')`);
   const final = await workLoop.runWorkLoop({
     opts: {
-      workerId, project: slug, accept, concurrency, intervalMs, maxIntervalMs, retryAfterMs, max, once: !!values.once, factory: factoryId,
+      workerId, project: slug, accept, repos: factoryRepos, concurrency, intervalMs, maxIntervalMs, retryAfterMs, max, once: !!values.once, factory: factoryId,
       // The pid-reuse guard for this record: a SIGKILLed worker leaves no
       // stopped_at, and a bare pid probe would read its recycled pid as this
       // worker still running (the same identity check the run store makes).
@@ -10916,9 +10973,23 @@ async function cmdWork(cfg, { values }) {
               // almost always "no orphans", so reading it every poll to learn
               // that would be the loop's dominant cost. No dead worker holding
               // a slot ⇒ nothing to resume, without touching the journal.
-              if (!statuses.some((w) => !w.live && ((w.gating || []).length || (w.active || []).length))) return [];
+              // A foreign orphan is never adoptable, so it must not keep this
+              // guard open either — otherwise one stranded pipeline makes every
+              // poll read the whole run journal for its whole 7-day retention.
+              const mine = (w) => !factoryId || !w.factory || w.factory === factoryId;
+              if (!statuses.some((w) => !w.live && mine(w) && ((w.gating || []).length || (w.active || []).length))) return [];
               return workLoop.orphanedGateRuns(statuses, {
                 records: new Map(dispatchRuns.readRunRecords(home).map((r) => [r.run_id, r])),
+                // Only pipelines THIS factory started (issue-spor-work-scope-
+                // union-factory-mismatch): resumption never goes through
+                // candidate selection, so without this the repo-scope guard has
+                // a back door straight into another factory's repo.
+                factory: factoryId,
+                onForeign: (slot) =>
+                  warn(
+                    `work: not resuming the gate pipeline for ${slot.node_id} (run ${String(slot.run_id).slice(0, 8)}) — ` +
+                      `it was started under factory '${slot.factory}', not '${factoryId}'. Run a worker armed with that factory to finish it.`
+                  ),
                 // The run store owns the terminal vocabulary; the scan needs it
                 // to tell a node an agent may still be working from one that is
                 // genuinely idle (a resumed pipeline re-dispatches fix cycles).
@@ -13138,9 +13209,16 @@ const COMMANDS = {
       "                BLOCKS the resolve until a person answers it\n\n" +
       "Every gate outcome is written as a graph fact linked to the work item. A\n" +
       "factory that cannot be read, or does not validate, REFUSES to start the worker\n" +
-      "rather than running it ungated. See WORKERS.md §10.",
+      "rather than running it ungated.\n\n" +
+      "A factory judges only the repos it declares ('repos' in its payload, defaulting\n" +
+      "to the factory node's own repo stamp) — NOT whatever --project unions in: a bare\n" +
+      "repo slug resolves up to its home-project grouping, so an undeclared factory\n" +
+      "would gate sibling repos' items with a suite written for another checkout. An\n" +
+      "out-of-scope item is skipped with the reason on stdout and in --status. With one\n" +
+      "declared repo and no --project, that repo is also the default queue scope. See\n" +
+      "WORKERS.md §10.",
     options: {
-      project: { type: "string", value: "S", desc: "scope to a project slug (default: work.project/queue.project, else the whole queue)" },
+      project: { type: "string", value: "S", desc: "scope to a project slug (default: work.project/queue.project, else a single-repo factory's own repo, else the whole queue)" },
       accept: { type: "string", value: "P", desc: "acceptance policy: 'ready' dispatches only items explicitly stamped agent-ready (default; also work.accept/SPOR_WORK_ACCEPT); 'open' takes anything except readiness:human" },
       factory: { type: "string", value: "factory-id", desc: "the graph-resident factory definition whose gates every run must pass (default: work.factory; absent = bare loop)" },
       concurrency: { type: "string", value: "N", desc: "how many runs to keep in flight (default 1)" },

@@ -14,6 +14,12 @@ words, and stop asking anything the repo or the graph already answered.
 | 6 | What a person must see before it ships | a `human` gate and the `risk_classes` that arm it |
 | 7 | What happens once everything above passes | an `integration:` block (merge-queue landing), or nothing — resolve-without-merge stays the default |
 
+Which repos the factory may judge (`repos`) is not one of the seven: you are
+standing in the answer. Emit the repo you compiled it in, and only ask when the
+operator's acceptance criteria plainly span more than one — the worker's
+`--project` will NOT bound it (a bare slug unions the whole product grouping),
+so an unstated scope is how a gate ends up judging a sibling repo.
+
 ## Reading the register
 
 Pick the register from how the ask arrives, not from a job title, and switch if

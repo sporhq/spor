@@ -98,6 +98,47 @@ test("a definition that does not validate refuses — the worker never runs on a
   }
 });
 
+test("a factory declares the repos it may judge, defaulting to its own project stamp", () => {
+  // issue-spor-work-scope-union-factory-mismatch: the worker's --project token
+  // unions a grouping, so what a factory may GATE has to be declared on the
+  // factory rather than inferred from however the worker was scoped.
+  const declared = gates.parseFactory(factoryBody({ ...INLINE, repos: ["spor-server", "Spor-Docs"] }), { id: "f", project: "spor" });
+  assert.deepStrictEqual(declared.errors, []);
+  assert.deepStrictEqual(declared.factory.repos, ["spor-server", "spor-docs"], "declared repos win over the node's own stamp, normalized");
+
+  const inherited = gates.parseFactory(factoryBody(INLINE), { id: "f", project: "spor-server" });
+  assert.deepStrictEqual(inherited.factory.repos, ["spor-server"], "undeclared falls back to the factory node's own project");
+
+  const unscoped = gates.parseFactory(factoryBody(INLINE), { id: "f" });
+  assert.deepStrictEqual(unscoped.factory.repos, [], "neither declared nor stamped: unscoped, exactly as before this field");
+
+  // Fail closed on a typo: an empty `repos` reads like "judge everything",
+  // which is the very bug — so it refuses instead.
+  const empty = gates.parseFactory(factoryBody({ ...INLINE, repos: [] }), { id: "f", project: "spor" });
+  assert.strictEqual(empty.factory, null);
+  assert.match(empty.errors.join("\n"), /'repos' is declared but names no repo/);
+});
+
+test("repoScope tolerates the node-id spelling one way only, and an unstamped item is outside every scope", () => {
+  const scope = gates.repoScope(["spor-server"]);
+  assert.strictEqual(gates.inRepoScope("spor-server", scope), true);
+  assert.strictEqual(gates.inRepoScope("SPOR-SERVER", scope), true, "case is not identity");
+  assert.strictEqual(gates.inRepoScope("spor", scope), false, "a sibling repo in the same grouping is OUT");
+  // Declaring the `repo-<slug>` node-id form also admits items stamped with the
+  // bare slug, which is what an item actually carries.
+  assert.strictEqual(gates.inRepoScope("spor-server", gates.repoScope(["repo-spor-server"])), true);
+  // The inverse is deliberately NOT true: a repo genuinely named `repo-tools`
+  // is a different repo from `tools`, and admitting it would be a fail-OPEN in
+  // a guard whose whole job is to fail closed.
+  assert.strictEqual(gates.inRepoScope("repo-tools", gates.repoScope(["tools"])), false);
+  assert.strictEqual(gates.inRepoScope("repo-", gates.repoScope([""])), true, "an empty declaration is no scope at all, not a `repo-` wildcard");
+  // Fail closed: no stamp, no idea which repo — do not gate it.
+  assert.strictEqual(gates.inRepoScope(null, scope), false);
+  assert.strictEqual(gates.inRepoScope("", scope), false);
+  // An empty scope is "unscoped" and admits everything, including no stamp.
+  for (const p of ["anything", null, ""]) assert.strictEqual(gates.inRepoScope(p, gates.repoScope([])), true);
+});
+
 test("a node with no fenced json payload is not a factory", () => {
   const { factory, errors } = gates.parseFactory("just prose", { id: "f" });
   assert.strictEqual(factory, null);

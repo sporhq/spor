@@ -2,9 +2,9 @@
 id: schema-factory
 type: schema
 kind: node-schema
-schema_version: 2026.08.28.1
+schema_version: 2026.08.31.1
 title: Software-factory definition
-summary: A factory definition — the ordered gate list a worker enforces between claim and resolve, plus the trusted ref, protected test paths, test-change lane, risk classes those gates key on, and an optional integration (merge-queue landing) stage. Candidate pack; adopt it into a graph to use `spor work --factory`.
+summary: A factory definition — the ordered gate list a worker enforces between claim and resolve, plus the trusted ref, the repos it may judge, protected test paths, test-change lane, risk classes those gates key on, and an optional integration (merge-queue landing) stage. Candidate pack; adopt it into a graph to use `spor work --factory`.
 date: 2026-08-26
 edges:
   - {type: derived-from, to: dec-spor-software-factory-substrate}
@@ -38,6 +38,7 @@ convention schema nodes use:
     {
       "factory": "spor-default",
       "trusted_ref": "main",
+      "repos": ["spor"],
       "protected_paths": ["test/**", "conformance/**"],
       "test_lane_profile": "profile-test-writer",
       "risk_classes": { "touches:auth": ["lib/auth.js", "**/auth/**"] },
@@ -50,6 +51,13 @@ convention schema nodes use:
 
 - `trusted_ref` — the ref a command gate's suite is taken from (default `main`).
   **The implementer branch's copy of the tests is never what runs.**
+- `repos` — the repos this factory may judge. A worker's `--project` token
+  does NOT bound it: a bare repo slug unions its whole home-project grouping,
+  so without this a factory is handed sibling repos' items and gates them with
+  a suite authored for another checkout (issue-spor-work-scope-union-factory-
+  mismatch). Undeclared, the factory node's own `repo:` stamp is the scope; a
+  factory with neither is unscoped. An item outside the scope is skipped
+  visibly, never gated. Declaring it EMPTY is an error, not "judge anything".
 - `protected_paths` — test paths the implementer may not touch. A change that
   touches one fails its command gate CLOSED (unrun) and routes to
   `test_lane_profile`; declaring paths without a lane is an error, because

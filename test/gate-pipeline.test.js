@@ -575,6 +575,64 @@ test("with NO factory the loop is unchanged: nothing gates, nothing is held, no 
   assert.deepStrictEqual(status.skipped, []);
 });
 
+test("the LIVE loop enforces the factory's repo scope — an out-of-scope item is never dispatched, let alone gated", async () => {
+  // issue-spor-work-scope-union-factory-mismatch. The --print path and
+  // selectWorkCandidates are pinned in work-loop.test.js; this pins the path
+  // that actually LAUNCHES, which is the one that could silently lose the
+  // filter.
+  const { deps, control, state } = loopHarness({
+    queue: [
+      { id: "task-other", project: "spor" },
+      { id: "task-mine", project: "spor-server" },
+    ],
+    gate: () => ({ state: "passed", reason: "1 gate(s) passed" }),
+  });
+  const status = await workLoop.runWorkLoop({
+    opts: { workerId: "w", concurrency: 2, intervalMs: 1000, max: 1, repos: ["spor-server"], factory: "factory-spor-server" },
+    deps,
+    control,
+  });
+  assert.strictEqual(status.dispatched, 1);
+  assert.deepStrictEqual(state.gateCalls.map((c) => c.entry.node_id), ["task-mine"]);
+  assert.deepStrictEqual(status.skipped.map((s) => s.id), ["task-other"]);
+  assert.match(status.skipped[0].reason, /outside the factory's repo scope \(repo spor; this factory judges spor-server\)/);
+  assert.deepStrictEqual(status.repos, ["spor-server"], "the scope a worker is enforcing is on its status record");
+  // The gate fact is filed under the ITEM's own repo, not the worker's scope
+  // token — they differ under a multi-repo factory.
+  assert.strictEqual(state.gateCalls[0].entry.project, "spor-server");
+  // ...and that repo survives the active->gating move ON THE PUBLISHED SLOT,
+  // which is the only copy a resuming worker gets after this one is killed.
+  const gatingSlot = state.published.flatMap((p) => p.gating || []).find((g) => g.node_id === "task-mine");
+  assert.ok(gatingSlot, "the item was published as gating");
+  assert.strictEqual(gatingSlot.project, "spor-server");
+  // The orphan scan reads it straight back off that slot.
+  assert.deepStrictEqual(
+    workLoop
+      .orphanedGateRuns([{ worker_id: "dead", live: false, factory: "factory-spor-server", gating: [gatingSlot] }], {
+        records: new Map([[gatingSlot.run_id, { ...ORPHAN_RECORD, run_id: gatingSlot.run_id, node_id: "task-mine" }]]),
+        factory: "factory-spor-server",
+      })
+      .map((o) => o.project),
+    ["spor-server"]
+  );
+});
+
+test("a scoped worker whose whole page belongs to other repos SAYS so — it does not just idle like an empty queue", async () => {
+  const { deps, control, state } = loopHarness({
+    queue: [{ id: "task-other", project: "spor" }],
+    gate: () => ({ state: "passed" }),
+  });
+  const status = await workLoop.runWorkLoop({
+    opts: { workerId: "w", intervalMs: 1000, once: true, repos: ["spor-server"], factory: "factory-spor-server" },
+    deps,
+    control,
+  });
+  assert.strictEqual(status.dispatched, 0);
+  const notice = state.log.find((l) => /outside the factory's repo scope \(spor-server\)/.test(l));
+  assert.ok(notice, `expected a scope-starvation notice, got:\n${state.log.join("\n")}`);
+  assert.match(notice, /Narrow the read with --project, or widen the factory's 'repos'/);
+});
+
 test("a resolved run holds its slot through the gate pipeline, and a PASS clears it with no cooldown", async () => {
   const { deps, control, state } = loopHarness({
     queue: [{ id: "task-a" }],
@@ -818,6 +876,32 @@ test("a dead BARE worker's runs are never adopted — a gate is only ever impose
   assert.deepStrictEqual(workLoop.resumableSlots({ gates: armed, gating: [slot], active: [slot] }).length, 2);
   assert.deepStrictEqual(workLoop.resumableSlots({ gating: [], active: [slot] }), []);
   assert.deepStrictEqual(workLoop.resumableSlots(null), []);
+});
+
+test("an orphan is only ever adopted by the factory that started it — a resume is not a back door into another repo", () => {
+  // issue-spor-work-scope-union-factory-mismatch: a resumed pipeline never goes
+  // through candidate selection, so the repo-scope guard there does not reach
+  // it. Without this, a worker armed with factory B finishes a pipeline factory
+  // A started — running B's suite and B's integration command against A's repo,
+  // and on a refusal filing a `blocks` edge and rolling the item's status back.
+  const records = new Map([["run-orphan", ORPHAN_RECORD]]);
+  const slot = { run_id: "run-orphan", node_id: "task-orphan", harness: "fake" };
+  const dead = (factory) => ({ worker_id: "w1", live: false, factory, gates: { passed: 0, failed: 0, blocked: 0 }, gating: [slot], active: [] });
+
+  assert.strictEqual(workLoop.orphanedGateRuns([dead("factory-a")], { records, factory: "factory-a" }).length, 1, "the same factory finishes its own work");
+
+  const foreign = [];
+  assert.deepStrictEqual(
+    workLoop.orphanedGateRuns([dead("factory-a")], { records, factory: "factory-b", onForeign: (o) => foreign.push(o) }),
+    [],
+    "a different factory does not adopt it"
+  );
+  assert.deepStrictEqual(foreign.map((o) => [o.node_id, o.factory]), [["task-orphan", "factory-a"]], "…and it is reported, not silently stranded");
+
+  // Both of the pre-existing shapes are untouched: a caller that passes no
+  // factory, and a dead record that carries none, behave exactly as before.
+  assert.strictEqual(workLoop.orphanedGateRuns([dead("factory-a")], { records }).length, 1);
+  assert.strictEqual(workLoop.orphanedGateRuns([dead(undefined)], { records, factory: "factory-b" }).length, 1);
 });
 
 // A resumed pipeline RE-RUNS its gates from the first one, and a fix cycle

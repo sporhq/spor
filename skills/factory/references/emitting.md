@@ -131,6 +131,7 @@ gate still serves them.
 {
   "factory": "<team-or-product>",
   "trusted_ref": "main",
+  "repos": ["<slug>"],
   "protected_paths": ["test/**"],
   "test_lane_profile": "profile-test-writer",
   "risk_classes": { "touches:payments": ["lib/billing/**", "**/payments/**"] },
@@ -146,7 +147,19 @@ gate still serves them.
 `gates` is **ordered** — the runner walks it in order and stops at the first
 refusal, so put the cheap deterministic check first and the person last.
 
-Five things a factory must satisfy or it refuses to start the worker:
+`repos` is **the repos this factory may judge** — write it, and never assume
+the worker's `--project` will bound it: a bare repo slug on the queue resolves
+UP to its home-project grouping and unions the members, so a sibling repo's
+items reach a gated worker and its command gate runs against a checkout it was
+never authored for (issue-spor-work-scope-union-factory-mismatch). Usually it
+is the one repo you compiled the factory in, and the factory node's own
+`project:`/`repo:` stamp is the fallback when you omit it — so this is a key
+to write when the factory genuinely covers several repos, or when you want the
+scope stated rather than inherited. An item outside the scope is skipped
+visibly by the worker, never gated. Do not emit `"repos": []` — an empty list
+is an error, not "judge anything".
+
+Six things a factory must satisfy or it refuses to start the worker:
 
 1. every `ref` resolves to a `type: gate` node that exists;
 2. every agent-review gate names a `profile`, and command gates a `command`;
@@ -154,7 +167,8 @@ Five things a factory must satisfy or it refuses to start the worker:
    must never mean "dropped on the floor";
 4. a human gate may only name risk classes declared in `risk_classes` — a gate
    that can never arm reads exactly like an approved one;
-5. gate ids are unique and kebab-case.
+5. gate ids are unique and kebab-case;
+6. `repos`, if written, names at least one repo.
 
 ## 3b. The integration block — merge-queue landing (optional)
 

@@ -638,7 +638,32 @@ slot until the pipeline settles (and its node is out of candidate selection for
 EVERY worker on the box while it does, so a free slot never re-dispatches what a
 gate is judging), and a
 factory that does not validate REFUSES to start the worker rather than running it
-ungated. A failed/blocked pipeline does more than cool the node — a cooldown is
+ungated. WHAT a factory may gate is the factory's own declaration, never the
+worker's `--project` (issue-spor-work-scope-union-factory-mismatch): a bare
+repo slug on the queue resolves UP to its home-project grouping and unions the
+members, so a `--project spor-server` worker is handed repo:spor items and its
+command/integration commands run against a checkout they were not authored for.
+The payload's `repos:` (defaulting to the factory NODE's own repo stamp; a
+factory with NEITHER is unscoped and byte-identical to before — an existing
+factory carrying a repo stamp does change, which is the fix) bounds candidate
+selection — `gates.repoScope`/`inRepoScope` compared against the item's own
+stamp, so an out-of-scope item is skipped VISIBLY (stdout + `--status`, like a
+policy skip), an item with no stamp or an unlisted historical alias fails
+closed, and a lone declared repo also becomes the default `--project` when none
+is given (warned about at startup in local mode if it names nothing in the
+graph, and a page whose candidates were ALL scope-filtered says so once, since
+a starved scoped worker otherwise looks exactly like an empty queue). The
+node-id spelling resolves one way only (`repo-x` admits `x`, never the
+reverse — the reverse would fail OPEN on a repo genuinely named `repo-x`).
+RESUMPTION is the other door into a gate, and it never goes through selection,
+so an orphaned pipeline is adopted only by a worker armed with the SAME factory
+that started it (`orphanedGateRuns`'s `factory`/`onForeign`) — the wrong-factory
+case has the same consequences the bare-worker exclusion already exists to
+prevent. A gate/merge fact — and every item a refusal files (the escalation,
+the test-change lane, the approval, the proposal tracker) — is filed under the
+ITEM's own repo (carried on the worker's slot, across the active->gating move
+so a resumed pipeline files there too), not the worker's scope token, which
+differ under a multi-repo factory. A failed/blocked pipeline does more than cool the node — a cooldown is
 machine-local and the gate runs AFTER the resolver exists, so the refusal is
 also written as GRAPH state (§10.7) in two parts: the `requires: [human]` item
 it files carries `blocks` onto the work item (the fail-closed half — a live

@@ -382,6 +382,51 @@ test("selectWorkCandidates: excludes in-flight, human-readiness and cooling-off 
   assert.deepStrictEqual(later.map((i) => i.id), ["a", "c", "d"]);
 });
 
+test("selectWorkCandidates: a factory's declared repo scope bounds what it gates, visibly", () => {
+  // issue-spor-work-scope-union-factory-mismatch: a bare --project slug unions
+  // its whole home-project grouping, so a worker scoped to spor-server is
+  // handed spor's items too — and the factory's suite and integration command,
+  // authored for one repo, would judge them anyway. The declared scope is the
+  // bound; a mismatch is a VISIBLE skip, like a policy skip, never a silent drop.
+  const items = [
+    { id: "a", readiness: "agent", project: "spor-server" },
+    { id: "b", readiness: "agent", project: "spor" },
+    { id: "c", readiness: "agent" },
+  ];
+  const skips = [];
+  const got = workLoop.selectWorkCandidates(items, { repos: ["spor-server"], onSkip: (it, reason) => skips.push([it.id, reason]) });
+  assert.deepStrictEqual(got.map((i) => i.id), ["a"]);
+  assert.deepStrictEqual(skips.map(([id]) => id), ["b", "c"]);
+  assert.match(skips[0][1], /outside the factory's repo scope \(repo spor; this factory judges spor-server\)/);
+  assert.match(skips[1][1], /no project stamp/, "an item whose repo cannot be told is skipped, not gated");
+
+  // The stamp KEY is `repo:` (dec-cc-repo-project-two-layer-identity); a queue
+  // payload that spells it that way must not fail the guard closed on every
+  // item, which would idle a whole mode's workers.
+  assert.deepStrictEqual(
+    workLoop.selectWorkCandidates([{ id: "r", readiness: "agent", repo: "spor-server" }], { repos: ["spor-server"] }).map((i) => i.id),
+    ["r"]
+  );
+
+  // No scope (a bare loop, or a factory that declares none) is byte-identical
+  // to before this filter existed.
+  for (const repos of [null, []]) {
+    const all = workLoop.selectWorkCandidates(items, { repos, onSkip: () => assert.fail("an unscoped worker skips nothing on repo") });
+    assert.deepStrictEqual(all.map((i) => i.id), ["a", "b", "c"], `repos ${JSON.stringify(repos)} is unscoped`);
+  }
+
+  // The scope check runs AFTER the cooldown, so an out-of-scope item that is
+  // already cooling is not re-reported every poll.
+  const cooling = [];
+  workLoop.selectWorkCandidates(items, {
+    repos: ["spor-server"],
+    skipped: new Map([["b", { until: 500 }], ["c", { until: 500 }]]),
+    now: 100,
+    onSkip: (it) => cooling.push(it.id),
+  });
+  assert.deepStrictEqual(cooling, []);
+});
+
 test("selectWorkCandidates: the DEFAULT policy is explicit consent — untriaged is skipped, visibly", () => {
   // dec-spor-work-accept-policy-configurable: with nothing configured, only an
   // item a person stamped agent-ready is a candidate. An untriaged item — a
@@ -637,6 +682,103 @@ test("spor work --print previews scope, pacing and candidates, and launches noth
   assert.match(open.stdout, /task-untriaged/);
   assert.doesNotMatch(open.stdout, /skip task-untriaged/);
   assert.doesNotMatch(open.stdout, /task-needs-human/, "human-readiness stays out under every policy");
+});
+
+// Two repos in ONE home-project grouping, each with an agent-ready item, plus a
+// factory living in one of them. This is the shape of the reported repro
+// (issue-spor-work-scope-union-factory-mismatch): `--project <repo slug>`
+// resolves UP to the grouping and unions the members, so the sibling repo's
+// item lands in a gated worker's page.
+function groupedFixture({ repos = null } = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-scope-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const write = (id, front, body) => fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\n${front}date: 2026-08-20\n---\n${body}\n`);
+  write("proj-demo", "type: project\ntitle: The demo product\nsummary: The grouping above the demo client and server repos.\n", "A product grouping.");
+  for (const slug of ["demo", "demo-server"]) {
+    write(`repo-${slug}`, `type: repo\ntitle: The ${slug} repo\nsummary: Repo identity for ${slug}, grouped under the demo product.\nslugs: [${slug}]\nedges:\n  - {type: grouped-under, to: proj-demo}\n`, "A repo identity.");
+  }
+  write("agent-workbox", "type: agent\ntitle: The work loop test box\nsummary: An agent identity for the work-loop scope fixture, owned by the test person.\n", "Test agent.");
+  write("profile-work", `type: profile\ntitle: Work loop test profile\nsummary: A profile selecting the fake harness the work-loop scope test declares locally.\nharness: ${HARNESS}\n`, "Test profile.");
+  const task = (id, slug, title) =>
+    write(id, `type: task\nrepo: ${slug}\ntitle: ${title}\nsummary: ${title}, an agent-ready item stamped to repo ${slug}.\nstatus: open\nedges:\n  - {type: assigned, to: agent-workbox, profile: profile-work}\n`, title);
+  task("task-server-ready", "demo-server", "Add bounded retry to the demo server sync worker");
+  task("task-client-ready", "demo", "Add bounded retry to the demo client sync worker");
+  const payload = { factory: "demo-server", ...(repos ? { repos } : {}), gates: [{ id: "acceptance", kind: "command", command: "npm test" }] };
+  write(
+    "factory-demo-server",
+    "type: factory\nrepo: demo-server\nstatus: active\ntitle: What done means in demo-server\nsummary: The gate the demo-server repo's work must clear before it counts as done.\n",
+    ["The demo-server factory.", "", "```json", JSON.stringify(payload, null, 2), "```"].join("\n")
+  );
+  return { home, nodes };
+}
+
+test("a gated worker judges only the repos its factory declares — the grouping union does not widen it", () => {
+  const { home } = groupedFixture();
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode() };
+
+  // The union is REAL: unfactoried, `--project demo-server` surfaces the
+  // sibling repo's item too (dec-spor-queue-slug-resolves-to-grouping), which
+  // is the documented read semantics and stays untouched.
+  const bare = cli(["work", "--print", "--project", "demo-server"], env);
+  assert.strictEqual(bare.status, 0, bare.stderr);
+  assert.match(bare.stdout, /queue:   2 candidate\(s\)/);
+  assert.match(bare.stdout, /task-server-ready/);
+  assert.match(bare.stdout, /task-client-ready/, "the bare loop is unchanged: the grouping union still applies");
+  assert.match(bare.stdout, /^factory: none/m);
+
+  // With the factory armed, the sibling repo's item is SKIPPED — visibly, with
+  // the repo named — rather than gated by a suite written for another repo.
+  const gated = cli(["work", "--print", "--project", "demo-server", "--factory", "factory-demo-server"], env);
+  assert.strictEqual(gated.status, 0, gated.stderr);
+  assert.match(gated.stdout, /judges: repo\(s\) demo-server/);
+  assert.match(gated.stdout, /queue:   1 candidate\(s\)/);
+  assert.match(gated.stdout, /-> task-server-ready/);
+  assert.doesNotMatch(gated.stdout, /-> task-client-ready/);
+  assert.match(gated.stdout, /skip task-client-ready.*outside the factory's repo scope \(repo demo; this factory judges demo-server\)/);
+
+  // ...and with no --project at all the scope DEFAULTS to the factory's own
+  // repo, instead of reading every project's queue to discard most of it.
+  const defaulted = cli(["work", "--print", "--factory", "factory-demo-server"], env);
+  assert.strictEqual(defaulted.status, 0, defaulted.stderr);
+  assert.match(defaulted.stdout, /^project: demo-server$/m);
+  assert.match(defaulted.stdout, /queue:   1 candidate\(s\)/);
+  assert.match(defaulted.stdout, /-> task-server-ready/);
+});
+
+test("a declared repo that names nothing in this graph is called out at startup, not left to look like an empty queue", () => {
+  // The quiet failure mode of the whole feature: one typo in `repos` and every
+  // item is out of scope, so the worker reads an empty page and idles with
+  // nothing to say. A warning, not a refusal — an unknown-here repo is not
+  // necessarily a typo.
+  const { home } = groupedFixture({ repos: ["demo-sever"] });
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode() };
+  const r = cli(["work", "--print", "--factory", "factory-demo-server"], env);
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stderr, /declares repo 'demo-sever', which names no repo or project in this graph/);
+  assert.match(r.stdout, /queue:   nothing dispatchable right now/);
+  // A repo that DOES resolve says nothing.
+  const good = groupedFixture().home;
+  const ok = cli(["work", "--print", "--factory", "factory-demo-server"], { SPOR_HOME: good, XDG_CONFIG_HOME: good, PATH: pathWithOnlyGitAndNode() });
+  assert.doesNotMatch(ok.stderr, /names no repo or project/);
+});
+
+test("a factory that declares its repos judges those, not the one it happens to live in", () => {
+  // The escape hatch (option c of the issue): a factory whose gates genuinely
+  // do apply to several repos says so, and an explicit --project cannot widen
+  // it past that declaration either.
+  const { home } = groupedFixture({ repos: ["demo", "demo-server"] });
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode() };
+  const r = cli(["work", "--print", "--project", "demo-server", "--factory", "factory-demo-server"], env);
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /judges: repo\(s\) demo, demo-server/);
+  assert.match(r.stdout, /task-server-ready/);
+  assert.match(r.stdout, /task-client-ready/);
+  assert.doesNotMatch(r.stdout, /outside the factory's repo scope/);
+  // Two declared repos leave the scope token alone — there is no single repo
+  // to narrow a missing --project to.
+  const defaulted = cli(["work", "--print", "--factory", "factory-demo-server"], env);
+  assert.match(defaulted.stdout, /^project: \(all projects\)$/m);
 });
 
 test("an unknown accept policy refuses to start the worker — flag or config, never a silent fallback", () => {
