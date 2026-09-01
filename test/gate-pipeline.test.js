@@ -2214,3 +2214,84 @@ test("a failed command gate's fact carries the failure lines, not just the tail"
   assert.match(seen.facts[0].markdown, /✖ the broken one/);
   assert.match(seen.escalations[0].evidence, /✖ the broken one/);
 });
+
+// -------------------------------------------------- spor work --regate <run> --
+// A gate can refuse for a reason that is not the item's (a red trusted ref, a
+// flaky suite). The fail-closed shape leaves the item demoted and blocked by
+// an escalation, its work committed in a worktree, and — before this — no way
+// back but redoing it. `--regate` re-judges the same run after the cause is
+// fixed, under attempt-scoped ids, and undoes the refusal's graph state on a
+// pass.
+
+test("end to end: a run refused for an external cause is re-judged with --regate — new attempt-scoped facts, the escalation closed, nothing redone", () => {
+  const { home, repo, nodes, outfile } = cliFixture({ factoryPayload: OK_FACTORY });
+  // The trusted ref's suite is red for a reason outside the item (an env the
+  // box lacks); the fix arrives later, outside the branch.
+  fs.writeFileSync(path.join(repo, "test", "acceptance.js"), 'if (process.env.GATE_OK !== "1") { console.error("✖ the trusted ref is red"); process.exit(1); }\n');
+  git(repo, "checkout", "-q", "main");
+  git(repo, "add", "-A");
+  git(repo, "commit", "-q", "-m", "a red trusted suite");
+  git(repo, "checkout", "-q", "impl");
+  git(repo, "merge", "-q", "--no-edit", "main");
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, GATE_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() };
+  const first = cli(["work", "--once", "--max", "1", "--interval", "1", "--no-brief", "--no-worktree", "--factory", "factory-demo"], env);
+  assert.strictEqual(first.status, 0, `${first.stderr}\n${first.stdout}`);
+  assert.match(first.stdout, /gate acceptance failed on task-ready/);
+  const runId = fs.readdirSync(path.join(home, "journal", "dispatch")).find((f) => f.endsWith(".run.json")).replace(".run.json", "");
+  const recordPath = path.join(home, "journal", "dispatch", `${runId}.run.json`);
+  const refused = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  assert.strictEqual(refused.gate_state, "failed");
+  assert.match(refused.gate_escalated_to, /^task-gate-acceptance-ready-/, "the loop stamps the escalation it filed onto the run record");
+  const escalation = refused.gate_escalated_to;
+  assert.ok(fs.existsSync(path.join(nodes, `${escalation}.md`)));
+  const firstFacts = fs.readdirSync(nodes).filter((f) => f.startsWith("art-gate-acceptance-ready-"));
+  assert.strictEqual(firstFacts.length, 1);
+
+  // Refusals first: no such run; a run that is not a claim; no factory.
+  const nope = cli(["work", "--regate", "deadbeef", "--factory", "factory-demo"], env);
+  assert.strictEqual(nope.status, 1);
+  assert.match(nope.stderr, /no run record matches 'deadbeef'/);
+  const bare = cli(["work", "--regate", runId.slice(0, 8)], env);
+  assert.strictEqual(bare.status, 1);
+  assert.match(bare.stderr, /needs a factory/);
+
+  // The cause is fixed outside the item; the same run is judged again.
+  const second = cli(["work", "--regate", runId.slice(0, 8), "--factory", "factory-demo"], { ...env, GATE_OK: "1" });
+  assert.strictEqual(second.status, 0, `${second.stderr}\n${second.stdout}`);
+  assert.match(second.stdout, /re-gating task-ready — run [0-9a-f]{8}, attempt 2, under factory-demo \(previously failed/);
+  assert.match(second.stdout, /gate acceptance passed on task-ready/);
+  assert.match(second.stdout, new RegExp(`re-gate of task-ready passed — .*closed ${escalation} with art-regate-ready-[0-9a-f]{8}-r2-`));
+  const facts = fs.readdirSync(nodes).filter((f) => f.startsWith("art-gate-acceptance-ready-"));
+  assert.strictEqual(facts.length, 2, `the first verdict's fact stands beside the second's, saw ${facts}`);
+  assert.ok(facts.some((f) => /-r2-/.test(f)), `the re-gate's fact is attempt-scoped: ${facts}`);
+  const regate = fs.readdirSync(nodes).find((f) => f.startsWith("art-regate-ready-"));
+  assert.ok(regate, "a resolving artifact was written for the escalation");
+  assert.match(fs.readFileSync(path.join(nodes, regate), "utf8"), new RegExp(`- \\{type: resolves, to: ${escalation}\\}`));
+  const after = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  assert.strictEqual(after.gate_state, "passed", "the settled verdict on the record is the re-gate's");
+  assert.strictEqual(after.gate_regate_count, 1);
+  assert.match(after.gate_reason, /gate\(s\) passed/);
+  assert.strictEqual(fs.readFileSync(path.join(nodes, "task-ready.md"), "utf8").includes("status: open"), true, "the stub never claimed completion, so nothing is promoted");
+  assert.strictEqual(execFileSync("git", ["-C", repo, "worktree", "list"], { encoding: "utf8" }).trim().split("\n").length, 1, "the re-gate's tree is cleaned up");
+
+  // A passed run is not re-judged again.
+  const again = cli(["work", "--regate", runId.slice(0, 8), "--factory", "factory-demo"], { ...env, GATE_OK: "1" });
+  assert.strictEqual(again.status, 1);
+  assert.match(again.stderr, /already read 'passed'/);
+});
+
+test("stampGateState refuses to overwrite a settled verdict unless the caller is an explicit re-gate", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-stamp-"));
+  const dir = path.join(home, "journal", "dispatch");
+  fs.mkdirSync(dir, { recursive: true });
+  const id = "11111111-2222-3333-4444-555555555555";
+  fs.writeFileSync(path.join(dir, `${id}.run.json`), JSON.stringify({ run_id: id, state: "done", gate_state: "failed", gate_reason: "red" }));
+  const runs = require("../lib/shell/agent-dispatch-runner.js");
+  runs.stampGateState(home, id, { gate_state: "running" });
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, `${id}.run.json`), "utf8")).gate_state, "failed", "an ordinary stamp cannot launder a settled verdict");
+  runs.stampGateState(home, id, { gate_state: "running", gate_regate_count: 1 }, { force: true });
+  const after = JSON.parse(fs.readFileSync(path.join(dir, `${id}.run.json`), "utf8"));
+  assert.strictEqual(after.gate_state, "running");
+  assert.strictEqual(after.gate_regate_count, 1);
+  assert.strictEqual(after.gate_reason, "red", "force only writes what it was given");
+});

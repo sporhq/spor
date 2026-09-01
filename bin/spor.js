@@ -10036,7 +10036,10 @@ function makeGateDeps(
 ) {
   const date = () => new Date().toISOString().slice(0, 10);
   const stem = gateStem(entry.node_id);
-  const short = gateShortRun(entry.run_id);
+  // A re-gate (entry.attempt > 1) mints ids under an attempt-scoped key so its
+  // facts and escalations never collide with the first attempt's.
+  const short = gateRunner.shortRunAttempt(entry.run_id, entry.attempt);
+  const runKey = gateRunner.gateRunKey(entry.run_id, entry.attempt);
   let change = null;
 
   const review = async ({ gate, cycle }) => {
@@ -10154,7 +10157,7 @@ function makeGateDeps(
     fix,
     recordFact: ({ id, markdown }) => writeGateNode(cfg, id, markdown),
     fileTestLaneItem: async ({ gate, paths, profile }) => {
-      const id = `task-test-lane-${stem}-${short}-${gateIdSuffix("test-lane", gate.id, entry.node_id, entry.run_id)}`;
+      const id = `task-test-lane-${stem}-${short}-${gateIdSuffix("test-lane", gate.id, entry.node_id, runKey)}`;
       const body = [
         `The implementer's branch for ${entry.node_id} changed protected test path(s):`,
         "",
@@ -10191,7 +10194,7 @@ function makeGateDeps(
       );
     },
     fileHumanItem: async ({ gate, classes }) => {
-      const id = `task-approve-${gate.id.slice(0, 24)}-${stem}-${short}-${gateIdSuffix("approve", gate.id, entry.node_id, entry.run_id)}`.toLowerCase();
+      const id = `task-approve-${gate.id.slice(0, 24)}-${stem}-${short}-${gateIdSuffix("approve", gate.id, entry.node_id, runKey)}`.toLowerCase();
       const body = [
         `The \`${gate.id}\` human gate is armed for ${entry.node_id}: the change touches` +
           (classes.length ? ` the declared risk class(es) ${classes.map((c) => `\`${c.class}\``).join(", ")}.` : " work this factory always has a person approve."),
@@ -10237,7 +10240,7 @@ function makeGateDeps(
     checkApproval: ({ id }) => gateApprovalState(cfg, id),
     demote: ({ blockerId }) => gateDemoteItem(cfg, entry.node_id, { blockerId }),
     escalate: async ({ gate, attempts, detail, evidence, findings }) => {
-      const id = `task-gate-${gate.id.slice(0, 24)}-${stem}-${short}-${gateIdSuffix("escalate", gate.id, entry.node_id, entry.run_id)}`.toLowerCase();
+      const id = `task-gate-${gate.id.slice(0, 24)}-${stem}-${short}-${gateIdSuffix("escalate", gate.id, entry.node_id, runKey)}`.toLowerCase();
       const cycles = attempts.length;
       const body = [
         `The \`${gate.kind}\` gate \`${gate.id}\` refused ${entry.node_id} and its fix cycles are spent`,
@@ -10554,7 +10557,8 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
   const integration = factory.integration;
   const date = () => new Date().toISOString().slice(0, 10);
   const stem = gateStem(entry.node_id);
-  const short = gateShortRun(entry.run_id);
+  const short = gateRunner.shortRunAttempt(entry.run_id, entry.attempt);
+  const runKey = gateRunner.gateRunKey(entry.run_id, entry.attempt);
   let top = null;
 
   const fix = async ({ cycle, kind, detail, evidence }) => {
@@ -10674,7 +10678,7 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
     },
     demote: ({ blockerId }) => gateDemoteItem(cfg, entry.node_id, { blockerId }),
     escalate: async ({ attempts, detail, evidence }) => {
-      const id = `task-integration-${stem}-${short}-${gateIdSuffix("integration-escalate", "integration", entry.node_id, entry.run_id)}`.toLowerCase();
+      const id = `task-integration-${stem}-${short}-${gateIdSuffix("integration-escalate", "integration", entry.node_id, runKey)}`.toLowerCase();
       // A lost CAS race is nobody's fix cycle (integration-runner.js never
       // charges it against the cap), so it must not be counted as one here —
       // an escalation reading "5 attempts, cap 0" after 5 races and zero real
@@ -10886,6 +10890,155 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
   }
 }
 
+// --- `spor work --regate <run-id>` (task-spor-work-regate) ---------------
+// Re-judge ONE refused run under the factory, without redoing the work. A gate
+// can refuse for a reason that is not the item's: the trusted ref itself is
+// red (a sibling-lib drift, someone else's landing), the suite flaked under
+// contention, a reviewer harness was down. The pipeline's fail-closed shape
+// then leaves the item demoted, blocked by a `requires: [human]` escalation,
+// with its resolver standing and its work sitting committed in a worktree —
+// and no path back but a person re-doing the item from scratch. This is that
+// path: the person fixes the cause, then re-runs the same gates on the same
+// run. The facts it mints carry the attempt in their ids (gate-runner.js
+// gateRunKey), so the first verdict's record is never overwritten or refused
+// as a collision; on a PASS it closes the escalation the last attempt filed
+// (with a resolving artifact) and restores the completion status that attempt
+// rolled back — the two graph-state halves of a refusal (WORKERS.md §10.7),
+// undone by the same machinery that wrote them.
+async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthrough, warn, runMaxMs, home }) {
+  if (!factory) {
+    err("spor work --regate needs a factory — pass --factory <id> or set work.factory; a re-gate re-runs the factory's own gates.");
+    return 1;
+  }
+  const wanted = String(values.regate || "").trim();
+  const matches = wanted ? dispatchRuns.listRuns(home, { runId: wanted }) : [];
+  if (!matches.length) {
+    err(`spor work --regate: no run record matches '${wanted || "(empty)"}' ('spor runs' lists this box's runs).`);
+    return 1;
+  }
+  if (matches.length > 1) {
+    err(`spor work --regate: '${wanted}' matches ${matches.length} runs — pass more of the id.`);
+    return 1;
+  }
+  const record = matches[0];
+  const shortId = String(record.run_id).slice(0, 8);
+  if (!dispatchRuns.TERMINAL_STATES.has(record.state)) {
+    err(`spor work --regate: run ${shortId} is still '${record.state}' — a gate judges a finished run ('spor runs ${shortId}' follows it).`);
+    return 1;
+  }
+  if (!record.node_id) {
+    err(`spor work --regate: run ${shortId} was a free-text dispatch with no work item — there is nothing to gate.`);
+    return 1;
+  }
+  if (!workLoop.shouldGate(record)) {
+    err(
+      `spor work --regate: run ${shortId} ended '${record.terminal_state || record.state}'${record.terminal_enforced ? " (enforced)" : ""} — ` +
+        "it carries no claim of completion to judge (only a resolved run, or an unenforced reported one, is gated)."
+    );
+    return 1;
+  }
+  if (record.gate_state === "passed" || record.gate_state === "parked") {
+    err(`spor work --regate: run ${shortId} already read '${record.gate_state}'${record.gate_reason ? ` (${record.gate_reason})` : ""} — there is nothing to re-judge.`);
+    return 1;
+  }
+  if (record.gate_state === "running" && record.gate_worker) {
+    const live = workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === record.gate_worker);
+    if (live) {
+      err(`spor work --regate: run ${shortId} is being gated right now by worker ${String(record.gate_worker).slice(0, 8)} — wait for its verdict.`);
+      return 1;
+    }
+  }
+  // Attempt 1 was the pipeline that refused; each re-gate counts up from there.
+  const attempt = (Number(record.gate_regate_count) || 0) + 2;
+  // The item's OWN repo stamp, exactly as the loop's slot would carry it.
+  let project = slug || null;
+  try {
+    const node = await resolveNode(cfg, record.node_id);
+    if (node && (node.repo || node.project)) project = node.repo || node.project;
+  } catch {
+    /* the worker's scope token stands in */
+  }
+  const previous = record.gate_state ? `${record.gate_state}${record.gate_reason ? `: ${record.gate_reason}` : ""}` : "no recorded verdict";
+  const escalatedBefore = record.gate_escalated_to || null;
+  out(`work: re-gating ${record.node_id} — run ${shortId}, attempt ${attempt}, under ${factoryId} (previously ${previous})`);
+  const stamp = (patch) => dispatchRuns.stampGateState(home, record.run_id, patch, { force: true });
+  stamp({ gate_state: "running", gate_at: new Date().toISOString(), gate_worker: null, gate_regate_count: attempt - 1, gate_regated_at: new Date().toISOString() });
+  const entry = { run_id: record.run_id, node_id: record.node_id, harness: record.harness || null, project, attempt };
+  let res;
+  try {
+    res = await runGateAndIntegration(cfg, entry, record, {
+      factory, slug, passthrough, warn, runMaxMs,
+      log: (line) => out(line),
+      stopping: () => false,
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    });
+  } catch (e) {
+    res = { state: "failed", reason: `the gate pipeline threw: ${(e && e.message) || e}` };
+  }
+  const state = (res && res.state) || "failed";
+  const reason = res && res.reason ? String(res.reason).slice(0, 300) : null;
+  stamp({
+    gate_state: state,
+    gate_reason: reason,
+    ...(res && res.escalated_to ? { gate_escalated_to: res.escalated_to } : {}),
+    ...(res && res.demoted != null ? { gate_demoted: !!res.demoted } : {}),
+  });
+  if (state !== "passed") {
+    out(`work: re-gate of ${record.node_id} ${state}${reason ? ` — ${reason}` : ""}${res && res.escalated_to ? ` (escalated to ${res.escalated_to})` : ""}`);
+    return 1;
+  }
+  // The refusal's graph state, undone: the escalation it filed is answered by
+  // a record of this pass, and the completion status it rolled back comes back.
+  const notes = [];
+  if (escalatedBefore) {
+    const closed = await writeRegateArtifact(cfg, { record, entry, factoryId, previous, reason, escalatedTo: escalatedBefore, project });
+    notes.push(closed.ok ? `closed ${escalatedBefore} with ${closed.id}` : `could not close ${escalatedBefore} (${closed.reason}) — resolve it by hand`);
+  }
+  if (record.gate_demoted) {
+    const promoted = await gatePromoteItem(cfg, record.node_id);
+    notes.push(promoted.ok ? promoted.note : `could not restore ${record.node_id}'s status (${promoted.reason})`);
+  }
+  out(`work: re-gate of ${record.node_id} passed — ${reason || "every gate passed"}${notes.length ? `; ${notes.join("; ")}` : ""}`);
+  return 0;
+}
+
+// The resolving record a passing re-gate writes onto the escalation the
+// refused attempt filed — an artifact, through the same validated door as
+// every other gate node, idempotent by id.
+async function writeRegateArtifact(cfg, { record, entry, factoryId, previous, reason, escalatedTo, project }) {
+  const stem = gateStem(entry.node_id);
+  const short = gateRunner.shortRunAttempt(entry.run_id, entry.attempt);
+  const id = `art-regate-${stem}-${short}-${gateIdSuffix("regate", factoryId || "factory", entry.node_id, gateRunner.gateRunKey(entry.run_id, entry.attempt))}`.toLowerCase();
+  const flat = (t, cap) => {
+    const s = String(t || "").replace(/\s+/g, " ").trim();
+    return s.length > cap ? `${s.slice(0, cap - 1)}…` : s;
+  };
+  const lines = [
+    "---",
+    `id: ${id}`,
+    "type: artifact",
+    ...(project ? [`project: ${project}`] : []),
+    `title: Re-gate passed — ${flat(entry.node_id, 60)} (attempt ${entry.attempt})`,
+    `summary: ${flat(`Run ${String(entry.run_id).slice(0, 8)} on ${entry.node_id} was re-judged under ${factoryId} after its earlier refusal (${previous}) and passed every gate: ${reason || "every gate passed"}. This closes the escalation that refusal filed.`, 460)}`,
+    `date: ${new Date().toISOString().slice(0, 10)}`,
+    "edges:",
+    `  - {type: resolves, to: ${escalatedTo}}`,
+    `  - {type: relates-to, to: ${entry.node_id}}`,
+    "---",
+    "",
+    `\`spor work --regate ${entry.run_id}\` re-ran factory \`${factoryId}\`'s gates on the same run — the same committed`,
+    `work, judged again after the cause of the earlier refusal was fixed outside the item. Previous verdict: ${flat(previous, 300)}.`,
+    "",
+    `Outcome: ${flat(reason || "every gate passed", 300)}`,
+    "",
+    "This is a gate outcome, not a resolution of the work item: the item's own resolver already stands, and the",
+    "escalation this resolves was the refusal's blocker, now answered.",
+    "",
+  ];
+  const written = await writeGateNode(cfg, id, gateCapBytes(lines.join("\n"), NODE_BODY_CAP_BYTES - 512));
+  return { ...written, id };
+}
+
 async function cmdWork(cfg, { values }) {
   if (values.status) return cmdWorkStatus(cfg, { json: !!values.json });
 
@@ -11037,6 +11190,12 @@ async function cmdWork(cfg, { values }) {
   // Read before `candidates` closes over it: `--print` calls that closure
   // before the loop starts, so this cannot be declared further down.
   const home = cfg.userConfigHome();
+
+  // `--regate <run>`: re-judge one refused run under this factory and exit —
+  // no polling, no dispatching (task-spor-work-regate).
+  if (values.regate) {
+    return cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthrough, warn: (line) => err(line), runMaxMs, home });
+  }
 
   const candidates = async ({ cooling = null } = {}) => {
     // Items already being worked by an agent on THIS box — this loop's earlier
@@ -13454,6 +13613,7 @@ const COMMANDS = {
       "max-interval": { type: "string", value: "S", desc: "backoff ceiling in seconds when idle (default 300)" },
       "retry-after": { type: "string", value: "S", desc: "seconds before retrying a refused item (default 600)" },
       "run-max": { type: "string", value: "H", desc: "hours to follow one run before freeing its slot (default 24)" },
+      regate: { type: "string", value: "run-id", desc: "re-judge one refused run under the factory (after fixing what refused it) and exit" },
       max: { type: "string", value: "N", desc: "stop after N dispatches (default: run forever)" },
       once: { type: "boolean", desc: "one selection pass, wait for those runs, exit" },
       status: { type: "boolean", desc: "read back this machine's workers instead of running one" },

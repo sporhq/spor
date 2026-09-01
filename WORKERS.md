@@ -851,6 +851,22 @@ a refusal into a pass. The runner says what it could not do — on the gate fact
 (`Demotion: …`), in the log line, and as `demoted`/`demote_reason` on the
 worker's `recent` entry.
 
+**A refusal can be re-judged.** A gate can refuse for a reason that is not
+the item's — the trusted ref itself is red (a sibling-library drift, someone
+else's landing), the suite flaked under contention, the reviewer's harness was
+down. The shape above then leaves the item demoted and blocked by its
+escalation, its work committed in a worktree, and nothing to re-dispatch. `spor
+work --regate <run-id> --factory <id>` re-runs the factory's gates (and the
+integration stage) on that same finished run once the cause is fixed outside
+the item: the facts it writes carry the attempt in their ids (`…-r2-…`), so the
+first verdict's record stands beside the second's and is never overwritten or
+refused as a collision; on a pass it writes a resolving artifact onto the
+escalation the refused attempt filed and restores the completion status that
+attempt rolled back. It refuses a run that is still running, one that carries
+no claim of completion, and one that already passed or parked. Only a re-gate
+may move a settled `gate_state` on the run record — every other writer
+(the loop, a resumed pipeline, a duplicate adopter) still cannot.
+
 ### 10.8 An interrupted pipeline is resumed, not lost
 
 A dispatched run is a detached process that owns its own terminal contract, so a
