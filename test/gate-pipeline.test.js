@@ -2201,7 +2201,7 @@ test("failureEvidence pulls the failure lines out of a long, mostly-green suite 
   assert.match(lines[2], /Running target test for 6 projects failed/);
   assert.match(e, /\n---\n/, "then the tail, separated");
   assert.ok(Buffer.byteLength(e, "utf8") <= 2600, `bounded, saw ${Buffer.byteLength(e, "utf8")}`);
-  assert.ok(!e.includes("✔"), "no passing line is picked up, not even one whose title says failed");
+  assert.ok(!e.split("\n---\n")[0].includes("✔"), "no passing line is picked up as a failure line, not even one whose title says failed");
   // Nothing matched: the plain tail, unchanged.
   assert.strictEqual(gateRunner.failureEvidence("all good\nfine"), "all good\nfine");
   assert.strictEqual(gateRunner.failureEvidence("✔ edge running -> failed (1ms)\nℹ pass 1"), "✔ edge running -> failed (1ms)\nℹ pass 1", "a passing title containing 'failed' is not a failure line");
