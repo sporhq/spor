@@ -38,6 +38,7 @@ const workLoop = require(path.join(ROOT, "lib", "shell", "work-loop.js"));
 const gatesKernel = require(path.join(ROOT, "lib", "kernel", "gates.js"));
 const gateRunner = require(path.join(ROOT, "lib", "shell", "gate-runner.js"));
 const integrationRunner = require(path.join(ROOT, "lib", "shell", "integration-runner.js"));
+const { workerContract } = require(path.join(ROOT, "lib", "shell", "worker-contract.js"));
 // Resolution truth (lib/kernel/resolution.js): a node is "done" when it carries a
 // TERMINAL status OR a live inbound resolves/answers edge — the same partition the
 // queue ranker and read surfaces use. The dispatch guard reads it so it never
@@ -7645,31 +7646,105 @@ function createDispatchWorktree(repoDir, name, { slug, nodeId } = {}) {
   // so a machine-local `dispatch.worktreeSetup` keeps working — that one isn't
   // the main checkout's file. targetRepoDispatchCfg reads exactly
   // `<dir>/.spor.json` with no walk at all, so it needs no fence.
+  const hook = runWorktreeSetupHook(dir, { repoDir, slug, nodeId, stdio: "inherit" });
+  if (hook.error) return { dir, branch, reused, created: !reused, setupError: hook.error };
+  return { dir, branch, reused, setupRan: hook.ran };
+}
+
+// Run the repo's `dispatch.worktreeSetup` hook in a freshly-cut worktree —
+// shared by the dispatch worktree above and by the gate pipeline's throwaway
+// trees (a command gate's tree, the integration stage's candidate tree; see
+// makeGateDeps/makeIntegrationDeps). A bare `git worktree add` lacks whatever
+// the repo's suite needs that is not in git — a node_modules symlink, a pinned
+// sibling-checkout path — and the hook is the ONE place a repo declares how to
+// stage that. Running it only for the implementer's worktree and not for the
+// tree the suite is judged in makes a factory whose repo needs the hook fail
+// its own acceptance gate on a missing dependency, every time, on a tree the
+// implementer never touched.
+//
+// Resolved from the WORKTREE's own checkout, never the main checkout's live
+// .spor.json (issue-spor-dispatch-worktree-config-live-file-race), with the
+// standing cascade fenced at the worktree root — see the comment that used to
+// sit inline in createDispatchWorktree, now the shape below. Returns
+// {ran: false} when no hook is declared, {ran: true} when it ran clean, and
+// {error} — a message, not a throw — when it failed.
+function runWorktreeSetupHook(dir, { repoDir, slug = null, nodeId = null, stdio = "inherit" } = {}) {
+  // `boundary: dir` is what keeps the STANDING cascade honest too: a dispatch
+  // worktree nests at `<repoDir>/.claude/worktrees/<name>`, so loadConfig's
+  // ordinary repo-file ancestor walk would climb straight back into `repoDir`
+  // and read the main checkout's live, possibly uncommitted `.spor.json`. The
+  // boundary fences every repo-file marker walk at the worktree root; env, the
+  // user `$SPOR_HOME/config.json` and the global config still apply, so a
+  // machine-local `dispatch.worktreeSetup` keeps working.
   const cfg = targetRepoDispatchCfg(dir);
   const standingCfg = loadConfig({ cwd: dir, env: process.env, boundary: dir });
   const setup = cfg.worktreeSetup != null ? cfg.worktreeSetup : standingCfg.get("dispatch.worktreeSetup", null);
-  if (setup) {
-    const sr = spawnSync(setup, [], {
-      cwd: dir,
-      stdio: "inherit",
-      shell: true,
-      // Scrubbed of the git location vars (u.gitEnv): the hook stages the fresh
-      // worktree, so its git must follow cwd rather than an ambient GIT_DIR
-      // inherited from whatever launched dispatch
-      // (issue-spor-dispatch-worktree-wrong-repo-location).
-      env: {
-        ...u.gitEnv(),
-        SPOR_WORKTREE: dir,
-        SPOR_MAIN_CHECKOUT: repoDir,
-        SPOR_DISPATCH_SLUG: slug || "",
-        SPOR_DISPATCH_NODE: nodeId || "",
-      },
-    });
-    if (sr.error) return { dir, branch, reused, created: !reused, setupError: sr.error.message };
-    if (sr.status !== 0) return { dir, branch, reused, created: !reused, setupError: `setup hook exited ${sr.status}` };
-    return { dir, branch, reused, setupRan: true };
+  if (!setup) return { ran: false };
+  const sr = spawnSync(setup, [], {
+    cwd: dir,
+    stdio,
+    shell: true,
+    // Scrubbed of the git location vars (u.gitEnv): the hook stages the fresh
+    // worktree, so its git must follow cwd rather than an ambient GIT_DIR
+    // inherited from whatever launched dispatch
+    // (issue-spor-dispatch-worktree-wrong-repo-location).
+    env: {
+      ...u.gitEnv(),
+      SPOR_WORKTREE: dir,
+      SPOR_MAIN_CHECKOUT: repoDir,
+      SPOR_DISPATCH_SLUG: slug || "",
+      SPOR_DISPATCH_NODE: nodeId || "",
+    },
+  });
+  if (sr.error) return { ran: true, error: sr.error.message };
+  if (sr.status !== 0) {
+    const tail = stdio === "pipe" ? String(sr.stderr || sr.stdout || "").trim().split("\n").filter(Boolean).pop() : "";
+    return { ran: true, error: `setup hook exited ${sr.status}${tail ? `: ${tail}` : ""}` };
   }
-  return { dir, branch, reused, setupRan: false };
+  return { ran: true };
+}
+
+// The durable MAIN checkout a worktree (or a plain checkout) belongs to —
+// `dirname(--git-common-dir)`, the same resolution removeDispatchWorktree and
+// the hooks' inferenceRoot use. Null when `dir` is not a git checkout at all.
+function mainCheckoutOf(dir) {
+  const common = (git(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).stdout || "").trim();
+  return common ? path.dirname(common) : null;
+}
+
+// The `env` block a worktree's own `.claude/settings.local.json` declares — the
+// channel the spor-server setup hook uses to pin `$SPOR_LIB` for the agent
+// that will run there (a launcher's env never reaches a `claude --bg` agent,
+// so the hook writes it where the harness reads it). A gate's suite runs in
+// such a tree under THIS process, not under a harness, so the same block is
+// folded into the suite's env here — otherwise the hook's pin reaches the
+// implementer and not the judge. Fail-soft: no file, or an unreadable one, is
+// simply no extra env.
+// Stage one of the gate pipeline's THROWAWAY trees (a command gate's tree, the
+// integration candidate) with the repo's worktree-setup hook. `top` is the
+// checkout the tree was cut from (the implementer's worktree, typically), from
+// which the durable main checkout — what the hook receives as
+// SPOR_MAIN_CHECKOUT, and where a node_modules symlink should point — is
+// derived. Shape matches the gate deps' own {ok, reason} contract: a hook that
+// fails refuses the tree, it never runs the suite on a half-staged one.
+function stageThrowawayTree(dir, top, { slug = null, nodeId = null, what = "gate" } = {}) {
+  const repoDir = mainCheckoutOf(top) || top;
+  const hook = runWorktreeSetupHook(dir, { repoDir, slug, nodeId, stdio: "pipe" });
+  if (hook.error) return { ok: false, reason: `the repo's dispatch.worktreeSetup hook failed staging the ${what} tree: ${hook.error}` };
+  return { ok: true, ran: !!hook.ran };
+}
+
+function worktreeDeclaredEnv(dir) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8"));
+    const env = parsed && parsed.env;
+    if (!env || typeof env !== "object") return {};
+    const out = {};
+    for (const [k, v] of Object.entries(env)) if (typeof v === "string") out[k] = v;
+    return out;
+  } catch {
+    return {};
+  }
 }
 
 // Best-effort teardown of a worktree WE just created (setup-hook failure path):
@@ -9283,10 +9358,16 @@ function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, warn = () => {} } = {}) {
 // applies to the node's `assigned -> agent` edge). A box that cannot satisfy
 // the routed profile refuses the dispatch loudly, same as an explicit
 // `--profile` would — the item cools off and stays for a worker that can.
-async function dispatchWorkItem(cfg, item, passthrough) {
+//
+// The WORKER CONTRACT rides along as the task text (the prompt's third part,
+// WORKERS.md §4): commit before you resolve, never merge to the target ref,
+// leave the protected suite alone, resolve last (lib/shell/worker-contract.js).
+// `spor dispatch` on its own stays byte-identical — a person aiming one agent
+// at one node writes their own instructions; an unattended loop cannot.
+async function dispatchWorkItem(cfg, item, passthrough, { factory = null } = {}) {
   const values = { ...passthrough, node: item.id };
   if (!values.profile && item.profile) values.profile = item.profile;
-  return dispatchThrough(cfg, values, []);
+  return dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })]);
 }
 
 // Whether THIS machine can satisfy a loaded factory's integration
@@ -10055,10 +10136,14 @@ function makeGateDeps(
     },
     runSuite: async ({ gate, trustedRef, protectedPaths }) => {
       if (!change) return { ok: false, reason: "the change under judgement could not be read" };
-      const tree = prepareGateTree(change, { trustedRef, protectedPaths });
+      // The repo's own worktree-setup hook stages the throwaway tree exactly as
+      // it stages an implementer's worktree (node_modules, a pinned sibling
+      // checkout) — without it a repo whose suite needs anything not in git
+      // fails its own gate on a missing dependency, never on the change.
+      const tree = prepareGateTree(change, { trustedRef, protectedPaths, setup: (dir) => stageThrowawayTree(dir, change.top, { slug, nodeId: entry.node_id, what: "gate" }) });
       if (!tree.ok) return tree;
       try {
-        return await runGateCommand(gate, tree.dir);
+        return await runGateCommand(gate, tree.dir, { env: worktreeDeclaredEnv(tree.dir) });
       } finally {
         // AFTER the await, not after the call: runGateCommand is async, so a
         // bare `return` here would tear the worktree down under a running suite.
@@ -10515,7 +10600,19 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
     },
     acquireLease: () => acquireIntegrationLease(cfg, home, top || (record && record.cwd), { slug }),
     releaseLease: (token) => releaseIntegrationLease(cfg, token),
-    buildCandidate: async ({ head, targetRef, strategy }) => integrationRunner.buildCandidateTree({ top, head, targetRef, strategy }),
+    buildCandidate: async ({ head, targetRef, strategy }) => {
+      const built = integrationRunner.buildCandidateTree({ top, head, targetRef, strategy });
+      if (!built.ok) return built;
+      // Same staging the command gate's tree gets (stageThrowawayTree): the
+      // candidate suite runs here, and a repo whose suite needs a hook-staged
+      // dependency must not fail its own landing on a bare checkout.
+      const staged = stageThrowawayTree(built.dir, top, { slug, nodeId: entry.node_id, what: "integration candidate" });
+      if (!staged.ok) {
+        built.cleanup();
+        return { ok: false, reason: staged.reason };
+      }
+      return built;
+    },
     forceProtected: ({ dir, sha }) => {
       const forced = gateRunner.forceProtectedPaths({ top, dir, trustedRef: factory.trustedRef, protectedPaths: factory.protectedPaths });
       if (!forced.ok) return forced;
@@ -10527,7 +10624,7 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       // sha instead; a no-op restore returns `sha` unchanged.
       return integrationRunner.reconcileCandidateSha({ dir, sha });
     },
-    runSuite: ({ dir }) => gateRunner.runGateCommand({ id: "integration", command: integration.command, timeoutMs: integration.timeoutMs }, dir),
+    runSuite: ({ dir }) => gateRunner.runGateCommand({ id: "integration", command: integration.command, timeoutMs: integration.timeoutMs }, dir, { env: worktreeDeclaredEnv(dir) }),
     land: (args) => integrationRunner.landCandidate(args),
     propose: ({ head, targetRef }) => proposeIntegrationPR({ top, head, targetRef }),
     parkForReview: async ({ proposal }) => {
@@ -11079,7 +11176,7 @@ async function cmdWork(cfg, { values }) {
           const verdict = integrationSatisfiability(cfg, factory);
           if (!verdict.ok) return { ok: false, reason: verdict.reasons[0] };
         }
-        return dispatchWorkItem(cfg, item, passthrough);
+        return dispatchWorkItem(cfg, item, passthrough, { factory });
       },
       pollRuns: (ids) => pollWorkRuns(cfg, ids, { maxAgeMs: runMaxMs, warn }),
       publish: (status) => workLoop.writeWorkerStatus(home, status),

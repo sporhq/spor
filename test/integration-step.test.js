@@ -1089,9 +1089,9 @@ process.stdin.on("end", () => {
   const cwd = process.cwd();
   const commitCount = (cp.execSync("git rev-list --count HEAD", { cwd }).toString().trim());
   // Only do real implementer work the FIRST time this worker is asked to work
-  // this node — a fix-cycle re-dispatch (prompt mentions "integration stage")
+  // this node — a fix-cycle re-dispatch (its prompt says the stage "refused to land")
   // must not re-add a file that's already there.
-  if (!prompt.includes("integration stage") && !fs.existsSync(cwd + "/lib/sub.js")) {
+  if (!prompt.includes("refused to land") && !fs.existsSync(cwd + "/lib/sub.js")) {
     fs.writeFileSync(cwd + "/lib/sub.js", "module.exports = (a, b) => a - b;\\n");
     cp.execSync('git add -A && git -c user.email=t@t -c user.name=Test commit -qm "add subtract"', { cwd });
   }
@@ -1246,4 +1246,113 @@ test("ghPrStatus: refuses directly when gh is not on PATH — the backstop check
   } finally {
     process.env.PATH = originalPath;
   }
+});
+
+// ------------------------------------- reconciling the checked-out target --
+// `git update-ref` moves the ref and nothing else: the checkout that has the
+// target branch checked out (the shared main checkout on a dev box) is left
+// with HEAD at the landed commit but its index and working tree at the OLD one
+// — `git status` reads as a staged mega-revert of the landing, and a plain
+// `git commit` there backs the feature out again (the beb04c9 incident). The
+// stage brings that checkout up to the landed commit, for the landed paths,
+// only where nothing local touched them.
+
+function reconcileRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-reconcile-repo-"));
+  execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
+  git(dir, "config", "user.email", "t@t");
+  git(dir, "config", "user.name", "Test");
+  for (const f of ["modified.txt", "deleted.txt", "collides.txt", "untouched.txt"]) fs.writeFileSync(path.join(dir, f), `${f} v1\n`);
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "trusted");
+  git(dir, "checkout", "-q", "-b", "branch");
+  fs.writeFileSync(path.join(dir, "modified.txt"), "modified.txt v2\n");
+  fs.rmSync(path.join(dir, "deleted.txt"));
+  fs.writeFileSync(path.join(dir, "added.txt"), "added.txt v2\n");
+  fs.writeFileSync(path.join(dir, "collides.txt"), "collides.txt v2\n");
+  fs.writeFileSync(path.join(dir, "adds-over-local.txt"), "adds-over-local.txt v2\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "branch work");
+  git(dir, "checkout", "-q", "main");
+  return dir;
+}
+
+test("after a local landing, the checkout holding the target branch is brought up to the landed commit — landed paths only, local edits left alone", () => {
+  const dir = reconcileRepo();
+  // Local state in the main checkout that the landing must respect:
+  fs.writeFileSync(path.join(dir, "collides.txt"), "collides.txt LOCAL EDIT\n"); // landed too — must be skipped
+  fs.writeFileSync(path.join(dir, "adds-over-local.txt"), "someone's untracked file\n"); // landing adds it — must not be overwritten
+  fs.writeFileSync(path.join(dir, "wip.txt"), "unrelated wip\n"); // untracked, unrelated
+  const head = git(dir, "rev-parse", "branch").trim();
+  const built = integrationRunner.buildCandidateTree({ top: dir, head, targetRef: "main", strategy: "merge" });
+  assert.strictEqual(built.ok, true, built.reason);
+  const landed = integrationRunner.landCandidate({ top: dir, dir: built.dir, sha: built.sha, expectedSha: built.expectedSha, targetRef: "main", mode: "local" });
+  built.cleanup();
+  assert.strictEqual(landed.ok, true, landed.reason);
+  assert.strictEqual(git(dir, "rev-parse", "main").trim(), built.sha);
+  assert.strictEqual(fs.realpathSync(landed.reconciled.checkout), fs.realpathSync(dir));
+  assert.deepStrictEqual(landed.reconciled.updated.sort(), ["added.txt", "deleted.txt", "modified.txt"]);
+  assert.deepStrictEqual(landed.reconciled.skipped.sort(), ["adds-over-local.txt", "collides.txt"]);
+  assert.match(landed.detail, /brought .* up to the landed commit \(3 paths; left 2 locally-modified paths alone/);
+  // The working tree now matches the landed commit where it safely can...
+  assert.strictEqual(fs.readFileSync(path.join(dir, "modified.txt"), "utf8"), "modified.txt v2\n");
+  assert.strictEqual(fs.readFileSync(path.join(dir, "added.txt"), "utf8"), "added.txt v2\n");
+  assert.ok(!fs.existsSync(path.join(dir, "deleted.txt")), "a path the landing deleted is gone");
+  // ...and nobody's local work was touched.
+  assert.strictEqual(fs.readFileSync(path.join(dir, "collides.txt"), "utf8"), "collides.txt LOCAL EDIT\n");
+  assert.strictEqual(fs.readFileSync(path.join(dir, "adds-over-local.txt"), "utf8"), "someone's untracked file\n");
+  assert.strictEqual(fs.readFileSync(path.join(dir, "wip.txt"), "utf8"), "unrelated wip\n");
+  // No phantom revert: the only things git status reports are the local edits.
+  const status = git(dir, "status", "--porcelain").trimEnd().split("\n").sort();
+  assert.deepStrictEqual(status, [" M adds-over-local.txt", " M collides.txt", "?? wip.txt"].sort(), status.join(" | "));
+});
+
+test("reconcile is a no-op when nothing has the target branch checked out, and when the landing is empty", () => {
+  const dir = reconcileRepo();
+  git(dir, "checkout", "-q", "--detach");
+  const head = git(dir, "rev-parse", "branch").trim();
+  const built = integrationRunner.buildCandidateTree({ top: dir, head, targetRef: "main", strategy: "merge" });
+  assert.strictEqual(built.ok, true, built.reason);
+  const landed = integrationRunner.landCandidate({ top: dir, dir: built.dir, sha: built.sha, expectedSha: built.expectedSha, targetRef: "main", mode: "local" });
+  built.cleanup();
+  assert.strictEqual(landed.ok, true, landed.reason);
+  assert.strictEqual(landed.reconciled.checkout, null);
+  assert.ok(!fs.existsSync(path.join(dir, "added.txt")), "a detached checkout is nobody's stale main tree — untouched");
+  assert.deepStrictEqual(integrationRunner.reconcileCheckedOutTarget({ top: dir, ref: "refs/heads/main", fromSha: built.sha, toSha: built.sha }).updated, []);
+});
+
+test("end to end, local mode: the candidate tree is staged with the repo's own dispatch.worktreeSetup hook before its suite runs", () => {
+  const { home, repo, outfile } = integrationCliFixture({ integration: { mode: "local", command: `"${process.execPath}" test/acceptance.js`, strategy: "merge" } });
+  const hookLog = path.join(home, "hook.log");
+  fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "scripts", "stage.sh"), '#!/bin/sh\nprintf "%s\\n" "$SPOR_MAIN_CHECKOUT" >> "$HOOK_LOG"\n: > "$SPOR_WORKTREE/staged.txt"\n');
+  fs.chmodSync(path.join(repo, "scripts", "stage.sh"), 0o755);
+  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktreeSetup: "scripts/stage.sh" } }));
+  fs.writeFileSync(
+    path.join(repo, "test", "acceptance.js"),
+    'const fs = require("fs");\nif (!fs.existsSync("staged.txt")) { console.error("not staged: the suite needs the hook"); process.exit(1); }\n'
+  );
+  git(repo, "add", "-A");
+  git(repo, "commit", "-q", "-m", "declare the setup hook and a suite that needs it");
+  const before = git(repo, "rev-parse", "main").trim();
+  const r = cli(["work", "--once", "--max", "1", "--interval", "1", "--no-brief", "--worktree", "--factory", "factory-demo"], {
+    SPOR_HOME: home,
+    XDG_CONFIG_HOME: home,
+    OUTFILE: outfile,
+    HOOK_LOG: hookLog,
+    PATH: pathWithOnlyGitAndNode(),
+  });
+  assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
+  assert.match(r.stdout, /gate acceptance passed on task-ready/);
+  assert.match(r.stdout, /integration landed on main/);
+  assert.notStrictEqual(git(repo, "rev-parse", "main").trim(), before, "main really moved");
+  // Three trees, three hook runs: the implementer's dispatch worktree, the
+  // command gate's tree, the integration candidate.
+  const ran = fs.readFileSync(hookLog, "utf8").trim().split("\n");
+  assert.strictEqual(ran.length, 3, `expected the hook to stage 3 trees, saw ${ran.length}`);
+  for (const main of ran) assert.strictEqual(fs.realpathSync(main), fs.realpathSync(repo));
+  // And the main checkout — which has `main` checked out — was reconciled to
+  // the landing rather than left as a staged phantom revert.
+  assert.strictEqual(fs.readFileSync(path.join(repo, "lib", "sub.js"), "utf8"), "module.exports = (a, b) => a - b;\n");
+  assert.strictEqual(git(repo, "status", "--porcelain").trim(), "", "no phantom revert in the main checkout after the landing");
 });

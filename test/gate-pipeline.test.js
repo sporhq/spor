@@ -2065,3 +2065,115 @@ process.stdin.on("end", () => {
     }
   }
 });
+
+// ------------------------------------------------------ empty diff, fail closed --
+// issue-spor-review-gate-empty-diff-vacuous-pass: the first live factory run's
+// implementer landed its commit on main itself, so the review gate diffed a
+// commit against itself, dispatched a reviewer at nothing, and read back a
+// pass. A review with nothing to judge must fail closed, unretried.
+
+test("an agent-review gate with an EMPTY diff fails closed — no reviewer dispatched, no fix cycle, straight to a person", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-reviewer", cycles: 3 }] });
+  const { deps, seen } = fakes({ changed: [] });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.match(res.reason, /no committed change against main/);
+  assert.match(res.reason, /fails closed/);
+  assert.strictEqual(seen.reviews.length, 0, "a reviewer is never dispatched at an empty diff");
+  assert.strictEqual(seen.fixes.length, 0, "no fix cycle can produce a diff where the branch carries none");
+  assert.strictEqual(seen.escalations.length, 1, "a person is asked why the branch is empty");
+  assert.strictEqual(seen.demotions.length, 1);
+});
+
+test("a command gate is NOT the empty-diff guard — an unchanged tree still runs its suite (the review gate is where a vacuous pass would launder)", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+  const { deps, seen } = fakes({ changed: [] });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.deepStrictEqual(seen.suites, ["acceptance"]);
+});
+
+// ------------------------------------------------- the gate tree's setup hook --
+// A bare `git worktree add` lacks whatever the repo's suite needs that is not in
+// git (spor-server's node_modules symlink, a pinned sibling checkout). The gate
+// tree is staged by the caller's `setup` hook — the repo's own
+// dispatch.worktreeSetup on the CLI path — or the suite would fail on a missing
+// dependency on a tree the implementer never touched.
+
+test("prepareGateTree runs the caller's setup hook AFTER forcing the protected paths, and a failing hook refuses the tree", () => {
+  const repo = repoWithBranch({ weakenTest: true, regress: false });
+  const change = gateRunner.gateChangeSet({ cwd: repo }, "main");
+  assert.strictEqual(change.ok, true, change.reason);
+  const seen = [];
+  const tree = gateRunner.prepareGateTree(change, {
+    trustedRef: "main",
+    protectedPaths: ["test/**"],
+    setup: (dir) => {
+      // By the time the hook runs, the protected path is already the trusted copy.
+      seen.push(fs.readFileSync(path.join(dir, "test", "acceptance.js"), "utf8"));
+      fs.writeFileSync(path.join(dir, "staged.txt"), "hook ran\n");
+      return { ok: true };
+    },
+  });
+  assert.strictEqual(tree.ok, true, tree.reason);
+  assert.match(seen[0], /add is broken/, "the hook saw the TRUSTED suite, not the branch's weakened one");
+  assert.strictEqual(fs.readFileSync(path.join(tree.dir, "staged.txt"), "utf8"), "hook ran\n");
+  tree.cleanup();
+
+  const refused = gateRunner.prepareGateTree(change, { trustedRef: "main", protectedPaths: [], setup: () => ({ ok: false, reason: "no node_modules upstream" }) });
+  assert.strictEqual(refused.ok, false);
+  assert.match(refused.reason, /no node_modules upstream/);
+  const thrown = gateRunner.prepareGateTree(change, { trustedRef: "main", protectedPaths: [], setup: () => { throw new Error("boom"); } });
+  assert.strictEqual(thrown.ok, false);
+  assert.match(thrown.reason, /threw: boom/);
+  assert.strictEqual(git(repo, "worktree", "list").trim().split("\n").length, 1, "a refused tree leaves no worktree behind");
+});
+
+test("runGateCommand layers the caller's env UNDER the gate's own CI/SPOR_GATE", async () => {
+  const gate = { id: "envgate", command: `"${process.execPath}" -e "process.exit(process.env.EXTRA === '1' && process.env.SPOR_GATE === 'envgate' && process.env.CI === '1' ? 0 : 3)"`, timeoutMs: 20000 };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-env-"));
+  const r = await gateRunner.runGateCommand(gate, dir, { env: { EXTRA: "1", SPOR_GATE: "overridden" } });
+  assert.strictEqual(r.ok, true, r.reason);
+});
+
+test("end to end: the gate tree is staged with the repo's own dispatch.worktreeSetup hook, and the dispatched prompt carries the worker contract", () => {
+  const { home, repo, outfile } = cliFixture({ factoryPayload: OK_FACTORY });
+  // The repo declares a setup hook (committed, relative path — the shape
+  // spor-server ships) that stages a file the acceptance suite requires.
+  const hookLog = path.join(home, "hook.log");
+  fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "scripts", "stage.sh"), '#!/bin/sh\nprintf "%s\\n" "$SPOR_MAIN_CHECKOUT" >> "$HOOK_LOG"\n: > "$SPOR_WORKTREE/staged.txt"\n');
+  fs.chmodSync(path.join(repo, "scripts", "stage.sh"), 0o755);
+  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktreeSetup: "scripts/stage.sh" } }));
+  fs.writeFileSync(
+    path.join(repo, "test", "acceptance.js"),
+    'const fs = require("fs");\nif (!fs.existsSync("staged.txt")) { console.error("not staged: the suite needs the hook"); process.exit(1); }\n'
+  );
+  // Committed on MAIN (the trusted ref — the suite is a protected path, so it
+  // must come from there), then merged into the implementer's branch so the
+  // branch carries the hook and the marker but no protected-path edit of its own.
+  git(repo, "stash", "-q", "--include-untracked");
+  git(repo, "checkout", "-q", "main");
+  git(repo, "stash", "pop", "-q");
+  git(repo, "add", "-A");
+  git(repo, "commit", "-q", "-m", "declare the setup hook and a suite that needs it");
+  git(repo, "checkout", "-q", "impl");
+  git(repo, "merge", "-q", "--no-edit", "main");
+  const r = cli(
+    ["work", "--once", "--max", "1", "--interval", "1", "--no-brief", "--no-worktree", "--factory", "factory-demo"],
+    { SPOR_HOME: home, XDG_CONFIG_HOME: home, GATE_OUTFILE: outfile, HOOK_LOG: hookLog, PATH: pathWithOnlyGitAndNode() }
+  );
+  assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
+  assert.match(r.stdout, /gate acceptance passed on task-ready/, "the suite passed only because the hook staged the tree");
+  const ran = fs.readFileSync(hookLog, "utf8").trim().split("\n");
+  assert.strictEqual(ran.length, 1, `the hook ran once, for the gate tree (saw ${ran.length})`);
+  assert.strictEqual(fs.realpathSync(ran[0]), fs.realpathSync(repo), "SPOR_MAIN_CHECKOUT is the durable main checkout");
+  assert.ok(!fs.existsSync(path.join(repo, "staged.txt")), "the hook staged the throwaway tree, never the repo itself");
+  // The implementer got the contract as its task text.
+  const invocation = JSON.parse(fs.readFileSync(outfile, "utf8").trim().split("\n")[0]);
+  assert.match(invocation.prompt, /Work on task-ready/);
+  assert.match(invocation.prompt, /## Worker contract/);
+  assert.match(invocation.prompt, /Do NOT edit the protected test paths \(`test\/\*\*`\)/);
+  assert.match(invocation.prompt, /`profile-test-writer` lane/);
+  assert.match(invocation.prompt, /Resolve the item on the graph LAST/);
+});

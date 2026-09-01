@@ -225,6 +225,19 @@ standing context. <any additional free-text task instructions>
    but every fleet worker benefits from it.
 3. **Task.** What to do — the target node's id and title plus any additional
    instruction text, or free-text task instructions with no node at all.
+4. **Worker contract** (`spor work` only). An unattended worker appends a
+   standing contract as the task's instruction text
+   (`lib/shell/worker-contract.js`): work only in the launched checkout and
+   branch, never merge to or push the target ref, do not edit the factory's
+   protected test paths, verify deterministically, **commit everything and
+   leave the tree clean BEFORE resolving**, resolve the item LAST with a
+   resolver node carrying a `resolves` edge, and if the item will not
+   converge leave it unresolved with the blocker named in the report. The
+   factory-specific lines (the integration target, the acceptance command,
+   the protected paths and their lane, the cross-model review) appear only
+   when the factory declares them; a bare worker's contract is the plain
+   commit-then-resolve discipline. A person's one-off `spor dispatch` adds
+   nothing — they write their own instructions.
 
 There is no wire-level requirement that a worker consume this exact string;
 what matters is that a conforming worker (a) is capable of reading a compiled
@@ -693,8 +706,13 @@ under test cannot rewrite its own judge. So a command gate:
    not be the lane that writes the code;
 3. otherwise materializes a throwaway git worktree at the implementer's commit
    and **forces every protected path back to the trusted ref's copy** (files the
-   branch added under a protected path are removed), then runs the declared
-   command there.
+   branch added under a protected path are removed), stages that tree with the
+   repo's own `dispatch.worktreeSetup` hook exactly as a dispatch worktree is
+   staged (a `node_modules` symlink, a pinned sibling checkout — whatever the
+   suite needs that is not in git; the hook's `.claude/settings.local.json`
+   `env` block reaches the suite's environment too), then runs the declared
+   command there. A hook that fails refuses the tree — the suite is never run
+   on a half-staged one.
 
 Step 3 is belt and braces — step 2 already refuses a branch that touched those
 paths — and that is the point: the guarantee that the suite is the trusted ref's
@@ -739,7 +757,12 @@ Fail-closed throughout: a review that could not be dispatched, that never
 finished, that left no report to read (an agent-review gate must therefore route
 to a SUPERVISED harness — a native-background launch has no report channel), or
 whose verdict is unparseable or unrecognized is a gate FAILURE. An unread review
-is not an approval.
+is not an approval. Nor is a review of nothing: a branch that carries **no
+committed change against the trusted ref** (the implementer landed its work on
+the trusted ref directly, or resolved with nothing behind it) fails the gate
+closed and unretried, straight to a person — no reviewer is dispatched at an
+empty diff, because a vacuous pass is exactly how an unreviewed change would
+launder into an approval.
 
 On `changes_requested` with cycles left, the runner dispatches an implementer
 **fix cycle** — the findings and the evidence, at the same node, in the same
@@ -1017,7 +1040,13 @@ failure is fed into the same fix-cycle machinery a conflict is.
 
 **Landing is compare-and-swap**, and losing the race is nobody's mistake. Local
 mode's `git update-ref target_ref new_sha old_sha` refuses if the ref moved
-since the candidate was built; push mode's rejection of a non-fast-forward push
+since the candidate was built (and, having moved it, brings the one checkout
+that has `target_ref` checked out up to the landed commit — for the landed
+paths only, and only where that checkout's index and working copy were
+untouched since; a path someone edited there meanwhile is left alone and named
+in the landing's note. `update-ref` alone leaves such a checkout reading as a
+staged revert of everything just landed, which a plain `git commit` there would
+then make real); push mode's rejection of a non-fast-forward push
 is the same guarantee over a remote ref. Either way, a **lost race rebuilds the
 candidate against the ref's new tip and reruns** — automatically, bounded by a
 small retry ceiling against the pathological case of a target that never stops
