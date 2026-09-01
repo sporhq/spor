@@ -2177,3 +2177,40 @@ test("end to end: the gate tree is staged with the repo's own dispatch.worktreeS
   assert.match(invocation.prompt, /`profile-test-writer` lane/);
   assert.match(invocation.prompt, /Resolve the item on the graph LAST/);
 });
+
+// ---------------------------------------------- evidence that names the failure --
+// The first spor-server factory escalation carried 2.5KB of green checks and an
+// nx footer ("server:test failed") — the failing test itself had scrolled out of
+// the tail. Evidence for a failed suite leads with the failure lines.
+
+test("failureEvidence pulls the failure lines out of a long, mostly-green suite output, then the tail", () => {
+  const E = String.fromCharCode(27);
+  const out = [
+    "✔ a (1ms)",
+    `${E}[31m✖ the one that broke (3ms)${E}[39m`,
+    "  AssertionError [ERR_ASSERTION]: expected 1 got 2",
+    ...Array(400).fill("✔ passing (1ms)"),
+    `${E}[31m NX ${E}[39m  Running target test for 6 projects failed`,
+    "Failed tasks:",
+    "- server:test",
+  ].join("\n");
+  const e = gateRunner.failureEvidence(out);
+  const lines = e.split("\n");
+  assert.strictEqual(lines[0], "✖ the one that broke (3ms)", "ANSI stripped, failure first");
+  assert.strictEqual(lines[1], "AssertionError [ERR_ASSERTION]: expected 1 got 2");
+  assert.match(lines[2], /Running target test for 6 projects failed/);
+  assert.match(e, /\n---\n/, "then the tail, separated");
+  assert.ok(Buffer.byteLength(e, "utf8") <= 2600, `bounded, saw ${Buffer.byteLength(e, "utf8")}`);
+  // Nothing matched: the plain tail, unchanged.
+  assert.strictEqual(gateRunner.failureEvidence("all good\nfine"), "all good\nfine");
+});
+
+test("a failed command gate's fact carries the failure lines, not just the tail", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+  const output = ["✖ the broken one", ...Array(300).fill("✔ fine"), "Failed tasks:", "- server:test"].join("\n");
+  const { deps, seen } = fakes({ suite: () => ({ ok: false, code: 1, output }) });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.match(seen.facts[0].markdown, /✖ the broken one/);
+  assert.match(seen.escalations[0].evidence, /✖ the broken one/);
+});
