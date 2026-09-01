@@ -890,6 +890,88 @@ test("a dispatch refusal is recorded with its own reason and the worker stops in
   assert.strictEqual(skipped.find((s) => s.id === "task-untriaged").reason, "not agent-ready; work.accept ready");
 });
 
+// The cooling half of the page's eligible predicate (bin/spor.js's
+// `candidates`, the closure handed to dispatchableQueuePage): a queue whose
+// FIRST page holds one agent-ready item this box refuses deterministically
+// (its profile selects a harness with no declaration here) plus a page's worth
+// of untriaged items ranked above a second agent-ready item. Poll 1 tries the
+// refusable one and cools it off; the page does not widen (something on it WAS
+// eligible). Poll 2 sees it cooling, finds nothing else eligible on the same
+// 25, and must widen past it to reach the item below — the exact starvation
+// the widening exists to fix (dec-spor-work-page-widens-past-undispatchable),
+// one hop deeper than the policy skips, and the one branch the fake-queue loop
+// tests and `--print` (which runs with no cooldowns) cannot reach.
+function widenFixture() {
+  const { home, repo, nodes, outfile } = cliFixture();
+  // A second profile whose harness NO declaration binds: `spor dispatch`
+  // refuses it, every time, which is what makes the cooldown deterministic.
+  fs.writeFileSync(path.join(nodes, "profile-nodecl.md"), `---\nid: profile-nodecl\ntype: profile\ntitle: Work loop undeclared-harness profile\nsummary: A profile selecting a harness this machine declares no binding for, so dispatch refuses it.\nharness: workmissing\ndate: 2026-08-20\n---\nUndeclared here.\n`);
+  const node = (id, extra, body) =>
+    fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\ntype: task\nrepo: demo\n${extra}date: 2026-08-20\n---\n${body}\n`);
+  // Ranked FIRST (p1): agent-ready, refused on this box.
+  node("task-refused", "title: Port the sync worker to the other harness\nsummary: An agent-ready item whose profile this machine cannot satisfy, so every dispatch of it refuses.\nstatus: open\npriority: p1\nedges:\n  - {type: assigned, to: agent-workbox, profile: profile-nodecl}\n", "Refused here.");
+  // Ranked ABOVE the fixture's `task-ready` (p3 outranks its unset priority;
+  // same date, so nothing else separates them): enough to fill the rest of the
+  // first 25-item page, and two more so the widened page still holds all of
+  // them ahead of the item under test.
+  for (let i = 1; i <= 26; i++) {
+    const n = String(i).padStart(2, "0");
+    node(`task-untriaged-${n}`, `title: Captured sync worker cleanup ${n}\nsummary: A captured cleanup nobody has triaged or stamped agent-ready yet, number ${n}.\nstatus: open\npriority: p3\n`, "Untriaged capture.");
+  }
+  return { home, repo, nodes, outfile };
+}
+
+test("a cooled-off refusal lets the next poll widen the page past it and dispatch the eligible item below", () => {
+  const { home, repo, outfile } = widenFixture();
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() };
+
+  // The control: with no cooldowns in play (`--print` runs the same closure
+  // before the loop starts) the page stops at 25 — the refusable item is
+  // eligible, so nothing widens — and `task-ready` is BELOW it. So if the loop
+  // dispatches `task-ready`, a widened page is the only way it got there.
+  const print = cli(["work", "--print"], env);
+  assert.strictEqual(print.status, 0, print.stderr);
+  assert.match(print.stdout, /-> task-refused/);
+  assert.doesNotMatch(print.stdout, /task-ready/, "the item under test is beyond the first page");
+  assert.ok(!fs.existsSync(outfile), "--print launches nothing");
+
+  // Two real polls: --max 1 without --once, so the loop keeps polling after
+  // the refusal until it has dispatched one item. Poll 1 refuses and cools
+  // task-refused; poll 2 widens past it.
+  const r = cli(["work", "--max", "1", "--interval", "1", "--no-brief"], env);
+  assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
+  const refused = r.stdout.indexOf("work: skipping task-refused — ");
+  const dispatched = r.stdout.indexOf("work: dispatched task-ready");
+  assert.ok(refused >= 0, r.stdout);
+  assert.ok(dispatched >= 0, r.stdout);
+  assert.ok(refused < dispatched, "the refusal is cooled BEFORE the poll that reaches the item below it");
+  assert.match(r.stdout, /work: task-ready finished/);
+  assert.match(r.stdout, /dispatched 1;/);
+  assert.strictEqual((r.stdout.match(/work: skipping task-refused/g) || []).length, 1, "a cooling item is not re-refused on the next poll");
+
+  const invocations = fs.readFileSync(outfile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.strictEqual(invocations.length, 1, "exactly one launch");
+  assert.strictEqual(invocations[0].cwd, repo);
+  assert.match(invocations[0].prompt, /task-ready/);
+  assert.doesNotMatch(invocations[0].prompt, /task-refused/);
+
+  const status = JSON.parse(cli(["work", "--status", "--json"], { SPOR_HOME: home, XDG_CONFIG_HOME: home }).stdout);
+  const w = status.workers[0];
+  assert.strictEqual(w.dispatched, 1);
+  assert.strictEqual(w.recent[0].node_id, "task-ready");
+  assert.match(w.stop_reason, /--max/);
+  const cooled = w.skipped.find((s) => s.id === "task-refused");
+  assert.ok(cooled, JSON.stringify(w.skipped));
+  assert.ok(Date.parse(cooled.until) > Date.now(), "the refusal is still cooling when the worker stops");
+  // The untriaged page-fillers were policy skips, never candidates.
+  assert.ok(w.skipped.filter((s) => s.id.startsWith("task-untriaged-")).every((s) => s.reason === "not agent-ready; work.accept ready"));
+  // The dispatched item cools only AFTER its run ended unresolved (local mode
+  // can never verify a resolution) — a post-run cooldown, never a refusal.
+  const ready = w.skipped.find((s) => s.id === "task-ready");
+  assert.ok(ready, JSON.stringify(w.skipped));
+  assert.match(ready.reason, /^last run here ended /);
+});
+
 // A scratch graph home whose queue holds exactly one item that names its
 // worker profile via `profile:` frontmatter alone — no `assigned -> agent`
 // edge at all, the exact shape `buildGateWorkNode`'s test-change lane item
