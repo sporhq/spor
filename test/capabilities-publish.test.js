@@ -14,7 +14,7 @@ const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 const { spawn } = require("node:child_process");
-const { pathWithOnlyGit } = require("./helpers/portable");
+const { isolatedBinDir } = require("./helpers/portable");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 
@@ -57,15 +57,18 @@ function homeWithCaps() {
   return home;
 }
 
-// A scratch HOME (no ~/.claude manifest) and a harness-free PATH (only git, for
-// config load), so the publish's re-probe (issue-spor-capabilities-publish-
-// manual-no-spor-seed) yields a DETERMINISTIC set on any box: empty
-// harnesses/plugins/skills, with reachable_mcp seeded to [spor] from remote-mode
-// CONFIGURED-ness. Without pinning HOME/PATH the probe would read this box's real
-// harnesses + ~/.claude (a dev box with `claude` installed flips the assertion).
+// A scratch HOME (no ~/.claude manifest) and a harness/gh-free PATH (only
+// git, for config load), so the publish's re-probe (issue-spor-capabilities-
+// publish-manual-no-spor-seed) yields a DETERMINISTIC set on any box: empty
+// harnesses/plugins/skills/gh, with reachable_mcp seeded to [spor] from
+// remote-mode CONFIGURED-ness. Without pinning HOME/PATH the probe would read
+// this box's real harnesses + ~/.claude (a dev box with `claude` installed
+// flips the assertion) — isolatedBinDir(["git"]), not dirname(whichSync
+// ("git")), because a Homebrew-style box often puts `git` and `gh` in the
+// SAME directory, which would leak `gh: true` into the "clean" probe.
 function cleanProbeEnv() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-caps-cleanhome-"));
-  return { HOME: home, PATH: pathWithOnlyGit() };
+  return { HOME: home, PATH: isolatedBinDir(["git"]) };
 }
 
 // Records every request; POST /v1/agents/{id}/capabilities echoes the collapsed caps.
@@ -127,7 +130,7 @@ test("publish (remote): re-probes THIS box then POSTs the effective capabilities
     // deterministic [spor] seed remote mode always carries
     // (issue-spor-capabilities-publish-manual-no-spor-seed).
     assert.deepStrictEqual(JSON.parse(post.body), {
-      harnesses: [], reachable_mcp: ["spor"], skills: ["writing"], plugins: [], deny: [],
+      harnesses: [], reachable_mcp: ["spor"], skills: ["writing"], plugins: [], deny: [], gh: false,
     });
   } finally {
     srv.close();

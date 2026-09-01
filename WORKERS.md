@@ -1074,12 +1074,24 @@ for. Only the landing STEP itself differs: where `local`/`push` call
 **never touches `target_ref` at all** — it pushes the implementer's OWN branch
 (`tree.head`, unmerged; never the throwaway candidate commit, which only ever
 proved merging would be green) and opens a PR against it through the `gh` CLI,
-the v1 backend. `gh` is a declared capability, not an implicit one: `spor
-work` refuses to start, loudly, at the same load-time check an unreadable
-factory already gets, if a factory declares `propose` and the machine has no
-`gh` on PATH — never a silent fallback to another mode. A re-run (a fix cycle,
-or a resumed pipeline) reuses whatever PR is already open for the branch
-rather than erroring on a duplicate.
+the v1 backend. `gh` is a declared capability, checked through the SAME
+machine-profile satisfiability layer a profile's harness/mcp/skills/plugins
+already go through (dec-spor-machine-profile-satisfiability), not a one-off
+startup PATH probe (task-spor-propose-gh-capability-satisfiability): loading a
+factory that declares `propose` warns loudly, once, at the same load-time
+check an unreadable factory already gets, but no longer kills the whole
+worker — a mixed fleet may point several boxes at the same propose
+factory/queue and only some have `gh`, and a box that can never land a
+proposal should idle (skipping every candidate here, visibly, in `spor work
+--status`, leaving them for a capable box) rather than crash-loop under a
+service supervisor. The refusal that actually stops a claim runs per item,
+right where `dispatchWorkItem` would otherwise launch it — no lease is ever
+established on a box that can't finish the job. `proposeIntegrationPR` and
+`ghPrStatus` keep their own `hasCmd("gh")` checks as the backstop at the exact
+point `gh` is invoked, regardless of caller — the guarantee never rests on the
+satisfiability check having run. Never a silent fallback to another mode. A
+re-run (a fix cycle, or a resumed pipeline) reuses whatever PR is already open
+for the branch rather than erroring on a duplicate.
 
 **Opening the PR PARKS the item — it does not resolve it, and it frees the
 slot immediately.** This is deliberately NOT the `human` gate's shape (§10.2's

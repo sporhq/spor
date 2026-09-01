@@ -9289,6 +9289,32 @@ async function dispatchWorkItem(cfg, item, passthrough) {
   return dispatchThrough(cfg, values, []);
 }
 
+// Whether THIS machine can satisfy a loaded factory's integration
+// requirements (task-spor-propose-gh-capability-satisfiability) — today just
+// `gh` for `mode: propose`, checked through the machine-profile
+// satisfiability layer (dec-spor-machine-profile-satisfiability) rather than
+// a bespoke probe. Re-probed fresh on every call (mirrors
+// resolveDispatchProfile) so the verdict reflects current reality — gh
+// installed mid-session, or a fresh box with no prior session-start probe —
+// rather than a stale snapshot. Trivially satisfiable for any factory that
+// isn't propose mode (the common case), including no factory at all.
+function integrationSatisfiability(cfg, factory) {
+  // Skip the probe entirely for the common case (no factory, or a factory
+  // whose integration isn't propose mode) — a full probe re-reads the
+  // claude-plugins manifest and re-scans PATH, not worth paying on every
+  // dispatch attempt of an unrelated factory.
+  if (!factory || !factory.integration || factory.integration.mode !== "propose") return { ok: true, reasons: [] };
+  const rawCap = cfg.get("dispatch.capabilities", {}) || {};
+  let probed = null;
+  try {
+    probed = u.probeCapabilities(cfg.userConfigHome(), { sporReachable: cfg.mode() === "remote", cfg });
+  } catch {
+    /* probe is best-effort; match against what the cascade already holds */
+  }
+  const machine = sat.effectiveCapabilities(probed ? { ...rawCap, probed } : rawCap);
+  return sat.satisfiesIntegration(machine, factory);
+}
+
 // The shared body of the above and of the gate pipeline's review/fix launches
 // (task-spor-work-gate-pipeline): one dispatch through the real code path,
 // reporting the run it started or the refusal's own reason.
@@ -10839,14 +10865,25 @@ async function cmdWork(cfg, { values }) {
       return 1;
     }
     factory = loaded.factory;
-    // task-spor-integration-propose-mode: `gh` is a declared capability, not
-    // an implicit one — refuse loudly at startup, the same place a factory
-    // that cannot be read is already refused, rather than let the first
-    // parked item silently never open its PR.
-    if (factory.integration && factory.integration.mode === "propose" && !hasCmd("gh")) {
-      err(`spor work: factory '${factoryId}' declares integration mode 'propose', but the 'gh' CLI is not on PATH.`);
-      err("  propose mode opens pull requests through gh — install it (https://cli.github.com), or declare 'local'/'push' instead.");
-      return 1;
+    // task-spor-propose-gh-capability-satisfiability: `gh` is a declared
+    // capability, checked through the SAME machine-profile satisfiability
+    // layer as a profile's harness/mcp/skills/plugins
+    // (dec-spor-machine-profile-satisfiability), not a one-off startup PATH
+    // probe that kills the whole worker. A mixed fleet may point several
+    // boxes at the same propose factory/queue and only some have gh — a box
+    // that can't ever land a proposal should idle (skipping every candidate
+    // here, visibly, in `spor work --status`, and leaving them for a
+    // capable box) rather than crash-loop under a service supervisor. Warn
+    // once, loudly, so an operator watching THIS box's own log still learns
+    // why nothing here ever dispatches; the per-item check below is what
+    // actually stops a claim. `proposeIntegrationPR`/`ghPrStatus` keep their
+    // own `hasCmd("gh")` checks as the backstop at the point `gh` is
+    // actually invoked — the guarantee must never rest on this check having
+    // run.
+    const startupGh = integrationSatisfiability(cfg, factory);
+    if (!startupGh.ok) {
+      err(`spor work: factory '${factoryId}' declares integration mode 'propose', but ${startupGh.reasons[0]}`);
+      err("  every candidate under this factory will be skipped here (see 'spor work --status') until gh is available, or run this worker on a box that has it.");
     }
   }
   // The factory's repo scope (issue-spor-work-scope-union-factory-mismatch).
@@ -10959,6 +10996,8 @@ async function cmdWork(cfg, { values }) {
           g.kind === "command" ? `\`${g.command}\`` : g.kind === "agent-review" ? `review under ${g.profile}` : `approval${g.risk.length ? ` when ${g.risk.join("/")}` : " (always)"}`;
         out(`  gate ${g.id}  ${g.kind}  ${how}${g.cycles ? `  (up to ${g.cycles} fix cycle${g.cycles === 1 ? "" : "s"})` : ""}${g.source !== "inline" ? `  [${g.source}]` : ""}`);
       }
+      const ghVerdict = integrationSatisfiability(cfg, factory);
+      if (!ghVerdict.ok) out(`  integration: mode 'propose' — UNSATISFIABLE here: ${ghVerdict.reasons[0]}`);
     } else {
       out(`factory: none — the loop runs bare (declare one with --factory <id> or work.factory)`);
     }
@@ -11027,7 +11066,21 @@ async function cmdWork(cfg, { values }) {
     control,
     deps: {
       candidates,
-      dispatch: (item) => dispatchWorkItem(cfg, item, passthrough),
+      // Refuse BEFORE any side effect if this machine can't satisfy the
+      // loaded factory's integration requirement (task-spor-propose-gh-
+      // capability-satisfiability) — mirrors cmdDispatch's own profile-
+      // satisfiability refusal (dec-spor-machine-profile-satisfiability):
+      // never call through to dispatchWorkItem/cmdDispatch, so no lease is
+      // ever established for an item this box can never finish landing. The
+      // loop's existing refusal-cooldown machinery does the rest — the same
+      // path any other unsatisfiable-profile refusal already takes.
+      dispatch: (item) => {
+        if (factory) {
+          const verdict = integrationSatisfiability(cfg, factory);
+          if (!verdict.ok) return { ok: false, reason: verdict.reasons[0] };
+        }
+        return dispatchWorkItem(cfg, item, passthrough);
+      },
       pollRuns: (ids) => pollWorkRuns(cfg, ids, { maxAgeMs: runMaxMs, warn }),
       publish: (status) => workLoop.writeWorkerStatus(home, status),
       log: (line) => out(line),
@@ -13637,7 +13690,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, proposeIntegrationPR, ghPrStatus };
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
 
 if (require.main === module) {
   main()

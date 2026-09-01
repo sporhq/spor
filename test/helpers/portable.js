@@ -96,6 +96,36 @@ function pathWithOnlyGitAndNode() {
   return `${pathWithOnlyGit()}${path.delimiter}${dir}`;
 }
 
+// Symlinks the REAL binaries named in `names` (resolved via whichSync, or
+// process.execPath for "node") into a fresh, otherwise-empty bin dir and
+// returns its path — for a PATH holding EXACTLY these binaries and nothing
+// else, deterministically. `dirname(whichSync(x))` alone is not enough
+// whenever two binaries share one directory (a Homebrew-style box routinely
+// puts `git` and `gh` in the same bin/, so pathWithOnlyGit() drags gh along
+// with it too — task-spor-propose-gh-capability-satisfiability). Falls back
+// to a copy where symlinking is unavailable (e.g. an unprivileged Windows
+// account); silently skips a name that isn't found on this machine at all.
+function isolatedBinDir(names) {
+  const u = require(path.join(ROOT, "scripts", "engines", "util.js"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-isobin-"));
+  for (const name of names) {
+    const real = name === "node" ? process.execPath : u.whichSync(name);
+    if (!real) continue;
+    const dest = path.join(dir, process.platform === "win32" ? `${name}.exe` : name);
+    try {
+      fs.symlinkSync(real, dest);
+    } catch {
+      try {
+        fs.copyFileSync(real, dest);
+        fs.chmodSync(dest, 0o755);
+      } catch {
+        /* best-effort — a name that can't be placed just stays absent */
+      }
+    }
+  }
+  return dir;
+}
+
 module.exports = {
   ROOT,
   HOOK_JS,
@@ -107,4 +137,5 @@ module.exports = {
   writeFakePathBin,
   pathWithOnlyGit,
   pathWithOnlyGitAndNode,
+  isolatedBinDir,
 };

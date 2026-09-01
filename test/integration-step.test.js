@@ -30,7 +30,7 @@ const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const gates = require("../lib/kernel/gates.js");
 const integrationRunner = require("../lib/shell/integration-runner.js");
 const gateRunner = require("../lib/shell/gate-runner.js");
-const { writeSpawnableNodeStub, pathWithOnlyGitAndNode, writeFakePathBin, pathWithOnlyGit } = require("./helpers/portable");
+const { writeSpawnableNodeStub, pathWithOnlyGitAndNode, writeFakePathBin, pathWithOnlyGit, isolatedBinDir } = require("./helpers/portable");
 
 // ---------------------------------------------------------------- parsing --
 
@@ -1163,4 +1163,87 @@ test("spor work refuses to start on an invalid integration block — the same lo
   assert.strictEqual(r.status, 1, r.stdout);
   assert.match(r.stderr, /integration\.command is required/);
   assert.match(r.stderr, /does not run ungated/);
+});
+
+// ------ task-spor-propose-gh-capability-satisfiability -----------------------
+//
+// `gh` used to be a bare startup PATH probe: a factory declaring `propose`
+// on a box with no `gh` killed the whole worker before it ever polled the
+// queue. It is now wired through machine-profile satisfiability instead
+// (dec-spor-machine-profile-satisfiability) — the worker stays alive, warns
+// once, and skips every candidate under that factory with a visible reason,
+// the same pattern an unsatisfiable profile already gets. The literal
+// `hasCmd("gh")` checks inside proposeIntegrationPR/ghPrStatus remain as the
+// backstop at the actual point of use (see the two tests further below).
+//
+// pathWithOnlyGitAndNode() is NOT good enough here: on a box where `git` and
+// `gh` happen to live in the SAME directory (e.g. a Homebrew-style shared
+// bin), that "git-only" PATH drags gh along with it. These tests need a PATH
+// that genuinely has git (and, for the CLI ones, node) but NOT gh —
+// isolatedBinDir() builds one from symlinks to the real binaries.
+function pathWithGitAndNodeButNoGh() {
+  return isolatedBinDir(["git", "node"]);
+}
+
+test("spor work under a propose factory on a box with no gh: warns loudly, never crashes, and NEVER CLAIMS the item — skipped with a visible reason in --status, same pattern as an unsatisfiable profile", () => {
+  const { home, outfile } = integrationCliFixture({ integration: { mode: "propose", command: `"${process.execPath}" test/acceptance.js`, strategy: "merge" } });
+  // pathWithGitAndNodeButNoGh() has no `gh` anywhere on it — the deterministic
+  // "this box cannot satisfy propose mode" case.
+  const r = cli(["work", "--once", "--interval", "1", "--no-brief", "--factory", "factory-demo"], {
+    SPOR_HOME: home,
+    XDG_CONFIG_HOME: home,
+    OUTFILE: outfile,
+    PATH: pathWithGitAndNodeButNoGh(),
+  });
+  assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
+  // Loud at startup — but the worker keeps running (exit 0, not 1).
+  assert.match(r.stderr, /factory 'factory-demo' declares integration mode 'propose', but the 'gh' CLI is not available/);
+  assert.match(r.stdout, /work: skipping task-ready — /);
+  assert.match(r.stdout, /dispatched 0;/);
+  assert.ok(!fs.existsSync(outfile), "never claimed/launched — the implementer stub never ran, no gate ever started");
+
+  const status = JSON.parse(cli(["work", "--status", "--json"], { SPOR_HOME: home, XDG_CONFIG_HOME: home }).stdout);
+  const skipped = status.workers[0].skipped;
+  assert.strictEqual(skipped.length, 1);
+  assert.strictEqual(skipped[0].id, "task-ready");
+  assert.match(skipped[0].reason, /the 'gh' CLI is not available on this machine/);
+  assert.ok(Date.parse(skipped[0].until) > Date.now(), "cooling off, not dropped — a capable box can still pick it up");
+});
+
+test("spor work --print names a propose factory as unsatisfiable here when gh is missing, alongside the rest of the factory preview", () => {
+  const { home } = integrationCliFixture({ integration: { mode: "propose", command: `"${process.execPath}" test/acceptance.js`, strategy: "merge" } });
+  const r = cli(["work", "--print", "--factory", "factory-demo"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithGitAndNodeButNoGh() });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /integration: mode 'propose' — UNSATISFIABLE here: the 'gh' CLI is not available/);
+});
+
+// ------ the backstop: proposeIntegrationPR/ghPrStatus refuse directly, -------
+// ------ regardless of any satisfiability check having run --------------------
+
+test("proposeIntegrationPR: refuses directly when gh is not on PATH — the backstop, independent of the satisfiability layer above", () => {
+  const sporCli = require("../bin/spor.js");
+  const dir = proposeRepo("task-demo-backstop");
+  const head = git(dir, "rev-parse", "HEAD").trim();
+  const originalPath = process.env.PATH;
+  process.env.PATH = pathWithGitAndNodeButNoGh(); // no gh anywhere
+  try {
+    const res = sporCli.proposeIntegrationPR({ top: dir, head, targetRef: "main" });
+    assert.strictEqual(res.ok, false);
+    assert.match(res.reason, /the 'gh' CLI is not on PATH — propose mode needs it to open pull requests/);
+  } finally {
+    process.env.PATH = originalPath;
+  }
+});
+
+test("ghPrStatus: refuses directly when gh is not on PATH — the backstop checkProposals relies on", () => {
+  const sporCli = require("../bin/spor.js");
+  const originalPath = process.env.PATH;
+  process.env.PATH = pathWithGitAndNodeButNoGh(); // no gh anywhere
+  try {
+    const res = sporCli.ghPrStatus({ repo: "demo/repo", number: 1 });
+    assert.strictEqual(res.ok, false);
+    assert.match(res.reason, /the 'gh' CLI is not on PATH/);
+  } finally {
+    process.env.PATH = originalPath;
+  }
 });
