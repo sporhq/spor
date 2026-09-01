@@ -10601,7 +10601,7 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
     acquireLease: () => acquireIntegrationLease(cfg, home, top || (record && record.cwd), { slug }),
     releaseLease: (token) => releaseIntegrationLease(cfg, token),
     buildCandidate: async ({ head, targetRef, strategy }) => {
-      const built = integrationRunner.buildCandidateTree({ top, head, targetRef, strategy });
+      const built = integrationRunner.buildCandidateTree({ top, head, targetRef, strategy, label: entry.node_id });
       if (!built.ok) return built;
       // Same staging the command gate's tree gets (stageThrowawayTree): the
       // candidate suite runs here, and a repo whose suite needs a hook-staged
