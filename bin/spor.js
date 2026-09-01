@@ -10959,7 +10959,9 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     /* the worker's scope token stands in */
   }
   const previous = record.gate_state ? `${record.gate_state}${record.gate_reason ? `: ${record.gate_reason}` : ""}` : "no recorded verdict";
-  const escalatedBefore = record.gate_escalated_to || null;
+  // Every escalation this run has accumulated across attempts — a passing
+  // re-gate answers all of them, not only the latest.
+  const escalatedBefore = [...new Set([...(Array.isArray(record.gate_escalation_ids) ? record.gate_escalation_ids : []), record.gate_escalated_to].filter(Boolean))];
   out(`work: re-gating ${record.node_id} — run ${shortId}, attempt ${attempt}, under ${factoryId} (previously ${previous})`);
   const stamp = (patch) => dispatchRuns.stampGateState(home, record.run_id, patch, { force: true });
   stamp({ gate_state: "running", gate_at: new Date().toISOString(), gate_worker: null, gate_regate_count: attempt - 1, gate_regated_at: new Date().toISOString() });
@@ -10980,8 +10982,9 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   stamp({
     gate_state: state,
     gate_reason: reason,
-    ...(res && res.escalated_to ? { gate_escalated_to: res.escalated_to } : {}),
-    ...(res && res.demoted != null ? { gate_demoted: !!res.demoted } : {}),
+    ...(res && res.escalated_to ? { gate_escalated_to: res.escalated_to, gate_escalation_ids: [...escalatedBefore, res.escalated_to] } : {}),
+    // A demotion from an earlier attempt still stands until a pass restores it.
+    ...(res && res.demoted ? { gate_demoted: true } : {}),
   });
   if (state !== "passed") {
     out(`work: re-gate of ${record.node_id} ${state}${reason ? ` — ${reason}` : ""}${res && res.escalated_to ? ` (escalated to ${res.escalated_to})` : ""}`);
@@ -10990,9 +10993,9 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // The refusal's graph state, undone: the escalation it filed is answered by
   // a record of this pass, and the completion status it rolled back comes back.
   const notes = [];
-  if (escalatedBefore) {
+  if (escalatedBefore.length) {
     const closed = await writeRegateArtifact(cfg, { record, entry, factoryId, previous, reason, escalatedTo: escalatedBefore, project });
-    notes.push(closed.ok ? `closed ${escalatedBefore} with ${closed.id}` : `could not close ${escalatedBefore} (${closed.reason}) — resolve it by hand`);
+    notes.push(closed.ok ? `closed ${escalatedBefore.join(", ")} with ${closed.id}` : `could not close ${escalatedBefore.join(", ")} (${closed.reason}) — resolve by hand`);
   }
   if (record.gate_demoted) {
     const promoted = await gatePromoteItem(cfg, record.node_id);
@@ -11019,10 +11022,10 @@ async function writeRegateArtifact(cfg, { record, entry, factoryId, previous, re
     "type: artifact",
     ...(project ? [`project: ${project}`] : []),
     `title: Re-gate passed — ${flat(entry.node_id, 60)} (attempt ${entry.attempt})`,
-    `summary: ${flat(`Run ${String(entry.run_id).slice(0, 8)} on ${entry.node_id} was re-judged under ${factoryId} after its earlier refusal (${previous}) and passed every gate: ${reason || "every gate passed"}. This closes the escalation that refusal filed.`, 460)}`,
+    `summary: ${flat(`Run ${String(entry.run_id).slice(0, 8)} on ${entry.node_id} was re-judged under ${factoryId} after its earlier refusal (${previous}) and passed every gate: ${reason || "every gate passed"}. This closes the ${escalatedTo.length === 1 ? "escalation" : `${escalatedTo.length} escalations`} the refusals filed.`, 460)}`,
     `date: ${new Date().toISOString().slice(0, 10)}`,
     "edges:",
-    `  - {type: resolves, to: ${escalatedTo}}`,
+    ...escalatedTo.map((id) => `  - {type: resolves, to: ${id}}`),
     `  - {type: relates-to, to: ${entry.node_id}}`,
     "---",
     "",
