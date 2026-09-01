@@ -361,6 +361,7 @@ Run it as a service and read it back:
 
 ```bash
 spor work --status          # every worker on this box: slots, outcomes, what it is skipping and why
+spor work --regate <run-id> --factory <id>   # re-judge one refused run after fixing what refused it (no redo)
 spor work --status --json
 ```
 
