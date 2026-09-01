@@ -933,6 +933,89 @@ test("runIntegrationStage, wired with the real composed forceProtected dep, land
   assert.match(git(dir, "show", `${landedSha}:lib/sub.js`), /a - b/, "the branch's own, non-protected work still landed");
 });
 
+// issue-spor-integration-stale-head-across-fix-cycles: `tree` used to be
+// captured once, before the fix-cycle loop, and never refreshed across a
+// `continue` — so a conflict-fix or suite-fix that commits new work in the
+// implementer's checkout was invisible to the retried rebuild, which kept
+// merging the STALE pre-fix head forever. Pins that `changedTree()` is
+// re-read after every fix cycle, and that the retried build actually uses
+// the refreshed head.
+test("issue-spor-integration-stale-head-across-fix-cycles: a fix-cycle retry rebuilds from the REFRESHED head, not the stale pre-fix one", async () => {
+  const heads = ["head-v1", "head-v2"];
+  let changedTreeCalls = 0;
+  const seenHeads = [];
+  const { deps, seen } = integrationFakes({
+    build: (args) => {
+      seenHeads.push(args.head);
+      return seenHeads.length === 1
+        ? { ok: false, conflict: true, reason: "merging onto main conflicts" }
+        : { ok: true, dir: "/tmp/candidate", sha: "candidatesha", expectedSha: "expected2" };
+    },
+  });
+  deps.changedTree = async () => ({ ok: true, top: "/repo", head: heads[Math.min(changedTreeCalls++, heads.length - 1)], cwd: "/repo/wt" });
+
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.strictEqual(changedTreeCalls, 2, "changedTree is re-read after the fix cycle, not just once up front");
+  assert.deepStrictEqual(seenHeads, ["head-v1", "head-v2"], "the retried build used the refreshed post-fix head, not the stale pre-fix one");
+  assert.strictEqual(seen.fixes.length, 1);
+});
+
+// The same regression, pinned against REAL git plumbing end to end: the fix
+// cycle's commit must actually land, not merely be visible to a fake.
+test("REGRESSION, real git: a fix cycle's commit in the implementer's checkout reaches the LANDED tree on retry", async () => {
+  const dir = integrationRepo();
+  // integrationRepo() leaves `dir` checked out on `main` (so other tests can
+  // read `branch`'s tip without disturbing it) — but changedTree() reads
+  // `HEAD` of the IMPLEMENTER's own checkout, which is always the task
+  // branch, never the target ref. Move `dir` there so this test's changedTree
+  // dep reflects the real shape.
+  git(dir, "checkout", "-q", "branch");
+  const targetRef = "main";
+  const factory = {
+    id: "factory-stale-head",
+    integration: { targetRef, mode: "local", command: "true", strategy: "merge", serialize: "repo", cycles: 1, timeoutMs: 900000 },
+    trustedRef: targetRef,
+    protectedPaths: [],
+  };
+  const item = { node_id: "task-demo", run_id: "run-abcdef12", project: "demo" };
+  let suiteRuns = 0;
+  const deps = {
+    now: () => 1_700_000_000_000,
+    // The REAL production wiring (bin/spor.js's changedTree dep): re-reads
+    // HEAD from the implementer's checkout on every call.
+    changedTree: async () => gateRunner.gateChangeSet({ cwd: dir }, targetRef),
+    acquireLease: async () => null,
+    releaseLease: async () => {},
+    buildCandidate: async ({ head, targetRef: t, strategy }) => integrationRunner.buildCandidateTree({ top: dir, head, targetRef: t, strategy }),
+    runSuite: async ({ dir: candidateDir }) => {
+      suiteRuns += 1;
+      return fs.existsSync(path.join(candidateDir, "lib", "fix-marker.js"))
+        ? { ok: true }
+        : { ok: false, reason: "the candidate is missing the implementer's fix", output: "" };
+    },
+    land: async (args) => integrationRunner.landCandidate(args),
+    // Simulates the implementer resolving the "failure" with a REAL commit in
+    // their OWN checkout — exactly what a fix-cycle dispatch produces.
+    fix: async () => {
+      fs.writeFileSync(path.join(dir, "lib", "fix-marker.js"), "module.exports = true;\n");
+      git(dir, "add", "-A");
+      git(dir, "commit", "-q", "-m", "fix: add the marker the suite requires");
+      return { ok: true };
+    },
+    escalate: async () => ({ ok: true, id: "task-integration-escalate-x" }),
+    demote: async () => ({ ok: true, demoted: false }),
+    recordFact: async () => ({ ok: true }),
+    cleanupImplementer: async () => {},
+  };
+
+  const res = await integrationRunner.runIntegrationStage({ item, factory, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.strictEqual(suiteRuns, 2, "the suite ran once before the fix and once on the retried candidate");
+  const landedSha = git(dir, "rev-parse", targetRef).trim();
+  assert.doesNotThrow(() => git(dir, "show", `${landedSha}:lib/fix-marker.js`), "the landed tree carries the fix cycle's commit, not the stale pre-fix head");
+});
+
 test("squash and rebase strategies both produce a candidate that descends cleanly from the target ref", () => {
   const dir = integrationRepo();
   const head = git(dir, "rev-parse", "branch").trim();
