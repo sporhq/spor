@@ -1261,3 +1261,91 @@ machines, or two passes, checking the same PR agree), and for the rest calls
 See the "propose mode" and "checkProposal" sections of
 test/integration-step.test.js, and the two propose-specific tests in
 test/gate-pipeline.test.js.
+
+### 10.10 The attestation — a commit-bound, config-checksummed record per run
+
+A gate fact that says only "gate `acceptance` passed" cannot be validated by
+anyone who did not watch it run: nothing in it names the commit it judged, the
+definition that judged it, or whether the commit that later landed is the one
+it judged. Paul Stack's pre-PR verification loop
+(stack72.dev/ai-broke-the-assumptions-behind-ci) and the swamp `verification/`
+reference implementation close exactly that gap — a fresh worktree at the
+verified commit, config checksums, one attestation JSON a CI
+`validate-attestation` job checks (commit == PR head, all steps green, fresh,
+checksums match) instead of re-running the suite. The pipeline now leaves the
+same evidence chain (task-spor-factory-gate-attestation), in four pieces:
+
+1. **Every gate fact is commit-bound.** `gateChangeSet` already reads
+   `head`/`base` from the run's checkout; every `art-gate-*` fact now carries
+   them as `gate_head:`/`gate_base:` frontmatter plus the trusted ref and its
+   own sha (`git rev-parse <trusted_ref>`, which can lead the merge-base) and
+   the branch in the body ("Judged commit: …"). An unreadable change says
+   "Judged commit: unknown" rather than inventing one. The pipeline's result
+   hands the same chain back (`head`, `base`, `trusted_ref`, `trusted_sha`,
+   `branch`) and each step carries the head IT judged — after a fix cycle the
+   later gates judge a newer head than the earlier ones did, and the steps say
+   so rather than pretending one head.
+2. **Every gate fact is definition-bound.** `parseFactory` attaches
+   `definition` provenance to the parsed factory: a `sha256:` digest of the
+   normalized factory (canonical JSON — sorted keys, no whitespace — so
+   authored key order never changes it) and of each normalized gate, and
+   `loadFactoryDefinition` stamps the node **revision** (blob sha) of the
+   factory node and of every referenced gate node beside them
+   (`stampDefinitionRevisions`; an inline gate inherits the factory node's).
+   Each fact's body names both ("Definition: factory `…` rev `…` digest `…`;
+   gate `…` digest `…`"), so a fact says which revision of which rules judged
+   it. A validator recomputes the digest from the graph node with the kernel's
+   own `definitionDigest` (`lib/kernel/gates.js`) and compares.
+3. **Head equality at integration.** The integration stage re-reads the
+   implementer's tree independently; a FIRST read whose head differs from the
+   head the last passing gate judged (`gatedHead`, handed in by
+   `runGateAndIntegration`) REFUSES — settled `failed`, escalated to a person,
+   the item demoted per §10.7 — with no candidate built and nothing pushed.
+   Whatever moved the checkout between the verdict and the landing produced a
+   head no gate has judged. This is deliberately NOT a fix cycle: a fix cycle
+   commits, so it produces a new head by construction and can never restore
+   the equality; only `spor work --regate <run>` can (the refusal names it).
+   The stage's OWN fix cycles (a conflict, a red candidate suite) legitimately
+   move the head afterwards, and the `art-merge-*` fact records both heads
+   ("Integrated commit: `…` — the gates judged `…`") plus the landed sha
+   (`gate_head:`/`landed_sha:` frontmatter) so that is visible, never hidden.
+4. **One attestation artifact per run** — `art-attest-<stem>-<short-run[-aN]>-
+   <hash>`, deterministic and idempotent like every gate-minted node (a re-gate
+   attests separately by attempt), `relates-to` the work item and every
+   `art-gate-*`/`art-merge-*` fact it summarizes, never `resolves`. Its body
+   carries the attestation as fenced JSON (`schema: spor.attestation/1`):
+   `subject` {node, run, attempt, repo, commit, branch, base, trusted_ref,
+   trusted_sha}, `factory` {id, revision, digest}, `gate` {allPassed, state,
+   head, steps[] with per-step verdict/head/digest/revision/fact/timing},
+   `integration` {mode, strategy, state, target_ref, target_sha, head,
+   gated_head, head_matches_gated, landed_sha, candidate, proposal, timing} or
+   null, `configIntegrity` {factory, gates[], trusted_ref, trusted_sha,
+   protected_paths}, `timing`, `environment` {spor_version, worker, host,
+   platform, node, mode}. `passed` is true only when every gate passed AND the
+   integration (if any) landed or parked. `subject.commit` is the head the
+   STAGE saw when one ran (what would have landed), else the gated head — so a
+   validator comparing it against a PR head sees the truth when they differ.
+   The run record is stamped alongside (`gate_head`, `gate_base`,
+   `gate_trusted_sha`, `gate_factory_digest`, `gate_landed_sha`,
+   `gate_attestation`), read back by `spor runs` ("gated head:", "attested:")
+   and `spor work --status`. Fail-soft like every fact write: the verdict is
+   the enforcement, the attestation is its record.
+
+**In `propose` mode the PR body carries the attestation.** `proposeIntegrationPR`
+writes `renderPrBody`'s text — the step list, the candidate suite that just
+passed on merge(target, head), the validation rule in one sentence, and the
+JSON between `<!-- spor-attestation:begin -->`/`<!-- spor-attestation:end -->`
+markers (`extractPrAttestation` is the reader). It is built at PROPOSE time,
+bound to the head being proposed, with `integration.state: "proposing"` and
+`integration.candidate` {base, sha, suite, command}; a reused PR gets its body
+refreshed (best-effort `gh pr edit`) so a fix cycle's re-proposal never leaves
+the old head's attestation on the PR. A repo's CI can then run a
+validate-attestation job — `subject.commit == PR head`, `gate.allPassed`,
+`integration.head_matches_gated` not false, `issued_at` fresh, `configIntegrity`
+digests match the factory node as it stands — instead of re-running the suite.
+Making any particular repo's CI do so is that repo's work, not the runner's;
+this is what makes `propose` mode worth adopting for a PR-policy team.
+
+See test/attestation.test.js, the provenance assertions in
+test/gate-pipeline.test.js and test/gates.test.js, and the head-equality tests
+plus the local end-to-end attestation check in test/integration-step.test.js.

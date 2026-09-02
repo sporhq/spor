@@ -60,7 +60,10 @@ function fakes({ changed = ["lib/x.js"], suite = () => ({ ok: true }), review = 
       clock += ms;
       seen.slept += 1;
     },
-    changedPaths: async () => (changed === null ? { ok: false, reason: "unreadable tree" } : { ok: true, paths: changed }),
+    changedPaths: async () =>
+      changed === null
+        ? { ok: false, reason: "unreadable tree" }
+        : { ok: true, paths: changed, head: "headsha0000000000000000000000000000000001", base: "basesha0000000000000000000000000000000002", trustedRef: "main", trustedSha: "trustsha000000000000000000000000000000003", branch: "task-demo" },
     runSuite: async (args) => {
       seen.suites.push(args.gate.id);
       return suite(args, seen);
@@ -134,6 +137,39 @@ test("a passing pipeline runs its gates IN ORDER and records a graph fact for ea
   }
   assert.strictEqual(new Set(seen.facts.map((f) => f.id)).size, 3, "one distinct fact per gate");
   assert.strictEqual(seen.human.length, 0, "an unarmed human gate files nothing");
+
+  // task-spor-factory-gate-attestation: every fact is commit-bound and
+  // definition-bound, and the pipeline hands the chain back for the run record.
+  for (const f of seen.facts) {
+    assert.match(f.markdown, /^gate_head: headsha0000000000000000000000000000000001$/m, "the fact names the head it judged");
+    assert.match(f.markdown, /^gate_base: basesha0000000000000000000000000000000002$/m);
+    assert.match(f.markdown, /trusted ref `main` at `trustsha000000000000000000000000000000003`/);
+    assert.match(f.markdown, /on branch `task-demo`/);
+    assert.match(f.markdown, new RegExp(`Definition: factory \\\`factory-test\\\` digest \\\`${factory.definition.factory.digest}\\\``), "the fact names the definition that judged it");
+  }
+  assert.match(seen.facts[0].markdown, new RegExp(`gate \\\`acceptance\\\` digest \\\`${factory.definition.gates[0].digest}\\\``));
+  assert.strictEqual(res.head, "headsha0000000000000000000000000000000001");
+  assert.strictEqual(res.base, "basesha0000000000000000000000000000000002");
+  assert.strictEqual(res.trusted_ref, "main");
+  assert.strictEqual(res.trusted_sha, "trustsha000000000000000000000000000000003");
+  assert.strictEqual(res.branch, "task-demo");
+  assert.strictEqual(res.definition.factory.digest, factory.definition.factory.digest);
+  for (const g of res.gates) {
+    assert.strictEqual(g.head, "headsha0000000000000000000000000000000001", "each step records the head it judged");
+    assert.match(g.digest, /^sha256:/);
+    assert.match(g.started_at, /^\d{4}-\d{2}-\d{2}T/);
+    assert.ok(g.duration_ms >= 0);
+  }
+});
+
+test("a fact for an UNREADABLE change says so rather than inventing a head, and the chain reads null", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+  const { deps, seen } = fakes({ changed: null });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(res.head, null);
+  assert.doesNotMatch(seen.facts[0].markdown, /^gate_head:/m);
+  assert.match(seen.facts[0].markdown, /Judged commit: unknown/);
 });
 
 test("a REFERENCED shareable gate node runs exactly like the same gate written inline", async () => {
@@ -426,6 +462,12 @@ test("gateChangeSet reads the committed change against the trusted ref, and refu
   assert.strictEqual(change.ok, true, change.reason);
   assert.deepStrictEqual(change.paths.sort(), ["lib/add.js", "test/acceptance.js"]);
   assert.strictEqual(change.head, git(dir, "rev-parse", "HEAD").trim());
+  // The evidence chain (task-spor-factory-gate-attestation): the trusted ref's
+  // own tip and the branch name ride along with the merge-base.
+  assert.strictEqual(change.trustedRef, "main");
+  assert.strictEqual(change.trustedSha, git(dir, "rev-parse", "main").trim());
+  assert.strictEqual(change.branch, git(dir, "rev-parse", "--abbrev-ref", "HEAD").trim());
+  assert.notStrictEqual(change.branch, "HEAD");
 
   fs.writeFileSync(path.join(dir, "lib", "add.js"), "module.exports = () => 0;\n");
   const dirty = gateRunner.gateChangeSet({ cwd: dir }, "main");

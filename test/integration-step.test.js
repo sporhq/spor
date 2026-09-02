@@ -206,6 +206,65 @@ test("a clean build+suite+land is a PASS, records a landed art-merge fact, and c
   assert.match(seen.facts[0].markdown, /landed/);
   assert.strictEqual(seen.escalations.length, 0);
   assert.strictEqual(seen.demotions.length, 0, "a landing demotes nothing");
+  // task-spor-factory-gate-attestation: the merge fact and the result are
+  // commit-bound — the head the stage read, the sha it landed.
+  assert.match(seen.facts[0].markdown, /^gate_head: headsha$/m);
+  assert.match(seen.facts[0].markdown, /^landed_sha: candidatesha$/m);
+  assert.strictEqual(res.head, "headsha");
+  assert.strictEqual(res.landed_sha, "candidatesha");
+  assert.strictEqual(res.target_sha, "expected1");
+  assert.strictEqual(res.mode, "local");
+  assert.strictEqual(res.head_matches_gated, null, "no gated head was handed in — nothing to compare");
+  assert.ok(res.duration_ms >= 0);
+});
+
+// ------------------------------------ head equality (task-spor-factory-gate-attestation) --
+
+test("the stage REFUSES a head that differs from the head the last passing gate judged — no build, no landing, escalated to a person", async () => {
+  const { deps, seen } = integrationFakes({ tree: { ok: true, top: "/repo", head: "movedsha", cwd: "/repo/wt" } });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps, gatedHead: "headsha" });
+  assert.strictEqual(res.state, "failed");
+  assert.match(res.reason, /moved after the gates judged it/);
+  assert.match(res.reason, /judged `headsha`/);
+  assert.match(res.reason, /now reads `movedsha`/);
+  assert.match(res.reason, /spor work --regate run-abcdef12/);
+  assert.strictEqual(seen.builds, 0, "nothing is built from an unjudged head");
+  assert.strictEqual(seen.lands, 0);
+  assert.strictEqual(seen.fixes.length, 0, "not a fix cycle — a fix commits, so it can never restore the equality");
+  assert.strictEqual(seen.escalations.length, 1);
+  assert.strictEqual(seen.demotions.length, 1, "the resolution does not stand");
+  assert.strictEqual(res.head, "movedsha");
+  assert.strictEqual(res.gated_head, "headsha");
+  assert.strictEqual(res.head_matches_gated, false);
+  assert.match(seen.facts[0].markdown, /the gates judged `headsha`/);
+});
+
+test("a matching head proceeds, and the result says the heads matched", async () => {
+  const { deps, seen } = integrationFakes();
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps, gatedHead: "headsha" });
+  assert.strictEqual(res.state, "passed");
+  assert.strictEqual(seen.builds, 1);
+  assert.strictEqual(res.head_matches_gated, true);
+  assert.match(seen.facts[0].markdown, /Integrated commit: `headsha` \(the head the gates judged\)/);
+});
+
+test("propose mode hands the PR opener the chain it needs for the attestation — gated head, target sha, and the candidate suite that passed", async () => {
+  const propose = { ...FACTORY, integration: { ...FACTORY.integration, mode: "propose" } };
+  let seenChain = null;
+  const { deps } = integrationFakes({
+    propose: (args) => {
+      seenChain = args.chain;
+      return { ok: true, number: 42, url: "https://github.com/demo/repo/pull/42", repo: "demo/repo", branch: "task-demo", targetRef: "main", detail: "opened PR #42" };
+    },
+  });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: propose, deps, gatedHead: "headsha" });
+  assert.strictEqual(res.state, "parked");
+  assert.ok(seenChain, "the proposer receives the chain");
+  assert.strictEqual(seenChain.head, "headsha");
+  assert.strictEqual(seenChain.gatedHead, "headsha");
+  assert.strictEqual(seenChain.targetSha, "expected1");
+  assert.deepStrictEqual(seenChain.candidate, { base: "expected1", sha: "candidatesha", suite: "passed", command: "npm test" });
+  assert.deepStrictEqual(res.proposal, { number: 42, url: "https://github.com/demo/repo/pull/42", repo: "demo/repo", branch: "task-demo" });
 });
 
 test("a merge CONFLICT routes through the fix-cycle machinery, and lands once the fix resolves it", async () => {
@@ -447,6 +506,42 @@ test("proposeIntegrationPR: an open PR whose base already matches targetRef is a
   assert.match(res.detail, /already open/);
   const calls = fs.readFileSync(callsFile, "utf8");
   assert.doesNotMatch(calls, /gh pr create/, "no new PR is opened when an existing one already targets targetRef");
+});
+
+test("proposeIntegrationPR: the attestation body reaches `gh pr create`, and a reused PR gets its body refreshed (task-spor-factory-gate-attestation)", () => {
+  const sporCli = require("../bin/spor.js");
+  const attestation = require("../lib/shell/attestation.js");
+  const body = `Opened by spor.\n\n${attestation.PR_BEGIN}\n\`\`\`json\n{"schema":"${attestation.SCHEMA}","subject":{"commit":"abc"}}\n\`\`\`\n${attestation.PR_END}\n`;
+
+  // Fresh PR: the body is what gh is asked to create with.
+  const dirA = proposeRepo("task-demo-body-a");
+  const headA = git(dirA, "rev-parse", "HEAD").trim();
+  const a = proposeFakeBin({ listJson: "[]" });
+  const resA = withFakeBin(a.binDir, () => sporCli.proposeIntegrationPR({ top: dirA, head: headA, targetRef: "main", body }));
+  assert.strictEqual(resA.ok, true, resA.reason);
+  const callsA = fs.readFileSync(a.callsFile, "utf8");
+  assert.match(callsA, /gh pr create .*--body Opened by spor\./, "the attestation body is passed to gh pr create");
+  assert.match(callsA, /spor-attestation:begin/, "the markers ride along in the body");
+
+  // Reused PR: the body is refreshed (gh pr edit) — best-effort, so the fake
+  // gh's refusal of the unknown subcommand does not fail the proposal.
+  const dirB = proposeRepo("task-demo-body-b");
+  const headB = git(dirB, "rev-parse", "HEAD").trim();
+  const listJson = JSON.stringify([{ number: 13, url: "https://github.com/demo/repo/pull/13", state: "OPEN", baseRefName: "main" }]);
+  const b = proposeFakeBin({ listJson, createRefused: "pr create should not have been called" });
+  const resB = withFakeBin(b.binDir, () => sporCli.proposeIntegrationPR({ top: dirB, head: headB, targetRef: "main", body }));
+  assert.strictEqual(resB.ok, true, resB.reason);
+  assert.strictEqual(resB.number, 13);
+  const callsB = fs.readFileSync(b.callsFile, "utf8");
+  assert.match(callsB, /gh pr edit 13 --repo demo\/repo --body /, "the reused PR's body is refreshed with the new head's attestation");
+  assert.doesNotMatch(callsB, /gh pr create/);
+
+  // No body given: the plain sentence stands, and nothing is edited.
+  const dirC = proposeRepo("task-demo-body-c");
+  const headC = git(dirC, "rev-parse", "HEAD").trim();
+  const c = proposeFakeBin({ listJson });
+  withFakeBin(c.binDir, () => sporCli.proposeIntegrationPR({ top: dirC, head: headC, targetRef: "main" }));
+  assert.doesNotMatch(fs.readFileSync(c.callsFile, "utf8"), /gh pr edit/, "without a body there is nothing to refresh");
 });
 
 test("proposeIntegrationPR: gh's own exact-duplicate refusal on create surfaces verbatim as the stage failure", () => {
@@ -1139,6 +1234,32 @@ test("end to end, local mode: after its gate passes, the integration stage lands
   assert.strictEqual(facts.length, 1, `expected one integration fact, saw ${fs.readdirSync(nodes)}`);
   assert.match(fs.readFileSync(path.join(nodes, facts[0]), "utf8"), /- \{type: relates-to, to: task-ready\}/);
   assert.strictEqual(git(repo, "worktree", "list").trim().split("\n").length, 1, "the candidate worktree is cleaned up, and the implementer's dispatch worktree too");
+
+  // task-spor-factory-gate-attestation: ONE attestation per run, in the graph
+  // and on the run record, binding the gate verdicts to the commit they judged
+  // and to the definition that judged them.
+  const attests = fs.readdirSync(nodes).filter((f) => f.startsWith("art-attest-"));
+  assert.strictEqual(attests.length, 1, `expected one attestation, saw ${fs.readdirSync(nodes)}`);
+  const attMd = fs.readFileSync(path.join(nodes, attests[0]), "utf8");
+  const att = JSON.parse(attMd.match(/```json\n([\s\S]*?)\n```/)[1]);
+  assert.strictEqual(att.schema, "spor.attestation/1");
+  assert.strictEqual(att.passed, true);
+  assert.strictEqual(att.gate.allPassed, true);
+  assert.deepStrictEqual(att.gate.steps.map((st) => [st.id, st.verdict]), [["acceptance", "passed"]]);
+  assert.match(att.subject.commit, /^[0-9a-f]{40}$/, "the subject is a real commit");
+  assert.strictEqual(att.integration.head_matches_gated, true, "the stage landed the head the gate judged");
+  assert.strictEqual(att.integration.landed_sha, after, "the landed sha is main's new tip");
+  assert.match(att.configIntegrity.factory.digest, /^sha256:[0-9a-f]{64}$/);
+  assert.match(att.configIntegrity.factory.revision, /^[0-9a-f]{40}$/, "the factory node's revision is stamped");
+  assert.match(attMd, new RegExp(`- \\{type: relates-to, to: ${facts[0].replace(/\.md$/, "")}\\}`), "the attestation links the merge fact");
+  const gateFacts = fs.readdirSync(nodes).filter((f) => f.startsWith("art-gate-"));
+  assert.strictEqual(gateFacts.length, 1);
+  assert.match(fs.readFileSync(path.join(nodes, gateFacts[0]), "utf8"), new RegExp(`^gate_head: ${att.subject.commit}$`, "m"), "the gate fact is bound to the same commit");
+  const runRecord = require("../lib/shell/agent-dispatch-runner.js").readRunRecords(home).find((r) => r.gate_attestation);
+  assert.ok(runRecord, "the run record names its attestation");
+  assert.strictEqual(runRecord.gate_attestation, attests[0].replace(/\.md$/, ""));
+  assert.strictEqual(runRecord.gate_head, att.subject.commit);
+  assert.strictEqual(runRecord.gate_landed_sha, after);
 });
 
 test("end to end: with NO integration block, behavior is byte-identical to the gate pipeline alone — no art-merge fact, main untouched", () => {

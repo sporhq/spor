@@ -38,6 +38,7 @@ const workLoop = require(path.join(ROOT, "lib", "shell", "work-loop.js"));
 const gatesKernel = require(path.join(ROOT, "lib", "kernel", "gates.js"));
 const gateRunner = require(path.join(ROOT, "lib", "shell", "gate-runner.js"));
 const integrationRunner = require(path.join(ROOT, "lib", "shell", "integration-runner.js"));
+const attestation = require(path.join(ROOT, "lib", "shell", "attestation.js"));
 const { workerContract } = require(path.join(ROOT, "lib", "shell", "worker-contract.js"));
 // Resolution truth (lib/kernel/resolution.js): a node is "done" when it carries a
 // TERMINAL status OR a live inbound resolves/answers edge — the same partition the
@@ -6993,16 +6994,23 @@ async function resolveNode(cfg, id) {
   let resolution = null;
   let held = null;
   let inert = null;
+  // `revision` is the node's git blob sha (API.md §3) — the server echoes it;
+  // local mode computes the same sha over the file bytes. The factory loader
+  // stamps it into every gate fact as definition provenance
+  // (task-spor-factory-gate-attestation).
+  let revision = null;
   if (cfg.mode() === "remote") {
     const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 6000 });
     if (!r.ok) return null;
     raw = (r.json && r.json.raw) || r.text || "";
+    revision = (r.json && typeof r.json.revision === "string" && r.json.revision) || null;
     resolution = (r.json && r.json.resolution) || null;
     held = (r.json && r.json.held) || null;
     inert = (r.json && typeof r.json.inert === "boolean") ? r.json.inert : null;
   } else {
     try {
       raw = fs.readFileSync(path.join(cfg.nodesDir(), `${id}.md`), "utf8");
+      revision = gitBlobSha(Buffer.from(raw, "utf8"));
     } catch {
       return null;
     }
@@ -7032,6 +7040,7 @@ async function resolveNode(cfg, id) {
     resolution,
     held,
     inert,
+    revision,
   };
 }
 
@@ -8351,6 +8360,8 @@ function cmdRuns(cfg, { values, positionals: pos }) {
     // 'spor runs <that id>' is how a human (or a restarted 'spor work') finds
     // out whether it is still going.
     if (r.gate_state) out(`  gate:       ${r.gate_state}${r.gate_reason ? ` — ${r.gate_reason}` : ""}`);
+    if (r.gate_head) out(`  gated head: ${r.gate_head}${r.gate_landed_sha ? ` (landed ${String(r.gate_landed_sha).slice(0, 12)})` : ""}`);
+    if (r.gate_attestation) out(`  attested:   ${r.gate_attestation}`);
     if (r.gate_fix_run_id) {
       out(`  fix cycle:  run ${String(r.gate_fix_run_id).slice(0, 8)} — 'spor runs ${r.gate_fix_run_id}' follows it${r.gate_state === "interrupted" ? " (left running by a stopped worker)" : ""}`);
     }
@@ -9614,10 +9625,16 @@ async function loadFactoryDefinition(cfg, id) {
   }
   const errors = [];
   const gateNodes = new Map();
+  // Definition provenance (task-spor-factory-gate-attestation): the revision
+  // (blob sha) of the factory node and of every referenced gate node, stamped
+  // onto the parsed definition beside the kernel's digests so each fact says
+  // which revision of which definition judged it.
+  const gateRevisions = {};
   const explainedRefs = new Set(); // refs whose problem we already reported below
   for (const ref of gatesKernel.factoryRefs(parsed.body || "")) {
     const gn = await resolveNode(cfg, ref);
     if (!gn || !gn.raw) continue; // resolveGates reports the missing reference itself
+    if (gn.revision) gateRevisions[ref] = gn.revision;
     const pg = parse(gn.raw, `${ref}.md`);
     if ((pg.type || "") !== "gate") {
       errors.push(`referenced gate '${ref}' is a '${pg.type || "?"}' node, not a 'type: gate' node`);
@@ -9641,6 +9658,7 @@ async function loadFactoryDefinition(cfg, id) {
   // payload declares no `repos` (issue-spor-work-scope-union-factory-mismatch)
   // — a factory authored for one repo says so by living in it.
   const res = gatesKernel.parseFactory(parsed.body || "", { gateNodes, id, project: parsed.project || null });
+  if (res.factory) gatesKernel.stampDefinitionRevisions(res.factory, { factory: node.revision || null, gates: gateRevisions });
   // A ref we already explained above (wrong type, retired, bad payload) is left
   // out of gateNodes on purpose, which makes resolveGates raise its own generic
   // "could not be read from the graph" for the same ref — accurate for an
@@ -10474,7 +10492,15 @@ function ghRepoSlug(top) {
 // which only ever proved merging would be green. Idempotent across a fix
 // cycle: a re-run pushes the branch's new tip and reuses whatever PR is
 // already open for it rather than erroring on a duplicate.
-function proposeIntegrationPR({ top, head, targetRef }) {
+//
+// `body` (task-spor-factory-gate-attestation) is the PR description — the
+// attestation-bearing text `renderPrBody` builds, so a CI validate-attestation
+// job reads the gate verdicts off the PR instead of re-running the suite. A
+// reused PR gets its body refreshed too (best-effort — the PR already carries
+// the new head, and an unrefreshed description is stale evidence, not a wrong
+// landing), so a fix cycle's re-proposal never leaves the OLD head's attestation
+// on the PR.
+function proposeIntegrationPR({ top, head, targetRef, body = null }) {
   if (!hasCmd("gh")) return { ok: false, reason: "the 'gh' CLI is not on PATH — propose mode needs it to open pull requests" };
   const repo = ghRepoSlug(top);
   if (!repo) return { ok: false, reason: `could not resolve a github.com 'owner/repo' from ${top}'s 'origin' remote — propose mode needs a GitHub remote` };
@@ -10508,6 +10534,7 @@ function proposeIntegrationPR({ top, head, targetRef }) {
       const list = JSON.parse(existing.stdout);
       const j = Array.isArray(list) ? list[0] : null;
       if (j && j.number && String(j.state || "").toUpperCase() === "OPEN" && j.baseRefName === baseBranch) {
+        if (body) runGh(["pr", "edit", String(j.number), "--repo", repo, "--body", body], { cwd: top }); // best-effort refresh of the attestation
         return { ok: true, number: j.number, url: j.url, repo, branch: branchName, targetRef, detail: `PR #${j.number} already open (${j.url}) — updated with ${head.slice(0, 8)}` };
       }
     } catch {
@@ -10519,7 +10546,7 @@ function proposeIntegrationPR({ top, head, targetRef }) {
     [
       "pr", "create", "--repo", repo, "--base", baseBranch, "--head", branchName,
       "--title", `Integration: ${branchName}`,
-      "--body", `Opened by the spor work integration stage (\`propose\` mode) for \`${branchName}\` onto \`${baseBranch}\`.`,
+      "--body", body || `Opened by the spor work integration stage (\`propose\` mode) for \`${branchName}\` onto \`${baseBranch}\`.`,
     ],
     { cwd: top }
   );
@@ -10614,7 +10641,7 @@ function buildProposalTrackingNode({ id, nodeId, runId, targetRef, proposal, pro
 // integration-runner.js's pure orchestration, mirroring makeGateDeps above.
 // Only ever constructed when `factory.integration` resolved, so a bare
 // factory (or one with no integration block) never touches any of this.
-function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, warn, sleep, log, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, dispatch = dispatchThrough, home = cfg.userConfigHome() }) {
+function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, warn, sleep, log, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, dispatch = dispatchThrough, home = cfg.userConfigHome(), gateResult = null, workerId = null }) {
   const integration = factory.integration;
   const date = () => new Date().toISOString().slice(0, 10);
   const stem = gateStem(entry.node_id);
@@ -10704,7 +10731,32 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
         },
       }),
     land: (args) => integrationRunner.landCandidate(args),
-    propose: ({ head, targetRef }) => proposeIntegrationPR({ top, head, targetRef }),
+    // The PR body carries the run's attestation (task-spor-factory-gate-
+    // attestation, piece 4): the gate verdicts as they stand, bound to the head
+    // being proposed, with the candidate suite the stage just ran. Built here
+    // rather than in the pure runner because it needs the gate pipeline's
+    // result (ctx.gateResult) and the environment, which the stage never sees.
+    propose: ({ head, targetRef, chain = null }) => {
+      let body = null;
+      try {
+        const baseBranch = integrationRunner.splitRemoteRef(targetRef).branch;
+        const partial = {
+          mode: integration.mode, strategy: integration.strategy, state: "proposing", target_ref: targetRef,
+          target_sha: chain ? chain.targetSha : null, head: head || (chain && chain.head) || null,
+          gated_head: chain ? chain.gatedHead : null, landed_sha: null, candidate: chain ? chain.candidate : null,
+        };
+        const att = attestation.buildAttestationObject({
+          item: { ...entry, project: slug || entry.project || null }, factory,
+          gate: gateResult || { state: "passed", gates: [], facts: [], definition: factory.definition || null },
+          integration: partial,
+          environment: attestationEnvironment(cfg, workerId),
+        });
+        body = attestation.renderPrBody({ attestation: att, branch: (git(top, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout || "").trim() || "HEAD", base: baseBranch });
+      } catch (e) {
+        log(`work: the attestation for the pull request body could not be built (${(e && e.message) || e}) — proposing without it`);
+      }
+      return proposeIntegrationPR({ top, head, targetRef, body });
+    },
     parkForReview: async ({ proposal }) => {
       const id = proposalTrackingId(entry.node_id, entry.run_id);
       const written = await writeGateNode(
@@ -10818,9 +10870,75 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // the project-scoped queue a person would look in.
   const dctx = { ...ctx, slug: item.project || ctx.slug || null, record, entry };
   const gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: makeGateDeps(cfg, dctx) });
-  if (gateResult.state !== "passed" || !ctx.factory.integration) return gateResult;
-  const intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, deps: makeIntegrationDeps(cfg, dctx) });
-  return { ...intResult, gates: gateResult.gates, facts: [...(gateResult.facts || []), ...(intResult.facts || [])] };
+  let intResult = null;
+  if (gateResult.state === "passed" && ctx.factory.integration) {
+    // The head the last passing gate judged is what the stage must find when it
+    // re-reads the tree (task-spor-factory-gate-attestation, piece 3).
+    intResult = await integrationRunner.runIntegrationStage({
+      item, factory: ctx.factory, log: ctx.log, gatedHead: gateResult.head || null,
+      deps: makeIntegrationDeps(cfg, { ...dctx, gateResult }),
+    });
+  }
+  // ONE attestation per run (piece 4): the evidence chain over everything
+  // above, written as a graph artifact and stamped onto the run record
+  // (`gate_head`/`gate_base`/`gate_attestation`). Fail-soft like every fact
+  // write — the verdict is the enforcement, the attestation is its record.
+  const attested = await writeRunAttestation(cfg, { item, factory: ctx.factory, gateResult, intResult, log: ctx.log, home: ctx.home, workerId: ctx.workerId || null });
+  if (!intResult) return { ...gateResult, ...attested };
+  return { ...intResult, gates: gateResult.gates, gate_head: gateResult.head || null, facts: [...(gateResult.facts || []), ...(intResult.facts || [])], ...attested };
+}
+
+// What the attestation says about where it was produced. `spor_version` is the
+// package's; the rest is the box, so two attestations for one commit from two
+// workers stay distinguishable.
+function attestationEnvironment(cfg, workerId = null) {
+  let version = null;
+  try {
+    version = require(path.join(ROOT, "package.json")).version || null;
+  } catch {
+    /* an unreadable package.json is not worth failing an attestation over */
+  }
+  let mode = null;
+  try {
+    mode = cfg.mode();
+  } catch {
+    /* unknown */
+  }
+  return { spor_version: version, worker: workerId || null, host: os.hostname(), platform: `${process.platform}-${process.arch}`, node: process.version, mode };
+}
+
+// Build, write, and stamp the run's attestation. Returns `{attestation}` — the
+// node id, or null when it could not be recorded — for the gate result to carry
+// onward; never throws.
+async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, log = () => {}, home = null, workerId = null }) {
+  const out = { attestation: null };
+  let built = null;
+  try {
+    built = attestation.buildAttestationNode({ item, factory, gate: gateResult, integration: intResult, environment: attestationEnvironment(cfg, workerId) });
+  } catch (e) {
+    log(`work: the attestation for ${item.node_id} could not be built (${(e && e.message) || e}) — the verdict still stands`);
+    return out;
+  }
+  try {
+    const wrote = await writeGateNode(cfg, built.id, built.markdown);
+    if (wrote && wrote.ok) out.attestation = built.id;
+    else log(`work: the attestation for ${item.node_id} could not be recorded on the graph (${(wrote && wrote.reason) || "no response"}) — the verdict still stands`);
+  } catch (e) {
+    log(`work: the attestation for ${item.node_id} could not be recorded on the graph (${(e && e.message) || e}) — the verdict still stands`);
+  }
+  try {
+    dispatchRuns.stampGateState(home || cfg.userConfigHome(), item.run_id, {
+      gate_head: (gateResult && gateResult.head) || null,
+      gate_base: (gateResult && gateResult.base) || null,
+      gate_trusted_sha: (gateResult && gateResult.trusted_sha) || null,
+      gate_factory_digest: (factory && factory.definition && factory.definition.factory && factory.definition.factory.digest) || null,
+      ...(intResult && intResult.landed_sha ? { gate_landed_sha: intResult.landed_sha } : {}),
+      ...(out.attestation ? { gate_attestation: out.attestation } : {}),
+    });
+  } catch {
+    /* fail-soft: the run record is bookkeeping, the attestation node is the record */
+  }
+  return out;
 }
 
 // task-spor-integration-propose-mode: the LATER half of propose mode's
@@ -11503,6 +11621,8 @@ async function cmdWork(cfg, { values }) {
                 passthrough,
                 warn,
                 runMaxMs,
+                workerId,
+                home,
                 log: (line) => out(line),
                 stopping: () => !!control.stopping,
                 // A plain timer, NOT the loop's wakeable sleep: that one has a

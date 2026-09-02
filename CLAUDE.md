@@ -632,7 +632,21 @@ live RESOLVING EDGE (approved — a bare status flip is not an approval) or any
 other terminal status (refused) answers it, reporting `blocked` at `approval_timeout_ms` rather than deciding for the
 person. Every gate outcome is a deterministic, idempotent `art-gate-*` artifact
 carrying `relates-to` the work item (never `resolves` — a gate records, it does
-not retire). Only a CLAIM is gated (`shouldGate`: a verified `resolved`, or an
+not retire). Every fact is COMMIT-BOUND and DEFINITION-BOUND
+(task-spor-factory-gate-attestation, WORKERS.md §10.10): `gate_head:`/`gate_base:`
+frontmatter plus the trusted ref's sha and branch in the body, and the
+`sha256:` digest (canonical JSON of the normalized definition,
+`gates.definitionDigest`) and node revision of the factory and gate that judged
+it (`factory.definition`, stamped by `loadFactoryDefinition`). The integration
+stage REFUSES (settled failed, never a fix cycle — a fix commits and so can
+never restore equality) when its own re-read of the tree finds a head other than
+the one the last passing gate judged (`gatedHead`), and `runGateAndIntegration`
+writes ONE `art-attest-<stem>-<run>-<hash>` artifact per run (`schema:
+spor.attestation/1` — subject/factory/gate/integration/configIntegrity/timing/
+environment, `lib/shell/attestation.js`) linking every fact, stamping
+`gate_head`/`gate_attestation`/… on the run record; in `propose` mode the same
+attestation rides in the PR body between `<!-- spor-attestation:begin/end -->`
+markers so a repo's CI can validate instead of re-run. Only a CLAIM is gated (`shouldGate`: a verified `resolved`, or an
 UNENFORCED `reported` where nothing could check it), the gated item HOLDS its
 slot until the pipeline settles (and its node is out of candidate selection for
 EVERY worker on the box while it does, so a free slot never re-dispatches what a

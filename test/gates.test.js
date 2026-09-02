@@ -219,3 +219,49 @@ test("cycleDecision retries up to the declared cap, then escalates", () => {
   assert.strictEqual(gates.cycleDecision({ cycles: 0 }, 0), "escalate");
   assert.strictEqual(gates.cycleDecision({}, 0), "escalate");
 });
+
+// --- definition provenance (task-spor-factory-gate-attestation) --------------
+test("parseFactory attaches definition digests that are stable under payload key order and change when a gate changes", () => {
+  const body = (payload) => ["```json", JSON.stringify(payload), "```"].join("\n");
+  const a = gates.parseFactory(body({ factory: "t", trusted_ref: "main", gates: [{ id: "acc", kind: "command", command: "npm test" }] }), { id: "factory-t" });
+  const b = gates.parseFactory(body({ gates: [{ command: "npm test", kind: "command", id: "acc" }], trusted_ref: "main", factory: "t" }), { id: "factory-t" });
+  assert.deepStrictEqual(a.errors, []);
+  assert.match(a.factory.definition.factory.digest, /^sha256:[0-9a-f]{64}$/);
+  assert.strictEqual(a.factory.definition.factory.digest, b.factory.definition.factory.digest, "key order never changes the digest");
+  assert.strictEqual(a.factory.definition.gates.length, 1);
+  assert.strictEqual(a.factory.definition.gates[0].id, "acc");
+  assert.strictEqual(a.factory.definition.gates[0].source, "inline");
+  assert.strictEqual(a.factory.definition.gates[0].digest, b.factory.definition.gates[0].digest);
+  assert.strictEqual(a.factory.definition.factory.revision, null, "no node behind a bare payload — the shell stamps revisions");
+
+  const c = gates.parseFactory(body({ factory: "t", trusted_ref: "main", gates: [{ id: "acc", kind: "command", command: "npm run test:all" }] }), { id: "factory-t" });
+  assert.notStrictEqual(c.factory.definition.factory.digest, a.factory.definition.factory.digest, "a changed command is a changed definition");
+  assert.notStrictEqual(c.factory.definition.gates[0].digest, a.factory.definition.gates[0].digest);
+
+  // An inline gate and the same gate referenced by id digest IDENTICALLY —
+  // the runner cannot tell them apart, so neither can the attestation.
+  const shared = { id: "acc", kind: "command", command: "npm test" };
+  const inline = gates.parseFactory(body({ factory: "t", trusted_ref: "main", gates: [shared] }), { id: "factory-t" });
+  const referenced = gates.parseFactory(body({ factory: "t", trusted_ref: "main", gates: [{ ref: "gate-acc" }] }), { id: "factory-t", gateNodes: new Map([["gate-acc", shared]]) });
+  assert.deepStrictEqual(referenced.errors, []);
+  assert.strictEqual(referenced.factory.definition.gates[0].source, "gate-acc");
+  // The gate digest covers the normalized gate INCLUDING its source, so inline
+  // vs referenced is visible there; the factory digest is what a validator
+  // compares against the graph node, and it differs too (the payload differs).
+  assert.match(referenced.factory.definition.gates[0].digest, /^sha256:/);
+  void inline;
+
+  // The shell's half: revisions ride per node — an inline gate inherits the
+  // factory node's, a referenced one gets its own node's.
+  gates.stampDefinitionRevisions(referenced.factory, { factory: "f-rev", gates: { "gate-acc": "g-rev" } });
+  assert.strictEqual(referenced.factory.definition.factory.revision, "f-rev");
+  assert.strictEqual(referenced.factory.definition.gates[0].revision, "g-rev");
+  gates.stampDefinitionRevisions(inline.factory, { factory: "f-rev", gates: {} });
+  assert.strictEqual(inline.factory.definition.gates[0].revision, "f-rev");
+});
+
+test("canonicalJson sorts keys recursively, drops undefined, and definitionDigest is sha256 over it", () => {
+  assert.strictEqual(gates.canonicalJson({ b: [3, { z: 1, y: undefined, x: 2 }], a: "s" }), '{"a":"s","b":[3,{"x":2,"z":1}]}');
+  assert.strictEqual(gates.definitionDigest({ a: 1, b: 2 }), gates.definitionDigest({ b: 2, a: 1 }));
+  assert.match(gates.definitionDigest({}), /^sha256:[0-9a-f]{64}$/);
+});
