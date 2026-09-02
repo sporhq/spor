@@ -440,7 +440,7 @@ function proposeRepo(branchName) {
 // faked per-test via `listJson`/`create`). Every invocation of either is
 // appended to a shared calls log so a test can assert what was (or was NOT)
 // asked for, not just the final return value.
-function proposeFakeBin({ listJson, createOut = "https://github.com/demo/repo/pull/99\n", createRefused = null }) {
+function proposeFakeBin({ listJson, createOut = "https://github.com/demo/repo/pull/99\n", createRefused = null, editRefused = null }) {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-propose-bin-"));
   const callsFile = path.join(binDir, "calls.log");
   const realGit = path.join(pathWithOnlyGit(), "git");
@@ -452,6 +452,9 @@ function proposeFakeBin({ listJson, createOut = "https://github.com/demo/repo/pu
       `echo "gh $*" >> "${callsFile}"`,
       `if [ "$1" = "--version" ]; then echo "gh version 2.0.0"; exit 0; fi`,
       `if [ "$1" = "pr" ] && [ "$2" = "list" ]; then printf '%s' '${listJson}'; exit 0; fi`,
+      editRefused
+        ? `if [ "$1" = "pr" ] && [ "$2" = "edit" ]; then echo "${editRefused}" >&2; exit 1; fi`
+        : `if [ "$1" = "pr" ] && [ "$2" = "edit" ]; then exit 0; fi`,
       createRefused
         ? `if [ "$1" = "pr" ] && [ "$2" = "create" ]; then echo "${createRefused}" >&2; exit 1; fi`
         : `if [ "$1" = "pr" ] && [ "$2" = "create" ]; then printf '%s' '${createOut}'; exit 0; fi`,
@@ -523,8 +526,7 @@ test("proposeIntegrationPR: the attestation body reaches `gh pr create`, and a r
   assert.match(callsA, /gh pr create .*--body Opened by spor\./, "the attestation body is passed to gh pr create");
   assert.match(callsA, /spor-attestation:begin/, "the markers ride along in the body");
 
-  // Reused PR: the body is refreshed (gh pr edit) — best-effort, so the fake
-  // gh's refusal of the unknown subcommand does not fail the proposal.
+  // Reused PR: the body is refreshed (gh pr edit).
   const dirB = proposeRepo("task-demo-body-b");
   const headB = git(dirB, "rev-parse", "HEAD").trim();
   const listJson = JSON.stringify([{ number: 13, url: "https://github.com/demo/repo/pull/13", state: "OPEN", baseRefName: "main" }]);
@@ -542,6 +544,33 @@ test("proposeIntegrationPR: the attestation body reaches `gh pr create`, and a r
   const c = proposeFakeBin({ listJson });
   withFakeBin(c.binDir, () => sporCli.proposeIntegrationPR({ top: dirC, head: headC, targetRef: "main" }));
   assert.doesNotMatch(fs.readFileSync(c.callsFile, "utf8"), /gh pr edit/, "without a body there is nothing to refresh");
+});
+
+// Cross-model review, finding 4: the refresh is the evidence a CI job is told
+// to check. A reused PR whose body could NOT be refreshed carries the OLD
+// head's attestation under a "success" — so the refusal is the proposal's
+// failure, surfaced verbatim, never swallowed.
+test("proposeIntegrationPR: a reused PR whose body refresh FAILS is a failed proposal, with gh's reason", () => {
+  const sporCli = require("../bin/spor.js");
+  const attestation = require("../lib/shell/attestation.js");
+  const body = `Opened by spor.\n\n${attestation.PR_BEGIN}\n\`\`\`json\n{"schema":"${attestation.SCHEMA}","subject":{"commit":"abc"}}\n\`\`\`\n${attestation.PR_END}\n`;
+  const dir = proposeRepo("task-demo-body-d");
+  const head = git(dir, "rev-parse", "HEAD").trim();
+  const listJson = JSON.stringify([{ number: 21, url: "https://github.com/demo/repo/pull/21", state: "OPEN", baseRefName: "main" }]);
+  const { binDir, callsFile } = proposeFakeBin({ listJson, createRefused: "pr create should not have been called", editRefused: "HTTP 403: Resource not accessible by integration" });
+  const res = withFakeBin(binDir, () => sporCli.proposeIntegrationPR({ top: dir, head, targetRef: "main", body }));
+  assert.strictEqual(res.ok, false, "an unrefreshed body is not a successful proposal");
+  assert.match(res.reason, /PR #21 is already open/);
+  assert.match(res.reason, /could not be refreshed with that head's attestation/);
+  assert.match(res.reason, /HTTP 403: Resource not accessible by integration/, "gh's own reason surfaces");
+  const calls = fs.readFileSync(callsFile, "utf8");
+  assert.match(calls, /gh pr edit 21 --repo demo\/repo --body /);
+  assert.doesNotMatch(calls, /gh pr create/, "a failed refresh does not fall through to opening a duplicate");
+  // The door itself, on its own: {ok:false, reason} shapes.
+  const direct = withFakeBin(binDir, () => sporCli.editProposalBody({ top: dir, repo: "demo/repo", number: 21, body }));
+  assert.strictEqual(direct.ok, false);
+  assert.match(direct.reason, /HTTP 403/);
+  assert.deepStrictEqual(sporCli.editProposalBody({ repo: null, number: 21, body }).ok, false);
 });
 
 test("proposeIntegrationPR: gh's own exact-duplicate refusal on create surfaces verbatim as the stage failure", () => {
@@ -1756,6 +1785,194 @@ test("runGateAndIntegration settles the run record BEFORE writing the attestatio
   const att = JSON.parse(/```json\n([\s\S]*?)\n```/.exec(md)[1]);
   assert.strictEqual(att.passed, true);
   assert.strictEqual(att.subject.commit, git(repo, "rev-parse", "HEAD").trim());
+});
+
+// Cross-model review, blocking finding 1: a duplicate pipeline for the SAME
+// run (a resumed orphan, a second adopter) that loses the settle race must not
+// write an attestation for its own verdict, nor overwrite the winner's
+// evidence fields (gate_head/gate_attestation/...) on the record. Here the
+// record is already settled by "another worker" as FAILED at a different head
+// before this pipeline finishes PASSING: nothing of this pipeline's reaches
+// the record or the graph.
+test("runGateAndIntegration: a pipeline that loses the settle race writes NO attestation and touches NO evidence field on the record", async () => {
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-settle-race-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  fs.writeFileSync(path.join(nodes, "task-race.md"), "---\nid: task-race\ntype: task\ntitle: Settle race\nsummary: A work item whose run record another pipeline settled first, so this pipeline must not attest over it.\nstatus: done\ndate: 2026-08-26\n---\n\nBody.\n");
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const repo = integrationRepo();
+  git(repo, "checkout", "-q", "branch");
+  const entry = { node_id: "task-race", run_id: "11111111-2222-3333-4444-000000000088", attempt: 0 };
+  const recordPath = dispatchRuns.runPaths(home, entry.run_id).record;
+  const winner = {
+    run_id: entry.run_id, node_id: entry.node_id, state: "done", cwd: repo, created_at: new Date().toISOString(),
+    gate_state: "failed", gate_at: "2026-09-02T10:00:00.000Z", gate_worker: "other-worker", gate_reason: "gate 'acceptance' failed",
+    gate_head: "winnerhead00000000000000000000000000000001", gate_attestation: "art-attest-race-11111111-deadbeef",
+  };
+  dispatchRuns.atomicJson(recordPath, winner);
+  const factory = {
+    id: "factory-race", trustedRef: "main", protectedPaths: [], riskClasses: {}, testLaneProfile: null, integration: null,
+    gates: [{ id: "acceptance", kind: "command", command: "true", timeoutMs: 60000, cycles: 0, source: "inline", risk: [] }],
+    definition: { factory: { id: "factory-race", revision: null, digest: "sha256:0000" }, gates: [{ id: "acceptance", source: "inline", revision: null, digest: "sha256:1111" }] },
+  };
+  const logs = [];
+  const res = await sporCli.runGateAndIntegration(cfg, entry, { cwd: repo, run_id: entry.run_id }, {
+    factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: (m) => logs.push(m), home, stopping: () => false,
+  });
+  assert.strictEqual(res.state, "passed", "this pipeline's own verdict is still reported to its caller");
+  assert.strictEqual(res.attestation, null, "no attestation for a verdict the record does not hold");
+  assert.strictEqual(res.superseded, true);
+  assert.ok(logs.some((m) => /already settled as 'failed' by other-worker/.test(m) && /no attestation is written/.test(m)), `the race is logged: ${logs.join(" | ")}`);
+  const after = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  for (const k of Object.keys(winner)) assert.strictEqual(after[k], winner[k], `${k} is the winner's, untouched`);
+  assert.ok(!Object.keys(after).some((k) => /^gate_(base|trusted_sha|factory_digest)$/.test(k)), "none of this pipeline's evidence fields landed");
+  assert.deepStrictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("art-attest-")), [], "no attestation node on the graph");
+  // The gate fact itself IS written (a record of what was judged — it never
+  // claims the run's verdict), so the graph holds the gate fact and nothing else.
+  assert.ok(fs.readdirSync(nodes).some((f) => f.startsWith("art-gate-")));
+});
+
+// The mirror: the SETTLER's own evidence stamp goes through stampGateState's
+// `own` door — it lands only while the record's gate_at is the settler's, and
+// is refused (record returned unchanged) once another writer's verdict is on
+// the file. `force` remains --regate's door alone.
+test("stampGateState `own`: lands only on the record whose gate_at is the caller's, never over another settler's", () => {
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-own-stamp-"));
+  const runId = "11111111-2222-3333-4444-000000000099";
+  const file = dispatchRuns.runPaths(home, runId).record;
+  dispatchRuns.atomicJson(file, { run_id: runId, node_id: "task-x", state: "done", gate_state: "passed", gate_at: "2026-09-02T10:00:00.000Z" });
+  const mine = dispatchRuns.stampGateState(home, runId, { gate_attestation: "art-attest-mine" }, { own: "2026-09-02T10:00:00.000Z" });
+  assert.strictEqual(mine.gate_attestation, "art-attest-mine");
+  assert.strictEqual(JSON.parse(fs.readFileSync(file, "utf8")).gate_attestation, "art-attest-mine");
+  const theirs = dispatchRuns.stampGateState(home, runId, { gate_attestation: "art-attest-theirs", gate_head: "h2" }, { own: "2026-09-02T11:11:11.000Z" });
+  assert.strictEqual(theirs.gate_attestation, "art-attest-mine", "the record comes back unchanged");
+  const after = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.strictEqual(after.gate_attestation, "art-attest-mine");
+  assert.strictEqual(after.gate_head, undefined);
+});
+
+// Propose mode's post-settle refresh: the PR body written at propose time
+// predates the graph artifact it must be bound to, so once the run settles the
+// PR is refreshed with the FINAL, digest-bound copy — and a refresh that fails
+// is logged loudly and stamped stale on the record (never "success").
+test("refreshProposalAttestation: the PR body is replaced with the bound attestation; a failed refresh is stamped stale, not swallowed", async () => {
+  const sporCli = require("../bin/spor.js");
+  const attestation = require("../lib/shell/attestation.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-refresh-"));
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const runId = "11111111-2222-3333-4444-000000000066";
+  const item = { node_id: "task-refresh", run_id: runId, attempt: 0, project: "demo" };
+  const factory = { id: "factory-p", trustedRef: "main", integration: { targetRef: "origin/main", mode: "propose", strategy: "merge", command: "npm test" }, definition: { factory: { id: "factory-p", revision: null, digest: "sha256:0000" }, gates: [] } };
+  const settledAt = "2026-09-02T12:00:00.000Z";
+  const file = dispatchRuns.runPaths(home, runId).record;
+  dispatchRuns.atomicJson(file, { run_id: runId, node_id: item.node_id, state: "done", gate_state: "parked", gate_at: settledAt, gate_proposal_number: 7 });
+  const intResult = { state: "parked", mode: "propose", head: "h1", gated_head: "h1", proposal: { number: 7, url: "https://github.com/demo/repo/pull/7", repo: "demo/repo", branch: "task-refresh" } };
+  const att = attestation.buildAttestationObject({ item, factory, gate: { state: "passed", gates: [], facts: [], head: "h1" }, integration: intResult, signing: { key: "k", keyId: "ci" } });
+  const edits = [];
+  const logs = [];
+  const ok = await sporCli.refreshProposalAttestation(cfg, { item, factory, intResult, attestationObject: att, home, log: (m) => logs.push(m), settledAt, cwd: null, editBody: (a) => { edits.push(a); return { ok: true }; } });
+  assert.strictEqual(ok.ok, true);
+  assert.deepStrictEqual([edits[0].repo, edits[0].number], ["demo/repo", 7]);
+  const back = attestation.extractPrAttestation(edits[0].body);
+  assert.strictEqual(back.id, att.id);
+  assert.strictEqual(back.digest, att.digest, "the PR now carries the graph artifact's own bound copy");
+  assert.deepStrictEqual(back.signature, att.signature);
+  assert.match(edits[0].body, /onto `main`/, "the base is the branch half of the remote ref");
+  let rec = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.strictEqual(rec.gate_proposal_attestation, att.id);
+  assert.strictEqual(rec.gate_proposal_attestation_stale, false);
+  assert.ok(logs.some((m) => /PR #7 now carries the bound attestation/.test(m)));
+
+  const bad = await sporCli.refreshProposalAttestation(cfg, { item, factory, intResult, attestationObject: att, home, log: (m) => logs.push(m), settledAt, editBody: () => ({ ok: false, reason: "gh: HTTP 502" }) });
+  assert.strictEqual(bad.ok, false);
+  assert.strictEqual(bad.reason, "gh: HTTP 502");
+  rec = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.strictEqual(rec.gate_proposal_attestation_stale, true, "a failed refresh is on the record");
+  assert.strictEqual(rec.gate_proposal_attestation_error, "gh: HTTP 502");
+  assert.ok(logs.some((m) => /could NOT be refreshed/.test(m) && /validator will refuse/.test(m)));
+  // A throwing editor is the same failure, not a crash.
+  const thrown = await sporCli.refreshProposalAttestation(cfg, { item, factory, intResult, attestationObject: att, home, settledAt, editBody: () => { throw new Error("boom"); } });
+  assert.deepStrictEqual(thrown, { ok: false, reason: "boom" });
+  // And the stamp is own-guarded: another settler's record is never touched.
+  dispatchRuns.atomicJson(file, { run_id: runId, node_id: item.node_id, state: "done", gate_state: "failed", gate_at: "2026-09-02T13:00:00.000Z" });
+  await sporCli.refreshProposalAttestation(cfg, { item, factory, intResult, attestationObject: att, home, settledAt, editBody: () => ({ ok: true }) });
+  rec = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.strictEqual(rec.gate_proposal_attestation, undefined);
+});
+
+// The validator's CLI: `spor attestation verify` against a scratch graph
+// holding the runner-written artifact — the copy on the PR must match it.
+test("spor attestation verify: binds a PR body to the graph artifact, verifies the key, and refuses a tampered or foreign copy", () => {
+  const attestation = require("../lib/shell/attestation.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-verify-cli-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const item = { node_id: "task-verify", run_id: "11111111-2222-3333-4444-000000000055", attempt: 0, project: "demo" };
+  const factory = { id: "factory-v", trustedRef: "main", integration: null, protectedPaths: [], gates: [{ id: "acceptance", kind: "command", command: "npm test" }], definition: { factory: { id: "factory-v", revision: "r1", digest: "sha256:abcd" }, gates: [{ id: "acceptance", source: "inline", revision: "r1", digest: "sha256:ef01" }] } };
+  const gate = { state: "passed", head: "c0ffee00", base: "b", trusted_ref: "main", trusted_sha: "t", branch: "task-verify", definition: factory.definition, facts: [], gates: [{ gate: "acceptance", kind: "command", verdict: "passed", head: "c0ffee00", base: "b", digest: "sha256:ef01", revision: "r1", fact: null }] };
+  const node = attestation.buildAttestationNode({ item, factory, gate, signing: { key: "team-key", keyId: "ci" } });
+  fs.writeFileSync(path.join(nodes, `${node.id}.md`), node.markdown);
+  const prBody = attestation.renderPrBody({ attestation: node.attestation, branch: "task-verify", base: "main" });
+  const prFile = path.join(home, "pr.md");
+  fs.writeFileSync(prFile, `Reviewer prose.\n\n${prBody}`);
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_ATTESTATION_KEY: "team-key" };
+
+  const good = cli(["attestation", "verify", "--pr-body", prFile, "--commit", "c0ffee00", "--max-age", "24h", "--factory-digest", "sha256:abcd", "--require-signature"], env);
+  assert.strictEqual(good.status, 0, good.stderr + good.stdout);
+  assert.match(good.stdout, /ok {4}trusted {3}bound to graph artifact art-attest-/);
+  assert.match(good.stdout, /ok {4}signature hmac-sha256 by key 'ci'/);
+  assert.match(good.stdout, /verified$/m);
+  const asJson = JSON.parse(cli(["attestation", "verify", "--pr-body", prFile, "--json"], env).stdout);
+  assert.strictEqual(asJson.ok, true);
+  assert.strictEqual(asJson.id, node.id);
+
+  // Tampered PR body: the author flips the commit. Digest, signature and the
+  // graph binding all refuse; exit 1.
+  const forged = JSON.parse(JSON.stringify(node.attestation));
+  forged.subject.commit = "attacker1";
+  fs.writeFileSync(path.join(home, "forged.md"), attestation.renderPrBody({ attestation: forged, branch: "task-verify", base: "main" }));
+  const bad = cli(["attestation", "verify", "--pr-body", path.join(home, "forged.md"), "--commit", "attacker1"], env);
+  assert.strictEqual(bad.status, 1);
+  assert.match(bad.stdout, /FAIL {2}digest/);
+  assert.match(bad.stdout, /FAIL {2}signature/);
+  assert.match(bad.stdout, /REFUSED/);
+  // Re-bound by the attacker (digest recomputed): the graph copy still disagrees, and it is unsigned.
+  fs.writeFileSync(path.join(home, "rebound.md"), attestation.renderPrBody({ attestation: attestation.bindAttestation(JSON.parse(JSON.stringify(forged))), branch: "b", base: "main" }));
+  const rebound = cli(["attestation", "verify", "--pr-body", path.join(home, "rebound.md"), "--commit", "attacker1"], env);
+  assert.strictEqual(rebound.status, 1);
+  assert.match(rebound.stdout, /ok {4}digest/);
+  assert.match(rebound.stdout, /FAIL {2}signature .*unsigned/);
+  assert.match(rebound.stdout, /FAIL {2}trusted .*carries digest/);
+  // Without the key on this box the signature is not checked — but the graph binding still refuses the forgery.
+  const noKey = cli(["attestation", "verify", "--pr-body", path.join(home, "rebound.md")], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.strictEqual(noKey.status, 1);
+  assert.match(noKey.stdout, /FAIL {2}trusted/);
+  assert.doesNotMatch(noKey.stdout, /signature/);
+  // A copy naming an artifact the graph does not hold fails closed; --no-graph is the only way past, and it says so.
+  const orphan = JSON.parse(JSON.stringify(node.attestation));
+  orphan.id = "art-attest-nowhere-runabcde-00000000";
+  attestation.bindAttestation(orphan, { key: "team-key", keyId: "ci" });
+  fs.writeFileSync(path.join(home, "orphan.json"), JSON.stringify(orphan));
+  const missing = cli(["attestation", "verify", "--file", path.join(home, "orphan.json")], env);
+  assert.strictEqual(missing.status, 1);
+  assert.match(missing.stdout, /FAIL {2}trusted .*could not be read/);
+  const skipped = cli(["attestation", "verify", "--file", path.join(home, "orphan.json"), "--no-graph"], env);
+  assert.strictEqual(skipped.status, 0, skipped.stdout);
+  // Stale, wrong commit, wrong factory digest, unreadable input, bad duration.
+  assert.strictEqual(cli(["attestation", "verify", "--pr-body", prFile, "--max-age", "1ms"], env).status, 1);
+  assert.match(cli(["attestation", "verify", "--pr-body", prFile, "--commit", "other"], env).stdout, /FAIL {2}commit/);
+  assert.match(cli(["attestation", "verify", "--pr-body", prFile, "--factory-digest", "sha256:9999"], env).stdout, /FAIL {2}config/);
+  fs.writeFileSync(path.join(home, "prose.md"), "no attestation here");
+  assert.match(cli(["attestation", "verify", "--pr-body", path.join(home, "prose.md")], env).stdout, /FAIL {2}schema/);
+  assert.match(cli(["attestation", "verify", "--pr-body", prFile, "--max-age", "soon"], env).stderr, /not a duration/);
+  assert.match(cli(["attestation", "verify"], env).stderr, /usage: spor attestation verify/);
+  assert.match(cli(["attestation", "frobnicate"], env).stderr, /usage: spor attestation verify/);
 });
 
 // The REMOTE door: `if_exists: skip` reports the id existed, not that this

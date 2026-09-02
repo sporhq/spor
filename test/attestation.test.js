@@ -255,3 +255,126 @@ test("a large factory's attestation fits the node body cap with WHOLE JSON — t
   const small = attestation.buildAttestationNode({ item: ITEM, factory: FACTORY, gate: gateResult(), integration: null, now: () => 1_700_000_100_000 });
   assert.match(small.markdown, /"schema": "spor\.attestation\/1"/, "pretty-printed when it fits");
 });
+
+// --- binding: digest, signature, verification (cross-model review, finding 2) --
+//
+// A PR body is mutable text; the JSON in it is evidence only through what
+// binds it: the digest (equal to the runner-written graph artifact's) and,
+// when the pipeline holds a key, the HMAC signature.
+test("every attestation carries a digest over its bound core that survives the node-body ladder, and a key adds an HMAC signature", () => {
+  const unsigned = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult() });
+  assert.match(unsigned.digest, /^sha256:[0-9a-f]{64}$/);
+  assert.strictEqual(unsigned.signature, undefined, "no key, no signature");
+  assert.strictEqual(attestation.attestationDigest(unsigned), unsigned.digest, "the digest recomputes over the object's own core");
+  // Fields OUTSIDE the core (free text, the box the run happened on) do not move it.
+  const withHost = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), environment: { host: "other-box", worker: "w2" }, now: () => Date.parse(unsigned.issued_at) });
+  assert.strictEqual(withHost.digest, unsigned.digest, "environment.host/worker are outside the bound core");
+  // Fields INSIDE it do: a different commit, a different verdict, a different factory digest.
+  const otherHead = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult({ head: "otherhead00000000000000000000000000000002", gates: gateResult().gates.map((g) => ({ ...g, head: "otherhead00000000000000000000000000000002" })) }), now: () => Date.parse(unsigned.issued_at) });
+  assert.notStrictEqual(otherHead.digest, unsigned.digest);
+  const failed = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult({ state: "failed", gates: gateResult().gates.map((g) => ({ ...g, verdict: "failed" })) }), now: () => Date.parse(unsigned.issued_at) });
+  assert.notStrictEqual(failed.digest, unsigned.digest);
+
+  const signed = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), signing: { key: "team-secret", keyId: "ci-2026" }, now: () => Date.parse(unsigned.issued_at) });
+  assert.strictEqual(signed.digest, unsigned.digest, "signing does not change the digest");
+  assert.deepStrictEqual(Object.keys(signed.signature).sort(), ["alg", "key_id", "value"]);
+  assert.strictEqual(signed.signature.alg, attestation.SIGNATURE_ALG);
+  assert.strictEqual(signed.signature.key_id, "ci-2026");
+  assert.match(signed.signature.value, /^[0-9a-f]{64}$/);
+
+  // The node-body ladder thins the JSON but never the bound core: a node
+  // rendered at the floor still carries the SAME digest field, and the core
+  // recomputed from the thinned copy still matches it.
+  const many = factoryOf({ factory: "big", trusted_ref: "main", gates: Array.from({ length: 40 }, (_, i) => ({ id: `gate-${i}`, kind: "command", command: `npm run check-${i}` })) });
+  const bigGate = { ...gateResult(), gates: many.gates.map((g, i) => ({ gate: g.id, kind: g.kind, verdict: "passed", detail: "x".repeat(200), fact: `art-gate-${g.id}-demo-runabcde-${String(i).padStart(8, "0")}`, source: "inline", digest: many.definition.gates[i].digest, revision: "f00d", head: HEAD, base: "basesha", cycles: 1 })), facts: [], definition: many.definition };
+  const node = attestation.buildAttestationNode({ item: ITEM, factory: many, gate: bigGate });
+  const inNode = JSON.parse(/```json\n([\s\S]*?)\n```/.exec(node.markdown)[1]);
+  assert.strictEqual(inNode.digest, node.attestation.digest);
+  assert.strictEqual(attestation.attestationDigest(inNode), node.attestation.digest, "the thinned graph copy recomputes to the same digest");
+  assert.match(node.markdown, new RegExp(`^attestation_digest: ${node.attestation.digest}$`, "m"));
+});
+
+test("verifyAttestation fails closed: a tampered body, a wrong key, a missing signature under a key, a graph copy that disagrees, a stale or foreign commit", () => {
+  const issued = Date.parse("2026-09-02T12:00:00.000Z");
+  const now = () => issued + 60_000;
+  const att = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), signing: { key: "k", keyId: "ci" }, now: () => issued });
+  const trusted = JSON.parse(JSON.stringify(att));
+  const ok = attestation.verifyAttestation(att, { key: "k", trusted, commit: HEAD, maxAgeMs: 3_600_000, factoryDigest: FACTORY.definition.factory.digest, now });
+  assert.strictEqual(ok.ok, true, ok.reason);
+  assert.deepStrictEqual(ok.checks.map((c) => c.check), ["schema", "digest", "signature", "trusted", "passed", "commit", "fresh", "config"]);
+
+  // Tampered: a PR author flips `passed` in the body. The digest no longer
+  // matches, the signature no longer matches, and the graph copy disagrees.
+  const forged = JSON.parse(JSON.stringify(att));
+  forged.gate.steps[1].verdict = "passed";
+  forged.subject.commit = "attackerhead000000000000000000000000000000";
+  const bad = attestation.verifyAttestation(forged, { key: "k", trusted, commit: "attackerhead000000000000000000000000000000", now });
+  assert.strictEqual(bad.ok, false);
+  assert.deepStrictEqual(bad.checks.filter((c) => !c.ok).map((c) => c.check), ["digest", "signature"]);
+  // ...and re-binding it (recomputing the digest) still cannot make it the graph's copy or sign it.
+  const rebound = attestation.bindAttestation(JSON.parse(JSON.stringify(forged)));
+  const bad2 = attestation.verifyAttestation(rebound, { key: "k", trusted, now });
+  assert.deepStrictEqual(bad2.checks.filter((c) => !c.ok).map((c) => c.check), ["signature", "trusted"]);
+  assert.match(bad2.reason, /unsigned|does not verify/);
+  assert.match(bad2.reason, /carries digest/);
+
+  // Wrong key, wrong key id, signature required but absent.
+  assert.strictEqual(attestation.verifyAttestation(att, { key: "not-k", now }).checks.find((c) => c.check === "signature").ok, false);
+  assert.match(attestation.verifyAttestation(att, { key: "k", keyId: "other", now }).reason, /signed with key 'ci', not 'other'/);
+  const unsigned = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), now: () => issued });
+  assert.match(attestation.verifyAttestation(unsigned, { key: "k", now }).reason, /is unsigned/);
+  assert.match(attestation.verifyAttestation(unsigned, { requireSignature: true, now }).reason, /signature is required/);
+  assert.strictEqual(attestation.verifyAttestation(unsigned, { now }).ok, true, "no key and no requirement: the digest alone is checked");
+  assert.match(attestation.verifyAttestation(unsigned, { requireTrusted: true, now }).reason, /graph artifact copy is required/);
+
+  // Graph copy under a different id, or a different digest.
+  assert.match(attestation.verifyAttestation(att, { trusted: { ...trusted, id: "art-attest-other" }, now }).reason, /graph artifact is art-attest-other/);
+  // Commit, freshness, config.
+  assert.match(attestation.verifyAttestation(att, { commit: "deadbeef", now }).reason, /subject\.commit is headsha.*expected deadbeef/);
+  assert.match(attestation.verifyAttestation(att, { maxAgeMs: 1000, now }).reason, /older than 1s/);
+  assert.match(attestation.verifyAttestation(att, { maxAgeMs: 1000, now: () => issued - 5000 }).reason, /in the future/);
+  assert.match(attestation.verifyAttestation(att, { factoryDigest: "sha256:ffff", now }).reason, /factory digest is sha256:.*expected sha256:ffff/);
+  // A failed attestation never verifies, whatever else is right.
+  const failed = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult({ state: "failed" }), now: () => issued });
+  assert.match(attestation.verifyAttestation(failed, { now }).reason, /passed is false/);
+  // Wrong schema, no object.
+  assert.match(attestation.verifyAttestation({ ...att, schema: "other/9" }, { now }).reason, /schema 'other\/9'/);
+  assert.strictEqual(attestation.verifyAttestation(null).ok, false);
+});
+
+test("the PR body names the graph artifact and the digest it is bound to, and says the text alone is not evidence", () => {
+  const att = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), signing: { key: "k", keyId: "ci" } });
+  const body = attestation.renderPrBody({ attestation: att, branch: "task-demo", base: "main" });
+  assert.match(body, /this text is not evidence by itself/);
+  assert.match(body, new RegExp(`spor get ${att.id}`));
+  assert.match(body, new RegExp(att.digest));
+  assert.match(body, /verify the `signature` \(hmac-sha256, key `ci`/);
+  assert.match(body, /spor attestation verify --pr-body/);
+  const back = attestation.extractPrAttestation(body);
+  assert.strictEqual(back.digest, att.digest);
+  assert.deepStrictEqual(back.signature, att.signature);
+  assert.strictEqual(attestation.verifyAttestation(back, { key: "k", trusted: att }).ok, true);
+});
+
+// The signing key is a SECRET: it resolves from env / the user config, never
+// from a committable repo `.spor.json` (a teammate's PR must not be able to
+// set the key the pipeline signs with).
+test("attestation.signingKey is stripped from a repo .spor.json but resolves from env and the user config", () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const { loadConfig } = require("../lib/config.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-attest-cfg-"));
+  const repo = path.join(home, "repo");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, attestation: { signingKey: "from-the-repo", keyId: "repo-key" } }));
+  const warned = [];
+  const viaRepo = loadConfig({ cwd: repo, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home }, warn: (m) => warned.push(m) });
+  assert.strictEqual(viaRepo.get("attestation.signingKey", null), null, "a repo .spor.json cannot set the signing key");
+  assert.strictEqual(viaRepo.get("attestation.keyId", null), "repo-key", "the key id is not a secret and stays configurable per repo");
+  const viaEnv = loadConfig({ cwd: repo, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_ATTESTATION_KEY: "from-env", SPOR_ATTESTATION_KEY_ID: "ci" } });
+  assert.strictEqual(viaEnv.get("attestation.signingKey"), "from-env");
+  assert.strictEqual(viaEnv.get("attestation.keyId"), "ci");
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ attestation: { signingKey: "from-user-config" } }));
+  const viaUser = loadConfig({ cwd: repo, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  assert.strictEqual(viaUser.get("attestation.signingKey"), "from-user-config");
+});

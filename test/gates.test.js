@@ -245,11 +245,16 @@ test("parseFactory attaches definition digests that are stable under payload key
   const referenced = gates.parseFactory(body({ factory: "t", trusted_ref: "main", gates: [{ ref: "gate-acc" }] }), { id: "factory-t", gateNodes: new Map([["gate-acc", shared]]) });
   assert.deepStrictEqual(referenced.errors, []);
   assert.strictEqual(referenced.factory.definition.gates[0].source, "gate-acc");
-  // The gate digest covers the normalized gate INCLUDING its source, so inline
-  // vs referenced is visible there; the factory digest is what a validator
-  // compares against the graph node, and it differs too (the payload differs).
+  // `source` is provenance the runner never branches on, so it is NOT in the
+  // digest: the gate digests are equal, and so are the factory digests (the
+  // runtime-effective definition is the same). Provenance still rides beside
+  // the digest, and a validator recomputes over the same effective shape.
   assert.match(referenced.factory.definition.gates[0].digest, /^sha256:/);
-  void inline;
+  assert.strictEqual(referenced.factory.definition.gates[0].digest, inline.factory.definition.gates[0].digest, "inline vs referenced never changes the gate digest");
+  assert.strictEqual(referenced.factory.definition.factory.digest, inline.factory.definition.factory.digest, "inline vs referenced never changes the factory digest");
+  assert.strictEqual(inline.factory.definition.gates[0].source, "inline");
+  assert.strictEqual(gates.definitionDigest(gates.effectiveGate(referenced.factory.gates[0])), referenced.factory.definition.gates[0].digest, "a validator recomputes the gate digest over the effective gate");
+  assert.strictEqual(gates.definitionDigest(gates.effectiveFactory(referenced.factory)), referenced.factory.definition.factory.digest, "a validator recomputes the factory digest over the effective factory");
 
   // The shell's half: revisions ride per node — an inline gate inherits the
   // factory node's, a referenced one gets its own node's.

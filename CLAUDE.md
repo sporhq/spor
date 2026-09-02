@@ -653,9 +653,22 @@ record first, then writes ONE `art-attest-<stem>-<run>-<hash>` artifact per run
 configIntegrity/timing/environment, `lib/shell/attestation.js`; `allPassed`
 also checks every step bound to the subject commit; the JSON is thinned to fit
 the 8KB node cap, never byte-cut) linking every fact, stamping
-`gate_head`/`gate_attestation`/… on the record; in `propose` mode the same
-attestation rides in the PR body between `<!-- spor-attestation:begin/end -->`
-markers so a repo's CI can validate instead of re-run. Every gate-minted node is
+`gate_head`/`gate_attestation`/… on the record — but ONLY when its own settle
+LANDED: a duplicate pipeline that lost the settle race writes no attestation
+and touches no evidence field (`superseded: true`), and the post-settle stamps
+go through `stampGateState`'s `own: <gate_at>` door, never `force`. Every
+attestation is BOUND — `digest` (sha256 over the canonical JSON of its core,
+which survives the node-body ladder via `steps_digest`/`gates_digest`) plus an
+HMAC-SHA256 `signature` when `attestation.signingKey` (`SPOR_ATTESTATION_KEY`,
+a secret stripped from repo `.spor.json`) is set — and the definition digests
+hash the runtime-effective definition only (gate `source` stripped, so inline
+== referenced). In `propose` mode the same attestation rides in the PR body
+between `<!-- spor-attestation:begin/end -->` markers, refreshed with the final
+graph-bound copy after settlement (a failed `gh pr edit` is a failed proposal
+on reuse, and a stamped-stale record post-settle, never a silent success), so
+a repo's CI runs `spor attestation verify --pr-body … --commit … --max-age …
+--factory …` (fail-closed: digest, signature, graph-artifact binding, passed,
+commit, freshness, factory digest as it stands) instead of re-running. Every gate-minted node is
 written `if_exists: skip` in both modes with a read-back content comparison on
 skip — a different node under the same id is refused, never adopted. Only a CLAIM is gated (`shouldGate`: a verified `resolved`, or an
 UNENFORCED `reported` where nothing could check it), the gated item HOLDS its

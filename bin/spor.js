@@ -10541,11 +10541,12 @@ function ghRepoSlug(top) {
 // `body` (task-spor-factory-gate-attestation) is the PR description — the
 // attestation-bearing text `renderPrBody` builds, so a CI validate-attestation
 // job reads the gate verdicts off the PR instead of re-running the suite. A
-// reused PR gets its body refreshed too (best-effort — the PR already carries
-// the new head, and an unrefreshed description is stale evidence, not a wrong
-// landing), so a fix cycle's re-proposal never leaves the OLD head's attestation
-// on the PR.
-function proposeIntegrationPR({ top, head, targetRef, body = null }) {
+// reused PR gets its body refreshed too, and that refresh is NOT best-effort
+// (cross-model review, finding 4): the body is the evidence a CI job is told
+// to check, so a PR re-proposed at a new head but still describing the OLD
+// head's verdicts is stale evidence under a "success" — the refusal here
+// surfaces as an ordinary propose failure (fix cycle, then a person) instead.
+function proposeIntegrationPR({ top, head, targetRef, body = null, editBody = editProposalBody }) {
   if (!hasCmd("gh")) return { ok: false, reason: "the 'gh' CLI is not on PATH — propose mode needs it to open pull requests" };
   const repo = ghRepoSlug(top);
   if (!repo) return { ok: false, reason: `could not resolve a github.com 'owner/repo' from ${top}'s 'origin' remote — propose mode needs a GitHub remote` };
@@ -10579,7 +10580,12 @@ function proposeIntegrationPR({ top, head, targetRef, body = null }) {
       const list = JSON.parse(existing.stdout);
       const j = Array.isArray(list) ? list[0] : null;
       if (j && j.number && String(j.state || "").toUpperCase() === "OPEN" && j.baseRefName === baseBranch) {
-        if (body) runGh(["pr", "edit", String(j.number), "--repo", repo, "--body", body], { cwd: top }); // best-effort refresh of the attestation
+        if (body) {
+          const edited = editBody({ top, repo, number: j.number, body });
+          if (!edited || !edited.ok) {
+            return { ok: false, reason: `PR #${j.number} is already open (${j.url}) and now carries ${head.slice(0, 8)}, but its body could not be refreshed with that head's attestation — ${(edited && edited.reason) || "gh pr edit failed"}` };
+          }
+        }
         return { ok: true, number: j.number, url: j.url, repo, branch: branchName, targetRef, detail: `PR #${j.number} already open (${j.url}) — updated with ${head.slice(0, 8)}` };
       }
     } catch {
@@ -10602,6 +10608,19 @@ function proposeIntegrationPR({ top, head, targetRef, body = null }) {
   const num = (url.match(/\/pull\/(\d+)/) || [])[1];
   if (!num) return { ok: false, reason: `gh pr create did not report a pull request number/url (got: ${url || "nothing"})` };
   return { ok: true, number: Number(num), url, repo, branch: branchName, targetRef, detail: `opened PR #${num} (${url}) for ${head.slice(0, 8)} onto ${targetRef}` };
+}
+
+// Replace a PR's description — the attestation refresh door, used both by the
+// reuse arm above and by runGateAndIntegration once the run has SETTLED and the
+// graph artifact the PR body must be bound to exists (the body written at
+// propose time predates that artifact, so it is refreshed with the final,
+// digest-bound copy). {ok} | {ok:false, reason}.
+function editProposalBody({ top = null, repo, number, body }) {
+  if (!hasCmd("gh")) return { ok: false, reason: "the 'gh' CLI is not on PATH" };
+  if (!repo || !number) return { ok: false, reason: "no pull request repo/number to edit" };
+  const r = runGh(["pr", "edit", String(number), "--repo", repo, "--body", String(body || "")], top ? { cwd: top } : {});
+  if (r.status !== 0) return { ok: false, reason: (r.stderr || r.stdout || "").trim().split("\n").filter(Boolean).pop() || "gh pr edit failed" };
+  return { ok: true };
 }
 
 // The PR's current state, for checkProposals below — {ok, state: "open" |
@@ -10798,6 +10817,7 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
           gate: currentGate() || { state: "passed", gates: [], facts: [], definition: factory.definition || null },
           integration: partial,
           environment: attestationEnvironment(cfg, workerId),
+          signing: attestationSigning(cfg),
         });
         body = attestation.renderPrBody({ attestation: att, branch: (git(top, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout || "").trim() || "HEAD", base: baseBranch });
       } catch (e) {
@@ -10955,32 +10975,130 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // pipeline could later be pointed at). The loop's own settle stamp after
   // this is a no-op against an already-settled verdict, by stampGateState's
   // contract; the `--regate` path stamps with force and lands regardless.
-  settleRunRecord(ctx.home || cfg.userConfigHome(), item.run_id, result, ctx.workerId || null);
+  //
+  // The evidence fields (gate_head/gate_base/trusted sha/factory digest/landed
+  // sha) ride IN the settle stamp — one write, one writer — and the settle
+  // reports whether it LANDED. When it did not (another pipeline for the same
+  // run — a duplicate adopter, a resumed orphan — settled first and the guard
+  // yielded to it), this pipeline's verdict is not the record's, so it writes
+  // NO attestation and touches NO evidence field (cross-model review, blocking
+  // finding 1): the graph and the record must describe one verdict at one
+  // head, and that is the winner's. The result still reports what this
+  // pipeline found (`superseded` says the record disagrees) so the loop's own
+  // bookkeeping stays honest.
+  const home = ctx.home || cfg.userConfigHome();
+  const settled = settleRunRecord(home, item.run_id, result, ctx.workerId || null, { gateResult: gateAsStands, factory: ctx.factory, intResult });
+  if (!settled.landed) {
+    ctx.log(
+      `work: the run record for ${item.node_id} (run ${String(item.run_id).slice(0, 8)}) was already settled${settled.record && settled.record.gate_state ? ` as '${settled.record.gate_state}'` : ""}${settled.record && settled.record.gate_worker ? ` by ${settled.record.gate_worker}` : ""} — this pipeline's '${result.state}' verdict is not recorded and no attestation is written for it`
+    );
+    return { ...result, attestation: null, superseded: true };
+  }
   // ONE attestation per run (piece 4): the evidence chain over everything
   // above, written as a graph artifact and stamped onto the run record
-  // (`gate_head`/`gate_base`/`gate_attestation`). Fail-soft like every fact
-  // write — the verdict is the enforcement, the attestation is its record.
-  const attested = await writeRunAttestation(cfg, { item, factory: ctx.factory, gateResult: gateAsStands, intResult, log: ctx.log, home: ctx.home, workerId: ctx.workerId || null });
+  // (`gate_attestation`) through the settler's OWN door (`own: gate_at`), so
+  // it can never land on a record another writer settled. Fail-soft like
+  // every fact write — the verdict is the enforcement, the attestation is its
+  // record.
+  const { attestationObject, ...attested } = await writeRunAttestation(cfg, {
+    item, factory: ctx.factory, gateResult: gateAsStands, intResult, log: ctx.log, home, workerId: ctx.workerId || null, settledAt: settled.at,
+  });
+  // Propose mode: the PR body written at propose time predates the graph
+  // artifact it must be bound to (the artifact is minted only after the run
+  // settles, above), so the PR is refreshed with the final, digest-bound copy
+  // the graph holds — the copy a CI validate-attestation job compares against.
+  if (attested.attestation && attestationObject && intResult && intResult.state === "parked" && intResult.proposal && intResult.proposal.number && ctx.factory.integration && ctx.factory.integration.mode === "propose") {
+    await refreshProposalAttestation(cfg, {
+      item, factory: ctx.factory, intResult, attestationObject, home, log: ctx.log, settledAt: settled.at,
+      cwd: (record && record.cwd) || null, editBody: ctx.editProposalBody || editProposalBody,
+    });
+  }
   return { ...result, ...attested };
 }
 
 // The settled verdict, on the run record, in the same shape work-loop.js's
-// settleGates stamps it (one writer's fields, not two disagreeing ones).
-function settleRunRecord(home, runId, res, workerId = null) {
+// settleGates stamps it (one writer's fields, not two disagreeing ones), plus
+// the run's evidence fields when the pipeline's inputs are given. Returns
+// {landed, at, record}: `landed` is whether THIS stamp is the verdict now on
+// the file — false when the settled-verdict guard yielded to an earlier writer
+// (the record returned is theirs) or the write could not be made at all.
+function settleRunRecord(home, runId, res, workerId = null, { gateResult = null, factory = null, intResult = null } = {}) {
+  const at = new Date().toISOString();
   try {
     const state = res && res.state ? res.state : "failed";
     const reason = res && res.reason ? String(res.reason).slice(0, 300) : null;
-    dispatchRuns.stampGateState(home, runId, {
+    const stamped = dispatchRuns.stampGateState(home, runId, {
       gate_state: state,
-      gate_at: new Date().toISOString(),
+      gate_at: at,
       ...(workerId ? { gate_worker: workerId } : {}),
       ...(reason ? { gate_reason: reason } : {}),
       ...(res && res.escalated_to ? { gate_escalated_to: res.escalated_to, gate_escalation_ids: [res.escalated_to] } : {}),
       ...(res && res.demoted != null ? { gate_demoted: !!res.demoted } : {}),
+      ...(gateResult
+        ? {
+            gate_head: gateResult.head || null,
+            gate_base: gateResult.base || null,
+            gate_trusted_sha: gateResult.trusted_sha || null,
+            gate_factory_digest: (factory && factory.definition && factory.definition.factory && factory.definition.factory.digest) || null,
+            ...(intResult && intResult.landed_sha ? { gate_landed_sha: intResult.landed_sha } : {}),
+          }
+        : {}),
     });
+    const landed = !!stamped && stamped.gate_at === at && stamped.gate_state === state;
+    return { landed, at, record: stamped || null };
   } catch {
     /* fail-soft: the loop's own settle stamp is the second writer */
+    return { landed: false, at, record: null };
   }
+}
+
+// The HMAC key the pipeline signs each attestation with, from the config
+// cascade (`attestation.signingKey` / SPOR_ATTESTATION_KEY — never a repo
+// `.spor.json`, lib/config.js REPO_FORBIDDEN_PATHS). No key = digest-only
+// binding through the graph artifact.
+function attestationSigning(cfg) {
+  let key = null;
+  let keyId = null;
+  try {
+    key = cfg.get("attestation.signingKey", null) || null;
+    keyId = cfg.get("attestation.keyId", null) || null;
+  } catch {
+    /* no config — unsigned */
+  }
+  return key ? { key: String(key), keyId: keyId ? String(keyId) : "default" } : null;
+}
+
+// Refresh a parked proposal's PR body with the run's FINAL attestation — the
+// digest-bound copy of the graph artifact, the thing a CI validate-attestation
+// job is told to compare against. Not best-effort: a refresh that fails leaves
+// the PR carrying the propose-time (pre-artifact, unbound) copy, so the failure
+// is logged loudly and stamped on the run record (`gate_proposal_attestation_
+// stale`), where `spor runs`/`--status` surface it; a validator comparing the
+// PR body to the graph artifact fails closed on the digest mismatch anyway.
+async function refreshProposalAttestation(cfg, { item, factory, intResult, attestationObject, home, log = () => {}, settledAt, cwd = null, editBody = editProposalBody }) {
+  const proposal = intResult.proposal;
+  let edited;
+  try {
+    const base = integrationRunner.splitRemoteRef(factory.integration.targetRef).branch;
+    const body = attestation.renderPrBody({ attestation: attestationObject, branch: proposal.branch || "HEAD", base });
+    edited = await editBody({ top: cwd, repo: proposal.repo, number: proposal.number, body });
+  } catch (e) {
+    edited = { ok: false, reason: (e && e.message) || String(e) };
+  }
+  const ok = !!(edited && edited.ok);
+  if (ok) log(`work: PR #${proposal.number} now carries the bound attestation ${attestationObject.id} for ${item.node_id}`);
+  else log(`work: PR #${proposal.number} for ${item.node_id} could NOT be refreshed with the bound attestation ${attestationObject.id} (${(edited && edited.reason) || "no response"}) — its body still carries the propose-time copy, which a validator will refuse against the graph artifact`);
+  try {
+    dispatchRuns.stampGateState(
+      home,
+      item.run_id,
+      { gate_proposal_attestation: attestationObject.id, gate_proposal_attestation_stale: !ok, ...(ok ? {} : { gate_proposal_attestation_error: String((edited && edited.reason) || "no response").slice(0, 300) }) },
+      { own: settledAt }
+    );
+  } catch {
+    /* fail-soft: the log line above is the record of it */
+  }
+  return { ok, reason: ok ? null : (edited && edited.reason) || "no response" };
 }
 
 // What the attestation says about where it was produced. `spor_version` is the
@@ -11002,14 +11120,19 @@ function attestationEnvironment(cfg, workerId = null) {
   return { spor_version: version, worker: workerId || null, host: os.hostname(), platform: `${process.platform}-${process.arch}`, node: process.version, mode };
 }
 
-// Build, write, and stamp the run's attestation. Returns `{attestation}` — the
-// node id, or null when it could not be recorded — for the gate result to carry
-// onward; never throws.
-async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, log = () => {}, home = null, workerId = null }) {
-  const out = { attestation: null };
+// Build, write, and stamp the run's attestation. Returns `{attestation,
+// attestationObject}` — the node id (null when it could not be recorded) and
+// the bound object itself — for the gate result to carry onward; never throws.
+// `settledAt` is the settler's own `gate_at`: the `gate_attestation` stamp goes
+// through stampGateState's `own` door, so it lands only while the record still
+// holds THIS pipeline's verdict — never force, which would let a pipeline that
+// lost the settle race overwrite the winner's evidence.
+async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, log = () => {}, home = null, workerId = null, settledAt = null }) {
+  const out = { attestation: null, attestationObject: null };
   let built = null;
   try {
-    built = attestation.buildAttestationNode({ item, factory, gate: gateResult, integration: intResult, environment: attestationEnvironment(cfg, workerId) });
+    built = attestation.buildAttestationNode({ item, factory, gate: gateResult, integration: intResult, environment: attestationEnvironment(cfg, workerId), signing: attestationSigning(cfg) });
+    out.attestationObject = built.attestation;
   } catch (e) {
     log(`work: the attestation for ${item.node_id} could not be built (${(e && e.message) || e}) — the verdict still stands`);
     return out;
@@ -11021,27 +11144,128 @@ async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, 
   } catch (e) {
     log(`work: the attestation for ${item.node_id} could not be recorded on the graph (${(e && e.message) || e}) — the verdict still stands`);
   }
+  if (!out.attestation) return out;
   try {
-    // `force`: the verdict is already settled on the record (settleRunRecord
-    // runs first, by design) and these are its evidence fields, not a second
-    // verdict — stampGateState's refuse-once-settled guard is for gate_state.
-    dispatchRuns.stampGateState(
-      home || cfg.userConfigHome(),
-      item.run_id,
-      {
-        gate_head: (gateResult && gateResult.head) || null,
-        gate_base: (gateResult && gateResult.base) || null,
-        gate_trusted_sha: (gateResult && gateResult.trusted_sha) || null,
-        gate_factory_digest: (factory && factory.definition && factory.definition.factory && factory.definition.factory.digest) || null,
-        ...(intResult && intResult.landed_sha ? { gate_landed_sha: intResult.landed_sha } : {}),
-        ...(out.attestation ? { gate_attestation: out.attestation } : {}),
-      },
-      { force: true }
-    );
+    const stamped = dispatchRuns.stampGateState(home || cfg.userConfigHome(), item.run_id, { gate_attestation: out.attestation }, settledAt ? { own: settledAt } : {});
+    if (!stamped || stamped.gate_attestation !== out.attestation) log(`work: the run record for ${item.node_id} no longer holds this pipeline's verdict — attestation ${out.attestation} is on the graph but not stamped on the record`);
   } catch {
     /* fail-soft: the run record is bookkeeping, the attestation node is the record */
   }
   return out;
+}
+
+// `spor attestation verify` — the validator's half of the evidence chain
+// (task-spor-factory-gate-attestation, piece 4): what a repo's CI runs against
+// a propose-mode PR instead of re-running the suite. Reads an attestation from
+// a PR body (between the spor-attestation markers), a JSON file, or stdin;
+// then, by default, fetches the graph artifact it names (`art-attest-*`, the
+// runner's own write — a store the PR author does not write through) and
+// requires the two digests to agree; verifies the HMAC signature when this box
+// holds the key (`attestation.signingKey` / SPOR_ATTESTATION_KEY); and checks
+// the caller's commit/freshness/factory-digest expectations. Every check is
+// fail-closed (lib/shell/attestation.js verifyAttestation); exit 1 on any
+// failure, so a CI job can gate on the exit code alone.
+async function cmdAttestation(cfg, args) {
+  const usage = "usage: spor attestation verify (--pr-body <file>|--file <file>|-) [--commit <sha>] [--max-age <ms|1h|24h>] [--factory-digest <sha256:…>|--factory <id>] [--key-id <id>] [--require-signature] [--no-graph] [--json]";
+  if (args[0] !== "verify") {
+    err(usage);
+    return 1;
+  }
+  const json = args.includes("--json");
+  const prBodyPath = optVal(args, "pr-body");
+  const filePath = optVal(args, "file");
+  const fromStdin = args.includes("-");
+  if (!prBodyPath && !filePath && !fromStdin) {
+    err(usage);
+    return 1;
+  }
+  let text;
+  try {
+    text = fromStdin && !prBodyPath && !filePath ? fs.readFileSync(0, "utf8") : fs.readFileSync(prBodyPath || filePath, "utf8");
+  } catch (e) {
+    err(`could not read ${prBodyPath || filePath || "stdin"}: ${(e && e.message) || e}`);
+    return 1;
+  }
+  // A PR body carries the JSON between markers; a bare file/stdin is the JSON
+  // itself — or a PR body, if the markers are there.
+  let att = null;
+  if (text.includes(attestation.PR_BEGIN)) att = attestation.extractPrAttestation(text);
+  else {
+    try {
+      att = JSON.parse(text);
+    } catch {
+      att = null;
+    }
+  }
+  const finish = (result) => {
+    if (json) out(JSON.stringify(result, null, 2));
+    else {
+      for (const c of result.checks) out(`${c.ok ? "ok  " : "FAIL"}  ${c.check.padEnd(9)} ${c.detail}`);
+      out(result.ok ? `attestation ${result.id || ""} verified` : `attestation ${result.id || ""} REFUSED — ${result.reason}`);
+    }
+    return result.ok ? 0 : 1;
+  };
+  if (!att) return finish({ ok: false, id: null, checks: [{ check: "schema", ok: false, detail: `no ${attestation.SCHEMA} attestation could be read from ${prBodyPath || filePath || "stdin"}` }], reason: "unreadable attestation" });
+
+  const maxAgeRaw = optVal(args, "max-age");
+  const maxAgeMs = maxAgeRaw != null ? parseDurationMs(maxAgeRaw) : null;
+  if (maxAgeRaw != null && maxAgeMs == null) {
+    err(`--max-age: '${maxAgeRaw}' is not a duration (ms, or 30s/10m/24h/7d)`);
+    return 1;
+  }
+  const commit = optVal(args, "commit");
+  let factoryDigest = optVal(args, "factory-digest");
+  const extra = [];
+  // `--factory <id>`: recompute the digest from the factory AS IT STANDS on
+  // the graph (the definition a validator must compare against), through the
+  // same loader the worker uses, so the two can never disagree on shape.
+  const factoryId = optVal(args, "factory");
+  if (factoryId && !factoryDigest) {
+    const loaded = await loadFactoryDefinition(cfg, factoryId);
+    if (!loaded.factory) extra.push({ check: "config", ok: false, detail: `the factory '${factoryId}' could not be loaded to compare against: ${loaded.errors.join("; ")}` });
+    else factoryDigest = loaded.factory.definition && loaded.factory.definition.factory && loaded.factory.definition.factory.digest;
+  }
+  // The trusted copy: the graph artifact the attestation names.
+  let trusted = null;
+  const noGraph = args.includes("--no-graph");
+  if (!noGraph) {
+    const id = att.id;
+    if (!id || !/^art-attest-/.test(String(id))) extra.push({ check: "trusted", ok: false, detail: `the attestation names no art-attest-* graph artifact (id: ${id || "none"})` });
+    else {
+      let node = null;
+      try {
+        node = await resolveNode(cfg, id);
+      } catch {
+        node = null;
+      }
+      const raw = node && node.raw;
+      const m = raw ? /```json\n([\s\S]*?)\n```/.exec(raw) : null;
+      if (!raw) extra.push({ check: "trusted", ok: false, detail: `the graph artifact ${id} could not be read (${cfg.mode()} mode) — pass --no-graph to skip the graph binding deliberately` });
+      else if (!m) extra.push({ check: "trusted", ok: false, detail: `the graph artifact ${id} carries no attestation JSON` });
+      else {
+        try {
+          trusted = JSON.parse(m[1]);
+        } catch {
+          extra.push({ check: "trusted", ok: false, detail: `the graph artifact ${id}'s attestation JSON does not parse` });
+        }
+      }
+    }
+  }
+  const signing = attestationSigning(cfg);
+  const keyId = optVal(args, "key-id") || null;
+  const result = attestation.verifyAttestation(att, {
+    key: signing ? signing.key : null,
+    keyId,
+    maxAgeMs,
+    commit: commit || null,
+    factoryDigest: factoryDigest || null,
+    trusted,
+    requireSignature: args.includes("--require-signature"),
+    requireTrusted: !noGraph && !trusted && !extra.some((c) => c.check === "trusted"),
+  });
+  const checks = [...result.checks, ...extra];
+  const failed = checks.filter((c) => !c.ok);
+  return finish({ ok: failed.length === 0, id: att.id || null, checks, reason: failed.length ? failed.map((c) => `${c.check}: ${c.detail}`).join("; ") : null });
 }
 
 // task-spor-integration-propose-mode: the LATER half of propose mode's
@@ -13973,6 +14197,40 @@ const COMMANDS = {
     examples: ["spor work", "spor work --project spor --concurrency 2", "spor work --factory factory-spor-default", "spor work --once --max 1 --print", "spor work --status --json"],
     run: (cfg, p) => cmdWork(cfg, p),
   },
+  attestation: {
+    group: "Dispatch (background agents)", parse: "raw",
+    args: "verify (--pr-body <file>|--file <file>|-) [--commit <sha>] [--max-age <dur>] [--factory <id>|--factory-digest <sha256:…>] [--key-id <id>] [--require-signature] [--no-graph] [--json]",
+    summary: "validate a gate-pipeline attestation (PR body or JSON) against the graph, a key, a commit",
+    help:
+      "The validator's half of the factory gate pipeline's evidence chain\n" +
+      "(task-spor-factory-gate-attestation): what a PR-policy repo's CI runs on a\n" +
+      "`propose`-mode pull request INSTEAD of re-running the whole suite.\n\n" +
+      "The attestation is read from the PR body (the JSON between the\n" +
+      "<!-- spor-attestation:begin/end --> markers), a JSON file, or stdin. PR text\n" +
+      "is not evidence by itself — anyone who can edit the PR can edit it — so the\n" +
+      "checks bind it to what the runner itself wrote:\n\n" +
+      "  trusted    the graph artifact it names (art-attest-*, written by the runner,\n" +
+      "             never by a PR author) is fetched and its `digest` must equal this\n" +
+      "             copy's (skip ONLY deliberately, with --no-graph)\n" +
+      "  digest     the copy's `digest` matches a recomputation over its own core\n" +
+      "  signature  when this box holds the key (attestation.signingKey /\n" +
+      "             SPOR_ATTESTATION_KEY), the HMAC-SHA256 signature must verify;\n" +
+      "             --require-signature refuses an unsigned attestation outright\n" +
+      "  passed     `passed` is true (every gate at the subject commit; the stage's\n" +
+      "             head is the gated head)\n" +
+      "  commit     --commit <sha>: `subject.commit` equals it (the PR head)\n" +
+      "  fresh      --max-age <dur>: `issued_at` is within it (ms, 30s, 24h, 7d)\n" +
+      "  config     --factory <id> recomputes the factory's digest AS IT STANDS on the\n" +
+      "             graph (same loader the worker uses) — or --factory-digest gives it\n" +
+      "             — and `configIntegrity.factory.digest` must equal it\n\n" +
+      "Every check is fail-closed; exit 1 on any failure, 0 only when all pass.\n" +
+      "--json prints {ok, id, checks[], reason}.",
+    examples: [
+      "gh pr view 42 --json body -q .body > pr.md && spor attestation verify --pr-body pr.md --commit $(git rev-parse HEAD) --max-age 24h --factory factory-spor",
+      "spor attestation verify --file att.json --no-graph --require-signature",
+    ],
+    run: (cfg, args) => cmdAttestation(cfg, args),
+  },
   runs: {
     group: "Dispatch (background agents)", parse: "strict", args: "[<run-id>]",
     summary: "what happened to the runs this machine dispatched",
@@ -14282,7 +14540,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
+module.exports = { editProposalBody, refreshProposalAttestation, attestationSigning, nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
 
 if (require.main === module) {
   main()
