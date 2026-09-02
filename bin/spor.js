@@ -9768,6 +9768,38 @@ function stripFrontmatterDate(markdown) {
   return text.slice(0, end).replace(/^date: .*$/m, "date:") + text.slice(end);
 }
 
+// Is the node the graph already holds under a gate id the SAME node this
+// runner is writing? The server stamps what it stamps on write (author,
+// authored_via, agent/session attribution, timestamps) and the calendar day
+// drifts (stripFrontmatterDate), so the comparison is over the frontmatter
+// lines that carry the fact — order-insensitive, minus the server's own keys —
+// and the body, whitespace-trimmed. Anything else (a different verdict, a
+// different head, a different summary) is a different node.
+const SERVER_STAMPED_KEYS = new Set(["date", "author", "authored_via", "authored_by_agent", "session", "revision", "created_at", "updated_at", "captured_at", "authored_at"]);
+function gateNodeShape(markdown) {
+  const text = String(markdown || "").replace(/\r\n/g, "\n");
+  if (!text.startsWith("---\n")) return { fm: [], body: text.trim() };
+  const end = text.indexOf("\n---", 4);
+  if (end === -1) return { fm: [], body: text.trim() };
+  const fm = text
+    .slice(4, end)
+    .split("\n")
+    .map((l) => l.replace(/\s+$/, ""))
+    .filter((l) => l.trim())
+    .filter((l) => {
+      const m = /^([A-Za-z_][\w-]*):/.exec(l);
+      return !(m && SERVER_STAMPED_KEYS.has(m[1]));
+    })
+    .sort();
+  const body = text.slice(end + 4).replace(/^\n+/, "").trim();
+  return { fm, body };
+}
+function gateNodeEquivalent(a, b) {
+  const x = gateNodeShape(a);
+  const y = gateNodeShape(b);
+  return x.body === y.body && x.fm.length === y.fm.length && x.fm.every((l, i) => l === y.fm[i]);
+}
+
 // Write a gate's node — a fact, an escalation, an approval — through the same
 // validated door `spor put-node` uses, idempotently (a deterministic id written
 // twice is one node, never two).
@@ -9776,7 +9808,20 @@ async function writeGateNode(cfg, id, markdown) {
     const r = await remote.post(cfg, "/v1/nodes", { nodes: [{ node: markdown, if_exists: "skip" }] }, { timeoutMs: 15000 });
     if (r.transport) return { ok: false, reason: `offline — ${r.error}` };
     const res0 = r.json && r.json.results && r.json.results[0];
-    if (res0 && (res0.ok === true || res0.status === "skipped" || res0.status === "created")) return { ok: true, id };
+    if (res0 && res0.status === "skipped") {
+      // The SAME distinction the local door draws below (review finding 5): a
+      // skip means the id exists, not that THIS fact landed. Read it back and
+      // compare — a racing runner's node under this id carrying a different
+      // verdict is a collision to refuse, never evidence to adopt. An
+      // unreadable existing node is refused too (fail closed: it cannot be
+      // shown to be this fact).
+      const existing = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 8000 });
+      if (existing.transport) return { ok: false, id, existing: true, reason: `${id} already exists and could not be read back to compare (offline — ${existing.error})` };
+      const raw = existing.ok ? (existing.json && existing.json.raw) || existing.text || "" : "";
+      if (!existing.ok || !raw) return { ok: false, id, existing: true, reason: `${id} already exists and could not be read back to compare (HTTP ${existing.status})` };
+      return gateNodeEquivalent(raw, markdown) ? { ok: true, id, existing: true } : { ok: false, id, existing: true, reason: `${id} already exists with different content — refusing to adopt another gate's node` };
+    }
+    if (res0 && (res0.ok === true || res0.status === "created")) return { ok: true, id };
     return { ok: false, reason: putNodeEntryError(res0, r.status, "gate") };
   }
   const dir = cfg.nodesDir();
@@ -10641,8 +10686,11 @@ function buildProposalTrackingNode({ id, nodeId, runId, targetRef, proposal, pro
 // integration-runner.js's pure orchestration, mirroring makeGateDeps above.
 // Only ever constructed when `factory.integration` resolved, so a bare
 // factory (or one with no integration block) never touches any of this.
-function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, warn, sleep, log, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, dispatch = dispatchThrough, home = cfg.userConfigHome(), gateResult = null, workerId = null }) {
+function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, warn, sleep, log, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, dispatch = dispatchThrough, home = cfg.userConfigHome(), gateResult = null, workerId = null, regate = null }) {
   const integration = factory.integration;
+  // The gate pipeline's result AS IT STANDS — a re-gate of a moved head
+  // (below) replaces it, and the PR body's attestation must carry the latest.
+  const currentGate = () => (typeof gateResult === "function" ? gateResult() : gateResult);
   const date = () => new Date().toISOString().slice(0, 10);
   const stem = gateStem(entry.node_id);
   const short = gateRunner.shortRunAttempt(entry.run_id, entry.attempt);
@@ -10747,7 +10795,7 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
         };
         const att = attestation.buildAttestationObject({
           item: { ...entry, project: slug || entry.project || null }, factory,
-          gate: gateResult || { state: "passed", gates: [], facts: [], definition: factory.definition || null },
+          gate: currentGate() || { state: "passed", gates: [], facts: [], definition: factory.definition || null },
           integration: partial,
           environment: attestationEnvironment(cfg, workerId),
         });
@@ -10793,6 +10841,10 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       return { ...written, id };
     },
     fix,
+    // A fix cycle moved the implementer's head: the stage hands it back to the
+    // gate pipeline before anything at that head can land (review finding 2).
+    // Wired by runGateAndIntegration, which owns the pipeline's result.
+    ...(typeof regate === "function" ? { regate } : {}),
     recordFact: ({ id, markdown }) => writeGateNode(cfg, id, markdown),
     cleanupImplementer: async () => {
       const dir = record && record.cwd;
@@ -10869,23 +10921,66 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // a refusal (§10.7) under the worker's scope token would hide it from exactly
   // the project-scoped queue a person would look in.
   const dctx = { ...ctx, slug: item.project || ctx.slug || null, record, entry };
-  const gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: makeGateDeps(cfg, dctx) });
+  let gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: makeGateDeps(cfg, dctx) });
+  // Every gate fact the run minted, across re-gates — the attestation links
+  // them all; `gateResult` itself is the verdict as it STANDS (the latest).
+  const gateFacts = [...(gateResult.facts || [])];
   let intResult = null;
   if (gateResult.state === "passed" && ctx.factory.integration) {
     // The head the last passing gate judged is what the stage must find when it
-    // re-reads the tree (task-spor-factory-gate-attestation, piece 3).
+    // re-reads the tree (task-spor-factory-gate-attestation, piece 3) — and
+    // when one of the stage's own fix cycles moves it, the stage calls back
+    // here to re-run the pipeline at the moved head before landing it.
+    const regate = async ({ head }) => {
+      const again = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: makeGateDeps(cfg, dctx) });
+      for (const f of again.facts || []) if (!gateFacts.includes(f)) gateFacts.push(f);
+      gateResult = again;
+      if (again.state === "passed" && again.head !== head) ctx.log(`work: the re-gate of ${item.node_id} judged ${String(again.head || "an unknown head").slice(0, 12)}, not the moved head ${String(head).slice(0, 12)}`);
+      return again;
+    };
     intResult = await integrationRunner.runIntegrationStage({
       item, factory: ctx.factory, log: ctx.log, gatedHead: gateResult.head || null,
-      deps: makeIntegrationDeps(cfg, { ...dctx, gateResult }),
+      deps: makeIntegrationDeps(cfg, { ...dctx, gateResult: () => gateResult, regate }),
     });
   }
+  const gateAsStands = { ...gateResult, facts: gateFacts };
+  const result = !intResult
+    ? { ...gateAsStands }
+    : { ...intResult, gates: gateResult.gates, gate_head: gateResult.head || null, facts: [...gateFacts, ...(intResult.facts || [])] };
+  // SETTLE FIRST, ATTEST SECOND (review finding 5): the verdict is written to
+  // the run record — the durable, read-back-verified `gate_state` the resume
+  // scan and `spor runs` key on — BEFORE the attestation node exists, so no
+  // window has a graph artifact claiming a verdict the record does not yet
+  // hold (a worker dying in that window would leave evidence a resumed
+  // pipeline could later be pointed at). The loop's own settle stamp after
+  // this is a no-op against an already-settled verdict, by stampGateState's
+  // contract; the `--regate` path stamps with force and lands regardless.
+  settleRunRecord(ctx.home || cfg.userConfigHome(), item.run_id, result, ctx.workerId || null);
   // ONE attestation per run (piece 4): the evidence chain over everything
   // above, written as a graph artifact and stamped onto the run record
   // (`gate_head`/`gate_base`/`gate_attestation`). Fail-soft like every fact
   // write — the verdict is the enforcement, the attestation is its record.
-  const attested = await writeRunAttestation(cfg, { item, factory: ctx.factory, gateResult, intResult, log: ctx.log, home: ctx.home, workerId: ctx.workerId || null });
-  if (!intResult) return { ...gateResult, ...attested };
-  return { ...intResult, gates: gateResult.gates, gate_head: gateResult.head || null, facts: [...(gateResult.facts || []), ...(intResult.facts || [])], ...attested };
+  const attested = await writeRunAttestation(cfg, { item, factory: ctx.factory, gateResult: gateAsStands, intResult, log: ctx.log, home: ctx.home, workerId: ctx.workerId || null });
+  return { ...result, ...attested };
+}
+
+// The settled verdict, on the run record, in the same shape work-loop.js's
+// settleGates stamps it (one writer's fields, not two disagreeing ones).
+function settleRunRecord(home, runId, res, workerId = null) {
+  try {
+    const state = res && res.state ? res.state : "failed";
+    const reason = res && res.reason ? String(res.reason).slice(0, 300) : null;
+    dispatchRuns.stampGateState(home, runId, {
+      gate_state: state,
+      gate_at: new Date().toISOString(),
+      ...(workerId ? { gate_worker: workerId } : {}),
+      ...(reason ? { gate_reason: reason } : {}),
+      ...(res && res.escalated_to ? { gate_escalated_to: res.escalated_to, gate_escalation_ids: [res.escalated_to] } : {}),
+      ...(res && res.demoted != null ? { gate_demoted: !!res.demoted } : {}),
+    });
+  } catch {
+    /* fail-soft: the loop's own settle stamp is the second writer */
+  }
 }
 
 // What the attestation says about where it was produced. `spor_version` is the
@@ -10927,14 +11022,22 @@ async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, 
     log(`work: the attestation for ${item.node_id} could not be recorded on the graph (${(e && e.message) || e}) — the verdict still stands`);
   }
   try {
-    dispatchRuns.stampGateState(home || cfg.userConfigHome(), item.run_id, {
-      gate_head: (gateResult && gateResult.head) || null,
-      gate_base: (gateResult && gateResult.base) || null,
-      gate_trusted_sha: (gateResult && gateResult.trusted_sha) || null,
-      gate_factory_digest: (factory && factory.definition && factory.definition.factory && factory.definition.factory.digest) || null,
-      ...(intResult && intResult.landed_sha ? { gate_landed_sha: intResult.landed_sha } : {}),
-      ...(out.attestation ? { gate_attestation: out.attestation } : {}),
-    });
+    // `force`: the verdict is already settled on the record (settleRunRecord
+    // runs first, by design) and these are its evidence fields, not a second
+    // verdict — stampGateState's refuse-once-settled guard is for gate_state.
+    dispatchRuns.stampGateState(
+      home || cfg.userConfigHome(),
+      item.run_id,
+      {
+        gate_head: (gateResult && gateResult.head) || null,
+        gate_base: (gateResult && gateResult.base) || null,
+        gate_trusted_sha: (gateResult && gateResult.trusted_sha) || null,
+        gate_factory_digest: (factory && factory.definition && factory.definition.factory && factory.definition.factory.digest) || null,
+        ...(intResult && intResult.landed_sha ? { gate_landed_sha: intResult.landed_sha } : {}),
+        ...(out.attestation ? { gate_attestation: out.attestation } : {}),
+      },
+      { force: true }
+    );
   } catch {
     /* fail-soft: the run record is bookkeeping, the attestation node is the record */
   }

@@ -181,3 +181,77 @@ test("the PR body carries the attestation between markers, and extractPrAttestat
   assert.strictEqual(attestation.extractPrAttestation(`${attestation.PR_BEGIN}\n\`\`\`json\n{not json\n\`\`\`\n${attestation.PR_END}`), null);
   assert.strictEqual(attestation.extractPrAttestation(`${attestation.PR_BEGIN}\n\`\`\`json\n{"schema":"other/1"}\n\`\`\`\n${attestation.PR_END}`), null);
 });
+
+// ---------------------------------------- head consistency (review findings 1 and 3) --
+test("an attestation whose steps did not all judge the subject commit is NOT allPassed — and an unknown commit never passes", () => {
+  const other = "head9999999999999999999999999999999999999";
+  const gate = gateResult();
+  gate.gates[0].head = other; // gate A passed at an earlier head; a fix cycle moved HEAD before gate B
+  const att = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate, integration: null, now: () => 1_700_000_005_000 });
+  assert.strictEqual(att.gate.state, "passed");
+  assert.strictEqual(att.gate.head_consistent, false);
+  assert.strictEqual(att.gate.allPassed, false, "a pass at a head other than the subject commit is not a pass for the subject commit");
+  assert.strictEqual(att.passed, false);
+  const node = attestation.buildAttestationNode({ item: ITEM, factory: FACTORY, gate, integration: null, now: () => 1_700_000_005_000 });
+  assert.match(node.markdown, /gates passed but not all at the subject commit/);
+
+  const unknown = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult({ head: null, gates: gateResult().gates.map((s) => ({ ...s, head: null })) }), integration: null, now: () => 1_700_000_005_000 });
+  assert.strictEqual(unknown.subject.commit, null);
+  assert.strictEqual(unknown.gate.allPassed, false, "no commit, no attestation of it");
+  assert.strictEqual(unknown.passed, false);
+});
+
+test("an integration head that is not the gated head fails the attestation even when the stage reports passed", () => {
+  const att = attestation.buildAttestationObject({
+    item: ITEM, factory: FACTORY, gate: gateResult(),
+    integration: { mode: "local", state: "passed", head: "otherhead", gated_head: HEAD, landed_sha: "landed", facts: [] },
+    now: () => 1_700_000_005_000,
+  });
+  assert.strictEqual(att.integration.head_matches_gated, false);
+  assert.strictEqual(att.gate.allPassed, true);
+  assert.strictEqual(att.passed, false);
+  // A stage that RE-GATED a moved head reports that head as gated_head — equality is against it.
+  const regated = attestation.buildAttestationObject({
+    item: ITEM, factory: FACTORY, gate: gateResult({ head: "movedhead", gates: gateResult().gates.map((s) => ({ ...s, head: "movedhead" })) }),
+    integration: { mode: "local", state: "passed", head: "movedhead", gated_head: "movedhead", landed_sha: "landed", facts: [] },
+    now: () => 1_700_000_005_000,
+  });
+  assert.strictEqual(regated.passed, true);
+  assert.strictEqual(regated.subject.commit, "movedhead");
+});
+
+// ------------------------------------------------ the node body cap (review finding 4) --
+// A large factory's attestation used to be byte-truncated AFTER serialization,
+// leaving a cut JSON block no validator can parse. The rendering now steps
+// down (pretty -> compact -> thinned) until it fits; the JSON is always whole.
+test("a large factory's attestation fits the node body cap with WHOLE JSON — thinned, never cut", () => {
+  const gateRunner = require("../lib/shell/gate-runner.js");
+  const big = factoryOf({
+    factory: "big", trusted_ref: "main",
+    gates: Array.from({ length: 60 }, (_, i) => ({ id: `gate-number-${i}-with-a-long-name`, kind: "command", command: `npm run suite-${i} -- --with --several --flags` })),
+  });
+  const steps = big.gates.map((g, i) => ({
+    gate: g.id, kind: g.kind, verdict: "passed", detail: `\`${g.command}\` passed against main's copy of the protected paths, with a long detail line ${"x".repeat(80)}`,
+    fact: `art-gate-${g.id.slice(0, 24)}-demo-runabcde-${String(i).padStart(8, "0")}`, escalated_to: null, source: "inline", digest: big.definition.gates[i].digest, revision: "f00d",
+    head: HEAD, base: "basesha", cycles: 1, started_at: new Date(1_700_000_000_000 + i * 1000).toISOString(), finished_at: new Date(1_700_000_000_000 + i * 1000 + 500).toISOString(), duration_ms: 500,
+  }));
+  const gate = { state: "passed", reason: "60 gate(s) passed", gates: steps, facts: steps.map((s) => s.fact), head: HEAD, base: "basesha", trusted_ref: "main", trusted_sha: "trustsha", branch: "task-demo", definition: big.definition };
+  const node = attestation.buildAttestationNode({ item: ITEM, factory: big, gate, integration: null, now: () => 1_700_000_100_000 });
+  assert.ok(Buffer.byteLength(node.markdown, "utf8") <= gateRunner.NODE_BODY_CAP_BYTES - 512, `the node body is within the cap (${Buffer.byteLength(node.markdown, "utf8")} bytes)`);
+  const block = /```json\n([\s\S]*?)\n```/.exec(node.markdown);
+  assert.ok(block, "the JSON block is intact");
+  const parsed = JSON.parse(block[1]);
+  assert.strictEqual(parsed.schema, attestation.SCHEMA);
+  assert.strictEqual(parsed.passed, true);
+  assert.strictEqual(parsed.subject.commit, HEAD);
+  assert.strictEqual(parsed.gate.allPassed, true);
+  assert.strictEqual(parsed.configIntegrity.factory.digest, big.definition.factory.digest);
+  assert.ok(parsed.gate.steps.length === 60 || parsed.gate.steps_elided === 60, "the steps are carried or their count is");
+  assert.match(node.markdown, /This is an attestation, not a resolution/, "the trailing prose survived — nothing was cut");
+  // The full object is untouched: the node thins only what it renders.
+  assert.strictEqual(node.attestation.gate.steps.length, 60);
+  assert.strictEqual(node.attestation.gate.steps[0].detail.length > 80, true);
+  // A small factory still renders the pretty, complete JSON.
+  const small = attestation.buildAttestationNode({ item: ITEM, factory: FACTORY, gate: gateResult(), integration: null, now: () => 1_700_000_100_000 });
+  assert.match(small.markdown, /"schema": "spor\.attestation\/1"/, "pretty-printed when it fits");
+});

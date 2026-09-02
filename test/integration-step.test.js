@@ -1633,3 +1633,174 @@ test("runIntegrationStage passes the factory's integration mode through to build
   assert.strictEqual(seen[0].targetRef, "origin/main");
   assert.ok(res);
 });
+
+// ---------------------------------------------- re-gating a moved head (task-spor-factory-gate-attestation, review finding 2) --
+// The entry check refuses a head the gates never judged; the SAME rule must
+// hold after the stage's OWN fix cycle commits new work. The moved head is
+// handed back to the gate pipeline through `deps.regate`, and only a pass at
+// exactly that head lets the stage go on to land it.
+test("a fix cycle that moves the head is RE-GATED before the retried candidate can land — a pass at the moved head advances gated_head", async () => {
+  const heads = ["head-v1", "head-v2"];
+  let reads = 0;
+  const regates = [];
+  const { deps, seen } = integrationFakes({
+    build: (args) => (args.head === "head-v1" ? { ok: false, conflict: true, reason: "merging onto main conflicts" } : { ok: true, dir: "/tmp/candidate", sha: "candidatesha", expectedSha: "expected2" }),
+  });
+  deps.changedTree = async () => ({ ok: true, top: "/repo", head: heads[Math.min(reads++, heads.length - 1)], cwd: "/repo/wt" });
+  deps.regate = async (args) => {
+    regates.push(args);
+    return { state: "passed", head: args.head, gates: [], facts: ["art-gate-review-regated"] };
+  };
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps, gatedHead: "head-v1" });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.deepStrictEqual(regates.map((r) => [r.head, r.gatedHead]), [["head-v2", "head-v1"]], "the moved head was re-gated once, against the head the gates had judged");
+  assert.strictEqual(res.gated_head, "head-v2", "the pass at the moved head is what the landing is now bound to");
+  assert.strictEqual(res.head_matches_gated, true);
+  assert.strictEqual(seen.lands, 1);
+  assert.strictEqual(seen.fixes.length, 1);
+  const fact = seen.facts[seen.facts.length - 1].markdown;
+  assert.match(fact, /Integrated commit: `head-v2` \(the head the gates judged\)/, "the merge fact names the RE-GATED head as the judged one");
+});
+
+test("a re-gate that FAILS at the moved head settles the stage failed — nothing lands, and the re-gate's own escalation stands in for the stage's", async () => {
+  const heads = ["head-v1", "head-v2"];
+  let reads = 0;
+  const { deps, seen } = integrationFakes({ build: [{ ok: false, conflict: true, reason: "merging onto main conflicts" }, { ok: true, dir: "/tmp/candidate", sha: "candidatesha", expectedSha: "expected2" }] });
+  deps.changedTree = async () => ({ ok: true, top: "/repo", head: heads[Math.min(reads++, heads.length - 1)], cwd: "/repo/wt" });
+  deps.regate = async () => ({ state: "failed", reason: "gate 'review' failed: still broken", head: "head-v2", escalated_to: "task-gate-review" });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps, gatedHead: "head-v1" });
+  assert.strictEqual(res.state, "failed");
+  assert.match(res.reason, /re-gating that head failed — gate 'review' failed: still broken/);
+  assert.strictEqual(seen.lands, 0, "an un-gated head never lands");
+  assert.strictEqual(seen.builds, 1, "no second candidate is built for a head nothing passed");
+  assert.strictEqual(seen.escalations.length, 0, "the re-gate already filed the person's item — no second escalation");
+  assert.strictEqual(res.escalated_to, "task-gate-review");
+  assert.strictEqual(res.gated_head, "head-v1", "gated_head never advanced to a head that did not pass");
+  assert.strictEqual(res.head_matches_gated, false);
+});
+
+test("a re-gate that passes at a DIFFERENT head than the moved one is not a pass for the moved head", async () => {
+  const heads = ["head-v1", "head-v2"];
+  let reads = 0;
+  const { deps, seen } = integrationFakes({ build: [{ ok: false, conflict: true, reason: "conflicts" }, { ok: true, dir: "/tmp/candidate", sha: "candidatesha", expectedSha: "expected2" }] });
+  deps.changedTree = async () => ({ ok: true, top: "/repo", head: heads[Math.min(reads++, heads.length - 1)], cwd: "/repo/wt" });
+  deps.regate = async () => ({ state: "passed", head: "head-v3", gates: [], facts: [] });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps, gatedHead: "head-v1" });
+  assert.strictEqual(res.state, "failed");
+  assert.match(res.reason, /the re-gate judged `head-v3`, not the moved one/);
+  assert.strictEqual(seen.lands, 0);
+});
+
+test("with no re-gate door wired, a moved head fails the stage closed rather than landing un-gated", async () => {
+  const heads = ["head-v1", "head-v2"];
+  let reads = 0;
+  const { deps, seen } = integrationFakes({ build: [{ ok: false, conflict: true, reason: "conflicts" }, { ok: true, dir: "/tmp/candidate", sha: "candidatesha", expectedSha: "expected2" }] });
+  deps.changedTree = async () => ({ ok: true, top: "/repo", head: heads[Math.min(reads++, heads.length - 1)], cwd: "/repo/wt" });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps, gatedHead: "head-v1" });
+  assert.strictEqual(res.state, "failed");
+  assert.match(res.reason, /no way to re-gate the moved head/);
+  assert.strictEqual(seen.lands, 0);
+  assert.strictEqual(seen.escalations.length, 1, "the stage files the person's item itself here");
+});
+
+// The bin/spor.js wiring: runGateAndIntegration hands the stage a `regate`
+// that re-runs the REAL pipeline, and the attestation/result carry the
+// pipeline's verdict AS IT STANDS after the re-gate — plus the run record is
+// SETTLED before the attestation node exists (review finding 5).
+test("runGateAndIntegration settles the run record BEFORE writing the attestation, and the attestation names the settled verdict", async () => {
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-settle-first-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  fs.writeFileSync(path.join(nodes, "task-settle.md"), "---\nid: task-settle\ntype: task\ntitle: Settle first\nsummary: A work item whose gate pipeline must settle its run record before any attestation is written.\nstatus: done\ndate: 2026-08-26\n---\n\nBody.\n");
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const repo = integrationRepo();
+  git(repo, "checkout", "-q", "branch");
+  const entry = { node_id: "task-settle", run_id: "11111111-2222-3333-4444-000000000077", attempt: 0 };
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, entry.run_id).record, { run_id: entry.run_id, node_id: entry.node_id, state: "done", cwd: repo, created_at: new Date().toISOString() });
+  const factory = {
+    id: "factory-settle", trustedRef: "main", protectedPaths: [], riskClasses: {}, testLaneProfile: null, integration: null,
+    gates: [{ id: "acceptance", kind: "command", command: "true", timeoutMs: 60000, cycles: 0, source: "inline", risk: [] }],
+    definition: { factory: { id: "factory-settle", revision: null, digest: "sha256:0000" }, gates: [{ id: "acceptance", source: "inline", revision: null, digest: "sha256:1111" }] },
+  };
+  // Observe the ORDER: the moment the attestation file appears, what does the
+  // run record say? A watcher on the nodes dir reads the record on creation.
+  const seenAtWrite = [];
+  const origWrite = fs.writeFileSync;
+  const recordPath = dispatchRuns.runPaths(home, entry.run_id).record;
+  fs.writeFileSync = function (file, ...rest) {
+    if (typeof file === "string" && path.basename(file).startsWith("art-attest-")) {
+      seenAtWrite.push(JSON.parse(origWrite === fs.writeFileSync ? "{}" : fs.readFileSync(recordPath, "utf8")).gate_state || null);
+    }
+    return origWrite.call(fs, file, ...rest);
+  };
+  let res;
+  try {
+    res = await sporCli.runGateAndIntegration(cfg, entry, { cwd: repo, run_id: entry.run_id }, {
+      factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home, stopping: () => false,
+    });
+  } finally {
+    fs.writeFileSync = origWrite;
+  }
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.ok(res.attestation, "an attestation was written");
+  assert.ok(seenAtWrite.length >= 1, "the attestation node was written through the observed door");
+  assert.ok(seenAtWrite.every((st) => st === "passed"), `the run record already read the settled verdict when the attestation node was written (saw ${JSON.stringify(seenAtWrite)})`);
+  const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  assert.strictEqual(record.gate_state, "passed");
+  assert.strictEqual(record.gate_attestation, res.attestation);
+  assert.strictEqual(record.gate_head, res.head);
+  const md = fs.readFileSync(path.join(nodes, `${res.attestation}.md`), "utf8");
+  const att = JSON.parse(/```json\n([\s\S]*?)\n```/.exec(md)[1]);
+  assert.strictEqual(att.passed, true);
+  assert.strictEqual(att.subject.commit, git(repo, "rev-parse", "HEAD").trim());
+});
+
+// The REMOTE door: `if_exists: skip` reports the id existed, not that this
+// fact landed. The node is read back and compared; a different fact under the
+// same id is a collision to refuse, never evidence to adopt.
+test("writeGateNode (remote): a skipped write is compared against the existing node — same fact adopts, different fact refuses", async () => {
+  const http = require("node:http");
+  const sporCli = require("../bin/spor.js");
+  const { loadConfig } = require("../lib/config.js");
+  const stored = new Map();
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
+      if (req.method === "POST" && req.url === "/v1/nodes") {
+        const node = JSON.parse(body).nodes[0].node;
+        const id = /^id: (.+)$/m.exec(node)[1];
+        if (stored.has(id)) return j(200, { results: [{ status: "skipped", id }] });
+        // The server stamps what it stamps on write.
+        stored.set(id, node.replace(/^date: (.+)$/m, "date: 2026-09-01\nauthor: Someone Else <else@example.com>\nauthored_via: rest"));
+        return j(200, { results: [{ status: "created", id }] });
+      }
+      const m = /^\/v1\/nodes\/([^/?]+)$/.exec(req.url);
+      if (req.method === "GET" && m) {
+        const id = decodeURIComponent(m[1]);
+        return stored.has(id) ? j(200, { id, raw: stored.get(id) }) : j(404, { error: { code: "not_found" } });
+      }
+      return j(404, { error: { code: "not_found" } });
+    });
+  });
+  await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+  try {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-remote-skip-"));
+    const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: `http://127.0.0.1:${srv.address().port}`, SPOR_TOKEN: "t" } });
+    const node = (summary, date = "2026-08-26") => `---\nid: art-gate-demo-z-abcdef12\ntype: artifact\ntitle: Gate demo\nsummary: ${summary}\ndate: ${date}\ngate_head: abc123\nedges:\n  - {type: relates-to, to: task-demo}\n---\n\nThe demo gate passed.\n`;
+    const first = await sporCli.writeGateNode(cfg, "art-gate-demo-z-abcdef12", node("The demo gate passed on the change under judgement."));
+    assert.deepStrictEqual(first, { ok: true, id: "art-gate-demo-z-abcdef12" });
+    const again = await sporCli.writeGateNode(cfg, "art-gate-demo-z-abcdef12", node("The demo gate passed on the change under judgement.", "2026-08-27"));
+    assert.strictEqual(again.ok, true, `the same fact (modulo the server's own stamps and the day) is this write landing: ${again.reason}`);
+    assert.strictEqual(again.existing, true);
+    const other = await sporCli.writeGateNode(cfg, "art-gate-demo-z-abcdef12", node("The demo gate FAILED on the change under judgement."));
+    assert.strictEqual(other.ok, false);
+    assert.match(other.reason, /already exists with different content/);
+  } finally {
+    srv.close();
+  }
+});

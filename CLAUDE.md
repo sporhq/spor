@@ -637,16 +637,27 @@ not retire). Every fact is COMMIT-BOUND and DEFINITION-BOUND
 frontmatter plus the trusted ref's sha and branch in the body, and the
 `sha256:` digest (canonical JSON of the normalized definition,
 `gates.definitionDigest`) and node revision of the factory and gate that judged
-it (`factory.definition`, stamped by `loadFactoryDefinition`). The integration
-stage REFUSES (settled failed, never a fix cycle — a fix commits and so can
-never restore equality) when its own re-read of the tree finds a head other than
-the one the last passing gate judged (`gatedHead`), and `runGateAndIntegration`
-writes ONE `art-attest-<stem>-<run>-<hash>` artifact per run (`schema:
-spor.attestation/1` — subject/factory/gate/integration/configIntegrity/timing/
-environment, `lib/shell/attestation.js`) linking every fact, stamping
-`gate_head`/`gate_attestation`/… on the run record; in `propose` mode the same
+it (`factory.definition`, stamped by `loadFactoryDefinition`). Every step must
+judge the SAME head: a fix cycle that moves the head restarts the pipeline from
+gate 0 (a gate already passed at the current head stands; cycle caps are
+cumulative across restarts; fact ids fold the judged head in, so the superseded
+fact keeps its own id), and an unreadable change fails every gate kind closed.
+The integration stage REFUSES (settled failed, never a fix cycle — a fix
+commits and so can never restore equality) when its own re-read of the tree
+finds a head other than the one the last passing gate judged (`gatedHead`); its
+OWN fix cycles move the head by construction, so after each one the moved head
+is handed back through `deps.regate` (re-running the real pipeline) and only a
+pass at exactly that head lets it land. `runGateAndIntegration` SETTLES the run
+record first, then writes ONE `art-attest-<stem>-<run>-<hash>` artifact per run
+(`schema: spor.attestation/1` — subject/factory/gate/integration/
+configIntegrity/timing/environment, `lib/shell/attestation.js`; `allPassed`
+also checks every step bound to the subject commit; the JSON is thinned to fit
+the 8KB node cap, never byte-cut) linking every fact, stamping
+`gate_head`/`gate_attestation`/… on the record; in `propose` mode the same
 attestation rides in the PR body between `<!-- spor-attestation:begin/end -->`
-markers so a repo's CI can validate instead of re-run. Only a CLAIM is gated (`shouldGate`: a verified `resolved`, or an
+markers so a repo's CI can validate instead of re-run. Every gate-minted node is
+written `if_exists: skip` in both modes with a read-back content comparison on
+skip — a different node under the same id is refused, never adopted. Only a CLAIM is gated (`shouldGate`: a verified `resolved`, or an
 UNENFORCED `reported` where nothing could check it), the gated item HOLDS its
 slot until the pipeline settles (and its node is out of candidate selection for
 EVERY worker on the box while it does, so a free slot never re-dispatches what a

@@ -2455,3 +2455,105 @@ test("prepareGateTree runs the caller's teardown first thing in cleanup, and a t
   assert.ok(!fs.existsSync(tree.dir), "the tree is gone despite the throwing teardown");
   assert.strictEqual(git(repo, "worktree", "list").trim().split("\n").length, 1);
 });
+
+// ------------------------------------------------ head consistency across fix cycles --
+// (task-spor-factory-gate-attestation, review findings 1, 3 and 6)
+
+// Gate A passes at H1; gate B's fix cycle commits H2 and B passes there. A
+// never judged H2 — so the pipeline goes back to A, re-runs it at H2, and the
+// result's every step binds to the SAME head. The H1 fact stays on the graph
+// (a record of what was judged), under a different id than the H2 fact.
+test("a fix cycle that moves the head sends the pipeline back to the first gate, and every step then binds to the moved head", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }, { id: "review", kind: "agent-review", profile: "profile-review", cycles: 2 }] });
+  const H1 = "head1000000000000000000000000000000000001";
+  const H2 = "head2000000000000000000000000000000000002";
+  let head = H1;
+  let call = 0;
+  const { deps, seen } = fakes({
+    review: () => {
+      call += 1;
+      return { ok: true, text: call === 1 ? '```json\n{"verdict":"changes_requested","findings":[{"summary":"x"}]}\n```' : '```json\n{"verdict":"pass"}\n```' };
+    },
+    fix: () => {
+      head = H2; // the fix cycle committed
+      return { ok: true };
+    },
+  });
+  deps.changedPaths = async () => ({ ok: true, paths: ["lib/x.js"], head, base: "basesha", trustedRef: "main", trustedSha: "trustsha", branch: "task-demo" });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.strictEqual(res.head, H2);
+  assert.deepStrictEqual(res.gates.map((g) => [g.gate, g.verdict, g.head]), [["acceptance", "passed", H2], ["review", "passed", H2]], "every step in the result judged the moved head");
+  assert.strictEqual(seen.suites.length, 2, "the acceptance suite ran again at the moved head");
+  assert.strictEqual(seen.reviews.length, 2, "the review that already passed at H2 was NOT re-dispatched");
+  assert.strictEqual(seen.fixes.length, 1);
+  // Three facts: acceptance@H1, review@H2, acceptance@H2 — distinct ids.
+  assert.strictEqual(seen.facts.length, 3);
+  assert.strictEqual(new Set(seen.facts.map((f) => f.id)).size, 3, "the re-run's fact does not collide with the H1 fact's id");
+  assert.strictEqual(seen.facts.filter((f) => /gate_head: head1/.test(f.markdown)).length, 1);
+  assert.strictEqual(seen.facts.filter((f) => /gate_head: head2/.test(f.markdown)).length, 2);
+  assert.strictEqual(res.facts.length, 3, "the pipeline hands back every fact it minted, the superseded one included");
+  assert.strictEqual(gateRunner.gateFactId("acceptance", "task-demo", "run-abcdef12", 0, H1) !== gateRunner.gateFactId("acceptance", "task-demo", "run-abcdef12", 0, H2), true);
+});
+
+// The restart is bounded: fix cycles are charged against each gate's cap
+// CUMULATIVELY, so a gate that keeps failing after a restart escalates at its
+// declared cap rather than getting a fresh budget every time the head moves.
+test("fix cycles are charged cumulatively across restarts — a restarted gate does not get a fresh budget", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 1 }, { id: "second", kind: "agent-review", profile: "profile-review", cycles: 1 }] });
+  let n = 0;
+  let head = "head-a";
+  const { deps, seen } = fakes({
+    // review#1 changes_requested -> fix (head moves) -> review#2 pass; then
+    // `second` fails -> fix (head moves) -> pass; restart: review at the
+    // third head fails again — its ONE cycle is spent, so it escalates.
+    review: ({ gate }) => {
+      n += 1;
+      const pass = '```json\n{"verdict":"pass"}\n```';
+      const fail = '```json\n{"verdict":"changes_requested","findings":[{"summary":"x"}]}\n```';
+      if (gate.id === "review") return { ok: true, text: n === 2 ? pass : fail };
+      return { ok: true, text: n === 3 ? fail : pass };
+    },
+    fix: () => {
+      head = `${head}+`;
+      return { ok: true };
+    },
+  });
+  deps.changedPaths = async () => ({ ok: true, paths: ["lib/x.js"], head, base: "b", trustedRef: "main", trustedSha: "t", branch: "task-demo" });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.match(res.reason, /gate 'review' failed/);
+  assert.strictEqual(seen.fixes.filter((f) => f.gate === "review").length, 1, "review's single cycle was spent before the restart and not replenished by it");
+  assert.strictEqual(seen.escalations.length, 1);
+});
+
+// A review gate with nothing readable to review is a failure like the command
+// and human gates already were — never a passing fact with no head.
+test("an agent-review gate whose change cannot be read FAILS closed — no reviewer is dispatched, no fix cycle", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 2 }] });
+  const { deps, seen } = fakes({ changed: null });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.match(res.reason, /unreadable tree/);
+  assert.strictEqual(seen.reviews.length, 0, "nothing was dispatched at a change nobody could read");
+  assert.strictEqual(seen.fixes.length, 0, "unretried: a fix cycle does not make an unreadable tree readable");
+  assert.strictEqual(seen.escalations.length, 1);
+  assert.strictEqual(res.head, null);
+  assert.match(seen.facts[0].markdown, /Judged commit: unknown/);
+});
+
+// The status surface must say what the run record says: with an integration
+// stage folded in, the result's `head` is the stage's re-read head and the
+// gated head rides as `gate_head`.
+test("work --status records the GATED head, not the integration stage's head, when both are present", async () => {
+  const { deps, control } = loopHarness({
+    queue: [{ id: "task-a" }],
+    gate: () => ({ state: "passed", reason: "landed", head: "integration-head", gate_head: "gated-head", facts: [] }),
+  });
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, max: 1 }, deps, control });
+  assert.strictEqual(status.recent[0].gate, "passed");
+  assert.strictEqual(status.recent[0].gate_head, "gated-head");
+  const { deps: d2, control: c2 } = loopHarness({ queue: [{ id: "task-b" }], gate: () => ({ state: "passed", reason: "ok", head: "only-head", facts: [] }) });
+  const s2 = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, max: 1 }, deps: d2, control: c2 });
+  assert.strictEqual(s2.recent[0].gate_head, "only-head", "with no stage, the pipeline's own head is the gated head");
+});

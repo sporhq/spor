@@ -1282,9 +1282,18 @@ same evidence chain (task-spor-factory-gate-attestation), in four pieces:
    the branch in the body ("Judged commit: …"). An unreadable change says
    "Judged commit: unknown" rather than inventing one. The pipeline's result
    hands the same chain back (`head`, `base`, `trusted_ref`, `trusted_sha`,
-   `branch`) and each step carries the head IT judged — after a fix cycle the
-   later gates judge a newer head than the earlier ones did, and the steps say
-   so rather than pretending one head.
+   `branch`) and each step carries the head IT judged. **Every step judges the
+   same head**: a fix cycle that moves the head (it committed) sends the
+   pipeline back to the FIRST gate, and each earlier gate is re-run against the
+   moved head — a gate whose recorded pass already judged the current head
+   stands (a review is never re-dispatched at a head it approved), fix cycles
+   are charged against each gate's cap cumulatively across restarts (so the
+   whole pipeline runs at most the sum of the caps), and the superseded fact
+   stays on the graph under its own id: fact ids are commit-bound too
+   (`gateFactId` folds the judged head into the hash), so gate A at H1 and gate
+   A at H2 are two facts, never one adopting the other. An unreadable change
+   fails EVERY gate kind closed — command, human, and agent-review alike — so
+   no passing fact is ever minted with no head to bind it to.
 2. **Every gate fact is definition-bound.** `parseFactory` attaches
    `definition` provenance to the parsed factory: a `sha256:` digest of the
    normalized factory (canonical JSON — sorted keys, no whitespace — so
@@ -1305,10 +1314,19 @@ same evidence chain (task-spor-factory-gate-attestation), in four pieces:
    head no gate has judged. This is deliberately NOT a fix cycle: a fix cycle
    commits, so it produces a new head by construction and can never restore
    the equality; only `spor work --regate <run>` can (the refusal names it).
-   The stage's OWN fix cycles (a conflict, a red candidate suite) legitimately
-   move the head afterwards, and the `art-merge-*` fact records both heads
-   ("Integrated commit: `…` — the gates judged `…`") plus the landed sha
-   (`gate_head:`/`landed_sha:` frontmatter) so that is visible, never hidden.
+   The stage's OWN fix cycles (a conflict, a red candidate suite, a failed
+   landing) move the head afterwards by construction, and the same rule holds
+   there: after every fix cycle the stage re-reads the tree and, when the head
+   is no longer `gatedHead`, hands it back to the gate pipeline through
+   `deps.regate` (wired by `runGateAndIntegration` to re-run the REAL pipeline)
+   — only a PASS at exactly that head advances `gatedHead` and lets the
+   rebuilt candidate be judged and landed; a re-gate that fails settles the
+   stage `failed` with the re-gate's own escalation standing in (no second
+   person's item for one refusal), a re-gate that passed at some other head is
+   not a pass for the moved one, and a wiring with no re-gate door fails
+   closed. The `art-merge-*` fact records the head it landed and the head the
+   gates judged ("Integrated commit: `…` (the head the gates judged)") plus the
+   landed sha (`gate_head:`/`landed_sha:` frontmatter).
 4. **One attestation artifact per run** — `art-attest-<stem>-<short-run[-aN]>-
    <hash>`, deterministic and idempotent like every gate-minted node (a re-gate
    attests separately by attempt), `relates-to` the work item and every
@@ -1321,15 +1339,33 @@ same evidence chain (task-spor-factory-gate-attestation), in four pieces:
    gated_head, head_matches_gated, landed_sha, candidate, proposal, timing} or
    null, `configIntegrity` {factory, gates[], trusted_ref, trusted_sha,
    protected_paths}, `timing`, `environment` {spor_version, worker, host,
-   platform, node, mode}. `passed` is true only when every gate passed AND the
-   integration (if any) landed or parked. `subject.commit` is the head the
-   STAGE saw when one ran (what would have landed), else the gated head — so a
-   validator comparing it against a PR head sees the truth when they differ.
-   The run record is stamped alongside (`gate_head`, `gate_base`,
-   `gate_trusted_sha`, `gate_factory_digest`, `gate_landed_sha`,
-   `gate_attestation`), read back by `spor runs` ("gated head:", "attested:")
-   and `spor work --status`. Fail-soft like every fact write: the verdict is
-   the enforcement, the attestation is its record.
+   platform, node, mode}. `gate.allPassed` is true only when every step passed
+   AND every step judged the gated head AND that head is known
+   (`gate.head_consistent` — checked here, not assumed from the runner);
+   `passed` additionally needs the integration (if any) landed or parked with
+   `head_matches_gated` not false. `subject.commit` is the head the STAGE saw
+   when one ran (what would have landed), else the gated head — so a validator
+   comparing it against a PR head sees the truth when they differ. The node
+   body is capped (the REST door's 8KB) but the JSON is NEVER cut: the
+   rendering steps down — pretty, compact, free-text dropped, steps thinned to
+   id/kind/verdict/head/digest/fact (`abridged` says so), fewer linked edges,
+   and at the floor the step list replaced by its count — so every rung is
+   whole JSON carrying what a validator checks; the full object still rides
+   the run's in-process result. ORDER: the run record is settled FIRST
+   (`gate_state` and the verdict fields, read-back verified) and the
+   attestation node written second, so no window holds a graph artifact
+   claiming a verdict the record does not; the evidence fields (`gate_head`,
+   `gate_base`, `gate_trusted_sha`, `gate_factory_digest`, `gate_landed_sha`,
+   `gate_attestation`) are then stamped with force onto the settled record,
+   read back by `spor runs` ("gated head:", "attested:") and `spor work
+   --status` (whose `gate_head` is the GATED head, not the stage's). And every
+   gate-minted node — fact, escalation, approval, attestation — is written
+   `if_exists: skip` in BOTH modes with the same rule: a skip means the id
+   exists, not that this write landed, so the existing node is read back and
+   compared (frontmatter minus the server's own stamps and the day, plus the
+   body); a different node under the same id is refused, never adopted as
+   this run's evidence. Fail-soft like every fact write: the verdict is the
+   enforcement, the attestation is its record.
 
 **In `propose` mode the PR body carries the attestation.** `proposeIntegrationPR`
 writes `renderPrBody`'s text — the step list, the candidate suite that just
