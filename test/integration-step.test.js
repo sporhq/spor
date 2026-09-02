@@ -1876,7 +1876,7 @@ test("refreshProposalAttestation: the PR body is replaced with the bound attesta
   const att = attestation.buildAttestationObject({ item, factory, gate: { state: "passed", gates: [], facts: [], head: "h1" }, integration: intResult, signing: { key: "k", keyId: "ci" } });
   const edits = [];
   const logs = [];
-  const ok = await sporCli.refreshProposalAttestation(cfg, { item, factory, intResult, attestationObject: att, home, log: (m) => logs.push(m), settledAt, cwd: null, editBody: (a) => { edits.push(a); return { ok: true }; } });
+  const ok = await sporCli.refreshProposalAttestation(cfg, { item, factory, intResult, attestationObject: att, home, log: (m) => logs.push(m), settleToken: settledAt, cwd: null, editBody: (a) => { edits.push(a); return { ok: true }; } });
   assert.strictEqual(ok.ok, true);
   assert.deepStrictEqual([edits[0].repo, edits[0].number], ["demo/repo", 7]);
   const back = attestation.extractPrAttestation(edits[0].body);
@@ -1889,7 +1889,7 @@ test("refreshProposalAttestation: the PR body is replaced with the bound attesta
   assert.strictEqual(rec.gate_proposal_attestation_stale, false);
   assert.ok(logs.some((m) => /PR #7 now carries the bound attestation/.test(m)));
 
-  const bad = await sporCli.refreshProposalAttestation(cfg, { item, factory, intResult, attestationObject: att, home, log: (m) => logs.push(m), settledAt, editBody: () => ({ ok: false, reason: "gh: HTTP 502" }) });
+  const bad = await sporCli.refreshProposalAttestation(cfg, { item, factory, intResult, attestationObject: att, home, log: (m) => logs.push(m), settleToken: settledAt, editBody: () => ({ ok: false, reason: "gh: HTTP 502" }) });
   assert.strictEqual(bad.ok, false);
   assert.strictEqual(bad.reason, "gh: HTTP 502");
   rec = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -1897,11 +1897,11 @@ test("refreshProposalAttestation: the PR body is replaced with the bound attesta
   assert.strictEqual(rec.gate_proposal_attestation_error, "gh: HTTP 502");
   assert.ok(logs.some((m) => /could NOT be refreshed/.test(m) && /validator will refuse/.test(m)));
   // A throwing editor is the same failure, not a crash.
-  const thrown = await sporCli.refreshProposalAttestation(cfg, { item, factory, intResult, attestationObject: att, home, settledAt, editBody: () => { throw new Error("boom"); } });
+  const thrown = await sporCli.refreshProposalAttestation(cfg, { item, factory, intResult, attestationObject: att, home, settleToken: settledAt, editBody: () => { throw new Error("boom"); } });
   assert.deepStrictEqual(thrown, { ok: false, reason: "boom" });
   // And the stamp is own-guarded: another settler's record is never touched.
   dispatchRuns.atomicJson(file, { run_id: runId, node_id: item.node_id, state: "done", gate_state: "failed", gate_at: "2026-09-02T13:00:00.000Z" });
-  await sporCli.refreshProposalAttestation(cfg, { item, factory, intResult, attestationObject: att, home, settledAt, editBody: () => ({ ok: true }) });
+  await sporCli.refreshProposalAttestation(cfg, { item, factory, intResult, attestationObject: att, home, settleToken: settledAt, editBody: () => ({ ok: true }) });
   rec = JSON.parse(fs.readFileSync(file, "utf8"));
   assert.strictEqual(rec.gate_proposal_attestation, undefined);
 });
@@ -2020,4 +2020,35 @@ test("writeGateNode (remote): a skipped write is compared against the existing n
   } finally {
     srv.close();
   }
+});
+
+// -- major finding 3 (cross-model review): the candidate-suite evidence rides
+// on the SETTLED integration result in every mode — the run's final,
+// graph-bound attestation is built from that result, not from the chain handed
+// to the PR opener at propose time.
+test("the settled integration result carries the candidate evidence in propose AND landing modes — the final attestation never loses it", async () => {
+  const propose = { ...FACTORY, integration: { ...FACTORY.integration, mode: "propose" } };
+  const { deps } = integrationFakes({
+    propose: () => ({ ok: true, number: 42, url: "https://github.com/demo/repo/pull/42", repo: "demo/repo", branch: "task-demo", targetRef: "main", detail: "opened PR #42" }),
+  });
+  const parked = await integrationRunner.runIntegrationStage({ item: ITEM, factory: propose, deps, gatedHead: "headsha" });
+  assert.strictEqual(parked.state, "parked");
+  assert.deepStrictEqual(parked.candidate, { base: "expected1", sha: "candidatesha", suite: "passed", command: "npm test" });
+  assert.strictEqual(parked.target_sha, "expected1");
+  const attestation = require("../lib/shell/attestation.js");
+  const gate = { state: "passed", gates: [{ gate: "acceptance", kind: "command", verdict: "passed", head: "headsha" }], facts: [], head: "headsha", definition: propose.definition };
+  const att = attestation.buildAttestationObject({ item: ITEM, factory: propose, gate, integration: parked });
+  assert.deepStrictEqual(att.integration.candidate, parked.candidate);
+  assert.deepStrictEqual(attestation.attestationCore(att).integration.candidate, parked.candidate, "and it is inside the bound core");
+
+  const { deps: landDeps } = integrationFakes({});
+  const landed = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps: landDeps, gatedHead: "headsha" });
+  assert.strictEqual(landed.state, "passed");
+  assert.deepStrictEqual(landed.candidate, { base: "expected1", sha: "candidatesha", suite: "passed", command: "npm test" });
+
+  // A candidate suite that FAILED is recorded as such on the settled result.
+  const { deps: badDeps } = integrationFakes({ suite: () => ({ ok: false, reason: "npm test exited 1", output: "1 failing" }) });
+  const failed = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps: badDeps, gatedHead: "headsha" });
+  assert.strictEqual(failed.state, "failed");
+  assert.strictEqual(failed.candidate && failed.candidate.suite, "failed");
 });

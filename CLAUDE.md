@@ -654,11 +654,18 @@ configIntegrity/timing/environment, `lib/shell/attestation.js`; `allPassed`
 also checks every step bound to the subject commit; the JSON is thinned to fit
 the 8KB node cap, never byte-cut) linking every fact, stamping
 `gate_head`/`gate_attestation`/… on the record — but ONLY when its own settle
-LANDED: a duplicate pipeline that lost the settle race writes no attestation
-and touches no evidence field (`superseded: true`), and the post-settle stamps
-go through `stampGateState`'s `own: <gate_at>` door, never `force`. Every
-attestation is BOUND — `digest` (sha256 over the canonical JSON of its core,
-which survives the node-body ladder via `steps_digest`/`gates_digest`) plus an
+LANDED: the settle is a LOCKED compare-and-swap (`stampGateState` takes a
+per-record `.lock`, O_EXCL, stale after 30s, and returns the record read back
+from disk) that mints a random `gate_settle_id`; a duplicate pipeline that lost
+the settle race writes no attestation and touches no evidence field
+(`superseded: true`, carrying the record's own verdict as `settled`, which is
+what the work loop publishes on `--status` — the loser's stays labeled
+`superseded_verdict`), and the post-settle stamps go through `stampGateState`'s
+`own: <gate_settle_id>` door, never `force`. Every attestation is BOUND —
+`digest` (sha256 over the canonical JSON of its core — subject, verdicts,
+config, and the integration stage's bound fields INCLUDING the candidate-suite
+evidence and proposal identity — which survives the node-body ladder via
+`steps_digest`/`gates_digest`) plus an
 HMAC-SHA256 `signature` when `attestation.signingKey` (`SPOR_ATTESTATION_KEY`,
 a secret stripped from repo `.spor.json`) is set — and the definition digests
 hash the runtime-effective definition only (gate `source` stripped, so inline

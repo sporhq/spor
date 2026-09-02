@@ -509,6 +509,7 @@ written only after the outcome dimension exists):
 | `gate_state` | string | `"running"` \| `"interrupted"` \| `"passed"` \| `"failed"` \| `"blocked"` — the last thing a gate pipeline said about this run. The three verdicts are SETTLED; the other two mean a pipeline started and never reported, which is what a later worker resumes from (§10.8) |
 | `gate_worker` | string | the worker id that last touched it |
 | `gate_at` | ISO 8601 | when that stamp was written |
+| `gate_settle_id` | string | the settler's random ownership nonce, minted with a settled verdict (§10.10); every evidence field stamped after the verdict lands only through it |
 | `gate_reason` | string | optional — the settled verdict's one-line reason |
 | `gate_fix_run_id` | string | optional — the run id of the most recent fix cycle this pipeline dispatched at the same node, stamped the moment it was dispatched (not when it finishes). If a stop lands while that fix cycle is still going, this field is what turns "the pipeline was abandoned" into "here is the run to go check" — a fix cycle's own dispatched run is detached and keeps going regardless (§10.7), and this is the only durable pointer to it. `spor runs`/`spor work --status` surface it. |
 | `gate_fix_at` | ISO 8601 | when `gate_fix_run_id` was stamped |
@@ -1362,16 +1363,30 @@ same evidence chain (task-spor-factory-gate-attestation), in four pieces:
    attestation node written second, so no window holds a graph artifact
    claiming a verdict the record does not. The evidence fields (`gate_head`,
    `gate_base`, `gate_trusted_sha`, `gate_factory_digest`, `gate_landed_sha`)
-   ride IN that settle stamp — one write, one writer — and the settle reports
-   whether it LANDED: when the settled-verdict guard yielded to an earlier
+   ride IN that settle stamp — one write, one writer — and the settle is a
+   **locked compare-and-swap**, not a read-modify-rename: `stampGateState`
+   takes a per-record `<record>.lock` (O_EXCL; a lock older than 30s is a
+   dead writer's corpse and is broken; a lock that cannot be taken within the
+   bounded wait is a stamp that did NOT land) around the read-guard-write, and
+   returns the record READ BACK FROM DISK after its write — never the
+   in-memory merge — so two pipelines for one run cannot both pass the
+   unsettled guard and both believe they own the verdict. The settle also
+   mints `gate_settle_id`, a random nonce (two settlers in the same
+   millisecond cannot share it the way they could share `gate_at`), and
+   reports whether it LANDED by that id: when the guard yielded to an earlier
    writer (a duplicate pipeline for the same run — a resumed orphan, a second
    adopter — settled first), this pipeline's verdict is not the record's, so
    it writes NO attestation and touches NO evidence field (its result carries
-   `superseded: true` and the log names the winner). `gate_attestation` is
-   stamped afterwards through the settler's OWN door (`stampGateState`'s
-   `own: <gate_at>` — lands only while the record still holds this
-   pipeline's verdict; `force` stays `--regate`'s door alone), so the graph
-   and the record can never describe two verdicts or two heads for one run.
+   `superseded: true` plus `settled` — the record's own verdict, head,
+   attestation and worker — and the log names the winner; the work loop then
+   PUBLISHES the record's verdict on `--status`, keeps the loser's under
+   `superseded_verdict`, stamps nothing for it, and cools the node by the
+   record's verdict). `gate_attestation` is stamped afterwards through the
+   settler's OWN door (`stampGateState`'s `own: <gate_settle_id>` — lands only
+   while the record still holds this pipeline's settle id, falling back to
+   `gate_at` only for a record settled without one; `force` stays
+   `--regate`'s door alone), so the graph and the record can never describe
+   two verdicts or two heads for one run.
    Read back by `spor runs` ("gated head:", "attested:") and `spor work
    --status` (whose `gate_head` is the GATED head, not the stage's). And every
    gate-minted node — fact, escalation, approval, attestation — is written
@@ -1387,7 +1402,13 @@ a key.** A PR body is mutable text its author can edit, so the JSON in it is
 not evidence by itself. `bindAttestation` stamps `digest` — sha256 over the
 canonical JSON of the attestation's bound core: subject, factory, per-step
 verdicts/heads/digests (through `gate.steps_digest`), the config lists
-(through `configIntegrity.gates_digest`), `passed`, `issued_at`, the artifact
+(through `configIntegrity.gates_digest`), the integration stage's bound
+fields — mode, strategy, state, target ref and sha, head, gated head, landed
+sha, the **candidate-suite evidence** (`candidate` {base, sha, suite,
+command}: a validator trusting a propose-mode PR is trusting "merge(target,
+head) was green under <command>", so that block is as tamper-evident as the
+verdicts) and the proposal's identity (`proposal` {number, repo, branch,
+url}) — `passed`, `issued_at`, the artifact
 `id`; free text and the box's host/worker are outside it, so the core survives
 every rung of the node-body ladder including the floor that elides the lists —
 and, when `attestation.signingKey` (`SPOR_ATTESTATION_KEY`; a secret, so

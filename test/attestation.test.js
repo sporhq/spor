@@ -378,3 +378,57 @@ test("attestation.signingKey is stripped from a repo .spor.json but resolves fro
   const viaUser = loadConfig({ cwd: repo, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
   assert.strictEqual(viaUser.get("attestation.signingKey"), "from-user-config");
 });
+
+// -- blocking finding 1 (cross-model review): the candidate-suite evidence is
+// part of the BOUND core — a validator trusting a propose-mode PR is trusting
+// "merge(target, head) was green under <command>", so that block must be as
+// tamper-evident as the verdicts.
+test("the bound core covers the integration candidate evidence and proposal identity — editing any of it fails the digest", () => {
+  const integration = {
+    state: "parked", mode: "propose", strategy: "merge", target_ref: "main", target_sha: "targetsha", head: HEAD, gated_head: HEAD, head_matches_gated: true,
+    candidate: { base: "targetsha", sha: "candsha", suite: "passed", command: "npm test" },
+    proposal: { number: 42, url: "https://github.com/demo/repo/pull/42", repo: "demo/repo", branch: "task-demo" },
+  };
+  const att = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), integration, signing: { key: "k", keyId: "ci" } });
+  assert.strictEqual(attestation.verifyAttestation(att, { key: "k" }).ok, true);
+  const core = attestation.attestationCore(att);
+  assert.deepStrictEqual(core.integration.candidate, { base: "targetsha", sha: "candsha", suite: "passed", command: "npm test" });
+  assert.deepStrictEqual(core.integration.proposal, { number: 42, repo: "demo/repo", branch: "task-demo", url: "https://github.com/demo/repo/pull/42" });
+  assert.strictEqual(core.integration.target_sha, "targetsha");
+  assert.strictEqual(core.integration.strategy, "merge");
+  const tampered = (mutate) => {
+    const copy = JSON.parse(JSON.stringify(att));
+    mutate(copy);
+    return attestation.verifyAttestation(copy, { key: "k" });
+  };
+  for (const [label, mutate] of [
+    ["suite verdict", (c) => { c.integration.candidate.suite = "failed"; }],
+    ["candidate command", (c) => { c.integration.candidate.command = "true"; }],
+    ["candidate base", (c) => { c.integration.candidate.base = "othersha"; }],
+    ["candidate sha", (c) => { c.integration.candidate.sha = "othersha"; }],
+    ["candidate block removed", (c) => { c.integration.candidate = null; }],
+    ["target sha", (c) => { c.integration.target_sha = "othersha"; }],
+    ["proposal number", (c) => { c.integration.proposal.number = 43; }],
+    ["proposal repo", (c) => { c.integration.proposal.repo = "evil/repo"; }],
+  ]) {
+    const v = tampered(mutate);
+    assert.strictEqual(v.ok, false, `${label}: a tampered copy must fail`);
+    assert.ok(v.checks.find((c) => c.check === "digest" && !c.ok), `${label}: the digest check catches it`);
+    assert.ok(v.checks.find((c) => c.check === "signature" && !c.ok), `${label}: and so does the signature`);
+  }
+  // ...and the node-body ladder's thinnest rung still carries the whole bound
+  // block, so a graph copy reproduces the digest its PR copy was bound to.
+  const big = factoryOf({
+    factory: "big", trusted_ref: "main",
+    gates: Array.from({ length: 40 }, (_, i) => ({ id: `g${i}`, kind: "command", command: `npm run t${i}` })),
+    integration: { target_ref: "main", mode: "propose", command: "npm test" },
+  });
+  const steps = big.gates.map((g, i) => ({ gate: g.id, kind: g.kind, verdict: "passed", detail: "x".repeat(200), fact: `art-gate-${g.id}-demo-runabcde-${String(i).padStart(8, "0")}`, source: "inline", digest: big.definition.gates[i].digest, head: HEAD, base: "b" }));
+  const node = attestation.buildAttestationNode({ item: ITEM, factory: big, gate: { state: "passed", gates: steps, facts: steps.map((s) => s.fact), head: HEAD, definition: big.definition }, integration, now: () => 1_700_000_100_000 });
+  const json = node.markdown.slice(node.markdown.indexOf("```json") + 7, node.markdown.lastIndexOf("```"));
+  const thinned = JSON.parse(json);
+  assert.ok(thinned.abridged, "the fixture is big enough to reach the thinned rung");
+  assert.deepStrictEqual(thinned.integration.candidate, integration.candidate);
+  assert.strictEqual(thinned.integration.proposal.number, 42);
+  assert.strictEqual(attestation.attestationDigest(thinned), node.attestation.digest, "the thinned graph copy reproduces the bound digest");
+});

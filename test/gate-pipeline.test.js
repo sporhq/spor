@@ -2557,3 +2557,105 @@ test("work --status records the GATED head, not the integration stage's head, wh
   const s2 = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, max: 1 }, deps: d2, control: c2 });
   assert.strictEqual(s2.recent[0].gate_head, "only-head", "with no stage, the pipeline's own head is the gated head");
 });
+
+// -- blocking finding 2 (cross-model review): settlement is a locked
+// compare-and-swap. Two pipelines for one run cannot both pass the
+// unsettled guard, and what a stamp returns is the record ON DISK after its
+// write — so "did my verdict land" is a disk fact, never a process's belief.
+test("stampGateState is a locked CAS: a held lock refuses the stamp, a stale lock is broken, and two settlers cannot both own the record", () => {
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-cas-"));
+  const runId = "11111111-2222-3333-4444-00000000cas0";
+  const paths = dispatchRuns.runPaths(home, runId);
+  const base = { run_id: runId, node_id: "task-x", state: "done", terminal_state: "resolved", terminal_enforced: true, gate_state: "running" };
+  dispatchRuns.atomicJson(paths.record, base);
+  const lock = dispatchRuns.recordLockPath(paths.record);
+
+  // Held by a LIVE writer: the stamp does not land and reports so (null).
+  fs.writeFileSync(lock, "4242\n");
+  assert.strictEqual(dispatchRuns.stampGateState(home, runId, { gate_state: "passed", gate_at: "t1" }, { lock: (file, fn, o) => dispatchRuns.withRecordLock(file, fn, { ...o, attempts: 3, waitMs: 1 }) }), null);
+  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_state, "running", "the record is untouched under a held lock");
+  assert.ok(fs.existsSync(lock), "and the holder's lock is left alone");
+
+  // A corpse — a lock older than the stale window — is broken and the stamp lands.
+  const old = new Date(Date.now() - dispatchRuns.RECORD_LOCK_STALE_MS - 5000);
+  fs.utimesSync(lock, old, old);
+  const landed = dispatchRuns.stampGateState(home, runId, { gate_state: "passed", gate_at: "t1", gate_settle_id: "tok-A" });
+  assert.strictEqual(landed.gate_state, "passed");
+  assert.strictEqual(landed.gate_settle_id, "tok-A");
+  assert.ok(!fs.existsSync(lock), "the lock is released after the stamp");
+
+  // A second settler for the same run: the guard yields and it gets the
+  // WINNER's record back — settle id and all — so it can tell it lost.
+  const lost = dispatchRuns.stampGateState(home, runId, { gate_state: "failed", gate_at: "t2", gate_settle_id: "tok-B" });
+  assert.strictEqual(lost.gate_settle_id, "tok-A");
+  assert.strictEqual(lost.gate_state, "passed");
+  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_settle_id, "tok-A");
+
+  // The `own` door keys on the settle id when the record has one: the
+  // loser's `gate_at` — even an identical timestamp — is not ownership.
+  dispatchRuns.atomicJson(paths.record, { ...base, gate_state: "passed", gate_at: "same-ms", gate_settle_id: "tok-A" });
+  const byAt = dispatchRuns.stampGateState(home, runId, { gate_attestation: "art-attest-loser" }, { own: "same-ms" });
+  assert.strictEqual(byAt.gate_attestation, undefined, "gate_at alone does not open the door on a record that carries a settle id");
+  const byToken = dispatchRuns.stampGateState(home, runId, { gate_attestation: "art-attest-winner" }, { own: "tok-A" });
+  assert.strictEqual(byToken.gate_attestation, "art-attest-winner");
+  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_attestation, "art-attest-winner");
+
+  // Every stamp inside the lock reads and writes under it — a writer that
+  // sees the lock taken waits for it rather than interleaving.
+  dispatchRuns.atomicJson(paths.record, base);
+  let order = [];
+  const held = dispatchRuns.withRecordLock(paths.record, () => {
+    order.push("first-in");
+    const r = dispatchRuns.stampGateState(home, runId, { gate_state: "blocked", gate_settle_id: "tok-C" }, { lock: (file, fn, o) => dispatchRuns.withRecordLock(file, fn, { ...o, attempts: 2, waitMs: 1 }) });
+    order.push(r === null ? "second-refused" : "second-landed");
+    return "done";
+  });
+  assert.deepStrictEqual([held.ok, held.value, order], [true, "done", ["first-in", "second-refused"]]);
+  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_state, "running");
+});
+
+// -- major finding 4 (cross-model review): the loop publishes the RECORD's
+// verdict for a superseded pipeline — never the loser's head and verdict —
+// and stamps nothing on its behalf.
+test("a superseded pipeline's verdict is not what the loop publishes: the status surface carries the record's settled verdict, head and attestation", async () => {
+  const marks = [];
+  const { deps, control, state } = loopHarness({
+    queue: [{ id: "task-a" }],
+    gate: () => ({
+      state: "passed", reason: "2 gate(s) passed", gate_head: "loserhead", attestation: null, gates: [{ gate: "acceptance", verdict: "passed" }],
+      superseded: true,
+      settled: { state: "failed", reason: "gate 'acceptance' failed: npm test exited 1", head: "winnerhead", attestation: "art-attest-winner", worker: "w-other", at: "2026-09-02T10:00:00.000Z" },
+    }),
+  });
+  deps.markGate = (runId, patch) => {
+    marks.push({ runId, patch });
+    return null;
+  };
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", intervalMs: 1000, retryAfterMs: 600000, max: 1 }, deps, control });
+  const entry = status.recent[0];
+  assert.strictEqual(entry.gate, "failed", "the record's verdict, not the loser's 'passed'");
+  assert.strictEqual(entry.gate_head, "winnerhead");
+  assert.strictEqual(entry.attestation, "art-attest-winner");
+  assert.strictEqual(entry.gate_worker, "w-other");
+  assert.strictEqual(entry.superseded, true);
+  assert.deepStrictEqual(entry.superseded_verdict, { state: "passed", head: "loserhead" }, "what this pipeline found is kept, labeled as superseded");
+  assert.strictEqual(entry.gates, undefined, "the loser's per-gate steps are not published as the run's");
+  assert.strictEqual(status.gates.failed, 1);
+  assert.strictEqual(status.gates.superseded, 1);
+  assert.strictEqual(status.gates.passed, 0);
+  assert.ok(marks.every((m) => m.patch.gate_state !== "passed"), "the loser stamps no verdict on the record");
+  assert.strictEqual(marks.filter((m) => m.patch.gate_state && m.patch.gate_state !== "running").length, 0, "no settle stamp at all from the loser");
+  assert.strictEqual(status.skipped.length, 1, "the node cools off per the RECORD's failed verdict, not the loser's pass");
+  assert.match(status.skipped[0].reason, /settled by another pipeline/);
+  assert.ok(state.log.some((l) => /gates failed \(settled by w-other\) — this pipeline's 'passed' verdict was superseded/.test(l)), state.log.join("\n"));
+
+  // With no settled info carried back, the verdict is UNKNOWN — published as
+  // superseded, and the node cools (the safe direction), never a pass.
+  const { deps: d2, control: c2 } = loopHarness({ queue: [{ id: "task-b" }], gate: () => ({ state: "passed", superseded: true }) });
+  const s2 = await workLoop.runWorkLoop({ opts: { workerId: "w", intervalMs: 1000, retryAfterMs: 600000, max: 1 }, deps: d2, control: c2 });
+  assert.strictEqual(s2.recent[0].gate, "superseded");
+  assert.strictEqual(s2.gates.superseded, 1);
+  assert.strictEqual(s2.gates.passed, 0);
+  assert.strictEqual(s2.skipped.length, 1);
+});
