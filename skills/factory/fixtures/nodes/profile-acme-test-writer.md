@@ -1,7 +1,7 @@
 ---
 id: profile-acme-test-writer
 type: profile
-project: acme-checkout
+repo: acme-checkout
 title: Acceptance test-writer lane
 summary: The lane that writes and repairs the black-box acceptance suite — the lane a protected-path hit routes to, kept separate from the lane that writes the code under test.
 date: 2026-08-26

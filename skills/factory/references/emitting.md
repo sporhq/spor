@@ -39,7 +39,7 @@ factory is written, even though the queue item it serves comes last (step 4).
 ---
 id: profile-codex-review
 type: profile
-project: <slug>
+repo: <slug>
 title: Cross-model adversarial reviewer
 summary: <one standalone sentence>
 date: <YYYY-MM-DD>
@@ -74,7 +74,7 @@ override the referenced gate's own.
 ---
 id: gate-adversarial-review
 type: gate
-project: <slug>
+repo: <slug>
 title: Adversarial cross-model review
 summary: <one standalone sentence — most consumers only ever see this>
 date: <YYYY-MM-DD>
@@ -113,7 +113,7 @@ Keys by kind (`lib/kernel/gates.js` is the authority):
 ---
 id: factory-<team-or-product>
 type: factory
-project: <slug>
+repo: <slug>
 title: <what "done" means here>
 summary: <one standalone sentence>
 date: <YYYY-MM-DD>
@@ -153,7 +153,9 @@ UP to its home-project grouping and unions the members, so a sibling repo's
 items reach a gated worker and its command gate runs against a checkout it was
 never authored for (issue-spor-work-scope-union-factory-mismatch). Usually it
 is the one repo you compiled the factory in, and the factory node's own
-`project:`/`repo:` stamp is the fallback when you omit it — so this is a key
+`repo:` stamp is the fallback when you omit it (the legacy `project:` spelling
+still reads the same, but emit `repo:` — it is the current stamp key,
+dec-cc-repo-project-two-layer-identity) — so this is a key
 to write when the factory genuinely covers several repos, or when you want the
 scope stated rather than inherited. An item outside the scope is skipped
 visibly by the worker, never gated. Do not emit `"repos": []` — an empty list
@@ -293,7 +295,7 @@ left is one queue item whose body carries their criteria in their words:
 ---
 id: task-<stem>-acceptance-suite
 type: task
-project: <slug>
+repo: <slug>
 title: Write the acceptance suite for <what>
 summary: <one standalone sentence naming what the suite must cover>
 date: <YYYY-MM-DD>

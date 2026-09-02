@@ -1,7 +1,7 @@
 ---
 id: task-acme-checkout-acceptance-suite
 type: task
-project: acme-checkout
+repo: acme-checkout
 title: Write the black-box acceptance suite for buying something
 summary: Cover the customer journey the owner named — product page to basket to card to confirmation email — as a black-box suite under e2e/, so the factory's command gate can judge "someone can't pay" instead of only the unit tests.
 date: 2026-08-26

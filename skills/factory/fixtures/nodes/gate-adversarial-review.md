@@ -1,7 +1,7 @@
 ---
 id: gate-adversarial-review
 type: gate
-project: acme-checkout
+repo: acme-checkout
 title: Adversarial cross-model review
 summary: A second model reads the diff hunting for correctness defects and silently lost orders, with one implementer fix cycle before the failure escalates to a person. Shareable across Acme's factories so the review bar is vetted once.
 date: 2026-08-26
