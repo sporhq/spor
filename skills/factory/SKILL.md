@@ -84,8 +84,13 @@ git branch --show-current && git remote show origin 2>/dev/null | sed -n '/HEAD 
 What you are extracting: the **command** a command gate should run (prefer what
 CI already runs — a gate that disagrees with CI is a second definition of
 done), the **trusted ref** (the repo's default branch), the **protected test
-paths**, and any hard rule from CLAUDE.md/AGENTS.md that is really a gate in
-prose ("refactors prove themselves byte-identical", "zero dependencies").
+paths**, any hard rule from CLAUDE.md/AGENTS.md that is really a gate in
+prose ("refactors prove themselves byte-identical", "zero dependencies") —
+and **what the suite needs that is not in git**: a `services:` block in CI, a
+`docker compose`, `supabase start`, a `DATABASE_URL`, an `engines` pin. Each
+of those is a hook the repo must carry and, for a one-per-box service, a
+`serialize`/`risk` pair on the gate (`references/emitting.md` §3c); the box
+that has the service is the only box that can be the worker.
 
 ### 3. Read the graph and the fleet
 

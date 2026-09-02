@@ -232,6 +232,57 @@ gate — not a silent drop — and every landing or failure writes an `art-merge
 fact, the integration stage's twin of a gate's `art-gate-` fact
 (WORKERS.md §10.9, `references/maintenance.md`).
 
+## 3c. Gates that need a service — a database, a stack, a login (optional)
+
+A command gate runs in a throwaway worktree the runner cuts from the
+implementer's commit. Everything the suite needs that is not in git — a
+`node_modules`, a local database, credentials — is staged by the repo's own
+hooks, declared in the repo's committable `.spor.json`, never in the factory:
+
+```json
+{ "dispatch": { "worktree": true,
+                "worktreeSetup": "scripts/spor-tree-setup.sh",
+                "worktreeTeardown": "scripts/spor-tree-teardown.sh" } }
+```
+
+Both hooks run with cwd = the tree and `SPOR_WORKTREE`, `SPOR_MAIN_CHECKOUT`,
+`SPOR_DISPATCH_SLUG`, `SPOR_DISPATCH_NODE`, and **`SPOR_TREE_ROLE`** =
+`dispatch` (the implementer's worktree) | `gate` (a command gate's tree) |
+`integration` (the merge candidate). Teardown runs before each tree is
+removed. A Supabase-shaped pair, for a suite that needs `supabase start`:
+
+```sh
+# scripts/spor-tree-setup.sh
+ln -s "$SPOR_MAIN_CHECKOUT/node_modules" node_modules
+case "$SPOR_TREE_ROLE" in gate|integration) supabase start ;; esac   # only where the suite runs
+# scripts/spor-tree-teardown.sh
+case "$SPOR_TREE_ROLE" in gate|integration) supabase stop --no-backup ;; esac
+```
+
+Then the gate itself carries the two fields such a suite needs:
+
+```json
+{"id": "rls", "kind": "command", "command": "bash scripts/rls-gate.sh",
+ "timeout_ms": 2400000, "serialize": "repo", "risk": ["touches:db"]}
+```
+
+- **`serialize: "repo"`** — the suite owns a singleton per box (a fixed port,
+  a fixed container name, a `db reset`); the gate waits for any other run of
+  a serialized gate, or the integration stage, on the same repo before it
+  starts. The same lease `integration.serialize` uses.
+- **`risk`** — the classes (from `risk_classes`) that ARM this gate, exactly
+  as on a human gate. Unarmed, the gate records `skipped` and runs nothing;
+  an unreadable diff still fails closed.
+- The suite's env carries **`SPOR_GATE_BASE`**, **`SPOR_GATE_HEAD`** (the shas
+  under judgement), **`SPOR_TRUSTED_REF`**, **`SPOR_GATE_STAGE`** (`gate` |
+  `integration`) and **`SPOR_GATE_NODE`**, beside `CI=1` and `SPOR_GATE=<id>`,
+  so a script can `git diff --name-only $SPOR_GATE_BASE..$SPOR_GATE_HEAD` and
+  decide for itself, the way a CI job reads a pull request's file list.
+
+State back: which box has the service (that box is the worker), that the
+gate queues, that it is skipped and says so when the change never touched the
+database, and that the hook pair is engineering's to write and commit.
+
 ## 4. The test-writer lane
 
 When step 2 of the creation flow found no acceptance suite, the operator's

@@ -7646,7 +7646,7 @@ function createDispatchWorktree(repoDir, name, { slug, nodeId } = {}) {
   // so a machine-local `dispatch.worktreeSetup` keeps working — that one isn't
   // the main checkout's file. targetRepoDispatchCfg reads exactly
   // `<dir>/.spor.json` with no walk at all, so it needs no fence.
-  const hook = runWorktreeSetupHook(dir, { repoDir, slug, nodeId, stdio: "inherit" });
+  const hook = runWorktreeSetupHook(dir, { repoDir, slug, nodeId, stdio: "inherit", role: "dispatch" });
   if (hook.error) return { dir, branch, reused, created: !reused, setupError: hook.error };
   return { dir, branch, reused, setupRan: hook.ran };
 }
@@ -7668,7 +7668,23 @@ function createDispatchWorktree(repoDir, name, { slug, nodeId } = {}) {
 // sit inline in createDispatchWorktree, now the shape below. Returns
 // {ran: false} when no hook is declared, {ran: true} when it ran clean, and
 // {error} — a message, not a throw — when it failed.
-function runWorktreeSetupHook(dir, { repoDir, slug = null, nodeId = null, stdio = "inherit" } = {}) {
+function runWorktreeSetupHook(dir, { repoDir, slug = null, nodeId = null, stdio = "inherit", role = "dispatch" } = {}) {
+  return runWorktreeHook("setup", dir, { repoDir, slug, nodeId, stdio, role });
+}
+
+// The teardown twin (task-spor-worktree-hook-role-and-teardown): the repo's
+// `dispatch.worktreeTeardown`, run before a tree is removed — the implementer
+// worktree after a landing, a command gate's tree, the integration candidate
+// — with the same env the setup hook got, so whatever setup started for that
+// tree (a database stack on a per-tree port, a dev server) can be stopped.
+// `SPOR_TREE_ROLE` (dispatch | gate | integration) tells both hooks which
+// tree they are staging, so a hook can start a service only for the trees
+// whose suite needs it.
+function runWorktreeTeardownHook(dir, { repoDir, slug = null, nodeId = null, stdio = "pipe", role = "dispatch" } = {}) {
+  return runWorktreeHook("teardown", dir, { repoDir, slug, nodeId, stdio, role });
+}
+
+function runWorktreeHook(which, dir, { repoDir, slug = null, nodeId = null, stdio = "inherit", role = "dispatch" } = {}) {
   // `boundary: dir` is what keeps the STANDING cascade honest too: a dispatch
   // worktree nests at `<repoDir>/.claude/worktrees/<name>`, so loadConfig's
   // ordinary repo-file ancestor walk would climb straight back into `repoDir`
@@ -7678,7 +7694,8 @@ function runWorktreeSetupHook(dir, { repoDir, slug = null, nodeId = null, stdio 
   // machine-local `dispatch.worktreeSetup` keeps working.
   const cfg = targetRepoDispatchCfg(dir);
   const standingCfg = loadConfig({ cwd: dir, env: process.env, boundary: dir });
-  const setup = cfg.worktreeSetup != null ? cfg.worktreeSetup : standingCfg.get("dispatch.worktreeSetup", null);
+  const key = which === "teardown" ? "worktreeTeardown" : "worktreeSetup";
+  const setup = cfg[key] != null ? cfg[key] : standingCfg.get(`dispatch.${key}`, null);
   if (!setup) return { ran: false };
   const sr = spawnSync(setup, [], {
     cwd: dir,
@@ -7694,12 +7711,13 @@ function runWorktreeSetupHook(dir, { repoDir, slug = null, nodeId = null, stdio 
       SPOR_MAIN_CHECKOUT: repoDir,
       SPOR_DISPATCH_SLUG: slug || "",
       SPOR_DISPATCH_NODE: nodeId || "",
+      SPOR_TREE_ROLE: role || "dispatch",
     },
   });
   if (sr.error) return { ran: true, error: sr.error.message };
   if (sr.status !== 0) {
     const tail = stdio === "pipe" ? String(sr.stderr || sr.stdout || "").trim().split("\n").filter(Boolean).pop() : "";
-    return { ran: true, error: `setup hook exited ${sr.status}${tail ? `: ${tail}` : ""}` };
+    return { ran: true, error: `${which} hook exited ${sr.status}${tail ? `: ${tail}` : ""}` };
   }
   return { ran: true };
 }
@@ -7727,11 +7745,20 @@ function mainCheckoutOf(dir) {
 // SPOR_MAIN_CHECKOUT, and where a node_modules symlink should point — is
 // derived. Shape matches the gate deps' own {ok, reason} contract: a hook that
 // fails refuses the tree, it never runs the suite on a half-staged one.
-function stageThrowawayTree(dir, top, { slug = null, nodeId = null, what = "gate" } = {}) {
+function stageThrowawayTree(dir, top, { slug = null, nodeId = null, what = "gate", role = "gate" } = {}) {
   const repoDir = mainCheckoutOf(top) || top;
-  const hook = runWorktreeSetupHook(dir, { repoDir, slug, nodeId, stdio: "pipe" });
+  const hook = runWorktreeSetupHook(dir, { repoDir, slug, nodeId, stdio: "pipe", role });
   if (hook.error) return { ok: false, reason: `the repo's dispatch.worktreeSetup hook failed staging the ${what} tree: ${hook.error}` };
   return { ok: true, ran: !!hook.ran };
+}
+
+// The teardown for a throwaway tree — best-effort by contract (the tree is
+// going either way), so a failing hook is a warning, never a refusal.
+function teardownThrowawayTree(dir, top, { slug = null, nodeId = null, role = "gate", warn = () => {} } = {}) {
+  const repoDir = mainCheckoutOf(top) || top;
+  const hook = runWorktreeTeardownHook(dir, { repoDir, slug, nodeId, stdio: "pipe", role });
+  if (hook.error) warn(`work: the repo's dispatch.worktreeTeardown hook failed on the ${role} tree ${dir}: ${hook.error}`);
+  return hook;
 }
 
 function worktreeDeclaredEnv(dir) {
@@ -7772,6 +7799,9 @@ function removeDispatchWorktree(repoDir, dir, branch) {
   if (status.status !== 0 || (status.stdout || "").trim()) {
     return { removed: false, reason: `${dir} has uncommitted changes — refusing to remove` };
   }
+  // The branch IS the node id for a node dispatch (worktreeName), which is
+  // what the hook's SPOR_DISPATCH_NODE carried on the way in.
+  runWorktreeTeardownHook(dir, { repoDir, nodeId: branch || null, stdio: "pipe", role: "dispatch" });
   git(repoDir, ["worktree", "remove", "--force", dir]);
   if (branch) git(repoDir, ["branch", "-D", branch]);
   return { removed: true };
@@ -7796,6 +7826,9 @@ function targetRepoDispatchCfg(dir) {
   if (typeof d.worktree === "boolean") out.worktree = d.worktree;
   if (typeof d.worktreeSetup === "string" && d.worktreeSetup) {
     out.worktreeSetup = path.isAbsolute(d.worktreeSetup) ? d.worktreeSetup : path.join(dir, d.worktreeSetup);
+  }
+  if (typeof d.worktreeTeardown === "string" && d.worktreeTeardown) {
+    out.worktreeTeardown = path.isAbsolute(d.worktreeTeardown) ? d.worktreeTeardown : path.join(dir, d.worktreeTeardown);
   }
   return out;
 }
@@ -10143,16 +10176,39 @@ function makeGateDeps(
       // it stages an implementer's worktree (node_modules, a pinned sibling
       // checkout) — without it a repo whose suite needs anything not in git
       // fails its own gate on a missing dependency, never on the change.
-      const tree = prepareGateTree(change, { trustedRef, protectedPaths, setup: (dir) => stageThrowawayTree(dir, change.top, { slug, nodeId: entry.node_id, what: "gate" }) });
+      const tree = prepareGateTree(change, {
+        trustedRef,
+        protectedPaths,
+        setup: (dir) => stageThrowawayTree(dir, change.top, { slug, nodeId: entry.node_id, what: "gate", role: "gate" }),
+        teardown: (dir) => teardownThrowawayTree(dir, change.top, { slug, nodeId: entry.node_id, role: "gate", warn }),
+      });
       if (!tree.ok) return tree;
       try {
-        return await runGateCommand(gate, tree.dir, { env: worktreeDeclaredEnv(tree.dir) });
+        // What the suite is judging, in its env (task-spor-gate-command-
+        // change-env): a script can `git diff $SPOR_GATE_BASE..$SPOR_GATE_HEAD`
+        // inside the tree and decide what to run, the way a CI job reads the
+        // pull request's file list.
+        const env = {
+          ...worktreeDeclaredEnv(tree.dir),
+          SPOR_GATE_STAGE: "gate",
+          SPOR_GATE_BASE: change.base,
+          SPOR_GATE_HEAD: change.head,
+          SPOR_TRUSTED_REF: trustedRef,
+          SPOR_GATE_NODE: entry.node_id || "",
+        };
+        return await runGateCommand(gate, tree.dir, { env });
       } finally {
         // AFTER the await, not after the call: runGateCommand is async, so a
         // bare `return` here would tear the worktree down under a running suite.
         tree.cleanup();
       }
     },
+    // The per-gate serialize lease (task-spor-gate-serialize-lease) reuses the
+    // integration stage's: keyed on the repo's MAIN checkout locally, the
+    // synthetic per-repo lock node remotely, so a `serialize: repo` command
+    // gate and the integration stage never overlap on one box either.
+    acquireGateLease: () => acquireIntegrationLease(cfg, home, change ? change.top : record && record.cwd, { slug }),
+    releaseGateLease: (token) => releaseIntegrationLease(cfg, token),
     review,
     fix,
     recordFact: ({ id, markdown }) => writeGateNode(cfg, id, markdown),
@@ -10303,7 +10359,12 @@ const INTEGRATION_LEASE_WAIT_MS = 20000; // how long to wait for a busy lease be
 const INTEGRATION_LEASE_POLL_MS = 1000;
 
 function integrationLeaseKey(top) {
-  return crypto.createHash("sha256").update(path.resolve(top || "")).digest("hex").slice(0, 16);
+  // The repo's durable MAIN checkout, never the per-item worktree `top`
+  // usually names (gateChangeSet's `--show-toplevel` of a dispatch worktree
+  // IS the worktree): two workers landing two items have two worktrees, and a
+  // lease keyed on those would never have serialized anything.
+  const anchor = mainCheckoutOf(top) || top;
+  return crypto.createHash("sha256").update(path.resolve(anchor || "")).digest("hex").slice(0, 16);
 }
 
 async function acquireLocalIntegrationLease(home, top, { sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
@@ -10605,12 +10666,15 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
     acquireLease: () => acquireIntegrationLease(cfg, home, top || (record && record.cwd), { slug }),
     releaseLease: (token) => releaseIntegrationLease(cfg, token),
     buildCandidate: async ({ head, targetRef, strategy }) => {
-      const built = integrationRunner.buildCandidateTree({ top, head, targetRef, strategy, label: entry.node_id });
+      const built = integrationRunner.buildCandidateTree({
+        top, head, targetRef, strategy, label: entry.node_id,
+        teardown: (dir) => teardownThrowawayTree(dir, top, { slug, nodeId: entry.node_id, role: "integration", warn }),
+      });
       if (!built.ok) return built;
       // Same staging the command gate's tree gets (stageThrowawayTree): the
       // candidate suite runs here, and a repo whose suite needs a hook-staged
       // dependency must not fail its own landing on a bare checkout.
-      const staged = stageThrowawayTree(built.dir, top, { slug, nodeId: entry.node_id, what: "integration candidate" });
+      const staged = stageThrowawayTree(built.dir, top, { slug, nodeId: entry.node_id, what: "integration candidate", role: "integration" });
       if (!staged.ok) {
         built.cleanup();
         return { ok: false, reason: staged.reason };
@@ -10628,7 +10692,17 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       // sha instead; a no-op restore returns `sha` unchanged.
       return integrationRunner.reconcileCandidateSha({ dir, sha });
     },
-    runSuite: ({ dir }) => gateRunner.runGateCommand({ id: "integration", command: integration.command, timeoutMs: integration.timeoutMs }, dir, { env: worktreeDeclaredEnv(dir) }),
+    runSuite: ({ dir, base, head }) =>
+      gateRunner.runGateCommand({ id: "integration", command: integration.command, timeoutMs: integration.timeoutMs }, dir, {
+        env: {
+          ...worktreeDeclaredEnv(dir),
+          SPOR_GATE_STAGE: "integration",
+          SPOR_GATE_BASE: base || "",
+          SPOR_GATE_HEAD: head || "",
+          SPOR_TRUSTED_REF: factory.trustedRef,
+          SPOR_GATE_NODE: entry.node_id || "",
+        },
+      }),
     land: (args) => integrationRunner.landCandidate(args),
     propose: ({ head, targetRef }) => proposeIntegrationPR({ top, head, targetRef }),
     parkForReview: async ({ proposal }) => {
@@ -10958,6 +11032,19 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   } catch {
     /* the worker's scope token stands in */
   }
+  // Bring the implementer's branch up to the trusted ref BEFORE judging it
+  // (issue-spor-command-gate-judges-stale-branch-base): the usual reason a
+  // run is re-gated is that the trusted ref was red and has since been fixed,
+  // and a command gate judges the branch's OWN base — so without this the
+  // re-gate re-tests the same stale tree and fails the same way. A merge
+  // conflict is refused loudly (the branch needs a person or a fix cycle);
+  // a dirty tree is left alone and refused by the gate as before.
+  const refreshed = refreshBranchFromTrustedRef(record.cwd, factory.trustedRef);
+  if (refreshed.refused) {
+    err(`spor work --regate: ${refreshed.refused}`);
+    return 1;
+  }
+  if (refreshed.note) out(`work: ${refreshed.note}`);
   const previous = record.gate_state ? `${record.gate_state}${record.gate_reason ? `: ${record.gate_reason}` : ""}` : "no recorded verdict";
   // Every escalation this run has accumulated across attempts — a passing
   // re-gate answers all of them, not only the latest.
@@ -11003,6 +11090,28 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   }
   out(`work: re-gate of ${record.node_id} passed — ${reason || "every gate passed"}${notes.length ? `; ${notes.join("; ")}` : ""}`);
   return 0;
+}
+
+// Merge the trusted ref into the run's checkout ahead of a re-gate. Returns
+// {note} (what happened, for the log), {} (nothing to do — no checkout, not a
+// git tree, dirty, or already up to date), or {refused} (a conflict).
+function refreshBranchFromTrustedRef(cwd, trustedRef) {
+  if (!cwd || !fs.existsSync(cwd)) return {};
+  if (git(cwd, ["rev-parse", "--is-inside-work-tree"]).status !== 0) return {};
+  const dirty = git(cwd, ["status", "--porcelain", "--untracked-files=no"]);
+  if (dirty.status !== 0 || (dirty.stdout || "").trim()) return {}; // the gate refuses a dirty tree itself, with the better message
+  const target = git(cwd, ["rev-parse", "--verify", "--quiet", trustedRef]);
+  if (target.status !== 0) return {};
+  if (git(cwd, ["merge-base", "--is-ancestor", trustedRef, "HEAD"]).status === 0) return {};
+  const before = (git(cwd, ["rev-parse", "HEAD"]).stdout || "").trim();
+  const merge = git(cwd, ["-c", "user.name=spor-regate", "-c", "user.email=regate@spor.local", "merge", "--no-edit", "-m", `Merge ${trustedRef} into the branch before re-gating`, trustedRef]);
+  if (merge.status !== 0) {
+    git(cwd, ["merge", "--abort"]);
+    const line = `${merge.stdout || ""}\n${merge.stderr || ""}`.trim().split("\n").filter(Boolean).pop() || "git merge failed";
+    return { refused: `merging ${trustedRef} into ${cwd} conflicts (${line}) — resolve it in that checkout (or re-dispatch the item), then re-gate` };
+  }
+  const after = (git(cwd, ["rev-parse", "HEAD"]).stdout || "").trim();
+  return { note: `merged ${trustedRef} (${(target.stdout || "").trim().slice(0, 8)}) into ${cwd} before re-gating (${before.slice(0, 8)} -> ${after.slice(0, 8)})` };
 }
 
 // The resolving record a passing re-gate writes onto the escalation the

@@ -2142,12 +2142,27 @@ test("end to end: the gate tree is staged with the repo's own dispatch.worktreeS
   // spor-server ships) that stages a file the acceptance suite requires.
   const hookLog = path.join(home, "hook.log");
   fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
-  fs.writeFileSync(path.join(repo, "scripts", "stage.sh"), '#!/bin/sh\nprintf "%s\\n" "$SPOR_MAIN_CHECKOUT" >> "$HOOK_LOG"\n: > "$SPOR_WORKTREE/staged.txt"\n');
+  fs.writeFileSync(path.join(repo, "scripts", "stage.sh"), '#!/bin/sh\nprintf "%s %s\\n" "$SPOR_MAIN_CHECKOUT" "$SPOR_TREE_ROLE" >> "$HOOK_LOG"\n: > "$SPOR_WORKTREE/staged.txt"\n');
+  fs.writeFileSync(path.join(repo, "scripts", "unstage.sh"), '#!/bin/sh\nprintf "teardown %s %s\\n" "$SPOR_TREE_ROLE" "$SPOR_DISPATCH_NODE" >> "$HOOK_LOG"\n');
   fs.chmodSync(path.join(repo, "scripts", "stage.sh"), 0o755);
-  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktreeSetup: "scripts/stage.sh" } }));
+  fs.chmodSync(path.join(repo, "scripts", "unstage.sh"), 0o755);
+  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktreeSetup: "scripts/stage.sh", worktreeTeardown: "scripts/unstage.sh" } }));
+  // The suite needs the hook's staging AND reads what it is judging from the
+  // env (task-spor-gate-command-change-env): base and head must be real shas
+  // it can diff inside the tree, the trusted ref its name, the stage "gate".
   fs.writeFileSync(
     path.join(repo, "test", "acceptance.js"),
-    'const fs = require("fs");\nif (!fs.existsSync("staged.txt")) { console.error("not staged: the suite needs the hook"); process.exit(1); }\n'
+    [
+      'const fs = require("fs");',
+      'const cp = require("child_process");',
+      'if (!fs.existsSync("staged.txt")) { console.error("not staged: the suite needs the hook"); process.exit(1); }',
+      'const { SPOR_GATE_BASE: base, SPOR_GATE_HEAD: head, SPOR_TRUSTED_REF: ref, SPOR_GATE_STAGE: stage, SPOR_GATE_NODE: node } = process.env;',
+      'if (!/^[0-9a-f]{40}$/.test(base || "") || !/^[0-9a-f]{40}$/.test(head || "")) { console.error("no base/head sha in env"); process.exit(2); }',
+      'if (ref !== "main" || stage !== "gate" || node !== "task-ready") { console.error("bad ref/stage/node: " + [ref, stage, node]); process.exit(3); }',
+      'const changed = cp.execSync(`git diff --name-only ${base}..${head}`).toString().trim();',
+      'if (!changed.includes("lib/sub.js")) { console.error("the diff in env does not name the change: " + changed); process.exit(4); }',
+      "",
+    ].join("\n")
   );
   // Committed on MAIN (the trusted ref — the suite is a protected path, so it
   // must come from there), then merged into the implementer's branch so the
@@ -2166,8 +2181,10 @@ test("end to end: the gate tree is staged with the repo's own dispatch.worktreeS
   assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
   assert.match(r.stdout, /gate acceptance passed on task-ready/, "the suite passed only because the hook staged the tree");
   const ran = fs.readFileSync(hookLog, "utf8").trim().split("\n");
-  assert.strictEqual(ran.length, 1, `the hook ran once, for the gate tree (saw ${ran.length})`);
-  assert.strictEqual(fs.realpathSync(ran[0]), fs.realpathSync(repo), "SPOR_MAIN_CHECKOUT is the durable main checkout");
+  assert.strictEqual(ran.length, 2, `setup then teardown (saw ${ran})`);
+  assert.match(ran[0], / gate$/, `the setup hook was told the role (saw ${ran[0]})`);
+  assert.strictEqual(ran[1], "teardown gate task-ready", "the teardown hook ran once, told the role and the node");
+  assert.strictEqual(fs.realpathSync(ran[0].split(" ")[0]), fs.realpathSync(repo), "SPOR_MAIN_CHECKOUT is the durable main checkout");
   assert.ok(!fs.existsSync(path.join(repo, "staged.txt")), "the hook staged the throwaway tree, never the repo itself");
   // The implementer got the contract as its task text.
   const invocation = JSON.parse(fs.readFileSync(outfile, "utf8").trim().split("\n")[0]);
@@ -2229,7 +2246,7 @@ test("end to end: a run refused for an external cause is re-judged with --regate
   const { home, repo, nodes, outfile } = cliFixture({ factoryPayload: OK_FACTORY });
   // The trusted ref's suite is red for a reason outside the item (an env the
   // box lacks); the fix arrives later, outside the branch.
-  fs.writeFileSync(path.join(repo, "test", "acceptance.js"), 'if (process.env.GATE_OK !== "1") { console.error("✖ the trusted ref is red"); process.exit(1); }\n');
+  fs.writeFileSync(path.join(repo, "test", "acceptance.js"), 'const fs = require("fs");\nif (!fs.existsSync("lib/fixed.js")) { console.error("✖ the trusted ref is red"); process.exit(1); }\n');
   git(repo, "checkout", "-q", "main");
   git(repo, "add", "-A");
   git(repo, "commit", "-q", "-m", "a red trusted suite");
@@ -2257,9 +2274,18 @@ test("end to end: a run refused for an external cause is re-judged with --regate
   assert.strictEqual(bare.status, 1);
   assert.match(bare.stderr, /needs a factory/);
 
-  // The cause is fixed outside the item; the same run is judged again.
-  const second = cli(["work", "--regate", runId.slice(0, 8), "--factory", "factory-demo"], { ...env, GATE_OK: "1" });
+  // The cause is fixed on the TRUSTED REF, after the branch was cut — the
+  // branch's own base is still red (issue-spor-command-gate-judges-stale-
+  // branch-base), so the re-gate must merge main in before judging.
+  git(repo, "checkout", "-q", "main");
+  fs.writeFileSync(path.join(repo, "lib", "fixed.js"), "module.exports = true;\n");
+  git(repo, "add", "-A");
+  git(repo, "commit", "-q", "-m", "fix the trusted ref");
+  git(repo, "checkout", "-q", "impl");
+  const second = cli(["work", "--regate", runId.slice(0, 8), "--factory", "factory-demo"], env);
   assert.strictEqual(second.status, 0, `${second.stderr}\n${second.stdout}`);
+  assert.match(second.stdout, /merged main \([0-9a-f]{8}\) into .* before re-gating/);
+  assert.ok(execFileSync("git", ["-C", repo, "merge-base", "--is-ancestor", "main", "impl"], { encoding: "utf8" }) === "", "the branch now contains the trusted ref");
   assert.match(second.stdout, /re-gating task-ready — run [0-9a-f]{8}, attempt 2, under factory-demo \(previously failed/);
   assert.match(second.stdout, /gate acceptance passed on task-ready/);
   assert.match(second.stdout, new RegExp(`re-gate of task-ready passed — .*closed ${escalation} with art-regate-ready-[0-9a-f]{8}-r2-`));
@@ -2277,7 +2303,7 @@ test("end to end: a run refused for an external cause is re-judged with --regate
   assert.strictEqual(execFileSync("git", ["-C", repo, "worktree", "list"], { encoding: "utf8" }).trim().split("\n").length, 1, "the re-gate's tree is cleaned up");
 
   // A passed run is not re-judged again.
-  const again = cli(["work", "--regate", runId.slice(0, 8), "--factory", "factory-demo"], { ...env, GATE_OK: "1" });
+  const again = cli(["work", "--regate", runId.slice(0, 8), "--factory", "factory-demo"], env);
   assert.strictEqual(again.status, 1);
   assert.match(again.stderr, /already read 'passed'/);
 });
@@ -2296,4 +2322,94 @@ test("stampGateState refuses to overwrite a settled verdict unless the caller is
   assert.strictEqual(after.gate_state, "running");
   assert.strictEqual(after.gate_regate_count, 1);
   assert.strictEqual(after.gate_reason, "red", "force only writes what it was given");
+});
+
+
+// --------------------------------- DB-backed gates: arming + serialize lease --
+// A repo whose acceptance suite owns a singleton per box (a local database
+// stack on a fixed port) needs two things a plain command gate lacks: a way
+// to run only when the change warrants it, and a way to never run twice at
+// once (task-spor-command-gate-risk-arming, task-spor-gate-serialize-lease).
+
+test("a command gate parses `risk` and `serialize: repo`; an undeclared risk class or another scope refuses the factory", () => {
+  const ok = gates.parseFactory(
+    ["```json", JSON.stringify({ ...BASE, risk_classes: { "touches:db": ["db/**"] }, gates: [{ id: "rls", kind: "command", command: "make rls", risk: ["touches:db"], serialize: "repo" }] }), "```"].join("\n"),
+    { id: "factory-test" }
+  );
+  assert.deepStrictEqual(ok.errors, []);
+  assert.deepStrictEqual(ok.factory.gates[0].risk, ["touches:db"]);
+  assert.strictEqual(ok.factory.gates[0].serialize, "repo");
+  const plain = gates.parseFactory(["```json", JSON.stringify({ ...BASE, gates: [{ id: "a", kind: "command", command: "npm test" }] }), "```"].join("\n"), { id: "f" });
+  assert.deepStrictEqual(plain.factory.gates[0].risk, []);
+  assert.strictEqual(plain.factory.gates[0].serialize, null);
+  const badRisk = gates.parseFactory(["```json", JSON.stringify({ ...BASE, gates: [{ id: "a", kind: "command", command: "x", risk: ["touches:nope"] }] }), "```"].join("\n"), { id: "f" });
+  assert.ok(badRisk.errors.some((e) => /gate 'a': risk class 'touches:nope' is not declared/.test(e)), badRisk.errors.join("; "));
+  assert.strictEqual(badRisk.factory, null);
+  const badScope = gates.parseFactory(["```json", JSON.stringify({ ...BASE, gates: [{ id: "a", kind: "command", command: "x", serialize: "box" }] }), "```"].join("\n"), { id: "f" });
+  assert.ok(badScope.errors.some((e) => /serialize 'box' must be 'repo'/.test(e)), badScope.errors.join("; "));
+  assert.strictEqual(badScope.factory, null);
+});
+
+test("an UNARMED command gate is skipped — no suite runs, the fact says so, the pipeline continues", async () => {
+  const factory = factoryOf({
+    ...BASE,
+    risk_classes: { "touches:db": ["db/**"] },
+    gates: [
+      { id: "rls", kind: "command", command: "make rls", risk: ["touches:db"] },
+      { id: "unit", kind: "command", command: "npm test" },
+    ],
+  });
+  const { deps, seen } = fakes({ changed: ["lib/x.js"] });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.deepStrictEqual(res.gates.map((g) => [g.gate, g.verdict]), [["rls", "skipped"], ["unit", "passed"]]);
+  assert.deepStrictEqual(seen.suites, ["unit"], "the DB suite never ran");
+  assert.match(res.gates[0].detail, /no declared risk class \(touches:db\) was touched/);
+  assert.strictEqual(seen.facts.length, 2, "the skip is still a recorded fact");
+});
+
+test("an ARMED command gate runs, names its class, and an unreadable change set still fails closed", async () => {
+  const factory = factoryOf({ ...BASE, risk_classes: { "touches:db": ["db/**"] }, gates: [{ id: "rls", kind: "command", command: "make rls", risk: ["touches:db"] }] });
+  const armed = fakes({ changed: ["db/migrations/1.sql"] });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: armed.deps });
+  assert.strictEqual(res.state, "passed");
+  assert.deepStrictEqual(armed.seen.suites, ["rls"]);
+  assert.match(res.gates[0].detail, /armed by touches:db/);
+  const unreadable = fakes({ changed: null });
+  const res2 = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: unreadable.deps });
+  assert.strictEqual(res2.state, "failed", "no diff means no arming decision — fail closed, never skip");
+});
+
+test("a `serialize: repo` command gate takes the lease before its suite and releases it after — even when the suite throws", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "rls", kind: "command", command: "make rls", serialize: "repo" }, { id: "unit", kind: "command", command: "npm test" }] });
+  const events = [];
+  const mk = (suite) => {
+    const { deps, seen } = fakes({ suite: (args) => { events.push(`suite:${args.gate.id}`); return suite(args); } });
+    deps.acquireGateLease = async ({ gate }) => { events.push(`acquire:${gate.id}`); return { kind: "fake", gate: gate.id }; };
+    deps.releaseGateLease = async (t) => { events.push(`release:${t.gate}`); };
+    return { deps, seen };
+  };
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: mk(() => ({ ok: true })).deps });
+  assert.deepStrictEqual(events, ["acquire:rls", "suite:rls", "release:rls", "suite:unit"], "only the serialized gate touches the lease");
+  events.length = 0;
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: mk(() => { throw new Error("db exploded"); }).deps });
+  assert.strictEqual(res.state, "failed");
+  assert.deepStrictEqual(events, ["acquire:rls", "suite:rls", "release:rls"], "released on a throw too");
+  // No lease dep at all (a bare caller): the gate simply runs.
+  events.length = 0;
+  const bare = fakes({ suite: (args) => { events.push(`suite:${args.gate.id}`); return { ok: true }; } });
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: bare.deps });
+  assert.deepStrictEqual(events, ["suite:rls", "suite:unit"]);
+});
+
+test("prepareGateTree runs the caller's teardown first thing in cleanup, and a throwing teardown never blocks the removal", () => {
+  const repo = repoWithBranch({ weakenTest: false, regress: false });
+  const change = gateRunner.gateChangeSet({ cwd: repo }, "main");
+  const order = [];
+  const tree = gateRunner.prepareGateTree(change, { trustedRef: "main", protectedPaths: [], setup: (d) => { order.push(`setup ${fs.existsSync(d)}`); return { ok: true }; }, teardown: (d) => { order.push(`teardown ${fs.existsSync(d)}`); throw new Error("boom"); } });
+  assert.strictEqual(tree.ok, true, tree.reason);
+  tree.cleanup();
+  assert.deepStrictEqual(order, ["setup true", "teardown true"], "teardown sees the tree still there");
+  assert.ok(!fs.existsSync(tree.dir), "the tree is gone despite the throwing teardown");
+  assert.strictEqual(git(repo, "worktree", "list").trim().split("\n").length, 1);
 });

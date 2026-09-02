@@ -712,7 +712,31 @@ under test cannot rewrite its own judge. So a command gate:
    suite needs that is not in git; the hook's `.claude/settings.local.json`
    `env` block reaches the suite's environment too), then runs the declared
    command there. A hook that fails refuses the tree — the suite is never run
-   on a half-staged one.
+   on a half-staged one. Both hooks — `dispatch.worktreeSetup` and its twin
+   `dispatch.worktreeTeardown`, run before a tree is removed — see
+   `SPOR_TREE_ROLE` (`dispatch` | `gate` | `integration`) beside the rest of
+   the hook env, so a repo can start a database only for the trees whose
+   suite needs one and stop it again.
+
+Two more things a command gate may declare, for a suite that owns something
+outside git (a database on a fixed port, a `db reset`):
+
+- **`risk`** — the same arming predicate a human gate has (§10.5): with risk
+  classes declared, the gate runs only when the change touched one of them,
+  and otherwise records `skipped` — a fact, not a pass by omission. An
+  unreadable diff still fails closed.
+- **`serialize: "repo"`** — the gate takes the repo's lease (the one the
+  integration stage holds, keyed on the main checkout locally and the
+  synthetic per-repo lock node remotely) before its suite and releases it
+  after, so two gate trees, or a gate tree and a landing, never share the
+  singleton. Fail-open like the integration lease: an unavailable lease is
+  logged and the suite runs.
+
+The suite's environment says what it is judging: `SPOR_GATE_BASE` and
+`SPOR_GATE_HEAD` (the shas), `SPOR_TRUSTED_REF`, `SPOR_GATE_STAGE` (`gate`,
+or `integration` for the candidate suite, where base/head are the target
+ref's tip and the candidate), and `SPOR_GATE_NODE`, beside `CI=1` and
+`SPOR_GATE=<id>` — enough for a script to diff and decide what to run.
 
 Step 3 is belt and braces — step 2 already refuses a branch that touched those
 paths — and that is the point: the guarantee that the suite is the trusted ref's
@@ -862,8 +886,12 @@ the item: the facts it writes carry the attempt in their ids (`…-r2-…`), so 
 first verdict's record stands beside the second's and is never overwritten or
 refused as a collision; on a pass it writes a resolving artifact onto the
 escalation the refused attempt filed and restores the completion status that
-attempt rolled back. It refuses a run that is still running, one that carries
-no claim of completion, and one that already passed or parked. Only a re-gate
+attempt rolled back. Before judging, it merges the current trusted ref into
+the run's checkout (a command gate judges the branch's own base, and the usual
+reason to re-gate is that the trusted ref was red and has since been fixed);
+a conflict is refused with the checkout named, a dirty tree is left for the
+gate to refuse as before. It refuses a run that is still running, one that
+carries no claim of completion, and one that already passed or parked. Only a re-gate
 may move a settled `gate_state` on the run record — every other writer
 (the loop, a resumed pipeline, a duplicate adopter) still cannot.
 

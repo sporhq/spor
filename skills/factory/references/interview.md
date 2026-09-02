@@ -71,6 +71,19 @@ owner, and every answer is evidence you carry verbatim into the nodes you emit.
    target ref — and note that it needs the `gh` CLI on PATH wherever the
    worker runs.
 
+8. **"When your tests run, do they need anything that is not in the code —
+   a database, a login to some other service, a copy of production data?"**
+   — the external-service turn. A "yes" means three more plain sentences from
+   you, not from them: *which machine has it* (the worker runs the suite on
+   its own box — if only the CI machine has the database, that machine is the
+   worker, or the suite is not a gate yet); *whether two copies can run at
+   once* (a local database on a fixed port cannot — emit `serialize: "repo"`
+   on that gate, and say the gate queues); and *whether every change needs
+   it* (a 30-minute database suite for a wording change is waste — emit a
+   `risk` class over the database paths so the gate runs only when they move,
+   and say so). The hook that starts and stops the service is engineering's
+   to write (emitting.md §3c); tell them one will be needed.
+
 **What not to ask them**: which harness, what timeout, how many fix cycles,
 what glob covers auth, whether to inline or reference a gate. Decide those,
 state them in the proposal in one plain line each, and let them push back.
@@ -101,6 +114,22 @@ state them in the proposal in one plain line each, and let them push back.
    `rebase`, default `merge`), and `cycles` (fix cycles on a merge conflict or
    a candidate-suite failure, separate from any gate's own `cycles`).
    `serialize` is always `repo` — there is nothing to ask.
+8. Does the suite need a service the checkout does not carry — a database
+   (Postgres, a local Supabase stack), a message broker, an API stub, secrets?
+   For each: **where does it live** (the worker's box must have it; the
+   `dispatch.worktreeSetup` hook stages it per tree and `worktreeTeardown`
+   stops it — `SPOR_TREE_ROLE` tells the hook whether it is staging the
+   implementer's worktree, a gate tree, or the integration candidate, so it
+   can start the service only where the suite runs); **is it a singleton per
+   box** (fixed port, fixed container name, `db reset`) — then that gate gets
+   `serialize: "repo"` so two gate trees never share it; and **which paths
+   make it worth running** — a `risk` class on the command gate, so the suite
+   is skipped (recorded as `skipped`, not passed) when the change never
+   touched them. The suite can read `SPOR_GATE_BASE`/`SPOR_GATE_HEAD` from
+   its env to diff for itself.
+9. Which Node/runtime does the suite pin, and does the worker box run it? An
+   engine-strict repo fails its own gate on the wrong Node with a message
+   that looks like a code error; the hook is where `nvm use` belongs.
 
 ## Translating a product answer into a gate
 
@@ -114,6 +143,7 @@ state them in the proposal in one plain line each, and let them push back.
 | "Once it's clean it should just ship" | an `integration:` block, `mode: local` or `mode: push` | that it re-runs the FULL suite on the merged result before landing, and that a conflict or that re-run failing feeds the same fix-cycle machinery as any other gate |
 | "It should ship, but through a PR someone reviews" | an `integration:` block, `mode: propose` | that it still runs the full suite pre-PR, then opens a PR via `gh` and parks the item for review rather than landing directly — and that `gh` must be on PATH wherever the worker runs |
 | "I want to open the PR myself" | nothing — omit `integration:` | that a gate-passed branch still resolves the work without merging it; landing stays a manual step until they say otherwise |
+| "The tests need the database" | the same `command` gate, plus `serialize: "repo"` if the database is one-per-box, plus a `risk` class over the migration/schema paths so it runs only when they change — and a setup/teardown hook pair for the box that has the database | that the gate queues behind any other run of itself, that it is skipped (and says so) for changes that never touch the database, and that someone must write the hook that starts and stops the stack |
 
 ## What a first factory should look like
 

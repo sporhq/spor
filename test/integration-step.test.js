@@ -1325,9 +1325,11 @@ test("end to end, local mode: the candidate tree is staged with the repo's own d
   const { home, repo, outfile } = integrationCliFixture({ integration: { mode: "local", command: `"${process.execPath}" test/acceptance.js`, strategy: "merge" } });
   const hookLog = path.join(home, "hook.log");
   fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
-  fs.writeFileSync(path.join(repo, "scripts", "stage.sh"), '#!/bin/sh\nprintf "%s\\n" "$SPOR_MAIN_CHECKOUT" >> "$HOOK_LOG"\n: > "$SPOR_WORKTREE/staged.txt"\n');
+  fs.writeFileSync(path.join(repo, "scripts", "stage.sh"), '#!/bin/sh\nprintf "setup %s %s\\n" "$SPOR_TREE_ROLE" "$SPOR_MAIN_CHECKOUT" >> "$HOOK_LOG"\n: > "$SPOR_WORKTREE/staged.txt"\n');
+  fs.writeFileSync(path.join(repo, "scripts", "unstage.sh"), '#!/bin/sh\nprintf "teardown %s %s\\n" "$SPOR_TREE_ROLE" "$SPOR_DISPATCH_NODE" >> "$HOOK_LOG"\n');
   fs.chmodSync(path.join(repo, "scripts", "stage.sh"), 0o755);
-  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktreeSetup: "scripts/stage.sh" } }));
+  fs.chmodSync(path.join(repo, "scripts", "unstage.sh"), 0o755);
+  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktreeSetup: "scripts/stage.sh", worktreeTeardown: "scripts/unstage.sh" } }));
   fs.writeFileSync(
     path.join(repo, "test", "acceptance.js"),
     'const fs = require("fs");\nif (!fs.existsSync("staged.txt")) { console.error("not staged: the suite needs the hook"); process.exit(1); }\n'
@@ -1346,13 +1348,63 @@ test("end to end, local mode: the candidate tree is staged with the repo's own d
   assert.match(r.stdout, /gate acceptance passed on task-ready/);
   assert.match(r.stdout, /integration landed on main/);
   assert.notStrictEqual(git(repo, "rev-parse", "main").trim(), before, "main really moved");
-  // Three trees, three hook runs: the implementer's dispatch worktree, the
-  // command gate's tree, the integration candidate.
+  // Three trees, each staged with its ROLE and torn down again: the
+  // implementer's dispatch worktree, the command gate's tree, the integration
+  // candidate (task-spor-worktree-hook-role-and-teardown).
   const ran = fs.readFileSync(hookLog, "utf8").trim().split("\n");
-  assert.strictEqual(ran.length, 3, `expected the hook to stage 3 trees, saw ${ran.length}`);
-  for (const main of ran) assert.strictEqual(fs.realpathSync(main), fs.realpathSync(repo));
+  const setups = ran.filter((l) => l.startsWith("setup "));
+  const teardowns = ran.filter((l) => l.startsWith("teardown "));
+  assert.deepStrictEqual(setups.map((l) => l.split(" ")[1]), ["dispatch", "gate", "integration"], `roles in order, saw ${ran}`);
+  for (const l of setups) assert.strictEqual(fs.realpathSync(l.split(" ")[2]), fs.realpathSync(repo));
+  assert.deepStrictEqual(teardowns.sort(), ["teardown dispatch task-ready", "teardown gate task-ready", "teardown integration task-ready"], `every tree is torn down, saw ${teardowns}`);
   // And the main checkout — which has `main` checked out — was reconciled to
   // the landing rather than left as a staged phantom revert.
   assert.strictEqual(fs.readFileSync(path.join(repo, "lib", "sub.js"), "utf8"), "module.exports = (a, b) => a - b;\n");
   assert.strictEqual(git(repo, "status", "--porcelain").trim(), "", "no phantom revert in the main checkout after the landing");
+});
+
+
+test("buildCandidateTree runs the caller's teardown first thing in cleanup, even when it throws", () => {
+  const dir = integrationRepo();
+  const head = git(dir, "rev-parse", "branch").trim();
+  const order = [];
+  const built = integrationRunner.buildCandidateTree({ top: dir, head, targetRef: "main", strategy: "merge", teardown: (d) => { order.push(fs.existsSync(d)); throw new Error("boom"); } });
+  assert.strictEqual(built.ok, true, built.reason);
+  built.cleanup();
+  assert.deepStrictEqual(order, [true]);
+  assert.ok(!fs.existsSync(built.dir));
+  assert.strictEqual(git(dir, "worktree", "list").trim().split("\n").length, 1);
+});
+
+test("the candidate suite is told what it is judging: SPOR_GATE_BASE/HEAD are the target and candidate shas, the stage is integration", async () => {
+  const dir = integrationRepo();
+  git(dir, "branch", "-D", "branch");
+  git(dir, "checkout", "-q", "-b", "impl");
+  fs.writeFileSync(path.join(dir, "lib", "sub.js"), "module.exports = (a, b) => a - b;\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "impl work");
+  git(dir, "checkout", "-q", "main");
+  // Drive the stage with real git plumbing but a recording runSuite.
+  const seen = [];
+  const factory = gates.parseFactory(["```json", JSON.stringify({ ...BASE, integration: { mode: "local", command: "true" } }), "```"].join("\n"), { id: "factory-test" }).factory;
+  const head = git(dir, "rev-parse", "impl").trim();
+  const res = await integrationRunner.runIntegrationStage({
+    item: { node_id: "task-x", run_id: "run-1", project: "demo" },
+    factory,
+    deps: {
+      now: () => Date.now(),
+      changedTree: async () => ({ ok: true, top: dir, head, cwd: dir }),
+      buildCandidate: (a) => integrationRunner.buildCandidateTree(a),
+      runSuite: async (a) => { seen.push(a); return { ok: true }; },
+      land: (a) => integrationRunner.landCandidate(a),
+      recordFact: async ({ id }) => ({ ok: true, id }),
+      escalate: async () => ({ ok: false }),
+    },
+  });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.strictEqual(seen.length, 1);
+  assert.match(seen[0].base, /^[0-9a-f]{40}$/);
+  assert.match(seen[0].head, /^[0-9a-f]{40}$/);
+  assert.strictEqual(seen[0].head, git(dir, "rev-parse", "main").trim(), "head is the sha that landed");
+  assert.notStrictEqual(seen[0].base, seen[0].head);
 });
