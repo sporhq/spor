@@ -88,7 +88,10 @@ function resolveEmittedFactory() {
     assert.ok(payload.ok, `${ref}: ${payload.error || ""}`);
     gateNodes.set(ref, payload.payload);
   }
-  return { byId, def, ...gates.parseFactory(def.body || "", { gateNodes, id: def.id }) };
+  // The node's own repo stamp is the default repo scope, exactly as
+  // loadFactoryDefinition passes it (parseFrontmatter folds `repo:` into
+  // `.project`, the canonical field every consumer keys on).
+  return { byId, def, ...gates.parseFactory(def.body || "", { gateNodes, id: def.id, project: def.project || null }) };
 }
 
 test("the skill is registered like the other spor skills", () => {
@@ -151,6 +154,23 @@ test("the emitted factory parses with the runner's own vocabulary", () => {
   assert.strictEqual(review.source, "gate-adversarial-review", "provenance is the one visible difference");
   assert.strictEqual(review.cycles, 1, "the factory's `cycles` overrides the shared gate's own");
   assert.strictEqual(review.profile, "profile-codex-review");
+});
+
+test("the emitted factory is stamped `repo:` and that stamp is its default repo scope", () => {
+  // The stamp is load-bearing: with no `repos` in the payload it is the ONLY
+  // thing bounding which items a gated worker may judge
+  // (dec-spor-factory-declares-the-repos-it-judges), so the skill must emit
+  // the current `repo:` spelling rather than the legacy `project:` one.
+  for (const f of fixtureFiles()) {
+    const { raw } = parseFixture(f);
+    assert.match(raw, /^repo: acme-checkout$/m, `${f} carries the repo: stamp`);
+    assert.doesNotMatch(raw, /^project:/m, `${f} does not use the legacy project: key`);
+  }
+  const { factory, errors } = resolveEmittedFactory();
+  assert.deepStrictEqual(errors, []);
+  assert.deepStrictEqual(factory.repos, ["acme-checkout"], "the stamp becomes the default repo scope");
+  assert.ok(gates.inRepoScope("acme-checkout", gates.repoScope(factory.repos)));
+  assert.ok(!gates.inRepoScope("acme-billing", gates.repoScope(factory.repos)), "a sibling repo's items are out of scope");
 });
 
 test("the emitted integration block parses with the runner's own vocabulary", () => {

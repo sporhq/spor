@@ -1,7 +1,7 @@
 ---
 id: profile-codex-review
 type: profile
-project: acme-checkout
+repo: acme-checkout
 title: Cross-model adversarial reviewer
 summary: The review lane Acme's agent-review gate routes to — a different model from the implementer, run under a supervised harness so its structured verdict comes back on a report the runner can read.
 date: 2026-08-26
