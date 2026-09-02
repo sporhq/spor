@@ -1408,3 +1408,107 @@ test("the candidate suite is told what it is judging: SPOR_GATE_BASE/HEAD are th
   assert.strictEqual(seen[0].head, git(dir, "rev-parse", "main").trim(), "head is the sha that landed");
   assert.notStrictEqual(seen[0].base, seen[0].head);
 });
+
+// Push mode lands on a REMOTE ref whose local remote-tracking copy moves only
+// when this box pushes or fetches. A second pusher (another worker machine, a
+// human) advancing the branch between builds must be SEEN by the next
+// candidate build, or a lost race rebuilds on the same stale tip until the
+// retry cap (issue-spor-integration-push-mode-never-fetches).
+function pushModeFixture() {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "spor-integration-push-"));
+  const bare = path.join(parent, "origin.git");
+  execFileSync("git", ["init", "-q", "--bare", "-b", "main", bare], { stdio: "ignore" });
+  const seed = path.join(parent, "seed");
+  execFileSync("git", ["init", "-q", "-b", "main", seed], { stdio: "ignore" });
+  git(seed, "config", "user.email", "t@t");
+  git(seed, "config", "user.name", "Test");
+  fs.writeFileSync(path.join(seed, "a.txt"), "a\n");
+  git(seed, "add", "-A");
+  git(seed, "commit", "-q", "-m", "trusted");
+  git(seed, "remote", "add", "origin", bare);
+  git(seed, "push", "-q", "origin", "main");
+  // The worker's checkout: a clone with origin/main at the seed tip and a branch.
+  const worker = path.join(parent, "worker");
+  execFileSync("git", ["clone", "-q", bare, worker], { stdio: "ignore" });
+  git(worker, "config", "user.email", "t@t");
+  git(worker, "config", "user.name", "Test");
+  git(worker, "checkout", "-q", "-b", "impl");
+  fs.writeFileSync(path.join(worker, "b.txt"), "b\n");
+  git(worker, "add", "-A");
+  git(worker, "commit", "-q", "-m", "impl work");
+  git(worker, "checkout", "-q", "main");
+  return { parent, bare, seed, worker };
+}
+
+test("push mode fetches the target branch before every candidate build, so a rebuild sees another pusher's tip", () => {
+  const { seed, worker } = pushModeFixture();
+  const head = git(worker, "rev-parse", "impl").trim();
+  const staleTip = git(worker, "rev-parse", "origin/main").trim();
+  // Someone else lands on origin/main behind this worker's back.
+  fs.writeFileSync(path.join(seed, "c.txt"), "c\n");
+  git(seed, "add", "-A");
+  git(seed, "commit", "-q", "-m", "other pusher");
+  git(seed, "push", "-q", "origin", "main");
+  const liveTip = git(seed, "rev-parse", "main").trim();
+  assert.notStrictEqual(liveTip, staleTip);
+  assert.strictEqual(git(worker, "rev-parse", "origin/main").trim(), staleTip, "precondition: the worker's remote-tracking ref is stale");
+
+  const built = integrationRunner.buildCandidateTree({ top: worker, head, targetRef: "origin/main", strategy: "merge", mode: "push" });
+  assert.strictEqual(built.ok, true, built.reason);
+  try {
+    assert.strictEqual(built.expectedSha, liveTip, "the candidate is built on the LIVE remote tip, not the stale tracking ref");
+    assert.ok(fs.existsSync(path.join(built.dir, "c.txt")), "the other pusher's work is in the candidate tree");
+    assert.ok(fs.existsSync(path.join(built.dir, "b.txt")), "and so is the branch's");
+    assert.strictEqual(git(worker, "rev-parse", "origin/main").trim(), liveTip, "the fetch updated the remote-tracking ref");
+  } finally {
+    built.cleanup();
+  }
+});
+
+test("push mode fails closed when the target branch cannot be fetched", () => {
+  const { worker, parent } = pushModeFixture();
+  const head = git(worker, "rev-parse", "impl").trim();
+  git(worker, "remote", "set-url", "origin", path.join(parent, "does-not-exist.git"));
+  const built = integrationRunner.buildCandidateTree({ top: worker, head, targetRef: "origin/main", strategy: "merge", mode: "push" });
+  assert.strictEqual(built.ok, false);
+  assert.ok(!built.race && !built.conflict, "a fetch failure is neither a race nor a conflict");
+  assert.match(built.reason, /could not fetch origin\/main/);
+  assert.strictEqual(git(worker, "worktree", "list").trim().split("\n").length, 1, "no candidate worktree is left behind");
+});
+
+test("local mode never fetches — an unreachable origin does not stop a local landing", () => {
+  const { worker, parent } = pushModeFixture();
+  const head = git(worker, "rev-parse", "impl").trim();
+  git(worker, "remote", "set-url", "origin", path.join(parent, "does-not-exist.git"));
+  const built = integrationRunner.buildCandidateTree({ top: worker, head, targetRef: "main", strategy: "merge", mode: "local" });
+  assert.strictEqual(built.ok, true, built.reason);
+  built.cleanup();
+});
+
+test("runIntegrationStage passes the factory's integration mode through to buildCandidate", async () => {
+  const dir = integrationRepo();
+  const head = git(dir, "rev-parse", "branch").trim();
+  const factory = gates.parseFactory(["```json", JSON.stringify({ ...BASE, integration: { mode: "push", target_ref: "origin/main", command: "true" } }), "```"].join("\n"), { id: "factory-test" }).factory;
+  const seen = [];
+  const res = await integrationRunner.runIntegrationStage({
+    item: { node_id: "task-x", run_id: "run-1", project: "demo" },
+    factory,
+    deps: {
+      now: () => Date.now(),
+      changedTree: async () => ({ ok: true, top: dir, head, cwd: dir }),
+      buildCandidate: async (a) => { seen.push(a); return { ok: false, reason: "stop here" }; },
+      runSuite: async () => ({ ok: true }),
+      land: async () => ({ ok: false, reason: "unreached" }),
+      recordFact: async ({ id }) => ({ ok: true, id }),
+      runFix: async () => ({ ok: false, reason: "no fix" }),
+      escalate: async () => ({ ok: true, id: "task-h" }),
+      demote: async () => ({ ok: true }),
+      cleanupImplementer: async () => {},
+      log: () => {},
+    },
+  });
+  assert.ok(seen.length >= 1);
+  assert.strictEqual(seen[0].mode, "push");
+  assert.strictEqual(seen[0].targetRef, "origin/main");
+  assert.ok(res);
+});

@@ -1091,7 +1091,11 @@ untouched since; a path someone edited there meanwhile is left alone and named
 in the landing's note. `update-ref` alone leaves such a checkout reading as a
 staged revert of everything just landed, which a plain `git commit` there would
 then make real); push mode's rejection of a non-fast-forward push
-is the same guarantee over a remote ref. Either way, a **lost race rebuilds the
+is the same guarantee over a remote ref — and because the local
+remote-tracking ref only moves when this box pushes or fetches, push mode
+FETCHES the target branch before every candidate build (a fetch that cannot
+run fails the build closed, never a race), so a rebuild after a lost race
+really is against the live tip and not the same stale one. Either way, a **lost race rebuilds the
 candidate against the ref's new tip and reruns** — automatically, bounded by a
 small retry ceiling against the pathological case of a target that never stops
 moving, and *never* charged against the fix-cycle cap: the implementer did

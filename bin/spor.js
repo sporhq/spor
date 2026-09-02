@@ -10665,9 +10665,9 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
     },
     acquireLease: () => acquireIntegrationLease(cfg, home, top || (record && record.cwd), { slug }),
     releaseLease: (token) => releaseIntegrationLease(cfg, token),
-    buildCandidate: async ({ head, targetRef, strategy }) => {
+    buildCandidate: async ({ head, targetRef, strategy, mode }) => {
       const built = integrationRunner.buildCandidateTree({
-        top, head, targetRef, strategy, label: entry.node_id,
+        top, head, targetRef, strategy, mode, label: entry.node_id,
         teardown: (dir) => teardownThrowawayTree(dir, top, { slug, nodeId: entry.node_id, role: "integration", warn }),
       });
       if (!built.ok) return built;
