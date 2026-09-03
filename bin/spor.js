@@ -10053,16 +10053,79 @@ function gateRunReportText(record) {
 // on the log; reading just the report would file that session as
 // category "unknown" — the truncation case the early block exists for
 // (issue-spor-rescue-and-fix-sessions-end-turn-waiting-on-background-job).
-// `salvaged` marks a diagnosis read off an earlier message.
-function gateRescueDiagnosis(record, home) {
+// Between the two sits the rescue's DIAGNOSIS FILE — the channel that does
+// not depend on the harness at all. The stream read can only ever cover a
+// harness whose events carry a text path the client knows (a built-in
+// adapter's hook, a declared `report: lastText`); a declared harness that
+// writes its own report file (`report: file`) describes NO message shape, so
+// its stream is unreadable by construction and the salvage reads [] — the
+// row the stream fix could never close. So the rescue is also told to write
+// the same block to a named file in its own checkout (`rescueDiagnosisPath`:
+// `.spor-rescue/<run name>.json`, git-excluded and untracked, so the gates —
+// which judge tracked, committed work — never see it) the moment it has
+// diagnosed, and the read consults that file before the stream: a harness
+// that can run an implementer can write a file into its workspace, whatever
+// its sandbox or its stream looks like. `salvaged` says where a diagnosis
+// that was not in the final report came from: "file" or "stream".
+function gateRescueDiagnosis(record, home, { file = null } = {}) {
   const parsed = gatesKernel.parseRescueReport(gateRunReportText(record));
   if (parsed.ok) return parsed;
+  if (file) {
+    let raw = "";
+    try {
+      raw = fs.readFileSync(file, "utf8");
+    } catch {
+      raw = "";
+    }
+    if (raw.trim()) {
+      const p = gatesKernel.parseRescueReport(raw);
+      if (p.ok) return { ...p, salvaged: "file" };
+    }
+  }
   const earlier = dispatchRuns.runReportTexts(record, { home });
   for (let i = earlier.length - 1; i >= 0; i--) {
     const p = gatesKernel.parseRescueReport(earlier[i]);
-    if (p.ok) return { ...p, salvaged: true };
+    if (p.ok) return { ...p, salvaged: "stream" };
   }
   return parsed;
+}
+
+// Where a rescue run writes its diagnosis file: inside the checkout it works
+// in (the one place every harness sandbox lets an implementer write), under a
+// directory of its own, keyed by the run's unique name so a resumed pipeline
+// adopting the run by name finds the same file.
+const RESCUE_DIAGNOSIS_DIR = ".spor-rescue";
+function rescueDiagnosisPath(cwd, name) {
+  return path.join(cwd, RESCUE_DIAGNOSIS_DIR, `${name}.json`);
+}
+
+// Keep that directory out of git for the checkout: an entry in the repo's
+// own `info/exclude` (never the tracked .gitignore — that would be a change
+// under review), so a rescue that stages with `git add -A` cannot commit its
+// diagnosis into the branch the gates judge. Idempotent, fail-soft: a
+// checkout that is not a git repo, or an exclude file that cannot be
+// written, leaves the gates' own untracked-residue tolerance as the backstop.
+function excludeRescueDiagnosisDir(cwd) {
+  try {
+    const r = spawnSync("git", ["-C", cwd, "rev-parse", "--git-path", "info/exclude"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] });
+    if (r.status !== 0) return false;
+    const rel = String(r.stdout || "").trim();
+    if (!rel) return false;
+    const exclude = path.resolve(cwd, rel);
+    const entry = `/${RESCUE_DIAGNOSIS_DIR}/`;
+    let cur = "";
+    try {
+      cur = fs.readFileSync(exclude, "utf8");
+    } catch {
+      cur = "";
+    }
+    if (cur.split(/\r?\n/).some((l) => l.trim() === entry)) return true;
+    fs.mkdirSync(path.dirname(exclude), { recursive: true });
+    fs.appendFileSync(exclude, `${cur && !cur.endsWith("\n") ? "\n" : ""}${entry}\n`);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Gate nodes mint `date:` from `new Date()` at write time (WORKERS.md §10.7),
@@ -11013,6 +11076,10 @@ function makeGateDeps(
     const spent = gatesKernel.describeCycles(gate, attempts || []);
     const blocking = (findings || []).filter((f) => f.blocking !== false);
     const advisory = (findings || []).filter((f) => f.blocking === false);
+    const name = `rescue-${short}-${attempt}`;
+    // The harness-agnostic diagnosis channel (see gateRescueDiagnosis): the
+    // file the prompt names, git-excluded in the checkout before the launch.
+    const diagnosisFile = rescueDiagnosisPath(cwd, name);
     const prompt = [
       `You are the RESCUE lane of the '${factory.id || "factory"}' factory for Spor work item ${entry.node_id} (rescue attempt ${attempt} of ${lane.attempts}).`,
       `The '${gate.id}' ${gate.kind} gate refused this item and its fix cycles are spent (${spent.text}). Without you, a person`,
@@ -11083,6 +11150,11 @@ function makeGateDeps(
       "verification, so a session cut short still yields a category — and restate it at the end of your final message",
       "once `fixed` and `filed` are known (the runner reads the LAST block of your final message, and falls back to the",
       "last block of any earlier message — so the early block counts even if your final message never comes). Exactly this shape:",
+      "",
+      `ALSO write that same JSON object (the object alone, no fence needed) to \`${diagnosisFile}\` the moment you have`,
+      "diagnosed, and rewrite it whenever `fixed` or `filed` change — the runner reads that file whenever your final",
+      "message carries no block, whatever harness you run under. The file is git-excluded and untracked: it does not",
+      "dirty the tree, and you must never `git add` or commit it.",
       "```json",
       `{"diagnosis": "what went wrong, in one or two sentences", "category": "reviewer-drift" | "real-defect" | "stale-premise" | "environment", "fixed": true | false, "filed": ["task-..."]}`,
       "```",
@@ -11091,7 +11163,6 @@ function makeGateDeps(
       "",
       workerContractLib.ONE_TURN_NOTICE,
     ].join("\n");
-    const name = `rescue-${short}-${attempt}`;
     // Adopted on resume exactly like a fix cycle: the launcher writes the run
     // record before dispatch returns, so a worker killed between the launch
     // and its durable record still finds the run by its unique name.
@@ -11134,6 +11205,10 @@ function makeGateDeps(
         );
       }
       values = { ...shaped.values, profile: lane.profile, node: entry.node_id, dir: cwd, force: true, "no-worktree": true, name };
+      // Fail-soft and silent: where the exclude cannot be written (not a git
+      // checkout, an unwritable info/exclude) the gates' own untracked-residue
+      // tolerance is the backstop.
+      excludeRescueDiagnosisDir(cwd);
     }
     const launched = already ? { ok: true, run: already, adopted: true } : await dispatch(cfg, values, [prompt]);
     if (!launched.ok) return { ok: false, reason: `the rescue under ${lane.profile} could not be dispatched: ${launched.reason}` };
@@ -11148,8 +11223,9 @@ function makeGateDeps(
     }
     const done = await awaitGateRun(cfg, launched.run.run_id, { timeoutMs: lane.awaitMs, warn, sleep });
     if (!done.ok) return { ok: false, reason: done.reason };
-    const parsed = gateRescueDiagnosis(done.record, home);
-    if (parsed.salvaged) log(`work: rescue attempt ${attempt} on ${entry.node_id} left no diagnosis block in its final report — read the last one from an earlier message on its stream`);
+    const parsed = gateRescueDiagnosis(done.record, home, { file: diagnosisFile });
+    if (parsed.salvaged === "file") log(`work: rescue attempt ${attempt} on ${entry.node_id} left no diagnosis block in its final report — read the one it wrote to ${diagnosisFile}`);
+    else if (parsed.salvaged) log(`work: rescue attempt ${attempt} on ${entry.node_id} left no diagnosis block in its final report — read the last one from an earlier message on its stream`);
     if (!parsed.ok) log(`work: rescue attempt ${attempt} on ${entry.node_id} left no structured diagnosis (${parsed.error}) — its tree is judged regardless`);
     return { ok: true, runId: launched.run.run_id, diagnosis: parsed.diagnosis, category: parsed.category, fixed: parsed.fixed, filed: parsed.filed, unread: !parsed.ok, record: done.record };
   };
@@ -15429,7 +15505,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { loadedCodeCommit, makeCodeMovedNotice, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
+module.exports = { loadedCodeCommit, makeCodeMovedNotice, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
 
 if (require.main === module) {
   main()

@@ -1748,7 +1748,12 @@ a stale premise is triage's, not the lane's.
    is MANDATORY and asked for EARLY — the moment the diagnosis exists, before
    any fix or long verification, restated at the end once `fixed`/`filed` are
    known (the parser takes the LAST block) — so a session cut short still
-   yields a category; and the prompt ends with the one-turn notice (§4):
+   yields a category. It is also told to write that same object to a named
+   DIAGNOSIS FILE in its own checkout (`.spor-rescue/<run name>.json`,
+   git-excluded through the repo's `info/exclude` before the launch, so it
+   is neither tracked nor untracked-visible and can never be committed) the
+   moment it has diagnosed — the channel that does not depend on what the
+   harness's stream looks like; and the prompt ends with the one-turn notice (§4):
    verify in the foreground, never background a suite and end the turn
    waiting on it, an uncommitted tree is a refusal.
 3. Reads the rescue's final report in code (`parseRescueReport`,
@@ -1763,8 +1768,16 @@ a stale premise is triage's, not the lane's.
    `agent_message` items; a DECLARED harness's declaration rides the run
    record — the supervisor stamps it there before it deletes the job file, so
    a finished run's log is still readable), newest first, and logs that it
-   did — so the truncated session the early block exists for still yields
-   its category whichever harness the rescue profile names. This read
+   did. Between the report and the stream sits the diagnosis FILE the rescue
+   was told to write: the stream read can only cover a harness whose events
+   carry a text path the client knows, and a declared harness that writes its
+   own report (`report: file`) describes no message shape at all, so its
+   stream is unreadable by construction — the file is what closes that row,
+   since whatever the harness or its sandbox, an implementer can write into
+   its workspace. The order is the final report's last block, then the file,
+   then the stream (`gateRescueDiagnosis`, bin/spor.js), each logged when it
+   is the one that answered — so the truncated session the early block exists
+   for still yields its category whichever harness the rescue profile names. This read
    is deliberately FAIL-SOFT, unlike a review
    verdict: it feeds only the escalation body and the rescue fact, so a rescue
    that fixed the tree and forgot the block still gets its fix judged. A rescue

@@ -3657,6 +3657,116 @@ test("the rescue's early diagnosis block survives a final message that overwrote
   assert.ok(logs.some((l) => /left no diagnosis block in its final report — read the last one from an earlier message/.test(l)), `the salvage is logged (saw ${JSON.stringify(logs)})`);
 });
 
+// issue-spor-rescue-and-fix-sessions-end-turn-waiting-on-background-job (F2,
+// the mechanism rather than its next row): the stream salvage above can only
+// read a harness whose events carry a text path the client knows — a
+// declared harness that writes its own report file (`report: file`) describes
+// no message shape at all, so its stream reads [] by construction and an early
+// block was still lost there. The rescue is therefore also told to write the
+// block to a named, git-excluded file in its own checkout, and the diagnosis
+// read consults that file before the stream: whatever the harness, an
+// implementer can write a file into its workspace.
+test("the rescue's diagnosis file is read when the final report has no block and the harness's stream is unreadable", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-rescue-file-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  fs.writeFileSync(path.join(home, "nodes", "task-fix-me.md"), "---\nid: task-fix-me\ntype: task\ntitle: Make the bound exclusive\nsummary: The loop over-reads by one element.\nstatus: open\ndate: 2026-09-03\n---\n\nAcceptance: reading N items yields N.\n");
+  fs.writeFileSync(path.join(home, "nodes", "profile-claude-fable.md"), "---\nid: profile-claude-fable\ntype: profile\ntitle: The strong-model rescue profile\nharness: claude-code\nsummary: The strong-model rescue profile.\ndate: 2026-09-03\n---\n\nThe rescue lane's profile.\n");
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-rescue-file-repo-"));
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  g("init", "-q", "-b", "main");
+  fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n;\n");
+  g("add", "."); g("commit", "-q", "-m", "base");
+  g("checkout", "-q", "-b", "task-fix-me");
+  fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n + 1;\n");
+  g("commit", "-q", "-am", "implement");
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  const runId = "aaaaaaaa-bbbb-cccc-dddd-ffffffffffff";
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, { run_id: runId, node_id: "task-fix-me", state: "done", created_at: new Date().toISOString() });
+  const waiting = "Fix committed to the tree. The full suite is running in the background; I'll commit the test as soon as its notification arrives.";
+  const block = { diagnosis: "the fixer widened the bound instead of tightening it", category: "real-defect", fixed: false, filed: ["task-review-say-which-way"] };
+  const logs = [];
+  const launches = [];
+  let writeFile = true;
+  const deps = sporCli.makeGateDeps(cfg, {
+    record: { node_id: "task-fix-me", cwd: repo },
+    entry: { run_id: runId, node_id: "task-fix-me", project: null },
+    factory: { id: "factory-test", rescue: { profile: "profile-claude-fable", attempts: 3, awaitMs: 5000 } },
+    slug: null, passthrough: {},
+    warn: () => {}, log: (l) => logs.push(l), stopping: () => false, home,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    dispatch: async (_cfg, values, positionals) => {
+      launches.push({ values, prompt: positionals[0] });
+      const id = `rescue-run-${values.name}`;
+      const p = dispatchRuns.runPaths(home, id);
+      fs.writeFileSync(p.report, `${waiting}\n`);
+      // A stream with a message shape the client has no adapter for: a
+      // declared `report: file` harness, whose declaration names no text
+      // path — runReportTexts reads nothing off it.
+      fs.writeFileSync(p.log, `${JSON.stringify({ kind: "msg", body: "Diagnosed: " + JSON.stringify(block) })}\n${JSON.stringify({ kind: "msg", body: waiting })}\n`);
+      // The agent, doing what the prompt asks: the object alone, in the named file.
+      if (writeFile) {
+        const file = sporCli.rescueDiagnosisPath(repo, values.name);
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, `${JSON.stringify(block)}\n`);
+      }
+      dispatchRuns.atomicJson(p.record, { run_id: id, node_id: "task-fix-me", name: values.name, harness: "own-report-harness", state: "done", created_at: new Date().toISOString(), log_path: p.log, report_path: p.report });
+      return { ok: true, run: { run_id: id, harness: "own-report-harness" } };
+    },
+  });
+  const gate = { id: "adversarial-review", kind: "agent-review", profile: "profile-review", cycles: 1 };
+  const base = { gate, detail: "changes requested", evidence: "", findings: [], attempts: [], ledger: [], fact: "art-gate-x", facts: ["art-gate-x"], previous: [] };
+  assert.ok((await deps.changedPaths({ trustedRef: "main" })).ok);
+
+  const r1 = await deps.rescue({ ...base, attempt: 1 });
+  assert.strictEqual(r1.ok, true, r1.reason);
+  assert.deepStrictEqual([r1.category, r1.fixed, r1.filed, r1.unread], ["real-defect", false, ["task-review-say-which-way"], false], "the file's block is the diagnosis, not 'unknown'");
+  assert.match(r1.diagnosis, /widened the bound/);
+  const file1 = sporCli.rescueDiagnosisPath(repo, "rescue-aaaaaaaa-1");
+  assert.ok(logs.some((l) => l.includes(`left no diagnosis block in its final report — read the one it wrote to ${file1}`)), `the file read is logged (saw ${JSON.stringify(logs)})`);
+  // The prompt names the file, absolute, and says it must never be committed.
+  assert.ok(launches[0].prompt.includes(`\`${file1}\``), "the prompt names the diagnosis file");
+  assert.match(launches[0].prompt, /never `git add` or commit it/);
+  // The checkout excludes the directory: the file is invisible to git, so the
+  // gates' tracked-only judgement and a `git add -A` both leave it alone.
+  assert.strictEqual(g("status", "--porcelain"), "", "the diagnosis file is neither tracked nor untracked-visible");
+  assert.match(fs.readFileSync(path.join(repo, ".git", "info", "exclude"), "utf8"), /^\/\.spor-rescue\/$/m);
+  assert.strictEqual(fs.existsSync(file1), true);
+
+  // No file (a rescue that never wrote one) and an unreadable stream: unread, as before.
+  writeFile = false;
+  logs.length = 0;
+  const r2 = await deps.rescue({ ...base, attempt: 2 });
+  assert.deepStrictEqual([r2.category, r2.unread], ["unknown", true]);
+  assert.ok(logs.some((l) => /left no structured diagnosis/.test(l)));
+  // The exclude entry is written once, however many rescues the checkout sees.
+  assert.strictEqual((fs.readFileSync(path.join(repo, ".git", "info", "exclude"), "utf8").match(/^\/\.spor-rescue\/$/gm) || []).length, 1);
+  assert.strictEqual(sporCli.excludeRescueDiagnosisDir(repo), true);
+  assert.strictEqual((fs.readFileSync(path.join(repo, ".git", "info", "exclude"), "utf8").match(/^\/\.spor-rescue\/$/gm) || []).length, 1, "idempotent");
+  assert.strictEqual(sporCli.excludeRescueDiagnosisDir(fs.mkdtempSync(path.join(os.tmpdir(), "spor-not-a-repo-"))), false, "fail-soft outside a repo");
+
+  // Precedence, read directly: a block in the final report beats the file,
+  // the file beats the stream, and each source stands in for a missing one.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-rescue-prec-"));
+  const report = path.join(dir, "r.md");
+  const log = path.join(dir, "r.log");
+  const file = path.join(dir, "d.json");
+  const line = (o) => `${JSON.stringify(o)}\n`;
+  fs.writeFileSync(log, line({ type: "assistant", message: { content: [{ type: "text", text: '```json\n{"diagnosis":"from the stream","category":"environment"}\n```' }] } }));
+  fs.writeFileSync(file, JSON.stringify({ diagnosis: "from the file", category: "reviewer-drift", fixed: true, filed: [] }));
+  fs.writeFileSync(report, 'done\n```json\n{"diagnosis":"from the report","category":"stale-premise"}\n```\n');
+  const rec = { harness: "claude-code", report_path: report, log_path: log };
+  assert.deepStrictEqual([sporCli.gateRescueDiagnosis(rec, home, { file }).diagnosis, sporCli.gateRescueDiagnosis(rec, home, { file }).salvaged], ["from the report", undefined]);
+  fs.writeFileSync(report, "just prose\n");
+  assert.deepStrictEqual([sporCli.gateRescueDiagnosis(rec, home, { file }).diagnosis, sporCli.gateRescueDiagnosis(rec, home, { file }).salvaged, sporCli.gateRescueDiagnosis(rec, home, { file }).fixed], ["from the file", "file", true]);
+  fs.writeFileSync(file, "{not json");
+  assert.deepStrictEqual([sporCli.gateRescueDiagnosis(rec, home, { file }).diagnosis, sporCli.gateRescueDiagnosis(rec, home, { file }).salvaged], ["from the stream", "stream"], "an unparseable file falls through to the stream");
+  fs.unlinkSync(file);
+  assert.strictEqual(sporCli.gateRescueDiagnosis(rec, home, { file }).salvaged, "stream", "a missing file falls through to the stream");
+  assert.strictEqual(sporCli.gateRescueDiagnosis(rec, home).salvaged, "stream", "no file named at all: as before");
+});
+
 test("the real rescue dispatch runs under the rescue profile in the run's own checkout with the full history, its diagnosis is read in code, and the escalation body opens with it", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-rescue-prompt-"));
   fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
