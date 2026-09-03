@@ -1103,8 +1103,10 @@ moves afterwards — a gate fix that lands on `main` at noon does not reach a
 worker started at nine until it is restarted (a worker ran a whole day on code
 predating the rescue-pass round-trip that had landed hours earlier). So the
 worker says at startup which code it runs — the checkout's commit and branch
-when the package root is a git checkout, the package version when it is an
-npm install — and, once per pass, logs a one-line notice the first time that
+when the package root is a SOURCE checkout (its own `package.json` is tracked
+from there — git walks up, so an npm install nested under a consumer's
+`node_modules/` would otherwise answer with the consumer's commit), the
+package version when it is an install — and, once per pass, logs a one-line notice the first time that
 checkout has moved past the loaded commit (once per new tip, never once per
 pass). It never restarts itself: which code a worker runs is the operator's
 call; the notice only makes the drift visible in the log rather than
@@ -1758,9 +1760,11 @@ a stale premise is triage's, not the lane's.
    message on that log (`runReportTexts`, through the harness adapter's own
    report hook — or, on a harness that writes its report file itself and so
    declares no report hook, its read-only `messageFromEvent`: Codex's
-   `agent_message` items), newest first, and logs that it did — so the
-   truncated session the early block exists for still yields its category
-   whichever harness the rescue profile names. This read
+   `agent_message` items; a DECLARED harness's declaration rides the run
+   record — the supervisor stamps it there before it deletes the job file, so
+   a finished run's log is still readable), newest first, and logs that it
+   did — so the truncated session the early block exists for still yields
+   its category whichever harness the rescue profile names. This read
    is deliberately FAIL-SOFT, unlike a review
    verdict: it feeds only the escalation body and the rescue fact, so a rescue
    that fixed the tree and forgot the block still gets its fix judged. A rescue

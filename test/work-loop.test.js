@@ -1806,6 +1806,9 @@ test("makeCodeMovedNotice says once per new tip that the loaded code was moved p
   const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
   g("init", "-q", "-b", "main");
   fs.writeFileSync(path.join(repo, "a"), "1\n");
+  fs.writeFileSync(path.join(repo, "package.json"), '{"name":"x","version":"0.0.1"}\n');
+  fs.mkdirSync(path.join(repo, "lib"));
+  fs.writeFileSync(path.join(repo, "lib", "i.js"), "");
   g("add", "."); g("commit", "-q", "-m", "one");
   const loaded = loadedCodeCommit(repo);
   assert.deepStrictEqual(loaded, { commit: g("rev-parse", "--short", "HEAD"), branch: "main" });
@@ -1823,6 +1826,26 @@ test("makeCodeMovedNotice says once per new tip that the loaded code was moved p
   g("commit", "-q", "-am", "three");
   notice();
   assert.strictEqual(lines.length, 2, "a further move is said again");
+  // F4 (issue-spor-rescue-and-fix-sessions-end-turn-waiting-on-background-job):
+  // git walks UP, so a probe from a directory INSIDE a checkout that is not
+  // itself the tracked package root must not answer with the enclosing
+  // checkout's commit — a subdirectory of the source (`lib/`), an npm install
+  // nested under a consumer's node_modules (ignored, untracked, or even
+  // vendored and tracked) are all "not a source checkout": null, so the
+  // worker announces the package version instead of a commit it never loaded.
+  assert.strictEqual(loadedCodeCommit(path.join(repo, "lib")), null, "a subdirectory of the checkout is not the package root");
+  const nested = path.join(repo, "node_modules", "@sporhq", "spor");
+  fs.mkdirSync(nested, { recursive: true });
+  fs.writeFileSync(path.join(nested, "package.json"), '{"name":"@sporhq/spor","version":"9.9.9"}\n');
+  assert.strictEqual(loadedCodeCommit(nested), null, "an untracked install under a consumer checkout");
+  g("add", "-f", "node_modules"); g("commit", "-q", "-m", "vendor");
+  assert.strictEqual(loadedCodeCommit(nested), null, "a vendored (tracked) install under a consumer checkout");
+  const sub = path.join(repo, "packages", "spor");
+  fs.mkdirSync(sub, { recursive: true });
+  fs.writeFileSync(path.join(sub, "package.json"), '{"name":"@sporhq/spor","version":"0.0.1"}\n');
+  assert.strictEqual(loadedCodeCommit(sub), null, "an untracked package dir is not a source checkout");
+  g("add", "packages"); g("commit", "-q", "-m", "monorepo");
+  assert.deepStrictEqual(loadedCodeCommit(sub), { commit: g("rev-parse", "--short", "HEAD"), branch: "main" }, "a tracked monorepo package IS a source checkout");
   // Not a git checkout (an npm install): nothing is known, nothing is said.
   const plain = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-plain-"));
   assert.strictEqual(loadedCodeCommit(plain), null);

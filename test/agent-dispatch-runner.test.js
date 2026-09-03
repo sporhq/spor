@@ -289,6 +289,37 @@ test("runReportTexts reads every final-message candidate back off the run log, i
   assert.deepStrictEqual(runReportTexts({ run_id: "run-declared", harness: "fake", log_path: log }), [], "without a home the declaration cannot be found");
 });
 
+// F2's second residual (issue-spor-rescue-and-fix-sessions-end-turn-waiting-
+// on-background-job): a DECLARED harness's declaration lived only in the job
+// file, which the supervisor deletes at launch — so for every FINISHED
+// declared-harness run runReportTexts had nothing to rebuild the adapter from
+// and the early block was lost. The supervisor now stamps the declaration on
+// the persistent run record before the job file goes; the reader needs no
+// home and no job file.
+test("runJob carries a declared harness's declaration onto the run record so the log stays readable after the job file is gone", async () => {
+  const { runReportTexts } = require("../lib/shell/agent-dispatch-runner.js");
+  const declaration = { id: "fake", command: "/bin/fake", args: [], label: "Fake", session: [], report: { from: "lastText", text: ["message.text"] } };
+  const fixture = jobFixture(
+    'process.stdout.write(JSON.stringify({kind:"message",message:{text:"```json\\n{\\"diagnosis\\":\\"early\\",\\"category\\":\\"prompt\\"}\\n```"}}) + "\\n" + JSON.stringify({kind:"message",message:{text:"I will commit once the suite notifies me."}}) + "\\n"); process.exit(0);',
+    "p\n"
+  );
+  const job = readJson(fixture.job);
+  atomicJson(fixture.job, { ...job, harness: "fake", harness_declaration: declaration });
+  atomicJson(fixture.record, { ...readJson(fixture.record), harness: "fake" });
+  assert.strictEqual(await runJob(fixture.job), 0);
+  assert.ok(!fs.existsSync(fixture.job), "the job file is gone after launch");
+  const record = readJson(fixture.record);
+  assert.deepStrictEqual(record.harness_declaration, declaration, "the declaration rides the record");
+  assert.strictEqual(record.state, "done");
+  const texts = runReportTexts(record);
+  assert.strictEqual(texts.length, 2, `both messages read back off the log with no home and no job file (${JSON.stringify(texts)})`);
+  assert.match(texts[0], /"diagnosis":"early"/);
+  // A built-in harness stamps nothing (byte-identical).
+  const plain = jobFixture("process.exit(0);", "p\n");
+  await runJob(plain.job);
+  assert.strictEqual(readJson(plain.record).harness_declaration, undefined);
+});
+
 // F2's residual: Codex writes its report itself (`--output-last-message`) and
 // so declares NO reportFromEvent — which left a Codex rescue's stream with no
 // text hook, runReportTexts empty, and the early block lost. The adapter now

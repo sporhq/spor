@@ -12414,11 +12414,23 @@ async function writeRegateArtifact(cfg, { record, entry, factoryId, previous, re
 // never applied to its pipelines — issue-spor-rescue-and-fix-sessions-end-turn-
 // waiting-on-background-job, task-spor-work-announce-lib-commit-and-notice-
 // main-moved). `loadedCodeCommit` names that code: the checkout's HEAD when
-// the package root is a git checkout (a developer's clone, a worktree), null
-// when it is not (an npm install — the package version stands in). Fail-soft
-// and bounded: one `git rev-parse` per call, never a throw.
+// the package root is a SOURCE checkout (a developer's clone, a worktree, a
+// monorepo package), null when it is not (an npm install — the package
+// version stands in). "Is a git checkout" is NOT `git rev-parse` succeeding:
+// git walks UP from any directory, so an npm-installed copy under a
+// consumer's `node_modules/` answers with the CONSUMER's commit and the
+// worker would announce, and watch, code it never loaded
+// (issue-spor-rescue-and-fix-sessions-end-turn-waiting-on-background-job,
+// F4). A source checkout is one whose own `package.json` git TRACKS from
+// that root (an install's is ignored or untracked, and a subdirectory of a
+// checkout — `lib/` — has none), and that is not itself under a
+// `node_modules` segment (a vendored copy is still an install). Fail-soft
+// and bounded: a few short `git` calls per call, never a throw.
 function loadedCodeCommit(root = ROOT) {
   try {
+    if (path.resolve(root).split(path.sep).includes("node_modules")) return null;
+    const tracked = spawnSync("git", ["-C", root, "ls-files", "--error-unmatch", "--", "package.json"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] });
+    if (tracked.status !== 0 || !String(tracked.stdout || "").trim()) return null;
     const r = spawnSync("git", ["-C", root, "rev-parse", "--short", "HEAD"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] });
     if (r.status !== 0) return null;
     const commit = String(r.stdout || "").trim();
