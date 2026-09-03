@@ -29,6 +29,10 @@ test("a BARE worker's contract is the plain commit-then-resolve discipline, with
   assert.match(text, /`resolves`\n?\s*edge to `task-demo`/);
   assert.match(text, /leave the\nitem UNRESOLVED/);
   assert.match(text, /FINDINGS: none/);
+  // The durable-debt checklist rides in the bare contract too: it is design
+  // discipline, not a factory fact (task-spor-review-gate-durable-debt-flag-checklist).
+  assert.match(text, /introduces or extends a durable retry\/debt flag[\s\S]*say how each is handled in the commit message/);
+  assert.match(text, /\n   \(a\) the flag write itself fails[\s\S]*\n   \(b\) clear-before-owe[\s\S]*\n   \(c\) the check-then-write race[\s\S]*\n   \(d\) a stale flag against already-settled state/, "the four rows, indented under step 4");
   // Nothing a bare worker has no way to honor.
   assert.doesNotMatch(text, /integration stage/);
   assert.doesNotMatch(text, /protected test paths/);
@@ -56,6 +60,7 @@ test("a FACTORY worker's contract names the integration target, the acceptance c
   assert.match(text, /acceptance command \(`npm test`\)/);
   assert.match(text, /second model reviews `git diff release\.\.\.HEAD`/);
   assert.match(text, /terminal status \(`resolved`\)/);
+  assert.match(text, /\(d\) a stale flag against already-settled state/, "the durable-debt checklist rides under a factory too");
 });
 
 test("a factory with NO integration block tells the worker landing is not its job, without naming a stage that does not exist", () => {

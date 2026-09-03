@@ -3006,6 +3006,14 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.match(p0, /"evidence": "the command\/test you ran and what it showed"/);
   assert.doesNotMatch(p0, /## Prior findings/, "no prior set on the initial review");
   assert.doesNotMatch(p0, /introduced_by_fix/, "attribution is only asked for on a fix cycle");
+  // task-spor-review-gate-durable-debt-flag-checklist: the four failure modes
+  // of a retry/debt flag are asked for in ONE verdict, and the block sits
+  // after the gate's own instructions.
+  assert.match(p0, /## Durable retry\/debt flags — review the mechanism WHOLE, in this one verdict/);
+  assert.match(p0, /file every row that is open in THIS verdict, each as its own finding naming the row/);
+  assert.match(p0, /\(a\) the flag write itself fails[\s\S]*\(b\) clear-before-owe ordering[\s\S]*\(c\) the check-then-write race[\s\S]*\(d\) a stale flag against already-settled state/);
+  assert.ok(p0.indexOf("Hunt for off-by-ones.") < p0.indexOf("## Durable retry/debt flags"), "the checklist follows the gate's instructions");
+  assert.doesNotMatch(p0, /walk the table again against the writes the fix added/, "the fix-cycle reading of the table is only on a fix cycle");
 
   // A fix cycle lands a commit; review 2 is handed the prior finding and that commit.
   fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n;\n");
@@ -3023,6 +3031,8 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.match(p1, /"prior": \[\{"id": "F1", "status": "resolved" \| "open"/);
   assert.match(p1, /"introduced_by_fix": true \| false/);
   assert.match(p1, /omits any prior finding \(neither cleared nor confirmed\) is UNREADABLE/);
+  assert.match(p1, /## Durable retry\/debt flags — review the mechanism WHOLE/);
+  assert.match(p1, /walk the table again against the writes the fix added or reordered: a row the fix\nINTRODUCED is blocking \(`introduced_by_fix: true`\)/);
 
   // And the fix prompt names the findings by id, splits advisory from blocking,
   // and lists what earlier cycles already resolved.
@@ -3058,6 +3068,8 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.match(fixLaunch.prompt, /Advisory \(recorded, not enforced — fix if cheap\):\nF3 \[major\] x\.js — name the constant/);
   assert.match(fixLaunch.prompt, /Already resolved by earlier cycles \(do not regress\):\nF1 \[blocking\] x\.js — off by one/);
   assert.match(fixLaunch.prompt, /naming the finding ids you addressed in the commit message/);
+  // …and hands the fixer the same durable-debt table the reviewer walks.
+  assert.match(fixLaunch.prompt, /If the fix touches a durable retry\/debt flag[\s\S]*say how each is handled in the commit message[\s\S]*\(a\) the flag write itself fails[\s\S]*\(d\) a stale flag against already-settled state/);
 });
 
 // --- the dirty-tree round-trip (task-spor-worker-declined-outcome) --------
