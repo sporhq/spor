@@ -98,7 +98,11 @@ Declared harness test profile.
 // A fake harness speaking an event shape no in-code adapter knows: the whole
 // point is that the DECLARATION teaches the supervisor where the session id
 // and the final message live.
-function harnessStub(home, { writesReport = false, exitCode = 0, delayMs = 0 } = {}) {
+// `holdFile` keeps the stub ALIVE until that file exists (a test creates it
+// when it is ready for the run to end), with a 30s backstop so a failed test
+// never leaks a process. It is how a test asserts ORDERING — dispatch returned
+// while the run was still going — without a wall-clock bound.
+function harnessStub(home, { writesReport = false, exitCode = 0, delayMs = 0, holdFile = null } = {}) {
   return writeSpawnableNodeStub(home, "ox-stub", `
 const fs = require("node:fs");
 let prompt = "";
@@ -118,7 +122,17 @@ process.stdin.on("end", () => {
     const flag = process.argv.slice(2).find((a) => a.startsWith("--out="));
     fs.writeFileSync(flag.slice("--out=".length), "written by the harness itself\\n");
   }
-  setTimeout(() => process.exit(${exitCode}), ${delayMs});
+  const holdFile = ${JSON.stringify(holdFile)};
+  if (holdFile) {
+    const deadline = Date.now() + 30000;
+    const poll = () => {
+      if (fs.existsSync(holdFile) || Date.now() > deadline) process.exit(${exitCode});
+      setTimeout(poll, 25);
+    };
+    poll();
+  } else {
+    setTimeout(() => process.exit(${exitCode}), ${delayMs});
+  }
 });
 `);
 }
@@ -474,12 +488,17 @@ test("--read-only on a declared harness refuses before launch — no posture mea
 
 test("a declared dispatch launches the bound command, binds its session, and recovers the report", async () => {
   const { home, repo } = fixture({ declaration: null });
-  const stub = harnessStub(home, { delayMs: 1500 });
+  // The stub does not exit until the test releases it, so "dispatch returned
+  // before the run ended" is an ORDERING fact — the run record cannot be
+  // terminal while the child is still held — not a wall-clock bound that a
+  // loaded box (five suites running concurrently) turns into a flake
+  // (issue-spor-declared-harness-dispatch-timing-flake).
+  const release = path.join(home, "release-the-stub");
+  const stub = harnessStub(home, { holdFile: release });
   fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({
     dispatch: { harness: { [HARNESS]: declarationFor(stub) } },
   }, null, 2) + "\n");
   const outfile = path.join(home, "invocation.json");
-  const started = Date.now();
   const result = run(
     ["dispatch", "task-declared", "--dir", repo, "--profile", "profile-declared", "--no-brief"],
     // Nothing this harness needs is on PATH — the declaration is the ONLY way
@@ -487,8 +506,7 @@ test("a declared dispatch launches the bound command, binds its session, and rec
     { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode(), OUTFILE: outfile }
   );
   assert.strictEqual(result.status, 0, `${result.stderr}\n${result.stdout}`);
-  assert.ok(Date.now() - started < 1400, "dispatch returns after the launch handshake, not after the run");
-  assert.match(result.stdout, /Ox Alpha supervisor (launching|running|done)/);
+  assert.match(result.stdout, /Ox Alpha supervisor (launching|running)/, "dispatch returns after the launch handshake, not after the run");
 
   const invocation = await awaitJson(outfile);
   assert.ok(invocation, "the detached stub ran");
@@ -497,6 +515,11 @@ test("a declared dispatch launches the bound command, binds its session, and rec
   assert.match(invocation.prompt, /task-declared/, "the prompt arrives on stdin");
   assert.ok(!invocation.args.some((a) => a.includes("task-declared")), "and never in argv");
 
+  const live = await awaitRecord(home, () => true);
+  assert.ok(live, "the supervisor opened a run record");
+  assert.notStrictEqual(live.state, "done", "the run is still going after dispatch has returned — the launcher did not wait for it");
+
+  fs.writeFileSync(release, "");
   const record = await awaitRecord(home, (r) => r.state === "done");
   assert.ok(record, "the supervised run reaches a terminal state");
   assert.strictEqual(record.harness, HARNESS);
