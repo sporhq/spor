@@ -465,3 +465,95 @@ test("a later review may demonstrate an earlier undemonstrated blocking finding 
   // Rolling the upgrade cycle back returns it to advisory.
   assert.deepStrictEqual(gates.rollbackCycle(ledger, 1).map((e) => [e.id, e.status, e.blocking]), [["F1", "advisory", false]]);
 });
+
+// Review finding 2 on the third cut: a verdict that cannot be read at all —
+// an unrecognized verdict word, or no structured verdict anywhere — used to
+// come back with an EMPTY findings list, so on a fix cycle the fixer was sent
+// off with nothing to fix and the prior blocking set silently dropped out of
+// the cycle. Unreadable answers nothing: the whole prior set is carried, open.
+test("an unrecognized or absent fix-cycle verdict carries the prior blocking set to the fixer instead of discarding it", () => {
+  const prior = [
+    { id: "F1", severity: "blocking", file: "a.js", summary: "races", evidence: "node race.js", opened: 0 },
+    { id: "F2", severity: "blocking", file: "b.js", summary: "loses data", evidence: "npm test", opened: 0 },
+  ];
+  const odd = gates.parseReviewVerdict('```json\n{"verdict":"needs_work","findings":[]}\n```', { prior, cycle: 1 });
+  assert.strictEqual(odd.ok, false);
+  assert.match(odd.error, /unrecognized verdict 'needs_work' — fails closed for the prior set/);
+  assert.deepStrictEqual(odd.findings.map((f) => [f.id, f.origin, f.blocking, f.status]), [["F1", "prior", true, "open"], ["F2", "prior", true, "open"]]);
+  assert.deepStrictEqual(odd.prior.map((p) => p.id), ["F1", "F2"]);
+  assert.match(odd.findings[0].note, /not answered by this review/);
+
+  const prose = gates.parseReviewVerdict("Looks fine to me, ship it.", { prior, cycle: 1 });
+  assert.strictEqual(prose.ok, false);
+  assert.match(prose.error, /no structured verdict found in the review report — fails closed for the prior set/);
+  assert.deepStrictEqual(prose.findings.map((f) => f.id), ["F1", "F2"]);
+  assert.ok(prose.findings.every((f) => f.blocking && f.status === "open"));
+  // Folded, the ledger still carries both open — the next review is asked again.
+  const ledger = [
+    { id: "F1", severity: "blocking", file: "a.js", summary: "races", evidence: "node race.js", blocking: true, status: "open", opened: 0, closed: null },
+    { id: "F2", severity: "blocking", file: "b.js", summary: "loses data", evidence: "npm test", blocking: true, status: "open", opened: 0, closed: null },
+  ];
+  const next = gates.applyReviewToLedger(ledger, prose, 1);
+  assert.deepStrictEqual(gates.openPriorFindings(next).map((p) => p.id), ["F1", "F2"]);
+  assert.strictEqual(gates.renderFindings(prose.findings).split("\n").length, 2, "the fixer's evidence block names both");
+  // With no prior set there is nothing to carry — same failure, empty list.
+  const first = gates.parseReviewVerdict("no json here", { cycle: 0 });
+  assert.deepStrictEqual([first.ok, first.findings, first.prior], [false, [], []]);
+  assert.strictEqual(first.error, "no structured verdict found in the review report");
+});
+
+// Review finding 3 on the third cut: rolling back the cycle that UPGRADED an
+// advisory entry (demonstrated it by id) reset its status but left the
+// upgrade's evidence on it, so the rolled-back entry no longer read as
+// undemonstrated and the redo's reviewer could not demonstrate it by id.
+test("rolling back an upgrade cycle restores the entry exactly — evidence included — so it is demonstrable again on the redo", () => {
+  const c0 = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"a.js","summary":"I think this races"}]}\n```', { cycle: 0 });
+  let ledger = gates.applyReviewToLedger([], c0, 0);
+  const raised = gates.raisedUndemonstrated(ledger);
+  assert.deepStrictEqual(raised.map((r) => r.id), ["F1"]);
+  const upgrade = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","findings":[{"id":"F1","severity":"blocking","file":"a.js","summary":"it races","evidence":"node race.js hangs"}]}\n```', { cycle: 1, raised });
+  const upgraded = gates.applyReviewToLedger(ledger, upgrade, 1);
+  assert.deepStrictEqual(upgraded.map((e) => [e.id, e.status, e.evidence]), [["F1", "open", "node race.js hangs"]]);
+  assert.strictEqual(upgraded[0].prev.cycle, 1, "the fold snapshots the entry before it touches it");
+  const rolled = gates.rollbackCycle(upgraded, 1);
+  assert.deepStrictEqual(rolled.map((e) => [e.id, e.status, e.blocking, e.evidence, e.demonstrated]), [["F1", "advisory", false, "", null]]);
+  assert.strictEqual(rolled[0].prev, undefined, "the snapshot is consumed by the rollback");
+  assert.deepStrictEqual(gates.raisedUndemonstrated(rolled).map((r) => r.id), ["F1"], "the redo's reviewer may demonstrate F1 by id again");
+  // The note the upgrade wrote is gone with it too.
+  assert.strictEqual(rolled[0].note, ledger[0].note);
+  // A ledger folded before snapshots existed rolls back field by field, and
+  // an upgrade's evidence goes with the upgrade there as well.
+  const legacy = [{ id: "F1", severity: "blocking", file: "a.js", summary: "it races", evidence: "node race.js hangs", blocking: true, status: "open", opened: 0, closed: null, demonstrated: 1 }];
+  assert.deepStrictEqual(gates.rollbackCycle(legacy, 1).map((e) => [e.status, e.evidence]), [["advisory", ""]]);
+  assert.deepStrictEqual(gates.raisedUndemonstrated(gates.rollbackCycle(legacy, 1)).map((r) => r.id), ["F1"]);
+  // A prior answer is snapshotted the same way: resolving F1 at cycle 2 and
+  // rolling cycle 2 back returns its note along with its status.
+  const answered = gates.applyReviewToLedger(upgraded, gates.parseReviewVerdict('```json\n{"verdict":"pass","prior":[{"id":"F1","status":"resolved","note":"fixed in 2"}]}\n```', { prior: gates.openPriorFindings(upgraded), cycle: 2 }), 2);
+  assert.deepStrictEqual([answered[0].status, answered[0].note], ["resolved", "fixed in 2"]);
+  const back = gates.rollbackCycle(answered, 2);
+  assert.deepStrictEqual([back[0].status, back[0].closed, back[0].note, back[0].evidence], ["open", null, upgraded[0].note, "node race.js hangs"]);
+  assert.strictEqual(back[0].prev.cycle, 1, "the earlier cycle's snapshot survives, so a further rollback still has it");
+});
+
+// Review finding 4 on the third cut: a fresh, demonstrated blocking finding
+// that REUSED the id of a resolved ledger entry was dropped by the fold (the
+// id matched an existing entry that was not advisory), so it never reached the
+// ledger, the fixer, or the next review's prior set.
+test("a fresh blocking finding that reuses a resolved ledger id is minted as a new entry, not silently dropped", () => {
+  const before = [
+    { id: "F1", severity: "blocking", file: "a.js", summary: "first bug", evidence: "npm test", blocking: true, status: "resolved", opened: 0, closed: 1, answered: 1 },
+  ];
+  const v = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","findings":[{"id":"F1","severity":"blocking","file":"b.js","summary":"the fix broke b","evidence":"node b.test.js fails","introduced_by_fix":true}]}\n```', { prior: [], cycle: 2 });
+  assert.deepStrictEqual([v.ok, v.passed, v.findings.length, v.findings[0].blocking], [true, false, 1, true]);
+  const next = gates.applyReviewToLedger(before, v, 2);
+  assert.deepStrictEqual(next.map((e) => [e.id, e.status, e.summary]), [["F1", "resolved", "first bug"], ["F2", "open", "the fix broke b"]]);
+  assert.match(next[1].note, /already-used ledger id F1; recorded as F2/);
+  const named = gates.withLedgerIds(v.findings, next, before);
+  assert.strictEqual(named[0].id, "F2", "the fixer is told the minted name, not the reused one");
+  assert.deepStrictEqual(gates.openPriorFindings(next).map((p) => p.id), ["F2"], "…and the next review must answer it");
+  // Reusing an OPEN prior id under `findings` is still an answer, not a new
+  // finding (the prior answer carries it) — unchanged.
+  const open = [{ id: "F1", severity: "blocking", file: "a.js", summary: "still open", evidence: "npm test", blocking: true, status: "open", opened: 0, closed: null }];
+  const again = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","prior":[{"id":"F1","status":"open"}],"findings":[{"id":"F1","severity":"blocking","summary":"still open","evidence":"npm test"}]}\n```', { prior: gates.openPriorFindings(open), cycle: 1 });
+  assert.deepStrictEqual(gates.applyReviewToLedger(open, again, 1).map((e) => e.id), ["F1"]);
+});

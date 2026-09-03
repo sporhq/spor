@@ -773,13 +773,19 @@ declared `profile` (cross-model by convention; the machine's own declared
 harness binding still decides what actually executes — a graph write never
 defines what a box runs), **read-only** (`spor dispatch --read-only`: Codex's
 `--sandbox read-only`, Claude Code's plan permission mode, OpenCode's built-in
-`plan` agent (edit denied everywhere), Copilot's `--deny-tool write --deny-tool
-shell` (the file-writing tool AND the shell tool denied at the permission
-layer — Copilot has no sandbox, and a shell command writes the live checkout as
-freely as the write tool, so leaving `shell` open was a prompt-bounded posture,
-not an enforced one; the named cost is that a Copilot-routed reviewer cannot run
-commands and therefore cannot DEMONSTRATE a blocking finding — its verdicts are
-advisory, and a gate that needs blocking power routes elsewhere) — the
+`plan` agent (edit denied everywhere) PLUS a `bash: deny` for that agent
+handed to the run as `OPENCODE_CONFIG_CONTENT` by the adapter's `prepareRun`
+(the plan agent's own table leaves `bash` at `allow *`, so plan mode alone
+left the shell write-capable — the same hole Copilot's had), Copilot's
+`--deny-tool write --deny-tool shell` (the file-writing tool AND the shell
+tool denied at the permission layer — Copilot has no sandbox, and a shell
+command writes the live checkout as freely as the write tool, so leaving
+`shell` open was a prompt-bounded posture, not an enforced one). The named
+cost of the OpenCode and Copilot postures is the same: a reviewer routed
+there cannot run commands and therefore cannot DEMONSTRATE a blocking finding —
+its verdicts are advisory, and a gate that needs blocking power routes to a
+harness whose read-only posture still runs commands (Codex's sandbox, Claude
+Code's plan mode) — the
 reviewer reads the implementer's live checkout, so it must not be able to write
 to it, and the posture overrides any write-capable `--sandbox`/
 `--permission-mode` the worker's passthrough carries. A harness with NO

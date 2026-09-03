@@ -87,6 +87,7 @@ const STUB_TAIL = `
     cwd: process.cwd(),
     prompt,
     pwd: process.env.PWD || null,
+    opencodeConfig: process.env.OPENCODE_CONFIG_CONTENT || null,
     sporToken: process.env.SPOR_TOKEN || null,
     internalChildToken: process.env.SPOR_DISPATCH_CHILD_TOKEN || null,
   }, null, 2));
@@ -529,3 +530,50 @@ for (const harness of ["opencode", "copilot"]) {
     }
   });
 }
+
+// Review finding 1 on the third cut of the review gate: OpenCode's `plan` agent
+// denies `edit` but leaves `bash` at `allow *`, so `--agent plan` alone left a
+// `--read-only` run able to write the implementer's checkout through any shell
+// command. The posture is completed in the ENVIRONMENT: `opencodePrepareRun`
+// hands the child an OPENCODE_CONFIG_CONTENT that denies bash (and restates
+// edit) for the plan agent, merged over whatever the operator already set.
+test("opencode --read-only denies bash for the plan agent through OPENCODE_CONFIG_CONTENT, merged over the operator's own", () => {
+  const plain = dispatchHarnesses.opencodePrepareRun({ cwd: "/work" });
+  assert.deepStrictEqual(plain, { env: { PWD: "/work" } }, "a plain dispatch's environment is byte-identical");
+  const ro = dispatchHarnesses.opencodePrepareRun({ cwd: "/work", env: {}, readOnly: getHarness("opencode").readOnly });
+  assert.strictEqual(ro.env.PWD, "/work");
+  assert.deepStrictEqual(JSON.parse(ro.env.OPENCODE_CONFIG_CONTENT), { agent: { plan: { permission: { edit: "deny", bash: "deny" } } } });
+  // An operator's own config content is kept, the denial layered on top —
+  // and it can never re-allow what the posture denies.
+  const own = JSON.stringify({ model: "x/y", agent: { plan: { model: "x/z", permission: { bash: "allow", webfetch: "deny" } }, build: { permission: { bash: "allow" } } } });
+  const merged = JSON.parse(dispatchHarnesses.opencodeReadOnlyConfigContent(own));
+  assert.deepStrictEqual(merged, {
+    model: "x/y",
+    agent: { plan: { model: "x/z", permission: { bash: "deny", webfetch: "deny", edit: "deny" } }, build: { permission: { bash: "allow" } } },
+  });
+  // Unparseable operator content is replaced, not obeyed: the promise wins.
+  assert.deepStrictEqual(JSON.parse(dispatchHarnesses.opencodeReadOnlyConfigContent("{not json")), { agent: { plan: { permission: { edit: "deny", bash: "deny" } } } });
+});
+
+test("a --read-only opencode dispatch reaches the harness with plan mode AND the bash denial; a plain one carries neither", async () => {
+  for (const readOnly of [true, false]) {
+    const { home, repo } = fixture("opencode");
+    const outfile = path.join(home, `invocation-${readOnly ? "ro" : "rw"}.json`);
+    const stub = harnessStub(home, "opencode");
+    const result = run(
+      ["dispatch", "task-opencode", "--dir", repo, "--profile", "profile-opencode", "--no-brief", ...(readOnly ? ["--read-only"] : [])],
+      { SPOR_HOME: home, SPOR_OPENCODE_CMD: stub, OUTFILE: outfile }
+    );
+    assert.strictEqual(result.status, 0, result.stderr);
+    const invocation = await awaitJson(outfile);
+    assert.ok(invocation, "the stub ran");
+    if (readOnly) {
+      assert.ok(invocation.args.includes("--agent") && invocation.args[invocation.args.indexOf("--agent") + 1] === "plan", "plan mode in argv");
+      assert.deepStrictEqual(JSON.parse(invocation.opencodeConfig).agent.plan.permission, { edit: "deny", bash: "deny" }, "the bash denial reaches the child's environment");
+    } else {
+      assert.ok(!invocation.args.includes("--agent"));
+      assert.strictEqual(invocation.opencodeConfig, null, "a plain dispatch's environment is untouched");
+    }
+    await awaitRecord(home, (r) => r.state === "done", { timeoutMs: 15000 });
+  }
+});

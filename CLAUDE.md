@@ -639,8 +639,16 @@ per-gate finding ledger rides on the `art-gate-*` fact AND on the run record
 (`gate_progress`: ledger + fix count + attempts + last fix, saved BEFORE each fix
 dispatch, so a resumed pipeline keeps its prior findings and its cap holds across
 the interruption). `--read-only` REFUSES on a harness with no posture (the built-ins
-all have one: codex sandbox, claude plan mode, opencode `--agent plan`, copilot
-`--deny-tool write`). `cycles` counts FIX dispatches (`cycles: 3` = initial review + 3 fixes). **human** arms on
+all have one: codex sandbox, claude plan mode, opencode `--agent plan` plus a
+`bash: deny` for that agent via `OPENCODE_CONFIG_CONTENT` from the adapter's
+`prepareRun` — plan mode alone leaves the shell write-capable — and copilot
+`--deny-tool write --deny-tool shell`; the OpenCode and Copilot reviewers
+therefore cannot run commands, so they cannot demonstrate a blocking finding
+and their verdicts are advisory). An unreadable verdict (unrecognized word, no
+structured verdict) carries the whole prior set to the fixer still open; a
+fresh finding reusing a resolved ledger id mints a new entry; the fold
+snapshots every entry it touches (`prev`) so `rollbackCycle` restores it
+exactly, evidence included. `cycles` counts FIX dispatches (`cycles: 3` = initial review + 3 fixes). **human** arms on
 declared risk classes, files an approval item and BLOCKS the resolve until a
 live RESOLVING EDGE (approved — a bare status flip is not an approval) or any
 other terminal status (refused) answers it, reporting `blocked` at `approval_timeout_ms` rather than deciding for the

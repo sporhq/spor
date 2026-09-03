@@ -8115,7 +8115,7 @@ function awaitLaunchHandshake(stream, timeoutMs) {
 
 async function launchSupervisedHarness(cfg, {
   adapter, command, args, cwd, name, nodeId, prompt, server, localNodesDir, childToken, mcpToken, bindToken,
-  renewToken, renewNode, releaseNode, project,
+  renewToken, renewNode, releaseNode, project, readOnly = false,
 }) {
   const runId = crypto.randomUUID();
   const p = dispatchRuns.runPaths(cfg.userConfigHome(), runId);
@@ -8148,6 +8148,10 @@ async function launchSupervisedHarness(cfg, {
     // supervisor has no registry entry to look up, so it rebuilds the adapter
     // from exactly the declaration this launch resolved.
     ...(adapter.declaration ? { harness_declaration: adapter.declaration } : {}),
+    // Present only under `--read-only`: the supervisor hands the adapter's
+    // posture to its `prepareRun` so the part of it that lives in the
+    // ENVIRONMENT (OpenCode's bash denial) is applied to the child too.
+    ...(readOnly ? { read_only: true } : {}),
     log_path: p.log,
     report_path: p.report,
     scratch_path: p.scratch,
@@ -9191,6 +9195,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
       command: harnessBin,
       args,
       cwd: launchDir,
+      readOnly: !!readOnlyPosture,
       name,
       nodeId,
       prompt,
