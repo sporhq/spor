@@ -11094,7 +11094,7 @@ function makeGateDeps(
     // already on the trusted ref. Consulted only for an adopted pipeline.
     resolved: async () => verifyRunResolution(cfg, record),
     landed: async ({ trustedRef }) => gateRunner.gateHeadLanded(record, trustedRef),
-    runSuite: async ({ gate, trustedRef, protectedPaths }) => {
+    runSuite: async ({ gate, trustedRef, protectedPaths, attempt = 1 }) => {
       if (!change) return { ok: false, reason: "the change under judgement could not be read" };
       // The repo's own worktree-setup hook stages the throwaway tree exactly as
       // it stages an implementer's worktree (node_modules, a pinned sibling
@@ -11119,6 +11119,9 @@ function makeGateDeps(
           SPOR_GATE_HEAD: change.head,
           SPOR_TRUSTED_REF: trustedRef,
           SPOR_GATE_NODE: entry.node_id || "",
+          // 1 for the declared run, N+1 for the Nth same-tree rerun (WORKERS.md
+          // §10.3 `reruns`) — a suite can log or tighten itself on a rerun.
+          SPOR_GATE_ATTEMPT: String(attempt),
         };
         return await runGateCommand(gate, tree.dir, { env });
       } finally {
@@ -11651,7 +11654,7 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       // sha instead; a no-op restore returns `sha` unchanged.
       return integrationRunner.reconcileCandidateSha({ dir, sha });
     },
-    runSuite: ({ dir, base, head }) =>
+    runSuite: ({ dir, base, head, attempt = 1 }) =>
       gateRunner.runGateCommand({ id: "integration", command: integration.command, timeoutMs: integration.timeoutMs }, dir, {
         env: {
           ...worktreeDeclaredEnv(dir),
@@ -11660,6 +11663,7 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
           SPOR_GATE_HEAD: head || "",
           SPOR_TRUSTED_REF: factory.trustedRef,
           SPOR_GATE_NODE: entry.node_id || "",
+          SPOR_GATE_ATTEMPT: String(attempt),
         },
       }),
     land: (args) => integrationRunner.landCandidate(args),

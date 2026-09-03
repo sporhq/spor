@@ -98,7 +98,13 @@ Why this gate exists, in the operator's own words, and what it does not catch.
 
 Keys by kind (`lib/kernel/gates.js` is the authority):
 
-- **command** — `command` (required), `timeout_ms` (default 900000), `dir`.
+- **command** — `command` (required), `timeout_ms` (default 900000), `dir`,
+  `reruns` (default 0, max 3 — how many times a FAILED suite is re-run on the
+  SAME tree before the failure is charged; a rerun costs one more suite run,
+  never a fix dispatch, and a pass on a rerun is recorded on the `art-gate-*`
+  fact WITH the first failure as evidence, so flakes stay countable). Declare
+  `reruns: 1` only where the operator says the full suite is known to flake
+  under load; a rerun also hides a genuine intermittent defect one more time.
   Deliberately *no* ref or protected-path key: those belong to the factory, so
   one shared gate can never relax another team's trusted boundary.
 - **agent-review** — `profile` (required), `instructions`, `await_ms` (default
@@ -234,6 +240,10 @@ Keys (`lib/kernel/gates.js parseIntegration` is the authority):
   candidate-suite failure, fed through the same fix-cycle machinery a failing
   gate uses. This is a separate counter from any gate's own `cycles`.
 - **`timeout_ms`** (default 900000) — the candidate suite's timeout.
+- **`reruns`** (default 0, max 3) — the same bounded same-tree rerun a
+  command gate's `reruns` gives: the candidate suite runs again before a
+  failure becomes a fix cycle, and a rerun-rescued landing keeps the first
+  failure as evidence on its `art-merge-*` fact.
 
 State back to the operator, in one line each: it re-runs the full suite a
 second time on the merged result (so a green gate run does not skip it), a

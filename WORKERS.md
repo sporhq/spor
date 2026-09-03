@@ -836,6 +836,20 @@ outside git (a database on a fixed port, a `db reset`):
   after, so two gate trees, or a gate tree and a landing, never share the
   singleton. Fail-open like the integration lease: an unavailable lease is
   logged and the suite runs.
+- **`reruns`** (default 0, at most 3) — how many times the gate re-runs the
+  SAME command on the SAME tree before a failure counts
+  (task-spor-factory-spor-flaky-command-gate-needs-fix-cycle-or-rerun). A
+  full suite that flakes under parallel load used to cost either a fix cycle
+  (an implementer re-dispatched at a change that was never wrong) or, at
+  `cycles: 0`, a rescue or a person; a rerun costs one more suite run and
+  nothing else. It is never a laundering step: a pass on a rerun is recorded
+  on the `art-gate-*` fact WITH the first attempt's failure as evidence and
+  an outcome line that names it a rerun, so the flakes stay countable in the
+  gate telemetry — and a suite that fails on every run is charged as one
+  failure whose outcome says how many runs it failed. The lease, when
+  declared, is held across the reruns. The suite sees `SPOR_GATE_ATTEMPT`
+  (1 for the declared run, N+1 for the Nth rerun) beside the rest of its
+  environment.
 
 The suite's environment says what it is judging: `SPOR_GATE_BASE` and
 `SPOR_GATE_HEAD` (the shas), `SPOR_TRUSTED_REF`, `SPOR_GATE_STAGE` (`gate`,
@@ -1336,6 +1350,10 @@ stage, run only after every declared gate has passed:
   built.
 - **`serialize`** — the lease's scope; `repo` is the only value today (the
   merge queue is per-repo, not per-machine or per-org).
+- **`reruns`** (default 0, at most 3) — the same bounded same-tree rerun a
+  command gate has (§10.3): the candidate suite runs again before a failure
+  becomes a fix cycle, and a rerun-rescued pass lands with the first
+  failure's evidence on its `art-merge-*` fact.
 
 **The run holds its slot through integration.** The runner folds the
 integration stage into the SAME promise `deps.gate` already returns (§10.2), so
