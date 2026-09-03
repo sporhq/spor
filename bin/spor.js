@@ -6990,9 +6990,13 @@ async function cmdUpgrade(cfg, { values, positionals: pos }) {
   return rc;
 }
 
-// --- spor dispatch: kick off a Claude Code background agent --------------
+// --- spor dispatch: kick off a coding-agent run ---------------------------
 // (task-spor-cli-dispatch-background-agents) Compile a briefing for a task and
-// launch `claude --bg "<prompt>"` in the correct repo. The "correct repo" comes
+// launch the harness in the correct repo — by default a SUPERVISED headless
+// run (`claude -p --output-format stream-json` under the shared supervisor,
+// dec-spor-claude-code-supervised-by-default; codex/opencode/copilot likewise);
+// `--bg` / `dispatch.claudeLaunchMode` opts a Claude run into the native
+// `claude --bg` agent instead. The "correct repo" comes
 // from a per-machine slug->path map stored in the config cascade under
 // `dispatch.repos` (read via cfg.get; written to $SPOR_HOME/config.json) — the
 // shared graph is path-free by design (repo nodes carry slugs/fingerprints,
@@ -8653,10 +8657,10 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     !backfill && (values["no-worktree"] ? false : !!(values.worktree || worktreeDefault));
 
   // Session project (issue-spor-dispatch-propagate-session-project-to-questions).
-  // The launcher env never reaches a `claude --bg` agent (it self-allocates a
-  // spare worker; dec-spor-session-identity-active-record), and the agent token
-  // carries only {agent, session} — NOT the project. So the only channel the
-  // session project can ride to the bg agent is the prompt itself: state it, and
+  // The launcher env never reaches a native `claude --bg` agent (it self-allocates
+  // a spare worker; dec-spor-session-identity-active-record), and the agent token
+  // carries only {agent, session} — NOT the project. So the one channel the session
+  // project rides to the agent in every launch mode is the prompt itself: state it, and
   // tell the agent to pass it as ask_question's `project` param when a question
   // has no clear `mentions:`. The server gives that explicit project precedence
   // over its mentions/neighborhood derivation, closing the residual mention-less,
@@ -8710,12 +8714,14 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   // exit / unparseable output => empty => no guard (fail-open); --force overrides.
   const inFlight = nodeId && !backfill ? dispatchedAgents(cfg).get(name) || [] : [];
 
-  // Session identity (dec-spor-dispatch-bg-session-late-bind). `claude --bg`
-  // IGNORES `--session-id` and self-allocates its own run session (verified — it
-  // warns and ignores the flag), so we do NOT force one and the session is NOT
-  // knowable up front. The agent token is minted session-DEFERRED; the real
-  // session is captured from `claude agents --json` AFTER launch and bound then
-  // (rebind the token + renew the lease). SPOR_SESSION_ID pins the session for
+  // Session identity (dec-spor-dispatch-bg-session-late-bind). No harness lets
+  // us pick the run session up front: the native `claude --bg` variant IGNORES
+  // `--session-id` and self-allocates (verified — it warns and ignores the
+  // flag), and a supervised run (`claude -p` stream-json, codex, …) announces
+  // its session on its own stream. So we do NOT force one; the agent token is
+  // minted session-DEFERRED and the real session is bound AFTER launch — read
+  // off the supervised stream, or captured from `claude agents --json` for a
+  // native run (rebind the token + renew the lease). SPOR_SESSION_ID pins the session for
   // tests/reproducibility (short-circuits the capture). `mcpKey` names the 0600
   // --mcp-config file — a fresh uuid, since the session id isn't available here.
   const pinnedSession = process.env.SPOR_SESSION_ID || null;
@@ -9186,8 +9192,9 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   // claim, it skips the redundant claim-nudge). Remote node-mode only; --no-claim
   // opts out (dispatch with no lease, the prior behavior). PERSON-SCOPED here
   // (session omitted, dec-spor-dispatch-bg-session-late-bind): the real session
-  // isn't known until after launch, so we bind it to the lease via renewDispatch
-  // below; until then any of this person's sessions may renew it.
+  // isn't known until after launch in ANY launch mode (the supervised stream
+  // announces it, `claude --bg` self-allocates it), so we bind it to the lease
+  // via renewDispatch below; until then any of this person's sessions may renew it.
   let claimEstablished = false;
   if (nodeId && !backfill && !noClaim && cfg.mode() === "remote") {
     // Tag this claim with a per-invocation dispatch nonce so the server refuses a
@@ -9325,8 +9332,9 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     prompt,
     readOnly: readOnlyPosture,
   });
-  // A durable run record for the NATIVE-background launch
-  // (inc-spor-dispatch-session-vanished-2026-07-18). `claude --bg` hands the
+  // A durable run record for the NATIVE-background launch (the `--bg` opt-in;
+  // the supervised default writes its own record from the supervisor,
+  // inc-spor-dispatch-session-vanished-2026-07-18). `claude --bg` hands the
   // child to its own daemon and returns, so this launcher never observes the
   // child's exit, and `claude agents --json` lists only LIVE agents — a run that
   // finished and a run that died look identical afterwards, which is precisely
@@ -9388,7 +9396,9 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     return r.status == null ? 1 : r.status;
   }
 
-  // Late session binding (dec-spor-dispatch-bg-session-late-bind). `claude --bg`
+  // Late session binding for the NATIVE-background `--bg` opt-in
+  // (dec-spor-dispatch-bg-session-late-bind; a supervised run binds its session
+  // from its own stream in the supervisor instead). `claude --bg`
   // has now self-allocated its run session and registered the agent; read the
   // REAL session from `claude agents --json` and bind it: (a) rebind the agent
   // token's session so every subsequent agent write stamps the real run, and

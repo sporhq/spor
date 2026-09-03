@@ -8,6 +8,9 @@
 # For each node (default: every currently-listed agent whose name looks like a
 # node id), joins the three signals the supervisor loop cares about:
 #   session   — `claude agents --json` status (bare array; status, not state)
+#               for a `--bg` agent; for a node NOT listed there (a supervised
+#               `claude -p` run — the default since c1ab5b6 — or a Codex run)
+#               the newest `spor runs --node <id>` state as `run:<state>`
 #   graph     — the node's frontmatter status via `spor get`
 #   verdict   — RUNNING / FINISHED (resolved, gate+merge it) / RECOVER
 #               (session gone or idle but node NOT resolved) / DONE
@@ -21,17 +24,13 @@
 # one dispatched with agent-prompt.md/infra-agent-prompt.md, whose own
 # contract is to resolve its node before it exits. A Codex-harness
 # implementer (assets/codex-agent-prompt.md) is explicitly forbidden from
-# resolving its own node, and it runs via the `codex` CLI (not `claude --bg`)
-# so it never appears in `claude agents --json` at all — its session lookup
-# always comes back empty, which this script's case logic treats the same as
-# "idle"/"gone". Concretely: while the node is still unresolved, that makes
-# every check RECOVER regardless of whether the codex process is still
-# running or already finished — the script cannot tell those apart for a
-# Codex node, so don't trust a RECOVER verdict on one. Once the orchestrator
-# has resolved the node (after reading a MERGE-READY report — see SKILL.md
-# "The Codex implementer" — do that BEFORE re-checking here), this script
-# again reports correctly: `gs=resolved` short-circuits to FINISHED
-# regardless of the (still-empty) session lookup.
+# resolving its own node, so once its run record reads terminal
+# (`run:done`) an unresolved node is RECOVER here even though the work may
+# be finished — don't trust that verdict on a Codex node. Once the
+# orchestrator has resolved the node (after reading a MERGE-READY report —
+# see SKILL.md "The Codex implementer" — do that BEFORE re-checking here),
+# this script again reports correctly: `gs=resolved` short-circuits to
+# FINISHED regardless of the session lookup.
 set -u
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -41,11 +40,11 @@ if [ $# -ge 1 ]; then NODES=("$@"); else
 fi
 printf '%-70s %-10s %-10s %s\n' NODE SESSION GRAPH VERDICT
 for n in "${NODES[@]}"; do
-  st=$(fleet_agent_status "$out" "$n")
+  st=$(fleet_node_status "$out" "$n")
   gs=$(spor get "$n" --json 2>/dev/null | jq -r '.frontmatter.status // "open"')
   case "$gs" in
     resolved|done|answered)
-      case "$st" in ""|idle) v=FINISHED ;; *) v="FINISHED (session still $st — reap with: claude stop)";; esac ;;
+      case "$st" in ""|idle|run:*) v=FINISHED ;; *) v="FINISHED (session still $st — reap with: claude stop)";; esac ;;
     *)
       if fleet_status_active "$st"; then v=RUNNING; else v="RECOVER (session ${st:-gone}, node $gs)"; fi ;;
   esac

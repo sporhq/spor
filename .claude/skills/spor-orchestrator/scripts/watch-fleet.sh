@@ -6,7 +6,8 @@
 # (CLAUDE.md "Hard rules" — Zero dependencies) and may use bash+jq.
 #
 # Exits 0 printing "AGENT_DONE <node> status=<s>" the moment any named agent's
-# status leaves working/busy/starting, "NODE_RESOLVED <node>" if the node
+# status leaves working/busy/starting (or, for a node with no listed session,
+# its `spor runs` record goes terminal — status=run:<state>), "NODE_RESOLVED <node>" if the node
 # resolved on the graph even while the session lingers (trust the graph over
 # the process table), or "AGENT_STALLED <node> idle_secs=<n> session=<sid>"
 # when a busy agent's session transcript hasn't moved for WATCH_STALL seconds
@@ -41,14 +42,16 @@
 #   if the wait is genuine). The stall check only runs while the session is
 #   working/busy/starting — a finished agent exits via AGENT_DONE instead.
 #
-# Scope: like fleet-status.sh, this polls `claude agents --json` and treats
-# an unresolved node as not-yet-done — correct only for a SELF-RESOLVING
-# agent (agent-prompt.md/infra-agent-prompt.md). A Codex-harness implementer
-# (assets/codex-agent-prompt.md) never appears in `claude agents --json` (it
-# runs via the `codex` CLI) and is contractually forbidden from resolving its
-# own node, so don't pass this script a Codex node id expecting a meaningful
-# result — track its completion by watching the process/job you spawned for
-# it and reading its final report instead (see SKILL.md "The Codex
+# Scope: like fleet-status.sh, this polls `claude agents --json` — which
+# lists only native-background (`--bg`) agents — and falls back to the
+# `spor runs --node <id>` record for a node not listed there (a supervised
+# `claude -p` run, the claude-code default since c1ab5b6, or a Codex run):
+# a non-terminal run state counts as working, a terminal one fires
+# AGENT_DONE status=run:<state>. The stall check has no transcript for a
+# supervised run, so it only covers listed sessions. A Codex-harness
+# implementer (assets/codex-agent-prompt.md) is contractually forbidden from
+# resolving its own node, so NODE_RESOLVED never fires for one — read its
+# final report from the run's report_path instead (see SKILL.md "The Codex
 # implementer").
 set -u
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
@@ -64,7 +67,7 @@ for i in $(seq 1 "$ROUNDS"); do
   sleep "$INTERVAL"
   out=$(fleet_agents_array "$(claude agents --json 2>/dev/null)")
   for n in "${NODES[@]}"; do
-    st=$(fleet_agent_status "$out" "$n")
+    st=$(fleet_node_status "$out" "$n")
     if [ -n "$st" ]; then
       seen[$n]=1
       fleet_status_active "$st" || { echo "AGENT_DONE $n status=$st"; exit 0; }
@@ -104,7 +107,7 @@ for i in $(seq 1 "$ROUNDS"); do
   for n in "${NODES[@]}"; do
     [ "${seen[$n]:-}" = "1" ] || continue
     printf '%s\n' "$inflight" | grep -qxF -- "$n" && continue
-    cur=$(fleet_agent_status "$out" "$n")
+    cur=$(fleet_node_status "$out" "$n")
     fleet_status_active "$cur" && continue   # still committing — wait
     st=$(spor get "$n" --json 2>/dev/null | jq -r '.frontmatter.status // empty')
     case "$st" in resolved|done|answered) echo "NODE_RESOLVED $n status=$st"; exit 0 ;; esac

@@ -27,8 +27,16 @@ next item — until the eligible queue drains or the user stops you.
 
 The heavy lifting already exists. `spor dispatch --worktree` claims a team-wide
 heartbeat lease on the node, creates a git worktree on a branch named after the
-node id, compiles the briefing into the agent's prompt, and launches a
-`claude --bg` agent named after the node. You are the loop around it.
+node id, compiles the briefing into the agent's prompt, and launches the implementer
+named after the node. **This skill passes `--bg` explicitly** so a Claude
+implementer runs as a native-background `claude --bg` agent: since spor
+c1ab5b6 (dec-spor-claude-code-supervised-by-default) the default claude-code
+dispatch is a supervised headless `claude -p` run, which never enters
+`claude agents --json` and cannot be reached by `claude attach`/`claude stop`/
+`SendMessage` — every fleet affordance below depends on the `--bg` opt-in.
+(The watcher scripts fall back to `spor runs --node <id> --json` for a node
+absent from the agents list, so a supervised run is still followed, just not
+talked to.) You are the loop around it.
 
 ## Mental model — four things that make this safe
 
@@ -240,11 +248,15 @@ Dispatch the specific item you selected, in its own worktree, with the delegated
 workflow as the prompt template:
 
 ```bash
-spor dispatch --node <id> --worktree --model <sonnet|opus|fable> \
+spor dispatch --node <id> --worktree --bg --model <sonnet|opus|fable> \
   --permission-mode bypassPermissions \
   --template ~/.claude/skills/spor-orchestrator/assets/agent-prompt.md
 ```
 
+- `--bg` launches the native-background `claude --bg` agent instead of the
+  supervised default — required for the attach/stop/`SendMessage` affordances
+  this skill leans on (see the note under "Mental model"). Claude-only; a
+  Codex profile dispatch refuses it.
 - `--model` right-sizes the implementer per item — your biggest token lever;
   pick it deliberately (see "Right-size the model per item" below).
 - `--node <id>` runs the item *you* chose (so you control non-overlap). Use
@@ -256,7 +268,8 @@ spor dispatch --node <id> --worktree --model <sonnet|opus|fable> \
   full command and how completion differs.
 - `--worktree` isolates the checkout; the branch is the node id.
 - `--permission-mode bypassPermissions` is **required** for an unattended Claude
-  agent: a detached `claude --bg` agent has no human to answer permission
+  agent: a detached `claude --bg` agent (or a supervised `claude -p` run) has
+  no human to answer permission
   prompts, so the default mode leaves it **stuck/blocked** the first time it
   wants to write, run a test, or commit — the whole point of the agent is to do
   those without asking. `bypassPermissions` is the right call on an **isolated
@@ -382,17 +395,20 @@ them):
   `<cross-session-message>` question it sent you (→ answer it; the reply
   resumes it). Check your inbound messages before treating it as failed —
   see "Talking to the fleet".
-- **Both scripts only see the Claude side of the fleet.** They read `claude
-  agents --json`, and a Codex-harness implementer (`assets/codex-agent-prompt.md`)
-  isn't a `claude --bg` agent at all — it never appears in that list, session
-  or gone. Feed them a Codex node id and, absent a resolved node, you get
-  `RECOVER` unconditionally — that's not a signal, it's a blind spot. Track a
-  Codex node's completion with `spor runs --node <id> --json` instead (poll it
-  — its `state` reaches a terminal value `done`/`failed`/`vanished`/
-  `failed_launch` on its own once the Codex supervisor exits, no session list
-  to consult), and read its final report from the `.runs[0].report_path` that
-  call returns (the JSON shape is `{reconciled, count, runs}`), not through
-  these scripts; see "The Codex implementer" below.
+- **`claude agents --json` only lists native-background (`--bg`) agents.** A
+  supervised run — a Claude implementer dispatched WITHOUT `--bg` (the default
+  since c1ab5b6), or any Codex-harness implementer
+  (`assets/codex-agent-prompt.md`) — never appears in that list, session or
+  gone. Both scripts therefore fall back to `spor runs --node <id> --json` for
+  a node absent from the list: a run whose `state` is still non-terminal
+  reads RUNNING (`session=run:<state>`), and a terminal `state`
+  (`done`/`failed`/`vanished`/`failed_launch`) reads as the session having
+  finished (`AGENT_DONE <node> status=run:<state>`). Only a node with NEITHER
+  a listed session NOR a run record reads `session gone`. What the fallback
+  cannot give you is a voice: no `claude attach`/`stop`/`SendMessage` for a
+  supervised run — read its final report from the `.runs[0].report_path` that
+  `spor runs --node <id> --json` returns (JSON shape `{reconciled, count,
+  runs}`), see "The Codex implementer" below.
 
 To read a finished agent's final report, never `claude logs` (it replays raw
 TUI escape frames — huge and unreadable). Use:
@@ -545,7 +561,7 @@ or it deliberately bailed:
 ### The Codex implementer (a self-resolution exception)
 
 `assets/codex-agent-prompt.md` dispatches a **Codex-harness** implementer
-(via the `codex` CLI — a different binary from `claude --bg`) for the same
+(via the `codex` CLI — a different binary from `claude`) for the same
 kind of worktree item a code agent handles. Launch it with `spor dispatch`
 exactly like a Claude agent, just with a Codex profile instead of a Claude
 model:
@@ -576,8 +592,9 @@ expected, not a failure signal — but it collides head-on with
 completion-detection paths built for **self-resolving** agents:
 `fleet-status.sh`'s `RECOVER` branch and the supervisor loop's default
 `recover()` fallthrough both read "unresolved" as "didn't finish," and
-neither script can even see a Codex session in the first place (they poll
-`claude agents --json`, which a Codex process never enters).
+neither script can see a Codex session (they poll `claude agents --json`,
+which a Codex process never enters — they follow it only through the
+`spor runs` fallback, which reports liveness, not a resolution).
 
 Two things close the gap:
 
@@ -621,7 +638,7 @@ the code agents use. Run them through a **dedicated infra agent** instead, and
 dedicate at most ONE pool slot to it:
 
 ```bash
-spor dispatch --node <infra-id> --no-worktree --permission-mode bypassPermissions \
+spor dispatch --node <infra-id> --no-worktree --bg --permission-mode bypassPermissions \
   --template ~/.claude/skills/spor-orchestrator/assets/infra-agent-prompt.md
 ```
 
@@ -659,7 +676,7 @@ promises an isolated worktree and a branch for you to CAS-merge, neither of
 which exists when the agent lands directly in the shared checkout.
 
 ```bash
-spor dispatch --node <id> --no-worktree --model <sonnet|opus|fable> \
+spor dispatch --node <id> --no-worktree --bg --model <sonnet|opus|fable> \
   --permission-mode bypassPermissions \
   --template ~/.claude/skills/spor-orchestrator/assets/agent-prompt-inplace.md
 ```
