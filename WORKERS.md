@@ -579,7 +579,7 @@ written only after the outcome dimension exists):
 
 | Field | Type | Meaning |
 |---|---|---|
-| `gate_state` | string | `"running"` \| `"interrupted"` \| `"passed"` \| `"failed"` \| `"blocked"` — the last thing a gate pipeline said about this run. The three verdicts are SETTLED; the other two mean a pipeline started and never reported, which is what a later worker resumes from (§10.8) |
+| `gate_state` | string | `"running"` \| `"interrupted"` \| `"passed"` \| `"failed"` \| `"blocked"` \| `"superseded"` — the last thing a gate pipeline said about this run. The three verdicts and `superseded` (an adopted pipeline whose item was already landed by hand, §10.8 — no gate ran) are SETTLED; `running`/`interrupted` mean a pipeline started and never reported, which is what a later worker resumes from (§10.8). Propose-mode integration adds `parked` (§10.9) |
 | `gate_worker` | string | the worker id that last touched it |
 | `gate_at` | ISO 8601 | when that stamp was written |
 | `gate_reason` | string | optional — the settled verdict's one-line reason |
@@ -588,9 +588,11 @@ written only after the outcome dimension exists):
 | `gate_progress` | object | optional — `{key, at, seq, gates: {<gate id>: {fixes, attempts, ledger, lastFix}}}`: each gate's own memory (§10.4), saved after every review verdict (with the fix it decided on as `lastFix.dispatched: false`) and again when the fix's launch is known (`fixes` counts LAUNCHED fixes only). `key` is the attempt's run key — a resumed pipeline of the same attempt reads it back; a `--regate` (a new attempt) ignores it. Best-effort like every `gate_*` stamp: a write that fails is logged and the pipeline goes on |
 | `gate_escalation_failed` | boolean | optional — set when the refusal could not file the escalation that carries it, so nothing was written to the graph and (§10.7) nothing was demoted either. The verdict is still settled; this is what says the refusal is readable only on this box, and that `spor work --regate` is the door back |
 
-A consumer reading `gate_state` as a verdict must check it is one of the three
-settled values: `running` under a worker that is gone is a claim nobody
-finished judging, not a pass.
+A consumer reading `gate_state` as a verdict must check it is one of the
+settled values (`passed`/`failed`/`blocked`/`superseded`, or `parked` under
+propose mode — `SETTLED_GATE_STATES` in `lib/kernel/gates.js` is the list):
+`running` under a worker that is gone is a claim nobody finished judging, not a
+pass.
 
 **Retention.** Terminal records age out after `dispatch.runRetentionMs`
 (default 14 days — a config-cascade key, set in `.spor.json` or

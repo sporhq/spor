@@ -3690,6 +3690,44 @@ test("a gone checkout whose item is NOT landed refuses its first gate and escala
   assert.ok(["failed", "passed"].includes(rd.state));
 });
 
+test("a persisted rescue entry the worker died BEFORE launching is settled unrun when the checkout is gone — deps.rescue is never invoked, and a launched one is still adopted by name", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }], rescue: { ...RESCUE, attempts: 2 } });
+  const pending = { n: 1, gate: "acceptance", verdict: "failed", detail: "suite failed", evidence: "", findings: [], attempts: [{ verdict: "failed" }], ledger: [], fact: "art-gate-acceptance-demo-runabcde-deadbeef", seed: { acceptance: { ledger: [], base: 0 } }, dispatched: false, runId: null, done: false, diagnosis: null, category: null, fixed: null, filed: [], error: null };
+  const log = [];
+  const states = [];
+  // Unresolved on the graph, checkout gone: the refusal the entry holds escalates.
+  const a = withLanded(withRescue(fakes({ changedSeq: [GONE] })), { resolved: null });
+  a.deps.loadRescueState = async () => [JSON.parse(JSON.stringify(pending))];
+  a.deps.saveRescueState = async ({ rescues }) => states.push(JSON.parse(JSON.stringify(rescues)));
+  const ra = await gateRunner.runGatePipeline({ item: RESUMED, factory, deps: a.deps, log: (l) => log.push(l) });
+  assert.strictEqual(ra.state, "failed");
+  assert.deepStrictEqual(a.seen.rescues, [], "the not-yet-launched rescue is never dispatched into the missing directory");
+  assert.deepStrictEqual(a.seen.suites, [], "no rescue pass is judged");
+  assert.strictEqual(a.seen.escalations.length, 1);
+  assert.deepStrictEqual(a.seen.escalations[0].rescues.map((r) => [r.n, /checkout is gone/.test(r.error)]), [[1, true]], "the escalation says the rescue never ran, and why");
+  assert.ok(a.seen.facts.some((f) => /^art-rescue-/.test(f.id)), "the rescue's own unrun fact is recorded");
+  assert.ok(!a.seen.facts.some((f) => /^art-gate-acceptance-.*-x0-|^art-gate-acceptance-demo-runabcde-deadbeef$/.test(f.id)), "the pre-rescue gate fact was written before the worker died and is not re-minted");
+  assert.ok(states.length >= 1 && states[states.length - 1][0].done && /checkout is gone/.test(states[states.length - 1][0].error), "settled unrun on the record, so a further resume never re-tries it");
+  assert.ok(log.some((l) => /never launched and the run's checkout is gone/.test(l)), log.join("\n"));
+  assert.deepStrictEqual(a.seen.demotions.length, 1);
+
+  // The same entry, resolved AND landed: supersession still wins first.
+  const b = withLanded(withRescue(fakes({ changedSeq: [GONE] })));
+  b.deps.loadRescueState = async () => [JSON.parse(JSON.stringify(pending))];
+  const rb = await gateRunner.runGatePipeline({ item: RESUMED, factory, deps: b.deps });
+  assert.strictEqual(rb.state, "superseded");
+  assert.deepStrictEqual(b.seen.rescues, []);
+
+  // A rescue that DID launch is adopted by its run name, not its directory.
+  const c = withLanded(withRescue(fakes({ changedSeq: [GONE] }), () => ({ ok: true, runId: "run-rescue-1", diagnosis: "d", category: "environment", fixed: false, filed: [] })), { resolved: null });
+  c.deps.loadRescueState = async () => [{ ...JSON.parse(JSON.stringify(pending)), dispatched: true, runId: "run-rescue-1" }];
+  const rc = await gateRunner.runGatePipeline({ item: RESUMED, factory, deps: c.deps });
+  assert.strictEqual(c.seen.rescues.length, 1, "the launched rescue is re-entered");
+  assert.strictEqual(c.seen.rescues[0].attempt, 1);
+  assert.strictEqual(rc.state, "failed");
+  assert.deepStrictEqual(c.seen.rescues.length, 1, "and no second rescue is minted into the gone checkout");
+});
+
 test("a pipeline the worker starts off its OWN harvest never consults the supersession reads, and without the deps a resumed one judges as before", async () => {
   const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
   const fresh = withLanded(fakes({ changed: ["lib/x.js"] }));
