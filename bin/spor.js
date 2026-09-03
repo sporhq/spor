@@ -10376,7 +10376,10 @@ function gateWorkItemText(node) {
 // (review finding 5 on the third cut). Only the harness-neutral keys ride to
 // a review; the profile is the gate's and the posture is `--read-only`. The
 // FIX dispatch keeps the full passthrough: it runs in the worker's own lane.
-const REVIEW_HARNESS_FLAGS = ["permission-mode", "sandbox", "approval-policy", "agent", "model"];
+// Derived from the harness module's ONE flag list (HARNESS_OPTION_FLAGS), so a
+// new harness flag lands here without a second edit
+// (issue-spor-rescue-posture-foreign-restrictive-flag-becomes-bypass).
+const REVIEW_HARNESS_FLAGS = Object.keys(dispatchHarnesses.HARNESS_OPTION_FLAGS).concat(["model"]);
 function reviewPassthrough(passthrough) {
   const out = { ...(passthrough || {}) };
   for (const k of REVIEW_HARNESS_FLAGS) delete out[k];
@@ -10394,10 +10397,10 @@ function reviewPassthrough(passthrough) {
 // worker's posture exactly as a fix cycle does: a claude-code rescue launched
 // without the worker's `--permission-mode bypassPermissions` stalls on its
 // first write prompt with nobody there to answer it.
-const RESCUE_ROUTING_FLAGS = ["model", "agent"];
+const RESCUE_ROUTING_FLAGS = ["model"].concat(Object.keys(dispatchHarnesses.harnessOptionFlags("routing")));
 // The posture flags, each mapped to the option key an adapter's
 // `validateOptions` reads it under.
-const RESCUE_POSTURE_FLAGS = Object.freeze({ "permission-mode": "permissionMode", sandbox: "sandbox", "approval-policy": "approvalPolicy" });
+const RESCUE_POSTURE_FLAGS = dispatchHarnesses.harnessOptionFlags("posture");
 
 // The worker's passthrough as the rescue's own harness can read it. The
 // posture is spelled in the WORKER's harness vocabulary and the lane routinely
@@ -10408,19 +10411,40 @@ const RESCUE_POSTURE_FLAGS = Object.freeze({ "permission-mode": "permissionMode"
 // bypassPermissions into `--sandbox danger-full-access --ask-for-approval
 // never`, the same translation the fix cycle gets) alongside its own
 // `--sandbox`/`--approval-policy`, and OpenCode/Copilot take neither — they
-// run unattended by default, so dropping the posture there loses nothing. The
-// probe is per FLAG (a posture the lane's harness does own must not be dropped
-// because a foreign sibling rode beside it), each dropped flag is REPORTED
-// rather than silently swallowed — dropping a restrictive mode widens what the
-// rescue may do, and that has to be visible — and an unknown or unreadable
-// harness keeps the posture, so the mistake surfaces as dispatch's own loud
-// refusal rather than as a silently attended rescue.
+// run unattended by default. The probe is per FLAG (a posture the lane's
+// harness does own must not be dropped because a foreign sibling rode beside
+// it), and an unknown or unreadable harness keeps the posture, so the mistake
+// surfaces as dispatch's own loud refusal rather than as a silently attended
+// rescue.
+//
+// A flag the lane cannot read is not simply dropped: it is translated BY
+// MEANING (issue-spor-rescue-posture-foreign-restrictive-flag-becomes-bypass).
+// The worker's whole posture is read by the adapters that own its flags
+// (dispatchHarnesses.postureMeaning — read-only / attended / unattended, the
+// most restrictive reading winning) and re-expressed in the lane harness's own
+// declarations: read-only becomes the lane's `--read-only` posture (dispatch
+// applies the adapter's `readOnly`, and refuses loudly on a harness without
+// one) and displaces every posture flag, since a read-only worker's rescue
+// must not be able to write more than the worker could; unattended fills in
+// the lane's declared `unattended` posture (`--permission-mode
+// bypassPermissions` on claude-code, empty on every harness that needs no
+// flag); attended applies NOTHING — on claude-code that rescue stalls on its
+// first write, which is the more restrictive of the two postures and is said
+// out loud, never silently widened to the bypass. Only an EMPTY posture (a
+// worker on a harness that needs no flag at all) takes the lane's unattended
+// posture without a reading, since there is nothing to read. Every drop,
+// translation and substitution is REPORTED — changing what an unattended
+// agent may do has to be visible.
 function rescuePassthrough(passthrough, adapter) {
   const out = { ...(passthrough || {}) };
   for (const k of RESCUE_ROUTING_FLAGS) delete out[k];
   const dropped = [];
   const applied = [];
-  if (!adapter || typeof adapter.validateOptions !== "function") return { values: out, dropped, applied };
+  let translated = null;
+  if (!adapter || typeof adapter.validateOptions !== "function") return { values: out, dropped, applied, translated };
+  // The worker's whole posture, as the adapters read it.
+  const posture = {};
+  for (const [flag, option] of Object.entries(RESCUE_POSTURE_FLAGS)) if (out[flag]) posture[option] = out[flag];
   for (const [flag, option] of Object.entries(RESCUE_POSTURE_FLAGS)) {
     if (!out[flag]) continue;
     // `agent` is already gone above, and Codex checks it BEFORE the permission
@@ -10429,28 +10453,41 @@ function rescuePassthrough(passthrough, adapter) {
     const check = adapter.validateOptions({ permissionMode: null, agent: null, sandbox: null, approvalPolicy: null, [option]: out[flag] });
     if (!check || !check.message) continue;
     delete out[flag];
-    dropped.push({ flag, message: check.message });
+    dropped.push({ flag, value: posture[option], message: check.message });
   }
-  // Nothing of the worker's posture survives in the lane's own vocabulary —
-  // either the worker spelled it in another harness's flags (a Codex worker
-  // rescuing into a claude-code lane) or it needed none at all (Codex,
-  // OpenCode and Copilot are unattended with no flags, so a worker on any of
-  // them carries an EMPTY posture). Either way the rescue would launch
-  // attended, which on claude-code means stalling on its first write with
-  // nobody to answer — the very failure this lane exists to spare a person.
-  // So express the LANE harness's own declared unattended posture instead
-  // (`adapter.unattended`, beside `readOnly` — never a table here). It is
-  // empty for every harness that needs no flag, so this is a no-op there; on
-  // claude-code it is the bypass, and it is said out loud because a posture
-  // nobody typed is being applied.
-  if (!Object.keys(RESCUE_POSTURE_FLAGS).some((k) => out[k]) && adapter.unattended) {
+  const spelled = (flags) => flags.map((d) => `--${d.flag} ${d.value}`).join(" ");
+  if (dropped.length) {
+    // Something the lane cannot read was said: translate what the WHOLE
+    // posture means. A posture whose flags no adapter owns cannot happen (each
+    // posture flag has an owner), but if it did, attended is the safe reading.
+    const meaning = dispatchHarnesses.postureMeaning(posture) || "attended";
+    translated = { meaning, from: spelled(dropped) };
+    if (meaning === "read-only") {
+      for (const flag of Object.keys(RESCUE_POSTURE_FLAGS)) delete out[flag];
+      out["read-only"] = true;
+      applied.push({ flag: "read-only", value: true });
+    } else if (meaning === "unattended" && adapter.unattended) {
+      for (const [flag, option] of Object.entries(RESCUE_POSTURE_FLAGS)) {
+        if (!adapter.unattended[option] || out[flag]) continue;
+        out[flag] = adapter.unattended[option];
+        applied.push({ flag, value: adapter.unattended[option] });
+      }
+    }
+  } else if (!Object.keys(posture).length && adapter.unattended) {
+    // Nothing of a posture was said at all: the worker is on a harness that
+    // needs no flag to run unattended (Codex, OpenCode, Copilot), and the
+    // lane's may not be — claude-code stalls on its first write without one.
+    // Express the LANE harness's own declared unattended posture
+    // (`adapter.unattended`, beside `readOnly` — never a table here); empty
+    // for every harness that needs no flag, the bypass on claude-code, and
+    // said out loud because a posture nobody typed is being applied.
     for (const [flag, option] of Object.entries(RESCUE_POSTURE_FLAGS)) {
       if (!adapter.unattended[option]) continue;
       out[flag] = adapter.unattended[option];
       applied.push({ flag, value: adapter.unattended[option] });
     }
   }
-  return { values: out, dropped, applied };
+  return { values: out, dropped, applied, translated };
 }
 
 // The harness the rescue's profile launches under, read the way the factory
@@ -10916,10 +10953,23 @@ function makeGateDeps(
             ` ${lane.profile} — ${shaped.dropped[0].message}`
         );
       }
-      if (shaped.applied.length) {
+      const appliedFlags = shaped.applied.map((a) => (a.value === true ? `--${a.flag}` : `--${a.flag} ${a.value}`)).join(" ");
+      if (shaped.translated && shaped.translated.meaning === "read-only") {
         warn(
-          `warning: the rescue under ${lane.profile} carries none of the worker's posture, so it runs unattended with` +
-            ` ${shaped.applied.map((a) => `--${a.flag} ${a.value}`).join(" ")} — that harness stalls on its first write without it.`
+          `warning: the worker's posture (${shaped.translated.from}) reads as read-only, so the rescue under ${lane.profile} runs` +
+            ` under that harness's own read-only posture (${appliedFlags}) — it can diagnose but not fix; a rescue never widens the worker's posture.`
+        );
+      } else if (shaped.translated && shaped.translated.meaning === "attended") {
+        warn(
+          `warning: the worker's posture (${shaped.translated.from}) reads as attended and has no ${lane.profile} spelling, so the rescue` +
+            ` runs attended there — the more restrictive of the two; on claude-code it stalls on its first write. Pass an unattended posture the worker means.`
+        );
+      } else if (shaped.applied.length) {
+        warn(
+          (shaped.translated
+            ? `warning: the worker's posture (${shaped.translated.from}) reads as unattended, so the rescue under ${lane.profile}`
+            : `warning: the rescue under ${lane.profile} carries none of the worker's posture, so it`) +
+            ` runs unattended with ${appliedFlags} — that harness stalls on its first write without it.`
         );
       }
       values = { ...shaped.values, profile: lane.profile, node: entry.node_id, dir: cwd, force: true, "no-worktree": true, name };
@@ -12167,7 +12217,9 @@ async function cmdWork(cfg, { values }) {
   // --force: a loop that forces past the duplicate/resolved guards is exactly
   // the runaway a pull worker must not be.
   const passthrough = {};
-  for (const k of ["profile", "model", "as", "agent", "template", "dir", "permission-mode", "sandbox", "approval-policy"]) {
+  // The harness-specific flags come from the harness module's own list, so a
+  // new one rides without a second edit here.
+  for (const k of ["profile", "model", "as", "template", "dir"].concat(Object.keys(dispatchHarnesses.HARNESS_OPTION_FLAGS))) {
     if (values[k]) passthrough[k] = values[k];
   }
   // NOT --no-claim either: the lease is the ONLY thing that keeps two pull

@@ -1573,17 +1573,32 @@ a stale premise is triage's, not the lane's.
    accepts: Claude Code takes the permission mode, Codex takes it too (its
    adapter translates `bypassPermissions` into `--sandbox danger-full-access
    --ask-for-approval never`, exactly as it does for a fix cycle), and
-   OpenCode/Copilot take neither because they are unattended by default, so
-   the posture is dropped there with a warning. Where NOTHING of the worker's
-   posture survives in the lane harness's vocabulary — a Codex worker rescuing
-   into a claude-code lane, or a worker on any harness that needs no posture
-   flag at all — the lane harness's OWN declared unattended posture is applied
-   instead (`adapter.unattended`, beside `readOnly`; empty for every harness
-   that needs no flag, `--permission-mode bypassPermissions` for Claude Code),
-   also with a warning, because otherwise the rescue launches attended and
-   stalls exactly as the un-postured dispatch did. What never rides is the
-   worker's ROUTING — `--model` and `--agent` — because the lane's profile is
-   what names the strong model, and a worker's `--model` would override it.
+   OpenCode/Copilot take neither because they are unattended by default. A
+   flag the lane's harness cannot read is never simply dropped: it is
+   **translated by meaning**. The adapters that own the worker's flags read
+   the whole posture as one of `read-only` / `attended` / `unattended`
+   (`postureMeaning` in lib/shell/dispatch-harnesses.js — Claude Code's
+   `plan` / other / `bypassPermissions`, Codex's `--sandbox read-only` / an
+   approval policy other than `never` / the rest; the most restrictive reading
+   wins across a mixed posture), and the runner re-expresses that reading in
+   the lane harness's own declarations: read-only becomes the lane's
+   `--read-only` posture (Codex's read-only sandbox, Claude Code's plan mode)
+   and displaces every posture flag — a rescue can then diagnose but not fix,
+   which is the point: a worker deliberately held to `--sandbox read-only`
+   never gets a `bypassPermissions` rescue; unattended fills in the lane
+   harness's declared unattended posture (`adapter.unattended`, beside
+   `readOnly`; empty for every harness that needs no flag, `--permission-mode
+   bypassPermissions` for Claude Code); attended applies nothing, so on
+   claude-code the rescue runs attended and stalls on its first write — the
+   more restrictive of the two postures, said out loud rather than widened.
+   Only an EMPTY posture — a worker on a harness that needs no posture flag at
+   all — takes the lane's unattended posture without a reading, because
+   otherwise a claude-code rescue launches attended and stalls exactly as the
+   un-postured dispatch did. Every drop, translation and substitution is
+   warned about, since it changes what an unattended agent may do. What never
+   rides is the worker's ROUTING — `--model` and `--agent` — because the
+   lane's profile is what names the strong model, and a worker's `--model`
+   would override it.
    The prompt the runner composes carries: the work item, the diff, EVERY commit on the branch
    (the implementer's and each fix cycle's), the refused gate's detail and
    evidence, the cycle history, the whole finding ledger, the gate facts on the
