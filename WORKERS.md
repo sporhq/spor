@@ -300,6 +300,16 @@ process-level fact (§8's `state`/`termination_*` fields), never conflated
 with the outcome. The invariant a consumer keys on: whenever a report
 artifact id is present, `terminal_state` is `reported` — always, whether the
 verdict was fully verified or not (see "unverifiable targets" below).
+The one thing that is NOT a report is the harness's own declaration that
+the run failed: a supervised Claude Code stream whose terminal `result` event
+carries `is_error: true` writes no report file at all — its text is the
+reason the run stopped, not the agent's final message — so the run reads
+`failed` (`termination_signal: "error-result"`, the error text retained in
+`termination_reason`) whatever its exit code, and never enters the gates as
+a clean `reported`. Only that declared text is read for an environment
+signal (a credit or rate-limit phrase in it still classifies the run
+`environment`); the assistant turns before it are never scanned, so prose
+that merely quotes such a phrase cannot override the real error.
 
 **A decline is a fixed form, not prose.** A worker that finds the item
 itself wrong — its premise no longer holds, it is already done, the change
@@ -510,7 +520,7 @@ violation — new fields may be added additively.
 | `exit_code` | int \| null | supervised runs only |
 | `signal` | string \| null | supervised runs only — the OS signal, if any |
 | `termination_class` | string | a broad bucket: `"completed"`, `"environment"` (credit/rate/auth exhaustion — re-dispatchable, not a real failure), `"launch"`, `"failed"` (a supervised child that launched but exited nonzero for no recognized environment reason), `"idle"` (a run that stopped writing anything and was stopped for it), or `"unknown"` — an open vocabulary; do not exhaustively `switch` on it |
-| `termination_signal` | string | a short machine tag within the class, e.g. `"supervised-exit"`, `"nonzero-exit"`, `"credit-exhausted"`, `"supervisor-gone"`, `"launch-failed"`, `"idle-timeout"` |
+| `termination_signal` | string | a short machine tag within the class, e.g. `"supervised-exit"`, `"nonzero-exit"`, `"error-result"`, `"credit-exhausted"`, `"supervisor-gone"`, `"launch-failed"`, `"idle-timeout"` |
 | `termination_reason` | string | a human-readable one-line explanation (≤ 300 chars) |
 | `error` | string | optional — the raw underlying error message, when there was one |
 | `session_id` | string \| null | the harness's own session/thread id, possibly bound after launch (§2) |
