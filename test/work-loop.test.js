@@ -1238,6 +1238,45 @@ test("the loop names the first few skips and AGGREGATES the rest, rather than on
   assert.strictEqual(status.skipped.length, 12);
 });
 
+test("spor work --status says out loud when a refusal filed NOTHING on the graph, and names the re-judge command", () => {
+  // task-spor-gate-escalation-demote-atomic: with no escalation there is
+  // deliberately no demotion either, so `demote_reason` is null and the
+  // fail-soft demotion line above says nothing. Without its own line the only
+  // trace is a `gate_reason` a 300-char slice can cut the suffix off.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-unescalated-"));
+  workLoop.writeWorkerStatus(home, {
+    worker_id: "11111111-2222-3333-4444-666666666666",
+    pid: 999999,
+    state: "polling",
+    project: "demo",
+    concurrency: 1,
+    dispatched: 1,
+    outcomes: { resolved: 1, reported: 0, failed: 0 },
+    active: [],
+    gating: [],
+    recent: [
+      {
+        run_id: "run-abcdef12",
+        node_id: "task-demo",
+        terminal_state: "resolved",
+        terminal_enforced: true,
+        gate: "failed",
+        gate_reason: "gate 'acceptance' failed: the suite failed",
+        demoted: false,
+        escalation_failed: true,
+      },
+    ],
+    skipped: [],
+    started_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    stopped_at: new Date().toISOString(),
+    stop_reason: "one pass (--once)",
+  });
+  const text = cli(["work", "--status"], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.strictEqual(text.status, 0, text.stderr);
+  assert.match(text.stdout, /no escalation could be filed, so nothing was demoted — re-judge with 'spor work --regate run-abcdef12'/);
+});
+
 test("spor work --status counts the skips it does not list, instead of stopping silently at five", () => {
   // The human renderer is the DEFAULT surface: showing five of 25 told an
   // operator that five items were skipped (the review's second finding).

@@ -655,7 +655,12 @@ test("a demotion the graph refuses is REPORTED, not swallowed — and never turn
   assert.match(seen.facts[0].markdown, /Demotion: the item could not be demoted on the graph \(offline/);
 });
 
-test("an escalation that could not be filed still demotes, and the note never implies a blocker that does not exist", async () => {
+// task-spor-gate-escalation-demote-atomic. The two halves of §10.7 are ONE act:
+// rolling the status back without the escalation that blocks the item leaves
+// it open, agent-ready and unblocked while its resolving edge still stands —
+// fresh-looking agent work carrying a stale resolver, and a refusal held only
+// in this box's cooldown map.
+test("an escalation that could not be filed STOPS the demotion — no blocker on the graph, no rollback", async () => {
   const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", cycles: 0 }] });
   const { deps, seen } = fakes({
     suite: () => ({ ok: false, code: 1 }),
@@ -663,11 +668,60 @@ test("an escalation that could not be filed still demotes, and the note never im
   });
   deps.escalate = async () => ({ ok: false, reason: "the graph refused the write" });
   const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
-  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(res.state, "failed", "the enforcement is still the verdict");
   assert.strictEqual(res.escalated_to, null, "nothing was filed");
-  assert.strictEqual(seen.demotions.length, 1, "the status rollback is still worth doing without a blocker");
-  assert.strictEqual(seen.demotions[0].blockerId, null);
-  assert.match(seen.facts[0].markdown, /Demotion: nothing blocks task-demo/);
+  assert.strictEqual(seen.demotions.length, 0, "the item's status is left exactly as the run left it");
+  assert.strictEqual(res.demoted, false);
+  assert.strictEqual(res.demote_reason, null, "nothing was attempted, so there is no failure to report");
+  assert.strictEqual(res.escalation_failed, true, "the caller records this as UN-settled and re-attempts it");
+  assert.match(res.reason, /the escalation could not be filed/);
+  // The fact says what was withheld and why — a refusal that goes quiet is the
+  // thing §10.7 exists to prevent.
+  assert.match(seen.facts[0].markdown, /Demotion: not attempted — no escalation could be filed to block task-demo/);
+  assert.doesNotMatch(seen.facts[0].markdown, /rolled back/);
+});
+
+test("the same refusal WITH an escalation is unchanged — it escalates, then demotes, naming the blocker", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", cycles: 0 }] });
+  const { deps, seen } = fakes({
+    suite: () => ({ ok: false, code: 1 }),
+    demote: ({ blockerId }) => ({ ok: true, demoted: true, note: `task-demo rolled back done -> open; ${blockerId} now blocks task-demo` }),
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(res.escalated_to, "task-gate-acceptance");
+  assert.strictEqual(res.escalation_failed, undefined, "a landed escalation settles the verdict as before");
+  assert.strictEqual(seen.demotions.length, 1);
+  assert.strictEqual(seen.demotions[0].blockerId, "task-gate-acceptance", "the demotion names the blocker it waits on");
+  assert.match(seen.facts[0].markdown, /Demotion: task-demo rolled back done -> open/);
+});
+
+// A test-lane item that could not be filed falls through to the ordinary
+// escalation (the `fail-closed` outcome carries no blocker of its own); if THAT
+// write fails too, the same rule applies — nothing blocks the item, so nothing
+// is rolled back.
+test("a fail-closed gate whose lane AND escalation writes both fail demotes nothing either", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", cycles: 0 }] });
+  const { deps, seen } = fakes({ changed: ["test/acceptance.js"] });
+  deps.fileTestLaneItem = async () => ({ ok: false, reason: "the graph refused the write" });
+  deps.escalate = async () => ({ ok: false, reason: "the graph refused the write" });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(res.escalated_to, null);
+  assert.strictEqual(res.escalation_failed, true);
+  assert.strictEqual(seen.demotions.length, 0);
+  assert.strictEqual(seen.suites.length, 0, "and the suite is still never run from a branch that edits it");
+});
+
+test("a human gate whose approval item comes back without an id is a FAILED filing, not a blocker that does not exist", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "security", kind: "human", risk: ["touches:auth"] }] });
+  const { deps, seen } = fakes({ changed: ["lib/auth.js"] });
+  deps.fileHumanItem = async () => ({ ok: true });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed", "never `blocked`: there is no item for a person to answer");
+  assert.strictEqual(res.escalated_to, "task-gate-security", "it falls through to the ordinary escalation, which DID land");
+  assert.strictEqual(seen.approvals, 0, "and nothing is polled for an approval that was never filed");
+  assert.strictEqual(seen.demotions.length, 1, "with a real blocker in hand the rollback runs as usual");
 });
 
 test("a pipeline with no demote dep at all still settles — the step is optional, like every other write", async () => {
@@ -1283,6 +1337,50 @@ test("a worker RESUMES an unfinished gate pipeline before taking new work, and s
   assert.deepStrictEqual(marks.map((m) => m.gate_state), ["running", "failed"]);
   assert.strictEqual(marks[0].gate_worker, "w2");
   assert.ok(marks.every((m) => m.gate_at), "every stamp is dated");
+});
+
+test("a refusal whose escalation never landed is MARKED on the run record, and still settles rather than re-gating in a loop", async () => {
+  const marks = [];
+  const h = loopHarness({
+    queue: [],
+    // What runGatePipeline returns when deps.escalate failed: a failed verdict
+    // with nothing on the graph behind it (task-spor-gate-escalation-demote-atomic).
+    gate: () => ({
+      state: "failed",
+      reason: "gate 'acceptance' failed: the suite failed (the escalation could not be filed, so the item's status was left alone)",
+      escalation_failed: true,
+      demoted: false,
+    }),
+    maxPasses: 6,
+  });
+  h.deps.markGate = (runId, patch) => marks.push({ run_id: runId, ...patch });
+  h.deps.pendingGates = async () =>
+    marks.some((m) => m.gate_state === "running") ? [] : [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake", record: ORPHAN_RECORD }];
+
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w9", concurrency: 1, intervalMs: 1000 }, deps: h.deps, control: h.control });
+  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["running", "failed"]);
+  assert.strictEqual(marks[1].gate_escalation_failed, true, "the record says this refusal is readable only on this box");
+  assert.strictEqual(marks[1].gate_demoted, false, "and that nothing was rolled back");
+  assert.strictEqual(status.recent[0].escalation_failed, true, "--status surfaces it beside the verdict");
+  assert.strictEqual(status.gates.failed, 1);
+  assert.strictEqual(status.skipped[0].id, "task-orphan", "a refused resume cools the node like any other");
+  // SETTLED on purpose. An un-settled stamp would leave this run in the resume
+  // scan, which re-runs the WHOLE pipeline (suite, review dispatch, a fix cycle
+  // forced into the run's own checkout) with no cooldown behind it — a re-gate
+  // loop for as long as the graph stayed unwritable. `spor work --regate` is
+  // the door back, and the un-demoted status is what keeps it open.
+  assert.ok(gates.SETTLED_GATE_STATES.has("failed"));
+  const dead = { worker_id: "w9", live: false, gating: [{ run_id: "run-orphan", node_id: "task-orphan" }], active: [] };
+  const records = new Map([["run-orphan", { ...ORPHAN_RECORD, gate_state: "failed", gate_escalation_failed: true }]]);
+  assert.deepStrictEqual(
+    workLoop.orphanedGateRuns([dead], {
+      records,
+      terminalStates: new Set(["done", "failed", "failed_launch", "vanished"]),
+      now: () => Date.parse(ORPHAN_RECORD.finished_at),
+    }),
+    [],
+    "a settled verdict is never re-adopted, however the escalation went"
+  );
 });
 
 test("resumption is bounded by the free slots, comes AHEAD of new work, and stops when the worker winds down", async () => {

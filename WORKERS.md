@@ -586,6 +586,7 @@ written only after the outcome dimension exists):
 | `gate_fix_run_id` | string | optional — the run id of the most recent fix cycle this pipeline dispatched at the same node, stamped the moment it was dispatched (not when it finishes). If a stop lands while that fix cycle is still going, this field is what turns "the pipeline was abandoned" into "here is the run to go check" — a fix cycle's own dispatched run is detached and keeps going regardless (§10.7), and this is the only durable pointer to it. `spor runs`/`spor work --status` surface it. |
 | `gate_fix_at` | ISO 8601 | when `gate_fix_run_id` was stamped |
 | `gate_progress` | object | optional — `{key, at, seq, gates: {<gate id>: {fixes, attempts, ledger, lastFix}}}`: each gate's own memory (§10.4), saved after every review verdict (with the fix it decided on as `lastFix.dispatched: false`) and again when the fix's launch is known (`fixes` counts LAUNCHED fixes only). `key` is the attempt's run key — a resumed pipeline of the same attempt reads it back; a `--regate` (a new attempt) ignores it. Best-effort like every `gate_*` stamp: a write that fails is logged and the pipeline goes on |
+| `gate_escalation_failed` | boolean | optional — set when the refusal could not file the escalation that carries it, so nothing was written to the graph and (§10.7) nothing was demoted either. The verdict is still settled; this is what says the refusal is readable only on this box, and that `spor work --regate` is the door back |
 
 A consumer reading `gate_state` as a verdict must check it is one of the three
 settled values: `running` under a worker that is gone is a claim nobody
@@ -1062,6 +1063,32 @@ Fail-soft, like the fact write: a graph that refuses the demotion does not turn
 a refusal into a pass. The runner says what it could not do — on the gate fact
 (`Demotion: …`), in the log line, and as `demoted`/`demote_reason` on the
 worker's `recent` entry.
+
+**The two parts are one act, in that order.** The rollback is attempted only
+once the escalation exists; a rollback on its own is not half a refusal, it is
+the worst state on the graph. The item would read `open`, keep its agent-ready
+stamp, carry no `blocks` edge, and still carry the resolving edge the run
+wrote — fresh-looking agent work with a stale resolver, which no reader can
+tell apart from a genuinely open item and which the next worker may pick up.
+So when the escalation write fails (the server is down, the write is rejected):
+the item's status is left exactly as the run left it, the gate fact records
+that the demotion was `not attempted` and why, and the run record carries
+`gate_escalation_failed: true` beside its verdict — the marker that says this
+refusal exists nowhere but on this box.
+
+The verdict is still **settled**, deliberately. The obvious-looking alternative
+— stamp something un-settled so the resume scan (§10.8) re-attempts the
+escalation on a later pass — does not work: resumption re-runs the WHOLE
+pipeline (the suite, a fresh review dispatch, a fix cycle forced into the run's
+own checkout), it re-offers a run on every pass with no cooldown behind it, and
+it can only ever see a run its worker's status file still lists. So it would
+loop that pipeline for as long as the graph stayed unwritable in exactly the
+case it could reach, and would not reach the ordinary case at all. The
+recorded door is `spor work --regate <run-id>` (below): it judges the RUN
+record, which a failed escalation leaves untouched, so the whole pipeline —
+escalation included — can be re-run by hand once the graph is writable. `spor
+work --status` says so on the run's line, because until someone does, this
+refusal exists nowhere else.
 
 **A refusal can be re-judged.** A gate can refuse for a reason that is not
 the item's — the trusted ref itself is red (a sibling-library drift, someone

@@ -9711,6 +9711,14 @@ function cmdWorkStatus(cfg, { json }) {
       // The fail-soft half of a refusal: the verdict stands either way, but an
       // operator has to know the item is still reading DONE on the graph.
       if (r.demote_reason) out(`            not demoted on the graph: ${r.demote_reason}`);
+      // ...and its atomic twin: the escalation never landed, so NOTHING was
+      // written to the graph — no blocker, and deliberately no rollback either
+      // (task-spor-gate-escalation-demote-atomic). This refusal exists only
+      // here until someone re-runs the judgement, so it has to be said out
+      // loud rather than left in a `gate_reason` a 300-char slice can cut off.
+      if (r.escalation_failed) {
+        out(`            no escalation could be filed, so nothing was demoted — re-judge with 'spor work --regate ${r.run_id}'`);
+      }
     }
     // One pass can cool off a whole page of items (a queue of untriaged work
     // under the default accept policy, a sibling repo's items under a scoped
@@ -11502,6 +11510,12 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     gate_state: state,
     gate_reason: reason,
     ...(res && res.escalated_to ? { gate_escalated_to: res.escalated_to, gate_escalation_ids: [...escalatedBefore, res.escalated_to] } : {}),
+    // Whether THIS attempt could file its escalation (task-spor-gate-escalation-
+    // demote-atomic). Written either way, unlike the sticky `gate_demoted`
+    // above: a demotion outlives the attempt that made it, but "nothing about
+    // this refusal reached the graph" is answered afresh by every attempt, and
+    // a re-gate that escalated (or passed) must not leave the old claim standing.
+    gate_escalation_failed: !!(res && res.escalation_failed),
     // A demotion from an earlier attempt still stands until a pass restores it.
     ...(res && res.demoted ? { gate_demoted: true } : {}),
   });
