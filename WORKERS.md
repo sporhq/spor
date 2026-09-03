@@ -1588,9 +1588,17 @@ a stale premise is triage's, not the lane's.
    never gets a `bypassPermissions` rescue; unattended fills in the lane
    harness's declared unattended posture (`adapter.unattended`, beside
    `readOnly`; empty for every harness that needs no flag, `--permission-mode
-   bypassPermissions` for Claude Code); attended applies nothing, so on
-   claude-code the rescue runs attended and stalls on its first write — the
-   more restrictive of the two postures, said out loud rather than widened.
+   bypassPermissions` for Claude Code); attended first DISPLACES every
+   surviving posture flag (a bypass that rode beside a foreign approval
+   policy gating on prompts must not be left standing) and then fills in the
+   lane harness's declared attended posture (`adapter.attended`: empty on
+   claude-code, where every mode but plan/bypass asks, so the rescue runs
+   attended and stalls on its first write; `--approval-policy on-request` on
+   Codex, whose argv otherwise defaults to never asking) — and where the lane
+   declares NO attended posture (OpenCode/Copilot, whose `--auto` /
+   `--allow-all` cannot be unsaid) it narrows to the lane's `--read-only`,
+   the next reading DOWN, never up to that harness's unattended default. In
+   every case the more restrictive posture, said out loud rather than widened.
    Only an EMPTY posture — a worker on a harness that needs no posture flag at
    all — takes the lane's unattended posture without a reading, because
    otherwise a claude-code rescue launches attended and stalls exactly as the

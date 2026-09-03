@@ -10428,13 +10428,19 @@ const RESCUE_POSTURE_FLAGS = dispatchHarnesses.harnessOptionFlags("posture");
 // must not be able to write more than the worker could; unattended fills in
 // the lane's declared `unattended` posture (`--permission-mode
 // bypassPermissions` on claude-code, empty on every harness that needs no
-// flag); attended applies NOTHING — on claude-code that rescue stalls on its
-// first write, which is the more restrictive of the two postures and is said
-// out loud, never silently widened to the bypass. Only an EMPTY posture (a
-// worker on a harness that needs no flag at all) takes the lane's unattended
-// posture without a reading, since there is nothing to read. Every drop,
-// translation and substitution is REPORTED — changing what an unattended
-// agent may do has to be visible.
+// flag); attended fills in the lane's declared `attended` posture (empty on
+// claude-code, where every mode but plan/bypass asks; `--approval-policy
+// on-request` on Codex, whose argv otherwise defaults to never asking) — and
+// where the lane declares NO attended posture (OpenCode/Copilot, whose
+// `--auto`/`--allow-all` cannot be unsaid) it NARROWS to the lane's
+// `--read-only`, the next reading down, never up to the unattended default.
+// Either way every surviving posture flag is displaced first: a worker whose
+// bypass rode beside a foreign approval policy that gates on prompts reads as
+// attended, and the bypass must not be left standing to widen it. Only an
+// EMPTY posture (a worker on a harness that needs no flag at all) takes the
+// lane's unattended posture without a reading, since there is nothing to
+// read. Every drop, translation and substitution is REPORTED — changing what
+// an unattended agent may do has to be visible.
 function rescuePassthrough(passthrough, adapter) {
   const out = { ...(passthrough || {}) };
   for (const k of RESCUE_ROUTING_FLAGS) delete out[k];
@@ -10466,6 +10472,22 @@ function rescuePassthrough(passthrough, adapter) {
       for (const flag of Object.keys(RESCUE_POSTURE_FLAGS)) delete out[flag];
       out["read-only"] = true;
       applied.push({ flag: "read-only", value: true });
+    } else if (meaning === "attended") {
+      // Displace what survived (a bypass beside the foreign attended flag
+      // would otherwise stand), then say attended the lane's own way — or,
+      // where the lane has no attended spelling, narrow to read-only.
+      for (const flag of Object.keys(RESCUE_POSTURE_FLAGS)) delete out[flag];
+      if (adapter.attended) {
+        for (const [flag, option] of Object.entries(RESCUE_POSTURE_FLAGS)) {
+          if (!adapter.attended[option]) continue;
+          out[flag] = adapter.attended[option];
+          applied.push({ flag, value: adapter.attended[option] });
+        }
+      } else {
+        translated.narrowed = true;
+        out["read-only"] = true;
+        applied.push({ flag: "read-only", value: true });
+      }
     } else if (meaning === "unattended" && adapter.unattended) {
       for (const [flag, option] of Object.entries(RESCUE_POSTURE_FLAGS)) {
         if (!adapter.unattended[option] || out[flag]) continue;
@@ -10961,8 +10983,15 @@ function makeGateDeps(
         );
       } else if (shaped.translated && shaped.translated.meaning === "attended") {
         warn(
-          `warning: the worker's posture (${shaped.translated.from}) reads as attended and has no ${lane.profile} spelling, so the rescue` +
-            ` runs attended there — the more restrictive of the two; on claude-code it stalls on its first write. Pass an unattended posture the worker means.`
+          shaped.translated.narrowed
+            ? `warning: the worker's posture (${shaped.translated.from}) reads as attended, and ${lane.profile}'s harness has no attended posture` +
+              ` (it never asks), so the rescue narrows to that harness's read-only posture (${appliedFlags}) — it can diagnose but not fix;` +
+              ` a rescue never widens the worker's posture. Pass an unattended posture the worker means.`
+            : shaped.applied.length
+              ? `warning: the worker's posture (${shaped.translated.from}) reads as attended, so the rescue under ${lane.profile} runs attended` +
+                ` there as ${appliedFlags} — the more restrictive of the two; it stops on its first unapproved write. Pass an unattended posture the worker means.`
+              : `warning: the worker's posture (${shaped.translated.from}) reads as attended and has no ${lane.profile} spelling, so the rescue` +
+                ` runs attended there — the more restrictive of the two; on claude-code it stalls on its first write. Pass an unattended posture the worker means.`
         );
       } else if (shaped.applied.length) {
         warn(
