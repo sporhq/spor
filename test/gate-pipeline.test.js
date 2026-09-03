@@ -2056,8 +2056,8 @@ test("a fix cycle's run id is stamped onto the pipeline's own run BEFORE the lon
     runMaxMs: 200, // the fix's own awaitGateRun gives up quickly — nothing here waits on the run terminating
     stopping: () => false,
     home,
-    dispatch: async (_cfg, values) => {
-      dispatchCalls.push(values);
+    dispatch: async (_cfg, values, positionals) => {
+      dispatchCalls.push({ ...values, prompt: positionals[0] });
       // A run record that reads NON-terminal, exactly like a real fix-cycle
       // dispatch's supervised run while its harness is still working — this is
       // what keeps awaitGateRun actually polling (not resolving on its very
@@ -2085,6 +2085,11 @@ test("a fix cycle's run id is stamped onto the pipeline's own run BEFORE the lon
   assert.ok(midFlight.gate_fix_at, "and it is dated");
   assert.strictEqual(dispatchCalls[0].node, "task-fix-me");
   assert.strictEqual(dispatchCalls[0].force, true);
+  // issue-spor-rescue-and-fix-sessions-end-turn-waiting-on-background-job: the
+  // fix cycle carries the shared one-turn notice — a fix that backgrounds the
+  // suite and ends its turn waiting on it leaves the gate a dirty tree.
+  assert.ok(dispatchCalls[0].prompt.endsWith(require("../lib/shell/worker-contract.js").ONE_TURN_NOTICE), "the fix-cycle prompt ends with the one-turn notice");
+  assert.match(dispatchCalls[0].prompt, /^The 'acceptance' gate refused your resolution of task-fix-me\.\nthe suite fails\n/);
 
   // Simulate the stop: work-loop.js's runWorkLoop marks the pipeline's own run
   // interrupted on the way out (lib/shell/work-loop.js, the final `if
@@ -3596,6 +3601,16 @@ test("the real rescue dispatch runs under the rescue profile in the run's own ch
   const p = launches[0].prompt;
   assert.match(p, /rescue attempt 1 of 1/);
   assert.match(p, /DIAGNOSE[\s\S]*`reviewer-drift`[\s\S]*`real-defect`[\s\S]*`stale-premise`[\s\S]*`environment`/);
+  // issue-spor-rescue-and-fix-sessions-end-turn-waiting-on-background-job: the
+  // diagnosis block is mandatory and asked for EARLY (a truncated session still
+  // yields a category; the parser takes the LAST block, so restating is safe),
+  // and the rescue carries the same one-turn notice every dispatched
+  // implementer gets — a rescue that backgrounds its suite and ends its turn
+  // waiting commits nothing.
+  assert.match(p, /The fenced diagnosis block is MANDATORY\. Write it the moment you have diagnosed — BEFORE any fix or long\nverification/);
+  assert.match(p, /restate it at the end of your final message[\s\S]*the runner reads the LAST block/);
+  assert.match(p, /Verify in the FOREGROUND and read the exit before you commit — never background a suite/);
+  assert.ok(p.endsWith(require("../lib/shell/worker-contract.js").ONE_TURN_NOTICE), "the rescue prompt ends with the shared one-turn notice");
   assert.match(p, /## The work item\n\ntask-fix-me: Make the bound exclusive/);
   assert.match(p, /Gate fact on the graph: art-gate-adversarial-review-fix-me-aaaaaaaa-deadbeef/);
   assert.match(p, /derived-from, to: art-gate-adversarial-review-fix-me-aaaaaaaa-deadbeef/, "told to link its proposals to the gate fact");

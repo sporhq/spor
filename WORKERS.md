@@ -232,7 +232,17 @@ standing context. <any additional free-text task instructions>
    protected test paths, verify deterministically, **commit everything and
    leave the tree clean BEFORE resolving**, resolve the item LAST with a
    resolver node carrying a `resolves` edge, and if the item will not
-   converge leave it unresolved with the blocker named in the report. The
+   converge leave it unresolved with the blocker named in the report. It
+   opens with the **one-turn notice** (`ONE_TURN_NOTICE`, the same string the
+   fix-cycle, dirty-tree round-trip, integration-fix and rescue prompts
+   carry): the session ends with the worker's final message and nothing wakes
+   it later, so every verification runs in the FOREGROUND — never a
+   backgrounded suite, never a turn ended "waiting" on a notification — and
+   anything not committed before that message is lost, an uncommitted tree
+   being a refusal (issue-spor-rescue-and-fix-sessions-end-turn-waiting-on-
+   background-job: two headless sessions in one day authored correct fixes,
+   backgrounded `npm test`, ended their turn waiting on it, and paged a person
+   over a dirty tree). The
    factory-specific lines (the integration target, the acceptance command,
    the protected paths and their lane, the cross-model review) appear only
    when the factory declares them; a bare worker's contract is the plain
@@ -1006,7 +1016,11 @@ verdict, each as its own finding naming the row:
 The same table goes to the implementer: the worker contract (§4) and the
 fix-cycle prompt ask for the flag to be designed against all four rows up
 front and for the commit message to say how each is handled, so the reviewer
-reads a design and the fix closes the mechanism rather than its next row. On
+reads a design and the fix closes the mechanism rather than its next row. The
+fix-cycle prompt (and the dirty-tree round-trip's, which is a fix cycle with a
+different detail) also ends with the one-turn notice (§4): a fix that
+backgrounds the suite and ends its turn waiting on it leaves the gate the very
+dirty tree it was dispatched to clean. On
 a fix cycle the fix-introduced floor still applies: a row the fix INTRODUCED is
 blocking, one open at the initial review and not raised then is advisory.
 The checklist is prose — nothing parses it; the parser's protocol is unchanged.
@@ -1710,7 +1724,13 @@ a stale premise is triage's, not the lane's.
    (3) **file** at least one Spor task proposing the factory / gate / prompt /
    item change that would have prevented the pattern, `derived-from` the gate
    fact — the input `/spor:factory`'s maintenance mode reads. It is told, and
-   it is true, that it never marks a gate passed.
+   it is true, that it never marks a gate passed. The fenced diagnosis block
+   is MANDATORY and asked for EARLY — the moment the diagnosis exists, before
+   any fix or long verification, restated at the end once `fixed`/`filed` are
+   known (the parser takes the LAST block) — so a session cut short still
+   yields a category; and the prompt ends with the one-turn notice (§4):
+   verify in the foreground, never background a suite and end the turn
+   waiting on it, an uncommitted tree is a refusal.
 3. Reads the rescue's final report in code (`parseRescueReport`,
    lib/kernel/gates.js): the fenced `{"diagnosis", "category", "fixed",
    "filed"}` block. This read is deliberately FAIL-SOFT, unlike a review

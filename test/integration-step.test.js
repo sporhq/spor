@@ -2219,3 +2219,37 @@ test("checkProposals writes a demotion's outcome in ONE stamp, keeps the debt wh
   await sporCli.checkProposals(cfg, { home, log: (l) => sixth.push(l) });
   assert.deepStrictEqual(sixth.filter((l) => l.includes("task-proposed")), []);
 });
+
+// issue-spor-rescue-and-fix-sessions-end-turn-waiting-on-background-job: the
+// integration stage's fix cycle is a dispatched implementer like any other,
+// so its prompt ends with the shared one-turn notice — a fix that backgrounds
+// the candidate suite and ends its turn waiting on it commits nothing.
+test("the integration fix-cycle prompt names the refusal and ends with the one-turn notice", async () => {
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+  const { ONE_TURN_NOTICE } = require("../lib/shell/worker-contract.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-integration-fix-prompt-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const entry = { node_id: "task-landing", run_id: "11111111-2222-3333-4444-000000000009" };
+  const factory = { id: "factory-demo", integration: { targetRef: "main", mode: "local", strategy: "squash", command: "npm test" } };
+  const launches = [];
+  const deps = sporCli.makeIntegrationDeps(cfg, {
+    record: { cwd: home }, entry, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home,
+    dispatch: async (_cfg, values, positionals) => {
+      const id = "integration-fix-run-1";
+      dispatchRuns.atomicJson(dispatchRuns.runPaths(home, id).record, { run_id: id, node_id: entry.node_id, name: values.name, state: "done", created_at: new Date().toISOString() });
+      launches.push({ values, prompt: positionals[0] });
+      return { ok: true, run: { run_id: id, harness: "fake" } };
+    },
+  });
+  const r = await deps.fix({ cycle: 0, kind: "suite", detail: "2 failing", evidence: "not ok 1" });
+  assert.strictEqual(r.ok, true, r.reason);
+  assert.strictEqual(launches.length, 1);
+  const p = launches[0].prompt;
+  assert.match(p, /^The integration stage refused to land task-landing onto `main` \(`local` mode, `squash` strategy\)\.\nthe integration stage's candidate suite \(`npm test`\) failed on the merged tree\.\n2 failing\nEvidence:\nnot ok 1\n/);
+  assert.match(p, /Fix the cause in this checkout and commit\./);
+  assert.ok(p.endsWith(ONE_TURN_NOTICE), "the integration fix prompt ends with the one-turn notice");
+});

@@ -39,7 +39,8 @@ const workLoop = require(path.join(ROOT, "lib", "shell", "work-loop.js"));
 const gatesKernel = require(path.join(ROOT, "lib", "kernel", "gates.js"));
 const gateRunner = require(path.join(ROOT, "lib", "shell", "gate-runner.js"));
 const integrationRunner = require(path.join(ROOT, "lib", "shell", "integration-runner.js"));
-const { workerContract } = require(path.join(ROOT, "lib", "shell", "worker-contract.js"));
+const workerContractLib = require(path.join(ROOT, "lib", "shell", "worker-contract.js"));
+const { workerContract } = workerContractLib;
 // Resolution truth (lib/kernel/resolution.js): a node is "done" when it carries a
 // TERMINAL status OR a live inbound resolves/answers edge — the same partition the
 // queue ranker and read surfaces use. The dispatch guard reads it so it never
@@ -10804,6 +10805,10 @@ function makeGateDeps(
       gatesKernel.renderDurableFlagChecklist(),
       "The gate will re-run against the trusted ref's copy of the acceptance suite, so do not edit protected test",
       "paths — a change that touches them fails the gate closed.",
+      // The one-turn notice: a fix that backgrounds its suite and ends its turn
+      // waiting on it leaves the gate the dirty tree it was fixing (issue-spor-
+      // rescue-and-fix-sessions-end-turn-waiting-on-background-job).
+      workerContractLib.ONE_TURN_NOTICE,
     ]
       .filter((l) => l !== "")
       .join("\n");
@@ -10978,6 +10983,8 @@ function makeGateDeps(
       "   ids you addressed (the gates re-run on your commits and the next review is asked whether each prior finding is",
       "   resolved). Do NOT edit protected test paths — a change that touches them fails the gate closed. Leave the tree",
       "   CLEAN. If the premise is stale or the environment is at fault, say so and change nothing you cannot justify.",
+      "   Verify in the FOREGROUND and read the exit before you commit — never background a suite and end your turn",
+      "   waiting on it (see the session rule under \"Your report\").",
       "3. FILE what would have prevented this. Whether or not your fix lands, capture at least one Spor task proposing a",
       "   factory, gate, prompt or item change (a review instruction to tighten, a cycles cap to change, a suite to fix,",
       "   an item to re-scope) — `spor put-node - --if-exists skip` with a `type: task` node carrying",
@@ -11029,12 +11036,16 @@ function makeGateDeps(
       ...(lane.instructions ? ["## Factory instructions for the rescue", "", lane.instructions, ""] : []),
       "## Your report",
       "",
-      "End your final message with a fenced json block, exactly this shape:",
+      "The fenced diagnosis block is MANDATORY. Write it the moment you have diagnosed — BEFORE any fix or long",
+      "verification, so a session cut short still yields a category — and restate it at the end of your final message",
+      "once `fixed` and `filed` are known (the runner reads the LAST block). Exactly this shape:",
       "```json",
       `{"diagnosis": "what went wrong, in one or two sentences", "category": "reviewer-drift" | "real-defect" | "stale-premise" | "environment", "fixed": true | false, "filed": ["task-..."]}`,
       "```",
       "`fixed` is whether you committed a change you believe resolves the refusal; `filed` lists the Spor task ids you",
       "created. The runner reads this block for the escalation it files if the gates refuse again — it never decides a verdict.",
+      "",
+      workerContractLib.ONE_TURN_NOTICE,
     ].join("\n");
     const name = `rescue-${short}-${attempt}`;
     // Adopted on resume exactly like a fix cycle: the launcher writes the run
@@ -11628,6 +11639,7 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
         : "Fix the cause in this checkout and commit.",
       "The stage will rebuild the candidate and re-run the full suite, so do not edit protected test paths — a change",
       "that touches them fails the acceptance gate closed, separately from this stage.",
+      workerContractLib.ONE_TURN_NOTICE,
     ]
       .filter((l) => l !== "")
       .join("\n");
