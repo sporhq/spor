@@ -759,9 +759,12 @@ fact FIRST, dispatches `rescue.profile` into the run's own checkout
 (`makeGateDeps.rescue` in bin/spor.js: `--no-worktree --force`, NOT read-only,
 and — unlike a review — carrying the worker's unattended POSTURE
 (`--permission-mode`/`--sandbox`/`--approval-policy`, else a claude-code rescue
-stalls on its first write prompt) filtered through the LANE harness's own
-`validateOptions`, while its ROUTING (`--model`/`--agent`) is dropped so the
-lane's profile keeps naming the strong model,
+stalls on its first write prompt) filtered per flag through the LANE harness's
+own `validateOptions` — and where nothing survives, replaced by that harness's
+declared `unattended` posture (the new per-adapter twin of `readOnly`: empty
+wherever the argv builder is already unattended, the bypass on claude-code) —
+while its ROUTING (`--model`/`--agent`) is dropped so the lane's profile keeps
+naming the strong model,
 issue-spor-rescue-dispatch-drops-harness-flags) with the item, the diff,
 EVERY commit on the branch, the cycle history, the finding ledger and the gate
 facts, reads its `{"diagnosis","category","fixed","filed"}` block FAIL-SOFT

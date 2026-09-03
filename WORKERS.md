@@ -1533,7 +1533,14 @@ a stale premise is triage's, not the lane's.
    adapter translates `bypassPermissions` into `--sandbox danger-full-access
    --ask-for-approval never`, exactly as it does for a fix cycle), and
    OpenCode/Copilot take neither because they are unattended by default, so
-   the posture is dropped there with a warning. What never rides is the
+   the posture is dropped there with a warning. Where NOTHING of the worker's
+   posture survives in the lane harness's vocabulary — a Codex worker rescuing
+   into a claude-code lane, or a worker on any harness that needs no posture
+   flag at all — the lane harness's OWN declared unattended posture is applied
+   instead (`adapter.unattended`, beside `readOnly`; empty for every harness
+   that needs no flag, `--permission-mode bypassPermissions` for Claude Code),
+   also with a warning, because otherwise the rescue launches attended and
+   stalls exactly as the un-postured dispatch did. What never rides is the
    worker's ROUTING — `--model` and `--agent` — because the lane's profile is
    what names the strong model, and a worker's `--model` would override it.
    The prompt the runner composes carries: the work item, the diff, EVERY commit on the branch

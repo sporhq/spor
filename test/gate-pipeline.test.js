@@ -3461,6 +3461,7 @@ test("the rescue inherits the worker's unattended posture, filtered per harness 
     dispatchRuns.atomicJson(dispatchRuns.runPaths(home, pipelineRun).record, { run_id: pipelineRun, node_id: "task-fix-me", state: "done", created_at: new Date().toISOString() });
     const warnings = [];
     let values = null;
+    let dispatches = 0;
     const deps = sporCli.makeGateDeps(cfg, {
       record: { node_id: "task-fix-me", cwd: home },
       entry: { run_id: pipelineRun, node_id: "task-fix-me", project: null },
@@ -3471,6 +3472,7 @@ test("the rescue inherits the worker's unattended posture, filtered per harness 
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
       dispatch: async (_cfg, vals) => {
         values = vals;
+        dispatches += 1;
         const id = `rescue-run-${n}`;
         const p = dispatchRuns.runPaths(home, id);
         fs.writeFileSync(p.record.replace(/\.run\.json$/, ".report.md"), '```json\n{"diagnosis":"d","category":"environment","fixed":false,"filed":[]}\n```');
@@ -3483,7 +3485,7 @@ test("the rescue inherits the worker's unattended posture, filtered per harness 
       attempt: 1, detail: "the review requested changes", evidence: "", findings: [], attempts: [], ledger: [], fact: null,
     });
     assert.strictEqual(r.ok, true, r.reason);
-    return { values, warnings };
+    return { values, warnings, deps, dispatches: () => dispatches };
   };
 
   // A claude-code worker rescuing to a claude-code profile: the bypass rides.
@@ -3517,12 +3519,46 @@ test("the rescue inherits the worker's unattended posture, filtered per harness 
   assert.strictEqual(opencode.warnings.length, 1);
   assert.match(opencode.warnings[0], /--permission-mode, --sandbox does not ride to the rescue under profile-rescue-opencode/);
 
+  // The mirror of the filed bug: a CODEX worker rescuing into a claude-code
+  // lane. Its posture is spelled in Codex flags — or, since Codex is
+  // unattended with no flags at all, is EMPTY — and claude-code is the one
+  // harness that stalls without an explicit one. The lane harness's own
+  // declared unattended posture is applied instead of launching attended.
+  const codexToClaude = await launchUnder("profile-rescue-claude", { sandbox: "danger-full-access", "approval-policy": "never" });
+  assert.strictEqual(codexToClaude.values["permission-mode"], "bypassPermissions", "the lane harness's unattended posture replaces a posture it cannot read");
+  assert.deepStrictEqual([codexToClaude.values.sandbox, codexToClaude.values["approval-policy"]], [undefined, undefined]);
+  assert.strictEqual(codexToClaude.warnings.length, 2, "the drop and the substitution are both said out loud");
+  assert.match(codexToClaude.warnings[1], /runs unattended with --permission-mode bypassPermissions/);
+  const noPosture = await launchUnder("profile-rescue-claude", { as: "agent-worker" });
+  assert.strictEqual(noPosture.values["permission-mode"], "bypassPermissions", "a worker on a harness that needs no posture flag still gets a claude-code rescue that runs");
+  assert.strictEqual(noPosture.warnings.length, 1);
+  // …and a harness that needs none is not handed one.
+  const noPostureCodex = await launchUnder("profile-rescue-codex", { as: "agent-worker" });
+  assert.deepStrictEqual(
+    [noPostureCodex.values["permission-mode"], noPostureCodex.values.sandbox, noPostureCodex.values["approval-policy"]],
+    [undefined, undefined, undefined],
+    "Codex is unattended with no flags — nothing to apply"
+  );
+  assert.deepStrictEqual(noPostureCodex.warnings, []);
+  for (const a of require("../lib/shell/dispatch-harnesses.js").harnesses()) assert.ok(a.unattended, `${a.id} declares an unattended posture`);
+
   // A profile that cannot be read resolves no harness: the posture rides
   // untouched, so a mistake surfaces as dispatch's own loud refusal rather
   // than as a silently attended rescue.
   const unknown = await launchUnder("profile-not-in-the-graph", { "permission-mode": "bypassPermissions", model: "worker-model" });
   assert.strictEqual(unknown.values["permission-mode"], "bypassPermissions");
   assert.strictEqual(unknown.values.model, undefined, "--model is dropped whatever the harness is");
+
+  // A resumed pipeline ADOPTS the run it already launched: no second dispatch,
+  // and no posture is shaped (or warned about) for a launch that happened.
+  const before = opencode.warnings.length;
+  const again = await opencode.deps.rescue({
+    gate: { id: "adversarial-review", kind: "agent-review", profile: "profile-review", cycles: 1 },
+    attempt: 1, detail: "", evidence: "", findings: [], attempts: [], ledger: [], fact: null,
+  });
+  assert.strictEqual(again.ok, true, again.reason);
+  assert.strictEqual(opencode.dispatches(), 1, "adopted, not dispatched twice");
+  assert.strictEqual(opencode.warnings.length, before, "an adopted run re-shapes nothing");
 });
 
 test("a resumed rescue that had already failed to run escalates the handed refusal — never re-judging a rescue pass that never happened — and the resumed seed carries every gate", async () => {

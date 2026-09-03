@@ -10391,7 +10391,8 @@ function rescuePassthrough(passthrough, adapter) {
   const out = { ...(passthrough || {}) };
   for (const k of RESCUE_ROUTING_FLAGS) delete out[k];
   const dropped = [];
-  if (!adapter || typeof adapter.validateOptions !== "function") return { values: out, dropped };
+  const applied = [];
+  if (!adapter || typeof adapter.validateOptions !== "function") return { values: out, dropped, applied };
   for (const [flag, option] of Object.entries(RESCUE_POSTURE_FLAGS)) {
     if (!out[flag]) continue;
     // `agent` is already gone above, and Codex checks it BEFORE the permission
@@ -10402,7 +10403,26 @@ function rescuePassthrough(passthrough, adapter) {
     delete out[flag];
     dropped.push({ flag, message: check.message });
   }
-  return { values: out, dropped };
+  // Nothing of the worker's posture survives in the lane's own vocabulary —
+  // either the worker spelled it in another harness's flags (a Codex worker
+  // rescuing into a claude-code lane) or it needed none at all (Codex,
+  // OpenCode and Copilot are unattended with no flags, so a worker on any of
+  // them carries an EMPTY posture). Either way the rescue would launch
+  // attended, which on claude-code means stalling on its first write with
+  // nobody to answer — the very failure this lane exists to spare a person.
+  // So express the LANE harness's own declared unattended posture instead
+  // (`adapter.unattended`, beside `readOnly` — never a table here). It is
+  // empty for every harness that needs no flag, so this is a no-op there; on
+  // claude-code it is the bypass, and it is said out loud because a posture
+  // nobody typed is being applied.
+  if (!Object.keys(RESCUE_POSTURE_FLAGS).some((k) => out[k]) && adapter.unattended) {
+    for (const [flag, option] of Object.entries(RESCUE_POSTURE_FLAGS)) {
+      if (!adapter.unattended[option]) continue;
+      out[flag] = adapter.unattended[option];
+      applied.push({ flag, value: adapter.unattended[option] });
+    }
+  }
+  return { values: out, dropped, applied };
 }
 
 // The harness the rescue's profile launches under, read the way the factory
@@ -10863,7 +10883,13 @@ function makeGateDeps(
       if (shaped.dropped.length) {
         warn(
           `warning: the worker's ${shaped.dropped.map((d) => `--${d.flag}`).join(", ")} does not ride to the rescue under` +
-            ` ${lane.profile} — ${shaped.dropped[0].message} The rescue runs under that harness's own posture.`
+            ` ${lane.profile} — ${shaped.dropped[0].message}`
+        );
+      }
+      if (shaped.applied.length) {
+        warn(
+          `warning: the rescue under ${lane.profile} carries none of the worker's posture, so it runs unattended with` +
+            ` ${shaped.applied.map((a) => `--${a.flag} ${a.value}`).join(" ")} — that harness stalls on its first write without it.`
         );
       }
       values = { ...shaped.values, profile: lane.profile, node: entry.node_id, dir: cwd, force: true, "no-worktree": true, name };
