@@ -11860,6 +11860,28 @@ async function healProposalTracking(cfg, r) {
   return { id, healed: !!(written && written.ok), ok: !!(written && written.ok), reason: written && written.reason };
 }
 
+// Whether a proposal settled between a pass's tracker read and the demotion
+// that read licensed (checkProposals, F4): its tracker now reads terminal, or
+// its LANDED fact — the deterministic id checkProposal mints for a merged PR,
+// written by the settling actor's pass BEFORE it promotes the item and closes
+// the tracker — is on the graph. Either is evidence the item's completion
+// stands again and a rollback that just landed on it must be undone. An
+// unreadable graph is evidence of neither (the demotion then stands, as the
+// tracker read that licensed it said it should).
+async function proposalSettledMeanwhile(cfg, r, blockerId) {
+  try {
+    if (await blockerAlreadyClosed(cfg, blockerId)) return true;
+  } catch {
+    /* not evidence */
+  }
+  try {
+    const landedFact = integrationRunner.integrationFactId(r.node_id, r.run_id, "landed");
+    return !!(await resolveNode(cfg, landedFact));
+  } catch {
+    return false;
+  }
+}
+
 async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {} } = {}) {
   // Requires only gate_proposal_number — NOT gate_proposal_blocker too — so a
   // proposal whose tracking-node write failed (leaving the blocker field
@@ -11896,6 +11918,35 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
     // would roll a completed item back to `open` behind a blocker that is
     // no longer live, and the settled check below would then skip every
     // restoration — the item stuck open with nothing left to close it.
+    //
+    // That read is NOT atomic with the demotion (F4 of the same review): the
+    // graph has no compare-and-swap on a status write, so between the read
+    // and the rollback another actor — a second box's proposal pass whose
+    // restore() promoted the item and closed the tracker, or a person — can
+    // settle the proposal, and the rollback then lands on a COMPLETED item
+    // behind a tracker no longer live, with the flag cleared and (the tracker
+    // now reading closed) every later pass skipping it. So a demotion that
+    // actually flipped the item is followed by a SECOND read of the same
+    // settled evidence (`proposalSettledMeanwhile`: the tracker terminal, or
+    // the landed fact — which the other actor's restore writes FIRST —
+    // present), and one that lands against a proposal settled meanwhile is
+    // undone on the spot by the same promotion restore() uses. Undoing it
+    // can fail too, so the debt is durable: `gate_restore_pending` on the run
+    // record, retried at the top of every pass until it lands.
+    if (r.gate_restore_pending) {
+      let promoted = null;
+      try {
+        promoted = await gatePromoteItem(cfg, r.node_id);
+      } catch (e) {
+        promoted = { ok: false, reason: `${(e && e.message) || e}` };
+      }
+      if (promoted && promoted.ok) {
+        log(`work: undid the demotion of ${r.node_id} that landed against an already-settled proposal; ${promoted.note}`);
+        dispatchRuns.stampGateState(home, r.run_id, { gate_restore_pending: false }, { force: true });
+      } else {
+        log(`work: the demotion of ${r.node_id} that landed against an already-settled proposal could not be undone (${(promoted && promoted.reason) || "no response"}) — will retry next pass`);
+      }
+    }
     let closed = false;
     try {
       closed = await blockerAlreadyClosed(cfg, healed.id);
@@ -11924,6 +11975,22 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
       // stampGateState's settled guard — it touches no verdict, only the
       // flag that says the rollback is still owed.
       dispatchRuns.stampGateState(home, r.run_id, { gate_demote_pending: !landed }, { force: true });
+      // The check-then-demote window (F4, above): only a rollback that
+      // actually FLIPPED the item can have crossed it — a no-op demotion
+      // ("nothing to roll back") changed nothing to undo.
+      if (landed && demoted.demoted && (await proposalSettledMeanwhile(cfg, r, healed.id))) {
+        let promoted = null;
+        try {
+          promoted = await gatePromoteItem(cfg, r.node_id);
+        } catch (e) {
+          promoted = { ok: false, reason: `${(e && e.message) || e}` };
+        }
+        const undone = !!(promoted && promoted.ok);
+        if (undone) log(`work: the proposal for ${r.node_id} settled while its demotion was landing — undone; ${promoted.note}`);
+        else log(`work: the proposal for ${r.node_id} settled while its demotion was landing, and undoing it failed (${(promoted && promoted.reason) || "no response"}) — will retry next pass`);
+        dispatchRuns.stampGateState(home, r.run_id, { gate_restore_pending: !undone }, { force: true });
+        continue; // settled: nothing left for this pass to check
+      }
     }
     const proposal = {
       nodeId: r.node_id,
@@ -15107,7 +15174,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
 
 if (require.main === module) {
   main()
