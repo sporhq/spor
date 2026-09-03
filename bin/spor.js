@@ -10205,10 +10205,17 @@ const GATE_DEMOTED_STATUS = "open";
 // with `ok:true` is the ordinary case where there was nothing to roll back (the
 // item never went to a completion status, which is every local-mode
 // `reported` run).
+//
+// A blocker id is REQUIRED (task-spor-gate-escalation-demote-atomic,
+// issue-spor-integration-settle-escalate-demote-race): a rollback with nothing
+// on the graph blocking the item is the worst state there is — open,
+// agent-ready, unblocked, its resolving edge standing. Every caller (the gate
+// pipeline's refusal, the integration stage's settle() and park(), the
+// proposal heal pass) now withholds the demotion until it has one, so this is
+// the door refusing rather than the last line of defence being crossed.
 async function gateDemoteItem(cfg, id, { blockerId = null } = {}) {
-  const blocked = blockerId
-    ? `${blockerId} now blocks ${id}`
-    : `nothing blocks ${id} — the gate could not file the item that would have`;
+  if (!blockerId) return { ok: false, reason: `nothing blocks ${id} — a demotion is refused until the item that would block it exists (WORKERS.md §10.7)` };
+  const blocked = `${blockerId} now blocks ${id}`;
   const node = await resolveNode(cfg, id);
   if (!node) return { ok: false, reason: `${id} could not be re-read, so its status could not be rolled back` };
   const status = String(node.status || "").trim().toLowerCase();
@@ -11865,6 +11872,22 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
     if (!healed.ok) {
       log(`work: the integration proposal tracking item for ${r.node_id} could not be healed (${healed.reason || "no response"}) — will retry next pass`);
       continue; // no tracking item to check/demote against yet — try again next pass
+    }
+    // A tracker that had to be HEALED is one park() never had in hand, so
+    // park() withheld the item's demotion (the §10.7 pair is atomic:
+    // escalate/track first, demote only with the blocker's id). Complete it
+    // now, one pass late — the same fail-soft, idempotent door park() would
+    // have used, so a record from before the pair was atomic (already rolled
+    // back) reads "nothing to roll back" here rather than failing.
+    if (healed.healed) {
+      let demoted = null;
+      try {
+        demoted = await gateDemoteItem(cfg, r.node_id, { blockerId: healed.id });
+      } catch (e) {
+        demoted = { ok: false, reason: `${(e && e.message) || e}` };
+      }
+      if (demoted && demoted.ok) log(`work: healed the tracking item for ${r.node_id}; ${demoted.note}`);
+      else log(`work: healed the tracking item for ${r.node_id}, but it could not be demoted on the graph (${(demoted && demoted.reason) || "no response"}) — the proposal still stands`);
     }
     let closed = false;
     try {

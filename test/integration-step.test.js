@@ -348,6 +348,102 @@ test("propose failing to open a PR routes through the fix-cycle cap, then FAILS 
   assert.strictEqual(seen.parks.length, 0, "a proposal that never opened is not parked");
 });
 
+// issue-spor-integration-settle-escalate-demote-race: the same atomic pair the
+// gate pipeline closed in task-spor-gate-escalation-demote-atomic. A settle()
+// whose escalation write fails must NOT roll the item back — that leaves it
+// open, agent-ready, unblocked, its resolving edge standing, and the refusal
+// held only in this box's cooldown map.
+test("an integration escalation that could not be filed STOPS the demotion, records the withheld rollback on the fact, and marks the refusal", async () => {
+  const { deps, seen } = integrationFakes({
+    suite: () => ({ ok: false, reason: "npm test exited 1", output: "1 failing" }),
+    escalate: () => ({ ok: false, reason: "the graph refused the write" }),
+    demote: ({ blockerId }) => ({ ok: true, demoted: true, note: blockerId ? `blocked by ${blockerId}` : "nothing blocks task-demo" }),
+  });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: { ...FACTORY, integration: { ...FACTORY.integration, cycles: 0 } }, deps });
+  assert.strictEqual(res.state, "failed", "the enforcement is still the verdict");
+  assert.strictEqual(res.escalated_to, null, "nothing was filed");
+  assert.strictEqual(seen.escalations.length, 1);
+  assert.strictEqual(seen.demotions.length, 0, "the item's status is left exactly as the run left it");
+  assert.strictEqual(res.demoted, false);
+  assert.strictEqual(res.demote_reason, null, "nothing was attempted, so there is no failure to report");
+  assert.strictEqual(res.escalation_failed, true, "the caller stamps gate_escalation_failed on the run record — the refusal is readable only on this box");
+  assert.match(res.reason, /the escalation could not be filed, so the item's status was left alone/);
+  assert.strictEqual(seen.facts.length, 1, "the verdict still settles as a fact");
+  assert.match(seen.facts[0].markdown, /Demotion: not attempted — no escalation could be filed to block task-demo, so its status is left as the run left it/);
+  assert.doesNotMatch(seen.facts[0].markdown, /rolled back/);
+  assert.doesNotMatch(seen.facts[0].markdown, /Escalated to/);
+});
+
+test("the same integration refusal WITH an escalation is unchanged — it escalates, then demotes naming the blocker, and is not marked", async () => {
+  const { deps, seen } = integrationFakes({
+    suite: () => ({ ok: false, reason: "npm test exited 1", output: "1 failing" }),
+    demote: ({ blockerId }) => ({ ok: true, demoted: true, note: `task-demo rolled back done -> open; ${blockerId} now blocks task-demo` }),
+  });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: { ...FACTORY, integration: { ...FACTORY.integration, cycles: 0 } }, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(res.escalated_to, "task-integration-escalate-x");
+  assert.strictEqual(res.escalation_failed, undefined, "a landed escalation settles the verdict as before");
+  assert.strictEqual(seen.demotions.length, 1);
+  assert.strictEqual(seen.demotions[0].blockerId, "task-integration-escalate-x", "the demotion names the blocker it waits on");
+  assert.match(seen.facts[0].markdown, /Demotion: task-demo rolled back done -> open; task-integration-escalate-x now blocks task-demo/);
+  assert.match(seen.facts[0].markdown, /Escalated to task-integration-escalate-x/);
+});
+
+test("an escalation that throws is the same as one refused — no demotion, marked", async () => {
+  const { deps, seen } = integrationFakes({ suite: () => ({ ok: false, reason: "npm test exited 1" }) });
+  deps.escalate = async () => { throw new Error("ECONNREFUSED"); };
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: { ...FACTORY, integration: { ...FACTORY.integration, cycles: 0 } }, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(res.escalation_failed, true);
+  assert.strictEqual(seen.demotions.length, 0);
+});
+
+// A blocked-by-escalation demotion that itself fails is still the fail-soft
+// case it always was: attempted (the blocker exists), reported, never a pass.
+test("a demotion the graph refuses AFTER the escalation landed is reported, not withheld and not marked", async () => {
+  const { deps, seen } = integrationFakes({
+    suite: () => ({ ok: false, reason: "npm test exited 1" }),
+    demote: () => ({ ok: false, reason: "offline — ECONNREFUSED" }),
+  });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: { ...FACTORY, integration: { ...FACTORY.integration, cycles: 0 } }, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(res.escalated_to, "task-integration-escalate-x");
+  assert.strictEqual(res.escalation_failed, undefined);
+  assert.strictEqual(seen.demotions.length, 1, "the demotion was attempted — the blocker exists");
+  assert.strictEqual(res.demoted, false);
+  assert.match(res.demote_reason, /offline/);
+  assert.match(seen.facts[0].markdown, /Demotion: the item could not be demoted on the graph \(offline/);
+});
+
+// park() is the propose-mode twin: the tracking item is the blocker, and the
+// demotion waits for it exactly the same way — the heal pass (checkProposals)
+// completes the pair one pass later, so nothing is marked for a person here.
+test("a park whose tracking item could not be filed withholds the demotion, records why on the fact, and is not an escalation failure", async () => {
+  const { deps, seen } = integrationFakes({ parkForReview: () => ({ ok: false, reason: "the graph refused the write", id: "task-integration-proposed-x" }) });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_PROPOSE, deps });
+  assert.strictEqual(res.state, "parked", "the PR is open — the park still settles");
+  assert.strictEqual(res.escalated_to, null);
+  assert.strictEqual(seen.parks.length, 1);
+  assert.strictEqual(seen.demotions.length, 0, "no tracker on the graph, no rollback");
+  assert.strictEqual(res.demoted, false);
+  assert.strictEqual(res.demote_reason, null);
+  assert.strictEqual(res.escalation_failed, undefined, "a park is healed by the next checkProposals pass, not re-gated by a person");
+  assert.strictEqual(seen.facts.length, 1);
+  assert.match(seen.facts[0].markdown, /Demotion: not attempted — no tracking item could be filed to block task-demo, so its status is left as the run left it/);
+  assert.doesNotMatch(seen.facts[0].markdown, /rolled back/);
+});
+
+test("a park WITH a tracking item demotes naming it, as before", async () => {
+  const { deps, seen } = integrationFakes({
+    demote: ({ blockerId }) => ({ ok: true, demoted: true, note: `task-demo rolled back done -> open; ${blockerId} now blocks task-demo` }),
+  });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_PROPOSE, deps });
+  assert.strictEqual(res.state, "parked");
+  assert.strictEqual(seen.demotions.length, 1);
+  assert.strictEqual(seen.demotions[0].blockerId, "task-integration-proposed-x");
+  assert.match(seen.facts[0].markdown, /Demotion: task-demo rolled back done -> open; task-integration-proposed-x now blocks task-demo/);
+});
+
 // ------------------------- proposeIntegrationPR: reuse keys on (head, base) --
 //
 // task-spor-integration-propose-mode base-check gap (cross-model review):
@@ -700,6 +796,73 @@ test("issue-spor-integration-park-orphan: a failed tracking-node write still sta
   await sporCli.checkProposals(cfg, { home, log: () => {} });
   assert.strictEqual(statusOf(expectedId), "done");
   assert.strictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("art-merge-")).length, 1, "no duplicate fact from the second pass");
+});
+
+// The other half of park()'s withheld demotion: the heal pass that re-creates
+// the missing tracking item is the first moment a blocker exists, so it is
+// where the rollback finally runs — against the REAL gateDemoteItem and a real
+// nodes dir, with the PR still open so nothing else in the lifecycle moves.
+test("issue-spor-integration-settle-escalate-demote-race: checkProposals completes park()'s withheld demotion the moment it heals the tracking item", async (t) => {
+  if (process.platform === "win32") return;
+  if (process.getuid && process.getuid() === 0) return;
+
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-park-heal-demote-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const write = (id, front) => fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\n${front}date: 2026-08-26\n---\n\nBody.\n`);
+  const statusOf = (id) => /^status: (.+)$/m.exec(fs.readFileSync(path.join(nodes, `${id}.md`), "utf8"))[1];
+
+  // The run resolved the item (its resolver stands), so the graph reads DONE.
+  write("task-proposed", "type: task\ntitle: Add bounded retry\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: done\n");
+  write("dec-resolver", "type: decision\ntitle: Added bounded retry\nsummary: Added bounded retry with backoff to the sync worker, so a transient failure retries instead of dropping.\nedges:\n  - {type: resolves, to: task-proposed}\n");
+
+  const entry = { node_id: "task-proposed", run_id: "11111111-2222-3333-4444-000000000002" };
+  const factory = { id: "factory-demo", integration: { targetRef: "main", mode: "propose", strategy: "merge" } };
+  const proposal = { number: 8, url: "https://github.com/demo/repo/pull/8", repo: "demo/repo", branch: "task-proposed" };
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, entry.run_id).record, {
+    run_id: entry.run_id, node_id: entry.node_id, state: "done", terminal_state: "resolved", terminal_enforced: true,
+  });
+  const deps = sporCli.makeIntegrationDeps(cfg, {
+    record: { cwd: home }, entry, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home,
+  });
+  const expectedId = sporCli.proposalTrackingId(entry.node_id, entry.run_id);
+
+  // The tracking-node write fails; park() therefore withholds the demotion.
+  fs.chmodSync(nodes, 0o500);
+  t.after(() => { try { fs.chmodSync(nodes, 0o700); } catch { /* best-effort */ } });
+  const filed = await deps.parkForReview({ proposal });
+  assert.strictEqual(filed.ok, false);
+  const withheld = filed.ok ? await deps.demote({ blockerId: filed.id }) : null; // what park() does: nothing
+  fs.chmodSync(nodes, 0o700);
+  assert.strictEqual(withheld, null);
+  assert.strictEqual(statusOf("task-proposed"), "done", "no tracker, no rollback — the status is left as the run left it");
+  dispatchRuns.stampGateState(home, entry.run_id, { gate_state: "parked", gate_at: new Date().toISOString() });
+
+  // The PR is still OPEN: the heal pass has nothing to land, only the tracker
+  // to re-create — and the demotion that was waiting on it.
+  const ghDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-fake-gh-"));
+  writeFakePathBin(ghDir, "gh", `if [ "$1" = "--version" ]; then echo "gh version 2.0.0"; exit 0; fi\necho '{"state":"OPEN","baseRefName":"main"}'\n`);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${ghDir}${path.delimiter}${originalPath}`;
+  t.after(() => { process.env.PATH = originalPath; });
+
+  const lines = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => lines.push(l) });
+  assert.strictEqual(fs.existsSync(path.join(nodes, `${expectedId}.md`)), true, "the tracking item was healed");
+  assert.strictEqual(statusOf("task-proposed"), "open", "and the withheld demotion ran the moment its blocker existed");
+  assert.ok(lines.some((l) => l.includes(`healed the tracking item for task-proposed; task-proposed rolled back done -> open; ${expectedId} now blocks task-proposed`)), lines.join("\n"));
+  assert.ok(fs.existsSync(path.join(nodes, "dec-resolver.md")), "the resolver is left standing — it is the evidence");
+
+  // A second pass finds the tracker present, heals nothing, and demotes nothing again.
+  const again = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => again.push(l) });
+  assert.strictEqual(statusOf("task-proposed"), "open");
+  assert.ok(!again.some((l) => l.includes("healed the tracking item")), again.join("\n"));
 });
 
 // ---------------------------------------------------- the git plumbing, for real --
