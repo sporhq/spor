@@ -9720,7 +9720,7 @@ function cmdWorkStatus(cfg, { json }) {
       out(
         `  gates:    ${w.factory || "(factory)"}${(w.repos || []).length ? ` [judges ${w.repos.join(", ")}]` : ""} — passed ${w.gates.passed || 0}, failed ${
           w.gates.failed || 0
-        }, blocked ${w.gates.blocked || 0}${w.gates.parked ? `, parked ${w.gates.parked}` : ""}`
+        }, blocked ${w.gates.blocked || 0}${w.gates.parked ? `, parked ${w.gates.parked}` : ""}${w.gates.superseded ? `, superseded ${w.gates.superseded}` : ""}`
       );
     for (const a of w.active || []) out(`  active:   ${a.node_id || "(free-text)"}  run ${String(a.run_id).slice(0, 8)}  ${a.harness || ""}  since ${a.started_at}`);
     for (const g of w.gating || []) {
@@ -10931,6 +10931,12 @@ function makeGateDeps(
       change = c;
       return c;
     },
+    // The two reads behind a SUPERSEDED verdict (issue-spor-work-adopts-
+    // orphaned-pipeline-of-hand-landed-run): is the item resolved on the graph
+    // — the same verify leg the loop's harvest uses — and is the run's head
+    // already on the trusted ref. Consulted only for an adopted pipeline.
+    resolved: async () => verifyRunResolution(cfg, record),
+    landed: async ({ trustedRef }) => gateRunner.gateHeadLanded(record, trustedRef),
     runSuite: async ({ gate, trustedRef, protectedPaths }) => {
       if (!change) return { ok: false, reason: "the change under judgement could not be read" };
       // The repo's own worktree-setup hook stages the throwaway tree exactly as
@@ -11807,7 +11813,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     );
     return 1;
   }
-  if (record.gate_state === "passed" || record.gate_state === "parked") {
+  if (record.gate_state === "passed" || record.gate_state === "parked" || record.gate_state === "superseded") {
     err(`spor work --regate: run ${shortId} already read '${record.gate_state}'${record.gate_reason ? ` (${record.gate_reason})` : ""} — there is nothing to re-judge.`);
     return 1;
   }
@@ -12344,7 +12350,7 @@ async function cmdWork(cfg, { values }) {
     out(
       `work: gates — passed ${final.gates.passed}, failed ${final.gates.failed}, blocked ${final.gates.blocked}${
         final.gates.parked ? `, parked ${final.gates.parked}` : ""
-      } (factory ${factoryId}).`
+      }${final.gates.superseded ? `, superseded ${final.gates.superseded}` : ""} (factory ${factoryId}).`
     );
   }
   if (final.active.length) out(`work: ${final.active.length} run(s) still in flight — 'spor runs' follows them to their terminal state.`);
