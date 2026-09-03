@@ -3595,3 +3595,186 @@ test("a resumed rescue that had already failed to run escalates the handed refus
   assert.ok(reviewInPass2, "the review gate in rescue pass 2 runs at the carried base, with the carried ledger");
   assert.deepStrictEqual(c.seen.escalations[0].ledger.map((e) => e.id), ["F1"]);
 });
+
+// --- an adopted pipeline whose work was already landed by hand ---------------
+// (issue-spor-work-adopts-orphaned-pipeline-of-hand-landed-run). A resumed
+// orphan — or any run whose checkout is gone — first asks the graph and git
+// whether there is anything left to judge; a run that is resolved AND whose
+// head is on the trusted ref settles `superseded`, touching nothing. A gone
+// checkout whose item is NOT landed refuses as before, minus the rescue.
+
+const GONE = { ok: false, gone: true, cwd: "/nowhere/.claude/worktrees/task-demo", reason: "the run's working directory (/nowhere/.claude/worktrees/task-demo) is gone, so its change cannot be read" };
+function withLanded(world, { resolved = { terminal_state: "resolved", resolved_by: "dec-demo-done" }, landed = { known: true, landed: true, head: "abcdef1234567890" } } = {}) {
+  world.seen.resolvedReads = 0;
+  world.seen.landedReads = 0;
+  world.deps.resolved = async () => {
+    world.seen.resolvedReads += 1;
+    return typeof resolved === "function" ? resolved() : resolved;
+  };
+  world.deps.landed = async ({ trustedRef }) => {
+    world.seen.landedReads += 1;
+    world.seen.landedRef = trustedRef;
+    return typeof landed === "function" ? landed() : landed;
+  };
+  return world;
+}
+const RESUMED = { ...ITEM, resumed: true };
+
+test("a resumed orphan whose item is resolved and whose head is on the trusted ref settles SUPERSEDED — no gate fact, no escalation, no demotion, no rescue", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }, { id: "review", kind: "agent-review", profile: "profile-review" }], rescue: RESCUE });
+  const log = [];
+  // The checkout is GONE (the incident's shape): the change is unreadable.
+  const { deps, seen } = withLanded(withRescue(fakes({ changedSeq: [GONE] })));
+  const res = await gateRunner.runGatePipeline({ item: RESUMED, factory, deps, log: (l) => log.push(l) });
+  assert.strictEqual(res.state, "superseded");
+  assert.deepStrictEqual(res.gates, []);
+  assert.deepStrictEqual(res.facts, []);
+  assert.strictEqual(res.resolved_by, "dec-demo-done");
+  assert.match(res.reason, /already resolved on the graph \(by dec-demo-done\) and abcdef12 is already contained in main — its checkout is gone/);
+  assert.deepStrictEqual(seen.facts, [], "no gate fact");
+  assert.deepStrictEqual(seen.escalations, [], "no escalation");
+  assert.deepStrictEqual(seen.demotions, [], "no demotion");
+  assert.deepStrictEqual(seen.rescues, [], "no rescue");
+  assert.deepStrictEqual(seen.suites, []);
+  assert.deepStrictEqual(seen.reviews, []);
+  assert.strictEqual(seen.landedRef, "main", "containment is asked of the factory's trusted ref");
+  assert.ok(log.some((l) => /superseded/.test(l)), log.join("\n"));
+
+  // The checkout still PRESENT: a resumed orphan is checked all the same, and
+  // settles the same way.
+  const present = withLanded(withRescue(fakes({ changed: ["lib/x.js"] })));
+  const r2 = await gateRunner.runGatePipeline({ item: RESUMED, factory, deps: present.deps });
+  assert.strictEqual(r2.state, "superseded");
+  assert.doesNotMatch(r2.reason, /checkout is gone/);
+  assert.deepStrictEqual(present.seen.suites, []);
+});
+
+test("a gone checkout whose item is NOT landed refuses its first gate and escalates WITHOUT attempting a rescue", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }], rescue: RESCUE });
+  const log = [];
+  // Unresolved on the graph: the claim stands un-judged, so it is judged.
+  const a = withLanded(withRescue(fakes({ changedSeq: [GONE] })), { resolved: null });
+  const ra = await gateRunner.runGatePipeline({ item: RESUMED, factory, deps: a.deps, log: (l) => log.push(l) });
+  assert.strictEqual(ra.state, "failed");
+  assert.strictEqual(ra.escalated_to, "task-gate-acceptance");
+  assert.strictEqual(a.seen.escalations.length, 1);
+  assert.match(a.seen.escalations[0].detail, /working directory .* is gone/);
+  assert.deepStrictEqual(a.seen.rescues, [], "no rescue is dispatched into a directory that does not exist");
+  assert.strictEqual(a.seen.facts.length, 1, "the refused gate's fact, and no rescue fact");
+  assert.match(a.seen.facts[0].id, /^art-gate-acceptance-/);
+  assert.strictEqual(a.seen.demotions.length, 1);
+  assert.strictEqual(a.seen.landedReads, 0, "an unresolved item never has its head checked");
+  assert.ok(log.some((l) => /checkout is gone — no rescue can work in it/.test(l)), log.join("\n"));
+
+  // Resolved, but its head is NOT (or not knowably) on the trusted ref —
+  // e.g. the branch was deleted with the worktree: fail closed, judge it.
+  for (const landed of [{ known: true, landed: false, head: "1234567890abcdef" }, { known: false, landed: null, head: null }]) {
+    const b = withLanded(withRescue(fakes({ changedSeq: [GONE] })), { landed });
+    const rb = await gateRunner.runGatePipeline({ item: RESUMED, factory, deps: b.deps });
+    assert.strictEqual(rb.state, "failed", JSON.stringify(landed));
+    assert.strictEqual(b.seen.escalations.length, 1);
+    assert.deepStrictEqual(b.seen.rescues, []);
+  }
+
+  // A dep that THROWS is a doubt, not evidence: judged as before.
+  const c = withLanded(withRescue(fakes({ changedSeq: [GONE] })), { resolved: () => { throw new Error("graph down"); } });
+  const rc = await gateRunner.runGatePipeline({ item: RESUMED, factory, deps: c.deps });
+  assert.strictEqual(rc.state, "failed");
+  assert.strictEqual(c.seen.escalations.length, 1);
+
+  // Not gone, not resumed, but the tree is unreadable for another reason: the
+  // rescue lane is offered exactly as before.
+  const d = withLanded(withRescue(fakes({ changed: null })));
+  const rd = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: d.deps });
+  assert.strictEqual(d.seen.rescues.length, 1, "an ordinary unreadable tree is still rescuable");
+  assert.ok(["failed", "passed"].includes(rd.state));
+});
+
+test("a pipeline the worker starts off its OWN harvest never consults the supersession reads, and without the deps a resumed one judges as before", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+  const fresh = withLanded(fakes({ changed: ["lib/x.js"] }));
+  const r = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: fresh.deps });
+  assert.strictEqual(r.state, "passed");
+  assert.strictEqual(fresh.seen.resolvedReads, 0);
+  assert.strictEqual(fresh.seen.landedReads, 0);
+
+  const bare = fakes({ changed: ["lib/x.js"] });
+  const r2 = await gateRunner.runGatePipeline({ item: RESUMED, factory, deps: bare.deps });
+  assert.strictEqual(r2.state, "passed");
+  assert.strictEqual(bare.seen.suites.length, 1, "no deps, no check — the gates run");
+});
+
+test("the loop settles a SUPERSEDED verdict like a pass: tallied, stamped settled, no cooldown, and never re-offered by the orphan scan", async () => {
+  const stamps = [];
+  const { deps, control, state } = loopHarness({
+    queue: [{ id: "task-a" }],
+    gate: () => ({ state: "superseded", reason: "superseded: task-a is already resolved on the graph and abcdef12 is already contained in main; nothing left to judge" }),
+  });
+  deps.markGate = (runId, patch) => stamps.push({ runId, ...patch });
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, retryAfterMs: 600000, max: 1 }, deps, control });
+  assert.strictEqual(state.gateCalls.length, 1);
+  assert.strictEqual(status.gates.superseded, 1);
+  assert.strictEqual(status.gates.passed, 0);
+  assert.deepStrictEqual(status.skipped, [], "a superseded item is done — no cooldown");
+  assert.strictEqual(status.recent[0].gate, "superseded");
+  assert.deepStrictEqual(stamps.map((s) => s.gate_state), ["running", "superseded"]);
+  assert.ok(gates.SETTLED_GATE_STATES.has("superseded"));
+  const slot = { run_id: "run-orphan", node_id: "task-orphan", harness: "fake" };
+  const dead = { worker_id: "w1", live: false, gates: { passed: 0, failed: 0, blocked: 0 }, gating: [slot], active: [] };
+  assert.deepStrictEqual(workLoop.orphanedGateRuns([dead], { records: new Map([["run-orphan", { ...ORPHAN_RECORD, gate_state: "superseded" }]]) }), []);
+  // A pipeline this worker started off its own harvest is called exactly as
+  // before; only an ADOPTED slot carries `resumed`.
+  assert.strictEqual(state.gateCalls[0].entry.resumed, undefined);
+});
+
+test("the resumed flag rides the gate call only for an adopted orphan", async () => {
+  const { deps, control, state } = loopHarness({ gate: () => ({ state: "superseded", reason: "superseded" }) });
+  const record = { ...ORPHAN_RECORD };
+  deps.pendingGates = async () => [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake", record }];
+  await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, once: true }, deps, control });
+  assert.strictEqual(state.gateCalls.length, 1);
+  assert.strictEqual(state.gateCalls[0].entry.resumed, true);
+  assert.strictEqual(state.gateCalls[0].entry.node_id, "task-orphan");
+});
+
+test("gateChangeSet marks a missing checkout `gone`, and gateHeadLanded reads the run's head from the checkout or, once it is removed, from the dispatch worktree's branch", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "spor-landed-"));
+  const g = (dir, args) => execFileSync("git", args, { cwd: dir, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  g(repo, ["init", "-q", "-b", "main"]);
+  fs.writeFileSync(path.join(repo, "a.txt"), "a\n");
+  g(repo, ["add", "."]);
+  g(repo, ["commit", "-q", "-m", "base"]);
+  const wt = path.join(repo, ".claude", "worktrees", "task-demo");
+  fs.mkdirSync(path.dirname(wt), { recursive: true });
+  g(repo, ["worktree", "add", "-q", "-b", "task-demo", wt, "HEAD"]);
+  fs.writeFileSync(path.join(wt, "b.txt"), "b\n");
+  g(wt, ["add", "."]);
+  g(wt, ["commit", "-q", "-m", "work"]);
+  const head = g(wt, ["rev-parse", "HEAD"]);
+  const record = { cwd: wt };
+
+  assert.strictEqual(gateRunner.gateChangeSet(record, "main").ok, true);
+  assert.deepStrictEqual(gateRunner.gateHeadLanded(record, "main"), { known: true, landed: false, head }, "present, unlanded");
+
+  // Landed by hand: fast-forward main to the branch, then remove the worktree.
+  g(repo, ["update-ref", "refs/heads/main", head]);
+  assert.deepStrictEqual(gateRunner.gateHeadLanded(record, "main"), { known: true, landed: true, head }, "present, landed");
+  g(repo, ["worktree", "remove", "--force", wt]);
+  const gone = gateRunner.gateChangeSet(record, "main");
+  assert.strictEqual(gone.ok, false);
+  assert.strictEqual(gone.gone, true);
+  assert.strictEqual(gone.cwd, wt);
+  assert.match(gone.reason, /is gone/);
+  assert.deepStrictEqual(gateRunner.gateHeadLanded(record, "main"), { known: true, landed: true, head }, "gone, read off the branch");
+  // A trusted ref that does not resolve, or a branch that was deleted with
+  // the worktree, is NOT knowable — never "unlanded".
+  assert.deepStrictEqual(gateRunner.gateHeadLanded(record, "nope"), { known: false, landed: null, head });
+  g(repo, ["branch", "-D", "task-demo"]);
+  assert.deepStrictEqual(gateRunner.gateHeadLanded(record, "main"), { known: false, landed: null, head: null });
+  // A gone checkout that is not a dispatch worktree names no ref at all.
+  assert.deepStrictEqual(gateRunner.gateHeadLanded({ cwd: path.join(root, "elsewhere") }, "main"), { known: false, landed: null, head: null });
+  assert.deepStrictEqual(gateRunner.gateHeadLanded({ cwd: null }, "main"), { known: false, landed: null, head: null });
+  fs.rmSync(root, { recursive: true, force: true });
+});

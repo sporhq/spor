@@ -1126,7 +1126,7 @@ Two durable records make it recoverable by any later worker on the box:
 
 - each pipeline stamps **`gate_state`** on its run record — `running` when it
   starts, `interrupted` when a stop abandons it, and the settled verdict
-  (`passed`/`failed`/`blocked`) when it reports. A settled verdict is FINAL for
+  (`passed`/`failed`/`blocked`, or `superseded` — see below) when it reports. A settled verdict is FINAL for
   that run: nothing may overwrite it, so a duplicate pipeline (see below) can
   never launder a `failed` into a `passed`, and a stop cannot reopen one. On the
   way out of the loop the worker makes one last pass over its pipelines, so a
@@ -1169,6 +1169,30 @@ its worker). So an orphan whose **node still has a non-terminal run record is
 deferred**, not adopted — the next pass takes it once that agent's run is
 terminal. A record aged past the worker's own watchdog ceiling is not evidence
 of a live agent, so it cannot defer an orphan forever.
+
+**An adopted pipeline first asks whether the work was already landed by hand.**
+An orphan can sit un-judged for hours, and in that window a person may have
+merged its branch onto the trusted ref and removed its worktree (an
+orchestrator's ordinary close-out). Re-gating that is worse than wasted spend:
+the acceptance gate refuses on the missing directory, the rescue cannot dispatch
+into it, and the pipeline escalates and DEMOTES an item that is done and on the
+trusted ref (issue-spor-work-adopts-orphaned-pipeline-of-hand-landed-run). So
+before any gate runs on a resumed pipeline — or on any pipeline whose run
+checkout is gone — the runner reads two facts, and BOTH must hold: the graph
+says the item is resolved (the same verify leg the harvest uses), and git says
+the run's head is contained in `trusted_ref` (read from the checkout, or, when
+it is gone, from the branch the dispatch worktree was cut on — `git worktree
+remove` leaves it standing). Then the pipeline settles **`superseded`**: a
+settled `gate_state` (never re-offered, `--regate` has nothing to re-judge),
+no gate fact, no escalation, no demotion, no cooldown. Every doubt falls
+CLOSED to the ordinary judgement — an unreachable graph, a deleted branch, a
+head not yet on the ref — and a run whose checkout is gone but whose item is
+NOT landed refuses its first gate as before, except that the rescue lane is
+skipped (a rescue works in the run's own tree, and there is none) and the
+escalation says so. The accepted residual: a resumed run that resolved its
+item without committing anything has a head trivially contained in the
+trusted ref and reads as superseded; a pipeline the worker starts off its own
+harvest is never checked, so that reading never hides a fresh no-work claim.
 
 Scoping the candidate set to slots a work loop actually held is what keeps this
 from becoming "gate every run ever dispatched on this box": a hand-run `spor
