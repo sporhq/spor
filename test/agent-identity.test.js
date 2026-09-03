@@ -60,13 +60,19 @@ function run(args, env, cwd) {
 const NATIVE_BG = { SPOR_DISPATCH_CLAUDE_LAUNCH_MODE: "native-background" };
 async function waitForFile(file, { timeoutMs = 10000, intervalMs = 25 } = {}) {
   const end = Date.now() + timeoutMs;
+  // Wait for CONTENT, not mere existence: every stub writes its record with
+  // one writeFileSync, whose truncating open() and write() are two syscalls,
+  // so under a loaded full suite a poll can land between them and read ''
+  // (art-gate-acceptance-spor-claude-bg-prose-sweep-aft-febdf471-53e607fa —
+  // a launch that had happened read as "launched inside the worktree" ''). No
+  // caller ever accepted an empty read (`assert.ok('')` fails), so this only
+  // removes the race.
   for (;;) {
-    try {
-      return fs.readFileSync(file, "utf8");
-    } catch {
-      if (Date.now() >= end) return null;
-      await new Promise((resolve) => setTimeout(resolve, intervalMs));
-    }
+    let text = null;
+    try { text = fs.readFileSync(file, "utf8"); } catch { /* not yet */ }
+    if (text) return text;
+    if (Date.now() >= end) return text;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
 }
 function runAsync(args, env, cwd) {
