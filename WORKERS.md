@@ -1505,9 +1505,15 @@ write the `art-attest-*` anchor as the runner. Unrelated keys the suite needs
 are left alone. The same holds one level up and one level down. UP: the
 dispatched implementer never inherits the judge's secrets either — the
 supervisor strips `SPOR_ATTESTATION_KEY`, `SPOR_ADMIN_TOKEN` and
-`SPOR_REFRESH_TOKEN` (`JUDGE_ONLY_ENV`, agent-dispatch-runner.js) from every
-harness child, whatever the harness, on top of the agent-scoped token that
-replaces the person's graph bearer. DOWN: every git call the JUDGE makes over
+`SPOR_REFRESH_TOKEN` — under their legacy `SUBSTRATE_*` spellings too, which
+the config cascade dual-reads (`JUDGE_ONLY_ENV`, agent-dispatch-runner.js) —
+from every harness child, whatever the harness, on top of the agent-scoped
+token that replaces the person's graph bearer. SIDEWAYS: the repo's
+`dispatch.worktreeSetup`/`worktreeTeardown` hooks are resolved from the
+tree's own checkout — the commit under judgement — and run under the same
+`judgeGitEnv` as the judge's git (secrets scrubbed, hooks off), for every
+tree role, so candidate-controlled staging code never sees the key or a
+graph credential before the scrubbed suite does. DOWN: every git call the JUDGE makes over
 the judged tree (`git worktree add`, the protected-path checkout, the
 candidate merge/rebase) runs under `judgeGitEnv` — the same secret scrub plus
 every git HOOK disabled, `core.hooksPath` forced through git's env-config door
@@ -1542,9 +1548,15 @@ the lock path (two waiters unlinking one stale lock let the second remove
 the first's fresh lock — two holders); it RENAMES the corpse to a name only
 it knows (one breaker wins), judges the file it actually took, deletes it if
 stale and hands it back (a hard link, never replacing a lock taken in the
-meantime) if it turned out live. Release is checked: the holder wrote a
-random token into its lock and removes the lock path only while that token is
-still what it holds.
+meantime) if it turned out live. The rename leaves the lock path empty for a
+moment, so the break runs under a BREAKER LOCK (`<lock>.break`, one breaker
+at a time, held until the moved lock is back at its path or deleted) and an
+acquirer whose O_EXCL open succeeds while that breaker lock exists does not
+hold — it releases what it took and goes round again — so a lock opened in
+the break window never becomes a second holder beside the live one whose
+lock was moved aside. Release is checked: the holder wrote a random token
+into its lock and removes the lock path only while that token is still what
+it holds.
 
 **In `propose` mode the PR body carries the attestation — or there is no PR.**
 A body that cannot be built (the attestation object throws, or renders

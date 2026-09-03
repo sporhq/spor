@@ -7719,9 +7719,19 @@ function runWorktreeHook(which, dir, { repoDir, slug = null, nodeId = null, stdi
     // Scrubbed of the git location vars (u.gitEnv): the hook stages the fresh
     // worktree, so its git must follow cwd rather than an ambient GIT_DIR
     // inherited from whatever launched dispatch
-    // (issue-spor-dispatch-worktree-wrong-repo-location).
+    // (issue-spor-dispatch-worktree-wrong-repo-location). And run under the
+    // JUDGE's environment (gateRunner.judgeGitEnv — cross-model review,
+    // blocking finding 1): the hook is resolved from the tree's OWN checkout,
+    // i.e. from the commit under judgement (a gate tree, the integration
+    // candidate — and a reused dispatch worktree on a fix cycle sits at the
+    // implementer's branch too), so it is candidate-controlled code that ran
+    // BEFORE the scrubbed gate command with the attestation signing key and
+    // the graph credentials in its environment. Same scrub as the suite
+    // (scrubSecretEnv: the key, every graph bearer/refresh/admin token, both
+    // SPOR_/SUBSTRATE_ spellings) plus every git hook disabled. The hook
+    // never needs the judge's credentials: it stages files.
     env: {
-      ...u.gitEnv(),
+      ...gateRunner.judgeGitEnv(u.gitEnv()),
       SPOR_WORKTREE: dir,
       SPOR_MAIN_CHECKOUT: repoDir,
       SPOR_DISPATCH_SLUG: slug || "",
@@ -9546,7 +9556,9 @@ function cmdWorkStatus(cfg, { json }) {
       out(
         `  gates:    ${w.factory || "(factory)"}${(w.repos || []).length ? ` [judges ${w.repos.join(", ")}]` : ""} — passed ${w.gates.passed || 0}, failed ${
           w.gates.failed || 0
-        }, blocked ${w.gates.blocked || 0}${w.gates.parked ? `, parked ${w.gates.parked}` : ""}`
+        }, blocked ${w.gates.blocked || 0}${w.gates.parked ? `, parked ${w.gates.parked}` : ""}${
+          w.gates.superseded ? `, superseded ${w.gates.superseded}` : ""
+        }`
       );
     for (const a of w.active || []) out(`  active:   ${a.node_id || "(free-text)"}  run ${String(a.run_id).slice(0, 8)}  ${a.harness || ""}  since ${a.started_at}`);
     for (const g of w.gating || []) {
@@ -9571,9 +9583,22 @@ function cmdWorkStatus(cfg, { json }) {
         `  done:     ${r.node_id || "(free-text)"}  ${r.terminal_state || r.state || "?"}` +
           `${r.terminal_state && !r.terminal_enforced ? " (unenforced)" : ""}` +
           `${r.resolved_by ? ` by ${r.resolved_by}` : ""}${r.report_node_id ? ` — report ${r.report_node_id}` : ""}` +
-          `${r.gate ? `  gates ${r.gate}` : ""}`
+          `${r.gate ? `  gates ${r.gate}` : ""}${r.superseded ? " (superseded)" : ""}`
       );
       if (r.gate && r.gate !== "passed" && r.gate_reason) out(`            ${r.gate_reason}`);
+      // A verdict this worker's pipeline did NOT produce (cross-model review,
+      // minor finding 5): the `gates` state above is the record's — the one
+      // that won the settle race — and this worker's own verdict lost and was
+      // never recorded. Without the marker a displayed `passed` reads as this
+      // worker's judgement.
+      if (r.superseded) {
+        const own = r.superseded_verdict || {};
+        out(
+          `            superseded: this worker's own '${own.state || "failed"}' verdict${own.head ? ` at ${String(own.head).slice(0, 12)}` : ""} lost the settle race and is not recorded — shown is the record's verdict${
+            r.gate_worker ? `, settled by ${r.gate_worker}` : ", settled by another pipeline"
+          }`
+        );
+      }
       // The fail-soft half of a refusal: the verdict stands either way, but an
       // operator has to know the item is still reading DONE on the graph.
       if (r.demote_reason) out(`            not demoted on the graph: ${r.demote_reason}`);
@@ -12158,7 +12183,7 @@ async function cmdWork(cfg, { values }) {
     out(
       `work: gates — passed ${final.gates.passed}, failed ${final.gates.failed}, blocked ${final.gates.blocked}${
         final.gates.parked ? `, parked ${final.gates.parked}` : ""
-      } (factory ${factoryId}).`
+      }${final.gates.superseded ? `, superseded ${final.gates.superseded}` : ""} (factory ${factoryId}).`
     );
   }
   if (final.active.length) out(`work: ${final.active.length} run(s) still in flight — 'spor runs' follows them to their terminal state.`);
