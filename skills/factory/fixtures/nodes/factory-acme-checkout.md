@@ -9,6 +9,7 @@ status: active
 edges:
   - {type: relates-to, to: gate-adversarial-review}
   - {type: relates-to, to: profile-acme-test-writer}
+  - {type: relates-to, to: profile-acme-rescue}
 ---
 
 Compiled from the owner's own acceptance criteria (see the interview fixture).
@@ -36,6 +37,14 @@ work lands itself onto `main`, re-running `npm test` on the merged result
 first, with one fix cycle before a conflict or that re-run failing comes back
 to them the same way a failed review would.
 
+And before any of that reaches them (Q8): a refusal that has spent its fix
+cycles is handed to a strong model first — dispatched into the implementer's
+own checkout to diagnose why the lane could not converge, fix and commit, and
+file the factory change that would have prevented it — and the whole gate list
+re-runs on what it leaves. Only if that pass also refuses is the owner paged,
+and the item they get opens with the diagnosis. It never passes anything
+itself.
+
 ```json
 {
   "factory": "acme-checkout",
@@ -58,6 +67,12 @@ to them the same way a failed review would.
     "strategy": "merge",
     "serialize": "repo",
     "cycles": 1
+  },
+  "rescue": {
+    "profile": "profile-acme-rescue",
+    "attempts": 1,
+    "await_ms": 3600000,
+    "instructions": "Prefer the smallest fix that makes the prior findings resolve; if the review was arguing about naming, say so."
   }
 }
 ```

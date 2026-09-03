@@ -797,7 +797,10 @@ under test cannot rewrite its own judge. So a command gate:
    the first gate refuses it unretried as before, with the round-trip on the
    escalation so the person sees it was tried. Only the dirty-tree refusal
    earns this — a missing checkout, an unresolvable trusted ref, or a failed
-   `git status` is about the checkout, not the work, and escalates directly;
+   `git status` is about the checkout, not the work, and escalates directly.
+   A rescue pass (§10.10) gets the same one round-trip, keyed by pass: a
+   rescue that leaves its fix uncommitted is an implementer that forgot to
+   commit, and the original pass's spent round-trip never denies it;
 2. **fails CLOSED** if that change touches any declared protected test path —
    the suite is not run at all, no fix cycle is offered, and the test change is
    filed as its own queue item naming the `test_lane_profile` (a different
@@ -1605,7 +1608,10 @@ a stale premise is triage's, not the lane's.
    `relates-to` the item, the refused gate's fact and each filed task, never
    `resolves` (WORKERS.md §10.6's rule holds: a record, not a retirement).
 5. Re-reads the change and re-runs the **whole gate list as a rescue pass**:
-   every gate, from the first, on the tree the rescue left. Each gate gets a
+   every gate, from the first, on the tree the rescue left — after the same
+   one commit-or-discard round-trip a dirty implementer tree gets (§10.3),
+   keyed to the rescue pass, so a rescue that committed nothing but left the
+   fix in the tree is not refused unretried on the tree that carries it. Each gate gets a
    FRESH fix-cycle budget (its declared `cycles`, counted from the rescue), but
    the finding ledger is CARRIED and the cycle index CONTINUES — so the review
    after the rescue is a fix-cycle review under §10.4's stateful protocol:
