@@ -406,9 +406,19 @@ async function cmdNext(cfg, args) {
     // softly say so on stderr. The cwd-default firehose (no explicit/pinned scope)
     // and an explicit --all-projects are deliberately not flagged — an empty
     // result there is normal, not a typo.
+    // A server that knows the graph says so AUTHORITATIVELY: GET /v1/queue
+    // echoes a zero-match scope token as the additive `project_warning` string
+    // (task-spor-remote-next-print-project-warning, the remote twin of local
+    // queue.js's projectKnown() check). Print it verbatim on stderr and strip it
+    // from the envelope, so --json matches local byte-for-byte — the analytics
+    // arm's pattern (analyticsRemote). It supersedes the best-effort note below
+    // for the same read; an older server that omits the field still gets the
+    // soft note.
+    const projectWarning = takeProjectWarning(r.json);
+    if (projectWarning) err(projectWarning);
     const scoped = (allProjects && !explicit) ? null : (explicit ?? pinned);
     const count = (r.json && (r.json.count ?? (Array.isArray(r.json.items) ? r.json.items.length : null)));
-    if (scoped && count === 0) {
+    if (scoped && count === 0 && !projectWarning) {
       err(`project '${scoped}' returned an empty queue — check the slug / grouping id (the server scoped to it and found nothing)`);
     }
     if (needAgents) {
@@ -717,6 +727,18 @@ function queueLimitTarget(args) {
   const n = parseInt(args[i + 1], 10);
   if (n === 0) return Infinity;
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_LIMIT;
+}
+
+// Lift the server's additive `project_warning` off a GET /v1/queue envelope
+// (task-spor-remote-next-print-project-warning): a non-empty string when the
+// `project` token matched no repo, grouping, or project stamp — the
+// /v1/analytics shape. Returns it (or null) and DELETES it from the envelope so
+// what the caller prints/keeps carries only the fields local mode has.
+function takeProjectWarning(envelope) {
+  if (!envelope || typeof envelope !== "object") return null;
+  const w = envelope.project_warning;
+  if (w !== undefined) delete envelope.project_warning;
+  return typeof w === "string" && w ? w : null;
 }
 
 // Page through GET /v1/queue assembling up to `target` items (Infinity = all)
@@ -7342,11 +7364,24 @@ async function fetchQueuePage(cfg, slug, LIMIT, ctx = {}) {
     const base = `limit=${LIMIT}&exclude_type=question`;
     const q = slug ? `?project=${encodeURIComponent(slug)}&${base}` : `?${base}`;
     const r = await remote.get(cfg, `/v1/queue${q}`, { timeoutMs: 6000 });
+    // Keep the ENVELOPE, not just `items`: a zero-match scope rides back as the
+    // additive `project_warning` string (task-spor-remote-next-print-project-
+    // warning), and discarding it here is what made a typo'd --project look
+    // exactly like an empty queue to `spor work` / `dispatch --from-queue`.
+    const warning = r.ok ? takeProjectWarning(r.json) : null;
+    if (warning) warnQueueProjectOnce(slug, warning);
     items = r.ok && r.json ? r.json.items || [] : [];
   } else {
     try {
-      if (!ctx.graph) ctx.graph = require(path.join(ROOT, "lib", "graph.js")).loadGraph(cfg.nodesDir());
+      const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+      if (!ctx.graph) ctx.graph = graphLib.loadGraph(cfg.nodesDir());
       const g = ctx.graph;
+      // The local twin of the remote warning above (norm-spor-cli-mode-parity):
+      // lib/queue.js prints this only from its CLI main, which rankQueue
+      // bypasses, so say it here — same text, same once-per-token throttle.
+      if (slug && !graphLib.projectKnown(g, slug)) {
+        warnQueueProjectOnce(slug, `project '${slug}' matched no repo or grouping — queue is empty (try a repo slug, a repo-<slug> node id, or a grouping id)`);
+      }
       const { rankQueue } = require(path.join(ROOT, "lib", "queue.js"));
       const opts = { limit: LIMIT, excludeTypes: ["question"] };
       const r = rankQueue(g, slug ? { project: slug, ...opts } : opts);
@@ -7356,6 +7391,20 @@ async function fetchQueuePage(cfg, slug, LIMIT, ctx = {}) {
     }
   }
   return items;
+}
+
+// `spor work` re-reads the queue every poll (and widens it within a pass), so a
+// scope warning is printed ONCE per token per process — the first read says it,
+// where an operator watching the startup output sees it, and the loop's own
+// scope-starvation notice carries it from there. Keyed by the token, so a
+// worker whose scope changes mid-run (a later --project) still warns for the
+// new one.
+const warnedQueueProjects = new Set();
+function warnQueueProjectOnce(slug, warning) {
+  const key = String(slug || "");
+  if (warnedQueueProjects.has(key)) return;
+  warnedQueueProjects.add(key);
+  err(warning);
 }
 
 // The hard exclusions applied to whatever the ranker returned — classes an
@@ -12077,19 +12126,45 @@ async function cmdWork(cfg, { values }) {
   // A declared repo that names nothing in this graph is the quiet failure mode
   // of the whole feature: every item is out of scope, so the worker reads an
   // empty page (or filters the whole one away) and idles with nothing to say.
-  // In LOCAL mode the graph is right here — say so at startup, where an
-  // operator is watching. A WARNING, not a refusal: a remote graph, or a repo
-  // whose identity node does not exist yet, is not a typo. Remote mode has no
-  // cheap equivalent, and falls back to the loop's own scope-starvation notice.
+  // Say so at startup, where an operator is watching. A WARNING, not a
+  // refusal: a repo whose identity node does not exist yet is not a typo. In
+  // LOCAL mode the graph is right here (projectKnown); in REMOTE mode the
+  // server answers the same question — GET /v1/queue?project=<repo> echoes a
+  // zero-match token as the additive `project_warning` string
+  // (task-spor-remote-next-print-project-warning) — so one bounded, fail-open
+  // probe per declared repo asks it. The warning line is the SAME in both
+  // modes (norm-spor-cli-mode-parity); a dead server, an error, or an older
+  // server that omits the field says nothing here and falls back to the
+  // loop's own scope-starvation notice.
+  const unknownRepoWarning = (r) => `warning: factory '${factoryId}' declares repo '${r}', which names no repo or project in this graph — items stamped with it will never be found.`;
   if (factoryRepos.length && cfg.mode() === "local") {
     try {
       const graphLib = require(path.join(ROOT, "lib", "graph.js"));
       const g = graphLib.loadGraph(cfg.nodesDir());
       for (const r of factoryRepos) {
-        if (!graphLib.projectKnown(g, r)) err(`warning: factory '${factoryId}' declares repo '${r}', which names no repo or project in this graph — items stamped with it will never be found.`);
+        if (!graphLib.projectKnown(g, r)) err(unknownRepoWarning(r));
       }
     } catch {
       /* an unreadable graph is the queue read's problem to report, not this check's */
+    }
+  } else if (factoryRepos.length && cfg.mode() === "remote") {
+    for (const r of factoryRepos) {
+      try {
+        const res = await remote.get(cfg, `/v1/queue?project=${encodeURIComponent(r)}&limit=1`, { timeoutMs: 3000 });
+        const warning = res.ok ? takeProjectWarning(res.json) : null;
+        if (!warning) continue;
+        // The server's text is the authoritative answer, so print it VERBATIM
+        // (the acceptance: byte-matching what `spor next --project <typo>`
+        // prints), then the factory-shaped context line local mode prints. The
+        // verbatim line goes through the once-per-token printer so a
+        // single-repo factory — whose page read is scoped to this same repo and
+        // carries the same field — says it once, while a multi-repo factory —
+        // whose page read is UNSCOPED and never sees it — still says it per repo.
+        warnQueueProjectOnce(r, warning);
+        err(unknownRepoWarning(r));
+      } catch {
+        /* fail-open: an unreachable server is the queue read's problem to report */
+      }
     }
   }
 
