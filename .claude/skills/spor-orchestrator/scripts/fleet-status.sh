@@ -12,8 +12,11 @@
 #               `claude -p` run — the default since c1ab5b6 — or a Codex run)
 #               the newest `spor runs --node <id>` state as `run:<state>`
 #   graph     — the node's frontmatter status via `spor get`
-#   verdict   — RUNNING / FINISHED (resolved, gate+merge it) / RECOVER
-#               (session gone or idle but node NOT resolved) / DONE
+#   verdict   — RUNNING (session/run still active — including a node
+#               already resolved whose supervised run has not gone terminal:
+#               NOT merge-ready yet) / FINISHED (resolved AND the process is
+#               over, gate+merge it) / RECOVER (session gone or idle but node
+#               NOT resolved) / DONE
 #
 # A RECOVER verdict (session idle, node unresolved) can also mean the agent
 # idled awaiting the orchestrator's SendMessage reply to a blocking question —
@@ -44,7 +47,20 @@ for n in "${NODES[@]}"; do
   gs=$(spor get "$n" --json 2>/dev/null | jq -r '.frontmatter.status // "open"')
   case "$gs" in
     resolved|done|answered)
-      case "$st" in ""|idle|run:*) v=FINISHED ;; *) v="FINISHED (session still $st — reap with: claude stop)";; esac ;;
+      # A resolved node is merge-ready only once its process is ALSO over. A
+      # `--bg` session still working can be reaped; a SUPERVISED run still
+      # running/launching (run:<state> non-terminal) cannot — an implementer
+      # resolves its node a beat before its final commit lands, so gating or
+      # merging here would judge an incomplete branch. Wait for the run record
+      # to go terminal (done/failed/failed_launch/vanished) first.
+      if fleet_status_active "$st"; then
+        case "$st" in
+          run:*) v="RUNNING (node $gs, run still ${st#run:} — wait for the run record to go terminal before gate+merge)" ;;
+          *)     v="FINISHED (session still $st — reap with: claude stop)" ;;
+        esac
+      else
+        v=FINISHED
+      fi ;;
     *)
       if fleet_status_active "$st"; then v=RUNNING; else v="RECOVER (session ${st:-gone}, node $gs)"; fi ;;
   esac

@@ -14633,13 +14633,16 @@ const COMMANDS = {
       "The durable record of every background agent dispatched from this machine —\n" +
       "how each run ENDED, and where to look (inc-spor-dispatch-session-vanished-\n" +
       "2026-07-18).\n\n" +
-      "A Claude Code dispatch detaches into the harness daemon, so the launcher\n" +
-      "never sees the child exit and 'claude agents' lists only what is still\n" +
-      "running: without this record a finished run and a dead one are\n" +
-      "indistinguishable afterwards. Reading this reconciles first — every run the\n" +
-      "harness no longer reports live is resolved against its own transcript and\n" +
-      "stamped with a terminal state, a classification, a reason, and a transcript\n" +
-      "pointer:\n\n" +
+      "A supervised dispatch (the default for every built-in harness, including\n" +
+      "Claude Code since it moved to 'claude -p' under the supervisor) has its\n" +
+      "record finalized by the supervisor itself when the child exits. Only an\n" +
+      "explicit 'spor dispatch --bg' still detaches into the Claude harness daemon,\n" +
+      "where the launcher never sees the child exit and 'claude agents' lists only\n" +
+      "what is still running: without this record a finished run and a dead one\n" +
+      "are indistinguishable afterwards. Reading this reconciles those first —\n" +
+      "every native-background run the harness no longer reports live is resolved\n" +
+      "against its own transcript and stamped with a terminal state, a\n" +
+      "classification, a reason, and a transcript pointer:\n\n" +
       "  done       the session ended its turn cleanly\n" +
       "  failed     it ended for a recognized reason (see the class)\n" +
       "  vanished   it stopped mid-turn with no end-of-turn marker — the reason\n" +
