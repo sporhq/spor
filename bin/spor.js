@@ -9871,8 +9871,10 @@ async function loadFactoryDefinition(cfg, id) {
   // precheck cannot see — a dangling profile, a machine-declared harness this
   // box has no binding for.
   if (res.factory) {
-    for (const gate of res.factory.gates) {
-      if (gate.kind !== "agent-review") continue;
+    // The rescue lane's profile gets the same precheck (its diagnosis is
+    // read off the run's final report too — WORKERS.md §10.10).
+    const routed = [...res.factory.gates.filter((g) => g.kind === "agent-review"), ...(res.factory.rescue ? [{ id: "rescue", kind: "rescue", profile: res.factory.rescue.profile }] : [])];
+    for (const gate of routed) {
       const pn = await resolveNode(cfg, gate.profile);
       if (!pn || !pn.raw) continue; // an unreadable/missing profile is a dispatch-time refusal, not this precheck's job
       // Read `.harness` the same way resolveDispatchProfile does — off
@@ -9892,10 +9894,14 @@ async function loadFactoryDefinition(cfg, id) {
       const resolved = dispatchHarnesses.resolveHarness(harness, { cfg });
       if (resolved.adapter && resolved.adapter.launchMode === "native-background") {
         errors.push(
-          `gate '${gate.id}': agent-review gate routes to profile '${gate.profile}', whose harness '${harness}' launches` +
-            ` native-background and has no report channel — an agent-review gate's verdict is read from the run's final` +
-            ` report, which only a SUPERVISED harness writes; route '${gate.profile}' to a supervised harness (codex,` +
-            ` opencode, copilot, or a machine-declared one) instead.`
+          gate.kind === "rescue"
+            ? `rescue: the rescue lane routes to profile '${gate.profile}', whose harness '${harness}' launches` +
+              ` native-background and has no report channel — the rescue's diagnosis is read from the run's final` +
+              ` report, which only a SUPERVISED harness writes; route '${gate.profile}' to a supervised harness instead.`
+            : `gate '${gate.id}': agent-review gate routes to profile '${gate.profile}', whose harness '${harness}' launches` +
+              ` native-background and has no report channel — an agent-review gate's verdict is read from the run's final` +
+              ` report, which only a SUPERVISED harness writes; route '${gate.profile}' to a supervised harness (codex,` +
+              ` opencode, copilot, or a machine-declared one) instead.`
         );
       }
     }
@@ -10300,6 +10306,16 @@ function gateFixText(change, fix) {
   return lines.join("\n");
 }
 
+// Every commit on the branch — the implementer's and each fix cycle's — for
+// the rescue lane, which is handed the whole history rather than only the
+// last fix (task-spor-factory-rescue-lane).
+function gateHistoryText(change) {
+  if (!change || !change.base || !change.head || change.base === change.head) return "";
+  const log = git(change.cwd, ["log", "--no-color", "--format=%h %s%n%b", "--stat", `${change.base}..${change.head}`], { maxBuffer: 8 * 1024 * 1024 });
+  if (log.status !== 0 || !String(log.stdout || "").trim()) return "";
+  return gateRunner.capBytes(String(log.stdout).trim(), 8000);
+}
+
 // The work item as the reviewer should see it: id, title, summary and the
 // body (bounded) — what was asked, so "does it do what was asked" has a
 // referent.
@@ -10362,6 +10378,12 @@ function makeGateDeps(
   // facts and escalations never collide with the first attempt's.
   const short = gateRunner.shortRunAttempt(entry.run_id, entry.attempt);
   const runKey = gateRunner.gateRunKey(entry.run_id, entry.attempt);
+  // A RESCUE pass (task-spor-factory-rescue-lane) re-runs the gates on the
+  // same run; everything it files or names is keyed one segment deeper so it
+  // never collides with — or silently adopts — the original pass's node.
+  // Pass 0 hands back the exact keys above.
+  const keysFor = (rescue) => (rescue ? { short: gateRunner.shortRunAttempt(entry.run_id, entry.attempt, rescue), runKey: gateRunner.gateRunKey(entry.run_id, entry.attempt, rescue) } : { short, runKey });
+  const progressKey = (gate, rescue) => (rescue ? `${gate.id}#x${rescue}` : gate.id);
   let change = null;
   // The work item's own text, read once for the review prompt: a reviewer
   // judging "does this do what was asked" has to be told what was asked.
@@ -10384,9 +10406,13 @@ function makeGateDeps(
   // checkout and raise a fourth new finding where three were already open.
   // The verdict protocol it is asked to follow is the one
   // gates.parseReviewVerdict enforces; the prose here only explains it.
-  const review = async ({ gate, cycle, prior = [], raised = [], fix = null }) => {
+  const review = async ({ gate, cycle, prior = [], raised = [], fix = null, rescue = 0, base = 0 }) => {
     if (!change) return { ok: false, reason: "the change under review could not be read" };
     const cap = gatesKernel.cycleCap(gate);
+    // On a rescue pass the cycle index continues (so the stateful protocol
+    // treats the rescue's fix as a fix), but the budget the reviewer is told
+    // about is the rescue pass's own, counted from `base`.
+    const shown = rescue ? cycle - base : cycle;
     const item = await workItemText();
     const diff = gateDiffText(change);
     const fixText = fix ? gateFixText(change, fix) : "";
@@ -10404,7 +10430,13 @@ function makeGateDeps(
       `}]}`;
     const prompt = [
       `You are the '${gate.id}' review gate for Spor work item ${entry.node_id}` +
-        (cycle === 0 ? " (the initial review)." : ` (the review after fix cycle ${cycle} of ${cap}).`),
+        (rescue
+          ? shown === 0
+            ? ` (the review after the rescue lane's fix, rescue attempt ${rescue} — judge the rescue's commits as a fix cycle).`
+            : ` (the review after fix cycle ${shown} of ${cap} of rescue attempt ${rescue}).`
+          : cycle === 0
+            ? " (the initial review)."
+            : ` (the review after fix cycle ${cycle} of ${cap}).`),
       "You are running READ-ONLY. Do NOT edit any file, do NOT commit, and do NOT resolve, close, or write any Spor node:",
       "you are a gate, not an implementer. Run commands and tests freely to check your claims.",
       "",
@@ -10474,7 +10506,7 @@ function makeGateDeps(
     ].join("\n");
     const launched = await dispatch(
       cfg,
-      { ...reviewPassthrough(passthrough), profile: gate.profile, dir: change.cwd, "no-brief": true, "no-worktree": true, "read-only": true, name: `gate-${gate.id}-${short}-${cycle}` },
+      { ...reviewPassthrough(passthrough), profile: gate.profile, dir: change.cwd, "no-brief": true, "no-worktree": true, "read-only": true, name: `gate-${gate.id}-${keysFor(rescue).short}-${cycle}` },
       [prompt]
     );
     if (!launched.ok) return { ok: false, reason: `the review under ${gate.profile} could not be dispatched: ${launched.reason}` };
@@ -10492,7 +10524,7 @@ function makeGateDeps(
     return { ok: true, text, runId: launched.run.run_id };
   };
 
-  const fix = async ({ gate, cycle, findings, detail, evidence, ledger, onLaunch = null }) => {
+  const fix = async ({ gate, cycle, findings, detail, evidence, ledger, onLaunch = null, rescue = 0, base = 0 }) => {
     // The one place the worker deliberately passes --force. The loop never
     // does (a loop that forces past the resolved/duplicate guards is the
     // runaway a pull worker must not be), but here the runner KNOWS why the
@@ -10506,7 +10538,7 @@ function makeGateDeps(
     const advisory = (findings || []).filter((f) => f.blocking === false);
     const resolved = (ledger || []).filter((e) => e.status === "resolved");
     const prompt = [
-      `The '${gate.id}' gate refused your resolution of ${entry.node_id}${cycle > 0 ? ` (fix cycle ${cycle + 1} of ${gatesKernel.cycleCap(gate)})` : ""}.`,
+      `The '${gate.id}' gate refused your resolution of ${entry.node_id}${rescue ? ` (rescue attempt ${rescue}, fix cycle ${cycle - base + 1} of ${gatesKernel.cycleCap(gate)})` : cycle > 0 ? ` (fix cycle ${cycle + 1} of ${gatesKernel.cycleCap(gate)})` : ""}.`,
       "",
       detail || "",
       "",
@@ -10522,7 +10554,7 @@ function makeGateDeps(
     ]
       .filter((l) => l !== "")
       .join("\n");
-    const fixName = `fix-${gate.id}-${short}-${cycle}`;
+    const fixName = `fix-${gate.id}-${keysFor(rescue).short}-${cycle}`;
     // A fix this pipeline ALREADY launched at this cycle — the worker died
     // between the launch and the durable record of it (the run-id stamp
     // below, or the runner's launched-progress save) — is adopted from its own
@@ -10594,11 +10626,11 @@ function makeGateDeps(
       return record || null;
     }
   };
-  const loadGateProgress = async ({ gate }) => {
+  const loadGateProgress = async ({ gate, rescue = 0 }) => {
     const r = readRecordNow();
     const all = r && r.gate_progress && typeof r.gate_progress === "object" ? r.gate_progress : null;
     if (!all || all.key !== runKey || !all.gates || typeof all.gates !== "object") return null;
-    const p = all.gates[gate.id];
+    const p = all.gates[progressKey(gate, rescue)];
     if (!p || typeof p !== "object") return null;
     const lastFix = p.lastFix && typeof p.lastFix === "object" ? { ...p.lastFix } : null;
     if (lastFix && !lastFix.runId && r.gate_fix_run_id) lastFix.runId = r.gate_fix_run_id;
@@ -10613,15 +10645,167 @@ function makeGateDeps(
     }
     return { ...p, lastFix };
   };
-  const saveGateProgress = async ({ gate, progress }) => {
+  const saveGateProgress = async ({ gate, progress, rescue = 0 }) => {
     const r = readRecordNow();
     const prev = r && r.gate_progress && r.gate_progress.key === runKey && r.gate_progress.gates && typeof r.gate_progress.gates === "object" ? r.gate_progress.gates : {};
-    const stamp = { key: runKey, at: new Date().toISOString(), seq: (prev && r && r.gate_progress && Number.isInteger(r.gate_progress.seq) ? r.gate_progress.seq : 0) + 1, gates: { ...prev, [gate.id]: progress } };
+    // The rescue lane's own entries ride beside the gates under the same key
+    // (loadRescueState below) and are carried, never dropped, by a gate save.
+    const carried = r && r.gate_progress && r.gate_progress.key === runKey && Array.isArray(r.gate_progress.rescue) ? { rescue: r.gate_progress.rescue } : {};
+    const stamp = { key: runKey, at: new Date().toISOString(), seq: (prev && r && r.gate_progress && Number.isInteger(r.gate_progress.seq) ? r.gate_progress.seq : 0) + 1, gates: { ...prev, [progressKey(gate, rescue)]: progress }, ...carried };
     const wrote = dispatchRuns.stampGateState(home, entry.run_id, { gate_progress: stamp });
     // stampGateState hands back the record UNCHANGED (not null) when the
     // verdict is already settled; a progress write that did not land is a
     // failure the runner should hear about, not a silent no-op.
     if (!wrote || wrote.gate_progress !== stamp) throw new Error("the run record could not be updated");
+  };
+  // The rescue lane's durable state (task-spor-factory-rescue-lane): one
+  // entry per rescue attempt — the refusal it was handed, the seed its gate
+  // pass starts from, its run and its diagnosis — on the same `gate_progress`
+  // stamp, keyed to this attempt, so a killed worker resumes INSIDE the
+  // rescue (adopting its run, or re-judging its pass) instead of re-running
+  // the original pass and paging a person a rescue was about to spare.
+  const loadRescueState = async () => {
+    const r = readRecordNow();
+    const all = r && r.gate_progress && typeof r.gate_progress === "object" ? r.gate_progress : null;
+    if (!all || all.key !== runKey || !Array.isArray(all.rescue)) return [];
+    return all.rescue.map((e) => {
+      const out = { ...e };
+      // A launch the rescue closure stamped before the worker died.
+      if (out.n === r.gate_rescue_attempt && r.gate_rescue_run_id && !out.runId) {
+        out.runId = r.gate_rescue_run_id;
+        out.dispatched = true;
+      }
+      return out;
+    });
+  };
+  const saveRescueState = async ({ rescues }) => {
+    const r = readRecordNow();
+    const prevAll = r && r.gate_progress && r.gate_progress.key === runKey ? r.gate_progress : null;
+    const stamp = { key: runKey, at: new Date().toISOString(), seq: (prevAll && Number.isInteger(prevAll.seq) ? prevAll.seq : 0) + 1, gates: prevAll && prevAll.gates && typeof prevAll.gates === "object" ? prevAll.gates : {}, rescue: rescues };
+    const wrote = dispatchRuns.stampGateState(home, entry.run_id, { gate_progress: stamp });
+    if (!wrote || wrote.gate_progress !== stamp) throw new Error("the run record could not be updated");
+  };
+
+  // --- the rescue lane (task-spor-factory-rescue-lane, WORKERS.md §10.10) ---
+  // Composed HERE, deterministically, like the review and the fix: the
+  // strong-model profile is handed everything the run left behind — the work
+  // item, the diff, the commit history of every fix cycle, the refused gate's
+  // detail and evidence, the finding ledger, the gate facts already on the
+  // graph, and any earlier rescue's diagnosis — and asked to diagnose, fix in
+  // the same checkout, and file factory-improvement tasks. It is NOT asked to
+  // pass anything: the runner re-runs the gates on whatever it commits. Its
+  // structured diagnosis is read in code (gatesKernel.parseRescueReport) and
+  // only feeds the escalation body and the rescue fact — fail-soft, so a
+  // rescue that fixed the tree and forgot the block still gets its fix
+  // judged. The dispatch runs under the RESCUE profile, so the worker's own
+  // harness flags are dropped exactly as they are for a review.
+  const rescue = async ({ gate, attempt, detail, evidence, findings, attempts, ledger, fact, facts = [], previous = [], onLaunch = null }) => {
+    const lane = factory && factory.rescue;
+    if (!lane || !lane.profile) return { ok: false, reason: "no rescue lane is declared on the factory" };
+    const cwd = change ? change.cwd : (record && record.cwd) || undefined;
+    if (!cwd) return { ok: false, reason: "the run's checkout is unknown, so the rescue has nowhere to work" };
+    const item = await workItemText();
+    const diff = change ? gateDiffText(change) : null;
+    const history = change ? gateHistoryText(change) : "";
+    const spent = gatesKernel.describeCycles(gate, attempts || []);
+    const blocking = (findings || []).filter((f) => f.blocking !== false);
+    const advisory = (findings || []).filter((f) => f.blocking === false);
+    const prompt = [
+      `You are the RESCUE lane of the '${factory.id || "factory"}' factory for Spor work item ${entry.node_id} (rescue attempt ${attempt} of ${lane.attempts}).`,
+      `The '${gate.id}' ${gate.kind} gate refused this item and its fix cycles are spent (${spent.text}). Without you, a person`,
+      "would be paged now. Your job, in order:",
+      "",
+      "1. DIAGNOSE what actually went wrong. Pick ONE category: `reviewer-drift` (the reviewer moved the goalposts or",
+      "   demanded something the item never asked for), `real-defect` (the implementation is wrong and the gate is right),",
+      "   `stale-premise` (the item's premise no longer holds — already done, wrong repo, superseded), or `environment`",
+      "   (a red trusted ref, a flaky suite, a missing dependency, a harness problem — nothing about the change itself).",
+      "2. FIX IT if a fix is the right answer: work in THIS checkout, commit with a clear message that names the finding",
+      "   ids you addressed (the gates re-run on your commits and the next review is asked whether each prior finding is",
+      "   resolved). Do NOT edit protected test paths — a change that touches them fails the gate closed. Leave the tree",
+      "   CLEAN. If the premise is stale or the environment is at fault, say so and change nothing you cannot justify.",
+      "3. FILE what would have prevented this. Whether or not your fix lands, capture at least one Spor task proposing a",
+      "   factory, gate, prompt or item change (a review instruction to tighten, a cycles cap to change, a suite to fix,",
+      "   an item to re-scope) — `spor put-node - --if-exists skip` with a `type: task` node carrying",
+      `   \`{type: derived-from, to: ${fact || "<the gate fact>"}}\` so /spor:factory's maintenance mode can read it, or \`spor add "..."\``,
+      "   when you are unsure of the shape. Do not resolve, close or re-status the work item itself.",
+      "",
+      "You never mark a gate passed: the runner re-judges the whole gate list on the tree you leave.",
+      "",
+      "## The work item",
+      "",
+      item || `(the node ${entry.node_id} could not be read — judge the change against its commit messages)`,
+      "",
+      "## The refusal",
+      "",
+      `Gate \`${gate.id}\` (${gate.kind}): ${detail || "no detail"}`,
+      ...(fact ? [`Gate fact on the graph: ${fact}${facts.length > 1 ? ` (all facts for this run: ${facts.join(", ")})` : ""}`] : []),
+      "",
+      ...((attempts || []).length > 1
+        ? [`Cycles (${spent.text}):`, ...attempts.map((a, i) => `${i + 1}. ${i === 0 ? "initial review" : `after fix cycle ${i}`}: ${a.verdict} — ${String(a.detail || "").slice(0, 300)}`), ""]
+        : []),
+      ...(blocking.length ? ["Blocking findings still open:", gatesKernel.renderFindings(blocking), ""] : []),
+      ...(advisory.length ? ["Advisory (recorded, not enforced):", gatesKernel.renderFindings(advisory), ""] : []),
+      ...(ledger && ledger.length ? ["Finding ledger (every finding the gate's cycles raised, what cleared it, what still stands):", gatesKernel.renderLedger(ledger), ""] : []),
+      ...(evidence ? ["Evidence:", "```", gateRunner.fenceSafe(String(evidence).slice(0, 4000)), "```", ""] : []),
+      ...(previous.length
+        ? [
+            "## Earlier rescue attempts",
+            "",
+            ...previous.map((p) => `- attempt ${p.n}${p.runId ? ` (run ${String(p.runId).slice(0, 8)})` : ""}: ${p.error ? `could not run — ${p.error}` : `${p.category || "unknown"} — ${p.diagnosis || "(no diagnosis read)"}${(p.filed || []).length ? `; filed ${p.filed.join(", ")}` : ""}`}`),
+            "",
+            "Your diagnosis should say why the earlier rescue did not land, not repeat it.",
+            "",
+          ]
+        : []),
+      ...(change
+        ? [
+            "## The change",
+            "",
+            `\`git diff ${change.base}..${change.head}\` in ${cwd} (${Array.isArray(change.paths) ? change.paths.length : "?"} file(s)):`,
+            "",
+            "```diff",
+            gateRunner.fenceSafe(diff.text),
+            "```",
+            ...(diff.truncated ? [`(diff truncated at ${Math.round(GATE_DIFF_CAP_BYTES / 1024)}KB — run the git command above for the rest)`] : []),
+            "",
+            ...(history ? ["## Every commit on the branch — the implementer's and each fix cycle's", "", "```", gateRunner.fenceSafe(history), "```", ""] : []),
+          ]
+        : [`## The change`, "", `The change under judgement could not be read from ${cwd}: ${detail || "see the refusal above"}. Start by reading the checkout's state (\`git status\`, \`git log\`).`, ""]),
+      ...(lane.instructions ? ["## Factory instructions for the rescue", "", lane.instructions, ""] : []),
+      "## Your report",
+      "",
+      "End your final message with a fenced json block, exactly this shape:",
+      "```json",
+      `{"diagnosis": "what went wrong, in one or two sentences", "category": "reviewer-drift" | "real-defect" | "stale-premise" | "environment", "fixed": true | false, "filed": ["task-..."]}`,
+      "```",
+      "`fixed` is whether you committed a change you believe resolves the refusal; `filed` lists the Spor task ids you",
+      "created. The runner reads this block for the escalation it files if the gates refuse again — it never decides a verdict.",
+    ].join("\n");
+    const name = `rescue-${short}-${attempt}`;
+    // Adopted on resume exactly like a fix cycle: the launcher writes the run
+    // record before dispatch returns, so a worker killed between the launch
+    // and its durable record still finds the run by its unique name.
+    const already = launchedFixRun(home, entry.node_id, name);
+    const launched = already ? { ok: true, run: already, adopted: true } : await dispatch(
+      cfg,
+      { ...reviewPassthrough(passthrough), profile: lane.profile, node: entry.node_id, dir: cwd, force: true, "no-worktree": true, name },
+      [prompt]
+    );
+    if (!launched.ok) return { ok: false, reason: `the rescue under ${lane.profile} could not be dispatched: ${launched.reason}` };
+    if (launched.adopted) log(`work: rescue attempt ${attempt} on ${entry.node_id} was already launched as run ${String(launched.run.run_id).slice(0, 8)} — adopting it, not dispatching again`);
+    dispatchRuns.stampGateState(home, entry.run_id, { gate_rescue_run_id: launched.run.run_id, gate_rescue_at: new Date().toISOString(), gate_rescue_attempt: attempt });
+    if (onLaunch) {
+      try {
+        await onLaunch({ runId: launched.run.run_id });
+      } catch (e) {
+        warn(`warning: the rescue's launch could not be recorded on the run record (${(e && e.message) || e})`);
+      }
+    }
+    const done = await awaitGateRun(cfg, launched.run.run_id, { timeoutMs: lane.awaitMs, warn, sleep });
+    if (!done.ok) return { ok: false, reason: done.reason };
+    const parsed = gatesKernel.parseRescueReport(gateRunReportText(done.record));
+    if (!parsed.ok) log(`work: rescue attempt ${attempt} on ${entry.node_id} left no structured diagnosis (${parsed.error}) — its tree is judged regardless`);
+    return { ok: true, runId: launched.run.run_id, diagnosis: parsed.diagnosis, category: parsed.category, fixed: parsed.fixed, filed: parsed.filed, unread: !parsed.ok, record: done.record };
   };
 
   return {
@@ -10633,6 +10817,9 @@ function makeGateDeps(
     stopping,
     loadGateProgress,
     saveGateProgress,
+    loadRescueState,
+    saveRescueState,
+    rescue,
     changedPaths: async ({ trustedRef }) => {
       change = null;
       const c = gateChangeSet(record, trustedRef);
@@ -10682,8 +10869,9 @@ function makeGateDeps(
     review,
     fix,
     recordFact: ({ id, markdown }) => writeGateNode(cfg, id, markdown),
-    fileTestLaneItem: async ({ gate, paths, profile }) => {
-      const id = `task-test-lane-${stem}-${short}-${gateIdSuffix("test-lane", gate.id, entry.node_id, runKey)}`;
+    fileTestLaneItem: async ({ gate, paths, profile, rescue = 0 }) => {
+      const k = keysFor(rescue);
+      const id = `task-test-lane-${stem}-${k.short}-${gateIdSuffix("test-lane", gate.id, entry.node_id, k.runKey)}`;
       const body = [
         `The implementer's branch for ${entry.node_id} changed protected test path(s):`,
         "",
@@ -10719,8 +10907,9 @@ function makeGateDeps(
         })
       );
     },
-    fileHumanItem: async ({ gate, classes }) => {
-      const id = `task-approve-${gate.id.slice(0, 24)}-${stem}-${short}-${gateIdSuffix("approve", gate.id, entry.node_id, runKey)}`.toLowerCase();
+    fileHumanItem: async ({ gate, classes, rescue = 0 }) => {
+      const k = keysFor(rescue);
+      const id = `task-approve-${gate.id.slice(0, 24)}-${stem}-${k.short}-${gateIdSuffix("approve", gate.id, entry.node_id, k.runKey)}`.toLowerCase();
       const body = [
         `The \`${gate.id}\` human gate is armed for ${entry.node_id}: the change touches` +
           (classes.length ? ` the declared risk class(es) ${classes.map((c) => `\`${c.class}\``).join(", ")}.` : " work this factory always has a person approve."),
@@ -10765,16 +10954,35 @@ function makeGateDeps(
     },
     checkApproval: ({ id }) => gateApprovalState(cfg, id),
     demote: ({ blockerId }) => gateDemoteItem(cfg, entry.node_id, { blockerId }),
-    escalate: async ({ gate, attempts, detail, evidence, findings, ledger }) => {
-      const id = `task-gate-${gate.id.slice(0, 24)}-${stem}-${short}-${gateIdSuffix("escalate", gate.id, entry.node_id, runKey)}`.toLowerCase();
+    escalate: async ({ gate, attempts, detail, evidence, findings, ledger, rescue = 0, rescues = [] }) => {
+      const k = keysFor(rescue);
+      const id = `task-gate-${gate.id.slice(0, 24)}-${stem}-${k.short}-${gateIdSuffix("escalate", gate.id, entry.node_id, k.runKey)}`.toLowerCase();
       const cycles = attempts.length;
       // Counted in FIX CYCLES against the cap, not in attempts: `attempts` has
       // one entry per review, so "4 attempts, cap 3" read as an off-by-one
       // when it was the initial review plus the three fix cycles declared.
       const spent = gatesKernel.describeCycles(gate, attempts);
+      // The rescue lane ran first (task-spor-factory-rescue-lane): the body
+      // OPENS with its diagnosis — the person is paged only because the
+      // rescue also failed, and what it found is the first thing to read.
+      const last = rescues.length ? rescues[rescues.length - 1] : null;
+      const rescueLines = last
+        ? [
+            last.error
+              ? `Rescue attempt ${last.n} could not run (${last.error}) — this is the refusal it was handed.`
+              : `Rescue diagnosis (attempt ${last.n}${rescues.length > 1 ? ` of ${rescues.length}` : ""}, ${last.category || "unknown"}): ${last.diagnosis || "(the rescue left no readable diagnosis)"}`,
+            ...(last.run_id ? [`The rescue ran as \`${last.run_id}\`${last.fixed ? " and committed a fix; the gates below refused the tree it left" : " and committed no fix it claims resolves the refusal"}.`] : []),
+            ...((last.filed || []).length ? [`Filed by the rescue: ${last.filed.join(", ")}.`] : []),
+            ...(rescues.length > 1
+              ? rescues.slice(0, -1).map((r) => `Earlier rescue attempt ${r.n}: ${r.error ? `could not run (${r.error})` : `${r.category || "unknown"} — ${String(r.diagnosis || "").slice(0, 300)}`}`)
+              : []),
+            "",
+          ]
+        : [];
       const body = [
+        ...rescueLines,
         `The \`${gate.kind}\` gate \`${gate.id}\` refused ${entry.node_id} and its fix cycles are spent`,
-        `(${spent.text}). A person decides what happens next —`,
+        `(${spent.text})${rescue ? `, after rescue attempt ${rescue}` : ""}. A person decides what happens next —`,
         "the worker has stopped re-dispatching it.",
         "",
         `This item \`blocks\` ${entry.node_id} on the graph, and if that item had already been flipped to a`,
@@ -10798,8 +11006,10 @@ function makeGateDeps(
         id,
         buildGateWorkNode({
           id,
-          title: `Gate escalation — ${gate.id} refused ${entry.node_id}`,
-          summary: `The ${gate.id} ${gate.kind} gate refused ${entry.node_id} after ${spent.fixes} fix cycle(s); it needs a person${detail ? `: ${String(detail).slice(0, 200)}` : "."}`,
+          title: `Gate escalation — ${gate.id} refused ${entry.node_id}${rescue ? " after rescue" : ""}`,
+          summary: last
+            ? `Rescue ${last.error ? "could not run" : `diagnosed ${last.category || "unknown"}`}: ${String(last.error || last.diagnosis || "no diagnosis").slice(0, 200)} — the ${gate.id} ${gate.kind} gate still refused ${entry.node_id}; it needs a person.`
+            : `The ${gate.id} ${gate.kind} gate refused ${entry.node_id} after ${spent.fixes} fix cycle(s); it needs a person${detail ? `: ${String(detail).slice(0, 200)}` : "."}`,
           body,
           project: slug,
           date: date(),
@@ -11853,6 +12063,7 @@ async function cmdWork(cfg, { values }) {
           g.kind === "command" ? `\`${g.command}\`` : g.kind === "agent-review" ? `review under ${g.profile}` : `approval${g.risk.length ? ` when ${g.risk.join("/")}` : " (always)"}`;
         out(`  gate ${g.id}  ${g.kind}  ${how}${g.cycles ? `  (up to ${g.cycles} fix cycle${g.cycles === 1 ? "" : "s"})` : ""}${g.source !== "inline" ? `  [${g.source}]` : ""}`);
       }
+      if (factory.rescue) out(`  rescue: under ${factory.rescue.profile}, up to ${factory.rescue.attempts} attempt${factory.rescue.attempts === 1 ? "" : "s"} before any human escalation`);
       const ghVerdict = integrationSatisfiability(cfg, factory);
       if (!ghVerdict.ok) out(`  integration: mode 'propose' — UNSATISFIABLE here: ${ghVerdict.reasons[0]}`);
     } else {

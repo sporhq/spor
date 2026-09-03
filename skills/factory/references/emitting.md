@@ -293,6 +293,50 @@ State back: which box has the service (that box is the worker), that the
 gate queues, that it is skipped and says so when the change never touched the
 database, and that the hook pair is engineering's to write and commit.
 
+## 3d. The rescue block — a strong-model step before any escalation (optional)
+
+Only emit this if the operator answered interview question 8 (or, in the
+maintenance flow, asked why a person keeps being paged for agent-resolvable
+refusals). It is FACTORY-level — one lane covers every gate's exhaustion —
+and lives beside `gates` and `integration` in the same payload:
+
+```json
+{
+  "factory": "<team-or-product>",
+  "gates": [ "..." ],
+  "rescue": {
+    "profile": "profile-claude-fable",
+    "attempts": 1,
+    "await_ms": 3600000,
+    "instructions": "Prefer the smallest fix that makes the prior findings resolve."
+  }
+}
+```
+
+Keys (`lib/kernel/gates.js parseRescue` is the authority):
+
+- **`profile`** (required) — the profile the rescue dispatches under. Route
+  it to a strong model on a SUPERVISED harness that can WRITE (it commits in
+  the implementer's checkout), run the suite, and run `spor put-node` — the
+  worker refuses to start if the profile's harness launches native-background,
+  because the diagnosis is read off the run's final report. Never a command:
+  the machine's own binding decides what runs.
+- **`attempts`** (default 1, at most 3) — rescue attempts per pipeline; each
+  is a full dispatch plus a whole re-run of the gate list, so keep it at 1
+  unless the telemetry argues otherwise.
+- **`await_ms`** (default 3600000) — how long the runner follows the rescue.
+- **`instructions`** — optional, appended to the rescue prompt.
+
+State back to the operator, one line each: the rescue runs when a gate has
+spent its fix cycles and BEFORE the `task-gate-*` escalation; it is handed the
+item, the diff, every fix cycle's commits and the finding ledger; it
+diagnoses (`reviewer-drift` / `real-defect` / `stale-premise` /
+`environment`), fixes and commits, and files tasks `derived-from` the gate
+fact proposing what would have prevented the pattern; the gates then re-run
+on what it left (it never passes anything itself); and only if that also
+refuses is the person paged — with the diagnosis first. Each attempt leaves
+an `art-rescue-*` fact (WORKERS.md §10.10, `references/maintenance.md`).
+
 ## 4. The test-writer lane
 
 When step 2 of the creation flow found no acceptance suite, the operator's
@@ -350,12 +394,14 @@ the error rather than retrying: a 422 on a factory is almost always a body over
 8192 bytes (trim the prose, not the payload) or a summary over 500 characters.
 
 `spor validate` only checks that the body has a fenced `json` payload — it does
-not parse `gates` or `integration` the way the runner does. `spor work
+not parse `gates`, `integration` or `rescue` the way the runner does. `spor work
 --factory factory-<id> --print` does: it loads and validates the definition
 the same way the real loop would, prints the resolved pipeline, and dispatches
 nothing — so a bad `integration:` block surfaces there as a load error before
-anyone hands the factory off, and (for `mode: propose`) a missing `gh` on
-PATH surfaces as a refusal to start rather than a silent no-op.
+anyone hands the factory off, (for `mode: propose`) a missing `gh` on
+PATH surfaces as a refusal to start rather than a silent no-op, and a
+`rescue.profile` routed to a native-background harness is refused the same
+way an agent-review gate's would be.
 
 ## Writing from Cowork or the connector
 

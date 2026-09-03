@@ -42,6 +42,16 @@ Two more surfaces worth reading before concluding anything:
   is routed to a worker profile, not a person — it does NOT carry `requires:
   [human]`, so it will not show up in that query; find those instead via
   `spor query --edges --edge-type blocks --to task-<stem>`.
+- the **rescue lane's record**, when the factory declares one (WORKERS.md
+  §10.10): `spor query --type artifact --id-prefix art-rescue- --summary` lists
+  every attempt with its category (`reviewer-drift` / `real-defect` /
+  `stale-premise` / `environment`) and diagnosis, and the tasks the rescue
+  filed hang off the gate fact it rescued — `spor query --edges --edge-type
+  derived-from --to art-gate-<…>`. Those tasks ARE proposed factory edits,
+  written by a strong model that read the whole run; read them before
+  proposing your own. An escalation that followed a failed rescue opens with
+  the diagnosis, so the category tally across a week's escalations is the
+  fastest read of what the factory keeps getting wrong.
 - the **rolled-back items** — a refused claim has its completion status rolled
   back to `open` while its resolving edge stands, which `spor get` flags with a
   ⚠. An item in that state is a refusal nobody has adjudicated yet.
@@ -103,6 +113,12 @@ supports:
    most reversible, and usually the real fix.
 2. **Raise `cycles`** — the review is right but the implementer needs another
    pass before escalating to a person.
+2b. **Declare a `rescue:` lane** (or raise its `attempts`) — the refusals are
+   real but agent-resolvable (`real-defect` and `environment` diagnoses, an
+   implementer that never converges on a finding a stronger model fixes in
+   one pass): a rescue before the page costs one dispatch per exhaustion and
+   files the factory change that would have prevented it. If the rescue
+   facts read `reviewer-drift` again and again, the lever is 1, not this.
 3. **Narrow a human gate's `risk_classes`** — it is arming on changes nobody
    meant it to cover; tighten the globs.
 4. **Retire the gate** — **remove its entry from the factory's `gates` list**;

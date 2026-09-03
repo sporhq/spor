@@ -13,6 +13,7 @@ words, and stop asking anything the repo or the graph already answered.
 | 5 | What a second reader should hunt for | an `agent-review` gate, its `profile` and `cycles` |
 | 6 | What a person must see before it ships | a `human` gate and the `risk_classes` that arm it |
 | 7 | What happens once everything above passes | an `integration:` block (merge-queue landing), or nothing — resolve-without-merge stays the default |
+| 8 | Who gets a refusal before they do | a `rescue:` block (a strong-model profile that diagnoses, fixes and files before any human escalation), or nothing — the person is paged at the cycle cap as today |
 
 Which repos the factory may judge (`repos`) is not one of the seven: you are
 standing in the answer. Emit the repo you compiled it in, and only ask when the
@@ -130,6 +131,17 @@ state them in the proposal in one plain line each, and let them push back.
 9. Which Node/runtime does the suite pin, and does the worker box run it? An
    engine-strict repo fails its own gate on the wrong Node with a message
    that looks like a code error; the hook is where `nvm use` belongs.
+10. Rescue lane: when a gate spends its fix cycles, should a stronger model
+    get one go before a person is paged? If so — the `profile` to route it to
+    (a strong-model, SUPERVISED harness; it must be able to write, run the
+    suite and `spor put-node`), `attempts` (default 1, at most 3), and any
+    `instructions`. Say what it does: diagnoses (reviewer drift / real defect
+    / stale premise / environment), fixes in the same checkout, files tasks
+    proposing the factory change that would have prevented it, and the gates
+    re-run on what it leaves — the person is paged only if that also fails,
+    with the diagnosis on top. It is a full dispatch plus a whole re-run of
+    the gates per attempt; a factory with one or two cheap gates may not
+    want it.
 
 ## Translating a product answer into a gate
 
@@ -143,6 +155,7 @@ state them in the proposal in one plain line each, and let them push back.
 | "Once it's clean it should just ship" | an `integration:` block, `mode: local` or `mode: push` | that it re-runs the FULL suite on the merged result before landing, and that a conflict or that re-run failing feeds the same fix-cycle machinery as any other gate |
 | "It should ship, but through a PR someone reviews" | an `integration:` block, `mode: propose` | that it still runs the full suite pre-PR, then opens a PR via `gh` and parks the item for review rather than landing directly — and that `gh` must be on PATH wherever the worker runs |
 | "I want to open the PR myself" | nothing — omit `integration:` | that a gate-passed branch still resolves the work without merging it; landing stays a manual step until they say otherwise |
+| "Don't page me until something smart has had a look" | a `rescue:` block routed to a strong-model profile | that the rescue runs in the implementer's checkout, that the gates re-run on whatever it commits (it never passes anything itself), and that the escalation they do get opens with its diagnosis and the tasks it filed |
 | "The tests need the database" | the same `command` gate, plus `serialize: "repo"` if the database is one-per-box, plus a `risk` class over the migration/schema paths so it runs only when they change — and a setup/teardown hook pair for the box that has the database | that the gate queues behind any other run of itself, that it is skipped (and says so) for changes that never touch the database, and that someone must write the hook that starts and stops the stack |
 
 ## What a first factory should look like
@@ -161,6 +174,10 @@ complete one that scares them off:
   landing — it is the one piece of this pipeline that mutates the target ref
   on its own, so it is opt-in even more deliberately than the gates are.
   Resolve-without-merge (today's default) is a fine first factory.
+- **a `rescue:` block only once there is a strong-model profile to route it
+  to** and the operator has seen at least one escalation they would rather
+  not have received — it is the maintenance-flow's answer to "why do I keep
+  getting paged", not a first-factory default.
 
 Everything else is a maintenance-flow edit once there is telemetry to argue
 from.

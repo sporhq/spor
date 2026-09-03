@@ -965,7 +965,9 @@ knows why it is going back. The declared `cycles` cap bounds it and counts
 cycles (four reviews), and the record says so — "4 attempts: the initial one
 plus 3 fix cycles, cap 3", never "4 attempts, cap 3". At the cap the gate
 **escalates** by filing a `requires: [human]` queue item carrying the cycle
-history and the ledger, and stops. The `art-gate-*` fact carries the ledger too
+history and the ledger, and stops — unless the factory declares a **rescue
+lane** (§10.10), which runs first and escalates only if it also fails, with its
+diagnosis on top. The `art-gate-*` fact carries the ledger too
 (`Finding ledger:` — what was raised when, what cleared it, what still stands),
 so the rescue lane and `/spor:factory`'s telemetry read convergence per gate
 without re-reading every report. The ledger, the fix-cycle count, the attempt
@@ -1482,3 +1484,101 @@ machines, or two passes, checking the same PR agree), and for the rest calls
 See the "propose mode" and "checkProposal" sections of
 test/integration-step.test.js, and the two propose-specific tests in
 test/gate-pipeline.test.js.
+
+### 10.10 The rescue lane — a strong-model step before any human escalation
+
+The first two days of live factory runs deferred agent-resolvable work to a
+person (task-spor-factory-robustness-program): a review that would not
+converge, a suite red for a reason the item never touched, a fixer patching
+around a defect it never understood. Every one of those refusals reached
+§10.7's escalation with nothing between the spent fix cycles and the page. The
+**rescue lane** (task-spor-factory-rescue-lane) is that something. It is
+OPTIONAL and FACTORY-level — one lane covers every gate's exhaustion, never a
+per-gate block — declared beside `gates` and `integration`:
+
+```json
+"rescue": {"profile": "profile-claude-fable", "attempts": 1, "await_ms": 3600000, "instructions": "…"}
+```
+
+- **`profile`** (required) — the profile the rescue dispatches under; a strong
+  model by intent. Profile-routed ONLY, like an agent-review gate: the graph
+  names the lane and the machine's own binding decides what runs. The same
+  load-time precheck refuses a profile whose harness launches native-background,
+  because the diagnosis is read off the run's final report.
+- **`attempts`** (default 1, at most 3) — rescue attempts per pipeline. A second
+  attempt is handed the first's diagnosis and asked why it did not land.
+- **`await_ms`** (default 1h) — how long the runner follows the rescue run.
+- **`instructions`** — optional factory-specific guidance added to the prompt.
+
+**When it runs:** when a pipeline would otherwise ESCALATE — a gate has spent
+its fix cycles, or refused unretried for a reason that is not already a
+person's item. Not every refusal is rescuable: a protected-path hit already
+filed its test-change lane item (§10.3), a rejected approval is the person's own
+answer and a BLOCKED one is waiting on it (§10.5) — those go on exactly as
+before. A `declined` run is never gated at all (§10.2), so it is never rescued:
+a stale premise is triage's, not the lane's.
+
+**What the runner does**, in code (lib/shell/gate-runner.js), in order:
+
+1. Writes the refused gate's `art-gate-*` fact FIRST — verdict `failed`, no
+   escalation, a `Rescue: attempt n of N … follows this refusal` line — so the
+   rescue can link what it files to the fact that refused it.
+2. Dispatches the rescue under `rescue.profile`, into the run's OWN checkout
+   (`--no-worktree --force`, like a fix cycle; the worker's harness flags
+   dropped, like a review; NOT read-only — the rescue writes), with a prompt
+   the runner composes: the work item, the diff, EVERY commit on the branch
+   (the implementer's and each fix cycle's), the refused gate's detail and
+   evidence, the cycle history, the whole finding ledger, the gate facts on the
+   graph, and any earlier rescue's diagnosis. It is asked to (1) **diagnose**
+   in one of four categories — `reviewer-drift`, `real-defect`,
+   `stale-premise`, `environment`; (2) **fix** in that checkout and commit,
+   naming the finding ids it addressed, or change nothing it cannot justify;
+   (3) **file** at least one Spor task proposing the factory / gate / prompt /
+   item change that would have prevented the pattern, `derived-from` the gate
+   fact — the input `/spor:factory`'s maintenance mode reads. It is told, and
+   it is true, that it never marks a gate passed.
+3. Reads the rescue's final report in code (`parseRescueReport`,
+   lib/kernel/gates.js): the fenced `{"diagnosis", "category", "fixed",
+   "filed"}` block. This read is deliberately FAIL-SOFT, unlike a review
+   verdict: it feeds only the escalation body and the rescue fact, so a rescue
+   that fixed the tree and forgot the block still gets its fix judged. A rescue
+   that could not be dispatched, or never reached a terminal state inside
+   `await_ms`, is recorded as unrun and the refusal it was handed escalates
+   exactly as it would have without a lane — the escalation says so.
+4. Writes the rescue's own fact, `art-rescue-<stem>-<run>-x<n>-<hash>`: the
+   diagnosis and category, whether it committed a fix, what it filed —
+   `relates-to` the item, the refused gate's fact and each filed task, never
+   `resolves` (WORKERS.md §10.6's rule holds: a record, not a retirement).
+5. Re-reads the change and re-runs the **whole gate list as a rescue pass**:
+   every gate, from the first, on the tree the rescue left. Each gate gets a
+   FRESH fix-cycle budget (its declared `cycles`, counted from the rescue), but
+   the finding ledger is CARRIED and the cycle index CONTINUES — so the review
+   after the rescue is a fix-cycle review under §10.4's stateful protocol:
+   handed the same prior findings by the same ids, required to clear or
+   confirm each, and bound by the introduced-by-fix floor for anything new. A
+   rescue must not itself restart the drift it exists to cure. Everything a
+   rescue pass writes — facts, a lane item, an approval item, the escalation,
+   its progress — is keyed one segment deeper (`-x<n>` in the readable id,
+   `#x<n>` in the hash input, `<gate>#x<n>` in `gate_progress`), so it never
+   collides with, or silently adopts, the original pass's node.
+6. If the rescue pass passes, the item **stands**: nothing is escalated,
+   nothing demoted, and the integration stage (§10.9) follows as usual. If it
+   refuses and attempts remain, the next rescue is handed everything above plus
+   the earlier diagnoses. Otherwise the escalation fires (§10.7, demotion and
+   all) — and its body **opens with the rescue's diagnosis**: the category, the
+   sentence, the rescue's run, whether it committed a fix, what it filed. The
+   person reads what a strong model already concluded before deciding.
+
+Durable like the rest (§10.8): the rescue's state — the refusal it was handed,
+the per-gate seed its pass starts from, its run id and its diagnosis — rides on
+the run record's `gate_progress` beside the gates' own entries, saved BEFORE
+the dispatch and again at launch (`gate_rescue_run_id` / `gate_rescue_attempt`
+are stamped the moment the run exists), so a killed worker resumes INSIDE the
+rescue — adopting the launched run by its unique name (`rescue-<run>-<n>`), or
+re-judging its pass — and never re-runs the original pass to page the person
+the rescue was about to spare. The run record and `spor work --status` carry
+`gate_rescues`, the number of attempts the pipeline made.
+
+A factory without a `rescue:` block behaves byte-identically to before the
+lane existed. See test/gate-pipeline.test.js ("the rescue lane") and
+test/gates.test.js.

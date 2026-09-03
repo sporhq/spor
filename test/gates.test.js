@@ -614,3 +614,41 @@ test("an upgrade by id must be the same finding — a different file under a bor
   const upFolded = gates.applyReviewToLedger(nofile, up, 1);
   assert.deepStrictEqual([upFolded[0].status, upFolded[0].summary, upFolded[0].restated, upFolded[0].file], ["open", "something races", "a races", ""]);
 });
+
+// --- the rescue lane (task-spor-factory-rescue-lane) -----------------------
+
+test("a factory's `rescue:` block parses — profile required, attempts bounded 1..3, absent means no lane", () => {
+  const body = (payload) => ["```json", JSON.stringify(payload), "```"].join("\n");
+  const base = { gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 1 }] };
+  const none = gates.parseFactory(body(base));
+  assert.deepStrictEqual(none.errors, []);
+  assert.strictEqual(none.factory.rescue, null, "no block, no lane — byte-identical to before");
+  const lane = gates.parseFactory(body({ ...base, rescue: { profile: "profile-claude-fable" } }));
+  assert.deepStrictEqual(lane.errors, []);
+  assert.deepStrictEqual(lane.factory.rescue, { profile: "profile-claude-fable", attempts: 1, awaitMs: 3600000, instructions: "" }, "one attempt by default, followed as long as a review");
+  const tuned = gates.parseFactory(body({ ...base, rescue: { profile: "profile-claude-fable", attempts: 9, await_ms: 5000, instructions: "  prefer the smallest fix  " } }));
+  assert.deepStrictEqual(tuned.factory.rescue, { profile: "profile-claude-fable", attempts: 3, awaitMs: 5000, instructions: "prefer the smallest fix" }, "attempts capped at 3");
+  assert.strictEqual(gates.parseFactory(body({ ...base, rescue: { profile: "p", attempts: 0 } })).factory.rescue.attempts, 1, "…and floored at 1");
+  const noProfile = gates.parseFactory(body({ ...base, rescue: { attempts: 1 } }));
+  assert.strictEqual(noProfile.factory, null, "a lane with no profile refuses the factory");
+  assert.match(noProfile.errors.join("; "), /rescue\.profile is required/);
+  const notObject = gates.parseFactory(body({ ...base, rescue: "profile-claude-fable" }));
+  assert.strictEqual(notObject.factory, null);
+  assert.match(notObject.errors.join("; "), /rescue: must be a JSON object/);
+});
+
+test("parseRescueReport reads the structured diagnosis in code — last fence wins, unknown category reads unknown, prose-only is unread but salvaged", () => {
+  const r = gates.parseRescueReport(
+    "I looked.\n```json\n{\"diagnosis\": \"draft\"}\n```\nMore.\n```json\n{\"diagnosis\": \"the reviewer demanded a refactor the item never asked for\", \"category\": \"Reviewer Drift\", \"fixed\": true, \"filed\": [\"task-tighten-review-instructions\", \"not a valid id\"]}\n```"
+  );
+  assert.deepStrictEqual(r, { ok: true, diagnosis: "the reviewer demanded a refactor the item never asked for", category: "reviewer-drift", fixed: true, filed: ["task-tighten-review-instructions"] }, "malformed filed ids are dropped, the category normalizes");
+  assert.strictEqual(gates.parseRescueReport('{"diagnosis":"x","category":"cosmic-rays","fixed":"yes"}').category, "unknown", "a bare object is accepted; an unknown category is unknown");
+  assert.strictEqual(gates.parseRescueReport('{"diagnosis":"x","category":"cosmic-rays","fixed":"yes"}').fixed, true);
+  const prose = gates.parseRescueReport("I could not tell what went wrong, the suite is red on main.");
+  assert.strictEqual(prose.ok, false);
+  assert.strictEqual(prose.category, "unknown");
+  assert.match(prose.diagnosis, /suite is red on main/, "the prose tail is kept for the escalation");
+  assert.match(prose.error, /no structured diagnosis/);
+  const empty = gates.parseRescueReport("");
+  assert.deepStrictEqual([empty.ok, empty.diagnosis, empty.error], [false, "", "the rescue left no report"]);
+});

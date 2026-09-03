@@ -3142,3 +3142,283 @@ test("the round-trip is saved on the first gate's progress BEFORE it is dispatch
   assert.deepStrictEqual(b.seen.fixes, [], "a resumed pipeline does not spend the round-trip again");
   assert.strictEqual(res.state === "passed" || res.state === "failed", true);
 });
+
+// --- the rescue lane (task-spor-factory-rescue-lane, WORKERS.md §10.10) ---
+// Before any human escalation a declared strong-model profile is handed the
+// refusal, the WHOLE gate list re-runs on what it committed under a fresh
+// fix-cycle budget, and only a refusal of that pass pages a person — with the
+// rescue's diagnosis first. The rescue never marks anything passed.
+
+const RESCUE = { profile: "profile-claude-fable" };
+const confirmOpen = ({ prior }) => ({
+  ok: true,
+  text: prior.length
+    ? `\`\`\`json\n{"verdict":"changes_requested","prior":[${prior.map((p) => `{"id":"${p.id}","status":"open"}`).join(",")}],"findings":[]}\n\`\`\``
+    : changesRequested,
+});
+const clearAll = ({ prior }) => ({ ok: true, text: `\`\`\`json\n{"verdict":"pass","prior":[${prior.map((p) => `{"id":"${p.id}","status":"resolved"}`).join(",")}],"findings":[]}\n\`\`\`` });
+function withRescue(world, answer = () => ({ ok: true, runId: "run-rescue-1", diagnosis: "the reviewer kept demanding a refactor the item never asked for", category: "reviewer-drift", fixed: true, filed: ["task-tighten-review-instructions"] })) {
+  world.seen.rescues = [];
+  world.deps.rescue = async (args) => {
+    world.seen.rescues.push(args);
+    if (args.onLaunch) await args.onLaunch({ runId: `run-rescue-${args.attempt}` });
+    return answer(args, world.seen);
+  };
+  return world;
+}
+
+test("a rescue that lands: the refused gate's fact is written first, the rescue is handed the ledger and that fact, the gates re-run as a rescue pass, and nobody is paged", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }, { id: "review", kind: "agent-review", profile: "profile-review", cycles: 1 }], rescue: RESCUE });
+  let rescued = false;
+  const world = withRescue(
+    fakes({ review: (args) => (rescued ? clearAll(args) : confirmOpen(args)) }),
+    (args) => {
+      rescued = true;
+      return { ok: true, runId: "run-rescue-1", diagnosis: "F1 was a real off-by-one the fixer kept patching around", category: "real-defect", fixed: true, filed: ["task-review-instructions-name-the-bound"] };
+    }
+  );
+  const { deps, seen } = world;
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.strictEqual(res.reason, "4 gate(s) passed (after rescue attempt 1)");
+  assert.deepStrictEqual(res.rescues.map((r) => [r.n, r.gate, r.category, r.fixed, r.filed]), [[1, "review", "real-defect", true, ["task-review-instructions-name-the-bound"]]]);
+  assert.strictEqual(seen.escalations.length, 0, "the person was never paged");
+  assert.strictEqual(seen.demotions.length, 0, "a rescued item stands — nothing to demote");
+  // The rescue's context.
+  assert.strictEqual(seen.rescues.length, 1);
+  const r = seen.rescues[0];
+  assert.strictEqual(r.gate.id, "review");
+  assert.strictEqual(r.attempt, 1);
+  assert.deepStrictEqual(r.ledger.map((e) => [e.id, e.status]), [["F1", "open"]], "the finding ledger rides to the rescue");
+  assert.strictEqual(r.attempts.length, 2, "the initial review plus the one fix cycle");
+  assert.match(r.fact, /^art-gate-review-demo-runabcde-[0-9a-f]{8}$/, "the refused gate's fact exists BEFORE the rescue, so it can link its proposals to it");
+  assert.deepStrictEqual(r.previous, []);
+  // The gate list re-ran as pass 1: both gates again, keyed one segment deeper.
+  assert.deepStrictEqual(seen.suites, ["acceptance", "acceptance"], "the command gate re-runs on the rescue's tree");
+  assert.deepStrictEqual(seen.reviews.map((x) => x.cycle), [0, 1, 2], "the rescue pass's review continues the cycle numbering — the rescue's commits are judged as a fix");
+  assert.deepStrictEqual(res.gates.map((g) => [g.gate, g.verdict, g.rescue || 0]), [["acceptance", "passed", 0], ["review", "failed", 0], ["acceptance", "passed", 1], ["review", "passed", 1]]);
+  const ids = seen.facts.map((f) => f.id);
+  assert.match(ids[1], /^art-gate-review-demo-runabcde-[0-9a-f]{8}$/);
+  assert.match(seen.facts[1].markdown, /Rescue: attempt 1 of 1 under `profile-claude-fable` follows this refusal before any human escalation\./);
+  assert.doesNotMatch(seen.facts[1].markdown, /Escalated to/);
+  assert.match(ids[2], /^art-rescue-demo-runabcde-x1-[0-9a-f]{8}$/, "the rescue leaves its own fact");
+  assert.match(seen.facts[2].markdown, /- \{type: relates-to, to: task-demo\}\n  - \{type: relates-to, to: art-gate-review-demo-runabcde-[0-9a-f]{8}\}\n  - \{type: relates-to, to: task-review-instructions-name-the-bound\}/, "linked to the item, the refused gate's fact, and what it filed");
+  assert.match(seen.facts[2].markdown, /Diagnosis \(real-defect\): F1 was a real off-by-one/);
+  assert.match(seen.facts[2].markdown, /not a resolution/);
+  assert.match(ids[3], /^art-gate-acceptance-demo-runabcde-x1-[0-9a-f]{8}$/, "a rescue-pass fact never collides with the original pass's");
+  assert.match(ids[4], /^art-gate-review-demo-runabcde-x1-[0-9a-f]{8}$/);
+  assert.match(seen.facts[4].markdown, /\(rescue pass 1 — the gates re-run on the tree the rescue lane left\)/);
+  assert.strictEqual(new Set(ids).size, 5);
+});
+
+test("a rescue that also fails: a FRESH fix-cycle budget on the rescue pass, then the escalation opens with the diagnosis and the item is demoted once", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 1 }], rescue: RESCUE });
+  const handed = [];
+  const { deps, seen } = withRescue(fakes({ review: (args) => { handed.push(args); return confirmOpen(args); } }));
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(seen.rescues.length, 1);
+  assert.strictEqual(seen.fixes.length, 2, "one fix cycle on the original pass, one on the rescue pass — the cap restarts for the rescue");
+  assert.deepStrictEqual(seen.reviews.map((x) => x.cycle), [0, 1, 2, 3]);
+  assert.deepStrictEqual(handed.slice(2).map((h) => [h.rescue, h.base, h.prior.map((p) => p.id)]), [[1, 2, ["F1"]], [1, 2, ["F1"]]], "the rescue pass's reviews are told which pass they are, its base, and the carried prior set");
+  assert.strictEqual(seen.fixes[1].cycle, 2, "the rescue pass's fix is at absolute cycle 2");
+  assert.strictEqual(seen.escalations.length, 1, "escalated exactly once, after the rescue");
+  const esc = seen.escalations[0];
+  assert.strictEqual(esc.rescue, 1);
+  assert.deepStrictEqual(esc.rescues.map((r) => [r.n, r.category, r.diagnosis, r.run_id]), [[1, "reviewer-drift", "the reviewer kept demanding a refactor the item never asked for", "run-rescue-1"]], "the escalation carries the diagnosis");
+  assert.strictEqual(esc.attempts.length, 2, "the rescue pass's own attempt history");
+  assert.strictEqual(seen.demotions.length, 1, "demoted once, at the final refusal");
+  assert.strictEqual(seen.demotions[0].blockerId, "task-gate-review");
+  assert.deepStrictEqual(res.rescues.map((r) => r.n), [1]);
+  assert.strictEqual(res.escalated_to, "task-gate-review");
+  // Facts: the original refusal (rescue follows), the rescue, the final refusal (escalated).
+  assert.deepStrictEqual(seen.facts.map((f) => f.id.replace(/-[0-9a-f]{8}$/, "")), ["art-gate-review-demo-runabcde", "art-rescue-demo-runabcde-x1", "art-gate-review-demo-runabcde-x1"]);
+  assert.match(seen.facts[2].markdown, /Escalated to task-gate-review\./);
+});
+
+test("the rescue lane is bounded and scoped: `attempts: 2` hands the second rescue the first's diagnosis, a refusal that already filed a person's item or is BLOCKED is never rescued, and a factory without the block never calls it", async () => {
+  // Two attempts, both fail: the second sees the first.
+  const two = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review" }], rescue: { ...RESCUE, attempts: 2 } });
+  const a = withRescue(fakes({ review: confirmOpen }));
+  const resA = await gateRunner.runGatePipeline({ item: ITEM, factory: two, deps: a.deps });
+  assert.strictEqual(resA.state, "failed");
+  assert.strictEqual(a.seen.rescues.length, 2);
+  assert.deepStrictEqual(a.seen.rescues[1].previous.map((p) => [p.n, p.category]), [[1, "reviewer-drift"]]);
+  assert.strictEqual(a.seen.escalations.length, 1);
+  assert.strictEqual(a.seen.escalations[0].rescues.length, 2);
+  assert.deepStrictEqual(a.seen.facts.map((f) => f.id.replace(/-[0-9a-f]{8}$/, "")), ["art-gate-review-demo-runabcde", "art-rescue-demo-runabcde-x1", "art-gate-review-demo-runabcde-x1", "art-rescue-demo-runabcde-x2", "art-gate-review-demo-runabcde-x2"]);
+  // A protected-path hit routed to the test lane: that lane item IS the route.
+  const lane = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }], rescue: RESCUE });
+  const b = withRescue(fakes({ changed: ["test/x.test.js"] }));
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory: lane, deps: b.deps })).state, "failed");
+  assert.strictEqual(b.seen.rescues.length, 0, "a fail-closed refusal with a lane item is not rescued");
+  // A human gate nobody answered: the approval item is the person's already.
+  const human = factoryOf({ ...BASE, gates: [{ id: "security", kind: "human", risk: ["touches:auth"], approval_timeout_ms: 1000, poll_ms: 1000 }], rescue: RESCUE });
+  const c = withRescue(fakes({ changed: ["lib/auth.js"], approval: () => ({ state: "pending" }) }));
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory: human, deps: c.deps })).state, "blocked");
+  assert.strictEqual(c.seen.rescues.length, 0, "a blocked approval is not rescued");
+  const d = withRescue(fakes({ changed: ["lib/auth.js"], approval: () => ({ state: "rejected", by: "abandoned" }) }));
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory: human, deps: d.deps })).state, "failed");
+  assert.strictEqual(d.seen.rescues.length, 0, "a refused approval is not rescued");
+  // No block: the dep is present but never called, and the result carries no rescue key.
+  const bare = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review" }] });
+  const e = withRescue(fakes({ review: confirmOpen }));
+  const resE = await gateRunner.runGatePipeline({ item: ITEM, factory: bare, deps: e.deps });
+  assert.strictEqual(e.seen.rescues.length, 0);
+  assert.strictEqual("rescues" in resE, false);
+  assert.strictEqual(e.seen.escalations[0].rescue, undefined, "byte-identical escalate args without a lane");
+});
+
+test("a rescue that could not run escalates the refusal it was handed, saying so — and records the unrun attempt", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review" }], rescue: RESCUE });
+  const { deps, seen } = withRescue(fakes({ review: confirmOpen }), () => ({ ok: false, reason: "profile-claude-fable is not satisfiable on this box" }));
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(seen.reviews.length, 1, "no rescue pass ran");
+  assert.strictEqual(seen.escalations.length, 1);
+  assert.deepStrictEqual(seen.escalations[0].rescues.map((r) => [r.n, r.error, r.run_id]), [[1, "profile-claude-fable is not satisfiable on this box", "run-rescue-1"]]);
+  assert.match(seen.facts[1].markdown, /could not run: profile-claude-fable is not satisfiable/);
+  assert.strictEqual(seen.facts.length, 3, "the original refusal, the unrun rescue, the escalated refusal");
+  assert.match(seen.facts[2].markdown, /Escalated to task-gate-review/);
+});
+
+test("a pipeline killed inside a rescue is resumed INSIDE it: the rescue run is adopted, the original pass is not re-judged, and the carried ledger seeds the rescue pass", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 1 }], rescue: RESCUE });
+  // Worker A: the rescue launched (onLaunch fired) and then A died waiting on it.
+  const states = [];
+  const a = withRescue(fakes({ review: confirmOpen }), async () => {
+    throw new Error("worker A was killed here");
+  });
+  a.deps.saveRescueState = async ({ rescues }) => states.push(JSON.parse(JSON.stringify(rescues)));
+  const gateSaves = {};
+  a.deps.saveGateProgress = async ({ gate, progress, rescue = 0 }) => {
+    gateSaves[rescue ? `${gate.id}#x${rescue}` : gate.id] = JSON.parse(JSON.stringify(progress));
+  };
+  const resA = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: a.deps });
+  assert.strictEqual(resA.state, "failed", "A's own throw is a could-not-run for A");
+  const launched = states.find((s) => s[0].dispatched === true && !s[0].done);
+  assert.ok(launched, "the launch was saved before the long wait");
+  assert.strictEqual(launched[0].runId, "run-rescue-1");
+  assert.deepStrictEqual(launched[0].seed.review.ledger.map((e) => e.id), ["F1"]);
+  assert.strictEqual(launched[0].seed.review.base, 2);
+
+  // Worker B adopts: its rescue dep is called again for attempt 1 (the real
+  // one adopts the run by name), answers, and the rescue pass runs.
+  const b = withRescue(fakes({ review: clearAll }));
+  b.deps.loadRescueState = async () => launched;
+  b.deps.loadGateProgress = async ({ gate, rescue = 0 }) => gateSaves[rescue ? `${gate.id}#x${rescue}` : gate.id] || null;
+  const resB = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b.deps });
+  assert.strictEqual(resB.state, "passed", resB.reason);
+  assert.strictEqual(b.seen.rescues.length, 1);
+  assert.strictEqual(b.seen.rescues[0].attempt, 1, "the SAME attempt, re-entered — not a second rescue");
+  assert.deepStrictEqual(b.seen.reviews.map((x) => x.cycle), [2], "no original-pass review: straight to the rescue pass at the carried cycle");
+  assert.strictEqual(b.seen.escalations.length, 0);
+  assert.deepStrictEqual(b.seen.facts.map((f) => f.id.replace(/-[0-9a-f]{8}$/, "")), ["art-rescue-demo-runabcde-x1", "art-gate-review-demo-runabcde-x1"], "B writes the rescue fact and the rescue-pass fact; the original refusal's fact was A's");
+});
+
+test("the real rescue dispatch runs under the rescue profile in the run's own checkout with the full history, its diagnosis is read in code, and the escalation body opens with it", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-rescue-prompt-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  fs.writeFileSync(path.join(home, "nodes", "task-fix-me.md"), "---\nid: task-fix-me\ntype: task\ntitle: Make the bound exclusive\nsummary: The loop over-reads by one element.\nstatus: open\ndate: 2026-09-03\n---\n\nAcceptance: reading N items yields N.\n");
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-rescue-repo-"));
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  g("init", "-q", "-b", "main");
+  fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n;\n");
+  g("add", "."); g("commit", "-q", "-m", "base");
+  g("checkout", "-q", "-b", "task-fix-me");
+  fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n + 1;\n");
+  g("commit", "-q", "-am", "implement");
+  fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n + 2;\n");
+  g("commit", "-q", "-am", "fix F1: adjust the bound");
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  const runId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, { run_id: runId, node_id: "task-fix-me", state: "done", created_at: new Date().toISOString() });
+  const launches = [];
+  const deps = sporCli.makeGateDeps(cfg, {
+    record: { node_id: "task-fix-me", cwd: repo },
+    entry: { run_id: runId, node_id: "task-fix-me", project: null },
+    factory: { id: "factory-test", rescue: { profile: "profile-claude-fable", attempts: 1, awaitMs: 5000, instructions: "Prefer the smallest correct fix." } },
+    slug: null,
+    passthrough: { sandbox: "danger-full-access", "permission-mode": "bypassPermissions", model: "worker-model", as: "agent-worker" },
+    warn: () => {}, log: () => {}, stopping: () => false, home,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    dispatch: async (_cfg, values, positionals) => {
+      const id = `rescue-run-${launches.length + 1}`;
+      const p = dispatchRuns.runPaths(home, id);
+      fs.writeFileSync(p.record.replace(/\.run\.json$/, ".report.md"), 'Diagnosed.\n```json\n{"diagnosis":"the fixer widened the bound instead of tightening it","category":"real-defect","fixed":true,"filed":["task-review-say-which-way"]}\n```');
+      dispatchRuns.atomicJson(p.record, { run_id: id, node_id: "task-fix-me", name: values.name, state: "done", created_at: new Date().toISOString(), report_path: p.record.replace(/\.run\.json$/, ".report.md") });
+      launches.push({ values, prompt: positionals[0] });
+      return { ok: true, run: { run_id: id, harness: "fake" } };
+    },
+  });
+  const gate = { id: "adversarial-review", kind: "agent-review", profile: "profile-review", cycles: 1 };
+  assert.ok((await deps.changedPaths({ trustedRef: "main" })).ok);
+  const ledger = [{ id: "F1", severity: "blocking", file: "x.js", summary: "off by one", status: "open", opened: 0, closed: null, blocking: true, evidence: "node -e 'f(1)'" }];
+  const launchedIds = [];
+  const r = await deps.rescue({
+    gate, attempt: 1, detail: "the review under profile-review requested changes — 1 blocking finding(s)", evidence: "F1 [blocking] x.js — off by one",
+    findings: [{ id: "F1", severity: "blocking", file: "x.js", summary: "off by one", blocking: true }],
+    attempts: [{ verdict: "failed", detail: "1 blocking" }, { verdict: "failed", detail: "F1 still open" }],
+    ledger, fact: "art-gate-adversarial-review-fix-me-aaaaaaaa-deadbeef", facts: ["art-gate-adversarial-review-fix-me-aaaaaaaa-deadbeef"], previous: [],
+    onLaunch: async (l) => launchedIds.push(l.runId),
+  });
+  assert.strictEqual(r.ok, true, r.reason);
+  assert.deepStrictEqual([r.runId, r.category, r.fixed, r.filed, r.unread], ["rescue-run-1", "real-defect", true, ["task-review-say-which-way"], false]);
+  assert.match(r.diagnosis, /widened the bound/);
+  assert.deepStrictEqual(launchedIds, ["rescue-run-1"], "the launch is reported before the wait");
+  const v = launches[0].values;
+  assert.strictEqual(v.profile, "profile-claude-fable");
+  assert.strictEqual(v.node, "task-fix-me");
+  assert.strictEqual(v.dir, repo, "in the run's own checkout");
+  assert.strictEqual(v.force, true);
+  assert.strictEqual(v["no-worktree"], true);
+  assert.strictEqual(v["read-only"], undefined, "the rescue WRITES");
+  assert.strictEqual(v.name, "rescue-aaaaaaaa-1");
+  for (const k of ["sandbox", "permission-mode", "model"]) assert.strictEqual(v[k], undefined, `the worker's --${k} does not ride to the rescue profile`);
+  assert.strictEqual(v.as, "agent-worker");
+  const p = launches[0].prompt;
+  assert.match(p, /rescue attempt 1 of 1/);
+  assert.match(p, /DIAGNOSE[\s\S]*`reviewer-drift`[\s\S]*`real-defect`[\s\S]*`stale-premise`[\s\S]*`environment`/);
+  assert.match(p, /## The work item\n\ntask-fix-me: Make the bound exclusive/);
+  assert.match(p, /Gate fact on the graph: art-gate-adversarial-review-fix-me-aaaaaaaa-deadbeef/);
+  assert.match(p, /derived-from, to: art-gate-adversarial-review-fix-me-aaaaaaaa-deadbeef/, "told to link its proposals to the gate fact");
+  assert.match(p, /Cycles \(2 attempts: the initial one plus 1 fix cycle, cap 1\)/);
+  assert.match(p, /Finding ledger[\s\S]*F1 \[blocking\] OPEN since cycle 0 — x\.js — off by one/);
+  assert.match(p, /```diff\n[\s\S]*\+module\.exports = \(n\) => n \+ 2;/);
+  assert.match(p, /## Every commit on the branch[\s\S]*fix F1: adjust the bound[\s\S]*implement/, "every fix cycle's commits, not just the last");
+  assert.match(p, /Prefer the smallest correct fix\./);
+  assert.match(p, /never mark a gate passed/);
+  assert.match(p, /"category": "reviewer-drift" \| "real-defect" \| "stale-premise" \| "environment"/);
+  // Adopted on a second call (a resumed pipeline), never dispatched twice.
+  const again = await deps.rescue({ gate, attempt: 1, detail: "", evidence: "", findings: [], attempts: [], ledger: [], fact: null });
+  assert.strictEqual(again.runId, "rescue-run-1");
+  assert.strictEqual(launches.length, 1);
+  // The launch stamp landed on the pipeline's own record, and the rescue
+  // state survives a gate-progress save.
+  const rec0 = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  assert.deepStrictEqual([rec0.gate_rescue_run_id, rec0.gate_rescue_attempt], ["rescue-run-1", 1]);
+  await deps.saveRescueState({ rescues: [{ n: 1, gate: "adversarial-review", dispatched: false, done: false }] });
+  await deps.saveGateProgress({ gate, progress: { fixes: 0, attempts: [], ledger: [], lastFix: null } });
+  await deps.saveGateProgress({ gate, progress: { base: 2, fixes: 2, attempts: [], ledger, lastFix: null }, rescue: 1 });
+  const state = await deps.loadRescueState();
+  assert.deepStrictEqual([state[0].n, state[0].runId, state[0].dispatched], [1, "rescue-run-1", true], "the stamped launch is read back into an entry saved before it");
+  assert.deepStrictEqual((await deps.loadGateProgress({ gate })).fixes, 0);
+  assert.deepStrictEqual((await deps.loadGateProgress({ gate, rescue: 1 })).base, 2, "the rescue pass keeps its own progress key");
+  // The escalation body opens with the diagnosis.
+  const esc = await deps.escalate({
+    gate, attempts: [{ verdict: "failed", detail: "F1 still open" }], detail: "F1 still open", evidence: "", findings: [], ledger,
+    rescue: 1, rescues: [{ n: 1, gate: "adversarial-review", run_id: "rescue-run-1", category: "real-defect", diagnosis: "the fixer widened the bound instead of tightening it", fixed: true, filed: ["task-review-say-which-way"] }],
+  });
+  assert.strictEqual(esc.ok, true, esc.reason);
+  assert.match(esc.id, /^task-gate-adversarial-review-fix-me-aaaaaaaa-x1-[0-9a-f]{8}$/, "keyed to the rescue pass");
+  const md = fs.readFileSync(path.join(home, "nodes", `${esc.id}.md`), "utf8");
+  const body = md.slice(md.indexOf("\n---", 4) + 4).trim();
+  assert.match(body, /^Rescue diagnosis \(attempt 1, real-defect\): the fixer widened the bound instead of tightening it\n/, "the body OPENS with the diagnosis");
+  assert.match(body, /The rescue ran as `rescue-run-1` and committed a fix; the gates below refused the tree it left\./);
+  assert.match(body, /Filed by the rescue: task-review-say-which-way\./);
+  assert.match(md, /summary: Rescue diagnosed real-defect: the fixer widened/);
+  assert.match(md, /title: Gate escalation — adversarial-review refused task-fix-me after rescue/);
+  assert.match(md, /requires: \[human\]/);
+});

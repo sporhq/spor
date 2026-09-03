@@ -454,7 +454,11 @@ declare an optional `integration` block — the merge-queue landing stage that
 runs once every gate has passed (dec-spor-factory-integration-step): it is
 deliberately NOT a fourth gate kind (a gate judges the branch; integration
 mutates the target ref and serializes across workers), so it is its own key
-beside `gates`, parsed the same fail-closed way. Both `gate` and `factory` are
+beside `gates`, parsed the same fail-closed way — and an optional `rescue`
+block (task-spor-factory-rescue-lane): a strong-model profile the runner
+dispatches at a gate's exhaustion BEFORE any human escalation, to diagnose,
+fix and file factory-improvement tasks, re-running the gates on what it
+commits (WORKERS.md §10.10). Both `gate` and `factory` are
 `capturable: false` (the distiller never drafts one: a factory changes what a
 worker will accept, so it is written deliberately) and both arrive by adoption
 rather than in the seed, for the same reason. WORKERS.md §10 documents the

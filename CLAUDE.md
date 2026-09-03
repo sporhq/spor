@@ -747,6 +747,33 @@ work — DEFERRING any whose node still has a live run, since a resumed pipeline
 re-runs from gate 0 and its fix cycle would put a second agent in one checkout.
 WORKERS.md §10 is the contract; see test/gates.test.js +
 test/gate-pipeline.test.js.
+**The rescue lane (task-spor-factory-rescue-lane, WORKERS.md §10.10):** an
+optional FACTORY-level `rescue:` block (`profile` required, `attempts` 1..3
+default 1, `await_ms` default 1h, `instructions`; parsed by `parseRescue` in
+`lib/kernel/gates.js`, absent = byte-identical) that runs when a gate would
+otherwise ESCALATE — fix cycles spent, or an unretried refusal that is not
+already a person's item (a lane item, a rejected/blocked approval are never
+rescued; a `declined` run is never gated). The runner (`runGatePipeline`,
+now a `judge(rescue, seed)` pass over the gate list) writes the refused gate's
+fact FIRST, dispatches `rescue.profile` into the run's own checkout
+(`makeGateDeps.rescue` in bin/spor.js: `--no-worktree --force`, the worker's
+harness flags dropped like a review, NOT read-only) with the item, the diff,
+EVERY commit on the branch, the cycle history, the finding ledger and the gate
+facts, reads its `{"diagnosis","category","fixed","filed"}` block FAIL-SOFT
+(`parseRescueReport` — it only feeds the escalation and the `art-rescue-*`
+fact; the tree is judged regardless), then re-runs the WHOLE gate list as a
+rescue pass: fresh fix-cycle budget per gate (`cycleDecision(gate, cycle -
+base)`), but the ledger is CARRIED and the cycle index CONTINUES so the
+post-rescue review is a fix-cycle review under the stateful protocol. Every
+id a rescue pass mints is keyed one segment deeper (`shortRunAttempt`/
+`gateRunKey`'s third arg → `-x<n>`/`#x<n>`; progress under `<gate>#x<n>`).
+Only a refusal of the LAST rescue pass escalates, and the escalation body
+OPENS with the diagnosis. The rescue state (refusal handed, per-gate seed,
+run id, diagnosis) rides `gate_progress.rescue` on the run record
+(`loadRescueState`/`saveRescueState`, `gate_rescue_run_id` stamped at launch),
+so a killed worker resumes INSIDE the rescue and adopts its run by name
+(`rescue-<short>-<n>`), never re-running the original pass. See
+test/gate-pipeline.test.js "the rescue lane".
 **The integration step (task-spor-factory-integration-step, WORKERS.md §10.9,
 dec-spor-factory-integration-step):** a factory's optional `integration:` block
 is the merge-queue landing stage `spor work` runs after every declared gate has

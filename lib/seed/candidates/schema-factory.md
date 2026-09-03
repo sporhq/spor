@@ -2,14 +2,15 @@
 id: schema-factory
 type: schema
 kind: node-schema
-schema_version: 2026.08.31.1
+schema_version: 2026.09.03.1
 title: Software-factory definition
-summary: A factory definition — the ordered gate list a worker enforces between claim and resolve, plus the trusted ref, the repos it may judge, protected test paths, test-change lane, risk classes those gates key on, and an optional integration (merge-queue landing) stage. Candidate pack; adopt it into a graph to use `spor work --factory`.
+summary: A factory definition — the ordered gate list a worker enforces between claim and resolve, plus the trusted ref, the repos it may judge, protected test paths, test-change lane, risk classes those gates key on, an optional integration (merge-queue landing) stage, and an optional rescue lane (a strong-model step before any human escalation). Candidate pack; adopt it into a graph to use `spor work --factory`.
 date: 2026-08-26
 edges:
   - {type: derived-from, to: dec-spor-software-factory-substrate}
   - {type: relates-to, to: task-spor-work-gate-pipeline}
   - {type: derived-from, to: dec-spor-factory-integration-step}
+  - {type: relates-to, to: task-spor-factory-rescue-lane}
 ---
 
 A `factory` node is a team's bespoke factory as DATA (dec-spor-software-factory-
@@ -46,7 +47,8 @@ convention schema nodes use:
         {"id": "acceptance", "kind": "command", "command": "npm test", "timeout_ms": 900000},
         {"ref": "gate-adversarial-review", "cycles": 2},
         {"id": "security-approval", "kind": "human", "risk": ["touches:auth"]}
-      ]
+      ],
+      "rescue": {"profile": "profile-claude-fable", "attempts": 1}
     }
 
 - `trusted_ref` — the ref a command gate's suite is taken from (default `main`).
@@ -67,6 +69,17 @@ convention schema nodes use:
   exactly like an approved one.
 - `gates[].cycles` — how many implementer fix cycles a failing gate gets before
   the runner escalates by filing a human queue item. Default 0.
+- `rescue` (optional, WORKERS.md §10.10) — the rescue lane: when any gate has
+  spent its fix cycles, BEFORE the human escalation, the runner dispatches
+  `rescue.profile` (a strong model by intent; profile-routed only, like a
+  review) into the run's own checkout with the item, the diff, every fix
+  cycle's commits and the finding ledger — to diagnose (`reviewer-drift` /
+  `real-defect` / `stale-premise` / `environment`), fix and commit, and file
+  factory-improvement tasks `derived-from` the gate fact — then re-runs the
+  whole gate list on what it left under a fresh cycle budget, carrying the
+  ledger. Only if that also refuses is the person paged, with the diagnosis
+  first. `attempts` (default 1, max 3), `await_ms` (default 1h),
+  `instructions`. Absent, the factory is byte-identical to one without a lane.
 
 ```json
 {

@@ -245,3 +245,18 @@ test("the test-writer lane carries the owner's criteria and takes its readiness 
   // unattributed stamp, so the emitted node deliberately carries none.
   assert.strictEqual(lane.readiness, undefined, "the readiness stamp comes from `spor ready`, not the emitted markdown");
 });
+
+test("the emitting reference's rescue block parses with the runner's own vocabulary (task-spor-factory-rescue-lane)", () => {
+  // The skill teaches an operator to answer interview question 8 with this
+  // exact block; if the reference drifts from parseRescue, a factory compiled
+  // from it refuses to start the worker.
+  const md = fs.readFileSync(path.join(SKILL_DIR, "references", "emitting.md"), "utf8");
+  const section = md.slice(md.indexOf("## 3d. The rescue block"));
+  const fence = /```json\n([\s\S]*?)\n```/.exec(section);
+  assert.ok(fence, "the rescue section carries a json example");
+  const payload = JSON.parse(fence[1]);
+  const { rescue, errors } = gates.parseRescue(payload);
+  assert.deepStrictEqual(errors, []);
+  assert.deepStrictEqual(rescue, { profile: "profile-claude-fable", attempts: 1, awaitMs: 3600000, instructions: "Prefer the smallest fix that makes the prior findings resolve." });
+  assert.strictEqual(gates.parseRescue({ gates: [] }).rescue, null, "no block, no lane");
+});

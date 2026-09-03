@@ -135,6 +135,15 @@ runs `spor work` (a preflight refuses to start otherwise). Leaving
 `integration:` out entirely keeps resolve-without-merge working as it does
 today.
 
+If they want a `rescue:` block, say what it is: not a gate, and not an
+orchestrator — a strong-model profile the runner dispatches into the
+implementer's checkout when any gate has spent its fix cycles, BEFORE the
+person is paged, to diagnose (reviewer drift / real defect / stale premise /
+environment), fix and commit, and file tasks proposing the factory change
+that would have prevented it; the whole gate list then re-runs on what it
+left, and the escalation they do get opens with its diagnosis. It never
+passes anything itself. One lane covers every gate (WORKERS.md §10.10).
+
 ### 5. Emit the nodes
 
 In this order, so nothing dangles: **schemas → profiles → gates → factory →
@@ -160,6 +169,9 @@ right failure but a rude way to discover a typo:
 - `protected_paths` is declared **only** with a `test_lane_profile` to route to;
 - every risk class a human gate names is declared in `risk_classes`;
 - gate ids are unique and kebab-case;
+- if you wrote a `rescue:` block: `profile` names a supervised, write-capable
+  strong-model profile (the worker refuses a native-background one at load
+  time), and `attempts` is 1-3;
 - if you wrote an `integration:` block: `mode` is `local`, `push`, or
   `propose`, `command` is set, `strategy` is one of `merge`/`squash`/`rebase`,
   and `serialize` is `repo` — and if `mode` is `propose`, the `gh` CLI must be
@@ -201,7 +213,9 @@ either direction.
 
 Every gate outcome is already a graph fact (`art-gate-*`, WORKERS.md §10.6),
 and — for a factory with an `integration:` block — every landing or landing
-failure is too (`art-merge-*`, WORKERS.md §10.9), so "why did the last three
+failure is too (`art-merge-*`, WORKERS.md §10.9), and every rescue attempt
+leaves its diagnosis and the tasks it filed (`art-rescue-*`, the tasks
+`derived-from` the gate fact, WORKERS.md §10.10), so "why did the last three
 fail review" or "why isn't finished work landing" is a **query**, not a guess,
 and "the reviews are too strict" is a definition edit proposed **with that
 evidence attached** — never a silent one. The queries, the read-back, and the
@@ -220,7 +234,8 @@ Say no, briefly, and offer the nearest thing you can do:
 - **"Skip the review for this one"** — a gate exists to be unskippable. Offer
   the honest alternatives: sharpen the gate's `instructions` so it stops
   flagging what they do not care about, **raise** `cycles` so the implementer
-  gets another pass before it escalates to them, or retire the gate with a
+  gets another pass before it escalates to them, declare a `rescue:` lane so
+  a stronger model gets a go before they are paged, or retire the gate with a
   decision node saying why. Only a **human** gate has `risk` classes to narrow;
   an agent-review gate has no arming predicate and runs on every gated item.
   And `cycles` is fix cycles *before* escalation — lowering it reaches a person
