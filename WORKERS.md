@@ -1097,6 +1097,19 @@ so rather than claiming a fact it could not write.
 `spor work --status` reads the same story back per worker: what is gating now,
 the passed/failed/blocked tally, and the reason a gated item was cooled off.
 
+A worker runs the code it LOADED. A long-running `spor work` keeps executing
+the lib/bin it required at startup however far the checkout it was loaded from
+moves afterwards — a gate fix that lands on `main` at noon does not reach a
+worker started at nine until it is restarted (a worker ran a whole day on code
+predating the rescue-pass round-trip that had landed hours earlier). So the
+worker says at startup which code it runs — the checkout's commit and branch
+when the package root is a git checkout, the package version when it is an
+npm install — and, once per pass, logs a one-line notice the first time that
+checkout has moved past the loaded commit (once per new tip, never once per
+pass). It never restarts itself: which code a worker runs is the operator's
+call; the notice only makes the drift visible in the log rather than
+discoverable after a pipeline ran stale.
+
 ### 10.7 A refusal is graph state, not a machine-local cooldown
 
 The gate necessarily runs AFTER the run wrote its resolver, so a refused claim
@@ -1743,8 +1756,11 @@ a stale premise is triage's, not the lane's.
    commit once the suite notifies me" is only on the run log; when the report
    carries no block, the read falls back to the last block of any EARLIER
    message on that log (`runReportTexts`, through the harness adapter's own
-   report hook), newest first, and logs that it did — so the truncated
-   session the early block exists for still yields its category. This read
+   report hook — or, on a harness that writes its report file itself and so
+   declares no report hook, its read-only `messageFromEvent`: Codex's
+   `agent_message` items), newest first, and logs that it did — so the
+   truncated session the early block exists for still yields its category
+   whichever harness the rescue profile names. This read
    is deliberately FAIL-SOFT, unlike a review
    verdict: it feeds only the escalation body and the rescue fact, so a rescue
    that fixed the tree and forgot the block still gets its fix judged. A rescue

@@ -288,3 +288,32 @@ test("runReportTexts reads every final-message candidate back off the run log, i
   assert.deepStrictEqual(runReportTexts({ run_id: "run-declared", harness: "fake", log_path: log }, { home }), ["first", "last"]);
   assert.deepStrictEqual(runReportTexts({ run_id: "run-declared", harness: "fake", log_path: log }), [], "without a home the declaration cannot be found");
 });
+
+// F2's residual: Codex writes its report itself (`--output-last-message`) and
+// so declares NO reportFromEvent — which left a Codex rescue's stream with no
+// text hook, runReportTexts empty, and the early block lost. The adapter now
+// declares the read-only `messageFromEvent` (every `agent_message` item), and
+// the reader prefers it; the supervisor still consults only reportFromEvent,
+// so what a Codex run's report IS does not change.
+test("runReportTexts reads a Codex stream's assistant messages through the read-only message hook", () => {
+  const { runReportTexts } = require("../lib/shell/agent-dispatch-runner.js");
+  const { getHarness } = require("../lib/shell/dispatch-harnesses.js");
+  assert.strictEqual(typeof getHarness("codex").messageFromEvent, "function");
+  assert.strictEqual(getHarness("codex").reportFromEvent, undefined, "the supervisor's report hook stays undeclared: Codex writes its own report file");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-runner-codex-texts-"));
+  const log = path.join(dir, "run.log");
+  const line = (o) => `${JSON.stringify(o)}\n`;
+  const early = 'Diagnosed.\n```json\n{"diagnosis":"early","category":"real-defect"}\n```';
+  fs.writeFileSync(
+    log,
+    line({ type: "thread.started", thread_id: "thread-1" }) +
+      line({ type: "turn.started" }) +
+      line({ type: "item.completed", item: { id: "item_0", type: "reasoning", text: "thinking" } }) +
+      line({ type: "item.completed", item: { id: "item_1", type: "agent_message", text: early } }) +
+      line({ type: "item.completed", item: { id: "item_2", type: "command_execution", command: "npm test", status: "completed" } }) +
+      line({ type: "item.completed", item: { id: "item_3", type: "agent_message", text: "" } }) +
+      line({ type: "item.completed", item: { id: "item_4", type: "agent_message", text: "Now fixing; the long suite is still running in the background." } }) +
+      line({ type: "turn.completed", usage: { input_tokens: 1 } })
+  );
+  assert.deepStrictEqual(runReportTexts({ harness: "codex", log_path: log }), [early, "Now fixing; the long suite is still running in the background."]);
+});

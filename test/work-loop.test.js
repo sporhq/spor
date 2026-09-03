@@ -29,7 +29,7 @@ const { writeSpawnableNodeStub, pathWithOnlyGitAndNode } = require("./helpers/po
 // A driver that runs the loop with no real clock, no real queue and no real
 // dispatch: `queue` is the page each poll returns, `dispatch` decides ok/refused
 // per item, and every launched run stays non-terminal until `finish()` says so.
-function harness({ queue = [], dispatch = () => ({ ok: true }), pollRuns = null, onTick = () => {}, opts = {}, maxPasses = 20, gate = null } = {}) {
+function harness({ queue = [], dispatch = () => ({ ok: true }), pollRuns = null, onTick = () => {}, opts = {}, maxPasses = 20, gate = null, extraDeps = null } = {}) {
   const state = {
     clock: 1_700_000_000_000,
     sleeps: [],
@@ -101,7 +101,7 @@ function harness({ queue = [], dispatch = () => ({ ok: true }), pollRuns = null,
       control,
       // A gate dep only when a test hands one over — the bare loop's tests must
       // stay exactly the bare loop (the full pipeline has test/gate-pipeline.test.js).
-      deps: gate ? { ...deps, gate } : deps,
+      deps: { ...deps, ...(gate ? { gate } : {}), ...(extraDeps || {}) },
     });
   state.control = control;
   return state;
@@ -1770,4 +1770,63 @@ test("pollWorkRuns: a native-background record among the followed runs still tak
     assert.strictEqual(verdict.record.state, "running");
     assert.ok(warned.some((l) => /could not list live background agents/.test(l)), warned.join("\n"));
   });
+});
+
+// task-spor-work-announce-lib-commit-and-notice-main-moved: a worker keeps the
+// code it loaded, so the loop offers one optional per-pass hook through which
+// `spor work` says when the checkout it loaded from has moved past that code.
+// Optional and fire-and-forget: a bare loop is byte-identical, and a hook that
+// throws costs nothing but that pass's notice.
+test("the optional noticeCode hook runs once per pass and a throw never stops the loop", async () => {
+  let calls = 0;
+  const h = harness({
+    queue: [],
+    opts: { concurrency: 1 },
+    maxPasses: 3,
+    extraDeps: {
+      noticeCode: () => {
+        calls += 1;
+        if (calls === 2) throw new Error("git unreachable");
+      },
+    },
+  });
+  await h.run();
+  // One call per pass: every pass that slept, plus the pass that read the stop.
+  assert.strictEqual(calls, h.sleeps.length + 1, "one call per pass, the throwing pass included");
+  assert.ok(calls >= 3, `the throw on the second pass did not stop the loop (${calls} calls)`);
+});
+
+test("makeCodeMovedNotice says once per new tip that the loaded code was moved past, and nothing when it was not", () => {
+  const { makeCodeMovedNotice, loadedCodeCommit } = require("../bin/spor.js");
+  const fs = require("fs");
+  const os = require("os");
+  const path = require("path");
+  const { execFileSync } = require("child_process");
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-code-"));
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  g("init", "-q", "-b", "main");
+  fs.writeFileSync(path.join(repo, "a"), "1\n");
+  g("add", "."); g("commit", "-q", "-m", "one");
+  const loaded = loadedCodeCommit(repo);
+  assert.deepStrictEqual(loaded, { commit: g("rev-parse", "--short", "HEAD"), branch: "main" });
+  const lines = [];
+  const notice = makeCodeMovedNotice(loaded, { root: repo, log: (l) => lines.push(l) });
+  notice();
+  assert.deepStrictEqual(lines, [], "nothing moved, nothing said");
+  fs.writeFileSync(path.join(repo, "a"), "2\n");
+  g("commit", "-q", "-am", "two");
+  const two = g("rev-parse", "--short", "HEAD");
+  notice(); notice();
+  assert.strictEqual(lines.length, 1, "said once per new tip, not once per pass");
+  assert.match(lines[0], new RegExp(`moved to ${two} \\(main\\) — this worker still runs the code it loaded at ${loaded.commit}; restart it`));
+  fs.writeFileSync(path.join(repo, "a"), "3\n");
+  g("commit", "-q", "-am", "three");
+  notice();
+  assert.strictEqual(lines.length, 2, "a further move is said again");
+  // Not a git checkout (an npm install): nothing is known, nothing is said.
+  const plain = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-plain-"));
+  assert.strictEqual(loadedCodeCommit(plain), null);
+  const quiet = [];
+  makeCodeMovedNotice(null, { root: plain, log: (l) => quiet.push(l) })();
+  assert.deepStrictEqual(quiet, []);
 });

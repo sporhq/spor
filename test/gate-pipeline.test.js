@@ -3576,6 +3576,7 @@ test("the rescue's early diagnosis block survives a final message that overwrote
   fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
   fs.writeFileSync(path.join(home, "nodes", "task-fix-me.md"), "---\nid: task-fix-me\ntype: task\ntitle: Make the bound exclusive\nsummary: The loop over-reads by one element.\nstatus: open\ndate: 2026-09-03\n---\n\nAcceptance: reading N items yields N.\n");
   fs.writeFileSync(path.join(home, "nodes", "profile-claude-fable.md"), "---\nid: profile-claude-fable\ntype: profile\ntitle: The strong-model rescue profile\nharness: claude-code\nsummary: The strong-model rescue profile.\ndate: 2026-09-03\n---\n\nThe rescue lane's profile.\n");
+  fs.writeFileSync(path.join(home, "nodes", "profile-codex-sol.md"), "---\nid: profile-codex-sol\ntype: profile\ntitle: The Codex rescue profile\nharness: codex\nsummary: The Codex rescue profile.\ndate: 2026-09-03\n---\n\nA rescue lane profile on a harness that writes its own report.\n");
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-rescue-early-repo-"));
   const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
   g("init", "-q", "-b", "main");
@@ -3600,12 +3601,18 @@ test("the rescue's early diagnosis block survives a final message that overwrote
     final: { report: `${waiting}\n\x60\x60\x60json\n{"diagnosis":"restated at the end","category":"stale-premise","fixed":true,"filed":[]}\n\x60\x60\x60`, log: line({ type: "assistant", message: { content: [{ type: "text", text: early }] } }) },
     // No block anywhere: still unread, the tail of the prose salvaged.
     none: { report: waiting, log: line({ type: "assistant", message: { content: [{ type: "text", text: "Looking at the diff." }] } }) + line({ type: "assistant", message: { content: [{ type: "text", text: waiting }] } }) },
+    // The same shape on a CODEX stream (F2's residual): Codex writes its own
+    // report through --output-last-message and declares no report hook, so
+    // the salvage reads its `agent_message` items through the read-only
+    // message hook instead of coming back empty.
+    codex: { harness: "codex", report: waiting, log: line({ type: "thread.started", thread_id: "thread-1" }) + line({ type: "item.completed", item: { id: "item_0", type: "agent_message", text: early } }) + line({ type: "item.completed", item: { id: "item_1", type: "command_execution", command: "npm test" } }) + line({ type: "item.completed", item: { id: "item_2", type: "agent_message", text: waiting } }) + line({ type: "turn.completed" }) },
   };
   let which = "early";
+  const factory = { id: "factory-test", rescue: { profile: "profile-claude-fable", attempts: 4, awaitMs: 5000 } };
   const deps = sporCli.makeGateDeps(cfg, {
     record: { node_id: "task-fix-me", cwd: repo },
     entry: { run_id: runId, node_id: "task-fix-me", project: null },
-    factory: { id: "factory-test", rescue: { profile: "profile-claude-fable", attempts: 3, awaitMs: 5000 } },
+    factory,
     slug: null, passthrough: {},
     warn: () => {}, log: (l) => logs.push(l), stopping: () => false, home,
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -3614,8 +3621,9 @@ test("the rescue's early diagnosis block survives a final message that overwrote
       const p = dispatchRuns.runPaths(home, id);
       fs.writeFileSync(p.report, `${streams[which].report}\n`);
       fs.writeFileSync(p.log, streams[which].log);
-      dispatchRuns.atomicJson(p.record, { run_id: id, node_id: "task-fix-me", name: values.name, harness: "claude-code", state: "done", created_at: new Date().toISOString(), log_path: p.log, report_path: p.report });
-      return { ok: true, run: { run_id: id, harness: "claude-code" } };
+      const harness = streams[which].harness || "claude-code";
+      dispatchRuns.atomicJson(p.record, { run_id: id, node_id: "task-fix-me", name: values.name, harness, state: "done", created_at: new Date().toISOString(), log_path: p.log, report_path: p.report });
+      return { ok: true, run: { run_id: id, harness } };
     },
   });
   const gate = { id: "adversarial-review", kind: "agent-review", profile: "profile-review", cycles: 1 };
@@ -3638,6 +3646,15 @@ test("the rescue's early diagnosis block survives a final message that overwrote
   assert.deepStrictEqual([r3.category, r3.unread], ["unknown", true], "no block anywhere is still unread");
   assert.match(r3.diagnosis, /commit the test as soon as its notification arrives\.$/, "the tail of the prose is salvaged as before");
   assert.ok(logs.some((l) => /left no structured diagnosis/.test(l)));
+
+  which = "codex";
+  logs.length = 0;
+  factory.rescue.profile = "profile-codex-sol";
+  const r4 = await deps.rescue({ ...base, attempt: 4 });
+  assert.strictEqual(r4.ok, true, r4.reason);
+  assert.deepStrictEqual([r4.category, r4.fixed, r4.filed, r4.unread], ["real-defect", false, ["task-review-say-which-way"], false], "a Codex rescue's early block is the diagnosis too, not 'unknown'");
+  assert.match(r4.diagnosis, /widened the bound/);
+  assert.ok(logs.some((l) => /left no diagnosis block in its final report — read the last one from an earlier message/.test(l)), `the salvage is logged (saw ${JSON.stringify(logs)})`);
 });
 
 test("the real rescue dispatch runs under the rescue profile in the run's own checkout with the full history, its diagnosis is read in code, and the escalation body opens with it", async () => {

@@ -12407,6 +12407,46 @@ async function writeRegateArtifact(cfg, { record, entry, factoryId, previous, re
   return { ...written, id };
 }
 
+// The code a worker RUNS is the code it loaded at startup — a long-running
+// `spor work` keeps executing the lib/bin it required, however far the
+// checkout it was loaded from moves afterwards (worker 3edbecd2 ran from 15:50
+// on code predating the fix that had landed on main hours earlier, so the fix
+// never applied to its pipelines — issue-spor-rescue-and-fix-sessions-end-turn-
+// waiting-on-background-job, task-spor-work-announce-lib-commit-and-notice-
+// main-moved). `loadedCodeCommit` names that code: the checkout's HEAD when
+// the package root is a git checkout (a developer's clone, a worktree), null
+// when it is not (an npm install — the package version stands in). Fail-soft
+// and bounded: one `git rev-parse` per call, never a throw.
+function loadedCodeCommit(root = ROOT) {
+  try {
+    const r = spawnSync("git", ["-C", root, "rev-parse", "--short", "HEAD"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] });
+    if (r.status !== 0) return null;
+    const commit = String(r.stdout || "").trim();
+    if (!commit) return null;
+    const b = spawnSync("git", ["-C", root, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] });
+    const branch = b.status === 0 ? String(b.stdout || "").trim() : "";
+    return { commit, branch: branch && branch !== "HEAD" ? branch : null };
+  } catch {
+    return null;
+  }
+}
+
+// The per-pass notice for the above: when the checkout the worker loaded its
+// code from has moved past that commit, say so ONCE per new tip — the worker
+// still runs what it loaded, and the operator's remedy is a restart. A
+// checkout that is not a git checkout, or one that has not moved, says
+// nothing (byte-identical to before the notice existed).
+function makeCodeMovedNotice(loaded, { root = ROOT, log = () => {} } = {}) {
+  let noticed = loaded ? loaded.commit : null;
+  return () => {
+    if (!loaded) return;
+    const now = loadedCodeCommit(root);
+    if (!now || now.commit === noticed) return;
+    noticed = now.commit;
+    log(`work: ${root} moved to ${now.commit}${now.branch ? ` (${now.branch})` : ""} — this worker still runs the code it loaded at ${loaded.commit}; restart it to pick the new code up`);
+  };
+}
+
 async function cmdWork(cfg, { values }) {
   if (values.status) return cmdWorkStatus(cfg, { json: !!values.json });
 
@@ -12723,6 +12763,17 @@ async function cmdWork(cfg, { values }) {
   out(`work: worker ${workerId.slice(0, 8)} — ${slug || "all projects"}, accept ${accept}, concurrency ${concurrency}, poll ${intervalMs / 1000}s${max ? `, stopping after ${max} dispatch(es)` : ""}`);
   if (factoryRepos.length) out(`work: factory ${factoryId} judges repo(s) ${factoryRepos.join(", ")} — items from any other repo are skipped, not gated`);
   out(`work: status at ${workLoop.workerStatusPath(home, workerId)}  ('spor work --status')`);
+  // What code this worker runs, said once up front and re-checked each pass
+  // (task-spor-work-announce-lib-commit-and-notice-main-moved): a long-running
+  // worker keeps the lib/bin it loaded, so a fix that lands on main after
+  // startup does not reach its pipelines until it is restarted.
+  const loadedCode = loadedCodeCommit(ROOT);
+  out(
+    loadedCode
+      ? `work: running ${ROOT} at ${loadedCode.commit}${loadedCode.branch ? ` (${loadedCode.branch})` : ""} — a worker keeps the code it loaded; restart it after a land you want it to run`
+      : `work: running @sporhq/spor ${require(path.join(ROOT, "package.json")).version} from ${ROOT} — a worker keeps the code it loaded; restart it after an upgrade you want it to run`
+  );
+  const noticeCode = makeCodeMovedNotice(loadedCode, { root: ROOT, log: (line) => out(line) });
   const final = await workLoop.runWorkLoop({
     opts: {
       workerId, project: slug, accept, repos: factoryRepos, concurrency, intervalMs, maxIntervalMs, retryAfterMs, max, once: !!values.once, factory: factoryId,
@@ -12733,6 +12784,7 @@ async function cmdWork(cfg, { values }) {
     },
     control,
     deps: {
+      noticeCode,
       candidates,
       // Refuse BEFORE any side effect if this machine can't satisfy the
       // loaded factory's integration requirement (task-spor-propose-gh-
@@ -15365,7 +15417,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
+module.exports = { loadedCodeCommit, makeCodeMovedNotice, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
 
 if (require.main === module) {
   main()
