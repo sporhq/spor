@@ -83,7 +83,7 @@ Codex test profile.
 // stdin, records its invocation, then emits the stream-json events a real run
 // does — `system`/`init` first (every event carries `session_id`), an
 // `assistant` message, and the terminal `result`.
-function claudeStreamStub(home, { delayMs = 0, exitCode = 0, resultText = "stub final report" } = {}) {
+function claudeStreamStub(home, { delayMs = 0, exitCode = 0, resultText = "stub final report", isError = false } = {}) {
   return writeSpawnableNodeStub(home, "claude-stream-stub", `
 const fs = require("node:fs");
 let prompt = "";
@@ -102,7 +102,7 @@ process.stdin.on("end", () => {
   w({ type: "system", subtype: "init", cwd: process.cwd(), session_id: ${JSON.stringify(SESSION)}, model: "stub" });
   w({ type: "assistant", message: { role: "assistant", content: [{ type: "thinking", thinking: "" }] }, session_id: ${JSON.stringify(SESSION)} });
   w({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "working on it" }] }, session_id: ${JSON.stringify(SESSION)} });
-  w({ type: "result", subtype: "success", is_error: false, result: ${JSON.stringify(resultText)}, session_id: ${JSON.stringify(SESSION)} });
+  w({ type: "result", subtype: ${isError ? '"error_during_execution"' : '"success"'}, is_error: ${isError ? "true" : "false"}, result: ${JSON.stringify(resultText)}, session_id: ${JSON.stringify(SESSION)} });
   setTimeout(() => process.exit(${exitCode}), ${delayMs});
 });
 `);
@@ -197,7 +197,7 @@ test("claude-code reads its session from any stream event and its report from re
   assert.strictEqual(sessionFromEvent(null), null);
 
   assert.strictEqual(reportFromEvent({ type: "result", subtype: "success", is_error: false, result: "pong" }), "pong");
-  assert.strictEqual(reportFromEvent({ type: "result", subtype: "error_during_execution", is_error: true, result: "boom" }), "boom", "an error result is still the run's own account");
+  assert.strictEqual(reportFromEvent({ type: "result", subtype: "error_during_execution", is_error: true, result: "boom" }), null, "an error result is never the report — the contract would read it as a clean `reported`");
   assert.strictEqual(reportFromEvent({ type: "result", subtype: "success" }), null);
   assert.strictEqual(
     reportFromEvent({ type: "assistant", message: { content: [{ type: "text", text: "first" }, { type: "tool_use", name: "Bash" }, { type: "text", text: "last" }] } }),
@@ -211,6 +211,83 @@ test("claude-code reads its session from any stream event and its report from re
 });
 
 // ---- the launch --------------------------------------------------------------
+
+test("claude-code declares a failure from an is_error result, and from nothing else", () => {
+  const { failureFromEvent } = getHarness("claude-code");
+  assert.strictEqual(typeof failureFromEvent, "function");
+  assert.deepStrictEqual(
+    failureFromEvent({ type: "result", subtype: "error_during_execution", is_error: true, result: "API Error: 500" }),
+    { reason: "error_during_execution: API Error: 500" }
+  );
+  assert.deepStrictEqual(
+    failureFromEvent({ type: "result", subtype: "error_max_turns", is_error: true, errors: ["hit the turn cap", " and stopped "] }),
+    { reason: "error_max_turns: hit the turn cap; and stopped" },
+    "an `errors` list stands in for a missing result string"
+  );
+  assert.deepStrictEqual(failureFromEvent({ type: "result", is_error: true }), { reason: "error" }, "a bare error result still declares failure");
+  assert.strictEqual(failureFromEvent({ type: "result", subtype: "success", is_error: false, result: "pong" }), null);
+  assert.strictEqual(failureFromEvent({ type: "result", subtype: "success", result: "pong" }), null);
+  assert.strictEqual(failureFromEvent({ type: "assistant", message: { content: [{ type: "text", text: "is_error: true" }] } }), null, "only a result event can declare it");
+  assert.strictEqual(failureFromEvent({ type: "system", subtype: "init" }), null);
+  assert.strictEqual(failureFromEvent(null), null);
+  for (const id of ["codex", "opencode", "copilot"]) {
+    assert.strictEqual(getHarness(id).failureFromEvent, undefined, `${id} declares no stream failure — its supervision is byte-identical`);
+  }
+});
+
+test("a supervised claude-code run ending in an is_error result classifies FAILED with the error text as the reason — no report, never `reported`", async () => {
+  // Exit 0 on purpose: the exit code must not be what saves this case, the
+  // declared error result alone has to.
+  const { home, repo } = fixture();
+  const outfile = path.join(home, "claude-invocation.json");
+  const stub = claudeStreamStub(home, { delayMs: 100, exitCode: 0, isError: true, resultText: "API Error: 500 Internal Server Error" });
+  const result = run(
+    ["dispatch", "task-cc", "--dir", repo, "--permission-mode", "bypassPermissions", "--no-brief"],
+    { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outfile }
+  );
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.ok(await awaitJson(outfile), "the detached stub ran");
+
+  const recordPath = await runRecordFile(home);
+  assert.ok(recordPath);
+  const settled = await waitFor(() => {
+    const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+    return record.contract_pending === false ? record : null;
+  });
+  assert.ok(settled, "the run settled");
+  assert.strictEqual(settled.state, "failed");
+  assert.strictEqual(settled.exit_code, 0, "the child exited 0 — the error result is what failed the run");
+  assert.strictEqual(settled.termination_class, "failed");
+  assert.strictEqual(settled.termination_signal, "error-result");
+  assert.match(settled.termination_reason, /error_during_execution: API Error: 500 Internal Server Error/, "the error text is retained as the reason");
+  assert.strictEqual(settled.terminal_state, "failed", "never `reported` — an error result has no report to file");
+  assert.ok(!fs.existsSync(settled.report_path), "no report file is written for an errored session");
+  assert.match(fs.readFileSync(settled.log_path, "utf8"), /"is_error":true/, "the log still holds the whole stream, error event included");
+});
+
+test("a supervised claude-code run whose is_error result carries a recognized environment signal keeps that classification", async () => {
+  const { home, repo } = fixture();
+  const outfile = path.join(home, "claude-invocation.json");
+  const stub = claudeStreamStub(home, { delayMs: 100, exitCode: 1, isError: true, resultText: "Credit balance is too low" });
+  const result = run(
+    ["dispatch", "task-cc", "--dir", repo, "--permission-mode", "bypassPermissions", "--no-brief"],
+    { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outfile }
+  );
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.ok(await awaitJson(outfile), "the detached stub ran");
+  const recordPath = await runRecordFile(home);
+  const settled = await waitFor(() => {
+    const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+    return record.contract_pending === false ? record : null;
+  });
+  assert.ok(settled);
+  assert.strictEqual(settled.state, "failed");
+  assert.strictEqual(settled.exit_code, 1);
+  assert.strictEqual(settled.termination_class, "environment", "an environment signal in the error text still wins over the generic reading");
+  assert.strictEqual(settled.termination_signal, "credit-exhausted");
+  assert.strictEqual(settled.terminal_state, "failed");
+  assert.ok(!fs.existsSync(settled.report_path), "no report either way");
+});
 
 test("a default claude-code dispatch launches supervised: print-mode argv, prompt on stdin, session and report off the stream", async () => {
   const { home, repo } = fixture();
