@@ -12151,7 +12151,17 @@ async function cmdWork(cfg, { values }) {
     for (const r of factoryRepos) {
       try {
         const res = await remote.get(cfg, `/v1/queue?project=${encodeURIComponent(r)}&limit=1`, { timeoutMs: 3000 });
-        if (res.ok && takeProjectWarning(res.json)) err(unknownRepoWarning(r));
+        const warning = res.ok ? takeProjectWarning(res.json) : null;
+        if (!warning) continue;
+        // The server's text is the authoritative answer, so print it VERBATIM
+        // (the acceptance: byte-matching what `spor next --project <typo>`
+        // prints), then the factory-shaped context line local mode prints. The
+        // verbatim line goes through the once-per-token printer so a
+        // single-repo factory — whose page read is scoped to this same repo and
+        // carries the same field — says it once, while a multi-repo factory —
+        // whose page read is UNSCOPED and never sees it — still says it per repo.
+        warnQueueProjectOnce(r, warning);
+        err(unknownRepoWarning(r));
       } catch {
         /* fail-open: an unreachable server is the queue read's problem to report */
       }
