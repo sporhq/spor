@@ -597,6 +597,7 @@ written only after the outcome dimension exists):
 | `gate_fix_at` | ISO 8601 | when `gate_fix_run_id` was stamped |
 | `gate_progress` | object | optional — `{key, at, seq, gates: {<gate id>: {fixes, attempts, ledger, lastFix}}}`: each gate's own memory (§10.4), saved after every review verdict (with the fix it decided on as `lastFix.dispatched: false`) and again when the fix's launch is known (`fixes` counts LAUNCHED fixes only). `key` is the attempt's run key — a resumed pipeline of the same attempt reads it back; a `--regate` (a new attempt) ignores it. Best-effort like every `gate_*` stamp: a write that fails is logged and the pipeline goes on |
 | `gate_escalation_failed` | boolean | optional — set when the refusal (a gate's, or the integration stage's, §10.9) could not file the escalation that carries it, so nothing was written to the graph and (§10.7) nothing was demoted either. The verdict is still settled; this is what says the refusal is readable only on this box, and that `spor work --regate` is the door back |
+| `gate_demote_pending` | boolean | optional, propose mode only (§10.9) — `true` while a parked item's rollback is still owed: its tracking item filed but the demotion's own write failed (at park time, or during a heal pass). The per-pass proposal check retries the demotion on this flag and writes it back `false` once it lands; a park that never filed its tracker needs no flag, since healing the tracker is itself what triggers the rollback |
 
 A consumer reading `gate_state` as a verdict must check it is one of the
 settled values (`passed`/`failed`/`blocked`/`superseded`, or `parked` under
@@ -1456,7 +1457,13 @@ as well: with no tracking item on the graph the rollback is withheld and the
 `proposed` fact says so, and it is the per-pass proposal check (below) that
 completes it — the moment it heals the missing tracking item from the run
 record's `gate_proposal_*` stamps, the blocker exists, so the demotion runs
-then. Nothing is marked for a person: the heal is the retry. The pipeline returns a THIRD settled state,
+then. Nothing is marked for a person: the heal is the retry. The same pass is
+also the retry for a demotion that FAILED beside a tracker that did file (a
+transient write error, at park time or during the heal itself): the run record
+carries `gate_demote_pending: true` until the rollback lands, and every
+proposal check re-attempts it on that flag — otherwise the next pass would find
+the tracker present, heal nothing, and leave the item at its completion status
+for as long as the proposal stayed open. The pipeline returns a THIRD settled state,
 `parked` (alongside `passed`/`failed`/`blocked`, all in
 `gates.SETTLED_GATE_STATES` — this run's pipeline is genuinely done; a
 resumed orphan re-running it from gate 0 would open a duplicate PR), and the

@@ -865,6 +865,102 @@ test("issue-spor-integration-settle-escalate-demote-race: checkProposals complet
   assert.ok(!again.some((l) => l.includes("healed the tracking item")), again.join("\n"));
 });
 
+// F2 of the review of issue-spor-integration-settle-escalate-demote-race: a
+// demotion that fails TRANSIENTLY beside a tracker that did file — at park
+// time, or in the heal pass itself — must be retried by later proposal passes,
+// not left at its completion status for the life of the PR. The run record's
+// `gate_demote_pending` flag is what carries the debt across passes.
+test("checkProposals retries a withheld demotion on gate_demote_pending until it lands, then clears the flag", async (t) => {
+  if (process.platform === "win32") return;
+  if (process.getuid && process.getuid() === 0) return;
+
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-park-demote-retry-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const write = (id, front) => fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\n${front}date: 2026-08-26\n---\n\nBody.\n`);
+  const statusOf = (id) => /^status: (.+)$/m.exec(fs.readFileSync(path.join(nodes, `${id}.md`), "utf8"))[1];
+  const recordOf = (runId) => dispatchRuns.readRunRecords(home).find((r) => r.run_id === runId);
+  const itemFile = path.join(nodes, "task-proposed.md");
+  t.after(() => { try { fs.chmodSync(itemFile, 0o600); } catch { /* best-effort */ } });
+
+  write("task-proposed", "type: task\ntitle: Add bounded retry\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: done\n");
+
+  const ghDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-fake-gh-"));
+  writeFakePathBin(ghDir, "gh", `if [ "$1" = "--version" ]; then echo "gh version 2.0.0"; exit 0; fi\necho '{"state":"OPEN","baseRefName":"main"}'\n`);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${ghDir}${path.delimiter}${originalPath}`;
+  t.after(() => { process.env.PATH = originalPath; });
+
+  const factory = { id: "factory-demo", integration: { targetRef: "main", mode: "propose", strategy: "merge" } };
+
+  // --- Case 1: the tracker filed at park time, but the demotion's own write failed.
+  const entry = { node_id: "task-proposed", run_id: "11111111-2222-3333-4444-000000000003" };
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, entry.run_id).record, {
+    run_id: entry.run_id, node_id: entry.node_id, state: "done", terminal_state: "resolved", terminal_enforced: true,
+  });
+  const deps = sporCli.makeIntegrationDeps(cfg, {
+    record: { cwd: home }, entry, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home,
+  });
+  const proposal = { number: 9, url: "https://github.com/demo/repo/pull/9", repo: "demo/repo", branch: "task-proposed" };
+  const filed = await deps.parkForReview({ proposal });
+  assert.strictEqual(filed.ok, true, "the tracker filed");
+  // The item cannot be re-read (a transient failure standing in for any write
+  // error) — exactly the demotion outcome park() reports as `demote_reason`.
+  fs.chmodSync(itemFile, 0o000);
+  const failed = await deps.demote({ blockerId: filed.id });
+  fs.chmodSync(itemFile, 0o600);
+  assert.strictEqual(failed.ok, false, "the demotion really failed");
+  assert.strictEqual(statusOf("task-proposed"), "done");
+  // What the loop stamps for a parked verdict whose demotion failed.
+  dispatchRuns.stampGateState(home, entry.run_id, { gate_state: "parked", gate_at: new Date().toISOString(), gate_demote_pending: true });
+
+  const lines = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => lines.push(l) });
+  assert.strictEqual(statusOf("task-proposed"), "open", "the next proposal pass retried the demotion and it landed");
+  assert.ok(lines.some((l) => l.includes(`retried the withheld demotion of task-proposed; task-proposed rolled back done -> open; ${filed.id} now blocks task-proposed`)), lines.join("\n"));
+  assert.strictEqual(recordOf(entry.run_id).gate_demote_pending, false, "the debt is cleared on the record");
+
+  // A further pass owes nothing: no demotion attempt, no log line.
+  const again = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => again.push(l) });
+  assert.ok(!again.some((l) => l.includes("withheld demotion") || l.includes("healed the tracking item")), again.join("\n"));
+
+  // --- Case 2: the heal pass re-created the tracker, but ITS demotion failed.
+  write("task-proposed", "type: task\ntitle: Add bounded retry\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: done\n");
+  const entry2 = { node_id: "task-proposed", run_id: "11111111-2222-3333-4444-000000000004" };
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, entry2.run_id).record, {
+    run_id: entry2.run_id, node_id: entry2.node_id, state: "done", terminal_state: "resolved", terminal_enforced: true,
+    gate_state: "parked", gate_proposal_number: 10, gate_proposal_url: "https://github.com/demo/repo/pull/10", gate_proposal_repo: "demo/repo",
+    gate_proposal_branch: "task-proposed", gate_proposal_target_ref: "main", gate_proposal_strategy: "merge", gate_proposal_project: "demo",
+  });
+  // Retire case 1's record so only this proposal is on the pass.
+  dispatchRuns.stampGateState(home, entry.run_id, { gate_state: "superseded" }, { force: true });
+  const tracker2 = sporCli.proposalTrackingId(entry2.node_id, entry2.run_id);
+  assert.strictEqual(fs.existsSync(path.join(nodes, `${tracker2}.md`)), false, "the tracker is missing — the heal case");
+
+  // Read-only: the heal's own write (a NEW file) and the graph load both
+  // succeed, while setStatusLocal's in-place rewrite of the item fails.
+  fs.chmodSync(itemFile, 0o444);
+  const healLines = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => healLines.push(l) });
+  fs.chmodSync(itemFile, 0o600);
+  assert.strictEqual(fs.existsSync(path.join(nodes, `${tracker2}.md`)), true, "the tracker was healed");
+  assert.strictEqual(statusOf("task-proposed"), "done", "but the demotion failed this pass");
+  assert.ok(healLines.some((l) => l.includes("healed the tracking item for task-proposed, but it could not be demoted") && l.includes("will retry next pass")), healLines.join("\n"));
+  assert.strictEqual(recordOf(entry2.run_id).gate_demote_pending, true, "the failed heal-pass demotion is recorded as still owed");
+
+  const retryLines = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => retryLines.push(l) });
+  assert.strictEqual(statusOf("task-proposed"), "open", "the pass after that retried it, tracker already present");
+  assert.ok(retryLines.some((l) => l.includes(`retried the withheld demotion of task-proposed; task-proposed rolled back done -> open; ${tracker2} now blocks task-proposed`)), retryLines.join("\n"));
+  assert.strictEqual(recordOf(entry2.run_id).gate_demote_pending, false);
+});
+
 // ---------------------------------------------------- the git plumbing, for real --
 
 function git(dir, ...args) {

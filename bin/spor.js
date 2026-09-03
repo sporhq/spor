@@ -11879,15 +11879,30 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
     // now, one pass late — the same fail-soft, idempotent door park() would
     // have used, so a record from before the pair was atomic (already rolled
     // back) reads "nothing to roll back" here rather than failing.
-    if (healed.healed) {
+    //
+    // `gate_demote_pending` is the durable form of "the rollback has not
+    // landed": stamped by the loop when park() reported a demotion that
+    // FAILED (a transient write error beside a tracker that did file), and
+    // here when the heal-pass demotion fails the same way. Without it a
+    // demotion that failed once was never retried — the next pass found the
+    // tracker present, healed nothing, and left the item at its completion
+    // status for as long as the proposal stayed open. The stamp is cleared
+    // the moment a demotion lands, so a settled record costs no extra read.
+    if (healed.healed || r.gate_demote_pending) {
       let demoted = null;
       try {
         demoted = await gateDemoteItem(cfg, r.node_id, { blockerId: healed.id });
       } catch (e) {
         demoted = { ok: false, reason: `${(e && e.message) || e}` };
       }
-      if (demoted && demoted.ok) log(`work: healed the tracking item for ${r.node_id}; ${demoted.note}`);
-      else log(`work: healed the tracking item for ${r.node_id}, but it could not be demoted on the graph (${(demoted && demoted.reason) || "no response"}) — the proposal still stands`);
+      const landed = !!(demoted && demoted.ok);
+      const how = healed.healed ? `healed the tracking item for ${r.node_id}` : `retried the withheld demotion of ${r.node_id}`;
+      if (landed) log(`work: ${how}; ${demoted.note}`);
+      else log(`work: ${how}, but it could not be demoted on the graph (${(demoted && demoted.reason) || "no response"}) — the proposal still stands; will retry next pass`);
+      // `parked` is a settled state, so this stamp must force past
+      // stampGateState's settled guard — it touches no verdict, only the
+      // flag that says the rollback is still owed.
+      dispatchRuns.stampGateState(home, r.run_id, { gate_demote_pending: !landed }, { force: true });
     }
     let closed = false;
     try {
@@ -12038,6 +12053,9 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     gate_escalation_failed: !!(res && res.escalation_failed),
     // A demotion from an earlier attempt still stands until a pass restores it.
     ...(res && res.demoted ? { gate_demoted: true } : {}),
+    // A park whose tracker filed but whose demotion failed owes the rollback
+    // to checkProposals (§10.9); the same flag the loop stamps.
+    ...(state === "parked" && res && res.escalated_to && res.demote_reason ? { gate_demote_pending: true } : {}),
   });
   if (state !== "passed") {
     out(`work: re-gate of ${record.node_id} ${state}${reason ? ` — ${reason}` : ""}${res && res.escalated_to ? ` (escalated to ${res.escalated_to})` : ""}`);
