@@ -12001,7 +12001,35 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
       }
       continue;
     }
-    if (healed.healed || r.gate_demote_pending) {
+    // The record is not the only ledger of the debt (F1 of the third
+    // review): a heal-pass demotion that fails AND whose `gate_demote_pending`
+    // stamp fails leaves NOTHING behind — the next pass finds the tracker
+    // present (healed nothing) and no flag, and skips the demotion for the
+    // life of the open PR. So when neither the heal nor the flag says a
+    // rollback is owed, the pass RE-DERIVES it from the graph, where the debt
+    // is always legible: an OPEN tracker (read above) whose proposal has not
+    // landed (no landed fact) beside an item still at its completion status
+    // IS a withheld rollback, whatever the record says. gateDemoteItem is
+    // the probe — it reads the item and rolls back only a claim of
+    // completion, answering "nothing to roll back" otherwise — so the common
+    // case (item already `open`) is one read and no write, and an item that
+    // really was stranded is demoted through exactly the path a flagged
+    // retry takes (settled-meanwhile check and undo included). A probe needs
+    // no flag of its own: it runs again next pass, so a probe that fails is
+    // only logged. The landed fact is checked first because restore() writes
+    // it before it promotes and closes the tracker — a tracker whose close
+    // failed sits open beside a legitimately completed item, and a probe
+    // that demoted it there would churn against the landing every pass.
+    const owed = !!(healed.healed || r.gate_demote_pending);
+    let probe = false;
+    if (!owed) {
+      try {
+        probe = !(await resolveNode(cfg, integrationRunner.integrationFactId(r.node_id, r.run_id, "landed")));
+      } catch {
+        probe = false; // an unreadable graph cannot license a rollback
+      }
+    }
+    if (owed || probe) {
       let demoted = null;
       try {
         demoted = await gateDemoteItem(cfg, r.node_id, { blockerId: healed.id });
@@ -12009,9 +12037,19 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
         demoted = { ok: false, reason: `${(e && e.message) || e}` };
       }
       const landed = !!(demoted && demoted.ok);
-      const how = healed.healed ? `healed the tracking item for ${r.node_id}` : `retried the withheld demotion of ${r.node_id}`;
-      if (landed) log(`work: ${how}; ${demoted.note}`);
-      else log(`work: ${how}, but it could not be demoted on the graph (${(demoted && demoted.reason) || "no response"}) — the proposal still stands; will retry next pass`);
+      if (probe && landed && !demoted.demoted) {
+        // The ordinary case: nothing was owed. Silent — this is a read, not
+        // a retry, and the item's proposal is checked below as before.
+      } else {
+        const how = healed.healed
+          ? `healed the tracking item for ${r.node_id}`
+          : probe
+            ? `recovered an unrecorded rollback debt for ${r.node_id} (its tracking item ${healed.id} is open, its proposal has not landed, and it still claimed completion)`
+            : `retried the withheld demotion of ${r.node_id}`;
+        if (landed) log(`work: ${how}; ${demoted.note}`);
+        else if (probe) log(`work: ${r.node_id} could not be read to check whether its rollback is still owed (${(demoted && demoted.reason) || "no response"}) — will check again next pass`);
+        else log(`work: ${how}, but it could not be demoted on the graph (${(demoted && demoted.reason) || "no response"}) — the proposal still stands; will retry next pass`);
+      }
       // The check-then-demote window (F4, above): only a rollback that
       // actually FLIPPED the item can have crossed it — a no-op demotion
       // ("nothing to roll back") changed nothing to undo. The settled check
@@ -12033,7 +12071,10 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
         stamp({ gate_demote_pending: false, gate_restore_pending: !undone }, undone ? "the rollback and its undo both landed" : "the undo is owed");
         continue; // settled: nothing left for this pass to check
       }
-      stamp({ gate_demote_pending: !landed }, landed ? "the rollback landed" : "the rollback is owed");
+      // A probe that found nothing (or could not read) owes no stamp: the
+      // record carries no flag and the graph is re-read next pass. One that
+      // flipped the item, or a flagged/healed attempt, writes its outcome.
+      if (!probe || (landed && demoted.demoted)) stamp({ gate_demote_pending: !landed }, landed ? "the rollback landed" : "the rollback is owed");
     }
     const proposal = {
       nodeId: r.node_id,
