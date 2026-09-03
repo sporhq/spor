@@ -160,7 +160,7 @@ node **your git identity binds to**, this machine's agent, and the repo enabled.
 
 `spor dispatch --backfill` stays as the **unattended CLI primitive**: it inits
 the graph home, re-enables a disabled repo, registers the repo in the dispatch
-slug→path map, and launches a `claude --bg` backfill agent. It does **not** set up
+slug→path map, and launches a supervised headless Claude Code backfill agent. It does **not** set up
 identity (person/agent), pick a tenant, verify a person binding, or get tracker
 consent. So:
 

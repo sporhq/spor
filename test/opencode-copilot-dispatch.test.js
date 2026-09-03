@@ -176,9 +176,12 @@ test("the two new harnesses are ADDITIVE registry entries under the same uniform
   assert.strictEqual(getHarness("gemini"), null, "a harness with no adapter still never silently substitutes");
 });
 
-test("the shipped claude-code and codex launch behavior is byte-identical", () => {
+test("the shipped claude-code (--bg variant) and codex launch behavior is byte-identical", () => {
+  // The claude-code adapter launches supervised by default since
+  // task-spor-claude-adapter-headless-supervised; the argv this test always
+  // pinned is now its native-background VARIANT's, byte-identical.
   assert.deepStrictEqual(
-    getHarness("claude-code").buildArgs({
+    getHarness("claude-code").nativeVariant.buildArgs({
       name: "n", model: "m", permissionMode: "p", agent: "a", mcpConfig: "/mcp.json", prompt: "P",
     }),
     ["--bg", "--name", "n", "--model", "m", "--permission-mode", "p", "--agent", "a",

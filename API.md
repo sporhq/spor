@@ -720,16 +720,20 @@ anything with a token.
   (Not to be confused with `spor dispatch --agent`, the unrelated `claude
   --agent` harness passthrough.) The
   token is minted **session-deferred** and bound to the real run session AFTER
-  launch (dec-spor-dispatch-bg-session-late-bind): `claude --bg` ignores
-  `--session-id` and self-allocates its session, so dispatch reads the real one
-  from `claude agents --json` and binds it via `POST /v1/agents/session` (§3) — the
-  one place an agent token's session is set, write-once. The session can't be
-  forged a-priori (it isn't known until the run exists) and can't ride the write
-  payload (token-derived, §1), so the binding is always the actual run. A
-  **supervised**-harness dispatch (Codex, OpenCode, GitHub Copilot CLI) follows
+  launch (dec-spor-dispatch-bg-session-late-bind): a harness self-allocates its
+  session, so dispatch reads the real one and binds it via `POST
+  /v1/agents/session` (§3) — the one place an agent token's session is set,
+  write-once. The session can't be forged a-priori (it isn't known until the run
+  exists) and can't ride the write payload (token-derived, §1), so the binding
+  is always the actual run. For the opt-in native launch (`spor dispatch --bg`,
+  `claude --bg` ignores `--session-id`) the launcher reads it from `claude agents
+  --json`. A **supervised**-harness dispatch (Claude Code by default, Codex,
+  OpenCode, GitHub Copilot CLI) follows
   the same late-bind contract from its own supervisor process instead: it reads
   the session id out of the run's supervised JSONL log rather than
-  `claude agents --json` — Codex off its `thread.started` event, OpenCode off
+  `claude agents --json` — Claude Code off the `session_id` every stream-json
+  event carries (first on its `system`/`init` event), Codex off its
+  `thread.started` event, OpenCode off
   the `sessionID` every event carries, Copilot off the `sessionId` on its
   terminal `result` event (so a Copilot run binds only at exit, still before its
   record goes terminal) — then binds it the same way. Token transport also

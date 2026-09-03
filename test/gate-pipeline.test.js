@@ -1809,32 +1809,29 @@ test("a factory id that is not a factory node says so, and points at the candida
 
 // task-spor-agent-review-gate-satisfiability-precheck: an agent-review gate's
 // verdict is read off the dispatched run's own final report, which only a
-// SUPERVISED harness writes — a native-background launch (claude --bg, the
-// default when a profile names no harness at all) has none. That mismatch
-// used to surface only once a worker claimed the item and the review came
-// back with nothing to parse; it must now refuse the worker at LOAD time.
-test("an agent-review gate routed to a native-background profile refuses the worker at load time", () => {
+// SUPERVISED harness writes. Until task-spor-claude-adapter-headless-supervised
+// the claude-code default (a profile naming no harness at all) launched
+// native-background (`claude --bg`) and had no report channel, so this
+// precheck refused the worker at load time for every such profile. Claude Code
+// now launches supervised (`claude -p --output-format stream-json` under the
+// shared supervisor) and writes a report like every other built-in, so the
+// same three profile shapes LOAD CLEANLY — the precheck stays in place for any
+// adapter whose default launch mode is native-background, but no built-in
+// trips it any more, and a claude-code review profile is a valid route.
+test("an agent-review gate routed to a claude-code profile (the supervised default) loads cleanly", () => {
   for (const [front, label] of [
-    ["type: profile\ntitle: Native background profile\nsummary: A profile that names no harness at all.\n", "unset harness (defaults to claude-code)"],
-    ["type: profile\ntitle: Explicit claude-code profile\nsummary: A profile that explicitly names the native-background built-in.\nharness: claude-code\n", "explicit claude-code"],
-    // gate.profile pointing at a real node that is NOT `type: profile` (a
-    // mistyped id, or a profile authored with no `type:` line at all) must
-    // still be caught: neither resolveDispatchProfile nor spor dispatch's own
-    // harness resolution checks the node's type, so this precheck must not
-    // either — a `type:` mismatch here would silently fall back to run-time-
-    // only detection for a plausible authoring mistake.
+    ["type: profile\ntitle: Default-harness profile\nsummary: A profile that names no harness at all.\n", "unset harness (defaults to claude-code)"],
+    ["type: profile\ntitle: Explicit claude-code profile\nsummary: A profile that explicitly names the claude-code built-in.\nharness: claude-code\n", "explicit claude-code"],
     ["type: task\ntitle: Not actually a profile node\nsummary: A node with the right id but the wrong type, and no harness field.\n", "wrong node type, no type:profile gate"],
   ]) {
     const { home, nodes } = cliFixture({
       factoryPayload: { ...OK_FACTORY, gates: [...OK_FACTORY.gates, { id: "review", kind: "agent-review", profile: "profile-native" }] },
     });
     fs.writeFileSync(path.join(nodes, "profile-native.md"), `---\nid: profile-native\n${front}date: 2026-08-26\n---\nTest profile.\n`);
-    const r = cli(["work", "--once", "--factory", "factory-demo"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode() });
-    assert.strictEqual(r.status, 1, `${label}: ${r.stdout}`);
-    assert.match(r.stderr, /gate 'review': agent-review gate routes to profile 'profile-native'/, label);
-    assert.match(r.stderr, /launches native-background and has no report channel/, label);
-    assert.match(r.stderr, /only a SUPERVISED harness writes/, label);
-    assert.match(r.stderr, /does not run ungated/, label);
+    const r = cli(["work", "--print", "--factory", "factory-demo"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode() });
+    assert.strictEqual(r.status, 0, `${label}: ${r.stderr}`);
+    assert.doesNotMatch(r.stderr, /launches native-background and has no report channel/, label);
+    assert.match(r.stdout, /gate review {2}agent-review {2}review under profile-native/, label);
   }
 });
 

@@ -550,7 +550,10 @@ function dispatchedAgents(cfg) {
       map.set(name, list);
     };
     const home = cfg && typeof cfg.userConfigHome === "function" ? cfg.userConfigHome() : u.userConfigHome();
-    for (const adapter of dispatchHarnesses.harnesses({ cfg })) {
+    // discoveryAdapters, not harnesses: a `--bg` claude-code run (and every
+    // native record from before the supervised default) is enumerated through
+    // the adapter's native variant, while its supervised runs come off run records.
+    for (const adapter of dispatchHarnesses.discoveryAdapters({ cfg })) {
       const discovery = adapter.activeDiscovery || {};
       if (discovery.kind === "run-records") {
         for (const a of dispatchRuns.activeRuns(home)) {
@@ -8295,7 +8298,7 @@ function cmdRuns(cfg, { values, positionals: pos }) {
   const home = cfg.userConfigHome();
   let enumerated = false;
   const agents = [];
-  for (const adapter of dispatchHarnesses.harnesses()) {
+  for (const adapter of dispatchHarnesses.discoveryAdapters()) {
     if ((adapter.activeDiscovery || {}).kind !== "cli-json") continue;
     const e = enumerateHarnessAgents(adapter, cfg);
     if (!e.ok) continue;
@@ -8771,12 +8774,39 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   // error rather than as "unsupported harness" — the operator wrote something,
   // and needs to know what is wrong with it.
   const harnessResolution = dispatchHarnesses.resolveHarness(harness, { cfg });
-  const harnessAdapter = harnessResolution.adapter;
+  let harnessAdapter = harnessResolution.adapter;
   if (harnessResolution.error && !dryRun) {
     err(`cannot dispatch ${nodeId || name}: this machine's declaration for harness '${harness}' is unusable.`);
     err(`  ${harnessResolution.error}`);
     err(`  fix it in $SPOR_HOME/config.json; the assignment is unchanged.`);
     return 1;
+  }
+  // Launch-mode opt-in (task-spor-claude-adapter-headless-supervised): every
+  // built-in launches SUPERVISED by default, Claude Code included; `--bg` (or
+  // a standing `dispatch.claudeLaunchMode: native-background`) swaps in the
+  // adapter's native-background variant — `claude --bg`, the attachable
+  // interactive run. An explicit `--bg` on a harness that has no such mode is
+  // refused (silently ignoring a flag the operator passed is worse); the
+  // standing knob only means anything for the harness that has one, so it is
+  // a no-op elsewhere. A worker-loop dispatch (`spor work`'s implementer runs,
+  // its agent-review gates and fix cycles — everything through
+  // dispatchThroughLocked) passes `ctx.supervisedOnly` and ignores BOTH: the
+  // loop needs the supervised arm's report channel and enforced outcome, and
+  // a box-wide config knob must not silently turn every worker run into an
+  // unenforced, report-less one that the factory precheck can no longer see.
+  const configuredLaunchMode = cfg.get("dispatch.claudeLaunchMode", null) || null;
+  if (configuredLaunchMode && !["supervised", "native-background"].includes(configuredLaunchMode)) {
+    err(`warning: dispatch.claudeLaunchMode '${configuredLaunchMode}' is not recognized (supervised | native-background) — ignoring it.`);
+  }
+  const launchModeRequest = ctx && ctx.supervisedOnly ? null : (values.bg ? "native-background" : configuredLaunchMode);
+  if (harnessAdapter && launchModeRequest) {
+    const variant = dispatchHarnesses.launchVariant(harnessAdapter, launchModeRequest);
+    if (variant) harnessAdapter = variant;
+    else if (values.bg) {
+      err(`cannot use --bg with a ${harnessAdapter.label} dispatch — only Claude Code has a native background (attachable) launch mode.`);
+      err(`  drop --bg to run it under the supervisor, or pick a claude-code profile.`);
+      return 1;
+    }
   }
   const effectiveModel = model || profileRuntime.model || null;
   // Explicit-first launcher resolution (task-spor-dispatch-adapters-opencode-
@@ -9127,7 +9157,14 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
       !!identityAgent || (Array.isArray(profileRuntime.mcp) && profileRuntime.mcp.includes("spor"))
     );
     const args = harnessAdapter.buildArgs({
+      name,
       model: effectiveModel,
+      permissionMode: permMode,
+      agent,
+      // The `mcp-file` identity mechanism (Claude Code): the agent-scoped token
+      // rides the 0600 --mcp-config written above, exactly as the native launch
+      // carried it; an `env-mcp`/`env-token` adapter never has a file here.
+      mcpConfig: agentMcpFile,
       sandbox: effectiveSandbox,
       approvalPolicy: effectiveApprovalPolicy,
       reportPath: dispatchHarnesses.REPORT_PLACEHOLDER,
@@ -9325,7 +9362,7 @@ function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, warn = () => {} } = {}) {
   if (!wanted.size) return [];
   let enumerated = false;
   const agents = [];
-  for (const adapter of dispatchHarnesses.harnesses({ cfg })) {
+  for (const adapter of dispatchHarnesses.discoveryAdapters({ cfg })) {
     if ((adapter.activeDiscovery || {}).kind !== "cli-json") continue;
     const e = enumerateHarnessAgents(adapter, cfg);
     if (!e.ok) continue;
@@ -9455,7 +9492,10 @@ async function dispatchThroughLocked(cfg, values, positionals = []) {
   ERR_TEE = lines;
   let code;
   try {
-    code = await cmdDispatch(cfg, { values, positionals }, { onLaunch: (l) => launches.push(l) });
+    // supervisedOnly: a worker's runs must be followable and judgeable, so
+    // neither `--bg` nor a standing dispatch.claudeLaunchMode may route them
+    // native-background (see cmdDispatch's launch-mode opt-in).
+    code = await cmdDispatch(cfg, { values, positionals }, { onLaunch: (l) => launches.push(l), supervisedOnly: true });
   } catch (e) {
     // A throw AFTER the launch (the post-launch session capture and bind are
     // network calls) still means an agent is running and holding a lease —
@@ -9677,8 +9717,10 @@ async function loadFactoryDefinition(cfg, id) {
       // mistake this precheck exists to catch before a worker claims work on it.
       const profile = parse(pn.raw, `${gate.profile}.md`);
       // Mirrors resolveDispatchProfile's own default (dispatch --profile path):
-      // an unset harness runs claude --bg, so the gap is silent (and fatal to
-      // an agent-review gate) unless a profile explicitly names a supervised one.
+      // an unset harness runs claude-code. Since task-spor-claude-adapter-
+      // headless-supervised that is a supervised launch too, so no BUILT-IN
+      // trips this today; it stays as the guard for any adapter whose default
+      // launch mode is native-background.
       const harness = (typeof profile.harness === "string" && profile.harness) || "claude-code";
       const resolved = dispatchHarnesses.resolveHarness(harness, { cfg });
       if (resolved.adapter && resolved.adapter.launchMode === "native-background") {
@@ -13630,6 +13672,7 @@ const COMMANDS = {
       backfill: { type: "boolean", desc: "init + enable + launch /spor:backfill (the primitive behind /spor:onboard)" },
       worktree: { type: "boolean", desc: "run the agent in its own git worktree (overrides dispatch.worktree)" },
       "no-worktree": { type: "boolean", desc: "force-disable worktree isolation for this dispatch" },
+      bg: { type: "boolean", desc: "Claude Code only: launch native-background (claude --bg, attachable with 'claude attach') instead of the supervised headless run — unenforced outcome, no report channel; also dispatch.claudeLaunchMode" },
       print: { type: "boolean", desc: "dry run — print the prompt, launch nothing" },
       "dry-run": DRYRUN_OPT,
     },

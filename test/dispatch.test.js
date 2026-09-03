@@ -34,6 +34,15 @@ function bare(extra = {}) {
   env.SPOR_HOME = ISO_HOME;
   env.XDG_CONFIG_HOME = ISO_HOME;
   env.SPOR_FAKE_AGENTS_JSON = "[]";
+  // These tests pin the LAUNCHER — cwd, worktree, $PWD, argv, claim ordering,
+  // session capture through `claude agents --json` — against the native
+  // `claude --bg` launch they were written for, now the explicit opt-in
+  // (`--bg` / dispatch.claudeLaunchMode, task-spor-claude-adapter-headless-
+  // supervised). The supervised default (`claude -p --output-format
+  // stream-json` under the shared supervisor) is covered in
+  // test/claude-supervised-dispatch.test.js; every guard exercised here runs
+  // before the launch branch forks, so it is shared by both.
+  env.SPOR_DISPATCH_CLAUDE_LAUNCH_MODE = "native-background";
   return Object.assign(env, extra);
 }
 function run(args, env, cwd) {
@@ -1732,6 +1741,9 @@ function remoteEnv(home, server, extra = {}) {
   // agent-identity.test.js) — so default the hard-fail's escape hatch on to keep
   // those guards reachable; `extra` can still override it.
   env.SPOR_ALLOW_PERSON_TOKEN = "1";
+  // Same native-launch pin as bare(): these exercise the launcher's guard and
+  // claim ordering against `claude --bg` (see the note there).
+  env.SPOR_DISPATCH_CLAUDE_LAUNCH_MODE = "native-background";
   return Object.assign(env, extra);
 }
 
