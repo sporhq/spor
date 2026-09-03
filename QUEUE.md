@@ -617,8 +617,13 @@ schemas already self-surface in the queue, so no duplicate findings are
 filed for them. Trigger: `POST /v1/gardener` on demand (the `spor admin
 gardener` CLI verb is the shell front-door), or
 `SPOR_GARDENER_MS` (a server-side env var) for
-an in-process interval (off by default — the schedule is ops' choice). Deferred: "done but contradicted" (needs
-git-history analysis of resolving artifacts).
+an in-process interval. Self-host/local: off by default — the schedule is
+ops' choice. Hosted tenants (`SPOR_HOSTED`): on by default at 6h, and the
+control plane bakes the same `SPOR_GARDENER_MS` onto every tenant it
+provisions (`SPOR_CP_GARDENER_MS`; explicit `0` disables) — a suspended
+tenant's timer fires on resume, so the cadence is per hour of awake time
+(issue-spor-hosting-tenant-gardener-silent). Deferred: "done but
+contradicted" (needs git-history analysis of resolving artifacts).
 
 Findings route to stewards the same way questions do
 (task-cc-findings-steward-routing): at filing time the finding's edge
