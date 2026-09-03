@@ -767,34 +767,86 @@ satisfies the profile picks it up.
 
 ### 10.4 Agent-review gates — a verdict that is read, not asserted
 
-The runner composes the review dispatch itself: a free-text launch under the
-gate's declared `profile` (cross-model by convention; the machine's own declared
+The runner composes the review dispatch itself: a launch under the gate's
+declared `profile` (cross-model by convention; the machine's own declared
 harness binding still decides what actually executes — a graph write never
-defines what a box runs), with a fixed prompt that ends:
+defines what a box runs), **read-only** (`spor dispatch --read-only`: Codex's
+`--sandbox read-only`, Claude Code's plan permission mode — the reviewer reads
+the implementer's live checkout, so it must not be able to write to it, and the
+posture overrides any write-capable `--sandbox`/`--permission-mode` the worker's
+passthrough carries), with a prompt that carries everything the reviewer needs
+rather than sending it to read a growing `base..head` diff on its own: the work
+item's text, the diff itself (bounded; the git command for the rest), the gate's
+`instructions`, and — on a fix cycle — the **prior findings** and the fix that
+was dispatched at them (its run, its commits and their stat). It ends with the
+verdict shape:
 
 ```json
-{"verdict": "pass" | "changes_requested", "findings": [{"severity": "...", "file": "...", "summary": "..."}]}
+{"verdict": "pass" | "changes_requested",
+ "prior": [{"id": "F1", "status": "resolved" | "open", "note": "..."}],
+ "findings": [{"severity": "blocking|major|minor", "file": "...", "summary": "...",
+               "evidence": "the command/test run and what it showed", "introduced_by_fix": true | false}]}
 ```
 
-The runner then parses that block **in code** from the run's final report.
-Fail-closed throughout: a review that could not be dispatched, that never
-finished, that left no report to read (an agent-review gate must therefore route
-to a SUPERVISED harness — a native-background launch has no report channel), or
-whose verdict is unparseable or unrecognized is a gate FAILURE. An unread review
-is not an approval. Nor is a review of nothing: a branch that carries **no
-committed change against the trusted ref** (the implementer landed its work on
-the trusted ref directly, or resolved with nothing behind it) fails the gate
-closed and unretried, straight to a person — no reviewer is dispatched at an
-empty diff, because a vacuous pass is exactly how an unreviewed change would
-launder into an approval.
+The runner then parses that block **in code** from the run's final report
+(`parseReviewVerdict`, lib/kernel/gates.js). Fail-closed throughout: a review
+that could not be dispatched, that never finished, that left no report to read
+(an agent-review gate must therefore route to a SUPERVISED harness — a
+native-background launch has no report channel), or whose verdict is
+unparseable or unrecognized is a gate FAILURE. An unread review is not an
+approval. Nor is a review of nothing: a branch that carries **no committed
+change against the trusted ref** (the implementer landed its work on the
+trusted ref directly, or resolved with nothing behind it) fails the gate closed
+and unretried, straight to a person — no reviewer is dispatched at an empty
+diff, because a vacuous pass is exactly how an unreviewed change would launder
+into an approval.
+
+**The gate is stateful and bounded** (task-spor-review-gate-stateful-bounded).
+The first live runs showed a memoryless reviewer raising a NEW blocking finding
+on every cycle — four different ones by the escalation, none of them what the
+fixer had been sent to fix — so the protocol the parser enforces is:
+
+- **Only `blocking` blocks.** Every other severity (`major`, `minor`,
+  `critical`, anything) is advisory: recorded on the fact, handed to the fixer
+  as a note, never a reason to fail the gate. A `changes_requested` that rates
+  nothing blocking is a pass with notes; a `pass` that reports a blocking
+  finding is `changes_requested` (the findings win over the word, both ways).
+- **A blocking finding must be demonstrated.** It carries `evidence` naming
+  the command or test the reviewer ran and what it showed; one without it is
+  downgraded to advisory (the record says why). On a fix cycle a NEW blocking
+  finding must also be one the fix **introduced** (`introduced_by_fix: true`)
+  — a defect available at the initial review and not raised then does not move
+  the goalposts now; it is recorded for a person to weigh.
+- **Every prior finding is answered first.** The runner keeps a **finding
+  ledger** per gate — ids `F1, F2, …` minted in the order findings were first
+  raised, never reused — and hands review N its open blocking entries as
+  `prior`. The verdict must clear or confirm each one; a verdict that ignores
+  any prior finding is **unreadable and counts as `changes_requested` for the
+  prior set only**: the fixer is sent back at the still-open prior findings and
+  nothing the memoryless verdict raised is admitted. (Replaying the four real
+  reports of that first run through this protocol keeps every fix cycle and the
+  escalation on the initial two findings; the fourth cycle's new findings never
+  reach the record.)
 
 On `changes_requested` with cycles left, the runner dispatches an implementer
-**fix cycle** — the findings and the evidence, at the same node, in the same
-tree — waits for it to reach a terminal state, re-reads the diff, and re-runs
-the gate. This is the one place the worker passes `--force`: the node reads
-resolved because the run resolved it, and the runner knows why it is going back.
-The declared `cycles` cap bounds it; at the cap the gate **escalates** by filing
-a `requires: [human]` queue item carrying the cycle history, and stops.
+**fix cycle** — the blocking findings by id, the advisory notes, what earlier
+cycles already resolved (do not regress), at the same node, in the same tree —
+waits for it to reach a terminal state, re-reads the diff, and re-runs the gate
+with the ledger and that fix in hand. This is the one place the worker passes
+`--force`: the node reads resolved because the run resolved it, and the runner
+knows why it is going back. The declared `cycles` cap bounds it and counts
+**fix dispatches**: `cycles: 3` is the initial review plus exactly three fix
+cycles (four reviews), and the record says so — "4 attempts: the initial one
+plus 3 fix cycles, cap 3", never "4 attempts, cap 3". At the cap the gate
+**escalates** by filing a `requires: [human]` queue item carrying the cycle
+history and the ledger, and stops. The `art-gate-*` fact carries the ledger too
+(`Finding ledger:` — what was raised when, what cleared it, what still stands),
+so the rescue lane and `/spor:factory`'s telemetry read convergence per gate
+without re-reading every report. The kernel default is still `cycles: 0` (a
+factory opts into re-dispatching an implementer); a factory that routes to a
+review gate should declare at least one, since with the floor above the only
+thing that reaches a person is a demonstrated blocking finding the implementer
+never got to fix.
 
 ### 10.5 Human gates — approval keyed on declared risk
 

@@ -157,6 +157,36 @@ test("Codex profile dry-run uses adapter argv and model precedence", () => {
   assert.doesNotMatch(override.stdout, /--model profile-model/);
 });
 
+// task-spor-review-gate-stateful-bounded: a review gate's dispatch runs
+// READ-ONLY in the implementer's live checkout. `--read-only` is the harness-
+// neutral spelling; the adapter supplies the posture, and it overrides a
+// write-capable --sandbox/--permission-mode a worker's passthrough may carry.
+test("--read-only dispatches Codex under --sandbox read-only, overriding a passthrough sandbox or bypass", () => {
+  const { home, repo } = fixture();
+  const common = ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--print", "--read-only"];
+  const plain = run(common, { SPOR_HOME: home });
+  assert.strictEqual(plain.status, 0, plain.stderr);
+  assert.match(plain.stdout, /codex --ask-for-approval never exec --json --sandbox read-only/);
+  assert.doesNotMatch(plain.stderr, /warning: --read-only/);
+
+  const overridden = run([...common, "--sandbox", "danger-full-access"], { SPOR_HOME: home });
+  assert.strictEqual(overridden.status, 0, overridden.stderr);
+  assert.match(overridden.stdout, /--sandbox read-only/);
+  assert.match(overridden.stderr, /warning: --read-only overrides --sandbox danger-full-access/);
+
+  // A passthrough bypassPermissions would translate to danger-full-access;
+  // the explicit read-only posture wins, without the translation warning.
+  const bypass = run([...common, "--permission-mode", "bypassPermissions"], { SPOR_HOME: home });
+  assert.strictEqual(bypass.status, 0, bypass.stderr);
+  assert.match(bypass.stdout, /--sandbox read-only/);
+  assert.doesNotMatch(bypass.stdout, /danger-full-access/);
+
+  for (const adapter of harnesses()) {
+    if (adapter.id === "codex") assert.deepStrictEqual(adapter.readOnly, { sandbox: "read-only" });
+    if (adapter.id === "claude-code") assert.deepStrictEqual(adapter.readOnly, { permissionMode: "plan" });
+  }
+});
+
 test("Codex adapter launches detached, captures JSONL session, prompt, cwd, and report", async () => {
   const { home, repo } = fixture();
   const outfile = path.join(home, "codex-invocation.json");

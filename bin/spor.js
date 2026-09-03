@@ -8380,8 +8380,9 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   const fromQueue = !!values["from-queue"];
   const dirOpt = values.dir || null;
   const model = values.model || null;
-  const permMode = values["permission-mode"] || null;
-  const sandbox = values.sandbox || null;
+  let permMode = values["permission-mode"] || null;
+  let sandbox = values.sandbox || null;
+  const readOnly = !!values["read-only"];
   const approvalPolicy = values["approval-policy"] || null;
   const agent = values.agent || null; // claude --agent (harness agent DEFINITION)
   const asAgent = values.as || null; // Spor agent IDENTITY override for dispatch.agent
@@ -8784,6 +8785,34 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   // through the cascade before falling back to the bare name. With neither set
   // this is the same string it always returned.
   const harnessBin = harnessAdapter ? harnessAdapter.command(process.env, cfg) : null;
+  // --read-only (task-spor-review-gate-stateful-bounded): the posture a gate's
+  // REVIEW dispatch runs under — it reads the implementer's live checkout, so
+  // it must not be able to write to it. Expressed per harness by the adapter
+  // (Codex's --sandbox read-only, Claude Code's plan permission mode); it
+  // OVERRIDES an explicit --sandbox/--permission-mode from the caller (a
+  // worker's passthrough may carry a write-capable posture for its
+  // implementers — that must not leak into its reviewers), with a warning so
+  // the override is visible. A harness with no read-only posture warns rather
+  // than refuses: the prompt still forbids writing, and refusing would leave
+  // every review gate on that harness unrunnable.
+  if (readOnly && harnessAdapter) {
+    const ro = harnessAdapter.readOnly || null;
+    if (!ro) {
+      err(`warning: --read-only has no ${harnessAdapter.label} posture; the run is asked not to write but is not sandboxed.`);
+    } else {
+      if (ro.sandbox) {
+        if (sandbox && sandbox !== ro.sandbox) err(`warning: --read-only overrides --sandbox ${sandbox} with --sandbox ${ro.sandbox}.`);
+        sandbox = ro.sandbox;
+        // A translated bypassPermissions would re-open the sandbox; the
+        // explicit read-only posture wins over a passthrough bypass.
+        if (permMode === "bypassPermissions") permMode = null;
+      }
+      if (ro.permissionMode) {
+        if (permMode && permMode !== ro.permissionMode) err(`warning: --read-only overrides --permission-mode ${permMode} with --permission-mode ${ro.permissionMode}.`);
+        permMode = ro.permissionMode;
+      }
+    }
+  }
   // Validate BEFORE building any argv (preview or real) — a translated option
   // (today: Codex + --permission-mode bypassPermissions) changes what argv
   // buildArgs should see, so effectiveSandbox/effectiveApprovalPolicy below
@@ -10057,6 +10086,56 @@ async function gatePromoteItem(cfg, id) {
   return { ok: true, restored: true, note: `${id} restored ${GATE_DEMOTED_STATUS} -> ${target}` };
 }
 
+// What the review prompt carries of the change itself: the diff, embedded and
+// bounded (a reviewer that reads an unbounded, growing diff in the
+// implementer's live checkout is the memoryless posture this gate moved away
+// from). Past the cap the prompt still names the git command for the rest.
+const GATE_DIFF_CAP_BYTES = 48 * 1024;
+function gateDiffText(change) {
+  const r = git(change.cwd, ["diff", "--no-color", "--no-ext-diff", `${change.base}..${change.head}`], { maxBuffer: 64 * 1024 * 1024 });
+  if (r.status !== 0) {
+    return { text: `(the diff could not be read: ${(r.stderr || "").trim().split("\n")[0] || "git diff failed"})`, truncated: false };
+  }
+  const text = String(r.stdout || "");
+  if (Buffer.byteLength(text, "utf8") <= GATE_DIFF_CAP_BYTES) return { text, truncated: false };
+  return { text: gateRunner.capBytes(text, GATE_DIFF_CAP_BYTES), truncated: true };
+}
+
+// What the last fix cycle did, for the next review: the fixer's commits (the
+// message is where it names the finding ids it addressed) and their stat — so
+// the reviewer answers "was F2 fixed" against what changed, not from scratch.
+// Falls back to naming the run when the heads are not known.
+function gateFixText(change, fix) {
+  const lines = [];
+  const ids = (fix.findings || []).filter((f) => f.blocking !== false && f.id).map((f) => f.id);
+  if (fix.runId) lines.push(`Fix cycle ${(fix.cycle || 0) + 1} was dispatched as run ${fix.runId}${ids.length ? ` to address ${ids.join(", ")}` : ""}.`);
+  if (fix.fromHead && fix.toHead && fix.fromHead !== fix.toHead) {
+    const log = git(change.cwd, ["log", "--no-color", "--format=%h %s%n%b", "--stat", `${fix.fromHead}..${fix.toHead}`], { maxBuffer: 8 * 1024 * 1024 });
+    if (log.status === 0 && String(log.stdout || "").trim()) {
+      lines.push("", `Commits ${fix.fromHead.slice(0, 8)}..${fix.toHead.slice(0, 8)}:`, "", "```", gateRunner.fenceSafe(gateRunner.capBytes(String(log.stdout).trim(), 6000)), "```");
+    }
+  } else if (fix.fromHead && fix.toHead) {
+    lines.push("The fix cycle added NO commits — the tree is exactly what the previous review judged.");
+  }
+  return lines.join("\n");
+}
+
+// The work item as the reviewer should see it: id, title, summary and the
+// body (bounded) — what was asked, so "does it do what was asked" has a
+// referent.
+function gateWorkItemText(node) {
+  const raw = String(node.raw || "");
+  let body = "";
+  if (raw.startsWith("---\n")) {
+    const end = raw.indexOf("\n---", 4);
+    if (end !== -1) body = raw.slice(end + 4).trim();
+  }
+  const parts = [node.title ? `${node.id}: ${node.title}` : node.id];
+  if (node.summary) parts.push("", node.summary);
+  if (body) parts.push("", gateRunner.capBytes(body, 4000));
+  return parts.join("\n");
+}
+
 // The deps one gate pipeline runs on: git plumbing against THIS run's tree,
 // dispatches through the real `spor dispatch`, and graph writes through the
 // validated node door. `dispatch` and `home` are overridable ONLY so a test
@@ -10074,25 +10153,102 @@ function makeGateDeps(
   const short = gateRunner.shortRunAttempt(entry.run_id, entry.attempt);
   const runKey = gateRunner.gateRunKey(entry.run_id, entry.attempt);
   let change = null;
+  // The work item's own text, read once for the review prompt: a reviewer
+  // judging "does this do what was asked" has to be told what was asked.
+  let itemText = null;
+  const workItemText = async () => {
+    if (itemText !== null) return itemText;
+    try {
+      const node = await resolveNode(cfg, entry.node_id);
+      itemText = node ? gateWorkItemText(node) : "";
+    } catch {
+      itemText = "";
+    }
+    return itemText;
+  };
 
-  const review = async ({ gate, cycle }) => {
+  // The review prompt (task-spor-review-gate-stateful-bounded). Everything the
+  // reviewer needs is IN the prompt — the work item, the diff itself, the
+  // prior findings with the ids the ledger gave them, the fix the last cycle
+  // made — so review N does not restart from nothing in the implementer's
+  // checkout and raise a fourth new finding where three were already open.
+  // The verdict protocol it is asked to follow is the one
+  // gates.parseReviewVerdict enforces; the prose here only explains it.
+  const review = async ({ gate, cycle, prior = [], fix = null }) => {
     if (!change) return { ok: false, reason: "the change under review could not be read" };
+    const cap = gatesKernel.cycleCap(gate);
+    const item = await workItemText();
+    const diff = gateDiffText(change);
+    const fixText = fix ? gateFixText(change, fix) : "";
+    const priorText = prior
+      .map((p) => `${p.id} [${p.severity}] ${p.file ? `${p.file} — ` : ""}${p.summary}${p.evidence ? `\n    evidence: ${String(p.evidence).replace(/\s+/g, " ").slice(0, 400)}` : ""}`)
+      .join("\n");
+    const verdictShape =
+      `{"verdict": "pass" | "changes_requested",` +
+      (prior.length ? ` "prior": [{"id": "${prior[0].id}", "status": "resolved" | "open", "note": "what you checked"}],` : "") +
+      ` "findings": [{"severity": "blocking|major|minor", "file": "path", "summary": "what is wrong", "evidence": "the command/test you ran and what it showed"` +
+      (cycle > 0 ? `, "introduced_by_fix": true | false` : "") +
+      `}]}`;
     const prompt = [
-      `You are the '${gate.id}' review gate for Spor work item ${entry.node_id}.`,
-      `Review the change \`git diff ${change.base}..${change.head}\` in ${change.cwd} — that diff, nothing else.`,
+      `You are the '${gate.id}' review gate for Spor work item ${entry.node_id}` +
+        (cycle === 0 ? " (the initial review)." : ` (the review after fix cycle ${cycle} of ${cap}).`),
+      "You are running READ-ONLY. Do NOT edit any file, do NOT commit, and do NOT resolve, close, or write any Spor node:",
+      "you are a gate, not an implementer. Run commands and tests freely to check your claims.",
+      "",
+      "## The work item",
+      "",
+      item || `(the node ${entry.node_id} could not be read — judge the change against its commit messages)`,
+      "",
+      "## The change",
+      "",
+      `\`git diff ${change.base}..${change.head}\` in ${change.cwd} (${Array.isArray(change.paths) ? change.paths.length : "?"} file(s)):`,
+      "",
+      "```diff",
+      gateRunner.fenceSafe(diff.text),
+      "```",
+      diff.truncated ? `(diff truncated at ${Math.round(GATE_DIFF_CAP_BYTES / 1024)}KB — run the git command above for the rest)` : "",
+      "",
+      ...(prior.length
+        ? [
+            "## Prior findings — answer these FIRST",
+            "",
+            "Earlier cycles of this gate raised the following BLOCKING findings, which the implementer was sent to fix.",
+            "For EACH one, check the current tree and say whether the fix resolved it (`prior` in the verdict):",
+            "",
+            priorText,
+            "",
+            ...(fixText ? ["## What the last fix cycle changed", "", fixText, ""] : []),
+            "A verdict that omits any prior finding (neither cleared nor confirmed) is UNREADABLE and counts as",
+            "changes_requested for the prior set only — nothing new you raise is admitted in that case.",
+            "",
+          ]
+        : []),
+      "## What to look for",
+      "",
       gate.instructions || "Look for correctness defects: does this change do what the work item asked, and does it break anything?",
       "",
-      "Do NOT edit any file, and do NOT resolve, close, or write any Spor node: you are a gate, not an implementer.",
+      "## Severity — only `blocking` blocks",
+      "",
+      "- `blocking`: a correctness defect, silent data loss, or contract break that MUST be fixed before this lands —",
+      "  and that you DEMONSTRATED: `evidence` names the command or test you ran and what it showed. A blocking",
+      "  finding without evidence is recorded as advisory, not enforced.",
+      ...(cycle > 0
+        ? [
+            "- On a fix cycle, a NEW blocking finding must be one the fix INTRODUCED (`introduced_by_fix: true`). A defect",
+            "  that was there at the initial review and was not raised then is advisory now — record it, do not block on it.",
+          ]
+        : []),
+      "- `major` / `minor`: worth noting, never a reason to fail the gate. Style, naming and formatting are minor.",
       "",
       "End your final message with your verdict as a fenced json block, exactly this shape:",
       "```json",
-      '{"verdict": "pass" | "changes_requested", "findings": [{"severity": "blocking|major|minor", "file": "path", "summary": "what is wrong"}]}',
+      verdictShape,
       "```",
-      'Use "pass" only when nothing blocking remains. An unreadable verdict counts as changes_requested.',
+      `Use "pass" only when nothing blocking remains${prior.length ? " — including every prior finding you confirmed" : ""}. An unreadable verdict counts as changes_requested.`,
     ].join("\n");
     const launched = await dispatch(
       cfg,
-      { ...passthrough, profile: gate.profile, dir: change.cwd, "no-brief": true, "no-worktree": true, name: `gate-${gate.id}-${short}-${cycle}` },
+      { ...passthrough, profile: gate.profile, dir: change.cwd, "no-brief": true, "no-worktree": true, "read-only": true, name: `gate-${gate.id}-${short}-${cycle}` },
       [prompt]
     );
     if (!launched.ok) return { ok: false, reason: `the review under ${gate.profile} could not be dispatched: ${launched.reason}` };
@@ -10110,22 +10266,33 @@ function makeGateDeps(
     return { ok: true, text, runId: launched.run.run_id };
   };
 
-  const fix = async ({ gate, cycle, findings, detail, evidence }) => {
+  const fix = async ({ gate, cycle, findings, detail, evidence, ledger }) => {
     // The one place the worker deliberately passes --force. The loop never
     // does (a loop that forces past the resolved/duplicate guards is the
     // runaway a pull worker must not be), but here the runner KNOWS why the
     // node reads resolved — its own gate just refused that resolution — and the
     // cycle cap bounds how often this can happen before a person is asked.
+    //
+    // A review gate's findings arrive classified (blocking / advisory) and
+    // named by ledger id; the fixer is told to name the ids it addressed so
+    // the next review can answer "was F2 fixed" against its commits.
+    const blocking = (findings || []).filter((f) => f.blocking !== false);
+    const advisory = (findings || []).filter((f) => f.blocking === false);
+    const resolved = (ledger || []).filter((e) => e.status === "resolved");
     const prompt = [
-      `The '${gate.id}' gate refused your resolution of ${entry.node_id}.`,
+      `The '${gate.id}' gate refused your resolution of ${entry.node_id}${cycle > 0 ? ` (fix cycle ${cycle + 1} of ${gatesKernel.cycleCap(gate)})` : ""}.`,
       "",
       detail || "",
       "",
-      findings && findings.length ? `Findings:\n${gatesKernel.renderFindings(findings)}` : "",
-      evidence ? `Evidence:\n${String(evidence).slice(0, 4000)}` : "",
+      blocking.length ? `${blocking.some((f) => f.id) ? "Blocking findings — fix each, by id" : "Findings"}:\n${gatesKernel.renderFindings(blocking)}` : "",
+      advisory.length ? `Advisory (recorded, not enforced — fix if cheap):\n${gatesKernel.renderFindings(advisory)}` : "",
+      resolved.length ? `Already resolved by earlier cycles (do not regress):\n${gatesKernel.renderFindings(resolved)}` : "",
+      evidence && !blocking.length ? `Evidence:\n${String(evidence).slice(0, 4000)}` : "",
       "",
-      "Fix the cause in the same worktree and commit. The gate will re-run against the trusted ref's copy of the",
-      "acceptance suite, so do not edit protected test paths — a change that touches them fails the gate closed.",
+      `Fix the cause in the same worktree and commit${blocking.some((f) => f.id) ? ", naming the finding ids you addressed in the commit message —" : "."}`,
+      ...(blocking.some((f) => f.id) ? ["the next review is handed your commits and asked whether each prior finding is resolved."] : []),
+      "The gate will re-run against the trusted ref's copy of the acceptance suite, so do not edit protected test",
+      "paths — a change that touches them fails the gate closed.",
     ]
       .filter((l) => l !== "")
       .join("\n");
@@ -10295,12 +10462,16 @@ function makeGateDeps(
     },
     checkApproval: ({ id }) => gateApprovalState(cfg, id),
     demote: ({ blockerId }) => gateDemoteItem(cfg, entry.node_id, { blockerId }),
-    escalate: async ({ gate, attempts, detail, evidence, findings }) => {
+    escalate: async ({ gate, attempts, detail, evidence, findings, ledger }) => {
       const id = `task-gate-${gate.id.slice(0, 24)}-${stem}-${short}-${gateIdSuffix("escalate", gate.id, entry.node_id, runKey)}`.toLowerCase();
       const cycles = attempts.length;
+      // Counted in FIX CYCLES against the cap, not in attempts: `attempts` has
+      // one entry per review, so "4 attempts, cap 3" read as an off-by-one
+      // when it was the initial review plus the three fix cycles declared.
+      const spent = gatesKernel.describeCycles(gate, attempts);
       const body = [
         `The \`${gate.kind}\` gate \`${gate.id}\` refused ${entry.node_id} and its fix cycles are spent`,
-        `(${cycles} attempt${cycles === 1 ? "" : "s"}, cap ${gate.cycles}). A person decides what happens next —`,
+        `(${spent.text}). A person decides what happens next —`,
         "the worker has stopped re-dispatching it.",
         "",
         `This item \`blocks\` ${entry.node_id} on the graph, and if that item had already been flipped to a`,
@@ -10310,8 +10481,11 @@ function makeGateDeps(
         detail ? `Last outcome: ${detail}` : "",
         "",
         ...(findings && findings.length ? ["Findings:", "", gatesKernel.renderFindings(findings), ""] : []),
+        ...(ledger && ledger.length ? ["Finding ledger:", "", gatesKernel.renderLedger(ledger), ""] : []),
         ...(evidence ? ["Evidence:", "", "```", fenceSafe(String(evidence).slice(0, 3000)), "```", ""] : []),
-        ...(cycles > 1 ? ["Cycles:", ...attempts.map((a, i) => `${i + 1}. ${a.verdict} — ${String(a.detail || "").slice(0, 200)}`), ""] : []),
+        ...(cycles > 1
+          ? [`Cycles (${spent.text}):`, ...attempts.map((a, i) => `${i + 1}. ${i === 0 ? "initial review" : `after fix cycle ${i}`}: ${a.verdict} — ${String(a.detail || "").slice(0, 200)}`), ""]
+          : []),
         `The run's own record is \`${entry.run_id}\` ('spor runs ${entry.run_id}').`,
       ]
         .filter((l) => l !== "")
@@ -10322,7 +10496,7 @@ function makeGateDeps(
         buildGateWorkNode({
           id,
           title: `Gate escalation — ${gate.id} refused ${entry.node_id}`,
-          summary: `The ${gate.id} ${gate.kind} gate refused ${entry.node_id} after ${cycles} cycle(s); it needs a person${detail ? `: ${String(detail).slice(0, 200)}` : "."}`,
+          summary: `The ${gate.id} ${gate.kind} gate refused ${entry.node_id} after ${spent.fixes} fix cycle(s); it needs a person${detail ? `: ${String(detail).slice(0, 200)}` : "."}`,
           body,
           project: slug,
           date: date(),
@@ -13617,6 +13791,7 @@ const COMMANDS = {
       "permission-mode": { type: "string", value: "P", desc: "claude --permission-mode" },
       sandbox: { type: "string", value: "S", desc: "codex exec --sandbox (default: workspace-write)" },
       "approval-policy": { type: "string", value: "P", desc: "codex exec --ask-for-approval (default: never)" },
+      "read-only": { type: "boolean", desc: "run under the harness's read-only posture (codex --sandbox read-only, claude --permission-mode plan); overrides --sandbox/--permission-mode" },
       agent: { type: "string", value: "A", desc: "claude --agent (harness agent DEFINITION — NOT the Spor identity; see --as)" },
       profile: { type: "string", value: "profile-id", desc: "profile to run under; checked against this machine's capabilities (overrides the assigned/default profile)" },
       name: { type: "string", value: "N", desc: "dispatch run name (passed to Claude; tracked locally for Codex)" },

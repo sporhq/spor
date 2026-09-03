@@ -1,0 +1,11 @@
+Found two blocking concurrency defects.
+
+- **Blocking — revocation affects the replacement before the conflict is detected.** The REST handler runs the cascade at [server/rest-fastify.ts:4026], then performs CAS at [server/rest-fastify.ts:4037]. Because revocation matches only `connection_id`, a PUT that replaces the connection before the cascade can have its newly minted PATs/OAuth grants revoked even though DELETE returns 409 and preserves the replacement. The CLI has the same ordering at [server/spor-admin.js:285]. I reproduced this: the replacement survived with `replaced:true`, while its connection-stamped PAT was deleted. The added test inserts the replacement before the real cascade but creates no replacement credential, so it misses the destructive behavior.
+
+- **Blocking — REST authorization and CAS use different snapshots and remain ABA-vulnerable.** At [server/rest-fastify.ts:3994], `authorizedRaw` is read, but the org-scope check uses a second independent `getConnection` read. The final deep-equality CAS compares against the first snapshot. An out-of-scope record can therefore be temporarily replaced with an in-scope value for authorization, restored byte-identically, and then deleted; deep equality cannot detect this ABA cycle. Authorization must use the exact CAS snapshot, backed by a monotonic revision/generation if delete-and-recreate must also be distinguished.
+
+`npm run build` passed, and the isolated store CAS test passed. The complete admin suite could not run in this sandbox because its scratch-home setup received `spawnSync git EPERM`.
+
+```json
+{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"server/rest-fastify.ts","summary":"The revocation cascade runs before compare-and-delete and matches only connection_id, so a stale DELETE can revoke credentials belonging to a concurrent replacement before returning 409; the CLI has the same defect."},{"severity":"blocking","file":"server/rest-fastify.ts","summary":"The handler authorizes against a second connection read while CAS compares the first raw read, and value equality has no generation, allowing an ABA update sequence to delete a record that never passed the caller's org-scope check."}]}
+```

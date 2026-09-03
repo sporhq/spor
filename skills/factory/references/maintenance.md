@@ -86,6 +86,13 @@ last, so a gate-passed item that never landed failed *after* every gate:
 - **exhausted its `cycles`** — demoted exactly like a failed gate: an
   escalation was filed, it `blocks` the work item, and the item's completion
   status was rolled back. Find it with the same rolled-back-item query above.
+- **a review gate that would not converge** — read the `Finding ledger:` on
+  its `art-gate-*` fact before touching anything: it says what was raised at
+  which cycle, what the fix cycles cleared, and what still stands. Prior
+  findings still `OPEN` after every cycle are an implementer problem (raise
+  `cycles`, or sharpen the item); a ledger full of `advisory` entries the
+  reviewer rated blocking without `evidence` is a reviewer that reads code
+  instead of running it — sharpen `instructions` to demand the reproduction.
 
 ## "The reviews are too strict"
 

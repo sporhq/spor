@@ -1,0 +1,11 @@
+Changes requested.
+
+1. **Blocking — env-indirected secrets are persisted during cascading DELETE, and force DELETE falsely conflicts.** The guard calls the mutating `resolveEnvIndirection(existingRaw)` on the store-owned raw record ([rest-fastify.ts:4044]). Cascading DELETE then saves that mutated record with its claim ([idp-connection-store.js:365]), writing resolved `api_key`, `secret_key`, etc. into `idp-connections.json`. I reproduced this in a scratch home. On `?force=1`, the same mutation makes the fresh-record comparison fail ([idp-connection-store.js:291]), so env-backed connections cannot be force-deleted and return a spurious 409.
+
+2. **Blocking — losing a delete claim does not stop its revocation cascade.** A second DELETE unconditionally overwrites the first claim ([idp-connection-store.js:362]), while the first request proceeds with the cascade without confirming it still owns the claim ([rest-fastify.ts:4091]). If the second DELETE finalizes and the ID is recreated before the first cascade runs, the stale cascade can revoke credentials belonging to the replacement; the final CAS protects only the connection record. The added test actually replaces the record before invoking the real cascade ([admin-idp.test.js:1388]) but asserts only record survival, so it misses this destructive side effect.
+
+The targeted server tests could not run fully because this VM denied their scratch `git init` with `spawnSync git EPERM`; the store-level reproductions ran successfully.
+
+```json
+{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"server/rest-fastify.ts","summary":"The DELETE guard mutates the raw store record via resolveEnvIndirection: cascading delete persists resolved secrets, while force delete falsely reports a replacement conflict for env-backed connections."},{"severity":"blocking","file":"server/stores/idp-connection-store.js","summary":"A later DELETE may overwrite an active claim without stopping the superseded cascade, allowing that stale cascade to revoke credentials belonging to a subsequently recreated connection."}]}
+```

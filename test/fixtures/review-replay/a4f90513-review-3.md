@@ -1,0 +1,15 @@
+Changes requested. Two blocking correctness defects remain.
+
+- **Blocking — post-delete credential minting remains possible.** [server/rest-fastify.ts:4107] claims the connection and revokes persisted grants, but does not fence authorization codes or approved device codes issued before the claim. Those can subsequently be redeemed without rechecking the connection ([oauth.js:1615], [oauth.js:1676]), minting fresh access/refresh credentials after the cascade and configuration deletion have completed.
+
+- **Blocking — the claim operation can silently overwrite a concurrent replacement.** [idp-connection-store.js:393] loads the document before invoking the guard, then saves that stale snapshot without reloading or comparing the record. Because the lock is reentrant—and may be stolen after its stale timeout—a write landing during the guard is overwritten. The REST guard performs unbounded binding and credential scans inside that lock at [rest-fastify.ts:4076], making stale takeover possible. A direct reproduction showed a reentrant `putConnection` being replaced by the old record when the claim was stamped.
+
+- **Major — cooperative abort checkpoints are too coarse.** [identity-adapter.js:1111] checks ownership once per subject, then executes token, grant, and capability revocation without checking between them. If ownership changes during the first call, the stale cascade still performs the other destructive calls. There is also no checkpoint after the final client-grant sweep. A focused reproduction produced `["tokens","grants","caps"]` after ownership was lost during `tokens`.
+
+- **Minor — aborted responses overstate completed work.** [identity-adapter.js:1095] always reports `subjects.length`, so an abort before processing any subject still returns every bound subject as `subjects_revoked`.
+
+`git diff --check` and TypeScript typechecking passed. Server-backed tests could not initialize in this VM because their scratch-home setup hit `spawnSync git EPERM`; the non-server tests completed successfully.
+
+```json
+{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"server/rest-fastify.ts","summary":"Connection deletion does not fence already-issued authorization or approved device codes, which can mint fresh credentials after the cascade and config removal."},{"severity":"blocking","file":"server/stores/idp-connection-store.js","summary":"claimConnectionDelete saves its pre-guard snapshot without a post-guard reload/compare, so a reentrant or stale-lock concurrent replacement can be silently overwritten."},{"severity":"major","file":"server/identity-adapter.js","summary":"The cooperative cascade checks claim ownership only once per subject and not after the final limb, allowing stale destructive revocations after ownership is lost."},{"severity":"minor","file":"server/identity-adapter.js","summary":"An aborted cascade reports the total bound-subject count as subjects_revoked even when those subjects were not processed."}]}
+```

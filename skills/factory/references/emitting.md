@@ -103,9 +103,17 @@ Keys by kind (`lib/kernel/gates.js` is the authority):
   one shared gate can never relax another team's trusted boundary.
 - **agent-review** — `profile` (required), `instructions`, `await_ms` (default
   3600000). Must be a **supervised** harness: the report is the verdict channel.
+  The review runs read-only and is stateful across fix cycles (WORKERS.md
+  §10.4): only a DEMONSTRATED `blocking` finding blocks, review N is handed the
+  prior findings by ledger id and must clear or confirm each before raising
+  anything new, and the `art-gate-*` fact carries the finding ledger. So an
+  agent-review gate should always declare `cycles` — with the default 0 the
+  first demonstrated blocking finding goes straight to a person, unfixed.
 - **human** — `risk` (the factory-declared classes that arm it; empty means
   always), `approval_timeout_ms` (default 24h), `poll_ms`, `instructions`.
-- all three — `cycles` (default 0), `title`, `id` (kebab-case, under 48 chars).
+- all three — `cycles` (default 0; counts FIX dispatches — `cycles: 3` is the
+  initial attempt plus three fix cycles), `title`, `id` (kebab-case, under 48
+  chars).
 
 ## 3. The factory
 

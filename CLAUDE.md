@@ -626,7 +626,15 @@ code — unreadable, undispatchable or report-less is a FAILURE, never a pass (s
 the profile must be a SUPERVISED harness: the report is the verdict channel) —
 then loops implementer fix cycles up to the declared `cycles` cap (the ONE place
 the worker passes `--force`: the node reads resolved because the run resolved
-it) before escalating with a `requires: [human]` queue item. **human** arms on
+it) before escalating with a `requires: [human]` queue item. The review is
+STATEFUL and BOUNDED (task-spor-review-gate-stateful-bounded, WORKERS.md §10.4):
+it runs read-only (`spor dispatch --read-only`, the adapter's posture), its prompt
+carries the work item, the bounded diff, the prior findings by ledger id and the
+last fix's commits; only a DEMONSTRATED `blocking` finding blocks (`evidence`
+required, `introduced_by_fix` on a fix cycle — everything else is advisory), a
+verdict that ignores a prior finding is unreadable and counts as changes_requested
+for the prior set only, and the per-gate finding ledger rides on the `art-gate-*`
+fact. `cycles` counts FIX dispatches (`cycles: 3` = initial review + 3 fixes). **human** arms on
 declared risk classes, files an approval item and BLOCKS the resolve until a
 live RESOLVING EDGE (approved — a bare status flip is not an approval) or any
 other terminal status (refused) answers it, reporting `blocked` at `approval_timeout_ms` rather than deciding for the

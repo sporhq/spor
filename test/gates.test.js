@@ -174,18 +174,20 @@ test("a review verdict is READ from its structured block — and anything unread
   assert.deepStrictEqual([pass.ok, pass.passed], [true, true]);
 
   const changes = gates.parseReviewVerdict(
-    '```json\n{"verdict": "changes_requested", "findings": [{"severity":"blocking","file":"a.js","summary":"off by one"}]}\n```'
+    '```json\n{"verdict": "changes_requested", "findings": [{"severity":"blocking","file":"a.js","summary":"off by one","evidence":"node -e ... prints 4, expected 3"}]}\n```'
   );
   assert.deepStrictEqual([changes.ok, changes.passed, changes.findings.length], [true, false, 1]);
   assert.match(gates.renderFindings(changes.findings), /\[blocking\] a\.js — off by one/);
 
-  // findings with no verdict word: empty passes, non-empty does not.
+  // findings with no verdict word: empty passes; a non-blocking one is a
+  // pass with notes; a demonstrated blocking one is not.
   assert.strictEqual(gates.parseReviewVerdict('```json\n{"findings": []}\n```').passed, true);
-  assert.strictEqual(gates.parseReviewVerdict('```json\n{"findings": [{"summary":"x"}]}\n```').passed, false);
+  assert.strictEqual(gates.parseReviewVerdict('```json\n{"findings": [{"summary":"x"}]}\n```').passed, true);
+  assert.strictEqual(gates.parseReviewVerdict('```json\n{"findings": [{"severity":"blocking","summary":"x","evidence":"npm test fails"}]}\n```').passed, false);
 
   // The LAST block wins — a reviewer that quotes the schema before answering.
   const quoted = gates.parseReviewVerdict(
-    'I will answer as\n```json\n{"verdict": "pass"}\n```\nand my answer is\n```json\n{"verdict": "changes_requested", "findings": [{"summary":"x"}]}\n```'
+    'I will answer as\n```json\n{"verdict": "pass"}\n```\nand my answer is\n```json\n{"verdict": "changes_requested", "findings": [{"severity":"blocking","summary":"x","evidence":"repro"}]}\n```'
   );
   assert.strictEqual(quoted.passed, false);
 
@@ -193,7 +195,7 @@ test("a review verdict is READ from its structured block — and anything unread
   // findings win — taking the word over the evidence is the laundering this
   // parser exists to prevent.
   const contradictory = gates.parseReviewVerdict(
-    '```json\n{"verdict":"pass","findings":[{"severity":"blocking","file":"a.js","summary":"drops records"}]}\n```'
+    '```json\n{"verdict":"pass","findings":[{"severity":"blocking","file":"a.js","summary":"drops records","evidence":"the sync test drops row 3"}]}\n```'
   );
   assert.strictEqual(contradictory.passed, false);
   assert.strictEqual(contradictory.findings.length, 1);
@@ -211,11 +213,130 @@ test("a review verdict is READ from its structured block — and anything unread
   }
 });
 
-test("cycleDecision retries up to the declared cap, then escalates", () => {
+// task-spor-review-gate-stateful-bounded: the severity floor. Only `blocking`
+// blocks, and only when the reviewer demonstrated it — the first live run's
+// reviewer re-opened the gate every cycle on `major` notes and undemonstrated
+// readings of the code, and the fix cycles chased a moving target.
+test("only a DEMONSTRATED `blocking` finding blocks — major/critical are advisory, and blocking-without-evidence is downgraded", () => {
+  const major = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","findings":[{"severity":"major","file":"a.js","summary":"stale checkpoint"},{"severity":"critical","summary":"was blocking under the old floor"}]}\n```');
+  assert.deepStrictEqual([major.ok, major.passed], [true, true], "changes_requested with nothing blocking is a pass with notes");
+  assert.strictEqual(major.verdict, "pass");
+  assert.match(major.note, /rated nothing blocking/);
+  assert.deepStrictEqual(major.findings.map((f) => f.blocking), [false, false]);
+
+  const undemonstrated = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"a.js","summary":"I think this races"}]}\n```');
+  assert.strictEqual(undemonstrated.passed, true, "a blocking finding nobody demonstrated does not block");
+  assert.strictEqual(undemonstrated.findings[0].blocking, false);
+  assert.match(undemonstrated.findings[0].note, /without evidence/);
+  assert.match(gates.renderFindings(undemonstrated.findings), /\[blocking, advisory\] a\.js — I think this races \(rated blocking without evidence/);
+
+  // Demonstrated: `evidence` (or its aliases) names what was run.
+  for (const key of ["evidence", "reproduction", "repro"]) {
+    const v = gates.parseReviewVerdict(`\`\`\`json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","summary":"x","${key}":"node test/a.test.js -> AssertionError"}]}\n\`\`\``);
+    assert.strictEqual(v.passed, false, `${key} demonstrates the finding`);
+    assert.strictEqual(v.findings[0].blocking, true);
+  }
+});
+
+test("on a fix cycle a NEW blocking finding must be one the fix introduced — otherwise it is advisory, never a moved goalpost", () => {
+  const text = (introduced) =>
+    `\`\`\`json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"b.js","summary":"pre-existing race","evidence":"repro script"${introduced === undefined ? "" : `,"introduced_by_fix":${introduced}`}}]}\n\`\`\``;
+  // Cycle 0: no fix yet, so the attribution is not asked for.
+  assert.strictEqual(gates.parseReviewVerdict(text(undefined), { cycle: 0 }).passed, false);
+  // Cycle 1: not attributed to the fix -> advisory.
+  const later = gates.parseReviewVerdict(text(undefined), { cycle: 1 });
+  assert.strictEqual(later.passed, true);
+  assert.match(later.findings[0].note, /not introduced by the fix/);
+  assert.strictEqual(gates.parseReviewVerdict(text(false), { cycle: 1 }).passed, true);
+  // Attributed AND demonstrated -> blocks.
+  assert.strictEqual(gates.parseReviewVerdict(text(true), { cycle: 1 }).passed, false);
+});
+
+test("a verdict must answer every prior finding — one it ignores is unreadable and counts as changes_requested for the prior set only", () => {
+  const prior = [
+    { id: "F1", severity: "blocking", file: "a.js", summary: "cascade runs before the CAS" },
+    { id: "F2", severity: "blocking", file: "a.js", summary: "auth reads a different snapshot" },
+  ];
+  // Memoryless: no `prior` at all, and a brand-new blocking finding.
+  const memoryless = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"c.js","summary":"the lock can expire","evidence":"repro","introduced_by_fix":true}]}\n```',
+    { prior, cycle: 1 }
+  );
+  assert.strictEqual(memoryless.ok, false, "ignoring the prior set is unreadable");
+  assert.strictEqual(memoryless.passed, false);
+  assert.deepStrictEqual(memoryless.unanswered, ["F1", "F2"]);
+  assert.deepStrictEqual(memoryless.findings.map((f) => f.id), ["F1", "F2"], "the fix cycle gets the PRIOR set, not the new finding");
+  assert.match(memoryless.error, /ignored prior findings F1, F2/);
+
+  // Half-answered: F1 cleared, F2 ignored -> still unreadable, and F2 alone stands.
+  const half = gates.parseReviewVerdict('```json\n{"verdict":"pass","prior":[{"id":"F1","status":"resolved","note":"CAS now precedes the cascade"}],"findings":[]}\n```', { prior, cycle: 1 });
+  assert.strictEqual(half.ok, false);
+  assert.deepStrictEqual(half.unanswered, ["F2"]);
+  assert.deepStrictEqual(half.findings.map((f) => f.id), ["F2"]);
+  assert.strictEqual(half.prior.find((p) => p.id === "F1").status, "resolved", "the answered one is still recorded as cleared");
+
+  // Fully answered: F1 cleared, F2 confirmed open -> readable, F2 blocks, and a
+  // demonstrated fix-introduced finding joins it.
+  const answered = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","prior":[{"id":"F1","status":"resolved"},{"id":"F2","status":"open","note":"still two reads"}],"findings":[{"severity":"blocking","file":"c.js","summary":"the fix leaks the lock","evidence":"node repro.js hangs","introduced_by_fix":true},{"severity":"minor","summary":"nit"}]}\n```',
+    { prior, cycle: 1 }
+  );
+  assert.strictEqual(answered.ok, true);
+  assert.strictEqual(answered.passed, false);
+  assert.deepStrictEqual(answered.findings.filter((f) => f.blocking).map((f) => f.id || f.summary), ["F2", "the fix leaks the lock"]);
+  assert.strictEqual(answered.findings.find((f) => f.id === "F2").note, "still two reads");
+
+  // An object-shaped `prior` map is the same answer.
+  const mapped = gates.parseReviewVerdict('```json\n{"verdict":"pass","prior":{"F1":"resolved","F2":"fixed"},"findings":[]}\n```', { prior, cycle: 1 });
+  assert.deepStrictEqual([mapped.ok, mapped.passed], [true, true]);
+
+  // A "pass" that CONFIRMS a prior finding open contradicts itself; the finding wins.
+  const confirmedPass = gates.parseReviewVerdict('```json\n{"verdict":"pass","prior":[{"id":"F1","status":"open"},{"id":"F2","status":"resolved"}]}\n```', { prior, cycle: 1 });
+  assert.deepStrictEqual([confirmedPass.ok, confirmedPass.passed], [true, false]);
+  assert.match(confirmedPass.error, /said 'pass' while a blocking finding stands/);
+});
+
+test("the finding ledger assigns stable ids, folds each verdict, and yields the next review's prior set", () => {
+  let ledger = [];
+  const c0 = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"a.js","summary":"one","evidence":"e1"},{"severity":"major","summary":"note"},{"severity":"blocking","file":"b.js","summary":"two","evidence":"e2"}]}\n```',
+    { prior: gates.openPriorFindings(ledger), cycle: 0 }
+  );
+  ledger = gates.applyReviewToLedger(ledger, c0, 0);
+  assert.deepStrictEqual(ledger.map((e) => [e.id, e.status]), [["F1", "open"], ["F2", "advisory"], ["F3", "open"]]);
+  assert.deepStrictEqual(gates.openPriorFindings(ledger).map((p) => p.id), ["F1", "F3"], "only open BLOCKING entries are carried as prior");
+
+  const c1 = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","prior":[{"id":"F1","status":"resolved"},{"id":"F3","status":"open"}],"findings":[{"severity":"blocking","summary":"regression","evidence":"e4","introduced_by_fix":true}]}\n```',
+    { prior: gates.openPriorFindings(ledger), cycle: 1 }
+  );
+  ledger = gates.applyReviewToLedger(ledger, c1, 1);
+  assert.deepStrictEqual(ledger.map((e) => [e.id, e.status, e.closed]), [["F1", "resolved", 1], ["F2", "advisory", null], ["F3", "open", null], ["F4", "open", null]]);
+  assert.deepStrictEqual(gates.openPriorFindings(ledger).map((p) => p.id), ["F3", "F4"]);
+  // Ids are never reused: a resolved F1 stays F1 on the record.
+  assert.match(gates.renderLedger(ledger), /^F1 \[blocking\] resolved at cycle 1 — a\.js — one/m);
+  assert.match(gates.renderLedger(ledger), /^F3 \[blocking\] OPEN since cycle 0/m);
+  assert.match(gates.renderLedger(ledger), /^F2 \[major\] advisory \(cycle 0\)/m);
+
+  // A memoryless verdict folds only its (empty) answers: nothing new is admitted.
+  const c2 = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","summary":"fresh goalpost","evidence":"x","introduced_by_fix":true}]}\n```', { prior: gates.openPriorFindings(ledger), cycle: 2 });
+  assert.strictEqual(c2.ok, false);
+  ledger = gates.applyReviewToLedger(ledger, c2, 2);
+  assert.strictEqual(ledger.length, 4, "the ignored-prior verdict's new finding is not on the ledger");
+});
+
+test("cycleDecision retries up to the declared cap, then escalates — `cycles: N` is exactly N fix cycles, and the history reads that way", () => {
   assert.strictEqual(gates.cycleDecision({ cycles: 2 }, 0), "retry");
   assert.strictEqual(gates.cycleDecision({ cycles: 2 }, 1), "retry");
   assert.strictEqual(gates.cycleDecision({ cycles: 2 }, 2), "escalate");
   // The default is no fix cycle at all: one failure escalates.
   assert.strictEqual(gates.cycleDecision({ cycles: 0 }, 0), "escalate");
   assert.strictEqual(gates.cycleDecision({}, 0), "escalate");
+  assert.strictEqual(gates.cycleCap({ cycles: "3" }), 3);
+  // Four attempts under cap 3 is not an overrun: it is the initial review plus
+  // three fix cycles, and the escalation says so instead of "4 attempts, cap 3".
+  const spent = gates.describeCycles({ cycles: 3 }, [{}, {}, {}, {}]);
+  assert.deepStrictEqual([spent.reviews, spent.fixes, spent.cap], [4, 3, 3]);
+  assert.strictEqual(spent.text, "4 attempts: the initial one plus 3 fix cycles, cap 3");
+  assert.strictEqual(gates.describeCycles({ cycles: 0 }, [{}]).text, "1 attempt: the initial one plus 0 fix cycles, cap 0");
 });

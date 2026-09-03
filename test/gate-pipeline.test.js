@@ -186,35 +186,141 @@ test("an implementer branch that edits a protected test path fails the gate CLOS
   assert.strictEqual(res.gates[0].escalated_to, "task-test-lane-x");
 });
 
+// A demonstrated blocking finding — the only kind that fails the gate under
+// task-spor-review-gate-stateful-bounded's severity floor.
+const BLOCKING = (summary, extra = "") => `{"severity":"blocking","file":"lib/x.js","summary":"${summary}","evidence":"node -e 'require(\\"./lib/x.js\\")' throws"${extra}}`;
+const changesRequested = `\`\`\`json\n{"verdict":"changes_requested","findings":[${BLOCKING("off by one")}]}\n\`\`\``;
+
 test("an agent-review gate loops fix cycles up to its cap, then escalates by filing a human queue item", async () => {
   const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 2 }] });
-  const changesRequested = '```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"lib/x.js","summary":"off by one"}]}\n```';
-  const { deps, seen } = fakes({ review: () => ({ ok: true, text: changesRequested }) });
+  // A reviewer that CONFIRMS the prior finding still open every cycle.
+  const { deps, seen } = fakes({
+    review: ({ prior }) => ({
+      ok: true,
+      text: prior.length
+        ? `\`\`\`json\n{"verdict":"changes_requested","prior":[${prior.map((p) => `{"id":"${p.id}","status":"open"}`).join(",")}],"findings":[]}\n\`\`\``
+        : changesRequested,
+    }),
+  });
   const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
   assert.strictEqual(res.state, "failed");
   assert.strictEqual(seen.reviews.length, 3, "the first attempt plus two fix cycles");
   assert.deepStrictEqual(seen.reviews.map((r) => r.cycle), [0, 1, 2]);
   assert.strictEqual(seen.fixes.length, 2, "exactly the declared cap");
   assert.deepStrictEqual(seen.fixes[0].findings.map((f) => f.summary), ["off by one"], "the fix cycle is handed the findings");
+  assert.deepStrictEqual(seen.fixes[1].findings.map((f) => f.id), ["F1"], "the second fix cycle is handed the SAME finding by its ledger id");
   assert.strictEqual(seen.escalations.length, 1);
   assert.strictEqual(seen.escalations[0].attempts.length, 3);
+  assert.deepStrictEqual(seen.escalations[0].ledger.map((e) => [e.id, e.status]), [["F1", "open"]], "the escalation carries the ledger");
   assert.strictEqual(seen.facts.length, 1, "one fact per gate, carrying the cycle history");
-  assert.match(seen.facts[0].markdown, /Cycles:/);
+  assert.match(seen.facts[0].markdown, /Cycles \(3 attempts: the initial one plus 2 fix cycles, cap 2\):/);
+  assert.match(seen.facts[0].markdown, /2\. after fix cycle 1: failed/);
+  assert.match(seen.facts[0].markdown, /Finding ledger:\n\nF1 \[blocking\] OPEN since cycle 0 — lib\/x\.js — off by one/);
 });
 
-test("a fix cycle that lands makes the gate pass, and nothing is escalated", async () => {
+// The acceptance line of task-spor-review-gate-stateful-bounded: `cycles: 3`
+// is exactly three fix dispatches. The reviews number four (the initial one
+// plus one after each fix), and the record says so in fix cycles rather than
+// reading as "4 attempts, cap 3".
+test("`cycles: 3` produces exactly three fix dispatches — four reviews, counted as fix cycles on the record", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 3 }] });
+  const { deps, seen } = fakes({
+    review: ({ prior }) => ({
+      ok: true,
+      text: prior.length
+        ? `\`\`\`json\n{"verdict":"changes_requested","prior":[${prior.map((p) => `{"id":"${p.id}","status":"open"}`).join(",")}],"findings":[]}\n\`\`\``
+        : changesRequested,
+    }),
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(seen.fixes.length, 3, "exactly three fix dispatches");
+  assert.strictEqual(seen.reviews.length, 4);
+  assert.match(seen.facts[0].markdown, /4 attempts: the initial one plus 3 fix cycles, cap 3/);
+});
+
+test("a fix cycle that lands makes the gate pass, and nothing is escalated — the reviewer is handed the prior set and the fix", async () => {
   const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 2 }] });
   let call = 0;
+  const handed = [];
   const { deps, seen } = fakes({
-    review: () => {
+    review: ({ prior, fix, ledger }) => {
       call += 1;
-      return { ok: true, text: call === 1 ? '```json\n{"verdict":"changes_requested","findings":[{"summary":"x"}]}\n```' : '```json\n{"verdict":"pass"}\n```' };
+      handed.push({ prior, fix, ledger });
+      return { ok: true, text: call === 1 ? changesRequested : '```json\n{"verdict":"pass","prior":[{"id":"F1","status":"resolved","note":"the bound is now exclusive"}]}\n```' };
     },
+    fix: () => ({ ok: true, runId: "run-fix-1" }),
   });
   const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
   assert.strictEqual(res.state, "passed");
   assert.strictEqual(seen.fixes.length, 1);
   assert.strictEqual(seen.escalations.length, 0);
+  assert.deepStrictEqual(handed[0].prior, [], "the initial review has no prior set");
+  assert.strictEqual(handed[0].fix, null);
+  assert.deepStrictEqual(handed[1].prior.map((p) => [p.id, p.summary]), [["F1", "off by one"]], "review 2 is handed review 1's open finding by id");
+  assert.strictEqual(handed[1].fix.runId, "run-fix-1", "…and the fix cycle that was dispatched at it");
+  assert.strictEqual(handed[1].fix.cycle, 0);
+  assert.match(seen.facts[0].markdown, /F1 \[blocking\] resolved at cycle 1 — lib\/x\.js — off by one \(the bound is now exclusive\)/, "the passing fact records what cleared it");
+});
+
+// The bounded half: a memoryless reviewer that ignores the prior set does not
+// get to move the goalposts. Its verdict is unreadable and counts as
+// changes_requested for the PRIOR set only — the fixer is sent back at F1,
+// never at the fresh finding, and the fresh finding never reaches the ledger.
+test("a review that ignores a prior finding is unreadable and re-dispatches the fix at the PRIOR set only — a new finding it raised is never admitted", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 1 }] });
+  let call = 0;
+  const { deps, seen } = fakes({
+    review: () => {
+      call += 1;
+      return {
+        ok: true,
+        text: call === 1 ? changesRequested : `\`\`\`json\n{"verdict":"changes_requested","findings":[${BLOCKING("a brand new goalpost", ',"introduced_by_fix":true')}]}\n\`\`\``,
+      };
+    },
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.match(res.reason, /ignored prior finding F1/);
+  assert.deepStrictEqual(seen.escalations[0].findings.map((f) => f.id), ["F1"], "the escalation carries the prior set, not the goalpost");
+  assert.deepStrictEqual(seen.escalations[0].ledger.map((e) => e.summary), ["off by one"], "the goalpost never reached the ledger");
+  assert.match(seen.facts[0].markdown, /ignored prior finding F1 \(neither cleared nor confirmed\)/);
+});
+
+// Replay of the four real codex reports from dispatched run a4f90513 (gate
+// adversarial-review on issue-spor-connection-deletion-update-toctou): under the
+// memoryless prompt each cycle raised NEW blocking findings and the escalation
+// carried four, none of them the two the fixer had been sent to fix. Under the
+// stateful protocol the same four reports converge on the initial set:
+// nothing raised after cycle 0 is admitted, because none of the later reports
+// answers a prior finding — so the escalation is bounded by cycle 0's findings
+// (two here, both demonstrated in the reviewer's own prose — lifted into the
+// structured `evidence` field the new prompt asks for), and the "fourth new
+// finding" never exists. The replay ALSO shows the honest limit: a reviewer
+// that never answers the prior set cannot converge below it.
+test("replaying run a4f90513's four codex reports through the stateful protocol admits nothing after the initial set", async () => {
+  const dir = path.join(__dirname, "fixtures", "review-replay");
+  const reports = [0, 1, 2, 3].map((i) => fs.readFileSync(path.join(dir, `a4f90513-review-${i}.md`), "utf8"));
+  // The initial review's blocking findings carry their demonstration in prose
+  // ("I reproduced this: …"); the new prompt asks for it in `evidence`, so the
+  // replay stamps it there for cycle 0 only. Cycles 1..3 are replayed VERBATIM.
+  const initial = reports[0].replace(/"severity":"blocking",/g, '"severity":"blocking","evidence":"reproduced: the replacement survived with replaced:true while its connection-stamped PAT was deleted",');
+  const texts = [initial, reports[1], reports[2], reports[3]];
+  const factory = factoryOf({ ...BASE, gates: [{ id: "adversarial-review", kind: "agent-review", profile: "profile-codex-sol", cycles: 3 }] });
+  let call = 0;
+  const { deps, seen } = fakes({ review: () => ({ ok: true, text: texts[call++] }) });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(seen.reviews.length, 4);
+  assert.strictEqual(seen.fixes.length, 3, "cycles: 3 — three fix dispatches");
+  const escalated = seen.escalations[0];
+  assert.deepStrictEqual(escalated.ledger.map((e) => e.id), ["F1", "F2"], "only cycle 0's findings are ever on the ledger");
+  assert.deepStrictEqual(escalated.findings.map((f) => f.id), ["F1", "F2"], "the escalation is bounded by the initial set — never the four different findings the old loop ended on");
+  for (const fix of seen.fixes) {
+    assert.deepStrictEqual(fix.findings.map((f) => f.id), ["F1", "F2"], "every fix cycle is sent back at the SAME two findings");
+  }
+  assert.match(seen.facts[0].markdown, /F1 \[blocking\] OPEN since cycle 0 — server\/rest-fastify\.ts/);
+  assert.doesNotMatch(seen.facts[0].markdown, /authorization or approved device codes/, "cycle 3's new finding is nowhere on the record");
 });
 
 test("a review that cannot be read, dispatched or reported is a FAILURE — never a pass", async () => {
@@ -2412,4 +2518,114 @@ test("prepareGateTree runs the caller's teardown first thing in cleanup, and a t
   assert.deepStrictEqual(order, ["setup true", "teardown true"], "teardown sees the tree still there");
   assert.ok(!fs.existsSync(tree.dir), "the tree is gone despite the throwing teardown");
   assert.strictEqual(git(repo, "worktree", "list").trim().split("\n").length, 1);
+});
+
+// ------------------------------------------------ the stateful review prompt --
+// task-spor-review-gate-stateful-bounded: what makeGateDeps' `review` actually
+// hands the reviewer, against a real git checkout — the work item's text, the
+// diff itself, and on a fix cycle the prior findings by ledger id and the fix
+// cycle's commits — launched read-only. The verdict protocol is tested on the
+// kernel; this pins the prompt that asks for it.
+test("the review dispatch is read-only and carries the work item, the diff, the prior findings and the last fix's commits", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-review-prompt-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, "nodes", "task-fix-me.md"),
+    "---\nid: task-fix-me\ntype: task\ntitle: Make the bound exclusive\nsummary: The loop over-reads by one element.\nstatus: open\ndate: 2026-09-03\n---\n\nAcceptance: reading N items yields N.\n"
+  );
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-review-repo-"));
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  g("init", "-q", "-b", "main");
+  fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n;\n");
+  g("add", "."); g("commit", "-q", "-m", "base");
+  g("checkout", "-q", "-b", "task-fix-me");
+  fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n + 1;\n");
+  g("commit", "-q", "-am", "implement");
+  const head0 = g("rev-parse", "HEAD");
+
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  const launches = [];
+  let n = 0;
+  const deps = sporCli.makeGateDeps(cfg, {
+    record: { node_id: "task-fix-me", cwd: repo },
+    entry: { run_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", node_id: "task-fix-me", project: null },
+    factory: { id: "factory-test" },
+    slug: null,
+    passthrough: { sandbox: "danger-full-access" },
+    warn: () => {}, log: () => {}, stopping: () => false, home,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    dispatch: async (_cfg, values, positionals) => {
+      n += 1;
+      const runId = `review-run-${n}`;
+      const p = dispatchRuns.runPaths(home, runId);
+      fs.writeFileSync(p.record.replace(/\.run\.json$/, ".report.md"), '```json\n{"verdict":"pass","prior":[{"id":"F1","status":"resolved"}]}\n```');
+      dispatchRuns.atomicJson(p.record, { run_id: runId, node_id: "task-fix-me", state: "done", created_at: new Date().toISOString(), report_path: p.record.replace(/\.run\.json$/, ".report.md") });
+      launches.push({ values, prompt: positionals[0] });
+      return { ok: true, run: { run_id: runId, harness: "fake" } };
+    },
+  });
+  const gate = { id: "adversarial-review", kind: "agent-review", profile: "profile-review", cycles: 2, awaitMs: 5000, instructions: "Hunt for off-by-ones." };
+
+  assert.ok((await deps.changedPaths({ trustedRef: "main" })).ok);
+  const first = await deps.review({ gate, cycle: 0, prior: [], fix: null });
+  assert.strictEqual(first.ok, true, first.reason);
+  assert.strictEqual(launches[0].values["read-only"], true, "the reviewer is launched read-only");
+  assert.strictEqual(launches[0].values["no-worktree"], true);
+  const p0 = launches[0].prompt;
+  assert.match(p0, /\(the initial review\)/);
+  assert.match(p0, /## The work item\n\ntask-fix-me: Make the bound exclusive\n\nThe loop over-reads by one element\.\n\nAcceptance: reading N items yields N\./, "the work item's title, summary and body are in the prompt");
+  assert.match(p0, /```diff\n[\s\S]*-module\.exports = \(n\) => n;\n\+module\.exports = \(n\) => n \+ 1;/, "the diff itself is embedded");
+  assert.match(p0, /Hunt for off-by-ones\./);
+  assert.match(p0, /only `blocking` blocks/i);
+  assert.match(p0, /"evidence": "the command\/test you ran and what it showed"/);
+  assert.doesNotMatch(p0, /## Prior findings/, "no prior set on the initial review");
+  assert.doesNotMatch(p0, /introduced_by_fix/, "attribution is only asked for on a fix cycle");
+
+  // A fix cycle lands a commit; review 2 is handed the prior finding and that commit.
+  fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n;\n");
+  g("commit", "-q", "-am", "fix F1: the bound is exclusive again");
+  await deps.changedPaths({ trustedRef: "main" });
+  const head1 = g("rev-parse", "HEAD");
+  const prior = [{ id: "F1", severity: "blocking", file: "x.js", summary: "off by one", evidence: "node -e 'f(1)' prints 2" }];
+  const second = await deps.review({ gate, cycle: 1, prior, fix: { cycle: 0, runId: "fix-run-1", fromHead: head0, toHead: head1, findings: [{ id: "F1", blocking: true }] } });
+  assert.strictEqual(second.ok, true, second.reason);
+  const p1 = launches[1].prompt;
+  assert.match(p1, /\(the review after fix cycle 1 of 2\)/);
+  assert.match(p1, /## Prior findings — answer these FIRST[\s\S]*F1 \[blocking\] x\.js — off by one\n    evidence: node -e 'f\(1\)' prints 2/);
+  assert.match(p1, /## What the last fix cycle changed\n\nFix cycle 1 was dispatched as run fix-run-1 to address F1\./);
+  assert.match(p1, /fix F1: the bound is exclusive again[\s\S]*x\.js \|/, "the fix's commit message and stat are in the prompt");
+  assert.match(p1, /"prior": \[\{"id": "F1", "status": "resolved" \| "open"/);
+  assert.match(p1, /"introduced_by_fix": true \| false/);
+  assert.match(p1, /omits any prior finding \(neither cleared nor confirmed\) is UNREADABLE/);
+
+  // And the fix prompt names the findings by id, splits advisory from blocking,
+  // and lists what earlier cycles already resolved.
+  let fixLaunch = null;
+  const fixDeps = sporCli.makeGateDeps(cfg, {
+    record: { node_id: "task-fix-me", cwd: repo }, entry: { run_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", node_id: "task-fix-me", project: null },
+    factory: { id: "factory-test" }, slug: null, passthrough: {}, warn: () => {}, log: () => {}, stopping: () => false, home, runMaxMs: 50,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    dispatch: async (_cfg, values, positionals) => {
+      fixLaunch = { values, prompt: positionals[0] };
+      return { ok: true, run: { run_id: "fix-run-2", harness: "fake" } };
+    },
+  });
+  await fixDeps.changedPaths({ trustedRef: "main" });
+  await fixDeps.fix({
+    gate, cycle: 1, detail: "the review requested changes — 1 blocking finding(s)",
+    findings: [
+      { id: "F2", severity: "blocking", file: "x.js", summary: "still over-reads on empty input", blocking: true, evidence: "node -e ..." },
+      { id: "F3", severity: "major", file: "x.js", summary: "name the constant", blocking: false, note: null },
+    ],
+    ledger: [{ id: "F1", severity: "blocking", file: "x.js", summary: "off by one", status: "resolved", opened: 0, closed: 1 }],
+  });
+  assert.ok(fixLaunch, "the fix cycle was dispatched");
+  assert.strictEqual(fixLaunch.values["read-only"], undefined, "the FIXER is not read-only");
+  assert.match(fixLaunch.prompt, /\(fix cycle 2 of 2\)/);
+  assert.match(fixLaunch.prompt, /Blocking findings — fix each, by id:\nF2 \[blocking\] x\.js — still over-reads on empty input/);
+  assert.match(fixLaunch.prompt, /Advisory \(recorded, not enforced — fix if cheap\):\nF3 \[major\] x\.js — name the constant/);
+  assert.match(fixLaunch.prompt, /Already resolved by earlier cycles \(do not regress\):\nF1 \[blocking\] x\.js — off by one/);
+  assert.match(fixLaunch.prompt, /naming the finding ids you addressed in the commit message/);
 });
