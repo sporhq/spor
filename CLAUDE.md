@@ -756,8 +756,13 @@ already a person's item (a lane item, a rejected/blocked approval are never
 rescued; a `declined` run is never gated). The runner (`runGatePipeline`,
 now a `judge(rescue, seed)` pass over the gate list) writes the refused gate's
 fact FIRST, dispatches `rescue.profile` into the run's own checkout
-(`makeGateDeps.rescue` in bin/spor.js: `--no-worktree --force`, the worker's
-harness flags dropped like a review, NOT read-only) with the item, the diff,
+(`makeGateDeps.rescue` in bin/spor.js: `--no-worktree --force`, NOT read-only,
+and — unlike a review — carrying the worker's unattended POSTURE
+(`--permission-mode`/`--sandbox`/`--approval-policy`, else a claude-code rescue
+stalls on its first write prompt) filtered through the LANE harness's own
+`validateOptions`, while its ROUTING (`--model`/`--agent`) is dropped so the
+lane's profile keeps naming the strong model,
+issue-spor-rescue-dispatch-drops-harness-flags) with the item, the diff,
 EVERY commit on the branch, the cycle history, the finding ledger and the gate
 facts, reads its `{"diagnosis","category","fixed","filed"}` block FAIL-SOFT
 (`parseRescueReport` — it only feeds the escalation and the `art-rescue-*`

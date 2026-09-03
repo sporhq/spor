@@ -10355,6 +10355,73 @@ function reviewPassthrough(passthrough) {
   return out;
 }
 
+// The two halves of an implementer's passthrough, as a RESCUE has to read them
+// (issue-spor-rescue-dispatch-drops-harness-flags). ROUTING says WHO runs —
+// and a rescue routes to the lane's profile precisely because that profile
+// names a stronger model, so the worker's `--model` (which OVERRIDES a
+// profile's own model — cmdDispatch's `effectiveModel`) and its `--agent` (a
+// Claude Code agent DEFINITION belonging to the worker's lane) must not ride.
+// POSTURE says HOW the box runs — unattended or not — and a rescue is an
+// implementer that commits into the run's own checkout, so it needs the
+// worker's posture exactly as a fix cycle does: a claude-code rescue launched
+// without the worker's `--permission-mode bypassPermissions` stalls on its
+// first write prompt with nobody there to answer it.
+const RESCUE_ROUTING_FLAGS = ["model", "agent"];
+// The posture flags, each mapped to the option key an adapter's
+// `validateOptions` reads it under.
+const RESCUE_POSTURE_FLAGS = Object.freeze({ "permission-mode": "permissionMode", sandbox: "sandbox", "approval-policy": "approvalPolicy" });
+
+// The worker's passthrough as the rescue's own harness can read it. The
+// posture is spelled in the WORKER's harness vocabulary and the lane routinely
+// runs a different one, where a foreign flag is refused outright
+// (rejectForeignOptions) — so the rescue's ADAPTER is the judge of what rides,
+// never a second table here (norm-cc-registry-is-contract): Claude Code takes
+// `--permission-mode`, Codex takes it too (its `validateOptions` TRANSLATES
+// bypassPermissions into `--sandbox danger-full-access --ask-for-approval
+// never`, the same translation the fix cycle gets) alongside its own
+// `--sandbox`/`--approval-policy`, and OpenCode/Copilot take neither — they
+// run unattended by default, so dropping the posture there loses nothing. The
+// probe is per FLAG (a posture the lane's harness does own must not be dropped
+// because a foreign sibling rode beside it), each dropped flag is REPORTED
+// rather than silently swallowed — dropping a restrictive mode widens what the
+// rescue may do, and that has to be visible — and an unknown or unreadable
+// harness keeps the posture, so the mistake surfaces as dispatch's own loud
+// refusal rather than as a silently attended rescue.
+function rescuePassthrough(passthrough, adapter) {
+  const out = { ...(passthrough || {}) };
+  for (const k of RESCUE_ROUTING_FLAGS) delete out[k];
+  const dropped = [];
+  if (!adapter || typeof adapter.validateOptions !== "function") return { values: out, dropped };
+  for (const [flag, option] of Object.entries(RESCUE_POSTURE_FLAGS)) {
+    if (!out[flag]) continue;
+    // `agent` is already gone above, and Codex checks it BEFORE the permission
+    // mode it translates — passing it here would mask that translation with a
+    // refusal the rescue never earned.
+    const check = adapter.validateOptions({ permissionMode: null, agent: null, sandbox: null, approvalPolicy: null, [option]: out[flag] });
+    if (!check || !check.message) continue;
+    delete out[flag];
+    dropped.push({ flag, message: check.message });
+  }
+  return { values: out, dropped };
+}
+
+// The harness the rescue's profile launches under, read the way the factory
+// precheck reads it — off whatever frontmatter is there, with no `type:
+// profile` gate, defaulting to claude-code — so the worker's posture can be
+// filtered to what that harness accepts. Fail-soft: an unreadable profile or
+// an unknown harness yields null and the posture rides untouched.
+async function rescueHarnessAdapter(cfg, profileId) {
+  try {
+    const pn = await resolveNode(cfg, profileId);
+    if (!pn || !pn.raw) return null;
+    const profile = require(path.join(ROOT, "lib", "graph.js")).parseFrontmatter(pn.raw, `${profileId}.md`);
+    const harness = (typeof profile.harness === "string" && profile.harness) || "claude-code";
+    return dispatchHarnesses.resolveHarness(harness, { cfg }).adapter || null;
+  } catch {
+    return null;
+  }
+}
+
 // The run record of a fix cycle this pipeline already launched under `name`
 // for `nodeId`, if one exists — the launcher writes a run's record before
 // `dispatch` returns, so a launch the pipeline's own bookkeeping never got to
@@ -10697,8 +10764,10 @@ function makeGateDeps(
   // structured diagnosis is read in code (gatesKernel.parseRescueReport) and
   // only feeds the escalation body and the rescue fact — fail-soft, so a
   // rescue that fixed the tree and forgot the block still gets its fix
-  // judged. The dispatch runs under the RESCUE profile, so the worker's own
-  // harness flags are dropped exactly as they are for a review.
+  // judged. The dispatch runs under the RESCUE profile, so the worker's
+  // ROUTING flags (--model/--agent) are dropped — the lane's profile is what
+  // names the strong model — while its unattended POSTURE rides, filtered to
+  // what the rescue's own harness accepts (rescuePassthrough).
   const rescue = async ({ gate, attempt, detail, evidence, findings, attempts, ledger, fact, facts = [], previous = [], onLaunch = null }) => {
     const lane = factory && factory.rescue;
     if (!lane || !lane.profile) return { ok: false, reason: "no rescue lane is declared on the factory" };
@@ -10786,11 +10855,20 @@ function makeGateDeps(
     // record before dispatch returns, so a worker killed between the launch
     // and its durable record still finds the run by its unique name.
     const already = launchedFixRun(home, entry.node_id, name);
-    const launched = already ? { ok: true, run: already, adopted: true } : await dispatch(
-      cfg,
-      { ...reviewPassthrough(passthrough), profile: lane.profile, node: entry.node_id, dir: cwd, force: true, "no-worktree": true, name },
-      [prompt]
-    );
+    // Read the lane's harness only when there is a launch to shape — an
+    // adopted run was already launched under whatever posture it got.
+    let values = null;
+    if (!already) {
+      const shaped = rescuePassthrough(passthrough, await rescueHarnessAdapter(cfg, lane.profile));
+      if (shaped.dropped.length) {
+        warn(
+          `warning: the worker's ${shaped.dropped.map((d) => `--${d.flag}`).join(", ")} does not ride to the rescue under` +
+            ` ${lane.profile} — ${shaped.dropped[0].message} The rescue runs under that harness's own posture.`
+        );
+      }
+      values = { ...shaped.values, profile: lane.profile, node: entry.node_id, dir: cwd, force: true, "no-worktree": true, name };
+    }
+    const launched = already ? { ok: true, run: already, adopted: true } : await dispatch(cfg, values, [prompt]);
     if (!launched.ok) return { ok: false, reason: `the rescue under ${lane.profile} could not be dispatched: ${launched.reason}` };
     if (launched.adopted) log(`work: rescue attempt ${attempt} on ${entry.node_id} was already launched as run ${String(launched.run.run_id).slice(0, 8)} — adopting it, not dispatching again`);
     dispatchRuns.stampGateState(home, entry.run_id, { gate_rescue_run_id: launched.run.run_id, gate_rescue_at: new Date().toISOString(), gate_rescue_attempt: attempt });

@@ -1524,9 +1524,19 @@ a stale premise is triage's, not the lane's.
    escalation, a `Rescue: attempt n of N … follows this refusal` line — so the
    rescue can link what it files to the fact that refused it.
 2. Dispatches the rescue under `rescue.profile`, into the run's OWN checkout
-   (`--no-worktree --force`, like a fix cycle; the worker's harness flags
-   dropped, like a review; NOT read-only — the rescue writes), with a prompt
-   the runner composes: the work item, the diff, EVERY commit on the branch
+   (`--no-worktree --force`, like a fix cycle; NOT read-only — the rescue
+   writes). A rescue is an IMPLEMENTER, so unlike a review it keeps the
+   worker's unattended POSTURE — `--permission-mode` / `--sandbox` /
+   `--approval-policy`, without which a claude-code rescue stalls on its first
+   write prompt on an unattended box — filtered to what the lane's own harness
+   accepts: Claude Code takes the permission mode, Codex takes it too (its
+   adapter translates `bypassPermissions` into `--sandbox danger-full-access
+   --ask-for-approval never`, exactly as it does for a fix cycle), and
+   OpenCode/Copilot take neither because they are unattended by default, so
+   the posture is dropped there with a warning. What never rides is the
+   worker's ROUTING — `--model` and `--agent` — because the lane's profile is
+   what names the strong model, and a worker's `--model` would override it.
+   The prompt the runner composes carries: the work item, the diff, EVERY commit on the branch
    (the implementer's and each fix cycle's), the refused gate's detail and
    evidence, the cycle history, the whole finding ledger, the gate facts on the
    graph, and any earlier rescue's diagnosis. It is asked to (1) **diagnose**

@@ -3320,6 +3320,7 @@ test("the real rescue dispatch runs under the rescue profile in the run's own ch
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-rescue-prompt-"));
   fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
   fs.writeFileSync(path.join(home, "nodes", "task-fix-me.md"), "---\nid: task-fix-me\ntype: task\ntitle: Make the bound exclusive\nsummary: The loop over-reads by one element.\nstatus: open\ndate: 2026-09-03\n---\n\nAcceptance: reading N items yields N.\n");
+  fs.writeFileSync(path.join(home, "nodes", "profile-claude-fable.md"), "---\nid: profile-claude-fable\ntype: profile\ntitle: The strong-model rescue profile\nharness: claude-code\nmodel: fable\nsummary: The strong-model rescue profile.\ndate: 2026-09-03\n---\n\nThe rescue lane's profile.\n");
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-rescue-repo-"));
   const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
   g("init", "-q", "-b", "main");
@@ -3376,7 +3377,15 @@ test("the real rescue dispatch runs under the rescue profile in the run's own ch
   assert.strictEqual(v["no-worktree"], true);
   assert.strictEqual(v["read-only"], undefined, "the rescue WRITES");
   assert.strictEqual(v.name, "rescue-aaaaaaaa-1");
-  for (const k of ["sandbox", "permission-mode", "model"]) assert.strictEqual(v[k], undefined, `the worker's --${k} does not ride to the rescue profile`);
+  // issue-spor-rescue-dispatch-drops-harness-flags: the rescue is an
+  // IMPLEMENTER, so the worker's unattended POSTURE rides — filtered to what
+  // the lane's own harness reads. This lane is claude-code: it takes the
+  // permission mode and refuses Codex's --sandbox, which is dropped (and
+  // warned about) rather than taking the permission mode down with it.
+  assert.strictEqual(v["permission-mode"], "bypassPermissions", "the worker's --permission-mode rides to a claude-code rescue");
+  assert.strictEqual(v.sandbox, undefined, "…and Codex's --sandbox does not");
+  assert.strictEqual(v.model, undefined, "--model never rides: the lane's profile is what names the strong model");
+  assert.strictEqual(v.agent, undefined);
   assert.strictEqual(v.as, "agent-worker");
   const p = launches[0].prompt;
   assert.match(p, /rescue attempt 1 of 1/);
@@ -3421,6 +3430,99 @@ test("the real rescue dispatch runs under the rescue profile in the run's own ch
   assert.match(md, /summary: Rescue diagnosed real-defect: the fixer widened/);
   assert.match(md, /title: Gate escalation — adversarial-review refused task-fix-me after rescue/);
   assert.match(md, /requires: \[human\]/);
+});
+
+// issue-spor-rescue-dispatch-drops-harness-flags: a rescue is an IMPLEMENTER,
+// so unlike a review it inherits the worker's unattended POSTURE — a
+// claude-code rescue launched without `--permission-mode bypassPermissions`
+// stalls on its first write prompt on a box with nobody to answer it. The
+// posture is filtered by the LANE harness's own adapter, so a profile on
+// another harness is never handed a flag it refuses; the worker's ROUTING
+// (--model/--agent) never rides, because the lane's profile is what names the
+// strong model.
+test("the rescue inherits the worker's unattended posture, filtered per harness — and never its --model", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-rescue-posture-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  fs.writeFileSync(path.join(nodes, "task-fix-me.md"), "---\nid: task-fix-me\ntype: task\ntitle: Make the bound exclusive\nsummary: The loop over-reads by one element.\nstatus: open\ndate: 2026-09-03\n---\n\nAcceptance: reading N items yields N.\n");
+  for (const [id, harness] of [["profile-rescue-claude", "claude-code"], ["profile-rescue-codex", "codex"], ["profile-rescue-opencode", "opencode"]]) {
+    fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\ntype: profile\ntitle: A rescue profile on ${harness}\nharness: ${harness}\nmodel: strong\nsummary: A rescue profile on ${harness}.\ndate: 2026-09-03\n---\n\nThe rescue lane's profile.\n`);
+  }
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  let n = 0;
+  // One rescue launch under `profile`, with the worker's passthrough. Each
+  // gets its own pipeline run id: the adoption-by-name guard is keyed to it,
+  // and two launches sharing one would adopt instead of dispatching.
+  const launchUnder = async (profile, passthrough) => {
+    n += 1;
+    const pipelineRun = `${String(n).repeat(8)}-bbbb-cccc-dddd-eeeeeeeeeeee`;
+    dispatchRuns.atomicJson(dispatchRuns.runPaths(home, pipelineRun).record, { run_id: pipelineRun, node_id: "task-fix-me", state: "done", created_at: new Date().toISOString() });
+    const warnings = [];
+    let values = null;
+    const deps = sporCli.makeGateDeps(cfg, {
+      record: { node_id: "task-fix-me", cwd: home },
+      entry: { run_id: pipelineRun, node_id: "task-fix-me", project: null },
+      factory: { id: "factory-test", rescue: { profile, attempts: 1, awaitMs: 5000 } },
+      slug: null,
+      passthrough,
+      warn: (line) => warnings.push(line), log: () => {}, stopping: () => false, home,
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      dispatch: async (_cfg, vals) => {
+        values = vals;
+        const id = `rescue-run-${n}`;
+        const p = dispatchRuns.runPaths(home, id);
+        fs.writeFileSync(p.record.replace(/\.run\.json$/, ".report.md"), '```json\n{"diagnosis":"d","category":"environment","fixed":false,"filed":[]}\n```');
+        dispatchRuns.atomicJson(p.record, { run_id: id, node_id: "task-fix-me", name: vals.name, state: "done", created_at: new Date().toISOString(), report_path: p.record.replace(/\.run\.json$/, ".report.md") });
+        return { ok: true, run: { run_id: id, harness: "fake" } };
+      },
+    });
+    const r = await deps.rescue({
+      gate: { id: "adversarial-review", kind: "agent-review", profile: "profile-review", cycles: 1 },
+      attempt: 1, detail: "the review requested changes", evidence: "", findings: [], attempts: [], ledger: [], fact: null,
+    });
+    assert.strictEqual(r.ok, true, r.reason);
+    return { values, warnings };
+  };
+
+  // A claude-code worker rescuing to a claude-code profile: the bypass rides.
+  const claude = await launchUnder("profile-rescue-claude", { "permission-mode": "bypassPermissions", model: "worker-model", agent: "worker-agent", as: "agent-worker" });
+  assert.strictEqual(claude.values["permission-mode"], "bypassPermissions", "an unattended claude-code rescue keeps the worker's bypass");
+  assert.deepStrictEqual([claude.values.model, claude.values.agent], [undefined, undefined], "the lane's profile names the model, not the worker");
+  assert.strictEqual(claude.values.as, "agent-worker", "harness-neutral keys still ride");
+  assert.deepStrictEqual(claude.warnings, []);
+
+  // …to a Codex profile: the flag rides too, and the Codex adapter is what
+  // translates it into `--sandbox danger-full-access --ask-for-approval never`
+  // — exactly the translation the fix cycle's dispatch gets.
+  const codex = await launchUnder("profile-rescue-codex", { "permission-mode": "bypassPermissions", model: "worker-model" });
+  assert.strictEqual(codex.values["permission-mode"], "bypassPermissions");
+  assert.deepStrictEqual(codex.warnings, []);
+  assert.deepStrictEqual(
+    require("../lib/shell/dispatch-harnesses.js").getHarness("codex").validateOptions({ permissionMode: "bypassPermissions" }).translate,
+    { sandbox: "danger-full-access", approvalPolicy: "never" },
+    "…and that is what Codex reads it as"
+  );
+
+  // A Codex worker rescuing to a Codex profile: its own posture rides whole.
+  const codexWorker = await launchUnder("profile-rescue-codex", { sandbox: "danger-full-access", "approval-policy": "never" });
+  assert.deepStrictEqual([codexWorker.values.sandbox, codexWorker.values["approval-policy"]], ["danger-full-access", "never"]);
+
+  // …and to a harness that reads NEITHER vocabulary: dropped, not refused —
+  // OpenCode is unattended by default — but said out loud, since dropping a
+  // posture changes what the rescue may do.
+  const opencode = await launchUnder("profile-rescue-opencode", { "permission-mode": "bypassPermissions", sandbox: "danger-full-access" });
+  assert.deepStrictEqual([opencode.values["permission-mode"], opencode.values.sandbox], [undefined, undefined]);
+  assert.strictEqual(opencode.warnings.length, 1);
+  assert.match(opencode.warnings[0], /--permission-mode, --sandbox does not ride to the rescue under profile-rescue-opencode/);
+
+  // A profile that cannot be read resolves no harness: the posture rides
+  // untouched, so a mistake surfaces as dispatch's own loud refusal rather
+  // than as a silently attended rescue.
+  const unknown = await launchUnder("profile-not-in-the-graph", { "permission-mode": "bypassPermissions", model: "worker-model" });
+  assert.strictEqual(unknown.values["permission-mode"], "bypassPermissions");
+  assert.strictEqual(unknown.values.model, undefined, "--model is dropped whatever the harness is");
 });
 
 test("a resumed rescue that had already failed to run escalates the handed refusal — never re-judging a rescue pass that never happened — and the resumed seed carries every gate", async () => {
