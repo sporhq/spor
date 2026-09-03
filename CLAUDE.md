@@ -590,7 +590,38 @@ bare probe a non-Linux host degrades to. The mirror hazard
 is a slot held FOREVER: a native-background run whose harness can no longer be
 enumerated never goes terminal at all, so `work.runMaxMs` (`--run-max`, default
 24h) is the watchdog and the un-enumerable case is warned about rather than
-hidden. There is deliberately no `--no-claim` passthrough (the lease is the only
+hidden. That watchdog bounds a run's LENGTH and only ever stops FOLLOWING it,
+which is the wrong instrument for a WEDGED one, so `work.runIdleMs`
+(`--run-idle`, default 45min, 0 disables) bounds its SILENCE and actually ends
+it (task-spor-work-idle-run-detection): a run whose OBSERVED output has not
+moved for the ceiling is STOPPED and classified `failed`/`idle-timeout`, with a
+recognized environment signal in the log still winning over the generic
+reading. Observed is `observedActivityAt` — the log's or the transcript's mtime
+with `lastActivityAt`'s launch fallback REMOVED, because a native launch whose
+session was never bound has no readable channel and judging it on its launch
+stamp would stop a healthy agent at the ceiling; a 0 there falls through to the
+watchdog. Stopping means the run is OVER, not that a signal was sent: the
+supervisor's whole (detached) process GROUP is SIGTERMed — grandchildren
+included, and group membership is stronger ownership evidence than a bare pid —
+then anything we signalled that still answers after a bounded grace is
+SIGKILLed, all gated on the supervisor's recorded start-time ticks so a recycled
+pid is never touched. What it measures is SILENCE, not idleness, so one tool
+call longer than the ceiling is stopped mid-work — the accepted trade, with
+`--run-idle` as the lever (WORKERS.md §8). Both that classification and the `contract_pending` harvest above
+RE-READ the graph first (`verifyRunResolution`, the verify leg of
+lib/shell/dispatch-terminal.js lifted out as `resolvedOutcomeFromNode`): an
+agent that wrote its resolver and then hung — or one whose supervisor was
+killed inside the 60s grace — genuinely finished the work, and filing it as an
+unenforced `reported` gates and cools an item that is done. Only a POSITIVE
+reading ever overwrites what a record says, so an unreachable graph leaves the
+provisional verdict exactly as it was. Two things the idle stop deliberately
+does NOT do: it never releases the LEASE (that is the terminal contract's job,
+part of filing a report a wedged run never produced — leaving it held keeps
+other workers off the node and self-heals at its TTL), and where there was
+nothing of ours to signal — or the stop did not take — it takes the WATCHDOG's
+cooldown rather than the ordinary refusal window, since it then only stopped
+FOLLOWING the run and a second agent must not land in a checkout the first may
+still hold. There is deliberately no `--no-claim` passthrough (the lease is the only
 thing keeping two pull workers off one node), and numeric options are REFUSED
 rather than silently replaced (`--max $UNSET` must not become an unbounded
 worker). The LOOP never passes `--force` (a loop
@@ -600,6 +631,7 @@ exception), and a worker never claims a `readiness: human` item even though
 one-shot dispatch only warns on the non-`requires:human` half (WORKERS.md §3).
 Knobs: `work.concurrency` (1), `work.intervalMs` (30s), `work.maxIntervalMs`
 (the idle backoff ceiling, 5min), `work.retryAfterMs` (10min),
+`work.runMaxMs` (24h), `work.runIdleMs` (45min),
 `work.project` (falls back to `queue.project`). Status is machine-local under
 `journal/work/<worker>.work.json`, read back by `spor work --status [--json]` (a
 worker whose pid is gone reads STALE, never running). See test/work-loop.test.js.

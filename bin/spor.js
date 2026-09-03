@@ -32,6 +32,7 @@ const auth = require(path.join(ROOT, "lib", "auth.js"));
 const u = require(path.join(ROOT, "scripts", "engines", "util.js"));
 const { gitSpawn } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
 const dispatchRuns = require(path.join(ROOT, "lib", "shell", "agent-dispatch-runner.js"));
+const dispatchTerminal = require(path.join(ROOT, "lib", "shell", "dispatch-terminal.js"));
 const dispatchHarnesses = require(path.join(ROOT, "lib", "shell", "dispatch-harnesses.js"));
 const sat = require(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
 const workLoop = require(path.join(ROOT, "lib", "shell", "work-loop.js"));
@@ -9372,13 +9373,45 @@ function runSupervisorAlive(pid, ticks) {
   return dispatchRuns.isSameSupervisor(pid, ticks).reallyAlive;
 }
 
+// Ask the graph the ONE question WORKERS.md §6 asks — does this run's target
+// read RESOLVED? — outside the supervised run that normally asks it
+// (task-spor-work-idle-run-detection). Two callers below need it, and both are
+// the same situation: the process that would have run the contract is not going
+// to. Returns the verified `resolved` patch, or null for "not resolved, or
+// could not tell" — the fail-safe direction, since only a POSITIVE reading is
+// ever allowed to overwrite what a record already says.
+//
+// The door is this worker's own config (same box, same tenant), except the
+// LOCAL graph home, which is read back from the run's own job file: the
+// launcher resolved that home for this run and a repo `graph:` binding can make
+// it differ from the worker's cwd-resolved one.
+async function verifyRunResolution(cfg, record) {
+  const nodeId = record && record.node_id;
+  if (!nodeId) return null;
+  if (remote.isRemote(cfg)) {
+    let res = null;
+    try {
+      res = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}`);
+    } catch {
+      return null; // an unreachable graph is not evidence of anything
+    }
+    if (!res || !res.ok) return null;
+    return dispatchTerminal.resolvedOutcomeFromNode(res.json || {});
+  }
+  let job = null;
+  try {
+    job = JSON.parse(fs.readFileSync(dispatchRuns.runPaths(cfg.userConfigHome(), record.run_id).job, "utf8"));
+  } catch { /* the job file has been pruned, or predates local_nodes_dir */ }
+  return dispatchTerminal.verifyLocalResolution((job && job.local_nodes_dir) || cfg.nodesDir(), nodeId);
+}
+
 // Which of this worker's runs are over, and what they did to the graph.
 // RECONCILE first, exactly as `spor runs` does: a native-background run's
 // ending is invisible to its launcher, so its record only goes terminal when
 // something resolves it against the harness's live-agent list plus its own
 // transcript. Supervised runs need none of that (their supervisor closes the
 // record itself), so a box with no enumerable harness still follows them.
-function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, warn = () => {} } = {}) {
+async function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, idleMs = 0, warn = () => {} } = {}) {
   const home = cfg.userConfigHome();
   const wanted = new Set(runIds || []);
   if (!wanted.size) return [];
@@ -9398,37 +9431,104 @@ function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, warn = () => {} } = {}) {
   // a slot whose run record has vanished can never be observed going terminal,
   // so reporting nothing for it would hold that slot for the life of the
   // worker. workLoop.runHarvest owns the rule; this only names what it decided.
-  return [...wanted].map((id) => {
-    const record = found.get(id) || null;
-    const verdict = workLoop.runHarvest(record, { terminalStates: dispatchRuns.TERMINAL_STATES, alive: runSupervisorAlive, maxAgeMs });
+  const out = [];
+  for (const id of wanted) {
+    let record = found.get(id) || null;
+    const verdict = workLoop.runHarvest(record, {
+      terminalStates: dispatchRuns.TERMINAL_STATES,
+      alive: runSupervisorAlive,
+      maxAgeMs,
+      idleMs,
+      // OBSERVED activity, never the launch fallback: a record with no output
+      // channel this box can read (an unbound native-background run) must fall
+      // through to the watchdog rather than read as silent since launch.
+      activityAt: (r) => dispatchRuns.observedActivityAt(r),
+    });
     if (verdict.why === "missing") {
-      return {
+      out.push({
         run_id: id, terminal: true,
         record: { run_id: id, state: "missing", terminal_note: "the run record is gone — this worker can no longer follow the run ('spor runs' aged it out, or it was removed)" },
-      };
+      });
+      continue;
+    }
+    if (verdict.why === "idle") {
+      // The one verdict that ACTS on the run rather than just stopping to
+      // follow it: the run has written nothing for longer than any real step
+      // takes, so it is wedged, and leaving it alone would pin this slot (and
+      // its lease, and its worktree) until the 24h watchdog. Verify the graph
+      // BEFORE classifying — an agent that wrote its resolver and then hung
+      // did the work, and `resolved` is a graph read, never an exit code.
+      const quietAt = dispatchRuns.observedActivityAt(record);
+      const outcome = await verifyRunResolution(cfg, record);
+      const { record: closed, stopped } = await dispatchRuns.stopIdleRun(home, record, { idleMs, quietAt, outcome });
+      // ENDED, not merely signalled: the record is now terminal and nothing
+      // reconciles it again, so "we sent SIGTERM" is not enough to believe the
+      // checkout is free.
+      const ended = (stopped.child || stopped.supervisor || stopped.group) && !stopped.alive;
+      warn(
+        `work: ${ended ? "stopping" : "giving up following"} run ${String(id).slice(0, 8)} (${record.node_id || record.name || "?"}) — nothing written to its log or transcript for ` +
+          `${Math.max(1, Math.round((verdict.quietMs || 0) / 60000))}m (idle ceiling ${Math.max(1, Math.round(idleMs / 60000))}m)` +
+          `${ended ? "" : `; ${stopped.alive ? "it did not die on SIGTERM/SIGKILL" : "it had no process of ours to signal"}, so something may still be running in its checkout`}` +
+          `${outcome ? ". Its target reads resolved on the graph" : ""}.`
+      );
+      out.push({
+        run_id: id, terminal: true,
+        // Having ENDED the run, the ordinary refusal window is the honest
+        // cooldown (and a resolved target is never cooled at all). Otherwise we
+        // only stopped FOLLOWING it, which is the watchdog's situation exactly
+        // and takes the watchdog's rule: cool the node for at least as long as
+        // the silence we waited out, rather than re-dispatching into a checkout
+        // something may still hold.
+        ...(ended ? {} : { cool_ms: idleMs }),
+        record: closed,
+      });
+      continue;
+    }
+    if (verdict.why === "state" && record && record.contract_pending && record.terminal_state !== "resolved") {
+      // The contract's grace has expired (or its supervisor is gone) and the
+      // record still carries the PROVISIONAL, unenforced placeholder. Filing
+      // that as the verdict is how a genuinely resolved run gets recorded as
+      // an unenforced `reported`, gated, and cooled off despite being done, so
+      // run the verify leg the supervisor did not reach. Only a positive
+      // reading is written: "we could not tell" leaves the record exactly as
+      // it was, still flagged pending for a slow supervisor to settle.
+      const outcome = await verifyRunResolution(cfg, record);
+      if (outcome) {
+        record = dispatchRuns.settleContractOutcome(home, record, {
+          ...outcome,
+          terminal_note: `${outcome.terminal_note} — verified by this worker after the supervisor did not settle the terminal-state contract in time`,
+        });
+      }
     }
     if (verdict.why === "watchdog") {
       // The record is still non-terminal, so `spor runs` keeps reconciling it;
       // this worker simply stops holding a slot for it, and says so.
       warn(`work: giving up following run ${String(id).slice(0, 8)} (${record.node_id || record.name || "?"}) — it has not reached a terminal state in ${Math.round(maxAgeMs / 3600000)}h ('spor runs' still tracks it).`);
-      return {
+      out.push({
         run_id: id, terminal: true,
         // Giving up on FOLLOWING a run says nothing about whether it stopped,
         // so the node is cooled for at least as long as we followed it rather
         // than for the ordinary refusal window.
         cool_ms: maxAgeMs,
         record: { ...record, terminal_note: `this worker stopped following the run after ${Math.round(maxAgeMs / 3600000)}h without a terminal state` },
-      };
+      });
+      continue;
     }
     if (!enumerated && record && record.launch_mode === "native-background" && !verdict.terminal) {
       // The same caveat `spor runs` prints: a native run's state can only be
       // resolved against the harness's live-agent listing, and this call could
       // not read one. The slot is held (correctly — nothing says the run is
       // over), but a worker that quietly stops dispatching must say why.
-      warn("work: could not list live background agents — a native run's state may be stale, so its slot stays held ('spor runs' reports the same).");
+      warn(
+        "work: could not list live background agents — a native run's state may be stale, so its slot stays held ('spor runs' reports the same)" +
+          // Only where the run bound a session: the idle ceiling reads a native
+          // run's freshness off its transcript, and an unbound record has none.
+          `${idleMs > 0 && record.session_id ? `; the idle ceiling still frees it after ${Math.max(1, Math.round(idleMs / 60000))}m of silence` : ""}.`
+      );
     }
-    return { run_id: id, terminal: verdict.terminal, record };
-  });
+    out.push({ run_id: id, terminal: verdict.terminal, record });
+  }
+  return out;
 }
 
 // Dispatch ONE queue item through the real `spor dispatch` code path, and
@@ -9767,7 +9867,7 @@ async function awaitGateRun(cfg, runId, { timeoutMs, pollMs = 5000, warn = () =>
   for (;;) {
     let verdict = null;
     try {
-      verdict = pollWorkRuns(cfg, [runId], { maxAgeMs: 0, warn })[0];
+      verdict = (await pollWorkRuns(cfg, [runId], { maxAgeMs: 0, warn }))[0];
     } catch (e) {
       return { ok: false, reason: `the run record could not be read: ${e.message}` };
     }
@@ -11523,6 +11623,7 @@ async function cmdWork(cfg, { values }) {
   const maxIntervalMs = num("max-interval", values["max-interval"], { min: 1, max: DAY_S, fallback: cfg.getNum("work.maxIntervalMs", workLoop.WORK_DEFAULTS.maxIntervalMs) / 1000 }) * 1000;
   const retryAfterMs = num("retry-after", values["retry-after"], { min: 0, max: 30 * DAY_S, fallback: cfg.getNum("work.retryAfterMs", workLoop.WORK_DEFAULTS.retryAfterMs) / 1000 }) * 1000;
   const runMaxMs = num("run-max", values["run-max"], { min: 0, max: 720, fallback: cfg.getNum("work.runMaxMs", workLoop.WORK_DEFAULTS.runMaxMs) / 3600000 }) * 3600000;
+  const runIdleMs = num("run-idle", values["run-idle"], { min: 0, max: 43200, fallback: cfg.getNum("work.runIdleMs", workLoop.WORK_DEFAULTS.runIdleMs) / 60000 }) * 60000;
   const max = num("max", values.max, { min: 0, max: 1000000, fallback: 0 });
   // The acceptance policy (task-spor-work-accept-policy): which readiness
   // classifications this loop may pick up. `ready` (the default) dispatches
@@ -11686,7 +11787,7 @@ async function cmdWork(cfg, { values }) {
   if (values.print || values["dry-run"]) {
     out(`project: ${slug || "(all projects)"}`);
     out(`accept:  ${accept} — ${accept === "open" ? "any queue item except readiness:human (untriaged included)" : "only items explicitly stamped agent-ready (--accept open for the looser pickup)"}`);
-    out(`loop:    concurrency ${concurrency}, interval ${intervalMs / 1000}s, backoff to ${maxIntervalMs / 1000}s, retry refused after ${retryAfterMs / 1000}s, stop following a run after ${runMaxMs / 3600000}h${max ? `, stop after ${max}` : ""}`);
+    out(`loop:    concurrency ${concurrency}, interval ${intervalMs / 1000}s, backoff to ${maxIntervalMs / 1000}s, retry refused after ${retryAfterMs / 1000}s, stop following a run after ${runMaxMs / 3600000}h${runIdleMs > 0 ? `, stop a run idle for ${runIdleMs / 60000}m` : ""}${max ? `, stop after ${max}` : ""}`);
     out(`status:  ${workLoop.workDir(cfg.userConfigHome())}`);
     if (factory) {
       out(`factory: ${factoryId} — trusted ref ${factory.trustedRef}${factory.protectedPaths.length ? `, protected ${factory.protectedPaths.join(" ")} -> ${factory.testLaneProfile}` : ""}`);
@@ -11781,7 +11882,7 @@ async function cmdWork(cfg, { values }) {
         }
         return dispatchWorkItem(cfg, item, passthrough, { factory });
       },
-      pollRuns: (ids) => pollWorkRuns(cfg, ids, { maxAgeMs: runMaxMs, warn }),
+      pollRuns: (ids) => pollWorkRuns(cfg, ids, { maxAgeMs: runMaxMs, idleMs: runIdleMs, warn }),
       publish: (status) => workLoop.writeWorkerStatus(home, status),
       log: (line) => out(line),
       // Present only when a factory resolved, so a bare worker's deps — and its
@@ -14058,6 +14159,7 @@ const COMMANDS = {
       "max-interval": { type: "string", value: "S", desc: "backoff ceiling in seconds when idle (default 300)" },
       "retry-after": { type: "string", value: "S", desc: "seconds before retrying a refused item (default 600)" },
       "run-max": { type: "string", value: "H", desc: "hours to follow one run before freeing its slot (default 24)" },
+      "run-idle": { type: "string", value: "M", desc: "minutes of silence (nothing written to a run's log or transcript) before stopping it as wedged (default 45; 0 disables)" },
       regate: { type: "string", value: "run-id", desc: "re-judge one refused run under the factory (after fixing what refused it) and exit" },
       max: { type: "string", value: "N", desc: "stop after N dispatches (default: run forever)" },
       once: { type: "boolean", desc: "one selection pass, wait for those runs, exit" },
@@ -14392,7 +14494,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
 
 if (require.main === module) {
   main()

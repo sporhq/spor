@@ -577,6 +577,34 @@ test("runHarvest: a supervised record whose OUTCOME is still provisional is not 
   assert.strictEqual(workLoop.runHarvest(settled, at(2000)).why, "state");
 });
 
+test("runHarvest: a run that has gone silent past the idle ceiling is IDLE — a verdict about the run, not about following it", () => {
+  // The failure this exists for is a wedged agent, not a long one: a live
+  // supervisor whose child is waiting forever on a prompt nobody will answer
+  // reads alive by every other test in this file, and pins its slot, lease and
+  // worktree for the whole 24h watchdog while doing nothing.
+  const started = Date.parse("2026-08-26T10:00:00.000Z");
+  const running = { run_id: "r", state: "running", launch_mode: "supervised-jsonl", created_at: new Date(started).toISOString() };
+  const opts = (nowMs, idleMs, quiet = started) => ({
+    terminalStates: TERMINAL, now: () => nowMs, maxAgeMs: 86400000, idleMs, activityAt: () => quiet,
+  });
+  assert.strictEqual(workLoop.runHarvest(running, opts(started + 600000, 2700000)).terminal, false, "ten minutes of quiet is a working agent");
+  const idle = workLoop.runHarvest(running, opts(started + 3000000, 2700000));
+  assert.strictEqual(idle.terminal, true);
+  assert.strictEqual(idle.why, "idle");
+  assert.strictEqual(idle.quietMs, 3000000, "the verdict carries how long it has been silent, for the reason the caller records");
+  // Activity resets it: this is FRESHNESS, not age.
+  assert.strictEqual(workLoop.runHarvest(running, opts(started + 3000000, 2700000, started + 2900000)).terminal, false);
+  // Idle beats the watchdog when both would fire — a wedged run should be
+  // reported as wedged, not as one we merely followed too long.
+  assert.strictEqual(workLoop.runHarvest(running, { ...opts(started + 90000000, 2700000), maxAgeMs: 86400000 }).why, "idle");
+  // Off by default-if-zero, and never invented from a record with no readable
+  // sign of life at all (which would stop live runs).
+  assert.strictEqual(workLoop.runHarvest(running, opts(started + 90000000, 0)).why, "watchdog");
+  assert.strictEqual(workLoop.runHarvest(running, opts(started + 90000000, 2700000, 0)).why, "watchdog");
+  // A record that is already terminal is done, never idle.
+  assert.strictEqual(workLoop.runHarvest({ ...running, state: "done" }, opts(started + 90000000, 2700000)).why, "state");
+});
+
 test("runHarvest: a non-terminal run is followed until the watchdog age, then let go with no claim about it", () => {
   const started = Date.parse("2026-08-26T10:00:00.000Z");
   const running = { run_id: "r", state: "running", launch_mode: "native-background", created_at: new Date(started).toISOString() };
@@ -1302,4 +1330,263 @@ test("a declined run frees its slot without a gate, is tallied apart, and cools 
   const cooled = status.skipped.find((x) => x.id === "task-a");
   assert.ok(cooled, "the declined item does not come straight back to this worker");
   assert.match(cooled.reason, /declined — the server half already shipped .* \(finding find-declined-a-1234abcd\)/);
+});
+
+// ------------------------------------------------ pollWorkRuns: idle + grace --
+//
+// The two halves of task-spor-work-idle-run-detection, driven through the real
+// wiring (bin/spor.js pollWorkRuns) against a scratch graph home:
+//
+//   - a run that has stopped writing anything is STOPPED and classified, rather
+//     than pinning its slot until the 24h watchdog. `runHarvest` above decides
+//     it; this is what acting on that decision does;
+//   - a `contract_pending` record whose supervisor never landed the verified
+//     verdict is not filed under the provisional one without RE-READING the
+//     graph first — a run that genuinely resolved its target reads `resolved`.
+
+const sporCli = require("../bin/spor.js");
+const { loadConfig } = require("../lib/config.js");
+const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+const { spawn } = require("node:child_process");
+
+// A scratch SPOR_HOME with one task and, optionally, the decision that resolves
+// it — the exact evidence WORKERS.md §6 calls `resolved`.
+function pollFixture({ resolver = false } = {}) {
+  // The live-agent listing is irrelevant to both halves under test (neither
+  // record is native-background) and probing for real would spawn every
+  // installed harness CLI; the canned empty listing is the same seam
+  // `enumerateHarnessAgents` offers everywhere else.
+  process.env.SPOR_FAKE_AGENTS_JSON = "[]";
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-poll-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  fs.writeFileSync(
+    path.join(nodes, "task-wedged.md"),
+    "---\nid: task-wedged\ntype: task\nrepo: demo\ntitle: Add bounded retry to the sync worker\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: open\ndate: 2026-09-03\n---\n\nBody.\n"
+  );
+  if (resolver) {
+    fs.writeFileSync(
+      path.join(nodes, "dec-retry-added.md"),
+      "---\nid: dec-retry-added\ntype: decision\ntitle: Added bounded retry to the sync worker\nsummary: Added bounded retry with backoff to the sync worker, so a transient failure retries instead of dropping the record.\ndate: 2026-09-03\nedges:\n  - {type: resolves, to: task-wedged}\n---\n\nBody.\n"
+    );
+  }
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  return { home, nodes, cfg };
+}
+
+function writeRecord(home, runId, extra) {
+  const rec = { run_id: runId, node_id: "task-wedged", name: "task-wedged", harness: "workfake", cwd: home, ...extra };
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, rec);
+  return rec;
+}
+
+// A supervised run's log, opened at launch and untouched since — the OBSERVED
+// output channel the idle ceiling reads a run's freshness off. Without one the
+// run has no observable channel at all and is deliberately not judged idle.
+function silentLog(home, runId, agoMs) {
+  const file = dispatchRuns.runPaths(home, runId).log;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "");
+  const at = (Date.now() - agoMs) / 1000;
+  fs.utimesSync(file, at, at);
+  return file;
+}
+
+// A real process to stand in for a supervisor that is alive and identity-checks
+// clean — the ONLY case reconciliation leaves a run open indefinitely, and
+// therefore the only one an idle ceiling has to catch.
+function liveProcess() {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1e9)"], { stdio: "ignore" });
+  return { pid: child.pid, ticks: dispatchRuns.processStartTicks(child.pid), kill: () => { try { child.kill("SIGKILL"); } catch { /* gone */ } } };
+}
+
+async function goneWithin(pid, ms = 5000) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (!dispatchRuns.pidAlive(pid)) return true;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return dispatchRuns.pidAlive(pid) === false;
+}
+
+test("pollWorkRuns: a run silent past the idle ceiling is STOPPED and classified, not followed to the watchdog", async () => {
+  const { home, cfg } = pollFixture();
+  const proc = liveProcess();
+  try {
+    const runId = "run-idle-1";
+    writeRecord(home, runId, {
+      state: "running",
+      launch_mode: "supervised-jsonl",
+      created_at: new Date(Date.now() - 3600000).toISOString(),
+      log_path: silentLog(home, runId, 3600000),
+      runner_pid: proc.pid,
+      runner_started_ticks: proc.ticks,
+    });
+    const warned = [];
+    const [verdict] = await sporCli.pollWorkRuns(cfg, [runId], { maxAgeMs: 86400000, idleMs: 60000, warn: (l) => warned.push(l) });
+
+    assert.strictEqual(verdict.terminal, true, "the slot is freed on the same pass the ceiling is crossed");
+    assert.strictEqual(verdict.record.state, "failed");
+    assert.strictEqual(verdict.record.termination_class, "idle");
+    assert.strictEqual(verdict.record.termination_signal, "idle-timeout");
+    assert.match(verdict.record.termination_reason, /wrote nothing to its log or transcript/);
+    assert.strictEqual(verdict.record.terminal_state, "failed");
+    assert.strictEqual(verdict.record.terminal_enforced, false, "nothing verified it — the graph does not show the target resolved");
+    assert.ok(!verdict.cool_ms, "we ENDED the run rather than giving up on it, so the ordinary refusal window applies");
+    assert.match(warned.join("\n"), /stopping run run-idle/);
+    assert.match(warned.join("\n"), /nothing written to its log or transcript for 60m \(idle ceiling 1m\)/);
+
+    // Durable, not just reported: `spor runs` and the resume scan read the file.
+    const onDisk = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+    assert.strictEqual(onDisk.state, "failed");
+    assert.strictEqual(onDisk.termination_signal, "idle-timeout");
+    // And the wedged process is actually gone — the whole point of stopping it.
+    assert.strictEqual(await goneWithin(proc.pid), true, "the idle run's supervisor was signalled, not just recorded");
+  } finally {
+    proc.kill();
+  }
+});
+
+test("pollWorkRuns: an idle run whose target reads resolved is classified RESOLVED — a stop is not evidence the work was not done", async () => {
+  const { home, cfg } = pollFixture({ resolver: true });
+  const proc = liveProcess();
+  try {
+    const runId = "run-idle-2";
+    writeRecord(home, runId, {
+      state: "running",
+      launch_mode: "supervised-jsonl",
+      created_at: new Date(Date.now() - 3600000).toISOString(),
+      log_path: silentLog(home, runId, 3600000),
+      runner_pid: proc.pid,
+      runner_started_ticks: proc.ticks,
+    });
+    const [verdict] = await sporCli.pollWorkRuns(cfg, [runId], { maxAgeMs: 86400000, idleMs: 60000 });
+    assert.strictEqual(verdict.record.state, "failed", "the PROCESS was stopped mid-flight, and the record says so");
+    assert.strictEqual(verdict.record.terminal_state, "resolved", "the OUTCOME is a graph read: the agent wrote its resolver, then wedged");
+    assert.strictEqual(verdict.record.terminal_enforced, true);
+    assert.strictEqual(verdict.record.resolved_by, "dec-retry-added");
+    assert.strictEqual(await goneWithin(proc.pid), true);
+  } finally {
+    proc.kill();
+  }
+});
+
+test("pollWorkRuns: an idle run with no process of ours to signal takes the WATCHDOG's cooldown, not the ordinary one", async () => {
+  // A native-background agent lives in the harness's own daemon, which this
+  // client has no stop verb for. Freeing the slot is still right — 45 minutes
+  // of silence is not a working agent — but we only stopped FOLLOWING it, so
+  // the node must not come straight back round to a worker and put a second
+  // agent into a checkout the first may still hold.
+  const { home, cfg } = pollFixture();
+  const runId = "run-idle-native";
+  const cwd = path.join(home, "checkout");
+  // A native run's observable channel is the harness's own session transcript,
+  // reachable only through a bound session id.
+  const configDir = path.join(home, "cc");
+  const projectDir = path.join(configDir, "projects", cwd.replace(/[^A-Za-z0-9]/g, "-"));
+  fs.mkdirSync(projectDir, { recursive: true });
+  const transcript = path.join(projectDir, "sid-live.jsonl");
+  fs.writeFileSync(transcript, "{}\n");
+  const anHourAgo = (Date.now() - 3600000) / 1000;
+  fs.utimesSync(transcript, anHourAgo, anHourAgo);
+  writeRecord(home, runId, {
+    state: "running",
+    launch_mode: "native-background",
+    session_id: "sid-live",
+    cwd,
+    created_at: new Date(Date.now() - 3600000).toISOString(),
+  });
+  // The harness still lists the agent, so reconciliation leaves the record
+  // open — the exact case the idle ceiling is the only thing that can free.
+  process.env.SPOR_FAKE_AGENTS_JSON = JSON.stringify([{ id: "a1", sessionId: "sid-live", kind: "background", state: "running", cwd }]);
+  const warned = [];
+  let verdict;
+  process.env.CLAUDE_CONFIG_DIR = configDir;
+  try {
+    [verdict] = await sporCli.pollWorkRuns(cfg, [runId], { maxAgeMs: 86400000, idleMs: 60000, warn: (l) => warned.push(l) });
+  } finally {
+    delete process.env.CLAUDE_CONFIG_DIR;
+    process.env.SPOR_FAKE_AGENTS_JSON = "[]";
+  }
+  assert.strictEqual(verdict.terminal, true);
+  assert.strictEqual(verdict.cool_ms, 60000, "cooled for at least as long as the silence we waited out");
+  assert.match(verdict.record.termination_reason, /no process of ours left to signal/);
+  assert.match(warned.join("\n"), /giving up following run run-idle/);
+  assert.match(warned.join("\n"), /something may still be running in its checkout/);
+});
+
+test("pollWorkRuns: a run with NO observable output channel is never judged idle — it falls through to the watchdog", async () => {
+  // A `claude --bg` launch binds its session best-effort and deliberately
+  // leaves the record session-less rather than guessing, so such a record has
+  // no transcript and no log of ours. Reading its LAUNCH as its last activity
+  // would stop a perfectly healthy agent the moment the ceiling passed.
+  const { home, cfg } = pollFixture();
+  const runId = "run-unbound";
+  writeRecord(home, runId, {
+    state: "running",
+    launch_mode: "native-background",
+    created_at: new Date(Date.now() - 3600000).toISOString(),
+  });
+  process.env.SPOR_FAKE_AGENTS_JSON = JSON.stringify([{ id: "a2", name: "task-wedged", kind: "background", state: "running", cwd: home, startedAt: Date.now() - 3600000 }]);
+  const [verdict] = await sporCli.pollWorkRuns(cfg, [runId], { maxAgeMs: 86400000, idleMs: 60000 });
+  assert.strictEqual(verdict.terminal, false, "the slot is held; the 24h watchdog is the honest instrument here");
+  assert.strictEqual(verdict.record.state, "running", "and the record is left open, not closed as failed");
+  process.env.SPOR_FAKE_AGENTS_JSON = "[]";
+});
+
+test("pollWorkRuns: a contract-pending record is verified against the graph before it is filed under the provisional verdict", async () => {
+  // The record a supervised run writes SYNCHRONOUSLY on close: terminal, with
+  // an unenforced placeholder, waiting on the contract's verify leg. A
+  // supervisor killed inside that window never lands the real one, and
+  // harvesting it as-is files a run that RESOLVED its target as an unenforced
+  // `reported` — then gates it and cools it off despite being done.
+  const { home, cfg } = pollFixture({ resolver: true });
+  const runId = "run-grace-1";
+  writeRecord(home, runId, {
+    state: "done",
+    launch_mode: "supervised-jsonl",
+    created_at: new Date(Date.now() - 600000).toISOString(),
+    finished_at: new Date(Date.now() - 300000).toISOString(),
+    contract_pending: true,
+    terminal_state: "reported",
+    terminal_enforced: false,
+    terminal_note: "provisional",
+    gate_state: "running",
+  });
+  const [verdict] = await sporCli.pollWorkRuns(cfg, [runId], { maxAgeMs: 86400000, idleMs: 0 });
+  assert.strictEqual(verdict.terminal, true);
+  assert.strictEqual(verdict.record.terminal_state, "resolved");
+  assert.strictEqual(verdict.record.terminal_enforced, true);
+  assert.strictEqual(verdict.record.resolved_by, "dec-retry-added");
+  assert.strictEqual(verdict.record.contract_pending, false, "the contract is settled — by this worker, since nothing else was going to");
+  assert.match(verdict.record.terminal_note, /verified by this worker/);
+  assert.strictEqual(verdict.record.gate_state, "running", "the out-of-band gate namespace survives this write, as it does the supervisor's");
+
+  const onDisk = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  assert.strictEqual(onDisk.terminal_state, "resolved");
+  assert.strictEqual(onDisk.contract_pending, false);
+});
+
+test("pollWorkRuns: a contract-pending record the graph does NOT show resolved is left exactly as it was", async () => {
+  // Only a POSITIVE reading may overwrite what a record says. "We could not
+  // tell" leaves the provisional verdict — and the pending flag — for a slow
+  // supervisor to settle, rather than inventing a verdict of our own.
+  const { home, cfg } = pollFixture();
+  const runId = "run-grace-2";
+  writeRecord(home, runId, {
+    state: "done",
+    launch_mode: "supervised-jsonl",
+    created_at: new Date(Date.now() - 600000).toISOString(),
+    finished_at: new Date(Date.now() - 300000).toISOString(),
+    contract_pending: true,
+    terminal_state: "reported",
+    terminal_enforced: false,
+    terminal_note: "provisional",
+  });
+  const [verdict] = await sporCli.pollWorkRuns(cfg, [runId], { maxAgeMs: 86400000, idleMs: 0 });
+  assert.strictEqual(verdict.terminal, true);
+  assert.strictEqual(verdict.record.terminal_state, "reported");
+  assert.strictEqual(verdict.record.terminal_enforced, false);
+  assert.strictEqual(verdict.record.contract_pending, true);
+  assert.strictEqual(dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record).contract_pending, true);
 });

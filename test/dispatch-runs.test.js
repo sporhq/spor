@@ -1266,3 +1266,186 @@ test("dispatch: a harness that exits non-zero without leaving an agent is record
   assert.strictEqual(rec.launcher_exit, 7);
   assert.match(rec.termination_reason, /exited 7 without leaving a background agent/);
 });
+
+// --- idleness (task-spor-work-idle-run-detection) ---------------------------
+// Reconciliation only ever asks "is this over?", and answers NO for a live,
+// identity-confirmed supervisor however long it has been wedged — deliberately,
+// since a long job may legitimately go quiet. A WORKER holding a slot, a lease
+// and a worktree for that run needs the other question answered too, and these
+// are the pieces it uses.
+
+test("lastActivityAt: a native run's TRANSCRIPT counts as a sign of life, not just a supervisor's log", () => {
+  // `log_path` is a supervised-only field, so a silence check that looked there
+  // alone would read every native-background run as quiet since launch.
+  const configDir = scratch("spor-runs-cc-");
+  const cwd = "/tmp/spor-runs-native-idle";
+  const file = writeTranscript(configDir, cwd, "sid-idle", [CLEAN_END]);
+  const twoHoursAgo = Date.parse("2026-07-20T08:00:00.000Z") / 1000;
+  fs.utimesSync(file, twoHoursAgo, twoHoursAgo);
+  const rec = { run_id: "nat-idle", launch_mode: "native-background", cwd, session_id: "sid-idle", created_at: "2026-07-18T10:00:00.000Z" };
+  assert.strictEqual(
+    runner.lastActivityAt(rec, fs.statSync, { CLAUDE_CONFIG_DIR: configDir }),
+    twoHoursAgo * 1000,
+    "the transcript's mtime is the run's freshness, not the launch two days earlier"
+  );
+  // A record with nothing to stat at all still falls back to its own launch.
+  assert.strictEqual(
+    runner.lastActivityAt({ ...rec, session_id: null }, fs.statSync, { CLAUDE_CONFIG_DIR: configDir }),
+    Date.parse("2026-07-18T10:00:00.000Z")
+  );
+});
+
+test("stopRun: the whole process GROUP is signalled, escalated to SIGKILL, and identity-checked", async () => {
+  const alive = () => spawn(process.execPath, ["-e", "setInterval(() => {}, 1e9)"], { stdio: "ignore" });
+  const child = alive();
+  const supervisor = alive();
+  const gone = async (pid) => {
+    for (let i = 0; i < 200 && runner.pidAlive(pid); i += 1) await new Promise((r) => setTimeout(r, 25));
+    return !runner.pidAlive(pid);
+  };
+  try {
+    const stopped = await runner.stopRun({
+      run_id: "stop-1",
+      child_pid: child.pid,
+      runner_pid: supervisor.pid,
+      runner_started_ticks: runner.processStartTicks(supervisor.pid),
+    }, { graceMs: 200 });
+    assert.strictEqual(stopped.child, true, "the harness child must never outlive its supervisor as an orphan");
+    assert.strictEqual(stopped.supervisor, true);
+    assert.strictEqual(stopped.alive, false, "a stop is only a stop once nothing we signalled still answers");
+    assert.strictEqual(await gone(child.pid), true);
+    assert.strictEqual(await gone(supervisor.pid), true);
+  } finally {
+    child.kill("SIGKILL");
+    supervisor.kill("SIGKILL");
+  }
+
+  // The GROUP, not just the two recorded pids: a supervisor is spawned
+  // `detached`, so everything the harness child spawned shares its group and
+  // would otherwise be left running in the worktree the loop is about to make
+  // re-dispatchable. This grandchild TRAPS SIGTERM — the case the group SIGKILL
+  // exists for, and the one where neither recorded pid is a survivor, so the
+  // escalation must not be gated on them.
+  if (process.platform !== "win32") {
+    const pidFile = path.join(scratch("spor-runs-group-"), "grandchild.pid");
+    // The grandchild announces itself only AFTER installing its trap: written
+    // by the leader at spawn time, the file would race the grandchild's own
+    // boot and the first SIGTERM would kill it by default action — leaving the
+    // test green whether or not the group SIGKILL below ever fires.
+    const grandchildSrc = `process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1e9);`;
+    const leaderSrc = `
+      require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(grandchildSrc)}], { stdio: "ignore" });
+      setInterval(() => {}, 1e9);
+    `;
+    const leader = spawn(process.execPath, ["-e", leaderSrc], { stdio: "ignore", detached: true });
+    try {
+      for (let i = 0; i < 100 && !fs.existsSync(pidFile); i += 1) await new Promise((r) => setTimeout(r, 25));
+      const grandchild = Number(fs.readFileSync(pidFile, "utf8"));
+      assert.ok(grandchild > 0 && runner.pidAlive(grandchild), "the fixture must actually have a live grandchild to stop");
+      const stopped = await runner.stopRun(
+        { run_id: "stop-group", runner_pid: leader.pid, runner_started_ticks: runner.processStartTicks(leader.pid) },
+        { graceMs: 300 }
+      );
+      assert.strictEqual(stopped.group, true, "identity was proven, so the group is signalled");
+      assert.strictEqual(await gone(leader.pid), true);
+      assert.strictEqual(await gone(grandchild), true, "a grandchild that ignored SIGTERM is still SIGKILLed with the group");
+      assert.strictEqual(stopped.alive, false, "and with the group empty, the stop reads as taken");
+    } finally {
+      try { process.kill(-leader.pid, "SIGKILL"); } catch { /* already reaped */ }
+    }
+  }
+
+  // A supervisor whose identity could NOT be proven (no recorded ticks, or a
+  // host with no /proc) keeps the single per-pid SIGTERM it always got — a
+  // group blast inferred from an unverified pid is a far wider mistake.
+  const unproven = alive();
+  try {
+    const stopped = await runner.stopRun({ run_id: "stop-unproven", runner_pid: unproven.pid }, { graceMs: 200 });
+    assert.strictEqual(stopped.group, false, "no identity, no group");
+    assert.strictEqual(stopped.supervisor, true);
+    assert.strictEqual(await gone(unproven.pid), true);
+  } finally {
+    unproven.kill("SIGKILL");
+  }
+
+  // A recycled pid belongs to an unrelated process: killing THAT is a real
+  // mistake, not cleanup, so a tick-count mismatch signals nothing — and
+  // nothing is escalated against either.
+  if (process.platform === "linux") {
+    const bystander = alive();
+    try {
+      const stopped = await runner.stopRun({ run_id: "stop-2", runner_pid: bystander.pid, runner_started_ticks: runner.processStartTicks(bystander.pid) + 1 }, { graceMs: 50 });
+      assert.deepStrictEqual(stopped, { child: false, supervisor: false, group: false, alive: false });
+      assert.strictEqual(runner.pidAlive(bystander.pid), true, "an unrelated process that inherited the pid is left alone");
+    } finally {
+      bystander.kill("SIGKILL");
+    }
+    // Same for a child whose recorded identity cannot be confirmed and whose
+    // supervisor is already gone: no group to signal, and not ours to kill.
+    const orphan = alive();
+    try {
+      const stopped = await runner.stopRun({ run_id: "stop-4", child_pid: orphan.pid, child_started_ticks: runner.processStartTicks(orphan.pid) + 1 }, { graceMs: 50 });
+      assert.strictEqual(stopped.child, false);
+      assert.strictEqual(runner.pidAlive(orphan.pid), true);
+    } finally {
+      orphan.kill("SIGKILL");
+    }
+  }
+  // Nothing of ours left to signal is not an error — the record says so instead.
+  assert.deepStrictEqual(await runner.stopRun({ run_id: "stop-3", launch_mode: "native-background" }), { child: false, supervisor: false, group: false, alive: false });
+});
+
+test("observedActivityAt: a run with no readable output channel answers 0, never its launch timestamp", () => {
+  // The idle ceiling keys on this: a native-background record whose session was
+  // never bound has no transcript to read, and reading its LAUNCH as its last
+  // activity would declare a healthy agent wedged the moment the ceiling passed.
+  const unbound = { run_id: "nat-unbound", launch_mode: "native-background", cwd: "/tmp/spor-runs-unbound", created_at: "2026-07-18T10:00:00.000Z" };
+  assert.strictEqual(runner.observedActivityAt(unbound), 0);
+  assert.strictEqual(runner.lastActivityAt(unbound), Date.parse("2026-07-18T10:00:00.000Z"), "the launch fallback stays, for the callers that want it");
+
+  // A supervised run's log is opened at launch, so it is always observable.
+  const home = scratch("spor-runs-store-");
+  const rec = supervisedRecord(home, "sup-observed");
+  fs.mkdirSync(path.dirname(rec.log_path), { recursive: true });
+  fs.writeFileSync(rec.log_path, "");
+  const anHourBefore = Date.parse("2026-07-20T09:00:00.000Z") / 1000;
+  fs.utimesSync(rec.log_path, anHourBefore, anHourBefore);
+  assert.strictEqual(runner.observedActivityAt(rec), anHourBefore * 1000);
+});
+
+test("finalizeIdleRun: an environment cause in the log still wins over the generic idle reading", () => {
+  const home = scratch("spor-runs-store-");
+  const rec = supervisedRecord(home, "sup-idle-credits");
+  fs.mkdirSync(path.dirname(rec.log_path), { recursive: true });
+  fs.writeFileSync(rec.log_path, "thinking…\nError: your account is out of usage credits\n");
+  const patch = runner.finalizeIdleRun(rec, { idleMs: 2700000, quietAt: Date.parse("2026-07-20T09:00:00.000Z"), now: () => "2026-07-20T10:00:00.000Z" });
+  assert.strictEqual(patch.state, "failed");
+  assert.strictEqual(patch.termination_class, "environment", "an agent silent since it ran out of credits died of the credits");
+  assert.strictEqual(patch.termination_signal, "credit-exhausted");
+
+  // With nothing recognized, it is idleness, said plainly and unverified.
+  const plain = supervisedRecord(home, "sup-idle-plain");
+  const idle = runner.finalizeIdleRun(plain, { idleMs: 2700000, quietAt: Date.parse("2026-07-20T09:00:00.000Z"), now: () => "2026-07-20T10:00:00.000Z", stopped: { child: true, supervisor: true } });
+  assert.strictEqual(idle.termination_signal, "idle-timeout");
+  assert.match(idle.termination_reason, /nothing to its log or transcript for 60m \(the idle ceiling is 45m\)/);
+  assert.strictEqual(idle.child_reaped, true);
+  assert.strictEqual(idle.terminal_state, "failed");
+  assert.strictEqual(idle.terminal_enforced, false);
+  // A caller-supplied verified outcome is the outcome — a stop is not evidence
+  // the work was not done.
+  const resolved = runner.finalizeIdleRun(plain, { idleMs: 2700000, outcome: { terminal_state: "resolved", terminal_enforced: true, resolved_by: "dec-x" } });
+  assert.strictEqual(resolved.terminal_state, "resolved");
+  assert.strictEqual(resolved.state, "failed", "the PROCESS dimension still records that it was stopped mid-flight");
+  // An already-terminal record is done, never idle.
+  assert.strictEqual(runner.finalizeIdleRun({ ...plain, state: "done" }, { idleMs: 2700000 }), null);
+});
+
+test("stopIdleRun: a supervisor that finished in the same instant keeps its own observed outcome", async () => {
+  const home = scratch("spor-runs-store-");
+  const rec = supervisedRecord(home, "sup-idle-race");
+  // The supervisor's own close landing between the caller's read and this write.
+  runner.atomicJson(runner.runPaths(home, "sup-idle-race").record, { ...rec, state: "done", terminal_state: "reported", terminal_enforced: true });
+  const { record: out } = await runner.stopIdleRun(home, rec, { idleMs: 2700000, quietAt: Date.now() - 3600000 });
+  assert.strictEqual(out.state, "done", "an observed outcome is never overwritten by a derived one");
+  assert.strictEqual(out.terminal_state, "reported");
+});

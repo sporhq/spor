@@ -509,8 +509,8 @@ violation — new fields may be added additively.
 | `finished_at` | ISO 8601 | when the record went terminal |
 | `exit_code` | int \| null | supervised runs only |
 | `signal` | string \| null | supervised runs only — the OS signal, if any |
-| `termination_class` | string | a broad bucket: `"completed"`, `"environment"` (credit/rate/auth exhaustion — re-dispatchable, not a real failure), `"launch"`, `"failed"` (a supervised child that launched but exited nonzero for no recognized environment reason), or `"unknown"` — an open vocabulary; do not exhaustively `switch` on it |
-| `termination_signal` | string | a short machine tag within the class, e.g. `"supervised-exit"`, `"nonzero-exit"`, `"credit-exhausted"`, `"supervisor-gone"`, `"launch-failed"` |
+| `termination_class` | string | a broad bucket: `"completed"`, `"environment"` (credit/rate/auth exhaustion — re-dispatchable, not a real failure), `"launch"`, `"failed"` (a supervised child that launched but exited nonzero for no recognized environment reason), `"idle"` (a run that stopped writing anything and was stopped for it), or `"unknown"` — an open vocabulary; do not exhaustively `switch` on it |
+| `termination_signal` | string | a short machine tag within the class, e.g. `"supervised-exit"`, `"nonzero-exit"`, `"credit-exhausted"`, `"supervisor-gone"`, `"launch-failed"`, `"idle-timeout"` |
 | `termination_reason` | string | a human-readable one-line explanation (≤ 300 chars) |
 | `error` | string | optional — the raw underlying error message, when there was one |
 | `session_id` | string \| null | the harness's own session/thread id, possibly bound after launch (§2) |
@@ -528,6 +528,31 @@ on a just-closed record is still the provisional placeholder rather than the
 settled verdict (a record goes terminal synchronously, and §6 runs a beat
 later). They are not meaningful to an external consumer, which should poll for
 `terminal_state` rather than trying to interpret them.
+
+**A `contract_pending` record is verified before it is believed.** A supervisor
+killed inside that window never lands the real verdict, so the placeholder — an
+unenforced `reported`, or `failed` — would otherwise be filed as the outcome of
+a run that genuinely resolved its target, and then gated and cooled off for it.
+Whoever harvests such a record re-runs §6's verify leg itself (`spor work`
+does), and only a POSITIVE reading overwrites the placeholder: a graph it
+cannot reach leaves the record exactly as it was, still flagged pending. The
+same read classifies a run stopped for **idleness** — a run whose log and
+transcript have both stopped moving for `work.runIdleMs` (`--run-idle`, default
+45 minutes) is stopped and recorded `failed` / `termination_class: "idle"`,
+because a wedged agent otherwise holds its worker's slot, its lease and its
+worktree until the 24-hour `--run-max` watchdog. Its *outcome* is still a graph
+read: an agent that wrote its resolver and then hung reads `resolved`, and
+being stopped is not evidence otherwise.
+
+What the ceiling measures is **silence**, not idleness. A run's observable
+output — the supervisor's JSONL log, or a native launch's session transcript —
+only moves when a tool result comes back, so a single tool call that runs longer
+than the ceiling (a full test matrix, a slow image build) is indistinguishable
+from a wedged agent and is stopped mid-work. Raise `--run-idle` (or set it to
+`0`) for a lane whose steps genuinely run that long. A run with **no** observable
+channel at all — a native launch whose session was never bound — is never judged
+idle; it falls through to the 24-hour watchdog, which frees the slot without
+making any claim about the run.
 
 **Outcome dimension** (present once §6 has run against this record; a
 record still `launching`/`running` has none of these yet):
