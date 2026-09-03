@@ -281,6 +281,7 @@ writing its resolver still finished the job.
 | `resolved` | the target is genuinely done | re-reading the graph shows a **live inbound `resolves`/`answers` edge** onto the target node |
 | `reported` | not done, but the work reached the graph | no resolving edge, but the worker's final report was filed as an artifact `relates-to` the target |
 | `failed` | nothing usable reached the graph | no resolving edge and no usable report |
+| `declined` | the worker declared the ITEM wrong, not the work unfinished | no resolving edge, and the final report's **first line** is `DECLINED: <reason>` — the reason is filed as a `finding` on the target, its `readiness: agent` stamp is cleared, and the lease is released; the item goes to triage, never to a gate |
 
 **`resolved` is a graph read, never an exit code, never the worker's own
 claim.** Re-fetch the node — `GET /v1/nodes/{id}` — and check its
@@ -299,6 +300,39 @@ process-level fact (§8's `state`/`termination_*` fields), never conflated
 with the outcome. The invariant a consumer keys on: whenever a report
 artifact id is present, `terminal_state` is `reported` — always, whether the
 verdict was fully verified or not (see "unverifiable targets" below).
+
+**A decline is a fixed form, not prose.** A worker that finds the item
+itself wrong — its premise no longer holds, it is already done, the change
+belongs in another repo — declines it: commits nothing, writes no resolver,
+and makes the first non-blank line of its final message exactly `DECLINED:
+<one-line reason>` (the rest of the message explains; a heading or bold
+wrapper around the line is tolerated). The runner reads that line and nothing
+else — "I declined" in a later paragraph is a report, not a declaration. Two
+of the first live factory's eight human escalations were honest declines
+misfiled this way (task-spor-worker-declined-outcome): the implementer refused
+with a clean tree, the pipeline ran the review gate into its fail-closed
+empty-diff rule, and a person was paged about a change that was never
+proposed. A declined run:
+
+- is never gated (§10.2) — it carries no claim of completion to test;
+- has its reason filed as a **`finding`** node (`find-declined-<stem>-<run>`,
+  `relates-to` the target, never `resolves`/`blocks`) with the full report in
+  the body, so the item re-briefs with the decline attached the next time it
+  is compiled;
+- has its **`readiness: agent` stamp cleared** (`POST
+  /v1/nodes/{id}/readiness {readiness: "clear"}`) — the stamp was the claim the
+  decline contradicts, and clearing it is what keeps a `work.accept: ready`
+  worker from re-dispatching the item as written;
+- releases the lease, in the same file-then-release order as a report.
+
+The graph still wins over the words: a run whose target reads resolved is
+`resolved` whatever its final line says, and is gated (where its empty diff
+fails closed as before — a decline with a resolver behind it is judged as the
+claim it makes). `finding_node_id` present ⇒ `terminal_state === "declined"`,
+the twin of the `report_node_id` invariant above. An unreachable server or a
+local-mode run still reads a decline as `declined` (unenforced: nothing filed,
+nothing cleared) rather than as an unenforced `reported`, so a local factory
+does not gate it either.
 
 **Unverifiable targets.** Only node types whose completion is a *resolving
 edge* rather than a status flip — `task`, `issue`, `question`, `incident` —
@@ -319,6 +353,10 @@ never the other way, and never both-or-neither on a failure.**
 1. Re-read the target node; a live resolving edge → done, **`resolved`**,
    release nothing (the durable `assigned` edge already stands as the record
    of who did the work).
+1b. No resolving edge and the report's first line is `DECLINED: <reason>` →
+   file the finding, clear the readiness stamp, release the lease →
+   **`declined`**. A refused finding write leaves the lease held, as in step
+   3; a refused readiness clear is noted and never fatal.
 2. Target is an **unjudgeable type** (`decision`/`finding` — see above) →
    file the report if text exists, worded "not verified"; **release
    nothing either way** — `terminal_state` reads `reported` if a report was
@@ -361,6 +399,13 @@ above directly against REST once your worker process ends:
 ```
 1. GET  /v1/nodes/{targetId}
 2. if resolution.by present               → terminal_state = resolved; done, no release
+2b. elif report's first line is `DECLINED: <reason>`
+                                           → POST /v1/nodes (file the finding, if_exists: skip)
+                                             if the write lands: POST /v1/nodes/{targetId}/readiness {readiness: "clear"}
+                                                                 POST /v1/nodes/{leaseNode}/release
+                                                                  → terminal_state = declined
+                                             if the write is refused: leave the lease held
+                                                                  → terminal_state = declined (held)
 3. elif targetId's type is decision/finding (an unjudgeable type, §6)
                                            → if final report text exists: POST /v1/nodes (file it, §7, if_exists: skip)
                                                 → terminal_state = reported, terminal_enforced = false
@@ -489,11 +534,14 @@ record still `launching`/`running` has none of these yet):
 
 | Field | Type | Meaning |
 |---|---|---|
-| `terminal_state` | string | `"resolved"` \| `"reported"` \| `"failed"` — see §6 |
+| `terminal_state` | string | `"resolved"` \| `"reported"` \| `"failed"` \| `"declined"` — see §6 |
 | `terminal_enforced` | bool | whether this was a *verified* verdict (re-read against a reachable graph) or a best-effort classification — **gate on this before trusting `terminal_state` as ground truth** |
 | `resolved_by` | string | present only when `terminal_state === "resolved"` — the resolver node's id |
 | `resolved_edge` | string | present only when resolved — `"resolves"` or `"answers"` |
 | `report_node_id` | string | present only when a report was actually filed — its presence always implies `terminal_state === "reported"`, but an unenforced `reported` record (§6) may have none (§7) |
+| `declined_reason` | string | present only when `terminal_state === "declined"` — the reason off the report's `DECLINED:` line |
+| `finding_node_id` | string | present only when a decline's finding was actually filed — its presence always implies `terminal_state === "declined"`; an unenforced declined record has none |
+| `readiness_cleared` | bool | declined only — whether the target's `readiness: agent` stamp was cleared |
 | `lease_released` | bool | optional — `true`/`false` reports whether a release attempt succeeded; **omitted** (not `false`) when no lease was this run's to release at all |
 | `terminal_note` | string | a human-readable explanation of the outcome, always present once this dimension exists |
 
@@ -676,7 +724,10 @@ Two run outcomes, and only two (`shouldGate`, lib/shell/work-loop.js):
   gating quietly mode-dependent.
 
 An ENFORCED `reported` run self-declares *not* done (the item is already back in
-the pool carrying its report) and a `failed` run produced nothing to gate.
+the pool carrying its report) and a `failed` run produced nothing to gate. A
+`declined` run (§6) is never gated, enforced or not: it declared the item wrong
+and its route is triage — the finding it filed re-briefs the item, and its
+readiness stamp is gone, so it does not come straight back to a worker either.
 
 A gated item **keeps its worker slot** until the pipeline settles — a slot frees
 on a settled outcome, and a gate verdict is part of that outcome. Its node is
@@ -699,7 +750,16 @@ under test cannot rewrite its own judge. So a command gate:
    the gate would take is then not the tree the agent produced. Untracked
    residue — a coverage dir, a build artifact a suite left behind — is ignored,
    since the gate builds its own tree from the commit. A `git status` that
-   cannot be read is itself a refusal, never a clean tree);
+   cannot be read is itself a refusal, never a clean tree). A tree that is
+   dirty in exactly that way gets **one commit-or-discard round-trip** before
+   any gate judges it (task-spor-worker-declined-outcome): a fix-cycle
+   dispatch into the run's own checkout, told to commit what belongs to the
+   item, discard what does not, and leave the tree clean. The tree is then
+   re-read; if it is clean the gates run normally, and if it is still dirty
+   the first gate refuses it unretried as before, with the round-trip on the
+   escalation so the person sees it was tried. Only the dirty-tree refusal
+   earns this — a missing checkout, an unresolvable trusted ref, or a failed
+   `git status` is about the checkout, not the work, and escalates directly;
 2. **fails CLOSED** if that change touches any declared protected test path —
    the suite is not run at all, no fix cycle is offered, and the test change is
    filed as its own queue item naming the `test_lane_profile` (a different

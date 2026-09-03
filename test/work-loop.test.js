@@ -29,7 +29,7 @@ const { writeSpawnableNodeStub, pathWithOnlyGitAndNode } = require("./helpers/po
 // A driver that runs the loop with no real clock, no real queue and no real
 // dispatch: `queue` is the page each poll returns, `dispatch` decides ok/refused
 // per item, and every launched run stays non-terminal until `finish()` says so.
-function harness({ queue = [], dispatch = () => ({ ok: true }), pollRuns = null, onTick = () => {}, opts = {}, maxPasses = 20 } = {}) {
+function harness({ queue = [], dispatch = () => ({ ok: true }), pollRuns = null, onTick = () => {}, opts = {}, maxPasses = 20, gate = null } = {}) {
   const state = {
     clock: 1_700_000_000_000,
     sleeps: [],
@@ -99,7 +99,9 @@ function harness({ queue = [], dispatch = () => ({ ok: true }), pollRuns = null,
     workLoop.runWorkLoop({
       opts: { workerId: "worker-test", pid: 4242, intervalMs: 1000, maxIntervalMs: 16000, retryAfterMs: 10000, ...opts },
       control,
-      deps,
+      // A gate dep only when a test hands one over — the bare loop's tests must
+      // stay exactly the bare loop (the full pipeline has test/gate-pipeline.test.js).
+      deps: gate ? { ...deps, gate } : deps,
     });
   state.control = control;
   return state;
@@ -151,7 +153,7 @@ test("a run whose record has vanished frees its slot, with no verdict invented f
   });
   const status = await h.run();
   assert.strictEqual(status.dispatched, 2, "the slot is freed, so the queue keeps moving");
-  assert.deepStrictEqual(status.outcomes, { resolved: 0, reported: 0, failed: 0, unenforced: 0 }, "a missing record is not evidence of any outcome");
+  assert.deepStrictEqual(status.outcomes, { resolved: 0, reported: 0, failed: 0, declined: 0, unenforced: 0 }, "a missing record is not evidence of any outcome");
   assert.strictEqual(status.recent[0].terminal_state, null);
   assert.ok(status.skipped.some((s) => s.id === "task-a"), "and the node cools off like any other unresolved run");
 });
@@ -1256,4 +1258,48 @@ test("spor work --status with nothing recorded says so, in both renderings", () 
   assert.match(text.stdout, /no spor work loops recorded/);
   const json = cli(["work", "--status", "--json"], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
   assert.deepStrictEqual(JSON.parse(json.stdout), { count: 0, workers: [] });
+});
+
+// --- declined (task-spor-worker-declined-outcome) -------------------------
+
+test("shouldGate: a DECLINED run is never gated, enforced or not — its route is triage", () => {
+  assert.strictEqual(workLoop.shouldGate({ terminal_state: "declined", terminal_enforced: true }), false);
+  assert.strictEqual(workLoop.shouldGate({ terminal_state: "declined", terminal_enforced: false }), false);
+  // ...while the two gateable cases are unchanged.
+  assert.strictEqual(workLoop.shouldGate({ terminal_state: "resolved", terminal_enforced: true }), true);
+  assert.strictEqual(workLoop.shouldGate({ terminal_state: "reported", terminal_enforced: false }), true);
+  assert.strictEqual(workLoop.shouldGate({ terminal_state: "reported", terminal_enforced: true }), false);
+  assert.strictEqual(workLoop.shouldGate({ terminal_state: "failed", terminal_enforced: true }), false);
+});
+
+test("a declined run frees its slot without a gate, is tallied apart, and cools the node off naming the finding", async () => {
+  const gated = [];
+  const h = harness({
+    queue: [{ id: "task-a", readiness: "agent" }],
+    opts: { concurrency: 1, max: 1 },
+    maxPasses: 4,
+    onTick: (state) =>
+      state.finishAll({
+        terminal_state: "declined",
+        terminal_enforced: true,
+        declined_reason: "the server half already shipped in 50c53d0",
+        finding_node_id: "find-declined-a-1234abcd",
+        terminal_note: "routed to triage",
+      }),
+    gate: async (args) => {
+      gated.push(args);
+      return { state: "passed", gates: [], facts: [] };
+    },
+  });
+  const status = await h.run();
+  assert.strictEqual(status.outcomes.declined, 1);
+  assert.strictEqual(status.outcomes.reported, 0);
+  assert.strictEqual(status.outcomes.unenforced, 0);
+  assert.deepStrictEqual(gated, [], "a decline carries no claim of completion — nothing to gate");
+  assert.deepStrictEqual(status.gating, []);
+  assert.strictEqual(status.recent[0].declined_reason, "the server half already shipped in 50c53d0");
+  assert.strictEqual(status.recent[0].finding_node_id, "find-declined-a-1234abcd");
+  const cooled = status.skipped.find((x) => x.id === "task-a");
+  assert.ok(cooled, "the declined item does not come straight back to this worker");
+  assert.match(cooled.reason, /declined — the server half already shipped .* \(finding find-declined-a-1234abcd\)/);
 });

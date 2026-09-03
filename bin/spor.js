@@ -9573,7 +9573,7 @@ function cmdWorkStatus(cfg, { json }) {
       `${String(w.worker_id).slice(0, 8)}  ${state}  ${w.project || "(all projects)"}  ` +
         `${w.accept ? `accept ${w.accept}  ` : ""}` +
         `${(w.active || []).length}/${w.concurrency} slots  dispatched ${w.dispatched || 0}  ` +
-        `resolved ${o.resolved || 0} reported ${o.reported || 0} failed ${o.failed || 0}` +
+        `resolved ${o.resolved || 0} reported ${o.reported || 0} failed ${o.failed || 0}${o.declined ? ` declined ${o.declined}` : ""}` +
         `${o.unenforced ? ` (${o.unenforced} unenforced)` : ""}`
     );
     if (w.gates)
@@ -10384,7 +10384,11 @@ function makeGateDeps(
     const already = launchedFixRun(home, entry.node_id, fixName);
     const launched = already ? { ok: true, run: already, adopted: true } : await dispatch(
       cfg,
-      { ...passthrough, node: entry.node_id, dir: change ? change.cwd : undefined, force: true, "no-worktree": true, name: fixName },
+      // `record.cwd` when the change could not be read: the commit-or-discard
+      // round-trip a DIRTY tree gets (gate-runner.js runGatePipeline) runs
+      // before any change set exists, and it has to land in the run's own
+      // checkout — a fresh worktree would never see the uncommitted files.
+      { ...passthrough, node: entry.node_id, dir: change ? change.cwd : (record && record.cwd) || undefined, force: true, "no-worktree": true, name: fixName },
       [prompt]
     );
     if (!launched.ok) return { ok: false, reason: launched.reason };
@@ -11335,7 +11339,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   if (!workLoop.shouldGate(record)) {
     err(
       `spor work --regate: run ${shortId} ended '${record.terminal_state || record.state}'${record.terminal_enforced ? " (enforced)" : ""} — ` +
-        "it carries no claim of completion to judge (only a resolved run, or an unenforced reported one, is gated)."
+        "it carries no claim of completion to judge (only a resolved run, or an unenforced reported one, is gated; a declined run never is)."
     );
     return 1;
   }

@@ -51,8 +51,8 @@ const BASE = {
 // A fake world: what the diff says, what the suite does, what a review answers,
 // what the graph accepts. Every write is captured so the tests can assert on
 // the FACTS, which is the deliverable, not just on the verdict.
-function fakes({ changed = ["lib/x.js"], suite = () => ({ ok: true }), review = () => ({ ok: true, text: '```json\n{"verdict":"pass"}\n```' }), fix = () => ({ ok: true }), approval = () => ({ state: "approved", by: "person-a" }), demote = () => ({ ok: true, demoted: true, note: "task-demo rolled back done -> open" }), writes = null } = {}) {
-  const seen = { facts: [], lane: [], human: [], escalations: [], demotions: [], suites: [], reviews: [], fixes: [], approvals: 0, slept: 0 };
+function fakes({ changed = ["lib/x.js"], changedSeq = null, suite = () => ({ ok: true }), review = () => ({ ok: true, text: '```json\n{"verdict":"pass"}\n```' }), fix = () => ({ ok: true }), approval = () => ({ state: "approved", by: "person-a" }), demote = () => ({ ok: true, demoted: true, note: "task-demo rolled back done -> open" }), writes = null } = {}) {
+  const seen = { facts: [], lane: [], human: [], escalations: [], demotions: [], suites: [], reviews: [], fixes: [], approvals: 0, slept: 0, reads: 0 };
   let clock = 1_700_000_000_000;
   const deps = {
     now: () => clock,
@@ -60,7 +60,13 @@ function fakes({ changed = ["lib/x.js"], suite = () => ({ ok: true }), review = 
       clock += ms;
       seen.slept += 1;
     },
-    changedPaths: async () => (changed === null ? { ok: false, reason: "unreadable tree" } : { ok: true, paths: changed }),
+    // `changedSeq`: what each successive read of the tree answers (the last
+    // entry repeats), for the tests where the tree MOVES between reads.
+    changedPaths: async () => {
+      seen.reads += 1;
+      if (changedSeq) return changedSeq[Math.min(seen.reads - 1, changedSeq.length - 1)];
+      return changed === null ? { ok: false, reason: "unreadable tree" } : { ok: true, paths: changed };
+    },
     runSuite: async (args) => {
       seen.suites.push(args.gate.id);
       return suite(args, seen);
@@ -720,6 +726,8 @@ test("gateChangeSet reads the committed change against the trusted ref, and refu
   const dirty = gateRunner.gateChangeSet({ cwd: dir }, "main");
   assert.strictEqual(dirty.ok, false);
   assert.match(dirty.reason, /uncommitted/);
+  assert.strictEqual(dirty.dirty, true, "a dirty tree is the ONE refusal the commit-or-discard round-trip may repair");
+  assert.strictEqual(dirty.cwd, dir);
 
   assert.strictEqual(gateRunner.gateChangeSet({ cwd: "/nonexistent/xyz" }, "main").ok, false);
   const notARepo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-plain-"));
@@ -2951,4 +2959,91 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.match(fixLaunch.prompt, /Advisory \(recorded, not enforced — fix if cheap\):\nF3 \[major\] x\.js — name the constant/);
   assert.match(fixLaunch.prompt, /Already resolved by earlier cycles \(do not regress\):\nF1 \[blocking\] x\.js — off by one/);
   assert.match(fixLaunch.prompt, /naming the finding ids you addressed in the commit message/);
+});
+
+// --- the dirty-tree round-trip (task-spor-worker-declined-outcome) --------
+// An uncommitted tree gets ONE commit-or-discard dispatch into the same
+// checkout before the first gate refuses it; every other unreadable reason
+// still goes straight to the gate.
+
+const DIRTY = { ok: false, dirty: true, cwd: "/wt/task-demo", reason: "the run left uncommitted changes to tracked files in /wt/task-demo — a gate judges committed work, so this one cannot judge it at all" };
+
+test("a dirty tree gets one commit-or-discard round-trip, and a tree that is clean afterwards is judged normally", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }, { id: "review", kind: "agent-review", profile: "profile-review" }] });
+  const { deps, seen } = fakes({ changedSeq: [DIRTY, { ok: true, paths: ["lib/x.js"] }] });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.strictEqual(seen.fixes.length, 1);
+  assert.strictEqual(seen.fixes[0].gate, "acceptance", "the round-trip is dispatched in the first gate's name");
+  assert.strictEqual(seen.fixes[0].cycle, "tree");
+  assert.deepStrictEqual(seen.fixes[0].findings, []);
+  assert.strictEqual(seen.reads, 2, "the tree is re-read after the round-trip");
+  assert.deepStrictEqual(seen.suites, ["acceptance"], "the suite ran once the tree was clean");
+  assert.deepStrictEqual(seen.escalations, [], "nobody was paged");
+  // The round-trip is recorded on the first gate's fact as an attempt.
+  assert.match(seen.facts[0].markdown, /dirty-tree/);
+});
+
+test("a tree still dirty after its one round-trip is refused by the first gate, unretried, with the round-trip on the escalation", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", cycles: 3 }] });
+  const { deps, seen } = fakes({ changedSeq: [DIRTY] });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.match(res.reason, /uncommitted changes/);
+  assert.strictEqual(seen.fixes.length, 1, "exactly one round-trip — never a second, whatever the gate's cycle cap says");
+  assert.strictEqual(seen.reads, 2);
+  assert.deepStrictEqual(seen.suites, []);
+  assert.strictEqual(seen.escalations.length, 1);
+  assert.deepStrictEqual(
+    seen.escalations[0].attempts.map((a) => a.verdict),
+    ["dirty-tree", "failed"],
+    "the escalation shows the person the round-trip was tried before they were paged"
+  );
+});
+
+test("a round-trip that cannot be dispatched falls through to the gate's own refusal", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+  const { deps, seen } = fakes({ changedSeq: [DIRTY], fix: () => ({ ok: false, reason: "no harness" }) });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(seen.fixes.length, 1);
+  assert.strictEqual(seen.reads, 1, "no re-read when the round-trip never ran");
+  assert.strictEqual(seen.escalations.length, 1);
+});
+
+test("every OTHER unreadable-change reason skips the round-trip and goes straight to the gate", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+  const { deps, seen } = fakes({ changedSeq: [{ ok: false, reason: "the trusted ref 'main' does not resolve" }] });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.deepStrictEqual(seen.fixes, [], "a missing ref is not the implementer's to fix");
+  assert.strictEqual(seen.reads, 1);
+});
+
+test("the round-trip is saved on the first gate's progress BEFORE it is dispatched, stays out of the ledger's cycle-indexed attempts, and is never repeated on a resume", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 2 }] });
+  // First worker: dirty tree, one round-trip, still dirty afterwards.
+  const saves = [];
+  const a = fakes({ changedSeq: [DIRTY], review: () => ({ ok: true, text: '```json\n{"verdict":"pass"}\n```' }) });
+  let store = null;
+  a.deps.loadGateProgress = async () => store;
+  a.deps.saveGateProgress = async ({ gate, progress }) => {
+    saves.push({ gate: gate.id, fixes: a.seen.fixes.length, progress: JSON.parse(JSON.stringify(progress)) });
+    store = JSON.parse(JSON.stringify(progress));
+  };
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: a.deps });
+  assert.strictEqual(a.seen.fixes.length, 1);
+  assert.strictEqual(saves[0].fixes, 0, "the round-trip is on the record before its dispatch");
+  assert.deepStrictEqual(saves[0].progress.preAttempts.map((x) => x.verdict), ["dirty-tree"]);
+  const last = saves[saves.length - 1].progress;
+  assert.deepStrictEqual(last.preAttempts.map((x) => x.verdict), ["dirty-tree"], "later ledger saves keep the round-trip on the record");
+  assert.ok(!last.attempts.some((x) => x.verdict === "dirty-tree"), "the ledger's cycle-indexed attempts never carry it");
+
+  // Second worker resumes the same pipeline with the tree still dirty: no second round-trip.
+  const b = fakes({ changedSeq: [DIRTY] });
+  b.deps.loadGateProgress = async () => store;
+  b.deps.saveGateProgress = async () => {};
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b.deps });
+  assert.deepStrictEqual(b.seen.fixes, [], "a resumed pipeline does not spend the round-trip again");
+  assert.strictEqual(res.state === "passed" || res.state === "failed", true);
 });

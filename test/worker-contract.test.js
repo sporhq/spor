@@ -74,3 +74,16 @@ test("the contract is harness-neutral — no harness-specific tool names, no bac
   }
   assert.match(text, /nobody is watching this session/);
 });
+
+test("both contracts carry the fixed DECLINED form the runner reads back, and say what it does", () => {
+  for (const text of [workerContract({ nodeId: "task-demo" }), workerContract({ nodeId: "task-demo", factory: factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "npm test" }] }) })]) {
+    assert.match(text, /If the ITEM itself is wrong/);
+    assert.match(text, /FIRST line of your final message exactly `DECLINED: <one-line reason>`/);
+    assert.match(text, /commit nothing, write no resolver/);
+    assert.match(text, /skips the gates and goes back to triage/);
+    assert.match(text, /A decline with commits behind it,\nor with a resolver written, is not a decline/);
+  }
+  // The form the contract prescribes is the form the contract layer parses.
+  const terminal = require("../lib/shell/dispatch-terminal.js");
+  assert.deepStrictEqual(terminal.parseDecline("DECLINED: premise no longer holds\n\nexplanation"), { reason: "premise no longer holds" });
+});

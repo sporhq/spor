@@ -725,3 +725,140 @@ test("end to end: a supervised launch failure still records a terminal outcome",
     await new Promise((resolve) => srv.close(resolve));
   }
 });
+
+// --- declined (task-spor-worker-declined-outcome) -------------------------
+// An implementer that honestly refuses the item — stale premise, wrong repo —
+// in the fixed `DECLINED: <reason>` form is routed to TRIAGE (a finding on the
+// item, its agent-ready stamp cleared, the lease released) and never to a gate.
+
+const DECLINE_REPORT = [
+  "DECLINED: the server half already shipped in 50c53d0; the rest belongs in ../spor",
+  "",
+  "The item asks for offset paging on the queue API. That landed on main in 50c53d0; the",
+  "remaining client change is in the spor repo, not this one. Tree is clean, nothing committed.",
+  "",
+  "FINDINGS: none",
+].join("\n");
+
+test("parseDecline reads the fixed form off the FIRST line only, tolerating heading/bold wrapping", () => {
+  assert.deepStrictEqual(terminal.parseDecline(DECLINE_REPORT), { reason: "the server half already shipped in 50c53d0; the rest belongs in ../spor" });
+  assert.deepStrictEqual(terminal.parseDecline("\n\n## DECLINED — premise unreachable\nbody"), { reason: "premise unreachable" });
+  assert.deepStrictEqual(terminal.parseDecline("**DECLINED**: wrong repo"), { reason: "wrong repo" });
+  assert.deepStrictEqual(terminal.parseDecline("**DECLINED: wrong repo**"), { reason: "wrong repo" });
+  // Prose is not a declaration.
+  assert.strictEqual(terminal.parseDecline("I have declined: the item is wrong"), null);
+  assert.strictEqual(terminal.parseDecline("Done.\n\nDECLINED: too late, this is line two"), null);
+  assert.strictEqual(terminal.parseDecline("DECLINED:"), null);
+  assert.strictEqual(terminal.parseDecline(""), null);
+  assert.strictEqual(terminal.parseDecline(null), null);
+});
+
+test("a declined run files a FINDING on the item, clears its agent-ready stamp, then releases — in that order", async () => {
+  const t = transport({
+    "GET /v1/nodes/task-x": { ok: true, status: 200, json: { id: "task-x", type: "task", status: "open", readiness: "agent" } },
+    "POST /v1/nodes": { ok: true, status: 200, json: { results: [{ ok: true, status: "created" }] } },
+  });
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, nodeId: "task-x", releaseNode: "task-x", state: "done", reportText: DECLINE_REPORT, request: t.call,
+  });
+  assert.strictEqual(patch.terminal_state, "declined");
+  assert.strictEqual(patch.terminal_enforced, true);
+  assert.strictEqual(patch.declined_reason, "the server half already shipped in 50c53d0; the rest belongs in ../spor");
+  assert.strictEqual(patch.finding_node_id, "find-declined-x-run1234a");
+  assert.strictEqual(patch.readiness_cleared, true);
+  assert.strictEqual(patch.lease_released, true);
+  assert.strictEqual(patch.report_node_id, undefined, "a decline is not a report — the reported invariant must not fire");
+  assert.match(patch.terminal_note, /returns to triage, not to a gate/);
+  assert.deepStrictEqual(
+    t.calls.map((c) => `${c.method} ${c.path}`),
+    ["GET /v1/nodes/task-x", "POST /v1/nodes", "POST /v1/nodes/task-x/readiness", "POST /v1/nodes/task-x/release"]
+  );
+  assert.deepStrictEqual(t.calls[2].body, { readiness: "clear" });
+  // The finding: type finding, relates-to the item (never resolves/blocks), reason in the summary, report in the body.
+  const fm = parseFrontmatter(t.calls[1].body.nodes[0].node);
+  assert.strictEqual(fm.type, "finding");
+  assert.strictEqual(fm.id, "find-declined-x-run1234a");
+  assert.strictEqual(fm.status, "open");
+  assert.strictEqual(fm.project, "demo");
+  assert.deepStrictEqual(fm.edges, [{ type: "relates-to", to: "task-x" }]);
+  assert.match(fm.summary, /declined the item: the server half already shipped/);
+  assert.match(t.calls[1].body.nodes[0].node, /remaining client change is in the spor repo/);
+  assert.strictEqual(t.calls[1].body.nodes[0].if_exists, "skip");
+});
+
+test("a resolving edge on the graph beats the DECLINED line — the graph wins over the words, and that run is gated as resolved", async () => {
+  const t = transport({
+    "GET /v1/nodes/task-x": { ok: true, status: 200, json: { id: "task-x", type: "task", resolution: { by: "dec-y", edge: "resolves" } } },
+  });
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, nodeId: "task-x", releaseNode: "task-x", state: "done", reportText: DECLINE_REPORT, request: t.call,
+  });
+  assert.strictEqual(patch.terminal_state, "resolved");
+  assert.strictEqual(t.calls.length, 1, "nothing filed, nothing cleared, nothing released");
+});
+
+test("a decline whose finding cannot be filed leaves the lease HELD, still reads declined, and never touches readiness", async () => {
+  const t = transport({
+    "GET /v1/nodes/task-x": { ok: true, status: 200, json: { id: "task-x", type: "task" } },
+    "POST /v1/nodes": { ok: false, status: 500, json: null },
+  });
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, nodeId: "task-x", releaseNode: "task-x", state: "done", reportText: DECLINE_REPORT, request: t.call,
+  });
+  assert.strictEqual(patch.terminal_state, "declined");
+  assert.strictEqual(patch.terminal_enforced, true);
+  assert.strictEqual(patch.lease_released, false);
+  assert.strictEqual(patch.finding_node_id, undefined);
+  assert.match(patch.terminal_note, /left HELD/);
+  assert.deepStrictEqual(t.calls.map((c) => `${c.method} ${c.path}`), ["GET /v1/nodes/task-x", "POST /v1/nodes"]);
+});
+
+test("a decline whose readiness clear is refused still files, still releases, and says what to run", async () => {
+  const t = transport({
+    "GET /v1/nodes/task-x": { ok: true, status: 200, json: { id: "task-x", type: "task" } },
+    "POST /v1/nodes/task-x/readiness": { ok: false, status: 503, json: null },
+    "POST /v1/nodes": { ok: true, status: 200, json: { results: [{ ok: true, status: "skipped" }] } },
+  });
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, nodeId: "task-x", releaseNode: "task-x", state: "done", reportText: DECLINE_REPORT, request: t.call,
+  });
+  assert.strictEqual(patch.terminal_state, "declined");
+  assert.strictEqual(patch.readiness_cleared, false);
+  assert.strictEqual(patch.lease_released, true);
+  assert.strictEqual(patch.finding_node_id, "find-declined-x-run1234a");
+  assert.match(patch.terminal_note, /spor ready task-x --needs-input/);
+});
+
+test("an unreachable graph and local mode still read a decline as declined — unenforced, never as a gateable reported", async () => {
+  const dead = await terminal.applyTerminalContract({
+    ...BASE, nodeId: "task-x", state: "done", reportText: DECLINE_REPORT,
+    request: async () => ({ ok: false, status: 0, json: null, error: "ECONNREFUSED" }),
+  });
+  assert.strictEqual(dead.terminal_state, "declined");
+  assert.strictEqual(dead.terminal_enforced, false);
+  assert.match(dead.declined_reason, /already shipped/);
+  assert.match(dead.terminal_note, /ECONNREFUSED/);
+
+  const local = await terminal.applyTerminalContract({ base: "", token: "", nodeId: "task-x", runId: "r1", state: "done", reportText: DECLINE_REPORT });
+  assert.strictEqual(local.terminal_state, "declined");
+  assert.strictEqual(local.terminal_enforced, false);
+  assert.strictEqual(local.finding_node_id, undefined, "local mode files nothing");
+
+  // The provisional/backfill callers pass no report and are byte-identical.
+  assert.deepStrictEqual(terminal.unenforcedOutcome("done", "why"), { terminal_state: "reported", terminal_enforced: false, terminal_note: "why" });
+  assert.ok(terminal.TERMINAL_OUTCOMES.includes("declined"));
+});
+
+test("a report that merely mentions declining later on is an ordinary reported run", async () => {
+  const t = transport({
+    "GET /v1/nodes/task-x": { ok: true, status: 200, json: { id: "task-x", type: "task" } },
+    "POST /v1/nodes": { ok: true, status: 200, json: { results: [{ ok: true, status: "created" }] } },
+  });
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, nodeId: "task-x", releaseNode: "task-x", state: "done", request: t.call,
+    reportText: "Blocked on the server repo.\n\nI nearly declined: the premise is shaky, but the work is committed on the branch.",
+  });
+  assert.strictEqual(patch.terminal_state, "reported");
+  assert.ok(patch.report_node_id);
+  assert.ok(!t.calls.some((c) => c.path.endsWith("/readiness")), "readiness is untouched on a report");
+});
