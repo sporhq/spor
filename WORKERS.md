@@ -242,7 +242,12 @@ standing context. <any additional free-text task instructions>
    being a refusal (issue-spor-rescue-and-fix-sessions-end-turn-waiting-on-
    background-job: two headless sessions in one day authored correct fixes,
    backgrounded `npm test`, ended their turn waiting on it, and paged a person
-   over a dirty tree). The
+   over a dirty tree). The contract reaches the agent whatever prompt
+   template rides the loop's `--template` (or a personal `dispatch.template`):
+   a worker's launch checks the rendered template for its task text and, when
+   the template names neither `{{task}}` nor `{{default}}`, appends the task
+   after it with a warning — a person's own `spor dispatch --template` keeps
+   the template's full authority. The
    factory-specific lines (the integration target, the acceptance command,
    the protected paths and their lane, the cross-model review) appear only
    when the factory declares them; a bare worker's contract is the plain
@@ -1733,7 +1738,14 @@ a stale premise is triage's, not the lane's.
    waiting on it, an uncommitted tree is a refusal.
 3. Reads the rescue's final report in code (`parseRescueReport`,
    lib/kernel/gates.js): the fenced `{"diagnosis", "category", "fixed",
-   "filed"}` block. This read is deliberately FAIL-SOFT, unlike a review
+   "filed"}` block. The supervisor keeps only the LAST assistant text as the
+   report, so a block emitted early and then overwritten by a final "I'll
+   commit once the suite notifies me" is only on the run log; when the report
+   carries no block, the read falls back to the last block of any EARLIER
+   message on that log (`runReportTexts`, through the harness adapter's own
+   report hook), newest first, and logs that it did — so the truncated
+   session the early block exists for still yields its category. This read
+   is deliberately FAIL-SOFT, unlike a review
    verdict: it feeds only the escalation body and the rescue fact, so a rescue
    that fixed the tree and forgot the block still gets its fix judged. A rescue
    that could not be dispatched, or never reached a terminal state inside

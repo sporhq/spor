@@ -245,3 +245,46 @@ process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "writab
   assert.strictEqual(invocation.codexHome, realHome, "CODEX_HOME is passed through unchanged when the real home is writable");
   assert.strictEqual(fs.existsSync(scratchPath), false, "nothing is provisioned for the byte-identical non-nested path");
 });
+
+// issue-spor-rescue-and-fix-sessions-end-turn-waiting-on-background-job (F2):
+// the supervisor keeps only the LAST text as the report, so an early message
+// — a rescue's diagnosis block, emitted before a long verification — is only
+// on the run log. runReportTexts reads every candidate back off that log
+// through the same adapter hook, in stream order, skipping what is not a
+// JSON event (stderr interleaved into the log) and what carries no text.
+test("runReportTexts reads every final-message candidate back off the run log, in order, fail-soft", () => {
+  const { runReportTexts, runPaths, atomicJson: writeJson } = require("../lib/shell/agent-dispatch-runner.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-runner-texts-"));
+  const log = path.join(dir, "run.log");
+  const line = (o) => `${JSON.stringify(o)}\n`;
+  fs.writeFileSync(
+    log,
+    line({ type: "system", subtype: "init", session_id: "s1" }) +
+      line({ type: "assistant", message: { content: [{ type: "text", text: 'Diagnosed.\n```json\n{"diagnosis":"early","category":"real-defect"}\n```' }] } }) +
+      "warning: some stderr noise the child printed\n" +
+      line({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash" }] } }) +
+      line({ type: "assistant", message: { content: [{ type: "text", text: "The suite is running in the background; I'll commit once it notifies me." }] } }) +
+      line({ type: "result", subtype: "success", is_error: false, result: "The suite is running in the background; I'll commit once it notifies me." }) +
+      "{not json at all\n"
+  );
+  assert.deepStrictEqual(runReportTexts({ harness: "claude-code", log_path: log }), [
+    'Diagnosed.\n```json\n{"diagnosis":"early","category":"real-defect"}\n```',
+    "The suite is running in the background; I'll commit once it notifies me.",
+    "The suite is running in the background; I'll commit once it notifies me.",
+  ]);
+  // No log, no adapter, an unreadable log → nothing, never a throw.
+  assert.deepStrictEqual(runReportTexts({ harness: "claude-code" }), []);
+  assert.deepStrictEqual(runReportTexts({ harness: "no-such-harness", log_path: log }), []);
+  assert.deepStrictEqual(runReportTexts({ harness: "claude-code", log_path: path.join(dir, "missing.log") }), []);
+  assert.deepStrictEqual(runReportTexts(null), []);
+  // A DECLARED harness has no registry entry: its declaration is read from the
+  // run's job file under `home` (the same file the supervisor rebuilt it from).
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-runner-texts-home-"));
+  const p = runPaths(home, "run-declared");
+  fs.mkdirSync(path.dirname(p.job), { recursive: true });
+  const declaration = { id: "fake", command: "/bin/fake", args: [], label: "Fake", session: [], report: { from: "lastText", text: ["message.text"] } };
+  writeJson(p.job, { run_id: "run-declared", harness: "fake", harness_declaration: declaration });
+  fs.writeFileSync(log, line({ kind: "message", message: { text: "first" } }) + line({ kind: "message", message: { text: "last" } }));
+  assert.deepStrictEqual(runReportTexts({ run_id: "run-declared", harness: "fake", log_path: log }, { home }), ["first", "last"]);
+  assert.deepStrictEqual(runReportTexts({ run_id: "run-declared", harness: "fake", log_path: log }), [], "without a home the declaration cannot be found");
+});

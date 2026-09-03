@@ -2725,6 +2725,41 @@ test("end to end: the gate tree is staged with the repo's own dispatch.worktreeS
   assert.match(invocation.prompt, /Resolve the item on the graph LAST/);
 });
 
+// issue-spor-rescue-and-fix-sessions-end-turn-waiting-on-background-job (F1):
+// `--template` rides the loop's passthrough (and a personal dispatch.template
+// applies to every dispatch on the box), and the worker contract — with its
+// one-turn notice — is the dispatch's TASK text. A template naming neither
+// {{task}} nor {{default}} would launch an unattended implementer with no
+// contract at all, the exact bypass the notice exists to close; a worker's
+// launch therefore appends the task after the rendered template, and says so.
+// A person's own `spor dispatch --template` keeps the template's full
+// authority (dispatch.test.js: "the built-in wrapper is gone").
+test("spor work --template that omits {{task}}/{{default}} still hands the implementer the worker contract and its one-turn notice", () => {
+  const { home, outfile } = cliFixture({});
+  const tpl = path.join(home, "prompt.tpl");
+  fs.writeFileSync(tpl, "Just do {{title}} in {{slug}}.\n");
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, GATE_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() };
+  const r = cli(["work", "--once", "--max", "1", "--interval", "1", "--no-brief", "--no-worktree", "--template", tpl], env);
+  assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
+  assert.match(r.stderr, /warning: the prompt template omits \{\{task\}\} and \{\{default\}\}, so the worker's instructions/);
+  const invocation = JSON.parse(fs.readFileSync(outfile, "utf8").trim().split("\n")[0]);
+  assert.ok(invocation.prompt.startsWith("Just do Add bounded retry to the sync worker in demo."), `the template still leads (saw ${invocation.prompt.slice(0, 120)})`);
+  assert.match(invocation.prompt, /\n\n---\n\n# Task\n\nWork on task-ready/);
+  assert.match(invocation.prompt, /## Worker contract/);
+  assert.ok(invocation.prompt.includes(require("../lib/shell/worker-contract.js").ONE_TURN_NOTICE), "the one-turn notice reaches the agent");
+
+  // A template that DOES place the task is left alone: rendered once, nothing appended, no warning.
+  const { home: home2, outfile: outfile2 } = cliFixture({});
+  const tpl2 = path.join(home2, "prompt.tpl");
+  fs.writeFileSync(tpl2, "Preamble.\n\n{{task}}\n");
+  const r2 = cli(["work", "--once", "--max", "1", "--interval", "1", "--no-brief", "--no-worktree", "--template", tpl2], { ...env, SPOR_HOME: home2, XDG_CONFIG_HOME: home2, GATE_OUTFILE: outfile2 });
+  assert.strictEqual(r2.status, 0, `${r2.stderr}\n${r2.stdout}`);
+  assert.doesNotMatch(r2.stderr, /the prompt template omits/);
+  const inv2 = JSON.parse(fs.readFileSync(outfile2, "utf8").trim().split("\n")[0]);
+  assert.ok(inv2.prompt.startsWith("Preamble.\n\nWork on task-ready"), inv2.prompt.slice(0, 120));
+  assert.strictEqual((inv2.prompt.match(/## Worker contract/g) || []).length, 1, "placed once by the template, never appended again");
+});
+
 // ---------------------------------------------- evidence that names the failure --
 // The first spor-server factory escalation carried 2.5KB of green checks and an
 // nx footer ("server:test failed") — the failing test itself had scrolled out of
@@ -3525,6 +3560,84 @@ test("a pipeline killed inside a rescue is resumed INSIDE it: the rescue run is 
   assert.deepStrictEqual(b.seen.reviews.map((x) => x.cycle), [2], "no original-pass review: straight to the rescue pass at the carried cycle");
   assert.strictEqual(b.seen.escalations.length, 0);
   assert.deepStrictEqual(b.seen.facts.map((f) => f.id.replace(/-[0-9a-f]{8}$/, "")), ["art-rescue-demo-runabcde-x1", "art-gate-review-demo-runabcde-x1"], "B writes the rescue fact and the rescue-pass fact; the original refusal's fact was A's");
+});
+
+// issue-spor-rescue-and-fix-sessions-end-turn-waiting-on-background-job (F2):
+// the rescue is told to emit its diagnosis block EARLY, but the supervisor
+// keeps only the LAST assistant text as the report — so a rescue that
+// diagnosed, then ended on "I'll commit once the suite notifies me", has its
+// block only on the run log. The diagnosis read falls back to the last block
+// of any earlier message on that log (through the harness adapter's own
+// report hook), so the truncated session still yields its category instead
+// of "unknown"; a report that carries a block is read as before, and a run
+// with no block anywhere is still unread.
+test("the rescue's early diagnosis block survives a final message that overwrote it: read back off the run log when the final report has none", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-rescue-early-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  fs.writeFileSync(path.join(home, "nodes", "task-fix-me.md"), "---\nid: task-fix-me\ntype: task\ntitle: Make the bound exclusive\nsummary: The loop over-reads by one element.\nstatus: open\ndate: 2026-09-03\n---\n\nAcceptance: reading N items yields N.\n");
+  fs.writeFileSync(path.join(home, "nodes", "profile-claude-fable.md"), "---\nid: profile-claude-fable\ntype: profile\ntitle: The strong-model rescue profile\nharness: claude-code\nsummary: The strong-model rescue profile.\ndate: 2026-09-03\n---\n\nThe rescue lane's profile.\n");
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-rescue-early-repo-"));
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  g("init", "-q", "-b", "main");
+  fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n;\n");
+  g("add", "."); g("commit", "-q", "-m", "base");
+  g("checkout", "-q", "-b", "task-fix-me");
+  fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n + 1;\n");
+  g("commit", "-q", "-am", "implement");
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  const runId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, { run_id: runId, node_id: "task-fix-me", state: "done", created_at: new Date().toISOString() });
+  const line = (o) => `${JSON.stringify(o)}\n`;
+  const waiting = "Fix committed to the tree. The full suite is running in the background; I'll commit the test as soon as its notification arrives.";
+  const early = 'Diagnosed.\n```json\n{"diagnosis":"the fixer widened the bound instead of tightening it","category":"real-defect","fixed":false,"filed":["task-review-say-which-way"]}\n```\nNow fixing.';
+  const logs = [];
+  const streams = {
+    // The shape the issue observed: block early, prose last — the report is the prose.
+    early: { report: waiting, log: line({ type: "system", subtype: "init" }) + line({ type: "assistant", message: { content: [{ type: "text", text: early }] } }) + line({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash" }] } }) + line({ type: "assistant", message: { content: [{ type: "text", text: waiting }] } }) + line({ type: "result", subtype: "success", is_error: false, result: waiting }) },
+    // A block in the final report is read as before — the log is never consulted.
+    final: { report: `${waiting}\n\x60\x60\x60json\n{"diagnosis":"restated at the end","category":"stale-premise","fixed":true,"filed":[]}\n\x60\x60\x60`, log: line({ type: "assistant", message: { content: [{ type: "text", text: early }] } }) },
+    // No block anywhere: still unread, the tail of the prose salvaged.
+    none: { report: waiting, log: line({ type: "assistant", message: { content: [{ type: "text", text: "Looking at the diff." }] } }) + line({ type: "assistant", message: { content: [{ type: "text", text: waiting }] } }) },
+  };
+  let which = "early";
+  const deps = sporCli.makeGateDeps(cfg, {
+    record: { node_id: "task-fix-me", cwd: repo },
+    entry: { run_id: runId, node_id: "task-fix-me", project: null },
+    factory: { id: "factory-test", rescue: { profile: "profile-claude-fable", attempts: 3, awaitMs: 5000 } },
+    slug: null, passthrough: {},
+    warn: () => {}, log: (l) => logs.push(l), stopping: () => false, home,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    dispatch: async (_cfg, values) => {
+      const id = `rescue-run-${which}`;
+      const p = dispatchRuns.runPaths(home, id);
+      fs.writeFileSync(p.report, `${streams[which].report}\n`);
+      fs.writeFileSync(p.log, streams[which].log);
+      dispatchRuns.atomicJson(p.record, { run_id: id, node_id: "task-fix-me", name: values.name, harness: "claude-code", state: "done", created_at: new Date().toISOString(), log_path: p.log, report_path: p.report });
+      return { ok: true, run: { run_id: id, harness: "claude-code" } };
+    },
+  });
+  const gate = { id: "adversarial-review", kind: "agent-review", profile: "profile-review", cycles: 1 };
+  const base = { gate, detail: "changes requested", evidence: "", findings: [], attempts: [], ledger: [], fact: "art-gate-x", facts: ["art-gate-x"], previous: [] };
+  assert.ok((await deps.changedPaths({ trustedRef: "main" })).ok);
+
+  const r1 = await deps.rescue({ ...base, attempt: 1 });
+  assert.strictEqual(r1.ok, true, r1.reason);
+  assert.deepStrictEqual([r1.category, r1.fixed, r1.filed, r1.unread], ["real-defect", false, ["task-review-say-which-way"], false], "the early block is the diagnosis, not 'unknown'");
+  assert.match(r1.diagnosis, /widened the bound/);
+  assert.ok(logs.some((l) => /left no diagnosis block in its final report — read the last one from an earlier message/.test(l)), `the salvage is logged (saw ${JSON.stringify(logs)})`);
+
+  which = "final";
+  const r2 = await deps.rescue({ ...base, attempt: 2 });
+  assert.deepStrictEqual([r2.category, r2.fixed, r2.unread, r2.diagnosis], ["stale-premise", true, false, "restated at the end"], "a block in the final report wins; the log is not consulted");
+
+  which = "none";
+  logs.length = 0;
+  const r3 = await deps.rescue({ ...base, attempt: 3 });
+  assert.deepStrictEqual([r3.category, r3.unread], ["unknown", true], "no block anywhere is still unread");
+  assert.match(r3.diagnosis, /commit the test as soon as its notification arrives\.$/, "the tail of the prose is salvaged as before");
+  assert.ok(logs.some((l) => /left no structured diagnosis/.test(l)));
 });
 
 test("the real rescue dispatch runs under the rescue profile in the run's own checkout with the full history, its diagnosis is read in code, and the escalation body opens with it", async () => {

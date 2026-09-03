@@ -8749,6 +8749,25 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
       );
     }
     prompt = r.text;
+    // A WORKER's dispatch (ctx.carryTask — set by dispatchThrough beside
+    // supervisedOnly) must reach the agent with its task text whatever the
+    // template says: for `spor work` that text IS the worker contract, a fix
+    // cycle's or a rescue's instructions, and the one-turn notice they all
+    // carry (issue-spor-rescue-and-fix-sessions-end-turn-waiting-on-
+    // background-job). `--template` rides the loop's passthrough and a
+    // personal `dispatch.template` applies to every dispatch on the box, so a
+    // template naming neither {{task}} nor {{default}} would silently launch
+    // an unattended implementer with no contract at all — the bypass the
+    // notice exists to close. A person's own `spor dispatch --template` keeps
+    // the template's full authority (byte-identical); only a worker's launch
+    // gets the task appended, and says so.
+    if (ctx && ctx.carryTask && instruction && !prompt.includes(instruction)) {
+      err(
+        `warning: the prompt template omits {{task}} and {{default}}, so the worker's instructions (the contract and its` +
+          ` one-turn notice) would not reach the agent — appending them after the rendered template`
+      );
+      prompt = `${prompt.replace(/\s+$/, "")}\n\n---\n\n# Task\n\n${instruction}\n`;
+    }
   }
 
   // Same-machine duplicate-dispatch guard (task-spor-dispatch-same-machine-guard).
@@ -9764,7 +9783,10 @@ async function dispatchThroughLocked(cfg, values, positionals = []) {
     // supervisedOnly: a worker's runs must be followable and judgeable, so
     // neither `--bg` nor a standing dispatch.claudeLaunchMode may route them
     // native-background (see cmdDispatch's launch-mode opt-in).
-    code = await cmdDispatch(cfg, { values, positionals }, { onLaunch: (l) => launches.push(l), supervisedOnly: true });
+    // carryTask: whatever prompt template rides the passthrough (or a personal
+    // dispatch.template), the task text — the worker contract, a fix cycle's
+    // or a rescue's instructions, the one-turn notice — reaches the agent.
+    code = await cmdDispatch(cfg, { values, positionals }, { onLaunch: (l) => launches.push(l), supervisedOnly: true, carryTask: true });
   } catch (e) {
     // A throw AFTER the launch (the post-launch session capture and bind are
     // network calls) still means an agent is running and holding a lease —
@@ -10020,6 +10042,27 @@ function gateRunReportText(record) {
   } catch {
     return "";
   }
+}
+
+// A rescue's diagnosis (WORKERS.md §10.10): the final report first, then —
+// when that carries no block — the LAST block in any EARLIER message on the
+// run's own stream, newest first. The supervisor keeps the last assistant
+// text as the report (the `--output-last-message` semantics every harness
+// shares), so a rescue that emitted its block early, as it is told to, and
+// then ended on "I'll commit once the suite notifies me" has the block only
+// on the log; reading just the report would file that session as
+// category "unknown" — the truncation case the early block exists for
+// (issue-spor-rescue-and-fix-sessions-end-turn-waiting-on-background-job).
+// `salvaged` marks a diagnosis read off an earlier message.
+function gateRescueDiagnosis(record, home) {
+  const parsed = gatesKernel.parseRescueReport(gateRunReportText(record));
+  if (parsed.ok) return parsed;
+  const earlier = dispatchRuns.runReportTexts(record, { home });
+  for (let i = earlier.length - 1; i >= 0; i--) {
+    const p = gatesKernel.parseRescueReport(earlier[i]);
+    if (p.ok) return { ...p, salvaged: true };
+  }
+  return parsed;
 }
 
 // Gate nodes mint `date:` from `new Date()` at write time (WORKERS.md §10.7),
@@ -11038,7 +11081,8 @@ function makeGateDeps(
       "",
       "The fenced diagnosis block is MANDATORY. Write it the moment you have diagnosed — BEFORE any fix or long",
       "verification, so a session cut short still yields a category — and restate it at the end of your final message",
-      "once `fixed` and `filed` are known (the runner reads the LAST block). Exactly this shape:",
+      "once `fixed` and `filed` are known (the runner reads the LAST block of your final message, and falls back to the",
+      "last block of any earlier message — so the early block counts even if your final message never comes). Exactly this shape:",
       "```json",
       `{"diagnosis": "what went wrong, in one or two sentences", "category": "reviewer-drift" | "real-defect" | "stale-premise" | "environment", "fixed": true | false, "filed": ["task-..."]}`,
       "```",
@@ -11104,7 +11148,8 @@ function makeGateDeps(
     }
     const done = await awaitGateRun(cfg, launched.run.run_id, { timeoutMs: lane.awaitMs, warn, sleep });
     if (!done.ok) return { ok: false, reason: done.reason };
-    const parsed = gatesKernel.parseRescueReport(gateRunReportText(done.record));
+    const parsed = gateRescueDiagnosis(done.record, home);
+    if (parsed.salvaged) log(`work: rescue attempt ${attempt} on ${entry.node_id} left no diagnosis block in its final report — read the last one from an earlier message on its stream`);
     if (!parsed.ok) log(`work: rescue attempt ${attempt} on ${entry.node_id} left no structured diagnosis (${parsed.error}) — its tree is judged regardless`);
     return { ok: true, runId: launched.run.run_id, diagnosis: parsed.diagnosis, category: parsed.category, fixed: parsed.fixed, filed: parsed.filed, unread: !parsed.ok, record: done.record };
   };
