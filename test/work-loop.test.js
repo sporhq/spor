@@ -828,6 +828,69 @@ test("a declared repo that names nothing in this graph is called out at startup,
   assert.doesNotMatch(ok.stderr, /names no repo or project/);
 });
 
+// task-spor-remote-next-print-project-warning: the REMOTE twin of the check
+// above. The server answers the known-project question through GET /v1/queue's
+// additive `project_warning` (task-spor-remote-project-validation-warning), so
+// a remote worker probes each declared repo once at startup and prints the SAME
+// warning line local mode does (norm-spor-cli-mode-parity); the queue page's
+// own warning is printed verbatim, once, and never mistaken for an empty queue.
+test("a declared repo the SERVER does not know is called out at startup in remote mode too", async () => {
+  const http = require("node:http");
+  const { home } = groupedFixture({ repos: ["demo-sever"] });
+  let factoryRaw = fs.readFileSync(path.join(home, "nodes", "factory-demo-server.md"), "utf8");
+  const hits = [];
+  const warningFor = (p) => `project '${p}' matched no repo, grouping, or project stamp on any resident node — queue is empty (try a repo slug, a repo-<slug> node id, a grouping id, or the exact project value carried on existing nodes)`;
+  const srv = http.createServer((req, res) => {
+    hits.push(req.url);
+    if (req.method === "GET" && req.url === "/v1/nodes/factory-demo-server") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "factory-demo-server", raw: factoryRaw }));
+      return;
+    }
+    if (req.method === "GET" && req.url.startsWith("/v1/queue")) {
+      const qs = new URLSearchParams(req.url.slice(req.url.indexOf("?") + 1));
+      const project = qs.get("project");
+      // The server knows demo-server; 'demo-sever' is the typo it echoes back.
+      const body = { items: [], count: 0 };
+      if (project === "demo-sever") body.project_warning = warningFor(project);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(body));
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { code: "not_found", message: "no route" } }));
+  });
+  await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  const runAsync = (args, env) =>
+    new Promise((resolve) => {
+      const c = spawn(process.execPath, [CLI, ...args], { env: cleanEnv(env), stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "", stderr = "";
+      c.stdout.on("data", (d) => (stdout += d));
+      c.stderr.on("data", (d) => (stderr += d));
+      c.on("close", (code) => resolve({ status: code, stdout, stderr }));
+    });
+  try {
+    const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: "t", PATH: pathWithOnlyGitAndNode() };
+    const r = await runAsync(["work", "--print", "--factory", "factory-demo-server"], env);
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stderr, /declares repo 'demo-sever', which names no repo or project in this graph/);
+    assert.ok(hits.some((u) => /\/v1\/queue\?project=demo-sever&limit=1$/.test(u)), `one bounded probe per declared repo, got: ${hits.join(" ")}`);
+    // The page read (scope defaulted to the lone declared repo) carries the
+    // same field: printed verbatim, exactly once, and the queue reads empty.
+    assert.strictEqual(r.stderr.split(warningFor("demo-sever")).length - 1, 1, `verbatim page warning printed once, got: ${r.stderr}`);
+    assert.match(r.stdout, /queue:   nothing dispatchable right now/);
+    // A repo the server DOES know says nothing.
+    const good = groupedFixture().home;
+    factoryRaw = fs.readFileSync(path.join(good, "nodes", "factory-demo-server.md"), "utf8");
+    const ok = await runAsync(["work", "--print", "--factory", "factory-demo-server"], { ...env, SPOR_HOME: good, XDG_CONFIG_HOME: good });
+    assert.strictEqual(ok.status, 0, ok.stderr);
+    assert.doesNotMatch(ok.stderr, /names no repo or project|matched no repo/);
+  } finally {
+    srv.close();
+  }
+});
+
 test("a factory that declares its repos judges those, not the one it happens to live in", () => {
   // The escape hatch (option c of the issue): a factory whose gates genuinely
   // do apply to several repos says so, and an explicit --project cannot widen

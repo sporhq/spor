@@ -2159,6 +2159,7 @@ test('compile --query (remote) fails open with a clear OFFLINE line, no stack', 
 // task-spor-queue-default-project-config (pinned default reaches the server) and
 // issue-spor-next-project-token-not-roundtrippable (a SCOPED read that comes back
 // empty earns a soft stderr note; the cwd-default firehose does not).
+const QUEUE_PROJECT_WARNING = "project 'typo-scope' matched no repo, grouping, or project stamp on any resident node — queue is empty (try a repo slug, a repo-<slug> node id, a grouping id, or the exact project value carried on existing nodes)";
 function queueStubServer() {
   const http = require('node:http');
   const hits = [];
@@ -2168,10 +2169,14 @@ function queueStubServer() {
     if (req.method === 'GET' && m) {
       const qs = new URLSearchParams(m[1]);
       const project = qs.get('project');
-      // 'empty-scope' returns nothing; anything else returns one item.
-      const items = project === 'empty-scope' ? [] : [{ id: 'task-a', score: 1, suggest: 'do', why: 'queueable and live' }];
+      // 'empty-scope' returns nothing; 'typo-scope' returns nothing PLUS the
+      // server's additive project_warning (a scope that matched no repo,
+      // grouping, or project stamp); anything else returns one item.
+      const items = project === 'empty-scope' || project === 'typo-scope' ? [] : [{ id: 'task-a', score: 1, suggest: 'do', why: 'queueable and live' }];
+      const body = { items, count: items.length };
+      if (project === 'typo-scope') body.project_warning = QUEUE_PROJECT_WARNING;
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ items, count: items.length }));
+      res.end(JSON.stringify(body));
       return;
     }
     res.writeHead(404, { 'content-type': 'application/json' });
@@ -2207,6 +2212,33 @@ test('next (remote) notes a scoped read that returns nothing; an unscoped fireho
     // a non-empty scoped read does NOT warn
     const nonEmpty = await runAsyncCli(['next', '--project', 'proj-ok'], { SPOR_SERVER: base, SPOR_TOKEN: 't' });
     assert.doesNotMatch(nonEmpty.stderr, /returned an empty queue/);
+  } finally {
+    srv.close();
+  }
+});
+
+// task-spor-remote-next-print-project-warning: the server's additive
+// `project_warning` (GET /v1/queue, a scope token matching no repo/grouping/
+// stamp) is printed VERBATIM on stderr — the remote twin of local queue.js's
+// projectKnown() note — and stripped from --json so the envelope matches local.
+// It supersedes the best-effort empty-queue note for that read.
+test('next (remote) prints the server\'s project_warning verbatim on stderr and strips it from --json', async () => {
+  const { srv, base } = await queueStubServer();
+  try {
+    const typo = await runAsyncCli(['next', '--project', 'typo-scope'], { SPOR_SERVER: base, SPOR_TOKEN: 't' });
+    assert.strictEqual(typo.status, 0, typo.stderr);
+    assert.ok(typo.stderr.includes(QUEUE_PROJECT_WARNING), `verbatim server warning on stderr, got: ${typo.stderr}`);
+    assert.doesNotMatch(typo.stderr, /returned an empty queue/, 'the authoritative warning replaces the soft note');
+    const json = await runAsyncCli(['next', '--project', 'typo-scope', '--json'], { SPOR_SERVER: base, SPOR_TOKEN: 't' });
+    assert.strictEqual(json.status, 0, json.stderr);
+    assert.ok(json.stderr.includes(QUEUE_PROJECT_WARNING));
+    const j = JSON.parse(json.stdout);
+    assert.ok(!('project_warning' in j), 'project_warning stripped from the --json envelope');
+    assert.deepStrictEqual(j.items, []);
+    // a known scope carries no field and prints no warning
+    const ok = await runAsyncCli(['next', '--project', 'proj-ok'], { SPOR_SERVER: base, SPOR_TOKEN: 't' });
+    assert.strictEqual(ok.status, 0, ok.stderr);
+    assert.doesNotMatch(ok.stderr, /matched no repo/);
   } finally {
     srv.close();
   }
