@@ -184,6 +184,8 @@ test("--read-only dispatches Codex under --sandbox read-only, overriding a passt
   for (const adapter of harnesses()) {
     if (adapter.id === "codex") assert.deepStrictEqual(adapter.readOnly, { sandbox: "read-only" });
     if (adapter.id === "claude-code") assert.deepStrictEqual(adapter.readOnly, { permissionMode: "plan" });
+    if (adapter.id === "opencode") assert.deepStrictEqual(adapter.readOnly, { agent: "plan" });
+    if (adapter.id === "copilot") assert.deepStrictEqual(adapter.readOnly, { denyTools: ["write"] });
   }
 });
 

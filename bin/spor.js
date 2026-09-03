@@ -8370,6 +8370,19 @@ function cmdRuns(cfg, { values, positionals: pos }) {
 // caller can follow that run to its terminal state. It is called once, at the
 // launch that succeeded, on both launch modes; a plain CLI dispatch passes no
 // ctx and is unaffected.
+// The built-in harnesses that can keep `--read-only`, and how — for the
+// refusal message when a dispatch names one that cannot.
+function harnessReadOnlyPostures() {
+  const out = [];
+  for (const a of dispatchHarnesses.harnesses ? dispatchHarnesses.harnesses() : []) {
+    const ro = a.readOnly;
+    if (!ro) continue;
+    const how = ro.sandbox ? `--sandbox ${ro.sandbox}` : ro.permissionMode ? `--permission-mode ${ro.permissionMode}` : ro.agent ? `--agent ${ro.agent}` : Array.isArray(ro.denyTools) ? ro.denyTools.map((t) => `--deny-tool ${t}`).join(" ") : "declared";
+    out.push(`${a.id} (${how})`);
+  }
+  return out.join(", ") || "none";
+}
+
 async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   const dryRun = !!(values.print || values["dry-run"]);
   const full = !!values.full;
@@ -8792,13 +8805,19 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   // OVERRIDES an explicit --sandbox/--permission-mode from the caller (a
   // worker's passthrough may carry a write-capable posture for its
   // implementers — that must not leak into its reviewers), with a warning so
-  // the override is visible. A harness with no read-only posture warns rather
-  // than refuses: the prompt still forbids writing, and refusing would leave
-  // every review gate on that harness unrunnable.
+  // the override is visible. A harness with NO read-only posture is REFUSED,
+  // not warned about (review finding 3 on the first cut: a warning left the
+  // reviewer write-capable on exactly the harnesses that had no posture yet):
+  // `--read-only` is a promise the caller relies on, and a launch that cannot
+  // keep it must not proceed as if it had. Every built-in adapter declares a
+  // posture; a declared custom harness has none by v1 scope, so a review gate
+  // has to route to a built-in one.
   if (readOnly && harnessAdapter) {
     const ro = harnessAdapter.readOnly || null;
     if (!ro) {
-      err(`warning: --read-only has no ${harnessAdapter.label} posture; the run is asked not to write but is not sandboxed.`);
+      err(`spor dispatch: --read-only cannot be enforced on ${harnessAdapter.label} — the harness declares no read-only posture, so the run would be write-capable.`);
+      err(`  route the read-only run (a review gate's profile) to a harness that has one: ${harnessReadOnlyPostures()}.`);
+      return 1;
     } else {
       if (ro.sandbox) {
         if (sandbox && sandbox !== ro.sandbox) err(`warning: --read-only overrides --sandbox ${sandbox} with --sandbox ${ro.sandbox}.`);
@@ -8831,6 +8850,9 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   const effectiveApprovalPolicy = (translated && translated.approvalPolicy) || approvalPolicy || "never";
   // NB: no `--session-id` — `claude --bg` ignores it (warns) and manages its own
   // session; we capture the real one post-launch (dec-spor-dispatch-bg-session-late-bind).
+  // The adapter's own read-only posture rides into buildArgs only under
+  // --read-only, so a plain dispatch's argv is byte-identical.
+  const readOnlyPosture = readOnly && harnessAdapter ? harnessAdapter.readOnly || null : null;
   const previewArgs = harnessAdapter ? harnessAdapter.buildArgs({
     name,
     model: effectiveModel,
@@ -8840,6 +8862,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     approvalPolicy: effectiveApprovalPolicy,
     reportPath: dispatchHarnesses.REPORT_PLACEHOLDER,
     sporMcp: null,
+    readOnly: readOnlyPosture,
   }) : [];
   const supportedHarness = !!harnessAdapter;
   // An UNSATISFIABLE profile is refused further down by the satisfiability path
@@ -9161,6 +9184,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
       approvalPolicy: effectiveApprovalPolicy,
       reportPath: dispatchHarnesses.REPORT_PLACEHOLDER,
       sporMcp: wantsSporMcp && mcpToken ? { url: `${remote.base(cfg)}/mcp` } : null,
+      readOnly: readOnlyPosture,
     });
     const launched = await launchSupervisedHarness(cfg, {
       adapter: harnessAdapter,
@@ -9205,6 +9229,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     agent,
     mcpConfig: agentMcpFile,
     prompt,
+    readOnly: readOnlyPosture,
   });
   // A durable run record for the NATIVE-background launch
   // (inc-spor-dispatch-session-vanished-2026-07-18). `claude --bg` hands the
@@ -10323,6 +10348,43 @@ function makeGateDeps(
     return { ok: true, runId: launched.run.run_id, record: done.record };
   };
 
+  // The gate's durable memory (review finding 1 on this gate's first cut):
+  // the per-gate finding ledger, fix-cycle count, attempt history and last
+  // fix ride on the RUN RECORD as `gate_progress`, keyed by this attempt's
+  // run key so a `--regate` (a new attempt) starts clean while a RESUMED
+  // pipeline (§10.8 — same run, same attempt) reads back exactly where the
+  // killed worker left each gate. Read fresh from disk, not from the record
+  // this closure was handed: the fix cycle's own stamp (`gate_fix_run_id`)
+  // lands on the same file, and the last fix's run id is recovered from it
+  // when the progress entry never got to record it.
+  const readRecordNow = () => {
+    try {
+      return dispatchRuns.readJson(dispatchRuns.runPaths(home, entry.run_id).record) || record || null;
+    } catch {
+      return record || null;
+    }
+  };
+  const loadGateProgress = async ({ gate }) => {
+    const r = readRecordNow();
+    const all = r && r.gate_progress && typeof r.gate_progress === "object" ? r.gate_progress : null;
+    if (!all || all.key !== runKey || !all.gates || typeof all.gates !== "object") return null;
+    const p = all.gates[gate.id];
+    if (!p || typeof p !== "object") return null;
+    const lastFix = p.lastFix && typeof p.lastFix === "object" ? { ...p.lastFix } : null;
+    if (lastFix && !lastFix.runId && r.gate_fix_run_id) lastFix.runId = r.gate_fix_run_id;
+    return { ...p, lastFix };
+  };
+  const saveGateProgress = async ({ gate, progress }) => {
+    const r = readRecordNow();
+    const prev = r && r.gate_progress && r.gate_progress.key === runKey && r.gate_progress.gates && typeof r.gate_progress.gates === "object" ? r.gate_progress.gates : {};
+    const stamp = { key: runKey, at: new Date().toISOString(), seq: (prev && r && r.gate_progress && Number.isInteger(r.gate_progress.seq) ? r.gate_progress.seq : 0) + 1, gates: { ...prev, [gate.id]: progress } };
+    const wrote = dispatchRuns.stampGateState(home, entry.run_id, { gate_progress: stamp });
+    // stampGateState hands back the record UNCHANGED (not null) when the
+    // verdict is already settled; a progress write that did not land is a
+    // failure the runner should hear about, not a silent no-op.
+    if (!wrote || wrote.gate_progress !== stamp) throw new Error("the run record could not be updated");
+  };
+
   return {
     now: () => Date.now(),
     sleep,
@@ -10330,6 +10392,8 @@ function makeGateDeps(
     // reports it BLOCKED (the approval item stands, unanswered) rather than
     // pretending to a verdict nobody gave.
     stopping,
+    loadGateProgress,
+    saveGateProgress,
     changedPaths: async ({ trustedRef }) => {
       change = null;
       const c = gateChangeSet(record, trustedRef);

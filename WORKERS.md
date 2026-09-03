@@ -512,6 +512,7 @@ written only after the outcome dimension exists):
 | `gate_reason` | string | optional — the settled verdict's one-line reason |
 | `gate_fix_run_id` | string | optional — the run id of the most recent fix cycle this pipeline dispatched at the same node, stamped the moment it was dispatched (not when it finishes). If a stop lands while that fix cycle is still going, this field is what turns "the pipeline was abandoned" into "here is the run to go check" — a fix cycle's own dispatched run is detached and keeps going regardless (§10.7), and this is the only durable pointer to it. `spor runs`/`spor work --status` surface it. |
 | `gate_fix_at` | ISO 8601 | when `gate_fix_run_id` was stamped |
+| `gate_progress` | object | optional — `{key, at, seq, gates: {<gate id>: {fixes, attempts, ledger, lastFix}}}`: each gate's own memory (§10.4), saved after every review verdict and BEFORE every fix dispatch. `key` is the attempt's run key — a resumed pipeline of the same attempt reads it back; a `--regate` (a new attempt) ignores it. Best-effort like every `gate_*` stamp: a write that fails is logged and the pipeline goes on |
 
 A consumer reading `gate_state` as a verdict must check it is one of the three
 settled values: `running` under a worker that is gone is a claim nobody
@@ -771,10 +772,17 @@ The runner composes the review dispatch itself: a launch under the gate's
 declared `profile` (cross-model by convention; the machine's own declared
 harness binding still decides what actually executes — a graph write never
 defines what a box runs), **read-only** (`spor dispatch --read-only`: Codex's
-`--sandbox read-only`, Claude Code's plan permission mode — the reviewer reads
-the implementer's live checkout, so it must not be able to write to it, and the
-posture overrides any write-capable `--sandbox`/`--permission-mode` the worker's
-passthrough carries), with a prompt that carries everything the reviewer needs
+`--sandbox read-only`, Claude Code's plan permission mode, OpenCode's built-in
+`plan` agent (edit denied everywhere), Copilot's `--deny-tool write` (the
+file-writing tool denied at the permission layer; its shell tool stays so the
+reviewer can run tests, which is the honest limit of that posture) — the
+reviewer reads the implementer's live checkout, so it must not be able to write
+to it, and the posture overrides any write-capable `--sandbox`/
+`--permission-mode` the worker's passthrough carries. A harness with NO
+declared posture — a declared custom harness, by v1 scope — is **refused**
+before launch, never run write-capable behind a warning: `--read-only` is a
+promise, and a review gate has to route to a harness that can keep it), with a
+prompt that carries everything the reviewer needs
 rather than sending it to read a growing `base..head` diff on its own: the work
 item's text, the diff itself (bounded; the git command for the rest), the gate's
 `instructions`, and — on a fix cycle — the **prior findings** and the fix that
@@ -811,6 +819,12 @@ fixer had been sent to fix — so the protocol the parser enforces is:
   as a note, never a reason to fail the gate. A `changes_requested` that rates
   nothing blocking is a pass with notes; a `pass` that reports a blocking
   finding is `changes_requested` (the findings win over the word, both ways).
+  But a request for changes that SAYS NOTHING is not a pass with notes: a
+  `changes_requested` with no findings list, with an empty list and no prior
+  finding confirmed open, or with any entry the parser cannot read (not an
+  object, or no summary — under either word) is **unreadable and fails
+  closed**, for the prior set only. Unreadable findings are never filtered
+  down to "nothing blocking".
 - **A blocking finding must be demonstrated.** It carries `evidence` naming
   the command or test the reviewer ran and what it showed; one without it is
   downgraded to advisory (the record says why). On a fix cycle a NEW blocking
@@ -842,7 +856,13 @@ plus 3 fix cycles, cap 3", never "4 attempts, cap 3". At the cap the gate
 history and the ledger, and stops. The `art-gate-*` fact carries the ledger too
 (`Finding ledger:` — what was raised when, what cleared it, what still stands),
 so the rescue lane and `/spor:factory`'s telemetry read convergence per gate
-without re-reading every report. The kernel default is still `cycles: 0` (a
+without re-reading every report. The ledger, the fix-cycle count, the attempt
+history and the last fix are also **durable**: the runner saves them per gate
+onto the pipeline's run record (`gate_progress`, §10.8) after every step that
+changes them — the fix COUNTED before its dispatch, not after — so a pipeline a
+killed worker left behind resumes each review gate at the cycle it reached
+with its prior findings intact, and the cap is a cap across interruptions
+rather than a fresh allowance per one. The kernel default is still `cycles: 0` (a
 factory opts into re-dispatching an implementer); a factory that routes to a
 review gate should declare at least one, since with the floor above the only
 thing that reaches a person is a demonstrated blocking finding the implementer
@@ -986,10 +1006,16 @@ scoping a gate-armed worker would retroactively judge a bare worker's runs — a
 on a refusal file a `blocks` edge and roll back the status of an item a person
 may have deliberately closed.
 
-**A resumed pipeline re-runs its gates from the first one.** `gate_state` is one
-word about the whole pipeline; there is no per-gate progress record, so the
-suite runs again, the review is dispatched again, and the fix loop is re-entered
-from cycle 0. The fact *nodes* are idempotent (deterministic ids), so the graph
+**A resumed pipeline re-runs its gates from the first one — with each gate's
+memory intact.** `gate_state` is one word about the whole pipeline, so the suite
+runs again and the review is dispatched again; but every gate's own progress —
+its finding ledger, how many fix cycles it has dispatched, its attempt history
+and the fix that was in flight — is saved on the run record as
+`gate_progress` (keyed by the attempt's run key, so a `--regate` starts clean)
+and read back, so a review gate resumes at the review AFTER the last fix it
+dispatched, with the prior findings it had raised, and its `cycles` cap holds
+across the interruption instead of being granted afresh by it
+(task-spor-review-gate-stateful-bounded). The fact *nodes* are idempotent (deterministic ids), so the graph
 record does not double — but the side effects are not, and one of them matters:
 a fix cycle dispatches an implementer at the node with `--force` and
 `--no-worktree`, into the run's own checkout, and the abandoned pipeline may

@@ -452,6 +452,26 @@ test("a declared harness dry-run previews the bound command, argv and session pa
   assert.match(result.stdout, /session: \(read from the declared session\.id JSON path/);
 });
 
+// A declared harness has no read-only posture (v1 scope fixes the declaration
+// to five keys), so `--read-only` — the review gate's launch — is REFUSED
+// rather than run write-capable behind a warning (review finding 3 on
+// task-spor-review-gate-stateful-bounded's first cut).
+test("--read-only on a declared harness refuses before launch — no posture means no promise", () => {
+  const { home, repo } = fixture({ declaration: declarationFor("/opt/ox/bin/ox") });
+  for (const extra of [["--print"], []]) {
+    const result = run(
+      ["dispatch", "task-declared", "--dir", repo, "--profile", "profile-declared", "--no-brief", "--read-only", ...extra],
+      { SPOR_HOME: home, XDG_CONFIG_HOME: home }
+    );
+    assert.strictEqual(result.status, 1, result.stdout);
+    assert.match(result.stderr, /--read-only cannot be enforced on .* — the harness declares no read-only posture/);
+    assert.match(result.stderr, /codex \(--sandbox read-only\)/);
+    assert.match(result.stderr, /opencode \(--agent plan\)/);
+    assert.doesNotMatch(result.stderr, /warning: --read-only/);
+    assert.doesNotMatch(result.stdout, /run:/);
+  }
+});
+
 test("a declared dispatch launches the bound command, binds its session, and recovers the report", async () => {
   const { home, repo } = fixture({ declaration: null });
   const stub = harnessStub(home, { delayMs: 1500 });

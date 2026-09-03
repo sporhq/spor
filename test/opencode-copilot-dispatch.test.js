@@ -378,6 +378,35 @@ test("a real dispatch whose launcher is nowhere on PATH refuses BEFORE launching
   }
 });
 
+// task-spor-review-gate-stateful-bounded (review finding 3 on its first cut):
+// `--read-only` must be ENFORCED by the harness, not merely asked for in the
+// prompt. Each supervised adapter declares its posture — OpenCode's built-in
+// `plan` agent (edit denied everywhere), Copilot's `--deny-tool write` (the
+// file-writing tool denied at the permission layer, over --allow-all).
+test("--read-only dispatches OpenCode under the plan agent and Copilot with the write tool denied", () => {
+  const oc = fixture("opencode");
+  const ocRun = run(["dispatch", "task-opencode", "--dir", oc.repo, "--profile", "profile-opencode", "--no-brief", "--print", "--read-only"], { SPOR_HOME: oc.home });
+  assert.strictEqual(ocRun.status, 0, ocRun.stderr);
+  assert.match(ocRun.stdout, /opencode run --format json --auto --dir '?<dir>'? --agent plan --model profile-model/);
+  assert.doesNotMatch(ocRun.stderr, /warning: --read-only/);
+  const ocPlain = run(["dispatch", "task-opencode", "--dir", oc.repo, "--profile", "profile-opencode", "--no-brief", "--print"], { SPOR_HOME: oc.home });
+  assert.doesNotMatch(ocPlain.stdout, /--agent plan/, "a plain dispatch's argv is byte-identical");
+
+  const cp = fixture("copilot");
+  const cpRun = run(["dispatch", "task-copilot", "--dir", cp.repo, "--profile", "profile-copilot", "--no-brief", "--print", "--read-only"], { SPOR_HOME: cp.home });
+  assert.strictEqual(cpRun.status, 0, cpRun.stderr);
+  assert.match(cpRun.stdout, /copilot --output-format json --allow-all --no-ask-user --no-color --no-auto-update --deny-tool write --model profile-model/);
+  const cpPlain = run(["dispatch", "task-copilot", "--dir", cp.repo, "--profile", "profile-copilot", "--no-brief", "--print"], { SPOR_HOME: cp.home });
+  assert.doesNotMatch(cpPlain.stdout, /--deny-tool/);
+
+  assert.deepStrictEqual(dispatchHarnesses.getHarness("opencode").readOnly, { agent: "plan" });
+  assert.deepStrictEqual(dispatchHarnesses.getHarness("copilot").readOnly, { denyTools: ["write"] });
+  assert.deepStrictEqual(dispatchHarnesses.getHarness("opencode").buildArgs({ model: "m", readOnly: { agent: "plan" } }).slice(-4), ["--agent", "plan", "--model", "m"]);
+  assert.deepStrictEqual(dispatchHarnesses.getHarness("copilot").buildArgs({ model: null, readOnly: { denyTools: ["write"] } }).slice(-2), ["--deny-tool", "write"]);
+  // Every built-in harness can keep the promise.
+  for (const a of dispatchHarnesses.harnesses()) assert.ok(a.readOnly, `${a.id} declares a read-only posture`);
+});
+
 // ---- the dispatch path -----------------------------------------------------
 
 for (const harness of ["opencode", "copilot"]) {

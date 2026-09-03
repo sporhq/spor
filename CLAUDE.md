@@ -633,8 +633,14 @@ carries the work item, the bounded diff, the prior findings by ledger id and the
 last fix's commits; only a DEMONSTRATED `blocking` finding blocks (`evidence`
 required, `introduced_by_fix` on a fix cycle — everything else is advisory), a
 verdict that ignores a prior finding is unreadable and counts as changes_requested
-for the prior set only, and the per-gate finding ledger rides on the `art-gate-*`
-fact. `cycles` counts FIX dispatches (`cycles: 3` = initial review + 3 fixes). **human** arms on
+for the prior set only (so is a `changes_requested` with no readable findings — a
+malformed entry or a missing/empty list is never filtered down to a pass), and the
+per-gate finding ledger rides on the `art-gate-*` fact AND on the run record
+(`gate_progress`: ledger + fix count + attempts + last fix, saved BEFORE each fix
+dispatch, so a resumed pipeline keeps its prior findings and its cap holds across
+the interruption). `--read-only` REFUSES on a harness with no posture (the built-ins
+all have one: codex sandbox, claude plan mode, opencode `--agent plan`, copilot
+`--deny-tool write`). `cycles` counts FIX dispatches (`cycles: 3` = initial review + 3 fixes). **human** arms on
 declared risk classes, files an approval item and BLOCKS the resolve until a
 live RESOLVING EDGE (approved — a bare status flip is not an approval) or any
 other terminal status (refused) answers it, reporting `blocked` at `approval_timeout_ms` rather than deciding for the

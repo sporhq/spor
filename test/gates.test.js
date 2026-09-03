@@ -340,3 +340,47 @@ test("cycleDecision retries up to the declared cap, then escalates — `cycles: 
   assert.strictEqual(spent.text, "4 attempts: the initial one plus 3 fix cycles, cap 3");
   assert.strictEqual(gates.describeCycles({ cycles: 0 }, [{}]).text, "1 attempt: the initial one plus 0 fix cycles, cap 0");
 });
+
+// Review finding 2 on the first cut of the stateful gate: an explicit
+// `changes_requested` whose findings could not be read was filtered down to
+// "nothing blocking" and PASSED. A request for changes that says nothing —
+// no list, an empty list with no prior finding standing, or an entry the
+// parser cannot read — is unreadable, and unreadable fails closed.
+test("malformed or missing findings on an explicit changes_requested fail closed — never a pass laundered out of a filter", () => {
+  const cases = [
+    ['```json\n{"verdict":"changes_requested"}\n```', /carried no findings list/],
+    ['```json\n{"verdict":"changes_requested","findings":[]}\n```', /empty findings list and no prior finding confirmed open/],
+    ['```json\n{"verdict":"changes_requested","findings":["the lock is stolen"]}\n```', /1 of 1 findings is malformed/],
+    ['```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"a.js","evidence":"npm test fails"}]}\n```', /malformed \(not an object with a summary\)/],
+    ['```json\n{"verdict":"changes_requested","findings":[{"severity":"minor","summary":"nit"},42]}\n```', /1 of 2 findings is malformed/],
+    // The word does not launder a malformed entry either way: a "pass" whose
+    // findings cannot be read might be hiding the blocking one.
+    ['```json\n{"verdict":"pass","findings":[null]}\n```', /malformed/],
+  ];
+  for (const [text, re] of cases) {
+    const v = gates.parseReviewVerdict(text);
+    assert.strictEqual(v.ok, false, `${text} must be unreadable`);
+    assert.strictEqual(v.passed, false, `${text} must not pass`);
+    assert.match(v.error, re);
+    assert.match(v.error, /fails closed/);
+  }
+  // Well-formed advisory findings are still a pass with notes (rule 1).
+  assert.strictEqual(gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","findings":[{"severity":"minor","summary":"nit"}]}\n```').passed, true);
+
+  // On a fix cycle the prior answers survive an unreadable findings list: the
+  // fixer is sent back at what is still OPEN, not at a finding the reviewer
+  // just cleared, and an empty list beside a CONFIRMED prior finding is a
+  // readable "F1 still stands".
+  const prior = [{ id: "F1", severity: "blocking", summary: "off by one", evidence: "x" }, { id: "F2", severity: "blocking", summary: "drops rows", evidence: "y" }];
+  const partial = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","prior":[{"id":"F1","status":"resolved"},{"id":"F2","status":"open"}],"findings":["junk"]}\n```', { prior, cycle: 1 });
+  assert.strictEqual(partial.ok, false);
+  assert.deepStrictEqual(partial.findings.map((f) => f.id), ["F2"], "the cleared prior finding stays cleared; the open one is what the fix gets");
+  assert.deepStrictEqual(partial.prior.map((p) => [p.id, p.status]), [["F1", "resolved"], ["F2", "open"]]);
+  const confirmed = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","prior":[{"id":"F1","status":"open"},{"id":"F2","status":"resolved"}],"findings":[]}\n```', { prior, cycle: 1 });
+  assert.deepStrictEqual([confirmed.ok, confirmed.passed], [true, false]);
+  assert.deepStrictEqual(confirmed.findings.map((f) => f.id), ["F1"]);
+  // ...but clearing everything and still requesting changes says nothing.
+  const contradictory = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","prior":[{"id":"F1","status":"resolved"},{"id":"F2","status":"resolved"}],"findings":[]}\n```', { prior, cycle: 1 });
+  assert.strictEqual(contradictory.ok, false);
+  assert.match(contradictory.error, /no prior finding confirmed open/);
+});

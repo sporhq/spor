@@ -290,37 +290,159 @@ test("a review that ignores a prior finding is unreadable and re-dispatches the 
 // Replay of the four real codex reports from dispatched run a4f90513 (gate
 // adversarial-review on issue-spor-connection-deletion-update-toctou): under the
 // memoryless prompt each cycle raised NEW blocking findings and the escalation
-// carried four, none of them the two the fixer had been sent to fix. Under the
-// stateful protocol the same four reports converge on the initial set:
-// nothing raised after cycle 0 is admitted, because none of the later reports
-// answers a prior finding — so the escalation is bounded by cycle 0's findings
-// (two here, both demonstrated in the reviewer's own prose — lifted into the
-// structured `evidence` field the new prompt asks for), and the "fourth new
-// finding" never exists. The replay ALSO shows the honest limit: a reviewer
-// that never answers the prior set cannot converge below it.
-test("replaying run a4f90513's four codex reports through the stateful protocol admits nothing after the initial set", async () => {
+// carried four, none of them the two the fixer had been sent to fix.
+//
+// The reports predate the protocol, so they carry no structured `evidence`
+// field: the reviewer's demonstration, where it made one, is in its PROSE
+// ("I reproduced this: …", "a concurrency probe reproduced …"). The replay
+// lifts exactly that — the reviewer's own reproduction sentence, for exactly
+// the findings whose prose claims one — into `evidence`, by position, and
+// stamps NOTHING on a finding the reviewer only argued from the code. Nothing
+// else about any report is touched. So what the protocol sees is what the
+// reviewer actually did, and the acceptance line of
+// task-spor-review-gate-stateful-bounded is exercised as stated: at most ONE
+// escalation-worthy unresolved blocking finding, and exactly three fix
+// dispatches for `cycles: 3`.
+function liftProseEvidence(report) {
+  // The prose findings, in order: "- **Blocking — …**" / "1. **Blocking — …**"
+  // paragraphs. A paragraph demonstrates its finding iff it says so.
+  const paragraphs = report.split(/\n\s*\n/).filter((para) => /^\s*(?:-|\d+\.)\s+\*\*Blocking\b/i.test(para));
+  const demonstrated = paragraphs.map((para) => {
+    const m = para.match(/[^.]*\breproduc(?:ed|tion)\b[^.]*\./i);
+    return m ? m[0].replace(/\s+/g, " ").trim() : null;
+  });
+  const fence = report.match(/```json\n([\s\S]*?)\n```/);
+  const obj = JSON.parse(fence[1]);
+  let i = 0;
+  for (const f of obj.findings) {
+    if (f.severity !== "blocking") continue;
+    const ev = demonstrated[i++];
+    if (ev) f.evidence = ev;
+  }
+  return report.slice(0, fence.index) + "```json\n" + JSON.stringify(obj) + "\n```" + report.slice(fence.index + fence[0].length);
+}
+
+test("replaying run a4f90513's four codex reports through the stateful protocol bounds the escalation to ONE demonstrated finding", async () => {
   const dir = path.join(__dirname, "fixtures", "review-replay");
   const reports = [0, 1, 2, 3].map((i) => fs.readFileSync(path.join(dir, `a4f90513-review-${i}.md`), "utf8"));
-  // The initial review's blocking findings carry their demonstration in prose
-  // ("I reproduced this: …"); the new prompt asks for it in `evidence`, so the
-  // replay stamps it there for cycle 0 only. Cycles 1..3 are replayed VERBATIM.
-  const initial = reports[0].replace(/"severity":"blocking",/g, '"severity":"blocking","evidence":"reproduced: the replacement survived with replaced:true while its connection-stamped PAT was deleted",');
-  const texts = [initial, reports[1], reports[2], reports[3]];
+  const texts = reports.map(liftProseEvidence);
+  // What the lift did, made explicit so the test cannot quietly fabricate: the
+  // initial review demonstrated ONE of its two blocking findings (the
+  // revocation-before-CAS one; the ABA finding is argued from the code alone).
+  const initial = JSON.parse(texts[0].match(/```json\n([\s\S]*?)\n```/)[1]);
+  assert.deepStrictEqual(initial.findings.map((f) => !!f.evidence), [true, false]);
+  assert.match(initial.findings[0].evidence, /^I reproduced this: the replacement survived/);
+  assert.strictEqual(reports[0].includes('"evidence"'), false, "the fixture itself carries no evidence field");
+
   const factory = factoryOf({ ...BASE, gates: [{ id: "adversarial-review", kind: "agent-review", profile: "profile-codex-sol", cycles: 3 }] });
   let call = 0;
   const { deps, seen } = fakes({ review: () => ({ ok: true, text: texts[call++] }) });
   const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
   assert.strictEqual(res.state, "failed");
   assert.strictEqual(seen.reviews.length, 4);
-  assert.strictEqual(seen.fixes.length, 3, "cycles: 3 — three fix dispatches");
+  assert.strictEqual(seen.fixes.length, 3, "cycles: 3 — exactly three fix dispatches");
+  assert.deepStrictEqual(seen.reviews.map((r) => r.cycle), [0, 1, 2, 3]);
+
   const escalated = seen.escalations[0];
-  assert.deepStrictEqual(escalated.ledger.map((e) => e.id), ["F1", "F2"], "only cycle 0's findings are ever on the ledger");
-  assert.deepStrictEqual(escalated.findings.map((f) => f.id), ["F1", "F2"], "the escalation is bounded by the initial set — never the four different findings the old loop ended on");
+  const unresolved = escalated.findings.filter((f) => f.blocking);
+  assert.strictEqual(unresolved.length, 1, "at most one escalation-worthy unresolved blocking finding");
+  assert.strictEqual(unresolved[0].id, "F1");
+  assert.match(unresolved[0].summary, /revocation cascade runs before compare-and-delete/);
+  assert.deepStrictEqual(
+    escalated.ledger.map((e) => [e.id, e.status]),
+    [["F1", "open"], ["F2", "advisory"]],
+    "cycle 0's undemonstrated finding is on the record as advisory; nothing from cycles 1..3 is admitted (none answered the prior set)"
+  );
   for (const fix of seen.fixes) {
-    assert.deepStrictEqual(fix.findings.map((f) => f.id), ["F1", "F2"], "every fix cycle is sent back at the SAME two findings");
+    assert.deepStrictEqual(fix.findings.filter((f) => f.blocking !== false).map((f) => f.id), ["F1"], "every fix cycle is sent back at the SAME demonstrated finding");
   }
+  assert.match(res.reason, /ignored prior finding F1/, "the later reports never answered F1 — that is why they were unreadable");
+  assert.match(seen.facts[0].markdown, /4 attempts: the initial one plus 3 fix cycles, cap 3/);
   assert.match(seen.facts[0].markdown, /F1 \[blocking\] OPEN since cycle 0 — server\/rest-fastify\.ts/);
+  assert.match(seen.facts[0].markdown, /F2 \[blocking\] advisory \(cycle 0\) — server\/rest-fastify\.ts/);
   assert.doesNotMatch(seen.facts[0].markdown, /authorization or approved device codes/, "cycle 3's new finding is nowhere on the record");
+  assert.doesNotMatch(seen.facts[0].markdown, /non-renewable 30-second-stale file lock/, "nor is cycle 1's");
+});
+
+// Review finding 1 on the first cut: the ledger and the cycle count lived only
+// in the worker process, so a resumed pipeline (§10.8) restarted every review
+// gate from cycle 0 with an empty ledger — prior findings forgotten, and the
+// declared `cycles` cap granted afresh per interruption. The runner now saves
+// its per-gate progress through `saveGateProgress` after every step that
+// changes it and seeds from `loadGateProgress`; the bound holds ACROSS the
+// interruption: the fix cycles a killed worker dispatched still count.
+test("a resumed pipeline carries the finding ledger and the fix-cycle count, so the cap holds across the interruption", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 3 }] });
+  const confirming = ({ prior }) => ({
+    ok: true,
+    text: prior.length
+      ? `\`\`\`json\n{"verdict":"changes_requested","prior":[${prior.map((p) => `{"id":"${p.id}","status":"open"}`).join(",")}],"findings":[]}\n\`\`\``
+      : changesRequested,
+  });
+
+  // Worker A runs the gate and records what it saves, in order.
+  const saves = [];
+  const a = fakes({ review: confirming, fix: () => ({ ok: true, runId: "run-fix-a" }) });
+  a.deps.saveGateProgress = async ({ gate, progress }) => saves.push({ gate: gate.id, progress: JSON.parse(JSON.stringify(progress)) });
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: a.deps });
+  assert.strictEqual(a.seen.fixes.length, 3);
+  // The count is saved BEFORE each fix dispatch (a worker killed while it waits
+  // on the fix must resume AFTER it, not dispatch it twice): the save preceding
+  // the second fix already says two fixes.
+  const beforeSecondFix = saves.find((s) => s.progress.fixes === 2 && s.progress.lastFix && s.progress.lastFix.runId === null);
+  assert.ok(beforeSecondFix, "progress is saved with the fix counted before the fix is dispatched");
+  assert.deepStrictEqual(beforeSecondFix.progress.ledger.map((e) => [e.id, e.status]), [["F1", "open"]]);
+  assert.strictEqual(beforeSecondFix.progress.attempts.length, 2, "two reviews had run");
+
+  // Worker B adopts the orphan with exactly that snapshot — as if A died
+  // waiting on its second fix cycle.
+  const handed = [];
+  const b = fakes({
+    review: (args) => {
+      handed.push({ cycle: args.cycle, prior: args.prior, fix: args.fix });
+      return confirming(args);
+    },
+    fix: () => ({ ok: true, runId: "run-fix-b" }),
+  });
+  b.deps.loadGateProgress = async () => beforeSecondFix.progress;
+  const resumedSaves = [];
+  b.deps.saveGateProgress = async ({ progress }) => resumedSaves.push(JSON.parse(JSON.stringify(progress)));
+  const logs = [];
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b.deps, log: (l) => logs.push(l) });
+  assert.strictEqual(res.state, "failed");
+  assert.deepStrictEqual(b.seen.reviews.map((r) => r.cycle), [2, 3], "B resumes at the review AFTER A's second fix");
+  assert.strictEqual(b.seen.fixes.length, 1, "A dispatched two fixes, B dispatches the third and last — three in total, the cap");
+  assert.deepStrictEqual(handed[0].prior.map((p) => p.id), ["F1"], "the prior set survived the interruption");
+  assert.strictEqual(handed[0].fix.cycle, 1, "…and so did the record of the fix that was in flight");
+  assert.strictEqual(b.seen.escalations.length, 1);
+  assert.strictEqual(b.seen.escalations[0].attempts.length, 4, "the attempt history counts A's two reviews plus B's two");
+  assert.deepStrictEqual(b.seen.escalations[0].ledger.map((e) => e.id), ["F1"], "the ledger never reset");
+  assert.match(b.seen.facts[0].markdown, /4 attempts: the initial one plus 3 fix cycles, cap 3/);
+  assert.ok(logs.some((l) => /resumed on task-demo at fix cycle 2\/3 — 1 ledger finding\(s\) carried/.test(l)), logs.join("\n"));
+  assert.ok(resumedSaves.every((p) => p.fixes <= 3));
+
+  // A snapshot that already used the whole allowance resumes straight into the
+  // escalating review: one more review, no fix.
+  const exhausted = saves[saves.length - 1].progress;
+  assert.strictEqual(exhausted.fixes, 3);
+  const c = fakes({ review: confirming });
+  c.deps.loadGateProgress = async () => exhausted;
+  const resC = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: c.deps });
+  assert.strictEqual(resC.state, "failed");
+  assert.strictEqual(c.seen.fixes.length, 0, "no fourth fix cycle, ever");
+  assert.deepStrictEqual(c.seen.reviews.map((r) => r.cycle), [3]);
+
+  // The deps are optional: a runner with neither is the in-process behaviour.
+  const bare = fakes({ review: confirming });
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: bare.deps });
+  assert.strictEqual(bare.seen.fixes.length, 3);
+  // …and a save that throws is logged, never fatal.
+  const broken = fakes({ review: confirming });
+  broken.deps.saveGateProgress = async () => { throw new Error("disk full"); };
+  const brokenLogs = [];
+  const resBroken = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: broken.deps, log: (l) => brokenLogs.push(l) });
+  assert.strictEqual(resBroken.state, "failed");
+  assert.ok(brokenLogs.some((l) => /progress could not be saved \(disk full\)/.test(l)));
 });
 
 test("a review that cannot be read, dispatched or reported is a FAILURE — never a pass", async () => {
@@ -1677,6 +1799,56 @@ test("issue-spor-gate-node-refile-date-collision: re-filing the same gate fact a
   );
   assert.strictEqual(realCollision.ok, false);
   assert.match(realCollision.reason, /already exists with different content/);
+});
+
+// The durable half of the resumption above: makeGateDeps keeps the per-gate
+// progress on the pipeline's own RUN RECORD (`gate_progress`, keyed by the
+// attempt's run key), which is what a later worker's makeGateDeps reads back.
+test("makeGateDeps saves gate progress on the run record and reads it back — keyed to the attempt, so a re-gate starts clean", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-progress-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  const runId = "11111111-2222-3333-4444-555555555555";
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, {
+    run_id: runId, node_id: "task-p", state: "done", terminal_state: "resolved", terminal_enforced: true,
+    created_at: new Date().toISOString(), gate_state: "running", gate_worker: "w1", gate_at: new Date().toISOString(),
+  });
+  const mk = (attempt) =>
+    sporCli.makeGateDeps(cfg, {
+      record: { node_id: "task-p", cwd: home },
+      entry: { run_id: runId, node_id: "task-p", project: null, ...(attempt > 1 ? { attempt } : {}) },
+      factory: { id: "factory-test" }, slug: null, passthrough: {}, warn: () => {}, log: () => {}, stopping: () => false, home,
+      dispatch: async () => ({ ok: false, reason: "never" }),
+    });
+  const gate = { id: "review" };
+  const first = mk(1);
+  assert.strictEqual(await first.loadGateProgress({ gate }), null, "nothing saved yet");
+  const progress = { fixes: 2, attempts: [{ verdict: "failed", detail: "a" }, { verdict: "failed", detail: "b" }], ledger: [{ id: "F1", severity: "blocking", status: "open", blocking: true, summary: "x", opened: 0 }], lastFix: { cycle: 1, runId: null, fromHead: "abc", toHead: null } };
+  await first.saveGateProgress({ gate, progress });
+  await first.saveGateProgress({ gate: { id: "acceptance" }, progress: { fixes: 0, attempts: [], ledger: [], lastFix: null } });
+  const onDisk = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  assert.deepStrictEqual(Object.keys(onDisk.gate_progress.gates).sort(), ["acceptance", "review"], "one entry per gate, both kept");
+  assert.strictEqual(onDisk.gate_state, "running", "the verdict fields are untouched");
+
+  // A later worker's deps (same run, same attempt) read it back — and recover
+  // the in-flight fix's run id from the stamp the fix closure wrote.
+  dispatchRuns.stampGateState(home, runId, { gate_fix_run_id: "fix-run-77" });
+  const later = mk(1);
+  const back = await later.loadGateProgress({ gate });
+  assert.strictEqual(back.fixes, 2);
+  assert.deepStrictEqual(back.ledger.map((e) => e.id), ["F1"]);
+  assert.strictEqual(back.attempts.length, 2);
+  assert.strictEqual(back.lastFix.runId, "fix-run-77", "the fix run id lands on the resumed lastFix");
+
+  // A re-gate is a NEW attempt: it must not inherit the first attempt's cycles.
+  assert.strictEqual(await mk(2).loadGateProgress({ gate }), null);
+  // A settled record refuses the write (stampGateState's guard) and the dep
+  // says so, which the runner logs and survives.
+  dispatchRuns.stampGateState(home, runId, { gate_state: "failed" });
+  await assert.rejects(() => first.saveGateProgress({ gate, progress }), /could not be updated/);
+  fs.rmSync(home, { recursive: true, force: true });
 });
 
 // --------------------------------------------------- stop-during-fix-cycle --
