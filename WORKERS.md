@@ -1463,7 +1463,12 @@ transient write error, at park time or during the heal itself): the run record
 carries `gate_demote_pending: true` until the rollback lands, and every
 proposal check re-attempts it on that flag — otherwise the next pass would find
 the tracker present, heal nothing, and leave the item at its completion status
-for as long as the proposal stayed open. The pipeline returns a THIRD settled state,
+for as long as the proposal stayed open. The retry runs only while the tracker
+is still OPEN: a pass reads the tracker's own status first, and a tracker that
+is already terminal (closed by the merged PR's restore, or by a person) means
+the proposal is settled and the debt is simply cleared — re-demoting there
+would roll the completed item back to `open` behind a blocker no longer live,
+and nothing would ever restore it. The pipeline returns a THIRD settled state,
 `parked` (alongside `passed`/`failed`/`blocked`, all in
 `gates.SETTLED_GATE_STATES` — this run's pipeline is genuinely done; a
 resumed orphan re-running it from gate 0 would open a duplicate PR), and the

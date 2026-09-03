@@ -11888,6 +11888,27 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
     // tracker present, healed nothing, and left the item at its completion
     // status for as long as the proposal stayed open. The stamp is cleared
     // the moment a demotion lands, so a settled record costs no extra read.
+    //
+    // The tracker's own status is read FIRST (F3 of the same review): a
+    // tracker that is already terminal — closed by restore() once the PR
+    // merged, or by a person — means the proposal is SETTLED, and a
+    // demotion owed from an earlier pass is no longer owed. Retrying it here
+    // would roll a completed item back to `open` behind a blocker that is
+    // no longer live, and the settled check below would then skip every
+    // restoration — the item stuck open with nothing left to close it.
+    let closed = false;
+    try {
+      closed = await blockerAlreadyClosed(cfg, healed.id);
+    } catch {
+      closed = false; // an unreadable graph is not evidence this is settled
+    }
+    if (closed) {
+      if (r.gate_demote_pending) {
+        log(`work: the tracking item ${healed.id} for ${r.node_id} is already closed — the withheld demotion is no longer owed`);
+        dispatchRuns.stampGateState(home, r.run_id, { gate_demote_pending: false }, { force: true });
+      }
+      continue;
+    }
     if (healed.healed || r.gate_demote_pending) {
       let demoted = null;
       try {
@@ -11904,13 +11925,6 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
       // flag that says the rollback is still owed.
       dispatchRuns.stampGateState(home, r.run_id, { gate_demote_pending: !landed }, { force: true });
     }
-    let closed = false;
-    try {
-      closed = await blockerAlreadyClosed(cfg, healed.id);
-    } catch {
-      closed = false; // an unreadable graph is not evidence this is settled
-    }
-    if (closed) continue;
     const proposal = {
       nodeId: r.node_id,
       runId: r.run_id,

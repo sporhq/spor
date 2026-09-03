@@ -961,6 +961,75 @@ test("checkProposals retries a withheld demotion on gate_demote_pending until it
   assert.strictEqual(recordOf(entry2.run_id).gate_demote_pending, false);
 });
 
+// F3 of the same review: the pending-demotion retry must NOT run against a
+// tracker that is already closed. Once the PR merged, restore() promoted the
+// item and closed the tracker (`done`) — if the flag still stood from an
+// earlier failed pass, the retry would roll the completed item back to
+// `open` behind a terminal, non-live blocker and the settled check would
+// then skip every restoration, stranding it. The settled check runs first
+// and the no-longer-owed debt is cleared.
+test("checkProposals never retries a pending demotion against an already-closed tracker — it clears the debt and leaves the completed item alone (F3)", async (t) => {
+  if (process.platform === "win32") return;
+
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-park-demote-closed-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const write = (id, front) => fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\n${front}date: 2026-08-26\n---\n\nBody.\n`);
+  const statusOf = (id) => /^status: (.+)$/m.exec(fs.readFileSync(path.join(nodes, `${id}.md`), "utf8"))[1];
+  const recordOf = (runId) => dispatchRuns.readRunRecords(home).find((r) => r.run_id === runId);
+
+  // The PR reads MERGED onto main — so the first pass restores and closes the tracker.
+  const ghDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-fake-gh-"));
+  writeFakePathBin(ghDir, "gh", `if [ "$1" = "--version" ]; then echo "gh version 2.0.0"; exit 0; fi\necho '{"state":"MERGED","baseRefName":"main","mergedBy":{"login":"anthony"},"mergeCommit":{"oid":"abcdef0123456789"}}'\n`);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${ghDir}${path.delimiter}${originalPath}`;
+  t.after(() => { process.env.PATH = originalPath; });
+
+  const entry = { node_id: "task-proposed", run_id: "11111111-2222-3333-4444-000000000005" };
+  const tracker = sporCli.proposalTrackingId(entry.node_id, entry.run_id);
+  write("task-proposed", `type: task\ntitle: Add bounded retry\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: done\n`);
+  // The tracker filed at park time; the demotion beside it failed, so the
+  // debt is on the record — and the PR has since merged.
+  write(tracker, `type: task\ntitle: Review the proposal\nsummary: Review the proposal for task-proposed opened as a pull request and merge or close it.\nstatus: open\nrequires: [human]\nedges:\n  - {type: blocks, to: task-proposed}\n`);
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, entry.run_id).record, {
+    run_id: entry.run_id, node_id: entry.node_id, state: "done", terminal_state: "resolved", terminal_enforced: true,
+    gate_state: "parked", gate_demote_pending: true, gate_proposal_number: 11, gate_proposal_blocker: tracker,
+    gate_proposal_url: "https://github.com/demo/repo/pull/11", gate_proposal_repo: "demo/repo",
+    gate_proposal_branch: "task-proposed", gate_proposal_target_ref: "main", gate_proposal_strategy: "merge", gate_proposal_project: "demo",
+  });
+
+  // Pass 1: the tracker is still open, so the owed demotion lands first; the
+  // merged PR then restores the item and closes the tracker in the same pass.
+  const first = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => first.push(l) });
+  assert.strictEqual(statusOf(tracker), "done", "the merged PR closed the tracker");
+  assert.strictEqual(statusOf("task-proposed"), "done", "and restored the item");
+  assert.strictEqual(recordOf(entry.run_id).gate_demote_pending, false, "the demotion landed before the restore");
+
+  // The hazard itself: the debt is still on the record (a pass that
+  // restored but whose clearing stamp never landed, or a person who closed
+  // the tracker under a pending flag). The next pass must NOT reopen the
+  // completed item behind the terminal tracker.
+  dispatchRuns.stampGateState(home, entry.run_id, { gate_demote_pending: true }, { force: true });
+  const second = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => second.push(l) });
+  assert.strictEqual(statusOf("task-proposed"), "done", "a closed tracker never reopens the completed item");
+  assert.strictEqual(statusOf(tracker), "done");
+  assert.ok(!second.some((l) => l.includes("retried the withheld demotion")), second.join("\n"));
+  assert.ok(second.some((l) => l.includes(`the tracking item ${tracker} for task-proposed is already closed — the withheld demotion is no longer owed`)), second.join("\n"));
+  assert.strictEqual(recordOf(entry.run_id).gate_demote_pending, false, "the no-longer-owed debt is cleared");
+
+  // And a further pass is a silent no-op.
+  const third = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => third.push(l) });
+  assert.deepStrictEqual(third.filter((l) => l.includes("task-proposed")), []);
+});
+
 // ---------------------------------------------------- the git plumbing, for real --
 
 function git(dir, ...args) {
