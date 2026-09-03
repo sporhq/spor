@@ -652,3 +652,23 @@ test("parseRescueReport reads the structured diagnosis in code — last fence wi
   const empty = gates.parseRescueReport("");
   assert.deepStrictEqual([empty.ok, empty.diagnosis, empty.error], [false, "", "the rescue left no report"]);
 });
+
+// task-spor-review-gate-durable-debt-flag-checklist: the durable-debt table
+// is ONE constant rendered into the review, fix and worker prompts, so the
+// rows are named the same way everywhere ("row (c)" means the same thing to a
+// reviewer, a fixer and a commit message).
+test("the durable-debt checklist has the four fixed rows, lettered, and indents as one block", () => {
+  assert.deepStrictEqual(
+    gates.DURABLE_FLAG_FAILURE_MODES.map((m) => m.key),
+    ["write-fails", "clear-before-owe", "check-then-write", "stale-flag"]
+  );
+  const text = gates.renderDurableFlagChecklist();
+  const lines = text.split("\n");
+  assert.strictEqual(lines.length, 4);
+  assert.match(lines[0], /^\(a\) the flag write itself fails — /);
+  assert.match(lines[1], /^\(b\) clear-before-owe ordering and the crash window — /);
+  assert.match(lines[2], /^\(c\) the check-then-write race — /);
+  assert.match(lines[3], /^\(d\) a stale flag against already-settled state — /);
+  for (const l of gates.renderDurableFlagChecklist({ indent: "   " }).split("\n")) assert.match(l, /^   \([a-d]\) /);
+  assert.ok(Object.isFrozen(gates.DURABLE_FLAG_FAILURE_MODES), "the table is a contract, not a mutable list");
+});

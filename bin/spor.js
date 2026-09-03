@@ -10672,6 +10672,24 @@ function makeGateDeps(
       "",
       gate.instructions || "Look for correctness defects: does this change do what the work item asked, and does it break anything?",
       "",
+      "## Durable retry/debt flags — review the mechanism WHOLE, in this one verdict",
+      "",
+      "If the change introduces or extends a durable retry/debt flag — a `*_pending` field on a run record, a journal",
+      "line, a cooldown file, an outbox entry: anything one pass writes so a later pass owes an action — walk EVERY",
+      "row below against it and file every row that is open in THIS verdict, each as its own finding naming the row.",
+      "Do not raise one row now and the next after the fix: a flag reviewed one failure mode per cycle spends the",
+      "whole cycle budget on one design.",
+      "",
+      gatesKernel.renderDurableFlagChecklist(),
+      "",
+      ...(cycle > 0
+        ? [
+            "On a fix cycle, walk the table again against the writes the fix added or reordered: a row the fix",
+            "INTRODUCED is blocking (`introduced_by_fix: true`); a row that was open at the initial review and was not",
+            "raised then is advisory now.",
+            "",
+          ]
+        : []),
       ...(raised.length
         ? [
             "## Earlier findings rated blocking but not demonstrated",
@@ -10751,6 +10769,10 @@ function makeGateDeps(
       "",
       `Fix the cause in the same worktree and commit${blocking.some((f) => f.id) ? ", naming the finding ids you addressed in the commit message —" : "."}`,
       ...(blocking.some((f) => f.id) ? ["the next review is handed your commits and asked whether each prior finding is resolved."] : []),
+      "If the fix touches a durable retry/debt flag (a `*_pending` run-record field, a journal line, a cooldown file),",
+      "design it against ALL of these at once and say how each is handled in the commit message — the next review",
+      "walks the whole table in one verdict, and a fix that closes one row by opening the next is a fix cycle spent:",
+      gatesKernel.renderDurableFlagChecklist(),
       "The gate will re-run against the trusted ref's copy of the acceptance suite, so do not edit protected test",
       "paths — a change that touches them fails the gate closed.",
     ]

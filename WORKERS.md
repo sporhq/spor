@@ -236,7 +236,10 @@ standing context. <any additional free-text task instructions>
    factory-specific lines (the integration target, the acceptance command,
    the protected paths and their lane, the cross-model review) appear only
    when the factory declares them; a bare worker's contract is the plain
-   commit-then-resolve discipline. A person's one-off `spor dispatch` adds
+   commit-then-resolve discipline, plus the **durable-debt checklist** — the
+   four failure modes of a retry/debt flag (§10.4), which a change that
+   introduces or extends one is asked to design against up front and answer
+   row by row in its commit message. A person's one-off `spor dispatch` adds
    nothing — they write their own instructions.
 
 There is no wire-level requirement that a worker consume this exact string;
@@ -970,6 +973,41 @@ fixer had been sent to fix — so the protocol the parser enforces is:
   reports of that first run through this protocol keeps every fix cycle and the
   escalation on the initial two findings; the fourth cycle's new findings never
   reach the record.)
+
+**A durable retry/debt flag is reviewed whole, in one verdict**
+(task-spor-review-gate-durable-debt-flag-checklist). The stateful protocol
+above stops a reviewer raising a NEW finding per cycle, but a single design
+can still be walked one failure mode at a time: the first live run to ship a
+`gate_*_pending` run-record flag spent all three fix cycles on one mechanism —
+F2 the retry, F3 the closed tracker, F4 the check-then-write race, F5 the
+non-atomic pair of writes — each fix exposing the next row, until the item
+escalated with the design still one step short. So the review prompt carries
+a fixed checklist (`DURABLE_FLAG_FAILURE_MODES`, lib/kernel/gates.js, rendered
+by `renderDurableFlagChecklist`) and asks that when a change introduces or
+extends such a flag — a `*_pending` field on a run record, a journal line, a
+cooldown file, an outbox entry: anything one pass writes so a later pass owes
+an action — the reviewer walk EVERY row and file every open one in the SAME
+verdict, each as its own finding naming the row:
+
+- (a) **the flag write itself fails** — the stamp is best-effort; is the debt
+  still owed, and by what, when the write that records it did not land?
+- (b) **clear-before-owe ordering and the crash window** — clearing one flag
+  and owing the next as two writes loses the debt on a crash or a failed
+  second write; owe first, or write both in one stamp.
+- (c) **the check-then-write race** — another actor (a second worker, the heal
+  pass, a resumed pipeline) settles the same state between the check and the
+  write.
+- (d) **a stale flag against already-settled state** — a later pass finds the
+  flag but what it guards is already resolved or closed; reconcile, do not
+  act blindly.
+
+The same table goes to the implementer: the worker contract (§4) and the
+fix-cycle prompt ask for the flag to be designed against all four rows up
+front and for the commit message to say how each is handled, so the reviewer
+reads a design and the fix closes the mechanism rather than its next row. On
+a fix cycle the fix-introduced floor still applies: a row the fix INTRODUCED is
+blocking, one open at the initial review and not raised then is advisory.
+The checklist is prose — nothing parses it; the parser's protocol is unchanged.
 
 On `changes_requested` with cycles left, the runner dispatches an implementer
 **fix cycle** — the blocking findings by id, the advisory notes, what earlier
