@@ -422,7 +422,10 @@ terminal-state contract judges the outcome like any other supervised harness.
 Pass `--bg` (or set `dispatch.claudeLaunchMode: native-background` in your user
 config) to launch the native background session instead (`claude --bg`) — the
 attachable, interactive form (`claude attach`), at the cost of an unenforced
-outcome and no report channel. To dispatch under a different coding-agent CLI —
+outcome and no report channel. Both are `spor dispatch`'s alone: `spor work`
+launches every run supervised (its runs must be followed, judged and gated),
+and a worker started under a standing `native-background` says so once on
+stderr rather than silently ignoring it. To dispatch under a different coding-agent CLI —
 Codex, OpenCode, and GitHub Copilot CLI are also supported — resolve a
 **profile**: a node that bundles a harness, model, and toolset.
 

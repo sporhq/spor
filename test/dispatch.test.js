@@ -34,19 +34,35 @@ function bare(extra = {}) {
   env.SPOR_HOME = ISO_HOME;
   env.XDG_CONFIG_HOME = ISO_HOME;
   env.SPOR_FAKE_AGENTS_JSON = "[]";
-  // These tests pin the LAUNCHER — cwd, worktree, $PWD, argv, claim ordering,
-  // session capture through `claude agents --json` — against the native
-  // `claude --bg` launch they were written for, now the explicit opt-in
-  // (`--bg` / dispatch.claudeLaunchMode, task-spor-claude-adapter-headless-
-  // supervised). The supervised default (`claude -p --output-format
-  // stream-json` under the shared supervisor) is covered in
-  // test/claude-supervised-dispatch.test.js; every guard exercised here runs
-  // before the launch branch forks, so it is shared by both.
-  env.SPOR_DISPATCH_CLAUDE_LAUNCH_MODE = "native-background";
+  // The launcher tests here run against the SUPERVISED default (`claude -p
+  // --output-format stream-json` under the shared supervisor,
+  // task-spor-claude-adapter-headless-supervised); the few whose subject is the
+  // native `claude --bg` opt-in merge NATIVE_BG into their env (see below).
   return Object.assign(env, extra);
 }
 function run(args, env, cwd) {
   return spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", env: bare(env), cwd });
+}
+
+// The launch-mode pin for the handful of tests whose SUBJECT is the native
+// `claude --bg` launch (its argv, its $PWD pin, its exit-code/lease coupling,
+// its `claude agents --json` session capture): merge into a test's env. Every
+// other launcher test here runs against the SUPERVISED default
+// (`claude -p --output-format stream-json` under the shared supervisor,
+// task-spor-claude-adapter-headless-supervised), whose harness child is a
+// DETACHED grandchild — so a launch is observed by waiting for the stub's
+// marker file rather than reading it the instant the CLI returns.
+const NATIVE_BG = { SPOR_DISPATCH_CLAUDE_LAUNCH_MODE: "native-background" };
+async function waitForFile(file, { timeoutMs = 10000, intervalMs = 25 } = {}) {
+  const end = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      return fs.readFileSync(file, "utf8");
+    } catch {
+      if (Date.now() >= end) return null;
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
 }
 
 function slashPath(p) {
@@ -673,14 +689,14 @@ test("dispatch <node>: an unmapped slug matching the cwd's own slug resolves to 
   assert.doesNotMatch(r.stderr, /carries no repo\/project stamp/); // nor the stampless-node guard
 });
 
-test("dispatch <node> (real): an unmapped cwd-matching slug self-registers the repo", () => {
+test("dispatch <node> (real): an unmapped cwd-matching slug self-registers the repo", async () => {
   const { home } = fixture();
   const { real } = namedRepo("demo");
   const sentinel = path.join(home, "g-launched");
   const stub = claudeStub(home, sentinel);
   const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub }, real);
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.ok(fs.existsSync(sentinel), "the agent launched in the cwd-resolved repo");
+  assert.ok(await waitForFile(sentinel), "the agent launched in the cwd-resolved repo");
   const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
   assert.ok(slashPath(cfg.dispatch.repos.demo).endsWith("/demo"), "demo self-registered to the cwd's durable root");
 });
@@ -694,7 +710,7 @@ test("dispatch spawns the claude binary with --bg in the target dir", () => {
   // cwd on line 1, then each argv element on its own line (the prompt is last
   // and may add extra lines — fine, we only assert on the leading flags).
   const stub = pwdStub(home);
-  const r = run(["dispatch", "dec-x", "--model", "haiku"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile });
+  const r = run(["dispatch", "dec-x", "--model", "haiku"], { ...NATIVE_BG, SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile });
   assert.strictEqual(r.status, 0);
   const lines = fs.readFileSync(outFile, "utf8").split("\n");
   const cwd = lines[0];
@@ -716,7 +732,7 @@ test("dispatch native launch pins $PWD to the launch dir, not the launcher's inh
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const outFile = path.join(home, "spawn.out");
   const stub = pwdEnvStub(home);
-  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile });
+  const r = run(["dispatch", "dec-x", "--no-brief"], { ...NATIVE_BG, SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile });
   assert.strictEqual(r.status, 0, r.stderr);
   const [cwd, pwd] = fs.readFileSync(outFile, "utf8").split("\n");
   const expected = fs.realpathSync(repo);
@@ -797,7 +813,7 @@ test("dispatch --worktree --print: previews the worktree path + branch and creat
   assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees")), "--print created no worktree");
 });
 
-test("dispatch --worktree (stubbed): creates the worktree + branch and launches IN it, not the main checkout", () => {
+test("dispatch --worktree (stubbed): creates the worktree + branch and launches IN it, not the main checkout", async () => {
   const { home } = fixture();
   const { repo, real, g } = gitTargetRepo();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
@@ -806,7 +822,7 @@ test("dispatch --worktree (stubbed): creates the worktree + branch and launches 
   const r = run(["dispatch", "dec-x", "--no-brief", "--worktree"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile });
   assert.strictEqual(r.status, 0, r.stderr);
   const wtDir = path.join(repo, ".claude", "worktrees", "dec-x");
-  const cwd = fs.readFileSync(outFile, "utf8").split("\n")[0];
+  const cwd = (await waitForFile(outFile)).split("\n")[0];
   assert.strictEqual(cwd, fs.realpathSync(wtDir), "launched inside the worktree");
   assert.notStrictEqual(cwd, real, "did NOT launch in the main checkout");
   assert.ok(fs.existsSync(wtDir), "worktree dir exists on disk");
@@ -841,7 +857,7 @@ fs.writeFileSync(".wt-setup-ran", process.env.SPOR_MAIN_CHECKOUT + "\\n" + proce
   assert.match(r.stdout, /setup ran/);
 });
 
-test("dispatch --no-worktree overrides dispatch.worktree=true: launches in the main checkout, no worktree", () => {
+test("dispatch --no-worktree overrides dispatch.worktree=true: launches in the main checkout, no worktree", async () => {
   const { home } = fixture();
   const { repo, real } = gitTargetRepo();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
@@ -850,7 +866,7 @@ test("dispatch --no-worktree overrides dispatch.worktree=true: launches in the m
   const stub = pwdStub(home);
   const r = run(["dispatch", "dec-x", "--no-brief", "--no-worktree"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile });
   assert.strictEqual(r.status, 0, r.stderr);
-  const cwd = fs.readFileSync(outFile, "utf8").split("\n")[0];
+  const cwd = (await waitForFile(outFile)).split("\n")[0];
   assert.strictEqual(cwd, real, "launched in the main checkout");
   assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees")), "no worktree created");
 });
@@ -914,7 +930,7 @@ test("dispatch worktree setup hook leaves uncommitted changes then fails: worktr
 // corrupt-mapping guard misread the target's identity and refused a correct map.
 // Dispatch scrubs the location vars now (u.gitEnv), so the directory wins.
 
-test("dispatch --worktree under an ambient GIT_DIR: the worktree belongs to the TARGET repo, not the launcher's", () => {
+test("dispatch --worktree under an ambient GIT_DIR: the worktree belongs to the TARGET repo, not the launcher's", async () => {
   const { home } = fixture();
   const { repo, g } = gitTargetRepo();
   const launcher = gitTargetRepo("launcher"); // an unrelated repo, as a git hook's GIT_DIR would name
@@ -935,7 +951,7 @@ test("dispatch --worktree under an ambient GIT_DIR: the worktree belongs to the 
     "launcher's repo hosts NO worktree"
   );
   assert.strictEqual(g(["rev-parse", "--verify", "--quiet", "refs/heads/dec-x"]).trim().length, 40, "branch cut in the target");
-  const cwd = fs.readFileSync(outFile, "utf8").split("\n")[0];
+  const cwd = (await waitForFile(outFile)).split("\n")[0];
   assert.strictEqual(cwd, fs.realpathSync(wtDir), "launched inside the target's worktree");
 });
 
@@ -1000,7 +1016,7 @@ test("dispatch --backfill --print: worktree forced off even with dispatch.worktr
 // A cross-repo dispatch (standing somewhere else) honors the TARGET repo's own
 // dispatch.worktree[/Setup], since the cfg cascade only sees the dispatcher cwd.
 
-test("dispatch (cross-repo): honors the TARGET repo's .spor.json dispatch.worktree, not the standing config", () => {
+test("dispatch (cross-repo): honors the TARGET repo's .spor.json dispatch.worktree, not the standing config", async () => {
   const { home } = fixture();
   const { repo } = gitTargetRepo();
   // The target repo declares it wants isolation; the standing config does NOT.
@@ -1011,7 +1027,7 @@ test("dispatch (cross-repo): honors the TARGET repo's .spor.json dispatch.worktr
   const stub = pwdStub(home);
   const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile }, elsewhere);
   assert.strictEqual(r.status, 0, r.stderr);
-  const cwd = fs.readFileSync(outFile, "utf8").split("\n")[0];
+  const cwd = (await waitForFile(outFile)).split("\n")[0];
   assert.strictEqual(cwd, fs.realpathSync(path.join(repo, ".claude", "worktrees", "dec-x")), "launched in the worktree per target .spor.json");
 });
 
@@ -1035,7 +1051,7 @@ test("dispatch (cross-repo): a relative dispatch.worktreeSetup in the target .sp
   assert.ok(fs.existsSync(path.join(repo, ".claude", "worktrees", "dec-x", ".ran")), "relative setup hook ran (resolved against the repo dir)");
 });
 
-test("dispatch (cross-repo): does not apply the LAUNCHER's own .spor.json dispatch.worktreeSetup to the target's worktree", () => {
+test("dispatch (cross-repo): does not apply the LAUNCHER's own .spor.json dispatch.worktreeSetup to the target's worktree", async () => {
   // issue-spor-dispatch-worktree-setup-wrong-repo-config: dispatching from repo
   // A (which declares its own dispatch.worktreeSetup, relative to A) for a node
   // targeting repo B used to fall back to the standing cfg — anchored at A's
@@ -1062,7 +1078,7 @@ test("dispatch (cross-repo): does not apply the LAUNCHER's own .spor.json dispat
   );
   assert.strictEqual(r.status, 0, r.stderr);
   assert.doesNotMatch(r.stderr, /setup hook failed/);
-  const cwd = fs.readFileSync(outFile, "utf8").split("\n")[0];
+  const cwd = (await waitForFile(outFile)).split("\n")[0];
   assert.strictEqual(
     cwd,
     fs.realpathSync(path.join(repo, ".claude", "worktrees", "dec-x")),
@@ -1070,7 +1086,7 @@ test("dispatch (cross-repo): does not apply the LAUNCHER's own .spor.json dispat
   );
 });
 
-test("dispatch --no-worktree overrides the target repo's .spor.json dispatch.worktree", () => {
+test("dispatch --no-worktree overrides the target repo's .spor.json dispatch.worktree", async () => {
   const { home } = fixture();
   const { repo, real } = gitTargetRepo();
   fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktree: true } }) + "\n");
@@ -1080,7 +1096,7 @@ test("dispatch --no-worktree overrides the target repo's .spor.json dispatch.wor
   const stub = pwdStub(home);
   const r = run(["dispatch", "dec-x", "--no-brief", "--no-worktree"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outFile }, elsewhere);
   assert.strictEqual(r.status, 0, r.stderr);
-  const cwd = fs.readFileSync(outFile, "utf8").split("\n")[0];
+  const cwd = (await waitForFile(outFile)).split("\n")[0];
   assert.strictEqual(cwd, real, "launched in the main checkout despite the target asking for a worktree");
   assert.ok(!fs.existsSync(path.join(repo, ".claude", "worktrees")), "no worktree created");
 });
@@ -1140,7 +1156,7 @@ test("dispatch worktree setup hook: fires from a STALE/dirty main checkout, reso
 // an equally-uncommitted script: dispatch must run NO hook (before the
 // boundary fence it ran the main checkout's value against the worktree, where
 // the script doesn't exist, and aborted with `setup hook exited 127`).
-test("dispatch worktree setup hook: does NOT pick up the main checkout's uncommitted .spor.json via the ancestor walk", () => {
+test("dispatch worktree setup hook: does NOT pick up the main checkout's uncommitted .spor.json via the ancestor walk", async () => {
   const { home } = fixture();
   const { repo, g } = gitTargetRepo();
   fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktree: true } }) + "\n");
@@ -1167,7 +1183,7 @@ test("dispatch worktree setup hook: does NOT pick up the main checkout's uncommi
   assert.doesNotMatch(r.stdout, /setup ran/, "no setup hook ran");
   assert.ok(!fs.existsSync(path.join(wtDir, ".ran")), "the main checkout's uncommitted hook did not run");
   // Dispatch proceeded hookless, launching in the worktree as usual.
-  assert.strictEqual(fs.readFileSync(outFile, "utf8").split("\n")[0], fs.realpathSync(wtDir));
+  assert.strictEqual((await waitForFile(outFile)).split("\n")[0], fs.realpathSync(wtDir));
 });
 
 // --- profile satisfiability gate (dec-spor-machine-profile-satisfiability) ---
@@ -1223,7 +1239,7 @@ test("dispatch --profile: refuses when this machine can't satisfy it; nothing la
   assert.ok(!fs.existsSync(mark), "claude was never launched");
 });
 
-test("dispatch --profile: a satisfiable profile dispatches normally", () => {
+test("dispatch --profile: a satisfiable profile dispatches normally", async () => {
   const { home, nodes, repo } = fixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   writeProfile(nodes, "profile-cc", "harness: claude-code\nplugins: [spor]");
@@ -1232,7 +1248,7 @@ test("dispatch --profile: a satisfiable profile dispatches normally", () => {
   const mark = path.join(home, "launched.mark");
   const r = run(["dispatch", "dec-x", "--profile", "profile-cc", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
   assert.strictEqual(r.status, 0);
-  assert.ok(fs.existsSync(mark), "claude launched for a satisfiable profile");
+  assert.ok(await waitForFile(mark), "claude launched for a satisfiable profile");
 });
 
 test("dispatch --profile: an unknown profile id is a hard error before any launch", () => {
@@ -1308,7 +1324,7 @@ test("dispatch --from-queue: an item's own `profile:` frontmatter routes it, wit
   assert.ok(!fs.existsSync(mark), "never launched under an unsatisfiable auto-routed profile");
 });
 
-test("dispatch --from-queue: an explicit --profile still wins over the item's own `profile:` frontmatter", () => {
+test("dispatch --from-queue: an explicit --profile still wins over the item's own `profile:` frontmatter", async () => {
   const { home, nodes, repo } = fixture();
   writeProfile(nodes, "profile-codex", "harness: codex");
   writeProfile(nodes, "profile-cc", "harness: claude-code\nplugins: [spor]");
@@ -1325,7 +1341,7 @@ test("dispatch --from-queue: an explicit --profile still wins over the item's ow
     { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark, ...cleanProbeEnv() }
   );
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.ok(fs.existsSync(mark), "the explicit --profile satisfied here, so it launched — the item's own unsatisfiable profile-codex was never consulted");
+  assert.ok(await waitForFile(mark), "the explicit --profile satisfied here, so it launched — the item's own unsatisfiable profile-codex was never consulted");
 });
 
 test("dispatch --print --profile: previews the verdict and writes nothing", () => {
@@ -1741,9 +1757,8 @@ function remoteEnv(home, server, extra = {}) {
   // agent-identity.test.js) — so default the hard-fail's escape hatch on to keep
   // those guards reachable; `extra` can still override it.
   env.SPOR_ALLOW_PERSON_TOKEN = "1";
-  // Same native-launch pin as bare(): these exercise the launcher's guard and
-  // claim ordering against `claude --bg` (see the note there).
-  env.SPOR_DISPATCH_CLAUDE_LAUNCH_MODE = "native-background";
+  // Supervised default here too, exactly as bare(); a native-subject test
+  // merges NATIVE_BG itself (see the note there).
   return Object.assign(env, extra);
 }
 
@@ -1834,7 +1849,7 @@ test("dispatch <node-id> (remote): auto-claims the node, then launches the agent
     assert.ok(claim, "POST .../claim was sent");
     assert.match(claim.url, /^\/v1\/nodes\/task-rotate\/claim$/);
     assert.match(r.stdout, /claimed task-rotate/);
-    assert.ok(fs.existsSync(sentinel), "the bg agent launched after the claim");
+    assert.ok(await waitForFile(sentinel), "the bg agent launched after the claim");
   } finally {
     srv.close();
   }
@@ -1928,7 +1943,7 @@ test("dispatch (remote): a harness that exits non-zero without leaving an agent 
   const { srv, hits, base } = await claimStub({ claimStatus: 200 });
   const stub = claudeBoomStub(home);
   try {
-    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { ...NATIVE_BG, SPOR_CLAUDE_CMD: stub }));
     assert.notStrictEqual(r.status, 0, "the non-zero launcher exit is surfaced, not swallowed");
     assert.ok(claimHit(hits), "the claim was established");
     const release = releaseHit(hits);
@@ -1946,7 +1961,7 @@ test("dispatch (remote): a SUCCESSFUL native launch keeps its lease — no relea
   const sentinel = path.join(home, "launched");
   const stub = claudeStub(home, sentinel);
   try {
-    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { ...NATIVE_BG, SPOR_CLAUDE_CMD: stub }));
     assert.strictEqual(r.status, 0, r.stderr);
     assert.ok(claimHit(hits), "the claim was established");
     assert.ok(fs.existsSync(sentinel), "the bg agent launched");
@@ -1961,7 +1976,7 @@ test("dispatch (remote): a harness release call fails open — the launch failur
   const { srv, hits, base } = await claimStub({ claimStatus: 200, releaseStatus: 500 });
   const stub = claudeBoomStub(home);
   try {
-    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { ...NATIVE_BG, SPOR_CLAUDE_CMD: stub }));
     assert.notStrictEqual(r.status, 0);
     assert.ok(releaseHit(hits), "the release was still attempted");
     assert.match(r.stderr, /could not release the claim/);
@@ -2001,7 +2016,7 @@ test("dispatch --no-claim (remote): skips the claim entirely and launches", asyn
     assert.strictEqual(r.status, 0, r.stderr);
     assert.ok(!claimHit(hits), "no claim attempted with --no-claim");
     assert.doesNotMatch(r.stdout, /claimed task-rotate/);
-    assert.ok(fs.existsSync(sentinel), "the agent still launched");
+    assert.ok(await waitForFile(sentinel), "the agent still launched");
   } finally {
     srv.close();
   }
@@ -2016,7 +2031,7 @@ test("dispatch free-text (remote): no node to claim, so no claim is attempted", 
     const r = await runAsync(["dispatch", "some free text task here", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
     assert.strictEqual(r.status, 0, r.stderr);
     assert.ok(!claimHit(hits), "free-text dispatch claims nothing");
-    assert.ok(fs.existsSync(sentinel), "the agent launched");
+    assert.ok(await waitForFile(sentinel), "the agent launched");
   } finally {
     srv.close();
   }
@@ -2033,7 +2048,7 @@ test("dispatch (remote): a claim server error warns but still dispatches (fail-o
     assert.ok(claimHit(hits), "the claim was attempted");
     assert.match(r.stderr, /could not establish a lease/);
     assert.match(r.stderr, /internal/); // the failure code is surfaced
-    assert.ok(fs.existsSync(sentinel), "dispatch proceeds despite the outage");
+    assert.ok(await waitForFile(sentinel), "dispatch proceeds despite the outage");
   } finally {
     srv.close();
   }
@@ -2209,17 +2224,17 @@ test("dispatch <node-id> (local): a same-named agent already in flight refuses, 
   assert.ok(!fs.existsSync(sentinel), "no duplicate agent was launched");
 });
 
-test("dispatch <node-id> --force (local): launches despite an agent in flight", () => {
+test("dispatch <node-id> --force (local): launches despite an agent in flight", async () => {
   const { home, repo } = fixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const sentinel = path.join(home, "g-launched");
   const stub = claudeStub(home, sentinel);
   const r = run(["dispatch", "dec-x", "--no-brief", "--force"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: inFlightAgent("dec-x") });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.ok(fs.existsSync(sentinel), "the agent launched with --force");
+  assert.ok(await waitForFile(sentinel), "the agent launched with --force");
 });
 
-test("dispatch <node-id> (local): a DONE same-named agent is not in flight — dispatch proceeds", () => {
+test("dispatch <node-id> (local): a DONE same-named agent is not in flight — dispatch proceeds", async () => {
   const { home, repo } = fixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const sentinel = path.join(home, "g-launched");
@@ -2227,27 +2242,27 @@ test("dispatch <node-id> (local): a DONE same-named agent is not in flight — d
   const agents = inFlightAgent("dec-x", { status: "idle", state: "done" });
   const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: agents });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.ok(fs.existsSync(sentinel), "a finished agent does not block dispatch");
+  assert.ok(await waitForFile(sentinel), "a finished agent does not block dispatch");
 });
 
-test("dispatch free-text (local): NOT guarded even if an agent shares the derived name (node mode only)", () => {
+test("dispatch free-text (local): NOT guarded even if an agent shares the derived name (node mode only)", async () => {
   const { home, repo } = fixture();
   const sentinel = path.join(home, "g-launched");
   const stub = claudeStub(home, sentinel);
   // free-text name derives from the first words: "alpha beta gamma"
   const r = run(["dispatch", "alpha beta gamma", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: inFlightAgent("alpha beta gamma") });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.ok(fs.existsSync(sentinel), "free-text dispatch is not guarded — only node dispatch is");
+  assert.ok(await waitForFile(sentinel), "free-text dispatch is not guarded — only node dispatch is");
 });
 
-test("dispatch <node-id> (local): fails soft on unparseable agents output (no guard, dispatches)", () => {
+test("dispatch <node-id> (local): fails soft on unparseable agents output (no guard, dispatches)", async () => {
   const { home, repo } = fixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const sentinel = path.join(home, "g-launched");
   const stub = claudeStub(home, sentinel);
   const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: "not json at all" });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.ok(fs.existsSync(sentinel), "unparseable => empty => no guard => dispatch proceeds");
+  assert.ok(await waitForFile(sentinel), "unparseable => empty => no guard => dispatch proceeds");
 });
 
 test("dispatch <node-id> --print: previews the in-flight warning; clean when nothing is in flight", () => {
@@ -2296,7 +2311,7 @@ test("dispatch <node-id> --force (remote): still auto-claims and launches", asyn
     );
     assert.strictEqual(r.status, 0, r.stderr);
     assert.ok(claimHit(hits), "--force still auto-claims the lease");
-    assert.ok(fs.existsSync(sentinel), "and launches");
+    assert.ok(await waitForFile(sentinel), "and launches");
   } finally {
     srv.close();
   }
@@ -2357,25 +2372,25 @@ test("dispatch <node-id> (local): a node retired by an inbound resolves edge ref
   assert.ok(!fs.existsSync(sentinel), "the status lags but the resolver retires it — no launch");
 });
 
-test("dispatch <node-id> --force (local): launches despite a resolved target", () => {
+test("dispatch <node-id> --force (local): launches despite a resolved target", async () => {
   const { home, repo } = resolvedFixture();
   const sentinel = path.join(home, "g-launched");
   const stub = claudeStub(home, sentinel);
   const r = run(["dispatch", "task-done", "--dir", repo, "--no-brief", "--force"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.ok(fs.existsSync(sentinel), "the agent launched with --force");
+  assert.ok(await waitForFile(sentinel), "the agent launched with --force");
 });
 
-test("dispatch <node-id> (local): a genuinely-open node is NOT guarded — dispatch proceeds", () => {
+test("dispatch <node-id> (local): a genuinely-open node is NOT guarded — dispatch proceeds", async () => {
   const { home, repo } = resolvedFixture();
   const sentinel = path.join(home, "g-launched");
   const stub = claudeStub(home, sentinel);
   const r = run(["dispatch", "task-live", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.ok(fs.existsSync(sentinel), "an open task with no resolver dispatches normally");
+  assert.ok(await waitForFile(sentinel), "an open task with no resolver dispatches normally");
 });
 
-test("dispatch <node-id> (local): the resolved-task guard reads the real parser, not a body line that happens to start with 'status:'", () => {
+test("dispatch <node-id> (local): the resolved-task guard reads the real parser, not a body line that happens to start with 'status:'", async () => {
   // issue-spor-fmfield-multiline-truncation: the guard used to re-derive status
   // via a single-line regex over the raw node text (unbounded by the closing
   // `---`), so a body line like "status: done" below a frontmatter with no
@@ -2393,7 +2408,7 @@ test("dispatch <node-id> (local): the resolved-task guard reads the real parser,
   const stub = claudeStub(home, sentinel);
   const r = run(["dispatch", "task-body-status", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.ok(fs.existsSync(sentinel), "the body's 'status:' line must not false-gate the dispatch");
+  assert.ok(await waitForFile(sentinel), "the body's 'status:' line must not false-gate the dispatch");
 });
 
 test("dispatch <node-id> --print (local): previews the resolved warning; --force flips it; clean run prints none", () => {
@@ -2474,7 +2489,7 @@ test("dispatch <node-id> (remote): a released TASK (not an artifact) is NOT guar
     const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
     assert.strictEqual(r.status, 0, r.stderr);
     assert.ok(claimHit(hits), "a released task is not terminal, so the normal claim flow runs");
-    assert.ok(fs.existsSync(sentinel), "and launches");
+    assert.ok(await waitForFile(sentinel), "and launches");
   } finally {
     srv.close();
   }
@@ -2515,7 +2530,7 @@ test("dispatch <node-id> (remote): a server-computed `inert: false` proceeds eve
     const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
     assert.strictEqual(r.status, 0, r.stderr);
     assert.ok(claimHit(hits), "a server-flagged NOT-inert node runs the normal claim flow");
-    assert.ok(fs.existsSync(sentinel), "and launches");
+    assert.ok(await waitForFile(sentinel), "and launches");
   } finally {
     srv.close();
   }
@@ -2530,7 +2545,7 @@ test("dispatch <node-id> --force (remote): launches despite the server reporting
     const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief", "--force"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
     assert.strictEqual(r.status, 0, r.stderr);
     assert.ok(claimHit(hits), "--force still auto-claims the lease");
-    assert.ok(fs.existsSync(sentinel), "and launches");
+    assert.ok(await waitForFile(sentinel), "and launches");
   } finally {
     srv.close();
   }
@@ -2632,17 +2647,17 @@ test("dispatch <node-id> (local): requires:human refuses BEFORE profile resoluti
   );
 });
 
-test("dispatch <node-id> (local): assigned-to-person WARNS but still launches", () => {
+test("dispatch <node-id> (local): assigned-to-person WARNS but still launches", async () => {
   const { home, repo } = readinessFixture();
   const sentinel = path.join(home, "g-launched");
   const stub = claudeStub(home, sentinel);
   const r = run(["dispatch", "task-assigned-person", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.match(r.stderr, /warning: task-assigned-person's derived readiness is human, not agent — assigned to person-x\./);
-  assert.ok(fs.existsSync(sentinel), "the warn does not block the dispatch");
+  assert.ok(await waitForFile(sentinel), "the warn does not block the dispatch");
 });
 
-test("dispatch <node-id> (local): a readiness:agent-stamped task and a plain untriaged task carry no readiness guard output", () => {
+test("dispatch <node-id> (local): a readiness:agent-stamped task and a plain untriaged task carry no readiness guard output", async () => {
   const { home, repo } = readinessFixture();
   for (const id of ["task-agent-ready", "task-plain"]) {
     const sentinel = path.join(home, `g-launched-${id}`);
@@ -2650,7 +2665,7 @@ test("dispatch <node-id> (local): a readiness:agent-stamped task and a plain unt
     const r = run(["dispatch", id, "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
     assert.strictEqual(r.status, 0, r.stderr);
     assert.doesNotMatch(r.stderr, /readiness is human|requires a human/, `${id} must not warn`);
-    assert.ok(fs.existsSync(sentinel));
+    assert.ok(await waitForFile(sentinel));
   }
 });
 
@@ -2691,7 +2706,7 @@ test("dispatch <node-id> (remote): the server's already-shipped held enrichment 
     assert.strictEqual(r.status, 0, r.stderr);
     assert.match(r.stderr, /warning: task-rotate's derived readiness is human, not agent — held task awaiting triage\./);
     assert.ok(claimHit(hits), "a warn (not a refuse) still proceeds to claim + launch");
-    assert.ok(fs.existsSync(sentinel));
+    assert.ok(await waitForFile(sentinel));
   } finally {
     srv.close();
   }
@@ -2707,7 +2722,7 @@ test("dispatch <node-id> (remote): no readiness signal at all is byte-identical 
     assert.strictEqual(r.status, 0, r.stderr);
     assert.doesNotMatch(r.stderr, /readiness is human|requires a human/);
     assert.ok(claimHit(hits));
-    assert.ok(fs.existsSync(sentinel));
+    assert.ok(await waitForFile(sentinel));
   } finally {
     srv.close();
   }

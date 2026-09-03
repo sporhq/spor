@@ -720,6 +720,34 @@ process.stdin.on("end", () => {
   return { home, repo, nodes, outfile: path.join(home, "invocations.jsonl") };
 }
 
+// task-spor-work-honor-claude-launch-mode-and-retire-native-precheck: a
+// standing `dispatch.claudeLaunchMode: native-background` is honored by an
+// interactive `spor dispatch` but IGNORED by every dispatch the loop makes (a
+// worker's runs are always supervised, so they can be followed, judged and
+// gated). Ignoring it is right; ignoring it SILENTLY is not — the worker says
+// so once at startup, and says nothing at all under the default.
+test("spor work announces once that it ignores dispatch.claudeLaunchMode: native-background", () => {
+  const { home, outfile } = cliFixture();
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() };
+  const quiet = cli(["work", "--print"], env);
+  assert.strictEqual(quiet.status, 0, quiet.stderr);
+  assert.doesNotMatch(quiet.stderr, /claudeLaunchMode/, "nothing to announce under the default (supervised) mode");
+  const explicit = cli(["work", "--print"], { ...env, SPOR_DISPATCH_CLAUDE_LAUNCH_MODE: "supervised" });
+  assert.strictEqual(explicit.status, 0, explicit.stderr);
+  assert.doesNotMatch(explicit.stderr, /claudeLaunchMode/, "an explicit 'supervised' is what the worker does anyway — nothing to announce");
+  const native = cli(["work", "--print"], { ...env, SPOR_DISPATCH_CLAUDE_LAUNCH_MODE: "native-background" });
+  assert.strictEqual(native.status, 0, native.stderr);
+  assert.strictEqual(
+    (native.stderr.match(/claudeLaunchMode/g) || []).length, 1,
+    `announced exactly once: ${native.stderr}`
+  );
+  assert.match(native.stderr, /^spor work: dispatch\.claudeLaunchMode is 'native-background', which this worker ignores — .*launched SUPERVISED .*still applies to an interactive 'spor dispatch'\.$/m);
+  assert.match(native.stdout, /-> task-ready/, "the notice never changes what the worker would do");
+  const bogus = cli(["work", "--print"], { ...env, SPOR_DISPATCH_CLAUDE_LAUNCH_MODE: "attached" });
+  assert.strictEqual(bogus.status, 0, bogus.stderr);
+  assert.match(bogus.stderr, /^spor work: dispatch\.claudeLaunchMode 'attached' is not recognized \(supervised \| native-background\) — ignoring it; this worker always launches supervised\.$/m);
+});
+
 test("spor work --print previews scope, pacing and candidates, and launches nothing", () => {
   const { home, outfile } = cliFixture();
   const r = cli(["work", "--print"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() });
