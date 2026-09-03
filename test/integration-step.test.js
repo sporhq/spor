@@ -2125,3 +2125,53 @@ test("the settled integration result carries the candidate evidence in propose A
   assert.strictEqual(failed.state, "failed");
   assert.strictEqual(failed.candidate && failed.candidate.suite, "failed");
 });
+
+// -- major finding 5 (cross-model review): a PR that cannot carry its
+// attestation is not opened — the attestation-bearing body IS the contract a
+// PR-policy repo's CI validates, so building it failing is a failed proposal.
+test("propose mode refuses to open a PR without its attestation body: a body that cannot be built is a failed proposal, never a generic PR", async () => {
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-propose-body-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const entry = { node_id: "task-no-body", run_id: "11111111-2222-3333-4444-000000000009" };
+  const factory = { id: "factory-demo", integration: { targetRef: "main", mode: "propose", strategy: "merge" } };
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, entry.run_id).record, {
+    run_id: entry.run_id, node_id: entry.node_id, state: "done", terminal_state: "resolved", terminal_enforced: true,
+  });
+  const opened = [];
+  const logs = [];
+  const deps = sporCli.makeIntegrationDeps(cfg, {
+    record: { cwd: home }, entry, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: (l) => logs.push(l), home,
+    buildProposalBody: () => { throw new Error("no definition digest"); },
+    proposeIntegrationPR: (args) => { opened.push(args); return { ok: true, number: 1 }; },
+  });
+  const refused = await deps.propose({ head: "abc123", targetRef: "main", chain: null });
+  assert.strictEqual(refused.ok, false);
+  assert.match(refused.reason, /attestation for the pull request body could not be built \(no definition digest\)/);
+  assert.match(refused.reason, /no PR was opened/);
+  assert.deepStrictEqual(opened, [], "gh was never asked to open a PR");
+  assert.ok(logs.some((l) => /no PR was opened/.test(l)), "the refusal is logged");
+
+  // An empty body is refused the same way.
+  const deps2 = sporCli.makeIntegrationDeps(cfg, {
+    record: { cwd: home }, entry, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home,
+    buildProposalBody: () => null,
+    proposeIntegrationPR: (args) => { opened.push(args); return { ok: true, number: 1 }; },
+  });
+  const empty = await deps2.propose({ head: "abc123", targetRef: "main", chain: null });
+  assert.strictEqual(empty.ok, false);
+  assert.deepStrictEqual(opened, []);
+
+  // And a body that builds goes to gh with the body attached.
+  const deps3 = sporCli.makeIntegrationDeps(cfg, {
+    record: { cwd: home }, entry, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home,
+    buildProposalBody: () => "<!-- spor-attestation:begin -->{}<!-- spor-attestation:end -->",
+    proposeIntegrationPR: (args) => { opened.push(args); return { ok: true, number: 1 }; },
+  });
+  assert.strictEqual((await deps3.propose({ head: "abc123", targetRef: "main", chain: null })).ok, true);
+  assert.strictEqual(opened.length, 1);
+  assert.match(opened[0].body, /spor-attestation:begin/);
+});

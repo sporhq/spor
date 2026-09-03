@@ -253,7 +253,14 @@ test("a large factory's attestation fits the node body cap with WHOLE JSON — t
   assert.strictEqual(parsed.subject.commit, HEAD);
   assert.strictEqual(parsed.gate.allPassed, true);
   assert.strictEqual(parsed.configIntegrity.factory.digest, big.definition.factory.digest);
-  assert.ok(parsed.gate.steps.length === 60 || parsed.gate.steps_elided === 60, "the steps are carried or their count is");
+  assert.ok((parsed.gate.steps && parsed.gate.steps.length === 60) || parsed.gate.steps_elided === 60, "the steps are carried or their count is");
+  // The thinned copy is VERIFIABLE (cross-model review, major finding 4): a
+  // floor that elides the step list carries no list at all — never an empty
+  // one beside a nonzero count — so the validator takes the count+digest path
+  // and the runner's own large attestation passes its own verifier.
+  const verified = attestation.verifyAttestation(parsed, { trusted: JSON.parse(JSON.stringify(node.attestation)), trustedProvenance: { mode: "remote", author: "person-x" }, commit: HEAD, now: () => 1_700_000_100_000 });
+  assert.strictEqual(verified.ok, true, verified.reason);
+  assert.strictEqual(parsed.digest, node.attestation.digest, "the thinned copy carries the full object's digest");
   assert.match(node.markdown, /This is an attestation, not a resolution/, "the trailing prose survived — nothing was cut");
   // The full object is untouched: the node thins only what it renders.
   assert.strictEqual(node.attestation.gate.steps.length, 60);
@@ -340,7 +347,9 @@ test("verifyAttestation fails closed: a tampered body, a wrong key, a missing si
   const anchorless = attestation.verifyAttestation(unsigned, { now });
   assert.strictEqual(anchorless.ok, false, "no anchor, no pass");
   assert.match(anchorless.reason, /no trust anchor/);
-  assert.strictEqual(attestation.verifyAttestation(unsigned, { trusted: JSON.parse(JSON.stringify(unsigned)), now }).ok, true, "the graph copy alone is an anchor");
+  const graphCopy = () => JSON.parse(JSON.stringify(unsigned));
+  const remotePerson = { mode: "remote", author: "person-anthony", authored_via: "cli" };
+  assert.strictEqual(attestation.verifyAttestation(unsigned, { trusted: graphCopy(), trustedProvenance: remotePerson, now }).ok, true, "a server-stamped, person-written graph copy is an anchor");
   assert.strictEqual(attestation.verifyAttestation(signed, { key: "k", now }).ok, true, "the key alone is an anchor");
   assert.match(attestation.verifyAttestation(unsigned, { requireTrusted: true, now }).reason, /graph artifact copy is required/);
 
@@ -598,4 +607,48 @@ test("verifyAttestation binds the target: --target must equal the candidate's ba
   // An attestation carrying no target tip cannot satisfy a target check.
   const none = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult({ trusted_sha: null }), signing: { key: "k" } });
   assert.match(attestation.verifyAttestation(none, { key: "k", target: "tip-1" }).reason, /binds no target tip/);
+});
+
+// --- the graph anchor is checked as an attestation with provenance (cross-model
+// review, blocking finding 2): a dispatched agent holds graph-write authority,
+// so a node that merely carries the right id and digest is not an anchor.
+test("a forged graph artifact is no anchor: the graph copy must recompute its own digest, verify under the key, and be server-stamped as not agent-written", () => {
+  const issued = Date.parse("2026-09-02T12:00:00.000Z");
+  const now = () => issued + 60_000;
+  const unsigned = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult({}, issued - 1500), now: () => issued });
+  const copy = () => JSON.parse(JSON.stringify(unsigned));
+  const failing = (r) => r.checks.filter((c) => !c.ok).map((c) => c.check);
+
+  // An id/digest pair on a node whose content is something else: the graph
+  // copy's own digest does not recompute — refused as `trusted`.
+  const shell = { id: unsigned.id, digest: unsigned.digest, schema: unsigned.schema };
+  const forgedShell = attestation.verifyAttestation(unsigned, { trusted: shell, trustedProvenance: { mode: "remote", author: "person-x" }, now });
+  assert.strictEqual(forgedShell.ok, false);
+  assert.ok(failing(forgedShell).includes("trusted"), failing(forgedShell).join(","));
+  assert.match(forgedShell.reason, /does not recompute from its own content/);
+
+  // A real copy, but written by an AGENT (the implementer's own token can do
+  // exactly that) and no key held: no anchor.
+  const byAgent = attestation.verifyAttestation(unsigned, { trusted: copy(), trustedProvenance: { mode: "remote", author: "person-x", authored_by_agent: "agent-impl" }, now });
+  assert.strictEqual(byAgent.ok, false);
+  assert.deepStrictEqual(failing(byAgent), ["anchor"]);
+  assert.match(byAgent.reason, /written by agent 'agent-impl'/);
+
+  // A LOCAL graph is a directory the judged code could write: no anchor either.
+  const local = attestation.verifyAttestation(unsigned, { trusted: copy(), trustedProvenance: { mode: "local" }, now });
+  assert.deepStrictEqual(failing(local), ["anchor"]);
+  assert.match(local.reason, /local graph/);
+  // ...and unknown provenance is not assumed benign.
+  assert.deepStrictEqual(failing(attestation.verifyAttestation(unsigned, { trusted: copy(), now })), ["anchor"]);
+
+  // With a key, the SIGNATURE is the anchor and provenance is informational —
+  // but the graph copy's own signature must then verify too.
+  const signed = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult({}, issued - 1500), signing: { key: "k", keyId: "ci" }, now: () => issued });
+  const signedCopy = JSON.parse(JSON.stringify(signed));
+  assert.strictEqual(attestation.verifyAttestation(signed, { key: "k", trusted: signedCopy, trustedProvenance: { mode: "remote", authored_by_agent: "agent-impl" }, now }).ok, true, "a key anchors regardless of who wrote the graph node");
+  const badSig = JSON.parse(JSON.stringify(signed));
+  badSig.signature.value = "0".repeat(64);
+  const forgedSig = attestation.verifyAttestation(signed, { key: "k", trusted: badSig, now });
+  assert.deepStrictEqual(failing(forgedSig), ["trusted"]);
+  assert.match(forgedSig.reason, /signature does not verify with the key held/);
 });

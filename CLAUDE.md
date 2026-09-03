@@ -678,7 +678,12 @@ proposal identity — which survives the node-body ladder via
 `steps_digest`/`gates_digest`/`protected_paths_digest`) plus an
 HMAC-SHA256 `signature` when `attestation.signingKey` (`SPOR_ATTESTATION_KEY`,
 a secret stripped from repo `.spor.json`) is set; verification with neither a
-key nor the graph copy FAILS (`anchor`), so `spor attestation verify --no-graph`
+key nor the graph copy FAILS (`anchor`) — and the graph copy is an anchor
+only when it recomputes its own digest (and verifies under the key, if held)
+AND its server-stamped provenance rules out the judged code having written it:
+without a key, an `authored_by_agent` node, a LOCAL-mode node, or unknown
+provenance fails `anchor` (a dispatched agent has graph-write authority) — so
+`spor attestation verify --no-graph`
 requires a verified signature and is refused on a box with no key — and the definition digests
 hash the runtime-effective definition only (gate `source` stripped, so inline
 == referenced). Verification also checks the EVIDENCE under `passed`
@@ -688,10 +693,18 @@ and binds the target (`--target <sha>` against the candidate's base tip,
 `--target-ref`). `issued_at` is derived from the last step's finish, never
 the clock (a rebuilt attestation is byte-identical); the propose-time PR body
 is a PASSING, signed attestation in state `proposing`; the gate/candidate
-suites run with the judge's credentials SCRUBBED (`scrubSecretEnv`:
+suites run with the judge's credentials SCRUBBED, the dispatched implementer
+never inherits `SPOR_ATTESTATION_KEY`/admin/refresh secrets (`JUDGE_ONLY_ENV`
+in the supervisor), and every judge-side git call over the judged tree runs
+hook-free with secrets scrubbed (`judgeGitEnv`: `core.hooksPath` forced to an
+uncreatable path, so a committed `.githooks/post-checkout` never runs as the
+judge) (`scrubSecretEnv`:
 `SPOR_ATTESTATION_KEY`, graph tokens); protected paths are forced from the
 pinned `trusted_sha`, never the moving ref; and every whole-record run-record
-writer takes the record lock (`writeRecordCarryingGate`). In `propose` mode the same attestation rides in the PR body
+writer takes the record lock (`writeRecordCarryingGate`) with NO unlocked
+fallback — the bounded wait outlasts the stale window, stale locks are broken
+by rename (one breaker wins, a live lock taken by mistake is handed back) and
+release is token-checked. In `propose` mode the same attestation rides in the PR body — a body that cannot be built is a FAILED proposal, never a generic PR —
 between `<!-- spor-attestation:begin/end -->` markers, refreshed with the final
 graph-bound copy after settlement (a failed `gh pr edit` is a failed proposal
 on reuse, and a stamped-stale record post-settle, never a silent success), so

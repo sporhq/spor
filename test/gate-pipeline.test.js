@@ -2774,18 +2774,28 @@ test("whole-record writers take the record lock: a held lock makes them wait, a 
   assert.strictEqual(onDisk.gate_attestation, "art-attest-x", "the settle survives the whole-record write");
   assert.ok(!fs.existsSync(lock), "the writer released the lock");
 
-  // Held by a live writer: the write WAITS for the bounded window, then still
-  // lands (fail-soft — a supervisor's terminal outcome must never be lost to
-  // a settler that died holding the lock), carrying what is on disk by then.
+  // Held by a live writer: the write WAITS for the bounded window and, if the
+  // lock is still held, DOES NOT HAPPEN — never an unlocked fallback (cross-
+  // model review, blocking finding 3): an unlocked carry is the rename-over-
+  // the-settle the lock exists to prevent. The bounded window is shortened
+  // here through the injectable lock; the real one outlasts the stale window.
   fs.writeFileSync(lock, "4242\n");
+  const shortLock = (file, fn, o) => dispatchRuns.withRecordLock(file, fn, { ...o, attempts: 20, waitMs: 5 });
   const t0 = Date.now();
-  dispatchRuns.writeRecordCarryingGate(paths.record, { ...onDisk, note: "late" });
+  assert.throws(() => dispatchRuns.writeRecordCarryingGate(paths.record, { ...onDisk, note: "late" }, { lock: shortLock }), /not written: record lock contended/);
   const waited = Date.now() - t0;
-  assert.ok(waited >= 500, `waited for the lock (${waited}ms)`);
+  assert.ok(waited >= 50, `waited for the lock (${waited}ms)`);
+  assert.strictEqual(dispatchRuns.closeRun(paths.record, { state: "failed" }, null, { lock: shortLock }), null, "closeRun under a live lock did not write");
+  assert.strictEqual(dispatchRuns.mergeTerminalOutcome(paths.record, { terminal_state: "failed" }, { lock: shortLock }), null, "mergeTerminalOutcome under a live lock did not write");
   onDisk = dispatchRuns.readJson(paths.record);
-  assert.strictEqual(onDisk.note, "late");
+  assert.strictEqual(onDisk.note, undefined, "nothing landed unlocked");
+  assert.strictEqual(onDisk.state, "done");
   assert.strictEqual(onDisk.gate_attestation, "art-attest-x");
   assert.ok(fs.existsSync(lock), "a live holder's lock is left alone");
+  assert.strictEqual(fs.readFileSync(lock, "utf8"), "4242\n", "...and untouched");
+  // The real bounded wait outlasts the stale window, so no writer ever needs
+  // an unlocked path: a corpse is always broken before the wait runs out.
+  assert.ok(dispatchRuns.RECORD_LOCK_ATTEMPTS * dispatchRuns.RECORD_LOCK_WAIT_MS > dispatchRuns.RECORD_LOCK_STALE_MS, "the wait outlasts the stale window");
 
   // A corpse is broken and the write goes through at once.
   const old = new Date(Date.now() - dispatchRuns.RECORD_LOCK_STALE_MS - 5000);
@@ -2844,4 +2854,115 @@ test("a missing attestation and a stale proposal body surface on 'spor runs' and
   const status2 = await workLoop.runWorkLoop({ opts: { workerId: "w", intervalMs: 1000, retryAfterMs: 600000, max: 1 }, deps: sup.deps, control: sup.control });
   assert.strictEqual(status2.recent[0].attestation_missing, true);
   assert.strictEqual(status2.recent[0].attestation_error, "could not be recorded on the graph");
+});
+
+// -- blocking finding 3 (cross-model review): breaking a stale lock is
+// ownership-safe, and releasing one is checked.
+test("the record lock is ownership-safe: a corpse is broken by rename (one breaker wins), a live lock a breaker took by mistake is handed back, and release never removes another holder's lock", () => {
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-lock-own-"));
+  const file = path.join(home, "r.json");
+  dispatchRuns.atomicJson(file, { a: 1 });
+  const lock = dispatchRuns.recordLockPath(file);
+  const staleMs = dispatchRuns.RECORD_LOCK_STALE_MS;
+
+  // A FRESH lock that a breaker takes (its stat said stale a moment ago, the
+  // holder changed in between): the breaker finds it live and puts it back —
+  // same content, same path — and reports nothing broken.
+  fs.writeFileSync(lock, "4242:live\n");
+  assert.strictEqual(dispatchRuns.breakStaleLock(lock, { staleMs, now: Date.now }), false);
+  assert.ok(fs.existsSync(lock), "the live lock is back where its holder will release it");
+  assert.strictEqual(fs.readFileSync(lock, "utf8"), "4242:live\n");
+  assert.deepStrictEqual(fs.readdirSync(home).filter((f) => f.includes(".stale-")), [], "no renamed corpse left behind");
+
+  // A corpse: broken, and the lock path is free.
+  const old = new Date(Date.now() - staleMs - 5000);
+  fs.utimesSync(lock, old, old);
+  assert.strictEqual(dispatchRuns.breakStaleLock(lock, { staleMs, now: Date.now }), true);
+  assert.ok(!fs.existsSync(lock));
+  // ...and a second breaker for the same corpse finds nothing to break.
+  assert.strictEqual(dispatchRuns.breakStaleLock(lock, { staleMs, now: Date.now }), false);
+
+  // A holder whose lock was re-taken under the same name by someone else
+  // (the race the naive unlink produced) does NOT remove the newcomer's lock.
+  const held = dispatchRuns.withRecordLock(file, () => {
+    const mine = fs.readFileSync(lock, "utf8");
+    assert.match(mine, new RegExp(`^${process.pid}:[0-9a-f]{16}\\n$`), "the holder's token is in the lock");
+    fs.unlinkSync(lock);
+    fs.writeFileSync(lock, "9999:someone-else\n");
+    return "ran";
+  });
+  assert.deepStrictEqual(held, { ok: true, value: "ran" });
+  assert.strictEqual(fs.readFileSync(lock, "utf8"), "9999:someone-else\n", "release is checked: another holder's lock is left alone");
+  fs.unlinkSync(lock);
+
+  // The ordinary path: acquire, run, release — the lock is gone afterwards.
+  assert.deepStrictEqual(dispatchRuns.withRecordLock(file, () => 7), { ok: true, value: 7 });
+  assert.ok(!fs.existsSync(lock));
+
+  // Two waiters over one corpse, end to end: both go through the breaker and
+  // exactly one holds at a time (the critical sections never overlap).
+  fs.writeFileSync(lock, "4242:corpse\n");
+  fs.utimesSync(lock, old, old);
+  let inside = 0;
+  let overlap = false;
+  const run = () => dispatchRuns.withRecordLock(file, () => {
+    inside += 1;
+    if (inside > 1) overlap = true;
+    inside -= 1;
+    return true;
+  }, { attempts: 200, waitMs: 1 });
+  assert.deepStrictEqual([run().ok, run().ok, overlap], [true, true, false]);
+  assert.ok(!fs.existsSync(lock));
+});
+
+// -- blocking finding 1 (cross-model review): the judge's git never runs a
+// hook the judged change controls, and never carries the judge's secrets.
+test("the judge's git runs hook-free over the judged tree: a committed core.hooksPath hook does not fire on the gate worktree, and the signing key is scrubbed", () => {
+  const dir = repoWithBranch({ weakenTest: false, regress: false });
+  // The implementer's commit points core.hooksPath at a TRACKED directory
+  // (the repo's own config does — as a `.githooks` convention would) whose
+  // post-checkout hook leaves a marker and exfiltrates the judge's key.
+  git(dir, "checkout", "-q", "impl");
+  const marker = path.join(dir, "..", `hook-fired-${path.basename(dir)}`);
+  fs.mkdirSync(path.join(dir, ".githooks"));
+  const hook = path.join(dir, ".githooks", "post-checkout");
+  fs.writeFileSync(hook, `#!/bin/sh\nprintf '%s' "\${SPOR_ATTESTATION_KEY:-none}" > "${marker}"\n`);
+  fs.chmodSync(hook, 0o755);
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "hooks");
+  git(dir, "config", "core.hooksPath", ".githooks");
+  // Sanity: the hook DOES fire for an ordinary checkout in that repo.
+  git(dir, "checkout", "-q", "main");
+  git(dir, "checkout", "-q", "impl");
+  assert.ok(fs.existsSync(marker), "the hook fires for a plain checkout");
+  fs.unlinkSync(marker);
+
+  const prevKey = process.env.SPOR_ATTESTATION_KEY;
+  process.env.SPOR_ATTESTATION_KEY = "judge-secret";
+  try {
+    const change = gateRunner.gateChangeSet({ cwd: dir }, "main");
+    assert.strictEqual(change.ok, true, change.reason);
+    const tree = gateRunner.prepareGateTree(change, { trustedRef: "main", protectedPaths: ["test/**"] });
+    assert.strictEqual(tree.ok, true, tree.reason);
+    try {
+      assert.ok(!fs.existsSync(marker), "no hook ran on the judge's worktree add / protected-path checkout");
+      assert.ok(fs.existsSync(path.join(tree.dir, ".githooks", "post-checkout")), "the tree itself is materialized");
+    } finally {
+      tree.cleanup && tree.cleanup();
+    }
+  } finally {
+    if (prevKey === undefined) delete process.env.SPOR_ATTESTATION_KEY;
+    else process.env.SPOR_ATTESTATION_KEY = prevKey;
+  }
+  if (process.platform !== "win32") assert.ok(!fs.existsSync(marker), "still no hook");
+
+  // The env itself: secrets scrubbed, hooks path forced, an existing
+  // GIT_CONFIG_COUNT appended to rather than clobbered.
+  const env = gateRunner.judgeGitEnv({ PATH: "/bin", SPOR_ATTESTATION_KEY: "k", SPOR_TOKEN: "t", GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "a.b", GIT_CONFIG_VALUE_0: "c" });
+  assert.strictEqual(env.SPOR_ATTESTATION_KEY, undefined);
+  assert.strictEqual(env.SPOR_TOKEN, undefined);
+  assert.strictEqual(env.PATH, "/bin");
+  assert.deepStrictEqual([env.GIT_CONFIG_COUNT, env.GIT_CONFIG_KEY_0, env.GIT_CONFIG_VALUE_0, env.GIT_CONFIG_KEY_1, env.GIT_CONFIG_VALUE_1], ["2", "a.b", "c", "core.hooksPath", gateRunner.noHooksPath()]);
+  if (process.platform !== "win32") assert.ok(gateRunner.noHooksPath().startsWith(os.devNull), "a path nothing on the box can create a hook under");
 });

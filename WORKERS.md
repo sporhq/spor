@@ -1356,7 +1356,9 @@ same evidence chain (task-spor-factory-gate-attestation), in four pieces:
    body is capped (the REST door's 8KB) but the JSON is NEVER cut: the
    rendering steps down — pretty, compact, free-text dropped, steps thinned to
    id/kind/verdict/head/digest/fact (`abridged` says so), fewer linked edges,
-   and at the floor every list (steps, gates, protected paths) replaced by
+   and at the floor every list (steps, gates, protected paths) REMOVED —
+   never left as an empty list beside a nonzero count, which the validator
+   refuses as a disagreement — and replaced by
    its count — so every rung is whole JSON carrying what a validator checks;
    the full object still rides the run's in-process result. The floor is
    bounded by construction (ids, shas, digests, counts — no list rides the
@@ -1442,9 +1444,16 @@ and, when `attestation.signingKey` (`SPOR_ATTESTATION_KEY`; a secret, so
 stripped from a committable repo `.spor.json` — env, user or global config
 only; `attestation.keyId` names it) is configured, `signature`
 {alg: hmac-sha256, key_id, value} over those same bytes. Two trust anchors
-follow: the GRAPH ARTIFACT the runner wrote (a store a PR author does not
-write through) — a copy is genuine only if its `digest` equals the artifact's
-— and the shared key, for a CI that cannot reach the graph. `spor attestation
+follow: the GRAPH ARTIFACT the runner wrote — a copy is genuine only if its
+`digest` equals the artifact's, AND the artifact is checked as an attestation
+in its own right (its digest recomputes from its own content; under a key its
+signature verifies) AND its server-stamped provenance shows the judged code
+could not have written it: a dispatched agent holds graph-write authority
+(its agent-scoped token), so without a key a graph copy the server stamped
+`authored_by_agent`, or one read from a LOCAL graph (a directory on the box
+the implementer ran on), or one whose provenance is unknown, is NO anchor
+(`anchor` fails) — and the shared key, for a CI that cannot reach the graph
+or whose runner writes the graph under an agent identity. `spor attestation
 verify (--pr-body <file>|--file <file>|-) [--commit <sha>] [--max-age <dur>]
 [--factory <id>|--factory-digest <d>] [--require-signature] [--no-graph]` is
 the validator (`verifyAttestation`, every check fail-closed, exit 1 on any
@@ -1493,7 +1502,19 @@ signing key and every graph credential (`SPOR_ATTESTATION_KEY`,
 list) from the inherited environment AND from the tree's declared setup env
 before spawning; otherwise a branch could sign its own forged attestation or
 write the `art-attest-*` anchor as the runner. Unrelated keys the suite needs
-are left alone.
+are left alone. The same holds one level up and one level down. UP: the
+dispatched implementer never inherits the judge's secrets either — the
+supervisor strips `SPOR_ATTESTATION_KEY`, `SPOR_ADMIN_TOKEN` and
+`SPOR_REFRESH_TOKEN` (`JUDGE_ONLY_ENV`, agent-dispatch-runner.js) from every
+harness child, whatever the harness, on top of the agent-scoped token that
+replaces the person's graph bearer. DOWN: every git call the JUDGE makes over
+the judged tree (`git worktree add`, the protected-path checkout, the
+candidate merge/rebase) runs under `judgeGitEnv` — the same secret scrub plus
+every git HOOK disabled, `core.hooksPath` forced through git's env-config door
+to a path no hook can live under (`/dev/null/…` on POSIX; a fresh private
+empty directory on Windows) — because a commit can point `core.hooksPath` at
+a tracked directory and a `post-checkout` in the change under judgement would
+otherwise run as the judge before a single gate had looked at it.
 
 **The trusted tree is pinned once.** `gateChangeSet` resolves
 `trusted_sha` and REFUSES when the ref does not resolve; `prepareGateTree`
@@ -1510,11 +1531,27 @@ on-disk `gate_*` fields OUTSIDE that lock — a settle landing between their
 read and their rename was renamed over, erasing a verdict and attestation the
 settler's read-back had verified. They, `closeRun` and `mergeTerminalOutcome`
 now do their read-carry-write under the same per-record lock
-(`writeRecordCarryingGate`); a lock that cannot be taken in the bounded wait
-still writes (a terminal outcome must land), so the residual window is the
-lock's own failure, not the ordinary path.
+(`writeRecordCarryingGate`), and NONE of them has an unlocked fallback: a
+write that cannot take the lock does not happen (`null`, or a throw the
+caller's own fail-soft handling absorbs — the supervisor keeps its in-memory
+record and carries the patch on its next update). The lock's bounded wait
+OUTLASTS the stale window (`RECORD_LOCK_ATTEMPTS × RECORD_LOCK_WAIT_MS` >
+`RECORD_LOCK_STALE_MS`), so a settler that died holding it costs a wait,
+never a write. Breaking a corpse is OWNERSHIP-SAFE: a breaker never unlinks
+the lock path (two waiters unlinking one stale lock let the second remove
+the first's fresh lock — two holders); it RENAMES the corpse to a name only
+it knows (one breaker wins), judges the file it actually took, deletes it if
+stale and hands it back (a hard link, never replacing a lock taken in the
+meantime) if it turned out live. Release is checked: the holder wrote a
+random token into its lock and removes the lock path only while that token is
+still what it holds.
 
-**In `propose` mode the PR body carries the attestation.** `proposeIntegrationPR`
+**In `propose` mode the PR body carries the attestation — or there is no PR.**
+A body that cannot be built (the attestation object throws, or renders
+empty) is a FAILED proposal, routed like any other stage failure (§10.9),
+never a PR opened with a generic description: the attestation-bearing body
+is the contract a PR-policy repo's CI validates, and a PR without it would
+pass through that repo's merge queue with nothing to check. `proposeIntegrationPR`
 writes `renderPrBody`'s text — the step list, the candidate suite that just
 passed on merge(target, head), the artifact id and digest it is bound to, the
 rule that the text alone is not evidence, and the JSON between

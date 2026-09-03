@@ -7041,6 +7041,12 @@ async function resolveNode(cfg, id) {
     held,
     inert,
     revision,
+    // Server-stamped authorship (API.md §3): who wrote the node and through
+    // what. In local mode these are whatever the file says — a validator
+    // treats a local graph's provenance as unverifiable (attestation.js).
+    author: parsed.author || null,
+    authored_by_agent: parsed.authored_by_agent || null,
+    authored_via: parsed.authored_via || null,
   };
 }
 
@@ -10718,7 +10724,32 @@ function buildProposalTrackingNode({ id, nodeId, runId, targetRef, proposal, pro
 // integration-runner.js's pure orchestration, mirroring makeGateDeps above.
 // Only ever constructed when `factory.integration` resolved, so a bare
 // factory (or one with no integration block) never touches any of this.
-function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, warn, sleep, log, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, dispatch = dispatchThrough, home = cfg.userConfigHome(), gateResult = null, workerId = null, regate = null }) {
+// The propose-time PR body: the run's attestation as it stands (the gate
+// verdicts bound to the head being proposed, with the candidate suite the
+// stage just ran), rendered with the validation recipe
+// (task-spor-factory-gate-attestation, piece 4). Built here rather than in
+// the pure runner because it needs the gate pipeline's result and the
+// environment, which the stage never sees. Throws when it cannot be built —
+// the caller (makeIntegrationDeps `propose`) turns that into a failed
+// proposal, never a PR without it.
+function buildProposalBody({ cfg, entry, factory, slug, workerId, top, head, targetRef, chain = null, integration, gate }) {
+  const baseBranch = integrationRunner.splitRemoteRef(targetRef).branch;
+  const partial = {
+    mode: integration.mode, strategy: integration.strategy, state: "proposing", target_ref: targetRef,
+    target_sha: chain ? chain.targetSha : null, head: head || (chain && chain.head) || null,
+    gated_head: chain ? chain.gatedHead : null, landed_sha: null, candidate: chain ? chain.candidate : null,
+  };
+  const att = attestation.buildAttestationObject({
+    item: { ...entry, project: slug || entry.project || null }, factory,
+    gate,
+    integration: partial,
+    environment: attestationEnvironment(cfg, workerId),
+    signing: attestationSigning(cfg),
+  });
+  return attestation.renderPrBody({ attestation: att, branch: (git(top, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout || "").trim() || "HEAD", base: baseBranch });
+}
+
+function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, warn, sleep, log, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, dispatch = dispatchThrough, home = cfg.userConfigHome(), gateResult = null, workerId = null, regate = null, buildProposalBody: buildBody = buildProposalBody, proposeIntegrationPR: proposePR = proposeIntegrationPR }) {
   const integration = factory.integration;
   // The gate pipeline's result AS IT STANDS — a re-gate of a moved head
   // (below) replaces it, and the PR body's attestation must carry the latest.
@@ -10825,27 +10856,26 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
     // being proposed, with the candidate suite the stage just ran. Built here
     // rather than in the pure runner because it needs the gate pipeline's
     // result (ctx.gateResult) and the environment, which the stage never sees.
+    // A PR that cannot carry its attestation is NOT opened (cross-model
+    // review, major finding 5): the attestation-bearing body is the contract
+    // a PR-policy repo's CI validates, and a PR opened with a generic body
+    // would pass through that repo's merge queue with nothing to check. A
+    // body that cannot be built is a failed proposal, which the stage
+    // routes like any other failure (§10.9) — never a silent downgrade.
     propose: ({ head, targetRef, chain = null }) => {
       let body = null;
       try {
-        const baseBranch = integrationRunner.splitRemoteRef(targetRef).branch;
-        const partial = {
-          mode: integration.mode, strategy: integration.strategy, state: "proposing", target_ref: targetRef,
-          target_sha: chain ? chain.targetSha : null, head: head || (chain && chain.head) || null,
-          gated_head: chain ? chain.gatedHead : null, landed_sha: null, candidate: chain ? chain.candidate : null,
-        };
-        const att = attestation.buildAttestationObject({
-          item: { ...entry, project: slug || entry.project || null }, factory,
+        body = buildBody({
+          cfg, entry, factory, slug, workerId, top, head, targetRef, chain, integration,
           gate: currentGate() || { state: "passed", gates: [], facts: [], definition: factory.definition || null },
-          integration: partial,
-          environment: attestationEnvironment(cfg, workerId),
-          signing: attestationSigning(cfg),
         });
-        body = attestation.renderPrBody({ attestation: att, branch: (git(top, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout || "").trim() || "HEAD", base: baseBranch });
       } catch (e) {
-        log(`work: the attestation for the pull request body could not be built (${(e && e.message) || e}) — proposing without it`);
+        const reason = `the attestation for the pull request body could not be built (${(e && e.message) || e}) — a proposal must carry its attestation, so no PR was opened`;
+        log(`work: ${reason}`);
+        return { ok: false, reason };
       }
-      return proposeIntegrationPR({ top, head, targetRef, body });
+      if (!body) return { ok: false, reason: "the attestation for the pull request body was not built — a proposal must carry its attestation, so no PR was opened" };
+      return proposePR({ top, head, targetRef, body });
     },
     parkForReview: async ({ proposal }) => {
       const id = proposalTrackingId(entry.node_id, entry.run_id);
@@ -11352,6 +11382,7 @@ async function cmdAttestation(cfg, args) {
   }
   // The trusted copy: the graph artifact the attestation names.
   let trusted = null;
+  let trustedProvenance = null;
   const noGraph = args.includes("--no-graph");
   if (!noGraph) {
     const id = att.id;
@@ -11370,6 +11401,10 @@ async function cmdAttestation(cfg, args) {
       else {
         try {
           trusted = JSON.parse(m[1]);
+          // The node's server-stamped authorship is what makes the graph copy
+          // an anchor (attestation.js verifyAttestation `anchor`): only a
+          // remote-mode node not written by an agent counts without a key.
+          trustedProvenance = { mode: cfg.mode(), author: node.author, authored_by_agent: node.authored_by_agent, authored_via: node.authored_via };
         } catch {
           extra.push({ check: "trusted", ok: false, detail: `the graph artifact ${id}'s attestation JSON does not parse` });
         }
@@ -11393,6 +11428,7 @@ async function cmdAttestation(cfg, args) {
     targetRef: targetRef || null,
     factoryDigest: factoryDigest || null,
     trusted,
+    trustedProvenance,
     requireSignature: args.includes("--require-signature") || (noGraph && !!signing),
     requireTrusted: !noGraph && !trusted && !extra.some((c) => c.check === "trusted"),
   });
@@ -14345,9 +14381,15 @@ const COMMANDS = {
       "is not evidence by itself — anyone who can edit the PR can edit it — so the\n" +
       "checks bind it to what the runner itself wrote:\n\n" +
       "  trusted    the graph artifact it names (art-attest-*, written by the runner,\n" +
-      "             never by a PR author) is fetched and its `digest` must equal this\n" +
-      "             copy's (skip ONLY deliberately, with --no-graph — which then\n" +
-      "             REQUIRES a verified signature: no key on this box, no pass)\n" +
+      "             never by a PR author) is fetched, its `digest` must equal this\n" +
+      "             copy's, and it must be an attestation in its own right (its\n" +
+      "             digest recomputes; under a key its signature verifies) (skip\n" +
+      "             ONLY deliberately, with --no-graph — which then REQUIRES a\n" +
+      "             verified signature: no key on this box, no pass)\n" +
+      "  anchor     without a key, the graph copy anchors only when the server\n" +
+      "             stamped it as written by a PERSON in remote mode — a node an\n" +
+      "             agent wrote (a dispatched implementer has graph-write authority),\n" +
+      "             a local-mode graph, or unknown provenance is no anchor\n" +
       "  digest     the copy's `digest` matches a recomputation over its own core\n" +
       "  signature  when this box holds the key (attestation.signingKey /\n" +
       "             SPOR_ATTESTATION_KEY), the HMAC-SHA256 signature must verify;\n" +
@@ -14684,7 +14726,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { editProposalBody, refreshProposalAttestation, attestationSigning, nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
+module.exports = { editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
 
 if (require.main === module) {
   main()

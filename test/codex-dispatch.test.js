@@ -100,6 +100,9 @@ process.stdin.on("end", () => {
     substrateToken: process.env.SUBSTRATE_TOKEN || null,
     mcpToken: process.env.SPOR_DISPATCH_MCP_TOKEN || null,
     internalChildToken: process.env.SPOR_DISPATCH_CHILD_TOKEN || null,
+    attestationKey: process.env.SPOR_ATTESTATION_KEY || null,
+    adminToken: process.env.SPOR_ADMIN_TOKEN || null,
+    refreshToken: process.env.SPOR_REFRESH_TOKEN || null,
   }, null, 2));
   process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "codex-thread-fixture" }) + "\\n");
   setTimeout(() => process.exit(${exitCode}), ${delayMs});
@@ -164,7 +167,7 @@ test("Codex adapter launches detached, captures JSONL session, prompt, cwd, and 
   const started = Date.now();
   const result = run(
     ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--no-brief"],
-    { SPOR_HOME: home, SPOR_CODEX_CMD: stub, OUTFILE: outfile }
+    { SPOR_HOME: home, SPOR_CODEX_CMD: stub, OUTFILE: outfile, SPOR_ATTESTATION_KEY: "judge-secret", SPOR_ADMIN_TOKEN: "admin-secret", SPOR_REFRESH_TOKEN: "refresh-secret" }
   );
   assert.strictEqual(result.status, 0, result.stderr);
   assert.ok(Date.now() - started < 2000, "dispatch returns after the launch handshake");
@@ -173,6 +176,10 @@ test("Codex adapter launches detached, captures JSONL session, prompt, cwd, and 
   const invocation = await awaitJson(outfile);
   assert.ok(invocation, "the detached stub ran");
   assert.strictEqual(invocation.cwd, repo);
+  // The judge's secrets never reach the dispatched harness (cross-model
+  // review, blocking finding 1): the code under judgement cannot sign its
+  // own attestation or act with the person's refresh/admin credentials.
+  assert.deepStrictEqual([invocation.attestationKey, invocation.adminToken, invocation.refreshToken], [null, null, null], "SPOR_ATTESTATION_KEY / SPOR_ADMIN_TOKEN / SPOR_REFRESH_TOKEN are stripped from the child");
   assert.deepStrictEqual(invocation.args.slice(0, 6), [
     "--ask-for-approval", "never", "exec", "--json", "--sandbox", "workspace-write",
   ]);
