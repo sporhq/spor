@@ -3647,7 +3647,7 @@ test("the rescue inherits the worker's unattended posture, filtered per harness 
   // and two launches sharing one would adopt instead of dispatching.
   const launchUnder = async (profile, passthrough) => {
     n += 1;
-    const pipelineRun = `${String(n).repeat(8)}-bbbb-cccc-dddd-eeeeeeeeeeee`;
+    const pipelineRun = `${n.toString(16).padStart(8, "0")}-bbbb-cccc-dddd-eeeeeeeeeeee`;
     dispatchRuns.atomicJson(dispatchRuns.runPaths(home, pipelineRun).record, { run_id: pipelineRun, node_id: "task-fix-me", state: "done", created_at: new Date().toISOString() });
     const warnings = [];
     let values = null;
@@ -3739,6 +3739,74 @@ test("the rescue inherits the worker's unattended posture, filtered per harness 
   assert.strictEqual(unknown.values["permission-mode"], "bypassPermissions");
   assert.strictEqual(unknown.values.model, undefined, "--model is dropped whatever the harness is");
 
+  // issue-spor-rescue-posture-foreign-restrictive-flag-becomes-bypass: a flag
+  // the lane cannot read is translated BY MEANING, never replaced by the
+  // lane's unattended posture. A Codex worker deliberately held to `--sandbox
+  // read-only` rescuing into a claude-code lane gets claude-code's OWN
+  // read-only posture (`--read-only`, which dispatch applies as plan mode),
+  // not bypassPermissions — a rescue never widens the worker's posture.
+  const readOnlyToClaude = await launchUnder("profile-rescue-claude", { sandbox: "read-only", "approval-policy": "never", as: "agent-worker" });
+  assert.strictEqual(readOnlyToClaude.values["read-only"], true, "read-only is re-expressed as the lane's --read-only posture");
+  assert.strictEqual(readOnlyToClaude.values["permission-mode"], undefined, "…and NOT substituted with bypassPermissions");
+  assert.deepStrictEqual([readOnlyToClaude.values.sandbox, readOnlyToClaude.values["approval-policy"]], [undefined, undefined]);
+  assert.strictEqual(readOnlyToClaude.values.as, "agent-worker");
+  assert.strictEqual(readOnlyToClaude.warnings.length, 2);
+  assert.match(readOnlyToClaude.warnings[1], /reads as read-only, so the rescue under profile-rescue-claude runs under that harness's own read-only posture \(--read-only\)/);
+  // The mirror: a claude-code worker in plan mode rescuing into a Codex lane
+  // (Codex hard-errors on `--permission-mode plan`) gets Codex's read-only
+  // sandbox through the same `--read-only`, not the unattended default.
+  const planToCodex = await launchUnder("profile-rescue-codex", { "permission-mode": "plan" });
+  assert.strictEqual(planToCodex.values["read-only"], true);
+  assert.strictEqual(planToCodex.values["permission-mode"], undefined);
+  assert.match(planToCodex.warnings[1], /--permission-mode plan\) reads as read-only/);
+  // The most restrictive reading of a mixed posture wins: a read-only sandbox
+  // beside a bypass the lane DOES read still yields read-only, and the bypass
+  // is displaced rather than left to re-open what the sandbox closed.
+  const mixed = await launchUnder("profile-rescue-claude", { "permission-mode": "bypassPermissions", sandbox: "read-only" });
+  assert.strictEqual(mixed.values["read-only"], true);
+  assert.strictEqual(mixed.values["permission-mode"], undefined, "the surviving bypass is displaced by the more restrictive reading");
+  // An ATTENDED posture with no spelling in the lane (a Codex approval policy
+  // that gates on prompts) applies NOTHING — the more restrictive of the two —
+  // and says so, rather than silently becoming the bypass.
+  const attendedToClaude = await launchUnder("profile-rescue-claude", { sandbox: "workspace-write", "approval-policy": "on-request" });
+  assert.deepStrictEqual(
+    [attendedToClaude.values["permission-mode"], attendedToClaude.values["read-only"], attendedToClaude.values.sandbox],
+    [undefined, undefined, undefined],
+    "attended is expressed as the absence of a posture, never widened"
+  );
+  assert.strictEqual(attendedToClaude.warnings.length, 2);
+  assert.match(attendedToClaude.warnings[1], /reads as attended and has no profile-rescue-claude spelling, so the rescue runs attended there/);
+  // F1 of the review of that fix: attended is ENFORCED on the lane, not left
+  // to whatever survived or to the lane's default. A claude-code worker in
+  // `acceptEdits` rescuing into a Codex lane (Codex hard-errors on it) gets
+  // Codex's declared attended posture — `--approval-policy on-request`, since
+  // Codex otherwise runs with `--ask-for-approval never` — never that
+  // unattended default.
+  const acceptEditsToCodex = await launchUnder("profile-rescue-codex", { "permission-mode": "acceptEdits" });
+  assert.strictEqual(acceptEditsToCodex.values["approval-policy"], "on-request", "attended is said in the lane's own declaration");
+  assert.deepStrictEqual([acceptEditsToCodex.values["permission-mode"], acceptEditsToCodex.values["read-only"]], [undefined, undefined]);
+  assert.strictEqual(acceptEditsToCodex.warnings.length, 2);
+  assert.match(acceptEditsToCodex.warnings[1], /reads as attended, so the rescue under profile-rescue-codex runs attended there as --approval-policy on-request/);
+  // …and a surviving UNATTENDED flag is displaced by the attended reading: a
+  // Codex worker's translated bypass beside an approval policy that gates on
+  // prompts reads as attended, so the bypass must not ride into a claude-code
+  // lane that reads it natively.
+  const bypassBesideAttended = await launchUnder("profile-rescue-claude", { "permission-mode": "bypassPermissions", "approval-policy": "on-request" });
+  assert.strictEqual(bypassBesideAttended.values["permission-mode"], undefined, "the surviving bypass is displaced by the attended reading");
+  assert.deepStrictEqual([bypassBesideAttended.values["read-only"], bypassBesideAttended.values["approval-policy"]], [undefined, undefined]);
+  assert.match(bypassBesideAttended.warnings[1], /reads as attended and has no profile-rescue-claude spelling/);
+  // A lane whose harness has NO attended posture (OpenCode's `--auto` cannot
+  // be unsaid) narrows to read-only — the next reading down — rather than
+  // running attended-in-name-only at its unattended default.
+  const attendedToOpencode = await launchUnder("profile-rescue-opencode", { "permission-mode": "acceptEdits" });
+  assert.strictEqual(attendedToOpencode.values["read-only"], true, "no attended spelling narrows to the lane's read-only posture");
+  assert.strictEqual(attendedToOpencode.values["permission-mode"], undefined);
+  assert.match(attendedToOpencode.warnings[1], /reads as attended, and profile-rescue-opencode's harness has no attended posture \(it never asks\), so the rescue narrows to that harness's read-only posture \(--read-only\)/);
+  // A posture the lane reads NATIVELY is untouched by the translation: the
+  // Codex lane keeps the worker's own `--sandbox read-only` verbatim.
+  const readOnlyToCodex = await launchUnder("profile-rescue-codex", { sandbox: "read-only" });
+  assert.deepStrictEqual([readOnlyToCodex.values.sandbox, readOnlyToCodex.values["read-only"]], ["read-only", undefined]);
+  assert.deepStrictEqual(readOnlyToCodex.warnings, []);
   // A resumed pipeline ADOPTS the run it already launched: no second dispatch,
   // and no posture is shaped (or warned about) for a launch that happened.
   const before = opencode.warnings.length;
@@ -3749,6 +3817,48 @@ test("the rescue inherits the worker's unattended posture, filtered per harness 
   assert.strictEqual(again.ok, true, again.reason);
   assert.strictEqual(opencode.dispatches(), 1, "adopted, not dispatched twice");
   assert.strictEqual(opencode.warnings.length, before, "an adopted run re-shapes nothing");
+});
+
+// The meaning reading lives on the adapters that own the flags, most
+// restrictive first, and the flag membership lists the rescue, the review and
+// the work loop split a passthrough by all derive from the harness module's
+// one HARNESS_OPTION_FLAGS map.
+test("posture meaning is read by the owning adapters, most restrictive first, and the harness flag lists derive from one map", () => {
+  const h = require("../lib/shell/dispatch-harnesses.js");
+  assert.deepStrictEqual(h.POSTURE_MEANINGS, ["read-only", "attended", "unattended"]);
+  assert.strictEqual(h.postureMeaning({}), null, "an empty posture has no reading");
+  assert.strictEqual(h.postureMeaning({ permissionMode: "plan" }), "read-only");
+  assert.strictEqual(h.postureMeaning({ permissionMode: "bypassPermissions" }), "unattended");
+  assert.strictEqual(h.postureMeaning({ permissionMode: "acceptEdits" }), "attended");
+  assert.strictEqual(h.postureMeaning({ sandbox: "read-only", approvalPolicy: "never" }), "read-only");
+  assert.strictEqual(h.postureMeaning({ sandbox: "danger-full-access", approvalPolicy: "never" }), "unattended");
+  assert.strictEqual(h.postureMeaning({ sandbox: "workspace-write" }), "unattended", "Codex's default sandbox with no approval policy is its unattended default");
+  assert.strictEqual(h.postureMeaning({ approvalPolicy: "on-request" }), "attended");
+  assert.strictEqual(h.postureMeaning({ permissionMode: "bypassPermissions", sandbox: "read-only" }), "read-only", "the most restrictive reading wins across vocabularies");
+  assert.strictEqual(h.postureMeaning({ permissionMode: "bypassPermissions", approvalPolicy: "untrusted" }), "attended");
+  assert.strictEqual(h.postureMeaning({ agent: "x" }), null, "--agent is routing, not posture");
+  // Only the adapters that own a posture flag read one; the rest declare none.
+  assert.strictEqual(typeof h.getHarness("claude-code").postureMeaning, "function");
+  assert.strictEqual(typeof h.getHarness("codex").postureMeaning, "function");
+  assert.strictEqual(h.getHarness("opencode").postureMeaning, undefined);
+  assert.strictEqual(h.getHarness("copilot").postureMeaning, undefined);
+  // The attended declaration: empty where the harness asks by default, the
+  // explicit approval policy on Codex, absent where unattended cannot be unsaid.
+  assert.deepStrictEqual(h.getHarness("claude-code").attended, {});
+  assert.deepStrictEqual(h.getHarness("codex").attended, { approvalPolicy: "on-request" });
+  assert.strictEqual(h.getHarness("opencode").attended, undefined);
+  assert.strictEqual(h.getHarness("copilot").attended, undefined);
+  // The one membership list, split by role.
+  assert.deepStrictEqual(Object.keys(h.HARNESS_OPTION_FLAGS), ["permission-mode", "agent", "sandbox", "approval-policy"]);
+  assert.deepStrictEqual(h.harnessOptionFlags("posture"), { "permission-mode": "permissionMode", sandbox: "sandbox", "approval-policy": "approvalPolicy" });
+  assert.deepStrictEqual(h.harnessOptionFlags("routing"), { agent: "agent" });
+  // …and every option key it names is one the adapters' validateOptions read
+  // (a foreign flag under each key is refused by a harness that owns none).
+  for (const spec of Object.values(h.HARNESS_OPTION_FLAGS)) {
+    const check = h.getHarness("opencode").validateOptions({ [spec.option]: "x" });
+    assert.ok(check && /is .*-specific/.test(check.message), `${spec.option} is a key OpenCode's validateOptions refuses as foreign`);
+    assert.match(check.message, new RegExp(`that flag is ${spec.owner}-specific`));
+  }
 });
 
 test("a resumed rescue that had already failed to run escalates the handed refusal — never re-judging a rescue pass that never happened — and the resumed seed carries every gate", async () => {

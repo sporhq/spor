@@ -760,9 +760,21 @@ fact FIRST, dispatches `rescue.profile` into the run's own checkout
 and — unlike a review — carrying the worker's unattended POSTURE
 (`--permission-mode`/`--sandbox`/`--approval-policy`, else a claude-code rescue
 stalls on its first write prompt) filtered per flag through the LANE harness's
-own `validateOptions` — and where nothing survives, replaced by that harness's
-declared `unattended` posture (the new per-adapter twin of `readOnly`: empty
-wherever the argv builder is already unattended, the bypass on claude-code) —
+own `validateOptions` — and where a flag does not survive, TRANSLATED BY
+MEANING (issue-spor-rescue-posture-foreign-restrictive-flag-becomes-bypass):
+the owning adapters read the whole posture as read-only / attended /
+unattended (`postureMeaning`, most restrictive first) and it is re-expressed
+in the lane's own declarations — read-only as the lane's `--read-only`,
+unattended as its declared `unattended` posture (the per-adapter twin of
+`readOnly`: empty wherever the argv builder is already unattended, the bypass
+on claude-code), attended as its declared `attended` posture (empty on
+claude-code, `--approval-policy on-request` on Codex) after displacing every
+surviving posture flag — and where the lane declares none (OpenCode/Copilot,
+whose unattended argv cannot be unsaid) it NARROWS to the lane's
+`--read-only`, never up to that harness's unattended default; only an EMPTY
+worker posture takes the lane's unattended posture unread. The harness-flag membership lists
+(review subset, rescue posture/routing halves, work-loop passthrough) all
+derive from `HARNESS_OPTION_FLAGS` in dispatch-harnesses.js —
 while its ROUTING (`--model`/`--agent`) is dropped so the lane's profile keeps
 naming the strong model,
 issue-spor-rescue-dispatch-drops-harness-flags) with the item, the diff,
