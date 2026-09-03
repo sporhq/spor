@@ -246,6 +246,28 @@ test("the test-writer lane carries the owner's criteria and takes its readiness 
   assert.strictEqual(lane.readiness, undefined, "the readiness stamp comes from `spor ready`, not the emitted markdown");
 });
 
+test("the emitted factory carries a rescue block routed to a strong-model profile that exists (task-spor-rescue-pass-dirty-tree-round-trip-and-fixtures)", () => {
+  // The fixture's Q8 answer ("don't page me until something smart has had a
+  // look") emits a FACTORY-level rescue lane — parsed by the runner's own
+  // parseRescue, routed to a profile in the emitted set, on a supervised
+  // write-capable harness (the diagnosis is read off the run's report).
+  const { byId, factory, errors } = resolveEmittedFactory();
+  assert.deepStrictEqual(errors, []);
+  assert.deepStrictEqual(factory.rescue, {
+    profile: "profile-acme-rescue",
+    attempts: 1,
+    awaitMs: 3600000,
+    instructions: "Prefer the smallest fix that makes the prior findings resolve; if the review was arguing about naming, say so.",
+  });
+  const lane = byId.get(factory.rescue.profile);
+  assert.ok(lane, "the rescue routes to a profile that exists");
+  assert.strictEqual(lane.type, "profile");
+  assert.strictEqual(lane.harness, "claude-code", "a supervised, write-capable harness");
+  assert.ok(lane.model, "a strong model is named on the lane, never on the factory");
+  assert.ok(new Set([factory.testLaneProfile, ...factory.gates.filter((g) => g.profile).map((g) => g.profile)]).size, "distinct from the review and test-writer lanes");
+  assert.ok(![factory.testLaneProfile, ...factory.gates.map((g) => g.profile)].includes(factory.rescue.profile), "the rescue lane is not the implementer's, the reviewer's, or the test-writer's");
+});
+
 test("the emitting reference's rescue block parses with the runner's own vocabulary (task-spor-factory-rescue-lane)", () => {
   // The skill teaches an operator to answer interview question 8 with this
   // exact block; if the reference drifts from parseRescue, a factory compiled

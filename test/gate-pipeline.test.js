@@ -3286,6 +3286,116 @@ test("a rescue that could not run escalates the refusal it was handed, saying so
   assert.match(seen.facts[2].markdown, /Escalated to task-gate-review/);
 });
 
+// --- the rescue pass's own round-trip (task-spor-rescue-pass-dirty-tree-round-trip-and-fixtures) ---
+// A rescue is an implementer in the same checkout; one that leaves its fix
+// uncommitted gets the same ONE commit-or-discard round-trip the implementer
+// pass had, keyed by pass so neither pass's spent round-trip denies the other.
+
+const CLEAN = { ok: true, paths: ["lib/x.js"] };
+
+test("a rescue that leaves the tree dirty gets one commit-or-discard round-trip on its own pass, and a clean tree afterwards is judged normally", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }, { id: "review", kind: "agent-review", profile: "profile-review", cycles: 1 }], rescue: RESCUE });
+  let rescued = false;
+  // Reads: 1 initial (clean), 2 after the original pass's fix cycle (clean),
+  // 3 after the rescue (DIRTY), 4 after the round-trip (clean).
+  const world = withRescue(
+    fakes({ changedSeq: [CLEAN, CLEAN, DIRTY, CLEAN], review: (args) => (rescued ? clearAll(args) : confirmOpen(args)) }),
+    () => { rescued = true; return { ok: true, runId: "run-rescue-1", diagnosis: "forgot to commit", category: "real-defect", fixed: true, filed: [] }; }
+  );
+  const { deps, seen } = world;
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.strictEqual(seen.escalations.length, 0, "nobody was paged");
+  const trips = seen.fixes.filter((f) => f.cycle === "tree");
+  assert.strictEqual(trips.length, 1, "exactly one round-trip, on the rescue pass");
+  assert.strictEqual(trips[0].gate, "acceptance", "dispatched in the first gate's name");
+  const tripCall = seen.fixes.indexOf(trips[0]);
+  assert.strictEqual(tripCall, 1, "after the original pass's fix cycle, before any rescue-pass gate");
+  assert.strictEqual(seen.reads, 4, "the tree is re-read after the round-trip");
+  assert.deepStrictEqual(seen.suites, ["acceptance", "acceptance"], "the rescue pass's command gate ran once the tree was clean");
+  // The round-trip is recorded on the rescue pass's first-gate fact, and only there.
+  const rescuePassAcceptance = seen.facts.find((f) => /^art-gate-acceptance-demo-runabcde-x1-/.test(f.id));
+  assert.ok(rescuePassAcceptance);
+  assert.match(rescuePassAcceptance.markdown, /dirty-tree/);
+  const originalAcceptance = seen.facts.find((f) => /^art-gate-acceptance-demo-runabcde-[0-9a-f]{8}$/.test(f.id));
+  assert.doesNotMatch(originalAcceptance.markdown, /dirty-tree/, "the original pass's fact never carries the rescue pass's round-trip");
+});
+
+test("a rescue tree still dirty after its one round-trip is refused by the first gate unretried, the escalation carries that round-trip, and the fix is keyed to the rescue pass", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", cycles: 3 }, { id: "review", kind: "agent-review", profile: "profile-review", cycles: 1 }], rescue: RESCUE });
+  const fixArgs = [];
+  const { deps, seen } = withRescue(fakes({ changedSeq: [CLEAN, CLEAN, DIRTY], review: confirmOpen, fix: (args) => { fixArgs.push(args); return { ok: true }; } }));
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.match(res.reason, /uncommitted changes/);
+  const trips = seen.fixes.filter((f) => f.cycle === "tree");
+  assert.strictEqual(trips.length, 1, "exactly one round-trip on the rescue pass — never a second, whatever the first gate's cycle cap says");
+  assert.deepStrictEqual(seen.suites, ["acceptance"], "the rescue pass's suite never ran on a dirty tree");
+  const trip = fixArgs.find((a) => a.cycle === "tree");
+  assert.strictEqual(trip.kind, "commit-or-discard");
+  assert.strictEqual(trip.rescue, 1, "the round-trip dispatch is keyed to the rescue pass, so its run name never collides with an original-pass round-trip");
+  assert.strictEqual(seen.escalations.length, 1);
+  const esc = seen.escalations[0];
+  assert.strictEqual(esc.rescue, 1);
+  assert.strictEqual(esc.gate.id, "acceptance");
+  assert.deepStrictEqual(esc.attempts.map((a) => a.verdict), ["dirty-tree", "failed"], "the person sees the rescue's round-trip was tried before they were paged");
+});
+
+test("the two passes' round-trips are independent: an implementer round-trip spent on the original pass does not deny the rescue its own, and the rescue-pass save carries the seeded ledger", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 1 }], rescue: RESCUE });
+  let rescued = false;
+  const saves = [];
+  const world = withRescue(
+    // Reads: 1 DIRTY (original round-trip), 2 clean, 3 after the original fix (clean), 4 after the rescue (DIRTY), 5 after its round-trip (clean).
+    fakes({ changedSeq: [DIRTY, CLEAN, CLEAN, DIRTY, CLEAN], review: (args) => (rescued ? clearAll(args) : confirmOpen(args)) }),
+    () => { rescued = true; return { ok: true, runId: "run-rescue-1", diagnosis: "d", category: "real-defect", fixed: true, filed: [] }; }
+  );
+  const store = {};
+  world.deps.loadGateProgress = async ({ gate, rescue = 0 }) => store[rescue ? `${gate.id}#x${rescue}` : gate.id] || null;
+  world.deps.saveGateProgress = async ({ gate, progress, rescue = 0 }) => {
+    const key = rescue ? `${gate.id}#x${rescue}` : gate.id;
+    saves.push({ key, progress: JSON.parse(JSON.stringify(progress)) });
+    store[key] = JSON.parse(JSON.stringify(progress));
+  };
+  const { deps, seen } = world;
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.deepStrictEqual(seen.fixes.filter((f) => f.cycle === "tree").length, 2, "one round-trip per pass");
+  const firstRescueSave = saves.find((s) => s.key === "review#x1");
+  assert.deepStrictEqual(firstRescueSave.progress.preAttempts.map((x) => x.verdict), ["dirty-tree"], "the rescue pass's round-trip is on its own record before its dispatch");
+  assert.deepStrictEqual(firstRescueSave.progress.ledger.map((e) => e.id), ["F1"], "…and that first save carries the seeded ledger, so the review after it is still a fix-cycle review");
+  assert.strictEqual(firstRescueSave.progress.base, 2);
+  assert.deepStrictEqual(seen.reviews.map((x) => x.cycle), [0, 1, 2], "the rescue pass's review continues the cycle numbering");
+  assert.deepStrictEqual(store.review.preAttempts.map((x) => x.verdict), ["dirty-tree"], "the original pass keeps its own");
+  assert.ok(!store["review#x1"].attempts.some((x) => x.verdict === "dirty-tree"), "the ledger's cycle-indexed attempts never carry it");
+});
+
+test("a pipeline resumed inside a rescue whose round-trip was already spent does not run it again", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }, { id: "review", kind: "agent-review", profile: "profile-review", cycles: 1 }], rescue: RESCUE });
+  // Worker A: rescue lands, tree dirty afterwards, round-trip spent, still dirty → refused.
+  const a = withRescue(fakes({ changedSeq: [CLEAN, CLEAN, DIRTY], review: confirmOpen }));
+  const store = {};
+  let rescueState = null;
+  a.deps.loadGateProgress = async ({ gate, rescue = 0 }) => store[rescue ? `${gate.id}#x${rescue}` : gate.id] || null;
+  a.deps.saveGateProgress = async ({ gate, progress, rescue = 0 }) => { store[rescue ? `${gate.id}#x${rescue}` : gate.id] = JSON.parse(JSON.stringify(progress)); };
+  a.deps.saveRescueState = async ({ rescues }) => { rescueState = JSON.parse(JSON.stringify(rescues)); };
+  const resA = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: a.deps });
+  assert.strictEqual(resA.state, "failed");
+  assert.strictEqual(a.seen.fixes.filter((f) => f.cycle === "tree").length, 1);
+  // Worker B resumes inside the (done) rescue with the tree still dirty: no second round-trip.
+  const b = withRescue(fakes({ changedSeq: [DIRTY], review: confirmOpen }));
+  b.deps.loadRescueState = async () => rescueState.map((e) => ({ ...e, done: true, dispatched: true }));
+  b.deps.loadGateProgress = async ({ gate, rescue = 0 }) => store[rescue ? `${gate.id}#x${rescue}` : gate.id] || null;
+  b.deps.saveGateProgress = async () => {};
+  const resB = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b.deps });
+  assert.strictEqual(resB.state, "failed");
+  assert.deepStrictEqual(b.seen.fixes, [], "a resumed rescue pass does not spend its round-trip again");
+  assert.strictEqual(b.seen.rescues.length, 0, "the done rescue is not re-dispatched");
+  assert.deepStrictEqual(b.seen.suites, [], "the suite never runs on the still-dirty tree");
+  assert.strictEqual(b.seen.escalations[0].gate.id, "acceptance");
+  assert.deepStrictEqual(b.seen.escalations[0].attempts.map((x) => x.verdict), ["dirty-tree", "failed"], "the spent round-trip is still shown on the escalation");
+});
+
 test("a pipeline killed inside a rescue is resumed INSIDE it: the rescue run is adopted, the original pass is not re-judged, and the carried ledger seeds the rescue pass", async () => {
   const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 1 }], rescue: RESCUE });
   // Worker A: the rescue launched (onLaunch fired) and then A died waiting on it.

@@ -10310,6 +10310,15 @@ function gateDiffText(change) {
   return { text: gateRunner.capBytes(text, GATE_DIFF_CAP_BYTES), truncated: true };
 }
 
+// `git log --stat` over a commit range, capped in bytes — the one composition
+// both the fix-cycle context and the rescue lane's whole-branch history are
+// built from. Empty when the range is empty or cannot be read.
+function gateLogText(change, from, to, cap) {
+  const log = git(change.cwd, ["log", "--no-color", "--format=%h %s%n%b", "--stat", `${from}..${to}`], { maxBuffer: 8 * 1024 * 1024 });
+  if (log.status !== 0 || !String(log.stdout || "").trim()) return "";
+  return gateRunner.capBytes(String(log.stdout).trim(), cap);
+}
+
 // What the last fix cycle did, for the next review: the fixer's commits (the
 // message is where it names the finding ids it addressed) and their stat — so
 // the reviewer answers "was F2 fixed" against what changed, not from scratch.
@@ -10319,10 +10328,8 @@ function gateFixText(change, fix) {
   const ids = (fix.findings || []).filter((f) => f.blocking !== false && f.id).map((f) => f.id);
   if (fix.runId) lines.push(`Fix cycle ${(fix.cycle || 0) + 1} was dispatched as run ${fix.runId}${ids.length ? ` to address ${ids.join(", ")}` : ""}.`);
   if (fix.fromHead && fix.toHead && fix.fromHead !== fix.toHead) {
-    const log = git(change.cwd, ["log", "--no-color", "--format=%h %s%n%b", "--stat", `${fix.fromHead}..${fix.toHead}`], { maxBuffer: 8 * 1024 * 1024 });
-    if (log.status === 0 && String(log.stdout || "").trim()) {
-      lines.push("", `Commits ${fix.fromHead.slice(0, 8)}..${fix.toHead.slice(0, 8)}:`, "", "```", gateRunner.fenceSafe(gateRunner.capBytes(String(log.stdout).trim(), 6000)), "```");
-    }
+    const log = gateLogText(change, fix.fromHead, fix.toHead, 6000);
+    if (log) lines.push("", `Commits ${fix.fromHead.slice(0, 8)}..${fix.toHead.slice(0, 8)}:`, "", "```", gateRunner.fenceSafe(log), "```");
   } else if (fix.fromHead && fix.toHead) {
     lines.push("The fix cycle added NO commits — the tree is exactly what the previous review judged.");
   }
@@ -10334,9 +10341,7 @@ function gateFixText(change, fix) {
 // last fix (task-spor-factory-rescue-lane).
 function gateHistoryText(change) {
   if (!change || !change.base || !change.head || change.base === change.head) return "";
-  const log = git(change.cwd, ["log", "--no-color", "--format=%h %s%n%b", "--stat", `${change.base}..${change.head}`], { maxBuffer: 8 * 1024 * 1024 });
-  if (log.status !== 0 || !String(log.stdout || "").trim()) return "";
-  return gateRunner.capBytes(String(log.stdout).trim(), 8000);
+  return gateLogText(change, change.base, change.head, 8000);
 }
 
 // The work item as the reviewer should see it: id, title, summary and the
@@ -10648,7 +10653,9 @@ function makeGateDeps(
     const advisory = (findings || []).filter((f) => f.blocking === false);
     const resolved = (ledger || []).filter((e) => e.status === "resolved");
     const prompt = [
-      `The '${gate.id}' gate refused your resolution of ${entry.node_id}${rescue ? ` (rescue attempt ${rescue}, fix cycle ${cycle - base + 1} of ${gatesKernel.cycleCap(gate)})` : cycle > 0 ? ` (fix cycle ${cycle + 1} of ${gatesKernel.cycleCap(gate)})` : ""}.`,
+      // The dirty-tree round-trip arrives as `cycle: "tree"` — not a fix
+      // cycle, so it is never numbered against the cap on either pass.
+      `The '${gate.id}' gate refused your resolution of ${entry.node_id}${rescue ? ` (rescue attempt ${rescue}${Number.isInteger(cycle) ? `, fix cycle ${cycle - base + 1} of ${gatesKernel.cycleCap(gate)}` : ""})` : cycle > 0 ? ` (fix cycle ${cycle + 1} of ${gatesKernel.cycleCap(gate)})` : ""}.`,
       "",
       detail || "",
       "",

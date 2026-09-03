@@ -62,6 +62,14 @@ and the pipeline mechanics are proposed rather than asked.
 > "If it passed the review and, when it's money stuff, I've okayed it — just
 > ship it. I don't want to be the release button for every little thing."
 
+> **Q8. When a change fails one of these checks and the agents can't sort it
+> out between them, do you want to hear about it straight away — or should
+> something smarter take a look first?**
+>
+> "Something smarter first. Last week I got paged three times for the same
+> review argument about naming. Don't page me until something smart has had a
+> look and either fixed it or can tell me what's actually wrong."
+
 ## The proposal that was confirmed (step 4)
 
 1. **Acceptance** — run what CI runs (`npm test`) from `main`'s copy, never the
@@ -83,6 +91,19 @@ and the pipeline mechanics are proposed rather than asked.
    review would. `mode: propose` (open a PR instead, for orgs whose policy
    forbids a direct land) was not offered — the owner asked to "just ship it",
    not to route it through a PR.
+7. **Rescue lane** (Q8) — a factory-level `rescue:` block routed to a
+   strong-model profile on a supervised, write-capable harness: when any gate
+   has spent its fix cycles, it is dispatched into the implementer's checkout
+   with the item, the diff, every commit, the finding ledger and the gate
+   facts, to diagnose (reviewer drift / real defect / stale premise /
+   environment), fix and commit, and file the factory change that would have
+   prevented the pattern; the whole gate list then re-runs on what it left.
+   Only if that also refuses is the owner paged — and the item opens with the
+   diagnosis. It never passes anything itself. One attempt: each costs a
+   strong-model dispatch plus a whole re-run of the gates. This is the one
+   place the first-factory advice ("a `rescue:` block only once there is a
+   strong-model profile and the operator has seen an escalation they would
+   rather not have") is met at creation: Q8 IS that escalation, three times.
 
 ## What was emitted (step 5)
 
@@ -91,7 +112,8 @@ and the pipeline mechanics are proposed rather than asked.
 | `gate-adversarial-review` | shareable: Q6 applies to every Acme repo, so it is a `type: gate` node other factories reference |
 | `profile-codex-review` | the cross-model lane that gate routes to |
 | `profile-acme-test-writer` | the lane a protected-path hit routes to, and the one that writes the seeded suite |
-| `factory-acme-checkout` | the ordered pipeline, trusted ref, protected paths, the `touches:payments` risk class, and the `integration:` block from Q7 |
+| `profile-acme-rescue` | the strong-model lane the factory-level `rescue:` block routes to — a different, stronger model than the implementer's, on a supervised harness that can write |
+| `factory-acme-checkout` | the ordered pipeline, trusted ref, protected paths, the `touches:payments` risk class, the `integration:` block from Q7, and the `rescue:` block from Q8 |
 | `task-acme-checkout-acceptance-suite` | the missing black-box suite, carrying Q1-Q3 verbatim as its spec |
 
 Nothing was turned on: `spor work --factory factory-acme-checkout` is the
