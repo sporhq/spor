@@ -3147,6 +3147,44 @@ test("the round-trip is saved on the first gate's progress BEFORE it is dispatch
   assert.strictEqual(res.state === "passed" || res.state === "failed", true);
 });
 
+test("a pipeline resumed AFTER its spent round-trip with an already-clean tree still shows the round-trip on the first gate's fact, its escalation, and its later saves (review F1)", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", cycles: 1 }] });
+  // Worker A: dirty tree, one round-trip, still dirty afterwards → refused.
+  const a = fakes({ changedSeq: [DIRTY] });
+  let store = null;
+  a.deps.loadGateProgress = async () => store;
+  a.deps.saveGateProgress = async ({ progress }) => { store = JSON.parse(JSON.stringify(progress)); };
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: a.deps });
+  assert.strictEqual(a.seen.fixes.length, 1);
+  assert.deepStrictEqual(store.preAttempts.map((x) => x.verdict), ["dirty-tree"]);
+
+  // Worker B resumes with the tree CLEAN (the implementer committed after the
+  // round-trip, before the worker died) and the suite passing: no second
+  // round-trip, and the fact still records that one was spent.
+  const saves = [];
+  const b = fakes({ changedSeq: [CLEAN] });
+  b.deps.loadGateProgress = async () => store;
+  b.deps.saveGateProgress = async ({ progress }) => { saves.push(JSON.parse(JSON.stringify(progress))); };
+  const resB = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b.deps });
+  assert.strictEqual(resB.state, "passed", resB.reason);
+  assert.deepStrictEqual(b.seen.fixes, [], "a clean resumed tree never spends a round-trip");
+  assert.deepStrictEqual(b.seen.suites, ["acceptance"]);
+  assert.match(b.seen.facts[0].markdown, /dirty-tree/, "the passing fact still shows the round-trip that was spent before the resume");
+  assert.ok(saves.length && saves.every((p) => Array.isArray(p.preAttempts) && p.preAttempts[0].verdict === "dirty-tree"), "the resumed pipeline's saves keep the round-trip on the record");
+
+  // Worker C resumes with the tree clean but the suite FAILING: the escalation
+  // still shows the person the round-trip was tried.
+  const c = fakes({ changedSeq: [CLEAN], suite: () => ({ ok: false, reason: "2 tests failed" }) });
+  c.deps.loadGateProgress = async () => store;
+  c.deps.saveGateProgress = async () => {};
+  const resC = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: c.deps });
+  assert.strictEqual(resC.state, "failed");
+  assert.strictEqual(c.seen.fixes.length, 1, "the suite failure gets its ordinary fix cycle — not a round-trip");
+  assert.strictEqual(c.seen.fixes[0].cycle, 0);
+  assert.strictEqual(c.seen.escalations.length, 1);
+  assert.strictEqual(c.seen.escalations[0].attempts[0].verdict, "dirty-tree", "the escalation opens with the round-trip spent before the resume");
+});
+
 // --- the rescue lane (task-spor-factory-rescue-lane, WORKERS.md §10.10) ---
 // Before any human escalation a declared strong-model profile is handed the
 // refusal, the WHOLE gate list re-runs on what it committed under a fresh
@@ -3394,6 +3432,44 @@ test("a pipeline resumed inside a rescue whose round-trip was already spent does
   assert.deepStrictEqual(b.seen.suites, [], "the suite never runs on the still-dirty tree");
   assert.strictEqual(b.seen.escalations[0].gate.id, "acceptance");
   assert.deepStrictEqual(b.seen.escalations[0].attempts.map((x) => x.verdict), ["dirty-tree", "failed"], "the spent round-trip is still shown on the escalation");
+});
+
+test("a pipeline resumed inside a rescue AFTER its spent round-trip with an already-clean tree still shows the round-trip on the rescue pass's fact and escalation (review F1)", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", cycles: 1 }, { id: "review", kind: "agent-review", profile: "profile-review", cycles: 1 }], rescue: RESCUE });
+  // Worker A: rescue lands, tree dirty afterwards, round-trip spent, still dirty → refused.
+  const a = withRescue(fakes({ changedSeq: [CLEAN, CLEAN, DIRTY], review: confirmOpen }));
+  const store = {};
+  let rescueState = null;
+  a.deps.loadGateProgress = async ({ gate, rescue = 0 }) => store[rescue ? `${gate.id}#x${rescue}` : gate.id] || null;
+  a.deps.saveGateProgress = async ({ gate, progress, rescue = 0 }) => { store[rescue ? `${gate.id}#x${rescue}` : gate.id] = JSON.parse(JSON.stringify(progress)); };
+  a.deps.saveRescueState = async ({ rescues }) => { rescueState = JSON.parse(JSON.stringify(rescues)); };
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: a.deps })).state, "failed");
+  assert.deepStrictEqual(store["acceptance#x1"].preAttempts.map((x) => x.verdict), ["dirty-tree"]);
+
+  // Worker B resumes inside the (done) rescue with the tree CLEAN and the
+  // suite passing: the rescue pass's acceptance fact carries the round-trip.
+  const resume = (world) => {
+    world.deps.loadRescueState = async () => rescueState.map((e) => ({ ...e, done: true, dispatched: true }));
+    world.deps.loadGateProgress = async ({ gate, rescue = 0 }) => store[rescue ? `${gate.id}#x${rescue}` : gate.id] || null;
+    world.deps.saveGateProgress = async () => {};
+    return world;
+  };
+  const b = resume(withRescue(fakes({ changedSeq: [CLEAN], review: clearAll })));
+  const resB = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b.deps });
+  assert.strictEqual(resB.state, "passed", resB.reason);
+  assert.deepStrictEqual(b.seen.fixes, [], "a clean resumed rescue tree never spends a round-trip");
+  assert.strictEqual(b.seen.rescues.length, 0, "the done rescue is not re-dispatched");
+  const rescueAcceptance = b.seen.facts.find((f) => /^art-gate-acceptance-demo-runabcde-x1-/.test(f.id));
+  assert.ok(rescueAcceptance, "the rescue pass's acceptance fact is written");
+  assert.match(rescueAcceptance.markdown, /dirty-tree/, "it still shows the round-trip spent before the resume");
+
+  // Worker C: same resume, suite failing → the escalation opens with it.
+  const c = resume(withRescue(fakes({ changedSeq: [CLEAN], review: clearAll, suite: () => ({ ok: false, reason: "2 tests failed" }) })));
+  const resC = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: c.deps });
+  assert.strictEqual(resC.state, "failed");
+  assert.strictEqual(c.seen.escalations.length, 1);
+  assert.strictEqual(c.seen.escalations[0].gate.id, "acceptance");
+  assert.strictEqual(c.seen.escalations[0].attempts[0].verdict, "dirty-tree", "the rescue-pass escalation opens with the round-trip spent before the resume");
 });
 
 test("a pipeline killed inside a rescue is resumed INSIDE it: the rescue run is adopted, the original pass is not re-judged, and the carried ledger seeds the rescue pass", async () => {
