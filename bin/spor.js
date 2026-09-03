@@ -7037,6 +7037,28 @@ async function cmdUpgrade(cfg, { values, positionals: pos }) {
 // never a local path; teammates clone to different paths), so the map MUST be
 // local. It self-learns from session-start and from `--dir`/`spor repos`.
 
+// Whether a node is CONFIRMED absent from the graph — as opposed to merely
+// unreadable right now. resolveNode folds both into `null` (a 404, a 5xx, a
+// transport error, an EACCES all read the same), which is fine for a caller
+// that only wants to ACT on a node it can read, and wrong for one that wants
+// to act on the node's ABSENCE: the checkProposals probe licenses a rollback
+// of a completed item on "no landed fact", and a server blip must not be
+// mistaken for that evidence (review F2). Only an explicit 404 (remote) or
+// ENOENT (local) answers true; anything else is "unknown", and the caller
+// treats unknown as not-absent.
+async function nodeConfirmedAbsent(cfg, id) {
+  if (cfg.mode() === "remote") {
+    const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 6000 });
+    return !!(r && !r.ok && !r.transport && r.status === 404);
+  }
+  try {
+    fs.statSync(path.join(cfg.nodesDir(), `${id}.md`));
+    return false;
+  } catch (e) {
+    return !!(e && e.code === "ENOENT");
+  }
+}
+
 // Resolve a node id to { id, raw, repo, title, summary, type, status, date } or
 // null if it doesn't exist.
 async function resolveNode(cfg, id) {
@@ -10205,10 +10227,17 @@ const GATE_DEMOTED_STATUS = "open";
 // with `ok:true` is the ordinary case where there was nothing to roll back (the
 // item never went to a completion status, which is every local-mode
 // `reported` run).
+//
+// A blocker id is REQUIRED (task-spor-gate-escalation-demote-atomic,
+// issue-spor-integration-settle-escalate-demote-race): a rollback with nothing
+// on the graph blocking the item is the worst state there is — open,
+// agent-ready, unblocked, its resolving edge standing. Every caller (the gate
+// pipeline's refusal, the integration stage's settle() and park(), the
+// proposal heal pass) now withholds the demotion until it has one, so this is
+// the door refusing rather than the last line of defence being crossed.
 async function gateDemoteItem(cfg, id, { blockerId = null } = {}) {
-  const blocked = blockerId
-    ? `${blockerId} now blocks ${id}`
-    : `nothing blocks ${id} — the gate could not file the item that would have`;
+  if (!blockerId) return { ok: false, reason: `nothing blocks ${id} — a demotion is refused until the item that would block it exists (WORKERS.md §10.7)` };
+  const blocked = `${blockerId} now blocks ${id}`;
   const node = await resolveNode(cfg, id);
   if (!node) return { ok: false, reason: `${id} could not be re-read, so its status could not be rolled back` };
   const status = String(node.status || "").trim().toLowerCase();
@@ -11875,6 +11904,28 @@ async function healProposalTracking(cfg, r) {
   return { id, healed: !!(written && written.ok), ok: !!(written && written.ok), reason: written && written.reason };
 }
 
+// Whether a proposal settled between a pass's tracker read and the demotion
+// that read licensed (checkProposals, F4): its tracker now reads terminal, or
+// its LANDED fact — the deterministic id checkProposal mints for a merged PR,
+// written by the settling actor's pass BEFORE it promotes the item and closes
+// the tracker — is on the graph. Either is evidence the item's completion
+// stands again and a rollback that just landed on it must be undone. An
+// unreadable graph is evidence of neither (the demotion then stands, as the
+// tracker read that licensed it said it should).
+async function proposalSettledMeanwhile(cfg, r, blockerId) {
+  try {
+    if (await blockerAlreadyClosed(cfg, blockerId)) return true;
+  } catch {
+    /* not evidence */
+  }
+  try {
+    const landedFact = integrationRunner.integrationFactId(r.node_id, r.run_id, "landed");
+    return !!(await resolveNode(cfg, landedFact));
+  } catch {
+    return false;
+  }
+}
+
 async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {} } = {}) {
   // Requires only gate_proposal_number — NOT gate_proposal_blocker too — so a
   // proposal whose tracking-node write failed (leaving the blocker field
@@ -11888,13 +11939,193 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
       log(`work: the integration proposal tracking item for ${r.node_id} could not be healed (${healed.reason || "no response"}) — will retry next pass`);
       continue; // no tracking item to check/demote against yet — try again next pass
     }
+    // A tracker that had to be HEALED is one park() never had in hand, so
+    // park() withheld the item's demotion (the §10.7 pair is atomic:
+    // escalate/track first, demote only with the blocker's id). Complete it
+    // now, one pass late — the same fail-soft, idempotent door park() would
+    // have used, so a record from before the pair was atomic (already rolled
+    // back) reads "nothing to roll back" here rather than failing.
+    //
+    // `gate_demote_pending` is the durable form of "the rollback has not
+    // landed": stamped by the loop when park() reported a demotion that
+    // FAILED (a transient write error beside a tracker that did file), and
+    // here when the heal-pass demotion fails the same way. Without it a
+    // demotion that failed once was never retried — the next pass found the
+    // tracker present, healed nothing, and left the item at its completion
+    // status for as long as the proposal stayed open. The stamp is cleared
+    // the moment a demotion lands, so a settled record costs no extra read.
+    //
+    // The tracker's own status is read FIRST (F3 of the same review): a
+    // tracker that is already terminal — closed by restore() once the PR
+    // merged, or by a person — means the proposal is SETTLED, and a
+    // demotion owed from an earlier pass is no longer owed. Retrying it here
+    // would roll a completed item back to `open` behind a blocker that is
+    // no longer live, and the settled check below would then skip every
+    // restoration — the item stuck open with nothing left to close it.
+    //
+    // That read is NOT atomic with the demotion (F4 of the same review): the
+    // graph has no compare-and-swap on a status write, so between the read
+    // and the rollback another actor — a second box's proposal pass whose
+    // restore() promoted the item and closed the tracker, or a person — can
+    // settle the proposal, and the rollback then lands on a COMPLETED item
+    // behind a tracker no longer live, with the flag cleared and (the tracker
+    // now reading closed) every later pass skipping it. So a demotion that
+    // actually flipped the item is followed by a SECOND read of the same
+    // settled evidence (`proposalSettledMeanwhile`: the tracker terminal, or
+    // the landed fact — which the other actor's restore writes FIRST —
+    // present), and one that lands against a proposal settled meanwhile is
+    // undone on the spot by the same promotion restore() uses. Undoing it
+    // can fail too, so the debt is durable: `gate_restore_pending` on the run
+    // record, retried at the top of every pass until it lands.
+    // Every flag write below is checked (F5 of the same review): stampGateState
+    // is best-effort and returns null when the record could not be written,
+    // and a debt the record does not carry is a debt no later pass can see.
+    // A stamp that fails therefore leaves the PREVIOUS flags standing — which
+    // is why the debts are written in ONE stamp each (never "clear this,
+    // then owe that" as two writes, a window a crash or a failed second write
+    // turns into a stranded item), and why a stale `gate_demote_pending`
+    // against a settled proposal is treated as "the rollback MAY have landed"
+    // (recovered, below) rather than as a no-op to clear.
+    const stamp = (patch, what) => {
+      const wrote = dispatchRuns.stampGateState(home, r.run_id, patch, { force: true });
+      if (!wrote) log(`work: the run record for ${r.node_id} could not be stamped (${what}) — the debt it carried stands and is re-examined next pass`);
+      return !!wrote;
+    };
+    if (r.gate_restore_pending) {
+      let promoted = null;
+      try {
+        promoted = await gatePromoteItem(cfg, r.node_id);
+      } catch (e) {
+        promoted = { ok: false, reason: `${(e && e.message) || e}` };
+      }
+      if (promoted && promoted.ok) {
+        log(`work: undid the demotion of ${r.node_id} that landed against an already-settled proposal; ${promoted.note}`);
+        stamp({ gate_restore_pending: false }, "the owed undo landed");
+      } else {
+        log(`work: the demotion of ${r.node_id} that landed against an already-settled proposal could not be undone (${(promoted && promoted.reason) || "no response"}) — will retry next pass`);
+      }
+    }
     let closed = false;
     try {
       closed = await blockerAlreadyClosed(cfg, healed.id);
     } catch {
       closed = false; // an unreadable graph is not evidence this is settled
     }
-    if (closed) continue;
+    if (closed) {
+      if (r.gate_demote_pending) {
+        // A pending flag against a closed tracker is not only "never owed":
+        // it is also what a pass whose stamp never landed leaves behind AFTER
+        // its rollback did land (F5) — the item demoted, the proposal settled
+        // meanwhile, the undo unrecorded. If the proposal LANDED (its landed
+        // fact is on the graph — the settling pass writes it before it
+        // promotes), the item's completion must stand, so restore it here
+        // (idempotent: an item already at its completion reads "nothing to
+        // restore") and clear the flag only once that holds. A tracker a
+        // person closed with no landing is left alone, as before.
+        let landedFactPresent = false;
+        try {
+          landedFactPresent = !!(await resolveNode(cfg, integrationRunner.integrationFactId(r.node_id, r.run_id, "landed")));
+        } catch {
+          landedFactPresent = false;
+        }
+        let restored = { ok: true, note: null };
+        if (landedFactPresent) {
+          try {
+            restored = await gatePromoteItem(cfg, r.node_id);
+          } catch (e) {
+            restored = { ok: false, reason: `${(e && e.message) || e}` };
+          }
+        }
+        if (restored && restored.ok) {
+          log(`work: the tracking item ${healed.id} for ${r.node_id} is already closed — the withheld demotion is no longer owed${restored.note ? `; ${restored.note}` : ""}`);
+          stamp({ gate_demote_pending: false }, "the withheld demotion is no longer owed");
+        } else {
+          log(`work: the tracking item ${healed.id} for ${r.node_id} is already closed and its proposal landed, but the item could not be restored (${(restored && restored.reason) || "no response"}) — will retry next pass`);
+        }
+      }
+      continue;
+    }
+    // The record is not the only ledger of the debt (F1 of the third
+    // review): a heal-pass demotion that fails AND whose `gate_demote_pending`
+    // stamp fails leaves NOTHING behind — the next pass finds the tracker
+    // present (healed nothing) and no flag, and skips the demotion for the
+    // life of the open PR. So when neither the heal nor the flag says a
+    // rollback is owed, the pass RE-DERIVES it from the graph, where the debt
+    // is always legible: an OPEN tracker (read above) whose proposal has not
+    // landed (no landed fact) beside an item still at its completion status
+    // IS a withheld rollback, whatever the record says. gateDemoteItem is
+    // the probe — it reads the item and rolls back only a claim of
+    // completion, answering "nothing to roll back" otherwise — so the common
+    // case (item already `open`) is one read and no write, and an item that
+    // really was stranded is demoted through exactly the path a flagged
+    // retry takes (settled-meanwhile check and undo included). A probe needs
+    // no flag of its own: it runs again next pass, so a probe that fails is
+    // only logged. The landed fact is checked first because restore() writes
+    // it before it promotes and closes the tracker — a tracker whose close
+    // failed sits open beside a legitimately completed item, and a probe
+    // that demoted it there would churn against the landing every pass. And
+    // the read must distinguish ABSENT from UNREADABLE (F2): resolveNode
+    // answers null to a 5xx, a timeout or an EACCES exactly as it does to a
+    // missing node, so a probe keyed on it would demote a legitimately landed
+    // item on a server blip. Only a confirmed absence (404 / ENOENT) licenses
+    // the probe; an unreadable graph is "unknown", and unknown is not-absent —
+    // the probe simply runs again next pass.
+    const owed = !!(healed.healed || r.gate_demote_pending);
+    let probe = false;
+    if (!owed) {
+      try {
+        probe = await nodeConfirmedAbsent(cfg, integrationRunner.integrationFactId(r.node_id, r.run_id, "landed"));
+      } catch {
+        probe = false; // an unreadable graph cannot license a rollback
+      }
+    }
+    if (owed || probe) {
+      let demoted = null;
+      try {
+        demoted = await gateDemoteItem(cfg, r.node_id, { blockerId: healed.id });
+      } catch (e) {
+        demoted = { ok: false, reason: `${(e && e.message) || e}` };
+      }
+      const landed = !!(demoted && demoted.ok);
+      if (probe && landed && !demoted.demoted) {
+        // The ordinary case: nothing was owed. Silent — this is a read, not
+        // a retry, and the item's proposal is checked below as before.
+      } else {
+        const how = healed.healed
+          ? `healed the tracking item for ${r.node_id}`
+          : probe
+            ? `recovered an unrecorded rollback debt for ${r.node_id} (its tracking item ${healed.id} is open, its proposal has not landed, and it still claimed completion)`
+            : `retried the withheld demotion of ${r.node_id}`;
+        if (landed) log(`work: ${how}; ${demoted.note}`);
+        else if (probe) log(`work: ${r.node_id} could not be read to check whether its rollback is still owed (${(demoted && demoted.reason) || "no response"}) — will check again next pass`);
+        else log(`work: ${how}, but it could not be demoted on the graph (${(demoted && demoted.reason) || "no response"}) — the proposal still stands; will retry next pass`);
+      }
+      // The check-then-demote window (F4, above): only a rollback that
+      // actually FLIPPED the item can have crossed it — a no-op demotion
+      // ("nothing to roll back") changed nothing to undo. The settled check
+      // and the undo run BEFORE any flag is written, so the record moves in
+      // one stamp from "demotion owed" to exactly what is owed now — the undo
+      // (`gate_restore_pending`), or nothing. `parked` is a settled state, so
+      // the stamp forces past stampGateState's settled guard: it touches no
+      // verdict, only the flags that say what is still owed.
+      if (landed && demoted.demoted && (await proposalSettledMeanwhile(cfg, r, healed.id))) {
+        let promoted = null;
+        try {
+          promoted = await gatePromoteItem(cfg, r.node_id);
+        } catch (e) {
+          promoted = { ok: false, reason: `${(e && e.message) || e}` };
+        }
+        const undone = !!(promoted && promoted.ok);
+        if (undone) log(`work: the proposal for ${r.node_id} settled while its demotion was landing — undone; ${promoted.note}`);
+        else log(`work: the proposal for ${r.node_id} settled while its demotion was landing, and undoing it failed (${(promoted && promoted.reason) || "no response"}) — will retry next pass`);
+        stamp({ gate_demote_pending: false, gate_restore_pending: !undone }, undone ? "the rollback and its undo both landed" : "the undo is owed");
+        continue; // settled: nothing left for this pass to check
+      }
+      // A probe that found nothing (or could not read) owes no stamp: the
+      // record carries no flag and the graph is re-read next pass. One that
+      // flipped the item, or a flagged/healed attempt, writes its outcome.
+      if (!probe || (landed && demoted.demoted)) stamp({ gate_demote_pending: !landed }, landed ? "the rollback landed" : "the rollback is owed");
+    }
     const proposal = {
       nodeId: r.node_id,
       runId: r.run_id,
@@ -12037,6 +12268,9 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     gate_escalation_failed: !!(res && res.escalation_failed),
     // A demotion from an earlier attempt still stands until a pass restores it.
     ...(res && res.demoted ? { gate_demoted: true } : {}),
+    // A park whose tracker filed but whose demotion failed owes the rollback
+    // to checkProposals (§10.9); the same flag the loop stamps.
+    ...(state === "parked" && res && res.escalated_to && res.demote_reason ? { gate_demote_pending: true } : {}),
   });
   if (state !== "passed") {
     out(`work: re-gate of ${record.node_id} ${state}${reason ? ` — ${reason}` : ""}${res && res.escalated_to ? ` (escalated to ${res.escalated_to})` : ""}`);
@@ -15074,7 +15308,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
+module.exports = { nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
 
 if (require.main === module) {
   main()

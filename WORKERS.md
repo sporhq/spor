@@ -599,7 +599,9 @@ written only after the outcome dimension exists):
 | `gate_fix_run_id` | string | optional — the run id of the most recent fix cycle this pipeline dispatched at the same node, stamped the moment it was dispatched (not when it finishes). If a stop lands while that fix cycle is still going, this field is what turns "the pipeline was abandoned" into "here is the run to go check" — a fix cycle's own dispatched run is detached and keeps going regardless (§10.7), and this is the only durable pointer to it. `spor runs`/`spor work --status` surface it. |
 | `gate_fix_at` | ISO 8601 | when `gate_fix_run_id` was stamped |
 | `gate_progress` | object | optional — `{key, at, seq, gates: {<gate id>: {fixes, attempts, ledger, lastFix}}}`: each gate's own memory (§10.4), saved after every review verdict (with the fix it decided on as `lastFix.dispatched: false`) and again when the fix's launch is known (`fixes` counts LAUNCHED fixes only). `key` is the attempt's run key — a resumed pipeline of the same attempt reads it back; a `--regate` (a new attempt) ignores it. Best-effort like every `gate_*` stamp: a write that fails is logged and the pipeline goes on |
-| `gate_escalation_failed` | boolean | optional — set when the refusal could not file the escalation that carries it, so nothing was written to the graph and (§10.7) nothing was demoted either. The verdict is still settled; this is what says the refusal is readable only on this box, and that `spor work --regate` is the door back |
+| `gate_escalation_failed` | boolean | optional — set when the refusal (a gate's, or the integration stage's, §10.9) could not file the escalation that carries it, so nothing was written to the graph and (§10.7) nothing was demoted either. The verdict is still settled; this is what says the refusal is readable only on this box, and that `spor work --regate` is the door back |
+| `gate_demote_pending` | boolean | optional, propose mode only (§10.9) — `true` while a parked item's rollback is still owed: its tracking item filed but the demotion's own write failed (at park time, or during a heal pass). The per-pass proposal check retries the demotion on this flag and writes it back `false` once it lands (in the same stamp that owes `gate_restore_pending`, if the rollback has to be undone); left standing against a tracker that is already terminal, it is recovered — the item restored if the proposal's landed fact exists — before it is cleared. A park that never filed its tracker needs no flag, since healing the tracker is itself what triggers the rollback; and a debt this flag failed to record is re-derived from the graph (open tracker, no landed fact, item still at completion) on every later pass |
+| `gate_restore_pending` | boolean | optional, propose mode only (§10.9) — `true` while the UNDO of a rollback is still owed: the demotion above landed against a proposal that had settled between the tracker read that licensed it and the write itself (the tracker closed, or the landed fact written, by another pass or a person), and the promotion that undoes it failed. The per-pass proposal check retries the promotion on this flag and writes it back `false` once it lands |
 
 A consumer reading `gate_state` as a verdict must check it is one of the
 settled values (`passed`/`failed`/`blocked`/`superseded`, or `parked` under
@@ -1420,7 +1422,14 @@ exhausts its fix cycles **demotes the item exactly as a failed gate does**
 (§10.7): an escalation is filed, it `blocks` the work item, and the item's
 completion status is rolled back if it claimed one — the run's resolver
 already declared every gate passed, so the ONLY thing an integration failure
-disputes is whether the change ever reached the target ref.
+disputes is whether the change ever reached the target ref. The two are one
+act in that order here too: the rollback runs only once the escalation
+exists. An escalation write that fails leaves the item's status exactly as
+the run left it, the `art-merge-…` fact records `Demotion: not attempted`
+and why, and the run record carries `gate_escalation_failed: true` beside
+the settled verdict — the same marker, and the same door back (`spor work
+--regate <run-id>`, which re-runs the gates AND this stage off the run
+record), as a gate refusal.
 
 **Cleanup runs on a landing OR a proposal.** The candidate worktree is always
 removed, win or lose (it is throwaway by construction); the implementer's own
@@ -1482,7 +1491,53 @@ that long would starve the loop's throughput for nothing. So propose mode's
 "parking" reuses only the GRAPH-STATE half of a blocked/failed gate's
 demotion (§10.7: a tracking item is filed carrying `blocks` onto the work
 item, and the work item's own completion status is rolled back if it claimed
-one) — never the in-process poll. The pipeline returns a THIRD settled state,
+one) — never the in-process poll. The pair is atomic in that order for a park
+as well: with no tracking item on the graph the rollback is withheld and the
+`proposed` fact says so, and it is the per-pass proposal check (below) that
+completes it — the moment it heals the missing tracking item from the run
+record's `gate_proposal_*` stamps, the blocker exists, so the demotion runs
+then. Nothing is marked for a person: the heal is the retry. The same pass is
+also the retry for a demotion that FAILED beside a tracker that did file (a
+transient write error, at park time or during the heal itself): the run record
+carries `gate_demote_pending: true` until the rollback lands, and every
+proposal check re-attempts it on that flag — otherwise the next pass would find
+the tracker present, heal nothing, and leave the item at its completion status
+for as long as the proposal stayed open. The retry runs only while the tracker
+is still OPEN: a pass reads the tracker's own status first, and a tracker that
+is already terminal (closed by the merged PR's restore, or by a person) means
+the proposal is settled and the debt is simply cleared — re-demoting there
+would roll the completed item back to `open` behind a blocker no longer live,
+and nothing would ever restore it. That read is not atomic with the demotion
+(a status write has no compare-and-swap), so a rollback that actually flipped
+the item re-reads the settled evidence afterwards — the tracker terminal, or
+the landed fact (which a settling pass writes before it promotes and closes)
+present — and one that landed against a proposal settled meanwhile is undone
+on the spot by the same promotion the landing restore uses; an undo that fails
+is owed on the run record as `gate_restore_pending: true` and retried by every
+later pass. The flags themselves are best-effort writes, so a pass records a
+demotion's whole outcome in ONE stamp (never "clear the demotion, then owe
+the undo" as two — a second write that fails, or a crash between them, would
+leave the item open behind a closed tracker with no debt on the record), a
+stamp that fails is logged and leaves the previous debt standing, and a
+`gate_demote_pending` still set against a tracker that is already terminal is
+read as "the rollback MAY have landed": when the proposal's landed fact is on
+the graph the item is restored first and the flag cleared only once that
+holds; with no landed fact (a tracker a person closed) the flag is simply
+cleared, as above. And because a demotion AND its flag can both fail in one
+pass (the record's directory unwritable at that moment) — leaving the next
+pass a present tracker and no flag, i.e. nothing to retry — the record is
+not the debt's only ledger: when neither the heal nor the flag says a
+rollback is owed, the pass re-derives it from the graph, where it is always
+legible — an open tracker whose proposal has no landed fact, beside an item
+still at its completion status, is a withheld rollback whatever the record
+says, and it is demoted through the same path a flagged retry takes. The
+probe is one read in the ordinary case (the item already `open`), needs no
+flag of its own (it runs again next pass), and skips a proposal whose landed
+fact exists, since a tracker whose close failed sits open beside a
+legitimately completed item. That landed-fact read licenses a rollback only
+on a CONFIRMED absence (a 404, or ENOENT in local mode) — a server error,
+timeout or unreadable file is "unknown", not "absent", and unknown never
+demotes: the probe waits for the next pass. The pipeline returns a THIRD settled state,
 `parked` (alongside `passed`/`failed`/`blocked`, all in
 `gates.SETTLED_GATE_STATES` — this run's pipeline is genuinely done; a
 resumed orphan re-running it from gate 0 would open a duplicate PR), and the

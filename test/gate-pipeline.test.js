@@ -1699,26 +1699,30 @@ test("a refused item's COMPLETION status is rolled back — and nothing else is"
 
   // A person's decision to DROP the work is not a claim of completion.
   write("task-abandoned", "abandoned");
-  const abandoned = await sporCli.gateDemoteItem(cfg, "task-abandoned");
+  const abandoned = await sporCli.gateDemoteItem(cfg, "task-abandoned", { blockerId: "task-gate-acceptance" });
   assert.deepStrictEqual([abandoned.ok, abandoned.demoted], [true, false], "a gate never reopens what a person deliberately dropped");
   assert.strictEqual(statusOf("task-abandoned"), "abandoned");
 
   // And a node it cannot read is a reported failure, not a silent no-op.
-  const missing = await sporCli.gateDemoteItem(cfg, "task-nope");
+  const missing = await sporCli.gateDemoteItem(cfg, "task-nope", { blockerId: "task-gate-acceptance" });
   assert.strictEqual(missing.ok, false);
   assert.match(missing.reason, /could not be re-read/);
 
-  // The escalation write can fail (an offline graph, an id collision), and the
-  // demotion still runs — but it must not imply a blocker that does not exist.
+  // The escalation write can fail (an offline graph, an id collision) — and
+  // then there is NO demotion: every caller withholds it until the item that
+  // blocks the work exists (task-spor-gate-escalation-demote-atomic,
+  // issue-spor-integration-settle-escalate-demote-race), and the door itself
+  // refuses a blockerless call rather than rolling an item back into
+  // open-agent-ready-unblocked with its resolver standing.
   write("task-done-2", "done");
   fs.writeFileSync(
     path.join(nodes, "dec-resolver-2.md"),
     "---\nid: dec-resolver-2\ntype: decision\ntitle: Added bounded retry again\nsummary: Added bounded retry with backoff to the second sync worker, so a transient failure retries instead of dropping.\ndate: 2026-08-26\nedges:\n  - {type: resolves, to: task-done-2}\n---\n\nBody.\n"
   );
   const unblocked = await sporCli.gateDemoteItem(cfg, "task-done-2");
-  assert.deepStrictEqual([unblocked.ok, unblocked.demoted], [true, true]);
-  assert.match(unblocked.note, /nothing blocks task-done-2/, "the note says the blocker is missing rather than implying one");
-  assert.strictEqual(statusOf("task-done-2"), "open");
+  assert.strictEqual(unblocked.ok, false, "a demotion with nothing to block the item is refused, not performed");
+  assert.match(unblocked.reason, /nothing blocks task-done-2 — a demotion is refused/);
+  assert.strictEqual(statusOf("task-done-2"), "done", "the status is left exactly as the run left it");
 });
 
 // gatePromoteItem is gateDemoteItem's mirror (task-spor-integration-propose-
