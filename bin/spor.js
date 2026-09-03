@@ -11933,6 +11933,20 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
     // undone on the spot by the same promotion restore() uses. Undoing it
     // can fail too, so the debt is durable: `gate_restore_pending` on the run
     // record, retried at the top of every pass until it lands.
+    // Every flag write below is checked (F5 of the same review): stampGateState
+    // is best-effort and returns null when the record could not be written,
+    // and a debt the record does not carry is a debt no later pass can see.
+    // A stamp that fails therefore leaves the PREVIOUS flags standing — which
+    // is why the debts are written in ONE stamp each (never "clear this,
+    // then owe that" as two writes, a window a crash or a failed second write
+    // turns into a stranded item), and why a stale `gate_demote_pending`
+    // against a settled proposal is treated as "the rollback MAY have landed"
+    // (recovered, below) rather than as a no-op to clear.
+    const stamp = (patch, what) => {
+      const wrote = dispatchRuns.stampGateState(home, r.run_id, patch, { force: true });
+      if (!wrote) log(`work: the run record for ${r.node_id} could not be stamped (${what}) — the debt it carried stands and is re-examined next pass`);
+      return !!wrote;
+    };
     if (r.gate_restore_pending) {
       let promoted = null;
       try {
@@ -11942,7 +11956,7 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
       }
       if (promoted && promoted.ok) {
         log(`work: undid the demotion of ${r.node_id} that landed against an already-settled proposal; ${promoted.note}`);
-        dispatchRuns.stampGateState(home, r.run_id, { gate_restore_pending: false }, { force: true });
+        stamp({ gate_restore_pending: false }, "the owed undo landed");
       } else {
         log(`work: the demotion of ${r.node_id} that landed against an already-settled proposal could not be undone (${(promoted && promoted.reason) || "no response"}) — will retry next pass`);
       }
@@ -11955,8 +11969,35 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
     }
     if (closed) {
       if (r.gate_demote_pending) {
-        log(`work: the tracking item ${healed.id} for ${r.node_id} is already closed — the withheld demotion is no longer owed`);
-        dispatchRuns.stampGateState(home, r.run_id, { gate_demote_pending: false }, { force: true });
+        // A pending flag against a closed tracker is not only "never owed":
+        // it is also what a pass whose stamp never landed leaves behind AFTER
+        // its rollback did land (F5) — the item demoted, the proposal settled
+        // meanwhile, the undo unrecorded. If the proposal LANDED (its landed
+        // fact is on the graph — the settling pass writes it before it
+        // promotes), the item's completion must stand, so restore it here
+        // (idempotent: an item already at its completion reads "nothing to
+        // restore") and clear the flag only once that holds. A tracker a
+        // person closed with no landing is left alone, as before.
+        let landedFactPresent = false;
+        try {
+          landedFactPresent = !!(await resolveNode(cfg, integrationRunner.integrationFactId(r.node_id, r.run_id, "landed")));
+        } catch {
+          landedFactPresent = false;
+        }
+        let restored = { ok: true, note: null };
+        if (landedFactPresent) {
+          try {
+            restored = await gatePromoteItem(cfg, r.node_id);
+          } catch (e) {
+            restored = { ok: false, reason: `${(e && e.message) || e}` };
+          }
+        }
+        if (restored && restored.ok) {
+          log(`work: the tracking item ${healed.id} for ${r.node_id} is already closed — the withheld demotion is no longer owed${restored.note ? `; ${restored.note}` : ""}`);
+          stamp({ gate_demote_pending: false }, "the withheld demotion is no longer owed");
+        } else {
+          log(`work: the tracking item ${healed.id} for ${r.node_id} is already closed and its proposal landed, but the item could not be restored (${(restored && restored.reason) || "no response"}) — will retry next pass`);
+        }
       }
       continue;
     }
@@ -11971,13 +12012,14 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
       const how = healed.healed ? `healed the tracking item for ${r.node_id}` : `retried the withheld demotion of ${r.node_id}`;
       if (landed) log(`work: ${how}; ${demoted.note}`);
       else log(`work: ${how}, but it could not be demoted on the graph (${(demoted && demoted.reason) || "no response"}) — the proposal still stands; will retry next pass`);
-      // `parked` is a settled state, so this stamp must force past
-      // stampGateState's settled guard — it touches no verdict, only the
-      // flag that says the rollback is still owed.
-      dispatchRuns.stampGateState(home, r.run_id, { gate_demote_pending: !landed }, { force: true });
       // The check-then-demote window (F4, above): only a rollback that
       // actually FLIPPED the item can have crossed it — a no-op demotion
-      // ("nothing to roll back") changed nothing to undo.
+      // ("nothing to roll back") changed nothing to undo. The settled check
+      // and the undo run BEFORE any flag is written, so the record moves in
+      // one stamp from "demotion owed" to exactly what is owed now — the undo
+      // (`gate_restore_pending`), or nothing. `parked` is a settled state, so
+      // the stamp forces past stampGateState's settled guard: it touches no
+      // verdict, only the flags that say what is still owed.
       if (landed && demoted.demoted && (await proposalSettledMeanwhile(cfg, r, healed.id))) {
         let promoted = null;
         try {
@@ -11988,9 +12030,10 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
         const undone = !!(promoted && promoted.ok);
         if (undone) log(`work: the proposal for ${r.node_id} settled while its demotion was landing — undone; ${promoted.note}`);
         else log(`work: the proposal for ${r.node_id} settled while its demotion was landing, and undoing it failed (${(promoted && promoted.reason) || "no response"}) — will retry next pass`);
-        dispatchRuns.stampGateState(home, r.run_id, { gate_restore_pending: !undone }, { force: true });
+        stamp({ gate_demote_pending: false, gate_restore_pending: !undone }, undone ? "the rollback and its undo both landed" : "the undo is owed");
         continue; // settled: nothing left for this pass to check
       }
+      stamp({ gate_demote_pending: !landed }, landed ? "the rollback landed" : "the rollback is owed");
     }
     const proposal = {
       nodeId: r.node_id,

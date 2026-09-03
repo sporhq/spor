@@ -597,7 +597,7 @@ written only after the outcome dimension exists):
 | `gate_fix_at` | ISO 8601 | when `gate_fix_run_id` was stamped |
 | `gate_progress` | object | optional — `{key, at, seq, gates: {<gate id>: {fixes, attempts, ledger, lastFix}}}`: each gate's own memory (§10.4), saved after every review verdict (with the fix it decided on as `lastFix.dispatched: false`) and again when the fix's launch is known (`fixes` counts LAUNCHED fixes only). `key` is the attempt's run key — a resumed pipeline of the same attempt reads it back; a `--regate` (a new attempt) ignores it. Best-effort like every `gate_*` stamp: a write that fails is logged and the pipeline goes on |
 | `gate_escalation_failed` | boolean | optional — set when the refusal (a gate's, or the integration stage's, §10.9) could not file the escalation that carries it, so nothing was written to the graph and (§10.7) nothing was demoted either. The verdict is still settled; this is what says the refusal is readable only on this box, and that `spor work --regate` is the door back |
-| `gate_demote_pending` | boolean | optional, propose mode only (§10.9) — `true` while a parked item's rollback is still owed: its tracking item filed but the demotion's own write failed (at park time, or during a heal pass). The per-pass proposal check retries the demotion on this flag and writes it back `false` once it lands; a park that never filed its tracker needs no flag, since healing the tracker is itself what triggers the rollback |
+| `gate_demote_pending` | boolean | optional, propose mode only (§10.9) — `true` while a parked item's rollback is still owed: its tracking item filed but the demotion's own write failed (at park time, or during a heal pass). The per-pass proposal check retries the demotion on this flag and writes it back `false` once it lands (in the same stamp that owes `gate_restore_pending`, if the rollback has to be undone); left standing against a tracker that is already terminal, it is recovered — the item restored if the proposal's landed fact exists — before it is cleared. A park that never filed its tracker needs no flag, since healing the tracker is itself what triggers the rollback |
 | `gate_restore_pending` | boolean | optional, propose mode only (§10.9) — `true` while the UNDO of a rollback is still owed: the demotion above landed against a proposal that had settled between the tracker read that licensed it and the write itself (the tracker closed, or the landed fact written, by another pass or a person), and the promotion that undoes it failed. The per-pass proposal check retries the promotion on this flag and writes it back `false` once it lands |
 
 A consumer reading `gate_state` as a verdict must check it is one of the
@@ -1476,7 +1476,16 @@ the landed fact (which a settling pass writes before it promotes and closes)
 present — and one that landed against a proposal settled meanwhile is undone
 on the spot by the same promotion the landing restore uses; an undo that fails
 is owed on the run record as `gate_restore_pending: true` and retried by every
-later pass. The pipeline returns a THIRD settled state,
+later pass. The flags themselves are best-effort writes, so a pass records a
+demotion's whole outcome in ONE stamp (never "clear the demotion, then owe
+the undo" as two — a second write that fails, or a crash between them, would
+leave the item open behind a closed tracker with no debt on the record), a
+stamp that fails is logged and leaves the previous debt standing, and a
+`gate_demote_pending` still set against a tracker that is already terminal is
+read as "the rollback MAY have landed": when the proposal's landed fact is on
+the graph the item is restored first and the flag cleared only once that
+holds; with no landed fact (a tracker a person closed) the flag is simply
+cleared, as above. The pipeline returns a THIRD settled state,
 `parked` (alongside `passed`/`failed`/`blocked`, all in
 `gates.SETTLED_GATE_STATES` — this run's pipeline is genuinely done; a
 resumed orphan re-running it from gate 0 would open a duplicate PR), and the

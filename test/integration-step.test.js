@@ -1919,3 +1919,116 @@ test("checkProposals undoes a demotion that landed against a proposal settled me
   await sporCli.checkProposals(cfg, { home, log: (l) => third.push(l) });
   assert.deepStrictEqual(third.filter((l) => l.includes("task-proposed")), []);
 });
+
+// F5 of the same review: the flags that carry a debt across passes are
+// themselves best-effort writes (stampGateState returns null when the record
+// cannot be written). Clearing `gate_demote_pending` in one stamp and owing
+// `gate_restore_pending` in a second meant a second stamp that failed — or a
+// crash between the two — left a demoted item behind a closed tracker with
+// NO debt on the record, and every later pass skipping the closed tracker.
+// Now the settle check and the undo run before any flag is written, the
+// record moves in ONE stamp, a stamp that fails is logged and leaves the
+// previous debt standing, and a stale pending flag against a closed tracker
+// whose proposal LANDED is recovered (the item restored) rather than cleared.
+test("checkProposals writes a demotion's outcome in ONE stamp, keeps the debt when the stamp fails, and recovers a stranded item behind a closed tracker (F5)", async (t) => {
+  if (process.platform === "win32") return;
+  if (process.getuid && process.getuid() === 0) return;
+
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const integrationRunner = require("../lib/shell/integration-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-park-demote-stamp-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const write = (id, front) => fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\n${front}date: 2026-08-26\n---\n\nBody.\n`);
+  const statusOf = (id) => /^status: (.+)$/m.exec(fs.readFileSync(path.join(nodes, `${id}.md`), "utf8"))[1];
+  const recordOf = (runId) => dispatchRuns.readRunRecords(home).find((r) => r.run_id === runId);
+
+  const ghDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-fake-gh-"));
+  writeFakePathBin(ghDir, "gh", `if [ "$1" = "--version" ]; then echo "gh version 2.0.0"; exit 0; fi\necho '{"state":"OPEN","baseRefName":"main"}'\n`);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${ghDir}${path.delimiter}${originalPath}`;
+  t.after(() => { process.env.PATH = originalPath; });
+
+  const entry = { node_id: "task-proposed", run_id: "11111111-2222-3333-4444-000000000007" };
+  const tracker = sporCli.proposalTrackingId(entry.node_id, entry.run_id);
+  const item = `type: task\ntitle: Add bounded retry\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: done\n`;
+  const trackerNode = (status) => `type: task\ntitle: Review the proposal\nsummary: Review the proposal for task-proposed opened as a pull request and merge or close it.\nstatus: ${status}\nrequires: [human]\nedges:\n  - {type: blocks, to: task-proposed}\n`;
+  const landedFact = integrationRunner.integrationFactId(entry.node_id, entry.run_id, "landed");
+  const runDir = dispatchRuns.runPaths(home, entry.run_id).dir;
+  t.after(() => { try { fs.chmodSync(runDir, 0o700); } catch { /* best-effort */ } });
+
+  // --- Part 1: the F4 interleaving (tracker read open, proposal already
+  // landed), but the run record cannot be written when the pass goes to
+  // record its outcome. The rollback and its undo both land on the graph;
+  // the record must NOT lose the debt — the previous flag stands.
+  write("task-proposed", item);
+  write(tracker, trackerNode("open"));
+  write(landedFact, `type: artifact\ntitle: Integration landed task-proposed\nsummary: Integration landed task-proposed onto main for dispatched run 11111111 — PR #13 merged onto main.\nstatus: active\nedges:\n  - {type: resolves, to: ${tracker}}\n  - {type: relates-to, to: task-proposed}\n`);
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, entry.run_id).record, {
+    run_id: entry.run_id, node_id: entry.node_id, state: "done", terminal_state: "resolved", terminal_enforced: true,
+    gate_state: "parked", gate_demote_pending: true, gate_proposal_number: 13, gate_proposal_blocker: tracker,
+    gate_proposal_url: "https://github.com/demo/repo/pull/13", gate_proposal_repo: "demo/repo",
+    gate_proposal_branch: "task-proposed", gate_proposal_target_ref: "main", gate_proposal_strategy: "merge", gate_proposal_project: "demo",
+  });
+  fs.chmodSync(runDir, 0o500); // atomicJson's temp file cannot be created: every stamp fails
+  const first = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => first.push(l) });
+  fs.chmodSync(runDir, 0o700);
+  assert.strictEqual(statusOf("task-proposed"), "done", "the demotion landed and was undone on the graph");
+  assert.ok(first.some((l) => l.includes("the proposal for task-proposed settled while its demotion was landing — undone")), first.join("\n"));
+  assert.ok(first.some((l) => l.includes("the run record for task-proposed could not be stamped")), first.join("\n"));
+  assert.strictEqual(recordOf(entry.run_id).gate_demote_pending, true, "a stamp that fails leaves the previous debt standing — nothing is cleared without its outcome recorded");
+  assert.strictEqual(recordOf(entry.run_id).gate_restore_pending, undefined, "and never owes a debt the same write did not clear");
+
+  // --- Part 2: the stranded state F5 describes — a pass whose rollback
+  // landed against the settled proposal, whose undo did not, and whose
+  // record never got either fact: the item OPEN behind a tracker now
+  // CLOSED, only the stale pending flag left. The next pass recognizes the
+  // landed proposal and restores the item before it clears the flag.
+  write("task-proposed", item.replace("status: done", "status: open"));
+  write(tracker, trackerNode("done"));
+  const second = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => second.push(l) });
+  assert.strictEqual(statusOf("task-proposed"), "done", "the stranded item is restored — the proposal landed, so its completion stands");
+  assert.ok(second.some((l) => l.includes(`the tracking item ${tracker} for task-proposed is already closed — the withheld demotion is no longer owed; task-proposed restored open -> done`)), second.join("\n"));
+  assert.strictEqual(recordOf(entry.run_id).gate_demote_pending, false, "cleared only once the restore held");
+  assert.ok(!second.some((l) => l.includes("retried the withheld demotion")), second.join("\n"));
+
+  // The restore can fail like any write: the flag then STAYS, and the next
+  // pass tries again — a debt is never cleared ahead of the write it owes.
+  write("task-proposed", item.replace("status: done", "status: open"));
+  dispatchRuns.stampGateState(home, entry.run_id, { gate_demote_pending: true }, { force: true });
+  const itemFile = path.join(nodes, "task-proposed.md");
+  t.after(() => { try { fs.chmodSync(itemFile, 0o600); } catch { /* best-effort */ } });
+  fs.chmodSync(itemFile, 0o000);
+  const third = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => third.push(l) });
+  fs.chmodSync(itemFile, 0o600);
+  assert.strictEqual(statusOf("task-proposed"), "open");
+  assert.ok(third.some((l) => l.includes("is already closed and its proposal landed, but the item could not be restored")), third.join("\n"));
+  assert.strictEqual(recordOf(entry.run_id).gate_demote_pending, true, "the debt stands until the restore lands");
+  const fourth = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => fourth.push(l) });
+  assert.strictEqual(statusOf("task-proposed"), "done", "retried and landed");
+  assert.strictEqual(recordOf(entry.run_id).gate_demote_pending, false);
+
+  // --- Part 3: a tracker a PERSON closed with no landing is not a landing:
+  // the stale flag is cleared and the item is left exactly as it stands.
+  fs.unlinkSync(path.join(nodes, `${landedFact}.md`));
+  write("task-proposed", item.replace("status: done", "status: open"));
+  dispatchRuns.stampGateState(home, entry.run_id, { gate_demote_pending: true }, { force: true });
+  const fifth = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => fifth.push(l) });
+  assert.strictEqual(statusOf("task-proposed"), "open", "no landed fact — nothing says the completion should stand, so nothing is restored");
+  assert.ok(fifth.some((l) => l.includes(`the tracking item ${tracker} for task-proposed is already closed — the withheld demotion is no longer owed`)), fifth.join("\n"));
+  assert.strictEqual(recordOf(entry.run_id).gate_demote_pending, false);
+
+  // And a further pass is a silent no-op.
+  const sixth = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => sixth.push(l) });
+  assert.deepStrictEqual(sixth.filter((l) => l.includes("task-proposed")), []);
+});
