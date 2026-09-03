@@ -83,7 +83,7 @@ Codex test profile.
 // stdin, records its invocation, then emits the stream-json events a real run
 // does — `system`/`init` first (every event carries `session_id`), an
 // `assistant` message, and the terminal `result`.
-function claudeStreamStub(home, { delayMs = 0, exitCode = 0, resultText = "stub final report", isError = false } = {}) {
+function claudeStreamStub(home, { delayMs = 0, exitCode = 0, resultText = "stub final report", isError = false, assistantText = "working on it" } = {}) {
   return writeSpawnableNodeStub(home, "claude-stream-stub", `
 const fs = require("node:fs");
 let prompt = "";
@@ -101,7 +101,7 @@ process.stdin.on("end", () => {
   const w = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
   w({ type: "system", subtype: "init", cwd: process.cwd(), session_id: ${JSON.stringify(SESSION)}, model: "stub" });
   w({ type: "assistant", message: { role: "assistant", content: [{ type: "thinking", thinking: "" }] }, session_id: ${JSON.stringify(SESSION)} });
-  w({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "working on it" }] }, session_id: ${JSON.stringify(SESSION)} });
+  w({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: ${JSON.stringify(assistantText)} }] }, session_id: ${JSON.stringify(SESSION)} });
   w({ type: "result", subtype: ${isError ? '"error_during_execution"' : '"success"'}, is_error: ${isError ? "true" : "false"}, result: ${JSON.stringify(resultText)}, session_id: ${JSON.stringify(SESSION)} });
   setTimeout(() => process.exit(${exitCode}), ${delayMs});
 });
@@ -287,6 +287,38 @@ test("a supervised claude-code run whose is_error result carries a recognized en
   assert.strictEqual(settled.termination_signal, "credit-exhausted");
   assert.strictEqual(settled.terminal_state, "failed");
   assert.ok(!fs.existsSync(settled.report_path), "no report either way");
+});
+
+test("assistant prose preceding an is_error result never classifies the run: only the declared error text is read for environment signals", async () => {
+  // The assistant turn quotes an environment phrase (it was asked about
+  // credits, or read the words in a file); the harness then declares a plain
+  // error. The log tail holds both — the declaration alone is the evidence.
+  const { home, repo } = fixture();
+  const outfile = path.join(home, "claude-invocation.json");
+  const stub = claudeStreamStub(home, {
+    delayMs: 100, exitCode: 1, isError: true,
+    assistantText: "Checking the docs: the API replies 'Credit balance is too low' when an org runs dry.",
+    resultText: "Tool execution failed: permission denied",
+  });
+  const result = run(
+    ["dispatch", "task-cc", "--dir", repo, "--permission-mode", "bypassPermissions", "--no-brief"],
+    { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outfile }
+  );
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.ok(await awaitJson(outfile), "the detached stub ran");
+  const recordPath = await runRecordFile(home);
+  const settled = await waitFor(() => {
+    const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+    return record.contract_pending === false ? record : null;
+  });
+  assert.ok(settled);
+  assert.match(fs.readFileSync(settled.log_path, "utf8"), /Credit balance is too low/, "the prose IS in the log tail the old scan read");
+  assert.strictEqual(settled.state, "failed");
+  assert.strictEqual(settled.termination_class, "failed", "prose before the error result is not the run's cause of death");
+  assert.strictEqual(settled.termination_signal, "error-result");
+  assert.match(settled.termination_reason, /error_during_execution: Tool execution failed: permission denied/);
+  assert.strictEqual(settled.terminal_state, "failed");
+  assert.ok(!fs.existsSync(settled.report_path));
 });
 
 test("a default claude-code dispatch launches supervised: print-mode argv, prompt on stdin, session and report off the stream", async () => {

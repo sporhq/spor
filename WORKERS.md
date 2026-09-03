@@ -306,7 +306,10 @@ carries `is_error: true` writes no report file at all — its text is the
 reason the run stopped, not the agent's final message — so the run reads
 `failed` (`termination_signal: "error-result"`, the error text retained in
 `termination_reason`) whatever its exit code, and never enters the gates as
-a clean `reported`.
+a clean `reported`. Only that declared text is read for an environment
+signal (a credit or rate-limit phrase in it still classifies the run
+`environment`); the assistant turns before it are never scanned, so prose
+that merely quotes such a phrase cannot override the real error.
 
 **A decline is a fixed form, not prose.** A worker that finds the item
 itself wrong — its premise no longer holds, it is already done, the change
