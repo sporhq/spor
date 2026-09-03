@@ -297,9 +297,10 @@ The ordering is the contract: the report is filed before the lease goes back to
 the pool, so an interrupted run can leave a held lease with the report filed but
 never a released lease with nothing attached.
 
-Enforcement covers **supervised** launches (Codex, OpenCode, Copilot CLI) against
-a team graph, targeting a node type whose completion is a resolving edge (`task`,
-`issue`, `question`, `incident`). A native-background run (`claude --bg`), a
+Enforcement covers **supervised** launches (Claude Code, Codex, OpenCode, Copilot
+CLI — every built-in) against a team graph, targeting a node type whose
+completion is a resolving edge (`task`, `issue`, `question`, `incident`). A
+native-background run (`spor dispatch --bg`, the opt-in `claude --bg` launch), a
 local-mode dispatch, a free-text dispatch, a target retired by status instead of
 by an edge, and a run whose graph could not be reached are all classified
 best-effort and marked `terminal_enforced: false` — an unenforced run can never
@@ -349,13 +350,15 @@ is what keeps two workers off one node, so a loop always takes it. Stopping
 (`SIGINT`/`SIGTERM`, or `--once`/`--max`) stops picking up new work; runs
 already in flight are detached, keep going, and self-report through `spor runs`.
 
-A native-background harness (`claude --bg`) is the weak spot, for the same
-reason its outcome is unenforced: its termination is not deterministically
-observable, so a slot is freed from the harness's own live-agent listing. If
-that listing cannot be read, the slot stays held and the worker says so;
-`--run-max` (default 24 hours) is the backstop that stops following such a run.
-A supervised harness — Codex, OpenCode, Copilot CLI, or a declared one — has
-none of this.
+A native-background run (`claude --bg`, reached only through `spor dispatch
+--bg` or a standing `dispatch.claudeLaunchMode: native-background`) is the weak
+spot, for the same reason its outcome is unenforced: its termination is not
+deterministically observable, so a slot is freed from the harness's own
+live-agent listing. If that listing cannot be read, the slot stays held and the
+worker says so; `--run-max` (default 24 hours) is the backstop that stops
+following such a run. A supervised harness — Claude Code by default, Codex,
+OpenCode, Copilot CLI, or a declared one — has none of this, which is why the
+worker never passes `--bg`.
 
 Run it as a service and read it back:
 
@@ -411,10 +414,17 @@ to gate on yet. It authors data only; enforcement stays in `spor work`.
 
 ### Choosing a harness
 
-By default, `spor dispatch` launches a Claude Code agent (`claude --bg`). To
-dispatch under a different coding-agent CLI — Codex, OpenCode, and GitHub
-Copilot CLI are also supported — resolve a **profile**: a node that bundles a
-harness, model, and toolset.
+By default, `spor dispatch` launches a Claude Code agent in headless print mode
+(`claude -p --output-format stream-json`) under the shared supervisor: the
+prompt goes in on stdin, the run's session id and final report are read off its
+event stream, the run record goes terminal when the process does, and the
+terminal-state contract judges the outcome like any other supervised harness.
+Pass `--bg` (or set `dispatch.claudeLaunchMode: native-background` in your user
+config) to launch the native background session instead (`claude --bg`) — the
+attachable, interactive form (`claude attach`), at the cost of an unenforced
+outcome and no report channel. To dispatch under a different coding-agent CLI —
+Codex, OpenCode, and GitHub Copilot CLI are also supported — resolve a
+**profile**: a node that bundles a harness, model, and toolset.
 
 ```bash
 spor dispatch issue-86 --profile profile-codex-sol

@@ -34,6 +34,15 @@ function localEnv(extra = {}) {
   env.XDG_CONFIG_HOME = ISO;
   env.SPOR_FAKE_AGENTS_JSON = "[]";
   env.SPOR_DISTILLING = "1";
+  // These tests pin the LAUNCHER — cwd, worktree, $PWD, argv, claim ordering,
+  // session capture through `claude agents --json` — against the native
+  // `claude --bg` launch they were written for, now the explicit opt-in
+  // (`--bg` / dispatch.claudeLaunchMode, task-spor-claude-adapter-headless-
+  // supervised). The supervised default (`claude -p --output-format
+  // stream-json` under the shared supervisor) is covered in
+  // test/claude-supervised-dispatch.test.js; every guard exercised here runs
+  // before the launch branch forks, so it is shared by both.
+  env.SPOR_DISPATCH_CLAUDE_LAUNCH_MODE = "native-background";
   return Object.assign(env, extra);
 }
 function remoteEnv(home, server, extra = {}) {
