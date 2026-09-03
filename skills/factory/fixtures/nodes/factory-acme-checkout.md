@@ -1,7 +1,7 @@
 ---
 id: factory-acme-checkout
 type: factory
-project: acme-checkout
+repo: acme-checkout
 title: What "done" means for Acme Checkout
 summary: The ordered gates Acme Checkout work must clear between an agent claiming it and it counting as done — the CI suite from main, a cross-model review, and the owner's approval on anything that touches money.
 date: 2026-08-26
