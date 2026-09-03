@@ -1175,6 +1175,41 @@ test("spor runs --json: 'reconciled' is false only when a NATIVE run was actuall
   assert.match(cli(["runs"], blind).stderr, /native run states may be stale/);
 });
 
+test("spor runs: the harness listing is taken only when a non-terminal NATIVE record needs it (task-spor-retire-native-bg-enumerated-skip-after-supervised-default)", () => {
+  // The listing is the native path's evidence alone: a supervised run is
+  // reconciled against its own supervisor, so a store holding only supervised
+  // (or already-terminal) records must not boot a harness CLI to read it.
+  const home = scratch("spor-runs-store-");
+  const mark = path.join(home, "agents-listed");
+  const stub = writeSpawnableNodeStub(home, "claude-agents", `require("fs").writeFileSync(${JSON.stringify(mark)}, process.argv.slice(2).join(" ")); console.log("[]");`);
+  const env = bare({ SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  delete env.SPOR_FAKE_AGENTS_JSON; // let the CLI really decide whether to shell out
+  const runs = (...args) => spawnSync(process.execPath, [CLI, "runs", ...args], { encoding: "utf8", env });
+
+  supervisedRecord(home, "sup-only", { runner_pid: deadPid() });
+  let r = runs("--json");
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(JSON.parse(r.stdout).runs[0].state, "vanished", "the supervised run is reconciled off its supervisor");
+  assert.ok(!fs.existsSync(mark), "no harness was asked for a live-agent listing");
+
+  // A terminal native record needs no listing either.
+  const done = runner.beginNativeRun(home, { harness: "claude-code", name: "d", nodeId: "issue-d", cwd: "/tmp/nope", now: () => "2026-07-18T10:00:00.000Z" });
+  runner.updateRun(done, { state: "vanished", termination_class: "unknown", termination_signal: "session-unbound" });
+  r = runs("--json");
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(!fs.existsSync(mark), "a terminal native record spends no listing");
+
+  // A non-terminal native record (the `--bg` opt-in) is the one case that does.
+  const native = runner.beginNativeRun(home, { harness: "claude-code", name: "n", nodeId: "issue-n", cwd: "/tmp/nope", now: () => "2026-07-18T10:00:00.000Z" });
+  runner.updateRun(native, { state: "running" });
+  r = runs("--json");
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(fs.readFileSync(mark, "utf8"), "agents --json", "the harness was enumerated for the live native record");
+  const parsed = JSON.parse(r.stdout);
+  assert.strictEqual(parsed.reconciled, true);
+  assert.strictEqual(parsed.runs.find((x) => x.run_id === native.runId).state, "vanished", "and the empty listing resolved it");
+});
+
 test("spor runs: an agent the harness still lists as 'done' does not hold its run open", () => {
   const { home, repo } = fixture();
   const configDir = scratch("spor-runs-cc-");

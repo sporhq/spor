@@ -1720,3 +1720,54 @@ test("pollWorkRuns: a contract-pending record the graph does NOT show resolved i
   assert.strictEqual(verdict.record.contract_pending, true);
   assert.strictEqual(dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record).contract_pending, true);
 });
+
+// ------------------------------------------ pollWorkRuns: native evidence --
+//
+// task-spor-retire-native-bg-enumerated-skip-after-supervised-default: every
+// run this loop dispatches is supervised, so following its own runs must not
+// boot a harness CLI per poll for a live-agent listing only a native-background
+// record could use. The `enumerated === false` skip in reconcileRuns survives
+// as the `--bg` opt-in's rule alone — a native record a resumed pipeline
+// adopted is still held (and said so) when the listing is unreadable.
+
+async function withRealAgentListing(stubBody, fn) {
+  const saved = { fake: process.env.SPOR_FAKE_AGENTS_JSON, cmd: process.env.SPOR_CLAUDE_CMD };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-poll-agents-"));
+  const mark = path.join(dir, "listed");
+  process.env.SPOR_CLAUDE_CMD = writeSpawnableNodeStub(dir, "claude-agents", `require("fs").writeFileSync(${JSON.stringify(mark)}, "1"); ${stubBody}`);
+  delete process.env.SPOR_FAKE_AGENTS_JSON;
+  try {
+    return await fn({ listed: () => fs.existsSync(mark) });
+  } finally {
+    if (saved.fake === undefined) delete process.env.SPOR_FAKE_AGENTS_JSON; else process.env.SPOR_FAKE_AGENTS_JSON = saved.fake;
+    if (saved.cmd === undefined) delete process.env.SPOR_CLAUDE_CMD; else process.env.SPOR_CLAUDE_CMD = saved.cmd;
+  }
+}
+
+test("pollWorkRuns: following only supervised runs never asks the harness for a live-agent listing", async () => {
+  const { home, cfg } = pollFixture();
+  await withRealAgentListing('console.log("[]");', async ({ listed }) => {
+    const runId = "sup-followed";
+    writeRecord(home, runId, { launch_mode: "supervised-jsonl", state: "running", runner_pid: 2 ** 22 - 1, created_at: "2026-07-18T10:00:00.000Z" });
+    const [verdict] = await sporCli.pollWorkRuns(cfg, [runId], { maxAgeMs: 86400000 });
+    assert.strictEqual(verdict.terminal, true, "the dead supervisor closes the run");
+    assert.strictEqual(verdict.record.state, "vanished");
+    assert.strictEqual(listed(), false, "no harness CLI was booted for a listing nothing could use");
+  });
+});
+
+test("pollWorkRuns: a native-background record among the followed runs still takes the listing, and an unreadable one still holds the slot (the `--bg` rule)", async () => {
+  const { home, cfg } = pollFixture();
+  await withRealAgentListing('console.log("not json");', async ({ listed }) => {
+    const runId = "native-adopted";
+    // Past the 60s registration grace, well inside the watchdog: the record's
+    // state is decided by the listing alone.
+    writeRecord(home, runId, { harness: "claude-code", launch_mode: "native-background", state: "running", created_at: new Date(Date.now() - 120000).toISOString() });
+    const warned = [];
+    const [verdict] = await sporCli.pollWorkRuns(cfg, [runId], { maxAgeMs: 86400000, idleMs: 60000, warn: (l) => warned.push(l) });
+    assert.strictEqual(listed(), true, "the live native record is what the listing is for");
+    assert.strictEqual(verdict.terminal, false, "an unreadable listing is not evidence the run ended");
+    assert.strictEqual(verdict.record.state, "running");
+    assert.ok(warned.some((l) => /could not list live background agents/.test(l)), warned.join("\n"));
+  });
+});

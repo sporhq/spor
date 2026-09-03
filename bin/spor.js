@@ -539,6 +539,40 @@ function enumerateHarnessAgents(adapter, cfg = null) {
   return { ok: true, agents: arr };
 }
 
+// The live-agent listing is the NATIVE path's evidence and nobody else's: a
+// `native-background` record — a `spor dispatch --bg` opt-in, or one written
+// before the supervised default (task-spor-claude-adapter-headless-supervised)
+// — is reconciled against `claude agents --json`, while a supervised run is
+// reconciled against its own supervisor process and never reads the listing.
+// So the listing is only worth taking (a CLI boot per cli-json harness, on
+// every `spor runs` and every work-loop poll) when some record still needs it:
+// a NON-TERMINAL native one among `records`. Otherwise nothing is listed and
+// `enumerated: false` is the honest answer — reconcileRuns consults it only
+// for the native records there are none of, so the outcome is identical to a
+// successful empty listing at zero cost (task-spor-retire-native-bg-
+// enumerated-skip-after-supervised-default). A worker's own dispatches are all
+// supervised (cmdDispatch's `supervisedOnly`), so a worker following only its
+// own runs never spawns a harness here at all.
+function nativeAgentEvidence(cfg, records) {
+  const needed = (records || []).some(
+    (r) => r && r.launch_mode === "native-background" && !dispatchRuns.TERMINAL_STATES.has(r.state)
+  );
+  if (!needed) return { agents: [], enumerated: false };
+  let enumerated = false;
+  const agents = [];
+  for (const adapter of dispatchHarnesses.discoveryAdapters({ cfg })) {
+    if ((adapter.activeDiscovery || {}).kind !== "cli-json") continue;
+    const e = enumerateHarnessAgents(adapter, cfg);
+    if (!e.ok) continue;
+    enumerated = true;
+    // A finished agent the harness still lists is NOT live — reconciling it is
+    // the whole point, so it must not hold its run open (same `done` filter the
+    // in-flight surface applies).
+    for (const a of e.agents) if (a && a.kind === "background" && a.state !== "done") agents.push(a);
+  }
+  return { agents, enumerated };
+}
+
 // Active background agents keyed by node id (task-spor-cli-in-flight-surface).
 // `spor dispatch` names each background agent after the node id it works
 // (cmdDispatch: name = name || nodeId), so `claude agents --json` lets the queue
@@ -8351,21 +8385,12 @@ async function launchSupervisedHarness(cfg, {
 // read, a pid probe, and a bounded file tail.
 //
 // Only the live-agent listing can fail, and it is only the native path's
-// evidence — hence `enumerated` gating that path alone.
+// evidence — hence `enumerated` gating that path alone, and the listing being
+// taken only when a non-terminal native record exists to spend it on
+// (nativeAgentEvidence).
 function cmdRuns(cfg, { values, positionals: pos }) {
   const home = cfg.userConfigHome();
-  let enumerated = false;
-  const agents = [];
-  for (const adapter of dispatchHarnesses.discoveryAdapters()) {
-    if ((adapter.activeDiscovery || {}).kind !== "cli-json") continue;
-    const e = enumerateHarnessAgents(adapter, cfg);
-    if (!e.ok) continue;
-    enumerated = true;
-    // A finished agent the harness still lists is NOT live — reconciling it is
-    // the whole point, so it must not hold its run open (same `done` filter the
-    // in-flight surface applies).
-    for (const a of e.agents) if (a && a.kind === "background" && a.state !== "done") agents.push(a);
-  }
+  const { agents, enumerated } = nativeAgentEvidence(cfg, dispatchRuns.readRunRecords(home));
   const records = dispatchRuns.reconcileRuns(home, { agents, enumerated });
   const limit = Math.max(1, parseInt(values.limit, 10) || 20); // a bad --limit falls back to the default, never to 1
   const runs = dispatchRuns.listRuns(home, { records, node: values.node || null, runId: pos[0] || null, limit });
@@ -9504,24 +9529,23 @@ async function verifyRunResolution(cfg, record) {
 }
 
 // Which of this worker's runs are over, and what they did to the graph.
-// RECONCILE first, exactly as `spor runs` does: a native-background run's
-// ending is invisible to its launcher, so its record only goes terminal when
-// something resolves it against the harness's live-agent list plus its own
-// transcript. Supervised runs need none of that (their supervisor closes the
-// record itself), so a box with no enumerable harness still follows them.
+// RECONCILE first, exactly as `spor runs` does. Every run this loop dispatches
+// is SUPERVISED (cmdDispatch's `supervisedOnly`), and a supervised run's
+// supervisor closes its own record, so following them needs no harness
+// listing at all. Only a native-background record — one a RESUMED pipeline
+// adopted from before the supervised default (§10.8), never a run this loop
+// launched — has an ending invisible to its launcher, resolvable only against
+// the harness's live-agent list plus its own transcript; the listing is taken
+// only when such a record is among the runs asked about (nativeAgentEvidence),
+// so a worker following its own runs never boots a harness CLI per poll.
 async function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, idleMs = 0, warn = () => {} } = {}) {
   const home = cfg.userConfigHome();
   const wanted = new Set(runIds || []);
   if (!wanted.size) return [];
-  let enumerated = false;
-  const agents = [];
-  for (const adapter of dispatchHarnesses.discoveryAdapters({ cfg })) {
-    if ((adapter.activeDiscovery || {}).kind !== "cli-json") continue;
-    const e = enumerateHarnessAgents(adapter, cfg);
-    if (!e.ok) continue;
-    enumerated = true;
-    for (const a of e.agents) if (a && a.kind === "background" && a.state !== "done") agents.push(a);
-  }
+  const { agents, enumerated } = nativeAgentEvidence(
+    cfg,
+    dispatchRuns.readRunRecords(home).filter((r) => r && wanted.has(r.run_id))
+  );
   const records = dispatchRuns.reconcileRuns(home, { agents, enumerated });
   const found = new Map();
   for (const r of records) if (r && wanted.has(r.run_id)) found.set(r.run_id, r);
@@ -9613,10 +9637,12 @@ async function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, idleMs = 0, warn = () =
       continue;
     }
     if (!enumerated && record && record.launch_mode === "native-background" && !verdict.terminal) {
-      // The same caveat `spor runs` prints: a native run's state can only be
-      // resolved against the harness's live-agent listing, and this call could
-      // not read one. The slot is held (correctly — nothing says the run is
-      // over), but a worker that quietly stops dispatching must say why.
+      // The same caveat `spor runs` prints, reachable here only for a native
+      // record a resumed pipeline adopted (this loop launches none): a native
+      // run's state can only be resolved against the harness's live-agent
+      // listing, and this call could not read one. The slot is held (correctly
+      // — nothing says the run is over, and the idle ceiling / watchdog bound
+      // the hold), but a worker that quietly stops dispatching must say why.
       warn(
         "work: could not list live background agents — a native run's state may be stale, so its slot stays held ('spor runs' reports the same)" +
           // Only where the run bound a session: the idle ceiling reads a native
@@ -15026,7 +15052,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
+module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
 
 if (require.main === module) {
   main()
