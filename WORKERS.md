@@ -1496,7 +1496,10 @@ says, and it is demoted through the same path a flagged retry takes. The
 probe is one read in the ordinary case (the item already `open`), needs no
 flag of its own (it runs again next pass), and skips a proposal whose landed
 fact exists, since a tracker whose close failed sits open beside a
-legitimately completed item. The pipeline returns a THIRD settled state,
+legitimately completed item. That landed-fact read licenses a rollback only
+on a CONFIRMED absence (a 404, or ENOENT in local mode) — a server error,
+timeout or unreadable file is "unknown", not "absent", and unknown never
+demotes: the probe waits for the next pass. The pipeline returns a THIRD settled state,
 `parked` (alongside `passed`/`failed`/`blocked`, all in
 `gates.SETTLED_GATE_STATES` — this run's pipeline is genuinely done; a
 resumed orphan re-running it from gate 0 would open a duplicate PR), and the

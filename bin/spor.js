@@ -7037,6 +7037,28 @@ async function cmdUpgrade(cfg, { values, positionals: pos }) {
 // never a local path; teammates clone to different paths), so the map MUST be
 // local. It self-learns from session-start and from `--dir`/`spor repos`.
 
+// Whether a node is CONFIRMED absent from the graph — as opposed to merely
+// unreadable right now. resolveNode folds both into `null` (a 404, a 5xx, a
+// transport error, an EACCES all read the same), which is fine for a caller
+// that only wants to ACT on a node it can read, and wrong for one that wants
+// to act on the node's ABSENCE: the checkProposals probe licenses a rollback
+// of a completed item on "no landed fact", and a server blip must not be
+// mistaken for that evidence (review F2). Only an explicit 404 (remote) or
+// ENOENT (local) answers true; anything else is "unknown", and the caller
+// treats unknown as not-absent.
+async function nodeConfirmedAbsent(cfg, id) {
+  if (cfg.mode() === "remote") {
+    const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 6000 });
+    return !!(r && !r.ok && !r.transport && r.status === 404);
+  }
+  try {
+    fs.statSync(path.join(cfg.nodesDir(), `${id}.md`));
+    return false;
+  } catch (e) {
+    return !!(e && e.code === "ENOENT");
+  }
+}
+
 // Resolve a node id to { id, raw, repo, title, summary, type, status, date } or
 // null if it doesn't exist.
 async function resolveNode(cfg, id) {
@@ -12019,12 +12041,18 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
     // only logged. The landed fact is checked first because restore() writes
     // it before it promotes and closes the tracker — a tracker whose close
     // failed sits open beside a legitimately completed item, and a probe
-    // that demoted it there would churn against the landing every pass.
+    // that demoted it there would churn against the landing every pass. And
+    // the read must distinguish ABSENT from UNREADABLE (F2): resolveNode
+    // answers null to a 5xx, a timeout or an EACCES exactly as it does to a
+    // missing node, so a probe keyed on it would demote a legitimately landed
+    // item on a server blip. Only a confirmed absence (404 / ENOENT) licenses
+    // the probe; an unreadable graph is "unknown", and unknown is not-absent —
+    // the probe simply runs again next pass.
     const owed = !!(healed.healed || r.gate_demote_pending);
     let probe = false;
     if (!owed) {
       try {
-        probe = !(await resolveNode(cfg, integrationRunner.integrationFactId(r.node_id, r.run_id, "landed")));
+        probe = await nodeConfirmedAbsent(cfg, integrationRunner.integrationFactId(r.node_id, r.run_id, "landed"));
       } catch {
         probe = false; // an unreadable graph cannot license a rollback
       }
@@ -15258,7 +15286,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { nodeFloor, nodeRuntimeCheck, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
+module.exports = { nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
 
 if (require.main === module) {
   main()

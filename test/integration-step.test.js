@@ -1048,6 +1048,106 @@ test("checkProposals recovers a heal-pass demotion debt whose gate_demote_pendin
   assert.ok(!settled.some((l) => l.includes("rollback debt")), settled.join("\n"));
 });
 
+// F2 of the fourth review: the probe above licenses a rollback on "no landed
+// fact", but resolveNode answers null to a FAILED read (a 5xx, a timeout, an
+// unreadable file) exactly as it does to a missing node — so a server blip
+// beside a legitimately landed item would demote it. The probe now keys on a
+// CONFIRMED absence (404 / ENOENT); anything else is unknown, and unknown
+// never demotes.
+test("checkProposals' rollback probe never demotes on an UNREADABLE landed fact — only a confirmed absence licenses it (F2)", async (t) => {
+  if (process.platform === "win32") return;
+  if (process.getuid && process.getuid() === 0) return;
+
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-park-probe-unreadable-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const write = (id, front) => fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\n${front}date: 2026-08-26\n---\n\nBody.\n`);
+  const statusOf = (id) => /^status: (.+)$/m.exec(fs.readFileSync(path.join(nodes, `${id}.md`), "utf8"))[1];
+
+  write("task-proposed", "type: task\ntitle: Add bounded retry\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: done\n");
+
+  const ghDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-fake-gh-"));
+  writeFakePathBin(ghDir, "gh", `if [ "$1" = "--version" ]; then echo "gh version 2.0.0"; exit 0; fi\necho '{"state":"OPEN","baseRefName":"main"}'\n`);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${ghDir}${path.delimiter}${originalPath}`;
+  t.after(() => { process.env.PATH = originalPath; });
+
+  const entry = { node_id: "task-proposed", run_id: "11111111-2222-3333-4444-000000000006" };
+  const tracker = sporCli.proposalTrackingId(entry.node_id, entry.run_id);
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, entry.run_id).record, {
+    run_id: entry.run_id, node_id: entry.node_id, state: "done", terminal_state: "resolved", terminal_enforced: true,
+    gate_state: "parked", gate_proposal_number: 14, gate_proposal_url: "https://github.com/demo/repo/pull/14", gate_proposal_repo: "demo/repo",
+    gate_proposal_branch: "task-proposed", gate_proposal_target_ref: "main", gate_proposal_strategy: "merge", gate_proposal_project: "demo",
+    gate_proposal_blocker: tracker,
+  });
+  // The tracker is present and open (nothing to heal), no flag on the record,
+  // and the proposal LANDED — but its landed fact is unreadable this pass.
+  write(tracker, "type: task\ntitle: Land PR #14\nsummary: Tracking item for the proposal of task-proposed opened as PR #14 against main.\nstatus: open\n");
+  const landedId = integrationRunner.integrationFactId(entry.node_id, entry.run_id, "landed");
+  const landedFile = path.join(nodes, `${landedId}.md`);
+  write(landedId, "type: artifact\ntitle: Landed\nsummary: The proposal for task-proposed merged into main and the item's completion stands again.\nstatus: active\n");
+  fs.chmodSync(landedFile, 0o000);
+  t.after(() => { try { fs.chmodSync(landedFile, 0o600); } catch { /* best-effort */ } });
+
+  const blip = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => blip.push(l) });
+  assert.strictEqual(statusOf("task-proposed"), "done", "an unreadable landed fact is not evidence of absence — the completed item stands");
+  assert.ok(!blip.some((l) => l.includes("rollback debt") || l.includes("rolled back")), blip.join("\n"));
+
+  // The read heals: the fact is present, and the probe still leaves the
+  // landing alone (the F1 case, unchanged).
+  fs.chmodSync(landedFile, 0o600);
+  const readable = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => readable.push(l) });
+  assert.strictEqual(statusOf("task-proposed"), "done");
+  assert.ok(!readable.some((l) => l.includes("rollback debt")), readable.join("\n"));
+
+  // Only a CONFIRMED absence licenses the probe: with the fact gone (ENOENT),
+  // the same open tracker beside the same completed item IS the debt.
+  fs.unlinkSync(landedFile);
+  const absent = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => absent.push(l) });
+  assert.strictEqual(statusOf("task-proposed"), "open", "a confirmed absence still recovers the unrecorded debt");
+  assert.ok(absent.some((l) => l.includes("recovered an unrecorded rollback debt for task-proposed")), absent.join("\n"));
+});
+
+// The remote half of the same distinction: the helper the probe keys on
+// answers "absent" to a 404 ONLY — a 5xx, a non-JSON 200-less blip and a
+// dead server are all "unknown", which the probe treats as not-absent.
+test("nodeConfirmedAbsent: remote mode confirms absence on 404 only — a 5xx or a dead server is unknown, never absent (F2)", async (t) => {
+  const http = require("node:http");
+  const sporCli = require("../bin/spor.js");
+  const { loadConfig } = require("../lib/config.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-absent-remote-"));
+  let mode = 404;
+  const server = http.createServer((req, res) => {
+    if (mode === 404) { res.writeHead(404, { "content-type": "application/json" }); res.end('{"error":"not found"}'); return; }
+    if (mode === 500) { res.writeHead(500, { "content-type": "text/plain" }); res.end("boom"); return; }
+    res.writeHead(200, { "content-type": "application/json" }); res.end('{"raw":"---\\nid: x\\ntype: artifact\\n---\\n"}');
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => server.close());
+  const port = server.address().port;
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: `http://127.0.0.1:${port}`, SPOR_TOKEN: "t" } });
+  assert.strictEqual(cfg.mode(), "remote");
+
+  assert.strictEqual(await sporCli.nodeConfirmedAbsent(cfg, "x"), true, "404 is a confirmed absence");
+  mode = 500;
+  assert.strictEqual(await sporCli.nodeConfirmedAbsent(cfg, "x"), false, "a 5xx is unknown, not absent");
+  mode = 200;
+  assert.strictEqual(await sporCli.nodeConfirmedAbsent(cfg, "x"), false, "a readable node is present");
+
+  // A dead server (transport failure) is unknown too.
+  await new Promise((r) => server.close(r));
+  const dead = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: `http://127.0.0.1:${port}`, SPOR_TOKEN: "t" } });
+  assert.strictEqual(await sporCli.nodeConfirmedAbsent(dead, "x"), false, "a transport failure is unknown, not absent");
+});
+
 // F3 of the same review: the pending-demotion retry must NOT run against a
 // tracker that is already closed. Once the PR merged, restore() promoted the
 // item and closed the tracker (`done`) — if the flag still stood from an
