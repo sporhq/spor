@@ -392,6 +392,79 @@ test("a supervised claude-code run whose supervisor is KILLED mid-run is finaliz
   assert.strictEqual(JSON.parse(fs.readFileSync(recordPath, "utf8")).state, "vanished", "durable, not just printed");
 });
 
+// Claude Code 2.x leaves a persistent background daemon, and a `--mcp-config`
+// server is a child of the run too; either can inherit the child's stdout/
+// stderr and keep the PIPES open after `claude -p` itself has exited
+// (test/helpers/claude-e2e.js resolves on `exit` for exactly this reason). A
+// supervisor that finalized only on `close` would then hold the run — and its
+// work-loop slot and lease — open forever. Model it: a child that hands its
+// stdout to a detached grandchild sleeping well past the test, then exits 0.
+function pipeHoldingStub(home) {
+  return writeSpawnableNodeStub(home, "claude-pipe-holder", `
+const fs = require("node:fs");
+const { spawn } = require("node:child_process");
+let prompt = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { prompt += chunk; });
+process.stdin.on("end", () => {
+  const w = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+  w({ type: "system", subtype: "init", session_id: ${JSON.stringify(SESSION)} });
+  w({ type: "result", subtype: "success", is_error: false, result: "held-pipe report", session_id: ${JSON.stringify(SESSION)} });
+  // The lingering "daemon": inherits BOTH pipes and outlives this process.
+  const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: ["ignore", "inherit", "inherit"], detached: true });
+  holder.unref();
+  fs.writeFileSync(process.env.OUTFILE, JSON.stringify({ holderPid: holder.pid }));
+  process.exit(0);
+});
+`);
+}
+
+test("a claude-code run whose pipes are held open after exit still finalizes within the drain grace", async () => {
+  const { home, repo } = fixture();
+  const outfile = path.join(home, "holder.json");
+  const stub = pipeHoldingStub(home);
+  const result = run(["dispatch", "task-cc", "--dir", repo, "--no-brief"], {
+    SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outfile, SPOR_DISPATCH_PIPE_DRAIN_MS: "500",
+  });
+  assert.strictEqual(result.status, 0, result.stderr);
+  const holder = await awaitJson(outfile);
+  assert.ok(holder && holder.holderPid, "the pipe-holding grandchild started");
+  try {
+    const recordPath = await runRecordFile(home);
+    const started = Date.now();
+    const finished = await waitFor(() => {
+      const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+      return record.state === "done" && record.contract_pending === false ? record : null;
+    }, { timeoutMs: 10000 });
+    assert.ok(finished, "the run went terminal even though the grandchild still holds stdout/stderr");
+    assert.ok(Date.now() - started < 8000, "within seconds, not a watchdog window");
+    assert.strictEqual(finished.exit_code, 0);
+    assert.strictEqual(finished.session_id, SESSION, "everything read before the exit was kept");
+    assert.strictEqual(fs.readFileSync(finished.report_path, "utf8"), "held-pipe report\n");
+    const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+    const runnerPid = record.runner_pid || finished.runner_pid;
+    assert.ok(runnerPid, "sanity: the record names its supervisor");
+    const runnerGone = await waitFor(() => {
+      try { process.kill(runnerPid, 0); return null; } catch { return true; }
+    });
+    assert.ok(runnerGone, "the supervisor process itself exits, not kept alive by the inherited fds");
+    // The holder is still alive — the test never depended on it dying.
+    assert.doesNotThrow(() => process.kill(holder.holderPid, 0), "sanity: the grandchild is still holding the pipes");
+  } finally {
+    try { process.kill(holder.holderPid, "SIGKILL"); } catch { /* already gone */ }
+  }
+});
+
+test("pipeDrainGraceMs: the default, an env override, and garbage", () => {
+  const runner = require("../lib/shell/agent-dispatch-runner.js");
+  assert.strictEqual(runner.PIPE_DRAIN_GRACE_MS, 3000);
+  assert.strictEqual(runner.pipeDrainGraceMs({}), 3000);
+  assert.strictEqual(runner.pipeDrainGraceMs({ SPOR_DISPATCH_PIPE_DRAIN_MS: "250" }), 250);
+  assert.strictEqual(runner.pipeDrainGraceMs({ SPOR_DISPATCH_PIPE_DRAIN_MS: "0" }), 0);
+  assert.strictEqual(runner.pipeDrainGraceMs({ SPOR_DISPATCH_PIPE_DRAIN_MS: "soon" }), 3000);
+  assert.strictEqual(runner.pipeDrainGraceMs({ SPOR_DISPATCH_PIPE_DRAIN_MS: "-5" }), 3000);
+});
+
 test("the same-machine duplicate guard sees a live supervised claude-code run through its run record", async () => {
   const { home, repo } = fixture();
   const stub = claudeStreamStub(home, { delayMs: 30000 });
