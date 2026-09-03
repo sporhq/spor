@@ -2689,3 +2689,159 @@ test("a superseded pipeline's verdict is not what the loop publishes: the status
   assert.strictEqual(s2.gates.passed, 0);
   assert.strictEqual(s2.skipped.length, 1);
 });
+
+// -- cross-model review (second round), blocking finding 1: the judged
+// repository's own suite ran with the judge's credentials in its environment —
+// the attestation signing key (forge the signature anchor) and the graph
+// bearer token (write the graph anchor as the runner). Both doors are
+// scrubbed, whichever way the name arrives.
+test("runGateCommand never hands the suite the attestation key or a graph token — from the process env or the caller's extra env", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-secret-"));
+  const probe = 'const e = process.env; const leaked = ["SPOR_ATTESTATION_KEY","SPOR_TOKEN","SUBSTRATE_TOKEN","SPOR_REFRESH_TOKEN","SPOR_CI_SECRET"].filter((k) => k in e); if (leaked.length) { console.error("leaked " + leaked.join(",")); process.exit(3); } if (e.SPOR_HOME !== "/keep" || e.KEEP !== "1" || e.SPOR_GATE !== "secretgate") { console.error("lost a harmless var"); process.exit(4); } process.exit(0);';
+  const gate = { id: "secretgate", command: `"${process.execPath}" -e '${probe}'`, timeoutMs: 20000 };
+  const saved = {};
+  for (const k of ["SPOR_ATTESTATION_KEY", "SPOR_TOKEN", "SUBSTRATE_TOKEN"]) {
+    saved[k] = process.env[k];
+    process.env[k] = "hunter2";
+  }
+  try {
+    const r = await gateRunner.runGateCommand(gate, dir, { env: { SPOR_HOME: "/keep", KEEP: "1", SPOR_REFRESH_TOKEN: "x", SPOR_CI_SECRET: "y" } });
+    assert.strictEqual(r.ok, true, r.output || r.reason);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+  assert.deepStrictEqual(gateRunner.scrubSecretEnv({ SPOR_ATTESTATION_KEY: "k", SPOR_TOKEN: "t", SUBSTRATE_TOKEN: "t", SPOR_HOME: "h", SPOR_SERVER: "s", PATH: "p", MY_API_KEY: "kept" }), { SPOR_HOME: "h", SPOR_SERVER: "s", PATH: "p", MY_API_KEY: "kept" }, "only the judge's own credentials are scrubbed — a repo's unrelated keys stay");
+});
+
+// -- major finding 5: the attested `trusted_sha` was resolved by one
+// rev-parse while the protected paths were restored from the SYMBOLIC ref by
+// a later checkout — a ref that moved in between put a different suite in
+// the tree than the fact named. The restore now forces from the pinned sha.
+test("prepareGateTree forces the protected paths from the sha gateChangeSet pinned, not from a ref that has since moved", () => {
+  const dir = repoWithBranch();
+  const change = gateRunner.gateChangeSet({ cwd: dir }, "main");
+  assert.strictEqual(change.ok, true, change.reason);
+  const pinned = change.trustedSha;
+  // Move `main` AFTER the change-set read: a new commit that rewrites the suite.
+  git(dir, "checkout", "-q", "main");
+  fs.writeFileSync(path.join(dir, "test", "acceptance.js"), "console.log('moved suite'); process.exit(0);\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "main moved");
+  assert.notStrictEqual(git(dir, "rev-parse", "main").trim(), pinned);
+  git(dir, "checkout", "-q", "impl");
+  const tree = gateRunner.prepareGateTree(change, { trustedRef: "main", protectedPaths: ["test/**"] });
+  assert.strictEqual(tree.ok, true, tree.reason);
+  try {
+    assert.match(fs.readFileSync(path.join(tree.dir, "test", "acceptance.js"), "utf8"), /add is broken/, "the suite is the PINNED sha's copy — what the fact's trusted_sha names");
+  } finally {
+    tree.cleanup();
+  }
+  // A caller whose change carries no pin falls back to the ref, as before.
+  const unpinned = gateRunner.prepareGateTree({ ...change, trustedSha: null }, { trustedRef: "main", protectedPaths: ["test/**"] });
+  try {
+    assert.match(fs.readFileSync(path.join(unpinned.dir, "test", "acceptance.js"), "utf8"), /moved suite/);
+  } finally {
+    unpinned.cleanup();
+  }
+});
+
+// -- blocking finding 4: the two whole-record writers (updateRun, the
+// supervisor's `update`) carried the on-disk gate fields but did their
+// read+rename OUTSIDE the record lock the settle takes — a settle landing
+// between the two was renamed over, erasing the verdict the settler's own
+// read-back had just verified. Every whole-record writer now takes the lock.
+test("whole-record writers take the record lock: a held lock makes them wait, a stale lock is broken, and a gate settle is never renamed over", () => {
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-writer-lock-"));
+  const runId = "11111111-2222-3333-4444-00000000wr10";
+  const paths = dispatchRuns.runPaths(home, runId);
+  const base = { run_id: runId, node_id: "task-x", state: "running" };
+  dispatchRuns.atomicJson(paths.record, base);
+  const lock = dispatchRuns.recordLockPath(paths.record);
+
+  // A settle that landed after the writer's in-memory copy was taken is
+  // carried, whichever writer runs: updateRun (a handle), closeRun,
+  // mergeTerminalOutcome, and the raw writeRecordCarryingGate.
+  const handle = { paths, record: { ...base } };
+  dispatchRuns.stampGateState(home, runId, { gate_state: "passed", gate_settle_id: "tok", gate_attestation: "art-attest-x" }, { force: true });
+  dispatchRuns.updateRun(handle, { state: "done" });
+  let onDisk = dispatchRuns.readJson(paths.record);
+  assert.strictEqual(onDisk.state, "done");
+  assert.strictEqual(onDisk.gate_state, "passed");
+  assert.strictEqual(onDisk.gate_attestation, "art-attest-x", "the settle survives the whole-record write");
+  assert.ok(!fs.existsSync(lock), "the writer released the lock");
+
+  // Held by a live writer: the write WAITS for the bounded window, then still
+  // lands (fail-soft — a supervisor's terminal outcome must never be lost to
+  // a settler that died holding the lock), carrying what is on disk by then.
+  fs.writeFileSync(lock, "4242\n");
+  const t0 = Date.now();
+  dispatchRuns.writeRecordCarryingGate(paths.record, { ...onDisk, note: "late" });
+  const waited = Date.now() - t0;
+  assert.ok(waited >= 500, `waited for the lock (${waited}ms)`);
+  onDisk = dispatchRuns.readJson(paths.record);
+  assert.strictEqual(onDisk.note, "late");
+  assert.strictEqual(onDisk.gate_attestation, "art-attest-x");
+  assert.ok(fs.existsSync(lock), "a live holder's lock is left alone");
+
+  // A corpse is broken and the write goes through at once.
+  const old = new Date(Date.now() - dispatchRuns.RECORD_LOCK_STALE_MS - 5000);
+  fs.utimesSync(lock, old, old);
+  dispatchRuns.atomicJson(paths.record, { ...onDisk, state: "running" });
+  const t1 = Date.now();
+  const closed = dispatchRuns.closeRun(paths.record, { state: "failed", terminal_state: "failed" });
+  assert.strictEqual(closed.state, "failed");
+  assert.ok(Date.now() - t1 < 400, "no wait on a stale lock");
+  assert.strictEqual(closed.gate_attestation, "art-attest-x");
+  assert.ok(!fs.existsSync(lock), "the corpse is gone");
+  // closeRun refuses a record that is already terminal; mergeTerminalOutcome adds to it.
+  assert.strictEqual(dispatchRuns.closeRun(paths.record, { state: "done" }).state, "failed");
+  const merged = dispatchRuns.mergeTerminalOutcome(paths.record, { terminal_state: "resolved" });
+  assert.strictEqual(merged.terminal_state, "failed", "the earlier terminal outcome stands");
+  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_state, "passed");
+});
+
+// -- minor finding 8: the record's `gate_attestation_missing`/`_error` and
+// `gate_proposal_attestation_stale` stamps were documented but rendered
+// nowhere. `spor runs` prints them and the work loop's status carries them.
+test("a missing attestation and a stale proposal body surface on 'spor runs' and on the work loop's status entry", async () => {
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-attest-missing-"));
+  const runId = "11111111-2222-3333-4444-0000000miss1";
+  const paths = dispatchRuns.runPaths(home, runId);
+  dispatchRuns.atomicJson(paths.record, {
+    run_id: runId, node_id: "task-x", harness: "claude-code", launch_mode: "supervised-jsonl", state: "done", terminal_state: "resolved", terminal_enforced: true,
+    created_at: "2026-09-02T10:00:00.000Z", finished_at: "2026-09-02T10:05:00.000Z",
+    gate_state: "passed", gate_head: "abc123", gate_attestation: null, gate_attestation_missing: true, gate_attestation_error: "could not be recorded on the graph",
+    gate_proposal_attestation: "art-attest-x-1", gate_proposal_attestation_stale: true, gate_proposal_attestation_error: "gh pr edit exited 1",
+  });
+  const shown = cli(["runs", runId], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.strictEqual(shown.status, 0, shown.stderr);
+  assert.match(shown.stdout, /attested: {3}MISSING — could not be recorded on the graph/);
+  assert.match(shown.stdout, /proposal: {3}PR body carries a STALE attestation \(graph copy art-attest-x-1\) — gh pr edit exited 1/);
+
+  const { deps, control } = loopHarness({
+    queue: [{ id: "task-a" }],
+    gate: () => ({ state: "passed", reason: "2 gate(s) passed", gate_head: "abc123", attestation: null, attestation_missing: true, attestation_error: "could not be built: boom", proposal_attestation_stale: true, proposal_attestation_error: "gh pr edit exited 1" }),
+  });
+  deps.markGate = () => null;
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", intervalMs: 1000, retryAfterMs: 600000, max: 1 }, deps, control });
+  const entry = status.recent[0];
+  assert.strictEqual(entry.gate, "passed");
+  assert.strictEqual(entry.attestation_missing, true);
+  assert.strictEqual(entry.attestation_error, "could not be built: boom");
+  assert.strictEqual(entry.proposal_attestation_stale, true);
+  assert.strictEqual(entry.proposal_attestation_error, "gh pr edit exited 1");
+  // ...and for a superseded pipeline, the RECORD's own stamps are what is published.
+  const sup = loopHarness({
+    queue: [{ id: "task-b" }],
+    gate: () => ({ state: "passed", superseded: true, settled: { state: "passed", head: "def", attestation: null, attestation_missing: true, attestation_error: "could not be recorded on the graph", worker: "w-other", at: "t" } }),
+  });
+  sup.deps.markGate = () => null;
+  const status2 = await workLoop.runWorkLoop({ opts: { workerId: "w", intervalMs: 1000, retryAfterMs: 600000, max: 1 }, deps: sup.deps, control: sup.control });
+  assert.strictEqual(status2.recent[0].attestation_missing, true);
+  assert.strictEqual(status2.recent[0].attestation_error, "could not be recorded on the graph");
+});

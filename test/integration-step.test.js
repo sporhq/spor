@@ -263,7 +263,7 @@ test("propose mode hands the PR opener the chain it needs for the attestation â€
   assert.strictEqual(seenChain.head, "headsha");
   assert.strictEqual(seenChain.gatedHead, "headsha");
   assert.strictEqual(seenChain.targetSha, "expected1");
-  assert.deepStrictEqual(seenChain.candidate, { base: "expected1", sha: "candidatesha", suite: "passed", command: "npm test" });
+  assert.deepStrictEqual(seenChain.candidate, { base: "expected1", sha: "candidatesha", suite: "passed", command: "npm test", trusted_sha: null });
   assert.deepStrictEqual(res.proposal, { number: 42, url: "https://github.com/demo/repo/pull/42", repo: "demo/repo", branch: "task-demo" });
 });
 
@@ -2106,7 +2106,7 @@ test("the settled integration result carries the candidate evidence in propose A
   });
   const parked = await integrationRunner.runIntegrationStage({ item: ITEM, factory: propose, deps, gatedHead: "headsha" });
   assert.strictEqual(parked.state, "parked");
-  assert.deepStrictEqual(parked.candidate, { base: "expected1", sha: "candidatesha", suite: "passed", command: "npm test" });
+  assert.deepStrictEqual(parked.candidate, { base: "expected1", sha: "candidatesha", suite: "passed", command: "npm test", trusted_sha: null });
   assert.strictEqual(parked.target_sha, "expected1");
   const attestation = require("../lib/shell/attestation.js");
   const gate = { state: "passed", gates: [{ gate: "acceptance", kind: "command", verdict: "passed", head: "headsha" }], facts: [], head: "headsha", definition: propose.definition };
@@ -2117,7 +2117,7 @@ test("the settled integration result carries the candidate evidence in propose A
   const { deps: landDeps } = integrationFakes({});
   const landed = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps: landDeps, gatedHead: "headsha" });
   assert.strictEqual(landed.state, "passed");
-  assert.deepStrictEqual(landed.candidate, { base: "expected1", sha: "candidatesha", suite: "passed", command: "npm test" });
+  assert.deepStrictEqual(landed.candidate, { base: "expected1", sha: "candidatesha", suite: "passed", command: "npm test", trusted_sha: null });
 
   // A candidate suite that FAILED is recorded as such on the settled result.
   const { deps: badDeps } = integrationFakes({ suite: () => ({ ok: false, reason: "npm test exited 1", output: "1 failing" }) });

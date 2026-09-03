@@ -36,11 +36,14 @@ const FACTORY = factoryOf({
 const ITEM = { node_id: "task-demo", run_id: "run-abcdef12", project: "demo", attempt: 0 };
 const HEAD = "headsha0000000000000000000000000000000001";
 
-function gateResult(overrides = {}) {
+// `at` is the epoch the steps ran at — `issued_at` is DERIVED from the last
+// step's finish (never minted from a clock), so a test that checks freshness
+// against a `now` places the steps near it.
+function gateResult(overrides = {}, at = 1_700_000_000_000) {
   const steps = FACTORY.gates.map((g, i) => ({
     gate: g.id, kind: g.kind, verdict: "passed", detail: "ok", fact: `art-gate-${g.id}-demo-runabcde-0000000${i}`, escalated_to: null,
     source: "inline", digest: FACTORY.definition.gates[i].digest, revision: "f00d", head: HEAD, base: "basesha", cycles: 1,
-    started_at: new Date(1_700_000_000_000 + i * 1000).toISOString(), finished_at: new Date(1_700_000_000_000 + i * 1000 + 500).toISOString(), duration_ms: 500,
+    started_at: new Date(at + i * 1000).toISOString(), finished_at: new Date(at + i * 1000 + 500).toISOString(), duration_ms: 500,
   }));
   return {
     state: "passed", reason: "2 gate(s) passed", gates: steps, facts: steps.map((s) => s.fact),
@@ -82,8 +85,12 @@ test("a passing run with no integration attests: subject commit = gated head, al
   assert.deepStrictEqual(att.configIntegrity.gates.map((g) => g.id), ["acceptance", "review"]);
   assert.deepStrictEqual(att.configIntegrity.protected_paths, ["test/**"]);
   assert.strictEqual(att.timing.started_at, new Date(1_700_000_000_000).toISOString(), "the earliest step start");
-  assert.strictEqual(att.timing.finished_at, new Date(1_700_000_010_000).toISOString());
-  assert.strictEqual(att.timing.duration_ms, 10_000);
+  // Derived from the judgement, not the clock: the last step finished at
+  // +1500ms, and `now` (10s later) is only the fallback for a result that
+  // carries no timestamps (cross-model review, major finding 7).
+  assert.strictEqual(att.timing.finished_at, new Date(1_700_000_001_500).toISOString());
+  assert.strictEqual(att.issued_at, new Date(1_700_000_001_500).toISOString());
+  assert.strictEqual(att.timing.duration_ms, 1_500);
   assert.strictEqual(att.environment.spor_version, "0.0.0-test");
   assert.strictEqual(att.environment.host, "box");
   // A validator recomputes the digest from the factory node with the kernel's
@@ -297,12 +304,13 @@ test("every attestation carries a digest over its bound core that survives the n
 test("verifyAttestation fails closed: a tampered body, a wrong key, a missing signature under a key, a graph copy that disagrees, a stale or foreign commit", () => {
   const issued = Date.parse("2026-09-02T12:00:00.000Z");
   const now = () => issued + 60_000;
-  const att = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), signing: { key: "k", keyId: "ci" }, now: () => issued });
+  const att = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult({}, issued - 1500), signing: { key: "k", keyId: "ci" }, now: () => issued });
+  assert.strictEqual(att.issued_at, new Date(issued).toISOString(), "issued when the last step finished");
   const signed = att;
   const trusted = JSON.parse(JSON.stringify(att));
   const ok = attestation.verifyAttestation(att, { key: "k", trusted, commit: HEAD, maxAgeMs: 3_600_000, factoryDigest: FACTORY.definition.factory.digest, now });
   assert.strictEqual(ok.ok, true, ok.reason);
-  assert.deepStrictEqual(ok.checks.map((c) => c.check), ["schema", "digest", "signature", "trusted", "passed", "commit", "fresh", "config"]);
+  assert.deepStrictEqual(ok.checks.map((c) => c.check), ["schema", "digest", "signature", "trusted", "passed", "verdicts", "commit", "fresh", "config"]);
 
   // Tampered: a PR author flips `passed` in the body. The digest no longer
   // matches, the signature no longer matches, and the graph copy disagrees.
@@ -311,18 +319,20 @@ test("verifyAttestation fails closed: a tampered body, a wrong key, a missing si
   forged.subject.commit = "attackerhead000000000000000000000000000000";
   const bad = attestation.verifyAttestation(forged, { key: "k", trusted, commit: "attackerhead000000000000000000000000000000", now });
   assert.strictEqual(bad.ok, false);
-  assert.deepStrictEqual(bad.checks.filter((c) => !c.ok).map((c) => c.check), ["digest", "signature"]);
+  // ...and the evidence check sees the steps judged a head that is not the
+  // forged subject commit, independently of the binding.
+  assert.deepStrictEqual(bad.checks.filter((c) => !c.ok).map((c) => c.check), ["digest", "signature", "verdicts"]);
   // ...and re-binding it (recomputing the digest) still cannot make it the graph's copy or sign it.
   const rebound = attestation.bindAttestation(JSON.parse(JSON.stringify(forged)));
   const bad2 = attestation.verifyAttestation(rebound, { key: "k", trusted, now });
-  assert.deepStrictEqual(bad2.checks.filter((c) => !c.ok).map((c) => c.check), ["signature", "trusted"]);
+  assert.deepStrictEqual(bad2.checks.filter((c) => !c.ok).map((c) => c.check), ["signature", "trusted", "verdicts"]);
   assert.match(bad2.reason, /unsigned|does not verify/);
   assert.match(bad2.reason, /carries digest/);
 
   // Wrong key, wrong key id, signature required but absent.
   assert.strictEqual(attestation.verifyAttestation(att, { key: "not-k", now }).checks.find((c) => c.check === "signature").ok, false);
   assert.match(attestation.verifyAttestation(att, { key: "k", keyId: "other", now }).reason, /signed with key 'ci', not 'other'/);
-  const unsigned = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), now: () => issued });
+  const unsigned = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult({}, issued - 1500), now: () => issued });
   assert.match(attestation.verifyAttestation(unsigned, { key: "k", now }).reason, /is unsigned/);
   assert.match(attestation.verifyAttestation(unsigned, { requireSignature: true, now }).reason, /signature is required/);
   // No key and no graph copy: the digest alone is self-authored, so this is
@@ -342,7 +352,7 @@ test("verifyAttestation fails closed: a tampered body, a wrong key, a missing si
   assert.match(attestation.verifyAttestation(att, { maxAgeMs: 1000, now: () => issued - 5000 }).reason, /in the future/);
   assert.match(attestation.verifyAttestation(att, { factoryDigest: "sha256:ffff", now }).reason, /factory digest is sha256:.*expected sha256:ffff/);
   // A failed attestation never verifies, whatever else is right.
-  const failed = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult({ state: "failed" }), now: () => issued });
+  const failed = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult({ state: "failed" }, issued - 1500), now: () => issued });
   assert.match(attestation.verifyAttestation(failed, { now }).reason, /passed is false/);
   // Wrong schema, no object.
   assert.match(attestation.verifyAttestation({ ...att, schema: "other/9" }, { now }).reason, /schema 'other\/9'/);
@@ -424,13 +434,13 @@ test("attestation.signingKey is stripped from a repo .spor.json but resolves fro
 test("the bound core covers the integration candidate evidence and proposal identity — editing any of it fails the digest", () => {
   const integration = {
     state: "parked", mode: "propose", strategy: "merge", target_ref: "main", target_sha: "targetsha", head: HEAD, gated_head: HEAD, head_matches_gated: true,
-    candidate: { base: "targetsha", sha: "candsha", suite: "passed", command: "npm test" },
+    candidate: { base: "targetsha", sha: "candsha", suite: "passed", command: "npm test", trusted_sha: "trustsha" },
     proposal: { number: 42, url: "https://github.com/demo/repo/pull/42", repo: "demo/repo", branch: "task-demo" },
   };
   const att = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), integration, signing: { key: "k", keyId: "ci" } });
   assert.strictEqual(attestation.verifyAttestation(att, { key: "k" }).ok, true);
   const core = attestation.attestationCore(att);
-  assert.deepStrictEqual(core.integration.candidate, { base: "targetsha", sha: "candsha", suite: "passed", command: "npm test" });
+  assert.deepStrictEqual(core.integration.candidate, { base: "targetsha", sha: "candsha", suite: "passed", command: "npm test", trusted_sha: "trustsha" });
   assert.deepStrictEqual(core.integration.proposal, { number: 42, repo: "demo/repo", branch: "task-demo", url: "https://github.com/demo/repo/pull/42" });
   assert.strictEqual(core.integration.target_sha, "targetsha");
   assert.strictEqual(core.integration.strategy, "merge");
@@ -444,6 +454,7 @@ test("the bound core covers the integration candidate evidence and proposal iden
     ["candidate command", (c) => { c.integration.candidate.command = "true"; }],
     ["candidate base", (c) => { c.integration.candidate.base = "othersha"; }],
     ["candidate sha", (c) => { c.integration.candidate.sha = "othersha"; }],
+    ["candidate trusted sha", (c) => { c.integration.candidate.trusted_sha = "othersha"; }],
     ["candidate block removed", (c) => { c.integration.candidate = null; }],
     ["target sha", (c) => { c.integration.target_sha = "othersha"; }],
     ["proposal number", (c) => { c.integration.proposal.number = 43; }],
@@ -469,4 +480,122 @@ test("the bound core covers the integration candidate evidence and proposal iden
   assert.deepStrictEqual(thinned.integration.candidate, integration.candidate);
   assert.strictEqual(thinned.integration.proposal.number, 42);
   assert.strictEqual(attestation.attestationDigest(thinned), node.attestation.digest, "the thinned graph copy reproduces the bound digest");
+});
+
+// -- cross-model review (second round), major finding 7: `issued_at` was
+// minted from the clock inside the bound core, so rebuilding the SAME run's
+// attestation (a resumed pipeline, a retried write) produced a different
+// digest under the same stable id — and the `if_exists: skip` read-back
+// comparison refused it as a foreign node. It is now derived from the
+// judgement's own timestamps.
+test("rebuilding an attestation from the same results reproduces the same bytes — issued_at is derived, not minted", () => {
+  const a = attestation.buildAttestationNode({ item: ITEM, factory: FACTORY, gate: gateResult(), environment: { spor_version: "0.0.0-test", mode: "local" }, now: () => 1_700_000_050_000, signing: { key: "k" } });
+  const b = attestation.buildAttestationNode({ item: ITEM, factory: FACTORY, gate: gateResult(), environment: { spor_version: "0.0.0-test", mode: "local" }, now: () => 1_700_009_999_000, signing: { key: "k" } });
+  assert.strictEqual(a.id, b.id);
+  assert.strictEqual(a.attestation.issued_at, b.attestation.issued_at);
+  assert.strictEqual(a.attestation.digest, b.attestation.digest);
+  assert.strictEqual(a.attestation.signature.value, b.attestation.signature.value);
+  assert.strictEqual(a.markdown, b.markdown, "byte-identical, so the idempotent node write matches its earlier copy");
+  // The integration stage's finish, when later than the last gate, is the issue time.
+  const withStage = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), integration: { state: "passed", head: HEAD, gated_head: HEAD, finished_at: new Date(1_700_000_020_000).toISOString() }, now: () => 1_700_000_090_000 });
+  assert.strictEqual(withStage.issued_at, new Date(1_700_000_020_000).toISOString());
+  // A result with no timestamps at all still gets a time — the clock is the fallback only.
+  const bare = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: { state: "passed", gates: [{ gate: "g", kind: "command", verdict: "passed", head: HEAD }], facts: [], head: HEAD, definition: FACTORY.definition }, now: () => 1_700_000_090_000 });
+  assert.strictEqual(bare.issued_at, new Date(1_700_000_090_000).toISOString());
+});
+
+// -- major finding 6: the PR body written as the PR is OPENED carried
+// `passed: false` — its stage state was `proposing`, which the builder did not
+// recognise — and was only repaired by a later body edit, so a validator
+// triggered on creation failed for good. `proposing` is now an OK state,
+// provided the candidate suite passed and the head is the gated head.
+test("a propose-time attestation (state 'proposing', before the PR exists) is passed and verifiable by signature; a red candidate is not", () => {
+  const proposing = { mode: "propose", strategy: "merge", state: "proposing", target_ref: "main", target_sha: "targetsha", head: HEAD, gated_head: HEAD, candidate: { base: "targetsha", sha: "candsha", suite: "passed", command: "npm test", trusted_sha: "trustsha" } };
+  const att = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), integration: proposing, signing: { key: "k", keyId: "ci" } });
+  assert.strictEqual(att.passed, true);
+  assert.strictEqual(att.integration.state, "proposing");
+  assert.strictEqual(att.integration.proposal, null, "the proposal's identity does not exist yet");
+  const v = attestation.verifyAttestation(att, { key: "k", commit: HEAD, target: "targetsha", targetRef: "main" });
+  assert.strictEqual(v.ok, true, v.reason);
+  const body = attestation.renderPrBody({ attestation: att, branch: "task-demo", base: "main" });
+  assert.match(body, /validate it by signature/, "the body says how a creation-triggered validator can check this copy");
+  assert.strictEqual(attestation.extractPrAttestation(body).passed, true);
+  // A candidate suite that failed: the stage is not one to vouch for, whatever its state says.
+  const red = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), integration: { ...proposing, candidate: { ...proposing.candidate, suite: "failed" } } });
+  assert.strictEqual(red.passed, false);
+  const parkedRed = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), integration: { ...proposing, state: "parked", candidate: { ...proposing.candidate, suite: "failed" } } });
+  assert.strictEqual(parkedRed.passed, false, "parked over a red candidate is not passed either");
+});
+
+// -- blocking finding 2: verification checked only the top-level `passed`.
+// A bound copy — genuinely signed, genuinely on the graph — whose evidence
+// says otherwise must be refused on the evidence, not trusted on the flag.
+test("verifyAttestation refuses a bound attestation whose evidence contradicts `passed`", () => {
+  const good = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), integration: { mode: "local", state: "passed", target_ref: "main", target_sha: "targetsha", head: HEAD, gated_head: HEAD, landed_sha: "landed", candidate: { base: "targetsha", sha: "candsha", suite: "passed", command: "npm test" } }, signing: { key: "k" } });
+  assert.strictEqual(attestation.verifyAttestation(good, { key: "k" }).ok, true);
+  assert.deepStrictEqual(attestation.evidenceFailures(good), []);
+  // Each mutation is RE-BOUND and RE-SIGNED (what a runner with a bug, or an
+  // attacker holding the key, would produce) and handed over as its own
+  // trusted copy — so only the evidence check can catch it.
+  const bound = (mutate) => {
+    const copy = JSON.parse(JSON.stringify(good));
+    mutate(copy);
+    copy.passed = true;
+    attestation.bindAttestation(copy, { key: "k" });
+    return attestation.verifyAttestation(copy, { key: "k", trusted: JSON.parse(JSON.stringify(copy)) });
+  };
+  for (const [label, mutate, pattern] of [
+    ["gate.allPassed false", (c) => { c.gate.allPassed = false; }, /gate\.allPassed is false/],
+    ["gate.state failed", (c) => { c.gate.state = "failed"; }, /gate\.state is "failed"/],
+    ["head not consistent", (c) => { c.gate.head_consistent = false; }, /head_consistent is false/],
+    ["a step failed", (c) => { c.gate.steps[1].verdict = "failed"; c.gate.steps[1].passed = false; }, /gate 'review' verdict is "failed"/],
+    ["a step judged another head", (c) => { c.gate.steps[0].head = "otherhead"; }, /gate 'acceptance' judged otherhead/],
+    ["integration failed", (c) => { c.integration.state = "failed"; }, /integration\.state is "failed"/],
+    ["integration head mismatch", (c) => { c.integration.head_matches_gated = false; }, /head_matches_gated is false/],
+    ["integration head is another commit", (c) => { c.integration.head = "otherhead"; c.subject.commit = "otherhead"; c.integration.head_matches_gated = true; }, /integration\.head otherhead is not the gated head/],
+    ["candidate suite failed", (c) => { c.integration.candidate.suite = "failed"; }, /candidate suite is "failed"/],
+    ["unknown commit", (c) => { c.subject.commit = null; c.integration.head = null; }, /subject\.commit is unknown/],
+  ]) {
+    const v = bound(mutate);
+    assert.strictEqual(v.ok, false, `${label}: refused`);
+    const check = v.checks.find((c) => c.check === "verdicts");
+    assert.ok(check && !check.ok, `${label}: on the verdicts check`);
+    assert.match(check.detail, pattern, label);
+    assert.ok(v.checks.find((c) => c.check === "digest").ok && v.checks.find((c) => c.check === "signature").ok, `${label}: the binding itself was genuine`);
+  }
+  // A floor copy (steps elided, count kept) still passes on its booleans.
+  const floor = JSON.parse(JSON.stringify(good));
+  delete floor.gate.steps;
+  assert.strictEqual(attestation.verifyAttestation(floor, { key: "k" }).checks.find((c) => c.check === "verdicts").ok, true);
+  // ...but a copy that lists MORE steps than it counts, or lists nothing and counts nothing, does not.
+  const padded = JSON.parse(JSON.stringify(good));
+  padded.gate.steps.push({ ...padded.gate.steps[0], id: "extra" });
+  assert.match(attestation.verifyAttestation(padded, { key: "k" }).checks.find((c) => c.check === "verdicts").detail, /lists 3 step\(s\), steps_count says 2/);
+});
+
+// -- blocking finding 3: nothing bound the attestation to the target's tip.
+// After the base branch advances, merge(old tip, head) is not what would
+// land; and an attestation for one base must not validate against another.
+test("verifyAttestation binds the target: --target must equal the candidate's base tip, --target-ref the stage's ref", () => {
+  const integration = { mode: "propose", strategy: "merge", state: "parked", target_ref: "origin/main", target_sha: "tip-1", head: HEAD, gated_head: HEAD, candidate: { base: "tip-1", sha: "candsha", suite: "passed", command: "npm test" }, proposal: { number: 7, repo: "demo/repo", branch: "task-demo", url: "u" } };
+  const att = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), integration, signing: { key: "k" } });
+  assert.deepStrictEqual(attestation.attestedTarget(att), { sha: "tip-1", via: "integration.candidate.base" });
+  assert.strictEqual(attestation.verifyAttestation(att, { key: "k", target: "tip-1" }).ok, true);
+  const moved = attestation.verifyAttestation(att, { key: "k", target: "tip-2" });
+  assert.strictEqual(moved.ok, false);
+  assert.match(moved.reason, /target: integration\.candidate\.base is tip-1, expected tip-2 — the target has advanced/);
+  // The ref: a short name matches the full remote-tracking spelling; a different branch does not.
+  assert.strictEqual(attestation.verifyAttestation(att, { key: "k", targetRef: "main" }).ok, true);
+  assert.strictEqual(attestation.verifyAttestation(att, { key: "k", targetRef: "origin/main" }).ok, true);
+  assert.strictEqual(attestation.verifyAttestation(att, { key: "k", targetRef: "refs/heads/main" }).ok, false, "two full spellings must match exactly");
+  assert.match(attestation.verifyAttestation(att, { key: "k", targetRef: "release" }).reason, /target_ref: integration\.target_ref is origin\/main, expected release/);
+  // No candidate block: falls back to the stage's target_sha; no stage at all: the trusted ref's sha.
+  const noCand = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), integration: { ...integration, candidate: null }, signing: { key: "k" } });
+  assert.deepStrictEqual(attestation.attestedTarget(noCand), { sha: "tip-1", via: "integration.target_sha" });
+  const noStage = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), signing: { key: "k" } });
+  assert.deepStrictEqual(attestation.attestedTarget(noStage), { sha: "trustsha", via: "subject.trusted_sha" });
+  assert.strictEqual(attestation.verifyAttestation(noStage, { key: "k", target: "trustsha", targetRef: "main" }).ok, true);
+  // An attestation carrying no target tip cannot satisfy a target check.
+  const none = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult({ trusted_sha: null }), signing: { key: "k" } });
+  assert.match(attestation.verifyAttestation(none, { key: "k", target: "tip-1" }).reason, /binds no target tip/);
 });

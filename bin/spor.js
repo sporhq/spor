@@ -8362,6 +8362,14 @@ function cmdRuns(cfg, { values, positionals: pos }) {
     if (r.gate_state) out(`  gate:       ${r.gate_state}${r.gate_reason ? ` — ${r.gate_reason}` : ""}`);
     if (r.gate_head) out(`  gated head: ${r.gate_head}${r.gate_landed_sha ? ` (landed ${String(r.gate_landed_sha).slice(0, 12)})` : ""}`);
     if (r.gate_attestation) out(`  attested:   ${r.gate_attestation}`);
+    // A run that PROMISED an attestation and has none says so here, never
+    // only in the worker's log (cross-model review, minor finding 8) — the
+    // record's `gate_attestation_missing`/`_error` stamps are the evidence
+    // chain's own "no evidence" entry, and a parked proposal whose PR body
+    // could not be refreshed with the bound copy is a PR a validator will
+    // refuse against the graph artifact.
+    if (r.gate_attestation_missing) out(`  attested:   MISSING — ${r.gate_attestation_error || "the attestation was not recorded"}`);
+    if (r.gate_proposal_attestation_stale) out(`  proposal:   PR body carries a STALE attestation${r.gate_proposal_attestation ? ` (graph copy ${r.gate_proposal_attestation})` : ""}${r.gate_proposal_attestation_error ? ` — ${r.gate_proposal_attestation_error}` : ""}`);
     if (r.gate_fix_run_id) {
       out(`  fix cycle:  run ${String(r.gate_fix_run_id).slice(0, 8)} — 'spor runs ${r.gate_fix_run_id}' follows it${r.gate_state === "interrupted" ? " (left running by a stopped worker)" : ""}`);
     }
@@ -9563,6 +9571,11 @@ function cmdWorkStatus(cfg, { json }) {
       // The fail-soft half of a refusal: the verdict stands either way, but an
       // operator has to know the item is still reading DONE on the graph.
       if (r.demote_reason) out(`            not demoted on the graph: ${r.demote_reason}`);
+      // The evidence chain's own holes (cross-model review, minor finding 8):
+      // a verdict whose attestation was never recorded, or a parked PR whose
+      // body still carries the propose-time copy a validator will refuse.
+      if (r.attestation_missing) out(`            attestation MISSING: ${r.attestation_error || "not recorded"}`);
+      if (r.proposal_attestation_stale) out(`            PR body carries a STALE attestation${r.proposal_attestation_error ? `: ${r.proposal_attestation_error}` : ""}`);
     }
     // One pass can cool off a whole page of items (a queue of untriaged work
     // under the default accept policy, a sibling repo's items under a scoped
@@ -10776,7 +10789,15 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       return built;
     },
     forceProtected: ({ dir, sha }) => {
-      const forced = gateRunner.forceProtectedPaths({ top, dir, trustedRef: factory.trustedRef, protectedPaths: factory.protectedPaths });
+      // Pin the trusted ref to ONE commit before touching the tree, and force
+      // from that sha — never from the symbolic ref, which can advance between
+      // this restore and the attestation naming it (cross-model review, major
+      // finding 5). An unresolvable ref refuses the stage rather than forcing
+      // from whatever the ref means by the time checkout runs.
+      const pin = git(top, ["rev-parse", "--verify", `${factory.trustedRef}^{commit}`]);
+      const trustedSha = pin.status === 0 ? (pin.stdout || "").trim() : null;
+      if (!trustedSha) return { ok: false, reason: `the trusted ref '${factory.trustedRef}' does not resolve to a commit in ${top}, so the candidate's protected paths cannot be pinned to it` };
+      const forced = gateRunner.forceProtectedPaths({ top, dir, trustedRef: trustedSha, protectedPaths: factory.protectedPaths });
       if (!forced.ok) return forced;
       // The restore above only touches the candidate worktree's WORKING
       // DIRECTORY — `sha` still names the pre-restoration commit. Landing it
@@ -10784,7 +10805,8 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       // meant to strip (issue-spor-integration-landed-sha-pre-restoration), so
       // re-commit when the restore actually changed anything and land that
       // sha instead; a no-op restore returns `sha` unchanged.
-      return integrationRunner.reconcileCandidateSha({ dir, sha });
+      const reconciled = integrationRunner.reconcileCandidateSha({ dir, sha });
+      return reconciled && reconciled.ok ? { ...reconciled, trusted_sha: trustedSha } : reconciled;
     },
     runSuite: ({ dir, base, head }) =>
       gateRunner.runGateCommand({ id: "integration", command: integration.command, timeoutMs: integration.timeoutMs }, dir, {
@@ -10972,7 +10994,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
       attestation: null,
       superseded: true,
       not_run: true,
-      settled: rec ? { state: rec.gate_state || null, reason: rec.gate_reason || null, head: rec.gate_head || null, attestation: rec.gate_attestation || null, worker: rec.gate_worker || null, at: rec.gate_at || null } : null,
+      settled: rec ? settledGateSummary(rec) : null,
     };
   }
   const ownToken = claim.ok ? claim.token : null;
@@ -11034,7 +11056,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
       // What the record DOES hold — the winner's verdict — so the loop's status
       // surface publishes that, never this pipeline's losing head and verdict
       // (cross-model review, major finding 4).
-      settled: rec ? { state: rec.gate_state || null, reason: rec.gate_reason || null, head: rec.gate_head || null, attestation: rec.gate_attestation || null, worker: rec.gate_worker || null, at: rec.gate_at || null } : null,
+      settled: rec ? settledGateSummary(rec) : null,
     };
   }
   // ONE attestation per run (piece 4): the evidence chain over everything
@@ -11051,10 +11073,12 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // settles, above), so the PR is refreshed with the final, digest-bound copy
   // the graph holds — the copy a CI validate-attestation job compares against.
   if (attested.attestation && attestationObject && intResult && intResult.state === "parked" && intResult.proposal && intResult.proposal.number && ctx.factory.integration && ctx.factory.integration.mode === "propose") {
-    await refreshProposalAttestation(cfg, {
+    const refreshed = await refreshProposalAttestation(cfg, {
       item, factory: ctx.factory, intResult, attestationObject, home, log: ctx.log, settleToken: settled.token,
       cwd: (record && record.cwd) || null, editBody: ctx.editProposalBody || editProposalBody,
     });
+    attested.proposal_attestation_stale = !refreshed.ok;
+    if (!refreshed.ok) attested.proposal_attestation_error = String(refreshed.reason || "no response").slice(0, 300);
   }
   return { ...result, ...attested };
 }
@@ -11106,6 +11130,26 @@ function settleRunRecord(home, runId, res, workerId = null, { gateResult = null,
     /* fail-soft: the loop's own settle stamp is the second writer */
     return { landed: false, at, token, record: null };
   }
+}
+
+// What the run record holds of a settled pipeline, for the loop's `--status`
+// surface — INCLUDING the attestation's own failure stamps (a promised
+// attestation that is missing, a parked PR whose body is stale), so the
+// status a person reads never shows a clean verdict over an evidence chain
+// with a hole in it (cross-model review, minor finding 8).
+function settledGateSummary(rec) {
+  return {
+    state: rec.gate_state || null,
+    reason: rec.gate_reason || null,
+    head: rec.gate_head || null,
+    attestation: rec.gate_attestation || null,
+    attestation_missing: rec.gate_attestation_missing === true,
+    attestation_error: rec.gate_attestation_error || null,
+    proposal_attestation_stale: rec.gate_proposal_attestation_stale === true,
+    proposal_attestation_error: rec.gate_proposal_attestation_error || null,
+    worker: rec.gate_worker || null,
+    at: rec.gate_at || null,
+  };
 }
 
 // The HMAC key the pipeline signs each attestation with, from the config
@@ -11184,7 +11228,17 @@ function attestationEnvironment(cfg, workerId = null) {
 // record still holds THIS pipeline's verdict — never force, which would let a
 // pipeline that lost the settle race overwrite the winner's evidence.
 async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, log = () => {}, home = null, workerId = null, settleToken = null }) {
-  const out = { attestation: null, attestationObject: null };
+  // `attestation_missing`/`attestation_error` ride on the result the loop
+  // publishes (`--status`), the same fields the run record is stamped with —
+  // a missing attestation is part of the verdict's evidence, not a log line
+  // (cross-model review, minor finding 8).
+  const out = { attestation: null, attestationObject: null, attestation_missing: false, attestation_error: null };
+  const missing = (reason) => {
+    out.attestation_missing = true;
+    out.attestation_error = String(reason || "unknown").slice(0, 300);
+    stampAttestationMissing(cfg, { item, home, settleToken, reason });
+    return out;
+  };
   let built = null;
   try {
     built = attestation.buildAttestationNode({ item, factory, gate: gateResult, integration: intResult, environment: attestationEnvironment(cfg, workerId), signing: attestationSigning(cfg) });
@@ -11192,8 +11246,7 @@ async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, 
   } catch (e) {
     const reason = `could not be built: ${(e && e.message) || e}`;
     log(`work: the attestation for ${item.node_id} ${reason} — the verdict still stands, and the record says the attestation is MISSING`);
-    stampAttestationMissing(cfg, { item, home, settleToken, reason });
-    return out;
+    return missing(reason);
   }
   try {
     const wrote = await writeGateNode(cfg, built.id, built.markdown);
@@ -11202,10 +11255,7 @@ async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, 
   } catch (e) {
     log(`work: the attestation for ${item.node_id} could not be recorded on the graph (${(e && e.message) || e}) — the verdict still stands`);
   }
-  if (!out.attestation) {
-    stampAttestationMissing(cfg, { item, home, settleToken, reason: "could not be recorded on the graph" });
-    return out;
-  }
+  if (!out.attestation) return missing("could not be recorded on the graph");
   try {
     const stamped = dispatchRuns.stampGateState(home || cfg.userConfigHome(), item.run_id, { gate_attestation: out.attestation }, settleToken ? { own: settleToken } : {});
     if (!stamped || stamped.gate_attestation !== out.attestation) log(`work: the run record for ${item.node_id} no longer holds this pipeline's verdict — attestation ${out.attestation} is on the graph but not stamped on the record`);
@@ -11239,7 +11289,7 @@ function stampAttestationMissing(cfg, { item, home, settleToken, reason }) {
 // fail-closed (lib/shell/attestation.js verifyAttestation); exit 1 on any
 // failure, so a CI job can gate on the exit code alone.
 async function cmdAttestation(cfg, args) {
-  const usage = "usage: spor attestation verify (--pr-body <file>|--file <file>|-) [--commit <sha>] [--max-age <ms|1h|24h>] [--factory-digest <sha256:…>|--factory <id>] [--key-id <id>] [--require-signature] [--no-graph] [--json]";
+  const usage = "usage: spor attestation verify (--pr-body <file>|--file <file>|-) [--commit <sha>] [--target <sha>] [--target-ref <ref>] [--max-age <ms|1h|24h>] [--factory-digest <sha256:…>|--factory <id>] [--key-id <id>] [--require-signature] [--no-graph] [--json]";
   if (args[0] !== "verify") {
     err(usage);
     return 1;
@@ -11287,6 +11337,8 @@ async function cmdAttestation(cfg, args) {
     return 1;
   }
   const commit = optVal(args, "commit");
+  const target = optVal(args, "target");
+  const targetRef = optVal(args, "target-ref");
   let factoryDigest = optVal(args, "factory-digest");
   const extra = [];
   // `--factory <id>`: recompute the digest from the factory AS IT STANDS on
@@ -11337,6 +11389,8 @@ async function cmdAttestation(cfg, args) {
     keyId,
     maxAgeMs,
     commit: commit || null,
+    target: target || null,
+    targetRef: targetRef || null,
     factoryDigest: factoryDigest || null,
     trusted,
     requireSignature: args.includes("--require-signature") || (noGraph && !!signing),
@@ -14280,7 +14334,7 @@ const COMMANDS = {
   },
   attestation: {
     group: "Dispatch (background agents)", parse: "raw",
-    args: "verify (--pr-body <file>|--file <file>|-) [--commit <sha>] [--max-age <dur>] [--factory <id>|--factory-digest <sha256:…>] [--key-id <id>] [--require-signature] [--no-graph] [--json]",
+    args: "verify (--pr-body <file>|--file <file>|-) [--commit <sha>] [--target <sha>] [--target-ref <ref>] [--max-age <dur>] [--factory <id>|--factory-digest <sha256:…>] [--key-id <id>] [--require-signature] [--no-graph] [--json]",
     summary: "validate a gate-pipeline attestation (PR body or JSON) against the graph, a key, a commit",
     help:
       "The validator's half of the factory gate pipeline's evidence chain\n" +
@@ -14298,9 +14352,17 @@ const COMMANDS = {
       "  signature  when this box holds the key (attestation.signingKey /\n" +
       "             SPOR_ATTESTATION_KEY), the HMAC-SHA256 signature must verify;\n" +
       "             --require-signature refuses an unsigned attestation outright\n" +
-      "  passed     `passed` is true (every gate at the subject commit; the stage's\n" +
-      "             head is the gated head)\n" +
+      "  passed     `passed` is true\n" +
+      "  verdicts   the evidence beneath it agrees: gate.allPassed, every listed step\n" +
+      "             passed AT the subject commit, the stage's head is the gated head,\n" +
+      "             and the candidate suite passed — a `passed` over failed evidence\n" +
+      "             is refused whatever bound it\n" +
       "  commit     --commit <sha>: `subject.commit` equals it (the PR head)\n" +
+      "  target     --target <sha>: the target tip the candidate was merged with\n" +
+      "             (integration.candidate.base) equals it — the PR base's CURRENT\n" +
+      "             tip, so an attestation goes stale when the target advances and\n" +
+      "             cannot be reused against another base; --target-ref <ref> checks\n" +
+      "             the stage's target_ref names that ref\n" +
       "  fresh      --max-age <dur>: `issued_at` is within it (ms, 30s, 24h, 7d)\n" +
       "  config     --factory <id> recomputes the factory's digest AS IT STANDS on the\n" +
       "             graph (same loader the worker uses) — or --factory-digest gives it\n" +
@@ -14308,7 +14370,7 @@ const COMMANDS = {
       "Every check is fail-closed; exit 1 on any failure, 0 only when all pass.\n" +
       "--json prints {ok, id, checks[], reason}.",
     examples: [
-      "gh pr view 42 --json body -q .body > pr.md && spor attestation verify --pr-body pr.md --commit $(git rev-parse HEAD) --max-age 24h --factory factory-spor",
+      "gh pr view 42 --json body -q .body > pr.md && spor attestation verify --pr-body pr.md --commit $(git rev-parse HEAD) --target $(git rev-parse origin/main) --target-ref main --max-age 24h --factory factory-spor",
       "spor attestation verify --file att.json --no-graph --require-signature",
     ],
     run: (cfg, args) => cmdAttestation(cfg, args),

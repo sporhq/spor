@@ -681,7 +681,17 @@ a secret stripped from repo `.spor.json`) is set; verification with neither a
 key nor the graph copy FAILS (`anchor`), so `spor attestation verify --no-graph`
 requires a verified signature and is refused on a box with no key — and the definition digests
 hash the runtime-effective definition only (gate `source` stripped, so inline
-== referenced). In `propose` mode the same attestation rides in the PR body
+== referenced). Verification also checks the EVIDENCE under `passed`
+(`verdicts`: allPassed, head-consistent, every listed step passed at the
+gated head, the stage's head is the gated head, the candidate suite passed)
+and binds the target (`--target <sha>` against the candidate's base tip,
+`--target-ref`). `issued_at` is derived from the last step's finish, never
+the clock (a rebuilt attestation is byte-identical); the propose-time PR body
+is a PASSING, signed attestation in state `proposing`; the gate/candidate
+suites run with the judge's credentials SCRUBBED (`scrubSecretEnv`:
+`SPOR_ATTESTATION_KEY`, graph tokens); protected paths are forced from the
+pinned `trusted_sha`, never the moving ref; and every whole-record run-record
+writer takes the record lock (`writeRecordCarryingGate`). In `propose` mode the same attestation rides in the PR body
 between `<!-- spor-attestation:begin/end -->` markers, refreshed with the final
 graph-bound copy after settlement (a failed `gh pr edit` is a failed proposal
 on reuse, and a stamped-stale record post-settle, never a silent success), so

@@ -1405,8 +1405,14 @@ same evidence chain (task-spor-factory-gate-attestation), in four pieces:
    `gate_at` only for a record settled without one; `force` stays
    `--regate`'s door alone), so the graph and the record can never describe
    two verdicts or two heads for one run.
-   Read back by `spor runs` ("gated head:", "attested:") and `spor work
-   --status` (whose `gate_head` is the GATED head, not the stage's). And every
+   Read back by `spor runs` ("gated head:", "attested:" — or "attested:
+   MISSING — <reason>" from `gate_attestation_missing`/`_error`, and
+   "proposal: PR body carries a STALE attestation" from
+   `gate_proposal_attestation_stale`) and `spor work --status` (whose
+   `gate_head` is the GATED head, not the stage's, and whose entries carry
+   `attestation_missing`/`attestation_error`/`proposal_attestation_stale`/
+   `proposal_attestation_error` for both a settled and a superseded
+   pipeline). And every
    gate-minted node — fact, escalation, approval, attestation — is written
    `if_exists: skip` in BOTH modes with the same rule: a skip means the id
    exists, not that this write landed, so the existing node is read back and
@@ -1445,9 +1451,21 @@ the validator (`verifyAttestation`, every check fail-closed, exit 1 on any
 failure): schema, digest recomputation, signature (a key on the box and no
 signature is a failure), the graph binding (fetches `art-attest-*` by id;
 missing/unreadable fails unless `--no-graph` is passed deliberately),
-`passed`, commit equality, freshness, and the factory digest AS IT STANDS
-(`--factory` loads it through the worker's own loader). The digest alone is
-never a pass: whoever edits the body recomputes it, so a verification with
+`passed`, **the evidence beneath it** (`verdicts`: `gate.allPassed`,
+`gate.state`, `gate.head_consistent`, every listed step passed AT the gated
+head — the list's length agreeing with `steps_count` — and, where a stage ran,
+a state the attestation may vouch for, `head_matches_gated`, the stage head
+equal to the gated head, and the candidate suite `passed`; a copy whose flag
+says passed over explicitly failed evidence is refused whatever bound it),
+commit equality, **the target binding** (`--target <sha>`: the tip the
+candidate was merged with — `integration.candidate.base`, else the stage's
+`target_sha`, else for a stage-less run `subject.trusted_sha` — must equal
+it, so an attestation over merge(old tip, head) goes stale when the base
+advances and one made for another base is not reusable against this one;
+`--target-ref <ref>`: the stage's `target_ref` names it, a short name
+matching the remote-tracking spelling), freshness, and the factory digest AS
+IT STANDS (`--factory` loads it through the worker's own loader). The digest
+alone is never a pass: whoever edits the body recomputes it, so a verification with
 NEITHER anchor — no key on the box and no graph copy — fails (`anchor`), and
 `--no-graph`, which drops the artifact, therefore REQUIRES a verified
 signature: it implies `--require-signature`, and on a box with no key
@@ -1459,6 +1477,43 @@ could not say where to) leaves the judged commit UNKNOWN — the fact says so
 and the chain carries no head — never the pre-fix head standing in as what
 was judged.
 
+`issued_at` is DERIVED from the judgement — the moment the last gate step (or
+the integration stage) finished — never minted from the clock: the id is
+stable per run and the node is written `if_exists: skip` with a read-back
+comparison, so an attestation rebuilt from the same results (a retried write,
+a resumed pipeline) must reproduce the same bytes rather than collide with
+its own earlier copy. The clock is the fallback only for a result carrying no
+timestamps.
+
+**The judged code never sees the judge's credentials.** A command gate's
+suite and the integration candidate's suite are the judged repository's own
+code running on the judge's box, so `runGateCommand` scrubs the attestation
+signing key and every graph credential (`SPOR_ATTESTATION_KEY`,
+`SPOR_TOKEN`/`SUBSTRATE_TOKEN`, refresh/admin tokens — `scrubSecretEnv`, one
+list) from the inherited environment AND from the tree's declared setup env
+before spawning; otherwise a branch could sign its own forged attestation or
+write the `art-attest-*` anchor as the runner. Unrelated keys the suite needs
+are left alone.
+
+**The trusted tree is pinned once.** `gateChangeSet` resolves
+`trusted_sha` and REFUSES when the ref does not resolve; `prepareGateTree`
+and the integration candidate's protected-path restore then force from that
+sha, never from the symbolic ref — so a ref that advances between the read
+and the restore cannot put a different suite in the tree than the fact
+names. The candidate block carries the sha it was forced from
+(`candidate.trusted_sha`, inside the bound core).
+
+**Every whole-record writer takes the record lock.** The settle is a locked
+compare-and-swap, but the two in-process writers that rewrite the WHOLE run
+record from memory (`updateRun`, the supervisor's `update`) carried the
+on-disk `gate_*` fields OUTSIDE that lock — a settle landing between their
+read and their rename was renamed over, erasing a verdict and attestation the
+settler's read-back had verified. They, `closeRun` and `mergeTerminalOutcome`
+now do their read-carry-write under the same per-record lock
+(`writeRecordCarryingGate`); a lock that cannot be taken in the bounded wait
+still writes (a terminal outcome must land), so the residual window is the
+lock's own failure, not the ordinary path.
+
 **In `propose` mode the PR body carries the attestation.** `proposeIntegrationPR`
 writes `renderPrBody`'s text — the step list, the candidate suite that just
 passed on merge(target, head), the artifact id and digest it is bound to, the
@@ -1466,7 +1521,13 @@ rule that the text alone is not evidence, and the JSON between
 `<!-- spor-attestation:begin -->`/`<!-- spor-attestation:end -->` markers
 (`extractPrAttestation` is the reader). It is built at PROPOSE time, bound to
 the head being proposed, with `integration.state: "proposing"` and
-`integration.candidate` {base, sha, suite, command}; a reused PR gets its body
+`integration.candidate` {base, sha, suite, command, trusted_sha} — and it is
+a PASSING attestation as it stands (`proposing` is a state the builder vouches
+for when every gate passed at that head and the candidate suite is green; the
+proposal's identity is the one thing it cannot yet carry), signed when a key
+is held, so a validator triggered on PR creation checks it by SIGNATURE and
+passes rather than failing for good on a body the runner only repairs later;
+the body says so. A reused PR gets its body
 refreshed (`gh pr edit`), and that refresh is NOT best-effort — a PR
 re-proposed at a new head but still describing the old head's verdicts is
 stale evidence under a "success", so a failed edit is a failed proposal (fix
@@ -1479,7 +1540,10 @@ record (`gate_proposal_attestation_stale`, `gate_proposal_attestation_error`,
 through the settler's own door) — never reported as success; a validator
 comparing the stale body to the artifact refuses on the digest mismatch anyway.
 A repo's CI can then run `spor attestation verify --pr-body … --commit <PR
-head> --max-age 24h --factory <id>` — instead of re-running the suite. Making
+head> --target <base tip> --target-ref <base> --max-age 24h --factory <id>` —
+instead of re-running the suite (a validator comparing against the graph
+artifact runs on the post-settle body edit, or re-runs; the creation-time
+body verifies by signature). Making
 any particular repo's CI do so is that repo's work, not the runner's; this is
 what makes `propose` mode worth adopting for a PR-policy team.
 
