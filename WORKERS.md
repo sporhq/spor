@@ -897,8 +897,10 @@ verdict shape:
 The runner then parses that block **in code** from the run's final report
 (`parseReviewVerdict`, lib/kernel/gates.js). Fail-closed throughout: a review
 that could not be dispatched, that never finished, that left no report to read
-(an agent-review gate must therefore route to a SUPERVISED harness — a
-native-background launch has no report channel), or whose verdict is
+(an agent-review gate therefore needs a SUPERVISED harness — every built-in
+is one by default, and a worker's own dispatches are always supervised, so a
+missing report is a run-time failure rather than a load-time refusal), or whose
+verdict is
 unparseable or unrecognized is a gate FAILURE. An unread review is not an
 approval. Nor is a review of nothing: a branch that carries **no committed
 change against the trusted ref** (the implementer landed its work on the
@@ -1528,9 +1530,9 @@ per-gate block — declared beside `gates` and `integration`:
 
 - **`profile`** (required) — the profile the rescue dispatches under; a strong
   model by intent. Profile-routed ONLY, like an agent-review gate: the graph
-  names the lane and the machine's own binding decides what runs. The same
-  load-time precheck refuses a profile whose harness launches native-background,
-  because the diagnosis is read off the run's final report.
+  names the lane and the machine's own binding decides what runs. The
+  diagnosis is read off the run's final report, which a worker's dispatches
+  always have (they run supervised regardless of `dispatch.claudeLaunchMode`).
 - **`attempts`** (default 1, at most 3) — rescue attempts per pipeline. A second
   attempt is handed the first's diagnosis and asked why it did not land.
 - **`await_ms`** (default 1h) — how long the runner follows the rescue run.

@@ -34,15 +34,11 @@ function localEnv(extra = {}) {
   env.XDG_CONFIG_HOME = ISO;
   env.SPOR_FAKE_AGENTS_JSON = "[]";
   env.SPOR_DISTILLING = "1";
-  // These tests pin the LAUNCHER — cwd, worktree, $PWD, argv, claim ordering,
-  // session capture through `claude agents --json` — against the native
-  // `claude --bg` launch they were written for, now the explicit opt-in
-  // (`--bg` / dispatch.claudeLaunchMode, task-spor-claude-adapter-headless-
-  // supervised). The supervised default (`claude -p --output-format
-  // stream-json` under the shared supervisor) is covered in
-  // test/claude-supervised-dispatch.test.js; every guard exercised here runs
-  // before the launch branch forks, so it is shared by both.
-  env.SPOR_DISPATCH_CLAUDE_LAUNCH_MODE = "native-background";
+  // The launcher tests here run against the SUPERVISED default (`claude -p
+  // --output-format stream-json` under the shared supervisor,
+  // task-spor-claude-adapter-headless-supervised); the few whose subject is the
+  // native `claude --bg` opt-in (its `claude agents --json` session capture)
+  // merge NATIVE_BG into their env (see below).
   return Object.assign(env, extra);
 }
 function remoteEnv(home, server, extra = {}) {
@@ -51,6 +47,27 @@ function remoteEnv(home, server, extra = {}) {
 }
 function run(args, env, cwd) {
   return spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", env: localEnv(env), cwd });
+}
+
+// The launch-mode pin for the handful of tests whose SUBJECT is the native
+// `claude --bg` launch (its argv, its $PWD pin, its exit-code/lease coupling,
+// its `claude agents --json` session capture): merge into a test's env. Every
+// other launcher test here runs against the SUPERVISED default
+// (`claude -p --output-format stream-json` under the shared supervisor,
+// task-spor-claude-adapter-headless-supervised), whose harness child is a
+// DETACHED grandchild — so a launch is observed by waiting for the stub's
+// marker file rather than reading it the instant the CLI returns.
+const NATIVE_BG = { SPOR_DISPATCH_CLAUDE_LAUNCH_MODE: "native-background" };
+async function waitForFile(file, { timeoutMs = 10000, intervalMs = 25 } = {}) {
+  const end = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      return fs.readFileSync(file, "utf8");
+    } catch {
+      if (Date.now() >= end) return null;
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
 }
 function runAsync(args, env, cwd) {
   return new Promise((resolve) => {
@@ -784,8 +801,8 @@ test("dispatch (remote, real) --allow-person-token: no agent configured => fails
       remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub })
     );
     assert.strictEqual(r.status, 0, r.stderr);
-    const argv = fs.readFileSync(outFile, "utf8").split("\n").slice(1);
-    assert.strictEqual(argv[0], "--bg", "dispatch still launches");
+    const argv = (await waitForFile(outFile)).split("\n").slice(1);
+    assert.strictEqual(argv[0], "-p", "dispatch still launches (supervised print mode)");
     assert.ok(!argv.includes("--mcp-config"), "no agent-scoping — person-scoped");
   } finally {
     srv.close();
@@ -803,7 +820,7 @@ test("dispatch (remote, real) dispatch.allowPersonToken config: no agent configu
   try {
     const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub }));
     assert.strictEqual(r.status, 0, r.stderr);
-    assert.ok(fs.existsSync(outFile), "launched person-scoped, via dispatch.allowPersonToken");
+    assert.ok(await waitForFile(outFile), "launched person-scoped, via dispatch.allowPersonToken");
   } finally {
     srv.close();
   }
@@ -812,13 +829,13 @@ test("dispatch (remote, real) dispatch.allowPersonToken config: no agent configu
 // Local mode has no CA to mint against in the first place — the hard-fail is
 // remote-only, and a local dispatch with no agent configured stays exactly as
 // it always has (byte-identical).
-test("dispatch (local, real): no agent identity concept at all — never hard-fails", () => {
+test("dispatch (local, real): no agent identity concept at all — never hard-fails", async () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-dlocal-"));
   const outFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-dlocalh-")), "argv.out");
   const stub = argvStub(path.dirname(outFile), outFile);
   const r = run(["dispatch", "some free text task here", "--dir", repo, "--no-brief"], { SPOR_CLAUDE_CMD: stub, SPOR_SESSION_ID: SID });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.ok(fs.existsSync(outFile), "local dispatch still launches with no agent configured");
+  assert.ok(await waitForFile(outFile), "local dispatch still launches with no agent configured");
 });
 
 test("dispatch (remote) --as: overrides dispatch.agent for one dispatch, marked (via --as)", async () => {
@@ -873,7 +890,7 @@ test("dispatch (remote, real): mints a session-DEFERRED token + 0600 mcp-config,
   const { srv, hits, base } = await dispatchStub({ mintStatus: 201 });
   try {
     // SPOR_SESSION_ID pins the captured session, short-circuiting `claude agents --json`.
-    const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub }));
+    const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], remoteEnv(home, base, { ...NATIVE_BG, SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub }));
     assert.strictEqual(r.status, 0, r.stderr);
     assert.match(r.stdout, /agent:  agent-anthony-laptop \(writes attributed/);
     assert.match(r.stdout, new RegExp(`session: ${SID} \\(bound`)); // late-bound to the real run
@@ -959,8 +976,8 @@ test("dispatch (remote, real) --allow-person-token: mint endpoint absent (404) =
     );
     assert.strictEqual(r.status, 0, r.stderr);
     assert.match(r.stderr, /can't mint agent-scoped session tokens yet.*--allow-person-token/);
-    const argv = fs.readFileSync(outFile, "utf8").split("\n").slice(1);
-    assert.ok(!argv.includes("--session-id"), "--session-id is never passed (claude --bg ignores it)");
+    const argv = (await waitForFile(outFile)).split("\n").slice(1);
+    assert.ok(!argv.includes("--session-id"), "--session-id is never passed — the session is read off the run's own stream");
     assert.ok(!argv.includes("--mcp-config"), "no mcp-config when mint is absent");
     assert.ok(!argv.includes("--strict-mcp-config"), "no strict flag when mint is absent");
     assert.ok(!fs.existsSync(path.join(home, "outbox", "dispatch")), "no mcp-config file written");
@@ -1003,8 +1020,8 @@ test("dispatch (remote, real) --allow-person-token: mint 403 (caller doesn't own
     );
     assert.strictEqual(r.status, 0, r.stderr);
     assert.match(r.stderr, /could not mint an agent token .* dispatching person-scoped \(--allow-person-token\)/);
-    const argv = fs.readFileSync(outFile, "utf8").split("\n").slice(1);
-    assert.ok(!argv.includes("--session-id"), "--session-id is never passed (claude --bg ignores it)");
+    const argv = (await waitForFile(outFile)).split("\n").slice(1);
+    assert.ok(!argv.includes("--session-id"), "--session-id is never passed — the session is read off the run's own stream");
     assert.ok(!argv.includes("--mcp-config"), "no agent-scoping on an owner-mismatch");
   } finally {
     srv.close();
@@ -1027,7 +1044,7 @@ test("dispatch (remote, real) dispatch.allowPersonToken config: mint failure fai
   try {
     const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub }));
     assert.strictEqual(r.status, 0, r.stderr);
-    assert.ok(fs.existsSync(outFile), "launched person-scoped, via dispatch.allowPersonToken");
+    assert.ok(await waitForFile(outFile), "launched person-scoped, via dispatch.allowPersonToken");
   } finally {
     srv.close();
   }
@@ -1080,8 +1097,8 @@ test("dispatch (remote, real) --allow-person-token: a prefix-less dispatch.agent
     assert.match(r.stderr, /configured dispatch\.agent 'anthony-shark-november' is not a valid agent id/);
     assert.match(r.stderr, /dispatching person-scoped \(--allow-person-token\)/);
     assert.ok(!hits.some((h) => /\/token$/.test(h.url)), "no /v1/agents/{id}/token round-trip — caught before the network");
-    const argv = fs.readFileSync(outFile, "utf8").split("\n").slice(1);
-    assert.strictEqual(argv[0], "--bg", "dispatch still launches");
+    const argv = (await waitForFile(outFile)).split("\n").slice(1);
+    assert.strictEqual(argv[0], "-p", "dispatch still launches (supervised print mode)");
     assert.ok(!argv.includes("--mcp-config"), "no agent-scoping on an invalid dispatch.agent");
     assert.ok(!argv.includes("--strict-mcp-config"), "no strict flag either");
   } finally {
@@ -1144,7 +1161,7 @@ test("dispatch (remote, real): captures the run session from `claude agents --js
   try {
     const r = await runAsync(
       ["dispatch", "dec-x", "--dir", repo, "--no-brief", "--force"],
-      remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: agents })
+      remoteEnv(home, base, { ...NATIVE_BG, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: agents })
     );
     assert.strictEqual(r.status, 0, r.stderr);
     // it reported binding the captured session
@@ -1191,7 +1208,7 @@ test("dispatch (remote, real): a STALE same-name agent from an EARLIER dispatch 
   try {
     const r = await runAsync(
       ["dispatch", "dec-x", "--dir", repo, "--no-brief", "--force"],
-      remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: agents })
+      remoteEnv(home, base, { ...NATIVE_BG, SPOR_CLAUDE_CMD: stub, SPOR_FAKE_AGENTS_JSON: agents })
     );
     assert.strictEqual(r.status, 0, r.stderr);
     // no session was captured — the honest miss, never the stale decoy
@@ -1254,7 +1271,7 @@ test("dispatch (remote, real): a SPOR_SESSION_ID that doesn't match the launched
     // never spawn a real "agents --json" process — but that same seam would
     // short-circuit THIS test's delayed stub, so drop it and let discovery
     // actually invoke delayedAgentsStub.
-    const env = remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub, SPOR_SESSION_ID: CALLER_PIN });
+    const env = remoteEnv(home, base, { ...NATIVE_BG, SPOR_CLAUDE_CMD: stub, SPOR_SESSION_ID: CALLER_PIN });
     delete env.SPOR_FAKE_AGENTS_JSON;
     const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], env);
     assert.strictEqual(r.status, 0, r.stderr);

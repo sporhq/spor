@@ -8861,7 +8861,9 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   // dispatchThroughLocked) passes `ctx.supervisedOnly` and ignores BOTH: the
   // loop needs the supervised arm's report channel and enforced outcome, and
   // a box-wide config knob must not silently turn every worker run into an
-  // unenforced, report-less one that the factory precheck can no longer see.
+  // unenforced, report-less one. The knob is not SILENTLY ignored, though:
+  // cmdWork says so once at worker start (task-spor-work-honor-claude-launch-
+  // mode-and-retire-native-precheck).
   const configuredLaunchMode = cfg.get("dispatch.claudeLaunchMode", null) || null;
   if (configuredLaunchMode && !["supervised", "native-background"].includes(configuredLaunchMode)) {
     err(`warning: dispatch.claudeLaunchMode '${configuredLaunchMode}' is not recognized (supervised | native-background) — ignoring it.`);
@@ -9906,55 +9908,17 @@ async function loadFactoryDefinition(cfg, id) {
   const resErrors = res.errors.filter(
     (e) => ![...explainedRefs].some((ref) => e.includes(`referenced gate '${ref}' could not be read from the graph`))
   );
-  // Satisfiability-style precheck (task-spor-agent-review-gate-satisfiability-
-  // precheck): an agent-review gate's structured verdict is read off the
-  // dispatched run's own final report (gateRunReportText below), and only a
-  // SUPERVISED harness writes one — a native-background launch (`claude --bg`
-  // with no profile override) has no report channel at all. Today that
-  // mismatch surfaces only once a worker actually claims the item, dispatches
-  // the review, and gets back no text to parse — after the item already reads
-  // demoted-and-escalated on the graph. Catch it here instead, the same moment
-  // every other factory-shape mistake is caught, so a misrouted gate refuses
-  // the worker at load time rather than at the claim's expense. Run-time stays
-  // the backstop (bin/spor.js gateRunReportText's own error) for whatever this
-  // precheck cannot see — a dangling profile, a machine-declared harness this
-  // box has no binding for.
-  if (res.factory) {
-    // The rescue lane's profile gets the same precheck (its diagnosis is
-    // read off the run's final report too — WORKERS.md §10.10).
-    const routed = [...res.factory.gates.filter((g) => g.kind === "agent-review"), ...(res.factory.rescue ? [{ id: "rescue", kind: "rescue", profile: res.factory.rescue.profile }] : [])];
-    for (const gate of routed) {
-      const pn = await resolveNode(cfg, gate.profile);
-      if (!pn || !pn.raw) continue; // an unreadable/missing profile is a dispatch-time refusal, not this precheck's job
-      // Read `.harness` the same way resolveDispatchProfile does — off
-      // whatever frontmatter is there, with NO `type: profile` gate. Neither
-      // resolveDispatchProfile nor spor dispatch's own harness resolution
-      // checks the node's type, so requiring one here would under-cover a
-      // mistyped gate.profile (a real node id, wrong type, or a profile
-      // authored without an explicit `type:` line) — exactly the authoring
-      // mistake this precheck exists to catch before a worker claims work on it.
-      const profile = parse(pn.raw, `${gate.profile}.md`);
-      // Mirrors resolveDispatchProfile's own default (dispatch --profile path):
-      // an unset harness runs claude-code. Since task-spor-claude-adapter-
-      // headless-supervised that is a supervised launch too, so no BUILT-IN
-      // trips this today; it stays as the guard for any adapter whose default
-      // launch mode is native-background.
-      const harness = (typeof profile.harness === "string" && profile.harness) || "claude-code";
-      const resolved = dispatchHarnesses.resolveHarness(harness, { cfg });
-      if (resolved.adapter && resolved.adapter.launchMode === "native-background") {
-        errors.push(
-          gate.kind === "rescue"
-            ? `rescue: the rescue lane routes to profile '${gate.profile}', whose harness '${harness}' launches` +
-              ` native-background and has no report channel — the rescue's diagnosis is read from the run's final` +
-              ` report, which only a SUPERVISED harness writes; route '${gate.profile}' to a supervised harness instead.`
-            : `gate '${gate.id}': agent-review gate routes to profile '${gate.profile}', whose harness '${harness}' launches` +
-              ` native-background and has no report channel — an agent-review gate's verdict is read from the run's final` +
-              ` report, which only a SUPERVISED harness writes; route '${gate.profile}' to a supervised harness (codex,` +
-              ` opencode, copilot, or a machine-declared one) instead.`
-        );
-      }
-    }
-  }
+  // There is deliberately NO launch-mode precheck on the agent-review / rescue
+  // profiles here any more (task-spor-work-honor-claude-launch-mode-and-
+  // retire-native-precheck). One used to refuse a profile whose harness
+  // launched native-background (`claude --bg`, no report channel to read a
+  // verdict off); since task-spor-claude-adapter-headless-supervised every
+  // built-in launches SUPERVISED by default, a declared harness is supervised
+  // by v1 scope, and a worker's dispatches pass `supervisedOnly` (so neither
+  // `--bg` nor dispatch.claudeLaunchMode can route them native), so nothing
+  // could ever trip it. What it guarded against is still fail-closed at run
+  // time: a review or rescue that leaves no report is a gate FAILURE
+  // (gateRunReportText's own error), never a pass.
   return { factory: errors.length ? null : res.factory, errors: [...new Set([...errors, ...resErrors])] };
 }
 
@@ -12105,6 +12069,20 @@ async function cmdWork(cfg, { values }) {
       err(`spor work: factory '${factoryId}' declares integration mode 'propose', but ${startupGh.reasons[0]}`);
       err("  every candidate under this factory will be skipped here (see 'spor work --status') until gh is available, or run this worker on a box that has it.");
     }
+  }
+  // A standing `dispatch.claudeLaunchMode: native-background` is honored by an
+  // interactive `spor dispatch` and IGNORED by every dispatch this loop makes
+  // (dispatchThroughLocked passes `supervisedOnly`: a worker's runs must be
+  // followable, judgeable and gateable, which only the supervised arm's report
+  // channel and enforced outcome give). Ignoring a knob the operator set is
+  // fine; ignoring it SILENTLY is not — say so once, here, where an operator
+  // reading the worker's log will see it (task-spor-work-honor-claude-launch-
+  // mode-and-retire-native-precheck). Same wording for --print and a real run.
+  const configuredLaunchMode = cfg.get("dispatch.claudeLaunchMode", null) || null;
+  if (configuredLaunchMode === "native-background") {
+    err("spor work: dispatch.claudeLaunchMode is 'native-background', which this worker ignores — every run it dispatches (implementers, agent-review gates, fix cycles, rescues) is launched SUPERVISED (claude -p under the supervisor) so it can be followed, judged and gated; the setting still applies to an interactive 'spor dispatch'.");
+  } else if (configuredLaunchMode && configuredLaunchMode !== "supervised") {
+    err(`spor work: dispatch.claudeLaunchMode '${configuredLaunchMode}' is not recognized (supervised | native-background) — ignoring it; this worker always launches supervised.`);
   }
   // The factory's repo scope (issue-spor-work-scope-union-factory-mismatch).
   // Two distinct jobs, and only the second is load-bearing:
