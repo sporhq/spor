@@ -8,7 +8,8 @@ require("./helpers/tmp-cleanup");
 const test = require("node:test");
 const assert = require("node:assert");
 
-const { workerContract } = require("../lib/shell/worker-contract.js");
+const workerContractLib = require("../lib/shell/worker-contract.js");
+const { workerContract } = workerContractLib;
 const gates = require("../lib/kernel/gates.js");
 
 function factoryOf(payload) {
@@ -29,6 +30,14 @@ test("a BARE worker's contract is the plain commit-then-resolve discipline, with
   assert.match(text, /`resolves`\n?\s*edge to `task-demo`/);
   assert.match(text, /leave the\nitem UNRESOLVED/);
   assert.match(text, /FINDINGS: none/);
+  // The one-turn notice (issue-spor-rescue-and-fix-sessions-end-turn-waiting-
+  // on-background-job): a headless implementer that backgrounds its suite and
+  // ends its turn "waiting" commits nothing — the contract says so plainly.
+  assert.match(text, /\nSession:\nThis is a ONE-TURN headless session: it ends with your final message, and nothing wakes it later/);
+  assert.match(text, /never\nbackground a test run, never spawn a watcher, and never end your turn waiting on anything/);
+  assert.match(text, /an uncommitted tree is a refusal/);
+  assert.match(text, /A long suite is\n   still a foreground command — run it, read its exit, THEN commit/, "step 3 repeats it where the suite is run");
+  assert.strictEqual(text, `${text.split("\nSession:\n")[0]}\nSession:\n${workerContractLib.ONE_TURN_NOTICE}\n${text.split(`${workerContractLib.ONE_TURN_NOTICE}\n`)[1]}`, "the contract embeds the SHARED notice verbatim — the fix, integration and rescue prompts carry the same string");
   // The durable-debt checklist rides in the bare contract too: it is design
   // discipline, not a factory fact (task-spor-review-gate-durable-debt-flag-checklist).
   assert.match(text, /introduces or extends a durable retry\/debt flag[\s\S]*say how each is handled in the commit message/);

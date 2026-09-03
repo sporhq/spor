@@ -232,7 +232,22 @@ standing context. <any additional free-text task instructions>
    protected test paths, verify deterministically, **commit everything and
    leave the tree clean BEFORE resolving**, resolve the item LAST with a
    resolver node carrying a `resolves` edge, and if the item will not
-   converge leave it unresolved with the blocker named in the report. The
+   converge leave it unresolved with the blocker named in the report. It
+   opens with the **one-turn notice** (`ONE_TURN_NOTICE`, the same string the
+   fix-cycle, dirty-tree round-trip, integration-fix and rescue prompts
+   carry): the session ends with the worker's final message and nothing wakes
+   it later, so every verification runs in the FOREGROUND — never a
+   backgrounded suite, never a turn ended "waiting" on a notification — and
+   anything not committed before that message is lost, an uncommitted tree
+   being a refusal (issue-spor-rescue-and-fix-sessions-end-turn-waiting-on-
+   background-job: two headless sessions in one day authored correct fixes,
+   backgrounded `npm test`, ended their turn waiting on it, and paged a person
+   over a dirty tree). The contract reaches the agent whatever prompt
+   template rides the loop's `--template` (or a personal `dispatch.template`):
+   a worker's launch checks the rendered template for its task text and, when
+   the template names neither `{{task}}` nor `{{default}}`, appends the task
+   after it with a warning — a person's own `spor dispatch --template` keeps
+   the template's full authority. The
    factory-specific lines (the integration target, the acceptance command,
    the protected paths and their lane, the cross-model review) appear only
    when the factory declares them; a bare worker's contract is the plain
@@ -1006,7 +1021,11 @@ verdict, each as its own finding naming the row:
 The same table goes to the implementer: the worker contract (§4) and the
 fix-cycle prompt ask for the flag to be designed against all four rows up
 front and for the commit message to say how each is handled, so the reviewer
-reads a design and the fix closes the mechanism rather than its next row. On
+reads a design and the fix closes the mechanism rather than its next row. The
+fix-cycle prompt (and the dirty-tree round-trip's, which is a fix cycle with a
+different detail) also ends with the one-turn notice (§4): a fix that
+backgrounds the suite and ends its turn waiting on it leaves the gate the very
+dirty tree it was dispatched to clean. On
 a fix cycle the fix-introduced floor still applies: a row the fix INTRODUCED is
 blocking, one open at the initial review and not raised then is advisory.
 The checklist is prose — nothing parses it; the parser's protocol is unchanged.
@@ -1077,6 +1096,21 @@ so rather than claiming a fact it could not write.
 
 `spor work --status` reads the same story back per worker: what is gating now,
 the passed/failed/blocked tally, and the reason a gated item was cooled off.
+
+A worker runs the code it LOADED. A long-running `spor work` keeps executing
+the lib/bin it required at startup however far the checkout it was loaded from
+moves afterwards — a gate fix that lands on `main` at noon does not reach a
+worker started at nine until it is restarted (a worker ran a whole day on code
+predating the rescue-pass round-trip that had landed hours earlier). So the
+worker says at startup which code it runs — the checkout's commit and branch
+when the package root is a SOURCE checkout (its own `package.json` is tracked
+from there — git walks up, so an npm install nested under a consumer's
+`node_modules/` would otherwise answer with the consumer's commit), the
+package version when it is an install — and, once per pass, logs a one-line notice the first time that
+checkout has moved past the loaded commit (once per new tip, never once per
+pass). It never restarts itself: which code a worker runs is the operator's
+call; the notice only makes the drift visible in the log rather than
+discoverable after a pipeline ran stale.
 
 ### 10.7 A refusal is graph state, not a machine-local cooldown
 
@@ -1710,10 +1744,41 @@ a stale premise is triage's, not the lane's.
    (3) **file** at least one Spor task proposing the factory / gate / prompt /
    item change that would have prevented the pattern, `derived-from` the gate
    fact — the input `/spor:factory`'s maintenance mode reads. It is told, and
-   it is true, that it never marks a gate passed.
+   it is true, that it never marks a gate passed. The fenced diagnosis block
+   is MANDATORY and asked for EARLY — the moment the diagnosis exists, before
+   any fix or long verification, restated at the end once `fixed`/`filed` are
+   known (the parser takes the LAST block) — so a session cut short still
+   yields a category. It is also told to write that same object to a named
+   DIAGNOSIS FILE in its own checkout (`.spor-rescue/<run name>.json`,
+   git-excluded through the repo's `info/exclude` before the launch, so it
+   is neither tracked nor untracked-visible and can never be committed) the
+   moment it has diagnosed — the channel that does not depend on what the
+   harness's stream looks like; and the prompt ends with the one-turn notice (§4):
+   verify in the foreground, never background a suite and end the turn
+   waiting on it, an uncommitted tree is a refusal.
 3. Reads the rescue's final report in code (`parseRescueReport`,
    lib/kernel/gates.js): the fenced `{"diagnosis", "category", "fixed",
-   "filed"}` block. This read is deliberately FAIL-SOFT, unlike a review
+   "filed"}` block. The supervisor keeps only the LAST assistant text as the
+   report, so a block emitted early and then overwritten by a final "I'll
+   commit once the suite notifies me" is only on the run log; when the report
+   carries no block, the read falls back to the last block of any EARLIER
+   message on that log (`runReportTexts`, through the harness adapter's own
+   report hook — or, on a harness that writes its report file itself and so
+   declares no report hook, its read-only `messageFromEvent`: Codex's
+   `agent_message` items; a DECLARED harness's declaration rides the run
+   record — the supervisor stamps it there before it deletes the job file, so
+   a finished run's log is still readable), newest first, and logs that it
+   did. Between the report and the stream sits the diagnosis FILE the rescue
+   was told to write: the stream read can only cover a harness whose events
+   carry a text path the client knows, and a declared harness that writes its
+   own report (`report: file`) describes no message shape at all, so its
+   stream is unreadable by construction — the file is what closes that row,
+   since whatever the harness or its sandbox, an implementer can write into
+   its workspace. The order is the final report's last block, then the file,
+   then the stream (`gateRescueDiagnosis`, bin/spor.js), each logged when it
+   is the one that answered — so the truncated session the early block exists
+   for still yields its category whichever harness the rescue profile names. This read
+   is deliberately FAIL-SOFT, unlike a review
    verdict: it feeds only the escalation body and the rescue fact, so a rescue
    that fixed the tree and forgot the block still gets its fix judged. A rescue
    that could not be dispatched, or never reached a terminal state inside
