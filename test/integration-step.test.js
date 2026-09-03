@@ -1787,14 +1787,14 @@ test("runGateAndIntegration settles the run record BEFORE writing the attestatio
   assert.strictEqual(att.subject.commit, git(repo, "rev-parse", "HEAD").trim());
 });
 
-// Cross-model review, blocking finding 1: a duplicate pipeline for the SAME
-// run (a resumed orphan, a second adopter) that loses the settle race must not
-// write an attestation for its own verdict, nor overwrite the winner's
-// evidence fields (gate_head/gate_attestation/...) on the record. Here the
-// record is already settled by "another worker" as FAILED at a different head
-// before this pipeline finishes PASSING: nothing of this pipeline's reaches
-// the record or the graph.
-test("runGateAndIntegration: a pipeline that loses the settle race writes NO attestation and touches NO evidence field on the record", async () => {
+// Cross-model review, blocking findings 1 and 2: a duplicate pipeline for the
+// SAME run (a resumed orphan, a second adopter) must not reach the graph at
+// all — not an attestation, not a fact, not an escalation or a demotion — nor
+// overwrite the winner's evidence fields on the record. The ownership claim is
+// taken BEFORE the first gate runs, so a record another worker already
+// settled refuses the pipeline outright: nothing of this worker's reaches the
+// record or the graph, and the caller is handed the record's verdict.
+test("runGateAndIntegration: a record another pipeline settled refuses the pipeline before it runs — no fact, no attestation, no evidence field", async () => {
   const sporCli = require("../bin/spor.js");
   const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
   const { loadConfig } = require("../lib/config.js");
@@ -1822,17 +1822,76 @@ test("runGateAndIntegration: a pipeline that loses the settle race writes NO att
   const res = await sporCli.runGateAndIntegration(cfg, entry, { cwd: repo, run_id: entry.run_id }, {
     factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: (m) => logs.push(m), home, stopping: () => false,
   });
-  assert.strictEqual(res.state, "passed", "this pipeline's own verdict is still reported to its caller");
-  assert.strictEqual(res.attestation, null, "no attestation for a verdict the record does not hold");
+  assert.strictEqual(res.state, "failed", "the caller is handed the RECORD's verdict, not one this pipeline never produced");
+  assert.strictEqual(res.not_run, true);
+  assert.strictEqual(res.attestation, null);
   assert.strictEqual(res.superseded, true);
-  assert.ok(logs.some((m) => /already settled as 'failed' by other-worker/.test(m) && /no attestation is written/.test(m)), `the race is logged: ${logs.join(" | ")}`);
+  assert.strictEqual(res.settled.worker, "other-worker");
+  assert.strictEqual(res.settled.head, winner.gate_head);
+  assert.ok(logs.some((m) => /already settled as 'failed' by other-worker/.test(m) && /does not run the gate pipeline/.test(m)), `the refusal is logged: ${logs.join(" | ")}`);
   const after = JSON.parse(fs.readFileSync(recordPath, "utf8"));
   for (const k of Object.keys(winner)) assert.strictEqual(after[k], winner[k], `${k} is the winner's, untouched`);
-  assert.ok(!Object.keys(after).some((k) => /^gate_(base|trusted_sha|factory_digest)$/.test(k)), "none of this pipeline's evidence fields landed");
-  assert.deepStrictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("art-attest-")), [], "no attestation node on the graph");
-  // The gate fact itself IS written (a record of what was judged — it never
-  // claims the run's verdict), so the graph holds the gate fact and nothing else.
+  assert.ok(!Object.keys(after).some((k) => /^gate_(base|trusted_sha|factory_digest|settle_id)$/.test(k)), "none of this pipeline's fields landed");
+  // NOTHING reached the graph: no attestation, and no gate fact either — a
+  // pipeline that never ran judged nothing.
+  assert.deepStrictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("art-")), [], "no artifact of any kind on the graph");
+});
+
+// The other half of finding 2: a record a LIVE worker is gating right now is
+// refused too (two adopters of one orphan, work-loop.js's read/publish race),
+// while a DEAD owner's record is taken over — that is orphan resumption — and
+// the taker's token replaces the corpse's, so the settle lands under its own.
+test("runGateAndIntegration: a record a live worker holds is refused before anything runs; a dead owner's is taken over", async () => {
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-claim-race-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  fs.writeFileSync(path.join(nodes, "task-claim.md"), "---\nid: task-claim\ntype: task\ntitle: Claim race\nsummary: A work item whose run record another worker is gating, so a second pipeline must refuse before it runs anything.\nstatus: done\ndate: 2026-08-26\n---\n\nBody.\n");
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const repo = integrationRepo();
+  git(repo, "checkout", "-q", "branch");
+  const entry = { node_id: "task-claim", run_id: "11111111-2222-3333-4444-000000000089", attempt: 0 };
+  const recordPath = dispatchRuns.runPaths(home, entry.run_id).record;
+  const held = { run_id: entry.run_id, node_id: entry.node_id, state: "done", cwd: repo, created_at: new Date().toISOString(), gate_state: "running", gate_at: "2026-09-02T10:00:00.000Z", gate_worker: "other-worker", gate_settle_id: "othertoken00000000000000" };
+  dispatchRuns.atomicJson(recordPath, held);
+  const factory = {
+    id: "factory-claim", trustedRef: "main", protectedPaths: [], riskClasses: {}, testLaneProfile: null, integration: null,
+    gates: [{ id: "acceptance", kind: "command", command: "true", timeoutMs: 60000, cycles: 0, source: "inline", risk: [] }],
+    definition: { factory: { id: "factory-claim", revision: null, digest: "sha256:0000" }, gates: [{ id: "acceptance", source: "inline", revision: null, digest: "sha256:1111" }] },
+  };
+  const base = { factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, home, stopping: () => false, workerId: "this-worker" };
+  // Alive: refused, untouched, nothing on the graph.
+  const logs = [];
+  const refused = await sporCli.runGateAndIntegration(cfg, entry, { cwd: repo, run_id: entry.run_id }, { ...base, log: (m) => logs.push(m), ownerLive: (w) => w === "other-worker" });
+  assert.strictEqual(refused.not_run, true);
+  assert.strictEqual(refused.superseded, true);
+  assert.strictEqual(refused.state, "running", "the record's own state is what the caller is handed");
+  assert.ok(logs.some((m) => /being gated right now by worker other-worker/.test(m)), logs.join(" | "));
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(recordPath, "utf8")), held, "the live owner's record is byte-for-byte untouched");
+  assert.deepStrictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("art-")), []);
+  // Dead: taken over — the pipeline runs, settles under ITS token, and the corpse's is gone.
+  const taken = await sporCli.runGateAndIntegration(cfg, entry, { cwd: repo, run_id: entry.run_id }, { ...base, log: () => {}, ownerLive: () => false });
+  assert.strictEqual(taken.state, "passed", taken.reason);
+  assert.ok(!taken.superseded);
+  assert.ok(taken.attestation, "the taker attests");
+  const after = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  assert.strictEqual(after.gate_state, "passed");
+  assert.strictEqual(after.gate_worker, "this-worker");
+  assert.notStrictEqual(after.gate_settle_id, held.gate_settle_id, "the ownership nonce is the taker's");
+  assert.strictEqual(after.gate_attestation, taken.attestation);
   assert.ok(fs.readdirSync(nodes).some((f) => f.startsWith("art-gate-")));
+  // A settle whose ownership was re-opened underneath it (a --regate between
+  // the claim and the settle) does NOT land: the record is not the settler's.
+  const rerun = { run_id: entry.run_id, node_id: entry.node_id, state: "done", cwd: repo, created_at: new Date().toISOString(), gate_state: "running", gate_settle_id: null, gate_worker: null };
+  dispatchRuns.atomicJson(recordPath, rerun);
+  const claim = dispatchRuns.claimGateRecord(home, entry.run_id, { workerId: "this-worker" });
+  assert.strictEqual(claim.ok, true);
+  dispatchRuns.stampGateState(home, entry.run_id, { gate_state: "running", gate_settle_id: null, gate_worker: null }, { force: true }); // the re-gate re-opens it
+  const stamped = dispatchRuns.stampGateState(home, entry.run_id, { gate_state: "passed", gate_settle_id: claim.token, gate_worker: "this-worker" }, { own: claim.token });
+  assert.notStrictEqual(stamped.gate_settle_id, claim.token, "the stale owner's settle is refused");
+  assert.strictEqual(JSON.parse(fs.readFileSync(recordPath, "utf8")).gate_state, "running");
 });
 
 // The mirror: the SETTLER's own evidence stamp goes through stampGateState's
@@ -1964,6 +2023,20 @@ test("spor attestation verify: binds a PR body to the graph artifact, verifies t
   assert.match(missing.stdout, /FAIL {2}trusted .*could not be read/);
   const skipped = cli(["attestation", "verify", "--file", path.join(home, "orphan.json"), "--no-graph"], env);
   assert.strictEqual(skipped.status, 0, skipped.stdout);
+  assert.match(skipped.stdout, /ok {4}signature hmac-sha256 by key 'ci'/, "--no-graph passes only on a VERIFIED signature");
+  // ...and with no key on this box, --no-graph has no anchor left: refused,
+  // never passed on the self-authored digest (cross-model review, blocking finding 1).
+  const anchorless = cli(["attestation", "verify", "--file", path.join(home, "orphan.json"), "--no-graph"], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.strictEqual(anchorless.status, 1, anchorless.stdout);
+  assert.match(anchorless.stdout, /FAIL {2}signature .*verification key is required/);
+  assert.match(anchorless.stdout, /REFUSED/);
+  // An unsigned copy under --no-graph is refused even where the key IS configured.
+  const unsignedCopy = JSON.parse(JSON.stringify(orphan));
+  attestation.bindAttestation(unsignedCopy);
+  fs.writeFileSync(path.join(home, "unsigned.json"), JSON.stringify(unsignedCopy));
+  const unsignedNoGraph = cli(["attestation", "verify", "--file", path.join(home, "unsigned.json"), "--no-graph"], env);
+  assert.strictEqual(unsignedNoGraph.status, 1);
+  assert.match(unsignedNoGraph.stdout, /FAIL {2}signature .*unsigned/);
   // Stale, wrong commit, wrong factory digest, unreadable input, bad duration.
   assert.strictEqual(cli(["attestation", "verify", "--pr-body", prFile, "--max-age", "1ms"], env).status, 1);
   assert.match(cli(["attestation", "verify", "--pr-body", prFile, "--commit", "other"], env).stdout, /FAIL {2}commit/);

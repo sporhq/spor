@@ -10941,6 +10941,41 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // a refusal (§10.7) under the worker's scope token would hide it from exactly
   // the project-scoped queue a person would look in.
   const dctx = { ...ctx, slug: item.project || ctx.slug || null, record, entry };
+  // OWN THE RECORD BEFORE JUDGING (cross-model review, blocking finding 2).
+  // The settle below is a compare-and-swap, but the pipeline writes facts,
+  // files an escalation and demotes the item on its way there — irreversible
+  // graph state — so the ownership nonce is taken FIRST, under the record
+  // lock: a record another pipeline already settled, or one a still-live
+  // worker is gating, refuses the claim and this worker runs NOTHING for it
+  // (no fact, no escalation, no demotion, no attestation). Only a dead
+  // owner's record is taken over, which is what orphan resumption is. The
+  // settle then lands only while the record still carries this token.
+  const home = ctx.home || cfg.userConfigHome();
+  const ownerLive =
+    ctx.ownerLive ||
+    ((owner) => {
+      try {
+        return workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner);
+      } catch {
+        return false;
+      }
+    });
+  const claim = dispatchRuns.claimGateRecord(home, item.run_id, { workerId: ctx.workerId || null, ownerLive });
+  if (claim.refused) {
+    const rec = claim.record || null;
+    ctx.log(`work: the run record for ${item.node_id} (run ${String(item.run_id).slice(0, 8)}) is ${claim.refused} — this worker does not run the gate pipeline for it: no fact, escalation, demotion or attestation is written`);
+    return {
+      state: (rec && rec.gate_state) || "failed",
+      reason: `the gate pipeline was not run: the run record is ${claim.refused}`,
+      gates: [],
+      facts: [],
+      attestation: null,
+      superseded: true,
+      not_run: true,
+      settled: rec ? { state: rec.gate_state || null, reason: rec.gate_reason || null, head: rec.gate_head || null, attestation: rec.gate_attestation || null, worker: rec.gate_worker || null, at: rec.gate_at || null } : null,
+    };
+  }
+  const ownToken = claim.ok ? claim.token : null;
   let gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: makeGateDeps(cfg, dctx) });
   // Every gate fact the run minted, across re-gates — the attestation links
   // them all; `gateResult` itself is the verdict as it STANDS (the latest).
@@ -10986,8 +11021,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // head, and that is the winner's. The result still reports what this
   // pipeline found (`superseded` says the record disagrees) so the loop's own
   // bookkeeping stays honest.
-  const home = ctx.home || cfg.userConfigHome();
-  const settled = settleRunRecord(home, item.run_id, result, ctx.workerId || null, { gateResult: gateAsStands, factory: ctx.factory, intResult });
+  const settled = settleRunRecord(home, item.run_id, result, ctx.workerId || null, { gateResult: gateAsStands, factory: ctx.factory, intResult, token: ownToken });
   if (!settled.landed) {
     ctx.log(
       `work: the run record for ${item.node_id} (run ${String(item.run_id).slice(0, 8)}) was already settled${settled.record && settled.record.gate_state ? ` as '${settled.record.gate_state}'` : ""}${settled.record && settled.record.gate_worker ? ` by ${settled.record.gate_worker}` : ""} — this pipeline's '${result.state}' verdict is not recorded and no attestation is written for it`
@@ -11037,9 +11071,14 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
 // (`gate_settle_id`, random — two settlers in one millisecond cannot share it
 // the way they could share `gate_at`): every evidence field stamped after the
 // verdict goes through stampGateState's `own` door with it.
-function settleRunRecord(home, runId, res, workerId = null, { gateResult = null, factory = null, intResult = null } = {}) {
+function settleRunRecord(home, runId, res, workerId = null, { gateResult = null, factory = null, intResult = null, token: owned = null } = {}) {
   const at = new Date().toISOString();
-  const token = crypto.randomBytes(12).toString("hex");
+  // The token claimGateRecord minted before the pipeline ran, when there was a
+  // record to own — the settle then goes through the `own` door and lands only
+  // while the record still carries it (a re-gate or another owner in between
+  // refuses it). With no record to own beforehand, a fresh nonce and the
+  // settled-verdict guard alone, as before.
+  const token = owned || crypto.randomBytes(12).toString("hex");
   try {
     const state = res && res.state ? res.state : "failed";
     const reason = res && res.reason ? String(res.reason).slice(0, 300) : null;
@@ -11060,7 +11099,7 @@ function settleRunRecord(home, runId, res, workerId = null, { gateResult = null,
             ...(intResult && intResult.landed_sha ? { gate_landed_sha: intResult.landed_sha } : {}),
           }
         : {}),
-    });
+    }, owned ? { own: owned } : {});
     const landed = !!stamped && stamped.gate_settle_id === token && stamped.gate_state === state;
     return { landed, at, token, record: stamped || null };
   } catch {
@@ -11151,7 +11190,9 @@ async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, 
     built = attestation.buildAttestationNode({ item, factory, gate: gateResult, integration: intResult, environment: attestationEnvironment(cfg, workerId), signing: attestationSigning(cfg) });
     out.attestationObject = built.attestation;
   } catch (e) {
-    log(`work: the attestation for ${item.node_id} could not be built (${(e && e.message) || e}) — the verdict still stands`);
+    const reason = `could not be built: ${(e && e.message) || e}`;
+    log(`work: the attestation for ${item.node_id} ${reason} — the verdict still stands, and the record says the attestation is MISSING`);
+    stampAttestationMissing(cfg, { item, home, settleToken, reason });
     return out;
   }
   try {
@@ -11161,7 +11202,10 @@ async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, 
   } catch (e) {
     log(`work: the attestation for ${item.node_id} could not be recorded on the graph (${(e && e.message) || e}) — the verdict still stands`);
   }
-  if (!out.attestation) return out;
+  if (!out.attestation) {
+    stampAttestationMissing(cfg, { item, home, settleToken, reason: "could not be recorded on the graph" });
+    return out;
+  }
   try {
     const stamped = dispatchRuns.stampGateState(home || cfg.userConfigHome(), item.run_id, { gate_attestation: out.attestation }, settleToken ? { own: settleToken } : {});
     if (!stamped || stamped.gate_attestation !== out.attestation) log(`work: the run record for ${item.node_id} no longer holds this pipeline's verdict — attestation ${out.attestation} is on the graph but not stamped on the record`);
@@ -11169,6 +11213,18 @@ async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, 
     /* fail-soft: the run record is bookkeeping, the attestation node is the record */
   }
   return out;
+}
+
+// A run that promised an attestation and has none says so ON THE RECORD
+// (`gate_attestation_missing` + the reason), through the settler's own door —
+// a log line alone is exactly the silent loss the review refused (cross-model
+// review, major finding 3). `spor runs` and `--status` read the field.
+function stampAttestationMissing(cfg, { item, home, settleToken, reason }) {
+  try {
+    dispatchRuns.stampGateState(home || cfg.userConfigHome(), item.run_id, { gate_attestation: null, gate_attestation_missing: true, gate_attestation_error: String(reason || "unknown").slice(0, 300) }, settleToken ? { own: settleToken } : {});
+  } catch {
+    /* the log line above is the last record of it */
+  }
 }
 
 // `spor attestation verify` — the validator's half of the evidence chain
@@ -11270,6 +11326,12 @@ async function cmdAttestation(cfg, args) {
   }
   const signing = attestationSigning(cfg);
   const keyId = optVal(args, "key-id") || null;
+  // `--no-graph` drops the runner-written artifact, which leaves the HMAC
+  // signature as the ONLY anchor a PR author does not control — so it implies
+  // `--require-signature`, and with no key on this box there is nothing to
+  // verify against: refused, never passed on the self-authored digest
+  // (cross-model review, blocking finding 1).
+  if (noGraph && !signing) extra.push({ check: "signature", ok: false, detail: "--no-graph drops the graph anchor, so a verification key is required (attestation.signingKey / SPOR_ATTESTATION_KEY) — none is configured on this box" });
   const result = attestation.verifyAttestation(att, {
     key: signing ? signing.key : null,
     keyId,
@@ -11277,7 +11339,7 @@ async function cmdAttestation(cfg, args) {
     commit: commit || null,
     factoryDigest: factoryDigest || null,
     trusted,
-    requireSignature: args.includes("--require-signature"),
+    requireSignature: args.includes("--require-signature") || (noGraph && !!signing),
     requireTrusted: !noGraph && !trusted && !extra.some((c) => c.check === "trusted"),
   });
   const checks = [...result.checks, ...extra];
@@ -14230,7 +14292,8 @@ const COMMANDS = {
       "checks bind it to what the runner itself wrote:\n\n" +
       "  trusted    the graph artifact it names (art-attest-*, written by the runner,\n" +
       "             never by a PR author) is fetched and its `digest` must equal this\n" +
-      "             copy's (skip ONLY deliberately, with --no-graph)\n" +
+      "             copy's (skip ONLY deliberately, with --no-graph — which then\n" +
+      "             REQUIRES a verified signature: no key on this box, no pass)\n" +
       "  digest     the copy's `digest` matches a recomputation over its own core\n" +
       "  signature  when this box holds the key (attestation.signingKey /\n" +
       "             SPOR_ATTESTATION_KEY), the HMAC-SHA256 signature must verify;\n" +

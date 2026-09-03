@@ -1345,8 +1345,8 @@ same evidence chain (task-spor-factory-gate-attestation), in four pieces:
    `integration` {mode, strategy, state, target_ref, target_sha, head,
    gated_head, head_matches_gated, landed_sha, candidate, proposal, timing} or
    null, `configIntegrity` {factory, gates[], trusted_ref, trusted_sha,
-   protected_paths}, `timing`, `environment` {spor_version, worker, host,
-   platform, node, mode}. `gate.allPassed` is true only when every step passed
+   protected_paths, protected_paths_count, protected_paths_digest}, `timing`,
+   `environment` {spor_version, worker, host, platform, node, mode}. `gate.allPassed` is true only when every step passed
    AND every step judged the gated head AND that head is known
    (`gate.head_consistent` — checked here, not assumed from the runner);
    `passed` additionally needs the integration (if any) landed or parked with
@@ -1356,23 +1356,41 @@ same evidence chain (task-spor-factory-gate-attestation), in four pieces:
    body is capped (the REST door's 8KB) but the JSON is NEVER cut: the
    rendering steps down — pretty, compact, free-text dropped, steps thinned to
    id/kind/verdict/head/digest/fact (`abridged` says so), fewer linked edges,
-   and at the floor the step list replaced by its count — so every rung is
-   whole JSON carrying what a validator checks; the full object still rides
-   the run's in-process result. ORDER: the run record is settled FIRST
+   and at the floor every list (steps, gates, protected paths) replaced by
+   its count — so every rung is whole JSON carrying what a validator checks;
+   the full object still rides the run's in-process result. The floor is
+   bounded by construction (ids, shas, digests, counts — no list rides the
+   bound core, see below) and it is MEASURED, not assumed: a rendering that
+   still does not fit is refused as a build error, and an attestation that
+   could not be built or recorded is stamped on the run record
+   (`gate_attestation_missing`, `gate_attestation_error`) through the
+   settler's own door, never lost behind a log line. OWNERSHIP comes before
+   the first gate: `claimGateRecord` mints the run's ownership nonce
+   (`gate_settle_id`) under the record lock BEFORE the pipeline runs — a
+   record another pipeline already settled, or one a still-live worker is
+   gating, refuses the claim and the worker runs NOTHING for it (no fact, no
+   escalation, no demotion, no attestation; its result carries `not_run` and
+   `superseded` with the record's own verdict), while a dead owner's record is
+   taken over, which is what orphan resumption is — so two adopters of one
+   orphan can never both mutate the graph and leave the loser's escalation or
+   demotion standing against the winner's verdict. ORDER: the run record is settled FIRST
    (`gate_state` and the verdict fields, read-back verified) and the
    attestation node written second, so no window holds a graph artifact
    claiming a verdict the record does not. The evidence fields (`gate_head`,
    `gate_base`, `gate_trusted_sha`, `gate_factory_digest`, `gate_landed_sha`)
-   ride IN that settle stamp — one write, one writer — and the settle is a
+   ride IN that settle stamp — one write, one writer — through the claim's
+   own door (`own: <gate_settle_id>`: a re-gate or another owner in between
+   re-opened the record, and the settle does not land) — and the settle is a
    **locked compare-and-swap**, not a read-modify-rename: `stampGateState`
    takes a per-record `<record>.lock` (O_EXCL; a lock older than 30s is a
    dead writer's corpse and is broken; a lock that cannot be taken within the
    bounded wait is a stamp that did NOT land) around the read-guard-write, and
    returns the record READ BACK FROM DISK after its write — never the
    in-memory merge — so two pipelines for one run cannot both pass the
-   unsettled guard and both believe they own the verdict. The settle also
-   mints `gate_settle_id`, a random nonce (two settlers in the same
-   millisecond cannot share it the way they could share `gate_at`), and
+   unsettled guard and both believe they own the verdict. The settle keeps
+   the claim's `gate_settle_id` (a random nonce — two settlers in the same
+   millisecond cannot share it the way they could share `gate_at`; a record
+   that had none to claim gets a fresh one at settle time) and
    reports whether it LANDED by that id: when the guard yielded to an earlier
    writer (a duplicate pipeline for the same run — a resumed orphan, a second
    adopter — settled first), this pipeline's verdict is not the record's, so
@@ -1402,7 +1420,10 @@ a key.** A PR body is mutable text its author can edit, so the JSON in it is
 not evidence by itself. `bindAttestation` stamps `digest` — sha256 over the
 canonical JSON of the attestation's bound core: subject, factory, per-step
 verdicts/heads/digests (through `gate.steps_digest`), the config lists
-(through `configIntegrity.gates_digest`), the integration stage's bound
+(through `configIntegrity.gates_digest`, and the protected paths through
+`protected_paths_count`/`protected_paths_digest` — a count and a digest, never
+the list, so a factory protecting hundreds of globs neither overflows the
+node nor escapes the binding), the integration stage's bound
 fields — mode, strategy, state, target ref and sha, head, gated head, landed
 sha, the **candidate-suite evidence** (`candidate` {base, sha, suite,
 command}: a validator trusting a propose-mode PR is trusting "merge(target,
@@ -1425,7 +1446,18 @@ failure): schema, digest recomputation, signature (a key on the box and no
 signature is a failure), the graph binding (fetches `art-attest-*` by id;
 missing/unreadable fails unless `--no-graph` is passed deliberately),
 `passed`, commit equality, freshness, and the factory digest AS IT STANDS
-(`--factory` loads it through the worker's own loader).
+(`--factory` loads it through the worker's own loader). The digest alone is
+never a pass: whoever edits the body recomputes it, so a verification with
+NEITHER anchor — no key on the box and no graph copy — fails (`anchor`), and
+`--no-graph`, which drops the artifact, therefore REQUIRES a verified
+signature: it implies `--require-signature`, and on a box with no key
+configured it is refused outright rather than passed on a self-authored
+digest.
+
+A change read that fails AFTER a fix cycle (the tree moved and the re-read
+could not say where to) leaves the judged commit UNKNOWN — the fact says so
+and the chain carries no head — never the pre-fix head standing in as what
+was judged.
 
 **In `propose` mode the PR body carries the attestation.** `proposeIntegrationPR`
 writes `renderPrBody`'s text — the step list, the candidate suite that just

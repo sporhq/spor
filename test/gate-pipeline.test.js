@@ -2496,6 +2496,36 @@ test("a fix cycle that moves the head sends the pipeline back to the first gate,
   assert.strictEqual(gateRunner.gateFactId("acceptance", "task-demo", "run-abcdef12", 0, H1) !== gateRunner.gateFactId("acceptance", "task-demo", "run-abcdef12", 0, H2), true);
 });
 
+// Cross-model review, major finding 4: a change read that FAILS after a fix
+// cycle must not leave the pre-fix head standing as the judged commit — the
+// tree moved and nobody could read where to. The fact and the chain say
+// "unknown", and nothing is recorded as judged at the stale head.
+test("a change read that fails AFTER a fix cycle reports the judged commit as unknown, never the pre-fix head", async () => {
+  const H1 = "head1000000000000000000000000000000000001";
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", cycles: 1 }] });
+  let reads = 0;
+  const { deps, seen } = fakes({
+    suite: () => ({ ok: false, reason: "1 failing" }),
+    fix: () => ({ ok: true }),
+  });
+  deps.changedPaths = async () => {
+    reads += 1;
+    if (reads === 1) return { ok: true, paths: ["lib/x.js"], head: H1, base: "basesha", trustedRef: "main", trustedSha: "trustsha", branch: "task-demo" };
+    return { ok: false, reason: "git diff exited 128 after the fix cycle" };
+  };
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(reads, 2, "the change was re-read after the fix cycle");
+  assert.strictEqual(res.head, null, "the chain does not carry the pre-fix head");
+  assert.strictEqual(res.base, null);
+  assert.strictEqual(res.branch, null);
+  assert.match(res.reason, /exited 128 after the fix cycle/);
+  const last = seen.facts[seen.facts.length - 1];
+  assert.match(last.markdown, /Judged commit: unknown/);
+  assert.doesNotMatch(last.markdown, /gate_head: head1/, "the escalating fact does not name the stale head as what it judged");
+  assert.strictEqual(seen.escalations.length, 1);
+});
+
 // The restart is bounded: fix cycles are charged against each gate's cap
 // CUMULATIVELY, so a gate that keeps failing after a restart escalates at its
 // declared cap rather than getting a fresh budget every time the head moves.

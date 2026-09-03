@@ -298,6 +298,7 @@ test("verifyAttestation fails closed: a tampered body, a wrong key, a missing si
   const issued = Date.parse("2026-09-02T12:00:00.000Z");
   const now = () => issued + 60_000;
   const att = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), signing: { key: "k", keyId: "ci" }, now: () => issued });
+  const signed = att;
   const trusted = JSON.parse(JSON.stringify(att));
   const ok = attestation.verifyAttestation(att, { key: "k", trusted, commit: HEAD, maxAgeMs: 3_600_000, factoryDigest: FACTORY.definition.factory.digest, now });
   assert.strictEqual(ok.ok, true, ok.reason);
@@ -324,7 +325,13 @@ test("verifyAttestation fails closed: a tampered body, a wrong key, a missing si
   const unsigned = attestation.buildAttestationObject({ item: ITEM, factory: FACTORY, gate: gateResult(), now: () => issued });
   assert.match(attestation.verifyAttestation(unsigned, { key: "k", now }).reason, /is unsigned/);
   assert.match(attestation.verifyAttestation(unsigned, { requireSignature: true, now }).reason, /signature is required/);
-  assert.strictEqual(attestation.verifyAttestation(unsigned, { now }).ok, true, "no key and no requirement: the digest alone is checked");
+  // No key and no graph copy: the digest alone is self-authored, so this is
+  // NOT a pass — verification without an anchor fails closed.
+  const anchorless = attestation.verifyAttestation(unsigned, { now });
+  assert.strictEqual(anchorless.ok, false, "no anchor, no pass");
+  assert.match(anchorless.reason, /no trust anchor/);
+  assert.strictEqual(attestation.verifyAttestation(unsigned, { trusted: JSON.parse(JSON.stringify(unsigned)), now }).ok, true, "the graph copy alone is an anchor");
+  assert.strictEqual(attestation.verifyAttestation(signed, { key: "k", now }).ok, true, "the key alone is an anchor");
   assert.match(attestation.verifyAttestation(unsigned, { requireTrusted: true, now }).reason, /graph artifact copy is required/);
 
   // Graph copy under a different id, or a different digest.
@@ -340,6 +347,37 @@ test("verifyAttestation fails closed: a tampered body, a wrong key, a missing si
   // Wrong schema, no object.
   assert.match(attestation.verifyAttestation({ ...att, schema: "other/9" }, { now }).reason, /schema 'other\/9'/);
   assert.strictEqual(attestation.verifyAttestation(null).ok, false);
+});
+
+// Cross-model review, major finding 3: the size ladder's floor was built but
+// never measured, and `configIntegrity.protected_paths` rode in the bound core
+// unbounded — a factory protecting a few hundred globs produced a node over
+// the cap that the graph refused, silently losing the attestation. The paths
+// are now bound by count + digest, thinned like the steps, and the floor is
+// checked.
+test("a factory protecting hundreds of paths still fits the node body cap — the paths are bound by digest, and the thinned copy recomputes it", () => {
+  const gateRunner = require("../lib/shell/gate-runner.js");
+  const paths = Array.from({ length: 400 }, (_, i) => `packages/service-${i}/test/**/*.spec.js`);
+  const wide = { ...FACTORY, protectedPaths: paths };
+  const node = attestation.buildAttestationNode({ item: ITEM, factory: wide, gate: gateResult(), integration: null, now: () => 1_700_000_100_000 });
+  const cap = gateRunner.NODE_BODY_CAP_BYTES - 512;
+  assert.ok(Buffer.byteLength(node.markdown, "utf8") <= cap, `within the cap (${Buffer.byteLength(node.markdown, "utf8")} bytes)`);
+  const inNode = JSON.parse(/```json\n([\s\S]*?)\n```/.exec(node.markdown)[1]);
+  assert.strictEqual(inNode.digest, node.attestation.digest);
+  assert.strictEqual(attestation.attestationDigest(inNode), node.attestation.digest, "the thinned copy (paths elided) recomputes to the same digest");
+  assert.strictEqual(inNode.configIntegrity.protected_paths_count, 400);
+  assert.match(inNode.configIntegrity.protected_paths_digest, /^[0-9a-f]{64}$/);
+  // The paths ARE bound: a copy that adds or drops one fails the digest.
+  const full = node.attestation;
+  assert.deepStrictEqual(full.configIntegrity.protected_paths.length, 400);
+  const tampered = JSON.parse(JSON.stringify(full));
+  tampered.configIntegrity.protected_paths = tampered.configIntegrity.protected_paths.slice(1);
+  assert.notStrictEqual(attestation.attestationDigest(tampered), full.digest, "dropping a protected path moves the digest");
+  const narrow = attestation.buildAttestationObject({ item: ITEM, factory: { ...FACTORY, protectedPaths: ["test/**"] }, gate: gateResult(), now: () => 1_700_000_100_000 });
+  assert.notStrictEqual(narrow.digest, attestation.buildAttestationObject({ item: ITEM, factory: wide, gate: gateResult(), now: () => 1_700_000_100_000 }).digest);
+  // The floor is checked, not assumed: an item whose identity alone cannot fit is refused loudly, never rendered over the cap.
+  const huge = { node_id: `task-${"x".repeat(9000)}`, run_id: "run-abcdef12", project: "demo", attempt: 0 };
+  assert.throws(() => attestation.buildAttestationNode({ item: huge, factory: wide, gate: gateResult(), integration: null }), /does not fit the node body cap even at its floor/);
 });
 
 test("the PR body names the graph artifact and the digest it is bound to, and says the text alone is not evidence", () => {

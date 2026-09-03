@@ -641,33 +641,45 @@ it (`factory.definition`, stamped by `loadFactoryDefinition`). Every step must
 judge the SAME head: a fix cycle that moves the head restarts the pipeline from
 gate 0 (a gate already passed at the current head stands; cycle caps are
 cumulative across restarts; fact ids fold the judged head in, so the superseded
-fact keeps its own id), and an unreadable change fails every gate kind closed.
+fact keeps its own id), and an unreadable change fails every gate kind closed —
+a read that fails AFTER a fix cycle leaves the judged commit UNKNOWN in the fact
+and the chain, never the pre-fix head.
 The integration stage REFUSES (settled failed, never a fix cycle — a fix
 commits and so can never restore equality) when its own re-read of the tree
 finds a head other than the one the last passing gate judged (`gatedHead`); its
 OWN fix cycles move the head by construction, so after each one the moved head
 is handed back through `deps.regate` (re-running the real pipeline) and only a
-pass at exactly that head lets it land. `runGateAndIntegration` SETTLES the run
-record first, then writes ONE `art-attest-<stem>-<run>-<hash>` artifact per run
+pass at exactly that head lets it land. `runGateAndIntegration` CLAIMS the run
+record's ownership nonce (`claimGateRecord`, under the record lock) BEFORE the
+first gate runs — a record another pipeline settled, or one a live worker is
+gating, refuses the pipeline outright (`not_run` + `superseded`: no fact, no
+escalation, no demotion, no attestation; only a dead owner's record is taken
+over) — then SETTLES the run record through that claim's `own` door, then
+writes ONE `art-attest-<stem>-<run>-<hash>` artifact per run
 (`schema: spor.attestation/1` — subject/factory/gate/integration/
 configIntegrity/timing/environment, `lib/shell/attestation.js`; `allPassed`
 also checks every step bound to the subject commit; the JSON is thinned to fit
-the 8KB node cap, never byte-cut) linking every fact, stamping
+the 8KB node cap, never byte-cut — the floor is bounded and MEASURED, and a
+missing attestation is stamped `gate_attestation_missing`/`_error` on the
+record) linking every fact, stamping
 `gate_head`/`gate_attestation`/… on the record — but ONLY when its own settle
 LANDED: the settle is a LOCKED compare-and-swap (`stampGateState` takes a
 per-record `.lock`, O_EXCL, stale after 30s, and returns the record read back
-from disk) that mints a random `gate_settle_id`; a duplicate pipeline that lost
+from disk) keyed on the claim's random `gate_settle_id`; a duplicate pipeline that lost
 the settle race writes no attestation and touches no evidence field
 (`superseded: true`, carrying the record's own verdict as `settled`, which is
 what the work loop publishes on `--status` — the loser's stays labeled
 `superseded_verdict`), and the post-settle stamps go through `stampGateState`'s
 `own: <gate_settle_id>` door, never `force`. Every attestation is BOUND —
 `digest` (sha256 over the canonical JSON of its core — subject, verdicts,
-config, and the integration stage's bound fields INCLUDING the candidate-suite
-evidence and proposal identity — which survives the node-body ladder via
-`steps_digest`/`gates_digest`) plus an
+config (protected paths by count + digest, never the list), and the
+integration stage's bound fields INCLUDING the candidate-suite evidence and
+proposal identity — which survives the node-body ladder via
+`steps_digest`/`gates_digest`/`protected_paths_digest`) plus an
 HMAC-SHA256 `signature` when `attestation.signingKey` (`SPOR_ATTESTATION_KEY`,
-a secret stripped from repo `.spor.json`) is set — and the definition digests
+a secret stripped from repo `.spor.json`) is set; verification with neither a
+key nor the graph copy FAILS (`anchor`), so `spor attestation verify --no-graph`
+requires a verified signature and is refused on a box with no key — and the definition digests
 hash the runtime-effective definition only (gate `source` stripped, so inline
 == referenced). In `propose` mode the same attestation rides in the PR body
 between `<!-- spor-attestation:begin/end -->` markers, refreshed with the final
