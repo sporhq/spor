@@ -512,7 +512,7 @@ written only after the outcome dimension exists):
 | `gate_reason` | string | optional — the settled verdict's one-line reason |
 | `gate_fix_run_id` | string | optional — the run id of the most recent fix cycle this pipeline dispatched at the same node, stamped the moment it was dispatched (not when it finishes). If a stop lands while that fix cycle is still going, this field is what turns "the pipeline was abandoned" into "here is the run to go check" — a fix cycle's own dispatched run is detached and keeps going regardless (§10.7), and this is the only durable pointer to it. `spor runs`/`spor work --status` surface it. |
 | `gate_fix_at` | ISO 8601 | when `gate_fix_run_id` was stamped |
-| `gate_progress` | object | optional — `{key, at, seq, gates: {<gate id>: {fixes, attempts, ledger, lastFix}}}`: each gate's own memory (§10.4), saved after every review verdict and BEFORE every fix dispatch. `key` is the attempt's run key — a resumed pipeline of the same attempt reads it back; a `--regate` (a new attempt) ignores it. Best-effort like every `gate_*` stamp: a write that fails is logged and the pipeline goes on |
+| `gate_progress` | object | optional — `{key, at, seq, gates: {<gate id>: {fixes, attempts, ledger, lastFix}}}`: each gate's own memory (§10.4), saved after every review verdict (with the fix it decided on as `lastFix.dispatched: false`) and again when the fix's launch is known (`fixes` counts LAUNCHED fixes only). `key` is the attempt's run key — a resumed pipeline of the same attempt reads it back; a `--regate` (a new attempt) ignores it. Best-effort like every `gate_*` stamp: a write that fails is logged and the pipeline goes on |
 
 A consumer reading `gate_state` as a verdict must check it is one of the three
 settled values: `running` under a worker that is gone is a claim nobody
@@ -773,9 +773,13 @@ declared `profile` (cross-model by convention; the machine's own declared
 harness binding still decides what actually executes — a graph write never
 defines what a box runs), **read-only** (`spor dispatch --read-only`: Codex's
 `--sandbox read-only`, Claude Code's plan permission mode, OpenCode's built-in
-`plan` agent (edit denied everywhere), Copilot's `--deny-tool write` (the
-file-writing tool denied at the permission layer; its shell tool stays so the
-reviewer can run tests, which is the honest limit of that posture) — the
+`plan` agent (edit denied everywhere), Copilot's `--deny-tool write --deny-tool
+shell` (the file-writing tool AND the shell tool denied at the permission
+layer — Copilot has no sandbox, and a shell command writes the live checkout as
+freely as the write tool, so leaving `shell` open was a prompt-bounded posture,
+not an enforced one; the named cost is that a Copilot-routed reviewer cannot run
+commands and therefore cannot DEMONSTRATE a blocking finding — its verdicts are
+advisory, and a gate that needs blocking power routes elsewhere) — the
 reviewer reads the implementer's live checkout, so it must not be able to write
 to it, and the posture overrides any write-capable `--sandbox`/
 `--permission-mode` the worker's passthrough carries. A harness with NO
@@ -827,10 +831,19 @@ fixer had been sent to fix — so the protocol the parser enforces is:
   down to "nothing blocking".
 - **A blocking finding must be demonstrated.** It carries `evidence` naming
   the command or test the reviewer ran and what it showed; one without it is
-  downgraded to advisory (the record says why). On a fix cycle a NEW blocking
-  finding must also be one the fix **introduced** (`introduced_by_fix: true`)
-  — a defect available at the initial review and not raised then does not move
-  the goalposts now; it is recorded for a person to weigh.
+  downgraded to advisory (the record says why). But that downgrade is never
+  laundered into an approval: a `changes_requested` backed ONLY by
+  undemonstrated blocking findings is **unreadable and fails closed** (for the
+  prior set only), with the downgraded findings recorded as advisory on the
+  ledger and handed to the fixer — the reviewer asked for changes and named
+  what it rated blocking, and the protocol's answer is "demonstrate it", not
+  "passed". The next review is handed those entries as **raised** and may
+  demonstrate one by ITS id; it then counts as raised at its original cycle
+  (the ledger upgrades the entry in place), not as a goalpost. On a fix cycle
+  any OTHER new blocking finding must be one the fix **introduced**
+  (`introduced_by_fix: true`) — a defect available at the initial review and
+  not raised then does not move the goalposts now; it is recorded for a person
+  to weigh.
 - **Every prior finding is answered first.** The runner keeps a **finding
   ledger** per gate — ids `F1, F2, …` minted in the order findings were first
   raised, never reused — and hands review N its open blocking entries as
@@ -859,10 +872,15 @@ so the rescue lane and `/spor:factory`'s telemetry read convergence per gate
 without re-reading every report. The ledger, the fix-cycle count, the attempt
 history and the last fix are also **durable**: the runner saves them per gate
 onto the pipeline's run record (`gate_progress`, §10.8) after every step that
-changes them — the fix COUNTED before its dispatch, not after — so a pipeline a
-killed worker left behind resumes each review gate at the cycle it reached
-with its prior findings intact, and the cap is a cap across interruptions
-rather than a fresh allowance per one. The kernel default is still `cycles: 0` (a
+changes them — a fix is recorded PENDING (`lastFix.dispatched: false`) in the
+same save as the verdict that decided on it, and COUNTED the moment its launch
+is known (the dispatch's launch callback, or its completion), never before —
+so a pipeline a killed worker left behind resumes each review gate at the
+cycle it reached with its prior findings intact: a worker killed before the
+launch resumes INTO the unrun fix, one killed after it resumes past it, and a
+cycle whose review ran but whose next step never landed is rolled out of the
+ledger and re-run with fresh ids. The cap is a cap across interruptions rather
+than a fresh allowance per one, and never one fix short. The kernel default is still `cycles: 0` (a
 factory opts into re-dispatching an implementer); a factory that routes to a
 review gate should declare at least one, since with the floor above the only
 thing that reaches a person is a demonstrated blocking finding the implementer

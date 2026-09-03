@@ -10199,7 +10199,7 @@ function makeGateDeps(
   // checkout and raise a fourth new finding where three were already open.
   // The verdict protocol it is asked to follow is the one
   // gates.parseReviewVerdict enforces; the prose here only explains it.
-  const review = async ({ gate, cycle, prior = [], fix = null }) => {
+  const review = async ({ gate, cycle, prior = [], raised = [], fix = null }) => {
     if (!change) return { ok: false, reason: "the change under review could not be read" };
     const cap = gatesKernel.cycleCap(gate);
     const item = await workItemText();
@@ -10207,6 +10207,9 @@ function makeGateDeps(
     const fixText = fix ? gateFixText(change, fix) : "";
     const priorText = prior
       .map((p) => `${p.id} [${p.severity}] ${p.file ? `${p.file} — ` : ""}${p.summary}${p.evidence ? `\n    evidence: ${String(p.evidence).replace(/\s+/g, " ").slice(0, 400)}` : ""}`)
+      .join("\n");
+    const raisedText = raised
+      .map((p) => `${p.id} [${p.severity}, undemonstrated at cycle ${p.opened}] ${p.file ? `${p.file} — ` : ""}${p.summary}`)
       .join("\n");
     const verdictShape =
       `{"verdict": "pass" | "changes_requested",` +
@@ -10252,11 +10255,23 @@ function makeGateDeps(
       "",
       gate.instructions || "Look for correctness defects: does this change do what the work item asked, and does it break anything?",
       "",
+      ...(raised.length
+        ? [
+            "## Earlier findings rated blocking but not demonstrated",
+            "",
+            "These were recorded as advisory because no command or test backed them. If you can DEMONSTRATE one now,",
+            "raise it again under `findings` with ITS id and `evidence`; it then counts as raised at its original cycle.",
+            "",
+            raisedText,
+            "",
+          ]
+        : []),
       "## Severity — only `blocking` blocks",
       "",
       "- `blocking`: a correctness defect, silent data loss, or contract break that MUST be fixed before this lands —",
       "  and that you DEMONSTRATED: `evidence` names the command or test you ran and what it showed. A blocking",
-      "  finding without evidence is recorded as advisory, not enforced.",
+      "  finding without evidence is recorded as advisory, not enforced — and a `changes_requested` backed ONLY by",
+      "  undemonstrated blocking findings is unreadable (it fails closed, it is not a pass): demonstrate what you block on.",
       ...(cycle > 0
         ? [
             "- On a fix cycle, a NEW blocking finding must be one the fix INTRODUCED (`introduced_by_fix: true`). A defect",
@@ -10291,7 +10306,7 @@ function makeGateDeps(
     return { ok: true, text, runId: launched.run.run_id };
   };
 
-  const fix = async ({ gate, cycle, findings, detail, evidence, ledger }) => {
+  const fix = async ({ gate, cycle, findings, detail, evidence, ledger, onLaunch = null }) => {
     // The one place the worker deliberately passes --force. The loop never
     // does (a loop that forces past the resolved/duplicate guards is the
     // runaway a pull worker must not be), but here the runner KNOWS why the
@@ -10340,6 +10355,16 @@ function makeGateDeps(
     // can't race the loop's own interrupted/passed/failed stamp into anything
     // wrong — worst case is a stale id on a pipeline that has already settled.
     dispatchRuns.stampGateState(home, entry.run_id, { gate_fix_run_id: launched.run.run_id, gate_fix_at: new Date().toISOString() });
+    // …and the runner charges the fix cycle to the gate's progress at this
+    // same moment: launched, not merely decided on (a worker killed before
+    // this line resumes INTO the fix; one killed after it resumes past it).
+    if (onLaunch) {
+      try {
+        await onLaunch({ runId: launched.run.run_id });
+      } catch (e) {
+        warn(`warning: the fix cycle's launch could not be recorded on the gate's progress (${(e && e.message) || e})`);
+      }
+    }
     // The operator's own ceiling on how long this box follows a run (--run-max),
     // not a second hardcoded day: a fix cycle holds a gating slot exactly as a
     // dispatched run holds an active one.

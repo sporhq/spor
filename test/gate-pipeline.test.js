@@ -386,16 +386,22 @@ test("a resumed pipeline carries the finding ledger and the fix-cycle count, so 
   a.deps.saveGateProgress = async ({ gate, progress }) => saves.push({ gate: gate.id, progress: JSON.parse(JSON.stringify(progress)) });
   await gateRunner.runGatePipeline({ item: ITEM, factory, deps: a.deps });
   assert.strictEqual(a.seen.fixes.length, 3);
-  // The count is saved BEFORE each fix dispatch (a worker killed while it waits
-  // on the fix must resume AFTER it, not dispatch it twice): the save preceding
-  // the second fix already says two fixes.
-  const beforeSecondFix = saves.find((s) => s.progress.fixes === 2 && s.progress.lastFix && s.progress.lastFix.runId === null);
-  assert.ok(beforeSecondFix, "progress is saved with the fix counted before the fix is dispatched");
+  // The count is charged the moment the fix's LAUNCH is durably known (the
+  // fake fix dep reports none, so at its completion) — a worker killed while
+  // it waits on the fix must resume AFTER it, not dispatch it twice. The save
+  // that precedes the second fix records it PENDING (`dispatched: false`)
+  // under the unchanged count of one, so a crash before the launch resumes
+  // INTO that fix rather than past it (review finding 2 on the second cut).
+  const beforeSecondFix = saves.find((s) => s.progress.fixes === 1 && s.progress.lastFix && s.progress.lastFix.dispatched === false && s.progress.lastFix.cycle === 1);
+  assert.ok(beforeSecondFix, "progress is saved with the fix pending before the fix is dispatched");
   assert.deepStrictEqual(beforeSecondFix.progress.ledger.map((e) => [e.id, e.status]), [["F1", "open"]]);
   assert.strictEqual(beforeSecondFix.progress.attempts.length, 2, "two reviews had run");
+  const afterSecondFix = saves.find((s) => s.progress.fixes === 2 && s.progress.lastFix && s.progress.lastFix.dispatched === true);
+  assert.ok(afterSecondFix, "…and charged once the fix ran");
+  assert.strictEqual(afterSecondFix.progress.lastFix.runId, "run-fix-a");
 
-  // Worker B adopts the orphan with exactly that snapshot — as if A died
-  // waiting on its second fix cycle.
+  // Worker B adopts the orphan as if A died waiting on its second fix cycle
+  // (the fix launched: the snapshot after it).
   const handed = [];
   const b = fakes({
     review: (args) => {
@@ -404,7 +410,7 @@ test("a resumed pipeline carries the finding ledger and the fix-cycle count, so 
     },
     fix: () => ({ ok: true, runId: "run-fix-b" }),
   });
-  b.deps.loadGateProgress = async () => beforeSecondFix.progress;
+  b.deps.loadGateProgress = async () => afterSecondFix.progress;
   const resumedSaves = [];
   b.deps.saveGateProgress = async ({ progress }) => resumedSaves.push(JSON.parse(JSON.stringify(progress)));
   const logs = [];
@@ -420,6 +426,61 @@ test("a resumed pipeline carries the finding ledger and the fix-cycle count, so 
   assert.match(b.seen.facts[0].markdown, /4 attempts: the initial one plus 3 fix cycles, cap 3/);
   assert.ok(logs.some((l) => /resumed on task-demo at fix cycle 2\/3 — 1 ledger finding\(s\) carried/.test(l)), logs.join("\n"));
   assert.ok(resumedSaves.every((p) => p.fixes <= 3));
+
+  // Worker B' adopts the PENDING snapshot instead — A died between deciding on
+  // its second fix and launching it. The fix is dispatched (not skipped), no
+  // review is re-run for cycle 1, and the cap still holds at three fixes.
+  const handedP = [];
+  const bp = fakes({
+    review: (args) => {
+      handedP.push(args.cycle);
+      return confirming(args);
+    },
+    fix: () => ({ ok: true, runId: "run-fix-bp" }),
+  });
+  bp.deps.loadGateProgress = async () => beforeSecondFix.progress;
+  const logsP = [];
+  const resP = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: bp.deps, log: (l) => logsP.push(l) });
+  assert.strictEqual(resP.state, "failed");
+  assert.deepStrictEqual(bp.seen.fixes.map((f) => f.cycle), [1, 2], "the never-launched second fix runs first, then the third");
+  assert.deepStrictEqual(bp.seen.fixes[0].findings.map((f) => f.id), ["F1"], "…with the findings the review it followed had decided on");
+  assert.deepStrictEqual(bp.seen.reviews.map((r) => r.cycle), [2, 3], "cycle 1's review is not re-run: it already ran");
+  assert.strictEqual(bp.seen.escalations[0].attempts.length, 4);
+  assert.ok(logsP.some((l) => /the fix for cycle 1 never launched, dispatching it first/.test(l)), logsP.join("\n"));
+
+  // A fix dep that reports its launch (`onLaunch`, as the real one does from
+  // cmdDispatch) charges the cycle at that moment, before the long wait.
+  const launchSaves = [];
+  const l = fakes({
+    review: confirming,
+    fix: async ({ onLaunch }) => {
+      await onLaunch({ runId: "run-fix-l" });
+      launchSaves.push(JSON.parse(JSON.stringify(saves2[saves2.length - 1].progress)));
+      return { ok: true, runId: "run-fix-l" };
+    },
+  });
+  const saves2 = [];
+  l.deps.saveGateProgress = async ({ progress }) => saves2.push({ progress: JSON.parse(JSON.stringify(progress)) });
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: l.deps });
+  assert.deepStrictEqual(launchSaves.map((p) => [p.fixes, p.lastFix.dispatched, p.lastFix.runId]), [[1, true, "run-fix-l"], [2, true, "run-fix-l"], [3, true, "run-fix-l"]]);
+
+  // A snapshot whose review at the resume cycle ran but whose next step was
+  // never durably decided (the fold saved, the worker died before the pass or
+  // escalation landed) rolls that cycle's fold back and re-runs the review —
+  // the redo's findings get fresh ids, never an earlier attempt's (review
+  // finding 3 on the second cut).
+  const afterReview1 = saves.find((s) => s.progress.fixes === 1 && s.progress.attempts.length === 2);
+  const redoSnapshot = JSON.parse(JSON.stringify(afterReview1.progress));
+  redoSnapshot.lastFix = { ...redoSnapshot.lastFix, dispatched: true }; // not pending: as if the next step had been a pass/escalation
+  const redo = fakes({
+    review: ({ prior }) => ({ ok: true, text: `\`\`\`json\n{"verdict":"changes_requested","prior":[${prior.map((p) => `{"id":"${p.id}","status":"open"}`).join(",")}],"findings":[{"severity":"blocking","summary":"the redo's own finding","evidence":"e","introduced_by_fix":true}]}\n\`\`\`` }),
+    fix: () => ({ ok: true, runId: "run-fix-redo" }),
+  });
+  redo.deps.loadGateProgress = async () => redoSnapshot;
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: redo.deps });
+  assert.deepStrictEqual(redo.seen.reviews.map((r) => r.cycle), [1, 2, 3], "the review at cycle 1 is re-run");
+  assert.deepStrictEqual(redo.seen.fixes[0].findings.map((f) => [f.id, f.summary]), [["F1", "off by one"], ["F2", "the redo's own finding"]]);
+  assert.strictEqual(redo.seen.escalations[0].attempts.length, 4, "the rolled-back attempt is not double counted");
 
   // A snapshot that already used the whole allowance resumes straight into the
   // escalating review: one more review, no fix.
