@@ -3422,3 +3422,38 @@ test("the real rescue dispatch runs under the rescue profile in the run's own ch
   assert.match(md, /title: Gate escalation — adversarial-review refused task-fix-me after rescue/);
   assert.match(md, /requires: \[human\]/);
 });
+
+test("a resumed rescue that had already failed to run escalates the handed refusal — never re-judging a rescue pass that never happened — and the resumed seed carries every gate", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }, { id: "review", kind: "agent-review", profile: "profile-review" }], rescue: { ...RESCUE, attempts: 2 } });
+  // Worker A: the rescue could not be dispatched; A died before the escalation landed.
+  const states = [];
+  const a = withRescue(fakes({ review: confirmOpen }), () => ({ ok: false, reason: "not satisfiable" }));
+  a.deps.saveRescueState = async ({ rescues }) => states.push(JSON.parse(JSON.stringify(rescues)));
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: a.deps });
+  const failed = states.find((s) => s[0].done && s[0].error);
+  assert.ok(failed);
+  const b = withRescue(fakes({ review: confirmOpen }));
+  b.deps.loadRescueState = async () => failed;
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b.deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(b.seen.rescues.length, 0, "no second rescue is minted for a first that never ran");
+  assert.deepStrictEqual(b.seen.suites, [], "no rescue pass ran");
+  assert.strictEqual(b.seen.escalations.length, 1);
+  assert.deepStrictEqual(b.seen.escalations[0].rescues.map((r) => [r.n, r.error]), [[1, "not satisfiable"]]);
+
+  // Resumed inside a launched rescue whose pass then refuses at the FIRST
+  // gate: the second rescue's seed still carries the review gate's ledger.
+  const c = withRescue(fakes({ review: confirmOpen }), () => ({ ok: true, runId: "run-rescue-1", diagnosis: "d", category: "environment", fixed: true, filed: [] }));
+  const launched = { n: 1, gate: "review", verdict: "failed", detail: "F1 open", evidence: "", findings: [], attempts: [{ verdict: "failed" }], ledger: [{ id: "F1", severity: "blocking", file: "lib/x.js", summary: "off by one", status: "open", blocking: true, opened: 0, closed: null, evidence: "e" }], fact: "art-gate-review-demo-runabcde-deadbeef", seed: { acceptance: { ledger: [], base: 1 }, review: { ledger: [{ id: "F1", severity: "blocking", file: "lib/x.js", summary: "off by one", status: "open", blocking: true, opened: 0, closed: null, evidence: "e" }], base: 1 } }, dispatched: true, runId: "run-rescue-1", done: false, diagnosis: null, category: null, fixed: null, filed: [], error: null };
+  let suiteRuns = 0;
+  c.deps.runSuite = async () => ({ ok: ++suiteRuns > 1 }); // the resumed pass fails the suite; the second rescue's pass gets past it
+  c.deps.loadRescueState = async () => [launched];
+  const resC = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: c.deps });
+  assert.strictEqual(resC.state, "failed");
+  assert.strictEqual(c.seen.rescues.length, 2);
+  assert.deepStrictEqual(c.seen.rescues[1].previous.map((p) => p.n), [1]);
+  assert.strictEqual(c.seen.rescues[0].attempt, 1, "the launched rescue is re-entered, not re-minted");
+  const reviewInPass2 = c.seen.reviews.find((r) => r.cycle === 1);
+  assert.ok(reviewInPass2, "the review gate in rescue pass 2 runs at the carried base, with the carried ledger");
+  assert.deepStrictEqual(c.seen.escalations[0].ledger.map((e) => e.id), ["F1"]);
+});
