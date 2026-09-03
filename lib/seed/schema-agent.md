@@ -14,9 +14,10 @@ with `kind: node-schema` and the same `node_type` overrides this entry.
 
 An agent node makes a person's automation principal first-class instead of an
 anonymous flag on a write (dec-spor-agent-identity-nodes). It generalizes the
-workflow-run principal the graph already carries: an interactively dispatched
-`claude --bg` session is just another principal kind owned by a person, so its
-created nodes can read "agent on behalf of person" instead of person-direct.
+workflow-run principal the graph already carries: a dispatched Claude Code run
+(a supervised `claude -p`, or an opt-in `claude --bg` session) is just another
+principal kind owned by a person, so its created nodes can read "agent on
+behalf of person" instead of person-direct.
 
 **Grain: persistent + lightweight runs.** One durable agent node per
 machine/install, created once (e.g. `agent-anthony-laptop`) by `spor agent

@@ -24,7 +24,8 @@ already supports:
 
 - `harness:` — the launcher/adapter the work runs under (`claude-code` |
   `codex` | `opencode` | …), operationalizing dec-cc-portable-core-adapters
-  (claude-code → `claude --bg`, codex/opencode → their CLIs). A flat scalar.
+  (claude-code → `claude -p` under the shared supervisor, codex/opencode →
+  their CLIs). A flat scalar.
 - `model:` — the model id passed to the harness (`--model`). A flat scalar.
 - `skills:` / `plugins:` / `mcp:` — inline lists of the skills, plugins, and MCP
   servers the harness preloads; `mcp` is merged into the strict `--mcp-config`

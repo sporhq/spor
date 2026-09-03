@@ -892,7 +892,8 @@ server-side (issue-cc-onboarding-email-mismatch-silent-degradation).
 ### Agents (person-owned principals)
 
 An `agent` node (prefix `agent-`) is a person's automation principal — the
-durable identity of a dispatched `claude --bg` session
+durable identity of a dispatched Claude Code run (a supervised `claude -p`, or
+an opt-in `claude --bg` session)
 (dec-spor-agent-identity-nodes). It generalizes the workflow-run principal: a
 dispatched session is just another principal kind owned by a person, so work it
 creates reads "agent **on behalf of** person" rather than person-direct.
@@ -972,8 +973,8 @@ date: 2026-06-18
 ```
 
 - `harness:` (`claude-code` | `codex` | `opencode` | …) selects the launcher
-  (dec-cc-portable-core-adapters: claude-code → `claude --bg`, others → their
-  CLIs); `model:` → the harness `--model`; `skills`/`plugins` are preloaded;
+  (dec-cc-portable-core-adapters: claude-code → `claude -p` under the shared
+  supervisor, others → their CLIs); `model:` → the harness `--model`; `skills`/`plugins` are preloaded;
   `mcp` is merged into the strict `--mcp-config` dispatch writes, so the agent's
   toolset is exactly the profile plus the agent-spor server, nothing ambient
   (dec-spor-session-identity-active-record).
