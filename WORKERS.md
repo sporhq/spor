@@ -837,15 +837,22 @@ fixer had been sent to fix — so the protocol the parser enforces is:
   down to "nothing blocking".
 - **A blocking finding must be demonstrated.** It carries `evidence` naming
   the command or test the reviewer ran and what it showed; one without it is
-  downgraded to advisory (the record says why). But that downgrade is never
-  laundered into an approval: a `changes_requested` backed ONLY by
-  undemonstrated blocking findings is **unreadable and fails closed** (for the
-  prior set only), with the downgraded findings recorded as advisory on the
-  ledger and handed to the fixer — the reviewer asked for changes and named
-  what it rated blocking, and the protocol's answer is "demonstrate it", not
-  "passed". The next review is handed those entries as **raised** and may
-  demonstrate one by ITS id; it then counts as raised at its original cycle
-  (the ledger upgrades the entry in place), not as a goalpost. On a fix cycle
+  downgraded to advisory (the record says why). Evidence is a non-empty
+  STRING naming what was run — a boolean `true`, a number, an object or a
+  bare "yes"/"n/a" is not a demonstration. A `changes_requested` backed ONLY
+  by undemonstrated blocking findings therefore does NOT fail the gate: the
+  contract is demonstrated-only, and charging a fix cycle (and at the cap a
+  person) to findings nobody demonstrated is the goalpost-moving it exists to
+  stop. It passes, with the downgraded findings recorded as advisory on the
+  ledger and the fact, and the record says what the reviewer claimed and
+  could not back. A LATER review (another cycle, a re-gate) is handed those
+  entries as **raised** and may demonstrate one by ITS id — provided it is
+  the same finding: the entry's file must match, and the upgrade takes the
+  ledger's file and summary as its identity (the reviewer's wording rides
+  beside them as a restatement). A borrowed id under a different file is
+  stripped and the finding read as the new one it is, subject to the
+  fix-cycle floor. It then counts as raised at its original cycle (the ledger
+  upgrades the entry in place), not as a goalpost. On a fix cycle
   any OTHER new blocking finding must be one the fix **introduced**
   (`introduced_by_fix: true`) — a defect available at the initial review and
   not raised then does not move the goalposts now; it is recorded for a person

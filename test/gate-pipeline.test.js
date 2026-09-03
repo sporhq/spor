@@ -1994,6 +1994,81 @@ test("a fix cycle's run id is stamped onto the pipeline's own run BEFORE the lon
   await fixOutcome;
 });
 
+// Review finding 4 on the third cut: a worker killed after the fix cycle's
+// dispatch returned but before its launch was durably recorded — between the
+// launch and the `gate_fix_run_id` stamp, or between that stamp and the
+// runner's launched-progress save — resumed with `lastFix.dispatched: false`
+// and dispatched the SAME fix again: two implementers in one checkout. Two
+// doors close it: the stamp now says which gate and cycle it was, so
+// loadGateProgress reads the launch back from it; and the fix closure adopts a
+// run already launched under the fix's own (unique) name instead of dispatching.
+test("an already-launched fix cycle is adopted on resume, never dispatched a second time", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-fix-adopt-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  const runId = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, {
+    run_id: runId, node_id: "task-adopt", state: "done", terminal_state: "resolved", terminal_enforced: true,
+    created_at: new Date().toISOString(), gate_state: "running", gate_worker: "w1", gate_at: new Date().toISOString(),
+  });
+  const dispatchCalls = [];
+  let n = 0;
+  const mk = () =>
+    sporCli.makeGateDeps(cfg, {
+      record: { node_id: "task-adopt", cwd: home },
+      entry: { run_id: runId, node_id: "task-adopt", project: null },
+      factory: { id: "factory-test" }, slug: null, passthrough: {}, warn: () => {}, log: () => {}, stopping: () => false, home,
+      runMaxMs: 500,
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      dispatch: async (_cfg, values) => {
+        n += 1;
+        dispatchCalls.push(values);
+        const id = `fix-run-${n}`;
+        // What a real dispatch does before returning: the child's own run record.
+        dispatchRuns.atomicJson(dispatchRuns.runPaths(home, id).record, { run_id: id, node_id: "task-adopt", name: values.name, state: "done", created_at: new Date().toISOString() });
+        return { ok: true, run: { run_id: id, harness: "fake" } };
+      },
+    });
+  const gate = { id: "review", cycles: 2 };
+  const launches = [];
+  const onLaunch = async (l) => launches.push(l.runId);
+
+  // First launch: dispatched once, stamped with its gate and cycle.
+  const first = await mk().fix({ gate, cycle: 1, findings: [], detail: "d", evidence: "", onLaunch });
+  assert.strictEqual(first.ok, true, first.reason);
+  assert.deepStrictEqual([dispatchCalls.length, first.runId, launches], [1, "fix-run-1", ["fix-run-1"]]);
+  const stamped = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  assert.deepStrictEqual([stamped.gate_fix_run_id, stamped.gate_fix_gate, stamped.gate_fix_cycle], ["fix-run-1", "review", 1]);
+
+  // Door 1: the resume path re-enters deps.fix for the same gate and cycle
+  // (the runner's pendingFix) — the launched run is adopted by name; no
+  // second dispatch, and onLaunch still charges it.
+  const again = await mk().fix({ gate, cycle: 1, findings: [], detail: "d", evidence: "", onLaunch });
+  assert.strictEqual(again.ok, true, again.reason);
+  assert.deepStrictEqual([dispatchCalls.length, again.runId, launches], [1, "fix-run-1", ["fix-run-1", "fix-run-1"]], "adopted, not re-dispatched");
+  // A different cycle (or gate) is a different fix and does dispatch.
+  const next = await mk().fix({ gate, cycle: 2, findings: [], detail: "d", evidence: "", onLaunch });
+  assert.deepStrictEqual([dispatchCalls.length, next.runId], [2, "fix-run-2"]);
+  assert.strictEqual(dispatchCalls[1].name, "fix-review-bbbbbbbb-2");
+
+  // Door 2: a progress entry saved BEFORE the launch (dispatched: false) whose
+  // launch the stamp records for this gate and cycle reads back as launched
+  // and charged — the runner then resumes past it, not into it.
+  const deps = mk();
+  await deps.saveGateProgress({ gate, progress: { fixes: 2, attempts: [{}, {}, {}], ledger: [], lastFix: { cycle: 2, runId: null, dispatched: false, fromHead: "abc", toHead: null } } });
+  const back = await deps.loadGateProgress({ gate });
+  assert.deepStrictEqual([back.fixes, back.lastFix.dispatched, back.lastFix.runId], [3, true, "fix-run-2"]);
+  // …but a stamp from ANOTHER gate or cycle does not launder a pending fix.
+  await deps.saveGateProgress({ gate, progress: { fixes: 1, attempts: [{}, {}], ledger: [], lastFix: { cycle: 1, runId: null, dispatched: false, fromHead: "abc", toHead: null } } });
+  const other = await deps.loadGateProgress({ gate });
+  assert.deepStrictEqual([other.fixes, other.lastFix.dispatched, other.lastFix.runId], [1, false, "fix-run-2"], "the stamp names cycle 2; cycle 1's pending fix stays pending (the run id still rides for the record)");
+  const foreign = await deps.loadGateProgress({ gate: { id: "acceptance" } });
+  assert.strictEqual(foreign, null);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 // ------------------------------------------------------------------- the CLI --
 
 const HARNESS = "gatefake";
@@ -2786,7 +2861,7 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
     entry: { run_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", node_id: "task-fix-me", project: null },
     factory: { id: "factory-test" },
     slug: null,
-    passthrough: { sandbox: "danger-full-access" },
+    passthrough: { sandbox: "danger-full-access", "permission-mode": "bypassPermissions", model: "worker-model", as: "agent-worker" },
     warn: () => {}, log: () => {}, stopping: () => false, home,
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     dispatch: async (_cfg, values, positionals) => {
@@ -2806,6 +2881,15 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.strictEqual(first.ok, true, first.reason);
   assert.strictEqual(launches[0].values["read-only"], true, "the reviewer is launched read-only");
   assert.strictEqual(launches[0].values["no-worktree"], true);
+  // Review finding 5 on the third cut: the worker's harness-specific flags
+  // (Claude Code's --permission-mode, Codex's --sandbox, the worker's --model)
+  // describe the IMPLEMENTER's harness; a review under a different harness's
+  // profile was refused outright by that adapter's foreign-flag check.
+  for (const k of ["sandbox", "permission-mode", "model", "agent", "approval-policy"]) {
+    assert.strictEqual(launches[0].values[k], undefined, `the worker's --${k} does not ride to the reviewer`);
+  }
+  assert.strictEqual(launches[0].values.as, "agent-worker", "harness-neutral keys still ride");
+  assert.strictEqual(launches[0].values.profile, "profile-review");
   const p0 = launches[0].prompt;
   assert.match(p0, /\(the initial review\)/);
   assert.match(p0, /## The work item\n\ntask-fix-me: Make the bound exclusive\n\nThe loop over-reads by one element\.\n\nAcceptance: reading N items yields N\./, "the work item's title, summary and body are in the prompt");
@@ -2838,7 +2922,8 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   let fixLaunch = null;
   const fixDeps = sporCli.makeGateDeps(cfg, {
     record: { node_id: "task-fix-me", cwd: repo }, entry: { run_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", node_id: "task-fix-me", project: null },
-    factory: { id: "factory-test" }, slug: null, passthrough: {}, warn: () => {}, log: () => {}, stopping: () => false, home, runMaxMs: 50,
+    factory: { id: "factory-test" }, slug: null, passthrough: { sandbox: "danger-full-access", "permission-mode": "bypassPermissions", model: "worker-model" },
+    warn: () => {}, log: () => {}, stopping: () => false, home, runMaxMs: 50,
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     dispatch: async (_cfg, values, positionals) => {
       fixLaunch = { values, prompt: positionals[0] };
@@ -2856,6 +2941,11 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   });
   assert.ok(fixLaunch, "the fix cycle was dispatched");
   assert.strictEqual(fixLaunch.values["read-only"], undefined, "the FIXER is not read-only");
+  assert.deepStrictEqual(
+    [fixLaunch.values.sandbox, fixLaunch.values["permission-mode"], fixLaunch.values.model],
+    ["danger-full-access", "bypassPermissions", "worker-model"],
+    "…and runs in the worker's own lane, full passthrough intact"
+  );
   assert.match(fixLaunch.prompt, /\(fix cycle 2 of 2\)/);
   assert.match(fixLaunch.prompt, /Blocking findings — fix each, by id:\nF2 \[blocking\] x\.js — still over-reads on empty input/);
   assert.match(fixLaunch.prompt, /Advisory \(recorded, not enforced — fix if cheap\):\nF3 \[major\] x\.js — name the constant/);

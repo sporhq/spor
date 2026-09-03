@@ -648,7 +648,17 @@ and their verdicts are advisory). An unreadable verdict (unrecognized word, no
 structured verdict) carries the whole prior set to the fixer still open; a
 fresh finding reusing a resolved ledger id mints a new entry; the fold
 snapshots every entry it touches (`prev`) so `rollbackCycle` restores it
-exactly, evidence included. `cycles` counts FIX dispatches (`cycles: 3` = initial review + 3 fixes). **human** arms on
+exactly, evidence included. Evidence is a non-empty STRING (a boolean `true`
+or a bare "yes" is not a demonstration), a `changes_requested` backed only by
+undemonstrated blocking findings PASSES with them recorded as advisory (the
+contract is demonstrated-only; failing it charged fix cycles to nothing), an
+upgrade by id must match the ledger entry's file and takes the ledger's
+identity, the review dispatch drops the worker's harness flags
+(`permission-mode`/`sandbox`/`approval-policy`/`agent`/`model` — a foreign flag
+is refused by the reviewer's adapter), and a fix cycle already launched under
+its unique run name is ADOPTED on resume, never dispatched twice
+(`gate_fix_gate`/`gate_fix_cycle` ride the stamp so `loadGateProgress` reads
+the launch back). `cycles` counts FIX dispatches (`cycles: 3` = initial review + 3 fixes). **human** arms on
 declared risk classes, files an approval item and BLOCKS the resolve until a
 live RESOLVING EDGE (approved — a bare status flip is not an approval) or any
 other terminal status (refused) answers it, reporting `blocked` at `approval_timeout_ms` rather than deciding for the

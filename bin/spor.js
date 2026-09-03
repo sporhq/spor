@@ -10172,6 +10172,36 @@ function gateWorkItemText(node) {
 // can fake the launch without spawning a real agent; the real caller (cmdWork)
 // never passes either, so it gets the live `dispatchThrough` and this box's
 // config home, byte-identical to before either param existed.
+// The keys of the worker's passthrough that describe the IMPLEMENTER's
+// harness — `--permission-mode` is Claude Code's, `--sandbox`/`--approval-
+// policy` are Codex's, `--agent` is Claude Code's, and `--model` names a
+// model of the worker's harness. A review runs under the GATE's profile,
+// routinely a different harness whose adapter rejects a foreign flag outright
+// (rejectForeignOptions) — so a claude-code worker's `--permission-mode
+// bypassPermissions` refused every OpenCode/Copilot review before it launched
+// (review finding 5 on the third cut). Only the harness-neutral keys ride to
+// a review; the profile is the gate's and the posture is `--read-only`. The
+// FIX dispatch keeps the full passthrough: it runs in the worker's own lane.
+const REVIEW_HARNESS_FLAGS = ["permission-mode", "sandbox", "approval-policy", "agent", "model"];
+function reviewPassthrough(passthrough) {
+  const out = { ...(passthrough || {}) };
+  for (const k of REVIEW_HARNESS_FLAGS) delete out[k];
+  return out;
+}
+
+// The run record of a fix cycle this pipeline already launched under `name`
+// for `nodeId`, if one exists — the launcher writes a run's record before
+// `dispatch` returns, so a launch the pipeline's own bookkeeping never got to
+// record is still findable by its name. Newest first; null when none.
+function launchedFixRun(home, nodeId, name) {
+  try {
+    const hit = dispatchRuns.listRuns(home, { node: nodeId }).find((r) => r && r.name === name && r.run_id);
+    return hit ? { run_id: hit.run_id, harness: hit.harness || null, adopted: true } : null;
+  } catch {
+    return null;
+  }
+}
+
 function makeGateDeps(
   cfg,
   { record, entry, factory, slug, passthrough, warn, sleep, log, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, stopping = () => false, dispatch = dispatchThrough, home = cfg.userConfigHome() }
@@ -10275,8 +10305,9 @@ function makeGateDeps(
       "",
       "- `blocking`: a correctness defect, silent data loss, or contract break that MUST be fixed before this lands —",
       "  and that you DEMONSTRATED: `evidence` names the command or test you ran and what it showed. A blocking",
-      "  finding without evidence is recorded as advisory, not enforced — and a `changes_requested` backed ONLY by",
-      "  undemonstrated blocking findings is unreadable (it fails closed, it is not a pass): demonstrate what you block on.",
+      "  finding without evidence is recorded as advisory, not enforced — a `changes_requested` backed ONLY by",
+      "  undemonstrated blocking findings passes with those findings recorded as advisory. Demonstrate what you block on:",
+      "  `evidence` is a string naming what you ran; `true`, `yes` or a bare affirmation is not evidence.",
       ...(cycle > 0
         ? [
             "- On a fix cycle, a NEW blocking finding must be one the fix INTRODUCED (`introduced_by_fix: true`). A defect",
@@ -10293,7 +10324,7 @@ function makeGateDeps(
     ].join("\n");
     const launched = await dispatch(
       cfg,
-      { ...passthrough, profile: gate.profile, dir: change.cwd, "no-brief": true, "no-worktree": true, "read-only": true, name: `gate-${gate.id}-${short}-${cycle}` },
+      { ...reviewPassthrough(passthrough), profile: gate.profile, dir: change.cwd, "no-brief": true, "no-worktree": true, "read-only": true, name: `gate-${gate.id}-${short}-${cycle}` },
       [prompt]
     );
     if (!launched.ok) return { ok: false, reason: `the review under ${gate.profile} could not be dispatched: ${launched.reason}` };
@@ -10341,12 +10372,23 @@ function makeGateDeps(
     ]
       .filter((l) => l !== "")
       .join("\n");
-    const launched = await dispatch(
+    const fixName = `fix-${gate.id}-${short}-${cycle}`;
+    // A fix this pipeline ALREADY launched at this cycle — the worker died
+    // between the launch and the durable record of it (the run-id stamp
+    // below, or the runner's launched-progress save) — is adopted from its own
+    // run record rather than dispatched a second time (review finding 4 on the
+    // third cut). The name is unique per pipeline run, attempt, gate and
+    // cycle, and the launcher writes the child's record before dispatch
+    // returns, so the record exists from the first moment a crash could leave
+    // the launch unrecorded.
+    const already = launchedFixRun(home, entry.node_id, fixName);
+    const launched = already ? { ok: true, run: already, adopted: true } : await dispatch(
       cfg,
-      { ...passthrough, node: entry.node_id, dir: change ? change.cwd : undefined, force: true, "no-worktree": true, name: `fix-${gate.id}-${short}-${cycle}` },
+      { ...passthrough, node: entry.node_id, dir: change ? change.cwd : undefined, force: true, "no-worktree": true, name: fixName },
       [prompt]
     );
     if (!launched.ok) return { ok: false, reason: launched.reason };
+    if (launched.adopted) log(`work: gate ${gate.id} fix cycle ${cycle} on ${entry.node_id} was already launched as run ${String(launched.run.run_id).slice(0, 8)} — adopting it, not dispatching again`);
     // The fix cycle's own run is DETACHED — it outlives this worker process,
     // and the await below can run for up to `runMaxMs` (a day by default). If
     // this worker is stopped while that await is still pending, nothing else
@@ -10359,7 +10401,11 @@ function makeGateDeps(
     // ever writes `gate_*` fields and never clobbers a settled verdict, so this
     // can't race the loop's own interrupted/passed/failed stamp into anything
     // wrong — worst case is a stale id on a pipeline that has already settled.
-    dispatchRuns.stampGateState(home, entry.run_id, { gate_fix_run_id: launched.run.run_id, gate_fix_at: new Date().toISOString() });
+    // `gate_fix_gate`/`gate_fix_cycle` say WHICH fix the stamped run is, so a
+    // resumed pipeline whose progress save never landed (the crash window
+    // between this stamp and `onLaunch` below) can read the launch back from
+    // the stamp instead of taking the fix for undispatched (loadGateProgress).
+    dispatchRuns.stampGateState(home, entry.run_id, { gate_fix_run_id: launched.run.run_id, gate_fix_at: new Date().toISOString(), gate_fix_gate: gate.id, gate_fix_cycle: cycle });
     // …and the runner charges the fix cycle to the gate's progress at this
     // same moment: launched, not merely decided on (a worker killed before
     // this line resumes INTO the fix; one killed after it resumes past it).
@@ -10402,6 +10448,15 @@ function makeGateDeps(
     if (!p || typeof p !== "object") return null;
     const lastFix = p.lastFix && typeof p.lastFix === "object" ? { ...p.lastFix } : null;
     if (lastFix && !lastFix.runId && r.gate_fix_run_id) lastFix.runId = r.gate_fix_run_id;
+    // A fix the progress entry recorded as NOT launched, but whose launch the
+    // fix closure stamped on the record (this gate, this cycle) before the
+    // worker died: it launched. Read it as such — dispatched, charged — so
+    // the resume reviews its result instead of dispatching it again.
+    if (lastFix && lastFix.dispatched === false && r.gate_fix_run_id && r.gate_fix_gate === gate.id && r.gate_fix_cycle === lastFix.cycle) {
+      lastFix.dispatched = true;
+      lastFix.runId = r.gate_fix_run_id;
+      return { ...p, fixes: Math.max(Number.isInteger(p.fixes) ? p.fixes : 0, lastFix.cycle + 1), lastFix };
+    }
     return { ...p, lastFix };
   };
   const saveGateProgress = async ({ gate, progress }) => {
@@ -10916,9 +10971,14 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
     ]
       .filter((l) => l !== "")
       .join("\n");
-    const launched = await dispatch(cfg, { ...passthrough, node: entry.node_id, dir: record ? record.cwd : undefined, force: true, "no-worktree": true, name: `integration-fix-${short}-${cycle}` }, [prompt]);
+    const fixName = `integration-fix-${short}-${cycle}`;
+    // Adopt a fix this stage already launched at this cycle (see the gate
+    // deps' fix closure) rather than dispatching it twice.
+    const already = launchedFixRun(home, entry.node_id, fixName);
+    const launched = already ? { ok: true, run: already, adopted: true } : await dispatch(cfg, { ...passthrough, node: entry.node_id, dir: record ? record.cwd : undefined, force: true, "no-worktree": true, name: fixName }, [prompt]);
     if (!launched.ok) return { ok: false, reason: launched.reason };
-    dispatchRuns.stampGateState(home, entry.run_id, { gate_fix_run_id: launched.run.run_id, gate_fix_at: new Date().toISOString() });
+    if (launched.adopted) log(`work: integration fix cycle ${cycle} on ${entry.node_id} was already launched as run ${String(launched.run.run_id).slice(0, 8)} — adopting it, not dispatching again`);
+    dispatchRuns.stampGateState(home, entry.run_id, { gate_fix_run_id: launched.run.run_id, gate_fix_at: new Date().toISOString(), gate_fix_gate: "integration", gate_fix_cycle: cycle });
     const done = await awaitGateRun(cfg, launched.run.run_id, { timeoutMs: runMaxMs, warn, sleep });
     if (!done.ok) return { ok: false, reason: done.reason };
     return { ok: true, runId: launched.run.run_id, record: done.record };

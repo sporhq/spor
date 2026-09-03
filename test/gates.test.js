@@ -217,22 +217,26 @@ test("a review verdict is READ from its structured block — and anything unread
 // blocks, and only when the reviewer demonstrated it — the first live run's
 // reviewer re-opened the gate every cycle on `major` notes and undemonstrated
 // readings of the code, and the fix cycles chased a moving target.
-test("only a DEMONSTRATED `blocking` finding blocks — major/critical are advisory, and blocking-without-evidence fails closed as advisory, never as a pass", () => {
+test("only a DEMONSTRATED `blocking` finding blocks — major/critical are advisory, and blocking-without-evidence is advisory too, never a failure", () => {
   const major = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","findings":[{"severity":"major","file":"a.js","summary":"stale checkpoint"},{"severity":"critical","summary":"was blocking under the old floor"}]}\n```');
   assert.deepStrictEqual([major.ok, major.passed], [true, true], "changes_requested with nothing blocking is a pass with notes");
   assert.strictEqual(major.verdict, "pass");
   assert.match(major.note, /rated nothing blocking/);
   assert.deepStrictEqual(major.findings.map((f) => f.blocking), [false, false]);
 
-  // Rule 5 (review finding 1 on the second cut): a blocking finding nobody
-  // demonstrated cannot be ENFORCED — but an explicit changes_requested
-  // backed only by such findings is not laundered into a pass either. It is
-  // unreadable, fails closed, and carries the downgraded findings as advisory.
+  // Rule 5: a blocking finding nobody demonstrated cannot be ENFORCED, so an
+  // explicit changes_requested backed only by such findings does not fail the
+  // gate — the contract is demonstrated-only. (The second cut read this case
+  // as fail-closed, which charged fix cycles and, at the cap, a person to
+  // findings nobody demonstrated — review finding 1 on the third cut.) It is a
+  // pass that carries the downgraded findings as advisory, with a note saying
+  // exactly what the reviewer claimed and could not back.
   const undemonstrated = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"a.js","summary":"I think this races"}]}\n```');
-  assert.deepStrictEqual([undemonstrated.ok, undemonstrated.passed], [false, false], "changes_requested backed by nothing demonstrated is NOT a pass");
-  assert.strictEqual(undemonstrated.verdict, "changes_requested");
+  assert.deepStrictEqual([undemonstrated.ok, undemonstrated.passed], [true, true], "changes_requested backed by nothing demonstrated does not block");
+  assert.strictEqual(undemonstrated.verdict, "pass");
   assert.strictEqual(undemonstrated.undemonstrated, 1);
-  assert.match(undemonstrated.error, /rated 1 finding blocking but demonstrated none of them/);
+  assert.match(undemonstrated.note, /rated 1 finding blocking but demonstrated none of them .* recorded as advisory; only a demonstrated blocking finding fails the gate/);
+  assert.strictEqual(undemonstrated.error, undefined);
   assert.strictEqual(undemonstrated.findings[0].blocking, false);
   assert.match(undemonstrated.findings[0].note, /without evidence/);
   assert.match(gates.renderFindings(undemonstrated.findings), /\[blocking, advisory\] a\.js — I think this races \(rated blocking without evidence/);
@@ -442,7 +446,7 @@ test("ledger ids are minted from the fold, not from the cycle stamp — a same-c
 // place rather than minting a second one.
 test("a later review may demonstrate an earlier undemonstrated blocking finding by id — an upgrade, not a goalpost", () => {
   const c0 = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"a.js","summary":"I think this races"}]}\n```', { cycle: 0 });
-  assert.strictEqual(c0.ok, false, "rule 5: unreadable, not a pass");
+  assert.deepStrictEqual([c0.ok, c0.passed], [true, true], "rule 5: an undemonstrated request for changes is a pass with an advisory note");
   let ledger = gates.applyReviewToLedger([], c0, 0);
   assert.deepStrictEqual(ledger.map((e) => [e.id, e.status]), [["F1", "advisory"]]);
   const raised = gates.raisedUndemonstrated(ledger);
@@ -458,6 +462,9 @@ test("a later review may demonstrate an earlier undemonstrated blocking finding 
   const upgrade = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","findings":[{"id":"F1","severity":"blocking","file":"a.js","summary":"it races","evidence":"node race.js hangs"}]}\n```', { cycle: 1, raised });
   assert.deepStrictEqual([upgrade.ok, upgrade.passed, upgrade.findings[0].blocking], [true, false, true]);
   assert.match(upgrade.findings[0].note, /raised undemonstrated on an earlier cycle, now demonstrated/);
+  // The upgrade's identity is the LEDGER's: F1's file and summary stay, the
+  // reviewer's new wording rides beside them as a restatement.
+  assert.deepStrictEqual([upgrade.findings[0].file, upgrade.findings[0].summary, upgrade.findings[0].restated], ["a.js", "I think this races", "it races"]);
   ledger = gates.applyReviewToLedger(ledger, upgrade, 1);
   assert.deepStrictEqual(ledger.map((e) => [e.id, e.status, e.evidence, e.demonstrated]), [["F1", "open", "node race.js hangs", 1]]);
   assert.deepStrictEqual(gates.withLedgerIds(upgrade.findings, ledger, [ledger[0]]).map((f) => f.id), ["F1"]);
@@ -556,4 +563,54 @@ test("a fresh blocking finding that reuses a resolved ledger id is minted as a n
   const open = [{ id: "F1", severity: "blocking", file: "a.js", summary: "still open", evidence: "npm test", blocking: true, status: "open", opened: 0, closed: null }];
   const again = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","prior":[{"id":"F1","status":"open"}],"findings":[{"id":"F1","severity":"blocking","summary":"still open","evidence":"npm test"}]}\n```', { prior: gates.openPriorFindings(open), cycle: 1 });
   assert.deepStrictEqual(gates.applyReviewToLedger(open, again, 1).map((e) => e.id), ["F1"]);
+});
+
+// Review finding 2 on the third cut: `evidence: true` (or a number, an object,
+// a bare "yes") was stringified and passed the evidence check, so any truthy
+// value was a one-token key to the blocking floor. Evidence is a non-empty
+// string naming what was run, and nothing else.
+test("evidence must be a real string — a boolean, number, object or bare affirmation is not a demonstration", () => {
+  for (const bad of [true, 1, {}, ["npm test"], "yes", " TRUE ", "n/a", "-", ""]) {
+    const v = gates.parseReviewVerdict(`\`\`\`json\n${JSON.stringify({ verdict: "changes_requested", findings: [{ severity: "blocking", file: "a.js", summary: "races", evidence: bad }] })}\n\`\`\``);
+    assert.strictEqual(v.findings[0].blocking, false, `evidence ${JSON.stringify(bad)} does not demonstrate`);
+    assert.strictEqual(v.findings[0].evidence, "", `evidence ${JSON.stringify(bad)} is recorded as none`);
+    assert.strictEqual(v.passed, true, "…so the request for changes is advisory");
+  }
+  // The aliases are read the same way, and a real string still counts.
+  const good = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"a.js","summary":"races","evidence":true,"reproduction":"node race.js hangs after 3 runs"}]}\n```');
+  assert.deepStrictEqual([good.findings[0].blocking, good.findings[0].evidence, good.passed], [true, "node race.js hangs after 3 runs", false]);
+});
+
+// Review finding 3 on the third cut: a later reviewer could put a DIFFERENT
+// defect under an earlier advisory finding's id — the id alone unlocked the
+// upgrade path, skipping the introduced-by-fix floor and rewriting what the
+// fixer was told F1 was. An upgrade must describe the same file, and its
+// identity comes from the ledger.
+test("an upgrade by id must be the same finding — a different file under a borrowed id is a new finding, subject to the fix-cycle floor", () => {
+  const c0 = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"a.js","summary":"I think a races"}]}\n```', { cycle: 0 });
+  const ledger = gates.applyReviewToLedger([], c0, 0);
+  const raised = gates.raisedUndemonstrated(ledger);
+  assert.deepStrictEqual(raised.map((r) => [r.id, r.file]), [["F1", "a.js"]]);
+  // Borrowed id, different file, no introduced_by_fix: a goalpost, advisory.
+  const borrowed = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","findings":[{"id":"F1","severity":"blocking","file":"b.js","summary":"b loses data","evidence":"node b.test.js fails"}]}\n```', { cycle: 1, raised });
+  assert.strictEqual(borrowed.passed, true);
+  assert.strictEqual(borrowed.findings[0].id, null, "the borrowed id is stripped");
+  assert.match(borrowed.findings[0].note, /named F1 but describes b\.js, not a\.js — not an upgrade/);
+  assert.match(borrowed.findings[0].note, /not introduced by the fix/);
+  const folded = gates.applyReviewToLedger(ledger, borrowed, 1);
+  assert.deepStrictEqual(folded.map((e) => [e.id, e.file, e.summary, e.status]), [["F1", "a.js", "I think a races", "advisory"], ["F2", "b.js", "b loses data", "advisory"]], "F1 keeps its identity; the new defect is its own entry");
+  // Same borrowed id, different file, but introduced by the fix: blocks as
+  // the new finding it is, still never as F1.
+  const introduced = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","findings":[{"id":"F1","severity":"blocking","file":"b.js","summary":"b loses data","evidence":"node b.test.js fails","introduced_by_fix":true}]}\n```', { cycle: 1, raised });
+  assert.deepStrictEqual([introduced.passed, introduced.findings[0].blocking, introduced.findings[0].id], [false, true, null]);
+  const next = gates.applyReviewToLedger(ledger, introduced, 1);
+  assert.deepStrictEqual(next.map((e) => [e.id, e.file, e.status]), [["F1", "a.js", "advisory"], ["F2", "b.js", "open"]]);
+  assert.strictEqual(gates.withLedgerIds(introduced.findings, next, ledger)[0].id, "F2");
+  // A ledger entry with NO file cannot be checked and admits the upgrade —
+  // with the entry's own summary as its identity.
+  const nofile = [{ id: "F1", severity: "blocking", file: "", summary: "something races", blocking: false, status: "advisory", evidence: "", opened: 0, closed: null }];
+  const up = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","findings":[{"id":"F1","severity":"blocking","file":"a.js","summary":"a races","evidence":"node race.js"}]}\n```', { cycle: 1, raised: gates.raisedUndemonstrated(nofile) });
+  assert.deepStrictEqual([up.findings[0].blocking, up.findings[0].id, up.findings[0].summary, up.findings[0].restated, up.findings[0].file], [true, "F1", "something races", "a races", "a.js"]);
+  const upFolded = gates.applyReviewToLedger(nofile, up, 1);
+  assert.deepStrictEqual([upFolded[0].status, upFolded[0].summary, upFolded[0].restated, upFolded[0].file], ["open", "something races", "a races", ""]);
 });
