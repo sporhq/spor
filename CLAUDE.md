@@ -206,16 +206,35 @@ id whose full key is stamped on the node as `capture_key`. The id carries only a
 truncation of that key, so an occupied pathname is never on its own proof the
 finding is captured — the occupant is READ and its `capture_key` compared, and a
 mismatch takes the next, longer candidate id rather than consuming a finding
-that was never written. The node itself is created with a hardlink-exclusive
-atomic write (`createNodeExclusive`), so a concurrent drain neither clobbers the
-winner nor parses a half-written file. The spool WORKER owes before it clears
-(`runSpoolWorker` in util.js): the `.in.json` is the job's debt and is unlinked
-only once the classifier's verdict is durable — the `.out.json` landed, or the
-verdict was definitive with nothing to write. A backend failure or a failed
-result write leaves it owed, and the prompt-time drain's orphan sweep re-drives
-a stale input exactly ONCE — claimed by an atomic RENAME to `<hash>.redriven.in.json`
-so overlapping sweeps can't both spawn — before pruning, so the debt has a
-collector and still cannot spin.
+that was never written — and a MATCH is only proof when the node's BODY still
+carries the facts, since a crash-torn publish leaves complete frontmatter
+(`summary` is the finding's own first line) over a body that never landed. The
+node itself is created with an atomic exclusive write (`createNodeExclusive`):
+hardlink-a-finished-temp-file where link() works, and where it does not
+(EPERM/EOPNOTSUPP/ENOSYS/EXDEV) an exclusive `wx` RESERVATION with the temp file
+renamed over it — never an in-place `wx` write, whose half-written window is
+exactly where a concurrent drain reads a matching `capture_key` and consumes the
+only copy of a body that does not exist. BOTH drains claim a `.out.json` with an
+atomic rename before reading it (`u.claimSpoolResult`,
+dec-spor-nudge-drain-atomic-claim), so one finding is never both injected and
+captured; the claimed name still ends in `.out.json`, so a result the SessionEnd
+drain deliberately KEEPS stays visible to every later sweep. The spool WORKER
+owes before it clears (`runSpoolWorker` in util.js): the `.in.json` is the job's
+debt and is unlinked only once the classifier's verdict is durable — the
+`.out.json` landed, or the verdict was definitive with nothing to write. A
+backend failure or a failed result write leaves it owed, and the prompt-time
+drain's orphan sweep re-drives a stale input exactly ONCE — claimed by an atomic
+RENAME to `<hash>.redriven.in.json` so overlapping sweeps can't both spawn —
+before pruning, so the debt has a collector and still cannot spin. Three rules
+keep that claim honest: the orphan horizon is refreshed BEFORE the rename (which
+carries the inode's mtime across, so claim and stamp are ONE write and a failed
+refresh abandons the redrive rather than leaving a claimed-but-stale input the
+next sweep prunes mid-classification); a spawn that throws hands the claim BACK,
+since a retry that never started is not spent; and an input is reconciled
+against settled state first — a `<hash>.out.json` in the same listing (the
+worker reached a verdict, only its cleanup failed) or a file already in
+`<session>.nudged-injected` is pruned, never re-driven into a second classifier
+call or a second injection.
 The default synchronous path is byte-identical (the drain and its
 syscalls are gated on the flag). See test/nudge-async.test.js.
 

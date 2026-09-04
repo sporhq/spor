@@ -250,14 +250,21 @@ function drainPendingNudges(graph, input, slug) {
   const files = all.filter((f) => f.endsWith(".out.json")).sort();
 
   const injectedState = path.join(graph, "journal", `${session}.nudged-injected`);
-  let injected = 0;
+  let injectedLines = [];
   try {
-    injected = fs.readFileSync(injectedState, "utf8").split("\n").filter(Boolean).length;
+    injectedLines = fs.readFileSync(injectedState, "utf8").split("\n").filter(Boolean);
   } catch {}
+  const injected = injectedLines.length;
+  const injectedFiles = new Set(injectedLines);
 
   const results = [];
   for (const f of files) {
-    const fp = path.join(dir, f);
+    // Claim before reading (dec-spor-nudge-drain-atomic-claim): the SessionEnd
+    // drain reads this same spool, and without the claim an overlapping pair
+    // can inject a finding here and capture it there. See u.claimSpoolResult.
+    const claimed = u.claimSpoolResult(dir, f);
+    if (!claimed) continue; // another drain took it
+    const fp = path.join(dir, claimed);
     let r = null;
     try {
       r = JSON.parse(fs.readFileSync(fp, "utf8"));
@@ -283,13 +290,31 @@ function drainPendingNudges(graph, input, slug) {
   // spawn. The winner's rename succeeds, every loser's fails with ENOENT, and
   // the new name still ends in `.in.json` so the job stays visible to this
   // sweep; carrying `.redriven.` is what marks its one retry spent, so the
-  // NEXT sweep prunes it instead of spinning it round again. mtime is pushed
-  // forward with the claim so the re-driven worker gets a full horizon to
-  // finish before that prune can touch its input. A claim that cannot be
-  // taken, or a spawn that does not land after one, leaves a job that is
-  // pruned on the following sweep — the bound that keeps a poison input out
-  // of a respawn loop, and the reason this adds at most one classifier call
-  // per spooled job.
+  // NEXT sweep prunes it instead of spinning it round again. A claim that
+  // cannot be taken leaves a job that is pruned on the following sweep — the
+  // bound that keeps a poison input out of a respawn loop, and the reason this
+  // adds at most one classifier call per spooled job.
+  //
+  // Three things that ride ON the claim rather than beside it, because a debt
+  // marker whose own write can fail is not a debt marker:
+  //
+  //  * the HORIZON is refreshed BEFORE the rename, on the original name, and a
+  //    refresh that fails abandons the redrive entirely. rename() carries the
+  //    inode's mtime across, so the claim lands already-fresh in ONE stamp —
+  //    where the refresh used to follow the claim and be swallowed, leaving a
+  //    claimed-but-stale input the very next sweep pruned out from under a
+  //    worker still classifying it.
+  //  * a spawn that throws HANDS THE CLAIM BACK (rename to the unclaimed
+  //    name), because the claim marks the one retry SPENT and a retry that
+  //    never started has not been spent. Only a spawn that actually landed
+  //    leaves the job marked.
+  //  * an input is reconciled against SETTLED state before it is re-driven at
+  //    all: a `<hash>.out.json` in this same listing means the worker did
+  //    reach a verdict and only its own cleanup failed, and a job whose file
+  //    is already in `.nudged-injected` has been surfaced. Either way the debt
+  //    is discharged — the input is pruned instead of spending a second
+  //    classifier call, or (for the injected case) re-injecting a finding this
+  //    session has already seen.
   //
   // Deliberately do NOT rmdir an emptied dir: a worker's result lands seconds
   // after its input clears, so the dir is legitimately empty mid-classification
@@ -298,24 +323,47 @@ function drainPendingNudges(graph, input, slug) {
   // wider journal GC lands.
   try {
     const now = Date.now();
+    // The settled set is read off the PRE-drain listing, so a result this pass
+    // has just injected still counts as a discharged debt.
+    const settledHashes = new Set(files.map(u.spoolResultHash));
     for (const f of all) {
       if (!f.endsWith(".in.json")) continue;
       const fp = path.join(dir, f);
       try {
+        if (settledHashes.has(f.replace(/(?:\.redriven)?\.in\.json$/, ""))) {
+          fs.unlinkSync(fp); // its verdict already landed; only the cleanup failed
+          continue;
+        }
         if (now - fs.statSync(fp).mtimeMs <= PENDING_ORPHAN_MS) continue;
         if (!f.includes(".redriven.")) {
+          let job = null;
+          try {
+            job = JSON.parse(fs.readFileSync(fp, "utf8"));
+          } catch {}
+          if (job && job.file && injectedFiles.has(job.file)) {
+            fs.unlinkSync(fp); // already surfaced — re-driving it would re-inject it
+            continue;
+          }
+          try {
+            const t = now / 1000;
+            fs.utimesSync(fp, t, t); // rename carries this across the claim
+          } catch {
+            continue; // no fresh horizon, so do not claim one
+          }
           const claimed = path.join(dir, f.replace(/\.in\.json$/, ".redriven.in.json"));
           try {
             fs.renameSync(fp, claimed); // atomic: exactly one sweep wins
-            try {
-              const t = now / 1000;
-              fs.utimesSync(claimed, t, t);
-            } catch {}
-            u.spawnDetached([path.join(__dirname, "nudge-worker.js"), claimed]);
-            continue;
           } catch {
             continue; // lost the claim (another sweep took it) — nothing to prune
           }
+          try {
+            u.spawnDetached([path.join(__dirname, "nudge-worker.js"), claimed]);
+          } catch {
+            try {
+              fs.renameSync(claimed, fp); // the retry was never spent — give it back
+            } catch {}
+          }
+          continue;
         }
         fs.unlinkSync(fp); // its one retry is spent
       } catch {}

@@ -1647,6 +1647,31 @@ function runSpoolWorker(inFile, classify, buildOutput) {
   process.exit(0);
 }
 
+// Atomic CLAIM on an async-nudge spool result (dec-spor-nudge-drain-atomic-claim).
+// Both drains read the same `<hash>.out.json` — the prompt-time one injects it,
+// the SessionEnd one captures it — so without a claim an overlapping pair can
+// act on ONE finding twice. The claim is a rename, not a check-then-act: exactly
+// one caller's rename succeeds and every loser gets ENOENT and skips. Two
+// properties make it safe for a drain that must not destroy what it cannot yet
+// place: the claimed name still ends in `.out.json`, so a result the SessionEnd
+// drain deliberately KEEPS (a transient failure) stays visible to every later
+// sweep, and a crash between the claim and the capture strands nothing. Any
+// previous claim segment is stripped first, so re-claiming across sweeps cannot
+// grow the name. Returns the claimed basename, or null when the claim was lost.
+const SPOOL_CLAIM_RE = /(?:\.claim-\d+-\d+)?\.out\.json$/;
+function spoolResultHash(f) {
+  return f.replace(SPOOL_CLAIM_RE, "");
+}
+function claimSpoolResult(dir, f) {
+  const claimed = `${spoolResultHash(f)}.claim-${process.pid}-${Date.now()}.out.json`;
+  try {
+    fs.renameSync(path.join(dir, f), path.join(dir, claimed));
+    return claimed;
+  } catch {
+    return null;
+  }
+}
+
 // Detached child that survives the hook process (replaces nohup setsid).
 function spawnDetached(nodeArgs, env = process.env) {
   const child = spawn(process.execPath, nodeArgs, {
@@ -1733,6 +1758,8 @@ module.exports = {
   parseClaudeResult,
   runClassifierBackend,
   runSpoolWorker,
+  claimSpoolResult,
+  spoolResultHash,
   spawnDetached,
   bashRandom,
   writeFileAtomic,

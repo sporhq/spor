@@ -289,9 +289,13 @@ async function fetchRemoteTitleIndex(graph, rlog) {
 // hardlink-then-unlink is the primitive that gives both properties at once:
 // the temp file is fully written before it is linked, and link() fails with
 // EEXIST rather than clobbering. Where the filesystem has no usable link()
-// (EPERM/EOPNOTSUPP/ENOSYS on some mounts), fall back to an exclusive `wx`
-// open — still no clobber, at the cost of a brief window where a reader could
-// see a partial file.
+// (EPERM/EOPNOTSUPP/ENOSYS on some mounts), the fallback must keep BOTH — an
+// in-place `wx` write keeps exclusivity but gives up atomicity, and a
+// concurrent drain that reads a half-written node parses a matching
+// `capture_key` out of complete frontmatter, calls the finding settled, and
+// consumes the only spool copy of a body that was never written. So the
+// fallback reserves the pathname with the exclusive create and then RENAMES
+// the finished temp file over its own reservation.
 function createNodeExclusive(nodePath, md) {
   const tmp = `${nodePath}.${process.pid}.tmp`;
   try {
@@ -302,12 +306,36 @@ function createNodeExclusive(nodePath, md) {
     } catch (e) {
       if (e && e.code === "EEXIST") return false;
       if (e && ["EPERM", "EOPNOTSUPP", "ENOSYS", "EXDEV"].includes(e.code)) {
+        // `wx` is an ATOMIC exclusive create everywhere — it is only the
+        // WRITING that is not atomic — so use it purely as the reservation and
+        // let rename() publish the bytes. Nobody else can hold this
+        // reservation, so the rename replaces a placeholder that is provably
+        // ours and never another actor's node.
+        let fd;
         try {
-          fs.writeFileSync(nodePath, md, { flag: "wx" });
-          return true;
+          fd = fs.openSync(nodePath, "wx");
         } catch (e2) {
           if (e2 && e2.code === "EEXIST") return false;
           throw e2;
+        }
+        try {
+          fs.closeSync(fd);
+        } catch {
+          /* best effort */
+        }
+        try {
+          fs.renameSync(tmp, nodePath);
+          return true;
+        } catch (e3) {
+          // Hand the pathname back rather than leaving an empty node squatting
+          // it: the caller keeps the finding spooled and a later sweep retries
+          // the same id instead of minting a longer one.
+          try {
+            fs.rmSync(nodePath, { force: true });
+          } catch {
+            /* best effort */
+          }
+          throw e3;
         }
       }
       throw e;
@@ -417,7 +445,15 @@ async function sessionEndPendingNudges({ graph, slug, session, remote }) {
 
   const results = [];
   for (const f of files) {
-    const fp = path.join(dir, f);
+    // Claim before reading (dec-spor-nudge-drain-atomic-claim): the
+    // prompt-time drain reads this same spool and INJECTS what it finds, so
+    // without the claim an overlapping pair can inject a finding there and
+    // capture it here. The claimed name still ends in `.out.json`, so a
+    // finding this drain deliberately keeps stays visible to every later
+    // sweep — the claim narrows who may act on it, it never destroys it.
+    const claimed = u.claimSpoolResult(dir, f);
+    if (!claimed) continue; // another drain took it
+    const fp = path.join(dir, claimed);
     // A read that FAILED is not a result that is MALFORMED, and only the
     // second is terminal. EIO, EMFILE, EACCES and a Windows sharing violation
     // all read fine on a later sweep, so a failed read keeps its file —
@@ -573,9 +609,19 @@ async function sessionEndPendingNudges({ graph, slug, session, remote }) {
         " "
       )}\ndate: ${u.localDate()}\nauthored_via: capture\ncapture_key: ${key}\n---\n\n${text}\n`;
 
-    // Settled | mine | free | taken, decided by READING the occupant rather
+    // Settled | free | torn | taken, decided by READING the occupant rather
     // than by its existence. Unreadable is none of those — it is transient, so
     // it keeps the finding spooled rather than deciding either way.
+    //
+    // A matching `capture_key` alone is not proof the finding LANDED: on a
+    // filesystem without link() the node is published by a rename over an
+    // exclusive reservation, and a legacy (or crash-torn) file can carry
+    // complete frontmatter over a truncated body. So settled additionally
+    // requires the body to still carry the facts verbatim — which an ordinary
+    // later edit (an added edge, a reworded title) preserves and a torn write
+    // cannot. `torn` is treated like `taken`: the finding moves to the next
+    // candidate id rather than being consumed against a node that does not
+    // contain it.
     const reconcile = (nodePath) => {
       let existing;
       try {
@@ -588,7 +634,11 @@ async function sessionEndPendingNudges({ graph, slug, session, remote }) {
       try {
         parsed = graphLib.parseFrontmatter(existing, path.basename(nodePath));
       } catch {}
-      return parsed && parsed.capture_key === key ? "settled" : "taken";
+      if (!parsed || parsed.capture_key !== key) return "taken";
+      // The BODY specifically, not the raw file: the frontmatter's `summary`
+      // is the finding's own first line, so a whole-file match would call an
+      // empty body settled on any single-fact capture.
+      return String(parsed.body || "").includes(facts) ? "settled" : "torn";
     };
 
     let settledAs = null;
@@ -610,7 +660,14 @@ async function sessionEndPendingNudges({ graph, slug, session, remote }) {
         candidate = id;
         break;
       }
-      // "taken" — a different node owns this pathname; try a longer key slice.
+      if (state === "torn") {
+        u.appendLine(
+          logFile,
+          `  session-final capture from ${r.file}: ${id}.md carries this capture key over a truncated body; trying a longer id`
+        );
+      }
+      // "taken"/"torn" — this pathname does not hold the finding; try a longer
+      // key slice.
     }
     if (blocked) continue;
     if (settledAs) {

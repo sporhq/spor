@@ -628,22 +628,100 @@ test("SessionEnd: a read failure is not a malformed result — the finding survi
   const { home, cwd } = scratch();
   const dir = spoolDir(home, "s1");
   fs.mkdirSync(dir, { recursive: true });
-  const fp = path.join(dir, "r0.out.json");
-  fs.writeFileSync(fp, JSON.stringify({ file: path.join(cwd, "doc.md"), facts: "1. a finding", nfacts: 1 }));
-  fs.chmodSync(fp, 0o000); // EACCES on read — transient, not corrupt
+  // A DIRECTORY where the result belongs: readFileSync fails (EISDIR) on every
+  // platform this ships on — a transient IO failure, not corrupt bytes. Chmod
+  // 0o000 would be the obvious way to say that on POSIX, but Windows does not
+  // remove read access that way and npm test runs on windows-latest too, so
+  // the hook would happily read and CONSUME the file there and this test would
+  // assert the opposite of what it means. (Same trick the runSpoolWorker tests
+  // below use to break a write.)
+  fs.mkdirSync(path.join(dir, "r0.out.json"));
 
   const out = runHook(["distill", "--host", "claude-code"], sessionEndPayload(cwd), env(home, null, { SPOR_DISTILL: "0" }));
-  fs.chmodSync(fp, 0o600);
   assert.strictEqual(out.status, 0, out.stderr);
   assert.strictEqual(outFiles(home).length, 1, "an unreadable-right-now result must not be destroyed");
   assert.strictEqual(nodeFiles(home).length, 0);
   assert.match(distillLog(home), /kept in the spool: read failed/);
 
-  // ...and it lands once the read succeeds again.
+  // ...and it lands once the read succeeds again. (The kept file carries this
+  // drain's claim stamp, so clear the spool by listing it rather than by
+  // guessing its name.)
+  for (const f of fs.readdirSync(dir)) fs.rmSync(path.join(dir, f), { recursive: true, force: true });
+  seedOut(home, "s1", "r0", path.join(cwd, "doc.md"), "1. a finding");
   const again = runHook(["distill", "--host", "claude-code"], sessionEndPayload(cwd), env(home, null, { SPOR_DISTILL: "0" }));
   assert.strictEqual(again.status, 0, again.stderr);
   assert.strictEqual(outFiles(home).length, 0);
   assert.strictEqual(nodeFiles(home).length, 1);
+});
+
+test("SessionEnd: a node carrying the capture key over a TRUNCATED body is not mistaken for the capture", () => {
+  const { home, cwd } = scratch();
+  const file = path.join(cwd, "doc.md");
+  seedOut(home, "s1", "r0", file, "1. a finding worth keeping");
+
+  const first = runHook(["distill", "--host", "claude-code"], sessionEndPayload(cwd), env(home, null, { SPOR_DISTILL: "0" }));
+  assert.strictEqual(first.status, 0, first.stderr);
+  const written = nodeFiles(home)[0];
+  const nodePath = path.join(home, "nodes", written);
+  const md = fs.readFileSync(nodePath, "utf8");
+
+  // A publish torn in half: complete frontmatter (so `capture_key` parses and
+  // matches) over a body that never landed. Trusting the key alone would call
+  // this finding settled and consume the only spool copy of facts that are
+  // nowhere on disk.
+  const cut = md.indexOf("---\n\n", 4) + "---\n\n".length;
+  fs.writeFileSync(nodePath, md.slice(0, cut));
+  seedOut(home, "s1", "r0", file, "1. a finding worth keeping");
+
+  const second = runHook(["distill", "--host", "claude-code"], sessionEndPayload(cwd), env(home, null, { SPOR_DISTILL: "0" }));
+  assert.strictEqual(second.status, 0, second.stderr);
+  assert.match(distillLog(home), /truncated body; trying a longer id/);
+  assert.strictEqual(outFiles(home).length, 0, "the finding was captured, so its spool copy is spent");
+  const after = nodeFiles(home);
+  assert.strictEqual(after.length, 2, "the facts land at the next candidate id rather than being consumed against a torn node");
+  const survivor = after.find((f) => f !== written);
+  assert.match(fs.readFileSync(path.join(home, "nodes", survivor), "utf8"), /a finding worth keeping/);
+});
+
+test("drain: a stale input whose verdict already landed is pruned, never re-classified", async () => {
+  const { root, home, cwd } = scratch();
+  const e = env(home, factStub(root));
+  const file = path.join(cwd, "doc.md");
+  const fp = seedIn(home, "s1", "h7", file, { nudgeCmd: e.SUBSTRATE_NUDGE_CMD });
+  const old = Date.now() / 1000 - 7200; // past the orphan horizon
+  fs.utimesSync(fp, old, old);
+  // The worker DID reach a verdict here — only its own cleanup failed. The
+  // debt is discharged, so re-driving it would spend a second classifier call
+  // on an answer that already exists.
+  seedOut(home, "s1", "h7", file, "1. a finding");
+
+  const out = promptContext(home, cwd, {
+    prompt: "six words minimum to pass gate",
+    extraEnv: { SUBSTRATE_NUDGE_CMD: e.SUBSTRATE_NUDGE_CMD },
+  });
+  assert.match(out, /a finding/, "the landed result is still injected");
+  assert.ok(!fs.existsSync(fp), "a discharged debt is pruned, not re-driven");
+  await sleep(400);
+  assert.strictEqual(outFiles(home).length, 0, "and no second classifier call was spent on it");
+});
+
+test("drain: a stale input for an ALREADY-INJECTED file is pruned, not re-driven into a second injection", async () => {
+  const { root, home, cwd } = scratch();
+  const e = env(home, factStub(root));
+  const file = path.join(cwd, "doc.md");
+  const fp = seedIn(home, "s1", "h8", file, { nudgeCmd: e.SUBSTRATE_NUDGE_CMD });
+  const old = Date.now() / 1000 - 7200;
+  fs.utimesSync(fp, old, old);
+  fs.mkdirSync(path.join(home, "journal"), { recursive: true });
+  fs.writeFileSync(path.join(home, "journal", "s1.nudged-injected"), `${file}\n`);
+
+  promptContext(home, cwd, {
+    prompt: "six words minimum to pass gate",
+    extraEnv: { SUBSTRATE_NUDGE_CMD: e.SUBSTRATE_NUDGE_CMD },
+  });
+  assert.ok(!fs.existsSync(fp), "a finding this session already surfaced owes nothing");
+  await sleep(400);
+  assert.strictEqual(outFiles(home).length, 0, "re-driving it would only re-inject what was already seen");
 });
 
 test("SessionEnd: an unrelated node squatting the capture id is reconciled, not mistaken for the capture", () => {
