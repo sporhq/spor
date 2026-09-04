@@ -174,16 +174,35 @@ orphan no run table tracks (art-spor-docs-bulk-lease-endpoints-2026-08-10).
 Finish THIS repo's half here, then re-scope the node BEFORE you resolve it —
 a resolver against the node as written would claim the other half done. In
 order (you write these yourself even under an orchestrator — they are your own
-acceptance, not findings): (1) `/spor:defer` the other repo's half as its own
-queue item stamped to that repo, with enough acceptance text to stand alone and
-a `relates-to` edge to `{{node}}`; (2) `get_node` `{{node}}` for its revision
-and `put_node` (or `spor put-node - --if-exists update --revision <rev>`) a
-body whose acceptance is scoped to this repo and names the sibling for the
-other half, plus a `relates-to` edge to the sibling — skip if the body already
-names it; (3) only then write the resolver (step 7), naming the sibling's id
-there and in your final report. If the narrowing write is refused and a retry
-after a fresh `get_node` still fails, leave the node unresolved and report the
-sibling's id — never resolve against the wider acceptance. Only if the two
+acceptance, not findings): (1) file the other repo's half as its own queue
+item under the DERIVED id `task-<{{node}} minus its type prefix>-<other repo
+slug>` with `put_node` `if_exists: skip` (or `spor put-node - --if-exists
+skip`) — never `/spor:defer`/`spor add`, which mint a duplicate per retry —
+stamped to that repo, with enough acceptance text to stand alone and a
+`relates-to` edge to `{{node}}`; then `get_node` it back — whatever is under
+that id after the write IS the sibling (a skipped write is success; an error
+plus an empty read means nothing is filed: don't narrow, don't resolve, hand
+back below). (2) `get_node` `{{node}}` for its revision and `put_node` (or
+`spor put-node - --if-exists update --revision <rev>`) the SAME body with
+this block appended — keep every other line of the body and every existing
+edge intact, since a full-node write replaces the whole node:
+
+    ## Scope (narrowed)
+    covers: <this repo's slug>
+    sibling: <sibling id> — <other repo slug>: <one line: what lives there>
+
+plus a `relates-to` edge to the sibling. The node is narrowed only if that
+block is present naming this repo and that id — the id appearing elsewhere
+in the body or an edge alone is not narrowing; skip the write only on that
+exact condition, and on a revision conflict re-read and re-check before
+re-sending. (3) Only then write the resolver (step 7), naming the sibling's
+id there and in your final report — unless the re-read shows `{{node}}`
+already resolved (a live `resolves` edge), in which case write no second
+resolver (append the marker if it is missing, and say so). If (1) could not
+file, or the narrowing write is refused and a retry after a fresh `get_node`
+still fails, leave the node unresolved and end your final report with
+`MERGE-READY (unresolved: narrowing refused)` plus the `## HANDED BACK` block
+(format below) — never resolve against the wider acceptance. Only if the two
 halves must land together to work at all is it the lockstep case above: then
 stop and leave the node unresolved.
 
@@ -205,3 +224,12 @@ graph if one dispatched you; otherwise file these yourself with `/spor:defer`):
     literally is clearly worse than an alternative** (say what you did, the better
     approach, and why); missing tests / fragile patterns / surprising behavior.
     If there's genuinely nothing worth tracking, write "FINDINGS: none."
+
+If (and only if) you handed the cross-repo split back unnarrowed (see "If it
+won't converge"), add a second block — not a finding, but unfinished graph
+work the orchestrator runs before it resolves this node:
+
+    ## HANDED BACK
+    - repo: <other-repo slug> — <the acceptance text for that half, standing alone>
+      sibling: <the derived id> (filed: yes|no)
+      narrowed: no — <the exact error the narrowing write returned>

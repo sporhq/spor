@@ -165,27 +165,64 @@ order, each a graph write you make yourself (the one exception to step 5's
 "don't write to the graph yourself": this is a piece of your own acceptance,
 not a finding):
 
-1. **File the sibling first.** `/spor:defer` the other repo's half as its own
-   queue item, stamped to that repo, carrying enough of the acceptance text to
-   stand alone, with a `relates-to` edge to `{{node}}`. The debt must exist
-   on the graph before anything narrows or resolves the original.
-2. **Narrow `{{node}}`'s own acceptance.** `get_node` it for the current
-   revision, then `put_node` (or `spor put-node - --if-exists update
-   --revision <rev>`) an edited body that scopes the acceptance to this repo
-   and points at the sibling's id for the other half — keep the rest of the
-   body and every existing edge intact. Add a `relates-to` edge from
-   `{{node}}` to the sibling. If the sibling id already appears in the body
-   (the orchestrator pre-split it, or a prior attempt did this), skip this
-   step.
+1. **File the sibling first, under a DERIVED id.** The id is
+   `task-<{{node}} with its type prefix stripped>-<other repo slug>` (so
+   `task-foo-bar` handed to `spor-server` gives `task-foo-bar-spor-server`);
+   never let `/spor:defer` or `spor add` mint one — a minted id is a fresh
+   duplicate on every retry and a second one if the orchestrator pre-split
+   this item. Write it with `put_node` `if_exists: skip` (or `spor put-node -
+   --if-exists skip`): a `task` stamped to that repo (`repo:`/`project:`),
+   carrying enough of the acceptance text to stand alone, with a `relates-to`
+   edge to `{{node}}`. Then `get_node` that id back: whatever is there after
+   the write — yours or someone else's — IS the sibling, and a skipped write
+   is success. If the write errored and the read finds nothing, nothing is
+   filed: do not narrow, do not resolve; go to the hand-back below.
+2. **Narrow `{{node}}`'s own acceptance — with the marker, not a mention.**
+   `{{node}}` counts as narrowed if and only if its body already carries this
+   block naming THIS repo and the id from step 1:
+
+   ```
+   ## Scope (narrowed)
+   covers: <this repo's slug>
+   sibling: <sibling id> — <other repo slug>: <one line: what lives there>
+   ```
+
+   Skip this step only when that block is present with both values; the
+   sibling's id appearing elsewhere in the body, a `relates-to` edge alone,
+   or a prose "see also" is NOT narrowing — write the block. `get_node`
+   `{{node}}` for its current revision, then `put_node` (or `spor put-node -
+   --if-exists update --revision <rev>`) the SAME body with the block
+   appended — keep every other line of the body and every existing edge
+   intact (a full-node write replaces the whole node; a body retyped from
+   memory silently drops edges). Add a `relates-to` edge from `{{node}}` to
+   the sibling (idempotent). On a revision conflict, re-read and re-check
+   the marker before re-sending — the orchestrator or a parallel actor may
+   have written it meanwhile.
 3. **Only then** write the resolver (step 7) — its body names the sibling's
    id, and it resolves a node whose acceptance is now exactly what you did.
+   If the re-read in step 2 shows `{{node}}` already resolved (a live inbound
+   `resolves` edge), do NOT write a second resolver: with the marker present
+   you are done; with it absent, still append the marker (a body edit is
+   valid on a resolved node) and say so in your report.
 
-If the narrowing write in step 2 is refused (revision conflict, validation
-error) and a retry after a fresh `get_node` still fails, do NOT resolve: leave
-`{{node}}` unresolved, say so in your final report with the sibling's id, and
-let the orchestrator narrow and resolve it. Only if the two halves must land
-together to work at all (one half's tests need the other's edits) is it the
-lockstep case above: then stop and leave the node unresolved.
+If step 1 could not file the sibling, or the narrowing write in step 2 is
+refused (revision conflict, validation error) and one retry after a fresh
+`get_node` still fails, do NOT resolve: leave `{{node}}` unresolved and hand
+the split back to the orchestrator in your final report — end it with the
+line `MERGE-READY (unresolved: narrowing refused)` and add the block below,
+which is what the orchestrator's supervisor acts on (it files/narrows under
+the same ids and resolves; without the block, an unresolved node reads as a
+failed run and is re-dispatched):
+
+    ## HANDED BACK
+    - repo: <other-repo slug> — <the acceptance text for that half, standing
+      alone: which file(s), what must be true there, why it belongs here>
+      sibling: <the id you derived in step 1> (filed: yes|no)
+      narrowed: no — <the exact error the narrowing write returned>
+
+Only if the two halves must land together to work at all (one half's tests
+need the other's edits) is it the lockstep case above: then stop and leave
+the node unresolved.
 
 ## Final report
 

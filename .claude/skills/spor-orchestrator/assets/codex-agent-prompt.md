@@ -70,6 +70,11 @@ this is the ONLY place these go; you do NOT file them yourself:
     ## FINDINGS FOR THE ORCHESTRATOR
     One tight line each; the orchestrator files each as the right node:
     - [issue|task|smell|better-approach] <file:line or area> — <what + why, 1–2 sentences>
+    Surface: latent bugs you spotted but didn't fix (out of scope); smells / refactors /
+    duplication / dead code; **places where following this item literally is clearly
+    worse than an alternative** (say what you did, the better approach, and why); missing
+    tests / fragile patterns / surprising behavior. If genuinely nothing, write
+    "FINDINGS: none."
 
 If (and only if) part of this item's acceptance lives in another repo (see "If it won't
 converge"), add a second block — this is NOT a finding, it is unfinished acceptance the
@@ -78,8 +83,8 @@ orchestrator must file before it may resolve this node:
     ## HANDED BACK
     - repo: <other-repo slug> — <the acceptance text for that half, standing alone:
       which file(s), what must be true there, and why it belongs to this item>
-    Surface: latent bugs you spotted but didn't fix (out of scope); smells / refactors /
-    duplication / dead code; **places where following this item literally is clearly
-    worse than an alternative** (say what you did, the better approach, and why); missing
-    tests / fragile patterns / surprising behavior. If genuinely nothing, write
-    "FINDINGS: none."
+      sibling: task-<this node's id minus its type prefix>-<other-repo slug>
+
+The `sibling:` line is the id the orchestrator will file the half under (derived, never
+minted, so a retry or a pre-split finds the same node) — state it so the report is
+self-describing; the orchestrator re-derives it from the rule rather than trusting it.
