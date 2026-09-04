@@ -7443,13 +7443,25 @@ async function compileBriefing(cfg, { nodeId, query, full, project }) {
 //     ONE read, the LADDER itself stops there remotely (see `cap` below): the
 //     carried width a starved worker re-reads every 30s is by construction a
 //     width the server will serve in a single GET.
-//   - a server too old to honour `?offset` re-serves its TOP page. That is
-//     detected by OVERLAP — any item a page at a non-zero offset shares with
-//     what we have already read is a window we did not ask for — and the walk
-//     then FALLS BACK to the pre-offset behaviour, re-paging the whole read
-//     from offset 0 at each doubled width and replacing what it assembled, so
-//     widening still reaches an item ranked deep on an old backend instead of
-//     stopping at the base page.
+//   - a server too old to honour `?offset` re-serves its TOP page, so the walk
+//     must recognize one and FALL BACK to the pre-offset behaviour — re-paging
+//     the whole read from offset 0 at each doubled width and replacing what it
+//     assembled — or widening cannot reach a deep item on such a backend at
+//     all. It recognizes one from the ENVELOPE: `?offset` shipped together with
+//     `next_offset`/`truncated` (API.md §5), so a queue response carrying
+//     NEITHER field is a backend from before paging existed, known from its
+//     very first answer and before a doomed `?offset` request is ever sent.
+//     That is the whole detection — deliberately NOT "this window overlaps what
+//     we already read". A ranked queue RE-RANKS between requests, so a window
+//     at a legitimate offset routinely shares an item or two with the tail of
+//     the previous one (API.md §5 says as much: an offset resumes the same
+//     slice only across an unchanged ranking), and reading that as a
+//     re-served top page truncated a real, current-server chunked read back to
+//     one page and silently dropped everything below it. What remains as a
+//     backstop, for a backend that reports the fields and ignores the offset
+//     anyway, is the one reading churn cannot produce: a window at a non-zero
+//     offset containing NOTHING we have not already read made no progress at
+//     all, which is the top-page signature rather than a shifted boundary.
 const PAGE_LIMIT_CAP = 200;
 // GET /v1/queue's own page ceiling (API.md §5: "default 20, max 100 — values
 // above the max are clamped, not rejected").
@@ -7495,24 +7507,41 @@ async function dispatchableQueuePage(cfg, slug, LIMIT = 25, { eligible = null, m
     if (want <= 0) break;
     const res = await fetchQueuePage(cfg, slug, want, ctx, at);
     const raw = res.items;
-    // A backend that honours `?offset=<everything read so far>` serves a window
-    // that begins strictly PAST what we have read, so it cannot contain an item
-    // we have already seen. ANY overlap therefore means the window we were
-    // served is not the one we asked for — an old backend re-serving its top
-    // page. Testing that the page is IDENTICAL is too weak: such a server
-    // re-RANKS between requests (that is what a queue does), so one item having
-    // moved made the duplicate top page look like genuine progress, and the
-    // walk then advanced its offset over a page it had never been given and
-    // silently lost every eligible item below it. Re-run this rung the old way
-    // rather than reading that page for the rest of the walk. A genuinely
-    // paging server can trip this only by GAINING an item above the window
-    // mid-walk, which costs one re-page from the top — the pre-offset
-    // behaviour — and never a lost item.
-    if (offsets && at > 0 && raw.some((it) => it && seen.has(it.id))) {
+    // `?offset` and the `next_offset`/`truncated` it is walked by are ONE
+    // contract (API.md §5), so an answer carrying neither field is a backend
+    // that cannot page — the only backend whose window is not the one we asked
+    // for. Known from the FIRST answer, which is the top page either way, so
+    // the downgrade re-reads nothing there; past it, the window we were handed
+    // is one we may never have been served, so that rung is re-run from the
+    // top. `paged` is null on an answer we never got (a dead server, a
+    // non-200): an error says nothing about what the backend supports, and the
+    // empty page it returns ends the walk below.
+    if (offsets && res.paged === false) {
+      offsets = false;
+      // Re-run the rung the old way unless this answer already IS what the old
+      // way would have asked for — the top of the queue, at the rung's whole
+      // width. A window past the top may never have been served; a first chunk
+      // NARROWER than the rung (a base ask wider than one server page) is only
+      // part of it, and a backend with no `?offset` may have no page clamp
+      // either, so the whole width is worth asking for once.
+      if (at > 0 || want < target) continue;
+    }
+    const fresh = raw.filter((it) => it && !seen.has(it.id));
+    // The backstop for a backend that reports those fields and ignores the
+    // offset anyway. It is NOT "this window overlaps what we already read": a
+    // queue re-ranks between requests, so an item appearing above the window
+    // slides the boundary and the next legitimate page shares its first item or
+    // two with the previous one — routine churn, which API.md §5 documents as
+    // the cost of offset paging over a live ranking. Treating that as a
+    // re-served top page is what truncated a current-server chunked read (a
+    // base ask wider than one page) back to its first page, silently dropping
+    // every eligible item below. A page that made NO progress — nothing in it
+    // we had not already read — is the reading churn cannot produce: a shifted
+    // boundary displaces a window by the churn, not by a whole page.
+    if (offsets && at > 0 && raw.length && !fresh.length) {
       offsets = false;
       continue;
     }
-    const fresh = raw.filter((it) => it && !seen.has(it.id));
     for (const it of fresh) seen.add(it.id);
     const page = winnowQueuePage(fresh);
     if (page.length) items = items.length ? items.concat(page) : page;
@@ -7564,9 +7593,17 @@ function ladderWidth(depth, step, maxLimit) {
 // backend that reports neither field falls back to "a full page probably has
 // more" — measured against what the server would actually serve, so the clamp
 // reads as "more", never as exhaustion.
+// `paged` reports the same thing about the BACKEND rather than the page: true
+// when the answer carried the paging contract `?offset` shipped with, false
+// when it carried none of it (a backend from before paging — its window is its
+// top page whatever offset was asked for), and null when there was no answer to
+// read at all, since a dead server or a non-200 says nothing about what the
+// backend supports. Local mode is `true` by construction: the offset is applied
+// here, to the ranker's own output.
 async function fetchQueuePage(cfg, slug, LIMIT, ctx = {}, OFFSET = 0) {
   let items = [];
   let more = false;
+  let paged = true;
   // --from-queue dispatches an AGENT to do work, and questions are human
   // decisions — not agent-dispatchable (the standing model: agent-actionable
   // work is a task, not a question; dec-spor-questions-human-not-agent-dispatch).
@@ -7593,6 +7630,9 @@ async function fetchQueuePage(cfg, slug, LIMIT, ctx = {}, OFFSET = 0) {
     if (envelope && typeof envelope.truncated === "boolean") more = envelope.truncated;
     else if (envelope && envelope.next_offset != null) more = Number(envelope.next_offset) > OFFSET;
     else more = items.length >= Math.min(LIMIT, SERVER_PAGE_MAX);
+    paged = envelope
+      ? typeof envelope.truncated === "boolean" || envelope.next_offset !== undefined
+      : null;
   } else {
     try {
       const graphLib = require(path.join(ROOT, "lib", "graph.js"));
@@ -7617,7 +7657,7 @@ async function fetchQueuePage(cfg, slug, LIMIT, ctx = {}, OFFSET = 0) {
       more = false;
     }
   }
-  return { items, more };
+  return { items, more, paged };
 }
 
 // `spor work` re-reads the queue every poll (and widens it within a pass), so a

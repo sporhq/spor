@@ -2208,9 +2208,14 @@ test("a base ask wider than the server's page is chunked, not mistaken for the e
 // request. Stopping there (nothing new came back, so nothing deeper is
 // reachable) reads correctly and behaves wrongly: it leaves the widening unable
 // to see past the BASE page against such a server, where before offsets existed
-// it re-paged the whole read at each doubled width and did reach deeper. So the
-// duplicate top page is a signal, not an ending: the walk falls back to that
+// it re-paged the whole read at each doubled width and did reach deeper. So
+// such a backend is a signal, not an ending: the walk falls back to that
 // pre-offset behaviour for the rest of the call.
+//
+// It is recognized from the ENVELOPE — `?offset` shipped together with
+// `next_offset`/`truncated` (API.md §5), so an answer carrying neither is a
+// backend from before paging — which is known from its very FIRST answer, so
+// the doomed `?offset` request is never sent at all.
 //
 // `rerank` models the harder case: a queue RE-RANKS between requests, so the
 // top page such a server re-serves is not byte-identical to the one before it.
@@ -2239,10 +2244,9 @@ test("a server too old to honour ?offset makes the read fall back to re-paging t
     const width = {};
     const page = await dispatchableQueuePage(cfg, null, 25, { eligible: () => false, width });
     assert.deepStrictEqual(requests, [
-      { limit: 25, offset: null },  // the base read
-      { limit: 25, offset: 25 },    // the delta this server ignores — it re-serves the top 25
-      { limit: 50, offset: null },  // ...so from here the whole width is re-paged, as it used to be
-      { limit: 100, offset: null },
+      { limit: 25, offset: null },  // the base read — and its envelope says this backend cannot page
+      { limit: 50, offset: null },  // ...so from here the whole width is re-paged, as it used to be,
+      { limit: 100, offset: null }, // and no `?offset` request is ever spent on it
     ]);
     assert.strictEqual(page.length, 100, "the widening still reaches past the base page on an old backend");
     assert.strictEqual(new Set(page.map((it) => it.id)).size, 100, "and the re-paged read replaces rather than appends");
@@ -2251,15 +2255,13 @@ test("a server too old to honour ?offset makes the read fall back to re-paging t
   }
 });
 
-// The detection above cannot demand an IDENTICAL repeated page. A queue
-// re-ranks — that is what a queue does — so an old backend's second top page
-// routinely differs from its first by an item or two, and requiring "nothing in
-// this page is new" then read the re-served top page as genuine progress: the
-// walk advanced its offset over a window it had never been given, and every
-// eligible item below the shallowest re-page was silently unreachable. Overlap
-// is the signal instead: a window that begins past everything we have read
-// cannot contain an item we have already seen, so ONE shared id is proof the
-// offset was ignored.
+// The detection must survive a RE-RANKING old backend. A queue re-ranks — that
+// is what a queue does — so such a server's second top page routinely differs
+// from its first by an item or two, and a detection that compares PAGES (they
+// are not identical, so this must be progress) then let the walk advance its
+// offset over a window it had never been given, leaving every eligible item
+// below the shallowest re-page silently unreachable. The envelope says nothing
+// about the ranking, so re-ranking cannot fool it.
 test("an offset-ignoring server that RE-RANKS is still detected, and the deep eligible item is reached", async () => {
   // Request 2 onward, a fresh top-priority item has appeared — so the re-served
   // top page is not the one we saw, but it still overlaps it heavily.
@@ -2269,17 +2271,105 @@ test("an offset-ignoring server that RE-RANKS is still detected, and the deep el
     const cfg = offsetCfg(base);
     const width = {};
     const page = await dispatchableQueuePage(cfg, null, 25, { eligible: (it) => it.id === "task-80", width });
-    // The harm first: demanding an identical page leaves the walk stepping its
-    // offset over re-served top pages, so it never assembles past rank ~49 and
-    // this item is unreachable on every poll, forever.
-    assert.ok(page.some((it) => it.id === "task-80"), "the item the identical-page detection could never reach");
+    // The harm first: reading the re-served top page as progress leaves the
+    // walk stepping its offset over pages it was never given, so it never
+    // assembles past rank ~49 and this item is unreachable on every poll.
+    assert.ok(page.some((it) => it.id === "task-80"), "the item a page-comparing detection could never reach");
     assert.deepStrictEqual(requests, [
       { limit: 25, offset: null },
-      { limit: 25, offset: 25 },    // one NEW item, and 24 we already read — an ignored offset, not progress
-      { limit: 50, offset: null },  // ...so the fallback re-pages the whole width from the top
+      { limit: 50, offset: null },  // the fallback re-pages the whole width from the top
       { limit: 100, offset: null },
     ]);
     assert.strictEqual(width.limit, 100);
+  } finally {
+    srv.close();
+  }
+});
+
+// A backend that reports the paging fields and ignores the offset anyway is not
+// a server that ships, but it is the one case the envelope cannot speak for, so
+// the walk keeps a backstop: a window at a non-zero offset holding NOTHING it
+// had not already read made no progress at all. That is the one reading churn
+// cannot produce — a shifted boundary displaces a window by the churn, never by
+// a whole page — which is why the backstop is "no progress" and not "any
+// overlap" (see the chunked-read regression below).
+function lyingPagerStub(all) {
+  const http = require("node:http");
+  const requests = [];
+  const srv = http.createServer((req, res) => {
+    const p = new URLSearchParams(req.url.slice(req.url.indexOf("?") + 1));
+    const limit = Math.max(1, Number(p.get("limit")) || 20);
+    requests.push({ limit, offset: p.has("offset") ? Number(p.get("offset")) : null });
+    const page = all.slice(0, Math.min(limit, STUB_PAGE_MAX)); // the top page, whatever was asked
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      items: page, count: all.length, offset: 0, returned_count: page.length,
+      next_offset: page.length < all.length ? page.length : null,
+      truncated: page.length < all.length,
+    }));
+  });
+  return new Promise((resolve) =>
+    srv.listen(0, "127.0.0.1", () => resolve({ srv, base: `http://127.0.0.1:${srv.address().port}`, requests }))
+  );
+}
+
+test("a backend that reports paging and ignores the offset is caught by the no-progress backstop", async () => {
+  const { srv, base, requests } = await lyingPagerStub(queueItems(120));
+  try {
+    const cfg = offsetCfg(base);
+    const width = {};
+    const page = await dispatchableQueuePage(cfg, null, 25, { eligible: (it) => it.id === "task-80", width });
+    assert.deepStrictEqual(requests, [
+      { limit: 25, offset: null },
+      { limit: 25, offset: 25 },    // the top 25 again: nothing new at all, so the offset was ignored
+      { limit: 50, offset: null },  // ...and the walk finishes the pre-offset way
+      { limit: 100, offset: null },
+    ]);
+    assert.ok(page.some((it) => it.id === "task-80"), "the deep eligible item is still reached");
+  } finally {
+    srv.close();
+  }
+});
+
+// The regression the backstop above is deliberately narrow for. A CURRENT
+// server pages correctly, and its ranking moves between two requests — an item
+// is filed and lands at the top, so the window at offset 100 begins one item
+// EARLIER in what we already read and shares its first item with our first
+// chunk. Reading that overlap as an ignored offset threw away a legitimate
+// chunked read: the fallback re-paged the caller's whole 150-item ask from the
+// top, the server clamped it to 100, the ladder was already at its ceiling — so
+// the call returned one page and every eligible item past rank 100 was silently
+// dropped, on this poll and every poll after it.
+test("a rerank at the chunk boundary is churn, not an ignored offset — the wide base read still reaches its depth", async () => {
+  const all = queueItems(200);
+  const http = require("node:http");
+  const requests = [];
+  const srv = http.createServer((req, res) => {
+    const p = new URLSearchParams(req.url.slice(req.url.indexOf("?") + 1));
+    const limit = Math.max(1, Number(p.get("limit")) || 20);
+    const from = Math.max(0, Number(p.get("offset")) || 0);
+    requests.push({ limit, offset: p.has("offset") ? Number(p.get("offset")) : null });
+    // Request 2 onward, one item has been filed above the whole queue.
+    const ranked = requests.length > 1 ? [{ id: "task-hot", type: "task", suggest: "dispatch" }, ...all] : all;
+    const page = ranked.slice(from, from + Math.min(limit, STUB_PAGE_MAX));
+    const end = from + page.length;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      items: page, count: ranked.length, offset: from, returned_count: page.length,
+      next_offset: end < ranked.length ? end : null, truncated: end < ranked.length,
+    }));
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  try {
+    const cfg = offsetCfg(`http://127.0.0.1:${srv.address().port}`);
+    const page = await dispatchableQueuePage(cfg, null, 150, { eligible: (it) => it.id === "task-140" });
+    assert.deepStrictEqual(requests, [
+      { limit: 100, offset: null },
+      { limit: 50, offset: 100 },   // it shares task-100 with the first chunk — churn, and the walk goes on
+    ]);
+    assert.ok(page.some((it) => it.id === "task-140"), "the item the any-overlap fallback dropped");
+    assert.strictEqual(new Set(page.map((it) => it.id)).size, page.length, "and the shared item is not counted twice");
+    assert.strictEqual(page.filter((it) => it.id === "task-100").length, 1);
   } finally {
     srv.close();
   }
