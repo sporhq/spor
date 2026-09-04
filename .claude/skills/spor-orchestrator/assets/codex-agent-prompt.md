@@ -52,6 +52,14 @@ If it needs a coordinated change across both spor and spor-server, or it's block
 you genuinely can't make it pass: STOP, don't thrash. Explain the blocker in your final
 report and leave it for the orchestrator — that's the designed path, not a failure.
 
+If instead the acceptance merely names a file in ANOTHER repo (a docs row elsewhere,
+an independent half that would pass its own tests without yours), do this repo's half
+here and never cut a worktree or branch in the other repo — a branch left there is an
+orphan nobody tracks. Report it as MERGE-READY and add a `## HANDED BACK` block to
+your final report (format below). The orchestrator files that block as a sibling queue
+item in the other repo and narrows this node's acceptance to what you did BEFORE it
+resolves this node — so the block must carry enough acceptance text to stand alone.
+
 ## Final report
 End with: what you changed, how you verified (paste the key test/build output), the
 commit sha, and whether it's MERGE-READY or BLOCKED (and why).
@@ -67,3 +75,25 @@ this is the ONLY place these go; you do NOT file them yourself:
     worse than an alternative** (say what you did, the better approach, and why); missing
     tests / fragile patterns / surprising behavior. If genuinely nothing, write
     "FINDINGS: none."
+
+If (and only if) part of this item's acceptance lives in another repo (see "If it won't
+converge"), add a second block — this is NOT a finding, it is unfinished acceptance the
+orchestrator must file before it may resolve this node:
+
+    ## HANDED BACK
+    - repo: <other-repo slug> — <the acceptance text for that half, standing alone:
+      which file(s), what must be true there, and why it belongs to this item>
+      sibling: task-split-<other-repo slug>-<hash>
+
+`repo:` must be the other repo's canonical slug — its `repo:` stamp value as it
+appears on graph nodes (kebab-case, e.g. `spor-server`; never a `repo-…` node id, a
+path, or a display name) — because it is one of the two inputs the sibling id is
+derived from. The `sibling:` line is the id the orchestrator will file the half under:
+`<hash>` is the first 12 hex characters of the SHA-256 of this node's full id (type
+prefix included) and that slug, each followed by a newline —
+`printf '%s\n%s\n' '<this node id>' '<slug>' | sha256sum | cut -c1-12` (e.g.
+`issue-foo-bar` + `spor-server` → `task-split-spor-server-a543f6c75e9a`). Derived,
+never minted, so a retry or a pre-split finds the same node — state it so the report
+is self-describing; the orchestrator re-derives it from the rule rather than trusting
+it, and treats an unrelated node already holding that id as an anomaly to escalate,
+never as the sibling.

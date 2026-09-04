@@ -194,3 +194,9 @@ When in doubt, an agent that discovers mid-task that its item is actually a
 coordinated cross-repo change will leave the node unresolved and defer the
 blocker (see `assets/agent-prompt.md`). Treat that as the signal to re-run the
 item solo, not as a failure.
+
+This is only the *lockstep* case. An item whose acceptance merely lists a file in
+a second repo — halves that each pass their own suite with the other absent — is
+not serialized but **split** into per-repo sibling items at selection time
+(SKILL.md "Picking non-overlapping work"); a second worktree in the other repo is
+never the answer, since its branch would sit outside the orchestrator's run table.

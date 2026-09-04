@@ -150,6 +150,95 @@ Otherwise `/spor:defer` the blocker with a clear explanation, leave the node
 The orchestrator will see the node is unresolved and serialize or escalate it —
 that's the designed path, not a failure on your part.
 
+**Acceptance that turns out to span a second repo** is a different, milder
+case — a docs item whose criteria also name a file in another repo, a checkbox
+"and update the reference in `<other-repo>`" — and it does NOT block you. Your
+worktree, your branch, and your merge authority all cover exactly this repo;
+you are not authorized to cut a worktree or a branch in any other repo, and a
+branch you left there would be an orphan nothing in the orchestrator's run
+table tracks (an implementer once pushed exactly such a branch from a docs
+dispatch and it sat unmerged, art-spor-docs-bulk-lease-endpoints-2026-08-10).
+Instead, finish THIS repo's half here and, before step 7, re-scope the node so
+its `resolves` edge tells the truth — a resolver against the node *as written*
+would claim the other repo's half done when nobody has touched it. In this
+order, each a graph write you make yourself (the one exception to step 5's
+"don't write to the graph yourself": this is a piece of your own acceptance,
+not a finding):
+
+1. **File the sibling first, under a DERIVED id, and check it is yours.**
+   The id is `task-split-<slug>-<hash>`: the slug is the other repo's
+   `repo:` stamp value (kebab-case, e.g. `spor-server`; never a `repo-…`
+   node id, a path, or a display name; first 60 characters if longer), and
+   the hash is the first 12 hex characters of the SHA-256 of `{{node}}`'s
+   full id (type prefix included) and that full slug, each followed by a
+   newline — `printf '%s\n%s\n' '{{node}}' '<slug>' | sha256sum | cut
+   -c1-12` — so `issue-foo-bar` handed to `spor-server` gives
+   `task-split-spor-server-a543f6c75e9a`. The hash covers both inputs, so
+   it is unique per (item, repo) and always well inside the id length limit.
+   Never let `/spor:defer` or `spor
+   add` mint one — a minted id is a fresh duplicate on every retry and a
+   second one if the orchestrator pre-split this item. Write it with
+   `put_node` `if_exists: skip` (or `spor put-node - --if-exists skip`): a
+   `task` stamped to that repo (`repo:`/`project:` = the slug), carrying
+   enough of the acceptance text to stand alone, with a `relates-to` edge to
+   `{{node}}`. Then `get_node` that id back and test it: it IS the sibling
+   only if its `repo:` is that slug AND it has a `relates-to` (or
+   `derived-from`) edge to `{{node}}` — yours or someone else's, a skipped
+   write that passes is success. A node that fails the test is NOT the
+   sibling — nothing lands under a hashed id by accident, so it is a graph
+   anomaly: leave it alone, do not try another id (the orchestrator derives
+   the same one, and a second id is the fork this rule prevents), do not
+   narrow, do not resolve; go to the hand-back below and say what you found
+   under the id. If the write errored and the read finds nothing, nothing
+   is filed: same hand-back.
+2. **Narrow `{{node}}`'s own acceptance — with the marker, not a mention.**
+   `{{node}}` counts as narrowed if and only if its body already carries this
+   block naming THIS repo and an id that passed step 1's test:
+
+   ```
+   ## Scope (narrowed)
+   covers: <this repo's slug>
+   sibling: <sibling id> — <other repo slug>: <one line: what lives there>
+   ```
+
+   Skip this step only when that block is present with both values and the
+   id it names passes the test; the sibling's id appearing elsewhere in the
+   body, a `relates-to` edge alone, a prose "see also", or a marker naming a
+   collided id is NOT narrowing — write (or rewrite) the block. `get_node`
+   `{{node}}` for its current revision, then `put_node` (or `spor put-node -
+   --if-exists update --revision <rev>`) the SAME body with the block
+   appended — keep every other line of the body and every existing edge
+   intact (a full-node write replaces the whole node; a body retyped from
+   memory silently drops edges). Add a `relates-to` edge from `{{node}}` to
+   the sibling (idempotent). On a revision conflict, re-read and re-check
+   the marker before re-sending — the orchestrator or a parallel actor may
+   have written it meanwhile.
+3. **Only then** write the resolver (step 7) — its body names the sibling's
+   id, and it resolves a node whose acceptance is now exactly what you did.
+   If the re-read in step 2 shows `{{node}}` already resolved (a live inbound
+   `resolves` edge), do NOT write a second resolver: with the marker present
+   you are done; with it absent, still append the marker (a body edit is
+   valid on a resolved node) and say so in your report.
+
+If step 1 could not file the sibling, or the narrowing write in step 2 is
+refused (revision conflict, validation error) and one retry after a fresh
+`get_node` still fails, do NOT resolve: leave `{{node}}` unresolved and hand
+the split back to the orchestrator in your final report — end it with the
+line `MERGE-READY (unresolved: narrowing refused)` and add the block below,
+which is what the orchestrator's supervisor acts on (it files/narrows under
+the same ids and resolves; without the block, an unresolved node reads as a
+failed run and is re-dispatched):
+
+    ## HANDED BACK
+    - repo: <other-repo slug> — <the acceptance text for that half, standing
+      alone: which file(s), what must be true there, why it belongs here>
+      sibling: <the id you derived in step 1> (filed: yes|no|anomaly — what sits under it)
+      narrowed: no — <the exact error the narrowing write returned>
+
+Only if the two halves must land together to work at all (one half's tests
+need the other's edits) is it the lockstep case above: then stop and leave
+the node unresolved.
+
 ## Final report
 
 End with: the node id, what you changed, confirmation that tests pass and your

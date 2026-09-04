@@ -167,6 +167,56 @@ your final message exactly what's blocking it. If an orchestrator dispatched
 you, it will see the node is unresolved and serialize or escalate it — that's
 the designed path, not a failure on your part.
 
+**Acceptance that turns out to span a second repo** (a docs item whose criteria
+also name a file in another repo) does NOT block you and does not authorize you
+to cut a worktree or branch in that other repo — a branch left there is an
+orphan no run table tracks (art-spor-docs-bulk-lease-endpoints-2026-08-10).
+Finish THIS repo's half here, then re-scope the node BEFORE you resolve it —
+a resolver against the node as written would claim the other half done. In
+order (you write these yourself even under an orchestrator — they are your own
+acceptance, not findings): (1) file the other repo's half as its own queue
+item under the DERIVED id `task-split-<slug>-<hash>` — the slug is that
+repo's `repo:` stamp value (e.g. `spor-server`, never a `repo-…` node id;
+first 60 characters if longer), the hash the first 12 hex characters of the
+SHA-256 of `{{node}}`'s full id and that full slug, each followed by a
+newline (`printf '%s\n%s\n' '{{node}}' '<slug>' | sha256sum | cut -c1-12`;
+e.g. `issue-foo-bar` + `spor-server` → `task-split-spor-server-a543f6c75e9a`)
+— with `put_node`
+`if_exists: skip` (or `spor put-node - --if-exists skip`) — never
+`/spor:defer`/`spor add`, which mint a duplicate per retry — stamped to that
+repo, with enough acceptance text to stand alone and a `relates-to` edge to
+`{{node}}`; then `get_node` it back and test it: it is the sibling only if
+its `repo:` is that slug and it carries a `relates-to`/`derived-from` edge to
+`{{node}}` (a skipped write that passes is success). A node that fails is
+NOT the sibling — nothing lands under a hashed id by accident — so it is a
+graph anomaly: leave it, never try another id, don't narrow, don't resolve,
+hand back below saying what sits under the id; an error plus an empty read
+means nothing is filed: same hand-back.
+(2) `get_node` `{{node}}` for its revision and `put_node` (or
+`spor put-node - --if-exists update --revision <rev>`) the SAME body with
+this block appended — keep every other line of the body and every existing
+edge intact, since a full-node write replaces the whole node:
+
+    ## Scope (narrowed)
+    covers: <this repo's slug>
+    sibling: <sibling id> — <other repo slug>: <one line: what lives there>
+
+plus a `relates-to` edge to the sibling. The node is narrowed only if that
+block is present naming this repo and an id that passed the test — the id
+appearing elsewhere in the body, an edge alone, or a marker naming a
+collided id is not narrowing; skip the write only on that
+exact condition, and on a revision conflict re-read and re-check before
+re-sending. (3) Only then write the resolver (step 7), naming the sibling's
+id there and in your final report — unless the re-read shows `{{node}}`
+already resolved (a live `resolves` edge), in which case write no second
+resolver (append the marker if it is missing, and say so). If (1) could not
+file, or the narrowing write is refused and a retry after a fresh `get_node`
+still fails, leave the node unresolved and end your final report with
+`MERGE-READY (unresolved: narrowing refused)` plus the `## HANDED BACK` block
+(format below) — never resolve against the wider acceptance. Only if the two
+halves must land together to work at all is it the lockstep case above: then
+stop and leave the node unresolved.
+
 ## Final report
 
 End with: the node id, what you changed, confirmation that tests pass and your
@@ -185,3 +235,12 @@ graph if one dispatched you; otherwise file these yourself with `/spor:defer`):
     literally is clearly worse than an alternative** (say what you did, the better
     approach, and why); missing tests / fragile patterns / surprising behavior.
     If there's genuinely nothing worth tracking, write "FINDINGS: none."
+
+If (and only if) you handed the cross-repo split back unnarrowed (see "If it
+won't converge"), add a second block — not a finding, but unfinished graph
+work the orchestrator runs before it resolves this node:
+
+    ## HANDED BACK
+    - repo: <other-repo slug> — <the acceptance text for that half, standing alone>
+      sibling: <the derived id> (filed: yes|no|anomaly — what sits under it)
+      narrowed: no — <the exact error the narrowing write returned>
