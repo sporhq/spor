@@ -1047,6 +1047,34 @@ a fix cycle the fix-introduced floor still applies: a row the fix INTRODUCED is
 blocking, one open at the initial review and not raised then is advisory.
 The checklist is prose — nothing parses it; the parser's protocol is unchanged.
 
+**A carried finding names the mechanism, not the next row**
+(task-spor-review-gate-carried-finding-names-the-mechanism-not-the-next-row).
+The checklist above tables one mechanism's rows in advance; the general case
+cannot be. The first live rescue spent its whole cycle budget on one finding —
+"an early rescue diagnosis does not survive truncation" — because each fix
+closed the one harness row the reviewer had probed (the Claude stream, the
+Codex stream, a declared harness's job file, a declared `report: file`
+harness) and the reviewer named the next; every cycle was right in isolation
+and nobody was asked to enumerate the rows. So when a review confirms a prior
+finding open it is asked to name the MECHANISM the finding is an instance of
+and list every remaining row it can see as `rows` on that `prior` entry (one
+string per row — the cases one fix would have to close together), saying
+which rows the fix must close. The prompt tells the reviewer how many fix
+cycles each prior finding has already survived, and once one has been carried
+`ROW_BY_ROW_CARRY` (two) fix cycles the list is REQUIRED: a confirmation that
+still names fewer than two rows is recorded **row-by-row** on the finding, on
+the gate's fact (`[blocking, row-by-row]`) and in the refusal's detail
+(`gates.rowByRowFindings`). The rows ride the finding ledger (folded by
+`applyReviewToLedger`, cleared when the entry resolves, restored by
+`rollbackCycle`, replayed to the next review), and the fix-cycle prompt hands
+the fixer the same list under the finding, says how many cycles it has
+survived, and asks it to enumerate the rows ITSELF — whether or not the
+review listed them — and to state in the commit message which rows the fix
+closes and which it deliberately leaves, so the next review reads a design
+rather than the next probe. Like the checklist this is prose for the reader
+and a tag for the record: pass/fail is decided exactly as before, and the
+`cycles` cap is unchanged (the budget was fine; the framing was not).
+
 On `changes_requested` with cycles left, the runner dispatches an implementer
 **fix cycle** — the blocking findings by id, the advisory notes, what earlier
 cycles already resolved (do not regress), at the same node, in the same tree —

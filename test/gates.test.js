@@ -710,3 +710,87 @@ test("the durable-debt checklist has the four fixed rows, lettered, and indents 
   for (const l of gates.renderDurableFlagChecklist({ indent: "   " }).split("\n")) assert.match(l, /^   \([a-d]\) /);
   assert.ok(Object.isFrozen(gates.DURABLE_FLAG_FAILURE_MODES), "the table is a contract, not a mutable list");
 });
+
+// --- a carried finding names the mechanism, not the next row ---------------
+// (task-spor-review-gate-carried-finding-names-the-mechanism-not-the-next-row)
+// A reviewer confirming a prior finding open may enumerate the mechanism's
+// remaining `rows`; the ledger carries them to the fixer and the next review,
+// and a finding carried ROW_BY_ROW_CARRY+ fix cycles that is still answered
+// with fewer than two rows reads row-by-row. Pure protocol: pass/fail unchanged.
+test("a confirmed-open prior finding's `rows` are read, cleaned, capped, and folded onto the ledger; a resolved one has none", () => {
+  const prior = [
+    { id: "F1", severity: "blocking", file: "a.js", summary: "a", evidence: "ran a", opened: 0, rows: ["stale row from cycle 0"] },
+    { id: "F2", severity: "blocking", file: "b.js", summary: "b", evidence: "ran b", opened: 0, rows: [] },
+  ];
+  const text =
+    "```json\n" +
+    JSON.stringify({
+      verdict: "changes_requested",
+      prior: [
+        { id: "F1", status: "open", note: "still there", rows: ["  the Claude stream ", "", 7, null, "the Codex  stream", "x".repeat(300)] },
+        { id: "F2", status: "resolved", note: "fixed", rows: ["should be dropped"] },
+      ],
+      findings: [],
+    }) +
+    "\n```";
+  const v = gates.parseReviewVerdict(text, { prior, cycle: 1 });
+  assert.strictEqual(v.ok, true, v.error);
+  assert.strictEqual(v.passed, false);
+  const f1 = v.findings.find((f) => f.id === "F1");
+  assert.deepStrictEqual(f1.rows.slice(0, 2), ["the Claude stream", "the Codex stream"], "rows are trimmed, whitespace-collapsed, non-strings dropped");
+  assert.strictEqual(f1.rows.length, 3);
+  assert.strictEqual(f1.rows[2].length, 240, "each row is capped");
+  assert.deepStrictEqual(v.prior.find((f) => f.id === "F2").rows, [], "a resolved finding carries no rows");
+  // Folded onto the ledger, and read back into the next prior set.
+  const ledger = [
+    { id: "F1", severity: "blocking", file: "a.js", summary: "a", evidence: "ran a", blocking: true, status: "open", opened: 0, closed: null, rows: ["stale row from cycle 0"] },
+    { id: "F2", severity: "blocking", file: "b.js", summary: "b", evidence: "ran b", blocking: true, status: "open", opened: 0, closed: null },
+  ];
+  const next = gates.applyReviewToLedger(ledger, v, 1);
+  assert.deepStrictEqual(next[0].rows, f1.rows, "the reviewer's rows replace the earlier list");
+  assert.deepStrictEqual(next[1].rows, [], "a resolved entry's rows are cleared");
+  assert.deepStrictEqual(gates.openPriorFindings(next).map((p) => [p.id, p.rows.length]), [["F1", 3]]);
+  // A later verdict that names no rows keeps the ledger's list (a verdict
+  // that says less does not erase a design an earlier review enumerated).
+  const v2 = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","prior":[{"id":"F1","status":"open"}],"findings":[]}\n```', { prior: gates.openPriorFindings(next), cycle: 2 });
+  assert.deepStrictEqual(v2.findings[0].rows, f1.rows);
+  assert.deepStrictEqual(gates.applyReviewToLedger(next, v2, 2)[0].rows, f1.rows);
+  // …and a rollback of the cycle restores the rows the fold replaced.
+  assert.deepStrictEqual(gates.rollbackCycle(next, 1)[0].rows, ["stale row from cycle 0"]);
+  // The row list is capped at 12.
+  const many = gates.mechanismRows(Array.from({ length: 20 }, (_, i) => `row ${i}`));
+  assert.strictEqual(many.length, 12);
+  assert.deepStrictEqual(gates.mechanismRows("one string"), ["one string"], "a single string reads as one row");
+  assert.deepStrictEqual(gates.mechanismRows(undefined), []);
+});
+
+test("row-by-row: a prior finding carried ROW_BY_ROW_CARRY+ fix cycles and confirmed open with fewer than two rows is flagged; fewer carries or two rows are not", () => {
+  assert.strictEqual(gates.ROW_BY_ROW_CARRY, 2);
+  const at = (opened, cycle) => gates.carriedFixCycles({ opened }, cycle);
+  assert.strictEqual(at(0, 0), 0);
+  assert.strictEqual(at(0, 1), 1);
+  assert.strictEqual(at(0, 3), 3);
+  assert.strictEqual(at(2, 1), 0, "never negative");
+  assert.strictEqual(gates.carriedFixCycles({ opened: 0 }, "tree"), 0, "the dirty-tree round-trip carries nothing");
+  assert.strictEqual(gates.carriedFixCycles({}, 2), 0, "a fresh finding has no opened cycle");
+  const open = (id, opened, rows) => ({ id, origin: "prior", status: "open", opened, rows });
+  const flagged = gates.rowByRowFindings(
+    [
+      open("F1", 0, []), // carried 2, no rows -> row-by-row
+      open("F2", 0, ["only the next row"]), // carried 2, one row -> row-by-row
+      open("F3", 0, ["the Claude stream", "the Codex stream"]), // enumerated -> fine
+      open("F4", 1, []), // carried once -> not yet required
+      { ...open("F5", 0, []), status: "resolved" }, // resolved -> not open
+      { id: "F6", origin: "new", status: "open", opened: 0 }, // not a prior finding
+    ],
+    2
+  );
+  assert.deepStrictEqual(flagged.map((f) => f.id), ["F1", "F2"]);
+  assert.deepStrictEqual(gates.rowByRowFindings([open("F1", 0, [])], "tree"), []);
+  // The rendered line carries the tag and the rows, one indented line each.
+  const text = gates.renderFindings([
+    { id: "F1", severity: "blocking", file: "a.js", summary: "a", blocking: true, rowByRow: true, rows: ["the Claude stream", "the Codex stream"] },
+    { id: "F2", severity: "blocking", file: "b.js", summary: "b", blocking: true },
+  ]);
+  assert.strictEqual(text, "F1 [blocking, row-by-row] a.js — a\n    row: the Claude stream\n    row: the Codex stream\nF2 [blocking] b.js — b");
+});

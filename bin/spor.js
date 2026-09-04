@@ -10752,15 +10752,27 @@ function makeGateDeps(
     const item = await workItemText();
     const diff = gateDiffText(change);
     const fixText = fix ? gateFixText(change, fix) : "";
+    // How many fix cycles each prior finding has already survived, and the
+    // rows an earlier review enumerated for it: a finding carried a second
+    // time must be answered with the mechanism's rows (below), not the next
+    // one (task-spor-review-gate-carried-finding-names-the-mechanism-not-the-
+    // next-row).
+    const carriedOf = (p) => gatesKernel.carriedFixCycles(p, cycle);
+    const secondCarry = prior.filter((p) => carriedOf(p) >= gatesKernel.ROW_BY_ROW_CARRY);
     const priorText = prior
-      .map((p) => `${p.id} [${p.severity}] ${p.file ? `${p.file} — ` : ""}${p.summary}${p.evidence ? `\n    evidence: ${String(p.evidence).replace(/\s+/g, " ").slice(0, 400)}` : ""}`)
+      .map(
+        (p) =>
+          `${p.id} [${p.severity}${carriedOf(p) ? `, carried ${carriedOf(p)} fix cycle${carriedOf(p) === 1 ? "" : "s"}` : ""}] ${p.file ? `${p.file} — ` : ""}${p.summary}` +
+          (p.evidence ? `\n    evidence: ${String(p.evidence).replace(/\s+/g, " ").slice(0, 400)}` : "") +
+          gatesKernel.mechanismRows(p.rows).map((r) => `\n    row (enumerated by an earlier review): ${r}`).join("")
+      )
       .join("\n");
     const raisedText = raised
       .map((p) => `${p.id} [${p.severity}, undemonstrated at cycle ${p.opened}] ${p.file ? `${p.file} — ` : ""}${p.summary}`)
       .join("\n");
     const verdictShape =
       `{"verdict": "pass" | "changes_requested",` +
-      (prior.length ? ` "prior": [{"id": "${prior[0].id}", "status": "resolved" | "open", "note": "what you checked"}],` : "") +
+      (prior.length ? ` "prior": [{"id": "${prior[0].id}", "status": "resolved" | "open", "note": "what you checked", "rows": ["each remaining row of the mechanism, when open"]}],` : "") +
       ` "findings": [{"severity": "blocking|major|minor", "file": "path", "summary": "what is wrong", "evidence": "the command/test you ran and what it showed"` +
       (cycle > 0 ? `, "introduced_by_fix": true | false` : "") +
       `}]}`;
@@ -10801,6 +10813,23 @@ function makeGateDeps(
             ...(fixText ? ["## What the last fix cycle changed", "", fixText, ""] : []),
             "A verdict that omits any prior finding (neither cleared nor confirmed) is UNREADABLE and counts as",
             "changes_requested for the prior set only — nothing new you raise is admitted in that case.",
+            "",
+            "### A carried finding names the MECHANISM, not the next row",
+            "",
+            "When you confirm a prior finding open, do not answer with the next failing case. Name the mechanism the",
+            "finding is one instance of (the thing every case has in common — a stream the client reads text off, a",
+            "flag one pass writes for another, a path spelling), enumerate EVERY remaining row of it you can see as",
+            "`rows` on that prior entry (one string per row — the cases one fix would have to close together), and say",
+            "in the note which rows the fix must close for the finding to resolve. A fix closes the row it was shown;",
+            "a finding answered one row per cycle spends the whole cycle budget on one mechanism.",
+            ...(secondCarry.length
+              ? [
+                  "",
+                  `${secondCarry.map((p) => p.id).join(", ")} ${secondCarry.length === 1 ? "has" : "have"} already been carried through ${gatesKernel.ROW_BY_ROW_CARRY} or more fix cycles: if you confirm ${secondCarry.length === 1 ? "it" : "any of them"} open, \`rows\``,
+                  "is REQUIRED — a confirmation naming fewer than two rows is recorded as row-by-row on the finding and on the",
+                  "gate's fact, and the fixer is told to enumerate the rows itself.",
+                ]
+              : []),
             "",
           ]
         : []),
@@ -10891,6 +10920,19 @@ function makeGateDeps(
     const blocking = (findings || []).filter((f) => f.blocking !== false);
     const advisory = (findings || []).filter((f) => f.blocking === false);
     const resolved = (ledger || []).filter((e) => e.status === "resolved");
+    // The blocking findings that already survived a fix cycle: the fixer is
+    // asked to enumerate the mechanism's rows itself and say which the fix
+    // closes and which it leaves, so the next review reads a design rather
+    // than the next probe (task-spor-review-gate-carried-finding-names-the-
+    // mechanism-not-the-next-row). `cycle` is the review index the findings
+    // came from; the dirty-tree round-trip's `"tree"` carries nothing.
+    const carriedFindings = blocking.filter((f) => gatesKernel.carriedFixCycles(f, cycle) >= 1);
+    const carriedText = carriedFindings
+      .map((f) => {
+        const n = gatesKernel.carriedFixCycles(f, cycle);
+        return `${f.id} has survived ${n} fix cycle${n === 1 ? "" : "s"}${f.rowByRow ? " and the review named only the next row (row-by-row)" : ""}`;
+      })
+      .join("\n");
     const prompt = [
       // The dirty-tree round-trip arrives as `cycle: "tree"` — not a fix
       // cycle, so it is never numbered against the cap on either pass.
@@ -10905,6 +10947,19 @@ function makeGateDeps(
       "",
       `Fix the cause in the same worktree and commit${blocking.some((f) => f.id) ? ", naming the finding ids you addressed in the commit message —" : "."}`,
       ...(blocking.some((f) => f.id) ? ["the next review is handed your commits and asked whether each prior finding is resolved."] : []),
+      ...(carriedFindings.length
+        ? [
+            "",
+            "Carried findings — close the MECHANISM, not the next row:",
+            carriedText,
+            "A finding that survives a fix is one instance of a mechanism, and the last fix closed the one row it was",
+            "shown. Before you change anything, enumerate the mechanism's rows yourself — every case the finding can",
+            "take that you can see, whether or not the review listed it (the rows it did list are under the finding",
+            "above) — then fix so that ONE change closes them together, and state in the commit message which rows",
+            "the fix closes and which it deliberately leaves and why. The next review reads that design; a fix that",
+            "closes the row it was shown and leaves the next is a fix cycle spent.",
+          ]
+        : []),
       "If the fix touches a durable retry/debt flag (a `*_pending` run-record field, a journal line, a cooldown file),",
       "design it against ALL of these at once and say how each is handled in the commit message — the next review",
       "walks the whole table in one verdict, and a fix that closes one row by opening the next is a fix cycle spent:",
