@@ -3068,6 +3068,101 @@ test("an ARMED command gate runs, names its class, and an unreadable change set 
   assert.strictEqual(res2.state, "failed", "no diff means no arming decision — fail closed, never skip");
 });
 
+// ------------------------- agent-review gates: the same arming predicate -----
+// The third gate kind gains the predicate the other two already shared
+// (task-spor-review-gate-risk-arming). The saving is the largest of the three:
+// an unarmed review skips a whole agent dispatch — a model call, a lease and an
+// `await_ms` window — not just a suite run on the worker's own box.
+
+test("an agent-review gate parses `risk`, and an undeclared risk class refuses the factory", () => {
+  const mk = (gate, extra = {}) =>
+    gates.parseFactory(
+      ["```json", JSON.stringify({ ...BASE, risk_classes: { "touches:ui": ["src/routes/**"] }, ...extra, gates: [gate] }), "```"].join("\n"),
+      { id: "factory-test" }
+    );
+  const ok = mk({ id: "explore", kind: "agent-review", profile: "profile-explorer", risk: ["touches:ui"] });
+  assert.deepStrictEqual(ok.errors, []);
+  assert.deepStrictEqual(ok.factory.gates[0].risk, ["touches:ui"]);
+  // The `risk_classes` spelling parses to the same thing, as on the other kinds.
+  assert.deepStrictEqual(mk({ id: "explore", kind: "agent-review", profile: "p", risk_classes: ["touches:ui"] }).factory.gates[0].risk, ["touches:ui"]);
+  // Declaring none stays unconditional — the shape every factory already in
+  // service has.
+  assert.deepStrictEqual(mk({ id: "explore", kind: "agent-review", profile: "p" }).factory.gates[0].risk, []);
+  // A typo is a LOAD error, not a gate that can never arm and reads as passing.
+  const bad = mk({ id: "explore", kind: "agent-review", profile: "p", risk: ["touches:nope"] });
+  assert.ok(bad.errors.some((e) => /gate 'explore': risk class 'touches:nope' is not declared/.test(e)), bad.errors.join("; "));
+  assert.strictEqual(bad.factory, null);
+});
+
+test("an UNARMED agent-review gate is skipped — no reviewer is dispatched, the fact says so, the pipeline continues", async () => {
+  const factory = factoryOf({
+    ...BASE,
+    risk_classes: { "touches:ui": ["src/routes/**"] },
+    gates: [
+      { id: "explore", kind: "agent-review", profile: "profile-explorer", risk: ["touches:ui"] },
+      { id: "unit", kind: "command", command: "npm test" },
+    ],
+  });
+  const { deps, seen } = fakes({ changed: ["docs/x.md"] });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.deepStrictEqual(res.gates.map((g) => [g.gate, g.verdict]), [["explore", "skipped"], ["unit", "passed"]]);
+  assert.deepStrictEqual(seen.reviews, [], "no agent dispatch was paid for");
+  assert.match(res.gates[0].detail, /no declared risk class \(touches:ui\) was touched/);
+  assert.strictEqual(seen.facts.length, 2, "the skip is still a recorded fact");
+});
+
+test("an ARMED agent-review gate runs and names its class; an unreadable diff fails closed only where risk is declared", async () => {
+  const factory = factoryOf({ ...BASE, risk_classes: { "touches:ui": ["src/routes/**"] }, gates: [{ id: "explore", kind: "agent-review", profile: "profile-explorer", risk: ["touches:ui"] }] });
+  const armed = fakes({ changed: ["src/routes/+page.svelte"] });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: armed.deps });
+  assert.strictEqual(res.state, "passed");
+  assert.deepStrictEqual(armed.seen.reviews.map((r) => r.gate), ["explore"]);
+  assert.match(res.gates[0].detail, /armed by touches:ui/);
+
+  const unreadable = fakes({ changed: null });
+  const res2 = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: unreadable.deps });
+  assert.strictEqual(res2.state, "failed", "no diff means no arming decision — fail closed, never skip");
+  assert.deepStrictEqual(unreadable.seen.reviews, [], "and nothing was dispatched at an unjudgeable change");
+
+  // ...but a gate declaring NO risk consults no paths at all, and its reviewer
+  // reads the implementer's live checkout for itself. Arming must not hand it
+  // a refusal it never had (dec-spor-review-gate-unreadable-diff-fails-closed-
+  // only-when-armed).
+  const plain = factoryOf({ ...BASE, gates: [{ id: "explore", kind: "agent-review", profile: "profile-explorer" }] });
+  const un2 = fakes({ changed: null });
+  const res3 = await gateRunner.runGatePipeline({ item: ITEM, factory: plain, deps: un2.deps });
+  assert.strictEqual(res3.state, "passed", "an unconditional review gate is untouched by arming");
+  assert.deepStrictEqual(un2.seen.reviews.map((r) => r.gate), ["explore"]);
+});
+
+test("an agent-review gate whose ledger holds an open blocking finding runs even once the change stops arming it", async () => {
+  // Arming is read from a diff that MOVES across fix cycles, so a fix that
+  // reverts the arming paths would otherwise disarm the gate mid-pipeline —
+  // and `skipped` passes, retiring a demonstrated finding nobody cleared
+  // (dec-spor-review-gate-arming-never-buries-open-findings).
+  const factory = factoryOf({
+    ...BASE,
+    risk_classes: { "touches:ui": ["src/routes/**"] },
+    gates: [{ id: "explore", kind: "agent-review", profile: "profile-explorer", risk: ["touches:ui"], cycles: 1 }],
+  });
+  const { deps, seen } = fakes({
+    // Read 1 arms the gate; every read after the fix does not.
+    changedSeq: [{ ok: true, paths: ["src/routes/+page.svelte"] }, { ok: true, paths: ["docs/x.md"] }],
+    review: ({ prior }) => ({
+      ok: true,
+      text: prior.length
+        ? `\`\`\`json\n{"verdict":"pass","prior":[${prior.map((p) => `{"id":"${p.id}","status":"resolved"}`).join(",")}]}\n\`\`\``
+        : changesRequested,
+    }),
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(seen.reviews.length, 2, "the disarmed cycle still reviewed — the open finding was answered, not buried");
+  assert.deepStrictEqual(seen.reviews.map((r) => r.cycle), [0, 1]);
+  assert.strictEqual(res.state, "passed");
+  assert.strictEqual(res.gates[0].verdict, "passed");
+});
+
 test("a `serialize: repo` command gate takes the lease before its suite and releases it after — even when the suite throws", async () => {
   const factory = factoryOf({ ...BASE, gates: [{ id: "rls", kind: "command", command: "make rls", serialize: "repo" }, { id: "unit", kind: "command", command: "npm test" }] });
   const events = [];

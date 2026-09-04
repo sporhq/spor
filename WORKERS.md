@@ -843,7 +843,8 @@ under test cannot rewrite its own judge. So a command gate:
 Two more things a command gate may declare, for a suite that owns something
 outside git (a database on a fixed port, a `db reset`):
 
-- **`risk`** — the same arming predicate a human gate has (§10.5): with risk
+- **`risk`** — the same arming predicate a human gate (§10.5) and an
+  agent-review gate (§10.4) have: with risk
   classes declared, the gate runs only when the change touched one of them,
   and otherwise records `skipped` — a fact, not a pass by omission. An
   unreadable diff still fails closed.
@@ -958,6 +959,30 @@ trusted ref directly, or resolved with nothing behind it) fails the gate closed
 and unretried, straight to a person — no reviewer is dispatched at an empty
 diff, because a vacuous pass is exactly how an unreviewed change would launder
 into an approval.
+
+**Arming by risk class** (task-spor-review-gate-risk-arming). A review gate may
+declare `risk` against the factory's `risk_classes`, exactly as a command gate
+(§10.3) or a human gate (§10.5) does — the same predicate, the same `skipped`
+verdict, the same recorded fact. A gate declaring none is unconditional and
+runs on every gated item, which is what every review gate did before. The
+saving is the largest of the three kinds: an unarmed command gate skips a suite
+run on the worker's own box, while an unarmed review skips a whole agent
+dispatch — a model call, a lease, and an `await_ms` window up to the 1h default
+— for a review that had no diff in its subject area to reason about. An
+exploratory reviewer that drives a built UI, for instance, has nothing to
+explore in a docs-only or repo-tooling change.
+
+Three boundaries it does not relax. The empty-diff refusal above runs BEFORE
+arming, because an empty diff arms nothing and evaluating arming first would
+convert that fail-closed failure into a silent pass. An UNREADABLE diff fails a
+gate that declares risk closed — a risk class is a path predicate, and "assume
+it isn't armed" is the fail-open direction — but leaves a gate declaring none
+exactly as it was, since that gate consults no paths and its reviewer reads the
+live checkout itself. And a gate whose finding **ledger** holds an open
+blocking finding runs regardless of arming: the diff moves across fix cycles,
+so a fix that reverts the arming paths could otherwise disarm the gate
+mid-pipeline, and `skipped` passes. A demonstrated defect is retired by a
+reviewer clearing it, never by the paths that raised it going away.
 
 **The gate is stateful and bounded** (task-spor-review-gate-stateful-bounded).
 The first live runs showed a memoryless reviewer raising a NEW blocking finding

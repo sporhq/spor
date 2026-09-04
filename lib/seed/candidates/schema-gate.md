@@ -2,7 +2,7 @@
 id: schema-gate
 type: schema
 kind: node-schema
-schema_version: 2026.08.26.1
+schema_version: 2026.09.04.1
 title: Shareable factory gate
 summary: One reusable gate — command, agent-review or human — that any factory definition can reference by id, so an org vets a gate once (a `gate-security-review`) and reuses it product-wide instead of copying it into every factory.
 date: 2026-08-26
@@ -45,11 +45,16 @@ Keys by kind:
   cannot quietly relax another team's trusted boundary.
 - **agent-review** — `profile` (required: the review lane, cross-model by
   convention; the machine's declared binding decides what that actually
-  executes), `instructions`, `await_ms`. The reviewer answers with a fenced JSON
-  verdict which the runner parses in code — an unreadable verdict is a failure,
-  never a pass.
-- **human** — `risk` (the factory-declared risk classes that ARM this gate; an
-  empty list means always), `approval_timeout_ms`, `poll_ms`, `instructions`.
+  executes), `instructions`, `await_ms`, and `risk`. The reviewer answers with a
+  fenced JSON verdict which the runner parses in code — an unreadable verdict is
+  a failure, never a pass.
+- **human** — `approval_timeout_ms`, `poll_ms`, `instructions`, and `risk`.
+
+`risk` is common to all three kinds: the factory-declared risk classes that ARM
+the gate, an empty list meaning always. Unarmed, the gate records `skipped` and
+runs nothing — no suite, no reviewer dispatch, no approval item. Naming a class
+the factory never declared is a load error, because a gate that can never arm
+reads exactly like one that passed.
 
 `cycles` is common to all three: how many implementer fix cycles a failure gets
 before the runner escalates to a human queue item. Reruns come BEFORE fix

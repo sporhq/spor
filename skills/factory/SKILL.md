@@ -167,7 +167,8 @@ right failure but a rude way to discover a typo:
   present, not that a matching profile node exists — a typo there is not
   caught until dispatch, so double-check it yourself, e.g. `spor get <profile>`);
 - `protected_paths` is declared **only** with a `test_lane_profile` to route to;
-- every risk class a human gate names is declared in `risk_classes`;
+- every risk class a gate names is declared in `risk_classes` (any kind that
+  arms: command, agent-review, human);
 - gate ids are unique and kebab-case;
 - if you wrote a `rescue:` block: `profile` names a supervised, write-capable
   strong-model profile (the worker refuses a native-background one at load
@@ -236,8 +237,9 @@ Say no, briefly, and offer the nearest thing you can do:
   flagging what they do not care about, **raise** `cycles` so the implementer
   gets another pass before it escalates to them, declare a `rescue:` lane so
   a stronger model gets a go before they are paged, or retire the gate with a
-  decision node saying why. Only a **human** gate has `risk` classes to narrow;
-  an agent-review gate has no arming predicate and runs on every gated item.
+  decision node saying why. All three kinds take `risk` classes, so the
+  honest narrowing is to declare the paths the gate actually judges — a gate
+  that skips a docs-only change was never the gate for that change.
   And `cycles` is fix cycles *before* escalation — lowering it reaches a person
   sooner, not later.
 - **"Set protected_paths so agents can fix the tests when they fail"** —

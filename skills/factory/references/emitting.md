@@ -108,7 +108,11 @@ Keys by kind (`lib/kernel/gates.js` is the authority):
   Deliberately *no* ref or protected-path key: those belong to the factory, so
   one shared gate can never relax another team's trusted boundary.
 - **agent-review** — `profile` (required), `instructions`, `await_ms` (default
-  3600000). Must be a **supervised** harness: the report is the verdict channel.
+  3600000), `risk` (the factory-declared classes that arm it; empty means
+  always — the same predicate a command or human gate takes, and the biggest
+  saving of the three, since an unarmed review skips a whole agent dispatch
+  rather than a local suite run). Must be a **supervised** harness: the report
+  is the verdict channel.
   The review runs read-only and is stateful across fix cycles (WORKERS.md
   §10.4): only a DEMONSTRATED `blocking` finding blocks, review N is handed the
   prior findings by ledger id and must clear or confirm each before raising
@@ -181,8 +185,8 @@ Six things a factory must satisfy or it refuses to start the worker:
 2. every agent-review gate names a `profile`, and command gates a `command`;
 3. `protected_paths` without a `test_lane_profile` is an error — "fails closed"
    must never mean "dropped on the floor";
-4. a human gate may only name risk classes declared in `risk_classes` — a gate
-   that can never arm reads exactly like an approved one;
+4. a gate of ANY kind may only name risk classes declared in `risk_classes` —
+   a gate that can never arm reads exactly like an approved one;
 5. gate ids are unique and kebab-case;
 6. `repos`, if written, names at least one repo.
 
@@ -291,8 +295,8 @@ Then the gate itself carries the two fields such a suite needs:
   a serialized gate, or the integration stage, on the same repo before it
   starts. The same lease `integration.serialize` uses.
 - **`risk`** — the classes (from `risk_classes`) that ARM this gate, exactly
-  as on a human gate. Unarmed, the gate records `skipped` and runs nothing;
-  an unreadable diff still fails closed.
+  as on a human or an agent-review gate. Unarmed, the gate records `skipped`
+  and runs nothing; an unreadable diff still fails closed.
 - The suite's env carries **`SPOR_GATE_BASE`**, **`SPOR_GATE_HEAD`** (the shas
   under judgement), **`SPOR_TRUSTED_REF`**, **`SPOR_GATE_STAGE`** (`gate` |
   `integration`) and **`SPOR_GATE_NODE`**, beside `CI=1` and `SPOR_GATE=<id>`,

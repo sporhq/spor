@@ -2,7 +2,7 @@
 id: schema-factory
 type: schema
 kind: node-schema
-schema_version: 2026.09.03.1
+schema_version: 2026.09.04.1
 title: Software-factory definition
 summary: A factory definition — the ordered gate list a worker enforces between claim and resolve, plus the trusted ref, the repos it may judge, protected test paths, test-change lane, risk classes those gates key on, an optional integration (merge-queue landing) stage, and an optional rescue lane (a strong-model step before any human escalation). Candidate pack; adopt it into a graph to use `spor work --factory`.
 date: 2026-08-26
@@ -64,9 +64,9 @@ convention schema nodes use:
   touches one fails its command gate CLOSED (unrun) and routes to
   `test_lane_profile`; declaring paths without a lane is an error, because
   "fails closed" must never mean "dropped on the floor".
-- `risk_classes` — named path predicates a `human` gate keys on. A human gate
-  naming an undeclared class is an error: a gate that can never arm reads
-  exactly like an approved one.
+- `risk_classes` — named path predicates a gate of ANY kind keys on to ARM
+  itself (command, agent-review, human). A gate naming an undeclared class is
+  an error: a gate that can never arm reads exactly like an approved one.
 - `gates[].cycles` — how many implementer fix cycles a failing gate gets before
   the runner escalates by filing a human queue item. Default 0.
 - `gates[].reruns` (command gates) and `integration.reruns` — how many times a
