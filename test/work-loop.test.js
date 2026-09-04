@@ -1982,6 +1982,40 @@ test("makeCodeMovedNotice says once per new tip that the loaded code was moved p
   } finally {
     for (const [k, v] of Object.entries(savedEnv)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   }
+  // F3: a TRANSIENT ancestry failure (git 128 on a momentarily unreadable
+  // object store, a timeout) must not record the tip — the next pass asks
+  // again and the land is still noticed; recording first silenced it forever.
+  const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-gitshim-"));
+  const realGit = execFileSync(process.platform === "win32" ? "where" : "which", ["git"], { encoding: "utf8" }).split(/\r?\n/)[0].trim();
+  const failFlag = path.join(shimDir, "fail-merge-base");
+  fs.writeFileSync(path.join(shimDir, "git"), `#!/bin/sh\nif [ "$1" = merge-base ] && [ -e "${failFlag}" ]; then exit 128; fi\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${shimDir}${path.delimiter}${savedPath}`;
+  try {
+    const here3 = loadedCodeCommit(repo);
+    const f3 = [];
+    const n3 = makeCodeMovedNotice(here3, { root: repo, log: (l) => f3.push(l) });
+    assert.strictEqual(n3(), undefined, "nothing has moved yet");
+    fs.writeFileSync(path.join(repo, "a"), "five\n");
+    g("commit", "-q", "-am", "five");
+    const five = g("rev-parse", "--short", "HEAD");
+    fs.writeFileSync(failFlag, "");
+    assert.strictEqual(n3(), undefined, "the ancestry read failed transiently: no verdict this pass");
+    assert.strictEqual(n3(), undefined, "still failing, still no verdict");
+    assert.deepStrictEqual(f3, [], "a failed read never claims a land");
+    fs.unlinkSync(failFlag);
+    assert.strictEqual(n3(), five, "the read recovers and the land is noticed — the tip was not recorded by the failed pass");
+    assert.strictEqual(f3.length, 1);
+    assert.strictEqual(n3(), undefined, "and then said once");
+    // A DEFINITIVE not-a-descendant answer IS recorded (examined once).
+    g("reset", "-q", "--hard", "side");
+    assert.strictEqual(n3(), undefined, "a non-descendant tip says nothing");
+    fs.writeFileSync(failFlag, "");
+    assert.strictEqual(n3(), undefined, "…and, recorded, is not re-examined even while reads fail");
+    fs.unlinkSync(failFlag);
+  } finally {
+    process.env.PATH = savedPath;
+  }
   // Not a git checkout (an npm install): nothing is known, nothing is said.
   const plain = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-plain-"));
   assert.strictEqual(loadedCodeCommit(plain), null);

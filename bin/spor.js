@@ -12569,10 +12569,20 @@ function makeCodeMovedNotice(loaded, { root = ROOT, log = () => {}, ref = null }
     // spelling of the loaded commit is not a move.
     const full = (r) => (codeGit(root, ["rev-parse", "--verify", "-q", `${r}^{commit}`]) || "").trim();
     if (full(now) && full(now) === full(loaded.commit)) return;
+    // Only a DEFINITIVE ancestry answer settles this tip: exit 0 (descends)
+    // or exit 1 (does not). Anything else — a timeout, a spawn error, git's
+    // 128 on a momentarily unreadable object store mid-fetch — leaves the
+    // tip UNRECORDED so the next pass asks again; recording it first would
+    // turn one transient failure into a permanently silenced notice, and a
+    // never-draining `--restart-on-land`, for that tip (review finding F3).
+    // The record is a closure variable, not durable state: there is no
+    // write that can fail to land, no second flag to owe, and no other actor
+    // reading it.
+    const anc = gitSpawn(root, ["merge-base", "--is-ancestor", loaded.commit, now], { timeout: 3000, stdio: "ignore" });
+    if (anc.error || (anc.status !== 0 && anc.status !== 1)) return;
     // Remember the tip either way, so an unrelated tip is examined once and a
     // later descendant tip is still noticed.
     noticed = now;
-    const anc = gitSpawn(root, ["merge-base", "--is-ancestor", loaded.commit, now], { timeout: 3000, stdio: "ignore" });
     if (anc.status !== 0) return;
     log(`work: ${watch} in ${root} moved to ${now} — this worker still runs the code it loaded at ${loaded.commit}; restart it to pick the new code up`);
     // The tip moved past, for a caller that acts on it (`--restart-on-land`);
