@@ -1475,6 +1475,7 @@ test("a declined run frees its slot without a gate, is tallied apart, and cools 
 //     graph first — a run that genuinely resolved its target reads `resolved`.
 
 const sporCli = require("../bin/spor.js");
+const { dispatchableQueuePage, ladderWidth } = sporCli;
 const { loadConfig } = require("../lib/config.js");
 const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
 const { spawn } = require("node:child_process");
@@ -2027,4 +2028,357 @@ test("makeCodeMovedNotice says once per new tip that the loaded code was moved p
   const quiet = [];
   makeCodeMovedNotice(null, { root: plain, log: (l) => quiet.push(l) })();
   assert.deepStrictEqual(quiet, []);
+});
+
+// ------------------------------------------- the widening read's offsets --
+
+// task-spor-queue-api-offset-paging. `dispatchableQueuePage` widens past a page
+// of items this worker may not take (dec-spor-work-page-widens-past-
+// undispatchable). It used to do that by RE-PAGING the whole ranked read at a
+// doubled limit from offset 0, and it forgot the width it reached the moment
+// the call returned — so a remote worker with nothing eligible near the front
+// paid four GET /v1/queue round-trips (25 + 50 + 100 + 200 items) on every 30s
+// poll, forever. Now each step reads only its own delta at `?offset=<read so
+// far>` (the server's paging contract, API.md §5 — the same one
+// `fetchQueuePaged` walks for `spor next`), and the width the call NEEDED is
+// handed back through the caller's box so the next poll starts there.
+//
+// The stub CLAMPS `limit` at 100 exactly as the server does ("max 100 — values
+// above the max are clamped, not rejected", API.md §5). That clamp is the whole
+// reason the walk cannot read exhaustion off a page's LENGTH: an ask of 200
+// gets 100, which is the server rationing the page, not the end of the queue.
+// It is also why the LADDER stops at 100 remotely — the carried width has to be
+// a width one GET can serve, or the poll it is carried into costs two.
+const STUB_PAGE_MAX = 100;
+function offsetQueueStub(allItems) {
+  const http = require("node:http");
+  const requests = [];
+  const srv = http.createServer((req, res) => {
+    const m = /^\/v1\/queue\?(.*)$/.exec(req.url);
+    if (req.method === "GET" && m) {
+      const p = new URLSearchParams(m[1]);
+      const limit = Math.max(1, Number(p.get("limit")) || 20);
+      // The offset the CLIENT asked for — `null` when it sent none, so a test
+      // can tell "offset=0" from "no offset at all".
+      requests.push({ limit, offset: p.has("offset") ? Number(p.get("offset")) : null });
+      const from = Math.max(0, Number(p.get("offset")) || 0);
+      const page = allItems.slice(from, from + Math.min(limit, STUB_PAGE_MAX));
+      const end = from + page.length;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        items: page,
+        count: allItems.length,
+        offset: from,
+        returned_count: page.length,
+        next_offset: end < allItems.length ? end : null,
+        truncated: end < allItems.length,
+      }));
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { code: "not_found" } }));
+  });
+  return new Promise((resolve) =>
+    srv.listen(0, "127.0.0.1", () => resolve({ srv, base: `http://127.0.0.1:${srv.address().port}`, requests }))
+  );
+}
+
+const queueItems = (n) => Array.from({ length: n }, (_, i) => ({ id: `task-${i + 1}`, type: "task", suggest: "dispatch" }));
+
+function offsetCfg(base) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-offset-"));
+  return loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: "t" } });
+}
+
+test("a widening read fetches only the NEXT page, and the width it needed is carried to the following poll", async () => {
+  const { srv, base, requests } = await offsetQueueStub(queueItems(200));
+  try {
+    const cfg = offsetCfg(base);
+    assert.strictEqual(cfg.mode(), "remote");
+    const width = {};
+
+    // Poll 1, cold: nothing on the queue is eligible (the worker holds a run on
+    // the only thing it could take), so the read walks the whole ladder — and
+    // each rung asks only for what it has not already read.
+    const page = await dispatchableQueuePage(cfg, null, 25, { eligible: () => false, width });
+    assert.deepStrictEqual(requests, [
+      { limit: 25, offset: null },  // the base read is byte-identical to the unpaged one
+      { limit: 25, offset: 25 },    // ...and every widening step reads its DELTA
+      { limit: 50, offset: 50 },    // ...up to the server's own page ceiling, which
+    ]);                             // is where the ladder stops remotely
+    assert.strictEqual(page.length, 100, "the assembled page is the whole ceiling, not just the last step");
+    assert.deepStrictEqual(page.slice(0, 3).map((it) => it.id), ["task-1", "task-2", "task-3"]);
+    assert.deepStrictEqual(page.slice(-1).map((it) => it.id), ["task-100"], "in rank order across the steps");
+    assert.strictEqual(width.limit, 100);
+
+    // Poll 2 and 3: the same starved worker, now starting at the width it
+    // needed. THE ACCEPTANCE: at most ONE queue read per poll after the first
+    // widening — not the three rungs, 100 items, of a cold ladder. That is what
+    // the ladder's remote ceiling buys; a wider carried width could not be
+    // served in one GET, so every later poll would pay two round-trips and the
+    // fix would just be a smaller version of the problem it replaces.
+    for (const poll of [2, 3]) {
+      requests.length = 0;
+      const again = await dispatchableQueuePage(cfg, null, 25, { eligible: () => false, width });
+      assert.deepStrictEqual(requests, [
+        { limit: 100, offset: null },
+      ], `poll ${poll} reads the carried width in ONE request`);
+      assert.strictEqual(again.length, 100, `poll ${poll} still assembles the whole carried width`);
+      assert.strictEqual(width.limit, 100);
+    }
+  } finally {
+    srv.close();
+  }
+});
+
+test("the carried width is what the pass NEEDED — a queue whose front becomes dispatchable again narrows back", async () => {
+  const { srv, base, requests } = await offsetQueueStub(queueItems(200));
+  try {
+    const cfg = offsetCfg(base);
+    const width = { limit: 200 }; // a stale box from a wider ladder — clamped to the ceiling, still ONE read
+
+    // The eligible item sits at rank 30: one rung past the base width, so the
+    // width carried forward is 50 — not the 100 this call actually read.
+    requests.length = 0;
+    await dispatchableQueuePage(cfg, null, 25, { eligible: (it) => it.id === "task-30", width });
+    assert.deepStrictEqual(requests, [{ limit: 100, offset: null }]);
+    assert.strictEqual(width.limit, 50);
+
+    // ...and it is STABLE there: the next poll reads 50 in one request and
+    // still reaches the item, so the width neither grows nor oscillates.
+    requests.length = 0;
+    await dispatchableQueuePage(cfg, null, 25, { eligible: (it) => it.id === "task-30", width });
+    assert.deepStrictEqual(requests, [{ limit: 50, offset: null }]);
+    assert.strictEqual(width.limit, 50);
+
+    // The front is dispatchable again: back to the base width, and the worker
+    // stops paying for a depth it no longer needs.
+    requests.length = 0;
+    await dispatchableQueuePage(cfg, null, 25, { eligible: (it) => it.id === "task-1", width });
+    assert.deepStrictEqual(requests, [{ limit: 50, offset: null }]);
+    assert.strictEqual(width.limit, 25);
+  } finally {
+    srv.close();
+  }
+});
+
+test("a caller with no width box is unchanged, and a short queue ends the walk without a cap's worth of reads", async () => {
+  const { srv, base, requests } = await offsetQueueStub(queueItems(30));
+  try {
+    const cfg = offsetCfg(base);
+    // No box: the ladder starts at the base width exactly as it always did
+    // (`spor dispatch --from-queue` and `--print` pass none).
+    const page = await dispatchableQueuePage(cfg, null, 25, { eligible: () => false });
+    assert.deepStrictEqual(requests, [
+      { limit: 25, offset: null },
+      { limit: 25, offset: 25 },  // 5 items come back — a short page is the whole queue
+    ]);
+    assert.strictEqual(page.length, 30);
+  } finally {
+    srv.close();
+  }
+});
+
+// The server CLAMPS `limit` to 100 (API.md §5), so a request wider than that
+// comes back short BY THE SERVER'S CHOICE. Reading exhaustion off the page's
+// LENGTH mistook that clamp for the end of the queue and stopped, starving
+// everything below it. The ladder no longer widens past the ceiling, so the
+// only ask that reaches it is a CALLER's own base width — `spor work` sizes its
+// base off `--concurrency`, which can exceed one page. That ask is honoured in
+// full, chunked across pages, and the clamped first chunk is read as the server
+// rationing rather than as the queue ending.
+test("a base ask wider than the server's page is chunked, not mistaken for the end of the queue", async () => {
+  const { srv, base, requests } = await offsetQueueStub(queueItems(200));
+  try {
+    const cfg = offsetCfg(base);
+    const page = await dispatchableQueuePage(cfg, null, 150, { eligible: (it) => it.id === "task-150" });
+
+    assert.deepStrictEqual(requests, [
+      { limit: 100, offset: null },  // clamped to 100 items — the server rationing, not the queue ending
+      { limit: 50, offset: 100 },    // ...so the walk reads the REST of the caller's ask
+    ]);
+    assert.ok(page.some((it) => it.id === "task-150"), "the eligible item past the server's page ceiling is reached");
+    assert.strictEqual(page.length, 150);
+  } finally {
+    srv.close();
+  }
+});
+
+// A backend too old to honour `?offset` re-serves its TOP page for every
+// request. Stopping there (nothing new came back, so nothing deeper is
+// reachable) reads correctly and behaves wrongly: it leaves the widening unable
+// to see past the BASE page against such a server, where before offsets existed
+// it re-paged the whole read at each doubled width and did reach deeper. So
+// such a backend is a signal, not an ending: the walk falls back to that
+// pre-offset behaviour for the rest of the call.
+//
+// It is recognized from the ENVELOPE — `?offset` shipped together with
+// `next_offset`/`truncated` (API.md §5), so an answer carrying neither is a
+// backend from before paging — which is known from its very FIRST answer, so
+// the doomed `?offset` request is never sent at all.
+//
+// `rerank` models the harder case: a queue RE-RANKS between requests, so the
+// top page such a server re-serves is not byte-identical to the one before it.
+function legacyQueueStub(all, { rerank = null } = {}) {
+  const http = require("node:http");
+  const requests = [];
+  const srv = http.createServer((req, res) => {
+    const p = new URLSearchParams(req.url.slice(req.url.indexOf("?") + 1));
+    const limit = Math.max(1, Number(p.get("limit")) || 20);
+    requests.push({ limit, offset: p.has("offset") ? Number(p.get("offset")) : null });
+    // Old server: `?offset` is not a parameter it knows, and it carries no
+    // `truncated`/`next_offset` in the envelope either.
+    const ranked = rerank && requests.length > 1 ? rerank(all) : all;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ items: ranked.slice(0, limit), count: ranked.length }));
+  });
+  return new Promise((resolve) =>
+    srv.listen(0, "127.0.0.1", () => resolve({ srv, base: `http://127.0.0.1:${srv.address().port}`, requests }))
+  );
+}
+
+test("a server too old to honour ?offset makes the read fall back to re-paging the whole width", async () => {
+  const { srv, base, requests } = await legacyQueueStub(queueItems(120));
+  try {
+    const cfg = offsetCfg(base);
+    const width = {};
+    const page = await dispatchableQueuePage(cfg, null, 25, { eligible: () => false, width });
+    assert.deepStrictEqual(requests, [
+      { limit: 25, offset: null },  // the base read — and its envelope says this backend cannot page
+      { limit: 50, offset: null },  // ...so from here the whole width is re-paged, as it used to be,
+      { limit: 100, offset: null }, // and no `?offset` request is ever spent on it
+    ]);
+    assert.strictEqual(page.length, 100, "the widening still reaches past the base page on an old backend");
+    assert.strictEqual(new Set(page.map((it) => it.id)).size, 100, "and the re-paged read replaces rather than appends");
+  } finally {
+    srv.close();
+  }
+});
+
+// The detection must survive a RE-RANKING old backend. A queue re-ranks — that
+// is what a queue does — so such a server's second top page routinely differs
+// from its first by an item or two, and a detection that compares PAGES (they
+// are not identical, so this must be progress) then let the walk advance its
+// offset over a window it had never been given, leaving every eligible item
+// below the shallowest re-page silently unreachable. The envelope says nothing
+// about the ranking, so re-ranking cannot fool it.
+test("an offset-ignoring server that RE-RANKS is still detected, and the deep eligible item is reached", async () => {
+  // Request 2 onward, a fresh top-priority item has appeared — so the re-served
+  // top page is not the one we saw, but it still overlaps it heavily.
+  const hot = { id: "task-hot", type: "task", suggest: "dispatch" };
+  const { srv, base, requests } = await legacyQueueStub(queueItems(120), { rerank: (all) => [hot, ...all] });
+  try {
+    const cfg = offsetCfg(base);
+    const width = {};
+    const page = await dispatchableQueuePage(cfg, null, 25, { eligible: (it) => it.id === "task-80", width });
+    // The harm first: reading the re-served top page as progress leaves the
+    // walk stepping its offset over pages it was never given, so it never
+    // assembles past rank ~49 and this item is unreachable on every poll.
+    assert.ok(page.some((it) => it.id === "task-80"), "the item a page-comparing detection could never reach");
+    assert.deepStrictEqual(requests, [
+      { limit: 25, offset: null },
+      { limit: 50, offset: null },  // the fallback re-pages the whole width from the top
+      { limit: 100, offset: null },
+    ]);
+    assert.strictEqual(width.limit, 100);
+  } finally {
+    srv.close();
+  }
+});
+
+// A backend that reports the paging fields and ignores the offset anyway is not
+// a server that ships, but it is the one case the envelope cannot speak for, so
+// the walk keeps a backstop: a window at a non-zero offset holding NOTHING it
+// had not already read made no progress at all. That is the one reading churn
+// cannot produce — a shifted boundary displaces a window by the churn, never by
+// a whole page — which is why the backstop is "no progress" and not "any
+// overlap" (see the chunked-read regression below).
+function lyingPagerStub(all) {
+  const http = require("node:http");
+  const requests = [];
+  const srv = http.createServer((req, res) => {
+    const p = new URLSearchParams(req.url.slice(req.url.indexOf("?") + 1));
+    const limit = Math.max(1, Number(p.get("limit")) || 20);
+    requests.push({ limit, offset: p.has("offset") ? Number(p.get("offset")) : null });
+    const page = all.slice(0, Math.min(limit, STUB_PAGE_MAX)); // the top page, whatever was asked
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      items: page, count: all.length, offset: 0, returned_count: page.length,
+      next_offset: page.length < all.length ? page.length : null,
+      truncated: page.length < all.length,
+    }));
+  });
+  return new Promise((resolve) =>
+    srv.listen(0, "127.0.0.1", () => resolve({ srv, base: `http://127.0.0.1:${srv.address().port}`, requests }))
+  );
+}
+
+test("a backend that reports paging and ignores the offset is caught by the no-progress backstop", async () => {
+  const { srv, base, requests } = await lyingPagerStub(queueItems(120));
+  try {
+    const cfg = offsetCfg(base);
+    const width = {};
+    const page = await dispatchableQueuePage(cfg, null, 25, { eligible: (it) => it.id === "task-80", width });
+    assert.deepStrictEqual(requests, [
+      { limit: 25, offset: null },
+      { limit: 25, offset: 25 },    // the top 25 again: nothing new at all, so the offset was ignored
+      { limit: 50, offset: null },  // ...and the walk finishes the pre-offset way
+      { limit: 100, offset: null },
+    ]);
+    assert.ok(page.some((it) => it.id === "task-80"), "the deep eligible item is still reached");
+  } finally {
+    srv.close();
+  }
+});
+
+// The regression the backstop above is deliberately narrow for. A CURRENT
+// server pages correctly, and its ranking moves between two requests — an item
+// is filed and lands at the top, so the window at offset 100 begins one item
+// EARLIER in what we already read and shares its first item with our first
+// chunk. Reading that overlap as an ignored offset threw away a legitimate
+// chunked read: the fallback re-paged the caller's whole 150-item ask from the
+// top, the server clamped it to 100, the ladder was already at its ceiling — so
+// the call returned one page and every eligible item past rank 100 was silently
+// dropped, on this poll and every poll after it.
+test("a rerank at the chunk boundary is churn, not an ignored offset — the wide base read still reaches its depth", async () => {
+  const all = queueItems(200);
+  const http = require("node:http");
+  const requests = [];
+  const srv = http.createServer((req, res) => {
+    const p = new URLSearchParams(req.url.slice(req.url.indexOf("?") + 1));
+    const limit = Math.max(1, Number(p.get("limit")) || 20);
+    const from = Math.max(0, Number(p.get("offset")) || 0);
+    requests.push({ limit, offset: p.has("offset") ? Number(p.get("offset")) : null });
+    // Request 2 onward, one item has been filed above the whole queue.
+    const ranked = requests.length > 1 ? [{ id: "task-hot", type: "task", suggest: "dispatch" }, ...all] : all;
+    const page = ranked.slice(from, from + Math.min(limit, STUB_PAGE_MAX));
+    const end = from + page.length;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      items: page, count: ranked.length, offset: from, returned_count: page.length,
+      next_offset: end < ranked.length ? end : null, truncated: end < ranked.length,
+    }));
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  try {
+    const cfg = offsetCfg(`http://127.0.0.1:${srv.address().port}`);
+    const page = await dispatchableQueuePage(cfg, null, 150, { eligible: (it) => it.id === "task-140" });
+    assert.deepStrictEqual(requests, [
+      { limit: 100, offset: null },
+      { limit: 50, offset: 100 },   // it shares task-100 with the first chunk — churn, and the walk goes on
+    ]);
+    assert.ok(page.some((it) => it.id === "task-140"), "the item the any-overlap fallback dropped");
+    assert.strictEqual(new Set(page.map((it) => it.id)).size, page.length, "and the shared item is not counted twice");
+    assert.strictEqual(page.filter((it) => it.id === "task-100").length, 1);
+  } finally {
+    srv.close();
+  }
+});
+
+test("ladderWidth: the narrowest rung that reaches a depth, never past the cap", () => {
+  assert.strictEqual(ladderWidth(1, 25, 200), 25);
+  assert.strictEqual(ladderWidth(25, 25, 200), 25);
+  assert.strictEqual(ladderWidth(26, 25, 200), 50);
+  assert.strictEqual(ladderWidth(101, 25, 200), 200);
+  assert.strictEqual(ladderWidth(9999, 25, 200), 200, "a depth past the cap is the cap");
 });

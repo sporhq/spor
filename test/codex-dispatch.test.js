@@ -575,12 +575,16 @@ test("a launch failure is reported off the supervisor's own handshake, not infer
   const release = path.join(home, "release-the-record-write");
   const slowRunner = writeNodeScript(path.join(home, "runner-slow-record.js"), `
 const fs = require("node:fs");
+// Read the job BEFORE reporting the failed handshake: the launcher unlinks the
+// ephemeral job file the moment that handshake lands (its abandon path), so a
+// stub that reads after it is racing the launcher for the file — and loses
+// under full-suite load, crashing before the withheld write it exists to make.
+const job = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 const fd = Number(process.env.SPOR_DISPATCH_HANDSHAKE_FD);
 try {
   fs.writeSync(fd, JSON.stringify({ ok: false, error: "the codex binary does not exist (stub)" }) + "\\n");
 } catch {}
 try { fs.closeSync(fd); } catch {}
-const job = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 // Simulate the async terminal-state contract call this record write used to be
 // gated behind. The 30s backstop is only so a failed test cannot wedge: the
 // release file is what normally lands it.

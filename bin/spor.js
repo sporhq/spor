@@ -7415,41 +7415,195 @@ async function compileBriefing(cfg, { nodeId, query, full, project }) {
 // whatever the caller knows about its own slots: the readiness floor, the
 // accept policy, the factory's repo scope, an item already in flight or
 // cooling off here). When one is given and NOTHING on the page passes it, the
-// page is REFETCHED wider — doubling to PAGE_LIMIT_CAP — until something does
+// page is WIDENED — doubling to PAGE_LIMIT_CAP, or to the server's own page
+// ceiling remotely — until something does
 // or the queue runs out. Without that, the policy filter runs after a
 // fixed-size fetch, so a page filled by items this worker may not take
 // (untriaged ones under the default `accept: ready`, a sibling repo's under a
 // scoped factory) starves an eligible item ranked below it FOREVER: every poll
-// refetches the same page. The queue has no offset, so widening is the whole
-// re-page — at most three extra reads, and paid only by a pass that would
-// otherwise have dispatched nothing at all. In local mode those reads share
-// ONE graph load (the expensive half); remote mode pays a bounded GET each.
+// refetches the same page.
+// Widening READS ONLY THE DELTA (task-spor-queue-api-offset-paging): each step
+// fetches `?offset=<raw items already read>` and APPENDS, rather than
+// re-paging the whole ranked set at a doubled limit, so reaching the cap costs
+// one cap's worth of items instead of nearly twice that. And the width a call
+// needed is handed back through the caller's `width` box, so `spor work` starts
+// its NEXT poll at that width — ONE read, not the whole 25 -> 50 -> 100
+// ladder every 30s. The box carries only what was NEEDED: a queue whose front
+// becomes dispatchable again narrows back to the base width on the next poll
+// rather than pinning the wide read forever. In local mode the steps share ONE
+// graph load (the expensive half); remote mode pays a bounded GET each.
+// Two things the SERVER's paging contract forces on that walk (API.md §5),
+// both of which a naive "a short page is the end of the queue" read gets wrong:
+//   - `limit` is CLAMPED to the server's page max, not rejected. A request
+//     wider than that comes back short BY THE SERVER'S CHOICE, so exhaustion is
+//     taken from the envelope's `truncated`/`next_offset` rather than from the
+//     page's length. Without that, a width of 200 read the top 100 and called
+//     the queue exhausted — re-pinning the very starvation this widening exists
+//     to break, one rung deeper. And because a width past that ceiling is not
+//     ONE read, the LADDER itself stops there remotely (see `cap` below): the
+//     carried width a starved worker re-reads every 30s is by construction a
+//     width the server will serve in a single GET.
+//   - a server too old to honour `?offset` re-serves its TOP page, so the walk
+//     must recognize one and FALL BACK to the pre-offset behaviour — re-paging
+//     the whole read from offset 0 at each doubled width and replacing what it
+//     assembled — or widening cannot reach a deep item on such a backend at
+//     all. It recognizes one from the ENVELOPE: `?offset` shipped together with
+//     `next_offset`/`truncated` (API.md §5), so a queue response carrying
+//     NEITHER field is a backend from before paging existed, known from its
+//     very first answer and before a doomed `?offset` request is ever sent.
+//     That is the whole detection — deliberately NOT "this window overlaps what
+//     we already read". A ranked queue RE-RANKS between requests, so a window
+//     at a legitimate offset routinely shares an item or two with the tail of
+//     the previous one (API.md §5 says as much: an offset resumes the same
+//     slice only across an unchanged ranking), and reading that as a
+//     re-served top page truncated a real, current-server chunked read back to
+//     one page and silently dropped everything below it. What remains as a
+//     backstop, for a backend that reports the fields and ignores the offset
+//     anyway, is the one reading churn cannot produce: a window at a non-zero
+//     offset containing NOTHING we have not already read made no progress at
+//     all, which is the top-page signature rather than a shifted boundary.
 const PAGE_LIMIT_CAP = 200;
-async function dispatchableQueuePage(cfg, slug, LIMIT = 25, { eligible = null, maxLimit = PAGE_LIMIT_CAP } = {}) {
+// GET /v1/queue's own page ceiling (API.md §5: "default 20, max 100 — values
+// above the max are clamped, not rejected").
+const SERVER_PAGE_MAX = 100;
+async function dispatchableQueuePage(cfg, slug, LIMIT = 25, { eligible = null, maxLimit = PAGE_LIMIT_CAP, width = null } = {}) {
   // Memo for THIS call only, so a widened local-mode read re-ranks the graph
   // it already loaded instead of re-reading every node file per step; the next
   // poll starts fresh and sees new nodes.
   const ctx = {};
-  let limit = Math.max(1, LIMIT);
-  let items;
+  // A base wider than the ceiling is honoured as-is (the ceiling bounds the
+  // WIDENING, not the caller's ask) — it is still read in server-sized chunks.
+  const step = Math.max(1, LIMIT);
+  // Local ranking has no server in between, so it answers any width in one
+  // call; a remote read is chunked to what the server will actually serve.
+  const pageMax = cfg.mode() === "remote" ? SERVER_PAGE_MAX : Infinity;
+  // The ladder's own ceiling, which remotely is the SERVER's page ceiling
+  // rather than `maxLimit`. The width this call hands back is re-read on EVERY
+  // later poll of a starved worker, and the whole point of carrying it is that
+  // the poll then costs ONE `GET /v1/queue` — so widening to a width no single
+  // GET can be served would buy depth by making every subsequent poll cost two
+  // round-trips, trading the fix for a smaller version of the problem. Depth
+  // past one server page is not reachable in one read at all: `PAGE_LIMIT_CAP`
+  // was written when the widened read was a single request, and remotely that
+  // request was clamped to 100 long before this ladder existed, so 200 was
+  // never actually served. Local mode has no such ceiling and keeps the cap.
+  const cap = Math.min(maxLimit, pageMax);
+  // Start at the width the caller last NEEDED, never below the base step.
+  const carried = Number(width && width.limit);
+  let target = Math.max(step, Math.min(Number.isFinite(carried) ? carried : 0, cap));
+  const seen = new Set();
+  let read = 0; // raw items the ranker has handed back across this call = the next offset
+  let items = []; // the winnowed page assembled from every fetch
+  let needed = 0; // the depth at which this call found something eligible
+  let offsets = true; // until a backend proves it ignores ?offset
   for (;;) {
-    const raw = await fetchQueuePage(cfg, slug, limit, ctx);
-    // A widened fetch that comes back EMPTY where a narrower one did not is a
-    // blip (a server that went away mid-widening), not an emptier queue: keep
-    // the page we already have, so this pass still records its skips.
-    if (items && items.length && !raw.length) break;
-    items = winnowQueuePage(raw);
-    if (!eligible) break;
-    if (items.some((it) => eligible(it))) break;
-    // A short page is the whole queue: there is nothing deeper to widen into.
-    if (raw.length < limit || limit >= maxLimit) break;
-    limit = Math.min(limit * 2, maxLimit);
+    // Without offsets there is no delta to read: every rung re-pages the WHOLE
+    // width from 0 and REPLACES what was assembled, exactly as the pre-offset
+    // walk did — and asks for the full width (a server that ignores `?offset`
+    // may also predate the limit clamp, and one that doesn't clamps it itself).
+    if (!offsets) { seen.clear(); items = []; read = 0; needed = 0; }
+    const at = offsets ? read : 0;
+    const want = offsets ? Math.min(target - read, pageMax) : target;
+    if (want <= 0) break;
+    const res = await fetchQueuePage(cfg, slug, want, ctx, at);
+    const raw = res.items;
+    // `?offset` and the `next_offset`/`truncated` it is walked by are ONE
+    // contract (API.md §5), so an answer carrying neither field is a backend
+    // that cannot page — the only backend whose window is not the one we asked
+    // for. Known from the FIRST answer, which is the top page either way, so
+    // the downgrade re-reads nothing there; past it, the window we were handed
+    // is one we may never have been served, so that rung is re-run from the
+    // top. `paged` is null on an answer we never got (a dead server, a
+    // non-200): an error says nothing about what the backend supports, and the
+    // empty page it returns ends the walk below.
+    if (offsets && res.paged === false) {
+      offsets = false;
+      // Re-run the rung the old way unless this answer already IS what the old
+      // way would have asked for — the top of the queue, at the rung's whole
+      // width. A window past the top may never have been served; a first chunk
+      // NARROWER than the rung (a base ask wider than one server page) is only
+      // part of it, and a backend with no `?offset` may have no page clamp
+      // either, so the whole width is worth asking for once.
+      if (at > 0 || want < target) continue;
+    }
+    const fresh = raw.filter((it) => it && !seen.has(it.id));
+    // The backstop for a backend that reports those fields and ignores the
+    // offset anyway. It is NOT "this window overlaps what we already read": a
+    // queue re-ranks between requests, so an item appearing above the window
+    // slides the boundary and the next legitimate page shares its first item or
+    // two with the previous one — routine churn, which API.md §5 documents as
+    // the cost of offset paging over a live ranking. Treating that as a
+    // re-served top page is what truncated a current-server chunked read (a
+    // base ask wider than one page) back to its first page, silently dropping
+    // every eligible item below. A page that made NO progress — nothing in it
+    // we had not already read — is the reading churn cannot produce: a shifted
+    // boundary displaces a window by the churn, not by a whole page.
+    if (offsets && at > 0 && raw.length && !fresh.length) {
+      offsets = false;
+      continue;
+    }
+    for (const it of fresh) seen.add(it.id);
+    const page = winnowQueuePage(fresh);
+    if (page.length) items = items.length ? items.concat(page) : page;
+    // Where the first eligible item sits in the WHOLE ranked read, so the
+    // width handed back covers it and no more. Earlier steps had none (we
+    // would have stopped), so the first hit in this step is the first overall.
+    const hit = eligible ? raw.findIndex((it) => dispatchableItem(it) && eligible(it)) : -1;
+    if (hit >= 0) needed = read + hit + 1;
+    // With offsets the next one is what the server actually served; without
+    // them the rung asked for its whole width, so it is complete either way.
+    read = offsets ? read + raw.length : target;
+    if (!eligible || hit >= 0) break;
+    // Nothing came back at all — an empty widening read, a server that went
+    // away mid-walk: keep the page we have rather than spinning on it.
+    if (offsets && !raw.length) break;
+    // The QUEUE ran out, as the server itself reported it. Never inferred from
+    // a short page: a clamped `limit` produces one too.
+    if (!res.more) break;
+    // Still filling this rung — read the rest of it before widening. Only a
+    // base ask wider than one server page can get here (the ladder itself
+    // stops at `cap`), so a widened poll is one request by construction.
+    if (read < target) continue;
+    if (target >= cap) break;
+    target = Math.min(target * 2, cap);
   }
+  if (width) width.limit = needed ? ladderWidth(needed, step, cap) : target;
   return items;
 }
 
-async function fetchQueuePage(cfg, slug, LIMIT, ctx = {}) {
+// The narrowest rung of the doubling ladder that reaches `depth`. Carrying a
+// rung rather than the raw depth keeps a widened poll on the same widths a
+// cold one would have walked, so a queue that shifts by an item or two does not
+// re-widen every poll.
+function ladderWidth(depth, step, maxLimit) {
+  let w = step;
+  while (w < depth && w < maxLimit) w = Math.min(w * 2, maxLimit);
+  return w;
+}
+
+// One step of that read: the `LIMIT` ranked items starting at `OFFSET`, plus
+// whether anything remains BEYOND them (`more`). The server takes ?offset
+// directly (API.md §5, alongside next_offset/truncated); the local ranker has
+// no offset, so it ranks the prefix that reaches the window and slices — the
+// memoized graph makes that the same work the whole re-page used to be. An
+// OFFSET of 0 is byte-identical to the unpaged read.
+// `more` comes from the server's OWN report of what follows this page, because
+// the page's length cannot carry it: `limit` is clamped to SERVER_PAGE_MAX, so
+// a wider ask is short by the server's choice rather than the queue's end. A
+// backend that reports neither field falls back to "a full page probably has
+// more" — measured against what the server would actually serve, so the clamp
+// reads as "more", never as exhaustion.
+// `paged` reports the same thing about the BACKEND rather than the page: true
+// when the answer carried the paging contract `?offset` shipped with, false
+// when it carried none of it (a backend from before paging — its window is its
+// top page whatever offset was asked for), and null when there was no answer to
+// read at all, since a dead server or a non-200 says nothing about what the
+// backend supports. Local mode is `true` by construction: the offset is applied
+// here, to the ranker's own output.
+async function fetchQueuePage(cfg, slug, LIMIT, ctx = {}, OFFSET = 0) {
   let items = [];
+  let more = false;
+  let paged = true;
   // --from-queue dispatches an AGENT to do work, and questions are human
   // decisions — not agent-dispatchable (the standing model: agent-actionable
   // work is a task, not a question; dec-spor-questions-human-not-agent-dispatch).
@@ -7462,7 +7616,7 @@ async function fetchQueuePage(cfg, slug, LIMIT, ctx = {}) {
   // queueable for the HUMAN queue (`spor next`). Sibling of
   // issue-spor-routed-questions-ignore-wake.
   if (cfg.mode() === "remote") {
-    const base = `limit=${LIMIT}&exclude_type=question`;
+    const base = `limit=${LIMIT}&exclude_type=question${OFFSET ? `&offset=${OFFSET}` : ""}`;
     const q = slug ? `?project=${encodeURIComponent(slug)}&${base}` : `?${base}`;
     const r = await remote.get(cfg, `/v1/queue${q}`, { timeoutMs: 6000 });
     // Keep the ENVELOPE, not just `items`: a zero-match scope rides back as the
@@ -7471,7 +7625,14 @@ async function fetchQueuePage(cfg, slug, LIMIT, ctx = {}) {
     // exactly like an empty queue to `spor work` / `dispatch --from-queue`.
     const warning = r.ok ? takeProjectWarning(r.json) : null;
     if (warning) warnQueueProjectOnce(slug, warning);
-    items = r.ok && r.json ? r.json.items || [] : [];
+    const envelope = r.ok && r.json ? r.json : null;
+    items = envelope ? envelope.items || [] : [];
+    if (envelope && typeof envelope.truncated === "boolean") more = envelope.truncated;
+    else if (envelope && envelope.next_offset != null) more = Number(envelope.next_offset) > OFFSET;
+    else more = items.length >= Math.min(LIMIT, SERVER_PAGE_MAX);
+    paged = envelope
+      ? typeof envelope.truncated === "boolean" || envelope.next_offset !== undefined
+      : null;
   } else {
     try {
       const graphLib = require(path.join(ROOT, "lib", "graph.js"));
@@ -7484,14 +7645,19 @@ async function fetchQueuePage(cfg, slug, LIMIT, ctx = {}) {
         warnQueueProjectOnce(slug, `project '${slug}' matched no repo or grouping — queue is empty (try a repo slug, a repo-<slug> node id, or a grouping id)`);
       }
       const { rankQueue } = require(path.join(ROOT, "lib", "queue.js"));
-      const opts = { limit: LIMIT, excludeTypes: ["question"] };
+      const opts = { limit: OFFSET + LIMIT, excludeTypes: ["question"] };
       const r = rankQueue(g, slug ? { project: slug, ...opts } : opts);
       items = r.items || [];
+      if (OFFSET) items = items.slice(OFFSET);
+      // The ranker handed back everything it had up to the window, so a slice
+      // short of the ask IS the end of the queue.
+      more = items.length >= LIMIT;
     } catch {
       items = [];
+      more = false;
     }
   }
-  return items;
+  return { items, more, paged };
 }
 
 // `spor work` re-reads the queue every poll (and widens it within a pass), so a
@@ -7510,23 +7676,24 @@ function warnQueueProjectOnce(slug, warning) {
 
 // The hard exclusions applied to whatever the ranker returned — classes an
 // AGENT must never be picked for, all of them defense-in-depth against a
-// backend that ignores the scope filters above.
-function winnowQueuePage(page) {
-  let items = page || [];
-  if (!items.length) return [];
+// backend that ignores the scope filters above. A per-ITEM predicate so a
+// widening read can ask where the first eligible item sits in the raw page it
+// just fetched without winnowing it twice; `winnowQueuePage` is the page-level
+// filter over it, and because it is a pure filter, winnowing each step of a
+// widened read and concatenating is the same page as winnowing the whole.
+function dispatchableItem(it) {
+  if (!it) return false;
   // Defense-in-depth: drop any question the ranker left in (an older server that
   // predates / ignores exclude_type), so a question is never dispatched even
   // against a stale backend. Primary exclusion is at the ranker above.
-  items = items.filter((it) => it.type !== "question");
-  if (!items.length) return [];
+  if (it.type === "question") return false;
   // Defense-in-depth (dec-spor-queue-hide-blocked): a current ranker drops
   // blocked items from the page entirely, but a stale server may still return
   // them demoted (suggest:blocked / blocked_by set). --from-queue dispatches an
   // AGENT to do work, and a blocked item can't proceed until its unblocker
   // lands — never dispatch one, even against an old backend. Mirrors the
   // question defense above.
-  items = items.filter((it) => it.suggest !== "blocked" && !(Array.isArray(it.blocked_by) && it.blocked_by.length));
-  if (!items.length) return [];
+  if (it.suggest === "blocked" || (Array.isArray(it.blocked_by) && it.blocked_by.length)) return false;
   // Held-task hard skip (dec-spor-dispatch-from-queue-skip-held, the held-task
   // self-limit task-spor-queue-front-loop-self-limit-on-held-tasks): the ranker
   // damps a held task's front to 0 and flags it `suggest:triage` — an OPEN task
@@ -7541,9 +7708,14 @@ function winnowQueuePage(page) {
   // hidden from `spor next` (the self-limit shows it, demoted, for human triage),
   // and an explicit `spor dispatch --node <id>` still sends it — only AUTOMATIC
   // selection skips it, so a held p1 stays deliberately dispatchable.
-  items = items.filter((it) => it.suggest !== "triage");
+  if (it.suggest === "triage") return false;
+  return true;
+}
+
+function winnowQueuePage(page) {
+  const items = page || [];
   if (!items.length) return [];
-  return items;
+  return items.filter(dispatchableItem);
 }
 
 // The highest-ranked open queue item for --from-queue — the first that ISN'T
@@ -12921,6 +13093,18 @@ async function cmdWork(cfg, { values }) {
   // before the loop starts, so this cannot be declared further down.
   const home = cfg.userConfigHome();
 
+  // The page width the last pass NEEDED, carried across polls
+  // (task-spor-queue-api-offset-paging). A worker whose only eligible work sits
+  // below a page of items it may not take widens to reach it — and without this
+  // it re-walks that ladder from the base width on every poll, paying several
+  // GET /v1/queue round-trips every 30s to reach the same item. Carried, that
+  // width is read in ONE request — the ladder does not widen past what the
+  // server serves in a single page, precisely so this carried width stays a
+  // one-read poll; and because dispatchableQueuePage hands back only the width
+  // it actually needed, a queue whose front becomes dispatchable again narrows
+  // straight back to the base.
+  const pageWidth = {};
+
   // `--regate <run>`: re-judge one refused run under this factory and exit —
   // no polling, no dispatching (task-spor-work-regate).
   if (values.regate) {
@@ -12963,7 +13147,7 @@ async function cmdWork(cfg, { values }) {
     // ranked across the whole scope token, so a grouping's sibling repos can
     // otherwise fill the page and starve a worker that has eligible work
     // further down.
-    const page = await dispatchableQueuePage(cfg, slug, Math.max(factoryRepos.length ? 50 : 25, concurrency * 4), { eligible });
+    const page = await dispatchableQueuePage(cfg, slug, Math.max(factoryRepos.length ? 50 : 25, concurrency * 4), { eligible, width: pageWidth });
     const items = annotateInFlight(page, agents, true).items;
     if (!gating) return items;
     return gating.size ? items.filter((it) => !gating.has(it.id)) : items;
@@ -15772,7 +15956,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
+module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
 
 if (require.main === module) {
   main()
