@@ -1004,6 +1004,15 @@ machine-local — never committed, always in the shared-graph `.gitignore`):
   `.spor` `org:` marker (committable, nearest-ancestor — the remote-mode sibling
   of the `graph:` binding in §6.1) > store `default` > legacy flat config.json
   `server`+`token` (migrated on read) > local.
+- **Unknown `--org` refuses.** `--org` is the one selector that does not fall
+  through: naming an org with no stored credential is an error (exit 1, the
+  stored orgs listed), not a quiet demotion to the active tenant — which would
+  answer a read from the wrong graph and land a write in it while the operator
+  believes they are scoped elsewhere
+  (issue-spor-cli-unrecognized-org-fallback). The `auth`/`join`/`login` verbs
+  are exempt: naming an org you have no credential for **yet** is what they are
+  for. The ambient selectors (`SPOR_ORG`, the repo `org:` marker) still fall
+  through — they also ride the fail-open hook engines.
 - **Refresh.** A 401/403 on a tenant carrying a `refresh_token` transparently
   refreshes against its issuer (`grant_type=refresh_token`) and retries once.
 - **Byte-identical.** With no credential store and only a flat

@@ -4466,7 +4466,10 @@ async function cmdAuthLogin(cfg, args) {
 
   // Default to the hosted Spor front door when no server is named — onboarding
   // parity with `spor join <token>` (task-spor-api-cli-default-server-base).
-  const server = auth.normServer(serverFlag || cfg.server() || DEFAULT_SERVER);
+  // serverForNewTenant(), not server(): `--org <new>` is legitimate here (it
+  // names the org this login will ESTABLISH), and it leaves server() empty
+  // (issue-spor-cli-unrecognized-org-fallback).
+  const server = auth.normServer(serverFlag || cfg.serverForNewTenant() || DEFAULT_SERVER);
   if (all) {
     out("note: --all (one token per org in a single leg) needs the front-door membership");
     out("      endpoint (task-spor-frontdoor-org-membership-enumeration), not yet shipped —");
@@ -15657,6 +15660,29 @@ function extractOrgFlag(argv) {
   return { org, rest };
 }
 
+// The verbs exempt from the unknown-`--org` refusal below: the credential
+// namespace, whose whole job is to ACQUIRE a credential for an org you do not
+// have one for yet (`spor auth login --org <new>`, `spor join … --org <new>`),
+// and to list/switch/clear what is stored — i.e. the place you go to FIX the
+// refusal. Everything else refuses (issue-spor-cli-unrecognized-org-fallback).
+const TENANT_VERBS = new Set(["auth", "join", "login"]);
+
+// A global `--org` that names no stored credential must REFUSE the command, not
+// quietly run it against the active tenant: a read then answers from the wrong
+// graph, and a write LANDS in it while the operator believes they are scoped
+// elsewhere (issue-spor-cli-unrecognized-org-fallback). lib/config.js already
+// declines to fall through — it reports the refusal instead of resolving a
+// tenant — so all that is left here is to say so and exit non-zero rather than
+// running the verb in the local mode that null tenant resolves to.
+function refuseUnknownOrg(cfg, canon) {
+  const te = cfg.tenantError();
+  if (!te || te.kind !== "unknown-org" || TENANT_VERBS.has(canon)) return false;
+  err(`spor: no credential stored for org '${te.org}' — refusing to run against a different tenant.`);
+  err(te.orgs.length ? `  stored orgs: ${te.orgs.join(", ")}` : "  the credential store is empty");
+  err(`  run 'spor auth login --org ${te.org}' to add one, or 'spor auth list' to see them.`);
+  return true;
+}
+
 async function main() {
   const { org: cliOrg, rest: argv } = extractOrgFlag(process.argv.slice(2));
   const verb = argv.shift();
@@ -15687,6 +15713,10 @@ async function main() {
     out(renderCmdHelp(canon));
     return 0;
   }
+
+  // Checked after help/version (asking what a verb does needs no tenant) and
+  // before any verb runs, so an unknown `--org` can neither read nor write.
+  if (refuseUnknownOrg(cfg, canon)) return 1;
 
   if (entry.parse === "raw") return await entry.run(cfg, args, verb);
 
