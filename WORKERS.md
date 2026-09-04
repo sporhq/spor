@@ -913,13 +913,27 @@ outside git (a database on a fixed port, a `db reset`):
   not an argument, and a test that never appears in one can still import,
   spawn or read a file that does (the refusal that prompted this feature is
   exactly that shape — test/codex-dispatch.test.js spawns `bin/spor.js`,
-  which the change had edited). So each failing test file, and the local files
-  it itself names one hop out, are READ and checked for any spelling of a
-  changed path — the path itself, its basename as a token (what a
-  `path.join(ROOT, "bin", "spor.js")` leaves behind), an extensionless quoted
-  specifier. That check is deliberately over-inclusive and bounded: a
-  reference it cannot rule out, a file it cannot read, and a walk that would
-  exceed its budget all read as "not demonstrably off-diff". The practical
+  which the change had edited). So the files the failure named, and the local
+  files they themselves name one hop out, are READ and asked that question two
+  ways — because one spelling misses the other's shape. TEXTUALLY: any
+  spelling of a changed path in the source — the path itself, its basename as
+  a token (what a `path.join(ROOT, "bin", "spor.js")` leaves behind), an
+  extensionless quoted specifier. And by RESOLVED IMPORT EDGE: every local file
+  the source names, resolved against its own directory and compared to the
+  change set exactly, which is what catches a segmented spelling whose text
+  contains no repo-relative path at all (`lib/index.js` requiring
+  `./kernel/queue.js` references `lib/kernel/queue.js` while spelling neither).
+  The edge question is asked on every hop, the last one included.
+
+  WHICH files are asked is likewise two sets. The test files the isolation
+  would re-RUN are HARD seeds: anything that stops us reading one stops the
+  pass, since we would otherwise re-run a file we could not judge. The other
+  files the failure named ride along as soft seeds — the failure went THROUGH
+  them, so what they import is as much part of the question, but a path
+  scraped out of a stack frame need not exist in this tree and one that does
+  not is importing nothing. That check is deliberately over-inclusive and
+  bounded: a reference it cannot rule out, a hard seed it cannot read, and a
+  walk that would exceed its budget all read as "not demonstrably off-diff". The practical
   consequence is that the pass is NARROW — in a repo whose tests drive one
   large entry point, most changes are implicated in most failures and the
   failure is charged as it always was. That is the intended trade: the
@@ -977,6 +991,21 @@ outside git (a database on a fixed port, a `db reset`):
   has been closed and reopened past every rung is reported unfiled, which
   charges the failure and gets a person, the right answer for a test that
   keeps coming back.
+
+  That reconciliation is only as good as the read behind it, so a read that
+  did not HAPPEN settles nothing. "No such node" and "could not look" are
+  different answers (a 404 versus a transport error or a 5xx; ENOENT versus an
+  I/O fault), and an occupant that could not be read is reported unfiled — not
+  written past as if absent, not linked as if live, not climbed over as if
+  settled. The write is not a second chance at that question: its door reports
+  an id that was already occupied as a SUCCESS (`if_exists: skip` remotely,
+  identical-content adoption locally), so believing it would adopt whatever is
+  there unread — which for a resolved occupant is the very thing this
+  reconciliation exists to prevent. A write that created NOTHING therefore
+  sends the id back through the read once and lets the same live / settled /
+  unreadable rule decide. That also covers the check-then-write RACE: two
+  workers tripping over the same flaky file both read the id as free, and the
+  loser's skip is read back rather than reported as a filing.
 
   Declaring nothing keeps the pre-existing behaviour exactly: with no
   `isolate` the runner never runs an extra command. What it DOES do for every

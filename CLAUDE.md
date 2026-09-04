@@ -811,13 +811,24 @@ cycles, its rescue lane and finally a person. "Demonstrably not the change's" is
 TWO claims, both required and both failing closed: EVERY failed run (not just
 the last — `reruns` means several samples of one tree, and an off-diff flake on
 run 2 must not overwrite an on-diff failure on run 1, `gates.offDiffRuns`) named
-only files off the diff, AND those test files REFERENCE nothing the change edits
-(`gates.mentionsChanged` over each failing test and the local files it names one
-hop out, `changeReferencedBy` in gate-runner.js) — because a test absent from a
+only files off the diff, AND the files it named REFERENCE nothing the change
+edits (`changeReferencedBy` in gate-runner.js) — because a test absent from a
 diff can still import or spawn a file in it, which is exactly the shape of the
 refusal that prompted this (test/codex-dispatch.test.js spawns `bin/spor.js`,
-which the change had edited). The reference read is over-inclusive and bounded,
-and an unreadable file or an over-budget walk charges the failure, so the pass is
+which the change had edited). A reference is read two ways, since one spelling
+misses the other's shape: TEXTUALLY (`gates.mentionsChanged` — the path, the
+basename as a token, an extensionless quoted specifier) and as a RESOLVED import
+EDGE (`gates.referencedCandidates` resolved against the file's own dir and
+compared to the change set, asked on every hop INCLUDING the last, so
+`lib/index.js` requiring `./kernel/queue.js` is a reference to
+`lib/kernel/queue.js` even though its text spells neither). The seeds are every
+file the failure named, not only the ones the isolation would re-run: those
+others are where the failure WENT, so what they import is part of the same
+question — the test files are HARD seeds (unreadable stops the pass, since we
+would otherwise re-run a file we could not judge) and the rest are soft (a path
+scraped from a stack frame need not exist in this tree, and one that does not
+imports nothing). The reference read is over-inclusive and bounded, and an
+unreadable seed or an over-budget walk charges the failure, so the pass is
 NARROW by design: `reruns` stays the broad flake mitigation. Off-diff is
 a reason to LOOK, never to pass: a failure naming a file the change touches, or
 one that fails alone too, is charged as before, and the pass is never clean (the
@@ -827,7 +838,17 @@ too and a red suite passing with neither write is a green light nobody can audit
 The issue's convergent id is reconciled against SETTLED state rather than adopted
 on its name: a live occupant is linked, a resolved/closed one advances to a
 recurrence rung (`-r2`, `-r3`) that links back to it, and a file past every rung
-is reported unfiled — which charges the failure and gets a person. Declaring
+is reported unfiled — which charges the failure and gets a person. That
+reconciliation is only as good as the READ behind it, so a read that did not
+HAPPEN settles nothing: `resolveNode`'s optional out-param separates "no such
+node" from "could not look" (a 404 vs a transport error / 5xx; ENOENT vs an I/O
+fault), and an unreadable occupant is reported unfiled rather than written past,
+linked or climbed over. The write is not a second chance at that question — its
+door reports an occupied id as a SUCCESS (`if_exists: skip` remotely, which
+`writeGateNode` now distinguishes as `existing`, and identical-content adoption
+locally), so a write that created NOTHING sends the id back through the read once
+and lets the same live/settled/unknown rule decide, instead of returning a filing
+for whatever is actually there. Declaring
 nothing runs no extra command; what happens for EVERY command gate either way is
 that a charged failure records WHICH files it failed in
 (`gates.describeFailingFiles`), so flake telemetry aggregates by file instead of

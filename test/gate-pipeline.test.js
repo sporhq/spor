@@ -24,6 +24,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn, spawnSync, execFileSync } = require("node:child_process");
+const http = require("node:http");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const gates = require("../lib/kernel/gates.js");
@@ -4835,6 +4836,73 @@ test("a failing test that REFERENCES the change is not off-diff, however absent 
   fs.rmSync(dir2, { recursive: true, force: true });
 });
 
+// "References the change" is asked of RESOLVED import edges, not only of the
+// text. A file can name what it imports without its source containing that
+// file's repo-relative path anywhere — `lib/index.js` requiring
+// `./kernel/queue.js` is a reference to `lib/kernel/queue.js` while containing
+// neither that string nor `queue.js` as an unprefixed token — and the LAST hop
+// is where it matters most, since its candidates used to be computed only to be
+// thrown away.
+test("a reference is a resolved import edge, not just a spelling — including on the walk's last hop", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-edge-"));
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "lib", "kernel"), { recursive: true });
+  // Nothing here spells `lib/kernel/queue.js`: the test names the barrel, the
+  // barrel names its own sibling.
+  fs.writeFileSync(path.join(dir, "test", "codex-dispatch.test.js"), 'const spor = require("../lib/index.js");\n');
+  fs.writeFileSync(path.join(dir, "lib", "index.js"), 'module.exports = { queue: require("./kernel/queue.js") };\n');
+  fs.writeFileSync(path.join(dir, "lib", "kernel", "queue.js"), "module.exports = {};\n");
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const { deps, seen } = treeFakes({
+    dir,
+    changed: ["lib/kernel/queue.js"],
+    run: (attempt, command) => (command ? { ok: true } : { ok: false, code: 1, output: FAILED_OFF_DIFF }),
+  });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps })).state, "failed");
+  assert.deepStrictEqual(seen.suites, ["acceptance"], "the change is reached two hops out, so nothing is re-run in isolation");
+  assert.deepStrictEqual(seen.flakes, []);
+  assert.match(seen.facts[0].markdown, /reference lib\/kernel\/queue\.js, which the change does edit/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// The failure named more than the files the isolation would RUN. Those others
+// are where the failure WENT, so what they import is as much part of the
+// question — but they are only guesses at a local file, so one that is not
+// there is simply not a reference rather than a refusal.
+test("every file the failure named is asked the reference question, and one that is not in the tree is not an answer", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const output = [
+    "✖ the launch handshake (40001.2ms)",
+    "  AssertionError [ERR_ASSERTION]: the record was never written",
+    "      at dispatch (lib/shell/dispatch.js:88:9)",
+    "      at TestContext.<anonymous> (test/codex-dispatch.test.js:120:5)",
+  ].join("\n");
+
+  // The frame in lib/ imports the change; the test file itself says nothing
+  // about it. Seeding only the isolation set would have called this off-diff.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-soft-"));
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "lib", "shell"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "test", "codex-dispatch.test.js"), 'const assert = require("node:assert");\n');
+  fs.writeFileSync(path.join(dir, "lib", "shell", "dispatch.js"), 'const q = require("../kernel/queue.js");\n');
+  const one = treeFakes({ dir, changed: ["lib/kernel/queue.js"], run: (a, c) => (c ? { ok: true } : { ok: false, code: 1, output }) });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: one.deps })).state, "failed");
+  assert.deepStrictEqual(one.seen.flakes, [], "the failure went through a file that imports the change");
+  assert.match(one.seen.facts[0].markdown, /reference lib\/kernel\/queue\.js, which the change does edit/);
+
+  // Same failure, same named files — but this tree has no lib/shell/dispatch.js
+  // at all. A path that is not a file here imports nothing, so the pass still
+  // happens; only a file the isolation would RUN fails closed when unreadable.
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-soft2-"));
+  fs.mkdirSync(path.join(dir2, "test"), { recursive: true });
+  fs.writeFileSync(path.join(dir2, "test", "codex-dispatch.test.js"), 'const assert = require("node:assert");\n');
+  const two = treeFakes({ dir: dir2, changed: ["lib/kernel/queue.js"], run: (a, c) => (c ? { ok: true } : { ok: false, code: 1, output }) });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: two.deps })).state, "passed");
+  assert.deepStrictEqual(two.seen.flakes[0].files, ["test/codex-dispatch.test.js"]);
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir2, { recursive: true, force: true });
+});
+
 test("a failing test the walk cannot READ is charged, not isolated — the reference question fails closed", async () => {
   const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
   // A prepared tree that does not contain the file the failure named.
@@ -5058,5 +5126,110 @@ test("a flake whose issue is already SETTLED climbs to a recurrence rung rather 
   const exhausted = await deps.fileFlakeItem(call);
   assert.strictEqual(exhausted.ok, false);
   assert.match(exhausted.reason, /every candidate id for this flake .* is already settled/);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+// The reconciliation above only holds while the read that drives it actually
+// HAPPENS. A null from the graph is two different answers — "no such node" and
+// "could not look" — and treating the second as the first sends the filing to
+// its write door, whose success means "the id is occupied" as readily as "I
+// created it" (`if_exists: skip` remotely, identical-content adoption locally).
+// So an unreadable occupant must settle nothing: not absence, not liveness, not
+// settledness.
+test("an occupant the graph could not READ is never adopted — the filing refuses instead, and writes nothing", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-flake-unread-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    hits.push(`${req.method} ${req.url.split("?")[0]}`);
+    // Drain the body before answering, so a regression that DOES write fails
+    // on the assertion below instead of stalling on a half-sent request.
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { code: "boom", message: "the graph is down" } }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${srv.address().port}`;
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: url, SPOR_TOKEN: "t" } });
+  const r = await flakeDeps(cfg, home).fileFlakeItem({
+    gate: { id: "acceptance" }, files: ["test/codex-dispatch.test.js"], command: "npm test", isolate: "node --test 'test/codex-dispatch.test.js'",
+  });
+  assert.strictEqual(r.ok, false, "an unread occupant is not a filing");
+  assert.match(r.reason, /could not be read.*whether it is still live could not be decided/);
+  assert.deepStrictEqual(hits, ["GET /v1/nodes/issue-flake-test-codex-dispatch-test-js-" + hits[0].split("-").pop()], "one read…");
+  assert.strictEqual(hits.length, 1, "…and no write attempted on the strength of a question the read left open");
+  await new Promise((r2) => srv.close(r2));
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+// The check-then-write RACE, in the mode where it is real: two workers trip
+// over the same flaky file at once, both read the id as free, and the loser's
+// write comes back `skipped`. A skip is not a write — this markdown did not
+// land — so the loser reads the id back and the same live/settled rule decides,
+// rather than reporting a filing for whatever is actually there.
+test("a write the door reports as SKIPPED is read back, not adopted — a settled occupant still climbs a rung", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-flake-race-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const node = (id, status) => [
+    "---", `id: ${id}`, "type: issue", `status: ${status}`, "date: 2026-09-04",
+    "title: Flaky under the acceptance gate", "summary: it flakes", "---", "", "body",
+  ].join("\n");
+  // The occupant appears between the read and the write, the way a second
+  // worker's filing would: absent on the first GET, present on the re-read.
+  const run = async (statusOnReread) => {
+    const hits = [];
+    let base = "";
+    const srv = http.createServer((req, res) => {
+      const p = req.url.split("?")[0];
+      const id = decodeURIComponent(p.replace("/v1/nodes/", ""));
+      hits.push(`${req.method} ${req.method === "POST" ? "" : id}`.trim());
+      if (req.method === "GET") {
+        base = base || id;
+        const seenBefore = hits.filter((h) => h === `GET ${id}`).length > 1;
+        if (id === base && seenBefore) {
+          res.writeHead(200, { "content-type": "application/json" });
+          return res.end(JSON.stringify({ raw: node(id, statusOnReread) }));
+        }
+        res.writeHead(404, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: { code: "not_found", message: "no" } }));
+      }
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", () => {
+        const id2 = /^id: (\S+)$/m.exec(JSON.parse(body).nodes[0].node)[1];
+        res.writeHead(200, { "content-type": "application/json" });
+        // The FIRST write loses the race; a later rung's write is this
+        // worker's own and creates.
+        res.end(JSON.stringify({ results: [{ status: id2 === base ? "skipped" : "created" }] }));
+      });
+    });
+    await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+    const url = `http://127.0.0.1:${srv.address().port}`;
+    const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: url, SPOR_TOKEN: "t" } });
+    const r = await flakeDeps(cfg, home).fileFlakeItem({
+      gate: { id: "acceptance" }, files: ["test/codex-dispatch.test.js"], command: "npm test", isolate: "node --test 'test/codex-dispatch.test.js'",
+    });
+    await new Promise((r2) => srv.close(r2));
+    return { r, hits, base };
+  };
+
+  // The winner's node is RESOLVED — an occurrence hung on it resurfaces to
+  // nobody, so this occurrence gets its own live rung.
+  const settled = await run("resolved");
+  assert.strictEqual(settled.r.ok, true, settled.r.reason);
+  assert.strictEqual(settled.r.id, `${settled.base}-r2`, "the skip was read back, found settled, and climbed");
+  assert.deepStrictEqual(
+    settled.hits,
+    [`GET ${settled.base}`, "POST", `GET ${settled.base}`, `GET ${settled.base}-r2`, "POST"],
+    "read, lost the race, re-read, then filed the recurrence"
+  );
+
+  // The winner's node is LIVE — the same flake, so it is linked and nothing
+  // new is minted.
+  const live = await run("open");
+  assert.deepStrictEqual([live.r.ok, live.r.id, live.r.existing], [true, live.base, true]);
+  assert.deepStrictEqual(live.hits, [`GET ${live.base}`, "POST", `GET ${live.base}`], "linked the live occupant — no second write");
   fs.rmSync(home, { recursive: true, force: true });
 });

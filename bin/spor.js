@@ -7102,7 +7102,17 @@ async function nodeConfirmedAbsent(cfg, id) {
 
 // Resolve a node id to { id, raw, repo, title, summary, type, status, date } or
 // null if it doesn't exist.
-async function resolveNode(cfg, id) {
+//
+// A null is TWO different answers — "there is no such node" and "the graph
+// could not be read" — and every caller that only wants to enrich a display can
+// treat them the same. A caller that is about to ACT on absence cannot: writing
+// a node because a read timed out is how a settled occupant gets adopted unread
+// (fileFlakeItem). The optional `out` object separates them, and nothing else
+// about this function changes, so callers that pass nothing are unaffected:
+// `out.unreadable` is true only when the node may well exist and we failed to
+// look, false when the graph answered "not there".
+async function resolveNode(cfg, id, out = null) {
+  if (out) out.unreadable = false;
   let raw = "";
   // The server's get(node) hook attaches read-time enrichment as additive
   // top-level keys (API.md §3): `resolution` is the live inbound resolves/answers
@@ -7122,7 +7132,12 @@ async function resolveNode(cfg, id) {
   let inert = null;
   if (cfg.mode() === "remote") {
     const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 6000 });
-    if (!r.ok) return null;
+    if (!r.ok) {
+      // Only a 404 is the graph SAYING the node is absent. A transport error, a
+      // 5xx or an auth refusal all leave the question open.
+      if (out) out.unreadable = r.status !== 404;
+      return null;
+    }
     raw = (r.json && r.json.raw) || r.text || "";
     resolution = (r.json && r.json.resolution) || null;
     held = (r.json && r.json.held) || null;
@@ -7130,7 +7145,9 @@ async function resolveNode(cfg, id) {
   } else {
     try {
       raw = fs.readFileSync(path.join(cfg.nodesDir(), `${id}.md`), "utf8");
-    } catch {
+    } catch (e) {
+      // ENOENT is absence; a permission error or an I/O fault is not.
+      if (out) out.unreadable = !(e && e.code === "ENOENT");
       return null;
     }
   }
@@ -10376,7 +10393,16 @@ async function writeGateNode(cfg, id, markdown) {
     const r = await remote.post(cfg, "/v1/nodes", { nodes: [{ node: markdown, if_exists: "skip" }] }, { timeoutMs: 15000 });
     if (r.transport) return { ok: false, reason: `offline — ${r.error}` };
     const res0 = r.json && r.json.results && r.json.results[0];
-    if (res0 && (res0.ok === true || res0.status === "skipped" || res0.status === "created")) return { ok: true, id };
+    // A SKIP is not a write: the id was already occupied and this markdown did
+    // not land. Every node a gate files is idempotent, so the two are the same
+    // outcome for a fact or an escalation — but a caller that must reconcile
+    // against what is ALREADY there (fileFlakeItem, whose occupant may be a
+    // resolved issue) has to be able to tell them apart, and locally it always
+    // could. Reporting it keeps the two modes' answers the same shape; a server
+    // that reports neither `created` nor `skipped` is unchanged (no flag).
+    if (res0 && (res0.ok === true || res0.status === "skipped" || res0.status === "created")) {
+      return res0.status === "skipped" ? { ok: true, id, existing: true } : { ok: true, id };
+    }
     return { ok: false, reason: putNodeEntryError(res0, r.status, "gate") };
   }
   const dir = cfg.nodesDir();
@@ -11676,6 +11702,17 @@ function makeGateDeps(
     // one that was closed. All rungs settled — a file closed and reopened four
     // times — is reported unfiled, which the runner turns into a charged
     // failure and a person, the right answer for a file that keeps coming back.
+    //
+    // And a read that could not be MADE decides nothing at all: it is neither
+    // absence (which would write) nor liveness (which would link) nor
+    // settledness (which would climb), so it is reported unfiled and the
+    // failure is charged. The write is not a second chance at that question —
+    // its door reports an occupied id as a SUCCESS, so believing it would adopt
+    // whatever is there unread, which for a resolved occupant is the very
+    // "fresh occurrence attached to a terminal node" this reconciliation
+    // exists to prevent. That is why a write that did not create anything
+    // (`existing`, in either mode) sends the id back through the read once,
+    // instead of being returned as a filing.
     fileFlakeItem: async ({ gate, files, command, isolate }) => {
       const list = (files || []).map(String);
       const stem = list[0].replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase().slice(0, 34).replace(/-+$/, "") || "suite";
@@ -11713,37 +11750,63 @@ function makeGateDeps(
             ...(priorId ? [{ type: "relates-to", to: priorId }] : []),
           ],
         });
+      // The occupant of one candidate id, as the FOUR answers the adoption rule
+      // needs rather than the two a null carries. "Could not look" is the one
+      // the old reading collapsed into "absent": a read that timed out was
+      // followed by a write, the write's door reported the id already taken as
+      // a success (`if_exists: skip` remotely, identical-content adoption
+      // locally), and a RESOLVED occupant was adopted unread — the stale-flag
+      // failure exactly. It is now its own answer and it settles nothing.
+      const occupantOf = async (id) => {
+        const read = {};
+        let node = null;
+        try {
+          node = await resolveNode(cfg, id, read);
+        } catch (e) {
+          return { state: "unknown", why: `${id} could not be read (${(e && e.message) || e})` };
+        }
+        if (node) {
+          const settled = dispatchResolutionReason(cfg, node);
+          return settled ? { state: "settled", why: settled } : { state: "live" };
+        }
+        return read.unreadable ? { state: "unknown", why: `${id} could not be read` } : { state: "absent" };
+      };
       let prior = null;
       let priorWhy = "";
       let rung = 0;
       let raced = false;
       while (rung < FLAKE_ID_RUNGS) {
         const id = rung === 0 ? base : `${base}-r${rung + 1}`;
-        // A node this read cannot reach is not thereby absent, so nothing is
-        // concluded from the failure: the write below is the atomic door, and
-        // when the graph is unreachable it fails too — which the runner turns
-        // into a charged failure rather than a pass with no record.
-        const node = await resolveNode(cfg, id).catch(() => null);
-        if (node) {
-          const settled = dispatchResolutionReason(cfg, node);
-          if (!settled) return { ok: true, id, existing: true };
+        const occupant = await occupantOf(id);
+        // Nothing is concluded from a read that failed. Climbing to the next
+        // rung would mint a duplicate beside a live issue; adopting would link
+        // a possibly-settled one. Both are answers about state we did not see,
+        // so the filing is refused — which the runner turns into a charged
+        // failure, the same direction every other unreadable answer takes here.
+        if (occupant.state === "unknown") return { ok: false, reason: `the flake's issue ${occupant.why}, so whether it is still live could not be decided` };
+        if (occupant.state === "live") return { ok: true, id, existing: true };
+        if (occupant.state === "settled") {
           prior = id;
-          priorWhy = settled;
+          priorWhy = occupant.why;
           rung += 1;
           raced = false;
           continue;
         }
         const written = await writeGateNode(cfg, id, markdown(id, prior, priorWhy));
-        if (written.ok) return written;
+        // Created it: this filing IS the record.
+        if (written.ok && !written.existing) return written;
         // The id was occupied between the read and the write — another worker
         // filed the same flake first (its content is this flake's by
-        // construction, the id being keyed on the files and nothing else). Read
-        // it back ONCE so the same live/settled rule decides, rather than
-        // adopting it unread.
+        // construction, the id being keyed on the files and nothing else), or
+        // the same-content door adopted it. Either way this markdown did not
+        // land, so the occupant is read back ONCE and the same live/settled/
+        // unknown rule decides, rather than adopted on the strength of the id.
         if (written.existing && !raced) {
           raced = true;
           continue;
         }
+        // Occupied by content that is not this flake's, or occupied again after
+        // a re-read that said absent: the id is not usable, climb a rung.
         if (written.existing) {
           rung += 1;
           raced = false;
