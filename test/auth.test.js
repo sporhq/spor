@@ -306,6 +306,86 @@ test('CLI: the credential verbs are exempt — naming an org you lack is what th
   assert.ok(store.tenants['https://a/acme'], 'the sibling was not clobbered');
 });
 
+// The exemption is per-INVOCATION, not per-verb: `auth` is a sub-dispatcher, and
+// exempting the whole namespace left every non-acquiring subcommand with the
+// exact wrong-tenant behavior the refusal exists to stop.
+
+test('CLI: only the ACQUIRING auth subcommand is exempt — auth logout --org <unknown> refuses', async () => {
+  const home = tmp();
+  auth.upsertTenant(home, { server: 'https://a', org: 'acme', access_token: 'AT' });
+  const r = await runAsync(['auth', 'logout', '--org', 'nope'], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.strictEqual(r.code, 1);
+  assert.match(r.stderr, /no credential stored for org 'nope'/);
+  assert.ok(auth.readStore(home).tenants['https://a/acme'], 'the ACTIVE tenant was not destroyed');
+  assert.strictEqual(r.stdout, '', 'the subcommand never ran');
+});
+
+test('CLI: auth whoami/list/switch under an unknown --org refuse too (they answer about the active tenant)', async () => {
+  const home = tmp();
+  auth.upsertTenant(home, { server: 'https://a', org: 'acme', access_token: 'AT' });
+  for (const args of [['auth', 'whoami'], ['auth', 'list'], ['auth'], ['auth', 'switch', 'acme']]) {
+    const r = await runAsync([...args, '--org', 'nope'], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+    assert.strictEqual(r.code, 1, `${args.join(' ')}: ${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, /no credential stored for org 'nope'/, args.join(' '));
+    assert.strictEqual(r.stdout, '', `${args.join(' ')} never ran`);
+  }
+});
+
+test('CLI: `auth login --org <new>` stays exempt (it is the door out of the refusal)', async () => {
+  const home = tmp();
+  auth.upsertTenant(home, { server: 'https://a', org: 'acme', access_token: 'AT' });
+  // The paste path of `auth login` is `login <url> <token>` — acquisition, so it runs.
+  const r = await runAsync(['auth', 'login', 'https://b', 'BT', '--org', 'brandnew'], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.strictEqual(r.code, 0, r.stderr);
+  const store = auth.readStore(home);
+  assert.ok(Object.keys(store.tenants).some((k) => store.tenants[k].org === 'brandnew'), 'the new tenant was added');
+  assert.ok(store.tenants['https://a/acme'], 'the sibling was not clobbered');
+});
+
+// --- an EMPTY --org is malformed input, not "no selector" -------------------
+// The classic shape is an unset shell variable: quoted it arrives as `--org ""`,
+// unquoted the word vanishes and `--org` dangles.
+
+test('extractOrgFlag: absent -> null; empty, `--org=`, and a dangling `--org` -> "" (asserted but unusable)', () => {
+  const { extractOrgFlag } = require('../bin/spor.js');
+  assert.deepStrictEqual(extractOrgFlag(['get', 'x']), { org: null, rest: ['get', 'x'] });
+  assert.deepStrictEqual(extractOrgFlag(['get', 'x', '--org', 'acme']), { org: 'acme', rest: ['get', 'x'] });
+  assert.deepStrictEqual(extractOrgFlag(['get', 'x', '--org', '']), { org: '', rest: ['get', 'x'] });
+  assert.deepStrictEqual(extractOrgFlag(['get', 'x', '--org=']), { org: '', rest: ['get', 'x'] });
+  assert.deepStrictEqual(extractOrgFlag(['get', 'x', '--org']), { org: '', rest: ['get', 'x'] });
+  // dangling before another flag: the next flag is preserved, the org is empty
+  assert.deepStrictEqual(extractOrgFlag(['get', 'x', '--org', '--json']), { org: '', rest: ['get', 'x', '--json'] });
+});
+
+test('selector: an empty --org refuses (it must not read as "use the active tenant")', () => {
+  const home = tmp();
+  auth.upsertTenant(home, { server: 'https://a', org: 'acme', access_token: 'AT' });
+  for (const org of ['', '   ']) {
+    const c = loadAt(home, { cli: { org } });
+    assert.strictEqual(c.tenant(), null, JSON.stringify(org));
+    assert.strictEqual(c.server(), '');
+    assert.strictEqual(c.token(), '');
+    assert.strictEqual(c.tenantError().kind, 'empty-org');
+    assert.deepStrictEqual(c.tenantError().orgs, ['acme']);
+  }
+  // A whitespace-PADDED org is still an unknown org, not an empty one: the
+  // emptiness test trims, the lookup does not.
+  assert.strictEqual(loadAt(home, { cli: { org: ' acme' } }).tenantError().kind, 'unknown-org');
+});
+
+test('CLI: an empty --org refuses every verb, acquisition included', async () => {
+  const home = tmp();
+  auth.upsertTenant(home, { server: 'https://a', org: 'acme', access_token: 'AT' });
+  for (const args of [['get', 'dec-anything', '--org', ''], ['get', 'dec-anything', '--org='], ['join', '--org', ''], ['auth', 'login', 'https://b', 'BT', '--org', ''], ['auth', 'logout', '--org', '']]) {
+    const r = await runAsync(args, { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+    assert.strictEqual(r.code, 1, `${args.join(' ')}: ${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, /--org was given an empty value/, args.join(' '));
+    assert.strictEqual(r.stdout, '', `${args.join(' ')} never ran`);
+  }
+  const store = auth.readStore(home);
+  assert.deepStrictEqual(Object.keys(store.tenants), ['https://a/acme'], 'nothing was acquired, nothing was cleared');
+});
+
 test('selector: env SPOR_SERVER pointing at a known tenant carries its refresh + org', () => {
   const home = tmp();
   auth.upsertTenant(home, { server: 'https://a', org: 'acme', access_token: 'AT', refresh_token: 'RT' });

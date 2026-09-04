@@ -875,11 +875,22 @@ the store default / legacy flat config, and `main()` turns that into an exit-1
 refusal listing the stored orgs (`refuseUnknownOrg`) before the verb runs —
 otherwise a read answers from the wrong graph and a write LANDS in it while the
 operator believes they are scoped elsewhere
-(issue-spor-cli-unrecognized-org-fallback). Exempt: `auth`/`join`/`login`, whose
-job is to acquire a credential for an org you do not have one for yet — they read
+(issue-spor-cli-unrecognized-org-fallback). Exempt: the credential-ACQUIRING
+INVOCATIONS — `spor login`, `spor join`, `spor auth login` — whose job is to
+acquire a credential for an org you do not have one for yet; they read
 `Config.serverForNewTenant()` (the cascade re-resolved with the flag ignored) so
 `spor auth login --org <new>` still defaults to the server the rest of the
-cascade names. The AMBIENT org selectors (`SPOR_ORG`, the repo `org:` marker)
+cascade names. The exemption is per-INVOCATION, not per-verb
+(`isCredentialAcquisition` reads `auth`'s subcommand off `args[0]`, the same
+expression `cmdAuth` dispatches on): exempting the whole `auth` namespace left every
+non-acquiring subcommand with the exact hazard the refusal exists to stop —
+`spor auth logout --org <unknown>` cleared the ACTIVE tenant, and `auth
+whoami`/`list`/`switch` answered about (or re-pointed) it. An `--org` given an
+EMPTY value is a SECOND refusal kind (`empty-org`) and is exempt from nothing,
+acquisition included — no org was named at all, so there is nothing to acquire
+or read; both spellings a shell's unset `$ORG` produces are caught (quoted, it
+arrives as `--org ""`; unquoted, the word vanishes and the dangling `--org` is
+read as empty rather than dropped). The AMBIENT org selectors (`SPOR_ORG`, the repo `org:` marker)
 deliberately still fall through: they also ride the fail-open hook engines, so
 hardening them is its own change (issue-spor-ambient-org-selector-silent-fallback).
 Because only a caller that passes `--org` can ever see the refusal, the engines
