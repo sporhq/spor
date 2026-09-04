@@ -407,19 +407,35 @@ at the same node finds the first one's work instead of duplicating it. The
 state lives on the graph itself; there is no run-record flag to lose.
 
 - **The sibling's id is derived from two pinned inputs, never minted:**
-  `task-split-<original id>-<other repo slug>`, where the original id is the
-  node's full id VERBATIM (type prefix included — `issue-foo` and `task-foo`
-  must not collapse onto one sibling) and the repo slug is the other repo's
-  canonical `repo:` stamp value (the kebab-case slug of "Project slug
-  convention", e.g. `spor-server` — never the `repo-spor-server` node id, a
-  path, or a display name). E.g. `task-spor-docs-bulk-lease-endpoints`
-  handed back to `spor` gives `task-split-task-spor-docs-bulk-lease-endpoints-spor`;
+  `task-split-<slug>-<hash>`, where `<slug>` is the other repo's canonical
+  `repo:` stamp value (the kebab-case slug of "Project slug convention",
+  e.g. `spor-server` — never the `repo-spor-server` node id, a path, or a
+  display name; if it is longer than 60 characters, only its first 60 appear
+  in the id) and `<hash>` is the first 12 hex characters of the SHA-256 of
+  the original node's FULL id (type prefix included) and the FULL slug, each
+  followed by one newline:
+
+  ```
+  printf '%s\n%s\n' '<original id>' '<slug>' | sha256sum | cut -c1-12
+  ```
+
+  (`shasum -a 256` or any SHA-256 tool gives the same digest.) E.g.
+  `task-spor-docs-bulk-lease-endpoints` handed back to `spor` hashes to
+  `3a9e7b9946fb`, so the sibling is `task-split-spor-3a9e7b9946fb`;
   `issue-foo-bar` handed back to `spor-server` gives
-  `task-split-issue-foo-bar-spor-server`. Every actor computes the id from
-  those two inputs; a `## HANDED BACK` block names the id it derived (and
-  MUST name the repo by that canonical slug), but you derive it yourself and
-  use the rule's answer, not the block's. If the acceptance spans more than
-  one other repo, each gets its own sibling under its own slug.
+  `task-split-spor-server-a543f6c75e9a`. The hash is the identity, the slug
+  prefix is only for readability: because it covers BOTH inputs verbatim
+  (ids contain no newlines, so the two cannot bleed into each other), two
+  different (original, repo) pairs share an id only on a SHA-256 prefix
+  collision — `issue-foo`/`task-foo`, or an original id that happens to end
+  in another repo's slug, never collapse onto one sibling — and the id is
+  at most 84 characters (11 + 60 + 1 + 12), so it is always inside Spor's
+  200-character id limit however long the original id is. Every actor
+  computes the id from those two inputs; a `## HANDED BACK` block names the
+  id it derived (and MUST name the repo by that canonical slug), but you
+  derive it yourself and use the rule's answer, not the block's. If the
+  acceptance spans more than one other repo, each gets its own sibling
+  under its own slug.
 - **File it with `put_node --if-exists skip`, then read it back and CHECK
   IT IS THE SIBLING.** The write (MCP `put_node` with `if_exists: skip`, or
   `spor put-node - --if-exists skip`) is a `task` stamped to that repo
@@ -431,16 +447,14 @@ state lives on the graph itself; there is no run-record flag to lose.
   its `repo:` stamp is that slug AND it carries a `relates-to` (or
   `derived-from`) edge to the original id — both of which the write above
   always sets, so a skipped write that passes the test is success, not a
-  duplicate, whoever wrote it. A node that FAILS the test is an unrelated
-  collision (the join is not injective: a genuine pre-existing
-  `task-split-…` id, or a slug that happens to end one id and start another):
-  it is NOT the sibling, do not narrow against it, and do not edit it.
-  Probe the next id in the fixed sequence `<derived>-2`, `<derived>-3` —
-  write-with-skip, read back, test — and use the first that passes; every
-  actor walks the same sequence from the same start, so concurrent actors
-  still converge on one node. If `-3` also collides, stop: nothing is filed,
-  resolve nothing, and escalate to the user (three collisions on a derived
-  id is a graph anomaly, not a retry). If the write errored AND the read
+  duplicate, whoever wrote it. A node that FAILS the test is NOT the
+  sibling: with the id derived from a hash, nothing arrives under it by
+  accident, so a failing node is either a sibling written outside this
+  contract (wrong `repo:`, edge missing) or a hand-authored id — a graph
+  anomaly, not a retry. Do not narrow against it, do not edit it, do not
+  probe some other id (a second id is exactly the fork this contract
+  exists to prevent): stop, resolve nothing, and escalate to the user with
+  the id and what you found under it. If the write errored AND the read
   finds nothing, nothing has been filed either: stop here, resolve nothing,
   and retry next turn — the report that carries the block (the Codex
   `report_path`, the Claude transcript) is the durable record of the debt,
@@ -469,6 +483,12 @@ state lives on the graph itself; there is no run-record flag to lose.
   sibling and an unresolved original — never a resolved original whose body
   still claims the other half. On any conflict (`--revision` stale, a 409),
   re-read and re-evaluate rather than re-send: the marker may now be there.
+  The resolver step belongs ONLY to the actor holding the finished work —
+  the Claude agent after its own half passes, or you on a `MERGE-READY`
+  report carrying a `## HANDED BACK` block. At selection time the contract
+  ends at the marker: you have split an item nobody has implemented yet,
+  and the narrowed original goes to dispatch like any other item, not to a
+  resolver.
 - **Settled state wins over the retry — and a settled node still owes the
   block.** The contract runs whenever a report carries `## HANDED BACK`,
   whether or not the node is already resolved (the supervisor loop reads
@@ -488,7 +508,7 @@ state lives on the graph itself; there is no run-record flag to lose.
 - **Bounded:** the supervisor keeps a node whose split has not gone through
   in `running` and retries the contract on each loop turn; after **3** turns
   it stops retrying and escalates to the user with the node, the derived
-  sibling id (and any probe suffix reached), what was filed, and where the
+  sibling id, what was filed, and where the
   report is — a slot is never held forever on a graph that will not take
   the write.
 
@@ -779,9 +799,10 @@ Two things close the gap:
    unable to write the graph — could only report. Resolving the node as
    written would claim that half done, so run "The split contract" yourself
    *before* `resolve_on_graph`, in its order: derive the sibling id from the
-   node's full id and the block's canonical repo slug, file it with
-   `put_node --if-exists skip`, read it back and confirm it passes the
-   identity test (probing `-2`/`-3` past an unrelated collision), append the
+   node's full id and the block's canonical repo slug (the hash rule), file
+   it with `put_node --if-exists skip`, read it back and confirm it passes
+   the identity test (a node that fails it is an anomaly: stop and
+   escalate, never a second id), append the
    `## Scope (narrowed)` marker to the node under `--revision`, then resolve
    naming the sibling's id in the resolver body. The sibling is ordinary
    queue work: dispatch it next like any single-repo item. If any write in

@@ -83,13 +83,17 @@ orchestrator must file before it may resolve this node:
     ## HANDED BACK
     - repo: <other-repo slug> — <the acceptance text for that half, standing alone:
       which file(s), what must be true there, and why it belongs to this item>
-      sibling: task-split-<this node's full id, type prefix included>-<other-repo slug>
+      sibling: task-split-<other-repo slug>-<hash>
 
 `repo:` must be the other repo's canonical slug — its `repo:` stamp value as it
 appears on graph nodes (kebab-case, e.g. `spor-server`; never a `repo-…` node id, a
 path, or a display name) — because it is one of the two inputs the sibling id is
-derived from. The `sibling:` line is the id the orchestrator will file the half under
-(derived from this node's full id plus that slug, never minted, so a retry or a
-pre-split finds the same node) — state it so the report is self-describing; the
-orchestrator re-derives it from the rule rather than trusting it, and steps past an
-unrelated node already holding that id.
+derived from. The `sibling:` line is the id the orchestrator will file the half under:
+`<hash>` is the first 12 hex characters of the SHA-256 of this node's full id (type
+prefix included) and that slug, each followed by a newline —
+`printf '%s\n%s\n' '<this node id>' '<slug>' | sha256sum | cut -c1-12` (e.g.
+`issue-foo-bar` + `spor-server` → `task-split-spor-server-a543f6c75e9a`). Derived,
+never minted, so a retry or a pre-split finds the same node — state it so the report
+is self-describing; the orchestrator re-derives it from the rule rather than trusting
+it, and treats an unrelated node already holding that id as an anomaly to escalate,
+never as the sibling.

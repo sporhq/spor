@@ -166,11 +166,16 @@ order, each a graph write you make yourself (the one exception to step 5's
 not a finding):
 
 1. **File the sibling first, under a DERIVED id, and check it is yours.**
-   The id is `task-split-<{{node}} verbatim, type prefix included>-<other
-   repo's canonical slug>` — the slug is that repo's `repo:` stamp value
-   (kebab-case, e.g. `spor-server`; never a `repo-…` node id, a path, or a
-   display name) — so `task-foo-bar` handed to `spor-server` gives
-   `task-split-task-foo-bar-spor-server`. Never let `/spor:defer` or `spor
+   The id is `task-split-<slug>-<hash>`: the slug is the other repo's
+   `repo:` stamp value (kebab-case, e.g. `spor-server`; never a `repo-…`
+   node id, a path, or a display name; first 60 characters if longer), and
+   the hash is the first 12 hex characters of the SHA-256 of `{{node}}`'s
+   full id (type prefix included) and that full slug, each followed by a
+   newline — `printf '%s\n%s\n' '{{node}}' '<slug>' | sha256sum | cut
+   -c1-12` — so `issue-foo-bar` handed to `spor-server` gives
+   `task-split-spor-server-a543f6c75e9a`. The hash covers both inputs, so
+   it is unique per (item, repo) and always well inside the id length limit.
+   Never let `/spor:defer` or `spor
    add` mint one — a minted id is a fresh duplicate on every retry and a
    second one if the orchestrator pre-split this item. Write it with
    `put_node` `if_exists: skip` (or `spor put-node - --if-exists skip`): a
@@ -179,12 +184,13 @@ not a finding):
    `{{node}}`. Then `get_node` that id back and test it: it IS the sibling
    only if its `repo:` is that slug AND it has a `relates-to` (or
    `derived-from`) edge to `{{node}}` — yours or someone else's, a skipped
-   write that passes is success. A node that fails the test is an unrelated
-   collision: leave it alone, and probe `<id>-2` then `<id>-3` the same way
-   (write-with-skip, read, test), using the first that passes — the
-   orchestrator walks the same sequence, so you still meet on one node. If
-   `-3` also fails, or the write errored and the read finds nothing, nothing
-   is filed: do not narrow, do not resolve; go to the hand-back below.
+   write that passes is success. A node that fails the test is NOT the
+   sibling — nothing lands under a hashed id by accident, so it is a graph
+   anomaly: leave it alone, do not try another id (the orchestrator derives
+   the same one, and a second id is the fork this rule prevents), do not
+   narrow, do not resolve; go to the hand-back below and say what you found
+   under the id. If the write errored and the read finds nothing, nothing
+   is filed: same hand-back.
 2. **Narrow `{{node}}`'s own acceptance — with the marker, not a mention.**
    `{{node}}` counts as narrowed if and only if its body already carries this
    block naming THIS repo and an id that passed step 1's test:
@@ -226,7 +232,7 @@ failed run and is re-dispatched):
     ## HANDED BACK
     - repo: <other-repo slug> — <the acceptance text for that half, standing
       alone: which file(s), what must be true there, why it belongs here>
-      sibling: <the id you derived in step 1, with any probe suffix> (filed: yes|no)
+      sibling: <the id you derived in step 1> (filed: yes|no|anomaly — what sits under it)
       narrowed: no — <the exact error the narrowing write returned>
 
 Only if the two halves must land together to work at all (one half's tests

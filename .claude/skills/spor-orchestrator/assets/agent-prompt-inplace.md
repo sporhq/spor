@@ -175,18 +175,23 @@ Finish THIS repo's half here, then re-scope the node BEFORE you resolve it —
 a resolver against the node as written would claim the other half done. In
 order (you write these yourself even under an orchestrator — they are your own
 acceptance, not findings): (1) file the other repo's half as its own queue
-item under the DERIVED id `task-split-<{{node}} verbatim, type prefix
-included>-<other repo's canonical slug>` (the slug is that repo's `repo:`
-stamp value, e.g. `spor-server`, never a `repo-…` node id) with `put_node`
+item under the DERIVED id `task-split-<slug>-<hash>` — the slug is that
+repo's `repo:` stamp value (e.g. `spor-server`, never a `repo-…` node id;
+first 60 characters if longer), the hash the first 12 hex characters of the
+SHA-256 of `{{node}}`'s full id and that full slug, each followed by a
+newline (`printf '%s\n%s\n' '{{node}}' '<slug>' | sha256sum | cut -c1-12`;
+e.g. `issue-foo-bar` + `spor-server` → `task-split-spor-server-a543f6c75e9a`)
+— with `put_node`
 `if_exists: skip` (or `spor put-node - --if-exists skip`) — never
 `/spor:defer`/`spor add`, which mint a duplicate per retry — stamped to that
 repo, with enough acceptance text to stand alone and a `relates-to` edge to
 `{{node}}`; then `get_node` it back and test it: it is the sibling only if
 its `repo:` is that slug and it carries a `relates-to`/`derived-from` edge to
-`{{node}}` (a skipped write that passes is success). A node that fails is an
-unrelated collision: leave it, probe `<id>-2` then `<id>-3` the same way and
-use the first that passes; if `-3` fails too, or an error plus an empty read
-means nothing is filed: don't narrow, don't resolve, hand back below.
+`{{node}}` (a skipped write that passes is success). A node that fails is
+NOT the sibling — nothing lands under a hashed id by accident — so it is a
+graph anomaly: leave it, never try another id, don't narrow, don't resolve,
+hand back below saying what sits under the id; an error plus an empty read
+means nothing is filed: same hand-back.
 (2) `get_node` `{{node}}` for its revision and `put_node` (or
 `spor put-node - --if-exists update --revision <rev>`) the SAME body with
 this block appended — keep every other line of the body and every existing
@@ -237,5 +242,5 @@ work the orchestrator runs before it resolves this node:
 
     ## HANDED BACK
     - repo: <other-repo slug> — <the acceptance text for that half, standing alone>
-      sibling: <the derived id, with any probe suffix> (filed: yes|no)
+      sibling: <the derived id> (filed: yes|no|anomaly — what sits under it)
       narrowed: no — <the exact error the narrowing write returned>
