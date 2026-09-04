@@ -165,21 +165,29 @@ order, each a graph write you make yourself (the one exception to step 5's
 "don't write to the graph yourself": this is a piece of your own acceptance,
 not a finding):
 
-1. **File the sibling first, under a DERIVED id.** The id is
-   `task-<{{node}} with its type prefix stripped>-<other repo slug>` (so
-   `task-foo-bar` handed to `spor-server` gives `task-foo-bar-spor-server`);
-   never let `/spor:defer` or `spor add` mint one — a minted id is a fresh
-   duplicate on every retry and a second one if the orchestrator pre-split
-   this item. Write it with `put_node` `if_exists: skip` (or `spor put-node -
-   --if-exists skip`): a `task` stamped to that repo (`repo:`/`project:`),
-   carrying enough of the acceptance text to stand alone, with a `relates-to`
-   edge to `{{node}}`. Then `get_node` that id back: whatever is there after
-   the write — yours or someone else's — IS the sibling, and a skipped write
-   is success. If the write errored and the read finds nothing, nothing is
-   filed: do not narrow, do not resolve; go to the hand-back below.
+1. **File the sibling first, under a DERIVED id, and check it is yours.**
+   The id is `task-split-<{{node}} verbatim, type prefix included>-<other
+   repo's canonical slug>` — the slug is that repo's `repo:` stamp value
+   (kebab-case, e.g. `spor-server`; never a `repo-…` node id, a path, or a
+   display name) — so `task-foo-bar` handed to `spor-server` gives
+   `task-split-task-foo-bar-spor-server`. Never let `/spor:defer` or `spor
+   add` mint one — a minted id is a fresh duplicate on every retry and a
+   second one if the orchestrator pre-split this item. Write it with
+   `put_node` `if_exists: skip` (or `spor put-node - --if-exists skip`): a
+   `task` stamped to that repo (`repo:`/`project:` = the slug), carrying
+   enough of the acceptance text to stand alone, with a `relates-to` edge to
+   `{{node}}`. Then `get_node` that id back and test it: it IS the sibling
+   only if its `repo:` is that slug AND it has a `relates-to` (or
+   `derived-from`) edge to `{{node}}` — yours or someone else's, a skipped
+   write that passes is success. A node that fails the test is an unrelated
+   collision: leave it alone, and probe `<id>-2` then `<id>-3` the same way
+   (write-with-skip, read, test), using the first that passes — the
+   orchestrator walks the same sequence, so you still meet on one node. If
+   `-3` also fails, or the write errored and the read finds nothing, nothing
+   is filed: do not narrow, do not resolve; go to the hand-back below.
 2. **Narrow `{{node}}`'s own acceptance — with the marker, not a mention.**
    `{{node}}` counts as narrowed if and only if its body already carries this
-   block naming THIS repo and the id from step 1:
+   block naming THIS repo and an id that passed step 1's test:
 
    ```
    ## Scope (narrowed)
@@ -187,9 +195,10 @@ not a finding):
    sibling: <sibling id> — <other repo slug>: <one line: what lives there>
    ```
 
-   Skip this step only when that block is present with both values; the
-   sibling's id appearing elsewhere in the body, a `relates-to` edge alone,
-   or a prose "see also" is NOT narrowing — write the block. `get_node`
+   Skip this step only when that block is present with both values and the
+   id it names passes the test; the sibling's id appearing elsewhere in the
+   body, a `relates-to` edge alone, a prose "see also", or a marker naming a
+   collided id is NOT narrowing — write (or rewrite) the block. `get_node`
    `{{node}}` for its current revision, then `put_node` (or `spor put-node -
    --if-exists update --revision <rev>`) the SAME body with the block
    appended — keep every other line of the body and every existing edge
@@ -217,7 +226,7 @@ failed run and is re-dispatched):
     ## HANDED BACK
     - repo: <other-repo slug> — <the acceptance text for that half, standing
       alone: which file(s), what must be true there, why it belongs here>
-      sibling: <the id you derived in step 1> (filed: yes|no)
+      sibling: <the id you derived in step 1, with any probe suffix> (filed: yes|no)
       narrowed: no — <the exact error the narrowing write returned>
 
 Only if the two halves must land together to work at all (one half's tests

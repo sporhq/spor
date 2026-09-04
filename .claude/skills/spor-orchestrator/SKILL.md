@@ -206,15 +206,30 @@ loop:
   # --- supervise: wait for a change, then act ---
   wait_for_change()                       # see Waiting — don't spin
   for node in running whose agent is no longer active:
+      report = final_report(node)   # ALWAYS read it, resolved or not — a
+                                    #   HANDED BACK block is debt the graph
+                                    #   does not yet record, and a node that
+                                    #   another actor resolved meanwhile still
+                                    #   owes it. codex: read(running[node]
+                                    #   .report_path) — NOT agent-report.sh,
+                                    #   which only reads claude session
+                                    #   transcripts; a codex process never
+                                    #   writes one. Read the report_path `spor
+                                    #   dispatch` printed at launch (its Codex
+                                    #   supervisor writes Codex's final message
+                                    #   there). claude: scripts/agent-report.sh
+                                    #   <session>
+      if report has a HANDED BACK block:
+          if not split_handed_back(node, report):  # sibling + marker, run
+              continue          #   BEFORE the resolved check: it reconciles
+                                #   against the settled graph (already filed,
+                                #   already narrowed, already resolved —
+                                #   "The split contract"), so on a resolved
+                                #   node it files/repairs and writes no second
+                                #   resolver. Idempotent; keep in `running`,
+                                #   retry next turn, escalate after 3 turns.
+                                #   Nothing merges while the block is unmet.
       if not resolved_on_graph(node):
-          report = final_report(node)   # codex: read(running[node].report_path) —
-                                        #   NOT agent-report.sh, which only reads
-                                        #   claude session transcripts; a codex
-                                        #   process never writes one. Read the
-                                        #   report_path `spor dispatch` printed at
-                                        #   launch (its Codex supervisor writes
-                                        #   Codex's final message there).
-                                        # claude: scripts/agent-report.sh <session>
           if report says MERGE-READY and (running[node].kind == 'codex'
                                           or report has a HANDED BACK block):
               # Codex ALWAYS lands here (it never writes the graph). A Claude
@@ -222,10 +237,6 @@ loop:
               # and it handed the split back (HANDED BACK, `narrowed: no`) —
               # its work is done, only the graph is behind, so it is never a
               # Recover. See "The split contract".
-              if report has a HANDED BACK block:
-                  if not split_handed_back(node, report):  # sibling + marker,
-                      continue          #   idempotent; keep in `running`, retry
-                                        #   next turn, escalate after 3 turns.
               resolve_on_graph(node)   # writes the resolver + resolves edge +
                                         #   terminal status HERE (a no-op if the
                                         #   graph shows the node already resolved)
@@ -395,61 +406,91 @@ retry of the above — follows this contract, so that a second actor arriving
 at the same node finds the first one's work instead of duplicating it. The
 state lives on the graph itself; there is no run-record flag to lose.
 
-- **The sibling's id is derived, never minted:** `task-<original id with its
-  type prefix stripped>-<other repo slug>` — e.g.
-  `task-spor-docs-bulk-lease-endpoints` handed back to `spor` gives
-  `task-spor-docs-bulk-lease-endpoints-spor`; `issue-foo-bar` handed back to
-  `spor-server` gives `task-foo-bar-spor-server`. A `## HANDED BACK` block
-  names the id it derived, but you derive it yourself and use the rule's
-  answer, not the block's.
-- **File it with `put_node --if-exists skip`** (MCP `put_node` with
-  `if_exists: skip`, or `spor put-node - --if-exists skip`): a `task` stamped
-  to that repo (`repo:`/`project:`), body = the standalone acceptance text,
-  `relates-to` the original, and made agent-ready per "Triage each agent's
-  FINDINGS" (it is a piece of the item, not a finding, so it never waits for
-  that curation pass). Then **`get_node` the id back**: whatever exists under
-  it after the write — yours, or a concurrent actor's — IS the sibling. A
-  skipped write is success, not a duplicate. If the write errored AND the
-  read finds nothing, nothing has been filed: stop here, resolve nothing,
+- **The sibling's id is derived from two pinned inputs, never minted:**
+  `task-split-<original id>-<other repo slug>`, where the original id is the
+  node's full id VERBATIM (type prefix included — `issue-foo` and `task-foo`
+  must not collapse onto one sibling) and the repo slug is the other repo's
+  canonical `repo:` stamp value (the kebab-case slug of "Project slug
+  convention", e.g. `spor-server` — never the `repo-spor-server` node id, a
+  path, or a display name). E.g. `task-spor-docs-bulk-lease-endpoints`
+  handed back to `spor` gives `task-split-task-spor-docs-bulk-lease-endpoints-spor`;
+  `issue-foo-bar` handed back to `spor-server` gives
+  `task-split-issue-foo-bar-spor-server`. Every actor computes the id from
+  those two inputs; a `## HANDED BACK` block names the id it derived (and
+  MUST name the repo by that canonical slug), but you derive it yourself and
+  use the rule's answer, not the block's. If the acceptance spans more than
+  one other repo, each gets its own sibling under its own slug.
+- **File it with `put_node --if-exists skip`, then read it back and CHECK
+  IT IS THE SIBLING.** The write (MCP `put_node` with `if_exists: skip`, or
+  `spor put-node - --if-exists skip`) is a `task` stamped to that repo
+  (`repo:`/`project:` = the slug above), body = the standalone acceptance
+  text, a `relates-to` edge to the original, and made agent-ready per
+  "Triage each agent's FINDINGS" (it is a piece of the item, not a finding,
+  so it never waits for that curation pass). Then `get_node` the id back and
+  apply the identity test: the node under it is the sibling if and only if
+  its `repo:` stamp is that slug AND it carries a `relates-to` (or
+  `derived-from`) edge to the original id — both of which the write above
+  always sets, so a skipped write that passes the test is success, not a
+  duplicate, whoever wrote it. A node that FAILS the test is an unrelated
+  collision (the join is not injective: a genuine pre-existing
+  `task-split-…` id, or a slug that happens to end one id and start another):
+  it is NOT the sibling, do not narrow against it, and do not edit it.
+  Probe the next id in the fixed sequence `<derived>-2`, `<derived>-3` —
+  write-with-skip, read back, test — and use the first that passes; every
+  actor walks the same sequence from the same start, so concurrent actors
+  still converge on one node. If `-3` also collides, stop: nothing is filed,
+  resolve nothing, and escalate to the user (three collisions on a derived
+  id is a graph anomaly, not a retry). If the write errored AND the read
+  finds nothing, nothing has been filed either: stop here, resolve nothing,
   and retry next turn — the report that carries the block (the Codex
   `report_path`, the Claude transcript) is the durable record of the debt,
-  and this loop re-reads it every turn until the node is resolved.
+  and this loop re-reads it on every turn the node stays in `running`.
 - **Narrowing is the marker, not a mention.** The original is narrowed if and
   only if its body carries this block, verbatim in shape, naming THIS repo
-  and the derived id:
+  and a sibling id that PASSES the identity test above:
 
   ```
   ## Scope (narrowed)
   covers: <the agent's repo slug>
-  sibling: <derived sibling id> — <other repo slug>: <one line: what lives there>
+  sibling: <sibling id that passed the identity test> — <other repo slug>: <one line: what lives there>
   ```
 
   Skip the narrowing write only when that block is already present with
-  both values; the sibling's id appearing anywhere else in the body, a
-  `relates-to` edge alone, or a prose "see also" is NOT narrowing — write
-  the block. Write it with `get_node` → `put_node --if-exists update
-  --revision <rev>`, appending the block and keeping every other line of the
-  body and every existing edge intact (a full-node write replaces the whole
-  node), plus a `relates-to` edge to the sibling (idempotent).
+  both values and the named id tests as the sibling; the sibling's id
+  appearing anywhere else in the body, a `relates-to` edge alone, a prose
+  "see also", or a marker naming an id that fails the test (a collision
+  someone narrowed against) is NOT narrowing — write (or rewrite) the block
+  with the id that passed. Write it with `get_node` → `put_node --if-exists
+  update --revision <rev>`, appending the block and keeping every other line
+  of the body and every existing edge intact (a full-node write replaces the
+  whole node), plus a `relates-to` edge to the sibling (idempotent).
 - **Order is owe-first and every step is re-runnable:** sibling → marker →
   resolver. A crash or refused write at any point leaves at worst a filed
   sibling and an unresolved original — never a resolved original whose body
   still claims the other half. On any conflict (`--revision` stale, a 409),
   re-read and re-evaluate rather than re-send: the marker may now be there.
-- **Settled state wins over the retry.** On re-read, if the original is
-  already resolved (a live inbound `resolves` edge — trust the edge over
-  `status`): with the marker present, it is done — write nothing, fall
-  through to gate+merge; with the marker absent, someone resolved it against
-  the wider acceptance — still append the marker (a body edit is valid on a
-  resolved node and repairs the record), but never write a second resolver.
-  A sibling that is itself already terminal is fine to name — the pointer is
-  to settled work. Only the LAST step, the resolver, is conditional on the
-  node not yet being resolved.
+- **Settled state wins over the retry — and a settled node still owes the
+  block.** The contract runs whenever a report carries `## HANDED BACK`,
+  whether or not the node is already resolved (the supervisor loop reads
+  the report BEFORE its resolved check for exactly this reason). On
+  re-read, if the original is already resolved (a live inbound `resolves`
+  edge — trust the edge over `status`): the sibling is still filed if
+  missing (the debt is the other repo's work, and a resolver does not
+  discharge it); with the marker present and passing, it is done — write
+  nothing more, fall through to gate+merge; with the marker absent, someone
+  resolved it against the wider acceptance — still append the marker (a
+  body edit is valid on a resolved node and repairs the record), but never
+  write a second resolver. A sibling that is itself already terminal is
+  fine to name — the pointer is to settled work. Only the LAST step, the
+  resolver, is conditional on the node not yet being resolved; nothing
+  proceeds to gate+merge while the sibling is unfiled or the marker
+  missing.
 - **Bounded:** the supervisor keeps a node whose split has not gone through
   in `running` and retries the contract on each loop turn; after **3** turns
   it stops retrying and escalates to the user with the node, the derived
-  sibling id, what was filed, and where the report is — a slot is never held
-  forever on a graph that will not take the write.
+  sibling id (and any probe suffix reached), what was filed, and where the
+  report is — a slot is never held forever on a graph that will not take
+  the write.
 
 ### Waiting (don't burn turns spinning)
 
@@ -737,17 +778,23 @@ Two things close the gap:
    that lives in a repo the agent's worktree never covered, which Codex —
    unable to write the graph — could only report. Resolving the node as
    written would claim that half done, so run "The split contract" yourself
-   *before* `resolve_on_graph`, in its order: derive the sibling id, file it
-   with `put_node --if-exists skip` and read it back, append the `## Scope
-   (narrowed)` marker to the node under `--revision`, then resolve naming
-   the sibling's id in the resolver body. The sibling is ordinary queue
-   work: dispatch it next like any single-repo item. If any write in the
-   contract fails, do NOT resolve against the wider acceptance and do NOT
-   route the node through Recover (the work is done, only the graph is
+   *before* `resolve_on_graph`, in its order: derive the sibling id from the
+   node's full id and the block's canonical repo slug, file it with
+   `put_node --if-exists skip`, read it back and confirm it passes the
+   identity test (probing `-2`/`-3` past an unrelated collision), append the
+   `## Scope (narrowed)` marker to the node under `--revision`, then resolve
+   naming the sibling's id in the resolver body. The sibling is ordinary
+   queue work: dispatch it next like any single-repo item. If any write in
+   the contract fails, do NOT resolve against the wider acceptance and do
+   NOT route the node through Recover (the work is done, only the graph is
    behind): keep it in `running` and retry the whole contract next turn —
    every step is idempotent and the contract reconciles against whatever
    the graph holds by then (already filed, already narrowed, already
-   resolved by another actor); escalate to the user after 3 turns. A
+   resolved by another actor); escalate to the user after 3 turns. The
+   block is owed even when the node reads resolved by the time you get to
+   it (another actor, or a resolver that landed before a crash): the loop
+   reads the report first, files what is missing, repairs the marker, and
+   writes no second resolver — a resolved node never skips the block. A
    **Claude** agent whose own narrowing write was refused hands back the
    same block (with `narrowed: no`) under a `MERGE-READY` line and leaves
    its node unresolved — handle it identically, it is the same debt.
