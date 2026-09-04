@@ -748,15 +748,49 @@ test("a confirmed-open prior finding's `rows` are read, cleaned, capped, and fol
   ];
   const next = gates.applyReviewToLedger(ledger, v, 1);
   assert.deepStrictEqual(next[0].rows, f1.rows, "the reviewer's rows replace the earlier list");
+  assert.strictEqual(next[0].rowsCycle, 1, "stamped with the cycle that enumerated them");
+  assert.deepStrictEqual(next[0].earlierRows, [], "a fresh enumeration supersedes the earlier list outright");
   assert.deepStrictEqual(next[1].rows, [], "a resolved entry's rows are cleared");
-  assert.deepStrictEqual(gates.openPriorFindings(next).map((p) => [p.id, p.rows.length]), [["F1", 3]]);
-  // A later verdict that names no rows keeps the ledger's list (a verdict
-  // that says less does not erase a design an earlier review enumerated).
+  assert.deepStrictEqual(gates.openPriorFindings(next).map((p) => [p.id, p.rows.length, p.rowsCycle]), [["F1", 3, 1]]);
+  // A later verdict that names no rows does NOT inherit the ledger's list as
+  // its own enumeration (F1 on the second cut: stale rows suppressed the
+  // row-by-row flag and read as the current mechanism enumeration). This
+  // review's `rows` are empty — so F1, carried 2 fix cycles, reads
+  // row-by-row — and the earlier list rides beside them as history, stamped
+  // with the cycle it came from.
   const v2 = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","prior":[{"id":"F1","status":"open"}],"findings":[]}\n```', { prior: gates.openPriorFindings(next), cycle: 2 });
-  assert.deepStrictEqual(v2.findings[0].rows, f1.rows);
-  assert.deepStrictEqual(gates.applyReviewToLedger(next, v2, 2)[0].rows, f1.rows);
-  // …and a rollback of the cycle restores the rows the fold replaced.
+  assert.deepStrictEqual(v2.findings[0].rows, [], "a confirmation naming no rows carries none");
+  assert.deepStrictEqual(v2.findings[0].earlierRows, f1.rows);
+  assert.strictEqual(v2.findings[0].earlierRowsCycle, 1);
+  assert.deepStrictEqual(gates.rowByRowFindings(v2.findings, 2).map((f) => f.id), ["F1"], "an inherited list must not suppress the flag");
+  const after = gates.applyReviewToLedger(next, v2, 2);
+  assert.deepStrictEqual(after[0].rows, [], "the ledger's current rows are what the last review enumerated: none");
+  assert.strictEqual(after[0].rowsCycle, null);
+  assert.deepStrictEqual(after[0].earlierRows, f1.rows, "the earlier enumeration is kept as history");
+  assert.strictEqual(after[0].earlierRowsCycle, 1);
+  const replayed = gates.openPriorFindings(after)[0];
+  assert.deepStrictEqual([replayed.rows, replayed.earlierRows, replayed.earlierRowsCycle], [[], f1.rows, 1]);
+  // A third review that still names nothing keeps the same history (it is
+  // not re-stamped as the current cycle's), and one that enumerates anew
+  // supersedes it.
+  const v3 = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","prior":[{"id":"F1","status":"open"}],"findings":[]}\n```', { prior: gates.openPriorFindings(after), cycle: 3 });
+  assert.deepStrictEqual([v3.findings[0].rows, v3.findings[0].earlierRows, v3.findings[0].earlierRowsCycle], [[], f1.rows, 1]);
+  const after3 = gates.applyReviewToLedger(after, v3, 3);
+  assert.deepStrictEqual([after3[0].rows, after3[0].earlierRows, after3[0].earlierRowsCycle], [[], f1.rows, 1]);
+  const v4 = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","prior":[{"id":"F1","status":"open","rows":["row a","row b"]}],"findings":[]}\n```', { prior: gates.openPriorFindings(after3), cycle: 4 });
+  assert.deepStrictEqual([v4.findings[0].rows, v4.findings[0].earlierRows], [["row a", "row b"], []]);
+  assert.deepStrictEqual(gates.rowByRowFindings(v4.findings, 4), []);
+  const after4 = gates.applyReviewToLedger(after3, v4, 4);
+  assert.deepStrictEqual([after4[0].rows, after4[0].rowsCycle, after4[0].earlierRows, after4[0].earlierRowsCycle], [["row a", "row b"], 4, [], null]);
+  // A cleared finding drops both lists; an unanswered one carries only history.
+  const v5 = gates.parseReviewVerdict('```json\n{"verdict":"pass","prior":[{"id":"F1","status":"resolved"}],"findings":[]}\n```', { prior: gates.openPriorFindings(after4), cycle: 5 });
+  assert.deepStrictEqual([v5.prior[0].rows, v5.prior[0].earlierRows], [[], []]);
+  assert.deepStrictEqual(gates.applyReviewToLedger(after4, v5, 5)[0].earlierRows, []);
+  assert.deepStrictEqual(gates.carriedRowsOf({ rows: ["x", "y"], rowsCycle: 2 }, undefined), { rows: [], earlierRows: ["x", "y"], earlierRowsCycle: 2 });
+  // …and a rollback of a cycle restores the rows AND the history the fold moved.
   assert.deepStrictEqual(gates.rollbackCycle(next, 1)[0].rows, ["stale row from cycle 0"]);
+  const back = gates.rollbackCycle(after, 2)[0];
+  assert.deepStrictEqual([back.rows, back.rowsCycle, back.earlierRows, back.earlierRowsCycle], [f1.rows, 1, [], null]);
   // The row list is capped at 12.
   const many = gates.mechanismRows(Array.from({ length: 20 }, (_, i) => `row ${i}`));
   assert.strictEqual(many.length, 12);
@@ -793,4 +827,14 @@ test("row-by-row: a prior finding carried ROW_BY_ROW_CARRY+ fix cycles and confi
     { id: "F2", severity: "blocking", file: "b.js", summary: "b", blocking: true },
   ]);
   assert.strictEqual(text, "F1 [blocking, row-by-row] a.js — a\n    row: the Claude stream\n    row: the Codex stream\nF2 [blocking] b.js — b");
+  // An earlier enumeration the review did not re-confirm renders as history,
+  // never as `row:` — and only when the review enumerated nothing itself.
+  assert.strictEqual(
+    gates.renderFindings([{ id: "F1", severity: "blocking", file: "a.js", summary: "a", blocking: true, rowByRow: true, rows: [], earlierRows: ["the Claude stream"], earlierRowsCycle: 1 }]),
+    "F1 [blocking, row-by-row] a.js — a\n    row (enumerated at cycle 1, not re-confirmed by this review): the Claude stream"
+  );
+  assert.strictEqual(
+    gates.renderFindings([{ id: "F1", severity: "blocking", file: "a.js", summary: "a", blocking: true, rows: ["now"], earlierRows: ["then"], earlierRowsCycle: 1 }]),
+    "F1 [blocking] a.js — a\n    row: now"
+  );
 });

@@ -3211,14 +3211,21 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   // rows the last review enumerated, and makes `rows` required for it.
   const third = await deps.review({
     gate, cycle: 2,
-    prior: [{ id: "F1", severity: "blocking", file: "x.js", summary: "off by one", evidence: "node -e 'f(1)' prints 2", opened: 0, rows: ["the empty list"] }, { id: "F4", severity: "blocking", file: "y.js", summary: "new", opened: 1 }],
+    prior: [
+      { id: "F1", severity: "blocking", file: "x.js", summary: "off by one", evidence: "node -e 'f(1)' prints 2", opened: 0, rows: ["the empty list"], rowsCycle: 1 },
+      { id: "F4", severity: "blocking", file: "y.js", summary: "new", opened: 1 },
+      // F5: the last review confirmed it open WITHOUT rows; the enumeration
+      // an earlier review made is replayed as history, never as current.
+      { id: "F5", severity: "blocking", file: "z.js", summary: "stale", evidence: "node -e 'g()' throws", opened: 0, rows: [], earlierRows: ["row one", "row two"], earlierRowsCycle: 1 },
+    ],
     fix: { cycle: 1, runId: "fix-run-2", fromHead: head0, toHead: head1, findings: [{ id: "F1", blocking: true }] },
   });
   assert.strictEqual(third.ok, true, third.reason);
   const p2 = launches[2].prompt;
-  assert.match(p2, /F1 \[blocking, carried 2 fix cycles\] x\.js — off by one\n    evidence: [^\n]*\n    row \(enumerated by an earlier review\): the empty list/);
+  assert.match(p2, /F1 \[blocking, carried 2 fix cycles\] x\.js — off by one\n    evidence: [^\n]*\n    row \(enumerated by the last review, cycle 1\): the empty list/);
   assert.match(p2, /F4 \[blocking, carried 1 fix cycle\] y\.js — new/);
-  assert.match(p2, /F1 has already been carried through 2 or more fix cycles: if you confirm it open, `rows`\nis REQUIRED — a confirmation naming fewer than two rows is recorded as row-by-row/);
+  assert.match(p2, /F5 \[blocking, carried 2 fix cycles\] z\.js — stale\n    evidence: [^\n]*\n    row \(enumerated at cycle 1, NOT re-confirmed by the last review — re-enumerate if it still stands\): row one\n    row \(enumerated at cycle 1, NOT re-confirmed by the last review — re-enumerate if it still stands\): row two/);
+  assert.match(p2, /F1, F5 have already been carried through 2 or more fix cycles: if you confirm any of them open, `rows`\nis REQUIRED — a confirmation naming fewer than two rows is recorded as row-by-row/);
 
   // And the fix prompt names the findings by id, splits advisory from blocking,
   // and lists what earlier cycles already resolved.

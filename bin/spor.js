@@ -10764,7 +10764,12 @@ function makeGateDeps(
         (p) =>
           `${p.id} [${p.severity}${carriedOf(p) ? `, carried ${carriedOf(p)} fix cycle${carriedOf(p) === 1 ? "" : "s"}` : ""}] ${p.file ? `${p.file} — ` : ""}${p.summary}` +
           (p.evidence ? `\n    evidence: ${String(p.evidence).replace(/\s+/g, " ").slice(0, 400)}` : "") +
-          gatesKernel.mechanismRows(p.rows).map((r) => `\n    row (enumerated by an earlier review): ${r}`).join("")
+          gatesKernel.mechanismRows(p.rows).map((r) => `\n    row (enumerated by the last review${Number.isInteger(p.rowsCycle) ? `, cycle ${p.rowsCycle}` : ""}): ${r}`).join("") +
+          // An enumeration the LAST review did not re-confirm is replayed as
+          // history, never as the current row list (F1 on the second cut).
+          (gatesKernel.mechanismRows(p.rows).length ? [] : gatesKernel.mechanismRows(p.earlierRows))
+            .map((r) => `\n    row (enumerated at ${Number.isInteger(p.earlierRowsCycle) ? `cycle ${p.earlierRowsCycle}` : "an earlier cycle"}, NOT re-confirmed by the last review — re-enumerate if it still stands): ${r}`)
+            .join("")
       )
       .join("\n");
     const raisedText = raised

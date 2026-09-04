@@ -1066,7 +1066,14 @@ still names fewer than two rows is recorded **row-by-row** on the finding, on
 the gate's fact (`[blocking, row-by-row]`) and in the refusal's detail
 (`gates.rowByRowFindings`). The rows ride the finding ledger (folded by
 `applyReviewToLedger`, cleared when the entry resolves, restored by
-`rollbackCycle`, replayed to the next review), and the fix-cycle prompt hands
+`rollbackCycle`, replayed to the next review) — and they are always the LAST
+review's own enumeration: a confirmation that names no rows carries none (so
+the row-by-row check reads what that review said, never a list an earlier
+review made), and the earlier list moves to `earlierRows`, stamped with the
+cycle it was enumerated at (`earlierRowsCycle`), replayed to the reviewer, the
+fixer and the fact as history ("enumerated at cycle N, not re-confirmed") —
+never as the current mechanism enumeration. A fresh enumeration supersedes it
+(`gates.carriedRowsOf`). The fix-cycle prompt hands
 the fixer the same list under the finding, says how many cycles it has
 survived, and asks it to enumerate the rows ITSELF — whether or not the
 review listed them — and to state in the commit message which rows the fix
