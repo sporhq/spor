@@ -1874,7 +1874,7 @@ test("makeCodeMovedNotice says once per new tip that the loaded code was moved p
   const two = g("rev-parse", "--short", "HEAD");
   notice(); notice();
   assert.strictEqual(lines.length, 1, "said once per new tip, not once per pass");
-  assert.match(lines[0], new RegExp(`moved to ${two} \\(main\\) — this worker still runs the code it loaded at ${loaded.commit}; restart it`));
+  assert.match(lines[0], new RegExp(`^work: main in .* moved to ${two} — this worker still runs the code it loaded at ${loaded.commit}; restart it`));
   // The pass that says so returns the new tip (what --restart-on-land acts
   // on); a quiet pass returns nothing.
   assert.strictEqual(notice(), undefined, "a quiet pass returns nothing");
@@ -1902,6 +1902,86 @@ test("makeCodeMovedNotice says once per new tip that the loaded code was moved p
   assert.strictEqual(loadedCodeCommit(sub), null, "an untracked package dir is not a source checkout");
   g("add", "packages"); g("commit", "-q", "-m", "monorepo");
   assert.deepStrictEqual(loadedCodeCommit(sub), { commit: g("rev-parse", "--short", "HEAD"), branch: "main" }, "a tracked monorepo package IS a source checkout");
+  // F1 (review of task-spor-work-announce-lib-commit-and-notice-main-moved):
+  // the notice watches a REF and tests ANCESTRY — "main moved past the loaded
+  // code" — never bare HEAD-differs. A branch switch in the worker's linked
+  // checkout, a bisect checkout of an older commit, or a rewind of the branch
+  // are not a land and say nothing (and so never drain a --restart-on-land
+  // worker); the branch moving on to a descendant of the loaded commit does.
+  const { codeWatchRef } = require("../bin/spor.js");
+  const three = g("rev-parse", "--short", "HEAD");
+  const loaded3 = loadedCodeCommit(repo);
+  assert.deepStrictEqual(loaded3, { commit: three, branch: "main" });
+  assert.strictEqual(codeWatchRef(loaded3, { root: repo }), "main", "watches the loaded branch by default");
+  assert.strictEqual(codeWatchRef(loaded3, { root: repo, targetRef: "origin/main" }), "main", "a declared target that does not resolve here falls back to the loaded branch");
+  assert.strictEqual(codeWatchRef(null, { root: repo }), null);
+  const f1 = [];
+  const notice3 = makeCodeMovedNotice(loaded3, { root: repo, log: (l) => f1.push(l) });
+  g("checkout", "-q", "-b", "side");
+  fs.writeFileSync(path.join(repo, "a"), "side\n");
+  g("commit", "-q", "-am", "side work");
+  assert.strictEqual(notice3(), undefined, "HEAD on another branch is not main moving past the loaded code");
+  g("checkout", "-q", "--detach", `${three}~1`);
+  assert.strictEqual(notice3(), undefined, "a bisect checkout of an older commit is not a land");
+  g("checkout", "-q", "main");
+  g("reset", "-q", "--hard", `${three}~1`);
+  assert.strictEqual(notice3(), undefined, "a rewound main is not a land");
+  assert.deepStrictEqual(f1, [], "none of those said anything");
+  g("reset", "-q", "--hard", three);
+  assert.strictEqual(notice3(), undefined, "main back at the loaded commit is not a move");
+  g("merge", "-q", "--no-edit", "side");
+  const merged = g("rev-parse", "--short", "HEAD");
+  assert.strictEqual(notice3(), merged, "main advancing to a descendant of the loaded commit IS a land");
+  assert.strictEqual(f1.length, 1);
+  assert.match(f1[0], new RegExp(`^work: main in .* moved to ${merged} —`));
+  // …and it is main that is watched, wherever HEAD sits: a later land on main
+  // is noticed while HEAD is parked elsewhere.
+  g("checkout", "-q", "--detach", three);
+  assert.strictEqual(notice3(), undefined, "same tip, said once");
+  g("branch", "-f", "main", "side");
+  assert.strictEqual(notice3(), undefined, "main forced to a non-descendant says nothing");
+  g("checkout", "-q", "main");
+  g("merge", "-q", "--no-edit", merged);
+  assert.strictEqual(notice3(), undefined, "a fast-forward back to the tip already reported says nothing new");
+  fs.writeFileSync(path.join(repo, "a"), "four\n");
+  g("commit", "-q", "-am", "four");
+  assert.strictEqual(notice3(), g("rev-parse", "--short", "HEAD"), "a further land on main, descending from the loaded commit, is noticed");
+  // A factory's integration target that resolves in the checkout is watched
+  // in preference to the loaded branch.
+  g("branch", "release", three);
+  const rel = makeCodeMovedNotice(loaded3, { root: repo, log: () => {}, ref: codeWatchRef(loaded3, { root: repo, targetRef: "release" }) });
+  assert.strictEqual(codeWatchRef(loaded3, { root: repo, targetRef: "release" }), "release");
+  assert.strictEqual(rel(), undefined, "release has not moved");
+  g("branch", "-f", "release", "main");
+  assert.strictEqual(rel(), g("rev-parse", "--short", "main"), "release moving past the loaded commit is noticed");
+  // F2: the probe and the notice go through the env-scrubbed git spawn — an
+  // ambient GIT_DIR naming ANOTHER repository must not make the worker
+  // announce, watch, or drain on that repository's commits.
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-other-"));
+  const og = (...args) => execFileSync("git", ["-C", other, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  og("init", "-q", "-b", "main");
+  fs.writeFileSync(path.join(other, "package.json"), "{}\n");
+  og("add", "."); og("commit", "-q", "-m", "elsewhere");
+  // (Expected values are read BEFORE the env is poisoned: the test's own git
+  // helper is deliberately not scrubbed, so it would follow the leak too.)
+  const hereHead = g("rev-parse", "--short", "HEAD");
+  const otherHead = og("rev-parse", "--short", "HEAD");
+  const savedEnv = { GIT_DIR: process.env.GIT_DIR, GIT_WORK_TREE: process.env.GIT_WORK_TREE };
+  process.env.GIT_DIR = path.join(other, ".git");
+  process.env.GIT_WORK_TREE = other;
+  try {
+    const here = loadedCodeCommit(repo);
+    assert.strictEqual(here.commit, hereHead, "announces this checkout's commit, not the ambient GIT_DIR's");
+    assert.notStrictEqual(here.commit, otherHead);
+    const f2 = [];
+    const n = makeCodeMovedNotice(here, { root: repo, log: (l) => f2.push(l) });
+    fs.writeFileSync(path.join(other, "b"), "x\n");
+    og("add", "."); og("commit", "-q", "-m", "elsewhere moves");
+    assert.strictEqual(n(), undefined, "the other repository moving is not this checkout moving");
+    assert.deepStrictEqual(f2, []);
+  } finally {
+    for (const [k, v] of Object.entries(savedEnv)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
   // Not a git checkout (an npm install): nothing is known, nothing is said.
   const plain = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-plain-"));
   assert.strictEqual(loadedCodeCommit(plain), null);

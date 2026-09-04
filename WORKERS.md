@@ -1106,16 +1106,29 @@ worker says at startup which code it runs — the checkout's commit and branch
 when the package root is a SOURCE checkout (its own `package.json` is tracked
 from there — git walks up, so an npm install nested under a consumer's
 `node_modules/` would otherwise answer with the consumer's commit), the
-package version when it is an install — and, once per pass, logs a one-line notice the first time that
-checkout has moved past the loaded commit (once per new tip, never once per
-pass). It never restarts itself: which code a worker runs is the operator's
-call; the notice only makes the drift visible in the log rather than
-discoverable after a pipeline ran stale.
+package version when it is an install — and, once per pass, logs a one-line notice the first time the
+watched ref has moved PAST the loaded commit (once per new tip, never once per
+pass). "Moved past" is a statement about a ref and its ancestry, never about
+HEAD: the worker watches the factory's declared integration `target_ref` when
+it resolves in the code checkout (a self-hosting factory lands onto it), else
+the branch the code was loaded from, else HEAD only when it was loaded detached
+with nothing declared — and it reports a move only when that ref's tip is a
+different commit that DESCENDS from the loaded one (`merge-base
+--is-ancestor`). A branch switch or bisect checkout in a linked worker
+checkout, a rewound branch, or a ref forced to an unrelated history changes
+HEAD without anything having landed, and says nothing. Every git read here goes
+through the env-scrubbed spawn the rest of the CLI uses, so an ambient
+`GIT_DIR`/`GIT_WORK_TREE` cannot make the worker announce or watch another
+repository's commits. It never restarts itself: which code a worker runs is
+the operator's call; the notice only makes the drift visible in the log rather
+than discoverable after a pipeline ran stale.
 
 The operator can make that call once, up front: `--restart-on-land`
 (`work.restartOnLand`, `SPOR_WORK_RESTART_ON_LAND=1`; off by default) is for a
 self-hosting factory whose worker runs from the very checkout its own pipelines
-land onto. The first time that checkout moves past the loaded code, the worker
+land onto. The first time the watched ref moves past the loaded code (a
+descendant tip — the same test as the notice, so a branch switch or rewind in
+the checkout never drains the worker), the worker
 stops taking new work and exits cleanly once every run and gate pipeline in
 flight has settled — a drain, not a stop, so no pipeline is abandoned for the
 restarted worker to re-run from gate 0 — with `stop_reason` naming the tip it

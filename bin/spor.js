@@ -12505,38 +12505,80 @@ async function writeRegateArtifact(cfg, { record, entry, factoryId, previous, re
 function loadedCodeCommit(root = ROOT) {
   try {
     if (path.resolve(root).split(path.sep).includes("node_modules")) return null;
-    const tracked = spawnSync("git", ["-C", root, "ls-files", "--error-unmatch", "--", "package.json"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] });
-    if (tracked.status !== 0 || !String(tracked.stdout || "").trim()) return null;
-    const r = spawnSync("git", ["-C", root, "rev-parse", "--short", "HEAD"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] });
-    if (r.status !== 0) return null;
-    const commit = String(r.stdout || "").trim();
+    const tracked = codeGit(root, ["ls-files", "--error-unmatch", "--", "package.json"]);
+    if (tracked == null || !tracked.trim()) return null;
+    const commit = (codeGit(root, ["rev-parse", "--short", "HEAD"]) || "").trim();
     if (!commit) return null;
-    const b = spawnSync("git", ["-C", root, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] });
-    const branch = b.status === 0 ? String(b.stdout || "").trim() : "";
+    const branch = (codeGit(root, ["rev-parse", "--abbrev-ref", "HEAD"]) || "").trim();
     return { commit, branch: branch && branch !== "HEAD" ? branch : null };
   } catch {
     return null;
   }
 }
 
-// The per-pass notice for the above: when the checkout the worker loaded its
-// code from has moved past that commit, say so ONCE per new tip — the worker
-// still runs what it loaded, and the operator's remedy is a restart. A
-// checkout that is not a git checkout, or one that has not moved, says
-// nothing (byte-identical to before the notice existed). Returns the new tip
-// on the pass that says so, undefined otherwise.
-function makeCodeMovedNotice(loaded, { root = ROOT, log = () => {} } = {}) {
+// Every git read the probe and the notice make goes through the env-scrubbed
+// `gitSpawn` (lib/shell/git-exec.js, dec-spor-dispatch-git-location-env-scrub)
+// like the rest of the CLI: git takes its repository from an ambient
+// GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR before it discovers one from `cwd`, so
+// a bare spawn under a leaked variable would announce — and, under
+// `--restart-on-land`, drain on — a DIFFERENT repository's commit (review
+// finding F2 on task-spor-work-announce-lib-commit-and-notice-main-moved).
+// Bounded (3s) and fail-soft: stdout on exit 0, null otherwise.
+function codeGit(root, args) {
+  const r = gitSpawn(root, args, { timeout: 3000, stdio: ["ignore", "pipe", "ignore"] });
+  return r.status === 0 ? String(r.stdout || "") : null;
+}
+
+// Which ref the notice below WATCHES — "main moved past the loaded code" is a
+// statement about a ref, not about whatever HEAD happens to be: a linked
+// worker checkout switching branches, a `git checkout <older>` to bisect, or
+// a rewound HEAD all change HEAD without anything having landed (review
+// finding F1). Preference: the factory's declared integration target (the
+// ref its own pipelines land onto — a self-hosting factory's `target_ref`),
+// when it resolves to a commit in the code checkout; else the branch the
+// code was loaded from; else (a detached HEAD, nothing declared) HEAD itself.
+// null when there is no source checkout to watch.
+function codeWatchRef(loaded, { root = ROOT, targetRef = null } = {}) {
+  if (!loaded) return null;
+  const candidates = [targetRef, loaded.branch].map((r) => String(r || "").trim()).filter(Boolean);
+  for (const ref of candidates) {
+    if (codeGit(root, ["rev-parse", "--verify", "-q", `${ref}^{commit}`]) != null) return ref;
+  }
+  return "HEAD";
+}
+
+// The per-pass notice for the above: when the watched ref has moved PAST the
+// commit the worker loaded — its tip is a different commit that DESCENDS from
+// the loaded one (`merge-base --is-ancestor`), i.e. something landed on top of
+// the loaded code — say so ONCE per new tip; the worker still runs what it
+// loaded, and the operator's remedy is a restart. A tip that does not descend
+// from the loaded commit (a branch switch, a bisect checkout, a rewind, an
+// unrelated history) is not a land and says nothing — and, under
+// `--restart-on-land`, does not drain the worker. A checkout that is not a git
+// checkout, or a ref that has not moved, says nothing (byte-identical to
+// before the notice existed). Returns the new tip on the pass that says so,
+// undefined otherwise.
+function makeCodeMovedNotice(loaded, { root = ROOT, log = () => {}, ref = null } = {}) {
   let noticed = loaded ? loaded.commit : null;
+  const watch = ref || codeWatchRef(loaded, { root });
   return () => {
-    if (!loaded) return;
-    const now = loadedCodeCommit(root);
-    if (!now || now.commit === noticed) return;
-    noticed = now.commit;
-    log(`work: ${root} moved to ${now.commit}${now.branch ? ` (${now.branch})` : ""} — this worker still runs the code it loaded at ${loaded.commit}; restart it to pick the new code up`);
+    if (!loaded || !watch) return;
+    const now = (codeGit(root, ["rev-parse", "--short", `${watch}^{commit}`]) || "").trim();
+    if (!now || now === noticed || now === loaded.commit) return;
+    // Abbreviations grow as a repo does, so compare the OBJECTS: a longer
+    // spelling of the loaded commit is not a move.
+    const full = (r) => (codeGit(root, ["rev-parse", "--verify", "-q", `${r}^{commit}`]) || "").trim();
+    if (full(now) && full(now) === full(loaded.commit)) return;
+    // Remember the tip either way, so an unrelated tip is examined once and a
+    // later descendant tip is still noticed.
+    noticed = now;
+    const anc = gitSpawn(root, ["merge-base", "--is-ancestor", loaded.commit, now], { timeout: 3000, stdio: "ignore" });
+    if (anc.status !== 0) return;
+    log(`work: ${watch} in ${root} moved to ${now} — this worker still runs the code it loaded at ${loaded.commit}; restart it to pick the new code up`);
     // The tip moved past, for a caller that acts on it (`--restart-on-land`);
     // every other return above is undefined, so a caller that ignores it
     // sees nothing new.
-    return now.commit;
+    return now;
   };
 }
 
@@ -12872,7 +12914,13 @@ async function cmdWork(cfg, { values }) {
       ? `work: running ${ROOT} at ${loadedCode.commit}${loadedCode.branch ? ` (${loadedCode.branch})` : ""} — a worker keeps the code it loaded; restart it after a land you want it to run`
       : `work: running @sporhq/spor ${require(path.join(ROOT, "package.json")).version} from ${ROOT} — a worker keeps the code it loaded; restart it after an upgrade you want it to run`
   );
-  const noticeCode = makeCodeMovedNotice(loadedCode, { root: ROOT, log: (line) => out(line) });
+  // The ref watched is the factory's integration target when it resolves in
+  // this checkout (a self-hosting factory lands onto it), else the branch the
+  // code was loaded from — never bare HEAD while a branch is known, so a branch
+  // switch or bisect in a linked worker checkout is not mistaken for a land.
+  const watchRef = codeWatchRef(loadedCode, { root: ROOT, targetRef: factory && factory.integration ? factory.integration.targetRef : null });
+  if (loadedCode && watchRef) out(`work: watching ${watchRef} in ${ROOT} for a commit that moves past ${loadedCode.commit}`);
+  const noticeCode = makeCodeMovedNotice(loadedCode, { root: ROOT, log: (line) => out(line), ref: watchRef });
   // The flag needs a checkout to watch: an npm install never moves under the
   // worker (it is replaced by an upgrade), so say once that it is inert.
   if (restartOnLand && !loadedCode) out(`work: --restart-on-land has nothing to watch — ${ROOT} is not a source checkout; the worker runs until stopped`);
@@ -15520,7 +15568,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { loadedCodeCommit, makeCodeMovedNotice, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
+module.exports = { loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
 
 if (require.main === module) {
   main()
