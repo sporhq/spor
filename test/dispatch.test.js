@@ -267,9 +267,15 @@ test("dispatch from inside a git worktree (local, stubbed): registers the MAIN c
   const mapped = Object.values(JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8")).dispatch.repos);
   assert.ok(mapped.some((p) => slashPath(p).endsWith("/wt-main-svc")), `main checkout registered (got ${JSON.stringify(mapped)})`);
   assert.ok(!mapped.some((p) => slashPath(p).endsWith("/wt-ephemeral-checkout")), "ephemeral worktree path NOT registered");
-  // Retried: on Windows the just-launched (detached) stub can still hold the
-  // worktree as its cwd for a beat, and rm of a held directory is EPERM there.
-  fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  // Best-effort: on Windows the just-launched detached supervisor still holds
+  // the worktree as its cwd, and rm of a held directory is EPERM there — the
+  // launch is what this test asserts, and a temp dir left behind is what every
+  // other fixture in this file does anyway.
+  try {
+    fs.rmSync(base, { recursive: true, force: true });
+  } catch {
+    /* held by the detached launch on Windows */
+  }
 });
 
 test("dispatch <node-id>: auto-detects node mode and resolves the dir cross-repo via the map", () => {

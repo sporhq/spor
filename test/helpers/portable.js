@@ -45,8 +45,12 @@ function nodeCommand(file) {
 function writeSpawnableNodeStub(dir, name, body) {
   const js = writeNodeScript(path.join(dir, `${name}.js`), body);
   if (process.platform !== "win32") return js;
+  // The wrapper names its .js twin RELATIVE to itself (%~dp0), so the pair
+  // travels together: a stub committed into a repo and cut into a worktree
+  // runs the worktree's copy, not the main checkout's (which a test may have
+  // deleted to stage a stale checkout).
   const cmd = path.join(dir, `${name}.cmd`);
-  fs.writeFileSync(cmd, `@echo off\r\n"${process.execPath}" "${js}" %*\r\nexit /b %errorlevel%\r\n`);
+  fs.writeFileSync(cmd, `@echo off\r\n"${process.execPath}" "%~dp0${name}.js" %*\r\nexit /b %errorlevel%\r\n`);
   return cmd;
 }
 

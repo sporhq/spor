@@ -535,6 +535,7 @@ function proposeRepo(branchName) {
   execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
   git(dir, "config", "user.email", "t@t");
   git(dir, "config", "user.name", "Test");
+  git(dir, "config", "core.autocrlf", "false"); // the checked-out BYTES are compared below; the Windows CI runner's global autocrlf would rewrite them
   fs.writeFileSync(path.join(dir, "f.txt"), "base\n");
   git(dir, "add", "-A");
   git(dir, "commit", "-q", "-m", "base");
@@ -1310,6 +1311,7 @@ function integrationRepo() {
   execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
   git(dir, "config", "user.email", "t@t");
   git(dir, "config", "user.name", "Test");
+  git(dir, "config", "core.autocrlf", "false"); // the checked-out BYTES are compared below; the Windows CI runner's global autocrlf would rewrite them
   fs.mkdirSync(path.join(dir, "test"), { recursive: true });
   fs.mkdirSync(path.join(dir, "lib"), { recursive: true });
   fs.writeFileSync(path.join(dir, ".spor"), "project: demo\n");
@@ -1361,6 +1363,7 @@ test("buildCandidateTree reports a real merge conflict, aborts cleanly, and leav
   execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
   git(dir, "config", "user.email", "t@t");
   git(dir, "config", "user.name", "Test");
+  git(dir, "config", "core.autocrlf", "false"); // the checked-out BYTES are compared below; the Windows CI runner's global autocrlf would rewrite them
   fs.writeFileSync(path.join(dir, "f.txt"), "base\n");
   git(dir, "add", "-A");
   git(dir, "commit", "-q", "-m", "base");
@@ -1855,6 +1858,7 @@ function reconcileRepo() {
   execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
   git(dir, "config", "user.email", "t@t");
   git(dir, "config", "user.name", "Test");
+  git(dir, "config", "core.autocrlf", "false"); // the checked-out BYTES are compared below; the Windows CI runner's global autocrlf would rewrite them
   for (const f of ["modified.txt", "deleted.txt", "collides.txt", "untouched.txt"]) fs.writeFileSync(path.join(dir, f), `${f} v1\n`);
   git(dir, "add", "-A");
   git(dir, "commit", "-q", "-m", "trusted");
