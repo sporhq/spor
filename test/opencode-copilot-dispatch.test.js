@@ -29,6 +29,7 @@ const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const dispatchHarnesses = require("../lib/shell/dispatch-harnesses.js");
 const { getHarness, harnesses } = dispatchHarnesses;
 const { writeSpawnableNodeStub, pathWithOnlyGit, pathWithOnlyGitAndNode } = require("./helpers/portable.js");
+const { waitFor, awaitJson, awaitRecord, stubExitTail } = require("./helpers/launch.js");
 
 function cleanEnv(extra = {}) {
   const env = {};
@@ -93,7 +94,7 @@ const STUB_TAIL = `
   }, null, 2));
 `;
 
-function harnessStub(home, harness, { exitCode = 0, delayMs = 0, stderr = "" } = {}) {
+function harnessStub(home, harness, { exitCode = 0, delayMs = 0, stderr = "", holdFile = null } = {}) {
   const emit = harness === "opencode"
     ? `
   process.stdout.write(JSON.stringify({ type: "step_start", sessionID: "ses_fixture", part: { type: "step-start" } }) + "\\n");
@@ -115,41 +116,13 @@ process.stdin.on("data", (chunk) => { prompt += chunk; });
 process.stdin.on("end", () => {
 ${STUB_TAIL}${emit}
   if (${JSON.stringify(stderr)}) process.stderr.write(${JSON.stringify(stderr)} + "\\n");
-  setTimeout(() => process.exit(${exitCode}), ${delayMs});
+  ${stubExitTail({ holdFile, exitCode, delayMs })}
 });
 `);
 }
 
 const SESSIONS = { opencode: "ses_fixture", copilot: "copilot-session-fixture" };
 const CMD_ENV = { opencode: "SPOR_OPENCODE_CMD", copilot: "SPOR_COPILOT_CMD" };
-
-async function waitFor(read, { timeoutMs = 5000, intervalMs = 25 } = {}) {
-  const end = Date.now() + timeoutMs;
-  while (Date.now() < end) {
-    const value = read();
-    if (value) return value;
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-  return null;
-}
-
-function awaitJson(file) {
-  return waitFor(() => {
-    try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; }
-  });
-}
-
-function awaitRecord(home, predicate, opts) {
-  const runDir = path.join(home, "journal", "dispatch");
-  return waitFor(() => {
-    if (!fs.existsSync(runDir)) return null;
-    const file = fs.readdirSync(runDir).find((name) => name.endsWith(".run.json"));
-    if (!file) return null;
-    let record;
-    try { record = JSON.parse(fs.readFileSync(path.join(runDir, file), "utf8")); } catch { return null; }
-    return predicate(record) ? record : null;
-  }, opts);
-}
 
 // ---- the registry contract -------------------------------------------------
 
@@ -436,20 +409,21 @@ for (const harness of ["opencode", "copilot"]) {
   test(`${harness} adapter launches detached, binds its session, and writes the report from its event stream`, async () => {
     const { home, repo } = fixture(harness);
     const outfile = path.join(home, "invocation.json");
-    // The stub stays alive well past the launch handshake, so a launcher that
-    // waited for the RUN could not come in under the bound below.
-    const stub = harnessStub(home, harness, { delayMs: 3000 });
-    const started = Date.now();
+    // The stub does not exit until the test releases it, so "dispatch returned
+    // before the run ended" is an ORDERING fact — the run record cannot be
+    // terminal while the child is still held — not a wall-clock bound a loaded
+    // box turns into a flake (issue-spor-declared-harness-dispatch-timing-flake).
+    const release = path.join(home, "release-the-stub");
+    const stub = harnessStub(home, harness, { holdFile: release });
     const result = run(
       ["dispatch", `task-${harness}`, "--dir", repo, "--profile", `profile-${harness}`, "--no-brief"],
       { SPOR_HOME: home, [CMD_ENV[harness]]: stub, OUTFILE: outfile }
     );
     assert.strictEqual(result.status, 0, result.stderr);
-    assert.ok(
-      Date.now() - started < 2500,
-      "dispatch returns after the launch handshake, not after the 3s run"
+    assert.match(
+      result.stdout, /supervisor (launching|running)/,
+      "dispatch returns after the launch handshake, not after the run"
     );
-    assert.match(result.stdout, /supervisor (launching|running|done)/);
 
     const invocation = await awaitJson(outfile);
     assert.ok(invocation, "the detached stub ran");
@@ -478,6 +452,11 @@ for (const harness of ["opencode", "copilot"]) {
     assert.ok(invocation.args.includes("profile-model"), "the profile's model reaches the real invocation");
     assert.ok(!invocation.args.some((a) => a.includes("Implement the")), "the prompt never enters argv");
 
+    const live = await awaitRecord(home, () => true);
+    assert.ok(live, "the supervisor opened a run record");
+    assert.notStrictEqual(live.state, "done", "the run is still going after dispatch has returned — the launcher did not wait for it");
+
+    fs.writeFileSync(release, "");
     const finished = await awaitRecord(home, (r) => r.state === "done", { timeoutMs: 15000 });
     assert.ok(finished, "the supervisor records terminal success");
     assert.strictEqual(finished.harness, harness);

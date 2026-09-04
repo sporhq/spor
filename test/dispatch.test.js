@@ -15,6 +15,7 @@ const path = require("node:path");
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const u = require(path.join(__dirname, "..", "scripts", "engines", "util.js"));
 const { pathWithOnlyGitAndNode, writeSpawnableNodeStub } = require("./helpers/portable");
+const { waitForFile } = require("./helpers/launch.js");
 
 // Env with no SPOR_*/SUBSTRATE_* leakage; force LOCAL mode (no server). Also
 // isolate the config-cascade homes to an empty temp dir so the developer's real
@@ -53,23 +54,6 @@ function run(args, env, cwd) {
 // DETACHED grandchild — so a launch is observed by waiting for the stub's
 // marker file rather than reading it the instant the CLI returns.
 const NATIVE_BG = { SPOR_DISPATCH_CLAUDE_LAUNCH_MODE: "native-background" };
-async function waitForFile(file, { timeoutMs = 10000, intervalMs = 25 } = {}) {
-  const end = Date.now() + timeoutMs;
-  // Wait for CONTENT, not mere existence: every stub writes its record with
-  // one writeFileSync, whose truncating open() and write() are two syscalls,
-  // so under a loaded full suite a poll can land between them and read ''
-  // (art-gate-acceptance-spor-claude-bg-prose-sweep-aft-febdf471-53e607fa —
-  // a launch that had happened read as "launched inside the worktree" ''). No
-  // caller ever accepted an empty read (`assert.ok('')` fails), so this only
-  // removes the race.
-  for (;;) {
-    let text = null;
-    try { text = fs.readFileSync(file, "utf8"); } catch { /* not yet */ }
-    if (text) return text;
-    if (Date.now() >= end) return text;
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-}
 
 function slashPath(p) {
   return String(p || "").replace(/\\/g, "/").toLowerCase();

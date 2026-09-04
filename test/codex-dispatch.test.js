@@ -15,6 +15,7 @@ const path = require("node:path");
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const { getHarness, harnesses, codexPrepareRun } = require("../lib/shell/dispatch-harnesses.js");
 const { writeSpawnableNodeStub, writeNodeScript } = require("./helpers/portable.js");
+const { waitFor, awaitJson, awaitRecord, stubExitTail } = require("./helpers/launch.js");
 
 function cleanEnv(extra = {}) {
   const env = {};
@@ -81,7 +82,7 @@ Codex test profile.
   return { home, nodes, repo };
 }
 
-function codexStub(home, { delayMs = 0, exitCode = 0 } = {}) {
+function codexStub(home, { delayMs = 0, exitCode = 0, holdFile = null } = {}) {
   return writeSpawnableNodeStub(home, "codex-stub", `
 const fs = require("node:fs");
 let prompt = "";
@@ -102,27 +103,9 @@ process.stdin.on("end", () => {
     internalChildToken: process.env.SPOR_DISPATCH_CHILD_TOKEN || null,
   }, null, 2));
   process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "codex-thread-fixture" }) + "\\n");
-  setTimeout(() => process.exit(${exitCode}), ${delayMs});
+  ${stubExitTail({ holdFile, exitCode, delayMs })}
 });
 `);
-}
-
-async function waitFor(read, { timeoutMs = 5000, intervalMs = 25 } = {}) {
-  const end = Date.now() + timeoutMs;
-  while (Date.now() < end) {
-    const value = read();
-    if (value) return value;
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-  return null;
-}
-
-// The detached stub writes this file WHILE we poll for it, so a torn read is
-// expected under load — retry instead of failing the test on partial JSON.
-function awaitJson(file) {
-  return waitFor(() => {
-    try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; }
-  });
 }
 
 test("dispatch harness registry exposes one uniform adapter contract", () => {
@@ -192,15 +175,18 @@ test("--read-only dispatches Codex under --sandbox read-only, overriding a passt
 test("Codex adapter launches detached, captures JSONL session, prompt, cwd, and report", async () => {
   const { home, repo } = fixture();
   const outfile = path.join(home, "codex-invocation.json");
-  const stub = codexStub(home, { delayMs: 150 });
-  const started = Date.now();
+  // The stub does not exit until the test releases it, so "dispatch returned
+  // before the run ended" is an ORDERING fact — the run record cannot be
+  // terminal while the child is still held — not a wall-clock bound a loaded
+  // box turns into a flake (issue-spor-declared-harness-dispatch-timing-flake).
+  const release = path.join(home, "release-the-stub");
+  const stub = codexStub(home, { holdFile: release });
   const result = run(
     ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--no-brief"],
     { SPOR_HOME: home, SPOR_CODEX_CMD: stub, OUTFILE: outfile }
   );
   assert.strictEqual(result.status, 0, result.stderr);
-  assert.ok(Date.now() - started < 2000, "dispatch returns after the launch handshake");
-  assert.match(result.stdout, /Codex supervisor (running|done)/);
+  assert.match(result.stdout, /Codex supervisor (launching|running)/, "dispatch returns after the launch handshake, not after the run");
 
   const invocation = await awaitJson(outfile);
   assert.ok(invocation, "the detached stub ran");
@@ -212,17 +198,12 @@ test("Codex adapter launches detached, captures JSONL session, prompt, cwd, and 
   assert.strictEqual(invocation.args.at(-1), "-");
   assert.match(invocation.prompt, /Implement the Codex dispatch fixture/);
 
-  const runDir = path.join(home, "journal", "dispatch");
-  const recordFile = await waitFor(() => {
-    if (!fs.existsSync(runDir)) return null;
-    return fs.readdirSync(runDir).find((file) => file.endsWith(".run.json"));
-  });
-  assert.ok(recordFile);
-  const recordPath = path.join(runDir, recordFile);
-  const finished = await waitFor(() => {
-    const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
-    return record.state === "done" ? record : null;
-  });
+  const live = await awaitRecord(home, () => true);
+  assert.ok(live, "the supervisor opened a run record");
+  assert.notStrictEqual(live.state, "done", "the run is still going after dispatch has returned — the launcher did not wait for it");
+
+  fs.writeFileSync(release, "");
+  const finished = await awaitRecord(home, (record) => record.state === "done");
   assert.ok(finished, "supervisor records terminal success");
   assert.strictEqual(finished.harness, "codex");
   assert.strictEqual(finished.session_id, "codex-thread-fixture");
@@ -577,16 +558,21 @@ test("a supervisor that exits before reporting anything stamps failed_launch, di
   assert.ok(!fs.readdirSync(runDir).some((f) => /\.job\.json$|\.prompt$/.test(f)));
 });
 
-test("a launch failure is reported off the supervisor's own handshake, not inferred from how long the run record takes to update it (task-spor-dispatch-launch-handshake)", () => {
+test("a launch failure is reported off the supervisor's own handshake, not inferred from how long the run record takes to update it (task-spor-dispatch-launch-handshake)", async () => {
   // The bug this regression test pins: launchSupervisedHarness used to poll
   // the run record for a fixed 20 x 50ms and infer "launched" from silence.
   // Any delay in the record's own write — an async terminal-state write, a
   // slow disk, anything — could silently outlast that window and read as a
-  // false success. This stub writes the handshake signal immediately but
-  // deliberately delays the record's own `failed_launch` write far past the
-  // OLD poll window, to prove the launcher's verdict now comes from the
-  // handshake channel, not from racing that write.
+  // false success. This stub writes the handshake signal immediately and then
+  // WITHHOLDS the record's own `failed_launch` write until the test releases
+  // it. Withholding it indefinitely — rather than delaying it past a deadline
+  // and timing the return — is what makes this an ordering proof instead of a
+  // wall-clock bound a loaded box can flip
+  // (art-spor-declared-harness-dispatch-ordering-assertion): a launcher that
+  // inferred its verdict from that write could not have returned at all, and
+  // the message it did return names the handshake's error, not the write's.
   const { home, repo } = fixture();
+  const release = path.join(home, "release-the-record-write");
   const slowRunner = writeNodeScript(path.join(home, "runner-slow-record.js"), `
 const fs = require("node:fs");
 const fd = Number(process.env.SPOR_DISPATCH_HANDSHAKE_FD);
@@ -595,24 +581,31 @@ try {
 } catch {}
 try { fs.closeSync(fd); } catch {}
 const job = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-// Simulate the async terminal-state contract call this record write used to
-// be gated behind — well past the old fixed poll window (1000ms).
-setTimeout(() => {
+// Simulate the async terminal-state contract call this record write used to be
+// gated behind. The 30s backstop is only so a failed test cannot wedge: the
+// release file is what normally lands it.
+const deadline = Date.now() + 30000;
+const poll = () => {
+  if (!fs.existsSync(${JSON.stringify(release)}) && Date.now() <= deadline) return void setTimeout(poll, 25);
   fs.writeFileSync(job.record_path, JSON.stringify({
     state: "failed_launch", error: "the codex binary does not exist (stub, delayed write)",
   }, null, 2));
-}, 2000);
+};
+poll();
 `);
-  const started = Date.now();
   const result = run(
     ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--no-brief"],
     { SPOR_HOME: home, SPOR_CODEX_CMD: codexStub(home), SPOR_DISPATCH_RUNNER_CMD: slowRunner }
   );
-  const elapsed = Date.now() - started;
   assert.strictEqual(result.status, 1);
-  // The message came off the handshake — the delayed record write hasn't
-  // happened yet at this point, so a record-derived message would differ (or
+  // The message came off the handshake — the record write it used to race is
+  // still withheld at this point, so a record-derived message would differ (or
   // still read `launching`).
   assert.match(result.stderr, /could not launch .*: the codex binary does not exist \(stub\)/);
-  assert.ok(elapsed < 1500, `expected the handshake to resolve well under the delayed record write, took ${elapsed}ms`);
+
+  // And the write really was withheld rather than absent: releasing it lands
+  // the other message, the one the launcher demonstrably never read.
+  fs.writeFileSync(release, "");
+  const record = await awaitRecord(home, (r) => /stub, delayed write/.test(r.error || ""));
+  assert.ok(record, "the withheld record write lands once released");
 });
