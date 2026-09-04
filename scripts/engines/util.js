@@ -1216,11 +1216,17 @@ function probeCapabilities(graphHomeDir, opts) {
   return probed;
 }
 
+// Best-effort by default — every caller that ignores the return value behaves
+// exactly as it did. It RETURNS whether the line landed for the one caller that
+// cannot treat the write as free: drainPendingNudges consumes a
+// classifier-verified finding on the strength of its `.nudged-injected` marker,
+// so a silently failed marker write would discharge a debt nothing recorded.
 function appendLine(file, line) {
   try {
     fs.appendFileSync(file, line + "\n");
+    return true;
   } catch {
-    /* best-effort */
+    return false;
   }
 }
 
@@ -1689,15 +1695,98 @@ function claimHeldByLiveOwner(f) {
     return Boolean(e && e.code === "EPERM");
   }
 }
-function claimSpoolResult(dir, f) {
-  if (claimHeldByLiveOwner(f)) return null;
+
+// The optional `status` out-param records WHY a claim came back null, because
+// the three reasons are not the same fact and a caller that collapses them
+// destroys work (F16/F17): "held" — a live owner has it and has not yet decided
+// what its bytes even are; "gone" — it was renamed or consumed out from under
+// us, which says who no longer has it, never that a verdict was reached;
+// "failed" — the claim RENAME itself failed (EACCES, EBUSY, EIO, a Windows
+// sharing violation), so nobody owns it, nothing was read, and the result is
+// still sitting there recoverable. None of the three is a read verdict, so none
+// of them is proof that the worker input backing it may be deleted.
+function claimSpoolResult(dir, f, status) {
+  const say = (outcome) => {
+    if (status) status.outcome = outcome;
+  };
+  if (claimHeldByLiveOwner(f)) {
+    say("held");
+    return null;
+  }
   const claimed = `${spoolResultHash(f)}.claim-${process.pid}-${Date.now()}.out.json`;
   try {
     fs.renameSync(path.join(dir, f), path.join(dir, claimed));
+    say("claimed");
     return claimed;
-  } catch {
+  } catch (e) {
+    say(e && e.code === "ENOENT" ? "gone" : "failed");
     return null;
   }
+}
+
+// Exclusive lock over ONE spool JOB — the `<hash>.in.json` +
+// `<hash>.redriven.in.json` pair the prompt-time orphan sweep re-drives.
+// COPYFILE_EXCL is the atomic claim for a FIRST re-drive, but it cannot guard
+// the recovery arm, which re-copies over a `.redriven.in.json` that already
+// exists: two overlapping sweeps would both copy (tearing the copy under a
+// worker already reading it) and both spawn. This is that arm's missing claim
+// (F17), and it covers every mutation of the pair — the settled prune
+// included, so a prune can never delete files a sweep is mid-recovery on.
+//
+// Same self-healing shape as the result claim above: the holder's pid and the
+// acquisition time are the lock's contents, a lock held by a LIVE pid is
+// refused, and SPOOL_CLAIM_TTL_MS bounds every hold so a crash mid-recovery
+// costs one horizon rather than wedging the job forever. A lock that exists but
+// carries no stamp yet is a holder caught between create and write, so it reads
+// as HELD (bounded by the same TTL) rather than as free to steal. Returns a
+// release function, or null when the job is not ours this pass — and a null is
+// always "leave the pair exactly as it is", never "act on it anyway".
+function spoolJobLockHeld(p) {
+  let st;
+  try {
+    st = fs.statSync(p);
+  } catch {
+    return false; // no lock at all
+  }
+  if (Date.now() - st.mtimeMs >= SPOOL_CLAIM_TTL_MS) return false; // stale, whatever it claims
+  let raw = "";
+  try {
+    raw = fs.readFileSync(p, "utf8");
+  } catch {
+    return true; // unreadable right now: assume a holder (the TTL above bounds it)
+  }
+  const m = /^(\d+)/.exec(raw.trim());
+  if (!m) return true; // created, not yet stamped
+  const pid = Number(m[1]);
+  if (pid === process.pid) return false; // our own lock is ours to retake
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return Boolean(e && e.code === "EPERM"); // EPERM: alive under another uid
+  }
+}
+function claimSpoolJob(dir, hash) {
+  const p = path.join(dir, `${hash}.redrive.lock`);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.writeFileSync(p, `${process.pid} ${Date.now()}`, { flag: "wx" });
+      return () => {
+        try {
+          fs.unlinkSync(p);
+        } catch {}
+      };
+    } catch (e) {
+      if (!e || e.code !== "EEXIST") return null; // cannot lock here at all: do not act
+      if (spoolJobLockHeld(p)) return null;
+      try {
+        fs.unlinkSync(p); // stale: break it, then take it (exactly one racer's wx wins)
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
 }
 
 // Detached child that survives the hook process (replaces nohup setsid).
@@ -1787,6 +1876,7 @@ module.exports = {
   runClassifierBackend,
   runSpoolWorker,
   claimSpoolResult,
+  claimSpoolJob,
   spoolResultHash,
   spawnDetached,
   bashRandom,

@@ -451,8 +451,20 @@ async function sessionEndPendingNudges({ graph, slug, session, remote }) {
     // capture it here. The claimed name still ends in `.out.json`, so a
     // finding this drain deliberately keeps stays visible to every later
     // sweep — the claim narrows who may act on it, it never destroys it.
-    const claimed = u.claimSpoolResult(dir, f);
-    if (!claimed) continue; // another drain took it
+    const claimStatus = {};
+    const claimed = u.claimSpoolResult(dir, f, claimStatus);
+    if (!claimed) {
+      // "held"/"gone" is another drain doing its job and needs no note. A
+      // "failed" claim is different: the rename itself failed (EACCES, EBUSY,
+      // EIO, a Windows sharing violation), so NOBODY has the finding and this
+      // last-chance drain silently walked past it. The file is still there —
+      // the claim never destroys what it cannot take — so a later sweep can
+      // still land it, but the operator needs the line to know why nothing
+      // was captured (fail-open hooks look identical to healthy ones,
+      // dec-cc-fail-open-hooks).
+      if (claimStatus.outcome === "failed") note(`session-final result ${f} kept in the spool: claim failed`);
+      continue;
+    }
     const fp = path.join(dir, claimed);
     // A read that FAILED is not a result that is MALFORMED, and only the
     // second is terminal. EIO, EMFILE, EACCES and a Windows sharing violation

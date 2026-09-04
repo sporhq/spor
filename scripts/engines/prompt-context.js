@@ -257,14 +257,28 @@ function drainPendingNudges(graph, input, slug) {
   const injected = injectedLines.length;
   const injectedFiles = new Set(injectedLines);
 
-  // Per-result accounting, and the set of hashes whose DEBT the pass could
-  // account for. An input `.in.json` is owed until its verdict is durable
-  // somewhere else, so the settled set is built from what was actually READ —
-  // never from a bare filename (row (d)). An output that could not be read, or
-  // whose bytes do not parse into a result, holds no verdict at all, and
-  // pruning its input on the strength of its NAME deletes the last copy of
-  // both.
+  // Per-result accounting in THREE states, because "this pass did not discharge
+  // the debt" and "this pass may destroy the job" are different claims and
+  // collapsing them is how a finding disappears (F16/F17):
+  //   settled  — a verdict was actually READ here, so the worker's `.in.json`
+  //              is answered and prunable (row (d): read state, never a bare
+  //              filename);
+  //   deferred — a result FILE exists for this hash but this pass reached no
+  //              verdict on it (another drain holds the claim, took it, or the
+  //              claim write itself failed). Neither prune nor re-drive: the
+  //              pair is left exactly as it is for a later sweep;
+  //   neither  — no result at all, so the input is an orphan candidate and the
+  //              sweep below may re-drive it.
+  // The deferred state is what the old code was missing. It treated EVERY null
+  // claim — and a vanished result — as proof of settlement and pruned the
+  // input, but a claim is taken BEFORE its owner has read the bytes: the owner
+  // may still find them unparseable, and its own recovery is to re-drive the
+  // input this pass had already deleted. A claim rename that simply FAILED
+  // (EACCES, EBUSY, EIO, a Windows sharing violation) is worse still — nobody
+  // owns the finding, nobody read it, and both copies were being dropped on the
+  // strength of a syscall error.
   const settled = new Set();
+  const deferred = new Set();
   const results = [];
   for (const f of files) {
     const hash = u.spoolResultHash(f);
@@ -273,21 +287,25 @@ function drainPendingNudges(graph, input, slug) {
     // can inject a finding here and capture it there. See u.claimSpoolResult.
     const claimed = u.claimSpoolResult(dir, f);
     if (!claimed) {
-      // Another drain owns it. Injecting it there or capturing it at
-      // SessionEnd discharges the same debt, so its input is not ours to keep.
-      settled.add(hash);
+      // held / gone / failed — see u.claimSpoolResult. Not one of the three is
+      // a read verdict, so the job stays owed and untouched.
+      deferred.add(hash);
       continue;
     }
     const fp = path.join(dir, claimed);
     // A failed READ is not a malformed result, and only the second is
     // terminal: EIO, EMFILE, EACCES and a Windows sharing violation all read
     // fine on a later sweep, so they keep the result AND its input. ENOENT is
-    // neither — the file is already gone, so there is nothing left to keep.
+    // not a verdict either — the file was taken out from under us, which says
+    // only that this pass cannot judge it, so the input stays owed too. (The
+    // cost of that is bounded and one-sided: once no result remains for the
+    // hash, the orphan sweep re-drives the input ONCE. Paying one classifier
+    // call beats deleting the last copy of a job whose verdict nobody read.)
     let raw = null;
     try {
       raw = fs.readFileSync(fp, "utf8");
-    } catch (e) {
-      if (e && e.code === "ENOENT") settled.add(hash);
+    } catch {
+      deferred.add(hash);
       continue;
     }
     let r = null;
@@ -394,6 +412,24 @@ function drainPendingNudges(graph, input, slug) {
     for (const [hash, has] of jobs) {
       const plain = has.plain ? path.join(dir, `${hash}.in.json`) : null;
       const copy = path.join(dir, `${hash}.redriven.in.json`);
+      // A result exists for this job that this pass could not judge (row (c)):
+      // its claim is held by a live drain, it was taken, or the claim write
+      // failed. The job is neither discharged nor orphaned — leave the pair
+      // untouched and let a later sweep, once the owner has exited, reach a
+      // real verdict on it.
+      if (deferred.has(hash)) continue;
+      // Everything below MUTATES the pair, so it runs under ONE exclusive
+      // per-job lock (row (c), F17). COPYFILE_EXCL is the atomic claim for a
+      // FIRST re-drive, but the recovery arm re-copies over a
+      // `.redriven.in.json` that already exists and nothing guarded that: two
+      // overlapping sweeps could both re-copy — tearing the copy under a
+      // worker already reading it — and both spawn. The lock covers the settled
+      // prune too, so a prune can never delete files another sweep is
+      // mid-recovery on. It is pid-stamped, liveness-checked and TTL-bounded
+      // like the result claim, so a crash while holding it self-heals; a lock
+      // we cannot take means only "not ours this pass", never "act anyway".
+      const release = u.claimSpoolJob(dir, hash);
+      if (!release) continue;
       try {
         if (settled.has(hash)) {
           // Its verdict already landed (and this pass injected, consumed or
@@ -448,7 +484,10 @@ function drainPendingNudges(graph, input, slug) {
           continue;
         }
         rm(plain); // the worker owns the job now; the original is discharged
-      } catch {}
+      } catch {
+      } finally {
+        release();
+      }
     }
   } catch {}
 
@@ -461,13 +500,21 @@ function drainPendingNudges(graph, input, slug) {
     // between leaves the result claimed but INTACT, and the next drain
     // reconciles it against that marker above (consume, do not re-inject);
     // clearing first left a window with neither a debt nor a finding in it.
-    u.appendLine(injectedState, r.file);
+    //
+    // (row (a)) That marker write is the ONLY record of the debt this consume
+    // discharges, so it is not allowed to be best-effort here: if it did not
+    // land, the result file is KEPT. A finding re-injected next prompt is
+    // noise; a finding consumed against a marker that was never written is
+    // gone. Everything downstream of the marker — the metrics journal line —
+    // is genuinely best-effort and does not gate the consume.
+    const marked = u.appendLine(injectedState, r.file);
     // Journal the fired nudge (async) so lib/capture-metrics.js correlates it to
     // a subsequent capture, exactly like the synchronous nudge's journal line.
     u.appendLine(
       path.join(graph, "journal", `${session}.jsonl`),
       JSON.stringify({ ts: u.jqNow(), project: slug, tool: "nudge", file: r.file, facts: r.nfacts, async: true })
     );
+    if (!marked) continue; // still injected below — just not yet discharged
     try {
       fs.unlinkSync(fp);
     } catch {}

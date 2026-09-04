@@ -222,11 +222,26 @@ drain deliberately KEEPS stays visible to every later sweep — which is also wh
 a claim is HELD, not just taken: a re-claim is refused while the claiming pid is
 still ALIVE (bounded by a 5min stamp TTL for a recycled pid), so a hook that
 exited hands its claim straight back while a drain genuinely mid-capture keeps
-it. The prompt-time drain then consumes a result only AFTER its
-`<session>.nudged-injected` marker and journal line are written, so a crash in
-between leaves the result intact rather than a window with neither a debt nor a
-finding; the next drain reconciles it against that marker and consumes it
-without re-injecting. The spool WORKER
+it. A claim that comes back NULL is never on its own proof the finding is
+settled: the three reasons are different facts (`u.claimSpoolResult`'s `status`
+out-param names them) and a claim is taken BEFORE its owner has read the bytes,
+so a live HOLDER may yet find them unparseable and need the worker input the
+other drain would have deleted — and a claim rename that simply FAILED (EACCES,
+EBUSY, EIO, a Windows sharing violation) means nobody owns it and nobody read
+it. So a result the prompt-time drain could not judge puts its job in a third
+state, DEFERRED — neither pruned nor re-driven — and only a verdict this pass
+actually READ discharges the input. The prompt-time drain then consumes a result
+only AFTER its `<session>.nudged-injected` marker and journal line are written,
+so a crash in between leaves the result intact rather than a window with neither
+a debt nor a finding; the next drain reconciles it against that marker and
+consumes it without re-injecting. That marker write is the sole record of the
+debt the consume discharges, so it is not best-effort HERE: `u.appendLine`
+reports whether the line landed, and an unwritable marker keeps the result (a
+re-injected finding is noise; one consumed against a marker nobody wrote is
+gone). The residual, deliberately left: the marker precedes the hook's own
+output, so a crash in THAT gap loses one injection — the mirror ordering would
+trade a bounded loss for an unbounded double-inject, and the acceptance suite
+pins the consume inside the drain. The spool WORKER
 owes before it clears (`runSpoolWorker` in util.js): the `.in.json` is the job's
 debt and is unlinked only once the classifier's verdict is durable — the
 `.out.json` landed, or the verdict was definitive with nothing to write. A
@@ -253,7 +268,16 @@ ACCOUNT FOR (read and parsed; never by filename alone, since an unreadable or
 unparseable result holds no verdict and pruning its input on the strength of its
 name deletes the last copy of both) or a file already in
 `<session>.nudged-injected` is pruned, never re-driven into a second classifier
-call or a second injection.
+call or a second injection. Every mutation of the pair — the settled prune
+included — runs under ONE exclusive per-job lock (`u.claimSpoolJob`,
+`<hash>.redrive.lock`): COPYFILE_EXCL is the atomic claim for a FIRST re-drive
+but cannot guard the RECOVERY arm, which re-copies over a `.redriven.in.json`
+that already exists, so two overlapping sweeps could both re-copy — tearing the
+copy under a worker already reading it — and both spawn. The lock is
+pid-stamped, liveness-checked and TTL-bounded exactly like the result claim (an
+unstamped lock reads as held, so the create/write window is not stealable), so a
+crash holding it self-heals within one horizon, and a lock we cannot take means
+only "not ours this pass", never "act anyway".
 The default synchronous path is byte-identical (the drain and its
 syscalls are gated on the flag). See test/nudge-async.test.js.
 
