@@ -38,15 +38,34 @@
 // population this measures. The absolute counts are a lower bound; the RATE is
 // over what was actually classified.
 //
-// KNOWN DRIFT. `--until` pins the journal side, but the transcript side lives in
-// ~/.claude/projects, which Claude Code prunes on its own retention schedule.
-// An evicted transcript moves its finding from `scored` into the reported
-// `transcript missing` bucket, so the rate can drift with no flag and the same
-// cutoff — already 41 of 117 findings here. It is reported rather than hidden;
-// pinning it too would mean committing the derived per-session prompt timelines.
+// KNOWN DRIFT — AND WHY THE WINDOW MOVED. `--until` pins the journal side, but
+// the transcript side lives in ~/.claude/projects, which Claude Code prunes on
+// its own retention schedule. An evicted transcript moves its finding from
+// `scored` into the reported `transcript missing` bucket, so the rate drifts
+// with no flag and the same cutoff — 41 of 117 findings at first run, and by
+// 2026-09-04 ALL 117: the original 2026-07-17 corpus now scores zero findings
+// and its numbers are unreproducible from the live box. That is why the default
+// window moved to the replay pin below (2026-08-01 .. 2026-09-04) and why the
+// pin commits the per-finding SessionEnd verdicts rather than only a census of
+// hand-adjudicated facts: the derived verdicts outlive the transcripts they
+// were derived from. Re-pin, don't re-cite, once these transcripts age out too.
 //
 //   node scripts/analysis/measure-async-nudge-loss.js [--home <dir>]
-//        [--transcripts <dir>] [--until <iso>] [--live-window-min <n>] [--json]
+//        [--transcripts <dir>] [--from <iso>] [--until <iso>]
+//        [--live-window-min <n>] [--without-sessionend-drain] [--json]
+//
+// THE SHIPPED SESSIONEND DRAIN (the second run's whole point,
+// task-spor-reevaluate-nudge-async-default-post-sessionend). The first run
+// measured async against a client that had no SessionEnd surfacing, so a
+// stranded result's only backstop was the SessionEnd DISTILLER re-deriving the
+// same fact from the transcript in its own words — lossy, and adjudicated by
+// hand. Since 2026-08-21 `sessionEndPendingNudges` (scripts/engines/distill.js)
+// drains the leftover spool at SessionEnd and captures the classifier's OWN
+// fact text, so a lost finding whose session fired SessionEnd needs no
+// inference at all: it is captured verbatim. The replay therefore models that
+// drain first and falls back to the distiller-coverage analysis only for the
+// findings the drain could not reach. `--without-sessionend-drain` restores the
+// pre-2026-08-21 model for continuity with the first run's artifact.
 
 const fs = require("fs");
 const path = require("path");
@@ -62,6 +81,15 @@ const { parseFactList } = require("../engines/post-tool.js");
 // It also pins the corpus: its `until` is the default cutoff, so a plain re-run
 // reproduces the committed numbers even though the live journal keeps growing.
 const ADJUDICATION = path.join(__dirname, "adjudication-2026-07-17.json");
+
+// The second run's pin. Unlike the census this is a RESULT, not a lookup table:
+// the transcripts the SessionEnd verdicts were derived from get pruned (see
+// KNOWN DRIFT above), so the derived verdicts are committed to keep the quoted
+// numbers auditable after the corpus evaporates. It also supplies the default
+// window, so a plain re-run reproduces the committed numbers while the live
+// journal keeps growing. A re-run inside the window joins it and reports any
+// disagreement per finding — drift is surfaced, never silently absorbed.
+const REPLAY_PIN = path.join(__dirname, "sessionend-replay-2026-09-04.json");
 
 // A session whose transcript went quiet less than this before the cutoff may
 // still be running, and a still-open session's finding is not lost — its next
@@ -303,11 +331,83 @@ function coverage(fact, distill) {
   return hit / a.size;
 }
 
+// When did SessionEnd run for a session? The hook itself journals nothing
+// unconditionally, so the observable is its DISTILLER call: the llm-calls row is
+// stamped after the backend returns, and sessionEndPendingNudges runs at the top
+// of distill() — before the transcript read, the prompt build and the backend
+// call — so `ts - latency_ms` brackets the drain from above by the few ms of
+// setup between them. Multiple rows mean a resumed session ended more than once;
+// every one of them is a drain opportunity, because an undrained result file
+// persists until some SessionEnd consumes it.
+//
+// This is a LOWER bound on SessionEnd firings, and deliberately so: the drain
+// sits ahead of the distill.enabled kill switch and the missing/too-small
+// transcript gates, so a firing that produced no llm-calls row may still have
+// drained. Counting only demonstrated firings makes the residual loss an UPPER
+// bound — the honest direction for a number that argues against flipping a
+// default.
+function sessionEndDrains(distillRecords) {
+  const out = [];
+  for (const d of distillRecords || []) {
+    const at = Date.parse(d.ts);
+    if (Number.isNaN(at)) continue;
+    const latency = Number(d.latency_ms);
+    out.push(at - (Number.isFinite(latency) && latency > 0 ? latency : 0));
+  }
+  return out.sort((a, b) => a - b);
+}
+
+// How much earlier would this session have reached SessionEnd under async?
+// Exactly the tool-loop time the synchronous path spent blocked from this call
+// onward: its own latency, plus every later classifier call's. (Blocks BEFORE
+// it shift the result file and the session end by the same amount, so they
+// cancel — see sessionEndOutcome.) Errors and NOTHING verdicts count: they
+// produce no result file but they did block the loop.
+function asyncEndShift(call, sessionCalls) {
+  const at = Date.parse(call.ts);
+  let shift = 0;
+  for (const c of sessionCalls || []) {
+    const t = Date.parse(c.ts);
+    if (Number.isNaN(t) || t < at) continue;
+    const latency = Number(c.latency_ms);
+    if (Number.isFinite(latency) && latency > 0) shift += latency;
+  }
+  return shift;
+}
+
+// Would the shipped SessionEnd drain have surfaced this stranded finding?
+//
+// Both sides of the comparison are measured on the SYNCHRONOUS timeline the
+// journal actually recorded, then corrected onto the async one:
+//   result ready:  t1 (the row's ts) minus the blocking that PRECEDED the call
+//   drain runs:    tEnd minus that same preceding blocking, minus `shift`
+// The shared term cancels, leaving `tEnd - t1 > shift` — i.e. the session's
+// remaining wall-clock after the classifier answered must exceed the tool-loop
+// time async gives back. Margin is that slack; a negative one is the race where
+// the worker is still classifying when the session ends.
+function sessionEndOutcome({ resultAt, shiftMs }, drains) {
+  if (!drains || !drains.length) return { verdict: "no-sessionend", marginMs: null };
+  let best = -Infinity;
+  for (const d of drains) best = Math.max(best, d - resultAt - shiftMs);
+  return { verdict: best > 0 ? "captured" : "too-late", marginMs: best };
+}
+
 const COVERED_AT = 0.6;
 const THRESHOLDS = [0.3, 0.4, 0.5, 0.6];
 
 function factKey(session, fact) {
   return crypto.createHash("sha256").update(`${session}|${fact}`).digest("hex").slice(0, 12);
+}
+
+// One stranded finding's identity in the replay pin. The classifier row's own
+// timestamp is in the key, so a session that stranded two findings keys them
+// apart and a re-run can only match a verdict to the call it was derived from.
+function findingKey(session, ts, file) {
+  return crypto
+    .createHash("sha256")
+    .update(`${session}|${ts}|${file ?? ""}`)
+    .digest("hex")
+    .slice(0, 12);
 }
 
 // The census is the join key for the headline coverage number, so a malformed
@@ -329,7 +429,26 @@ function loadAdjudication() {
   };
 }
 
-const FLAGS = ["--home", "--transcripts", "--until", "--live-window-min"];
+// Same posture as loadAdjudication: an absent pin is fine (the replay just runs
+// unpinned), a malformed one must fail loudly rather than read as "no drift".
+function loadReplayPin() {
+  let raw;
+  try {
+    raw = fs.readFileSync(REPLAY_PIN, "utf8");
+  } catch (e) {
+    if (e.code === "ENOENT") return { verdicts: new Map(), from: null, until: null };
+    throw e;
+  }
+  const doc = JSON.parse(raw); // deliberately unguarded — a typo must not read as an empty pin
+  return {
+    verdicts: new Map((doc.findings || []).map((f) => [f.key, f.verdict])),
+    from: doc.from || null,
+    until: doc.until || null,
+  };
+}
+
+const FLAGS = ["--home", "--transcripts", "--from", "--until", "--live-window-min"];
+const BOOLEAN_FLAGS = ["--json", "--without-sessionend-drain"];
 
 function main(argv) {
   // Parse argv ONCE into a map. Two different models of the same argv — a
@@ -346,12 +465,12 @@ function main(argv) {
       console.error(`unexpected argument: ${a}`);
       process.exit(2);
     }
-    if (a === "--json") {
+    if (BOOLEAN_FLAGS.includes(a)) {
       parsed.set(a, true);
       continue;
     }
     if (!FLAGS.includes(a)) {
-      console.error(`unknown flag: ${a}\nusage: [${FLAGS.join(" <v>] [")} <v>] [--json]`);
+      console.error(`unknown flag: ${a}\nusage: [${FLAGS.join(" <v>] [")} <v>] [${BOOLEAN_FLAGS.join("] [")}]`);
       process.exit(2);
     }
     const v = argv[i + 1];
@@ -366,14 +485,28 @@ function main(argv) {
   const home = arg("--home", process.env.SPOR_HOME || path.join(os.homedir(), ".spor"));
   const transcripts = arg("--transcripts", path.join(os.homedir(), ".claude", "projects"));
   const asJson = parsed.has("--json");
+  const modelSessionEndDrain = !parsed.has("--without-sessionend-drain");
   const census = loadAdjudication();
-  // Pin the corpus to the census's cutoff by default: the journal grows every
-  // session, so an unpinned run re-stales the census within hours and the
-  // headline stops being reproducible.
-  const untilRaw = arg("--until", census.until);
+  const pin = loadReplayPin();
+  // Pin the corpus to the replay pin's window by default: the journal grows
+  // every session, so an unpinned run re-stales the pin within hours and the
+  // headline stops being reproducible. The census's own (earlier) cutoff is no
+  // longer the default — its transcripts are gone, so that window now scores
+  // nothing at all; see KNOWN DRIFT.
+  const untilRaw = arg("--until", pin.until);
   const until = untilRaw ? Date.parse(untilRaw) : Date.now();
   if (Number.isNaN(until)) {
     console.error(`--until: unparseable timestamp: ${untilRaw}`);
+    process.exit(2);
+  }
+  const fromRaw = arg("--from", pin.from);
+  const from = fromRaw ? Date.parse(fromRaw) : -Infinity;
+  if (Number.isNaN(from)) {
+    console.error(`--from: unparseable timestamp: ${fromRaw}`);
+    process.exit(2);
+  }
+  if (from > until) {
+    console.error(`--from is after --until: ${fromRaw} > ${untilRaw}`);
     process.exit(2);
   }
   // Unvalidated, a typo here (`--live-window-min 60min`) yields NaN, every
@@ -404,6 +537,18 @@ function main(argv) {
     distillBySession.set(d.session, prev);
   }
 
+  // Every classifier call of a session, windowed by nothing: asyncEndShift sums
+  // the blocking that happened AFTER a stranded call, and a later call sits
+  // outside the corpus cutoff as easily as inside it. Clipping this index to
+  // the window would under-count the shift and score a race as a clean capture.
+  const nudgeBySession = new Map();
+  for (const n of nudges) {
+    if (!n.session) continue;
+    const prev = nudgeBySession.get(n.session) || [];
+    prev.push(n);
+    nudgeBySession.set(n.session, prev);
+  }
+
   const index = indexTranscripts(transcripts);
   const timelines = new Map();
   const timelineFor = (session, strict) => {
@@ -418,6 +563,7 @@ function main(argv) {
   const stats = {
     calls: 0,
     afterCutoff: 0,
+    beforeWindow: 0,
     errors: 0,
     nothing: 0,
     findings: 0,
@@ -442,6 +588,10 @@ function main(argv) {
     // recordLlm), so this is when the worker's result file would exist.
     if (!Number.isNaN(at) && at > until) {
       stats.afterCutoff++;
+      continue;
+    }
+    if (!Number.isNaN(at) && at < from) {
+      stats.beforeWindow++;
       continue;
     }
     stats.calls++;
@@ -489,10 +639,12 @@ function main(argv) {
       lostRecords.push({
         session: r.session,
         ts: r.ts,
+        at,
         project: r.project,
         file: (r.vars || {}).FILE,
         facts: v.facts,
         nfacts: v.nfacts,
+        shiftMs: asyncEndShift(r, nudgeBySession.get(r.session)),
       });
     }
 
@@ -503,15 +655,65 @@ function main(argv) {
     }
   }
 
-  // Backstop: for each lost finding, did the SessionEnd distiller run for that
-  // session, did it extract anything, and does what it extracted look like the
-  // same fact? The first two are exact; the third is the lexical lower bound.
+  // FIRST backstop: the shipped SessionEnd drain. A finding it reaches is
+  // captured VERBATIM — the classifier's own fact text goes straight through
+  // the capture path — so it needs no coverage inference and drops out of the
+  // distiller analysis below entirely. `uncovered` is what is left for that
+  // weaker, lossier backstop to argue about.
+  const sessionEnd = { captured: 0, capturedFacts: 0, tooLate: 0, tooLateFacts: 0, none: 0, noneFacts: 0 };
+  let narrowestMarginMs = null;
+  const uncovered = [];
+  const pinAgreed = [];
+  const pinDrifted = [];
+  const replaySamples = [];
+  for (const L of lostRecords) {
+    if (!modelSessionEndDrain) {
+      uncovered.push(L);
+      continue;
+    }
+    const drains = sessionEndDrains(distillBySession.get(L.session));
+    const { verdict, marginMs } = sessionEndOutcome({ resultAt: L.at, shiftMs: L.shiftMs }, drains);
+    L.sessionEnd = verdict;
+    L.marginMs = marginMs;
+    replaySamples.push({
+      key: findingKey(L.session, L.ts, L.file),
+      session: L.session,
+      ts: L.ts,
+      file: L.file,
+      nfacts: L.nfacts,
+      verdict,
+      marginMs,
+      shiftMs: L.shiftMs,
+    });
+    const pinned = pin.verdicts.get(findingKey(L.session, L.ts, L.file));
+    if (pinned !== undefined) (pinned === verdict ? pinAgreed : pinDrifted).push({ key: findingKey(L.session, L.ts, L.file), pinned, verdict });
+    if (verdict === "captured") {
+      sessionEnd.captured++;
+      sessionEnd.capturedFacts += L.nfacts;
+      if (narrowestMarginMs === null || marginMs < narrowestMarginMs) narrowestMarginMs = marginMs;
+      continue;
+    }
+    if (verdict === "too-late") {
+      sessionEnd.tooLate++;
+      sessionEnd.tooLateFacts += L.nfacts;
+    } else {
+      sessionEnd.none++;
+      sessionEnd.noneFacts += L.nfacts;
+    }
+    uncovered.push(L);
+  }
+  const uncoveredFacts = uncovered.reduce((n, L) => n + L.nfacts, 0);
+
+  // SECOND backstop, for whatever the drain could not reach: did the SessionEnd
+  // distiller run for that session, did it extract anything, and does what it
+  // extracted look like the same fact? The first two are exact; the third is the
+  // lexical lower bound.
   let backstopRanFindings = 0;
   let backstopProductiveFindings = 0;
   const coverageSamples = [];
   const coveredAt = Object.fromEntries(THRESHOLDS.map((t) => [t, 0]));
   let lostFactsScored = 0;
-  for (const L of lostRecords) {
+  for (const L of uncovered) {
     const ds = distillBySession.get(L.session) || [];
     if (!ds.length) continue;
     backstopRanFindings++;
@@ -548,17 +750,20 @@ function main(argv) {
   }
   // Facts whose session produced no distiller extraction at all: nothing could
   // have covered them.
-  const noBackstopFacts = stats.lostFacts - lostFactsScored;
+  const noBackstopFacts = uncoveredFacts - lostFactsScored;
   const durablyLost = adjMissing ? null : adjLost + noBackstopFacts;
 
   const pct = (n, d) => (d ? `${((n / d) * 100).toFixed(1)}%` : "n/a");
   const out = {
     home,
     transcripts,
+    from: Number.isFinite(from) ? new Date(from).toISOString() : null,
     until: new Date(until).toISOString(),
+    modelSessionEndDrain,
     liveWindowMin: liveWindowMs / 60000,
     calls: stats.calls,
     afterCutoff: stats.afterCutoff,
+    beforeWindow: stats.beforeWindow,
     errors: stats.errors,
     nothing: stats.nothing,
     findings: stats.findings,
@@ -579,6 +784,11 @@ function main(argv) {
     },
     sessionsWithFindings: stats.sessions.size,
     sessionsWithLoss: stats.lostSessions.size,
+    sessionEnd,
+    narrowestMarginMs,
+    uncovered: uncovered.length,
+    uncoveredFacts,
+    pin: { agreed: pinAgreed.length, drifted: pinDrifted, size: pin.verdicts.size },
     backstopRanFindings,
     backstopProductiveFindings,
     lostFactsScored,
@@ -589,16 +799,27 @@ function main(argv) {
   };
 
   if (asJson) {
-    console.log(JSON.stringify({ ...out, lostRecords, coverageSamples }, null, 2));
+    console.log(JSON.stringify({ ...out, lostRecords, replaySamples, coverageSamples }, null, 2));
     return;
   }
 
   console.log(`# Async capture-nudge session-final loss — counterfactual replay`);
   console.log(`  graph home:  ${home}`);
   console.log(`  transcripts: ${transcripts}`);
-  console.log(`  corpus:      calls at or before ${new Date(until).toISOString()}`);
-  console.log(`               (${stats.afterCutoff} later calls excluded; sessions active within`);
-  console.log(`               ${liveWindowMs / 60000} min of the cutoff are treated as unfinished)`);
+  console.log(
+    `  corpus:      calls in [${Number.isFinite(from) ? new Date(from).toISOString() : "-∞"} .. ${new Date(
+      until
+    ).toISOString()}]`
+  );
+  console.log(`               (${stats.afterCutoff} later + ${stats.beforeWindow} earlier calls excluded; sessions`);
+  console.log(`               active within ${liveWindowMs / 60000} min of the cutoff are treated as unfinished)`);
+  console.log(
+    `  model:       ${
+      modelSessionEndDrain
+        ? "the SHIPPED client — sessionEndPendingNudges drains the leftover spool"
+        : "pre-2026-08-21 — no SessionEnd drain (--without-sessionend-drain)"
+    }`
+  );
   console.log();
   console.log(`## Classifier calls (source=nudge)`);
   console.log(`  calls in corpus .............. ${stats.calls}`);
@@ -621,10 +842,57 @@ function main(argv) {
   console.log(`  would a HUMAN have prompted again; system/sdk turns verified to fire the hook):`);
   console.log(`    scored ${stats.scoredStrict}, lost ${stats.lostStrict}  ${pct(stats.lostStrict, stats.scoredStrict)}`);
   console.log();
-  console.log(`## Does the SessionEnd distiller back it up?`);
-  console.log(`  lost findings ................ ${stats.lost}   [${stats.lostFacts} facts]`);
-  console.log(`  ...whose session ran it ...... ${backstopRanFindings}  ${pct(backstopRanFindings, stats.lost)}  (findings)`);
-  console.log(`  ...and it extracted facts .... ${backstopProductiveFindings}  ${pct(backstopProductiveFindings, stats.lost)}  (findings)`);
+  if (modelSessionEndDrain) {
+    console.log(`## Does the shipped SessionEnd drain surface it? (sessionEndPendingNudges)`);
+    console.log(`  lost findings ................ ${stats.lost}   [${stats.lostFacts} facts]`);
+    console.log(
+      `  captured VERBATIM at SessionEnd ${sessionEnd.captured}  ${pct(sessionEnd.captured, stats.lost)}  [${
+        sessionEnd.capturedFacts
+      } facts]`
+    );
+    console.log(
+      `  result landed after the drain . ${sessionEnd.tooLate}  ${pct(sessionEnd.tooLate, stats.lost)}  [${
+        sessionEnd.tooLateFacts
+      } facts]`
+    );
+    console.log(
+      `  no SessionEnd observed ........ ${sessionEnd.none}  ${pct(sessionEnd.none, stats.lost)}  [${
+        sessionEnd.noneFacts
+      } facts]`
+    );
+    if (narrowestMarginMs !== null) {
+      console.log();
+      console.log(`  narrowest capture margin ..... ${Math.round(narrowestMarginMs / 1000)}s of slack`);
+      console.log(`  (async reaches SessionEnd earlier by the tool-loop time it gives back; a`);
+      console.log(`   capture needs the session's remaining wall-clock to exceed that. This is`);
+      console.log(`   the closest any finding in the corpus came to losing that race.)`);
+    }
+    if (pin.verdicts.size) {
+      console.log();
+      if (pinDrifted.length) {
+        console.log(`  replay pin: ${pinDrifted.length} of ${pinAgreed.length + pinDrifted.length} findings DRIFTED from the`);
+        console.log(`  committed verdicts — re-pin before quoting a number:`);
+        for (const d of pinDrifted) console.log(`    ${d.key}: pinned ${d.pinned}, replayed ${d.verdict}`);
+      } else {
+        console.log(`  replay pin: ${pinAgreed.length}/${pin.verdicts.size} committed verdicts reproduced.`);
+      }
+    }
+    console.log();
+    console.log(`## For what it could not reach, does the SessionEnd distiller back it up?`);
+    console.log(`  uncovered findings ........... ${uncovered.length}   [${uncoveredFacts} facts]`);
+  } else {
+    console.log(`## Does the SessionEnd distiller back it up?`);
+    console.log(`  lost findings ................ ${stats.lost}   [${stats.lostFacts} facts]`);
+  }
+  console.log(
+    `  ...whose session ran it ...... ${backstopRanFindings}  ${pct(backstopRanFindings, uncovered.length)}  (findings)`
+  );
+  console.log(
+    `  ...and it extracted facts .... ${backstopProductiveFindings}  ${pct(
+      backstopProductiveFindings,
+      uncovered.length
+    )}  (findings)`
+  );
   console.log();
   console.log(`  per-fact lexical overlap vs that session's distiller output`);
   console.log(`  (${lostFactsScored} facts from sessions where the distiller DID extract something;`);
@@ -644,10 +912,24 @@ function main(argv) {
   console.log();
   console.log(`## Bottom line — facts durably lost (no channel captured them)`);
   console.log(`  facts in lost findings ....... ${stats.lostFacts}`);
+  if (modelSessionEndDrain) {
+    console.log(
+      `  surfaced at SessionEnd ....... ${sessionEnd.capturedFacts}  ${pct(
+        sessionEnd.capturedFacts,
+        stats.lostFacts
+      )}  (verbatim — no coverage inference needed)`
+    );
+    console.log(`  left to the distiller ........ ${uncoveredFacts}`);
+  }
   console.log(`  no distiller extraction ...... ${noBackstopFacts}  (nothing could cover these)`);
   console.log(`  distiller missed the fact .... ${adjMissing ? "?" : adjLost}`);
   if (durablyLost !== null) {
-    console.log(`  DURABLY LOST ................. ${durablyLost}  ${pct(durablyLost, stats.lostFacts)} of lost facts`);
+    console.log(
+      `  DURABLY LOST ................. ${durablyLost}  ${pct(durablyLost, stats.lostFacts)} of lost facts, ${pct(
+        durablyLost,
+        stats.factsTotal
+      )} of all classified facts`
+    );
   }
   console.log();
   console.log(`  NOTE: a floor, not a total — the sync path stops classifying after 3 fired`);
@@ -662,6 +944,9 @@ module.exports = {
   coverage,
   contentWords,
   sessionTimeline,
+  sessionEndDrains,
+  sessionEndOutcome,
+  asyncEndShift,
   splitFacts,
   stem,
 };

@@ -1,0 +1,162 @@
+{
+  "note": "Per-finding verdicts from the second counterfactual replay (task-spor-reevaluate-nudge-async-default-post-sessionend), modelling the SHIPPED SessionEnd drain (sessionEndPendingNudges, 2026-08-21). This file is a RESULT, not a lookup table: the ~/.claude/projects transcripts these verdicts were derived from get pruned, and the first run's 2026-07-17 corpus is already fully evicted, so the derived verdicts are committed to keep the quoted numbers auditable. measure-async-nudge-loss.js defaults its window to the one below and re-joins these keys, reporting any per-finding drift.",
+  "from": "2026-08-01T00:00:00.000Z",
+  "until": "2026-09-04T00:00:00.000Z",
+  "date": "2026-09-04",
+  "replayed_by": "spor work gate pipeline (task-spor-reevaluate-nudge-async-default-post-sessionend)",
+  "headline": {
+    "findingsScored": 57,
+    "drained": 43,
+    "lost": 14,
+    "lostFacts": 19,
+    "factsTotal": 69,
+    "capturedAtSessionEnd": 10,
+    "capturedFacts": 14,
+    "tooLate": 0,
+    "noSessionEnd": 4,
+    "durablyLostFacts": 5,
+    "narrowestMarginMs": 365091
+  },
+  "findings": [
+    {
+      "key": "42502f274e82",
+      "session": "8c8e6722-beea-4cdc-aade-cea36cdc6711",
+      "ts": "2026-08-05T15:01:37.884Z",
+      "file": "/home/exedev/repos/spor-server/.claude/worktrees/task-spor-owner-questions-out-of-band-push/SERVER.md",
+      "nfacts": 2,
+      "verdict": "captured",
+      "marginMs": 2162796,
+      "shiftMs": 7653
+    },
+    {
+      "key": "4ad2cda57e96",
+      "session": "76a6b3c2-510d-4bd4-8484-6a798e48cd47",
+      "ts": "2026-08-05T15:16:11.245Z",
+      "file": "/home/exedev/repos/spor-server/.claude/worktrees/issue-spor-resolution-unverified-merge-gap/SERVER.md",
+      "nfacts": 2,
+      "verdict": "no-sessionend",
+      "marginMs": null,
+      "shiftMs": 7795
+    },
+    {
+      "key": "e504d31a3e12",
+      "session": "40053c37-ba4f-4aec-88dd-2f909b6c2ae8",
+      "ts": "2026-08-10T10:31:02.650Z",
+      "file": "/home/exedev/repos/spor-server/.claude/worktrees/issue-spor-owner-digest-pacing-race-conditions/SERVER.md",
+      "nfacts": 1,
+      "verdict": "captured",
+      "marginMs": 1268672,
+      "shiftMs": 5048
+    },
+    {
+      "key": "fc874a577e5c",
+      "session": "44bd9fe9-f152-46c8-b0a7-889f992c3aef",
+      "ts": "2026-08-10T10:50:00.257Z",
+      "file": "/home/exedev/repos/spor-docs/.claude/worktrees/task-spor-docs-bulk-lease-endpoints/src/content/docs/reference/api/leases.md",
+      "nfacts": 1,
+      "verdict": "captured",
+      "marginMs": 467078,
+      "shiftMs": 13536
+    },
+    {
+      "key": "81daabc161eb",
+      "session": "44bd9fe9-f152-46c8-b0a7-889f992c3aef",
+      "ts": "2026-08-10T10:51:49.998Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-docs-bulk-lease-endpoints-apimd/API.md",
+      "nfacts": 1,
+      "verdict": "captured",
+      "marginMs": 365091,
+      "shiftMs": 5782
+    },
+    {
+      "key": "c431e5c440d1",
+      "session": "c1f683e5-f8d4-4fac-850a-8bc6b8faab07",
+      "ts": "2026-08-10T11:02:54.301Z",
+      "file": "/home/exedev/repos/spor-server/.claude/worktrees/issue-spor-capture-elaborations-unbounded-body-cap/SERVER.md",
+      "nfacts": 1,
+      "verdict": "captured",
+      "marginMs": 1484681,
+      "shiftMs": 4964
+    },
+    {
+      "key": "df9bf8330345",
+      "session": "4305497d-ae09-4a5f-85f2-e2a02b30992e",
+      "ts": "2026-08-10T11:37:23.238Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-triage-skill-body-full-guidance-update/skills/triage/SKILL.md",
+      "nfacts": 1,
+      "verdict": "captured",
+      "marginMs": 436749,
+      "shiftMs": 4314
+    },
+    {
+      "key": "e7d902d91ebb",
+      "session": "bb9c3c3e-f017-4da9-9829-2e2db7d1bcf8",
+      "ts": "2026-08-10T11:40:29.502Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-api-md-lease-reclaim-contract-pass/API.md",
+      "nfacts": 4,
+      "verdict": "captured",
+      "marginMs": 483129,
+      "shiftMs": 7732
+    },
+    {
+      "key": "cbe6615e5c4b",
+      "session": "61b54d17-47ad-4715-91be-7174bea25312",
+      "ts": "2026-08-21T05:45:25.892Z",
+      "file": "/tmp/claude-1000/-home-exedev-repos-spor-server/61b54d17-47ad-4715-91be-7174bea25312/scratchpad/issue-diacritic.md",
+      "nfacts": 1,
+      "verdict": "captured",
+      "marginMs": 2436786,
+      "shiftMs": 10278
+    },
+    {
+      "key": "21d394c27796",
+      "session": "61b54d17-47ad-4715-91be-7174bea25312",
+      "ts": "2026-08-21T05:45:44.352Z",
+      "file": "/tmp/claude-1000/-home-exedev-repos-spor-server/61b54d17-47ad-4715-91be-7174bea25312/scratchpad/issue-lease-nonwork.md",
+      "nfacts": 1,
+      "verdict": "captured",
+      "marginMs": 2423187,
+      "shiftMs": 5417
+    },
+    {
+      "key": "98a3dab9e9bf",
+      "session": "3f477ce2-1e3c-4c26-957b-0ceabae87b69",
+      "ts": "2026-08-22T09:45:10.951Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/issue-spor-dispatch-no-worktree-template-mismatch/.claude/skills/spor-orchestrator/assets/agent-prompt-inplace.md",
+      "nfacts": 1,
+      "verdict": "no-sessionend",
+      "marginMs": null,
+      "shiftMs": 6884
+    },
+    {
+      "key": "4ba8fee33d83",
+      "session": "3f477ce2-1e3c-4c26-957b-0ceabae87b69",
+      "ts": "2026-08-22T09:46:08.271Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/issue-spor-dispatch-no-worktree-template-mismatch/.claude/skills/spor-orchestrator/SKILL.md",
+      "nfacts": 1,
+      "verdict": "no-sessionend",
+      "marginMs": null,
+      "shiftMs": 3317
+    },
+    {
+      "key": "d67a8c3e17b4",
+      "session": "c06971e1-e35c-4d51-be39-0fdf0ade0fce",
+      "ts": "2026-08-28T14:14:12.582Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-factory-integration-step/WORKERS.md",
+      "nfacts": 1,
+      "verdict": "captured",
+      "marginMs": 998058,
+      "shiftMs": 4357
+    },
+    {
+      "key": "928a641dfa26",
+      "session": "626a5dda-3c77-42be-9522-e36876d9c6d8",
+      "ts": "2026-08-31T10:47:59.351Z",
+      "file": "/home/exedev/repos/spor/WORKERS.md",
+      "nfacts": 1,
+      "verdict": "no-sessionend",
+      "marginMs": null,
+      "shiftMs": 13527
+    }
+  ]
+}

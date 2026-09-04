@@ -15,6 +15,9 @@ const {
   coverage,
   splitFacts,
   stem,
+  sessionEndDrains,
+  sessionEndOutcome,
+  asyncEndShift,
 } = require("../scripts/analysis/measure-async-nudge-loss.js");
 
 const user = (extra) => ({ type: "user", message: { content: "do the thing" }, ...extra });
@@ -170,4 +173,117 @@ test("coverage: an unrelated distiller extraction scores near zero", () => {
   const fact = "Inbound resolves edges are authoritative over the status field.";
   const distill = "The marketing site footer grid expanded from three columns to four.";
   assert.ok(coverage(fact, distill) < 0.2);
+});
+
+// The second run (task-spor-reevaluate-nudge-async-default-post-sessionend)
+// re-scores the same replay against the SHIPPED client, where
+// sessionEndPendingNudges drains the leftover spool at SessionEnd. That verdict
+// turns on a timing comparison between two clocks — the synchronous timeline the
+// journal recorded, and the async one it is being corrected onto — and getting
+// the correction backwards would silently convert every race into a clean
+// capture. These pin it.
+
+test("sessionEndDrains: the drain time is the distill row minus its own latency", () => {
+  // sessionEndPendingNudges runs at the TOP of distill(), before the backend
+  // call the row is stamped after — so the row's ts overstates the drain by the
+  // whole backend latency, and using it raw would credit a capture to a session
+  // that ended before the worker answered.
+  assert.deepEqual(
+    sessionEndDrains([{ ts: "2026-08-10T10:00:30.000Z", latency_ms: 30000 }]),
+    [Date.parse("2026-08-10T10:00:00.000Z")]
+  );
+});
+
+test("sessionEndDrains: unusable rows degrade to the row's own timestamp, ascending", () => {
+  // A missing/zero/garbled latency must not shift the drain the wrong way (a
+  // negative correction would invent slack that never existed).
+  const drains = sessionEndDrains([
+    { ts: "2026-08-10T11:00:00.000Z", latency_ms: 0 },
+    { ts: "2026-08-10T10:00:00.000Z", latency_ms: -5 },
+    { ts: "2026-08-10T09:00:00.000Z" },
+    { ts: "not a timestamp", latency_ms: 100 },
+  ]);
+  assert.deepEqual(drains, [
+    Date.parse("2026-08-10T09:00:00.000Z"),
+    Date.parse("2026-08-10T10:00:00.000Z"),
+    Date.parse("2026-08-10T11:00:00.000Z"),
+  ]);
+});
+
+test("asyncEndShift: async gives back this call's blocking plus every later one", () => {
+  // Blocks BEFORE the call shift its result file and the session end by the
+  // same amount and cancel out; blocks at or after it do not.
+  const call = { ts: "2026-08-10T10:00:10.000Z", latency_ms: 5000 };
+  const session = [
+    { ts: "2026-08-10T09:59:00.000Z", latency_ms: 9000 }, // earlier: cancels
+    call,
+    { ts: "2026-08-10T10:02:00.000Z", latency_ms: 4000 },
+    { ts: "2026-08-10T10:03:00.000Z", latency_ms: 3000 },
+  ];
+  assert.equal(asyncEndShift(call, session), 12000);
+  assert.equal(asyncEndShift(call, [call]), 5000);
+  assert.equal(asyncEndShift(call, undefined), 0);
+});
+
+test("asyncEndShift: an errored or NOTHING call still blocked the tool loop", () => {
+  // It produces no result file, but the synchronous path waited for it, so the
+  // time it returns is real. Dropping these would understate the shift.
+  const call = { ts: "2026-08-10T10:00:00.000Z", latency_ms: 1000 };
+  assert.equal(
+    asyncEndShift(call, [call, { ts: "2026-08-10T10:01:00.000Z", latency_ms: 8000, error: "nudge cmd failed" }]),
+    9000
+  );
+});
+
+test("sessionEndOutcome: no observed SessionEnd is the residual loss, not a capture", () => {
+  const r = sessionEndOutcome({ resultAt: Date.parse("2026-08-10T10:00:00Z"), shiftMs: 5000 }, []);
+  assert.deepEqual(r, { verdict: "no-sessionend", marginMs: null });
+});
+
+test("sessionEndOutcome: the session must outlive the tool-loop time async gives back", () => {
+  const at = Date.parse("2026-08-10T10:00:00Z");
+  const drain = (s) => [at + s * 1000];
+  // 10s of remaining wall-clock against a 5s shift: the worker's result is on
+  // disk when the drain runs.
+  assert.equal(sessionEndOutcome({ resultAt: at, shiftMs: 5000 }, drain(10)).verdict, "captured");
+  // 3s against the same 5s shift: async reached SessionEnd first — the race the
+  // one-turn delay can still lose.
+  assert.equal(sessionEndOutcome({ resultAt: at, shiftMs: 5000 }, drain(3)).verdict, "too-late");
+  // Exactly on the boundary is NOT a capture: a tie means the drain and the
+  // write are simultaneous, and the drain reads the directory first.
+  assert.equal(sessionEndOutcome({ resultAt: at, shiftMs: 5000 }, drain(5)).verdict, "too-late");
+});
+
+test("sessionEndOutcome: a later SessionEnd still drains what an earlier one missed", () => {
+  // A resumed session ends more than once, and an undrained .out.json persists
+  // until some SessionEnd consumes it — so the BEST firing decides, and the
+  // margin reported is that firing's.
+  const at = Date.parse("2026-08-10T10:00:00Z");
+  const r = sessionEndOutcome({ resultAt: at, shiftMs: 5000 }, [at - 60000, at + 2000, at + 600000]);
+  assert.equal(r.verdict, "captured");
+  assert.equal(r.marginMs, 595000);
+});
+
+test("the committed replay pin is internally consistent", () => {
+  // The pin is what survives once ~/.claude/projects prunes the transcripts the
+  // verdicts were derived from, so a headline that has drifted from its own
+  // per-finding rows would be unfalsifiable afterwards.
+  const pin = require("../scripts/analysis/sessionend-replay-2026-09-04.json");
+  const h = pin.headline;
+  assert.equal(pin.findings.length, h.lost);
+  const tally = (v) => pin.findings.filter((f) => f.verdict === v);
+  assert.equal(tally("captured").length, h.capturedAtSessionEnd);
+  assert.equal(tally("too-late").length, h.tooLate);
+  assert.equal(tally("no-sessionend").length, h.noSessionEnd);
+  const facts = (v) => tally(v).reduce((n, f) => n + f.nfacts, 0);
+  assert.equal(facts("captured"), h.capturedFacts);
+  assert.equal(
+    pin.findings.reduce((n, f) => n + f.nfacts, 0),
+    h.lostFacts
+  );
+  // Everything the drain could not reach is what the decision was made on.
+  assert.equal(h.lostFacts - h.capturedFacts, h.durablyLostFacts);
+  // Every key must be distinct, or a re-run's drift check silently compares a
+  // finding against another finding's verdict.
+  assert.equal(new Set(pin.findings.map((f) => f.key)).size, pin.findings.length);
 });
