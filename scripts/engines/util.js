@@ -1216,11 +1216,17 @@ function probeCapabilities(graphHomeDir, opts) {
   return probed;
 }
 
+// Best-effort by default — every caller that ignores the return value behaves
+// exactly as it did. It RETURNS whether the line landed for the one caller that
+// cannot treat the write as free: drainPendingNudges consumes a
+// classifier-verified finding on the strength of its `.nudged-injected` marker,
+// so a silently failed marker write would discharge a debt nothing recorded.
 function appendLine(file, line) {
   try {
     fs.appendFileSync(file, line + "\n");
+    return true;
   } catch {
-    /* best-effort */
+    return false;
   }
 }
 
@@ -1594,30 +1600,215 @@ function runSpoolWorker(inFile, classify, buildOutput) {
   try {
     job = JSON.parse(fs.readFileSync(inFile, "utf8"));
   } catch {
+    // Unreadable/malformed input: nothing to classify. Leave it — a transient
+    // read failure is indistinguishable from a corrupt one here, and the
+    // drain's orphan sweep bounds the spool either way.
     process.exit(0);
   }
-  try {
-    fs.unlinkSync(inFile);
-  } catch {}
 
+  // OWE BEFORE YOU CLEAR. The `.in.json` IS this job's durable debt — it is
+  // already on disk, so owing it costs no write of ours that could itself fail
+  // — and it is not cleared until the classifier's verdict is durable
+  // somewhere else. The old order (unlink, then classify, then write the
+  // result) had two holes this closes: a crash after classification but before
+  // the result landed lost the job with nothing left to retry, and a FAILED
+  // `.out.json` write was swallowed silently, discarding a classifier-verified
+  // finding that had already been paid for. Both now leave the input in place.
   let result = null;
+  let threw = false;
   try {
     result = classify(job);
   } catch {
-    /* fail-open: leave the file reserved, inject nothing */
+    threw = true;
   }
+  // Both classifiers share one contract: `null` means the BACKEND failed (a
+  // SIGKILLed timeout, a non-zero exit) — no verdict was reached. Anything else
+  // is the classifier's answer. Only an answer settles the job.
+  const definitive = !threw && result !== null;
 
-  const out = buildOutput(job, result);
+  // Cleared only on a DEFINITIVE outcome: a verdict whose result landed
+  // durably, or a verdict with nothing to write (a NOTHING classification is
+  // settled, not lost — re-running it would spend another backend call to
+  // reach the same answer). A backend failure settles nothing, so its input
+  // stays owed for the drain's bounded re-drive.
+  let settled = false;
+  const out = threw ? null : buildOutput(job, result);
   if (out && job.hash) {
     const outFile = path.join(path.dirname(inFile), `${job.hash}.out.json`);
     try {
       writeFileAtomic(outFile, JSON.stringify(out));
+      settled = true;
     } catch {
-      /* fail-open: a dropped result file just means no injection next prompt */
+      /* the result did NOT land — keep the input as the debt to re-run */
     }
+  } else if (definitive) {
+    settled = true;
+  }
+  if (settled) {
+    try {
+      fs.unlinkSync(inFile);
+    } catch {}
   }
 
   process.exit(0);
+}
+
+// Atomic CLAIM on an async-nudge spool result (dec-spor-nudge-drain-atomic-claim).
+// Both drains read the same `<hash>.out.json` — the prompt-time one injects it,
+// the SessionEnd one captures it — so without a claim an overlapping pair can
+// act on ONE finding twice. The claim is a rename, not a check-then-act: exactly
+// one caller's rename succeeds and every loser gets ENOENT and skips. Two
+// properties make it safe for a drain that must not destroy what it cannot yet
+// place: the claimed name still ends in `.out.json`, so a result the SessionEnd
+// drain deliberately KEEPS (a transient failure) stays visible to every later
+// sweep, and a crash between the claim and the capture strands nothing. Any
+// previous claim segment is stripped first, so re-claiming across sweeps cannot
+// grow the name. Returns the claimed basename, or null when the claim was lost.
+//
+// That same visibility is why a claim is not only taken but HELD: a name ending
+// in `.out.json` can be re-claimed the instant it is written, including while
+// its first owner is still acting on it — the double action the claim exists to
+// stop (the prompt drain injecting a finding the SessionEnd drain is
+// mid-capture, say). So a claim stamped by a pid that is still ALIVE is refused
+// until it goes stale. Liveness, not a bare timeout, is what makes the hold
+// safe for a last-chance drain: a hook process is over in milliseconds, so it
+// hands its claim back by exiting, and only a drain genuinely still running
+// keeps one. The TTL is the backstop for the one case liveness misreads — a
+// recycled pid — and bounds any hold at SPOOL_CLAIM_TTL_MS.
+const SPOOL_CLAIM_RE = /(?:\.claim-\d+-\d+)?\.out\.json$/;
+const SPOOL_CLAIM_STAMP = /\.claim-(\d+)-(\d+)\.out\.json$/;
+const SPOOL_CLAIM_TTL_MS = 300000; // 5min: longer than any drain, short enough to self-heal
+function spoolResultHash(f) {
+  return f.replace(SPOOL_CLAIM_RE, "");
+}
+function claimHeldByLiveOwner(f) {
+  const m = SPOOL_CLAIM_STAMP.exec(f);
+  if (!m) return false;
+  const pid = Number(m[1]);
+  if (pid === process.pid) return false; // our own claim is ours to retake
+  if (Date.now() - Number(m[2]) >= SPOOL_CLAIM_TTL_MS) return false;
+  try {
+    process.kill(pid, 0);
+    return true; // alive: it may still be acting on this finding
+  } catch (e) {
+    // EPERM means the pid exists under another uid — alive. ESRCH means gone.
+    return Boolean(e && e.code === "EPERM");
+  }
+}
+
+// The optional `status` out-param records WHY a claim came back null, because
+// the three reasons are not the same fact and a caller that collapses them
+// destroys work (F16/F17): "held" — a live owner has it and has not yet decided
+// what its bytes even are; "gone" — it was renamed or consumed out from under
+// us, which says who no longer has it, never that a verdict was reached;
+// "failed" — the claim RENAME itself failed (EACCES, EBUSY, EIO, a Windows
+// sharing violation), so nobody owns it, nothing was read, and the result is
+// still sitting there recoverable. None of the three is a read verdict, so none
+// of them is proof that the worker input backing it may be deleted.
+function claimSpoolResult(dir, f, status) {
+  const say = (outcome) => {
+    if (status) status.outcome = outcome;
+  };
+  if (claimHeldByLiveOwner(f)) {
+    say("held");
+    return null;
+  }
+  const claimed = `${spoolResultHash(f)}.claim-${process.pid}-${Date.now()}.out.json`;
+  try {
+    fs.renameSync(path.join(dir, f), path.join(dir, claimed));
+    say("claimed");
+    return claimed;
+  } catch (e) {
+    say(e && e.code === "ENOENT" ? "gone" : "failed");
+    return null;
+  }
+}
+
+// Exclusive lock over ONE spool JOB — the `<hash>.in.json` +
+// `<hash>.redriven.in.json` pair the prompt-time orphan sweep re-drives.
+// COPYFILE_EXCL is the atomic claim for a FIRST re-drive, but it cannot guard
+// the recovery arm, which re-copies over a `.redriven.in.json` that already
+// exists: two overlapping sweeps would both copy (tearing the copy under a
+// worker already reading it) and both spawn. This is that arm's missing claim
+// (F17), and it covers every mutation of the pair — the settled prune
+// included, so a prune can never delete files a sweep is mid-recovery on.
+//
+// The lock is self-healing like the result claim above — a holder that dies
+// must not wedge the job forever — but it reaches that WITHOUT ever deleting
+// another actor's lock (F19). A single well-known lock pathname forced the old
+// shape: see it, judge it stale, unlink it, re-create it. That check-then-unlink
+// is not a claim. Two sweepers could both judge one stale lock, both break it,
+// and both `wx` — worse, the loser's break deletes the WINNER's fresh lock, and
+// the winner's `release()` then deletes its successor's, so a third sweeper
+// walks in on a pair two others are already mutating. That is precisely the
+// concurrent re-copy/re-spawn the lock exists to prevent.
+//
+// So each contender creates ONLY its own uniquely-named lock file
+// (`<hash>.redrive.lock-<pid>-<ts>-<rand>`) and deletes ONLY its own. Everything
+// a racer needs to judge a lock is in its NAME, so there is no create-then-write
+// window to misread and no file to read at all. Ownership is decided by a listing
+// AFTER the create: you hold the job only if no OTHER live contender is present.
+// Two contenders can never both win — each creates before it lists, so if A's
+// listing missed B then B was created after A, and B's own listing must see A.
+// A collision simply means "not ours this pass" for one or both, which is the
+// safe answer: the pair is left exactly as it is for a later sweep.
+//
+// Staleness is per-contender and read-only: a lock whose pid is gone or whose
+// stamp is past SPOOL_CLAIM_TTL_MS is IGNORED by every racer, so a crashed
+// holder costs one horizon, not the job. Such a file is unlinked only when it is
+// provably dead AND expired — and because every racer already ignores it, that
+// unlink can neither grant nor revoke ownership.
+const SPOOL_JOB_LOCK_STAMP = /^(\d+)-(\d+)-[0-9a-f]+$/;
+function spoolJobLockContends(name) {
+  const m = SPOOL_JOB_LOCK_STAMP.exec(name);
+  if (!m) return { contends: false, prunable: false }; // not one of ours: never touch it
+  const pid = Number(m[1]);
+  const expired = Date.now() - Number(m[2]) >= SPOOL_CLAIM_TTL_MS;
+  if (pid === process.pid) return { contends: false, prunable: false }; // ours to ignore, never to reap blindly
+  let alive = false;
+  try {
+    process.kill(pid, 0);
+    alive = true;
+  } catch (e) {
+    alive = Boolean(e && e.code === "EPERM"); // EPERM: alive under another uid
+  }
+  return { contends: alive && !expired, prunable: !alive && expired };
+}
+function claimSpoolJob(dir, hash) {
+  const prefix = `${hash}.redrive.lock-`;
+  const mine = `${prefix}${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+  const p = path.join(dir, mine);
+  try {
+    fs.writeFileSync(p, "", { flag: "wx" });
+  } catch {
+    return null; // cannot lock here at all: do not act
+  }
+  const release = () => {
+    try {
+      fs.unlinkSync(p);
+    } catch {}
+  };
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    release();
+    return null; // cannot tell who else is here: not ours this pass
+  }
+  for (const f of entries) {
+    if (f === mine || !f.startsWith(prefix)) continue;
+    const { contends, prunable } = spoolJobLockContends(f.slice(prefix.length));
+    if (contends) {
+      release();
+      return null; // a live contender owns the pair this pass
+    }
+    if (prunable) {
+      try {
+        fs.unlinkSync(path.join(dir, f));
+      } catch {}
+    }
+  }
+  return release;
 }
 
 // Detached child that survives the hook process (replaces nohup setsid).
@@ -1706,6 +1897,9 @@ module.exports = {
   parseClaudeResult,
   runClassifierBackend,
   runSpoolWorker,
+  claimSpoolResult,
+  claimSpoolJob,
+  spoolResultHash,
   spawnDetached,
   bashRandom,
   writeFileAtomic,

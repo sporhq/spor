@@ -187,9 +187,139 @@ once that hits 3, further spawns are suppressed — a best-effort analog of the
 synchronous 3-fired early-stop, backstopped by the hard `nudge.maxCalls` ceiling.
 Known tradeoff (inherent to one-turn-delay): a finding in a doc written as the
 FINAL action of a session — no subsequent prompt — is never injected; the
-SessionEnd distiller is the backstop that still captures it. The default
-synchronous path is byte-identical (the drain and its syscalls are gated on the
-flag). See test/nudge-async.test.js.
+SessionEnd distiller is the backstop that still captures it
+(`sessionEndPendingNudges` in distill.js). That drain is a finding's LAST
+chance, so it consumes a `.out.json` only once the finding is durably elsewhere
+(a 200, a spooled outbox payload, a dead-lettered payload, a written node) or is
+provably uncapturable (bytes that don't PARSE into a result — a failed READ is
+transient and keeps its file — already injected, or a node the parser or
+validator refuses); a TRANSIENT failure leaves the file spooled for a later
+sweep (issue-spor-session-end-pending-nudges-data-loss). Retention is only the
+safe side if something eventually comes BACK for the file, and the owning
+session is over — no later prompt drains its spool, no later SessionEnd looked
+at it, and journal GC removes the directory at `gc.maxAgeMs` — so
+`sessionEndPendingNudges` also COLLECTS abandoned spools: it drains its own
+session, then up to `SPOOL_COLLECT_MAX` (5) foreign `pending-nudges/<session>/`
+dirs that are untouched for 6h AND show no other sign of life (the same bucket
+signal `gcJournal` protects a concurrently-live session with) AND actually hold
+a result. The horizon is generous because the owning session's own next prompt
+is the better home for a finding; collection is the last resort before the GC
+cutoff. A collected finding is stamped to the project of the FILE it was
+classified from (`spoolCaptureSlug`), not the collector's ambient slug, and it
+is keyed on the ORIGIN session so its idempotency key and node id are the ones
+that session's own drain would have minted. A dir is not a unit of work, so the
+whole phase is BOUNDED too — a 20s wall-clock deadline over both drains plus
+`SPOOL_COLLECT_RESULT_MAX` (10) foreign results per pass, spent own-session
+first — since each result is its own capture round trip and the transcript
+distiller runs after this. The bound is admissible only because stopping early
+has no durable consequence: the `.out.json` IS the debt, an unreached result is
+left byte-for-byte as found, and the collector is itself what comes back for it
+(6h horizon, well inside `gc.maxAgeMs`). A server 401/400/413/422 is
+permanent but NOT discardable: per API.md §5 a mechanical writer preserves a
+rejected payload in `outbox/dead/` (the channel session-start and `spor-hook
+doctor` already surface), so the consume waits on that write like any other.
+The consume therefore trails the durable write, so a crash in the gap re-drains
+an already-captured finding — made idempotent on both sides by keying the
+capture on sha256(session, file, facts): the remote `idempotency_key` (and a
+deterministic outbox/dead-letter filename), and locally a content-addressed node
+id whose full key is stamped on the node as `capture_key`. The id carries only a
+truncation of that key, so an occupied pathname is never on its own proof the
+finding is captured — the occupant is READ and its `capture_key` compared, and a
+mismatch takes the next, longer candidate id rather than consuming a finding
+that was never written — and a MATCH is only proof when the node's BODY still
+carries the facts, since a crash-torn publish leaves complete frontmatter
+(`summary` is the finding's own first line) over a body that never landed. The
+node itself is created with an atomic exclusive write (`createNodeExclusive`):
+hardlink-a-finished-temp-file where link() works, and where it does not
+(EPERM/EOPNOTSUPP/ENOSYS/EXDEV) an exclusive `wx` RESERVATION with the temp file
+renamed over it — never an in-place `wx` write, whose half-written window is
+exactly where a concurrent drain reads a matching `capture_key` and consumes the
+only copy of a body that does not exist. BOTH drains claim a `.out.json` with an
+atomic rename before reading it (`u.claimSpoolResult`,
+dec-spor-nudge-drain-atomic-claim), so one finding is never both injected and
+captured; the claimed name still ends in `.out.json`, so a result the SessionEnd
+drain deliberately KEEPS stays visible to every later sweep — which is also why
+a claim is HELD, not just taken: a re-claim is refused while the claiming pid is
+still ALIVE (bounded by a 5min stamp TTL for a recycled pid), so a hook that
+exited hands its claim straight back while a drain genuinely mid-capture keeps
+it. A claim that comes back NULL is never on its own proof the finding is
+settled: the three reasons are different facts (`u.claimSpoolResult`'s `status`
+out-param names them) and a claim is taken BEFORE its owner has read the bytes,
+so a live HOLDER may yet find them unparseable and need the worker input the
+other drain would have deleted — and a claim rename that simply FAILED (EACCES,
+EBUSY, EIO, a Windows sharing violation) means nobody owns it and nobody read
+it. So a result the prompt-time drain could not judge puts its job in a third
+state, DEFERRED — neither pruned nor re-driven — and only a verdict this pass
+actually READ discharges the input. The prompt-time drain then consumes a result
+only AFTER its `<session>.nudged-injected` marker and journal line are written,
+so a crash in between leaves the result intact rather than a window with neither
+a debt nor a finding; the next drain reconciles it against that marker and
+consumes it without re-injecting. That marker write is the sole record of the
+debt the consume discharges, so it is not best-effort HERE: `u.appendLine`
+reports whether the line landed, and an unwritable marker keeps the result (a
+re-injected finding is noise; one consumed against a marker nobody wrote is
+gone). The residual, deliberately left: the marker precedes the hook's own
+output, so a crash in THAT gap loses one injection — the mirror ordering would
+trade a bounded loss for an unbounded double-inject, and the acceptance suite
+pins the consume inside the drain. The spool WORKER
+owes before it clears (`runSpoolWorker` in util.js): the `.in.json` is the job's
+debt and is unlinked only once the classifier's verdict is durable — the
+`.out.json` landed, or the verdict was definitive with nothing to write. A
+backend failure or a failed result write leaves it owed, and the prompt-time
+drain's orphan sweep re-drives a stale input exactly ONCE before pruning, so the
+debt has a collector and still cannot spin. The re-drive is ordered OWE BEFORE
+YOU CLEAR: the job is COPIED to `<hash>.redriven.in.json` with COPYFILE_EXCL
+(the atomic claim — exactly one of two overlapping sweeps creates it, and the
+fresh copy carries a fresh orphan horizon, so no separate mtime stamp exists to
+fail and no sweep prunes a job mid-classification), the worker is spawned on the
+COPY, and only then is the original unlinked. Renaming first made the claim and
+the retry-spent stamp one write, so a crash between it and the spawn left a file
+whose name said its retry was spent when no worker had ever run — and the next
+sweep deleted the only copy of the job. Now that crash leaves the original
+BESIDE the copy, and a copy with its original still present is proof the spawn
+never landed: the sweep re-copies (healing a torn copy) and re-spawns it. A
+spawn that throws removes the copy and keeps the original, since a retry that
+never started is not spent; a copy found ALONE is a retry that ran and died, and
+is pruned. The bound is one extra classifier call per job — the one case that
+repeats is a box where spawning cannot work at all, which retries at most once
+per orphan horizon and spends no backend call. Both halves of the pair are
+reconciled against settled state first — a `<hash>.out.json` this pass could
+ACCOUNT FOR (read and parsed; never by filename alone, since an unreadable or
+unparseable result holds no verdict and pruning its input on the strength of its
+name deletes the last copy of both) or a file already in
+`<session>.nudged-injected` is pruned, never re-driven into a second classifier
+call or a second injection. Every mutation of the pair — the settled prune
+included — runs under ONE exclusive per-job lock (`u.claimSpoolJob`): COPYFILE_EXCL is the atomic claim for a FIRST re-drive
+but cannot guard the RECOVERY arm, which re-copies over a `.redriven.in.json`
+that already exists, so two overlapping sweeps could both re-copy — tearing the
+copy under a worker already reading it — and both spawn. That lock is NOT a
+well-known pathname broken by a check-then-unlink — see-it, judge-it-stale,
+unlink-it, re-create-it is not a claim, and two sweepers could both break one
+stale lock, both `wx` it, and then delete each OTHER's (the loser's break takes
+the winner's lock, the winner's release takes its successor's). Instead each
+contender creates ONLY its own uniquely-named
+`<hash>.redrive.lock-<pid>-<ts>-<rand>` and deletes ONLY its own; everything a
+racer must judge is in the NAME, so there is no create-then-write window to
+misread; and ownership is decided by a listing taken AFTER the create — you hold
+the job only if no other LIVE contender is present, which two contenders can
+never both conclude (each creates before it lists). A lock whose pid is gone or
+whose stamp is past the TTL is ignored by every racer, so a crash self-heals
+within one horizon, and it is unlinked only when provably dead AND expired —
+which, since everyone already ignores it, can neither grant nor revoke
+ownership. A lock we cannot take means only "not ours this pass", never "act
+anyway". The recovery arm's re-copy is a temp-write + atomic RENAME, because a
+stale plain+copy pair also arises when the spawn DID land and only the original's
+unlink failed: owe-before-clear takes the safe reading (one extra classifier
+call), and a rename swaps the inode so a worker already reading the copy keeps
+its intact bytes instead of being torn. Symmetrically, the prompt-time drain
+destroys a RESULT only once its job's input pair is gone: unlinking a result
+while its `.in.json` is still spooled leaves a later sweep looking at exactly the
+re-drive signal ("no result, a stale input"), so every consume — the injected
+one and the discards (already-injected, over the fired cap) — is deferred until
+after the prune, and a result whose input survived is KEPT and reconciled next
+pass rather than destroyed.
+The default synchronous path is byte-identical (the drain and its
+syscalls are gated on the flag). See test/nudge-async.test.js.
 
 The prompt-context engine's digest has the same async pattern as an INTENT GATE
 (issue-spor-user-prompt-submit-digest-noise,
