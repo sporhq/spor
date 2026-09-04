@@ -127,7 +127,8 @@ back — so a page filled entirely by items this worker may not take would hide
 an eligible one ranked below it on every poll, forever. When nothing on the
 page is dispatchable by this worker — un-consented, out of scope, already in
 flight here, or cooling off after a refusal — the read is widened, doubling to
-200, until something is or the queue is exhausted. The
+200 — or, remotely, to the server's own page ceiling of 100 — until something
+is or the queue is exhausted. The
 cooldowns count, deliberately: an item that refuses deterministically (a
 profile this box cannot satisfy) would otherwise pin the page at its own rank
 forever. A pass that finds a candidate on the first page pays nothing extra,
@@ -135,17 +136,23 @@ and in local mode a widened read re-ranks the graph it already loaded. Each
 step of a widening read fetches only its own DELTA (`GET /v1/queue?offset=`,
 the same paging contract `spor next` walks) and appends, and the width a pass
 needed is carried to the next poll — so a worker starved behind a page of
-items it may not take reads that width directly rather than re-walking
-25 → 50 → 100 → 200 every 30 seconds. Only the width actually needed is
+items it may not take pays ONE `GET /v1/queue` per poll rather than re-walking
+25 → 50 → 100 every 30 seconds. Only the width actually needed is
 carried, so a queue whose front becomes dispatchable again narrows straight
-back to the base. A carried width wider than the server's own page ceiling
-(`limit` is clamped at 100, API.md §5) is read in server-sized chunks, and
-whether more of the queue follows is taken from the response's
-`truncated`/`next_offset` rather than from the page's length — a clamped page
-is the server rationing the read, not the end of the queue. Against a server
-too old to honour `?offset` (it re-serves its top page), the read falls back to
-the pre-offset behaviour, re-paging the whole width from the top at each rung,
-so widening still reaches past the base page there. The
+back to the base. That one-read guarantee is why the ladder stops at the
+server's page ceiling remotely (`limit` is clamped at 100, API.md §5): a
+carried width no single page can serve would make every later poll cost two
+round-trips, which is the problem the carry exists to remove. A caller's own
+base ask may still exceed that ceiling (`spor work` sizes its base off
+`--concurrency`); it is honoured in full, read across pages, and whether more
+of the queue follows is taken from the response's `truncated`/`next_offset`
+rather than from the page's length — a clamped page is the server rationing the
+read, not the end of the queue. Against a server too old to honour `?offset`
+(it re-serves its top page — detected by any OVERLAP with what has already been
+read, since a window past everything read cannot repeat it, and a re-ranking
+backend's repeat is never byte-identical), the read falls back to the
+pre-offset behaviour, re-paging the whole width from the top at each rung, so
+widening still reaches past the base page there. The
 skips themselves stay visible: the first five of a pass are named individually
 on stdout and the rest are aggregated by reason (`...and 31 more skipped this
 pass — 31 not agent-ready`); `spor work --status` and `--print` do the same,

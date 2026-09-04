@@ -7415,7 +7415,8 @@ async function compileBriefing(cfg, { nodeId, query, full, project }) {
 // whatever the caller knows about its own slots: the readiness floor, the
 // accept policy, the factory's repo scope, an item already in flight or
 // cooling off here). When one is given and NOTHING on the page passes it, the
-// page is WIDENED — doubling to PAGE_LIMIT_CAP — until something does
+// page is WIDENED — doubling to PAGE_LIMIT_CAP, or to the server's own page
+// ceiling remotely — until something does
 // or the queue runs out. Without that, the policy filter runs after a
 // fixed-size fetch, so a page filled by items this worker may not take
 // (untriaged ones under the default `accept: ready`, a sibling repo's under a
@@ -7426,7 +7427,7 @@ async function compileBriefing(cfg, { nodeId, query, full, project }) {
 // re-paging the whole ranked set at a doubled limit, so reaching the cap costs
 // one cap's worth of items instead of nearly twice that. And the width a call
 // needed is handed back through the caller's `width` box, so `spor work` starts
-// its NEXT poll at that width — one rung, not the whole 25 -> 50 -> 100 -> 200
+// its NEXT poll at that width — ONE read, not the whole 25 -> 50 -> 100
 // ladder every 30s. The box carries only what was NEEDED: a queue whose front
 // becomes dispatchable again narrows back to the base width on the next poll
 // rather than pinning the wide read forever. In local mode the steps share ONE
@@ -7434,17 +7435,21 @@ async function compileBriefing(cfg, { nodeId, query, full, project }) {
 // Two things the SERVER's paging contract forces on that walk (API.md §5),
 // both of which a naive "a short page is the end of the queue" read gets wrong:
 //   - `limit` is CLAMPED to the server's page max, not rejected. A request
-//     wider than that comes back short BY THE SERVER'S CHOICE, so the walk asks
-//     in <=SERVER_PAGE_MAX chunks and takes exhaustion from the envelope's
-//     `truncated`/`next_offset` rather than from the page's length. Without
-//     that, a carried width of 200 read the top 100 and called the queue
-//     exhausted — re-pinning the very starvation this widening exists to break,
-//     one rung deeper.
+//     wider than that comes back short BY THE SERVER'S CHOICE, so exhaustion is
+//     taken from the envelope's `truncated`/`next_offset` rather than from the
+//     page's length. Without that, a width of 200 read the top 100 and called
+//     the queue exhausted — re-pinning the very starvation this widening exists
+//     to break, one rung deeper. And because a width past that ceiling is not
+//     ONE read, the LADDER itself stops there remotely (see `cap` below): the
+//     carried width a starved worker re-reads every 30s is by construction a
+//     width the server will serve in a single GET.
 //   - a server too old to honour `?offset` re-serves its TOP page. That is
-//     detected on the first non-zero offset, and the walk then FALLS BACK to
-//     the pre-offset behaviour — re-paging the whole read from offset 0 at each
-//     doubled width, replacing what it assembled — so widening still reaches an
-//     item ranked deep on an old backend instead of stopping at the base page.
+//     detected by OVERLAP — any item a page at a non-zero offset shares with
+//     what we have already read is a window we did not ask for — and the walk
+//     then FALLS BACK to the pre-offset behaviour, re-paging the whole read
+//     from offset 0 at each doubled width and replacing what it assembled, so
+//     widening still reaches an item ranked deep on an old backend instead of
+//     stopping at the base page.
 const PAGE_LIMIT_CAP = 200;
 // GET /v1/queue's own page ceiling (API.md §5: "default 20, max 100 — values
 // above the max are clamped, not rejected").
@@ -7454,15 +7459,26 @@ async function dispatchableQueuePage(cfg, slug, LIMIT = 25, { eligible = null, m
   // it already loaded instead of re-reading every node file per step; the next
   // poll starts fresh and sees new nodes.
   const ctx = {};
-  // A base wider than the cap is honoured as-is (the cap bounds the WIDENING,
-  // not the caller's ask) — it is still read in server-sized chunks.
+  // A base wider than the ceiling is honoured as-is (the ceiling bounds the
+  // WIDENING, not the caller's ask) — it is still read in server-sized chunks.
   const step = Math.max(1, LIMIT);
-  // Start at the width the caller last NEEDED, never below the base step.
-  const carried = Number(width && width.limit);
-  let target = Math.max(step, Math.min(Number.isFinite(carried) ? carried : 0, maxLimit));
   // Local ranking has no server in between, so it answers any width in one
   // call; a remote read is chunked to what the server will actually serve.
   const pageMax = cfg.mode() === "remote" ? SERVER_PAGE_MAX : Infinity;
+  // The ladder's own ceiling, which remotely is the SERVER's page ceiling
+  // rather than `maxLimit`. The width this call hands back is re-read on EVERY
+  // later poll of a starved worker, and the whole point of carrying it is that
+  // the poll then costs ONE `GET /v1/queue` — so widening to a width no single
+  // GET can be served would buy depth by making every subsequent poll cost two
+  // round-trips, trading the fix for a smaller version of the problem. Depth
+  // past one server page is not reachable in one read at all: `PAGE_LIMIT_CAP`
+  // was written when the widened read was a single request, and remotely that
+  // request was clamped to 100 long before this ladder existed, so 200 was
+  // never actually served. Local mode has no such ceiling and keeps the cap.
+  const cap = Math.min(maxLimit, pageMax);
+  // Start at the width the caller last NEEDED, never below the base step.
+  const carried = Number(width && width.limit);
+  let target = Math.max(step, Math.min(Number.isFinite(carried) ? carried : 0, cap));
   const seen = new Set();
   let read = 0; // raw items the ranker has handed back across this call = the next offset
   let items = []; // the winnowed page assembled from every fetch
@@ -7479,10 +7495,20 @@ async function dispatchableQueuePage(cfg, slug, LIMIT = 25, { eligible = null, m
     if (want <= 0) break;
     const res = await fetchQueuePage(cfg, slug, want, ctx, at);
     const raw = res.items;
-    // A page at a NON-ZERO offset holding nothing we have not already read is
-    // a backend that ignored `?offset` and re-served its top page. Re-run this
-    // rung the old way rather than reading that page for the rest of the walk.
-    if (offsets && at > 0 && raw.length && !raw.some((it) => it && !seen.has(it.id))) {
+    // A backend that honours `?offset=<everything read so far>` serves a window
+    // that begins strictly PAST what we have read, so it cannot contain an item
+    // we have already seen. ANY overlap therefore means the window we were
+    // served is not the one we asked for — an old backend re-serving its top
+    // page. Testing that the page is IDENTICAL is too weak: such a server
+    // re-RANKS between requests (that is what a queue does), so one item having
+    // moved made the duplicate top page look like genuine progress, and the
+    // walk then advanced its offset over a page it had never been given and
+    // silently lost every eligible item below it. Re-run this rung the old way
+    // rather than reading that page for the rest of the walk. A genuinely
+    // paging server can trip this only by GAINING an item above the window
+    // mid-walk, which costs one re-page from the top — the pre-offset
+    // behaviour — and never a lost item.
+    if (offsets && at > 0 && raw.some((it) => it && seen.has(it.id))) {
       offsets = false;
       continue;
     }
@@ -7505,12 +7531,14 @@ async function dispatchableQueuePage(cfg, slug, LIMIT = 25, { eligible = null, m
     // The QUEUE ran out, as the server itself reported it. Never inferred from
     // a short page: a clamped `limit` produces one too.
     if (!res.more) break;
-    // Still filling this rung — read the rest of it before widening.
+    // Still filling this rung — read the rest of it before widening. Only a
+    // base ask wider than one server page can get here (the ladder itself
+    // stops at `cap`), so a widened poll is one request by construction.
     if (read < target) continue;
-    if (target >= maxLimit) break;
-    target = Math.min(target * 2, maxLimit);
+    if (target >= cap) break;
+    target = Math.min(target * 2, cap);
   }
-  if (width) width.limit = needed ? ladderWidth(needed, step, maxLimit) : target;
+  if (width) width.limit = needed ? ladderWidth(needed, step, cap) : target;
   return items;
 }
 
@@ -13028,12 +13056,13 @@ async function cmdWork(cfg, { values }) {
   // The page width the last pass NEEDED, carried across polls
   // (task-spor-queue-api-offset-paging). A worker whose only eligible work sits
   // below a page of items it may not take widens to reach it — and without this
-  // it re-walks that ladder from the base width on every poll, paying up to four
+  // it re-walks that ladder from the base width on every poll, paying several
   // GET /v1/queue round-trips every 30s to reach the same item. Carried, that
-  // width is read directly — in server-sized chunks, since the server clamps a
-  // page at 100 — instead of re-climbing the ladder; and because
-  // dispatchableQueuePage hands back only the width it actually needed, a queue
-  // whose front becomes dispatchable again narrows straight back to the base.
+  // width is read in ONE request — the ladder does not widen past what the
+  // server serves in a single page, precisely so this carried width stays a
+  // one-read poll; and because dispatchableQueuePage hands back only the width
+  // it actually needed, a queue whose front becomes dispatchable again narrows
+  // straight back to the base.
   const pageWidth = {};
 
   // `--regate <run>`: re-judge one refused run under this factory and exit —
