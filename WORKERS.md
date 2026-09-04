@@ -846,8 +846,11 @@ outside git (a database on a fixed port, a `db reset`):
   on the `art-gate-*` fact WITH the first attempt's failure as evidence and
   an outcome line that names it a rerun, so the flakes stay countable in the
   gate telemetry — and a suite that fails on every run is charged as one
-  failure whose outcome says how many runs it failed. The lease, when
-  declared, is held across the reruns. The suite sees `SPOR_GATE_ATTEMPT`
+  failure whose outcome says how many runs it failed. "The same tree" is
+  literal: the judged worktree is prepared ONCE for the whole loop (the
+  protected paths forced back, the repo's worktree-setup hook run) and every
+  rerun executes in that one checkout, torn down after the last run. The
+  lease, when declared, is held across the reruns. The suite sees `SPOR_GATE_ATTEMPT`
   (1 for the declared run, N+1 for the Nth rerun) beside the rest of its
   environment.
 
@@ -1351,9 +1354,12 @@ stage, run only after every declared gate has passed:
 - **`serialize`** — the lease's scope; `repo` is the only value today (the
   merge queue is per-repo, not per-machine or per-org).
 - **`reruns`** (default 0, at most 3) — the same bounded same-tree rerun a
-  command gate has (§10.3): the candidate suite runs again before a failure
-  becomes a fix cycle, and a rerun-rescued pass lands with the first
-  failure's evidence on its `art-merge-*` fact.
+  command gate has (§10.3): the candidate suite runs again on the ONE
+  candidate worktree (never rebuilt) before a failure becomes a fix cycle,
+  a rerun-rescued pass lands — or, in `propose` mode, opens its PR — with
+  the first failure's evidence on its `art-merge-*` fact beside the PR url,
+  and a suite that fails every run is charged one failure whose outcome
+  says how many runs it failed.
 
 **The run holds its slot through integration.** The runner folds the
 integration stage into the SAME promise `deps.gate` already returns (§10.2), so
