@@ -218,21 +218,40 @@ only copy of a body that does not exist. BOTH drains claim a `.out.json` with an
 atomic rename before reading it (`u.claimSpoolResult`,
 dec-spor-nudge-drain-atomic-claim), so one finding is never both injected and
 captured; the claimed name still ends in `.out.json`, so a result the SessionEnd
-drain deliberately KEEPS stays visible to every later sweep. The spool WORKER
+drain deliberately KEEPS stays visible to every later sweep — which is also why
+a claim is HELD, not just taken: a re-claim is refused while the claiming pid is
+still ALIVE (bounded by a 5min stamp TTL for a recycled pid), so a hook that
+exited hands its claim straight back while a drain genuinely mid-capture keeps
+it. The prompt-time drain then consumes a result only AFTER its
+`<session>.nudged-injected` marker and journal line are written, so a crash in
+between leaves the result intact rather than a window with neither a debt nor a
+finding; the next drain reconciles it against that marker and consumes it
+without re-injecting. The spool WORKER
 owes before it clears (`runSpoolWorker` in util.js): the `.in.json` is the job's
 debt and is unlinked only once the classifier's verdict is durable — the
 `.out.json` landed, or the verdict was definitive with nothing to write. A
 backend failure or a failed result write leaves it owed, and the prompt-time
-drain's orphan sweep re-drives a stale input exactly ONCE — claimed by an atomic
-RENAME to `<hash>.redriven.in.json` so overlapping sweeps can't both spawn —
-before pruning, so the debt has a collector and still cannot spin. Three rules
-keep that claim honest: the orphan horizon is refreshed BEFORE the rename (which
-carries the inode's mtime across, so claim and stamp are ONE write and a failed
-refresh abandons the redrive rather than leaving a claimed-but-stale input the
-next sweep prunes mid-classification); a spawn that throws hands the claim BACK,
-since a retry that never started is not spent; and an input is reconciled
-against settled state first — a `<hash>.out.json` in the same listing (the
-worker reached a verdict, only its cleanup failed) or a file already in
+drain's orphan sweep re-drives a stale input exactly ONCE before pruning, so the
+debt has a collector and still cannot spin. The re-drive is ordered OWE BEFORE
+YOU CLEAR: the job is COPIED to `<hash>.redriven.in.json` with COPYFILE_EXCL
+(the atomic claim — exactly one of two overlapping sweeps creates it, and the
+fresh copy carries a fresh orphan horizon, so no separate mtime stamp exists to
+fail and no sweep prunes a job mid-classification), the worker is spawned on the
+COPY, and only then is the original unlinked. Renaming first made the claim and
+the retry-spent stamp one write, so a crash between it and the spawn left a file
+whose name said its retry was spent when no worker had ever run — and the next
+sweep deleted the only copy of the job. Now that crash leaves the original
+BESIDE the copy, and a copy with its original still present is proof the spawn
+never landed: the sweep re-copies (healing a torn copy) and re-spawns it. A
+spawn that throws removes the copy and keeps the original, since a retry that
+never started is not spent; a copy found ALONE is a retry that ran and died, and
+is pruned. The bound is one extra classifier call per job — the one case that
+repeats is a box where spawning cannot work at all, which retries at most once
+per orphan horizon and spends no backend call. Both halves of the pair are
+reconciled against settled state first — a `<hash>.out.json` this pass could
+ACCOUNT FOR (read and parsed; never by filename alone, since an unreadable or
+unparseable result holds no verdict and pruning its input on the strength of its
+name deletes the last copy of both) or a file already in
 `<session>.nudged-injected` is pruned, never re-driven into a second classifier
 call or a second injection.
 The default synchronous path is byte-identical (the drain and its

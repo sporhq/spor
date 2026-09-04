@@ -257,24 +257,76 @@ function drainPendingNudges(graph, input, slug) {
   const injected = injectedLines.length;
   const injectedFiles = new Set(injectedLines);
 
+  // Per-result accounting, and the set of hashes whose DEBT the pass could
+  // account for. An input `.in.json` is owed until its verdict is durable
+  // somewhere else, so the settled set is built from what was actually READ —
+  // never from a bare filename (row (d)). An output that could not be read, or
+  // whose bytes do not parse into a result, holds no verdict at all, and
+  // pruning its input on the strength of its NAME deletes the last copy of
+  // both.
+  const settled = new Set();
   const results = [];
   for (const f of files) {
+    const hash = u.spoolResultHash(f);
     // Claim before reading (dec-spor-nudge-drain-atomic-claim): the SessionEnd
     // drain reads this same spool, and without the claim an overlapping pair
     // can inject a finding here and capture it there. See u.claimSpoolResult.
     const claimed = u.claimSpoolResult(dir, f);
-    if (!claimed) continue; // another drain took it
+    if (!claimed) {
+      // Another drain owns it. Injecting it there or capturing it at
+      // SessionEnd discharges the same debt, so its input is not ours to keep.
+      settled.add(hash);
+      continue;
+    }
     const fp = path.join(dir, claimed);
+    // A failed READ is not a malformed result, and only the second is
+    // terminal: EIO, EMFILE, EACCES and a Windows sharing violation all read
+    // fine on a later sweep, so they keep the result AND its input. ENOENT is
+    // neither — the file is already gone, so there is nothing left to keep.
+    let raw = null;
+    try {
+      raw = fs.readFileSync(fp, "utf8");
+    } catch (e) {
+      if (e && e.code === "ENOENT") settled.add(hash);
+      continue;
+    }
     let r = null;
     try {
-      r = JSON.parse(fs.readFileSync(fp, "utf8"));
+      r = JSON.parse(raw);
     } catch {}
-    // Consume every drained file whether or not it's injected — an over-cap or
-    // unreadable result must not linger and re-inject on the next prompt.
-    try {
-      fs.unlinkSync(fp);
-    } catch {}
-    if (r && r.file && r.facts && injected + results.length < 3) results.push(r);
+    if (!r || !r.file || !r.facts) {
+      // Bytes that do not parse into a usable result reach the same verdict on
+      // every future sweep, so the result itself is terminal and must not
+      // linger and re-inject. Deliberately NOT settled: if the worker's input
+      // is still spooled it is now the only recoverable copy of the job, and
+      // the sweep below re-drives it rather than deleting both.
+      try {
+        fs.unlinkSync(fp);
+      } catch {}
+      continue;
+    }
+    // A readable verdict: the job is answered, whatever happens to it here.
+    settled.add(hash);
+    if (injectedFiles.has(r.file)) {
+      // Already surfaced this session — including the crash window below,
+      // where the marker landed and the unlink did not. Consume it, never
+      // re-inject it.
+      try {
+        fs.unlinkSync(fp);
+      } catch {}
+      continue;
+    }
+    if (injected + results.length >= 3) {
+      // Over the session's fired cap. Consumed rather than left to re-inject
+      // next prompt: the count only ever grows, so it can never come back
+      // under the cap (parity with the synchronous nudge, which simply stops
+      // firing after 3).
+      try {
+        fs.unlinkSync(fp);
+      } catch {}
+      continue;
+    }
+    results.push({ r, fp });
   }
 
   // RE-DRIVE, then GC (bounds the spool leak): an input still sitting here an
@@ -285,36 +337,36 @@ function drainPendingNudges(graph, input, slug) {
   // it one more worker rather than silently dropping a classification the
   // session already paid the tool-loop reservation for.
   //
-  // The claim is an atomic RENAME taken BEFORE the spawn — not a check then a
-  // write, because two overlapping sweeps would both pass the check and both
-  // spawn. The winner's rename succeeds, every loser's fails with ENOENT, and
-  // the new name still ends in `.in.json` so the job stays visible to this
-  // sweep; carrying `.redriven.` is what marks its one retry spent, so the
-  // NEXT sweep prunes it instead of spinning it round again. A claim that
-  // cannot be taken leaves a job that is pruned on the following sweep — the
-  // bound that keeps a poison input out of a respawn loop, and the reason this
-  // adds at most one classifier call per spooled job.
+  // The re-drive itself is ordered OWE BEFORE YOU CLEAR (row (b)): the job is
+  // COPIED to the retry-spent `<hash>.redriven.in.json` name, the worker is
+  // spawned on that copy, and only THEN is the original unlinked. The copy is
+  // created with COPYFILE_EXCL, which is the atomic claim two overlapping
+  // sweeps race for — exactly one creates it, every loser gets EEXIST and
+  // skips, so the retry is still spent at most once. The old order RENAMED
+  // first, which made the claim and the retry-spent stamp the same write: a
+  // crash between it and the spawn left a file whose name said its retry was
+  // spent when no worker had ever run, and the next sweep deleted the only
+  // copy of the job. Now that same crash leaves the original sitting BESIDE
+  // the copy, and a copy with its original still present is proof the spawn
+  // never landed — so the sweep re-spawns it (refreshing the copy from the
+  // original, which also heals a copy torn by that crash) instead of
+  // discarding it. A synchronous spawn failure removes the copy and keeps the
+  // original: a retry that never started has not been spent.
   //
-  // Three things that ride ON the claim rather than beside it, because a debt
-  // marker whose own write can fail is not a debt marker:
+  // The bound is unchanged — a copy whose worker DID run and die is pruned on
+  // the next sweep, so one spooled job still costs at most one extra
+  // classifier call. The one case that repeats is a box where spawning a
+  // worker cannot work at all: the pair stays, and the sweep tries again once
+  // per orphan horizon. That is rate-limited, spends no backend call, and is
+  // strictly better than deleting a classifier-verified finding because a
+  // spawn failed.
   //
-  //  * the HORIZON is refreshed BEFORE the rename, on the original name, and a
-  //    refresh that fails abandons the redrive entirely. rename() carries the
-  //    inode's mtime across, so the claim lands already-fresh in ONE stamp —
-  //    where the refresh used to follow the claim and be swallowed, leaving a
-  //    claimed-but-stale input the very next sweep pruned out from under a
-  //    worker still classifying it.
-  //  * a spawn that throws HANDS THE CLAIM BACK (rename to the unclaimed
-  //    name), because the claim marks the one retry SPENT and a retry that
-  //    never started has not been spent. Only a spawn that actually landed
-  //    leaves the job marked.
-  //  * an input is reconciled against SETTLED state before it is re-driven at
-  //    all: a `<hash>.out.json` in this same listing means the worker did
-  //    reach a verdict and only its own cleanup failed, and a job whose file
-  //    is already in `.nudged-injected` has been surfaced. Either way the debt
-  //    is discharged — the input is pruned instead of spending a second
-  //    classifier call, or (for the injected case) re-injecting a finding this
-  //    session has already seen.
+  // Two reconciliations run BEFORE any of that (row (d)): an input whose
+  // `<hash>.out.json` this pass could account for has already reached a
+  // verdict — only its own cleanup failed — and an input whose file is in
+  // `.nudged-injected` has been surfaced. Either way the debt is discharged,
+  // so it is pruned instead of spending a second classifier call or re-showing
+  // a finding this session has already seen.
   //
   // Deliberately do NOT rmdir an emptied dir: a worker's result lands seconds
   // after its input clears, so the dir is legitimately empty mid-classification
@@ -323,56 +375,92 @@ function drainPendingNudges(graph, input, slug) {
   // wider journal GC lands.
   try {
     const now = Date.now();
-    // The settled set is read off the PRE-drain listing, so a result this pass
-    // has just injected still counts as a discharged debt.
-    const settledHashes = new Set(files.map(u.spoolResultHash));
+    const rm = (p) => {
+      try {
+        fs.unlinkSync(p);
+      } catch {}
+    };
+    // Pair each job's original with its re-drive copy: the two names are one
+    // job, and every decision below is about the PAIR, not about a filename.
+    const jobs = new Map();
     for (const f of all) {
       if (!f.endsWith(".in.json")) continue;
-      const fp = path.join(dir, f);
+      const hash = f.replace(/(?:\.redriven)?\.in\.json$/, "");
+      const e = jobs.get(hash) || {};
+      if (f.endsWith(".redriven.in.json")) e.copy = true;
+      else e.plain = true;
+      jobs.set(hash, e);
+    }
+    for (const [hash, has] of jobs) {
+      const plain = has.plain ? path.join(dir, `${hash}.in.json`) : null;
+      const copy = path.join(dir, `${hash}.redriven.in.json`);
       try {
-        if (settledHashes.has(f.replace(/(?:\.redriven)?\.in\.json$/, ""))) {
-          fs.unlinkSync(fp); // its verdict already landed; only the cleanup failed
+        if (settled.has(hash)) {
+          // Its verdict already landed (and this pass injected, consumed or
+          // handed it on) — only the worker's own cleanup failed.
+          if (plain) rm(plain);
+          if (has.copy) rm(copy);
           continue;
         }
-        if (now - fs.statSync(fp).mtimeMs <= PENDING_ORPHAN_MS) continue;
-        if (!f.includes(".redriven.")) {
-          let job = null;
-          try {
-            job = JSON.parse(fs.readFileSync(fp, "utf8"));
-          } catch {}
-          if (job && job.file && injectedFiles.has(job.file)) {
-            fs.unlinkSync(fp); // already surfaced — re-driving it would re-inject it
-            continue;
-          }
-          try {
-            const t = now / 1000;
-            fs.utimesSync(fp, t, t); // rename carries this across the claim
-          } catch {
-            continue; // no fresh horizon, so do not claim one
-          }
-          const claimed = path.join(dir, f.replace(/\.in\.json$/, ".redriven.in.json"));
-          try {
-            fs.renameSync(fp, claimed); // atomic: exactly one sweep wins
-          } catch {
-            continue; // lost the claim (another sweep took it) — nothing to prune
-          }
-          try {
-            u.spawnDetached([path.join(__dirname, "nudge-worker.js"), claimed]);
-          } catch {
-            try {
-              fs.renameSync(claimed, fp); // the retry was never spent — give it back
-            } catch {}
-          }
+        // The file that GOVERNS the pair is the re-drive copy when there is
+        // one: it carries the horizon a running worker is protected by, and
+        // the original's older stamp says nothing about that worker.
+        const governing = has.copy ? copy : plain;
+        if (!governing) continue;
+        if (now - fs.statSync(governing).mtimeMs <= PENDING_ORPHAN_MS) continue;
+        let job = null;
+        try {
+          job = JSON.parse(fs.readFileSync(governing, "utf8"));
+        } catch {}
+        if (job && job.file && injectedFiles.has(job.file)) {
+          if (plain) rm(plain); // already surfaced — re-driving it re-injects it
+          if (has.copy) rm(copy);
           continue;
         }
-        fs.unlinkSync(fp); // its one retry is spent
+        if (has.copy && !plain) {
+          rm(copy); // its one retry ran and is spent
+          continue;
+        }
+        if (has.copy) {
+          // A stale copy with its original still beside it: the spawn never
+          // landed (it precedes the unlink below), so this retry was never
+          // actually spent. Refresh the copy from the original — healing a
+          // copy the crash tore in half — and drive it.
+          try {
+            fs.copyFileSync(plain, copy);
+          } catch {
+            continue; // cannot re-arm it; the pair keeps the job owed
+          }
+        } else {
+          // First re-drive. COPYFILE_EXCL is the atomic claim: exactly one
+          // sweep creates the copy, and the original is still the debt until
+          // the spawn below has landed.
+          try {
+            fs.copyFileSync(plain, copy, fs.constants.COPYFILE_EXCL);
+          } catch {
+            continue; // lost the claim, or the job could not be copied
+          }
+        }
+        try {
+          u.spawnDetached([path.join(__dirname, "nudge-worker.js"), copy]);
+        } catch {
+          rm(copy); // the retry never started, so it is not spent — hand it back
+          continue;
+        }
+        rm(plain); // the worker owns the job now; the original is discharged
       } catch {}
     }
   } catch {}
 
   if (!results.length) return "";
 
-  for (const r of results) {
+  for (const { r, fp } of results) {
+    // OWE BEFORE YOU CLEAR (row (b)): the injected marker — and the journal
+    // line the capture-metrics correlation reads — are written while the
+    // result file is still on disk, and only then is it consumed. A crash in
+    // between leaves the result claimed but INTACT, and the next drain
+    // reconciles it against that marker above (consume, do not re-inject);
+    // clearing first left a window with neither a debt nor a finding in it.
     u.appendLine(injectedState, r.file);
     // Journal the fired nudge (async) so lib/capture-metrics.js correlates it to
     // a subsequent capture, exactly like the synchronous nudge's journal line.
@@ -380,6 +468,9 @@ function drainPendingNudges(graph, input, slug) {
       path.join(graph, "journal", `${session}.jsonl`),
       JSON.stringify({ ts: u.jqNow(), project: slug, tool: "nudge", file: r.file, facts: r.nfacts, async: true })
     );
+    try {
+      fs.unlinkSync(fp);
+    } catch {}
   }
 
   // Cap the merged fact blocks so the framing — the actionable "capture it NOW"
@@ -388,7 +479,7 @@ function drainPendingNudges(graph, input, slug) {
   // cut mid-instruction by the host's additionalContext ceiling).
   const blocks = u.byteHead(
     results
-      .map((r) => `The file you wrote (${r.file}) contains findings that do not appear to be in the team graph:\n\n${u.stripTrailingNewlines(r.facts)}`)
+      .map(({ r }) => `The file you wrote (${r.file}) contains findings that do not appear to be in the team graph:\n\n${u.stripTrailingNewlines(r.facts)}`)
       .join("\n\n"),
     7000
   );

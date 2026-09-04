@@ -1658,11 +1658,39 @@ function runSpoolWorker(inFile, classify, buildOutput) {
 // sweep, and a crash between the claim and the capture strands nothing. Any
 // previous claim segment is stripped first, so re-claiming across sweeps cannot
 // grow the name. Returns the claimed basename, or null when the claim was lost.
+//
+// That same visibility is why a claim is not only taken but HELD: a name ending
+// in `.out.json` can be re-claimed the instant it is written, including while
+// its first owner is still acting on it — the double action the claim exists to
+// stop (the prompt drain injecting a finding the SessionEnd drain is
+// mid-capture, say). So a claim stamped by a pid that is still ALIVE is refused
+// until it goes stale. Liveness, not a bare timeout, is what makes the hold
+// safe for a last-chance drain: a hook process is over in milliseconds, so it
+// hands its claim back by exiting, and only a drain genuinely still running
+// keeps one. The TTL is the backstop for the one case liveness misreads — a
+// recycled pid — and bounds any hold at SPOOL_CLAIM_TTL_MS.
 const SPOOL_CLAIM_RE = /(?:\.claim-\d+-\d+)?\.out\.json$/;
+const SPOOL_CLAIM_STAMP = /\.claim-(\d+)-(\d+)\.out\.json$/;
+const SPOOL_CLAIM_TTL_MS = 300000; // 5min: longer than any drain, short enough to self-heal
 function spoolResultHash(f) {
   return f.replace(SPOOL_CLAIM_RE, "");
 }
+function claimHeldByLiveOwner(f) {
+  const m = SPOOL_CLAIM_STAMP.exec(f);
+  if (!m) return false;
+  const pid = Number(m[1]);
+  if (pid === process.pid) return false; // our own claim is ours to retake
+  if (Date.now() - Number(m[2]) >= SPOOL_CLAIM_TTL_MS) return false;
+  try {
+    process.kill(pid, 0);
+    return true; // alive: it may still be acting on this finding
+  } catch (e) {
+    // EPERM means the pid exists under another uid — alive. ESRCH means gone.
+    return Boolean(e && e.code === "EPERM");
+  }
+}
 function claimSpoolResult(dir, f) {
+  if (claimHeldByLiveOwner(f)) return null;
   const claimed = `${spoolResultHash(f)}.claim-${process.pid}-${Date.now()}.out.json`;
   try {
     fs.renameSync(path.join(dir, f), path.join(dir, claimed));
