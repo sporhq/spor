@@ -670,6 +670,27 @@ test("parseRescueReport reads the structured diagnosis in code — last fence wi
   assert.deepStrictEqual([empty.ok, empty.diagnosis, empty.error], [false, "", "the rescue left no report"]);
 });
 
+// issue-spor-rescue-and-fix-sessions-end-turn-waiting-on-background-job: the
+// two report shapes a headless session that backgrounds its suite leaves
+// behind. (1) The paid-for one — prose only, ending on "I'll commit once the
+// notification arrives": unread, tail salvaged for the escalation, so the
+// person sees what the rescue was waiting on. (2) The shape the prompt now
+// asks for — the block written EARLY, before verification, with the session
+// cut short after it: the early block is read, so a truncated rescue still
+// yields its category instead of "unknown".
+test("parseRescueReport on a session that ended its turn waiting on a background suite: prose-only is unread with the waiting sentence salvaged; an EARLY block survives the truncation", () => {
+  const waiting = gates.parseRescueReport(
+    "Diagnosed F1 as a real off-by-one and fixed it in x.js with a test. Four targeted suites pass. The only remaining item is the commit, which waits on the full suite that is already running in the background. I'll commit as soon as its completion notification arrives."
+  );
+  assert.strictEqual(waiting.ok, false, "no fenced block was emitted — unread");
+  assert.strictEqual(waiting.category, "unknown");
+  assert.match(waiting.diagnosis, /I'll commit as soon as its completion notification arrives\.$/, "the escalation shows the person the sentence the session ended on");
+  const early = gates.parseRescueReport(
+    "Diagnosis first, as asked:\n```json\n{\"diagnosis\": \"F1 is a real off-by-one the fixer kept widening\", \"category\": \"real-defect\", \"fixed\": false, \"filed\": []}\n```\nNow fixing. Edited x.js and the test; the full suite is running in the backgr"
+  );
+  assert.deepStrictEqual(early, { ok: true, diagnosis: "F1 is a real off-by-one the fixer kept widening", category: "real-defect", fixed: false, filed: [] }, "the early block is the diagnosis even though the session never restated it");
+});
+
 // task-spor-review-gate-durable-debt-flag-checklist: the durable-debt table
 // is ONE constant rendered into the review, fix and worker prompts, so the
 // rows are named the same way everywhere ("row (c)" means the same thing to a
