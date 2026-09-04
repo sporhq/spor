@@ -135,10 +135,17 @@ and in local mode a widened read re-ranks the graph it already loaded. Each
 step of a widening read fetches only its own DELTA (`GET /v1/queue?offset=`,
 the same paging contract `spor next` walks) and appends, and the width a pass
 needed is carried to the next poll — so a worker starved behind a page of
-items it may not take reads ONE page per poll at the width that reaches its
-work, rather than re-walking 25 → 50 → 100 → 200 every 30 seconds. Only the
-width actually needed is carried, so a queue whose front becomes dispatchable
-again narrows straight back to the base. The
+items it may not take reads that width directly rather than re-walking
+25 → 50 → 100 → 200 every 30 seconds. Only the width actually needed is
+carried, so a queue whose front becomes dispatchable again narrows straight
+back to the base. A carried width wider than the server's own page ceiling
+(`limit` is clamped at 100, API.md §5) is read in server-sized chunks, and
+whether more of the queue follows is taken from the response's
+`truncated`/`next_offset` rather than from the page's length — a clamped page
+is the server rationing the read, not the end of the queue. Against a server
+too old to honour `?offset` (it re-serves its top page), the read falls back to
+the pre-offset behaviour, re-paging the whole width from the top at each rung,
+so widening still reaches past the base page there. The
 skips themselves stay visible: the first five of a pass are named individually
 on stdout and the rest are aggregated by reason (`...and 31 more skipped this
 pass — 31 not agent-ready`); `spor work --status` and `--print` do the same,
