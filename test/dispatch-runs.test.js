@@ -1383,8 +1383,17 @@ test("stopRun: the whole process GROUP is signalled, escalated to SIGKILL, and i
     `;
     const leader = spawn(process.execPath, ["-e", leaderSrc], { stdio: "ignore", detached: true });
     try {
-      for (let i = 0; i < 100 && !fs.existsSync(pidFile); i += 1) await new Promise((r) => setTimeout(r, 25));
-      const grandchild = Number(fs.readFileSync(pidFile, "utf8"));
+      // Wait for CONTENT, not existence: the grandchild's writeFileSync is a
+      // truncating open() then a write(), and a poll between them reads ''
+      // (Number('') is 0, which fails the liveness assertion below as a
+      // phantom) — the same race the dispatch stubs' waitForFile closes
+      // (art-gate-acceptance-spor-claude-bg-prose-sweep-aft-febdf471-53e607fa).
+      let pidText = "";
+      for (let i = 0; i < 100 && !pidText; i += 1) {
+        try { pidText = fs.readFileSync(pidFile, "utf8"); } catch { /* not yet */ }
+        if (!pidText) await new Promise((r) => setTimeout(r, 25));
+      }
+      const grandchild = Number(pidText);
       assert.ok(grandchild > 0 && runner.pidAlive(grandchild), "the fixture must actually have a live grandchild to stop");
       const stopped = await runner.stopRun(
         { run_id: "stop-group", runner_pid: leader.pid, runner_started_ticks: runner.processStartTicks(leader.pid) },

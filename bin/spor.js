@@ -11255,7 +11255,15 @@ function makeGateDeps(
     // already on the trusted ref. Consulted only for an adopted pipeline.
     resolved: async () => verifyRunResolution(cfg, record),
     landed: async ({ trustedRef }) => gateRunner.gateHeadLanded(record, trustedRef),
-    runSuite: async ({ gate, trustedRef, protectedPaths }) => {
+    // The judged tree is prepared ONCE per gate and handed back as a suite
+    // handle: `run(attempt)` executes the declared command on it, `close()`
+    // tears it down. The gate runner's rerun loop (WORKERS.md §10.3
+    // `reruns`) calls `run` once per attempt on this ONE checkout — the
+    // same worktree, the same forced protected paths, the same staged
+    // dependencies — so a rerun is literally the same tree, not a fresh
+    // build that happens to have the same sha, and the setup/teardown hooks
+    // fire once for the whole loop rather than once per run.
+    openSuite: async ({ gate, trustedRef, protectedPaths }) => {
       if (!change) return { ok: false, reason: "the change under judgement could not be read" };
       // The repo's own worktree-setup hook stages the throwaway tree exactly as
       // it stages an implementer's worktree (node_modules, a pinned sibling
@@ -11268,25 +11276,31 @@ function makeGateDeps(
         teardown: (dir) => teardownThrowawayTree(dir, change.top, { slug, nodeId: entry.node_id, role: "gate", warn }),
       });
       if (!tree.ok) return tree;
-      try {
-        // What the suite is judging, in its env (task-spor-gate-command-
-        // change-env): a script can `git diff $SPOR_GATE_BASE..$SPOR_GATE_HEAD`
-        // inside the tree and decide what to run, the way a CI job reads the
-        // pull request's file list.
-        const env = {
-          ...worktreeDeclaredEnv(tree.dir),
-          SPOR_GATE_STAGE: "gate",
-          SPOR_GATE_BASE: change.base,
-          SPOR_GATE_HEAD: change.head,
-          SPOR_TRUSTED_REF: trustedRef,
-          SPOR_GATE_NODE: entry.node_id || "",
-        };
-        return await runGateCommand(gate, tree.dir, { env });
-      } finally {
-        // AFTER the await, not after the call: runGateCommand is async, so a
-        // bare `return` here would tear the worktree down under a running suite.
-        tree.cleanup();
-      }
+      return {
+        ok: true,
+        dir: tree.dir,
+        run: async (attempt = 1) => {
+          // What the suite is judging, in its env (task-spor-gate-command-
+          // change-env): a script can `git diff $SPOR_GATE_BASE..$SPOR_GATE_HEAD`
+          // inside the tree and decide what to run, the way a CI job reads the
+          // pull request's file list.
+          const env = {
+            ...worktreeDeclaredEnv(tree.dir),
+            SPOR_GATE_STAGE: "gate",
+            SPOR_GATE_BASE: change.base,
+            SPOR_GATE_HEAD: change.head,
+            SPOR_TRUSTED_REF: trustedRef,
+            SPOR_GATE_NODE: entry.node_id || "",
+            // 1 for the declared run, N+1 for the Nth same-tree rerun — a
+            // suite can log or tighten itself on a rerun.
+            SPOR_GATE_ATTEMPT: String(attempt),
+          };
+          return await runGateCommand(gate, tree.dir, { env });
+        },
+        // Called by the runner only after the LAST run has returned (its loop
+        // awaits each run), never under a running suite.
+        close: () => tree.cleanup(),
+      };
     },
     // The per-gate serialize lease (task-spor-gate-serialize-lease) reuses the
     // integration stage's: keyed on the repo's MAIN checkout locally, the
@@ -11813,7 +11827,7 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       // sha instead; a no-op restore returns `sha` unchanged.
       return integrationRunner.reconcileCandidateSha({ dir, sha });
     },
-    runSuite: ({ dir, base, head }) =>
+    runSuite: ({ dir, base, head, attempt = 1 }) =>
       gateRunner.runGateCommand({ id: "integration", command: integration.command, timeoutMs: integration.timeoutMs }, dir, {
         env: {
           ...worktreeDeclaredEnv(dir),
@@ -11822,6 +11836,7 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
           SPOR_GATE_HEAD: head || "",
           SPOR_TRUSTED_REF: factory.trustedRef,
           SPOR_GATE_NODE: entry.node_id || "",
+          SPOR_GATE_ATTEMPT: String(attempt),
         },
       }),
     land: (args) => integrationRunner.landCandidate(args),

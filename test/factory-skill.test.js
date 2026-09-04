@@ -188,6 +188,7 @@ test("the emitted integration block parses with the runner's own vocabulary", ()
     serialize: "repo",
     cycles: 1,
     timeoutMs: 900000,
+    reruns: 0,
   });
   // mode: propose now parses (task-spor-integration-propose-mode landed PR-
   // landing via gh) — the skill's emitted vocabulary must match the runner's.

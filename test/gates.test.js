@@ -41,6 +41,23 @@ test("a factory declares an ordered list of the three gate kinds", () => {
   assert.strictEqual(factory.testLaneProfile, "profile-test-writer");
   assert.strictEqual(factory.gates[1].cycles, 2);
   assert.strictEqual(factory.gates[0].timeoutMs, gates.GATE_DEFAULTS.commandTimeoutMs);
+  assert.strictEqual(factory.gates[0].reruns, 0, "a command gate declares no reruns by default");
+});
+
+test("a command gate's `reruns` is a bounded same-tree rerun budget: default 0, declared as given, capped at 3, and read by rerunDecision", () => {
+  const declared = gates.parseFactory(factoryBody({ ...INLINE, gates: [{ id: "acceptance", kind: "command", command: "npm test", reruns: 1 }] }), { id: "factory-demo" });
+  assert.deepStrictEqual(declared.errors, []);
+  assert.strictEqual(declared.factory.gates[0].reruns, 1);
+  const capped = gates.parseFactory(factoryBody({ ...INLINE, gates: [{ id: "acceptance", kind: "command", command: "npm test", reruns: 99 }] }), { id: "factory-demo" });
+  assert.strictEqual(capped.factory.gates[0].reruns, gates.GATE_DEFAULTS.maxReruns);
+  const junk = gates.parseFactory(factoryBody({ ...INLINE, gates: [{ id: "acceptance", kind: "command", command: "npm test", reruns: "lots" }] }), { id: "factory-demo" });
+  assert.strictEqual(junk.factory.gates[0].reruns, 0, "an unreadable value falls back to the default, never to unbounded");
+  // attempt is 1-based: `reruns: 1` is exactly two runs.
+  assert.strictEqual(gates.rerunDecision({ reruns: 1 }, 1), "rerun");
+  assert.strictEqual(gates.rerunDecision({ reruns: 1 }, 2), "charge");
+  assert.strictEqual(gates.rerunDecision({}, 1), "charge", "a definition with no reruns key is byte-identical to before the knob");
+  assert.strictEqual(gates.rerunDecision(null, 1), "charge");
+  assert.strictEqual(gates.rerunCap({ reruns: 7 }), gates.GATE_DEFAULTS.maxReruns);
 });
 
 test("an INLINE gate and a REFERENCED shareable gate node fold into the same object", () => {

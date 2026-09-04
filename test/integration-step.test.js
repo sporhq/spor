@@ -62,7 +62,15 @@ test("a valid integration block resolves with its declared shape and sensible de
     serialize: "repo",
     cycles: 0,
     timeoutMs: 900000,
+    reruns: 0,
   });
+});
+
+test("integration.reruns parses like a command gate's: declared as given, capped at 3", () => {
+  const one = factoryOf({ ...BASE, integration: { mode: "local", command: "npm test", reruns: 1 } });
+  assert.strictEqual(one.factory.integration.reruns, 1);
+  const capped = factoryOf({ ...BASE, integration: { mode: "local", command: "npm test", reruns: 50 } });
+  assert.strictEqual(capped.factory.integration.reruns, gates.GATE_DEFAULTS.maxReruns);
 });
 
 test("integration.target_ref really defaults to the FACTORY's own trusted_ref, not a hardcoded 'main'", () => {
@@ -101,6 +109,7 @@ test("mode: propose loads — PR-landing for orgs whose policy requires review (
     serialize: "repo",
     cycles: 0,
     timeoutMs: 900000,
+    reruns: 0,
   });
 });
 
@@ -230,6 +239,70 @@ test("a candidate SUITE FAILURE routes through the SAME fix-cycle machinery, cyc
   assert.strictEqual(seen.escalations.length, 1, "the cap escalates to a human item exactly once");
   assert.strictEqual(seen.demotions.length, 1, "a failure demotes the item, same as a failed gate");
   assert.match(seen.facts[seen.facts.length - 1].markdown, /failed/);
+});
+
+test("a candidate suite FLAKE under `integration.reruns: 1` is re-run on the same candidate and LANDS on the rerun — no fix cycle, the first failure kept as evidence", async () => {
+  const outcomes = [{ ok: false, reason: "npm test exited 1", output: "1 failing\n  waitForFile read '' under load\n" }, { ok: true }];
+  const attempts = [];
+  const { deps, seen } = integrationFakes({
+    suite: (args) => {
+      attempts.push(args.attempt);
+      return outcomes.shift();
+    },
+  });
+  const factory = { ...FACTORY, integration: { ...FACTORY.integration, reruns: 1 } };
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.deepStrictEqual(attempts, [1, 2], "the candidate suite ran twice on ONE candidate");
+  assert.strictEqual(seen.builds, 1, "a rerun never rebuilds the candidate");
+  assert.strictEqual(seen.lands, 1);
+  assert.strictEqual(seen.fixes.length, 0, "a rerun is not a fix cycle");
+  assert.strictEqual(seen.escalations.length, 0);
+  const fact = seen.facts[seen.facts.length - 1].markdown;
+  assert.match(fact, /passed on rerun 1 of the same tree after failing/);
+  assert.match(fact, /waitForFile read '' under load/, "the flake stays on the merge fact");
+});
+
+test("a candidate suite that fails on every rerun is charged ONE fix cycle, not one per run", async () => {
+  const { deps, seen } = integrationFakes({ suite: () => ({ ok: false, reason: "npm test exited 1", output: "1 failing" }) });
+  const factory = { ...FACTORY, integration: { ...FACTORY.integration, reruns: 1, cycles: 1 } };
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(seen.suites, 4, "two runs per cycle: the declared run plus one rerun, before and after the fix");
+  assert.strictEqual(seen.fixes.length, 1);
+  assert.strictEqual(seen.escalations.length, 1);
+  // The exhausted budget is on the record everywhere the failure travels: the
+  // fix cycle's brief, the escalation and the merge fact all say how many runs
+  // of the one candidate failed, so the fact never reads like a single run.
+  assert.match(seen.fixes[0].detail, /npm test exited 1 — on every one of 2 runs of the same tree \(1 rerun declared\)/);
+  assert.match(seen.escalations[0].detail, /on every one of 2 runs of the same tree \(1 rerun declared\)/);
+  const fact = seen.facts[seen.facts.length - 1].markdown;
+  assert.match(fact, /on every one of 2 runs of the same tree \(1 rerun declared\)/);
+  assert.match(fact, /1 failing/, "the last run's output is the evidence");
+});
+
+test("a candidate suite that fails with NO rerun declared is charged with its bare reason — the exhausted-runs wording is only for a spent budget", async () => {
+  const { deps, seen } = integrationFakes({ suite: () => ({ ok: false, reason: "npm test exited 1", output: "1 failing" }) });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.doesNotMatch(seen.escalations[0].detail, /on every one of/);
+  assert.match(seen.escalations[0].detail, /^npm test exited 1/);
+});
+
+test("in `propose` mode a rerun-rescued candidate suite opens its PR with the first failure kept as evidence beside the PR url", async () => {
+  const outcomes = [{ ok: false, reason: "npm test exited 1", output: "1 failing\n  waitForFile read '' under load\n" }, { ok: true }];
+  const { deps, seen } = integrationFakes({ suite: () => outcomes.shift() });
+  const factory = { ...FACTORY, integration: { ...FACTORY.integration, mode: "propose", reruns: 1 } };
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "parked");
+  assert.strictEqual(seen.builds, 1, "a rerun never rebuilds the candidate");
+  assert.strictEqual(seen.proposals, 1);
+  assert.strictEqual(seen.fixes.length, 0, "a rerun is not a fix cycle");
+  const fact = seen.facts[seen.facts.length - 1].markdown;
+  assert.match(fact, /Integration proposed/);
+  assert.match(fact, /passed on rerun 1 of the same tree after failing/);
+  assert.match(fact, /https:\/\/github\.com\/demo\/repo\/pull\/42/, "the PR url is still the proposal's evidence");
+  assert.match(fact, /waitForFile read '' under load/, "the flake rides the proposed fact exactly as it would a landed one");
 });
 
 test("a LOST CAS race rebuilds and retries automatically — it is nobody's fix cycle", async () => {

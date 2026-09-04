@@ -69,6 +69,14 @@ convention schema nodes use:
   exactly like an approved one.
 - `gates[].cycles` — how many implementer fix cycles a failing gate gets before
   the runner escalates by filing a human queue item. Default 0.
+- `gates[].reruns` (command gates) and `integration.reruns` — how many times a
+  failed suite is run again on the SAME tree before the failure is charged
+  (default 0, at most 3; the `gate` candidate node documents the rule). The
+  integration candidate suite gets the same budget on the one candidate
+  worktree — a rerun never rebuilds the candidate — and a rerun-rescued pass
+  lands (or, in `propose` mode, opens its PR) with the first failure kept as
+  evidence on the `art-merge-*` fact; a suite that fails every run is charged
+  ONE failure whose outcome says how many runs it failed.
 - `rescue` (optional, WORKERS.md §10.10) — the rescue lane: when any gate has
   spent its fix cycles, BEFORE the human escalation, the runner dispatches
   `rescue.profile` (a strong model by intent; profile-routed only, like a

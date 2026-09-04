@@ -171,8 +171,131 @@ test("a command gate whose suite fails escalates to a human item, and the fact c
   assert.strictEqual(res.escalated_to, "task-gate-acceptance");
   assert.strictEqual(seen.escalations.length, 1);
   assert.strictEqual(seen.fixes.length, 0, "cycles default to 0 — one failure escalates");
+  assert.strictEqual(seen.suites.length, 1, "reruns default to 0 — the suite runs exactly once");
   assert.match(seen.facts[0].markdown, /the sync worker drops records/);
   assert.match(seen.facts[0].markdown, /Escalated to task-gate-acceptance/);
+});
+
+// task-spor-factory-spor-flaky-command-gate-needs-fix-cycle-or-rerun: a
+// declared rerun budget re-runs the SAME suite on the SAME tree before a
+// failure is charged, so a flake costs a suite run, never a fix cycle, a
+// rescue or a person — and never disappears from the record.
+test("a command gate with `reruns: 1` re-runs a failed suite once on the same tree, and a pass on the rerun PASSES with the flake recorded", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", reruns: 1 }] });
+  const outcomes = [{ ok: false, code: 1, output: "1 failing\n  waitForFile read '' under load\n" }, { ok: true }];
+  const attempts = [];
+  const { deps, seen } = fakes({
+    suite: (args) => {
+      attempts.push(args.attempt);
+      return outcomes.shift();
+    },
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.deepStrictEqual(attempts, [1, 2], "the suite ran twice, and each run was told which attempt it was");
+  assert.strictEqual(seen.fixes.length, 0, "a rerun is not a fix cycle");
+  assert.strictEqual(seen.escalations.length, 0);
+  assert.strictEqual(seen.demotions.length, 0);
+  const fact = seen.facts[0].markdown;
+  assert.match(fact, /Gate acceptance — passed/);
+  assert.match(fact, /passed on rerun 1 of the same tree after failing/);
+  assert.match(fact, /waitForFile read '' under load/, "the first attempt's failure rides the passing fact as evidence — the flake stays countable");
+});
+
+test("a command gate whose suite fails on the declared run AND every rerun is charged ONE failure that says how many runs it failed", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", reruns: 2 }] });
+  const { deps, seen } = fakes({ suite: () => ({ ok: false, code: 1, output: "1 failing\n  the sync worker drops records\n" }) });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(seen.suites.length, 3, "the declared run plus two reruns");
+  assert.strictEqual(seen.fixes.length, 0);
+  assert.strictEqual(seen.escalations.length, 1, "exhausted reruns escalate exactly once, like any other failure");
+  assert.match(seen.facts[0].markdown, /on every one of 3 runs of the same tree \(2 reruns declared\)/);
+  assert.match(seen.facts[0].markdown, /the sync worker drops records/);
+});
+
+// The tree is prepared ONCE for the whole rerun loop: a dep exposing
+// `openSuite` (bin/spor.js's door) is opened once, run per attempt on that one
+// handle, and closed once after the last run — a rerun executes in the very
+// checkout the declared run failed in, never a fresh worktree at the same sha.
+test("a command gate with `reruns` opens the judged tree ONCE, runs every attempt on it, and closes it once after the last run", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", reruns: 2, serialize: "repo" }] });
+  const { deps, seen } = fakes({ suite: () => ({ ok: true }) });
+  const events = [];
+  const outcomes = [{ ok: false, code: 1, output: "1 failing\n" }, { ok: false, code: 1, output: "1 failing\n" }, { ok: true }];
+  deps.acquireGateLease = async () => {
+    events.push("lease");
+    return { token: 1 };
+  };
+  deps.releaseGateLease = async () => events.push("release");
+  deps.openSuite = async (args) => {
+    events.push(`open:${args.gate.id}`);
+    return {
+      ok: true,
+      run: async (attempt) => {
+        events.push(`run:${attempt}`);
+        return outcomes.shift();
+      },
+      close: () => events.push("close"),
+    };
+  };
+  deps.runSuite = async () => {
+    events.push("runSuite");
+    return { ok: true };
+  };
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.deepStrictEqual(events, ["lease", "open:acceptance", "run:1", "run:2", "run:3", "close", "release"], "one tree for all three runs, torn down before the lease is released; the one-shot runSuite is never consulted when openSuite is present");
+  assert.strictEqual(seen.suites.length, 0);
+  assert.match(seen.facts[0].markdown, /passed on rerun 2 of the same tree after failing/);
+});
+
+test("a judged tree that cannot be prepared fails the command gate once, with the preparation failure as the reason — nothing to rerun on", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", reruns: 2 }] });
+  const { deps, seen } = fakes({ suite: () => ({ ok: true }) });
+  let opens = 0;
+  deps.openSuite = async () => {
+    opens += 1;
+    return { ok: false, reason: "the trusted ref could not be checked out" };
+  };
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(opens, 1);
+  assert.strictEqual(seen.suites.length, 0);
+  assert.match(seen.facts[0].markdown, /the trusted ref could not be checked out/);
+  assert.doesNotMatch(seen.facts[0].markdown, /on every one of/, "an unprepared tree is not a suite that failed three times");
+});
+
+test("reruns come BEFORE fix cycles: a flake never spends a fix cycle, and a real failure spends its reruns before the first fix is dispatched", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", reruns: 1, cycles: 1 }] });
+  // declared run fails, rerun fails -> fix cycle 1 -> declared run fails, rerun passes
+  const outcomes = [{ ok: false, code: 1, output: "fail A" }, { ok: false, code: 1, output: "fail A" }, { ok: false, code: 1, output: "fail B" }, { ok: true }];
+  const { deps, seen } = fakes({ suite: () => outcomes.shift() });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.strictEqual(seen.suites.length, 4);
+  assert.strictEqual(seen.fixes.length, 1, "one fix cycle, dispatched only after the rerun budget was spent");
+  assert.strictEqual(seen.escalations.length, 0);
+});
+
+test("a serialize lease is held across the reruns — one acquire, one release, however many runs", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", reruns: 2, serialize: "repo" }] });
+  const outcomes = [{ ok: false, code: 1, output: "x" }, { ok: false, code: 1, output: "x" }, { ok: true }];
+  const { deps, seen } = fakes({ suite: () => outcomes.shift() });
+  let acquired = 0;
+  let released = 0;
+  deps.acquireGateLease = async () => {
+    acquired += 1;
+    return { token: "t" };
+  };
+  deps.releaseGateLease = async () => {
+    released += 1;
+  };
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.strictEqual(seen.suites.length, 3);
+  assert.strictEqual(acquired, 1);
+  assert.strictEqual(released, 1);
 });
 
 test("an implementer branch that edits a protected test path fails the gate CLOSED — unrun, unretried, routed to the test lane", async () => {

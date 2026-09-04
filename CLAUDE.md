@@ -651,7 +651,12 @@ at the implementer's commit with every declared protected path forced back to
 unrun and unretried, filing the test change as its own item under the declared
 `test_lane_profile` (a different lane: same entity, same misunderstanding). It
 judges COMMITTED work only — uncommitted TRACKED changes (or an unreadable `git
-status`) refuse the gate, while untracked suite residue is ignored. **agent-review**
+status`) refuse the gate, while untracked suite residue is ignored. A declared
+`reruns` (default 0, max 3; also on the `integration:` block) re-runs the SAME
+command on the SAME tree before a failure is charged — a flaky full suite then
+costs one more suite run, not a fix dispatch or a rescue — and a rerun-rescued
+pass keeps the first failure as evidence on its fact so flakes stay countable
+(`gates.rerunDecision`, task-spor-factory-spor-flaky-command-gate-needs-fix-cycle-or-rerun). **agent-review**
 dispatches a profile-routed (cross-model) review through the same `cmdDispatch`
 path, waits for its terminal state, and parses a fenced-JSON findings verdict in
 code — unreadable, undispatchable or report-less is a FAILURE, never a pass (so

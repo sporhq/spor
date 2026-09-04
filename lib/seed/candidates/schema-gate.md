@@ -32,8 +32,16 @@ The body carries the gate as a fenced ```json payload:
 Keys by kind:
 
 - **command** — `command` (the declared suite, run from the factory's TRUSTED
-  ref), `timeout_ms`, optional `dir`. There is deliberately no way to name a
-  ref or a protected path here: those are the FACTORY's, so one shared gate
+  ref), `timeout_ms`, optional `dir`, optional `serialize`, and optional
+  `reruns` (default 0, at most 3): how many times a FAILED suite is run again
+  on the SAME prepared tree before the failure is charged to a fix cycle, a
+  rescue or a person. A rerun is the same command on the one checkout the
+  declared run failed in (the tree is prepared once for the whole loop), it
+  costs a suite run and never a fix dispatch, and a pass on a rerun PASSES
+  but its `art-gate-*` fact names the rerun and carries the first failure as
+  evidence, so a flaky suite stays countable in the telemetry instead of
+  laundering into clean passes. There is deliberately no way to name a ref
+  or a protected path here: those are the FACTORY's, so one shared gate
   cannot quietly relax another team's trusted boundary.
 - **agent-review** — `profile` (required: the review lane, cross-model by
   convention; the machine's declared binding decides what that actually
@@ -44,7 +52,9 @@ Keys by kind:
   empty list means always), `approval_timeout_ms`, `poll_ms`, `instructions`.
 
 `cycles` is common to all three: how many implementer fix cycles a failure gets
-before the runner escalates to a human queue item.
+before the runner escalates to a human queue item. Reruns come BEFORE fix
+cycles: a command gate spends its `reruns` budget on one tree first, and only
+a suite that failed every run is charged a cycle.
 
 ```json
 {
