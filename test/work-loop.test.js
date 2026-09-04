@@ -1796,6 +1796,59 @@ test("the optional noticeCode hook runs once per pass and a throw never stops th
   assert.ok(calls >= 3, `the throw on the second pass did not stop the loop (${calls} calls)`);
 });
 
+// `--restart-on-land`: the notice reporting a move latches a DRAIN — no new
+// work, exit once the in-flight runs and pipelines settle — so a supervisor
+// restarts the worker on the new code. A drain, not a stop: nothing gating is
+// abandoned. Off, the hook's return value is ignored and the loop is
+// byte-identical.
+test("--restart-on-land drains the in-flight work and exits once the loaded code is moved past; off, the same signal changes nothing", async () => {
+  // On: one run in flight when the move is noticed; the loop takes no more
+  // work, and exits only after that run finishes.
+  let tip = null;
+  const h = harness({
+    queue: [{ id: "task-a" }, { id: "task-b" }],
+    opts: { concurrency: 1, restartOnLand: true },
+    extraDeps: { noticeCode: () => tip },
+    onTick: (s, n) => {
+      if (n === 1) tip = "abc1234"; // main moved during the first wait
+      if (n === 3) s.finishAll({ terminal_state: "resolved" });
+    },
+  });
+  const final = await h.run();
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-a"], "no new work once the move was noticed");
+  assert.strictEqual(final.restart_on_land, true);
+  assert.strictEqual(final.active.length, 0, "exited only after the in-flight run settled");
+  assert.match(final.stop_reason, /moved past \(now abc1234\); exited for a restart \(--restart-on-land\)/);
+  assert.ok(h.log.some((l) => /--restart-on-land — taking no new work; exiting once the 1 run\(s\)\/pipeline\(s\) in flight settle/.test(l)), h.log.join("\n"));
+  assert.ok(h.sleeps.length < 20, "the loop exited on its own, not by the test driver");
+
+  // Off: the same hook return is ignored — every item is taken, the loop runs
+  // until the driver stops it, and the status carries no restart field.
+  let tip2 = "abc1234";
+  const off = harness({
+    queue: [{ id: "task-a" }, { id: "task-b" }],
+    opts: { concurrency: 2 },
+    maxPasses: 3,
+    extraDeps: { noticeCode: () => tip2 },
+  });
+  const finalOff = await off.run();
+  assert.deepStrictEqual(off.dispatched.map((d) => d.id), ["task-a", "task-b"]);
+  assert.strictEqual("restart_on_land" in finalOff, false, "byte-identical status when off");
+  assert.strictEqual(finalOff.stop_reason, "stopped by the test driver");
+});
+
+test("--restart-on-land with nothing in flight exits on the pass that notices the move", async () => {
+  const h = harness({
+    queue: [],
+    opts: { concurrency: 1, restartOnLand: true },
+    extraDeps: { noticeCode: () => "def5678" },
+  });
+  const final = await h.run();
+  assert.strictEqual(h.sleeps.length, 0, "exited before sleeping");
+  assert.match(final.stop_reason, /now def5678/);
+  assert.ok(h.log.some((l) => /taking no new work; exiting now so a supervisor/.test(l)), h.log.join("\n"));
+});
+
 test("makeCodeMovedNotice says once per new tip that the loaded code was moved past, and nothing when it was not", () => {
   const { makeCodeMovedNotice, loadedCodeCommit } = require("../bin/spor.js");
   const fs = require("fs");
@@ -1822,9 +1875,12 @@ test("makeCodeMovedNotice says once per new tip that the loaded code was moved p
   notice(); notice();
   assert.strictEqual(lines.length, 1, "said once per new tip, not once per pass");
   assert.match(lines[0], new RegExp(`moved to ${two} \\(main\\) — this worker still runs the code it loaded at ${loaded.commit}; restart it`));
+  // The pass that says so returns the new tip (what --restart-on-land acts
+  // on); a quiet pass returns nothing.
+  assert.strictEqual(notice(), undefined, "a quiet pass returns nothing");
   fs.writeFileSync(path.join(repo, "a"), "3\n");
   g("commit", "-q", "-am", "three");
-  notice();
+  assert.strictEqual(notice(), g("rev-parse", "--short", "HEAD"), "the pass that notices a move returns the new tip");
   assert.strictEqual(lines.length, 2, "a further move is said again");
   // F4 (issue-spor-rescue-and-fix-sessions-end-turn-waiting-on-background-job):
   // git walks UP, so a probe from a directory INSIDE a checkout that is not

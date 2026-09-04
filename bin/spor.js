@@ -12523,7 +12523,8 @@ function loadedCodeCommit(root = ROOT) {
 // code from has moved past that commit, say so ONCE per new tip — the worker
 // still runs what it loaded, and the operator's remedy is a restart. A
 // checkout that is not a git checkout, or one that has not moved, says
-// nothing (byte-identical to before the notice existed).
+// nothing (byte-identical to before the notice existed). Returns the new tip
+// on the pass that says so, undefined otherwise.
 function makeCodeMovedNotice(loaded, { root = ROOT, log = () => {} } = {}) {
   let noticed = loaded ? loaded.commit : null;
   return () => {
@@ -12532,6 +12533,10 @@ function makeCodeMovedNotice(loaded, { root = ROOT, log = () => {} } = {}) {
     if (!now || now.commit === noticed) return;
     noticed = now.commit;
     log(`work: ${root} moved to ${now.commit}${now.branch ? ` (${now.branch})` : ""} — this worker still runs the code it loaded at ${loaded.commit}; restart it to pick the new code up`);
+    // The tip moved past, for a caller that acts on it (`--restart-on-land`);
+    // every other return above is undefined, so a caller that ignores it
+    // sees nothing new.
+    return now.commit;
   };
 }
 
@@ -12577,6 +12582,12 @@ async function cmdWork(cfg, { values }) {
   const runMaxMs = num("run-max", values["run-max"], { min: 0, max: 720, fallback: cfg.getNum("work.runMaxMs", workLoop.WORK_DEFAULTS.runMaxMs) / 3600000 }) * 3600000;
   const runIdleMs = num("run-idle", values["run-idle"], { min: 0, max: 43200, fallback: cfg.getNum("work.runIdleMs", workLoop.WORK_DEFAULTS.runIdleMs) / 60000 }) * 60000;
   const max = num("max", values.max, { min: 0, max: 1000000, fallback: 0 });
+  // `--restart-on-land` (work.restartOnLand): exit cleanly, once the in-flight
+  // work settles, when the checkout this worker loaded its code from moves past
+  // that code — for a self-hosting factory whose worker sits on the checkout
+  // its own pipelines land onto, run under a supervisor that restarts it. Opt-in
+  // only; the flag wins over the config key.
+  const restartOnLand = values["restart-on-land"] ? true : cfg.getBool("work.restartOnLand", false);
   // The acceptance policy (task-spor-work-accept-policy): which readiness
   // classifications this loop may pick up. `ready` (the default) dispatches
   // only items a person explicitly stamped agent-ready; `open` restores the
@@ -12862,9 +12873,12 @@ async function cmdWork(cfg, { values }) {
       : `work: running @sporhq/spor ${require(path.join(ROOT, "package.json")).version} from ${ROOT} — a worker keeps the code it loaded; restart it after an upgrade you want it to run`
   );
   const noticeCode = makeCodeMovedNotice(loadedCode, { root: ROOT, log: (line) => out(line) });
+  // The flag needs a checkout to watch: an npm install never moves under the
+  // worker (it is replaced by an upgrade), so say once that it is inert.
+  if (restartOnLand && !loadedCode) out(`work: --restart-on-land has nothing to watch — ${ROOT} is not a source checkout; the worker runs until stopped`);
   const final = await workLoop.runWorkLoop({
     opts: {
-      workerId, project: slug, accept, repos: factoryRepos, concurrency, intervalMs, maxIntervalMs, retryAfterMs, max, once: !!values.once, factory: factoryId,
+      workerId, project: slug, accept, repos: factoryRepos, concurrency, intervalMs, maxIntervalMs, retryAfterMs, max, once: !!values.once, factory: factoryId, restartOnLand,
       // The pid-reuse guard for this record: a SIGKILLed worker leaves no
       // stopped_at, and a bare pid probe would read its recycled pid as this
       // worker still running (the same identity check the run store makes).
@@ -15171,6 +15185,7 @@ const COMMANDS = {
       regate: { type: "string", value: "run-id", desc: "re-judge one refused run under the factory (after fixing what refused it) and exit" },
       max: { type: "string", value: "N", desc: "stop after N dispatches (default: run forever)" },
       once: { type: "boolean", desc: "one selection pass, wait for those runs, exit" },
+      "restart-on-land": { type: "boolean", desc: "exit cleanly (after in-flight runs and pipelines settle) when the checkout this worker loaded its code from moves past that code, so a supervisor restarts it on the new code (also work.restartOnLand; self-hosting factories)" },
       status: { type: "boolean", desc: "read back this machine's workers instead of running one" },
       json: { type: "boolean", desc: "machine-readable status (with --status)" },
       profile: { type: "string", value: "profile-id", desc: "pin the profile every dispatch runs under" },

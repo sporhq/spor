@@ -1112,6 +1112,18 @@ pass). It never restarts itself: which code a worker runs is the operator's
 call; the notice only makes the drift visible in the log rather than
 discoverable after a pipeline ran stale.
 
+The operator can make that call once, up front: `--restart-on-land`
+(`work.restartOnLand`, `SPOR_WORK_RESTART_ON_LAND=1`; off by default) is for a
+self-hosting factory whose worker runs from the very checkout its own pipelines
+land onto. The first time that checkout moves past the loaded code, the worker
+stops taking new work and exits cleanly once every run and gate pipeline in
+flight has settled — a drain, not a stop, so no pipeline is abandoned for the
+restarted worker to re-run from gate 0 — with `stop_reason` naming the tip it
+was moved past, and a supervisor (a systemd unit, a shell loop) restarts it on
+the new code. The latch never clears: a further move before the drain finishes
+is logged like any other but changes nothing. On an npm install there is no
+checkout to watch, so the flag says so once at startup and is otherwise inert.
+
 ### 10.7 A refusal is graph state, not a machine-local cooldown
 
 The gate necessarily runs AFTER the run wrote its resolver, so a refused claim
