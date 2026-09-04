@@ -112,22 +112,30 @@
 //
 // There is no hard ceiling on T - T' to lean on: drainOutbox iterates an
 // UNCAPPED spool at 30s per file (x3 attempts), so a box with a large backlog
-// can put minutes between the two. The replay therefore does not pretend to
-// know T'; it brackets it and refuses to decide inside the bracket
-// (sessionEndOutcome):
-//   captured               margin > DRAIN_OBSERVABLE_LAG_MS — the result was on
-//                          disk before the EARLIEST moment the drain could have
-//                          run, so no lag within the ceiling flips it.
-//   too-late               margin <= 0 — the result was not on disk even at the
-//                          LATEST possible drain moment. Sound at any lag.
+// can put minutes between the two. A constant "plausible lag" does NOT repair
+// this — it only relocates the guess into a number nobody can check, and a
+// capture verdict resting on it is still possibly a miss. So the replay closes
+// the bracket from the OTHER end with recorded evidence instead, and every
+// verdict it does reach holds at ANY lag (sessionEndOutcome):
+//   captured               the result was on disk before the session's own last
+//                          recorded transcript entry. SessionEnd fires only
+//                          once the session has ENDED, and every entry is
+//                          written while it is still running, so that entry is
+//                          at or before T' — the EARLIEST moment the drain
+//                          could have run. Lag-free.
+//   too-late               the result was not on disk even at T, the LATEST
+//                          moment it could have run. Lag-free.
 //   drain-time-unresolved  in between — a firing IS observed, but whether it
 //                          preceded or followed the result turns on a gap the
 //                          journal does not record. Indeterminate, and charged
 //                          to the upper bound with the unobserved bucket.
-// `--drain-lag-sec` moves the ceiling (default DRAIN_OBSERVABLE_LAG_MS); the
-// report prints the narrowest capture margin, which is the BREAKEVEN — the
-// smallest drain-to-observable lag that would flip any capture verdict — so the
-// choice of default is auditable rather than load-bearing.
+// The floor is refused when it runs past the latest observable firing (a
+// resumed segment's entry says nothing about when the firing we can see ran),
+// so it can never be read as being ABOVE the drain. `--drain-lag-sec` no longer
+// decides anything: it survives only as a what-if the report prints beside the
+// range — how many INDETERMINATE findings a chosen ceiling would have called
+// captured — and the report prints the narrowest LAG-FREE capture margin, which
+// is the closest any finding came to not being demonstrable at all.
 
 const fs = require("fs");
 const path = require("path");
@@ -158,19 +166,23 @@ const REPLAY_PIN = path.join(__dirname, "sessionend-replay-2026-09-04.json");
 // prompt simply hasn't happened yet. Those are excluded, not scored.
 const DEFAULT_LIVE_WINDOW_MIN = 60;
 
-// How much EARLIER than its observable the drain could have run. Both
-// observables are stamped below sessionEndPendingNudges (see EVERY DRAIN
-// OBSERVABLE IS AN UPPER BOUND above), and the work between them is a remote
-// `drainOutbox` plus local IO. One outbox file's worst case is 30s x 3 attempts
+// SENSITIVITY ONLY — no verdict, and therefore no reported number, depends on
+// this constant (F5). It is a plausible guess at how much EARLIER than its
+// observable the drain could have run: the work between them is a remote
+// `drainOutbox` plus local IO, one outbox file's worst case is 30s x 3 attempts
 // (drain-outbox.js: timeoutMs = maxTimeSec * 1000, retry 2), and the llm-calls
 // observable adds the 6s index fetch — 96s, rounded up to two minutes.
 //
-// This is a WORKING CEILING, not a proof: drainOutbox takes no file cap from
-// distill.js, so a large enough backlog exceeds any constant. It is chosen so
-// that a capture verdict means "no plausible lag flips this", and the report
-// prints the narrowest capture margin so the headroom over the ceiling is
-// visible rather than assumed. Raise it with --drain-lag-sec to test how much
-// lag the corpus tolerates before a capture becomes indeterminate.
+// An earlier revision of this script used it as the capture RULE: a result that
+// beat its observable by more than this was scored `captured`. That was
+// unsound and the review was right to refuse it — drainOutbox takes no file cap
+// from distill.js, so no constant bounds the gap, and any constant chosen
+// silently converts "the result may have landed after the drain" into
+// "surfaced". The capture rule is now derived from evidence instead
+// (`activityFloor`, see sessionEndOutcome) and holds at ANY lag. This survives
+// as `--drain-lag-sec`, which reports how many INDETERMINATE findings would
+// read as captured if you chose to grant a ceiling of that size — an explicit
+// what-if beside the headline, never inside it.
 const DRAIN_OBSERVABLE_LAG_MS = 120000;
 
 // A classifier result is only worth draining when it found ≥1 fact — the async
@@ -551,30 +563,88 @@ function promptDrains({ resultAt, promptAt, shiftMs }) {
 //
 // `tEnd` is an OBSERVABLE, though, not the drain: both readers above are
 // stamped below sessionEndPendingNudges, so the real drain ran at some
-// tEnd - lag with lag >= 0 and no journal record of it. A two-way verdict has
-// to guess which, and guessing `captured` is the direction that hides loss — a
-// result written after the drain but before the observable reads as surfaced
-// (F4). So the bracket is honoured explicitly and the verdict is three-way:
-//   margin > lagMs   captured: the result beat even the EARLIEST drain the
-//                    bracket allows, so no lag within the ceiling flips it.
-//   margin <= 0      too-late: the result was not on disk at the LATEST drain
-//                    the bracket allows either. Sound at any lag.
-//   otherwise        drain-time-unresolved: a firing is observed, but the
-//                    verdict turns on a gap the journal does not record.
+// tEnd - lag with lag >= 0 and no journal record of it. Guessing `captured`
+// inside that gap is the direction that hides loss — a result written after the
+// drain but before the observable would read as surfaced (F4) — and no constant
+// bounds the gap, so a ceiling cannot repair the guess either, it only relocates
+// it into a number nobody can check (F5).
+//
+// So the bracket is closed from BOTH ends with recorded evidence, and no
+// verdict depends on a chosen constant:
+//
+//   UPPER end — the observable. The drain ran at or before it (both readers are
+//   stamped strictly below sessionEndPendingNudges). A result not on disk even
+//   then was not on disk at the drain: `too-late`, sound at any lag.
+//
+//   LOWER end — `activityFloor`, the session's own last recorded activity
+//   (sessionTimeline's lastActivity, clamped to the corpus cutoff). SessionEnd
+//   fires when the session ENDS, and every transcript entry is written while it
+//   is still running, so the drain ran at or after the last entry. A result on
+//   disk before that moment was on disk at the drain: `captured`, and — this is
+//   the point — sound at any lag, because it never reads the observable as the
+//   drain at all.
+//
+// The floor is only admitted when it does not run PAST the latest observable
+// firing. A transcript that grew beyond the last firing we can see is a resumed
+// session whose later segment left no observable, and its last entry then says
+// nothing about when the firing we DID see ran; scoring against it would put
+// the floor above the drain and manufacture the capture this rule exists to
+// avoid. Such a finding falls through to indeterminate.
+//
+//   margin(floor) > 0   captured             lag-free: on disk before the
+//                                            EARLIEST moment the drain could
+//                                            have run.
+//   margin(observable) <= 0
+//                       too-late             lag-free: not on disk even at the
+//                                            LATEST moment it could have run.
+//   otherwise           drain-time-unresolved a firing is observed, but the
+//                                            verdict turns on a gap the journal
+//                                            does not record.
+//
 // Both indeterminate verdicts are charged to the upper bound and withheld from
-// the lower one, so widening the bracket can only ever grow the reported loss.
-function sessionEndOutcome({ resultAt, shiftMs }, drains, lagMs = DRAIN_OBSERVABLE_LAG_MS) {
+// the lower one, so nothing here can shrink the reported loss on an assumption.
+// `lagMs` no longer decides anything; it is carried through as `withinCeiling`
+// purely so the report can say how many indeterminate findings a chosen ceiling
+// WOULD have called captured (see DRAIN_OBSERVABLE_LAG_MS).
+//
+// RESIDUAL, written down rather than papered over: a session that resumed
+// INSIDE the drain-to-observable gap, wrote one entry there, and then went
+// silent without producing a firing of its own would put an entry after the
+// drain yet still at or before the observable, admitting a floor that is
+// marginally too high. It needs a resume landing in a gap of seconds-to-minutes
+// followed by silence, and unlike the ceiling it is not a free parameter — it
+// is a bounded, nameable construction rather than a number chosen to make the
+// captures come out.
+function sessionEndOutcome({ resultAt, shiftMs, activityFloor }, drains, lagMs = DRAIN_OBSERVABLE_LAG_MS) {
   // "observed" is load-bearing: no row and no distill.log line is an absence of
   // EVIDENCE, not evidence of absence, and every downstream tally treats this
   // bucket as indeterminate rather than as a demonstrated loss. See WHY THE
   // RESIDUAL IS A BOUND at the top.
-  if (!drains || !drains.length) return { verdict: "no-sessionend-observed", marginMs: null };
-  const lag = Number.isFinite(lagMs) && lagMs > 0 ? lagMs : 0;
+  if (!drains || !drains.length) {
+    return { verdict: "no-sessionend-observed", marginMs: null, floorMarginMs: null, withinCeiling: false };
+  }
+  // Not drains[drains.length - 1]: both readers sort, but a caller that does not
+  // would silently pick the wrong end and the floor guard below would admit a
+  // floor past the latest firing — the one thing it exists to refuse.
+  let latest = -Infinity;
   let best = -Infinity;
-  for (const d of drains) best = Math.max(best, d - resultAt - shiftMs);
-  if (best > lag) return { verdict: "captured", marginMs: best };
-  if (best <= 0) return { verdict: "too-late", marginMs: best };
-  return { verdict: "drain-time-unresolved", marginMs: best };
+  for (const d of drains) {
+    if (d > latest) latest = d;
+    const m = d - resultAt - shiftMs;
+    if (m > best) best = m;
+  }
+  // Ordered before the floor on purpose: floor <= latest, so a result that
+  // missed the latest observable missed the floor too. Checking the floor first
+  // could only ever agree, never disagree — this way the cheap sound verdict
+  // wins and the two can never contradict each other.
+  if (best <= 0) return { verdict: "too-late", marginMs: best, floorMarginMs: null, withinCeiling: false };
+  const floorUsable = Number.isFinite(activityFloor) && activityFloor > 0 && activityFloor <= latest;
+  const floorMarginMs = floorUsable ? activityFloor - resultAt - shiftMs : null;
+  if (floorMarginMs !== null && floorMarginMs > 0) {
+    return { verdict: "captured", marginMs: best, floorMarginMs, withinCeiling: true };
+  }
+  const lag = Number.isFinite(lagMs) && lagMs > 0 ? lagMs : 0;
+  return { verdict: "drain-time-unresolved", marginMs: best, floorMarginMs, withinCeiling: best > lag };
 }
 
 const COVERED_AT = 0.6;
@@ -721,9 +791,10 @@ function main(argv) {
     process.exit(2);
   }
   const liveWindowMs = liveWindowMin * 60000;
-  // Same guard as --live-window-min, for the same reason: a NaN ceiling makes
-  // every `margin > lag` comparison false, silently reclassifying every capture
-  // as indeterminate and moving the headline with no error.
+  // Same guard as --live-window-min. This one no longer moves a verdict — the
+  // ceiling is a what-if now — but a NaN would silently zero the sensitivity
+  // line beside the range, which reads as "no finding is anywhere near the
+  // bracket" when the truth is that the flag was misspelt.
   const drainLagSec = Number(arg("--drain-lag-sec", DRAIN_OBSERVABLE_LAG_MS / 1000));
   if (!Number.isFinite(drainLagSec) || drainLagSec < 0) {
     console.error(
@@ -880,6 +951,11 @@ function main(argv) {
         facts: v.facts,
         nfacts: v.nfacts,
         shiftMs: asyncEndShift(r, sessionCalls),
+        // The LOWER end of the drain bracket: SessionEnd cannot have fired
+        // before the session's own last recorded entry. Already clamped to the
+        // cutoff by sessionTimeline, so it stays reproducible as the transcript
+        // grows. See sessionEndOutcome.
+        activityFloor: tl.lastActivity,
       });
     }
 
@@ -906,8 +982,12 @@ function main(argv) {
     unresolvedFacts: 0,
     unobserved: 0,
     unobservedFacts: 0,
+    // Of `unresolved`, how many `--drain-lag-sec` would have called captured.
+    unresolvedWithinCeiling: 0,
+    unresolvedWithinCeilingFacts: 0,
   };
   let narrowestMarginMs = null;
+  let narrowestFloorMarginMs = null;
   const uncovered = [];
   const replaySamples = [];
   const verdictByKey = new Map();
@@ -920,9 +1000,14 @@ function main(argv) {
     // firing's loose (post-backend) bracket can never displace its tight one.
     const rows = distillBySession.get(L.session);
     const drains = rows && rows.length ? sessionEndDrains(rows) : distillLogDrains(distillLog, L.session);
-    const { verdict, marginMs } = sessionEndOutcome({ resultAt: L.at, shiftMs: L.shiftMs }, drains, drainLagMs);
+    const { verdict, marginMs, floorMarginMs, withinCeiling } = sessionEndOutcome(
+      { resultAt: L.at, shiftMs: L.shiftMs, activityFloor: L.activityFloor },
+      drains,
+      drainLagMs
+    );
     L.sessionEnd = verdict;
     L.marginMs = marginMs;
+    L.floorMarginMs = floorMarginMs;
     verdictByKey.set(L.key, verdict);
     replaySamples.push({
       key: L.key,
@@ -932,11 +1017,19 @@ function main(argv) {
       nfacts: L.nfacts,
       verdict,
       marginMs,
+      floorMarginMs,
       shiftMs: L.shiftMs,
     });
     if (verdict === "captured") {
       sessionEnd.captured++;
       sessionEnd.capturedFacts += L.nfacts;
+      // The narrowest LAG-FREE slack: how close the closest capture came to not
+      // being demonstrable at all. The old headline reported the margin to the
+      // observable instead, which was the breakeven on a ceiling that no longer
+      // decides anything.
+      if (narrowestFloorMarginMs === null || floorMarginMs < narrowestFloorMarginMs) {
+        narrowestFloorMarginMs = floorMarginMs;
+      }
       if (narrowestMarginMs === null || marginMs < narrowestMarginMs) narrowestMarginMs = marginMs;
       continue;
     }
@@ -946,6 +1039,12 @@ function main(argv) {
     } else if (verdict === "drain-time-unresolved") {
       sessionEnd.unresolved++;
       sessionEnd.unresolvedFacts += L.nfacts;
+      // Sensitivity, not a verdict: how much of the indeterminate bucket a
+      // chosen drain-to-observable ceiling would have called captured.
+      if (withinCeiling) {
+        sessionEnd.unresolvedWithinCeiling++;
+        sessionEnd.unresolvedWithinCeilingFacts += L.nfacts;
+      }
     } else {
       sessionEnd.unobserved++;
       sessionEnd.unobservedFacts += L.nfacts;
@@ -1107,6 +1206,7 @@ function main(argv) {
     sessionsWithLoss: stats.lostSessions.size,
     sessionEnd,
     narrowestMarginMs,
+    narrowestFloorMarginMs,
     uncovered: uncovered.length,
     uncoveredFacts,
     pin: { agreed: pinAgreed.length, drifted: pinDrifted, size: pin.rows.size },
@@ -1190,28 +1290,41 @@ function main(argv) {
       } facts]  (indeterminate — see below)`
     );
     console.log();
-    console.log(`  drain-to-observable lag allowed for: ${Math.round(drainLagMs / 1000)}s (--drain-lag-sec)`);
-    console.log(`  Both observables are stamped BELOW sessionEndPendingNudges in distill(), so`);
-    console.log(`  each one is an UPPER bound on the drain, never the drain itself. A capture`);
-    console.log(`  verdict therefore requires the result to have beaten the observable by more`);
-    console.log(`  than this ceiling; a finding inside it is "drain time unresolved" rather`);
-    console.log(`  than captured, because reading the stamp as the drain would score a result`);
-    console.log(`  written AFTER the drain as surfaced.`);
-    if (narrowestMarginMs !== null) {
+    console.log(`  NO verdict above depends on a chosen constant. Both observables are stamped`);
+    console.log(`  BELOW sessionEndPendingNudges in distill(), so each is an UPPER bound on the`);
+    console.log(`  drain and never the drain itself, and no constant bounds the gap between the`);
+    console.log(`  two. The bracket is therefore closed from both ends with recorded evidence:`);
+    console.log(`    too-late  the result was not on disk even at the observable — the LATEST`);
+    console.log(`              moment the drain could have run.`);
+    console.log(`    captured  the result was on disk before the session's last recorded entry —`);
+    console.log(`              the EARLIEST moment it could have run, since SessionEnd fires`);
+    console.log(`              only once the session has ended.`);
+    console.log(`  Both hold at ANY drain-to-observable lag; anything in between is left`);
+    console.log(`  indeterminate rather than decided.`);
+    if (narrowestFloorMarginMs !== null) {
       console.log();
-      console.log(`  narrowest capture margin ..... ${Math.round(narrowestMarginMs / 1000)}s of slack`);
-      console.log(`  (async reaches SessionEnd earlier by the tool-loop time it gives back; a`);
-      console.log(`   capture needs the session's remaining wall-clock to exceed that. This is`);
-      console.log(`   the closest any finding in the corpus came to losing that race — and the`);
-      console.log(`   BREAKEVEN on the ceiling above: no capture verdict flips until the real`);
-      console.log(`   drain-to-observable lag exceeds it.)`);
+      console.log(
+        `  narrowest capture margin ..... ${Math.round(narrowestFloorMarginMs / 1000)}s of slack (lag-free)`
+      );
+      console.log(`  (async reaches the session's end earlier by the tool-loop time it gives`);
+      console.log(`   back; a capture needs the wall-clock between the result and the session's`);
+      console.log(`   last recorded entry to exceed that. This is the closest any finding in the`);
+      console.log(`   corpus came to losing that race.)`);
     }
     if (sessionEnd.unresolved) {
       console.log();
       console.log(`  "drain time unresolved" means a SessionEnd firing IS observed for the`);
-      console.log(`  session but the result landed within the lag ceiling of its stamp, so`);
-      console.log(`  whether the drain preceded it turns on a gap the journal never recorded.`);
-      console.log(`  Counted with the unobserved bucket in the upper bound, never in the lower.`);
+      console.log(`  session, but the result landed between the earliest and latest moment the`);
+      console.log(`  drain could have run, and the journal records neither. Counted with the`);
+      console.log(`  unobserved bucket in the upper bound, never in the lower.`);
+      console.log(
+        `    of which a ${Math.round(drainLagMs / 1000)}s ceiling would call captured: ${
+          sessionEnd.unresolvedWithinCeiling
+        }  [${sessionEnd.unresolvedWithinCeilingFacts} facts]  (--drain-lag-sec)`
+      );
+      console.log(`    That is a WHAT-IF, deliberately outside the range below: drainOutbox takes`);
+      console.log(`    no file cap from distill.js, so no constant bounds the gap and a ceiling`);
+      console.log(`    only relocates the guess into a number nobody can check.`);
     }
     if (sessionEnd.unobserved) {
       console.log();

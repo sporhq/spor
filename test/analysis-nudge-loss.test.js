@@ -272,36 +272,98 @@ test("asyncEndShift: an errored or NOTHING call still blocked the tool loop", ()
   );
 });
 
-test("sessionEndOutcome: a drain observable is an upper bound, so a near miss is not a capture", () => {
-  // F4. Both observables are stamped BELOW sessionEndPendingNudges in
+test("sessionEndOutcome: the drain bracket is closed with evidence, not with a chosen ceiling", () => {
+  // F4 + F5. Both observables are stamped BELOW sessionEndPendingNudges in
   // distill() — the llm-calls row at the backend START, a distill.log line
   // after a remote drainOutbox and the transcript read — so the stamp proves
   // only that the drain ran at or before it. Reading it AS the drain scores a
-  // result written after the real drain as "captured VERBATIM", which
-  // understates both ends of the residual.
+  // result written after the real drain as "captured VERBATIM" (F4); bounding
+  // the gap with a constant only moves that guess into a number nobody can
+  // check, since drainOutbox takes no file cap from distill.js (F5). So a
+  // capture must be demonstrated from the OTHER end — the session's own last
+  // recorded entry, which the drain cannot precede — and hold at ANY lag.
   const at = Date.parse("2026-08-10T10:00:00Z");
   const drain = (s) => [at + s * 1000];
   const lag = 120000;
-  // 60s of apparent slack against a 120s ceiling: the drain could have run at
-  // any point in that bracket, so the journal does not say whether it saw the
-  // result. Indeterminate — never captured.
-  assert.equal(sessionEndOutcome({ resultAt: at, shiftMs: 0 }, drain(60), lag).verdict, "drain-time-unresolved");
-  // Exactly on the ceiling is still unresolved: the drain may have run at that
-  // instant, and a tie loses for the same reason it does below.
-  assert.equal(sessionEndOutcome({ resultAt: at, shiftMs: 0 }, drain(120), lag).verdict, "drain-time-unresolved");
-  // Beyond it, no lag within the ceiling can flip the verdict.
-  assert.equal(sessionEndOutcome({ resultAt: at, shiftMs: 0 }, drain(121), lag).verdict, "captured");
-  // too-late stays sound at ANY ceiling: the result was not on disk even at the
-  // LATEST drain moment the bracket allows, so an earlier one missed it too.
-  assert.equal(sessionEndOutcome({ resultAt: at, shiftMs: 0 }, drain(-5), lag).verdict, "too-late");
-  assert.equal(sessionEndOutcome({ resultAt: at, shiftMs: 0 }, drain(-5), 0).verdict, "too-late");
-  // The ceiling only ever moves verdicts toward indeterminate, so widening the
-  // bracket can grow the reported loss and never shrink it.
-  assert.equal(sessionEndOutcome({ resultAt: at, shiftMs: 0 }, drain(300), lag).verdict, "captured");
-  assert.equal(sessionEndOutcome({ resultAt: at, shiftMs: 0 }, drain(300), 600000).verdict, "drain-time-unresolved");
-  // A garbled ceiling degrades to zero rather than to NaN — every comparison
-  // against NaN is false, which would silently reclassify every capture.
-  assert.equal(sessionEndOutcome({ resultAt: at, shiftMs: 0 }, drain(1), NaN).verdict, "captured");
+  // No floor: an observable 60s, 121s or an hour after the result all say the
+  // same thing — the drain ran somewhere at or before it, and the journal does
+  // not say where. Indeterminate at EVERY ceiling, including a generous one.
+  for (const s of [60, 121, 3600]) {
+    for (const l of [0, lag, 600000, NaN]) {
+      assert.equal(
+        sessionEndOutcome({ resultAt: at, shiftMs: 0 }, drain(s), l).verdict,
+        "drain-time-unresolved",
+        `observable +${s}s with ceiling ${l} must not be decided without a floor`
+      );
+    }
+  }
+  // With a floor — the session was still writing 30s after the result landed —
+  // the capture is demonstrated, and it does not move with the ceiling.
+  for (const l of [0, lag, 600000, NaN]) {
+    const r = sessionEndOutcome(
+      { resultAt: at, shiftMs: 0, activityFloor: at + 30000 },
+      drain(3600),
+      l
+    );
+    assert.equal(r.verdict, "captured");
+    assert.equal(r.floorMarginMs, 30000);
+    assert.equal(r.marginMs, 3600000); // still reported against the observable
+  }
+  // A floor at or before the result is no demonstration: a tie means the last
+  // entry and the write are simultaneous, and nothing orders them.
+  assert.equal(
+    sessionEndOutcome({ resultAt: at, shiftMs: 0, activityFloor: at }, drain(3600), lag).verdict,
+    "drain-time-unresolved"
+  );
+  // A floor PAST the latest observable firing is refused: the transcript grew
+  // beyond the last firing we can see, so that entry belongs to a resumed
+  // segment and says nothing about when the observed firing ran. Admitting it
+  // would put the floor above the drain and manufacture a capture.
+  assert.equal(
+    sessionEndOutcome({ resultAt: at, shiftMs: 0, activityFloor: at + 4000000 }, drain(3600), lag).verdict,
+    "drain-time-unresolved"
+  );
+  // A garbled floor is refused rather than coerced — NaN/0 must not read as a
+  // demonstration, and must not throw.
+  for (const f of [NaN, 0, undefined, null, Infinity]) {
+    assert.equal(
+      sessionEndOutcome({ resultAt: at, shiftMs: 0, activityFloor: f }, drain(3600), lag).verdict,
+      "drain-time-unresolved"
+    );
+  }
+  // too-late is the mirror demonstration and equally lag-free: the result was
+  // not on disk even at the LATEST moment the drain could have run.
+  for (const l of [0, lag, 600000]) {
+    assert.equal(sessionEndOutcome({ resultAt: at, shiftMs: 0 }, drain(-5), l).verdict, "too-late");
+    // ...and it wins over a floor, which can only ever agree with it: the floor
+    // is at or before the observable, so a result that missed the observable
+    // missed the floor too.
+    assert.equal(
+      sessionEndOutcome({ resultAt: at, shiftMs: 0, activityFloor: at + 30000 }, drain(-5), l).verdict,
+      "too-late"
+    );
+  }
+});
+
+test("sessionEndOutcome: the ceiling is carried as a what-if and decides nothing", () => {
+  // F5. `--drain-lag-sec` survives only so the report can say how many
+  // INDETERMINATE findings a chosen ceiling would have called captured. It must
+  // never change a verdict — if it does, the headline is resting on it again.
+  const at = Date.parse("2026-08-10T10:00:00Z");
+  const drain = (s) => [at + s * 1000];
+  const wide = sessionEndOutcome({ resultAt: at, shiftMs: 0 }, drain(300), 120000);
+  assert.equal(wide.verdict, "drain-time-unresolved");
+  assert.equal(wide.withinCeiling, true); // 300s of apparent slack clears a 120s ceiling
+  const narrow = sessionEndOutcome({ resultAt: at, shiftMs: 0 }, drain(300), 600000);
+  assert.equal(narrow.verdict, "drain-time-unresolved"); // same verdict...
+  assert.equal(narrow.withinCeiling, false); // ...only the what-if moves
+  // A demonstrated capture is inside any ceiling by construction, so the
+  // what-if never double-counts it in the report's sensitivity line.
+  assert.equal(
+    sessionEndOutcome({ resultAt: at, shiftMs: 0, activityFloor: at + 30000 }, drain(300), 600000)
+      .withinCeiling,
+    true
+  );
 });
 
 test("sessionEndOutcome: an unobserved SessionEnd is indeterminate, not a demonstrated loss", () => {
@@ -312,7 +374,21 @@ test("sessionEndOutcome: an unobserved SessionEnd is indeterminate, not a demons
   // the residual is a bound, and calling this `no-sessionend` read as a
   // measured cause.
   const r = sessionEndOutcome({ resultAt: Date.parse("2026-08-10T10:00:00Z"), shiftMs: 5000 }, []);
-  assert.deepEqual(r, { verdict: "no-sessionend-observed", marginMs: null });
+  assert.deepEqual(r, {
+    verdict: "no-sessionend-observed",
+    marginMs: null,
+    floorMarginMs: null,
+    withinCeiling: false,
+  });
+  // ...and an activity floor cannot rescue it: with no firing observed there is
+  // no drain to have preceded, so the floor has nothing to bound.
+  assert.equal(
+    sessionEndOutcome(
+      { resultAt: Date.parse("2026-08-10T10:00:00Z"), shiftMs: 5000, activityFloor: Date.parse("2026-08-10T11:00:00Z") },
+      []
+    ).verdict,
+    "no-sessionend-observed"
+  );
 });
 
 test("distillLogDrains: a distill.log line is a SessionEnd firing the llm-calls journal missed", () => {
@@ -338,18 +414,32 @@ test("distillLogDrains: a distill.log line is a SessionEnd firing the llm-calls 
 });
 
 test("sessionEndOutcome: the session must outlive the tool-loop time async gives back", () => {
-  // Lag ceiling 0 here to isolate the clock correction; the bracket it models
-  // is pinned by the F4 test above.
+  // The async clock correction applies to BOTH ends of the bracket, so it is
+  // pinned on both. The bracket itself is pinned by the F4/F5 test above.
   const at = Date.parse("2026-08-10T10:00:00Z");
   const drain = (s) => [at + s * 1000];
+  const floor = (s) => at + s * 1000;
   // 10s of remaining wall-clock against a 5s shift: the worker's result is on
-  // disk when the drain runs.
-  assert.equal(sessionEndOutcome({ resultAt: at, shiftMs: 5000 }, drain(10), 0).verdict, "captured");
-  // 3s against the same 5s shift: async reached SessionEnd first — the race the
-  // one-turn delay can still lose.
+  // disk before the session's last entry, hence before the drain.
+  assert.equal(
+    sessionEndOutcome({ resultAt: at, shiftMs: 5000, activityFloor: floor(10) }, drain(3600), 0).verdict,
+    "captured"
+  );
+  // 3s against the same 5s shift: async reached the session's end first — the
+  // race the one-turn delay can still lose, and no longer a demonstration.
+  assert.equal(
+    sessionEndOutcome({ resultAt: at, shiftMs: 5000, activityFloor: floor(3) }, drain(3600), 0).verdict,
+    "drain-time-unresolved"
+  );
+  // Exactly on the boundary is NOT a capture: a tie means the last entry and
+  // the write are simultaneous, and nothing orders them.
+  assert.equal(
+    sessionEndOutcome({ resultAt: at, shiftMs: 5000, activityFloor: floor(5) }, drain(3600), 0).verdict,
+    "drain-time-unresolved"
+  );
+  // The same correction on the upper end: 3s of observable against a 5s shift
+  // is a demonstrated miss, and a tie loses there too.
   assert.equal(sessionEndOutcome({ resultAt: at, shiftMs: 5000 }, drain(3), 0).verdict, "too-late");
-  // Exactly on the boundary is NOT a capture: a tie means the drain and the
-  // write are simultaneous, and the drain reads the directory first.
   assert.equal(sessionEndOutcome({ resultAt: at, shiftMs: 5000 }, drain(5), 0).verdict, "too-late");
 });
 
@@ -358,9 +448,22 @@ test("sessionEndOutcome: a later SessionEnd still drains what an earlier one mis
   // until some SessionEnd consumes it — so the BEST firing decides, and the
   // margin reported is that firing's.
   const at = Date.parse("2026-08-10T10:00:00Z");
-  const r = sessionEndOutcome({ resultAt: at, shiftMs: 5000 }, [at - 60000, at + 2000, at + 600000], 0);
+  const r = sessionEndOutcome(
+    { resultAt: at, shiftMs: 5000, activityFloor: at + 10000 },
+    [at - 60000, at + 2000, at + 600000],
+    0
+  );
   assert.equal(r.verdict, "captured");
   assert.equal(r.marginMs, 595000);
+  // The floor guard reads the LATEST firing, not the last element of whatever
+  // order it was handed: an unsorted list must not make a floor look like it
+  // ran past the observable and lose the capture.
+  const unsorted = sessionEndOutcome(
+    { resultAt: at, shiftMs: 5000, activityFloor: at + 10000 },
+    [at + 600000, at - 60000, at + 2000],
+    0
+  );
+  assert.deepEqual(unsorted, r);
 });
 
 test("the committed replay pin is internally consistent", () => {
@@ -396,18 +499,43 @@ test("the committed replay pin is internally consistent", () => {
     h.durablyLostFactsUpper - h.noSessionEndObservedFacts - h.drainTimeUnresolvedFacts,
     h.durablyLostFactsLower
   );
-  // Every capture verdict in the pin was derived under a declared ceiling on
-  // the drain-to-observable lag, and narrowestMarginMs is the breakeven: if the
-  // pin ever committed a capture whose margin sat inside the ceiling, the file
-  // would be asserting a capture the model itself calls unresolved.
-  assert.ok(h.drainLagSec > 0, "the pin must record the lag ceiling its verdicts were derived under");
-  assert.ok(
-    h.narrowestMarginMs > h.drainLagSec * 1000,
-    `narrowest capture margin ${h.narrowestMarginMs}ms is inside the ${h.drainLagSec}s ceiling`
-  );
+  // F5. Every capture verdict in the pin must be LAG-FREE: demonstrated against
+  // the session's own last recorded entry (floorMarginMs), never against a
+  // chosen drain-to-observable ceiling. A committed capture with no positive
+  // floor margin would be resting on the constant again — the exact claim the
+  // rows were re-derived to remove — and no ceiling appears in this check at
+  // all, so tightening or deleting drainLagSec cannot move it.
   for (const f of tally("captured")) {
-    assert.ok(f.marginMs >= h.narrowestMarginMs, `capture ${f.key} is narrower than the reported breakeven`);
+    assert.ok(
+      typeof f.floorMarginMs === "number" && f.floorMarginMs > 0,
+      `capture ${f.key} has no lag-free demonstration (floorMarginMs ${f.floorMarginMs})`
+    );
+    assert.ok(
+      f.floorMarginMs >= h.narrowestFloorMarginMs,
+      `capture ${f.key} is narrower than the reported lag-free breakeven`
+    );
+    // The floor is only admissible when it does not run past the observable;
+    // a row asserting otherwise would have been scored against a resumed
+    // segment's entry (see sessionEndOutcome's floor guard).
+    assert.ok(f.floorMarginMs <= f.marginMs, `capture ${f.key} floor sits past its observable`);
   }
+  assert.ok(
+    h.narrowestFloorMarginMs > 0,
+    "the pin's lag-free breakeven must be positive or no capture in it is demonstrated"
+  );
+  // The ceiling survives in the pin only as the what-if the report prints
+  // BESIDE the range. It may never absorb an indeterminate row into a capture,
+  // so its count is bounded by the indeterminate bucket and stays outside every
+  // number the range is built from.
+  assert.ok(
+    h.drainTimeUnresolvedWithinCeiling <= h.drainTimeUnresolved,
+    "the ceiling what-if cannot exceed the indeterminate bucket it is drawn from"
+  );
+  assert.equal(
+    h.lostFacts - h.capturedFacts,
+    h.durablyLostFactsUpper,
+    "the upper bound must not be net of any ceiling what-if"
+  );
   // THE DENOMINATOR, derived — not asserted. A pin holding only the numerator
   // cannot be audited after the transcripts are pruned: `findingsScored`,
   // `drained` and `factsTotal` would have no rows behind them, and the 7.2%

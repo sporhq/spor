@@ -1,5 +1,5 @@
 {
-  "note": "Per-finding rows from the second counterfactual replay (task-spor-reevaluate-nudge-async-default-post-sessionend), modelling the SHIPPED SessionEnd drain (sessionEndPendingNudges, 2026-08-21). This file is a RESULT, not a lookup table: the ~/.claude/projects transcripts these verdicts were derived from get pruned, and the first run's 2026-07-17 corpus is already fully evicted, so the derived rows are committed to keep the quoted numbers auditable. It carries EVERY SCORED finding, drained ones included, so the headline's DENOMINATOR (findingsScored / drained / factsTotal) is derivable from the file after the transcripts are gone and not merely asserted. measure-async-nudge-loss.js defaults its window to the one below and re-joins these keys, reporting per-finding drift on the drain outcome, the SessionEnd verdict and the fact count. Every verdict here was derived at drainLagSec=120 (--drain-lag-sec): both SessionEnd observables are stamped BELOW the drain in distill(), so a capture verdict means the result beat the observable by more than that ceiling and a smaller margin is reported as drain-time-unresolved rather than captured. narrowestMarginMs is the breakeven — no verdict in this file flips until the real drain-to-observable lag exceeds 365s.",
+  "note": "Per-finding rows from the second counterfactual replay (task-spor-reevaluate-nudge-async-default-post-sessionend), modelling the SHIPPED SessionEnd drain (sessionEndPendingNudges, 2026-08-21). This file is a RESULT, not a lookup table: the ~/.claude/projects transcripts these verdicts were derived from get pruned, and the first run's 2026-07-17 corpus is already fully evicted, so the derived rows are committed to keep the quoted numbers auditable. It carries EVERY SCORED finding, drained ones included, so the headline's DENOMINATOR (findingsScored / drained / factsTotal) is derivable from the file after the transcripts are gone and not merely asserted. measure-async-nudge-loss.js defaults its window to the one below and re-joins these keys, reporting per-finding drift on the drain outcome, the SessionEnd verdict and the fact count. EVERY VERDICT HERE IS LAG-FREE. Both SessionEnd observables are stamped BELOW the drain in distill(), so an observable bounds the drain only from ABOVE and no constant bounds the gap between the two (drainOutbox takes no file cap from distill.js). An earlier revision of these rows was derived under a chosen 120s drain-to-observable ceiling, which made a `captured` verdict rest on a number nobody can check; the bracket is now closed from both ends with recorded evidence instead. `too-late` means the result was not on disk even at the observable \u2014 the LATEST moment the drain could have run. `captured` means it was on disk before that session's last recorded transcript entry (floorMarginMs, the slack) \u2014 the EARLIEST moment it could have run, since SessionEnd fires only once the session has ended. Anything between the two is `drain-time-unresolved` and is charged to the upper bound, never decided. narrowestFloorMarginMs is the closest any capture in the corpus came to not being demonstrable; marginMs and drainLagSec survive only as the what-if the report prints beside the range, and decide nothing. Re-pin rather than re-cite once these transcripts age out.",
   "from": "2026-08-01T00:00:00.000Z",
   "until": "2026-09-04T00:00:00.000Z",
   "date": "2026-09-04",
@@ -13,14 +13,18 @@
     "capturedAtSessionEnd": 10,
     "capturedFacts": 14,
     "tooLate": 0,
+    "tooLateFacts": 0,
     "drainTimeUnresolved": 0,
     "drainTimeUnresolvedFacts": 0,
     "noSessionEndObserved": 4,
     "noSessionEndObservedFacts": 5,
     "durablyLostFactsLower": 0,
     "durablyLostFactsUpper": 5,
+    "narrowestFloorMarginMs": 41344,
+    "narrowestMarginMs": 365091,
     "drainLagSec": 120,
-    "narrowestMarginMs": 365091
+    "drainTimeUnresolvedWithinCeiling": 0,
+    "drainTimeUnresolvedWithinCeilingFacts": 0
   },
   "findings": [
     {
@@ -32,6 +36,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -43,6 +48,7 @@
       "drain": "lost",
       "verdict": "captured",
       "marginMs": 2162796,
+      "floorMarginMs": 1773068,
       "shiftMs": 7653
     },
     {
@@ -54,6 +60,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -65,6 +72,7 @@
       "drain": "lost",
       "verdict": "no-sessionend-observed",
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": 7795
     },
     {
@@ -76,6 +84,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -87,6 +96,7 @@
       "drain": "lost",
       "verdict": "captured",
       "marginMs": 1268672,
+      "floorMarginMs": 1210536,
       "shiftMs": 5048
     },
     {
@@ -98,6 +108,7 @@
       "drain": "lost",
       "verdict": "captured",
       "marginMs": 467078,
+      "floorMarginMs": 347406,
       "shiftMs": 13536
     },
     {
@@ -109,6 +120,7 @@
       "drain": "lost",
       "verdict": "captured",
       "marginMs": 365091,
+      "floorMarginMs": 245419,
       "shiftMs": 5782
     },
     {
@@ -120,6 +132,7 @@
       "drain": "lost",
       "verdict": "captured",
       "marginMs": 1484681,
+      "floorMarginMs": 1382346,
       "shiftMs": 4964
     },
     {
@@ -131,6 +144,7 @@
       "drain": "lost",
       "verdict": "captured",
       "marginMs": 436749,
+      "floorMarginMs": 327341,
       "shiftMs": 4314
     },
     {
@@ -142,6 +156,7 @@
       "drain": "lost",
       "verdict": "captured",
       "marginMs": 483129,
+      "floorMarginMs": 370609,
       "shiftMs": 7732
     },
     {
@@ -153,6 +168,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -164,6 +180,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -175,6 +192,7 @@
       "drain": "lost",
       "verdict": "captured",
       "marginMs": 2436786,
+      "floorMarginMs": 54943,
       "shiftMs": 10278
     },
     {
@@ -186,6 +204,7 @@
       "drain": "lost",
       "verdict": "captured",
       "marginMs": 2423187,
+      "floorMarginMs": 41344,
       "shiftMs": 5417
     },
     {
@@ -197,6 +216,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -208,6 +228,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -219,6 +240,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -230,6 +252,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -241,6 +264,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -252,6 +276,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -263,6 +288,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -274,6 +300,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -285,6 +312,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -296,6 +324,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -307,6 +336,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -318,6 +348,7 @@
       "drain": "lost",
       "verdict": "no-sessionend-observed",
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": 6884
     },
     {
@@ -329,6 +360,7 @@
       "drain": "lost",
       "verdict": "no-sessionend-observed",
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": 3317
     },
     {
@@ -340,6 +372,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -351,6 +384,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -362,6 +396,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -373,6 +408,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -384,6 +420,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -395,6 +432,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -406,6 +444,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -417,6 +456,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -428,6 +468,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -439,6 +480,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -450,6 +492,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -461,6 +504,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -472,6 +516,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -483,6 +528,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -494,6 +540,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -505,6 +552,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -516,6 +564,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -527,6 +576,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -538,6 +588,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -549,6 +600,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -560,6 +612,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -571,6 +624,7 @@
       "drain": "lost",
       "verdict": "captured",
       "marginMs": 998058,
+      "floorMarginMs": 859365,
       "shiftMs": 4357
     },
     {
@@ -582,6 +636,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -593,6 +648,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -604,6 +660,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -615,6 +672,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -626,6 +684,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     },
     {
@@ -637,6 +696,7 @@
       "drain": "lost",
       "verdict": "no-sessionend-observed",
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": 13527
     },
     {
@@ -648,6 +708,7 @@
       "drain": "drained",
       "verdict": null,
       "marginMs": null,
+      "floorMarginMs": null,
       "shiftMs": null
     }
   ]
