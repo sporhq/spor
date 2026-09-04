@@ -332,7 +332,7 @@ function runAsync(args, input, env) {
   });
 }
 
-function stubCaptureServer() {
+function stubCaptureServer(status = 200) {
   const http = require("node:http");
   const hits = [];
   const srv = http.createServer((req, res) => {
@@ -340,8 +340,8 @@ function stubCaptureServer() {
     req.on("data", (c) => (body += c));
     req.on("end", () => {
       hits.push({ method: req.method, url: req.url, body });
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", ids: ["task-stub"] }));
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify(status === 200 ? { status: "ok", ids: ["task-stub"] } : { error: "invalid_capture" }));
     });
   });
   return new Promise((resolve) =>
@@ -484,4 +484,112 @@ test("SessionEnd (remote): a transport failure spools the finding to the outbox"
   const spooled = JSON.parse(fs.readFileSync(path.join(home, "outbox", outbox[0]), "utf8"));
   assert.strictEqual(spooled.source, "nudge-sessionend");
   assert.match(spooled.text, /a session-final finding/);
+});
+
+// issue-spor-session-end-pending-nudges-data-loss: this drain is a finding's
+// LAST chance, so the spool file is consumed only once the finding is durably
+// somewhere else — or is provably uncapturable. A transient failure must leave
+// it where a later sweep can retry it, and that retry must not double-capture.
+
+function distillLog(home) {
+  const p = path.join(home, "journal", "distill.log");
+  return fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "";
+}
+
+test("SessionEnd: a transient local failure keeps the finding in the spool instead of destroying it", () => {
+  const { home, cwd } = scratch();
+  fs.rmSync(path.join(home, "nodes"), { recursive: true }); // graph home not initialized yet
+  const file = path.join(cwd, "doc.md");
+  seedOut(home, "s1", "r0", file, "1. a finding worth keeping");
+
+  const out = runHook(["distill", "--host", "claude-code"], sessionEndPayload(cwd), env(home, null, { SPOR_DISTILL: "0" }));
+  assert.strictEqual(out.status, 0, out.stderr);
+  assert.strictEqual(outFiles(home).length, 1, "an uncaptured finding must survive in the spool");
+  assert.match(distillLog(home), /kept in the spool: no local graph/);
+
+  // ...and the retry lands it, once the graph exists.
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const again = runHook(["distill", "--host", "claude-code"], sessionEndPayload(cwd), env(home, null, { SPOR_DISTILL: "0" }));
+  assert.strictEqual(again.status, 0, again.stderr);
+  assert.strictEqual(outFiles(home).length, 0);
+  assert.strictEqual(nodeFiles(home).length, 1);
+});
+
+test("SessionEnd: a re-drained finding resolves to the node it already wrote, never a second one", () => {
+  const { home, cwd } = scratch();
+  const file = path.join(cwd, "doc.md");
+  seedOut(home, "s1", "r0", file, "1. a finding worth keeping");
+
+  const first = runHook(["distill", "--host", "claude-code"], sessionEndPayload(cwd), env(home, null, { SPOR_DISTILL: "0" }));
+  assert.strictEqual(first.status, 0, first.stderr);
+  const written = nodeFiles(home);
+  assert.strictEqual(written.length, 1);
+
+  // The crash window the deferred consume opens: the node landed but the
+  // spool file outlived it, so the next sweep re-drains the same finding.
+  seedOut(home, "s1", "r0", file, "1. a finding worth keeping");
+  const second = runHook(["distill", "--host", "claude-code"], sessionEndPayload(cwd), env(home, null, { SPOR_DISTILL: "0" }));
+  assert.strictEqual(second.status, 0, second.stderr);
+  assert.deepStrictEqual(nodeFiles(home), written, "a replay must not mint a second node");
+  assert.strictEqual(outFiles(home).length, 0, "and it consumes the file, since the finding is already durable");
+  assert.match(distillLog(home), /already written as task-nudge-sessionend-/);
+
+  // A DIFFERENT finding out of the same file still gets its own node.
+  seedOut(home, "s1", "r1", file, "1. a second, unrelated finding");
+  const third = runHook(["distill", "--host", "claude-code"], sessionEndPayload(cwd), env(home, null, { SPOR_DISTILL: "0" }));
+  assert.strictEqual(third.status, 0, third.stderr);
+  assert.strictEqual(nodeFiles(home).length, 2);
+});
+
+test("SessionEnd: an unreadable result is still consumed (retention is bounded to retryable failures)", () => {
+  const { home, cwd } = scratch();
+  const dir = spoolDir(home, "s1");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "r0.out.json"), "{ not json");
+
+  const out = runHook(["distill", "--host", "claude-code"], sessionEndPayload(cwd), env(home, null, { SPOR_DISTILL: "0" }));
+  assert.strictEqual(out.status, 0, out.stderr);
+  assert.strictEqual(outFiles(home).length, 0, "a result no sweep could ever capture must not linger");
+  assert.strictEqual(nodeFiles(home).length, 0);
+});
+
+test("SessionEnd (remote): an unwritable outbox keeps the finding in the spool", async () => {
+  const { home, cwd } = scratch();
+  fs.rmSync(path.join(home, "nodes"), { recursive: true });
+  const file = path.join(cwd, "notes.md");
+  seedOut(home, "s1", "r0", file, "1. a session-final finding");
+  fs.writeFileSync(path.join(home, "outbox"), "not a directory"); // ensureDir fails
+
+  const e = env(home, null, {
+    SPOR_SERVER: "http://127.0.0.1:1", // nothing listening -> transport failure
+    SPOR_TOKEN: "spor_pat_test",
+    SPOR_DISTILL: "0",
+    SPOR_SESSION_LEASE: "0",
+  });
+  await runAsync(["distill", "--host", "claude-code"], sessionEndPayload(cwd), e);
+  assert.strictEqual(outFiles(home).length, 1, "with nowhere durable to put it, the finding stays spooled");
+});
+
+test("SessionEnd (remote): a server rejection is terminal — consumed, not retried forever", async () => {
+  const { home, cwd } = scratch();
+  fs.rmSync(path.join(home, "nodes"), { recursive: true });
+  const file = path.join(cwd, "notes.md");
+  seedOut(home, "s1", "r0", file, "1. a session-final finding");
+
+  const { srv, hits, base } = await stubCaptureServer(422);
+  try {
+    const e = env(home, null, {
+      SPOR_SERVER: base,
+      SPOR_TOKEN: "spor_pat_test",
+      SPOR_DISTILL: "0",
+      SPOR_SESSION_LEASE: "0",
+    });
+    await runAsync(["distill", "--host", "claude-code"], sessionEndPayload(cwd), e);
+    assert.ok(hits.find((h) => h.url === "/v1/capture"), "expected the capture attempt");
+    assert.strictEqual(outFiles(home).length, 0, "a rejected body reaches the same verdict on every retry");
+    const outbox = fs.existsSync(path.join(home, "outbox")) ? fs.readdirSync(path.join(home, "outbox")) : [];
+    assert.strictEqual(outbox.length, 0, "a rejection is not a transport failure — nothing is spooled");
+  } finally {
+    srv.close();
+  }
 });

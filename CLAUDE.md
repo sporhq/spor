@@ -187,9 +187,19 @@ once that hits 3, further spawns are suppressed — a best-effort analog of the
 synchronous 3-fired early-stop, backstopped by the hard `nudge.maxCalls` ceiling.
 Known tradeoff (inherent to one-turn-delay): a finding in a doc written as the
 FINAL action of a session — no subsequent prompt — is never injected; the
-SessionEnd distiller is the backstop that still captures it. The default
-synchronous path is byte-identical (the drain and its syscalls are gated on the
-flag). See test/nudge-async.test.js.
+SessionEnd distiller is the backstop that still captures it
+(`sessionEndPendingNudges` in distill.js). That drain is a finding's LAST
+chance, so it consumes a `.out.json` only once the finding is durably elsewhere
+(a 200, a spooled outbox payload, a written node) or is provably uncapturable
+(unreadable, already injected, a server 400/413/422, a node the parser or
+validator refuses); a TRANSIENT failure leaves the file spooled for a later
+sweep (issue-spor-session-end-pending-nudges-data-loss). The consume therefore
+trails the durable write, so a crash in the gap re-drains an already-captured
+finding — made idempotent on both sides by keying the capture on
+sha256(session, file, facts): the remote `idempotency_key`, and a
+content-addressed local node id a re-drain resolves to the node it already
+wrote. The default synchronous path is byte-identical (the drain and its
+syscalls are gated on the flag). See test/nudge-async.test.js.
 
 The prompt-context engine's digest has the same async pattern as an INTENT GATE
 (issue-spor-user-prompt-submit-digest-noise,
