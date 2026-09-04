@@ -126,12 +126,19 @@ page, and the policy (and a factory's repo scope, §10.6) filters what comes
 back — so a page filled entirely by items this worker may not take would hide
 an eligible one ranked below it on every poll, forever. When nothing on the
 page is dispatchable by this worker — un-consented, out of scope, already in
-flight here, or cooling off after a refusal — the fetch is repeated with the
-limit doubled, up to 200, until something is or the queue is exhausted. The
+flight here, or cooling off after a refusal — the read is widened, doubling to
+200, until something is or the queue is exhausted. The
 cooldowns count, deliberately: an item that refuses deterministically (a
 profile this box cannot satisfy) would otherwise pin the page at its own rank
 forever. A pass that finds a candidate on the first page pays nothing extra,
-and in local mode a widened read re-ranks the graph it already loaded. The
+and in local mode a widened read re-ranks the graph it already loaded. Each
+step of a widening read fetches only its own DELTA (`GET /v1/queue?offset=`,
+the same paging contract `spor next` walks) and appends, and the width a pass
+needed is carried to the next poll — so a worker starved behind a page of
+items it may not take reads ONE page per poll at the width that reaches its
+work, rather than re-walking 25 → 50 → 100 → 200 every 30 seconds. Only the
+width actually needed is carried, so a queue whose front becomes dispatchable
+again narrows straight back to the base. The
 skips themselves stay visible: the first five of a pass are named individually
 on stdout and the rest are aggregated by reason (`...and 31 more skipped this
 pass — 31 not agent-ready`); `spor work --status` and `--print` do the same,
