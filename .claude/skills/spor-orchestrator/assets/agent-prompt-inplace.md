@@ -171,13 +171,21 @@ the designed path, not a failure on your part.
 also name a file in another repo) does NOT block you and does not authorize you
 to cut a worktree or branch in that other repo — a branch left there is an
 orphan no run table tracks (art-spor-docs-bulk-lease-endpoints-2026-08-10).
-Finish and resolve THIS repo's half here; `/spor:defer` the other repo's half as
-its own queue item stamped to that repo, with enough acceptance text to stand
-alone and a `relates-to` edge to `{{node}}` (this is a piece of your own
-acceptance, not a finding, so you write it yourself even under an
-orchestrator), and name that sibling's id in your resolver and final report.
-Only if the two halves must land together to work at all is it the lockstep
-case above: then stop and leave the node unresolved.
+Finish THIS repo's half here, then re-scope the node BEFORE you resolve it —
+a resolver against the node as written would claim the other half done. In
+order (you write these yourself even under an orchestrator — they are your own
+acceptance, not findings): (1) `/spor:defer` the other repo's half as its own
+queue item stamped to that repo, with enough acceptance text to stand alone and
+a `relates-to` edge to `{{node}}`; (2) `get_node` `{{node}}` for its revision
+and `put_node` (or `spor put-node - --if-exists update --revision <rev>`) a
+body whose acceptance is scoped to this repo and names the sibling for the
+other half, plus a `relates-to` edge to the sibling — skip if the body already
+names it; (3) only then write the resolver (step 7), naming the sibling's id
+there and in your final report. If the narrowing write is refused and a retry
+after a fresh `get_node` still fails, leave the node unresolved and report the
+sibling's id — never resolve against the wider acceptance. Only if the two
+halves must land together to work at all is it the lockstep case above: then
+stop and leave the node unresolved.
 
 ## Final report
 

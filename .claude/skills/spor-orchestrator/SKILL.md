@@ -218,6 +218,13 @@ loop:
                                                        #   there — see "The Codex
                                                        #   implementer").
           if report says MERGE-READY:
+              if report has a HANDED BACK block:  # acceptance the agent could not
+                  if not split_handed_back(node, report):  # file sibling + narrow node
+                      continue                    #   FIRST, or the resolve below lies;
+                                                  #   on a failed narrow keep it in
+                                                  #   running and retry next turn —
+                                                  #   never Recover a done node. See
+                                                  #   "The Codex implementer" step 2.
               resolve_on_graph(node)             # orchestrator writes the resolver
                                                   #   node + resolves edge + terminal
                                                   #   status HERE — before the status
@@ -367,10 +374,15 @@ avoid collisions that will fight at merge time:
   test for which pattern applies: if the two halves would each pass their own
   repo's suite with the other half absent, split; if one half's tests need
   the other's edits on disk, it's the lockstep case and runs solo. The
-  second-worktree pattern is **not** authorized — an implementer that finds
-  the second half mid-task hands it back as a sibling item (see
-  `assets/agent-prompt.md` "If it won't converge"), and you dispatch that
-  sibling next; if an agent nonetheless reports a branch in another repo,
+  second-worktree pattern is **not** authorized — a Claude implementer that
+  finds the second half mid-task files the sibling itself, narrows its own
+  node's acceptance to its repo, and only then resolves (see
+  `assets/agent-prompt.md` "If it won't converge"); a Codex implementer,
+  which cannot write the graph, reports it in a `## HANDED BACK` block and
+  **you** file the sibling and narrow the node before resolving (see "The
+  Codex implementer"). Either way you dispatch that sibling next — and
+  either way the original is never resolved while its body still claims the
+  other repo's half. If an agent nonetheless reports a branch in another repo,
   treat it as an untracked orphan: file the sibling item yourself, point it at
   that branch, and gate+merge it through the same flow as any other branch.
 
@@ -650,6 +662,31 @@ Two things close the gap:
    On `BLOCKED`, or if the process died without a final report, that's a
    genuine non-completion — route it through Recover (above) like any other
    unresolved node, not this exception.
+
+   **A `MERGE-READY` report that carries a `## HANDED BACK` block is not yet
+   resolvable as the node stands.** The block is the Codex twin of a Claude
+   agent's mid-task split (see "Picking non-overlapping work"): acceptance
+   that lives in a repo the agent's worktree never covered, which Codex —
+   unable to write the graph — could only report. Resolving the node as
+   written would claim that half done, so do the split yourself, in this
+   order, *before* `resolve_on_graph`: (1) file the sibling — `put_node` a
+   `task` stamped to the named repo (`repo:`/`project:`) whose body is the
+   block's acceptance text, `relates-to` the node, and make it agent-ready
+   per "Triage each agent's FINDINGS" below (it is a piece of the item, not a
+   finding, so it never waits for that curation pass); (2) narrow the node —
+   `get_node` it for its revision and `put_node` a body whose acceptance is
+   scoped to the agent's repo and names the sibling for the rest, plus a
+   `relates-to` edge to the sibling (skip if the body already names it —
+   you pre-split it at selection, or a prior pass did this); (3) resolve,
+   naming the sibling's id in the resolver body. The sibling is ordinary
+   queue work: dispatch it next like any single-repo item. If the narrowing
+   write fails, do NOT resolve against the wider acceptance and do NOT route
+   the node through Recover (the work is done, only the graph is behind):
+   keep it in `running` with the sibling's id noted and retry (2)-(3) on the
+   next loop turn — the sibling write is idempotent (`put_node --if-exists
+   skip` on the same id), and if by then someone else has narrowed or
+   resolved the node, take the graph's state as final and fall through to
+   gate+merge.
 
 Never resolve a Codex node preemptively — because it's been running a while,
 or because it isn't in `claude agents --json`, or any signal short of a

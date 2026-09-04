@@ -55,8 +55,10 @@ report and leave it for the orchestrator — that's the designed path, not a fai
 If instead the acceptance merely names a file in ANOTHER repo (a docs row elsewhere,
 an independent half that would pass its own tests without yours), do this repo's half
 here and never cut a worktree or branch in the other repo — a branch left there is an
-orphan nobody tracks. Report it as MERGE-READY and list the other-repo half under
-"handed back" in your final report; the orchestrator files it as a sibling item.
+orphan nobody tracks. Report it as MERGE-READY and add a `## HANDED BACK` block to
+your final report (format below). The orchestrator files that block as a sibling queue
+item in the other repo and narrows this node's acceptance to what you did BEFORE it
+resolves this node — so the block must carry enough acceptance text to stand alone.
 
 ## Final report
 End with: what you changed, how you verified (paste the key test/build output), the
@@ -68,6 +70,14 @@ this is the ONLY place these go; you do NOT file them yourself:
     ## FINDINGS FOR THE ORCHESTRATOR
     One tight line each; the orchestrator files each as the right node:
     - [issue|task|smell|better-approach] <file:line or area> — <what + why, 1–2 sentences>
+
+If (and only if) part of this item's acceptance lives in another repo (see "If it won't
+converge"), add a second block — this is NOT a finding, it is unfinished acceptance the
+orchestrator must file before it may resolve this node:
+
+    ## HANDED BACK
+    - repo: <other-repo slug> — <the acceptance text for that half, standing alone:
+      which file(s), what must be true there, and why it belongs to this item>
     Surface: latent bugs you spotted but didn't fix (out of scope); smells / refactors /
     duplication / dead code; **places where following this item literally is clearly
     worse than an alternative** (say what you did, the better approach, and why); missing

@@ -158,15 +158,34 @@ you are not authorized to cut a worktree or a branch in any other repo, and a
 branch you left there would be an orphan nothing in the orchestrator's run
 table tracks (an implementer once pushed exactly such a branch from a docs
 dispatch and it sat unmerged, art-spor-docs-bulk-lease-endpoints-2026-08-10).
-Instead: finish and resolve THIS repo's half here, and hand the other repo's
-half back as its own queue item — `/spor:defer` it (the one exception to step
-5's "don't write to the graph yourself": this is a piece of your own
-acceptance, not a finding), stamped to that repo, with enough of the acceptance
-text to stand alone, and a `relates-to` edge to `{{node}}`. Name that sibling's
-id in your resolver node's body and in your final report so the orchestrator
-dispatches it next. Only if the two halves must land together to work at all
-(one half's tests need the other's edits) is it the lockstep case above:
-then stop and leave the node unresolved.
+Instead, finish THIS repo's half here and, before step 7, re-scope the node so
+its `resolves` edge tells the truth — a resolver against the node *as written*
+would claim the other repo's half done when nobody has touched it. In this
+order, each a graph write you make yourself (the one exception to step 5's
+"don't write to the graph yourself": this is a piece of your own acceptance,
+not a finding):
+
+1. **File the sibling first.** `/spor:defer` the other repo's half as its own
+   queue item, stamped to that repo, carrying enough of the acceptance text to
+   stand alone, with a `relates-to` edge to `{{node}}`. The debt must exist
+   on the graph before anything narrows or resolves the original.
+2. **Narrow `{{node}}`'s own acceptance.** `get_node` it for the current
+   revision, then `put_node` (or `spor put-node - --if-exists update
+   --revision <rev>`) an edited body that scopes the acceptance to this repo
+   and points at the sibling's id for the other half — keep the rest of the
+   body and every existing edge intact. Add a `relates-to` edge from
+   `{{node}}` to the sibling. If the sibling id already appears in the body
+   (the orchestrator pre-split it, or a prior attempt did this), skip this
+   step.
+3. **Only then** write the resolver (step 7) — its body names the sibling's
+   id, and it resolves a node whose acceptance is now exactly what you did.
+
+If the narrowing write in step 2 is refused (revision conflict, validation
+error) and a retry after a fresh `get_node` still fails, do NOT resolve: leave
+`{{node}}` unresolved, say so in your final report with the sibling's id, and
+let the orchestrator narrow and resolve it. Only if the two halves must land
+together to work at all (one half's tests need the other's edits) is it the
+lockstep case above: then stop and leave the node unresolved.
 
 ## Final report
 
