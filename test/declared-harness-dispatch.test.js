@@ -27,6 +27,7 @@ const dispatchHarnesses = require("../lib/shell/dispatch-harnesses.js");
 const sat = require("../lib/kernel/satisfiability.js");
 const { normalizeHarnessDeclaration, declaredAdapter, resolveHarness, harnesses } = dispatchHarnesses;
 const { writeSpawnableNodeStub, pathWithOnlyGitAndNode } = require("./helpers/portable.js");
+const { waitFor, awaitJson, awaitRecord, stubExitTail } = require("./helpers/launch.js");
 
 const HARNESS = "oxalpha";
 
@@ -98,10 +99,8 @@ Declared harness test profile.
 // A fake harness speaking an event shape no in-code adapter knows: the whole
 // point is that the DECLARATION teaches the supervisor where the session id
 // and the final message live.
-// `holdFile` keeps the stub ALIVE until that file exists (a test creates it
-// when it is ready for the run to end), with a 30s backstop so a failed test
-// never leaks a process. It is how a test asserts ORDERING — dispatch returned
-// while the run was still going — without a wall-clock bound.
+// `holdFile` holds the stub alive until the test releases it — see stubExitTail
+// in test/helpers/launch.js for what that proves.
 function harnessStub(home, { writesReport = false, exitCode = 0, delayMs = 0, holdFile = null } = {}) {
   return writeSpawnableNodeStub(home, "ox-stub", `
 const fs = require("node:fs");
@@ -122,17 +121,7 @@ process.stdin.on("end", () => {
     const flag = process.argv.slice(2).find((a) => a.startsWith("--out="));
     fs.writeFileSync(flag.slice("--out=".length), "written by the harness itself\\n");
   }
-  const holdFile = ${JSON.stringify(holdFile)};
-  if (holdFile) {
-    const deadline = Date.now() + 30000;
-    const poll = () => {
-      if (fs.existsSync(holdFile) || Date.now() > deadline) process.exit(${exitCode});
-      setTimeout(poll, 25);
-    };
-    poll();
-  } else {
-    setTimeout(() => process.exit(${exitCode}), ${delayMs});
-  }
+  ${stubExitTail({ holdFile, exitCode, delayMs })}
 });
 `);
 }
@@ -146,34 +135,6 @@ function declarationFor(stub, extra = {}) {
     session: "session.id",
     ...extra,
   };
-}
-
-async function waitFor(read, { timeoutMs = 5000, intervalMs = 25 } = {}) {
-  const end = Date.now() + timeoutMs;
-  while (Date.now() < end) {
-    const value = read();
-    if (value) return value;
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-  return null;
-}
-
-function awaitJson(file) {
-  return waitFor(() => {
-    try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; }
-  });
-}
-
-function awaitRecord(home, predicate) {
-  const runDir = path.join(home, "journal", "dispatch");
-  return waitFor(() => {
-    if (!fs.existsSync(runDir)) return null;
-    const file = fs.readdirSync(runDir).find((name) => name.endsWith(".run.json"));
-    if (!file) return null;
-    let record;
-    try { record = JSON.parse(fs.readFileSync(path.join(runDir, file), "utf8")); } catch { return null; }
-    return predicate(record) ? record : null;
-  });
 }
 
 // ---- the declaration contract ---------------------------------------------

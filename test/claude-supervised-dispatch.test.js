@@ -20,6 +20,7 @@ const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const dispatchHarnesses = require("../lib/shell/dispatch-harnesses.js");
 const { getHarness, launchVariant, discoveryAdapters } = dispatchHarnesses;
 const { writeSpawnableNodeStub } = require("./helpers/portable.js");
+const { waitFor, awaitJson } = require("./helpers/launch.js");
 
 const SESSION = "3d168405-2df8-43be-bf82-1b0802e376ce";
 
@@ -116,22 +117,6 @@ function claudeBgStub(home) {
 const fs = require("node:fs");
 fs.writeFileSync(process.env.OUTFILE, JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd() }, null, 2));
 `);
-}
-
-async function waitFor(read, { timeoutMs = 5000, intervalMs = 25 } = {}) {
-  const end = Date.now() + timeoutMs;
-  while (Date.now() < end) {
-    const value = read();
-    if (value) return value;
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-  return null;
-}
-
-function awaitJson(file) {
-  return waitFor(() => {
-    try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; }
-  });
 }
 
 function runRecordFile(home) {
