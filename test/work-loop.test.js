@@ -1796,6 +1796,59 @@ test("the optional noticeCode hook runs once per pass and a throw never stops th
   assert.ok(calls >= 3, `the throw on the second pass did not stop the loop (${calls} calls)`);
 });
 
+// `--restart-on-land`: the notice reporting a move latches a DRAIN — no new
+// work, exit once the in-flight runs and pipelines settle — so a supervisor
+// restarts the worker on the new code. A drain, not a stop: nothing gating is
+// abandoned. Off, the hook's return value is ignored and the loop is
+// byte-identical.
+test("--restart-on-land drains the in-flight work and exits once the loaded code is moved past; off, the same signal changes nothing", async () => {
+  // On: one run in flight when the move is noticed; the loop takes no more
+  // work, and exits only after that run finishes.
+  let tip = null;
+  const h = harness({
+    queue: [{ id: "task-a" }, { id: "task-b" }],
+    opts: { concurrency: 1, restartOnLand: true },
+    extraDeps: { noticeCode: () => tip },
+    onTick: (s, n) => {
+      if (n === 1) tip = "abc1234"; // main moved during the first wait
+      if (n === 3) s.finishAll({ terminal_state: "resolved" });
+    },
+  });
+  const final = await h.run();
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-a"], "no new work once the move was noticed");
+  assert.strictEqual(final.restart_on_land, true);
+  assert.strictEqual(final.active.length, 0, "exited only after the in-flight run settled");
+  assert.match(final.stop_reason, /moved past \(now abc1234\); exited for a restart \(--restart-on-land\)/);
+  assert.ok(h.log.some((l) => /--restart-on-land — taking no new work; exiting once the 1 run\(s\)\/pipeline\(s\) in flight settle/.test(l)), h.log.join("\n"));
+  assert.ok(h.sleeps.length < 20, "the loop exited on its own, not by the test driver");
+
+  // Off: the same hook return is ignored — every item is taken, the loop runs
+  // until the driver stops it, and the status carries no restart field.
+  let tip2 = "abc1234";
+  const off = harness({
+    queue: [{ id: "task-a" }, { id: "task-b" }],
+    opts: { concurrency: 2 },
+    maxPasses: 3,
+    extraDeps: { noticeCode: () => tip2 },
+  });
+  const finalOff = await off.run();
+  assert.deepStrictEqual(off.dispatched.map((d) => d.id), ["task-a", "task-b"]);
+  assert.strictEqual("restart_on_land" in finalOff, false, "byte-identical status when off");
+  assert.strictEqual(finalOff.stop_reason, "stopped by the test driver");
+});
+
+test("--restart-on-land with nothing in flight exits on the pass that notices the move", async () => {
+  const h = harness({
+    queue: [],
+    opts: { concurrency: 1, restartOnLand: true },
+    extraDeps: { noticeCode: () => "def5678" },
+  });
+  const final = await h.run();
+  assert.strictEqual(h.sleeps.length, 0, "exited before sleeping");
+  assert.match(final.stop_reason, /now def5678/);
+  assert.ok(h.log.some((l) => /taking no new work; exiting now so a supervisor/.test(l)), h.log.join("\n"));
+});
+
 test("makeCodeMovedNotice says once per new tip that the loaded code was moved past, and nothing when it was not", () => {
   const { makeCodeMovedNotice, loadedCodeCommit } = require("../bin/spor.js");
   const fs = require("fs");
@@ -1821,10 +1874,13 @@ test("makeCodeMovedNotice says once per new tip that the loaded code was moved p
   const two = g("rev-parse", "--short", "HEAD");
   notice(); notice();
   assert.strictEqual(lines.length, 1, "said once per new tip, not once per pass");
-  assert.match(lines[0], new RegExp(`moved to ${two} \\(main\\) — this worker still runs the code it loaded at ${loaded.commit}; restart it`));
+  assert.match(lines[0], new RegExp(`^work: main in .* moved to ${two} — this worker still runs the code it loaded at ${loaded.commit}; restart it`));
+  // The pass that says so returns the new tip (what --restart-on-land acts
+  // on); a quiet pass returns nothing.
+  assert.strictEqual(notice(), undefined, "a quiet pass returns nothing");
   fs.writeFileSync(path.join(repo, "a"), "3\n");
   g("commit", "-q", "-am", "three");
-  notice();
+  assert.strictEqual(notice(), g("rev-parse", "--short", "HEAD"), "the pass that notices a move returns the new tip");
   assert.strictEqual(lines.length, 2, "a further move is said again");
   // F4 (issue-spor-rescue-and-fix-sessions-end-turn-waiting-on-background-job):
   // git walks UP, so a probe from a directory INSIDE a checkout that is not
@@ -1846,6 +1902,120 @@ test("makeCodeMovedNotice says once per new tip that the loaded code was moved p
   assert.strictEqual(loadedCodeCommit(sub), null, "an untracked package dir is not a source checkout");
   g("add", "packages"); g("commit", "-q", "-m", "monorepo");
   assert.deepStrictEqual(loadedCodeCommit(sub), { commit: g("rev-parse", "--short", "HEAD"), branch: "main" }, "a tracked monorepo package IS a source checkout");
+  // F1 (review of task-spor-work-announce-lib-commit-and-notice-main-moved):
+  // the notice watches a REF and tests ANCESTRY — "main moved past the loaded
+  // code" — never bare HEAD-differs. A branch switch in the worker's linked
+  // checkout, a bisect checkout of an older commit, or a rewind of the branch
+  // are not a land and say nothing (and so never drain a --restart-on-land
+  // worker); the branch moving on to a descendant of the loaded commit does.
+  const { codeWatchRef } = require("../bin/spor.js");
+  const three = g("rev-parse", "--short", "HEAD");
+  const loaded3 = loadedCodeCommit(repo);
+  assert.deepStrictEqual(loaded3, { commit: three, branch: "main" });
+  assert.strictEqual(codeWatchRef(loaded3, { root: repo }), "main", "watches the loaded branch by default");
+  assert.strictEqual(codeWatchRef(loaded3, { root: repo, targetRef: "origin/main" }), "main", "a declared target that does not resolve here falls back to the loaded branch");
+  assert.strictEqual(codeWatchRef(null, { root: repo }), null);
+  const f1 = [];
+  const notice3 = makeCodeMovedNotice(loaded3, { root: repo, log: (l) => f1.push(l) });
+  g("checkout", "-q", "-b", "side");
+  fs.writeFileSync(path.join(repo, "a"), "side\n");
+  g("commit", "-q", "-am", "side work");
+  assert.strictEqual(notice3(), undefined, "HEAD on another branch is not main moving past the loaded code");
+  g("checkout", "-q", "--detach", `${three}~1`);
+  assert.strictEqual(notice3(), undefined, "a bisect checkout of an older commit is not a land");
+  g("checkout", "-q", "main");
+  g("reset", "-q", "--hard", `${three}~1`);
+  assert.strictEqual(notice3(), undefined, "a rewound main is not a land");
+  assert.deepStrictEqual(f1, [], "none of those said anything");
+  g("reset", "-q", "--hard", three);
+  assert.strictEqual(notice3(), undefined, "main back at the loaded commit is not a move");
+  g("merge", "-q", "--no-edit", "side");
+  const merged = g("rev-parse", "--short", "HEAD");
+  assert.strictEqual(notice3(), merged, "main advancing to a descendant of the loaded commit IS a land");
+  assert.strictEqual(f1.length, 1);
+  assert.match(f1[0], new RegExp(`^work: main in .* moved to ${merged} —`));
+  // …and it is main that is watched, wherever HEAD sits: a later land on main
+  // is noticed while HEAD is parked elsewhere.
+  g("checkout", "-q", "--detach", three);
+  assert.strictEqual(notice3(), undefined, "same tip, said once");
+  g("branch", "-f", "main", "side");
+  assert.strictEqual(notice3(), undefined, "main forced to a non-descendant says nothing");
+  g("checkout", "-q", "main");
+  g("merge", "-q", "--no-edit", merged);
+  assert.strictEqual(notice3(), undefined, "a fast-forward back to the tip already reported says nothing new");
+  fs.writeFileSync(path.join(repo, "a"), "four\n");
+  g("commit", "-q", "-am", "four");
+  assert.strictEqual(notice3(), g("rev-parse", "--short", "HEAD"), "a further land on main, descending from the loaded commit, is noticed");
+  // A factory's integration target that resolves in the checkout is watched
+  // in preference to the loaded branch.
+  g("branch", "release", three);
+  const rel = makeCodeMovedNotice(loaded3, { root: repo, log: () => {}, ref: codeWatchRef(loaded3, { root: repo, targetRef: "release" }) });
+  assert.strictEqual(codeWatchRef(loaded3, { root: repo, targetRef: "release" }), "release");
+  assert.strictEqual(rel(), undefined, "release has not moved");
+  g("branch", "-f", "release", "main");
+  assert.strictEqual(rel(), g("rev-parse", "--short", "main"), "release moving past the loaded commit is noticed");
+  // F2: the probe and the notice go through the env-scrubbed git spawn — an
+  // ambient GIT_DIR naming ANOTHER repository must not make the worker
+  // announce, watch, or drain on that repository's commits.
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-other-"));
+  const og = (...args) => execFileSync("git", ["-C", other, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  og("init", "-q", "-b", "main");
+  fs.writeFileSync(path.join(other, "package.json"), "{}\n");
+  og("add", "."); og("commit", "-q", "-m", "elsewhere");
+  // (Expected values are read BEFORE the env is poisoned: the test's own git
+  // helper is deliberately not scrubbed, so it would follow the leak too.)
+  const hereHead = g("rev-parse", "--short", "HEAD");
+  const otherHead = og("rev-parse", "--short", "HEAD");
+  const savedEnv = { GIT_DIR: process.env.GIT_DIR, GIT_WORK_TREE: process.env.GIT_WORK_TREE };
+  process.env.GIT_DIR = path.join(other, ".git");
+  process.env.GIT_WORK_TREE = other;
+  try {
+    const here = loadedCodeCommit(repo);
+    assert.strictEqual(here.commit, hereHead, "announces this checkout's commit, not the ambient GIT_DIR's");
+    assert.notStrictEqual(here.commit, otherHead);
+    const f2 = [];
+    const n = makeCodeMovedNotice(here, { root: repo, log: (l) => f2.push(l) });
+    fs.writeFileSync(path.join(other, "b"), "x\n");
+    og("add", "."); og("commit", "-q", "-m", "elsewhere moves");
+    assert.strictEqual(n(), undefined, "the other repository moving is not this checkout moving");
+    assert.deepStrictEqual(f2, []);
+  } finally {
+    for (const [k, v] of Object.entries(savedEnv)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+  // F3: a TRANSIENT ancestry failure (git 128 on a momentarily unreadable
+  // object store, a timeout) must not record the tip — the next pass asks
+  // again and the land is still noticed; recording first silenced it forever.
+  const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-gitshim-"));
+  const realGit = execFileSync(process.platform === "win32" ? "where" : "which", ["git"], { encoding: "utf8" }).split(/\r?\n/)[0].trim();
+  const failFlag = path.join(shimDir, "fail-merge-base");
+  fs.writeFileSync(path.join(shimDir, "git"), `#!/bin/sh\nif [ "$1" = merge-base ] && [ -e "${failFlag}" ]; then exit 128; fi\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${shimDir}${path.delimiter}${savedPath}`;
+  try {
+    const here3 = loadedCodeCommit(repo);
+    const f3 = [];
+    const n3 = makeCodeMovedNotice(here3, { root: repo, log: (l) => f3.push(l) });
+    assert.strictEqual(n3(), undefined, "nothing has moved yet");
+    fs.writeFileSync(path.join(repo, "a"), "five\n");
+    g("commit", "-q", "-am", "five");
+    const five = g("rev-parse", "--short", "HEAD");
+    fs.writeFileSync(failFlag, "");
+    assert.strictEqual(n3(), undefined, "the ancestry read failed transiently: no verdict this pass");
+    assert.strictEqual(n3(), undefined, "still failing, still no verdict");
+    assert.deepStrictEqual(f3, [], "a failed read never claims a land");
+    fs.unlinkSync(failFlag);
+    assert.strictEqual(n3(), five, "the read recovers and the land is noticed — the tip was not recorded by the failed pass");
+    assert.strictEqual(f3.length, 1);
+    assert.strictEqual(n3(), undefined, "and then said once");
+    // A DEFINITIVE not-a-descendant answer IS recorded (examined once).
+    g("reset", "-q", "--hard", "side");
+    assert.strictEqual(n3(), undefined, "a non-descendant tip says nothing");
+    fs.writeFileSync(failFlag, "");
+    assert.strictEqual(n3(), undefined, "…and, recorded, is not re-examined even while reads fail");
+    fs.unlinkSync(failFlag);
+  } finally {
+    process.env.PATH = savedPath;
+  }
   // Not a git checkout (an npm install): nothing is known, nothing is said.
   const plain = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-plain-"));
   assert.strictEqual(loadedCodeCommit(plain), null);

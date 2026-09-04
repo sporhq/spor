@@ -631,7 +631,13 @@ exception), and a worker never claims a `readiness: human` item even though
 one-shot dispatch only warns on the non-`requires:human` half (WORKERS.md §3).
 Knobs: `work.concurrency` (1), `work.intervalMs` (30s), `work.maxIntervalMs`
 (the idle backoff ceiling, 5min), `work.retryAfterMs` (10min),
-`work.runMaxMs` (24h), `work.runIdleMs` (45min),
+`work.runMaxMs` (24h), `work.runIdleMs` (45min), `work.restartOnLand`
+(`--restart-on-land`, off — a self-hosting factory's worker drains and exits
+for a supervisor restart once the watched ref — the factory's integration
+target when it resolves in the code checkout, else the loaded branch — moves to
+a DESCENDANT of the loaded commit; a branch switch, bisect or rewind is not a
+land, and the git reads are env-scrubbed via `gitSpawn`,
+task-spor-work-announce-lib-commit-and-notice-main-moved),
 `work.project` (falls back to `queue.project`). Status is machine-local under
 `journal/work/<worker>.work.json`, read back by `spor work --status [--json]` (a
 worker whose pid is gone reads STALE, never running). See test/work-loop.test.js.
