@@ -58,6 +58,15 @@ pending captures"):
   (comma-separated, repeatable, exclude wins on overlap). They apply *before*
   ranking, so the aggregate counts describe the filtered queue.
 
+An empty queue is never reported bare when the scope was only *inferred* from
+the working directory (issue-spor-next-silent-empty-on-unknown-inferred-project).
+If the server says that inferred slug matches nothing in the graph, `spor next`
+drops the guess and re-reads unscoped, saying so on stderr; if the scope is
+merely empty, the note names the project it scoped to and points at
+`--all-projects`. A scope you *typed* (`--project`) or pinned (`queue.project`)
+is an instruction — it is honoured and warned about, never widened for you. So
+"queue empty" with no note really does mean the whole graph is quiet.
+
 The `show_queue` MCP tool takes the same fields.
 
 ## In-flight awareness — don't re-pick work an agent is already on (Claude Code only)

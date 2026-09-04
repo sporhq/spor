@@ -2282,6 +2282,99 @@ test('next (remote) from a linked git worktree sends the same ?project= scope as
   }
 });
 
+// issue-spor-next-silent-empty-on-unknown-inferred-project: the cwd-inferred
+// scope is a GUESS, not an instruction, so a flagless `spor next` run from an
+// unrelated directory must never answer "queue empty" about a scope the graph
+// has never heard of. Two arms: the server's authoritative `project_warning`
+// makes the client drop the guess and re-read unscoped; without it (older
+// server, or a scope that IS known but is legitimately empty) an empty inferred
+// read at least says which project it was scoped to.
+function inferredScopeDir(name) {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-cli-inferred-'));
+  const dir = path.join(base, name); // basename => the inferred project slug
+  fs.mkdirSync(dir);
+  return { base, dir };
+}
+
+test('next (remote) drops an unknown cwd-INFERRED scope and re-reads unscoped', async () => {
+  const { base: tmp, dir } = inferredScopeDir('typo-scope');
+  const { srv, hits, base } = await queueStubServer();
+  try {
+    const r = await runAsyncCli(['next'], { SPOR_SERVER: base, SPOR_TOKEN: 't' }, dir);
+    assert.strictEqual(r.status, 0, r.stderr);
+    const sent = hits.filter((h) => /^\/v1\/queue\?/.test(h.url))
+      .map((h) => new URLSearchParams(h.url.split('?')[1]).get('project'));
+    assert.deepStrictEqual(sent, ['typo-scope', null], 'the guess is tried once, then dropped for an unscoped re-read');
+    assert.match(r.stderr, /no project 'typo-scope' in the graph \(inferred from the current directory\)/);
+    assert.doesNotMatch(r.stderr, /no queue items for project/, 'the fallback note replaces the empty-read note');
+    assert.match(r.stdout, /task-a/, 'the unscoped queue is what gets rendered');
+  } finally {
+    srv.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('next (remote --json) hands back the unscoped envelope after an inferred-scope fallback', async () => {
+  const { base: tmp, dir } = inferredScopeDir('typo-scope');
+  const { srv, base } = await queueStubServer();
+  try {
+    const r = await runAsyncCli(['next', '--json'], { SPOR_SERVER: base, SPOR_TOKEN: 't' }, dir);
+    assert.strictEqual(r.status, 0, r.stderr);
+    const j = JSON.parse(r.stdout);
+    assert.deepStrictEqual(j.items.map((i) => i.id), ['task-a'], 'machine consumers see the same fallback, not an empty envelope');
+    assert.ok(!('project_warning' in j), 'no warning field survives into the envelope');
+  } finally {
+    srv.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('next (remote) an EXPLICIT unknown --project is honoured, never widened', async () => {
+  const { srv, hits, base } = await queueStubServer();
+  try {
+    const r = await runAsyncCli(['next', '--project', 'typo-scope'], { SPOR_SERVER: base, SPOR_TOKEN: 't' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const sent = hits.filter((h) => /^\/v1\/queue\?/.test(h.url))
+      .map((h) => new URLSearchParams(h.url.split('?')[1]).get('project'));
+    assert.deepStrictEqual(sent, ['typo-scope'], 'one read only — a typed scope is an instruction, not a guess');
+    assert.ok(r.stderr.includes(QUEUE_PROJECT_WARNING));
+    assert.doesNotMatch(r.stderr, /inferred from the current directory/);
+  } finally {
+    srv.close();
+  }
+});
+
+test('next (remote) an empty INFERRED read the server does not flag names the scope it used', async () => {
+  // 'empty-scope' comes back empty with NO project_warning — a known-but-empty
+  // project, and the shape an older server gives for a typo'd one too.
+  const { base: tmp, dir } = inferredScopeDir('empty-scope');
+  const { srv, hits, base } = await queueStubServer();
+  try {
+    const r = await runAsyncCli(['next'], { SPOR_SERVER: base, SPOR_TOKEN: 't' }, dir);
+    assert.strictEqual(r.status, 0, r.stderr);
+    const sent = hits.filter((h) => /^\/v1\/queue\?/.test(h.url));
+    assert.strictEqual(sent.length, 1, 'no unscoped re-read without the server saying the scope is unknown');
+    assert.match(r.stderr, /no queue items for project 'empty-scope' \(inferred from the current directory\)/);
+    assert.match(r.stderr, /--all-projects/, 'the note carries the widening lever');
+  } finally {
+    srv.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('next (remote) a non-empty inferred read stays silent', async () => {
+  const { base: tmp, dir } = inferredScopeDir('proj-ok');
+  const { srv, base } = await queueStubServer();
+  try {
+    const r = await runAsyncCli(['next'], { SPOR_SERVER: base, SPOR_TOKEN: 't' }, dir);
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.doesNotMatch(r.stderr, /inferred from the current directory/);
+  } finally {
+    srv.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 // --- add (remote) transport-failure spooling --------------------------------
 // issue-spor-add-cli-residual-transport-failure-silent-loss: a one-shot `spor add`
 // has no hook loop, so a transport failure / transient 5xx must SPOOL the capture

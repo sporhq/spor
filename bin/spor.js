@@ -384,15 +384,24 @@ async function cmdNext(cfg, args) {
     // --all-projects drops the default scope (firehose); an explicit --project
     // still wins over it. Otherwise fall back to the pinned default, then cwd.
     const scopeSlug = allProjects && !explicit ? null : (explicit ?? pinned ?? safeSlug());
-    const qs = new URLSearchParams();
-    if (scopeSlug) qs.set("project", scopeSlug);
-    if (inclTypes.length) qs.set("type", inclTypes.join(","));
-    if (exclTypes.length) qs.set("exclude_type", exclTypes.join(","));
+    // Where the scope CAME FROM decides how a zero-match read is handled below
+    // (issue-spor-next-silent-empty-on-unknown-inferred-project): an explicit
+    // --project or a pinned queue.project is an INSTRUCTION — honour it and warn
+    // — while the cwd slug is only this repo's best GUESS at what the user meant.
+    const inferred = !!scopeSlug && !explicit && !pinned;
+    const queueQs = (slug) => {
+      const qs = new URLSearchParams();
+      if (slug) qs.set("project", slug);
+      if (inclTypes.length) qs.set("type", inclTypes.join(","));
+      if (exclTypes.length) qs.set("exclude_type", exclTypes.join(","));
+      return qs;
+    };
     // Page size (task-spor-next-limit-flag): --limit N defaults to DEFAULT_LIMIT
     // (20), --limit 0 means "all". fetchQueuePaged sets ?limit (+?offset) per page
     // and walks next_offset to assemble the target, so the limit is never set on
     // qs here.
-    const r = await fetchQueuePaged(cfg, qs, queueLimitTarget(args));
+    const target = queueLimitTarget(args);
+    let r = await fetchQueuePaged(cfg, queueQs(scopeSlug), target);
     if (r.transport) {
       err(`offline — could not reach server (${r.error})`);
       return 1;
@@ -401,26 +410,46 @@ async function cmdNext(cfg, args) {
       err(`queue error ${r.status}`);
       return 1;
     }
-    // Best-effort zero-match note (issue-spor-next-project-token-not-roundtrippable):
-    // unknown-token detection is authoritative only locally (where we hold the
-    // graph); remotely we can only observe an empty result for a SCOPED read and
-    // softly say so on stderr. The cwd-default firehose (no explicit/pinned scope)
-    // and an explicit --all-projects are deliberately not flagged — an empty
-    // result there is normal, not a typo.
-    // A server that knows the graph says so AUTHORITATIVELY: GET /v1/queue
-    // echoes a zero-match scope token as the additive `project_warning` string
-    // (task-spor-remote-next-print-project-warning, the remote twin of local
-    // queue.js's projectKnown() check). Print it verbatim on stderr and strip it
-    // from the envelope, so --json matches local byte-for-byte — the analytics
-    // arm's pattern (analyticsRemote). It supersedes the best-effort note below
-    // for the same read; an older server that omits the field still gets the
-    // soft note.
-    const projectWarning = takeProjectWarning(r.json);
+    // Zero-match handling. Unknown-token detection is authoritative only where
+    // the graph is held: locally that is projectKnown(), remotely it is the
+    // server, which echoes a zero-match scope token back as the additive
+    // `project_warning` string (task-spor-remote-next-print-project-warning, the
+    // remote twin of queue.js's projectKnown() check). Print that verbatim on
+    // stderr and strip it from the envelope, so --json matches local
+    // byte-for-byte — the analytics arm's pattern (analyticsRemote). Without it
+    // (an older server) all we can observe is an empty result, so the notes
+    // below are the best-effort fallbacks
+    // (issue-spor-next-project-token-not-roundtrippable). Only an explicit
+    // --all-projects — a firehose the user asked for — is never flagged.
+    let projectWarning = takeProjectWarning(r.json);
+    // An INFERRED scope the server authoritatively doesn't recognise is a wrong
+    // guess, not an empty backlog: drop it and re-read unscoped, which is what a
+    // markerless dir shows in local mode anyway (cmdNext never injects
+    // safeSlug() there) — norm-spor-cli-mode-parity. Gated on the server's own
+    // verdict, NEVER on a bare empty result, so a KNOWN project that happens to
+    // be empty keeps its scope. A retry that itself fails leaves the first read
+    // (and its verbatim warning) standing.
+    let fellBack = false;
+    if (projectWarning && inferred) {
+      const wide = await fetchQueuePaged(cfg, queueQs(null), target);
+      if (!wide.transport && wide.ok) {
+        err(`no project '${scopeSlug}' in the graph (inferred from the current directory) — showing the unscoped queue; pass --project <slug> to scope it`);
+        r = wide;
+        projectWarning = takeProjectWarning(r.json);
+        fellBack = true;
+      }
+    }
     if (projectWarning) err(projectWarning);
     const scoped = (allProjects && !explicit) ? null : (explicit ?? pinned);
     const count = (r.json && (r.json.count ?? (Array.isArray(r.json.items) ? r.json.items.length : null)));
     if (scoped && count === 0 && !projectWarning) {
       err(`project '${scoped}' returned an empty queue — check the slug / grouping id (the server scoped to it and found nothing)`);
+    } else if (inferred && !fellBack && count === 0) {
+      // Same silent-empty guard for the reads the fallback above can't reach: a
+      // server too old to send `project_warning`, and a scope that IS known but
+      // is legitimately empty. The read was scoped either way, so say so — a
+      // bare "queue empty" reads as "the whole backlog is empty".
+      err(`no queue items for project '${scopeSlug}' (inferred from the current directory) — run 'spor next --all-projects' for the whole graph`);
     }
     if (needAgents) {
       const q = r.json || {};
