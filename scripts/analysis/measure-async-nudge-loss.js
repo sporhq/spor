@@ -52,7 +52,8 @@
 //
 //   node scripts/analysis/measure-async-nudge-loss.js [--home <dir>]
 //        [--transcripts <dir>] [--from <iso>] [--until <iso>]
-//        [--live-window-min <n>] [--without-sessionend-drain] [--json]
+//        [--live-window-min <n>] [--drain-lag-sec <n>]
+//        [--without-sessionend-drain] [--json]
 //
 // THE SHIPPED SESSIONEND DRAIN (the second run's whole point,
 // task-spor-reevaluate-nudge-async-default-post-sessionend). The first run
@@ -83,11 +84,50 @@
 //
 // An unobserved firing is therefore either "never fired" (a real loss) or
 // "fired and captured" — never a silent miss. So the residual is reported as a
-// RANGE, not a point: `durablyLostUpper` counts every unobserved case as lost,
-// `durablyLostLower` counts it as captured, and the verdict is named
-// `no-sessionend-observed` rather than `no-sessionend` so nothing downstream
-// reads it as a demonstrated absence. Quote the range; the upper end alone is
-// an assertion the journal cannot support.
+// RANGE, not a point: `durablyLostUpper` counts every indeterminate case as
+// lost, `durablyLostLower` counts only what the drain is DEMONSTRATED to have
+// run on and missed, and the verdict is named `no-sessionend-observed` rather
+// than `no-sessionend` so nothing downstream reads it as a demonstrated
+// absence. Quote the range; the upper end alone is an assertion the journal
+// cannot support.
+//
+// The second backstop below is NOT independent corroboration of that residual.
+// A finding in the `no-sessionend-observed` bucket is there BECAUSE its session
+// has no distiller llm-calls row, and "the distiller extracted nothing for this
+// session" is read off that same missing row — so the bottom line's
+// `no distiller extraction` count re-states the absence, it does not confirm
+// it. Only a finding whose session DID record a distiller row gets a genuinely
+// second opinion (the census/lexical analysis); the rest inherit the bound.
+//
+// EVERY DRAIN OBSERVABLE IS AN UPPER BOUND ON THE DRAIN MOMENT, NEVER THE
+// MOMENT ITSELF. sessionEndPendingNudges runs at the very top of distill(), and
+// BOTH observables are stamped strictly below it: the llm-calls row's backend
+// start (`ts - latency_ms`) sits after the kill switch, the fs gates, a remote
+// `drainOutbox`, the transcript read/parse, the touched-file scan, the template
+// read and the 6s index fetch; a distill.log line for a row-less session sits
+// after the same prefix minus the backend leg. So an observable at T proves the
+// drain ran at some T' <= T, and reading T as T' is exactly the error that
+// converts "the worker's result landed AFTER the drain" into "captured" —
+// understating both ends of the loss.
+//
+// There is no hard ceiling on T - T' to lean on: drainOutbox iterates an
+// UNCAPPED spool at 30s per file (x3 attempts), so a box with a large backlog
+// can put minutes between the two. The replay therefore does not pretend to
+// know T'; it brackets it and refuses to decide inside the bracket
+// (sessionEndOutcome):
+//   captured               margin > DRAIN_OBSERVABLE_LAG_MS — the result was on
+//                          disk before the EARLIEST moment the drain could have
+//                          run, so no lag within the ceiling flips it.
+//   too-late               margin <= 0 — the result was not on disk even at the
+//                          LATEST possible drain moment. Sound at any lag.
+//   drain-time-unresolved  in between — a firing IS observed, but whether it
+//                          preceded or followed the result turns on a gap the
+//                          journal does not record. Indeterminate, and charged
+//                          to the upper bound with the unobserved bucket.
+// `--drain-lag-sec` moves the ceiling (default DRAIN_OBSERVABLE_LAG_MS); the
+// report prints the narrowest capture margin, which is the BREAKEVEN — the
+// smallest drain-to-observable lag that would flip any capture verdict — so the
+// choice of default is auditable rather than load-bearing.
 
 const fs = require("fs");
 const path = require("path");
@@ -117,6 +157,21 @@ const REPLAY_PIN = path.join(__dirname, "sessionend-replay-2026-09-04.json");
 // still be running, and a still-open session's finding is not lost — its next
 // prompt simply hasn't happened yet. Those are excluded, not scored.
 const DEFAULT_LIVE_WINDOW_MIN = 60;
+
+// How much EARLIER than its observable the drain could have run. Both
+// observables are stamped below sessionEndPendingNudges (see EVERY DRAIN
+// OBSERVABLE IS AN UPPER BOUND above), and the work between them is a remote
+// `drainOutbox` plus local IO. One outbox file's worst case is 30s x 3 attempts
+// (drain-outbox.js: timeoutMs = maxTimeSec * 1000, retry 2), and the llm-calls
+// observable adds the 6s index fetch — 96s, rounded up to two minutes.
+//
+// This is a WORKING CEILING, not a proof: drainOutbox takes no file cap from
+// distill.js, so a large enough backlog exceeds any constant. It is chosen so
+// that a capture verdict means "no plausible lag flips this", and the report
+// prints the narrowest capture margin so the headroom over the ceiling is
+// visible rather than assumed. Raise it with --drain-lag-sec to test how much
+// lag the corpus tolerates before a capture becomes indeterminate.
+const DRAIN_OBSERVABLE_LAG_MS = 120000;
 
 // A classifier result is only worth draining when it found ≥1 fact — the async
 // worker writes NO result file for a NOTHING verdict or a backend failure
@@ -356,20 +411,25 @@ function coverage(fact, distill) {
 // When did SessionEnd run for a session? The hook itself journals nothing
 // unconditionally, so the observable is its DISTILLER call: the llm-calls row is
 // stamped after the backend returns, and sessionEndPendingNudges runs at the top
-// of distill() — before the transcript read, the prompt build and the backend
-// call — so `ts - latency_ms` brackets the drain from above by the few ms of
-// setup between them. Multiple rows mean a resumed session ended more than once;
-// every one of them is a drain opportunity, because an undrained result file
-// persists until some SessionEnd consumes it.
+// of distill(), so `ts - latency_ms` — the moment the backend call STARTED —
+// brackets the drain from ABOVE. Multiple rows mean a resumed session ended more
+// than once; every one of them is a drain opportunity, because an undrained
+// result file persists until some SessionEnd consumes it.
 //
-// This is a LOWER bound on SessionEnd firings, and deliberately so: the drain
-// sits ahead of the distill.enabled kill switch and the missing/too-small
-// transcript gates, so a firing that produced no llm-calls row may still have
-// drained. Counting only demonstrated firings makes the residual loss an UPPER
-// bound — the honest direction for a number that argues against flipping a
-// default, and the reason the bottom line reports a RANGE (see WHY THE
-// RESIDUAL IS A BOUND above). distillLogDrains below narrows that gap by one
-// documented case; the rest of it is irreducible from the journal.
+// From above, and not tightly: between the drain and the backend start lie the
+// kill switch, the fs gates, a remote drainOutbox, the transcript read/parse,
+// the touched-file scan, the template read and the index fetch. So these are
+// UPPER bounds on the drain moment, and sessionEndOutcome must not read one as
+// the moment itself — see EVERY DRAIN OBSERVABLE IS AN UPPER BOUND above.
+//
+// The set of firings is also a LOWER bound, and deliberately so: the drain sits
+// ahead of the distill.enabled kill switch and the missing/too-small transcript
+// gates, so a firing that produced no llm-calls row may still have drained.
+// Counting only demonstrated firings makes the residual loss an UPPER bound —
+// the honest direction for a number that argues against flipping a default, and
+// the reason the bottom line reports a RANGE (see WHY THE RESIDUAL IS A BOUND
+// above). distillLogDrains below narrows that gap by one documented case; the
+// rest of it is irreducible from the journal.
 function sessionEndDrains(distillRecords) {
   const out = [];
   for (const d of distillRecords || []) {
@@ -389,16 +449,24 @@ function sessionEndDrains(distillRecords) {
 // session reads as "SessionEnd never fired" and its finding is charged to the
 // residual.
 //
-// Lines are `[<iso-seconds>] <session>: <msg>`; only the session-prefixed head
-// of a record matches (continuation lines are indented and unprefixed). The
-// stamp is SECOND-precision, so it can read up to 999ms EARLY — a tighter, not
-// looser, bracket, which is the conservative direction.
+// Like the row stamp this is an UPPER bound on the drain, not the drain: the
+// line lands after the kill switch, the fs gates, a remote drainOutbox and the
+// transcript read. Its POSITION in distill() is earlier than the backend start
+// the row bracket uses, so it is the tighter of the two — but "tighter" is not
+// "tight", and sessionEndOutcome brackets both the same way rather than
+// trusting either as the drain moment (F4). The stamp is also SECOND-precision,
+// so it can read up to 999ms early; that error runs the conservative way (an
+// earlier apparent drain never manufactures a capture).
 //
-// Used ONLY for sessions with no distill row (main below). A log line lands
-// after the backend returns, so for a firing that DID produce a row it is the
-// LOOSER of the two brackets — a 120s-timeout failure logs 120s after its own
-// drain — and taking the max over both would credit a capture to a result that
-// landed while the distiller was still running.
+// Lines are `[<iso-seconds>] <session>: <msg>`; only the session-prefixed head
+// of a record matches (continuation lines are indented and unprefixed).
+//
+// Used ONLY for sessions with no distill row (main below). Every log line that
+// lands after a backend call belongs to a firing that recorded a row — recordLlm
+// runs on the error paths too (distill.js `distill cmd failed` / `claude -p
+// failed`) — so a row-less session's lines can only come from the pre-backend
+// exits, and this reader never picks up a 120s-timeout line as if it were a
+// drain.
 function distillLogDrains(logText, session) {
   const out = [];
   if (!logText || !session) return out;
@@ -479,17 +547,34 @@ function promptDrains({ resultAt, promptAt, shiftMs }) {
 //   drain runs:    tEnd minus that same preceding blocking, minus `shift`
 // The shared term cancels, leaving `tEnd - t1 > shift` — i.e. the session's
 // remaining wall-clock after the classifier answered must exceed the tool-loop
-// time async gives back. Margin is that slack; a negative one is the race where
-// the worker is still classifying when the session ends.
-function sessionEndOutcome({ resultAt, shiftMs }, drains) {
+// time async gives back. Margin is that slack.
+//
+// `tEnd` is an OBSERVABLE, though, not the drain: both readers above are
+// stamped below sessionEndPendingNudges, so the real drain ran at some
+// tEnd - lag with lag >= 0 and no journal record of it. A two-way verdict has
+// to guess which, and guessing `captured` is the direction that hides loss — a
+// result written after the drain but before the observable reads as surfaced
+// (F4). So the bracket is honoured explicitly and the verdict is three-way:
+//   margin > lagMs   captured: the result beat even the EARLIEST drain the
+//                    bracket allows, so no lag within the ceiling flips it.
+//   margin <= 0      too-late: the result was not on disk at the LATEST drain
+//                    the bracket allows either. Sound at any lag.
+//   otherwise        drain-time-unresolved: a firing is observed, but the
+//                    verdict turns on a gap the journal does not record.
+// Both indeterminate verdicts are charged to the upper bound and withheld from
+// the lower one, so widening the bracket can only ever grow the reported loss.
+function sessionEndOutcome({ resultAt, shiftMs }, drains, lagMs = DRAIN_OBSERVABLE_LAG_MS) {
   // "observed" is load-bearing: no row and no distill.log line is an absence of
   // EVIDENCE, not evidence of absence, and every downstream tally treats this
   // bucket as indeterminate rather than as a demonstrated loss. See WHY THE
   // RESIDUAL IS A BOUND at the top.
   if (!drains || !drains.length) return { verdict: "no-sessionend-observed", marginMs: null };
+  const lag = Number.isFinite(lagMs) && lagMs > 0 ? lagMs : 0;
   let best = -Infinity;
   for (const d of drains) best = Math.max(best, d - resultAt - shiftMs);
-  return { verdict: best > 0 ? "captured" : "too-late", marginMs: best };
+  if (best > lag) return { verdict: "captured", marginMs: best };
+  if (best <= 0) return { verdict: "too-late", marginMs: best };
+  return { verdict: "drain-time-unresolved", marginMs: best };
 }
 
 const COVERED_AT = 0.6;
@@ -564,7 +649,7 @@ function loadReplayPin() {
   };
 }
 
-const FLAGS = ["--home", "--transcripts", "--from", "--until", "--live-window-min"];
+const FLAGS = ["--home", "--transcripts", "--from", "--until", "--live-window-min", "--drain-lag-sec"];
 const BOOLEAN_FLAGS = ["--json", "--without-sessionend-drain"];
 
 function main(argv) {
@@ -636,6 +721,17 @@ function main(argv) {
     process.exit(2);
   }
   const liveWindowMs = liveWindowMin * 60000;
+  // Same guard as --live-window-min, for the same reason: a NaN ceiling makes
+  // every `margin > lag` comparison false, silently reclassifying every capture
+  // as indeterminate and moving the headline with no error.
+  const drainLagSec = Number(arg("--drain-lag-sec", DRAIN_OBSERVABLE_LAG_MS / 1000));
+  if (!Number.isFinite(drainLagSec) || drainLagSec < 0) {
+    console.error(
+      `--drain-lag-sec: expected a non-negative number of seconds, got: ${arg("--drain-lag-sec")}`
+    );
+    process.exit(2);
+  }
+  const drainLagMs = drainLagSec * 1000;
 
   const recs = readLlmCalls(home);
   // Second SessionEnd observable, for sessions the llm-calls journal missed.
@@ -804,6 +900,10 @@ function main(argv) {
     capturedFacts: 0,
     tooLate: 0,
     tooLateFacts: 0,
+    // A firing IS observed, but the drain-to-observable lag decides the verdict
+    // and the journal does not record it. Indeterminate, like `unobserved`.
+    unresolved: 0,
+    unresolvedFacts: 0,
     unobserved: 0,
     unobservedFacts: 0,
   };
@@ -820,7 +920,7 @@ function main(argv) {
     // firing's loose (post-backend) bracket can never displace its tight one.
     const rows = distillBySession.get(L.session);
     const drains = rows && rows.length ? sessionEndDrains(rows) : distillLogDrains(distillLog, L.session);
-    const { verdict, marginMs } = sessionEndOutcome({ resultAt: L.at, shiftMs: L.shiftMs }, drains);
+    const { verdict, marginMs } = sessionEndOutcome({ resultAt: L.at, shiftMs: L.shiftMs }, drains, drainLagMs);
     L.sessionEnd = verdict;
     L.marginMs = marginMs;
     verdictByKey.set(L.key, verdict);
@@ -843,6 +943,9 @@ function main(argv) {
     if (verdict === "too-late") {
       sessionEnd.tooLate++;
       sessionEnd.tooLateFacts += L.nfacts;
+    } else if (verdict === "drain-time-unresolved") {
+      sessionEnd.unresolved++;
+      sessionEnd.unresolvedFacts += L.nfacts;
     } else {
       sessionEnd.unobserved++;
       sessionEnd.unobservedFacts += L.nfacts;
@@ -921,38 +1024,54 @@ function main(argv) {
     else if (v) adjCovered++;
     else adjLost++;
   }
-  // Facts whose session produced no distiller extraction at all: nothing could
-  // have covered them.
+  // Facts whose session produced no distiller extraction at all. For a finding
+  // in the `no-sessionend-observed` bucket this is the SAME missing llm-calls
+  // row that put it there, so it re-states the absence rather than confirming
+  // it independently (see WHY THE RESIDUAL IS A BOUND); only a finding whose
+  // session did record a distiller row gets a genuine second opinion.
   const noBackstopFacts = uncoveredFacts - lostFactsScored;
 
   // The bottom line is a RANGE, not a point (F1). Attribute each durably-lost
-  // fact to the finding it came from, then split on whether that finding's
-  // SessionEnd was OBSERVED:
-  //   upper — every unobserved firing is treated as "never fired", i.e. a real
-  //           loss. This is the number the first cut reported as a fact.
-  //   lower — every unobserved firing is treated as a firing suppressed after
-  //           the drain, i.e. a verbatim capture that left no journal trace.
+  // fact to the finding it came from, then split on whether the drain is
+  // DEMONSTRATED to have run on it and missed:
+  //   lower — only `too-late` findings, where an observed firing provably
+  //           post-dates nothing: the result was not on disk even at the latest
+  //           drain moment the bracket allows.
+  //   upper — additionally every INDETERMINATE finding, whether the firing was
+  //           unobserved (`no-sessionend-observed`) or observed with a drain
+  //           moment the journal does not pin down (`drain-time-unresolved`).
   // Both ends are reachable from the evidence; nothing in the journal picks
-  // between them, so the honest report carries both. `too-late` findings are in
-  // BOTH ends: for those the drain is demonstrated to have run and missed.
+  // between them, so the honest report carries both. There is deliberately no
+  // point total: any single number here is an assertion about the indeterminate
+  // bucket that the journal cannot support, which is how the first cut read
+  // "no distiller llm-calls row" as "the session never fired SessionEnd".
+  const INDETERMINATE = new Set(["no-sessionend-observed", "drain-time-unresolved"]);
   const factsDurablyLost = (L) => {
     if (!L.factKeys) return L.nfacts; // no distiller extraction: nothing could cover it
     return L.factKeys.filter((k) => census.verdicts.get(k) === false).length;
   };
   let durablyLostUpper = 0;
   let durablyLostLower = 0;
+  let indeterminateFacts = 0;
   for (const L of uncovered) {
     const n = factsDurablyLost(L);
     durablyLostUpper += n;
-    if (L.sessionEnd !== "no-sessionend-observed") durablyLostLower += n;
+    if (INDETERMINATE.has(L.sessionEnd)) indeterminateFacts += n;
+    else durablyLostLower += n;
   }
-  // An unadjudicated fact means the census is stale: report "?" rather than a
-  // number that silently shrinks the loss. Kept as the pre-existing total for
-  // the same reason the two bounds are computed above it — same arithmetic,
-  // asserted equal by the suite.
-  const durablyLost = adjMissing ? null : adjLost + noBackstopFacts;
-  if (durablyLost !== null && durablyLost !== durablyLostUpper) {
-    throw new Error(`internal: durably-lost attribution disagrees (${durablyLost} vs ${durablyLostUpper})`);
+  // An unadjudicated fact means the census is stale, so the bounds are reported
+  // as "?" rather than as numbers that silently shrink the loss. The pre-change
+  // arithmetic is kept only as an internal cross-check on the attribution — it
+  // is NOT emitted, because a bare `durablyLost` field is exactly the point
+  // claim the range exists to replace.
+  const durablyLostCheck = adjMissing ? null : adjLost + noBackstopFacts;
+  if (durablyLostCheck !== null && durablyLostCheck !== durablyLostUpper) {
+    throw new Error(`internal: durably-lost attribution disagrees (${durablyLostCheck} vs ${durablyLostUpper})`);
+  }
+  if (durablyLostLower + indeterminateFacts !== durablyLostUpper) {
+    throw new Error(
+      `internal: the residual range does not decompose (${durablyLostLower} + ${indeterminateFacts} != ${durablyLostUpper})`
+    );
   }
 
   const pct = (n, d) => (d ? `${((n / d) * 100).toFixed(1)}%` : "n/a");
@@ -997,10 +1116,10 @@ function main(argv) {
     coveredAt,
     coverageThreshold: COVERED_AT,
     adjudicated: { covered: adjCovered, missed: adjLost, unadjudicated: adjMissing },
-    durablyLost,
+    drainLagSec,
     durablyLostUpper: adjMissing ? null : durablyLostUpper,
     durablyLostLower: adjMissing ? null : durablyLostLower,
-    indeterminateFacts: sessionEnd.unobservedFacts,
+    indeterminateFacts: adjMissing ? null : indeterminateFacts,
   };
 
   if (asJson) {
@@ -1061,16 +1180,38 @@ function main(argv) {
       } facts]`
     );
     console.log(
+      `  drain time UNRESOLVED ......... ${sessionEnd.unresolved}  ${pct(sessionEnd.unresolved, stats.lost)}  [${
+        sessionEnd.unresolvedFacts
+      } facts]  (indeterminate — see below)`
+    );
+    console.log(
       `  no SessionEnd OBSERVED ........ ${sessionEnd.unobserved}  ${pct(sessionEnd.unobserved, stats.lost)}  [${
         sessionEnd.unobservedFacts
       } facts]  (indeterminate — see below)`
     );
+    console.log();
+    console.log(`  drain-to-observable lag allowed for: ${Math.round(drainLagMs / 1000)}s (--drain-lag-sec)`);
+    console.log(`  Both observables are stamped BELOW sessionEndPendingNudges in distill(), so`);
+    console.log(`  each one is an UPPER bound on the drain, never the drain itself. A capture`);
+    console.log(`  verdict therefore requires the result to have beaten the observable by more`);
+    console.log(`  than this ceiling; a finding inside it is "drain time unresolved" rather`);
+    console.log(`  than captured, because reading the stamp as the drain would score a result`);
+    console.log(`  written AFTER the drain as surfaced.`);
     if (narrowestMarginMs !== null) {
       console.log();
       console.log(`  narrowest capture margin ..... ${Math.round(narrowestMarginMs / 1000)}s of slack`);
       console.log(`  (async reaches SessionEnd earlier by the tool-loop time it gives back; a`);
       console.log(`   capture needs the session's remaining wall-clock to exceed that. This is`);
-      console.log(`   the closest any finding in the corpus came to losing that race.)`);
+      console.log(`   the closest any finding in the corpus came to losing that race — and the`);
+      console.log(`   BREAKEVEN on the ceiling above: no capture verdict flips until the real`);
+      console.log(`   drain-to-observable lag exceeds it.)`);
+    }
+    if (sessionEnd.unresolved) {
+      console.log();
+      console.log(`  "drain time unresolved" means a SessionEnd firing IS observed for the`);
+      console.log(`  session but the result landed within the lag ceiling of its stamp, so`);
+      console.log(`  whether the drain preceded it turns on a gap the journal never recorded.`);
+      console.log(`  Counted with the unobserved bucket in the upper bound, never in the lower.`);
     }
     if (sessionEnd.unobserved) {
       console.log();
@@ -1141,32 +1282,34 @@ function main(argv) {
     );
     console.log(`  left to the distiller ........ ${uncoveredFacts}`);
   }
-  console.log(`  no distiller extraction ...... ${noBackstopFacts}  (nothing could cover these)`);
+  console.log(
+    `  no distiller extraction ...... ${noBackstopFacts}  (no distiller output exists for these`
+  );
+  console.log(`                                    sessions — for an unobserved firing that is the`);
+  console.log(`                                    SAME missing row, not a second opinion)`);
   console.log(`  distiller missed the fact .... ${adjMissing ? "?" : adjLost}`);
-  if (durablyLost !== null) {
-    if (modelSessionEndDrain && durablyLostUpper !== durablyLostLower) {
-      console.log(
-        `  DURABLY LOST ................. ${durablyLostLower}–${durablyLostUpper}  ${pct(
-          durablyLostLower,
-          stats.factsTotal
-        )}–${pct(durablyLostUpper, stats.factsTotal)} of all classified facts`
-      );
-      console.log(
-        `    demonstrated ............... ${durablyLostLower}  (the drain provably ran and did not capture it)`
-      );
-      console.log(
-        `    indeterminate .............. ${durablyLostUpper - durablyLostLower}  (no SessionEnd observed: lost only if the`);
-      console.log(`                                    hook never fired — see the bucket note above)`);
+  if (!adjMissing) {
+    console.log(
+      `  DURABLY LOST ................. ${durablyLostLower}${
+        durablyLostUpper === durablyLostLower ? "" : `–${durablyLostUpper}`
+      }  ${pct(durablyLostLower, stats.factsTotal)}${
+        durablyLostUpper === durablyLostLower ? "" : `–${pct(durablyLostUpper, stats.factsTotal)}`
+      } of all classified facts`
+    );
+    console.log(
+      `    demonstrated ............... ${durablyLostLower}  (the drain provably ran and did not capture it)`
+    );
+    console.log(
+      `    indeterminate .............. ${indeterminateFacts}  (${sessionEnd.unobservedFacts} no SessionEnd observed, ${sessionEnd.unresolvedFacts} drain`
+    );
+    console.log(`                                    time unresolved — lost only if the hook never`);
+    console.log(`                                    fired, or fired before the result landed)`);
+    if (durablyLostUpper !== durablyLostLower) {
       console.log(`  Quote the RANGE. The upper end alone asserts an absence the journal cannot`);
       console.log(`  demonstrate; the lower end alone assumes away a loss it cannot rule out.`);
-    } else {
-      console.log(
-        `  DURABLY LOST ................. ${durablyLost}  ${pct(durablyLost, stats.lostFacts)} of lost facts, ${pct(
-          durablyLost,
-          stats.factsTotal
-        )} of all classified facts`
-      );
     }
+  } else {
+    console.log(`  DURABLY LOST ................. ?  (census is stale — see above)`);
   }
   console.log();
   console.log(`  NOTE: a floor, not a total — the sync path stops classifying after 3 fired`);

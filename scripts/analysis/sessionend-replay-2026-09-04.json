@@ -1,5 +1,5 @@
 {
-  "note": "Per-finding rows from the second counterfactual replay (task-spor-reevaluate-nudge-async-default-post-sessionend), modelling the SHIPPED SessionEnd drain (sessionEndPendingNudges, 2026-08-21). This file is a RESULT, not a lookup table: the ~/.claude/projects transcripts these verdicts were derived from get pruned, and the first run's 2026-07-17 corpus is already fully evicted, so the derived rows are committed to keep the quoted numbers auditable. It carries EVERY SCORED finding, drained ones included, so the headline's DENOMINATOR (findingsScored / drained / factsTotal) is derivable from the file after the transcripts are gone and not merely asserted. measure-async-nudge-loss.js defaults its window to the one below and re-joins these keys, reporting per-finding drift on the drain outcome, the SessionEnd verdict and the fact count.",
+  "note": "Per-finding rows from the second counterfactual replay (task-spor-reevaluate-nudge-async-default-post-sessionend), modelling the SHIPPED SessionEnd drain (sessionEndPendingNudges, 2026-08-21). This file is a RESULT, not a lookup table: the ~/.claude/projects transcripts these verdicts were derived from get pruned, and the first run's 2026-07-17 corpus is already fully evicted, so the derived rows are committed to keep the quoted numbers auditable. It carries EVERY SCORED finding, drained ones included, so the headline's DENOMINATOR (findingsScored / drained / factsTotal) is derivable from the file after the transcripts are gone and not merely asserted. measure-async-nudge-loss.js defaults its window to the one below and re-joins these keys, reporting per-finding drift on the drain outcome, the SessionEnd verdict and the fact count. Every verdict here was derived at drainLagSec=120 (--drain-lag-sec): both SessionEnd observables are stamped BELOW the drain in distill(), so a capture verdict means the result beat the observable by more than that ceiling and a smaller margin is reported as drain-time-unresolved rather than captured. narrowestMarginMs is the breakeven — no verdict in this file flips until the real drain-to-observable lag exceeds 365s.",
   "from": "2026-08-01T00:00:00.000Z",
   "until": "2026-09-04T00:00:00.000Z",
   "date": "2026-09-04",
@@ -13,10 +13,13 @@
     "capturedAtSessionEnd": 10,
     "capturedFacts": 14,
     "tooLate": 0,
+    "drainTimeUnresolved": 0,
+    "drainTimeUnresolvedFacts": 0,
     "noSessionEndObserved": 4,
     "noSessionEndObservedFacts": 5,
     "durablyLostFactsLower": 0,
     "durablyLostFactsUpper": 5,
+    "drainLagSec": 120,
     "narrowestMarginMs": 365091
   },
   "findings": [
