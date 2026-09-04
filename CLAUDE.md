@@ -194,7 +194,20 @@ chance, so it consumes a `.out.json` only once the finding is durably elsewhere
 provably uncapturable (bytes that don't PARSE into a result — a failed READ is
 transient and keeps its file — already injected, or a node the parser or
 validator refuses); a TRANSIENT failure leaves the file spooled for a later
-sweep (issue-spor-session-end-pending-nudges-data-loss). A server 400/413/422 is
+sweep (issue-spor-session-end-pending-nudges-data-loss). Retention is only the
+safe side if something eventually comes BACK for the file, and the owning
+session is over — no later prompt drains its spool, no later SessionEnd looked
+at it, and journal GC removes the directory at `gc.maxAgeMs` — so
+`sessionEndPendingNudges` also COLLECTS abandoned spools: it drains its own
+session, then up to `SPOOL_COLLECT_MAX` (5) foreign `pending-nudges/<session>/`
+dirs that are untouched for 6h AND show no other sign of life (the same bucket
+signal `gcJournal` protects a concurrently-live session with) AND actually hold
+a result. The horizon is generous because the owning session's own next prompt
+is the better home for a finding; collection is the last resort before the GC
+cutoff. A collected finding is stamped to the project of the FILE it was
+classified from (`spoolCaptureSlug`), not the collector's ambient slug, and it
+is keyed on the ORIGIN session so its idempotency key and node id are the ones
+that session's own drain would have minted. A server 400/413/422 is
 permanent but NOT discardable: per API.md §5 a mechanical writer preserves a
 rejected payload in `outbox/dead/` (the channel session-start and `spor-hook
 doctor` already surface), so the consume waits on that write like any other.
@@ -269,15 +282,35 @@ unparseable result holds no verdict and pruning its input on the strength of its
 name deletes the last copy of both) or a file already in
 `<session>.nudged-injected` is pruned, never re-driven into a second classifier
 call or a second injection. Every mutation of the pair — the settled prune
-included — runs under ONE exclusive per-job lock (`u.claimSpoolJob`,
-`<hash>.redrive.lock`): COPYFILE_EXCL is the atomic claim for a FIRST re-drive
+included — runs under ONE exclusive per-job lock (`u.claimSpoolJob`): COPYFILE_EXCL is the atomic claim for a FIRST re-drive
 but cannot guard the RECOVERY arm, which re-copies over a `.redriven.in.json`
 that already exists, so two overlapping sweeps could both re-copy — tearing the
-copy under a worker already reading it — and both spawn. The lock is
-pid-stamped, liveness-checked and TTL-bounded exactly like the result claim (an
-unstamped lock reads as held, so the create/write window is not stealable), so a
-crash holding it self-heals within one horizon, and a lock we cannot take means
-only "not ours this pass", never "act anyway".
+copy under a worker already reading it — and both spawn. That lock is NOT a
+well-known pathname broken by a check-then-unlink — see-it, judge-it-stale,
+unlink-it, re-create-it is not a claim, and two sweepers could both break one
+stale lock, both `wx` it, and then delete each OTHER's (the loser's break takes
+the winner's lock, the winner's release takes its successor's). Instead each
+contender creates ONLY its own uniquely-named
+`<hash>.redrive.lock-<pid>-<ts>-<rand>` and deletes ONLY its own; everything a
+racer must judge is in the NAME, so there is no create-then-write window to
+misread; and ownership is decided by a listing taken AFTER the create — you hold
+the job only if no other LIVE contender is present, which two contenders can
+never both conclude (each creates before it lists). A lock whose pid is gone or
+whose stamp is past the TTL is ignored by every racer, so a crash self-heals
+within one horizon, and it is unlinked only when provably dead AND expired —
+which, since everyone already ignores it, can neither grant nor revoke
+ownership. A lock we cannot take means only "not ours this pass", never "act
+anyway". The recovery arm's re-copy is a temp-write + atomic RENAME, because a
+stale plain+copy pair also arises when the spawn DID land and only the original's
+unlink failed: owe-before-clear takes the safe reading (one extra classifier
+call), and a rename swaps the inode so a worker already reading the copy keeps
+its intact bytes instead of being torn. Symmetrically, the prompt-time drain
+destroys a RESULT only once its job's input pair is gone: unlinking a result
+while its `.in.json` is still spooled leaves a later sweep looking at exactly the
+re-drive signal ("no result, a stale input"), so every consume — the injected
+one and the discards (already-injected, over the fired cap) — is deferred until
+after the prune, and a result whose input survived is KEPT and reconciled next
+pass rather than destroyed.
 The default synchronous path is byte-identical (the drain and its
 syscalls are gated on the flag). See test/nudge-async.test.js.
 

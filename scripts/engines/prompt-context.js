@@ -280,6 +280,16 @@ function drainPendingNudges(graph, input, slug) {
   const settled = new Set();
   const deferred = new Set();
   const results = [];
+  // Results this pass has judged and means to destroy (already injected, or
+  // over the fired cap). They are NOT unlinked in the read loop: a result is
+  // the durable record of its job's verdict, and destroying it while the
+  // worker's `.in.json` is still spooled leaves a concurrent sweep looking at
+  // "no result + a stale input" — which is the re-drive signal, so it spends a
+  // second classifier call on a job this pass already settled (row (c)/(d),
+  // F17). Every consume is therefore deferred until after the prune below has
+  // taken the input out from under that reading — owe (the result) before you
+  // clear (the input), then clear the result last.
+  const discard = [];
   for (const f of files) {
     const hash = u.spoolResultHash(f);
     // Claim before reading (dec-spor-nudge-drain-atomic-claim): the SessionEnd
@@ -328,10 +338,8 @@ function drainPendingNudges(graph, input, slug) {
     if (injectedFiles.has(r.file)) {
       // Already surfaced this session — including the crash window below,
       // where the marker landed and the unlink did not. Consume it, never
-      // re-inject it.
-      try {
-        fs.unlinkSync(fp);
-      } catch {}
+      // re-inject it. QUEUED, not unlinked here: see `consume` below.
+      discard.push({ hash, fp });
       continue;
     }
     if (injected + results.length >= 3) {
@@ -339,12 +347,10 @@ function drainPendingNudges(graph, input, slug) {
       // next prompt: the count only ever grows, so it can never come back
       // under the cap (parity with the synchronous nudge, which simply stops
       // firing after 3).
-      try {
-        fs.unlinkSync(fp);
-      } catch {}
+      discard.push({ hash, fp });
       continue;
     }
-    results.push({ r, fp });
+    results.push({ r, fp, hash });
   }
 
   // RE-DRIVE, then GC (bounds the spool leak): an input still sitting here an
@@ -462,9 +468,22 @@ function drainPendingNudges(graph, input, slug) {
           // landed (it precedes the unlink below), so this retry was never
           // actually spent. Refresh the copy from the original — healing a
           // copy the crash tore in half — and drive it.
+          //
+          // The refresh is a temp-write + atomic rename, never a copy in place
+          // (F20). This same state also arises the other way round — the spawn
+          // DID land and only the `rm(plain)` below failed — and the two are
+          // indistinguishable from the pair alone. Owe-before-clear picks the
+          // safe reading (an extra classifier call beats a dropped job), but an
+          // in-place copy would then rewrite the file a live worker is reading.
+          // A rename swaps the inode instead, so that worker keeps reading the
+          // intact bytes it opened and the residual is only the bounded extra
+          // call, never a torn job.
+          const heal = `${copy}.heal-${process.pid}`;
           try {
-            fs.copyFileSync(plain, copy);
+            fs.copyFileSync(plain, heal);
+            fs.renameSync(heal, copy);
           } catch {
+            rm(heal);
             continue; // cannot re-arm it; the pair keeps the job owed
           }
         } else {
@@ -491,9 +510,36 @@ function drainPendingNudges(graph, input, slug) {
     }
   } catch {}
 
+  // The consume, now that the prune above has run: destroying a result while
+  // its job's input is still spooled hands a later sweep the exact state it
+  // reads as "never classified" (row (c)/(d), F17). So a result is unlinked
+  // only once neither half of its input pair remains — the prune succeeded, or
+  // the worker had already cleared it. If an input survived (the job lock was
+  // another sweep's this pass, or the unlink failed), the result is KEPT: it is
+  // re-read next pass, re-reconciled against `.nudged-injected` — so it is
+  // never re-injected — and its input pruned then. Retention is the safe side;
+  // a leftover result costs one re-read, a premature one costs a backend call
+  // or a lost finding.
+  const inputRemains = (hash) => {
+    for (const n of [`${hash}.in.json`, `${hash}.redriven.in.json`]) {
+      try {
+        fs.accessSync(path.join(dir, n));
+        return true;
+      } catch {}
+    }
+    return false;
+  };
+  const consume = (hash, fp) => {
+    if (inputRemains(hash)) return;
+    try {
+      fs.unlinkSync(fp);
+    } catch {}
+  };
+  for (const { hash, fp } of discard) consume(hash, fp);
+
   if (!results.length) return "";
 
-  for (const { r, fp } of results) {
+  for (const { r, fp, hash } of results) {
     // OWE BEFORE YOU CLEAR (row (b)): the injected marker — and the journal
     // line the capture-metrics correlation reads — are written while the
     // result file is still on disk, and only then is it consumed. A crash in
@@ -515,9 +561,7 @@ function drainPendingNudges(graph, input, slug) {
       JSON.stringify({ ts: u.jqNow(), project: slug, tool: "nudge", file: r.file, facts: r.nfacts, async: true })
     );
     if (!marked) continue; // still injected below — just not yet discharged
-    try {
-      fs.unlinkSync(fp);
-    } catch {}
+    consume(hash, fp);
   }
 
   // Cap the merged fact blocks so the framing — the actionable "capture it NOW"

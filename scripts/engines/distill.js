@@ -406,10 +406,16 @@ function createNodeExclusive(nodePath, md) {
 // (prompt-context.js) — SPOR_NUDGE=0 must suppress this drain the same way it
 // suppresses the prompt-time one, so a user who disabled nudges mid-session
 // never gets an old pending finding captured behind their back.
-async function sessionEndPendingNudges({ graph, slug, session, remote }) {
-  if (!u.cfgBool("nudge.enabled", "NUDGE", true)) return;
-  if (!u.cfgBool("nudge.async", "NUDGE_ASYNC", false)) return;
-
+//
+// The drain of ONE session's spool. It is called for the ending session, and —
+// as the collector F21 named — for the ABANDONED spools of sessions that ended
+// without one (`foreign`), since a result this drain deliberately KEEPS on a
+// transient failure is otherwise never revisited by anybody: it is keyed under
+// a session id that is over, so no later prompt drains it and no later
+// SessionEnd looks at it, and journal GC recursively removes the directory at
+// gc.maxAgeMs. Retention was the safe side of every transient branch below
+// ONLY if something eventually comes back for it; this is what comes back.
+async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign }) {
   const dir = path.join(graph, "journal", "pending-nudges", session);
   let all;
   try {
@@ -501,13 +507,20 @@ async function sessionEndPendingNudges({ graph, slug, session, remote }) {
     // already landed, so the retry has to resolve to the SAME capture. The
     // key is the finding itself — this session, this file, these facts.
     const key = crypto.createHash("sha256").update(`${session}\n${r.file}\n${facts}`).digest("hex");
+    // Which project the finding is stamped to. For the ENDING session that is
+    // the ambient slug, unchanged. For a COLLECTED foreign spool the ambient
+    // slug is simply the wrong answer — that session may have run in another
+    // repo entirely — so it is taken from where the classified file itself
+    // lives, by the same `.spor`-marker-then-git-root rule the ambient slug
+    // came from, and only when that directory is still there to be read.
+    const stamp = foreign ? spoolCaptureSlug(slug, r.file) : slug;
 
     if (remote) {
       const body = JSON.stringify({
         text: u.byteHead(text, 3900),
         // Always the ambient session slug, never user-declared — same
         // posture as the LLM distiller's per-fact capture loop below.
-        context: { project: slug, project_explicit: false },
+        context: { project: stamp, project_explicit: false },
         source: "nudge-sessionend",
         idempotency_key: key,
       });
@@ -616,7 +629,7 @@ async function sessionEndPendingNudges({ graph, slug, session, remote }) {
     const firstFact = facts.split("\n")[0] || title;
     const summary = firstFact.length > 497 ? `${firstFact.slice(0, 497)}...` : firstFact;
     const mdFor = (id) =>
-      `---\nid: ${id}\ntype: ${type}\nrepo: ${slug}\ntitle: ${title.replace(/\n/g, " ")}\nsummary: ${summary.replace(
+      `---\nid: ${id}\ntype: ${type}\nrepo: ${stamp}\ntitle: ${title.replace(/\n/g, " ")}\nsummary: ${summary.replace(
         /\n/g,
         " "
       )}\ndate: ${u.localDate()}\nauthored_via: capture\ncapture_key: ${key}\n---\n\n${text}\n`;
@@ -735,6 +748,98 @@ async function sessionEndPendingNudges({ graph, slug, session, remote }) {
     } catch (e) {
       u.appendLine(logFile, `  session-final capture from ${r.file} kept in the spool: write failed: ${e.message}`);
     }
+  }
+}
+
+// The project a COLLECTED foreign finding is stamped to: read from the
+// classified file's own location, since the collecting session's ambient slug
+// says nothing about where that session was working. Falls back to the ambient
+// slug when the file's directory is gone (a deleted checkout) — a finding
+// stamped to the collector's project is recoverable; one dropped over an
+// unreadable path is not.
+function spoolCaptureSlug(ambient, file) {
+  try {
+    const d = path.dirname(file);
+    if (d && fs.existsSync(d)) return u.projectSlug(d) || ambient;
+  } catch {
+    /* fall through to the ambient slug */
+  }
+  return ambient;
+}
+
+// How long a spool dir must have been untouched before another session's
+// SessionEnd collects it, and how many it will take in one pass. The horizon is
+// generous on purpose: while the owning session may still be alive, ITS next
+// prompt is the better home for the finding (it gets injected in context rather
+// than captured behind someone's back), so collection is strictly the last
+// resort — well inside gc.maxAgeMs, which is what would otherwise delete it.
+const SPOOL_COLLECT_AFTER_MS = 21600000; // 6h
+const SPOOL_COLLECT_MAX = 5; // bounded work per SessionEnd: this runs in a hook
+
+// Abandoned spool dirs — a session that ended without a SessionEnd firing (the
+// dispatch sessions the loss measurement concentrated in), or one whose own
+// drain hit a TRANSIENT failure and rightly kept the file. Both leave a result
+// nobody revisits. A dir is collected only when it is stale AND the session
+// shows no other sign of life (the same bucket signal gcJournal uses to protect
+// a concurrently-live session) AND it actually holds a result.
+function orphanedSpoolSessions(graph, session, now = Date.now()) {
+  const base = path.join(graph, "journal", "pending-nudges");
+  let subs;
+  try {
+    subs = fs.readdirSync(base, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const cutoff = now - SPOOL_COLLECT_AFTER_MS;
+  const found = [];
+  for (const s of subs) {
+    if (!s.isDirectory() || s.name === session) continue;
+    const full = path.join(base, s.name);
+    let m;
+    try {
+      m = fs.statSync(full).mtimeMs;
+    } catch {
+      continue;
+    }
+    if (m >= cutoff) continue; // recent activity — leave it to its own session
+    let live = false;
+    for (const sfx of [".jsonl", ".nudged", ".nudged-injected"]) {
+      try {
+        if (fs.statSync(path.join(graph, "journal", `${s.name}${sfx}`)).mtimeMs >= cutoff) {
+          live = true;
+          break;
+        }
+      } catch {
+        /* absent artifact is no evidence of life */
+      }
+    }
+    if (live) continue;
+    let holds = false;
+    try {
+      holds = fs.readdirSync(full).some((f) => f.endsWith(".out.json"));
+    } catch {
+      continue;
+    }
+    if (holds) found.push({ name: s.name, m });
+  }
+  found.sort((a, b) => a.m - b.m); // oldest first: closest to the GC cutoff
+  return found.slice(0, SPOOL_COLLECT_MAX).map((e) => e.name);
+}
+
+async function sessionEndPendingNudges({ graph, slug, session, remote }) {
+  if (!u.cfgBool("nudge.enabled", "NUDGE", true)) return;
+  if (!u.cfgBool("nudge.async", "NUDGE_ASYNC", false)) return;
+
+  await drainPendingNudgeSpool({ graph, slug, session, remote });
+  // Then the collector. It introduces NO new durable flag: the `.out.json` is
+  // still the whole debt, and every consume rule above is unchanged — this only
+  // widens who eventually comes back for one. Concurrency is already handled by
+  // the atomic result claim (dec-spor-nudge-drain-atomic-claim), so two boxes
+  // collecting the same dir cannot both capture one finding, and the capture key
+  // is keyed on the ORIGIN session, so a replay resolves to the same node/
+  // idempotency key it would have on the owning session's own drain.
+  for (const other of orphanedSpoolSessions(graph, session)) {
+    await drainPendingNudgeSpool({ graph, slug, session: other, remote, foreign: true }).catch(() => {});
   }
 }
 

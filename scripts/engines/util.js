@@ -1733,60 +1733,82 @@ function claimSpoolResult(dir, f, status) {
 // (F17), and it covers every mutation of the pair — the settled prune
 // included, so a prune can never delete files a sweep is mid-recovery on.
 //
-// Same self-healing shape as the result claim above: the holder's pid and the
-// acquisition time are the lock's contents, a lock held by a LIVE pid is
-// refused, and SPOOL_CLAIM_TTL_MS bounds every hold so a crash mid-recovery
-// costs one horizon rather than wedging the job forever. A lock that exists but
-// carries no stamp yet is a holder caught between create and write, so it reads
-// as HELD (bounded by the same TTL) rather than as free to steal. Returns a
-// release function, or null when the job is not ours this pass — and a null is
-// always "leave the pair exactly as it is", never "act on it anyway".
-function spoolJobLockHeld(p) {
-  let st;
-  try {
-    st = fs.statSync(p);
-  } catch {
-    return false; // no lock at all
-  }
-  if (Date.now() - st.mtimeMs >= SPOOL_CLAIM_TTL_MS) return false; // stale, whatever it claims
-  let raw = "";
-  try {
-    raw = fs.readFileSync(p, "utf8");
-  } catch {
-    return true; // unreadable right now: assume a holder (the TTL above bounds it)
-  }
-  const m = /^(\d+)/.exec(raw.trim());
-  if (!m) return true; // created, not yet stamped
+// The lock is self-healing like the result claim above — a holder that dies
+// must not wedge the job forever — but it reaches that WITHOUT ever deleting
+// another actor's lock (F19). A single well-known lock pathname forced the old
+// shape: see it, judge it stale, unlink it, re-create it. That check-then-unlink
+// is not a claim. Two sweepers could both judge one stale lock, both break it,
+// and both `wx` — worse, the loser's break deletes the WINNER's fresh lock, and
+// the winner's `release()` then deletes its successor's, so a third sweeper
+// walks in on a pair two others are already mutating. That is precisely the
+// concurrent re-copy/re-spawn the lock exists to prevent.
+//
+// So each contender creates ONLY its own uniquely-named lock file
+// (`<hash>.redrive.lock-<pid>-<ts>-<rand>`) and deletes ONLY its own. Everything
+// a racer needs to judge a lock is in its NAME, so there is no create-then-write
+// window to misread and no file to read at all. Ownership is decided by a listing
+// AFTER the create: you hold the job only if no OTHER live contender is present.
+// Two contenders can never both win — each creates before it lists, so if A's
+// listing missed B then B was created after A, and B's own listing must see A.
+// A collision simply means "not ours this pass" for one or both, which is the
+// safe answer: the pair is left exactly as it is for a later sweep.
+//
+// Staleness is per-contender and read-only: a lock whose pid is gone or whose
+// stamp is past SPOOL_CLAIM_TTL_MS is IGNORED by every racer, so a crashed
+// holder costs one horizon, not the job. Such a file is unlinked only when it is
+// provably dead AND expired — and because every racer already ignores it, that
+// unlink can neither grant nor revoke ownership.
+const SPOOL_JOB_LOCK_STAMP = /^(\d+)-(\d+)-[0-9a-f]+$/;
+function spoolJobLockContends(name) {
+  const m = SPOOL_JOB_LOCK_STAMP.exec(name);
+  if (!m) return { contends: false, prunable: false }; // not one of ours: never touch it
   const pid = Number(m[1]);
-  if (pid === process.pid) return false; // our own lock is ours to retake
+  const expired = Date.now() - Number(m[2]) >= SPOOL_CLAIM_TTL_MS;
+  if (pid === process.pid) return { contends: false, prunable: false }; // ours to ignore, never to reap blindly
+  let alive = false;
   try {
     process.kill(pid, 0);
-    return true;
+    alive = true;
   } catch (e) {
-    return Boolean(e && e.code === "EPERM"); // EPERM: alive under another uid
+    alive = Boolean(e && e.code === "EPERM"); // EPERM: alive under another uid
   }
+  return { contends: alive && !expired, prunable: !alive && expired };
 }
 function claimSpoolJob(dir, hash) {
-  const p = path.join(dir, `${hash}.redrive.lock`);
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const prefix = `${hash}.redrive.lock-`;
+  const mine = `${prefix}${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+  const p = path.join(dir, mine);
+  try {
+    fs.writeFileSync(p, "", { flag: "wx" });
+  } catch {
+    return null; // cannot lock here at all: do not act
+  }
+  const release = () => {
     try {
-      fs.writeFileSync(p, `${process.pid} ${Date.now()}`, { flag: "wx" });
-      return () => {
-        try {
-          fs.unlinkSync(p);
-        } catch {}
-      };
-    } catch (e) {
-      if (!e || e.code !== "EEXIST") return null; // cannot lock here at all: do not act
-      if (spoolJobLockHeld(p)) return null;
+      fs.unlinkSync(p);
+    } catch {}
+  };
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    release();
+    return null; // cannot tell who else is here: not ours this pass
+  }
+  for (const f of entries) {
+    if (f === mine || !f.startsWith(prefix)) continue;
+    const { contends, prunable } = spoolJobLockContends(f.slice(prefix.length));
+    if (contends) {
+      release();
+      return null; // a live contender owns the pair this pass
+    }
+    if (prunable) {
       try {
-        fs.unlinkSync(p); // stale: break it, then take it (exactly one racer's wx wins)
-      } catch {
-        return null;
-      }
+        fs.unlinkSync(path.join(dir, f));
+      } catch {}
     }
   }
-  return null;
+  return release;
 }
 
 // Detached child that survives the hook process (replaces nohup setsid).
