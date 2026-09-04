@@ -207,7 +207,14 @@ is the better home for a finding; collection is the last resort before the GC
 cutoff. A collected finding is stamped to the project of the FILE it was
 classified from (`spoolCaptureSlug`), not the collector's ambient slug, and it
 is keyed on the ORIGIN session so its idempotency key and node id are the ones
-that session's own drain would have minted. A server 400/413/422 is
+that session's own drain would have minted. A dir is not a unit of work, so the
+whole phase is BOUNDED too — a 20s wall-clock deadline over both drains plus
+`SPOOL_COLLECT_RESULT_MAX` (10) foreign results per pass, spent own-session
+first — since each result is its own capture round trip and the transcript
+distiller runs after this. The bound is admissible only because stopping early
+has no durable consequence: the `.out.json` IS the debt, an unreached result is
+left byte-for-byte as found, and the collector is itself what comes back for it
+(6h horizon, well inside `gc.maxAgeMs`). A server 401/400/413/422 is
 permanent but NOT discardable: per API.md §5 a mechanical writer preserves a
 rejected payload in `outbox/dead/` (the channel session-start and `spor-hook
 doctor` already surface), so the consume waits on that write like any other.

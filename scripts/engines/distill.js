@@ -415,7 +415,7 @@ function createNodeExclusive(nodePath, md) {
 // SessionEnd looks at it, and journal GC recursively removes the directory at
 // gc.maxAgeMs. Retention was the safe side of every transient branch below
 // ONLY if something eventually comes back for it; this is what comes back.
-async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign }) {
+async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign, budget }) {
   const dir = path.join(graph, "journal", "pending-nudges", session);
   let all;
   try {
@@ -449,8 +449,24 @@ async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign })
   const llog = (m) => u.appendLine(path.join(graph, "journal", "distill.log"), `  ${m}`);
   const note = remote ? rlog : llog;
 
+  // The phase bound (F22). A result is only ever claimed when this drain
+  // intends to capture it in THIS pass, so the cap is spent on work actually
+  // done, and stopping early leaves an untouched file behind — no claim taken,
+  // no flag written, nothing to reconcile later.
+  const overBudget = () => {
+    if (!budget) return null;
+    if (budget.expired()) return "the SessionEnd spool budget expired";
+    if (foreign && budget.collectExhausted()) return "the per-pass collection cap is spent";
+    return null;
+  };
+
   const results = [];
-  for (const f of files) {
+  for (const [i, f] of files.entries()) {
+    const stop = overBudget();
+    if (stop) {
+      note(`${files.length - i} result(s) left in ${session}'s spool for a later sweep: ${stop}`);
+      break;
+    }
     // Claim before reading (dec-spor-nudge-drain-atomic-claim): the
     // prompt-time drain reads this same spool and INJECTS what it finds, so
     // without the claim an overlapping pair can inject a finding there and
@@ -494,12 +510,26 @@ async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign })
     // finding is one this session has surfaced already. Everything still
     // capturable keeps its file until the capture below lands it somewhere
     // durable.
-    if (r && r.file && r.facts && !alreadyInjected.has(r.file)) results.push({ r, fp });
-    else consume(fp);
+    if (r && r.file && r.facts && !alreadyInjected.has(r.file)) {
+      results.push({ r, fp });
+      // Only a result this pass will try to CAPTURE is charged to the
+      // collection cap: a claim that failed, or bytes that were terminal on
+      // sight, cost no round trip and must not crowd out a real finding.
+      if (budget && foreign) budget.countCollected();
+    } else consume(fp);
   }
   if (!results.length) return;
 
-  for (const { r, fp } of results) {
+  for (const [i, { r, fp }] of results.entries()) {
+    // The capture loop is where the time actually goes (a remote capture is
+    // its own bounded-but-slow round trip), so the deadline is re-checked per
+    // result. What is left stays CLAIMED but untouched — the claim is held only
+    // while this pid lives, so it hands straight back when the hook exits, and
+    // the claimed name still ends in `.out.json` for every later sweep.
+    if (budget && budget.expired()) {
+      note(`${results.length - i} claimed result(s) left in ${session}'s spool: the SessionEnd spool budget expired`);
+      break;
+    }
     const facts = u.stripTrailingNewlines(r.facts);
     const text = `Classifier-verified findings from ${r.file}, captured at session end because the session had no further prompt to drain them:\n\n${facts}`;
     // The capture's identity, shared by both modes: because the consume now
@@ -540,17 +570,20 @@ async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign })
       if (post && post.http === "200") {
         rlog(`captured session-final finding from ${r.file}`);
         consume(fp);
-      } else if (post && ["400", "413", "422"].includes(post.http)) {
+      } else if (post && ["400", "401", "413", "422"].includes(post.http)) {
         // The server's verdict on this exact body — a re-post can only be
-        // rejected again, so it is PERMANENT. API.md §5 says what a mechanical
-        // writer does with a permanent reject: dead-letter it to `outbox/dead/`
-        // with a loud remote.log line, never discard it. That preserves the
-        // rejected payload for inspection or replay after a fix, and it is the
-        // channel session-start and `spor-hook doctor` already count and
-        // surface — so the consume waits on the dead-letter write landing,
-        // exactly as the outbox spool below does. (401 is deliberately NOT
-        // here: it spools instead, handing the dead-letter decision to
-        // drain-outbox, which owns it and can re-post once a token is re-minted.)
+        // rejected again, so it is PERMANENT. API.md §5 names the set for a
+        // mechanical writer (`distill` included): 401, 400, 413 and 422 are
+        // permanent and dead-lettered to `outbox/dead/` with a loud remote.log
+        // line, never discarded and never re-POSTed forever; 429 and 5xx stay
+        // transient. Dead-lettering preserves the rejected payload for
+        // inspection or replay after a fix, and it is the channel session-start
+        // and `spor-hook doctor` already count and surface — so the consume
+        // waits on the dead-letter write landing, exactly as the outbox spool
+        // below does. 401 belongs here (F23): the engines carry no token
+        // refresh, so a revoked/invalid token does not un-revoke by being
+        // spooled — routing it through the outbox only bought one more failed
+        // POST before drain-outbox dead-lettered the identical bytes.
         let dead = false;
         if (u.ensureDir(path.join(graph, "outbox", "dead"))) {
           try {
@@ -560,8 +593,12 @@ async function drainPendingNudgeSpool({ graph, slug, session, remote, foreign })
         }
         if (dead) {
           rlog(
-            `session-final finding from ${r.file} rejected (http=${post.http}, permanent); ` +
-              `dead-lettered to outbox/dead/${spoolName} for inspection`
+            post.http === "401"
+              ? `session-final finding from ${r.file} rejected (http=401, revoked/invalid token); ` +
+                  `dead-lettered to outbox/dead/${spoolName} — re-mint SPOR_TOKEN and replay outbox/dead/, ` +
+                  `auth will not recover on its own`
+              : `session-final finding from ${r.file} rejected (http=${post.http}, permanent); ` +
+                  `dead-lettered to outbox/dead/${spoolName} for inspection`
           );
           consume(fp);
         } else {
@@ -776,6 +813,36 @@ function spoolCaptureSlug(ambient, file) {
 const SPOOL_COLLECT_AFTER_MS = 21600000; // 6h
 const SPOOL_COLLECT_MAX = 5; // bounded work per SessionEnd: this runs in a hook
 
+// A DIR is not a unit of work (F22): each of those five can hold any number of
+// results, and each result is its own capture — remotely a bounded-but-slow
+// round trip (30s), locally a graph load plus a node write — so a
+// dirs-only bound let one SessionEnd serially drain other sessions' backlogs
+// ahead of the transcript distiller that runs after it. The phase therefore
+// carries a wall-clock deadline over BOTH drains and a total-result cap over
+// the collection, spent oldest-spool-first with the ending session's own
+// findings served before any foreign one.
+//
+// A bound is admissible here only because stopping early has no durable
+// consequence: the `.out.json` IS the debt (no flag records it, so none can be
+// lost), an unreached result is left byte-for-byte as it was found, and the
+// collector itself is what comes back for it — the collection horizon is 6h
+// and the GC cutoff is gc.maxAgeMs, so a result deferred to a later sweep is
+// deferred, not dropped.
+const SPOOL_PHASE_BUDGET_MS = 20000; // wall clock for the whole SessionEnd spool phase
+const SPOOL_COLLECT_RESULT_MAX = 10; // total FOREIGN results captured per pass
+
+function makeSpoolBudget(now = Date.now()) {
+  const deadline = now + SPOOL_PHASE_BUDGET_MS;
+  let collected = 0;
+  return {
+    expired: () => Date.now() >= deadline,
+    collectExhausted: () => collected >= SPOOL_COLLECT_RESULT_MAX,
+    countCollected: () => {
+      collected += 1;
+    },
+  };
+}
+
 // Abandoned spool dirs — a session that ended without a SessionEnd firing (the
 // dispatch sessions the loss measurement concentrated in), or one whose own
 // drain hit a TRANSIENT failure and rightly kept the file. Both leave a result
@@ -830,7 +897,13 @@ async function sessionEndPendingNudges({ graph, slug, session, remote }) {
   if (!u.cfgBool("nudge.enabled", "NUDGE", true)) return;
   if (!u.cfgBool("nudge.async", "NUDGE_ASYNC", false)) return;
 
-  await drainPendingNudgeSpool({ graph, slug, session, remote });
+  // One budget for the whole phase (F22), started here and spent in order: the
+  // ending session's own spool is drained first and can use all of it, then
+  // whatever remains pays for collection. The distiller that runs after this
+  // therefore waits on a bounded phase rather than on other sessions' backlogs.
+  const budget = makeSpoolBudget();
+
+  await drainPendingNudgeSpool({ graph, slug, session, remote, budget });
   // Then the collector. It introduces NO new durable flag: the `.out.json` is
   // still the whole debt, and every consume rule above is unchanged — this only
   // widens who eventually comes back for one. Concurrency is already handled by
@@ -839,7 +912,11 @@ async function sessionEndPendingNudges({ graph, slug, session, remote }) {
   // is keyed on the ORIGIN session, so a replay resolves to the same node/
   // idempotency key it would have on the owning session's own drain.
   for (const other of orphanedSpoolSessions(graph, session)) {
-    await drainPendingNudgeSpool({ graph, slug, session: other, remote, foreign: true }).catch(() => {});
+    // Checked per dir as well as per result: an exhausted budget must stop the
+    // walk, not just each dir's inner loops, so a spent phase costs no further
+    // readdir/claim work at all.
+    if (budget.expired() || budget.collectExhausted()) break;
+    await drainPendingNudgeSpool({ graph, slug, session: other, remote, foreign: true, budget }).catch(() => {});
   }
 }
 
