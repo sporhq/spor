@@ -167,6 +167,18 @@ your final message exactly what's blocking it. If an orchestrator dispatched
 you, it will see the node is unresolved and serialize or escalate it — that's
 the designed path, not a failure on your part.
 
+**Acceptance that turns out to span a second repo** (a docs item whose criteria
+also name a file in another repo) does NOT block you and does not authorize you
+to cut a worktree or branch in that other repo — a branch left there is an
+orphan no run table tracks (art-spor-docs-bulk-lease-endpoints-2026-08-10).
+Finish and resolve THIS repo's half here; `/spor:defer` the other repo's half as
+its own queue item stamped to that repo, with enough acceptance text to stand
+alone and a `relates-to` edge to `{{node}}` (this is a piece of your own
+acceptance, not a finding, so you write it yourself even under an
+orchestrator), and name that sibling's id in your resolver and final report.
+Only if the two halves must land together to work at all is it the lockstep
+case above: then stop and leave the node unresolved.
+
 ## Final report
 
 End with: the node id, what you changed, confirmation that tests pass and your

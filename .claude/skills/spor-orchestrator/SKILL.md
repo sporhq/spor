@@ -344,6 +344,35 @@ avoid collisions that will fight at merge time:
   `references/merge.md`). Detect these (the briefing spans both repos, or touches
   client `lib/` *and* server code), run them **alone** on the real checkout
   (`--no-worktree`, no other agent active in that repo), then merge.
+- **Split an item whose acceptance merely *spans* two repos.** Different from
+  the lockstep case above: a docs item that says "document X on the docs site
+  *and* add the row to spor's API.md", a rename that touches a client contract
+  doc and a server reference, a follow-up that lists a checkbox per repo. The
+  halves don't need each other to build or test — they are two independent
+  changes that happen to share a title. A dispatched agent gets ONE worktree
+  in ONE repo (the node's `repo:` stamp) and merge authority for ONE branch;
+  handed a two-repo item it improvises a second worktree in the other repo and
+  leaves an orphan branch nothing in your `running` table tracks (this is how
+  `task-spor-docs-bulk-lease-endpoints-apimd` came to exist — an unmerged
+  spor branch pushed from a spor-docs dispatch, art-spor-docs-bulk-lease-
+  endpoints-2026-08-10). So split it **at selection time, before dispatch**:
+  file one sibling queue item per additional repo with `spor add`, stamped to
+  that repo (`repo: <slug>` / `project: <slug>`) and carrying enough of the
+  parent's body to stand alone, wire `relates-to` both ways (cohort, not a
+  prerequisite — `blocks` only if one half genuinely can't land first), then
+  narrow the original's acceptance to its own repo (edit the body via `spor
+  put-node --if-exists update`, or say so in the dispatch prompt if the body
+  is a capture you'd rather not rewrite). Dispatch each half as an ordinary
+  single-repo item — they may run concurrently, since they never collide. The
+  test for which pattern applies: if the two halves would each pass their own
+  repo's suite with the other half absent, split; if one half's tests need
+  the other's edits on disk, it's the lockstep case and runs solo. The
+  second-worktree pattern is **not** authorized — an implementer that finds
+  the second half mid-task hands it back as a sibling item (see
+  `assets/agent-prompt.md` "If it won't converge"), and you dispatch that
+  sibling next; if an agent nonetheless reports a branch in another repo,
+  treat it as an untracked orphan: file the sibling item yourself, point it at
+  that branch, and gate+merge it through the same flow as any other branch.
 
 ### Waiting (don't burn turns spinning)
 

@@ -150,6 +150,24 @@ Otherwise `/spor:defer` the blocker with a clear explanation, leave the node
 The orchestrator will see the node is unresolved and serialize or escalate it —
 that's the designed path, not a failure on your part.
 
+**Acceptance that turns out to span a second repo** is a different, milder
+case — a docs item whose criteria also name a file in another repo, a checkbox
+"and update the reference in `<other-repo>`" — and it does NOT block you. Your
+worktree, your branch, and your merge authority all cover exactly this repo;
+you are not authorized to cut a worktree or a branch in any other repo, and a
+branch you left there would be an orphan nothing in the orchestrator's run
+table tracks (an implementer once pushed exactly such a branch from a docs
+dispatch and it sat unmerged, art-spor-docs-bulk-lease-endpoints-2026-08-10).
+Instead: finish and resolve THIS repo's half here, and hand the other repo's
+half back as its own queue item — `/spor:defer` it (the one exception to step
+5's "don't write to the graph yourself": this is a piece of your own
+acceptance, not a finding), stamped to that repo, with enough of the acceptance
+text to stand alone, and a `relates-to` edge to `{{node}}`. Name that sibling's
+id in your resolver node's body and in your final report so the orchestrator
+dispatches it next. Only if the two halves must land together to work at all
+(one half's tests need the other's edits) is it the lockstep case above:
+then stop and leave the node unresolved.
+
 ## Final report
 
 End with: the node id, what you changed, confirmation that tests pass and your

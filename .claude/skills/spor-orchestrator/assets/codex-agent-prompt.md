@@ -52,6 +52,12 @@ If it needs a coordinated change across both spor and spor-server, or it's block
 you genuinely can't make it pass: STOP, don't thrash. Explain the blocker in your final
 report and leave it for the orchestrator — that's the designed path, not a failure.
 
+If instead the acceptance merely names a file in ANOTHER repo (a docs row elsewhere,
+an independent half that would pass its own tests without yours), do this repo's half
+here and never cut a worktree or branch in the other repo — a branch left there is an
+orphan nobody tracks. Report it as MERGE-READY and list the other-repo half under
+"handed back" in your final report; the orchestrator files it as a sibling item.
+
 ## Final report
 End with: what you changed, how you verified (paste the key test/build output), the
 commit sha, and whether it's MERGE-READY or BLOCKED (and why).
