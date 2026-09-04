@@ -36,6 +36,9 @@ function initRepo(opts = {}) {
   execFileSync("git", args, { stdio: "ignore" });
   git(dir, "config", "user.email", "t@t");
   git(dir, "config", "user.name", "Test");
+  // The oracle compares checked-out BYTES against what the test wrote; the
+  // windows-latest runner's global core.autocrlf=true would rewrite them.
+  git(dir, "config", "core.autocrlf", "false");
   return dir;
 }
 function write(dir, p, body) {

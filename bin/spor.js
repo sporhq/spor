@@ -7906,7 +7906,13 @@ function worktreeDeclaredEnv(dir) {
 function removeDispatchWorktree(repoDir, dir, branch) {
   const common = (git(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).stdout || "").trim();
   const mainCheckout = common ? path.dirname(common) : "";
-  if (!mainCheckout || path.resolve(mainCheckout) !== path.resolve(repoDir)) {
+  // Compared CANONICALIZED (u.canonPath): git answers in the long, resolved
+  // form, while `repoDir` is whatever the caller spelled — an 8.3 short name
+  // on Windows (os.tmpdir() is `…\RUNNER~1\…` on the CI runner), a
+  // /var -> /private/var symlink on macOS — and a spelling mismatch here read
+  // as "not a worktree of repoDir", stranding the half-prepped worktree the
+  // guard exists to clean up (inc-spor-windows-ci-main-failing).
+  if (!mainCheckout || u.canonPath(mainCheckout) !== u.canonPath(repoDir)) {
     return { removed: false, reason: `${dir} is not a worktree of ${repoDir} — refusing to remove` };
   }
   const status = git(dir, ["status", "--porcelain"]);
@@ -8119,10 +8125,17 @@ const DISPATCH_RUNNER = path.join(ROOT, "lib", "shell", "agent-dispatch-runner.j
 // startup, exercising launchSupervisedHarness's supervisor-exited-early
 // branch deterministically instead of relying on a real startup crash/OOM to
 // happen to occur (task-spor-dispatch-supervisor-test-seam). Unset (the
-// default) reproduces the exact prior invocation.
+// default) reproduces the exact prior invocation. A `.js` override runs under
+// THIS node, like the real runner: the supervisor is spawned with no shell
+// (its handshake rides an extra stdio pipe a cmd.exe hop would not inherit),
+// and Node refuses a bare `.cmd`/`.bat` spawn on Windows (EINVAL,
+// CVE-2024-27980), so a script is the one override shape that launches the
+// same way on every platform.
 function dispatchRunnerCommand(env = process.env) {
   const override = env.SPOR_DISPATCH_RUNNER_CMD;
-  return override ? { cmd: override, args: [] } : { cmd: process.execPath, args: [DISPATCH_RUNNER] };
+  if (!override) return { cmd: process.execPath, args: [DISPATCH_RUNNER] };
+  if (/\.js$/i.test(override)) return { cmd: process.execPath, args: [override] };
+  return { cmd: override, args: [] };
 }
 
 function writePrivate(file, text) {

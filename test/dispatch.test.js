@@ -267,7 +267,15 @@ test("dispatch from inside a git worktree (local, stubbed): registers the MAIN c
   const mapped = Object.values(JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8")).dispatch.repos);
   assert.ok(mapped.some((p) => slashPath(p).endsWith("/wt-main-svc")), `main checkout registered (got ${JSON.stringify(mapped)})`);
   assert.ok(!mapped.some((p) => slashPath(p).endsWith("/wt-ephemeral-checkout")), "ephemeral worktree path NOT registered");
-  fs.rmSync(base, { recursive: true, force: true });
+  // Best-effort: on Windows the just-launched detached supervisor still holds
+  // the worktree as its cwd, and rm of a held directory is EPERM there — the
+  // launch is what this test asserts, and a temp dir left behind is what every
+  // other fixture in this file does anyway.
+  try {
+    fs.rmSync(base, { recursive: true, force: true });
+  } catch {
+    /* held by the detached launch on Windows */
+  }
 });
 
 test("dispatch <node-id>: auto-detects node mode and resolves the dir cross-repo via the map", () => {
@@ -1002,9 +1010,11 @@ require("node:fs").writeFileSync(".wt-gitdir", dir.trim() + "\\n");
   assert.strictEqual(r.status, 0, r.stderr);
   const wtDir = path.join(repo, ".claude", "worktrees", "dec-x");
   const gitDir = fs.readFileSync(path.join(wtDir, ".wt-gitdir"), "utf8").trim();
+  // realpathSync.native: git answers in the long form, and only the native
+  // realpath expands the 8.3 short name os.tmpdir() hands out on Windows CI.
   assert.strictEqual(
     slashPath(gitDir),
-    slashPath(path.join(fs.realpathSync(repo), ".git")),
+    slashPath(path.join(fs.realpathSync.native(repo), ".git")),
     "the hook's git reads the TARGET repo"
   );
   assert.ok(!slashPath(gitDir).includes("/launcher/"), "not the launcher's repo");
@@ -1046,8 +1056,9 @@ test("dispatch (cross-repo): a relative dispatch.worktreeSetup in the target .sp
   // Committed, not just written to disk: the worktree is cut from HEAD, so
   // worktreeSetup and the script it names must be resolved from the commit,
   // not the main checkout's live working tree
-  // (issue-spor-dispatch-worktree-config-live-file-race).
-  g(["add", "scripts/wt-setup.js", ".spor.json"]);
+  // (issue-spor-dispatch-worktree-config-live-file-race). The whole scripts/
+  // dir, so the .cmd wrapper the stub adds on Windows is committed too.
+  g(["add", "scripts", ".spor.json"]);
   g(["commit", "-q", "-m", "add worktree setup hook"]);
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-elsewhere-"));
@@ -1126,12 +1137,12 @@ test("dispatch worktree setup hook: fires from a STALE/dirty main checkout, reso
   const preSetupSha = g(["rev-parse", "HEAD"]).trim();
 
   fs.mkdirSync(path.join(repo, "scripts"));
-  writeSpawnableNodeStub(path.join(repo, "scripts"), "wt-setup", "require('node:fs').writeFileSync('./.ran', 'ran\\n');");
+  const setup = writeSpawnableNodeStub(path.join(repo, "scripts"), "wt-setup", "require('node:fs').writeFileSync('./.ran', 'ran\\n');");
   fs.writeFileSync(
     path.join(repo, ".spor.json"),
-    JSON.stringify({ enabled: true, dispatch: { worktree: true, worktreeSetup: "scripts/wt-setup.js" } }) + "\n"
+    JSON.stringify({ enabled: true, dispatch: { worktree: true, worktreeSetup: path.relative(repo, setup) } }) + "\n"
   );
-  g(["add", "scripts/wt-setup.js", ".spor.json"]);
+  g(["add", "scripts", ".spor.json"]);
   g(["commit", "-q", "-m", "add worktree setup hook"]);
 
   // Revert the live checkout to the pre-setup-hook commit's content, WITHOUT

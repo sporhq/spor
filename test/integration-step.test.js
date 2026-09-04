@@ -30,7 +30,7 @@ const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const gates = require("../lib/kernel/gates.js");
 const integrationRunner = require("../lib/shell/integration-runner.js");
 const gateRunner = require("../lib/shell/gate-runner.js");
-const { writeSpawnableNodeStub, pathWithOnlyGitAndNode, writeFakePathBin, pathWithOnlyGit, isolatedBinDir } = require("./helpers/portable");
+const { writeSpawnableNodeStub, pathWithOnlyGitAndNode, writeFakePathBin, writeFakePathNodeBin, isolatedBinDir } = require("./helpers/portable");
 
 // ---------------------------------------------------------------- parsing --
 
@@ -535,40 +535,46 @@ function proposeRepo(branchName) {
   execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
   git(dir, "config", "user.email", "t@t");
   git(dir, "config", "user.name", "Test");
+  git(dir, "config", "core.autocrlf", "false"); // the checked-out BYTES are compared below; the Windows CI runner's global autocrlf would rewrite them
   fs.writeFileSync(path.join(dir, "f.txt"), "base\n");
   git(dir, "add", "-A");
   git(dir, "commit", "-q", "-m", "base");
   git(dir, "remote", "add", "origin", "https://github.com/demo/repo.git");
+  // `origin` READS as github.com (what ghRepoSlug resolves the owner/repo
+  // from) but PUSHES to a local bare repo, so the branch push that precedes
+  // `gh pr create` never reaches GitHub — on any platform, without shadowing
+  // `git` on PATH (a PATH shim cannot intercept a bare `git` spawn on
+  // Windows, where only .exe/.com resolve).
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), "spor-propose-origin-"));
+  execFileSync("git", ["init", "-q", "--bare", bare], { stdio: "ignore" });
+  git(dir, "remote", "set-url", "--push", "origin", bare);
   git(dir, "checkout", "-q", "-b", branchName);
   fs.writeFileSync(path.join(dir, "f.txt"), "base\nbranch work\n");
   git(dir, "commit", "-qam", "branch work");
   return dir;
 }
 
-// A fake bin dir shadowing both `git` (real, except `push` is short-circuited
-// to a no-op success — nothing here actually reaches GitHub) and `gh` (fully
-// faked per-test via `listJson`/`create`). Every invocation of either is
-// appended to a shared calls log so a test can assert what was (or was NOT)
-// asked for, not just the final return value.
+// A fake bin dir carrying a `gh` fully faked per-test via `listJson`/`create`
+// (the push itself goes to proposeRepo's local bare pushurl, so nothing here
+// reaches GitHub). Every gh invocation is appended to a shared calls log so a
+// test can assert what was (or was NOT) asked for, not just the final return
+// value.
 function proposeFakeBin({ listJson, createOut = "https://github.com/demo/repo/pull/99\n", createRefused = null }) {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-propose-bin-"));
   const callsFile = path.join(binDir, "calls.log");
-  const realGit = path.join(pathWithOnlyGit(), "git");
-  writeFakePathBin(binDir, "git", `echo "git $*" >> "${callsFile}"\nif [ "$1" = "push" ]; then exit 0; fi\nexec "${realGit}" "$@"\n`);
-  writeFakePathBin(
-    binDir,
-    "gh",
-    [
-      `echo "gh $*" >> "${callsFile}"`,
-      `if [ "$1" = "--version" ]; then echo "gh version 2.0.0"; exit 0; fi`,
-      `if [ "$1" = "pr" ] && [ "$2" = "list" ]; then printf '%s' '${listJson}'; exit 0; fi`,
-      createRefused
-        ? `if [ "$1" = "pr" ] && [ "$2" = "create" ]; then echo "${createRefused}" >&2; exit 1; fi`
-        : `if [ "$1" = "pr" ] && [ "$2" = "create" ]; then printf '%s' '${createOut}'; exit 0; fi`,
-      `echo "unexpected gh invocation: $*" >&2`,
-      `exit 1`,
-    ].join("\n")
-  );
+  const onCreate = createRefused
+    ? `process.stderr.write(${JSON.stringify(createRefused + "\n")}); process.exit(1);`
+    : `process.stdout.write(${JSON.stringify(createOut)}); process.exit(0);`;
+  writeFakePathNodeBin(binDir, "gh", [
+    'const fs = require("node:fs");',
+    "const args = process.argv.slice(2);",
+    `fs.appendFileSync(${JSON.stringify(callsFile)}, "gh " + args.join(" ") + "\\n");`,
+    'if (args[0] === "--version") { process.stdout.write("gh version 2.0.0\\n"); process.exit(0); }',
+    `if (args[0] === "pr" && args[1] === "list") { process.stdout.write(${JSON.stringify(listJson)}); process.exit(0); }`,
+    `if (args[0] === "pr" && args[1] === "create") { ${onCreate} }`,
+    'process.stderr.write("unexpected gh invocation: " + args.join(" ") + "\\n");',
+    "process.exit(1);",
+  ].join("\n"));
   return { binDir, callsFile };
 }
 
@@ -1305,6 +1311,7 @@ function integrationRepo() {
   execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
   git(dir, "config", "user.email", "t@t");
   git(dir, "config", "user.name", "Test");
+  git(dir, "config", "core.autocrlf", "false"); // the checked-out BYTES are compared below; the Windows CI runner's global autocrlf would rewrite them
   fs.mkdirSync(path.join(dir, "test"), { recursive: true });
   fs.mkdirSync(path.join(dir, "lib"), { recursive: true });
   fs.writeFileSync(path.join(dir, ".spor"), "project: demo\n");
@@ -1356,6 +1363,7 @@ test("buildCandidateTree reports a real merge conflict, aborts cleanly, and leav
   execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
   git(dir, "config", "user.email", "t@t");
   git(dir, "config", "user.name", "Test");
+  git(dir, "config", "core.autocrlf", "false"); // the checked-out BYTES are compared below; the Windows CI runner's global autocrlf would rewrite them
   fs.writeFileSync(path.join(dir, "f.txt"), "base\n");
   git(dir, "add", "-A");
   git(dir, "commit", "-q", "-m", "base");
@@ -1850,6 +1858,7 @@ function reconcileRepo() {
   execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" });
   git(dir, "config", "user.email", "t@t");
   git(dir, "config", "user.name", "Test");
+  git(dir, "config", "core.autocrlf", "false"); // the checked-out BYTES are compared below; the Windows CI runner's global autocrlf would rewrite them
   for (const f of ["modified.txt", "deleted.txt", "collides.txt", "untouched.txt"]) fs.writeFileSync(path.join(dir, f), `${f} v1\n`);
   git(dir, "add", "-A");
   git(dir, "commit", "-q", "-m", "trusted");
@@ -1878,7 +1887,7 @@ test("after a local landing, the checkout holding the target branch is brought u
   built.cleanup();
   assert.strictEqual(landed.ok, true, landed.reason);
   assert.strictEqual(git(dir, "rev-parse", "main").trim(), built.sha);
-  assert.strictEqual(fs.realpathSync(landed.reconciled.checkout), fs.realpathSync(dir));
+  assert.strictEqual(fs.realpathSync.native(landed.reconciled.checkout), fs.realpathSync.native(dir));
   assert.deepStrictEqual(landed.reconciled.updated.sort(), ["added.txt", "deleted.txt", "modified.txt"]);
   assert.deepStrictEqual(landed.reconciled.skipped.sort(), ["adds-over-local.txt", "collides.txt"]);
   assert.match(landed.detail, /brought .* up to the landed commit \(3 paths; left 2 locally-modified paths alone/);
@@ -1912,12 +1921,18 @@ test("reconcile is a no-op when nothing has the target branch checked out, and w
 test("end to end, local mode: the candidate tree is staged with the repo's own dispatch.worktreeSetup hook before its suite runs", () => {
   const { home, repo, outfile } = integrationCliFixture({ integration: { mode: "local", command: `"${process.execPath}" test/acceptance.js`, strategy: "merge" } });
   const hookLog = path.join(home, "hook.log");
+  // Node-scripted hooks (a .cmd wrapper on Windows, where the hook runner's
+  // shell is cmd.exe and a #!/bin/sh script cannot run), declared by the
+  // relative path the stub actually landed at.
   fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
-  fs.writeFileSync(path.join(repo, "scripts", "stage.sh"), '#!/bin/sh\nprintf "setup %s %s\\n" "$SPOR_TREE_ROLE" "$SPOR_MAIN_CHECKOUT" >> "$HOOK_LOG"\n: > "$SPOR_WORKTREE/staged.txt"\n');
-  fs.writeFileSync(path.join(repo, "scripts", "unstage.sh"), '#!/bin/sh\nprintf "teardown %s %s\\n" "$SPOR_TREE_ROLE" "$SPOR_DISPATCH_NODE" >> "$HOOK_LOG"\n');
-  fs.chmodSync(path.join(repo, "scripts", "stage.sh"), 0o755);
-  fs.chmodSync(path.join(repo, "scripts", "unstage.sh"), 0o755);
-  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktreeSetup: "scripts/stage.sh", worktreeTeardown: "scripts/unstage.sh" } }));
+  const stage = writeSpawnableNodeStub(path.join(repo, "scripts"), "stage", [
+    'const fs = require("node:fs");',
+    'fs.appendFileSync(process.env.HOOK_LOG, "setup " + process.env.SPOR_TREE_ROLE + " " + process.env.SPOR_MAIN_CHECKOUT + "\\n");',
+    'fs.writeFileSync(require("node:path").join(process.env.SPOR_WORKTREE, "staged.txt"), "");',
+  ].join("\n"));
+  const unstage = writeSpawnableNodeStub(path.join(repo, "scripts"), "unstage",
+    'require("node:fs").appendFileSync(process.env.HOOK_LOG, "teardown " + process.env.SPOR_TREE_ROLE + " " + process.env.SPOR_DISPATCH_NODE + "\\n");');
+  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktreeSetup: path.relative(repo, stage), worktreeTeardown: path.relative(repo, unstage) } }));
   fs.writeFileSync(
     path.join(repo, "test", "acceptance.js"),
     'const fs = require("fs");\nif (!fs.existsSync("staged.txt")) { console.error("not staged: the suite needs the hook"); process.exit(1); }\n'
@@ -1943,7 +1958,7 @@ test("end to end, local mode: the candidate tree is staged with the repo's own d
   const setups = ran.filter((l) => l.startsWith("setup "));
   const teardowns = ran.filter((l) => l.startsWith("teardown "));
   assert.deepStrictEqual(setups.map((l) => l.split(" ")[1]), ["dispatch", "gate", "integration"], `roles in order, saw ${ran}`);
-  for (const l of setups) assert.strictEqual(fs.realpathSync(l.split(" ")[2]), fs.realpathSync(repo));
+  for (const l of setups) assert.strictEqual(fs.realpathSync.native(l.split(" ")[2]), fs.realpathSync.native(repo));
   assert.deepStrictEqual(teardowns.sort(), ["teardown dispatch task-ready", "teardown gate task-ready", "teardown integration task-ready"], `every tree is torn down, saw ${teardowns}`);
   // And the main checkout — which has `main` checked out — was reconciled to
   // the landing rather than left as a staged phantom revert.
