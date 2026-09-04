@@ -570,7 +570,7 @@ test("SessionEnd (remote): an unwritable outbox keeps the finding in the spool",
   assert.strictEqual(outFiles(home).length, 1, "with nowhere durable to put it, the finding stays spooled");
 });
 
-test("SessionEnd (remote): a server rejection is terminal — consumed, not retried forever", async () => {
+test("SessionEnd (remote): a permanent rejection is dead-lettered, not discarded", async () => {
   const { home, cwd } = scratch();
   fs.rmSync(path.join(home, "nodes"), { recursive: true });
   const file = path.join(cwd, "notes.md");
@@ -587,9 +587,187 @@ test("SessionEnd (remote): a server rejection is terminal — consumed, not retr
     await runAsync(["distill", "--host", "claude-code"], sessionEndPayload(cwd), e);
     assert.ok(hits.find((h) => h.url === "/v1/capture"), "expected the capture attempt");
     assert.strictEqual(outFiles(home).length, 0, "a rejected body reaches the same verdict on every retry");
-    const outbox = fs.existsSync(path.join(home, "outbox")) ? fs.readdirSync(path.join(home, "outbox")) : [];
-    assert.strictEqual(outbox.length, 0, "a rejection is not a transport failure — nothing is spooled");
+    // API.md §5: a mechanical writer dead-letters a permanent reject rather
+    // than dropping it — the payload stays inspectable and doctor/session-start
+    // already count and surface outbox/dead/.
+    const dead = fs.readdirSync(path.join(home, "outbox", "dead"));
+    assert.strictEqual(dead.length, 1, "the rejected payload must be preserved for inspection");
+    assert.match(dead[0], /\.capture\.json$/);
+    assert.match(JSON.parse(fs.readFileSync(path.join(home, "outbox", "dead", dead[0]), "utf8")).text, /session-final finding/);
+    const spooled = fs.readdirSync(path.join(home, "outbox")).filter((f) => f.endsWith(".capture.json"));
+    assert.strictEqual(spooled.length, 0, "a rejection is not a transport failure — nothing is queued for replay");
   } finally {
     srv.close();
   }
+});
+
+test("SessionEnd (remote): an unwritable dead-letter dir keeps the rejected finding in the spool", async () => {
+  const { home, cwd } = scratch();
+  fs.rmSync(path.join(home, "nodes"), { recursive: true });
+  const file = path.join(cwd, "notes.md");
+  seedOut(home, "s1", "r0", file, "1. a session-final finding");
+  fs.mkdirSync(path.join(home, "outbox"), { recursive: true });
+  fs.writeFileSync(path.join(home, "outbox", "dead"), "not a directory"); // ensureDir fails
+
+  const { srv, base } = await stubCaptureServer(400);
+  try {
+    const e = env(home, null, {
+      SPOR_SERVER: base,
+      SPOR_TOKEN: "spor_pat_test",
+      SPOR_DISTILL: "0",
+      SPOR_SESSION_LEASE: "0",
+    });
+    await runAsync(["distill", "--host", "claude-code"], sessionEndPayload(cwd), e);
+    assert.strictEqual(outFiles(home).length, 1, "with nowhere to preserve it, the finding stays spooled");
+  } finally {
+    srv.close();
+  }
+});
+
+test("SessionEnd: a read failure is not a malformed result — the finding survives", () => {
+  const { home, cwd } = scratch();
+  const dir = spoolDir(home, "s1");
+  fs.mkdirSync(dir, { recursive: true });
+  const fp = path.join(dir, "r0.out.json");
+  fs.writeFileSync(fp, JSON.stringify({ file: path.join(cwd, "doc.md"), facts: "1. a finding", nfacts: 1 }));
+  fs.chmodSync(fp, 0o000); // EACCES on read — transient, not corrupt
+
+  const out = runHook(["distill", "--host", "claude-code"], sessionEndPayload(cwd), env(home, null, { SPOR_DISTILL: "0" }));
+  fs.chmodSync(fp, 0o600);
+  assert.strictEqual(out.status, 0, out.stderr);
+  assert.strictEqual(outFiles(home).length, 1, "an unreadable-right-now result must not be destroyed");
+  assert.strictEqual(nodeFiles(home).length, 0);
+  assert.match(distillLog(home), /kept in the spool: read failed/);
+
+  // ...and it lands once the read succeeds again.
+  const again = runHook(["distill", "--host", "claude-code"], sessionEndPayload(cwd), env(home, null, { SPOR_DISTILL: "0" }));
+  assert.strictEqual(again.status, 0, again.stderr);
+  assert.strictEqual(outFiles(home).length, 0);
+  assert.strictEqual(nodeFiles(home).length, 1);
+});
+
+test("SessionEnd: an unrelated node squatting the capture id is reconciled, not mistaken for the capture", () => {
+  const { home, cwd } = scratch();
+  const file = path.join(cwd, "doc.md");
+  seedOut(home, "s1", "r0", file, "1. a finding worth keeping");
+
+  // Learn the id this finding would take, then hand it to a DIFFERENT node.
+  const probe = runHook(["distill", "--host", "claude-code"], sessionEndPayload(cwd), env(home, null, { SPOR_DISTILL: "0" }));
+  assert.strictEqual(probe.status, 0, probe.stderr);
+  const taken = nodeFiles(home)[0];
+  const mine = fs.readFileSync(path.join(home, "nodes", taken), "utf8");
+  assert.match(mine, /^capture_key: [0-9a-f]{64}$/m, "the node carries the full capture key it is reconciled by");
+  fs.writeFileSync(
+    path.join(home, "nodes", taken),
+    mine.replace(/^capture_key: .*$/m, "capture_key: 0000000000000000000000000000000000000000000000000000000000000000")
+  );
+
+  // Same finding again: the pathname is occupied by something that is NOT this
+  // capture, so it must land under its own id rather than be dropped as done.
+  seedOut(home, "s1", "r0", file, "1. a finding worth keeping");
+  const out = runHook(["distill", "--host", "claude-code"], sessionEndPayload(cwd), env(home, null, { SPOR_DISTILL: "0" }));
+  assert.strictEqual(out.status, 0, out.stderr);
+  assert.strictEqual(outFiles(home).length, 0);
+  assert.strictEqual(nodeFiles(home).length, 2, "an occupied id is not proof this finding was captured");
+});
+
+// ---------------------------------------------------------------------------
+// The spool WORKER's own durable debt (util.runSpoolWorker). The `.in.json` is
+// the job's only copy; clearing it before the classifier's verdict is durable
+// somewhere else loses a classification the tool loop already paid for.
+
+const WORKER = path.join(__dirname, "..", "scripts", "engines", "nudge-worker.js");
+
+function seedIn(home, session, hash, file, extra = {}) {
+  const dir = spoolDir(home, session);
+  fs.mkdirSync(dir, { recursive: true });
+  const fp = path.join(dir, `${hash}.in.json`);
+  fs.writeFileSync(
+    fp,
+    JSON.stringify({
+      prompt: "classify this",
+      tplSha: "deadbeef",
+      session,
+      slug: "projx",
+      file,
+      graph: home,
+      timeoutMs: 30000,
+      hash,
+      vars: { SLUG: "projx", FILE: file },
+      ...extra,
+    })
+  );
+  return fp;
+}
+
+function runWorker(inFile, e) {
+  return require("node:child_process").spawnSync(process.execPath, [WORKER, inFile], {
+    env: e,
+    encoding: "utf8",
+  });
+}
+
+test("worker: a durable result clears the input; a NOTHING verdict clears it too", () => {
+  const { root, home, cwd } = scratch();
+  const e = env(home, factStub(root));
+  const fp = seedIn(home, "s1", "h1", path.join(cwd, "doc.md"), { nudgeCmd: e.SUBSTRATE_NUDGE_CMD });
+  const r = runWorker(fp, e);
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(!fs.existsSync(fp), "the debt is settled once the result is durable");
+  assert.deepStrictEqual(outFiles(home), ["h1.out.json"]);
+
+  // A NOTHING verdict is SETTLED, not lost — re-running it would only spend
+  // another backend call to reach the same answer.
+  const e2 = env(home, nothingStub(root));
+  const fp2 = seedIn(home, "s1", "h2", path.join(cwd, "other.md"), { nudgeCmd: e2.SUBSTRATE_NUDGE_CMD });
+  const r2 = runWorker(fp2, e2);
+  assert.strictEqual(r2.status, 0, r2.stderr);
+  assert.ok(!fs.existsSync(fp2), "a definitive no-facts verdict owes nothing");
+  assert.deepStrictEqual(outFiles(home), ["h1.out.json"]);
+});
+
+test("worker: a failed result write keeps the input as the debt instead of swallowing it", () => {
+  const { root, home, cwd } = scratch();
+  const e = env(home, factStub(root));
+  const fp = seedIn(home, "s1", "h3", path.join(cwd, "doc.md"), { nudgeCmd: e.SUBSTRATE_NUDGE_CMD });
+  // Block the result write (rename onto a directory) — the classifier-verified
+  // finding never lands, so the job must stay owed.
+  fs.mkdirSync(path.join(spoolDir(home, "s1"), "h3.out.json"));
+
+  const r = runWorker(fp, e);
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(fp), "an undelivered verdict must leave its input behind to re-run");
+});
+
+test("worker: a backend failure keeps the input owed rather than dropping the job", () => {
+  const { root, home, cwd } = scratch();
+  const e = env(home, backend(root, "dead-backend.js", `process.stdin.resume(); process.exit(7);`));
+  const fp = seedIn(home, "s1", "h4", path.join(cwd, "doc.md"), { nudgeCmd: e.SUBSTRATE_NUDGE_CMD });
+  const r = runWorker(fp, e);
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(fp), "no verdict was reached, so nothing is settled");
+  assert.strictEqual(outFiles(home).length, 0);
+});
+
+test("drain: a stale input is re-driven once, then pruned", async () => {
+  const { root, home, cwd } = scratch();
+  const e = env(home, factStub(root));
+  const fp = seedIn(home, "s1", "h5", path.join(cwd, "doc.md"), { nudgeCmd: e.SUBSTRATE_NUDGE_CMD });
+  const old = Date.now() / 1000 - 7200; // 2h — past the orphan horizon
+  fs.utimesSync(fp, old, old);
+
+  promptContext(home, cwd, { prompt: "six words minimum to pass gate", extraEnv: { SUBSTRATE_NUDGE_CMD: e.SUBSTRATE_NUDGE_CMD } });
+  assert.ok(await waitFor(() => outFiles(home).length === 1), "the orphaned job was dropped instead of re-driven");
+  assert.ok(!fs.existsSync(fp), "the re-driven worker settled and cleared its own input");
+
+  // The bound: a job that already had its retry is pruned, never spun again.
+  const dir = spoolDir(home, "s1");
+  seedIn(home, "s1", "h6", path.join(cwd, "doc2.md"), { nudgeCmd: e.SUBSTRATE_NUDGE_CMD });
+  const fp2 = path.join(dir, "h6.redriven.in.json");
+  fs.renameSync(path.join(dir, "h6.in.json"), fp2);
+  fs.utimesSync(fp2, old, old);
+  promptContext(home, cwd, { prompt: "six words minimum to pass gate", session: "s1" });
+  assert.ok(!fs.existsSync(fp2), "a job past its one retry must not linger");
+  await sleep(300);
+  assert.strictEqual(outFiles(home).filter((f) => f === "h6.out.json").length, 0, "and must not be classified again");
 });

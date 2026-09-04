@@ -281,6 +281,46 @@ async function fetchRemoteTitleIndex(graph, rlog) {
   return cached ? cached.index : "";
 }
 
+// Create `nodePath` with `md` if and only if nothing occupies it yet, and make
+// it appear COMPLETE or not at all. Returns true when this call created it,
+// false when another actor won the race; throws on a real IO failure, so a
+// caller can tell "someone else has it" from "we could not write".
+//
+// hardlink-then-unlink is the primitive that gives both properties at once:
+// the temp file is fully written before it is linked, and link() fails with
+// EEXIST rather than clobbering. Where the filesystem has no usable link()
+// (EPERM/EOPNOTSUPP/ENOSYS on some mounts), fall back to an exclusive `wx`
+// open — still no clobber, at the cost of a brief window where a reader could
+// see a partial file.
+function createNodeExclusive(nodePath, md) {
+  const tmp = `${nodePath}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, md);
+    try {
+      fs.linkSync(tmp, nodePath);
+      return true;
+    } catch (e) {
+      if (e && e.code === "EEXIST") return false;
+      if (e && ["EPERM", "EOPNOTSUPP", "ENOSYS", "EXDEV"].includes(e.code)) {
+        try {
+          fs.writeFileSync(nodePath, md, { flag: "wx" });
+          return true;
+        } catch (e2) {
+          if (e2 && e2.code === "EEXIST") return false;
+          throw e2;
+        }
+      }
+      throw e;
+    }
+  } finally {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
 // issue-spor-async-nudge-session-final-loss: the SessionEnd half of the async
 // capture-nudge. A background nudge-worker classifies a written file OFF the
 // tool loop and drops a `<hash>.out.json` result under
@@ -308,21 +348,27 @@ async function fetchRemoteTitleIndex(graph, rlog) {
 // deliberate difference (issue-spor-session-end-pending-nudges-data-loss):
 // this drain is the LAST chance a finding gets, so a `.out.json` is consumed
 // only once its finding is somewhere durable — a 200, a spooled outbox
-// payload, a written node — or is provably uncapturable. TERMINAL outcomes
-// are consumed exactly as before (an unreadable result, a finding already
-// recorded in <session>.nudged-injected, a server rejection of this exact
-// body, a node the parser or validator refuses): re-reading any of those on a
-// later sweep can only reach the same verdict, so they must not linger. A
-// TRANSIENT failure — no local graph yet, an unloadable graph, a node or
-// outbox write that failed — LEAVES the file in the spool instead of
-// destroying the only copy of a classifier-verified finding, since SessionEnd
-// can fire more than once for one session (a debounce-approximated firing
-// precedes the real one on a turn-scoped host). The consume therefore trails
-// the durable write, which makes a crash in between re-owe an
+// payload, a dead-lettered payload, a written node — or is provably
+// uncapturable. TERMINAL outcomes are consumed (bytes that do not PARSE into a
+// usable result, a finding already recorded in <session>.nudged-injected, a
+// node the parser or validator refuses): re-reading any of those on a later
+// sweep can only reach the same verdict, so they must not linger. A TRANSIENT
+// failure — a failed READ of the spool file, no local graph yet, an unloadable
+// graph, a node/outbox/dead-letter write that failed — LEAVES the file in the
+// spool instead of destroying the only copy of a classifier-verified finding,
+// since SessionEnd can fire more than once for one session (a
+// debounce-approximated firing precedes the real one on a turn-scoped host).
+// Note the read/parse split: an IO failure and corrupt bytes are NOT the same
+// verdict, and collapsing them is exactly the loss this drain exists to stop.
+// A server 400/413/422 is permanent but still not discardable — API.md §5 has
+// a mechanical writer preserve a rejected payload in outbox/dead/, so it is
+// dead-lettered and the consume waits on THAT write. The consume therefore
+// trails the durable write, which makes a crash in between re-owe an
 // already-captured finding: both modes make that replay idempotent rather
-// than duplicating — remote on the `idempotency_key` below, local on a
-// content-addressed node id that a re-drain resolves to the node it already
-// wrote. A finding already recorded in <session>.nudged-injected — drained
+// than duplicating — remote on the `idempotency_key` below (and a
+// key-deterministic outbox/dead-letter filename), local on a content-addressed
+// node id whose full key is stamped as `capture_key` so a re-drain RECONCILES
+// against the node it already wrote rather than trusting a pathname. A finding already recorded in <session>.nudged-injected — drained
 // and injected in-session, or a rare race with a concurrent prompt-time drain
 // — is skipped, never double-captured. Gated on nudge.async (default off) so the
 // shipped synchronous path stays byte-identical: no config read touches the
@@ -365,23 +411,39 @@ async function sessionEndPendingNudges({ graph, slug, session, remote }) {
     } catch {}
   };
 
+  const rlog = u.makeLogger(path.join(graph, "journal", "remote.log"), `nudge-sessionend ${slug}: `);
+  const llog = (m) => u.appendLine(path.join(graph, "journal", "distill.log"), `  ${m}`);
+  const note = remote ? rlog : llog;
+
   const results = [];
   for (const f of files) {
     const fp = path.join(dir, f);
+    // A read that FAILED is not a result that is MALFORMED, and only the
+    // second is terminal. EIO, EMFILE, EACCES and a Windows sharing violation
+    // all read fine on a later sweep, so a failed read keeps its file —
+    // collapsing the two is the very data loss this drain exists to stop.
+    // ENOENT is neither: the file is already gone (a concurrent drain took
+    // it), so there is nothing to keep and nothing to consume.
+    let raw = null;
+    try {
+      raw = fs.readFileSync(fp, "utf8");
+    } catch (e) {
+      if (e && e.code !== "ENOENT") note(`session-final result ${f} kept in the spool: read failed: ${e.message}`);
+      continue;
+    }
     let r = null;
     try {
-      r = JSON.parse(fs.readFileSync(fp, "utf8"));
+      r = JSON.parse(raw);
     } catch {}
-    // Terminal here and now: an unreadable result can never become
-    // capturable, and an already-injected one is a finding this session has
-    // already surfaced. Everything still capturable keeps its file until the
-    // capture below lands it somewhere durable.
+    // Terminal here and now: bytes that do not parse into a usable result
+    // reach the same verdict on every future sweep, and an already-injected
+    // finding is one this session has surfaced already. Everything still
+    // capturable keeps its file until the capture below lands it somewhere
+    // durable.
     if (r && r.file && r.facts && !alreadyInjected.has(r.file)) results.push({ r, fp });
     else consume(fp);
   }
   if (!results.length) return;
-
-  const rlog = u.makeLogger(path.join(graph, "journal", "remote.log"), `nudge-sessionend ${slug}: `);
 
   for (const { r, fp } of results) {
     const facts = u.stripTrailingNewlines(r.facts);
@@ -409,22 +471,46 @@ async function sessionEndPendingNudges({ graph, slug, session, remote }) {
           timeoutMs: 30000,
         })
         .catch(() => null);
+      // Deterministic on the capture key rather than on a clock+RANDOM name,
+      // so the replay the deferred consume allows (a crash between the durable
+      // write and the unlink) overwrites its own byte-identical file instead of
+      // piling a second copy into the spool.
+      const spoolName = `${session}-${key.slice(0, 16)}.capture.json`;
       if (post && post.http === "200") {
         rlog(`captured session-final finding from ${r.file}`);
         consume(fp);
       } else if (post && ["400", "413", "422"].includes(post.http)) {
         // The server's verdict on this exact body — a re-post can only be
-        // rejected again, so it is terminal, not a failure to retry.
-        rlog(`session-final finding from ${r.file} rejected (http=${post.http})`);
-        consume(fp);
+        // rejected again, so it is PERMANENT. API.md §5 says what a mechanical
+        // writer does with a permanent reject: dead-letter it to `outbox/dead/`
+        // with a loud remote.log line, never discard it. That preserves the
+        // rejected payload for inspection or replay after a fix, and it is the
+        // channel session-start and `spor-hook doctor` already count and
+        // surface — so the consume waits on the dead-letter write landing,
+        // exactly as the outbox spool below does. (401 is deliberately NOT
+        // here: it spools instead, handing the dead-letter decision to
+        // drain-outbox, which owns it and can re-post once a token is re-minted.)
+        let dead = false;
+        if (u.ensureDir(path.join(graph, "outbox", "dead"))) {
+          try {
+            u.writeFileAtomic(path.join(graph, "outbox", "dead", spoolName), body);
+            dead = true;
+          } catch {}
+        }
+        if (dead) {
+          rlog(
+            `session-final finding from ${r.file} rejected (http=${post.http}, permanent); ` +
+              `dead-lettered to outbox/dead/${spoolName} for inspection`
+          );
+          consume(fp);
+        } else {
+          rlog(`session-final finding from ${r.file} kept in the spool: dead-letter write failed (http=${post.http})`);
+        }
       } else {
         let spooled = false;
         if (u.ensureDir(path.join(graph, "outbox"))) {
           try {
-            fs.writeFileSync(
-              path.join(graph, "outbox", `${session}-${Math.floor(Date.now() / 1000)}-${u.bashRandom()}.capture.json`),
-              body
-            );
+            u.writeFileAtomic(path.join(graph, "outbox", spoolName), body);
             spooled = true;
           } catch {}
         }
@@ -468,22 +554,76 @@ async function sessionEndPendingNudges({ graph, slug, session, remote }) {
     const stem = u.slugify(path.basename(r.file, path.extname(r.file))) || "capture";
     // Content-addressed instead of collision-suffixed: the id is a function of
     // the same key the remote idempotency_key uses, so a re-drained finding
-    // resolves to the node it already wrote (below) rather than minting a
-    // second one, while two DIFFERENT findings out of one file still land on
-    // distinct ids — which is all the old `-2` suffix was buying.
-    const id = `${prefix}nudge-sessionend-${stem}-${key.slice(0, 8)}`;
-    if (fs.existsSync(path.join(nodesDir, `${id}.md`))) {
-      u.appendLine(logFile, `  session-final capture from ${r.file} already written as ${id}`);
-      consume(fp);
-      continue;
-    }
+    // resolves to the node it already wrote rather than minting a second one,
+    // while two DIFFERENT findings out of one file still land on distinct ids —
+    // which is all the old `-2` suffix was buying. The id carries a TRUNCATION
+    // of the key, so an occupied pathname is never on its own proof that THIS
+    // finding is the one already captured: the full key is stamped on the node
+    // as `capture_key` and reconciled below, and a mismatch (a truncation
+    // collision, or an unrelated node someone authored or renamed onto the id)
+    // falls through to the next, longer candidate instead of silently
+    // consuming a finding that was never written.
+    const idFor = (n) => `${prefix}nudge-sessionend-${stem}-${key.slice(0, n)}`;
     const title = `Session-final capture-nudge findings from ${r.file}`.slice(0, 120);
     const firstFact = facts.split("\n")[0] || title;
     const summary = firstFact.length > 497 ? `${firstFact.slice(0, 497)}...` : firstFact;
-    const md = `---\nid: ${id}\ntype: ${type}\nrepo: ${slug}\ntitle: ${title.replace(/\n/g, " ")}\nsummary: ${summary.replace(
-      /\n/g,
-      " "
-    )}\ndate: ${u.localDate()}\nauthored_via: capture\n---\n\n${text}\n`;
+    const mdFor = (id) =>
+      `---\nid: ${id}\ntype: ${type}\nrepo: ${slug}\ntitle: ${title.replace(/\n/g, " ")}\nsummary: ${summary.replace(
+        /\n/g,
+        " "
+      )}\ndate: ${u.localDate()}\nauthored_via: capture\ncapture_key: ${key}\n---\n\n${text}\n`;
+
+    // Settled | mine | free | taken, decided by READING the occupant rather
+    // than by its existence. Unreadable is none of those — it is transient, so
+    // it keeps the finding spooled rather than deciding either way.
+    const reconcile = (nodePath) => {
+      let existing;
+      try {
+        existing = fs.readFileSync(nodePath, "utf8");
+      } catch (e) {
+        if (e && e.code === "ENOENT") return "free";
+        return "unreadable";
+      }
+      let parsed = null;
+      try {
+        parsed = graphLib.parseFrontmatter(existing, path.basename(nodePath));
+      } catch {}
+      return parsed && parsed.capture_key === key ? "settled" : "taken";
+    };
+
+    let settledAs = null;
+    let candidate = null;
+    let blocked = false;
+    for (const n of [16, 24, 64]) {
+      const id = idFor(n);
+      const state = reconcile(path.join(nodesDir, `${id}.md`));
+      if (state === "settled") {
+        settledAs = id;
+        break;
+      }
+      if (state === "unreadable") {
+        u.appendLine(logFile, `  session-final capture from ${r.file} kept in the spool: ${id}.md unreadable`);
+        blocked = true;
+        break;
+      }
+      if (state === "free") {
+        candidate = id;
+        break;
+      }
+      // "taken" — a different node owns this pathname; try a longer key slice.
+    }
+    if (blocked) continue;
+    if (settledAs) {
+      u.appendLine(logFile, `  session-final capture from ${r.file} already written as ${settledAs}`);
+      consume(fp);
+      continue;
+    }
+    if (!candidate) {
+      u.appendLine(logFile, `  session-final capture from ${r.file} kept in the spool: every candidate id is taken`);
+      continue;
+    }
+    const id = candidate;
+    const md = mdFor(id);
     // A finding this graph's own parser or validator refuses is terminal —
     // the same bytes reach the same verdict on every future sweep — so it is
     // consumed rather than left to be re-judged forever.
@@ -502,7 +642,25 @@ async function sessionEndPendingNudges({ graph, slug, session, remote }) {
       continue;
     }
     try {
-      fs.writeFileSync(path.join(nodesDir, `${id}.md`), md);
+      // The existence check above is a fast path, not the guarantee: another
+      // drain (or a resumed sweep) can create the same id between it and this
+      // write. `createNodeExclusive` is therefore both ATOMIC — the node
+      // appears complete or not at all, so no concurrent reader parses a
+      // half-written file — and EXCLUSIVE, so the loser of the race never
+      // clobbers the winner and is told it lost.
+      if (!createNodeExclusive(path.join(nodesDir, `${id}.md`), md)) {
+        // Someone else got there first. Re-read to see whether it is THIS
+        // finding before consuming anything (row (d): reconcile, never act on
+        // the bare fact that a file appeared).
+        const state = reconcile(path.join(nodesDir, `${id}.md`));
+        if (state === "settled") {
+          u.appendLine(logFile, `  session-final capture from ${r.file} already written as ${id} (concurrent drain)`);
+          consume(fp);
+        } else {
+          u.appendLine(logFile, `  session-final capture from ${r.file} kept in the spool: ${id}.md taken mid-write`);
+        }
+        continue;
+      }
       u.appendLine(logFile, `  wrote ${path.join(nodesDir, `${id}.md`)} (session-final nudge capture)`);
       consume(fp);
     } catch (e) {

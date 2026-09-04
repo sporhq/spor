@@ -1594,27 +1594,54 @@ function runSpoolWorker(inFile, classify, buildOutput) {
   try {
     job = JSON.parse(fs.readFileSync(inFile, "utf8"));
   } catch {
+    // Unreadable/malformed input: nothing to classify. Leave it — a transient
+    // read failure is indistinguishable from a corrupt one here, and the
+    // drain's orphan sweep bounds the spool either way.
     process.exit(0);
   }
-  try {
-    fs.unlinkSync(inFile);
-  } catch {}
 
+  // OWE BEFORE YOU CLEAR. The `.in.json` IS this job's durable debt — it is
+  // already on disk, so owing it costs no write of ours that could itself fail
+  // — and it is not cleared until the classifier's verdict is durable
+  // somewhere else. The old order (unlink, then classify, then write the
+  // result) had two holes this closes: a crash after classification but before
+  // the result landed lost the job with nothing left to retry, and a FAILED
+  // `.out.json` write was swallowed silently, discarding a classifier-verified
+  // finding that had already been paid for. Both now leave the input in place.
   let result = null;
+  let threw = false;
   try {
     result = classify(job);
   } catch {
-    /* fail-open: leave the file reserved, inject nothing */
+    threw = true;
   }
+  // Both classifiers share one contract: `null` means the BACKEND failed (a
+  // SIGKILLed timeout, a non-zero exit) — no verdict was reached. Anything else
+  // is the classifier's answer. Only an answer settles the job.
+  const definitive = !threw && result !== null;
 
-  const out = buildOutput(job, result);
+  // Cleared only on a DEFINITIVE outcome: a verdict whose result landed
+  // durably, or a verdict with nothing to write (a NOTHING classification is
+  // settled, not lost — re-running it would spend another backend call to
+  // reach the same answer). A backend failure settles nothing, so its input
+  // stays owed for the drain's bounded re-drive.
+  let settled = false;
+  const out = threw ? null : buildOutput(job, result);
   if (out && job.hash) {
     const outFile = path.join(path.dirname(inFile), `${job.hash}.out.json`);
     try {
       writeFileAtomic(outFile, JSON.stringify(out));
+      settled = true;
     } catch {
-      /* fail-open: a dropped result file just means no injection next prompt */
+      /* the result did NOT land — keep the input as the debt to re-run */
     }
+  } else if (definitive) {
+    settled = true;
+  }
+  if (settled) {
+    try {
+      fs.unlinkSync(inFile);
+    } catch {}
   }
 
   process.exit(0);

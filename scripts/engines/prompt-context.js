@@ -270,20 +270,54 @@ function drainPendingNudges(graph, input, slug) {
     if (r && r.file && r.facts && injected + results.length < 3) results.push(r);
   }
 
-  // GC (bounds the spool leak): prune orphaned inputs whose detached worker
-  // never ran (older than 1h — a worker classifies in seconds). Deliberately do
-  // NOT rmdir an emptied dir: a worker unlinks its `.in.json` at start and
-  // writes its result back seconds later, so the dir is legitimately empty
-  // mid-classification and removing it would race the worker's write out from
-  // under it. An empty dir persists like the other per-session journal files
-  // (.nudged, .jsonl) until a wider journal GC lands.
+  // RE-DRIVE, then GC (bounds the spool leak): an input still sitting here an
+  // hour after it was spooled means its detached worker never landed a verdict
+  // — it died mid-classification, or its result write failed. util's
+  // runSpoolWorker deliberately keeps the input as the DEBT in exactly those
+  // cases (owe-before-clear), so this sweep is who that debt is owed to: give
+  // it one more worker rather than silently dropping a classification the
+  // session already paid the tool-loop reservation for.
+  //
+  // The claim is an atomic RENAME taken BEFORE the spawn — not a check then a
+  // write, because two overlapping sweeps would both pass the check and both
+  // spawn. The winner's rename succeeds, every loser's fails with ENOENT, and
+  // the new name still ends in `.in.json` so the job stays visible to this
+  // sweep; carrying `.redriven.` is what marks its one retry spent, so the
+  // NEXT sweep prunes it instead of spinning it round again. mtime is pushed
+  // forward with the claim so the re-driven worker gets a full horizon to
+  // finish before that prune can touch its input. A claim that cannot be
+  // taken, or a spawn that does not land after one, leaves a job that is
+  // pruned on the following sweep — the bound that keeps a poison input out
+  // of a respawn loop, and the reason this adds at most one classifier call
+  // per spooled job.
+  //
+  // Deliberately do NOT rmdir an emptied dir: a worker's result lands seconds
+  // after its input clears, so the dir is legitimately empty mid-classification
+  // and removing it would race that write out from under it. An empty dir
+  // persists like the other per-session journal files (.nudged, .jsonl) until a
+  // wider journal GC lands.
   try {
     const now = Date.now();
     for (const f of all) {
       if (!f.endsWith(".in.json")) continue;
       const fp = path.join(dir, f);
       try {
-        if (now - fs.statSync(fp).mtimeMs > PENDING_ORPHAN_MS) fs.unlinkSync(fp);
+        if (now - fs.statSync(fp).mtimeMs <= PENDING_ORPHAN_MS) continue;
+        if (!f.includes(".redriven.")) {
+          const claimed = path.join(dir, f.replace(/\.in\.json$/, ".redriven.in.json"));
+          try {
+            fs.renameSync(fp, claimed); // atomic: exactly one sweep wins
+            try {
+              const t = now / 1000;
+              fs.utimesSync(claimed, t, t);
+            } catch {}
+            u.spawnDetached([path.join(__dirname, "nudge-worker.js"), claimed]);
+            continue;
+          } catch {
+            continue; // lost the claim (another sweep took it) — nothing to prune
+          }
+        }
+        fs.unlinkSync(fp); // its one retry is spent
       } catch {}
     }
   } catch {}

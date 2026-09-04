@@ -190,15 +190,33 @@ FINAL action of a session — no subsequent prompt — is never injected; the
 SessionEnd distiller is the backstop that still captures it
 (`sessionEndPendingNudges` in distill.js). That drain is a finding's LAST
 chance, so it consumes a `.out.json` only once the finding is durably elsewhere
-(a 200, a spooled outbox payload, a written node) or is provably uncapturable
-(unreadable, already injected, a server 400/413/422, a node the parser or
+(a 200, a spooled outbox payload, a dead-lettered payload, a written node) or is
+provably uncapturable (bytes that don't PARSE into a result — a failed READ is
+transient and keeps its file — already injected, or a node the parser or
 validator refuses); a TRANSIENT failure leaves the file spooled for a later
-sweep (issue-spor-session-end-pending-nudges-data-loss). The consume therefore
-trails the durable write, so a crash in the gap re-drains an already-captured
-finding — made idempotent on both sides by keying the capture on
-sha256(session, file, facts): the remote `idempotency_key`, and a
-content-addressed local node id a re-drain resolves to the node it already
-wrote. The default synchronous path is byte-identical (the drain and its
+sweep (issue-spor-session-end-pending-nudges-data-loss). A server 400/413/422 is
+permanent but NOT discardable: per API.md §5 a mechanical writer preserves a
+rejected payload in `outbox/dead/` (the channel session-start and `spor-hook
+doctor` already surface), so the consume waits on that write like any other.
+The consume therefore trails the durable write, so a crash in the gap re-drains
+an already-captured finding — made idempotent on both sides by keying the
+capture on sha256(session, file, facts): the remote `idempotency_key` (and a
+deterministic outbox/dead-letter filename), and locally a content-addressed node
+id whose full key is stamped on the node as `capture_key`. The id carries only a
+truncation of that key, so an occupied pathname is never on its own proof the
+finding is captured — the occupant is READ and its `capture_key` compared, and a
+mismatch takes the next, longer candidate id rather than consuming a finding
+that was never written. The node itself is created with a hardlink-exclusive
+atomic write (`createNodeExclusive`), so a concurrent drain neither clobbers the
+winner nor parses a half-written file. The spool WORKER owes before it clears
+(`runSpoolWorker` in util.js): the `.in.json` is the job's debt and is unlinked
+only once the classifier's verdict is durable — the `.out.json` landed, or the
+verdict was definitive with nothing to write. A backend failure or a failed
+result write leaves it owed, and the prompt-time drain's orphan sweep re-drives
+a stale input exactly ONCE — claimed by an atomic RENAME to `<hash>.redriven.in.json`
+so overlapping sweeps can't both spawn — before pruning, so the debt has a
+collector and still cannot spin.
+The default synchronous path is byte-identical (the drain and its
 syscalls are gated on the flag). See test/nudge-async.test.js.
 
 The prompt-context engine's digest has the same async pattern as an INTENT GATE

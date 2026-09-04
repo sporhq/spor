@@ -12,8 +12,11 @@
 //
 // Two-phase cooldown: the parent already wrote `pending\t<file>` to
 // <session>.nudged (phase 1, the reservation); this result file is phase 2
-// (completion). A NOTHING verdict or a backend failure writes NO result — the
-// file simply stays reserved (fail-open, no retry storm, nothing injected).
+// (completion). A NOTHING verdict writes NO result — the file simply stays
+// reserved (fail-open, nothing injected). A BACKEND failure is different: no
+// verdict was reached, so runSpoolWorker leaves the `.in.json` in place as the
+// job's debt and the prompt-time drain re-drives it exactly once before pruning
+// (bounded, so still no retry storm).
 //
 //   node nudge-worker.js <input-spool.in.json>
 
