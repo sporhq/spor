@@ -163,7 +163,8 @@ A few of these have enough surface to be worth a sentence:
   **`repo-<slug>` node id** (pins that single repo), or a **grouping id
   `proj-<stem>`** (the grouping union). An unknown token you PASS warns on stderr
   and yields an empty queue (still exit 0); an unknown scope merely INFERRED from
-  the working directory is dropped for an unscoped re-read instead
+  the working directory is quietly dropped for an unscoped re-read instead — the
+  read local mode makes there anyway
   (issue-spor-next-silent-empty-on-unknown-inferred-project). Pin a default for both modes with the
   `queue.project` config key (`SPOR_QUEUE_PROJECT`, or `.spor.json` `{"queue":
   {"project": "<token>"}}`); an explicit `--project` always wins.

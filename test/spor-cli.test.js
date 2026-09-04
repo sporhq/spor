@@ -2286,9 +2286,12 @@ test('next (remote) from a linked git worktree sends the same ?project= scope as
 // scope is a GUESS, not an instruction, so a flagless `spor next` run from an
 // unrelated directory must never answer "queue empty" about a scope the graph
 // has never heard of. Two arms: the server's authoritative `project_warning`
-// makes the client drop the guess and re-read unscoped; without it (older
-// server, or a scope that IS known but is legitimately empty) an empty inferred
-// read at least says which project it was scoped to.
+// makes the client drop the guess and re-read unscoped — SILENTLY, because that
+// re-read is the one local mode makes from the same directory and a note remote
+// alone printed would be a mode divergence (norm-spor-cli-mode-parity); without
+// that verdict (older server, or a scope that IS known but is legitimately
+// empty) remote really did read something narrower than local, so the empty
+// inferred read says which project it was scoped to.
 function inferredScopeDir(name) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-cli-inferred-'));
   const dir = path.join(base, name); // basename => the inferred project slug
@@ -2305,12 +2308,36 @@ test('next (remote) drops an unknown cwd-INFERRED scope and re-reads unscoped', 
     const sent = hits.filter((h) => /^\/v1\/queue\?/.test(h.url))
       .map((h) => new URLSearchParams(h.url.split('?')[1]).get('project'));
     assert.deepStrictEqual(sent, ['typo-scope', null], 'the guess is tried once, then dropped for an unscoped re-read');
-    assert.match(r.stderr, /no project 'typo-scope' in the graph \(inferred from the current directory\)/);
-    assert.doesNotMatch(r.stderr, /no queue items for project/, 'the fallback note replaces the empty-read note');
     assert.match(r.stdout, /task-a/, 'the unscoped queue is what gets rendered');
+    // The fallback lands on the very read local mode makes from here, so it must
+    // not add a line local would not print (norm-spor-cli-mode-parity) — neither
+    // its own note nor the server's warning about the scope it just discarded.
+    assert.strictEqual(r.stderr, '', `a successful fallback says nothing, got: ${r.stderr}`);
   } finally {
     srv.close();
     fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('next from an unrelated cwd says the same thing in both modes', async () => {
+  // norm-spor-cli-mode-parity, the direct check behind the silence above: from a
+  // directory whose basename names no project, remote infers that slug, is told
+  // it matches nothing, and widens to the unscoped queue — which is the ONLY
+  // read local mode ever makes here. Same question asked, same (empty) stderr.
+  const { base: tmp, dir } = inferredScopeDir('typo-scope');
+  const { dir: graph } = fixtureGraph();
+  const { srv, base } = await queueStubServer();
+  try {
+    const remote = await runAsyncCli(['next'], { SPOR_SERVER: base, SPOR_TOKEN: 't' }, dir);
+    const local = await runAsyncCli(['next'], { SPOR_HOME: graph }, dir);
+    assert.strictEqual(remote.status, 0, remote.stderr);
+    assert.strictEqual(local.status, 0, local.stderr);
+    assert.strictEqual(remote.stderr, local.stderr, 'neither mode narrates the inferred scope it did not end up using');
+    assert.doesNotMatch(local.stderr, /typo-scope/, 'local never scoped to the cwd slug in the first place');
+  } finally {
+    srv.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(graph, { recursive: true, force: true });
   }
 });
 
@@ -2323,6 +2350,7 @@ test('next (remote --json) hands back the unscoped envelope after an inferred-sc
     const j = JSON.parse(r.stdout);
     assert.deepStrictEqual(j.items.map((i) => i.id), ['task-a'], 'machine consumers see the same fallback, not an empty envelope');
     assert.ok(!('project_warning' in j), 'no warning field survives into the envelope');
+    assert.strictEqual(r.stderr, '', `the --json arm is silent too, got: ${r.stderr}`);
   } finally {
     srv.close();
     fs.rmSync(tmp, { recursive: true, force: true });

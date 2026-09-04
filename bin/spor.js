@@ -423,17 +423,22 @@ async function cmdNext(cfg, args) {
     // --all-projects — a firehose the user asked for — is never flagged.
     let projectWarning = takeProjectWarning(r.json);
     // An INFERRED scope the server authoritatively doesn't recognise is a wrong
-    // guess, not an empty backlog: drop it and re-read unscoped, which is what a
-    // markerless dir shows in local mode anyway (cmdNext never injects
-    // safeSlug() there) — norm-spor-cli-mode-parity. Gated on the server's own
-    // verdict, NEVER on a bare empty result, so a KNOWN project that happens to
-    // be empty keeps its scope. A retry that itself fails leaves the first read
-    // (and its verbatim warning) standing.
+    // guess, not an empty backlog: drop it and re-read unscoped. That re-read is
+    // EXACTLY the read local mode already makes from the same directory (cmdNext
+    // never injects safeSlug() there), so once it succeeds the two modes are
+    // answering the same question — and a stderr note here would be a line
+    // remote prints and local does not, which is the divergence
+    // norm-spor-cli-mode-parity forbids. So the successful fallback is SILENT,
+    // and the server's warning about the guess we just discarded is dropped with
+    // it (a warning about a scope that no longer applies to the result is worse
+    // than none). Gated on the server's own verdict, NEVER on a bare empty
+    // result, so a KNOWN project that happens to be empty keeps its scope. A
+    // re-read that itself fails leaves the first read — and its verbatim warning
+    // — standing, which is the pre-existing explicit-scope behaviour.
     let fellBack = false;
     if (projectWarning && inferred) {
       const wide = await fetchQueuePaged(cfg, queueQs(null), target);
       if (!wide.transport && wide.ok) {
-        err(`no project '${scopeSlug}' in the graph (inferred from the current directory) — showing the unscoped queue; pass --project <slug> to scope it`);
         r = wide;
         projectWarning = takeProjectWarning(r.json);
         fellBack = true;
@@ -445,10 +450,13 @@ async function cmdNext(cfg, args) {
     if (scoped && count === 0 && !projectWarning) {
       err(`project '${scoped}' returned an empty queue — check the slug / grouping id (the server scoped to it and found nothing)`);
     } else if (inferred && !fellBack && count === 0) {
-      // Same silent-empty guard for the reads the fallback above can't reach: a
-      // server too old to send `project_warning`, and a scope that IS known but
-      // is legitimately empty. The read was scoped either way, so say so — a
-      // bare "queue empty" reads as "the whole backlog is empty".
+      // The reads the fallback above cannot reach: a server too old to send
+      // `project_warning`, and a scope that IS known but is legitimately empty.
+      // Unlike the fallback, remote here really did read something NARROWER than
+      // local would have (remote defaults to the cwd slug, local to the global
+      // queue), so this note does not create a mode divergence — it discloses
+      // one that already exists, and staying quiet about it is the reported bug:
+      // a bare "queue empty" reads as "the whole backlog is empty".
       err(`no queue items for project '${scopeSlug}' (inferred from the current directory) — run 'spor next --all-projects' for the whole graph`);
     }
     if (needAgents) {

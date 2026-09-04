@@ -61,11 +61,14 @@ pending captures"):
 An empty queue is never reported bare when the scope was only *inferred* from
 the working directory (issue-spor-next-silent-empty-on-unknown-inferred-project).
 If the server says that inferred slug matches nothing in the graph, `spor next`
-drops the guess and re-reads unscoped, saying so on stderr; if the scope is
-merely empty, the note names the project it scoped to and points at
-`--all-projects`. A scope you *typed* (`--project`) or pinned (`queue.project`)
-is an instruction — it is honoured and warned about, never widened for you. So
-"queue empty" with no note really does mean the whole graph is quiet.
+quietly drops the guess and re-reads unscoped — the same whole-graph read local
+mode makes from that directory, so both modes answer identically
+(norm-spor-cli-mode-parity). If the inferred scope is merely empty, remote *did*
+read something narrower than local would have, and a stderr note names the
+project it scoped to and points at `--all-projects`. A scope you *typed*
+(`--project`) or pinned (`queue.project`) is an instruction — it is honoured and
+warned about, never widened for you. So "queue empty" with no note really does
+mean the whole graph is quiet.
 
 The `show_queue` MCP tool takes the same fields.
 
