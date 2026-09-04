@@ -131,7 +131,7 @@ test("schema adopt (local) writes a proposed resident with provenance stamps, by
   const r = run(["schema", "adopt", "member-of-program"], { SPOR_HOME: home });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.match(r.stdout, /adopted: schema-edge-member-of-program @ \d{4}\.\d{2}\.\d{2}\.\d+ \(status: proposed\)/);
-  assert.match(r.stdout, new RegExp(`-> local ${home}`));
+  assert.match(r.stdout, new RegExp(`-> local ${home.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
   const raw = readResident(nodes);
   assert.match(raw, /^status: proposed$/m);
   assert.match(raw, /^adopted_from: spor@\d+\.\d+\.\d+/m);

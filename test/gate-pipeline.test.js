@@ -2588,7 +2588,12 @@ test("end to end: a failing gate cools the item, files an escalation, and says s
 // actually EXITS on the first signal instead of sitting on the abandoned
 // pipeline's own live timer, and the run record it leaves behind names the
 // fix-cycle run it walked away from.
-test("a single SIGTERM mid fix-cycle stops the worker promptly and leaves a durable record naming the orphaned run", async () => {
+test("a single SIGTERM mid fix-cycle stops the worker promptly and leaves a durable record naming the orphaned run", {
+  // Windows has no SIGTERM to deliver: child.kill() is TerminateProcess, which
+  // ends the worker without ever running its signal handler, so the graceful
+  // exit-0-with-a-record contract this test pins does not exist there.
+  skip: process.platform === "win32" && "SIGTERM is not deliverable on Windows (kill() is TerminateProcess)",
+}, async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-stop-"));
   const nodes = path.join(home, "nodes");
   fs.mkdirSync(nodes, { recursive: true });
@@ -2794,12 +2799,18 @@ test("end to end: the gate tree is staged with the repo's own dispatch.worktreeS
   // The repo declares a setup hook (committed, relative path — the shape
   // spor-server ships) that stages a file the acceptance suite requires.
   const hookLog = path.join(home, "hook.log");
+  // Node-scripted hooks (a .cmd wrapper on Windows, where the hook runner's
+  // shell is cmd.exe and a #!/bin/sh script cannot run), declared by the
+  // relative path the stub actually landed at.
   fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
-  fs.writeFileSync(path.join(repo, "scripts", "stage.sh"), '#!/bin/sh\nprintf "%s %s\\n" "$SPOR_MAIN_CHECKOUT" "$SPOR_TREE_ROLE" >> "$HOOK_LOG"\n: > "$SPOR_WORKTREE/staged.txt"\n');
-  fs.writeFileSync(path.join(repo, "scripts", "unstage.sh"), '#!/bin/sh\nprintf "teardown %s %s\\n" "$SPOR_TREE_ROLE" "$SPOR_DISPATCH_NODE" >> "$HOOK_LOG"\n');
-  fs.chmodSync(path.join(repo, "scripts", "stage.sh"), 0o755);
-  fs.chmodSync(path.join(repo, "scripts", "unstage.sh"), 0o755);
-  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktreeSetup: "scripts/stage.sh", worktreeTeardown: "scripts/unstage.sh" } }));
+  const stage = writeSpawnableNodeStub(path.join(repo, "scripts"), "stage", [
+    'const fs = require("node:fs");',
+    'fs.appendFileSync(process.env.HOOK_LOG, process.env.SPOR_MAIN_CHECKOUT + " " + process.env.SPOR_TREE_ROLE + "\\n");',
+    'fs.writeFileSync(require("node:path").join(process.env.SPOR_WORKTREE, "staged.txt"), "");',
+  ].join("\n"));
+  const unstage = writeSpawnableNodeStub(path.join(repo, "scripts"), "unstage",
+    'require("node:fs").appendFileSync(process.env.HOOK_LOG, "teardown " + process.env.SPOR_TREE_ROLE + " " + process.env.SPOR_DISPATCH_NODE + "\\n");');
+  fs.writeFileSync(path.join(repo, ".spor.json"), JSON.stringify({ enabled: true, dispatch: { worktreeSetup: path.relative(repo, stage), worktreeTeardown: path.relative(repo, unstage) } }));
   // The suite needs the hook's staging AND reads what it is judging from the
   // env (task-spor-gate-command-change-env): base and head must be real shas
   // it can diff inside the tree, the trusted ref its name, the stage "gate".
@@ -2837,7 +2848,7 @@ test("end to end: the gate tree is staged with the repo's own dispatch.worktreeS
   assert.strictEqual(ran.length, 2, `setup then teardown (saw ${ran})`);
   assert.match(ran[0], / gate$/, `the setup hook was told the role (saw ${ran[0]})`);
   assert.strictEqual(ran[1], "teardown gate task-ready", "the teardown hook ran once, told the role and the node");
-  assert.strictEqual(fs.realpathSync(ran[0].split(" ")[0]), fs.realpathSync(repo), "SPOR_MAIN_CHECKOUT is the durable main checkout");
+  assert.strictEqual(fs.realpathSync.native(ran[0].split(" ")[0]), fs.realpathSync.native(repo), "SPOR_MAIN_CHECKOUT is the durable main checkout");
   assert.ok(!fs.existsSync(path.join(repo, "staged.txt")), "the hook staged the throwaway tree, never the repo itself");
   // The implementer got the contract as its task text.
   const invocation = JSON.parse(fs.readFileSync(outfile, "utf8").trim().split("\n")[0]);

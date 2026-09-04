@@ -33,7 +33,9 @@ function freshEnv(home) {
 // subtree exclusion (a sibling-directory worktree would pass every test
 // trivially, even with that exclusion removed).
 function scratchWorktree() {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), "spor-pretool-"));
+  // Canonical (long-form) base: the engine answers with git's resolved
+  // spelling, and os.tmpdir() is an 8.3 short name on the Windows CI runner.
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "spor-pretool-")));
   const main = path.join(base, "main");
   fs.mkdirSync(main);
   const g = (args, cwd = main) => {

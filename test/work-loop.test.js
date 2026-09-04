@@ -1985,6 +1985,10 @@ test("makeCodeMovedNotice says once per new tip that the loaded code was moved p
   // F3: a TRANSIENT ancestry failure (git 128 on a momentarily unreadable
   // object store, a timeout) must not record the tip — the next pass asks
   // again and the land is still noticed; recording first silenced it forever.
+  // POSIX only: the shim below intercepts a bare `git` spawn through PATH,
+  // which on Windows resolves only .exe/.com — a shell script there is never
+  // found and the real git answers, so the failure cannot be staged.
+  if (process.platform !== "win32") {
   const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-gitshim-"));
   const realGit = execFileSync(process.platform === "win32" ? "where" : "which", ["git"], { encoding: "utf8" }).split(/\r?\n/)[0].trim();
   const failFlag = path.join(shimDir, "fail-merge-base");
@@ -2015,6 +2019,7 @@ test("makeCodeMovedNotice says once per new tip that the loaded code was moved p
     fs.unlinkSync(failFlag);
   } finally {
     process.env.PATH = savedPath;
+  }
   }
   // Not a git checkout (an npm install): nothing is known, nothing is said.
   const plain = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-plain-"));

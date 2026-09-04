@@ -14,7 +14,7 @@ const path = require("node:path");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const { getHarness, harnesses, codexPrepareRun } = require("../lib/shell/dispatch-harnesses.js");
-const { writeSpawnableNodeStub } = require("./helpers/portable.js");
+const { writeSpawnableNodeStub, writeNodeScript } = require("./helpers/portable.js");
 
 function cleanEnv(extra = {}) {
   const env = {};
@@ -555,7 +555,9 @@ test("a supervisor that exits before reporting anything stamps failed_launch, di
   // out the whole supervisor invocation so this is reproducible without
   // waiting for a real crash.
   const { home, repo } = fixture();
-  const crashedRunner = writeSpawnableNodeStub(home, "runner-crash", "process.exit(1);");
+  // A plain .js script, not a .cmd wrapper: the seam runs a script under this
+  // node on every platform (see dispatchRunnerCommand in bin/spor.js).
+  const crashedRunner = writeNodeScript(path.join(home, "runner-crash.js"), "process.exit(1);");
   const result = run(
     ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--no-brief"],
     { SPOR_HOME: home, SPOR_CODEX_CMD: codexStub(home), SPOR_DISPATCH_RUNNER_CMD: crashedRunner }
@@ -585,7 +587,7 @@ test("a launch failure is reported off the supervisor's own handshake, not infer
   // OLD poll window, to prove the launcher's verdict now comes from the
   // handshake channel, not from racing that write.
   const { home, repo } = fixture();
-  const slowRunner = writeSpawnableNodeStub(home, "runner-slow-record", `
+  const slowRunner = writeNodeScript(path.join(home, "runner-slow-record.js"), `
 const fs = require("node:fs");
 const fd = Number(process.env.SPOR_DISPATCH_HANDSHAKE_FD);
 try {

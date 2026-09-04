@@ -1,0 +1,10 @@
+# Check every text file out with LF on every platform. The windows-latest CI
+# runner's global core.autocrlf=true otherwise rewrites the checkout to CRLF,
+# and the tests that pin shipped wording (AGENTS.md's directive, the factory
+# SKILL.md frontmatter, README.md's command list, the review-replay fixtures)
+# match against `\n` — they read the WORDING, and the encoding must not drift
+# per OS (inc-spor-windows-ci-main-failing).
+* text=auto eol=lf
+# The Windows shims are checked out byte-for-byte as committed.
+*.cmd -text
+*.bat -text
