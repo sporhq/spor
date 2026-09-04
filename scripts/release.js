@@ -37,6 +37,10 @@ const MANIFESTS = [
   { file: 'package-lock.json', count: 2 },
 ];
 
+// Trailer on the generated "Release vX.Y.Z" commit. Kept here so the attribution
+// is edited in ONE place rather than buried in the commit call below.
+const RELEASE_TRAILER = 'Co-Authored-By: Claude <noreply@anthropic.com>';
+
 function die(msg) {
   console.error(`\x1b[31m✗ ${msg}\x1b[0m`);
   process.exit(1);
@@ -189,7 +193,7 @@ async function main() {
 
   // ---- Commit + tag --------------------------------------------------------
   git(['add', ...MANIFESTS.map((m) => m.file)]);
-  git(['commit', '-m', `Release ${tag}`, '-m', 'Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>']);
+  git(['commit', '-m', `Release ${tag}`, '-m', RELEASE_TRAILER]);
   git(['tag', tag]);
   ok(`committed and tagged ${tag}`);
 
