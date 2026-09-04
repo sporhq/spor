@@ -894,15 +894,16 @@ test("an unanswered prior finding keeps its rows, is not folded as answered, and
 
 test("failingFiles reads the repo-relative source paths a suite's failure names, and drops everything outside the judged tree", () => {
   const out = [
-    "\u001b[31m\u2716 the launch handshake (40001.2ms)\u001b[0m",
+    "\u001b[31m✖ the launch handshake (40001.2ms)\u001b[0m",
     "  AssertionError [ERR_ASSERTION]: the record was never written",
     "      at TestContext.<anonymous> (/tmp/gate-tree/test/codex-dispatch.test.js:120:5)",
     "      at node:internal/test_runner/test:1050:5",
     "      at Module._compile (/tmp/gate-tree/node_modules/foo/index.js:3:1)",
-    "\u2716 failing tests:",
+    "      at run (./lib/shell/dispatch.js:9:2)",
+    "      at fetch (https://example.com/some/page.js:1:1)",
+    "✖ failing tests:",
+    "",
     "test/codex-dispatch.test.js:118:1",
-    "./lib/shell/dispatch.js reported it",
-    "https://example.com/some/page.js",
     "ℹ pass 1022",
   ].join("\n");
   assert.deepStrictEqual(gates.failingFiles(out, { dir: "/tmp/gate-tree" }), [
@@ -915,10 +916,90 @@ test("failingFiles reads the repo-relative source paths a suite's failure names,
   // With no root, every absolute path is unresolvable and dropped — the
   // direction that finds fewer files, so the caller cannot claim off-diff on
   // paths it could not place.
-  assert.deepStrictEqual(gates.failingFiles(out), ["test/codex-dispatch.test.js", "lib/shell/dispatch.js"]);
+  assert.deepStrictEqual(gates.failingFiles(out), ["lib/shell/dispatch.js", "test/codex-dispatch.test.js"]);
   assert.deepStrictEqual(gates.failingFiles(""), []);
   assert.deepStrictEqual(gates.failingFiles("npm test exited 1\nFailed tasks: server:test"), [], "an exit-code-only failure names nothing");
-  assert.strictEqual(gates.failingFiles(Array.from({ length: 200 }, (_, i) => `test/f${i}.test.js:1:1`).join("\n")).length, 20, "bounded");
+  assert.strictEqual(gates.failingFiles(Array.from({ length: 200 }, (_, i) => `✖ boom\ntest/f${i}.test.js:1:1`).join("\n")).length, 20, "bounded");
+});
+
+// The single most dangerous way this could launder a red suite: a whole-suite
+// run prints a line per file it RAN, and a set of PASSING files is trivially
+// off-diff and trivially passes in isolation. Collection is therefore scoped to
+// the failure's own region, never to every path in the log.
+test("failingFiles collects from the FAILURE's region only — a passing file's own line, and the block under it, are never the failure's files", () => {
+  const tap = [
+    "TAP version 13",
+    "# Subtest: test/passes-first.test.js",
+    "    ok 1 - a thing that throws TypeError on bad input",
+    "    1..1",
+    "ok 1 - test/passes-first.test.js",
+    "  ---",
+    "  duration_ms: 12.3",
+    "  location: 'test/passes-first.test.js:1:1'",
+    "  ...",
+    "# Subtest: test/flaky.test.js",
+    "    not ok 1 - the launch handshake",
+    "      ---",
+    "      location: 'test/flaky.test.js:120:5'",
+    "      error: 'the record was never written'",
+    "      ...",
+    "not ok 2 - test/flaky.test.js",
+    "  ---",
+    "  failureType: 'subtestsFailed'",
+    "  ...",
+    "# pass 1021",
+    "# fail 1",
+  ].join("\n");
+  assert.deepStrictEqual(gates.failingFiles(tap), ["test/flaky.test.js"], "only the file the run said NOT OK");
+  // The same property in the spec reporter's vocabulary, where a passing file
+  // is a group heading and its passing test NAMES may carry failure words.
+  const spec = [
+    "▶ test/passes-first.test.js",
+    "  ✔ rejects with an AssertionError (2ms)",
+    "  location: test/passes-first.test.js:4:1",
+    "◀ test/passes-first.test.js (9ms)",
+    "▶ test/flaky.test.js",
+    "  ✖ the launch handshake (40001ms)",
+    "    AssertionError: the record was never written",
+    "        at TestContext.<anonymous> (test/flaky.test.js:120:5)",
+    "◀ test/flaky.test.js (40s)",
+  ].join("\n");
+  assert.deepStrictEqual(gates.failingFiles(spec), ["test/flaky.test.js"]);
+});
+
+test("offDiffRuns folds EVERY failed run, so an on-diff failure on one run is never overwritten by an off-diff one on the next", () => {
+  const onDiffRun = "✖ boom\n  at x (lib/kernel/queue.js:3:1)\n  at y (test/queue.test.js:9:1)";
+  const offDiffRun = "✖ boom\n  at x (test/flaky.test.js:9:1)";
+  const changed = ["lib/kernel/queue.js"];
+  assert.strictEqual(gates.offDiffRuns([offDiffRun, offDiffRun], changed).offDiff, true, "both runs failed off the diff");
+  const mixed = gates.offDiffRuns([onDiffRun, offDiffRun], changed);
+  assert.strictEqual(mixed.offDiff, false, "run 1 named a file the change edits — the claim has to hold for every run");
+  assert.deepStrictEqual(mixed.onDiff, ["lib/kernel/queue.js"]);
+  // A run whose output named nothing readable leaves the set unreadable: there
+  // is no off-diff claim to be made about a run that could not be read.
+  const unread = gates.offDiffRuns([offDiffRun, "Failed tasks: server:test"], changed);
+  assert.deepStrictEqual([unread.offDiff, unread.unreadable], [false, true]);
+  assert.strictEqual(gates.offDiffRuns([], changed).offDiff, false);
+});
+
+test("mentionsChanged is the reference half of off-diff: it fails CLOSED on every spelling of a path a test could use", () => {
+  const changed = ["bin/spor.js", "lib/kernel/gates.js"];
+  assert.deepStrictEqual(gates.mentionsChanged('const CLI = path.join(__dirname, "..", "bin", "spor.js");', changed), ["bin/spor.js"], "a segmented path.join spelling — the shape the refusal that prompted this feature had");
+  assert.deepStrictEqual(gates.mentionsChanged('require("../lib/kernel/gates.js")', changed), ["lib/kernel/gates.js"]);
+  assert.deepStrictEqual(gates.mentionsChanged("// see bin/spor.js for why", changed), ["bin/spor.js"], "a comment counts: the question is whether the change is implicated, not how");
+  assert.deepStrictEqual(gates.mentionsChanged('const g = require("../lib/kernel/gates");', changed), ["lib/kernel/gates.js"], "an extensionless specifier");
+  assert.deepStrictEqual(gates.mentionsChanged("const x = 1;\n// unrelated\n", changed), []);
+  assert.deepStrictEqual(gates.mentionsChanged("gates and spor are words in prose", changed), [], "a bare word is not a reference — only a path, a basename token or a quoted specifier");
+  assert.deepStrictEqual(gates.mentionsChanged("", changed), []);
+});
+
+test("referencedCandidates names the local files a source itself points at, one hop out", () => {
+  const src = 'require("./helpers/launch");\nconst {x} = require("../lib/shell/dispatch-harnesses.js");\nfs.readFileSync("test/fixtures/a.json");\nrequire("node:fs");\nrequire("../node_modules/foo/index.js");';
+  const got = gates.referencedCandidates(src, "test/codex-dispatch.test.js");
+  assert.ok(got.includes("lib/shell/dispatch-harnesses.js"), "a relative specifier resolves against the file's own directory");
+  assert.ok(got.includes("test/helpers/launch.js"), "an extensionless specifier gets the extensions a resolver would try");
+  assert.ok(!got.some((p) => p.includes("node_modules")), "a dependency is never a hop");
+  assert.deepStrictEqual(gates.referencedCandidates("", "test/a.test.js"), []);
 });
 
 test("offDiffFailure claims off-diff only when it read a file AND the change touches none of them", () => {

@@ -113,7 +113,11 @@ Keys by kind (`lib/kernel/gates.js` is the authority):
   instead of costing a fix cycle, the rescue lane and finally a person.
   Propose it wherever the operator's whole-suite command is the same one a
   single file can be run through — a repo whose suite cannot name a file
-  should declare nothing. Deliberately *no* ref or protected-path key: those
+  should declare nothing. Set expectations when you propose it: the pass is
+  narrow on purpose (the failing tests must also reference nothing the change
+  edits, checked by reading them), so in a repo whose tests all drive one
+  large entry point it will rarely fire and `reruns` stays the flake
+  mitigation that does the work. Deliberately *no* ref or protected-path key: those
   belong to the factory, so one shared gate can never relax another team's
   trusted boundary.
 - **agent-review** — `profile` (required), `instructions`, `await_ms` (default

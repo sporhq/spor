@@ -897,20 +897,47 @@ outside git (a database on a fixed port, a `db reset`):
   demonstrably not the cause of
   (task-spor-factory-flake-rescue-should-not-burn-when-failure-is-off-diff).
   After every declared rerun and before the failure is charged, the runner
-  reads the FILE PATHS the failure named and asks one question: does the
-  change touch any of them? If it named at least one file of the judged tree
-  and the diff touches NONE of them, the failing test files are re-run
-  through this template on that same prepared tree — and if they pass alone,
-  the whole-suite failure is an **off-diff flake**: the gate PASSES, and the
-  flake is filed as its own `issue-flake-*` node rather than spending the
-  item's fix cycles, its rescue lane and finally a person on work that was
-  never wrong. Bounded and conservative in every direction that matters:
+  reads the FILE PATHS the failure named and asks whether the change is
+  implicated in them at all. Only when it is demonstrably not are the failing
+  test files re-run through this template on that same prepared tree — and if
+  they pass alone, the whole-suite failure is an **off-diff flake**: the gate
+  PASSES, and the flake is filed as its own `issue-flake-*` node rather than
+  spending the item's fix cycles, its rescue lane and finally a person on work
+  that was never wrong.
+
+  "Off-diff" is TWO claims, and both must hold. First, no failed run named a
+  file the change edits — every run, not just the last, since a declared
+  `reruns` budget means a charged failure is several samples of one tree and
+  they need not fail the same way. Second, the failing tests do not
+  **reference** the change either: not appearing in a diff is a coincidence,
+  not an argument, and a test that never appears in one can still import,
+  spawn or read a file that does (the refusal that prompted this feature is
+  exactly that shape — test/codex-dispatch.test.js spawns `bin/spor.js`,
+  which the change had edited). So each failing test file, and the local files
+  it itself names one hop out, are READ and checked for any spelling of a
+  changed path — the path itself, its basename as a token (what a
+  `path.join(ROOT, "bin", "spor.js")` leaves behind), an extensionless quoted
+  specifier. That check is deliberately over-inclusive and bounded: a
+  reference it cannot rule out, a file it cannot read, and a walk that would
+  exceed its budget all read as "not demonstrably off-diff". The practical
+  consequence is that the pass is NARROW — in a repo whose tests drive one
+  large entry point, most changes are implicated in most failures and the
+  failure is charged as it always was. That is the intended trade: the
+  `reruns` budget is the broad flake mitigation, and this is the one case
+  where the gate can say the change had nothing to do with it.
+
+  Bounded and conservative in every other direction too:
 
   - it reads paths and nothing else — no verdicts, no counts, no test names.
     A harness's RESULT structure is the harness's (that is why
     dec-spor-command-gate-bounded-same-tree-rerun dismissed "re-run what
     failed"); a file path is printed the same way by all of them, and the
-    verdict still comes from the isolated run's own exit code;
+    verdict still comes from the isolated run's own exit code. What it does
+    read from the output's shape is only WHERE a path may be taken from: the
+    failure's own region (a `not ok`/`✖`/`FAIL`/Error/traceback line and the
+    indented block under it), never a line the run marked as a PASS — a whole
+    suite prints one line per file it ran, and a set of passing files is
+    trivially off-diff and trivially passes in isolation;
   - a failure that named no readable path, or named one the change touches,
     is **not** off-diff and is charged exactly as before. So is one whose
     isolated re-run fails too — off-diff is a reason to look, never to pass;
@@ -924,22 +951,32 @@ outside git (a database on a fixed port, a `db reset`):
     `SPOR_GATE_ISOLATE=1`;
   - it is never a laundering step: the whole-suite failure rides the
     `art-gate-*` fact as evidence, the outcome line names the flake, and the
-    fact carries a `relates-to` edge to the flake issue.
+    fact carries a `relates-to` edge to the flake issue. The pass is
+    CONDITIONAL on that flake issue landing — a gate fact write is
+    best-effort, so a flake that could be filed nowhere would be a pass over a
+    red suite that nothing records; when the filing fails the failure is
+    charged instead, and the outcome says the isolated run passed and why it
+    was charged anyway.
 
   The flake issue is the one node a gate files whose id and body are keyed on
   the failing FILES rather than on the run — a flake is a property of the
   file, so the same file flaking on ten dispatches converges on ONE issue
-  (`if_exists: skip` remotely, identical-content adoption locally) instead of
-  ten near-duplicates. The occurrence count is that issue's inbound
+  instead of ten near-duplicates. The occurrence count is that issue's inbound
   `relates-to` edges from the gate facts, each of which carries the run, the
   item and the evidence. It is routed to the factory's `test_lane_profile`,
   because fixing a flaky test is a test change and must not come from the
-  implementer's lane. An id already occupied by DIFFERENT content — a person
-  has triaged the issue since — is linked, never rewritten and never reported
-  unfiled: for every other node a gate files an occupied id is a refusal
-  (adopting a stranger's approval item would pass a gate nobody looked at),
-  but this id is keyed on the failing files and on nothing else, so the
-  occupant is this flake's issue by construction.
+  implementer's lane. The convergence is RECONCILED against settled state
+  rather than taken on the strength of the id: the candidate is read first,
+  and an id occupied by LIVE work is linked (never rewritten — for every other
+  node a gate files an occupied id is a refusal, since adopting a stranger's
+  approval item would pass a gate nobody looked at, but this id is keyed on
+  the failing files and on nothing else, so the occupant is this flake's issue
+  by construction), while an id whose occupant is already RESOLVED or CLOSED
+  advances to a recurrence rung (`…-r2`, `…-r3`) that links back to it — a
+  fresh occurrence hung on a terminal node is no signal at all. A file that
+  has been closed and reopened past every rung is reported unfiled, which
+  charges the failure and gets a person, the right answer for a test that
+  keeps coming back.
 
   Declaring nothing keeps the pre-existing behaviour exactly: with no
   `isolate` the runner never runs an extra command. What it DOES do for every

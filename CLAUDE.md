@@ -797,20 +797,41 @@ A declared `isolate` (a command template carrying a `{files}` token) adds the
 OFF-DIFF pass after those reruns
 (task-spor-factory-flake-rescue-should-not-burn-when-failure-is-off-diff): the
 runner reads the FILE PATHS the failure named — paths only, never a harness's
-result structure, so it stays harness-blind — and where the failure named at
-least one file of the judged tree and the change touches NONE of them, the
-failing TEST files (at most 5) are re-run alone on that same open tree under the
-same lease; passing there makes the whole-suite failure an off-diff FLAKE, so the
-gate PASSES and the flake is filed as its own convergent, per-FILE `issue-flake-*`
-(routed to the `test_lane_profile`, `relates-to` from every gate fact that ever
-tripped over it — the inbound edges are the occurrence count) rather than
-spending the item's fix cycles, its rescue lane and finally a person. Off-diff is
+result structure, so it stays harness-blind, and only out of the failure's own
+REGION (an anchor line plus its indented block, never a line the run marked as a
+PASS — a suite prints one line per file it RAN, and a set of passing files is
+trivially off-diff and trivially passes alone) — and where the failure is
+demonstrably not the change's, the failing TEST files (at most 5) are re-run
+alone on that same open tree under the same lease; passing there makes the
+whole-suite failure an off-diff FLAKE, so the gate PASSES and the flake is filed
+as its own convergent, per-FILE `issue-flake-*` (routed to the
+`test_lane_profile`, `relates-to` from every gate fact that ever tripped over it
+— the inbound edges are the occurrence count) rather than spending the item's fix
+cycles, its rescue lane and finally a person. "Demonstrably not the change's" is
+TWO claims, both required and both failing closed: EVERY failed run (not just
+the last — `reruns` means several samples of one tree, and an off-diff flake on
+run 2 must not overwrite an on-diff failure on run 1, `gates.offDiffRuns`) named
+only files off the diff, AND those test files REFERENCE nothing the change edits
+(`gates.mentionsChanged` over each failing test and the local files it names one
+hop out, `changeReferencedBy` in gate-runner.js) — because a test absent from a
+diff can still import or spawn a file in it, which is exactly the shape of the
+refusal that prompted this (test/codex-dispatch.test.js spawns `bin/spor.js`,
+which the change had edited). The reference read is over-inclusive and bounded,
+and an unreadable file or an over-budget walk charges the failure, so the pass is
+NARROW by design: `reruns` stays the broad flake mitigation. Off-diff is
 a reason to LOOK, never to pass: a failure naming a file the change touches, or
 one that fails alone too, is charged as before, and the pass is never clean (the
-whole-suite failure rides the fact as evidence). Declaring nothing runs no extra
-command; what happens for EVERY command gate either way is that a charged failure
-records WHICH files it failed in (`gates.describeFailingFiles`), so flake
-telemetry aggregates by file instead of reading "`npm test` exited 1".
+whole-suite failure rides the fact as evidence) — nor is it unconditional: it
+happens only if the flake ISSUE lands, since the gate fact write is best-effort
+too and a red suite passing with neither write is a green light nobody can audit.
+The issue's convergent id is reconciled against SETTLED state rather than adopted
+on its name: a live occupant is linked, a resolved/closed one advances to a
+recurrence rung (`-r2`, `-r3`) that links back to it, and a file past every rung
+is reported unfiled — which charges the failure and gets a person. Declaring
+nothing runs no extra command; what happens for EVERY command gate either way is
+that a charged failure records WHICH files it failed in
+(`gates.describeFailingFiles`), so flake telemetry aggregates by file instead of
+reading "`npm test` exited 1".
 **agent-review**
 dispatches a profile-routed (cross-model) review through the same `cmdDispatch`
 path, waits for its terminal state, and parses a fenced-JSON findings verdict in

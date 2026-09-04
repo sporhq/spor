@@ -10406,6 +10406,12 @@ async function writeGateNode(cfg, id, markdown) {
   }
 }
 
+// How many recurrence rungs the per-file flake id may climb past a SETTLED
+// occupant before the gate gives up and charges the failure (fileFlakeItem).
+// Small on purpose: a file whose flake issue has been closed and reopened four
+// times is not a convergence problem, it is a test that needs a person.
+const FLAKE_ID_RUNGS = 4;
+
 function gateStem(nodeId) {
   return String(nodeId || "item")
     .replace(/^[a-z]+-/, "")
@@ -11657,45 +11663,95 @@ function makeGateDeps(
     // `relates-to` edges from the `art-gate-*` facts, which each carry the run,
     // the item and the evidence — so nothing run-specific is lost by leaving
     // it out here, and there is no per-run content to make the write diverge.
+    //
+    // The convergence is RECONCILED against settled state, never taken on the
+    // strength of the id (the stale-flag failure mode): the same file can flake
+    // again months after its issue was fixed and closed, and a fresh occurrence
+    // attached to a terminal node is no signal at all — nothing resurfaces it,
+    // nobody triages it, and the gate would have passed a red suite against a
+    // record that reads "already handled". So each candidate id is READ first
+    // and only an id that is free (create) or occupied by LIVE work (link) is
+    // taken; a settled occupant advances to the next rung (`-r2`, `-r3`, …),
+    // which is a live issue for the recurrence that also points back at the
+    // one that was closed. All rungs settled — a file closed and reopened four
+    // times — is reported unfiled, which the runner turns into a charged
+    // failure and a person, the right answer for a file that keeps coming back.
     fileFlakeItem: async ({ gate, files, command, isolate }) => {
       const list = (files || []).map(String);
       const stem = list[0].replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase().slice(0, 34).replace(/-+$/, "") || "suite";
-      const id = `issue-flake-${stem}-${gateIdSuffix("flake", gate.id, slug || "", list.join("\n"))}`;
+      const base = `issue-flake-${stem}-${gateIdSuffix("flake", gate.id, slug || "", list.join("\n"))}`;
       const profile = factory.testLaneProfile || null;
-      const body = [
-        `The \`${gate.id}\` command gate of factory \`${factory.id}\` failed its whole-suite run \`${command}\`,`,
-        "in file(s) the change under judgement did not touch:",
-        "",
-        list.map((f) => `- \`${f}\``).join("\n"),
-        "",
-        `Re-running them alone on that same tree (\`${isolate}\`) PASSED, so the failure was the suite's`,
-        "scheduling — load, ordering, a shared fixture — and not the change. The gate therefore passed the",
-        "item and filed this instead of spending its fix cycles, its rescue lane and finally a person on",
-        "work that was never wrong (WORKERS.md §10.3).",
-        "",
-        "Fix the flake in the file itself: make it independent of what else is running. Every `art-gate-*`",
-        "fact that relates to this issue is one occurrence — the inbound edges are the count, and each",
-        "carries the run, the item and the whole-suite failure it saw as evidence.",
-        ...(profile ? ["", `Test changes belong in the \`${profile}\` lane, not an implementer's branch.`] : []),
-      ].join("\n");
-      return writeGateNode(
-        cfg,
-        id,
+      const markdown = (id, priorId, priorWhy) =>
         buildGateWorkNode({
           id,
           type: "issue",
           title: `Flaky under the ${gate.id} gate — ${list.join(", ")} fails the full suite and passes alone`,
           summary: `${list.join(", ")} failed factory \`${factory.id}\`'s \`${gate.id}\` gate (\`${command}\`) and passed when re-run alone on the same tree — an off-diff flake, not a failure of any change under judgement.`,
-          body,
+          body: [
+            `The \`${gate.id}\` command gate of factory \`${factory.id}\` failed its whole-suite run \`${command}\`,`,
+            "in file(s) the change under judgement did not touch and that reference nothing it edits:",
+            "",
+            list.map((f) => `- \`${f}\``).join("\n"),
+            "",
+            `Re-running them alone on that same tree (\`${isolate}\`) PASSED, so the failure was the suite's`,
+            "scheduling — load, ordering, a shared fixture — and not the change. The gate therefore passed the",
+            "item and filed this instead of spending its fix cycles, its rescue lane and finally a person on",
+            "work that was never wrong (WORKERS.md §10.3).",
+            "",
+            "Fix the flake in the file itself: make it independent of what else is running. Every `art-gate-*`",
+            "fact that relates to this issue is one occurrence — the inbound edges are the count, and each",
+            "carries the run, the item and the whole-suite failure it saw as evidence.",
+            ...(priorId ? ["", `This is a RECURRENCE: \`${priorId}\` holds the earlier occurrences of the same flake and is`, `already settled (${priorWhy}), so this file carries the ones since.`] : []),
+            ...(profile ? ["", `Test changes belong in the \`${profile}\` lane, not an implementer's branch.`] : []),
+          ].join("\n"),
           project: slug,
           date: date(),
           profile,
           edges: [
             ...(factory.id ? [{ type: "relates-to", to: factory.id }] : []),
             ...(profile ? [{ type: "relates-to", to: profile }] : []),
+            ...(priorId ? [{ type: "relates-to", to: priorId }] : []),
           ],
-        })
-      );
+        });
+      let prior = null;
+      let priorWhy = "";
+      let rung = 0;
+      let raced = false;
+      while (rung < FLAKE_ID_RUNGS) {
+        const id = rung === 0 ? base : `${base}-r${rung + 1}`;
+        // A node this read cannot reach is not thereby absent, so nothing is
+        // concluded from the failure: the write below is the atomic door, and
+        // when the graph is unreachable it fails too — which the runner turns
+        // into a charged failure rather than a pass with no record.
+        const node = await resolveNode(cfg, id).catch(() => null);
+        if (node) {
+          const settled = dispatchResolutionReason(cfg, node);
+          if (!settled) return { ok: true, id, existing: true };
+          prior = id;
+          priorWhy = settled;
+          rung += 1;
+          raced = false;
+          continue;
+        }
+        const written = await writeGateNode(cfg, id, markdown(id, prior, priorWhy));
+        if (written.ok) return written;
+        // The id was occupied between the read and the write — another worker
+        // filed the same flake first (its content is this flake's by
+        // construction, the id being keyed on the files and nothing else). Read
+        // it back ONCE so the same live/settled rule decides, rather than
+        // adopting it unread.
+        if (written.existing && !raced) {
+          raced = true;
+          continue;
+        }
+        if (written.existing) {
+          rung += 1;
+          raced = false;
+          continue;
+        }
+        return written;
+      }
+      return { ok: false, reason: `every candidate id for this flake (${base}, +${FLAKE_ID_RUNGS - 1} recurrence rungs) is already settled — the file has been closed and reopened too often to file another` };
     },
     fileHumanItem: async ({ gate, classes, rescue = 0 }) => {
       const k = keysFor(rescue);
