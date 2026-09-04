@@ -1,5 +1,5 @@
 {
-  "note": "Per-finding verdicts from the second counterfactual replay (task-spor-reevaluate-nudge-async-default-post-sessionend), modelling the SHIPPED SessionEnd drain (sessionEndPendingNudges, 2026-08-21). This file is a RESULT, not a lookup table: the ~/.claude/projects transcripts these verdicts were derived from get pruned, and the first run's 2026-07-17 corpus is already fully evicted, so the derived verdicts are committed to keep the quoted numbers auditable. measure-async-nudge-loss.js defaults its window to the one below and re-joins these keys, reporting any per-finding drift.",
+  "note": "Per-finding rows from the second counterfactual replay (task-spor-reevaluate-nudge-async-default-post-sessionend), modelling the SHIPPED SessionEnd drain (sessionEndPendingNudges, 2026-08-21). This file is a RESULT, not a lookup table: the ~/.claude/projects transcripts these verdicts were derived from get pruned, and the first run's 2026-07-17 corpus is already fully evicted, so the derived rows are committed to keep the quoted numbers auditable. It carries EVERY SCORED finding, drained ones included, so the headline's DENOMINATOR (findingsScored / drained / factsTotal) is derivable from the file after the transcripts are gone and not merely asserted. measure-async-nudge-loss.js defaults its window to the one below and re-joins these keys, reporting per-finding drift on the drain outcome, the SessionEnd verdict and the fact count.",
   "from": "2026-08-01T00:00:00.000Z",
   "until": "2026-09-04T00:00:00.000Z",
   "date": "2026-09-04",
@@ -13,20 +13,45 @@
     "capturedAtSessionEnd": 10,
     "capturedFacts": 14,
     "tooLate": 0,
-    "noSessionEnd": 4,
-    "durablyLostFacts": 5,
+    "noSessionEndObserved": 4,
+    "noSessionEndObservedFacts": 5,
+    "durablyLostFactsLower": 0,
+    "durablyLostFactsUpper": 5,
     "narrowestMarginMs": 365091
   },
   "findings": [
+    {
+      "key": "ed9fe64294e1",
+      "session": "72416a92-f9b1-4e50-8afe-4792f0b3333b",
+      "ts": "2026-08-05T13:04:49.546Z",
+      "file": "/home/exedev/repos/spor/.claude/skills/spor-orchestrator/SKILL.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
     {
       "key": "42502f274e82",
       "session": "8c8e6722-beea-4cdc-aade-cea36cdc6711",
       "ts": "2026-08-05T15:01:37.884Z",
       "file": "/home/exedev/repos/spor-server/.claude/worktrees/task-spor-owner-questions-out-of-band-push/SERVER.md",
       "nfacts": 2,
+      "drain": "lost",
       "verdict": "captured",
       "marginMs": 2162796,
       "shiftMs": 7653
+    },
+    {
+      "key": "37b9da565ee7",
+      "session": "7ca02825-c7e1-4d1d-8418-beab66c952c4",
+      "ts": "2026-08-05T15:14:50.049Z",
+      "file": "/home/exedev/repos/spor-server/.claude/worktrees/issue-spor-llmlog-records-uncapped/review/REVIEW.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
     },
     {
       "key": "4ad2cda57e96",
@@ -34,9 +59,21 @@
       "ts": "2026-08-05T15:16:11.245Z",
       "file": "/home/exedev/repos/spor-server/.claude/worktrees/issue-spor-resolution-unverified-merge-gap/SERVER.md",
       "nfacts": 2,
-      "verdict": "no-sessionend",
+      "drain": "lost",
+      "verdict": "no-sessionend-observed",
       "marginMs": null,
       "shiftMs": 7795
+    },
+    {
+      "key": "b3f9f32cab95",
+      "session": "32409128-17a1-4b50-9a9e-e09d0c9051f8",
+      "ts": "2026-08-09T13:27:13.066Z",
+      "file": "/home/exedev/repos/spor-server/usage-review/REVIEW.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
     },
     {
       "key": "e504d31a3e12",
@@ -44,6 +81,7 @@
       "ts": "2026-08-10T10:31:02.650Z",
       "file": "/home/exedev/repos/spor-server/.claude/worktrees/issue-spor-owner-digest-pacing-race-conditions/SERVER.md",
       "nfacts": 1,
+      "drain": "lost",
       "verdict": "captured",
       "marginMs": 1268672,
       "shiftMs": 5048
@@ -54,6 +92,7 @@
       "ts": "2026-08-10T10:50:00.257Z",
       "file": "/home/exedev/repos/spor-docs/.claude/worktrees/task-spor-docs-bulk-lease-endpoints/src/content/docs/reference/api/leases.md",
       "nfacts": 1,
+      "drain": "lost",
       "verdict": "captured",
       "marginMs": 467078,
       "shiftMs": 13536
@@ -64,6 +103,7 @@
       "ts": "2026-08-10T10:51:49.998Z",
       "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-docs-bulk-lease-endpoints-apimd/API.md",
       "nfacts": 1,
+      "drain": "lost",
       "verdict": "captured",
       "marginMs": 365091,
       "shiftMs": 5782
@@ -74,6 +114,7 @@
       "ts": "2026-08-10T11:02:54.301Z",
       "file": "/home/exedev/repos/spor-server/.claude/worktrees/issue-spor-capture-elaborations-unbounded-body-cap/SERVER.md",
       "nfacts": 1,
+      "drain": "lost",
       "verdict": "captured",
       "marginMs": 1484681,
       "shiftMs": 4964
@@ -84,6 +125,7 @@
       "ts": "2026-08-10T11:37:23.238Z",
       "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-triage-skill-body-full-guidance-update/skills/triage/SKILL.md",
       "nfacts": 1,
+      "drain": "lost",
       "verdict": "captured",
       "marginMs": 436749,
       "shiftMs": 4314
@@ -94,9 +136,32 @@
       "ts": "2026-08-10T11:40:29.502Z",
       "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-api-md-lease-reclaim-contract-pass/API.md",
       "nfacts": 4,
+      "drain": "lost",
       "verdict": "captured",
       "marginMs": 483129,
       "shiftMs": 7732
+    },
+    {
+      "key": "701d62b345f3",
+      "session": "30c78680-af6f-4213-90ea-7f13967f6ca0",
+      "ts": "2026-08-19T11:44:08.148Z",
+      "file": "/home/exedev/repos/spor-server/usage-collector/README.md",
+      "nfacts": 2,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "84f01e375131",
+      "session": "30c78680-af6f-4213-90ea-7f13967f6ca0",
+      "ts": "2026-08-19T12:03:04.858Z",
+      "file": "/home/exedev/repos/spor-server/usage-intake/README.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
     },
     {
       "key": "cbe6615e5c4b",
@@ -104,6 +169,7 @@
       "ts": "2026-08-21T05:45:25.892Z",
       "file": "/tmp/claude-1000/-home-exedev-repos-spor-server/61b54d17-47ad-4715-91be-7174bea25312/scratchpad/issue-diacritic.md",
       "nfacts": 1,
+      "drain": "lost",
       "verdict": "captured",
       "marginMs": 2436786,
       "shiftMs": 10278
@@ -114,9 +180,131 @@
       "ts": "2026-08-21T05:45:44.352Z",
       "file": "/tmp/claude-1000/-home-exedev-repos-spor-server/61b54d17-47ad-4715-91be-7174bea25312/scratchpad/issue-lease-nonwork.md",
       "nfacts": 1,
+      "drain": "lost",
       "verdict": "captured",
       "marginMs": 2423187,
       "shiftMs": 5417
+    },
+    {
+      "key": "ab4dd2f95004",
+      "session": "a4f2cc36-01ae-4ed9-a26b-efb7c17c7572",
+      "ts": "2026-08-21T08:45:32.577Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-program-membership-client-docs-sweep/GRAPH.md",
+      "nfacts": 2,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "3796ee1485f8",
+      "session": "a4f2cc36-01ae-4ed9-a26b-efb7c17c7572",
+      "ts": "2026-08-21T08:45:45.136Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-program-membership-client-docs-sweep/skills/next/SKILL.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "a844ee288d82",
+      "session": "a4f2cc36-01ae-4ed9-a26b-efb7c17c7572",
+      "ts": "2026-08-21T08:45:57.064Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-program-membership-client-docs-sweep/skills/triage/SKILL.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "58dcd446277f",
+      "session": "c0dd9f82-635f-4967-8fbd-361d16ea9de4",
+      "ts": "2026-08-21T08:59:23.337Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-api-queue-md-program-walk-stale/QUEUE.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "030fa9bbf0f2",
+      "session": "986604c2-502a-4632-adef-e21f74abc971",
+      "ts": "2026-08-21T09:55:59.209Z",
+      "file": "/home/exedev/repos/spor-docs/.claude/worktrees/task-spor-docs-site-member-of-program-sweep/src/content/docs/reference/graph-model/edges.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "4aa044618daa",
+      "session": "986604c2-502a-4632-adef-e21f74abc971",
+      "ts": "2026-08-21T09:56:59.958Z",
+      "file": "/home/exedev/repos/spor-docs/.claude/worktrees/task-spor-docs-site-member-of-program-sweep/src/content/docs/reference/api/reads.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "4bf8ce5603a3",
+      "session": "986604c2-502a-4632-adef-e21f74abc971",
+      "ts": "2026-08-21T09:57:12.597Z",
+      "file": "/home/exedev/repos/spor-docs/.claude/worktrees/task-spor-docs-site-member-of-program-sweep/src/content/docs/use-spor/review-what-changed.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "86dd3b99786c",
+      "session": "ea41e106-544b-4945-9c2c-d76861cb8a0c",
+      "ts": "2026-08-22T07:00:56.387Z",
+      "file": "/home/exedev/repos/spor-server/.claude/worktrees/task-spor-usage-review-consent-roster-read-path/usage-review/REVIEW.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "88a0b7a4d961",
+      "session": "4b2b442e-2f0e-4b2c-9894-1f8fed2cb42e",
+      "ts": "2026-08-22T07:56:39.305Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/issue-spor-accreting-log-rollover-fix-unlanded/GRAPH.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "d1bc1d841ee6",
+      "session": "f4167fa7-1972-49c9-ac28-f109fde10dac",
+      "ts": "2026-08-22T08:03:13.041Z",
+      "file": "/home/exedev/repos/spor-server/.claude/worktrees/issue-spor-idp-subject-store-no-cross-process-atomicity/SERVER.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "0b991e61c93e",
+      "session": "62c9f3c2-cbdc-4425-9c47-45203fcd6ddd",
+      "ts": "2026-08-22T08:52:49.577Z",
+      "file": "/home/exedev/repos/spor-docs/.claude/worktrees/task-spor-docs-mirror-harness-selection/src/content/docs/reference/api/authentication.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
     },
     {
       "key": "98a3dab9e9bf",
@@ -124,7 +312,8 @@
       "ts": "2026-08-22T09:45:10.951Z",
       "file": "/home/exedev/repos/spor/.claude/worktrees/issue-spor-dispatch-no-worktree-template-mismatch/.claude/skills/spor-orchestrator/assets/agent-prompt-inplace.md",
       "nfacts": 1,
-      "verdict": "no-sessionend",
+      "drain": "lost",
+      "verdict": "no-sessionend-observed",
       "marginMs": null,
       "shiftMs": 6884
     },
@@ -134,9 +323,241 @@
       "ts": "2026-08-22T09:46:08.271Z",
       "file": "/home/exedev/repos/spor/.claude/worktrees/issue-spor-dispatch-no-worktree-template-mismatch/.claude/skills/spor-orchestrator/SKILL.md",
       "nfacts": 1,
-      "verdict": "no-sessionend",
+      "drain": "lost",
+      "verdict": "no-sessionend-observed",
       "marginMs": null,
       "shiftMs": 3317
+    },
+    {
+      "key": "2c3d3c26c076",
+      "session": "ca7b023c-b896-415d-9139-35c455a9bc26",
+      "ts": "2026-08-22T09:54:55.387Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/issue-spor-codex-dispatch-permission-bypass-error/README.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "618cd16fb123",
+      "session": "18c6cb57-b3ed-4d26-872f-090010e59177",
+      "ts": "2026-08-22T10:53:40.316Z",
+      "file": "/home/exedev/repos/spor-docs/.claude/worktrees/task-spor-docs-mirror-codex-bypass-translate/src/content/docs/reference/dispatch.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "6b45029de0e3",
+      "session": "11032a2b-98d0-4f86-bd82-6af9e515d8c0",
+      "ts": "2026-08-22T10:58:37.073Z",
+      "file": "/home/exedev/repos/spor-docs/.claude/worktrees/task-spor-docs-mirror-opencode-copilot-harnesses/src/content/docs/reference/dispatch.md",
+      "nfacts": 2,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "e9dc06024aee",
+      "session": "11032a2b-98d0-4f86-bd82-6af9e515d8c0",
+      "ts": "2026-08-22T10:59:30.858Z",
+      "file": "/home/exedev/repos/spor-docs/.claude/worktrees/task-spor-docs-mirror-opencode-copilot-harnesses/src/content/docs/reference/api/authentication.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "27bcdcd6174c",
+      "session": "6b458fd3-5e7a-42ec-a593-7842f3539ee9",
+      "ts": "2026-08-25T11:52:29.642Z",
+      "file": "/home/exedev/repos/spor/GRAPH.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "c6ac7334cfd8",
+      "session": "6b458fd3-5e7a-42ec-a593-7842f3539ee9",
+      "ts": "2026-08-25T11:52:53.412Z",
+      "file": "/home/exedev/repos/spor/skills/spor/SKILL.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "b285e547c12b",
+      "session": "6b458fd3-5e7a-42ec-a593-7842f3539ee9",
+      "ts": "2026-08-25T11:54:09.279Z",
+      "file": "/home/exedev/repos/spor-docs/src/content/docs/reference/graph-model/schemas.md",
+      "nfacts": 2,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "7c57ed32122a",
+      "session": "c01ec8d3-81b1-468c-87e0-fa0e6b3a442e",
+      "ts": "2026-08-26T11:20:31.859Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-worker-protocol-doc/WORKERS.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "7193d9954541",
+      "session": "c01ec8d3-81b1-468c-87e0-fa0e6b3a442e",
+      "ts": "2026-08-26T14:43:10.495Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-work-gate-pipeline/WORKERS.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "57595a010fd7",
+      "session": "c01ec8d3-81b1-468c-87e0-fa0e6b3a442e",
+      "ts": "2026-08-26T16:59:24.549Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-factory-builder-skill/skills/factory/SKILL.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "6881e390cb83",
+      "session": "6a8078f0-0b89-42c7-aab6-939d0c4ad17b",
+      "ts": "2026-08-27T07:15:21.237Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/issue-spor-factory-definition-status-ignored/WORKERS.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "a57399ed1691",
+      "session": "b9008fb3-918d-4bf8-89d9-cd9b06d2bf37",
+      "ts": "2026-08-27T07:15:23.635Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-work-skip-readiness-human/WORKERS.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "d2bc5d1de677",
+      "session": "eb5a1680-4fda-4f81-91c1-9b682eff7fca",
+      "ts": "2026-08-27T08:03:10.126Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/issue-spor-work-stop-abandons-inflight-gates/WORKERS.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "df4ddeae8863",
+      "session": "9b897fe4-1e64-4997-b006-0a4fdd31bedb",
+      "ts": "2026-08-27T08:11:11.294Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-skill-evals-in-ci/CONTRIBUTING.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "4521494799f1",
+      "session": "3bea77e2-6c5c-42b3-b517-ec21762d6297",
+      "ts": "2026-08-27T10:16:34.998Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-dispatch-person-token-hard-fail/WORKERS.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "afe046ca9eae",
+      "session": "1c129e90-f2ad-4fec-983d-e92faacf20e7",
+      "ts": "2026-08-27T13:01:46.656Z",
+      "file": "/home/exedev/repos/spor-docs/.claude/worktrees/task-spor-docs-dispatch-person-token-hard-fail/src/content/docs/reference/worker-protocol.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "688cca649e9e",
+      "session": "1c129e90-f2ad-4fec-983d-e92faacf20e7",
+      "ts": "2026-08-27T13:02:02.612Z",
+      "file": "/home/exedev/repos/spor-docs/.claude/worktrees/task-spor-docs-dispatch-person-token-hard-fail/src/content/docs/reference/cli/dispatch.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "8eb93591f5ad",
+      "session": "1c129e90-f2ad-4fec-983d-e92faacf20e7",
+      "ts": "2026-08-27T13:02:26.993Z",
+      "file": "/home/exedev/repos/spor-docs/.claude/worktrees/task-spor-docs-dispatch-person-token-hard-fail/src/content/docs/reference/dispatch.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "81bfa7733097",
+      "session": "05bb05cb-6a4e-47c9-bd35-650bc95fec88",
+      "ts": "2026-08-27T13:03:00.998Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-test-change-lane-auto-routing/WORKERS.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "809ca9738bd1",
+      "session": "f51a19cb-b184-4ad6-8f3e-4fb1f1babb0f",
+      "ts": "2026-08-28T13:21:07.456Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-factory-integration-step/WORKERS.md",
+      "nfacts": 3,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "86f2b500c974",
+      "session": "f51a19cb-b184-4ad6-8f3e-4fb1f1babb0f",
+      "ts": "2026-08-28T13:27:10.943Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-factory-integration-step/GRAPH.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
     },
     {
       "key": "d67a8c3e17b4",
@@ -144,9 +565,65 @@
       "ts": "2026-08-28T14:14:12.582Z",
       "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-factory-integration-step/WORKERS.md",
       "nfacts": 1,
+      "drain": "lost",
       "verdict": "captured",
       "marginMs": 998058,
       "shiftMs": 4357
+    },
+    {
+      "key": "a761ea167ae1",
+      "session": "5cb8b92e-13f1-4a70-b0c9-00e13b7a3592",
+      "ts": "2026-08-28T14:42:16.538Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-factory-skill-integration-block/skills/factory/references/emitting.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "9a712931aed2",
+      "session": "5cb8b92e-13f1-4a70-b0c9-00e13b7a3592",
+      "ts": "2026-08-28T14:43:59.143Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-factory-skill-integration-block/skills/factory/references/maintenance.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "6fe1087bd600",
+      "session": "7824ffc0-e5e6-466a-b3da-2c7d13f1375e",
+      "ts": "2026-08-28T15:02:11.798Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-integration-propose-mode/WORKERS.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "5e6fc029369b",
+      "session": "b5f3db03-5a47-4d3c-94bb-9ffc7aa717a6",
+      "ts": "2026-08-28T17:35:03.371Z",
+      "file": "/home/exedev/repos/spor/.claude/worktrees/task-spor-propose-gh-capability-satisfiability/WORKERS.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
+    },
+    {
+      "key": "3cc42e24e538",
+      "session": "5e64f0ed-c462-47a9-905a-8b5706ed7844",
+      "ts": "2026-08-31T10:20:22.144Z",
+      "file": "/home/exedev/repos/spor-server/.claude/worktrees/task-spor-nexavo-tenant-roll-version-probe/usage-review/REVIEW.md",
+      "nfacts": 1,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
     },
     {
       "key": "928a641dfa26",
@@ -154,9 +631,21 @@
       "ts": "2026-08-31T10:47:59.351Z",
       "file": "/home/exedev/repos/spor/WORKERS.md",
       "nfacts": 1,
-      "verdict": "no-sessionend",
+      "drain": "lost",
+      "verdict": "no-sessionend-observed",
       "marginMs": null,
       "shiftMs": 13527
+    },
+    {
+      "key": "d8986b366c39",
+      "session": "52336326-0212-4558-8d72-88ee4fc47048",
+      "ts": "2026-09-01T19:16:14.721Z",
+      "file": "/home/exedev/.claude/projects/-home-exedev-repos-spor-server/memory/spor-factory-live.md",
+      "nfacts": 2,
+      "drain": "drained",
+      "verdict": null,
+      "marginMs": null,
+      "shiftMs": null
     }
   ]
 }

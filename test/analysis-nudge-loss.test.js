@@ -16,8 +16,11 @@ const {
   splitFacts,
   stem,
   sessionEndDrains,
+  distillLogDrains,
   sessionEndOutcome,
   asyncEndShift,
+  asyncShiftBefore,
+  promptDrains,
 } = require("../scripts/analysis/measure-async-nudge-loss.js");
 
 const user = (extra) => ({ type: "user", message: { content: "do the thing" }, ...extra });
@@ -225,6 +228,40 @@ test("asyncEndShift: async gives back this call's blocking plus every later one"
   assert.equal(asyncEndShift(call, undefined), 0);
 });
 
+test("asyncShiftBefore: a moment mid-session gets back only the blocking that preceded IT", () => {
+  // The prompt drain needs this: a prompt between two later classifier calls
+  // was moved earlier by the calls before it, not by the ones after it. Summing
+  // the whole tail there would over-correct and score a real drain as a loss.
+  const call = { ts: "2026-08-10T10:00:10.000Z", latency_ms: 5000 };
+  const session = [
+    { ts: "2026-08-10T09:59:00.000Z", latency_ms: 9000 }, // earlier: cancels
+    call,
+    { ts: "2026-08-10T10:02:00.000Z", latency_ms: 4000 },
+    { ts: "2026-08-10T10:03:00.000Z", latency_ms: 3000 },
+  ];
+  assert.equal(asyncShiftBefore(call, session, Date.parse("2026-08-10T10:01:00Z")), 5000);
+  assert.equal(asyncShiftBefore(call, session, Date.parse("2026-08-10T10:02:30Z")), 9000);
+  assert.equal(asyncShiftBefore(call, session, Infinity), 12000);
+  // The default is the whole tail, which is what the SessionEnd comparison wants.
+  assert.equal(asyncShiftBefore(call, session), asyncEndShift(call, session));
+});
+
+test("promptDrains: a prompt is judged on the async clock, not the synchronous one", () => {
+  // The defect this pins: `promptAt > resultAt` reads a prompt 2s after a
+  // classifier that blocked for 5s as a clean drain, when under async that
+  // prompt happens 3s BEFORE the worker's result exists. Both events move, and
+  // they do not move together.
+  const resultAt = Date.parse("2026-08-10T10:00:00Z");
+  assert.equal(promptDrains({ resultAt, promptAt: resultAt + 2000, shiftMs: 5000 }), false);
+  assert.equal(promptDrains({ resultAt, promptAt: resultAt + 8000, shiftMs: 5000 }), true);
+  // A tie is not a drain, same boundary rule as sessionEndOutcome.
+  assert.equal(promptDrains({ resultAt, promptAt: resultAt + 5000, shiftMs: 5000 }), false);
+  // With nothing blocking, it degrades to the naive comparison.
+  assert.equal(promptDrains({ resultAt, promptAt: resultAt + 1, shiftMs: 0 }), true);
+  // A prompt BEFORE the call is never a drain, whatever the shift.
+  assert.equal(promptDrains({ resultAt, promptAt: resultAt - 1000, shiftMs: 0 }), false);
+});
+
 test("asyncEndShift: an errored or NOTHING call still blocked the tool loop", () => {
   // It produces no result file, but the synchronous path waited for it, so the
   // time it returns is real. Dropping these would understate the shift.
@@ -235,9 +272,37 @@ test("asyncEndShift: an errored or NOTHING call still blocked the tool loop", ()
   );
 });
 
-test("sessionEndOutcome: no observed SessionEnd is the residual loss, not a capture", () => {
+test("sessionEndOutcome: an unobserved SessionEnd is indeterminate, not a demonstrated loss", () => {
+  // The verdict name is the contract. Both observables (the distiller's
+  // llm-calls row and its distill.log line) sit BELOW the drain in distill(),
+  // so their absence cannot distinguish "the hook never fired" (a real loss)
+  // from "the firing was suppressed after the drain" (a verbatim capture) —
+  // the residual is a bound, and calling this `no-sessionend` read as a
+  // measured cause.
   const r = sessionEndOutcome({ resultAt: Date.parse("2026-08-10T10:00:00Z"), shiftMs: 5000 }, []);
-  assert.deepEqual(r, { verdict: "no-sessionend", marginMs: null });
+  assert.deepEqual(r, { verdict: "no-sessionend-observed", marginMs: null });
+});
+
+test("distillLogDrains: a distill.log line is a SessionEnd firing the llm-calls journal missed", () => {
+  // The too-small-transcript exit returns before any backend call, so it
+  // records no llm-calls row — but it logs, and it logs BELOW the drain. Without
+  // this reader such a session reads as "never fired" and is charged to the
+  // residual.
+  const log = [
+    "[2026-08-10T10:00:00+00:00] sess-a: skipped: transcript too small",
+    "[2026-08-10T11:00:00+00:00] sess-b: distill cmd failed",
+    "  wrote /graph/nodes/dec-x.md (session-final nudge capture)", // continuation: unprefixed
+    "[2026-08-10T09:00:00+00:00] sess-a: distilled 2 nodes",
+    "not a log line at all",
+    "[garbled] sess-a: whatever",
+  ].join("\n");
+  assert.deepEqual(distillLogDrains(log, "sess-a"), [
+    Date.parse("2026-08-10T09:00:00Z"),
+    Date.parse("2026-08-10T10:00:00Z"),
+  ]);
+  assert.deepEqual(distillLogDrains(log, "sess-c"), []);
+  assert.deepEqual(distillLogDrains("", "sess-a"), []);
+  assert.deepEqual(distillLogDrains(log, ""), []);
 });
 
 test("sessionEndOutcome: the session must outlive the tool-loop time async gives back", () => {
@@ -270,19 +335,33 @@ test("the committed replay pin is internally consistent", () => {
   // per-finding rows would be unfalsifiable afterwards.
   const pin = require("../scripts/analysis/sessionend-replay-2026-09-04.json");
   const h = pin.headline;
-  assert.equal(pin.findings.length, h.lost);
-  const tally = (v) => pin.findings.filter((f) => f.verdict === v);
+  const lost = pin.findings.filter((f) => f.drain === "lost");
+  assert.equal(lost.length, h.lost);
+  const tally = (v) => lost.filter((f) => f.verdict === v);
   assert.equal(tally("captured").length, h.capturedAtSessionEnd);
   assert.equal(tally("too-late").length, h.tooLate);
-  assert.equal(tally("no-sessionend").length, h.noSessionEnd);
-  const facts = (v) => tally(v).reduce((n, f) => n + f.nfacts, 0);
-  assert.equal(facts("captured"), h.capturedFacts);
-  assert.equal(
-    pin.findings.reduce((n, f) => n + f.nfacts, 0),
-    h.lostFacts
-  );
-  // Everything the drain could not reach is what the decision was made on.
-  assert.equal(h.lostFacts - h.capturedFacts, h.durablyLostFacts);
+  assert.equal(tally("no-sessionend-observed").length, h.noSessionEndObserved);
+  const facts = (rows) => rows.reduce((n, f) => n + f.nfacts, 0);
+  assert.equal(facts(tally("captured")), h.capturedFacts);
+  assert.equal(facts(tally("no-sessionend-observed")), h.noSessionEndObservedFacts);
+  assert.equal(facts(lost), h.lostFacts);
+  // The residual is a RANGE, and both ends must fall out of the rows: the lower
+  // end counts only what the drain demonstrably ran on and missed, the upper end
+  // additionally charges every unobserved firing. Quoting the upper end as a
+  // measured loss rate is the claim this pin exists to keep falsifiable.
+  assert.equal(h.lostFacts - h.capturedFacts, h.durablyLostFactsUpper);
+  assert.equal(h.durablyLostFactsUpper - h.noSessionEndObservedFacts, h.durablyLostFactsLower);
+  // THE DENOMINATOR, derived — not asserted. A pin holding only the numerator
+  // cannot be audited after the transcripts are pruned: `findingsScored`,
+  // `drained` and `factsTotal` would have no rows behind them, and the 7.2%
+  // upper bound they divide into would be unfalsifiable.
+  assert.equal(pin.findings.length, h.findingsScored);
+  assert.equal(pin.findings.filter((f) => f.drain === "drained").length, h.drained);
+  assert.equal(h.drained + h.lost, h.findingsScored);
+  assert.equal(facts(pin.findings), h.factsTotal);
+  // A drained row carries no SessionEnd verdict: the drain never had to run.
+  for (const f of pin.findings.filter((f) => f.drain === "drained")) assert.equal(f.verdict, null);
+  for (const f of lost) assert.ok(f.verdict, `lost row ${f.key} has no verdict`);
   // Every key must be distinct, or a re-run's drift check silently compares a
   // finding against another finding's verdict.
   assert.equal(new Set(pin.findings.map((f) => f.key)).size, pin.findings.length);
