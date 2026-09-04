@@ -52,7 +52,7 @@ const BASE = {
 // what the graph accepts. Every write is captured so the tests can assert on
 // the FACTS, which is the deliverable, not just on the verdict.
 function fakes({ changed = ["lib/x.js"], changedSeq = null, suite = () => ({ ok: true }), review = () => ({ ok: true, text: '```json\n{"verdict":"pass"}\n```' }), fix = () => ({ ok: true }), approval = () => ({ state: "approved", by: "person-a" }), demote = () => ({ ok: true, demoted: true, note: "task-demo rolled back done -> open" }), writes = null } = {}) {
-  const seen = { facts: [], lane: [], human: [], escalations: [], demotions: [], suites: [], reviews: [], fixes: [], approvals: 0, slept: 0, reads: 0 };
+  const seen = { facts: [], lane: [], human: [], escalations: [], demotions: [], suites: [], reviews: [], fixes: [], approvals: 0, slept: 0, reads: 0, flakes: [] };
   let clock = 1_700_000_000_000;
   const deps = {
     now: () => clock,
@@ -68,7 +68,9 @@ function fakes({ changed = ["lib/x.js"], changedSeq = null, suite = () => ({ ok:
       return changed === null ? { ok: false, reason: "unreadable tree" } : { ok: true, paths: changed };
     },
     runSuite: async (args) => {
-      seen.suites.push(args.gate.id);
+      // `args.command` is the isolation pass's override — absent for the
+      // declared suite and its reruns (see the off-diff flake tests).
+      seen.suites.push(args.command || args.gate.id);
       return suite(args, seen);
     },
     review: async (args) => {
@@ -86,6 +88,10 @@ function fakes({ changed = ["lib/x.js"], changedSeq = null, suite = () => ({ ok:
     fileTestLaneItem: async (args) => {
       seen.lane.push(args);
       return { ok: true, id: "task-test-lane-x" };
+    },
+    fileFlakeItem: async (args) => {
+      seen.flakes.push(args);
+      return { ok: true, id: "issue-flake-x" };
     },
     fileHumanItem: async (args) => {
       seen.human.push(args);
@@ -4660,4 +4666,206 @@ test("gateChangeSet marks a missing checkout `gone`, and gateHeadLanded reads th
   assert.deepStrictEqual(gateRunner.gateHeadLanded({ cwd: path.join(root, "elsewhere") }, "main"), { known: false, landed: null, head: null });
   assert.deepStrictEqual(gateRunner.gateHeadLanded({ cwd: null }, "main"), { known: false, landed: null, head: null });
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+// --- the off-diff flake pass (task-spor-factory-flake-rescue-should-not-burn-
+// when-failure-is-off-diff, WORKERS.md §10.3 `isolate`) ---
+//
+// The refusal that prompted this failed a whole suite twice on a load-sensitive
+// race in a file the change never touched, and at `cycles: 0` went straight to
+// the rescue lane. The property under test is the narrow one that fixes it and
+// nothing wider: a failure the change is DEMONSTRABLY not the cause of — every
+// file it named is off the diff, and those files pass alone on that same tree —
+// passes and is filed as a flake, while every other shape of failure is charged
+// exactly as it was before.
+
+// The one-shot `runSuite` fake stands in for a suite whose output names files.
+const FAILED_OFF_DIFF = ["✖ failing tests:", "", "test/codex-dispatch.test.js:120:1", "AssertionError: the record was never written"].join("\n");
+
+test("an OFF-DIFF suite failure whose files pass alone on the same tree is a flake: the gate passes, and the flake is filed as its own issue", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const { deps, seen } = fakes({
+    changed: ["lib/kernel/queue.js", "API.md"],
+    suite: (args) => (args.command ? { ok: true } : { ok: false, code: 1, output: FAILED_OFF_DIFF }),
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed", "the change is not what failed, so the item is not refused");
+  assert.deepStrictEqual(seen.suites, ["acceptance", "node --test 'test/codex-dispatch.test.js'"], "the declared suite, then just the failing file");
+  assert.deepStrictEqual(seen.escalations, [], "no person is paged");
+  assert.deepStrictEqual(seen.fixes, [], "no fix cycle is spent on a change that was never wrong");
+  assert.deepStrictEqual(seen.demotions, [], "and the item is not rolled back");
+  // The flake is filed against the FILE, carrying both commands so the issue
+  // says what failed and what proved it a flake.
+  assert.strictEqual(seen.flakes.length, 1);
+  assert.deepStrictEqual(seen.flakes[0].files, ["test/codex-dispatch.test.js"]);
+  assert.strictEqual(seen.flakes[0].command, "npm test");
+  assert.strictEqual(seen.flakes[0].isolate, "node --test 'test/codex-dispatch.test.js'");
+  // …and the pass is never a CLEAN one: the fact names the flake, links the
+  // issue (the edge that makes flakes countable per file across runs) and
+  // carries the whole-suite failure as evidence.
+  const fact = seen.facts[0].markdown;
+  assert.match(fact, /an off-diff flake by the gate's own isolation rule, not a failure of the change/);
+  assert.match(fact, /filed as issue-flake-x/);
+  assert.match(fact, /- \{type: relates-to, to: issue-flake-x\}/);
+  assert.match(fact, /Off-diff flake: test\/codex-dispatch\.test\.js failed the whole-suite run and passed alone on the same tree, filed as issue-flake-x\./);
+  assert.match(fact, /AssertionError: the record was never written/, "the failure it passed over is still on the record");
+});
+
+test("a flake the graph refuses to file still passes and is still recorded — the fact is where the finding is durable, the issue is the convergence", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const { deps, seen } = fakes({
+    changed: ["lib/kernel/queue.js"],
+    suite: (args) => (args.command ? { ok: true } : { ok: false, code: 1, output: FAILED_OFF_DIFF }),
+  });
+  deps.fileFlakeItem = async () => ({ ok: false, reason: "the graph refused the write" });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  const fact = seen.facts[0].markdown;
+  assert.match(fact, /the flake could not be filed as its own issue/);
+  assert.doesNotMatch(fact, /relates-to, to: issue-flake/);
+  assert.match(fact, /an off-diff flake by the gate's own isolation rule/);
+});
+
+test("a flake whose per-file issue already exists, since TRIAGED, links that issue instead of reporting itself unfiled", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const { deps, seen } = fakes({
+    changed: ["lib/kernel/queue.js"],
+    suite: (args) => (args.command ? { ok: true } : { ok: false, code: 1, output: FAILED_OFF_DIFF }),
+  });
+  // What the local write door answers for an occupied id carrying different
+  // content — which here means a person has written into the flake's issue.
+  deps.fileFlakeItem = async () => ({ ok: false, existing: true, id: "issue-flake-x", reason: "issue-flake-x already exists with different content" });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  const fact = seen.facts[0].markdown;
+  assert.match(fact, /- \{type: relates-to, to: issue-flake-x\}/, "the occupant IS this flake's issue — the id is keyed on the files and nothing else");
+  assert.match(fact, /filed as issue-flake-x/);
+  assert.doesNotMatch(fact, /could not be filed/);
+});
+
+test("an ON-DIFF failure is never isolated: the change touched a file the failure names, so it is charged exactly as before", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const { deps, seen } = fakes({
+    changed: ["lib/shell/dispatch.js"],
+    suite: () => ({ ok: false, code: 1, output: "✖ boom\nlib/shell/dispatch.js:12:3\ntest/dispatch-runs.test.js:4:1\n" }),
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.deepStrictEqual(seen.suites, ["acceptance"], "one run: there is nothing to isolate when the change is in the failure");
+  assert.deepStrictEqual(seen.flakes, []);
+  assert.strictEqual(seen.escalations.length, 1);
+  assert.match(seen.facts[0].markdown, /1 of which the change touches \(lib\/shell\/dispatch\.js\)/);
+});
+
+test("an off-diff failure whose files fail ALONE too is charged, and the outcome says the isolated rerun failed as well", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const { deps, seen } = fakes({
+    changed: ["lib/kernel/queue.js"],
+    suite: (args) => (args.command ? { ok: false, code: 1, reason: "`node --test` exited 1", output: FAILED_OFF_DIFF } : { ok: false, code: 1, output: FAILED_OFF_DIFF }),
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed", "off-diff is a reason to LOOK, never a reason to pass");
+  assert.strictEqual(seen.suites.length, 2);
+  assert.deepStrictEqual(seen.flakes, [], "nothing was demonstrated to be a flake, so nothing is filed as one");
+  assert.strictEqual(seen.escalations.length, 1);
+  assert.match(seen.facts[0].markdown, /re-running test\/codex-dispatch\.test\.js on its own \(`node --test` exited 1\) failed too, so the failure is this tree's, not the suite's scheduling/);
+});
+
+test("the per-file telemetry rides EVERY charged command-gate failure, isolation declared or not", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+  const { deps, seen } = fakes({ changed: ["lib/kernel/queue.js"], suite: () => ({ ok: false, code: 1, output: FAILED_OFF_DIFF }) });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.deepStrictEqual(seen.suites, ["acceptance"], "reading paths costs nothing; RUNNING them needs a declaration");
+  assert.deepStrictEqual(seen.flakes, []);
+  assert.match(seen.facts[0].markdown, /the failure names 1 file\(s\) — test\/codex-dispatch\.test\.js — none of which the change touches/);
+  assert.doesNotMatch(seen.facts[0].markdown, /isolation rule/, "an undeclared isolation never claims a flake");
+  // A failure that named nothing readable reads exactly as it did before the
+  // telemetry existed — the safe direction when the paths cannot be read.
+  const bare = fakes({ changed: ["lib/kernel/queue.js"], suite: () => ({ ok: false, code: 1, output: "Failed tasks: server:test\n" }) });
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: bare.deps });
+  assert.doesNotMatch(bare.seen.facts[0].markdown, /the failure names/);
+});
+
+test("the isolated rerun runs on the SAME prepared tree, after every declared rerun, and its absolute paths fold onto the tree's root", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", reruns: 1, isolate: "node --test {files}", serialize: "repo" }] });
+  const { deps, seen } = fakes({ changed: ["lib/kernel/queue.js"] });
+  const events = [];
+  deps.acquireGateLease = async () => {
+    events.push("lease");
+    return { token: 1 };
+  };
+  deps.releaseGateLease = async () => events.push("release");
+  deps.openSuite = async () => {
+    events.push("open");
+    return {
+      ok: true,
+      dir: "/tmp/gate-tree-1",
+      run: async (attempt, command) => {
+        events.push(command ? `isolate:${attempt}:${command}` : `run:${attempt}`);
+        // The failure names the file ONLY as an absolute path inside the tree —
+        // a stack frame, which is how a real harness prints it.
+        return command ? { ok: true } : { ok: false, code: 1, output: "  at T (/tmp/gate-tree-1/test/codex-dispatch.test.js:120:5)\n" };
+      },
+      close: () => events.push("close"),
+    };
+  };
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.deepStrictEqual(
+    events,
+    ["lease", "open", "run:1", "run:2", "isolate:3:node --test 'test/codex-dispatch.test.js'", "close", "release"],
+    "reruns first, then one isolation run on that same open tree, all under the one lease"
+  );
+  assert.deepStrictEqual(seen.flakes[0].files, ["test/codex-dispatch.test.js"], "the absolute frame came back repo-relative and comparable with the diff");
+});
+
+// The flake issue is the one node a gate files that is keyed on the FAILING
+// FILES rather than on the run — because a flake is a property of the file, and
+// the same file flaking on ten dispatches must converge on one issue somebody
+// can actually fix, not ten near-duplicates nobody triages.
+test("makeGateDeps files an off-diff flake as a per-FILE issue in the test lane, and a repeat converges on the same node", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-flake-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const deps = sporCli.makeGateDeps(cfg, {
+    record: { node_id: "task-p", cwd: home },
+    entry: { run_id: "run-abcdef12", node_id: "task-p", project: "demo" },
+    factory: { id: "factory-demo", testLaneProfile: "profile-test-writer" },
+    slug: "demo", passthrough: {}, warn: () => {}, log: () => {}, stopping: () => false, home,
+    dispatch: async () => ({ ok: false, reason: "never" }),
+  });
+  const call = { gate: { id: "acceptance" }, files: ["test/codex-dispatch.test.js"], command: "npm test", isolate: "node --test 'test/codex-dispatch.test.js'" };
+  const first = await deps.fileFlakeItem(call);
+  assert.strictEqual(first.ok, true, first.reason);
+  assert.match(first.id, /^issue-flake-test-codex-dispatch-test-js-[0-9a-f]{8}$/);
+  const md = fs.readFileSync(path.join(home, "nodes", `${first.id}.md`), "utf8");
+  assert.match(md, /^type: issue$/m, "a flaky test is a defect in the suite, not work the gated item owes");
+  assert.match(md, /^profile: profile-test-writer$/m, "routed to the lane that may touch tests");
+  assert.match(md, /- \{type: relates-to, to: factory-demo\}/);
+  assert.match(md, /- \{type: relates-to, to: profile-test-writer\}/);
+  assert.match(md, /`test\/codex-dispatch\.test\.js`/);
+  assert.match(md, /Re-running them alone on that same tree \(`node --test 'test\/codex-dispatch\.test\.js'`\) PASSED/);
+  // Nothing run-specific in it: the run, the item and the evidence live on the
+  // `art-gate-*` facts that point AT this issue, which is what makes a repeat
+  // an idempotent no-op instead of a colliding write.
+  assert.doesNotMatch(md, /run-abcdef12|task-p/);
+
+  // A second occurrence — a different run, a different item — is the same node.
+  const deps2 = sporCli.makeGateDeps(cfg, {
+    record: { node_id: "task-q", cwd: home },
+    entry: { run_id: "run-99999999", node_id: "task-q", project: "demo" },
+    factory: { id: "factory-demo", testLaneProfile: "profile-test-writer" },
+    slug: "demo", passthrough: {}, warn: () => {}, log: () => {}, stopping: () => false, home,
+    dispatch: async () => ({ ok: false, reason: "never" }),
+  });
+  const again = await deps2.fileFlakeItem(call);
+  assert.deepStrictEqual([again.ok, again.id, again.existing], [true, first.id, true], "one issue per flaky file, however many runs trip over it");
+  assert.strictEqual(fs.readdirSync(path.join(home, "nodes")).length, 1);
+
+  // A different file is a different flake.
+  const other = await deps.fileFlakeItem({ ...call, files: ["test/dispatch-runs.test.js"] });
+  assert.notStrictEqual(other.id, first.id);
+  assert.strictEqual(fs.readdirSync(path.join(home, "nodes")).length, 2);
+  fs.rmSync(home, { recursive: true, force: true });
 });

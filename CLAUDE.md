@@ -792,7 +792,26 @@ status`) refuse the gate, while untracked suite residue is ignored. A declared
 command on the SAME tree before a failure is charged — a flaky full suite then
 costs one more suite run, not a fix dispatch or a rescue — and a rerun-rescued
 pass keeps the first failure as evidence on its fact so flakes stay countable
-(`gates.rerunDecision`, task-spor-factory-spor-flaky-command-gate-needs-fix-cycle-or-rerun). **agent-review**
+(`gates.rerunDecision`, task-spor-factory-spor-flaky-command-gate-needs-fix-cycle-or-rerun).
+A declared `isolate` (a command template carrying a `{files}` token) adds the
+OFF-DIFF pass after those reruns
+(task-spor-factory-flake-rescue-should-not-burn-when-failure-is-off-diff): the
+runner reads the FILE PATHS the failure named — paths only, never a harness's
+result structure, so it stays harness-blind — and where the failure named at
+least one file of the judged tree and the change touches NONE of them, the
+failing TEST files (at most 5) are re-run alone on that same open tree under the
+same lease; passing there makes the whole-suite failure an off-diff FLAKE, so the
+gate PASSES and the flake is filed as its own convergent, per-FILE `issue-flake-*`
+(routed to the `test_lane_profile`, `relates-to` from every gate fact that ever
+tripped over it — the inbound edges are the occurrence count) rather than
+spending the item's fix cycles, its rescue lane and finally a person. Off-diff is
+a reason to LOOK, never to pass: a failure naming a file the change touches, or
+one that fails alone too, is charged as before, and the pass is never clean (the
+whole-suite failure rides the fact as evidence). Declaring nothing runs no extra
+command; what happens for EVERY command gate either way is that a charged failure
+records WHICH files it failed in (`gates.describeFailingFiles`), so flake
+telemetry aggregates by file instead of reading "`npm test` exited 1".
+**agent-review**
 dispatches a profile-routed (cross-model) review through the same `cmdDispatch`
 path, waits for its terminal state, and parses a fenced-JSON findings verdict in
 code — unreadable, undispatchable or report-less is a FAILURE, never a pass (so

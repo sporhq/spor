@@ -892,12 +892,68 @@ outside git (a database on a fixed port, a `db reset`):
   lease, when declared, is held across the reruns. The suite sees `SPOR_GATE_ATTEMPT`
   (1 for the declared run, N+1 for the Nth rerun) beside the rest of its
   environment.
+- **`isolate`** — a command template carrying a `{files}` token, e.g. `node
+  --test {files}`, and the gate's answer to a failure the change is
+  demonstrably not the cause of
+  (task-spor-factory-flake-rescue-should-not-burn-when-failure-is-off-diff).
+  After every declared rerun and before the failure is charged, the runner
+  reads the FILE PATHS the failure named and asks one question: does the
+  change touch any of them? If it named at least one file of the judged tree
+  and the diff touches NONE of them, the failing test files are re-run
+  through this template on that same prepared tree — and if they pass alone,
+  the whole-suite failure is an **off-diff flake**: the gate PASSES, and the
+  flake is filed as its own `issue-flake-*` node rather than spending the
+  item's fix cycles, its rescue lane and finally a person on work that was
+  never wrong. Bounded and conservative in every direction that matters:
+
+  - it reads paths and nothing else — no verdicts, no counts, no test names.
+    A harness's RESULT structure is the harness's (that is why
+    dec-spor-command-gate-bounded-same-tree-rerun dismissed "re-run what
+    failed"); a file path is printed the same way by all of them, and the
+    verdict still comes from the isolated run's own exit code;
+  - a failure that named no readable path, or named one the change touches,
+    is **not** off-diff and is charged exactly as before. So is one whose
+    isolated re-run fails too — off-diff is a reason to look, never to pass;
+  - only files a harness would recognize as TESTS are re-run (a `lib/` path
+    scraped out of a stack frame handed to `node --test` would exit 0 for
+    having no tests in it), and at most five of them: six files failing at
+    once is a breakage, not a load-sensitive flake;
+  - the isolated run happens inside the SAME prepared tree, before it is torn
+    down and under the same lease, so a pass means "these files pass HERE",
+    never "on some fresh checkout at the same sha". It sees
+    `SPOR_GATE_ISOLATE=1`;
+  - it is never a laundering step: the whole-suite failure rides the
+    `art-gate-*` fact as evidence, the outcome line names the flake, and the
+    fact carries a `relates-to` edge to the flake issue.
+
+  The flake issue is the one node a gate files whose id and body are keyed on
+  the failing FILES rather than on the run — a flake is a property of the
+  file, so the same file flaking on ten dispatches converges on ONE issue
+  (`if_exists: skip` remotely, identical-content adoption locally) instead of
+  ten near-duplicates. The occurrence count is that issue's inbound
+  `relates-to` edges from the gate facts, each of which carries the run, the
+  item and the evidence. It is routed to the factory's `test_lane_profile`,
+  because fixing a flaky test is a test change and must not come from the
+  implementer's lane. An id already occupied by DIFFERENT content — a person
+  has triaged the issue since — is linked, never rewritten and never reported
+  unfiled: for every other node a gate files an occupied id is a refusal
+  (adopting a stranger's approval item would pass a gate nobody looked at),
+  but this id is keyed on the failing files and on nothing else, so the
+  occupant is this flake's issue by construction.
+
+  Declaring nothing keeps the pre-existing behaviour exactly: with no
+  `isolate` the runner never runs an extra command. What it DOES do for every
+  command gate, declared or not, is put the failing file paths on the charged
+  failure's outcome — flake telemetry aggregatable by file, where before the
+  record said only that `npm test` exited 1.
 
 The suite's environment says what it is judging: `SPOR_GATE_BASE` and
 `SPOR_GATE_HEAD` (the shas), `SPOR_TRUSTED_REF`, `SPOR_GATE_STAGE` (`gate`,
 or `integration` for the candidate suite, where base/head are the target
 ref's tip and the candidate), and `SPOR_GATE_NODE`, beside `CI=1` and
 `SPOR_GATE=<id>` — enough for a script to diff and decide what to run.
+`SPOR_GATE_ISOLATE=1` is set only for an `isolate` re-run, so a suite that
+wants to skip its own setup for a single-file pass can tell the two apart.
 
 Step 3 is belt and braces — step 2 already refuses a branch that touched those
 paths — and that is the point: the guarantee that the suite is the trusted ref's

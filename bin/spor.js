@@ -10433,7 +10433,7 @@ const { gateIdSuffix, fenceSafe, capBytes: gateCapBytes, NODE_BODY_CAP_BYTES } =
 // (work.accept ready, dec-spor-work-accept-policy-configurable) would leave it
 // unworked forever. The consent the stamp records is real, just upstream: the
 // operator declared the lane's profile in the factory definition.
-function buildGateWorkNode({ id, title, summary, body, project, date, edges = [], requiresHuman = false, profile = null }) {
+function buildGateWorkNode({ id, type = "task", title, summary, body, project, date, edges = [], requiresHuman = false, profile = null }) {
   // The frontmatter parser is line-based: a title or summary carrying a newline
   // (a git message, a suite's first failing line) would truncate the node. Flatten
   // and cap both, the same discipline the dispatch report artifact keeps.
@@ -10444,7 +10444,7 @@ function buildGateWorkNode({ id, title, summary, body, project, date, edges = []
   const lines = [
     "---",
     `id: ${id}`,
-    "type: task",
+    `type: ${type}`,
     ...(project ? [`project: ${project}`] : []),
     `title: ${flat(title, 120)}`,
     `summary: ${flat(summary, 460)}`,
@@ -11564,7 +11564,11 @@ function makeGateDeps(
       return {
         ok: true,
         dir: tree.dir,
-        run: async (attempt = 1) => {
+        // `command` overrides the gate's declared one for THIS run only — the
+        // door the off-diff isolation pass uses (WORKERS.md §10.3 `isolate`)
+        // to re-run just the failing files on this same prepared tree. Absent,
+        // the run is the declared suite, byte-identical to before.
+        run: async (attempt = 1, command = null) => {
           // What the suite is judging, in its env (task-spor-gate-command-
           // change-env): a script can `git diff $SPOR_GATE_BASE..$SPOR_GATE_HEAD`
           // inside the tree and decide what to run, the way a CI job reads the
@@ -11579,8 +11583,11 @@ function makeGateDeps(
             // 1 for the declared run, N+1 for the Nth same-tree rerun — a
             // suite can log or tighten itself on a rerun.
             SPOR_GATE_ATTEMPT: String(attempt),
+            // Set only for the isolation run, so a suite that wants to skip its
+            // own setup for a single-file re-run can tell the two apart.
+            ...(command ? { SPOR_GATE_ISOLATE: "1" } : {}),
           };
-          return await runGateCommand(gate, tree.dir, { env });
+          return await runGateCommand(command ? { ...gate, command } : gate, tree.dir, { env });
         },
         // Called by the runner only after the LAST run has returned (its loop
         // awaits each run), never under a running suite.
@@ -11631,6 +11638,62 @@ function makeGateDeps(
           // dependency has to be readable by everyone, not just this box's
           // cooldown map.
           edges: [{ type: "blocks", to: entry.node_id }, ...(profile ? [{ type: "relates-to", to: profile }] : [])],
+        })
+      );
+    },
+    // The off-diff FLAKE report (task-spor-factory-flake-rescue-should-not-
+    // burn-when-failure-is-off-diff): a whole-suite failure in files the change
+    // never touched, which passed alone on the same tree. Filed as an ISSUE —
+    // a defect in the suite, not work the gated item owes — and routed to the
+    // same `test_lane_profile` the protected-path lane uses, because fixing a
+    // flaky test IS a test change and must not come from the implementer.
+    //
+    // Alone among the nodes a gate files, its id and its BODY are keyed on the
+    // failing FILES rather than on the run: a flake is a property of the file,
+    // and the same file flaking on ten dispatches must converge on ONE issue
+    // (writeGateNode's `if_exists: skip` remotely, and its identical-content
+    // adoption locally, both then read the repeat as a no-op) instead of ten
+    // near-duplicates nobody triages. The occurrence count is the inbound
+    // `relates-to` edges from the `art-gate-*` facts, which each carry the run,
+    // the item and the evidence — so nothing run-specific is lost by leaving
+    // it out here, and there is no per-run content to make the write diverge.
+    fileFlakeItem: async ({ gate, files, command, isolate }) => {
+      const list = (files || []).map(String);
+      const stem = list[0].replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase().slice(0, 34).replace(/-+$/, "") || "suite";
+      const id = `issue-flake-${stem}-${gateIdSuffix("flake", gate.id, slug || "", list.join("\n"))}`;
+      const profile = factory.testLaneProfile || null;
+      const body = [
+        `The \`${gate.id}\` command gate of factory \`${factory.id}\` failed its whole-suite run \`${command}\`,`,
+        "in file(s) the change under judgement did not touch:",
+        "",
+        list.map((f) => `- \`${f}\``).join("\n"),
+        "",
+        `Re-running them alone on that same tree (\`${isolate}\`) PASSED, so the failure was the suite's`,
+        "scheduling — load, ordering, a shared fixture — and not the change. The gate therefore passed the",
+        "item and filed this instead of spending its fix cycles, its rescue lane and finally a person on",
+        "work that was never wrong (WORKERS.md §10.3).",
+        "",
+        "Fix the flake in the file itself: make it independent of what else is running. Every `art-gate-*`",
+        "fact that relates to this issue is one occurrence — the inbound edges are the count, and each",
+        "carries the run, the item and the whole-suite failure it saw as evidence.",
+        ...(profile ? ["", `Test changes belong in the \`${profile}\` lane, not an implementer's branch.`] : []),
+      ].join("\n");
+      return writeGateNode(
+        cfg,
+        id,
+        buildGateWorkNode({
+          id,
+          type: "issue",
+          title: `Flaky under the ${gate.id} gate — ${list.join(", ")} fails the full suite and passes alone`,
+          summary: `${list.join(", ")} failed factory \`${factory.id}\`'s \`${gate.id}\` gate (\`${command}\`) and passed when re-run alone on the same tree — an off-diff flake, not a failure of any change under judgement.`,
+          body,
+          project: slug,
+          date: date(),
+          profile,
+          edges: [
+            ...(factory.id ? [{ type: "relates-to", to: factory.id }] : []),
+            ...(profile ? [{ type: "relates-to", to: profile }] : []),
+          ],
         })
       );
     },

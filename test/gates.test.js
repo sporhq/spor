@@ -883,3 +883,99 @@ test("an unanswered prior finding keeps its rows, is not folded as answered, and
   assert.deepStrictEqual([confirmed.findings[0].answered, confirmed.findings[0].rows, confirmed.findings[0].earlierRows], [true, [], ["the empty list", "the one-element list"]]);
   assert.deepStrictEqual(gates.rowByRowFindings(confirmed.findings, 3).map((x) => x.id), ["F1"]);
 });
+
+// --- the off-diff flake pass (task-spor-factory-flake-rescue-should-not-burn-
+// when-failure-is-off-diff) ---
+//
+// The properties worth pinning are the ones that keep this from laundering a
+// real failure into a flake: it reads PATHS and nothing else, it only ever
+// finds FEWER files when it is unsure, and "off-diff" is a claim it refuses to
+// make unless it read at least one file and the change touches none of them.
+
+test("failingFiles reads the repo-relative source paths a suite's failure names, and drops everything outside the judged tree", () => {
+  const out = [
+    "\u001b[31m\u2716 the launch handshake (40001.2ms)\u001b[0m",
+    "  AssertionError [ERR_ASSERTION]: the record was never written",
+    "      at TestContext.<anonymous> (/tmp/gate-tree/test/codex-dispatch.test.js:120:5)",
+    "      at node:internal/test_runner/test:1050:5",
+    "      at Module._compile (/tmp/gate-tree/node_modules/foo/index.js:3:1)",
+    "\u2716 failing tests:",
+    "test/codex-dispatch.test.js:118:1",
+    "./lib/shell/dispatch.js reported it",
+    "https://example.com/some/page.js",
+    "ℹ pass 1022",
+  ].join("\n");
+  assert.deepStrictEqual(gates.failingFiles(out, { dir: "/tmp/gate-tree" }), [
+    "test/codex-dispatch.test.js",
+    "lib/shell/dispatch.js",
+  ], "the absolute frame folds onto the relative one, node_modules and an internal frame are dropped, and ./ is normalized");
+  // A URL survives ONLY because it has no tree to be outside of; with the root
+  // known it is absolute-and-elsewhere, which is exactly the drop rule.
+  assert.ok(!gates.failingFiles(out, { dir: "/tmp/gate-tree" }).some((f) => f.includes("example.com")));
+  // With no root, every absolute path is unresolvable and dropped — the
+  // direction that finds fewer files, so the caller cannot claim off-diff on
+  // paths it could not place.
+  assert.deepStrictEqual(gates.failingFiles(out), ["test/codex-dispatch.test.js", "lib/shell/dispatch.js"]);
+  assert.deepStrictEqual(gates.failingFiles(""), []);
+  assert.deepStrictEqual(gates.failingFiles("npm test exited 1\nFailed tasks: server:test"), [], "an exit-code-only failure names nothing");
+  assert.strictEqual(gates.failingFiles(Array.from({ length: 200 }, (_, i) => `test/f${i}.test.js:1:1`).join("\n")).length, 20, "bounded");
+});
+
+test("offDiffFailure claims off-diff only when it read a file AND the change touches none of them", () => {
+  const off = gates.offDiffFailure(["test/codex-dispatch.test.js"], ["lib/kernel/queue.js", "API.md"]);
+  assert.deepStrictEqual([off.offDiff, off.onDiff], [true, []]);
+  const on = gates.offDiffFailure(["test/queue.test.js", "lib/kernel/queue.js"], ["lib/kernel/queue.js"]);
+  assert.deepStrictEqual([on.offDiff, on.onDiff], [false, ["lib/kernel/queue.js"]], "one touched file is enough to make the whole failure the change's to answer for");
+  assert.strictEqual(gates.offDiffFailure([], ["lib/x.js"]).offDiff, false, "a failure that named nothing is never off-diff");
+  assert.strictEqual(gates.offDiffFailure(null, null).offDiff, false);
+  assert.strictEqual(gates.offDiffFailure(["test\\win.test.js"], ["test/win.test.js"]).offDiff, false, "separators are normalized before the comparison");
+});
+
+test("isolatableTests takes TEST files only, and only while there are few enough of them for 'flake' to be the likelier reading", () => {
+  assert.deepStrictEqual(gates.isolatableTests(["test/a.test.js", "lib/kernel/queue.js", "spec/b_spec.rb", "tests/test_c.py"]), ["test/a.test.js", "spec/b_spec.rb", "tests/test_c.py"], "a lib path scraped from a stack frame is never handed to a test runner (where a file with no tests in it exits 0)");
+  assert.deepStrictEqual(gates.isolatableTests(["lib/a.js", "lib/b.js"]), []);
+  assert.deepStrictEqual(gates.isolatableTests(Array.from({ length: 6 }, (_, i) => `test/f${i}.test.js`)), [], "six files failing at once is a breakage, not a flake");
+  assert.strictEqual(gates.isolatableTests(Array.from({ length: 6 }, (_, i) => `test/f${i}.test.js`), { max: 6 }).length, 6);
+});
+
+test("isolateCommand fills the declared {files} token, and refuses a template or a file set that cannot make one", () => {
+  assert.strictEqual(gates.isolateCommand({ isolate: "node --test {files}" }, ["test/a.test.js", "test/b.test.js"]), "node --test 'test/a.test.js' 'test/b.test.js'");
+  assert.strictEqual(gates.isolateCommand({ isolate: "npx jest {files} --ci" }, ["a.test.js"]), "npx jest 'a.test.js' --ci");
+  assert.strictEqual(gates.isolateCommand({ isolate: "node --test {files}" }, []), "");
+  assert.strictEqual(gates.isolateCommand({ isolate: "npm test" }, ["a.test.js"]), "", "a template with no token has nowhere to put them");
+  assert.strictEqual(gates.isolateCommand({}, ["a.test.js"]), "");
+  assert.strictEqual(gates.isolateCommand({ isolate: "t {files}" }, ["it's.test.js"]), "t 'it'\\''s.test.js'", "single-quoted regardless of what the extractor's character class already guarantees");
+});
+
+test("a command gate's `isolate` must carry a {files} token, and a factory that gets it wrong refuses to start", () => {
+  const ok = gates.parseFactory(factoryBody({ ...INLINE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: " node --test {files} " }] }), { id: "factory-demo" });
+  assert.deepStrictEqual(ok.errors, []);
+  assert.strictEqual(ok.factory.gates[0].isolate, "node --test {files}");
+  const bad = gates.parseFactory(factoryBody({ ...INLINE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test" }] }), { id: "factory-demo" });
+  assert.match(bad.errors.join("\n"), /must carry a \{files\} token/);
+  assert.strictEqual(bad.factory, null);
+  // Declaring nothing is the default posture: no template, and the runner's
+  // isolation pass is gated on it, so an existing factory is unchanged.
+  const bare = gates.parseFactory(factoryBody({ ...INLINE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] }), { id: "factory-demo" });
+  assert.strictEqual(bare.factory.gates[0].isolate, "");
+});
+
+test("describeFailingFiles is the per-file telemetry a charged failure carries, and says nothing when it read nothing", () => {
+  const off = gates.offDiffFailure(["test/a.test.js"], ["lib/x.js"]);
+  assert.match(gates.describeFailingFiles(off), /names 1 file\(s\) — test\/a\.test\.js — none of which the change touches/);
+  assert.match(gates.describeFailingFiles(off, { ok: false, files: ["test/a.test.js"], reason: "exited 1" }), /re-running test\/a\.test\.js on its own \(exited 1\) failed too/);
+  assert.strictEqual(gates.describeFailingFiles(off, { ok: true, files: ["test/a.test.js"] }).includes("failed too"), false, "an isolated PASS is a flake, never a charged failure");
+  const on = gates.offDiffFailure(["lib/x.js"], ["lib/x.js"]);
+  assert.match(gates.describeFailingFiles(on), /1 of which the change touches \(lib\/x\.js\)/);
+  assert.strictEqual(gates.describeFailingFiles(gates.offDiffFailure([], [])), "");
+  assert.strictEqual(gates.describeFailingFiles(null), "");
+});
+
+test("describeFlake says what failed, that the change does not touch it, that it passed alone — and where the flake was filed", () => {
+  const d = gates.describeFlake("npm test", "node --test 'test/a.test.js'", ["test/a.test.js"], "issue-flake-test-a-test-js-abcd1234");
+  assert.match(d, /`npm test` failed on test\/a\.test\.js, which the change does not touch/);
+  assert.match(d, /passed on the same tree/);
+  assert.match(d, /not a failure of the change/);
+  assert.match(d, /filed as issue-flake-test-a-test-js-abcd1234/);
+  assert.doesNotMatch(gates.describeFlake("npm test", "x", ["test/a.test.js"]), /filed as/);
+});
