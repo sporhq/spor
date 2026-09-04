@@ -3200,6 +3200,32 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.match(p1, /omits any prior finding \(neither cleared nor confirmed\) is UNREADABLE/);
   assert.match(p1, /## Durable retry\/debt flags — review the mechanism WHOLE/);
   assert.match(p1, /walk the table again against the writes the fix added or reordered: a row the fix\nINTRODUCED is blocking \(`introduced_by_fix: true`\)/);
+  // task-spor-review-gate-carried-finding-names-the-mechanism-not-the-next-
+  // row: every prior finding is asked for the mechanism's rows; the REQUIRED
+  // form only arms once a finding has been carried two fix cycles.
+  assert.match(p1, /### A carried finding names the MECHANISM, not the next row/);
+  assert.match(p1, /"rows": \["each remaining row of the mechanism, when open"\]/);
+  assert.doesNotMatch(p1, /already been carried through/, "a finding without an opened cycle is not a second carry");
+
+  // Review 3: F1 has survived two fixes — the prompt says so, replays the
+  // rows the last review enumerated, and makes `rows` required for it.
+  const third = await deps.review({
+    gate, cycle: 2,
+    prior: [
+      { id: "F1", severity: "blocking", file: "x.js", summary: "off by one", evidence: "node -e 'f(1)' prints 2", opened: 0, rows: ["the empty list"], rowsCycle: 1 },
+      { id: "F4", severity: "blocking", file: "y.js", summary: "new", opened: 1 },
+      // F5: the last review confirmed it open WITHOUT rows; the enumeration
+      // an earlier review made is replayed as history, never as current.
+      { id: "F5", severity: "blocking", file: "z.js", summary: "stale", evidence: "node -e 'g()' throws", opened: 0, rows: [], earlierRows: ["row one", "row two"], earlierRowsCycle: 1 },
+    ],
+    fix: { cycle: 1, runId: "fix-run-2", fromHead: head0, toHead: head1, findings: [{ id: "F1", blocking: true }] },
+  });
+  assert.strictEqual(third.ok, true, third.reason);
+  const p2 = launches[2].prompt;
+  assert.match(p2, /F1 \[blocking, carried 2 fix cycles\] x\.js — off by one\n    evidence: [^\n]*\n    row \(enumerated by the last review, cycle 1\): the empty list/);
+  assert.match(p2, /F4 \[blocking, carried 1 fix cycle\] y\.js — new/);
+  assert.match(p2, /F5 \[blocking, carried 2 fix cycles\] z\.js — stale\n    evidence: [^\n]*\n    row \(enumerated at cycle 1, NOT re-confirmed by the last review — re-enumerate if it still stands\): row one\n    row \(enumerated at cycle 1, NOT re-confirmed by the last review — re-enumerate if it still stands\): row two/);
+  assert.match(p2, /F1, F5 have already been carried through 2 or more fix cycles: if you confirm any of them open, `rows`\nis REQUIRED — a confirmation naming fewer than two rows is recorded as row-by-row/);
 
   // And the fix prompt names the findings by id, splits advisory from blocking,
   // and lists what earlier cycles already resolved.
@@ -3237,6 +3263,25 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.match(fixLaunch.prompt, /naming the finding ids you addressed in the commit message/);
   // …and hands the fixer the same durable-debt table the reviewer walks.
   assert.match(fixLaunch.prompt, /If the fix touches a durable retry\/debt flag[\s\S]*say how each is handled in the commit message[\s\S]*\(a\) the flag write itself fails[\s\S]*\(d\) a stale flag against already-settled state/);
+  assert.doesNotMatch(fixLaunch.prompt, /Carried findings — close the MECHANISM/, "nothing here has survived a fix cycle yet");
+
+  // A fix cycle for a finding that already survived one: the fixer is told
+  // how long it has been carried, shown the rows the review enumerated (and
+  // the row-by-row tag when it named only the next), and asked to enumerate
+  // the rows itself and say in the commit which the fix closes and leaves.
+  fixLaunch = null;
+  await fixDeps.fix({
+    gate, cycle: 2, detail: "the review requested changes — 2 blocking finding(s)",
+    findings: [
+      { id: "F2", severity: "blocking", file: "x.js", summary: "still over-reads on empty input", blocking: true, evidence: "node -e ...", origin: "prior", status: "open", opened: 0, rowByRow: true, rows: ["the empty list"] },
+      { id: "F4", severity: "blocking", file: "x.js", summary: "the reader drops the last item", blocking: true, evidence: "node -e ...", origin: "prior", status: "open", opened: 1, rows: ["a one-item list", "a list ending in a separator"] },
+    ],
+    ledger: [],
+  });
+  assert.ok(fixLaunch, "the fix cycle was dispatched");
+  assert.match(fixLaunch.prompt, /Blocking findings — fix each, by id:\nF2 \[blocking, row-by-row\] x\.js — still over-reads on empty input\n    row: the empty list\nF4 \[blocking\] x\.js — the reader drops the last item\n    row: a one-item list\n    row: a list ending in a separator/);
+  assert.match(fixLaunch.prompt, /Carried findings — close the MECHANISM, not the next row:\nF2 has survived 2 fix cycles and the review named only the next row \(row-by-row\)\nF4 has survived 1 fix cycle\n/);
+  assert.match(fixLaunch.prompt, /enumerate the mechanism's rows yourself[\s\S]*state in the commit message which rows\nthe fix closes and which it deliberately leaves and why/);
 });
 
 // --- the dirty-tree round-trip (task-spor-worker-declined-outcome) --------

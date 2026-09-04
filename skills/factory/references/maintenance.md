@@ -103,6 +103,12 @@ last, so a gate-passed item that never landed failed *after* every gate:
   `cycles`, or sharpen the item); a ledger full of `advisory` entries the
   reviewer rated blocking without `evidence` is a reviewer that reads code
   instead of running it — sharpen `instructions` to demand the reproduction.
+  A finding whose `[blocking, row-by-row]` tag appears on the fact was carried
+  two or more fix cycles and confirmed open without the mechanism's rows
+  enumerated (each cycle closed the one case the review probed, and the
+  review named the next): that is neither side's fault alone, but the fix
+  it needs is one that closes the mechanism — read the `row:` lines under
+  the finding, list the rest yourself, and dispatch one fix for all of them.
 
 ## "The reviews are too strict"
 
