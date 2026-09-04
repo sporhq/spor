@@ -1073,7 +1073,12 @@ review made), and the earlier list moves to `earlierRows`, stamped with the
 cycle it was enumerated at (`earlierRowsCycle`), replayed to the reviewer, the
 fixer and the fact as history ("enumerated at cycle N, not re-confirmed") —
 never as the current mechanism enumeration. A fresh enumeration supersedes it
-(`gates.carriedRowsOf`). The fix-cycle prompt hands
+(`gates.carriedRowsOf`). Only a CONFIRMATION does any of this: a prior finding
+the review did not answer at all (ignored under rule 3, or in a verdict that
+could not be read) is carried exactly as it stood — its last enumeration stays
+current, its ledger entry is not folded (not recorded as answered this cycle),
+and it is never tagged row-by-row, since it was not confirmed row-by-row but
+not confirmed at all (`answered: false` on the carried finding). The fix-cycle prompt hands
 the fixer the same list under the finding, says how many cycles it has
 survived, and asks it to enumerate the rows ITSELF — whether or not the
 review listed them — and to state in the commit message which rows the fix
