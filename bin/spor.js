@@ -4466,7 +4466,10 @@ async function cmdAuthLogin(cfg, args) {
 
   // Default to the hosted Spor front door when no server is named — onboarding
   // parity with `spor join <token>` (task-spor-api-cli-default-server-base).
-  const server = auth.normServer(serverFlag || cfg.server() || DEFAULT_SERVER);
+  // serverForNewTenant(), not server(): `--org <new>` is legitimate here (it
+  // names the org this login will ESTABLISH), and it leaves server() empty
+  // (issue-spor-cli-unrecognized-org-fallback).
+  const server = auth.normServer(serverFlag || cfg.serverForNewTenant() || DEFAULT_SERVER);
   if (all) {
     out("note: --all (one token per org in a single leg) needs the front-door membership");
     out("      endpoint (task-spor-frontdoor-org-membership-enumeration), not yet shipped —");
@@ -15635,6 +15638,15 @@ function renderCmdHelp(verb) {
 // resolution), lifted out of the per-verb argv so the strict parser never sees
 // it. No existing verb uses --org, so this is safe to strip everywhere; the auth
 // verbs read it back via Config.flagOrg().
+//
+// `org` distinguishes THREE states, not two: null = the flag was never typed;
+// a non-empty string = the tenant asserted; and "" = the flag was typed with an
+// EMPTY or MISSING value, which is malformed input and must refuse rather than
+// read as "no selector" (a shell's unset `$ORG` produces both spellings —
+// quoted it arrives as `--org ""`, unquoted the word vanishes and `--org` is
+// left dangling before the next flag or the end of argv). Collapsing either
+// into null resolved the command against whatever tenant happened to be active
+// (issue-spor-cli-unrecognized-org-fallback).
 function extractOrgFlag(argv) {
   const rest = [];
   let org = null;
@@ -15644,6 +15656,8 @@ function extractOrgFlag(argv) {
       if (argv[i + 1] != null && !argv[i + 1].startsWith("--")) {
         org = argv[i + 1];
         i++;
+      } else {
+        org = ""; // dangling `--org` — a value was intended and did not arrive
       }
       continue;
     }
@@ -15657,11 +15671,62 @@ function extractOrgFlag(argv) {
   return { org, rest };
 }
 
+// The ONE exemption from the unknown-`--org` refusal below: an invocation whose
+// whole job is to ACQUIRE a credential for an org you do not have one for yet —
+// `spor login`, `spor join`, `spor auth login`. Naming an unstored org is what
+// those are FOR, and they are where you go to fix the refusal.
+//
+// The exemption is per-INVOCATION, not per-verb: `auth` is a raw sub-dispatcher,
+// and exempting the whole namespace let every other subcommand keep the exact
+// wrong-tenant behavior the refusal exists to stop — `spor auth logout --org
+// dartlane` had the flag lifted out of argv, skipped the refusal because the
+// canonical verb was `auth`, and then cleared the ACTIVE tenant, destroying a
+// credential for an org the operator never named. `auth whoami`/`list`/`switch`
+// answered about (or re-pointed) the active tenant just as silently. The
+// subcommand is read as `args[0]` — the same expression `cmdAuth` dispatches on,
+// so the two cannot drift.
+function isCredentialAcquisition(canon, args) {
+  if (canon === "join" || canon === "login") return true;
+  return canon === "auth" && args[0] === "login";
+}
+
+// A global `--org` the cascade REFUSED to resolve must refuse the COMMAND, not
+// quietly run it against the active tenant: a read then answers from the wrong
+// graph, and a write LANDS in it while the operator believes they are scoped
+// elsewhere (issue-spor-cli-unrecognized-org-fallback). lib/config.js already
+// declines to fall through — it reports the refusal instead of resolving a
+// tenant — so all that is left here is to say so and exit non-zero rather than
+// running the verb in the local mode that null tenant resolves to.
+//
+// Two refusal kinds, and only ONE of them is exemptible. `unknown-org` names a
+// real org that this box has no credential for, which an acquisition verb can
+// legitimately act on. `empty-org` is MALFORMED INPUT — no org was named at all
+// — and nothing can act on it: `spor auth login --org ""` cannot acquire a
+// credential for the empty string any more than `spor get x --org ""` can read
+// one, so it refuses everywhere, acquisition included.
+function refuseUnknownOrg(cfg, canon, args = []) {
+  const te = cfg.tenantError();
+  if (!te) return false;
+  if (te.kind === "empty-org") {
+    err(`spor: --org was given an empty value — refusing to fall back to whichever tenant is active.`);
+    err(`  an empty selector is malformed input (typically an unset shell variable), not "use the default".`);
+    err(te.orgs.length ? `  stored orgs: ${te.orgs.join(", ")}` : "  the credential store is empty");
+    return true;
+  }
+  if (te.kind !== "unknown-org" || isCredentialAcquisition(canon, args)) return false;
+  err(`spor: no credential stored for org '${te.org}' — refusing to run against a different tenant.`);
+  err(te.orgs.length ? `  stored orgs: ${te.orgs.join(", ")}` : "  the credential store is empty");
+  err(`  run 'spor auth login --org ${te.org}' to add one, or 'spor auth list' to see them.`);
+  return true;
+}
+
 async function main() {
   const { org: cliOrg, rest: argv } = extractOrgFlag(process.argv.slice(2));
   const verb = argv.shift();
   const args = argv;
-  const cfg = loadConfig({ cwd: process.cwd(), cli: cliOrg ? { org: cliOrg } : undefined });
+  // `!== null`, not truthiness: an EMPTY `--org` must reach the cascade as an
+  // asserted-but-unusable selector so it refuses, not be dropped as "unset".
+  const cfg = loadConfig({ cwd: process.cwd(), cli: cliOrg !== null ? { org: cliOrg } : undefined });
 
   // Top-level help / version are intercepted before table dispatch. `spor help
   // <command>` prints that command's detailed page.
@@ -15688,6 +15753,10 @@ async function main() {
     return 0;
   }
 
+  // Checked after help/version (asking what a verb does needs no tenant) and
+  // before any verb runs, so an unknown `--org` can neither read nor write.
+  if (refuseUnknownOrg(cfg, canon, args)) return 1;
+
   if (entry.parse === "raw") return await entry.run(cfg, args, verb);
 
   // strict: util.parseArgs is the parser; a parse failure is a friendly error.
@@ -15703,7 +15772,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
+module.exports = { extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
 
 if (require.main === module) {
   main()
