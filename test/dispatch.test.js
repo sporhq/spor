@@ -14,7 +14,7 @@ const path = require("node:path");
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const u = require(path.join(__dirname, "..", "scripts", "engines", "util.js"));
-const { pathWithOnlyGit, writeSpawnableNodeStub } = require("./helpers/portable");
+const { pathWithOnlyGitAndNode, writeSpawnableNodeStub } = require("./helpers/portable");
 
 // Env with no SPOR_*/SUBSTRATE_* leakage; force LOCAL mode (no server). Also
 // isolate the config-cascade homes to an empty temp dir so the developer's real
@@ -1228,7 +1228,14 @@ require("node:fs").writeFileSync(process.env.LAUNCH_MARK, "launched\\n");
 // available here" assertion) + ~/.claude plugins/skills. Merge into a test's env.
 function cleanProbeEnv() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-cleanhome-"));
-  return { HOME: home, PATH: pathWithOnlyGit() };
+  // pathWithOnlyGitAndNode, not pathWithOnlyGit: the harness binaries must stay
+  // hidden from resolution, but a `#!/usr/bin/env node` stub launcher still has
+  // to execute. On a dev box node usually sits beside git in /usr/bin so a
+  // git-only PATH resolves the shebang anyway; on the CI runner node lives in
+  // hostedtoolcache, the detached stub dies instantly, and a launch that DID
+  // happen reads as one that never did (issue-spor-dispatch-test-ci-node-shebang-path
+  // fixed the opencode twin and missed this one).
+  return { HOME: home, PATH: pathWithOnlyGitAndNode() };
 }
 
 test("dispatch --profile: refuses when this machine can't satisfy it; nothing launches, assignment untouched", () => {

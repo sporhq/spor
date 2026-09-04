@@ -99,7 +99,9 @@ test("directive: instructs blocks edges for a multi-node cohort", () => {
 // other repo while our own copy silently rots. Only the directive is compared:
 // the tools line above it varies with whether a server is configured.
 test("directive: this repo's committed AGENTS.md carries the packaged wording", () => {
-  const md = fs.readFileSync(path.join(__dirname, "..", "AGENTS.md"), "utf8");
+  // Normalize CRLF: on a Windows checkout git rewrites the committed file's
+  // line endings, and this test is about the WORDING, not the encoding.
+  const md = fs.readFileSync(path.join(__dirname, "..", "AGENTS.md"), "utf8").replace(/\r\n/g, "\n");
   assert.ok(md.includes(DIRECTIVE), "run `spor agents-md` and commit the result");
 });
 
