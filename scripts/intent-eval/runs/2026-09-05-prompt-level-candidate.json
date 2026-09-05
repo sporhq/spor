@@ -1,6 +1,7 @@
 {
-  "label": "recalibrated @ HEAD 2026-09-05",
+  "label": "prompt-level candidate @ 2026-09-05",
   "tplSha": "c724fed604ec",
+  "binding": "bound",
   "score": {
     "n": 77,
     "firedW": 59,
@@ -43,6 +44,11 @@
       "value": 0,
       "pass": true
     },
+    "binding": {
+      "metric": "decisions not bound to prompt",
+      "value": 0,
+      "pass": true
+    },
     "warranted": {
       "metric": "warranted suppressed",
       "value": 0.06779661016949153,
@@ -71,14 +77,5 @@
       "f1": 0.8661417322834646
     }
   },
-  "spend": {
-    "calls": 77,
-    "failures": 0,
-    "costTotal": 5.305990499999999,
-    "costMean": 0.06890896753246752,
-    "latencyMedian": 18410,
-    "latencyP90": 27547,
-    "inputTokensMean": 10,
-    "outputTokensMean": 728.7402597402597
-  }
+  "spend": null
 }

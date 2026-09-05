@@ -20,6 +20,18 @@ harness that produced those numbers then lived in a scratchpad, so the next
 person to touch the prompt had nothing to re-score against
 (`task-spor-recalibrate-digest-intent-prompt`). This is that harness, committed.
 
+> **Verdict: the gate FAILS, and no prompt revision has scored inside budget.**
+> Every scored row below is a FAIL, `gateVerdict` returns `pass: false`,
+> `--strict` exits 1, and both committed `runs/*.json` record `gate.pass:
+> false`. What the current prompt *does* clear is the hard HARM rule — 0 of 29
+> good digests lost — which is a different and much narrower claim; quoting it
+> as "the gate is met" is the overclaim this file exists to stop making. (It was
+> made: the harness's first commit message, `f80e23b`, says "the calibration
+> gate is met". That is superseded by `53c00bb`, by this file, and — so that
+> prose cannot drift back — by `test/intent-metrics.test.js`, which asserts
+> `gate.pass === false` against the committed run artifacts and re-derives the
+> verdict from their recorded scores.)
+
 **The gate is not met, and the second measurement is why that is now a
 conclusion rather than a caveat.** A materially different prompt — the
 retrieval-judging rules swapped out for prompt-judging ones
@@ -41,7 +53,8 @@ takes `--labels` from).
 node scripts/intent-eval/run.js --labels ~/repos/spor-server/evals/digest-intent-2026-07-06
 
 # a candidate prompt: a template file (candidates/ holds the ones already scored)
-node scripts/intent-eval/run.js --labels <dir> --template candidates/<file>.md --label candidate
+node scripts/intent-eval/run.js --labels <dir> \
+  --template scripts/intent-eval/candidates/2026-09-05-prompt-level.md --label candidate
 
 # or a whole other checkout of this repo
 node scripts/intent-eval/run.js --labels <dir> --engine-root <other-checkout> --label candidate
@@ -54,6 +67,13 @@ node scripts/intent-eval/run.js --labels <dir> --cmd 'scripts/distill-gemini.sh'
 
 # re-score a recorded run — no backend calls, so every number below is re-derivable
 node scripts/intent-eval/run.js --labels <dir> --replay scripts/intent-eval/runs/2026-09-05-shipped-haiku.jsonl
+
+# a replay of a CANDIDATE's run must name that candidate: the records carry the
+# template sha they were produced under, and replaying them against a different
+# prompt is refused rather than scored under the wrong prompt's name
+node scripts/intent-eval/run.js --labels <dir> \
+  --template scripts/intent-eval/candidates/2026-09-05-prompt-level.md \
+  --replay scripts/intent-eval/runs/2026-09-05-prompt-level-candidate.jsonl
 ```
 
 A live run is 77 backend calls (~3min at `--concurrency 8`); `--out` preserves
@@ -89,6 +109,30 @@ way it happens:
   suppressions. `--limit 1` was otherwise a spotless PASS. Sub-population runs
   are still useful — they are how you iterate on a prompt — they just cannot
   certify one.
+
+### …and a measurement of one prompt must never be reported as another's
+
+A replay reads its decisions from a file while the template is resolved
+*separately*, from `--template` or the checkout. Nothing joined the two, so
+`--template <candidate> --replay <shipped>.jsonl` scored the shipped prompt's
+answers and printed the candidate's filename and sha over them — a real number
+attributed to an innocent file, and the report is exactly what gets quoted as
+"prompt X scores Y".
+
+Every record now carries the `template_sha` its decision was produced under, so
+the join exists and is checked:
+
+- **a different prompt** — refused, exit 2, naming both shas. A disagreement is
+  not a bad score, it is an unanswerable question.
+- **two prompts spliced into one file** — refused the same way. A run is of one
+  prompt.
+- **no sha at all** (a record predating stamping) — *scored*, because
+  reproducing an old run is useful, but it is bound to no prompt and so cannot
+  certify one: gate criterion `decisions not bound to prompt`, rule 0.
+
+The two committed runs carry the sha their own `--json` summary recorded, and
+`test/intent-metrics.test.js` asserts each record file binds to its summary's
+`tplSha`.
 
 ## Method
 
@@ -128,11 +172,13 @@ dropping them silently.
 3. **noise removed** — what the gate buys. A classifier that suppresses nothing
    passes 1 and 2 trivially and is worth no backend call.
 
-Plus two criteria that are about the RUN rather than the classifier — **cases
-with no verdict** and **population cases not scored**, both rule 0. See
+Plus three criteria that are about the RUN rather than the classifier — **cases
+with no verdict**, **population cases not scored** and **decisions not bound to
+prompt**, all rule 0. See
 ["A run that measured nothing"](#a-run-that-measured-nothing-must-never-read-as-a-passing-one)
 above: every way of not obtaining a decision subtracts from both harm metrics,
-so a run carrying any of them fails the gate outright however good it looks.
+so a run carrying any of them fails the gate outright however good it looks —
+and a decision not tied to the prompt being reported certifies no prompt at all.
 
 The full-population fire table (all 129 judged user-prompt cases, fired and not)
 is the basis the min-sim sweep reported on, so `engine+classifier` is directly
@@ -145,7 +191,7 @@ comparable to it and to the current always-inject engine.
 | shipped 2026-07-06 (pre-recalibration) | **12/29 (41%)** | 30/59 (51%) | 18/18 (100%) | 0.604 | **FAIL** |
 | recalibrated, 2026-07-06 run | 0/29 (0%) | 4/59 (6.8%) | 12/18 (67%) | 0.859 | FAIL (budget) |
 | **shipped @ 2026-09-05** (`runs/2026-09-05-shipped-haiku.jsonl`, tpl `23c700dcc195`) | **0/29 (0%)** | 4/59 (6.8%) | 14/18 (78%) | **0.873** | FAIL (budget) |
-| prompt-level candidate @ 2026-09-05 (`candidates/2026-09-05-prompt-level.md`, tpl `c724fed604ec`) | 0/29 (0%) | 4/59 (6.8%) | 13/18 (72%) | 0.866 | FAIL (budget) |
+| prompt-level candidate @ 2026-09-05 (`runs/2026-09-05-prompt-level-candidate.jsonl`, `candidates/2026-09-05-prompt-level.md`, tpl `c724fed604ec`) | 0/29 (0%) | 4/59 (6.8%) | 13/18 (72%) | 0.866 | FAIL (budget) |
 | current engine (always inject on fire) | 0 | 0 | 0/62 (0%) | 0.819 | n/a |
 | min-sim 0.08 sweep | — | — | — | 0.732 | n/a |
 | no-LLM intent regex | — | — | — | 0.596 | n/a |
@@ -153,7 +199,8 @@ comparable to it and to the current always-inject engine.
 **The shipped prompt does not pass this gate**, and neither does the candidate
 built to. 4/59 = 6.78% against a 6.00% budget is OVER, `gateVerdict` returns
 `pass: false`, and `--strict` exits 1 — including on both committed
-`runs/2026-09-05-*.json`, whose recorded `gate.pass` is `false`. What they *do*
+`runs/2026-09-05-*.json`, whose recorded `gate.pass` is `false` and is asserted
+to be by `test/intent-metrics.test.js`. What they *do*
 pass is the criterion the asymmetry is drawn on: 0 of 29 good digests lost.
 Those are different claims and the second is not the first.
 

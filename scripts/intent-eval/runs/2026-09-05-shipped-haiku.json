@@ -1,6 +1,7 @@
 {
   "label": "shipped @ HEAD 2026-09-05",
   "tplSha": "23c700dcc195",
+  "binding": "bound",
   "score": {
     "n": 77,
     "firedW": 59,
@@ -16,8 +17,8 @@
       "2c9eea3d80e6"
     ],
     "suppressedU": 14,
-    "errored": 0,
-    "erroredIds": [],
+    "noVerdict": 0,
+    "noVerdictIds": [],
     "warrantedSuppression": 0.06779661016949153,
     "goodLoss": 0,
     "noiseRemoved": 0.7777777777777778,
@@ -35,6 +36,16 @@
     },
     "integrity": {
       "metric": "cases with no verdict",
+      "value": 0,
+      "pass": true
+    },
+    "coverage": {
+      "metric": "population cases not scored",
+      "value": 0,
+      "pass": true
+    },
+    "binding": {
+      "metric": "decisions not bound to prompt",
       "value": 0,
       "pass": true
     },

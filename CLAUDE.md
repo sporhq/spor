@@ -381,7 +381,13 @@ doesn't COVER the population is refused, `cases with no verdict` counts a case
 as measured only when it carries one of the two decision words (the classifier
 fails SILENTLY to `null` with no error field, so counting error strings
 certified 77 dead backend calls as a spotless PASS), and `population cases not
-scored` refuses to certify a `--limit`/`--only` sub-population. The corpus stays
+scored` refuses to certify a `--limit`/`--only` sub-population. A measurement of
+one prompt must equally never be reported as ANOTHER's: a replay reads decisions
+from a file while the template resolves separately from `--template`/the
+checkout, so every record carries the `template_sha` it was produced under —
+a replay naming a different template (or splicing two) is REFUSED, and one
+carrying no sha at all is scored but fails the fourth rule-0 guard, `decisions
+not bound to prompt`. The corpus stays
 in the private server repo.
 Default-on is STILL deferred, now on three things: the budget criterion itself
 (over, twice-measured — a bigger judged set settles it and an assertion does

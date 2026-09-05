@@ -23,11 +23,13 @@
 // neither, a case absent from a replay file, a population narrowed by --limit —
 // scores as an inject and moves them TOWARD passing. A run that measured
 // nothing is therefore indistinguishable, on 1 and 2 alone, from a perfectly
-// calibrated one. That is why the gate carries two further INTEGRITY criteria —
-// every scored case carries a DECISION (`noVerdict === 0`) and the scored set
-// is the whole population (`uncovered === 0`) — and why run.js refuses a replay
-// that does not cover the population: an unmeasured case must never read as a
-// passing one.
+// calibrated one. That is why the gate carries three further INTEGRITY criteria
+// — every scored case carries a DECISION (`noVerdict === 0`), the scored set is
+// the whole population (`uncovered === 0`), and every decision is bound to the
+// template being reported (`unbound === 0`) — and why run.js refuses a replay
+// that does not cover the population, or whose decisions were produced under a
+// DIFFERENT prompt: an unmeasured case must never read as a passing one, and a
+// measurement of one prompt must never be reported as another's.
 //
 // The decision test is a POSITIVE one. The classifier's failures are silent by
 // design — `classifyDigestIntent` returns null both when the backend died and
@@ -158,8 +160,38 @@ function fireRow(cases, fires) {
   return { W: W.length, U: U.length, fireW, fireU, rateW: recall, rateU: rate(fireU, U.length), f1 };
 }
 
+// Which TEMPLATE a set of decisions was produced under. A record carries the
+// sha of the template that was filled to obtain it (`template_sha`), because a
+// replayed decision is otherwise unattached to any prompt: `--replay` reads a
+// decision file while the template is resolved SEPARATELY from --template / the
+// checkout, so `--template candidate.md --replay shipped.jsonl` scored one
+// prompt's decisions and printed the other prompt's name and sha over them. The
+// harness's whole claim is "this prompt scores X"; an unbound replay is a claim
+// about nothing.
+//
+//   bound     every record carries the same sha and it IS the resolved one
+//   mismatch  every record agrees, and it is a DIFFERENT template — the operator
+//             named a prompt that did not produce these decisions (run.js
+//             refuses: it is an unanswerable question, not a bad score)
+//   mixed     the file splices decisions from two templates (same refusal)
+//   unbound   one or more records predate stamping, so nothing ties them to any
+//             template. Scored and printed — reproducing an old run is useful —
+//             but it cannot certify a prompt, so the gate's `binding` criterion
+//             counts the unbound records and rule 0 applies.
+const UNBOUND = Symbol("unbound");
+
+function replayBinding(records, expected) {
+  const shas = new Set(records.map((r) => (r && typeof r.template_sha === "string" && r.template_sha ? r.template_sha : UNBOUND)));
+  const unbound = records.filter((r) => !(r && typeof r.template_sha === "string" && r.template_sha)).length;
+  const recorded = [...shas].filter((x) => x !== UNBOUND).sort();
+  if (unbound > 0) return { status: "unbound", unbound, recorded, expected };
+  if (recorded.length > 1) return { status: "mixed", unbound: 0, recorded, expected };
+  if (recorded.length === 1 && recorded[0] !== expected) return { status: "mismatch", unbound: 0, recorded, expected };
+  return { status: "bound", unbound: 0, recorded, expected };
+}
+
 // The pre-ship gate, as dec-spor-digest-intent-classifier-scored-prompt-recalibrated
-// applied it. Four criteria, deliberately not one number:
+// applied it. Five criteria, deliberately not one number:
 //
 //   goodLost === 0        the HARD rule. A digest the judge rated genuinely
 //                         good must never be suppressed; that is the harm no
@@ -184,15 +216,24 @@ function fireRow(cases, fires) {
 //                         SUBSET, and the cases it never looked at are exactly
 //                         the ones that could have carried the suppressions.
 //                         `--limit 1` is otherwise a spotless gate PASS.
+//   unbound === 0         INTEGRITY, per PROMPT. The two above ask whether the
+//                         classifier was measured; this one asks whether what
+//                         was measured is the template being reported. A
+//                         replayed decision that carries no `template_sha` is
+//                         attached to no prompt, so scoring it certifies
+//                         whichever template the report happened to resolve.
+//                         (A decision bound to a DIFFERENT template never
+//                         reaches the gate — run.js refuses that outright.)
 //
-// Both integrity criteria fire only on a POSITIVE count, so a caller that hands
-// gateVerdict a hand-built score (the pure-math tests, an archived JSON) is not
-// failed for a field it never carried. The counting itself is not optional
-// there — it lives in scoreRun, which always emits `noVerdict`, and in run.js,
-// which always passes the population it selected.
+// All three integrity criteria fire only on a POSITIVE count, so a caller that
+// hands gateVerdict a hand-built score (the pure-math tests, an archived JSON)
+// is not failed for a field it never carried. The counting itself is not
+// optional there — it lives in scoreRun, which always emits `noVerdict`, and in
+// run.js, which always passes the population it selected and the binding of the
+// decisions it scored.
 const DEFAULT_BUDGET = 0.06;
 
-function gateVerdict(score, budget = DEFAULT_BUDGET, { population = null } = {}) {
+function gateVerdict(score, budget = DEFAULT_BUDGET, { population = null, unbound = 0 } = {}) {
   const oneCase = score.firedW > 0 ? 1 / score.firedW : null;
   const over = score.warrantedSuppression != null ? score.warrantedSuppression - budget : null;
   const noVerdict = score.noVerdict ?? 0;
@@ -203,6 +244,11 @@ function gateVerdict(score, budget = DEFAULT_BUDGET, { population = null } = {})
     harm: { metric: "good digests lost", value: score.goodLost, pass: score.goodLost === 0 },
     integrity: { metric: "cases with no verdict", value: noVerdict, pass: !(noVerdict > 0) },
     coverage: { metric: "population cases not scored", value: uncovered, pass: !(uncovered > 0) },
+    binding: {
+      metric: "decisions not bound to prompt",
+      value: unbound,
+      pass: !(unbound > 0),
+    },
     warranted: {
       metric: "warranted suppressed",
       value: score.warrantedSuppression,
@@ -215,6 +261,7 @@ function gateVerdict(score, budget = DEFAULT_BUDGET, { population = null } = {})
       score.goodLost === 0 &&
       !(noVerdict > 0) &&
       !(uncovered > 0) &&
+      !(unbound > 0) &&
       over != null &&
       over <= 0,
   };
@@ -228,6 +275,7 @@ module.exports = {
   hasVerdict,
   isGoodDigest,
   selectPopulation,
+  replayBinding,
   scoreRun,
   fireRow,
   gateVerdict,

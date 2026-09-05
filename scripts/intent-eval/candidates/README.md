@@ -5,7 +5,10 @@ population and **did not ship**. They are here byte-for-byte as measured — no
 header comment, no edits — because the `template_sha` printed by a run is a hash
 of the file, and a file that no longer hashes to it is not the thing that was
 scored. Each has a row in `../README.md`'s Results table and a recorded run
-under `../runs/`.
+under `../runs/`, named for the candidate it scored — a run file whose name or
+`label` says a different prompt is the same mis-attribution the `template_sha`
+binding exists to stop (`2026-09-05-prompt-level-candidate.*` was committed as
+`…-recalibrated-haiku.*`, i.e. under the SHIPPED prompt's name).
 
 Score one directly (the shipped classifier still does the calling — only the
 template text is substituted):
@@ -13,6 +16,16 @@ template text is substituted):
 ```bash
 node scripts/intent-eval/run.js --labels <corpus> \
   --template scripts/intent-eval/candidates/<file>.md --label <name>
+```
+
+Re-scoring its recorded run costs no backend call, and needs the same
+`--template`: the records name the sha they were produced under, and replaying
+them against another prompt is refused rather than scored under its name.
+
+```bash
+node scripts/intent-eval/run.js --labels <corpus> \
+  --template scripts/intent-eval/candidates/2026-09-05-prompt-level.md \
+  --replay scripts/intent-eval/runs/2026-09-05-prompt-level-candidate.jsonl
 ```
 
 ## `2026-09-05-prompt-level.md` — sha `c724fed604ec`

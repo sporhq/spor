@@ -17,6 +17,11 @@
 //        [--budget 0.06] [--strict]
 //   node scripts/intent-eval/run.js --labels <evalDir> --replay <prior.jsonl>
 //
+// A replay is a replay OF A PROMPT: every record carries the `template_sha` its
+// decision was produced under, and a replay whose records name a different
+// template than the one this invocation resolved is REFUSED rather than scored
+// under the wrong prompt's name.
+//
 // The corpus is NOT in this repo and cannot be: it is 7MB of real prompts and
 // digests off a working box, and this repo is public. It lives in the private
 // server repo (`evals/digest-intent-2026-07-06`) — see README.md.
@@ -165,7 +170,18 @@ function report(records, score, gate, tables, spend, drops) {
 
   console.log(`\n=== intent-eval: ${LABEL} ===`);
   console.log(`engine       : ${ENGINE_ROOT}`);
-  console.log(`template     : ${drops.tplFile} (sha ${drops.tplSha})${TEMPLATE ? "   [candidate, not the shipped template]" : ""}`);
+  // The template line describes the DECISIONS, not whatever this invocation
+  // happened to resolve: under --replay those are different things, and the
+  // report is what a reader quotes as "prompt X scores Y".
+  console.log(
+    `template     : ${drops.tplFile} (sha ${drops.tplSha})${TEMPLATE ? "   [candidate, not the shipped template]" : ""}` +
+      (drops.binding && drops.binding.status === "unbound"
+        ? `\n               !! ${drops.binding.unbound}/${records.length} replayed decisions carry NO template sha —` +
+          ` nothing ties them to this prompt, so the gate cannot certify it`
+        : REPLAY
+          ? `   [replay decisions recorded under this same sha]`
+          : "")
+  );
   console.log(`backend      : ${REPLAY ? `replay ${REPLAY}` : CMD ? `cmd:${CMD}` : "cli:claude -p --model haiku (shipped default)"}`);
   console.log(`corpus       : ${LABELS_DIR}`);
   console.log(
@@ -208,18 +224,23 @@ function report(records, score, gate, tables, spend, drops) {
 
   console.log(`\n-- gate --`);
   console.log(
-    `  ${gate.harm.metric.padEnd(27)}: ${score.goodLost}        rule: 0` +
+    `  ${gate.harm.metric.padEnd(29)}: ${score.goodLost}        rule: 0` +
       `                     ${gate.harm.pass ? "PASS" : "FAIL"}`
   );
   console.log(
-    `  ${gate.integrity.metric.padEnd(27)}: ${gate.integrity.value}        rule: 0` +
+    `  ${gate.integrity.metric.padEnd(29)}: ${gate.integrity.value}        rule: 0` +
       `                     ${gate.integrity.pass ? "PASS" : "FAIL"}` +
       (gate.integrity.pass ? "" : "  (a case with no decision scored as an inject — not a measurement)")
   );
   console.log(
-    `  ${gate.coverage.metric.padEnd(27)}: ${gate.coverage.value}        rule: 0` +
+    `  ${gate.coverage.metric.padEnd(29)}: ${gate.coverage.value}        rule: 0` +
       `                     ${gate.coverage.pass ? "PASS" : "FAIL"}` +
       (gate.coverage.pass ? "" : "  (a sub-population cannot certify the classifier)")
+  );
+  console.log(
+    `  ${gate.binding.metric.padEnd(29)}: ${gate.binding.value}        rule: 0` +
+      `                     ${gate.binding.pass ? "PASS" : "FAIL"}` +
+      (gate.binding.pass ? "" : "  (a decision attached to no template certifies no template)")
   );
   const note = gate.warranted.pass
     ? ""
@@ -227,7 +248,7 @@ function report(records, score, gate, tables, spend, drops) {
       ? `  (over by less than one case = ${pct(gate.oneCase)} — a note on a FAILING criterion)`
       : "";
   console.log(
-    `  ${gate.warranted.metric.padEnd(27)}: ${pct(score.warrantedSuppression)}    budget: ${pct(BUDGET)}` +
+    `  ${gate.warranted.metric.padEnd(29)}: ${pct(score.warrantedSuppression)}    budget: ${pct(BUDGET)}` +
       `                ${gate.warranted.pass ? "PASS" : "OVER"}${note}`
   );
   // The aggregate verdict, printed rather than left to be read off the rows —
@@ -287,6 +308,10 @@ async function main() {
   // number can always be re-derived from its decision record.
   let decisions;
   let graph = null;
+  // The join between the decisions being scored and the template being
+  // reported. A live run makes it by construction (it stamps what it filled);
+  // a replay has to be checked against what it recorded.
+  let binding = { status: "bound", unbound: 0, recorded: [tplSha], expected: tplSha };
   if (REPLAY) {
     const prior = Object.fromEntries(readJsonl(REPLAY).map((r) => [r.case_id, r]));
     // A replay must COVER the population it is scored against. Substituting the
@@ -309,6 +334,36 @@ async function main() {
     const extra = Object.keys(prior).length - set.length;
     if (extra > 0) process.stderr.write(`replay covers ${set.length}/${set.length} selected (+${extra} out of population)\n`);
     decisions = set.map((r) => prior[r.case_id]);
+
+    // …and it must be a replay OF THE TEMPLATE BEING REPORTED. The decisions
+    // come from the file; the template comes from --template / the checkout;
+    // nothing joined them, so `--template candidate.md --replay shipped.jsonl`
+    // scored one prompt's answers and printed the other prompt's name and sha
+    // over them — a wrong number attributed to an innocent file. A live run
+    // stamps `template_sha` on every record, so the join exists; here it is
+    // checked. A disagreement is not a bad score, it is an unanswerable
+    // question, so it is refused rather than scored. (An UNBOUND record —
+    // recorded before stamping — is still scored: reproducing an old run is
+    // useful. It just cannot certify a prompt, so it fails the gate's `binding`
+    // criterion instead of exiting 2 here.)
+    binding = M.replayBinding(decisions, tplSha);
+    if (binding.status === "mismatch" || binding.status === "mixed") {
+      die(
+        binding.status === "mixed"
+          ? `replay ${REPLAY} splices decisions from ${binding.recorded.length} templates (${binding.recorded.join(", ")}).\n` +
+              `  a run is of ONE prompt; this file is not a run.`
+          : `replay ${REPLAY} records decisions made under template sha ${binding.recorded[0]},\n` +
+              `  but this invocation resolves ${tplFile} (sha ${tplSha}).\n` +
+              `  scoring them would report one prompt's answers as another prompt's result.\n` +
+              `  pass --template <the file with sha ${binding.recorded[0]}>, or replay against the checkout that produced it.`
+      );
+    }
+    if (binding.status === "unbound") {
+      process.stderr.write(
+        `NOTE: ${binding.unbound}/${decisions.length} replayed decisions carry no template_sha — ` +
+          `they are bound to no prompt and CANNOT certify one\n`
+      );
+    }
   } else {
     graph = fs.mkdtempSync(path.join(os.tmpdir(), "intent-eval-graph-"));
     decisions = await pool(set, CONC, (r) => {
@@ -346,10 +401,16 @@ async function main() {
     inject: decisions[i].inject,
     ms: decisions[i].ms,
     error: decisions[i].error ?? null,
+    // The template this decision was actually produced under, carried on the
+    // record so a later --replay of it is a replay of a PROMPT and not of a
+    // bare list of yes/nos. On a live run that is the template just filled; on
+    // a replay it is whatever the prior run recorded (null for a record
+    // predating stamping), never the one this invocation resolved.
+    template_sha: REPLAY ? (decisions[i].template_sha ?? null) : tplSha,
   }));
 
   const score = M.scoreRun(records);
-  const gate = M.gateVerdict(score, BUDGET, { population });
+  const gate = M.gateVerdict(score, BUDGET, { population, unbound: binding.unbound });
   const byId = Object.fromEntries(records.map((r) => [r.case_id, r]));
   const tables = {
     "current engine": M.fireRow(pop.userPrompt, pop.fires),
@@ -363,6 +424,7 @@ async function main() {
     skipped: pop.skipped.length,
     tplFile,
     tplSha,
+    binding,
   });
 
   if (OUT) {
@@ -371,7 +433,10 @@ async function main() {
     console.log(`\nwrote ${OUT}`);
   }
   if (JSON_OUT) {
-    fs.writeFileSync(JSON_OUT, JSON.stringify({ label: LABEL, tplSha, score, gate, tables, spend }, null, 2));
+    fs.writeFileSync(
+      JSON_OUT,
+      JSON.stringify({ label: LABEL, tplSha, binding: binding.status, score, gate, tables, spend }, null, 2)
+    );
     console.log(`wrote ${JSON_OUT}`);
   }
   if (graph) console.log(`llm-calls: ${path.join(graph, "journal", "llm-calls")}`);
