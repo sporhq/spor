@@ -362,7 +362,11 @@ test("Codex dispatch preview (--print) shows the translated bypassPermissions ar
   assert.match(result.stdout, /codex --ask-for-approval never exec --json --sandbox danger-full-access/);
 });
 
-test("an explicit --sandbox alongside --permission-mode bypassPermissions is respected, not overridden", async () => {
+// issue-spor-codex-bypass-translation-validation-flaws: the translation is
+// FIXED. An explicit Codex flag beside the bypass is a contradiction and is
+// refused before anything launches — never an override of the translated
+// default in either direction.
+test("an explicit --sandbox alongside --permission-mode bypassPermissions is refused, not translated", () => {
   const { home, repo } = fixture();
   const outfile = path.join(home, "codex-bypass-explicit-sandbox.json");
   const stub = codexStub(home);
@@ -373,13 +377,40 @@ test("an explicit --sandbox alongside --permission-mode bypassPermissions is res
     ],
     { SPOR_HOME: home, SPOR_CODEX_CMD: stub, OUTFILE: outfile }
   );
-  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(result.status, 1);
+  assert.match(result.stderr, /cannot combine --permission-mode bypassPermissions with --sandbox workspace-write/);
+  assert.match(result.stderr, /--sandbox danger-full-access --approval-policy never/);
+  assert.doesNotMatch(result.stderr, /warning:.*translating/);
+  assert.ok(!fs.existsSync(outfile), "nothing launched");
+});
 
-  const invocation = await awaitJson(outfile);
-  assert.ok(invocation);
-  assert.deepStrictEqual(invocation.args.slice(0, 6), [
-    "--ask-for-approval", "never", "exec", "--json", "--sandbox", "workspace-write",
-  ]);
+test("an explicit --approval-policy alongside --permission-mode bypassPermissions is refused too, in --print as well", () => {
+  const { home, repo } = fixture();
+  const result = run(
+    [
+      "dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex",
+      "--permission-mode", "bypassPermissions", "--approval-policy", "on-request", "--no-brief", "--print",
+    ],
+    { SPOR_HOME: home }
+  );
+  assert.strictEqual(result.status, 1);
+  assert.match(result.stderr, /cannot combine --permission-mode bypassPermissions with --approval-policy on-request/);
+  assert.match(result.stderr, /drop --permission-mode and pass the Codex flags/);
+  assert.doesNotMatch(result.stdout, /codex --ask-for-approval/);
+});
+
+test("the bypassPermissions translation warning names spor's --approval-policy flag, not Codex's argv spelling", () => {
+  const { home, repo } = fixture();
+  const result = run(
+    ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--permission-mode", "bypassPermissions", "--no-brief", "--print"],
+    { SPOR_HOME: home }
+  );
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.match(result.stderr, /translating to --sandbox danger-full-access --approval-policy never/);
+  assert.doesNotMatch(result.stderr, /--ask-for-approval/);
+  assert.doesNotMatch(result.stderr, /override/);
+  // …while the argv keeps the real Codex flag.
+  assert.match(result.stdout, /codex --ask-for-approval never exec --json --sandbox danger-full-access/);
 });
 
 test("Claude Code dispatch --permission-mode behavior is unchanged", () => {

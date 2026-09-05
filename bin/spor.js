@@ -11367,9 +11367,10 @@ const RESCUE_POSTURE_FLAGS = dispatchHarnesses.harnessOptionFlags("posture");
 // (rejectForeignOptions) — so the rescue's ADAPTER is the judge of what rides,
 // never a second table here (norm-cc-registry-is-contract): Claude Code takes
 // `--permission-mode`, Codex takes it too (its `validateOptions` TRANSLATES
-// bypassPermissions into `--sandbox danger-full-access --ask-for-approval
-// never`, the same translation the fix cycle gets) alongside its own
-// `--sandbox`/`--approval-policy`, and OpenCode/Copilot take neither — they
+// bypassPermissions into `--sandbox danger-full-access --approval-policy
+// never`, the same translation the fix cycle gets) or its own
+// `--sandbox`/`--approval-policy` — never both, the bypass beside an explicit
+// Codex flag is refused — and OpenCode/Copilot take neither — they
 // run unattended by default. The probe is per FLAG (a posture the lane's
 // harness does own must not be dropped because a foreign sibling rode beside
 // it), and an unknown or unreadable harness keeps the posture, so the mistake

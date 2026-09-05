@@ -4609,7 +4609,7 @@ test("the rescue inherits the worker's unattended posture, filtered per harness 
   assert.deepStrictEqual(claude.warnings, []);
 
   // …to a Codex profile: the flag rides too, and the Codex adapter is what
-  // translates it into `--sandbox danger-full-access --ask-for-approval never`
+  // translates it into `--sandbox danger-full-access --approval-policy never`
   // — exactly the translation the fix cycle's dispatch gets.
   const codex = await launchUnder("profile-rescue-codex", { "permission-mode": "bypassPermissions", model: "worker-model" });
   assert.strictEqual(codex.values["permission-mode"], "bypassPermissions");

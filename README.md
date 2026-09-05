@@ -499,12 +499,14 @@ ones (`--permission-mode`, `--agent`) are mutually exclusive — passing the
 wrong one for the resolved harness is a hard error, so a dispatch can't launch
 half-configured for the wrong CLI. The one exception: `--permission-mode
 bypassPermissions` against a Codex profile has a real Codex equivalent
-("run fully unattended"), so instead of erroring it translates to `--sandbox
-danger-full-access --approval-policy never` (an explicit `--sandbox`/
-`--approval-policy` you also pass wins over that default) and prints a loud
+("run fully unattended"), so instead of erroring it translates to exactly
+`--sandbox danger-full-access --approval-policy never` and prints a loud
 warning naming the translation — so an orchestrator or script that passes the
-same bypass flag to every dispatch regardless of harness keeps working.
-Every other permission-mode value still hard-errors against Codex.
+same bypass flag to every dispatch regardless of harness keeps working. The
+translation is fixed: an explicit `--sandbox`/`--approval-policy` beside the
+bypass is a contradiction and is refused, not an override (say the posture in
+Codex flags alone if you want a different one). Every other permission-mode
+value still hard-errors against Codex.
 
 The harnesses do not all confine a run the same way. Codex dispatch defaults to
 `--sandbox workspace-write`, so its filesystem reach is bounded. OpenCode

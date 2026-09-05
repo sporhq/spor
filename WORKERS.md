@@ -2167,7 +2167,7 @@ a stale premise is triage's, not the lane's.
    write prompt on an unattended box — filtered to what the lane's own harness
    accepts: Claude Code takes the permission mode, Codex takes it too (its
    adapter translates `bypassPermissions` into `--sandbox danger-full-access
-   --ask-for-approval never`, exactly as it does for a fix cycle), and
+   --approval-policy never`, exactly as it does for a fix cycle), and
    OpenCode/Copilot take neither because they are unattended by default. A
    flag the lane's harness cannot read is never simply dropped: it is
    **translated by meaning**. The adapters that own the worker's flags read
