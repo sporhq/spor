@@ -398,13 +398,17 @@ the type-blind completion words), not resolved while it has not. Which of the
 two paths applies is read off a **schema registry** — does this type's schema
 declare the `get()` hook — never off a hardcoded type list
 (norm-cc-registry-is-contract,
-task-spor-dispatch-terminal-resolution-all-types). A target whose type the
-graph does not echo at all is treated as edge-verified: nothing short of a
-resolving edge attests it, which is the fail-safe direction.
+task-spor-dispatch-terminal-resolution-all-types). *Which* registry answers
+that is part of the contract, not a detail: the reference client asks a
+different one on each of its two verification legs, and only one of them is
+the graph's own, so a resident `type: schema` override that moves a `get()`
+hook is honored on one leg and **invisible** on the other. Read the next
+paragraph before assuming either. A target whose type the graph does not echo
+at all is treated as edge-verified: nothing short of a resolving edge attests
+it, which is the fail-safe direction.
 
-**Which registry answers that question is part of the contract too — and the
-reference client answers it two different ways.** A registry is only as live
-as the graph behind it:
+**The two legs, and the registry each one actually reads.** A registry is
+only as live as the graph behind it:
 
 - **Local-mode verification** loads the graph it is verifying against, so it
   asks that graph's own registry (`registry.attachesResolutionHook`). A
@@ -415,15 +419,26 @@ as the graph behind it:
   which by construction cannot see a resident override — the same graph-less
   limitation API.md's reserved `inert` key names
   (issue-spor-type-blind-terminal-status-fallbacks). The seed answer is right
-  for every graph that leaves the `get()` hooks where the seed pack puts
-  them; the case where it is not is tracked as
-  issue-spor-remote-dispatch-ignores-resident-resolution-hooks. Note what it
-  can and cannot get wrong: the server's own `resolution` enrichment is read
-  FIRST and is authoritative, so an override that ADDS the hook to a type
-  still reads `resolved` off the real resolving edge it produces. The
-  residual is one-directional — a type an override made edge-verified, but
-  the seed pack still reads as status-only, would read `resolved` off a
-  terminal own-status with no edge behind it.
+  for every graph that leaves the `get()` hooks where the seed pack puts them.
+  Where an override moves one, this leg is wrong in **both** directions — the
+  server's own `resolution` enrichment (read FIRST, and authoritative when it
+  is there) covers only part of one of them:
+  - an override that **adds** the hook to a status-only type: a real resolving
+    edge still reads `resolved`, off the enrichment the override now produces.
+    The residual is the node carrying no such edge whose own status happens to
+    be terminal — the seed's status-only answer accepts that status and reads
+    `resolved`, an **over-read** of an attestation the live registry would not
+    have accepted.
+  - an override that **drops** the hook from an edge-verified type: the
+    enrichment goes with it, so nothing answers first, and the seed's
+    edge-verified answer never consults the status at all — a node genuinely
+    retired by its own terminal status reads as not attested, so the run files
+    a report and hands the lease back on finished work (and a factory gates an
+    item that is done). Fail-closed, but wrong.
+
+  Both directions are tracked as
+  issue-spor-remote-dispatch-ignores-resident-resolution-hooks; the bullet
+  below is what a worker does about it today.
 - **A third-party worker should do better than the reference client's remote
   leg**, and can: read the live answer from `GET /v1/schema` — the type's
   `hooks` array contains `get` (`spor schema <type> --json` prints the same
@@ -639,6 +654,26 @@ and no `model`. Absent fields read as `null`/absent per the rule above rather
 than as a violation. The asymmetry is pinned by a test against both real
 launch paths (`test/claude-supervised-dispatch.test.js`), so this table and
 the two record writers cannot drift apart.
+
+**Which record omits `model`, stated once so it stops being read backwards.**
+It is the **supervised** one. A native launch writes the resolved model onto
+its record at `beginNativeRun` (`lib/shell/agent-dispatch-runner.js`) — the
+key is always present there, `null` when nothing overrode it — because that
+launcher never sees the child again and the record is the only place the
+resolved model is written down; a supervised launch fixes the model into the
+harness argv instead and its record carries no such key
+(`launchSupervisedHarness`, `bin/spor.js`). Both halves, and the
+`launched_at`/`started_at` split above, are asserted against the two real
+launch paths in the test named above and again at the `spor runs --json` door
+they ride out through. The mirrored reading — that a *native* record is the
+one omitting `model` — is what this section used to invite by describing the
+field in four words, and it is wrong about the shipped writers in both
+directions. It is also not something this document could simply adopt: the
+field is documented and emitted, so making native records omit it would be a
+**removal** from a published record schema, which is exactly what the
+additive-only rule above forbids; a consumer already reading `model` off a
+native run would break. If a future change genuinely wants the field gone, it
+is a schema change with a deprecation, not a correction to this table.
 
 Fields like `runner_pid`, `child_pid`, `runner_started_ticks`,
 `child_started_ticks`, and `contract_pending` also ride on supervised records;
