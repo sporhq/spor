@@ -5026,7 +5026,15 @@ test("a failure naming two off-diff files files ONE issue PER FILE, and the fact
   second.deps.fileFlakeItem = async (args) =>
     args.file === "test/dispatch-runs.test.js" ? { ok: false, reason: "the graph refused the write" } : { ok: true, id: "issue-flake-one" };
   assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: second.deps })).state, "failed");
-  assert.match(second.seen.facts[0].markdown, /could not be filed as its own issue \(test\/dispatch-runs\.test\.js: the graph refused the write\)/);
+  const charged = second.seen.facts[0].markdown;
+  assert.match(charged, /could not be filed as its own issue \(test\/dispatch-runs\.test\.js: the graph refused the write\)/);
+  // …but the issue that DID land is this run's occurrence and must not be
+  // orphaned by the charge (F7): the fact links it and names it, so its
+  // inbound-edge occurrence count and its provenance survive the charged pass.
+  assert.match(charged, /- \{type: relates-to, to: issue-flake-one\}/, "the landed filing is linked from the charged fact");
+  assert.match(charged, /an off-diff flake filed as issue-flake-one, but the rest of it could not be filed/);
+  assert.match(charged, /Off-diff flake: test\/codex-dispatch\.test\.js, test\/dispatch-runs\.test\.js failed the whole-suite run and passed alone on the same tree, filed as issue-flake-one; but test\/dispatch-runs\.test\.js: the graph refused the write could not be filed as its own issue, so the failure was charged/);
+  assert.doesNotMatch(charged, /relates-to, to: issue-flake-test-dispatch-runs/, "and nothing is linked for the file whose filing did not land");
   fs.rmSync(dir2, { recursive: true, force: true });
 });
 

@@ -989,7 +989,10 @@ outside git (a database on a fixed port, a `db reset`):
     best-effort, so a flake that could be filed nowhere would be a pass over a
     red suite that nothing records; when the filing fails the failure is
     charged instead, and the outcome says the isolated run passed and why it
-    was charged anyway.
+    was charged anyway. The filings that DID land before one failed still ride
+    that charged fact as `relates-to` edges: each is this run's occurrence of
+    that file's flake, and an issue no fact links to has no provenance and no
+    occurrence to its name.
 
   The flake issue is the one node a gate files whose id and body are keyed on
   the failing FILES rather than on the run — a flake is a property of the

@@ -847,7 +847,10 @@ a reason to LOOK, never to pass: a failure naming a file the change touches, or
 one that fails alone too, is charged as before, and the pass is never clean (the
 whole-suite failure rides the fact as evidence) — nor is it unconditional: it
 happens only if the flake ISSUE lands, since the gate fact write is best-effort
-too and a red suite passing with neither write is a green light nobody can audit.
+too and a red suite passing with neither write is a green light nobody can audit
+(and a CHARGED pass still links the per-file issues that did land on its fact —
+`flake` rides the failed outcome through every `record` site — so an issue
+created before a later filing failed is never left with no fact naming it).
 The issue's convergent id is reconciled against SETTLED state rather than adopted
 on its name: a live occupant is linked, a resolved/closed one advances to a
 recurrence rung (`-r2`, `-r3`) that links back to it, and a file past every rung
