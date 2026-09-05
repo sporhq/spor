@@ -5150,8 +5150,10 @@ test("supersession is the other movement for a FINDING outcome — but never a s
   assert.match(res.reason, /superseded by task-canonical/);
 
   // The SAME shape where the only thing superseding the item is the node this
-  // run declared is refused: the resolver is the one node it certainly wrote.
-  const self = withNoCode(fakes({ changed: [] }), { report, nodes: { "art-scoping-x": { ...dup, edges: [...dup.edges, { type: "supersedes", to: "task-demo" }] }, "task-demo": { ...same, superseded_by: "art-scoping-x" }, "task-canonical": canonical } });
+  // run declared is refused: the resolver is the one node the route already
+  // requires, so a supersession it asserts rides along on a write that had to
+  // happen anyway.
+  const self = withNoCode(fakes({ changed: [] }), { report, nodes: { "art-scoping-x": { ...dup, edges: [...dup.edges, { type: "supersedes", to: "task-demo" }] }, "task-demo": { ...same, superseded_by: ["art-scoping-x"] }, "task-canonical": canonical } });
   const refused = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: self.deps });
   assert.strictEqual(refused.state, "failed");
   assert.match(refused.reason, /the only thing superseding it is `art-scoping-x`, the very node this run declared/);
@@ -5162,6 +5164,15 @@ test("supersession is the other movement for a FINDING outcome — but never a s
   const no = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: wrong.deps });
   assert.strictEqual(no.state, "failed");
   assert.match(no.reason, /a 'rescoped' outcome has to re-stamp the item to the repo that owns it/);
+
+  // `superseded_by` is a LIST because one id cannot answer "is there a
+  // superseder other than the declared node" — the resolver's own entry beside
+  // a third party's must not hide it (which a single-winner index would, on
+  // whichever box happened to read the resolver's file last).
+  const both = withNoCode(fakes({ changed: [] }), { report, nodes: { "art-scoping-x": { ...dup, edges: [...dup.edges, { type: "supersedes", to: "task-demo" }] }, "task-demo": { ...same, superseded_by: ["art-scoping-x", "task-canonical"] }, "task-canonical": canonical } });
+  const seen = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: both.deps });
+  assert.strictEqual(seen.state, "scoped");
+  assert.match(seen.reason, /superseded by task-canonical/);
 });
 
 test("a premise-stale outcome must name a node that EXISTS — a dangling edge demonstrates nothing", async () => {

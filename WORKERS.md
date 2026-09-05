@@ -799,7 +799,7 @@ violation — new fields may be added additively.
 | `launch_mode` | string | `"native-background"` (detaches into the harness's own daemon) or `"supervised-jsonl"` (runs under a supervisor Spor owns) |
 | `state` | string | `"launching"` → `"running"` → one of the **terminal** process states: `"done"`, `"failed"`, `"failed_launch"`, `"vanished"` |
 | `cwd` | string | the run's working directory |
-| `project` | string \| null | optional, supervised runs only — the target item's own repo stamp **as claimed**, recorded at launch. It is the "before" value the no-code-outcome re-stamp check compares against (§10.11), so it must not be re-read from the item later; absent on a record predating it, and on a free-text dispatch |
+| `item_repo` | string \| null | optional, supervised node-mode runs only — the target ITEM's own `repo:`/`project:` stamp **as claimed**, recorded at launch. It is the "before" value the no-code-outcome re-stamp check compares against (§10.11), so it must not be re-read from the item later, and it is deliberately not the dispatch's launch target (which `--slug` overrides for a cross-repo dispatch). Absent on a record predating it, on a free-text dispatch, and on a node carrying no stamp |
 | `model` | string \| null | **native-background records only** — the model override this launch resolved (`--model`, else the profile's), `null` when none did; the key is always present on a native record. A supervised record does not carry the field at all — its model is fixed into the harness argv at launch |
 | `created_at` | ISO 8601 | when the record was opened |
 | `started_at` | ISO 8601 | supervised runs only — when the child process actually started |
@@ -2372,8 +2372,9 @@ round-trip (`verifyNoCodeOutcome` in `lib/kernel/gates.js`, routed by
    resolver, and that **exists on the graph**: a dangling edge is a shape the
    graph accepts by design, so its presence demonstrates nothing.
 
-Check 4 demands a write the run could not have made **on its own**, and two
-things are deliberately not that:
+Check 4 asks for a write that is **not free** — one a run that did nothing has
+no reason to make, and that is not a side effect of being gated. Two things are
+deliberately excluded for being exactly that:
 
 - **"the item reads resolved."** A live resolving edge is the *precondition for
   being gated at all* (§10.2), so a run that did nothing but write its resolver
@@ -2387,10 +2388,24 @@ things are deliberately not that:
 
 The re-stamp branch is run-relative on top of that: it cannot be satisfied
 twice, because the next pipeline claims the item under the repo the first one
-moved it to. That "claimed under" value is the repo stamp the item carried **at
-dispatch** — carried on the worker's slot, and on the run record so
-`spor work --regate` compares against the same thing rather than against the
-item's own current stamp.
+moved it to. That "claimed under" value is the repo stamp **the item itself**
+carried at dispatch — carried on the worker's slot, and on the run record as
+`item_repo` so `spor work --regate` compares against the same thing rather than
+against the item's own current stamp (or against a `--slug` launch target it
+never had).
+
+**What this check is, and is not.** It is a *conformance* check, not an
+anti-forgery one, and it cannot be otherwise: an agent has write access to the
+graph, so every fact above is ultimately a write it could make. What the checks
+buy is that none of them is free and none rides along on being gated — each is a
+deliberate, consequential, auditable write that a run which did nothing has no
+reason to make, and every one is named in the `art-gate-scoping-…` fact. A
+determined agent authoring a second node purely to satisfy check 4 is the
+accepted residual; the point is that an empty diff now carries a *signal*, where
+before it carried none and a correct scoping was indistinguishable from a run
+that did nothing. Read the `scoped` facts the way you read any other gate
+telemetry — a rising count is a queue signal worth looking at, not a verdict
+nobody ever has to check.
 
 **If it checks out**, the pipeline settles **`scoped`**: an idempotent
 `art-gate-scoping-…` fact is recorded with verdict `scoped` (`relates-to` the

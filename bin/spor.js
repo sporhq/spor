@@ -8741,7 +8741,7 @@ function awaitLaunchHandshake(stream, timeoutMs) {
 
 async function launchSupervisedHarness(cfg, {
   adapter, command, args, cwd, name, nodeId, prompt, server, localNodesDir, childToken, mcpToken, bindToken,
-  renewToken, renewNode, releaseNode, project, readOnly = false,
+  renewToken, renewNode, releaseNode, project, itemRepo = null, readOnly = false,
 }) {
   const runId = crypto.randomUUID();
   const p = dispatchRuns.runPaths(cfg.userConfigHome(), runId);
@@ -8762,13 +8762,15 @@ async function launchSupervisedHarness(cfg, {
     // gate reading the implementer's checkout) is not a writer
     // (task-spor-worker-preflight-validation).
     ...(readOnly ? { read_only: true } : {}),
-    // The item's repo stamp AS CLAIMED, on the durable record rather than only
-    // in the job file (which is pruned): it is the "before" value the no-code
-    // outcome's re-stamp check compares against (WORKERS.md §10.11), and
-    // reading the node's CURRENT stamp instead would make that check compare a
-    // value with itself. The loop's own slot carries the same value; this is
-    // how `spor work --regate` gets it too.
-    ...(project ? { project } : {}),
+    // The ITEM's own repo stamp AS CLAIMED, on the durable record rather than
+    // only in the job file (which is pruned): it is the "before" value the
+    // no-code outcome's re-stamp check compares against (WORKERS.md §10.11).
+    // Reading the node's CURRENT stamp instead would make that check compare a
+    // value with itself; taking the LAUNCH TARGET (`project`, which `--slug`
+    // overrides for a cross-repo dispatch) would make it compare two unrelated
+    // repos and read a re-stamp that never happened. The loop's own slot
+    // carries this same value; this is how `spor work --regate` gets it too.
+    ...(itemRepo ? { item_repo: itemRepo } : {}),
     log_path: p.log,
     report_path: p.report,
   };
@@ -9057,6 +9059,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   const templateOpt = values.template || cfg.get("dispatch.template", null);
   let nodeId = values.node || null;
   let targetSlug = values.slug || null;
+  let itemRepo = null;
   let name = values.name || null;
   let profileFlag = values.profile || null;
   let dispatchNodeRaw = null; // the dispatched node's markdown — read for its assigned->agent profile
@@ -9122,6 +9125,13 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
       return 1;
     }
     dispatchNodeRaw = node.raw || null;
+    // The ITEM's own repo stamp, kept apart from `targetSlug`. They usually
+    // agree, but `--slug` deliberately overrides the launch target for a
+    // cross-repo dispatch, and the no-code-outcome check needs the value the
+    // ITEM carried (WORKERS.md §10.11): comparing the item's current stamp
+    // against a launch target it never had reads as a re-stamp that never
+    // happened.
+    itemRepo = node.repo || null;
     targetSlug = targetSlug || node.repo || null;
     nodeTitle = node.title || "";
     nodeSummary = node.summary || "";
@@ -10116,6 +10126,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
         renewNode: nodeId && !backfill && !noClaim ? nodeId : null,
         releaseNode: claimEstablished ? nodeId : null,
         project: res.slug || null,
+        itemRepo,
       });
       if (!launched.ok) {
         err(`could not launch ${harnessBin}: ${launched.error}`);
@@ -11543,11 +11554,18 @@ function makeGateDeps(
   let change = null;
   // The local graph, loaded lazily and at most once, for the one inbound fact
   // the `node` dep cannot read off a node's own file (see there). Remote mode
-  // never loads it; a graph that will not load answers "not superseded", which
-  // is the fail-closed reading for every caller.
+  // never loads it; a graph that will not load answers "nothing supersedes
+  // this", which is the fail-closed reading for every caller.
+  //
+  // EVERY superseder, not `graph.supersededBy`'s: that index is single-winner
+  // and last-writer-wins over file read order, so where two nodes supersede one
+  // item — a genuine third-party supersession plus a resolver using
+  // `supersedes` as its item link — which one it reports depends on readdir
+  // order, and the caller's "is the only superseder the node this run declared"
+  // test would then pass on one box and fail on another.
   let localGraph;
   const localSupersededBy = (id) => {
-    if (remote.isRemote(cfg)) return null;
+    if (remote.isRemote(cfg)) return [];
     if (localGraph === undefined) {
       try {
         localGraph = require(path.join(ROOT, "lib", "graph.js")).loadGraph(cfg.nodesDir());
@@ -11555,7 +11573,12 @@ function makeGateDeps(
         localGraph = null;
       }
     }
-    return (localGraph && localGraph.supersededBy && localGraph.supersededBy[id]) || null;
+    if (!localGraph || !localGraph.nodes) return [];
+    const out = [];
+    for (const n of Object.values(localGraph.nodes)) {
+      if ((n.edges || []).some((e) => e && String(e.type).toLowerCase() === "supersedes" && e.to === id)) out.push(n.id);
+    }
+    return out;
   };
   // The work item's own text, read once for the review prompt: a reviewer
   // judging "does this do what was asked" has to be told what was asked.
@@ -12269,10 +12292,12 @@ function makeGateDeps(
           // Supersession is an INBOUND fact, so it comes from the server's own
           // enrichment remotely and from the loaded graph locally — a node
           // stores only its own out-edges, and reading the frontmatter alone
-          // would make the check's supersession leg dead in local mode. The
-          // graph is loaded at most once per pipeline, and only on the path
-          // that runs for an empty diff with a declared claim.
-          superseded_by: node.superseded_by || localSupersededBy(id) || null,
+          // would make the check's supersession leg dead in local mode. A LIST,
+          // because the caller has to ask "is there a superseder other than the
+          // node this run declared" and one id cannot answer that. The graph is
+          // loaded at most once per pipeline, and only on the path that runs
+          // for an empty diff with a declared claim.
+          superseded_by: node.superseded_by ? [node.superseded_by] : localSupersededBy(id),
         },
       };
     },
@@ -13388,8 +13413,8 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // task-spor-factory-no-code-outcome-convention; for a record predating that,
   // the current stamp is the best available reading (it is also what this did
   // before), with the worker's scope token as the last resort.
-  let project = record.project || slug || null;
-  if (!record.project) {
+  let project = record.item_repo || slug || null;
+  if (!record.item_repo) {
     try {
       const node = await resolveNode(cfg, record.node_id);
       if (node && (node.repo || node.project)) project = node.repo || node.project;

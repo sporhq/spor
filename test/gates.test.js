@@ -1570,12 +1570,26 @@ test("verifyNoCodeOutcome demands a write a do-nothing run could not have made, 
     claimedRepo: "spor-server",
     nodes: {
       "art-scoping": { ...resolver, outcome: "duplicate", edges: [{ type: "supersedes", to: "task-a" }, { type: "derived-from", to: "task-b" }] },
-      "task-a": { ...same, superseded_by: "art-scoping" },
+      "task-a": { ...same, superseded_by: ["art-scoping"] },
       "task-b": { id: "task-b" },
     },
   });
   assert.strictEqual(selfSupersede.ok, false);
   assert.match(selfSupersede.reason, /the only thing superseding it is `art-scoping`, the very node this run declared/);
+  // A LIST, so the resolver's own entry can never hide a third party's — the
+  // single-winner reading would depend on which file was indexed last.
+  const alsoOther = gates.verifyNoCodeOutcome({
+    nodeId: "task-a",
+    claim: { ok: true, outcome: "duplicate", resolver: "art-scoping", reason: "" },
+    claimedRepo: "spor-server",
+    nodes: {
+      "art-scoping": { ...resolver, outcome: "duplicate", edges: [{ type: "supersedes", to: "task-a" }, { type: "derived-from", to: "task-b" }] },
+      "task-a": { ...same, superseded_by: ["art-scoping", "task-b"] },
+      "task-b": { id: "task-b" },
+    },
+  });
+  assert.strictEqual(alsoOther.ok, true);
+  assert.match(alsoOther.detail, /superseded by task-b/);
   // The same claim with a THIRD party asserting the supersession passes.
   const byOther = gates.verifyNoCodeOutcome({
     nodeId: "task-a",
@@ -1587,7 +1601,7 @@ test("verifyNoCodeOutcome demands a write a do-nothing run could not have made, 
       "task-b": { id: "task-b" },
     },
   });
-  assert.strictEqual(byOther.ok, true);
+  assert.strictEqual(byOther.ok, true, "a bare string is accepted too — the server's enrichment reports one");
   assert.match(byOther.detail, /superseded by task-b/);
 
   // Every other refusal names its own check.
