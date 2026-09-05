@@ -1208,6 +1208,12 @@ function probeCapabilities(graphHomeDir, opts) {
   // plain PATH stat, same cost class as the harness probe above (no spawn),
   // so it is always cheap enough for this fail-open session-start path.
   probed.gh = whichSync("gh") != null;
+  // `persist: false` computes the same map and writes NOTHING — for a caller
+  // that must be side-effect free (`spor dispatch --print`, whose whole promise
+  // is that a preview mutates no configuration,
+  // task-spor-worker-preflight-validation). Every other caller keeps the
+  // refresh-on-read behavior byte-identically.
+  if (opts && opts.persist === false) return probed;
   editCapabilities(graphHomeDir, (cap) => {
     if (JSON.stringify(cap.probed || null) === JSON.stringify(probed)) return false;
     cap.probed = probed;

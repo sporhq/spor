@@ -502,7 +502,12 @@ test("spor work ignores dispatch.claudeLaunchMode: a worker's claude-code run is
   const outfile = path.join(home, "work-invocation.json");
   const stub = claudeStreamStub(home);
   const r = run(
-    ["work", "--once", "--max", "1", "--interval", "1", "--no-brief", "--no-worktree", "--project", "demo"],
+    // `--permission-mode bypassPermissions` is the worker preflight's price of
+    // entry on Claude Code (task-spor-worker-preflight-validation): an
+    // unattended dispatch with no unattended posture is refused before its
+    // claim. The subject here is the LAUNCH MODE, so give it a posture and let
+    // the knob be the only thing under test.
+    ["work", "--once", "--max", "1", "--interval", "1", "--no-brief", "--no-worktree", "--project", "demo", "--permission-mode", "bypassPermissions"],
     { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_CLAUDE_CMD: stub, OUTFILE: outfile, SPOR_DISPATCH_CLAUDE_LAUNCH_MODE: "native-background" }
   );
   assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);

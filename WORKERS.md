@@ -210,6 +210,149 @@ pool with zero sweep, zero scheduler (dec-cc-task-claim-lease). Bulk variants
 (`POST /v1/queue/claim|renew|release`) exist for a worker carrying more than
 one node at once (API.md §3) but are not required for a single-node worker.
 
+### 3.1 Preflight — what must be true BEFORE a worker claims anything
+
+An unattended worker has nobody to answer a permission prompt and nobody to
+notice two agents writing over each other. The Dartlane pilot lost a run to
+each (art-spor-dartlane-factory-pilot-review-2026-09-05): `fe24cc97` launched
+Claude Code with no unattended posture, so every write it tried came back
+permission-blocked and the item was reported against work that never happened;
+`4002ba00` put several concurrent writers straight into one shared checkout
+because the repo declared `dispatch.worktreeSetup` and nobody had also set
+`dispatch.worktree`. Both are decided before the claim now
+(task-spor-worker-preflight-validation), on the ONE path `spor work` and a
+one-shot `spor dispatch` share — per
+dec-spor-work-loop-generalizes-dispatch the loop adds no guards of its own, so
+the guard lives in `cmdDispatch` and the judgement in `lib/shell/preflight.js`,
+where `--print` can ask for it without launching anything.
+
+**Write posture.** A posture is spelled in one harness's flags but says
+something harness-neutral: *read-only*, *attended* (it stops to ask),
+*unattended* (it never asks). Preflight reads it from the adapter that OWNS the
+flags — never through the cross-adapter `postureMeaning()` translator, whose
+most-restrictive-of-everyone reading is right for re-expressing a posture in
+another harness's vocabulary and wrong for judging one (every argv carries
+Codex's effective sandbox/approval defaults, so a permission-mode-less Claude
+Code launch would read as `unattended`). An unattended dispatch whose resolved
+posture is not `unattended` is **refused**, with no `--force` override and no
+claim: preflight never SETS a posture, because a worker that quietly grants
+itself a permission bypass is exactly the silent substitution the refusal
+exists to prevent. Three cases:
+
+| resolved posture | unattended dispatch | interactive `spor dispatch` |
+|---|---|---|
+| `unattended` (`--permission-mode bypassPermissions`; Codex/OpenCode/Copilot by construction) | proceeds | proceeds |
+| `attended`, or none resolved at all | **refused**, naming the flags that would fix it | proceeds — a person IS the answer to the prompt |
+| `read-only` under `--read-only` (a review gate) | proceeds — no writes were requested | proceeds |
+
+A **declared** custom harness (`dispatch.harness.<id>`) is operator-bound: v1
+scope fixes its argv and every posture flag is refused by its own
+`validateOptions`, so this client can neither express nor verify a posture for
+it. That is warned about, never refused — and as a `warning:` line, so it can
+never become a refusal reason.
+
+**Candidate workspace.** `dispatch.worktree` (repo `.spor.json` first, then the
+standing config, then `--worktree`/`--no-worktree`) decides whether a dispatch
+gets its own worktree under `.claude/worktrees/<name>` or writes into the main
+checkout. `dispatch.worktreeSetup` is **not** an input to that and never will
+be — a hook that says how to PREPARE an isolated tree does not say one is
+wanted — but declaring the hook with isolation off is diagnosed rather than
+silently honoured by halves: `spor dispatch` warns, and both `--print`
+surfaces name it. With isolation off, every dispatch into a repo shares one
+working tree and one index, so a candidate that already holds a **live,
+write-capable run** is refused. Occupancy is read from the durable run records —
+the same store the same-machine duplicate guard reads — so it can never disagree
+with `spor runs`; supervised runs are believed only while
+`supervisorStillWatching` says so, and a `read_only` launch is neither a writer
+nor blocked by one (a review gate reads the implementer's checkout, and
+gate-runner would score an undispatchable review as a gate FAILURE, §10.4).
+
+`--force` overrides the refusal. The pull worker's OWN item dispatches never
+pass it — that is what keeps two implementers out of one checkout — but its
+gate **fix cycles** and its **rescue** do (they run in the run's own checkout,
+whose implementer is already terminal; CLAUDE.md calls the fix cycle the one
+place the worker forces). So a worker running `--concurrency` above 1 against a
+shared checkout will refuse and cool off every item but one, per poll: with more
+than one slot, turn `dispatch.worktree` on.
+
+**Acquisition is atomic.** The occupancy check reads the run records, and the
+record that would make a SECOND dispatch see this one is written by the launch.
+Two launchers racing through that window would both read an empty candidate. So
+from just before the worktree is materialized until the run record exists, the
+launch holds an exclusive machine-local claim on the candidate path, and asks
+the occupancy question again under it.
+
+That claim is NOT a well-known lock pathname: see-it, judge-it-stale,
+unlink-it, re-create-it is not a claim (two contenders can both break one stale
+lock and then delete each *other's*), so it takes the shape
+`u.claimSpoolJob` already uses for the nudge spool
+(dec-spor-nudge-drain-atomic-claim). Each contender creates only its own
+uniquely-named
+`$SPOR_HOME/journal/workspace/<key>.lock-<pid>-<start-ticks>-<ts>-<rand>` and
+deletes only its own; everything a racer must judge is in the NAME, so there is
+no create-then-write window to misread; and ownership is decided by a listing
+taken AFTER the create, which two contenders can never both win (each creates
+before it lists).
+
+A lock whose HOLDER is gone contends with nobody — a dead launcher is not
+launching — so a launcher killed mid-launch self-heals at once rather than after
+a horizon, and its file is reaped once it is also expired (which, since every
+racer already ignores it, can neither grant nor revoke ownership). "Gone" is
+decided by **identity**, not by a pid: the name carries the holder's kernel
+start-time tick count, so a recycled pid — which answers a liveness probe
+exactly as readily as the real holder — is provably not our launcher and is
+reaped at once, and conversely a **verified live holder keeps the candidate
+however long it takes**, which matters because the claimed region includes an
+operator's unbounded `dispatch.worktreeSetup` hook. The 30-minute TTL is only
+the fallback for the case identity cannot be verified (off Linux, where the tick
+count is unreadable), the same trade `supervisorStillWatching` already makes.
+
+It degrades open twice over: a journal it cannot write or read loses the race
+tiebreak rather than stopping a dispatch (said out loud, as a `warning:`), and
+`--force` takes the same arm rather than being refused. This is the one refusal that comes after the claim,
+because it exists only to break a tie the pre-claim check could not see; it
+hands the lease straight back, exactly as a failed worktree setup does.
+
+### 3.2 `--print` — the diagnostic preview
+
+Both `spor dispatch --print` and `spor work --print` run the same resolution
+path a real run does and perform none of its side effects: no claim, no child
+process, no worktree, no configuration write (the capability probe is told not
+to persist), and no credential in the output — a token is reported present or
+missing, never echoed. An input that cannot be resolved is diagnosed rather
+than previewed as a clean run: an explicit `--profile` that will not load still
+exits non-zero.
+
+`spor dispatch --print` reports:
+
+```
+tenant: acme @ https://api.sporhq.io  (via SPOR_ORG env; token present)
+dir:    /home/dev/repos/demo  (slug: demo, via config)
+worktree: /home/dev/repos/demo/.claude/worktrees/task-x  (branch task-x, off HEAD); setup: ./bin/wt-setup
+workspace: /home/dev/repos/demo/.claude/worktrees/task-x  (isolated worktree); no live writers here
+posture: unattended
+harness: claude-code (profile profile-impl)
+preflight: ok — write posture and candidate workspace are both fit for an unattended run
+```
+
+The `tenant` line names the effective tenant **and the selector that chose
+it** (`--server`/`--org` flag, `SPOR_SERVER`/`SPOR_ORG` env, a repo `.spor`
+`org:` marker, the credential-store default, or a legacy flat config) — the
+half `spor status` never answered, and the first thing worth knowing when a
+worker is writing into a graph you did not expect. `preflight` is always
+judged for an UNATTENDED launch, so an interactive preview still tells you
+what a worker would do rather than being silently exempted.
+
+`spor work --print` adds the worker-level view: the same `tenant` line, the
+posture flags this worker hands to every dispatch it makes and which built-in
+harnesses that satisfies, the workspace isolation each in-scope repo resolves
+to (with the orphaned-`worktreeSetup` diagnostic), and — under a factory — each
+gate's **coverage**: armed or skipped, with the reason. A command gate runs on
+every change; a human gate arms only on its declared risk classes; an
+agent-review gate is coverage at all only if this box can dispatch its profile
+read-only, since gate-runner treats an undispatchable review as a FAILURE and
+never as a pass (§10.4).
+
 ## 4. The prompt contract
 
 A worker's context is assembled from three parts, in this order — this is
@@ -2055,8 +2198,14 @@ a stale premise is triage's, not the lane's.
    all — takes the lane's unattended posture without a reading, because
    otherwise a claude-code rescue launches attended and stalls exactly as the
    un-postured dispatch did. Every drop, translation and substitution is
-   warned about, since it changes what an unattended agent may do. What never
-   rides is the worker's ROUTING — `--model` and `--agent` — because the
+   warned about, since it changes what an unattended agent may do. Since
+   §3.1, a translation that lands on ATTENDED no longer merely warns: the
+   worker preflight refuses that rescue dispatch outright, because an
+   attended rescue on an unattended box stalls on its first write and is
+   discovered only by the idle ceiling. It reads back as "the rescue could
+   not be dispatched" and escalates to a person — which is what the stall
+   would have produced anyway, an hour later and with a worker slot held.
+   What never rides is the worker's ROUTING — `--model` and `--agent` — because the
    lane's profile is what names the strong model, and a worker's `--model`
    would override it.
    The prompt the runner composes carries: the work item, the diff, EVERY commit on the branch

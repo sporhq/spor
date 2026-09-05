@@ -237,6 +237,14 @@ To see what would be launched without starting anything:
 spor dispatch issue-86 --print
 ```
 
+`--print` is a full diagnostic, not just a prompt preview: it runs the same
+resolution path a real dispatch does and reports the **effective tenant and the
+selector that chose it**, the profile and harness, the **write posture**, the
+**candidate workspace and whether it is isolated**, and a `preflight:` verdict
+saying whether an unattended worker would be refused there and why. It performs
+none of a dispatch's side effects — no claim, no child, no worktree, no config
+write — and never echoes a credential.
+
 To provide your own prompt wrapper:
 
 ```bash
@@ -337,7 +345,7 @@ routed profile, waits for its **terminal state**, and goes round again.
 ```bash
 spor work                                   # work the whole queue, one run at a time
 spor work --project spor --concurrency 2    # two runs in flight, scoped to one project
-spor work --once --print                    # show scope, pacing and candidates; launch nothing
+spor work --once --print                    # tenant, posture, workspace isolation, gate coverage, candidates — launch nothing
 ```
 
 It is pull, not push: nothing schedules a worker, it takes work. That is safe
@@ -352,6 +360,16 @@ It adds no guards of its own. Every launch goes through the same code path as
 this box cannot satisfy (never substituted), a profile that tries to declare
 what to execute, the same-machine duplicate guard, the auto-claim, worktree
 isolation and the terminal-state contract all apply exactly as they do one-shot.
+Two of those guards exist for the unattended case specifically (WORKERS.md §3.1)
+and are checked **before the claim**: the resolved harness must have a
+non-interactive **write posture** — a Claude Code worker with no
+`--permission-mode` is refused rather than launched into a run where every write
+comes back permission-blocked, and preflight never sets a posture for you — and
+the **candidate workspace** must be free of other live writers, which with
+`dispatch.worktree` off means one dispatch at a time per checkout (turn
+`dispatch.worktree` on before running a worker at `--concurrency` above 1). (A
+`dispatch.worktreeSetup` hook does not turn isolation on; declaring one without
+`dispatch.worktree` is diagnosed, not silently honoured by halves.)
 Selection is the same filtered page `--from-queue` picks its one item from,
 minus anything whose derived readiness is `human` — a worker never claims work
 meant for a person — and minus anything already in flight on this machine. An

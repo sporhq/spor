@@ -34,6 +34,7 @@ const { gitSpawn } = require(path.join(ROOT, "lib", "shell", "git-exec.js"));
 const dispatchRuns = require(path.join(ROOT, "lib", "shell", "agent-dispatch-runner.js"));
 const dispatchTerminal = require(path.join(ROOT, "lib", "shell", "dispatch-terminal.js"));
 const dispatchHarnesses = require(path.join(ROOT, "lib", "shell", "dispatch-harnesses.js"));
+const preflight = require(path.join(ROOT, "lib", "shell", "preflight.js"));
 const sat = require(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
 const workLoop = require(path.join(ROOT, "lib", "shell", "work-loop.js"));
 const gatesKernel = require(path.join(ROOT, "lib", "kernel", "gates.js"));
@@ -7303,7 +7304,7 @@ function dispatchReadinessCheck(cfg, node) {
 // { id, source, found, profile, verdict }: an explicitly-named --profile that can't be
 // loaded sets found:false (a hard error the caller reports); an INFERRED profile
 // that can't be loaded returns null (fail-open — never block on a dangling edge).
-async function resolveDispatchProfile(cfg, { profileFlag, nodeRaw, identityAgent }) {
+async function resolveDispatchProfile(cfg, { profileFlag, nodeRaw, identityAgent, persistProbe = true }) {
   const graphLib = require(path.join(ROOT, "lib", "graph.js"));
   const parse = (raw, f) => {
     try {
@@ -7372,7 +7373,10 @@ async function resolveDispatchProfile(cfg, { profileFlag, nodeRaw, identityAgent
   const rawCap = cfg.get("dispatch.capabilities", {}) || {};
   let probed = null;
   try {
-    probed = u.probeCapabilities(cfg.userConfigHome(), { sporReachable: cfg.mode() === "remote", cfg });
+    // `--print` passes persistProbe:false — a preview resolves exactly the same
+    // verdict but writes no capability refresh back to config.json
+    // (task-spor-worker-preflight-validation: a diagnostic mutates nothing).
+    probed = u.probeCapabilities(cfg.userConfigHome(), { sporReachable: cfg.mode() === "remote", cfg, persist: persistProbe });
   } catch {
     /* probe is best-effort; match against what the cascade already holds */
   }
@@ -8691,6 +8695,11 @@ async function launchSupervisedHarness(cfg, {
     state: "launching",
     cwd,
     created_at: now,
+    // On the RECORD, not just the job: the preflight concurrency guard reads
+    // records to decide who is writing where, and a read-only run (a review
+    // gate reading the implementer's checkout) is not a writer
+    // (task-spor-worker-preflight-validation).
+    ...(readOnly ? { read_only: true } : {}),
     log_path: p.log,
     report_path: p.report,
   };
@@ -8951,6 +8960,13 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   const force = !!values.force;
   const backfill = !!values.backfill;
   const fromQueue = !!values["from-queue"];
+  // An UNATTENDED launch — a `spor work` implementer, one of its gate fix
+  // cycles, a rescue — has nobody to answer a permission prompt or to notice
+  // two agents writing into one checkout. Set by dispatchThroughLocked beside
+  // supervisedOnly/carryTask; a person's own `spor dispatch` never carries it,
+  // which is what keeps the interactive single-run behavior unchanged
+  // (task-spor-worker-preflight-validation).
+  const unattended = !!(ctx && ctx.unattended);
   const dirOpt = values.dir || null;
   const model = values.model || null;
   let permMode = values["permission-mode"] || null;
@@ -9142,18 +9158,36 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   // never seeing a foreign repo's .spor.json.
   const targetCfg = targetRepoDispatchCfg(res.dir);
   const targetStandingCfg = loadConfig({ cwd: res.dir, env: process.env });
-  // `worktreeSetup` here is a --print PREVIEW ONLY (line ~7855 below), read
-  // from the main checkout's live files since no worktree exists yet to read
-  // it from. The REAL dispatch never uses this value: createDispatchWorktree
-  // re-resolves dispatch.worktreeSetup from the freshly-created worktree's own
-  // checkout instead, so a stale/dirty main index at dispatch time can't
-  // silently no-op the hook (issue-spor-dispatch-worktree-config-live-file-race).
+  // `worktreeSetup` here is DIAGNOSTIC ONLY — the --print preview below and the
+  // real run's declared-but-not-enabled warning (task-spor-worker-preflight-
+  // validation) — read from the main checkout's live files since no worktree
+  // exists yet to read it from, so both can be wrong in either direction if
+  // that checkout's .spor.json is mid-edit. Neither the preview nor the warning
+  // changes what runs. The RUNNING hook never comes from this value:
+  // createDispatchWorktree re-resolves dispatch.worktreeSetup from the
+  // freshly-created worktree's own checkout instead, so a stale/dirty main index
+  // at dispatch time can't silently no-op the hook
+  // (issue-spor-dispatch-worktree-config-live-file-race).
   const worktreeSetup =
     targetCfg.worktreeSetup != null ? targetCfg.worktreeSetup : targetStandingCfg.get("dispatch.worktreeSetup", null);
   const worktreeDefault =
     targetCfg.worktree != null ? targetCfg.worktree : !!targetStandingCfg.get("dispatch.worktree", false);
   const useWorktree =
     !backfill && (values["no-worktree"] ? false : !!(values.worktree || worktreeDefault));
+  // Where this launch would actually write, decided once and read by the
+  // --print preview, the concurrency guard and the acquisition below
+  // (task-spor-worker-preflight-validation). `worktreeSetup` is deliberately
+  // not an input to `useWorktree` above — a hook that says how to PREPARE an
+  // isolated tree never says one is wanted — but a repo declaring the hook with
+  // isolation off is the Dartlane pilot's second failure verbatim, so the plan
+  // carries that mismatch (`setupOrphaned`) for the diagnostics to name.
+  const workspacePlan = preflight.planWorkspace({
+    repoDir: res.dir,
+    worktreeDir: backfill ? null : dispatchWorktreeDir(res.dir, name),
+    useWorktree,
+    worktreeSetup,
+    explicitNoWorktree: !!values["no-worktree"],
+  });
 
   // Session project (issue-spor-dispatch-propagate-session-project-to-questions).
   // The launcher env never reaches a native `claude --bg` agent (it self-allocates
@@ -9336,7 +9370,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   // machine can launch it. The verdict feeds the --print preview below and a
   // hard refusal before any side effect in the real run. No profile resolved =>
   // byte-identical to before (the common case until profiles are in use).
-  const profileCheck = await resolveDispatchProfile(cfg, { profileFlag, nodeRaw: dispatchNodeRaw, identityAgent });
+  const profileCheck = await resolveDispatchProfile(cfg, { profileFlag, nodeRaw: dispatchNodeRaw, identityAgent, persistProbe: !dryRun });
   if (profileCheck && profileCheck.found === false) {
     // Explicit --profile we couldn't load (absent locally, or unfetchable
     // remotely). Refuse rather than launch under an unverifiable profile.
@@ -9463,6 +9497,35 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   // The adapter's own read-only posture rides into buildArgs only under
   // --read-only, so a plain dispatch's argv is byte-identical.
   const readOnlyPosture = readOnly && harnessAdapter ? harnessAdapter.readOnly || null : null;
+  // --- worker preflight (task-spor-worker-preflight-validation) -------------
+  // Two things the Dartlane pilot proved nothing checked before a claim: that
+  // an unattended run can actually WRITE (fe24cc97 launched Claude Code with no
+  // permission mode and every write came back blocked), and that its candidate
+  // workspace is its own (4002ba00 put several writers into one shared checkout
+  // because `dispatch.worktreeSetup` was declared and `dispatch.worktree` was
+  // not). Both are decided HERE — on the one path `spor work` and a one-shot
+  // `spor dispatch` share, so the two can never grow contradictory guards
+  // (dec-spor-work-loop-generalizes-dispatch) — and both are read by the
+  // --print preview below without launching anything.
+  //
+  // The posture is judged on the EFFECTIVE options (after --read-only and the
+  // adapter's own option translation), so what is checked is exactly what
+  // buildArgs is about to receive.
+  const postureCheck = preflight.checkWritePosture({
+    adapter: harnessAdapter,
+    options: { permissionMode: permMode, sandbox: effectiveSandbox, approvalPolicy: effectiveApprovalPolicy },
+    unattended,
+    readOnly,
+    harnessId: harness,
+  });
+  // Live writers already in the candidate. Read from the durable run records —
+  // the same store the same-machine guard reads — so occupancy can never
+  // disagree with what `spor runs` reports. A read-only run (a review gate) is
+  // not a writer and never occupies anything.
+  const workspaceWriters = backfill
+    ? []
+    : preflight.liveWorkspaceWriters(dispatchRuns.readRunRecords(cfg.userConfigHome()), { dir: workspacePlan.dir });
+  const workspaceCheck = preflight.checkWorkspace({ plan: workspacePlan, writers: workspaceWriters, readOnly });
   const previewArgs = harnessAdapter ? harnessAdapter.buildArgs({
     name,
     model: effectiveModel,
@@ -9492,6 +9555,13 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   }
 
   if (dryRun) {
+    // The diagnostic preview (task-spor-worker-preflight-validation). It runs
+    // the SAME resolution path a real dispatch does — tenant, profile, harness,
+    // posture, candidate workspace — and performs none of its side effects: no
+    // claim, no child, no worktree, no config write (the capability probe above
+    // is passed persistProbe:false for exactly this), and no credential is ever
+    // echoed, only reported present/missing.
+    out(`tenant: ${preflight.tenantLine(preflight.describeTenant(cfg))}`);
     out(`dir:    ${res.dir}  (slug: ${res.slug}, via ${res.source})`);
     if (useWorktree) {
       out(
@@ -9499,6 +9569,17 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
           (worktreeSetup ? `; setup: ${worktreeSetup}` : `; no setup hook (dispatch.worktreeSetup unset)`)
       );
     }
+    out(
+      `workspace: ${workspacePlan.dir}  (${workspacePlan.isolation === "worktree" ? "isolated worktree" : "SHARED checkout — every dispatch here writes to one tree"})` +
+        (workspaceWriters.length ? `; ${workspaceWriters.length} live writer(s): ${preflight.describeWriters(workspaceWriters)}` : "; no live writers here")
+    );
+    if (workspacePlan.setupOrphaned) {
+      out(
+        `  note: dispatch.worktreeSetup is declared but dispatch.worktree is not — a setup hook does NOT enable isolation,`
+      );
+      out(`        so the hook never runs and the agent writes into ${res.dir} itself. Set dispatch.worktree true (or pass --worktree).`);
+    }
+    out(`posture: ${preflight.postureLine(postureCheck)}`);
     if (backfill) {
       const steps = [];
       if (cfg.mode() !== "remote") steps.push(fs.existsSync(cfg.nodesDir()) ? "graph home ready" : "init graph home");
@@ -9573,6 +9654,28 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     if (nodeId && !backfill && cfg.mode() === "remote") {
       out(`claim:  ${noClaim ? "(--no-claim — lease not established)" : `would establish a lease on ${nodeId} at launch (session bound from the run after launch)`}`);
     }
+    // The preflight verdict itself, stated once so a preview never reads as a
+    // clean run the real dispatch would refuse. Judged for an UNATTENDED
+    // launch, since that is the caller with nobody to answer a prompt; an
+    // interactive dispatch is told so rather than being silently exempted.
+    const previewPosture = preflight.checkWritePosture({
+      adapter: harnessAdapter,
+      options: { permissionMode: permMode, sandbox: effectiveSandbox, approvalPolicy: effectiveApprovalPolicy },
+      unattended: true,
+      readOnly,
+      harnessId: harness,
+    });
+    const blocks = [];
+    if (!previewPosture.ok) blocks.push(`posture — ${previewPosture.reason}`);
+    if (!workspaceCheck.ok) blocks.push(`workspace — ${workspaceCheck.reason}`);
+    if (blocks.length) {
+      out(`preflight: a worker dispatch here would REFUSE:`);
+      for (const b of blocks) out(`  - ${b}`);
+      if (!previewPosture.ok && previewPosture.hint) out(`    ${previewPosture.hint}`);
+      if (!workspaceCheck.ok && workspaceCheck.hint) out(`    ${workspaceCheck.hint}`);
+    } else if (previewPosture.warning) {
+      out(`preflight: ${previewPosture.warning.replace(/^warning: /, "")}`);
+    } else out(`preflight: ok — write posture and candidate workspace are both fit for an unattended run`);
     if (template != null) out(`template: ${path.resolve(templateOpt)}`);
     if (harnessResolution.error) out(`run:    (declaration for harness '${harness}' is unusable: ${harnessResolution.error})`);
     else if (!supportedHarness) out(`run:    (unsupported harness '${harness}')`);
@@ -9620,6 +9723,22 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     return 1;
   }
 
+  // Refuse an unattended launch that cannot WRITE, BEFORE any side effect
+  // (task-spor-worker-preflight-validation). The Dartlane pilot's `fe24cc97`
+  // ran a whole claimed item under a posture that stops to ask, with nobody to
+  // answer: every write came back permission-blocked and the item was reported
+  // against work that never happened. There is deliberately no --force
+  // override and preflight never SETS a posture — a worker that quietly grants
+  // itself a permission bypass is the substitution this refusal exists to
+  // prevent; the fix is the profile's, or the operator's, to make explicitly.
+  // An interactive dispatch is never judged here (a person IS the answer).
+  if (postureCheck.warning) err(postureCheck.warning);
+  if (!postureCheck.ok) {
+    err(`cannot dispatch ${nodeId || name}: ${postureCheck.reason}.`);
+    err(`  ${postureCheck.hint}`);
+    err(`  nothing was claimed or launched; the assignment is unchanged.`);
+    return 1;
+  }
   // Refuse a same-machine duplicate BEFORE any side effect or claim
   // (task-spor-dispatch-same-machine-guard): no repo registration, no lease, no
   // launch for a node already in flight here. --force overrides.
@@ -9650,6 +9769,28 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   }
 
   try {
+    // Refuse two writers in one candidate workspace, likewise before any side
+    // effect. Isolation is per-dispatch and opt-in, so with it off every dispatch
+    // into a repo shares one working tree and one index — the pilot's `4002ba00`,
+    // where three agents committed over each other in /home/exedev/dartlane.
+    // --force overrides, as it does for the other same-machine guards; the work
+    // loop never passes it, which is what keeps a pull worker out of this.
+    if (!workspaceCheck.ok && !force) {
+      err(`cannot dispatch ${nodeId || name}: ${workspaceCheck.reason}.`);
+      err(`  ${workspaceCheck.hint}`);
+      err(`  re-run with --force to write into it anyway; nothing was claimed or launched.`);
+      return 1;
+    }
+    if (!workspaceCheck.ok) err(`warning: --force set — dispatching a second writer into ${workspacePlan.dir}.`);
+    // A declared worktree SETUP hook with isolation off is not an error (the hook
+    // never enables isolation by itself, and must not start doing so) but it is
+    // almost always a mistake: the hook never runs and the agent writes into the
+    // main checkout. Say so once, loudly, where the operator will see it.
+    if (workspacePlan.setupOrphaned) {
+      err(`warning: ${res.slug} declares dispatch.worktreeSetup but not dispatch.worktree — a setup hook does not enable isolation,`);
+      err(`  so the hook is skipped and this run writes into ${res.dir} itself. Set dispatch.worktree true in its .spor.json (or pass --worktree).`);
+    }
+
     // Preflight only the PATH route — a launcher naming no directory, whether it
     // is the adapter default or an explicitly configured bare name. A launcher
     // given as a PATH is left to the launch, whose own `could not launch <path>:
@@ -9775,6 +9916,65 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
       if (r.ok) out(`  released the claim on ${nodeId}`);
       else err(`  warning: could not release the claim on ${nodeId} — retry with 'spor release ${nodeId}'`);
     };
+    // Take the candidate workspace ATOMICALLY, then re-check it
+    // (task-spor-worker-preflight-validation). The occupancy check above reads
+    // the run records; the record that would make a SECOND dispatch see THIS one
+    // is written by the launch below. Two launchers racing through that window
+    // both read an empty candidate and both land in it — the check/launch race
+    // acceptance names. So the claim on the candidate path is held from here
+    // until the run record exists, and the occupancy question is asked again
+    // under it. Machine-local and self-healing (a lock whose holder is gone, or
+    // older than a launch could take, is ignored and cleared); an unwritable
+    // journal degrades to "no lock", never to a refusal to dispatch.
+    //
+    // This is the one refusal that comes AFTER the claim, because it exists only
+    // to break a tie the pre-claim check could not see — so it hands the lease
+    // straight back, exactly as a failed worktree setup does.
+    // A read-only launch claims nothing: it is not a writer, so it neither
+    // occupies the candidate nor needs to exclude anyone from it.
+    let workspaceLock = null;
+    if (!backfill && !readOnly) {
+      const held = await preflight.acquireWorkspace(cfg.userConfigHome(), workspacePlan.dir, {
+        // How long to wait for a contender that is mid-launch before giving up on
+        // the tiebreak. A launch takes seconds; the default leaves room for a
+        // slow one without making a stuck box wait minutes.
+        waitMs: cfg.getNum("dispatch.workspaceLockWaitMs", preflight.WORKSPACE_LOCK_WAIT_MS),
+      });
+      // Fail-open is right — an unwritable journal must not be what stops a
+      // dispatch — but it must not be SILENT: the launch is running with no race
+      // tiebreak, and on a box where the journal is unwritable that is EVERY
+      // launch, whose first symptom would otherwise be two agents in one checkout.
+      if (held.degraded) {
+        err(`warning: could not claim the candidate workspace (${held.degraded}) — dispatching without the concurrent-launch tiebreak.`);
+      }
+      // `--force` is the operator (or a gate fix cycle / rescue, the two worker
+      // launches that pass it) saying "write into it anyway". Refusing THEM at the
+      // acquisition arm would contradict the guard it is only the tiebreak for —
+      // and a fix dispatch refused here spends a cycle from a bounded budget — so
+      // a forced launch degrades to "no tiebreak" rather than to a refusal, the
+      // same arm an unwritable journal takes.
+      if (!held.ok && !force) {
+        err(`cannot dispatch ${nodeId || name}: another dispatch on this box is launching into ${workspacePlan.dir} right now.`);
+        err(`  re-try in a moment${workspacePlan.isolation === "shared" ? ", or enable dispatch.worktree for this repo so the two runs get their own trees" : ""}.`);
+        await releaseClaimOnAbort();
+        return 1;
+      }
+      workspaceLock = held.ok ? held.token : null;
+      const racers = preflight.liveWorkspaceWriters(dispatchRuns.readRunRecords(cfg.userConfigHome()), { dir: workspacePlan.dir });
+      const recheck = preflight.checkWorkspace({ plan: workspacePlan, writers: racers, readOnly });
+      if (!recheck.ok && !force) {
+        err(`cannot dispatch ${nodeId || name}: ${recheck.reason} (it started while this dispatch was preparing).`);
+        err(`  ${recheck.hint}`);
+        preflight.releaseWorkspace(workspaceLock);
+        await releaseClaimOnAbort();
+        return 1;
+      }
+    }
+    const abortLaunch = async () => {
+      preflight.releaseWorkspace(workspaceLock);
+      await releaseClaimOnAbort();
+    };
+
     // Materialize the worktree just before launch — AFTER every guard/claim, so a
     // refused dispatch never leaves a worktree behind — and run the agent inside it.
     // res.dir stays the registered slug->path target (the durable main checkout,
@@ -9785,7 +9985,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
       if (wt.error) {
         err(`could not create dispatch worktree under ${res.dir}: ${wt.error}`);
         err(`  (is ${res.dir} a git repo with at least one commit? or pass --no-worktree.)`);
-        await releaseClaimOnAbort();
+        await abortLaunch();
         return 1;
       }
       if (wt.setupError) {
@@ -9801,7 +10001,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
         } else {
           err(`  left the reused worktree ${wt.dir} in place. Fix dispatch.worktreeSetup or pass --no-worktree.`);
         }
-        await releaseClaimOnAbort();
+        await abortLaunch();
         return 1;
       }
       launchDir = wt.dir;
@@ -9850,7 +10050,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
       });
       if (!launched.ok) {
         err(`could not launch ${harnessBin}: ${launched.error}`);
-        await releaseClaimOnAbort();
+        await abortLaunch();
         return 1;
       }
       if (ctx && ctx.onLaunch) {
@@ -9859,6 +10059,9 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
           node_id: nodeId || null, record_path: launched.paths.record,
         });
       }
+      // The run record exists now, so a concurrent dispatch's occupancy check can
+      // see this run: the candidate claim has done its job and is handed back.
+      preflight.releaseWorkspace(workspaceLock);
       out(`run:     ${launched.runId} (${harnessAdapter.label} supervisor ${launched.state.state || "launching"})`);
       out(`log:     ${launched.paths.log}`);
       out(`report:  ${launched.paths.report}`);
@@ -9887,6 +10090,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     dispatchRuns.pruneRuns(cfg.userConfigHome(), { maxAgeMs: cfg.getNum("dispatch.runRetentionMs", 1209600000) });
     const nativeRun = dispatchRuns.beginNativeRun(cfg.userConfigHome(), {
       harness: harnessAdapter.id, name, nodeId, cwd: launchDir, model: effectiveModel || null,
+      readOnly: !!readOnlyPosture,
     });
     // The agent's git must follow launchDir (its worktree, or the target checkout),
     // so hand it an env scrubbed of the git location vars — an ambient GIT_DIR
@@ -9909,7 +10113,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
         ...dispatchRuns.unenforcedOutcome("failed_launch", "the harness process could not be started, so nothing was verified against the graph"),
       });
       err(`could not launch ${harnessBin}: ${r.error.message}`);
-      await releaseClaimOnAbort();
+      await abortLaunch();
       return 1;
     }
     const launcherOk = r.status === 0;
@@ -9928,6 +10132,9 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
         node_id: nodeId || null, record_path: nativeRun.paths.record,
       });
     }
+    // As above: the native record is written and visible to the next dispatch's
+    // occupancy check, so the candidate claim is released.
+    preflight.releaseWorkspace(workspaceLock);
     out(`run:     ${nativeRun.runId} (${harnessAdapter.label}; 'spor runs' for its outcome)`);
     if (!launcherOk) {
       // A non-zero exit here means the harness never left a background agent
@@ -9935,7 +10142,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
       // spawn-error branch above already aborts on, so it needs the same
       // releaseClaimOnAbort() so the claim doesn't strand the node.
       err(`${harnessBin} exited ${r.status == null ? "abnormally" : r.status} without leaving a background agent`);
-      await releaseClaimOnAbort();
+      await abortLaunch();
       return r.status == null ? 1 : r.status;
     }
 
@@ -10216,7 +10423,7 @@ async function dispatchWorkItem(cfg, item, passthrough, { factory = null } = {})
 // installed mid-session, or a fresh box with no prior session-start probe —
 // rather than a stale snapshot. Trivially satisfiable for any factory that
 // isn't propose mode (the common case), including no factory at all.
-function integrationSatisfiability(cfg, factory) {
+function integrationSatisfiability(cfg, factory, { persistProbe = true } = {}) {
   // Skip the probe entirely for the common case (no factory, or a factory
   // whose integration isn't propose mode) — a full probe re-reads the
   // claude-plugins manifest and re-scans PATH, not worth paying on every
@@ -10225,7 +10432,7 @@ function integrationSatisfiability(cfg, factory) {
   const rawCap = cfg.get("dispatch.capabilities", {}) || {};
   let probed = null;
   try {
-    probed = u.probeCapabilities(cfg.userConfigHome(), { sporReachable: cfg.mode() === "remote", cfg });
+    probed = u.probeCapabilities(cfg.userConfigHome(), { sporReachable: cfg.mode() === "remote", cfg, persist: persistProbe });
   } catch {
     /* probe is best-effort; match against what the cascade already holds */
   }
@@ -10265,7 +10472,10 @@ async function dispatchThroughLocked(cfg, values, positionals = []) {
     // carryTask: whatever prompt template rides the passthrough (or a personal
     // dispatch.template), the task text — the worker contract, a fix cycle's
     // or a rescue's instructions, the one-turn notice — reaches the agent.
-    code = await cmdDispatch(cfg, { values, positionals }, { onLaunch: (l) => launches.push(l), supervisedOnly: true, carryTask: true });
+    // unattended: nobody is there to answer a permission prompt or to notice
+    // two agents in one checkout, so the worker preflight applies
+    // (task-spor-worker-preflight-validation).
+    code = await cmdDispatch(cfg, { values, positionals }, { onLaunch: (l) => launches.push(l), supervisedOnly: true, carryTask: true, unattended: true });
   } catch (e) {
     // A throw AFTER the launch (the post-launch session capture and bind are
     // network calls) still means an agent is running and holding a lease —
@@ -10274,6 +10484,12 @@ async function dispatchThroughLocked(cfg, values, positionals = []) {
     return { ok: false, reason: `dispatch failed: ${e && e.message ? e.message : String(e)}` };
   } finally {
     ERR_TEE = previousTee;
+    // A throw between the candidate claim and the launch would otherwise strand
+    // a lock naming this still-alive pid — honoured for its whole stale window,
+    // which with `dispatch.worktree` off is every subsequent item refused. This
+    // loop is the one caller that keeps running after a caught throw, so it is
+    // the one that has to sweep (task-spor-worker-preflight-validation).
+    preflight.releaseHeldWorkspaces();
   }
   if (code === 0 && launches.length) return { ok: true, run: launches[0] };
   // Exit 0 with no launch is the one shape that is neither: --print, or a
@@ -13269,6 +13485,44 @@ function makeCodeMovedNotice(loaded, { root = ROOT, log = () => {}, ref = null }
   };
 }
 
+// One gate's COVERAGE, for `spor work --print` (task-spor-worker-preflight-
+// validation): is this gate armed on this box, and if not, why not. A command
+// gate judges every change; a human gate arms only when the change touches one
+// of its declared risk classes; an agent-review gate is coverage only if THIS
+// machine can actually dispatch its profile — an unloadable profile, an
+// unsatisfiable one, or a harness with no read-only posture all mean the gate
+// would REFUSE rather than review (gate-runner treats an undispatchable review
+// as a failure, never a pass, so a preview must not read as coverage). Resolves
+// through the same `resolveDispatchProfile` a dispatch uses, with the capability
+// probe told not to persist — a preview mutates nothing.
+async function gateCoveragePreview(cfg, gate) {
+  if (gate.kind === "command") {
+    return `armed on every change${gate.reruns ? `; up to ${gate.reruns} rerun${gate.reruns === 1 ? "" : "s"} before a failure is charged` : ""}`;
+  }
+  if (gate.kind === "human") {
+    return gate.risk.length
+      ? `armed when the change touches risk class ${gate.risk.join(" or ")}; otherwise skipped`
+      : `armed on every change`;
+  }
+  if (gate.kind !== "agent-review") return `armed`;
+  if (!gate.profile) return `SKIPPED — the gate names no profile, so no reviewer can be dispatched`;
+  let check = null;
+  try {
+    check = await resolveDispatchProfile(cfg, { profileFlag: gate.profile, nodeRaw: null, identityAgent: null, persistProbe: false });
+  } catch (e) {
+    return `coverage unknown — ${gate.profile} could not be resolved (${e && e.message ? e.message : e})`;
+  }
+  if (!check || check.found === false) return `SKIPPED — profile ${gate.profile} could not be loaded here, and an undispatchable review is a gate FAILURE, not a pass`;
+  if (check.verdict && !check.verdict.ok) return `SKIPPED — this machine can't satisfy ${gate.profile}: ${check.verdict.reasons.join("; ")}`;
+  const harnessId = (check.profile && check.profile.harness) || "claude-code";
+  const adapter = dispatchHarnesses.resolveHarness(harnessId, { cfg }).adapter;
+  if (!adapter) return `SKIPPED — profile ${gate.profile} selects harness '${harnessId}', which this machine cannot launch`;
+  if (!adapter.readOnly) {
+    return `SKIPPED — ${adapter.label} declares no read-only posture, so the review dispatch is refused (route it to ${harnessReadOnlyPostures()})`;
+  }
+  return `armed — reviews read-only under ${adapter.label}${gate.cycles ? `, then up to ${gate.cycles} fix cycle${gate.cycles === 1 ? "" : "s"}` : ""}`;
+}
+
 async function cmdWork(cfg, { values }) {
   if (values.status) return cmdWorkStatus(cfg, { json: !!values.json });
 
@@ -13531,10 +13785,65 @@ async function cmdWork(cfg, { values }) {
   };
 
   if (values.print || values["dry-run"]) {
+    // The worker's own diagnostic preview (task-spor-worker-preflight-
+    // validation): the effective tenant and which selector chose it, the write
+    // posture every dispatch this loop makes will carry, the workspace
+    // isolation each in-scope repo resolves to, and the gate coverage — armed
+    // or skipped, with the reason. It reads the same resolution path the real
+    // loop does and performs none of its side effects (no claim, no dispatch,
+    // no worktree, no config write, no credential echoed).
+    out(`tenant:  ${preflight.tenantLine(preflight.describeTenant(cfg))}`);
     out(`project: ${slug || "(all projects)"}`);
     out(`accept:  ${accept} — ${accept === "open" ? "any queue item except readiness:human (untriaged included)" : "only items explicitly stamped agent-ready (--accept open for the looser pickup)"}`);
     out(`loop:    concurrency ${concurrency}, interval ${intervalMs / 1000}s, backoff to ${maxIntervalMs / 1000}s, retry refused after ${retryAfterMs / 1000}s, stop following a run after ${runMaxMs / 3600000}h${runIdleMs > 0 ? `, stop a run idle for ${runIdleMs / 60000}m` : ""}${max ? `, stop after ${max}` : ""}`);
     out(`status:  ${workLoop.workDir(cfg.userConfigHome())}`);
+    // The posture this worker hands to every dispatch it makes. Each dispatch
+    // resolves its OWN harness from the item's profile and refuses when the
+    // posture that resolves there is not unattended, so the useful thing to say
+    // here is what is being passed and which built-in harnesses that satisfies.
+    const postureFlags = Object.entries(dispatchHarnesses.harnessOptionFlags("posture"))
+      .filter(([flag]) => values[flag])
+      .map(([flag]) => `--${flag} ${values[flag]}`);
+    const postureOptions = {};
+    for (const [flag, option] of Object.entries(dispatchHarnesses.harnessOptionFlags("posture"))) {
+      if (values[flag]) postureOptions[option] = values[flag];
+    }
+    const postureFit = { unattended: [], refused: [] };
+    for (const adapter of dispatchHarnesses.harnesses({ cfg })) {
+      if (adapter.declaration) continue; // operator-bound; this client expresses no posture for it
+      const v = preflight.checkWritePosture({ adapter, options: postureOptions, unattended: true, harnessId: adapter.id });
+      (v.ok ? postureFit.unattended : postureFit.refused).push(adapter.id);
+    }
+    out(`posture: ${postureFlags.length ? postureFlags.join(" ") : "(none passed)"} — unattended on ${postureFit.unattended.join(", ") || "no built-in harness"}${postureFit.refused.length ? `; a ${postureFit.refused.join("/")} profile would be REFUSED before its claim` : ""}`);
+    // Workspace isolation, per in-scope repo. `dispatch.worktreeSetup` alone
+    // never enables `dispatch.worktree` — the mismatch is reported, not
+    // interpreted (the Dartlane pilot's shared-checkout failure).
+    const scopeRepos = (factoryRepos.length ? factoryRepos : slug ? [slug] : Object.keys(cfg.get("dispatch.repos", {}) || {})).slice(0, 8);
+    if (!scopeRepos.length) out(`workspace: no repo mapped yet — 'spor repos add <slug> <path>' (each item dispatches into its own repo)`);
+    for (const r of scopeRepos) {
+      const rd = resolveDir(cfg, { dir: null, slug: r });
+      if (!rd.dir) {
+        out(`workspace: ${r} — not mapped on this box ('spor repos add ${r} <path>'); every item stamped with it would refuse`);
+        continue;
+      }
+      const tcfg = targetRepoDispatchCfg(rd.dir);
+      const standing = loadConfig({ cwd: rd.dir, env: process.env });
+      const setup = tcfg.worktreeSetup != null ? tcfg.worktreeSetup : standing.get("dispatch.worktreeSetup", null);
+      const isolated = values["no-worktree"]
+        ? false
+        : !!(values.worktree || (tcfg.worktree != null ? tcfg.worktree : !!standing.get("dispatch.worktree", false)));
+      const plan = preflight.planWorkspace({
+        repoDir: rd.dir,
+        worktreeDir: dispatchWorktreeDir(rd.dir, "<node-id>"),
+        useWorktree: isolated,
+        worktreeSetup: setup,
+        explicitNoWorktree: !!values["no-worktree"],
+      });
+      out(
+        `workspace: ${r} -> ${rd.dir} — ${isolated ? "isolated worktree per dispatch" : "SHARED checkout (dispatch.worktree off): concurrent writers are refused, not isolated"}` +
+          (plan.setupOrphaned ? "; dispatch.worktreeSetup is declared but does NOT enable isolation — set dispatch.worktree true" : "")
+      );
+    }
     if (factory) {
       out(`factory: ${factoryId} — trusted ref ${factory.trustedRef}${factory.protectedPaths.length ? `, protected ${factory.protectedPaths.join(" ")} -> ${factory.testLaneProfile}` : ""}`);
       out(`  judges: ${factoryRepos.length ? `repo(s) ${factoryRepos.join(", ")} — items stamped with any other repo are skipped` : "any repo (no 'repos' declared and no project stamp on the factory node)"}`);
@@ -13542,10 +13851,19 @@ async function cmdWork(cfg, { values }) {
         const how =
           g.kind === "command" ? `\`${g.command}\`` : g.kind === "agent-review" ? `review under ${g.profile}` : `approval${g.risk.length ? ` when ${g.risk.join("/")}` : " (always)"}`;
         out(`  gate ${g.id}  ${g.kind}  ${how}${g.cycles ? `  (up to ${g.cycles} fix cycle${g.cycles === 1 ? "" : "s"})` : ""}${g.source !== "inline" ? `  [${g.source}]` : ""}`);
+        // Armed-or-skipped, with the reason — the coverage question an operator
+        // actually has. A command gate runs on every change; a human gate arms
+        // only on its declared risk classes; an agent-review gate is only
+        // coverage at all if THIS box can dispatch its profile read-only.
+        out(`    ${await gateCoveragePreview(cfg, g)}`);
       }
       if (factory.rescue) out(`  rescue: under ${factory.rescue.profile}, up to ${factory.rescue.attempts} attempt${factory.rescue.attempts === 1 ? "" : "s"} before any human escalation`);
-      const ghVerdict = integrationSatisfiability(cfg, factory);
+      else out(`  rescue: none declared — a gate whose fix cycles are spent escalates straight to a person`);
+      const ghVerdict = integrationSatisfiability(cfg, factory, { persistProbe: false });
       if (!ghVerdict.ok) out(`  integration: mode 'propose' — UNSATISFIABLE here: ${ghVerdict.reasons[0]}`);
+      else if (factory.integration) {
+        out(`  integration: mode '${factory.integration.mode}' onto ${factory.integration.targetRef} — armed once every gate above has passed`);
+      } else out(`  integration: none declared — a passing pipeline lands nothing; the branch waits for a person`);
     } else {
       out(`factory: none — the loop runs bare (declare one with --factory <id> or work.factory)`);
     }
