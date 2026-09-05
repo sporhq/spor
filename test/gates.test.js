@@ -12,6 +12,7 @@ const test = require("node:test");
 const assert = require("node:assert");
 
 const gates = require("../lib/kernel/gates.js");
+const sat = require("../lib/kernel/satisfiability.js");
 
 function factoryBody(payload) {
   return ["Some prose about this factory.", "", "```json", JSON.stringify(payload, null, 2), "```", ""].join("\n");
@@ -652,6 +653,214 @@ test("a factory's `rescue:` block parses — profile required, attempts bounded 
   const notObject = gates.parseFactory(body({ ...base, rescue: "profile-claude-fable" }));
   assert.strictEqual(notObject.factory, null);
   assert.match(notObject.errors.join("; "), /rescue: must be a JSON object/);
+});
+
+// --- the implementation stage + the completion boundary ----------------------
+// (task-spor-factory-implementation-stage-parser, FACTORY-IMPLEMENTATION-STAGE.md
+// §2). The parser is the enforcement point for a stage the runner has not been
+// taught yet, so what these pin is the REFUSAL half: a mistyped stage must never
+// produce a worker that dispatches unbudgeted, a launch field declared in the
+// graph must be named rather than dropped, and an unreachable completion
+// boundary must be fatal — an item that can never complete is indistinguishable
+// from a worker that silently stopped completing anything.
+
+const STAGE_BODY = (payload) => ["```json", JSON.stringify(payload), "```"].join("\n");
+// One command gate and one review gate: `author_checks` resolves against ids,
+// and only a COMMAND gate is a thing an author could run.
+const STAGE_BASE = {
+  gates: [
+    { id: "typecheck", kind: "command", command: "npm run typecheck" },
+    { id: "adversarial-review", kind: "agent-review", profile: "profile-codex-review" },
+  ],
+};
+const stageFactory = (payload) => gates.parseFactory(STAGE_BODY({ ...STAGE_BASE, ...payload }));
+
+test("a factory with no implementation stage and no completion block is byte-identical to before either existed", () => {
+  const { factory, errors } = stageFactory({});
+  assert.deepStrictEqual(errors, []);
+  assert.strictEqual(factory.implementation, null, "no block, no stage — every path below it is inert");
+  // The boundary is always RESOLVED rather than null, so no consumer has to
+  // re-derive the default table. `agent` is exactly today's behavior: the
+  // implementer writes the resolving edge and flips the status itself.
+  assert.deepStrictEqual(factory.completion, { by: "agent", after: "gates" });
+});
+
+test("an implementation stage takes every §2.1 default, and declaring the block moves completion onto the controller", () => {
+  const { factory, errors } = stageFactory({ implementation: {} });
+  assert.deepStrictEqual(errors, []);
+  assert.deepStrictEqual(factory.implementation, {
+    profile: "",
+    instructions: "",
+    authorChecks: [],
+    // null = inherit the worker's own ceiling: a factory that says nothing
+    // must not silently shorten a worker's watchdog.
+    budget: { runMaxMs: null, runIdleMs: null, attempts: 1 },
+    retry: { attempts: 1, backoffMs: 60000 },
+    // No expensive suite is prescribed twice, so author_checks defaults to
+    // none; the gate re-runs from the trusted ref regardless.
+    candidate: { requireClean: true, publish: "none", remote: "" },
+  });
+  assert.deepStrictEqual(factory.completion, { by: "controller", after: "gates" }, "the block is the opt-in: a factory that adopted the stage asked for its semantics");
+  // …and the boundary follows the LAST stage the factory actually declares.
+  const landed = stageFactory({ implementation: {}, integration: { command: "npm test", target_ref: "main" } });
+  assert.deepStrictEqual(landed.errors, []);
+  assert.deepStrictEqual(landed.factory.completion, { by: "controller", after: "integration" });
+});
+
+test("a declared implementation stage is read as written — profile, instructions, author checks, budget, retry and candidate", () => {
+  const { factory, errors } = stageFactory({
+    implementation: {
+      profile: "  profile-implementer  ",
+      instructions: "  Prefer the smallest change.  ",
+      author_checks: ["typecheck"],
+      budget: { run_max_ms: 5400000, run_idle_ms: 2700000, attempts: 2 },
+      retry: { attempts: 0, backoff_ms: 120000 },
+      candidate: { require_clean: false, publish: "branch", remote: "origin" },
+    },
+    completion: { by: "controller", after: "gates" },
+  });
+  assert.deepStrictEqual(errors, []);
+  assert.deepStrictEqual(factory.implementation, {
+    profile: "profile-implementer",
+    instructions: "Prefer the smallest change.",
+    authorChecks: ["typecheck"],
+    budget: { runMaxMs: 5400000, runIdleMs: 2700000, attempts: 2 },
+    retry: { attempts: 0, backoffMs: 120000 },
+    candidate: { requireClean: false, publish: "branch", remote: "origin" },
+  });
+});
+
+test("an implementation budget INHERITS whenever it is not READABLE as a ceiling — a typo must never remove a watchdog", () => {
+  const budget = (b) => {
+    const r = stageFactory({ implementation: { budget: b } });
+    assert.deepStrictEqual(r.errors, []);
+    return r.factory.implementation.budget;
+  };
+  assert.strictEqual(budget({ run_max_ms: 5400000 }).runMaxMs, 5400000);
+  assert.strictEqual(budget({ run_max_ms: "5400000" }).runMaxMs, 5400000, "a numeric string is still a ceiling");
+  // The whole hazard: work-loop.js reads `maxAgeMs > 0` / `idleMs > 0`, so a
+  // value that lands on 0 is NO CEILING AT ALL. Every shape a typo takes must
+  // therefore inherit, not disable — `Number("")`, `Number(false)` and
+  // `Number([])` are all a finite 0, which is exactly what a naive clamp would
+  // hand the runner as "run forever".
+  for (const junk of ["soon", "", "  ", false, true, [], {}, null, -1, 0, 0.5, 1.9, NaN, Infinity]) {
+    assert.strictEqual(budget({ run_max_ms: junk }).runMaxMs, null, `run_max_ms ${JSON.stringify(junk)} must inherit the worker's ceiling`);
+  }
+  // The other end of the same hazard: a ceiling no run ever reaches is an
+  // absent one, so an extra-zeros typo CLAMPS to the longest run `spor work`
+  // itself accepts rather than parsing to 2.7 billion years.
+  assert.strictEqual(budget({ run_max_ms: 8.64e19 }).runMaxMs, 2592000000);
+  assert.strictEqual(budget({ run_idle_ms: 8.64e19 }).runIdleMs, 2592000000);
+  assert.strictEqual(budget({}).runMaxMs, null, "undeclared inherits — a factory that says nothing must not shorten a worker's watchdog");
+  // `run_idle_ms` is the one knob §2.1 gives a disabling value: 0 disables idle
+  // detection for a lane whose steps genuinely run that long (WORKERS.md §8),
+  // so it is carried through where the same 0 on run_max_ms is not.
+  assert.strictEqual(budget({ run_idle_ms: 0 }).runIdleMs, 0);
+  assert.strictEqual(budget({ run_idle_ms: 2700000 }).runIdleMs, 2700000);
+  for (const junk of ["soon", "", "  ", false, [], {}, null, -1, 0.5, NaN, Infinity]) {
+    assert.strictEqual(budget({ run_idle_ms: junk }).runIdleMs, null, `run_idle_ms ${JSON.stringify(junk)} must inherit, never read as a declared disable`);
+  }
+});
+
+test("no launch field is declarable on an implementation stage — every one of them is named, never dropped", () => {
+  // The rule is dec-spor-declarative-harness-machine-binds-execution and the
+  // list is the profile guard's own, so a field added there is refused here by
+  // construction. A factory author who wrote `command` believes it is doing
+  // something, which is why each is an error naming the key.
+  for (const field of sat.GRAPH_LAUNCH_FIELDS) {
+    const { factory, errors } = stageFactory({ implementation: { [field]: "npm run agent" } });
+    assert.strictEqual(factory, null, `'${field}' must refuse the factory`);
+    assert.ok(
+      errors.some((e) => e.includes(`implementation: '${field}' is not declarable in the graph`)),
+      `'${field}' must be named in the refusal: ${errors.join("; ")}`
+    );
+    assert.ok(errors.some((e) => e.includes("dispatch.harness.<id>")), "…and the refusal must say where it DOES belong");
+  }
+});
+
+test("the §2.4 validation table: a mistyped stage refuses the factory, and a legal one is read", () => {
+  // FACTORY-IMPLEMENTATION-STAGE.md §2.4, row for row. A non-empty `errors`
+  // refuses to start the worker (WORKERS.md §10.1's fatal list), so the
+  // valid/invalid split IS the contract.
+  const INTEGRATION = { command: "npm test", target_ref: "main" };
+  const ROWS = [
+    ["V1", {}, null],
+    ["V2", { implementation: {} }, null],
+    ["V3", { implementation: { author_checks: ["typecheck"] } }, null],
+    ["V4", { implementation: { budget: { attempts: 3 } }, completion: { by: "controller", after: "gates" } }, null],
+    ["V5", { implementation: { candidate: { publish: "branch", remote: "origin" } } }, null],
+    ["E1", { implementation: [] }, /^implementation: must be a JSON object$/],
+    ["E2", { implementation: { command: "npm run agent" } }, /implementation: 'command' is not declarable in the graph — route by 'profile' and bind the harness on the machine \(dispatch\.harness\.<id>\)/],
+    ["E3", { implementation: { author_checks: ["nope"] } }, /implementation\.author_checks names 'nope', which is not a declared gate id/],
+    ["E4", { implementation: { author_checks: ["adversarial-review"] } }, /implementation\.author_checks may name command gates only — 'adversarial-review' is an agent-review gate/],
+    ["E7", { completion: { after: "integration" } }, /completion\.after 'integration' but no integration stage is declared — the completion boundary would never be reached/],
+    ["E8", { completion: { by: "nobody" } }, /completion\.by 'nobody' must be one of: agent, controller/],
+    // E9: a parse cannot read a checkout, so a `branch` publish with no remote
+    // is DEFERRED to the worker-startup capability check, not refused here.
+    ["E9", { implementation: { candidate: { publish: "branch" } } }, null],
+    // E10: the completion boundary is adoptable ALONE — the stage's routing
+    // and budget stay default, and `by` is what the operator wrote.
+    ["E10", { completion: { by: "controller" } }, null],
+  ];
+  for (const [row, payload, expected] of ROWS) {
+    const { factory, errors } = stageFactory(payload);
+    if (expected === null) {
+      assert.deepStrictEqual(errors, [], `${row} must be valid: ${errors.join("; ")}`);
+      assert.ok(factory, `${row} must produce a factory`);
+    } else {
+      assert.strictEqual(factory, null, `${row} must refuse the factory`);
+      assert.match(errors.join("; "), expected, `${row} must name what is wrong`);
+    }
+  }
+  // The rows whose verdict is a VALUE, not just a verdict.
+  assert.strictEqual(stageFactory(ROWS[3][1]).factory.implementation.budget.attempts, 3);
+  const reachable = stageFactory({ completion: { after: "integration" }, integration: INTEGRATION });
+  assert.deepStrictEqual(reachable.errors, [], "E7 fires only when the boundary is genuinely unreachable");
+  assert.strictEqual(reachable.factory.completion.after, "integration");
+  assert.deepStrictEqual(stageFactory({ completion: { by: "controller" } }).factory.implementation, null, "E10: the boundary alone, with no stage");
+  assert.strictEqual(stageFactory({ completion: { by: "controller" } }).factory.completion.by, "controller");
+  // E5/E6: a bounded count CLAMPS, the convention `cycles` and `reruns` keep —
+  // it is not an error, and it is never unbounded.
+  assert.strictEqual(stageFactory({ implementation: { budget: { attempts: 9 } } }).factory.implementation.budget.attempts, 3);
+  assert.strictEqual(stageFactory({ implementation: { retry: { attempts: -1 } } }).factory.implementation.retry.attempts, 0);
+  assert.strictEqual(stageFactory({ implementation: { retry: { backoff_ms: 1 } } }).factory.implementation.retry.backoffMs, 1000);
+  assert.strictEqual(stageFactory({ implementation: { retry: { backoff_ms: 9999999 } } }).factory.implementation.retry.backoffMs, 600000);
+  // …and a sub-block that is not an object is named, never ignored: an author
+  // who wrote `"budget": 5400000` believes it is doing something.
+  const flat = stageFactory({ implementation: { budget: 5400000 } });
+  assert.strictEqual(flat.factory, null);
+  assert.match(flat.errors.join("; "), /implementation\.budget: must be a JSON object/);
+  // …and neither is a key whose SHAPE is wrong quieter than E3's typo: an
+  // author_checks that is not a list of ids is named, never emptied.
+  for (const junk of [{ typecheck: true }, ["typecheck", 123], 7, ""]) {
+    const shape = stageFactory({ implementation: { author_checks: junk } });
+    assert.strictEqual(shape.factory, null, `author_checks ${JSON.stringify(junk)} must refuse`);
+    assert.match(shape.errors.join("; "), /implementation\.author_checks: must be a list of command gate ids/);
+  }
+  assert.deepStrictEqual(stageFactory({ implementation: { author_checks: "typecheck" } }).errors, [], "a lone id may be written as a bare string, the way every other list field is");
+  const publish = stageFactory({ implementation: { candidate: { publish: "ftp" } } });
+  assert.strictEqual(publish.factory, null);
+  assert.match(publish.errors.join("; "), /implementation\.candidate\.publish 'ftp' must be one of: none, branch, bundle/);
+  const badCompletion = stageFactory({ completion: "controller" });
+  assert.strictEqual(badCompletion.factory, null);
+  assert.match(badCompletion.errors.join("; "), /completion: must be a JSON object/);
+  assert.match(stageFactory({ completion: { after: "never" } }).errors.join("; "), /completion\.after 'never' must be one of: gates, integration/);
+  // …and the refused word is never CARRIED: a caller that ignored `errors`
+  // must not find `by: "nobody"` on the boundary to act on.
+  assert.deepStrictEqual(gates.parseImplementation({ completion: { by: "nobody", after: "never" } }).completion, { by: "agent", after: "gates" });
+});
+
+test("parseImplementation stands alone on a payload, the way parseIntegration and parseRescue do", () => {
+  // The stage is parsed from the same payload, so the pure function is usable
+  // without a factory node — with the caveat that `author_checks` can only be
+  // resolved against a gate list the caller passes.
+  const bare = gates.parseImplementation({ implementation: { author_checks: ["typecheck"] } });
+  assert.strictEqual(bare.implementation, null);
+  assert.match(bare.errors.join("; "), /not a declared gate id/, "no gates passed, no ids to resolve against");
+  const withGates = gates.parseImplementation({ implementation: { author_checks: ["typecheck"] } }, { gates: [{ id: "typecheck", kind: "command" }] });
+  assert.deepStrictEqual(withGates.errors, []);
+  assert.deepStrictEqual(withGates.implementation.authorChecks, ["typecheck"]);
+  assert.deepStrictEqual(gates.parseImplementation(null), { implementation: null, completion: { by: "agent", after: "gates" }, errors: [] }, "a payload that is not an object declares no stage");
 });
 
 test("parseRescueReport reads the structured diagnosis in code — last fence wins, unknown category reads unknown, prose-only is unread but salvaged", () => {

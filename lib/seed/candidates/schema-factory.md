@@ -2,15 +2,16 @@
 id: schema-factory
 type: schema
 kind: node-schema
-schema_version: 2026.09.04.1
+schema_version: 2026.09.05.1
 title: Software-factory definition
-summary: A factory definition — the ordered gate list a worker enforces between claim and resolve, plus the trusted ref, the repos it may judge, protected test paths, test-change lane, risk classes those gates key on, an optional integration (merge-queue landing) stage, and an optional rescue lane (a strong-model step before any human escalation). Candidate pack; adopt it into a graph to use `spor work --factory`.
+summary: A factory definition — the ordered gate list a worker enforces between claim and resolve, plus the trusted ref, the repos it may judge, protected test paths, test-change lane, risk classes those gates key on, an optional integration (merge-queue landing) stage, an optional rescue lane (a strong-model step before any human escalation), an optional implementation stage and the completion boundary that says who writes the resolving edge. Candidate pack; adopt it into a graph to use `spor work --factory`.
 date: 2026-08-26
 edges:
   - {type: derived-from, to: dec-spor-software-factory-substrate}
   - {type: relates-to, to: task-spor-work-gate-pipeline}
   - {type: derived-from, to: dec-spor-factory-integration-step}
   - {type: relates-to, to: task-spor-factory-rescue-lane}
+  - {type: derived-from, to: dec-spor-factory-implementation-stage-contract}
 ---
 
 A `factory` node is a team's bespoke factory as DATA (dec-spor-software-factory-
@@ -48,7 +49,15 @@ convention schema nodes use:
         {"ref": "gate-adversarial-review", "cycles": 2},
         {"id": "security-approval", "kind": "human", "risk": ["touches:auth"]}
       ],
-      "rescue": {"profile": "profile-claude-fable", "attempts": 1}
+      "rescue": {"profile": "profile-claude-fable", "attempts": 1},
+      "implementation": {
+        "profile": "profile-implementer",
+        "author_checks": ["typecheck"],
+        "budget": {"run_max_ms": 5400000, "run_idle_ms": 2700000, "attempts": 1},
+        "retry": {"attempts": 1, "backoff_ms": 60000},
+        "candidate": {"require_clean": true, "publish": "none"}
+      },
+      "completion": {"by": "controller", "after": "integration"}
     }
 
 - `trusted_ref` — the ref a command gate's suite is taken from (default `main`).
@@ -88,6 +97,56 @@ convention schema nodes use:
   ledger. Only if that also refuses is the person paged, with the diagnosis
   first. `attempts` (default 1, max 3), `await_ms` (default 1h),
   `instructions`. Absent, the factory is byte-identical to one without a lane.
+- `implementation` (optional, FACTORY-IMPLEMENTATION-STAGE.md §2) — the stage
+  that PRODUCES the candidate the gates then judge, declared beside them rather
+  than left as the one step of the pipeline a factory could not describe. It
+  routes by PROFILE only: no `command`/`args`/`argv`/`bin`/`exec`/`entrypoint`/
+  `env`/`report`/`session`/`launch_mode`/`identity_mode` key (or its camelCase
+  twin) is declarable, and
+  one present is an error naming it — a graph write must never define what a
+  machine executes (dec-spor-declarative-harness-machine-binds-execution), so a
+  bespoke implementer is a `dispatch.harness.<id>` declaration on the machine.
+  `profile` is the LOWEST-precedence router (an explicit `--profile`, the item's
+  own `profile:` and its assigned agent all still win). `instructions` is
+  APPENDED to the worker contract, never a replacement for it. `author_checks`
+  names the command gate ids the implementer is asked to run itself — default
+  NONE, because the gate re-runs the suite from the trusted ref regardless and
+  an author run of the same suite is duplicate spend; naming a cheap gate (a
+  typecheck, a lint) buys an early failure, and a name that is not a declared
+  command gate is an error. `budget.run_max_ms`/`run_idle_ms` default to
+  INHERITING the worker's own ceilings (a factory that says nothing must not
+  silently shorten a watchdog; `run_idle_ms: 0` disables idle detection),
+  `budget.attempts` (default 1, max 3) is the re-implementation pool and
+  `retry` (default 1 attempt, 60s backoff, max 3) the separate INFRASTRUCTURE
+  pool an outage spends instead of the code's. `candidate.require_clean`
+  (default true) refuses a dirty tree at submission rather than inside the
+  first gate, and `candidate.publish` (`none`|`branch`|`bundle`, default
+  `none`) is how the pinned commit is made reachable to a controller that does
+  not share a filesystem with the implementer — `candidate.remote` names the git
+  remote a `branch` publish pushes to, and a `branch` publish with no remote is
+  NOT a parse error (a parse cannot read a checkout): it is refused at worker
+  startup, beside the `gh` capability check `integration.mode: propose` makes.
+- `completion` (optional) — WHO writes the resolving edge that retires the work
+  item, and WHEN. `by: agent` is today's behavior (the implementer writes the
+  edge and flips the status), and stays the default for a factory that declares
+  no `implementation` block. `by: controller` moves both onto the runner: the
+  implementer submits a candidate and writes NO resolving edge, so a pending or
+  refused pipeline releases none of the item's dependents — queue liveness is
+  edge-derived, which is why a claim written before any gate ran released them
+  all. `after` is the boundary — `gates` or `integration` — defaulting to the
+  LAST stage the factory actually declares, so it is reachable by construction;
+  declaring `integration` without an `integration` block is an error, because a
+  boundary that can never be reached leaves every item unresolved forever.
+  Declaring an `implementation` block defaults `by` to `controller`: the block
+  is the opt-in, and controller-written completion is the semantics it asks for.
+  The boundary is adoptable ALONE, with the stage left at its defaults.
+- **Not yet enforced.** As of `schema_version` 2026.09.05.1 the runner PARSES
+  and validates `implementation`/`completion` (a mistyped stage refuses to start
+  the worker) but does not yet execute them: the stage dispatch, the candidate
+  object and the controller-written completion land with items 2-4 of
+  FACTORY-IMPLEMENTATION-STAGE.md §8. Until then a declared block is a
+  DECLARATION of intent, not a behavior change — `spor work` still dispatches
+  and completes exactly as WORKERS.md §10 documents.
 
 ```json
 {
