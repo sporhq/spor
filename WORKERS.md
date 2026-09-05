@@ -655,25 +655,27 @@ than as a violation. The asymmetry is pinned by a test against both real
 launch paths (`test/claude-supervised-dispatch.test.js`), so this table and
 the two record writers cannot drift apart.
 
-**Which record omits `model`, stated once so it stops being read backwards.**
-It is the **supervised** one. A native launch writes the resolved model onto
-its record at `beginNativeRun` (`lib/shell/agent-dispatch-runner.js`) — the
-key is always present there, `null` when nothing overrode it — because that
-launcher never sees the child again and the record is the only place the
-resolved model is written down; a supervised launch fixes the model into the
-harness argv instead and its record carries no such key
-(`launchSupervisedHarness`, `bin/spor.js`). Both halves, and the
-`launched_at`/`started_at` split above, are asserted against the two real
+**Which record omits `model`.** The **supervised** one. A native launch writes
+the resolved model onto its record at `beginNativeRun`
+(`lib/shell/agent-dispatch-runner.js`) — the key is always present there,
+`null` when nothing overrode it — because that launcher never sees the child
+again and the record is the only place the resolved model is written down. A
+supervised launch fixes the model into the harness argv instead, and
+`launchSupervisedHarness` (`bin/spor.js`) writes no such key. Both halves, and
+the `launched_at`/`started_at` split above, are asserted against the two real
 launch paths in the test named above and again at the `spor runs --json` door
-they ride out through. The mirrored reading — that a *native* record is the
-one omitting `model` — is what this section used to invite by describing the
-field in four words, and it is wrong about the shipped writers in both
-directions. It is also not something this document could simply adopt: the
-field is documented and emitted, so making native records omit it would be a
-**removal** from a published record schema, which is exactly what the
-additive-only rule above forbids; a consumer already reading `model` off a
-native run would break. If a future change genuinely wants the field gone, it
-is a schema change with a deprecation, not a correction to this table.
+they ride out through.
+
+The mirrored reading — that a *native* record is the one omitting `model` — is
+wrong about the shipped writers in both directions, and it is not a reading
+this table may be edited into. The field is documented and emitted, so dropping
+it from native records is a **removal** from a published record schema: the
+additive-only rule above forbids it, and a consumer already reading `model` off
+a native run breaks. That is a decided position rather than an editorial one —
+**`dec-spor-keep-native-run-record-model-field`**, which weighed unifying the
+two records against that rule and kept the field. Retiring it remains available
+as a schema change with a deprecation window; it is not available as a
+correction here.
 
 Fields like `runner_pid`, `child_pid`, `runner_started_ticks`,
 `child_started_ticks`, and `contract_pending` also ride on supervised records;
