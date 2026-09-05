@@ -45,10 +45,12 @@ convention schema nodes use:
       "test_lane_profile": "profile-test-writer",
       "risk_classes": { "touches:auth": ["lib/auth.js", "**/auth/**"] },
       "gates": [
+        {"id": "typecheck", "kind": "command", "command": "npm run typecheck", "timeout_ms": 120000},
         {"id": "acceptance", "kind": "command", "command": "npm test", "timeout_ms": 900000},
         {"ref": "gate-adversarial-review", "cycles": 2},
         {"id": "security-approval", "kind": "human", "risk": ["touches:auth"]}
       ],
+      "integration": {"command": "npm test", "target_ref": "main"},
       "rescue": {"profile": "profile-claude-fable", "attempts": 1},
       "implementation": {
         "profile": "profile-implementer",

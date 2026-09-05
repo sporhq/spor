@@ -10,6 +10,8 @@
 // verdict must never read as a pass.
 const test = require("node:test");
 const assert = require("node:assert");
+const fs = require("node:fs");
+const path = require("node:path");
 
 const gates = require("../lib/kernel/gates.js");
 const sat = require("../lib/kernel/satisfiability.js");
@@ -871,6 +873,60 @@ test("the §2.4 validation table: a mistyped stage refuses the factory, and a le
   assert.deepStrictEqual(gates.parseImplementation({ completion: { by: "nobody", after: "never" } }).completion, { by: "agent", after: "gates" });
 });
 
+test("completion.after 'integration' is refused as fatally unreachable AND is never carried on the boundary", () => {
+  // `after` is a legal WORD (it's in COMPLETION_AFTER) even when it names an
+  // unreachable boundary, so the vocabulary check alone doesn't exclude it —
+  // the fatal-unreachable check must ALSO gate what gets returned, the same
+  // way an outright unrecognized word already does.
+  const r = gates.parseImplementation({ completion: { after: "integration" } });
+  assert.match(r.errors.join("; "), /completion\.after 'integration' but no integration stage is declared/);
+  assert.strictEqual(r.completion.after, "gates", "the refused, unreachable word must not be carried, exactly like an unrecognized one");
+  // Declaring the integration block makes the same word legal and it IS carried.
+  const reachable = gates.parseImplementation({ integration: {}, completion: { after: "integration" } });
+  assert.deepStrictEqual(reachable.errors, []);
+  assert.strictEqual(reachable.completion.after, "integration");
+});
+
+test("completion.by / completion.after / candidate.publish read an explicit falsy JSON value, not the default", () => {
+  // `raw.x || default` used to take the default for `0`/`false`/`""` too,
+  // silently — the vocabulary check below is what must refuse them, not a
+  // truthiness test above it that never lets them arrive.
+  const by = gates.parseImplementation({ completion: { by: false } });
+  assert.match(by.errors.join("; "), /completion\.by 'false' must be one of: agent, controller/);
+  assert.strictEqual(by.completion.by, "agent", "a refused value still falls back to the default, just for the right reason");
+
+  const after = gates.parseImplementation({ completion: { after: 0 } });
+  assert.match(after.errors.join("; "), /completion\.after '0' must be one of: gates, integration/);
+  assert.strictEqual(after.completion.after, "gates");
+
+  const publish = gates.parseImplementation({ implementation: { candidate: { publish: false } } });
+  assert.match(publish.errors.join("; "), /implementation\.candidate\.publish 'false' must be one of: none, branch, bundle/);
+  assert.strictEqual(publish.implementation, null, "an unreadable candidate.publish still refuses the stage");
+
+  // `undefined`/`null` remain "not specified" — the file's standing convention
+  // for every other optional sub-key — so those two still take the default.
+  assert.strictEqual(gates.parseImplementation({ completion: { by: null } }).completion.by, "agent");
+  assert.strictEqual(gates.parseImplementation({ completion: { after: undefined } }).completion.after, "gates");
+  assert.deepStrictEqual(gates.parseImplementation({ implementation: { candidate: { publish: null } } }).errors, []);
+});
+
+test("a duplicate gate id in the `gates` list handed to parseImplementation is refused, not silently collapsed to the last one", () => {
+  // `resolveGates` guarantees unique ids for a real factory payload, but
+  // `parseImplementation` is also called directly with a hand-built list
+  // (it stands alone on a payload — see the test below) — nothing there
+  // prevents a caller from passing a duplicate.
+  const dupeGates = [
+    { id: "typecheck", kind: "command" },
+    { id: "typecheck", kind: "agent-review", profile: "profile-codex-review" },
+  ];
+  const r = gates.parseImplementation({ implementation: { author_checks: ["typecheck"] } }, { gates: dupeGates });
+  assert.match(r.errors.join("; "), /implementation: gate list has duplicate id\(s\) typecheck/);
+  assert.strictEqual(r.implementation, null, "a factory built off an ambiguous gate list must refuse, not guess which 'typecheck' was meant");
+  // A deduplicated list (what resolveGates always hands it) is unaffected.
+  const clean = gates.parseImplementation({ implementation: { author_checks: ["typecheck"] } }, { gates: [{ id: "typecheck", kind: "command" }] });
+  assert.deepStrictEqual(clean.errors, []);
+});
+
 test("an implementation stage that did not PARSE must not move the completion boundary", () => {
   // The controller default is keyed on adopting the stage, and a block that
   // refuses the factory adopted nothing — the return value already says so
@@ -899,7 +955,26 @@ test("an implementation stage that did not PARSE must not move the completion bo
   assert.strictEqual(gates.parseImplementation({ implementation: {} }).completion.by, "controller");
   // A completion error of its own is not an implementation failure: the
   // boundary a valid stage asked for is still the one reported.
-  assert.strictEqual(gates.parseImplementation({ implementation: {}, completion: { by: "nobody" } }).completion.by, "controller");
+  const completionOnlyError = gates.parseImplementation({ implementation: {}, completion: { by: "nobody" } });
+  assert.strictEqual(completionOnlyError.completion.by, "controller");
+  // issue-spor-parse-implementation-completion-error-nulls-implementation: the
+  // regression this guards. `implementation` used to be nulled off the
+  // COMBINED `errors` array — which also holds completion errors — so a
+  // completion-only mistake discarded an implementation block that parsed
+  // clean, contradicting both this file's own comment ("Every error pushed so
+  // far came from the implementation: block") and `implementationFailed`
+  // itself, which is computed from exactly that and then ignored at the
+  // return statement.
+  assert.notStrictEqual(completionOnlyError.implementation, null, "a completion-only error must not discard a cleanly parsed implementation block");
+  assert.deepStrictEqual(completionOnlyError.implementation, {
+    profile: "",
+    instructions: "",
+    authorChecks: [],
+    budget: { runMaxMs: null, runIdleMs: null, attempts: 1 },
+    retry: { attempts: 1, backoffMs: 60000 },
+    candidate: { requireClean: true, publish: "none", remote: "" },
+  });
+  assert.deepStrictEqual(completionOnlyError.errors, ["completion.by 'nobody' must be one of: agent, controller"], "errors carries only the one completion mistake");
 });
 
 test("parseImplementation stands alone on a payload, the way parseIntegration and parseRescue do", () => {
@@ -913,6 +988,25 @@ test("parseImplementation stands alone on a payload, the way parseIntegration an
   assert.deepStrictEqual(withGates.errors, []);
   assert.deepStrictEqual(withGates.implementation.authorChecks, ["typecheck"]);
   assert.deepStrictEqual(gates.parseImplementation(null), { implementation: null, completion: { by: "agent", after: "gates" }, errors: [] }, "a payload that is not an object declares no stage");
+});
+
+test("the schema-factory candidate's own worked example parses clean", () => {
+  // The doc's worked example is prose, not a fenced payload the compiler
+  // would ever read at runtime — nothing else exercises it, so a spec drift
+  // (a gate name that moved, a boundary that outran its own stage) can sit
+  // undetected in a document meant to be copied verbatim.
+  const body = fs.readFileSync(path.join(__dirname, "..", "lib", "seed", "candidates", "schema-factory.md"), "utf8");
+  const start = body.indexOf("convention schema nodes use:");
+  assert.notStrictEqual(start, -1, "the doc's own anchor text moved — update this test's extraction");
+  const blockStart = body.indexOf("    {\n", start);
+  const blockEnd = body.indexOf("\n    }\n", blockStart) + "\n    }".length;
+  const indented = body.slice(blockStart, blockEnd);
+  const dedented = indented.replace(/^ {4}/gm, "");
+  const payload = JSON.parse(dedented); // throws if the example itself isn't even valid JSON
+  const gateNodes = new Map([["gate-adversarial-review", { kind: "agent-review", profile: "profile-codex-review" }]]);
+  const { factory, errors } = gates.parseFactory(["```json", JSON.stringify(payload), "```"].join("\n"), { gateNodes });
+  assert.deepStrictEqual(errors, [], `the worked example must parse clean: ${errors.join("; ")}`);
+  assert.ok(factory, "the worked example must produce a factory");
 });
 
 test("parseRescueReport reads the structured diagnosis in code — last fence wins, unknown category reads unknown, prose-only is unread but salvaged", () => {
