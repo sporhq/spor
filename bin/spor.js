@@ -10220,8 +10220,8 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
 // divergence). Extracted to a named export so the EPERM/identity-unknown
 // behavior is pinned directly rather than only indirectly, through a live
 // dispatch.
-function runSupervisorAlive(pid, ticks) {
-  return dispatchRuns.isSameSupervisor(pid, ticks).reallyAlive;
+function runSupervisorAlive(pid, ticks, opts) {
+  return dispatchRuns.isSameSupervisor(pid, ticks, opts).reallyAlive;
 }
 
 // Ask the graph the ONE question WORKERS.md §6 asks — does this run's target
@@ -10518,8 +10518,8 @@ async function dispatchThroughLocked(cfg, values, positionals = []) {
 // the identity fallback for a ticks-less record ("no stamp: the pid probe is
 // all there is") is exactly `isSameSupervisor`'s own identityKnown=false
 // behavior, so no separate ticks branch is needed.
-function workerAlive(pid, ticks) {
-  return dispatchRuns.isSameSupervisor(pid, ticks).reallyAlive;
+function workerAlive(pid, ticks, opts) {
+  return dispatchRuns.isSameSupervisor(pid, ticks, opts).reallyAlive;
 }
 
 function cmdWorkStatus(cfg, { json }) {

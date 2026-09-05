@@ -608,19 +608,22 @@ test("reconcileRuns: a supervised run with no live child to reap has its scratch
 });
 
 test("reconcileRuns: a recycled child_pid is never signaled — identity mismatch leaves the unrelated process alone", async () => {
-  if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
+  // The real `processStartTicks` is Linux-only (/proc); `readTicks` is the
+  // injectable seam that lets this exercise the identity-mismatch branch
+  // deterministically on every platform instead of skipping off Linux
+  // (issue-spor-dispatch-supervisor-test-tick-count-non-linux).
   const home = scratch("spor-runs-store-");
   const unrelated = liveChild();
+  const FAKE_TICKS = 424242;
+  const readTicks = (pid) => (pid === unrelated.pid ? FAKE_TICKS : null);
   try {
     await new Promise((resolve) => unrelated.once("spawn", resolve));
-    const actualTicks = runner.processStartTicks(unrelated.pid);
-    assert.ok(Number.isFinite(actualTicks));
     supervisedRecord(home, "sup-child-reused", {
       runner_pid: deadPid(),
       child_pid: unrelated.pid,
-      child_started_ticks: actualTicks + 999999, // the recorded pid is not THIS process
+      child_started_ticks: FAKE_TICKS + 999999, // the recorded pid is not THIS process
     });
-    const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:10:00.000Z" });
+    const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:10:00.000Z", readTicks });
     assert.strictEqual(out[0].state, "vanished");
     assert.strictEqual(out[0].child_reaped, undefined, "a pid-reuse mismatch is not evidence to kill anything");
     assert.ok(runner.pidAlive(unrelated.pid), "the unrelated process holding the recycled pid was never touched");
@@ -760,29 +763,30 @@ test("reconcileRuns: a long run STILL WRITING to its log is alive however old it
 // mismatch — the timeout heuristic above stays only as the no-evidence fallback.
 
 test("finalizeSupervisedRun: a confirmed identity match is NEVER closed for silence, however long", () => {
-  if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
-  const startTicks = runner.processStartTicks(process.pid);
-  assert.ok(Number.isFinite(startTicks), "the test process itself must yield a real tick count on this platform");
+  // `readTicks` stands in for the real (Linux-only) `processStartTicks`, so
+  // the match branch runs deterministically on every platform instead of
+  // being skipped off Linux (issue-spor-dispatch-supervisor-test-tick-count-non-linux).
+  const FAKE_TICKS = 111222;
+  const readTicks = () => FAKE_TICKS;
   const home = scratch("spor-runs-store-");
-  supervisedRecord(home, "sup-identity-match", { runner_pid: process.pid, runner_started_ticks: startTicks });
+  supervisedRecord(home, "sup-identity-match", { runner_pid: process.pid, runner_started_ticks: FAKE_TICKS });
   // Ten days of silence — far past staleMs — but identity is confirmed, so the
   // freshness ceiling never even applies.
-  const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-28T10:00:00.000Z" });
+  const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-28T10:00:00.000Z", readTicks });
   assert.strictEqual(out[0].state, "running", "identity match overrides the silence heuristic entirely");
 });
 
 test("finalizeSupervisedRun: an identity MISMATCH closes the run immediately, no silence required", () => {
-  if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
-  const startTicks = runner.processStartTicks(process.pid);
-  assert.ok(Number.isFinite(startTicks), "the test process itself must yield a real tick count on this platform");
+  const FAKE_TICKS = 111222;
+  const readTicks = () => FAKE_TICKS;
   const home = scratch("spor-runs-store-");
   // The recorded tick count does not match this pid's ACTUAL start time — the
   // pid was reused by a different process than the one we launched.
-  const rec = supervisedRecord(home, "sup-identity-mismatch", { runner_pid: process.pid, runner_started_ticks: startTicks + 999999 });
+  const rec = supervisedRecord(home, "sup-identity-mismatch", { runner_pid: process.pid, runner_started_ticks: FAKE_TICKS + 999999 });
   fs.mkdirSync(path.dirname(rec.log_path), { recursive: true });
   fs.writeFileSync(rec.log_path, JSON.stringify({ type: "item.completed" }) + "\n");
   // Barely past the registration grace window, well short of staleMs.
-  const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:01:30.000Z" });
+  const out = runner.reconcileRuns(home, { agents: [], now: () => "2026-07-18T10:01:30.000Z", readTicks });
   assert.strictEqual(out[0].state, "vanished");
   assert.strictEqual(out[0].termination_signal, "supervisor-pid-reused");
   assert.match(out[0].termination_reason, /kernel start-time no longer matches/);
@@ -829,13 +833,12 @@ test("supervisorAliveProbe: EPERM (pid exists, no permission to signal) reads al
 });
 
 test("isSameSupervisor: EPERM plus a MATCHING kernel start-time is still our supervisor, e.g. root-owned after a privilege drop", () => {
-  if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
-  const startTicks = runner.processStartTicks(process.pid);
-  assert.ok(Number.isFinite(startTicks), "the test process itself must yield a real tick count on this platform");
+  const FAKE_TICKS = 55123;
+  const readTicks = () => FAKE_TICKS;
   const originalKill = process.kill;
   try {
     process.kill = () => { const err = new Error("no permission"); err.code = "EPERM"; throw err; };
-    const evidence = runner.isSameSupervisor(process.pid, startTicks);
+    const evidence = runner.isSameSupervisor(process.pid, FAKE_TICKS, { readTicks });
     assert.strictEqual(evidence.reallyAlive, true, "EPERM must not read as dead once identity is verified");
     assert.strictEqual(evidence.identityKnown, true);
   } finally {
@@ -844,13 +847,12 @@ test("isSameSupervisor: EPERM plus a MATCHING kernel start-time is still our sup
 });
 
 test("isSameSupervisor: EPERM plus a MISMATCHED kernel start-time is a recycled pid, not our supervisor, however alive it answers", () => {
-  if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
-  const startTicks = runner.processStartTicks(process.pid);
-  assert.ok(Number.isFinite(startTicks), "the test process itself must yield a real tick count on this platform");
+  const FAKE_TICKS = 55123;
+  const readTicks = () => FAKE_TICKS;
   const originalKill = process.kill;
   try {
     process.kill = () => { const err = new Error("no permission"); err.code = "EPERM"; throw err; };
-    const evidence = runner.isSameSupervisor(process.pid, startTicks + 999999);
+    const evidence = runner.isSameSupervisor(process.pid, FAKE_TICKS + 999999, { readTicks });
     assert.strictEqual(evidence.reallyAlive, false, "a confirmed identity mismatch is a reused pid regardless of EPERM");
     assert.strictEqual(evidence.identityKnown, true);
   } finally {
@@ -859,16 +861,15 @@ test("isSameSupervisor: EPERM plus a MISMATCHED kernel start-time is a recycled 
 });
 
 test("terminalOutcomeBackfill: holds off only while the pid is VERIFIABLY still our supervisor (EPERM included) — a recycled pid is repaired instead of held open forever", () => {
-  if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
-  const startTicks = runner.processStartTicks(process.pid);
-  assert.ok(Number.isFinite(startTicks), "the test process itself must yield a real tick count on this platform");
+  const FAKE_TICKS = 90909;
+  const readTicks = () => FAKE_TICKS;
   const originalKill = process.kill;
   try {
     process.kill = () => { const err = new Error("no permission"); err.code = "EPERM"; throw err; };
-    const stillOurs = { run_id: "sup-eperm-match", state: "vanished", launch_mode: "supervised-jsonl", runner_pid: process.pid, runner_started_ticks: startTicks };
-    assert.strictEqual(runner.terminalOutcomeBackfill(stillOurs), null, "the supervisor is genuinely still alive (EPERM-unowned) and may still be mid-contract");
-    const recycled = { run_id: "sup-eperm-mismatch", state: "vanished", launch_mode: "supervised-jsonl", runner_pid: process.pid, runner_started_ticks: startTicks + 999999 };
-    const backfilled = runner.terminalOutcomeBackfill(recycled);
+    const stillOurs = { run_id: "sup-eperm-match", state: "vanished", launch_mode: "supervised-jsonl", runner_pid: process.pid, runner_started_ticks: FAKE_TICKS };
+    assert.strictEqual(runner.terminalOutcomeBackfill(stillOurs, { readTicks }), null, "the supervisor is genuinely still alive (EPERM-unowned) and may still be mid-contract");
+    const recycled = { run_id: "sup-eperm-mismatch", state: "vanished", launch_mode: "supervised-jsonl", runner_pid: process.pid, runner_started_ticks: FAKE_TICKS + 999999 };
+    const backfilled = runner.terminalOutcomeBackfill(recycled, { readTicks });
     assert.ok(backfilled, "a pid that answers EPERM but no longer matches our recorded identity is not our supervisor — repair the record");
     assert.strictEqual(backfilled.terminal_enforced, false);
   } finally {
@@ -899,20 +900,19 @@ test("activeRuns: EPERM (pid exists, no permission to signal) still counts as ac
 });
 
 test("activeRuns: EPERM plus a MISMATCHED kernel start-time is a recycled pid, dropped from the active set", () => {
-  if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
   const home = scratch("spor-active-runs-mismatch-");
   const dir = path.join(home, "journal", "dispatch");
   fs.mkdirSync(dir, { recursive: true });
-  const startTicks = runner.processStartTicks(process.pid);
-  assert.ok(Number.isFinite(startTicks), "the test process itself must yield a real tick count on this platform");
+  const FAKE_TICKS = 70007;
+  const readTicks = () => FAKE_TICKS;
   fs.writeFileSync(
     path.join(dir, "r1.run.json"),
-    JSON.stringify({ run_id: "r1", state: "running", runner_pid: process.pid, runner_started_ticks: startTicks + 999999, name: "demo" })
+    JSON.stringify({ run_id: "r1", state: "running", runner_pid: process.pid, runner_started_ticks: FAKE_TICKS + 999999, name: "demo" })
   );
   const originalKill = process.kill;
   try {
     process.kill = () => { const err = new Error("no permission"); err.code = "EPERM"; throw err; };
-    const active = runner.activeRuns(home, {});
+    const active = runner.activeRuns(home, {}, { readTicks });
     assert.deepStrictEqual(active, [], "a confirmed identity mismatch is a reused pid, not our supervisor — must not read as active however alive it answers");
   } finally {
     process.kill = originalKill;
@@ -931,14 +931,13 @@ test("runSupervisorAlive (bin/spor.js's alive() for workLoop.runHarvest): EPERM 
 });
 
 test("runSupervisorAlive (bin/spor.js's alive() for workLoop.runHarvest): EPERM plus a MISMATCHED kernel start-time is not our supervisor", () => {
-  if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
   const sporjs = require("../bin/spor.js");
-  const startTicks = runner.processStartTicks(process.pid);
-  assert.ok(Number.isFinite(startTicks), "the test process itself must yield a real tick count on this platform");
+  const FAKE_TICKS = 24680;
+  const readTicks = () => FAKE_TICKS;
   const originalKill = process.kill;
   try {
     process.kill = () => { const err = new Error("no permission"); err.code = "EPERM"; throw err; };
-    assert.strictEqual(sporjs.runSupervisorAlive(process.pid, startTicks + 999999), false, "a confirmed identity mismatch is a reused pid regardless of EPERM");
+    assert.strictEqual(sporjs.runSupervisorAlive(process.pid, FAKE_TICKS + 999999, { readTicks }), false, "a confirmed identity mismatch is a reused pid regardless of EPERM");
   } finally {
     process.kill = originalKill;
   }
@@ -964,14 +963,13 @@ test("workerAlive (bin/spor.js's alive() for `spor work --status`): EPERM does n
 });
 
 test("workerAlive (bin/spor.js's alive() for `spor work --status`): EPERM plus a MISMATCHED kernel start-time is not this worker", () => {
-  if (process.platform !== "linux") return; // processStartTicks is Linux-only (/proc)
   const sporjs = require("../bin/spor.js");
-  const startTicks = runner.processStartTicks(process.pid);
-  assert.ok(Number.isFinite(startTicks), "the test process itself must yield a real tick count on this platform");
+  const FAKE_TICKS = 13579;
+  const readTicks = () => FAKE_TICKS;
   const originalKill = process.kill;
   try {
     process.kill = () => { const err = new Error("no permission"); err.code = "EPERM"; throw err; };
-    assert.strictEqual(sporjs.workerAlive(process.pid, startTicks + 999999), false, "a confirmed identity mismatch is a reused pid regardless of EPERM");
+    assert.strictEqual(sporjs.workerAlive(process.pid, FAKE_TICKS + 999999, { readTicks }), false, "a confirmed identity mismatch is a reused pid regardless of EPERM");
   } finally {
     process.kill = originalKill;
   }
@@ -1395,9 +1393,15 @@ test("stopRun: the whole process GROUP is signalled, escalated to SIGKILL, and i
       }
       const grandchild = Number(pidText);
       assert.ok(grandchild > 0 && runner.pidAlive(grandchild), "the fixture must actually have a live grandchild to stop");
+      // `readTicks` stands in for the real (Linux-only) `processStartTicks`,
+      // so identity is provably known on every platform and the group arm
+      // (gated on `identityKnown`) is exercised deterministically instead of
+      // silently degrading to a per-pid signal off Linux
+      // (issue-spor-dispatch-supervisor-test-tick-count-non-linux).
+      const FAKE_TICKS = 314159;
       const stopped = await runner.stopRun(
-        { run_id: "stop-group", runner_pid: leader.pid, runner_started_ticks: runner.processStartTicks(leader.pid) },
-        { graceMs: 300 }
+        { run_id: "stop-group", runner_pid: leader.pid, runner_started_ticks: FAKE_TICKS },
+        { graceMs: 300, readTicks: () => FAKE_TICKS }
       );
       assert.strictEqual(stopped.group, true, "identity was proven, so the group is signalled");
       assert.strictEqual(await gone(leader.pid), true);
@@ -1423,11 +1427,15 @@ test("stopRun: the whole process GROUP is signalled, escalated to SIGKILL, and i
 
   // A recycled pid belongs to an unrelated process: killing THAT is a real
   // mistake, not cleanup, so a tick-count mismatch signals nothing — and
-  // nothing is escalated against either.
-  if (process.platform === "linux") {
+  // nothing is escalated against either. `readTicks` makes this deterministic
+  // on every platform (issue-spor-dispatch-supervisor-test-tick-count-non-linux),
+  // rather than only ever running on Linux.
+  {
+    const MISMATCH_TICKS = 271828;
+    const readTicks = () => MISMATCH_TICKS;
     const bystander = alive();
     try {
-      const stopped = await runner.stopRun({ run_id: "stop-2", runner_pid: bystander.pid, runner_started_ticks: runner.processStartTicks(bystander.pid) + 1 }, { graceMs: 50 });
+      const stopped = await runner.stopRun({ run_id: "stop-2", runner_pid: bystander.pid, runner_started_ticks: MISMATCH_TICKS + 1 }, { graceMs: 50, readTicks });
       assert.deepStrictEqual(stopped, { child: false, supervisor: false, group: false, alive: false });
       assert.strictEqual(runner.pidAlive(bystander.pid), true, "an unrelated process that inherited the pid is left alone");
     } finally {
@@ -1437,7 +1445,7 @@ test("stopRun: the whole process GROUP is signalled, escalated to SIGKILL, and i
     // supervisor is already gone: no group to signal, and not ours to kill.
     const orphan = alive();
     try {
-      const stopped = await runner.stopRun({ run_id: "stop-4", child_pid: orphan.pid, child_started_ticks: runner.processStartTicks(orphan.pid) + 1 }, { graceMs: 50 });
+      const stopped = await runner.stopRun({ run_id: "stop-4", child_pid: orphan.pid, child_started_ticks: MISMATCH_TICKS + 1 }, { graceMs: 50, readTicks });
       assert.strictEqual(stopped.child, false);
       assert.strictEqual(runner.pidAlive(orphan.pid), true);
     } finally {

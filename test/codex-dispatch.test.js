@@ -233,11 +233,22 @@ test("a supervised run whose supervisor is KILLED mid-run is reconciled to a ter
   });
   assert.ok(recordPath, "the supervisor reported its child running");
   const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  // This launch runs as a REAL detached CLI subprocess, so there is no seam to
+  // inject a fake tick-reader into it (unlike the unit-level identity tests in
+  // dispatch-runs.test.js, which take an injectable `readTicks` instead of
+  // skipping — issue-spor-dispatch-supervisor-test-tick-count-non-linux). The
+  // real `processStartTicks` is Linux-only (/proc), so the platform branch is
+  // made explicit both ways rather than silently asserting nothing off Linux.
   if (process.platform === "linux") {
-    // processStartTicks is Linux-only (/proc); elsewhere it stays null by design.
     assert.ok(
       Number.isFinite(record.runner_started_ticks),
       "a real launch stamps the supervisor's kernel start-time tick count (issue-spor-dispatch-supervisor-identity-stale-timeout)"
+    );
+  } else {
+    assert.strictEqual(
+      record.runner_started_ticks,
+      undefined,
+      "off Linux, processStartTicks always returns null, so nothing is stamped by design"
     );
   }
   for (const pid of [record.runner_pid, record.child_pid]) {
