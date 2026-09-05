@@ -1546,19 +1546,49 @@ test("verifyNoCodeOutcome demands a write a do-nothing run could not have made, 
   assert.strictEqual(ok.found, null, "a rescope is a MOVE, not a finding — it needs no found node");
   assert.match(ok.detail, /re-stamped from repo 'spor-server' to 'spor'/);
 
-  // Supersession is the other movement, in its three readable forms.
+  // A `rescoped` claim is a MOVE and ONLY a move: no supersession, however
+  // asserted, is evidence for it.
   const same = { id: "task-a", repo: "spor-server", status: "open" };
-  assert.match(verify({ "art-scoping": resolver, "task-a": { ...same, status: "superseded" } }).detail, /superseded \(status\)/);
-  assert.match(verify({ "art-scoping": resolver, "task-a": { ...same, superseded_by: "task-b" } }).detail, /superseded by task-b/);
-  assert.match(verify({ "art-scoping": { ...resolver, edges: [{ type: "supersedes", to: "task-a" }] }, "task-a": same }).detail, /superseded by art-scoping/);
+  for (const item of [{ ...same, status: "superseded" }, { ...same, superseded_by: "task-b" }]) {
+    const r = verify({ "art-scoping": resolver, "task-a": item });
+    assert.strictEqual(r.ok, false);
+    assert.match(r.reason, /a 'rescoped' outcome has to re-stamp the item to the repo that owns it/);
+  }
 
-  // THE hole this check exists to close: a live resolving edge is the
+  // THE two holes this check exists to close. A live resolving edge is the
   // precondition for being gated at all, so a run that did nothing but write
-  // its resolver already has one. It is not movement.
+  // its resolver already has one...
   const unchanged = verify({ "art-scoping": resolver, "task-a": { ...same, status: "done" } });
   assert.strictEqual(unchanged.ok, false);
   assert.match(unchanged.reason, /task-a is unchanged/);
   assert.match(unchanged.reason, /being resolved is what got this run gated in the first place/);
+  // ...and the resolver is the one node the run certainly authored, so a
+  // supersession it asserts about the item is exactly as free.
+  const selfSupersede = gates.verifyNoCodeOutcome({
+    nodeId: "task-a",
+    claim: { ok: true, outcome: "duplicate", resolver: "art-scoping", reason: "" },
+    claimedRepo: "spor-server",
+    nodes: {
+      "art-scoping": { ...resolver, outcome: "duplicate", edges: [{ type: "supersedes", to: "task-a" }, { type: "derived-from", to: "task-b" }] },
+      "task-a": { ...same, superseded_by: "art-scoping" },
+      "task-b": { id: "task-b" },
+    },
+  });
+  assert.strictEqual(selfSupersede.ok, false);
+  assert.match(selfSupersede.reason, /the only thing superseding it is `art-scoping`, the very node this run declared/);
+  // The same claim with a THIRD party asserting the supersession passes.
+  const byOther = gates.verifyNoCodeOutcome({
+    nodeId: "task-a",
+    claim: { ok: true, outcome: "duplicate", resolver: "art-scoping", reason: "" },
+    claimedRepo: "spor-server",
+    nodes: {
+      "art-scoping": { ...resolver, outcome: "duplicate", edges: [{ type: "relates-to", to: "task-a" }, { type: "derived-from", to: "task-b" }] },
+      "task-a": { ...same, superseded_by: "task-b" },
+      "task-b": { id: "task-b" },
+    },
+  });
+  assert.strictEqual(byOther.ok, true);
+  assert.match(byOther.detail, /superseded by task-b/);
 
   // Every other refusal names its own check.
   const refusals = [
@@ -1606,6 +1636,26 @@ test("a FINDING outcome names a node that exists — candidates exclude the item
   const naked = verify({ "art-scoping": { ...resolver, edges: [{ type: "relates-to", to: "task-a" }] }, "task-a": moved });
   assert.strictEqual(naked.ok, false);
   assert.match(naked.reason, /names nothing it found/);
+
+  // An id that spells an Object.prototype key is not a node: the existence
+  // check is an OWN-key lookup, or `derived-from: constructor` would read as
+  // present and re-open the dangling-edge bypass.
+  const proto = gates.verifyNoCodeOutcome({
+    nodeId: "task-a",
+    claim,
+    claimedRepo: "spor-server",
+    nodes: { "art-scoping": { ...resolver, edges: [{ type: "relates-to", to: "task-a" }, { type: "derived-from", to: "constructor" }] }, "task-a": moved },
+  });
+  assert.strictEqual(proto.ok, false);
+  assert.match(proto.reason, /names `constructor` as what it found, and no such node is on the graph/);
+
+  // The read-back CAP lives with the candidate list, so the refusal can never
+  // name a target the check did not actually test.
+  assert.strictEqual(gates.NO_CODE_FOUND_READS, 4);
+  assert.deepStrictEqual(
+    gates.noCodeFoundCandidates({ nodeId: "task-a", resolver: { id: "art-scoping", edges: [1, 2, 3, 4, 5, 6].map((n) => ({ type: "derived-from", to: `art-${n}` })) } }),
+    ["art-1", "art-2", "art-3", "art-4"]
+  );
 
   // A found edge pointing back at the ITEM, or at the resolver itself, is not
   // a finding about it — neither is offered as a candidate.

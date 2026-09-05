@@ -55,8 +55,9 @@ Two more surfaces worth reading before concluding anything:
   fastest read of what the factory keeps getting wrong.
 - the **no-code outcomes** — runs whose real work was scoping, not code
   (WORKERS.md §10.11). Those settle `scoped`, not `passed`: no gate ran, the
-  item was re-stamped to the repo that owns it or superseded, and
-  `art-gate-scoping-…` records the claim the runner verified. `spor work --status` counts them beside
+  item was re-stamped to the repo that owns it (or, for a finding outcome,
+  superseded by another node), and `art-gate-scoping-…` records the claim the
+  runner verified. `spor work --status` counts them beside
   passed/failed/blocked. Read them before concluding a factory is being
   bypassed — a rising `scoped` count is a QUEUE signal (items whose premise
   went stale before a worker reached them), not a gate one, and the fix is

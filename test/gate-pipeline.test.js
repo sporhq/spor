@@ -5129,25 +5129,39 @@ test("a resolver alone is NOT movement: a do-nothing run that resolved its item 
   assert.strictEqual(res.state, "failed");
   assert.match(res.reason, /task-demo is unchanged/);
   assert.match(res.reason, /being resolved is what got this run gated in the first place/);
+  assert.match(res.reason, /has to re-stamp the item to the repo that owns it/);
   assert.strictEqual(seen.escalations.length, 1);
   assert.strictEqual(seen.demotions.length, 1);
   assert.ok(!seen.facts.some((f) => f.id.startsWith("art-gate-scoping-")));
 });
 
-test("supersession is the other movement: an item superseded by status, by the graph, or by the resolver itself", async () => {
+test("supersession is the other movement for a FINDING outcome — but never a supersession the run wrote itself", async () => {
   const factory = factoryOf(NO_CODE_FACTORY);
   const same = { id: "task-demo", type: "task", status: "open", repo: "demo", edges: [] };
-  const worlds = [
-    [{ "art-scoping-x": SCOPING_NODE, "task-demo": { ...same, status: "superseded" } }, /superseded \(status\)/],
-    [{ "art-scoping-x": SCOPING_NODE, "task-demo": { ...same, superseded_by: "task-canonical" } }, /superseded by task-canonical/],
-    [{ "art-scoping-x": { ...SCOPING_NODE, edges: [{ type: "supersedes", to: "task-demo" }] }, "task-demo": same }, /superseded by art-scoping-x/],
-  ];
-  for (const [nodes, expected] of worlds) {
-    const { deps } = withNoCode(fakes({ changed: [] }), { nodes });
-    const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
-    assert.strictEqual(res.state, "scoped", `${expected}`);
-    assert.match(res.reason, expected);
-  }
+  const dup = { ...SCOPING_NODE, outcome: "duplicate", edges: [{ type: "relates-to", to: "task-demo" }, { type: "derived-from", to: "task-canonical" }] };
+  const report = "SCOPED: duplicate art-scoping-x — the same work as task-canonical";
+  const canonical = { id: "task-canonical", type: "task", edges: [] };
+
+  // Another node asserts the supersession: a write this run could not have
+  // made on its own.
+  const ok = withNoCode(fakes({ changed: [] }), { report, nodes: { "art-scoping-x": dup, "task-demo": { ...same, superseded_by: "task-canonical" }, "task-canonical": canonical } });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: ok.deps });
+  assert.strictEqual(res.state, "scoped");
+  assert.match(res.reason, /superseded by task-canonical/);
+
+  // The SAME shape where the only thing superseding the item is the node this
+  // run declared is refused: the resolver is the one node it certainly wrote.
+  const self = withNoCode(fakes({ changed: [] }), { report, nodes: { "art-scoping-x": { ...dup, edges: [...dup.edges, { type: "supersedes", to: "task-demo" }] }, "task-demo": { ...same, superseded_by: "art-scoping-x" }, "task-canonical": canonical } });
+  const refused = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: self.deps });
+  assert.strictEqual(refused.state, "failed");
+  assert.match(refused.reason, /the only thing superseding it is `art-scoping-x`, the very node this run declared/);
+
+  // ...and a `rescoped` claim is a MOVE and only a move: even a third party's
+  // supersession is the wrong evidence for it.
+  const wrong = withNoCode(fakes({ changed: [] }), { nodes: { "art-scoping-x": SCOPING_NODE, "task-demo": { ...same, superseded_by: "task-canonical" } } });
+  const no = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: wrong.deps });
+  assert.strictEqual(no.state, "failed");
+  assert.match(no.reason, /a 'rescoped' outcome has to re-stamp the item to the repo that owns it/);
 });
 
 test("a premise-stale outcome must name a node that EXISTS — a dangling edge demonstrates nothing", async () => {

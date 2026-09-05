@@ -799,6 +799,7 @@ violation — new fields may be added additively.
 | `launch_mode` | string | `"native-background"` (detaches into the harness's own daemon) or `"supervised-jsonl"` (runs under a supervisor Spor owns) |
 | `state` | string | `"launching"` → `"running"` → one of the **terminal** process states: `"done"`, `"failed"`, `"failed_launch"`, `"vanished"` |
 | `cwd` | string | the run's working directory |
+| `project` | string \| null | optional, supervised runs only — the target item's own repo stamp **as claimed**, recorded at launch. It is the "before" value the no-code-outcome re-stamp check compares against (§10.11), so it must not be re-read from the item later; absent on a record predating it, and on a free-text dispatch |
 | `model` | string \| null | **native-background records only** — the model override this launch resolved (`--model`, else the profile's), `null` when none did; the key is always present on a native record. A supervised record does not carry the field at all — its model is fixed into the harness argv at launch |
 | `created_at` | ISO 8601 | when the record was opened |
 | `started_at` | ISO 8601 | supervised runs only — when the child process actually started |
@@ -2361,23 +2362,35 @@ round-trip (`verifyNoCodeOutcome` in `lib/kernel/gates.js`, routed by
    of the three;
 3. the node it names is readable, declares the **same** `outcome:`, and
    carries an edge to the work item;
-4. the item **moved** — either its `repo:` now differs from the repo this
-   pipeline claimed it under (a re-stamp), or it is superseded (its own status,
-   an inbound `supersedes` edge, or the declaring node superseding it);
+4. the item **moved**. For `rescoped` that means one thing only: its `repo:`
+   now differs from the repo this pipeline claimed it under — the re-stamp the
+   worker contract asks for. `premise-stale` and `duplicate` may show that or a
+   **supersession asserted by some other node** (the item's `superseded_by`,
+   which the server reports and the local graph indexes);
 5. and for `premise-stale`/`duplicate`, the node **names what it found** — a
    `derived-from`/`supersedes` edge to a node that is neither the item nor the
    resolver, and that **exists on the graph**: a dangling edge is a shape the
    graph accepts by design, so its presence demonstrates nothing.
 
-What check 4 deliberately does **not** accept is "the item reads resolved". A
-live resolving edge is the *precondition for being gated at all* (§10.2), so a
-run that did nothing but write its resolver already has one — counting it would
-let a single extra frontmatter key route exactly the "resolved with nothing
-behind it" run the empty-diff refusal names in its own text. What it demands
-instead is a write the run could not have made by doing nothing. And the
-re-stamp branch is run-relative on top of that: it cannot be satisfied twice,
-because the next pipeline claims the item under the repo the first one moved it
-to.
+Check 4 demands a write the run could not have made **on its own**, and two
+things are deliberately not that:
+
+- **"the item reads resolved."** A live resolving edge is the *precondition for
+  being gated at all* (§10.2), so a run that did nothing but write its resolver
+  already has one. Counting it would let a single extra frontmatter key route
+  exactly the "resolved with nothing behind it" run the empty-diff refusal names
+  in its own text.
+- **a supersession asserted by the declaring node itself.** The resolver is the
+  one node the run certainly authored, so `art-x supersedes task-a` is one more
+  self-write — and locally it is the *same fact*, since the graph's
+  `supersededBy` index is fed by any node's own `supersedes` edge.
+
+The re-stamp branch is run-relative on top of that: it cannot be satisfied
+twice, because the next pipeline claims the item under the repo the first one
+moved it to. That "claimed under" value is the repo stamp the item carried **at
+dispatch** — carried on the worker's slot, and on the run record so
+`spor work --regate` compares against the same thing rather than against the
+item's own current stamp.
 
 **If it checks out**, the pipeline settles **`scoped`**: an idempotent
 `art-gate-scoping-…` fact is recorded with verdict `scoped` (`relates-to` the

@@ -8762,6 +8762,13 @@ async function launchSupervisedHarness(cfg, {
     // gate reading the implementer's checkout) is not a writer
     // (task-spor-worker-preflight-validation).
     ...(readOnly ? { read_only: true } : {}),
+    // The item's repo stamp AS CLAIMED, on the durable record rather than only
+    // in the job file (which is pruned): it is the "before" value the no-code
+    // outcome's re-stamp check compares against (WORKERS.md §10.11), and
+    // reading the node's CURRENT stamp instead would make that check compare a
+    // value with itself. The loop's own slot carries the same value; this is
+    // how `spor work --regate` gets it too.
+    ...(project ? { project } : {}),
     log_path: p.log,
     report_path: p.report,
   };
@@ -13376,13 +13383,19 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   }
   // Attempt 1 was the pipeline that refused; each re-gate counts up from there.
   const attempt = (Number(record.gate_regate_count) || 0) + 2;
-  // The item's OWN repo stamp, exactly as the loop's slot would carry it.
-  let project = slug || null;
-  try {
-    const node = await resolveNode(cfg, record.node_id);
-    if (node && (node.repo || node.project)) project = node.repo || node.project;
-  } catch {
-    /* the worker's scope token stands in */
+  // The item's OWN repo stamp, exactly as the loop's slot would carry it --
+  // which means AS CLAIMED, not as it reads now. The record carries it since
+  // task-spor-factory-no-code-outcome-convention; for a record predating that,
+  // the current stamp is the best available reading (it is also what this did
+  // before), with the worker's scope token as the last resort.
+  let project = record.project || slug || null;
+  if (!record.project) {
+    try {
+      const node = await resolveNode(cfg, record.node_id);
+      if (node && (node.repo || node.project)) project = node.repo || node.project;
+    } catch {
+      /* the worker's scope token stands in */
+    }
   }
   // Bring the implementer's branch up to the trusted ref BEFORE judging it
   // (issue-spor-command-gate-judges-stale-branch-base): the usual reason a
@@ -13444,7 +13457,9 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     return 1;
   }
   // The refusal's graph state, undone: the escalation it filed is answered by
-  // a record of this pass, and the completion status it rolled back comes back.
+  // a record of this pass, and -- for a PASS -- the completion status it rolled
+  // back comes back. A `scoped` re-judgement answers the escalation but leaves
+  // the rollback standing; see the branch below for why.
   const notes = [];
   if (escalatedBefore.length) {
     const closed = await writeRegateArtifact(cfg, { record, entry, factoryId, previous, reason, escalatedTo: escalatedBefore, project, state });
