@@ -8178,9 +8178,12 @@ function localDispatchLockFile(home, name) {
 }
 // Returns the payload actually written, so the caller can later prove it is
 // still the recorded holder before touching the file again (releaseLocalDispatchLock).
-function writeLocalDispatchLock(file) {
+// `extra` merges in caller-specific fields (the integration lease's declared
+// `budgetMs`, see acquireLocalIntegrationLease) without changing the
+// dispatch lock's own byte-for-byte payload shape, since it never passes any.
+function writeLocalDispatchLock(file, extra = {}) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const payload = { pid: process.pid, started_ticks: dispatchRuns.processStartTicks(process.pid), at: new Date().toISOString() };
+  const payload = { pid: process.pid, started_ticks: dispatchRuns.processStartTicks(process.pid), at: new Date().toISOString(), ...extra };
   fs.writeFileSync(file, JSON.stringify(payload), { flag: "wx" });
   return payload;
 }
@@ -13139,8 +13142,17 @@ function makeGateDeps(
     // The per-gate serialize lease (task-spor-gate-serialize-lease) reuses the
     // integration stage's: keyed on the repo's MAIN checkout locally, the
     // synthetic per-repo lock node remotely, so a `serialize: repo` command
-    // gate and the integration stage never overlap on one box either.
-    acquireGateLease: () => acquireIntegrationLease(cfg, home, change ? change.top : record && record.cwd, { slug }),
+    // gate and the integration stage never overlap on one box either. Unlike
+    // the integration stage's own short landing pass, sized to THIS gate's
+    // own declared run (issue-spor-serialize-lease-does-not-wait-out-a-long-
+    // suite) — a 30min CPU-bound suite waits out a same-sized holder instead
+    // of running beside it, judges a live holder's staleness against its own
+    // declared budget rather than a fixed 30min, and stretches a remote
+    // claim's TTL up front to cover the whole run.
+    acquireGateLease: ({ gate } = {}) => {
+      const budgetMs = gateLeaseBudgetMs(gate);
+      return acquireIntegrationLease(cfg, home, change ? change.top : record && record.cwd, { slug, waitMs: budgetMs, budgetMs });
+    },
     releaseGateLease: (token) => releaseIntegrationLease(cfg, token),
     review,
     fix,
@@ -13433,9 +13445,30 @@ async function retryOneEscalation(
 // claim-lease "Local mode"), so it falls back to a machine-local lockfile
 // scoped to the repo's own path — the one thing this lease can still
 // coordinate offline: two `spor work` loops on the SAME box.
-const INTEGRATION_LEASE_STALE_MS = 30 * 60 * 1000; // older than any real integration pass could legitimately run
+const INTEGRATION_LEASE_STALE_MS = 30 * 60 * 1000; // the fallback ceiling when a holder declared no budgetMs — sized for the integration stage's own short landing pass
 const INTEGRATION_LEASE_WAIT_MS = 20000; // how long to wait for a busy lease before proceeding without one
 const INTEGRATION_LEASE_POLL_MS = 1000;
+const REMOTE_INTEGRATION_LEASE_POLL_MS = 5000; // coarser than the local lockfile's 1s poll — this is a network round trip, not a stat()
+const INTEGRATION_LEASE_EXTEND_ATTEMPTS = 3; // the TTL stretch is the lease's ONE chance to outlive a long suite — worth a couple of retries on a transient blip
+const INTEGRATION_LEASE_EXTEND_RETRY_MS = 1000;
+// A `serialize: repo` command gate reuses this lease, but its suite is sized
+// for the GATE's own run, not the integration stage's short landing pass
+// (issue-spor-serialize-lease-does-not-wait-out-a-long-suite): the fixed 20s
+// wait and 30min staleness ceiling below were both tuned for the latter, and
+// a CPU-bound suite of 3min-quiet/30min-contended blows past both — a second
+// gate tree then runs beside the first, which is exactly what `serialize`
+// promises never happens (WORKERS.md §10.3). `gateLeaseBudgetMs` sizes the
+// wait/staleness/TTL to the gate's OWN declared budget instead —
+// `timeout_ms` × (reruns+1), the same bound the gate runner itself uses to
+// decide when the suite has failed, plus headroom for the throwaway tree's
+// own setup/teardown (staging node_modules, a pinned sibling checkout) around
+// each attempt.
+const GATE_LEASE_BUDGET_MARGIN_MS = 5 * 60 * 1000;
+function gateLeaseBudgetMs(gate) {
+  const timeoutMs = Number.isFinite(gate && gate.timeoutMs) && gate.timeoutMs > 0 ? gate.timeoutMs : gatesKernel.GATE_DEFAULTS.commandTimeoutMs;
+  const attempts = gatesKernel.rerunCap(gate) + 1;
+  return timeoutMs * attempts + GATE_LEASE_BUDGET_MARGIN_MS;
+}
 
 function integrationLeaseKey(top) {
   // The repo's durable MAIN checkout, never the per-item worktree `top`
@@ -13460,15 +13493,21 @@ function integrationLeaseKey(top) {
 async function acquireLocalIntegrationLease(
   home,
   top,
-  { sleep = (ms) => new Promise((r) => setTimeout(r, ms)), waitMs = INTEGRATION_LEASE_WAIT_MS, pollMs = INTEGRATION_LEASE_POLL_MS } = {}
+  {
+    sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+    waitMs = INTEGRATION_LEASE_WAIT_MS,
+    pollMs = INTEGRATION_LEASE_POLL_MS,
+    budgetMs, // this ACQUIRE's own declared run length, stamped on the lock so a later contender judges staleness against it (see below) instead of the fixed default
+  } = {}
 ) {
   const dir = path.join(home, "journal", "integration-lease");
   const file = path.join(dir, `${integrationLeaseKey(top)}.lock`);
   const deadline = Date.now() + waitMs;
+  const extra = Number.isFinite(budgetMs) && budgetMs > 0 ? { budgetMs } : {};
   for (;;) {
     try {
       fs.mkdirSync(dir, { recursive: true });
-      const payload = writeLocalDispatchLock(file);
+      const payload = writeLocalDispatchLock(file, extra);
       return { kind: "lockfile", file, payload };
     } catch (e) {
       if (e.code !== "EEXIST") return null; // an unwritable journal is not worth blocking integration over
@@ -13482,14 +13521,21 @@ async function acquireLocalIntegrationLease(
         try {
           const raw = readLockRaw(file);
           const held = raw ? JSON.parse(raw) : null;
-          stale = !held || Date.now() - (Date.parse(held.at || "") || 0) > INTEGRATION_LEASE_STALE_MS || !workerAlive(held.pid, held.started_ticks);
+          // The HOLDER's own declared budget (if it stamped one) replaces the
+          // fixed 30min ceiling — a suite legitimately running longer than
+          // that default is not stale just because it is CPU-bound
+          // (issue-spor-serialize-lease-does-not-wait-out-a-long-suite). A
+          // holder with no budgetMs (the integration stage's own short pass,
+          // or an older lockfile) keeps the original constant.
+          const staleCeilingMs = held && Number.isFinite(held.budgetMs) && held.budgetMs > 0 ? held.budgetMs : INTEGRATION_LEASE_STALE_MS;
+          stale = !held || Date.now() - (Date.parse(held.at || "") || 0) > staleCeilingMs || !workerAlive(held.pid, held.started_ticks);
         } catch {
           stale = true; // an unreadable lock file cannot be honored as a live one
         }
         if (stale) {
           try {
             fs.rmSync(file, { force: true });
-            const payload = writeLocalDispatchLock(file);
+            const payload = writeLocalDispatchLock(file, extra);
             return { kind: "lockfile", file, payload };
           } catch (e) {
             // EEXIST here means an unrelated fresh acquire (not going through
@@ -13532,8 +13578,25 @@ function releaseLocalIntegrationLease(token) {
   }
 }
 
-async function acquireIntegrationLease(cfg, home, top, { slug } = {}) {
-  if (cfg.mode() !== "remote") return acquireLocalIntegrationLease(home, top);
+async function acquireIntegrationLease(
+  cfg,
+  home,
+  top,
+  {
+    slug,
+    waitMs = INTEGRATION_LEASE_WAIT_MS,
+    budgetMs, // this acquire's own declared run length — stretches the claim past its default TTL up front (see below)
+    sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+    // No default here: local and remote polling are on different clocks (a
+    // filesystem stat vs a network round trip) and each picks its OWN default
+    // below — defaulting it here would silently overwrite the local
+    // fallback's 1s default with the remote arm's coarser 5s one even when
+    // the caller never asked for that.
+    pollMs,
+  } = {}
+) {
+  if (cfg.mode() !== "remote") return acquireLocalIntegrationLease(home, top, { waitMs, budgetMs, sleep, pollMs });
+  const remotePollMs = pollMs === undefined ? REMOTE_INTEGRATION_LEASE_POLL_MS : pollMs;
   const id = `lock-integration-${gateStem(slug || path.basename(top || "repo"))}`;
   const markdown = [
     "---",
@@ -13546,11 +13609,39 @@ async function acquireIntegrationLease(cfg, home, top, { slug } = {}) {
     "Coordination node only — carries no durable fact of its own.",
     "",
   ].join("\n");
+  const deadline = Date.now() + waitMs;
   try {
     await writeGateNode(cfg, id, markdown);
-    const claimed = await claimDispatch(cfg, id, null, `integration-${crypto.randomUUID()}`);
-    if (claimed.ok) return { kind: "remote", id };
-    return null; // held by another worker, or the claim door errored — proceed without the lease
+    for (;;) {
+      const claimed = await claimDispatch(cfg, id, null, `integration-${crypto.randomUUID()}`);
+      if (claimed.ok) {
+        // Nothing else renews this lease against the tenant's claim TTL
+        // (issue-spor-serialize-lease-does-not-wait-out-a-long-suite): a
+        // gate's suite can legitimately outlive the default, so stretch it
+        // up front to the caller's own budget rather than mid-run — the ONE
+        // chance this lease gets, since nothing re-extends it once the suite
+        // is running. A few retries on a transient blip right after winning a
+        // contended claim, before falling open to the ordinary TTL: `extend`
+        // never shortens a lease, so a retry can never regress a success.
+        if (Number.isFinite(budgetMs) && budgetMs > 0) {
+          for (let attempt = 0; attempt < INTEGRATION_LEASE_EXTEND_ATTEMPTS; attempt++) {
+            try {
+              const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/extend`, { ms: budgetMs }, { timeoutMs: 6000 });
+              if (r && r.ok) break;
+            } catch {
+              /* transient — retried below, or falls open on the last attempt */
+            }
+            if (attempt < INTEGRATION_LEASE_EXTEND_ATTEMPTS - 1) await sleep(INTEGRATION_LEASE_EXTEND_RETRY_MS);
+          }
+        }
+        return { kind: "remote", id };
+      }
+      // A non-conflict failure (transport down, 5xx, auth) is not worth
+      // waiting out — same fail-open posture as before. Only a live holder
+      // (409) is worth polling for, up to this acquire's own wait bound.
+      if (!claimed.conflict || Date.now() >= deadline) return null;
+      await sleep(remotePollMs);
+    }
   } catch {
     return null;
   }
@@ -18013,7 +18104,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget };
+module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget };
 
 if (require.main === module) {
   main()

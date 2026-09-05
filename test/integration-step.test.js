@@ -2532,3 +2532,244 @@ cli.acquireLocalIntegrationLease(${JSON.stringify(home)}, ${JSON.stringify(top)}
     assert.strictEqual(losers.length, 1, "exactly one real process is refused, not both");
   });
 }
+
+// ---------- issue-spor-serialize-lease-does-not-wait-out-a-long-suite ----
+// The serialize:repo lease was sized for the integration stage's short
+// landing pass, not a CPU-bound command gate's own suite: gateLeaseBudgetMs
+// sizes wait/staleness/TTL to the GATE's own declared timeout_ms x
+// (reruns+1), and both the local staleness ceiling and the remote poll now
+// honor that budget instead of a fixed 20s/30min.
+{
+  const sporCli = require("../bin/spor.js");
+  const http = require("node:http");
+
+  test("gateLeaseBudgetMs: sizes to timeout_ms x (reruns+1) plus margin, and falls back on an unset/invalid timeout", () => {
+    assert.strictEqual(sporCli.gateLeaseBudgetMs({ timeoutMs: 600000, reruns: 2 }), 600000 * 3 + 5 * 60 * 1000);
+    assert.strictEqual(sporCli.gateLeaseBudgetMs({ timeoutMs: 600000, reruns: 0 }), 600000 + 5 * 60 * 1000);
+    // No gate at all (a defensive caller) still returns a sane, positive budget.
+    const fallback = sporCli.gateLeaseBudgetMs(null);
+    assert.ok(Number.isFinite(fallback) && fallback > 0);
+  });
+
+  test("makeGateDeps: the REAL acquireGateLease closure threads gateLeaseBudgetMs(gate) through as waitMs and the stamped budgetMs — not a mock", async () => {
+    const { loadConfig } = require("../lib/config.js");
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-lease-wiring-"));
+    const top = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-lease-wiring-top-"));
+    const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+    const item = { node_id: "task-demo", run_id: "run-abcdef12" };
+    const gate = { id: "acceptance", timeoutMs: 600000, reruns: 2 };
+    const expectedBudget = sporCli.gateLeaseBudgetMs(gate);
+    const deps = sporCli.makeGateDeps(cfg, { entry: item, factory: {}, slug: "demo", record: { cwd: top }, home, log: () => {}, warn: () => {} });
+    const lease = await deps.acquireGateLease({ gate, item });
+    assert.ok(lease && lease.kind === "lockfile", "local mode: the real closure falls back to the lockfile lease");
+    const payload = JSON.parse(fs.readFileSync(lease.file, "utf8"));
+    assert.strictEqual(payload.budgetMs, expectedBudget, "the closure computed gateLeaseBudgetMs(gate) and stamped it on the lock, not a default");
+    await deps.releaseGateLease(lease);
+    assert.ok(!fs.existsSync(lease.file), "release actually frees the real lockfile");
+  });
+
+  test("acquireLocalIntegrationLease: a holder's declared budgetMs replaces the fixed 30min staleness ceiling", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-budget-"));
+    const top = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-budget-top-"));
+    const file = path.join(home, "journal", "integration-lease", `${sporCli.integrationLeaseKey(top)}.lock`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    // A dead-pid holder stamped with a 45min budget, aged 40 minutes — well
+    // past a fixed 30min ceiling but still inside its OWN declared budget, so
+    // a contender must not reclaim it yet.
+    const at = new Date(Date.now() - 40 * 60 * 1000).toISOString();
+    fs.writeFileSync(file, JSON.stringify({ pid: process.pid, started_ticks: null, at, budgetMs: 45 * 60 * 1000 }));
+    const stillHeld = await sporCli.acquireLocalIntegrationLease(home, top, { waitMs: 50, pollMs: 5 });
+    assert.strictEqual(stillHeld, null, "a live holder inside its own declared budget is waited out, not reclaimed as stale");
+
+    // The SAME age against a SHORTER declared budget (10min) IS stale.
+    fs.writeFileSync(file, JSON.stringify({ pid: process.pid, started_ticks: null, at, budgetMs: 10 * 60 * 1000 }));
+    const reclaimed = await sporCli.acquireLocalIntegrationLease(home, top, { waitMs: 50, pollMs: 5 });
+    assert.ok(reclaimed, "a holder past ITS OWN declared budget is reclaimed even though it is still 'alive' by pid");
+    sporCli.releaseLocalIntegrationLease(reclaimed);
+  });
+
+  test("acquireLocalIntegrationLease: an acquired lease stamps the caller's own budgetMs for the NEXT contender to judge", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-budget-stamp-"));
+    const top = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-budget-stamp-top-"));
+    const acquired = await sporCli.acquireLocalIntegrationLease(home, top, { budgetMs: 42000 });
+    assert.ok(acquired);
+    const raw = fs.readFileSync(acquired.file, "utf8");
+    assert.strictEqual(JSON.parse(raw).budgetMs, 42000);
+    sporCli.releaseLocalIntegrationLease(acquired);
+  });
+
+  // A duck-typed remote cfg — acquireIntegrationLease only ever calls
+  // cfg.mode()/server()/token() (via lib/remote.js), never anything else.
+  function remoteCfg(base) {
+    return { mode: () => "remote", server: () => base, token: () => "test-token", tenant: () => null };
+  }
+
+  test("acquireIntegrationLease (remote): waits out a held claim (409) and succeeds once it frees, instead of refusing at once", async () => {
+    let claimCalls = 0;
+    const extendCalls = [];
+    const srv = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
+        if (req.method === "POST" && req.url === "/v1/nodes") return j(200, { results: [{ ok: true }] });
+        if (req.method === "POST" && /\/claim$/.test(req.url)) {
+          claimCalls += 1;
+          if (claimCalls < 3) return j(409, { error: { code: "already_claimed", message: "held by someone else, expires in 5m" } });
+          return j(200, { lease: { node_id: "lock-integration-demo" } });
+        }
+        if (req.method === "POST" && /\/extend$/.test(req.url)) {
+          extendCalls.push(JSON.parse(raw || "{}"));
+          return j(200, { ok: true });
+        }
+        return j(404, { error: { code: "not_found" } });
+      });
+    });
+    await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+    try {
+      const base = `http://127.0.0.1:${srv.address().port}`;
+      const sleeps = [];
+      const token = await sporCli.acquireIntegrationLease(remoteCfg(base), "/unused-home", "/unused/top", {
+        slug: "demo",
+        waitMs: 60000,
+        budgetMs: 1800000,
+        pollMs: 10,
+        sleep: (ms) => { sleeps.push(ms); return Promise.resolve(); },
+      });
+      assert.ok(token && token.kind === "remote", "eventually succeeds once the held claim frees, rather than refusing on the first 409");
+      assert.strictEqual(claimCalls, 3, "polled the claim door until it freed");
+      assert.ok(sleeps.length >= 2, "waited between polls instead of busy-looping");
+      assert.strictEqual(extendCalls.length, 1, "stretches the claim's TTL to the caller's own budget once acquired");
+      assert.strictEqual(extendCalls[0].ms, 1800000);
+    } finally {
+      srv.close();
+    }
+  });
+
+  test("acquireIntegrationLease (remote): a transient extend failure is RETRIED, not silently accepted as the final word", async () => {
+    // The TTL stretch is this lease's one chance to outlive a long suite —
+    // nothing else re-extends it once the suite is running (issue-spor-
+    // serialize-lease-does-not-wait-out-a-long-suite). A claim still lands
+    // even if the extend never succeeds (fail-open), but a transient blip on
+    // the FIRST attempt must not be the end of the story.
+    let extendCalls = 0;
+    const srv = http.createServer((req, res) => {
+      req.on("data", () => {});
+      req.on("end", () => {
+        const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
+        if (req.method === "POST" && req.url === "/v1/nodes") return j(200, { results: [{ ok: true }] });
+        if (req.method === "POST" && /\/claim$/.test(req.url)) return j(200, { lease: { node_id: "lock-integration-demo" } });
+        if (req.method === "POST" && /\/extend$/.test(req.url)) {
+          extendCalls += 1;
+          if (extendCalls < 2) return j(500, { error: { code: "internal" } }); // transient — the retry must recover
+          return j(200, { ok: true });
+        }
+        return j(404, { error: { code: "not_found" } });
+      });
+    });
+    await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+    try {
+      const base = `http://127.0.0.1:${srv.address().port}`;
+      const sleeps = [];
+      const token = await sporCli.acquireIntegrationLease(remoteCfg(base), "/unused-home", "/unused/top", {
+        slug: "demo",
+        budgetMs: 1800000,
+        sleep: (ms) => { sleeps.push(ms); return Promise.resolve(); },
+      });
+      assert.ok(token && token.kind === "remote");
+      assert.strictEqual(extendCalls, 2, "a failed extend attempt is retried at least once before giving up");
+      assert.ok(sleeps.length >= 1, "backs off between retries rather than hammering the server");
+    } finally {
+      srv.close();
+    }
+  });
+
+  test("acquireIntegrationLease (remote): an extend that fails EVERY attempt still fails open — the claim itself is not undone", async () => {
+    let extendCalls = 0;
+    const srv = http.createServer((req, res) => {
+      req.on("data", () => {});
+      req.on("end", () => {
+        const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
+        if (req.method === "POST" && req.url === "/v1/nodes") return j(200, { results: [{ ok: true }] });
+        if (req.method === "POST" && /\/claim$/.test(req.url)) return j(200, { lease: { node_id: "lock-integration-demo" } });
+        if (req.method === "POST" && /\/extend$/.test(req.url)) {
+          extendCalls += 1;
+          return j(500, { error: { code: "internal" } });
+        }
+        return j(404, { error: { code: "not_found" } });
+      });
+    });
+    await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+    try {
+      const base = `http://127.0.0.1:${srv.address().port}`;
+      const token = await sporCli.acquireIntegrationLease(remoteCfg(base), "/unused-home", "/unused/top", {
+        slug: "demo",
+        budgetMs: 1800000,
+        sleep: () => Promise.resolve(),
+      });
+      assert.ok(token && token.kind === "remote", "the claim itself still lands even though the TTL stretch never did — fail-open, not fail-closed");
+      assert.ok(extendCalls >= 2, "retried more than once before giving up");
+    } finally {
+      srv.close();
+    }
+  });
+
+  test("acquireIntegrationLease (remote): gives up at the wait bound if the claim never frees — fails open, never blocks integration forever", async () => {
+    const srv = http.createServer((req, res) => {
+      req.on("data", () => {});
+      req.on("end", () => {
+        const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
+        if (req.method === "POST" && req.url === "/v1/nodes") return j(200, { results: [{ ok: true }] });
+        if (req.method === "POST" && /\/claim$/.test(req.url)) return j(409, { error: { code: "already_claimed", message: "held" } });
+        return j(404, { error: { code: "not_found" } });
+      });
+    });
+    await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+    try {
+      const base = `http://127.0.0.1:${srv.address().port}`;
+      let sleepCount = 0;
+      const start = Date.now();
+      const token = await sporCli.acquireIntegrationLease(remoteCfg(base), "/unused-home", "/unused/top", {
+        slug: "demo",
+        waitMs: 500,
+        pollMs: 5,
+        sleep: (ms) => { sleepCount += 1; return Promise.resolve(); },
+      });
+      const elapsed = Date.now() - start;
+      assert.strictEqual(token, null, "a claim that never frees within the wait bound fails open — never blocks integration forever");
+      assert.ok(sleepCount >= 1, "polled at least once before giving up");
+      assert.ok(elapsed < 5000, `must give up at the wait bound, not run indefinitely (took ${elapsed}ms)`);
+    } finally {
+      srv.close();
+    }
+  });
+
+  test("acquireIntegrationLease (remote): a non-conflict failure (transport/5xx) is never worth waiting out", async () => {
+    const srv = http.createServer((req, res) => {
+      req.on("data", () => {});
+      req.on("end", () => {
+        const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
+        if (req.method === "POST" && req.url === "/v1/nodes") return j(200, { results: [{ ok: true }] });
+        if (req.method === "POST" && /\/claim$/.test(req.url)) return j(500, { error: { code: "internal" } });
+        return j(404, { error: { code: "not_found" } });
+      });
+    });
+    await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+    try {
+      const base = `http://127.0.0.1:${srv.address().port}`;
+      let sleepCount = 0;
+      const start = Date.now();
+      const token = await sporCli.acquireIntegrationLease(remoteCfg(base), "/unused-home", "/unused/top", {
+        slug: "demo",
+        waitMs: 60000,
+        pollMs: 10,
+        sleep: (ms) => { sleepCount += 1; return Promise.resolve(); },
+      });
+      assert.strictEqual(token, null);
+      assert.strictEqual(sleepCount, 0, "a non-conflict failure returns immediately rather than polling out the wait bound");
+      assert.ok(Date.now() - start < 2000);
+    } finally {
+      srv.close();
+    }
+  });
+}
