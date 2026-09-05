@@ -290,19 +290,29 @@ carries its **outcome** — what the run did to the graph — as exactly one of
 | outcome | meaning |
 |---|---|
 | `resolved` | the graph itself attests completion — a live resolving edge (`resolves`/`answers`) onto the target node, or, for a type retired by its own status rather than by an edge, a status that has reached that type's terminal partition. Verified by re-reading the node after the run, never inferred from an exit code and never taken from the agent's own word |
-| `reported` | no attestation of completion, but the agent left a final report. It is filed as an artifact node linked to the target (`relates-to`) and **then** the lease is released, so the item returns to the queue carrying the work instead of vanishing into a dead run. `report_node_id` names the artifact — a filed report always reads `reported`, enforced or not |
-| `declined` | the agent declared the ITEM wrong rather than the work unfinished, by making the first line of its final report `DECLINED: <reason>`. The reason is filed as a `finding` on the target, the target's `readiness: agent` stamp is cleared, and the lease is released — the item goes to triage, never into a gate |
-| `failed` | no attestation and no report filed — a launch failure, a crash before any report, an empty one, or a graph that refused the write. `terminal_note` carries the failure note. The lease is released, except where the report (or a decline's finding) could not be filed at all — see the ordering rule below |
+| `reported` | no attestation of completion, but the agent left a final report. An enforced run files it as an artifact node linked to the target (`relates-to`) and **then** hands the lease back, so the item returns to the queue carrying the work instead of vanishing into a dead run. `report_node_id` names the artifact — a filed report always reads `reported`, enforced or not; the converse does not hold, since an unenforced `reported` filed nothing |
+| `declined` | the agent declared the ITEM wrong rather than the work unfinished, by making the first line of its final report `DECLINED: <reason>`. An enforced run files the reason as a `finding` on the target, clears the target's `readiness: agent` stamp, and hands the lease back — the item goes to triage, never into a gate. The state is the agent's own declaration, so it stands whether or not those three land: an unenforced decline performs none of them, a finding the graph refuses leaves the lease deliberately held, and a refused readiness clear is recorded rather than fatal |
+| `failed` | no attestation and no report filed — a launch failure, a crash before any report, an empty one, or a graph that refused the write. `terminal_note` carries the failure note. An enforced run hands the lease back, except where the report (or a decline's finding) could not be filed at all — see the ordering rule below |
 
 The ordering is the contract: the report is filed before the lease goes back to
 the pool, so an interrupted run can leave a held lease with the report filed but
 never a released lease with nothing attached.
 
+Those legs are attempts, not postconditions of the outcome: each records its own
+verdict on the run record rather than being implied by the state. `report_node_id`
+/ `finding_node_id` are present only where the artifact actually landed,
+`readiness_cleared` says whether the stamp was cleared, and `lease_released` says
+whether the server *confirmed* the handback — a `false` there is an unconfirmed
+handback, not proof the lease is still held, and the remedy reconciles either way
+(`spor release <id>` is idempotent, and a claim someone else now holds answers
+`409`). WORKERS.md §8 is the field-by-field contract.
+
 Enforcement covers **supervised** launches (Claude Code, Codex, OpenCode, Copilot
 CLI — every built-in). A target's TYPE never costs a run its enforcement: both
 attestation paths — the resolving edge, and the terminal own-status a
-status-only type is retired by — are judged, and both release the lease. What
-does cost it is a posture where nothing could be verified at all: a
+status-only type is retired by — are judged, and a target that either path finds
+unfinished takes the same file-then-hand-back route, whichever one judged it.
+What does cost it is a posture where nothing could be verified at all: a
 native-background run (`spor dispatch --bg`, the opt-in `claude --bg` launch), a
 free-text dispatch with no target node, and a graph that could not be reached are
 classified best-effort and marked `terminal_enforced: false` — an unenforced run

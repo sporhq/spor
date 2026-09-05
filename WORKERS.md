@@ -377,6 +377,14 @@ proposed. A declined run:
   worker from re-dispatching the item as written;
 - releases the lease, in the same file-then-release order as a report.
 
+Those three are what an *enforced* decline attempts, in that order; each leg
+records its own verdict on the run record (`finding_node_id`,
+`readiness_cleared`, `lease_released` — §8) instead of being implied by the
+outcome, and none of them can unmake the `declined` state, which is the agent's
+own declaration: a refused finding write leaves the lease deliberately held
+(§6, step 1b), a refused readiness clear is recorded and never fatal, and an
+unenforced decline performs none of the three.
+
 The graph still wins over the words: a run whose target reads resolved is
 `resolved` whatever its final line says, and is gated (where its empty diff
 fails closed as before — a decline with a resolver behind it is judged as the
@@ -500,8 +508,11 @@ is a filed artifact, and the record says so on its own fields —
 `report_node_id`/`finding_node_id` absent, `lease_released: false` for a lease
 these two arms deliberately never attempted to hand back — never by demoting
 `terminal_enforced` to stand in for them. (`false` is the weaker claim §8
-spells out — "no confirmed handback" — and only here, where no release was
-attempted at all, does it also mean the lease is certainly still held.)
+spells out — "no confirmed handback". Only here, where no handback was
+requested at all, is nothing in doubt about WHY: no release of ours was in
+flight, so the lease stays ours until its own TTL lapses it or a person hands
+it back. Everywhere else `false` covers a request whose answer never came,
+which sits over a release the server may have committed.)
 Nothing is filed on the `resolved` arm either, for the opposite reason:
 completion is attested, so there is nothing left to file. Read the flag as
 "and the paperwork landed" and a checked verdict reports itself as a guess;
