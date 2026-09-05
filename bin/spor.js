@@ -38,6 +38,7 @@ const preflight = require(path.join(ROOT, "lib", "shell", "preflight.js"));
 const sat = require(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
 const workLoop = require(path.join(ROOT, "lib", "shell", "work-loop.js"));
 const gatesKernel = require(path.join(ROOT, "lib", "kernel", "gates.js"));
+const candidateKernel = require(path.join(ROOT, "lib", "kernel", "candidate.js"));
 const gateRunner = require(path.join(ROOT, "lib", "shell", "gate-runner.js"));
 const integrationRunner = require(path.join(ROOT, "lib", "shell", "integration-runner.js"));
 const workerContractLib = require(path.join(ROOT, "lib", "shell", "worker-contract.js"));
@@ -9474,6 +9475,23 @@ async function cmdRuns(cfg, { values, positionals: pos }) {
     if (r.gate_fix_run_id) {
       out(`  fix cycle:  run ${String(r.gate_fix_run_id).slice(0, 8)} — 'spor runs ${r.gate_fix_run_id}' follows it${r.gate_state === "interrupted" ? " (left running by a stopped worker)" : ""}`);
     }
+    // The implementation stage's own dimension (task-spor-factory-candidate-
+    // record, WORKERS.md §8) — absent on every legacy run and on every factory
+    // that declares no `implementation:` block. `impl_state` is printed with
+    // the SETTLED/unsettled reading spelled out, for the same reason
+    // `terminal_enforced` prints `(unenforced)`: an unsettled word is a stage
+    // nobody finished, not a verdict.
+    if (r.impl_state) {
+      out(`  stage:      ${r.impl_state}${candidateKernel.implSettled(r.impl_state) ? "" : " (unsettled — no stage verdict yet)"}${r.impl_pool ? ` — ${r.impl_pool} pool` : ""}${r.impl_attempt ? `, attempt ${r.impl_attempt}` : ""}`);
+    }
+    if (r.impl_candidate) {
+      out(`  candidate:  ${candidateKernel.candidateSummary(r.impl_candidate)}`);
+      const chain = Array.isArray(r.impl_candidates) ? r.impl_candidates : [];
+      // Only the ANCESTORS: the tip is the line above. A chain of one is not
+      // worth a second line, and one longer than that is the record of every
+      // fixer that moved the tree under the gates.
+      if (chain.length > 1) out(`              re-pinned ${chain.length - 1}x — ${chain.slice(0, -1).map((c) => String(c.candidate_id || "?")).join(" -> ")} -> (tip)`);
+    }
     if (r.child_reaped) out(`  reaped:     an orphaned harness child was terminated at reconciliation`);
     if (r.cwd) out(`  cwd:        ${r.cwd}`);
     if (r.session_id) out(`  session:    ${r.session_id}`);
@@ -11439,6 +11457,14 @@ function cmdWorkStatus(cfg, { json }) {
       if (gateRecord && gateRecord.gate_fix_run_id) {
         out(`            fix cycle in flight: run ${String(gateRecord.gate_fix_run_id).slice(0, 8)} — 'spor runs ${gateRecord.gate_fix_run_id}' follows it`);
       }
+      // WHICH TREE this slot is judging (task-spor-factory-candidate-record).
+      // Read off the run record for the same reason the fix cycle above is:
+      // the candidate is a durable fact on the RUN, and
+      // `journal/work/*.work.json` deliberately does not change shape for this
+      // stage. Absent unless the factory declares an `implementation:` block.
+      if (gateRecord && gateRecord.impl_candidate) {
+        out(`            candidate: ${candidateKernel.candidateSummary(gateRecord.impl_candidate)}`);
+      }
     }
     const recent = w.recent || [];
     const recentShown = workLoop.RECENT_LOG_CAP;
@@ -12347,7 +12373,7 @@ function launchedFixRun(home, nodeId, name) {
 
 function makeGateDeps(
   cfg,
-  { record, entry, factory, slug, passthrough, warn, sleep, log, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, stopping = () => false, dispatch = dispatchThrough, home = cfg.userConfigHome() }
+  { record, entry, factory, slug, passthrough, warn, sleep, log, workerId = null, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, stopping = () => false, dispatch = dispatchThrough, home = cfg.userConfigHome() }
 ) {
   const date = () => new Date().toISOString().slice(0, 10);
   const stem = gateStem(entry.node_id);
@@ -13175,6 +13201,143 @@ function makeGateDeps(
       if (!c.ok) return c;
       change = c;
       return c;
+    },
+    // Pin the CANDIDATE the pipeline is judging (task-spor-factory-candidate-
+    // record, FACTORY-IMPLEMENTATION-STAGE.md §3): the tree, the commit that
+    // labels it, the base it was cut from and the provenance of the run that
+    // produced it, folded against whatever this record already carries and
+    // stamped onto the run journal in the additive `impl_` namespace.
+    //
+    // Reuses the change-set the read above just cached, so the pin costs two
+    // git reads (the tree and the branch) rather than a second whole-diff pass,
+    // and so the candidate's `clean` verdict IS the command gate's own.
+    //
+    // Only a factory that declares an `implementation:` block gets here (the
+    // pipeline's own guard) — a factory that declares none pins nothing, stamps
+    // nothing, and is byte-identical to before the stage existed.
+    pinCandidate: async ({ submittedBy, runId = null }) => {
+      // The pipeline's OWN record, re-read: the `impl_` stamps are written out
+      // of band from the two in-process record writers, so the copy this
+      // closure captured at pipeline start is not authoritative about anything
+      // an earlier pin already recorded.
+      let current = record;
+      try {
+        current = dispatchRuns.readJson(dispatchRuns.runPaths(home, entry.run_id).record) || record;
+      } catch {
+        /* an unreadable record folds against what we have, which is the safe direction */
+      }
+      // WHOSE commit this is. A re-pin is made by a fix cycle or a rescue — a
+      // different run, with its own record — so EVERY per-run field below reads
+      // from THAT record: the harness that made it, when it ran, and what it
+      // left on the graph. Mixing the two would describe a run that never
+      // existed. The implementation stage's own pin is the case where the
+      // producer IS this pipeline's record.
+      const producerId = runId || entry.run_id;
+      let producer = current;
+      if (producerId !== entry.run_id) {
+        try {
+          producer = dispatchRuns.readJson(dispatchRuns.runPaths(home, producerId).record) || {};
+        } catch {
+          producer = {};
+        }
+      }
+      // ...and the profile it ran under. A RESCUE is the one step that routes
+      // itself: `rescue.profile` is dispatched deliberately in place of the
+      // worker's own (and `rescuePassthrough` strips the routing flags so the
+      // lane's stronger model wins), so reading the worker's passthrough there
+      // would name a profile that demonstrably did not produce this tree.
+      const producerProfile =
+        submittedBy && submittedBy.stage === "rescue"
+          ? (factory.rescue && factory.rescue.profile) || null
+          : (passthrough && passthrough.profile) || null;
+      const pinned = gateRunner.pinCandidate(record, factory.trustedRef, {
+        change,
+        // The ITEM's own repo, not the worker's scope token: the repo is part
+        // of the candidate's identity (§3.2), and under a multi-repo factory
+        // those differ. `item_repo` is the stamp AS CLAIMED at launch, which is
+        // the same "before" value §10.11's re-stamp check reads.
+        repo: record.item_repo || entry.project || slug || null,
+        nodeId: entry.node_id,
+        submittedBy,
+        provenance: {
+          run_id: producerId,
+          attempt: current.impl_attempt || 1,
+          // Only the implementation stage's own submission charges the CODE
+          // pool (§5.3). A fix cycle spends its gate's `cycles` and a rescue
+          // spends `rescue.attempts` — neither is one of the two pools, so
+          // naming one here would be a false accounting claim. (The accounting
+          // itself is task-spor-factory-execution-outcome-classifier's.)
+          pool: submittedBy && submittedBy.stage === "implementation" ? "implementation" : null,
+          harness: producer.harness || null,
+          // The rescue lane's declared profile, else the worker's own
+          // `--profile` passthrough — the only two routing inputs visible here.
+          // The work-loop SLOT (`entry`) carries no profile — it is `{run_id,
+          // node_id, harness, project}`, and its shape is the one
+          // `journal/work/*.work.json` publishes — so an item that routed
+          // ITSELF (a `profile:` frontmatter, an `assigned -> agent {profile:}`
+          // edge, §2.3 levels 2 and 3) is not recorded here. Null means "not
+          // recorded", never "unrouted".
+          profile: producerProfile,
+          agent: dispatchAgentId(cfg),
+          worker: workerId || null,
+          machine: os.hostname(),
+          started_at: producer.started_at || producer.launched_at || producer.created_at || null,
+          finished_at: producer.finished_at || null,
+        },
+        // What the run left on the graph, AS THE RUN RECORD SAW IT. The
+        // terminal contract writes `resolved_by`/`resolved_edge` together and
+        // only together, and only when it verified a live resolving edge — so
+        // what this block records is exactly "a resolving edge was observed,
+        // from this node". `resolves_edge: true` is therefore a PREMATURE
+        // resolution under `completion.by: controller` (§4.5), which is what
+        // the candidate is here to record; the completion boundary
+        // (task-spor-factory-controller-completion-boundary) is what acts on it.
+        //
+        // The mirror case — a resolver node written with NO edge, the intended
+        // steady state under controller completion — leaves no trace on the run
+        // record at all, so `node: null, written: false` here means "no
+        // resolving edge was observed", never "no resolver exists". Finding it
+        // needs a graph read that belongs to the completion boundary, not to a
+        // pin. `answers` counts beside `resolves`: both retire an item, so
+        // reading only one would be the fail-open direction.
+        resolver: {
+          node: producer.resolved_by || null,
+          written: !!producer.resolved_by,
+          resolves_edge: producer.resolved_edge === "resolves" || producer.resolved_edge === "answers",
+        },
+      });
+      if (!pinned.ok) return pinned;
+      const folded = candidateKernel.repinCandidate(current.impl_candidate || null, pinned.candidate);
+      const patch = {
+        impl_candidate: folded.candidate,
+        impl_candidates: candidateKernel.appendCandidateChain(current.impl_candidates, folded.candidate),
+      };
+      // The FIRST pin is the stage's submission and is the only one that
+      // stamps the stage's own dimensions: a re-pin never touches `impl_state`
+      // (§3.3 — the stage settled at the first candidate; a moved HEAD is not a
+      // new verdict), and the attempt, pool and run it names are the
+      // implementer's, not a fixer's.
+      if (folded.change === "created") {
+        patch.impl_run_id = entry.run_id;
+        patch.impl_attempt = current.impl_attempt || 1;
+        // Which pool THIS RECORD's own attempt belongs to — the record is an
+        // implementation run, whichever step happened to make the first
+        // readable tree, so this is not the same subject as the candidate's
+        // `provenance.pool` (which names what the PIN's producer spent, and is
+        // null for a fixer). The pool ACCOUNTING — the budgets, the classifier
+        // that decides which pool an outcome charges — is
+        // task-spor-factory-execution-outcome-classifier's.
+        patch.impl_pool = "implementation";
+        // §3.4: submission is not complete until the reference verified, so a
+        // candidate carrying no verified reference leaves the stage UNSETTLED
+        // with the publish owed. Nothing publishes yet (that is
+        // task-spor-factory-candidate-portable-reference), so today this always
+        // reads `running` — one predicate for the publisher to satisfy rather
+        // than a rule restated at each call site.
+        patch.impl_state = candidateKernel.candidateSubmitted(folded.candidate) ? "candidate" : "running";
+      }
+      dispatchRuns.stampImplState(home, entry.run_id, patch);
+      return { ok: true, candidate: folded.candidate, change: folded.change };
     },
     // The two reads behind a SUPERSEDED verdict (issue-spor-work-adopts-
     // orphaned-pipeline-of-hand-landed-run): is the item resolved on the graph
@@ -15538,6 +15701,9 @@ async function cmdWork(cfg, { values }) {
                 passthrough,
                 warn,
                 runMaxMs,
+                // Provenance only: which worker on this box pinned the
+                // candidate (task-spor-factory-candidate-record §3.1).
+                workerId,
                 log: (line) => out(line),
                 stopping: () => !!control.stopping,
                 // A plain timer, NOT the loop's wakeable sleep: that one has a

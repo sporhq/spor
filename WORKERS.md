@@ -1040,6 +1040,49 @@ written only after the outcome dimension exists):
 | `gate_demote_pending` | boolean | optional, propose mode only (§10.9) — `true` while a parked item's rollback is still owed: its tracking item filed but the demotion's own write failed (at park time, or during a heal pass). The per-pass proposal check retries the demotion on this flag and writes it back `false` once it lands (in the same stamp that owes `gate_restore_pending`, if the rollback has to be undone); left standing against a tracker that is already terminal, it is recovered — the item restored if the proposal's landed fact exists — before it is cleared. A park that never filed its tracker needs no flag, since healing the tracker is itself what triggers the rollback; and a debt this flag failed to record is re-derived from the graph (open tracker, no landed fact, item still at completion) on every later pass |
 | `gate_restore_pending` | boolean | optional, propose mode only (§10.9) — `true` while the UNDO of a rollback is still owed: the demotion above landed against a proposal that had settled between the tracker read that licensed it and the write itself (the tracker closed, or the landed fact written, by another pass or a person), and the promotion that undoes it failed. The per-pass proposal check retries the promotion on this flag and writes it back `false` once it lands |
 
+**Implementation dimension** (factories declaring an `implementation:` stage
+only — absent on every legacy run, and on every run of a factory that declares
+no stage; written beside the gate dimension). These fields are ADDITIVE per the
+rule above: **a record carrying none of them is a legacy run and reads as
+`completion.by: agent`** — it wrote its own resolver, `shouldGate` still gates
+it, and §10.7 still demotes it on a refusal. No record is ever rewritten, and
+`journal/work/*.work.json` does not change shape for this stage.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `impl_state` | string | the stage's own state, mirroring `gate_state`: `"candidate"`, `"declined"`, `"exhausted"`, `"escalated"`, `"unroutable"`, `"mismatch"` are **settled**; `"dispatched"`, `"running"`, `"interrupted"` mean a stage started and never reported. Read it exactly as `gate_state` is read — an **unrecognized** value RESUMES rather than counting as a verdict (`SETTLED_IMPL_STATES` in `lib/kernel/candidate.js` is the list), and **absence** is not an unfinished stage but a legacy run |
+| `impl_attempt` | int | which attempt of the code pool produced this record's tree (1-based) |
+| `impl_pool` | string | which budget pool that attempt belongs to — `"implementation"` (the code pool) or `"retry"` (the shared infrastructure/publish pool) |
+| `impl_run_id` | string | the run that submitted the candidate — the stage's own run, never a fix cycle's |
+| `impl_candidate` | object | the **tip** candidate: the pinned commit plus the tree it resolves to, plus provenance and a portable reference. See the table below |
+| `impl_candidates` | object[] | the **chain** of pins, oldest first, **ending at the tip**. A fix cycle or a rescue moves HEAD, and each re-pin onto a new tree appends here; a re-pin onto the SAME tree updates the last entry in place (it is the same candidate — the new commit joins its `commits_seen`). A tree can come back (a fix that reverts a one-hunk change reproduces it exactly), so **one `candidate_id` may appear more than once** — read the chain as an ordered list of pin events, never as a map keyed by id (§10.12) |
+
+**The candidate object** (`impl_candidate`, and every entry of
+`impl_candidates`), minted by `lib/kernel/candidate.js`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `candidate_id` | string | `cand-` + the first 16 hex of `sha256(repo, node_id, tree)` — **and nothing else**: not the commit, not the attempt, not the run. The TREE is the content a gate judges; the commit is one of possibly several labels on it |
+| `spec_version` | int | the object's own version (`1` today) |
+| `repo`, `node_id` | string | the two identity fields beside the tree — one tree in two repos, or for two items, is two candidates |
+| `commit` | string | the pinned commit, **immutable once published: first published wins** |
+| `tree` | string | what `commit^{tree}` resolves to — the identity, and what "we already judged this" means |
+| `base` | object | `{ref, commit, merge_base}` — the trusted ref, its tip at pin time, and the merge base a bundle is cut from |
+| `branch` | string \| null | the branch the checkout was on, or `null` for a detached HEAD |
+| `commits_seen` | string[] | every OTHER commit seen carrying this same tree — an amend, a same-tree re-commit. A re-submission with a different commit appends here and changes **nothing else** |
+| `clean` | bool | the `require_clean` verdict at submission, computed with the same `git status` read a command gate uses — an **unreadable** status is `false`, never `true` (§10.3) |
+| `changed_paths_sha256` | string | the digest of the changed-path list, in git's own order |
+| `supersedes` | string \| null | the `candidate_id` this one re-pinned over |
+| `submitted_by` | object | `{stage, cycle, rescue}` — which step produced this pin: `"implementation"` (the first submission), `"fix"`, `"rescue"` or `"integration-fix"` |
+| `provenance` | object | `{run_id, attempt, pool, harness, profile, agent, worker, machine, cwd, started_at, finished_at}`. **`cwd` is provenance, not a reference** — nothing in the pipeline follows it, and a controller on another machine never sees it as a way to obtain the commit |
+| `reference` | object \| null | the ONE door a reader uses to obtain the commit: `{kind: "bundle"\|"branch", locator, commit, …}`. `null` means the publish is still **owed** — there is no `publish: none`, so "unpublished" has exactly one meaning, and a candidate is not SUBMITTED until its reference verified |
+| `resolver` | object | `{node, written, resolves_edge}` — the implementer's own resolver node. `resolves_edge: false` is the point under controller completion: the node exists and the edge that retires the item is not on it yet |
+
+A consumer reading `impl_state` as a verdict must check it is settled, exactly
+as for `gate_state`. A consumer reading `impl_candidate` must consume the
+**pinned** `commit`, never a branch head: a head that is a same-tree relabel of
+the pinned commit is not what was judged.
+
 A consumer reading `gate_state` as a verdict must check it is one of the
 settled values (`passed`/`failed`/`blocked`/`superseded`/`scoped`, or `parked`
 under propose mode — `SETTLED_GATE_STATES` in `lib/kernel/gates.js` is the
@@ -2759,3 +2802,59 @@ unaffected: `deps.commitsLanded` still runs (a few git probes against
 `item_commits`, no new graph read) but finds nothing to check, and the
 declared-claim check and the refusal below it are exactly as before. See
 test/gate-pipeline.test.js ("stale premise").
+
+### 10.12 The candidate — what a pipeline is judging, pinned
+
+A `type: factory` may declare an `implementation:` stage beside its
+`integration:` block (`dec-spor-factory-implementation-stage-contract`). A
+factory that declares none is unaffected by everything below: nothing is
+pinned, no `impl_*` field is written, and the pipeline is byte-identical to
+before the stage existed.
+
+Where one is declared, the pipeline pins a **candidate** for the tree it is
+judging — a pinned commit plus the tree it resolves to, plus provenance, plus a
+reference something other than this process can follow. It is never an agent's
+claim of resolution: the point of the stage is that the implementer submits one
+of these and the *runner* writes the resolving edge at the declared completion
+boundary, so a pending or refused pipeline releases nothing.
+
+**Identity is the tree, not the commit.** `candidate_id` is `cand-` plus the
+first 16 hex of `sha256(repo, node_id, tree)` — nothing else goes into the key.
+An amend that changes only the message, a retry that re-commits the same files,
+and a rebase that happens to reproduce the same tree all yield the *same*
+candidate; a rebase onto a moved trusted ref changes the tree and is correctly a
+*new* one, because the merged-in base is content the gates have not judged.
+
+**A candidate is superseded, never mutated.** HEAD moves after submission — a
+fix cycle commits, a rescue amends — so the pipeline **re-pins at exactly the
+point it already re-reads the tree** (`readChanged`, after every fix cycle and
+after every rescue pass). The fold is the whole rule:
+
+- the same tree is the same candidate: the new commit is a relabel and is
+  appended to `commits_seen`; **nothing else changes** — not `commit`, not
+  `reference`, not the published object. This is what lets a published object be
+  keyed by `candidate_id` *and* be immutable;
+- a different tree is a new candidate carrying `supersedes: <prior id>`,
+  appended to the chain.
+
+The run record carries the tip as `impl_candidate` and the chain as
+`impl_candidates` (§8) — an ordered list of pin events whose LAST entry is
+always the tip. A tree that comes back after being superseded is appended
+again rather than folded onto its ancestor: folding would destroy the record of
+who first produced it, move the tip off the end, and leave two entries naming
+each other in `supersedes` so a reader walking back to the first submission
+never terminated. So the same `candidate_id` may appear twice, and a consumer
+must read the chain as a list, not as a map keyed by id.
+
+A re-pin never touches `impl_state`: the stage settled at the first candidate,
+and a moved HEAD is not a new verdict.
+
+**Pinning is fail-soft.** A tree that could not be read is logged and the
+pipeline judges the tree regardless — the candidate is a record *of* what was
+judged, never a precondition for judging it.
+
+`spor runs` prints the stage line and the tip candidate (with the chain length
+when it was re-pinned); `spor work --status` prints the tip beside the slot that
+is gating it, read off the run record — `journal/work/*.work.json` deliberately
+does not change shape for this stage. See `lib/kernel/candidate.js`,
+`pinCandidate` in `lib/shell/gate-runner.js`, and test/candidate.test.js.
