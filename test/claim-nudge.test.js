@@ -295,6 +295,55 @@ test('a held lease the blanket beat did not renew is journaled as dropped, never
   }
 });
 
+// issue-spor-sessionend-reserve-retakes-released-lease: the case above only
+// covers a lease that stays VISIBLE this beat but doesn't renew. A lease can
+// also vanish from the assignee=me lookup ENTIRELY between beats — an
+// ordinary TTL lapse, or a `spor release` from another terminal — which the
+// beat must journal as dropped too, or SessionEnd's replay (distill.js
+// sessionEndLease) still believes this session holds it and `reserve`s (and
+// the server auto-reclaims) a lease that was deliberately handed back.
+test('a lease that vanishes entirely from the lookup between beats is journaled as dropped, not silently forgotten', async () => {
+  const { home, cwd } = scratch();
+  let phase = 1;
+  const { srv, hits, base } = await stubServer((url) =>
+    isAssigneeMe(url)
+      ? phase === 1
+        ? { items: [{ id: 'task-mine', title: 'Mine', lease_state: 'in_progress', lease_by: 'person-t' }] }
+        : { items: [] } // released elsewhere, or lapsed and never reclaimed
+      : { items: [{ id: 'task-alpha', title: 'Alpha' }] }
+  );
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    // beat 1: holds and renews task-mine
+    const first = await runAsync(['post-tool', '--host', 'claude-code'], editPayload(cwd, 's1', 'a.js'), env);
+    assert.strictEqual(first.trim(), '');
+    let hb = journal(home).filter((e) => e.tool === 'claim-heartbeat');
+    assert.strictEqual(hb.length, 1);
+    assert.deepStrictEqual(hb[0].renewed, ['task-mine']);
+    assert.ok(!('dropped' in hb[0]));
+
+    // beat 2: task-mine no longer appears at all -> no live claim this beat,
+    // but the vanish must still be journaled as a drop before falling
+    // through toward the nudge path.
+    phase = 2;
+    await runAsync(['post-tool', '--host', 'claude-code'], editPayload(cwd, 's1', 'b.js'), env);
+    hb = journal(home).filter((e) => e.tool === 'claim-heartbeat');
+    assert.strictEqual(
+      hb.length, 2,
+      `expected a second heartbeat record recording the drop; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`
+    );
+    assert.deepStrictEqual(hb[1].renewed, []);
+    assert.deepStrictEqual(hb[1].dropped, ['task-mine']);
+
+    // a third beat, still vanished, must not repeat the same drop record —
+    // it was already recorded once and priorHeld no longer carries it.
+    await runAsync(['post-tool', '--host', 'claude-code'], editPayload(cwd, 's1', 'c.js'), env);
+    assert.strictEqual(journal(home).filter((e) => e.tool === 'claim-heartbeat').length, 2, 'no repeat drop record once already journaled');
+  } finally {
+    srv.close();
+  }
+});
+
 // Fail-open on the beat itself: the lookup succeeded, the renew did not (a
 // dead/older server, a 404, an unreadable body). The hook still exits 0 with no
 // output and journals the optimistic set, so SessionEnd keeps its evidence of

@@ -83,3 +83,29 @@ test('renaming the renewed/dropped fields is caught: readHeartbeatHeldIds only u
   const ids = u.readHeartbeatHeldIds([{ tool: 'claim-heartbeat', renewedIds: ['task-a'] }]);
   assert.deepStrictEqual([...ids], [], 'a field rename silently drops the record instead of crashing — exactly why both sides must share one helper');
 });
+
+// issue-spor-sessionend-reserve-retakes-released-lease: post-tool.js's
+// claimNudge diffs "what did this session already record holding IN THIS
+// PROJECT" against the current beat's lookup to catch a lease that vanished
+// entirely (rather than merely failing to renew). That diff has to replay
+// only this project's own entries, or a heartbeat for a different repo in
+// the same session would pollute the comparison — the optional `project`
+// filter is what makes that possible.
+test('readHeartbeatHeldIds(entries, project) replays only that project\'s entries', () => {
+  const ids = u.readHeartbeatHeldIds(
+    [
+      { tool: 'claim-heartbeat', project: 'projx', renewed: ['task-a'] },
+      { tool: 'claim-heartbeat', project: 'other-repo', renewed: ['task-z'] },
+    ],
+    'projx'
+  );
+  assert.deepStrictEqual([...ids], ['task-a']);
+});
+
+test('readHeartbeatHeldIds with no project argument still replays every entry (backward compatible)', () => {
+  const ids = u.readHeartbeatHeldIds([
+    { tool: 'claim-heartbeat', project: 'projx', renewed: ['task-a'] },
+    { tool: 'claim-heartbeat', project: 'other-repo', renewed: ['task-z'] },
+  ]);
+  assert.deepStrictEqual([...ids].sort(), ['task-a', 'task-z']);
+});

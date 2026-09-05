@@ -1266,11 +1266,18 @@ function appendHeartbeatRecord(journalPath, { project, renewed, dropped }) {
 // this beat confirmed, `dropped` REMOVES one it no longer holds — a
 // point-in-time reading, not a cumulative one (see distill.js sessionEndLease
 // for why order matters: a node dropped mid-session must not linger in the
-// set just because an earlier beat renewed it).
-function readHeartbeatHeldIds(entries) {
+// set just because an earlier beat renewed it). `project`, when given,
+// restricts the replay to entries recorded under that project — each beat's
+// `renewed`/`dropped` lists are already scoped to the ids visible in that
+// beat's project-scoped `assignee=me` lookup (post-tool.js's claimNudge), so
+// this lets a caller ask "what does this session hold IN THIS PROJECT so
+// far" without picking up ids a heartbeat in a different repo happened to
+// renew in the same session (issue-spor-sessionend-reserve-retakes-released-lease).
+function readHeartbeatHeldIds(entries, project) {
   const ids = new Set();
   for (const e of entries) {
     if (!e || e.tool !== HEARTBEAT_TOOL) continue;
+    if (project !== undefined && e.project !== project) continue;
     if (Array.isArray(e.renewed)) for (const id of e.renewed) if (id) ids.add(id);
     if (Array.isArray(e.dropped)) for (const id of e.dropped) if (id) ids.delete(id);
   }

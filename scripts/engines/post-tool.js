@@ -363,6 +363,7 @@ async function claimNudge({ graph, slug, session, cwd, file, remote }) {
   // the curl well under the host's PostToolUse budget; a dead/slow server
   // returns http "000" and we fail open.
   const timeoutMs = u.cfgNum("claimNudge.timeoutMs", "CLAIM_NUDGE_TIMEOUT", 3000);
+  const journalPath = path.join(graph, "journal", `${session}.jsonl`);
   const mine = await u.curl(`${u.serverBase()}/v1/queue?project=${encodeURIComponent(slug)}&assignee=me`, {
     headers: u.bearer(),
     timeoutMs,
@@ -385,6 +386,44 @@ async function claimNudge({ graph, slug, session, cwd, file, remote }) {
   // arm below). A Tier-2 reservation is owner-exclusive but NOT heartbeated,
   // so it suppresses without renewing.
   const held = myItems.filter((i) => i && i.lease_state && i.id);
+
+  // issue-spor-sessionend-reserve-retakes-released-lease: a node can drop out
+  // of this lookup ENTIRELY between beats — an ordinary lapse, or a `spor
+  // release` from another terminal — rather than merely failing to renew
+  // while still showing up as in_progress. The `dropped` computation below
+  // only catches the latter (it only ever looks at ids present in THIS
+  // beat's `inProgress`), so a fully-vanished id was silently falling out of
+  // the journal instead of being recorded as dropped — leaving it in
+  // sessionEndLease's replayed held-set, which then `reserve`s (and the
+  // server auto-reclaims) a lease this session no longer has any claim to.
+  // Read what this session has already recorded holding IN THIS PROJECT so
+  // far (each beat's renewed/dropped lists are already project-scoped, so
+  // filtering the replay the same way keeps this comparison meaningful) and
+  // diff it against what THIS beat's lookup still shows, in any lease state —
+  // an id that fell out entirely (not just out of `in_progress`) is a real
+  // drop, distinct from the existing "held but the renew wasn't confirmed"
+  // case below.
+  let priorEntries = [];
+  try {
+    priorEntries = fs
+      .readFileSync(journalPath, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => {
+        try {
+          return JSON.parse(l);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch {
+    // no journal yet this session -> nothing prior held
+  }
+  const priorHeld = u.readHeartbeatHeldIds(priorEntries, slug);
+  const heldIdsNow = new Set(held.map((i) => i.id));
+  const vanished = [...priorHeld].filter((id) => !heldIdsNow.has(id));
+
   if (held.length > 0) {
     // ONE round-trip for the whole working set, through renewAll's BLANKET
     // arm — `ids` OMITTED (dec-spor-heartbeat-adopts-blanket-renew-arm). That
@@ -440,14 +479,29 @@ async function claimNudge({ graph, slug, session, cwd, file, remote }) {
     // Journal the heartbeat so the operability log can correlate write-activity
     // to renewals; best-effort. `dropped` names held work this beat did NOT
     // renew — the lapsed-or-taken outcome the blanket arm accepts in exchange
-    // for never re-claiming — so a silent drop leaves a trace. This record's
-    // shape is a protocol distill.js's sessionEndLease replays in order
+    // for never re-claiming — plus any id this project's lookup used to show
+    // but has now stopped reporting at all (`vanished`, computed above), so a
+    // silent drop always leaves a trace whether it fell out mid-renew or fell
+    // out of the lookup entirely. `vanished` ids can never overlap the
+    // in_progress-derived half: by construction they are absent from `held`
+    // this beat, so `[...new Set(...)]` here is just a defensive merge, not a
+    // dedup this path can actually trigger. This record's shape is a protocol
+    // distill.js's sessionEndLease replays in order
     // (task-spor-heartbeat-journal-protocol-shape-guard) — write it through
     // u.appendHeartbeatRecord, not an ad-hoc JSON.stringify, so both ends stay
     // in sync.
-    const dropped = inProgress.map((x) => x.id).filter((id) => !renewed.includes(id));
-    u.appendHeartbeatRecord(path.join(graph, "journal", `${session}.jsonl`), { project: slug, renewed, dropped });
+    const dropped = [...new Set([...inProgress.map((x) => x.id).filter((id) => !renewed.includes(id)), ...vanished])];
+    u.appendHeartbeatRecord(journalPath, { project: slug, renewed, dropped });
     return null; // holds a claim -> never nudge
+  }
+
+  // No live claim reported by this beat's lookup. If this session previously
+  // held work in this project and it is now gone from the lookup entirely
+  // (the fully-vanished case `vanished` exists to catch — see above), record
+  // it as dropped before falling through to the nudge: SessionEnd's replay
+  // must not go on believing this session still holds it.
+  if (vanished.length > 0) {
+    u.appendHeartbeatRecord(journalPath, { project: slug, renewed: [], dropped: vanished });
   }
 
   // No live claim. Once-per-session cooldown (mirrors journal/<session>.nudged):
@@ -482,7 +536,7 @@ async function claimNudge({ graph, slug, session, cwd, file, remote }) {
   u.ensureDir(path.join(graph, "journal"));
   u.appendLine(state, u.jqNow());
   u.appendLine(
-    path.join(graph, "journal", `${session}.jsonl`),
+    journalPath,
     JSON.stringify({ ts: u.jqNow(), project: slug, tool: "claim-nudge", offered: poolItems.slice(0, 3).map((i) => i.id) })
   );
 
