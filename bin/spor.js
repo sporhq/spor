@@ -7902,9 +7902,10 @@ function breakerLockFile(file) {
 function acquireBreakerLock(file) {
   const deadline = Date.now() + BREAKER_LOCK_WAIT_MS;
   for (;;) {
+    if (Date.now() >= deadline) return null; // checked BEFORE every attempt (including the retry right after a reclaim) so the bound is structural, not just a property of there being nothing left to retry
     try {
-      writeLocalDispatchLock(file); // same {pid, started_ticks, at} shape; the breaker lock is not itself released/reclaimed by anything outside this pair
-      return { file };
+      const payload = writeLocalDispatchLock(file); // same {pid, started_ticks, at} shape; the breaker lock is not itself released/reclaimed by anything outside this pair
+      return { file, payload };
     } catch (e) {
       if (e.code !== "EEXIST") return null; // an unwritable journal — nothing to serialize on; caller falls back to refusing
     }
@@ -7924,16 +7925,27 @@ function acquireBreakerLock(file) {
         /* a racer beat us to the reclaim; fall through to the wait below */
       }
     }
-    if (Date.now() >= deadline) return null;
     sleepSyncMs(BREAKER_LOCK_POLL_MS);
   }
 }
+// Ownership-checked, exactly like releaseLocalDispatchLock: this lock's own
+// stale-reclaim (above) is the same rm+recreate shape the OUTER lock no
+// longer uses unguarded — accepted here only because the breaker's own
+// legitimate hold time is a handful of synchronous fs calls, not an entire
+// dispatch. A bare unconditional release would still be the one thing that
+// turns that accepted, vanishingly-rare residual into a THIRD holder: if a
+// stalled-but-alive breaker holder gets reclaimed by age, its own release
+// must not then delete the reclaimer's live breaker lock out from under it.
 function releaseBreakerLock(token) {
-  if (!token || !token.file) return;
+  if (!token || !token.file || !token.payload) return;
   try {
-    fs.rmSync(token.file, { force: true });
+    const raw = readLockRaw(token.file);
+    const held = raw ? JSON.parse(raw) : null;
+    if (held && held.pid === token.payload.pid && held.started_ticks === token.payload.started_ticks && held.at === token.payload.at) {
+      fs.rmSync(token.file, { force: true });
+    }
   } catch {
-    /* lapses on its own next stale check */
+    /* unreadable/gone: nothing of ours left to remove, or it lapses on its own next stale check */
   }
 }
 function acquireLocalDispatchLock(home, name) {
