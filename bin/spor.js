@@ -10984,10 +10984,16 @@ function makeGateDeps(
     // next-row).
     const carriedOf = (p) => gatesKernel.carriedFixCycles(p, cycle);
     const secondCarry = prior.filter((p) => carriedOf(p) >= gatesKernel.ROW_BY_ROW_CARRY);
+    // The carried findings the ledger records as a done-condition dispute: a
+    // second confirmation of one ends this gate's fix cycles (the runner's
+    // short-circuit, task-spor-review-gate-item-done-condition-vs-implementer-
+    // conclusion), so the reviewer is told what its answer costs — not to
+    // soften it, but so it says what the item asks and what the change does.
+    const unmetPrior = prior.filter((p) => gatesKernel.categoryOf(p) === gatesKernel.UNMET_CONDITION);
     const priorText = prior
       .map(
         (p) =>
-          `${p.id} [${p.severity}${carriedOf(p) ? `, carried ${carriedOf(p)} fix cycle${carriedOf(p) === 1 ? "" : "s"}` : ""}] ${p.file ? `${p.file} — ` : ""}${p.summary}` +
+          `${p.id} [${p.severity}${gatesKernel.categoryOf(p) === gatesKernel.UNMET_CONDITION ? `, ${gatesKernel.UNMET_CONDITION}` : ""}${carriedOf(p) ? `, carried ${carriedOf(p)} fix cycle${carriedOf(p) === 1 ? "" : "s"}` : ""}] ${p.file ? `${p.file} — ` : ""}${p.summary}` +
           (p.evidence ? `\n    evidence: ${String(p.evidence).replace(/\s+/g, " ").slice(0, 400)}` : "") +
           gatesKernel.mechanismRows(p.rows).map((r) => `\n    row (enumerated by the last review${Number.isInteger(p.rowsCycle) ? `, cycle ${p.rowsCycle}` : ""}): ${r}`).join("") +
           // An enumeration the LAST review did not re-confirm is replayed as
@@ -10998,12 +11004,27 @@ function makeGateDeps(
       )
       .join("\n");
     const raisedText = raised
-      .map((p) => `${p.id} [${p.severity}, undemonstrated at cycle ${p.opened}] ${p.file ? `${p.file} — ` : ""}${p.summary}`)
+      // The category rides this line for the same reason it rides `priorText`:
+      // an upgrade by id INHERITS it, so the reviewer must be able to see the
+      // one it is about to keep (F1 on the fourth cut of this gate).
+      .map(
+        (p) =>
+          `${p.id} [${p.severity}${gatesKernel.categoryOf(p) === gatesKernel.UNMET_CONDITION ? `, ${gatesKernel.UNMET_CONDITION}` : ""}, undemonstrated at cycle ${p.opened}] ${p.file ? `${p.file} — ` : ""}${p.summary}`
+      )
       .join("\n");
     const verdictShape =
       `{"verdict": "pass" | "changes_requested",` +
-      (prior.length ? ` "prior": [{"id": "${prior[0].id}", "status": "resolved" | "open", "note": "what you checked", "rows": ["each remaining row of the mechanism, when open"]}],` : "") +
-      ` "findings": [{"severity": "blocking|major|minor", "file": "path", "summary": "what is wrong", "evidence": "the command/test you ran and what it showed"` +
+      // `category` is on the prior shape because the prose below tells the
+      // reviewer to reclassify a carried finding with it (F2 on the fourth cut
+      // of this gate: the field was asked for and never shown). It is the one
+      // OPTIONAL key here — omitting it keeps the finding's recorded category,
+      // which is what a reviewer that is not reclassifying wants — so it is
+      // labelled as such, and the parser reads only the two category words, so
+      // an echo of this template reclassifies nothing.
+      (prior.length
+        ? ` "prior": [{"id": "${prior[0].id}", "status": "resolved" | "open", "note": "what you checked", "rows": ["each remaining row of the mechanism, when open"], "category": "correctness|unmet-condition — OPTIONAL, only to RECLASSIFY it; omit to keep the one it has"}],`
+        : "") +
+      ` "findings": [{"severity": "blocking|major|minor", "category": "correctness|unmet-condition", "file": "path", "summary": "what is wrong", "evidence": "the command/test you ran and what it showed"` +
       (cycle > 0 ? `, "introduced_by_fix": true | false` : "") +
       `}]}`;
     const prompt = [
@@ -11060,12 +11081,45 @@ function makeGateDeps(
                   "gate's fact, and the fixer is told to enumerate the rows itself.",
                 ]
               : []),
+            ...(unmetPrior.length
+              ? [
+                  "",
+                  `${unmetPrior.map((p) => p.id).join(", ")} ${unmetPrior.length === 1 ? "is" : "are"} recorded as an UNMET DONE CONDITION — a scope dispute, not a defect. Confirming`,
+                  `${unmetPrior.length === 1 ? "it" : "one"} open once it has been carried ${gatesKernel.UNMET_CONDITION_CARRY} fix cycles ENDS this gate's fix cycles: no further implementer is`,
+                  "dispatched at it and the refusal goes to the rescue lane or to a person, whose call a re-scope is.",
+                  "Confirm it open anyway if the condition is still unmet — that is the correct answer and the routing is",
+                  "not yours to manage — and use the note to say what the item asks, what the change achieves against it,",
+                  "and what the last fix argued.",
+                ]
+              : []),
             "",
           ]
         : []),
       "## What to look for",
       "",
       gate.instructions || "Look for correctness defects: does this change do what the work item asked, and does it break anything?",
+      "",
+      "## Finding category — a defect and an unmet done condition are different findings",
+      "",
+      "Every finding carries a `category`:",
+      "",
+      "- `correctness` (the default): the change is WRONG — a defect, silent data loss, a contract break.",
+      "- `unmet-condition`: the change is not wrong, it does not do what the WORK ITEM ASKED. Its stated done",
+      "  condition is unmet — a measured bar the result misses, a deliverable that was not attempted.",
+      "",
+      "Categorize honestly; they are answered differently. A defect is fixed. An unmet condition is met by a fresh,",
+      "materially different attempt at the thing, or by a person re-scoping the item — never by more evidence that it",
+      `is unmet, so once one has been carried ${gatesKernel.UNMET_CONDITION_CARRY} fix cycles the runner stops dispatching fixes at it and routes the`,
+      "refusal to the rescue lane or a person. To reclassify a prior finding you already raised, put `category` on its",
+      "`prior` entry; omit it and the finding keeps the category it has, which is what you want when you are only",
+      "confirming it. Naming one of the two earlier findings by id, to demonstrate it, likewise keeps the category it",
+      "was raised under unless you restate one. A finding you rate `unmet-condition` blocks on exactly the same terms as any other: only if you",
+      "DEMONSTRATE it — `evidence` naming what you ran and what it showed against the item's condition.",
+      "",
+      "A fix that ARGUES the condition is unattainable — a doc verdict, a test pinning the miss, a second measurement",
+      "of the same approach — has not met it: confirm the finding open and say so. A fix that files a decision",
+      "re-scoping the item has not met it either, and accepting a re-scope is not a reviewer's call: confirm it open,",
+      "name the decision in the note, and let the person the runner routes it to judge the re-scope.",
       "",
       "## Durable retry/debt flags — review the mechanism WHOLE, in this one verdict",
       "",
@@ -11157,6 +11211,13 @@ function makeGateDeps(
     // mechanism-not-the-next-row). `cycle` is the review index the findings
     // came from; the dirty-tree round-trip's `"tree"` carries nothing.
     const carriedFindings = blocking.filter((f) => gatesKernel.carriedFixCycles(f, cycle) >= 1);
+    // The blocking findings the review classified as an UNMET DONE CONDITION
+    // rather than a defect (task-spor-review-gate-item-done-condition-vs-
+    // implementer-conclusion): the fixer is told the two are answered
+    // differently, because the run that named this answered a condition with
+    // three cycles of evidence that it was unmet and the rescue then met it in
+    // one materially different attempt.
+    const unmetFindings = blocking.filter((f) => gatesKernel.categoryOf(f) === gatesKernel.UNMET_CONDITION);
     const carriedText = carriedFindings
       .map((f) => {
         const n = gatesKernel.carriedFixCycles(f, cycle);
@@ -11188,6 +11249,29 @@ function makeGateDeps(
             "above) — then fix so that ONE change closes them together, and state in the commit message which rows",
             "the fix closes and which it deliberately leaves and why. The next review reads that design; a fix that",
             "closes the row it was shown and leaves the next is a fix cycle spent.",
+          ]
+        : []),
+      ...(unmetFindings.length
+        ? [
+            "",
+            "Unmet done condition — meet it or re-scope it; do not argue it:",
+            unmetFindings.map((f) => `${f.id ? `${f.id} ` : ""}${f.summary}`).join("\n"),
+            `${unmetFindings.length === 1 ? "This finding says" : "These findings say"} the change does not do what the work item ASKED — not that it is wrong. More`,
+            "evidence that the condition is unmet does not close it: a doc verdict, a test pinning the miss, a second",
+            "measurement of the same approach are all the same answer said louder, and the last item answered that way",
+            "spent every fix cycle and a rescue before one materially different attempt met the condition. So do exactly ONE",
+            "of these — not a third restatement:",
+            "",
+            "  (1) make a fresh attempt at the condition that is materially DIFFERENT from the one that missed — a",
+            "      different approach, not the same one argued harder — and say in the commit message what you changed",
+            "      about the approach and what it now measures against the condition; or",
+            "  (2) if you have concluded the condition cannot be met, file a Spor DECISION that re-scopes the item — what",
+            `      was asked, what is achievable and on what evidence, what you propose instead — with a \`relates-to\` edge`,
+            `      to ${entry.node_id}, and name its id in the commit message.`,
+            "",
+            "Filing (2) does not clear the gate and is not meant to: the next review confirms the finding open, the runner",
+            "stops dispatching fix cycles at it, and the re-scope goes to a person, whose call it is. That is the",
+            "designed exit — it is not a failure, and it is a better answer than a third restatement.",
           ]
         : []),
       "If the fix touches a durable retry/debt flag (a `*_pending` run-record field, a journal line, a cooldown file),",

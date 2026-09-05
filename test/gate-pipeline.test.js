@@ -409,6 +409,65 @@ test("`cycles: 3` produces exactly three fix dispatches — four reviews, counte
   assert.match(seen.facts[0].markdown, /4 attempts: the initial one plus 3 fix cycles, cap 3/);
 });
 
+// task-spor-review-gate-item-done-condition-vs-implementer-conclusion: the run
+// that named this spent all three fix cycles and a rescue on ONE carried
+// finding — the reviewer correctly holding the item's literal done condition
+// while each fix asserted the failure more firmly. A condition held open for
+// the second fix cycle is a scope dispute, and the third fix cycle at it buys
+// nothing, so the runner stops dispatching implementers and hands the refusal
+// where a re-scope can actually be decided.
+test("an UNMET DONE CONDITION carried two fix cycles short-circuits the rest of the budget — the refusal goes to the escalation, or to the rescue lane when one is declared", async () => {
+  const unmet = ({ prior }) => ({
+    ok: true,
+    text: prior.length
+      ? `\`\`\`json\n{"verdict":"changes_requested","prior":[${prior.map((p) => `{"id":"${p.id}","status":"open","note":"still 6.78% against a 6% budget"}`).join(",")}],"findings":[]}\n\`\`\``
+      : `\`\`\`json\n{"verdict":"changes_requested","findings":[${BLOCKING("the calibration gate the item asks for is not met", ',"category":"unmet-condition"')}]}\n\`\`\``,
+  });
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 3 }] });
+  const { deps, seen } = fakes({ review: unmet });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.deepStrictEqual(seen.reviews.map((r) => r.cycle), [0, 1, 2]);
+  assert.strictEqual(seen.fixes.length, 2, "the third fix cycle the cap allows is never dispatched");
+  assert.strictEqual(seen.escalations.length, 1, "the refusal goes to a person, who can re-scope");
+  assert.match(
+    seen.facts[0].markdown,
+    /F1 held open as an unmet done condition through 2\+ fix cycles — a scope dispute, not a defect: no further fix cycle is dispatched at it/
+  );
+  assert.match(seen.facts[0].markdown, /Finding ledger:\n\nF1 \[blocking, unmet-condition\] OPEN since cycle 0/);
+  assert.match(seen.facts[0].markdown, /Cycles \(3 attempts: the initial one plus 2 fix cycles, cap 3\):/, "the record says how much of the budget was actually spent");
+
+  // A CORRECTNESS finding confirmed the same way spends the whole budget —
+  // the short-circuit is about the kind of finding, not about carrying one.
+  const defect = fakes({
+    review: ({ prior }) => ({
+      ok: true,
+      text: prior.length
+        ? `\`\`\`json\n{"verdict":"changes_requested","prior":[${prior.map((p) => `{"id":"${p.id}","status":"open"}`).join(",")}],"findings":[]}\n\`\`\``
+        : changesRequested,
+    }),
+  });
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: defect.deps });
+  assert.strictEqual(defect.seen.fixes.length, 3, "a defect is fixed, so every declared cycle is spent on it");
+
+  // With a rescue lane declared the short-circuited refusal is rescuable like
+  // any other — a fresh attempt at the condition is exactly what it is for.
+  const rescueFactory = factoryOf({
+    ...BASE,
+    gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 3 }],
+    rescue: { profile: "profile-claude-fable" },
+  });
+  const world = fakes({ review: unmet });
+  world.seen.rescues = [];
+  world.deps.rescue = async (args) => {
+    world.seen.rescues.push(args);
+    return { ok: true, runId: "run-rescue-1", diagnosis: "two complementary prompts; the conjunction meets the budget", category: "real-defect", fixed: true };
+  };
+  await gateRunner.runGatePipeline({ item: ITEM, factory: rescueFactory, deps: world.deps });
+  assert.strictEqual(world.seen.rescues.length, 1, "the refusal reached the rescue lane");
+  assert.strictEqual(world.seen.fixes.length, 2, "…without spending the last fix cycle first");
+});
+
 test("a fix cycle that lands makes the gate pass, and nothing is escalated — the reviewer is handed the prior set and the fix", async () => {
   const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 2 }] });
   let call = 0;
@@ -3353,6 +3412,19 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.match(p1, /### A carried finding names the MECHANISM, not the next row/);
   assert.match(p1, /"rows": \["each remaining row of the mechanism, when open"\]/);
   assert.doesNotMatch(p1, /already been carried through/, "a finding without an opened cycle is not a second carry");
+  // task-spor-review-gate-item-done-condition-vs-implementer-conclusion: every
+  // review is asked which KIND of finding it is raising, and the shape carries
+  // the field the parser reads.
+  assert.match(p1, /## Finding category — a defect and an unmet done condition are different findings/);
+  assert.match(p1, /"category": "correctness\|unmet-condition"/);
+  assert.match(p1, /once one has been carried 2 fix cycles the runner stops dispatching fixes at it/);
+  assert.match(p1, /accepting a re-scope is not a reviewer's call/);
+  assert.doesNotMatch(p1, /recorded as an UNMET DONE CONDITION/, "nothing on this ledger is one yet");
+  // F2 on the fourth cut of this gate: the prose tells the reviewer to
+  // reclassify with `category` on a `prior` entry, so the REQUIRED shape shows
+  // the field — labelled optional, since omitting it keeps the recorded one.
+  assert.match(p1, /"prior": \[\{"id": "F1"[^\n]*"category": "correctness\|unmet-condition — OPTIONAL, only to RECLASSIFY it; omit to keep the one it has"\}\]/);
+  assert.match(p1, /omit it and the finding keeps the category it has/);
 
   // Review 3: F1 has survived two fixes — the prompt says so, replays the
   // rows the last review enumerated, and makes `rows` required for it.
@@ -3364,6 +3436,16 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
       // F5: the last review confirmed it open WITHOUT rows; the enumeration
       // an earlier review made is replayed as history, never as current.
       { id: "F5", severity: "blocking", file: "z.js", summary: "stale", evidence: "node -e 'g()' throws", opened: 0, rows: [], earlierRows: ["row one", "row two"], earlierRowsCycle: 1 },
+      // A done-condition dispute, opened this cycle: tagged, and the reviewer
+      // is told what a second confirmation of it costs.
+      { id: "F6", severity: "blocking", category: "unmet-condition", file: "p.md", summary: "the budget the item asks for is not met", opened: 2 },
+    ],
+    // Two undemonstrated entries the review may re-raise by id. An upgrade
+    // INHERITS the entry's category, so the line shows it (F1 on the fourth
+    // cut of this gate — the inheritance was silently reading `correctness`).
+    raised: [
+      { id: "F7", severity: "blocking", file: "q.md", summary: "the deliverable was not attempted", opened: 1, category: "unmet-condition" },
+      { id: "F8", severity: "blocking", file: "w.js", summary: "loses the last write", opened: 1, category: "correctness" },
     ],
     fix: { cycle: 1, runId: "fix-run-2", fromHead: head0, toHead: head1, findings: [{ id: "F1", blocking: true }] },
   });
@@ -3373,6 +3455,12 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.match(p2, /F4 \[blocking, carried 1 fix cycle\] y\.js — new/);
   assert.match(p2, /F5 \[blocking, carried 2 fix cycles\] z\.js — stale\n    evidence: [^\n]*\n    row \(enumerated at cycle 1, NOT re-confirmed by the last review — re-enumerate if it still stands\): row one\n    row \(enumerated at cycle 1, NOT re-confirmed by the last review — re-enumerate if it still stands\): row two/);
   assert.match(p2, /F1, F5 have already been carried through 2 or more fix cycles: if you confirm any of them open, `rows`\nis REQUIRED — a confirmation naming fewer than two rows is recorded as row-by-row/);
+  assert.match(p2, /F6 \[blocking, unmet-condition\] p\.md — the budget the item asks for is not met/);
+  assert.match(p2, /F6 is recorded as an UNMET DONE CONDITION — a scope dispute, not a defect\./);
+  assert.match(p2, /ENDS this gate's fix cycles: no further implementer is\ndispatched at it and the refusal goes to the rescue lane or to a person/);
+  assert.match(p2, /Confirm it open anyway if the condition is still unmet/);
+  assert.match(p2, /F7 \[blocking, unmet-condition, undemonstrated at cycle 1\] q\.md — the deliverable was not attempted/);
+  assert.match(p2, /F8 \[blocking, undemonstrated at cycle 1\] w\.js — loses the last write/);
 
   // And the fix prompt names the findings by id, splits advisory from blocking,
   // and lists what earlier cycles already resolved.
@@ -3429,6 +3517,27 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.match(fixLaunch.prompt, /Blocking findings — fix each, by id:\nF2 \[blocking, row-by-row\] x\.js — still over-reads on empty input\n    row: the empty list\nF4 \[blocking\] x\.js — the reader drops the last item\n    row: a one-item list\n    row: a list ending in a separator/);
   assert.match(fixLaunch.prompt, /Carried findings — close the MECHANISM, not the next row:\nF2 has survived 2 fix cycles and the review named only the next row \(row-by-row\)\nF4 has survived 1 fix cycle\n/);
   assert.match(fixLaunch.prompt, /enumerate the mechanism's rows yourself[\s\S]*state in the commit message which rows\nthe fix closes and which it deliberately leaves and why/);
+  assert.doesNotMatch(fixLaunch.prompt, /Unmet done condition/, "both of those are defects");
+
+  // A fix cycle at an UNMET DONE CONDITION is told the two are answered
+  // differently, and given the two exits that actually close one: a fresh
+  // materially different attempt, or a filed re-scope decision.
+  fixLaunch = null;
+  await fixDeps.fix({
+    gate, cycle: 1, detail: "the review requested changes — 1 blocking finding(s)",
+    findings: [
+      { id: "F1", severity: "blocking", category: "unmet-condition", file: "p.md", summary: "suppresses 6.78% against the 6% budget the item asks for", blocking: true, evidence: "node scripts/intent-eval", origin: "prior", status: "open", opened: 0 },
+    ],
+    ledger: [],
+  });
+  assert.ok(fixLaunch, "the fix cycle was dispatched");
+  assert.match(fixLaunch.prompt, /Blocking findings — fix each, by id:\nF1 \[blocking, unmet-condition\] p\.md — suppresses 6\.78%/);
+  assert.match(fixLaunch.prompt, /Unmet done condition — meet it or re-scope it; do not argue it:\nF1 suppresses 6\.78% against the 6% budget the item asks for/);
+  assert.match(fixLaunch.prompt, /does not do what the work item ASKED — not that it is wrong/);
+  assert.match(fixLaunch.prompt, /\(1\) make a fresh attempt at the condition that is materially DIFFERENT/);
+  assert.match(fixLaunch.prompt, /\(2\) if you have concluded the condition cannot be met, file a Spor DECISION that re-scopes the item/);
+  assert.match(fixLaunch.prompt, /to task-fix-me, and name its id in the commit message\./);
+  assert.match(fixLaunch.prompt, /Filing \(2\) does not clear the gate and is not meant to/);
 });
 
 // --- the dirty-tree round-trip (task-spor-worker-declined-outcome) --------

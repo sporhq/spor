@@ -883,3 +883,145 @@ test("an unanswered prior finding keeps its rows, is not folded as answered, and
   assert.deepStrictEqual([confirmed.findings[0].answered, confirmed.findings[0].rows, confirmed.findings[0].earlierRows], [true, [], ["the empty list", "the one-element list"]]);
   assert.deepStrictEqual(gates.rowByRowFindings(confirmed.findings, 3).map((x) => x.id), ["F1"]);
 });
+
+// --- the finding CATEGORY (task-spor-review-gate-item-done-condition-vs-
+// implementer-conclusion) ----------------------------------------------------
+// A finding is a DEFECT or an UNMET DONE CONDITION, and the two are answered
+// differently: a defect is fixed, a condition is met by a fresh attempt or
+// re-scoped by a person. The category is read off the verdict, folded onto the
+// ledger, replayed to the next review, and — once a condition has been carried
+// UNMET_CONDITION_CARRY fix cycles — read by the runner as "stop dispatching
+// fixes at this". Pass/fail is unchanged: an unmet condition blocks on exactly
+// the same demonstrated-only terms as anything else.
+test("a finding's category is read, defaults to correctness, and rides the ledger; only a stated one reclassifies", () => {
+  assert.deepStrictEqual([...gates.FINDING_CATEGORIES], ["correctness", "unmet-condition"]);
+  assert.strictEqual(gates.UNMET_CONDITION, "unmet-condition");
+  assert.strictEqual(gates.UNMET_CONDITION_CARRY, 2);
+  // The spellings a reviewer reaches for, on each side. Both sets match
+  // EXACTLY; anything else is no statement at all rather than `correctness`,
+  // so an echo of the verdict shape's own `"correctness|unmet-condition"`
+  // cannot RECLASSIFY a carried finding (F2 on the fourth cut of this gate
+  // put that field on the prior shape).
+  for (const w of ["unmet-condition", "unmet_condition", "UNMET CONDITION", "done-condition-unmet", "scope", "re-scope"]) {
+    assert.strictEqual(gates.findingCategory(w), "unmet-condition", w);
+  }
+  for (const w of ["correctness", "bug", "defect", "data-loss", "contract-break"]) assert.strictEqual(gates.findingCategory(w), "correctness", w);
+  assert.strictEqual(gates.findingCategory(""), null, "unstated is null — the caller decides what silence means");
+  assert.strictEqual(gates.findingCategory(undefined), null);
+  assert.strictEqual(gates.findingCategory("correctness|unmet-condition — OPTIONAL, only to RECLASSIFY it"), null, "an echo of the shape states nothing");
+  assert.strictEqual(gates.findingCategory("wibble"), null, "a word neither set knows states nothing");
+  // …but every CALLER still resolves an unstated category the way it did:
+  // a ledger entry (legacy or unreadable) reads as `correctness`, and a fresh
+  // finding takes it as its default.
+  assert.strictEqual(gates.categoryOf({}), "correctness", "a legacy ledger entry with no category reads as correctness");
+  assert.strictEqual(gates.categoryOf({ category: "wibble" }), "correctness");
+
+  const v0 = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","findings":[' +
+      '{"severity":"blocking","category":"unmet-condition","file":"prompts/x.md","summary":"suppresses 6.78% against a 6% budget","evidence":"node scripts/intent-eval"},' +
+      '{"severity":"blocking","file":"lib/y.js","summary":"drops the last row","evidence":"npm test"}]}\n```',
+    { prior: [], cycle: 0 }
+  );
+  assert.strictEqual(v0.passed, false);
+  assert.deepStrictEqual(v0.findings.map((f) => [f.category, f.blocking]), [["unmet-condition", true], ["correctness", true]]);
+  const led0 = gates.applyReviewToLedger([], v0, 0);
+  assert.deepStrictEqual(led0.map((e) => [e.id, e.category]), [["F1", "unmet-condition"], ["F2", "correctness"]]);
+  // The next review is handed the category with the finding…
+  const prior = gates.openPriorFindings(led0);
+  assert.deepStrictEqual(prior.map((p) => p.category), ["unmet-condition", "correctness"]);
+  // …and a confirmation that says nothing about it leaves it alone, while a
+  // stated one reclassifies (a defect that turns out to be a scope dispute).
+  const v1 = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","prior":[{"id":"F1","status":"open","note":"still 6.78%"},{"id":"F2","status":"open","note":"asked for more than this","category":"unmet-condition"}],"findings":[]}\n```',
+    { prior, cycle: 1 }
+  );
+  assert.deepStrictEqual(v1.findings.map((f) => [f.id, f.category]), [["F1", "unmet-condition"], ["F2", "unmet-condition"]]);
+  const led1 = gates.applyReviewToLedger(led0, v1, 1);
+  assert.deepStrictEqual(led1.map((e) => e.category), ["unmet-condition", "unmet-condition"]);
+  // …and rolling that cycle back restores the category the entry had before it.
+  assert.deepStrictEqual(gates.rollbackCycle(led1, 1).map((e) => e.category), ["unmet-condition", "correctness"]);
+  // A confirmation that ECHOES the shape's own placeholder is not a
+  // reclassification either — it leaves both entries exactly as they were.
+  const echoed = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","prior":[{"id":"F1","status":"open","note":"still 6.78%","category":"correctness|unmet-condition — OPTIONAL, only to RECLASSIFY it"}],"findings":[]}\n```',
+    { prior: gates.openPriorFindings(led1), cycle: 2 }
+  );
+  assert.deepStrictEqual(echoed.findings.filter((f) => f.id === "F1").map((f) => f.category), ["unmet-condition"]);
+});
+
+// F1 on the fourth cut of this gate: an UNDEMONSTRATED unmet-condition finding
+// demonstrated by id on a later cycle is an UPGRADE, and the upgrade inherits
+// the entry's category. `parseReviewVerdict` projected the raised ledger
+// entries down to file+summary, so the inheritance read `correctness` for every
+// upgrade and `applyReviewToLedger` wrote that back over the recorded
+// `unmet-condition` — defeating the short-circuit for exactly the finding it
+// exists for, and spending the whole fix-cycle budget on it.
+test("an upgrade of an earlier undemonstrated finding keeps its category, and the short-circuit still fires on it", () => {
+  const led0 = gates.applyReviewToLedger(
+    [],
+    gates.parseReviewVerdict(
+      '```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","category":"unmet-condition","file":"prompts/x.md","summary":"suppresses 6.78% against a 6% budget"}]}\n```',
+      { prior: [], cycle: 0 }
+    ),
+    0
+  );
+  // Rated blocking without evidence: recorded advisory, and replayed to the
+  // next review as an upgradeable finding.
+  assert.deepStrictEqual(led0.map((e) => [e.id, e.status, e.category]), [["F1", "advisory", "unmet-condition"]]);
+  const raised = gates.raisedUndemonstrated(led0);
+  assert.deepStrictEqual(raised.map((r) => r.category), ["unmet-condition"]);
+
+  // Cycle 1 demonstrates it by id, restating no category.
+  const v1 = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","findings":[{"id":"F1","severity":"blocking","file":"prompts/x.md","summary":"still 6.78%","evidence":"node scripts/intent-eval/run.js — 4/59"}]}\n```',
+    { prior: [], cycle: 1, raised }
+  );
+  assert.deepStrictEqual(v1.findings.map((f) => [f.id, f.category, f.blocking]), [["F1", "unmet-condition", true]]);
+  const led1 = gates.applyReviewToLedger(led0, v1, 1);
+  assert.deepStrictEqual(led1.map((e) => [e.id, e.status, e.category]), [["F1", "open", "unmet-condition"]]);
+  // …so the next confirmation is its UNMET_CONDITION_CARRY'th carry and the
+  // runner short-circuits rather than spending the last fix cycle.
+  const v2 = gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","prior":[{"id":"F1","status":"open","note":"argued, not attempted"}],"findings":[]}\n```', {
+    prior: gates.openPriorFindings(led1),
+    cycle: 3,
+  });
+  assert.deepStrictEqual(gates.unmetConditionFindings(v2.findings, 3).map((f) => f.id), ["F1"]);
+  // A review that RESTATES a category on the upgrade still wins over the entry's.
+  const restated = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","findings":[{"id":"F1","severity":"blocking","category":"correctness","file":"prompts/x.md","summary":"still 6.78%","evidence":"npm test"}]}\n```',
+    { prior: [], cycle: 1, raised }
+  );
+  assert.deepStrictEqual(restated.findings.map((f) => f.category), ["correctness"]);
+  assert.deepStrictEqual(gates.applyReviewToLedger(led0, restated, 1).map((e) => e.category), ["correctness"]);
+});
+
+test("unmetConditionFindings: an unmet done condition confirmed open for the UNMET_CONDITION_CARRY'th time short-circuits; fewer carries, a defect, or an unanswered finding do not", () => {
+  const open = (id, opened, category) => ({ id, origin: "prior", status: "open", opened, category, blocking: true, answered: true });
+  const flagged = gates.unmetConditionFindings(
+    [
+      open("F1", 0, "unmet-condition"), // carried 2 -> short-circuit
+      open("F2", 1, "unmet-condition"), // carried 1 -> one more fix cycle first
+      open("F3", 0, "correctness"), // a defect is fixed, not re-scoped
+      open("F4", 0, undefined), // a legacy entry reads as correctness
+      { ...open("F5", 0, "unmet-condition"), status: "resolved" },
+      { ...open("F6", 0, "unmet-condition"), answered: false }, // ignored, not confirmed
+      { id: "F7", origin: "new", status: "open", opened: 0, category: "unmet-condition" },
+    ],
+    2
+  );
+  assert.deepStrictEqual(flagged.map((f) => f.id), ["F1"]);
+  assert.deepStrictEqual(gates.unmetConditionFindings([open("F1", 0, "unmet-condition")], "tree"), [], "the dirty-tree round-trip carries nothing");
+  // The tag rides both renderers, so the fact and the fixer's prompt say which
+  // kind of finding stood.
+  assert.strictEqual(
+    gates.renderFindings([
+      { id: "F1", severity: "blocking", category: "unmet-condition", file: "p.md", summary: "budget missed", blocking: true },
+      { id: "F2", severity: "blocking", file: "y.js", summary: "drops a row", blocking: true },
+    ]),
+    "F1 [blocking, unmet-condition] p.md — budget missed\nF2 [blocking] y.js — drops a row"
+  );
+  assert.strictEqual(
+    gates.renderLedger([{ id: "F1", severity: "blocking", category: "unmet-condition", status: "open", opened: 0, file: "p.md", summary: "budget missed" }]),
+    "F1 [blocking, unmet-condition] OPEN since cycle 0 — p.md — budget missed"
+  );
+});
