@@ -808,6 +808,17 @@ async function settleNativeContracts(cfg, records, { scope = null, now = () => D
   return out;
 }
 
+// preflight.liveWorkspaceWriters's own caller-side half
+// (issue-spor-native-bg-run-record-believed-without-liveness-probe): a
+// native-background record has no supervisor pid to probe, so occupancy for it
+// is only exact when reconciled against the harness's own live-agent listing —
+// the same evidence `spor runs` and the work loop already reconcile native
+// records against — rather than believed for the fallback horizon regardless.
+function liveWorkspaceWriters(cfg, records, dir) {
+  const { agents, enumerated } = nativeAgentEvidence(cfg, records);
+  return preflight.liveWorkspaceWriters(records, { dir, nativeAgents: agents, nativeEnumerated: enumerated });
+}
+
 // Active background agents keyed by node id (task-spor-cli-in-flight-surface).
 // `spor dispatch` names each background agent after the node id it works
 // (cmdDispatch: name = name || nodeId), so `claude agents --json` lets the queue
@@ -9935,7 +9946,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   // not a writer and never occupies anything.
   const workspaceWriters = backfill
     ? []
-    : preflight.liveWorkspaceWriters(dispatchRuns.readRunRecords(cfg.userConfigHome()), { dir: workspacePlan.dir });
+    : liveWorkspaceWriters(cfg, dispatchRuns.readRunRecords(cfg.userConfigHome()), workspacePlan.dir);
   const workspaceCheck = preflight.checkWorkspace({ plan: workspacePlan, writers: workspaceWriters, readOnly });
   const previewArgs = harnessAdapter ? harnessAdapter.buildArgs({
     name,
@@ -10371,7 +10382,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
         return 1;
       }
       workspaceLock = held.ok ? held.token : null;
-      const racers = preflight.liveWorkspaceWriters(dispatchRuns.readRunRecords(cfg.userConfigHome()), { dir: workspacePlan.dir });
+      const racers = liveWorkspaceWriters(cfg, dispatchRuns.readRunRecords(cfg.userConfigHome()), workspacePlan.dir);
       const recheck = preflight.checkWorkspace({ plan: workspacePlan, writers: racers, readOnly });
       if (!recheck.ok && !force) {
         err(`cannot dispatch ${nodeId || name}: ${recheck.reason} (it started while this dispatch was preparing).`);

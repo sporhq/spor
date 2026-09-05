@@ -113,6 +113,41 @@ test("liveWorkspaceWriters counts only live, write-capable runs in the exact can
   );
 });
 
+test("liveWorkspaceWriters reconciles a native-background record against the harness's own agent listing, not just the clock", () => {
+  // issue-spor-native-bg-run-record-believed-without-liveness-probe: a record
+  // well within the 1h horizon used to occupy the checkout regardless of
+  // whether the agent it names is still running. Once the caller can hand us
+  // `nativeAgentEvidence`'s listing, a record whose session is ABSENT from it
+  // is reconciled terminal immediately — the listing is exact evidence, so the
+  // clock never overrides it.
+  const dir = path.resolve("/tmp/candidate");
+  const now = () => Date.parse("2026-09-05T12:00:00Z"); // one minute after both records launched — well inside the 1h horizon
+  const records = [
+    { run_id: "finished", state: "running", cwd: dir, launch_mode: "native-background", session_id: "sess-finished", created_at: "2026-09-05T11:59:00Z" },
+    { run_id: "live", state: "running", cwd: dir, launch_mode: "native-background", session_id: "sess-live", created_at: "2026-09-05T11:59:00Z" },
+  ];
+  // An empty listing that WAS taken (enumerated: true): neither session is in
+  // it, so neither record is believed, no matter how young it is.
+  assert.deepStrictEqual(
+    preflight.liveWorkspaceWriters(records, { dir, now, nativeAgents: [], nativeEnumerated: true }).map((w) => w.run_id),
+    [],
+    "an empty agents list reconciles every native record terminal — the checkout is NOT reported occupied"
+  );
+  // A listing naming ONE of the two sessions: only that one is still believed.
+  const partial = [{ sessionId: "sess-live", kind: "background", state: "working" }];
+  assert.deepStrictEqual(
+    preflight.liveWorkspaceWriters(records, { dir, now, nativeAgents: partial, nativeEnumerated: true }).map((w) => w.run_id),
+    ["live"]
+  );
+  // The listing could not be taken at all (enumerated: false) — the fallback
+  // horizon applies exactly as before, believing both.
+  assert.deepStrictEqual(
+    preflight.liveWorkspaceWriters(records, { dir, now, nativeAgents: [], nativeEnumerated: false }).map((w) => w.run_id).sort(),
+    ["finished", "live"],
+    "with no listing to reconcile against, the short horizon is still the fallback"
+  );
+});
+
 test("a supervised writer is believed only while its supervisor is still WATCHING, not while its pid merely answers", () => {
   // Off Linux (and on an older record) the start-time tick count is unknowable,
   // so a bare `isSameSupervisor` collapses to a pid probe a RECYCLED pid answers
@@ -406,6 +441,45 @@ function parkRunIn(home, cwd, extra = {}) {
   );
   return runId;
 }
+
+// A native-background run record parked in `cwd` with no supervisor pid to
+// probe — what `claude --bg` leaves behind. `session_id` is what
+// `nativeAgentEvidence`'s listing is reconciled against.
+function parkNativeRunIn(home, cwd, extra = {}) {
+  const dir = path.join(home, "journal", "dispatch");
+  fs.mkdirSync(dir, { recursive: true });
+  const runId = `parknative-${Math.random().toString(16).slice(2, 10)}`;
+  fs.writeFileSync(
+    path.join(dir, `${runId}.run.json`),
+    JSON.stringify({
+      run_id: runId, node_id: "task-other", name: "task-other", harness: "claude-code",
+      launch_mode: "native-background", state: "running", cwd, session_id: "sess-vanished",
+      created_at: new Date().toISOString(), ...extra,
+    }, null, 2)
+  );
+  return runId;
+}
+
+test("issue-spor-native-bg-run-record-believed-without-liveness-probe: a native-background record whose session is absent from `claude agents --json` is NOT reported as occupying the checkout, even well within the 1h horizon", () => {
+  const f = fixture();
+  parkNativeRunIn(f.home, f.repo);
+  // `bare()` already sets SPOR_FAKE_AGENTS_JSON to "[]" — the empty listing.
+  const r = cli(["dispatch", "--node", "task-ready", "--no-brief", "--permission-mode", "bypassPermissions", "--print"], f.env);
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /no live writers here/, "the record is reconciled terminal against the empty agents list, not believed for the fallback horizon");
+  assert.match(r.stdout, /preflight: ok/);
+});
+
+test("...and the same record IS still believed live when its session is listed", () => {
+  const f = fixture();
+  parkNativeRunIn(f.home, f.repo, { session_id: "sess-still-running" });
+  const r = cli(["dispatch", "--node", "task-ready", "--no-brief", "--permission-mode", "bypassPermissions", "--print"], {
+    ...f.env,
+    SPOR_FAKE_AGENTS_JSON: JSON.stringify([{ sessionId: "sess-still-running", kind: "background", state: "working", cwd: f.repo }]),
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /1 live writer\(s\)/, "the listing names this session, so the record is still believed");
+});
 
 test("the pilot's missing-posture case: an unattended worker refuses a claude-code item with no write posture — no claim, no launch", () => {
   const { home, env, outfile } = fixture();
