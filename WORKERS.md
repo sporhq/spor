@@ -2362,18 +2362,28 @@ round-trip (`verifyNoCodeOutcome` in `lib/kernel/gates.js`, routed by
 3. the node it names is readable, declares the **same** `outcome:`, and
    carries an edge to the work item;
 4. the item **moved** — either its `repo:` now differs from the repo this
-   pipeline claimed it under (a re-stamp), or it reads retired (a live
-   resolving edge, a terminal status, a supersession);
-5. and for `premise-stale`/`duplicate`, the node **names what it found**.
+   pipeline claimed it under (a re-stamp), or it is superseded (its own status,
+   an inbound `supersedes` edge, or the declaring node superseding it);
+5. and for `premise-stale`/`duplicate`, the node **names what it found** — a
+   `derived-from`/`supersedes` edge to a node that is neither the item nor the
+   resolver, and that **exists on the graph**: a dangling edge is a shape the
+   graph accepts by design, so its presence demonstrates nothing.
 
-Check 4 is what keeps the route run-relative: a re-stamp cannot satisfy it
-twice, because the next pipeline claims the item under the repo the first one
-moved it to.
+What check 4 deliberately does **not** accept is "the item reads resolved". A
+live resolving edge is the *precondition for being gated at all* (§10.2), so a
+run that did nothing but write its resolver already has one — counting it would
+let a single extra frontmatter key route exactly the "resolved with nothing
+behind it" run the empty-diff refusal names in its own text. What it demands
+instead is a write the run could not have made by doing nothing. And the
+re-stamp branch is run-relative on top of that: it cannot be satisfied twice,
+because the next pipeline claims the item under the repo the first one moved it
+to.
 
 **If it checks out**, the pipeline settles **`scoped`**: an idempotent
 `art-gate-scoping-…` fact is recorded with verdict `scoped` (`relates-to` the
-item, like every gate fact — a gate records, it does not retire), **no code
-gate runs**, **no integration stage runs** (`runGateAndIntegration` follows a
+item, like every gate fact — a gate records, it does not retire; `scoping` is a
+**reserved** gate id, and a factory declaring a gate of that name refuses to
+parse rather than minting a colliding fact), **no code gate runs**, **no integration stage runs** (`runGateAndIntegration` follows a
 `passed` state only), no escalation is filed and nothing is demoted. The item
 is left exactly where the scoping put it: open under the repo that now owns it,
 or retired. The verdict is deliberately **not** `passed` — no gate ran and
@@ -2382,9 +2392,13 @@ It IS settled (`SETTLED_GATE_STATES`), so it is final for the run: a later
 worker never re-offers it, and `spor work --regate` refuses a run that already
 read `scoped`, like a pass. The other direction is open — a run REFUSED on its
 empty diff can be re-gated once the graph says what it should have said, and a
-re-judgement that settles `scoped` closes the escalation and restores anything
-the refusal demoted, exactly as a pass does (§10.7); the `art-regate-…` node it
-writes says a scoping result, not "passed every gate", because none ran.
+re-judgement that settles `scoped` closes the escalation exactly as a pass does
+(§10.7). It does **not** restore a completion status the refusal rolled back:
+the claim it just verified is that the item is where the scoping put it —
+re-stamped and still open, or superseded — so promoting it back to `done` would
+mark work complete that the verified outcome says is outstanding. The
+`art-regate-…` node it writes says a scoping result, not "passed every gate",
+because none ran.
 
 Unlike `superseded` (§10.8), a `scoped` item **cools off** for
 `work.retryAfterMs`: it may still be open under its new repo, and this worker

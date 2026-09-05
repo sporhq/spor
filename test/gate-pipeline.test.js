@@ -5053,14 +5053,15 @@ const SCOPING_NODE = {
   status: "",
   repo: "demo",
   outcome: "rescoped",
-  edges: [{ type: "relates-to", to: "task-demo" }],
+  edges: [{ type: "resolves", to: "task-demo" }],
 };
 
-// The item as the graph reads it AFTER the scoping: re-stamped to another repo,
-// still open. `ITEM.project` ("demo") is what the pipeline claimed it under.
+// The item as the graph reads it AFTER the scoping: re-stamped to the repo that
+// owns the remainder, still open. `ITEM.project` ("demo") is the repo this
+// pipeline claimed it under, which is the "before" the check compares against.
 const SCOPED_ITEM_NODE = { id: "task-demo", type: "task", status: "open", repo: "elsewhere", edges: [] };
 
-function withNoCode(world, { report = "SCOPED: rescoped art-scoping-x — the server half already shipped", nodes = { "art-scoping-x": SCOPING_NODE, "task-demo": SCOPED_ITEM_NODE }, resolved = null } = {}) {
+function withNoCode(world, { report = "SCOPED: rescoped art-scoping-x — the server half already shipped", nodes = { "art-scoping-x": SCOPING_NODE, "task-demo": SCOPED_ITEM_NODE } } = {}) {
   world.seen.nodeReads = [];
   world.deps.noCodeClaim = () => gates.parseNoCodeReport(report);
   world.deps.node = async ({ id }) => {
@@ -5068,7 +5069,6 @@ function withNoCode(world, { report = "SCOPED: rescoped art-scoping-x — the se
     const node = nodes[id];
     return node ? { ok: true, node } : { ok: false, reason: `${id} could not be read from the graph` };
   };
-  world.deps.resolved = async () => resolved;
   return world;
 }
 
@@ -5095,8 +5095,8 @@ test("a VERIFIED no-code outcome settles SCOPED: one art-gate-scoping fact, no g
   assert.strictEqual(seen.fixes.length, 0, "no fix cycle, and no commit-or-discard round-trip");
   assert.strictEqual(seen.escalations.length, 0, "nobody is paged for a verified scoping result");
   assert.strictEqual(seen.demotions.length, 0, "the item is left exactly where the scoping put it");
-  // The fact: one, under the scoping gate id, `relates-to` the item and never
-  // `resolves` it — a gate outcome records, it does not retire.
+  // The fact: one, under the reserved scoping gate id, `relates-to` the item
+  // and never `resolves` it — a gate outcome records, it does not retire.
   assert.strictEqual(seen.facts.length, 1);
   assert.match(seen.facts[0].id, /^art-gate-scoping-demo-runabcde-[0-9a-f]{8}$/);
   assert.deepStrictEqual(res.facts, [seen.facts[0].id]);
@@ -5108,7 +5108,49 @@ test("a VERIFIED no-code outcome settles SCOPED: one art-gate-scoping fact, no g
   assert.ok(gates.SETTLED_GATE_STATES.has("scoped"));
 });
 
-test("a premise-stale outcome must NAME what it found, and the item reading retired is enough on its own", async () => {
+// The hole this route must not open (review finding 1): a live resolving edge
+// is the PRECONDITION for being gated (`shouldGate`), so a run that did nothing
+// but write its resolver already has one. If "the item reads resolved" counted
+// as the movement, one extra frontmatter key would route exactly the "resolved
+// with nothing behind it" run the empty-diff refusal names in its own text.
+test("a resolver alone is NOT movement: a do-nothing run that resolved its item and declared `rescoped` is still refused", async () => {
+  const factory = factoryOf(NO_CODE_FACTORY);
+  const { deps, seen } = withNoCode(fakes({ changed: [] }), {
+    nodes: {
+      // Everything a do-nothing run controls: the artifact it had to write to
+      // reach the gates at all, plus one `outcome:` line.
+      "art-scoping-x": SCOPING_NODE,
+      // ...and an item that is resolved (by that very artifact) but otherwise
+      // untouched: same repo, not superseded.
+      "task-demo": { id: "task-demo", type: "task", status: "done", repo: "demo", edges: [] },
+    },
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.match(res.reason, /task-demo is unchanged/);
+  assert.match(res.reason, /being resolved is what got this run gated in the first place/);
+  assert.strictEqual(seen.escalations.length, 1);
+  assert.strictEqual(seen.demotions.length, 1);
+  assert.ok(!seen.facts.some((f) => f.id.startsWith("art-gate-scoping-")));
+});
+
+test("supersession is the other movement: an item superseded by status, by the graph, or by the resolver itself", async () => {
+  const factory = factoryOf(NO_CODE_FACTORY);
+  const same = { id: "task-demo", type: "task", status: "open", repo: "demo", edges: [] };
+  const worlds = [
+    [{ "art-scoping-x": SCOPING_NODE, "task-demo": { ...same, status: "superseded" } }, /superseded \(status\)/],
+    [{ "art-scoping-x": SCOPING_NODE, "task-demo": { ...same, superseded_by: "task-canonical" } }, /superseded by task-canonical/],
+    [{ "art-scoping-x": { ...SCOPING_NODE, edges: [{ type: "supersedes", to: "task-demo" }] }, "task-demo": same }, /superseded by art-scoping-x/],
+  ];
+  for (const [nodes, expected] of worlds) {
+    const { deps } = withNoCode(fakes({ changed: [] }), { nodes });
+    const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+    assert.strictEqual(res.state, "scoped", `${expected}`);
+    assert.match(res.reason, expected);
+  }
+});
+
+test("a premise-stale outcome must name a node that EXISTS — a dangling edge demonstrates nothing", async () => {
   const factory = factoryOf(NO_CODE_FACTORY);
   const resolver = {
     ...SCOPING_NODE,
@@ -5118,29 +5160,34 @@ test("a premise-stale outcome must NAME what it found, and the item reading reti
       { type: "derived-from", to: "art-already-shipped" },
     ],
   };
-  // The item did NOT change repo; it is retired by a live resolving edge.
-  const nodes = { "art-scoping-x": resolver, "task-demo": { id: "task-demo", type: "task", status: "open", repo: "demo", edges: [] } };
   const ok = withNoCode(fakes({ changed: [] }), {
     report: "SCOPED: premise-stale art-scoping-x — GET /v1/queue?offset= already shipped",
-    nodes,
-    resolved: { terminal_state: "resolved", resolved_by: "art-scoping-x" },
+    nodes: { "art-scoping-x": resolver, "task-demo": SCOPED_ITEM_NODE, "art-already-shipped": { id: "art-already-shipped", type: "artifact", edges: [] } },
   });
   const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: ok.deps });
   assert.strictEqual(res.state, "scoped");
   assert.strictEqual(res.found, "art-already-shipped");
   assert.match(res.reason, /names `art-already-shipped` as what it found/);
-  assert.match(res.reason, /is retired \(a live resolving edge\)/);
+  assert.ok(ok.seen.nodeReads.includes("art-already-shipped"), "the named node is read back, not taken from the edge");
 
-  // Strip the derived-from edge and the same claim is refused: a finding that
-  // names nothing it found is not a demonstration.
-  const bare = withNoCode(fakes({ changed: [] }), {
+  // The SAME claim with nothing behind the edge is refused: the graph accepts
+  // a dangling edge by design, so its presence proves nothing.
+  const dangling = withNoCode(fakes({ changed: [] }), {
     report: "SCOPED: premise-stale art-scoping-x — trust me",
-    nodes: { ...nodes, "art-scoping-x": { ...resolver, edges: [{ type: "resolves", to: "task-demo" }] } },
-    resolved: { terminal_state: "resolved", resolved_by: "art-scoping-x" },
+    nodes: { "art-scoping-x": resolver, "task-demo": SCOPED_ITEM_NODE },
   });
-  const refused = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: bare.deps });
+  const refused = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: dangling.deps });
   assert.strictEqual(refused.state, "failed");
-  assert.match(refused.reason, /names nothing it found/);
+  assert.match(refused.reason, /names `art-already-shipped` as what it found, and no such node is on the graph/);
+
+  // ...and with no such edge at all, the refusal says what is missing instead.
+  const naked = withNoCode(fakes({ changed: [] }), {
+    report: "SCOPED: duplicate art-scoping-x — dup",
+    nodes: { "art-scoping-x": { ...resolver, outcome: "duplicate", edges: [{ type: "resolves", to: "task-demo" }] }, "task-demo": SCOPED_ITEM_NODE },
+  });
+  const bare = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: naked.deps });
+  assert.strictEqual(bare.state, "failed");
+  assert.match(bare.reason, /names nothing it found/);
 });
 
 test("a no-code claim that does not check out falls through to the empty-diff refusal, carrying WHY", async () => {
@@ -5153,11 +5200,13 @@ test("a no-code claim that does not check out falls through to the empty-diff re
     // It declares a DIFFERENT outcome than the report claims.
     [{ nodes: { "art-scoping-x": { ...SCOPING_NODE, outcome: "duplicate" }, "task-demo": SCOPED_ITEM_NODE } }, /declares `outcome: duplicate`, but the report claims 'rescoped'/],
     // It is not linked to the item.
-    [{ nodes: { "art-scoping-x": { ...SCOPING_NODE, edges: [] }, "task-demo": SCOPED_ITEM_NODE } }, /carries no resolves\/answers\/relates-to\/derived-from edge to task-demo/],
-    // Nothing moved: same repo, not resolved, not superseded.
-    [{ nodes: { "art-scoping-x": SCOPING_NODE, "task-demo": { ...SCOPED_ITEM_NODE, repo: "demo" } } }, /task-demo is unchanged/],
-    // The declaration itself is unreadable.
+    [{ nodes: { "art-scoping-x": { ...SCOPING_NODE, edges: [] }, "task-demo": SCOPED_ITEM_NODE } }, /carries no resolves\/answers\/relates-to\/derived-from\/supersedes edge to task-demo/],
+    // The ITEM could not be read: that is not "unchanged", and the refusal says so.
+    [{ nodes: { "art-scoping-x": SCOPING_NODE } }, /task-demo itself could not be read from the graph/],
+    // The declaration itself is unreadable...
     [{ report: "SCOPED: rescoped" }, /does not read as `SCOPED: <outcome> <resolver-id>/],
+    // ...including the dropped-dash case, which must not silently truncate the id.
+    [{ report: "SCOPED: rescoped art-scoping-x the premise is stale" }, /does not read as `SCOPED: <outcome> <resolver-id>/],
     // ...or names a word that is not a declared outcome.
     [{ report: "SCOPED: vibes art-scoping-x — no" }, /is not a declared no-code outcome/],
   ];
@@ -5193,6 +5242,16 @@ test("a run that declares NOTHING is judged exactly as before — the deps are p
   assert.match(res.reason, /no committed change against main/);
   assert.doesNotMatch(res.reason, /no-code outcome/, "a run that claimed nothing is not told its claim failed");
   assert.deepStrictEqual(seen.nodeReads, []);
+});
+
+test("the scoping gate id is RESERVED — a factory declaring it refuses to parse rather than minting a colliding fact", () => {
+  const body = ["```json", JSON.stringify({ ...BASE, gates: [{ id: "scoping", kind: "command", command: "npm test" }] }), "```"].join("\n");
+  const { factory, errors } = gates.parseFactory(body, { id: "factory-test" });
+  assert.strictEqual(factory, null);
+  assert.ok(
+    errors.some((e) => /id 'scoping' is reserved for the no-code-outcome route/.test(e)),
+    errors.join("; ")
+  );
 });
 
 test("the loop tallies SCOPED, stamps it settled, and cools the item off — it may still be open under its new repo", async () => {

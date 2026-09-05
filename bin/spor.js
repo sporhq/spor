@@ -11534,6 +11534,22 @@ function makeGateDeps(
   const keysFor = (rescue) => (rescue ? { short: gateRunner.shortRunAttempt(entry.run_id, entry.attempt, rescue), runKey: gateRunner.gateRunKey(entry.run_id, entry.attempt, rescue) } : { short, runKey });
   const progressKey = (gate, rescue) => (rescue ? `${gate.id}#x${rescue}` : gate.id);
   let change = null;
+  // The local graph, loaded lazily and at most once, for the one inbound fact
+  // the `node` dep cannot read off a node's own file (see there). Remote mode
+  // never loads it; a graph that will not load answers "not superseded", which
+  // is the fail-closed reading for every caller.
+  let localGraph;
+  const localSupersededBy = (id) => {
+    if (remote.isRemote(cfg)) return null;
+    if (localGraph === undefined) {
+      try {
+        localGraph = require(path.join(ROOT, "lib", "graph.js")).loadGraph(cfg.nodesDir());
+      } catch {
+        localGraph = null;
+      }
+    }
+    return (localGraph && localGraph.supersededBy && localGraph.supersededBy[id]) || null;
+  };
   // The work item's own text, read once for the review prompt: a reviewer
   // judging "does this do what was asked" has to be told what was asked.
   let itemText = null;
@@ -12243,7 +12259,13 @@ function makeGateDeps(
           repo: node.repo || null,
           outcome: (node.frontmatter && node.frontmatter.outcome) || null,
           edges: node.edges || [],
-          superseded_by: node.superseded_by || null,
+          // Supersession is an INBOUND fact, so it comes from the server's own
+          // enrichment remotely and from the loaded graph locally — a node
+          // stores only its own out-edges, and reading the frontmatter alone
+          // would make the check's supersession leg dead in local mode. The
+          // graph is loaded at most once per pipeline, and only on the path
+          // that runs for an empty diff with a declared claim.
+          superseded_by: node.superseded_by || localSupersededBy(id) || null,
         },
       };
     },
@@ -13428,7 +13450,15 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     const closed = await writeRegateArtifact(cfg, { record, entry, factoryId, previous, reason, escalatedTo: escalatedBefore, project, state });
     notes.push(closed.ok ? `closed ${escalatedBefore.join(", ")} with ${closed.id}` : `could not close ${escalatedBefore.join(", ")} (${closed.reason}) — resolve by hand`);
   }
-  if (record.gate_demoted) {
+  // A PASS restores the completion status the refusal rolled back. A SCOPED
+  // re-judgement must NOT: its whole claim is that the item is where the
+  // scoping put it — re-stamped to the owning repo and still open, or
+  // superseded — so promoting it back to `done` would mark work complete that
+  // the verified outcome says is still outstanding. The rollback stands, and
+  // the note says so rather than leaving it unexplained.
+  if (record.gate_demoted && state === "scoped") {
+    notes.push(`left ${record.node_id} open — a scoping result is not a completion, and the earlier rollback is where the scoping wants it`);
+  } else if (record.gate_demoted) {
     const promoted = await gatePromoteItem(cfg, record.node_id);
     notes.push(promoted.ok ? promoted.note : `could not restore ${record.node_id}'s status (${promoted.reason})`);
   }

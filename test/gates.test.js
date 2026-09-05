@@ -1520,63 +1520,104 @@ test("parseNoCodeReport reads the fixed form off the FIRST line only, tolerating
   const unknown = gates.parseNoCodeReport("SCOPED: reorganised art-x");
   assert.strictEqual(unknown.ok, false);
   assert.match(unknown.error, /not a declared no-code outcome/);
+  // The separator is SPACE-DELIMITED, so a hyphen inside the id can never be
+  // read as one: a dropped dash refuses the line rather than silently
+  // truncating the id and refusing against a node the run never wrote.
+  for (const line of ["SCOPED: rescoped art-scoping-foo the premise is stale", "SCOPED: premise-stale art-x-y-z because reasons"]) {
+    const r = gates.parseNoCodeReport(line);
+    assert.strictEqual(r.ok, false, line);
+    assert.match(r.error, /does not read as/, line);
+  }
   assert.deepStrictEqual([...gates.NO_CODE_OUTCOMES], ["rescoped", "premise-stale", "duplicate"]);
 });
 
-test("verifyNoCodeOutcome checks the claim against the graph, and names what is missing when it does not hold", () => {
+test("verifyNoCodeOutcome demands a write a do-nothing run could not have made, and names what is missing", () => {
   const claim = { ok: true, outcome: "rescoped", resolver: "art-scoping", reason: "the server half shipped" };
-  const resolver = { id: "art-scoping", type: "artifact", outcome: "rescoped", edges: [{ type: "relates-to", to: "task-a" }] };
-  const base = { nodeId: "task-a", claim, resolver, claimedRepo: "spor-server" };
+  const resolver = { id: "art-scoping", type: "artifact", outcome: "rescoped", edges: [{ type: "resolves", to: "task-a" }] };
+  const moved = { id: "task-a", repo: "spor", status: "open" };
+  const verify = (nodes, patch = {}) => gates.verifyNoCodeOutcome({ nodeId: "task-a", claim, claimedRepo: "spor-server", nodes, ...patch });
 
   // Re-stamped: the item's repo is no longer the one this pipeline claimed it
   // under. That is what keeps the branch run-relative.
-  const ok = gates.verifyNoCodeOutcome({ ...base, item: { id: "task-a", repo: "spor", status: "open" } });
+  const ok = verify({ "art-scoping": resolver, "task-a": moved });
   assert.strictEqual(ok.ok, true);
   assert.strictEqual(ok.outcome, "rescoped");
   assert.strictEqual(ok.resolver, "art-scoping");
+  assert.strictEqual(ok.found, null, "a rescope is a MOVE, not a finding — it needs no found node");
   assert.match(ok.detail, /re-stamped from repo 'spor-server' to 'spor'/);
 
-  // Retired is the other half of the disjunction — by a resolving edge, by a
-  // terminal status, or by a supersession.
-  const unmoved = { id: "task-a", repo: "spor-server", status: "open" };
-  assert.strictEqual(gates.verifyNoCodeOutcome({ ...base, item: unmoved, resolved: true }).ok, true);
-  assert.strictEqual(gates.verifyNoCodeOutcome({ ...base, item: { ...unmoved, status: "done" } }).ok, true);
-  assert.strictEqual(gates.verifyNoCodeOutcome({ ...base, item: { ...unmoved, status: "superseded" } }).ok, true);
-  assert.strictEqual(gates.verifyNoCodeOutcome({ ...base, item: { ...unmoved, superseded_by: "task-b" } }).ok, true);
-  const still = gates.verifyNoCodeOutcome({ ...base, item: unmoved });
-  assert.strictEqual(still.ok, false);
-  assert.match(still.reason, /task-a is unchanged/);
+  // Supersession is the other movement, in its three readable forms.
+  const same = { id: "task-a", repo: "spor-server", status: "open" };
+  assert.match(verify({ "art-scoping": resolver, "task-a": { ...same, status: "superseded" } }).detail, /superseded \(status\)/);
+  assert.match(verify({ "art-scoping": resolver, "task-a": { ...same, superseded_by: "task-b" } }).detail, /superseded by task-b/);
+  assert.match(verify({ "art-scoping": { ...resolver, edges: [{ type: "supersedes", to: "task-a" }] }, "task-a": same }).detail, /superseded by art-scoping/);
+
+  // THE hole this check exists to close: a live resolving edge is the
+  // precondition for being gated at all, so a run that did nothing but write
+  // its resolver already has one. It is not movement.
+  const unchanged = verify({ "art-scoping": resolver, "task-a": { ...same, status: "done" } });
+  assert.strictEqual(unchanged.ok, false);
+  assert.match(unchanged.reason, /task-a is unchanged/);
+  assert.match(unchanged.reason, /being resolved is what got this run gated in the first place/);
 
   // Every other refusal names its own check.
   const refusals = [
-    [{ claim: null }, /declared no no-code outcome/],
-    [{ claim: { ok: false, error: "the `SCOPED:` line does not read as ..." } }, /does not read as/],
-    [{ resolver: null }, /`art-scoping` could not be read from the graph/],
-    [{ resolver: { ...resolver, outcome: null } }, /carries no `outcome:`/],
-    [{ resolver: { ...resolver, outcome: "duplicate" } }, /declares `outcome: duplicate`, but the report claims 'rescoped'/],
-    [{ resolver: { ...resolver, edges: [{ type: "mentions", to: "task-a" }] } }, /carries no resolves\/answers\/relates-to\/derived-from edge/],
-    [{ resolver: { ...resolver, edges: [{ type: "relates-to", to: "task-other" }] } }, /carries no resolves\/answers\/relates-to\/derived-from edge/],
+    [{ nodes: { "task-a": moved }, claim: null }, /declared no no-code outcome/],
+    [{ claim: { ok: false, error: "the `SCOPED:` line does not read as ..." }, nodes: { "task-a": moved } }, /does not read as/],
+    [{ nodes: { "task-a": moved } }, /`art-scoping` could not be read from the graph/],
+    [{ nodes: { "art-scoping": { ...resolver, outcome: null }, "task-a": moved } }, /carries no `outcome:`/],
+    [{ nodes: { "art-scoping": { ...resolver, outcome: "duplicate" }, "task-a": moved } }, /declares `outcome: duplicate`, but the report claims 'rescoped'/],
+    [{ nodes: { "art-scoping": { ...resolver, edges: [{ type: "mentions", to: "task-a" }] }, "task-a": moved } }, /carries no resolves\/answers\/relates-to\/derived-from\/supersedes edge/],
+    [{ nodes: { "art-scoping": { ...resolver, edges: [{ type: "relates-to", to: "task-other" }] }, "task-a": moved } }, /carries no resolves\/answers\/relates-to\/derived-from\/supersedes edge/],
+    // An unreadable ITEM is not "unchanged" — say which fact is missing.
+    [{ nodes: { "art-scoping": resolver } }, /task-a itself could not be read from the graph/],
   ];
   for (const [patch, expected] of refusals) {
-    const r = gates.verifyNoCodeOutcome({ ...base, item: { id: "task-a", repo: "spor", status: "open" }, ...patch });
+    const r = gates.verifyNoCodeOutcome({ nodeId: "task-a", claim, claimedRepo: "spor-server", nodes: {}, ...patch });
     assert.strictEqual(r.ok, false, `${expected}`);
     assert.match(r.reason, expected);
   }
+});
 
-  // A FINDING outcome has to name what it found, and the edge that names it
-  // may not be the one that links the item.
-  const stale = { ok: true, outcome: "premise-stale", resolver: "art-scoping", reason: "" };
-  const found = { ...resolver, outcome: "premise-stale", edges: [{ type: "relates-to", to: "task-a" }, { type: "derived-from", to: "art-shipped" }] };
-  const good = gates.verifyNoCodeOutcome({ ...base, claim: stale, resolver: found, item: { id: "task-a", repo: "spor", status: "open" } });
-  assert.strictEqual(good.ok, true);
-  assert.strictEqual(good.found, "art-shipped");
-  const naked = gates.verifyNoCodeOutcome({ ...base, claim: stale, resolver: { ...found, edges: [{ type: "relates-to", to: "task-a" }] }, item: { id: "task-a", repo: "spor", status: "open" } });
+test("a FINDING outcome names a node that exists — candidates exclude the item and the resolver, and a dangling edge refuses", () => {
+  const claim = { ok: true, outcome: "premise-stale", resolver: "art-scoping", reason: "" };
+  const resolver = {
+    id: "art-scoping",
+    outcome: "premise-stale",
+    edges: [
+      { type: "relates-to", to: "task-a" },
+      { type: "derived-from", to: "art-shipped" },
+    ],
+  };
+  const moved = { id: "task-a", repo: "spor", status: "open" };
+  const verify = (nodes) => gates.verifyNoCodeOutcome({ nodeId: "task-a", claim, claimedRepo: "spor-server", nodes });
+
+  const ok = verify({ "art-scoping": resolver, "task-a": moved, "art-shipped": { id: "art-shipped" } });
+  assert.strictEqual(ok.ok, true);
+  assert.strictEqual(ok.found, "art-shipped");
+
+  // The edge is there but nothing is behind it: the graph accepts a dangling
+  // edge by design, so its presence demonstrates nothing.
+  const dangling = verify({ "art-scoping": resolver, "task-a": moved });
+  assert.strictEqual(dangling.ok, false);
+  assert.match(dangling.reason, /names `art-shipped` as what it found, and no such node is on the graph/);
+
+  // No such edge at all reads differently from one that dangles.
+  const naked = verify({ "art-scoping": { ...resolver, edges: [{ type: "relates-to", to: "task-a" }] }, "task-a": moved });
   assert.strictEqual(naked.ok, false);
   assert.match(naked.reason, /names nothing it found/);
-  // A `derived-from` pointing back at the ITEM is not a finding about it.
-  const selfref = gates.verifyNoCodeOutcome({ ...base, claim: stale, resolver: { ...found, edges: [{ type: "derived-from", to: "task-a" }] }, item: { id: "task-a", repo: "spor", status: "open" } });
+
+  // A found edge pointing back at the ITEM, or at the resolver itself, is not
+  // a finding about it — neither is offered as a candidate.
+  assert.deepStrictEqual(
+    gates.noCodeFoundCandidates({
+      nodeId: "task-a",
+      resolver: { id: "art-scoping", edges: [{ type: "derived-from", to: "task-a" }, { type: "supersedes", to: "art-scoping" }, { type: "derived-from", to: "art-shipped" }, { type: "derived-from", to: "art-shipped" }, { type: "relates-to", to: "art-other" }] },
+    }),
+    ["art-shipped"],
+    "self-references, duplicates and non-finding edge types are all dropped"
+  );
+  const selfref = verify({ "art-scoping": { ...resolver, edges: [{ type: "derived-from", to: "task-a" }] }, "task-a": moved });
   assert.strictEqual(selfref.ok, false);
   assert.match(selfref.reason, /names nothing it found/);
-  // `rescoped` is a MOVE, not a finding — it needs no such edge.
-  assert.strictEqual(gates.verifyNoCodeOutcome({ ...base, item: { id: "task-a", repo: "spor", status: "open" } }).found, null);
 });
