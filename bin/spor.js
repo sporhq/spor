@@ -8456,15 +8456,20 @@ function removeDispatchWorktree(repoDir, dir, branch) {
   runWorktreeTeardownHook(dir, { repoDir, nodeId: branch || null, stdio: "pipe", role: "dispatch" });
   // Deliberately NOT --force: `git worktree remove` runs its own dirty check
   // (modified tracked files, or untracked-and-not-ignored files) as part of
-  // the SAME operation that deletes the tree, so there is no separate
-  // check-then-delete window left for a concurrent writer to land new work
-  // into before the delete lands — the TOCTOU half of
-  // issue-spor-remove-dispatch-worktree-safety-gaps. The manual status check
-  // above is now only a fast, clearly-worded early refusal; git's own atomic
-  // check at delete time is the actual gate, and a race that slips past the
-  // early check still gets caught here. A refusal is surfaced as the same
-  // "uncommitted changes" reason rather than retried with --force, which
-  // would just recreate the vulnerability this function exists to close.
+  // the SAME operation that deletes the tree, so for THAT class of change
+  // there is no separate check-then-delete window left for a concurrent
+  // writer to land new work into before the delete lands — the TOCTOU half
+  // of issue-spor-remove-dispatch-worktree-safety-gaps. The manual status
+  // check above is now only a fast, clearly-worded early refusal; git's own
+  // atomic check at delete time is the actual gate for tracked/untracked-
+  // non-ignored content, and a race that slips past the early check still
+  // gets caught here. (A new IGNORED file written in this same narrow window
+  // is a residual gap — git's own check still doesn't see those — but no
+  // call site today does any work between worktreeUnsafeIgnoredPath above
+  // and this call, so the window is empty in practice.) A refusal is
+  // surfaced as the same "uncommitted changes" reason rather than retried
+  // with --force, which would just recreate the vulnerability this function
+  // exists to close.
   const rm = git(repoDir, ["worktree", "remove", dir]);
   if (rm.status !== 0) {
     const detail = (rm.stderr || rm.stdout || "").trim();
