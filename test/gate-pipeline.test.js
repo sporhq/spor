@@ -2679,6 +2679,38 @@ test("end to end: a failing gate cools the item, files an escalation, and says s
   assert.match(status.stdout, /skipped:\s+task-ready — gate pipeline failed/);
 });
 
+// A test that deliberately abandons a dispatch owns what it abandoned. `spor
+// work` walking away from an in-flight fix cycle leaves a DETACHED supervisor
+// leading its own process group (the harness child and anything it spawned);
+// killing the worker does not touch it, so it outlives the test PROCESS and
+// writes its run record into the scratch home `tmp-cleanup` removed at exit —
+// re-creating the directory as a `journal/`-only husk nothing ever collects
+// (issue-spor-gate-stop-tests-leak-scratch-homes). So the test ends it, on the
+// same terms `spor work` ends an idle run.
+//
+// The wait is not optional: the supervisor records `runner_pid` on its child's
+// `spawn` event, and before that write there is no pid to signal — a stop that
+// found no record would leave exactly the straggler it exists to prevent. It is
+// bounded, and returns its reading rather than throwing, so a cleanup that
+// cannot run never masks the assertion failure that sent us here.
+async function stopOrphanedRun(home, runId, { deadlineMs = 10000 } = {}) {
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  if (!runId) return { ok: false, reason: "no run id to stop" };
+  const deadline = Date.now() + deadlineMs;
+  for (;;) {
+    const record = dispatchRuns.readRunRecords(home).find((r) => r.run_id === runId);
+    if (record && record.runner_pid) {
+      // graceMs low on purpose: this stub traps nothing, so the SIGTERM is the
+      // whole stop and the grace is only the window before the SIGKILL that
+      // makes it certain.
+      const stopped = await dispatchRuns.stopRun(record, { graceMs: 500 });
+      return { ok: !stopped.alive, stopped };
+    }
+    if (Date.now() > deadline) return { ok: false, reason: `no run record naming a supervisor for ${runId} within ${deadlineMs}ms` };
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
 // end to end: SIGTERM mid fix-cycle (issue-spor-work-stop-abandons-inflight-
 // gates). A real `spor work` process, no --once — it must keep running until
 // stopped. The declared harness answers a plain dispatch immediately but HANGS
@@ -2724,10 +2756,10 @@ test("a single SIGTERM mid fix-cycle stops the worker promptly and leaves a dura
   const outfile = path.join(home, "invocations.jsonl");
   // A plain dispatch (the initial claim) answers immediately, as every other
   // fixture's stub does. A FIX-CYCLE dispatch — its prompt names the gate that
-  // refused the resolution (makeGateDeps' `fix`, bin/spor.js) — never answers:
-  // it self-exits after a few seconds purely so this test does not leak a
-  // process, but that is well past when this test has already killed the
-  // worker and made its assertions.
+  // refused the resolution (makeGateDeps' `fix`, bin/spor.js) — never answers,
+  // which is what leaves the worker stuck mid-`awaitGateRun`. Its 5s self-exit
+  // is only a backstop for a stop that could not run: the test's own cleanup
+  // ends this process (and its supervisor) well before the timer fires.
   const stub = writeSpawnableNodeStub(
     home,
     "gate-stub",
@@ -2765,6 +2797,10 @@ process.stdin.on("end", () => {
   let stderr = "";
   child.stderr.on("data", (c) => (stderr += c));
 
+  // Hoisted: the cleanup below needs the run this test walked away from, and it
+  // runs whether the assertions passed or threw.
+  let fixRunId = null;
+  let orphanStop = null;
   try {
     // Wait for the fix cycle to actually be dispatched (two harness
     // invocations recorded: the initial claim, then the fix).
@@ -2786,7 +2822,7 @@ process.stdin.on("end", () => {
       if (Date.now() > deadline) throw new Error(`timed out waiting for gate_fix_run_id to be stamped.\nrecords: ${JSON.stringify(records)}\nstdout:\n${stdout}`);
       await new Promise((r) => setTimeout(r, 100));
     }
-    const fixRunId = named.gate_fix_run_id;
+    fixRunId = named.gate_fix_run_id;
 
     child.kill("SIGTERM");
     // "close", not "exit" — "exit" can fire before the child's stdio pipes have
@@ -2813,15 +2849,24 @@ process.stdin.on("end", () => {
     assert.match(runs.stdout, /gate:\s+interrupted/);
     assert.match(runs.stdout, new RegExp(`fix cycle:\\s+run ${fixRunId.slice(0, 8)}`));
   } finally {
-    // Best-effort cleanup: the fix-cycle harness self-exits after 5s regardless,
-    // but do not leave the worker (if somehow still alive) or its child around
-    // for the rest of the suite.
+    // The worker first — it is already gone by every path above, but a SIGTERM
+    // it somehow ignored must not outlive this test.
     try {
       child.kill("SIGKILL");
     } catch {
       /* already gone */
     }
+    // ...then the pipeline the worker was told to walk away FROM, which nothing
+    // else in this process owns. See stopOrphanedRun above.
+    orphanStop = await stopOrphanedRun(home, fixRunId);
   }
+  // Pinned, not merely attempted: the leak this closes is precisely "the test
+  // returned while something of its own was still running", and a best-effort
+  // cleanup nobody checks is how it came back.
+  assert.ok(
+    orphanStop.ok,
+    `the orphaned fix-cycle run must be gone before this test returns, or it writes its record back into ${home} after the suite has deleted it: ${JSON.stringify(orphanStop)}`
+  );
 });
 
 // ------------------------------------------------------ empty diff, fail closed --
