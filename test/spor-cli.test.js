@@ -33,6 +33,29 @@ function bare(extra = {}) {
 function run(args, env) {
   return spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf8', env: bare(env) });
 }
+// A command name that cannot resolve, so every `claude` shell-out fails to spawn
+// and falls open. Unique per run so it can never collide with a real file.
+const NO_CLAUDE = path.join(os.tmpdir(), `spor-no-claude-${process.pid}-${Math.random()}`);
+
+// `spor status` shells out to the machine's REAL Claude Code twice — `claude mcp
+// list` for split-brain connector detection and `claude plugin list --json` for
+// the stale-plugin line — each an 8s-bounded spawn of a binary that leaves a
+// background daemon behind. That made every status test read the developer's (or
+// the gate box's) LIVE connector and plugin state, at whatever latency claude
+// happened to answer with, and two runs of the same command could disagree: a
+// probe that times out reports no connector, a probe that answers reports one.
+// That is the reported flake (issue-spor-cli-split-brain-test-flake) — the
+// split-brain assertions, and the --quiet byte-identity assertion below that
+// diffs two status runs against each other.
+//
+// So status tests run with the launcher pinned to a path that cannot resolve:
+// both probes then fail open the SAME way every time, and what the test does
+// assert about connector state comes from the SPOR_FAKE_MCP_LIST stub. `env` is
+// applied last, so a test that wants a claude (claudeStub below) still wins.
+function runStatus(args = [], env = {}) {
+  return run(['status', ...args], { SPOR_CLAUDE_CMD: NO_CLAUDE, ...env });
+}
+
 function runLib(script, args, env) {
   return spawnSync(process.execPath, [path.join(LIB, script), ...args], { encoding: 'utf8', env: bare(env) });
 }
@@ -273,7 +296,7 @@ test('init refuses to rewrite identity or commit into the code repo when the gra
 
 test('status (local) reports local mode and node count', () => {
   const { dir, nodes } = fixtureGraph();
-  const r = run(['status'], { SPOR_HOME: dir });
+  const r = runStatus([], { SPOR_HOME: dir });
   assert.strictEqual(r.status, 0);
   assert.match(r.stdout, /mode:\s+local/);
   assert.match(r.stdout, new RegExp(`${nodes.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\(1 nodes\\)`));
@@ -302,7 +325,7 @@ test('status (local) NOTES a dead queue_mute when the git identity binds to no m
   // The box identity is some-other@test.dev, but the only queue_mute lives on
   // person-me <me@test.dev> — so the mutes silently do nothing. Status says so.
   const { dir } = muteStatusGraph('some-other@test.dev');
-  const r = run(['status'], { SPOR_HOME: dir });
+  const r = runStatus([], { SPOR_HOME: dir });
   assert.strictEqual(r.status, 0);
   assert.match(r.stdout, /note: queue_mute is set on a person node/);
   assert.match(r.stdout, /some-other@test\.dev/);          // names the resolved identity
@@ -312,14 +335,14 @@ test('status (local) NOTES a dead queue_mute when the git identity binds to no m
 
 test('status (local) stays QUIET about mutes when the identity binds to the muter', () => {
   const { dir } = muteStatusGraph('me@test.dev'); // binds to person-me, who holds the mute
-  const r = run(['status'], { SPOR_HOME: dir });
+  const r = runStatus([], { SPOR_HOME: dir });
   assert.strictEqual(r.status, 0);
   assert.doesNotMatch(r.stdout, /queue_mute is set on a person node/);
 });
 
 test('status (local) does NOT emit the mute note when no person carries a queue_mute', () => {
   const { dir } = fixtureGraph(); // only a decision node — no person, no mute
-  const r = run(['status'], { SPOR_HOME: dir });
+  const r = runStatus([], { SPOR_HOME: dir });
   assert.strictEqual(r.status, 0);
   assert.doesNotMatch(r.stdout, /queue_mute is set/);
 });
@@ -433,8 +456,6 @@ function fakeMcpList(connectors) {
   return `Checking MCP server health…\n\n${body}\n`;
 }
 const SPLIT = /SPLIT-BRAIN/;
-// A command name that cannot resolve, so spawnSync errors -> fail-open false.
-const NO_CLAUDE = path.join(os.tmpdir(), 'spor-no-claude-' + Math.random());
 
 test('sporConnectorBound: detects a Spor connector, ignores others, fail-open', () => {
   process.env.SPOR_FAKE_MCP_LIST = fakeMcpList(['claude.ai Spotify', 'claude.ai Spor']);
@@ -457,7 +478,7 @@ test('sporConnectorBound: detects a Spor connector, ignores others, fail-open', 
 
 test('status (local) WARNS of split-brain when a Spor connector is bound', () => {
   const { dir } = fixtureGraph();
-  const r = run(['status'], { SPOR_HOME: dir, SPOR_FAKE_MCP_LIST: fakeMcpList(['claude.ai Spor']) });
+  const r = runStatus([], { SPOR_HOME: dir, SPOR_FAKE_MCP_LIST: fakeMcpList(['claude.ai Spor']) });
   assert.strictEqual(r.status, 0);
   assert.match(r.stdout, /mode:\s+local/);
   assert.match(r.stdout, SPLIT);
@@ -466,7 +487,7 @@ test('status (local) WARNS of split-brain when a Spor connector is bound', () =>
 
 test('status (local) does NOT warn when no Spor connector is bound', () => {
   const { dir } = fixtureGraph();
-  const r = run(['status'], { SPOR_HOME: dir, SPOR_FAKE_MCP_LIST: fakeMcpList(['claude.ai Spotify']) });
+  const r = runStatus([], { SPOR_HOME: dir, SPOR_FAKE_MCP_LIST: fakeMcpList(['claude.ai Spotify']) });
   assert.strictEqual(r.status, 0);
   assert.doesNotMatch(r.stdout, SPLIT);
 });
@@ -475,7 +496,7 @@ test('status (local) does NOT warn after the connector is disabled (empty live l
   // The reported false positive: a previously-connected Spor connector, now
   // unbound, must not warn (issue-spor-status-split-brain-warning-false-positive).
   const { dir } = fixtureGraph();
-  const r = run(['status'], { SPOR_HOME: dir, SPOR_FAKE_MCP_LIST: fakeMcpList([]) });
+  const r = runStatus([], { SPOR_HOME: dir, SPOR_FAKE_MCP_LIST: fakeMcpList([]) });
   assert.strictEqual(r.status, 0);
   assert.doesNotMatch(r.stdout, SPLIT);
 });
@@ -483,7 +504,9 @@ test('status (local) does NOT warn after the connector is disabled (empty live l
 test('status (local) does NOT warn / crash when the connector probe fails', () => {
   const { dir } = fixtureGraph();
   // No SPOR_FAKE_MCP_LIST; an unresolvable claude cmd => spawn error => fail-open.
-  const r = run(['status'], { SPOR_HOME: dir, SPOR_CLAUDE_CMD: NO_CLAUDE });
+  // Pinned at the site as well as in runStatus: the unresolvable launcher IS this
+  // test's subject, not just its isolation.
+  const r = runStatus([], { SPOR_HOME: dir, SPOR_CLAUDE_CMD: NO_CLAUDE });
   assert.strictEqual(r.status, 0); // fail-open
   assert.doesNotMatch(r.stdout, SPLIT);
 });
@@ -492,7 +515,7 @@ test('status (remote) does NOT warn of split-brain even with a Spor connector', 
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-remote-status-'));
   // dead server => remote-mode status probes, fails open (exit 0), and the
   // split-brain block lives only in the local branch, so it must not appear.
-  const r = run(['status'], {
+  const r = runStatus([], {
     SPOR_HOME: home,
     SPOR_SERVER: 'http://127.0.0.1:9',
     SPOR_TOKEN: 'tok',
@@ -509,7 +532,7 @@ test('status (remote) does NOT warn of split-brain even with a Spor connector', 
 // shouldn't pay for the up-to-6s health round-trip.
 test('status (remote) without --quiet includes health/identity lines', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-remote-status-full-'));
-  const r = run(['status'], {
+  const r = runStatus([], {
     SPOR_HOME: home,
     SPOR_SERVER: 'http://127.0.0.1:9',
     SPOR_TOKEN: 'tok',
@@ -522,7 +545,7 @@ test('status (remote) without --quiet includes health/identity lines', () => {
 
 test('status (remote) --quiet skips health probe and identity lookup', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-remote-status-quiet-'));
-  const r = run(['status', '--quiet'], {
+  const r = runStatus(['--quiet'], {
     SPOR_HOME: home,
     SPOR_SERVER: 'http://127.0.0.1:9',
     SPOR_TOKEN: 'tok',
@@ -537,7 +560,7 @@ test('status (remote) --quiet skips health probe and identity lookup', () => {
 
 test('status -q is the short form of --quiet', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'spor-remote-status-q-'));
-  const r = run(['status', '-q'], {
+  const r = runStatus(['-q'], {
     SPOR_HOME: home,
     SPOR_SERVER: 'http://127.0.0.1:9',
     SPOR_TOKEN: 'tok',
@@ -549,8 +572,8 @@ test('status -q is the short form of --quiet', () => {
 
 test('status (local) --quiet is a no-op (already no network round-trip)', () => {
   const { dir } = fixtureGraph();
-  const withQuiet = run(['status', '--quiet'], { SPOR_HOME: dir });
-  const without = run(['status'], { SPOR_HOME: dir });
+  const withQuiet = runStatus(['--quiet'], { SPOR_HOME: dir });
+  const without = runStatus([], { SPOR_HOME: dir });
   assert.strictEqual(withQuiet.status, 0);
   assert.strictEqual(withQuiet.stdout, without.stdout);
 });
@@ -1245,7 +1268,7 @@ test('invite fails open against an unreachable server', () => {
 });
 
 test('remote verb fails open against an unreachable server (no stack trace)', () => {
-  const r = run(['status'], { SPOR_SERVER: 'http://127.0.0.1:9', SPOR_TOKEN: 't' });
+  const r = runStatus([], { SPOR_SERVER: 'http://127.0.0.1:9', SPOR_TOKEN: 't' });
   assert.strictEqual(r.status, 0);
   assert.match(r.stdout, /mode:\s+remote/);
   assert.match(r.stdout, /OFFLINE/);
@@ -1802,11 +1825,11 @@ test('status flags a stale Claude plugin and stays quiet when current', () => {
   const { dir } = fixtureGraph();
   const home = scratchHome();
   const stub = claudeStub(home);
-  const stale = run(['status'], { SPOR_HOME: dir, SPOR_CLAUDE_CMD: stub, STATE: path.join(home, 'loaded'), STARTVER: '0.0.1', NEWVER: PKG });
+  const stale = runStatus([], { SPOR_HOME: dir, SPOR_CLAUDE_CMD: stub, STATE: path.join(home, 'loaded'), STARTVER: '0.0.1', NEWVER: PKG });
   assert.strictEqual(stale.status, 0);
   assert.match(stale.stdout, /plugin:\s+spor@spor 0\.0\.1 loaded\s+\(STALE/);
   assert.match(stale.stdout, /run 'spor upgrade'/);
-  const current = run(['status'], { SPOR_HOME: dir, SPOR_CLAUDE_CMD: stub, STATE: path.join(home, 'loaded2'), STARTVER: PKG, NEWVER: PKG });
+  const current = runStatus([], { SPOR_HOME: dir, SPOR_CLAUDE_CMD: stub, STATE: path.join(home, 'loaded2'), STARTVER: PKG, NEWVER: PKG });
   assert.strictEqual(current.status, 0);
   assert.match(current.stdout, new RegExp(`plugin:\\s+spor@spor ${PKG.replace(/\./g, '\\.')} loaded`));
   assert.doesNotMatch(current.stdout, /STALE/);
