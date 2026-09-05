@@ -992,16 +992,27 @@ outside git (a database on a fixed port, a `db reset`):
     was charged anyway. The filings that DID land before one failed still ride
     that charged fact as `relates-to` edges: each is this run's occurrence of
     that file's flake, and an issue no fact links to has no provenance and no
-    occurrence to its name. That edge is a DEBT, and it survives the rescue
-    lane: the durable rescue entry carries the flake payload beside the id of
-    the fact that recorded the refusal, in ONE stamp, so a pipeline resumed
-    after a failed fact write pays the edge from its escalation fact instead
-    of leaving those issues orphaned — and pays it exactly once, since an
-    entry whose own fact DID land names the issues in prose without linking
-    them a second time (one occurrence, one edge). An entry that was never
-    saved is not a lost debt either: the resume then re-runs the original
-    pass, whose filings are convergent per file and whose fact id is the same
-    node, so the occurrence is recorded rather than doubled.
+    occurrence to its name. That edge is a DEBT, tracked PER ISSUE on the
+    flake payload itself and discharged only by a landing the pipeline
+    OBSERVED — a write that CREATED the fact, or, when the write door reported
+    the id already occupied (`if_exists: skip` remotely, identical-content
+    adoption locally, neither of which is this markdown landing), a read of
+    that occupant which saw the edge. A write door's bare success never
+    discharges it, and neither does the mere presence of a fact id. The debt
+    survives the rescue lane in ONE stamp: the durable rescue entry carries
+    the flake payload — its discharge state included — beside the fact id, so
+    a pipeline resumed after a failed fact write pays the edge from its
+    escalation fact instead of leaving those issues orphaned, while one whose
+    fact DID carry the edge names the issues in prose without linking them a
+    second time. The same value settles the uninterrupted case: a refusal
+    whose rescue could not be dispatched escalates immediately, and its
+    escalation fact sees the occurrence its own pre-rescue fact already paid.
+    What is NOT paid is what could not be read: an unconfirmed edge stays
+    owed and the next fact writes it, because a duplicate edge overcounts one
+    occurrence while a missing one leaves an issue no fact names at all. An
+    entry that was never saved is not a lost debt either: the resume then
+    re-runs the original pass, whose filings are convergent per file and whose
+    fact id is the same node — which the read back reconciles against.
 
   The flake issue is the one node a gate files whose id and body are keyed on
   the failing FILES rather than on the run — a flake is a property of the

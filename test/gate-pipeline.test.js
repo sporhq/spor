@@ -5201,6 +5201,34 @@ test("makeGateDeps files an off-diff flake as a per-FILE issue in the test lane,
   fs.rmSync(home, { recursive: true, force: true });
 });
 
+// The read behind F10: a gate fact whose write door reported the id already
+// OCCUPIED did not land this markdown, so whether the occurrence edges it was
+// carrying are on the graph is a question only a read answers. Three answers,
+// and "could not look" is its own — never collapsed into "names nothing".
+test("makeGateDeps reads back what an already-occupied fact id points at — and a read it could not make settles nothing", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-fact-edges-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const deps = flakeDeps(cfg, home);
+  fs.writeFileSync(
+    path.join(home, "nodes", "art-gate-occupied.md"),
+    ["---", "id: art-gate-occupied", "type: artifact", "title: t", "summary: s", "date: 2026-09-05", "edges:", "  - {type: relates-to, to: task-p}", "  - {type: relates-to, to: issue-flake-one}", "---", "", "body", ""].join("\n")
+  );
+  assert.deepStrictEqual(await deps.factEdges({ id: "art-gate-occupied" }), { ok: true, targets: ["task-p", "issue-flake-one"] });
+
+  // Absent: the write said the id was taken and the read says it is not there,
+  // which can only mean it was removed in between — either way no node on this
+  // graph carries the edge, so the debt is owed, not unknown.
+  assert.deepStrictEqual(await deps.factEdges({ id: "art-gate-missing" }), { ok: true, targets: [] });
+
+  // Unreadable: neither answer. The runner leaves the occurrence owed rather
+  // than assuming a node it could not open already records it.
+  fs.mkdirSync(path.join(home, "nodes", "art-gate-unreadable.md"));
+  const blind = await deps.factEdges({ id: "art-gate-unreadable" });
+  assert.strictEqual(blind.ok, false, "an I/O fault is not an absence");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 // The convergent id outlives its fix, so the SAME id can be sitting there
 // closed when the file flakes again a month later. Attaching a fresh occurrence
 // to a settled node is no signal at all — nothing resurfaces it and nobody
@@ -5409,14 +5437,109 @@ test("a charged off-diff pass hands its flake filings to the rescue entry, and a
   assert.match(escalation, /Off-diff flake: test\/codex-dispatch\.test\.js, test\/dispatch-runs\.test\.js failed the whole-suite run and passed alone on the same tree, filed as issue-flake-one/);
 
   // …and it pays it ONCE. Same entry, but this time the pre-rescue fact DID
-  // land with those edges on it: an occurrence is one edge, so the escalation
-  // names the issue in prose and does not link it a second time. The flag is
-  // reconciled against the state that already discharged it.
+  // land with those edges on it — which the entry says PER ISSUE, in the same
+  // stamp as the fact id, because the pipeline observed that write create the
+  // node. An occurrence is one edge, so the escalation names the issue in
+  // prose and does not link it a second time.
   const c = withRescue(fakes({ changed: ["lib/kernel/queue.js"] }));
-  c.deps.loadRescueState = async () => [{ ...JSON.parse(JSON.stringify(entry)), fact: "art-gate-acceptance-demo-abcdef12-cafe", done: true, error: "not satisfiable" }];
+  const paidEntry = {
+    ...JSON.parse(JSON.stringify(entry)),
+    fact: "art-gate-acceptance-demo-abcdef12-cafe",
+    flake: { ...JSON.parse(JSON.stringify(entry.flake)), linked: ["issue-flake-one"], linkedBy: "art-gate-acceptance-demo-abcdef12-cafe" },
+    done: true,
+    error: "not satisfiable",
+  };
+  c.deps.loadRescueState = async () => [paidEntry];
   assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: c.deps })).state, "failed");
   const paid = c.seen.facts.find((f) => /^art-gate-/.test(f.id)).markdown;
   assert.doesNotMatch(paid, /relates-to, to: issue-flake-one/, "one occurrence, one edge — the fact that recorded this refusal already linked it");
   assert.match(paid, /That occurrence is already recorded on art-gate-acceptance-demo-abcdef12-cafe, so this fact names the issue\(s\) without linking them a second time\./);
+
+  // F11: a fact ID is not a landed edge. The same entry with the fact id but
+  // NO record of what it linked — an entry stamped by a client from before the
+  // per-issue discharge state existed, or one whose write door reported an id
+  // that was already occupied — reads the debt as OWED and pays it. Adopting
+  // `fact` as proof would suppress the only edge the issue will ever get.
+  const d = withRescue(fakes({ changed: ["lib/kernel/queue.js"] }));
+  d.deps.loadRescueState = async () => [{ ...JSON.parse(JSON.stringify(entry)), fact: "art-gate-acceptance-demo-abcdef12-cafe", done: true, error: "not satisfiable" }];
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: d.deps })).state, "failed");
+  assert.match(
+    d.seen.facts.find((f) => /^art-gate-/.test(f.id)).markdown,
+    /- \{type: relates-to, to: issue-flake-one\}/,
+    "an unrecorded discharge is an owed one — the escalation pays it rather than trusting the id"
+  );
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// F12 (the uninterrupted twin of the resume above) and F10 (what a write door
+// that reports an occupied id actually proves). One pipeline, one occurrence:
+// the pre-rescue fact links the flake issue, the rescue cannot be dispatched,
+// and the escalation fact that follows immediately must NOT link it again.
+test("a charged off-diff pass whose rescue cannot be dispatched links its flake issue ONCE, and an occupied fact id is read back before its edges count as written", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-flake-once-"));
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "test", "codex-dispatch.test.js"), 'const assert = require("node:assert");\n');
+  fs.writeFileSync(path.join(dir, "test", "dispatch-runs.test.js"), 'const assert = require("node:assert");\n');
+  const output = [
+    "✖ the launch handshake (40001.2ms)",
+    "      at TestContext.<anonymous> (test/codex-dispatch.test.js:120:5)",
+    "✖ the run record (2.1ms)",
+    "      at TestContext.<anonymous> (test/dispatch-runs.test.js:44:5)",
+  ].join("\n");
+  const factory = factoryOf({
+    ...BASE,
+    gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }],
+    rescue: RESCUE,
+  });
+  // Both files pass alone, but the SECOND filing is refused — so the suite
+  // failure is CHARGED with file 1's issue already minted, which is the
+  // outcome that carries a flake payload into the rescue lane.
+  const mk = () => {
+    const f = withRescue(
+      treeFakes({ dir, changed: ["lib/kernel/queue.js"], run: (attempt, command) => (command ? { ok: true } : { ok: false, code: 1, output }) })
+    );
+    f.deps.fileFlakeItem = async ({ file }) =>
+      file === "test/dispatch-runs.test.js" ? { ok: false, reason: "the graph refused the write" } : { ok: true, id: "issue-flake-one" };
+    f.deps.rescue = async () => ({ ok: false, reason: "no lane profile is satisfiable on this box" });
+    return f;
+  };
+  const edgesTo = (md) => (md.match(/relates-to, to: issue-flake-one/g) || []).length;
+
+  // The ordinary path: the pre-rescue write CREATES the fact, so the edge is
+  // on it, and the escalation fact names the issue without linking it again.
+  const a = mk();
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: a.deps })).state, "failed");
+  const gateFacts = a.seen.facts.filter((f) => /^art-gate-/.test(f.id));
+  assert.strictEqual(gateFacts.length, 2, "the pre-rescue fact and the escalation's");
+  assert.deepStrictEqual(gateFacts.map((f) => edgesTo(f.markdown)), [1, 0], "one occurrence, one edge");
+  assert.match(gateFacts[1].markdown, /That occurrence is already recorded on /);
+
+  // The write door reports the id ALREADY OCCUPIED — which is not this
+  // markdown landing, so what the occupant names is a question only a read
+  // answers. It names the issue: the debt is discharged, and the escalation
+  // does not link it a second time.
+  const b = mk();
+  b.deps.recordFact = async ({ id, markdown }) => (b.seen.facts.push({ id, markdown }), { ok: true, id, existing: true });
+  b.deps.factEdges = async ({ id }) => (b.seen.reads = (b.seen.reads || 0) + 1, { ok: true, targets: ["task-demo", "issue-flake-one"] });
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b.deps });
+  assert.deepStrictEqual(b.seen.facts.filter((f) => /^art-gate-/.test(f.id)).map((f) => edgesTo(f.markdown)), [1, 0]);
+
+  // Same, but the occupant does NOT name it — an earlier incarnation of this
+  // pipeline whose filing had failed. The debt is still owed, so the
+  // escalation's fact pays it.
+  const c = mk();
+  c.deps.recordFact = async ({ id, markdown }) => (c.seen.facts.push({ id, markdown }), { ok: true, id, existing: true });
+  c.deps.factEdges = async () => ({ ok: true, targets: ["task-demo"] });
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: c.deps });
+  assert.deepStrictEqual(c.seen.facts.filter((f) => /^art-gate-/.test(f.id)).map((f) => edgesTo(f.markdown)), [1, 1], "the second fact pays what the first did not");
+
+  // And a read that could not be MADE settles nothing: an unconfirmed edge
+  // stays owed. An extra edge overcounts one occurrence; a missing one leaves
+  // an issue no fact names at all.
+  const d = mk();
+  d.deps.recordFact = async ({ id, markdown }) => (d.seen.facts.push({ id, markdown }), { ok: true, id, existing: true });
+  d.deps.factEdges = async () => ({ ok: false, reason: "the graph could not be reached" });
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: d.deps });
+  assert.deepStrictEqual(d.seen.facts.filter((f) => /^art-gate-/.test(f.id)).map((f) => edgesTo(f.markdown)), [1, 1], "unknown is owed, never assumed paid");
   fs.rmSync(dir, { recursive: true, force: true });
 });

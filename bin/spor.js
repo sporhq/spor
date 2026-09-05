@@ -11635,6 +11635,33 @@ function makeGateDeps(
     review,
     fix,
     recordFact: ({ id, markdown }) => writeGateNode(cfg, id, markdown),
+    // What a fact id ALREADY on the graph points at. `writeGateNode` reports an
+    // occupied id as a SUCCESS (`if_exists: skip` remotely, identical-content
+    // adoption locally), so a gate fact that came back `existing` did NOT land
+    // this markdown — and the flake occurrence edges it was carrying are a debt
+    // only a read can discharge (the runner's confirmFlakeEdges). Three answers,
+    // like the flake filing door's: the targets it names, no targets (a node
+    // that is not there names nothing — the write's `existing` and this read's
+    // absence can only both be true if it was removed in between, and either
+    // way no node carries the edge), or a refusal, which settles nothing and
+    // leaves the debt owed.
+    factEdges: async ({ id }) => {
+      const read = {};
+      let node = null;
+      try {
+        node = await resolveNode(cfg, id, read);
+      } catch (e) {
+        return { ok: false, reason: `${id} could not be read (${(e && e.message) || e})` };
+      }
+      if (!node) return read.unreadable ? { ok: false, reason: `${id} could not be read` } : { ok: true, targets: [] };
+      let edges = [];
+      try {
+        edges = require(path.join(ROOT, "lib", "graph.js")).parseFrontmatter(node.raw || "", `${id}.md`).edges || [];
+      } catch (e) {
+        return { ok: false, reason: `${id}'s frontmatter could not be parsed (${(e && e.message) || e})` };
+      }
+      return { ok: true, targets: edges.map((e) => e && e.to).filter(Boolean).map(String) };
+    },
     fileTestLaneItem: async ({ gate, paths, profile, rescue = 0 }) => {
       const k = keysFor(rescue);
       const id = `task-test-lane-${stem}-${k.short}-${gateIdSuffix("test-lane", gate.id, entry.node_id, k.runKey)}`;

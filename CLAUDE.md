@@ -850,9 +850,15 @@ happens only if the flake ISSUE lands, since the gate fact write is best-effort
 too and a red suite passing with neither write is a green light nobody can audit
 (and a CHARGED pass still links the per-file issues that did land on its fact —
 `flake` rides the failed outcome through every `record` site, and across the
-rescue lane on the durable entry itself, keyed against the id of the fact that
-already recorded that refusal — so an issue created before a later filing
-failed is never left with no fact naming it, and never left with two).
+rescue lane on the durable entry itself, carrying PER ISSUE which occurrence
+edges are already written — so an issue created before a later filing failed is
+never left with no fact naming it, and never left with two). That discharge is
+only ever recorded from a landing the pipeline SAW: a write door reports an
+already-occupied id as a success and an occupied id is not this markdown
+landing, so an `existing` fact is read back once (`deps.factEdges`) and only the
+issues its occupant actually names count as paid; a read that could not be made
+leaves the edge OWED for the next fact, since a duplicate edge overcounts one
+occurrence while a missing one leaves an issue no fact names at all.
 The issue's convergent id is reconciled against SETTLED state rather than adopted
 on its name: a live occupant is linked, a resolved/closed one advances to a
 recurrence rung (`-r2`, `-r3`) that links back to it, and a file past every rung
