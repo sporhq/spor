@@ -11308,14 +11308,19 @@ function cmdWorkStatus(cfg, { json }) {
     if (w.workspace_wait) {
       out(`  workspace: busy — ${w.workspace_wait.node_id} refused (${w.workspace_wait.reason}); retrying this page next poll`);
     }
-    if (w.gates)
+    if (w.gates) {
       out(
-        `  gates:    ${w.factory || "(factory)"}${(w.repos || []).length ? ` [judges ${w.repos.join(", ")}]` : ""} — passed ${w.gates.passed || 0}, failed ${
-          w.gates.failed || 0
-        }, blocked ${w.gates.blocked || 0}${w.gates.scoped ? `, scoped ${w.gates.scoped}` : ""}${w.gates.parked ? `, parked ${w.gates.parked}` : ""}${
-          w.gates.superseded ? `, superseded ${w.gates.superseded}` : ""
-        }`
+        `  gates:    ${w.factory || "(factory)"}${w.gates.factory_revision ? ` @ ${String(w.gates.factory_revision).slice(0, 12)}` : ""}${
+          (w.repos || []).length ? ` [judges ${w.repos.join(", ")}]` : ""
+        } — passed ${w.gates.passed || 0}, failed ${w.gates.failed || 0}, blocked ${w.gates.blocked || 0}${
+          w.gates.scoped ? `, scoped ${w.gates.scoped}` : ""
+        }${w.gates.parked ? `, parked ${w.gates.parked}` : ""}${w.gates.superseded ? `, superseded ${w.gates.superseded}` : ""}`
       );
+      // A rejected reload never stops the worker — it keeps enforcing the last
+      // definition that DID parse — but an operator staring at `--status` must
+      // still see that an edit landed and was refused, not just silence.
+      if (w.gates.factory_error) out(`            factory reload refused, still on @ ${String(w.gates.factory_revision || "?").slice(0, 12)}: ${w.gates.factory_error}`);
+    }
     for (const a of w.active || []) out(`  active:   ${a.node_id || "(free-text)"}  run ${String(a.run_id).slice(0, 8)}  ${a.harness || ""}  since ${a.started_at}`);
     for (const g of w.gating || []) {
       out(`  gating:   ${g.node_id}  run ${String(g.run_id).slice(0, 8)}  since ${g.started_at}`);
@@ -11405,10 +11410,18 @@ async function loadFactoryDefinition(cfg, id) {
   if (!node || !node.raw) {
     return { factory: null, errors: [`factory definition '${id}' could not be read from the graph`] };
   }
+  // The node's own blob sha (byte-identical to the server's, gitBlobSha above)
+  // — a stable, cheap-to-compute "which revision is this" stamp, independent of
+  // any status/history endpoint. Named on the returned factory so a per-pass
+  // reload (task-spor-work-reload-factory-definition-per-pass) can say which
+  // revision `--status` is judging with, and so a rejected edit's caller can
+  // still report the revision it tried (and failed) to load.
+  const revision = gitBlobSha(Buffer.from(node.raw));
   const parsed = parse(node.raw, `${id}.md`);
   if ((parsed.type || "") !== "factory") {
     return {
       factory: null,
+      revision,
       errors: [
         `'${id}' is a '${parsed.type || "?"}' node, not a 'type: factory' definition` +
           ` (the factory schema ships as a candidate — 'spor schema adopt schema-factory')`,
@@ -11420,6 +11433,7 @@ async function loadFactoryDefinition(cfg, id) {
   if (parsed.status && parsed.status !== "active") {
     return {
       factory: null,
+      revision,
       errors: [`'${id}' is '${parsed.status}', not 'status: active' — a retired or proposed factory never enforces`],
     };
   }
@@ -11502,8 +11516,9 @@ async function loadFactoryDefinition(cfg, id) {
       frontier = next;
     }
     if (renamedFrom.length) factory.renamedFrom = renamedFrom;
+    factory.revision = revision;
   }
-  return { factory, errors: [...new Set([...errors, ...resErrors])] };
+  return { factory, revision, errors: [...new Set([...errors, ...resErrors])] };
 }
 
 // The git plumbing for a command gate — reading the change under judgement,
@@ -14826,6 +14841,17 @@ async function cmdWork(cfg, { values }) {
   //     the token unions in, only items stamped with a repo this factory
   //     declares are candidates. That is the fix — the scope token is a
   //     read hint, the declared repos are the contract.
+  // NOT reloaded per pass (task-spor-work-reload-factory-definition-per-pass
+  // covers gate knobs — reruns, isolate, serialize — read fresh off the live
+  // `factory` binding at gate/dispatch time; this constant is captured once
+  // and frozen into the `candidates()` closure below, same as `slug` and
+  // `localFactoryGraph`). An operator editing a running factory's `repos:`
+  // list will see the new revision named in `--status` and the new gate list
+  // enforced, but candidate SELECTION keeps filtering on the repos declared
+  // at startup — a newly-added repo's items are never even paged in until
+  // the worker restarts. Widening this is a separate, larger change (it also
+  // touches the unknown-repo startup warning and `localFactoryGraph` below);
+  // left as a known limitation rather than folded in here.
   const factoryRepos = (factory && factory.repos) || [];
   if (!explicitSlug && factoryRepos.length === 1) slug = factoryRepos[0];
   // A declared repo that names nothing in this graph is the quiet failure mode
@@ -15025,7 +15051,7 @@ async function cmdWork(cfg, { values }) {
       );
     }
     if (factory) {
-      out(`factory: ${factoryId} — trusted ref ${factory.trustedRef}${factory.protectedPaths.length ? `, protected ${factory.protectedPaths.join(" ")} -> ${factory.testLaneProfile}` : ""}`);
+      out(`factory: ${factoryId}${factory.revision ? ` @ ${factory.revision.slice(0, 12)}` : ""} — trusted ref ${factory.trustedRef}${factory.protectedPaths.length ? `, protected ${factory.protectedPaths.join(" ")} -> ${factory.testLaneProfile}` : ""}`);
       out(`  judges: ${factoryRepos.length ? `repo(s) ${factoryRepos.join(", ")} — items stamped with any other repo are skipped` : "any repo (no 'repos' declared and no project stamp on the factory node)"}`);
       for (const g of factory.gates) {
         const how =
@@ -15100,6 +15126,10 @@ async function cmdWork(cfg, { values }) {
 
   out(`work: worker ${workerId.slice(0, 8)} — ${slug || "all projects"}, accept ${accept}, concurrency ${concurrency}, poll ${intervalMs / 1000}s${max ? `, stopping after ${max} dispatch(es)` : ""}`);
   if (factoryRepos.length) out(`work: factory ${factoryId} judges repo(s) ${factoryRepos.join(", ")} — items from any other repo are skipped, not gated`);
+  // Reloaded every pass from here on (task-spor-work-reload-factory-
+  // definition-per-pass) — say which revision this is so a later `--status`
+  // reading a different one is legible against this line.
+  if (factory) out(`work: factory ${factoryId} loaded @ ${(factory.revision || "?").slice(0, 12)} — re-read every poll pass; an edit takes effect on the next pass, a bad one is rejected and logged here`);
   out(`work: status at ${workLoop.workerStatusPath(home, workerId)}  ('spor work --status')`);
   // What code this worker runs, said once up front and re-checked each pass
   // (task-spor-work-announce-lib-commit-and-notice-main-moved): a long-running
@@ -15123,7 +15153,7 @@ async function cmdWork(cfg, { values }) {
   if (restartOnLand && !loadedCode) out(`work: --restart-on-land has nothing to watch — ${ROOT} is not a source checkout; the worker runs until stopped`);
   const final = await workLoop.runWorkLoop({
     opts: {
-      workerId, project: slug, accept, repos: factoryRepos, graph: localFactoryGraph, concurrency, intervalMs, maxIntervalMs, retryAfterMs, max, once: !!values.once, factory: factoryId, restartOnLand,
+      workerId, project: slug, accept, repos: factoryRepos, graph: localFactoryGraph, concurrency, intervalMs, maxIntervalMs, retryAfterMs, max, once: !!values.once, factory: factoryId, factoryRevision: factory && factory.revision, restartOnLand,
       // The pid-reuse guard for this record: a SIGKILLed worker leaves no
       // stopped_at, and a bare pid probe would read its recycled pid as this
       // worker still running (the same identity check the run store makes).
@@ -15155,6 +15185,33 @@ async function cmdWork(cfg, { values }) {
       // behavior — are byte-identical to what shipped.
       ...(factory
         ? {
+            // task-spor-work-reload-factory-definition-per-pass: re-read and
+            // re-validate the factory definition once per poll pass, through
+            // the SAME loadFactoryDefinition a starting worker uses, so any
+            // future validation it grows (schema changes, a new stage) is
+            // honored here for free. On a clean parse, swap the outer `factory`
+            // binding to the freshly-built object — every closure above and
+            // below reads that SAME `let` binding, so a fix cycle, a fresh
+            // dispatch or a newly-gating item picks it up on the very next use,
+            // with no restart. On a bad edit, the binding is left untouched: a
+            // worker never runs ungated on a definition it could not read any
+            // more than it would have refused to START on one
+            // (dec-spor-gates-enforced-in-code-factory-is-data) — it keeps
+            // enforcing the last one that DID parse, and the loop surfaces the
+            // rejected edit's errors in `--status` instead. This can never
+            // rewrite a pipeline already in flight: `deps.gate` below closes
+            // over `factory` at the moment IT is called (pipeline start), which
+            // copies the reference into that call's own options object — a
+            // later reassignment here does not reach back into an object
+            // already handed to a running pipeline.
+            reloadFactory: async () => {
+              const loaded = await loadFactoryDefinition(cfg, factoryId);
+              if (loaded.factory) {
+                factory = loaded.factory;
+                return { ok: true, revision: loaded.revision || null };
+              }
+              return { ok: false, revision: loaded.revision || null, errors: loaded.errors };
+            },
             // The durable half of the gate verdict, and the scan that reads it
             // back (WORKERS.md §10.8). A gate pipeline is the one piece of work
             // this PROCESS owns, so a worker that dies mid-pipeline leaves a
@@ -15250,14 +15307,22 @@ async function cmdWork(cfg, { values }) {
                 }
               };
             })(),
-            // task-spor-integration-propose-mode: only present under propose
-            // mode, so every OTHER factory's loop is byte-identical to before
-            // this existed. Runs once per pass, outside the slot/concurrency
-            // accounting — it never opens a candidate worktree or a run, just
-            // reads this box's own run journal and a handful of `gh` calls.
-            ...(factory.integration && factory.integration.mode === "propose"
-              ? { checkProposals: () => checkProposals(cfg, { home, log: (line) => out(line) }) }
-              : {}),
+            // task-spor-integration-propose-mode: present whenever a factory
+            // is armed, but a no-op unless the CURRENT (possibly reloaded)
+            // definition's integration mode is 'propose' — read live, at call
+            // time, off the same `factory` binding `reloadFactory` swaps, so a
+            // pass or serialize edit that turns propose mode ON reaches its
+            // own parked items without a restart
+            // (task-spor-work-reload-factory-definition-per-pass: gating this
+            // on the STARTUP mode instead would strand any proposal a later
+            // edit parks, since nothing would ever poll `gh` for it). Every
+            // OTHER factory shape still costs only a property check per pass,
+            // not a run-journal read — `checkProposals` itself never runs
+            // unless something was actually parked. Runs once per pass,
+            // outside the slot/concurrency accounting — it never opens a
+            // candidate worktree or a run, just reads this box's own run
+            // journal and a handful of `gh` calls.
+            checkProposals: () => (factory.integration && factory.integration.mode === "propose" ? checkProposals(cfg, { home, log: (line) => out(line) }) : Promise.resolve()),
           }
         : {}),
       sleep: (ms) =>

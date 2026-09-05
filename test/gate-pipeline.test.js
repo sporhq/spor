@@ -2155,6 +2155,54 @@ test("loadFactoryDefinition walks a factory's supersedes chain into factory.rena
   assert.deepStrictEqual(odd.factory.renamedFrom, ["task-unrelated"], "the non-factory hop itself is recorded, its own edges are not chased");
 });
 
+// task-spor-work-reload-factory-definition-per-pass: a per-pass reload names
+// which revision of the factory node it just read, so `spor work --status`
+// can say which one is judging (and, on a rejected edit, which one it kept
+// enforcing instead). The revision is the node's own git blob sha — content-
+// addressed, so an unchanged re-read is the SAME revision, a real edit is a
+// different one, and — crucially — a REJECTED edit (retired, wrong type,
+// malformed payload) still reports the revision it tried and failed to load,
+// since the reload dep needs that to log which edit it rejected.
+test("loadFactoryDefinition names the node's own revision, stable on a no-op re-read, changed on an edit, and reported even when the edit is rejected", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-factory-revision-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const write = (id, front, body = "Body.") =>
+    fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\n${front}date: 2026-09-05\n---\n${body}\n`);
+  const factoryBody = (payload) => ["```json", JSON.stringify(payload, null, 2), "```"].join("\n");
+  const plainBody = factoryBody({ gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+
+  write("factory-rev", "type: factory\ntitle: A factory\nsummary: Exercises the revision stamp.\nstatus: active\n", plainBody);
+  const first = await sporCli.loadFactoryDefinition(cfg, "factory-rev");
+  assert.ok(first.factory, first.errors.join("; "));
+  assert.match(first.revision, /^[0-9a-f]{40}$/);
+  assert.strictEqual(first.factory.revision, first.revision, "the same stamp is named on the returned factory object");
+
+  // Re-reading unchanged content is the SAME revision — a poll that changed
+  // nothing must not read as an edit.
+  const reread = await sporCli.loadFactoryDefinition(cfg, "factory-rev");
+  assert.strictEqual(reread.revision, first.revision);
+
+  // A gate knob edit (the exact shape this task exists for — reruns, isolate,
+  // serialize) changes the revision.
+  const editedBody = factoryBody({ gates: [{ id: "acceptance", kind: "command", command: "npm test", reruns: 1 }] });
+  write("factory-rev", "type: factory\ntitle: A factory\nsummary: Exercises the revision stamp.\nstatus: active\n", editedBody);
+  const edited = await sporCli.loadFactoryDefinition(cfg, "factory-rev");
+  assert.ok(edited.factory, edited.errors.join("; "));
+  assert.notStrictEqual(edited.revision, first.revision);
+  assert.strictEqual(edited.factory.gates[0].reruns, 1);
+
+  // An edit into an INVALID state (here: retired) still names the revision it
+  // tried and failed to load, distinct from every valid one above.
+  write("factory-rev", "type: factory\ntitle: A factory\nsummary: Exercises the revision stamp.\nstatus: retired\n", plainBody);
+  const retired = await sporCli.loadFactoryDefinition(cfg, "factory-rev");
+  assert.strictEqual(retired.factory, null);
+  assert.match(retired.revision, /^[0-9a-f]{40}$/);
+  assert.notStrictEqual(retired.revision, first.revision);
+  assert.notStrictEqual(retired.revision, edited.revision);
+});
+
 // The demotion's own write door. Only a claim of COMPLETION is rolled back: a
 // gate refuses "this is finished", it never reopens a person's decision to drop
 // the work — and it never touches the resolving EDGE, which is the agent's own
@@ -2881,7 +2929,7 @@ test("spor work --print names the factory and its gates, inline and referenced a
   const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, GATE_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() };
   const r = cli(["work", "--print", "--factory", "factory-demo"], env);
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.match(r.stdout, /factory: factory-demo — trusted ref main, protected test\/\*\* -> profile-test-writer/);
+  assert.match(r.stdout, /factory: factory-demo @ [0-9a-f]{12} — trusted ref main, protected test\/\*\* -> profile-test-writer/);
   assert.match(r.stdout, /gate acceptance {2}command/);
   assert.match(r.stdout, /gate adversarial {2}agent-review {2}review under profile-review {2}\(up to 2 fix cycles\) {2}\[gate-shared\]/);
 
@@ -3060,7 +3108,7 @@ test("end to end: a failing gate cools the item, files an escalation, and says s
   assert.match(body, /- \{type: blocks, to: task-ready\}/, "the refusal is durable graph state: the escalation blocks the gated item");
 
   const status = cli(["work", "--status"], env);
-  assert.match(status.stdout, /gates:\s+factory-demo — passed 0, failed 1/);
+  assert.match(status.stdout, /gates:\s+factory-demo @ [0-9a-f]{12} — passed 0, failed 1/);
   assert.match(status.stdout, /skipped:\s+task-ready — gate pipeline failed/);
 });
 

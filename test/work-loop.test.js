@@ -2366,6 +2366,71 @@ test("the optional noticeCode hook runs once per pass and a throw never stops th
   assert.ok(calls >= 3, `the throw on the second pass did not stop the loop (${calls} calls)`);
 });
 
+// task-spor-work-reload-factory-definition-per-pass: the optional
+// reloadFactory hook is the loop's half of the per-pass reload — bin/spor.js
+// owns re-reading and re-parsing the node (loadFactoryDefinition) and swaps
+// its own `factory` binding on a clean parse; the loop's only job is to call
+// it every pass, fold the {ok, revision, errors} it returns into
+// `status.gates`, and never let a throw or a rejection stop the worker — a
+// bad edit must not do what an unreadable one does at startup (refuse to
+// run), it must instead leave the worker on the last definition that DID
+// parse.
+test("the optional reloadFactory hook runs every pass: a clean reload updates the revision, a rejected one keeps the last good one and is logged once, not fatal", async () => {
+  const calls = [];
+  const rejection = "gate 'acceptance': reruns must be an integer";
+  const h = harness({
+    queue: [],
+    opts: { concurrency: 1, factory: "factory-x", factoryRevision: "rev0" },
+    maxPasses: 4,
+    gate: async () => ({ state: "passed", gates: [], facts: [] }),
+    extraDeps: {
+      reloadFactory: async () => {
+        calls.push(true);
+        if (calls.length === 1) return { ok: true, revision: "rev0" }; // unchanged re-read
+        if (calls.length <= 3) return { ok: false, errors: [rejection] }; // the same bad edit, twice
+        return { ok: true, revision: "rev1" }; // fixed
+      },
+    },
+  });
+  const status = await h.run();
+  // One call per pass, same cardinality as noticeCode above.
+  assert.strictEqual(calls.length, h.sleeps.length + 1, "reloaded once per pass, including the pass that reads the stop");
+  assert.strictEqual(status.gates.factory_revision, "rev1", "the last CLEAN parse is what's judging");
+  assert.strictEqual(status.gates.factory_error, null, "a later clean reload clears a prior rejection");
+  const rejections = h.log.filter((l) => l.includes("reload rejected"));
+  assert.strictEqual(rejections.length, 1, "the same rejection text logs once, not every pass it persists");
+  assert.match(rejections[0], new RegExp(rejection.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+test("a reloadFactory that throws never stops the loop, and the failure — not a crash — is what --status shows", async () => {
+  let calls = 0;
+  const h = harness({
+    queue: [],
+    opts: { concurrency: 1, factory: "factory-x", factoryRevision: "rev0" },
+    maxPasses: 3,
+    gate: async () => ({ state: "passed", gates: [], facts: [] }),
+    extraDeps: {
+      reloadFactory: async () => {
+        calls += 1;
+        throw new Error("graph unreachable");
+      },
+    },
+  });
+  const status = await h.run();
+  assert.ok(calls >= 3, `the throw stopped the reload from being retried (${calls} calls)`);
+  assert.strictEqual(status.gates.factory_revision, "rev0", "the last good definition's revision is untouched");
+  assert.strictEqual(status.gates.factory_error, "graph unreachable");
+});
+
+// A bare worker (no --factory, so bin/spor.js never builds a reloadFactory
+// dep) must be byte-identical to before this feature existed: no `gates` key
+// at all, since `deps.gate` is what gates that key's presence, not this one.
+test("with no factory declared, the loop has no reloadFactory dep and no `gates` status key — byte-identical to a bare worker", async () => {
+  const h = harness({ queue: [], opts: { concurrency: 1 }, maxPasses: 2 });
+  const status = await h.run();
+  assert.strictEqual("gates" in status, false);
+});
+
 // `--restart-on-land`: the notice reporting a move latches a DRAIN — no new
 // work, exit once the in-flight runs and pipelines settle — so a supervisor
 // restarts the worker on the new code. A drain, not a stop: nothing gating is
