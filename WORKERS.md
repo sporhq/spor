@@ -688,8 +688,61 @@ reading gets:
   any repo);
 - a dispatch with no target node to verify, report against, or release;
 - an unreachable — or unauthenticated — server;
-- (v1) a **native-background** launch, whose termination this runner cannot
-  deterministically observe, so the contract never runs for it at all.
+- a **native-background** launch whose run this box could not judge to be over
+  — the harness listing could not be read at all, or the run named no target
+  node (a free-text `--bg` dispatch), or the record was closed with no
+  attributable transcript to classify it from. A native launch that IS judged
+  over now gets the whole contract, same as a supervised one — see below.
+
+**A native-background launch is inside the contract now**
+(task-spor-dispatch-native-bg-terminal-detection). It was excluded in v1 for
+one reason: a `claude --bg` run's termination could not be deterministically
+observed. It can be. A finished background agent does **not** leave the
+harness daemon — it sits at `status: "idle"` while `state` still reads
+`"working"` — which is why such a run used to hold its worker's slot until the
+24-hour watchdog (two factory pipelines stalled five hours on exactly this on
+2026-09-02, released only by a manual `claude stop`). A run is judged over when
+three independent signals agree: every listed agent that identifies as it reads
+`status: "idle"`, its transcript's LAST turn closed with an end-of-turn marker,
+and nothing has been appended for a short quiet window. Idle with a mid-turn
+transcript is a waiting tool call, and stays live; a listing with no `status` at
+all never satisfies the first signal. `state: "done"` remains an independent
+terminal signal, as before.
+
+Two consequences ride with it. The daemon slot is freed — the agent is stopped
+through its harness adapter's own declared stop argv, and the record says
+`stopped_for: "turn-complete"` with `agent_stopped` reporting whether that
+took. And the contract then runs against the run's target: the record is closed
+FIRST, synchronously, carrying a provisional unenforced outcome plus
+`contract_pending` (the run store is synchronous and holds no credential), and
+the verified verdict merges in a beat later from whoever holds a graph door —
+the same two-write shape a supervised run already uses. The agent's final
+report is the LAST assistant text in its own session transcript, by the same
+`--output-last-message` rule the supervised stream applies (subagent sidechain
+records excluded, which that stream never sees either), so a native run can
+reach `reported` with its hand-back filed and a `DECLINED:` one routes to
+triage instead of every unresolved run reading `failed`.
+
+Three rules bound that second write, because unlike a supervisor it has no
+owning process and runs from whichever client next reconciles the record:
+
+- **The debt is spent only when it is discharged.** An unreachable or
+  unauthenticated graph leaves `contract_pending` set (and the honest
+  unenforced verdict written) for the next caller, rather than losing the
+  report and the lease handback permanently — bounded at `contract_attempts`
+  = 3, after which the unenforced reading stands.
+- **The record names the graph it was launched against** (`server` + `org`, or
+  `local_nodes_dir` for a local launch), and a client resolving a different
+  one SKIPS it — matching the org too, since a hosted deployment gives every
+  tenant the same front door. On a multi-tenant box the same node id exists in more than
+  one graph, and settling through the wrong one files a report where the run
+  never ran and releases a lease that is not the run's.
+- **A filtered read settles only what it asked about.** `spor runs --node x`
+  and a worker following its own runs settle those; an unfiltered `spor runs`
+  is the whole store's reconciler and settles everything it just closed. And
+  the lease handback is skipped once the record has been terminal longer than
+  the lease's own 45m TTL — by then the item may legitimately belong to
+  someone else.
 
 A `reported` or `failed` value on an unenforced record is a best-effort
 classification of the *process* outcome, not a checked verdict;
@@ -818,6 +871,15 @@ violation — new fields may be added additively.
 | `log_path` | string | supervised runs only — the raw JSONL/stderr log |
 | `report_path` | string | supervised runs only — where the harness's own final-message text landed, if any |
 | `child_reaped` | bool | optional — an orphaned harness child was terminated at reconciliation time |
+| `stopped_for` | string | optional, native runs only — why this run's agent was stopped rather than merely observed to end. `"turn-complete"` is the only value today: the agent was still registered in the harness daemon, idle, with a finished last turn |
+| `agent_stopped` | bool | optional, native runs only — whether the stop above actually took. `false` means the record is terminal anyway and an idle agent may still be registered |
+| `release_node` | string | optional, native runs only — the lease THIS dispatch established, and therefore the only one §6 may hand back. Absent when the dispatch claimed nothing (`--no-claim`, a `--force` re-dispatch over someone else's live lease) |
+| `local_nodes_dir` | string | optional, native runs only, local mode — the graph home the LAUNCHER resolved, which a repo `graph:` binding can make differ from the reconciling process's own |
+| `project` | string | optional, native runs only — the project slug the run resolved into, stamped onto any report artifact §6 files |
+| `server` | string | optional, native runs only, remote mode — the graph base URL this run was launched against; §6 refuses to settle it through any other |
+| `org` | string | optional, native runs only, remote mode — the tenant org that base URL was resolved under. A hosted deployment routes every tenant through ONE front door and separates them by the token's org claim, so §6 matches this too when the record names one |
+| `contract_attempts` | int | optional, native runs only — how many times §6 has been attempted for this record (see the debt rule above) |
+| `contract_settled_at` | ISO 8601 | optional, native runs only — when the outcome dimension stopped being provisional |
 
 **The two launch modes carry different fields, and that asymmetry IS the
 schema — not an omission to read around.** A `native-background` record
@@ -852,8 +914,10 @@ two records against that rule and kept the field. Retiring it remains available
 as a schema change with a deprecation window; it is not available as a
 correction here.
 
-Fields like `runner_pid`, `child_pid`, `runner_started_ticks`,
-`child_started_ticks`, and `contract_pending` also ride on supervised records;
+Fields like `runner_pid`, `child_pid`, `runner_started_ticks`, and
+`child_started_ticks` ride on supervised records, and `contract_pending` on
+both (a native record carries it between the reconcile that closes it and the
+settle that verifies it);
 they are internal bookkeeping — process identity for reconciliation (guarding
 against pid reuse), and, for `contract_pending`, whether the outcome dimension
 on a just-closed record is still the provisional placeholder rather than the
@@ -862,7 +926,8 @@ later). They are not meaningful to an external consumer, which should poll for
 `terminal_state` rather than trying to interpret them.
 
 **A `contract_pending` record is verified before it is believed.** A supervisor
-killed inside that window never lands the real verdict, so the placeholder — an
+killed inside that window — or a process that closed a native record and then
+died before settling it — never lands the real verdict, so the placeholder — an
 unenforced `reported`, or `failed` — would otherwise be filed as the outcome of
 a run that genuinely resolved its target, and then gated and cooled off for it.
 Whoever harvests such a record re-runs §6's verify leg itself (`spor work`

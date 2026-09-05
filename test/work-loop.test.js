@@ -2758,3 +2758,306 @@ test("verifyRunResolution (remote): a resident override that drops a type's get(
     srv.close();
   }
 });
+
+// --- the native-background terminal-state contract -------------------------
+// task-spor-dispatch-native-bg-terminal-detection. `reconcileRuns` can only
+// close a `--bg` record — it is synchronous and holds no credential — so it
+// leaves a provisional unenforced outcome plus `contract_pending`, and the
+// poller that DOES hold a graph door runs the same contract a supervisor runs
+// for itself. Before this, a native run could only ever be an unenforced guess
+// (dec-spor-dispatch-terminal-states-supervised-first's v1 scope).
+
+function nativeOwing(home, patch = {}) {
+  const dir = path.join(home, "journal", "dispatch");
+  fs.mkdirSync(dir, { recursive: true });
+  const record = {
+    run_id: "nb1", node_id: "task-x", name: "task-x", harness: "claude-code",
+    launch_mode: "native-background", state: "done", cwd: home,
+    created_at: new Date(Date.now() - 600000).toISOString(), finished_at: new Date().toISOString(),
+    terminal_state: "reported", terminal_enforced: false, contract_pending: true,
+    ...patch,
+  };
+  dispatchRuns.atomicJson(path.join(dir, "nb1.run.json"), record);
+  return record;
+}
+
+async function graphStub(handler) {
+  const http = require("node:http");
+  const seen = [];
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      seen.push({ method: req.method, url: req.url, body });
+      handler(req, res, body);
+    });
+  });
+  await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+  return { srv, base: `http://127.0.0.1:${srv.address().port}`, seen };
+}
+
+test("settleNativeContracts: a native run whose target reads RESOLVED ends verified, not as a best-effort guess", async () => {
+  const { srv, base, seen } = await graphStub((req, res) => {
+    if (req.method === "GET" && req.url === "/v1/nodes/task-x") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "task-x", type: "task", status: "done", resolution: { by: "dec-y" } }));
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  try {
+    const cfg = offsetCfg(base);
+    const home = cfg.userConfigHome();
+    const record = nativeOwing(home);
+    const [settled] = await sporCli.settleNativeContracts(cfg, [record]);
+    assert.strictEqual(settled.terminal_state, "resolved");
+    assert.strictEqual(settled.terminal_enforced, true, "a graph answered the re-read — that is the whole of the claim");
+    assert.strictEqual(settled.contract_pending, false);
+    // Durable, not just in the returned copy — `spor runs` prints what is on disk.
+    const onDisk = dispatchRuns.readJson(path.join(home, "journal", "dispatch", "nb1.run.json"));
+    assert.strictEqual(onDisk.terminal_state, "resolved");
+    // A resolved target is never released: a terminal status already takes it
+    // out of every queue (WORKERS.md §6).
+    assert.ok(!seen.some((r) => r.url.includes("/release")));
+  } finally {
+    srv.close();
+  }
+});
+
+test("settleNativeContracts: an unresolved native run files the agent's own TRANSCRIPT report and releases its lease", async () => {
+  const filed = [];
+  const { srv, base, seen } = await graphStub((req, res, body) => {
+    if (req.method === "GET" && req.url === "/v1/nodes/task-x") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "task-x", type: "task", status: "open" })); // no resolution
+      return;
+    }
+    if (req.method === "POST" && req.url === "/v1/nodes") {
+      filed.push(JSON.parse(body).nodes[0].node);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ results: [{ ok: true, status: "created" }] }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  try {
+    const cfg = offsetCfg(base);
+    const home = cfg.userConfigHome();
+    const transcript = path.join(home, "t.jsonl");
+    fs.writeFileSync(transcript, [
+      JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Got the parser landed; the migration half is still open." }] } }),
+      JSON.stringify({ type: "system", subtype: "turn_duration" }),
+    ].join("\n"));
+    const record = nativeOwing(home, { transcript_path: transcript, release_node: "task-x", project: "spor" });
+    const [settled] = await sporCli.settleNativeContracts(cfg, [record]);
+    assert.strictEqual(settled.terminal_state, "reported");
+    assert.strictEqual(settled.terminal_enforced, true);
+    assert.ok(settled.report_node_id, "`reported` always names the artifact it filed");
+    assert.strictEqual(filed.length, 1);
+    assert.match(filed[0], /the migration half is still open/, "the report is the last assistant text, as for a supervised stream");
+    // ORDERING IS THE CONTRACT: file, then release.
+    const order = seen.filter((r) => r.method === "POST").map((r) => r.url);
+    assert.deepStrictEqual(order, ["/v1/nodes", "/v1/nodes/task-x/release"]);
+    assert.strictEqual(settled.lease_released, true);
+  } finally {
+    srv.close();
+  }
+});
+
+test("settleNativeContracts: a record that owes nothing is passed through without asking the graph anything", async () => {
+  const { srv, base, seen } = await graphStub((req, res) => {
+    res.writeHead(500);
+    res.end("{}");
+  });
+  try {
+    const cfg = offsetCfg(base);
+    const home = cfg.userConfigHome();
+    // A supervised record, and a native one already settled: neither is ours.
+    const supervised = { run_id: "s", launch_mode: "supervised-jsonl", state: "done", contract_pending: true, node_id: "task-x" };
+    const settledAlready = nativeOwing(home, { contract_pending: false, terminal_enforced: true, terminal_state: "resolved" });
+    const out = await sporCli.settleNativeContracts(cfg, [supervised, settledAlready]);
+    assert.deepStrictEqual(out, [supervised, settledAlready]);
+    assert.strictEqual(seen.length, 0);
+  } finally {
+    srv.close();
+  }
+});
+
+test("settleNativeContracts (local mode): the run's OWN graph home answers the re-read", async () => {
+  // task-spor-work-local-mode-resolver-check: local dispatch has no server to
+  // file or release through, but it does have the files the agent wrote its
+  // resolver into — and the launcher's home, not the reconciling cwd's.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-native-local-"));
+  const nodes = path.join(home, "graph", "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  fs.writeFileSync(path.join(nodes, "task-x.md"), "---\nid: task-x\ntype: task\ntitle: A task\nsummary: A task the agent resolved.\nstatus: open\n---\nbody\n");
+  fs.writeFileSync(
+    path.join(nodes, "dec-y.md"),
+    "---\nid: dec-y\ntype: decision\ntitle: Why\nsummary: The decision that resolves it.\nedges:\n  - {type: resolves, to: task-x}\n---\nbody\n"
+  );
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const record = nativeOwing(cfg.userConfigHome(), { local_nodes_dir: nodes });
+  const [settled] = await sporCli.settleNativeContracts(cfg, [record]);
+  assert.strictEqual(settled.terminal_state, "resolved");
+  assert.strictEqual(settled.terminal_enforced, true);
+  assert.strictEqual(settled.resolved_by, "dec-y");
+});
+
+test("settleNativeContracts: an UNREACHABLE graph does not spend the run's one contract attempt", async () => {
+  // The debt has no owning process to retire it — a `--bg` launch keeps no
+  // supervisor — so clearing `contract_pending` on a transport failure would
+  // lose the report and the lease handback permanently: nothing would ever look
+  // again. The verdict is still written (it is no worse than the provisional
+  // reading), but the debt survives for the next caller with a reachable graph.
+  const { srv, base } = await graphStub((req, res) => {
+    res.writeHead(503, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  try {
+    const cfg = offsetCfg(base);
+    const home = cfg.userConfigHome();
+    let record = nativeOwing(home, { release_node: "task-x" });
+    for (let i = 1; i <= 2; i++) {
+      [record] = await sporCli.settleNativeContracts(cfg, [record]);
+      assert.strictEqual(record.terminal_enforced, false);
+      assert.strictEqual(record.contract_pending, true, `attempt ${i} keeps the debt`);
+      assert.strictEqual(record.contract_attempts, i);
+    }
+    // …but bounded: "retry until a graph answers" is a pair of timeouts every
+    // poll during an outage nobody asked for.
+    [record] = await sporCli.settleNativeContracts(cfg, [record]);
+    assert.strictEqual(record.contract_attempts, dispatchRuns.NATIVE_CONTRACT_ATTEMPTS);
+    assert.strictEqual(record.contract_pending, false, "three chances, then the honest unenforced reading stands");
+    assert.ok(record.contract_settled_at);
+  } finally {
+    srv.close();
+  }
+});
+
+test("settleNativeContracts: a record launched against ANOTHER graph is skipped, not settled through this one", async () => {
+  // dec-spor-client-cli-mode-tenant-resolution: the ambient tenant belongs to
+  // whoever is running `spor runs`, not to the run. The same node id routinely
+  // exists in two tenants, so settling through the wrong one files a report
+  // into a graph the run never touched and releases someone else's lease.
+  const { srv, base, seen } = await graphStub((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id: "task-x", type: "task", status: "open" }));
+  });
+  try {
+    const cfg = offsetCfg(base);
+    const home = cfg.userConfigHome();
+    const foreign = nativeOwing(home, { server: "https://api.other-tenant.invalid", release_node: "task-x" });
+    const [out] = await sporCli.settleNativeContracts(cfg, [foreign]);
+    assert.strictEqual(out.contract_pending, true, "the debt stays with the caller that owns it");
+    assert.strictEqual(seen.length, 0, "no call is made against the wrong graph");
+    assert.strictEqual(sporCli.nativeContractDoor(cfg, foreign), null);
+    // A LOCAL-mode launch settled from a remote process is the same mistake.
+    assert.strictEqual(sporCli.nativeContractDoor(cfg, { local_nodes_dir: "/tmp/nodes" }), null);
+    // …and the record that names this very server is ours to answer for.
+    assert.ok(sporCli.nativeContractDoor(cfg, { server: base }));
+    // The SAME front door under a different ORG is a different graph: a hosted
+    // deployment routes every tenant through one host and separates them by the
+    // token's org claim, so a base-URL match alone would settle org A's run
+    // against org B — the exact hazard the stamp exists to stop.
+    assert.strictEqual(sporCli.nativeContractDoor(cfg, { server: base, org: "globex" }), null);
+  } finally {
+    srv.close();
+  }
+});
+
+test("nativeContractDoor: a local-mode launch under an explicit mode:local is still settleable by its own config", () => {
+  // The door must decide localness the way the LAUNCHER did (`cfg.mode()`), not
+  // by whether a credential happens to resolve: a logged-in user with a
+  // deliberately local repo stamps `local_nodes_dir`, and a door that read
+  // "a server resolves, so this is remote" would skip that record forever —
+  // never verifying, never filing, never handing the lease back, and never
+  // even spending an attempt to say so.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-door-local-"));
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ mode: "local" }));
+  const cfg = loadConfig({
+    cwd: home,
+    env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: "http://127.0.0.1:1", SPOR_TOKEN: "t" },
+  });
+  assert.strictEqual(cfg.mode(), "local");
+  const door = sporCli.nativeContractDoor(cfg, { local_nodes_dir: path.join(home, "nodes") });
+  assert.ok(door, "its own config is the door");
+  assert.strictEqual(door.base, null);
+  assert.strictEqual(door.nodesDir, path.join(home, "nodes"));
+});
+
+test("settleNativeContracts: `scope` keeps a filtered read from filing reports for runs it never asked about", async () => {
+  const { srv, base, seen } = await graphStub((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id: "task-x", type: "task", status: "open" }));
+  });
+  try {
+    const cfg = offsetCfg(base);
+    const home = cfg.userConfigHome();
+    const record = nativeOwing(home);
+    const [out] = await sporCli.settleNativeContracts(cfg, [record], { scope: new Set(["some-other-run"]) });
+    assert.strictEqual(out.contract_pending, true);
+    assert.strictEqual(seen.length, 0);
+  } finally {
+    srv.close();
+  }
+});
+
+test("settleNativeContracts: a lease whose TTL has long since lapsed is not yanked back", async () => {
+  // Nothing reconciles a native record on a timer, so a `--bg` run can sit for
+  // hours — by which time the item may have been re-claimed, quite possibly by
+  // another worker of the same person, whom a 409 does not protect.
+  const { srv, base, seen } = await graphStub((req, res, body) => {
+    if (req.method === "GET") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "task-x", type: "task", status: "open" }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ results: [{ ok: true, status: "created" }] }));
+  });
+  try {
+    const cfg = offsetCfg(base);
+    const home = cfg.userConfigHome();
+    const stale = nativeOwing(home, {
+      release_node: "task-x",
+      finished_at: new Date(Date.now() - 6 * 3600 * 1000).toISOString(),
+      transcript_path: (() => {
+        const f = path.join(home, "old.jsonl");
+        fs.writeFileSync(f, `${JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "ran out of road" }] } })}\n`);
+        return f;
+      })(),
+    });
+    const [out] = await sporCli.settleNativeContracts(cfg, [stale]);
+    assert.strictEqual(out.terminal_state, "reported", "the report is still filed — it is the item's signal");
+    assert.ok(!seen.some((r) => r.url.includes("/release")), "but the lapsed lease is left alone");
+    assert.ok(!("lease_released" in out), "no lease of ours to hand back is an OMITTED key, never false");
+  } finally {
+    srv.close();
+  }
+});
+
+test("settleNativeOutcome: a verified `resolved` still wins after a weaker verdict already settled", async () => {
+  // Two processes can both reconcile a native record (a person's `spor runs`
+  // beside a worker's poll), and one may have read the graph before the agent's
+  // resolver landed. A plain pending-flag guard would let that earlier reading
+  // file a run that demonstrably resolved its target as `reported` — which
+  // shouldGate does not gate at all.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-native-upgrade-"));
+  const record = nativeOwing(home);
+  const weaker = { terminal_state: "reported", terminal_enforced: true, report_node_id: "art-x", terminal_note: "read before the resolver landed" };
+  const settled = dispatchRuns.settleNativeOutcome(home, record, weaker);
+  assert.strictEqual(settled.terminal_state, "reported");
+  assert.strictEqual(settled.contract_pending, false);
+
+  const stronger = { terminal_state: "resolved", terminal_enforced: true, resolved_by: "dec-y", terminal_note: "verified on the graph" };
+  const upgraded = dispatchRuns.settleNativeOutcome(home, record, stronger);
+  assert.strictEqual(upgraded.terminal_state, "resolved");
+  assert.strictEqual(upgraded.resolved_by, "dec-y");
+  assert.strictEqual(dispatchRuns.readJson(path.join(home, "journal", "dispatch", "nb1.run.json")).terminal_state, "resolved");
+
+  // …and nothing WEAKER may overwrite a settled verdict.
+  const again = dispatchRuns.settleNativeOutcome(home, record, weaker);
+  assert.strictEqual(again.terminal_state, "resolved");
+});

@@ -1510,3 +1510,199 @@ test("stopIdleRun: a supervisor that finished in the same instant keeps its own 
   assert.strictEqual(out.state, "done", "an observed outcome is never overwritten by a derived one");
   assert.strictEqual(out.terminal_state, "reported");
 });
+
+// --- native background: turn-complete detection ----------------------------
+// (task-spor-dispatch-native-bg-terminal-detection). A finished `claude --bg`
+// agent does NOT leave the daemon: it sits at `status: "idle"` while `state`
+// still reads `"working"`, so the run record stayed open and a worker
+// following it waited out the 24h watchdog on work that ended hours ago (the
+// 2026-09-02 evidence: two factory pipelines stalled five hours until a
+// `claude stop` on each session released them).
+
+const IDLE_AGENT = { kind: "background", sessionId: "sid-idle", state: "working", status: "idle" };
+// A minute of transcript quiet, then "now" two hours later: well past the
+// default quiet window, so these cases turn on the OTHER two signals.
+const QUIET_NOW = () => "2026-07-18T12:00:00.000Z";
+// Pin a transcript's mtime into that same fixed clock: the quiet window is
+// measured against the file, so a fixture written "now" would otherwise read as
+// activity two months in the future.
+function quiet(file, at = "2026-07-18T10:05:00.000Z") {
+  const t = new Date(at);
+  fs.utimesSync(file, t, t);
+  return file;
+}
+
+function nativeTurnCompleteFixture(lines, agentPatch = {}) {
+  const home = scratch("spor-runs-turn-");
+  const configDir = scratch("spor-runs-cc-");
+  const cwd = "/tmp/spor-runs-turn";
+  quiet(writeTranscript(configDir, cwd, "sid-idle", lines));
+  const run = runner.beginNativeRun(home, {
+    harness: "claude-code", name: "task-x", nodeId: "task-x", cwd, now: () => "2026-07-18T10:00:00.000Z",
+  });
+  runner.updateRun(run, { state: "running", session_id: "sid-idle" });
+  const stopped = [];
+  const out = runner.reconcileRuns(home, {
+    agents: [{ ...IDLE_AGENT, cwd, ...agentPatch }],
+    env: { CLAUDE_CONFIG_DIR: configDir },
+    now: QUIET_NOW,
+    stopAgent: (record, agent) => { stopped.push({ session: record.session_id, agent }); return true; },
+  });
+  return { home, record: out.find((r) => r.run_id === run.runId), stopped };
+}
+
+test("reconcileRuns: an IDLE agent whose last turn closed cleanly is finished, stopped, and left owing the contract", () => {
+  const { record, stopped } = nativeTurnCompleteFixture([TOOL_RESULT, CLEAN_END]);
+  assert.strictEqual(record.state, "done", "the transcript's own clean end is the outcome, as for a vanished run");
+  assert.strictEqual(record.termination_signal, "turn-complete");
+  assert.strictEqual(record.stopped_for, "turn-complete");
+  assert.strictEqual(record.agent_stopped, true);
+  assert.strictEqual(stopped.length, 1, "the daemon slot is freed — nothing reconciles this record again");
+  assert.strictEqual(stopped[0].session, "sid-idle");
+  // The contract is OWED, not skipped: the store holds no credential, so the
+  // caller that does settles it (settleNativeContracts).
+  assert.strictEqual(record.contract_pending, true);
+  assert.strictEqual(record.terminal_enforced, false, "the provisional beat is honest about not having verified anything");
+});
+
+test("reconcileRuns: an idle agent whose transcript is MID-TURN is a waiting tool call, not a finished run", () => {
+  const { record, stopped } = nativeTurnCompleteFixture([CLEAN_END, TOOL_RESULT]);
+  assert.strictEqual(record.state, "running", "idle alone is not the signal");
+  assert.strictEqual(stopped.length, 0, "a live agent is never stopped");
+});
+
+test("reconcileRuns: a turn-complete transcript under a WORKING agent leaves the run live", () => {
+  // The agent has picked up the next turn; the marker closed the previous one.
+  const { record, stopped } = nativeTurnCompleteFixture([TOOL_RESULT, CLEAN_END], { status: "working" });
+  assert.strictEqual(record.state, "running");
+  assert.strictEqual(stopped.length, 0);
+});
+
+test("reconcileRuns: an agent listing with NO status field never reads as finished", () => {
+  // An older CLI, or another harness's listing shape. An unreadable signal must
+  // leave the run live — the same fail-safe direction as `enumerated: false`.
+  const { record } = nativeTurnCompleteFixture([TOOL_RESULT, CLEAN_END], { status: undefined });
+  assert.strictEqual(record.state, "running");
+});
+
+test("nativeTurnComplete: the quiet window is what makes the three signals ONE observation", () => {
+  const home = scratch("spor-runs-turn-quiet-");
+  const configDir = scratch("spor-runs-cc-");
+  const cwd = "/tmp/spor-runs-turn-quiet";
+  const file = writeTranscript(configDir, cwd, "sid-idle", [TOOL_RESULT, CLEAN_END]);
+  const record = {
+    run_id: "q1", node_id: "task-x", harness: "claude-code", launch_mode: "native-background",
+    state: "running", cwd, session_id: "sid-idle", created_at: "2026-07-18T10:00:00.000Z",
+  };
+  const agents = [{ ...IDLE_AGENT, cwd }];
+  const opts = { env: { CLAUDE_CONFIG_DIR: configDir } };
+  const quietAt = fs.statSync(file).mtimeMs;
+  // Read a beat after the marker landed: the next turn may be opening right now.
+  assert.strictEqual(
+    runner.nativeTurnComplete(record, agents, { ...opts, now: () => new Date(quietAt + 1000).toISOString() }),
+    null
+  );
+  const fired = runner.nativeTurnComplete(record, agents, {
+    ...opts, now: () => new Date(quietAt + runner.NATIVE_QUIET_MS + 1000).toISOString(),
+  });
+  assert.ok(fired, "past the window all three signals are one consistent reading");
+  assert.strictEqual(fired.agent.sessionId, "sid-idle");
+});
+
+test("nativeTurnComplete: an UNBOUND run is never judged finished — it has no transcript of its own", () => {
+  // The identity rule the whole run store rests on: a project dir is one
+  // checkout, and a sibling's transcript is not evidence about this run.
+  const configDir = scratch("spor-runs-cc-");
+  const cwd = "/tmp/spor-runs-turn-unbound";
+  writeTranscript(configDir, cwd, "sid-of-a-sibling", [TOOL_RESULT, CLEAN_END]);
+  const record = {
+    run_id: "u1", node_id: "task-x", name: "task-x", harness: "claude-code",
+    launch_mode: "native-background", state: "running", cwd, created_at: "2026-07-18T10:00:00.000Z",
+  };
+  const agents = [{ kind: "background", name: "task-x", cwd, status: "idle", startedAt: Date.parse("2026-07-18T10:00:05.000Z") }];
+  assert.strictEqual(
+    runner.nativeTurnComplete(record, agents, { env: { CLAUDE_CONFIG_DIR: configDir }, now: QUIET_NOW }),
+    null
+  );
+});
+
+test("reconcileRuns: a stopAgent that throws still leaves the record terminal", () => {
+  const home = scratch("spor-runs-turn-throw-");
+  const configDir = scratch("spor-runs-cc-");
+  const cwd = "/tmp/spor-runs-turn-throw";
+  quiet(writeTranscript(configDir, cwd, "sid-idle", [TOOL_RESULT, CLEAN_END]));
+  const run = runner.beginNativeRun(home, { harness: "claude-code", name: "task-x", nodeId: "task-x", cwd, now: () => "2026-07-18T10:00:00.000Z" });
+  runner.updateRun(run, { state: "running", session_id: "sid-idle" });
+  const [record] = runner.reconcileRuns(home, {
+    agents: [{ ...IDLE_AGENT, cwd }],
+    env: { CLAUDE_CONFIG_DIR: configDir },
+    now: QUIET_NOW,
+    stopAgent: () => { throw new Error("claude stop is not on this box"); },
+  });
+  assert.strictEqual(record.state, "done", "reaping is a courtesy; it never costs the record its outcome");
+  assert.strictEqual(record.agent_stopped, false);
+});
+
+// --- a native run's own final report ---------------------------------------
+
+test("transcriptFinalText: the LAST assistant text is the report, and a torn tail line is skipped", () => {
+  const text = [
+    '{"type":"assist',                                                    // a bounded tail starts mid-line
+    JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "first pass" }] } }),
+    JSON.stringify({ type: "user", message: { role: "user", content: "carry on" } }),
+    JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "MERGE-READY" }, { type: "text", text: "resolver: dec-y" }] } }),
+    JSON.stringify(CLEAN_END),
+  ].join("\n");
+  assert.strictEqual(runner.transcriptFinalText(text), "MERGE-READY\nresolver: dec-y");
+});
+
+test("nativeRunReportText: a run with no attributable transcript reports nothing", () => {
+  assert.strictEqual(runner.nativeRunReportText({ cwd: "/tmp/nowhere" }, { CLAUDE_CONFIG_DIR: scratch("spor-runs-cc-") }), "");
+});
+
+test("nativeRunReportText: a DECLINE in the transcript survives into the provisional outcome", () => {
+  // The reading that keeps a declined native run out of the gates even in the
+  // beat before the contract settles it (dispatch-terminal's decline arm).
+  const home = scratch("spor-runs-decline-");
+  const configDir = scratch("spor-runs-cc-");
+  const cwd = "/tmp/spor-runs-decline";
+  quiet(writeTranscript(configDir, cwd, "sid-idle", [
+    { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "DECLINED: this belongs in spor-server" }] } },
+    CLEAN_END,
+  ]));
+  const run = runner.beginNativeRun(home, { harness: "claude-code", name: "task-x", nodeId: "task-x", cwd, now: () => "2026-07-18T10:00:00.000Z" });
+  runner.updateRun(run, { state: "running", session_id: "sid-idle" });
+  const [record] = runner.reconcileRuns(home, {
+    agents: [{ ...IDLE_AGENT, cwd }], env: { CLAUDE_CONFIG_DIR: configDir }, now: QUIET_NOW,
+  });
+  assert.strictEqual(record.terminal_state, "declined");
+  assert.strictEqual(record.declined_reason, "this belongs in spor-server");
+});
+
+test("stopNativeAgent: reaps through the ADAPTER's declared stop argv, resolved off the cascade", () => {
+  // The reap is the CLI's leg of the detector above: the run store says a
+  // native run finished, and this frees the daemon slot it still holds. WHAT to
+  // run is `activeStop` on the harness adapter — never a spelling hardcoded in
+  // the store — and WHERE the launcher lives comes from the same cascade the
+  // agent listing resolves through, so a box whose claude sits at
+  // `dispatch.bin.claude-code` still reaps.
+  const sporCli = require("../bin/spor.js");
+  const { loadConfig } = require("../lib/config.js");
+  const dir = scratch("spor-runs-stop-");
+  const seen = path.join(dir, "argv.json");
+  const stub = writeSpawnableNodeStub(dir, "claude-stub", `require("fs").writeFileSync(${JSON.stringify(seen)}, JSON.stringify(process.argv.slice(2)));`);
+  // Through the config cascade, not the env: `dispatch.bin` is a machine-local
+  // user-config key by design (never a committable repo `.spor.json`).
+  fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ dispatch: { bin: { "claude-code": stub } } }));
+  const cfg = loadConfig({ cwd: dir, env: { SPOR_HOME: dir, XDG_CONFIG_HOME: dir } });
+
+  assert.strictEqual(sporCli.stopNativeAgent(cfg, { harness: "claude-code", session_id: "sid-done" }, null), true);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(seen, "utf8")), ["stop", "sid-done"]);
+
+  // No identity, nothing to stop: an agent is never reaped by co-location.
+  fs.rmSync(seen);
+  assert.strictEqual(sporCli.stopNativeAgent(cfg, { harness: "claude-code" }, {}), false);
+  assert.ok(!fs.existsSync(seen));
+  // A harness that declares no stop is simply not reaped.
+  assert.strictEqual(sporCli.stopNativeAgent(cfg, { harness: "codex", session_id: "sid-done" }, null), false);
+});

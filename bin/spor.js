@@ -612,6 +612,202 @@ function nativeAgentEvidence(cfg, records) {
   return { agents, enumerated };
 }
 
+// Stop a FINISHED background agent, freeing the daemon slot it still occupies
+// (task-spor-dispatch-native-bg-terminal-detection). `claude --bg` leaves a
+// turn-complete agent registered forever, so a run reconciled terminal on that
+// signal reaps its own agent here — the mirror of `enumerateHarnessAgents`,
+// down to resolving the launcher through the cascade so a box whose `claude`
+// lives at `dispatch.bin.claude-code` still reaps.
+//
+// WHAT to run is the adapter's declaration (`activeStop`), never a spelling
+// hardcoded here; a harness that declares none is simply not reaped. Best-
+// effort by contract: the record is already terminal and stays so whether or
+// not this works, and `agent_stopped` on it says which happened. `claude stop`
+// leaves the daemon and its spare pty workers up — it ends one agent, not the
+// harness.
+function stopNativeAgent(cfg, record, agent) {
+  const sessionId = (record && record.session_id) || (agent && agent.sessionId) || null;
+  if (!sessionId) return false; // no identity to name — never stop by co-location
+  const adapter = dispatchHarnesses
+    .discoveryAdapters({ cfg })
+    .find((a) => a.id === (record && record.harness) && a.activeStop && a.activeStop.kind === "cli-args");
+  if (!adapter) return false;
+  const cmd = adapter.command(process.env, cfg);
+  if (cmd === "claude" && !hasCmd(cmd)) return false;
+  const r = spawnPortableSync(cmd, [...adapter.activeStop.args, sessionId], { encoding: "utf8", timeout: 5000 });
+  return !!r && r.status === 0;
+}
+
+// The reaper `reconcileRuns` calls when it closes a native run on the turn-
+// complete signal, or null when nothing here could reap: the store must not
+// pay a harness lookup per record for a machine that has no way to stop one.
+function makeAgentReaper(cfg) {
+  return (record, agent) => {
+    try {
+      return stopNativeAgent(cfg, record, agent);
+    } catch {
+      return false;
+    }
+  };
+}
+
+// Run the terminal-state contract for the NATIVE-background runs a reconcile
+// left owing it (task-spor-dispatch-native-bg-terminal-detection). The store
+// is synchronous and holds no credential, so it closes such a record with a
+// provisional unenforced outcome and flags `contract_pending`; this is the
+// second write, and the same one the supervised finalizer makes for itself —
+// so a `--bg` run now ends in exactly one of resolved-verified / reported /
+// failed / declined with `terminal_enforced: true`, instead of a permanent
+// best-effort guess (dec-spor-dispatch-terminal-states-supervised-first's v1
+// scope).
+//
+// The door is this box's own config, as `verifyRunResolution`'s is: same
+// machine, same tenant. What it CANNOT re-derive it reads off the record — the
+// lease this dispatch established (`release_node`), the project the report
+// artifact is stamped with, and the local graph home the launcher resolved —
+// because a repo `graph:` binding, an `--org`, or a different cwd can all make
+// this process's own answers differ from the launch's. A record written before
+// those stamps existed simply carries none, and the contract then omits the
+// legs they feed (an absent `releaseNode` releases nothing, and says nothing
+// about a lease that was never ours).
+//
+// The agent's final report is the last assistant text in its own transcript,
+// the same rule the supervised stream applies (`nativeRunReportText`) — so a
+// native run can reach `reported` with its hand-back filed, and a `DECLINED:`
+// one routes to triage, instead of every unresolved run reading `failed`.
+// The DOOR a native record must be settled through, or null when this process
+// is not it. The record names the graph its run was launched against — a server
+// base for a remote launch, a nodes dir for a local one — and the settle must
+// match, because the ambient config here belongs to whoever happens to be
+// running `spor runs`, not to the run. On a multi-tenant box (`--org`,
+// `SPOR_ORG`, a repo `org:` marker) a mismatch is not a near miss: the same
+// node id routinely exists in two tenants, so settling through the wrong one
+// files a report into a graph the run never touched and releases a lease that
+// belongs to someone else's work. A record whose door this is not is SKIPPED,
+// not discharged — it keeps its debt for the caller that owns it.
+//
+// A record naming NEITHER predates those stamps; it falls back to the ambient
+// config, which is the best-effort reading it has always had.
+function nativeContractDoor(cfg, record) {
+  // `cfg.mode()`, not "does a server resolve": an explicitly configured
+  // `mode: "local"` is what the LAUNCHER branched on when it stamped the
+  // record, and a logged-in user with a deliberately local repo still resolves
+  // a credential. Asking the two questions differently would leave every such
+  // record's debt permanently unclaimable — skipped by every caller, including
+  // the one running in the very config that launched it.
+  const isRemote = cfg.mode() === "remote";
+  const base = isRemote ? String(remote.base(cfg) || "").replace(/\/+$/, "") : null;
+  const tenant = isRemote && typeof cfg.tenant === "function" ? cfg.tenant() : null;
+  const org = String((tenant && tenant.org) || "");
+  const want = String((record && record.server) || "").replace(/\/+$/, "");
+  const wantOrg = String((record && record.org) || "");
+  if (want) {
+    if (!isRemote || base !== want) return null;
+    // A hosted deployment routes every tenant through ONE front door and
+    // separates them by the token's org claim, so the same base URL under a
+    // different org is a DIFFERENT graph and the org must match too. A record
+    // naming none — a flat `SPOR_SERVER`+`SPOR_TOKEN` launch, or one written
+    // before this stamp — can only be matched on the base, which is the
+    // reading it has always had.
+    if (wantOrg && wantOrg !== org) return null;
+    return { base, token: cfg.token(), nodesDir: null };
+  }
+  if (record && record.local_nodes_dir) {
+    return isRemote ? null : { base: null, token: "", nodesDir: record.local_nodes_dir };
+  }
+  return isRemote
+    ? { base, token: cfg.token(), nodesDir: null }
+    : { base: null, token: "", nodesDir: cfg.nodesDir() };
+}
+
+// How long after a run went terminal its lease is still ours to hand back.
+// Nothing reconciles a native record on a timer — it happens when someone runs
+// `spor runs`, or while a worker follows that run — so a `--bg` run can sit
+// unreconciled for hours, by which time its lease has lapsed at the documented
+// 45m TTL and the item may have been claimed by someone else, quite possibly
+// another worker of the SAME person (whom the server's 409-on-another-holder
+// answer does not protect). Past this window the handback is simply not
+// attempted: the key is omitted, which already means "no lease of ours",
+// rather than yanking a live claim.
+const NATIVE_LEASE_HANDBACK_MS = 2700000; // 45m — dec-cc-task-claim-lease's default TTL
+
+// Run the terminal-state contract for the NATIVE-background runs a reconcile
+// left owing it (task-spor-dispatch-native-bg-terminal-detection). The store
+// is synchronous and holds no credential, so it closes such a record with a
+// provisional unenforced outcome and flags `contract_pending`; this is the
+// second write, and the same one the supervised finalizer makes for itself —
+// so a `--bg` run now ends in exactly one of resolved-verified / reported /
+// failed / declined with `terminal_enforced: true`, instead of a permanent
+// best-effort guess (dec-spor-dispatch-terminal-states-supervised-first's v1
+// scope).
+//
+// `scope` bounds WHICH records are settled: this files nodes and releases
+// leases, so a caller that asked about specific runs must not have that done
+// on its behalf for unrelated ones (`spor runs --node x`, a worker following
+// its own runs). A record left unsettled keeps its debt for the next caller
+// that does own it. Omit `scope` for the unfiltered reconcile — `spor runs`
+// with no filter IS the whole store's reconciler.
+//
+// What the contract cannot re-derive it reads off the record: the lease this
+// dispatch established (`release_node`), the project a report artifact is
+// stamped with, the local graph home the launcher resolved, and the graph the
+// run was launched against (`nativeContractDoor`).
+//
+// The agent's final report is the last assistant text in its own transcript,
+// the same rule the supervised stream applies (`nativeRunReportText`) — so a
+// native run can reach `reported` with its hand-back filed, and a `DECLINED:`
+// one routes to triage, instead of every unresolved run reading `failed`.
+async function settleNativeContracts(cfg, records, { scope = null, now = () => Date.now() } = {}) {
+  const home = cfg.userConfigHome();
+  const out = [];
+  for (const record of records || []) {
+    if (
+      !record ||
+      record.launch_mode !== "native-background" ||
+      !record.contract_pending ||
+      !record.node_id ||
+      !dispatchRuns.TERMINAL_STATES.has(record.state) ||
+      (scope && !scope.has(record.run_id))
+    ) {
+      out.push(record);
+      continue;
+    }
+    const door = nativeContractDoor(cfg, record);
+    if (!door) {
+      out.push(record); // not this process's graph to answer for
+      continue;
+    }
+    // A concurrent reconciler may have settled it between the read above and
+    // now; the contract writes to the graph, so skip rather than re-run it.
+    const fresh = dispatchRuns.readJson(dispatchRuns.runPaths(home, record.run_id).record);
+    if (!fresh || !fresh.contract_pending) {
+      out.push(fresh || record);
+      continue;
+    }
+    const closedAt = Date.parse(fresh.finished_at || "") || 0;
+    const leaseOurs = !!fresh.release_node && (!closedAt || now() - closedAt <= NATIVE_LEASE_HANDBACK_MS);
+    let contract = null;
+    try {
+      contract = await dispatchTerminal.applyTerminalContract({
+        base: door.base,
+        token: door.token,
+        nodesDir: door.nodesDir,
+        nodeId: fresh.node_id,
+        releaseNode: leaseOurs ? fresh.release_node : null,
+        project: fresh.project || null,
+        runId: fresh.run_id,
+        harness: fresh.harness,
+        state: fresh.state,
+        reportText: dispatchRuns.nativeRunReportText(fresh),
+      });
+    } catch (e) {
+      contract = dispatchTerminal.unenforcedOutcome(fresh.state, `the terminal-state contract failed to run: ${e.message}`);
+    }
+    out.push(dispatchRuns.settleNativeOutcome(home, fresh, contract) || fresh);
+  }
+  return out;
+}
+
 // Active background agents keyed by node id (task-spor-cli-in-flight-surface).
 // `spor dispatch` names each background agent after the node id it works
 // (cmdDispatch: name = name || nodeId), so `claude agents --json` lets the queue
@@ -8991,17 +9187,42 @@ async function launchSupervisedHarness(cfg, {
 // plus its own transcript, a supervised one from its supervisor process plus
 // its own log — and written back, after which the run has a durable terminal
 // state, a classification, a reason, and a diagnostic pointer, whatever
-// happened to it. No LLM and no network: a live-agent listing, a directory
-// read, a pid probe, and a bounded file tail.
+// happened to it. No LLM: a live-agent listing, a directory read, a pid probe,
+// and a bounded file tail.
 //
 // Only the live-agent listing can fail, and it is only the native path's
 // evidence — hence `enumerated` gating that path alone, and the listing being
 // taken only when a non-terminal native record exists to spend it on
 // (nativeAgentEvidence).
-function cmdRuns(cfg, { values, positionals: pos }) {
+//
+// It is no longer network-free, and deliberately so
+// (task-spor-dispatch-native-bg-terminal-detection). Reconciling a
+// NATIVE-background run to terminal is now the moment its terminal-state
+// contract can run, and nothing else is going to run it — a `--bg` launch keeps
+// no supervisor. So a native run this call closes (or found already owing the
+// contract) is settled here: the verify re-read, and on a verified not-done the
+// report filing and lease handback §6 prescribes. That is the same work a
+// supervised run's own supervisor does at its exit, moved to the only process
+// that observes a native one ending. Bounded and once-only — the debt is the
+// record's `contract_pending` flag, cleared by the settle — and it is skipped
+// entirely for a record that owes nothing, so a store of supervised runs makes
+// no calls at all.
+async function cmdRuns(cfg, { values, positionals: pos }) {
   const home = cfg.userConfigHome();
   const { agents, enumerated } = nativeAgentEvidence(cfg, dispatchRuns.readRunRecords(home));
-  const records = dispatchRuns.reconcileRuns(home, { agents, enumerated });
+  const closed = dispatchRuns.reconcileRuns(home, { agents, enumerated, stopAgent: makeAgentReaper(cfg) });
+  // …then the second write the store could not make for itself: the terminal-
+  // state contract for any native run it just closed (settleNativeContracts).
+  // `spor runs` is the surface that PRINTS the outcome, so it must be the
+  // settled one, not the provisional beat.
+  // Scoped to what this call ASKED about: settling files nodes and releases
+  // leases, so `spor runs --node x` must not do that on the operator's behalf
+  // for unrelated runs. An unfiltered `spor runs` IS the whole store's
+  // reconciler and settles everything it just closed.
+  const asked = values.node || pos[0]
+    ? new Set(dispatchRuns.listRuns(home, { records: closed, node: values.node || null, runId: pos[0] || null }).map((r) => r.run_id))
+    : null;
+  const records = await settleNativeContracts(cfg, closed, { scope: asked });
   const limit = Math.max(1, parseInt(values.limit, 10) || 20); // a bad --limit falls back to the default, never to 1
   const runs = dispatchRuns.listRuns(home, { records, node: values.node || null, runId: pos[0] || null, limit });
   // `reconciled` is the honest claim "every run here was resolved against live
@@ -10268,6 +10489,14 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     const nativeRun = dispatchRuns.beginNativeRun(cfg.userConfigHome(), {
       harness: harnessAdapter.id, name, nodeId, cwd: launchDir, model: effectiveModel || null,
       readOnly: !!readOnlyPosture,
+      // The three facts the terminal-state contract will need when this run is
+      // reconciled, from the launcher that alone knows them — the same three
+      // the supervised launch writes into its job file.
+      releaseNode: claimEstablished ? nodeId : null,
+      project: res.slug || null,
+      localNodesDir: cfg.mode() === "remote" ? null : cfg.nodesDir(),
+      server: cfg.mode() === "remote" ? remote.base(cfg) : null,
+      org: cfg.mode() === "remote" ? (cfg.tenant() || {}).org || null : null,
     });
     // The agent's git must follow launchDir (its worktree, or the target checkout),
     // so hand it an env scrubbed of the git location vars — an ambient GIT_DIR
@@ -10449,7 +10678,13 @@ async function verifyRunResolution(cfg, record) {
   try {
     job = JSON.parse(fs.readFileSync(dispatchRuns.runPaths(cfg.userConfigHome(), record.run_id).job, "utf8"));
   } catch { /* the job file has been pruned, or predates local_nodes_dir */ }
-  return dispatchTerminal.verifyLocalResolution((job && job.local_nodes_dir) || cfg.nodesDir(), nodeId);
+  // The record's own stamp first (a native launch has no job file at all), then
+  // the job file, then this process's cwd-resolved home. All three can differ
+  // under a repo `graph:` binding, and only the first two are the LAUNCHER's.
+  return dispatchTerminal.verifyLocalResolution(
+    (record && record.local_nodes_dir) || (job && job.local_nodes_dir) || cfg.nodesDir(),
+    nodeId
+  );
 }
 
 // Whether the graph this worker talks to is the one the run was dispatched
@@ -10536,7 +10771,14 @@ async function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, idleMs = 0, warn = () =
     cfg,
     dispatchRuns.readRunRecords(home).filter((r) => r && wanted.has(r.run_id))
   );
-  const records = dispatchRuns.reconcileRuns(home, { agents, enumerated });
+  // Scoped to the runs this worker is following: a manual `spor dispatch --bg`
+  // someone left pending in another repo is not this worker's to file a report
+  // for or hand a lease back on.
+  const records = await settleNativeContracts(
+    cfg,
+    dispatchRuns.reconcileRuns(home, { agents, enumerated, stopAgent: makeAgentReaper(cfg) }),
+    { scope: wanted }
+  );
   const found = new Map();
   for (const r of records) if (r && wanted.has(r.run_id)) found.set(r.run_id, r);
   // Answer for EVERY id asked about, including one the store no longer holds:
@@ -16699,7 +16941,14 @@ const COMMANDS = {
       "auth — re-dispatch with headroom), launch, failed, completed, unknown.\n\n" +
       "A run still inside its first minute, or one whose harness could not be\n" +
       "queried at all, is left alone rather than declared dead. Terminal records\n" +
-      "age out after dispatch.runRetentionMs (default 14d).",
+      "age out after dispatch.runRetentionMs (default 14d).\n\n" +
+      "A finished --bg agent does NOT leave the harness daemon: it sits idle with\n" +
+      "its last turn closed. Such a run is reconciled done anyway, its agent is\n" +
+      "stopped to free the slot, and — since no supervisor exists to do it — its\n" +
+      "terminal-state contract runs here: the target is re-read on the graph, and\n" +
+      "an unresolved run files its final report and hands its lease back\n" +
+      "(WORKERS.md 6). So this reads the graph, and may write to it, for a native\n" +
+      "run it just closed; a store of supervised runs makes no calls at all.",
     options: {
       node: { type: "string", value: "id", desc: "only runs dispatched for this node id" },
       limit: { type: "string", value: "N", desc: "how many runs to show (default 20)" },
@@ -17045,7 +17294,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget };
+module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget };
 
 if (require.main === module) {
   main()

@@ -705,13 +705,23 @@ test("capBytes never leaves a mangled codepoint at the cut", () => {
   assert.ok(!cut.includes("\uFFFD"));
 });
 
-test("a native-background run reconciles to an UNENFORCED outcome and never reads resolved", () => {
+test("a native-background run's RECONCILE leaves a provisional unenforced outcome, owing the contract", () => {
+  // The store is synchronous and holds no credential, so it can only close the
+  // record — never verify it (task-spor-dispatch-native-bg-terminal-detection).
+  // What it must leave is an honest reading plus the debt: `contract_pending`
+  // for the caller that does hold a graph door (settleNativeContracts). Until
+  // that lands the record can never read `resolved`, exactly as before.
   const home = scratch("spor-terminal-native-");
   const dir = path.join(home, "journal", "dispatch");
   fs.mkdirSync(dir, { recursive: true });
   const created = new Date(Date.now() - 600000).toISOString();
+  // The run's OWN transcript is what makes it judgeable — see the no-transcript
+  // case below.
+  const projects = path.join(home, "projects", home.replace(/[^A-Za-z0-9]/g, "-"));
+  fs.mkdirSync(projects, { recursive: true });
+  fs.writeFileSync(path.join(projects, "sid-n1.jsonl"), `${JSON.stringify({ type: "system", subtype: "turn_duration" })}\n`);
   runner.atomicJson(path.join(dir, "n1.run.json"), {
-    run_id: "n1", node_id: "task-x", name: "task-x", harness: "claude-code",
+    run_id: "n1", node_id: "task-x", name: "task-x", harness: "claude-code", session_id: "sid-n1",
     launch_mode: "native-background", state: "running", cwd: home, created_at: created,
   });
   const [record] = runner.reconcileRuns(home, { agents: [], enumerated: true, env: { CLAUDE_CONFIG_DIR: home } });
@@ -719,7 +729,47 @@ test("a native-background run reconciles to an UNENFORCED outcome and never read
   assert.strictEqual(record.terminal_enforced, false);
   assert.ok(terminal.TERMINAL_OUTCOMES.includes(record.terminal_state));
   assert.notStrictEqual(record.terminal_state, "resolved");
-  assert.match(record.terminal_note, /outside the terminal-state contract/);
+  assert.match(record.terminal_note, /had not finished running/);
+  assert.strictEqual(record.contract_pending, true, "the second write is owed, not skipped");
+});
+
+test("a native-background run with NO target node keeps the permanent unenforced stamp", () => {
+  // A free-text `--bg` dispatch: there is nothing to verify, report against or
+  // release, so nothing is owed and the record is classified once and for all.
+  const home = scratch("spor-terminal-native-freetext-");
+  const dir = path.join(home, "journal", "dispatch");
+  fs.mkdirSync(dir, { recursive: true });
+  runner.atomicJson(path.join(dir, "n2.run.json"), {
+    run_id: "n2", name: "some-task", harness: "claude-code",
+    launch_mode: "native-background", state: "running", cwd: home,
+    created_at: new Date(Date.now() - 600000).toISOString(),
+  });
+  const [record] = runner.reconcileRuns(home, { agents: [], enumerated: true, env: { CLAUDE_CONFIG_DIR: home } });
+  assert.strictEqual(record.terminal_enforced, false);
+  assert.ok(!record.contract_pending, "nothing to verify — no debt is recorded");
+  assert.match(record.terminal_note, /named no target node/);
+});
+
+test("a native-background run with NO attributable transcript owes nothing either", () => {
+  // A run that never bound a session (captureDispatchSession gives up rather
+  // than guess), or a bound one whose transcript is gone. All this box knows is
+  // that no agent is listed — which is not evidence about the WORK, so running
+  // the contract would file an empty report as a VERIFIED `failed` and hand the
+  // lease back on the strength of nothing. It keeps its unenforced reading, and
+  // its lease, exactly as before.
+  const home = scratch("spor-terminal-native-blind-");
+  const dir = path.join(home, "journal", "dispatch");
+  fs.mkdirSync(dir, { recursive: true });
+  runner.atomicJson(path.join(dir, "n3.run.json"), {
+    run_id: "n3", node_id: "task-x", name: "task-x", harness: "claude-code",
+    launch_mode: "native-background", state: "running", cwd: home, release_node: "task-x",
+    created_at: new Date(Date.now() - 600000).toISOString(),
+  });
+  const [record] = runner.reconcileRuns(home, { agents: [], enumerated: true, env: { CLAUDE_CONFIG_DIR: home } });
+  assert.strictEqual(record.termination_signal, "session-unbound");
+  assert.strictEqual(record.terminal_enforced, false);
+  assert.ok(!record.contract_pending, "nothing to judge it by — no contract is owed");
+  assert.match(record.terminal_note, /no transcript can be attributed/);
 });
 
 test("a supervised run whose supervisor died reconciles unenforced too", () => {
