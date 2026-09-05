@@ -2679,6 +2679,72 @@ test("end to end: a failing gate cools the item, files an escalation, and says s
   assert.match(status.stdout, /skipped:\s+task-ready — gate pipeline failed/);
 });
 
+// A test that deliberately abandons a dispatch owns what it abandoned. `spor
+// work` walking away from an in-flight fix cycle leaves a DETACHED supervisor
+// leading its own process group (the harness child and anything it spawned);
+// killing the worker does not touch it, so it outlives the test PROCESS and
+// writes its run record into the scratch home `tmp-cleanup` removed at exit —
+// re-creating the directory as a `journal/`-only husk nothing ever collects
+// (issue-spor-gate-stop-tests-leak-scratch-homes). So the test ends it, on the
+// same terms `spor work` ends an idle run.
+//
+// It sweeps this home's RUN RECORDS rather than a run id the test hands it,
+// because the window it must cover is exactly the one where the test HAS no id
+// to hand: `spor dispatch` opens the record, detaches the supervisor and stamps
+// its pid well before `gate_fix_run_id` is stamped on the pipeline's own record
+// (bin/spor.js), so a timeout or a failed assertion in between reached a
+// cleanup keyed on that id with nothing to stop — leaking the straggler on the
+// very path most likely to produce one. The record is the durable name: the
+// launcher writes it at `launching` before the supervisor exists and stamps
+// `runner_pid` on it itself, so every launch this home made is named here
+// whether or not the test ever learned its id.
+//
+// The wait is not optional: before that stamp there is no pid to signal, and a
+// stop that found no pid would leave exactly the straggler it exists to
+// prevent. It never waits on a launch that already FAILED (the launcher closes
+// that record itself), it is bounded, and it returns its reading rather than
+// throwing, so a cleanup that cannot run never masks the assertion failure that
+// sent us here. Two passes, because a record stamped while the first pass was
+// signalling its siblings is a check-then-signal race the second pass closes;
+// re-stopping an already-dead run costs nothing (`stopRun` finds no one to
+// signal and returns without sleeping).
+async function stopOrphanedRuns(home, { deadlineMs = 10000, passes = 2 } = {}) {
+  const reading = { ok: false, records: 0, signalled: [], alive: [], midLaunch: [], error: null };
+  try {
+    const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+    const deadline = Date.now() + deadlineMs;
+    const unstamped = (r) => !r.runner_pid && !dispatchRuns.TERMINAL_STATES.has(r.state);
+    for (let pass = 0; pass < passes; pass++) {
+      let records = [];
+      for (;;) {
+        records = dispatchRuns.readRunRecords(home);
+        if (!records.some(unstamped) || Date.now() > deadline) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      reading.records = records.length;
+      reading.alive = [];
+      reading.midLaunch = records.filter(unstamped).map((r) => r.run_id);
+      for (const record of records) {
+        if (!record.runner_pid) continue;
+        // graceMs low on purpose: this stub traps nothing, so the SIGTERM is
+        // the whole stop and the grace is only the window before the SIGKILL
+        // that makes it certain.
+        const stopped = await dispatchRuns.stopRun(record, { graceMs: 500 });
+        if (stopped.supervisor || stopped.child || stopped.group) reading.signalled.push(record.run_id);
+        if (stopped.alive) reading.alive.push(record.run_id);
+      }
+      // `records` in the verdict, not just the survivors: a sweep that found
+      // NOTHING to sweep is a sweep pointed at the wrong place (a renamed
+      // journal dir, a moved home), and reading that as a clean home is how a
+      // cleanup nobody checks comes back.
+      reading.ok = !!reading.records && !reading.alive.length && !reading.midLaunch.length;
+    }
+  } catch (error) {
+    reading.error = String((error && error.stack) || error);
+  }
+  return reading;
+}
+
 // end to end: SIGTERM mid fix-cycle (issue-spor-work-stop-abandons-inflight-
 // gates). A real `spor work` process, no --once — it must keep running until
 // stopped. The declared harness answers a plain dispatch immediately but HANGS
@@ -2724,10 +2790,10 @@ test("a single SIGTERM mid fix-cycle stops the worker promptly and leaves a dura
   const outfile = path.join(home, "invocations.jsonl");
   // A plain dispatch (the initial claim) answers immediately, as every other
   // fixture's stub does. A FIX-CYCLE dispatch — its prompt names the gate that
-  // refused the resolution (makeGateDeps' `fix`, bin/spor.js) — never answers:
-  // it self-exits after a few seconds purely so this test does not leak a
-  // process, but that is well past when this test has already killed the
-  // worker and made its assertions.
+  // refused the resolution (makeGateDeps' `fix`, bin/spor.js) — never answers,
+  // which is what leaves the worker stuck mid-`awaitGateRun`. Its 5s self-exit
+  // is only a backstop for a stop that could not run: the test's own cleanup
+  // ends this process (and its supervisor) well before the timer fires.
   const stub = writeSpawnableNodeStub(
     home,
     "gate-stub",
@@ -2765,6 +2831,9 @@ process.stdin.on("end", () => {
   let stderr = "";
   child.stderr.on("data", (c) => (stderr += c));
 
+  // Hoisted so the cleanup's reading survives the try/finally; the cleanup
+  // itself needs NOTHING this block computes — see stopOrphanedRuns above.
+  let orphanStop = null;
   try {
     // Wait for the fix cycle to actually be dispatched (two harness
     // invocations recorded: the initial claim, then the fix).
@@ -2813,15 +2882,26 @@ process.stdin.on("end", () => {
     assert.match(runs.stdout, /gate:\s+interrupted/);
     assert.match(runs.stdout, new RegExp(`fix cycle:\\s+run ${fixRunId.slice(0, 8)}`));
   } finally {
-    // Best-effort cleanup: the fix-cycle harness self-exits after 5s regardless,
-    // but do not leave the worker (if somehow still alive) or its child around
-    // for the rest of the suite.
+    // The worker first — it is already gone by every path above, but a SIGTERM
+    // it somehow ignored must not outlive this test.
     try {
       child.kill("SIGKILL");
     } catch {
       /* already gone */
     }
+    // ...then every dispatch this home launched — including the pipeline the
+    // worker was told to walk away FROM, which nothing else in this process
+    // owns and which the paths that reach here early never got to name. See
+    // stopOrphanedRuns above.
+    orphanStop = await stopOrphanedRuns(home);
   }
+  // Pinned, not merely attempted: the leak this closes is precisely "the test
+  // returned while something of its own was still running", and a best-effort
+  // cleanup nobody checks is how it came back.
+  assert.ok(
+    orphanStop.ok,
+    `every run this test launched must be gone before it returns, or one writes its record back into ${home} after the suite has deleted it: ${JSON.stringify(orphanStop)}`
+  );
 });
 
 // ------------------------------------------------------ empty diff, fail closed --
