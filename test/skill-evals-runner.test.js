@@ -86,7 +86,7 @@ test('runCase against the real claude binary: a scripted Skill tool_use is detec
     assert.strictEqual(detectTrigger(stdout, 'spor:factory'), true);
   } finally {
     await fake.close();
-    scratch.cleanup();
+    await scratch.cleanup();
   }
 });
 
@@ -104,7 +104,7 @@ test('runCase against the real claude binary: a scripted plain-text reply is det
     assert.strictEqual(detectTrigger(stdout, 'spor:factory'), false);
   } finally {
     await fake.close();
-    scratch.cleanup();
+    await scratch.cleanup();
   }
 });
 

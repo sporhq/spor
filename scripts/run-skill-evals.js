@@ -182,7 +182,7 @@ async function main() {
       }
     }
   } finally {
-    scratch.cleanup();
+    await scratch.cleanup();
   }
 
   console.log(`skill-evals: ${total - failures}/${total} passed`);

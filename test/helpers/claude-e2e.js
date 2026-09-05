@@ -110,6 +110,75 @@ function git(dir, args) {
   spawnSync("git", ["-c", "user.email=e2e@test", "-c", "user.name=e2e", ...args], { cwd: dir, stdio: "ignore" });
 }
 
+// Find every process whose environment contains at least one of `markers` as a
+// substring (Linux /proc only; returns [] anywhere else — best-effort, same
+// posture as the rest of this file's process introspection). Used to find a
+// detached grandchild that outlives the `claude` process we spawned: it
+// inherited our unique scratch-dir env values at fork time, and keeps them
+// even if it double-forks and reparents to init, which drops it out of any
+// pid/ppid chain we could have recorded up front
+// (task-spor-e2e-claude-scratch-home-leak).
+function markedPids(markers) {
+  let entries;
+  try {
+    entries = fs.readdirSync("/proc");
+  } catch {
+    return [];
+  }
+  const pids = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    let environ;
+    try {
+      environ = fs.readFileSync(`/proc/${entry}/environ`, "utf8");
+    } catch {
+      continue; // exited between readdir and read, or not ours to read
+    }
+    if (markers.some((m) => environ.includes(m))) pids.push(Number(entry));
+  }
+  return pids;
+}
+
+function killSignal(pid, signal) {
+  try {
+    process.kill(pid, signal);
+    return true;
+  } catch {
+    return false; // already gone, or not permitted
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Stop every process marked by `markers`, then remove `paths` — in that
+// order, so a straggler that is still writing into one of `paths` cannot
+// recreate it the instant after we delete it. SIGTERM first, escalate to
+// SIGKILL for anything still alive past `deadlineMs`; two passes because a
+// process that forks a beat late (a check-then-signal race) can still slip in
+// between the first pass's scan and its own rmSync, and the second pass's
+// scan catches exactly that (same reasoning as gate-pipeline's
+// stopOrphanedRuns). Cheap when there is nothing to reap: each pass costs one
+// /proc scan and no sleep unless it actually finds a pid.
+async function reapAndClean(markers, paths, { deadlineMs = 2000, stepMs = 100, passes = 2 } = {}) {
+  for (let pass = 0; pass < passes; pass++) {
+    let pids = markedPids(markers);
+    const deadline = Date.now() + deadlineMs;
+    while (pids.length && Date.now() < deadline) {
+      for (const pid of pids) killSignal(pid, "SIGTERM");
+      await sleep(stepMs);
+      pids = markedPids(markers);
+    }
+    for (const pid of pids) killSignal(pid, "SIGKILL");
+    for (const p of paths) {
+      try {
+        fs.rmSync(p, { recursive: true, force: true });
+      } catch {
+        /* best effort */
+      }
+    }
+  }
+}
+
 // Create a scratch graph home (git-inited) plus a project checkout whose project slug is
 // `slug`. The project dir is its own git repo so projectSlug() (git toplevel basename)
 // resolves deterministically to `slug` rather than to some ancestor repo of os.tmpdir().
@@ -136,13 +205,13 @@ function makeScratchGraph({ slug = "e2eproj", nodes = [] } = {}) {
     nodesDir,
     cwd,
     slug,
-    cleanup: () => {
-      try {
-        fs.rmSync(root, { recursive: true, force: true });
-      } catch {
-        /* best effort */
-      }
-    },
+    // Async: a caller that had detached work outliving `claude` (the
+    // SessionEnd distiller) should already have waited for it before calling
+    // this, but a run that never finished in time still leaves a grandchild
+    // writing into `home` — reap it (tagged by SPOR_HOME=home in its
+    // environment) before removing `root`, or it recreates a `spor-e2e-*`
+    // husk right after this deletes it (task-spor-e2e-claude-scratch-home-leak).
+    cleanup: () => reapAndClean([home], [root]),
   };
 }
 
@@ -246,6 +315,16 @@ function runClaude({
       } catch {
         /* non-JSON / crash */
       }
+      // NOT reaped here: the SessionEnd hook is declared `"async": true` in
+      // hooks.json, so Claude Code does not wait for it before letting this
+      // `claude` process exit — the `spor-hook distill` invocation it fires
+      // inherits this same CLAUDE_CONFIG_DIR/HOME and can still be genuinely
+      // at work the instant we get here. Killing anything tagged with these
+      // paths on this exact event would race the SessionEnd distiller itself,
+      // not just a harmless daemon — the caller that actually depends on that
+      // work (the SessionEnd distill test) waits for it on its own terms and
+      // reaps what's left via makeScratchGraph's cleanup, tagged by SPOR_HOME
+      // instead (task-spor-e2e-claude-scratch-home-leak).
       for (const p of [configDir, fakeHome, outPath, errPath]) {
         try {
           fs.rmSync(p, { recursive: true, force: true });
@@ -272,7 +351,6 @@ function runClaude({
 
 // Poll `fn` until it returns truthy or the deadline passes. Used for the async SessionEnd
 // distill, which writes its node after claude has already exited.
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function waitFor(fn, { timeoutMs = 15000, stepMs = 200 } = {}) {
   const end = Date.now() + timeoutMs;
   for (;;) {

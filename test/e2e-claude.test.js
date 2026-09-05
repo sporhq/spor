@@ -114,7 +114,7 @@ test(
       assert.doesNotMatch(injected, /127\.0\.0\.1:8787|team graph:/, "must not leak the live team graph");
     } finally {
       await fake.close();
-      g.cleanup();
+      await g.cleanup();
     }
   }
 );
@@ -141,7 +141,7 @@ test("Tier 0: the digest relevance gate suppresses a digest for an off-topic pro
     assert.doesNotMatch(injected, /widget thumbnail caching/, "no digest means no matching node");
   } finally {
     await fake.close();
-    g.cleanup();
+    await g.cleanup();
   }
 });
 
@@ -192,7 +192,7 @@ test("Tier 1: a tool_use round-trip executes a real Write and fires the PostTool
     assert.ok(calls.length >= 1, "the nudge classifier call should be recorded to llm-calls");
   } finally {
     await fake.close();
-    g.cleanup();
+    await g.cleanup();
   }
 });
 
@@ -228,6 +228,6 @@ test("SessionEnd distill writes a node into the scratch graph (async, real Sessi
     assert.match(md, /distilled by the SessionEnd hook/);
   } finally {
     await fake.close();
-    g.cleanup();
+    await g.cleanup();
   }
 });
