@@ -60,6 +60,18 @@ test("isCouplingNorm: type, liveness, and both-keys gates", () => {
   assert.ok(!c.isCouplingNorm(NORM({ couples_when: "src/**" })));
 });
 
+test("TERMINAL: a back-compat static Set alias for isCouplingTerminal (issue-spor-terminal-status-validation-regressions) — a caller destructuring the old export shape never gets undefined", () => {
+  assert.ok(c.TERMINAL instanceof Set);
+  assert.ok(c.TERMINAL.size > 0);
+  // Every member reads terminal through the function, and nothing terminal
+  // through the function is missing from the set — they must never diverge.
+  for (const status of c.TERMINAL) assert.ok(c.isCouplingTerminal(status), `TERMINAL has ${status} but isCouplingTerminal doesn't`);
+  for (const status of ["done", "resolved", "retired", "deprecated", "merged", "completed"]) {
+    assert.strictEqual(c.TERMINAL.has(status), c.isCouplingTerminal(status));
+  }
+  assert.ok(!c.TERMINAL.has("open"));
+});
+
 test("scope: unstamped = everywhere; stamped = own repo; applies_to_* narrows strictly", () => {
   const ctx = { slug: "projx", relPath: "src/a.js", repoTags: [] };
   // unstamped global norm fires anywhere

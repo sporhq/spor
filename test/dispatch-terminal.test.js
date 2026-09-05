@@ -390,6 +390,56 @@ test("local mode: a capture-pending retired by STATUS (merged) also resolves via
   assert.match(patch.terminal_note, /status 'merged' is terminal/);
 });
 
+// A resident `type: schema, kind: register` node overriding the
+// `terminal-status` register — the local-graph mirror of
+// schemaSnapshotWithExtraTerminalStatus above
+// (issue-spor-terminal-status-validation-regressions).
+function residentTerminalStatusRegister(id, extraIds) {
+  const classes = extraIds.map((cid) => `    { "id": "${cid}", "description": "test-only resident addition" }`).join(",\n");
+  return [
+    `${id}.md`,
+    [
+      "---",
+      `id: ${id}`,
+      "type: schema",
+      "kind: register",
+      "schema_version: 2026.09.05.1",
+      `title: Test-only terminal-status register override`,
+      "summary: Test fixture adding a custom terminal status.",
+      "date: 2026-09-05",
+      "---",
+      "",
+      "```json",
+      "{",
+      '  "register": "terminal-status",',
+      '  "description": "test fixture",',
+      '  "classes": [',
+      classes,
+      "  ]",
+      "}",
+      "```",
+      "",
+    ].join("\n"),
+  ];
+}
+
+test("local mode: a resident `terminal-status` register override is honored — a custom universal terminal status resolves a status-only type with no per-type declaration of its own (issue-spor-terminal-status-validation-regressions)", async () => {
+  const nodesDir = localNodesDir(Object.fromEntries([
+    localNode("cap-x", "capture-pending", { status: "archived" }),
+    residentTerminalStatusRegister("schema-register-terminal-status-org", ["archived"]),
+  ]));
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, base: null, nodesDir, nodeId: "cap-x", releaseNode: "cap-x", state: "done",
+  });
+  // The shipped seed pack alone has no "archived" anywhere, so before this
+  // fix the local verify leg would have read this as not-yet-resolved and
+  // fallen through to unenforced `reported` — risking a duplicate dispatch
+  // onto work this graph already considers done.
+  assert.strictEqual(patch.terminal_state, "resolved");
+  assert.strictEqual(patch.terminal_enforced, true);
+  assert.match(patch.terminal_note, /status 'archived' is terminal/);
+});
+
 test("local mode: a missing/unreadable graph home fails closed to unenforced instead of throwing", async () => {
   const patch = await terminal.applyTerminalContract({
     ...BASE, base: null, nodesDir: "/no/such/spor/nodes/dir", nodeId: "task-x", state: "done",
@@ -512,6 +562,36 @@ test("a capture-pending retired by STATUS (merged) also resolves via the univers
   });
   assert.strictEqual(patch.terminal_state, "resolved");
   assert.strictEqual(patch.terminal_enforced, true);
+});
+
+// A schema snapshot with the live `terminal-status` register's classes
+// extended — the shape `GET /v1/schema` echoes back for a graph carrying a
+// resident `schema-register-terminal-status` override
+// (issue-spor-terminal-status-validation-regressions).
+function schemaSnapshotWithExtraTerminalStatus(...extraIds) {
+  const snap = JSON.parse(JSON.stringify(SEED_SCHEMA_SNAPSHOT));
+  const reg = snap.registers.find((r) => r.name === "terminal-status");
+  for (const id of extraIds) reg.classes.push({ id, description: "test-only resident addition" });
+  return snap;
+}
+
+test("a resident `terminal-status` register override is honored by remote dispatch: a custom universal terminal status resolves a status-only type with no per-type declaration of its own (issue-spor-terminal-status-validation-regressions)", async () => {
+  const t = transport({
+    "GET /v1/nodes/cap-x": { ok: true, status: 200, json: { id: "cap-x", type: "capture-pending", status: "archived" } },
+    "GET /v1/schema": { ok: true, status: 200, json: schemaSnapshotWithExtraTerminalStatus("archived") },
+  });
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, nodeId: "cap-x", releaseNode: "cap-x", state: "done",
+    reportText: "Retired under this org's own custom terminal status.", request: t.call,
+  });
+  // The shipped seed pack alone has no "archived" anywhere (not in the
+  // type-blind fallback, not in capture-pending's own declared terminal
+  // partition — it has none), so before this fix the run would have read
+  // `reported`, filing a redundant report and risking a duplicate dispatch
+  // onto work this tenant already considers done.
+  assert.strictEqual(patch.terminal_state, "resolved");
+  assert.strictEqual(patch.terminal_enforced, true);
+  assert.match(patch.terminal_note, /status 'archived' is terminal for 'capture-pending' nodes/);
 });
 
 test("a filed report reads `reported`, fully enforced, for a status-only type whose status has not yet gone terminal", async () => {
