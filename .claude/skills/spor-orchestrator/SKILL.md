@@ -851,8 +851,8 @@ spor dispatch --node <infra-id> --no-worktree --bg --permission-mode bypassPermi
 - The infra template (`assets/infra-agent-prompt.md`) tells the agent to load the
   `swamp` skill, change the model, **perform the deploy itself** (authorized — get
   explicit user sign-off that deploys are delegated and prod disruption is
-  acceptable *before* enabling this slot), verify it, resolve the node, and commit
-  the model change. "Done" = node resolved on the graph (deploy performed or the
+  acceptable *before* enabling this slot), verify it, commit the model change, and
+  resolve the node. "Done" = node resolved on the graph (deploy performed or the
   node's own "accept the gap" path taken), exactly like a code agent.
 - **You do not merge infra** — there's no CAS merge and no merge-subagent. When
   the infra agent's node resolves, read its report to confirm what it deployed (or
@@ -942,9 +942,9 @@ dispatch time.
 There are four per-agent workflows, all supplied as the dispatch `--template`:
 
 - **Code agents** — `assets/agent-prompt.md`: brief → implement in its worktree →
-  loop `/code-review` until clean → verify → resolve the node (resolver node +
-  `resolves` edge, then terminal status) → commit on its branch (it does **not**
-  merge — your merge-subagent does).
+  loop `/code-review` until clean → verify → commit on its branch → resolve the
+  node (resolver node + `resolves` edge, then terminal status) — it does **not**
+  merge (your merge-subagent does).
 - **Codex implementer** — `assets/codex-agent-prompt.md`: brief (read-only) →
   implement in its worktree → self-review → verify → commit on its branch,
   ending with a `MERGE-READY`/`BLOCKED` verdict. It does **not** write the
@@ -952,7 +952,7 @@ There are four per-agent workflows, all supplied as the dispatch `--template`:
   for the orchestrator-resolves-before-status-check contract this requires.
 - **Infra/swamp agent** — `assets/infra-agent-prompt.md`: brief → change the
   swamp model on the real checkout → **deploy via the `swamp` CLI** → verify →
-  resolve the node → commit the model change (it owns the deploy; you don't
+  commit the model change → resolve the node (it owns the deploy; you don't
   merge).
 - **Solo / in-place agent** — `assets/agent-prompt-inplace.md`: brief →
   implement directly on the shared checkout, under shared-checkout discipline
