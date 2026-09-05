@@ -10296,7 +10296,21 @@ async function verifyRunResolution(cfg, record) {
       return null; // an unreachable graph is not evidence of anything
     }
     if (!res || !res.ok) return null;
-    return dispatchTerminal.resolvedOutcomeFromNode(res.json || {});
+    const node = res.json || {};
+    const type = String(node.type || "").toLowerCase();
+    // Ask the LIVE registry, not the shipped seed pack
+    // (issue-spor-remote-dispatch-ignores-resident-resolution-hooks) — the
+    // same fetch applyTerminalContract makes on its own verify leg, best-effort
+    // (falls back to the seed pack on any failure).
+    const liveFacts = await dispatchTerminal.resolveLiveFacts({
+      type,
+      alreadyResolved: !!(node.resolution && node.resolution.by),
+      fetchSchema: async () => {
+        const r = await remote.get(cfg, "/v1/schema");
+        return r && r.ok ? r.json : null;
+      },
+    });
+    return dispatchTerminal.resolvedOutcomeFromNode(node, liveFacts);
   }
   let job = null;
   try {

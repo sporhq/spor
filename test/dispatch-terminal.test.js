@@ -15,7 +15,18 @@ const { spawn, spawnSync } = require("node:child_process");
 
 const terminal = require("../lib/shell/dispatch-terminal.js");
 const runner = require("../lib/shell/agent-dispatch-runner.js");
-const { parseFrontmatter } = require("../lib/graph.js");
+const graphLib = require("../lib/graph.js");
+const { parseFrontmatter } = graphLib;
+
+// The default `GET /v1/schema` answer for tests that don't care about the
+// live-registry fetch (issue-spor-remote-dispatch-ignores-resident-resolution-
+// hooks): the SEED pack's own snapshot, so a fake transport/server that hasn't
+// been told to override a type's resolution hook answers exactly as the seed
+// pack would — the fetch is present (it happens on every unresolved,
+// typed node) but its VERDICT is byte-identical to the pre-fetch offline
+// reading, so existing tests don't have to reason about it unless they are
+// specifically testing a resident override.
+const SEED_SCHEMA_SNAPSHOT = graphLib.seedRegistry().snapshot();
 
 const RUNNER = path.join(__dirname, "..", "lib", "shell", "agent-dispatch-runner.js");
 
@@ -40,8 +51,16 @@ function transport(plan = {}) {
   const call = async ({ method, path: p, body }) => {
     calls.push({ method, path: p, body });
     const key = Object.keys(plan).find((k) => `${method} ${p}`.startsWith(k));
-    const verdict = key ? plan[key] : { ok: true, status: 200, json: {} };
-    return typeof verdict === "function" ? verdict() : verdict;
+    if (key) {
+      const verdict = plan[key];
+      return typeof verdict === "function" ? verdict() : verdict;
+    }
+    // Unplanned `GET /v1/schema` defaults to the seed snapshot (see
+    // SEED_SCHEMA_SNAPSHOT above) rather than the generic `{}` every other
+    // unplanned call gets — a plan that doesn't care about the live-registry
+    // fetch still exercises a realistic one.
+    if (method === "GET" && p === "/v1/schema") return { ok: true, status: 200, json: SEED_SCHEMA_SNAPSHOT };
+    return { ok: true, status: 200, json: {} };
   };
   return { call, calls };
 }
@@ -406,9 +425,61 @@ test("a decision retired by STATUS resolves once its own status reaches its term
   assert.strictEqual(patch.terminal_enforced, true);
   assert.match(patch.terminal_note, /status 'settled' is terminal for 'decision' nodes/);
   // Verified done the same way an edge-verified type is: nothing filed, nothing
-  // released — the durable `assigned` edge is left as the record.
-  assert.deepStrictEqual(t.calls.map((c) => c.method), ["GET"]);
+  // released — the durable `assigned` edge is left as the record. Two reads,
+  // both GET: the node itself, then the live registry (to tell whether this
+  // type is still status-only, issue-spor-remote-dispatch-ignores-resident-
+  // resolution-hooks).
+  assert.deepStrictEqual(t.calls.map((c) => `${c.method} ${c.path}`), ["GET /v1/nodes/dec-x", "GET /v1/schema"]);
   assert.ok(!("lease_released" in patch));
+});
+
+// A schema snapshot with ONE node type's registry facts overridden, layered
+// onto the real seed snapshot — the shape `GET /v1/schema` echoes back for a
+// graph carrying a resident schema override
+// (issue-spor-remote-dispatch-ignores-resident-resolution-hooks).
+function schemaSnapshotWithOverride(type, patch) {
+  const snap = JSON.parse(JSON.stringify(SEED_SCHEMA_SNAPSHOT));
+  const entry = snap.node_types.find((n) => n.type === type);
+  Object.assign(entry, patch);
+  return snap;
+}
+
+test("a resident override that ADDS a get() hook to a status-only type is honored: a terminal status with no resolving edge no longer over-reads resolved (issue-spor-remote-dispatch-ignores-resident-resolution-hooks)", async () => {
+  const t = transport({
+    "GET /v1/nodes/dec-x": { ok: true, status: 200, json: { id: "dec-x", type: "decision", status: "settled" } },
+    "GET /v1/schema": { ok: true, status: 200, json: schemaSnapshotWithOverride("decision", { hooks: ["get", "validate", "transitions"] }) },
+    "POST /v1/nodes": { ok: true, status: 200, json: { results: [{ ok: true, status: "created" }] } },
+  });
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, nodeId: "dec-x", releaseNode: "dec-x", state: "done",
+    reportText: "Settled the decision, but nothing resolves it on the graph yet.", request: t.call,
+  });
+  // The shipped SEED pack alone (decision has no `get` hook there) would have
+  // read this as status-only and resolved it off the terminal status alone —
+  // the exact over-read this override exists to prevent: this graph now
+  // requires a resolving edge for a decision, and none exists.
+  assert.notStrictEqual(patch.terminal_state, "resolved");
+  assert.strictEqual(patch.terminal_state, "reported");
+  assert.strictEqual(patch.terminal_enforced, true);
+});
+
+test("a resident override that DROPS the get() hook from an edge-verified type is honored: own-status completion now resolves with no edge (issue-spor-remote-dispatch-ignores-resident-resolution-hooks)", async () => {
+  const t = transport({
+    "GET /v1/nodes/task-x": { ok: true, status: 200, json: { id: "task-x", type: "task", status: "done" } },
+    "GET /v1/schema": { ok: true, status: 200, json: schemaSnapshotWithOverride("task", { hooks: [], terminal: ["done", "abandoned"] }) },
+  });
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, nodeId: "task-x", releaseNode: "task-x", state: "done",
+    reportText: "Retired by status alone under this graph's override.", request: t.call,
+  });
+  // The shipped SEED pack alone (task has a `get` hook there) would have kept
+  // demanding a resolving edge and read this genuinely-done node as not
+  // attested — the exact false negative this override exists to prevent.
+  assert.strictEqual(patch.terminal_state, "resolved");
+  assert.strictEqual(patch.terminal_enforced, true);
+  assert.match(patch.terminal_note, /status 'done' is terminal for 'task' nodes/);
+  // Verified done, nothing filed or released — the same as any other resolved read.
+  assert.deepStrictEqual(t.calls.map((c) => `${c.method} ${c.path}`), ["GET /v1/nodes/task-x", "GET /v1/schema"]);
 });
 
 test("a capture-pending retired by STATUS (merged) also resolves via the universal completion words, no per-type declaration needed", async () => {
@@ -444,6 +515,7 @@ test("a filed report reads `reported`, fully enforced, for a status-only type wh
   // released nothing here and left the item stranded for a full lease TTL.
   assert.deepStrictEqual(t.calls.map((c) => `${c.method} ${c.path}`), [
     "GET /v1/nodes/dec-x",
+    "GET /v1/schema",
     "POST /v1/nodes",
     "POST /v1/nodes/dec-x/release",
   ]);
@@ -864,19 +936,19 @@ test("a declined run files a FINDING on the item, clears its agent-ready stamp, 
   assert.match(patch.terminal_note, /returns to triage, not to a gate/);
   assert.deepStrictEqual(
     t.calls.map((c) => `${c.method} ${c.path}`),
-    ["GET /v1/nodes/task-x", "POST /v1/nodes", "POST /v1/nodes/task-x/readiness", "POST /v1/nodes/task-x/release"]
+    ["GET /v1/nodes/task-x", "GET /v1/schema", "POST /v1/nodes", "POST /v1/nodes/task-x/readiness", "POST /v1/nodes/task-x/release"]
   );
-  assert.deepStrictEqual(t.calls[2].body, { readiness: "clear" });
+  assert.deepStrictEqual(t.calls[3].body, { readiness: "clear" });
   // The finding: type finding, relates-to the item (never resolves/blocks), reason in the summary, report in the body.
-  const fm = parseFrontmatter(t.calls[1].body.nodes[0].node);
+  const fm = parseFrontmatter(t.calls[2].body.nodes[0].node);
   assert.strictEqual(fm.type, "finding");
   assert.strictEqual(fm.id, "find-declined-x-run1234a");
   assert.strictEqual(fm.status, "open");
   assert.strictEqual(fm.project, "demo");
   assert.deepStrictEqual(fm.edges, [{ type: "relates-to", to: "task-x" }]);
   assert.match(fm.summary, /declined the item: the server half already shipped/);
-  assert.match(t.calls[1].body.nodes[0].node, /remaining client change is in the spor repo/);
-  assert.strictEqual(t.calls[1].body.nodes[0].if_exists, "skip");
+  assert.match(t.calls[2].body.nodes[0].node, /remaining client change is in the spor repo/);
+  assert.strictEqual(t.calls[2].body.nodes[0].if_exists, "skip");
 });
 
 test("a resolving edge on the graph beats the DECLINED line — the graph wins over the words, and that run is gated as resolved", async () => {
@@ -903,7 +975,7 @@ test("a decline whose finding cannot be filed leaves the lease HELD, still reads
   assert.strictEqual(patch.lease_released, false);
   assert.strictEqual(patch.finding_node_id, undefined);
   assert.match(patch.terminal_note, /left HELD/);
-  assert.deepStrictEqual(t.calls.map((c) => `${c.method} ${c.path}`), ["GET /v1/nodes/task-x", "POST /v1/nodes"]);
+  assert.deepStrictEqual(t.calls.map((c) => `${c.method} ${c.path}`), ["GET /v1/nodes/task-x", "GET /v1/schema", "POST /v1/nodes"]);
 });
 
 test("a decline whose readiness clear is refused still files, still releases, and says what to run", async () => {

@@ -2421,3 +2421,46 @@ test("ladderWidth: the narrowest rung that reaches a depth, never past the cap",
   assert.strictEqual(ladderWidth(101, 25, 200), 200);
   assert.strictEqual(ladderWidth(9999, 25, 200), 200, "a depth past the cap is the cap");
 });
+
+// verifyRunResolution (issue-spor-remote-dispatch-ignores-resident-resolution-
+// hooks): the REMOTE leg used to answer "does this type need a resolving
+// edge?" off the shipped seed pack alone, so a graph-resident schema override
+// that drops the `get()` hook from an edge-verified type (task, here) was
+// invisible to it — a genuinely-done node (retired by its own terminal status
+// under the override) read as unresolved. It now fetches the LIVE registry via
+// `GET /v1/schema` before answering.
+test("verifyRunResolution (remote): a resident override that drops a type's get() hook is honored via the live registry, not the seed pack", async () => {
+  const http = require("node:http");
+  const seedSnap = require("../lib/graph.js").seedRegistry().snapshot();
+  const overridden = JSON.parse(JSON.stringify(seedSnap));
+  const taskEntry = overridden.node_types.find((n) => n.type === "task");
+  taskEntry.hooks = []; // the resident override: task is no longer edge-verified
+  taskEntry.terminal = ["done", "abandoned"];
+  const srv = http.createServer((req, res) => {
+    if (req.method === "GET" && req.url === "/v1/nodes/task-x") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "task-x", type: "task", status: "done" })); // no resolution
+      return;
+    }
+    if (req.method === "GET" && req.url === "/v1/schema") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(overridden));
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+  try {
+    const cfg = offsetCfg(`http://127.0.0.1:${srv.address().port}`);
+    const outcome = await sporCli.verifyRunResolution(cfg, { node_id: "task-x" });
+    // The shipped seed pack alone (task has a `get` hook there) would have kept
+    // demanding a resolving edge and returned null (not resolved) here.
+    assert.ok(outcome, "the live registry override is honored, not just the seed pack");
+    assert.strictEqual(outcome.terminal_state, "resolved");
+    assert.strictEqual(outcome.terminal_enforced, true);
+    assert.match(outcome.terminal_note, /status 'done' is terminal for 'task' nodes/);
+  } finally {
+    srv.close();
+  }
+});
