@@ -174,7 +174,49 @@ async function sessionEndLease({ graph, slug, session, cwd, remote }) {
   // shared reader for post-tool.js's u.appendHeartbeatRecord writer
   // (task-spor-heartbeat-journal-protocol-shape-guard) — don't re-inline this
   // replay loop, or a field rename on one side can silently break the other.
-  const ids = u.readHeartbeatHeldIds(entries);
+  //
+  // issue-spor-sessionend-reserve-release-as-last-event-still-retaken: the
+  // journal-replay heartbeat's own vanish check
+  // (dec-spor-heartbeat-vanished-lease-distinct-from-lapse) only runs on the
+  // NEXT Write/Edit in a project, so a release from ANOTHER terminal that
+  // happens to be the session's LAST event in that repo never gets a
+  // `dropped` record — the replay above would still carry it, and `reserve`
+  // would auto-reclaim a lease this session no longer holds. Run the SAME
+  // assignee=me vanish check once more here, per PROJECT the journal actually
+  // touched (a session that edited more than one repo can hold leases in more
+  // than one pool, so readHeartbeatHeldIds is replayed scoped to each project
+  // in turn rather than once, unfiltered, over the whole journal): any id
+  // still in a project's replayed held-set that has fallen out of that
+  // project's `myItems` ENTIRELY is dropped before it ever reaches the
+  // reserve/release loop below. An ordinary lapse (still assigned, ephemeral
+  // lease merely expired) leaves the id in `myItems` with no `lease_state` —
+  // exactly the signal the heartbeat's own vanished computation relies on —
+  // so a lapsed-but-still-assigned node is untouched here and still reserved,
+  // preserving dec-spor-lease-auto-reclaim-and-deadline-exposure's behavior.
+  // Fail-open PER PROJECT: a dead/slow/unparseable lookup for one project
+  // skips the check for that project's ids only and replays them exactly as
+  // before; it never blocks another project's check or the ids already
+  // resolved.
+  //
+  // Deliberately reuses claimNudge.timeoutMs/CLAIM_NUDGE_TIMEOUT (the same
+  // lease-lookup budget the per-write heartbeat already bounds itself with)
+  // rather than sessionLease.timeoutMs below: this is the identical
+  // assignee=me lookup, just run once more at the SessionEnd boundary, so it
+  // shares that knob rather than growing a third one for the same call shape.
+  const vanishCheckTimeoutMs = u.cfgNum("claimNudge.timeoutMs", "CLAIM_NUDGE_TIMEOUT", 3000);
+  const ids = new Set();
+  for (const project of u.heartbeatJournalProjects(entries)) {
+    const projectIds = u.readHeartbeatHeldIds(entries, project);
+    if (projectIds.size === 0) continue;
+    const myItems = await u.fetchAssigneeMineItems(project, vanishCheckTimeoutMs).catch(() => null);
+    if (Array.isArray(myItems)) {
+      const mineIdsNow = new Set(myItems.filter((i) => i && i.id).map((i) => i.id));
+      for (const id of projectIds) if (mineIdsNow.has(id)) ids.add(id);
+    } else {
+      // lookup unavailable -> fail open, replay this project's ids untouched
+      for (const id of projectIds) ids.add(id);
+    }
+  }
   if (ids.size === 0) return; // no claim held this session
 
   const timeoutMs = u.cfgNum("sessionLease.timeoutMs", "SESSION_LEASE_TIMEOUT", 3000);

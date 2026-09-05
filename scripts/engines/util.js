@@ -1322,6 +1322,19 @@ function readHeartbeatHeldIds(entries, project) {
   return ids;
 }
 
+// The distinct projects a session's claim-heartbeat entries were recorded
+// under — a session that edited more than one repo can hold leases in more
+// than one project's pool, and each needs its own project-scoped
+// `assignee=me` lookup (readHeartbeatHeldIds already scopes the replay itself
+// per project; this is just "which projects did it ever touch").
+function heartbeatJournalProjects(entries) {
+  const projects = new Set();
+  for (const e of entries) {
+    if (e && e.tool === HEARTBEAT_TOOL && typeof e.project === "string") projects.add(e.project);
+  }
+  return projects;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1403,6 +1416,28 @@ function bearer() {
 function serverBase() {
   const v = _config ? _config.server() : home.envDual("SERVER");
   return (v || "").replace(/\/+$/, "");
+}
+
+// The shared "what does this person hold in this project's queue right now"
+// lookup — GET /v1/queue?project=<slug>&assignee=me — used both by
+// post-tool.js's claim heartbeat (per-write) and distill.js's sessionEndLease
+// (the SessionEnd-time re-check, issue-spor-sessionend-reserve-release-as-
+// last-event-still-retaken). Returns the raw `items` array (any lease state,
+// not just held) on a parseable 200, or null on anything that can't be
+// trusted — non-200, dead/slow server, unparseable body — so every caller
+// fails open the exact same way instead of re-deriving the same try/catch.
+async function fetchAssigneeMineItems(slug, timeoutMs) {
+  const mine = await curl(`${serverBase()}/v1/queue?project=${encodeURIComponent(slug)}&assignee=me`, {
+    headers: bearer(),
+    timeoutMs,
+  });
+  if (mine.http !== "200") return null;
+  try {
+    const body = JSON.parse(mine.body);
+    return Array.isArray(body.items) ? body.items : null;
+  } catch {
+    return null;
+  }
 }
 
 // `sed -E 's#^https?://##; s#/.*$##'` over the server URL.
@@ -1929,12 +1964,14 @@ module.exports = {
   HEARTBEAT_TOOL,
   appendHeartbeatRecord,
   readHeartbeatHeldIds,
+  heartbeatJournalProjects,
   loadGraphCached,
   journalLoadMs,
   gcJournal,
   curl,
   bearer,
   serverBase,
+  fetchAssigneeMineItems,
   serverHost,
   parseJsonStream,
   collectTextFields,

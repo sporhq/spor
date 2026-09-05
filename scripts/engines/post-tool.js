@@ -364,18 +364,8 @@ async function claimNudge({ graph, slug, session, cwd, file, remote }) {
   // returns http "000" and we fail open.
   const timeoutMs = u.cfgNum("claimNudge.timeoutMs", "CLAIM_NUDGE_TIMEOUT", 3000);
   const journalPath = path.join(graph, "journal", `${session}.jsonl`);
-  const mine = await u.curl(`${u.serverBase()}/v1/queue?project=${encodeURIComponent(slug)}&assignee=me`, {
-    headers: u.bearer(),
-    timeoutMs,
-  });
-  if (mine.http !== "200") return null; // can't verify -> never nudge (fail-open)
-  let myItems;
-  try {
-    myItems = JSON.parse(mine.body).items;
-  } catch {
-    return null;
-  }
-  if (!Array.isArray(myItems)) return null;
+  const myItems = await u.fetchAssigneeMineItems(slug, timeoutMs);
+  if (!myItems) return null; // can't verify -> never nudge (fail-open)
 
   // Person-scoped suppression: any item the person holds (live Tier-1
   // in_progress OR Tier-2 reserved) means they have a claim in this project

@@ -61,12 +61,19 @@ function scratch() {
 // post-tool claim-nudge branch writes on every renew (task-cc-claim-nudge-hook)
 // -- the evidence sessionEndLease reads to find what THIS session held.
 function seedHeartbeat(home, session, renewed, dropped) {
+  seedHeartbeatFor(home, session, 'projx', renewed, dropped);
+}
+
+// Same, but for an arbitrary project -- lets a test seed heartbeat entries
+// for MORE THAN ONE project in the same session's journal (a session that
+// edited more than one repo), which seedHeartbeat's hardcoded 'projx' can't.
+function seedHeartbeatFor(home, session, project, renewed, dropped) {
   const dir = path.join(home, 'journal');
   fs.mkdirSync(dir, { recursive: true });
   fs.appendFileSync(
     path.join(dir, `${session}.jsonl`),
     JSON.stringify({
-      ts: '2026-01-01T00:00:00Z', project: 'projx', tool: 'claim-heartbeat', renewed,
+      ts: '2026-01-01T00:00:00Z', project, tool: 'claim-heartbeat', renewed,
       ...(dropped ? { dropped } : {}),
     }) + '\n'
   );
@@ -74,7 +81,13 @@ function seedHeartbeat(home, session, renewed, dropped) {
 
 // Stub server: records hits. `nodesFor(id)` returns the GET /v1/nodes/{id}
 // response body object (or null for 404); reserve/release both 200.
-function stubServer(nodesFor) {
+// `queueItemsFor(project)`, when given, answers GET /v1/queue?project=<p>&
+// assignee=me with `{items: <its return value>}` (200) -- the SessionEnd
+// vanish re-check (issue-spor-sessionend-reserve-release-as-last-event-still-
+// retaken). Omitted (default), the route falls through to 404 exactly as
+// before this check existed, so every pre-existing test that doesn't pass it
+// keeps hitting the fail-open path unchanged.
+function stubServer(nodesFor, queueItemsFor) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = '';
@@ -97,6 +110,17 @@ function stubServer(nodesFor) {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: true, status: req.url.endsWith('reserve') ? 'reserved' : 'released' }));
         return;
+      }
+      if (queueItemsFor && req.method === 'GET' && req.url.startsWith('/v1/queue')) {
+        const u = new URL(req.url, 'http://x');
+        if (u.searchParams.get('assignee') === 'me') {
+          const items = queueItemsFor(u.searchParams.get('project'));
+          if (items) {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ items }));
+            return;
+          }
+        }
       }
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end('{}');
@@ -458,6 +482,117 @@ test('a debounced (quiescence-approximated) firing skips the lease branch entire
     assert.ok(!fs.existsSync(pending), 'watcher ran (spool cleaned up)');
     assert.strictEqual(hits.length, 0, 'a debounced firing must never call reserve/release');
     assert.strictEqual(journal(home, 'sess-deb').filter((e) => e.tool === 'session-lease').length, 0);
+  } finally {
+    srv.close();
+  }
+});
+
+// issue-spor-sessionend-reserve-release-as-last-event-still-retaken: a release
+// from another terminal that is the session's LAST event in a project never
+// gets a `dropped` journal record (that only happens on the NEXT write), so
+// the replay above would still reserve it. SessionEnd now re-checks
+// assignee=me once more, per project, before replaying -- catching exactly
+// this case.
+test('a lease released from another terminal as the session\'s last event vanishes from assignee=me -> SessionEnd issues NO reserve', async () => {
+  const { home, cwd } = scratch();
+  seedHeartbeat(home, 's1', ['task-mine', 'task-released-elsewhere']);
+  const { srv, hits, base } = await stubServer(
+    (id) => ({ raw: `id: ${id}\nstatus: open\n---\nbody` }),
+    (project) => (project === 'projx' ? [{ id: 'task-mine', lease_state: 'in_progress' }] : null)
+  );
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    await runAsync(['distill', '--host', 'claude-code'], sessionEndPayload(cwd), env);
+    assert.ok(
+      hits.some((h) => h.url === '/v1/nodes/task-mine/reserve'),
+      'the still-held node still reserves'
+    );
+    assert.ok(
+      !hits.some((h) => h.url.startsWith('/v1/nodes/task-released-elsewhere')),
+      `the vanished node is never touched; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`
+    );
+  } finally {
+    srv.close();
+  }
+});
+
+// The mirror case: an id still visible in `myItems` but with no `lease_state`
+// is an ORDINARY LAPSE (still assigned, the ephemeral lease merely expired),
+// not a release -- dec-spor-lease-auto-reclaim-and-deadline-exposure's decided
+// behavior (a long session whose claim lapsed still reserves at SessionEnd)
+// must survive this check untouched.
+test('a lapsed-but-still-assigned id (present, no lease_state) is still reserved', async () => {
+  const { home, cwd } = scratch();
+  seedHeartbeat(home, 's1', ['task-lapsed-but-mine']);
+  const { srv, hits, base } = await stubServer(
+    (id) => ({ raw: `id: ${id}\nstatus: open\n---\nbody` }),
+    (project) => (project === 'projx' ? [{ id: 'task-lapsed-but-mine' }] : null) // no lease_state
+  );
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    await runAsync(['distill', '--host', 'claude-code'], sessionEndPayload(cwd), env);
+    assert.ok(
+      hits.some((h) => h.url === '/v1/nodes/task-lapsed-but-mine/reserve'),
+      'an ordinary lapse (still in myItems, no lease_state) must still reserve'
+    );
+  } finally {
+    srv.close();
+  }
+});
+
+// The queue lookup itself is unavailable (dead server for that route, or a
+// non-200): the vanish check must fail OPEN and replay the journal exactly as
+// it did before this check existed, never silently drop a held id because the
+// re-check couldn't run.
+test('assignee=me lookup unavailable at SessionEnd -> fails open, replays the journal as before', async () => {
+  const { home, cwd } = scratch();
+  seedHeartbeat(home, 's1', ['task-mine']);
+  const { srv, hits, base } = await stubServer(
+    (id) => (id === 'task-mine' ? { raw: 'id: task-mine\nstatus: open\n---\nbody' } : null)
+    // no queueItemsFor -> GET /v1/queue falls through to 404
+  );
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    await runAsync(['distill', '--host', 'claude-code'], sessionEndPayload(cwd), env);
+    assert.ok(
+      hits.some((h) => h.url === '/v1/nodes/task-mine/reserve'),
+      `an unavailable vanish-check lookup must fail open, not silently drop the id; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`
+    );
+  } finally {
+    srv.close();
+  }
+});
+
+// A session that edited two different repos holds heartbeat entries under
+// TWO projects in the same journal. Each must get its OWN assignee=me
+// lookup and its OWN vanish decision -- one project's held id vanishing must
+// not affect the other project's (still-held) id, and a lookup failure
+// scoped to one project must not leak into the other's fail-open replay.
+test('a session holding leases in two different projects checks each project independently', async () => {
+  const { home, cwd } = scratch();
+  seedHeartbeatFor(home, 's1', 'projx', ['task-mine-projx']);
+  seedHeartbeatFor(home, 's1', 'other-repo', ['task-vanished-other', 'task-still-mine-other']);
+  const { srv, hits, base } = await stubServer(
+    (id) => ({ raw: `id: ${id}\nstatus: open\n---\nbody` }),
+    (project) => {
+      if (project === 'projx') return [{ id: 'task-mine-projx', lease_state: 'in_progress' }];
+      // 'other-repo': task-vanished-other has fallen out entirely; task-still-mine-other remains.
+      if (project === 'other-repo') return [{ id: 'task-still-mine-other', lease_state: 'in_progress' }];
+      return null;
+    }
+  );
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    await runAsync(['distill', '--host', 'claude-code'], sessionEndPayload(cwd), env);
+    const queueHits = hits.filter((h) => h.method === 'GET' && h.url.startsWith('/v1/queue'));
+    assert.ok(queueHits.some((h) => h.url.includes('project=projx')), 'projx got its own assignee=me lookup');
+    assert.ok(queueHits.some((h) => h.url.includes('project=other-repo')), 'other-repo got its own assignee=me lookup');
+    assert.ok(hits.some((h) => h.url === '/v1/nodes/task-mine-projx/reserve'), 'projx\'s still-held id reserves');
+    assert.ok(hits.some((h) => h.url === '/v1/nodes/task-still-mine-other/reserve'), "other-repo's still-held id reserves");
+    assert.ok(
+      !hits.some((h) => h.url.startsWith('/v1/nodes/task-vanished-other')),
+      `the vanished id in other-repo is dropped, independent of projx; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`
+    );
   } finally {
     srv.close();
   }
