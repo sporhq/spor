@@ -9650,16 +9650,6 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   }
 
   try {
-    // Side effects (real run only — --print writes nothing). --backfill is the
-    // onboarding door, so it sets the repo up (init + enable) first; every
-    // dispatch self-registers the dir it resolved.
-    if (backfill) onboardRepo(cfg, res.dir);
-    // The slug->path map is machine-local — written to the PERSONAL user config
-    // home, never the (possibly marker-shared) graph home
-    // (issue-spor-config-desync-shared-graph-home).
-    u.registerRepo(cfg.userConfigHome(), res.slug, res.dir);
-    if (backfill) out(`registered ${res.slug} → ${res.dir}; launching the backfill agent…`);
-
     // Preflight only the PATH route — a launcher naming no directory, whether it
     // is the adapter default or an explicitly configured bare name. A launcher
     // given as a PATH is left to the launch, whose own `could not launch <path>:
@@ -9685,9 +9675,13 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     // FAILS — a server without the mint surface, or a transient minting error, must
     // not silently attribute the dispatched agent's writes to the person — unless
     // --allow-person-token (or dispatch.allowPersonToken) opts back into the old
-    // fail-soft. Nothing has claimed a lease or launched anything yet, so a hard
-    // fail here leaves no cleanup behind. Remote + a configured agent only;
-    // local/unconfigured dispatch never reaches this block.
+    // fail-soft. Nothing has claimed a lease, written local config, or launched
+    // anything yet, so a hard fail here leaves no cleanup behind
+    // (issue-spor-dispatch-config-write-before-mint-fail: this block must stay
+    // ahead of the "Side effects" registration below, not just the claim/launch —
+    // a mint failure that hard-fails must not have already mutated
+    // dispatch.repos). Remote + a configured agent only; local/unconfigured
+    // dispatch never reaches this block.
     let agentToken = null;
     let agentMcpFile = null;
     if (identityAgent) {
@@ -9722,6 +9716,17 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
         err(`  check it exists and you own it: spor agent list  (set this machine's default with: spor agent use <agent-id>)`);
       }
     }
+
+    // Local config side effects (real run only — --print writes nothing), now
+    // that a hard mint failure above has already returned without reaching here.
+    // --backfill is the onboarding door, so it sets the repo up (init + enable)
+    // first; every dispatch self-registers the dir it resolved.
+    if (backfill) onboardRepo(cfg, res.dir);
+    // The slug->path map is machine-local — written to the PERSONAL user config
+    // home, never the (possibly marker-shared) graph home
+    // (issue-spor-config-desync-shared-graph-home).
+    u.registerRepo(cfg.userConfigHome(), res.slug, res.dir);
+    if (backfill) out(`registered ${res.slug} → ${res.dir}; launching the backfill agent…`);
 
     // Establish the claim/lease BEFORE launching (task-spor-dispatch-auto-claim):
     // a node already claimed by someone else is caught here, so we never launch a
