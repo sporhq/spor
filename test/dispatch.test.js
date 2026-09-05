@@ -2428,13 +2428,21 @@ test("acquireLocalDispatchLock: exactly one of two REAL concurrent processes win
 test("acquireLocalDispatchLock: exactly one of two REAL concurrent processes wins RECLAIMING an already-stale lock", async () => {
   // The plain fresh-create race above proves the `wx` primitive is atomic; it
   // never exercises the OTHER path through this function — reclaiming a lock
-  // that already exists and is judged stale, which used to be a bare
-  // rm-then-write (a second check-then-act window: two racers could each see
-  // the SAME stale lock, each rm it, and each then win their own fresh
-  // create, both believing they now hold it — reopening the exact hazard this
-  // whole primitive exists to close, one level up). Seed a genuinely stale
-  // lock (a dead pid) BEFORE either racer starts, so both are guaranteed to
-  // take the reclaim branch, then confirm only one of them ends up owning it.
+  // that already exists and is judged stale. Judging staleness and reclaiming
+  // it are serialized under a dedicated breaker lock (acquireBreakerLock) so
+  // two racers can never both decide the SAME stale content is theirs to act
+  // on — a `rename`-only eviction alone is not enough here, because rename
+  // does not check WHAT it evicts: a racer acting on an earlier "stale"
+  // verdict could rename away a DIFFERENT racer's brand-new, live lock just
+  // as easily as the original stale one. Seed a genuinely stale lock (a dead
+  // pid) BEFORE either racer starts, so both are guaranteed to take the
+  // reclaim branch, then confirm only one of them ends up owning it. In
+  // practice two independently-spawned processes rarely interleave precisely
+  // enough to hit the narrowest part of this window (Node process-startup
+  // jitter usually serializes them well apart on its own — a green run here
+  // is consistent with correctness but is not, by itself, proof of it); the
+  // actual guarantee rests on the breaker lock's own atomicity, reasoned
+  // through in the comment above acquireBreakerLock.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-lock-reclaim-race-"));
   const lockFile = cli.localDispatchLockFile(home, "dec-race");
   fs.mkdirSync(path.dirname(lockFile), { recursive: true });

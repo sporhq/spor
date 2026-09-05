@@ -7867,6 +7867,75 @@ function readLockRaw(file, { attempts = 25, delayMs = 2 } = {}) {
   }
   return ""; // still empty after the bounded wait — no valid content to honor either way
 }
+// The "breaker" lock (dec-spor-record-lock-breaker-stale-break's shape,
+// reused here for the same reason): judging the MAIN lock stale and then
+// reclaiming it must be one indivisible act, or the judge-then-act gap is
+// itself a fresh race — a `rename`-based eviction alone does not close it,
+// because `rename` doesn't check WHAT it evicts. Two racers who both read the
+// same stale content can still interleave: the first renames it away, rm's
+// it, and `wx`-recreates a brand-new LIVE lock; the second, still acting on
+// its earlier "stale" verdict, renames THAT fresh lock away (rename doesn't
+// care that the content changed underneath it) and recreates its own — two
+// holders, the exact hazard this whole primitive exists to prevent, reopened
+// one level deeper. So every contender for a HELD lock first takes this
+// breaker lock, and only then reads, judges, and (if warranted) reclaims the
+// main lock — serialized, so no two contenders can ever be inside that
+// sequence for the same file at once, and a plain rm+`wx`-create is safe
+// again once nothing else can be racing it.
+//
+// The breaker lock's own critical section is a handful of synchronous fs
+// calls (microseconds), so contention on IT is resolved by a short bounded
+// wait rather than an immediate refusal, and a lock left behind by a process
+// that died mid-section is stale after a few seconds, not minutes — the
+// residual TOCTOU in ITS OWN reclaim (the same shape, one level deeper still)
+// is real in principle but negligible in practice: two processes would have
+// to interleave inside a window this short, which is exactly the same
+// argument that makes the plain atomic `wx`-create trustworthy on its own
+// everywhere else in this file. This is where the recursion is accepted to
+// stop, matching the codebase's own prior art for this exact problem shape.
+const BREAKER_LOCK_WAIT_MS = 2000;
+const BREAKER_LOCK_POLL_MS = 5;
+const BREAKER_LOCK_STALE_MS = 5000; // far more than this lock is ever legitimately held
+function breakerLockFile(file) {
+  return `${file}.break-lock`;
+}
+function acquireBreakerLock(file) {
+  const deadline = Date.now() + BREAKER_LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      writeLocalDispatchLock(file); // same {pid, started_ticks, at} shape; the breaker lock is not itself released/reclaimed by anything outside this pair
+      return { file };
+    } catch (e) {
+      if (e.code !== "EEXIST") return null; // an unwritable journal — nothing to serialize on; caller falls back to refusing
+    }
+    let stale = false;
+    try {
+      const raw = readLockRaw(file);
+      const held = raw ? JSON.parse(raw) : null;
+      stale = !held || Date.now() - (Date.parse(held.at || "") || 0) > BREAKER_LOCK_STALE_MS || !workerAlive(held.pid, held.started_ticks);
+    } catch {
+      stale = true;
+    }
+    if (stale) {
+      try {
+        fs.rmSync(file, { force: true });
+        continue; // retry the wx-create immediately — this process's own turn
+      } catch {
+        /* a racer beat us to the reclaim; fall through to the wait below */
+      }
+    }
+    if (Date.now() >= deadline) return null;
+    sleepSyncMs(BREAKER_LOCK_POLL_MS);
+  }
+}
+function releaseBreakerLock(token) {
+  if (!token || !token.file) return;
+  try {
+    fs.rmSync(token.file, { force: true });
+  } catch {
+    /* lapses on its own next stale check */
+  }
+}
 function acquireLocalDispatchLock(home, name) {
   const file = localDispatchLockFile(home, name);
   try {
@@ -7875,49 +7944,38 @@ function acquireLocalDispatchLock(home, name) {
   } catch (e) {
     if (e.code !== "EEXIST") return { ok: true, file: null }; // an unwritable journal is not worth blocking dispatch over — fail open, nothing to release
   }
-  // Held — by a live racer, or a dead one that never cleaned up. Only the
-  // latter self-heals; a live holder is refused, not waited on.
-  let stale = false;
+  // Held — by a live racer, or a dead one that never cleaned up. Judging
+  // which, and reclaiming it if so, happens under the breaker lock so no
+  // other contender for THIS file can be doing the same thing at once.
+  const breaker = acquireBreakerLock(breakerLockFile(file));
+  if (!breaker) return { ok: false }; // could not get exclusive access to judge it — refuse rather than risk a double reclaim
   try {
-    const raw = readLockRaw(file);
-    const held = raw ? JSON.parse(raw) : null;
-    if (!held) {
-      stale = true; // gone, or genuinely empty even after the bounded retry
-    } else {
-      const age = Date.now() - (Date.parse(held.at || "") || 0);
-      stale = age > LOCAL_DISPATCH_LOCK_STALE_MS || !workerAlive(held.pid, held.started_ticks);
+    let stale = false;
+    try {
+      const raw = readLockRaw(file);
+      const held = raw ? JSON.parse(raw) : null;
+      if (!held) {
+        stale = true; // gone, or genuinely empty even after the bounded retry
+      } else {
+        const age = Date.now() - (Date.parse(held.at || "") || 0);
+        stale = age > LOCAL_DISPATCH_LOCK_STALE_MS || !workerAlive(held.pid, held.started_ticks);
+      }
+    } catch {
+      stale = true; // an unreadable/unparseable lock cannot be honored as a live one
     }
-  } catch {
-    stale = true; // an unreadable/unparseable lock cannot be honored as a live one
-  }
-  if (!stale) return { ok: false };
-  // Evict the stale holder ATOMICALLY before recreating it: a plain
-  // rm-then-write here would be a second check-then-act window on top of the
-  // one this whole function exists to close — two racers who both judged the
-  // same lock stale could each rm it and each then win their own fresh `wx`
-  // create, both believing they now hold it (the exact bug this function was
-  // built to prevent, reopened one level up). `rename` is the atomic claim
-  // instead: it requires the source to still exist, so of any number of
-  // racers renaming the SAME stale path away, exactly one succeeds — that one
-  // alone is entitled to recreate the lock. A racer whose rename fails (ENOENT
-  // — someone else already evicted it, or it is simply gone) does not get to
-  // assume victory; it refuses, matching a normal contended acquire.
-  const evicted = `${file}.evicted-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  try {
-    fs.renameSync(file, evicted);
-  } catch {
-    return { ok: false }; // did not win the eviction — someone else's claim (stale or fresh) stands
-  }
-  try {
-    fs.rmSync(evicted, { force: true });
-  } catch {
-    /* the evicted copy is orphaned but harmless — it is never looked up again */
-  }
-  try {
-    const payload = writeLocalDispatchLock(file);
-    return { ok: true, file, payload };
-  } catch {
-    return { ok: false }; // an unrelated fresh acquire won the now-clear path first — refuse rather than risk two holders
+    if (!stale) return { ok: false };
+    // Safe now: the breaker lock guarantees nobody else can be mid-judgment
+    // on this same file, so a plain rm+recreate can no longer race a sibling
+    // doing the exact same thing.
+    try {
+      fs.rmSync(file, { force: true });
+      const payload = writeLocalDispatchLock(file);
+      return { ok: true, file, payload };
+    } catch {
+      return { ok: false }; // an unrelated fresh acquire (not going through the reclaim path at all) won the now-clear path first
+    }
+  } finally {
+    releaseBreakerLock(breaker);
   }
 }
 // Release only if we are still the RECORDED holder. A lock this call once won
