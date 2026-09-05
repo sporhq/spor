@@ -2040,6 +2040,56 @@ test("a refused item's COMPLETION status is rolled back — and nothing else is"
   assert.strictEqual(statusOf("task-done-2"), "done", "the status is left exactly as the run left it");
 });
 
+// issue-spor-gate-escalation-demote-status-rollback-not-applied: every other
+// pipeline test above wires `demote` as a mock that records what it was CALLED
+// with, never what actually happened to the graph — so a bug where the pipeline
+// reports a rollback that never persisted would pass every one of them. This is
+// the one test that runs the pipeline's refusal through the REAL production
+// door (gateDemoteItem -> gateWriteStatus -> setStatusLocal) against a real
+// local nodes dir, and re-reads the file afterward instead of trusting the
+// pipeline's own verdict about itself.
+test("runGatePipeline's reported rollback actually lands on disk — the real demote door, not a mock", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-demote-real-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const write = (id, status) =>
+    fs.writeFileSync(
+      path.join(nodes, `${id}.md`),
+      `---\nid: ${id}\ntype: task\ntitle: Add bounded retry to the sync worker\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: ${status}\ndate: 2026-08-26\n---\n\nBody.\n`
+    );
+  const statusOf = (id) => /^status: (.+)$/m.exec(fs.readFileSync(path.join(nodes, `${id}.md`), "utf8"))[1];
+
+  // The graph already reads the run as finished, exactly as §10.7 describes:
+  // the gate runs after the resolver landed.
+  write("task-demo", "done");
+  fs.writeFileSync(
+    path.join(nodes, "dec-resolver.md"),
+    "---\nid: dec-resolver\ntype: decision\ntitle: Added bounded retry\nsummary: Added bounded retry with backoff to the sync worker, so a transient failure retries instead of dropping.\ndate: 2026-08-26\nedges:\n  - {type: resolves, to: task-demo}\n---\n\nBody.\n"
+  );
+
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+  const { deps: fakeDeps, seen } = fakes({ suite: () => ({ ok: false, code: 1, output: "1 failing\n  the sync worker drops records\n" }) });
+  const deps = {
+    ...fakeDeps,
+    // Only `demote` is real. `escalate` stays the fakes() default (which
+    // already returns `task-gate-acceptance`, a blocker id gateDemoteItem
+    // requires) — the escalation write's own reliability is a separate
+    // concern from whether a SUCCESSFUL escalation's demotion persists.
+    demote: ({ blockerId }) => sporCli.gateDemoteItem(cfg, ITEM.node_id, { blockerId }),
+  };
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(res.escalated_to, "task-gate-acceptance");
+  assert.strictEqual(res.demoted, true, "the pipeline must claim the demotion only when it actually landed");
+  assert.strictEqual(
+    statusOf("task-demo"),
+    "open",
+    "and the on-disk graph must actually say so — a pipeline that CLAIMS a rollback that never persisted is exactly issue-spor-gate-escalation-demote-status-rollback-not-applied"
+  );
+  assert.ok(fs.existsSync(path.join(nodes, "dec-resolver.md")), "the resolver is evidence, not the verdict — it is left standing, never retracted");
+});
+
 // gatePromoteItem is gateDemoteItem's mirror (task-spor-integration-propose-
 // mode): once a PR lands, the completion a park() rolled back is restored.
 test("gatePromoteItem restores a demoted item's completion status — the type's own declared value, not a hardcoded 'done'", async () => {
