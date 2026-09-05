@@ -5203,17 +5203,19 @@ test("a no-code claim that does not check out falls through to the empty-diff re
     [{ nodes: { "art-scoping-x": { ...SCOPING_NODE, edges: [] }, "task-demo": SCOPED_ITEM_NODE } }, /carries no resolves\/answers\/relates-to\/derived-from\/supersedes edge to task-demo/],
     // The ITEM could not be read: that is not "unchanged", and the refusal says so.
     [{ nodes: { "art-scoping-x": SCOPING_NODE } }, /task-demo itself could not be read from the graph/],
-    // The declaration itself is unreadable...
-    [{ report: "SCOPED: rescoped" }, /does not read as `SCOPED: <outcome> <resolver-id>/],
+    // The declaration itself is unreadable — refused on its own terms, without
+    // a single graph read.
+    [{ report: "SCOPED: rescoped" }, /does not read as `SCOPED: <outcome> <resolver-id>/, []],
     // ...including the dropped-dash case, which must not silently truncate the id.
     [{ report: "SCOPED: rescoped art-scoping-x the premise is stale" }, /does not read as `SCOPED: <outcome> <resolver-id>/],
     // ...or names a word that is not a declared outcome.
     [{ report: "SCOPED: vibes art-scoping-x — no" }, /is not a declared no-code outcome/],
   ];
-  for (const [world, expected] of cases) {
+  for (const [world, expected, reads] of cases) {
     const { deps, seen } = withNoCode(fakes({ changed: [] }), world);
     const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
     assert.strictEqual(res.state, "failed", `${expected} should refuse`);
+    if (reads) assert.deepStrictEqual(seen.nodeReads, reads, `${expected}`);
     assert.match(res.reason, /no committed change against main/, "the refusal is the one an unexplained empty diff already gets");
     assert.match(res.reason, /The run declared a no-code outcome, but it does not check out/);
     assert.match(res.reason, expected);

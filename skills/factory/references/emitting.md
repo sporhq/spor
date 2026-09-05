@@ -123,7 +123,9 @@ Keys by kind (`lib/kernel/gates.js` is the authority):
   always), `approval_timeout_ms` (default 24h), `poll_ms`, `instructions`.
 - all three — `cycles` (default 0; counts FIX dispatches — `cycles: 3` is the
   initial attempt plus three fix cycles), `title`, `id` (kebab-case, under 48
-  chars).
+  chars, and never `scoping` — that id is reserved for the runner's own
+  no-code-outcome fact, WORKERS.md §10.11, and a factory declaring it refuses
+  to parse).
 
 ## 3. The factory
 
@@ -187,7 +189,8 @@ Six things a factory must satisfy or it refuses to start the worker:
    must never mean "dropped on the floor";
 4. a gate of ANY kind may only name risk classes declared in `risk_classes` —
    a gate that can never arm reads exactly like an approved one;
-5. gate ids are unique and kebab-case;
+5. gate ids are unique, kebab-case, and none of them is the reserved
+   `scoping`;
 6. `repos`, if written, names at least one repo.
 
 ## 3b. The integration block — merge-queue landing (optional)
