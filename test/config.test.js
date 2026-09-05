@@ -95,6 +95,47 @@ test('secret rule: repo-level token is stripped and warned', () => {
   assert.match(c.warnings[0], /ignored 'token'/);
 });
 
+// issue-spor-repo-layer-config-can-name-executables: a repo-committed
+// .spor.json must never name a binary/backend spor spawns — same rule as
+// the secret-token strip above, extended to every command sink the repo
+// layer could otherwise reach.
+for (const dotted of ['dispatch.harness', 'dispatch.bin', 'dispatch.allowPersonToken', 'distill.cmd', 'nudge.cmd', 'digest.intentCmd']) {
+  test(`repo-layer executable strip: '${dotted}' is dropped from a committable .spor.json and warned`, () => {
+    const root = tmp();
+    const segs = dotted.split('.');
+    const leaf = segs.pop();
+    const value = leaf === 'harness' || leaf === 'bin'
+      ? { evil: '/bin/echo' }
+      : '/bin/echo pwned';
+    let obj = {};
+    let cur = obj;
+    for (const seg of segs) cur = (cur[seg] = {});
+    cur[leaf] = value;
+    obj.search = { minSim: 0.5 }; // a sibling top-level key survives the strip
+    write(path.join(root, '.spor.json'), obj);
+    const c = loadConfig({ cwd: root, env: bareEnv({ SPOR_HOME: root }) });
+    assert.strictEqual(c.get(dotted), undefined, `${dotted} must not survive the repo layer`);
+    assert.ok(c.warnings.some((w) => w.includes(`ignored '${dotted}'`)), `warning names ${dotted}`);
+    assert.strictEqual(c.getNum('search.minSim', 0.08), 0.5, 'unrelated repo config is untouched');
+  });
+}
+
+test('repo-layer executable strip: dispatch.worktreeSetup/worktreeTeardown stay repo-configurable (dec-spor-dispatch-worktree-config-target-anchored)', () => {
+  // Deliberately the mirror of the strip tests above: these two commands
+  // are the intended repo-declares-its-own-setup shape of the worktree
+  // feature (only fires on an explicit `spor dispatch --worktree`, never on
+  // the passive hook path), so folding them into REPO_FORBIDDEN_PATHS would
+  // be a regression, not a fix.
+  const root = tmp();
+  write(path.join(root, '.spor.json'), {
+    dispatch: { worktreeSetup: 'scripts/setup.sh', worktreeTeardown: 'scripts/teardown.sh' },
+  });
+  const c = loadConfig({ cwd: root, env: bareEnv({ SPOR_HOME: root }) });
+  assert.strictEqual(c.get('dispatch.worktreeSetup'), 'scripts/setup.sh');
+  assert.strictEqual(c.get('dispatch.worktreeTeardown'), 'scripts/teardown.sh');
+  assert.strictEqual(c.warnings.length, 0);
+});
+
 test('token IS honored from user config and env', () => {
   const root = tmp();
   write(path.join(root, 'config.json'), { token: 'user-tok' });

@@ -724,10 +724,26 @@ any of `sat.GRAPH_LAUNCH_FIELDS` (command/args/argv/bin/exec/entrypoint/env/
 report/session/launch_mode/identity_mode) is REFUSED by `spor dispatch`, and a
 machine with no binding for the id fails satisfiability (refuses loudly, leaves
 the assignment and lease intact, names the missing declaration). The same rule
-covers a write a TEAMMATE could land: `dispatch.harness` and `dispatch.bin` are
-stripped from a committable repo `.spor.json` with a warning
-(`REPO_FORBIDDEN_PATHS`, lib/config.js) — they resolve only from env, the user
-`$SPOR_HOME/config.json`, or the global one. The probe adds valid declared ids
+covers a write a TEAMMATE could land: `dispatch.harness`, `dispatch.bin`, and
+`dispatch.allowPersonToken` are stripped from a committable repo `.spor.json`
+with a warning (`REPO_FORBIDDEN_PATHS`, lib/config.js) — they resolve only
+from env, the user `$SPOR_HOME/config.json`, or the global one.
+`distill.cmd`/`nudge.cmd`/`digest.intentCmd`
+(issue-spor-repo-layer-config-can-name-executables) join the same list: these
+are the stdin-prompt/stdout-verdict backends for the distiller, the
+capture-nudge classifier, and the digest intent classifier, and they fire on
+the PASSIVE hook path (SessionEnd/PostToolUse/UserPromptSubmit) of any
+session that merely opens the repo — no explicit dispatch required — with
+real prompt/transcript content on stdin, so a repo-committed value is an
+EXFILTRATION vector, not just an arbitrary-exec one. `dispatch.worktreeSetup`
+and `dispatch.worktreeTeardown` stay DELIBERATELY OUT of this list even
+though they too let a repo commit a shell command: they run only on an
+EXPLICIT `spor dispatch --worktree` into that repo — the same trust boundary
+as running the repo's own build script right after a clone — never on the
+passive hook path, and carry no prompt/transcript content;
+dec-spor-dispatch-worktree-config-target-anchored already settled that a
+repo declaring its own worktree-setup script is the intended shape of that
+feature. The probe adds valid declared ids
 to `machine.harnesses`, so `spor capabilities` and the fleet publish reflect
 them. See test/declared-harness-dispatch.test.js. In REMOTE mode, when a
 `dispatch.agent` is configured (`spor agent use`), `session-start` ALSO
