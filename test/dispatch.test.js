@@ -2512,16 +2512,24 @@ ${stubExitTail({ holdFile: releaseFile, exitCode: 0 })}
   }
 });
 
-test("dispatch <node-id> (local): two concurrent dispatches of DIFFERENT nodes both launch", async () => {
-  const { home, repo } = fixture();
+test("dispatch <node-id> (local): two concurrent dispatches of DIFFERENT nodes both launch (isolated worktrees)", async () => {
+  // The local dispatch lock is per-NODE, so two different node names never
+  // contend on IT — but task-spor-worker-preflight-validation's workspace
+  // guard is per-CANDIDATE-DIRECTORY, and correctly refuses a SECOND writer
+  // into one shared checkout regardless of node identity (the Dartlane pilot
+  // failure the guard exists to close). So this scenario now needs
+  // `--worktree` isolation to reach "both launch" — each dispatch gets its
+  // own tree, and neither guard has anything left to refuse.
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });
   const s1 = path.join(home, "launched-x");
   const s2 = path.join(home, "launched-y");
   const stubX = writeSpawnableNodeStub(home, "claude-x", `require("node:fs").writeFileSync(${JSON.stringify(s1)}, "x\\n");`);
   const stubY = writeSpawnableNodeStub(home, "claude-y", `require("node:fs").writeFileSync(${JSON.stringify(s2)}, "y\\n");`);
   const [r1, r2] = await Promise.all([
-    runAsync(["dispatch", "dec-x", "--no-brief"], bare({ SPOR_HOME: home, SPOR_CLAUDE_CMD: stubX })),
-    runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], bare({ SPOR_HOME: home, SPOR_CLAUDE_CMD: stubY })),
+    runAsync(["dispatch", "dec-x", "--no-brief", "--worktree"], bare({ SPOR_HOME: home, SPOR_CLAUDE_CMD: stubX })),
+    runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief", "--worktree"], bare({ SPOR_HOME: home, SPOR_CLAUDE_CMD: stubY })),
   ]);
   assert.strictEqual(r1.status, 0, r1.stderr);
   assert.strictEqual(r2.status, 0, r2.stderr);
