@@ -1299,6 +1299,21 @@ Either way the item is left for a `spor work --profile <lane>` worker, a
 `spor dispatch --profile <lane>` run, or a person to take once a box that
 satisfies the profile picks it up.
 
+**Or it routes itself across the fleet.** `--auto-route` (`dispatch.autoRoute`,
+off by default — task-spor-fleet-autoroute-auto-tier-consumer) turns that
+"left for" into a handoff: on the same unsatisfiable-here refusal, a NODE
+dispatch asks the fleet scheduler which of the caller's OWN boxes satisfy
+*this* profile (`GET /v1/profiles/{id}/hosts?owner=me`) and hands the item to
+the freshest one by writing `assigned -> <host agent>` with the same profile
+pinned on the edge — so that box's own `spor work` picks it up on its next
+poll with nobody re-routing it by hand. It is a re-route, never a substitution:
+the profile id on the edge is the one that was refused here, and when no host
+satisfies it the refusal still escalates to the owner rather than downgrading.
+The dispatching box still refuses (exit 1) and its worker cools the item off,
+because nothing ran *here*; `dispatch.autoRouteMaxAge` (default `24h`) bounds
+how stale a target's last contact may be, and `--no-auto-route` opts one run
+back out.
+
 ### 10.4 Agent-review gates — a verdict that is read, not asserted
 
 The runner composes the review dispatch itself: a launch under the gate's

@@ -780,6 +780,40 @@ SAME `dispatch.agent` opt-in, throttled by `dispatch.heartbeatIntervalMs`
 (`SPOR_HEARTBEAT_INTERVAL`, default 5min), bounded by `dispatch.heartbeatTimeoutMs`
 (`SPOR_HEARTBEAT_TIMEOUT`, default 3s), and disabled by `SPOR_HEARTBEAT=0`
 (`dispatch.heartbeat:false`).
+**Autonomous re-routing (task-spor-fleet-autoroute-auto-tier-consumer):** the
+FORK B refusal — this box cannot satisfy the resolved profile — has a second,
+opt-in tier above the shipped human one. `spor dispatch --auto-route`
+(`dispatch.autoRoute`, `SPOR_AUTO_ROUTE`, default OFF) takes the same
+`GET /v1/profiles/{id}/hosts` host-match and, for a NODE dispatch, HANDS the
+item to the freshest satisfying box by writing `assigned -> <host agent>` with
+the SAME profile pinned as the edge's `profile:` attribute, so that box's own
+`spor work` picks it up with no human re-routing it. There is no cross-machine
+exec channel and this does not build one: routing IS explicit assignment
+(dec-spor-agent-orchestration-layer), so the graph is the handoff. FORK B is
+intact — the profile id on the edge is the one that was refused here (never a
+substitute), and no satisfying host still escalates to the owner. The
+host-match asks `owner=me` so only the caller's OWN agents are routed to
+(dec-spor-agent-orchestration-layer invariant 1; without it an ADMIN caller,
+whose default view is the whole fleet, would hand work to a colleague's box);
+`dispatch.autoRouteMaxAge` (`SPOR_AUTO_ROUTE_MAX_AGE`, default `24h`, `0`
+disables) bounds a target's `last_seen` staleness — generous because only an
+agent SESSION heartbeats, so a box idling in `spor work` goes quiet without
+going away. The refusing box is never its own target (a stale self-match is
+skipped for the next host), the dispatch still exits 1 (nothing ran HERE, so
+the work loop cools the item off and walks on), and anything the tier cannot
+act on — a free-text dispatch with no node to assign, no satisfying host, a
+scheduler outage, a refused edge write — degrades to the human-tier report. That
+report reuses the auto tier's fetch (`reportFleetHosts`'s `prefetched`) in ONE
+shape only: a target was chosen and just the write failed, so the answer is known
+to name a real re-route target. The two tiers are otherwise asking DIFFERENT
+questions — the auto tier's is narrowed to `owner=me` and bounded by
+`autoRouteMaxAge` — and rendering the narrow answer as the broad one would report
+`NO fleet host currently satisfies X` over a box quiet for a day (or, for an
+admin, a colleague's), or blame a scheduler for a `max_age` this client chose. So
+every other non-routing outcome re-asks broadly and prints exactly what an
+auto-route-free refusal would, at the cost of one bounded GET. Off, not one
+syscall of it runs and the refusal is byte-identical. See test/dispatch.test.js
+"AUTONOMOUS tier".
 **The work loop (task-spor-work-loop):** `spor work` is the pull-based
 continuous worker over the queue — poll, dispatch, await the TERMINAL state,
 repeat — and is a GENERALIZATION of `spor dispatch --from-queue`, never a second

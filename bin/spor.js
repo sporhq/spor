@@ -9330,6 +9330,19 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   const full = !!values.full;
   const noBrief = !!values["no-brief"];
   const noClaim = !!values["no-claim"];
+  // The AUTONOMOUS tier of substitution-free re-routing (task-spor-fleet-
+  // autoroute-auto-tier-consumer): on a FORK B refusal, hand the item to a fleet
+  // host that satisfies THIS profile instead of stopping for a human to re-route.
+  // Opt-in and explicit-wins, like the worktree flags — off, the refusal is
+  // byte-identical to the human tier it extends.
+  const autoRoute = values["no-auto-route"] ? false : !!(values["auto-route"] || cfg.getBool("dispatch.autoRoute", false));
+  // The liveness bound on a re-route target. Generous on purpose: only an
+  // agent SESSION heartbeats (the post-tool tick) or re-publishes (session
+  // start), so a box sitting idle in `spor work` — exactly the box a handoff
+  // wants — goes quiet without going away, and a tight window would escalate
+  // past it. `0`/empty disables the filter (the server's own default).
+  const autoRouteMaxAgeRaw = String(cfg.get("dispatch.autoRouteMaxAge", "24h") ?? "").trim();
+  const autoRouteMaxAge = autoRouteMaxAgeRaw && autoRouteMaxAgeRaw !== "0" ? autoRouteMaxAgeRaw : null;
   const force = !!values.force;
   const backfill = !!values.backfill;
   const fromQueue = !!values["from-queue"];
@@ -10062,6 +10075,17 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
       out(`profile: ${profileCheck.id} (via ${profileCheck.source}) — ${v.ok ? "satisfiable here" : "UNSATISFIABLE here; real dispatch would refuse"}`);
       for (const r of v.reasons) out(`  - ${r}`);
     }
+    // Auto-route preview (shown only when the autonomous tier is armed AND the
+    // profile is unsatisfiable here, so every other --print stays byte-identical).
+    // The dry run itself consults nothing and writes nothing — it says what a
+    // real dispatch WOULD do, like the guards above it.
+    if (autoRoute && unsatisfiable && cfg.mode() === "remote") {
+      out(
+        nodeId && !backfill
+          ? `auto-route: ON — real dispatch would hand ${nodeId} to the freshest fleet host that satisfies ${profileCheck.id} (assigned → <host agent>, same profile), or escalate if none does`
+          : `auto-route: ON — but only a NODE dispatch can be re-routed; this run has nothing to re-assign, so it would refuse and report the hosts`
+      );
+    }
     // Same-machine guard preview (node mode, any mode): a real dispatch would
     // refuse if an agent with this name is already in flight here. Shown only on a
     // hit, so a clean node --print stays byte-identical to before.
@@ -10137,7 +10161,43 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     // substitute a different profile). Remote-only and FAIL-SOFT: an
     // unreachable/undeployed scheduler falls through to the generic hint, so the
     // refusal still works offline and local mode stays byte-identical.
-    const routed = cfg.mode() === "remote" ? await reportFleetHosts(cfg, profileCheck.id) : false;
+    //
+    // With --auto-route (dispatch.autoRoute) the AUTONOMOUS tier runs first
+    // (task-spor-fleet-autoroute-auto-tier-consumer): it takes the same
+    // host-match and, for a NODE dispatch, hands the item to the freshest
+    // satisfying box by writing `assigned → <agent> {profile: <this profile>}`,
+    // so no human re-routes it. Anything it can't act on — a free-text dispatch
+    // with no node to assign, no satisfying host, a scheduler outage, a refused
+    // edge write — degrades to the human-tier report ABOVE. A `--print` dry run
+    // never reaches here at all (it returned with its preview above), so no dry
+    // run can write the edge.
+    //
+    // That fallback reuses the auto tier's fetch only where the two tiers are
+    // asking the same question. They usually are not: the auto tier asks a
+    // NARROWED one (`owner=me`, bounded by autoRouteMaxAge) because it is
+    // choosing a machine to hand work to, while the report answers a human's
+    // "where could this run at all". Rendering the narrow answer as the broad one
+    // turns a laptop that has been quiet overnight — or, for an admin, a
+    // colleague's box — into "NO fleet host currently satisfies X, escalate to
+    // the owner", which is both false and the opposite of the useful advice; and
+    // a typo'd autoRouteMaxAge (a 422) would be reported as a scheduler outage.
+    // So the reuse is limited to the one shape that cannot mislead — a target was
+    // chosen and only the edge write failed (`reusable`) — and every other
+    // non-routing outcome re-asks broadly, printing exactly what an
+    // auto-route-free refusal would, at the cost of one bounded GET.
+    let routed = false;
+    if (cfg.mode() === "remote") {
+      const canRoute = autoRoute && !!nodeId && !backfill;
+      const auto = canRoute
+        ? await autoRouteToFleetHost(cfg, {
+            nodeId,
+            profileId: profileCheck.id,
+            ownAgents: [identityAgent, dispatchAgentId(cfg)],
+            maxAge: autoRouteMaxAge,
+          })
+        : null;
+      routed = auto && auto.routed ? true : await reportFleetHosts(cfg, profileCheck.id, auto && auto.reusable ? { prefetched: auto.res } : {});
+    }
     if (!routed) {
       err(`  the assignment is unchanged. Re-route to a machine that satisfies it, run 'spor capabilities' to`);
       err(`  declare/repair what's missing here, or pass a different --profile.`);
@@ -15759,20 +15819,27 @@ async function fleetHostsForProfile(cfg, profileId, { owner, maxAge } = {}) {
   };
 }
 
-// reportFleetHosts — the dispatch-refusal CONSUMER. On a FORK B refusal (this box
-// can't satisfy the resolved profile), turn the dead-end "re-route somewhere"
-// hint into an actionable one: NAME the boxes that satisfy THIS exact profile
-// (re-route there), or — when none can — say so and escalate to the owner.
-// Prints to stderr (it's part of the refusal). Returns true when it printed a
-// scheduler-derived verdict, false to let the caller fall back to the generic
-// hint (an unreachable / undeployed / unknown-profile scheduler — fail-soft, so
-// the refusal still works offline and local mode stays byte-identical).
-async function reportFleetHosts(cfg, profileId) {
-  let res;
-  try {
-    res = await fleetHostsForProfile(cfg, profileId);
-  } catch {
-    return false;
+// reportFleetHosts — the dispatch-refusal CONSUMER, HUMAN tier. On a FORK B
+// refusal (this box can't satisfy the resolved profile), turn the dead-end
+// "re-route somewhere" hint into an actionable one: NAME the boxes that satisfy
+// THIS exact profile (re-route there), or — when none can — say so and escalate
+// to the owner. Prints to stderr (it's part of the refusal). Returns true when
+// it printed a scheduler-derived verdict, false to let the caller fall back to
+// the generic hint (an unreachable / undeployed / unknown-profile scheduler —
+// fail-soft, so the refusal still works offline and local mode stays
+// byte-identical). `prefetched` hands in a host-match the AUTONOMOUS tier below
+// already fetched, saving a round trip — but ONLY where that narrowed answer is
+// a faithful stand-in for the unscoped question this report would otherwise ask
+// (see its `reusable`); every other refusal reaches here with nothing prefetched
+// and asks for itself, so the report is what it always was.
+async function reportFleetHosts(cfg, profileId, { prefetched } = {}) {
+  let res = prefetched;
+  if (res === undefined) {
+    try {
+      res = await fleetHostsForProfile(cfg, profileId);
+    } catch {
+      return false;
+    }
   }
   if (!res || res.absent) return false; // unknown profile / no surface — generic hint fits better
   if (res.forbidden) {
@@ -15800,6 +15867,99 @@ async function reportFleetHosts(cfg, profileId) {
   err(`  NO fleet host currently satisfies ${res.profile} — escalate to the owner.`);
   err(`  (${checked} box(es) checked; none satisfy it. The assignment is unchanged — never substituted.)`);
   return true;
+}
+
+// autoRouteToFleetHost — the dispatch-refusal CONSUMER, AUTONOMOUS tier
+// (task-spor-fleet-autoroute-auto-tier-consumer). The human tier above NAMES the
+// boxes that satisfy the profile and stops there, leaving a person to re-dispatch
+// from one of them; this closes that loop with no human step by writing the
+// routing edge the fleet already understands — `assigned → <host agent>` with the
+// SAME profile pinned as the per-assignment `profile:` attribute (API.md §1) — so
+// the satisfying box's own `spor work` picks the item up on its next poll. There
+// is no cross-machine exec channel to launch through (and building one is the
+// general routine engine this task is deliberately not), and routing IS explicit
+// assignment (dec-spor-agent-orchestration-layer): the graph is the handoff.
+//
+// FORK B is preserved exactly. The profile is never substituted — every candidate
+// came back from the SERVER's host-match for THIS profile id, and that id is
+// carried verbatim onto the edge so the receiving box resolves it rather than the
+// agent's own default (dec-spor-machine-profile-satisfiability). When no host
+// satisfies it, this routes nothing and the caller still escalates to the owner.
+//
+// Opt-in (`--auto-route`, `dispatch.autoRoute`): a dispatch refusal has always
+// been a read-only report, so with the flag off not one syscall here runs and the
+// refusal stays byte-identical. Owner-scoped BY CONSTRUCTION (`owner=me`) —
+// only the caller's own agents are ever dispatched (dec-spor-agent-orchestration-
+// layer invariant 1), and without it an ADMIN caller, for whom the endpoint
+// defaults to the WHOLE fleet, would hand their work to a colleague's box.
+// Fail-soft throughout: an unreachable scheduler or a refused edge write reports
+// and hands back, never throws, and the refusal below it stands either way.
+//
+// Returns { routed: true, agent } once the edge has landed, else { routed: false,
+// res, reusable }. `reusable` marks the ONE case where this tier's NARROWED
+// host-match is a faithful stand-in for the human tier's own question: a target
+// was chosen and only the WRITE failed, so the list is known to name a real
+// re-route target and the report can render it instead of asking again. Every
+// other non-routing outcome leaves it false — see the call site.
+async function autoRouteToFleetHost(cfg, { nodeId, profileId, ownAgents, maxAge }) {
+  let res;
+  try {
+    res = await fleetHostsForProfile(cfg, profileId, { owner: "me", maxAge });
+  } catch {
+    return { routed: false, res: null };
+  }
+  if (!res || res.error || res.absent || res.forbidden) return { routed: false, res };
+  // Never re-route to THIS box, under EITHER of its identities. `--as` picks the
+  // identity a run is attributed under, but a box publishes its capabilities as
+  // its configured `dispatch.agent` — so a dispatch that overrides one and not
+  // the other would compare candidates against a name the fleet does not know
+  // this box by, and the stale self-match this guard exists to skip would sail
+  // through. The server matched against what we last PUBLISHED; the refusal
+  // above is what this box can actually do right now, so our own agent coming
+  // back satisfiable means those caps are stale, and routing there hands the
+  // item straight back to the machine that just refused it — a loop, not a
+  // re-route.
+  const mine = new Set((ownAgents || []).filter(Boolean));
+  const all = [...(res.satisfiable || []), ...(res.unsatisfiable || [])];
+  // The scoping above is the SERVER's (`owner=me`), so a deployment that ignores
+  // the parameter could hand this caller's work to a colleague's box. When the
+  // answer happens to name one of OUR agents we learn our own person id from it
+  // for free, and can hold the server to its own scope; when it does not, there
+  // is nothing here to check against and the request scope stands alone.
+  const myOwner = (all.find((h) => h && mine.has(h.agent) && h.owner) || {}).owner || null;
+  const target =
+    (res.satisfiable || []).find(
+      (h) => h && h.agent && !mine.has(h.agent) && !(myOwner && h.owner && h.owner !== myOwner)
+    ) || null;
+  if (!target) return { routed: false, res };
+  // Wrapped like the fetch above: `remote.post` answers transport failures in
+  // its return shape, but resolving the bearer ahead of the request can still
+  // throw (an unreadable credential store, a refresh that blows up), and a
+  // refusal must degrade to the human-tier report rather than take the process
+  // down on the way out.
+  let r;
+  try {
+    r = await remote.post(
+      cfg,
+      `/v1/nodes/${encodeURIComponent(nodeId)}/edges`,
+      { type: "assigned", to: target.agent, attrs: { profile: profileId } },
+      { timeoutMs: 8000 }
+    );
+  } catch (e) {
+    r = { ok: false, transport: true, error: e && e.message ? e.message : String(e) };
+  }
+  if (r.transport || !r.ok) {
+    const e = (r.json && r.json.error) || {};
+    err(`  (could not write the re-route assignment: ${r.transport ? r.error : `HTTP ${r.status}${e.message ? ` — ${e.message}` : ""}`})`);
+    // A target WAS chosen from this answer, so it names at least one real
+    // re-route target — the one shape the human tier can render as its own.
+    return { routed: false, res, reusable: true };
+  }
+  const meta = [labelledPerson(target.owner_name, target.owner), `${relAge(target.age_seconds)} ago`].filter(Boolean).join(", ");
+  err(`  auto-routed ${nodeId} to ${target.agent}${meta ? ` (${meta})` : ""} — assigned → ${target.agent} {profile: ${profileId}}.`);
+  err(`  that box satisfies THIS profile (never a substitute); its worker picks the item up on its next poll.`);
+  err(`  nothing was claimed or launched here.`);
+  return { routed: true, agent: target.agent };
 }
 
 // cmdCapabilitiesHosts — `spor capabilities hosts <profile-id>`, the explicit
@@ -17014,6 +17174,18 @@ const COMMANDS = {
       "naming the gap — no --force override, since no agent can do it regardless of\n" +
       "capability. A broader human classification (assigned to a person, a held\n" +
       "task, an open neighborhood question) only WARNS; the dispatch proceeds.\n\n" +
+      "PROFILE UNSATISFIABLE HERE. When this box can't satisfy the resolved profile\n" +
+      "the dispatch fails soft and loud, leaving the assignment intact and NEVER\n" +
+      "substituting another profile (dec-spor-machine-profile-satisfiability FORK B).\n" +
+      "In remote mode it consults the fleet scheduler and names the boxes that can run\n" +
+      "THIS profile, or escalates to the owner when none can. --auto-route\n" +
+      "(dispatch.autoRoute) closes that loop with no human step: for a NODE dispatch it\n" +
+      "hands the item to the freshest satisfying box by writing 'assigned -> <host\n" +
+      "agent>' with the same profile pinned on the edge, so that box's own 'spor work'\n" +
+      "picks it up — a re-route, never a substitution, and never onto someone else's\n" +
+      "machine (only your own agents are considered). Nothing satisfying it still\n" +
+      "escalates. dispatch.autoRouteMaxAge (default 24h, 0 to disable) bounds how stale\n" +
+      "a target's last contact may be. --no-auto-route opts a single run out.\n\n" +
       "--worktree runs the agent in its own git worktree off the repo (branch = the\n" +
       "node id / sanitized task), so parallel dispatches never race the shared tree/\n" +
       "index. Make it a repo default with dispatch.worktree — in the TARGET repo's\n" +
@@ -17056,6 +17228,8 @@ const COMMANDS = {
       full: { type: "boolean", desc: "full briefing instead of the digest" },
       "no-brief": { type: "boolean", desc: "raw task prompt, no briefing block" },
       "no-claim": { type: "boolean", desc: "don't auto-claim the lease (remote node dispatch)" },
+      "auto-route": { type: "boolean", desc: "when this box can't satisfy the profile, hand the node to a fleet host that can (assigned → host agent, same profile); also dispatch.autoRoute" },
+      "no-auto-route": { type: "boolean", desc: "force-disable the auto-route handoff for this dispatch" },
       "allow-person-token": { type: "boolean", desc: "fall back to a person-scoped token when no agent is configured or minting fails (default: hard-fail; also dispatch.allowPersonToken)" },
       force: { type: "boolean", desc: "dispatch even if the node is already resolved, or an agent for it is in flight here" },
       "from-queue": { type: "boolean", desc: "dispatch the top-ranked queue item not already in flight here" },

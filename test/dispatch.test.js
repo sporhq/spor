@@ -1526,28 +1526,49 @@ test("dispatch: no profile resolved => byte-identical (no profile line)", () => 
 const PROFILE_MD = (id, fields) =>
   `---\nid: ${id}\ntype: profile\ntitle: ${id}\nsummary: A test profile.\n${fields}\ndate: 2026-06-18\n---\nBody.\n`;
 
+const TASK_MD = (id) =>
+  `---\nid: ${id}\ntype: task\nrepo: demo\ntitle: Demo task ${id}\nsummary: A demo task.\ndate: 2026-06-01\n---\nbody\n`;
+
 // A fake server that serves the profile node and a scriptable /hosts host-match.
-function fleetStub({ hosts, hostsStatus = 200 } = {}) {
+// It also serves any `task-*` id and a scriptable `POST /v1/nodes/{id}/edges`,
+// so the AUTONOMOUS tier (which re-routes by writing an `assigned` edge) can be
+// driven end to end; hits carry the request body for that assertion.
+// `hostsScoped` answers an `owner=me` query (what the AUTONOMOUS tier asks) with a
+// DIFFERENT body from `hosts` (what the human tier's unscoped question gets), so a
+// test can pin that the narrow answer is never rendered as the broad one.
+function fleetStub({ hosts, hostsScoped = null, hostsStatus = 200, edgeStatus = 200 } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
-    hits.push({ method: req.method, url: req.url });
-    const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
-    const pm = req.url.match(/^\/v1\/nodes\/([^/?]+)/);
-    if (pm && req.method === "GET") {
-      const id = decodeURIComponent(pm[1]);
-      if (id === "profile-codex") return j(200, { id, raw: PROFILE_MD("profile-codex", "harness: codex") });
-      // An mcp:[spor] profile — satisfiable on ANY remote box by construction,
-      // since the fresh re-probe seeds reachable_mcp:[spor] in remote mode
-      // (task-spor-dispatch-fresh-probe-before-satisfiability).
-      if (id === "profile-spor") return j(200, { id, raw: PROFILE_MD("profile-spor", "mcp: [spor]") });
+    let raw = "";
+    req.on("data", (c) => (raw += c));
+    req.on("end", () => {
+      hits.push({ method: req.method, url: req.url, body: raw });
+      const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
+      const em = req.url.match(/^\/v1\/nodes\/([^/?]+)\/edges$/);
+      if (em && req.method === "POST") {
+        if (edgeStatus !== 200) return j(edgeStatus, { error: { code: "invalid_edge", message: "nope" } });
+        return j(200, { ok: true, id: decodeURIComponent(em[1]) });
+      }
+      const pm = req.url.match(/^\/v1\/nodes\/([^/?]+)$/);
+      if (pm && req.method === "GET") {
+        const id = decodeURIComponent(pm[1]);
+        if (id === "profile-codex") return j(200, { id, raw: PROFILE_MD("profile-codex", "harness: codex") });
+        // An mcp:[spor] profile — satisfiable on ANY remote box by construction,
+        // since the fresh re-probe seeds reachable_mcp:[spor] in remote mode
+        // (task-spor-dispatch-fresh-probe-before-satisfiability).
+        if (id === "profile-spor") return j(200, { id, raw: PROFILE_MD("profile-spor", "mcp: [spor]") });
+        if (id.startsWith("task-")) return j(200, { id, raw: TASK_MD(id) });
+        return j(404, { error: { code: "not_found" } });
+      }
+      const hm = req.url.match(/^\/v1\/profiles\/([^/?]+)\/hosts/);
+      if (hm && req.method === "GET") {
+        if (hostsStatus !== 200) return j(hostsStatus, { error: { code: "not_found", message: "x" } });
+        const scoped = hostsScoped && /[?&]owner=me(&|$)/.test(req.url);
+        const body = scoped ? hostsScoped : hosts;
+        return j(200, body || { profile: decodeURIComponent(hm[1]), satisfiable: [], unsatisfiable: [], counts: {} });
+      }
       return j(404, { error: { code: "not_found" } });
-    }
-    const hm = req.url.match(/^\/v1\/profiles\/([^/?]+)\/hosts/);
-    if (hm && req.method === "GET") {
-      if (hostsStatus !== 200) return j(hostsStatus, { error: { code: "not_found", message: "x" } });
-      return j(200, hosts || { profile: decodeURIComponent(hm[1]), satisfiable: [], unsatisfiable: [], counts: {} });
-    }
-    return j(404, { error: { code: "not_found" } });
+    });
   });
   return new Promise((resolve) => srv.listen(0, "127.0.0.1", () => resolve({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
 }
@@ -1670,6 +1691,374 @@ test("dispatch (local, unsatisfiable): byte-identical — no scheduler consult",
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /assignment is unchanged. Re-route to a machine that satisfies it/);
   assert.doesNotMatch(r.stderr, /fleet host/); // local mode never consults the scheduler
+});
+
+// --- AUTONOMOUS tier (task-spor-fleet-autoroute-auto-tier-consumer) --- The human
+// tier above NAMES the satisfying boxes and stops. With --auto-route (or
+// dispatch.autoRoute) the same refusal HANDS the node to the freshest satisfying
+// box — `assigned → <host agent>` carrying THIS profile on the edge — so that
+// box's own worker picks it up with no human re-routing it. Still FORK B: the
+// profile is never substituted, and no satisfying host still escalates. Opt-in,
+// so the default path stays byte-identical to the human tier.
+// The caller's OWN boxes — what an `owner=me` host-match answers with. `agent-mine`
+// is this box, published-but-stale: the server still matches it, the local refusal
+// just proved it can't run the profile.
+const HOSTS_TWO = {
+  profile: "profile-codex",
+  satisfiable: [
+    { agent: "agent-me-laptop", owner: "person-me", age_seconds: 120 },
+    { agent: "agent-me-ci", owner: "person-me", age_seconds: 4000 },
+  ],
+  unsatisfiable: [{ agent: "agent-mine", owner: "person-me", age_seconds: 5, reasons: ["harness 'codex' not available here"] }],
+  counts: { satisfiable: 2, unsatisfiable: 1 },
+};
+const edgeHits = (hits) => hits.filter((h) => h.method === "POST" && /\/edges$/.test(h.url));
+const hostsHits = (hits) => hits.filter((h) => h.method === "GET" && /\/hosts/.test(h.url));
+
+test("dispatch --auto-route (remote, unsatisfiable): hands the node to the freshest satisfying host, profile pinned on the edge", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } }); // codex NOT here
+  const stub = recordingStub(home);
+  const mark = path.join(home, "launched.mark");
+  const { srv, hits, base } = await fleetStub({ hosts: HOSTS_TWO });
+  try {
+    const r = await runAsyncDisp(
+      ["dispatch", "task-rotate", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--auto-route"],
+      remoteCapEnv(home, base, { SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark, ...cleanProbeEnv() })
+    );
+    assert.strictEqual(r.status, 1); // nothing ran HERE — this box still refused
+    assert.match(r.stderr, /can't satisfy profile profile-codex/);
+    // …and it routed rather than stopping for a human.
+    assert.match(r.stderr, /auto-routed task-rotate to agent-me-laptop \(person-me, 2m ago\)/);
+    assert.match(r.stderr, /assigned → agent-me-laptop \{profile: profile-codex\}/);
+    assert.match(r.stderr, /nothing was claimed or launched here/);
+    assert.doesNotMatch(r.stderr, /Re-route to a fleet host/); // the human-tier report is superseded
+    // The host-match is OWNER-scoped: only the caller's own boxes are ever routed to.
+    const asked = hostsHits(hits);
+    assert.strictEqual(asked.length, 1, "one host-match round trip, not one per tier");
+    assert.match(asked[0].url, /^\/v1\/profiles\/profile-codex\/hosts/);
+    assert.match(asked[0].url, /owner=me/);
+    assert.match(asked[0].url, /max_age=24h/);
+    // The routing edge is the handoff — the SAME profile, never a substitute.
+    const edges = edgeHits(hits);
+    assert.strictEqual(edges.length, 1, "exactly one routing edge written");
+    assert.match(edges[0].url, /^\/v1\/nodes\/task-rotate\/edges$/);
+    assert.deepStrictEqual(JSON.parse(edges[0].body), {
+      type: "assigned",
+      to: "agent-me-laptop",
+      attrs: { profile: "profile-codex" },
+    });
+    assert.ok(!fs.existsSync(mark), "claude was never launched here");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --auto-route: never re-routes to THIS box — a stale self-match is skipped for the next host", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  // The scheduler matched against what THIS box last published (stale caps), so
+  // our own agent comes back satisfiable for a profile we just refused.
+  const { srv, hits, base } = await fleetStub({
+    hosts: {
+      profile: "profile-codex",
+      satisfiable: [
+        { agent: "agent-mine", owner: "person-me", age_seconds: 5 },
+        { agent: "agent-me-laptop", owner: "person-me", age_seconds: 120 },
+      ],
+      unsatisfiable: [],
+      counts: { satisfiable: 2, unsatisfiable: 0 },
+    },
+  });
+  try {
+    const r = await runAsyncDisp(
+      ["dispatch", "task-rotate", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--auto-route", "--as", "agent-mine"],
+      remoteCapEnv(home, base, cleanProbeEnv())
+    );
+    assert.strictEqual(r.status, 1);
+    const edges = edgeHits(hits);
+    assert.strictEqual(edges.length, 1);
+    assert.strictEqual(JSON.parse(edges[0].body).to, "agent-me-laptop", "skipped our own stale self-match");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --auto-route: our own box the ONLY match — routes nothing and falls back to the human-tier report", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const { srv, hits, base } = await fleetStub({
+    hosts: { profile: "profile-codex", satisfiable: [{ agent: "agent-mine", owner: "person-me", age_seconds: 5 }], unsatisfiable: [], counts: {} },
+  });
+  try {
+    const r = await runAsyncDisp(
+      ["dispatch", "task-rotate", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--auto-route", "--as", "agent-mine"],
+      remoteCapEnv(home, base, cleanProbeEnv())
+    );
+    assert.strictEqual(r.status, 1);
+    assert.strictEqual(edgeHits(hits).length, 0, "no self-route was written");
+    assert.match(r.stderr, /Re-route to a fleet host that satisfies profile-codex/); // degraded to the human tier
+    assert.doesNotMatch(r.stderr, /auto-routed/);
+    // Nothing was routed FROM the narrowed answer, so it is not a stand-in for the
+    // human tier's broad question — the report asks its own, unscoped.
+    const asked = hostsHits(hits);
+    assert.strictEqual(asked.length, 2);
+    assert.match(asked[0].url, /owner=me/);
+    assert.doesNotMatch(asked[1].url, /owner=/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --auto-route (no host satisfies): escalates to the owner, routes nothing (FORK B)", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const { srv, hits, base } = await fleetStub({
+    hosts: { profile: "profile-codex", satisfiable: [], unsatisfiable: [
+      { agent: "agent-a", owner: "person-x", age_seconds: 10, reasons: ["harness 'codex' not available here"] },
+    ], counts: { satisfiable: 0, unsatisfiable: 1 } },
+  });
+  try {
+    const r = await runAsyncDisp(
+      ["dispatch", "task-rotate", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--auto-route"],
+      remoteCapEnv(home, base, cleanProbeEnv())
+    );
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /NO fleet host currently satisfies profile-codex — escalate to the owner/);
+    assert.match(r.stderr, /never substituted/);
+    assert.strictEqual(edgeHits(hits).length, 0, "nothing was re-assigned");
+    assert.strictEqual(hostsHits(hits).length, 2, "the escalation is judged on the BROAD question, not the narrowed one");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --auto-route: a refused edge write degrades to the human-tier report (fail-soft)", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const { srv, hits, base } = await fleetStub({ hosts: HOSTS_TWO, edgeStatus: 422 });
+  try {
+    const r = await runAsyncDisp(
+      ["dispatch", "task-rotate", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--auto-route"],
+      remoteCapEnv(home, base, cleanProbeEnv())
+    );
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /could not write the re-route assignment: HTTP 422/);
+    assert.match(r.stderr, /Re-route to a fleet host that satisfies profile-codex/);
+    assert.doesNotMatch(r.stderr, /auto-routed/);
+    // A narrow answer that NAMED hosts is a truthful re-route list, so the report
+    // reuses it instead of asking the scheduler the same question twice.
+    assert.strictEqual(hostsHits(hits).length, 1);
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --auto-route: a scheduler outage routes nothing and still degrades to the generic hint", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const { srv, hits, base } = await fleetStub({ hostsStatus: 404 });
+  try {
+    const r = await runAsyncDisp(
+      ["dispatch", "task-rotate", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--auto-route"],
+      remoteCapEnv(home, base, cleanProbeEnv())
+    );
+    assert.strictEqual(r.status, 1);
+    assert.strictEqual(edgeHits(hits).length, 0);
+    assert.match(r.stderr, /assignment is unchanged. Re-route to a machine that satisfies it/);
+    // An answer this tier could not route from is never rendered as the human
+    // tier's own — the report asks again, unscoped.
+    assert.strictEqual(hostsHits(hits).length, 2);
+    assert.doesNotMatch(hostsHits(hits)[1].url, /owner=/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --auto-route: a FREE-TEXT dispatch has nothing to re-assign — reports, never writes an edge", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const { srv, hits, base } = await fleetStub({ hosts: HOSTS_TWO });
+  try {
+    const r = await runAsyncDisp(
+      ["dispatch", "do a thing here", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--auto-route"],
+      remoteCapEnv(home, base, cleanProbeEnv())
+    );
+    assert.strictEqual(r.status, 1);
+    assert.strictEqual(edgeHits(hits).length, 0, "a free-text run re-assigns nothing");
+    assert.match(r.stderr, /Re-route to a fleet host that satisfies profile-codex/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --auto-route --print: previews the handoff, consults nothing, writes nothing", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const { srv, hits, base } = await fleetStub({ hosts: HOSTS_TWO });
+  try {
+    const r = await runAsyncDisp(
+      ["dispatch", "task-rotate", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--auto-route", "--print"],
+      remoteCapEnv(home, base, cleanProbeEnv())
+    );
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /profile: profile-codex \(via --profile\) — UNSATISFIABLE here/);
+    assert.match(r.stdout, /auto-route: ON — real dispatch would hand task-rotate to the freshest fleet host/);
+    assert.strictEqual(edgeHits(hits).length, 0, "a dry run writes nothing");
+    assert.strictEqual(hostsHits(hits).length, 0, "a dry run consults nothing");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch (remote, unsatisfiable): auto-route is OPT-IN — the default refusal writes no edge", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const { srv, hits, base } = await fleetStub({ hosts: HOSTS_TWO });
+  try {
+    const r = await runAsyncDisp(
+      ["dispatch", "task-rotate", "--dir", repo, "--profile", "profile-codex", "--no-brief"],
+      remoteCapEnv(home, base, cleanProbeEnv())
+    );
+    assert.strictEqual(r.status, 1);
+    assert.strictEqual(edgeHits(hits).length, 0, "nothing is re-assigned without the opt-in");
+    assert.match(r.stderr, /Re-route to a fleet host that satisfies profile-codex/);
+    assert.doesNotMatch(r.stderr, /auto-routed/);
+    // The human tier asks unscoped (an admin still sees the whole fleet).
+    assert.strictEqual(hostsHits(hits).length, 1);
+    assert.doesNotMatch(hostsHits(hits)[0].url, /owner=/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --auto-route: dispatch.autoRoute config arms it, --no-auto-route opts one run back out", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const { srv, hits, base } = await fleetStub({ hosts: HOSTS_TWO });
+  try {
+    const env = remoteCapEnv(home, base, { SPOR_AUTO_ROUTE: "1", ...cleanProbeEnv() });
+    const armed = await runAsyncDisp(["dispatch", "task-rotate", "--dir", repo, "--profile", "profile-codex", "--no-brief"], env);
+    assert.strictEqual(armed.status, 1);
+    assert.match(armed.stderr, /auto-routed task-rotate to agent-me-laptop/);
+    assert.strictEqual(edgeHits(hits).length, 1);
+
+    const opted = await runAsyncDisp(
+      ["dispatch", "task-rotate", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--no-auto-route"],
+      env
+    );
+    assert.strictEqual(opted.status, 1);
+    assert.doesNotMatch(opted.stderr, /auto-routed/);
+    assert.strictEqual(edgeHits(hits).length, 1, "the opted-out run wrote no second edge");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --auto-route: an empty owner-scoped answer never renders as 'NO fleet host satisfies it' — the report re-asks broadly", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  // The narrow question the auto tier asks (owner=me, max_age-bounded) comes back
+  // empty — a box quiet for longer than the staleness bound, or a colleague's.
+  // The human tier's own unscoped question still names it, and THAT is what the
+  // refusal must report: escalating to the owner here would be false, and the
+  // opposite of the useful advice (issue found in review of this change).
+  const { srv, hits, base } = await fleetStub({
+    hosts: {
+      profile: "profile-codex",
+      satisfiable: [{ agent: "agent-old-laptop", owner: "person-me", age_seconds: 200000 }],
+      unsatisfiable: [],
+      counts: { satisfiable: 1, unsatisfiable: 0 },
+    },
+    hostsScoped: { profile: "profile-codex", satisfiable: [], unsatisfiable: [], counts: { satisfiable: 0, unsatisfiable: 0 } },
+  });
+  try {
+    const r = await runAsyncDisp(
+      ["dispatch", "task-rotate", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--auto-route"],
+      remoteCapEnv(home, base, cleanProbeEnv())
+    );
+    assert.strictEqual(r.status, 1);
+    assert.strictEqual(edgeHits(hits).length, 0, "nothing satisfied the narrowed question, so nothing was routed");
+    assert.match(r.stderr, /Re-route to a fleet host that satisfies profile-codex/);
+    assert.match(r.stderr, /agent-old-laptop/);
+    assert.doesNotMatch(r.stderr, /NO fleet host currently satisfies/);
+    assert.strictEqual(hostsHits(hits).length, 2);
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --auto-route: the self-route guard knows this box by dispatch.agent, not just --as", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  // A box publishes its capabilities as its configured dispatch.agent; --as only
+  // changes what a run is ATTRIBUTED to. Comparing candidates against --as alone
+  // let the published (stale) self-match through and handed the item back to the
+  // machine that had just refused it.
+  const { srv, hits, base } = await fleetStub({
+    hosts: {
+      profile: "profile-codex",
+      satisfiable: [
+        { agent: "agent-mine", owner: "person-me", age_seconds: 5 },
+        { agent: "agent-me-ci", owner: "person-me", age_seconds: 120 },
+      ],
+      unsatisfiable: [],
+      counts: { satisfiable: 2, unsatisfiable: 0 },
+    },
+  });
+  try {
+    const r = await runAsyncDisp(
+      ["dispatch", "task-rotate", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--auto-route", "--as", "agent-other"],
+      remoteCapEnv(home, base, { SPOR_DISPATCH_AGENT: "agent-mine", ...cleanProbeEnv() })
+    );
+    assert.strictEqual(r.status, 1);
+    const edges = edgeHits(hits);
+    assert.strictEqual(edges.length, 1);
+    assert.strictEqual(JSON.parse(edges[0].body).to, "agent-me-ci", "agent-mine is this box under dispatch.agent — never its own re-route target");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --auto-route: a foreign-owned candidate is skipped even if the server ignored owner=me", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  // Owner scoping is the SERVER's; a deployment that predates or ignores `owner`
+  // would hand this caller's work to a colleague's box. Our own agent's entry
+  // names our person for free, so the client can hold the server to its scope.
+  const { srv, hits, base } = await fleetStub({
+    hosts: {
+      profile: "profile-codex",
+      satisfiable: [
+        { agent: "agent-bob-laptop", owner: "person-bob", age_seconds: 10 },
+        { agent: "agent-me-ci", owner: "person-me", age_seconds: 900 },
+      ],
+      unsatisfiable: [{ agent: "agent-mine", owner: "person-me", age_seconds: 5, reasons: ["harness 'codex' not available here"] }],
+      counts: { satisfiable: 2, unsatisfiable: 1 },
+    },
+  });
+  try {
+    const r = await runAsyncDisp(
+      ["dispatch", "task-rotate", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--auto-route"],
+      remoteCapEnv(home, base, { SPOR_DISPATCH_AGENT: "agent-mine", ...cleanProbeEnv() })
+    );
+    assert.strictEqual(r.status, 1);
+    const edges = edgeHits(hits);
+    assert.strictEqual(edges.length, 1);
+    assert.strictEqual(JSON.parse(edges[0].body).to, "agent-me-ci", "person-bob's box is never a re-route target");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --auto-route (local, unsatisfiable): byte-identical — no scheduler, no handoff", () => {
+  const { home, nodes, repo } = fixture();
+  writeProfile(nodes, "profile-codex", "harness: codex");
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const r = run(["dispatch", "dec-x", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--auto-route"], { SPOR_HOME: home, ...cleanProbeEnv() });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /assignment is unchanged. Re-route to a machine that satisfies it/);
+  assert.doesNotMatch(r.stderr, /auto-routed/);
 });
 
 // --- fresh re-probe before the satisfiability check
