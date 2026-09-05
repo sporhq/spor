@@ -5218,6 +5218,7 @@ test("the rescue inherits the worker's unattended posture, filtered per harness 
     dispatchRuns.atomicJson(dispatchRuns.runPaths(home, pipelineRun).record, { run_id: pipelineRun, node_id: "task-fix-me", state: "done", created_at: new Date().toISOString() });
     const warnings = [];
     let values = null;
+    let dispatchOpts = null;
     let dispatches = 0;
     const deps = sporCli.makeGateDeps(cfg, {
       record: { node_id: "task-fix-me", cwd: home },
@@ -5227,8 +5228,9 @@ test("the rescue inherits the worker's unattended posture, filtered per harness 
       passthrough,
       warn: (line) => warnings.push(line), log: () => {}, stopping: () => false, home,
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-      dispatch: async (_cfg, vals) => {
+      dispatch: async (_cfg, vals, _positionals, opts) => {
         values = vals;
+        dispatchOpts = opts;
         dispatches += 1;
         const id = `rescue-run-${n}`;
         const p = dispatchRuns.runPaths(home, id);
@@ -5242,7 +5244,7 @@ test("the rescue inherits the worker's unattended posture, filtered per harness 
       attempt: 1, detail: "the review requested changes", evidence: "", findings: [], attempts: [], ledger: [], fact: null,
     });
     assert.strictEqual(r.ok, true, r.reason);
-    return { values, warnings, deps, dispatches: () => dispatches };
+    return { values, warnings, deps, dispatchOpts: () => dispatchOpts, dispatches: () => dispatches };
   };
 
   // A claude-code worker rescuing to a claude-code profile: the bypass rides.
@@ -5251,6 +5253,7 @@ test("the rescue inherits the worker's unattended posture, filtered per harness 
   assert.deepStrictEqual([claude.values.model, claude.values.agent], [undefined, undefined], "the lane's profile names the model, not the worker");
   assert.strictEqual(claude.values.as, "agent-worker", "harness-neutral keys still ride");
   assert.deepStrictEqual(claude.warnings, []);
+  assert.deepStrictEqual(claude.dispatchOpts(), { allowAttended: false }, "an unattended posture never needs the acknowledgement");
 
   // …to a Codex profile: the flag rides too, and the Codex adapter is what
   // translates it into `--sandbox danger-full-access --approval-policy never`
@@ -5343,6 +5346,11 @@ test("the rescue inherits the worker's unattended posture, filtered per harness 
   );
   assert.strictEqual(attendedToClaude.warnings.length, 2);
   assert.match(attendedToClaude.warnings[1], /reads as attended and has no profile-rescue-claude spelling, so the rescue runs attended there/);
+  // issue-spor-rescue-posture-attended-translation-hard-refuses: a genuinely
+  // attended reading (no narrowing available) still tells the dispatcher to
+  // proceed rather than let the worker preflight hard-refuse the launch —
+  // the warn-and-narrow branch above must stay reachable.
+  assert.deepStrictEqual(attendedToClaude.dispatchOpts(), { allowAttended: true }, "claude-code: no lane spelling still dispatches, acknowledged");
   // F1 of the review of that fix: attended is ENFORCED on the lane, not left
   // to whatever survived or to the lane's default. A claude-code worker in
   // `acceptEdits` rescuing into a Codex lane (Codex hard-errors on it) gets
@@ -5354,6 +5362,8 @@ test("the rescue inherits the worker's unattended posture, filtered per harness 
   assert.deepStrictEqual([acceptEditsToCodex.values["permission-mode"], acceptEditsToCodex.values["read-only"]], [undefined, undefined]);
   assert.strictEqual(acceptEditsToCodex.warnings.length, 2);
   assert.match(acceptEditsToCodex.warnings[1], /reads as attended, so the rescue under profile-rescue-codex runs attended there as --approval-policy on-request/);
+  // Codex's OWN declared attended posture is also acknowledged, not refused.
+  assert.deepStrictEqual(acceptEditsToCodex.dispatchOpts(), { allowAttended: true }, "codex: its own attended posture still dispatches, acknowledged");
   // …and a surviving UNATTENDED flag is displaced by the attended reading: a
   // Codex worker's translated bypass beside an approval policy that gates on
   // prompts reads as attended, so the bypass must not ride into a claude-code
@@ -5362,6 +5372,7 @@ test("the rescue inherits the worker's unattended posture, filtered per harness 
   assert.strictEqual(bypassBesideAttended.values["permission-mode"], undefined, "the surviving bypass is displaced by the attended reading");
   assert.deepStrictEqual([bypassBesideAttended.values["read-only"], bypassBesideAttended.values["approval-policy"]], [undefined, undefined]);
   assert.match(bypassBesideAttended.warnings[1], /reads as attended and has no profile-rescue-claude spelling/);
+  assert.deepStrictEqual(bypassBesideAttended.dispatchOpts(), { allowAttended: true }, "the displaced-bypass case is also acknowledged, not refused");
   // A lane whose harness has NO attended posture (OpenCode's `--auto` cannot
   // be unsaid) narrows to read-only — the next reading down — rather than
   // running attended-in-name-only at its unattended default.
@@ -5369,6 +5380,10 @@ test("the rescue inherits the worker's unattended posture, filtered per harness 
   assert.strictEqual(attendedToOpencode.values["read-only"], true, "no attended spelling narrows to the lane's read-only posture");
   assert.strictEqual(attendedToOpencode.values["permission-mode"], undefined);
   assert.match(attendedToOpencode.warnings[1], /reads as attended, and profile-rescue-opencode's harness has no attended posture \(it never asks\), so the rescue narrows to that harness's read-only posture \(--read-only\)/);
+  // Narrowed to read-only already runs fine under the worker preflight (the
+  // read-only flag short-circuits its posture gate), so the caller needs no
+  // acknowledgement here — unlike the three genuinely-attended cases above.
+  assert.deepStrictEqual(attendedToOpencode.dispatchOpts(), { allowAttended: false }, "opencode: narrowed to read-only needs no acknowledgement");
   // A posture the lane reads NATIVELY is untouched by the translation: the
   // Codex lane keeps the worker's own `--sandbox read-only` verbatim.
   const readOnlyToCodex = await launchUnder("profile-rescue-codex", { sandbox: "read-only" });

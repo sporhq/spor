@@ -72,6 +72,20 @@ test("checkWritePosture refuses an unattended run with no posture, and never jud
   assert.strictEqual(attended.ok, false);
   assert.match(attended.reason, /ATTENDED/);
 
+  // issue-spor-rescue-posture-attended-translation-hard-refuses: the rescue
+  // lane's own posture translation reads a foreign flag BY MEANING and, where
+  // it lands on attended with no narrower reading available, deliberately
+  // runs it anyway (accepting the historical stall risk) rather than losing
+  // the rescue outright. `allowAttended` is that caller's acknowledgement —
+  // it must not relax the refusal for an ORDINARY unattended dispatch with no
+  // posture at all, only the already-attended reading.
+  const attendedAcknowledged = preflight.checkWritePosture({ adapter: claude, options: { permissionMode: "acceptEdits" }, unattended: true, allowAttended: true });
+  assert.strictEqual(attendedAcknowledged.ok, true, "the caller already read and deliberately chose this posture");
+  assert.strictEqual(attendedAcknowledged.meaning, "attended");
+  const noPostureAcknowledged = preflight.checkWritePosture({ adapter: claude, options: none, unattended: true, allowAttended: true });
+  assert.strictEqual(noPostureAcknowledged.ok, false, "allowAttended only covers an ATTENDED reading, not an unresolved one");
+  assert.match(noPostureAcknowledged.reason, /no write posture resolved/);
+
   const fine = preflight.checkWritePosture({ adapter: claude, options: { permissionMode: "bypassPermissions" }, unattended: true });
   assert.strictEqual(fine.ok, true);
   // A review gate never asked to write, so read-only IS the appropriate posture.

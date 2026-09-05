@@ -2455,12 +2455,21 @@ a stale premise is triage's, not the lane's.
    otherwise a claude-code rescue launches attended and stalls exactly as the
    un-postured dispatch did. Every drop, translation and substitution is
    warned about, since it changes what an unattended agent may do. Since
-   §3.1, a translation that lands on ATTENDED no longer merely warns: the
-   worker preflight refuses that rescue dispatch outright, because an
-   attended rescue on an unattended box stalls on its first write and is
-   discovered only by the idle ceiling. It reads back as "the rescue could
-   not be dispatched" and escalates to a person — which is what the stall
-   would have produced anyway, an hour later and with a worker slot held.
+   §3.1, the worker preflight also judges this dispatch's write posture — but
+   a translation that lands on ATTENDED does not trip it: the runner has
+   already read the worker's foreign posture, translated it BY MEANING, and
+   deliberately chosen not to widen it, so it hands preflight that
+   acknowledgement (never a general `--force` — an ordinary worker with no
+   posture at all still refuses) and the dispatch proceeds under the warned
+   posture instead of being hard-refused before it ever runs
+   (issue-spor-rescue-posture-attended-translation-hard-refuses). It may still
+   stall on its first write and be discovered only by the idle ceiling — the
+   same risk a pre-preflight rescue always ran — but a hard refusal here would
+   have thrown the rescue away outright, where a stall at least leaves the
+   diagnosis file and whatever the rescue committed before the stall. Only the
+   narrowed-to-read-only reading needs no such acknowledgement: it already
+   proceeds on its own, since a read-only run was never judged for write
+   posture in the first place.
    What never rides is the worker's ROUTING — `--model` and `--agent` — because the
    lane's profile is what names the strong model, and a worker's `--model`
    would override it.

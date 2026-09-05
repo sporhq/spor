@@ -9531,6 +9531,14 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   // which is what keeps the interactive single-run behavior unchanged
   // (task-spor-worker-preflight-validation).
   const unattended = !!(ctx && ctx.unattended);
+  // A rescue that read the worker's foreign posture and translated it BY
+  // MEANING to a genuinely attended one (no lane-declared unattended/read-only
+  // narrowing applied — see rescuePassthrough) sets this: the caller has
+  // already made the deliberate, non-widening choice this posture represents,
+  // so preflight's unattended-write gate proceeds instead of refusing
+  // (issue-spor-rescue-posture-attended-translation-hard-refuses). Nothing
+  // else sets it — an ordinary worker with no posture at all still refuses.
+  const allowAttended = !!(ctx && ctx.allowAttended);
   const dirOpt = values.dir || null;
   const model = values.model || null;
   let permMode = values["permission-mode"] || null;
@@ -10178,6 +10186,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     unattended,
     readOnly,
     harnessId: harness,
+    allowAttended,
   });
   // Live writers already in the candidate. Read from the durable run records —
   // the same store the same-machine guard reads — so occupancy can never
@@ -11294,8 +11303,8 @@ function integrationSatisfiability(cfg, factory, { persistProbe = true } = {}) {
 // dispatch's refusal under the wrong item. The lock is held only until a
 // launch returns (seconds), never for the life of a run.
 let DISPATCH_LOCK = Promise.resolve();
-function dispatchThrough(cfg, values, positionals = []) {
-  const run = DISPATCH_LOCK.then(() => dispatchThroughLocked(cfg, values, positionals));
+function dispatchThrough(cfg, values, positionals = [], opts = {}) {
+  const run = DISPATCH_LOCK.then(() => dispatchThroughLocked(cfg, values, positionals, opts));
   DISPATCH_LOCK = run.then(
     () => {},
     () => {}
@@ -11303,7 +11312,7 @@ function dispatchThrough(cfg, values, positionals = []) {
   return run;
 }
 
-async function dispatchThroughLocked(cfg, values, positionals = []) {
+async function dispatchThroughLocked(cfg, values, positionals = [], opts = {}) {
   const launches = [];
   const lines = [];
   const previousTee = ERR_TEE;
@@ -11319,7 +11328,11 @@ async function dispatchThroughLocked(cfg, values, positionals = []) {
     // unattended: nobody is there to answer a permission prompt or to notice
     // two agents in one checkout, so the worker preflight applies
     // (task-spor-worker-preflight-validation).
-    code = await cmdDispatch(cfg, { values, positionals }, { onLaunch: (l) => launches.push(l), supervisedOnly: true, carryTask: true, unattended: true });
+    // allowAttended: only the rescue lane ever sets this (opts.allowAttended),
+    // for a launch whose posture it already translated by meaning to a
+    // genuinely attended one — see cmdDispatch's own comment
+    // (issue-spor-rescue-posture-attended-translation-hard-refuses).
+    code = await cmdDispatch(cfg, { values, positionals }, { onLaunch: (l) => launches.push(l), supervisedOnly: true, carryTask: true, unattended: true, allowAttended: !!opts.allowAttended });
   } catch (e) {
     // A throw AFTER the launch (the post-launch session capture and bind are
     // network calls) still means an agent is running and holding a lease —
@@ -13062,6 +13075,14 @@ function makeGateDeps(
     // Read the lane's harness only when there is a launch to shape — an
     // adopted run was already launched under whatever posture it got.
     let values = null;
+    // Set only for the genuinely ATTENDED sub-case below (the lane's own
+    // declared attended posture, or no lane spelling at all): the read-only
+    // narrowing already runs fine under the worker preflight (it sets
+    // `values["read-only"]`, which the preflight gate never judges), so it
+    // needs no acknowledgement. This is the caller's deliberate, non-widening
+    // choice that lets preflight proceed instead of hard-refusing
+    // (issue-spor-rescue-posture-attended-translation-hard-refuses).
+    let allowAttended = false;
     if (!already) {
       const shaped = rescuePassthrough(passthrough, await rescueHarnessAdapter(cfg, lane.profile));
       if (shaped.dropped.length) {
@@ -13077,6 +13098,14 @@ function makeGateDeps(
             ` under that harness's own read-only posture (${appliedFlags}) — it can diagnose but not fix; a rescue never widens the worker's posture.`
         );
       } else if (shaped.translated && shaped.translated.meaning === "attended") {
+        // Narrowed to read-only already runs fine (values["read-only"] short-
+        // circuits the preflight gate below); the other two sub-cases are
+        // genuinely attended, so the preflight write-posture gate must be
+        // told this dispatch's posture was chosen deliberately, not left
+        // un-postured — else it hard-refuses before this run ever gets a
+        // chance to stall the way it always has
+        // (issue-spor-rescue-posture-attended-translation-hard-refuses).
+        allowAttended = !shaped.translated.narrowed;
         warn(
           shaped.translated.narrowed
             ? `warning: the worker's posture (${shaped.translated.from}) reads as attended, and ${lane.profile}'s harness has no attended posture` +
@@ -13108,7 +13137,7 @@ function makeGateDeps(
       // tolerance is the backstop.
       excludeRescueDiagnosisDir(cwd);
     }
-    const launched = already ? { ok: true, run: already, adopted: true } : await dispatch(cfg, values, [prompt]);
+    const launched = already ? { ok: true, run: already, adopted: true } : await dispatch(cfg, values, [prompt], { allowAttended });
     if (!launched.ok) return { ok: false, reason: `the rescue under ${lane.profile} could not be dispatched: ${launched.reason}` };
     if (launched.adopted) log(`work: rescue attempt ${attempt} on ${entry.node_id} was already launched as run ${String(launched.run.run_id).slice(0, 8)} — adopting it, not dispatching again`);
     dispatchRuns.stampGateState(home, entry.run_id, { gate_rescue_run_id: launched.run.run_id, gate_rescue_at: new Date().toISOString(), gate_rescue_attempt: attempt });
