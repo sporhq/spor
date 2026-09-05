@@ -459,6 +459,34 @@ test("an integration escalation that could not be filed STOPS the demotion, reco
   assert.match(seen.facts[0].markdown, /Demotion: not attempted — no escalation could be filed to block task-demo, so its status is left as the run left it/);
   assert.doesNotMatch(seen.facts[0].markdown, /rolled back/);
   assert.doesNotMatch(seen.facts[0].markdown, /Escalated to/);
+  // task-spor-escalation-retry-closing-artifact-and-integration-settle: the
+  // refusal also leaves the SAME replay payload a gate refusal leaves, so the
+  // loop stamps it as `gate_escalation_pending` and the bounded auto-retry
+  // (bin/spor.js retryOneEscalation) covers integration refusals too — no
+  // second retry machine. `stage` is the route (a gate may be named
+  // `integration`); the args are exactly what `deps.escalate` was handed.
+  assert.strictEqual(res.escalation_retry.stage, "integration");
+  assert.strictEqual(res.escalation_retry.gateId, integrationRunner.INTEGRATION_STAGE_ID);
+  assert.strictEqual(res.escalation_retry.attempt, ITEM.attempt, "the exact attempt this call used");
+  assert.deepStrictEqual(res.escalation_retry.attempts, seen.escalations[0].attempts);
+  assert.strictEqual(res.escalation_retry.detail, seen.escalations[0].detail);
+  assert.strictEqual(res.escalation_retry.evidence, seen.escalations[0].evidence);
+  assert.match(res.escalation_retry.evidence, /1 failing/);
+  assert.strictEqual(res.escalation_retry.factId, seen.facts[0].id, "names the art-merge fact that says no escalation could be filed");
+});
+
+test("a propose-mode integration refusal's retry payload names the phase-keyed art-merge fact it will close", async () => {
+  const { deps, seen } = integrationFakes({
+    suite: () => ({ ok: false, reason: "npm test exited 1", output: "1 failing" }),
+    escalate: () => ({ ok: false, reason: "offline" }),
+  });
+  const factory = { ...FACTORY, integration: { ...FACTORY.integration, mode: "propose", cycles: 0 } };
+  const res = await integrationRunner.runIntegrationStage({ item: { ...ITEM, attempt: 2 }, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(res.escalation_failed, true);
+  assert.strictEqual(res.escalation_retry.attempt, 2);
+  assert.strictEqual(res.escalation_retry.factId, integrationRunner.integrationFactId("task-demo", ITEM.run_id, "failed", 2));
+  assert.strictEqual(res.escalation_retry.factId, seen.facts[0].id);
 });
 
 test("the same integration refusal WITH an escalation is unchanged — it escalates, then demotes naming the blocker, and is not marked", async () => {
@@ -474,6 +502,7 @@ test("the same integration refusal WITH an escalation is unchanged — it escala
   assert.strictEqual(seen.demotions[0].blockerId, "task-integration-escalate-x", "the demotion names the blocker it waits on");
   assert.match(seen.facts[0].markdown, /Demotion: task-demo rolled back done -> open; task-integration-escalate-x now blocks task-demo/);
   assert.match(seen.facts[0].markdown, /Escalated to task-integration-escalate-x/);
+  assert.strictEqual(res.escalation_retry, undefined, "a landed escalation leaves nothing to replay");
 });
 
 test("an escalation that throws is the same as one refused — no demotion, marked", async () => {

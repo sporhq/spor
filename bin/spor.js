@@ -13999,10 +13999,21 @@ async function retryOneEscalation(
   // (never persisted whole in the payload — see gate-runner.js): a factory
   // edited since the refusal (the gate renamed or removed) can't be replayed,
   // and that is a give-up, not a wait — no later poll makes a missing gate
-  // reappear on its own.
-  const gate = payload && factory && Array.isArray(factory.gates) ? factory.gates.find((g) => g.id === payload.gateId) : null;
-  if (!payload || !gate) {
-    giveUp(!payload ? "no retry payload was recorded for this refusal" : `gate '${payload.gateId}' is no longer declared by factory '${(factory && factory.id) || "?"}'`);
+  // reappear on its own. An INTEGRATION-stage refusal (integration-runner.js
+  // settle(), `stage: "integration"`) has no gate to find: it replays through
+  // the integration deps' own `escalate` instead, and its give-up is a factory
+  // that no longer declares the stage at all. The route is the payload's
+  // `stage`, never its `gateId` — a declared gate may be named `integration`.
+  const fromIntegration = !!(payload && payload.stage === integrationRunner.INTEGRATION_STAGE_ID);
+  const gate = payload && !fromIntegration && factory && Array.isArray(factory.gates) ? factory.gates.find((g) => g.id === payload.gateId) : null;
+  if (!payload || (fromIntegration ? !(factory && factory.integration) : !gate)) {
+    giveUp(
+      !payload
+        ? "no retry payload was recorded for this refusal"
+        : fromIntegration
+        ? `factory '${(factory && factory.id) || "?"}' no longer declares an integration stage`
+        : `gate '${payload.gateId}' is no longer declared by factory '${(factory && factory.id) || "?"}'`
+    );
     return;
   }
   // `attempt` travels with the payload, not recomputed: it keys the
@@ -14023,18 +14034,27 @@ async function retryOneEscalation(
     }
   }
   const entry = { node_id: record.node_id, run_id: record.run_id, attempt: payload.attempt, project };
-  const deps = makeGateDeps(cfg, { entry, factory, slug: project, log });
+  // The same deps the original attempt escalated through — a gate refusal's
+  // (makeGateDeps) or the integration stage's (makeIntegrationDeps, whose
+  // `escalate` mints the `task-integration-*` id and body the stage would
+  // have filed) — so the id a retry lands is the one the first attempt
+  // reached for, and a person reads one escalation shape per refusal kind.
+  const deps = fromIntegration
+    ? makeIntegrationDeps(cfg, { record, entry, factory, slug: project, log, warn, home })
+    : makeGateDeps(cfg, { entry, factory, slug: project, log });
   let esc;
   try {
-    esc = await deps.escalate({
-      gate,
-      attempts: payload.attempts || [],
-      detail: payload.detail || "",
-      evidence: payload.evidence || "",
-      findings: payload.findings || [],
-      ledger: payload.ledger || [],
-      ...(payload.rescue ? { rescue: payload.rescue, rescues: payload.rescues || [] } : {}),
-    });
+    esc = fromIntegration
+      ? await deps.escalate({ attempts: payload.attempts || [], detail: payload.detail || "", evidence: payload.evidence || "" })
+      : await deps.escalate({
+          gate,
+          attempts: payload.attempts || [],
+          detail: payload.detail || "",
+          evidence: payload.evidence || "",
+          findings: payload.findings || [],
+          ledger: payload.ledger || [],
+          ...(payload.rescue ? { rescue: payload.rescue, rescues: payload.rescues || [] } : {}),
+        });
   } catch (e) {
     esc = { ok: false, reason: (e && e.message) || String(e) };
   }
@@ -14071,10 +14091,77 @@ async function retryOneEscalation(
     },
     { allowSettledPatch: true }
   );
+  // The refusal's own fact (`art-gate-*`/`art-merge-*`, `payload.factId`)
+  // still reads "no escalation could be filed … status left as the run left
+  // it" — true when written, false now. A fact is never rewritten, so the
+  // correction is a small closing artifact beside it, the way a passing
+  // --regate closes an escalation (writeRegateArtifact): idempotent by (run,
+  // gate), `relates-to` the fact, the escalation and the item — never
+  // `resolves`, since the escalation it names is still a person's open item.
+  // Written AFTER the stamp above on purpose, and best-effort: the stamp is
+  // what says the escalation landed (`gate_escalated_to`, read by --status
+  // and --regate) and it must follow the landing whatever else happens,
+  // while this node is a prose correction — a debt flag that held the retry
+  // pending until it landed would, on a persistent artifact failure, spin
+  // the budget and then give up CLAIMING the escalation never landed. So a
+  // crash or a failed write here loses only this record (logged), and a
+  // replay of a landed retry — possible when the stamp itself did not land —
+  // finds every write idempotent, this one included.
+  const closed = await writeEscalationRetryArtifact(cfg, { entry, payload, gate, factory, escalatedTo: esc.id, demoted, project });
   log(
-    `work: gate escalation for ${record.node_id} landed on retry ${nextAttempt} (${esc.id})` +
-      (demoted.note ? `; ${demoted.note}` : demoted.reason ? ` — the item could not be demoted (${demoted.reason})` : "")
+    `work: ${fromIntegration ? "integration" : "gate"} escalation for ${record.node_id} landed on retry ${nextAttempt} (${esc.id})` +
+      (demoted.note ? `; ${demoted.note}` : demoted.reason ? ` — the item could not be demoted (${demoted.reason})` : "") +
+      (closed.ok ? `; closed ${payload.factId || "the refusal's fact"} with ${closed.id}` : `; the closing artifact over ${payload.factId || "the refusal's fact"} could not be written (${closed.reason})`)
   );
+}
+
+// The closing record a LANDED auto-retry writes over the refusal's fact
+// (task-spor-escalation-retry-closing-artifact-and-integration-settle): the
+// `art-gate-*`/`art-merge-*` fact said no escalation could be filed and the
+// demotion was withheld; this says both have since happened, and names them.
+// Through the same validated door as every other gate node, deterministic by
+// (run attempt, gate) so a replayed retry — or two boxes sharing one graph —
+// writes it once. Deliberately free of anything that varies between replays
+// (the attempt count lives on the run record), or writeGateNode's same-id-
+// different-content guard would refuse the second write as a collision.
+async function writeEscalationRetryArtifact(cfg, { entry, payload, gate, factory, escalatedTo, demoted, project }) {
+  const fromIntegration = payload.stage === integrationRunner.INTEGRATION_STAGE_ID;
+  const gateId = fromIntegration ? integrationRunner.INTEGRATION_STAGE_ID : gate.id;
+  const stem = gateStem(entry.node_id);
+  const short = gateRunner.shortRunAttempt(entry.run_id, entry.attempt);
+  const id = `art-gate-retry-${gateId.slice(0, 24)}-${stem}-${short}-${gateIdSuffix("escalation-retry", gateId, entry.node_id, gateRunner.gateRunKey(entry.run_id, entry.attempt))}`.toLowerCase();
+  const flat = (t, cap) => {
+    const s = String(t || "").replace(/\s+/g, " ").trim();
+    return s.length > cap ? `${s.slice(0, cap - 1)}…` : s;
+  };
+  const what = fromIntegration ? "the integration stage's refusal" : `the ${gate.id} ${gate.kind} gate's refusal`;
+  const demotion = demoted.note ? demoted.note : demoted.reason ? `the item could not be demoted (${demoted.reason}) — a later attempt or a person still owes that rollback` : `the item was not demoted (${demoted.demoted ? "done" : "nothing to roll back"})`;
+  const lines = [
+    "---",
+    `id: ${id}`,
+    "type: artifact",
+    ...(project ? [`project: ${project}`] : []),
+    `title: Escalation landed on auto-retry — ${flat(gateId, 24)} on ${flat(entry.node_id, 60)}`,
+    `summary: ${flat(`The escalation for ${what} of ${entry.node_id} (run ${String(entry.run_id).slice(0, 8)}) could not be filed when the refusal settled, and has since landed on the worker's bounded auto-retry as ${escalatedTo}; ${demotion}. This closes the stale "no escalation could be filed" line on ${payload.factId || "the refusal's fact"}.`, 460)}`,
+    `date: ${new Date().toISOString().slice(0, 10)}`,
+    "edges:",
+    ...(payload.factId ? [`  - {type: relates-to, to: ${payload.factId}}`] : []),
+    `  - {type: relates-to, to: ${escalatedTo}}`,
+    `  - {type: relates-to, to: ${entry.node_id}}`,
+    "---",
+    "",
+    `When factory \`${(factory && factory.id) || "factory"}\` refused ${entry.node_id} on run \`${entry.run_id}\`, the escalation that`,
+    `carries ${what} could not be written to the graph, so (WORKERS.md §10.7) the item's status was left as the run left it`,
+    `and its fact${payload.factId ? ` \`${payload.factId}\`` : ""} recorded the withheld demotion. The worker's bounded auto-retry has since`,
+    `replayed that one write: \`${escalatedTo}\` now exists and \`blocks\` ${entry.node_id}, and ${demotion}.`,
+    "",
+    "This is a gate outcome, not a resolution of anything: the escalation it names is still the open item a person",
+    "judges, and the refusal it closes the loop on stands. It exists so the fact's own words are not the last thing",
+    "read about this refusal.",
+    "",
+  ];
+  const written = await writeGateNode(cfg, id, gateCapBytes(lines.join("\n"), NODE_BODY_CAP_BYTES - 512));
+  return { ...written, id };
 }
 
 // --- the integration stage's serialize:repo lease (dec-spor-factory-
@@ -19593,7 +19680,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem };
+module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem };
 
 if (require.main === module) {
   main()

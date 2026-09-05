@@ -957,6 +957,12 @@ test("a failed escalation leaves a replayable retry payload — gate id, attempt
   assert.strictEqual(res.escalation_retry.gate, undefined);
   assert.strictEqual(res.escalation_retry.item, undefined);
   assert.strictEqual(res.escalation_retry.factory, undefined);
+  // The refusal's own fact rides along by its deterministic id, so a landed
+  // retry can write its closing artifact over the node that says "no
+  // escalation could be filed" (task-spor-escalation-retry-closing-artifact-
+  // and-integration-settle).
+  assert.strictEqual(res.escalation_retry.factId, gateRunner.gateFactId("acceptance", ITEM.node_id, ITEM.run_id, 3, 0));
+  assert.ok(res.facts.includes(res.escalation_retry.factId), "it names the fact this refusal recorded");
 });
 
 test("a human gate genuinely blocked on its own already-filed approval leaves NO retry payload — there is no failed escalate call to replay", async () => {
@@ -3825,7 +3831,12 @@ function scratchGraphForRetry() {
 }
 
 function pendingRecord(dispatchRuns, home, runId, patch = {}) {
-  const pending = { gateId: "acceptance", attempt: undefined, attempts: [{ verdict: "failed", detail: "the suite failed" }], detail: "the suite failed", evidence: "", findings: [], ledger: [] };
+  const pending = {
+    gateId: "acceptance", attempt: undefined, attempts: [{ verdict: "failed", detail: "the suite failed" }], detail: "the suite failed", evidence: "", findings: [], ledger: [],
+    factId: gateRunner.gateFactId("acceptance", "task-demo", runId, 0, 0),
+    ...(patch.pending || {}),
+  };
+  delete patch.pending;
   dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, {
     run_id: runId, node_id: "task-demo", state: "done", terminal_state: "resolved", terminal_enforced: true, item_repo: null,
     gate_state: "failed", gate_escalation_failed: true, gate_escalation_pending: pending, gate_escalation_retry_count: 0,
@@ -3853,6 +3864,99 @@ test("retryOneEscalation lands the write on retry, demotes the item, and clears 
 
   assert.match(fs.readFileSync(path.join(home, "nodes", `${after.gate_escalated_to}.md`), "utf8"), /blocks/);
   assert.match(fs.readFileSync(path.join(home, "nodes", "task-demo.md"), "utf8"), /status: open/);
+
+  // task-spor-escalation-retry-closing-artifact-and-integration-settle: the
+  // refusal's art-gate fact still says no escalation could be filed, so the
+  // landed retry writes a closing artifact beside it — relating to the fact,
+  // the escalation and the item, resolving nothing (the escalation is still
+  // a person's open item).
+  const closing = fs.readdirSync(path.join(home, "nodes")).filter((f) => f.startsWith("art-gate-retry-acceptance-demo-"));
+  assert.strictEqual(closing.length, 1, "one closing artifact");
+  const closingMd = fs.readFileSync(path.join(home, "nodes", closing[0]), "utf8");
+  assert.match(closingMd, new RegExp(`relates-to, to: ${record.gate_escalation_pending.factId}`), "relates to the refusal's own fact");
+  assert.match(closingMd, new RegExp(`relates-to, to: ${after.gate_escalated_to}`), "relates to the escalation that landed");
+  assert.match(closingMd, /relates-to, to: task-demo/);
+  assert.doesNotMatch(closingMd, /type: resolves/, "closes the fact's stale claim; retires nothing");
+  assert.match(closingMd, /rolled back done -> open/, "says what the demotion did");
+  assert.match(closingMd, /task-demo/);
+
+  // A replay of an already-landed retry (the clearing stamp did not land, or
+  // a stale record was handed in) finds every write idempotent: the same
+  // escalation, no second demotion, the same single closing artifact — and
+  // the record still reads landed.
+  await sporCli.retryOneEscalation(cfg, { record, attempts: 0 }, { factory: RETRY_FACTORY, log: () => {}, home });
+  const again = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  assert.strictEqual(again.gate_escalated_to, after.gate_escalated_to);
+  assert.strictEqual(again.gate_escalation_failed, false);
+  assert.deepStrictEqual(fs.readdirSync(path.join(home, "nodes")).filter((f) => f.startsWith("art-gate-retry-")), closing);
+  assert.strictEqual(fs.readFileSync(path.join(home, "nodes", closing[0]), "utf8"), closingMd, "byte-identical on replay");
+  assert.match(fs.readFileSync(path.join(home, "nodes", "task-demo.md"), "utf8"), /status: open/);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+// task-spor-escalation-retry-closing-artifact-and-integration-settle: an
+// INTEGRATION-stage refusal leaves the same payload (integration-runner.js
+// settle()), keyed `stage: "integration"`, and the SAME retry machine replays
+// it — through the integration deps' own `escalate`, so the id and body a
+// person reads are the ones the stage would have filed itself.
+const RETRY_INTEGRATION_FACTORY = {
+  id: "factory-test",
+  gates: [{ id: "acceptance", kind: "command", command: "npm test" }],
+  integration: { targetRef: "main", mode: "local", command: "npm test", strategy: "merge", serialize: "repo", cycles: 0, timeoutMs: 900000 },
+};
+
+test("retryOneEscalation replays an INTEGRATION-stage refusal through the integration deps, demotes, and closes the art-merge fact", async () => {
+  const { home, cfg, dispatchRuns } = scratchGraphForRetry();
+  const integrationRunner = require("../lib/shell/integration-runner.js");
+  const runId = "ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const factId = integrationRunner.integrationFactId("task-demo", runId, null, 0);
+  const record = pendingRecord(dispatchRuns, home, runId, {
+    pending: { stage: "integration", gateId: "integration", attempts: [{ verdict: "failed", detail: "npm test exited 1" }], detail: "npm test exited 1", evidence: "1 failing", factId, findings: undefined, ledger: undefined },
+  });
+  assert.strictEqual(record.gate_escalation_pending.stage, "integration");
+
+  const logs = [];
+  await sporCli.retryOneEscalation(cfg, { record, attempts: 0 }, { factory: RETRY_INTEGRATION_FACTORY, log: (l) => logs.push(l), warn: (l) => logs.push(l), home });
+
+  const after = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  assert.strictEqual(after.gate_escalation_failed, false);
+  assert.strictEqual(after.gate_escalation_pending, null);
+  assert.strictEqual(after.gate_escalation_retry_count, 1);
+  assert.ok(after.gate_escalated_to, "an escalation now exists");
+  assert.match(after.gate_escalated_to, /^task-integration-demo-/, "the integration stage's own escalation id, not a gate's");
+  const escMd = fs.readFileSync(path.join(home, "nodes", `${after.gate_escalated_to}.md`), "utf8");
+  assert.match(escMd, /Integration escalation — could not land task-demo/);
+  assert.match(escMd, /blocks, to: task-demo/);
+  assert.match(escMd, /1 failing/, "the captured evidence rides the replayed body");
+  assert.match(fs.readFileSync(path.join(home, "nodes", "task-demo.md"), "utf8"), /status: open/, "demoted once the escalation landed");
+
+  const closing = fs.readdirSync(path.join(home, "nodes")).filter((f) => f.startsWith("art-gate-retry-integration-demo-"));
+  assert.strictEqual(closing.length, 1, "one closing artifact, keyed on the integration stage");
+  const closingMd = fs.readFileSync(path.join(home, "nodes", closing[0]), "utf8");
+  assert.match(closingMd, new RegExp(`relates-to, to: ${factId}`), "relates to the refusal's art-merge fact");
+  assert.match(closingMd, new RegExp(`relates-to, to: ${after.gate_escalated_to}`));
+  assert.match(closingMd, /integration stage's refusal/);
+  assert.ok(logs.some((l) => /integration escalation for task-demo landed on retry 1/.test(l) && new RegExp(`closed ${factId}`).test(l)), logs.join("\n"));
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("retryOneEscalation: an integration refusal whose factory no longer declares the stage gives up, never replays it through a gate named 'integration'", async () => {
+  const { home, cfg, dispatchRuns } = scratchGraphForRetry();
+  const runId = "abababab-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const record = pendingRecord(dispatchRuns, home, runId, {
+    pending: { stage: "integration", gateId: "integration", attempts: [], detail: "npm test exited 1", evidence: "", factId: "art-merge-demo-x", findings: undefined, ledger: undefined },
+  });
+  const logs = [];
+  // A factory that DOES declare a gate named `integration` but no integration
+  // stage: the payload's `stage` is the route, so this must not be mistaken
+  // for that gate's refusal.
+  const factory = { id: "factory-test", gates: [{ id: "integration", kind: "command", command: "npm test" }] };
+  await sporCli.retryOneEscalation(cfg, { record, attempts: 0 }, { factory, log: (l) => logs.push(l), warn: (l) => logs.push(l), home });
+  const after = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  assert.strictEqual(after.gate_escalation_retry_exhausted, true);
+  assert.strictEqual(after.gate_escalation_failed, true, "still unescalated");
+  assert.ok(logs.some((l) => /no longer declares an integration stage/.test(l)), logs.join("\n"));
+  assert.deepStrictEqual(fs.readdirSync(path.join(home, "nodes")).filter((f) => f.startsWith("task-")), ["task-demo.md"], "nothing was filed");
   fs.rmSync(home, { recursive: true, force: true });
 });
 

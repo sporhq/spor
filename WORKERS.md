@@ -1032,8 +1032,8 @@ written only after the outcome dimension exists):
 | `gate_fix_run_id` | string | optional — the run id of the most recent fix cycle this pipeline dispatched at the same node, stamped the moment it was dispatched (not when it finishes). If a stop lands while that fix cycle is still going, this field is what turns "the pipeline was abandoned" into "here is the run to go check" — a fix cycle's own dispatched run is detached and keeps going regardless (§10.7), and this is the only durable pointer to it. `spor runs`/`spor work --status` surface it. |
 | `gate_fix_at` | ISO 8601 | when `gate_fix_run_id` was stamped |
 | `gate_progress` | object | optional — `{key, at, seq, gates: {<gate id>: {fixes, attempts, ledger, lastFix}}}`: each gate's own memory (§10.4), saved after every review verdict (with the fix it decided on as `lastFix.dispatched: false`) and again when the fix's launch is known (`fixes` counts LAUNCHED fixes only). `key` is the attempt's run key — a resumed pipeline of the same attempt reads it back; a `--regate` (a new attempt) ignores it. Best-effort like every `gate_*` stamp: a write that fails is logged and the pipeline goes on |
-| `gate_escalation_failed` | boolean | optional — set when the refusal (a gate's, or the integration stage's, §10.9) could not file the escalation that carries it, so nothing was written to the graph and (§10.7) nothing was demoted either. The verdict is still settled; this is what says the refusal is readable only on this box, and that `spor work --regate` — or, for a GATE refusal, the bounded auto-retry below — is the door back. Cleared (`false`) once an escalation lands, by hand or by the auto-retry |
-| `gate_escalation_pending` | object | optional, gate-pipeline refusals only (§10.7) — the exact args `deps.escalate` needs to replay the failed write: `{gateId, attempt, attempts, detail, evidence, findings, ledger, rescue?, rescues?}`. What the bounded auto-retry reads; absent for an integration-stage refusal (no auto-retry there yet) or a blocked human gate (no escalate call to replay). Cleared (`null`) once the escalation lands |
+| `gate_escalation_failed` | boolean | optional — set when the refusal (a gate's, or the integration stage's, §10.9) could not file the escalation that carries it, so nothing was written to the graph and (§10.7) nothing was demoted either. The verdict is still settled; this is what says the refusal is readable only on this box, and that the bounded auto-retry below — or `spor work --regate` once it gives up — is the door back. Cleared (`false`) once an escalation lands, by hand or by the auto-retry |
+| `gate_escalation_pending` | object | optional (§10.7) — the exact args `deps.escalate` needs to replay the failed write. A gate refusal's: `{gateId, attempt, attempts, detail, evidence, findings, ledger, factId, rescue?, rescues?}`; the integration stage's (§10.9): `{stage: "integration", gateId: "integration", attempt, attempts, detail, evidence, factId}` — `stage` is what routes the replay to the stage's own escalation (a declared gate may be named `integration` too), and `factId` names the refusal's own `art-gate-…`/`art-merge-…` fact so a landed retry can close it. What the bounded auto-retry reads; absent for a blocked human gate (no escalate call to replay). Cleared (`null`) once the escalation lands |
 | `gate_escalation_retry_count` | number | optional — how many times the bounded auto-retry has attempted this refusal's escalation write, landed or not. `0` the moment `gate_escalation_pending` is first stamped |
 | `gate_escalation_retry_at` | ISO 8601 | optional — the earliest time the next auto-retry attempt may run (exponential backoff from `work.escalationRetryBackoffMs`, capped at `work.escalationRetryMaxBackoffMs`). Absent means "due now" |
 | `gate_escalation_retry_exhausted` | boolean | optional — the auto-retry spent `work.escalationRetryMaxAttempts` attempts without landing the escalation and gave up loudly (one log line); `spor work --regate` is the only door left |
@@ -2000,7 +2000,19 @@ backoff has elapsed (`gate_escalation_retry_count`/`_retry_at`, doubling from
 `gateDemoteItem` reads the item's current status before writing — so a retry
 can only ever finish what the first attempt started, never double-file the
 escalation or double-demote the item; nothing here re-runs the suite, a
-review, or a fix cycle. After `work.escalationRetryMaxAttempts` attempts
+review, or a fix cycle. The same door serves an integration-stage refusal
+(§10.9): its payload carries `stage: "integration"` and replays through the
+stage's own escalation, so there is one retry machine, not two. Once the
+write lands, the refusal's own fact (`art-gate-…`, or `art-merge-…` for the
+stage) still reads "no escalation could be filed" — a fact is never
+rewritten — so the retry writes a small closing artifact beside it
+(`art-gate-retry-…`, idempotent by run and gate) that `relates-to` the fact,
+the escalation and the item, and resolves nothing: the escalation it names is
+still a person's open item. That artifact is a prose correction, not a debt —
+it is written after the run record is stamped landed and a failed write is
+only logged, since a flag that held the retry pending on it would, on a
+persistent artifact failure, spend the budget and then give up claiming the
+escalation never landed. After `work.escalationRetryMaxAttempts` attempts
 (default 5) it gives up loudly — one log line, `gate_escalation_retry_exhausted:
 true` on the record — and the door back is the one below, `spor work --regate
 <run-id>`, exactly as if the auto-retry had never run.
@@ -2301,9 +2313,12 @@ act in that order here too: the rollback runs only once the escalation
 exists. An escalation write that fails leaves the item's status exactly as
 the run left it, the `art-merge-…` fact records `Demotion: not attempted`
 and why, and the run record carries `gate_escalation_failed: true` beside
-the settled verdict — the same marker, and the same door back (`spor work
---regate <run-id>`, which re-runs the gates AND this stage off the run
-record), as a gate refusal.
+the settled verdict — the same marker, and the same doors back, as a gate
+refusal: the bounded auto-retry (§10.7) reads the `gate_escalation_pending`
+payload this refusal leaves too (`stage: "integration"`, replayed through the
+stage's own escalation, closed over the `art-merge-…` fact by the same
+`art-gate-retry-…` artifact), and `spor work --regate <run-id>` — which
+re-runs the gates AND this stage off the run record — once it gives up.
 
 **Cleanup runs on a landing OR a proposal.** The candidate worktree is always
 removed, win or lose (it is throwaway by construction); the implementer's own
