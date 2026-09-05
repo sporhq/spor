@@ -5,8 +5,10 @@
 //   1. the PIPELINE (lib/shell/gate-runner.js) driven with fakes: all three gate
 //      kinds, inline and referenced, the fix-cycle loop, the cycle-cap
 //      escalation, the graph fact every outcome leaves behind, and the
-//      DEMOTION a refusal writes (§10.7 — a refused claim must stop reading
-//      done everywhere, not just in this box's cooldown map);
+//      ESCALATION and DEMOTION a refusal writes (§10.7 — a refused claim must
+//      stop reading done everywhere, not just in this box's cooldown map);
+//      both have one test apiece that swaps the mock for the real production
+//      door against a real local nodes dir, re-reading the file afterward;
 //   2. the COMMAND GATE's git plumbing against a REAL throwaway repo — the one
 //      test that has to be real, because the claim being made is "the suite that
 //      runs is the trusted ref's copy, never the implementer branch's";
@@ -2268,6 +2270,67 @@ test("runGatePipeline's reported rollback actually lands on disk — the real de
     "and the on-disk graph must actually say so — a pipeline that CLAIMS a rollback that never persisted is exactly issue-spor-gate-escalation-demote-status-rollback-not-applied"
   );
   assert.ok(fs.existsSync(path.join(nodes, "dec-resolver.md")), "the resolver is evidence, not the verdict — it is left standing, never retracted");
+});
+
+// task-spor-gate-pipeline-test-real-escalate-write: ba65bee proved the
+// pipeline's DEMOTION lands via the real door; nothing did the same for the
+// other half of a refusal — the ESCALATION itself. Every other pipeline test
+// (including the demote one above) wires `deps.escalate` as a mock that hands
+// back a fixed id, so a bug in the real door — buildGateWorkNode/writeGateNode
+// landing the wrong shape, dropping the `blocks` edge, or stamping the wrong
+// repo — would pass every one of them. This wires `deps.escalate` (and the
+// `recordFact` its own art-gate-* fact rides on) to the REAL makeGateDeps
+// closure against a real local nodes dir, and re-reads what actually landed.
+test("runGatePipeline's escalation actually lands on disk with the right shape — the real escalate door, not a mock", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-escalate-real-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+
+  // The ITEM's own repo — what `runGateAndIntegration` resolves as
+  // `entry.project || ctx.slug` before it ever reaches makeGateDeps
+  // (bin/spor.js: "the deps inherit it as their `slug`, so the ESCALATION...
+  // [is] filed under the item's repo") — deliberately not the same string a
+  // worker's own `--project`/scope token would carry, so a regression that fed
+  // the worker's scope through instead would show up as a mismatch below.
+  const itemRepo = "spor-server";
+  const item = { node_id: "task-demo", run_id: "run-abcdef12", project: itemRepo };
+
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+  const { deps: fakeDeps } = fakes({ suite: () => ({ ok: false, code: 1, output: "1 failing\n  the sync worker drops records\n" }) });
+  // Only `escalate` and `recordFact` are real — the same scoping the demote
+  // test above uses for `demote`: the reliability of the OTHER doors (review,
+  // fix, the test-lane/approval filers, demote itself) is a separate concern
+  // from whether a filed escalation's own write actually lands.
+  const realDeps = sporCli.makeGateDeps(cfg, { entry: item, factory, slug: itemRepo, log: () => {}, warn: () => {} });
+  const deps = { ...fakeDeps, escalate: realDeps.escalate, recordFact: realDeps.recordFact };
+
+  const res = await gateRunner.runGatePipeline({ item, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.ok(res.escalated_to, "the pipeline must report the real escalation id it actually filed, not fall through to no escalation");
+
+  const escFile = path.join(nodes, `${res.escalated_to}.md`);
+  assert.ok(fs.existsSync(escFile), `the escalation node the pipeline reports (${res.escalated_to}) must actually be on disk`);
+  const escMd = fs.readFileSync(escFile, "utf8");
+  assert.match(escMd, /^requires: \[human\]$/m, "an escalation is a needs-human item — no worker (this one included) can ever claim it");
+  assert.match(escMd, new RegExp(`- \\{type: blocks, to: ${item.node_id}\\}`), "the escalation `blocks` the work item — the fail-closed half of §10.7");
+  assert.match(escMd, new RegExp(`^project: ${itemRepo}$`, "m"), "filed under the ITEM's own repo, not the worker's scope token (WORKERS.md §10.7)");
+
+  // The gate's own art-gate-* fact carries a `relates-to` edge onto the
+  // escalation it filed (buildGateFact) — the two records are linked, not two
+  // islands a person has to cross-reference by hand.
+  const factFiles = fs.readdirSync(nodes).filter((f) => f.startsWith("art-gate-acceptance-"));
+  assert.strictEqual(factFiles.length, 1, "one gate fact for the one gate that ran");
+  const factMd = fs.readFileSync(path.join(nodes, factFiles[0]), "utf8");
+  assert.match(factMd, new RegExp(`- \\{type: relates-to, to: ${res.escalated_to}\\}`), "the fact records which escalation it filed");
+
+  // Re-running the same refusal must not double-file it: writeGateNode's
+  // deterministic id plus its same-content skip makes this idempotent, the
+  // same guarantee gateDemoteItem's read-before-write gives the demotion.
+  const res2 = await gateRunner.runGatePipeline({ item, factory, deps });
+  assert.strictEqual(res2.escalated_to, res.escalated_to, "the same refusal re-escalates to the SAME node, never a second one");
+  const escalationFiles = fs.readdirSync(nodes).filter((f) => f.startsWith("task-gate-acceptance-"));
+  assert.strictEqual(escalationFiles.length, 1, "idempotent — no second escalation node for the identical refusal");
 });
 
 // gatePromoteItem is gateDemoteItem's mirror (task-spor-integration-propose-
