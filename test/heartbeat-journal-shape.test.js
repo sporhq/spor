@@ -46,6 +46,26 @@ test('appendHeartbeatRecord includes dropped only when non-empty', () => {
   assert.deepStrictEqual(entry.dropped, ['task-b']);
 });
 
+// task-split-spor-5affee1c0338: skipped_other_project rides along the same
+// only-when-truthy convention as dropped, mirroring server/leases.js
+// renewAll's own skipped_other_project/skipped_reserved/skipped_other_session
+// counts.
+test('appendHeartbeatRecord includes skipped_other_project only when nonzero', () => {
+  const journalPath = scratchJournal();
+  u.appendHeartbeatRecord(journalPath, { project: 'projx', renewed: ['task-a'], dropped: [], skippedOtherProject: 3 });
+  const [entry] = readEntries(journalPath);
+  assert.strictEqual(entry.skipped_other_project, 3);
+});
+
+test('appendHeartbeatRecord omits skipped_other_project when zero or absent', () => {
+  const journalPath = scratchJournal();
+  u.appendHeartbeatRecord(journalPath, { project: 'projx', renewed: ['task-a'], dropped: [], skippedOtherProject: 0 });
+  u.appendHeartbeatRecord(journalPath, { project: 'projx', renewed: ['task-a'], dropped: [] });
+  for (const entry of readEntries(journalPath)) {
+    assert.strictEqual('skipped_other_project' in entry, false);
+  }
+});
+
 test('readHeartbeatHeldIds ignores non-heartbeat entries', () => {
   const ids = u.readHeartbeatHeldIds([
     { tool: 'agent-heartbeat', renewed: ['task-x'] },

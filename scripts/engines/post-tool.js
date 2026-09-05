@@ -449,26 +449,34 @@ async function claimNudge({ graph, slug, session, cwd, file, remote }) {
     // then silently take back work another actor released, writing a durable
     // `assigned` edge nobody asked for.
     //
-    // Two consequences of the blanket arm, both deliberate:
+    // Two consequences of the blanket arm, one deliberate, one now narrowed:
     //   - `session` is NOT sent. In this arm it is a FILTER, not the singular
     //     door's assignment, and a lease claimed outside a session (`spor
     //     claim`, or `spor dispatch`'s pre-launch person-scoped claim) carries
     //     `session: null` — filtering on it would skip exactly those and let
     //     them lapse mid-session. Person-scoped renewal matches what the
     //     project-scoped lookup above already suppresses the nudge on.
-    //   - It renews the person's leases in EVERY project, not just this one;
-    //     the enumerate arm takes no project scope. The lookup above stays
-    //     project-scoped, so the journal below (which SessionEnd reads to
-    //     reserve/release what this session held — distill.js sessionEndLease)
-    //     is narrowed back to the work this repo's queue actually reported.
+    //   - `project: <slug>` IS sent — the same slug the lookup above just used
+    //     (issue-spor-blanket-renew-not-project-scoped-stall-detection,
+    //     dec-spor-renewall-adopts-optional-project-scope). Server-side this
+    //     narrows the enumerate arm's sweep to leases on nodes in that
+    //     project's scope; a live claim the person holds OUTSIDE it is left
+    //     alone (never renewed, never reclaimed) and reported back via a
+    //     `skipped_other_project` count, the same shape as
+    //     `skipped_reserved`/`skipped_other_session`. This is the owner-
+    //     accepted self-heal: a `claude --bg` agent killed before SessionEnd no
+    //     longer has its lease renewed forever by edits in an unrelated repo
+    //     (dec-spor-heartbeat-adopts-blanket-renew-arm already priced the old
+    //     cross-repo renewal in as a cost, not a feature to preserve).
     const inProgress = held.filter((x) => x.lease_state === "in_progress");
     let renewed = inProgress.map((x) => x.id);
+    let skippedOtherProject = 0;
     if (inProgress.length > 0) {
       const hb = await u
         .curl(`${u.serverBase()}/v1/queue/renew`, {
           method: "POST",
           headers: { ...u.bearer(), "content-type": "application/json" },
-          body: "{}",
+          body: JSON.stringify({ project: slug }),
           timeoutMs,
         })
         .catch(() => null);
@@ -484,8 +492,9 @@ async function claimNudge({ graph, slug, session, cwd, file, remote }) {
             const confirmed = new Set(body.renewed);
             renewed = renewed.filter((id) => confirmed.has(id));
           }
+          if (Number.isFinite(body.skipped_other_project)) skippedOtherProject = body.skipped_other_project;
         } catch {
-          /* unparseable -> keep the optimistic list */
+          /* unparseable -> keep the optimistic list, no skipped_other_project count */
         }
       }
     }
@@ -500,13 +509,25 @@ async function claimNudge({ graph, slug, session, cwd, file, remote }) {
     // in_progress-derived half: `inProgress` is a subset of `held`, itself a
     // subset of `myItems`, so by construction they are absent from `mineIdsNow`
     // this beat, so `[...new Set(...)]` here is just a defensive merge, not a
-    // dedup this path can actually trigger. This record's shape is a protocol
-    // distill.js's sessionEndLease replays in order
-    // (task-spor-heartbeat-journal-protocol-shape-guard) — write it through
-    // u.appendHeartbeatRecord, not an ad-hoc JSON.stringify, so both ends stay
-    // in sync.
+    // dedup this path can actually trigger. `skippedOtherProject` is journaled
+    // the same way — a count, not ids — but it is NOT redundant with `dropped`:
+    // `myItems`/`held`/`inProgress` come from this beat's project-scoped GET, so
+    // every id `dropped` can ever name was already inside this project's scope.
+    // The nodes `skipped_other_project` counts are, by the server's own
+    // contract, OUTSIDE that scope — they were never candidates for `myItems`
+    // here at all, so no id of theirs appears anywhere in this record (or in
+    // `dropped`). SessionEnd's replay (readHeartbeatHeldIds) never reads this
+    // field — it can't remove ids it was never given — so it stays exactly as
+    // safe as before; recording the count here is pure observability, showing
+    // that the beat intentionally left an unknown number of other leases alone
+    // rather than reaching for them (which, before this change, the blanket arm
+    // silently did).
+    // This record's shape is a protocol distill.js's sessionEndLease replays in
+    // order (task-spor-heartbeat-journal-protocol-shape-guard) — write it
+    // through u.appendHeartbeatRecord, not an ad-hoc JSON.stringify, so both
+    // ends stay in sync.
     const dropped = [...new Set([...inProgress.map((x) => x.id).filter((id) => !renewed.includes(id)), ...vanished])];
-    u.appendHeartbeatRecord(journalPath, { project: slug, renewed, dropped });
+    u.appendHeartbeatRecord(journalPath, { project: slug, renewed, dropped, skippedOtherProject });
     return null; // holds a claim -> never nudge
   }
 

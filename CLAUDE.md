@@ -450,28 +450,49 @@ LLM path). On every Write/Edit in a team-mode repo it does one
 `GET /v1/queue?project=<slug>&assignee=me` (the assignee read is the
 lease-exempt steward view, so the person's own carried work returns tagged with
 `lease_state`/`lease_by`) and branches: this PERSON holds a live (`in_progress`)
-claim here → ONE `POST /v1/queue/renew` with an EMPTY body (the heartbeat,
-piggybacking on write-activity — no new timer, so it's portable across adapters
-that don't fire hooks uniformly), no nudge; this person holds none → nudge ONCE
-per session to claim a top eligible pool item (`GET /v1/queue?project=<slug>`)
-or `/spor:defer`. That renew is deliberately `renewAll`'s BLANKET arm —
+claim here → ONE `POST /v1/queue/renew` carrying `{project: <slug>}` — the
+SAME slug the lookup above just used (the heartbeat, piggybacking on
+write-activity — no new timer, so it's portable across adapters that don't
+fire hooks uniformly), no nudge; this person holds none → nudge ONCE per
+session to claim a top eligible pool item (`GET /v1/queue?project=<slug>`) or
+`/spor:defer`. That renew is deliberately `renewAll`'s BLANKET arm —
 `ids` omitted, and `session` omitted too
 (dec-spor-heartbeat-adopts-blanket-renew-arm): the named-`ids` arm and the
 singular `/v1/nodes/{id}/renew` both AUTO-RECLAIM a lapsed lease, which is right
 for a caller who names a node and wrong for a background beat that would then
 silently re-take work another actor released; and in the blanket arm `session`
 is a FILTER, so sending it would skip the leases claimed outside a session
-(`spor claim`, `spor dispatch`'s pre-launch claim) and let them lapse. The
-trade the blanket arm accepts is the mirror one — a lapsed node silently drops
-out of the working set — so the heartbeat journal line carries `renewed` (what
-the server confirmed) and `dropped` (held work this beat SAW but did not
-renew — the GET→POST race, or a node held live by someone else), and the
-SessionEnd reserve/release hook replays both in order (`distill.js`
-sessionEndLease) so it never `reserve`s — and thereby auto-reclaims — a node the
-beat reported letting go. Note `renewed` is what the server confirmed only when
-it answered: on any non-200 the beat keeps the optimistic list rather than
-dropping a live lease out of SessionEnd's reach on a blip. The residual: a lease
-that vanishes from the project lookup ENTIRELY between beats (the ordinary
+(`spor claim`, `spor dispatch`'s pre-launch claim) and let them lapse. Unlike
+`session`, `project` IS sent — the enumerate arm accepts it as an optional
+SCOPE, not a filter (`dec-spor-renewall-adopts-optional-project-scope`,
+resolving issue-spor-blanket-renew-not-project-scoped-stall-detection): it
+narrows the sweep to leases on nodes in that project, and a live claim the
+person holds OUTSIDE it is left alone — never renewed, never reclaimed — and
+reported back via a `skipped_other_project` count (same shape as
+`skipped_reserved`/`skipped_other_session` below). This is the accepted trade
+for the self-heal the issue asked for: a `claude --bg` agent killed before
+SessionEnd no longer has its lease renewed forever by the owner's edits in an
+unrelated repo. The client journals `skipped_other_project` the same way it
+journals `dropped` — a count, present only when nonzero, never folded into
+`renewed` — task-split-spor-5affee1c0338; NOT redundant with `dropped`, since
+`dropped` only ever names ids drawn from this beat's own project-scoped
+lookup, while the leases `skipped_other_project` counts sit OUTSIDE that
+scope and never appear as ids anywhere in the client's own `myItems`/`held`
+computation, so no id-level record of them exists anywhere else — this count
+is the only trace of them, journaled as the observability signal that the
+beat left them out ON PURPOSE, not by losing track of them. The trade the
+blanket arm still accepts (now project-SCOPED, not
+person-global) is the mirror one — a lapsed node silently drops out of the
+working set — so the heartbeat journal line carries `renewed` (what the server
+confirmed) and `dropped` (held work this beat SAW — inside this project's own
+scope — but did not renew: the GET→POST race, or a node held live by someone
+else), and the SessionEnd reserve/release hook replays
+both in order (`distill.js` sessionEndLease) so it never `reserve`s — and
+thereby auto-reclaims — a node the beat reported letting go. Note `renewed` is
+what the server confirmed only when it answered: on any non-200 the beat keeps
+the optimistic list rather than dropping a live lease out of SessionEnd's
+reach on a blip. The residual: a lease that vanishes from the project lookup
+ENTIRELY between beats (the ordinary
 45m lapse, or a `spor release` from another terminal) is never reported as
 dropped, so SessionEnd still `reserve`s it and the server auto-reclaims — which
 IS the decided behavior for a named call by the session that worked the node
@@ -479,13 +500,8 @@ IS the decided behavior for a named call by the session that worked the node
 lapsed-long-session case), but it means the no-reclaim guarantee is the
 heartbeat's, not the whole client's. Person-scoped suppression (a held claim from ANY
 session, including a Tier-2 `reserved` reservation, suppresses); the beat renews
-the person's live Tier-1 leases. Two costs ride with the arm, both accepted with
-it: the beat is NOT project-scoped (the enumerate arm takes no project, while
-the lookup above is project-scoped — so the journal is narrowed back to this
-project's held work, but a write in ANY opted-in repo renews the person's leases
-everywhere, and a lease nobody releases — a `claude --bg` agent killed before
-SessionEnd — stops self-healing back into the pool at its TTL while its owner
-keeps working elsewhere); and the arm never re-stamps `live.session` (it selects
+the person's live Tier-1 leases IN THIS PROJECT's scope. One cost still rides
+with the arm: it never re-stamps `live.session` (it selects
 on it), so lease session bindings go stale rather than following the last
 editing session, which is what the server's `skipped_other_session` drift signal
 keys on. Cooldown

@@ -59,7 +59,10 @@ function scratch() {
 // `queueFor` reports for assignee=me, exactly what the real enumerate arm would
 // find for a single-project holder. `renewAllIds` overrides that enumeration to
 // stage a lease that lapsed out of the set (the blanket arm never reclaims).
-function stubServer(queueFor, renewAllIds) {
+// `renewExtra` merges additional fields into the renew response (e.g.
+// `{ skipped_other_project: 2 }`, server/leases.js renewAll's own
+// only-when-nonzero convention — see dec-spor-renewall-adopts-optional-project-scope).
+function stubServer(queueFor, renewAllIds, renewExtra) {
   const enumerate = renewAllIds ||
     (() => ((queueFor('/v1/queue?project=projx&assignee=me').items) || [])
       .filter((i) => i.lease_state === 'in_progress')
@@ -87,7 +90,7 @@ function stubServer(queueFor, renewAllIds) {
           return Array.isArray(parsed.ids) ? parsed.ids : enumerate();
         })();
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, status: 'renewed', count: ids.length, renewed: ids, leases: [], failed: [] }));
+        res.end(JSON.stringify({ ok: true, status: 'renewed', count: ids.length, renewed: ids, leases: [], failed: [], ...renewExtra }));
         return;
       }
       res.writeHead(404, { 'content-type': 'application/json' });
@@ -222,7 +225,7 @@ test('live claim held by this person -> blanket renew (heartbeat) fires, no nudg
     // (dec-spor-heartbeat-adopts-blanket-renew-arm)
     const bulk = hits.filter((h) => h.method === 'POST' && h.url === '/v1/queue/renew');
     assert.strictEqual(bulk.length, 1, `expected one blanket renew; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`);
-    assert.deepStrictEqual(JSON.parse(bulk[0].body), {});
+    assert.deepStrictEqual(JSON.parse(bulk[0].body), { project: 'projx' });
     assert.ok(!hits.some((h) => h.method === 'POST' && /^\/v1\/nodes\//.test(h.url)), 'no per-node renew fired');
     // no claim-nudge journaled; a claim-heartbeat line was
     assert.strictEqual(journal(home).filter((e) => e.tool === 'claim-nudge').length, 0);
@@ -253,13 +256,63 @@ test('multiple live claims held -> one blanket POST /v1/queue/renew, not N singl
     // exactly one blanket renew, no per-node renews
     const bulk = hits.filter((h) => h.method === 'POST' && h.url === '/v1/queue/renew');
     assert.strictEqual(bulk.length, 1, `expected exactly one bulk renew; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`);
-    assert.deepStrictEqual(JSON.parse(bulk[0].body), {});
+    assert.deepStrictEqual(JSON.parse(bulk[0].body), { project: 'projx' });
     assert.ok(!hits.some((h) => h.method === 'POST' && /^\/v1\/nodes\//.test(h.url)), 'no per-node renew fired alongside the batch');
     // no claim-nudge journaled; a claim-heartbeat line names both nodes
     assert.strictEqual(journal(home).filter((e) => e.tool === 'claim-nudge').length, 0);
     const hb = journal(home).filter((e) => e.tool === 'claim-heartbeat');
     assert.strictEqual(hb.length, 1);
     assert.deepStrictEqual(hb[0].renewed, ['task-mine', 'task-mine-2']);
+  } finally {
+    srv.close();
+  }
+});
+
+// issue-spor-blanket-renew-not-project-scoped-stall-detection /
+// task-split-spor-5affee1c0338: the enumerate arm's `skipped_other_project`
+// count (server/leases.js renewAll) must be journaled alongside `dropped`,
+// not folded into `renewed` and not ignored, so SessionEnd's replay never
+// mistakes a lease the beat deliberately left out of project scope for one
+// it still holds.
+test('server-reported skipped_other_project is journaled on the claim-heartbeat record', async () => {
+  const { home, cwd } = scratch();
+  const { srv, hits, base } = await stubServer(
+    (url) =>
+      isAssigneeMe(url)
+        ? { items: [{ id: 'task-mine', title: 'Mine', lease_state: 'in_progress', lease_by: 'person-t' }] }
+        : { items: [{ id: 'task-alpha', title: 'Alpha' }] },
+    undefined,
+    { skipped_other_project: 2 }
+  );
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    const out = await runAsync(['post-tool', '--host', 'claude-code'], editPayload(cwd), env);
+    assert.strictEqual(out.trim(), '');
+    const bulk = hits.filter((h) => h.method === 'POST' && h.url === '/v1/queue/renew');
+    assert.strictEqual(bulk.length, 1);
+    assert.deepStrictEqual(JSON.parse(bulk[0].body), { project: 'projx' }, 'the heartbeat sends the same slug the lookup used');
+    const hb = journal(home).filter((e) => e.tool === 'claim-heartbeat');
+    assert.strictEqual(hb.length, 1);
+    assert.deepStrictEqual(hb[0].renewed, ['task-mine']);
+    assert.strictEqual(hb[0].skipped_other_project, 2);
+  } finally {
+    srv.close();
+  }
+});
+
+test('skipped_other_project absent from the response -> the field is omitted from the journal, never written as 0', async () => {
+  const { home, cwd } = scratch();
+  const { srv, hits, base } = await stubServer((url) =>
+    isAssigneeMe(url)
+      ? { items: [{ id: 'task-mine', title: 'Mine', lease_state: 'in_progress', lease_by: 'person-t' }] }
+      : { items: [{ id: 'task-alpha', title: 'Alpha' }] }
+  );
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    await runAsync(['post-tool', '--host', 'claude-code'], editPayload(cwd), env);
+    const hb = journal(home).filter((e) => e.tool === 'claim-heartbeat');
+    assert.strictEqual(hb.length, 1);
+    assert.strictEqual('skipped_other_project' in hb[0], false);
   } finally {
     srv.close();
   }

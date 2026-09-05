@@ -1275,7 +1275,7 @@ function makeLogger(file, prefix) {
 // in test/heartbeat-journal-shape.test.js instead of silently diverging.
 const HEARTBEAT_TOOL = "claim-heartbeat";
 
-function appendHeartbeatRecord(journalPath, { project, renewed, dropped }) {
+function appendHeartbeatRecord(journalPath, { project, renewed, dropped, skippedOtherProject }) {
   appendLine(
     journalPath,
     JSON.stringify({
@@ -1284,6 +1284,17 @@ function appendHeartbeatRecord(journalPath, { project, renewed, dropped }) {
       tool: HEARTBEAT_TOOL,
       renewed,
       ...(dropped && dropped.length ? { dropped } : {}),
+      // A count, not ids (mirrors server/leases.js renewAll's own
+      // skipped_other_project — only present when nonzero, same convention as
+      // `dropped`'s length check above). Purely observability, and NOT
+      // redundant with `dropped`: `dropped` only ever names ids drawn from
+      // this project's own scoped lookup, while the leases this count names
+      // are OUTSIDE that scope entirely and never appear as ids anywhere in
+      // this record. readHeartbeatHeldIds never reads this field
+      // (task-split-spor-5affee1c0338) — it records WHY the beat's `renewed`
+      // set stayed narrow: leases deliberately left out of project scope,
+      // not lost track of.
+      ...(skippedOtherProject ? { skipped_other_project: skippedOtherProject } : {}),
     })
   );
 }
