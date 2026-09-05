@@ -355,6 +355,61 @@ test("a real dispatch whose launcher is nowhere on PATH refuses BEFORE launching
   }
 });
 
+// A built-in harness's launcher override (dispatch.bin.<harness> / its env
+// spelling) is the same machine-local trust class as a declared harness's
+// `command`, and is spawned with the identical cwd=launchDir
+// (issue-spor-dispatch-bin-override-relative-path-execution). A relative path
+// there resolves against the DISPATCHED REPO's own worktree, not this
+// machine — the same hazard dec-spor-declared-harness-reject-relative-command
+// closed for `dispatch.harness.<id>.command`.
+test("checkHarnessBinOverride refuses a relative dispatch.bin.<harness> override; bare names and absolute paths stay accepted", () => {
+  for (const relative of ["./ox", "../ox/bin/ox", "bin/ox", "scripts\\ox.bat", ".\\ox.bat", "C:foo.exe"]) {
+    const cfg = { get: (key) => (key === "dispatch.bin.claude-code" ? relative : undefined) };
+    const r = dispatchHarnesses.checkHarnessBinOverride("claude-code", { env: {}, cfg });
+    assert.strictEqual(r.ok, false, `${JSON.stringify(relative)} must be refused`);
+    assert.match(r.error, /must be an absolute path or a bare name resolved on PATH/);
+    assert.match(r.error, new RegExp(relative.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(r.error, /dispatch\.bin\.claude-code/);
+  }
+  const cfgBare = { get: (key) => (key === "dispatch.bin.claude-code" ? "ox" : undefined) };
+  assert.ok(dispatchHarnesses.checkHarnessBinOverride("claude-code", { env: {}, cfg: cfgBare }).ok, "a bare name is a PATH lookup");
+  const cfgAbs = { get: (key) => (key === "dispatch.bin.claude-code" ? "/opt/ox/bin/ox" : undefined) };
+  assert.ok(dispatchHarnesses.checkHarnessBinOverride("claude-code", { env: {}, cfg: cfgAbs }).ok, "an absolute path is fine");
+  assert.ok(dispatchHarnesses.checkHarnessBinOverride("claude-code", { env: {}, cfg: null }).ok, "no override at all is fine");
+  // The env spelling is checked the same way as the config key.
+  const relEnv = dispatchHarnesses.checkHarnessBinOverride("codex", { env: { SPOR_CODEX_CMD: "./codex-wrapper.sh" }, cfg: null });
+  assert.strictEqual(relEnv.ok, false);
+  assert.match(relEnv.error, /\$SPOR_CODEX_CMD/);
+});
+
+test("a relative dispatch.bin.<harness> override is rejected by the real dispatch, before anything is launched — and could not have hijacked a nearby repo file", () => {
+  const harness = "opencode";
+  const { home, repo } = fixture(harness);
+  const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
+  cfg.dispatch.bin = { [harness]: "./ox-stub" };
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify(cfg, null, 2) + "\n");
+  // Plant a decoy at exactly the relative path the override names, inside the
+  // DISPATCHED repo's own worktree — the untrusted commit this refusal exists
+  // to defeat. If resolution ever fell through to spawning against the repo's
+  // cwd, this is what would run instead of the operator's intended launcher.
+  const marker = path.join(repo, "pwned");
+  fs.writeFileSync(path.join(repo, "ox-stub"), `#!/bin/sh\ntouch ${JSON.stringify(marker)}\n`, { mode: 0o755 });
+  const args = ["dispatch", `task-${harness}`, "--dir", repo, "--profile", `profile-${harness}`, "--no-brief"];
+  const real = run(args, { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.strictEqual(real.status, 1, real.stdout);
+  assert.match(real.stderr, /must be an absolute path or a bare name resolved on PATH/);
+  assert.match(real.stderr, /dispatch\.bin\.opencode/);
+  assert.ok(!fs.existsSync(path.join(home, "journal", "dispatch")), "nothing is launched");
+  assert.ok(!fs.existsSync(marker), "the decoy never ran");
+
+  const preview = run([...args, "--print"], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.strictEqual(preview.status, 0, preview.stderr);
+  assert.match(preview.stdout, /must be an absolute path or a bare name resolved on PATH/);
+  assert.doesNotMatch(preview.stdout, /run:\s+\.\/ox-stub/, "a preview must not show a launch the real run rejects");
+  assert.ok(!fs.existsSync(path.join(home, "journal", "dispatch")), "a preview writes nothing");
+  assert.ok(!fs.existsSync(marker), "the decoy never ran");
+});
+
 // task-spor-review-gate-stateful-bounded (review finding 3 on its first cut):
 // `--read-only` must be ENFORCED by the harness, not merely asked for in the
 // prompt. Each supervised adapter declares its posture — OpenCode's built-in

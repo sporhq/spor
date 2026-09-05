@@ -9935,6 +9935,23 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   // through the cascade before falling back to the bare name. With neither set
   // this is the same string it always returned.
   const harnessBin = harnessAdapter ? harnessAdapter.command(process.env, cfg) : null;
+  // A BUILT-IN harness's launcher override is machine-local config, spawned
+  // with cwd=launchDir exactly like a declared harness's `command` — refuse
+  // the same relative-path shape here, before any worktree setup, rather than
+  // letting it resolve against the dispatched repo's own worktree
+  // (issue-spor-dispatch-bin-override-relative-path-execution). A declared
+  // harness's own `command` never routes through this override (it reads
+  // `dispatch.harness.<id>.command` directly, already checked in
+  // normalizeHarnessDeclaration), so this is scoped to built-ins only.
+  const harnessBinCheck =
+    harnessAdapter && !harnessAdapter.declaration
+      ? dispatchHarnesses.checkHarnessBinOverride(harnessAdapter.id, { env: process.env, cfg })
+      : { ok: true };
+  if (!harnessBinCheck.ok && !dryRun) {
+    err(`cannot dispatch ${nodeId || name}: ${harnessBinCheck.error}.`);
+    err(`  fix it in $SPOR_HOME/config.json (or its env override); the assignment is unchanged.`);
+    return 1;
+  }
   // --read-only (task-spor-review-gate-stateful-bounded): the posture a gate's
   // REVIEW dispatch runs under — it reads the implementer's live checkout, so
   // it must not be able to write to it. Expressed per harness by the adapter
@@ -10191,6 +10208,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     } else out(`preflight: ok — write posture and candidate workspace are both fit for an unattended run`);
     if (template != null) out(`template: ${path.resolve(templateOpt)}`);
     if (harnessResolution.error) out(`run:    (declaration for harness '${harness}' is unusable: ${harnessResolution.error})`);
+    else if (!harnessBinCheck.ok) out(`run:    (${harnessBinCheck.error})`);
     else if (!supportedHarness) out(`run:    (unsupported harness '${harness}')`);
     else if (harnessAdapter.launchMode === "supervised-jsonl") {
       out(`run:    ${harnessBin} ${previewArgs.map((a) => renderLaunchArg(a, { embedded: !!harnessAdapter.declaration })).join(" ")}  # prompt on stdin`);
