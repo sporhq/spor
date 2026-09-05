@@ -811,6 +811,24 @@ test("no launch field is declarable on an implementation stage — every one of 
   }
 });
 
+test("a falsy-but-present launch field ('', 0, false) on an implementation stage is still refused", () => {
+  // issue-spor-satisfiability-graph-launch-fields-exempts-empty-string: the
+  // guard is presence, not truthiness — `graphLaunchFields` used to treat a
+  // falsy value as absent, so `{command: ""}` parsed clean with no refusal.
+  for (const falsy of ["", 0, false]) {
+    const { factory, errors } = stageFactory({ implementation: { command: falsy } });
+    assert.strictEqual(factory, null, `command: ${JSON.stringify(falsy)} must refuse the factory`);
+    assert.ok(
+      errors.some((e) => e.includes("implementation: 'command' is not declarable in the graph")),
+      `command: ${JSON.stringify(falsy)} must be named in the refusal: ${errors.join("; ")}`
+    );
+  }
+  // null/undefined (a key genuinely not written) stay absent — a stage with
+  // no launch field at all is still legal.
+  assert.ok(stageFactory({ implementation: { command: null } }).factory, "null command stays absent");
+  assert.ok(stageFactory({ implementation: {} }).factory, "no command key at all stays absent");
+});
+
 test("the §2.4 validation table: a mistyped stage refuses the factory, and a legal one is read", () => {
   // FACTORY-IMPLEMENTATION-STAGE.md §2.4, row for row. A non-empty `errors`
   // refuses to start the worker (WORKERS.md §10.1's fatal list), so the

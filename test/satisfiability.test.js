@@ -55,6 +55,22 @@ test("satisfies: a profile with no runtime needs is trivially satisfiable", () =
   assert.strictEqual(sat.satisfies({ harnesses: [] }, {}).ok, true);
 });
 
+test("graphLaunchFields: presence, not truthiness — '', 0, false are declared; null/undefined are absent", () => {
+  // issue-spor-satisfiability-graph-launch-fields-exempts-empty-string: a
+  // falsy-but-present launch field must be refused, since the rule is that
+  // naming the key at all is what's forbidden.
+  for (const falsy of ["", 0, false]) {
+    assert.deepStrictEqual(
+      sat.graphLaunchFields({ command: falsy }),
+      ["command"],
+      `command: ${JSON.stringify(falsy)} must count as present`
+    );
+  }
+  assert.deepStrictEqual(sat.graphLaunchFields({ command: null }), [], "null stays absent");
+  assert.deepStrictEqual(sat.graphLaunchFields({ command: undefined }), [], "undefined stays absent");
+  assert.deepStrictEqual(sat.graphLaunchFields({}), [], "a missing key stays absent");
+});
+
 test("effectiveCapabilities: declared AUGMENTS probed; deny is union of top-level + declared", () => {
   const eff = sat.effectiveCapabilities({
     probed: { harnesses: ["claude-code"], plugins: ["spor"] },
