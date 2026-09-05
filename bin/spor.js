@@ -8674,7 +8674,12 @@ function cmdRuns(cfg, { values, positionals: pos }) {
       if (r.terminal_note) out(`  note:       ${r.terminal_note}`);
       if (r.report_node_id) out(`  artifact:   ${r.report_node_id}`);
       if (r.lease_released === false && r.terminal_enforced && r.node_id) {
-        out(`  lease:      still held — release it with 'spor release ${r.node_id}'`);
+        // Not "still held": a `false` here means the handback was never
+        // confirmed, which also covers a release the server committed and
+        // whose answer we lost (WORKERS.md §8). The remedy reconciles either
+        // way — `/release` is idempotent and a claim someone else now holds
+        // answers 409 — so the hint says what we know, not what we assume.
+        out(`  lease:      handback unconfirmed — hand it back with 'spor release ${r.node_id}' (idempotent) or wait out the TTL`);
       }
     }
     if (r.termination_reason) out(`  why:        ${r.termination_reason}`);
