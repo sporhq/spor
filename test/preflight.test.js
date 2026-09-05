@@ -148,6 +148,25 @@ test("liveWorkspaceWriters reconciles a native-background record against the har
   );
 });
 
+// (issue-spor-native-run-done-state-unreachable-and-contract-pending-invisible)
+// `nativeAgentEvidence` now includes a `state: "done"` agent in the listing
+// (reconcileRuns needs it as evidence to reap and settle) — occupancy must
+// not start believing that agent is still WRITING just because it is now
+// present and matched by identity.
+test("liveWorkspaceWriters does not count a matched agent the harness already reports as 'done' as still occupying the checkout", () => {
+  const dir = path.resolve("/tmp/candidate");
+  const now = () => Date.parse("2026-09-05T12:00:00Z");
+  const records = [
+    { run_id: "finished", state: "running", cwd: dir, launch_mode: "native-background", session_id: "sess-finished", created_at: "2026-09-05T11:59:00Z" },
+  ];
+  const done = [{ sessionId: "sess-finished", kind: "background", state: "done" }];
+  assert.deepStrictEqual(
+    preflight.liveWorkspaceWriters(records, { dir, now, nativeAgents: done, nativeEnumerated: true }).map((w) => w.run_id),
+    [],
+    "a done agent is matched by identity, but it is not occupying anything"
+  );
+});
+
 test("a supervised writer is believed only while its supervisor is still WATCHING, not while its pid merely answers", () => {
   // Off Linux (and on an older record) the start-time tick count is unknowable,
   // so a bare `isSameSupervisor` collapses to a pid probe a RECYCLED pid answers

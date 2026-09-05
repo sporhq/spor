@@ -1222,6 +1222,45 @@ test("spor runs: an agent the harness still lists as 'done' does not hold its ru
   assert.strictEqual(runRecords(home)[0].state, "vanished");
 });
 
+// (issue-spor-native-run-done-state-unreachable-and-contract-pending-invisible)
+// A native record left `contract_pending` — this box could not settle its
+// terminal-state contract, e.g. because the record names a graph door that
+// isn't this box's — used to render exactly like a fully-settled one: an
+// operator staring at "outcome: reported (unenforced)" had no way to tell
+// whether that was the FINAL best-effort reading or a provisional beat still
+// owed a verified verdict.
+test("spor runs: a native record still owing its terminal-state contract shows a pending marker, in text and JSON", () => {
+  const home = scratch("spor-runs-store-");
+  const run = runner.beginNativeRun(home, {
+    harness: "claude-code", name: "task-x", nodeId: "task-x", cwd: "/tmp/spor-runs-pending",
+    now: () => "2026-07-18T10:00:00.000Z",
+  });
+  runner.updateRun(run, {
+    state: "done",
+    terminal_state: "reported",
+    terminal_enforced: false,
+    contract_pending: true,
+    // A server this LOCAL-mode call can never match (nativeContractDoor
+    // refuses whenever `!isRemote`, regardless of `want`) — the door this
+    // record's contract belongs to is not this box's, so settleNativeContracts
+    // must skip it rather than silently resolve (or force-settle) the debt.
+    server: "https://example.invalid",
+  });
+
+  const jsonOut = cli(["runs", "--json"], { SPOR_HOME: home });
+  assert.strictEqual(jsonOut.status, 0, jsonOut.stderr);
+  const parsed = JSON.parse(jsonOut.stdout);
+  assert.strictEqual(parsed.runs[0].contract_pending, true, "the field survives untouched for an operator's own tooling");
+
+  const textOut = cli(["runs"], { SPOR_HOME: home });
+  assert.strictEqual(textOut.status, 0, textOut.stderr);
+  assert.match(
+    textOut.stdout,
+    /outcome:\s+reported \(unenforced\) \(contract pending\)/,
+    "the operator can see the run still owes its contract, not just its best-effort reading"
+  );
+});
+
 test("spor runs: a credit-dead run reads as an ENVIRONMENT failure with the provider's own line retained", () => {
   const { home, repo } = fixture();
   const configDir = scratch("spor-runs-cc-");
@@ -1583,6 +1622,44 @@ test("reconcileRuns: an agent listing with NO status field never reads as finish
   // leave the run live — the same fail-safe direction as `enumerated: false`.
   const { record } = nativeTurnCompleteFixture([TOOL_RESULT, CLEAN_END], { status: undefined });
   assert.strictEqual(record.state, "running");
+});
+
+// (issue-spor-native-run-done-state-unreachable-and-contract-pending-invisible)
+// The harness's OWN `state: "done"` is a separate, independent terminal
+// signal from the idle+turn-complete+quiet triple above — it must be finished,
+// stopped, and left owing the contract even when none of those three would
+// (yet) agree: a MID-turn transcript and a `status` that still reads
+// "working". A prior revision dropped a `state: "done"` agent out of the
+// listing before it ever reached `matchingAgents`, so it could never be
+// matched here at all — the agent sat registered in the harness daemon
+// forever, never reaped.
+test("reconcileRuns: the harness's own state:'done' on a matched agent is finished, reaped, and left owing the contract — even mid-turn and non-idle", () => {
+  const { record, stopped } = nativeTurnCompleteFixture([TOOL_RESULT], { state: "done", status: "working" });
+  assert.strictEqual(stopped.length, 1, "a done agent is reaped exactly like a turn-complete one");
+  assert.strictEqual(stopped[0].session, "sid-idle");
+  assert.strictEqual(record.stopped_for, "turn-complete");
+  assert.strictEqual(record.agent_stopped, true);
+  assert.strictEqual(record.contract_pending, true, "still owed the terminal-state contract's second write");
+  assert.strictEqual(record.terminal_enforced, false, "the provisional beat is honest about not having verified anything");
+});
+
+test("nativeTurnComplete: a matched agent's state:'done' fires immediately, without waiting on the quiet window", () => {
+  const home = scratch("spor-runs-turn-done-immediate-");
+  const configDir = scratch("spor-runs-cc-");
+  const cwd = "/tmp/spor-runs-turn-done-immediate";
+  const file = writeTranscript(configDir, cwd, "sid-idle", [TOOL_RESULT, CLEAN_END]);
+  const record = {
+    run_id: "d1", node_id: "task-x", harness: "claude-code", launch_mode: "native-background",
+    state: "running", cwd, session_id: "sid-idle", created_at: "2026-07-18T10:00:00.000Z",
+  };
+  const agents = [{ kind: "background", sessionId: "sid-idle", state: "done", status: "working", cwd }];
+  const opts = { env: { CLAUDE_CONFIG_DIR: configDir } };
+  // "now" is one second after the transcript's own mtime — well inside the
+  // 2-minute quiet window the idle+turn-complete path would require.
+  const justAfter = fs.statSync(file).mtimeMs + 1000;
+  const fired = runner.nativeTurnComplete(record, agents, { ...opts, now: () => new Date(justAfter).toISOString() });
+  assert.ok(fired, "state: done needs no quiet window to corroborate it");
+  assert.strictEqual(fired.agent.sessionId, "sid-idle");
 });
 
 test("nativeTurnComplete: the quiet window is what makes the three signals ONE observation", () => {

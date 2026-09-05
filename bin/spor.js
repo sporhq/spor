@@ -604,10 +604,21 @@ function nativeAgentEvidence(cfg, records) {
     const e = enumerateHarnessAgents(adapter, cfg);
     if (!e.ok) continue;
     enumerated = true;
-    // A finished agent the harness still lists is NOT live — reconciling it is
-    // the whole point, so it must not hold its run open (same `done` filter the
-    // in-flight surface applies).
-    for (const a of e.agents) if (a && a.kind === "background" && a.state !== "done") agents.push(a);
+    // A finished agent the harness still lists is NOT live, but it is still
+    // THIS record's evidence: `state: "done"` is its own independent terminal
+    // signal (WORKERS.md, dec-spor-native-bg-turn-complete-and-contract), and
+    // `reconcileRuns`'s `nativeTurnComplete` is what acts on it to reap the
+    // daemon slot and hand the record to the terminal-state contract. An
+    // earlier revision dropped it here instead — the same `done` filter the
+    // in-flight surface (`dispatchedAgents`) applies for an unrelated reason —
+    // which hid it from `matchingAgents` entirely: never matched, never
+    // reaped, so a daemon accumulating done-but-registered agents kept those
+    // slots forever
+    // (issue-spor-native-run-done-state-unreachable-and-contract-pending-invisible).
+    // `liveWorkspaceWriters`'s own occupancy check is the one consumer that
+    // must NOT count a done agent as still writing, and it filters for that
+    // itself rather than relying on this listing to have done it already.
+    for (const a of e.agents) if (a && a.kind === "background") agents.push(a);
   }
   return { agents, enumerated };
 }
@@ -9311,9 +9322,17 @@ async function cmdRuns(cfg, { values, positionals: pos }) {
     // run did to the graph, and whether anyone verified it
     // (task-spor-dispatch-terminal-states-contract). `unenforced` is a
     // first-class label, never omitted — a best-effort classification must not
-    // read like a checked one.
+    // read like a checked one. `contract_pending` is a THIRD label, distinct
+    // from `unenforced`: an unenforced outcome that stays this way is the
+    // final, best-effort reading, but a `contract_pending` one is a
+    // provisional beat that a caller with a graph door still owes a verified
+    // verdict for (settleNativeContracts) — an operator staring at "reported
+    // (unenforced)" with no hint that anything is still owed has no way to
+    // know the run isn't actually settled yet
+    // (issue-spor-native-run-done-state-unreachable-and-contract-pending-invisible).
     if (r.terminal_state) {
-      out(`  outcome:    ${r.terminal_state}${r.terminal_enforced ? "" : " (unenforced)"}${r.resolved_by ? ` by ${r.resolved_by}` : ""}`);
+      const pending = r.contract_pending ? " (contract pending)" : "";
+      out(`  outcome:    ${r.terminal_state}${r.terminal_enforced ? "" : " (unenforced)"}${pending}${r.resolved_by ? ` by ${r.resolved_by}` : ""}`);
       if (r.terminal_note) out(`  note:       ${r.terminal_note}`);
       if (r.report_node_id) out(`  artifact:   ${r.report_node_id}`);
       // Not "still held": a `false` here means the handback was never
