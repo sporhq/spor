@@ -1478,6 +1478,39 @@ test("an orphan is only ever adopted by the factory that started it — a resume
   assert.strictEqual(workLoop.orphanedGateRuns([dead(undefined)], { records, factory: "factory-b" }).length, 1);
 });
 
+test("a renamed factory still adopts the pipelines it started under its old id (issue-spor-factory-rename-strands-pipelines)", () => {
+  const records = new Map([["run-orphan", ORPHAN_RECORD]]);
+  const slot = { run_id: "run-orphan", node_id: "task-orphan", harness: "fake" };
+  const dead = (factory) => ({ worker_id: "w1", live: false, factory, gates: { passed: 0, failed: 0, blocked: 0 }, gating: [slot], active: [] });
+
+  // A dead worker armed with the OLD id: the current factory declares it as
+  // an alias (the caller already walked the `supersedes` chain), so it is
+  // adopted exactly as if it were the same id — no `onForeign` report.
+  const foreign = [];
+  assert.strictEqual(
+    workLoop.orphanedGateRuns([dead("factory-old")], {
+      records,
+      factory: "factory-new",
+      factoryAliases: ["factory-old"],
+      onForeign: (o) => foreign.push(o),
+    }).length,
+    1,
+    "an old, renamed-from id still finishes its own work"
+  );
+  assert.deepStrictEqual(foreign, [], "a genuine alias is never reported as foreign");
+
+  // An id that is NOT a declared alias is still foreign, unaffected by an
+  // unrelated alias list.
+  assert.deepStrictEqual(
+    workLoop.orphanedGateRuns([dead("factory-unrelated")], { records, factory: "factory-new", factoryAliases: ["factory-old"], onForeign: (o) => foreign.push(o) }),
+    []
+  );
+  assert.deepStrictEqual(foreign.map((o) => o.factory), ["factory-unrelated"]);
+
+  // No aliases passed at all is byte-identical to before this existed.
+  assert.strictEqual(workLoop.orphanedGateRuns([dead("factory-old")], { records, factory: "factory-new" }).length, 0);
+});
+
 // A resumed pipeline RE-RUNS its gates from the first one, and a fix cycle
 // dispatches an implementer with --force --no-worktree into the run's own
 // checkout. The abandoned pipeline's fix agent is DETACHED and outlived the
@@ -1879,6 +1912,65 @@ test("an approval item approves ONLY on a resolving edge — every other termina
   const approved = await sporCli.gateApprovalState(cfg, "task-approve-y");
   assert.strictEqual(approved.state, "approved");
   assert.strictEqual(approved.by, "dec-approved-it");
+});
+
+// issue-spor-factory-rename-strands-pipelines: a factory rename is modeled
+// the same way any other node rename is (GRAPH.md's `supersedes` edge) — the
+// operator writes a NEW factory node with a `supersedes` edge to the old one
+// and retires it. `loadFactoryDefinition` walks that chain from the current
+// node so `spor work`'s orphan-resume scan can treat pipelines started under
+// an old id as this factory's own (see orphanedGateRuns' `factoryAliases`).
+test("loadFactoryDefinition walks a factory's supersedes chain into factory.renamedFrom", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-factory-rename-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const write = (id, front, body = "Body.") =>
+    fs.writeFileSync(path.join(nodes, `${id}.md`), `---\nid: ${id}\n${front}date: 2026-08-26\n---\n${body}\n`);
+  const payload = { gates: [{ id: "acceptance", kind: "command", command: "npm test" }] };
+  const factoryBody = ["```json", JSON.stringify(payload, null, 2), "```"].join("\n");
+
+  // A factory with no rename history: byte-identical (no `renamedFrom` key).
+  write("factory-plain", "type: factory\ntitle: A plain factory\nsummary: A factory with no rename history.\nstatus: active\n", factoryBody);
+  const plain = await sporCli.loadFactoryDefinition(cfg, "factory-plain");
+  assert.ok(plain.factory, plain.errors.join("; "));
+  assert.strictEqual(plain.factory.renamedFrom, undefined);
+
+  // One rename: factory-new supersedes factory-old.
+  write("factory-old", "type: factory\ntitle: The old factory\nsummary: The factory before it was renamed.\nstatus: retired\n", factoryBody);
+  write(
+    "factory-new",
+    "type: factory\ntitle: The renamed factory\nsummary: The factory after it was renamed from factory-old.\nstatus: active\nedges:\n  - {type: supersedes, to: factory-old}\n",
+    factoryBody
+  );
+  const renamed = await sporCli.loadFactoryDefinition(cfg, "factory-new");
+  assert.ok(renamed.factory, renamed.errors.join("; "));
+  assert.deepStrictEqual(renamed.factory.renamedFrom, ["factory-old"]);
+
+  // A second rename: factory-newest supersedes factory-new, which still
+  // supersedes factory-old — both prior ids are in the chain.
+  write(
+    "factory-newest",
+    "type: factory\ntitle: The twice-renamed factory\nsummary: The factory after a second rename, from factory-new.\nstatus: active\nedges:\n  - {type: supersedes, to: factory-new}\n",
+    factoryBody
+  );
+  const twice = await sporCli.loadFactoryDefinition(cfg, "factory-newest");
+  assert.ok(twice.factory, twice.errors.join("; "));
+  assert.deepStrictEqual(twice.factory.renamedFrom, ["factory-new", "factory-old"]);
+
+  // A `supersedes` edge onto a non-factory node is not a rename hop — it is
+  // recorded as a prior id (the node it superseded genuinely existed under
+  // that id) but the walk does not chase its own edges as if they were a
+  // factory's.
+  write("task-unrelated", "type: task\ntitle: An unrelated superseded task\nsummary: Some other node this same id once superseded, unrelated to factories.\nstatus: done\nedges:\n  - {type: supersedes, to: factory-old}\n");
+  write(
+    "factory-odd",
+    "type: factory\ntitle: A factory that supersedes a non-factory node\nsummary: Exercises the type guard on the supersedes walk.\nstatus: active\nedges:\n  - {type: supersedes, to: task-unrelated}\n",
+    factoryBody
+  );
+  const odd = await sporCli.loadFactoryDefinition(cfg, "factory-odd");
+  assert.ok(odd.factory, odd.errors.join("; "));
+  assert.deepStrictEqual(odd.factory.renamedFrom, ["task-unrelated"], "the non-factory hop itself is recorded, its own edges are not chased");
 });
 
 // The demotion's own write door. Only a claim of COMPLETION is rolled back: a

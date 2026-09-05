@@ -10243,7 +10243,38 @@ async function loadFactoryDefinition(cfg, id) {
   // could ever trip it. What it guarded against is still fail-closed at run
   // time: a review or rescue that leaves no report is a gate FAILURE
   // (gateRunReportText's own error), never a pass.
-  return { factory: errors.length ? null : res.factory, errors: [...new Set([...errors, ...resErrors])] };
+  const factory = errors.length ? null : res.factory;
+  if (factory) {
+    // A factory RENAME is modeled the same way any other node rename is here
+    // (GRAPH.md's `supersedes` edge): the operator writes a new factory node
+    // and points a `supersedes` edge at the old one, retiring it. Walk that
+    // chain from the CURRENT node so a worker armed with the new id can still
+    // adopt gate pipelines a dead worker started under an old, now-superseded
+    // id — without this, those in-flight pipelines are permanently unadoptable
+    // (reported on stderr forever) the moment the rename lands
+    // (issue-spor-factory-rename-strands-pipelines). `seen` bounds a cycle;
+    // only factory-to-factory hops are followed, since a `supersedes` edge onto
+    // a non-factory node is not a rename in this sense.
+    const renamedFrom = [];
+    const seen = new Set([id]);
+    let frontier = (parsed.edges || []).filter((e) => e && e.type === "supersedes" && e.to).map((e) => e.to);
+    while (frontier.length) {
+      const next = [];
+      for (const priorId of frontier) {
+        if (seen.has(priorId)) continue;
+        seen.add(priorId);
+        renamedFrom.push(priorId);
+        const priorNode = await resolveNode(cfg, priorId);
+        if (!priorNode || !priorNode.raw) continue;
+        const priorParsed = parse(priorNode.raw, `${priorId}.md`);
+        if ((priorParsed.type || "") !== "factory") continue; // not a factory rename hop
+        for (const e of priorParsed.edges || []) if (e && e.type === "supersedes" && e.to) next.push(e.to);
+      }
+      frontier = next;
+    }
+    if (renamedFrom.length) factory.renamedFrom = renamedFrom;
+  }
+  return { factory, errors: [...new Set([...errors, ...resErrors])] };
 }
 
 // The git plumbing for a command gate — reading the change under judgement,
@@ -13401,19 +13432,29 @@ async function cmdWork(cfg, { values }) {
               // A foreign orphan is never adoptable, so it must not keep this
               // guard open either — otherwise one stranded pipeline makes every
               // poll read the whole run journal for its whole 7-day retention.
-              const mine = (w) => !factoryId || !w.factory || w.factory === factoryId;
+              // `renamedFrom` (loadFactoryDefinition, walking the current
+              // factory's `supersedes` chain) counts a pipeline started under
+              // an OLD, now-renamed factory id as this worker's own too —
+              // otherwise a renamed factory permanently strands its own
+              // in-flight orphans (issue-spor-factory-rename-strands-pipelines).
+              const acceptedFactoryIds = factoryId ? new Set([factoryId, ...((factory && factory.renamedFrom) || [])]) : null;
+              const mine = (w) => !acceptedFactoryIds || !w.factory || acceptedFactoryIds.has(w.factory);
               if (!statuses.some((w) => !w.live && mine(w) && ((w.gating || []).length || (w.active || []).length))) return [];
               return workLoop.orphanedGateRuns(statuses, {
                 records: new Map(dispatchRuns.readRunRecords(home).map((r) => [r.run_id, r])),
-                // Only pipelines THIS factory started (issue-spor-work-scope-
-                // union-factory-mismatch): resumption never goes through
-                // candidate selection, so without this the repo-scope guard has
-                // a back door straight into another factory's repo.
+                // Only pipelines THIS factory started, under its current id OR
+                // any id it was renamed from (issue-spor-work-scope-union-
+                // factory-mismatch): resumption never goes through candidate
+                // selection, so without this the repo-scope guard has a back
+                // door straight into another factory's repo.
                 factory: factoryId,
+                factoryAliases: (factory && factory.renamedFrom) || [],
                 onForeign: (slot) =>
                   warn(
                     `work: not resuming the gate pipeline for ${slot.node_id} (run ${String(slot.run_id).slice(0, 8)}) — ` +
-                      `it was started under factory '${slot.factory}', not '${factoryId}'. Run a worker armed with that factory to finish it.`
+                      `it was started under factory '${slot.factory}', not '${factoryId}'${
+                        factory && factory.renamedFrom && factory.renamedFrom.length ? ` or any factory it was renamed from (${factory.renamedFrom.join(", ")})` : ""
+                      }. Run a worker armed with that factory to finish it.`
                   ),
                 // The run store owns the terminal vocabulary; the scan needs it
                 // to tell a node an agent may still be working from one that is
