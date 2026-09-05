@@ -6219,11 +6219,59 @@ function codexCmd(cfg = null) {
   return dispatchHarnesses.getHarness("codex").command(process.env, cfg);
 }
 
+// A `.cmd`/`.bat` shim (npm's cmd-shim, or an equivalent hand-rolled wrapper)
+// can only be run through cmd.exe, and cmd.exe ends the command line at the
+// FIRST newline in it — so any argument carrying a multi-line value (e.g. a
+// dispatch prompt) arrives at the wrapped program truncated to its first line
+// (issue-spor-dispatch-bg-cmd-shim-truncates-multiline-prompt). Most such
+// shims are themselves nothing but a `node <script> %*` launcher, so this
+// parses the shim's own text to recover that underlying `node`/script pair —
+// letting the caller spawn IT directly (a real .exe, no cmd.exe hop, no
+// command-line re-tokenization) instead of the shim. Returns
+// `{ command, scriptPath }`, or null when the shim's content doesn't match
+// that shape (an arbitrary batch script, say), so the caller can fall back to
+// the cmd.exe hop unchanged.
+function resolveCmdShimNodeTarget(shimPath) {
+  let content;
+  try {
+    content = fs.readFileSync(shimPath, "utf8");
+  } catch {
+    return null;
+  }
+  // npm's cmd-shim template (and the simpler node-stub wrappers this repo's
+  // own tests use) both end in one line shaped `"<prog>"  "<script>" %*`,
+  // where `<prog>` is `node`, `node.exe`, an absolute path to one, or a
+  // `%_prog%`-style variable cmd.exe would have substituted for us.
+  const m = content.match(/"([^"\r\n]*)"\s+"([^"\r\n]+\.[cm]?js)"\s+%\*/i);
+  if (!m) return null;
+  const dp0 = path.dirname(shimPath) + path.sep;
+  // `%dp0%`/`%~dp0` tokens are Windows-only, but the backslashes the shim was
+  // written with are a Windows path separator, not a POSIX one — normalize
+  // them so this resolves identically under test on any platform, not just
+  // on a real win32 box (where path.sep is already `\`).
+  const toPath = (token) => path.resolve(token.replace(/%~?dp0%?\\?/gi, dp0).split("\\").join(path.sep));
+  const scriptPath = toPath(m[2]);
+  if (!fs.existsSync(scriptPath)) return null;
+  // `<prog>` is `node`/`node.exe`, an absolute path to one, or a
+  // `%_prog%`-style batch variable cmd.exe would have substituted for us — an
+  // unresolvable token simply fails the existsSync check below and falls
+  // through to the same sibling-then-PATH resolution the shim's own batch
+  // logic uses.
+  const progCandidate = m[1] ? toPath(m[1]) : null;
+  const siblingNode = path.join(path.dirname(shimPath), "node.exe");
+  const command = progCandidate && fs.existsSync(progCandidate)
+    ? progCandidate
+    : fs.existsSync(siblingNode) ? siblingNode : (u.whichSync("node") || "node");
+  return { command, scriptPath };
+}
+
 function spawnPortableSync(cmd, args, opts = {}) {
   if (process.platform !== "win32" || opts.shell) return spawnSync(cmd, args, opts);
   const resolved = u.whichSync(cmd) || cmd;
   if (/\.(?:cmd|bat)$/i.test(resolved)) {
     const { shell: _shell, ...rest } = opts;
+    const target = resolveCmdShimNodeTarget(resolved);
+    if (target) return spawnSync(target.command, [target.scriptPath, ...args], rest);
     return spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", resolved, ...args], rest);
   }
   return spawnSync(resolved, args, opts);
@@ -16661,7 +16709,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
+module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget };
 
 if (require.main === module) {
   main()

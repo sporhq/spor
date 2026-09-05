@@ -369,14 +369,7 @@ test("--print previews the supervised launch (prompt on stdin) and, with --bg, t
   assert.match(bg.stdout, /^session: \(allocated by claude --bg at launch, bound after\)$/m);
 });
 
-test("--bg opts into the native launch: claude --bg with the prompt positional, a native-background run record", {
-  // The stub is a .cmd on Windows, which spawnPortableSync runs through
-  // cmd.exe — and cmd.exe ends the command line at the prompt's first newline,
-  // so the positional arrives truncated. That is a real limitation of the
-  // native launch through a .cmd shim (issue-spor-dispatch-bg-cmd-shim-
-  // truncates-multiline-prompt), not something this test can assert around.
-  skip: process.platform === "win32" && "a multi-line positional cannot pass through a cmd.exe-run .cmd stub",
-}, () => {
+test("--bg opts into the native launch: claude --bg with the prompt positional, a native-background run record", () => {
   const { home, repo } = fixture();
   const outfile = path.join(home, "claude-bg.json");
   const stub = claudeBgStub(home);
@@ -391,9 +384,7 @@ test("--bg opts into the native launch: claude --bg with the prompt positional, 
   assert.strictEqual(record.launch_mode, "native-background");
 });
 
-test("the run-record schema's launch-mode asymmetry is real: `model`+`launched_at` on native, `started_at` on supervised", {
-  skip: process.platform === "win32" && "a multi-line positional cannot pass through a cmd.exe-run .cmd stub",
-}, async () => {
+test("the run-record schema's launch-mode asymmetry is real: `model`+`launched_at` on native, `started_at` on supervised", async () => {
   // WORKERS.md §8 documents the two launch modes as carrying DIFFERENT field
   // sets, and a consumer reads an absent field as absent rather than as a
   // violation — so which fields each writer actually emits is a contract, not
