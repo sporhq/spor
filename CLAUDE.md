@@ -804,10 +804,13 @@ trivially off-diff and trivially passes alone) — and where the failure is
 demonstrably not the change's, the failing TEST files (at most 5) are re-run
 alone on that same open tree under the same lease; passing there makes the
 whole-suite failure an off-diff FLAKE, so the gate PASSES and the flake is filed
-as its own convergent, per-FILE `issue-flake-*` (routed to the
-`test_lane_profile`, `relates-to` from every gate fact that ever tripped over it
-— the inbound edges are the occurrence count) rather than spending the item's fix
-cycles, its rescue lane and finally a person. "Demonstrably not the change's" is
+as its own convergent, per-FILE `issue-flake-*` — ONE per failing file, keyed on
+that file ALONE and never on the co-failing set (which shifts with load and
+ordering, so keying on it would mint a near-duplicate per permutation), with the
+companions as body context; routed to the `test_lane_profile`, `relates-to` from
+every gate fact that ever tripped over it — the inbound edges are the occurrence
+count — and the pass needs EVERY file's filing to land — rather than spending the
+item's fix cycles, its rescue lane and finally a person. "Demonstrably not the change's" is
 TWO claims, both required and both failing closed: EVERY failed run (not just
 the last — `reruns` means several samples of one tree, and an off-diff flake on
 run 2 must not overwrite an on-diff failure on run 1, `gates.offDiffRuns`) named
@@ -819,17 +822,27 @@ which the change had edited). A reference is read two ways, since one spelling
 misses the other's shape: TEXTUALLY (`gates.mentionsChanged` — the path, the
 basename as a token, an extensionless quoted specifier) and as a RESOLVED import
 EDGE (`gates.referencedCandidates` resolved against the file's own dir and
-compared to the change set, asked on every hop INCLUDING the last, so
-`lib/index.js` requiring `./kernel/queue.js` is a reference to
-`lib/kernel/queue.js` even though its text spells neither). The seeds are every
+compared to the change set, asked of every file the walk READS including the
+last, so `lib/index.js` requiring `./kernel/queue.js` is a reference to
+`lib/kernel/queue.js` even though its text spells neither). It is a TRANSITIVE
+claim, so the walk follows the frontier to EXHAUSTION rather than stopping at a
+fixed depth — a test that reaches the change two helpers out executes it as much
+as one that requires it directly, and a walk that simply stopped answered "no
+reference" indistinguishably from having looked everywhere (the one budget in
+here that failed OPEN). The bounds left are read budgets that fail CLOSED
+(`REF_SCAN_MAX_READS`/`_BYTES`/`_TOTAL_BYTES`: a file still to read when one
+runs out is unknown, and the failure is charged). The seeds are every
 file the failure named, not only the ones the isolation would re-run: those
 others are where the failure WENT, so what they import is part of the same
-question — the test files are HARD seeds (unreadable stops the pass, since we
-would otherwise re-run a file we could not judge) and the rest are soft (a path
-scraped from a stack frame need not exist in this tree, and one that does not
-imports nothing). The reference read is over-inclusive and bounded, and an
-unreadable seed or an over-budget walk charges the failure, so the pass is
-NARROW by design: `reruns` stays the broad flake mitigation. Off-diff is
+question — the test files are HARD seeds (a seed that is not there stops the
+pass, since we would otherwise re-run a file we could not judge) and the rest
+are soft (a path scraped from a stack frame need not exist in this tree, and one
+that does not imports nothing). Softness is about ABSENCE only: once a file
+EXISTS, not reading it (too large, a permission error, an I/O fault) leaves the
+question open for a soft seed exactly as much as for a hard one, so it is
+unknown either way. The reference read is over-inclusive and bounded, and a
+missing hard seed, an unreadable file or an over-budget walk charges the failure,
+so the pass is NARROW by design: `reruns` stays the broad flake mitigation. Off-diff is
 a reason to LOOK, never to pass: a failure naming a file the change touches, or
 one that fails alone too, is charged as before, and the pass is never clean (the
 whole-suite failure rides the fact as evidence) — nor is it unconditional: it

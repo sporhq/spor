@@ -903,7 +903,12 @@ outside git (a database on a fixed port, a `db reset`):
   they pass alone, the whole-suite failure is an **off-diff flake**: the gate
   PASSES, and the flake is filed as its own `issue-flake-*` node rather than
   spending the item's fix cycles, its rescue lane and finally a person on work
-  that was never wrong.
+  that was never wrong. ONE issue per failing FILE, keyed on that file alone —
+  a flake belongs to the file that flakes, not to the set it happened to fail
+  beside (a set that shifts with load and ordering, and whose every permutation
+  would otherwise be its own near-duplicate). The pass needs every one of them
+  to land: a file with no durable record is the one thing it may not trade
+  away, and a filing that fails charges the failure as before.
 
   "Off-diff" is TWO claims, and both must hold. First, no failed run named a
   file the change edits — every run, not just the last, since a declared
@@ -913,9 +918,9 @@ outside git (a database on a fixed port, a `db reset`):
   not an argument, and a test that never appears in one can still import,
   spawn or read a file that does (the refusal that prompted this feature is
   exactly that shape — test/codex-dispatch.test.js spawns `bin/spor.js`,
-  which the change had edited). So the files the failure named, and the local
-  files they themselves name one hop out, are READ and asked that question two
-  ways — because one spelling misses the other's shape. TEXTUALLY: any
+  which the change had edited). So the files the failure named, and everything
+  reachable from them through the local files they name, are READ and asked
+  that question two ways — because one spelling misses the other's shape. TEXTUALLY: any
   spelling of a changed path in the source — the path itself, its basename as
   a token (what a `path.join(ROOT, "bin", "spor.js")` leaves behind), an
   extensionless quoted specifier. And by RESOLVED IMPORT EDGE: every local file
@@ -923,7 +928,17 @@ outside git (a database on a fixed port, a `db reset`):
   change set exactly, which is what catches a segmented spelling whose text
   contains no repo-relative path at all (`lib/index.js` requiring
   `./kernel/queue.js` references `lib/kernel/queue.js` while spelling neither).
-  The edge question is asked on every hop, the last one included.
+  The edge question is asked of every file the walk reads, the last one
+  included.
+
+  HOW FAR it looks is the whole transitive closure, not a fixed number of hops.
+  "Imported or executed by the failing test" is a transitive claim — a test that
+  reaches the change through two helpers executes it exactly as much as one that
+  requires it directly — and a walk that simply STOPPED at a depth limit would
+  answer "no reference" in a voice indistinguishable from having looked
+  everywhere. So the frontier is followed to exhaustion, and the only bounds
+  left are read budgets that fail CLOSED: a file the walk still had to read
+  when it ran out of budget is `unknown`, and the failure is charged.
 
   WHICH files are asked is likewise two sets. The test files the isolation
   would re-RUN are HARD seeds: anything that stops us reading one stops the
@@ -931,9 +946,13 @@ outside git (a database on a fixed port, a `db reset`):
   files the failure named ride along as soft seeds — the failure went THROUGH
   them, so what they import is as much part of the question, but a path
   scraped out of a stack frame need not exist in this tree and one that does
-  not is importing nothing. That check is deliberately over-inclusive and
-  bounded: a reference it cannot rule out, a hard seed it cannot read, and a
-  walk that would exceed its budget all read as "not demonstrably off-diff". The practical
+  not is importing nothing. That softness is about ABSENCE only: once a file
+  is here, not reading it leaves the question open exactly as much as for a
+  hard seed, so an existing file the walk cannot read (too large, a permission
+  error, an I/O fault) is `unknown` whichever kind of seed it is. That check is
+  deliberately over-inclusive and bounded: a reference it cannot rule out, a
+  hard seed that is not there, a file it cannot read, and a walk that would
+  exceed its budget all read as "not demonstrably off-diff". The practical
   consequence is that the pass is NARROW — in a repo whose tests drive one
   large entry point, most changes are implicated in most failures and the
   failure is charged as it always was. That is the intended trade: the

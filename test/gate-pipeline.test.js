@@ -4764,7 +4764,7 @@ test("a flake the graph refuses to file is CHARGED, not passed: the pass is cond
   const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
   assert.strictEqual(res.state, "failed", "no durable record of the flake, so no pass on the strength of it");
   const fact = seen.facts[0].markdown;
-  assert.match(fact, /PASSED — an off-diff flake, but it could not be filed as its own issue \(the graph refused the write\), so the failure is charged/);
+  assert.match(fact, /PASSED — an off-diff flake, but it could not be filed as its own issue \(test\/codex-dispatch\.test\.js: the graph refused the write\), so the failure is charged/);
   assert.doesNotMatch(fact, /relates-to, to: issue-flake/);
   assert.strictEqual(seen.escalations.length, 1, "and a person gets the item, which is what a charged failure has always done");
   fs.rmSync(dir, { recursive: true, force: true });
@@ -4929,6 +4929,107 @@ test("a failing test the walk cannot READ is charged, not isolated — the refer
   assert.match(bare.seen.facts[0].markdown, /the judged tree's path is unknown/);
 });
 
+// "Imported or executed by the failing test" is a TRANSITIVE claim, so the walk
+// that answers it has to be transitive too. A walk that stopped after a fixed
+// number of hops returned "no reference" for a test that reaches the change one
+// helper further out — an answer indistinguishable from having looked
+// everywhere, and the one budget in the reference read that failed OPEN.
+test("the reference walk follows the whole closure, not a fixed number of hops: a change reached through TWO helpers is still a reference", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-deep-"));
+  fs.mkdirSync(path.join(dir, "test", "helpers"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "lib", "kernel"), { recursive: true });
+  // test -> helpers/launch.js -> helpers/cli.js -> lib/kernel/queue.js. Nothing
+  // but the last file spells the change, and it is three hops from the seed.
+  fs.writeFileSync(path.join(dir, "test", "codex-dispatch.test.js"), 'const launch = require("./helpers/launch.js");\n');
+  fs.writeFileSync(path.join(dir, "test", "helpers", "launch.js"), 'module.exports = require("./cli.js");\n');
+  fs.writeFileSync(path.join(dir, "test", "helpers", "cli.js"), 'module.exports = require("../../lib/kernel/queue.js");\n');
+  fs.writeFileSync(path.join(dir, "lib", "kernel", "queue.js"), "module.exports = {};\n");
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const { deps, seen } = treeFakes({
+    dir,
+    changed: ["lib/kernel/queue.js"],
+    run: (attempt, command) => (command ? { ok: true } : { ok: false, code: 1, output: FAILED_OFF_DIFF }),
+  });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps })).state, "failed", "the test executes the change, however many helpers away");
+  assert.deepStrictEqual(seen.suites, ["acceptance"], "nothing is re-run in isolation");
+  assert.deepStrictEqual(seen.flakes, []);
+  assert.match(seen.facts[0].markdown, /reference lib\/kernel\/queue\.js, which the change does edit/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// Softness is about ABSENCE, and only absence. A path scraped out of a stack
+// frame that is not in this tree imports nothing — but one that IS here and
+// cannot be read is a file the failure went through and we did not look in, and
+// concluding "no reference" from it is the same fail-open the hop cap was.
+test("a soft seed that EXISTS and cannot be read closes the walk: unreadable is unknown, not absent", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const output = [
+    "✖ the launch handshake (40001.2ms)",
+    "  AssertionError [ERR_ASSERTION]: the record was never written",
+    "      at dispatch (lib/shell/dispatch.js:88:9)",
+    "      at TestContext.<anonymous> (test/codex-dispatch.test.js:120:5)",
+  ].join("\n");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-unreadable-"));
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "lib", "shell"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "test", "codex-dispatch.test.js"), 'const assert = require("node:assert");\n');
+  // Bigger than the walk's per-file ceiling: it is here, and we cannot read it.
+  fs.writeFileSync(path.join(dir, "lib", "shell", "dispatch.js"), `// ${"x".repeat(1024 * 1024 + 64)}\n`);
+  const { deps, seen } = treeFakes({ dir, changed: ["lib/kernel/queue.js"], run: (a, c) => (c ? { ok: true } : { ok: false, code: 1, output }) });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps })).state, "failed");
+  assert.deepStrictEqual(seen.flakes, [], "a file we could not look in settles nothing");
+  assert.match(seen.facts[0].markdown, /whether they reference the change could not be read \(lib\/shell\/dispatch\.js is too large to read\)/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// A flake belongs to the FILE that flakes. Keying its issue on the whole
+// co-failing set gives the same file a different issue every time its
+// companions — or their order — change, which is the near-duplicate the
+// convergent id exists to prevent.
+test("a failure naming two off-diff files files ONE issue PER FILE, and the fact links each", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-two-"));
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "test", "codex-dispatch.test.js"), 'const assert = require("node:assert");\n');
+  fs.writeFileSync(path.join(dir, "test", "dispatch-runs.test.js"), 'const assert = require("node:assert");\n');
+  const output = [
+    "✖ the launch handshake (40001.2ms)",
+    "      at TestContext.<anonymous> (test/codex-dispatch.test.js:120:5)",
+    "✖ the run record (2.1ms)",
+    "      at TestContext.<anonymous> (test/dispatch-runs.test.js:44:5)",
+  ].join("\n");
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const { deps, seen } = treeFakes({
+    dir,
+    changed: ["lib/kernel/queue.js"],
+    run: (attempt, command) => (command ? { ok: true } : { ok: false, code: 1, output }),
+  });
+  deps.fileFlakeItem = async (args) => {
+    seen.flakes.push(args);
+    return { ok: true, id: `issue-flake-${args.file.replace(/[^a-z0-9]+/gi, "-")}` };
+  };
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps })).state, "passed");
+  assert.deepStrictEqual(seen.flakes.map((f) => f.file), ["test/codex-dispatch.test.js", "test/dispatch-runs.test.js"], "one filing per file");
+  for (const f of seen.flakes) assert.deepStrictEqual(f.files, ["test/codex-dispatch.test.js", "test/dispatch-runs.test.js"], "the co-failing set rides along as context");
+  const fact = seen.facts[0].markdown;
+  assert.match(fact, /- \{type: relates-to, to: issue-flake-test-codex-dispatch-test-js\}/);
+  assert.match(fact, /- \{type: relates-to, to: issue-flake-test-dispatch-runs-test-js\}/);
+  assert.match(fact, /filed as issue-flake-test-codex-dispatch-test-js, issue-flake-test-dispatch-runs-test-js/);
+  fs.rmSync(dir, { recursive: true, force: true });
+
+  // …and the pass needs EVERY one of them: a file whose issue did not land has
+  // no durable record, which is the one thing this pass may not trade away.
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-two2-"));
+  fs.mkdirSync(path.join(dir2, "test"), { recursive: true });
+  fs.writeFileSync(path.join(dir2, "test", "codex-dispatch.test.js"), 'const assert = require("node:assert");\n');
+  fs.writeFileSync(path.join(dir2, "test", "dispatch-runs.test.js"), 'const assert = require("node:assert");\n');
+  const second = treeFakes({ dir: dir2, changed: ["lib/kernel/queue.js"], run: (a, c) => (c ? { ok: true } : { ok: false, code: 1, output }) });
+  second.deps.fileFlakeItem = async (args) =>
+    args.file === "test/dispatch-runs.test.js" ? { ok: false, reason: "the graph refused the write" } : { ok: true, id: "issue-flake-one" };
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: second.deps })).state, "failed");
+  assert.match(second.seen.facts[0].markdown, /could not be filed as its own issue \(test\/dispatch-runs\.test\.js: the graph refused the write\)/);
+  fs.rmSync(dir2, { recursive: true, force: true });
+});
+
 // A declared `reruns` budget means a charged failure is several runs of one
 // tree, and they need not fail the same way. Judging the last one alone would
 // let an off-diff flake on run 2 overwrite an on-diff failure on run 1.
@@ -5038,7 +5139,7 @@ test("the isolated rerun runs on the SAME prepared tree, after every declared re
 });
 
 // The flake issue is the one node a gate files that is keyed on the FAILING
-// FILES rather than on the run — because a flake is a property of the file, and
+// FILE rather than on the run — because a flake is a property of the file, and
 // the same file flaking on ten dispatches must converge on one issue somebody
 // can actually fix, not ten near-duplicates nobody triages.
 function flakeDeps(cfg, home, { node = "task-p", run = "run-abcdef12" } = {}) {
@@ -5066,7 +5167,7 @@ test("makeGateDeps files an off-diff flake as a per-FILE issue in the test lane,
   assert.match(md, /- \{type: relates-to, to: factory-demo\}/);
   assert.match(md, /- \{type: relates-to, to: profile-test-writer\}/);
   assert.match(md, /`test\/codex-dispatch\.test\.js`/);
-  assert.match(md, /Re-running them alone on that same tree \(`node --test 'test\/codex-dispatch\.test\.js'`\) PASSED/);
+  assert.match(md, /Re-running the failure's files alone on that same tree \(`node --test 'test\/codex-dispatch\.test\.js'`\) PASSED/);
   // Nothing run-specific in it: the run, the item and the evidence live on the
   // `art-gate-*` facts that point AT this issue, which is what makes a repeat
   // an idempotent no-op instead of a colliding write.
@@ -5078,8 +5179,16 @@ test("makeGateDeps files an off-diff flake as a per-FILE issue in the test lane,
   assert.strictEqual(fs.readdirSync(path.join(home, "nodes")).length, 1);
 
   // A different file is a different flake.
-  const other = await deps.fileFlakeItem({ ...call, files: ["test/dispatch-runs.test.js"] });
+  const other = await deps.fileFlakeItem({ ...call, file: "test/dispatch-runs.test.js", files: ["test/dispatch-runs.test.js"] });
   assert.notStrictEqual(other.id, first.id);
+  assert.strictEqual(fs.readdirSync(path.join(home, "nodes")).length, 2);
+
+  // …and the COMPANIONS are not part of the identity: the same file failing
+  // beside a different set, in a different order, is the same flake. Keying on
+  // the set would have minted a third node here and a fourth next time the
+  // suite's scheduling shuffled.
+  const beside = await deps.fileFlakeItem({ ...call, file: "test/codex-dispatch.test.js", files: ["test/dispatch-runs.test.js", "test/codex-dispatch.test.js"] });
+  assert.deepStrictEqual([beside.ok, beside.id, beside.existing], [true, first.id, true], "the file is the key; what it failed beside is context");
   assert.strictEqual(fs.readdirSync(path.join(home, "nodes")).length, 2);
   fs.rmSync(home, { recursive: true, force: true });
 });

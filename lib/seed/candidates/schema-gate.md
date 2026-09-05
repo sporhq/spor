@@ -44,8 +44,9 @@ Keys by kind:
   carrying a `{files}` token (`node --test {files}`) — which, when a failure
   names only files the change does NOT touch, re-runs those test files alone
   on that same tree: passing there makes the whole-suite failure an off-diff
-  FLAKE, so the gate passes and the flake is filed as its own `issue-flake-*`
-  instead of costing a fix cycle, a rescue or a person. Off-diff is a reason
+  FLAKE, so the gate passes and each failing file is filed as its own
+  convergent `issue-flake-*` instead of costing a fix cycle, a rescue or a
+  person. Off-diff is a reason
   to look, never to pass, and the bar is deliberately high: every failed run
   must have named only files off the diff, those tests must REFERENCE nothing
   the change edits (they are read to check), and they must pass alone. A

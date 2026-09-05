@@ -109,13 +109,15 @@ Keys by kind (`lib/kernel/gates.js` is the authority):
   `node --test {files}` — the OFF-DIFF flake pass: after the reruns, a failure
   naming only files the change does not touch has those test files re-run
   alone on the same tree, and passing there makes the whole-suite failure a
-  flake (the gate passes, the flake is filed as its own `issue-flake-*`)
-  instead of costing a fix cycle, the rescue lane and finally a person.
+  flake (the gate passes, and each failing file is filed as its own convergent
+  `issue-flake-*`) instead of costing a fix cycle, the rescue lane and finally
+  a person.
   Propose it wherever the operator's whole-suite command is the same one a
   single file can be run through — a repo whose suite cannot name a file
   should declare nothing. Set expectations when you propose it: the pass is
   narrow on purpose (the failing tests must also reference nothing the change
-  edits, checked by reading them), so in a repo whose tests all drive one
+  edits — checked by reading them and, transitively, everything they import),
+  so in a repo whose tests all drive one
   large entry point it will rarely fire and `reruns` stays the flake
   mitigation that does the work. Deliberately *no* ref or protected-path key: those
   belong to the factory, so one shared gate can never relax another team's

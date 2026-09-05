@@ -11680,9 +11680,12 @@ function makeGateDeps(
     // same `test_lane_profile` the protected-path lane uses, because fixing a
     // flaky test IS a test change and must not come from the implementer.
     //
-    // Alone among the nodes a gate files, its id and its BODY are keyed on the
-    // failing FILES rather than on the run: a flake is a property of the file,
-    // and the same file flaking on ten dispatches must converge on ONE issue
+    // Alone among the nodes a gate files, its id and its BODY are keyed on ONE
+    // failing FILE rather than on the run — the runner calls this once per file
+    // the failure named. A flake is a property of the file, not of the set it
+    // happened to fail beside (a set that changes with load and ordering, and
+    // whose every permutation would otherwise be its own issue), and the same
+    // file flaking on ten dispatches must converge on ONE issue
     // (writeGateNode's `if_exists: skip` remotely, and its identical-content
     // adoption locally, both then read the repeat as a no-op) instead of ten
     // near-duplicates nobody triages. The occurrence count is the inbound
@@ -11713,26 +11716,35 @@ function makeGateDeps(
     // exists to prevent. That is why a write that did not create anything
     // (`existing`, in either mode) sends the id back through the read once,
     // instead of being returned as a filing.
-    fileFlakeItem: async ({ gate, files, command, isolate }) => {
+    fileFlakeItem: async ({ gate, file, files, command, isolate }) => {
       const list = (files || []).map(String);
-      const stem = list[0].replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase().slice(0, 34).replace(/-+$/, "") || "suite";
-      const base = `issue-flake-${stem}-${gateIdSuffix("flake", gate.id, slug || "", list.join("\n"))}`;
+      // ONE issue per FILE, keyed on that file and nothing else. Keying it on
+      // the whole co-failing SET would mint a fresh issue for the same flaky
+      // file every time its companions — or their order — changed, which is
+      // exactly the near-duplicate a convergent id exists to prevent: the file
+      // is what someone fixes, so the file is the key. The rest of the
+      // failure's files are context in the body, never in the id.
+      const target = String(file || list[0]);
+      const others = list.filter((f) => f !== target);
+      const stem = target.replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase().slice(0, 34).replace(/-+$/, "") || "suite";
+      const base = `issue-flake-${stem}-${gateIdSuffix("flake", gate.id, slug || "", target)}`;
       const profile = factory.testLaneProfile || null;
       const markdown = (id, priorId, priorWhy) =>
         buildGateWorkNode({
           id,
           type: "issue",
-          title: `Flaky under the ${gate.id} gate — ${list.join(", ")} fails the full suite and passes alone`,
-          summary: `${list.join(", ")} failed factory \`${factory.id}\`'s \`${gate.id}\` gate (\`${command}\`) and passed when re-run alone on the same tree — an off-diff flake, not a failure of any change under judgement.`,
+          title: `Flaky under the ${gate.id} gate — ${target} fails the full suite and passes alone`,
+          summary: `${target} failed factory \`${factory.id}\`'s \`${gate.id}\` gate (\`${command}\`) and passed when re-run alone on the same tree — an off-diff flake, not a failure of any change under judgement.`,
           body: [
             `The \`${gate.id}\` command gate of factory \`${factory.id}\` failed its whole-suite run \`${command}\`,`,
-            "in file(s) the change under judgement did not touch and that reference nothing it edits:",
+            "in this file, which the change under judgement did not touch and which references nothing it edits:",
             "",
-            list.map((f) => `- \`${f}\``).join("\n"),
+            `- \`${target}\``,
+            ...(others.length ? ["", `It failed alongside ${others.map((f) => `\`${f}\``).join(", ")}, each of which carries its own issue — the`, "companion set is context here, not part of this issue's identity, so the same file converges on this", "node however it fails next time."] : []),
             "",
-            `Re-running them alone on that same tree (\`${isolate}\`) PASSED, so the failure was the suite's`,
-            "scheduling — load, ordering, a shared fixture — and not the change. The gate therefore passed the",
-            "item and filed this instead of spending its fix cycles, its rescue lane and finally a person on",
+            `Re-running the failure's files alone on that same tree (\`${isolate}\`) PASSED, so the failure was the`,
+            "suite's scheduling — load, ordering, a shared fixture — and not the change. An off-diff flake costs",
+            "this issue rather than the item's fix cycles, its rescue lane and finally a person, all spent on",
             "work that was never wrong (WORKERS.md §10.3).",
             "",
             "Fix the flake in the file itself: make it independent of what else is running. Every `art-gate-*`",
@@ -11797,7 +11809,7 @@ function makeGateDeps(
         if (written.ok && !written.existing) return written;
         // The id was occupied between the read and the write — another worker
         // filed the same flake first (its content is this flake's by
-        // construction, the id being keyed on the files and nothing else), or
+        // construction, the id being keyed on the file and nothing else), or
         // the same-content door adopted it. Either way this markdown did not
         // land, so the occupant is read back ONCE and the same live/settled/
         // unknown rule decides, rather than adopted on the strength of the id.
