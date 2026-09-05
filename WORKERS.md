@@ -497,8 +497,11 @@ report to file (step 3), a report the graph refused, and a decline whose
 finding the graph refused are all `terminal_enforced: true`: the graph was
 asked and it answered, which is the whole of the claim. What those three lack
 is a filed artifact, and the record says so on its own fields —
-`report_node_id`/`finding_node_id` absent, `lease_released: false` for the
-lease left held — never by demoting `terminal_enforced` to stand in for them.
+`report_node_id`/`finding_node_id` absent, `lease_released: false` for a lease
+these two arms deliberately never attempted to hand back — never by demoting
+`terminal_enforced` to stand in for them. (`false` is the weaker claim §8
+spells out — "no confirmed handback" — and only here, where no release was
+attempted at all, does it also mean the lease is certainly still held.)
 Nothing is filed on the `resolved` arm either, for the opposite reason:
 completion is attested, so there is nothing left to file. Read the flag as
 "and the paperwork landed" and a checked verdict reports itself as a guess;
@@ -731,11 +734,11 @@ record still `launching`/`running` has none of these yet):
 | `terminal_enforced` | bool | whether this was a *verified* verdict (re-read against a reachable graph) or a best-effort classification — **gate on this before trusting `terminal_state` as ground truth** |
 | `resolved_by` | string | present only when `terminal_state === "resolved"` — the resolver node's id |
 | `resolved_edge` | string | present only when resolved — `"resolves"` or `"answers"` |
-| `report_node_id` | string | present only when a report was actually filed (§7) — its presence always implies `terminal_state === "reported"`. Filing is downstream of a successful re-read (§6, step 1 precedes step 2), so only an *enforced* record can carry one; an unenforced `reported` record has none, the twin of the `finding_node_id` row below |
+| `report_node_id` | string | present only when a report was actually filed (§7). The invariant to key on is DIRECTIONAL: its presence always implies `terminal_state === "reported"`. The converse is **not** a contract. Under the current writer filing sits downstream of a successful re-read (§6, step 1 precedes step 2), so a record written today carries one only when `terminal_enforced` is `true` — but the unjudgeable arm §6 describes above filed the report and stamped the verdict `terminal_enforced: false` in the same record, and records written by it stay readable for the whole retention window below. So reach for the artifact by testing THIS KEY'S presence; gate on `terminal_enforced` to decide whether to trust `terminal_state`, never to decide whether an artifact id is there |
 | `declined_reason` | string | present only when `terminal_state === "declined"` — the reason off the report's `DECLINED:` line |
-| `finding_node_id` | string | present only when a decline's finding was actually filed — its presence always implies `terminal_state === "declined"`; an unenforced declined record has none |
+| `finding_node_id` | string | present only when a decline's finding was actually filed — its presence always implies `terminal_state === "declined"`; an unenforced declined record has none. Here the converse holds for every record ever written, unlike `report_node_id` above: the `declined` outcome post-dates the unjudgeable arm, so no retained record pairs a finding id with an unenforced verdict |
 | `readiness_cleared` | bool | declined only — whether the target's `readiness: agent` stamp was cleared |
-| `lease_released` | bool | optional — `true` once the lease was handed back. `false` means it is still **held**, which covers both ways that happens: a release that was attempted and failed, and one deliberately never attempted because the report or finding write was refused (§6). The two read the same way to an operator, who hands it back with `spor release <id>` or waits out the TTL. **Omitted** (not `false`) when no lease was this run's to release at all |
+| `lease_released` | bool | optional — `true` once the server CONFIRMED the handback. `false` means it was **not confirmed**, which is strictly weaker than "still held" and is all a client can honestly record: it covers a release deliberately never attempted (the report or finding write was refused, §6), one the server refused, and one whose answer never came back at all — and that last case sits over a release the server may well have committed and lost the ack for. Read it as "nobody has seen this lease come back", and act on it the same way either way: `spor release <id>`, or wait out the TTL. That remedy reconciles rather than assuming — release is idempotent, and a claim someone else now holds answers `409` naming the holder (API.md §3) instead of being yanked out from under a live agent. **Omitted** (not `false`) when no lease was this run's to release at all |
 | `terminal_note` | string | a human-readable explanation of the outcome, always present once this dimension exists |
 
 A record with `terminal_state` unset (or `state` still non-terminal) has not

@@ -285,30 +285,36 @@ Terminal records age out after `dispatch.runRetentionMs` (default 14 days).
 
 That state describes how the **process** ended. Alongside it every run also
 carries its **outcome** — what the run did to the graph — as exactly one of
-`resolved`, `reported`, or `failed`:
+`resolved`, `reported`, `declined`, or `failed`:
 
 | outcome | meaning |
 |---|---|
-| `resolved` | the graph itself shows a live resolving edge (`resolves`/`answers`) onto the target node. Verified by re-reading the node after the run, never inferred from an exit code and never taken from the agent's own word |
-| `reported` | no resolution, but the agent left a final report. It is filed as an artifact node linked to the target (`relates-to`) and **then** the lease is released, so the item returns to the queue carrying the work instead of vanishing into a dead run. `report_node_id` names the artifact — a filed report always reads `reported`, enforced or not |
-| `failed` | no resolution and no report filed — a launch failure, a crash before any report, an empty one, or a graph that refused the write. `terminal_note` carries the failure note. The lease is released, except where the report could not be filed (see the ordering rule below) or the target was one this runner cannot judge |
+| `resolved` | the graph itself attests completion — a live resolving edge (`resolves`/`answers`) onto the target node, or, for a type retired by its own status rather than by an edge, a status that has reached that type's terminal partition. Verified by re-reading the node after the run, never inferred from an exit code and never taken from the agent's own word |
+| `reported` | no attestation of completion, but the agent left a final report. It is filed as an artifact node linked to the target (`relates-to`) and **then** the lease is released, so the item returns to the queue carrying the work instead of vanishing into a dead run. `report_node_id` names the artifact — a filed report always reads `reported`, enforced or not |
+| `declined` | the agent declared the ITEM wrong rather than the work unfinished, by making the first line of its final report `DECLINED: <reason>`. The reason is filed as a `finding` on the target, the target's `readiness: agent` stamp is cleared, and the lease is released — the item goes to triage, never into a gate |
+| `failed` | no attestation and no report filed — a launch failure, a crash before any report, an empty one, or a graph that refused the write. `terminal_note` carries the failure note. The lease is released, except where the report (or a decline's finding) could not be filed at all — see the ordering rule below |
 
 The ordering is the contract: the report is filed before the lease goes back to
 the pool, so an interrupted run can leave a held lease with the report filed but
 never a released lease with nothing attached.
 
 Enforcement covers **supervised** launches (Claude Code, Codex, OpenCode, Copilot
-CLI — every built-in) against a team graph, targeting a node type whose
-completion is a resolving edge (`task`, `issue`, `question`, `incident`). A
+CLI — every built-in). A target's TYPE never costs a run its enforcement: both
+attestation paths — the resolving edge, and the terminal own-status a
+status-only type is retired by — are judged, and both release the lease. What
+does cost it is a posture where nothing could be verified at all: a
 native-background run (`spor dispatch --bg`, the opt-in `claude --bg` launch), a
-local-mode dispatch, a free-text dispatch, a target retired by status instead of
-by an edge, and a run whose graph could not be reached are all classified
-best-effort and marked `terminal_enforced: false` — an unenforced run can never
-read `resolved`, and only an **enforced** `reported` promises a `report_node_id`
-(an unenforced run that merely ended cleanly reads `reported` with no artifact).
-A report is still filed wherever one exists and the graph is reachable, including
-for a target this runner cannot judge — the verdict is scoped, the agent's work
-reaching the graph is not.
+free-text dispatch with no target node, and a graph that could not be reached are
+classified best-effort and marked `terminal_enforced: false` — an unenforced run
+can never read `resolved`. Local mode is not excluded: it has no server door to
+file a report or hand a lease back through, but it does have a graph, so a local
+target that reads attested complete is an enforced `resolved`, and only its other
+outcomes are unenforced. A report is still filed wherever one exists and the
+graph is reachable. Filing sits downstream of that verify leg, so a record this
+client writes unenforced today carries no `report_node_id` — but reach for the
+artifact by testing that key's presence, not by testing `terminal_enforced`,
+which is the flag for whether to trust `terminal_state` (WORKERS.md §8 has the
+retained-record case that distinction exists for).
 `spor runs` prints the outcome (tagging `(unenforced)`), the note, and the report
 artifact id; `spor runs --json` carries the same fields on each record.
 
