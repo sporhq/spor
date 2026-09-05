@@ -27,10 +27,15 @@
 # fleet_agents_array <raw-claude-agents-json>
 # Shape-defends `claude agents --json`'s output down to the bare entry
 # array (today it already is one; `// .` covers a future {agents:[...]}
-# wrapper). Echoes compact JSON, or nothing on parse failure. Callers
+# wrapper). Echoes compact JSON on stdout, or nothing on parse failure —
+# but a parse failure's jq diagnostic still reaches stderr (unsuppressed),
+# so malformed `claude agents --json` output is a loud error a caller can
+# see/log, not a silently-empty fleet (issue-spor-orchestrator-lib-fleet-
+# agents-stderr-suppression). jq exits 0 on empty input with no output and
+# no diagnostic, so the ordinary "no agents" case stays silent. Callers
 # iterate the result with plain `.[]?` — no shape clause needed downstream.
 fleet_agents_array() {
-  printf '%s' "$1" | jq -c '.agents? // .' 2>/dev/null
+  printf '%s' "$1" | jq -c '.agents? // .'
 }
 
 # fleet_agent_status <shaped-agents-json> <node-name>
