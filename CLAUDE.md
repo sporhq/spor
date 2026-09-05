@@ -349,9 +349,61 @@ Spend is capped by `SPOR_DIGEST_INTENT_MAX` (`digest.intentMaxCalls`, default
 result arriving beside a synchronous digest is consumed, not double-injected).
 The default path is byte-identical (spool, drain, and their syscalls are all
 gated on the flag), and the same one-turn-delay tradeoff as the async capture
-nudge applies: a digest for a session's final prompt is dropped. Enabling it by
-default is deliberately deferred until the classifier is scored against the
-eval's `warranted` labels. See test/digest-async.test.js.
+nudge applies: a digest for a session's final prompt is dropped. The classifier
+HAS been scored against the eval's `warranted` labels, and the shipped prompt
+in `prompts/client/digest-intent.md` PASSES the gate
+(dec-spor-digest-intent-conjunctive-prompt-passes-gate): the story is three
+prompts. The first shipped prompt FAILED, suppressing 51% of warranted digests —
+and fail-open does not cover that: it protects against backend failure, not
+against haiku confidently answering UNWARRANTED on a clearly-warranted prompt.
+Its recalibration (asymmetric-cost, default-WARRANTED, judging the RETRIEVAL)
+cleared the HARM rule — 0/29 good digests lost — but sat at 4/59 = 6.8%
+warranted suppressed, OVER the 6% budget; a second, materially different
+prompt that judged the PROMPT instead flipped all four of those and landed on
+4/59 again on four DISJOINT cases, which was first read as "6.8% is the rate"
+(dec-spor-digest-intent-eval-harness-committed-rescored). It was not: each
+prompt carried ONE failure mode (a substantive prompt whose digest missed the
+topic; a short steering turn whose digest was on point) while 11 of their 18
+noise suppressions were shared, so the shipped prompt asks for the CONJUNCTION
+— TEST 1 the prompt, TEST 2 the context, UNWARRANTED only when BOTH fail — and
+scores 1/59 and 2/59 on two independent live draws, 0/29 good lost on both,
+10/18 noise removed (down from 14/18: the price of the conjunction), fire-table
+F1 0.864–0.872 vs the always-inject engine's 0.819. Don't quote the 0/29 as if
+it were the gate; the budget row is the gate and it is now inside. That
+scoring is no longer a scratchpad — re-score
+any prompt edit with `scripts/intent-eval/` (`--template <file>` scores a
+candidate without a second checkout; `--replay` re-derives a recorded run with
+no backend calls), and `test/intent-metrics.test.js` ENFORCES it: the
+committed `runs/*.json` whose `tplSha` is the shipped file's sha must record
+a PASS and there must be at least two of them (the backend is not
+deterministic), so an edited prompt that was not re-scored has no run
+certifying it and fails the suite; the superseded prompts live byte-for-byte in
+`scripts/intent-eval/candidates/` with their runs pinned to their FAIL. A run
+that measured NOTHING must never read as a passing one,
+so three rule-0 gate guards cover the three ways it happens: a replay that
+doesn't COVER the population is refused, `cases with no verdict` counts a case
+as measured only when it carries one of the two decision words (the classifier
+fails SILENTLY to `null` with no error field, so counting error strings
+certified 77 dead backend calls as a spotless PASS), and `population cases not
+scored` refuses to certify a `--limit`/`--only` sub-population. A measurement of
+one prompt must equally never be reported as ANOTHER's: a replay reads decisions
+from a file while the template resolves separately from `--template`/the
+checkout, so every record carries the `template_sha` it was produced under —
+a replay naming a different template (or splicing two) is REFUSED, and one
+carrying no sha at all is scored but fails the fourth rule-0 guard, `decisions
+not bound to prompt`. The corpus stays
+in the private server repo.
+Default-on is STILL deferred, now on two things, neither of them prompt work: a
+held-out re-validation on a fresh transcript window (every prompt was scored
+against the set the first was iterated on, and the shipped one was designed from
+the failure pattern of the two before it there —
+task-spor-digest-intent-heldout-revalidation), and a backend-cost call — the
+shipped default `claude -p --model haiku` bills ~$0.08 and ~15s per
+classification on a cold CLI prompt cache (~$0.01 warm), ~98% of it CLI session
+boot rather than the 4.6KB classification, so a flip wants a cheaper
+`digest.intentCmd` backend first, and a different backend is a different
+classifier that must be re-scored. See test/digest-async.test.js and
+scripts/intent-eval/README.md.
 
 The post-tool engine ALSO carries the coupling nudge
 (task-spor-coupling-nudge-posttool, dec-spor-coupling-norms-declared-first) —
