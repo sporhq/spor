@@ -118,7 +118,11 @@ convention schema nodes use:
   silently shorten a watchdog; `run_idle_ms: 0` disables idle detection),
   `budget.attempts` (default 1, max 3) is the re-implementation pool and
   `retry` (default 1 attempt, 60s backoff, max 3) the separate INFRASTRUCTURE
-  pool an outage spends instead of the code's. `candidate.require_clean`
+  pool an outage spends instead of the code's; a count out of range clamps to the
+  bound and a fractional one floors (the convention `cycles`/`reruns` keep), but
+  one that is not readable as a number at all (a blank, a `null`, a `false`, a
+  list) takes the DEFAULT — a typo must never be read as "no
+  retries" or "retry in a second". `candidate.require_clean`
   (default true) refuses a dirty tree at submission rather than inside the
   first gate, and `candidate.publish` (`none`|`branch`|`bundle`, default
   `none`) is how the pinned commit is made reachable to a controller that does
@@ -137,8 +141,10 @@ convention schema nodes use:
   LAST stage the factory actually declares, so it is reachable by construction;
   declaring `integration` without an `integration` block is an error, because a
   boundary that can never be reached leaves every item unresolved forever.
-  Declaring an `implementation` block defaults `by` to `controller`: the block
-  is the opt-in, and controller-written completion is the semantics it asks for.
+  Declaring an `implementation` block that PARSES defaults `by` to `controller`:
+  the block is the opt-in, and controller-written completion is the semantics it
+  asks for. A block that refuses the factory adopted nothing and leaves the
+  boundary on the agent, so a typo in the stage never moves who completes.
   The boundary is adoptable ALONE, with the stage left at its defaults.
 - **Not yet enforced.** As of `schema_version` 2026.09.05.1 the runner PARSES
   and validates `implementation`/`completion` (a mistyped stage refuses to start

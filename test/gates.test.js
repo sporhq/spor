@@ -825,6 +825,27 @@ test("the §2.4 validation table: a mistyped stage refuses the factory, and a le
   assert.strictEqual(stageFactory({ implementation: { retry: { attempts: -1 } } }).factory.implementation.retry.attempts, 0);
   assert.strictEqual(stageFactory({ implementation: { retry: { backoff_ms: 1 } } }).factory.implementation.retry.backoffMs, 1000);
   assert.strictEqual(stageFactory({ implementation: { retry: { backoff_ms: 9999999 } } }).factory.implementation.retry.backoffMs, 600000);
+  // …but only a value READABLE as a number clamps. `Number("")`,
+  // `Number(null)`, `Number(false)` and `Number([])` are all a finite 0, so an
+  // unreadable one used to run that clamp and land on the FLOOR — silently 0
+  // infrastructure retries, or a 1s backoff — instead of the default §2.1
+  // documents, which is the same trap `msOrInherit` exists to close one type
+  // up. E5/E6 clamp a NUMBER; a typo takes the default.
+  for (const junk of ["", "  ", null, false, true, [], {}, "soon"]) {
+    const label = `${JSON.stringify(junk)}`;
+    const r = stageFactory({ implementation: { retry: { attempts: junk, backoff_ms: junk }, budget: { attempts: junk } } });
+    assert.deepStrictEqual(r.errors, [], `an unreadable count is a fallback, not a refusal (${label})`);
+    assert.strictEqual(r.factory.implementation.retry.attempts, 1, `retry.attempts ${label} must take the documented default, never the 0 floor`);
+    assert.strictEqual(r.factory.implementation.retry.backoffMs, 60000, `retry.backoff_ms ${label} must take the documented default, never the 1s floor`);
+    assert.strictEqual(r.factory.implementation.budget.attempts, 1, `budget.attempts ${label} must take the documented default`);
+  }
+  // A payload node is JSON, so `NaN`/`Infinity` can only reach a factory as
+  // `null` — but the pure function takes a plain object from any caller, and
+  // there the number that is not a COUNT must fall back too.
+  for (const junk of [NaN, Infinity, -Infinity]) {
+    const impl = gates.parseImplementation({ implementation: { retry: { attempts: junk, backoff_ms: junk }, budget: { attempts: junk } } }).implementation;
+    assert.deepStrictEqual({ ...impl.retry, budget: impl.budget.attempts }, { attempts: 1, backoffMs: 60000, budget: 1 }, `${junk} is not a count`);
+  }
   // …and a sub-block that is not an object is named, never ignored: an author
   // who wrote `"budget": 5400000` believes it is doing something.
   const flat = stageFactory({ implementation: { budget: 5400000 } });
@@ -848,6 +869,37 @@ test("the §2.4 validation table: a mistyped stage refuses the factory, and a le
   // …and the refused word is never CARRIED: a caller that ignored `errors`
   // must not find `by: "nobody"` on the boundary to act on.
   assert.deepStrictEqual(gates.parseImplementation({ completion: { by: "nobody", after: "never" } }).completion, { by: "agent", after: "gates" });
+});
+
+test("an implementation stage that did not PARSE must not move the completion boundary", () => {
+  // The controller default is keyed on adopting the stage, and a block that
+  // refuses the factory adopted nothing — the return value already says so
+  // (`implementation: null`). Moving the boundary as well would mean a typo in
+  // the stage silently changed WHO retires the item for a caller that read
+  // past `errors`, and `controller` is the one value the operator never wrote.
+  const broken = { implementation: { command: "npm run agent" } };
+  assert.strictEqual(stageFactory(broken).factory, null, "the stage is refused");
+  assert.deepStrictEqual(
+    gates.parseImplementation(broken).completion,
+    { by: "agent", after: "gates" },
+    "an invalid stage leaves the boundary exactly where a factory declaring none leaves it"
+  );
+  // Every other way the block can refuse reads the same.
+  for (const bad of [{ implementation: [] }, { implementation: { budget: 5400000 } }, { implementation: { author_checks: 7 } }, { implementation: { candidate: { publish: "ftp" } } }, { implementation: { author_checks: ["nope"] } }]) {
+    const r = gates.parseImplementation(bad);
+    assert.ok(r.errors.length, `${JSON.stringify(bad)} must refuse`);
+    assert.strictEqual(r.completion.by, "agent", `${JSON.stringify(bad)} must leave the boundary on the agent`);
+  }
+  // An EXPLICIT boundary still wins either way — it is the operator's word,
+  // not an inference off the block (§2.4 E10).
+  assert.strictEqual(gates.parseImplementation({ ...broken, completion: { by: "controller" } }).completion.by, "controller");
+  assert.strictEqual(gates.parseImplementation({ ...broken, completion: { by: "agent" } }).completion.by, "agent");
+  // …and a block that DOES parse still moves it, which is the whole point of
+  // the default.
+  assert.strictEqual(gates.parseImplementation({ implementation: {} }).completion.by, "controller");
+  // A completion error of its own is not an implementation failure: the
+  // boundary a valid stage asked for is still the one reported.
+  assert.strictEqual(gates.parseImplementation({ implementation: {}, completion: { by: "nobody" } }).completion.by, "controller");
 });
 
 test("parseImplementation stands alone on a payload, the way parseIntegration and parseRescue do", () => {
