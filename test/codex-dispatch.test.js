@@ -558,6 +558,41 @@ test("a supervisor that exits before reporting anything stamps failed_launch, di
   assert.ok(!fs.readdirSync(runDir).some((f) => /\.job\.json$|\.prompt$/.test(f)));
 });
 
+test("a direct handshake failure the supervisor never backs with its own record write still closes the run (issue-spor-dispatch-handshake-failure-stuck-launching)", () => {
+  // Some handshake failures (an invalid job file, an unrecognized harness
+  // adapter) are caught by the real runner BEFORE it ever reads or writes
+  // job.record_path — there is no terminal-state contract call to race, and
+  // nothing else will ever close this record. This stub reproduces exactly
+  // that shape: it reports { ok: false } over the handshake fd and exits
+  // clean without touching the record at all, so the fix under test —
+  // launchSupervisedHarness's abandon() call on a direct { ok: false }
+  // signal — is the ONLY thing that can move this run out of `launching`.
+  const { home, repo } = fixture();
+  const failFastRunner = writeNodeScript(path.join(home, "runner-handshake-fail.js"), `
+const fs = require("node:fs");
+const fd = Number(process.env.SPOR_DISPATCH_HANDSHAKE_FD);
+try { fs.writeSync(fd, JSON.stringify({ ok: false, error: "no supervised-jsonl harness adapter for codex" }) + "\\n"); } catch {}
+try { fs.closeSync(fd); } catch {}
+`);
+  const result = run(
+    ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--no-brief"],
+    { SPOR_HOME: home, SPOR_CODEX_CMD: codexStub(home), SPOR_DISPATCH_RUNNER_CMD: failFastRunner }
+  );
+  assert.strictEqual(result.status, 1);
+  assert.match(result.stderr, /could not launch .*: no supervised-jsonl harness adapter for codex/);
+
+  const runDir = path.join(home, "journal", "dispatch");
+  const recordFile = fs.readdirSync(runDir).find((f) => f.endsWith(".run.json"));
+  assert.ok(recordFile, "the launcher still leaves a durable run record");
+  const record = JSON.parse(fs.readFileSync(path.join(runDir, recordFile), "utf8"));
+  assert.strictEqual(record.state, "failed_launch", "a supervisor-reported failure with no record write of its own must not strand the run at launching");
+  assert.strictEqual(record.termination_signal, "supervisor-reported-failure");
+  assert.match(record.termination_reason, /no supervised-jsonl harness adapter for codex/);
+
+  // the ephemeral job/prompt files are cleaned up alongside the abandoned run
+  assert.ok(!fs.readdirSync(runDir).some((f) => /\.job\.json$|\.prompt$/.test(f)));
+});
+
 test("a launch failure is reported off the supervisor's own handshake, not inferred from how long the run record takes to update it (task-spor-dispatch-launch-handshake)", async () => {
   // The bug this regression test pins: launchSupervisedHarness used to poll
   // the run record for a fixed 20 x 50ms and infer "launched" from silence.
