@@ -296,12 +296,14 @@ test('a held lease the blanket beat did not renew is journaled as dropped, never
 });
 
 // issue-spor-sessionend-reserve-retakes-released-lease: the case above only
-// covers a lease that stays VISIBLE this beat but doesn't renew. A lease can
-// also vanish from the assignee=me lookup ENTIRELY between beats — an
-// ordinary TTL lapse, or a `spor release` from another terminal — which the
-// beat must journal as dropped too, or SessionEnd's replay (distill.js
-// sessionEndLease) still believes this session holds it and `reserve`s (and
-// the server auto-reclaims) a lease that was deliberately handed back.
+// covers a lease that stays VISIBLE this beat but doesn't renew. A node can
+// also vanish from the assignee=me lookup ENTIRELY between beats — a `spor
+// release` (or a reassignment) from another terminal retires the durable
+// `assigned` edge — which the beat must journal as dropped too, or
+// SessionEnd's replay (distill.js sessionEndLease) still believes this
+// session holds it and `reserve`s (and the server auto-reclaims) a lease
+// that was deliberately handed back. (An ORDINARY lapse is different and
+// must NOT be treated this way — see the next test.)
 test('a lease that vanishes entirely from the lookup between beats is journaled as dropped, not silently forgotten', async () => {
   const { home, cwd } = scratch();
   let phase = 1;
@@ -309,7 +311,7 @@ test('a lease that vanishes entirely from the lookup between beats is journaled 
     isAssigneeMe(url)
       ? phase === 1
         ? { items: [{ id: 'task-mine', title: 'Mine', lease_state: 'in_progress', lease_by: 'person-t' }] }
-        : { items: [] } // released elsewhere, or lapsed and never reclaimed
+        : { items: [] } // released or reassigned elsewhere — gone from `myItems` entirely
       : { items: [{ id: 'task-alpha', title: 'Alpha' }] }
   );
   try {
@@ -339,6 +341,50 @@ test('a lease that vanishes entirely from the lookup between beats is journaled 
     // it was already recorded once and priorHeld no longer carries it.
     await runAsync(['post-tool', '--host', 'claude-code'], editPayload(cwd, 's1', 'c.js'), env);
     assert.strictEqual(journal(home).filter((e) => e.tool === 'claim-heartbeat').length, 2, 'no repeat drop record once already journaled');
+  } finally {
+    srv.close();
+  }
+});
+
+// dec-spor-lease-auto-reclaim-and-deadline-exposure: an ORDINARY lapse (no
+// renew within the TTL, nobody else reclaimed it) must NOT be journaled as
+// dropped — the decided behavior is that SessionEnd still `reserve`s
+// (auto-reclaims) a claim that merely lapsed. `assigneeScope`
+// (lib/kernel/queue.js) lists a node here off its durable `assigned` edge
+// regardless of live lease state, so a lapsed-but-still-assigned node stays
+// in `myItems` with no `lease_state` — present, just not `held`. Only a
+// genuine disappearance from `myItems` (the previous test) is a real drop;
+// this pins the distinction the other way, guarding against a regression
+// that diffs against `held` instead of the full `myItems` set.
+test('an ordinary lapse (still assigned, no lease_state) is NOT journaled as dropped — the decided lapse-reclaim behavior survives', async () => {
+  const { home, cwd } = scratch();
+  let phase = 1;
+  const { srv, hits, base } = await stubServer((url) =>
+    isAssigneeMe(url)
+      ? phase === 1
+        ? { items: [{ id: 'task-mine', title: 'Mine', lease_state: 'in_progress', lease_by: 'person-t' }] }
+        : { items: [{ id: 'task-mine', title: 'Mine' }] } // still assigned, lease merely lapsed — no lease_state
+      : { items: [{ id: 'task-alpha', title: 'Alpha' }] }
+  );
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    const first = await runAsync(['post-tool', '--host', 'claude-code'], editPayload(cwd, 's1', 'a.js'), env);
+    assert.strictEqual(first.trim(), '');
+    let hb = journal(home).filter((e) => e.tool === 'claim-heartbeat');
+    assert.strictEqual(hb.length, 1);
+    assert.deepStrictEqual(hb[0].renewed, ['task-mine']);
+
+    // beat 2: task-mine is still assigned (still in myItems) but no longer
+    // has a live lease_state -> falls out of `held`, so this beat looks like
+    // "no live claim" and may nudge, but must NOT journal task-mine as
+    // dropped, since it never left `myItems` entirely.
+    phase = 2;
+    await runAsync(['post-tool', '--host', 'claude-code'], editPayload(cwd, 's1', 'b.js'), env);
+    hb = journal(home).filter((e) => e.tool === 'claim-heartbeat');
+    assert.strictEqual(
+      hb.length, 1,
+      `an ordinary lapse must not add a heartbeat record at all; hits: ${JSON.stringify(hits.map((h) => h.method + ' ' + h.url))}`
+    );
   } finally {
     srv.close();
   }

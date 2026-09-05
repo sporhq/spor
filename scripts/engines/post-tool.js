@@ -388,21 +388,34 @@ async function claimNudge({ graph, slug, session, cwd, file, remote }) {
   const held = myItems.filter((i) => i && i.lease_state && i.id);
 
   // issue-spor-sessionend-reserve-retakes-released-lease: a node can drop out
-  // of this lookup ENTIRELY between beats — an ordinary lapse, or a `spor
-  // release` from another terminal — rather than merely failing to renew
-  // while still showing up as in_progress. The `dropped` computation below
-  // only catches the latter (it only ever looks at ids present in THIS
-  // beat's `inProgress`), so a fully-vanished id was silently falling out of
-  // the journal instead of being recorded as dropped — leaving it in
-  // sessionEndLease's replayed held-set, which then `reserve`s (and the
-  // server auto-reclaims) a lease this session no longer has any claim to.
+  // of this project's `assignee=me` view ENTIRELY between beats — a `spor
+  // release` (or a reassignment) from another terminal retires the durable
+  // `assigned` edge, so the item disappears from `myItems` altogether. The
+  // `dropped` computation below only catches a DIFFERENT case (an item still
+  // visible as in_progress this beat, but the blanket renew didn't confirm
+  // it), so a fully-vanished id was silently falling out of the journal
+  // instead of being recorded dropped — leaving it in sessionEndLease's
+  // replayed held-set, which then `reserve`s (and the server auto-reclaims) a
+  // lease this session no longer has any claim to.
+  //
+  // This must be compared against the FULL `myItems` id set, never `held`:
+  // an item merely present with no `lease_state` is an ORDINARY LAPSE, not a
+  // release — `assigneeScope` (lib/kernel/queue.js) lists a node here purely
+  // off its durable `assigned`/`stewards` edge, independent of whether the
+  // ephemeral lease is still live, so a lapsed-but-still-assigned node stays
+  // in `myItems` (just missing `lease_state`) while a genuinely released or
+  // reassigned one disappears from the array entirely. Diffing against
+  // `held` instead would flag an ordinary lapse as dropped too and silently
+  // undo dec-spor-lease-auto-reclaim-and-deadline-exposure's "a long session
+  // whose claim lapsed still reserves at SessionEnd" — exactly the decided
+  // behavior this issue must leave alone.
+  //
   // Read what this session has already recorded holding IN THIS PROJECT so
   // far (each beat's renewed/dropped lists are already project-scoped, so
   // filtering the replay the same way keeps this comparison meaningful) and
-  // diff it against what THIS beat's lookup still shows, in any lease state —
-  // an id that fell out entirely (not just out of `in_progress`) is a real
-  // drop, distinct from the existing "held but the renew wasn't confirmed"
-  // case below.
+  // diff it against every id THIS beat's lookup still names, in any state —
+  // an id that fell out of `myItems` entirely is a real drop, distinct from
+  // the existing "still visible but the renew wasn't confirmed" case below.
   let priorEntries = [];
   try {
     priorEntries = fs
@@ -421,8 +434,8 @@ async function claimNudge({ graph, slug, session, cwd, file, remote }) {
     // no journal yet this session -> nothing prior held
   }
   const priorHeld = u.readHeartbeatHeldIds(priorEntries, slug);
-  const heldIdsNow = new Set(held.map((i) => i.id));
-  const vanished = [...priorHeld].filter((id) => !heldIdsNow.has(id));
+  const mineIdsNow = new Set(myItems.filter((i) => i && i.id).map((i) => i.id));
+  const vanished = [...priorHeld].filter((id) => !mineIdsNow.has(id));
 
   if (held.length > 0) {
     // ONE round-trip for the whole working set, through renewAll's BLANKET
@@ -479,11 +492,13 @@ async function claimNudge({ graph, slug, session, cwd, file, remote }) {
     // Journal the heartbeat so the operability log can correlate write-activity
     // to renewals; best-effort. `dropped` names held work this beat did NOT
     // renew — the lapsed-or-taken outcome the blanket arm accepts in exchange
-    // for never re-claiming — plus any id this project's lookup used to show
-    // but has now stopped reporting at all (`vanished`, computed above), so a
+    // for never re-claiming — plus any id this project's `myItems` used to
+    // include but has now stopped reporting AT ALL (`vanished`, computed
+    // above — a genuine release/reassignment, not an ordinary lapse), so a
     // silent drop always leaves a trace whether it fell out mid-renew or fell
     // out of the lookup entirely. `vanished` ids can never overlap the
-    // in_progress-derived half: by construction they are absent from `held`
+    // in_progress-derived half: `inProgress` is a subset of `held`, itself a
+    // subset of `myItems`, so by construction they are absent from `mineIdsNow`
     // this beat, so `[...new Set(...)]` here is just a defensive merge, not a
     // dedup this path can actually trigger. This record's shape is a protocol
     // distill.js's sessionEndLease replays in order
