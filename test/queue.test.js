@@ -307,6 +307,26 @@ test("rankQueue: stale anchors flip the suggestion to close instead of boosting"
   assert.match(it.why, /100% of anchors superseded or gone — consider closing/);
 });
 
+test("rankQueue: a node's own outbound supersedes edge is excluded from staleness (not counted as rot)", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-keeper", "task", { status: "open", edges: [["relates-to", "task-live"], ["supersedes", "task-dup"]] }),
+    node("task-live", "task", { status: "open" }),
+    node("task-dup", "task", { status: "open" }),
+  ])).load();
+  const it = rankQueue(g, { now: NOW }).items.find((i) => i.id === "task-keeper");
+  assert.equal(it.signals.staleness, 0, "the supersedes target isn't counted as a stale anchor or in the denominator");
+  assert.notEqual(it.suggest, "close");
+});
+
+test("rankQueue: a node with ONLY a supersedes edge has zero staleness (no anchors left to be stale)", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-keeper2", "task", { status: "open", edges: [["supersedes", "task-dup2"]] }),
+    node("task-dup2", "task", { status: "open" }),
+  ])).load();
+  const it = rankQueue(g, { now: NOW }).items.find((i) => i.id === "task-keeper2");
+  assert.equal(it.signals.staleness, 0);
+});
+
 test("rankQueue: human priority bumps the blend and shows in the why", () => {
   const g = tmpGraph(Object.fromEntries([
     node("task-p1", "task", { status: "open", priority: "p1" }),

@@ -431,7 +431,11 @@ signals via its schema's `queueSignals()`:
   `get()` hook, which rides a `held` note along on `get_node` (it shares the
   reference-edge narrowing; it has no `front`, so the floor has no twin there).
 - **staleness** — anchors superseded or gone; high staleness suggests
-  closing, not doing.
+  closing, not doing. A node's own outbound `supersedes` edges are excluded
+  from the fraction (numerator and denominator both) — their target is
+  retired by definition, so counting them as rot would permanently inflate
+  staleness for a consolidator node doing exactly what a `supersedes` edge is
+  for (issue-spor-queue-staleness-supersedes-false-positive).
 - **cold_neighbors** — the count of the node's traversable neighbors whose
   git-derived `updated_at` is newer than its own: a node that went cold while its
   neighborhood kept moving ("context moved around it"). Fed by the
