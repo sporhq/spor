@@ -5350,3 +5350,73 @@ test("a write the door reports as SKIPPED is read back, not adopted — a settle
   assert.deepStrictEqual(live.hits, [`GET ${live.base}`, "POST", `GET ${live.base}`], "linked the live occupant — no second write");
   fs.rmSync(home, { recursive: true, force: true });
 });
+
+// The flake-occurrence edge is a DEBT, and the rescue lane is where it used to
+// be dropped (F9, the residual of F7). A charged off-diff pass files real
+// issues; the fact that names them is what gives each its occurrence. When the
+// pre-rescue fact write fails and the worker dies, the pipeline is resumed from
+// the durable rescue entry — and that entry carried no flake at all, so the
+// escalation fact was written naming none of the issues the pass had created.
+test("a charged off-diff pass hands its flake filings to the rescue entry, and a RESUMED escalation pays the edge the failed fact write owed", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-flake-rescue-"));
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "test", "codex-dispatch.test.js"), 'const assert = require("node:assert");\n');
+  fs.writeFileSync(path.join(dir, "test", "dispatch-runs.test.js"), 'const assert = require("node:assert");\n');
+  const output = [
+    "✖ the launch handshake (40001.2ms)",
+    "      at TestContext.<anonymous> (test/codex-dispatch.test.js:120:5)",
+    "✖ the run record (2.1ms)",
+    "      at TestContext.<anonymous> (test/dispatch-runs.test.js:44:5)",
+  ].join("\n");
+  const factory = factoryOf({
+    ...BASE,
+    gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }],
+    rescue: RESCUE,
+  });
+  // Worker A: both files pass alone, but the SECOND filing is refused — so the
+  // suite failure is charged with file 1's issue already minted — and every
+  // fact write fails, which is exactly the write that owed that issue its edge.
+  const states = [];
+  const a = withRescue(
+    treeFakes({
+      dir,
+      changed: ["lib/kernel/queue.js"],
+      run: (attempt, command) => (command ? { ok: true } : { ok: false, code: 1, output }),
+      writes: "refuse",
+    })
+  );
+  a.deps.fileFlakeItem = async (args) => {
+    a.seen.flakes.push(args);
+    return args.file === "test/dispatch-runs.test.js" ? { ok: false, reason: "the graph refused the write" } : { ok: true, id: "issue-flake-one" };
+  };
+  a.deps.saveRescueState = async ({ rescues }) => states.push(JSON.parse(JSON.stringify(rescues)));
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: a.deps });
+  const entry = states[0][0];
+  assert.strictEqual(entry.fact, null, "the pre-rescue fact write did not land, so the edge is still owed");
+  assert.deepStrictEqual(entry.flake.issues, ["issue-flake-one"], "…and the entry carries the filing that is owed it");
+  assert.deepStrictEqual(entry.flake.files, ["test/codex-dispatch.test.js", "test/dispatch-runs.test.js"]);
+
+  // Worker B resumes that entry with its rescue already settled as unrun, so
+  // the carried refusal escalates without re-judging anything: the ONLY fact
+  // this pipeline ever writes is the escalation's, and it must carry the edge.
+  const b = withRescue(fakes({ changed: ["lib/kernel/queue.js"] }));
+  b.deps.loadRescueState = async () => [{ ...JSON.parse(JSON.stringify(entry)), done: true, error: "not satisfiable" }];
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b.deps });
+  assert.strictEqual(res.state, "failed", "a partial filing is still a charged failure and a person");
+  assert.deepStrictEqual(b.seen.suites, [], "nothing is re-judged: the refusal it was handed is what escalates");
+  const escalation = b.seen.facts.find((f) => /^art-gate-/.test(f.id)).markdown;
+  assert.match(escalation, /- \{type: relates-to, to: issue-flake-one\}/, "the resumed escalation pays the edge the failed fact write owed");
+  assert.match(escalation, /Off-diff flake: test\/codex-dispatch\.test\.js, test\/dispatch-runs\.test\.js failed the whole-suite run and passed alone on the same tree, filed as issue-flake-one/);
+
+  // …and it pays it ONCE. Same entry, but this time the pre-rescue fact DID
+  // land with those edges on it: an occurrence is one edge, so the escalation
+  // names the issue in prose and does not link it a second time. The flag is
+  // reconciled against the state that already discharged it.
+  const c = withRescue(fakes({ changed: ["lib/kernel/queue.js"] }));
+  c.deps.loadRescueState = async () => [{ ...JSON.parse(JSON.stringify(entry)), fact: "art-gate-acceptance-demo-abcdef12-cafe", done: true, error: "not satisfiable" }];
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: c.deps })).state, "failed");
+  const paid = c.seen.facts.find((f) => /^art-gate-/.test(f.id)).markdown;
+  assert.doesNotMatch(paid, /relates-to, to: issue-flake-one/, "one occurrence, one edge — the fact that recorded this refusal already linked it");
+  assert.match(paid, /That occurrence is already recorded on art-gate-acceptance-demo-abcdef12-cafe, so this fact names the issue\(s\) without linking them a second time\./);
+  fs.rmSync(dir, { recursive: true, force: true });
+});

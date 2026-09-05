@@ -992,7 +992,16 @@ outside git (a database on a fixed port, a `db reset`):
     was charged anyway. The filings that DID land before one failed still ride
     that charged fact as `relates-to` edges: each is this run's occurrence of
     that file's flake, and an issue no fact links to has no provenance and no
-    occurrence to its name.
+    occurrence to its name. That edge is a DEBT, and it survives the rescue
+    lane: the durable rescue entry carries the flake payload beside the id of
+    the fact that recorded the refusal, in ONE stamp, so a pipeline resumed
+    after a failed fact write pays the edge from its escalation fact instead
+    of leaving those issues orphaned — and pays it exactly once, since an
+    entry whose own fact DID land names the issues in prose without linking
+    them a second time (one occurrence, one edge). An entry that was never
+    saved is not a lost debt either: the resume then re-runs the original
+    pass, whose filings are convergent per file and whose fact id is the same
+    node, so the occurrence is recorded rather than doubled.
 
   The flake issue is the one node a gate files whose id and body are keyed on
   the failing FILES rather than on the run — a flake is a property of the

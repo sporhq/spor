@@ -849,8 +849,10 @@ whole-suite failure rides the fact as evidence) — nor is it unconditional: it
 happens only if the flake ISSUE lands, since the gate fact write is best-effort
 too and a red suite passing with neither write is a green light nobody can audit
 (and a CHARGED pass still links the per-file issues that did land on its fact —
-`flake` rides the failed outcome through every `record` site — so an issue
-created before a later filing failed is never left with no fact naming it).
+`flake` rides the failed outcome through every `record` site, and across the
+rescue lane on the durable entry itself, keyed against the id of the fact that
+already recorded that refusal — so an issue created before a later filing
+failed is never left with no fact naming it, and never left with two).
 The issue's convergent id is reconciled against SETTLED state rather than adopted
 on its name: a live occupant is linked, a resolved/closed one advances to a
 recurrence rung (`-r2`, `-r3`) that links back to it, and a file past every rung
