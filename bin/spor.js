@@ -12962,6 +12962,122 @@ function makeGateDeps(
   };
 }
 
+// task-spor-gate-escalation-bounded-auto-retry, dec-spor-gate-refusal-atomic-
+// escalate-then-demote. Retry ONLY the escalate+demote pair for one settled-
+// but-unescalated refusal, using the exact args the original attempt captured
+// on the run record (gate-runner.js's `escalation_retry`) — never re-runs the
+// pipeline that produced the refusal, which already settled and freed its
+// slot. Safe to retry blindly because both writes are idempotent:
+// writeGateNode skips an existing id whose content already matches, and
+// gateDemoteItem reads the item's current status before it writes — so a
+// retry can only ever finish what the first attempt started, never double-
+// file the escalation or double-demote the item.
+async function retryOneEscalation(
+  cfg,
+  pending,
+  {
+    factory,
+    slug = null,
+    log,
+    warn = log,
+    home = cfg.userConfigHome(),
+    maxAttempts = workLoop.WORK_DEFAULTS.escalationRetryMaxAttempts,
+    backoffMs = workLoop.WORK_DEFAULTS.escalationRetryBackoffMs,
+    maxBackoffMs = workLoop.WORK_DEFAULTS.escalationRetryMaxBackoffMs,
+  } = {}
+) {
+  const { record, attempts } = pending;
+  const payload = record.gate_escalation_pending;
+  const nextAttempt = attempts + 1;
+  const giveUp = (reason) => {
+    warn(
+      `work: gate escalation retry for ${record.node_id} (run ${String(record.run_id).slice(0, 8)}) gave up after ${nextAttempt} attempt(s) — ` +
+        `${reason}; re-run by hand with 'spor work --regate ${record.run_id}'`
+    );
+    dispatchRuns.stampGateState(home, record.run_id, { gate_escalation_retry_count: nextAttempt, gate_escalation_retry_exhausted: true }, { allowSettledPatch: true });
+  };
+  // The gate this refusal named, looked up fresh in the CURRENT factory
+  // (never persisted whole in the payload — see gate-runner.js): a factory
+  // edited since the refusal (the gate renamed or removed) can't be replayed,
+  // and that is a give-up, not a wait — no later poll makes a missing gate
+  // reappear on its own.
+  const gate = payload && factory && Array.isArray(factory.gates) ? factory.gates.find((g) => g.id === payload.gateId) : null;
+  if (!payload || !gate) {
+    giveUp(!payload ? "no retry payload was recorded for this refusal" : `gate '${payload.gateId}' is no longer declared by factory '${(factory && factory.id) || "?"}'`);
+    return;
+  }
+  // `attempt` travels with the payload, not recomputed: it keys the
+  // escalation's deterministic id (gateRunKey/shortRunAttempt), and getting it
+  // wrong here would mint a SECOND escalation instead of finishing the first.
+  // `project` mirrors --regate's own fallback chain (record.item_repo -> the
+  // worker's own scope token -> the node's current stamp): filing the
+  // escalation under no project at all would hide it from exactly the
+  // project-scoped queue a person would look in (bin/spor.js's own stated
+  // principle for why this is filed under the ITEM's repo in the first place).
+  let project = record.item_repo || slug || null;
+  if (!record.item_repo) {
+    try {
+      const node = await resolveNode(cfg, record.node_id);
+      if (node && (node.repo || node.project)) project = node.repo || node.project;
+    } catch {
+      /* the worker's scope token stands in */
+    }
+  }
+  const entry = { node_id: record.node_id, run_id: record.run_id, attempt: payload.attempt, project };
+  const deps = makeGateDeps(cfg, { entry, factory, slug: project, log });
+  let esc;
+  try {
+    esc = await deps.escalate({
+      gate,
+      attempts: payload.attempts || [],
+      detail: payload.detail || "",
+      evidence: payload.evidence || "",
+      findings: payload.findings || [],
+      ledger: payload.ledger || [],
+      ...(payload.rescue ? { rescue: payload.rescue, rescues: payload.rescues || [] } : {}),
+    });
+  } catch (e) {
+    esc = { ok: false, reason: (e && e.message) || String(e) };
+  }
+  if (!esc || !esc.ok) {
+    const reason = (esc && esc.reason) || "no response";
+    if (nextAttempt >= maxAttempts) {
+      giveUp(`the escalation still could not be filed after ${nextAttempt} attempts (${reason})`);
+      return;
+    }
+    const delay = workLoop.nextEscalationRetryDelay(nextAttempt, backoffMs, maxBackoffMs);
+    dispatchRuns.stampGateState(
+      home,
+      record.run_id,
+      { gate_escalation_retry_count: nextAttempt, gate_escalation_retry_at: new Date(Date.now() + delay).toISOString() },
+      { allowSettledPatch: true }
+    );
+    log(`work: gate escalation retry ${nextAttempt}/${maxAttempts} for ${record.node_id} could not be filed (${reason}) — trying again in ${Math.round(delay / 1000)}s`);
+    return;
+  }
+  // ATOMIC with the original attempt, in the same order: only a landed
+  // escalation demotes the item (dec-spor-gate-refusal-atomic-escalate-then-
+  // demote) — a retry earns no exception to that rule.
+  const demoted = await deps.demote({ blockerId: esc.id });
+  dispatchRuns.stampGateState(
+    home,
+    record.run_id,
+    {
+      gate_escalated_to: esc.id,
+      gate_escalation_ids: [esc.id],
+      gate_demoted: !!demoted.demoted,
+      gate_escalation_failed: false,
+      gate_escalation_pending: null,
+      gate_escalation_retry_count: nextAttempt,
+    },
+    { allowSettledPatch: true }
+  );
+  log(
+    `work: gate escalation for ${record.node_id} landed on retry ${nextAttempt} (${esc.id})` +
+      (demoted.note ? `; ${demoted.note}` : demoted.reason ? ` — the item could not be demoted (${demoted.reason})` : "")
+  );
+}
+
 // --- the integration stage's serialize:repo lease (dec-spor-factory-
 // integration-step) ------------------------------------------------------
 // The declared lease scope is one repo: N workers on M machines should not all
@@ -13915,6 +14031,14 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     // this refusal reached the graph" is answered afresh by every attempt, and
     // a re-gate that escalated (or passed) must not leave the old claim standing.
     gate_escalation_failed: !!(res && res.escalation_failed),
+    // The bounded auto-retry's own bookkeeping (task-spor-gate-escalation-
+    // bounded-auto-retry) is reset to a clean slate for THIS attempt, not
+    // carried from whichever earlier attempt last touched it — a stale
+    // `_retry_exhausted`/`_retry_at` from a superseded attempt must never gate
+    // (or skip) retrying the CURRENT one's own failed escalation.
+    ...(res && res.escalation_retry
+      ? { gate_escalation_pending: res.escalation_retry, gate_escalation_retry_count: 0, gate_escalation_retry_at: null, gate_escalation_retry_exhausted: false }
+      : { gate_escalation_pending: null, gate_escalation_retry_count: 0, gate_escalation_retry_at: null, gate_escalation_retry_exhausted: false }),
     // A demotion from an earlier attempt still stands until a pass restores it.
     ...(res && res.demoted ? { gate_demoted: true } : {}),
     // A park whose tracker filed but whose demotion failed owes the rollback
@@ -14211,6 +14335,15 @@ async function cmdWork(cfg, { values }) {
   const runMaxMs = num("run-max", values["run-max"], { min: 0, max: 720, fallback: cfg.getNum("work.runMaxMs", workLoop.WORK_DEFAULTS.runMaxMs) / 3600000 }) * 3600000;
   const runIdleMs = num("run-idle", values["run-idle"], { min: 0, max: 43200, fallback: cfg.getNum("work.runIdleMs", workLoop.WORK_DEFAULTS.runIdleMs) / 60000 }) * 60000;
   const max = num("max", values.max, { min: 0, max: 1000000, fallback: 0 });
+  // task-spor-gate-escalation-bounded-auto-retry: config-only, like the
+  // classifier knobs (nudge.maxCalls, distill.timeoutMs) — no CLI flags, since
+  // an unattended worker only ever needs to tune these once per box, not per
+  // invocation. Malformed config falls back to the default (cfg.getNum's own
+  // contract), never to an unbounded value: the backoff itself clamps to
+  // [backoffMs, maxBackoffMs] regardless of what lands here.
+  const escalationRetryMaxAttempts = Math.max(0, cfg.getNum("work.escalationRetryMaxAttempts", workLoop.WORK_DEFAULTS.escalationRetryMaxAttempts));
+  const escalationRetryBackoffMs = Math.max(0, cfg.getNum("work.escalationRetryBackoffMs", workLoop.WORK_DEFAULTS.escalationRetryBackoffMs));
+  const escalationRetryMaxBackoffMs = Math.max(escalationRetryBackoffMs, cfg.getNum("work.escalationRetryMaxBackoffMs", workLoop.WORK_DEFAULTS.escalationRetryMaxBackoffMs));
   // `--restart-on-land` (work.restartOnLand): exit cleanly, once the in-flight
   // work settles, when the checkout this worker loaded its code from moves past
   // that code — for a self-hosting factory whose worker sits on the checkout
@@ -14695,6 +14828,37 @@ async function cmdWork(cfg, { values }) {
                 // silently cancel the loop's own backoff.
                 sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
               }),
+            // task-spor-gate-escalation-bounded-auto-retry: the unattended
+            // recovery for a refusal whose escalation write failed. Throttled
+            // independently of the poll interval (escalationRetryScanMs) — the
+            // run journal can hold thousands of records, and most passes have
+            // nothing due; this bounds "read the whole journal" to at most
+            // once a minute regardless of how tight --interval is set. Each
+            // pending retry is bounded on its own backoff (pendingEscalationRetries),
+            // so the throttle only guards the directory read, never a retry's
+            // own timing.
+            retryEscalations: (() => {
+              let nextScan = 0;
+              return async () => {
+                const at = Date.now();
+                if (at < nextScan) return;
+                nextScan = at + workLoop.WORK_DEFAULTS.escalationRetryScanMs;
+                const pending = workLoop.pendingEscalationRetries(dispatchRuns.readRunRecords(home), { now: Date.now });
+                for (const p of pending) {
+                  if (control.stopping) break;
+                  await retryOneEscalation(cfg, p, {
+                    factory,
+                    slug,
+                    log: (line) => out(line),
+                    warn,
+                    home,
+                    maxAttempts: escalationRetryMaxAttempts,
+                    backoffMs: escalationRetryBackoffMs,
+                    maxBackoffMs: escalationRetryMaxBackoffMs,
+                  });
+                }
+              };
+            })(),
             // task-spor-integration-propose-mode: only present under propose
             // mode, so every OTHER factory's loop is byte-identical to before
             // this existed. Runs once per pass, outside the slot/concurrency
@@ -17324,7 +17488,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget };
+module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget };
 
 if (require.main === module) {
   main()

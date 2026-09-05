@@ -904,6 +904,57 @@ test("an escalation that could not be filed STOPS the demotion — no blocker on
   assert.doesNotMatch(seen.facts[0].markdown, /rolled back/);
 });
 
+// task-spor-gate-escalation-bounded-auto-retry: a failed escalate call leaves
+// behind everything a later retry needs to replay the IDENTICAL call — never
+// the full `gate`/`item`/`factory` objects, just the gate's id and the args
+// `deps.escalate` was actually handed.
+test("a failed escalation leaves a replayable retry payload — gate id, attempt, and the exact escalate args", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", cycles: 0 }] });
+  const { deps } = fakes({ suite: () => ({ ok: false, code: 1 }) });
+  deps.escalate = async () => ({ ok: false, reason: "offline" });
+  const res = await gateRunner.runGatePipeline({ item: { ...ITEM, attempt: 3 }, factory, deps });
+  assert.strictEqual(res.escalation_failed, true);
+  assert.ok(res.escalation_retry, "a retry payload is attached");
+  assert.strictEqual(res.escalation_retry.gateId, "acceptance");
+  assert.strictEqual(res.escalation_retry.attempt, 3, "the exact attempt this call used, not recomputed later");
+  assert.ok(Array.isArray(res.escalation_retry.attempts));
+  assert.match(res.escalation_retry.detail, /npm test/i, "the outcome detail rides along, whatever it says");
+  assert.deepStrictEqual(res.escalation_retry.findings, []);
+  assert.deepStrictEqual(res.escalation_retry.ledger, []);
+  // No `gate`, `item`, or `factory` object — those are reconstructed by the
+  // retry caller from the worker it runs in, never re-serialized here.
+  assert.strictEqual(res.escalation_retry.gate, undefined);
+  assert.strictEqual(res.escalation_retry.item, undefined);
+  assert.strictEqual(res.escalation_retry.factory, undefined);
+});
+
+test("a human gate genuinely blocked on its own already-filed approval leaves NO retry payload — there is no failed escalate call to replay", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "human", risk: ["touches:auth"], approval_timeout_ms: 1 }] });
+  const { deps } = fakes({ changed: ["lib/auth.js"] });
+  deps.checkApproval = async () => ({ state: "pending" });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "blocked");
+  assert.strictEqual(res.escalated_to, "task-approve-x", "the approval item itself is what this waits on");
+  assert.strictEqual(res.escalation_failed, undefined, "already escalated — nothing here failed");
+  assert.strictEqual(res.escalation_retry, undefined);
+});
+
+// A human gate whose approval item itself could not be FILED falls through to
+// the ordinary escalation path (verdict "failed", not "blocked" — there is no
+// approval item yet to wait on), so a failure there gets the same replayable
+// payload any other failed escalate call does.
+test("a human gate whose approval item could not be filed at all still gets a retry payload, off the fallback escalation", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "human", risk: ["touches:auth"] }] });
+  const { deps } = fakes({ changed: ["lib/auth.js"] });
+  deps.fileHumanItem = async () => ({ ok: false, reason: "offline" });
+  deps.escalate = async () => ({ ok: false, reason: "offline" });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed", "not filing an approval item is a failure, not yet a block");
+  assert.strictEqual(res.escalation_failed, true);
+  assert.ok(res.escalation_retry, "the fallback escalation is retryable the same as any other");
+  assert.strictEqual(res.escalation_retry.gateId, "review");
+});
+
 test("the same refusal WITH an escalation is unchanged — it escalates, then demotes, naming the blocker", async () => {
   const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", cycles: 0 }] });
   const { deps, seen } = fakes({
@@ -1419,6 +1470,49 @@ test("orphanedGateRuns joins the dead workers' slots to the run journal, and no 
   );
 });
 
+// task-spor-gate-escalation-bounded-auto-retry: the lightweight door
+// orphanedGateRuns deliberately does not open — a SETTLED run whose escalation
+// failed to file. pendingEscalationRetries picks these out on their own
+// backoff, for a caller to retry ONLY the escalate+demote pair.
+test("pendingEscalationRetries: picks out settled-but-unescalated runs due for another attempt, and only those", () => {
+  const pending = { gateId: "acceptance", attempt: undefined, attempts: [], detail: "the suite failed", evidence: "", findings: [], ledger: [] };
+  const base = { run_id: "run-orphan", node_id: "task-orphan", gate_state: "failed", gate_escalation_failed: true, gate_escalation_pending: pending };
+
+  assert.deepStrictEqual(
+    workLoop.pendingEscalationRetries([base]).map((p) => [p.run_id, p.node_id, p.attempts]),
+    [["run-orphan", "task-orphan", 0]]
+  );
+
+  // Already escalated: nothing left to retry, however the flag reads.
+  assert.deepStrictEqual(workLoop.pendingEscalationRetries([{ ...base, gate_escalated_to: "task-gate-acceptance" }]), []);
+  // This box already gave up loudly.
+  assert.deepStrictEqual(workLoop.pendingEscalationRetries([{ ...base, gate_escalation_retry_exhausted: true }]), []);
+  // No payload — a blocked human gate's own already-filed approval, nothing to replay.
+  assert.deepStrictEqual(workLoop.pendingEscalationRetries([{ ...base, gate_escalation_pending: null }]), []);
+  // A gate that never failed its escalation at all.
+  assert.deepStrictEqual(workLoop.pendingEscalationRetries([{ ...base, gate_escalation_failed: false }]), []);
+  // A run whose gate never even ran (bare loop, or still in flight) carries no
+  // escalation flag either — same as the case above, named separately for clarity.
+  assert.deepStrictEqual(workLoop.pendingEscalationRetries([{ run_id: "run-x", node_id: "task-x", gate_state: "running" }]), []);
+
+  // Backoff: not due yet is skipped; due (or no stamp at all, meaning "due now") is picked up.
+  const now = () => Date.parse("2026-09-05T12:00:00.000Z");
+  assert.deepStrictEqual(workLoop.pendingEscalationRetries([{ ...base, gate_escalation_retry_at: "2026-09-05T12:00:01.000Z" }], { now }), []);
+  assert.strictEqual(workLoop.pendingEscalationRetries([{ ...base, gate_escalation_retry_at: "2026-09-05T11:59:59.000Z" }], { now }).length, 1);
+  assert.strictEqual(workLoop.pendingEscalationRetries([base], { now }).length, 1, "no due-at stamp at all means due now");
+
+  // The attempt count already made rides along, read off the record.
+  assert.strictEqual(workLoop.pendingEscalationRetries([{ ...base, gate_escalation_retry_count: 3 }])[0].attempts, 3);
+});
+
+test("nextEscalationRetryDelay: doubles from the base, capped, and never below the base", () => {
+  assert.strictEqual(workLoop.nextEscalationRetryDelay(0, 1000, 60000), 1000);
+  assert.strictEqual(workLoop.nextEscalationRetryDelay(1, 1000, 60000), 2000);
+  assert.strictEqual(workLoop.nextEscalationRetryDelay(2, 1000, 60000), 4000);
+  assert.strictEqual(workLoop.nextEscalationRetryDelay(10, 1000, 60000), 60000, "capped, not left to overflow");
+  assert.strictEqual(workLoop.nextEscalationRetryDelay(-5, 1000, 60000), 1000, "a nonsense negative attempt count reads as the first attempt");
+});
+
 // `active` is populated by EVERY worker, bare ones included — and a bare worker
 // (no factory, the shipped default) was never owed a gate at all. Adopting its
 // runs would let a gate-armed worker retroactively judge work nobody meant to
@@ -1640,6 +1734,60 @@ test("a refusal whose escalation never landed is MARKED on the run record, and s
     [],
     "a settled verdict is never re-adopted, however the escalation went"
   );
+});
+
+// task-spor-gate-escalation-bounded-auto-retry: the loop's OWN half of the
+// feature — folding `escalation_retry` off the pipeline's result onto the run
+// record, so the bounded auto-retry (a separate step; see retryOneEscalation
+// in bin/spor.js and its own tests) has something to read.
+test("a failed escalation's retry payload is stamped onto the run record beside gate_escalation_failed", async () => {
+  const marks = [];
+  const h = loopHarness({
+    queue: [],
+    gate: () => ({
+      state: "failed",
+      reason: "gate 'acceptance' failed: the suite failed (the escalation could not be filed, so the item's status was left alone)",
+      escalation_failed: true,
+      escalation_retry: { gateId: "acceptance", attempt: undefined, attempts: [], detail: "the suite failed", evidence: "", findings: [], ledger: [] },
+      demoted: false,
+    }),
+    maxPasses: 6,
+  });
+  h.deps.markGate = (runId, patch) => marks.push({ run_id: runId, ...patch });
+  h.deps.pendingGates = async () =>
+    marks.some((m) => m.gate_state === "running") ? [] : [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake", record: ORPHAN_RECORD }];
+
+  await workLoop.runWorkLoop({ opts: { workerId: "w10", concurrency: 1, intervalMs: 1000 }, deps: h.deps, control: h.control });
+  const settled = marks.find((m) => m.gate_state === "failed");
+  assert.deepStrictEqual(settled.gate_escalation_pending, { gateId: "acceptance", attempt: undefined, attempts: [], detail: "the suite failed", evidence: "", findings: [], ledger: [] });
+  assert.strictEqual(settled.gate_escalation_retry_count, 0, "a fresh count for a fresh payload, never carried from an earlier refusal");
+});
+
+// The retry scan itself (deps.retryEscalations) is called once per pass, like
+// checkProposals/noticeCode — and its absence changes nothing, like theirs.
+test("deps.retryEscalations runs at least once per pass when present, never called when absent, and a throw does not stop the loop", async () => {
+  const { deps, control } = loopHarness({ queue: [{ id: "task-a" }] });
+  let calls = 0;
+  deps.retryEscalations = async () => {
+    calls += 1;
+  };
+  await workLoop.runWorkLoop({ opts: { workerId: "w", once: true, intervalMs: 1000 }, deps, control });
+  assert.ok(calls >= 1, "retryEscalations runs at least once per pass when the deps hook is present");
+
+  // Absent: a bare worker (or a factory whose loop never wired it) is
+  // byte-identical — no property access, no throw, nothing to await.
+  const bare = loopHarness({ queue: [{ id: "task-a" }] });
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", once: true, intervalMs: 1000 }, deps: bare.deps, control: bare.control });
+  assert.strictEqual(status.dispatched, 1, "no retryEscalations dep -> the loop runs exactly as before this hook existed");
+
+  // A throw is fire-and-forget, like checkProposals/noticeCode: the next pass
+  // tries again, and ordinary dispatch on THIS pass is unaffected.
+  const throwing = loopHarness({ queue: [{ id: "task-b" }] });
+  throwing.deps.retryEscalations = async () => {
+    throw new Error("offline");
+  };
+  const throwStatus = await workLoop.runWorkLoop({ opts: { workerId: "w", once: true, intervalMs: 1000 }, deps: throwing.deps, control: throwing.control });
+  assert.strictEqual(throwStatus.dispatched, 1);
 });
 
 test("resumption is bounded by the free slots, comes AHEAD of new work, and stops when the worker winds down", async () => {
@@ -3348,6 +3496,169 @@ test("stampGateState refuses to overwrite a settled verdict unless the caller is
   assert.strictEqual(after.gate_reason, "red", "force only writes what it was given");
 });
 
+// task-spor-gate-escalation-bounded-auto-retry: a narrower second door than
+// `force` — it lets a patch through on a settled record only when the patch
+// never touches `gate_state` itself, which is exactly what the bounded
+// escalation-retry writer needs (updating gate_escalated_to/gate_demoted/
+// gate_escalation_failed/the retry bookkeeping on a run that settled long
+// ago) without being able to reopen the verdict beside those fields.
+test("stampGateState's allowSettledPatch lets non-gate_state fields through on a settled record, but never gate_state itself", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-stamp-settled-"));
+  const dir = path.join(home, "journal", "dispatch");
+  fs.mkdirSync(dir, { recursive: true });
+  const id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const file = path.join(dir, `${id}.run.json`);
+  fs.writeFileSync(file, JSON.stringify({ run_id: id, state: "done", gate_state: "failed", gate_escalation_failed: true }));
+  const runs = require("../lib/shell/agent-dispatch-runner.js");
+
+  // Without the flag: the ordinary refusal, exactly as above.
+  runs.stampGateState(home, id, { gate_escalated_to: "task-gate-x" });
+  assert.strictEqual(JSON.parse(fs.readFileSync(file, "utf8")).gate_escalated_to, undefined, "no door, no write");
+
+  // With the flag, a patch that never names gate_state lands.
+  runs.stampGateState(home, id, { gate_escalated_to: "task-gate-x", gate_escalation_failed: false, gate_escalation_pending: null }, { allowSettledPatch: true });
+  const landed = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.strictEqual(landed.gate_state, "failed", "the verdict itself never moved");
+  assert.strictEqual(landed.gate_escalated_to, "task-gate-x");
+  assert.strictEqual(landed.gate_escalation_failed, false);
+  assert.strictEqual(landed.gate_escalation_pending, null);
+
+  // With the flag, a patch that DOES name gate_state is still refused — the
+  // flag only ever widens what moves BESIDE the verdict, never the verdict.
+  runs.stampGateState(home, id, { gate_state: "passed" }, { allowSettledPatch: true });
+  assert.strictEqual(JSON.parse(fs.readFileSync(file, "utf8")).gate_state, "failed", "allowSettledPatch is not force");
+});
+
+// ----------------------------------------- retryOneEscalation, end to end --
+// task-spor-gate-escalation-bounded-auto-retry: the writer that reconstructs
+// `deps.escalate`+`deps.demote` from a run record's `gate_escalation_pending`
+// and replays them, without re-running anything the original pipeline did.
+
+function scratchGraphForRetry() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-escalation-retry-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  fs.writeFileSync(path.join(home, "nodes", "task-demo.md"), "---\nid: task-demo\ntype: task\ntitle: Demo\nsummary: A demo task.\nstatus: done\n---\nBody.\n");
+  return { home, cfg, dispatchRuns };
+}
+
+function pendingRecord(dispatchRuns, home, runId, patch = {}) {
+  const pending = { gateId: "acceptance", attempt: undefined, attempts: [{ verdict: "failed", detail: "the suite failed" }], detail: "the suite failed", evidence: "", findings: [], ledger: [] };
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, {
+    run_id: runId, node_id: "task-demo", state: "done", terminal_state: "resolved", terminal_enforced: true, item_repo: null,
+    gate_state: "failed", gate_escalation_failed: true, gate_escalation_pending: pending, gate_escalation_retry_count: 0,
+    ...patch,
+  });
+  return dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+}
+
+const RETRY_FACTORY = { id: "factory-test", gates: [{ id: "acceptance", kind: "command", command: "npm test" }] };
+
+test("retryOneEscalation lands the write on retry, demotes the item, and clears the failed marker", async () => {
+  const { home, cfg, dispatchRuns } = scratchGraphForRetry();
+  const runId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const record = pendingRecord(dispatchRuns, home, runId);
+
+  await sporCli.retryOneEscalation(cfg, { record, attempts: 0 }, { factory: RETRY_FACTORY, log: () => {}, home });
+
+  const after = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  assert.strictEqual(after.gate_state, "failed", "the verdict itself never moves");
+  assert.strictEqual(after.gate_escalation_failed, false);
+  assert.strictEqual(after.gate_escalation_pending, null);
+  assert.strictEqual(after.gate_escalation_retry_count, 1);
+  assert.ok(after.gate_escalated_to, "an escalation now exists");
+  assert.deepStrictEqual(after.gate_escalation_ids, [after.gate_escalated_to]);
+
+  assert.match(fs.readFileSync(path.join(home, "nodes", `${after.gate_escalated_to}.md`), "utf8"), /blocks/);
+  assert.match(fs.readFileSync(path.join(home, "nodes", "task-demo.md"), "utf8"), /status: open/);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+// Review finding: a record predating item_repo (or one that never carried it)
+// must not file the escalation under NO project at all — that hides it from
+// exactly the project-scoped queue a person would look in. Mirrors --regate's
+// own fallback chain (item_repo -> the worker's scope token -> the node's own
+// current stamp).
+test("retryOneEscalation falls back to the worker's project scope when the run record carries no item_repo", async () => {
+  const { home, cfg, dispatchRuns } = scratchGraphForRetry();
+  const runId = "eeeeeeee-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const record = pendingRecord(dispatchRuns, home, runId, { item_repo: undefined });
+  assert.strictEqual(record.item_repo, undefined, "the fixture really carries none");
+
+  await sporCli.retryOneEscalation(cfg, { record, attempts: 0 }, { factory: RETRY_FACTORY, slug: "demo-project", log: () => {}, home });
+  const after = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  assert.ok(after.gate_escalated_to);
+  assert.match(
+    fs.readFileSync(path.join(home, "nodes", `${after.gate_escalated_to}.md`), "utf8"),
+    /project: demo-project/,
+    "the worker's own scope token stands in, never null"
+  );
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("retryOneEscalation: a still-failing write backs off, counts the attempt, and never demotes", async () => {
+  const { home, cfg, dispatchRuns } = scratchGraphForRetry();
+  const runId = "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const record = pendingRecord(dispatchRuns, home, runId);
+
+  // Force the SAME write to fail every time: pre-create the deterministic
+  // escalation id with different content, so writeGateNode's collision guard
+  // refuses it — the realistic shape of "the write still does not land."
+  const deps = sporCli.makeGateDeps(cfg, { entry: { node_id: "task-demo", run_id: runId, attempt: undefined }, factory: RETRY_FACTORY, slug: null, log: () => {} });
+  const first = await deps.escalate({ gate: RETRY_FACTORY.gates[0], attempts: [], detail: "d1", evidence: "", findings: [], ledger: [] });
+  assert.ok(first.ok);
+  fs.writeFileSync(path.join(home, "nodes", `${first.id}.md`), "---\nid: " + first.id + "\ntype: artifact\ntitle: Different\nsummary: A totally different fact landed under this id somehow.\ndate: 2026-09-05\n---\nBody.\n");
+
+  await sporCli.retryOneEscalation(cfg, { record, attempts: 0 }, { factory: RETRY_FACTORY, log: () => {}, home, maxAttempts: 5, backoffMs: 1000, maxBackoffMs: 60000 });
+
+  const after = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  assert.strictEqual(after.gate_escalation_failed, true, "still unescalated");
+  assert.strictEqual(after.gate_escalated_to, undefined);
+  assert.strictEqual(after.gate_escalation_retry_count, 1);
+  assert.ok(after.gate_escalation_retry_at, "a backoff is scheduled");
+  assert.ok(Date.parse(after.gate_escalation_retry_at) > Date.now(), "due in the future, not now");
+  assert.strictEqual(after.gate_escalation_retry_exhausted, undefined, "budget not spent yet");
+  assert.match(fs.readFileSync(path.join(home, "nodes", "task-demo.md"), "utf8"), /status: done/, "no demotion without a landed escalation");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("retryOneEscalation gives up loudly after maxAttempts, and stops trying", async () => {
+  const { home, cfg, dispatchRuns } = scratchGraphForRetry();
+  const runId = "cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const record = pendingRecord(dispatchRuns, home, runId, { gate_escalation_retry_count: 4 }); // this is attempt 5 of 5
+
+  const deps = sporCli.makeGateDeps(cfg, { entry: { node_id: "task-demo", run_id: runId, attempt: undefined }, factory: RETRY_FACTORY, slug: null, log: () => {} });
+  const first = await deps.escalate({ gate: RETRY_FACTORY.gates[0], attempts: [], detail: "d1", evidence: "", findings: [], ledger: [] });
+  fs.writeFileSync(path.join(home, "nodes", `${first.id}.md`), "---\nid: " + first.id + "\ntype: artifact\ntitle: Different\nsummary: A totally different fact landed under this id somehow.\ndate: 2026-09-05\n---\nBody.\n");
+
+  const logs = [];
+  await sporCli.retryOneEscalation(cfg, { record, attempts: 4 }, { factory: RETRY_FACTORY, log: (l) => logs.push(l), warn: (l) => logs.push(l), home, maxAttempts: 5 });
+
+  const after = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  assert.strictEqual(after.gate_escalation_retry_count, 5);
+  assert.strictEqual(after.gate_escalation_retry_exhausted, true);
+  assert.ok(logs.some((l) => /gave up after 5 attempt/.test(l) && /spor work --regate/.test(l)));
+
+  // pendingEscalationRetries now excludes it — no further passes retry a
+  // budget that is already spent.
+  assert.deepStrictEqual(workLoop.pendingEscalationRetries([after]), []);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("retryOneEscalation gives up immediately when the factory no longer declares the gate — nothing to replay", async () => {
+  const { home, cfg, dispatchRuns } = scratchGraphForRetry();
+  const runId = "dddddddd-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const record = pendingRecord(dispatchRuns, home, runId);
+  const logs = [];
+  await sporCli.retryOneEscalation(cfg, { record, attempts: 0 }, { factory: { id: "factory-test", gates: [] }, log: (l) => logs.push(l), warn: (l) => logs.push(l), home });
+  const after = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  assert.strictEqual(after.gate_escalation_retry_exhausted, true);
+  assert.strictEqual(after.gate_escalation_retry_count, 1);
+  assert.ok(logs.some((l) => /is no longer declared/.test(l)));
+  fs.rmSync(home, { recursive: true, force: true });
+});
 
 // --------------------------------- DB-backed gates: arming + serialize lease --
 // A repo whose acceptance suite owns a singleton per box (a local database

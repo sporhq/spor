@@ -996,7 +996,11 @@ written only after the outcome dimension exists):
 | `gate_fix_run_id` | string | optional — the run id of the most recent fix cycle this pipeline dispatched at the same node, stamped the moment it was dispatched (not when it finishes). If a stop lands while that fix cycle is still going, this field is what turns "the pipeline was abandoned" into "here is the run to go check" — a fix cycle's own dispatched run is detached and keeps going regardless (§10.7), and this is the only durable pointer to it. `spor runs`/`spor work --status` surface it. |
 | `gate_fix_at` | ISO 8601 | when `gate_fix_run_id` was stamped |
 | `gate_progress` | object | optional — `{key, at, seq, gates: {<gate id>: {fixes, attempts, ledger, lastFix}}}`: each gate's own memory (§10.4), saved after every review verdict (with the fix it decided on as `lastFix.dispatched: false`) and again when the fix's launch is known (`fixes` counts LAUNCHED fixes only). `key` is the attempt's run key — a resumed pipeline of the same attempt reads it back; a `--regate` (a new attempt) ignores it. Best-effort like every `gate_*` stamp: a write that fails is logged and the pipeline goes on |
-| `gate_escalation_failed` | boolean | optional — set when the refusal (a gate's, or the integration stage's, §10.9) could not file the escalation that carries it, so nothing was written to the graph and (§10.7) nothing was demoted either. The verdict is still settled; this is what says the refusal is readable only on this box, and that `spor work --regate` is the door back |
+| `gate_escalation_failed` | boolean | optional — set when the refusal (a gate's, or the integration stage's, §10.9) could not file the escalation that carries it, so nothing was written to the graph and (§10.7) nothing was demoted either. The verdict is still settled; this is what says the refusal is readable only on this box, and that `spor work --regate` — or, for a GATE refusal, the bounded auto-retry below — is the door back. Cleared (`false`) once an escalation lands, by hand or by the auto-retry |
+| `gate_escalation_pending` | object | optional, gate-pipeline refusals only (§10.7) — the exact args `deps.escalate` needs to replay the failed write: `{gateId, attempt, attempts, detail, evidence, findings, ledger, rescue?, rescues?}`. What the bounded auto-retry reads; absent for an integration-stage refusal (no auto-retry there yet) or a blocked human gate (no escalate call to replay). Cleared (`null`) once the escalation lands |
+| `gate_escalation_retry_count` | number | optional — how many times the bounded auto-retry has attempted this refusal's escalation write, landed or not. `0` the moment `gate_escalation_pending` is first stamped |
+| `gate_escalation_retry_at` | ISO 8601 | optional — the earliest time the next auto-retry attempt may run (exponential backoff from `work.escalationRetryBackoffMs`, capped at `work.escalationRetryMaxBackoffMs`). Absent means "due now" |
+| `gate_escalation_retry_exhausted` | boolean | optional — the auto-retry spent `work.escalationRetryMaxAttempts` attempts without landing the escalation and gave up loudly (one log line); `spor work --regate` is the only door left |
 | `gate_demote_pending` | boolean | optional, propose mode only (§10.9) — `true` while a parked item's rollback is still owed: its tracking item filed but the demotion's own write failed (at park time, or during a heal pass). The per-pass proposal check retries the demotion on this flag and writes it back `false` once it lands (in the same stamp that owes `gate_restore_pending`, if the rollback has to be undone); left standing against a tracker that is already terminal, it is recovered — the item restored if the proposal's landed fact exists — before it is cleared. A park that never filed its tracker needs no flag, since healing the tracker is itself what triggers the rollback; and a debt this flag failed to record is re-derived from the graph (open tracker, no landed fact, item still at completion) on every later pass |
 | `gate_restore_pending` | boolean | optional, propose mode only (§10.9) — `true` while the UNDO of a rollback is still owed: the demotion above landed against a proposal that had settled between the tracker read that licensed it and the write itself (the tracker closed, or the landed fact written, by another pass or a person), and the promotion that undoes it failed. The per-pass proposal check retries the promotion on this flag and writes it back `false` once it lands |
 
@@ -1728,12 +1732,34 @@ pipeline (the suite, a fresh review dispatch, a fix cycle forced into the run's
 own checkout), it re-offers a run on every pass with no cooldown behind it, and
 it can only ever see a run its worker's status file still lists. So it would
 loop that pipeline for as long as the graph stayed unwritable in exactly the
-case it could reach, and would not reach the ordinary case at all. The
-recorded door is `spor work --regate <run-id>` (below): it judges the RUN
-record, which a failed escalation leaves untouched, so the whole pipeline —
-escalation included — can be re-run by hand once the graph is writable. `spor
-work --status` says so on the run's line, because until someone does, this
-refusal exists nowhere else.
+case it could reach, and would not reach the ordinary case at all. `spor
+work --status` says so on the run's line, because until someone (or the
+bounded auto-retry below) does, this refusal exists nowhere else.
+
+**A bounded auto-retry re-attempts the WRITE, never the pipeline**
+(task-spor-gate-escalation-bounded-auto-retry). The run record also carries
+the exact args `deps.escalate` was handed (`gate_escalation_pending`) — every
+poll, a gate-armed worker's loop re-attempts ONLY that call, and the `demote`
+that follows it, for any of this box's own settled-but-unescalated runs whose
+backoff has elapsed (`gate_escalation_retry_count`/`_retry_at`, doubling from
+`work.escalationRetryBackoffMs`, default 5m, capped at
+`work.escalationRetryMaxBackoffMs`, default 1h). Both writes are idempotent —
+`writeGateNode`'s deterministic id skips a matching existing node, and
+`gateDemoteItem` reads the item's current status before writing — so a retry
+can only ever finish what the first attempt started, never double-file the
+escalation or double-demote the item; nothing here re-runs the suite, a
+review, or a fix cycle. After `work.escalationRetryMaxAttempts` attempts
+(default 5) it gives up loudly — one log line, `gate_escalation_retry_exhausted:
+true` on the record — and the door back is the one below, `spor work --regate
+<run-id>`, exactly as if the auto-retry had never run.
+
+The recorded manual door is `spor work --regate <run-id>` (below): it judges
+the RUN record, which a failed escalation leaves untouched, so the whole
+pipeline — escalation included — can be re-run by hand once the graph is
+writable, or once the auto-retry above has given up (a factory whose gate was
+renamed or removed since the refusal, say — the auto-retry cannot replay a
+gate it can no longer find, and gives up rather than waiting on one that will
+never reappear on its own).
 
 **A refusal can be re-judged.** A gate can refuse for a reason that is not
 the item's — the trusted ref itself is red (a sibling-library drift, someone
@@ -1751,9 +1777,12 @@ the run's checkout (a command gate judges the branch's own base, and the usual
 reason to re-gate is that the trusted ref was red and has since been fixed);
 a conflict is refused with the checkout named, a dirty tree is left for the
 gate to refuse as before. It refuses a run that is still running, one that
-carries no claim of completion, and one that already passed or parked. Only a re-gate
-may move a settled `gate_state` on the run record — every other writer
-(the loop, a resumed pipeline, a duplicate adopter) still cannot.
+carries no claim of completion, and one that already passed or parked. Only a
+re-gate may move a settled `gate_state` on the run record — every other
+writer (the loop, a resumed pipeline, a duplicate adopter) still cannot. The
+auto-retry above is not an exception: it never touches `gate_state` itself,
+only the escalation/demotion fields beside a verdict that stays exactly what
+it was.
 
 ### 10.8 An interrupted pipeline is resumed, not lost
 
