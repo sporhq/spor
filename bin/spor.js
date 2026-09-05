@@ -6238,11 +6238,11 @@ function resolveCmdShimNodeTarget(shimPath) {
   } catch {
     return null;
   }
-  // npm's cmd-shim template (and the simpler node-stub wrappers this repo's
-  // own tests use) both end in one line shaped `"<prog>"  "<script>" %*`,
-  // where `<prog>` is `node`, `node.exe`, an absolute path to one, or a
-  // `%_prog%`-style variable cmd.exe would have substituted for us.
-  const m = content.match(/"([^"\r\n]*)"\s+"([^"\r\n]+\.[cm]?js)"\s+%\*/i);
+  // npm's cmd-shim template quotes its program reference (`"%_prog%"  "<script>" %*`);
+  // this repo's own generated shims (bin/spor.cmd, bin/spor-hook.cmd) leave it
+  // bare (`node "<script>" %*`) — accept either shape for `<prog>`, always
+  // requiring the script token quoted since it may itself contain spaces.
+  const m = content.match(/(?:"([^"\r\n]*)"|(\S+))\s+"([^"\r\n]+\.[cm]?js)"\s+%\*/i);
   if (!m) return null;
   const dp0 = path.dirname(shimPath) + path.sep;
   // `%dp0%`/`%~dp0` tokens are Windows-only, but the backslashes the shim was
@@ -6250,14 +6250,15 @@ function resolveCmdShimNodeTarget(shimPath) {
   // them so this resolves identically under test on any platform, not just
   // on a real win32 box (where path.sep is already `\`).
   const toPath = (token) => path.resolve(token.replace(/%~?dp0%?\\?/gi, dp0).split("\\").join(path.sep));
-  const scriptPath = toPath(m[2]);
+  const scriptPath = toPath(m[3]);
   if (!fs.existsSync(scriptPath)) return null;
   // `<prog>` is `node`/`node.exe`, an absolute path to one, or a
   // `%_prog%`-style batch variable cmd.exe would have substituted for us — an
   // unresolvable token simply fails the existsSync check below and falls
   // through to the same sibling-then-PATH resolution the shim's own batch
   // logic uses.
-  const progCandidate = m[1] ? toPath(m[1]) : null;
+  const progToken = m[1] !== undefined ? m[1] : m[2];
+  const progCandidate = progToken ? toPath(progToken) : null;
   const siblingNode = path.join(path.dirname(shimPath), "node.exe");
   const command = progCandidate && fs.existsSync(progCandidate)
     ? progCandidate

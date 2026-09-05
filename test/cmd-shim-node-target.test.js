@@ -89,6 +89,25 @@ test("resolveCmdShimNodeTarget: falls back to a PATH-resolved node when no sibli
   assert.ok(target.command, "falls back to a resolvable node command rather than throwing");
 });
 
+test("resolveCmdShimNodeTarget: this repo's own generated shims (bin/spor.cmd) name `node` UNQUOTED, ahead of the quoted script", () => {
+  const dir = scratch();
+  const script = path.join(dir, "spor.js");
+  fs.writeFileSync(script, "// stub\n");
+  const shim = path.join(dir, "spor.cmd");
+  fs.writeFileSync(shim, [
+    "@echo off",
+    "where node >nul 2>nul || exit /b 0",
+    'node "%~dp0spor.js" %*',
+    "exit /b %errorlevel%",
+    "",
+  ].join("\r\n"));
+
+  const target = resolveCmdShimNodeTarget(shim);
+  assert.ok(target, "matches the bareword-`node` shape this repo's own .cmd wrappers use");
+  assert.strictEqual(target.scriptPath, script);
+  assert.ok(target.command, "falls back to a resolvable node command since `node` alone isn't a file on disk");
+});
+
 test("resolveCmdShimNodeTarget: an unrelated batch script (not a node launcher) is left alone", () => {
   const dir = scratch();
   const shim = path.join(dir, "custom.cmd");
