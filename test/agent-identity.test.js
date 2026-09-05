@@ -959,12 +959,21 @@ test("dispatch (remote, real): mint endpoint absent (404) => hard-fails, names '
 test("dispatch (remote, real): mint hard-fail (404) leaves dispatch.repos untouched (issue-spor-dispatch-config-write-before-mint-fail)", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d3c-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d3cr-"));
+  const outFile = path.join(home, "argv.out");
   fs.mkdirSync(home, { recursive: true });
   fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "agent-anthony-laptop" } }) + "\n");
+  // Stub the harness binary (like the sibling tests below) so this test
+  // reaches the mint block via the mint 404 itself rather than via an
+  // unrelated "claude CLI not on PATH" preflight refusal on a machine with no
+  // real `claude` binary installed (e.g. CI) — both refuse before touching
+  // dispatch.repos, which would otherwise let this regression test pass for
+  // the wrong reason and lose its coverage of the actual ordering fix.
+  const stub = argvStub(home, outFile);
   const { srv, base } = await dispatchStub({ mintStatus: 404 });
   try {
-    const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_SESSION_ID: SID }));
+    const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub }));
     assert.strictEqual(r.status, 1);
+    assert.ok(!fs.existsSync(outFile), "nothing launched — the hard mint failure returns before the launch");
     const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
     assert.ok(!cfg.dispatch.repos, "a hard mint failure must not register the repo's slug->path mapping");
   } finally {
