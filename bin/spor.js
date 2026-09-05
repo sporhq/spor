@@ -10107,7 +10107,9 @@ function cmdWorkStatus(cfg, { json }) {
         out(`            fix cycle in flight: run ${String(gateRecord.gate_fix_run_id).slice(0, 8)} — 'spor runs ${gateRecord.gate_fix_run_id}' follows it`);
       }
     }
-    for (const r of (w.recent || []).slice(0, 5)) {
+    const recent = w.recent || [];
+    const recentShown = workLoop.RECENT_LOG_CAP;
+    for (const r of recent.slice(0, recentShown)) {
       out(
         `  done:     ${r.node_id || "(free-text)"}  ${r.terminal_state || r.state || "?"}` +
           `${r.terminal_state && !r.terminal_enforced ? " (unenforced)" : ""}` +
@@ -10126,6 +10128,12 @@ function cmdWorkStatus(cfg, { json }) {
       if (r.escalation_failed) {
         out(`            no escalation could be filed, so nothing was demoted — re-judge with 'spor work --regate ${r.run_id}'`);
       }
+    }
+    // Same treatment as the `skipped` list below: the list itself stays a
+    // glance, but a hard truncation with no total silently hid how much
+    // recent activity there actually was (issue-spor-cmd-work-status-truncation).
+    if (recent.length > recentShown) {
+      out(`  done:     +${recent.length - recentShown} more — ${workLoop.summarizeRecent(recent.slice(recentShown))} ('spor work --status --json' lists them all)`);
     }
     // One pass can cool off a whole page of items (a queue of untriaged work
     // under the default accept policy, a sibling repo's items under a scoped

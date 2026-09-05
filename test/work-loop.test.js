@@ -1409,6 +1409,45 @@ test("spor work --status counts the skips it does not list, instead of stopping 
   assert.strictEqual(JSON.parse(json.stdout).workers[0].skipped.length, 25);
 });
 
+test("spor work --status counts the done entries it does not list, instead of stopping silently at five", () => {
+  // The human renderer used to hard-truncate `recent` (done) to 5 entries with
+  // no total and no breakdown — the same gap `skipped` had before it got the
+  // "+N more" treatment above (issue-spor-cmd-work-status-truncation).
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-recent-"));
+  const recent = [];
+  for (let i = 0; i < 5; i++) {
+    recent.push({ run_id: `run-shown-${i}`, node_id: `task-recent-shown-${i}`, terminal_state: "resolved", terminal_enforced: true });
+  }
+  for (let i = 0; i < 10; i++) recent.push({ run_id: `run-r-${i}`, node_id: `task-recent-r-${i}`, terminal_state: "resolved", terminal_enforced: true });
+  for (let i = 0; i < 3; i++) recent.push({ run_id: `run-p-${i}`, node_id: `task-recent-p-${i}`, terminal_state: "reported", terminal_enforced: true });
+  for (let i = 0; i < 2; i++) recent.push({ run_id: `run-f-${i}`, node_id: `task-recent-f-${i}`, terminal_state: "failed", terminal_enforced: true });
+  workLoop.writeWorkerStatus(home, {
+    worker_id: "11111111-2222-3333-4444-777777777777",
+    pid: 999999,
+    state: "polling",
+    project: "demo",
+    concurrency: 1,
+    dispatched: 20,
+    outcomes: { resolved: 11, reported: 3, failed: 2 },
+    active: [],
+    gating: [],
+    recent,
+    skipped: [],
+    started_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    stopped_at: new Date().toISOString(),
+    stop_reason: "one pass (--once)",
+  });
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home };
+  const text = cli(["work", "--status"], env);
+  assert.strictEqual(text.status, 0, text.stderr);
+  assert.strictEqual((text.stdout.match(/^  done:     task-recent-shown-/gm) || []).length, 5, "the list itself stays a glance");
+  assert.match(text.stdout, /^  done:     \+15 more — 10 resolved, 3 reported, 2 failed \('spor work --status --json' lists them all\)$/m);
+  // --json is unchanged: it carries every entry, in full detail.
+  const json = cli(["work", "--status", "--json"], env);
+  assert.strictEqual(JSON.parse(json.stdout).workers[0].recent.length, 20);
+});
+
 test("spor work --status with nothing recorded says so, in both renderings", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-empty-"));
   const text = cli(["work", "--status"], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
