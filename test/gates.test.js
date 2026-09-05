@@ -813,8 +813,11 @@ test("no launch field is declarable on an implementation stage — every one of 
 
 test("a falsy-but-present launch field ('', 0, false) on an implementation stage is still refused", () => {
   // issue-spor-satisfiability-graph-launch-fields-exempts-empty-string: the
-  // guard is presence, not truthiness — `graphLaunchFields` used to treat a
-  // falsy value as absent, so `{command: ""}` parsed clean with no refusal.
+  // guard is presence, not truthiness. `graphLaunchFields` used to exempt
+  // `""` specifically (it parsed clean with no refusal); `0`/`false` were
+  // already refused under the old filter too — both are asserted here as
+  // characterization coverage so a future rewrite to a bare truthiness check
+  // can't reintroduce the hole for any of the three.
   for (const falsy of ["", 0, false]) {
     const { factory, errors } = stageFactory({ implementation: { command: falsy } });
     assert.strictEqual(factory, null, `command: ${JSON.stringify(falsy)} must refuse the factory`);
