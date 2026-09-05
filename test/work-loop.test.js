@@ -1328,6 +1328,9 @@ test("skipClass/summarizeSkips classify a structured {reason, kind} entry BY KIN
     "run ended declined"
   );
   assert.strictEqual(workLoop.skipClass({ reason: "last run here ended failed", kind: "outcome" }), "run ended failed");
+  // The no-state fallback text (outcomeOf's own default) is itself multiple
+  // words — a naive `\S+` extractor would truncate it to "without".
+  assert.strictEqual(workLoop.skipClass({ reason: "last run here ended without a verdict", kind: "outcome" }), "run ended without a verdict");
   // Aggregating two gate failures with DIFFERENT underlying detail still
   // buckets them together once they carry the same kind — the fragmentation
   // the generic string parser could not avoid on its own.
