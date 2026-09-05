@@ -482,6 +482,27 @@ test("a resident override that DROPS the get() hook from an edge-verified type i
   assert.deepStrictEqual(t.calls.map((c) => `${c.method} ${c.path}`), ["GET /v1/nodes/task-x", "GET /v1/schema"]);
 });
 
+test("a malformed schema body (parses, but carries no node_types) is refused and falls back to the seed pack, never silently read as an unregistered type (issue-spor-remote-dispatch-ignores-resident-resolution-hooks)", async () => {
+  const t = transport({
+    "GET /v1/nodes/task-x": { ok: true, status: 200, json: { id: "task-x", type: "task", status: "done" } },
+    "GET /v1/schema": { ok: true, status: 200, json: { unexpected: "shape" } },
+    "POST /v1/nodes": { ok: true, status: 200, json: { results: [{ ok: true, status: "created" }] } },
+  });
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, nodeId: "task-x", releaseNode: "task-x", state: "done",
+    reportText: "Status is done, but nothing resolves it — the malformed schema body must not flip that.", request: t.call,
+  });
+  // A malformed 2xx `GET /v1/schema` body (no `node_types` array) is NOT
+  // evidence that `task` is absent from the registry — reading it that way
+  // would flip `task` from edge-verified to status-only and misread this
+  // genuinely UNresolved node (no resolving edge, status alone reached
+  // "done") as resolved. The fallback is the shipped seed pack, which
+  // correctly keeps demanding the edge for `task`.
+  assert.notStrictEqual(patch.terminal_state, "resolved");
+  assert.strictEqual(patch.terminal_state, "reported");
+  assert.strictEqual(patch.terminal_enforced, true);
+});
+
 test("a capture-pending retired by STATUS (merged) also resolves via the universal completion words, no per-type declaration needed", async () => {
   const t = transport({
     "GET /v1/nodes/cap-x": { ok: true, status: 200, json: { id: "cap-x", type: "capture-pending", status: "merged" } },
