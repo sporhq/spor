@@ -463,7 +463,13 @@ commits (WORKERS.md §10.10). Both `gate` and `factory` are
 worker will accept, so it is written deliberately) and both arrive by adoption
 rather than in the seed, for the same reason. WORKERS.md §10 documents the
 runtime contract; the payload keys are documented on the candidate nodes
-themselves.
+themselves. Every declared count or ms field in a gate/factory payload
+(`cycles`, `reruns`, `timeout_ms`, `poll_ms`, `approval_timeout_ms`,
+`await_ms`, rescue's `attempts`) is parsed through a guarded helper
+(`countOr`/`msOrInherit` in `lib/kernel/gates.js`): a value that isn't
+readable as a number — blank, `null`, `false`, an array, or the wrong type —
+takes the field's documented default rather than silently clamping to the
+floor, while a readable but out-of-range number still clamps.
 
 A complete worked example — a `escalation` type with a required `severity`
 field (enforced in `validate`) and an `open → mitigated → closed` status machine

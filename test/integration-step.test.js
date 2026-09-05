@@ -73,6 +73,20 @@ test("integration.reruns parses like a command gate's: declared as given, capped
   assert.strictEqual(capped.factory.integration.reruns, gates.GATE_DEFAULTS.maxReruns);
 });
 
+// task-spor-gates-sweep-intor-fields-to-guarded-helpers: cycles/reruns/timeout_ms
+// are read through the same guarded helper a command gate's are — an
+// unreadable value (blank/null/false/array) must take the documented default,
+// never clamp to the floor via bare `intOr`'s `Number(null) === 0`.
+test("integration.cycles, .reruns and .timeout_ms take the documented default on an unreadable declared value, never the floor", () => {
+  for (const junk of ["", null, false, []]) {
+    const label = JSON.stringify(junk);
+    const r = factoryOf({ ...BASE, integration: { mode: "local", command: "npm test", cycles: junk, reruns: junk, timeout_ms: junk } });
+    assert.strictEqual(r.factory.integration.cycles, gates.GATE_DEFAULTS.cycles, `cycles ${label} must take the documented default`);
+    assert.strictEqual(r.factory.integration.reruns, gates.GATE_DEFAULTS.reruns, `reruns ${label} must take the documented default, never 0-by-coincidence-with-the-floor`);
+    assert.strictEqual(r.factory.integration.timeoutMs, gates.GATE_DEFAULTS.commandTimeoutMs, `timeout_ms ${label} must take the documented default, never the 1000ms floor`);
+  }
+});
+
 test("integration.target_ref really defaults to the FACTORY's own trusted_ref, not a hardcoded 'main'", () => {
   const { factory, errors } = factoryOf({ ...BASE, trusted_ref: "develop", integration: { mode: "local", command: "npm test" } });
   assert.deepStrictEqual(errors, []);

@@ -63,6 +63,64 @@ test("a command gate's `reruns` is a bounded same-tree rerun budget: default 0, 
   assert.strictEqual(gates.rerunCap({ reruns: 7 }), gates.GATE_DEFAULTS.maxReruns);
 });
 
+// issue-spor-parse-implementation-completion-error-nulls-implementation
+// finding #5 / task-spor-gates-sweep-intor-fields-to-guarded-helpers: every
+// declared count/ms field in a gate — not just the implementation-stage ones
+// `countOr`/`msOrInherit` were introduced for — must fall back to its
+// documented default on a blank/null/false/array value rather than clamping
+// to the floor via bare `intOr` (`Number(null)`/`Number(false)`/`Number([])`
+// are all a finite 0). `cycles` is shared by every gate kind; `reruns` and
+// `timeout_ms` are command-gate-only.
+test("a gate's cycles, and a command gate's reruns and timeout_ms, take the documented default on an unreadable declared value, never the floor", () => {
+  const cmd = (extra) => gates.parseFactory(factoryBody({ ...INLINE, gates: [{ id: "acceptance", kind: "command", command: "npm test", ...extra }] }), { id: "factory-demo" }).factory.gates[0];
+  for (const junk of ["", null, false, []]) {
+    const label = JSON.stringify(junk);
+    assert.strictEqual(cmd({ cycles: junk }).cycles, gates.GATE_DEFAULTS.cycles, `cycles ${label} must take the documented default`);
+    assert.strictEqual(cmd({ reruns: junk }).reruns, gates.GATE_DEFAULTS.reruns, `reruns ${label} must take the documented default, never the 0 floor`);
+    assert.strictEqual(cmd({ timeout_ms: junk }).timeoutMs, gates.GATE_DEFAULTS.commandTimeoutMs, `timeout_ms ${label} must take the documented default, never the 1000ms floor`);
+  }
+  // A readable but out-of-range number still clamps (the convention every
+  // count/ms field in this file keeps).
+  assert.strictEqual(cmd({ cycles: 99 }).cycles, 10);
+  assert.strictEqual(cmd({ timeout_ms: 1 }).timeoutMs, 1000);
+});
+
+test("an agent-review gate's await_ms takes the documented default on an unreadable declared value, never the 1000ms floor", () => {
+  const review = (extra) => gates.parseFactory(factoryBody({ ...INLINE, gates: [{ id: "review", kind: "agent-review", profile: "profile-codex-review", ...extra }] }), { id: "factory-demo" }).factory.gates[0];
+  for (const junk of ["", null, false, []]) {
+    assert.strictEqual(review({ await_ms: junk }).awaitMs, gates.GATE_DEFAULTS.reviewAwaitMs, `await_ms ${JSON.stringify(junk)} must take the documented default`);
+  }
+  assert.strictEqual(review({ await_ms: 1 }).awaitMs, 1000, "a readable out-of-range value still clamps to the floor");
+});
+
+// The marquee bug the sweep exists for: `approval_timeout_ms: null` read as
+// `Number(null) === 0` — a ZERO timeout, not the documented one-day default.
+test("a human gate's approval_timeout_ms and poll_ms take the documented default on an unreadable declared value — never a zero approval timeout", () => {
+  const human = (extra) => gates.parseFactory(factoryBody({ ...INLINE, gates: [{ id: "security", kind: "human", ...extra }] }), { id: "factory-demo" }).factory.gates[0];
+  for (const junk of ["", null, false, []]) {
+    const label = JSON.stringify(junk);
+    assert.strictEqual(human({ approval_timeout_ms: junk }).approvalTimeoutMs, gates.GATE_DEFAULTS.approvalTimeoutMs, `approval_timeout_ms ${label} must take the documented default, never a zero timeout`);
+    assert.strictEqual(human({ poll_ms: junk }).pollMs, gates.GATE_DEFAULTS.approvalPollMs, `poll_ms ${label} must take the documented default`);
+  }
+  // approval_timeout_ms floors at 0 — a genuinely declared 0 (an immediate,
+  // already-expired timeout) must survive, distinct from an unreadable value.
+  assert.strictEqual(human({ approval_timeout_ms: 0 }).approvalTimeoutMs, 0, "a declared zero is a real value, not the blank/null/false hazard");
+  assert.strictEqual(human({ poll_ms: 1 }).pollMs, 1000, "a readable out-of-range value still clamps to the floor");
+});
+
+// The `integration:` block reads cycles/reruns/timeout_ms through the same
+// guarded helper as a command gate's.
+test("the integration block's cycles, reruns and timeout_ms take the documented default on an unreadable declared value", () => {
+  const base = { gates: [{ id: "acceptance", kind: "command", command: "npm test" }] };
+  const withIntegration = (extra) => gates.parseFactory(factoryBody({ ...base, integration: { mode: "local", command: "npm test", ...extra } })).factory.integration;
+  for (const junk of ["", null, false, []]) {
+    const label = JSON.stringify(junk);
+    assert.strictEqual(withIntegration({ cycles: junk }).cycles, gates.GATE_DEFAULTS.cycles, `integration.cycles ${label} must take the documented default`);
+    assert.strictEqual(withIntegration({ reruns: junk }).reruns, gates.GATE_DEFAULTS.reruns, `integration.reruns ${label} must take the documented default`);
+    assert.strictEqual(withIntegration({ timeout_ms: junk }).timeoutMs, gates.GATE_DEFAULTS.commandTimeoutMs, `integration.timeout_ms ${label} must take the documented default`);
+  }
+});
+
 test("an INLINE gate and a REFERENCED shareable gate node fold into the same object", () => {
   const shared = { id: "adversarial", kind: "agent-review", profile: "profile-codex-review", cycles: 2 };
   const inline = gates.parseFactory(factoryBody({ ...INLINE, gates: [{ ...shared }] }), { id: "factory-demo" });
@@ -681,6 +739,18 @@ test("a factory's `rescue:` block parses — profile required, attempts bounded 
   const notObject = gates.parseFactory(body({ ...base, rescue: "profile-claude-fable" }));
   assert.strictEqual(notObject.factory, null);
   assert.match(notObject.errors.join("; "), /rescue: must be a JSON object/);
+});
+
+test("rescue's attempts and await_ms take the documented default on an unreadable declared value, never the floor", () => {
+  const body = (payload) => ["```json", JSON.stringify(payload), "```"].join("\n");
+  const base = { gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 1 }] };
+  const rescueOf = (extra) => gates.parseFactory(body({ ...base, rescue: { profile: "profile-claude-fable", ...extra } })).factory.rescue;
+  for (const junk of ["", null, false, []]) {
+    const label = JSON.stringify(junk);
+    assert.strictEqual(rescueOf({ attempts: junk }).attempts, gates.GATE_DEFAULTS.rescueAttempts, `rescue.attempts ${label} must take the documented default, never the 1-attempt floor collapsing coincidentally`);
+    assert.strictEqual(rescueOf({ await_ms: junk }).awaitMs, gates.GATE_DEFAULTS.rescueAwaitMs, `rescue.await_ms ${label} must take the documented default, never the 1000ms floor`);
+  }
+  assert.strictEqual(rescueOf({ await_ms: 1 }).awaitMs, 1000, "a readable out-of-range value still clamps to the floor");
 });
 
 // --- the implementation stage + the completion boundary ----------------------
