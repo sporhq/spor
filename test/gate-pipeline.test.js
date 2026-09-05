@@ -4223,6 +4223,75 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.doesNotMatch(fixLaunch.prompt, /Advisory \(recorded, not enforced/);
 });
 
+// task-spor-agent-review-gate-accept-native-bg-reviewer: a native-background
+// reviewer keeps no report_path, but writes the same final assistant text to
+// its own session transcript — gateRunReportText now falls back to reading
+// that transcript (nativeRunReportText's rule) instead of treating every
+// native-background record as report-less.
+test("a native-background reviewer's verdict is read off its transcript, and a native record with no transcript still fails closed", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-review-native-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, "nodes", "task-fix-me.md"),
+    "---\nid: task-fix-me\ntype: task\ntitle: Make the bound exclusive\nsummary: The loop over-reads by one element.\nstatus: open\ndate: 2026-09-05\n---\n\nAcceptance: reading N items yields N.\n"
+  );
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-review-native-repo-"));
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  g("init", "-q", "-b", "main");
+  fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n;\n");
+  g("add", "."); g("commit", "-q", "-m", "base");
+  g("checkout", "-q", "-b", "task-fix-me");
+  fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n + 1;\n");
+  g("commit", "-q", "-am", "implement");
+
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  const gate = { id: "adversarial-review", kind: "agent-review", profile: "profile-review", cycles: 2, awaitMs: 5000 };
+  const line = (o) => `${JSON.stringify(o)}\n`;
+  const verdict = '```json\n{"verdict":"pass","prior":[{"id":"F1","status":"resolved"}]}\n```';
+
+  let which = "with-transcript";
+  const deps = sporCli.makeGateDeps(cfg, {
+    record: { node_id: "task-fix-me", cwd: repo },
+    entry: { run_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", node_id: "task-fix-me", project: null },
+    factory: { id: "factory-test" },
+    slug: null, passthrough: {},
+    warn: () => {}, log: () => {}, stopping: () => false, home,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    dispatch: async (_cfg, _values) => {
+      const runId = `native-review-run-${which}`;
+      const p = dispatchRuns.runPaths(home, runId);
+      const record = { run_id: runId, node_id: "task-fix-me", state: "done", created_at: new Date().toISOString(), launch_mode: "native-background", harness: "claude-code" };
+      if (which === "with-transcript") {
+        const transcript = path.join(home, `${runId}.transcript.jsonl`);
+        fs.writeFileSync(
+          transcript,
+          line({ type: "system", subtype: "init" }) +
+            line({ type: "assistant", message: { content: [{ type: "text", text: "Reviewing." }] } }) +
+            line({ type: "assistant", message: { content: [{ type: "text", text: verdict }] } }) +
+            line({ type: "result", subtype: "success", is_error: false, result: verdict })
+        );
+        record.transcript_path = transcript;
+      }
+      // Deliberately no report_path: a native-background run keeps none.
+      dispatchRuns.atomicJson(p.record, record);
+      return { ok: true, run: { run_id: runId, harness: "claude-code" } };
+    },
+  });
+  assert.ok((await deps.changedPaths({ trustedRef: "main" })).ok);
+
+  const withTranscript = await deps.review({ gate, cycle: 0, prior: [], fix: null });
+  assert.strictEqual(withTranscript.ok, true, withTranscript.reason);
+  assert.match(withTranscript.text, /"verdict":"pass"/);
+
+  which = "no-transcript";
+  const withoutTranscript = await deps.review({ gate, cycle: 0, prior: [], fix: null });
+  assert.strictEqual(withoutTranscript.ok, false, "a native record with no transcript still fails closed");
+  assert.match(withoutTranscript.reason, /left no final report to read a verdict from/);
+  assert.match(withoutTranscript.reason, /native-background with a bound transcript/);
+});
+
 // --- the dirty-tree round-trip (task-spor-worker-declined-outcome) --------
 // An uncommitted tree gets ONE commit-or-discard dispatch into the same
 // checkout before the first gate refuses it; every other unreadable reason

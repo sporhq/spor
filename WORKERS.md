@@ -1388,10 +1388,15 @@ in this section).
 The runner then parses that block **in code** from the run's final report
 (`parseReviewVerdict`, lib/kernel/gates.js). Fail-closed throughout: a review
 that could not be dispatched, that never finished, that left no report to read
-(an agent-review gate therefore needs a SUPERVISED harness — every built-in
-is one by default, and a worker's own dispatches are always supervised, so a
-missing report is a run-time failure rather than a load-time refusal), or whose
-verdict is
+(an agent-review gate needs a harness whose report is readable — a supervised
+run's `report_path`, or a native-background run's own session transcript
+through the same last-assistant-text reading that `nativeRunReportText`
+applies elsewhere, dec-spor-native-bg-turn-complete-and-contract,
+task-spor-agent-review-gate-accept-native-bg-reviewer. Every built-in launches
+supervised by default and a worker's own dispatches are always supervised, so
+this stays a run-time failure rather than a load-time refusal either way — a
+native record with no bound transcript to read is exactly as unreadable as a
+supervised run whose report file never landed), or whose verdict is
 unparseable or unrecognized is a gate FAILURE. An unread review is not an
 approval. Nor is a review of nothing: a branch that carries **no committed
 change against the trusted ref** (the implementer landed its work on the

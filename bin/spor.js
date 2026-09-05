@@ -11471,17 +11471,28 @@ async function awaitGateRun(cfg, runId, { timeoutMs, pollMs = 5000, warn = () =>
 }
 
 // A dispatched run's own final report text — the channel a review gate's
-// structured verdict comes back on. Supervised launches write it; a native
-// background launch does not, which is why an agent-review gate must be routed
-// to a supervised profile (the gate says so when the text is missing).
+// structured verdict comes back on. A supervised launch writes it straight to
+// `report_path`; a native-background launch keeps no such file, but writes
+// the same final assistant text to its own session transcript, which
+// `nativeRunReportText` reads by the same "last assistant message wins" rule
+// (dec-spor-native-bg-turn-complete-and-contract) — so a native record with a
+// bound transcript is readable here too, not just a supervised one
+// (task-spor-agent-review-gate-accept-native-bg-reviewer, retiring the
+// supervised-only restriction). A native record with no transcript to read —
+// or any record with neither a report file nor a transcript — still comes
+// back "", which the caller reads as an unreadable verdict: a gate FAILURE,
+// never a pass.
 function gateRunReportText(record) {
   const file = record && record.report_path;
-  if (!file) return "";
-  try {
-    return fs.readFileSync(file, "utf8");
-  } catch {
-    return "";
+  if (file) {
+    try {
+      return fs.readFileSync(file, "utf8");
+    } catch {
+      return "";
+    }
   }
+  if (record && record.launch_mode === "native-background") return dispatchRuns.nativeRunReportText(record);
+  return "";
 }
 
 // A rescue's diagnosis (WORKERS.md §10.10): the final report first, then —
@@ -12473,7 +12484,7 @@ function makeGateDeps(
         ok: false,
         reason:
           `the review run under ${gate.profile} left no final report to read a verdict from` +
-          ` (an agent-review gate must route to a SUPERVISED harness — a native background launch has no report channel)`,
+          ` (an agent-review gate must route to a harness whose report is readable — supervised, or native-background with a bound transcript)`,
       };
     }
     return { ok: true, text, runId: launched.run.run_id };
