@@ -1133,6 +1133,53 @@ rather than the next probe. Like the checklist this is prose for the reader
 and a tag for the record: pass/fail is decided exactly as before, and the
 `cycles` cap is unchanged (the budget was fine; the framing was not).
 
+**An unmet done condition is not a defect**
+(task-spor-review-gate-item-done-condition-vs-implementer-conclusion). The two
+rules above bound a reviewer that keeps moving; this one bounds an implementer
+that keeps arguing. The first item to hit it burned all three fix cycles AND
+the rescue lane on ONE carried finding: the reviewer correctly held the item's
+literal done condition (a classifier prompt inside a 6% budget) while each fix
+cycle asserted the failure more firmly — a README verdict, a test pinning the
+miss, a second measurement read as "the rate is real" — and none re-attempted
+it. The rescue met the condition in one materially different revision. So a
+finding now carries a **`category`**, asked for in the verdict and folded onto
+the ledger:
+
+- `correctness` (the default): the change is WRONG — a defect, silent data
+  loss, a contract break. A fixer fixes it.
+- `unmet-condition`: the change is not wrong, it does not do what the WORK ITEM
+  ASKED — its stated done condition is unmet. A fixer does not fix that: it
+  makes a fresh, materially different attempt at the condition, or a person
+  re-scopes the item.
+
+Unstated reads as `correctness` (only the unmet reading short-circuits the
+budget, so the default must not be the short-circuit), a `prior` answer may
+RECLASSIFY a carried finding by carrying `category`, and silence on a prior
+entry leaves the ledger's category alone. Pass/fail is untouched: an unmet
+condition blocks on exactly the same demonstrated-only terms as anything else,
+and the tag rides the fact and the fixer's prompt (`[blocking,
+unmet-condition]`) the way `row-by-row` does.
+
+Both prompts change with it. The reviewer is told the two are answered
+differently, that a fix which ARGUES the condition is unattainable — or files a
+decision re-scoping the item — has not met it, and that accepting a re-scope is
+not a reviewer's call: confirm the finding open, name the decision in the note.
+The fixer, handed an `unmet-condition` finding, is told to do exactly one of
+(1) a fresh attempt materially different from the one that missed, saying in
+the commit message what changed about the approach, or (2) file a Spor
+`decision` re-scoping the item, `relates-to` the work item, named in the commit
+message — and that (2) does not clear the gate and is not meant to.
+
+And the runner stops paying for the argument: once such a finding has been
+confirmed open through `UNMET_CONDITION_CARRY` (two) fix cycles
+(`gates.unmetConditionFindings`, the same `answered !== false` and `prior`
+guards the row-by-row check keeps), the refusal is returned `noRetry` — no
+further implementer is dispatched at it, and it goes where a scope dispute can
+actually be settled: the rescue lane if the factory declares one (§10.10), else
+the human escalation. The declared `cycles` cap is untouched; this only ever
+spends FEWER of them, and the refusal's detail and the gate fact say which
+finding ended them and why.
+
 On `changes_requested` with cycles left, the runner dispatches an implementer
 **fix cycle** — the blocking findings by id, the advisory notes, what earlier
 cycles already resolved (do not regress), at the same node, in the same tree —

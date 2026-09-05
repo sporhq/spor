@@ -109,6 +109,14 @@ last, so a gate-passed item that never landed failed *after* every gate:
   review named the next): that is neither side's fault alone, but the fix
   it needs is one that closes the mechanism — read the `row:` lines under
   the finding, list the rest yourself, and dispatch one fix for all of them.
+  A finding tagged `[blocking, unmet-condition]` is a SCOPE dispute, not a
+  bug: the reviewer is holding the item's stated done condition and the change
+  does not meet it. Once one has been carried two fix cycles the runner stops
+  dispatching implementers at it and routes the refusal to the rescue lane or
+  a person — so if you see one on an escalation, the question to answer is
+  whether the condition is attainable, not whether the code is correct. Raising
+  `cycles` will not help; a fresh approach or a decision re-scoping the item
+  will.
 
 ## "The reviews are too strict"
 
