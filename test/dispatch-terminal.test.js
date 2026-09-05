@@ -17,6 +17,7 @@ const terminal = require("../lib/shell/dispatch-terminal.js");
 const runner = require("../lib/shell/agent-dispatch-runner.js");
 const graphLib = require("../lib/graph.js");
 const { parseFrontmatter } = graphLib;
+const { waitFor } = require("./helpers/launch.js");
 
 // The default `GET /v1/schema` answer for tests that don't care about the
 // live-registry fetch (issue-spor-remote-dispatch-ignores-resident-resolution-
@@ -958,11 +959,17 @@ test("end to end: a resolving edge on the graph makes the same run resolved, wit
 });
 
 test("a launch failure goes terminal within the launcher's poll window even when the graph hangs", async () => {
-  // The launcher polls the run record for `failed_launch` for ONE SECOND before
-  // deciding a dispatch got off the ground (launchSupervisedHarness). The
-  // terminal-state contract is up to three bounded HTTP round-trips, so it must
-  // NOT gate that write: gating it made `spor dispatch` report success and skip
-  // its claim release for a harness binary that does not exist.
+  // The record must go terminal (`failed_launch`) promptly — well before the
+  // terminal-state contract's up-to-three bounded HTTP round-trips resolve.
+  // closeWithOutcome's synchronous write (agent-dispatch-runner.js) is what
+  // guarantees that: gating it made `spor dispatch` report success and skip
+  // its claim release for a harness binary that does not exist. This spawns
+  // the REAL supervisor process against a REAL nonexistent binary, so the
+  // wait below is real wall-clock too — `waitFor`'s load-scaled ceiling
+  // (test/helpers/launch.js) is what keeps it from flaking under a loaded
+  // box instead of a fixed 20 x 50ms budget sized for an idle one; the
+  // assertion still checks CONTENT (the written state), so it fails exactly
+  // as before if the synchronous write is reverted.
   const home = scratch("spor-terminal-poll-");
   const cwd = scratch("spor-terminal-poll-cwd-");
   const held = [];
@@ -988,12 +995,10 @@ test("a launch failure goes terminal within the launcher's poll window even when
   });
   const exited = new Promise((resolve) => { child.on("exit", resolve); child.on("error", resolve); });
   try {
-    let seen = null;
-    for (let i = 0; i < 20 && !seen; i++) { // the launcher's exact 20 x 50ms window
+    const seen = await waitFor(() => {
       const state = runner.readJson(p.record);
-      if (state && state.state === "failed_launch") seen = state;
-      else await new Promise((r) => setTimeout(r, 50));
-    }
+      return (state && state.state === "failed_launch") ? state : null;
+    }, { timeoutMs: 1000, intervalMs: 50 });
     assert.ok(seen, "the record goes terminal inside the launcher's poll window");
     // ...and is never terminal-without-an-outcome, even mid-contract.
     assert.strictEqual(seen.terminal_state, "failed");
