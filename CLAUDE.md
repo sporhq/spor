@@ -356,14 +356,22 @@ shipped prompt FAILED, suppressing 51% of warranted digests, and fail-open does
 not cover that — it protects against backend failure, not against haiku
 confidently answering UNWARRANTED on a clearly-warranted prompt. The
 recalibrated prompt in `prompts/client/digest-intent.md` (asymmetric-cost,
-default-WARRANTED) clears the gate: 0/29 good digests lost, 4/59 warranted
-suppressed, 78% of noise cut, fire-table F1 0.873 vs the current
-always-inject engine's 0.819. That scoring is no longer a scratchpad — re-score
+default-WARRANTED) clears the HARM rule but NOT the whole gate: 0/29 good
+digests lost (the asymmetric criterion, was 12/29) and fire-table F1 0.873 vs
+the current always-inject engine's 0.819, with 78% of noise cut — but 4/59 =
+6.8% warranted suppressed is still OVER the 6% budget, so `gateVerdict` returns
+`pass: false` and `--strict` exits 1 on it. The overage is smaller than one case
+(1.7pp at n=59), which the harness reports as a note on a FAILING row and not as
+an excuse that flips it; don't quote the 0/29 as if it were the gate. That
+scoring is no longer a scratchpad — re-score
 any prompt edit with `scripts/intent-eval/` (`--replay` re-derives a recorded
-run with no backend calls; the corpus stays in the private server repo).
-Default-on is STILL deferred, now on two things a prompt change can't settle:
-a held-out re-validation on a fresh transcript window (the prompt was iterated
-against this judged set), and a backend-cost call — the shipped default
+run with no backend calls, and REFUSES a file that doesn't cover the population,
+since an unclassified case would score as the fail-open inject and read as a
+pass; the corpus stays in the private server repo).
+Default-on is STILL deferred, now on three things: the budget criterion itself
+(over by less than the sample can resolve, which a bigger judged set settles and
+an assertion does not), a held-out re-validation on a fresh transcript window
+(the prompt was iterated against this judged set), and a backend-cost call — the shipped default
 `claude -p --model haiku` bills ~$0.08 and ~14s per classification, ~98% of it
 CLI session boot rather than the 4.6KB classification, so a flip wants a
 cheaper `digest.intentCmd` backend first. See test/digest-async.test.js and

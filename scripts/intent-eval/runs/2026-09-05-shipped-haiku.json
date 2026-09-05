@@ -16,6 +16,8 @@
       "2c9eea3d80e6"
     ],
     "suppressedU": 14,
+    "errored": 0,
+    "erroredIds": [],
     "warrantedSuppression": 0.06779661016949153,
     "goodLoss": 0,
     "noiseRemoved": 0.7777777777777778,
@@ -28,6 +30,11 @@
     "oneCase": 0.01694915254237288,
     "harm": {
       "metric": "good digests lost",
+      "value": 0,
+      "pass": true
+    },
+    "integrity": {
+      "metric": "cases with no verdict",
       "value": 0,
       "pass": true
     },

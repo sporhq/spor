@@ -195,15 +195,24 @@ function report(records, score, gate, tables, spend, drops) {
     `  ${gate.harm.metric.padEnd(21)}: ${score.goodLost}        rule: 0` +
       `                     ${gate.harm.pass ? "PASS" : "FAIL"}`
   );
+  console.log(
+    `  ${gate.integrity.metric.padEnd(21)}: ${gate.integrity.value}        rule: 0` +
+      `                     ${gate.integrity.pass ? "PASS" : "FAIL"}` +
+      (gate.integrity.pass ? "" : "  (a run that measured nothing cannot pass)")
+  );
   const note = gate.warranted.pass
     ? ""
     : gate.warranted.withinOneCase
-      ? `  (over by less than one case = ${pct(gate.oneCase)})`
+      ? `  (over by less than one case = ${pct(gate.oneCase)} — a note on a FAILING criterion)`
       : "";
   console.log(
     `  ${gate.warranted.metric.padEnd(21)}: ${pct(score.warrantedSuppression)}    budget: ${pct(BUDGET)}` +
       `                ${gate.warranted.pass ? "PASS" : "OVER"}${note}`
   );
+  // The aggregate verdict, printed rather than left to be read off the rows —
+  // the criteria are asymmetric and "0 good digests lost" is easy to quote as
+  // if it were the whole gate.
+  console.log(`\n  VERDICT: gate ${gate.pass ? "PASS" : "FAIL"}${STRICT ? "" : "   (--strict exits 1 on FAIL)"}`);
   const supp = records.filter((r) => r.warranted && !r.inject);
   if (supp.length) {
     console.log(`\n-- what the warranted suppressions actually cost (judge's rating of the suppressed digest) --`);
@@ -245,7 +254,26 @@ async function main() {
   let graph = null;
   if (REPLAY) {
     const prior = Object.fromEntries(readJsonl(REPLAY).map((r) => [r.case_id, r]));
-    decisions = set.map((r) => prior[r.case_id] ?? { verdict: null, inject: true, ms: 0, error: "absent from replay" });
+    // A replay must COVER the population it is scored against. Substituting the
+    // fail-open inject for an absent case is the production behaviour, but here
+    // it is not a measurement: both harm metrics count suppressions, so a
+    // truncated, empty or wrong-corpus file would score zero suppressions and
+    // report a PASS (exit 0 under --strict) having classified nothing. A record
+    // without a boolean `inject` is missing for the same reason — it carries no
+    // decision, and reading its absence as `false` would invent a suppression.
+    const missing = set.filter((r) => !prior[r.case_id] || typeof prior[r.case_id].inject !== "boolean");
+    if (missing.length) {
+      const ids = missing.slice(0, 6).map((r) => r.case_id).join(", ");
+      die(
+        `replay ${REPLAY} carries decisions for ${set.length - missing.length}/${set.length} selected cases.\n` +
+          `  missing ${missing.length}: ${ids}${missing.length > 6 ? ", …" : ""}\n` +
+          `  a partial replay is not a run — an unclassified case would score as the fail-open\n` +
+          `  inject and read as a PASS. Re-record with --out, or narrow the population (--limit).`
+      );
+    }
+    const extra = Object.keys(prior).length - set.length;
+    if (extra > 0) process.stderr.write(`replay covers ${set.length}/${set.length} selected (+${extra} out of population)\n`);
+    decisions = set.map((r) => prior[r.case_id]);
   } else {
     graph = fs.mkdtempSync(path.join(os.tmpdir(), "intent-eval-graph-"));
     decisions = await pool(set, CONC, (r) => {
