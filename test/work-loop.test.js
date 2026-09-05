@@ -1006,6 +1006,28 @@ test("spor work --print: an item assigned to a DIFFERENT agent is never a candid
   assert.match(noIdentity.stdout, /-> task-elsewhere/);
 });
 
+// A malformed --as/dispatch.agent must DISABLE the filter, not feed it: unlike
+// `cmdDispatch`, which validates --as up front and refuses loudly,
+// `spor work` only reaches that validation per item, inside the per-node
+// `cmdDispatch` call it makes — AFTER this filter would already have run. Left
+// unvalidated, EVERY item genuinely assigned to a real agent (never equal to
+// the garbage string) would be silently skip-classified "assigned to another
+// agent" forever, burying the loud "invalid --as agent id" refusal a real
+// dispatch attempt would otherwise surface.
+test("spor work --print: a malformed --as/dispatch.agent disables the assignee filter instead of misclassifying every self-assigned item", () => {
+  const { home, outfile } = cliFixture();
+  const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
+  cfg.dispatch.agent = "not-an-agent-id"; // missing the required agent- prefix
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify(cfg, null, 2) + "\n");
+  const r = cli(["work", "--print"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^agent:   \(ignoring 'not-an-agent-id' — not a valid agent-<slug> id; the assignee filter is disabled until it is\)$/m);
+  // task-ready is assigned -> agent-workbox, a real agent id that never equals
+  // the malformed config value — with the filter left ARMED it would read as
+  // "assigned to another agent" and never be a candidate at all.
+  assert.match(r.stdout, /-> task-ready/, "still a candidate — the filter is off, not comparing against garbage");
+});
+
 // Two repos in ONE home-project grouping, each with an agent-ready item, plus a
 // factory living in one of them. This is the shape of the reported repro
 // (issue-spor-work-scope-union-factory-mismatch): `--project <repo slug>`

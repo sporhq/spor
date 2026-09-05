@@ -14997,8 +14997,18 @@ async function cmdWork(cfg, { values }) {
   // (issue-spor-auto-route-additive-assignment-two-assignees): the same
   // precedence `spor dispatch` resolves `identityAgent` from (--as, else
   // dispatch.agent) — an unconfigured box has no identity to compare against,
-  // so the filter stays a no-op there rather than guessing.
-  const selfAgent = values.as || dispatchAgentId(cfg) || null;
+  // so the filter stays a no-op there rather than guessing. Unlike
+  // `cmdDispatch`, which validates `--as` up front and refuses loudly on a
+  // malformed id, `spor work` only reaches that validation per item, inside
+  // the per-node `cmdDispatch` call — AFTER this filter would already have
+  // run. A malformed value here must not silently misclassify every item
+  // genuinely assigned to a real agent as "assigned to another agent" (never
+  // equal to the garbage string) and skip it forever with a misleading
+  // reason, hiding the loud "invalid --as agent id" refusal `cmdDispatch`
+  // would otherwise give on the first attempt — so an unrecognized shape
+  // disables the filter instead of feeding it.
+  const selfAgentRaw = values.as || dispatchAgentId(cfg) || null;
+  const selfAgent = selfAgentRaw && isAgentId(selfAgentRaw) ? selfAgentRaw : null;
 
   // The GATE PIPELINE (task-spor-work-gate-pipeline), opt-in and graph-resident:
   // with no factory declared the loop runs exactly as it shipped. A declared one
@@ -15226,7 +15236,11 @@ async function cmdWork(cfg, { values }) {
     out(`tenant:  ${preflight.tenantLine(preflight.describeTenant(cfg))}`);
     out(`project: ${slug || "(all projects)"}`);
     out(`accept:  ${accept} — ${accept === "open" ? "any queue item except readiness:human (untriaged included)" : "only items explicitly stamped agent-ready (--accept open for the looser pickup)"}`);
-    out(`agent:   ${selfAgent || "(none configured — an item another agent already holds is not filtered out; set dispatch.agent or pass --as)"}`);
+    out(`agent:   ${selfAgent
+      ? selfAgent
+      : selfAgentRaw
+        ? `(ignoring '${selfAgentRaw}' — not a valid agent-<slug> id; the assignee filter is disabled until it is)`
+        : "(none configured — an item another agent already holds is not filtered out; set dispatch.agent or pass --as)"}`);
     out(`loop:    concurrency ${concurrency}, interval ${intervalMs / 1000}s, backoff to ${maxIntervalMs / 1000}s, retry refused after ${retryAfterMs / 1000}s, stop following a run after ${runMaxMs / 3600000}h${runIdleMs > 0 ? `, stop a run idle for ${runIdleMs / 60000}m` : ""}${max ? `, stop after ${max}` : ""}`);
     out(`status:  ${workLoop.workDir(cfg.userConfigHome())}`);
     // The posture this worker hands to every dispatch it makes. Each dispatch
