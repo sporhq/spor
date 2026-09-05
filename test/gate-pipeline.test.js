@@ -5039,3 +5039,186 @@ test("gateChangeSet marks a missing checkout `gone`, and gateHeadLanded reads th
   assert.deepStrictEqual(gateRunner.gateHeadLanded({ cwd: null }, "main"), { known: false, landed: null, head: null });
   fs.rmSync(root, { recursive: true, force: true });
 });
+
+// ------------------------------------------------ no-code outcomes (§10.11) --
+// task-spor-factory-no-code-outcome-convention: a run whose item's premise turned
+// out to be stale legitimately commits nothing, and the empty-diff refusal above
+// cannot tell it from a run that did nothing. So a run may DECLARE the outcome
+// and the runner CHECKS the declaration against the graph — a claim that does
+// not check out falls straight through to that same refusal, carrying why.
+
+const SCOPING_NODE = {
+  id: "art-scoping-x",
+  type: "artifact",
+  status: "",
+  repo: "demo",
+  outcome: "rescoped",
+  edges: [{ type: "relates-to", to: "task-demo" }],
+};
+
+// The item as the graph reads it AFTER the scoping: re-stamped to another repo,
+// still open. `ITEM.project` ("demo") is what the pipeline claimed it under.
+const SCOPED_ITEM_NODE = { id: "task-demo", type: "task", status: "open", repo: "elsewhere", edges: [] };
+
+function withNoCode(world, { report = "SCOPED: rescoped art-scoping-x — the server half already shipped", nodes = { "art-scoping-x": SCOPING_NODE, "task-demo": SCOPED_ITEM_NODE }, resolved = null } = {}) {
+  world.seen.nodeReads = [];
+  world.deps.noCodeClaim = () => gates.parseNoCodeReport(report);
+  world.deps.node = async ({ id }) => {
+    world.seen.nodeReads.push(id);
+    const node = nodes[id];
+    return node ? { ok: true, node } : { ok: false, reason: `${id} could not be read from the graph` };
+  };
+  world.deps.resolved = async () => resolved;
+  return world;
+}
+
+const NO_CODE_FACTORY = {
+  ...BASE,
+  gates: [
+    { id: "acceptance", kind: "command", command: "npm test" },
+    { id: "review", kind: "agent-review", profile: "profile-reviewer", cycles: 3 },
+  ],
+};
+
+test("a VERIFIED no-code outcome settles SCOPED: one art-gate-scoping fact, no gate run, no escalation, no demotion", async () => {
+  const factory = factoryOf(NO_CODE_FACTORY);
+  const log = [];
+  const { deps, seen } = withNoCode(fakes({ changed: [] }));
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps, log: (l) => log.push(l) });
+  assert.strictEqual(res.state, "scoped");
+  assert.strictEqual(res.outcome, "rescoped");
+  assert.strictEqual(res.resolver, "art-scoping-x");
+  assert.match(res.reason, /re-stamped from repo 'demo' to 'elsewhere'/);
+  assert.match(res.reason, /the server half already shipped/);
+  assert.deepStrictEqual(seen.suites, [], "no command gate runs");
+  assert.deepStrictEqual(seen.reviews, [], "no reviewer is dispatched");
+  assert.strictEqual(seen.fixes.length, 0, "no fix cycle, and no commit-or-discard round-trip");
+  assert.strictEqual(seen.escalations.length, 0, "nobody is paged for a verified scoping result");
+  assert.strictEqual(seen.demotions.length, 0, "the item is left exactly where the scoping put it");
+  // The fact: one, under the scoping gate id, `relates-to` the item and never
+  // `resolves` it — a gate outcome records, it does not retire.
+  assert.strictEqual(seen.facts.length, 1);
+  assert.match(seen.facts[0].id, /^art-gate-scoping-demo-runabcde-[0-9a-f]{8}$/);
+  assert.deepStrictEqual(res.facts, [seen.facts[0].id]);
+  assert.match(seen.facts[0].markdown, /- \{type: relates-to, to: task-demo\}/);
+  assert.doesNotMatch(seen.facts[0].markdown, /type: resolves/);
+  assert.match(seen.facts[0].markdown, /scoped on task-demo/);
+  assert.match(seen.facts[0].markdown, /recorded a verified no-code outcome/);
+  assert.deepStrictEqual(res.gates.map((g) => [g.gate, g.verdict]), [["scoping", "scoped"]]);
+  assert.ok(gates.SETTLED_GATE_STATES.has("scoped"));
+});
+
+test("a premise-stale outcome must NAME what it found, and the item reading retired is enough on its own", async () => {
+  const factory = factoryOf(NO_CODE_FACTORY);
+  const resolver = {
+    ...SCOPING_NODE,
+    outcome: "premise-stale",
+    edges: [
+      { type: "resolves", to: "task-demo" },
+      { type: "derived-from", to: "art-already-shipped" },
+    ],
+  };
+  // The item did NOT change repo; it is retired by a live resolving edge.
+  const nodes = { "art-scoping-x": resolver, "task-demo": { id: "task-demo", type: "task", status: "open", repo: "demo", edges: [] } };
+  const ok = withNoCode(fakes({ changed: [] }), {
+    report: "SCOPED: premise-stale art-scoping-x — GET /v1/queue?offset= already shipped",
+    nodes,
+    resolved: { terminal_state: "resolved", resolved_by: "art-scoping-x" },
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: ok.deps });
+  assert.strictEqual(res.state, "scoped");
+  assert.strictEqual(res.found, "art-already-shipped");
+  assert.match(res.reason, /names `art-already-shipped` as what it found/);
+  assert.match(res.reason, /is retired \(a live resolving edge\)/);
+
+  // Strip the derived-from edge and the same claim is refused: a finding that
+  // names nothing it found is not a demonstration.
+  const bare = withNoCode(fakes({ changed: [] }), {
+    report: "SCOPED: premise-stale art-scoping-x — trust me",
+    nodes: { ...nodes, "art-scoping-x": { ...resolver, edges: [{ type: "resolves", to: "task-demo" }] } },
+    resolved: { terminal_state: "resolved", resolved_by: "art-scoping-x" },
+  });
+  const refused = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: bare.deps });
+  assert.strictEqual(refused.state, "failed");
+  assert.match(refused.reason, /names nothing it found/);
+});
+
+test("a no-code claim that does not check out falls through to the empty-diff refusal, carrying WHY", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-reviewer", cycles: 3 }] });
+  const cases = [
+    // The named node is not on the graph at all.
+    [{ nodes: { "task-demo": SCOPED_ITEM_NODE } }, /could not be read from the graph/],
+    // It is there, but declares nothing.
+    [{ nodes: { "art-scoping-x": { ...SCOPING_NODE, outcome: null }, "task-demo": SCOPED_ITEM_NODE } }, /carries no `outcome:`/],
+    // It declares a DIFFERENT outcome than the report claims.
+    [{ nodes: { "art-scoping-x": { ...SCOPING_NODE, outcome: "duplicate" }, "task-demo": SCOPED_ITEM_NODE } }, /declares `outcome: duplicate`, but the report claims 'rescoped'/],
+    // It is not linked to the item.
+    [{ nodes: { "art-scoping-x": { ...SCOPING_NODE, edges: [] }, "task-demo": SCOPED_ITEM_NODE } }, /carries no resolves\/answers\/relates-to\/derived-from edge to task-demo/],
+    // Nothing moved: same repo, not resolved, not superseded.
+    [{ nodes: { "art-scoping-x": SCOPING_NODE, "task-demo": { ...SCOPED_ITEM_NODE, repo: "demo" } } }, /task-demo is unchanged/],
+    // The declaration itself is unreadable.
+    [{ report: "SCOPED: rescoped" }, /does not read as `SCOPED: <outcome> <resolver-id>/],
+    // ...or names a word that is not a declared outcome.
+    [{ report: "SCOPED: vibes art-scoping-x — no" }, /is not a declared no-code outcome/],
+  ];
+  for (const [world, expected] of cases) {
+    const { deps, seen } = withNoCode(fakes({ changed: [] }), world);
+    const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+    assert.strictEqual(res.state, "failed", `${expected} should refuse`);
+    assert.match(res.reason, /no committed change against main/, "the refusal is the one an unexplained empty diff already gets");
+    assert.match(res.reason, /The run declared a no-code outcome, but it does not check out/);
+    assert.match(res.reason, expected);
+    assert.strictEqual(seen.reviews.length, 0);
+    assert.strictEqual(seen.escalations.length, 1, "a person is still asked");
+    assert.strictEqual(seen.demotions.length, 1, "and the item is still demoted");
+    assert.ok(!seen.facts.some((f) => f.id.startsWith("art-gate-scoping-")), "no scoping fact for a claim that failed its check");
+  }
+});
+
+test("the route never fires on a NON-empty diff, however the run declares itself — the gates judge the code", async () => {
+  const factory = factoryOf(NO_CODE_FACTORY);
+  const { deps, seen } = withNoCode(fakes({ changed: ["lib/x.js"] }));
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.deepStrictEqual(seen.suites, ["acceptance"]);
+  assert.strictEqual(seen.reviews.length, 1);
+  assert.deepStrictEqual(seen.nodeReads, [], "not one graph read: the claim is never even consulted");
+});
+
+test("a run that declares NOTHING is judged exactly as before — the deps are present but never read", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-reviewer", cycles: 3 }] });
+  const { deps, seen } = withNoCode(fakes({ changed: [] }), { report: "Done — nothing to report.\n" });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.match(res.reason, /no committed change against main/);
+  assert.doesNotMatch(res.reason, /no-code outcome/, "a run that claimed nothing is not told its claim failed");
+  assert.deepStrictEqual(seen.nodeReads, []);
+});
+
+test("the loop tallies SCOPED, stamps it settled, and cools the item off — it may still be open under its new repo", async () => {
+  const stamps = [];
+  const { deps, control, state } = loopHarness({
+    queue: [{ id: "task-a" }],
+    gate: () => ({ state: "scoped", reason: "scoped: the run declared `rescoped` and it checks out" }),
+  });
+  deps.markGate = (runId, patch) => stamps.push({ runId, ...patch });
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, retryAfterMs: 600000, max: 1 }, deps, control });
+  assert.strictEqual(state.gateCalls.length, 1);
+  assert.strictEqual(status.gates.scoped, 1);
+  assert.strictEqual(status.gates.passed, 0);
+  assert.strictEqual(status.gates.failed, 0);
+  assert.strictEqual(status.recent[0].gate, "scoped");
+  assert.deepStrictEqual(stamps.map((s) => s.gate_state), ["running", "scoped"]);
+  assert.deepStrictEqual(
+    status.skipped.map((s) => s.id),
+    ["task-a"],
+    "unlike a superseded item, a scoped one may still be live — the worker walks on"
+  );
+  // Settled: a later worker never re-offers the run, and --regate refuses it.
+  assert.deepStrictEqual(
+    workLoop.orphanedGateRuns([{ worker_id: "w1", live: false, gates: { passed: 0, failed: 0, blocked: 0 }, gating: [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake" }], active: [] }], {
+      records: new Map([["run-orphan", { ...ORPHAN_RECORD, gate_state: "scoped" }]]),
+    }),
+    []
+  );
+});

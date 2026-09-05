@@ -105,3 +105,25 @@ test("both contracts carry the fixed DECLINED form the runner reads back, and sa
   const terminal = require("../lib/shell/dispatch-terminal.js");
   assert.deepStrictEqual(terminal.parseDecline("DECLINED: premise no longer holds\n\nexplanation"), { reason: "premise no longer holds" });
 });
+
+test("both contracts carry the fixed SCOPED form too, and the form they prescribe is the one the kernel parses", () => {
+  const gatesKernel = require("../lib/kernel/gates.js");
+  for (const text of [workerContract({ nodeId: "task-demo" }), workerContract({ nodeId: "task-demo", factory: factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "npm test" }] }) })]) {
+    assert.match(text, /outcome: rescoped \| premise-stale \| duplicate/);
+    assert.match(text, /FIRST line of your final message exactly\n`SCOPED: <outcome> <the node id you wrote> — <one-line reason>`/);
+    // It is a claim the runner CHECKS, not a bypass — the contract has to say
+    // so, or an implementer reads it as a way past the gates.
+    assert.match(text, /The runner CHECKS that claim against the/);
+    assert.match(text, /A claim that does not check\nout is refused exactly as an unexplained empty diff already is/);
+    // ...and it is not the decline: a decline claims nothing.
+    assert.match(text, /that is a\nreal outcome, not a decline/);
+  }
+  // The form the contract prescribes is the form the runner parses — the two
+  // are changed together or a correct scoping reads as a run that did nothing.
+  assert.deepStrictEqual(gatesKernel.parseNoCodeReport("SCOPED: rescoped art-scoping-x — the server half already shipped\n\nmore"), {
+    ok: true,
+    outcome: "rescoped",
+    resolver: "art-scoping-x",
+    reason: "the server half already shipped",
+  });
+});

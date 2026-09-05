@@ -418,8 +418,14 @@ standing context. <any additional free-text task instructions>
    commit-then-resolve discipline, plus the **durable-debt checklist** — the
    four failure modes of a retry/debt flag (§10.4), which a change that
    introduces or extends one is asked to design against up front and answer
-   row by row in its commit message. A person's one-off `spor dispatch` adds
-   nothing — they write their own instructions.
+   row by row in its commit message. It also carries the two **fixed forms**
+   for a first line of the final message, each read back in code, never from
+   prose: `DECLINED: <reason>` (§6 — the item itself is wrong, nothing was
+   done, route it to triage) and `SCOPED: <outcome> <node id> — <why>` (§10.11
+   — the item's real work turned out to be a graph write, so the empty diff is
+   the correct outcome and the runner verifies the claim before routing it).
+   A person's one-off `spor dispatch` adds nothing — they write their own
+   instructions.
 
 There is no wire-level requirement that a worker consume this exact string;
 what matters is that a conforming worker (a) is capable of reading a compiled
@@ -904,7 +910,7 @@ written only after the outcome dimension exists):
 
 | Field | Type | Meaning |
 |---|---|---|
-| `gate_state` | string | `"running"` \| `"interrupted"` \| `"passed"` \| `"failed"` \| `"blocked"` \| `"superseded"` — the last thing a gate pipeline said about this run. The three verdicts and `superseded` (an adopted pipeline whose item was already landed by hand, §10.8 — no gate ran) are SETTLED; `running`/`interrupted` mean a pipeline started and never reported, which is what a later worker resumes from (§10.8). Propose-mode integration adds `parked` (§10.9) |
+| `gate_state` | string | `"running"` \| `"interrupted"` \| `"passed"` \| `"failed"` \| `"blocked"` \| `"superseded"` \| `"scoped"` — the last thing a gate pipeline said about this run. The three verdicts, `superseded` (an adopted pipeline whose item was already landed by hand, §10.8 — no gate ran) and `scoped` (a verified no-code outcome, §10.11 — no gate ran) are SETTLED; `running`/`interrupted` mean a pipeline started and never reported, which is what a later worker resumes from (§10.8). Propose-mode integration adds `parked` (§10.9) |
 | `gate_worker` | string | the worker id that last touched it |
 | `gate_at` | ISO 8601 | when that stamp was written |
 | `gate_reason` | string | optional — the settled verdict's one-line reason |
@@ -916,8 +922,9 @@ written only after the outcome dimension exists):
 | `gate_restore_pending` | boolean | optional, propose mode only (§10.9) — `true` while the UNDO of a rollback is still owed: the demotion above landed against a proposal that had settled between the tracker read that licensed it and the write itself (the tracker closed, or the landed fact written, by another pass or a person), and the promotion that undoes it failed. The per-pass proposal check retries the promotion on this flag and writes it back `false` once it lands |
 
 A consumer reading `gate_state` as a verdict must check it is one of the
-settled values (`passed`/`failed`/`blocked`/`superseded`, or `parked` under
-propose mode — `SETTLED_GATE_STATES` in `lib/kernel/gates.js` is the list):
+settled values (`passed`/`failed`/`blocked`/`superseded`/`scoped`, or `parked`
+under propose mode — `SETTLED_GATE_STATES` in `lib/kernel/gates.js` is the
+list):
 `running` under a worker that is gone is a claim nobody finished judging, not a
 pass.
 
@@ -1085,6 +1092,11 @@ the pool carrying its report) and a `failed` run produced nothing to gate. A
 `declined` run (§6) is never gated, enforced or not: it declared the item wrong
 and its route is triage — the finding it filed re-briefs the item, and its
 readiness stamp is gone, so it does not come straight back to a worker either.
+
+A gated run whose diff is EMPTY may still be a correct outcome — the item's
+real work was scoping, not code. That is not a fourth gated outcome but a
+ROUTE inside the pipeline, taken only when the run declared it and the runner
+verified the declaration against the graph: §10.11.
 
 A gated item **keeps its worker slot** until the pipeline settles — a slot frees
 on a settled outcome, and a gate verdict is part of that outcome. Its node is
@@ -2297,4 +2309,99 @@ the rescue was about to spare. The run record and `spor work --status` carry
 
 A factory without a `rescue:` block behaves byte-identically to before the
 lane existed. See test/gate-pipeline.test.js ("the rescue lane") and
+test/gates.test.js.
+
+### 10.11 No-code outcomes — a scoping result the pipeline routes, not refuses
+
+A run that reads the ground and finds its item's premise stale legitimately
+ends with an **empty diff**. The first live case (2026-09-02,
+`task-spor-queue-api-offset-paging`, run `0b1b5dd2`) did exactly the work the
+item needed: it found the server half already shipped, recorded that as an
+artifact, re-stamped the task to the client repo with the remainder as its
+scope, and committed nothing. The review gate cannot tell that from a run that
+did nothing, so it failed closed on the empty diff (§10.4,
+issue-spor-review-gate-empty-diff-vacuous-pass) and paged a person, who agreed
+with the run (art-res-gate-escalation-offset-paging-scoping-accepted). That
+refusal was right in the absence of any other signal. What was missing was the
+signal.
+
+So a run may **declare** a no-code outcome, and the runner **checks** the
+declaration against the graph — never takes it
+(dec-spor-gates-enforced-in-code-factory-is-data). The declaration has two
+halves and needs both:
+
+- **A node**, an `artifact`, carrying `outcome: rescoped | premise-stale |
+  duplicate` in its frontmatter, a `resolves`/`relates-to`/`answers`/
+  `derived-from` edge to the work item, and — for `premise-stale` and
+  `duplicate` — a `derived-from`/`supersedes` edge to the node that makes the
+  item stale. This is the durable half a person reads later.
+- **The fixed line** the worker contract prescribes, FIRST in the run's final
+  message: `SCOPED: <outcome> <the node id> — <one-line reason>`. This is what
+  binds the claim to THIS RUN. A node alone could not: a scoping artifact an
+  earlier run left on the item would then launder a later run that did nothing
+  into the same route. It is also the only way to FIND the node in remote mode
+  — `GET /v1/nodes/{id}` carries `resolution` and `superseded_by`, never a
+  general inbound-edge list, so the runner cannot go looking for a declaring
+  node it was not handed.
+
+`SCOPED:` and `DECLINED:` (§6) are mutually exclusive by construction (one
+first line) and by meaning. A decline says *the item is wrong*: nothing was
+done, nothing is claimed, and its route is triage. A scoping result says *the
+item's real work is done and it was a graph write*: it claims completion, and
+it has to show for it.
+
+**What the runner verifies**, before any gate runs and before the dirty-tree
+round-trip (`verifyNoCodeOutcome` in `lib/kernel/gates.js`, routed by
+`gate-runner.js`):
+
+1. the change under judgement read cleanly and is **empty** — no committed
+   diff against the trusted ref, and no uncommitted changes to tracked files
+   (a dirty tree fails the read, so it never reaches here);
+2. the run's final report carries the fixed line, and its outcome word is one
+   of the three;
+3. the node it names is readable, declares the **same** `outcome:`, and
+   carries an edge to the work item;
+4. the item **moved** — either its `repo:` now differs from the repo this
+   pipeline claimed it under (a re-stamp), or it reads retired (a live
+   resolving edge, a terminal status, a supersession);
+5. and for `premise-stale`/`duplicate`, the node **names what it found**.
+
+Check 4 is what keeps the route run-relative: a re-stamp cannot satisfy it
+twice, because the next pipeline claims the item under the repo the first one
+moved it to.
+
+**If it checks out**, the pipeline settles **`scoped`**: an idempotent
+`art-gate-scoping-…` fact is recorded with verdict `scoped` (`relates-to` the
+item, like every gate fact — a gate records, it does not retire), **no code
+gate runs**, **no integration stage runs** (`runGateAndIntegration` follows a
+`passed` state only), no escalation is filed and nothing is demoted. The item
+is left exactly where the scoping put it: open under the repo that now owns it,
+or retired. The verdict is deliberately **not** `passed` — no gate ran and
+nothing was reviewed, and the telemetry has to be able to tell the two apart.
+It IS settled (`SETTLED_GATE_STATES`), so it is final for the run: a later
+worker never re-offers it, and `spor work --regate` refuses a run that already
+read `scoped`, like a pass. The other direction is open — a run REFUSED on its
+empty diff can be re-gated once the graph says what it should have said, and a
+re-judgement that settles `scoped` closes the escalation and restores anything
+the refusal demoted, exactly as a pass does (§10.7); the `art-regate-…` node it
+writes says a scoping result, not "passed every gate", because none ran.
+
+Unlike `superseded` (§10.8), a `scoped` item **cools off** for
+`work.retryAfterMs`: it may still be open under its new repo, and this worker
+has just spent a run establishing there is nothing here to do, so it walks on
+down the queue rather than re-dispatching what it has just scoped.
+
+**If it does not check out** — no node, the wrong `outcome:`, no edge to the
+item, an item that did not move — the pipeline falls straight through to the
+empty-diff refusal it would have got anyway, and that refusal now carries the
+run's own account plus the check that broke it, so the escalation says why. A
+declaration can therefore only ever REMOVE a wrong escalation; it can never
+manufacture a pass.
+
+Telemetry: `spor work --status` and the loop's closing summary count `scoped`
+alongside `passed`/`failed`/`blocked`, and the facts are
+`spor query --type artifact --id-prefix art-gate-scoping- --summary`.
+
+A run that declares nothing behaves byte-identically to before this route
+existed. See test/gate-pipeline.test.js ("no-code outcomes") and
 test/gates.test.js.

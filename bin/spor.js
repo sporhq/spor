@@ -7170,6 +7170,11 @@ async function resolveNode(cfg, id) {
   let resolution = null;
   let held = null;
   let inert = null;
+  // `superseded_by` is the same hook's supersession note — a live visible
+  // inbound supersedes edge (API.md §3). The no-code-outcome check reads it as
+  // one of the three ways an item can read RETIRED (WORKERS.md §10.11), so a
+  // node superseded by an edge without a status flip still counts.
+  let supersededBy = null;
   if (cfg.mode() === "remote") {
     const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 6000 });
     if (!r.ok) return null;
@@ -7177,6 +7182,7 @@ async function resolveNode(cfg, id) {
     resolution = (r.json && r.json.resolution) || null;
     held = (r.json && r.json.held) || null;
     inert = (r.json && typeof r.json.inert === "boolean") ? r.json.inert : null;
+    supersededBy = (r.json && (r.json.superseded_by || r.json.supersededBy)) || null;
   } else {
     try {
       raw = fs.readFileSync(path.join(cfg.nodesDir(), `${id}.md`), "utf8");
@@ -7206,6 +7212,13 @@ async function resolveNode(cfg, id) {
     type: parsed.type || "",
     status: parsed.status || "",
     date: parsed.date || "",
+    // The whole parsed frontmatter and the node's own out-edges, for callers
+    // that read a key this shape does not name (the no-code-outcome check
+    // reads `outcome:` and the resolver's edges, WORKERS.md §10.11). Additive:
+    // every existing caller reads the named fields above.
+    frontmatter: parsed,
+    edges: Array.isArray(parsed.edges) ? parsed.edges : [],
+    superseded_by: supersededBy && typeof supersededBy === "object" ? supersededBy.id || null : supersededBy || null,
     resolution,
     held,
     inert,
@@ -10610,7 +10623,9 @@ function cmdWorkStatus(cfg, { json }) {
       out(
         `  gates:    ${w.factory || "(factory)"}${(w.repos || []).length ? ` [judges ${w.repos.join(", ")}]` : ""} — passed ${w.gates.passed || 0}, failed ${
           w.gates.failed || 0
-        }, blocked ${w.gates.blocked || 0}${w.gates.parked ? `, parked ${w.gates.parked}` : ""}${w.gates.superseded ? `, superseded ${w.gates.superseded}` : ""}`
+        }, blocked ${w.gates.blocked || 0}${w.gates.scoped ? `, scoped ${w.gates.scoped}` : ""}${w.gates.parked ? `, parked ${w.gates.parked}` : ""}${
+          w.gates.superseded ? `, superseded ${w.gates.superseded}` : ""
+        }`
       );
     for (const a of w.active || []) out(`  active:   ${a.node_id || "(free-text)"}  run ${String(a.run_id).slice(0, 8)}  ${a.harness || ""}  since ${a.started_at}`);
     for (const g of w.gating || []) {
@@ -12204,6 +12219,34 @@ function makeGateDeps(
     // already on the trusted ref. Consulted only for an adopted pipeline.
     resolved: async () => verifyRunResolution(cfg, record),
     landed: async ({ trustedRef }) => gateRunner.gateHeadLanded(record, trustedRef),
+    // The two reads behind a SCOPED verdict (WORKERS.md §10.11): the run's own
+    // fixed-form claim, off its FINAL report only — the claim is "the first
+    // line of my final message", so an earlier message on the stream is not
+    // one (unlike a rescue's diagnosis, which the stream may legitimately
+    // carry) — and any node by id, so the runner can check what the claim
+    // names against the graph in either mode.
+    noCodeClaim: () => gatesKernel.parseNoCodeReport(gateRunReportText(record)),
+    node: async ({ id }) => {
+      let node = null;
+      try {
+        node = await resolveNode(cfg, id);
+      } catch (e) {
+        return { ok: false, reason: `${id} could not be read: ${(e && e.message) || e}` };
+      }
+      if (!node) return { ok: false, reason: `${id} could not be read from the graph` };
+      return {
+        ok: true,
+        node: {
+          id: node.id,
+          type: node.type || "",
+          status: node.status || "",
+          repo: node.repo || null,
+          outcome: (node.frontmatter && node.frontmatter.outcome) || null,
+          edges: node.edges || [],
+          superseded_by: node.superseded_by || null,
+        },
+      };
+    },
     // The judged tree is prepared ONCE per gate and handed back as a suite
     // handle: `run(attempt)` executes the declared command on it, `close()`
     // tears it down. The gate runner's rerun loop (WORKERS.md §10.3
@@ -13298,7 +13341,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     );
     return 1;
   }
-  if (record.gate_state === "passed" || record.gate_state === "parked" || record.gate_state === "superseded") {
+  if (record.gate_state === "passed" || record.gate_state === "parked" || record.gate_state === "superseded" || record.gate_state === "scoped") {
     err(`spor work --regate: run ${shortId} already read '${record.gate_state}'${record.gate_reason ? ` (${record.gate_reason})` : ""} — there is nothing to re-judge.`);
     return 1;
   }
@@ -13369,7 +13412,12 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     // to checkProposals (§10.9); the same flag the loop stamps.
     ...(state === "parked" && res && res.escalated_to && res.demote_reason ? { gate_demote_pending: true } : {}),
   });
-  if (state !== "passed") {
+  // A SCOPED re-judgement is settled and is not a refusal (WORKERS.md §10.11):
+  // the run's no-code outcome checks out now, so the earlier refusal's graph
+  // state is undone exactly as a pass undoes it — its escalation is answered
+  // and any completion status it rolled back comes back. Only the closing line
+  // differs, because no gate ran.
+  if (state !== "passed" && state !== "scoped") {
     out(`work: re-gate of ${record.node_id} ${state}${reason ? ` — ${reason}` : ""}${res && res.escalated_to ? ` (escalated to ${res.escalated_to})` : ""}`);
     return 1;
   }
@@ -13377,14 +13425,14 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // a record of this pass, and the completion status it rolled back comes back.
   const notes = [];
   if (escalatedBefore.length) {
-    const closed = await writeRegateArtifact(cfg, { record, entry, factoryId, previous, reason, escalatedTo: escalatedBefore, project });
+    const closed = await writeRegateArtifact(cfg, { record, entry, factoryId, previous, reason, escalatedTo: escalatedBefore, project, state });
     notes.push(closed.ok ? `closed ${escalatedBefore.join(", ")} with ${closed.id}` : `could not close ${escalatedBefore.join(", ")} (${closed.reason}) — resolve by hand`);
   }
   if (record.gate_demoted) {
     const promoted = await gatePromoteItem(cfg, record.node_id);
     notes.push(promoted.ok ? promoted.note : `could not restore ${record.node_id}'s status (${promoted.reason})`);
   }
-  out(`work: re-gate of ${record.node_id} passed — ${reason || "every gate passed"}${notes.length ? `; ${notes.join("; ")}` : ""}`);
+  out(`work: re-gate of ${record.node_id} ${state} — ${reason || (state === "scoped" ? "a verified no-code outcome" : "every gate passed")}${notes.length ? `; ${notes.join("; ")}` : ""}`);
   return 0;
 }
 
@@ -13413,7 +13461,14 @@ function refreshBranchFromTrustedRef(cwd, trustedRef) {
 // The resolving record a passing re-gate writes onto the escalation the
 // refused attempt filed — an artifact, through the same validated door as
 // every other gate node, idempotent by id.
-async function writeRegateArtifact(cfg, { record, entry, factoryId, previous, reason, escalatedTo, project }) {
+// `state` is the re-judgement's own verdict — `passed`, or `scoped` where the
+// run's no-code outcome checked out this time (WORKERS.md §10.11). Both close
+// the escalation the earlier refusal filed; they differ in what they claim was
+// judged, and this node is what a person reads later, so it must not say
+// "passed every gate" about a pass where no gate ran.
+async function writeRegateArtifact(cfg, { record, entry, factoryId, previous, reason, escalatedTo, project, state = "passed" }) {
+  const scoped = state === "scoped";
+  const verdict = scoped ? "a verified no-code outcome" : "every gate passed";
   const stem = gateStem(entry.node_id);
   const short = gateRunner.shortRunAttempt(entry.run_id, entry.attempt);
   const id = `art-regate-${stem}-${short}-${gateIdSuffix("regate", factoryId || "factory", entry.node_id, gateRunner.gateRunKey(entry.run_id, entry.attempt))}`.toLowerCase();
@@ -13426,8 +13481,8 @@ async function writeRegateArtifact(cfg, { record, entry, factoryId, previous, re
     `id: ${id}`,
     "type: artifact",
     ...(project ? [`project: ${project}`] : []),
-    `title: Re-gate passed — ${flat(entry.node_id, 60)} (attempt ${entry.attempt})`,
-    `summary: ${flat(`Run ${String(entry.run_id).slice(0, 8)} on ${entry.node_id} was re-judged under ${factoryId} after its earlier refusal (${previous}) and passed every gate: ${reason || "every gate passed"}. This closes the ${escalatedTo.length === 1 ? "escalation" : `${escalatedTo.length} escalations`} the refusals filed.`, 460)}`,
+    `title: Re-gate ${state} — ${flat(entry.node_id, 60)} (attempt ${entry.attempt})`,
+    `summary: ${flat(`Run ${String(entry.run_id).slice(0, 8)} on ${entry.node_id} was re-judged under ${factoryId} after its earlier refusal (${previous}) and settled ${scoped ? "as a scoping result — no gate ran" : "passed, every gate clean"}: ${reason || verdict}. This closes the ${escalatedTo.length === 1 ? "escalation" : `${escalatedTo.length} escalations`} the refusals filed.`, 460)}`,
     `date: ${new Date().toISOString().slice(0, 10)}`,
     "edges:",
     ...escalatedTo.map((id) => `  - {type: resolves, to: ${id}}`),
@@ -13437,10 +13492,11 @@ async function writeRegateArtifact(cfg, { record, entry, factoryId, previous, re
     `\`spor work --regate ${entry.run_id}\` re-ran factory \`${factoryId}\`'s gates on the same run — the same committed`,
     `work, judged again after the cause of the earlier refusal was fixed outside the item. Previous verdict: ${flat(previous, 300)}.`,
     "",
-    `Outcome: ${flat(reason || "every gate passed", 300)}`,
+    `Outcome: ${flat(reason || verdict, 300)}`,
     "",
-    "This is a gate outcome, not a resolution of the work item: the item's own resolver already stands, and the",
-    "escalation this resolves was the refusal's blocker, now answered.",
+    scoped
+      ? "This is a gate outcome, not a resolution of the work item: the run's no-code outcome was verified against the graph and\nthe item is left where the scoping put it. The escalation this resolves was the refusal's blocker, now answered."
+      : "This is a gate outcome, not a resolution of the work item: the item's own resolver already stands, and the\nescalation this resolves was the refusal's blocker, now answered.",
     "",
   ];
   const written = await writeGateNode(cfg, id, gateCapBytes(lines.join("\n"), NODE_BODY_CAP_BYTES - 512));
@@ -14139,8 +14195,8 @@ async function cmdWork(cfg, { values }) {
   if (final.gates) {
     out(
       `work: gates — passed ${final.gates.passed}, failed ${final.gates.failed}, blocked ${final.gates.blocked}${
-        final.gates.parked ? `, parked ${final.gates.parked}` : ""
-      }${final.gates.superseded ? `, superseded ${final.gates.superseded}` : ""} (factory ${factoryId}).`
+        final.gates.scoped ? `, scoped ${final.gates.scoped}` : ""
+      }${final.gates.parked ? `, parked ${final.gates.parked}` : ""}${final.gates.superseded ? `, superseded ${final.gates.superseded}` : ""} (factory ${factoryId}).`
     );
   }
   if (final.active.length) out(`work: ${final.active.length} run(s) still in flight — 'spor runs' follows them to their terminal state.`);

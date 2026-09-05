@@ -19,6 +19,7 @@ becomes decoration.
 ```bash
 spor query --type artifact --id-prefix art-gate- --summary       # every gate outcome
 spor query --type artifact --id-prefix art-gate-review --summary # one gate's history
+spor query --type artifact --id-prefix art-gate-scoping- --summary # runs routed as a no-code outcome
 spor query --type artifact --id-prefix art-merge- --summary      # every integration landing/failure
 spor get art-gate-<...>                                          # the verdict + evidence
 spor get art-merge-<...>                                         # a landing's conflict/suite evidence
@@ -52,6 +53,16 @@ Two more surfaces worth reading before concluding anything:
   proposing your own. An escalation that followed a failed rescue opens with
   the diagnosis, so the category tally across a week's escalations is the
   fastest read of what the factory keeps getting wrong.
+- the **no-code outcomes** — runs whose real work was scoping, not code
+  (WORKERS.md §10.11). Those settle `scoped`, not `passed`: no gate ran, the
+  item was re-stamped or retired, and `art-gate-scoping-…` records the claim
+  the runner verified. `spor work --status` counts them beside
+  passed/failed/blocked. Read them before concluding a factory is being
+  bypassed — a rising `scoped` count is a QUEUE signal (items whose premise
+  went stale before a worker reached them), not a gate one, and the fix is
+  triage upstream, not a stricter gate. What it must never be is a way past a
+  gate: a claim that does not check out is refused exactly as a bare empty
+  diff is, so a `scoped` fact is evidence the check held.
 - the **rolled-back items** — a refused claim has its completion status rolled
   back to `open` while its resolving edge stands, which `spor get` flags with a
   ⚠. An item in that state is a refusal nobody has adjudicated yet.
