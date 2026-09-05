@@ -13249,45 +13249,89 @@ function integrationLeaseKey(top) {
   return crypto.createHash("sha256").update(path.resolve(anchor || "")).digest("hex").slice(0, 16);
 }
 
-async function acquireLocalIntegrationLease(home, top, { sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
+// Reclaim is judged-then-acted the same way acquireLocalDispatchLock's is
+// (dec-spor-local-dispatch-lock-breaker-serialized-reclaim): a plain
+// rm-then-`wx` here has the identical TOCTOU that fix closed — two racers can
+// both read the same stale content, and a `rename`/`rm` alone doesn't check
+// WHAT it evicts, so the second racer can tear down the first's brand-new
+// live lock. Judging staleness and reclaiming it is therefore serialized
+// behind the SAME breaker lock primitive (acquireBreakerLock/
+// releaseBreakerLock, keyed off this file's own path via breakerLockFile) —
+// unlike the dispatch lock, a busy-but-live holder here is worth WAITING out
+// (INTEGRATION_LEASE_WAIT_MS), not refusing immediately, so this loop keeps
+// polling rather than returning on the first non-stale read.
+async function acquireLocalIntegrationLease(
+  home,
+  top,
+  { sleep = (ms) => new Promise((r) => setTimeout(r, ms)), waitMs = INTEGRATION_LEASE_WAIT_MS, pollMs = INTEGRATION_LEASE_POLL_MS } = {}
+) {
   const dir = path.join(home, "journal", "integration-lease");
   const file = path.join(dir, `${integrationLeaseKey(top)}.lock`);
-  const deadline = Date.now() + INTEGRATION_LEASE_WAIT_MS;
+  const deadline = Date.now() + waitMs;
   for (;;) {
     try {
       fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(file, JSON.stringify({ pid: process.pid, started_ticks: dispatchRuns.processStartTicks(process.pid), at: new Date().toISOString() }), { flag: "wx" });
-      return { kind: "lockfile", file };
+      const payload = writeLocalDispatchLock(file);
+      return { kind: "lockfile", file, payload };
     } catch (e) {
       if (e.code !== "EEXIST") return null; // an unwritable journal is not worth blocking integration over
     }
-    let stale = false;
-    try {
-      const held = JSON.parse(fs.readFileSync(file, "utf8"));
-      const age = Date.now() - (Date.parse(held.at || "") || 0);
-      stale = age > INTEGRATION_LEASE_STALE_MS || !workerAlive(held.pid, held.started_ticks);
-    } catch {
-      stale = true; // an unreadable lock file cannot be honored as a live one
-    }
-    if (stale) {
+    // Held — judge staleness and (if warranted) reclaim under the breaker
+    // lock, so no other contender for THIS file can be mid-judgment at once.
+    const breaker = acquireBreakerLock(breakerLockFile(file));
+    if (breaker) {
       try {
-        fs.rmSync(file, { force: true });
-      } catch {
-        /* a concurrent racer may have already cleared it */
+        let stale = false;
+        try {
+          const raw = readLockRaw(file);
+          const held = raw ? JSON.parse(raw) : null;
+          stale = !held || Date.now() - (Date.parse(held.at || "") || 0) > INTEGRATION_LEASE_STALE_MS || !workerAlive(held.pid, held.started_ticks);
+        } catch {
+          stale = true; // an unreadable lock file cannot be honored as a live one
+        }
+        if (stale) {
+          try {
+            fs.rmSync(file, { force: true });
+            const payload = writeLocalDispatchLock(file);
+            return { kind: "lockfile", file, payload };
+          } catch (e) {
+            // EEXIST here means an unrelated fresh acquire (not going through
+            // this reclaim path at all) won the now-clear path first — fall
+            // through to the wait below, same as the top-level attempt. Any
+            // OTHER error (EACCES/ENOSPC/…) is the same "unwritable journal"
+            // case the top-level attempt fails open on, not a race — honor
+            // the same contract here instead of busy-polling for the full
+            // wait bound over a lease that will never become writable.
+            if (e.code !== "EEXIST") return null;
+          }
+        }
+      } finally {
+        releaseBreakerLock(breaker);
       }
-      continue;
     }
+    // Busy (live, or the breaker itself was contended/unavailable this pass):
+    // wait out the bound, unlike the dispatch lock's immediate refusal — this
+    // lease is worth waiting for.
     if (Date.now() >= deadline) return null;
-    await sleep(INTEGRATION_LEASE_POLL_MS);
+    await sleep(pollMs);
   }
 }
 
+// Ownership-checked, exactly like releaseLocalDispatchLock: a lock this call
+// once won can be evicted out from under it by the staleness ceiling (a
+// holder judged dead/aged-out, whether or not it actually still is, just
+// slow) — a bare `rm` here would then delete the NEW holder's live lock, not
+// this process's own long-gone one. Only a payload match is ours to remove.
 function releaseLocalIntegrationLease(token) {
-  if (!token || token.kind !== "lockfile") return;
+  if (!token || token.kind !== "lockfile" || !token.file || !token.payload) return;
   try {
-    fs.rmSync(token.file, { force: true });
+    const raw = readLockRaw(token.file);
+    const held = raw ? JSON.parse(raw) : null;
+    if (held && held.pid === token.payload.pid && held.started_ticks === token.payload.started_ticks && held.at === token.payload.at) {
+      fs.rmSync(token.file, { force: true });
+    }
   } catch {
-    /* it lapses on its own next stale check */
+    /* unreadable/gone: nothing of ours left to remove, or it lapses on its own next stale check */
   }
 }
 

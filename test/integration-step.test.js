@@ -2355,3 +2355,180 @@ test("the integration fix-cycle prompt names the refusal and ends with the one-t
   assert.match(p, /Fix the cause in this checkout and commit\./);
   assert.ok(p.endsWith(ONE_TURN_NOTICE), "the integration fix prompt ends with the one-turn notice");
 });
+
+// ---------------------- acquireLocalIntegrationLease / releaseLocalIntegrationLease --
+// issue-spor-integration-lease-reclaim-toctou: this lease's local-mode reclaim
+// had the exact pre-fix shape dec-spor-local-dispatch-lock-breaker-serialized-
+// reclaim closed for the dispatch lock — a plain rm-then-`wx` judge-then-act
+// sequence (two racers can both read the same stale content and one can tear
+// down the other's brand-new live lock), and an unconditional release (which
+// can delete a lock that was reclaimed out from under it). Both are now the
+// SAME breaker-lock-serialized-reclaim / ownership-checked-release primitive
+// acquireLocalDispatchLock uses; this section is that primitive's own test
+// coverage, applied to this call site.
+{
+  const sporCli = require("../bin/spor.js");
+  const { spawn } = require("node:child_process");
+
+  test("acquireLocalIntegrationLease: a second acquire for the same repo is refused while the first is live-held", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-"));
+    const top = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-top-"));
+    const first = await sporCli.acquireLocalIntegrationLease(home, top);
+    assert.ok(first && first.kind === "lockfile" && fs.existsSync(first.file));
+    // A short wait bound (this process itself is alive, so the lock is never
+    // judged stale) — proves the busy branch actually refuses rather than
+    // waiting out the real 20s production default.
+    const second = await sporCli.acquireLocalIntegrationLease(home, top, { waitMs: 50, pollMs: 5 });
+    assert.strictEqual(second, null, "a live holder is waited out, then refused — not reclaimed");
+    sporCli.releaseLocalIntegrationLease(first);
+    assert.ok(!fs.existsSync(first.file), "release removes the lockfile");
+  });
+
+  test("acquireLocalIntegrationLease: releasing frees the repo for a later acquire", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-"));
+    const top = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-top-"));
+    const first = await sporCli.acquireLocalIntegrationLease(home, top);
+    assert.ok(first);
+    sporCli.releaseLocalIntegrationLease(first);
+    const second = await sporCli.acquireLocalIntegrationLease(home, top);
+    assert.ok(second, "a released lease can be re-acquired");
+    sporCli.releaseLocalIntegrationLease(second);
+  });
+
+  test("releaseLocalIntegrationLease: does not delete a lock that was reclaimed out from under it", async () => {
+    // A lease this call once won can be evicted later by the staleness
+    // ceiling (a holder judged dead/aged-out, whether or not it actually
+    // still is, just slow) — release must not blindly remove whatever now
+    // sits at the path, or it deletes the NEW holder's live lease instead of
+    // this process's own long-gone one.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-"));
+    const top = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-top-"));
+    const first = await sporCli.acquireLocalIntegrationLease(home, top);
+    assert.ok(first);
+    // Simulate a reclaim: someone else's fresh lease now occupies the same path.
+    fs.rmSync(first.file, { force: true });
+    fs.writeFileSync(first.file, JSON.stringify({ pid: 999999, started_ticks: null, at: new Date().toISOString() }));
+    sporCli.releaseLocalIntegrationLease(first);
+    assert.ok(fs.existsSync(first.file), "release must leave the new holder's lease alone — it is not ours to remove");
+  });
+
+  test("acquireLocalIntegrationLease: a stale lease (holder pid gone) self-heals and is reclaimed", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-"));
+    const top = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-top-"));
+    const file = path.join(home, "journal", "integration-lease", `${sporCli.integrationLeaseKey(top)}.lock`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    // A pid that (almost certainly) is not alive, with no started_ticks — the
+    // same "no stamp: the pid probe is all there is" fallback workerAlive uses.
+    fs.writeFileSync(file, JSON.stringify({ pid: 999999, started_ticks: null, at: new Date().toISOString() }));
+    const acquired = await sporCli.acquireLocalIntegrationLease(home, top);
+    assert.ok(acquired, "a lease held by a dead pid does not block integration forever");
+    sporCli.releaseLocalIntegrationLease(acquired);
+  });
+
+  test("acquireLocalIntegrationLease: an unreadable lock file cannot be honored as live — reclaimed", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-"));
+    const top = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-top-"));
+    const file = path.join(home, "journal", "integration-lease", `${sporCli.integrationLeaseKey(top)}.lock`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "not json at all");
+    const acquired = await sporCli.acquireLocalIntegrationLease(home, top);
+    assert.ok(acquired);
+    sporCli.releaseLocalIntegrationLease(acquired);
+  });
+
+  test("acquireLocalIntegrationLease: an unwritable journal fails open (nothing to release)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-"));
+    const top = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-top-"));
+    const journalDir = path.join(home, "journal");
+    fs.mkdirSync(journalDir, { recursive: true });
+    // Read+execute only, no write — mkdirSync under it (the integration-lease
+    // subdir) fails EACCES.
+    fs.chmodSync(journalDir, 0o500);
+    try {
+      const acquired = await sporCli.acquireLocalIntegrationLease(home, top);
+      assert.strictEqual(acquired, null, "an unwritable lease dir must not block integration — fails open with nothing to release");
+      sporCli.releaseLocalIntegrationLease(acquired); // a no-op; must not throw
+    } finally {
+      fs.chmodSync(journalDir, 0o700); // restore so the temp-dir cleanup can remove it
+    }
+  });
+
+  test("acquireLocalIntegrationLease: a genuine (non-EEXIST) failure reclaiming a stale lease fails open immediately, not after the wait bound", async () => {
+    // Judging staleness and reclaiming both run under the breaker lock, so
+    // getting HERE means judge-as-stale already succeeded and reclaim's own
+    // rm+recreate is the thing that fails. A directory sitting at the lock
+    // path (instead of the lockfile itself) reproduces exactly that: reading
+    // it throws (unreadable -> judged stale), and rmSync on a directory
+    // throws ERR_FS_EISDIR regardless of `force` — a genuine, non-EEXIST
+    // failure distinct from "an unrelated fresh acquirer already recreated
+    // it" (EEXIST). This must fail open right away, same as the top-level
+    // attempt's own unwritable-journal case, rather than busy-polling out
+    // the full wait bound over a lease that will never become writable.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-"));
+    const top = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-top-"));
+    const dir = path.join(home, "journal", "integration-lease");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${sporCli.integrationLeaseKey(top)}.lock`);
+    fs.mkdirSync(file); // occupies the lock path with a directory, not a lockfile
+    const start = Date.now();
+    const acquired = await sporCli.acquireLocalIntegrationLease(home, top, { waitMs: 5000, pollMs: 50 });
+    const elapsed = Date.now() - start;
+    assert.strictEqual(acquired, null, "a genuine reclaim failure must not be treated as integration-worth-waiting-for contention");
+    assert.ok(elapsed < 2000, `must fail open immediately, not busy-poll out the wait bound (took ${elapsed}ms)`);
+  });
+
+  // The unit tests above prove the FUNCTION's logic; this proves the
+  // PRIMITIVE holds under real cross-process contention over a genuinely
+  // stale lease — two independent OS processes that both read the same
+  // stale content and both attempt to reclaim it. Judging staleness and
+  // reclaiming are serialized under the shared breaker lock
+  // (acquireBreakerLock) so two racers can never both decide the SAME stale
+  // content is theirs to act on; a `rename`/`rm`-only eviction alone would
+  // not be enough, since it doesn't check WHAT it evicts. Seed the stale
+  // lease BEFORE either racer starts so both are guaranteed to take the
+  // reclaim branch, then confirm only one of them ends up owning it.
+  function raceLeaseScript(home, top, outFile) {
+    return `
+const fs = require("node:fs");
+const cli = require(${JSON.stringify(CLI)});
+// A short wait bound: the LOSING racer falls through to the ordinary busy-
+// wait loop (the winner's freshly-written lease is live, not stale), and this
+// test only cares that reclaim itself is exclusive — not about proving out
+// the full 20s production wait bound.
+cli.acquireLocalIntegrationLease(${JSON.stringify(home)}, ${JSON.stringify(top)}, { waitMs: 500, pollMs: 20 }).then((result) => {
+  fs.writeFileSync(${JSON.stringify(outFile)}, JSON.stringify({ ok: !!result, pid: process.pid }));
+  // A winner stays alive for a while instead of exiting the instant it
+  // acquires, so a losing racer's own staleness check (which pays the cost of
+  // re-requiring this whole CLI module) can't misread a real race as an
+  // abandoned lease and reclaim it too — a test artifact, not the hazard
+  // this fix closes.
+  if (result) setTimeout(() => process.exit(0), 4000);
+  else process.exit(0);
+});
+`;
+  }
+
+  test("acquireLocalIntegrationLease: exactly one of two REAL concurrent processes wins RECLAIMING an already-stale lease", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-reclaim-race-"));
+    const top = fs.mkdtempSync(path.join(os.tmpdir(), "spor-int-lease-reclaim-race-top-"));
+    const lockFile = path.join(home, "journal", "integration-lease", `${sporCli.integrationLeaseKey(top)}.lock`);
+    fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+    fs.writeFileSync(lockFile, JSON.stringify({ pid: 999999, started_ticks: null, at: new Date(0).toISOString() }));
+    const outA = path.join(home, "a.result.json");
+    const outB = path.join(home, "b.result.json");
+    const scriptA = path.join(home, "a.js");
+    const scriptB = path.join(home, "b.js");
+    fs.writeFileSync(scriptA, raceLeaseScript(home, top, outA));
+    fs.writeFileSync(scriptB, raceLeaseScript(home, top, outB));
+    await Promise.all([
+      new Promise((resolve) => spawn(process.execPath, [scriptA]).on("close", resolve)),
+      new Promise((resolve) => spawn(process.execPath, [scriptB]).on("close", resolve)),
+    ]);
+    const a = JSON.parse(fs.readFileSync(outA, "utf8"));
+    const b = JSON.parse(fs.readFileSync(outB, "utf8"));
+    const winners = [a, b].filter((r) => r.ok);
+    const losers = [a, b].filter((r) => !r.ok);
+    assert.strictEqual(winners.length, 1, "exactly one real process reclaims the stale lease");
+    assert.strictEqual(losers.length, 1, "exactly one real process is refused, not both");
+  });
+}
