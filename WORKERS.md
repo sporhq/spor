@@ -853,6 +853,7 @@ violation — new fields may be added additively.
 | `state` | string | `"launching"` → `"running"` → one of the **terminal** process states: `"done"`, `"failed"`, `"failed_launch"`, `"vanished"` |
 | `cwd` | string | the run's working directory |
 | `item_repo` | string \| null | optional, supervised node-mode runs only — the target ITEM's own `repo:`/`project:` stamp **as claimed**, recorded at launch. It is the "before" value the no-code-outcome re-stamp check compares against (§10.11), so it must not be re-read from the item later, and it is deliberately not the dispatch's launch target (which `--slug` overrides for a cross-repo dispatch). Absent on a record predating it, on a free-text dispatch, and on a node carrying no stamp |
+| `item_commits` | string[] | optional, supervised node-mode runs only — the target ITEM's own `commits:` stamps **as claimed**, recorded at launch. The stale-premise check (§10.11) reads only this, never the item's current `commits:` — `commits:` is an ordinary editable field, and re-reading it live would let a run with graph-write access append its own already-landed sha to its own item and manufacture the "predates the run" evidence the check exists to require. Absent (read as no stamps to check) on a record predating it, on a free-text dispatch, and on a node carrying none |
 | `model` | string \| null | **native-background records only** — the model override this launch resolved (`--model`, else the profile's), `null` when none did; the key is always present on a native record. A supervised record does not carry the field at all — its model is fixed into the harness argv at launch |
 | `created_at` | ISO 8601 | when the record was opened |
 | `started_at` | ISO 8601 | supervised runs only — when the child process actually started |
@@ -2551,7 +2552,13 @@ the declared `SCOPED:` claim above (`verifyStalePremise` in
 `lib/shell/gate-runner.js`):
 
 1. the change under judgement is empty, exactly as above;
-2. the item's own `commits:` stamps — read fresh off the graph, filtered to
+2. the item's own `commits:` stamps **as claimed** — `item_commits` on the
+   run record, a snapshot taken at launch, never a live re-read of the
+   item's current `commits:` (that is an ordinary editable field, and a run
+   with graph-write access could otherwise append its own already-landed
+   sha to its own item mid-run and manufacture the very "predates the run"
+   evidence this check exists to require — the same hazard `item_repo`
+   already avoids for the declared route's re-stamp check) — filtered to
    the ones this checkout can even verify (a stamp for a sibling repo is
    silently excluded, never counted either way) — are **non-empty**: an
    item with no stamps has made no claim that something already covered
@@ -2574,7 +2581,7 @@ above and, from there, to the ordinary empty-diff refusal: this can only
 ever remove a wrong escalation, never manufacture a pass.
 
 A run whose item carries no `commits:` at all — the overwhelming case — is
-unaffected: `deps.commitsLanded` still runs (one graph read, a few git
-probes) but finds nothing to check, and the declared-claim check and the
-refusal below it are exactly as before. See test/gate-pipeline.test.js
-("stale premise").
+unaffected: `deps.commitsLanded` still runs (a few git probes against
+`item_commits`, no new graph read) but finds nothing to check, and the
+declared-claim check and the refusal below it are exactly as before. See
+test/gate-pipeline.test.js ("stale premise").

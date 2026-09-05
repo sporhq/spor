@@ -8990,7 +8990,7 @@ function awaitLaunchHandshake(stream, timeoutMs) {
 
 async function launchSupervisedHarness(cfg, {
   adapter, command, args, cwd, name, nodeId, prompt, server, localNodesDir, childToken, mcpToken, bindToken,
-  renewToken, renewNode, releaseNode, project, itemRepo = null, readOnly = false,
+  renewToken, renewNode, releaseNode, project, itemRepo = null, itemCommits = null, readOnly = false,
 }) {
   const runId = crypto.randomUUID();
   const p = dispatchRuns.runPaths(cfg.userConfigHome(), runId);
@@ -9020,6 +9020,11 @@ async function launchSupervisedHarness(cfg, {
     // repos and read a re-stamp that never happened. The loop's own slot
     // carries this same value; this is how `spor work --regate` gets it too.
     ...(itemRepo ? { item_repo: itemRepo } : {}),
+    // The ITEM's `commits:` stamps AS CLAIMED (task-spor-factory-skip-
+    // resolved-items-with-empty-diff), the stale-premise check's "before"
+    // value — see itemCommits above for why this must never be re-read from
+    // the item's current state.
+    ...(Array.isArray(itemCommits) && itemCommits.length ? { item_commits: itemCommits } : {}),
     log_path: p.log,
     report_path: p.report,
     // The lease this launch established (and only that one — see `release_node`
@@ -9346,6 +9351,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   let nodeId = values.node || null;
   let targetSlug = values.slug || null;
   let itemRepo = null;
+  let itemCommits = null;
   let name = values.name || null;
   let profileFlag = values.profile || null;
   let dispatchNodeRaw = null; // the dispatched node's markdown — read for its assigned->agent profile
@@ -9418,6 +9424,14 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     // against a launch target it never had reads as a re-stamp that never
     // happened.
     itemRepo = node.repo || null;
+    // The ITEM's own `commits:` stamps AS CLAIMED (task-spor-factory-skip-
+    // resolved-items-with-empty-diff): the stale-premise check needs the
+    // BEFORE-this-run value, exactly as item_repo does above — a run with
+    // graph-write access could otherwise append its own already-landed sha to
+    // `commits:` on its own item and manufacture the "predates the run"
+    // evidence the check exists to require. Reading the node's CURRENT
+    // `commits:` instead would trust exactly that write.
+    itemCommits = Array.isArray(node.commits) ? node.commits : [];
     targetSlug = targetSlug || node.repo || null;
     nodeTitle = node.title || "";
     nodeSummary = node.summary || "";
@@ -10445,6 +10459,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
         releaseNode: claimEstablished ? nodeId : null,
         project: res.slug || null,
         itemRepo,
+        itemCommits,
       });
       if (!launched.ok) {
         err(`could not launch ${harnessBin}: ${launched.error}`);
@@ -12692,22 +12707,20 @@ function makeGateDeps(
     // names against the graph in either mode.
     noCodeClaim: () => gatesKernel.parseNoCodeReport(gateRunReportText(record)),
     // The read behind a STALE-PREMISE verdict (task-spor-factory-skip-
-    // resolved-items-with-empty-diff): the item's own `commits:` stamps, read
-    // fresh off the graph (never cached — this is the one place a stale local
-    // read would falsely credit a commit that only landed after the item was
-    // last read), checked against the trusted ref in this run's own checkout.
-    // `slug` scopes which stamps this checkout can even verify — a stamp for
-    // a sibling repo is unverifiable here and silently excluded.
-    commitsLanded: async ({ trustedRef }) => {
-      let node = null;
-      try {
-        node = await resolveNode(cfg, entry.node_id);
-      } catch {
-        node = null;
-      }
-      const commits = node && Array.isArray(node.commits) ? node.commits : [];
-      return gateRunner.gateCommitsLanded(record, trustedRef, commits, slug || null);
-    },
+    // resolved-items-with-empty-diff): the item's `commits:` stamps AS
+    // CLAIMED — `record.item_commits`, captured at launch — checked against
+    // the trusted ref in this run's own checkout. Deliberately NOT a fresh
+    // graph read: `commits:` is an ordinary editable list field, so a run with
+    // graph-write access could otherwise append its own already-landed sha to
+    // ITS OWN item mid-run and manufacture the "predates the run" evidence
+    // this check exists to require — exactly the hazard `item_repo` (§10.11's
+    // re-stamp check) is already built to avoid for the sibling declared
+    // route. `slug` scopes which stamps this checkout can even verify — a
+    // stamp for a sibling repo is unverifiable here and silently excluded.
+    // Absent on a record predating this field, a free-text dispatch, or a
+    // node carrying no stamp — `gateCommitsLanded` reads that as nothing to
+    // check, exactly as an empty list does.
+    commitsLanded: async ({ trustedRef }) => gateRunner.gateCommitsLanded(record, trustedRef, record.item_commits, slug || null),
     node: async ({ id }) => {
       let node = null;
       try {
