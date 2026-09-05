@@ -5043,6 +5043,71 @@ test("gateChangeSet marks a missing checkout `gone`, and gateHeadLanded reads th
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test("gateCommitsLanded checks an item's recorded commit stamps against the trusted ref, scoped to its own repo", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "spor-commits-landed-"));
+  const g = (dir, args) => execFileSync("git", args, { cwd: dir, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  g(repo, ["init", "-q", "-b", "main"]);
+  fs.writeFileSync(path.join(repo, "a.txt"), "a\n");
+  g(repo, ["add", "."]);
+  g(repo, ["commit", "-q", "-m", "base"]);
+  // A commit that lands on main via a SIBLING branch — the first live case:
+  // a different task's fix happened to already cover this item.
+  g(repo, ["checkout", "-q", "-b", "sibling"]);
+  fs.writeFileSync(path.join(repo, "b.txt"), "b\n");
+  g(repo, ["add", "."]);
+  g(repo, ["commit", "-q", "-m", "the sibling fix"]);
+  const landedSha = g(repo, ["rev-parse", "HEAD"]);
+  g(repo, ["checkout", "-q", "main"]);
+  g(repo, ["merge", "-q", "--no-ff", "-m", "land the sibling fix", "sibling"]);
+  // An UNLANDED commit — on a branch main never merged.
+  g(repo, ["checkout", "-q", "-b", "unmerged"]);
+  fs.writeFileSync(path.join(repo, "c.txt"), "c\n");
+  g(repo, ["add", "."]);
+  g(repo, ["commit", "-q", "-m", "not yet landed"]);
+  const unlandedSha = g(repo, ["rev-parse", "HEAD"]);
+  g(repo, ["checkout", "-q", "main"]);
+  const record = { cwd: repo };
+
+  // No commits: stamps at all is not evidence of anything.
+  assert.deepStrictEqual(gateRunner.gateCommitsLanded(record, "main", [], "spor"), { known: true, checked: [], landed: null, unlanded: [] });
+  assert.deepStrictEqual(gateRunner.gateCommitsLanded(record, "main", null, "spor"), { known: true, checked: [], landed: null, unlanded: [] });
+
+  // A single already-landed stamp for THIS repo.
+  assert.deepStrictEqual(gateRunner.gateCommitsLanded(record, "main", [`spor@${landedSha}`], "spor"), {
+    known: true,
+    checked: [`spor@${landedSha}`],
+    landed: true,
+    unlanded: [],
+  });
+
+  // A stamp for a SIBLING repo is unverifiable in this checkout and is
+  // silently excluded — never counted as landed OR unlanded.
+  assert.deepStrictEqual(gateRunner.gateCommitsLanded(record, "main", [`spor-server@${landedSha}`], "spor"), {
+    known: true,
+    checked: [],
+    landed: null,
+    unlanded: [],
+  });
+
+  // A mix of landed and unlanded: `landed` is false and only the unlanded one
+  // is named, but both are counted as CHECKED.
+  const mixed = gateRunner.gateCommitsLanded(record, "main", [`spor@${landedSha}`, `spor@${unlandedSha}`], "spor");
+  assert.strictEqual(mixed.known, true);
+  assert.strictEqual(mixed.landed, false);
+  assert.deepStrictEqual(mixed.checked, [`spor@${landedSha}`, `spor@${unlandedSha}`]);
+  assert.deepStrictEqual(mixed.unlanded, [`spor@${unlandedSha}`]);
+
+  // Unreadable evidence is UNKNOWN, never "unlanded": a bogus sha, a trusted
+  // ref that does not resolve, a missing checkout.
+  assert.strictEqual(gateRunner.gateCommitsLanded(record, "main", ["spor@deadbeef"], "spor").known, false);
+  assert.strictEqual(gateRunner.gateCommitsLanded(record, "nope", [`spor@${landedSha}`], "spor").known, false);
+  assert.strictEqual(gateRunner.gateCommitsLanded({ cwd: path.join(root, "gone") }, "main", [`spor@${landedSha}`], "spor").known, false);
+  assert.strictEqual(gateRunner.gateCommitsLanded({ cwd: null }, "main", [`spor@${landedSha}`], "spor").known, false);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 // ------------------------------------------------ no-code outcomes (§10.11) --
 // task-spor-factory-no-code-outcome-convention: a run whose item's premise turned
 // out to be stale legitimately commits nothing, and the empty-diff refusal above
@@ -5310,4 +5375,81 @@ test("the loop tallies SCOPED, stamps it settled, and cools the item off — it 
     }),
     []
   );
+});
+
+// -------------------------------------------------- stale premise (§10.11) --
+// task-spor-factory-skip-resolved-items-with-empty-diff: the same SCOPED
+// route as above, but AUTOMATIC — an item's own `commits:` stamps already
+// landed on the trusted ref before this run's dispatch, so nothing needed
+// declaring.
+
+function withStalePremise(world, { commitsLanded = { known: true, checked: ["spor@0efea66"], landed: true, unlanded: [] } } = {}) {
+  world.deps.commitsLanded = async () => commitsLanded;
+  return world;
+}
+
+test("a fully-landed recorded commit list settles SCOPED automatically — no declaration, no gate run, no escalation, no demotion", async () => {
+  const factory = factoryOf(NO_CODE_FACTORY);
+  const { deps, seen } = withStalePremise(fakes({ changed: [] }));
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "scoped");
+  assert.strictEqual(res.outcome, "already-landed");
+  assert.match(res.reason, /task-demo's recorded commit \(spor@0efea66\) is already an ancestor of the trusted ref/);
+  assert.deepStrictEqual(seen.suites, [], "no command gate runs");
+  assert.deepStrictEqual(seen.reviews, [], "no reviewer is dispatched");
+  assert.strictEqual(seen.fixes.length, 0, "no fix cycle, and no commit-or-discard round-trip");
+  assert.strictEqual(seen.escalations.length, 0, "nobody is paged for a verified stale premise");
+  assert.strictEqual(seen.demotions.length, 0);
+  assert.strictEqual(seen.facts.length, 1);
+  assert.match(seen.facts[0].id, /^art-gate-scoping-demo-runabcde-[0-9a-f]{8}$/);
+  assert.match(seen.facts[0].markdown, /- \{type: relates-to, to: task-demo\}/);
+  assert.doesNotMatch(seen.facts[0].markdown, /type: resolves/);
+  assert.match(seen.facts[0].markdown, /recorded a verified no-code outcome/);
+  assert.deepStrictEqual(res.gates.map((g) => [g.gate, g.verdict]), [["scoping", "scoped"]]);
+});
+
+test("a recorded commit list that is not (fully) landed falls straight through to the ordinary empty-diff refusal", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-reviewer", cycles: 3 }] });
+  const cases = [
+    { known: true, checked: ["spor@aaa"], landed: false, unlanded: ["spor@aaa"] },
+    { known: true, checked: [], landed: null, unlanded: [] }, // nothing this checkout could verify
+    { known: false, checked: [], landed: null, unlanded: [] }, // unreadable evidence
+    null, // no claim to check at all — no commits: on the item
+  ];
+  for (const commitsLanded of cases) {
+    const { deps, seen } = withStalePremise(fakes({ changed: [] }), { commitsLanded });
+    const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+    assert.strictEqual(res.state, "failed", JSON.stringify(commitsLanded));
+    assert.match(res.reason, /no committed change against main/);
+    assert.strictEqual(seen.reviews.length, 0);
+    assert.strictEqual(seen.escalations.length, 1);
+    assert.strictEqual(seen.demotions.length, 1);
+    assert.ok(!seen.facts.some((f) => f.id.startsWith("art-gate-scoping-")), "no scoping fact for evidence that did not check out");
+  }
+});
+
+test("a run that also declares a no-code outcome is unaffected when the automatic stale-premise check does not fire", async () => {
+  const factory = factoryOf(NO_CODE_FACTORY);
+  const withBoth = withStalePremise(withNoCode(fakes({ changed: [] })), { commitsLanded: { known: true, checked: [], landed: null, unlanded: [] } });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: withBoth.deps });
+  // The automatic check found nothing to settle on, so the declared claim
+  // (a genuine `rescoped` in withNoCode's default report) still runs and
+  // settles the pipeline exactly as the no-code-outcome tests above show.
+  assert.strictEqual(res.state, "scoped");
+  assert.strictEqual(res.outcome, "rescoped");
+});
+
+test("the stale-premise route is not consulted at all without the dependency, and never fires on a non-empty diff", async () => {
+  const reviewOnly = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-reviewer", cycles: 3 }] });
+  const { deps: noDep, seen: seenNoDep } = fakes({ changed: [] });
+  assert.strictEqual(noDep.commitsLanded, undefined);
+  const resNoDep = await gateRunner.runGatePipeline({ item: ITEM, factory: reviewOnly, deps: noDep });
+  assert.strictEqual(resNoDep.state, "failed", "an empty diff with no evidence at all is refused exactly as before");
+  assert.strictEqual(seenNoDep.escalations.length, 1);
+
+  const factory = factoryOf(NO_CODE_FACTORY);
+  const { deps, seen } = withStalePremise(fakes({ changed: ["lib/x.js"] }));
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.deepStrictEqual(seen.suites, ["acceptance"]);
 });

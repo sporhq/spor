@@ -1711,3 +1711,51 @@ test("a FINDING outcome names a node that exists — candidates exclude the item
   assert.strictEqual(selfref.ok, false);
   assert.match(selfref.reason, /names nothing it found/);
 });
+
+// ------------------------------------------- stale premise (§10.11 sibling) --
+// task-spor-factory-skip-resolved-items-with-empty-diff: an item's OWN
+// `commits:` stamps can already be landed on the trusted ref before its run
+// was ever dispatched — no declaration needed, since the evidence predates
+// the run.
+
+test("verifyStalePremise settles on a non-empty, fully-landed commit list", () => {
+  const ok = gates.verifyStalePremise({
+    nodeId: "issue-a",
+    commitsLanded: { known: true, checked: ["spor@0efea66"], landed: true, unlanded: [] },
+  });
+  assert.strictEqual(ok.ok, true);
+  assert.strictEqual(ok.outcome, gates.STALE_PREMISE_OUTCOME);
+  assert.match(ok.detail, /issue-a's recorded commit \(spor@0efea66\) is already an ancestor of the trusted ref/);
+  assert.match(ok.detail, /nothing was left to do/);
+
+  const plural = gates.verifyStalePremise({
+    nodeId: "issue-a",
+    commitsLanded: { known: true, checked: ["spor@aaa", "spor@bbb"], landed: true, unlanded: [] },
+  });
+  assert.match(plural.detail, /commits \(spor@aaa, spor@bbb\) are already an ancestor/);
+});
+
+test("verifyStalePremise refuses on anything short of fully-verified, fully-landed evidence", () => {
+  // Unreadable evidence (no checkout, git errored, trusted ref does not
+  // resolve) is not "unlanded" — it is not evidence of anything.
+  const unknown = gates.verifyStalePremise({ nodeId: "issue-a", commitsLanded: { known: false, checked: [], landed: null } });
+  assert.strictEqual(unknown.ok, false);
+  assert.match(unknown.reason, /could not be checked against the trusted ref/);
+  assert.strictEqual(gates.verifyStalePremise({ nodeId: "issue-a", commitsLanded: null }).ok, false);
+
+  // An item with NO verifiable commits: stamps has made no claim that
+  // something already covered it — a vacuously "landed" empty list must
+  // never route as a stale premise (the do-nothing run this whole check
+  // exists to keep out from behind a manufactured evidence gap).
+  const none = gates.verifyStalePremise({ nodeId: "issue-a", commitsLanded: { known: true, checked: [], landed: null } });
+  assert.strictEqual(none.ok, false);
+  assert.match(none.reason, /carries no commits: stamps this checkout can verify/);
+
+  // Recorded, but not (all) landed: refused, naming what is not.
+  const partial = gates.verifyStalePremise({
+    nodeId: "issue-a",
+    commitsLanded: { known: true, checked: ["spor@aaa", "spor@bbb"], landed: false, unlanded: ["spor@bbb"] },
+  });
+  assert.strictEqual(partial.ok, false);
+  assert.match(partial.reason, /not all land on the trusted ref \(spor@bbb do not\)/);
+});

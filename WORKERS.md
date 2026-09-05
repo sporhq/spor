@@ -2524,3 +2524,57 @@ alongside `passed`/`failed`/`blocked`, and the facts are
 A run that declares nothing behaves byte-identically to before this route
 existed. See test/gate-pipeline.test.js ("no-code outcomes") and
 test/gates.test.js.
+
+#### Stale premise — the same route, no declaration needed
+
+`scoped` above needs a run to *declare* the outcome, because the claim is
+about what the run itself found. A different case needs no declaration at
+all: an item's own `commits:` stamps are **already landed on the trusted
+ref before the run was ever dispatched** — typically because a different
+task's fix happened to touch the same code. The first live case
+(2026-09-05, `issue-spor-codex-handshake-stub-reads-job-after-abandon-
+unlink`, run `b000ee69`): the issue's `commits:` named spor `0efea66`,
+which had already landed on main as part of
+`task-spor-queue-api-offset-paging`'s own fix — a sibling task's commit
+happened to also resolve this issue's problem. The branch this run cut
+for the issue therefore carried nothing to add, and the run made no claim
+about it because there was nothing for it to find: the review gate failed
+closed on the empty diff (correctly, absent a signal) and the rescue lane
+had to re-derive by hand what the graph already recorded before the
+dispatch ever happened.
+
+There is nothing to declare here because the evidence **predates the
+run**: it either checks out or it doesn't, and there is nothing for a run
+to launder by asserting it. So the runner checks it automatically, before
+the declared `SCOPED:` claim above (`verifyStalePremise` in
+`lib/kernel/gates.js`, the git half `gateCommitsLanded` in
+`lib/shell/gate-runner.js`):
+
+1. the change under judgement is empty, exactly as above;
+2. the item's own `commits:` stamps — read fresh off the graph, filtered to
+   the ones this checkout can even verify (a stamp for a sibling repo is
+   silently excluded, never counted either way) — are **non-empty**: an
+   item with no stamps has made no claim that something already covered
+   it, so a vacuously "nothing to check" reading never routes as a stale
+   premise;
+3. and every one of those stamps is an **ancestor of the trusted ref**
+   (`git merge-base --is-ancestor`, read from the run's own checkout with
+   the same gone-checkout-falls-back-to-the-dispatch-worktree's-branch
+   handling `gateHeadLanded` (§10.8) uses).
+
+If it checks out, the pipeline settles **`scoped`** exactly as the declared
+route does — same reserved `scoping` gate id, same `art-gate-scoping-…`
+fact shape, same non-completion semantics (the item is left open; a person
+still decides whether to write a real resolver), same cooldown. The
+outcome label is `already-landed` rather than one of the three declared
+words, since nothing declared it. If any part of the check fails —
+unreadable evidence, no verifiable stamps, a stamp that is not an
+ancestor — the pipeline falls straight through to the declared-claim check
+above and, from there, to the ordinary empty-diff refusal: this can only
+ever remove a wrong escalation, never manufacture a pass.
+
+A run whose item carries no `commits:` at all — the overwhelming case — is
+unaffected: `deps.commitsLanded` still runs (one graph read, a few git
+probes) but finds nothing to check, and the declared-claim check and the
+refusal below it are exactly as before. See test/gate-pipeline.test.js
+("stale premise").

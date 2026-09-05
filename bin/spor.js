@@ -12691,6 +12691,23 @@ function makeGateDeps(
     // carry) — and any node by id, so the runner can check what the claim
     // names against the graph in either mode.
     noCodeClaim: () => gatesKernel.parseNoCodeReport(gateRunReportText(record)),
+    // The read behind a STALE-PREMISE verdict (task-spor-factory-skip-
+    // resolved-items-with-empty-diff): the item's own `commits:` stamps, read
+    // fresh off the graph (never cached — this is the one place a stale local
+    // read would falsely credit a commit that only landed after the item was
+    // last read), checked against the trusted ref in this run's own checkout.
+    // `slug` scopes which stamps this checkout can even verify — a stamp for
+    // a sibling repo is unverifiable here and silently excluded.
+    commitsLanded: async ({ trustedRef }) => {
+      let node = null;
+      try {
+        node = await resolveNode(cfg, entry.node_id);
+      } catch {
+        node = null;
+      }
+      const commits = node && Array.isArray(node.commits) ? node.commits : [];
+      return gateRunner.gateCommitsLanded(record, trustedRef, commits, slug || null);
+    },
     node: async ({ id }) => {
       let node = null;
       try {
