@@ -265,6 +265,31 @@ test("a malformed declaration is refused loudly, naming the key and what is allo
   assert.match(normalizeHarnessDeclaration("Ox Alpha", { command: "/x" }).error, /not a usable harness id/);
 });
 
+test("a relative command path is refused — it would resolve inside the dispatched repo's own worktree", () => {
+  // node's spawn resolves a command carrying a separator against the process
+  // `cwd` — for a dispatched harness that cwd is the TARGET REPO, content any
+  // collaborator's commit can write. Only a bare name (PATH lookup, immune to
+  // repo content) or an already-rooted path is safe. "C:foo.exe" carries no
+  // separator but is still relative — to drive C's OWN current directory,
+  // not a fixed location — so it is refused alongside the separator-shaped
+  // cases even though it needs its own detection.
+  for (const relative of ["./ox", "../ox/bin/ox", "bin/ox", "scripts\\ox.bat", ".\\ox.bat", "C:foo.exe"]) {
+    const r = normalizeHarnessDeclaration(HARNESS, { command: relative });
+    assert.strictEqual(r.ok, false, `${JSON.stringify(relative)} must be refused`);
+    assert.match(r.error, /must be an absolute path or a bare name resolved on PATH/);
+    assert.match(r.error, new RegExp(relative.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+  // A bare name has no separator at all — PATH lookup, never the repo's cwd.
+  assert.ok(normalizeHarnessDeclaration(HARNESS, { command: "ox" }).ok, "a bare name is a PATH lookup, not a relative path");
+  // Already-rooted paths, either platform's spelling, are fine regardless of
+  // the host OS — a declaration is hand-authored config that may be copied
+  // across machines.
+  for (const absolute of ["/opt/ox/bin/ox", "C:\\ox\\ox.exe", "\\\\server\\share\\ox.exe"]) {
+    const r = normalizeHarnessDeclaration(HARNESS, { command: absolute });
+    assert.ok(r.ok, `${JSON.stringify(absolute)} should be accepted: ${r.error}`);
+  }
+});
+
 test("a declaration can never redefine a BUILT-IN harness", () => {
   for (const id of ["claude-code", "codex", "opencode", "copilot"]) {
     const r = normalizeHarnessDeclaration(id, { command: "/opt/impostor" });
@@ -374,6 +399,26 @@ test("a graph-supplied command is rejected by the real dispatch, before anything
     assert.strictEqual(preview.status, 1, preview.stdout);
     assert.match(preview.stderr, /a graph write must never define what a machine executes/);
   }
+});
+
+test("a relative-path declaration is rejected by the real dispatch, before anything is launched — and could not have hijacked a nearby repo file", () => {
+  const { home, repo } = fixture({ declaration: declarationFor("./ox-stub") });
+  // Plant a decoy at exactly the relative path the declaration names, inside
+  // the DISPATCHED repo's own worktree — the untrusted commit this refusal
+  // exists to defeat. If resolution ever fell through to spawning against the
+  // repo's cwd, this is what would run instead of the operator's intended
+  // launcher.
+  fs.writeFileSync(path.join(repo, "ox-stub"), "#!/bin/sh\necho pwned\n", { mode: 0o755 });
+  const args = ["dispatch", "task-declared", "--dir", repo, "--profile", "profile-declared", "--no-brief"];
+  const real = run(args, { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.strictEqual(real.status, 1, real.stdout);
+  assert.match(real.stderr, /this machine's declaration for harness '.*' is unusable/);
+  assert.match(real.stderr, /must be an absolute path or a bare name resolved on PATH/);
+  assert.ok(!fs.existsSync(path.join(home, "journal", "dispatch")), "nothing is launched");
+  const preview = run([...args, "--print"], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.strictEqual(preview.status, 0, preview.stderr);
+  assert.match(preview.stdout, /must be an absolute path or a bare name resolved on PATH/);
+  assert.ok(!fs.existsSync(path.join(home, "journal", "dispatch")), "a preview writes nothing");
 });
 
 test("a machine with no binding for the harness refuses loudly and leaves the assignment intact", () => {
