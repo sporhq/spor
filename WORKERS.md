@@ -1561,6 +1561,72 @@ the human escalation. The declared `cycles` cap is untouched; this only ever
 spends FEWER of them, and the refusal's detail and the gate fact say which
 finding ended them and why.
 
+**Unrequested mechanism is answered by deletion, not by a fix cycle**
+(task-spor-factory-review-gate-fix-cycles-grow-unrequested-mechanism). The rule
+above bounds an implementer that keeps arguing; this one bounds a reviewer and
+an implementer growing surface together. The item that named it asked for
+selection guidance plus a mid-task rule in a skill — docs only — and the
+initial diff met that acceptance. All three fix cycles then went on findings
+against a derived sibling-id scheme the FIX CYCLES had introduced: its retry
+durability, the concurrency of the sibling write, the injectivity of the
+derived id, the id length limit. Each finding was true, each cleared the
+introduced-by-fix floor, and each cycle added the surface the next review
+attacked; the rescue closed it by REMOVING that surface (a hashed fixed-length
+id), not by hardening it once more. The floor could not stop it, because the
+findings were correct about code that should not have existed.
+
+So a finding carries a third `category`:
+
+- `unrequested-mechanism`: the defect is real, it is in mechanism the work
+  item's acceptance does not require, and REMOVING that mechanism would also
+  satisfy the finding. The removal test is the whole category — if deleting
+  the surface would not close what the reviewer found, it is `correctness`.
+
+Such a finding is recorded **advisory, never blocking**, however well it is
+demonstrated, at both doors: a fresh one never blocks (`normalizeFinding`, the
+acceptance floor, checked before the evidence floor) so it never enters a later
+review's `prior` set, and a carried one a `prior` answer RECLASSIFIES to it
+goes advisory on the ledger in the same fold (`applyReviewToLedger`) — the
+escape valve for a loop already running, since a demonstrated finding raised
+before this existed can still be released by the reviewer that recognizes it.
+A RELEASED entry is not an entry awaiting demonstration, so its id is not
+claimable as an upgrade and it is not offered back to a later review as
+`raised` (`gates.upgradableEntry`, the shared half of `advisoryIdSet` and
+`raisedUndemonstrated`): no evidence can make it blocking, and taking a
+reviewer's id collision as an upgrade re-opened it as a blocking
+`correctness` finding — restarting the very cycles the release ends. A fresh
+finding reusing the id mints a new entry instead, exactly as it does against
+an open or resolved one.
+The mechanism is not thereby blessed: the finding stands on the ledger and the
+fact, and the fixer's prompt asks for it to be DELETED — the surface removed,
+or reduced to the simplest thing the item asked for, with the commit message
+saying what went and why the item does not need it — explicitly NOT hardened,
+since every guard added to unrequested surface is more surface for the next
+review. It simply cannot spend a fix cycle any more, and an item whose
+acceptance is met lands instead of escalating on surface its own fixes grew.
+
+Both prompts change with it. The reviewer is told the removal test, that a
+blocking finding must name what it fails — a line of the item's ACCEPTANCE, or
+a defect this DIFF introduces into behaviour that worked before; anything else
+is `major`/`minor` — and, on a fix cycle, to ask the removal question of any
+finding against mechanism a previous fix added and answer it in the note.
+(`self-inflicted` is deliberately NOT one of the category's spellings: it is
+the natural English for "my own fix caused this" — `introduced_by_fix`, the
+qualifier that makes a fix-cycle finding blocking — and reading it as a scope
+statement would pass a demonstrated fix-introduced regression as advisory. A
+word in no vocabulary costs nothing; one in the wrong vocabulary costs the
+gate.) The pass note the gate's fact records names the acceptance release
+rather than rule 5's "demonstrated nothing", which is false of exactly this
+case. The
+fixer is handed the unrequested findings under their own heading with the
+delete-don't-extend instruction, and on any fix cycle is told to ask whether a
+previous cycle added the thing a finding attacks and to prefer deleting or
+simplifying it to guarding it, keeping the change inside what the item asked
+for. Categories stay prose for the prompts and a tag for the record
+(`gates.categoryTag` renders any non-default category on the fact, the ledger
+and the prior lines); the only mechanical effect is the advisory fold above,
+and pass/fail is otherwise decided exactly as before.
+
 On `changes_requested` with cycles left, the runner dispatches an implementer
 **fix cycle** — the blocking findings by id, the advisory notes, what earlier
 cycles already resolved (do not regress), at the same node, in the same tree —

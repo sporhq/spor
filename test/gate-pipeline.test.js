@@ -409,6 +409,35 @@ test("`cycles: 3` produces exactly three fix dispatches — four reviews, counte
   assert.match(seen.facts[0].markdown, /4 attempts: the initial one plus 3 fix cycles, cap 3/);
 });
 
+// task-spor-factory-review-gate-fix-cycles-grow-unrequested-mechanism: a
+// review whose only demonstrated blocking findings target mechanism the item
+// never asked for PASSES — the item's acceptance is met and the fix cycles
+// stop growing the surface the next review would attack. The findings are
+// still recorded: the fact carries them advisory.
+test("a review that only finds UNREQUESTED MECHANISM passes the gate, records the findings advisory, and dispatches no fix cycle", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 3 }] });
+  const { deps, seen } = fakes({
+    review: () => ({
+      ok: true,
+      text:
+        '```json\n{"verdict":"changes_requested","findings":[' +
+        BLOCKING("the derived sibling id is not injective", ',"category":"unrequested-mechanism"') +
+        "]}\n```",
+    }),
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.strictEqual(seen.fixes.length, 0, "no fix cycle is spent on surface the item never asked for");
+  assert.strictEqual(seen.reviews.length, 1);
+  assert.deepStrictEqual(seen.escalations, []);
+  assert.match(seen.facts[0].markdown, /1 advisory note recorded/);
+  // …and the durable record says WHY it passed — not that the reviewer
+  // demonstrated nothing (it demonstrated this).
+  assert.match(seen.facts[0].markdown, /targets mechanism the item's acceptance does not require \(unrequested-mechanism — deleting it closes it\)/);
+  assert.doesNotMatch(seen.facts[0].markdown, /demonstrated nothing/);
+  assert.match(seen.facts[0].markdown, /Finding ledger:\n\nF1 \[blocking, unrequested-mechanism\] advisory \(cycle 0\)/);
+});
+
 // task-spor-review-gate-item-done-condition-vs-implementer-conclusion: the run
 // that named this spent all three fix cycles and a rescue on ONE carried
 // finding — the reviewer correctly holding the item's literal done condition
@@ -3919,6 +3948,8 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   // of a retry/debt flag are asked for in ONE verdict, and the block sits
   // after the gate's own instructions.
   assert.match(p0, /## Durable retry\/debt flags — review the mechanism WHOLE, in this one verdict/);
+  assert.match(p0, /## Scope — say what a blocking finding fails/);
+  assert.doesNotMatch(p0, /would deleting the mechanism this finding attacks/, "the removal question is a fix-cycle question");
   assert.match(p0, /file every row that is open in THIS verdict, each as its own finding naming the row/);
   assert.match(p0, /\(a\) the flag write itself fails[\s\S]*\(b\) clear-before-owe ordering[\s\S]*\(c\) the check-then-write race[\s\S]*\(d\) a stale flag against already-settled state/);
   assert.ok(p0.indexOf("Hunt for off-by-ones.") < p0.indexOf("## Durable retry/debt flags"), "the checklist follows the gate's instructions");
@@ -3955,15 +3986,23 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   // task-spor-review-gate-item-done-condition-vs-implementer-conclusion: every
   // review is asked which KIND of finding it is raising, and the shape carries
   // the field the parser reads.
-  assert.match(p1, /## Finding category — a defect and an unmet done condition are different findings/);
-  assert.match(p1, /"category": "correctness\|unmet-condition"/);
+  assert.match(p1, /## Finding category — a defect, an unmet done condition and unrequested mechanism are different findings/);
+  // task-spor-factory-review-gate-fix-cycles-grow-unrequested-mechanism: a
+  // blocking finding says WHAT it fails, and on a fix cycle the reviewer is
+  // asked the removal question of mechanism a previous fix added.
+  assert.match(p1, /## Scope — say what a blocking finding fails/);
+  assert.match(p1, /the line of the WORK ITEM's\nacceptance the change does not meet, or the defect this DIFF introduces/);
+  assert.match(p1, /would deleting the mechanism this finding attacks also\nsatisfy the finding/);
+  assert.match(p1, /Unrequested mechanism is answered by DELETION, so it is recorded advisory and never fails this gate/);
+  assert.match(p1, /- `unrequested-mechanism`: the defect is real but it is in mechanism the item's acceptance does not require,/);
+  assert.match(p1, /"category": "correctness\|unmet-condition\|unrequested-mechanism"/);
   assert.match(p1, /once one has been carried 2 fix cycles the runner stops dispatching fixes at it/);
   assert.match(p1, /accepting a re-scope is not a reviewer's call/);
   assert.doesNotMatch(p1, /recorded as an UNMET DONE CONDITION/, "nothing on this ledger is one yet");
   // F2 on the fourth cut of this gate: the prose tells the reviewer to
   // reclassify with `category` on a `prior` entry, so the REQUIRED shape shows
   // the field — labelled optional, since omitting it keeps the recorded one.
-  assert.match(p1, /"prior": \[\{"id": "F1"[^\n]*"category": "correctness\|unmet-condition — OPTIONAL, only to RECLASSIFY it; omit to keep the one it has"\}\]/);
+  assert.match(p1, /"prior": \[\{"id": "F1"[^\n]*"category": "correctness\|unmet-condition\|unrequested-mechanism — OPTIONAL, only to RECLASSIFY it; omit to keep the one it has"\}\]/);
   assert.match(p1, /omit it and the finding keeps the category it has/);
 
   // Review 3: F1 has survived two fixes — the prompt says so, replays the
@@ -4060,6 +4099,12 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.match(fixLaunch.prompt, /Carried findings — close the MECHANISM, not the next row:\nF2 has survived 2 fix cycles and the review named only the next row \(row-by-row\)\nF4 has survived 1 fix cycle\n/);
   assert.match(fixLaunch.prompt, /enumerate the mechanism's rows yourself[\s\S]*state in the commit message which rows\nthe fix closes and which it deliberately leaves and why/);
   assert.doesNotMatch(fixLaunch.prompt, /Unmet done condition/, "both of those are defects");
+  // …and on any fix cycle the fixer is told to prefer deleting mechanism a
+  // previous cycle added to guarding it (task-spor-factory-review-gate-fix-
+  // cycles-grow-unrequested-mechanism).
+  assert.match(fixLaunch.prompt, /Before you extend anything, ask whether a PREVIOUS fix cycle added it\./);
+  assert.match(fixLaunch.prompt, /prefer deleting or simplifying\nit to guarding it, and keep the change inside what the work item asked for/);
+  assert.doesNotMatch(fixLaunch.prompt, /Unrequested mechanism — DELETE it/, "nothing here is categorized as one");
 
   // A fix cycle at an UNMET DONE CONDITION is told the two are answered
   // differently, and given the two exits that actually close one: a fresh
@@ -4080,6 +4125,26 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.match(fixLaunch.prompt, /\(2\) if you have concluded the condition cannot be met, file a Spor DECISION that re-scopes the item/);
   assert.match(fixLaunch.prompt, /to task-fix-me, and name its id in the commit message\./);
   assert.match(fixLaunch.prompt, /Filing \(2\) does not clear the gate and is not meant to/);
+
+  // A fix cycle carrying an UNREQUESTED-MECHANISM finding (always advisory —
+  // the parser's acceptance floor downgrades it) gets the opposite
+  // instruction: delete the surface, do not harden it.
+  fixLaunch = null;
+  await fixDeps.fix({
+    gate, cycle: 2, detail: "the review requested changes — 1 blocking finding(s)",
+    findings: [
+      { id: "F2", severity: "blocking", file: "lib/x.js", summary: "drops the last row", blocking: true, evidence: "npm test" },
+      { id: "F3", severity: "blocking", category: "unrequested-mechanism", file: "skills/y.md", summary: "the derived sibling id is not injective", blocking: false, note: "recorded as advisory" },
+    ],
+    ledger: [],
+  });
+  assert.ok(fixLaunch, "the fix cycle was dispatched");
+  assert.match(fixLaunch.prompt, /Unrequested mechanism — DELETE it, do not extend it:\nF3 \[blocking, advisory, unrequested-mechanism\] skills\/y\.md — the derived sibling id is not injective/);
+  assert.match(fixLaunch.prompt, /removing that mechanism would close it\. So remove it: delete the surface/);
+  assert.match(fixLaunch.prompt, /Do NOT answer these by hardening the mechanism/);
+  assert.match(fixLaunch.prompt, /does not block the gate; they are here because deleting is cheap and the right answer\./);
+  // …and it appears ONLY there: "fix if cheap" is the opposite instruction.
+  assert.doesNotMatch(fixLaunch.prompt, /Advisory \(recorded, not enforced/);
 });
 
 // --- the dirty-tree round-trip (task-spor-worker-declined-outcome) --------

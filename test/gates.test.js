@@ -1380,7 +1380,7 @@ test("an unanswered prior finding keeps its rows, is not folded as answered, and
 // fixes at this". Pass/fail is unchanged: an unmet condition blocks on exactly
 // the same demonstrated-only terms as anything else.
 test("a finding's category is read, defaults to correctness, and rides the ledger; only a stated one reclassifies", () => {
-  assert.deepStrictEqual([...gates.FINDING_CATEGORIES], ["correctness", "unmet-condition"]);
+  assert.deepStrictEqual([...gates.FINDING_CATEGORIES], ["correctness", "unmet-condition", "unrequested-mechanism"]);
   assert.strictEqual(gates.UNMET_CONDITION, "unmet-condition");
   assert.strictEqual(gates.UNMET_CONDITION_CARRY, 2);
   // The spellings a reviewer reaches for, on each side. Both sets match
@@ -1433,6 +1433,204 @@ test("a finding's category is read, defaults to correctness, and rides the ledge
     { prior: gates.openPriorFindings(led1), cycle: 2 }
   );
   assert.deepStrictEqual(echoed.findings.filter((f) => f.id === "F1").map((f) => f.category), ["unmet-condition"]);
+});
+
+// --- unrequested mechanism (task-spor-factory-review-gate-fix-cycles-grow-
+// unrequested-mechanism) -----------------------------------------------------
+// A defect in mechanism the item's acceptance does not require, which deleting
+// that mechanism would close, is ADVISORY however well it is demonstrated: the
+// run that named this spent all three fix cycles on true findings against a
+// derived id scheme the fix cycles themselves had added, each cycle growing
+// the surface the next review attacked.
+test("an unrequested-mechanism finding is recorded advisory and never blocks, at both doors", () => {
+  assert.strictEqual(gates.UNREQUESTED_MECHANISM, "unrequested-mechanism");
+  for (const w of ["unrequested-mechanism", "unrequested", "UNASKED", "scope_creep", "gold-plating", "out-of-acceptance"]) {
+    assert.strictEqual(gates.findingCategory(w), "unrequested-mechanism", w);
+  }
+  // Disjoint from the done-condition vocabulary: `scope` still means the
+  // done-condition dispute, and the creep spelling is `scope-creep`.
+  assert.strictEqual(gates.findingCategory("scope"), "unmet-condition");
+  assert.strictEqual(gates.categoryTag({ category: "unrequested" }), ", unrequested-mechanism");
+  assert.strictEqual(gates.categoryTag({}), "", "the default category is not tagged");
+
+  // Door 1 — a FRESH finding, demonstrated and (on a fix cycle) introduced by
+  // the fix, which would otherwise clear every floor there is.
+  const v = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","findings":[' +
+      '{"severity":"blocking","category":"unrequested-mechanism","file":"skills/x.md","summary":"the derived sibling id is not injective","evidence":"printf | sha256sum showed a collision","introduced_by_fix":true},' +
+      '{"severity":"blocking","file":"lib/y.js","summary":"drops the last row","evidence":"npm test","introduced_by_fix":true}]}\n```',
+    { prior: [], cycle: 1 }
+  );
+  assert.strictEqual(v.passed, false, "the correctness finding still blocks");
+  assert.deepStrictEqual(v.findings.map((f) => [f.category, f.blocking]), [["unrequested-mechanism", false], ["correctness", true]]);
+  assert.match(v.findings[0].note, /acceptance does not require/);
+  const led = gates.applyReviewToLedger([], v, 1);
+  assert.deepStrictEqual(led.map((e) => [e.id, e.status]), [["F1", "advisory"], ["F2", "open"]]);
+  // …so it never becomes a prior the next review must answer, and never
+  // spends a cycle.
+  assert.deepStrictEqual(gates.openPriorFindings(led).map((p) => p.id), ["F2"]);
+
+  // A verdict carrying ONLY unrequested-mechanism findings is a pass with
+  // notes — the whole point: the item's acceptance is met, so it lands.
+  const only = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","category":"unrequested-mechanism","file":"skills/x.md","summary":"the sibling write races","evidence":"two shells","introduced_by_fix":true}]}\n```',
+    { prior: [], cycle: 2 }
+  );
+  assert.strictEqual(only.passed, true);
+  assert.strictEqual(only.ok, true);
+});
+
+test("a carried finding RECLASSIFIED as unrequested mechanism stops blocking and goes advisory on the ledger", () => {
+  const led0 = gates.applyReviewToLedger(
+    [],
+    gates.parseReviewVerdict(
+      '```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"skills/x.md","summary":"the derived sibling id is not durable across retries","evidence":"killed mid-write"}]}\n```',
+      { prior: [], cycle: 0 }
+    ),
+    0
+  );
+  assert.deepStrictEqual(led0.map((e) => [e.id, e.status, e.blocking]), [["F1", "open", true]]);
+  const prior = gates.openPriorFindings(led0);
+  // The escape valve for a loop already running: the reviewer recognizes on a
+  // later cycle that deleting the mechanism closes the finding.
+  const v1 = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","prior":[{"id":"F1","status":"open","note":"the item never asked for a derived id; deleting it closes this","category":"unrequested-mechanism"}],"findings":[]}\n```',
+    { prior, cycle: 1 }
+  );
+  assert.strictEqual(v1.passed, true, "nothing blocks once the carried finding is reclassified");
+  assert.deepStrictEqual(v1.findings.map((f) => [f.id, f.category, f.blocking]), [["F1", "unrequested-mechanism", false]]);
+  const led1 = gates.applyReviewToLedger(led0, v1, 1);
+  assert.deepStrictEqual(led1.map((e) => [e.id, e.status, e.blocking]), [["F1", "advisory", false]]);
+  assert.match(led1[0].note, /no longer blocks/);
+  assert.deepStrictEqual(gates.openPriorFindings(led1), [], "and it is not carried again");
+  // …and it is not tagged row-by-row on the way out: the tag means a BLOCKING
+  // finding carried twice and answered with one row, and this one was
+  // answered by "delete the mechanism".
+  const carriedTwice = { id: "F1", origin: "prior", status: "open", answered: true, opened: 0, rows: [] };
+  assert.deepStrictEqual(gates.rowByRowFindings([carriedTwice], 2).map((f) => f.id), ["F1"], "a blocking one still is");
+  assert.deepStrictEqual(gates.rowByRowFindings([{ ...carriedTwice, blocking: false }], 2), []);
+  // …and rolling that cycle back restores the blocking entry exactly.
+  assert.deepStrictEqual(gates.rollbackCycle(led1, 1).map((e) => [e.id, e.status, e.blocking, e.category]), [["F1", "open", true, "correctness"]]);
+});
+
+test("an unrequested-mechanism finding is rendered with its tag on the fixer's prompt and the ledger", () => {
+  const line = gates.renderFindings([{ id: "F3", severity: "blocking", category: "unrequested-mechanism", file: "skills/x.md", summary: "the sibling id is 212 chars", blocking: false, note: "recorded as advisory" }]);
+  assert.match(line, /F3 \[blocking, advisory, unrequested-mechanism\] skills\/x\.md — the sibling id is 212 chars/);
+  const ledger = gates.renderLedger([{ id: "F3", severity: "blocking", category: "unrequested-mechanism", status: "advisory", opened: 2, file: "skills/x.md", summary: "the sibling id is 212 chars" }]);
+  assert.match(ledger, /F3 \[blocking, unrequested-mechanism\] advisory \(cycle 2\)/);
+});
+
+// Review finding 1 on this change: an entry RELEASED on acceptance grounds is
+// advisory WITH evidence, so it falls outside `raised` (whose inheritance
+// protects a category) but used to sit inside `advisoryIdSet` (which decides
+// what an id may upgrade). A reviewer numbering its own findings into a
+// collision therefore re-opened the released entry as a blocking
+// `correctness` one, restarting the fix cycles the release exists to end.
+test("a released finding's id is not upgradable — a fresh finding reusing it mints a new entry instead of re-opening it", () => {
+  const led0 = gates.applyReviewToLedger(
+    [],
+    gates.parseReviewVerdict(
+      '```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","category":"unrequested-mechanism","file":"skills/x.md","summary":"the derived sibling id is not injective","evidence":"printf | sha256sum collided"}]}\n```',
+      { prior: [], cycle: 0 }
+    ),
+    0
+  );
+  assert.deepStrictEqual(led0.map((e) => [e.id, e.status, e.category]), [["F1", "advisory", "unrequested-mechanism"]]);
+  // It is not offered for demonstration either: it was not downgraded for
+  // want of evidence, and no evidence can make it blocking.
+  assert.deepStrictEqual(gates.raisedUndemonstrated(led0), []);
+  const v1 = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","findings":[{"id":"F1","severity":"blocking","file":"skills/x.md","summary":"the id is still not injective","evidence":"same collision","introduced_by_fix":true}]}\n```',
+    { prior: gates.openPriorFindings(led0), cycle: 1, raised: gates.raisedUndemonstrated(led0) }
+  );
+  const led1 = gates.applyReviewToLedger(led0, v1, 1);
+  assert.deepStrictEqual(led1.map((e) => [e.id, e.status, e.category]), [["F1", "advisory", "unrequested-mechanism"], ["F2", "open", "correctness"]], "the released entry is untouched; the reused id minted a new one");
+  assert.match(led1[1].note, /already-used ledger id F1/);
+  // An unrequested-mechanism entry with NO evidence is released on the same
+  // grounds, so it is excluded from both sets too — no evidence could make it
+  // blocking, so there is nothing for a later review to demonstrate.
+  const ledU = gates.applyReviewToLedger(
+    [],
+    gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","category":"unrequested-mechanism","file":"skills/x.md","summary":"unneeded surface"}]}\n```', { prior: [], cycle: 0 }),
+    0
+  );
+  assert.deepStrictEqual(gates.raisedUndemonstrated(ledU), []);
+  // …while a plain undemonstrated finding is still offered, and an upgrade of
+  // it still counts as raised at its original cycle.
+  const ledP = gates.applyReviewToLedger(
+    [],
+    gates.parseReviewVerdict('```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"lib/y.js","summary":"drops the last row"}]}\n```', { prior: [], cycle: 0 }),
+    0
+  );
+  const raisedP = gates.raisedUndemonstrated(ledP);
+  assert.deepStrictEqual(raisedP.map((r) => [r.id, r.category]), [["F1", "correctness"]]);
+  const vP = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","findings":[{"id":"F1","severity":"blocking","file":"lib/y.js","summary":"drops the last row","evidence":"npm test"}]}\n```',
+    { prior: [], cycle: 1, raised: raisedP }
+  );
+  assert.deepStrictEqual(vP.findings.map((f) => [f.id, f.blocking]), [["F1", true]]);
+  assert.deepStrictEqual(gates.applyReviewToLedger(ledP, vP, 1).map((e) => [e.id, e.status]), [["F1", "open"]], "still one entry, upgraded in place");
+});
+
+// Review finding 2 on this change: `self-inflicted` is the natural English for
+// "my own fix caused this" — `introduced_by_fix`, the qualifier that makes a
+// fix-cycle finding BLOCKING — so reading it as a scope statement passed a
+// demonstrated fix-introduced regression as advisory.
+test("`self-inflicted` states causation, not scope, and is read as no category statement at all", () => {
+  assert.strictEqual(gates.findingCategory("self-inflicted"), null);
+  const v = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","category":"self-inflicted","file":"lib/y.js","summary":"the fix drops the last row","evidence":"npm test failed","introduced_by_fix":true}]}\n```',
+    { prior: [], cycle: 1 }
+  );
+  assert.strictEqual(v.passed, false);
+  assert.deepStrictEqual(v.findings.map((f) => [f.category, f.blocking]), [["correctness", true]]);
+});
+
+// Review finding 3 on this change: the note is the durable record of WHY a
+// `changes_requested` passed (the gate fact carries it), so a release on
+// ACCEPTANCE grounds must not be filed as "demonstrated nothing".
+test("the pass note names the acceptance release, not a missing demonstration", () => {
+  const demonstrated = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","findings":[' +
+      '{"severity":"blocking","category":"unrequested-mechanism","file":"skills/x.md","summary":"the sibling write races","evidence":"two shells raced it"},' +
+      '{"severity":"minor","file":"lib/y.js","summary":"name the constant"}]}\n```',
+    { prior: [], cycle: 1 }
+  );
+  assert.strictEqual(demonstrated.passed, true);
+  assert.match(demonstrated.note, /nothing it rated blocking is enforceable: 1 finding targets mechanism the item's acceptance does not require \(unrequested-mechanism — deleting it closes it\), the rest are advisory/);
+  assert.doesNotMatch(demonstrated.note, /demonstrated nothing/);
+  // An UNDEMONSTRATED one is released on the same grounds, not counted under
+  // rule 5's "rated it blocking and demonstrated none".
+  const undemonstrated = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","category":"unrequested-mechanism","file":"skills/x.md","summary":"unneeded surface"}]}\n```',
+    { prior: [], cycle: 0 }
+  );
+  assert.strictEqual(undemonstrated.passed, true);
+  assert.strictEqual(undemonstrated.undemonstrated, undefined);
+  assert.match(undemonstrated.note, /acceptance does not require/);
+  // …and a plain undemonstrated finding still reads exactly as it did.
+  const plain = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"lib/y.js","summary":"drops the last row"}]}\n```',
+    { prior: [], cycle: 0 }
+  );
+  assert.strictEqual(plain.undemonstrated, 1);
+  assert.match(plain.note, /demonstrated none of them/);
+});
+
+// The two short-circuits are independent: a done-condition dispute the
+// reviewer reclassifies as unrequested mechanism stops blocking, so it also
+// stops being the finding that ENDS the fix cycles — there is no refusal left
+// for `noRetry` to shorten.
+test("an unmet-condition finding reclassified as unrequested mechanism leaves the noRetry short-circuit with nothing to fire on", () => {
+  const ledger = [{ id: "F1", severity: "blocking", category: "unmet-condition", file: "p.md", summary: "the budget is not met", evidence: "the eval", status: "open", blocking: true, opened: 0 }];
+  const prior = gates.openPriorFindings(ledger);
+  const v = gates.parseReviewVerdict(
+    '```json\n{"verdict":"changes_requested","prior":[{"id":"F1","status":"open","note":"the item never asked for this classifier at all","category":"unrequested-mechanism"}],"findings":[]}\n```',
+    { prior, cycle: 2 }
+  );
+  assert.strictEqual(v.passed, true);
+  assert.deepStrictEqual(gates.unmetConditionFindings(v.findings, 2), [], "it is no longer a done-condition dispute");
+  assert.deepStrictEqual(gates.applyReviewToLedger(ledger, v, 2).map((e) => [e.status, e.category]), [["advisory", "unrequested-mechanism"]]);
 });
 
 // F1 on the fourth cut of this gate: an UNDEMONSTRATED unmet-condition finding

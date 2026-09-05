@@ -129,6 +129,14 @@ last, so a gate-passed item that never landed failed *after* every gate:
   whether the condition is attainable, not whether the code is correct. Raising
   `cycles` will not help; a fresh approach or a decision re-scoping the item
   will.
+  A finding tagged `[blocking, advisory, unrequested-mechanism]` is the mirror:
+  the defect is real but it is in surface the item never asked for, and the
+  reviewer said deleting that surface would close it. Those are recorded and
+  never enforced, so they cost no cycle — but several of them on one fact, all
+  opened on fix cycles, say the fix cycles grew mechanism the item did not
+  need. The answer is not more `cycles`: sharpen the item's acceptance so the
+  implementer knows where to stop, and check the fixer's commits for surface
+  that should simply be deleted.
 
 ## "The reviews are too strict"
 

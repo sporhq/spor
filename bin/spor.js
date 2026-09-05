@@ -12072,7 +12072,7 @@ function makeGateDeps(
     const priorText = prior
       .map(
         (p) =>
-          `${p.id} [${p.severity}${gatesKernel.categoryOf(p) === gatesKernel.UNMET_CONDITION ? `, ${gatesKernel.UNMET_CONDITION}` : ""}${carriedOf(p) ? `, carried ${carriedOf(p)} fix cycle${carriedOf(p) === 1 ? "" : "s"}` : ""}] ${p.file ? `${p.file} — ` : ""}${p.summary}` +
+          `${p.id} [${p.severity}${gatesKernel.categoryTag(p)}${carriedOf(p) ? `, carried ${carriedOf(p)} fix cycle${carriedOf(p) === 1 ? "" : "s"}` : ""}] ${p.file ? `${p.file} — ` : ""}${p.summary}` +
           (p.evidence ? `\n    evidence: ${String(p.evidence).replace(/\s+/g, " ").slice(0, 400)}` : "") +
           gatesKernel.mechanismRows(p.rows).map((r) => `\n    row (enumerated by the last review${Number.isInteger(p.rowsCycle) ? `, cycle ${p.rowsCycle}` : ""}): ${r}`).join("") +
           // An enumeration the LAST review did not re-confirm is replayed as
@@ -12088,7 +12088,7 @@ function makeGateDeps(
       // one it is about to keep (F1 on the fourth cut of this gate).
       .map(
         (p) =>
-          `${p.id} [${p.severity}${gatesKernel.categoryOf(p) === gatesKernel.UNMET_CONDITION ? `, ${gatesKernel.UNMET_CONDITION}` : ""}, undemonstrated at cycle ${p.opened}] ${p.file ? `${p.file} — ` : ""}${p.summary}`
+          `${p.id} [${p.severity}${gatesKernel.categoryTag(p)}, undemonstrated at cycle ${p.opened}] ${p.file ? `${p.file} — ` : ""}${p.summary}`
       )
       .join("\n");
     const verdictShape =
@@ -12098,12 +12098,12 @@ function makeGateDeps(
       // of this gate: the field was asked for and never shown). It is the one
       // OPTIONAL key here — omitting it keeps the finding's recorded category,
       // which is what a reviewer that is not reclassifying wants — so it is
-      // labelled as such, and the parser reads only the two category words, so
-      // an echo of this template reclassifies nothing.
+      // labelled as such, and the parser reads only the category vocabulary
+      // it was taught, so an echo of this template reclassifies nothing.
       (prior.length
-        ? ` "prior": [{"id": "${prior[0].id}", "status": "resolved" | "open", "note": "what you checked", "rows": ["each remaining row of the mechanism, when open"], "category": "correctness|unmet-condition — OPTIONAL, only to RECLASSIFY it; omit to keep the one it has"}],`
+        ? ` "prior": [{"id": "${prior[0].id}", "status": "resolved" | "open", "note": "what you checked", "rows": ["each remaining row of the mechanism, when open"], "category": "correctness|unmet-condition|unrequested-mechanism — OPTIONAL, only to RECLASSIFY it; omit to keep the one it has"}],`
         : "") +
-      ` "findings": [{"severity": "blocking|major|minor", "category": "correctness|unmet-condition", "file": "path", "summary": "what is wrong", "evidence": "the command/test you ran and what it showed"` +
+      ` "findings": [{"severity": "blocking|major|minor", "category": "correctness|unmet-condition|unrequested-mechanism", "file": "path", "summary": "what is wrong", "evidence": "the command/test you ran and what it showed"` +
       (cycle > 0 ? `, "introduced_by_fix": true | false` : "") +
       `}]}`;
     const prompt = [
@@ -12178,13 +12178,16 @@ function makeGateDeps(
       "",
       gate.instructions || "Look for correctness defects: does this change do what the work item asked, and does it break anything?",
       "",
-      "## Finding category — a defect and an unmet done condition are different findings",
+      "## Finding category — a defect, an unmet done condition and unrequested mechanism are different findings",
       "",
       "Every finding carries a `category`:",
       "",
       "- `correctness` (the default): the change is WRONG — a defect, silent data loss, a contract break.",
       "- `unmet-condition`: the change is not wrong, it does not do what the WORK ITEM ASKED. Its stated done",
       "  condition is unmet — a measured bar the result misses, a deliverable that was not attempted.",
+      "- `unrequested-mechanism`: the defect is real but it is in mechanism the item's acceptance does not require,",
+      "  and REMOVING that mechanism would also satisfy the finding. That removal test is the whole category: if",
+      "  deleting the surface would not close what you found, it is `correctness`, not this.",
       "",
       "Categorize honestly; they are answered differently. A defect is fixed. An unmet condition is met by a fresh,",
       "materially different attempt at the thing, or by a person re-scoping the item — never by more evidence that it",
@@ -12199,6 +12202,29 @@ function makeGateDeps(
       "of the same approach — has not met it: confirm the finding open and say so. A fix that files a decision",
       "re-scoping the item has not met it either, and accepting a re-scope is not a reviewer's call: confirm it open,",
       "name the decision in the note, and let the person the runner routes it to judge the re-scope.",
+      "",
+      "Unrequested mechanism is answered by DELETION, so it is recorded advisory and never fails this gate however",
+      "well you demonstrate it — the fixer is asked to remove the surface, not to harden it. Rate it honestly rather",
+      "than reaching for `correctness` to make it stick: a fix cycle spent hardening mechanism the item never asked",
+      "for is the budget gone, and the next review then attacks what that hardening added.",
+      "",
+      "## Scope — say what a blocking finding fails",
+      "",
+      "A blocking finding names ONE of two things, in its summary or its evidence: the line of the WORK ITEM's",
+      "acceptance the change does not meet, or the defect this DIFF introduces into behaviour that worked before.",
+      "A finding that is neither — a hardening you would like, a case the item never claimed to cover, a design you",
+      "would have chosen — is `major`/`minor`, recorded and not enforced.",
+      ...(cycle > 0
+        ? [
+            "",
+            "On a fix cycle this is where the budget goes: a previous fix added mechanism to answer a finding, and the",
+            "mechanism it added has its own defects, each true and each `introduced_by_fix`. Before you block on one, ask",
+            "the removal question and ANSWER it in the note: would deleting the mechanism this finding attacks also",
+            "satisfy the finding, and does the item's acceptance require that mechanism at all? If deleting it would",
+            "satisfy you, the finding is `unrequested-mechanism` — say so and let the fixer delete it, rather than",
+            "blocking until it is hardened enough that the next review finds the next hole in it.",
+          ]
+        : []),
       "",
       "## Durable retry/debt flags — review the mechanism WHOLE, in this one verdict",
       "",
@@ -12285,7 +12311,10 @@ function makeGateDeps(
     // named by ledger id; the fixer is told to name the ids it addressed so
     // the next review can answer "was F2 fixed" against its commits.
     const blocking = (findings || []).filter((f) => f.blocking !== false);
-    const advisory = (findings || []).filter((f) => f.blocking === false);
+    // …minus the ones released on acceptance grounds: they get their own
+    // section below, and "fix if cheap" is the opposite of what that section
+    // asks for.
+    const advisory = (findings || []).filter((f) => f.blocking === false && !gatesKernel.isUnrequestedMechanism(f));
     const resolved = (ledger || []).filter((e) => e.status === "resolved");
     // The blocking findings that already survived a fix cycle: the fixer is
     // asked to enumerate the mechanism's rows itself and say which the fix
@@ -12301,6 +12330,15 @@ function makeGateDeps(
     // three cycles of evidence that it was unmet and the rescue then met it in
     // one materially different attempt.
     const unmetFindings = blocking.filter((f) => gatesKernel.categoryOf(f) === gatesKernel.UNMET_CONDITION);
+    // The findings the review rated against mechanism the item never asked
+    // for (task-spor-factory-review-gate-fix-cycles-grow-unrequested-
+    // mechanism). These are always ADVISORY — the parser's acceptance floor
+    // downgrades them — so they arrive under `advisory`, not `blocking`, and
+    // the answer asked for is the opposite of the usual one: delete the
+    // surface the finding is about instead of hardening it. Read off the
+    // whole findings list rather than either bucket, so a fold that ever
+    // classifies one differently still routes it here.
+    const unrequestedFindings = (findings || []).filter((f) => gatesKernel.isUnrequestedMechanism(f));
     const carriedText = carriedFindings
       .map((f) => {
         const n = gatesKernel.carriedFixCycles(f, cycle);
@@ -12332,6 +12370,29 @@ function makeGateDeps(
             "above) — then fix so that ONE change closes them together, and state in the commit message which rows",
             "the fix closes and which it deliberately leaves and why. The next review reads that design; a fix that",
             "closes the row it was shown and leaves the next is a fix cycle spent.",
+          ]
+        : []),
+      ...(unrequestedFindings.length
+        ? [
+            "",
+            "Unrequested mechanism — DELETE it, do not extend it:",
+            gatesKernel.renderFindings(unrequestedFindings),
+            `${unrequestedFindings.length === 1 ? "This finding is" : "These findings are"} against mechanism the work item's acceptance does not require, and the review said`,
+            "removing that mechanism would close it. So remove it: delete the surface, or reduce it to the simplest",
+            "thing the item actually asked for, and say in the commit message what you deleted and why the item does",
+            "not need it. Do NOT answer these by hardening the mechanism — every guard you add to surface nobody asked",
+            "for is more surface for the next review to find a hole in, and that is the fix-cycle budget gone. These",
+            `${unrequestedFindings.length === 1 ? "does" : "do"} not block the gate; they are here because deleting is cheap and the right answer.`,
+          ]
+        : []),
+      ...(cycle > 0
+        ? [
+            "",
+            "Before you extend anything, ask whether a PREVIOUS fix cycle added it. A finding against mechanism your own",
+            "earlier cycle introduced is a signal that the mechanism should not be there: prefer deleting or simplifying",
+            "it to guarding it, and keep the change inside what the work item asked for — a prose contract for agents,",
+            "a helper, a derived scheme nobody requested is surface the next review will attack. Say in the commit",
+            "message which mechanism you removed and which you kept, and why the item needs what you kept.",
           ]
         : []),
       ...(unmetFindings.length
