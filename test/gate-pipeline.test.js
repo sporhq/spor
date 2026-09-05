@@ -4007,6 +4007,9 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.match(p0, /"evidence": "the command\/test you ran and what it showed"/);
   assert.doesNotMatch(p0, /## Prior findings/, "no prior set on the initial review");
   assert.doesNotMatch(p0, /introduced_by_fix/, "attribution is only asked for on a fix cycle");
+  // issue-spor-review-prompt-induces-finding-id-collisions: with no prior and
+  // no raised findings, no id is shown anywhere yet, so the section is skipped.
+  assert.doesNotMatch(p0, /## Finding ids —/, "no ids are in play on the initial review");
   // task-spor-review-gate-durable-debt-flag-checklist: the four failure modes
   // of a retry/debt flag are asked for in ONE verdict, and the block sits
   // after the gate's own instructions.
@@ -4067,6 +4070,12 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   // the field — labelled optional, since omitting it keeps the recorded one.
   assert.match(p1, /"prior": \[\{"id": "F1"[^\n]*"category": "correctness\|unmet-condition\|unrequested-mechanism — OPTIONAL, only to RECLASSIFY it; omit to keep the one it has"\}\]/);
   assert.match(p1, /omit it and the finding keeps the category it has/);
+  // issue-spor-review-prompt-induces-finding-id-collisions: a prior finding's
+  // id is on the prompt, so the section renders — but with no raised findings
+  // this cycle, it says nothing about upgrading one.
+  assert.match(p1, /## Finding ids — you name one only to answer `prior` or upgrade a raised finding\n\nA finding you raise FRESH under `findings` carries NO `id`/);
+  assert.match(p1, /its id goes under `prior`, never under `findings`\)\./, "no raised findings this cycle, so no upgrade clause");
+  assert.doesNotMatch(p1, /re-raising one of the undemonstrated findings/, "nothing was raised this cycle");
 
   // Review 3: F1 has survived two fixes — the prompt says so, replays the
   // rows the last review enumerated, and makes `rows` required for it.
@@ -4103,6 +4112,10 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.match(p2, /Confirm it open anyway if the condition is still unmet/);
   assert.match(p2, /F7 \[blocking, unmet-condition, undemonstrated at cycle 1\] q\.md — the deliverable was not attempted/);
   assert.match(p2, /F8 \[blocking, undemonstrated at cycle 1\] w\.js — loses the last write/);
+  // issue-spor-review-prompt-induces-finding-id-collisions: with raised
+  // findings on the prompt too, the section adds the upgrade clause.
+  assert.match(p2, /and re-raising one of the undemonstrated findings above under `findings` with ITS id to upgrade it\./);
+  assert.match(p2, /a numbering scheme of your own \(`F1`, `F2`, …\) can land on a name/);
 
   // And the fix prompt names the findings by id, splits advisory from blocking,
   // and lists what earlier cycles already resolved.

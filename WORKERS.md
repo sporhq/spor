@@ -1354,10 +1354,17 @@ verdict shape:
 
 ```json
 {"verdict": "pass" | "changes_requested",
- "prior": [{"id": "F1", "status": "resolved" | "open", "note": "..."}],
- "findings": [{"severity": "blocking|major|minor", "file": "...", "summary": "...",
+ "prior": [{"id": "F1", "status": "resolved" | "open", "note": "...",
+            "category": "correctness|unmet-condition|unrequested-mechanism — optional, only to reclassify it"}],
+ "findings": [{"severity": "blocking|major|minor", "category": "correctness|unmet-condition|unrequested-mechanism",
+               "file": "...", "summary": "...",
                "evidence": "the command/test run and what it showed", "introduced_by_fix": true | false}]}
 ```
+
+A finding raised fresh under `findings` carries no `id` — the ledger mints one when the verdict folds in. The
+only findings named by id are a `prior` answer (naming that entry's own id) and an upgrade of an earlier
+undemonstrated finding, re-raised under `findings` with its id (the "raised" entries described further down
+in this section).
 
 The runner then parses that block **in code** from the run's final report
 (`parseReviewVerdict`, lib/kernel/gates.js). Fail-closed throughout: a review

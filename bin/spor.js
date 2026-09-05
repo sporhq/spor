@@ -12415,6 +12415,20 @@ function makeGateDeps(
             "",
           ]
         : []),
+      ...(prior.length || raised.length
+        ? [
+            "## Finding ids — you name one only to answer `prior` or upgrade a raised finding",
+            "",
+            "A finding you raise FRESH under `findings` carries NO `id` — the ledger mints one once this verdict folds",
+            "in, and the fixer and the next review then address it by that name. The only findings you put an `id` on",
+            "are: answering an entry under `prior` above (its id goes under `prior`, never under `findings`)" +
+              (raised.length ? ", and re-raising one of the undemonstrated findings above under `findings` with ITS id to upgrade it." : ".") +
+            " Do not invent an id for anything else — a numbering scheme of your own (`F1`, `F2`, …) can land on a name",
+            "the ledger already uses for something else, and is then read as that other finding's name already taken,",
+            "not as the id of the finding you meant.",
+            "",
+          ]
+        : []),
       "## Severity — only `blocking` blocks",
       "",
       "- `blocking`: a correctness defect, silent data loss, or contract break that MUST be fixed before this lands —",
