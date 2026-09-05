@@ -160,6 +160,32 @@ test('no live claim -> claim-nudge fires once, naming the top eligible pool item
   }
 });
 
+// issue-spor-claim-nudge-fires-on-out-of-tree-writes: the cwd having a git
+// root is not enough — a Write/Edit whose target resolves OUTSIDE that repo
+// (a /tmp scratchpad, say) is not "editing this repo" and must not nudge,
+// even though the session's cwd is a real repo with a claimable pool.
+test('cwd is a repo but the edited file is outside it -> no claim-nudge, no lookup', async () => {
+  const { home, cwd, root } = scratch();
+  const { srv, hits, base } = await stubServer((url) =>
+    isAssigneeMe(url) ? { items: [] } : { items: [{ id: 'task-alpha', title: 'Alpha' }] }
+  );
+  try {
+    const env = freshEnv(home, { SPOR_SERVER: base, SPOR_TOKEN: 'spor_pat_test' });
+    const outsideFile = path.join(root, 'scratch.txt'); // sibling of cwd, outside the repo
+    const payload = JSON.stringify({
+      cwd, session_id: 's1', hook_event_name: 'PostToolUse',
+      tool_name: 'Write', tool_input: { file_path: outsideFile, content: 'x' },
+    });
+    const out = await runAsync(['post-tool', '--host', 'claude-code'], payload, env);
+    assert.strictEqual(out.trim(), '', 'an out-of-tree write must not nudge');
+    assert.ok(!hits.length, 'the lease lookup must not even fire for an out-of-tree write');
+    assert.strictEqual(journal(home).filter((e) => e.tool === 'claim-nudge').length, 0);
+    assert.ok(!fs.existsSync(path.join(home, 'journal', 's1.claim-nudged')));
+  } finally {
+    srv.close();
+  }
+});
+
 test('cooldown: a second write in the same session does not nudge again', async () => {
   const { home, cwd } = scratch();
   const { srv, hits, base } = await stubServer((url) =>

@@ -496,7 +496,14 @@ any non-200/unparseable/dead-server lease state → no nudge, exit 0 (never nudg
 during an outage). LOCAL mode is a no-op (returns before any side effect, so
 local output is byte-identical). The branch runs first and its nudge takes the
 single output envelope; the heartbeat branch returns null so a held-claim write
-still falls through to the capture nudge. See test/claim-nudge.test.js.
+still falls through to the capture nudge. The in-repo gate checks the EDITED
+FILE, not just the cwd: a git root backing the session's cwd is not enough —
+the write must resolve under that repo top (`u.repoRelativeCandidates`, the
+same test couplingNudge already applies to its own file-path gate), else a
+cwd-inside-a-repo write to an out-of-tree scratch file (e.g. `/tmp`) is not
+"editing this repo" and is silently skipped rather than nudged
+(issue-spor-claim-nudge-fires-on-out-of-tree-writes). See
+test/claim-nudge.test.js.
 
 The post-tool engine ALSO carries the FLEET liveness tick
 (task-spor-fleet-scheduler-client-heartbeat-tick) — REMOTE-MODE ONLY and the

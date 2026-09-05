@@ -328,12 +328,16 @@ function pendingResultCount(graph, session) {
 //
 // Gating (the capture-nudge lessons): remote/team mode only (a claim is
 // meaningless solo); in a real repo only (needs a project slug from a git
-// root); person-scoped nudge suppression but session-scoped heartbeat;
+// root) AND the edited file must resolve under that repo top (a cwd inside a
+// repo editing an out-of-tree scratch file, e.g. /tmp, is not "editing this
+// repo" — mirrors couplingNudge's own file-path gate,
+// issue-spor-claim-nudge-fires-on-out-of-tree-writes); person-scoped nudge
+// suppression but session-scoped heartbeat;
 // once-per-session cooldown via journal/<session>.claim-nudged; disable with
 // SPOR_CLAIM_NUDGE=0 (claimNudge.enabled:false). FAIL-OPEN: any error, or a
 // lease state we cannot verify (server down, non-200, unparseable), yields NO
 // nudge and exits 0 — never nudge during an outage, never block the tool loop.
-async function claimNudge({ graph, slug, session, cwd, remote }) {
+async function claimNudge({ graph, slug, session, cwd, file, remote }) {
   // Remote/team mode only — claims are meaningless without a shared server.
   if (!remote) return null;
   // Disable lever: SPOR_CLAIM_NUDGE=0 / claimNudge.enabled:false. Like the
@@ -345,8 +349,14 @@ async function claimNudge({ graph, slug, session, cwd, remote }) {
   // In-repo only: a real git root must back the slug, else this is a loose
   // directory and there is no project pool to claim from. (projectSlug falls
   // back to the cwd basename for a non-repo; the claim model is repo-scoped.)
-  const top = u.git(cwd, ["rev-parse", "--show-toplevel"]);
-  if (!top || !top.trim()) return null;
+  const top = u.git(cwd, ["rev-parse", "--show-toplevel"])?.trim();
+  if (!top) return null;
+  // The CWD having a git root is not enough — the tool must have actually
+  // EDITED something inside it. A Write/Edit whose target resolves outside the
+  // repo top (a /tmp scratchpad, e.g.) is not "editing this repo" and carries
+  // no claimable project pool, same reasoning couplingNudge already applies to
+  // its own file-path gate below (issue-spor-claim-nudge-fires-on-out-of-tree-writes).
+  if (file && !u.repoRelativeCandidates(top, file).length) return null;
 
   // The one no-LLM lookup: the viewer's own carried work in this project. The
   // bound (claimNudge.timeoutMs / SPOR_CLAIM_NUDGE_TIMEOUT, default 3s) keeps
@@ -775,7 +785,7 @@ async function postTool(input) {
     // precedence over the LLM capture nudge for the single output envelope. The
     // heartbeat branch returns null, so a held-claim write still falls through
     // to the nudges below. Both branches no-op in local mode. Fail-open.
-    const claim = await claimNudge({ graph, slug, session, cwd, remote }).catch(() => null);
+    const claim = await claimNudge({ graph, slug, session, cwd, file, remote }).catch(() => null);
     if (claim) return claim;
     // Coupling nudge (task-spor-coupling-nudge-posttool) runs SECOND: a
     // deterministic declared-coupling hit beats the LLM capture classifier for
