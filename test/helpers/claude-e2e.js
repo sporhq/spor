@@ -159,6 +159,32 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // scan catches exactly that (same reasoning as gate-pipeline's
 // stopOrphanedRuns). Cheap when there is nothing to reap: each pass costs one
 // /proc scan and no sleep unless it actually finds a pid.
+// Wait (without killing anything) for any process tagged with `markers` to
+// finish on its own, so a caller about to reclaim shared paths doesn't yank
+// them out from under a detached grandchild that is still reading them —
+// the opposite failure mode from reapAndClean below, which is for a caller
+// that no longer cares whether the process survives. Bounded two ways: a
+// `warmupMs` grace period to let a marked process even get scheduled/spawn
+// under load before we conclude nothing is coming, and an overall `maxMs`
+// cap so a process that genuinely never exits (crashed mid-write, wedged)
+// can't wedge teardown forever. Cheap when nothing is tagged: one /proc scan
+// per `stepMs` until warmupMs elapses, no sleep beyond that.
+async function waitForMarkedQuiescence(markers, { warmupMs = 5000, maxMs = 20000, stepMs = 100 } = {}) {
+  const start = Date.now();
+  let sawAny = false;
+  for (;;) {
+    const elapsed = Date.now() - start;
+    if (elapsed >= maxMs) return;
+    const pids = markedPids(markers);
+    if (pids.length) {
+      sawAny = true;
+    } else if (sawAny || elapsed >= warmupMs) {
+      return; // it ran and finished, or nothing ever showed up
+    }
+    await sleep(stepMs);
+  }
+}
+
 async function reapAndClean(markers, paths, { deadlineMs = 2000, stepMs = 100, passes = 2 } = {}) {
   for (let pass = 0; pass < passes; pass++) {
     let pids = markedPids(markers);
@@ -283,7 +309,7 @@ function runClaude({
     const outFd = fs.openSync(outPath, "w");
     const errFd = fs.openSync(errPath, "w");
     let settled = false;
-    const finish = (code, timedOut) => {
+    const finish = async (code, timedOut) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -315,16 +341,27 @@ function runClaude({
       } catch {
         /* non-JSON / crash */
       }
-      // NOT reaped here: the SessionEnd hook is declared `"async": true` in
+      // NOT KILLED here: the SessionEnd hook is declared `"async": true` in
       // hooks.json, so Claude Code does not wait for it before letting this
       // `claude` process exit — the `spor-hook distill` invocation it fires
       // inherits this same CLAUDE_CONFIG_DIR/HOME and can still be genuinely
-      // at work the instant we get here. Killing anything tagged with these
-      // paths on this exact event would race the SessionEnd distiller itself,
-      // not just a harmless daemon — the caller that actually depends on that
-      // work (the SessionEnd distill test) waits for it on its own terms and
-      // reaps what's left via makeScratchGraph's cleanup, tagged by SPOR_HOME
-      // instead (task-spor-e2e-claude-scratch-home-leak).
+      // at work the instant we get here. But we DO need to wait before
+      // deleting configDir/fakeHome below: the transcript claude wrote this
+      // session's turns to lives under CLAUDE_CONFIG_DIR
+      // (`<configDir>/projects/.../<session>.jsonl`), and distill() reads it
+      // by path with no retry — an unconditional early `return null` (silent,
+      // no journal/distill.log line at all) the instant the file is missing.
+      // Under heavy CPU contention (issue-spor-e2e-claude-distill-test-fails-
+      // on-devbox) the detached hook process can take a beat just to get
+      // scheduled/spawned; deleting configDir synchronously on `exit` (as
+      // this used to) routinely won that race and silently discarded the
+      // async distill before it ever read the transcript. Wait for any
+      // process still tagged with this run's configDir/fakeHome to finish on
+      // its own before reclaiming those paths — best-effort and bounded, so
+      // a hook that never touches them (the NOTHING_CMD default) costs
+      // nothing once it's gone, and a genuinely hung one doesn't wedge
+      // teardown forever.
+      await waitForMarkedQuiescence([configDir, fakeHome]);
       for (const p of [configDir, fakeHome, outPath, errPath]) {
         try {
           fs.rmSync(p, { recursive: true, force: true });
