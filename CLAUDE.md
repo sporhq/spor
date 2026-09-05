@@ -819,14 +819,24 @@ agent that wrote its resolver and then hung — or one whose supervisor was
 killed inside the 60s grace — genuinely finished the work, and filing it as an
 unenforced `reported` gates and cools an item that is done. Only a POSITIVE
 reading ever overwrites what a record says, so an unreachable graph leaves the
-provisional verdict exactly as it was. Two things the idle stop deliberately
-does NOT do: it never releases the LEASE (that is the terminal contract's job,
-part of filing a report a wedged run never produced — leaving it held keeps
-other workers off the node and self-heals at its TTL), and where there was
-nothing of ours to signal — or the stop did not take — it takes the WATCHDOG's
-cooldown rather than the ordinary refusal window, since it then only stopped
-FOLLOWING the run and a second agent must not land in a checkout the first may
-still hold. There is deliberately no `--no-claim` passthrough (the lease is the only
+provisional verdict exactly as it was. The idle stop then runs the terminal
+contract's RELEASE leg on the wedged run's behalf
+(issue-spor-idle-stop-never-releases-lease, `releaseIdleLease` in bin/spor.js,
+remote mode only): a run that never filed a report never released its claim,
+so the node stayed invisible to every other worker until the lease's TTL. It
+keeps the contract's guards — only the lease THIS dispatch established
+(`release_node`, stamped on the run RECORD at launch since the supervisor
+unlinks its job file on read; `server` rides with it), never after a
+`resolved` reading, only for a run that actually ENDED, and only against the
+graph the run was dispatched on (`runGraphMatches`; a record stamped with
+another server is neither verified nor released from here, the fail-safe half
+of the tenant-door gap) — and lands `lease_released` on the record AFTER
+`closeRun`, so a crash between the two leaves a closed record and a held
+lease, never a released lease with no record of why. Where there was nothing
+of ours to signal — or the stop did not take — the lease stays HELD and the
+node takes the WATCHDOG's cooldown rather than the ordinary refusal window,
+since it then only stopped FOLLOWING the run and a second agent must not land
+in a checkout the first may still hold. There is deliberately no `--no-claim` passthrough (the lease is the only
 thing keeping two pull workers off one node), and numeric options are REFUSED
 rather than silently replaced (`--max $UNSET` must not become an unbounded
 worker). The LOOP never passes `--force` (a loop

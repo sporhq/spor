@@ -1825,6 +1825,236 @@ test("pollWorkRuns: a contract-pending record the graph does NOT show resolved i
   assert.strictEqual(dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record).contract_pending, true);
 });
 
+// ------------------------------------------ pollWorkRuns: idle + the lease --
+//
+// issue-spor-idle-stop-never-releases-lease: a wedged run never runs the
+// terminal-state contract, so nothing released its claim — the node stayed
+// invisible to every other worker for the rest of the lease's TTL. The idle
+// arm now runs the contract's release leg on its behalf, with the contract's
+// guards (only OUR lease, never after a resolved reading, only for a run that
+// ENDED, only against the graph it was claimed on). Driven through the real
+// wiring against a fake server.
+
+function leaseServer({ resolved = false, releaseStatus = 200 } = {}) {
+  const http = require("node:http");
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      hits.push({ method: req.method, url: req.url, body });
+      if (req.method === "GET" && req.url === "/v1/nodes/task-wedged") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          id: "task-wedged", type: "task", status: "open",
+          ...(resolved ? { resolution: { by: "dec-retry-added", edge: "resolves" } } : {}),
+        }));
+        return;
+      }
+      if (req.method === "POST" && req.url === "/v1/nodes/task-wedged/release") {
+        res.writeHead(releaseStatus, { "content-type": "application/json" });
+        res.end(JSON.stringify(releaseStatus === 200 ? { ok: true, status: "released" } : { error: { code: "boom", message: "nope" } }));
+        return;
+      }
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end("{}");
+    });
+  });
+  return {
+    hits,
+    listen: async () => { await new Promise((r) => srv.listen(0, "127.0.0.1", r)); return `http://127.0.0.1:${srv.address().port}`; },
+    close: () => new Promise((r) => srv.close(r)),
+  };
+}
+
+function remotePollFixture(base) {
+  const { home } = pollFixture();
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: "t" } });
+  return { home, cfg };
+}
+
+function idleRecord(home, runId, proc, extra = {}) {
+  return writeRecord(home, runId, {
+    state: "running",
+    launch_mode: "supervised-jsonl",
+    created_at: new Date(Date.now() - 3600000).toISOString(),
+    log_path: silentLog(home, runId, 3600000),
+    ...(proc ? { runner_pid: proc.pid, runner_started_ticks: proc.ticks } : {}),
+    ...extra,
+  });
+}
+
+test("pollWorkRuns: stopping an idle run RELEASES the lease this dispatch established, so the node returns to the pool instead of lapsing at TTL", async () => {
+  const fake = leaseServer();
+  const base = await fake.listen();
+  const { home, cfg } = remotePollFixture(base);
+  const proc = liveProcess();
+  try {
+    const runId = "run-idle-lease-1";
+    idleRecord(home, runId, proc, { release_node: "task-wedged", server: base });
+    const warned = [];
+    const [verdict] = await sporCli.pollWorkRuns(cfg, [runId], { maxAgeMs: 86400000, idleMs: 60000, warn: (l) => warned.push(l) });
+    assert.strictEqual(verdict.terminal, true);
+    assert.strictEqual(verdict.record.state, "failed");
+    assert.strictEqual(verdict.record.termination_signal, "idle-timeout");
+    assert.strictEqual(verdict.record.terminal_state, "failed");
+    assert.strictEqual(verdict.record.lease_released, true);
+    assert.match(verdict.record.terminal_note, /its lease on task-wedged was released/);
+    assert.match(warned.join("\n"), /Its lease on task-wedged was released/);
+    // The graph was re-read BEFORE the release — a resolved target must never
+    // be released after the fact — and the release is the contract's own door.
+    // The `GET /v1/schema` in between is the verify leg asking the LIVE
+    // registry (issue-spor-remote-dispatch-ignores-resident-resolution-hooks),
+    // not this issue's concern.
+    const order = fake.hits.map((h) => `${h.method} ${h.url}`);
+    assert.deepStrictEqual(order, ["GET /v1/nodes/task-wedged", "GET /v1/schema", "POST /v1/nodes/task-wedged/release"]);
+    // Durable: `spor runs` reads the file, and the gate namespace is untouched.
+    const onDisk = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+    assert.strictEqual(onDisk.lease_released, true);
+    assert.strictEqual(onDisk.state, "failed");
+    assert.strictEqual(await goneWithin(proc.pid), true);
+  } finally {
+    proc.kill();
+    await fake.close();
+  }
+});
+
+test("pollWorkRuns: an idle run whose target reads RESOLVED on the server releases nothing — the resolver already took it out of the pool", async () => {
+  const fake = leaseServer({ resolved: true });
+  const base = await fake.listen();
+  const { home, cfg } = remotePollFixture(base);
+  const proc = liveProcess();
+  try {
+    const runId = "run-idle-lease-2";
+    idleRecord(home, runId, proc, { release_node: "task-wedged", server: base });
+    const [verdict] = await sporCli.pollWorkRuns(cfg, [runId], { maxAgeMs: 86400000, idleMs: 60000 });
+    assert.strictEqual(verdict.record.terminal_state, "resolved");
+    assert.strictEqual(verdict.record.resolved_by, "dec-retry-added");
+    assert.strictEqual(verdict.record.lease_released, undefined, "a resolved verdict never carries a release, exactly as the contract's does not");
+    assert.ok(!fake.hits.some((h) => h.url.endsWith("/release")), `no release call, got: ${fake.hits.map((h) => h.url).join(" ")}`);
+  } finally {
+    proc.kill();
+    await fake.close();
+  }
+});
+
+test("pollWorkRuns: a release the server refuses leaves the record closed and says the lease is still held", async () => {
+  const fake = leaseServer({ releaseStatus: 500 });
+  const base = await fake.listen();
+  const { home, cfg } = remotePollFixture(base);
+  const proc = liveProcess();
+  try {
+    const runId = "run-idle-lease-3";
+    idleRecord(home, runId, proc, { release_node: "task-wedged", server: base, gate_state: "running" });
+    const warned = [];
+    const [verdict] = await sporCli.pollWorkRuns(cfg, [runId], { maxAgeMs: 86400000, idleMs: 60000, warn: (l) => warned.push(l) });
+    assert.strictEqual(verdict.terminal, true, "a failed release never costs the verdict already earned");
+    assert.strictEqual(verdict.record.state, "failed");
+    assert.strictEqual(verdict.record.lease_released, false);
+    assert.match(verdict.record.terminal_note, /could not be released — HTTP 500; run 'spor release task-wedged'/);
+    assert.match(warned.join("\n"), /Its lease on task-wedged is still held/);
+    const onDisk = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+    assert.strictEqual(onDisk.lease_released, false);
+    assert.strictEqual(onDisk.gate_state, "running", "the out-of-band gate namespace survives the stamp");
+  } finally {
+    proc.kill();
+    await fake.close();
+  }
+});
+
+test("pollWorkRuns: a run this worker only stopped FOLLOWING keeps its lease held — something may still be in its checkout", async () => {
+  // No process of ours to signal: the run did not END, so a held lease is
+  // exactly what keeps a second agent out of that checkout until the TTL.
+  const fake = leaseServer();
+  const base = await fake.listen();
+  const { home, cfg } = remotePollFixture(base);
+  // The same native-background shape as the local-mode cooldown test above:
+  // the harness's daemon still lists the agent, and the only channel we can
+  // read is its bound session transcript.
+  const runId = "run-idle-lease-4";
+  const cwd = path.join(home, "checkout");
+  const configDir = path.join(home, "cc");
+  const projectDir = path.join(configDir, "projects", cwd.replace(/[^A-Za-z0-9]/g, "-"));
+  fs.mkdirSync(projectDir, { recursive: true });
+  const transcript = path.join(projectDir, "sid-held.jsonl");
+  fs.writeFileSync(transcript, "{}\n");
+  const anHourAgo = (Date.now() - 3600000) / 1000;
+  fs.utimesSync(transcript, anHourAgo, anHourAgo);
+  writeRecord(home, runId, {
+    state: "running", launch_mode: "native-background", session_id: "sid-held", cwd,
+    created_at: new Date(Date.now() - 3600000).toISOString(),
+    release_node: "task-wedged", server: base,
+  });
+  process.env.SPOR_FAKE_AGENTS_JSON = JSON.stringify([{ id: "a9", sessionId: "sid-held", kind: "background", state: "running", cwd }]);
+  process.env.CLAUDE_CONFIG_DIR = configDir;
+  try {
+    const [verdict] = await sporCli.pollWorkRuns(cfg, [runId], { maxAgeMs: 86400000, idleMs: 60000 });
+    assert.strictEqual(verdict.terminal, true);
+    assert.strictEqual(verdict.cool_ms, 60000);
+    assert.strictEqual(verdict.record.lease_released, false);
+    assert.match(verdict.record.terminal_note, /left HELD — something may still be running in its checkout/);
+    assert.ok(!fake.hits.some((h) => h.url.endsWith("/release")), "nothing released");
+  } finally {
+    delete process.env.CLAUDE_CONFIG_DIR;
+    process.env.SPOR_FAKE_AGENTS_JSON = "[]";
+    await fake.close();
+  }
+});
+
+test("pollWorkRuns: a run with no lease of ours (--no-claim, --force) releases nothing, and a lease on ANOTHER graph is left to that tenant's TTL", async () => {
+  const fake = leaseServer();
+  const base = await fake.listen();
+  const { home, cfg } = remotePollFixture(base);
+  const a = liveProcess();
+  const b = liveProcess();
+  try {
+    idleRecord(home, "run-idle-lease-5", a, { server: base }); // release_node absent: not ours to hand back
+    idleRecord(home, "run-idle-lease-6", b, { release_node: "task-wedged", server: "http://127.0.0.1:1" });
+    const [five, six] = await sporCli.pollWorkRuns(cfg, ["run-idle-lease-5", "run-idle-lease-6"], { maxAgeMs: 86400000, idleMs: 60000 });
+    assert.strictEqual(five.record.state, "failed");
+    assert.strictEqual(five.record.lease_released, undefined, "`lease_released: false` would send the operator to yank someone else's live claim");
+    assert.strictEqual(six.record.state, "failed");
+    assert.strictEqual(six.record.terminal_enforced, false, "the foreign run was never verified against THIS worker's graph — that would be answering about the wrong tenant");
+    assert.strictEqual(six.record.lease_released, false);
+    assert.match(six.record.terminal_note, /claimed against http:\/\/127\.0\.0\.1:1, not this worker's graph/);
+    assert.deepStrictEqual(fake.hits.map((h) => `${h.method} ${h.url}`), ["GET /v1/nodes/task-wedged", "GET /v1/schema"], "one verify read (node + live-registry) for the run that IS ours; the foreign one touched this server for nothing");
+  } finally {
+    a.kill();
+    b.kill();
+    await fake.close();
+  }
+});
+
+test("verifyRunResolution: a record stamped with another server is never verified against this worker's graph", async () => {
+  const fake = leaseServer({ resolved: true });
+  const base = await fake.listen();
+  const { cfg } = remotePollFixture(base);
+  try {
+    assert.strictEqual(await sporCli.verifyRunResolution(cfg, { run_id: "x", node_id: "task-wedged", server: "http://127.0.0.1:1" }), null);
+    assert.strictEqual(fake.hits.length, 0);
+    const own = await sporCli.verifyRunResolution(cfg, { run_id: "x", node_id: "task-wedged", server: `${base}/` });
+    assert.strictEqual(own && own.terminal_state, "resolved", "a trailing slash is the same door");
+    assert.strictEqual(sporCli.runGraphMatches(cfg, { node_id: "task-wedged" }), true, "an unstamped (older, or local-mode) record is taken to be this worker's");
+  } finally {
+    await fake.close();
+  }
+});
+
+test("pollWorkRuns: in LOCAL mode the idle stop touches no lease — there is none", async () => {
+  const { home, cfg } = pollFixture();
+  const proc = liveProcess();
+  try {
+    const runId = "run-idle-local-lease";
+    idleRecord(home, runId, proc, { release_node: "task-wedged" });
+    const [verdict] = await sporCli.pollWorkRuns(cfg, [runId], { maxAgeMs: 86400000, idleMs: 60000 });
+    assert.strictEqual(verdict.record.state, "failed");
+    assert.strictEqual(verdict.record.lease_released, undefined);
+    assert.doesNotMatch(verdict.record.terminal_note, /lease/);
+  } finally {
+    proc.kill();
+  }
+});
+
 // ------------------------------------------ pollWorkRuns: native evidence --
 //
 // task-spor-retire-native-bg-enumerated-skip-after-supervised-default: every

@@ -8826,6 +8826,14 @@ async function launchSupervisedHarness(cfg, {
     ...(itemRepo ? { item_repo: itemRepo } : {}),
     log_path: p.log,
     report_path: p.report,
+    // The lease this launch established (and only that one — see `release_node`
+    // on the job below), and the graph it was claimed against, carried on the
+    // RECORD as well as the job: the supervisor unlinks its job file the
+    // moment it has read it, and the record is all a later worker has when it
+    // stops a wedged run and hands the lease back on the contract's behalf
+    // (issue-spor-idle-stop-never-releases-lease).
+    release_node: releaseNode || null,
+    server: server || null,
   };
   dispatchRuns.pruneRuns(cfg.userConfigHome(), { maxAgeMs: cfg.getNum("dispatch.runRetentionMs", 1209600000) });
   writePrivate(p.prompt, prompt);
@@ -9027,13 +9035,17 @@ function cmdRuns(cfg, { values, positionals: pos }) {
       out(`  outcome:    ${r.terminal_state}${r.terminal_enforced ? "" : " (unenforced)"}${r.resolved_by ? ` by ${r.resolved_by}` : ""}`);
       if (r.terminal_note) out(`  note:       ${r.terminal_note}`);
       if (r.report_node_id) out(`  artifact:   ${r.report_node_id}`);
-      if (r.lease_released === false && r.terminal_enforced && r.node_id) {
-        // Not "still held": a `false` here means the handback was never
-        // confirmed, which also covers a release the server committed and
-        // whose answer we lost (WORKERS.md §8). The remedy reconciles either
-        // way — `/release` is idempotent and a claim someone else now holds
-        // answers 409 — so the hint says what we know, not what we assume.
-        out(`  lease:      handback unconfirmed — hand it back with 'spor release ${r.node_id}' (idempotent) or wait out the TTL`);
+      // Not "still held": a `false` here means the handback was never
+      // confirmed, which also covers a release the server committed and
+      // whose answer we lost (WORKERS.md §8), or one the idle stop left HELD
+      // on the contract's behalf rather than even attempting
+      // (issue-spor-idle-stop-never-releases-lease — that arm is necessarily
+      // unenforced, so this hint is no longer gated on `terminal_enforced`).
+      // The remedy reconciles either way — `/release` is idempotent and a
+      // claim someone else now holds answers 409 — so the hint says what we
+      // know, not what we assume.
+      if (r.lease_released === false && r.node_id) {
+        out(`  lease:      handback unconfirmed — hand it back with 'spor release ${r.release_node || r.node_id}' (idempotent) or wait out the TTL`);
       }
     }
     if (r.termination_reason) out(`  why:        ${r.termination_reason}`);
@@ -10368,11 +10380,16 @@ function runSupervisorAlive(pid, ticks, opts) {
 // The door is this worker's own config (same box, same tenant), except the
 // LOCAL graph home, which is read back from the run's own job file: the
 // launcher resolved that home for this run and a repo `graph:` binding can make
-// it differ from the worker's cwd-resolved one.
+// it differ from the worker's cwd-resolved one. The run's own token is never
+// persisted, so a run dispatched under a DIFFERENT `--org`/`--server` cannot
+// be verified from here at all — and reading the worker's tenant for it would
+// be answering about the wrong graph, so that case refuses (returns null,
+// the fail-safe reading) rather than guessing (`runGraphMatches`).
 async function verifyRunResolution(cfg, record) {
   const nodeId = record && record.node_id;
   if (!nodeId) return null;
   if (remote.isRemote(cfg)) {
+    if (!runGraphMatches(cfg, record)) return null;
     let res = null;
     try {
       res = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}`);
@@ -10401,6 +10418,72 @@ async function verifyRunResolution(cfg, record) {
     job = JSON.parse(fs.readFileSync(dispatchRuns.runPaths(cfg.userConfigHome(), record.run_id).job, "utf8"));
   } catch { /* the job file has been pruned, or predates local_nodes_dir */ }
   return dispatchTerminal.verifyLocalResolution((job && job.local_nodes_dir) || cfg.nodesDir(), nodeId);
+}
+
+// Whether the graph this worker talks to is the one the run was dispatched
+// against. A record stamped with a `server` names its door; an older record
+// (or a local-mode one) carries none and is taken to be this worker's, exactly
+// as before the stamp existed.
+function runGraphMatches(cfg, record) {
+  const own = String((record && record.server) || "").replace(/\/+$/, "");
+  return !own || own === remote.base(cfg);
+}
+
+// Hand back the lease of a run the idle ceiling just STOPPED, on behalf of the
+// terminal-state contract that run will never execute
+// (issue-spor-idle-stop-never-releases-lease). A wedged run produces no report,
+// so nothing else ever releases its claim: the node stays invisible to every
+// other worker for the rest of the lease's TTL. This is the contract's own
+// release leg (dispatch-terminal.js releaseLease), run by the only process left
+// to run it, with the contract's own guards:
+//
+//   - only a lease THIS dispatch established is ours to hand back
+//     (`release_node`, never `node_id` — a `--force` re-dispatch renews a lease
+//     that may belong to an agent still running);
+//   - a run whose target reads RESOLVED releases nothing, as the contract's
+//     `resolved` verdict releases nothing — the resolver has already taken the
+//     item out of the pool, and a release after the fact would only be noise;
+//   - the run must have ENDED. Where we only stopped FOLLOWING it (nothing of
+//     ours to signal, or a process that survived SIGKILL), something may still
+//     be working in that checkout, and a held lease is exactly what keeps a
+//     second agent out of it; it lapses at its TTL (dec-cc-task-claim-lease);
+//   - the lease lives on the graph the run was dispatched against, so a
+//     record stamped with a different server is left to that tenant's TTL.
+//
+// Local mode holds no lease, so it is a no-op there. A failed release costs
+// nothing already earned: the record is closed, and `lease_released: false`
+// is what `spor runs` turns into the 'release it yourself' hint.
+async function releaseIdleLease(cfg, home, record, { ended = false, outcome = null } = {}) {
+  if (!record || !record.run_id || !remote.isRemote(cfg)) return record;
+  const releaseNode = record.release_node || null;
+  if (!releaseNode || outcome) return record;
+  const stamp = (patch) => dispatchRuns.stampRun(home, record.run_id, patch) || { ...record, ...patch };
+  if (!runGraphMatches(cfg, record)) {
+    return stamp({
+      lease_released: false,
+      terminal_note: `${record.terminal_note} (its lease on ${releaseNode} was claimed against ${record.server}, not this worker's graph, and was left to lapse at its TTL)`,
+    });
+  }
+  if (!ended) {
+    return stamp({
+      lease_released: false,
+      terminal_note: `${record.terminal_note} (its lease on ${releaseNode} was left HELD — something may still be running in its checkout; it lapses at its TTL, or run 'spor release ${releaseNode}')`,
+    });
+  }
+  let r = null;
+  try {
+    r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(releaseNode)}/release`, {}, { timeoutMs: 6000 });
+  } catch (e) {
+    r = { ok: false, status: 0, error: e.message };
+  }
+  if (r && r.ok) {
+    return stamp({ lease_released: true, terminal_note: `${record.terminal_note}; its lease on ${releaseNode} was released` });
+  }
+  const why = (r && (r.error || `HTTP ${r.status}`)) || "no response";
+  return stamp({
+    lease_released: false,
+    terminal_note: `${record.terminal_note} (the lease could not be released — ${why}; run 'spor release ${releaseNode}')`,
+  });
 }
 
 // Which of this worker's runs are over, and what they did to the graph.
@@ -10462,11 +10545,18 @@ async function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, idleMs = 0, warn = () =
       // reconciles it again, so "we sent SIGTERM" is not enough to believe the
       // checkout is free.
       const ended = (stopped.child || stopped.supervisor || stopped.group) && !stopped.alive;
+      // The contract's release leg, which this run will never reach on its
+      // own — AFTER the record is closed, so a crash between the two leaves a
+      // closed record and a held lease (lapsing at its TTL), never a released
+      // lease with no record of why.
+      const released = await releaseIdleLease(cfg, home, closed, { ended, outcome });
       warn(
         `work: ${ended ? "stopping" : "giving up following"} run ${String(id).slice(0, 8)} (${record.node_id || record.name || "?"}) — nothing written to its log or transcript for ` +
           `${Math.max(1, Math.round((verdict.quietMs || 0) / 60000))}m (idle ceiling ${Math.max(1, Math.round(idleMs / 60000))}m)` +
           `${ended ? "" : `; ${stopped.alive ? "it did not die on SIGTERM/SIGKILL" : "it had no process of ours to signal"}, so something may still be running in its checkout`}` +
-          `${outcome ? ". Its target reads resolved on the graph" : ""}.`
+          `${outcome ? ". Its target reads resolved on the graph" : ""}` +
+          `${released && released.lease_released === true ? `. Its lease on ${released.release_node} was released` : ""}` +
+          `${released && released.lease_released === false ? `. Its lease on ${released.release_node} is still held` : ""}.`
       );
       out.push({
         run_id: id, terminal: true,
@@ -10477,7 +10567,7 @@ async function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, idleMs = 0, warn = () =
         // the silence we waited out, rather than re-dispatching into a checkout
         // something may still hold.
         ...(ended ? {} : { cool_ms: idleMs }),
-        record: closed,
+        record: released,
       });
       continue;
     }
@@ -16923,7 +17013,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget };
+module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget };
 
 if (require.main === module) {
   main()

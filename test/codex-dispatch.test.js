@@ -16,6 +16,7 @@ const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const { getHarness, harnesses, codexPrepareRun } = require("../lib/shell/dispatch-harnesses.js");
 const { writeSpawnableNodeStub, writeNodeScript } = require("./helpers/portable.js");
 const { waitFor, awaitJson, awaitRecord, stubExitTail } = require("./helpers/launch.js");
+const runner = require("../lib/shell/agent-dispatch-runner.js");
 
 function cleanEnv(extra = {}) {
   const env = {};
@@ -565,6 +566,14 @@ test("a supervised Codex launch failure releases the lease established by this d
     assert.ok(hits.some((hit) => hit.url === "/v1/nodes/task-codex/claim"));
     assert.ok(hits.some((hit) => hit.url === "/v1/nodes/task-codex/release"));
     assert.match(result.stdout, /released the claim/);
+    // The record (not just the supervisor's job file, which it unlinks on
+    // read) carries the lease this dispatch established and the graph it was
+    // claimed on — what a later worker stopping this run as idle hands back
+    // (issue-spor-idle-stop-never-releases-lease).
+    const records = runner.readRunRecords(home).filter((r) => r.node_id === "task-codex");
+    assert.strictEqual(records.length, 1);
+    assert.strictEqual(records[0].release_node, "task-codex");
+    assert.strictEqual(records[0].server, base);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

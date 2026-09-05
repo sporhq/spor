@@ -874,7 +874,19 @@ transcript have both stopped moving for `work.runIdleMs` (`--run-idle`, default
 because a wedged agent otherwise holds its worker's slot, its lease and its
 worktree until the 24-hour `--run-max` watchdog. Its *outcome* is still a graph
 read: an agent that wrote its resolver and then hung reads `resolved`, and
-being stopped is not evidence otherwise.
+being stopped is not evidence otherwise. A wedged run never reaches §6's
+release leg on its own, so the worker that stopped it runs that leg on the
+contract's behalf, under the contract's own guards: only the lease **this**
+dispatch established is handed back (`release_node`, never a `--force`
+re-dispatch's borrowed one), never after a `resolved` reading (the resolver
+already took the item out of the pool), only for a run that actually
+**ended** — where the worker merely stopped *following* it (nothing of ours
+to signal, or a process that survived SIGKILL) the lease stays held, since it
+is what keeps a second agent out of a checkout the first may still occupy, and
+lapses at its TTL — and only against the graph the run was dispatched on (a
+record stamped with another server is left to that tenant's TTL). The record
+carries the result as `lease_released` exactly as a contract-filed run does,
+and a refused release is a `spor release <id>` hint, never a lost verdict.
 
 What the ceiling measures is **silence**, not idleness. A run's observable
 output — the supervisor's JSONL log, or a native launch's session transcript —
