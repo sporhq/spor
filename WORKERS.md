@@ -317,20 +317,23 @@ writing its resolver still finished the job.
 
 | Value | Means | How it's earned |
 |---|---|---|
-| `resolved` | the target is genuinely done | re-reading the graph shows a **live inbound `resolves`/`answers` edge** onto the target node |
-| `reported` | not done, but the work reached the graph | no resolving edge, but the worker's final report was filed as an artifact `relates-to` the target |
-| `failed` | nothing usable reached the graph | no resolving edge and no usable report |
-| `declined` | the worker declared the ITEM wrong, not the work unfinished | no resolving edge, and the final report's **first line** is `DECLINED: <reason>` — the reason is filed as a `finding` on the target, its `readiness: agent` stamp is cleared, and the lease is released; the item goes to triage, never to a gate |
+| `resolved` | the target is genuinely done | re-reading the graph shows a **live inbound `resolves`/`answers` edge** onto the target node — or, for a type retired by status rather than by an edge, that the node's **own status** has reached its type's terminal partition |
+| `reported` | not done, but the work reached the graph | no attestation of completion, but the worker's final report was filed as an artifact `relates-to` the target |
+| `failed` | nothing usable reached the graph | no attestation of completion and no usable report |
+| `declined` | the worker declared the ITEM wrong, not the work unfinished | no attestation of completion, and the final report's **first line** is `DECLINED: <reason>` — the reason is filed as a `finding` on the target, its `readiness: agent` stamp is cleared, and the lease is released; the item goes to triage, never to a gate |
 
 **`resolved` is a graph read, never an exit code, never the worker's own
 claim.** Re-fetch the node — `GET /v1/nodes/{id}` — and check its
 `resolution` enrichment (API.md §3, the `get()` hook the seed
 `task`/`issue`/`question`/`incident` schemas attach): a live, visible,
-inbound `resolves` or `answers` edge, carrying the resolver's id. Its absence
+inbound `resolves` or `answers` edge, carrying the resolver's id. (A type
+whose schema attaches no such hook is retired by its own status instead, and
+is read that way — see "Two attestation paths" below; the rest of this
+section applies unchanged to both.) The absence of the attestation
 is the answer for a worker that *claims* success without writing one — that
 absence reads as `reported` or `failed`, never `resolved`. This is the
 single most important rule in this document: **a worker's own "I'm done" is
-not evidence; a resolving edge on the graph is.**
+not evidence; the graph's own attestation is.**
 
 **Report presence — not exit status — discriminates `reported` from
 `failed`.** A run that crashed midway but had already produced a usable
@@ -338,7 +341,7 @@ final report is `reported`, not `failed`; the crash itself is a separate,
 process-level fact (§8's `state`/`termination_*` fields), never conflated
 with the outcome. The invariant a consumer keys on: whenever a report
 artifact id is present, `terminal_state` is `reported` — always, whether the
-verdict was fully verified or not (see "unverifiable targets" below).
+verdict was enforced or not (see "What 'enforced' means" below).
 The one thing that is NOT a report is the harness's own declaration that
 the run failed: a supervised Claude Code stream whose terminal `result` event
 carries `is_error: true` writes no report file at all — its text is the
@@ -383,62 +386,141 @@ local-mode run still reads a decline as `declined` (unenforced: nothing filed,
 nothing cleared) rather than as an unenforced `reported`, so a local factory
 does not gate it either.
 
-**Unverifiable targets.** Only node types whose completion is a *resolving
-edge* rather than a status flip — `task`, `issue`, `question`, `incident` —
-can be judged for `resolved` at all. A `decision` or `finding` target (closed
-by status, not by edge) is out of scope for the verdict: the filed report's
-wording says "not verified" instead of "ended without resolving it" so it
-never asserts something that type could never have satisfied, and
-`terminal_enforced` reads `false` even when a report was filed. **This type
-also changes the ordering below**: the lease is never released on the
-strength of a verdict this contract cannot make — not on a successful report
-filing, and not on a missing one either. It is left to lapse at its own TTL
-in both cases; a lease on an unjudgeable target is simply not this runner's
-to hand back on a guess.
+**Two attestation paths, one verdict.** Types differ in how completion is
+*attested*, not in whether it can be judged. The seed types whose schema
+attaches the `get()` resolution hook — `task`, `issue`, `question`,
+`incident` — are attested by a **resolving edge**, above. Every other
+dispatchable type (`decision`, `finding`, `capture-pending`, …) is retired by
+its **own status**, and is judged against that instead: `resolved` once the
+node's status has reached its type's terminal partition (a decision
+`settled`, a finding `resolved`, a capture-pending `merged` — unioned with
+the type-blind completion words), not resolved while it has not. Which of the
+two paths applies is read off a **schema registry** — does this type's schema
+declare the `get()` hook — never off a hardcoded type list
+(norm-cc-registry-is-contract,
+task-spor-dispatch-terminal-resolution-all-types). *Which* registry answers
+that is part of the contract, not a detail: the reference client asks a
+different one on each of its two verification legs, and only one of them is
+the graph's own, so a resident `type: schema` override that moves a `get()`
+hook is honored on one leg and **invisible** on the other. Read the next
+paragraph before assuming either. A target whose type the graph does not echo
+at all is treated as edge-verified: nothing short of a resolving edge attests
+it, which is the fail-safe direction.
+
+**The two legs, and the registry each one actually reads.** A registry is
+only as live as the graph behind it:
+
+- **Local-mode verification** loads the graph it is verifying against, so it
+  asks that graph's own registry (`registry.attachesResolutionHook`). A
+  resident `type: schema` override that attaches the hook to another type —
+  or drops it — is honored there with no code change.
+- **The remote leg** holds one node's JSON and no graph, and answers from the
+  **shipped seed pack** (`attachesResolutionHookOffline`, `lib/graph.js`),
+  which by construction cannot see a resident override — the same graph-less
+  limitation API.md's reserved `inert` key names
+  (issue-spor-type-blind-terminal-status-fallbacks). The seed answer is right
+  for every graph that leaves the `get()` hooks where the seed pack puts them.
+  Where an override moves one, this leg is wrong in **both** directions — the
+  server's own `resolution` enrichment (read FIRST, and authoritative when it
+  is there) covers only part of one of them:
+  - an override that **adds** the hook to a status-only type: a real resolving
+    edge still reads `resolved`, off the enrichment the override now produces.
+    The residual is the node carrying no such edge whose own status happens to
+    be terminal — the seed's status-only answer accepts that status and reads
+    `resolved`, an **over-read** of an attestation the live registry would not
+    have accepted.
+  - an override that **drops** the hook from an edge-verified type: the
+    enrichment goes with it, so nothing answers first, and the seed's
+    edge-verified answer never consults the status at all — a node genuinely
+    retired by its own terminal status reads as not attested, so the run files
+    a report and hands the lease back on finished work (and a factory gates an
+    item that is done). Fail-closed, but wrong.
+
+  Both directions are tracked as
+  issue-spor-remote-dispatch-ignores-resident-resolution-hooks; the bullet
+  below is what a worker does about it today.
+- **A third-party worker should do better than the reference client's remote
+  leg**, and can: read the live answer from `GET /v1/schema` — the type's
+  `hooks` array contains `get` (`spor schema <type> --json` prints the same
+  registry snapshot) — which is exactly the "agents reverse-engineering the
+  registry from `lib/seed/`" failure that endpoint exists to close.
+
+**Both paths are fully enforced, and both run the ordering below unchanged**
+— including the release. A status-only target whose status has *not* gone
+terminal files its report and **releases the lease**, exactly as an
+edge-verified one does. An earlier revision of this contract carved those
+types out as *unjudgeable*: it hedged the report's wording, stamped
+`terminal_enforced: false`, and released nothing on the grounds that the
+verdict could not be made — which stranded the item for a whole lease TTL
+with no handback, the opposite of what §3's lease contract promises
+(issue-spor-unjudgeable-type-leases-never-released; it supersedes the
+lease-and-enforcement half of dec-spor-dispatch-unjudgeable-type-reports,
+whose file-the-report-anyway half stands). There is no unjudgeable arm left:
+a target's TYPE never makes a run unenforced any more — only a posture where
+nothing could be verified or filed does, and those are enumerated under "What
+'enforced' means" below.
 
 **Ordering is the contract: file the report, THEN release the lease —
 never the other way, and never both-or-neither on a failure.**
 
-1. Re-read the target node; a live resolving edge → done, **`resolved`**,
-   release nothing (the durable `assigned` edge already stands as the record
-   of who did the work).
-1b. No resolving edge and the report's first line is `DECLINED: <reason>` →
-   file the finding, clear the readiness stamp, release the lease →
-   **`declined`**. A refused finding write leaves the lease held, as in step
-   3; a refused readiness clear is noted and never fatal.
-2. Target is an **unjudgeable type** (`decision`/`finding` — see above) →
-   file the report if text exists, worded "not verified"; **release
-   nothing either way** — `terminal_state` reads `reported` if a report was
-   filed (report presence still governs, per the invariant above) or
-   `failed` if there was none, but always with `terminal_enforced: false`
-   and the lease left to lapse at its TTL.
-3. Judgeable type, no resolving edge, a final report text exists → **file it
+1. Re-read the target node; **attested complete** — a live resolving edge on
+   an edge-verified type, or a terminal own-status on a status-only one →
+   **`resolved`**, release nothing (the durable `assigned` edge already
+   stands as the record of who did the work, and an attested-complete node is
+   out of every queue by that attestation already).
+1b. Not attested complete, and the report's first line is `DECLINED:
+   <reason>` → file the finding, clear the readiness stamp, release the lease
+   → **`declined`**. A refused finding write leaves the lease held, as in
+   step 2; a refused readiness clear is noted and never fatal.
+2. Not attested complete, and a final report text exists → **file it
    as an artifact** (§7). If the write lands (or was already there — filing
    is idempotent), release the lease → **`reported`**. If the write is
    *refused* by the graph, the lease is deliberately left **held** rather
    than releasing a signal-free item back into the pool — it lapses at its
    own TTL instead, and the run's note says so.
-4. Judgeable type, no resolving edge, no report text at all → release the
-   lease → **`failed`**, with a `terminal_note` explaining why.
+3. Not attested complete, and no report text at all → release the
+   lease → **`failed`**, with a `terminal_note` explaining why — naming the
+   missing resolving edge, or the status that has not gone terminal,
+   whichever this type is judged by.
 
-A crash between steps 3's two writes can therefore only ever leave the lease
+A crash between step 2's two writes can therefore only ever leave the lease
 held with the report already filed, or leave both undone — **never** a
 released lease with no report to show for it.
 
 **What "enforced" means, and where it doesn't apply yet.** `terminal_state`
 is only as trustworthy as `terminal_enforced` says it is
-(dec-spor-dispatch-terminal-states-supervised-first): it is `true` only when
-the graph was actually re-read against a reachable server — and, for a
-target with no resolving edge, the report actually filed there too (a
-`resolved` verdict needs only the re-read; nothing is filed once a resolving
-edge is already found). Every other case — no team graph configured (local-mode
-dispatch), a free-text dispatch with no target node, an unreachable server,
-an out-of-scope target type (above), or (v1) a **native-background** launch
-whose termination this runner cannot deterministically observe — stamps
-`terminal_enforced: false` and can never read `resolved`. A `reported` or
-`failed` value on an unenforced record is a best-effort classification of the
-*process* outcome, not a checked verdict; `terminal_enforced` is the field a
-consumer must gate on before treating either as ground truth.
+(dec-spor-dispatch-terminal-states-supervised-first): it is `true` only when a
+graph was actually re-read — and, for a target that re-read finds **not**
+attested complete, the report actually filed too (a `resolved` verdict needs
+only the re-read; nothing is filed once completion is attested).
+
+**Two graphs can answer that re-read, and local mode is not excluded from
+it.** Against a reachable server the whole contract runs: verify, file,
+release. In local mode there is no server door to file a report or hand a
+lease back through — but there IS a graph to verify against: the run's own
+local graph home, resolved by the launcher (not re-derived by the detached
+supervisor) and handed over as `local_nodes_dir`
+(task-spor-work-local-mode-resolver-check). The VERIFY leg runs there, over
+**both** attestation paths, so a local-mode target that reads attested
+complete is `resolved` with `terminal_enforced: true`. That is the one
+enforced local reading; every other local outcome is unenforced, because
+nothing was filed and no lease was handed back.
+
+`terminal_enforced: false` — and never `resolved` — is what every other
+reading gets:
+
+- a local-mode run whose target is not attested complete on that local graph,
+  or whose graph home is missing or unreadable (a free-text dispatch outside
+  any repo);
+- a dispatch with no target node to verify, report against, or release;
+- an unreachable — or unauthenticated — server;
+- (v1) a **native-background** launch, whose termination this runner cannot
+  deterministically observe, so the contract never runs for it at all.
+
+A `reported` or `failed` value on an unenforced record is a best-effort
+classification of the *process* outcome, not a checked verdict;
+`terminal_enforced` is the field a consumer must gate on before treating
+either as ground truth.
 
 ### What a third-party (non-reference-client) worker must do
 
@@ -448,6 +530,9 @@ above directly against REST once your worker process ends:
 ```
 1. GET  /v1/nodes/{targetId}
 2. if resolution.by present               → terminal_state = resolved; done, no release
+2a. elif the target's type attaches no resolution hook (GET /v1/schema)
+       and its own status is terminal for that type
+                                           → terminal_state = resolved; done, no release
 2b. elif report's first line is `DECLINED: <reason>`
                                            → POST /v1/nodes (file the finding, if_exists: skip)
                                              if the write lands: POST /v1/nodes/{targetId}/readiness {readiness: "clear"}
@@ -455,18 +540,12 @@ above directly against REST once your worker process ends:
                                                                   → terminal_state = declined
                                              if the write is refused: leave the lease held
                                                                   → terminal_state = declined (held)
-3. elif targetId's type is decision/finding (an unjudgeable type, §6)
-                                           → if final report text exists: POST /v1/nodes (file it, §7, if_exists: skip)
-                                                → terminal_state = reported, terminal_enforced = false
-                                             else
-                                                → terminal_state = failed, terminal_enforced = false
-                                             NEVER release the lease either way — it lapses at its own TTL
-4. elif final report text exists          → POST /v1/nodes  (file the report, §7, if_exists: skip)
+3. elif final report text exists          → POST /v1/nodes  (file the report, §7, if_exists: skip)
                                              if the write lands: POST /v1/nodes/{leaseNode}/release
                                                                   → terminal_state = reported
                                              if the write is refused: leave the lease held
                                                                   → terminal_state = failed (held)
-5. else                                   → POST /v1/nodes/{leaseNode}/release
+4. else                                   → POST /v1/nodes/{leaseNode}/release
                                              → terminal_state = failed
 ```
 
@@ -488,8 +567,8 @@ id: art-dispatch-report-<stem>-<short-run-id>
 type: artifact
 project: <slug>              # when known
 title: Dispatch report — <target-node-id>
-summary: Final report from the dispatched <harness> run on <target>, <ended without
-  resolving it | whose outcome was not verified against the graph>: <first line of report>
+summary: Final report from the dispatched <harness> run on <target>, which ended
+  without resolving it: <first line of report>
 date: <YYYY-MM-DD>
 edges:
   - {type: relates-to, to: <target-node-id>}
@@ -499,13 +578,9 @@ Final report from dispatched run `<run-id>` (<harness>), which ended `<state>`.
 It is filed here so the run's work reaches the graph instead of vanishing into
 a dead run; nothing here resolves the target.
 
-<one of:>
-The run left no resolving edge on <target>, so the item returns to the queue
-carrying this report.
-<or, on an out-of-scope target type:>
-Whether <target> is complete was NOT verified: a `<type>` node of this type is
-retired by its status rather than by a resolving edge, which is the only
-signal this runner checks.
+The run ended with <one of: `no resolving edge on <target>` | `<target>'s
+status ('<status>') has not reached a terminal <type> status`>, so the item
+returns to the queue carrying this report.
 
 <the worker's own final report text, verbatim>
 ```
@@ -550,7 +625,7 @@ violation — new fields may be added additively.
 | `launch_mode` | string | `"native-background"` (detaches into the harness's own daemon) or `"supervised-jsonl"` (runs under a supervisor Spor owns) |
 | `state` | string | `"launching"` → `"running"` → one of the **terminal** process states: `"done"`, `"failed"`, `"failed_launch"`, `"vanished"` |
 | `cwd` | string | the run's working directory |
-| `model` | string \| null | native runs only — model override, when set |
+| `model` | string \| null | **native-background records only** — the model override this launch resolved (`--model`, else the profile's), `null` when none did; the key is always present on a native record. A supervised record does not carry the field at all — its model is fixed into the harness argv at launch |
 | `created_at` | ISO 8601 | when the record was opened |
 | `started_at` | ISO 8601 | supervised runs only — when the child process actually started |
 | `launched_at` | ISO 8601 | native runs only — when the launcher observed the harness hand off to its background daemon |
@@ -568,6 +643,39 @@ violation — new fields may be added additively.
 | `log_path` | string | supervised runs only — the raw JSONL/stderr log |
 | `report_path` | string | supervised runs only — where the harness's own final-message text landed, if any |
 | `child_reaped` | bool | optional — an orphaned harness child was terminated at reconciliation time |
+
+**The two launch modes carry different fields, and that asymmetry IS the
+schema — not an omission to read around.** A `native-background` record
+carries `launched_at` (never `started_at`: the launcher observes the hand-off
+to the harness's daemon, not the child's own start), plus `launcher_exit`,
+`bound_at`, `transcript_path`, and `model`. A `supervised-jsonl` record
+carries `started_at`, `exit_code`, `signal`, `log_path`, and `report_path` —
+and no `model`. Absent fields read as `null`/absent per the rule above rather
+than as a violation. The asymmetry is pinned by a test against both real
+launch paths (`test/claude-supervised-dispatch.test.js`), so this table and
+the two record writers cannot drift apart.
+
+**Which record omits `model`.** The **supervised** one. A native launch writes
+the resolved model onto its record at `beginNativeRun`
+(`lib/shell/agent-dispatch-runner.js`) — the key is always present there,
+`null` when nothing overrode it — because that launcher never sees the child
+again and the record is the only place the resolved model is written down. A
+supervised launch fixes the model into the harness argv instead, and
+`launchSupervisedHarness` (`bin/spor.js`) writes no such key. Both halves, and
+the `launched_at`/`started_at` split above, are asserted against the two real
+launch paths in the test named above and again at the `spor runs --json` door
+they ride out through.
+
+The mirrored reading — that a *native* record is the one omitting `model` — is
+wrong about the shipped writers in both directions, and it is not a reading
+this table may be edited into. The field is documented and emitted, so dropping
+it from native records is a **removal** from a published record schema: the
+additive-only rule above forbids it, and a consumer already reading `model` off
+a native run breaks. That is a decided position rather than an editorial one —
+**`dec-spor-keep-native-run-record-model-field`**, which weighed unifying the
+two records against that rule and kept the field. Retiring it remains available
+as a schema change with a deprecation window; it is not available as a
+correction here.
 
 Fields like `runner_pid`, `child_pid`, `runner_started_ticks`,
 `child_started_ticks`, and `contract_pending` also ride on supervised records;
@@ -663,10 +771,12 @@ A worker (and its launcher, if separate) is a conforming Spor worker when it:
 - [ ] reads the compiled briefing for its target before acting non-trivially
       (§4) — a worker that skips this reinvents decisions the graph already
       settled
-- [ ] on finishing, checks the target for a **live resolving edge** rather
-      than declaring victory itself (§6)
-- [ ] if no resolving edge exists, **files its final report as an artifact**
-      `relates-to` the target (§7) — never silently drops the work
+- [ ] on finishing, checks the target's own **attestation of completion** —
+      a live resolving edge, or a terminal own-status for a type retired by
+      status — rather than declaring victory itself (§6)
+- [ ] if the target is not attested complete, **files its final report as an
+      artifact** `relates-to` the target (§7) — never silently drops the
+      work, whichever of the two attestation paths its type takes
 - [ ] **releases the lease only after the report write is confirmed** — a
       refused write leaves the lease held, never released with nothing to
       show for it (§6)

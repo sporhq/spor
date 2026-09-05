@@ -354,6 +354,15 @@ test("a filed report reads `reported`, fully enforced, for a status-only type wh
   assert.strictEqual(patch.terminal_enforced, true);
   assert.strictEqual(patch.report_node_id, terminal.reportArtifactId("dec-x", BASE.runId));
   assert.strictEqual(patch.lease_released, true);
+  // ...and the handback runs the SAME file-then-release ordering an
+  // edge-verified target does — the whole point of
+  // issue-spor-unjudgeable-type-leases-never-released, whose old carve-out
+  // released nothing here and left the item stranded for a full lease TTL.
+  assert.deepStrictEqual(t.calls.map((c) => `${c.method} ${c.path}`), [
+    "GET /v1/nodes/dec-x",
+    "POST /v1/nodes",
+    "POST /v1/nodes/dec-x/release",
+  ]);
 });
 
 test("a status-only type with no report and a non-terminal status fails, fully enforced, and releases the lease", async () => {
