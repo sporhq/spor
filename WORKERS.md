@@ -489,10 +489,21 @@ released lease with no report to show for it.
 
 **What "enforced" means, and where it doesn't apply yet.** `terminal_state`
 is only as trustworthy as `terminal_enforced` says it is
-(dec-spor-dispatch-terminal-states-supervised-first): it is `true` only when a
-graph was actually re-read — and, for a target that re-read finds **not**
-attested complete, the report actually filed too (a `resolved` verdict needs
-only the re-read; nothing is filed once completion is attested).
+(dec-spor-dispatch-terminal-states-supervised-first), and what it reports is
+exactly one thing: **a graph answered the re-read**. Enforcement is a property
+of the VERIFY leg alone — once a graph has answered, every arm below it is
+enforced, the arms that file nothing included. A verified-not-done run with no
+report to file (step 3), a report the graph refused, and a decline whose
+finding the graph refused are all `terminal_enforced: true`: the graph was
+asked and it answered, which is the whole of the claim. What those three lack
+is a filed artifact, and the record says so on its own fields —
+`report_node_id`/`finding_node_id` absent, `lease_released: false` for the
+lease left held — never by demoting `terminal_enforced` to stand in for them.
+Nothing is filed on the `resolved` arm either, for the opposite reason:
+completion is attested, so there is nothing left to file. Read the flag as
+"and the paperwork landed" and a checked verdict reports itself as a guess;
+the list below is the whole of what unenforced means, and none of those arms
+is in it.
 
 **Two graphs can answer that re-read, and local mode is not excluded from
 it.** Against a reachable server the whole contract runs: verify, file,
@@ -720,11 +731,11 @@ record still `launching`/`running` has none of these yet):
 | `terminal_enforced` | bool | whether this was a *verified* verdict (re-read against a reachable graph) or a best-effort classification — **gate on this before trusting `terminal_state` as ground truth** |
 | `resolved_by` | string | present only when `terminal_state === "resolved"` — the resolver node's id |
 | `resolved_edge` | string | present only when resolved — `"resolves"` or `"answers"` |
-| `report_node_id` | string | present only when a report was actually filed — its presence always implies `terminal_state === "reported"`, but an unenforced `reported` record (§6) may have none (§7) |
+| `report_node_id` | string | present only when a report was actually filed (§7) — its presence always implies `terminal_state === "reported"`. Filing is downstream of a successful re-read (§6, step 1 precedes step 2), so only an *enforced* record can carry one; an unenforced `reported` record has none, the twin of the `finding_node_id` row below |
 | `declined_reason` | string | present only when `terminal_state === "declined"` — the reason off the report's `DECLINED:` line |
 | `finding_node_id` | string | present only when a decline's finding was actually filed — its presence always implies `terminal_state === "declined"`; an unenforced declined record has none |
 | `readiness_cleared` | bool | declined only — whether the target's `readiness: agent` stamp was cleared |
-| `lease_released` | bool | optional — `true`/`false` reports whether a release attempt succeeded; **omitted** (not `false`) when no lease was this run's to release at all |
+| `lease_released` | bool | optional — `true` once the lease was handed back. `false` means it is still **held**, which covers both ways that happens: a release that was attempted and failed, and one deliberately never attempted because the report or finding write was refused (§6). The two read the same way to an operator, who hands it back with `spor release <id>` or waits out the TTL. **Omitted** (not `false`) when no lease was this run's to release at all |
 | `terminal_note` | string | a human-readable explanation of the outcome, always present once this dimension exists |
 
 A record with `terminal_state` unset (or `state` still non-terminal) has not

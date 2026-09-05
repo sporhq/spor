@@ -125,6 +125,13 @@ test("a report that cannot be filed leaves the lease held — never a released l
     reportText: "Notes that the graph refused.", request: t.call,
   });
   assert.strictEqual(patch.terminal_state, "failed");
+  // ENFORCED, though nothing was filed: `terminal_enforced` reports the verify
+  // leg alone (WORKERS.md §6, "What 'enforced' means"). The graph was re-read
+  // and answered "not done" — a checked verdict. What is missing is the
+  // artifact, and the record says that on its own fields, not by demoting the
+  // flag a consumer gates on.
+  assert.strictEqual(patch.terminal_enforced, true);
+  assert.ok(!("report_node_id" in patch), "nothing filed, so nothing to name");
   assert.strictEqual(patch.lease_released, false);
   assert.ok(!t.calls.some((c) => /\/release$/.test(c.path)), "no release is even attempted");
   assert.match(patch.terminal_note, /left HELD/);
@@ -141,6 +148,7 @@ test("a transport that THROWS on the report write fails closed — never a repor
     reportText: "Notes worth keeping.", request: t.call,
   });
   assert.strictEqual(patch.terminal_state, "failed");
+  assert.strictEqual(patch.terminal_enforced, true, "a thrown write loses the artifact, not the verified verdict");
   assert.ok(!patch.report_node_id, "reported always names a node; this is not reported");
   assert.strictEqual(patch.lease_released, false);
   assert.ok(!t.calls.some((c) => /\/release$/.test(c.path)));
@@ -256,6 +264,10 @@ test("local mode: no resolving edge on the local graph still falls back to unenf
   assert.strictEqual(patch.terminal_state, "reported");
   assert.strictEqual(patch.terminal_enforced, false);
   assert.notStrictEqual(patch.terminal_state, "resolved");
+  // ...and an unenforced `reported` never names an artifact: filing sits below
+  // the verify leg, so a run with no graph answer has nothing filed to name
+  // (WORKERS.md §8, the `report_node_id` row).
+  assert.ok(!("report_node_id" in patch));
 });
 
 test("local mode: a decision retired by its own terminal STATUS also resolves off the local graph", async () => {
