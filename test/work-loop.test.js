@@ -513,6 +513,51 @@ test("selectWorkCandidates: excludes in-flight, human-readiness and cooling-off 
   assert.deepStrictEqual(later.map((i) => i.id), ["a", "c", "d"]);
 });
 
+// --- assignee filter (issue-spor-auto-route-additive-assignment-two-assignees)
+// --- a live `assigned -> agent` edge naming an agent that is NOT this worker
+// is someone else's work (most often the autonomous auto-route consumer's own
+// re-route target) — skip it, mirroring the queue's `assignee=me` view for a
+// person. `assigned_agents` (lib/kernel/queue.js) carries every agent a live
+// edge currently names.
+test("selectWorkCandidates: skips an item assigned to another agent, keeps one assigned to THIS agent or nobody", () => {
+  const items = [
+    { id: "mine", readiness: "agent", assigned_agents: ["agent-me"] },
+    { id: "other", readiness: "agent", assigned_agents: ["agent-other"] },
+    { id: "unassigned", readiness: "agent" },
+  ];
+  const got = workLoop.selectWorkCandidates(items, { selfAgent: "agent-me" });
+  assert.deepStrictEqual(got.map((i) => i.id), ["mine", "unassigned"]);
+});
+
+test("selectWorkCandidates: with no configured identity the assignee filter is a no-op — byte-identical to before it existed", () => {
+  const items = [
+    { id: "mine", readiness: "agent", assigned_agents: ["agent-me"] },
+    { id: "other", readiness: "agent", assigned_agents: ["agent-other"] },
+  ];
+  assert.deepStrictEqual(workLoop.selectWorkCandidates(items).map((i) => i.id), ["mine", "other"]);
+  assert.deepStrictEqual(workLoop.selectWorkCandidates(items, { selfAgent: null }).map((i) => i.id), ["mine", "other"]);
+});
+
+test("classifyWorkItem: an item assigned elsewhere reports a structured 'assigned-elsewhere' kind, aggregated like any other skip", () => {
+  const it = { id: "task-x", readiness: "agent", assigned_agents: ["agent-other"] };
+  const verdict = workLoop.classifyWorkItem(it, { selfAgent: "agent-me" });
+  assert.deepStrictEqual(verdict, { reason: "assigned to agent agent-other", kind: "assigned-elsewhere" });
+  assert.strictEqual(workLoop.skipClass(verdict), "assigned to another agent");
+  // The two-edge transient window this bug leaves behind (before the
+  // retraction lands, or if it fails): every OTHER agent is named, this
+  // worker's own id is never in the list.
+  const both = { id: "task-y", readiness: "agent", assigned_agents: ["agent-me", "agent-other"] };
+  assert.strictEqual(workLoop.classifyWorkItem(both, { selfAgent: "agent-me" }), null, "assigned to ME (among others) is still a candidate");
+});
+
+test("pageEligible: mirrors classifyWorkItem/selectWorkCandidates for the assignee filter — the page fetch and the loop's own re-check never disagree", () => {
+  const mine = { id: "a", readiness: "agent", assigned_agents: ["agent-me"] };
+  const other = { id: "b", readiness: "agent", assigned_agents: ["agent-other"] };
+  assert.strictEqual(workLoop.pageEligible(mine, { selfAgent: "agent-me" }), true);
+  assert.strictEqual(workLoop.pageEligible(other, { selfAgent: "agent-me" }), false);
+  assert.strictEqual(workLoop.pageEligible(other, {}), true, "no selfAgent configured — no-op");
+});
+
 test("selectWorkCandidates: a factory's declared repo scope bounds what it gates, visibly", () => {
   // issue-spor-work-scope-union-factory-mismatch: a bare --project slug unions
   // its whole home-project grouping, so a worker scoped to spor-server is
@@ -931,6 +976,34 @@ test("spor work --print previews scope, pacing and candidates, and launches noth
   assert.match(open.stdout, /task-untriaged/);
   assert.doesNotMatch(open.stdout, /skip task-untriaged/);
   assert.doesNotMatch(open.stdout, /task-needs-human/, "human-readiness stays out under every policy");
+});
+
+// issue-spor-auto-route-additive-assignment-two-assignees: an item a live
+// `assigned -> agent` edge already names to a DIFFERENT agent — the shape the
+// autonomous auto-route consumer's own handoff leaves behind — is not a
+// candidate for THIS box's worker, so the refusing box stops re-selecting it
+// every work.retryAfterMs.
+test("spor work --print: an item assigned to a DIFFERENT agent is never a candidate, once this box's own identity is configured", () => {
+  const { home, nodes, outfile } = cliFixture();
+  const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
+  cfg.dispatch.agent = "agent-workbox"; // this box's own identity — matches task-ready's assigned edge
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify(cfg, null, 2) + "\n");
+  fs.writeFileSync(path.join(nodes, "agent-other.md"), `---\nid: agent-other\ntype: agent\ntitle: A different fleet box\nsummary: The fleet agent this task was auto-routed to.\ndate: 2026-08-20\n---\nAnother test agent.\n`);
+  fs.writeFileSync(path.join(nodes, "task-elsewhere.md"), `---\nid: task-elsewhere\ntype: task\nrepo: demo\ntitle: Rotate the staging credentials\nsummary: A task already auto-routed to a different fleet agent — this box must not re-select it.\nstatus: open\nedges:\n  - {type: assigned, to: agent-other, profile: profile-work}\ndate: 2026-08-20\n---\nAlready handed to another box.\n`);
+  const r = cli(["work", "--print"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^agent:   agent-workbox$/m);
+  assert.match(r.stdout, /-> task-ready/, "still a candidate — assigned to THIS box's own agent");
+  assert.doesNotMatch(r.stdout, /-> task-elsewhere/, "assigned to a DIFFERENT agent — never taken as a candidate");
+  assert.match(r.stdout, /skip task-elsewhere\s+agent\s+assigned to agent agent-other/, "visibly skipped, like any other policy/scope skip — never silently dropped");
+
+  // With no configured identity (the default), the filter is a no-op and the
+  // item IS a candidate — byte-identical to before this filter existed.
+  delete cfg.dispatch.agent;
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify(cfg, null, 2) + "\n");
+  const noIdentity = cli(["work", "--print"], { SPOR_HOME: home, XDG_CONFIG_HOME: home, WORK_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() });
+  assert.strictEqual(noIdentity.status, 0, noIdentity.stderr);
+  assert.match(noIdentity.stdout, /-> task-elsewhere/);
 });
 
 // Two repos in ONE home-project grouping, each with an agent-ready item, plus a

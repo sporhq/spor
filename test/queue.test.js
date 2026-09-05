@@ -1598,6 +1598,28 @@ test("readiness: assigned→person is human, assigned→agent is agent (edge tar
   assert.deepEqual(rd(g, "task-to-agent").readiness_reasons, ["assigned to agent agent-x"]);
 });
 
+// issue-spor-auto-route-additive-assignment-two-assignees: a queue item
+// exposes EVERY agent a live `assigned` edge currently names (not just the
+// first, unlike deriveReadiness's own readiness bucket), so a pull worker can
+// tell "assigned to someone else" apart from "assigned to me" without a
+// second graph read. Omitted when there is none, so a node with no agent
+// assignment is byte-identical.
+test("assigned_agents: every live assigned->agent edge rides the item, omitted when there is none, unaffected by an assigned->person edge", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-none", "task", { status: "open" }),
+    node("task-one", "task", { status: "open", edges: [["assigned", "agent-x"]] }),
+    node("task-two", "task", { status: "open", edges: [["assigned", "agent-x"], ["assigned", "agent-y"]] }),
+    node("task-mixed", "task", { status: "open", edges: [["assigned", "agent-x"], ["assigned", "person-p"]] }),
+    node("agent-x", "agent", { status: "active" }),
+    node("agent-y", "agent", { status: "active" }),
+    node("person-p", "person", { status: "active" }),
+  ])).load();
+  assert.strictEqual(rd(g, "task-none").assigned_agents, undefined, "no agent assignment — the key is absent, not an empty array");
+  assert.deepEqual(rd(g, "task-one").assigned_agents, ["agent-x"]);
+  assert.deepEqual(rd(g, "task-two").assigned_agents, ["agent-x", "agent-y"], "the additive auto-route bug's own transient shape — both survive");
+  assert.deepEqual(rd(g, "task-mixed").assigned_agents, ["agent-x"], "a co-present assigned->person edge is never counted as an agent");
+});
+
 test("readiness: an agent stamp derives agent with readiness_by provenance", () => {
   const g = tmpGraph(Object.fromEntries([
     raw("task-s", "task", "status: open\nreadiness: agent\nreadiness_by: Dana via cli\n"),

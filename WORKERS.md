@@ -121,6 +121,18 @@ part of this knob — no policy value makes a worker claim a
 default `ready`); an unknown value refuses to start the worker rather than
 silently falling back. `spor work --print` shows the effective policy.
 
+**Assignee filter.** A live `assigned -> agent` edge naming an agent that is
+NOT this worker's own configured identity (`dispatch.agent`, or `--as`) is
+someone else's work — most often the autonomous auto-route consumer's own
+re-route target (§10.3) — so it is skipped from selection the same way a
+person's `assigned -> person` edge already routes an item to `readiness:
+human`, mirroring what the queue's `assignee=me` view does for a person
+(issue-spor-auto-route-additive-assignment-two-assignees). Each queue item
+carries every currently-assigned agent as `assigned_agents` (API.md §3); a
+worker with no configured identity can't tell "someone else" from "me" and
+leaves this filter a no-op, so an unconfigured box's selection is
+byte-identical to before this existed.
+
 **The page widens rather than starving.** Selection reads a fixed-size ranked
 page, and the policy (and a factory's repo scope, §10.6) filters what comes
 back — so a page filled entirely by items this worker may not take would hide
@@ -1336,7 +1348,14 @@ satisfies it the refusal still escalates to the owner rather than downgrading.
 The dispatching box still refuses (exit 1) and its worker cools the item off,
 because nothing ran *here*; `dispatch.autoRouteMaxAge` (default `24h`) bounds
 how stale a target's last contact may be, and `--no-auto-route` opts one run
-back out.
+back out. The handoff also retracts the refusing box's OWN `assigned` edge
+once the target's edge lands (`spor edge --remove`, the `remove_edge`
+micro-mutation, API.md §1/§3) — best-effort and idempotent, never touching
+anyone else's edge — so the node carries exactly one live assignment
+afterwards; without it the refusing box's own `spor work` would re-select the
+item every `work.retryAfterMs` and re-run this whole routine (harmless, since
+the write is idempotent, but noisy), which the assignee filter above (§3)
+backstops in any case.
 
 ### 10.4 Agent-review gates — a verdict that is read, not asserted
 

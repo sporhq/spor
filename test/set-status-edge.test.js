@@ -583,7 +583,7 @@ function edgeStub({ status = 200, errCode = "invalid_node", message = "x", detai
       hits.push({ method: req.method, url: req.url, body });
       const j = (code, b) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
       const m = req.url.match(/^\/v1\/nodes\/([^/]+)\/edges$/);
-      if (m && req.method === "POST") {
+      if (m && (req.method === "POST" || req.method === "DELETE")) {
         if (status !== 200) return j(status, { error: { code: errCode, message, details } });
         return j(200, { status: resultStatus, id: echoId || decodeURIComponent(m[1]), revision: "abc123", warnings: [] });
       }
@@ -667,6 +667,94 @@ test("edge (remote) rejects a malformed --attr client-side, never reaching the s
 
 test("edge (remote) fails open against an unreachable server (no stack trace)", async () => {
   const r = await runAsync(["edge", "dec-y", "resolves", "task-x"], remoteEnv("http://127.0.0.1:1"));
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /offline/);
+  assert.doesNotMatch(r.stderr, /at Object|Error:/);
+});
+
+// ---------------- edge --remove: the withdrawal twin (remove_edge, API.md §1/§3) ----------------
+// (issue-spor-auto-route-additive-assignment-two-assignees, fix shape item 1:
+// "add edge removal to the client — spor edge --remove over the existing REST
+// DELETE".)
+
+test("edge --remove (local) removes a flow-form edge line and validates clean", () => {
+  const { home, nodes } = fixtureGraph();
+  run(["edge", "dec-y", "resolves", "task-x"], { SPOR_HOME: home });
+  assert.match(readNode(nodes, "dec-y"), /- \{type: resolves, to: task-x\}/, "fixture sanity: edge present");
+  const r = run(["edge", "dec-y", "resolves", "task-x", "--remove"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /edge removed: dec-y -\[resolves\]-> task-x/);
+  assert.doesNotMatch(readNode(nodes, "dec-y"), /- \{type: resolves, to: task-x\}/);
+  const v = validateGraph(nodes);
+  assert.strictEqual(v.status, 0, v.stdout);
+  assert.match(v.stdout, /0 errors/);
+});
+
+test("edge --remove (local) on an inverse form removes the canonical edge on the OTHER node", () => {
+  const { home, nodes } = fixtureGraph();
+  run(["edge", "task-x", "blocked-by", "dec-y"], { SPOR_HOME: home }); // canonical: dec-y blocks task-x
+  assert.match(readNode(nodes, "dec-y"), /- \{type: blocks, to: task-x\}/, "fixture sanity");
+  const r = run(["edge", "task-x", "blocked-by", "dec-y", "--remove"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /edge removed: task-x -\[blocked-by\]-> dec-y \(removed on dec-y\)/);
+  assert.doesNotMatch(readNode(nodes, "dec-y"), /- \{type: blocks, to: task-x\}/);
+});
+
+test("edge --remove (local) on a missing edge is an idempotent no-op, never an error", () => {
+  const { home, nodes } = fixtureGraph();
+  const before = readNode(nodes, "dec-y");
+  const r = run(["edge", "dec-y", "resolves", "task-x", "--remove"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /edge already absent: dec-y -\[resolves\]-> task-x/);
+  assert.strictEqual(readNode(nodes, "dec-y"), before, "node untouched");
+});
+
+test("edge --remove (local) never removes a longer id sharing the same prefix", () => {
+  const { home, nodes } = fixtureGraph();
+  fs.writeFileSync(path.join(nodes, "task-x2.md"), `---\nid: task-x2\ntype: task\nproject: demo\ntitle: A second demo task\nsummary: A second demo task whose id shares a prefix with task-x.\ndate: 2026-06-01\n---\nBody.\n`);
+  run(["edge", "dec-y", "relates-to", "task-x"], { SPOR_HOME: home });
+  run(["edge", "dec-y", "relates-to", "task-x2"], { SPOR_HOME: home });
+  const r = run(["edge", "dec-y", "relates-to", "task-x", "--remove"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = readNode(nodes, "dec-y");
+  assert.doesNotMatch(md, /- \{type: relates-to, to: task-x\}/);
+  assert.match(md, /- \{type: relates-to, to: task-x2\}/, "the longer id survives");
+});
+
+test("edge --remove rejects --attr client-side (a removal is identified by type+to alone)", () => {
+  const { home } = fixtureGraph();
+  const r = run(["edge", "dec-y", "relates-to", "task-x", "--remove", "--attr", "weight=3"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /--attr is not accepted with --remove/);
+});
+
+test("edge --remove (remote) DELETEs {type, to} to the node's edges endpoint", async () => {
+  const { srv, hits, base } = await edgeStub();
+  try {
+    const r = await runAsync(["edge", "dec-y", "resolves", "task-x", "--remove"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /edge removed: dec-y -\[resolves\]-> task-x/);
+    const del = hits.find((h) => h.method === "DELETE" && h.url === "/v1/nodes/dec-y/edges");
+    assert.ok(del, "DELETEd the node's edges endpoint");
+    assert.deepStrictEqual(JSON.parse(del.body), { type: "resolves", to: "task-x" });
+  } finally {
+    srv.close();
+  }
+});
+
+test("edge --remove (remote) reports an idempotent skip", async () => {
+  const { srv, base } = await edgeStub({ resultStatus: "skipped" });
+  try {
+    const r = await runAsync(["edge", "dec-y", "resolves", "task-x", "--remove"], remoteEnv(base));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /edge already absent: dec-y -\[resolves\]-> task-x/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("edge --remove (remote) fails open against an unreachable server (no stack trace)", async () => {
+  const r = await runAsync(["edge", "dec-y", "resolves", "task-x", "--remove"], remoteEnv("http://127.0.0.1:1"));
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /offline/);
   assert.doesNotMatch(r.stderr, /at Object|Error:/);

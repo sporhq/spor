@@ -1602,7 +1602,7 @@ const TASK_MD = (id) =>
 // `hostsScoped` answers an `owner=me` query (what the AUTONOMOUS tier asks) with a
 // DIFFERENT body from `hosts` (what the human tier's unscoped question gets), so a
 // test can pin that the narrow answer is never rendered as the broad one.
-function fleetStub({ hosts, hostsScoped = null, hostsStatus = 200, edgeStatus = 200 } = {}) {
+function fleetStub({ hosts, hostsScoped = null, hostsStatus = 200, edgeStatus = 200, deleteEdgeStatus = 200, taskRaw = TASK_MD } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let raw = "";
@@ -1615,6 +1615,13 @@ function fleetStub({ hosts, hostsScoped = null, hostsStatus = 200, edgeStatus = 
         if (edgeStatus !== 200) return j(edgeStatus, { error: { code: "invalid_edge", message: "nope" } });
         return j(200, { ok: true, id: decodeURIComponent(em[1]) });
       }
+      // The retraction leg (issue-spor-auto-route-additive-assignment-two-
+      // assignees): the withdrawal twin, remove_edge semantics — a missing
+      // edge is an idempotent `skipped`, never an error.
+      if (em && req.method === "DELETE") {
+        if (deleteEdgeStatus !== 200) return j(deleteEdgeStatus, { error: { code: "invalid_edge", message: "nope" } });
+        return j(200, { status: "updated", id: decodeURIComponent(em[1]) });
+      }
       const pm = req.url.match(/^\/v1\/nodes\/([^/?]+)$/);
       if (pm && req.method === "GET") {
         const id = decodeURIComponent(pm[1]);
@@ -1623,7 +1630,7 @@ function fleetStub({ hosts, hostsScoped = null, hostsStatus = 200, edgeStatus = 
         // since the fresh re-probe seeds reachable_mcp:[spor] in remote mode
         // (task-spor-dispatch-fresh-probe-before-satisfiability).
         if (id === "profile-spor") return j(200, { id, raw: PROFILE_MD("profile-spor", "mcp: [spor]") });
-        if (id.startsWith("task-")) return j(200, { id, raw: TASK_MD(id) });
+        if (id.startsWith("task-")) return j(200, { id, raw: taskRaw(id) });
         return j(404, { error: { code: "not_found" } });
       }
       const hm = req.url.match(/^\/v1\/profiles\/([^/?]+)\/hosts/);
@@ -1779,6 +1786,7 @@ const HOSTS_TWO = {
   counts: { satisfiable: 2, unsatisfiable: 1 },
 };
 const edgeHits = (hits) => hits.filter((h) => h.method === "POST" && /\/edges$/.test(h.url));
+const deleteEdgeHits = (hits) => hits.filter((h) => h.method === "DELETE" && /\/edges$/.test(h.url));
 const hostsHits = (hits) => hits.filter((h) => h.method === "GET" && /\/hosts/.test(h.url));
 
 test("dispatch --auto-route (remote, unsatisfiable): hands the node to the freshest satisfying host, profile pinned on the edge", async () => {
@@ -1814,7 +1822,126 @@ test("dispatch --auto-route (remote, unsatisfiable): hands the node to the fresh
       to: "agent-me-laptop",
       attrs: { profile: "profile-codex" },
     });
+    // No configured identity here (no --as, no dispatch.agent) — the
+    // retraction leg has nothing of "ours" to remove, so it issues no request.
+    assert.strictEqual(deleteEdgeHits(hits).length, 0, "no identity configured — nothing of ours to retract");
     assert.ok(!fs.existsSync(mark), "claude was never launched here");
+  } finally {
+    srv.close();
+  }
+});
+
+// --- retraction leg (issue-spor-auto-route-additive-assignment-two-assignees)
+// --- auto-route's write is additive on its own: without retracting the
+// refusing box's OWN `assigned` edge, the node ends up with TWO live
+// assignments and the refusing box's own `spor work` re-selects it every
+// work.retryAfterMs. `TASK_MD_ASSIGNED` seeds that pre-existing edge so these
+// tests can drive the retraction end to end.
+const TASK_MD_ASSIGNED = (id, agent) =>
+  `---\nid: ${id}\ntype: task\nrepo: demo\ntitle: Demo task ${id}\nsummary: A demo task.\ndate: 2026-06-01\nedges:\n  - {type: assigned, to: ${agent}}\n---\nbody\n`;
+
+test("dispatch --auto-route: retracts the refusing box's own assignment once the target's edge lands — exactly one live assignment afterwards", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const { srv, hits, base } = await fleetStub({ hosts: HOSTS_TWO, taskRaw: (id) => TASK_MD_ASSIGNED(id, "agent-mine") });
+  try {
+    const r = await runAsyncDisp(
+      ["dispatch", "task-rotate", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--auto-route", "--as", "agent-mine"],
+      remoteCapEnv(home, base, cleanProbeEnv())
+    );
+    assert.strictEqual(r.status, 1); // nothing ran HERE — this box still refused
+    assert.match(r.stderr, /auto-routed task-rotate to agent-me-laptop/);
+    assert.match(r.stderr, /retracted this box's own assignment \(agent-mine\) — agent-me-laptop now holds it alone\./);
+    const edges = edgeHits(hits);
+    assert.strictEqual(edges.length, 1, "exactly one routing edge written");
+    assert.strictEqual(JSON.parse(edges[0].body).to, "agent-me-laptop");
+    const dels = deleteEdgeHits(hits);
+    assert.strictEqual(dels.length, 1, "exactly one retraction — the refusing box's own");
+    assert.strictEqual(dels[0].url, "/v1/nodes/task-rotate/edges");
+    assert.deepStrictEqual(JSON.parse(dels[0].body), { type: "assigned", to: "agent-mine" });
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --auto-route: a refused routing write retracts nothing — retraction only follows a landed handoff", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const { srv, hits, base } = await fleetStub({ hosts: HOSTS_TWO, taskRaw: (id) => TASK_MD_ASSIGNED(id, "agent-mine"), edgeStatus: 422 });
+  try {
+    const r = await runAsyncDisp(
+      ["dispatch", "task-rotate", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--auto-route", "--as", "agent-mine"],
+      remoteCapEnv(home, base, cleanProbeEnv())
+    );
+    assert.strictEqual(r.status, 1);
+    assert.doesNotMatch(r.stderr, /auto-routed/);
+    assert.strictEqual(deleteEdgeHits(hits).length, 0, "the routing write failed — this box's own edge is left exactly as it was");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --auto-route: a refused retraction is reported but does not undo the handoff — fail-soft, best-effort", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const { srv, hits, base } = await fleetStub({ hosts: HOSTS_TWO, taskRaw: (id) => TASK_MD_ASSIGNED(id, "agent-mine"), deleteEdgeStatus: 500 });
+  try {
+    const r = await runAsyncDisp(
+      ["dispatch", "task-rotate", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--auto-route", "--as", "agent-mine"],
+      remoteCapEnv(home, base, cleanProbeEnv())
+    );
+    assert.strictEqual(r.status, 1);
+    // The handoff itself is unaffected — it already landed before retraction ran.
+    assert.match(r.stderr, /auto-routed task-rotate to agent-me-laptop/);
+    assert.strictEqual(edgeHits(hits).length, 1, "the routing edge still landed");
+    assert.match(r.stderr, /could not retract this box's own assignment agent-mine/);
+    assert.doesNotMatch(r.stderr, /retracted this box's own assignment/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch --auto-route: retraction is attempted for our identity even with no pre-existing assignment — the server's idempotent skip, not a client-side existence check", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  // TASK_MD (the default taskRaw) carries no edges at all — remove_edge is
+  // idempotent server-side (a missing edge is a `skipped` no-op, API.md
+  // §1/§3), so the client attempts it unconditionally rather than paying for
+  // a GET first to check.
+  const { srv, hits, base } = await fleetStub({ hosts: HOSTS_TWO, deleteEdgeStatus: 200 });
+  try {
+    const r = await runAsyncDisp(
+      ["dispatch", "task-rotate", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--auto-route", "--as", "agent-mine"],
+      remoteCapEnv(home, base, cleanProbeEnv())
+    );
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /auto-routed task-rotate to agent-me-laptop/);
+    const dels = deleteEdgeHits(hits);
+    assert.strictEqual(dels.length, 1);
+    assert.deepStrictEqual(JSON.parse(dels[0].body), { type: "assigned", to: "agent-mine" });
+  } finally {
+    srv.close();
+  }
+});
+
+const TASK_MD_ASSIGNED2 = (id, a, b) =>
+  `---\nid: ${id}\ntype: task\nrepo: demo\ntitle: Demo task ${id}\nsummary: A demo task.\ndate: 2026-06-01\nedges:\n  - {type: assigned, to: ${a}}\n  - {type: assigned, to: ${b}}\n---\nbody\n`;
+
+test("dispatch --auto-route: retracts EVERY one of this box's own identities — --as and dispatch.agent can differ and both carry a live assignment", async () => {
+  const { home, repo } = fixture();
+  setCaps(home, { declared: { harnesses: ["claude-code"] } });
+  const { srv, hits, base } = await fleetStub({ hosts: HOSTS_TWO, taskRaw: (id) => TASK_MD_ASSIGNED2(id, "agent-other", "agent-mine") });
+  try {
+    const r = await runAsyncDisp(
+      ["dispatch", "task-rotate", "--dir", repo, "--profile", "profile-codex", "--no-brief", "--auto-route", "--as", "agent-other"],
+      remoteCapEnv(home, base, { SPOR_DISPATCH_AGENT: "agent-mine", ...cleanProbeEnv() })
+    );
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /auto-routed task-rotate to agent-me-laptop/);
+    const dels = deleteEdgeHits(hits);
+    assert.strictEqual(dels.length, 2, "both of this box's own identities are retracted");
+    assert.deepStrictEqual(new Set(dels.map((d) => JSON.parse(d.body).to)), new Set(["agent-other", "agent-mine"]));
+    for (const d of dels) assert.strictEqual(JSON.parse(d.body).type, "assigned");
   } finally {
     srv.close();
   }

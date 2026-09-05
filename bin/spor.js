@@ -4260,13 +4260,43 @@ function appendEdgeLine(raw, type, to, attrs) {
   return `---\n${lines.join("\n")}\n---\n${body}`;
 }
 
+// Remove a `  - {type: T, to: TO[, k: v]}` line matching (type, to) exactly —
+// the withdrawal twin of appendEdgeLine (local `spor edge --remove`, the
+// remove_edge micro-mutation, API.md §1/§3). `type` and `to` are pre-validated
+// [\w-]+ tokens (NODE_ID_RE / reg.isKnownEdge), so no regex-escaping is needed.
+// The lookahead after `to` requires the token to END there (a comma or the
+// closing brace) so removing `agent-x` can never eat a longer `agent-x-2`.
+// Only matches the FLOW form appendEdgeLine (and every machine writer) always
+// produces; a hand-authored block-form entry isn't addressed here. Returns the
+// new raw, or null when no matching line exists (the caller reports an
+// idempotent skip, mirroring the server's remove_edge contract) or the
+// frontmatter can't be located.
+function removeEdgeLine(raw, type, to) {
+  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(raw);
+  if (!m) return null;
+  const body = m[2];
+  const lines = m[1].split("\n");
+  const EDGE_LINE = new RegExp(`^\\s*-\\s*\\{type:\\s*${type}\\s*,\\s*(?:to|target):\\s*${to}(?=[,}])`);
+  const idx = lines.findIndex((l) => EDGE_LINE.test(l));
+  if (idx === -1) return null;
+  lines.splice(idx, 1);
+  return `---\n${lines.join("\n")}\n---\n${body}`;
+}
+
 async function cmdEdge(cfg, { values, positionals }) {
   const id = positionals[0];
   const type = positionals[1];
   const to = positionals[2];
+  const remove = !!values.remove;
   if (!id || !type || !to) {
-    err("usage: spor edge <id> <type> <to> [--attr key=value]");
-    err("  add a typed edge from <id> to <to> (e.g. blocks, resolves, relates-to)");
+    err(`usage: spor edge <id> <type> <to> [--attr key=value] [--remove]`);
+    err(remove
+      ? "  remove a typed edge from <id> to <to> — the withdrawal twin of add_edge"
+      : "  add a typed edge from <id> to <to> (e.g. blocks, resolves, relates-to)");
+    return 1;
+  }
+  if (remove && values.attr) {
+    err("--attr is not accepted with --remove — a removal is identified by type+to alone (remove_edge, API.md §1)");
     return 1;
   }
   const attrsRes = parseEdgeAttrs(values.attr);
@@ -4277,6 +4307,30 @@ async function cmdEdge(cfg, { values, positionals }) {
   const attrs = attrsRes.attrs;
 
   if (cfg.mode() === "remote") {
+    if (remove) {
+      // remove_edge semantics (API.md §1/§3): withdrawal twin of add_edge above,
+      // same normalization (canonical/alias/inverse) done SERVER-side — this
+      // just posts {type, to} to the DELETE route. A missing edge is an
+      // idempotent `skipped`, never an error.
+      const r = await remote.del(cfg, `/v1/nodes/${encodeURIComponent(id)}/edges`, { body: { type, to }, timeoutMs: 8000 });
+      if (r.transport) {
+        err(`offline — could not reach server (${r.error})`);
+        return 1;
+      }
+      if (!r.ok) {
+        const e = (r.json && r.json.error) || {};
+        err(`edge error ${r.status}${e.message ? `: ${e.message}` : ""}`);
+        if (Array.isArray(e.details)) for (const d of e.details) err(`  ${d}`);
+        return 1;
+      }
+      const echoed = (r.json && r.json.id) || id;
+      const skipped = r.json && r.json.status === "skipped";
+      out(skipped
+        ? `edge already absent: ${id} -[${type}]-> ${to}`
+        : `edge removed: ${id} -[${type}]-> ${to}${echoed !== id ? ` (removed on ${echoed})` : ""}`);
+      out(writeTargetLine(cfg));
+      return 0;
+    }
     const body = { type, to };
     if (attrs) body.attrs = attrs;
     const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/edges`, body, { timeoutMs: 8000 });
@@ -4301,11 +4355,11 @@ async function cmdEdge(cfg, { values, positionals }) {
     return 0;
   }
 
-  // local: normalize + validate + append, mirroring store.addEdge — an inverse
-  // form puts the canonical edge on the OTHER node (swap src/target), a rename
-  // canonicalizes, the edge type must be known, both ids well-formed, the source
-  // must exist, and the target must exist (add_edge never creates a dangling
-  // edge). Edge-type tables come from the registry, never a hardcoded list.
+  // local: normalize + validate + append/remove, mirroring store.addEdge /
+  // store.removeEdge — an inverse form puts the canonical edge on the OTHER
+  // node (swap src/target), a rename canonicalizes, the edge type must be
+  // known, both ids well-formed. Edge-type tables come from the registry,
+  // never a hardcoded list.
   const graphLib = require(path.join(ROOT, "lib", "graph.js"));
   const nodesDir = cfg.nodesDir();
   let g;
@@ -4342,11 +4396,42 @@ async function cmdEdge(cfg, { values, positionals }) {
     err(`no such node: ${srcId}`);
     return 1;
   }
+  const existing = (g.nodes[srcId] && g.nodes[srcId].edges) || [];
+  if (remove) {
+    // Unlike add, a removal target need not still exist (removing a stale
+    // edge onto a since-deleted node is exactly the cleanup this is for).
+    if (!existing.some((e) => e.type === edgeType && e.to === target)) {
+      out(`edge already absent: ${id} -[${type}]-> ${to}`);
+      out(writeTargetLine(cfg));
+      return 0;
+    }
+    const newRaw = removeEdgeLine(raw, edgeType, target);
+    if (newRaw == null) {
+      err(`could not remove ${srcId} -[${edgeType}]-> ${target}: no matching flow-form "- {type: ..., to: ...}" line found`);
+      err(`  (a hand-authored block-form edge entry can't be removed by this local-mode verb today — rewrite the node with 'spor put-node' instead)`);
+      return 1;
+    }
+    let node;
+    try {
+      node = graphLib.parseFrontmatter(newRaw, `${srcId}.md`);
+    } catch (e) {
+      err(`invalid node after edge remove: ${e.message}`);
+      return 1;
+    }
+    const v = graphLib.validateNode(g, node);
+    if (!v.ok) {
+      err(`invalid node after edge remove:\n  ${v.errors.join("\n  ")}`);
+      return 1;
+    }
+    fs.writeFileSync(file, newRaw);
+    out(`edge removed: ${id} -[${type}]-> ${to}${srcId !== id ? ` (removed on ${srcId})` : ""}`);
+    out(writeTargetLine(cfg));
+    return 0;
+  }
   if (!g.nodes[target]) {
     err(`edge target '${target}' does not exist — create it first (add_edge never creates dangling edges)`);
     return 1;
   }
-  const existing = (g.nodes[srcId] && g.nodes[srcId].edges) || [];
   if (existing.some((e) => e.type === edgeType && e.to === target) && !attrs) {
     out(`edge already present: ${id} -[${type}]-> ${to}`);
     out(writeTargetLine(cfg));
@@ -14908,6 +14993,13 @@ async function cmdWork(cfg, { values }) {
     return 1;
   }
 
+  // This box's own agent identity, for the assignee filter below
+  // (issue-spor-auto-route-additive-assignment-two-assignees): the same
+  // precedence `spor dispatch` resolves `identityAgent` from (--as, else
+  // dispatch.agent) — an unconfigured box has no identity to compare against,
+  // so the filter stays a no-op there rather than guessing.
+  const selfAgent = values.as || dispatchAgentId(cfg) || null;
+
   // The GATE PIPELINE (task-spor-work-gate-pipeline), opt-in and graph-resident:
   // with no factory declared the loop runs exactly as it shipped. A declared one
   // that cannot be read or does not validate REFUSES to start the worker —
@@ -15109,7 +15201,7 @@ async function cmdWork(cfg, { values }) {
       !(agents.get(it.id) || []).length &&
       !(gating && gating.has(it.id)) &&
       !(cooling && cooling(it.id)) &&
-      workLoop.pageEligible(it, { accept, repos: factoryRepos, scope, graph: localFactoryGraph });
+      workLoop.pageEligible(it, { accept, repos: factoryRepos, scope, graph: localFactoryGraph, selfAgent });
     // Page deeper than the default when the cap is high: the page is filtered
     // again below (in-flight) and again by the loop (readiness, cooldowns), so
     // a page the size of the cap could not fill it.
@@ -15134,6 +15226,7 @@ async function cmdWork(cfg, { values }) {
     out(`tenant:  ${preflight.tenantLine(preflight.describeTenant(cfg))}`);
     out(`project: ${slug || "(all projects)"}`);
     out(`accept:  ${accept} — ${accept === "open" ? "any queue item except readiness:human (untriaged included)" : "only items explicitly stamped agent-ready (--accept open for the looser pickup)"}`);
+    out(`agent:   ${selfAgent || "(none configured — an item another agent already holds is not filtered out; set dispatch.agent or pass --as)"}`);
     out(`loop:    concurrency ${concurrency}, interval ${intervalMs / 1000}s, backoff to ${maxIntervalMs / 1000}s, retry refused after ${retryAfterMs / 1000}s, stop following a run after ${runMaxMs / 3600000}h${runIdleMs > 0 ? `, stop a run idle for ${runIdleMs / 60000}m` : ""}${max ? `, stop after ${max}` : ""}`);
     out(`status:  ${workLoop.workDir(cfg.userConfigHome())}`);
     // The posture this worker hands to every dispatch it makes. Each dispatch
@@ -15207,7 +15300,7 @@ async function cmdWork(cfg, { values }) {
       out(`factory: none — the loop runs bare (declare one with --factory <id> or work.factory)`);
     }
     const policySkips = [];
-    const cands = workLoop.selectWorkCandidates(await candidates(), { accept, repos: factoryRepos, graph: localFactoryGraph, onSkip: (it, reason, kind) => policySkips.push({ it, reason, kind }) });
+    const cands = workLoop.selectWorkCandidates(await candidates(), { accept, repos: factoryRepos, graph: localFactoryGraph, selfAgent, onSkip: (it, reason, kind) => policySkips.push({ it, reason, kind }) });
     if (!cands.length) out("queue:   nothing dispatchable right now");
     else {
       out(`queue:   ${cands.length} candidate(s); this pass would take the first ${Math.min(concurrency, cands.length)}`);
@@ -15286,7 +15379,7 @@ async function cmdWork(cfg, { values }) {
   if (restartOnLand && !loadedCode) out(`work: --restart-on-land has nothing to watch — ${ROOT} is not a source checkout; the worker runs until stopped`);
   const final = await workLoop.runWorkLoop({
     opts: {
-      workerId, project: slug, accept, repos: factoryRepos, graph: localFactoryGraph, concurrency, intervalMs, maxIntervalMs, retryAfterMs, max, once: !!values.once, factory: factoryId, factoryRevision: factory && factory.revision, restartOnLand,
+      workerId, project: slug, accept, repos: factoryRepos, graph: localFactoryGraph, selfAgent, concurrency, intervalMs, maxIntervalMs, retryAfterMs, max, once: !!values.once, factory: factoryId, factoryRevision: factory && factory.revision, restartOnLand,
       // The pid-reuse guard for this record: a SIGKILLed worker leaves no
       // stopped_at, and a bare pid probe would read its recycled pid as this
       // worker still running (the same identity check the run store makes).
@@ -16423,6 +16516,37 @@ async function autoRouteToFleetHost(cfg, { nodeId, profileId, ownAgents, maxAge 
   err(`  auto-routed ${nodeId} to ${target.agent}${meta ? ` (${meta})` : ""} — assigned → ${target.agent} {profile: ${profileId}}.`);
   err(`  that box satisfies THIS profile (never a substitute); its worker picks the item up on its next poll.`);
   err(`  nothing was claimed or launched here.`);
+  // Retract THIS box's own assignment(s) now that the target holds the work
+  // (issue-spor-auto-route-additive-assignment-two-assignees): the write above
+  // is additive by itself — without this the node keeps its OLD `assigned ->
+  // <this box>` edge alongside the new one, so this box's own `spor work`
+  // re-selects the item every work.retryAfterMs (dispatchableQueuePage isn't
+  // assignee-filtered) and re-runs this whole routine, re-POSTing an
+  // idempotent edge to the same target every cycle — harmless (the server
+  // upserts) but noisy, and "handed off" was only ever true from the target's
+  // side. Every id here is `mine` — OUR OWN identity, never a person's or the
+  // target's — and remove_edge is idempotent (a missing edge is a `skipped`
+  // no-op, API.md §1/§3), so this is safe to attempt unconditionally and never
+  // touches anyone else's edge. Best-effort: a failure here leaves the node
+  // exactly as this bug already left it, and the report above already stands.
+  for (const agentId of mine) {
+    if (!agentId || agentId === target.agent) continue;
+    let dr;
+    try {
+      dr = await remote.del(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}/edges`, {
+        body: { type: "assigned", to: agentId },
+        timeoutMs: 8000,
+      });
+    } catch (e) {
+      dr = { ok: false, transport: true, error: e && e.message ? e.message : String(e) };
+    }
+    if (!dr.ok) {
+      const e = (dr.json && dr.json.error) || {};
+      err(`  (could not retract this box's own assignment ${agentId}: ${dr.transport ? dr.error : `HTTP ${dr.status}${e.message ? ` — ${e.message}` : ""}`} — harmless but noisy; it will keep re-routing here until this clears)`);
+    } else if (dr.json && dr.json.status !== "skipped") {
+      err(`  retracted this box's own assignment (${agentId}) — ${target.agent} now holds it alone.`);
+    }
+  }
   return { routed: true, agent: target.agent };
 }
 
@@ -17430,7 +17554,7 @@ const COMMANDS = {
   },
   edge: {
     group: "Graph", parse: "strict", args: "<id> <type> <to>", aliases: ["add-edge"],
-    summary: "add a typed edge from a node (local: in-place; remote: /v1/nodes/{id}/edges)",
+    summary: "add (or --remove) a typed edge (local: in-place; remote: /v1/nodes/{id}/edges)",
     help:
       "Add a typed edge from <id> to <to> — close a loop with 'resolves', mark a\n" +
       "dependency with 'blocks'/'blocked-by', or relate two nodes — without a raw\n" +
@@ -17441,14 +17565,22 @@ const COMMANDS = {
       "idempotent no-op. --attr key=value (repeatable) carries flat edge attributes\n" +
       "(e.g. a per-assignment 'profile:' override). Remote mode POSTs\n" +
       "/v1/nodes/{id}/edges (the add_edge micro-mutation); local mode appends the\n" +
-      "edge line to the node file, normalizing and validating it the same way.",
+      "edge line to the node file, normalizing and validating it the same way.\n" +
+      "--remove is the withdrawal twin (remove_edge, DELETE /v1/nodes/{id}/edges):\n" +
+      "drop one typed edge by <id> <type> <to>, no --attr. A missing edge is an\n" +
+      "idempotent no-op, never an error. Local mode removes only a flow-form\n" +
+      "\"- {type: ..., to: ...}\" line (what every machine writer, including this\n" +
+      "command's own --add path, produces) — a hand-authored block-form edge\n" +
+      "needs a whole-node rewrite ('spor put-node') instead.",
     options: {
       attr: { type: "string", value: "key=value", desc: "flat edge attribute (repeatable)", multiple: true },
+      remove: { type: "boolean", desc: "remove the edge instead of adding it (remove_edge)" },
     },
     examples: [
       "spor edge dec-x resolves task-y",
       "spor edge task-a blocked-by task-b",
       "spor edge task-x assigned agent-z --attr profile=profile-fast",
+      "spor edge task-x assigned agent-z --remove",
     ],
     run: (cfg, p) => cmdEdge(cfg, p),
   },

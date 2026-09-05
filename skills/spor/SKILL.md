@@ -112,7 +112,7 @@ spor ask "Does the queue's assignee filter union stewards edges or only direct a
 spor correct <target> "<text>" # standing briefing correction (corr file locally; /v1/corrections remotely)
 spor priority <id> <p1|p2|p3|clear>  # set/clear queue human-triage priority (local: rewrite frontmatter; remote: /v1/nodes/{id}/priority)
 spor set-status <id> <status>  # flip a node's status — an active status (active/open) also CLAIMS it (local: rewrite frontmatter; remote: /v1/nodes/{id}/status)
-spor edge <id> <type> <to>     # add a typed edge, e.g. close a loop with resolves (local: append edge line; remote: /v1/nodes/{id}/edges)
+spor edge <id> <type> <to> [--remove]  # add (or --remove) a typed edge, e.g. close a loop with resolves (local: append/remove edge line; remote: POST/DELETE /v1/nodes/{id}/edges)
 
 # remote (team server) only
 spor lens [<id>]               # list saved views, or render one
