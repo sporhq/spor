@@ -167,6 +167,35 @@ test("a supervised writer is believed only while its supervisor is still WATCHIN
   );
 });
 
+test("an unverifiable supervisor (dead/unknown start-time tick count) is bounded by the SAME 1h horizon as a native-background record, not supervisorStillWatching's own 24h default", () => {
+  // Off Linux — or on an older record with no `runner_started_ticks` — identity
+  // can never be verified, so this exercises the real `supervisorStillWatching`
+  // default (no injected `watching`) with a record whose recorded tick count is
+  // simply absent, which reproduces the "unverifiable" branch on ANY host
+  // (issue-spor-preflight-live-writers-24h-stale-off-linux).
+  const dir = path.resolve("/tmp/candidate-unverifiable");
+  const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+  const record = {
+    run_id: "a",
+    state: "running",
+    cwd: dir,
+    runner_pid: process.pid, // alive, but...
+    // ...no runner_started_ticks, so identity can never be confirmed.
+    started_at: twoHoursAgo,
+  };
+  assert.deepStrictEqual(
+    preflight.liveWorkspaceWriters([record], { dir }).map((w) => w.run_id),
+    [],
+    "silent for 2h — past the 1h horizon this function shares with the native-run believer — so no longer a live writer"
+  );
+  // A shorter silence, still within the 1h horizon, is unaffected.
+  const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  assert.deepStrictEqual(
+    preflight.liveWorkspaceWriters([{ ...record, started_at: tenMinutesAgo }], { dir }).map((w) => w.run_id),
+    ["a"]
+  );
+});
+
 test("planWorkspace reports a worktreeSetup hook declared without isolation — and never interprets it as enabling one", () => {
   const shared = preflight.planWorkspace({ repoDir: "/repo", worktreeDir: "/repo/.claude/worktrees/x", useWorktree: false, worktreeSetup: "/repo/setup.sh" });
   assert.strictEqual(shared.dir, "/repo");
