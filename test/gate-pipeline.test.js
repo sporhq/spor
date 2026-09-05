@@ -2688,27 +2688,61 @@ test("end to end: a failing gate cools the item, files an escalation, and says s
 // (issue-spor-gate-stop-tests-leak-scratch-homes). So the test ends it, on the
 // same terms `spor work` ends an idle run.
 //
-// The wait is not optional: the supervisor records `runner_pid` on its child's
-// `spawn` event, and before that write there is no pid to signal — a stop that
-// found no record would leave exactly the straggler it exists to prevent. It is
-// bounded, and returns its reading rather than throwing, so a cleanup that
-// cannot run never masks the assertion failure that sent us here.
-async function stopOrphanedRun(home, runId, { deadlineMs = 10000 } = {}) {
-  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
-  if (!runId) return { ok: false, reason: "no run id to stop" };
-  const deadline = Date.now() + deadlineMs;
-  for (;;) {
-    const record = dispatchRuns.readRunRecords(home).find((r) => r.run_id === runId);
-    if (record && record.runner_pid) {
-      // graceMs low on purpose: this stub traps nothing, so the SIGTERM is the
-      // whole stop and the grace is only the window before the SIGKILL that
-      // makes it certain.
-      const stopped = await dispatchRuns.stopRun(record, { graceMs: 500 });
-      return { ok: !stopped.alive, stopped };
+// It sweeps this home's RUN RECORDS rather than a run id the test hands it,
+// because the window it must cover is exactly the one where the test HAS no id
+// to hand: `spor dispatch` opens the record, detaches the supervisor and stamps
+// its pid well before `gate_fix_run_id` is stamped on the pipeline's own record
+// (bin/spor.js), so a timeout or a failed assertion in between reached a
+// cleanup keyed on that id with nothing to stop — leaking the straggler on the
+// very path most likely to produce one. The record is the durable name: the
+// launcher writes it at `launching` before the supervisor exists and stamps
+// `runner_pid` on it itself, so every launch this home made is named here
+// whether or not the test ever learned its id.
+//
+// The wait is not optional: before that stamp there is no pid to signal, and a
+// stop that found no pid would leave exactly the straggler it exists to
+// prevent. It never waits on a launch that already FAILED (the launcher closes
+// that record itself), it is bounded, and it returns its reading rather than
+// throwing, so a cleanup that cannot run never masks the assertion failure that
+// sent us here. Two passes, because a record stamped while the first pass was
+// signalling its siblings is a check-then-signal race the second pass closes;
+// re-stopping an already-dead run costs nothing (`stopRun` finds no one to
+// signal and returns without sleeping).
+async function stopOrphanedRuns(home, { deadlineMs = 10000, passes = 2 } = {}) {
+  const reading = { ok: false, records: 0, signalled: [], alive: [], midLaunch: [], error: null };
+  try {
+    const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+    const deadline = Date.now() + deadlineMs;
+    const unstamped = (r) => !r.runner_pid && !dispatchRuns.TERMINAL_STATES.has(r.state);
+    for (let pass = 0; pass < passes; pass++) {
+      let records = [];
+      for (;;) {
+        records = dispatchRuns.readRunRecords(home);
+        if (!records.some(unstamped) || Date.now() > deadline) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      reading.records = records.length;
+      reading.alive = [];
+      reading.midLaunch = records.filter(unstamped).map((r) => r.run_id);
+      for (const record of records) {
+        if (!record.runner_pid) continue;
+        // graceMs low on purpose: this stub traps nothing, so the SIGTERM is
+        // the whole stop and the grace is only the window before the SIGKILL
+        // that makes it certain.
+        const stopped = await dispatchRuns.stopRun(record, { graceMs: 500 });
+        if (stopped.supervisor || stopped.child || stopped.group) reading.signalled.push(record.run_id);
+        if (stopped.alive) reading.alive.push(record.run_id);
+      }
+      // `records` in the verdict, not just the survivors: a sweep that found
+      // NOTHING to sweep is a sweep pointed at the wrong place (a renamed
+      // journal dir, a moved home), and reading that as a clean home is how a
+      // cleanup nobody checks comes back.
+      reading.ok = !!reading.records && !reading.alive.length && !reading.midLaunch.length;
     }
-    if (Date.now() > deadline) return { ok: false, reason: `no run record naming a supervisor for ${runId} within ${deadlineMs}ms` };
-    await new Promise((r) => setTimeout(r, 50));
+  } catch (error) {
+    reading.error = String((error && error.stack) || error);
   }
+  return reading;
 }
 
 // end to end: SIGTERM mid fix-cycle (issue-spor-work-stop-abandons-inflight-
@@ -2797,9 +2831,8 @@ process.stdin.on("end", () => {
   let stderr = "";
   child.stderr.on("data", (c) => (stderr += c));
 
-  // Hoisted: the cleanup below needs the run this test walked away from, and it
-  // runs whether the assertions passed or threw.
-  let fixRunId = null;
+  // Hoisted so the cleanup's reading survives the try/finally; the cleanup
+  // itself needs NOTHING this block computes — see stopOrphanedRuns above.
   let orphanStop = null;
   try {
     // Wait for the fix cycle to actually be dispatched (two harness
@@ -2822,7 +2855,7 @@ process.stdin.on("end", () => {
       if (Date.now() > deadline) throw new Error(`timed out waiting for gate_fix_run_id to be stamped.\nrecords: ${JSON.stringify(records)}\nstdout:\n${stdout}`);
       await new Promise((r) => setTimeout(r, 100));
     }
-    fixRunId = named.gate_fix_run_id;
+    const fixRunId = named.gate_fix_run_id;
 
     child.kill("SIGTERM");
     // "close", not "exit" — "exit" can fire before the child's stdio pipes have
@@ -2856,16 +2889,18 @@ process.stdin.on("end", () => {
     } catch {
       /* already gone */
     }
-    // ...then the pipeline the worker was told to walk away FROM, which nothing
-    // else in this process owns. See stopOrphanedRun above.
-    orphanStop = await stopOrphanedRun(home, fixRunId);
+    // ...then every dispatch this home launched — including the pipeline the
+    // worker was told to walk away FROM, which nothing else in this process
+    // owns and which the paths that reach here early never got to name. See
+    // stopOrphanedRuns above.
+    orphanStop = await stopOrphanedRuns(home);
   }
   // Pinned, not merely attempted: the leak this closes is precisely "the test
   // returned while something of its own was still running", and a best-effort
   // cleanup nobody checks is how it came back.
   assert.ok(
     orphanStop.ok,
-    `the orphaned fix-cycle run must be gone before this test returns, or it writes its record back into ${home} after the suite has deleted it: ${JSON.stringify(orphanStop)}`
+    `every run this test launched must be gone before it returns, or one writes its record back into ${home} after the suite has deleted it: ${JSON.stringify(orphanStop)}`
   );
 });
 
