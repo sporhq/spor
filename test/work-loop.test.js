@@ -1309,6 +1309,45 @@ test("summarizeSkips aggregates by REASON CLASS, so one item's specifics never f
   assert.strictEqual(workLoop.summarizeSkips([]), "");
 });
 
+test("skipClass/summarizeSkips classify a structured {reason, kind} entry BY KIND, not by re-parsing the reason text (task-spor-work-loop-extend-cooldown-kinds)", () => {
+  // policy/scope/human have a fixed label independent of the reason's free
+  // text — no parenthetical-stripping or `;`/`:` splitting needed at all.
+  assert.strictEqual(workLoop.skipClass({ reason: "not agent-ready; work.accept ready", kind: "policy" }), "not agent-ready");
+  assert.strictEqual(
+    workLoop.skipClass({ reason: "outside the factory's repo scope (repo demo; this factory judges demo-server)", kind: "scope" }),
+    "outside the factory's repo scope"
+  );
+  assert.strictEqual(workLoop.skipClass({ reason: "readiness: human", kind: "human" }), "readiness: human");
+  // gate/outcome pull the VERDICT/STATE word out of a reason whose per-run
+  // detail (after the em dash) would otherwise fragment every instance into
+  // its own class under the generic `;`/`:` split.
+  assert.strictEqual(workLoop.skipClass({ reason: "gate pipeline failed — npm test exited 1", kind: "gate" }), "gate pipeline failed");
+  assert.strictEqual(workLoop.skipClass({ reason: "gate pipeline blocked", kind: "gate" }), "gate pipeline blocked");
+  assert.strictEqual(
+    workLoop.skipClass({ reason: "last run here ended declined (report art-x) — no reason given", kind: "outcome" }),
+    "run ended declined"
+  );
+  assert.strictEqual(workLoop.skipClass({ reason: "last run here ended failed", kind: "outcome" }), "run ended failed");
+  // Aggregating two gate failures with DIFFERENT underlying detail still
+  // buckets them together once they carry the same kind — the fragmentation
+  // the generic string parser could not avoid on its own.
+  assert.strictEqual(
+    workLoop.summarizeSkips([
+      { reason: "gate pipeline failed — npm test exited 1", kind: "gate" },
+      { reason: "gate pipeline failed — lint failed", kind: "gate" },
+      { reason: "last run here ended declined (report art-x) — no reason given", kind: "outcome" },
+    ]),
+    "2 gate pipeline failed, 1 run ended declined"
+  );
+  // An unrecognized or absent kind still falls through to the legacy string
+  // parsing — the "refusal" cooldown's free text has no fixed shape to key a
+  // label off of, so this is where prefix-stripping survives on purpose.
+  assert.strictEqual(
+    workLoop.skipClass({ reason: "cannot dispatch task-a here: this machine can't satisfy profile profile-x", kind: "refusal" }),
+    "this machine can't satisfy profile profile-x"
+  );
+});
+
 test("the loop names the first few skips and AGGREGATES the rest, rather than one log line per untriaged item per poll", async () => {
   // The widened page (above) can hand a pass far more skips than the cooldown
   // map remembers, so an uncoalesced log re-prints every evicted one every 30s.
@@ -1499,6 +1538,10 @@ test("a declined run frees its slot without a gate, is tallied apart, and cools 
   const cooled = status.skipped.find((x) => x.id === "task-a");
   assert.ok(cooled, "the declined item does not come straight back to this worker");
   assert.match(cooled.reason, /declined — the server half already shipped .* \(finding find-declined-a-1234abcd\)/);
+  // task-spor-work-loop-extend-cooldown-kinds: a harvested run that did not
+  // resolve its target cools off under its own structured kind, not the
+  // generic "refusal" default a true dispatch refusal carries.
+  assert.strictEqual(cooled.kind, "outcome");
 });
 
 // ------------------------------------------------ pollWorkRuns: idle + grace --

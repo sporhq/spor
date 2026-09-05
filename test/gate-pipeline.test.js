@@ -1234,6 +1234,9 @@ test("a FAILED gate cools the item off — a worker does not re-dispatch what it
   assert.strictEqual(status.skipped.length, 1);
   assert.strictEqual(status.skipped[0].id, "task-a");
   assert.match(status.skipped[0].reason, /gate pipeline failed/);
+  // task-spor-work-loop-extend-cooldown-kinds: a gate verdict cools the node
+  // off under its own structured kind, not the generic "refusal" default.
+  assert.strictEqual(status.skipped[0].kind, "gate");
   assert.strictEqual(status.recent[0].gate, "failed");
   assert.strictEqual(status.recent[0].escalated_to, "task-gate-acceptance");
 });

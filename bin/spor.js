@@ -10748,12 +10748,14 @@ function cmdWorkStatus(cfg, { json }) {
     // under the default accept policy, a sibling repo's items under a scoped
     // factory), so listing the first five and stopping told an operator that
     // five were skipped. The list stays capped — a status read is a glance, and
-    // --json carries every entry — but the REST is counted, by reason.
+    // --json carries every entry — but the REST is counted, by kind+reason
+    // (task-spor-work-loop-extend-cooldown-kinds: every skip carries a
+    // structured `kind` now, not just a free-text reason).
     const skips = w.skipped || [];
     const shown = workLoop.SKIP_LOG_CAP;
     for (const s of skips.slice(0, shown)) out(`  skipped:  ${s.id} — ${s.reason} (retry after ${s.until})`);
     if (skips.length > shown) {
-      out(`  skipped:  +${skips.length - shown} more — ${workLoop.summarizeSkips(skips.slice(shown).map((s) => s.reason))} ('spor work --status --json' lists them all)`);
+      out(`  skipped:  +${skips.length - shown} more — ${workLoop.summarizeSkips(skips.slice(shown).map((s) => ({ reason: s.reason, kind: s.kind })))} ('spor work --status --json' lists them all)`);
     }
     if (w.next_poll_at && !w.stopped_at) out(`  next poll: ${w.next_poll_at}`);
   }
@@ -14118,7 +14120,7 @@ async function cmdWork(cfg, { values }) {
       out(`factory: none — the loop runs bare (declare one with --factory <id> or work.factory)`);
     }
     const policySkips = [];
-    const cands = workLoop.selectWorkCandidates(await candidates(), { accept, repos: factoryRepos, onSkip: (it, reason) => policySkips.push({ it, reason }) });
+    const cands = workLoop.selectWorkCandidates(await candidates(), { accept, repos: factoryRepos, onSkip: (it, reason, kind) => policySkips.push({ it, reason, kind }) });
     if (!cands.length) out("queue:   nothing dispatchable right now");
     else {
       out(`queue:   ${cands.length} candidate(s); this pass would take the first ${Math.min(concurrency, cands.length)}`);
@@ -14131,7 +14133,7 @@ async function cmdWork(cfg, { values }) {
     // screen hides its own answer.
     for (const { it, reason } of policySkips.slice(0, workLoop.SKIP_LOG_CAP)) out(`  skip ${it.id}  ${it.readiness || "untriaged"}  ${reason}`.slice(0, 160));
     if (policySkips.length > workLoop.SKIP_LOG_CAP) {
-      out(`  ...and ${policySkips.length - workLoop.SKIP_LOG_CAP} more skipped — ${workLoop.summarizeSkips(policySkips.slice(workLoop.SKIP_LOG_CAP).map((p) => p.reason))}`);
+      out(`  ...and ${policySkips.length - workLoop.SKIP_LOG_CAP} more skipped — ${workLoop.summarizeSkips(policySkips.slice(workLoop.SKIP_LOG_CAP).map((p) => ({ reason: p.reason, kind: p.kind })))}`);
     }
     out(`\nnothing was launched (--print). Each item would go through 'spor dispatch --node <id>', whose guards decide.`);
     return 0;
