@@ -867,6 +867,22 @@ test("dispatch --dir: an ordinary subdirectory of a main checkout is NOT mistake
   assert.match(r.stdout, new RegExp(`dir:    ${sub.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*via --dir`));
 });
 
+test("dispatch --dir: a git SUBMODULE is NOT mistaken for a linked worktree", () => {
+  // A submodule also makes --show-toplevel/--git-common-dir diverge (common-dir
+  // resolves to the superproject's .git/modules/<name> admin dir, not a working
+  // tree), so the divergence alone isn't sufficient to call something a linked
+  // worktree — linkedWorktreeMainRoot() must also check the common-dir's
+  // basename is literally `.git`, never `modules/<name>`.
+  const { repo: outer } = gitTargetRepo("outer");
+  const { repo: inner } = gitTargetRepo("inner");
+  const r = spawnSync("git", ["-c", "protocol.file.allow=always", "-C", outer, "submodule", "add", "-q", inner, "sub"], {
+    encoding: "utf8",
+    env: { ...process.env, GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@example.com" },
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(u.linkedWorktreeMainRoot(path.join(outer, "sub")), null);
+});
+
 test("dispatch --worktree --print: previews the worktree path + branch and creates nothing", () => {
   const { home } = fixture();
   const { repo } = gitTargetRepo();

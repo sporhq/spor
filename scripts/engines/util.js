@@ -270,13 +270,19 @@ function inferenceRoot(cwd) {
 // holds an explicit directory — `spor dispatch --dir`, `dispatch.repos` — and
 // must tell "this literally IS/is-in a worktree" from "this is merely not the
 // repo root" before refusing or self-healing it
-// (issue-spor-dispatch-dir-inside-worktree-nesting). One spawn, same
+// (issue-spor-dispatch-dir-inside-worktree-nesting). A git SUBMODULE also
+// makes `--show-toplevel`/`--git-common-dir` diverge (common-dir resolves to
+// the superproject's `.git/modules/<name>` admin dir, not a working tree at
+// all), so the divergence alone isn't sufficient — a linked worktree's
+// common-dir is always the main checkout's OWN `.git` directly (basename
+// `.git`); a submodule's is nested one level deeper under `modules/`, whose
+// basename is the submodule's name, never literally `.git`. One spawn, same
 // TOCTOU-safe trick as inferenceRoot. Fail-open to null (not a worktree, not
 // git, or git couldn't resolve it at all) — never invented from a path alone.
 function linkedWorktreeMainRoot(dir) {
   const raw = git(dir, ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"]) ?? "";
   const [top, common] = raw.trim().split("\n").map((l) => l.trim());
-  if (!top || !common) return null;
+  if (!top || !common || path.basename(common) !== ".git") return null;
   const mainTop = path.dirname(common);
   return mainTop && mainTop !== top ? mainTop : null;
 }
