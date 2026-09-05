@@ -10683,8 +10683,18 @@ async function verifyRunResolution(cfg, record) {
     } catch {
       return null; // an unreachable graph is not evidence of anything
     }
-    if (!res || !res.ok) return null;
-    const node = res.json || {};
+    // `res.jsonError` means the body did not parse — a 2xx with an empty or
+    // malformed body is not a legitimate "no resolution" reading, it is a
+    // failed read (issue-spor-verify-run-resolution-silent-json-parse-failure):
+    // falling through to `res.json || {}` used to treat it as an empty node
+    // and confidently conclude "not resolved", the same class of bug
+    // dec-spor-dispatch-terminal-verify-jsonerror-fail-closed already fixed in
+    // dispatch-terminal.js's own verify leg. Only a POSITIVE reading may ever
+    // overwrite a provisional outcome, so this returns null exactly as the
+    // unreachable-graph case above does — "could not verify", not "verified
+    // not resolved".
+    if (!res || !res.ok || res.jsonError || !res.json || typeof res.json !== "object") return null;
+    const node = res.json;
     const type = String(node.type || "").toLowerCase();
     // Ask the LIVE registry, not the shipped seed pack
     // (issue-spor-remote-dispatch-ignores-resident-resolution-hooks) — the

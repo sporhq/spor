@@ -1581,6 +1581,7 @@ const sporCli = require("../bin/spor.js");
 const { dispatchableQueuePage, ladderWidth } = sporCli;
 const { loadConfig } = require("../lib/config.js");
 const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+const remoteLib = require("../lib/remote.js");
 const { spawn } = require("node:child_process");
 
 // A scratch SPOR_HOME with one task and, optionally, the decision that resolves
@@ -1867,6 +1868,32 @@ function leaseServer({ resolved = false, releaseStatus = 200 } = {}) {
   };
 }
 
+// A `GET /v1/nodes/task-wedged` that answers 200 with a body that fails to
+// parse — issue-spor-verify-run-resolution-silent-json-parse-failure. Before
+// the fix, `verifyRunResolution` defaulted the unparseable body to `{}` and
+// read it as a confidently-empty node; the fix must instead treat it as
+// "could not verify" — the same no-overwrite reading an unreachable graph
+// already gets — never a false "not resolved".
+function malformedLeaseServer() {
+  const http = require("node:http");
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    hits.push({ method: req.method, url: req.url });
+    if (req.method === "GET" && req.url === "/v1/nodes/task-wedged") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("not valid json{{{");
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  return {
+    hits,
+    listen: async () => { await new Promise((r) => srv.listen(0, "127.0.0.1", r)); return `http://127.0.0.1:${srv.address().port}`; },
+    close: () => new Promise((r) => srv.close(r)),
+  };
+}
+
 function remotePollFixture(base) {
   const { home } = pollFixture();
   const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: base, SPOR_TOKEN: "t" } });
@@ -2035,6 +2062,77 @@ test("verifyRunResolution: a record stamped with another server is never verifie
     const own = await sporCli.verifyRunResolution(cfg, { run_id: "x", node_id: "task-wedged", server: `${base}/` });
     assert.strictEqual(own && own.terminal_state, "resolved", "a trailing slash is the same door");
     assert.strictEqual(sporCli.runGraphMatches(cfg, { node_id: "task-wedged" }), true, "an unstamped (older, or local-mode) record is taken to be this worker's");
+  } finally {
+    await fake.close();
+  }
+});
+
+test("verifyRunResolution: a 2xx with an unparseable body reads as 'could not verify', never a confident 'not resolved'", async () => {
+  const fake = malformedLeaseServer();
+  const base = await fake.listen();
+  const { cfg } = remotePollFixture(base);
+  try {
+    const outcome = await sporCli.verifyRunResolution(cfg, { run_id: "x", node_id: "task-wedged", server: base });
+    assert.strictEqual(outcome, null, "an unparseable body must never be defaulted to an empty node and read as verified-not-resolved");
+  } finally {
+    await fake.close();
+  }
+});
+
+test("verifyRunResolution: a jsonError overrides even a json body that itself looks resolved — the guard is authoritative, not the empty-node fallback", async () => {
+  // The HTTP-level tests above happen to leave `json` at its parsed-failure
+  // `null`, which degenerates to an empty node the pre-fix code ALSO read as
+  // "not resolved" (a coincidence of `resolvedOutcomeFromNode`'s own
+  // empty-type fallback, not evidence this guard does anything). Stubbing
+  // `remote.get` directly lets the test hand back a `json` that WOULD read as
+  // resolved if the guard were skipped, pinned to a jsonError that must win
+  // regardless — the only way to prove the guard itself is load-bearing.
+  const original = remoteLib.get;
+  remoteLib.get = async (cfg, p) => {
+    if (p === "/v1/nodes/task-wedged") {
+      return {
+        ok: true, status: 200, jsonError: "Unexpected end of JSON input",
+        json: { id: "task-wedged", type: "task", resolution: { by: "dec-retry-added", edge: "resolves" } },
+      };
+    }
+    return { ok: true, status: 200, json: { node_types: [] }, jsonError: null };
+  };
+  try {
+    const { cfg } = remotePollFixture("http://127.0.0.1:1");
+    const outcome = await sporCli.verifyRunResolution(cfg, { run_id: "x", node_id: "task-wedged", server: "http://127.0.0.1:1" });
+    assert.strictEqual(outcome, null, "jsonError must veto the read even when json itself carries a resolution");
+  } finally {
+    remoteLib.get = original;
+  }
+});
+
+test("pollWorkRuns: a contract-pending record backed by an unparseable verify response is left exactly as it was", async () => {
+  // The same "only a POSITIVE reading may overwrite" contract as the
+  // not-resolved case above (line ~1804), now exercised with a verify read
+  // that failed to PARSE rather than one that legitimately answered "no
+  // resolution" — the malformed body must not be silently read as the latter.
+  const fake = malformedLeaseServer();
+  const base = await fake.listen();
+  const { home, cfg } = remotePollFixture(base);
+  const runId = "run-grace-json-error";
+  writeRecord(home, runId, {
+    state: "done",
+    launch_mode: "supervised-jsonl",
+    created_at: new Date(Date.now() - 600000).toISOString(),
+    finished_at: new Date(Date.now() - 300000).toISOString(),
+    contract_pending: true,
+    terminal_state: "reported",
+    terminal_enforced: false,
+    terminal_note: "provisional",
+    server: base,
+  });
+  try {
+    const [verdict] = await sporCli.pollWorkRuns(cfg, [runId], { maxAgeMs: 86400000, idleMs: 0 });
+    assert.strictEqual(verdict.terminal, true);
+    assert.strictEqual(verdict.record.terminal_state, "reported", "not flipped to a verified outcome off an unreadable body");
+    assert.strictEqual(verdict.record.terminal_enforced, false);
+    assert.strictEqual(verdict.record.contract_pending, true, "left pending for a later, readable verify");
+    assert.strictEqual(dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record).contract_pending, true);
   } finally {
     await fake.close();
   }

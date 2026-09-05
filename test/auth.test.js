@@ -505,6 +505,67 @@ test('remote.request: refreshable tenant with no cached access token refreshes b
 });
 
 // ===========================================================================
+// lib/remote.js request() — jsonError on an unparseable 2xx body
+// (issue-spor-verify-run-resolution-silent-json-parse-failure): mirrors
+// dispatch-terminal.js's own httpJson so every caller reading the parsed body
+// can tell "failed to parse" apart from "legitimately parsed to null/{}"
+// instead of both silently reading as the latter.
+// ===========================================================================
+
+function bodyServer(body) {
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    hits.push({ method: req.method, url: req.url });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(body);
+  });
+  return new Promise((r) => srv.listen(0, '127.0.0.1', () => r({ srv, hits, base: `http://127.0.0.1:${srv.address().port}` })));
+}
+
+test('remote.request: a 2xx with an unparseable body surfaces jsonError, leaving ok/json exactly as before', async () => {
+  const { srv, base } = await bodyServer('not valid json{{{');
+  try {
+    const home = tmp();
+    const c = loadAt(home, { env: { SPOR_SERVER: base, SPOR_TOKEN: 't' } });
+    const r = await remote.get(c, '/v1/nodes/task-x');
+    assert.strictEqual(r.ok, true, 'the HTTP layer alone still reports success');
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.json, null, 'byte-identical to before this fix: a failed parse still leaves json null');
+    assert.match(r.jsonError, /Unexpected|JSON/i);
+  } finally {
+    srv.close();
+  }
+});
+
+test('remote.request: a 2xx with a genuinely empty body carries no jsonError — that is not a parse failure', async () => {
+  const { srv, base } = await bodyServer('');
+  try {
+    const home = tmp();
+    const c = loadAt(home, { env: { SPOR_SERVER: base, SPOR_TOKEN: 't' } });
+    const r = await remote.get(c, '/v1/nodes/task-x');
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.json, null);
+    assert.strictEqual(r.jsonError, null);
+  } finally {
+    srv.close();
+  }
+});
+
+test('remote.request: a 2xx with a valid JSON body parses cleanly and carries no jsonError', async () => {
+  const { srv, base } = await bodyServer(JSON.stringify({ id: 'task-x', type: 'task' }));
+  try {
+    const home = tmp();
+    const c = loadAt(home, { env: { SPOR_SERVER: base, SPOR_TOKEN: 't' } });
+    const r = await remote.get(c, '/v1/nodes/task-x');
+    assert.strictEqual(r.ok, true);
+    assert.deepStrictEqual(r.json, { id: 'task-x', type: 'task' });
+    assert.strictEqual(r.jsonError, null);
+  } finally {
+    srv.close();
+  }
+});
+
+// ===========================================================================
 // `spor auth` CLI verbs (fake device server)
 // ===========================================================================
 
