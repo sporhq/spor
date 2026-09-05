@@ -260,6 +260,27 @@ function inferenceRoot(cwd) {
   return top;
 }
 
+// Narrower predicate than inferenceRoot(): is `dir` ITSELF sitting inside a
+// LINKED worktree (its own toplevel, whether `dir` names that toplevel exactly
+// or a subdirectory below it)? Returns the main checkout's directory if so,
+// else null — including for an ordinary subdirectory of a MAIN checkout, which
+// inferenceRoot's `!== cwd` would misflag (show-toplevel already collapses a
+// subdirectory to its checkout's root, so `top` and `mainTop` agree there; they
+// diverge only when `top` is a linked worktree's own root). Used where a caller
+// holds an explicit directory — `spor dispatch --dir`, `dispatch.repos` — and
+// must tell "this literally IS/is-in a worktree" from "this is merely not the
+// repo root" before refusing or self-healing it
+// (issue-spor-dispatch-dir-inside-worktree-nesting). One spawn, same
+// TOCTOU-safe trick as inferenceRoot. Fail-open to null (not a worktree, not
+// git, or git couldn't resolve it at all) — never invented from a path alone.
+function linkedWorktreeMainRoot(dir) {
+  const raw = git(dir, ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"]) ?? "";
+  const [top, common] = raw.trim().split("\n").map((l) => l.trim());
+  if (!top || !common) return null;
+  const mainTop = path.dirname(common);
+  return mainTop && mainTop !== top ? mainTop : null;
+}
+
 // Normalize a raw string to the canonical project slug (the server's SLUG_RE,
 // ^[a-z0-9][a-z0-9-]*$): lowercased, runs of non-alphanumerics collapsed to a
 // single '-', and leading/trailing '-' trimmed. This is the ONE normalization
@@ -1863,6 +1884,7 @@ module.exports = {
   wordCount,
   stripTrailingNewlines,
   inferenceRoot,
+  linkedWorktreeMainRoot,
   slugify,
   projectSlug,
   projectGrouping,

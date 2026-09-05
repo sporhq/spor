@@ -803,6 +803,70 @@ fs.writeFileSync(process.env.OUTFILE, [process.cwd(), process.env.PWD || ""].joi
 `);
 }
 
+// --- resolved dispatch dir must never itself be a linked worktree ---------
+// issue-spor-dispatch-dir-inside-worktree-nesting: dispatch cuts its OWN
+// worktree under the resolved dir (dir/.claude/worktrees/<name>), so a
+// resolved dir that is ALREADY a linked worktree would nest one worktree
+// inside another. --dir bypassed the cwd-based main-checkout correction
+// entirely; a poisoned dispatch.repos mapping has the same shape.
+
+// A linked worktree of `repo`, checked out to its own branch off HEAD.
+function addLinkedWorktree(repo, branch = "wt1") {
+  const dir = path.join(path.dirname(repo), `${branch}-checkout`);
+  const r = spawnSync("git", ["-C", repo, "worktree", "add", dir, "-b", branch, "HEAD"], { encoding: "utf8" });
+  assert.strictEqual(r.status, 0, r.stderr);
+  return fs.realpathSync(dir);
+}
+
+test("dispatch --dir inside a linked worktree: refused, not silently nested", () => {
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  const wt = addLinkedWorktree(repo);
+  const r = run(["dispatch", "some free text task here", "--dir", wt, "--no-brief", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1, r.stdout);
+  assert.match(r.stderr, new RegExp(`--dir ${wt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} is inside a linked git worktree of`));
+  assert.match(r.stderr, /nesting one inside another is refused/);
+  assert.match(r.stderr, new RegExp(`pass the main checkout instead: --dir ${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  // It must NOT have proceeded to print the dispatch into the worktree.
+  assert.doesNotMatch(r.stdout, /dir:    /);
+});
+
+test("dispatch --dir inside a linked worktree: --force overrides the refusal", () => {
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  const wt = addLinkedWorktree(repo);
+  const r = run(["dispatch", "some free text task here", "--dir", wt, "--no-brief", "--print", "--force"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stderr, /--force set — dispatching into the linked worktree anyway/);
+  assert.match(r.stdout, new RegExp(`dir:    ${wt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*via --dir`));
+});
+
+test("dispatch <node>: a dispatch.repos mapping poisoned to a linked worktree self-heals to the main checkout", () => {
+  const { home } = fixture(); // dec-x / task-rotate stamped repo: demo
+  const { repo } = gitTargetRepo("demo");
+  const wt = addLinkedWorktree(repo);
+  run(["repos", "add", "demo", wt], { SPOR_HOME: home }); // simulates a poisoned map entry
+  const r = run(["dispatch", "dec-x", "--no-brief", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stderr, new RegExp(`dispatch\\.repos\\['demo'\\] pointed inside a linked worktree \\(${wt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\); correcting to the main checkout ${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.match(r.stdout, new RegExp(`dir:    ${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*via config`));
+  assert.strictEqual(readRepos(home).demo, repo, "the healed path is persisted, not just used for this run");
+});
+
+test("dispatch --dir: an ordinary subdirectory of a main checkout is NOT mistaken for a linked worktree", () => {
+  // linkedWorktreeMainRoot() must not misfire on a plain subdirectory the way a
+  // naive inferenceRoot()-vs-dir comparison would (git already collapses
+  // --show-toplevel to the checkout root for any non-worktree subdirectory).
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  const sub = path.join(repo, "services", "api");
+  fs.mkdirSync(sub, { recursive: true });
+  const r = run(["dispatch", "some free text task here", "--dir", sub, "--no-brief", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stderr, /linked git worktree/);
+  assert.match(r.stdout, new RegExp(`dir:    ${sub.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*via --dir`));
+});
+
 test("dispatch --worktree --print: previews the worktree path + branch and creates nothing", () => {
   const { home } = fixture();
   const { repo } = gitTargetRepo();

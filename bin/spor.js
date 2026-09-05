@@ -9230,6 +9230,38 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     err(`target dir does not exist: ${res.dir}`);
     return 1;
   }
+  // Guard against a resolved dir that is ITSELF sitting inside a linked git
+  // worktree (issue-spor-dispatch-dir-inside-worktree-nesting). Worktree
+  // isolation cuts the AGENT's own worktree under res.dir
+  // (dispatchWorktreeDir = res.dir/.claude/worktrees/<name>), so a res.dir that
+  // is already a linked worktree would nest one worktree inside another. The
+  // "cwd"/"cwd-self" sources already resolve through dispatchRoot()
+  // (inferenceRoot), so they can never trip this — only an explicit --dir or a
+  // dispatch.repos config entry can name a worktree path directly.
+  // linkedWorktreeMainRoot() (unlike inferenceRoot()) doesn't also flag an
+  // ordinary subdirectory of a main checkout, so this never fires on a
+  // legitimate monorepo-subtree mapping.
+  const worktreeMainRoot = u.linkedWorktreeMainRoot(res.dir);
+  if (worktreeMainRoot) {
+    if (res.source === "--dir") {
+      err(`--dir ${res.dir} is inside a linked git worktree of ${worktreeMainRoot}.`);
+      if (!force) {
+        err(`  dispatch cuts its own worktree under the target dir, so nesting one inside another is refused.`);
+        err(`  pass the main checkout instead: --dir ${worktreeMainRoot}`);
+        err(`  re-run with --force to dispatch into the linked worktree anyway.`);
+        return 1;
+      }
+      err(`  --force set — dispatching into the linked worktree anyway.`);
+    } else if (res.source === "config") {
+      // A machine-local mapping has no business naming an ephemeral worktree —
+      // self-heal it the same way a "cwd" dispatch's own resolution never lets
+      // this happen in the first place, and persist the fix so the next
+      // dispatch doesn't re-read the same poisoned entry.
+      err(`note: dispatch.repos['${res.slug}'] pointed inside a linked worktree (${res.dir}); correcting to the main checkout ${worktreeMainRoot}.`);
+      res.dir = worktreeMainRoot;
+      u.registerRepo(cfg.userConfigHome(), res.slug, res.dir);
+    }
+  }
   // Guard a CORRUPT dispatch.repos mapping (issue-spor-dispatch-repos-corruption-
   // worktree-session-start). The slug->path map is machine-local and a
   // session-start re-probe from a confused worktree cwd could have pointed this
