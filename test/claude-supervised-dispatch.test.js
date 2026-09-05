@@ -391,6 +391,70 @@ test("--bg opts into the native launch: claude --bg with the prompt positional, 
   assert.strictEqual(record.launch_mode, "native-background");
 });
 
+test("the run-record schema's launch-mode asymmetry is real: `model`+`launched_at` on native, `started_at` on supervised", {
+  skip: process.platform === "win32" && "a multi-line positional cannot pass through a cmd.exe-run .cmd stub",
+}, async () => {
+  // WORKERS.md §8 documents the two launch modes as carrying DIFFERENT field
+  // sets, and a consumer reads an absent field as absent rather than as a
+  // violation — so which fields each writer actually emits is a contract, not
+  // an implementation detail, and the table drifts silently without this
+  // (issue-spor-unjudgeable-type-leases-never-released F3).
+  const { home, repo } = fixture();
+
+  const bgOut = path.join(home, "claude-bg.json");
+  const bgResult = run(
+    ["dispatch", "task-cc", "--dir", repo, "--no-brief", "--bg", "--model", "opus"],
+    { SPOR_HOME: home, SPOR_CLAUDE_CMD: claudeBgStub(home), OUTFILE: bgOut }
+  );
+  assert.strictEqual(bgResult.status, 0, bgResult.stderr);
+  const nativePath = await runRecordFile(home);
+  const native = JSON.parse(fs.readFileSync(nativePath, "utf8"));
+  assert.strictEqual(native.launch_mode, "native-background");
+  assert.strictEqual(native.model, "opus", "a native record carries the model override this launch resolved");
+  assert.ok(Object.prototype.hasOwnProperty.call(native, "launched_at"), "native: the launcher stamps the hand-off, not a child start");
+  assert.ok(!Object.prototype.hasOwnProperty.call(native, "started_at"), "native: `started_at` is the supervised field");
+
+  // A second, SUPERVISED dispatch into its own home, so the two records are
+  // told apart by their launch mode rather than by listing order.
+  const sup = fixture();
+  const supOut = path.join(sup.home, "claude-invocation.json");
+  const supResult = run(
+    ["dispatch", "task-cc", "--dir", sup.repo, "--no-brief", "--permission-mode", "bypassPermissions", "--model", "opus"],
+    { SPOR_HOME: sup.home, SPOR_CLAUDE_CMD: claudeStreamStub(sup.home, { delayMs: 50 }), OUTFILE: supOut }
+  );
+  assert.strictEqual(supResult.status, 0, supResult.stderr);
+  assert.ok(await awaitJson(supOut), "the supervised stub ran");
+  const supPath = await runRecordFile(sup.home);
+  const settled = await waitFor(() => {
+    const record = JSON.parse(fs.readFileSync(supPath, "utf8"));
+    return record.contract_pending === false ? record : null;
+  });
+  assert.ok(settled, "the supervised run settled");
+  assert.strictEqual(settled.launch_mode, "supervised-jsonl");
+  assert.ok(Object.prototype.hasOwnProperty.call(settled, "started_at"), "supervised: the supervisor stamps the child's real start");
+  assert.ok(!Object.prototype.hasOwnProperty.call(settled, "launched_at"), "supervised: `launched_at` is the native field");
+  assert.ok(
+    !Object.prototype.hasOwnProperty.call(settled, "model"),
+    "supervised: the model is fixed into the harness argv at launch and is NOT echoed onto the record — the same --model was passed"
+  );
+
+  // §8 documents the schema of `spor runs --json`, not of the file on disk, so
+  // pin it at that door too: the records ride out verbatim, asymmetry included.
+  const shown = (h) => {
+    const r = run(["runs", "--json"], { SPOR_HOME: h });
+    assert.strictEqual(r.status, 0, r.stderr);
+    return JSON.parse(r.stdout).runs[0];
+  };
+  const nativeJson = shown(home);
+  assert.strictEqual(nativeJson.launch_mode, "native-background");
+  assert.strictEqual(nativeJson.model, "opus");
+  assert.ok(!Object.prototype.hasOwnProperty.call(nativeJson, "started_at"));
+  const supJson = shown(sup.home);
+  assert.strictEqual(supJson.launch_mode, "supervised-jsonl");
+  assert.ok(!Object.prototype.hasOwnProperty.call(supJson, "model"));
+  assert.ok(Object.prototype.hasOwnProperty.call(supJson, "started_at"));
+});
+
 test("dispatch.claudeLaunchMode: native-background is the standing twin of --bg, and a no-op for a harness with no background mode", () => {
   const { home, repo } = fixture();
   const outfile = path.join(home, "claude-cfg.json");

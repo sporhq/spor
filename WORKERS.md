@@ -395,14 +395,40 @@ its **own status**, and is judged against that instead: `resolved` once the
 node's status has reached its type's terminal partition (a decision
 `settled`, a finding `resolved`, a capture-pending `merged` — unioned with
 the type-blind completion words), not resolved while it has not. Which of the
-two paths applies is read off the **schema registry** — does this type's
-schema declare the `get()` hook — never off a hardcoded type list, so a graph
-that attaches the hook to another type in a resident schema override is
-honored with no code change (norm-cc-registry-is-contract,
-task-spor-dispatch-terminal-resolution-all-types). A worker with no registry
-of its own reads the same answer from `GET /v1/schema` (`spor schema <type>
---json`); a target whose type the graph does not echo at all is treated as
-edge-verified, the fail-safe direction.
+two paths applies is read off a **schema registry** — does this type's schema
+declare the `get()` hook — never off a hardcoded type list
+(norm-cc-registry-is-contract,
+task-spor-dispatch-terminal-resolution-all-types). A target whose type the
+graph does not echo at all is treated as edge-verified: nothing short of a
+resolving edge attests it, which is the fail-safe direction.
+
+**Which registry answers that question is part of the contract too — and the
+reference client answers it two different ways.** A registry is only as live
+as the graph behind it:
+
+- **Local-mode verification** loads the graph it is verifying against, so it
+  asks that graph's own registry (`registry.attachesResolutionHook`). A
+  resident `type: schema` override that attaches the hook to another type —
+  or drops it — is honored there with no code change.
+- **The remote leg** holds one node's JSON and no graph, and answers from the
+  **shipped seed pack** (`attachesResolutionHookOffline`, `lib/graph.js`),
+  which by construction cannot see a resident override — the same graph-less
+  limitation API.md's reserved `inert` key names
+  (issue-spor-type-blind-terminal-status-fallbacks). The seed answer is right
+  for every graph that leaves the `get()` hooks where the seed pack puts
+  them; the case where it is not is tracked as
+  issue-spor-remote-dispatch-ignores-resident-resolution-hooks. Note what it
+  can and cannot get wrong: the server's own `resolution` enrichment is read
+  FIRST and is authoritative, so an override that ADDS the hook to a type
+  still reads `resolved` off the real resolving edge it produces. The
+  residual is one-directional — a type an override made edge-verified, but
+  the seed pack still reads as status-only, would read `resolved` off a
+  terminal own-status with no edge behind it.
+- **A third-party worker should do better than the reference client's remote
+  leg**, and can: read the live answer from `GET /v1/schema` — the type's
+  `hooks` array contains `get` (`spor schema <type> --json` prints the same
+  registry snapshot) — which is exactly the "agents reverse-engineering the
+  registry from `lib/seed/`" failure that endpoint exists to close.
 
 **Both paths are fully enforced, and both run the ordering below unchanged**
 — including the release. A status-only target whose status has *not* gone
@@ -415,7 +441,8 @@ with no handback, the opposite of what §3's lease contract promises
 (issue-spor-unjudgeable-type-leases-never-released; it supersedes the
 lease-and-enforcement half of dec-spor-dispatch-unjudgeable-type-reports,
 whose file-the-report-anyway half stands). There is no unjudgeable arm left:
-the only unenforced readings are the environmental ones under "What
+a target's TYPE never makes a run unenforced any more — only a posture where
+nothing could be verified or filed does, and those are enumerated under "What
 'enforced' means" below.
 
 **Ordering is the contract: file the report, THEN release the lease —
@@ -447,16 +474,36 @@ released lease with no report to show for it.
 
 **What "enforced" means, and where it doesn't apply yet.** `terminal_state`
 is only as trustworthy as `terminal_enforced` says it is
-(dec-spor-dispatch-terminal-states-supervised-first): it is `true` only when
-the graph was actually re-read against a reachable server — and, for a
-target with no resolving edge, the report actually filed there too (a
-`resolved` verdict needs only the re-read; nothing is filed once a resolving
-edge is already found). Every other case — no team graph configured (local-mode
-dispatch), a free-text dispatch with no target node, an unreachable server,
-or (v1) a **native-background** launch whose termination this runner cannot
-deterministically observe — stamps `terminal_enforced: false` and can never
-read `resolved`. A `reported` or `failed` value on an unenforced record is a
-best-effort classification of the *process* outcome, not a checked verdict;
+(dec-spor-dispatch-terminal-states-supervised-first): it is `true` only when a
+graph was actually re-read — and, for a target that re-read finds **not**
+attested complete, the report actually filed too (a `resolved` verdict needs
+only the re-read; nothing is filed once completion is attested).
+
+**Two graphs can answer that re-read, and local mode is not excluded from
+it.** Against a reachable server the whole contract runs: verify, file,
+release. In local mode there is no server door to file a report or hand a
+lease back through — but there IS a graph to verify against: the run's own
+local graph home, resolved by the launcher (not re-derived by the detached
+supervisor) and handed over as `local_nodes_dir`
+(task-spor-work-local-mode-resolver-check). The VERIFY leg runs there, over
+**both** attestation paths, so a local-mode target that reads attested
+complete is `resolved` with `terminal_enforced: true`. That is the one
+enforced local reading; every other local outcome is unenforced, because
+nothing was filed and no lease was handed back.
+
+`terminal_enforced: false` — and never `resolved` — is what every other
+reading gets:
+
+- a local-mode run whose target is not attested complete on that local graph,
+  or whose graph home is missing or unreadable (a free-text dispatch outside
+  any repo);
+- a dispatch with no target node to verify, report against, or release;
+- an unreachable — or unauthenticated — server;
+- (v1) a **native-background** launch, whose termination this runner cannot
+  deterministically observe, so the contract never runs for it at all.
+
+A `reported` or `failed` value on an unenforced record is a best-effort
+classification of the *process* outcome, not a checked verdict;
 `terminal_enforced` is the field a consumer must gate on before treating
 either as ground truth.
 
@@ -563,7 +610,7 @@ violation — new fields may be added additively.
 | `launch_mode` | string | `"native-background"` (detaches into the harness's own daemon) or `"supervised-jsonl"` (runs under a supervisor Spor owns) |
 | `state` | string | `"launching"` → `"running"` → one of the **terminal** process states: `"done"`, `"failed"`, `"failed_launch"`, `"vanished"` |
 | `cwd` | string | the run's working directory |
-| `model` | string \| null | native runs only — model override, when set |
+| `model` | string \| null | **native-background records only** — the model override this launch resolved (`--model`, else the profile's), `null` when none did; the key is always present on a native record. A supervised record does not carry the field at all — its model is fixed into the harness argv at launch |
 | `created_at` | ISO 8601 | when the record was opened |
 | `started_at` | ISO 8601 | supervised runs only — when the child process actually started |
 | `launched_at` | ISO 8601 | native runs only — when the launcher observed the harness hand off to its background daemon |
@@ -581,6 +628,17 @@ violation — new fields may be added additively.
 | `log_path` | string | supervised runs only — the raw JSONL/stderr log |
 | `report_path` | string | supervised runs only — where the harness's own final-message text landed, if any |
 | `child_reaped` | bool | optional — an orphaned harness child was terminated at reconciliation time |
+
+**The two launch modes carry different fields, and that asymmetry IS the
+schema — not an omission to read around.** A `native-background` record
+carries `launched_at` (never `started_at`: the launcher observes the hand-off
+to the harness's daemon, not the child's own start), plus `launcher_exit`,
+`bound_at`, `transcript_path`, and `model`. A `supervised-jsonl` record
+carries `started_at`, `exit_code`, `signal`, `log_path`, and `report_path` —
+and no `model`. Absent fields read as `null`/absent per the rule above rather
+than as a violation. The asymmetry is pinned by a test against both real
+launch paths (`test/claude-supervised-dispatch.test.js`), so this table and
+the two record writers cannot drift apart.
 
 Fields like `runner_pid`, `child_pid`, `runner_started_ticks`,
 `child_started_ticks`, and `contract_pending` also ride on supervised records;
