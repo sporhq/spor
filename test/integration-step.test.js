@@ -1241,6 +1241,70 @@ test("nodeConfirmedAbsent: remote mode confirms absence on 404 only — a 5xx or
   assert.strictEqual(await sporCli.nodeConfirmedAbsent(dead, "x"), false, "a transport failure is unknown, not absent");
 });
 
+// issue-spor-heal-proposal-tracking-reads-fetch-failure-as-present: healProposalTracking
+// used to check bare truthiness of resolveNode()'s result, which — like the F2
+// case above — collapses a confirmed absence and a fetch failure into the same
+// falsy `null`. Its own comment says it only writes when the node is confirmed
+// ABSENT, so a 5xx/timeout pass must neither heal (it hasn't confirmed
+// anything) nor be mistaken for "already present" — it must retry next pass,
+// and only a genuine 404 may license the write.
+test("healProposalTracking: a 5xx on the tracking-node GET defers the heal instead of writing over an unconfirmed absence, and a later 404 heals it (propose mode)", async (t) => {
+  const http = require("node:http");
+  const sporCli = require("../bin/spor.js");
+  const { loadConfig } = require("../lib/config.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-heal-tracking-remote-"));
+
+  let mode = 500;
+  let postCount = 0;
+  const server = http.createServer((req, res) => {
+    if (req.method === "GET" && req.url.startsWith("/v1/nodes/")) {
+      if (mode === 500) { res.writeHead(500, { "content-type": "text/plain" }); res.end("boom"); return; }
+      if (mode === 404) { res.writeHead(404, { "content-type": "application/json" }); res.end('{"error":"not found"}'); return; }
+      res.writeHead(200, { "content-type": "application/json" }); res.end('{"raw":"---\\nid: x\\ntype: task\\n---\\n"}');
+      return;
+    }
+    if (req.method === "POST" && req.url === "/v1/nodes") {
+      postCount++;
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ results: [{ ok: true, status: "created" }] }));
+      });
+      return;
+    }
+    res.writeHead(404); res.end();
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => server.close());
+  const port = server.address().port;
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: `http://127.0.0.1:${port}`, SPOR_TOKEN: "t" } });
+  assert.strictEqual(cfg.mode(), "remote");
+
+  const record = {
+    node_id: "task-proposed-remote",
+    run_id: "11111111-2222-3333-4444-000000000099",
+    gate_proposal_number: 21,
+    gate_proposal_url: "https://github.com/demo/repo/pull/21",
+    gate_proposal_target_ref: "main",
+    gate_proposal_project: "demo",
+  };
+
+  // Pass 1: the GET 5xxs. Not evidence of absence — must not write, and must
+  // report failure (not success) so checkProposals retries it next pass.
+  const first = await sporCli.healProposalTracking(cfg, record);
+  assert.strictEqual(first.healed, false, "a 5xx must not be read as a completed heal");
+  assert.strictEqual(first.ok, false, "a 5xx must not be read as 'already present, nothing to do'");
+  assert.strictEqual(postCount, 0, "an unconfirmed absence must never trigger a write");
+
+  // Pass 2: the GET now confirms a genuine 404 — the heal may proceed.
+  mode = 404;
+  const second = await sporCli.healProposalTracking(cfg, record);
+  assert.strictEqual(second.healed, true, "a confirmed absence heals the tracking item");
+  assert.strictEqual(second.ok, true);
+  assert.strictEqual(postCount, 1, "the heal happens on the second (confirmed-absent) pass, not the first");
+});
+
 // F3 of the same review: the pending-demotion retry must NOT run against a
 // tracker that is already closed. Once the PR merged, restore() promoted the
 // item and closed the tracker (`done`) — if the flag still stood from an

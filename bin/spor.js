@@ -14069,7 +14069,28 @@ async function restoreProposal(cfg, { blockerId, nodeId }) {
 async function healProposalTracking(cfg, r) {
   const id = r.gate_proposal_blocker || proposalTrackingId(r.node_id, r.run_id);
   const existing = await resolveNode(cfg, id);
-  if (existing) return { id, healed: false, ok: true };
+  if (existing) {
+    // The id answered, whether or not its body could be parsed — either way
+    // that is not evidence of absence. A malformed-but-live body
+    // (nodeUnreadable) can't be diffed against a freshly-built node, so it
+    // gets the same "retry next pass" treatment as a fetch failure below,
+    // never a skip that assumes it already matches what park() would have
+    // written.
+    if (nodeUnreadable(existing)) {
+      return { id, healed: false, ok: false, reason: `${id} answered but its body could not be read — will retry next pass` };
+    }
+    return { id, healed: false, ok: true };
+  }
+  // existing is null: resolveNode collapses a confirmed absence (404/ENOENT)
+  // and a fetch failure (5xx, timeout, transport error, EACCES) into the same
+  // value (see resolveNode's own comment) — exactly the conflation this
+  // function used to read as "go ahead and heal"
+  // (issue-spor-heal-proposal-tracking-reads-fetch-failure-as-present). Only
+  // nodeConfirmedAbsent's explicit 404/ENOENT check licenses the write;
+  // anything else is unknown, and unknown must never be treated as absent.
+  if (!(await nodeConfirmedAbsent(cfg, id))) {
+    return { id, healed: false, ok: false, reason: `${id} could not be confirmed absent — will retry next pass` };
+  }
   const proposal = { number: r.gate_proposal_number, url: r.gate_proposal_url };
   const markdown = buildProposalTrackingNode({
     id,
