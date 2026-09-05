@@ -15505,10 +15505,12 @@ async function cmdRepos(cfg, args) {
     return 0;
   }
   if (sub === "add" || sub === "set") {
-    const slug = args[1];
-    const p = args[2];
+    const force = args.includes("--force");
+    const rest = args.slice(1).filter((a) => a !== "--force");
+    const slug = rest[0];
+    const p = rest[1];
     if (!slug || !p) {
-      err("usage: spor repos add <slug> <path>");
+      err("usage: spor repos add <slug> <path> [--force]");
       return 1;
     }
     if (!NODE_ID_RE.test(slug)) {
@@ -15516,6 +15518,21 @@ async function cmdRepos(cfg, args) {
       return 1;
     }
     const abs = path.resolve(p);
+    // Same guard cmdDispatch runs on a resolved target dir
+    // (issue-spor-dispatch-dir-inside-worktree-nesting): a slug registered
+    // straight at a linked worktree's path leaves dispatch.repos poisoned
+    // until the next dispatch hits the guard and self-heals it — refuse it
+    // at registration time instead, naming the main checkout, with --force
+    // to register the worktree path anyway (e.g. deliberately pinning a
+    // subtree of it).
+    const worktreeMainRoot = u.linkedWorktreeMainRoot(abs);
+    if (worktreeMainRoot && !force) {
+      err(`${abs} is inside a linked git worktree of ${worktreeMainRoot}.`);
+      err(`  dispatch cuts its own worktree under the mapped dir, so mapping a slug to a worktree is refused.`);
+      err(`  map the main checkout instead: spor repos add ${slug} ${worktreeMainRoot}`);
+      err(`  re-run with --force to map the linked worktree path anyway.`);
+      return 1;
+    }
     u.registerRepo(home, slug, abs);
     out(`mapped ${slug} -> ${abs}`);
     return 0;
@@ -17541,14 +17558,15 @@ const COMMANDS = {
   },
   repos: {
     group: "Dispatch (background agents)", parse: "raw",
-    args: "[list | add <slug> <path> | rm <slug> | tags | tag <slug> [tag...] | untag <slug> [tag...]]",
+    args: "[list | add <slug> <path> [--force] | rm <slug> | tags | tag <slug> [tag...] | untag <slug> [tag...]]",
     summary: "the local dispatch slug->dir map, plus repo-identity tags in the graph",
     help:
       "Two repo registers in one place.\n\n" +
       "The machine-local slug->repo-dir map dispatch uses to find a repo (self-\n" +
       "registers as you open sessions, lives in your user config.json):\n" +
       "  spor repos                 list the map\n" +
-      "  spor repos add <slug> <p>  map a slug to a path\n" +
+      "  spor repos add <slug> <p>  map a slug to a path (refuses a path inside a\n" +
+      "                             linked git worktree; --force overrides)\n" +
       "  spor repos rm <slug>       forget a mapping\n\n" +
       "Repo-identity TAGS on the repo-<slug> graph node — the match key for a norm's\n" +
       "applies_to_tags ride-along (schema-repo). An UNTAGGED repo excludes every tag-\n" +

@@ -845,7 +845,11 @@ test("dispatch <node>: a dispatch.repos mapping poisoned to a linked worktree se
   const { home } = fixture(); // dec-x / task-rotate stamped repo: demo
   const { repo } = gitTargetRepo("demo");
   const wt = addLinkedWorktree(repo);
-  run(["repos", "add", "demo", wt], { SPOR_HOME: home }); // simulates a poisoned map entry
+  // `repos add` itself now refuses this (task-spor-repos-add-refuse-linked-
+  // worktree-path), so poison the map directly — this is what a stale/hand-
+  // edited config, or the pre-fix session-start re-probe corruption
+  // (issue-spor-dispatch-repos-corruption-worktree-session-start), looked like.
+  setDispatch(home, { repos: { demo: wt } });
   const r = run(["dispatch", "dec-x", "--no-brief", "--print"], { SPOR_HOME: home });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.match(r.stderr, new RegExp(`dispatch\\.repos\\['demo'\\] pointed inside a linked worktree \\(${wt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\); correcting to the main checkout ${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
@@ -881,6 +885,68 @@ test("dispatch --dir: a git SUBMODULE is NOT mistaken for a linked worktree", ()
   });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.strictEqual(u.linkedWorktreeMainRoot(path.join(outer, "sub")), null);
+});
+
+// --- `spor repos add`/`set` must run the same guard -----------------------
+// task-spor-repos-add-refuse-linked-worktree-path: an operator hand-registering
+// a slug straight at a worktree path bypassed the dispatch-time guard above and
+// left dispatch.repos poisoned until the next dispatch hit it and self-healed.
+// Registration now refuses up front, naming the main checkout, with --force to
+// override.
+
+test("repos add: a path inside a linked worktree is refused, naming the main checkout", () => {
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  const wt = addLinkedWorktree(repo);
+  const r = run(["repos", "add", "demo", wt], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1, r.stdout);
+  assert.match(r.stderr, new RegExp(`${wt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} is inside a linked git worktree of`));
+  assert.match(r.stderr, new RegExp(`map the main checkout instead: spor repos add demo ${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.deepStrictEqual(readRepos(home), {}, "refused registration must not land in config.json");
+});
+
+test("repos add: --force registers the linked worktree path anyway", () => {
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  const wt = addLinkedWorktree(repo);
+  const r = run(["repos", "add", "demo", wt, "--force"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, new RegExp(`mapped demo -> ${wt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.strictEqual(readRepos(home).demo, wt);
+});
+
+test("repos set: the alias runs the same guard as add", () => {
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  const wt = addLinkedWorktree(repo);
+  const r = run(["repos", "set", "demo", wt], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 1, r.stdout);
+  assert.match(r.stderr, /is inside a linked git worktree of/);
+});
+
+test("repos add: a git SUBMODULE path is NOT refused", () => {
+  const { home } = fixture();
+  const { repo: outer } = gitTargetRepo("outer");
+  const { repo: inner } = gitTargetRepo("inner");
+  const r = spawnSync("git", ["-c", "protocol.file.allow=always", "-C", outer, "submodule", "add", "-q", inner, "sub"], {
+    encoding: "utf8",
+    env: { ...process.env, GIT_AUTHOR_NAME: "T", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "T", GIT_COMMITTER_EMAIL: "t@example.com" },
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const sub = path.join(outer, "sub");
+  const addR = run(["repos", "add", "submod", sub], { SPOR_HOME: home });
+  assert.strictEqual(addR.status, 0, addR.stderr);
+  assert.strictEqual(readRepos(home).submod, sub);
+});
+
+test("repos add: an ordinary subdirectory of a main checkout is NOT refused", () => {
+  const { home } = fixture();
+  const { repo } = gitTargetRepo();
+  const sub = path.join(repo, "services", "api");
+  fs.mkdirSync(sub, { recursive: true });
+  const r = run(["repos", "add", "demo", sub], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(readRepos(home).demo, sub);
 });
 
 test("dispatch --worktree --print: previews the worktree path + branch and creates nothing", () => {
