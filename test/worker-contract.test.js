@@ -42,6 +42,10 @@ test("a BARE worker's contract is the plain commit-then-resolve discipline, with
   // discipline, not a factory fact (task-spor-review-gate-durable-debt-flag-checklist).
   assert.match(text, /introduces or extends a durable retry\/debt flag[\s\S]*say how each is handled in the commit message/);
   assert.match(text, /\n   \(a\) the flag write itself fails[\s\S]*\n   \(b\) clear-before-owe[\s\S]*\n   \(c\) the check-then-write race[\s\S]*\n   \(d\) a stale flag against already-settled state/, "the four rows, indented under step 4");
+  // A sibling check, rendered the same way (task-spor-review-gate-outcome-
+  // field-forwarding-instruction).
+  assert.match(text, /adds a field to an outcome\/result object recorded at more than one write site, forward it at EVERY\n   site that records that object/);
+  assert.match(text, /\n   If this change adds a field to an outcome\/result object[\s\S]*\(F7: a `flake` flag reached the/, "indented under step 4, alongside the durable-debt table");
   // Nothing a bare worker has no way to honor.
   assert.doesNotMatch(text, /integration stage/);
   assert.doesNotMatch(text, /protected test paths/);

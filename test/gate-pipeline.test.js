@@ -3609,6 +3609,10 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.match(p0, /\(a\) the flag write itself fails[\s\S]*\(b\) clear-before-owe ordering[\s\S]*\(c\) the check-then-write race[\s\S]*\(d\) a stale flag against already-settled state/);
   assert.ok(p0.indexOf("Hunt for off-by-ones.") < p0.indexOf("## Durable retry/debt flags"), "the checklist follows the gate's instructions");
   assert.doesNotMatch(p0, /walk the table again against the writes the fix added/, "the fix-cycle reading of the table is only on a fix cycle");
+  // task-spor-review-gate-outcome-field-forwarding-instruction: a sibling
+  // check, rendered right after the durable-debt block.
+  assert.match(p0, /## Outcome-field forwarding\n\nIf this change adds a field to an outcome\/result object[\s\S]*F7: a `flake` flag reached the/);
+  assert.ok(p0.indexOf("## Durable retry/debt flags") < p0.indexOf("## Outcome-field forwarding"), "the outcome-field check follows the durable-debt block");
 
   // A fix cycle lands a commit; review 2 is handed the prior finding and that commit.
   fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n;\n");
@@ -3720,6 +3724,8 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.match(fixLaunch.prompt, /naming the finding ids you addressed in the commit message/);
   // …and hands the fixer the same durable-debt table the reviewer walks.
   assert.match(fixLaunch.prompt, /If the fix touches a durable retry\/debt flag[\s\S]*say how each is handled in the commit message[\s\S]*\(a\) the flag write itself fails[\s\S]*\(d\) a stale flag against already-settled state/);
+  // …and the same outcome-field-forwarding check.
+  assert.match(fixLaunch.prompt, /If the fix adds a field to an outcome\/result object recorded at more than one write site, forward it at\nEVERY site that records that object[\s\S]*more than one write site — a pass[\s\S]*F7: a `flake` flag reached the/);
   assert.doesNotMatch(fixLaunch.prompt, /Carried findings — close the MECHANISM/, "nothing here has survived a fix cycle yet");
 
   // A fix cycle for a finding that already survived one: the fixer is told

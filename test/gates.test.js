@@ -1066,6 +1066,20 @@ test("the durable-debt checklist has the four fixed rows, lettered, and indents 
   assert.ok(Object.isFrozen(gates.DURABLE_FLAG_FAILURE_MODES), "the table is a contract, not a mutable list");
 });
 
+// task-spor-review-gate-outcome-field-forwarding-instruction: a sibling to the
+// durable-debt checklist above, prompted the same way — one constant rendered
+// into the review, fix and worker prompts.
+test("the outcome-field-forwarding check is one constant, and indents as a block", () => {
+  const text = gates.renderOutcomeFieldForwardingCheck();
+  assert.strictEqual(text, gates.OUTCOME_FIELD_FORWARDING_CHECK);
+  assert.match(text, /more than one write site/);
+  assert.match(text, /forwards the new field/);
+  assert.match(text, /F7: a `flake` flag reached the/);
+  const indented = gates.renderOutcomeFieldForwardingCheck({ indent: "   " }).split("\n");
+  assert.strictEqual(indented.length, text.split("\n").length);
+  for (const l of indented) assert.match(l, /^   /);
+});
+
 // --- a carried finding names the mechanism, not the next row ---------------
 // (task-spor-review-gate-carried-finding-names-the-mechanism-not-the-next-row)
 // A reviewer confirming a prior finding open may enumerate the mechanism's

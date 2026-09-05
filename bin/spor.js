@@ -11711,6 +11711,10 @@ function makeGateDeps(
             "",
           ]
         : []),
+      "## Outcome-field forwarding",
+      "",
+      gatesKernel.renderOutcomeFieldForwardingCheck(),
+      "",
       ...(raised.length
         ? [
             "## Earlier findings rated blocking but not demonstrated",
@@ -11850,6 +11854,9 @@ function makeGateDeps(
       "design it against ALL of these at once and say how each is handled in the commit message — the next review",
       "walks the whole table in one verdict, and a fix that closes one row by opening the next is a fix cycle spent:",
       gatesKernel.renderDurableFlagChecklist(),
+      "If the fix adds a field to an outcome/result object recorded at more than one write site, forward it at",
+      "EVERY site that records that object, not only the one this fix's own tests exercise:",
+      gatesKernel.renderOutcomeFieldForwardingCheck(),
       "The gate will re-run against the trusted ref's copy of the acceptance suite, so do not edit protected test",
       "paths — a change that touches them fails the gate closed.",
       // The one-turn notice: a fix that backgrounds its suite and ends its turn
