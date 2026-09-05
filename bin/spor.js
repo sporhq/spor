@@ -7821,13 +7821,13 @@ function localDispatchLockFile(home, name) {
   const key = crypto.createHash("sha256").update(String(name || "")).digest("hex").slice(0, 24);
   return path.join(home, "journal", "dispatch-lock", `${key}.lock`);
 }
+// Returns the payload actually written, so the caller can later prove it is
+// still the recorded holder before touching the file again (releaseLocalDispatchLock).
 function writeLocalDispatchLock(file) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(
-    file,
-    JSON.stringify({ pid: process.pid, started_ticks: dispatchRuns.processStartTicks(process.pid), at: new Date().toISOString() }),
-    { flag: "wx" }
-  );
+  const payload = { pid: process.pid, started_ticks: dispatchRuns.processStartTicks(process.pid), at: new Date().toISOString() };
+  fs.writeFileSync(file, JSON.stringify(payload), { flag: "wx" });
+  return payload;
 }
 // A short, synchronous, best-effort sleep (Atomics.wait needs a SharedArrayBuffer
 // and blocks the calling thread, which is exactly what a bounded retry here
@@ -7870,8 +7870,8 @@ function readLockRaw(file, { attempts = 25, delayMs = 2 } = {}) {
 function acquireLocalDispatchLock(home, name) {
   const file = localDispatchLockFile(home, name);
   try {
-    writeLocalDispatchLock(file);
-    return { ok: true, file };
+    const payload = writeLocalDispatchLock(file);
+    return { ok: true, file, payload };
   } catch (e) {
     if (e.code !== "EEXIST") return { ok: true, file: null }; // an unwritable journal is not worth blocking dispatch over — fail open, nothing to release
   }
@@ -7891,20 +7891,53 @@ function acquireLocalDispatchLock(home, name) {
     stale = true; // an unreadable/unparseable lock cannot be honored as a live one
   }
   if (!stale) return { ok: false };
+  // Evict the stale holder ATOMICALLY before recreating it: a plain
+  // rm-then-write here would be a second check-then-act window on top of the
+  // one this whole function exists to close — two racers who both judged the
+  // same lock stale could each rm it and each then win their own fresh `wx`
+  // create, both believing they now hold it (the exact bug this function was
+  // built to prevent, reopened one level up). `rename` is the atomic claim
+  // instead: it requires the source to still exist, so of any number of
+  // racers renaming the SAME stale path away, exactly one succeeds — that one
+  // alone is entitled to recreate the lock. A racer whose rename fails (ENOENT
+  // — someone else already evicted it, or it is simply gone) does not get to
+  // assume victory; it refuses, matching a normal contended acquire.
+  const evicted = `${file}.evicted-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   try {
-    fs.rmSync(file, { force: true });
-    writeLocalDispatchLock(file);
-    return { ok: true, file };
+    fs.renameSync(file, evicted);
   } catch {
-    return { ok: false }; // a racer beat us to the retry — refuse rather than risk two holders
+    return { ok: false }; // did not win the eviction — someone else's claim (stale or fresh) stands
+  }
+  try {
+    fs.rmSync(evicted, { force: true });
+  } catch {
+    /* the evicted copy is orphaned but harmless — it is never looked up again */
+  }
+  try {
+    const payload = writeLocalDispatchLock(file);
+    return { ok: true, file, payload };
+  } catch {
+    return { ok: false }; // an unrelated fresh acquire won the now-clear path first — refuse rather than risk two holders
   }
 }
+// Release only if we are still the RECORDED holder. A lock this call once won
+// can be evicted out from under it later (the staleness ceiling reclaiming a
+// holder that is in fact still alive and working, just slow — an accepted
+// tradeoff of the ceiling itself, not something release should compound): a
+// bare `rm` here would then delete the NEW holder's live lock, not this
+// process's own long-gone one. So read back what is there now and compare it
+// to the exact payload this call originally wrote; only a match is ours to
+// remove.
 function releaseLocalDispatchLock(token) {
-  if (!token || !token.file) return;
+  if (!token || !token.file || !token.payload) return;
   try {
-    fs.rmSync(token.file, { force: true });
+    const raw = readLockRaw(token.file);
+    const held = raw ? JSON.parse(raw) : null;
+    if (held && held.pid === token.payload.pid && held.started_ticks === token.payload.started_ticks && held.at === token.payload.at) {
+      fs.rmSync(token.file, { force: true });
+    }
   } catch {
-    /* it lapses on its own next stale check */
+    /* unreadable/gone: nothing of ours left to remove, or it lapses on its own next stale check */
   }
 }
 

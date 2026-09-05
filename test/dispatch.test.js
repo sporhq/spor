@@ -2324,6 +2324,21 @@ test("acquireLocalDispatchLock: releasing frees the name for a later acquire", (
   cli.releaseLocalDispatchLock(second);
 });
 
+test("releaseLocalDispatchLock: does not delete a lock that was reclaimed out from under it", () => {
+  // A lock this call once won can be evicted later by the staleness ceiling
+  // (a holder judged dead/aged-out, whether or not it actually still is) —
+  // release must not blindly remove whatever now sits at the path, or it
+  // deletes the NEW holder's live lock instead of its own long-gone one.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-lock-"));
+  const first = cli.acquireLocalDispatchLock(home, "dec-x");
+  assert.strictEqual(first.ok, true);
+  // Simulate a reclaim: someone else's fresh lock now occupies the same path.
+  fs.rmSync(first.file, { force: true });
+  fs.writeFileSync(first.file, JSON.stringify({ pid: 999999, started_ticks: null, at: new Date().toISOString() }));
+  cli.releaseLocalDispatchLock(first);
+  assert.ok(fs.existsSync(first.file), "release must leave the new holder's lock alone — it is not ours to remove");
+});
+
 test("acquireLocalDispatchLock: a stale lock (holder pid gone) self-heals and is reclaimed", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-lock-"));
   const file = cli.localDispatchLockFile(home, "dec-x");
@@ -2408,6 +2423,38 @@ test("acquireLocalDispatchLock: exactly one of two REAL concurrent processes win
   const losers = [a, b].filter((r) => !r.ok);
   assert.strictEqual(winners.length, 1, "exactly one real process acquires the lock");
   assert.strictEqual(losers.length, 1, "exactly one real process is refused");
+});
+
+test("acquireLocalDispatchLock: exactly one of two REAL concurrent processes wins RECLAIMING an already-stale lock", async () => {
+  // The plain fresh-create race above proves the `wx` primitive is atomic; it
+  // never exercises the OTHER path through this function — reclaiming a lock
+  // that already exists and is judged stale, which used to be a bare
+  // rm-then-write (a second check-then-act window: two racers could each see
+  // the SAME stale lock, each rm it, and each then win their own fresh
+  // create, both believing they now hold it — reopening the exact hazard this
+  // whole primitive exists to close, one level up). Seed a genuinely stale
+  // lock (a dead pid) BEFORE either racer starts, so both are guaranteed to
+  // take the reclaim branch, then confirm only one of them ends up owning it.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-lock-reclaim-race-"));
+  const lockFile = cli.localDispatchLockFile(home, "dec-race");
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: 999999, started_ticks: null, at: new Date(0).toISOString() }));
+  const outA = path.join(home, "a.result.json");
+  const outB = path.join(home, "b.result.json");
+  const scriptA = path.join(home, "a.js");
+  const scriptB = path.join(home, "b.js");
+  fs.writeFileSync(scriptA, raceLockScript(home, "dec-race", outA));
+  fs.writeFileSync(scriptB, raceLockScript(home, "dec-race", outB));
+  await Promise.all([
+    new Promise((resolve) => spawn(process.execPath, [scriptA]).on("close", resolve)),
+    new Promise((resolve) => spawn(process.execPath, [scriptB]).on("close", resolve)),
+  ]);
+  const a = JSON.parse(fs.readFileSync(outA, "utf8"));
+  const b = JSON.parse(fs.readFileSync(outB, "utf8"));
+  const winners = [a, b].filter((r) => r.ok);
+  const losers = [a, b].filter((r) => !r.ok);
+  assert.strictEqual(winners.length, 1, "exactly one real process reclaims the stale lock");
+  assert.strictEqual(losers.length, 1, "exactly one real process is refused, not both");
 });
 
 test("dispatch <node-id> (local): two concurrent dispatches of the SAME node — exactly one launches", async () => {
