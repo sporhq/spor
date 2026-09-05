@@ -13924,15 +13924,25 @@ async function cmdWork(cfg, { values }) {
   // server that omits the field says nothing here and falls back to the
   // loop's own scope-starvation notice.
   const unknownRepoWarning = (r) => `warning: factory '${factoryId}' declares repo '${r}', which names no repo or project in this graph — items stamped with it will never be found.`;
+  // Loaded once here (local mode only — the graph is not "cheaply available"
+  // remotely) and reused below to resolve historical `project:` stamps
+  // through `graph.projectAliases` when checking a factory's declared repo
+  // scope (task-spor-factory-alias-resolution-local-mode): a legacy stamp
+  // (`substrate`) and a current-slug declaration (`repos: ["spor"]`) both
+  // resolve to the same repo node's canonical id there. Stays null in remote
+  // mode or on an unreadable graph, which is exactly the byte-identical
+  // raw-stamp-comparison fallback gates.repoScope/inRepoScope already have.
+  let localFactoryGraph = null;
   if (factoryRepos.length && cfg.mode() === "local") {
     try {
       const graphLib = require(path.join(ROOT, "lib", "graph.js"));
-      const g = graphLib.loadGraph(cfg.nodesDir());
+      localFactoryGraph = graphLib.loadGraph(cfg.nodesDir());
       for (const r of factoryRepos) {
-        if (!graphLib.projectKnown(g, r)) err(unknownRepoWarning(r));
+        if (!graphLib.projectKnown(localFactoryGraph, r)) err(unknownRepoWarning(r));
       }
     } catch {
       /* an unreadable graph is the queue read's problem to report, not this check's */
+      localFactoryGraph = null;
     }
   } else if (factoryRepos.length && cfg.mode() === "remote") {
     for (const r of factoryRepos) {
@@ -14017,12 +14027,12 @@ async function cmdWork(cfg, { values }) {
     // item and everything ranked below it would starve exactly as before. A
     // page whose only eligible items are cooling is a pass with nothing to
     // dispatch, which is precisely when a deeper read is free.
-    const scope = gatesKernel.repoScope(factoryRepos);
+    const scope = gatesKernel.repoScope(factoryRepos, localFactoryGraph);
     const eligible = (it) =>
       !(agents.get(it.id) || []).length &&
       !(gating && gating.has(it.id)) &&
       !(cooling && cooling(it.id)) &&
-      workLoop.pageEligible(it, { accept, repos: factoryRepos, scope });
+      workLoop.pageEligible(it, { accept, repos: factoryRepos, scope, graph: localFactoryGraph });
     // Page deeper than the default when the cap is high: the page is filtered
     // again below (in-flight) and again by the loop (readiness, cooldowns), so
     // a page the size of the cap could not fill it.
@@ -14120,7 +14130,7 @@ async function cmdWork(cfg, { values }) {
       out(`factory: none — the loop runs bare (declare one with --factory <id> or work.factory)`);
     }
     const policySkips = [];
-    const cands = workLoop.selectWorkCandidates(await candidates(), { accept, repos: factoryRepos, onSkip: (it, reason, kind) => policySkips.push({ it, reason, kind }) });
+    const cands = workLoop.selectWorkCandidates(await candidates(), { accept, repos: factoryRepos, graph: localFactoryGraph, onSkip: (it, reason, kind) => policySkips.push({ it, reason, kind }) });
     if (!cands.length) out("queue:   nothing dispatchable right now");
     else {
       out(`queue:   ${cands.length} candidate(s); this pass would take the first ${Math.min(concurrency, cands.length)}`);
@@ -14195,7 +14205,7 @@ async function cmdWork(cfg, { values }) {
   if (restartOnLand && !loadedCode) out(`work: --restart-on-land has nothing to watch — ${ROOT} is not a source checkout; the worker runs until stopped`);
   const final = await workLoop.runWorkLoop({
     opts: {
-      workerId, project: slug, accept, repos: factoryRepos, concurrency, intervalMs, maxIntervalMs, retryAfterMs, max, once: !!values.once, factory: factoryId, restartOnLand,
+      workerId, project: slug, accept, repos: factoryRepos, graph: localFactoryGraph, concurrency, intervalMs, maxIntervalMs, retryAfterMs, max, once: !!values.once, factory: factoryId, restartOnLand,
       // The pid-reuse guard for this record: a SIGKILLed worker leaves no
       // stopped_at, and a bare pid probe would read its recycled pid as this
       // worker still running (the same identity check the run store makes).

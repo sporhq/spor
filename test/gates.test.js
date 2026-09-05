@@ -159,6 +159,32 @@ test("repoScope tolerates the node-id spelling one way only, and an unstamped it
   for (const p of ["anything", null, ""]) assert.strictEqual(gates.inRepoScope(p, gates.repoScope([])), true);
 });
 
+test("a graph's projectAliases resolves a historical stamp against a current-slug scope, and vice versa (task-spor-factory-alias-resolution-local-mode)", () => {
+  // Only `graph.projectAliases` is read — a minimal stand-in for a loaded
+  // local-mode graph is enough, mirroring the real map's shape (slug/id ->
+  // canonical repo-node id, see projectAliasMap in lib/kernel/graph.js).
+  const graph = { projectAliases: { spor: "repo-spor", substrate: "repo-spor", "cc-context-substrate": "repo-spor" } };
+
+  // Current-slug declaration, historical stamp on the item.
+  const scope = gates.repoScope(["spor"], graph);
+  assert.strictEqual(gates.inRepoScope("substrate", scope, graph), true, "a legacy stamp resolves to the same repo as the declared current slug");
+  assert.strictEqual(gates.inRepoScope("substrate", scope), false, "without the graph the raw comparison still fails closed");
+
+  // Historical declaration, current-slug stamp on the item — the alias
+  // expansion works in whichever direction the declaration and stamp diverge.
+  const legacyScope = gates.repoScope(["cc-context-substrate"], graph);
+  assert.strictEqual(gates.inRepoScope("spor", legacyScope, graph), true);
+
+  // A genuinely different repo's alias must not leak in.
+  const otherGraph = { projectAliases: { spor: "repo-spor", "spor-server": "repo-spor-server" } };
+  assert.strictEqual(gates.inRepoScope("spor-server", gates.repoScope(["spor"], otherGraph), otherGraph), false);
+
+  // No graph, no alias map, or an unrecognized stamp: falls through to the raw
+  // comparison exactly as before — never a fail-open.
+  assert.strictEqual(gates.inRepoScope("substrate", gates.repoScope(["spor"], null), null), false);
+  assert.strictEqual(gates.inRepoScope("unknown-repo", scope, graph), false);
+});
+
 test("a node with no fenced json payload is not a factory", () => {
   const { factory, errors } = gates.parseFactory("just prose", { id: "f" });
   assert.strictEqual(factory, null);

@@ -452,6 +452,24 @@ test("selectWorkCandidates: a factory's declared repo scope bounds what it gates
     assert.deepStrictEqual(all.map((i) => i.id), ["a", "b", "c"], `repos ${JSON.stringify(repos)} is unscoped`);
   }
 
+  // task-spor-factory-alias-resolution-local-mode: with a local-mode graph
+  // passed through, a historically-stamped item (e.g. `substrate`) is
+  // recognized against a current-slug declaration (`repos: ["spor"]`) instead
+  // of being skipped as out of scope.
+  const aliasGraph = { projectAliases: { spor: "repo-spor", substrate: "repo-spor" } };
+  const legacyItems = [{ id: "d", readiness: "agent", project: "substrate" }];
+  assert.deepStrictEqual(
+    workLoop.selectWorkCandidates(legacyItems, { repos: ["spor"], graph: aliasGraph, onSkip: () => assert.fail("resolves via the graph's alias map") }).map((i) => i.id),
+    ["d"]
+  );
+  const aliasSkips = [];
+  assert.deepStrictEqual(
+    workLoop.selectWorkCandidates(legacyItems, { repos: ["spor"], onSkip: (it, reason) => aliasSkips.push(reason) }).map((i) => i.id),
+    [],
+    "without a graph the legacy stamp still falls outside scope, exactly as before"
+  );
+  assert.match(aliasSkips[0], /outside the factory's repo scope/);
+
   // The scope check runs AFTER the cooldown, so an out-of-scope item that is
   // already cooling is not re-reported every poll.
   const cooling = [];
