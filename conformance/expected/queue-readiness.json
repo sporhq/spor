@@ -44,6 +44,9 @@
       "readiness_reasons": [
         "assigned to agent agent-worker"
       ],
+      "assigned_agents": [
+        "agent-worker"
+      ],
       "why": "agent-ready: assigned to agent agent-worker; 10d old"
     },
     {
