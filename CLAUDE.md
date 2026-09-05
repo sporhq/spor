@@ -349,9 +349,25 @@ Spend is capped by `SPOR_DIGEST_INTENT_MAX` (`digest.intentMaxCalls`, default
 result arriving beside a synchronous digest is consumed, not double-injected).
 The default path is byte-identical (spool, drain, and their syscalls are all
 gated on the flag), and the same one-turn-delay tradeoff as the async capture
-nudge applies: a digest for a session's final prompt is dropped. Enabling it by
-default is deliberately deferred until the classifier is scored against the
-eval's `warranted` labels. See test/digest-async.test.js.
+nudge applies: a digest for a session's final prompt is dropped. The classifier
+HAS now been scored against the eval's `warranted` labels
+(dec-spor-digest-intent-classifier-scored-prompt-recalibrated): the first
+shipped prompt FAILED, suppressing 51% of warranted digests, and fail-open does
+not cover that — it protects against backend failure, not against haiku
+confidently answering UNWARRANTED on a clearly-warranted prompt. The
+recalibrated prompt in `prompts/client/digest-intent.md` (asymmetric-cost,
+default-WARRANTED) clears the gate: 0/29 good digests lost, 4/59 warranted
+suppressed, 78% of noise cut, fire-table F1 0.873 vs the current
+always-inject engine's 0.819. That scoring is no longer a scratchpad — re-score
+any prompt edit with `scripts/intent-eval/` (`--replay` re-derives a recorded
+run with no backend calls; the corpus stays in the private server repo).
+Default-on is STILL deferred, now on two things a prompt change can't settle:
+a held-out re-validation on a fresh transcript window (the prompt was iterated
+against this judged set), and a backend-cost call — the shipped default
+`claude -p --model haiku` bills ~$0.08 and ~14s per classification, ~98% of it
+CLI session boot rather than the 4.6KB classification, so a flip wants a
+cheaper `digest.intentCmd` backend first. See test/digest-async.test.js and
+scripts/intent-eval/README.md.
 
 The post-tool engine ALSO carries the coupling nudge
 (task-spor-coupling-nudge-posttool, dec-spor-coupling-norms-declared-first) —
