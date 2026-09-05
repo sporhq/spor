@@ -2394,13 +2394,21 @@ function runAsync(args, env, cwd) {
 // resolved-task guard (issue-spor-type-blind-terminal-status-fallbacks): a
 // non-default node type for the offline seed-registry fallback, and the
 // server-computed `inert` enrichment key.
-function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nodeResolution = null, nodeRequires = null, nodeHeld = null, nodeType = "task", nodeInert = null, nodeOpenFindings = null, releaseStatus = 200 } = {}) {
+function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nodeResolution = null, nodeRequires = null, nodeHeld = null, nodeType = "task", nodeInert = null, nodeOpenFindings = null, releaseStatus = 200, nodeMalformed = false } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
       hits.push({ method: req.method, url: req.url, body });
+      if (req.method === "GET" && /^\/v1\/nodes\/[^/]+$/.test(req.url) && nodeMalformed) {
+        // A 2xx whose body fails to parse — issue-spor-resolve-node-unguarded-
+        // json-reads-null-as-unknown. resolveNode must read this as a FAILED
+        // read, not a node whose enrichment keys all happen to be absent.
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("not valid json{{{");
+        return;
+      }
       if (req.method === "GET" && /^\/v1\/nodes\/[^/]+$/.test(req.url)) {
         const id = decodeURIComponent(req.url.split("/").pop());
         const statusLine = nodeStatus ? `\nstatus: ${nodeStatus}` : "";
@@ -3614,6 +3622,28 @@ test("dispatch <node-id> --force (remote): launches despite the server reporting
     assert.strictEqual(r.status, 0, r.stderr);
     assert.ok(claimHit(hits), "--force still auto-claims the lease");
     assert.ok(await waitForFile(sentinel), "and launches");
+  } finally {
+    srv.close();
+  }
+});
+
+// issue-spor-resolve-node-unguarded-json-reads-null-as-unknown: a 2xx whose
+// body fails to parse used to become a node with raw/resolution/held/inert all
+// silently `null` — readable-but-empty, not a failed read — so the guard would
+// see no resolution/terminal status and wave the dispatch through. It must
+// instead refuse outright, the same "could not verify" direction as a 404 or
+// an unreachable server, never a confident "this is fine, proceed".
+test("dispatch <node-id> (remote): a 2xx with an unparseable node body refuses the dispatch, never silently proceeds", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({ nodeMalformed: true });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 1, r.stderr);
+    assert.match(r.stderr, /could not verify task-rotate/);
+    assert.ok(!claimHit(hits), "no claim POST against a node that never actually loaded");
+    assert.ok(!fs.existsSync(sentinel), "no agent launched against an unverified node");
   } finally {
     srv.close();
   }

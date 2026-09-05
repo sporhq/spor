@@ -7368,8 +7368,27 @@ async function nodeConfirmedAbsent(cfg, id) {
   }
 }
 
-// Resolve a node id to { id, raw, repo, title, summary, type, status, date } or
-// null if it doesn't exist.
+// Is this resolveNode() result the distinguished "read failed" marker
+// (issue-spor-resolve-node-unguarded-json-reads-null-as-unknown)? A caller that
+// treats this the same as a confirmed-absent `null` is reading "could not
+// verify" as "verified absent" — the exact fail-open-in-the-wrong-direction bug
+// this marker exists to make impossible to ignore by accident.
+function nodeUnreadable(node) {
+  return !!(node && node.unreadable === true);
+}
+
+// Resolve a node id to { id, raw, repo, title, summary, type, status, date },
+// null if it doesn't exist (remote: a non-2xx response; local: no such file),
+// or `{ unreadable: true, id }` (see nodeUnreadable) when the graph answered
+// but its body could not be parsed as JSON — a malformed 2xx must never read
+// the same as a confirmed absence: the resolved-task dispatch guard, readiness
+// checks and other verification call sites need to refuse/retry/say-unknown
+// rather than silently treat resolution/held/inert/supersededBy as null-i.e.-
+// "no" (issue-spor-resolve-node-unguarded-json-reads-null-as-unknown, the same
+// fail-open class dec-spor-dispatch-terminal-verify-jsonerror-fail-closed and
+// art-verify-run-resolution-jsonerror-fix already closed elsewhere). Local mode
+// has no such body to fail to parse — a read either succeeds or ENOENTs — so it
+// never returns the marker.
 async function resolveNode(cfg, id) {
   let raw = "";
   // The server's get(node) hook attaches read-time enrichment as additive
@@ -7406,12 +7425,20 @@ async function resolveNode(cfg, id) {
   if (cfg.mode() === "remote") {
     const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 6000 });
     if (!r.ok) return null;
-    raw = (r.json && r.json.raw) || r.text || "";
-    resolution = (r.json && r.json.resolution) || null;
-    held = (r.json && r.json.held) || null;
-    inert = (r.json && typeof r.json.inert === "boolean") ? r.json.inert : null;
-    openFindings = (r.json && Array.isArray(r.json.open_findings)) ? r.json.open_findings : null;
-    supersededBy = (r.json && (r.json.superseded_by || r.json.supersededBy)) || null;
+    // A 2xx with an unparseable (or non-object) body is a FAILED read, not a
+    // node whose enrichment keys all happen to be absent — falling through to
+    // `r.json && ...` used to read every one of resolution/held/inert/
+    // supersededBy as null (i.e. "no"), which is indistinguishable from a node
+    // that genuinely carries none of them. Surface it as the distinguished
+    // unreadable marker instead so a caller that skips checking for it fails
+    // loudly in review rather than quietly trusting a read that never happened.
+    if (r.jsonError || !r.json || typeof r.json !== "object") return { unreadable: true, id };
+    raw = r.json.raw || r.text || "";
+    resolution = r.json.resolution || null;
+    held = r.json.held || null;
+    inert = typeof r.json.inert === "boolean" ? r.json.inert : null;
+    openFindings = Array.isArray(r.json.open_findings) ? r.json.open_findings : null;
+    supersededBy = r.json.superseded_by || r.json.supersededBy || null;
   } else {
     try {
       raw = fs.readFileSync(path.join(cfg.nodesDir(), `${id}.md`), "utf8");
@@ -9490,7 +9517,14 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     instruction = taskText ? `/spor:backfill\n\n${taskText}` : "/spor:backfill";
     name = name || "spor-backfill";
   } else if (!nodeId && pos.length === 1 && /^[a-z0-9]+(-[a-z0-9]+)+$/.test(pos[0])) {
-    // Auto-detect: a single hyphenated token that resolves to a node => node mode.
+    // Auto-detect: a single hyphenated token that resolves to a node => node
+    // mode. An unreadable read (a 2xx the server actually answered, just with
+    // a body that failed to parse) is NOT the same as a confirmed 404 — it
+    // must still route into node mode so the guard below refuses the dispatch
+    // outright, rather than silently falling through to free-text mode and
+    // skipping every resolved/readiness guard entirely on what is quite
+    // possibly a real, already-finished work item
+    // (issue-spor-resolve-node-unguarded-json-reads-null-as-unknown).
     const maybe = await resolveNode(cfg, pos[0]);
     if (maybe) {
       nodeId = maybe.id;
@@ -9502,6 +9536,16 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     const node = await resolveNode(cfg, nodeId);
     if (!node) {
       err(`no such node: ${nodeId}`);
+      return 1;
+    }
+    // A malformed 2xx body is a FAILED verification, not a readable-but-empty
+    // node — dispatching against it would run dispatchResolutionReason /
+    // dispatchReadinessCheck on frontmatter that never actually loaded, which
+    // could silently wave through a dispatch this same guard exists to refuse
+    // (issue-spor-resolve-node-unguarded-json-reads-null-as-unknown). Refuse
+    // loudly instead of guessing.
+    if (nodeUnreadable(node)) {
+      err(`could not verify ${nodeId} — the graph's response body could not be read; try again`);
       return 1;
     }
     dispatchNodeRaw = node.raw || null;
@@ -11718,7 +11762,11 @@ function buildGateWorkNode({ id, title, summary, body, project, date, edges = []
 // status is a refusal; anything else is still pending.
 async function gateApprovalState(cfg, id) {
   const node = await resolveNode(cfg, id);
-  if (!node) return { state: "pending" };
+  // A failed read is neither an approval nor a rejection — same as a
+  // confirmed-absent node, this reads "pending" so the poll above keeps
+  // waiting and tries again next interval rather than concluding anything off
+  // a body that never actually loaded.
+  if (!node || nodeUnreadable(node)) return { state: "pending" };
   const status = (node.status || "").toLowerCase();
   if (node.resolution && node.resolution.by) return { state: "approved", by: node.resolution.by };
   if (cfg.mode() !== "remote") {
@@ -11816,7 +11864,11 @@ async function gateDemoteItem(cfg, id, { blockerId = null } = {}) {
   if (!blockerId) return { ok: false, reason: `nothing blocks ${id} — a demotion is refused until the item that would block it exists (WORKERS.md §10.7)` };
   const blocked = `${blockerId} now blocks ${id}`;
   const node = await resolveNode(cfg, id);
-  if (!node) return { ok: false, reason: `${id} could not be re-read, so its status could not be rolled back` };
+  // An unreadable body must read the same as an unreadable graph, not as "read
+  // fine, carries no status" — the latter reports ok:true and skips the
+  // rollback the whole gate demotion machinery exists to guarantee
+  // (issue-spor-resolve-node-unguarded-json-reads-null-as-unknown).
+  if (!node || nodeUnreadable(node)) return { ok: false, reason: `${id} could not be re-read, so its status could not be rolled back` };
   const status = String(node.status || "").trim().toLowerCase();
   // Every path below returns a NOTE saying what happened, including the
   // do-nothing ones. A demotion that silently did nothing reads exactly like
@@ -11901,7 +11953,9 @@ async function gateWriteStatus(cfg, id, value, graph = null) {
 // guess a completion the item may no longer deserve.
 async function gatePromoteItem(cfg, id) {
   const node = await resolveNode(cfg, id);
-  if (!node) return { ok: false, reason: `${id} could not be re-read, so its status could not be restored` };
+  // Same distinction as gateDemoteItem: an unreadable body is a failed read,
+  // not a node that happens to read as "not demoted, nothing to restore".
+  if (!node || nodeUnreadable(node)) return { ok: false, reason: `${id} could not be re-read, so its status could not be restored` };
   const status = String(node.status || "").trim().toLowerCase();
   if (status !== GATE_DEMOTED_STATUS) {
     return { ok: true, restored: false, note: `${id} reads '${status || "(none)"}', not '${GATE_DEMOTED_STATUS}' — nothing to restore` };
@@ -12227,7 +12281,7 @@ function makeGateDeps(
     if (itemText !== null) return itemText;
     try {
       const node = await resolveNode(cfg, entry.node_id);
-      itemText = node ? gateWorkItemText(node) : "";
+      itemText = node && !nodeUnreadable(node) ? gateWorkItemText(node) : "";
     } catch {
       itemText = "";
     }
@@ -13009,7 +13063,11 @@ function makeGateDeps(
       } catch (e) {
         return { ok: false, reason: `${id} could not be read: ${(e && e.message) || e}` };
       }
-      if (!node) return { ok: false, reason: `${id} could not be read from the graph` };
+      // An unreadable body must fail this check exactly like a missing node —
+      // returning ok:true with an all-empty node (no outcome, no edges) would
+      // read as "confirmed no evidence of resolution" instead of "could not
+      // check" (issue-spor-resolve-node-unguarded-json-reads-null-as-unknown).
+      if (!node || nodeUnreadable(node)) return { ok: false, reason: `${id} could not be read from the graph` };
       return {
         ok: true,
         node: {
@@ -13921,7 +13979,9 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
 // blip must not stop checkProposals from trying again next pass.
 async function blockerAlreadyClosed(cfg, id) {
   const node = await resolveNode(cfg, id);
-  if (!node) return false;
+  // An unreadable body is not evidence of closure either — see the function
+  // comment above: a graph blip must not stop checkProposals retrying.
+  if (!node || nodeUnreadable(node)) return false;
   const status = String(node.status || "").trim().toLowerCase();
   if (!status) return false;
   if (cfg.mode() !== "remote") {
@@ -14004,7 +14064,10 @@ async function proposalSettledMeanwhile(cfg, r, blockerId) {
   }
   try {
     const landedFact = integrationRunner.integrationFactId(r.node_id, r.run_id, "landed");
-    return !!(await resolveNode(cfg, landedFact));
+    // An unreadable body is truthy but is not evidence the fact landed — see
+    // the comment above: neither confirms the proposal settled.
+    const lf = await resolveNode(cfg, landedFact);
+    return !!(lf && !nodeUnreadable(lf));
   } catch {
     return false;
   }
@@ -14108,7 +14171,10 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
         // person closed with no landing is left alone, as before.
         let landedFactPresent = false;
         try {
-          landedFactPresent = !!(await resolveNode(cfg, integrationRunner.integrationFactId(r.node_id, r.run_id, "landed")));
+          // Same distinction as proposalSettledMeanwhile above: an unreadable
+          // body must not be read as "the landed fact is present".
+          const lf = await resolveNode(cfg, integrationRunner.integrationFactId(r.node_id, r.run_id, "landed"));
+          landedFactPresent = !!(lf && !nodeUnreadable(lf));
         } catch {
           landedFactPresent = false;
         }
