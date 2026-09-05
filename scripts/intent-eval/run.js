@@ -12,8 +12,9 @@
 // re-score against. This is that harness, committed.
 //
 //   node scripts/intent-eval/run.js --labels <evalDir> [--engine-root DIR]
-//        [--cmd "<backend>"] [--concurrency K] [--limit N] [--label NAME]
-//        [--out runs/<name>.jsonl] [--json OUT] [--budget 0.06] [--strict]
+//        [--template FILE] [--cmd "<backend>"] [--concurrency K] [--limit N]
+//        [--only id,id] [--label NAME] [--out runs/<name>.jsonl] [--json OUT]
+//        [--budget 0.06] [--strict]
 //   node scripts/intent-eval/run.js --labels <evalDir> --replay <prior.jsonl>
 //
 // The corpus is NOT in this repo and cannot be: it is 7MB of real prompts and
@@ -46,6 +47,18 @@ const LABEL = arg("label", "shipped");
 const CMD = arg("cmd", ""); // "" = the shipped default backend (claude -p --model haiku)
 const CONC = parseInt(arg("concurrency", "8"), 10);
 const LIMIT = parseInt(arg("limit", "0"), 10);
+// --only <id,id> scores a named handful, which is how you iterate on a prompt
+// without spending the whole population on every edit. Like --limit it can only
+// ever produce a SUB-population, and the gate's coverage criterion refuses to
+// certify one — see M.gateVerdict.
+const ONLY = arg("only", "");
+// --template scores a candidate template file in place of the engine's shipped
+// one. Only the TEXT is substituted: the fill, the backend, the timeout, the
+// llm-calls record and the verdict parse all still come from the engine under
+// test, so fidelity is unchanged (see the FIDELITY note above). Without it a
+// candidate can only be scored from a whole second checkout, which is how the
+// last one rotted unmeasured — candidates/ holds the ones already scored.
+const TEMPLATE = arg("template", "");
 const TIMEOUT = parseInt(arg("timeout", "60000"), 10);
 const BUDGET = parseFloat(arg("budget", String(M.DEFAULT_BUDGET)));
 const REPLAY = arg("replay", null);
@@ -152,14 +165,17 @@ function report(records, score, gate, tables, spend, drops) {
 
   console.log(`\n=== intent-eval: ${LABEL} ===`);
   console.log(`engine       : ${ENGINE_ROOT}`);
-  console.log(`template     : ${path.join(ENGINE_ROOT, "prompts", "client", "digest-intent.md")} (sha ${drops.tplSha})`);
+  console.log(`template     : ${drops.tplFile} (sha ${drops.tplSha})${TEMPLATE ? "   [candidate, not the shipped template]" : ""}`);
   console.log(`backend      : ${REPLAY ? `replay ${REPLAY}` : CMD ? `cmd:${CMD}` : "cli:claude -p --model haiku (shipped default)"}`);
   console.log(`corpus       : ${LABELS_DIR}`);
   console.log(
     `population   : ${score.n} fired user-prompt cases ` +
       `(${drops.judged} judged; -${drops.notFired} fired no digest, -${drops.skipped} headless backend personas)`
   );
-  console.log(`verdicts     : ${JSON.stringify(verdicts)}  (null = ambiguous/failed -> worker FAILS OPEN to inject)`);
+  console.log(
+    `verdicts     : ${JSON.stringify(verdicts)}  ` +
+      `(null = ambiguous/failed -> worker FAILS OPEN to inject, and the gate counts it as NO VERDICT)`
+  );
 
   console.log(`\n-- harm (the asymmetric side) --`);
   console.log(`  good digests lost   : ${score.goodLost}/${score.good}   (${pct(score.goodLoss)})`);
@@ -192,13 +208,18 @@ function report(records, score, gate, tables, spend, drops) {
 
   console.log(`\n-- gate --`);
   console.log(
-    `  ${gate.harm.metric.padEnd(21)}: ${score.goodLost}        rule: 0` +
+    `  ${gate.harm.metric.padEnd(27)}: ${score.goodLost}        rule: 0` +
       `                     ${gate.harm.pass ? "PASS" : "FAIL"}`
   );
   console.log(
-    `  ${gate.integrity.metric.padEnd(21)}: ${gate.integrity.value}        rule: 0` +
+    `  ${gate.integrity.metric.padEnd(27)}: ${gate.integrity.value}        rule: 0` +
       `                     ${gate.integrity.pass ? "PASS" : "FAIL"}` +
-      (gate.integrity.pass ? "" : "  (a run that measured nothing cannot pass)")
+      (gate.integrity.pass ? "" : "  (a case with no decision scored as an inject — not a measurement)")
+  );
+  console.log(
+    `  ${gate.coverage.metric.padEnd(27)}: ${gate.coverage.value}        rule: 0` +
+      `                     ${gate.coverage.pass ? "PASS" : "FAIL"}` +
+      (gate.coverage.pass ? "" : "  (a sub-population cannot certify the classifier)")
   );
   const note = gate.warranted.pass
     ? ""
@@ -206,7 +227,7 @@ function report(records, score, gate, tables, spend, drops) {
       ? `  (over by less than one case = ${pct(gate.oneCase)} — a note on a FAILING criterion)`
       : "";
   console.log(
-    `  ${gate.warranted.metric.padEnd(21)}: ${pct(score.warrantedSuppression)}    budget: ${pct(BUDGET)}` +
+    `  ${gate.warranted.metric.padEnd(27)}: ${pct(score.warrantedSuppression)}    budget: ${pct(BUDGET)}` +
       `                ${gate.warranted.pass ? "PASS" : "OVER"}${note}`
   );
   // The aggregate verdict, printed rather than left to be read off the rows —
@@ -232,17 +253,31 @@ async function main() {
   const replayFile = path.join(LABELS_DIR, "out", "replay-current.jsonl");
   const casesFile = path.join(LABELS_DIR, "cases", "cases.jsonl");
   for (const f of [judgeFile, replayFile, casesFile]) if (!fs.existsSync(f)) die(`corpus incomplete: no ${f}`);
-  const tplFile = path.join(ENGINE_ROOT, "prompts", "client", "digest-intent.md");
-  if (!fs.existsSync(tplFile)) die(`no classifier template under ${ENGINE_ROOT}`);
+  const tplFile = TEMPLATE
+    ? path.resolve(TEMPLATE)
+    : path.join(ENGINE_ROOT, "prompts", "client", "digest-intent.md");
+  if (!fs.existsSync(tplFile)) die(TEMPLATE ? `no such template: ${tplFile}` : `no classifier template under ${ENGINE_ROOT}`);
 
   const judged = readJsonl(judgeFile);
   const replay = Object.fromEntries(readJsonl(replayFile).map((r) => [r.case_id, r]));
   const cases = Object.fromEntries(readJsonl(casesFile).map((c) => [c.case_id, c]));
   const pop = M.selectPopulation({ judged, replay, caseIds: new Set(Object.keys(cases)) });
 
+  const population = pop.fired.length;
   let set = pop.fired;
+  if (ONLY) {
+    const want = new Set(ONLY.split(",").map((x) => x.trim()).filter(Boolean));
+    set = set.filter((r) => want.has(r.case_id));
+    const absent = [...want].filter((id) => !set.some((r) => r.case_id === id));
+    if (absent.length) die(`--only names ${absent.length} case(s) outside the fired population: ${absent.join(", ")}`);
+  }
   if (LIMIT) set = set.slice(0, LIMIT);
   process.stderr.write(`fired user-prompt cases: ${set.length} (skipped ${pop.skipped.length} backend-persona/absent)\n`);
+  if (set.length < population) {
+    process.stderr.write(
+      `NOTE: scoring ${set.length}/${population} of the population — a sub-population CANNOT pass the gate\n`
+    );
+  }
 
   const tpl = u.stripTrailingNewlines(fs.readFileSync(tplFile, "utf8"));
   const tplSha = u.sha256Head(tplFile);
@@ -314,7 +349,7 @@ async function main() {
   }));
 
   const score = M.scoreRun(records);
-  const gate = M.gateVerdict(score, BUDGET);
+  const gate = M.gateVerdict(score, BUDGET, { population });
   const byId = Object.fromEntries(records.map((r) => [r.case_id, r]));
   const tables = {
     "current engine": M.fireRow(pop.userPrompt, pop.fires),
@@ -326,6 +361,7 @@ async function main() {
     judged: pop.labeled.length,
     notFired: pop.notFired,
     skipped: pop.skipped.length,
+    tplFile,
     tplSha,
   });
 

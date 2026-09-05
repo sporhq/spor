@@ -360,18 +360,33 @@ default-WARRANTED) clears the HARM rule but NOT the whole gate: 0/29 good
 digests lost (the asymmetric criterion, was 12/29) and fire-table F1 0.873 vs
 the current always-inject engine's 0.819, with 78% of noise cut — but 4/59 =
 6.8% warranted suppressed is still OVER the 6% budget, so `gateVerdict` returns
-`pass: false` and `--strict` exits 1 on it. The overage is smaller than one case
-(1.7pp at n=59), which the harness reports as a note on a FAILING row and not as
-an excuse that flips it; don't quote the 0/29 as if it were the gate. That
+`pass: false` and `--strict` exits 1 on it; don't quote the 0/29 as if it were
+the gate. That 0.78pp overage is smaller than one case (1.7pp at n=59) and used
+to be read as a sample too coarse to convict — a SECOND prompt settled it the
+other way (dec-spor-digest-intent-eval-harness-committed-rescored): a materially
+different, prompt-level-judging candidate
+(`scripts/intent-eval/candidates/2026-09-05-prompt-level.md`) moves 13 of the 77
+verdicts, flips all four of the shipped prompt's warranted suppressions, and
+lands on 4/59 AGAIN on four DISJOINT cases. Two draws at one rate with no case
+in common means ~6.8% is the rate, not four fixable misreads, so the budget row
+is a conclusion and further prompt work on this population is fitting to its
+label noise (two near-identical spor-web prompts in it are labeled oppositely).
+The candidate did not ship (a wash on the gate, 13/18 noise vs 14/18). That
 scoring is no longer a scratchpad — re-score
-any prompt edit with `scripts/intent-eval/` (`--replay` re-derives a recorded
-run with no backend calls, and REFUSES a file that doesn't cover the population,
-since an unclassified case would score as the fail-open inject and read as a
-pass; the corpus stays in the private server repo).
+any prompt edit with `scripts/intent-eval/` (`--template <file>` scores a
+candidate without a second checkout; `--replay` re-derives a recorded run with
+no backend calls). A run that measured NOTHING must never read as a passing one,
+so three rule-0 gate guards cover the three ways it happens: a replay that
+doesn't COVER the population is refused, `cases with no verdict` counts a case
+as measured only when it carries one of the two decision words (the classifier
+fails SILENTLY to `null` with no error field, so counting error strings
+certified 77 dead backend calls as a spotless PASS), and `population cases not
+scored` refuses to certify a `--limit`/`--only` sub-population. The corpus stays
+in the private server repo.
 Default-on is STILL deferred, now on three things: the budget criterion itself
-(over by less than the sample can resolve, which a bigger judged set settles and
-an assertion does not), a held-out re-validation on a fresh transcript window
-(the prompt was iterated against this judged set), and a backend-cost call — the shipped default
+(over, twice-measured — a bigger judged set settles it and an assertion does
+not), a held-out re-validation on a fresh transcript window (both prompts were
+scored against the set the first was iterated on), and a backend-cost call — the shipped default
 `claude -p --model haiku` bills ~$0.08 and ~14s per classification, ~98% of it
 CLI session boot rather than the 4.6KB classification, so a flip wants a
 cheaper `digest.intentCmd` backend first. See test/digest-async.test.js and

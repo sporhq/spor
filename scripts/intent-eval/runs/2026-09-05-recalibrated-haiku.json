@@ -1,0 +1,84 @@
+{
+  "label": "recalibrated @ HEAD 2026-09-05",
+  "tplSha": "c724fed604ec",
+  "score": {
+    "n": 77,
+    "firedW": 59,
+    "firedU": 18,
+    "good": 29,
+    "goodLost": 0,
+    "goodLostIds": [],
+    "suppressedW": 4,
+    "suppressedWIds": [
+      "dce0f07641c4",
+      "649a7eaff80e",
+      "c651092aba77",
+      "63ce34486328"
+    ],
+    "suppressedU": 13,
+    "noVerdict": 0,
+    "noVerdictIds": [],
+    "warrantedSuppression": 0.06779661016949153,
+    "goodLoss": 0,
+    "noiseRemoved": 0.7222222222222222,
+    "precision": 0.7647058823529411,
+    "recall": 0.7222222222222222,
+    "f1": 0.7428571428571428
+  },
+  "gate": {
+    "budget": 0.06,
+    "oneCase": 0.01694915254237288,
+    "harm": {
+      "metric": "good digests lost",
+      "value": 0,
+      "pass": true
+    },
+    "integrity": {
+      "metric": "cases with no verdict",
+      "value": 0,
+      "pass": true
+    },
+    "coverage": {
+      "metric": "population cases not scored",
+      "value": 0,
+      "pass": true
+    },
+    "warranted": {
+      "metric": "warranted suppressed",
+      "value": 0.06779661016949153,
+      "pass": false,
+      "withinOneCase": true
+    },
+    "pass": false
+  },
+  "tables": {
+    "current engine": {
+      "W": 67,
+      "U": 62,
+      "fireW": 59,
+      "fireU": 18,
+      "rateW": 0.8805970149253731,
+      "rateU": 0.2903225806451613,
+      "f1": 0.8194444444444445
+    },
+    "engine+classifier": {
+      "W": 67,
+      "U": 62,
+      "fireW": 55,
+      "fireU": 5,
+      "rateW": 0.8208955223880597,
+      "rateU": 0.08064516129032258,
+      "f1": 0.8661417322834646
+    }
+  },
+  "spend": {
+    "calls": 77,
+    "failures": 0,
+    "costTotal": 5.305990499999999,
+    "costMean": 0.06890896753246752,
+    "latencyMedian": 18410,
+    "latencyP90": 27547,
+    "inputTokensMean": 10,
+    "outputTokensMean": 728.7402597402597
+  }
+}

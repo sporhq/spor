@@ -19,12 +19,25 @@
 //      nothing passes 1 and 2 trivially and is worth no backend call.
 //
 // Both harm metrics COUNT SUPPRESSIONS, so every way of not getting a verdict —
-// a dead backend, a child that printed nothing, a case absent from a replay
-// file — scores as an inject and moves them TOWARD passing. A run that measured
+// a dead backend, a child that printed nothing, a reply carrying both words or
+// neither, a case absent from a replay file, a population narrowed by --limit —
+// scores as an inject and moves them TOWARD passing. A run that measured
 // nothing is therefore indistinguishable, on 1 and 2 alone, from a perfectly
-// calibrated one. That is why the gate carries a third, INTEGRITY criterion
-// (`errored === 0`) and why run.js refuses a replay that does not cover the
-// population outright: an unmeasured case must never read as a passing one.
+// calibrated one. That is why the gate carries two further INTEGRITY criteria —
+// every scored case carries a DECISION (`noVerdict === 0`) and the scored set
+// is the whole population (`uncovered === 0`) — and why run.js refuses a replay
+// that does not cover the population: an unmeasured case must never read as a
+// passing one.
+//
+// The decision test is a POSITIVE one. The classifier's failures are silent by
+// design — `classifyDigestIntent` returns null both when the backend died and
+// when haiku answered ambiguously, and neither raises — so a record whose
+// verdict is null carries no `error` field to count. Counting error strings
+// therefore certified exactly the run this criterion exists to catch: 77 dead
+// backend calls score as 77 injects, zero suppressions, zero errors, and a
+// spotless PASS. A case counts as measured only when it carries one of the two
+// decisions the classifier is allowed to reach; every other shape — null,
+// undefined, absent, a novel spelling, an errored record — is no verdict.
 
 // A judged arm is "good" when the judge found the digest genuinely useful:
 // helpful-or-mixed overall, scored >= 4, and its TOP slot relevant (the top
@@ -33,6 +46,12 @@
 // harm metric reads; arm `a` is the live server digest of the day.
 const GOOD_VERDICTS = new Set(["helpful", "mixed"]);
 const GOOD_MIN_SCORE = 4;
+
+// The only two answers that ARE a classification. See the header: an allowlist,
+// because every other shape means the run did not measure this case.
+const DECISIVE = new Set(["WARRANTED", "UNWARRANTED"]);
+
+const hasVerdict = (r) => !r.error && DECISIVE.has(r.verdict);
 
 function isGoodDigest(judged, arm = "b") {
   const a = judged && judged[arm];
@@ -81,12 +100,13 @@ function scoreRun(records) {
   const suppressedW = firedW.filter((r) => !r.inject);
   const suppressedU = firedU.filter((r) => !r.inject);
   const goodLost = good.filter((r) => !r.inject);
-  // Cases where no verdict was OBTAINED — a backend/harness failure, recorded
-  // by run.js as `error`. Production fails open on these and so does the
-  // scoring (they count as injects above), which is exactly why they are
-  // counted separately: they make the harm metrics look better, so a run
-  // carrying any of them is not a measurement of the classifier.
-  const errored = records.filter((r) => r.error);
+  // Cases where no DECISION was obtained: a backend/harness failure (run.js
+  // records an `error`), or a reply the shipped parse could not read as either
+  // word (null verdict, no error — the silent majority). Production fails open
+  // on both and so does the scoring, since they count as injects above; that is
+  // exactly why they are counted here. They make the harm metrics look better,
+  // so a run carrying any of them is not a measurement of the classifier.
+  const noVerdict = records.filter((r) => !hasVerdict(r));
 
   // Suppression as a noise DETECTOR: predicting "suppress" is the positive
   // class, so precision is "of what it suppressed, how much was truly noise".
@@ -109,8 +129,8 @@ function scoreRun(records) {
     suppressedW: suppressedW.length,
     suppressedWIds: suppressedW.map((r) => r.case_id),
     suppressedU: suppressedU.length,
-    errored: errored.length,
-    erroredIds: errored.map((r) => r.case_id),
+    noVerdict: noVerdict.length,
+    noVerdictIds: noVerdict.map((r) => r.case_id),
     warrantedSuppression: rate(suppressedW.length, firedW.length),
     goodLoss: rate(goodLost.length, good.length),
     noiseRemoved: rate(suppressedU.length, firedU.length),
@@ -139,37 +159,50 @@ function fireRow(cases, fires) {
 }
 
 // The pre-ship gate, as dec-spor-digest-intent-classifier-scored-prompt-recalibrated
-// applied it. Three criteria, deliberately not one number:
+// applied it. Four criteria, deliberately not one number:
 //
 //   goodLost === 0        the HARD rule. A digest the judge rated genuinely
 //                         good must never be suppressed; that is the harm no
 //                         fail-open path recovers.
 //   warrantedSuppression  <= budget (default 6%, the async design's assumed
-//                         empty-missed budget). Reported with the size of ONE
-//                         case in the denominator, because at n=59 a single
-//                         case moves the rate ~1.7pp and a verdict that reads
-//                         "over budget" by less than that is measuring the
-//                         sample, not the prompt. `withinOneCase` says the
-//                         overage is under that resolution; it is a note on a
-//                         FAILING criterion, never an excuse that flips it.
-//   errored === 0         INTEGRITY. Both metrics above count suppressions, so
-//                         a case with no verdict scores as an inject and pushes
-//                         them toward passing — an all-failed run reads exactly
-//                         like a perfect one. A run that did not measure the
-//                         classifier cannot pass a gate on it. Absent (an older
-//                         score, or the pure-math callers) is not a failure:
-//                         the criterion only ever fires on a POSITIVE count.
+//                         empty-missed budget). `withinOneCase` reports whether
+//                         the overage is smaller than one case (1.7pp at n=59)
+//                         — the sample's RESOLUTION, printed on a FAILING
+//                         criterion and never an excuse that flips it. Do not
+//                         read it as "so it might really be under": two
+//                         materially different prompts have now both measured
+//                         4/59 here, on four DISJOINT cases (README Results),
+//                         which is two draws agreeing on the rate rather than
+//                         one draw that cannot resolve it.
+//   noVerdict === 0       INTEGRITY, per case. Both metrics above count
+//                         suppressions, so a case with no decision scores as an
+//                         inject and pushes them toward passing — an all-failed
+//                         run reads exactly like a perfect one. A run that did
+//                         not measure the classifier cannot pass a gate on it.
+//   uncovered === 0       INTEGRITY, per population. The same arithmetic one
+//                         level up: a run narrowed by --limit/--only scores a
+//                         SUBSET, and the cases it never looked at are exactly
+//                         the ones that could have carried the suppressions.
+//                         `--limit 1` is otherwise a spotless gate PASS.
+//
+// Both integrity criteria fire only on a POSITIVE count, so a caller that hands
+// gateVerdict a hand-built score (the pure-math tests, an archived JSON) is not
+// failed for a field it never carried. The counting itself is not optional
+// there — it lives in scoreRun, which always emits `noVerdict`, and in run.js,
+// which always passes the population it selected.
 const DEFAULT_BUDGET = 0.06;
 
-function gateVerdict(score, budget = DEFAULT_BUDGET) {
+function gateVerdict(score, budget = DEFAULT_BUDGET, { population = null } = {}) {
   const oneCase = score.firedW > 0 ? 1 / score.firedW : null;
   const over = score.warrantedSuppression != null ? score.warrantedSuppression - budget : null;
-  const errored = score.errored ?? 0;
+  const noVerdict = score.noVerdict ?? 0;
+  const uncovered = population != null && score.n != null ? population - score.n : 0;
   return {
     budget,
     oneCase,
     harm: { metric: "good digests lost", value: score.goodLost, pass: score.goodLost === 0 },
-    integrity: { metric: "cases with no verdict", value: errored, pass: !(errored > 0) },
+    integrity: { metric: "cases with no verdict", value: noVerdict, pass: !(noVerdict > 0) },
+    coverage: { metric: "population cases not scored", value: uncovered, pass: !(uncovered > 0) },
     warranted: {
       metric: "warranted suppressed",
       value: score.warrantedSuppression,
@@ -178,14 +211,21 @@ function gateVerdict(score, budget = DEFAULT_BUDGET) {
       // the resolution the sample can express.
       withinOneCase: over != null && over > 0 && oneCase != null && over <= oneCase,
     },
-    pass: score.goodLost === 0 && !(errored > 0) && over != null && over <= 0,
+    pass:
+      score.goodLost === 0 &&
+      !(noVerdict > 0) &&
+      !(uncovered > 0) &&
+      over != null &&
+      over <= 0,
   };
 }
 
 module.exports = {
   GOOD_VERDICTS,
   GOOD_MIN_SCORE,
+  DECISIVE,
   DEFAULT_BUDGET,
+  hasVerdict,
   isGoodDigest,
   selectPopulation,
   scoreRun,
