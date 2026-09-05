@@ -466,7 +466,7 @@ runtime contract; the payload keys are documented on the candidate nodes
 themselves. Every declared count or ms field in a gate/factory payload
 (`cycles`, `reruns`, `timeout_ms`, `poll_ms`, `approval_timeout_ms`,
 `await_ms`, rescue's `attempts`) is parsed through a guarded helper
-(`countOr`/`msOrInherit` in `lib/kernel/gates.js`): a value that isn't
+(`countOr` in `lib/kernel/gates.js`): a value that isn't
 readable as a number — blank, `null`, `false`, an array, or the wrong type —
 takes the field's documented default rather than silently clamping to the
 floor, while a readable but out-of-range number still clamps.
