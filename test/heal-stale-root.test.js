@@ -1016,6 +1016,109 @@ test("GIT_LOCAL_ENV_VARS covers every var the live git reports via --local-env-v
   }
 });
 
+// ---------- the rewind guard (task-spor-heal-stale-root-refuse-non-descendant-rewind) ----------
+//
+// The incident shape: a CAS `update-ref` only checks the OLD value, so main
+// can be swapped onto a sibling branch tip that does NOT descend from main's
+// own previous position — a rewind, not a merge. Healing that root would
+// check the rewound tip out over the working tree and make later readers of
+// this checkout treat it as truth, so the guard must refuse before anything
+// else touches the tree, in both a dry run and --apply, unless --force-rewind
+// says the rewind is deliberate.
+
+// Builds the incident: main advances normally to `cOld` (what the shared root
+// checkout is sitting at), then a DISJOINT sibling line off the same base is
+// CAS'd directly onto main — never descending from cOld. The sibling's first
+// commit deliberately matches cOld's content, so a forced heal has something
+// genuinely stale to check out (proving the guard's bypass still heals,
+// rather than just skipping a check that would have found nothing anyway).
+function buildRewind(dir) {
+  write(dir, "a.js", "v0\n");
+  const c0 = commit(dir, "init");
+
+  write(dir, "a.js", "v1\n");
+  const cOld = commit(dir, "old main tip");
+
+  git(dir, "checkout", "-q", "-b", "sibling", c0);
+  write(dir, "a.js", "v1\n"); // matches cOld's content — the stale evidence for the forced heal
+  commit(dir, "sibling: matches old content");
+  write(dir, "a.js", "v2\n");
+  const cNew = commit(dir, "sibling: new tip");
+  git(dir, "checkout", "-q", "main");
+
+  const anc = spawnSync("git", ["-C", dir, "merge-base", "--is-ancestor", cOld, cNew]);
+  assert.notEqual(anc.status, 0, "fixture sanity: cNew must not descend from cOld");
+
+  git(dir, "update-ref", "refs/heads/main", cNew, cOld); // the CAS — a rewind, not a merge
+  return { c0, cOld, cNew };
+}
+
+test("a dry run refuses a main rewound to a non-descendant sibling, naming both tips", () => {
+  const dir = initRepo();
+  const { cOld, cNew } = buildRewind(dir);
+
+  const r = run(dir);
+  assert.equal(r.status, 2, "the run never gets far enough to touch anything");
+  assert.match(r.stderr, new RegExp(cNew.slice(0, 8)));
+  assert.match(r.stderr, new RegExp(cOld.slice(0, 8)));
+  assert.match(r.stderr, /force-rewind/);
+  assert.equal(read(dir, "a.js"), "v1\n", "nothing was written");
+});
+
+test("--apply also refuses a rewind rather than propagating it into the root", () => {
+  const dir = initRepo();
+  buildRewind(dir);
+
+  const r = run(dir, "--apply");
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /force-rewind/);
+  assert.equal(read(dir, "a.js"), "v1\n", "the rewound tip was never checked out");
+});
+
+test("--force-rewind is the deliberate escape hatch: the same rewind now heals", () => {
+  const dir = initRepo();
+  buildRewind(dir);
+
+  const r = runJson(dir, "--apply", "--force-rewind");
+  assert.equal(r.json.verdict, "HEALED");
+  assert.equal(r.status, 0);
+  assert.equal(read(dir, "a.js"), "v2\n", "healed onto the forced tip");
+});
+
+test("an ordinary fast-forward advance is not mistaken for a rewind", () => {
+  const dir = initRepo();
+  write(dir, "a.js", "v0\n");
+  commit(dir, "init");
+  casAdvance(dir, () => write(dir, "a.js", "v1\n")); // a genuine descendant advance
+
+  const r = runJson(dir, "--apply");
+  assert.equal(r.json.verdict, "HEALED");
+  assert.equal(r.status, 0);
+});
+
+test("a repo with no prior reflog entry is not treated as a rewind", () => {
+  const dir = initRepo();
+  write(dir, "a.js", "one\n");
+  commit(dir, "init"); // main's very first reflog entry — no @{1} to compare against
+
+  const r = runJson(dir);
+  assert.equal(r.json.verdict, "IN-SYNC");
+  assert.equal(r.status, 0);
+});
+
+test("a detached HEAD has no branch to have rewound, so nothing is refused", () => {
+  const dir = initRepo();
+  write(dir, "a.js", "one\n");
+  const c0 = commit(dir, "init");
+  write(dir, "a.js", "two\n");
+  commit(dir, "second");
+  git(dir, "checkout", "-q", c0);
+
+  const r = runJson(dir);
+  assert.equal(r.json.verdict, "IN-SYNC");
+  assert.equal(r.status, 0);
+});
+
 // ---------- invocation ----------
 
 test("a merge in progress refuses with exit 2", () => {

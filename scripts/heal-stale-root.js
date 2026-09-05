@@ -96,12 +96,33 @@
 //     are adjacent subprocess spawns, with nothing else between — not closed,
 //     but as narrow as a tool without a tree lock can make it.
 //
+// THE REWIND GUARD (task-spor-heal-stale-root-refuse-non-descendant-rewind,
+// derived from issue-spor-orchestrator-merge-cas-lacks-ancestry-check): a CAS
+// `git update-ref refs/heads/main $new $old` only asserts the ref was still at
+// $old — it never checks that $new descends from it. A merge subagent that
+// skips its rebase can CAS main onto a branch tip based on some earlier
+// commit, silently dropping every commit landed since (the wave-7 incident:
+// main lost six commits before a human noticed). Every judgment call in this
+// file exists to avoid destroying novel work by checking out a STALE tree; a
+// rewound main is the opposite failure — healing would check the REWOUND tip
+// out over the working tree and hand every later reader of this checkout a
+// lie it cannot detect. So before anything else touches the tree, the current
+// branch's tip is compared against its own previous reflog position
+// (`<branch>@{1}`) with `git merge-base --is-ancestor`; a non-descendant
+// refuses outright, naming both tips, unless `--force-rewind` says the rewind
+// is deliberate (the orchestrator's own re-CAS after fixing a bad swap). A
+// detached HEAD (no branch to have rewound) or a branch with no second
+// reflog entry yet (nothing to compare against) is not evidence either way —
+// like every other probe in this file, an inability to confirm ancestry
+// refuses rather than answers "safe".
+//
 // Usage:
-//   node scripts/heal-stale-root.js [--repo <dir>] [--lookback N] [--apply] [--json]
-//     --repo <dir>   the checkout to guard (default: cwd)
-//     --apply        heal the STALE paths; without it this is a dry run
-//     --lookback N   ancestors of HEAD to scan (default 300, first-parent)
-//     --json         machine-readable verdict on stdout
+//   node scripts/heal-stale-root.js [--repo <dir>] [--lookback N] [--apply] [--json] [--force-rewind]
+//     --repo <dir>       the checkout to guard (default: cwd)
+//     --apply            heal the STALE paths; without it this is a dry run
+//     --lookback N       ancestors of HEAD to scan (default 300, first-parent)
+//     --json             machine-readable verdict on stdout
+//     --force-rewind     skip the rewind guard (the deliberate re-CAS case)
 // Exit 0 = the root matches HEAD: IN-SYNC (nothing was modified) or HEALED (every
 //          modification was stale and has been checked out). The caller may
 //          `git reset --hard main`; after --apply the heal has already done it.
@@ -112,8 +133,10 @@
 //          root — verify the merge in a throwaway detached worktree instead
 //          (norm-spor-orchestrator-cas-merge). A verdict is always reported.
 // Exit 2 = the run never got far enough to touch anything: a bad invocation, not
-//          a git repo, an operation (merge/rebase/…) in progress, or a probe that
-//          could not answer BEFORE any write. Nothing was modified.
+//          a git repo, an operation (merge/rebase/…) in progress, the checked-out
+//          branch having moved to a non-descendant of its previous position (a
+//          rewind — refused unless --force-rewind), or a probe that could not
+//          answer BEFORE any write. Nothing was modified.
 //
 // WIRING — NOT DONE YET, AND DELIBERATELY SO. The consumer is the orchestrator's
 // post-merge root sync (norm-spor-orchestrator-cas-merge), which lives in the
@@ -162,17 +185,18 @@ const UNKNOWN = Symbol('unknown');
 function usage(msg) {
   if (msg) process.stderr.write(`heal-stale-root: ${msg}\n`);
   process.stderr.write(
-    'usage: node scripts/heal-stale-root.js [--repo <dir>] [--lookback N] [--apply] [--json]\n'
+    'usage: node scripts/heal-stale-root.js [--repo <dir>] [--lookback N] [--apply] [--json] [--force-rewind]\n'
   );
   process.exit(2);
 }
 
 function parseArgs(argv) {
-  const opts = { repo: process.cwd(), lookback: 300, apply: false, json: false };
+  const opts = { repo: process.cwd(), lookback: 300, apply: false, json: false, forceRewind: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--apply') opts.apply = true;
     else if (a === '--json') opts.json = true;
+    else if (a === '--force-rewind') opts.forceRewind = true;
     else if (a === '--repo') {
       opts.repo = argv[++i];
       if (!opts.repo) usage('--repo needs a directory');
@@ -343,6 +367,63 @@ function chunks(arr, n) {
   }
   if (cur.length) out.push(cur);
   return out;
+}
+
+// ---------- rewind guard ----------
+//
+// See "THE REWIND GUARD" at the top of this file. `main` is checked against
+// its OWN previous reflog position, not a hardcoded branch name, so this also
+// guards a shared root for any other repo this tool is invoked against.
+
+// The branch HEAD is on, or null on a detached HEAD (no branch ref that could
+// have rewound). `--quiet` makes a detached HEAD a clean non-zero exit rather
+// than the stderr `fatal: ref HEAD is not a symbolic ref` this tool would
+// otherwise have to filter out of every other failure.
+function currentBranch(repo) {
+  const r = gitSpawn(repo, ['symbolic-ref', '--quiet', '--short', 'HEAD'], {
+    encoding: 'utf8',
+    env: envWithoutRepoLocalVars(),
+  });
+  return r.status === 0 ? (r.stdout || '').trim() : null;
+}
+
+// `<branch>@{1}` — the reflog's record of that ref's own previous position —
+// or null when there is no second entry yet (a fresh clone, a freshly created
+// branch): nothing to compare against, so not rewind evidence either way.
+function reflogPrevious(repo, branch) {
+  const r = gitSpawn(repo, ['rev-parse', '--verify', '-q', `${branch}@{1}`], {
+    encoding: 'utf8',
+    env: envWithoutRepoLocalVars(),
+  });
+  return r.status === 0 ? (r.stdout || '').trim() : null;
+}
+
+// true = `descendant` contains `ancestor` in its history; false = it does
+// not; null = the probe itself could not answer (git could not be run, or
+// exited with neither 0 nor 1 — a corrupt ref, an unresolvable object, …).
+// Only `true` is ever read as "safe" — the same rule every other probe in
+// this file follows: an unknown never reads as an answer.
+function isAncestor(repo, ancestor, descendant) {
+  const r = gitSpawn(repo, ['merge-base', '--is-ancestor', ancestor, descendant], {
+    encoding: 'utf8',
+    env: envWithoutRepoLocalVars(),
+  });
+  if (r.status === 0) return true;
+  if (r.status === 1) return false;
+  return null;
+}
+
+// {branch, prev, head} when `head` is a non-descendant rewind of the checked-
+// out branch's own previous reflog position; null when there is nothing to
+// refuse — no branch (detached HEAD), no prior reflog entry, the ref hasn't
+// moved, or an ordinary fast-forward/merge advance.
+function detectRewind(repo, head) {
+  const branch = currentBranch(repo);
+  if (!branch) return null;
+  const prev = reflogPrevious(repo, branch);
+  if (!prev || prev === head) return null;
+  if (isAncestor(repo, prev, head) === true) return null; // an ordinary advance
+  return { branch, prev, head }; // a non-descendant, or unconfirmed — refuse either way
 }
 
 // ---------- identity ----------
@@ -815,6 +896,18 @@ function main() {
   const headOut = git(repo, ['rev-parse', 'HEAD']);
   if (headOut === null) usage('no HEAD commit');
   const head = headOut.trim();
+
+  if (!opts.forceRewind) {
+    const rewind = detectRewind(repo, head);
+    if (rewind) {
+      usage(
+        `${rewind.branch} moved to ${rewind.head.slice(0, 8)}, which does not descend from its previous position ` +
+        `${rewind.prev.slice(0, 8)} (${rewind.branch}@{1}) — this looks like a rewind, not a merge or fast-forward. ` +
+        'Refusing to heal: healing would check the rewound tip out over this working tree and hand every later ' +
+        'reader of it a lie it cannot detect. If this is the deliberate re-CAS of a bad swap, re-run with --force-rewind.'
+      );
+    }
+  }
 
   const emptyBlob = emptyBlobSha(repo);
   if (emptyBlob === null) usage('cannot derive the empty-blob OID — refusing to classify');
