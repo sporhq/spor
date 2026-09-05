@@ -957,7 +957,7 @@ There are four per-agent workflows, all supplied as the dispatch `--template`:
 - **Solo / in-place agent** — `assets/agent-prompt-inplace.md`: brief →
   implement directly on the shared checkout, under shared-checkout discipline
   (no worktree assumptions) → loop `/code-review` until clean → verify →
-  resolve the node → commit on whatever branch was already checked out (it
+  commit on whatever branch was already checked out → resolve the node (it
   owns that commit directly — there is no branch for you to merge). See
   "Solo / in-place dispatch" above.
 
