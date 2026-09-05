@@ -2364,6 +2364,52 @@ test("acquireLocalDispatchLock: an unwritable journal fails open (nothing to rel
   }
 });
 
+// The single-process unit tests above prove the FUNCTION's logic; this proves
+// the PRIMITIVE holds under real cross-process contention — two independent OS
+// processes racing to `wx`-create the exact same lockfile, which is what the
+// exclusive-create syscall serializes regardless of scheduling (unlike the
+// snapshot-read same-machine guard, there is no timing window to get lucky or
+// unlucky in). Deterministic: run it in a loop and it never flakes either way.
+function raceLockScript(home, name, outFile) {
+  return `
+const fs = require("node:fs");
+const cli = require(${JSON.stringify(CLI)});
+const result = cli.acquireLocalDispatchLock(${JSON.stringify(home)}, ${JSON.stringify(name)});
+fs.writeFileSync(${JSON.stringify(outFile)}, JSON.stringify({ ok: result.ok, pid: process.pid }));
+// A winner stays alive for a while instead of exiting the instant it
+// acquires: the staleness check treats "the holder's pid is already gone" as
+// reclaimable (a deliberate self-heal for a crashed dispatch, mirroring
+// production where cmdDispatch holds this lock for its whole call, not just
+// the instant of acquisition) — a winner that exits too soon lets a losing
+// racer's own staleness check (which itself pays the cost of re-requiring
+// this whole CLI module) misread a real race as an abandoned lock and
+// reclaim it too, which is a test artifact, not the hazard this fix closes.
+// The hold comfortably outlasts that require+check cost even on a loaded box.
+if (result.ok) setTimeout(() => process.exit(0), 4000);
+else process.exit(0);
+`;
+}
+
+test("acquireLocalDispatchLock: exactly one of two REAL concurrent processes wins the same lock", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-lock-race-"));
+  const outA = path.join(home, "a.result.json");
+  const outB = path.join(home, "b.result.json");
+  const scriptA = path.join(home, "a.js");
+  const scriptB = path.join(home, "b.js");
+  fs.writeFileSync(scriptA, raceLockScript(home, "dec-race", outA));
+  fs.writeFileSync(scriptB, raceLockScript(home, "dec-race", outB));
+  await Promise.all([
+    new Promise((resolve) => spawn(process.execPath, [scriptA]).on("close", resolve)),
+    new Promise((resolve) => spawn(process.execPath, [scriptB]).on("close", resolve)),
+  ]);
+  const a = JSON.parse(fs.readFileSync(outA, "utf8"));
+  const b = JSON.parse(fs.readFileSync(outB, "utf8"));
+  const winners = [a, b].filter((r) => r.ok);
+  const losers = [a, b].filter((r) => !r.ok);
+  assert.strictEqual(winners.length, 1, "exactly one real process acquires the lock");
+  assert.strictEqual(losers.length, 1, "exactly one real process is refused");
+});
+
 test("dispatch <node-id> (local): two concurrent dispatches of the SAME node — exactly one launches", async () => {
   const { home, repo } = fixture();
   run(["repos", "add", "demo", repo], { SPOR_HOME: home });

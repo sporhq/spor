@@ -7829,6 +7829,44 @@ function writeLocalDispatchLock(file) {
     { flag: "wx" }
   );
 }
+// A short, synchronous, best-effort sleep (Atomics.wait needs a SharedArrayBuffer
+// and blocks the calling thread, which is exactly what a bounded retry here
+// wants — acquireLocalDispatchLock stays synchronous, matching every other
+// local-mode guard cmdDispatch checks inline). Falls back to a CPU spin if
+// Atomics.wait is unavailable (some sandboxes restrict SharedArrayBuffer); the
+// window this covers is a few milliseconds at most, so a spin is cheap.
+function sleepSyncMs(ms) {
+  if (!(ms > 0)) return;
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      /* spin */
+    }
+  }
+}
+// writeFileSync's O_CREAT|O_EXCL open and its write() are two syscalls, so a
+// reader that lands between them sees the lockfile mid-creation: EMPTY, not
+// the winner's real content — the same class of torn-read gotcha
+// helpers/launch.js's waitForFile works around for stub markers, here on the
+// READER side of the exact same file instead. Read this wrong and a racer
+// treats the winner's own brand-new lock as unreadable garbage, deletes it,
+// and writes its own — the bug this function exists to close, reintroduced by
+// its own staleness check. So an EMPTY read is retried briefly (bounded, and
+// rare — it is a few CPU instructions wide) before it is treated as anything;
+// a NON-empty read that still fails to parse is genuine corruption/leftover
+// garbage, never the torn-read case (our payload is small enough to write in
+// one syscall, so a reader only ever sees "nothing yet" or "all of it", never
+// a partial write), and is trusted immediately.
+function readLockRaw(file, { attempts = 25, delayMs = 2 } = {}) {
+  for (let i = 0; i < attempts; i++) {
+    const raw = fs.readFileSync(file, "utf8"); // let ENOENT/other errors propagate to the caller
+    if (raw !== "") return raw;
+    if (i < attempts - 1) sleepSyncMs(delayMs);
+  }
+  return ""; // still empty after the bounded wait — no valid content to honor either way
+}
 function acquireLocalDispatchLock(home, name) {
   const file = localDispatchLockFile(home, name);
   try {
@@ -7841,11 +7879,16 @@ function acquireLocalDispatchLock(home, name) {
   // latter self-heals; a live holder is refused, not waited on.
   let stale = false;
   try {
-    const held = JSON.parse(fs.readFileSync(file, "utf8"));
-    const age = Date.now() - (Date.parse(held.at || "") || 0);
-    stale = age > LOCAL_DISPATCH_LOCK_STALE_MS || !workerAlive(held.pid, held.started_ticks);
+    const raw = readLockRaw(file);
+    const held = raw ? JSON.parse(raw) : null;
+    if (!held) {
+      stale = true; // gone, or genuinely empty even after the bounded retry
+    } else {
+      const age = Date.now() - (Date.parse(held.at || "") || 0);
+      stale = age > LOCAL_DISPATCH_LOCK_STALE_MS || !workerAlive(held.pid, held.started_ticks);
+    }
   } catch {
-    stale = true; // an unreadable lock cannot be honored as a live one
+    stale = true; // an unreadable/unparseable lock cannot be honored as a live one
   }
   if (!stale) return { ok: false };
   try {
