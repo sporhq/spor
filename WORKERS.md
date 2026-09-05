@@ -519,7 +519,12 @@ proposed. A declined run:
 - has its reason filed as a **`finding`** node (`find-declined-<stem>-<run>`,
   `relates-to` the target, never `resolves`/`blocks`) with the full report in
   the body, so the item re-briefs with the decline attached the next time it
-  is compiled;
+  is compiled — and, while that finding stays LIVE (not yet resolved/dismissed
+  by a person), also GATES re-dispatch of the same node: `spor dispatch --node`
+  refuses (naming the finding id; `--force` overrides) and the work loop skips
+  it visibly, like a policy skip, under every accept policy (task-spor-
+  decline-finding-gates-redispatch) — a second worker no longer pays the same
+  investigation a standing decline already settled;
 - has its **`readiness: agent` stamp cleared** (`POST
   /v1/nodes/{id}/readiness {readiness: "clear"}`) — the stamp was the claim the
   decline contradicts, and clearing it is what keeps a `work.accept: ready`

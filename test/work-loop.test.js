@@ -308,6 +308,38 @@ test("a page full of policy skips never evicts a REFUSAL cooldown — the cheap 
   assert.ok(status.skipped.some((x) => x.kind === "policy"), "policy skips are still recorded — they are just the first to go");
 });
 
+test("a page full of DECLINED skips never evicts a REFUSAL cooldown either — declined is CHEAP too", async () => {
+  // task-spor-decline-finding-gates-redispatch: a decline verdict is derived
+  // purely from `it.findings`, already on the queue page — recomputed for
+  // free next poll, exactly like a policy/scope skip — so it must be in the
+  // CHEAP eviction bucket alongside them, not compete with a load-bearing
+  // refusal cooldown for the table's 50 slots.
+  let pass = 0;
+  const h = harness({
+    queue: () => {
+      pass += 1;
+      const page = [{ id: "task-refuses", readiness: "agent" }];
+      if (pass > 1) {
+        for (let i = 0; i < workLoop.SKIP_CAP * 3; i++) {
+          page.push({ id: `task-declined-${pass}-${i}`, readiness: "agent", findings: [`find-declined-${pass}-${i}`] });
+        }
+      }
+      return page;
+    },
+    dispatch: () => ({ ok: false, reason: "cannot dispatch task-refuses here: this machine can't satisfy profile profile-gpu" }),
+    opts: { concurrency: 1, retryAfterMs: 600000 },
+    maxPasses: 4,
+  });
+  const status = await h.run();
+  const refusals = h.log.filter((l) => l.includes("skipping task-refuses"));
+  assert.strictEqual(refusals.length, 1, `the refusal is attempted ONCE, not once every other poll: ${refusals.length}`);
+  assert.ok(status.skipped.length <= workLoop.SKIP_CAP, `still bounded at ${workLoop.SKIP_CAP}`);
+  const kept = status.skipped.find((x) => x.id === "task-refuses");
+  assert.ok(kept, "the refusal cooldown survived a page of declined skips");
+  assert.strictEqual(kept.kind, "refusal");
+  assert.ok(status.skipped.some((x) => x.kind === "declined"), "declined skips are still recorded — they are just the first to go");
+});
+
 test("a human-readiness item is never a candidate — a worker does not claim what needs a person", async () => {
   const h = harness({
     queue: [{ id: "task-human", readiness: "human", readiness_reasons: ["requires human"] }, { id: "task-agent", readiness: "agent" }],
@@ -482,6 +514,36 @@ test("selectWorkCandidates: a factory's declared repo scope bounds what it gates
   assert.deepStrictEqual(cooling, []);
 });
 
+test("selectWorkCandidates: a live decline finding is skipped visibly, under EVERY accept policy; a resolved one does not gate", () => {
+  // task-spor-decline-finding-gates-redispatch: a prior dispatch already
+  // declared this item's own premise wrong (DECLINED) and left the standing
+  // find-declined-* finding instead of a resolver. rankQueue's `findings`
+  // ride-along (ids only) already excludes anything superseded/terminal, so a
+  // finding a person has since resolved is simply absent from the list —
+  // nothing here has to special-case that.
+  const items = [
+    { id: "a", readiness: "agent", findings: ["find-declined-a-1a2b3c4d"] },
+    { id: "b", readiness: "agent", findings: ["find-stale-anchor-b-9e8f7a6b"] }, // a non-decline finding: not gated
+    { id: "c", readiness: "agent" }, // no findings at all
+  ];
+  const skips = [];
+  const got = workLoop.selectWorkCandidates(items, { onSkip: (it, reason, kind) => skips.push([it.id, reason, kind]) });
+  assert.deepStrictEqual(got.map((i) => i.id), ["b", "c"]);
+  assert.strictEqual(skips.length, 1);
+  assert.strictEqual(skips[0][0], "a");
+  assert.match(skips[0][1], /live decline finding find-declined-a-1a2b3c4d/);
+  assert.strictEqual(skips[0][2], "declined");
+  // Held under every accept policy — same floor as readiness:human, not a
+  // policy knob.
+  for (const accept of workLoop.WORK_ACCEPT_POLICIES) {
+    const withDeclined = workLoop.selectWorkCandidates(
+      [{ id: "a", readiness: "agent", findings: ["find-declined-a-1a2b3c4d"] }, { id: "c", readiness: "agent" }],
+      { accept }
+    );
+    assert.deepStrictEqual(withDeclined.map((i) => i.id), ["c"], `declined item refused under '${accept}'`);
+  }
+});
+
 test("selectWorkCandidates: the DEFAULT policy is explicit consent — untriaged is skipped, visibly", () => {
   // dec-spor-work-accept-policy-configurable: with nothing configured, only an
   // item a person stamped agent-ready is a candidate. An untriaged item — a
@@ -531,6 +593,20 @@ test("the loop under the default policy: an untriaged item is cooled off with th
   assert.strictEqual(status.skipped[0].id, "task-untriaged");
   assert.strictEqual(status.skipped[0].reason, "not agent-ready; work.accept ready");
   assert.ok(h.log.some((l) => l.includes("skipping task-untriaged — not agent-ready; work.accept ready")), h.log.join("\n"));
+});
+
+test("the loop: an item carrying a live decline finding is skipped with the finding id, visible on stdout and in --status", async () => {
+  const h = harness({
+    queue: [{ id: "task-declined", readiness: "agent", findings: ["find-declined-task-declined-1a2b3c4d"] }, { id: "task-ready", readiness: "agent" }],
+    opts: { concurrency: 1, max: 1 },
+    onTick: (state) => state.finishAll({ terminal_state: "resolved", terminal_enforced: true }),
+  });
+  const status = await h.run();
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-ready"], "only the clean item is dispatched");
+  assert.strictEqual(status.skipped.length, 1);
+  assert.strictEqual(status.skipped[0].id, "task-declined");
+  assert.match(status.skipped[0].reason, /live decline finding find-declined-task-declined-1a2b3c4d/);
+  assert.ok(h.log.some((l) => l.includes("skipping task-declined") && l.includes("find-declined-task-declined-1a2b3c4d")), h.log.join("\n"));
 });
 
 test("the loop under --accept open takes the untriaged item; human is still refused", async () => {

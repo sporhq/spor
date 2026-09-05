@@ -46,7 +46,7 @@ const { workerContract } = workerContractLib;
 // TERMINAL status OR a live inbound resolves/answers edge — the same partition the
 // queue ranker and read surfaces use. The dispatch guard reads it so it never
 // launches an agent at already-finished work (issue-spor-dispatch-resolved-task-no-guard).
-const { isTerminalStatus, resolutionOf } = require(path.join(ROOT, "lib", "kernel", "resolution.js"));
+const { isTerminalStatus, resolutionOf, openFindingsFor } = require(path.join(ROOT, "lib", "kernel", "resolution.js"));
 // Agent-readiness (dec-spor-agent-readiness-derived-classification): the same
 // derivation rankQueue uses per queue item, reused here for ONE node so the
 // dispatch guard (task-spor-dispatch-readiness-guard) shares its classification
@@ -7377,6 +7377,16 @@ async function resolveNode(cfg, id) {
   let resolution = null;
   let held = null;
   let inert = null;
+  // `open_findings` (API.md §3) is the same hook's open-gardener-findings
+  // ride-along — every LIVE (non-terminal, non-superseded) finding that
+  // `relates-to` this node, as `[{id, title, summary}]`. Kept so the decline-
+  // finding dispatch guard (task-spor-decline-finding-gates-redispatch) can
+  // refuse without a second fetch: a prior dispatch that DECLINED this node
+  // files a `find-declined-*` finding this way (dispatch-terminal.js's
+  // buildDeclineFinding) instead of resolving it. Absent on an older server
+  // that hasn't shipped the key yet — stays `null` (unknown), and the guard
+  // reads that as "nothing to gate on", never as "confirmed clear".
+  let openFindings = null;
   // `superseded_by` is the same hook's supersession note — a live visible
   // inbound supersedes edge (API.md §3). The no-code-outcome check reads it as
   // one of the three ways an item can read RETIRED (WORKERS.md §10.11), so a
@@ -7389,6 +7399,7 @@ async function resolveNode(cfg, id) {
     resolution = (r.json && r.json.resolution) || null;
     held = (r.json && r.json.held) || null;
     inert = (r.json && typeof r.json.inert === "boolean") ? r.json.inert : null;
+    openFindings = (r.json && Array.isArray(r.json.open_findings)) ? r.json.open_findings : null;
     supersededBy = (r.json && (r.json.superseded_by || r.json.supersededBy)) || null;
   } else {
     try {
@@ -7429,6 +7440,7 @@ async function resolveNode(cfg, id) {
     resolution,
     held,
     inert,
+    openFindings,
   };
 }
 
@@ -7502,6 +7514,38 @@ function dispatchResolutionReason(cfg, node) {
     }
   }
   return null;
+}
+
+// Live DECLINE-finding dispatch guard (task-spor-decline-finding-gates-
+// redispatch): a prior dispatched run that DECLINED this exact node — the
+// item's own premise was wrong, not merely unfinished — files a standing
+// `find-declined-*` finding `relates-to` it instead of resolving it
+// (dispatch-terminal.js's buildDeclineFinding). Nothing upstream of this
+// guard read that finding, so a second dispatch paid the same investigation
+// the first run already recorded. Same two-tier read as
+// dispatchResolutionReason/dispatchReadinessCheck: remote reads the server's
+// `open_findings` enrichment resolveNode already fetched (API.md §3, no extra
+// round trip); local loads the graph (paid for by the sibling guards' own
+// loads) and asks the kernel directly via openFindingsFor, which already
+// excludes anything superseded or terminal (resolved/dismissed) — a finding a
+// person has since judged is no longer LIVE and no longer gates, with no
+// special-casing needed here. Fail-open: an unreadable graph, or an older
+// server that hasn't shipped `open_findings` yet, yields null rather than
+// blocking every node dispatch. Returns the first live decline finding
+// `{id, title, summary}`, or null.
+function dispatchDeclineFindingCheck(cfg, node) {
+  const isDeclineFinding = (f) => f && typeof f.id === "string" && f.id.startsWith("find-declined-");
+  if (cfg.mode() === "remote") {
+    const list = Array.isArray(node.openFindings) ? node.openFindings : [];
+    return list.find(isDeclineFinding) || null;
+  }
+  try {
+    const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+    const g = graphLib.loadGraph(cfg.nodesDir());
+    return openFindingsFor(g, node.id).find(isDeclineFinding) || null;
+  } catch {
+    return null; // fail-open — an unreadable graph never blocks a dispatch
+  }
 }
 
 // Agent-readiness dispatch guard (task-spor-dispatch-readiness-guard, dec-spor-
@@ -9403,6 +9447,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   let nodeDate = "";
   let resolvedReason = null; // set in node mode when the target is already resolved
   let readinessCheck = null; // set in node mode: {readiness, reasons} — the agent-readiness guard
+  let declineFinding = null; // set in node mode: a live find-declined-* finding on the target
 
   if (fromQueue) {
     const top = await topQueueItem(cfg, targetSlug);
@@ -9464,6 +9509,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     nodeDate = node.date || "";
     resolvedReason = dispatchResolutionReason(cfg, node);
     readinessCheck = dispatchReadinessCheck(cfg, node);
+    declineFinding = dispatchDeclineFindingCheck(cfg, node);
     if (!noBrief) brief = await compileBriefing(cfg, { nodeId, full, project: targetSlug });
     instruction = `Work on ${nodeId}${node.title ? ` — ${node.title}` : ""}. The compiled Spor briefing above is your standing context.${taskText ? ` ${taskText}` : ""}`;
     name = name || nodeId;
@@ -9792,6 +9838,18 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     err(`  re-run with --force to dispatch at it anyway, or pick another task with 'spor next'.`);
     return 1;
   }
+  // A prior dispatch already declined this exact node — its premise was wrong,
+  // not merely unfinished — and left the standing finding as a record. Refuse
+  // rather than pay the same investigation again (task-spor-decline-finding-
+  // gates-redispatch); --force overrides, same shape as the resolved guard
+  // above. A finding a person has since resolved/dismissed already dropped out
+  // of dispatchDeclineFindingCheck, so this can only fire on a still-live one.
+  if (!dryRun && declineFinding && !force) {
+    err(`${nodeId} carries a live decline finding (${declineFinding.id}) — a prior dispatch declined this item, not dispatching.`);
+    err(`  ${declineFinding.summary || declineFinding.title || "see the finding for why the premise no longer holds"}`);
+    err(`  re-run with --force to dispatch anyway, or resolve/dismiss ${declineFinding.id} first if the finding no longer holds.`);
+    return 1;
+  }
   if (!dryRun && readinessRequiresHuman) {
     err(`cannot dispatch ${nodeId || name}: this item requires a human — ${readinessCheck.reasons.join(", ")}.`);
     err(`  the assignment is unchanged. A human must do this work (or edit the node's 'requires:' list once`);
@@ -10055,6 +10113,15 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
           (force ? " — --force set, dispatching anyway" : " — real dispatch would refuse (--force overrides)")
       );
     }
+    // Decline-finding guard preview (node mode, any mode): shown only on a hit,
+    // so a clean --print stays byte-identical (task-spor-decline-finding-gates-
+    // redispatch).
+    if (declineFinding) {
+      out(
+        `declined: ${nodeId} carries a live decline finding (${declineFinding.id})` +
+          (force ? " — --force set, dispatching anyway" : " — real dispatch would refuse (--force overrides)")
+      );
+    }
     // Agent-readiness guard preview (shown only when the node's derived
     // readiness is decisively human, so a clean/agent-ready/untriaged --print
     // stays byte-identical). requires:human is the one reason with NO --force
@@ -10132,9 +10199,10 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     return 0;
   }
 
-  // The already-RESOLVED guard and the requires:human agent-readiness guard both
-  // already refused above (before profile resolution) on a real run — nothing
-  // left to check here for those two. The broader `readiness: human`
+  // The already-RESOLVED guard, the decline-finding guard, and the
+  // requires:human agent-readiness guard all already refused above (before
+  // profile resolution) on a real run — nothing left to check here for those.
+  // The broader `readiness: human`
   // classification (assigned to a person, a held task, an open neighborhood
   // question, or the item itself a question/capture) is not a capability gap and
   // was never a refusal — it only WARNS and the dispatch proceeds, so that check
@@ -17275,7 +17343,7 @@ const COMMANDS = {
       "auto-route": { type: "boolean", desc: "when this box can't satisfy the profile, hand the node to a fleet host that can (assigned → host agent, same profile); also dispatch.autoRoute" },
       "no-auto-route": { type: "boolean", desc: "force-disable the auto-route handoff for this dispatch" },
       "allow-person-token": { type: "boolean", desc: "fall back to a person-scoped token when no agent is configured or minting fails (default: hard-fail; also dispatch.allowPersonToken)" },
-      force: { type: "boolean", desc: "dispatch even if the node is already resolved, or an agent for it is in flight here" },
+      force: { type: "boolean", desc: "dispatch even if the node is already resolved, carries a live decline finding, or an agent for it is in flight here" },
       "from-queue": { type: "boolean", desc: "dispatch the top-ranked queue item not already in flight here" },
       backfill: { type: "boolean", desc: "init + enable + launch /spor:backfill (the primitive behind /spor:onboard)" },
       worktree: { type: "boolean", desc: "run the agent in its own git worktree (overrides dispatch.worktree)" },
@@ -17313,12 +17381,14 @@ const COMMANDS = {
       "a worker claim a human-readiness item (WORKERS.md §3). An unknown value\n" +
       "refuses to start the worker.\n\n" +
       "IT ADDS NO GUARDS. Every launch goes through 'spor dispatch --node <id>', so\n" +
-      "already-resolved, requires:human, profile-unsatisfiable-here (never\n" +
-      "substituted), graph-declared launch fields, the same-machine duplicate guard,\n" +
-      "the auto-claim and its nonce, worktree isolation and the terminal-state\n" +
-      "contract all apply exactly as they do one-shot. Selection is the same\n" +
-      "filtered page --from-queue picks from, minus items whose derived readiness is\n" +
-      "human (a worker never claims those) and minus anything already in flight here.\n" +
+      "already-resolved, a live decline finding, requires:human, profile-\n" +
+      "unsatisfiable-here (never substituted), graph-declared launch fields, the\n" +
+      "same-machine duplicate guard, the auto-claim and its nonce, worktree\n" +
+      "isolation and the terminal-state contract all apply exactly as they do\n" +
+      "one-shot. Selection is the same filtered page --from-queue picks from, minus\n" +
+      "items whose derived readiness is human (a worker never claims those), minus\n" +
+      "anything carrying a live decline finding (skipped visibly, same as a policy\n" +
+      "skip — WORKERS.md §3), and minus anything already in flight here.\n" +
       "A refused item is remembered with the refusal's own reason and retried after\n" +
       "--retry-after, so the loop moves down the queue instead of re-refusing one item.\n\n" +
       "TERMINAL, NOT LAUNCHED. A slot frees when the RUN RECORD goes terminal AND its\n" +

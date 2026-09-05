@@ -2328,7 +2328,7 @@ function runAsync(args, env, cwd) {
 // resolved-task guard (issue-spor-type-blind-terminal-status-fallbacks): a
 // non-default node type for the offline seed-registry fallback, and the
 // server-computed `inert` enrichment key.
-function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nodeResolution = null, nodeRequires = null, nodeHeld = null, nodeType = "task", nodeInert = null, releaseStatus = 200 } = {}) {
+function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nodeResolution = null, nodeRequires = null, nodeHeld = null, nodeType = "task", nodeInert = null, nodeOpenFindings = null, releaseStatus = 200 } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     let body = "";
@@ -2343,6 +2343,7 @@ function claimStub({ claimStatus = 200, claimBody = null, nodeStatus = null, nod
         if (nodeResolution) node.resolution = nodeResolution;
         if (nodeHeld) node.held = nodeHeld;
         if (typeof nodeInert === "boolean") node.inert = nodeInert;
+        if (Array.isArray(nodeOpenFindings)) node.open_findings = nodeOpenFindings;
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(node));
         return;
@@ -3232,6 +3233,148 @@ test("dispatch <node-id> --print (local): previews the resolved warning; --force
   assert.match(forced.stdout, /--force set, dispatching anyway/);
   const clean = run(["dispatch", "task-live", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home });
   assert.doesNotMatch(clean.stdout, /resolved:/);
+});
+
+// --- live decline-finding dispatch guard (task-spor-decline-finding-gates-redispatch)
+// A prior dispatched run's final report DECLINED the item (its premise was
+// wrong, not merely unfinished) and dispatch-terminal.js's buildDeclineFinding
+// filed a standing `find-declined-*` finding `relates-to` it instead of a
+// resolver. Nothing upstream used to read that finding, so a second dispatch
+// paid the same investigation. Mirrors the already-resolved guard's shape:
+// node mode, both modes, --force overrides.
+
+function declineFixture() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-decl-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  fs.writeFileSync(
+    path.join(nodes, "task-declined.md"),
+    `---\nid: task-declined\ntype: task\nrepo: demo\nstatus: open\ntitle: A task a prior run declined\nsummary: A task a prior dispatched run declared already fixed elsewhere.\ndate: 2026-06-01\n---\nbody\n`
+  );
+  fs.writeFileSync(
+    path.join(nodes, "find-declined-task-declined-1a2b3c4d.md"),
+    `---\nid: find-declined-task-declined-1a2b3c4d\ntype: finding\nrepo: demo\nstatus: open\ntitle: Declined — task-declined\nsummary: The dispatched run declined the item: already fixed on another branch.\ndate: 2026-06-02\nedges:\n  - {type: relates-to, to: task-declined}\n---\nbody\n`
+  );
+  // A second task whose decline finding has since been RESOLVED by a person —
+  // no longer LIVE, so it must not gate.
+  fs.writeFileSync(
+    path.join(nodes, "task-declined-then-judged.md"),
+    `---\nid: task-declined-then-judged\ntype: task\nrepo: demo\nstatus: open\ntitle: A task whose decline finding a person already judged\nsummary: A task whose prior decline finding a person has since resolved.\ndate: 2026-06-01\n---\nbody\n`
+  );
+  fs.writeFileSync(
+    path.join(nodes, "find-declined-task-declined-then-judged-9e8f7a6b.md"),
+    `---\nid: find-declined-task-declined-then-judged-9e8f7a6b\ntype: finding\nrepo: demo\nstatus: resolved\ntitle: Declined — task-declined-then-judged\nsummary: The dispatched run declined the item — a person has since judged the finding.\ndate: 2026-06-02\nedges:\n  - {type: relates-to, to: task-declined-then-judged}\n---\nbody\n`
+  );
+  // A genuinely-open control with no decline finding at all.
+  fs.writeFileSync(
+    path.join(nodes, "task-no-decline.md"),
+    `---\nid: task-no-decline\ntype: task\nrepo: demo\nstatus: open\ntitle: A genuinely open task with no decline finding\nsummary: A task with no finding pointing at it, fully dispatchable.\ndate: 2026-06-01\n---\nbody\n`
+  );
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-repo-"));
+  return { home, nodes, repo };
+}
+
+test("dispatch <node-id> (local): a live decline finding refuses, naming the finding id, no launch", () => {
+  const { home, repo } = declineFixture();
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "task-declined", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  assert.strictEqual(r.status, 1, r.stderr);
+  assert.match(r.stderr, /task-declined carries a live decline finding \(find-declined-task-declined-1a2b3c4d\)/);
+  assert.match(r.stderr, /already fixed on another branch/);
+  assert.match(r.stderr, /--force/); // the override is suggested
+  assert.ok(!fs.existsSync(sentinel), "no agent was launched over a live decline finding");
+});
+
+test("dispatch <node-id> --force (local): launches despite a live decline finding", async () => {
+  const { home, repo } = declineFixture();
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "task-declined", "--dir", repo, "--no-brief", "--force"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(await waitForFile(sentinel), "the agent launched with --force");
+});
+
+test("dispatch <node-id> (local): a RESOLVED decline finding is no longer live and does not gate", async () => {
+  const { home, repo } = declineFixture();
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "task-declined-then-judged", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(await waitForFile(sentinel), "a resolved finding no longer gates — a person already judged it");
+});
+
+test("dispatch <node-id> (local): a node with no decline finding is byte-identical (dispatches normally)", async () => {
+  const { home, repo } = declineFixture();
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "task-no-decline", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(await waitForFile(sentinel), "no finding at all dispatches exactly as before");
+});
+
+test("dispatch <node-id> --print (local): previews the decline finding; --force flips it; clean run prints none", () => {
+  const { home, repo } = declineFixture();
+  const r = run(["dispatch", "task-declined", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /declined: task-declined carries a live decline finding \(find-declined-task-declined-1a2b3c4d\)/);
+  assert.match(r.stdout, /real dispatch would refuse/);
+  const forced = run(["dispatch", "task-declined", "--dir", repo, "--no-brief", "--print", "--force"], { SPOR_HOME: home });
+  assert.match(forced.stdout, /--force set, dispatching anyway/);
+  const clean = run(["dispatch", "task-no-decline", "--dir", repo, "--no-brief", "--print"], { SPOR_HOME: home });
+  assert.doesNotMatch(clean.stdout, /declined:/);
+});
+
+test("dispatch <node-id> (remote): a server `open_findings` decline entry refuses, naming the finding id", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({
+    nodeOpenFindings: [{ id: "find-declined-task-rotate-1a2b3c4d", title: "Declined — task-rotate", summary: "Already fixed on another branch." }],
+  });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 1, r.stderr);
+    assert.match(r.stderr, /task-rotate carries a live decline finding \(find-declined-task-rotate-1a2b3c4d\)/);
+    assert.ok(!claimHit(hits), "no claim POST for a node the server flags as live-declined");
+    assert.ok(!fs.existsSync(sentinel), "no launch");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch <node-id> --force (remote): launches despite the server reporting a live decline finding", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({
+    nodeOpenFindings: [{ id: "find-declined-task-rotate-1a2b3c4d", summary: "Already fixed on another branch." }],
+  });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief", "--force"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(claimHit(hits), "--force proceeds to the normal claim flow");
+    assert.ok(await waitForFile(sentinel), "and launches");
+  } finally {
+    srv.close();
+  }
+});
+
+test("dispatch <node-id> (remote): a non-decline open finding (e.g. a gardener stale-anchor) does not gate", async () => {
+  const { home, repo } = fixture();
+  const { srv, hits, base } = await claimStub({
+    nodeOpenFindings: [{ id: "find-stale-anchor-task-rotate-1a2b3c4d", summary: "An anchor rotted." }],
+  });
+  const sentinel = path.join(home, "launched");
+  const stub = claudeStub(home, sentinel);
+  try {
+    const r = await runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_CLAUDE_CMD: stub }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(claimHit(hits), "only a find-declined-* finding gates, not any open finding");
+    assert.ok(await waitForFile(sentinel));
+  } finally {
+    srv.close();
+  }
 });
 
 // issue-spor-dispatch-offline-check-graph-load-order: the LOCAL-mode guard
