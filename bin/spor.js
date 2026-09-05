@@ -8387,6 +8387,34 @@ function worktreeDeclaredEnv(dir) {
   }
 }
 
+// `git status --porcelain` (plain) never lists ignored paths at all — that's
+// its documented default, not a bug — so a genuinely gitignored `.env` or a
+// build/ directory holding real generated output that a worktreeSetup hook
+// (or the agent's own run) left behind reads as "clean" to the check below
+// and would be silently destroyed by the removal it's meant to gate
+// (issue-spor-remove-dispatch-worktree-safety-gaps). `--ignored=matching`
+// surfaces those paths too; a path that IS a symlink is exempted — the
+// common case is a worktreeSetup hook symlinking `node_modules` (or similar)
+// into the tree, where only the pointer lives in this worktree and removing
+// it destroys nothing. `-z` avoids porcelain's quoting of unusual filenames.
+// Returns the first unsafe path found, or null if there's nothing to protect.
+function worktreeUnsafeIgnoredPath(dir) {
+  const res = git(dir, ["status", "--porcelain=1", "-z", "--ignored=matching"]);
+  if (res.status !== 0) return "(could not check for ignored content)";
+  for (const entry of (res.stdout || "").split("\0")) {
+    if (!entry.startsWith("!! ")) continue;
+    const rel = entry.slice(3).replace(/[/\\]+$/, "");
+    if (!rel) continue;
+    try {
+      if (fs.lstatSync(path.join(dir, rel)).isSymbolicLink()) continue;
+    } catch {
+      continue; // vanished between status and stat — nothing left to protect
+    }
+    return rel;
+  }
+  return null;
+}
+
 // Best-effort teardown of a worktree WE just created (setup-hook failure path):
 // never strand a half-prepped worktree + branch. A reused worktree is left
 // untouched (it predates this dispatch) — the call site checks wt.created
@@ -8396,9 +8424,10 @@ function worktreeDeclaredEnv(dir) {
 // class of bug (a cleanup routine hard-resetting a DIFFERENT active worktree):
 // this is a destructive removal, so before touching anything it refuses
 // unless (a) `dir` is genuinely a worktree of `repoDir` (its --git-common-dir
-// resolves back to repoDir, the same test inferenceRoot() uses) and (b) it has
-// no uncommitted changes. The one call site today always passes the exact
-// {dir, branch} it just created, so neither check should ever fire in
+// resolves back to repoDir, the same test inferenceRoot() uses), (b) it has
+// no uncommitted changes, and (c) it carries no unsafe ignored content (see
+// worktreeUnsafeIgnoredPath above). The one call site today always passes the
+// exact {dir, branch} it just created, so none of these should ever fire in
 // practice — but a future caller mistake, or an external process pointed at
 // the wrong path, must be refused rather than silently forced. Returns
 // { removed: true } or { removed: false, reason }.
@@ -8418,10 +8447,29 @@ function removeDispatchWorktree(repoDir, dir, branch) {
   if (status.status !== 0 || (status.stdout || "").trim()) {
     return { removed: false, reason: `${dir} has uncommitted changes — refusing to remove` };
   }
+  const unsafeIgnored = worktreeUnsafeIgnoredPath(dir);
+  if (unsafeIgnored) {
+    return { removed: false, reason: `${dir} has untracked ignored content (${unsafeIgnored}) — refusing to remove` };
+  }
   // The branch IS the node id for a node dispatch (worktreeName), which is
   // what the hook's SPOR_DISPATCH_NODE carried on the way in.
   runWorktreeTeardownHook(dir, { repoDir, nodeId: branch || null, stdio: "pipe", role: "dispatch" });
-  git(repoDir, ["worktree", "remove", "--force", dir]);
+  // Deliberately NOT --force: `git worktree remove` runs its own dirty check
+  // (modified tracked files, or untracked-and-not-ignored files) as part of
+  // the SAME operation that deletes the tree, so there is no separate
+  // check-then-delete window left for a concurrent writer to land new work
+  // into before the delete lands — the TOCTOU half of
+  // issue-spor-remove-dispatch-worktree-safety-gaps. The manual status check
+  // above is now only a fast, clearly-worded early refusal; git's own atomic
+  // check at delete time is the actual gate, and a race that slips past the
+  // early check still gets caught here. A refusal is surfaced as the same
+  // "uncommitted changes" reason rather than retried with --force, which
+  // would just recreate the vulnerability this function exists to close.
+  const rm = git(repoDir, ["worktree", "remove", dir]);
+  if (rm.status !== 0) {
+    const detail = (rm.stderr || rm.stdout || "").trim();
+    return { removed: false, reason: `${dir} has uncommitted changes — refusing to remove${detail ? ` (${detail})` : ""}` };
+  }
   if (branch) git(repoDir, ["branch", "-D", branch]);
   return { removed: true };
 }

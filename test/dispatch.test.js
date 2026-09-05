@@ -922,6 +922,70 @@ test("dispatch worktree setup hook leaves uncommitted changes then fails: worktr
   );
 });
 
+// issue-spor-remove-dispatch-worktree-safety-gaps: plain `git status
+// --porcelain` never lists ignored paths at all, so a genuinely gitignored
+// file (a real .env, real build output) was invisible to the old dirty
+// check and got silently destroyed by the force-remove below it. Refuse on
+// that too, not just tracked/untracked-non-ignored changes.
+test("dispatch worktree setup hook writes real ignored content then fails: worktree is left in place, not force-removed", () => {
+  const { home } = fixture();
+  const { repo, g } = gitTargetRepo();
+  fs.writeFileSync(path.join(repo, ".gitignore"), "secret.env\n");
+  g(["add", ".gitignore"]);
+  g(["commit", "-q", "-m", "gitignore"]);
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const ignoredFailHook = writeSpawnableNodeStub(
+    home,
+    "ignored-fail",
+    'require("node:fs").writeFileSync("secret.env", "sekrit"); process.exit(3);'
+  );
+  setDispatch(home, { worktree: true, worktreeSetup: ignoredFailHook });
+  const mark = path.join(home, "launched.mark");
+  const stub = recordingStub(home);
+  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
+  assert.notStrictEqual(r.status, 0, "non-zero exit on setup failure");
+  assert.match(r.stderr, /setup hook failed/);
+  assert.match(r.stderr, /could not remove the half-prepped worktree.*untracked ignored content/s);
+  assert.ok(!fs.existsSync(mark), "agent never launched");
+  const wtDir = path.join(repo, ".claude", "worktrees", "dec-x");
+  assert.ok(fs.existsSync(wtDir), "worktree with real ignored data left in place, not force-removed");
+  assert.ok(fs.existsSync(path.join(wtDir, "secret.env")), "the ignored file survives");
+  assert.strictEqual(
+    g(["rev-parse", "--verify", "--quiet", "refs/heads/dec-x"]).trim().length,
+    40,
+    "branch left in place too"
+  );
+});
+
+// A worktreeSetup hook symlinking node_modules (or similar) into an ignored
+// path is the common, harmless case: only the pointer lives in the worktree,
+// so its removal must NOT be blocked the way real ignored content is above.
+test("dispatch worktree setup hook symlinks into an ignored path then fails: the symlink alone doesn't block removal", () => {
+  const { home } = fixture();
+  const { repo, g } = gitTargetRepo();
+  fs.writeFileSync(path.join(repo, ".gitignore"), "node_modules\n");
+  g(["add", ".gitignore"]);
+  g(["commit", "-q", "-m", "gitignore"]);
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const externalTarget = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-nm-"));
+  const symlinkFailHook = writeSpawnableNodeStub(
+    home,
+    "symlink-fail",
+    `require("node:fs").symlinkSync(${JSON.stringify(externalTarget)}, "node_modules"); process.exit(3);`
+  );
+  setDispatch(home, { worktree: true, worktreeSetup: symlinkFailHook });
+  const mark = path.join(home, "launched.mark");
+  const stub = recordingStub(home);
+  const r = run(["dispatch", "dec-x", "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub, LAUNCH_MARK: mark });
+  assert.notStrictEqual(r.status, 0, "non-zero exit on setup failure");
+  assert.match(r.stderr, /setup hook failed/);
+  assert.ok(!fs.existsSync(mark), "agent never launched");
+  const wtDir = path.join(repo, ".claude", "worktrees", "dec-x");
+  assert.ok(!fs.existsSync(wtDir), "worktree removed despite the ignored node_modules symlink");
+  const branchCheck = spawnSync("git", ["-C", repo, "rev-parse", "--verify", "--quiet", "refs/heads/dec-x"], { encoding: "utf8" });
+  assert.notStrictEqual(branchCheck.status, 0, "branch removed too");
+});
+
 // --- ambient git location env (issue-spor-dispatch-worktree-wrong-repo-location) --
 // Git resolves its repo from GIT_DIR/GIT_WORK_TREE BEFORE it discovers one from
 // the working directory, so a dispatch launched with those vars set — from a git
