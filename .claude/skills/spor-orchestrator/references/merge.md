@@ -85,13 +85,34 @@ id, sanitized by dispatch).
    deterministic gate — is the token-for-quality trade.
 
 4. **CAS merge.** Fast-forward `main` to the rebased branch tip, but only if main
-   is still where you tested:
+   is still where you tested — AND only if the new tip actually descends from
+   it. The ancestry check is **mandatory**, never skip it:
 
    ```bash
    OLD=$(git rev-parse main)
    NEW=$(git -C <worktree> rev-parse HEAD)     # rebased branch tip
+   git merge-base --is-ancestor "$OLD" "$NEW" || { echo "REFUSE: $NEW does not descend from $OLD — rebase first"; exit 1; }
+   git log main.."$NEW"   # sanity check by eye: should list only THIS branch's own commits
    git update-ref refs/heads/main "$NEW" "$OLD"  # fails if main moved
    ```
+
+   `update-ref <ref> <new> <old>` only asserts that `main` is **still at**
+   `$OLD` — it says nothing about whether `$NEW` is actually a *descendant* of
+   `$OLD`. If step 1's rebase was skipped or landed on the wrong base, `$NEW`
+   can be built from a stale ancestor of `$OLD`; the CAS still succeeds (main
+   really was at `$OLD`) but the swap silently **rewinds** main, dropping every
+   commit landed since `$NEW`'s base — with no error, because `update-ref`
+   never checked. This happened for real: a wave-7 merge subagent CAS'd spor
+   `main` from `68b944e` to `9cb447a` (a tip based on `8ebb3b6`, six commits
+   behind `68b944e`) without rebasing, and main silently lost those six
+   wave-6 commits until the orchestrator noticed and re-CAS'd
+   (issue-spor-orchestrator-merge-cas-lacks-ancestry-check). `git merge-base
+   --is-ancestor "$OLD" "$NEW"` exits 0 only when `$OLD` is an ancestor of
+   `$NEW`; a non-zero exit means the rebase either didn't happen or targeted
+   the wrong base — **REFUSE and go back to step 1, never swap anyway.** The
+   `git log main.."$NEW"` line is the same check by eye: it should list only
+   commits you recognize as this branch's own, never commits from someone
+   else's wave.
 
    If `update-ref` fails, main moved under you: go back to step 1 (re-rebase onto
    the new main) and retry. This loop is the whole point — it's safe under

@@ -1483,6 +1483,23 @@ test("landCandidate CAS-lands locally with git update-ref, and reports a LOST RA
   built2.cleanup();
 });
 
+// issue-spor-orchestrator-merge-cas-lacks-ancestry-check: `update-ref <ref>
+// <new> <old>` only asserts the ref is still at <old> — it never checks that
+// <new> descends from it. `integrationRepo()`'s `branch` was cut from main's
+// FIRST commit and never rebased onto main's later "main moved" commit, so it
+// is exactly the "skipped the rebase" shape that rewound main for real.
+test("landCandidate REFUSES to land locally when the candidate does not descend from the observed target tip (ancestry guard)", () => {
+  const dir = integrationRepo();
+  const expectedSha = git(dir, "rev-parse", "main").trim();
+  const staleSha = git(dir, "rev-parse", "branch").trim(); // never rebased onto main
+
+  const landed = integrationRunner.landCandidate({ top: dir, dir, sha: staleSha, expectedSha, targetRef: "main", mode: "local" });
+  assert.strictEqual(landed.ok, false);
+  assert.strictEqual(landed.race, false, "a non-descendant candidate is a refusal, not a lost race to silently retry");
+  assert.match(landed.reason, /does not descend/);
+  assert.strictEqual(git(dir, "rev-parse", "main").trim(), expectedSha, "main was NOT rewound — update-ref never ran");
+});
+
 // issue-spor-integration-landed-sha-pre-restoration: forceProtectedPaths only
 // rewrites the candidate worktree's WORKING DIRECTORY — buildCandidateTree's
 // own `sha` still names the pre-restoration commit. This pins the actual bug:
