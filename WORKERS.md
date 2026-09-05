@@ -1155,9 +1155,17 @@ the ledger:
 Unstated reads as `correctness` (only the unmet reading short-circuits the
 budget, so the default must not be the short-circuit), a `prior` answer may
 RECLASSIFY a carried finding by carrying `category`, and silence on a prior
-entry leaves the ledger's category alone. Pass/fail is untouched: an unmet
-condition blocks on exactly the same demonstrated-only terms as anything else,
-and the tag rides the fact and the fixer's prompt (`[blocking,
+entry leaves the ledger's category alone. **An upgrade by id inherits the
+entry's category** the same way — a finding raised undemonstrated as an unmet
+condition and demonstrated on a later cycle is still one, and a review that
+restates no category has not reclassified it. Only the two vocabularies count
+as a statement (`gates.findingCategory`, matched exactly); a `category` in
+neither — an echo of the verdict shape's own `"correctness|unmet-condition"`
+placeholder, a word nobody taught the parser — is read as no statement at all,
+so it can never reclassify a carried finding by accident. Pass/fail is
+untouched: an unmet condition blocks on exactly the same demonstrated-only
+terms as anything else, and the tag rides the fact, the prior/undemonstrated
+lines of the review prompt, and the fixer's prompt (`[blocking,
 unmet-condition]`) the way `row-by-row` does.
 
 Both prompts change with it. The reviewer is told the two are answered

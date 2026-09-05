@@ -11004,11 +11004,26 @@ function makeGateDeps(
       )
       .join("\n");
     const raisedText = raised
-      .map((p) => `${p.id} [${p.severity}, undemonstrated at cycle ${p.opened}] ${p.file ? `${p.file} — ` : ""}${p.summary}`)
+      // The category rides this line for the same reason it rides `priorText`:
+      // an upgrade by id INHERITS it, so the reviewer must be able to see the
+      // one it is about to keep (F1 on the fourth cut of this gate).
+      .map(
+        (p) =>
+          `${p.id} [${p.severity}${gatesKernel.categoryOf(p) === gatesKernel.UNMET_CONDITION ? `, ${gatesKernel.UNMET_CONDITION}` : ""}, undemonstrated at cycle ${p.opened}] ${p.file ? `${p.file} — ` : ""}${p.summary}`
+      )
       .join("\n");
     const verdictShape =
       `{"verdict": "pass" | "changes_requested",` +
-      (prior.length ? ` "prior": [{"id": "${prior[0].id}", "status": "resolved" | "open", "note": "what you checked", "rows": ["each remaining row of the mechanism, when open"]}],` : "") +
+      // `category` is on the prior shape because the prose below tells the
+      // reviewer to reclassify a carried finding with it (F2 on the fourth cut
+      // of this gate: the field was asked for and never shown). It is the one
+      // OPTIONAL key here — omitting it keeps the finding's recorded category,
+      // which is what a reviewer that is not reclassifying wants — so it is
+      // labelled as such, and the parser reads only the two category words, so
+      // an echo of this template reclassifies nothing.
+      (prior.length
+        ? ` "prior": [{"id": "${prior[0].id}", "status": "resolved" | "open", "note": "what you checked", "rows": ["each remaining row of the mechanism, when open"], "category": "correctness|unmet-condition — OPTIONAL, only to RECLASSIFY it; omit to keep the one it has"}],`
+        : "") +
       ` "findings": [{"severity": "blocking|major|minor", "category": "correctness|unmet-condition", "file": "path", "summary": "what is wrong", "evidence": "the command/test you ran and what it showed"` +
       (cycle > 0 ? `, "introduced_by_fix": true | false` : "") +
       `}]}`;
@@ -11096,7 +11111,9 @@ function makeGateDeps(
       "materially different attempt at the thing, or by a person re-scoping the item — never by more evidence that it",
       `is unmet, so once one has been carried ${gatesKernel.UNMET_CONDITION_CARRY} fix cycles the runner stops dispatching fixes at it and routes the`,
       "refusal to the rescue lane or a person. To reclassify a prior finding you already raised, put `category` on its",
-      "`prior` entry. A finding you rate `unmet-condition` blocks on exactly the same terms as any other: only if you",
+      "`prior` entry; omit it and the finding keeps the category it has, which is what you want when you are only",
+      "confirming it. Naming one of the two earlier findings by id, to demonstrate it, likewise keeps the category it",
+      "was raised under unless you restate one. A finding you rate `unmet-condition` blocks on exactly the same terms as any other: only if you",
       "DEMONSTRATE it — `evidence` naming what you ran and what it showed against the item's condition.",
       "",
       "A fix that ARGUES the condition is unattainable — a doc verdict, a test pinning the miss, a second measurement",

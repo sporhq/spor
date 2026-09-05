@@ -3420,6 +3420,11 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.match(p1, /once one has been carried 2 fix cycles the runner stops dispatching fixes at it/);
   assert.match(p1, /accepting a re-scope is not a reviewer's call/);
   assert.doesNotMatch(p1, /recorded as an UNMET DONE CONDITION/, "nothing on this ledger is one yet");
+  // F2 on the fourth cut of this gate: the prose tells the reviewer to
+  // reclassify with `category` on a `prior` entry, so the REQUIRED shape shows
+  // the field — labelled optional, since omitting it keeps the recorded one.
+  assert.match(p1, /"prior": \[\{"id": "F1"[^\n]*"category": "correctness\|unmet-condition — OPTIONAL, only to RECLASSIFY it; omit to keep the one it has"\}\]/);
+  assert.match(p1, /omit it and the finding keeps the category it has/);
 
   // Review 3: F1 has survived two fixes — the prompt says so, replays the
   // rows the last review enumerated, and makes `rows` required for it.
@@ -3435,6 +3440,13 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
       // is told what a second confirmation of it costs.
       { id: "F6", severity: "blocking", category: "unmet-condition", file: "p.md", summary: "the budget the item asks for is not met", opened: 2 },
     ],
+    // Two undemonstrated entries the review may re-raise by id. An upgrade
+    // INHERITS the entry's category, so the line shows it (F1 on the fourth
+    // cut of this gate — the inheritance was silently reading `correctness`).
+    raised: [
+      { id: "F7", severity: "blocking", file: "q.md", summary: "the deliverable was not attempted", opened: 1, category: "unmet-condition" },
+      { id: "F8", severity: "blocking", file: "w.js", summary: "loses the last write", opened: 1, category: "correctness" },
+    ],
     fix: { cycle: 1, runId: "fix-run-2", fromHead: head0, toHead: head1, findings: [{ id: "F1", blocking: true }] },
   });
   assert.strictEqual(third.ok, true, third.reason);
@@ -3447,6 +3459,8 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   assert.match(p2, /F6 is recorded as an UNMET DONE CONDITION — a scope dispute, not a defect\./);
   assert.match(p2, /ENDS this gate's fix cycles: no further implementer is\ndispatched at it and the refusal goes to the rescue lane or to a person/);
   assert.match(p2, /Confirm it open anyway if the condition is still unmet/);
+  assert.match(p2, /F7 \[blocking, unmet-condition, undemonstrated at cycle 1\] q\.md — the deliverable was not attempted/);
+  assert.match(p2, /F8 \[blocking, undemonstrated at cycle 1\] w\.js — loses the last write/);
 
   // And the fix prompt names the findings by id, splits advisory from blocking,
   // and lists what earlier cycles already resolved.
