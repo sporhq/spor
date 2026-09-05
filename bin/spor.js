@@ -12558,9 +12558,14 @@ function makeGateDeps(
       "```",
       `Use "pass" only when nothing blocking remains${prior.length ? " — including every prior finding you confirmed" : ""}. An unreadable verdict counts as changes_requested.`,
     ].join("\n");
+    // "no-auto-route": a free-text review dispatch names no `node:`, so today's
+    // auto tier can't act on it anyway (it only re-routes a NODE dispatch) —
+    // but the flag rides here too, explicitly, so this stays true if the
+    // profile ever resolves against the work item's node in the future
+    // (issue-spor-auto-route-reaches-fix-cycle-and-rescue-dispatches).
     const launched = await dispatch(
       cfg,
-      { ...reviewPassthrough(passthrough), profile: gate.profile, dir: change.cwd, "no-brief": true, "no-worktree": true, "read-only": true, name: `gate-${gate.id}-${keysFor(rescue).short}-${cycle}` },
+      { ...reviewPassthrough(passthrough), profile: gate.profile, dir: change.cwd, "no-brief": true, "no-worktree": true, "read-only": true, "no-auto-route": true, name: `gate-${gate.id}-${keysFor(rescue).short}-${cycle}` },
       [prompt]
     );
     if (!launched.ok) return { ok: false, reason: `the review under ${gate.profile} could not be dispatched: ${launched.reason}` };
@@ -12728,7 +12733,12 @@ function makeGateDeps(
       // round-trip a DIRTY tree gets (gate-runner.js runGatePipeline) runs
       // before any change set exists, and it has to land in the run's own
       // checkout — a fresh worktree would never see the uncommitted files.
-      { ...passthrough, node: entry.node_id, dir: change ? change.cwd : (record && record.cwd) || undefined, force: true, "no-worktree": true, name: fixName },
+      // "no-auto-route": a pipeline-internal dispatch never re-routes
+      // (issue-spor-auto-route-reaches-fix-cycle-and-rescue-dispatches) — this
+      // worker already holds the lease and the gate on entry.node_id, so a
+      // standing dispatch.autoRoute must not hand it to another box mid-fix; an
+      // unsatisfiable lane profile here stays a refusal the runner escalates.
+      { ...passthrough, node: entry.node_id, dir: change ? change.cwd : (record && record.cwd) || undefined, force: true, "no-worktree": true, "no-auto-route": true, name: fixName },
       [prompt]
     );
     if (!launched.ok) return { ok: false, reason: launched.reason };
@@ -12998,7 +13008,13 @@ function makeGateDeps(
             ` runs unattended with ${appliedFlags} — that harness stalls on its first write without it.`
         );
       }
-      values = { ...shaped.values, profile: lane.profile, node: entry.node_id, dir: cwd, force: true, "no-worktree": true, name };
+      // "no-auto-route": this worker holds the lease and the gate on
+      // entry.node_id for the DURATION of the rescue — a standing
+      // dispatch.autoRoute must not hand it to another box because the
+      // rescue's lane profile is unsatisfiable here
+      // (issue-spor-auto-route-reaches-fix-cycle-and-rescue-dispatches); that
+      // stays a refusal the runner escalates through the rescue's own path.
+      values = { ...shaped.values, profile: lane.profile, node: entry.node_id, dir: cwd, force: true, "no-worktree": true, "no-auto-route": true, name };
       // Fail-soft and silent: where the exclude cannot be written (not a git
       // checkout, an unwritable info/exclude) the gates' own untracked-residue
       // tolerance is the backstop.
@@ -13791,7 +13807,12 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
     // Adopt a fix this stage already launched at this cycle (see the gate
     // deps' fix closure) rather than dispatching it twice.
     const already = launchedFixRun(home, entry.node_id, fixName);
-    const launched = already ? { ok: true, run: already, adopted: true } : await dispatch(cfg, { ...passthrough, node: entry.node_id, dir: record ? record.cwd : undefined, force: true, "no-worktree": true, name: fixName }, [prompt]);
+    // "no-auto-route": the SAME pipeline-internal guard the gate deps' `fix`
+    // and `rescue` carry (issue-spor-auto-route-reaches-fix-cycle-and-rescue-
+    // dispatches) — the integration stage holds entry.node_id's lease for the
+    // duration of its own fix cycle, so a standing dispatch.autoRoute must not
+    // re-route it either.
+    const launched = already ? { ok: true, run: already, adopted: true } : await dispatch(cfg, { ...passthrough, node: entry.node_id, dir: record ? record.cwd : undefined, force: true, "no-worktree": true, "no-auto-route": true, name: fixName }, [prompt]);
     if (!launched.ok) return { ok: false, reason: launched.reason };
     if (launched.adopted) log(`work: integration fix cycle ${cycle} on ${entry.node_id} was already launched as run ${String(launched.run.run_id).slice(0, 8)} — adopting it, not dispatching again`);
     dispatchRuns.stampGateState(home, entry.run_id, { gate_fix_run_id: launched.run.run_id, gate_fix_at: new Date().toISOString(), gate_fix_gate: "integration", gate_fix_cycle: cycle });

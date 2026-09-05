@@ -2765,6 +2765,78 @@ test("a fix cycle's run id is stamped onto the pipeline's own run BEFORE the lon
   await fixOutcome;
 });
 
+// issue-spor-auto-route-reaches-fix-cycle-and-rescue-dispatches: a standing
+// dispatch.autoRoute reaches EVERY dispatch that passes `node:`, and the gate's
+// own fix cycle and rescue lane both do — so a mid-pipeline unsatisfiable
+// profile (a lane profile this box lacks) would have handed entry.node_id to a
+// fleet host while THIS worker still holds its lease and its gate. Both
+// dispatches now carry an explicit "no-auto-route" marker that forces
+// cmdDispatch's `autoRoute` to false regardless of the standing config
+// (cmdDispatch: `values["no-auto-route"] ? false : ...`, already exercised by
+// "dispatch --auto-route: dispatch.autoRoute config arms it, --no-auto-route
+// opts one run back out" in dispatch.test.js) — so an unsatisfiable profile
+// here stays a refusal the runner escalates, never a hand-off.
+test("the gate's fix-cycle and rescue dispatches carry no-auto-route — a standing dispatch.autoRoute never re-routes work this pipeline still holds the lease and gate on", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-no-auto-route-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, "nodes", "profile-claude-fable.md"),
+    "---\nid: profile-claude-fable\ntype: profile\ntitle: The strong-model rescue profile\nharness: claude-code\nsummary: The strong-model rescue profile.\ndate: 2026-09-05\n---\n\nThe rescue lane's profile.\n"
+  );
+  // dispatch.autoRoute standing ON, as if the box (or a committed repo
+  // .spor.json, dec-spor-auto-route-not-in-repo-forbidden-paths) armed it for
+  // ordinary dispatches — the pipeline-internal ones below must not inherit it.
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { autoRoute: true } }));
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  assert.strictEqual(cfg.getBool("dispatch.autoRoute", false), true, "the standing config is actually armed for this test");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  const runId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, { run_id: runId, node_id: "task-demo", state: "running", created_at: new Date().toISOString() });
+
+  const dispatchCalls = [];
+  const factory = { id: "factory-test", rescue: { profile: "profile-claude-fable", attempts: 1, awaitMs: 5000 } };
+  const deps = sporCli.makeGateDeps(cfg, {
+    record: { node_id: "task-demo", cwd: home },
+    entry: { run_id: runId, node_id: "task-demo", project: null },
+    factory,
+    slug: null,
+    passthrough: {},
+    warn: () => {},
+    log: () => {},
+    stopping: () => false,
+    home,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    dispatch: async (_cfg, values, positionals) => {
+      dispatchCalls.push({ ...values, prompt: positionals[0] });
+      // No run record written: `pollWorkRuns` reads a run id it never heard of
+      // as immediately terminal ("missing"), so `awaitGateRun` resolves on its
+      // first check — nothing here is exercising the run's own outcome.
+      return { ok: true, run: { run_id: `run-${dispatchCalls.length}`, harness: "fake" } };
+    },
+  });
+
+  await deps.fix({ gate: { id: "acceptance" }, cycle: 0, findings: [], detail: "the suite fails", evidence: "" });
+  await deps.rescue({
+    gate: { id: "acceptance", kind: "command" },
+    attempt: 1,
+    detail: "the fix cycles are spent",
+    evidence: "",
+    findings: [],
+    attempts: [],
+    ledger: [],
+    fact: "art-gate-x",
+    facts: ["art-gate-x"],
+    previous: [],
+  });
+
+  assert.strictEqual(dispatchCalls.length, 2, "one fix-cycle dispatch, one rescue dispatch");
+  assert.strictEqual(dispatchCalls[0].node, "task-demo", "the fix cycle is a NODE dispatch — exactly the shape the auto tier acts on");
+  assert.strictEqual(dispatchCalls[0]["no-auto-route"], true, "the fix cycle must force auto-route off despite the standing config");
+  assert.strictEqual(dispatchCalls[1].node, "task-demo", "the rescue is a NODE dispatch too");
+  assert.strictEqual(dispatchCalls[1]["no-auto-route"], true, "the rescue must force auto-route off despite the standing config");
+});
+
 // Review finding 4 on the third cut: a worker killed after the fix cycle's
 // dispatch returned but before its launch was durably recorded — between the
 // launch and the `gate_fix_run_id` stamp, or between that stamp and the
