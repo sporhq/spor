@@ -5201,31 +5201,96 @@ test("makeGateDeps files an off-diff flake as a per-FILE issue in the test lane,
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-// The read behind F10: a gate fact whose write door reported the id already
-// OCCUPIED did not land this markdown, so whether the occurrence edges it was
-// carrying are on the graph is a question only a read answers. Three answers,
-// and "could not look" is its own — never collapsed into "names nothing".
-test("makeGateDeps reads back what an already-occupied fact id points at — and a read it could not make settles nothing", async () => {
+// The read behind F10/F14: a gate fact whose write door reported the id
+// already OCCUPIED did not land this markdown, so BOTH of what follows are
+// questions only a read answers — is the node under that deterministic id
+// this record at all, and which of the occurrence edges it was carrying are
+// on it. Three answers, and "could not look" is its own — never collapsed
+// into "names nothing".
+test("makeGateDeps reads back an already-occupied fact id — its verdict, its TYPED edges — and a read it could not make settles nothing", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-fact-edges-"));
   fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
   const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
   const deps = flakeDeps(cfg, home);
-  fs.writeFileSync(
-    path.join(home, "nodes", "art-gate-occupied.md"),
-    ["---", "id: art-gate-occupied", "type: artifact", "title: t", "summary: s", "date: 2026-09-05", "edges:", "  - {type: relates-to, to: task-p}", "  - {type: relates-to, to: issue-flake-one}", "---", "", "body", ""].join("\n")
-  );
-  assert.deepStrictEqual(await deps.factEdges({ id: "art-gate-occupied" }), { ok: true, targets: ["task-p", "issue-flake-one"] });
+  const fact = (title, edges) =>
+    ["---", "id: art-gate-occupied", "type: artifact", `title: ${title}`, "summary: s", "date: 2026-09-05", "edges:", ...edges, "---", "", "body", ""].join("\n");
+  const occupant = fact("Gate acceptance — failed on task-demo", [
+    "  - {type: relates-to, to: task-p}",
+    "  - {type: relates-to, to: issue-flake-one}",
+    // A NON-occurrence edge at the same issue: it names it, it does not
+    // record an occurrence of it (F14).
+    "  - {type: mentions, to: issue-flake-two}",
+  ]);
+  fs.writeFileSync(path.join(home, "nodes", "art-gate-occupied.md"), occupant);
+
+  // The occupant IS this record — same verdict, same item — and its edges come
+  // back TYPED, so the runner can tell the occurrence from the mention.
+  assert.deepStrictEqual(await deps.readFact({ id: "art-gate-occupied", markdown: occupant }), {
+    ok: true,
+    same: true,
+    edges: [
+      { type: "relates-to", to: "task-p" },
+      { type: "relates-to", to: "issue-flake-one" },
+      { type: "mentions", to: "issue-flake-two" },
+    ],
+  });
+
+  // Same id, a DIFFERENT verdict under it: the check-then-write race. This
+  // markdown did not land and the graph says something else about this gate
+  // run, so the record is not ours to claim.
+  const mine = fact("Gate acceptance — passed on task-demo", ["  - {type: relates-to, to: task-p}"]);
+  assert.strictEqual((await deps.readFact({ id: "art-gate-occupied", markdown: mine })).same, false, "a different verdict under our id is not our record");
 
   // Absent: the write said the id was taken and the read says it is not there,
   // which can only mean it was removed in between — either way no node on this
-  // graph carries the edge, so the debt is owed, not unknown.
-  assert.deepStrictEqual(await deps.factEdges({ id: "art-gate-missing" }), { ok: true, targets: [] });
+  // graph carries this record or the edge, so the debt is owed, not unknown.
+  assert.deepStrictEqual(await deps.readFact({ id: "art-gate-missing", markdown: mine }), { ok: true, same: false, edges: [] });
 
   // Unreadable: neither answer. The runner leaves the occurrence owed rather
   // than assuming a node it could not open already records it.
   fs.mkdirSync(path.join(home, "nodes", "art-gate-unreadable.md"));
-  const blind = await deps.factEdges({ id: "art-gate-unreadable" });
+  const blind = await deps.readFact({ id: "art-gate-unreadable", markdown: mine });
   assert.strictEqual(blind.ok, false, "an I/O fault is not an absence");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+// The paying half of the occurrence debt (F13): the door that writes ONE
+// occurrence edge onto a fact whose own write found the id already taken. It
+// is the same add_edge micro-mutation `spor edge` uses, so what matters here
+// is that it is idempotent (a second payer cannot double-count an occurrence)
+// and that it REFUSES rather than writing something dangling.
+test("makeGateDeps pays a flake occurrence edge onto an existing fact — idempotently, and never at a target that is not there", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-link-fact-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const deps = flakeDeps(cfg, home);
+  const node = (id, type, extra = []) =>
+    fs.writeFileSync(
+      path.join(home, "nodes", `${id}.md`),
+      ["---", `id: ${id}`, `type: ${type}`, `title: ${id}`, `summary: ${id}`, "date: 2026-09-05", ...extra, "---", "", "body", ""].join("\n")
+    );
+  node("art-gate-fact", "artifact", ["edges:", "  - {type: relates-to, to: task-p}"]);
+  node("task-p", "task", ["status: open"]);
+  node("issue-flake-one", "issue", ["status: open"]);
+  const read = () => fs.readFileSync(path.join(home, "nodes", "art-gate-fact.md"), "utf8");
+
+  const paid = await deps.linkFact({ id: "art-gate-fact", type: "relates-to", to: "issue-flake-one" });
+  assert.strictEqual(paid.ok, true, paid.reason);
+  assert.match(read(), /- \{type: relates-to, to: issue-flake-one\}/);
+
+  // Again: the same occurrence, not a second one.
+  assert.strictEqual((await deps.linkFact({ id: "art-gate-fact", type: "relates-to", to: "issue-flake-one" })).ok, true);
+  assert.strictEqual((read().match(/relates-to, to: issue-flake-one/g) || []).length, 1, "one occurrence, one edge, however many payers");
+
+  // A target that is not on the graph is a REFUSAL: an occurrence edge
+  // pointing at nothing is worse than one still owed, and the runner reports
+  // the debt as owed on exactly this answer.
+  const dangling = await deps.linkFact({ id: "art-gate-fact", type: "relates-to", to: "issue-flake-gone" });
+  assert.strictEqual(dangling.ok, false);
+  assert.match(dangling.reason, /does not exist/);
+  // …and so is a fact that is not there to carry it.
+  assert.strictEqual((await deps.linkFact({ id: "art-gate-missing", type: "relates-to", to: "issue-flake-one" })).ok, false);
+  assert.doesNotMatch(read(), /issue-flake-gone/);
   fs.rmSync(home, { recursive: true, force: true });
 });
 
@@ -5515,31 +5580,96 @@ test("a charged off-diff pass whose rescue cannot be dispatched links its flake 
   assert.match(gateFacts[1].markdown, /That occurrence is already recorded on /);
 
   // The write door reports the id ALREADY OCCUPIED — which is not this
-  // markdown landing, so what the occupant names is a question only a read
-  // answers. It names the issue: the debt is discharged, and the escalation
-  // does not link it a second time.
-  const b = mk();
-  b.deps.recordFact = async ({ id, markdown }) => (b.seen.facts.push({ id, markdown }), { ok: true, id, existing: true });
-  b.deps.factEdges = async ({ id }) => (b.seen.reads = (b.seen.reads || 0) + 1, { ok: true, targets: ["task-demo", "issue-flake-one"] });
+  // markdown landing, so BOTH whether that record is ours and what it names
+  // are questions only a read answers. Here it is ours and it names the issue
+  // with the occurrence edge: the debt is discharged, and the escalation does
+  // not link it a second time.
+  const occupied = (f, seen) => {
+    f.deps.recordFact = async ({ id, markdown }) => (f.seen.facts.push({ id, markdown }), { ok: true, id, existing: true });
+    f.deps.readFact = async ({ id }) => (f.seen.reads = (f.seen.reads || 0) + 1, seen(id));
+    return f;
+  };
+  const b = occupied(mk(), () => ({ ok: true, same: true, edges: [{ type: "relates-to", to: "task-demo" }, { type: "relates-to", to: "issue-flake-one" }] }));
   await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b.deps });
   assert.deepStrictEqual(b.seen.facts.filter((f) => /^art-gate-/.test(f.id)).map((f) => edgesTo(f.markdown)), [1, 0]);
 
-  // Same, but the occupant does NOT name it — an earlier incarnation of this
-  // pipeline whose filing had failed. The debt is still owed, so the
+  // F14: the occupant NAMES the issue, but not with the occurrence edge — a
+  // `mentions` says the fact talks about it, the `relates-to` is what counts
+  // as an occurrence of it. Erasing the type let the mention discharge a debt
+  // no fact had recorded, so the issue's occurrence count silently lost one.
+  const b2 = occupied(mk(), () => ({ ok: true, same: true, edges: [{ type: "mentions", to: "issue-flake-one" }] }));
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b2.deps });
+  assert.deepStrictEqual(
+    b2.seen.facts.filter((f) => /^art-gate-/.test(f.id)).map((f) => edgesTo(f.markdown)),
+    [1, 1],
+    "a mention is not an occurrence — the debt is still owed and the escalation pays it"
+  );
+
+  // Same, but the occupant does NOT name it at all — an earlier incarnation of
+  // this pipeline whose filing had failed. The debt is still owed, so the
   // escalation's fact pays it.
-  const c = mk();
-  c.deps.recordFact = async ({ id, markdown }) => (c.seen.facts.push({ id, markdown }), { ok: true, id, existing: true });
-  c.deps.factEdges = async () => ({ ok: true, targets: ["task-demo"] });
+  const c = occupied(mk(), () => ({ ok: true, same: true, edges: [{ type: "relates-to", to: "task-demo" }] }));
   await gateRunner.runGatePipeline({ item: ITEM, factory, deps: c.deps });
   assert.deepStrictEqual(c.seen.facts.filter((f) => /^art-gate-/.test(f.id)).map((f) => edgesTo(f.markdown)), [1, 1], "the second fact pays what the first did not");
+
+  // F10, durable row (c) — the check-then-write race: the id is occupied by a
+  // DIFFERENT record (another actor wrote this gate run's fact between our
+  // check and our write). This markdown did not land, so the verdict is not
+  // reported as recorded — the run's gate result carries no fact id — and
+  // nothing about that stranger's node discharges our occurrence.
+  const c2 = occupied(mk(), () => ({ ok: true, same: false, edges: [{ type: "relates-to", to: "issue-flake-one" }] }));
+  const raced = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: c2.deps });
+  assert.deepStrictEqual(c2.seen.facts.filter((f) => /^art-gate-/.test(f.id)).map((f) => edgesTo(f.markdown)), [1, 1], "a stranger's verdict under our id settles nothing");
+  assert.deepStrictEqual(raced.gates.map((g) => g.fact), [null, null], "neither record that did not land is reported as one");
+  assert.deepStrictEqual(raced.facts, [], "and it is not offered to the rescue as an anchor");
 
   // And a read that could not be MADE settles nothing: an unconfirmed edge
   // stays owed. An extra edge overcounts one occurrence; a missing one leaves
   // an issue no fact names at all.
-  const d = mk();
-  d.deps.recordFact = async ({ id, markdown }) => (d.seen.facts.push({ id, markdown }), { ok: true, id, existing: true });
-  d.deps.factEdges = async () => ({ ok: false, reason: "the graph could not be reached" });
+  const d = occupied(mk(), () => ({ ok: false, reason: "the graph could not be reached" }));
   await gateRunner.runGatePipeline({ item: ITEM, factory, deps: d.deps });
   assert.deepStrictEqual(d.seen.facts.filter((f) => /^art-gate-/.test(f.id)).map((f) => edgesTo(f.markdown)), [1, 1], "unknown is owed, never assumed paid");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// F13: an occupied fact id whose occupant does not carry the occurrence is a
+// debt with nowhere left to go on a PASSING gate or a final refusal — there is
+// no later fact of that pass to pay it. So it is paid where it is discovered,
+// straight onto the fact that IS there, through the idempotent add_edge door.
+test("an occurrence edge the fact's own write could not carry is paid onto that fact directly, and stays owed when that payment fails", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-flake-pay-"));
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "test", "codex-dispatch.test.js"), 'const assert = require("node:assert");\n');
+  const output = ["✖ the launch handshake (40001.2ms)", "      at TestContext.<anonymous> (test/codex-dispatch.test.js:120:5)"].join("\n");
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const mk = () => {
+    const f = treeFakes({ dir, changed: ["lib/kernel/queue.js"], run: (attempt, command) => (command ? { ok: true } : { ok: false, code: 1, output }) });
+    f.deps.fileFlakeItem = async () => ({ ok: true, id: "issue-flake-one" });
+    // The occupant is this record — same verdict — but was written before the
+    // filing landed, so it does not carry the occurrence.
+    f.deps.recordFact = async ({ id, markdown }) => (f.seen.facts.push({ id, markdown }), { ok: true, id, existing: true });
+    f.deps.readFact = async () => ({ ok: true, same: true, edges: [{ type: "relates-to", to: "task-demo" }] });
+    return f;
+  };
+
+  // The gate PASSES on the off-diff flake, so this is the last fact of the
+  // pass: with no direct payment the occurrence would sink here forever.
+  const a = mk();
+  a.seen.links = [];
+  a.deps.linkFact = async ({ id, type, to }) => (a.seen.links.push({ id, type, to }), { ok: true, id });
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: a.deps })).state, "passed");
+  assert.deepStrictEqual(a.seen.links.map((l) => [l.type, l.to]), [["relates-to", "issue-flake-one"]], "the occurrence is written onto the fact that is there");
+  assert.match(a.seen.links[0].id, /^art-gate-acceptance-/);
+
+  // A payment that did not land pays nothing (durable row (a)): the debt is
+  // reported owed rather than recorded as discharged, so a later fact of this
+  // item still pays it.
+  const b = mk();
+  b.seen.links = [];
+  b.deps.linkFact = async ({ id, type, to }) => (b.seen.links.push({ id, type, to }), { ok: false, reason: "the graph could not be reached" });
+  const logs = [];
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b.deps, log: (m) => logs.push(m) })).state, "passed");
+  assert.strictEqual(b.seen.links.length, 1, "it was attempted");
+  assert.ok(logs.some((m) => /could not be linked onto .* stays owed/.test(m)), "and its failure is said out loud, not swallowed");
   fs.rmSync(dir, { recursive: true, force: true });
 });

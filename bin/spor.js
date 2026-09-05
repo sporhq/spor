@@ -10417,7 +10417,12 @@ async function writeGateNode(cfg, id, markdown) {
       // ignores `date:` drift (see stripFrontmatterDate) so it stays keyed on
       // the fact itself, not the calendar day it was re-filed on.
       const same = stripFrontmatterDate(fs.readFileSync(file, "utf8")) === stripFrontmatterDate(markdown);
-      return same ? { ok: true, id, existing: true } : { ok: false, id, existing: true, reason: `${id} already exists with different content — refusing to adopt another gate's node` };
+      // `identical` is the local door's own proof (F10): it COMPARED this
+      // markdown against the occupant, so an `existing` it reports is this
+      // record — edges and all — and the caller needs no read to know it.
+      // The remote door cannot say that (`if_exists: skip` compares nothing),
+      // so it omits the flag and the caller reconciles by reading.
+      return same ? { ok: true, id, existing: true, identical: true } : { ok: false, id, existing: true, reason: `${id} already exists with different content — refusing to adopt another gate's node` };
     }
     // The same validation the local `put-node` door runs: a malformed gate node
     // written straight to disk would break loadGraph for everything downstream.
@@ -10426,6 +10431,52 @@ async function writeGateNode(cfg, id, markdown) {
     const valid = validatePutNodeLocal(dir, parsed.node, markdown);
     if (valid.error) return { ok: false, reason: valid.error };
     fs.writeFileSync(file, markdown);
+    return { ok: true, id };
+  } catch (e) {
+    return { ok: false, reason: e.message };
+  }
+}
+
+// Add ONE typed edge to a node a gate already wrote — the paying half of the
+// flake occurrence debt (F13), through the same add_edge micro-mutation
+// `spor edge` uses (POST /v1/nodes/{id}/edges remotely, an in-place validated
+// append locally). Idempotent on both sides: the server reports an edge that
+// is already there as `skipped` and this reads it as the success it is, and
+// locally the edge set is checked before the append — so a second worker (or
+// this one, after a crash between the edge landing and the state that records
+// it) can never double-count one occurrence. A missing source or a dangling
+// target is a REFUSAL, never a silent write: an occurrence edge that points at
+// nothing is worse than one still owed.
+async function addGateEdge(cfg, id, type, to) {
+  if (cfg.mode() === "remote") {
+    const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(id)}/edges`, { type, to }, { timeoutMs: 8000 });
+    if (r.transport) return { ok: false, reason: `offline — ${r.error}` };
+    if (!r.ok) {
+      const e = (r.json && r.json.error) || {};
+      return { ok: false, reason: `edge error ${r.status}${e.message ? `: ${e.message}` : ""}` };
+    }
+    return { ok: true, id };
+  }
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const dir = cfg.nodesDir();
+  try {
+    const file = path.join(dir, `${id}.md`);
+    let raw;
+    try {
+      raw = fs.readFileSync(file, "utf8");
+    } catch {
+      return { ok: false, reason: `no such node: ${id}` };
+    }
+    const g = graphLib.loadGraph(dir);
+    if (!g.nodes[to]) return { ok: false, reason: `edge target '${to}' does not exist` };
+    if (((g.nodes[id] && g.nodes[id].edges) || []).some((e) => e.type === type && e.to === to)) return { ok: true, id };
+    const newRaw = appendEdgeLine(raw, type, to, null);
+    if (newRaw == null) return { ok: false, reason: `could not locate frontmatter in ${id}` };
+    // The same validation the local put-node door runs: an edge that would
+    // make the node invalid is not written.
+    const v = graphLib.validateNode(g, graphLib.parseFrontmatter(newRaw, `${id}.md`));
+    if (!v.ok) return { ok: false, reason: `invalid node after edge add: ${v.errors.join("; ")}` };
+    fs.writeFileSync(file, newRaw);
     return { ok: true, id };
   } catch (e) {
     return { ok: false, reason: e.message };
@@ -11635,17 +11686,37 @@ function makeGateDeps(
     review,
     fix,
     recordFact: ({ id, markdown }) => writeGateNode(cfg, id, markdown),
-    // What a fact id ALREADY on the graph points at. `writeGateNode` reports an
-    // occupied id as a SUCCESS (`if_exists: skip` remotely, identical-content
-    // adoption locally), so a gate fact that came back `existing` did NOT land
-    // this markdown — and the flake occurrence edges it was carrying are a debt
-    // only a read can discharge (the runner's confirmFlakeEdges). Three answers,
-    // like the flake filing door's: the targets it names, no targets (a node
-    // that is not there names nothing — the write's `existing` and this read's
-    // absence can only both be true if it was removed in between, and either
-    // way no node carries the edge), or a refusal, which settles nothing and
-    // leaves the debt owed.
-    factEdges: async ({ id }) => {
+    // What is ALREADY at a gate fact's id, read back ONCE. `writeGateNode`
+    // reports an occupied id as a SUCCESS (`if_exists: skip` remotely,
+    // identical-content adoption locally), and an occupied id is NOT this
+    // markdown landing — so two questions hang off that answer, and only a
+    // read settles either (F10/F14):
+    //   `same`  — is the node under this deterministic id THIS record? The
+    //             check-then-write race (durable row (c)) is another actor —
+    //             a resumed pipeline, a second worker, a heal pass — writing
+    //             this gate's fact between our check and our write, and what
+    //             it can change under us is the VERDICT. That is exactly what
+    //             the frontmatter `title:` carries (`Gate <id> — <verdict> on
+    //             <item>`), so the titles are compared and nothing else: the
+    //             body, the detail and the flake set may legitimately differ
+    //             (an earlier incarnation of this same write whose filing had
+    //             failed), which is the same record carrying a smaller debt,
+    //             not a stranger's verdict. A byte compare is the wrong
+    //             instrument for the remote half — the server stamps `author`/
+    //             `authored_via` onto what it stores, so nothing a client
+    //             posts ever reads back byte-identical.
+    //   `edges` — TYPED, never bare targets: a flake issue's occurrence count
+    //             is its inbound `relates-to` from gate facts, and a
+    //             `mentions`/`derived-from` pointing at the same issue is not
+    //             that occurrence (F14). Erasing the type let any edge at all
+    //             discharge the debt.
+    // Three answers, like the flake filing door's: the occupant (with those
+    // two readings), an ABSENCE — the write said the id was taken and the
+    // read says nothing is there, which can only mean it was removed in
+    // between, so no node carries this record and none carries the edges —
+    // or a refusal, which settles NEITHER question and leaves the debt owed.
+    readFact: async ({ id, markdown }) => {
+      const graphLib = require(path.join(ROOT, "lib", "graph.js"));
       const read = {};
       let node = null;
       try {
@@ -11653,15 +11724,40 @@ function makeGateDeps(
       } catch (e) {
         return { ok: false, reason: `${id} could not be read (${(e && e.message) || e})` };
       }
-      if (!node) return read.unreadable ? { ok: false, reason: `${id} could not be read` } : { ok: true, targets: [] };
+      if (!node) return read.unreadable ? { ok: false, reason: `${id} could not be read` } : { ok: true, same: false, edges: [] };
       let edges = [];
       try {
-        edges = require(path.join(ROOT, "lib", "graph.js")).parseFrontmatter(node.raw || "", `${id}.md`).edges || [];
+        edges = graphLib.parseFrontmatter(node.raw || "", `${id}.md`).edges || [];
       } catch (e) {
         return { ok: false, reason: `${id}'s frontmatter could not be parsed (${(e && e.message) || e})` };
       }
-      return { ok: true, targets: edges.map((e) => e && e.to).filter(Boolean).map(String) };
+      let mine = "";
+      try {
+        mine = String(graphLib.parseFrontmatter(String(markdown || ""), `${id}.md`).title || "").trim();
+      } catch {
+        mine = "";
+      }
+      const theirs = String(node.title || "").trim();
+      return {
+        ok: true,
+        // An unreadable title on either side is not a match: `same` is a
+        // POSITIVE reading or nothing.
+        same: !!(mine && theirs && mine === theirs),
+        edges: edges.filter((e) => e && e.to).map((e) => ({ type: String((e && e.type) || ""), to: String(e.to) })),
+      };
     },
+    // Pay a flake occurrence edge the FACT itself could not carry (F13). The
+    // fact's id was already occupied, so this markdown — and the edges in its
+    // frontmatter — did not land, and for a PASSING gate or the final refusal
+    // there is no later fact of this pass to carry them: without this door the
+    // occurrence is a permanent debt sink, an issue no fact names. Written
+    // through the same add_edge micro-mutation `spor edge` uses, which is
+    // IDEMPOTENT on both sides (the server answers `skipped`, local dedups
+    // against the edges already on the node), so two workers paying the same
+    // occurrence cannot double-count it — and which REFUSES a dangling target,
+    // so a flake issue that vanished leaves the debt logged unpaid rather than
+    // an edge pointing at nothing.
+    linkFact: ({ id, type, to }) => addGateEdge(cfg, id, type, to),
     fileTestLaneItem: async ({ gate, paths, profile, rescue = 0 }) => {
       const k = keysFor(rescue);
       const id = `task-test-lane-${stem}-${k.short}-${gateIdSuffix("test-lane", gate.id, entry.node_id, k.runKey)}`;

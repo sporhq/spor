@@ -997,8 +997,29 @@ outside git (a database on a fixed port, a `db reset`):
     OBSERVED — a write that CREATED the fact, or, when the write door reported
     the id already occupied (`if_exists: skip` remotely, identical-content
     adoption locally, neither of which is this markdown landing), a read of
-    that occupant which saw the edge. A write door's bare success never
-    discharges it, and neither does the mere presence of a fact id. The debt
+    that occupant which saw the edge, or an edge written straight onto that
+    occupant. A write door's bare success never discharges it, and neither
+    does the mere presence of a fact id. That read-back answers TWO questions,
+    not one. Is the node under this deterministic id THIS record? Another
+    actor — a resumed pipeline, a second worker, a heal pass — can have
+    written this gate run's fact between the check and the write, and what a
+    race changes under us is the VERDICT, which is what the frontmatter
+    `title:` carries; a title that differs means this markdown did not land,
+    so the verdict is not reported as recorded and the fact is not offered to
+    the rescue as its `derived-from` anchor. (A byte compare is the wrong
+    instrument for the remote half: the server stamps `author`/`authored_via`
+    onto what it stores, and a legitimate earlier incarnation of the same
+    record — one written before a filing landed — differs in body and detail
+    while being the same verdict with a smaller debt.) And which edges are on
+    it, read TYPED: an occurrence is a `relates-to`, so a `mentions` or a
+    `derived-from` pointing at the same issue from the same fact names it
+    without recording an occurrence of it, and counting it would silently lose
+    one from the file's count. An edge the fact could not carry is then paid
+    ONTO that fact, through the idempotent add_edge door, at the moment the
+    debt is known — a PASSING gate and the final refusal have no later fact of
+    that pass to carry it, so a debt deferred there is a debt that sinks. The
+    payment is recorded only from the door's own success; one that did not
+    land pays nothing and is said out loud. The debt
     survives the rescue lane in ONE stamp: the durable rescue entry carries
     the flake payload — its discharge state included — beside the fact id, so
     a pipeline resumed after a failed fact write pays the edge from its

@@ -855,10 +855,20 @@ edges are already written — so an issue created before a later filing failed i
 never left with no fact naming it, and never left with two). That discharge is
 only ever recorded from a landing the pipeline SAW: a write door reports an
 already-occupied id as a success and an occupied id is not this markdown
-landing, so an `existing` fact is read back once (`deps.factEdges`) and only the
-issues its occupant actually names count as paid; a read that could not be made
-leaves the edge OWED for the next fact, since a duplicate edge overcounts one
-occurrence while a missing one leaves an issue no fact names at all.
+landing, so an `existing` fact is read back once (`deps.readFact`), which
+answers BOTH questions that hang off it — is the node under that deterministic
+id this record (its frontmatter `title:` carries the verdict, which is exactly
+what a check-then-write race changes under us; a stranger's verdict means this
+markdown did not land, so the fact is not reported as recorded and is not
+offered to the rescue as an anchor) and which owed edges are on it, read TYPED,
+since an occurrence is a `relates-to` and a `mentions` at the same issue is not
+one. A read that could not be made settles neither, so the edge is OWED, since a
+duplicate edge overcounts one occurrence while a missing one leaves an issue no
+fact names at all. What the fact could not carry is then paid ONTO it, at the
+moment the debt is known (`deps.linkFact`, the idempotent add_edge door), because
+a passing gate and a final refusal have no later fact of that pass to pay it and
+the occurrence would otherwise sink there forever; a payment that did not land
+pays nothing and stays owed.
 The issue's convergent id is reconciled against SETTLED state rather than adopted
 on its name: a live occupant is linked, a resolved/closed one advances to a
 recurrence rung (`-r2`, `-r3`) that links back to it, and a file past every rung
