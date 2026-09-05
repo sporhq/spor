@@ -670,7 +670,12 @@ test("remote claude-code dispatch carries the agent token in a 0600 --mcp-config
       if (req.method === "POST" && req.url === "/v1/nodes/task-cc/claim") return j(200, { ok: true, lease: { by: "person-test" } });
       if (req.method === "POST" && req.url === "/v1/agents/agent-test/token") return j(200, { token: "agent-secret-token" });
       if (req.method === "POST" && ["/v1/agents/session", "/v1/nodes/task-cc/renew", "/v1/nodes/task-cc/release"].includes(req.url)) return j(200, { ok: true });
-      if (req.method === "POST" && req.url === "/v1/nodes") return j(201, { ok: true, id: "art-report" });
+      // POST /v1/nodes is the batch door (API.md §4): a genuine response
+      // always carries a per-entry `results` array, which is what
+      // `nodeWriteLanded` (lib/shell/dispatch-terminal.js) reads to confirm
+      // the write landed — a bare `{ok, id}` with no `results` is not a
+      // shape the real API returns.
+      if (req.method === "POST" && req.url === "/v1/nodes") return j(201, { results: [{ ok: true, status: "created", id: "art-report" }] });
       return j(404, {});
     });
   });

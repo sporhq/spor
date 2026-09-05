@@ -137,6 +137,36 @@ test("a report that cannot be filed leaves the lease held — never a released l
   assert.match(patch.terminal_note, /left HELD/);
 });
 
+test("an HTTP-ok write with no results entry is NOT trusted as landed — never a released lease with an unsaved report", async () => {
+  // A malformed/empty body on an otherwise-2xx write response used to fall
+  // back to the bare HTTP `ok`, reading the write as landed with no per-entry
+  // confirmation at all (issue-spor-dispatch-terminal-verification-vulnerabilities).
+  const t = transport({
+    "GET /v1/nodes/task-x": { ok: true, status: 200, json: { id: "task-x" } },
+    "POST /v1/nodes": { ok: true, status: 200, json: {} },
+  });
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, nodeId: "task-x", releaseNode: "task-x", state: "done",
+    reportText: "Claims to be done but the write response carries no verdict.", request: t.call,
+  });
+  assert.strictEqual(patch.terminal_state, "failed");
+  assert.strictEqual(patch.terminal_enforced, true);
+  assert.ok(!("report_node_id" in patch), "no per-entry verdict, so nothing is confirmed filed");
+  assert.strictEqual(patch.lease_released, false);
+  assert.ok(!t.calls.some((c) => /\/release$/.test(c.path)), "no release is even attempted");
+  assert.match(patch.terminal_note, /left HELD/);
+});
+
+test("nodeWriteLanded never trusts a bare HTTP ok with no per-entry verdict", () => {
+  assert.strictEqual(terminal.nodeWriteLanded({ ok: true, status: 200, json: {} }), false);
+  assert.strictEqual(terminal.nodeWriteLanded({ ok: true, status: 200, json: { results: [] } }), false);
+  assert.strictEqual(terminal.nodeWriteLanded({ ok: true, status: 200, json: null }), false);
+  assert.strictEqual(terminal.nodeWriteLanded({ ok: true, status: 200, json: null, jsonError: "Unexpected end of JSON input" }), false);
+  assert.strictEqual(terminal.nodeWriteLanded({ ok: true, status: 207, json: { results: [{ ok: true, status: "created" }] } }), true);
+  assert.strictEqual(terminal.nodeWriteLanded({ ok: true, status: 200, json: { results: [{ ok: true, status: "skipped" }] } }), true);
+  assert.strictEqual(terminal.nodeWriteLanded({ ok: true, status: 207, json: { results: [{ ok: false, code: "invalid_node" }] } }), false);
+});
+
 test("a transport that THROWS on the report write fails closed — never a reported with no artifact id", async () => {
   const t = transport({
     "GET /v1/nodes/task-x": { ok: true, status: 200, json: { id: "task-x" } },
@@ -190,6 +220,48 @@ test("an unreachable graph is reported unenforced, never resolved", async () => 
   assert.strictEqual(patch.terminal_enforced, false);
   assert.notStrictEqual(patch.terminal_state, "resolved");
   assert.match(patch.terminal_note, /could not re-read task-x/);
+});
+
+test("a verify read with an ok status but an unparseable body is unenforced, not a confident 'not resolved'", async () => {
+  // A 2xx GET whose body failed to parse used to be defaulted to `{}` and
+  // read as "the node genuinely has no resolution" — a verified `reported`,
+  // when in fact nothing was verified at all
+  // (issue-spor-dispatch-terminal-verification-vulnerabilities).
+  const t = transport({
+    "GET /v1/nodes/task-x": { ok: true, status: 200, json: null, jsonError: "Unexpected end of JSON input" },
+  });
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, nodeId: "task-x", releaseNode: "task-x", state: "done", reportText: "x", request: t.call,
+  });
+  assert.strictEqual(patch.terminal_enforced, false);
+  assert.notStrictEqual(patch.terminal_state, "resolved");
+  assert.match(patch.terminal_note, /could not re-read task-x/);
+  assert.match(patch.terminal_note, /invalid response body/);
+  assert.deepStrictEqual(t.calls.map((c) => `${c.method} ${c.path}`), ["GET /v1/nodes/task-x"], "an unverified read never files or releases");
+});
+
+test("the REAL httpJson (no request override) sets jsonError on a genuinely malformed body, not just in mocked tests", async () => {
+  // The mocked-transport tests above pin the CONTRACT (`jsonError` gates the
+  // verify leg); this one pins the IMPLEMENTATION — that `httpJson`'s own
+  // `try { await res.json() } catch` actually produces that field against a
+  // real `fetch` round trip, not only against hand-built test doubles.
+  const { srv } = graphServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("not valid json{{{");
+  });
+  await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  try {
+    const patch = await terminal.applyTerminalContract({
+      ...BASE, base, nodeId: "task-x", releaseNode: "task-x", state: "done", reportText: "x",
+    });
+    assert.strictEqual(patch.terminal_enforced, false);
+    assert.notStrictEqual(patch.terminal_state, "resolved");
+    assert.match(patch.terminal_note, /could not re-read task-x/);
+    assert.match(patch.terminal_note, /invalid response body/);
+  } finally {
+    await new Promise((resolve) => srv.close(resolve));
+  }
 });
 
 test("local mode and free-text dispatch are unenforced, with the reason on the record", async () => {
