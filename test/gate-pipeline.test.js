@@ -3460,12 +3460,97 @@ test("an agent-review gate with an EMPTY diff fails closed — no reviewer dispa
   assert.strictEqual(seen.demotions.length, 1);
 });
 
-test("a command gate is NOT the empty-diff guard — an unchanged tree still runs its suite (the review gate is where a vacuous pass would launder)", async () => {
-  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+// task-spor-command-gate-empty-diff-short-circuit: the command gate used to be
+// exempt ("the review gate is where a vacuous pass would launder") and ran its
+// suite on an unchanged tree. Run d6a89bfe gated a data-only item whose diff
+// was 3b5b854..3b5b854, ran `npm test` on what was literally the trusted ref,
+// timed out under load, and spent the one rescue on a stale premise. With no
+// change under it a suite result is a statement about the trusted ref, not
+// about the item — so the command gate now fails closed BEFORE the suite,
+// exactly as the review gate does, and neither refusal reaches the rescue lane.
+
+test("a command gate with an EMPTY diff fails closed BEFORE the suite — no suite run, no lease, no fix cycle, straight to a person, saying the deliverable was not code", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", serialize: "repo" }] });
+  const { deps, seen } = fakes({ changed: [] });
+  const leases = [];
+  deps.acquireGateLease = async ({ gate }) => { leases.push(gate.id); return { kind: "fake" }; };
+  deps.releaseGateLease = async () => {};
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.match(res.reason, /no committed change against main/, "the same refusal the review gate gives");
+  assert.match(res.reason, /`npm test` would judge main itself, not the change/, "…and says what a suite run would have measured");
+  assert.match(res.reason, /fails closed without running it/);
+  assert.match(res.reason, /the deliverable was not code: a graph write to verify by hand/, "the escalation tells the person what to verify");
+  assert.deepStrictEqual(seen.suites, [], "the suite is never run on the trusted ref itself");
+  assert.deepStrictEqual(leases, [], "no serialize lease is taken for a suite that will not run");
+  assert.strictEqual(seen.fixes.length, 0, "unretried — no fix cycle can produce a diff where the branch carries none");
+  assert.strictEqual(seen.escalations.length, 1, "a person is asked why the branch is empty");
+  assert.match(seen.escalations[0].detail, /the deliverable was not code/);
+  assert.strictEqual(seen.demotions.length, 1);
+  assert.deepStrictEqual(res.gates.map((g) => [g.gate, g.verdict]), [["acceptance", "failed"]]);
+  assert.strictEqual(seen.facts.length, 1);
+  assert.match(seen.facts[0].id, /^art-gate-acceptance-/);
+  assert.match(seen.facts[0].markdown, /the deliverable was not code/);
+
+  // A NON-empty diff is judged exactly as before: the suite runs.
+  const changed = fakes({ changed: ["lib/x.js"] });
+  const r2 = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: changed.deps });
+  assert.strictEqual(r2.state, "passed");
+  assert.deepStrictEqual(changed.seen.suites, ["acceptance"]);
+});
+
+test("the command gate's empty-diff refusal runs BEFORE arming — a risk-declaring gate refuses rather than reading `skipped`", async () => {
+  // An empty diff arms nothing, so evaluating arming first would convert the
+  // fail-closed refusal into a silent pass — the boundary §10.4 already keeps
+  // for the review gate.
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", risk: ["touches:auth"] }] });
   const { deps, seen } = fakes({ changed: [] });
   const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
-  assert.strictEqual(res.state, "passed");
-  assert.deepStrictEqual(seen.suites, ["acceptance"]);
+  assert.strictEqual(res.state, "failed");
+  assert.deepStrictEqual(res.gates.map((g) => [g.gate, g.verdict]), [["acceptance", "failed"]]);
+  assert.deepStrictEqual(seen.suites, []);
+  assert.strictEqual(seen.escalations.length, 1);
+
+  // ...while an unarmed gate on a REAL change still skips, as before.
+  const unarmed = fakes({ changed: ["lib/x.js"] });
+  const r2 = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: unarmed.deps });
+  assert.strictEqual(r2.state, "passed");
+  assert.deepStrictEqual(r2.gates.map((g) => [g.gate, g.verdict]), [["acceptance", "skipped"]]);
+});
+
+test("an empty-diff refusal never reaches the rescue lane — whichever gate kind reads it first — and the refusal is the first gate's, in declared order", async () => {
+  // A rescue works in the run's own tree on a CHANGE a gate refused; an empty
+  // diff gives it nothing to work on, and a person verifying the graph write
+  // is the route, not a strong model re-deriving a stale premise.
+  const rescue = { profile: "profile-claude-fable", attempts: 2 };
+  const orders = [
+    [[{ id: "acceptance", kind: "command", command: "npm test" }, { id: "review", kind: "agent-review", profile: "profile-review", cycles: 3 }], "acceptance"],
+    [[{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 3 }, { id: "acceptance", kind: "command", command: "npm test" }], "review"],
+  ];
+  for (const [gateList, first] of orders) {
+    const factory = factoryOf({ ...BASE, gates: gateList, rescue });
+    const log = [];
+    const { deps, seen } = withRescue(fakes({ changed: [] }));
+    const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps, log: (l) => log.push(l) });
+    assert.strictEqual(res.state, "failed", first);
+    assert.strictEqual(res.escalated_to, `task-gate-${first}`, "the FIRST gate in declared order refuses; the second never runs");
+    assert.deepStrictEqual(seen.rescues, [], `${first}: no rescue is dispatched at an empty diff`);
+    assert.deepStrictEqual(seen.suites, [], first);
+    assert.deepStrictEqual(seen.reviews, [], first);
+    assert.strictEqual(seen.escalations.length, 1, first);
+    assert.strictEqual(seen.facts.length, 1, `${first}: the refused gate's fact, and no rescue fact`);
+    assert.match(seen.facts[0].id, new RegExp(`^art-gate-${first}-`));
+    assert.doesNotMatch(seen.facts[0].markdown, /Rescue: attempt/, "the fact never announces a rescue that will not follow");
+    assert.strictEqual(seen.demotions.length, 1, first);
+    assert.ok(log.some((l) => /refused task-demo on an empty diff — a rescue has no change to work on/.test(l)), log.join("\n"));
+  }
+
+  // The rescue lane itself is untouched for a refusal that HAS a change: a
+  // failing suite on a real diff is still rescued.
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }], rescue });
+  const real = withRescue(fakes({ changed: ["lib/x.js"], suite: () => ({ ok: false, code: 1, output: "1 failing" }) }));
+  await gateRunner.runGatePipeline({ item: ITEM, factory, deps: real.deps });
+  assert.strictEqual(real.seen.rescues.length, rescue.attempts, "a refusal with a change under it is rescued as before, up to the declared attempts");
 });
 
 // ------------------------------------------------- the gate tree's setup hook --
@@ -6145,6 +6230,18 @@ test("a no-code claim that does not check out falls through to the empty-diff re
     assert.strictEqual(seen.demotions.length, 1, "and the item is still demoted");
     assert.ok(!seen.facts.some((f) => f.id.startsWith("art-gate-scoping-")), "no scoping fact for a claim that failed its check");
   }
+});
+
+test("a failed no-code claim is carried into the COMMAND gate's empty-diff refusal too, before any suite run", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+  const { deps, seen } = withNoCode(fakes({ changed: [] }), { nodes: { "task-demo": SCOPED_ITEM_NODE } });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.match(res.reason, /`npm test` would judge main itself/);
+  assert.match(res.reason, /The run declared a no-code outcome, but it does not check out: .*could not be read from the graph/);
+  assert.deepStrictEqual(seen.suites, [], "the suite is never spent on a claim that failed its check");
+  assert.strictEqual(seen.escalations.length, 1);
+  assert.match(seen.escalations[0].detail, /declared a no-code outcome, but it does not check out/);
 });
 
 test("the route never fires on a NON-empty diff, however the run declares itself — the gates judge the code", async () => {

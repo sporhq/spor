@@ -1367,12 +1367,28 @@ under test cannot rewrite its own judge. So a command gate:
    A rescue pass (§10.10) gets the same one round-trip, keyed by pass: a
    rescue that leaves its fix uncommitted is an implementer that forgot to
    commit, and the original pass's spent round-trip never denies it;
-2. **fails CLOSED** if that change touches any declared protected test path —
+2. **fails CLOSED on an EMPTY diff** — a branch carrying no committed change
+   against the trusted ref — before the suite, the serialize lease, and
+   arming, exactly as the review gate does (§10.4) and unretried, straight to
+   a person (task-spor-command-gate-empty-diff-short-circuit). With no change
+   under it a suite result is a statement about the trusted ref, not about the
+   item: a pass is vacuous and a failure (a red trusted ref, box contention) is
+   not the item's. The first live case (2026-09-05, run `d6a89bfe`) gated a
+   data-only item — the deliverable was a graph write and the tree sat at the
+   trusted ref — ran `npm test` on what was literally `main`, timed out under
+   load, and spent the one rescue on a stale premise. The refusal says the
+   deliverable was not code and asks the person to verify the graph write; a
+   declared no-code outcome that did not check out (§10.11) rides along with
+   why. It is never rescued (§10.10): the tree carries no change for a rescue
+   to work on. Before arming for the reason §10.4 gives: an empty diff arms
+   nothing, so a risk-declaring gate evaluated for arming first would read
+   `skipped` and pass;
+3. **fails CLOSED** if that change touches any declared protected test path —
    the suite is not run at all, no fix cycle is offered, and the test change is
    filed as its own queue item naming the `test_lane_profile` (a different
    lane). Same entity, same misunderstanding: the lane that writes the test may
    not be the lane that writes the code;
-3. otherwise materializes a throwaway git worktree at the implementer's commit
+4. otherwise materializes a throwaway git worktree at the implementer's commit
    and **forces every protected path back to the trusted ref's copy** (files the
    branch added under a protected path are removed), stages that tree with the
    repo's own `dispatch.worktreeSetup` hook exactly as a dispatch worktree is
@@ -1538,7 +1554,8 @@ change against the trusted ref** (the implementer landed its work on the
 trusted ref directly, or resolved with nothing behind it) fails the gate closed
 and unretried, straight to a person — no reviewer is dispatched at an empty
 diff, because a vacuous pass is exactly how an unreviewed change would launder
-into an approval.
+into an approval. A command gate refuses an empty diff the same way, before its
+suite (§10.3, item 2), and neither refusal is rescued (§10.10).
 
 **Arming by risk class** (task-spor-review-gate-risk-arming). A review gate may
 declare `risk` against the factory's `risk_classes`, exactly as a command gate
@@ -2259,7 +2276,7 @@ passed against) the *restored* tree
 changes anything, the stage re-commits the restored tree — amending the
 candidate's own tip commit, which keeps its parents intact under every
 strategy — and lands *that* sha instead (`reconcileCandidateSha` in
-integration-runner.js). Belt-and-braces, same rationale as §10.3's own step 3:
+integration-runner.js). Belt-and-braces, same rationale as §10.3's own step 4:
 this does not depend on the command gate's protected-path check having caught
 the touch in the first place, and it never depends on suite success either —
 the invariant is enforced on the tree that gets landed, not inferred from a
@@ -2539,7 +2556,15 @@ person's item. Not every refusal is rescuable: a protected-path hit already
 filed its test-change lane item (§10.3), a rejected approval is the person's own
 answer and a BLOCKED one is waiting on it (§10.5) — those go on exactly as
 before. A `declined` run is never gated at all (§10.2), so it is never rescued:
-a stale premise is triage's, not the lane's.
+a stale premise is triage's, not the lane's. Nor is an **empty-diff** refusal
+(§10.3 item 2, §10.4), from either gate kind: a rescue works in the run's own
+tree on a change a gate refused, and an empty diff gives it no change to work
+on — no rescue can turn that refusal into a pass short of authoring the whole
+item, which is an implementer's job, not a fix. Both live empty-diff rescues
+before this spent a strong-model dispatch re-deriving by hand what the graph
+already recorded; the deterministic routes that read that evidence (§10.11 and
+its stale-premise sibling) now run before any gate, so a diff that is still
+empty at a gate escalates straight to a person, who verifies the graph write.
 
 **What the runner does**, in code (lib/shell/gate-runner.js), in order:
 

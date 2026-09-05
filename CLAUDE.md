@@ -922,7 +922,13 @@ at the implementer's commit with every declared protected path forced back to
 unrun and unretried, filing the test change as its own item under the declared
 `test_lane_profile` (a different lane: same entity, same misunderstanding). It
 judges COMMITTED work only — uncommitted TRACKED changes (or an unreadable `git
-status`) refuse the gate, while untracked suite residue is ignored. A declared
+status`) refuse the gate, while untracked suite residue is ignored — and an
+EMPTY diff (head == trusted ref) fails closed BEFORE the suite, the lease and
+arming, exactly as the review gate does, saying the deliverable was not code
+(task-spor-command-gate-empty-diff-short-circuit: run d6a89bfe ran `npm test`
+on a data-only item's unchanged tree, timed out, and spent a rescue on a stale
+premise). Neither kind's empty-diff refusal reaches the rescue lane (`noRescue`
+on the outcome, `emptyDiffRefusal` in gate-runner.js). A declared
 `reruns` (default 0, max 3; also on the `integration:` block) re-runs the SAME
 command on the SAME tree before a failure is charged — a flaky full suite then
 costs one more suite run, not a fix dispatch or a rescue — and a rerun-rescued
