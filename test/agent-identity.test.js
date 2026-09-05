@@ -951,6 +951,53 @@ test("dispatch (remote, real): mint endpoint absent (404) => hard-fails, names '
   }
 });
 
+// issue-spor-dispatch-config-write-before-mint-fail: the machine-local
+// dispatch.repos self-registration used to run BEFORE the mint check, so a
+// dispatch that hard-fails on minting still permanently rewrote config.json
+// even though the dispatch never actually proceeded. It must now be deferred
+// until after the mint block has already returned on a hard failure.
+test("dispatch (remote, real): mint hard-fail (404) leaves dispatch.repos untouched (issue-spor-dispatch-config-write-before-mint-fail)", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d3c-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d3cr-"));
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "agent-anthony-laptop" } }) + "\n");
+  const { srv, base } = await dispatchStub({ mintStatus: 404 });
+  try {
+    const r = await runAsync(["dispatch", "dec-x", "--dir", repo, "--no-brief"], remoteEnv(home, base, { SPOR_SESSION_ID: SID }));
+    assert.strictEqual(r.status, 1);
+    const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
+    assert.ok(!cfg.dispatch.repos, "a hard mint failure must not register the repo's slug->path mapping");
+  } finally {
+    srv.close();
+  }
+});
+
+// The mirror case: once the mint failure is handled by --allow-person-token
+// and the dispatch actually proceeds, the self-registration still happens —
+// this isn't a case of the side effect disappearing, only of it moving to
+// after the point where a hard failure would have short-circuited it.
+test("dispatch (remote, real) --allow-person-token: mint hard-fail (404) still registers the repo once dispatch proceeds", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d3cc-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d3ccr-"));
+  const outFile = path.join(home, "argv.out");
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ dispatch: { agent: "agent-anthony-laptop" } }) + "\n");
+  const stub = argvStub(home, outFile);
+  const { srv, base } = await dispatchStub({ mintStatus: 404 });
+  try {
+    const r = await runAsync(
+      ["dispatch", "dec-x", "--dir", repo, "--no-brief", "--allow-person-token"],
+      remoteEnv(home, base, { SPOR_SESSION_ID: SID, SPOR_CLAUDE_CMD: stub })
+    );
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.ok(await waitForFile(outFile));
+    const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
+    assert.strictEqual(cfg.dispatch.repos.demo, repo, "dispatch still self-registers once it proceeds past the mint fallback");
+  } finally {
+    srv.close();
+  }
+});
+
 test("dispatch (remote, real) --allow-person-token: mint endpoint absent (404) => fails soft as before, person-scoped, no mcp-config flags", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d3b-"));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-agent-d3br-"));
