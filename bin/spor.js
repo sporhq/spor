@@ -11236,6 +11236,15 @@ function cmdWorkStatus(cfg, { json }) {
         `resolved ${o.resolved || 0} reported ${o.reported || 0} failed ${o.failed || 0}${o.declined ? ` declined ${o.declined}` : ""}` +
         `${o.unenforced ? ` (${o.unenforced} unenforced)` : ""}`
     );
+    // A workspace/lock refusal is deliberately NEVER cooled onto the item that
+    // hit it (task-spor-work-loop-workspace-refusal-cooldown-on-worker-not-
+    // item — the refused resource is this worker's own shared checkout, not
+    // the item), so it never appears in the `skipped:` list below. Surface it
+    // separately so a worker starved by `--concurrency` > 1 with no
+    // `dispatch.worktree` is explainable instead of looking merely idle.
+    if (w.workspace_wait) {
+      out(`  workspace: busy — ${w.workspace_wait.node_id} refused (${w.workspace_wait.reason}); retrying this page next poll`);
+    }
     if (w.gates)
       out(
         `  gates:    ${w.factory || "(factory)"}${(w.repos || []).length ? ` [judges ${w.repos.join(", ")}]` : ""} — passed ${w.gates.passed || 0}, failed ${

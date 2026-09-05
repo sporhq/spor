@@ -272,8 +272,27 @@ pass it — that is what keeps two implementers out of one checkout — but its
 gate **fix cycles** and its **rescue** do (they run in the run's own checkout,
 whose implementer is already terminal; CLAUDE.md calls the fix cycle the one
 place the worker forces). So a worker running `--concurrency` above 1 against a
-shared checkout will refuse and cool off every item but one, per poll: with more
-than one slot, turn `dispatch.worktree` on.
+shared checkout will hit this refusal on every candidate behind the one already
+running there — with more than one slot, still turn `dispatch.worktree` on so
+each run gets its own tree. What changed
+(task-spor-work-loop-workspace-refusal-cooldown-on-worker-not-item) is what the
+*loop* does with the SHARED-checkout half of that refusal (plus the
+candidate-claim race below, which fires only when two launches race for the
+very same path): it is recognized from its own text (`spor work`'s
+`isWorkspaceRefusal`, matched on the "shared checkout" wording specifically —
+a per-item **worktree** already occupied stays an ordinary item cooldown,
+since under isolation every other candidate gets its own tree and is not
+implicated) and never becomes an item cooldown — the
+occupied checkout says nothing about the REFUSED item's own readiness, and
+cooling it onto `work.retryAfterMs` (ten minutes by default) would walk the
+rest of the page into the same cooldown, one refusal at a time, while the
+occupying run finishes in seconds. Instead the loop leaves the item
+un-cooled, stops trying the REST of that pass's candidates (every one of them
+would contend for the same shared tree), and lets the ordinary next poll — at
+`work.intervalMs`, never the idle backoff — retry the whole page once the
+checkout frees up. It is worker-scoped, not item-scoped, so `spor work
+--status` reports it on its own `workspace:` line rather than in the item
+`skipped:` list.
 
 **Acquisition is atomic.** The occupancy check reads the run records, and the
 record that would make a SECOND dispatch see this one is written by the launch.

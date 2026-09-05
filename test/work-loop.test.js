@@ -253,6 +253,68 @@ test("a cooled-off item is not re-attempted until its retry window passes", asyn
   assert.strictEqual(attempts, 2, "one attempt, then one more only after the cooldown expired");
 });
 
+test("a workspace/lock refusal cools the WORKER's page, not the item (task-spor-work-loop-workspace-refusal-cooldown-on-worker-not-item)", async () => {
+  // Models a --concurrency 2 worker with no dispatch.worktree: `busy` mirrors
+  // preflight's checkWorkspace — refused whenever ANY run this worker holds is
+  // still in flight, exactly the shape of a shared checkout with one writer
+  // already in it. The refusal text is the real one both call sites in
+  // bin/spor.js emit (checkWorkspace's `already has N live writer(s)` and the
+  // candidate-claim race's `another dispatch ... is launching into`).
+  const calls = [];
+  const h = harness({
+    queue: [{ id: "task-a" }, { id: "task-b" }, { id: "task-c" }],
+    dispatch: (item, state) => {
+      calls.push(item.id);
+      const busy = [...state.runs.values()].some((r) => !r.terminal);
+      if (busy) {
+        return {
+          ok: false,
+          reason: `cannot dispatch ${item.id}: the shared checkout /repo/worker already has 1 live writer(s) on this box — deadbeef1 (busy).`,
+        };
+      }
+      return { ok: true };
+    },
+    opts: { concurrency: 2, retryAfterMs: 600000 },
+    maxPasses: 6,
+    onTick: (state, n) => {
+      // task-a's (then task-b's) run "finishes" one pass after it starts —
+      // the occupant clearing is exactly the event this worker must notice
+      // on its very next poll, not after work.retryAfterMs.
+      if (n === 1 || n === 2) state.finishAll();
+    },
+  });
+  const status = await h.run();
+  // task-c is never even ATTEMPTED while the checkout is occupied by task-a —
+  // the rest of the page is skipped outright, not refused-and-cooled one at a
+  // time.
+  assert.deepStrictEqual(calls.slice(0, 2), ["task-a", "task-b"], "task-c is not attempted this pass while the checkout is occupied");
+  // All three eventually dispatch, in order, once each occupant clears.
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-a", "task-b", "task-c"]);
+  // The workspace refusal itself never becomes an ITEM cooldown — task-b and
+  // task-c are dispatched on the very next poll, not after work.retryAfterMs.
+  for (const s of status.skipped) {
+    assert.ok(!workLoop.isWorkspaceRefusal(s.reason), `a workspace refusal must never cool the item it named (got: ${JSON.stringify(s)})`);
+  }
+  // It IS surfaced — just worker-scoped, not item-scoped (spor work --status).
+  assert.ok(
+    h.published.some((p) => p.workspace_wait && p.workspace_wait.node_id === "task-b"),
+    "the worker's own status carries the workspace-busy wait"
+  );
+});
+
+test("isWorkspaceRefusal recognizes both preflight workspace-occupancy phrasings, and nothing else", () => {
+  assert.ok(workLoop.isWorkspaceRefusal("cannot dispatch task-a: the shared checkout /x already has 2 live writer(s) on this box — abc12345 (task-b), def67890 (task-c)."));
+  assert.ok(workLoop.isWorkspaceRefusal("cannot dispatch task-a: another dispatch on this box is launching into /x right now."));
+  assert.ok(!workLoop.isWorkspaceRefusal("cannot dispatch task-a here: this machine can't satisfy profile profile-gpu"));
+  assert.ok(!workLoop.isWorkspaceRefusal("readiness: human"));
+  assert.ok(!workLoop.isWorkspaceRefusal(null));
+  // A per-item WORKTREE already occupied is a fact about that one candidate —
+  // under isolation every other candidate gets its own tree — so it stays an
+  // ordinary item cooldown rather than pausing the rest of the page.
+  assert.ok(!workLoop.isWorkspaceRefusal("cannot dispatch task-a: the worktree /x/task-a already has 1 live writer(s) on this box — abc12345 (task-a)."));
+  assert.strictEqual(workLoop.skipClass({ reason: "the shared checkout /x already has 1 live writer(s) on this box — abc12345", kind: "workspace" }), "shared checkout occupied on this box");
+});
+
 test("the cooldown table is bounded, and evicts the LEAST-recently-refused, not the most-refused", async () => {
   // A plain Map.set on an existing key keeps its original insertion position,
   // so the item refused most often would be first out — the opposite of what
