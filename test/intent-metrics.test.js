@@ -266,33 +266,48 @@ test("replayBinding: a record predating stamping is UNBOUND — scored, but it c
   assert.strictEqual(g.pass, false, "one unbound decision is enough — the reported prompt is unevidenced");
 });
 
-// --- the committed evidence says FAIL, and says so in the suite, not only in prose ---
+// --- the committed evidence certifies the SHIPPED prompt, in the suite, not only in prose ---
 
-test("the committed runs record a FAILING gate, and their records name the prompt they scored", () => {
-  // dec-spor-digest-intent-eval-harness-committed-rescored: NO prompt revision
-  // scored inside budget. That is the finding this whole harness exists to
-  // report, and prose can drift away from it (an earlier commit message on this
-  // very branch says "the calibration gate is met"), so it is asserted here
-  // against the artifacts themselves. If a future prompt DOES clear the budget,
-  // this test is the place that has to be updated deliberately.
+test("the committed runs certify the shipped prompt, and every record names the prompt it scored", () => {
+  // The shipped prompt is certified by its committed runs: a runs/*.json whose
+  // tplSha is the sha256 head of prompts/client/digest-intent.md must record a
+  // PASSING gate, and at least two such runs exist (independent draws, since the
+  // backend is not deterministic). Editing the prompt without re-scoring changes
+  // its sha, no committed run certifies it any more, and this test fails — a
+  // prompt edit ships WITH its measurement or not at all. The earlier prompts'
+  // runs stay committed as the evidence that they FAILED (the two 2026-09-05
+  // measurements at 4/59 on disjoint cases, README "Results"); their verdicts
+  // are pinned the other way. Every run's verdict is re-derived from its own
+  // recorded score, so neither block can have been hand-edited.
   const fs = require("node:fs");
   const path = require("node:path");
+  const u = require("../scripts/engines/util.js");
   const dir = path.join(__dirname, "..", "scripts", "intent-eval", "runs");
+  const shippedSha = u.sha256Head(path.join(__dirname, "..", "prompts", "client", "digest-intent.md"));
   const runs = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
-  assert.ok(runs.length >= 2, "both scored prompts are committed");
+  assert.ok(runs.length >= 3, "the shipped prompt's draws and the superseded prompts' runs are committed");
 
+  const certifying = [];
   for (const f of runs) {
     const run = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"));
-    assert.strictEqual(run.gate.pass, false, `${f}: the gate does not pass`);
-    assert.strictEqual(run.gate.harm.pass, true, `${f}: it DOES clear the harm rule — a different claim`);
-    assert.strictEqual(run.gate.warranted.pass, false, `${f}: the budget row is what fails`);
-    assert.ok(run.score.warrantedSuppression > run.gate.budget, `${f}: over budget, not merely at it`);
+    assert.strictEqual(run.gate.harm.pass, true, `${f}: every committed prompt clears the harm rule`);
+    assert.strictEqual(run.binding, "bound", `${f}: scored bound to its template`);
 
-    // Re-deriving the verdict from the recorded score reproduces the FAIL, so
-    // the artifact's own `gate` block cannot have been hand-edited to a pass.
+    // Re-deriving the verdict from the recorded score must reproduce the
+    // recorded verdict, whichever way it went.
     const rederived = m.gateVerdict(run.score, run.gate.budget, { population: run.score.n });
-    assert.strictEqual(rederived.pass, false, `${f}: re-derived verdict`);
-    assert.strictEqual(rederived.warranted.pass, false);
+    assert.strictEqual(rederived.pass, run.gate.pass, `${f}: re-derived verdict matches the recorded one`);
+    assert.strictEqual(rederived.warranted.pass, run.gate.warranted.pass, `${f}: budget row re-derives`);
+
+    if (run.tplSha === shippedSha) {
+      certifying.push(f);
+      assert.strictEqual(run.gate.pass, true, `${f}: a run of the SHIPPED prompt passes the gate`);
+      assert.ok(run.score.warrantedSuppression <= run.gate.budget, `${f}: inside budget`);
+    } else {
+      assert.strictEqual(run.gate.pass, false, `${f}: a superseded/candidate prompt's run records its FAIL`);
+      assert.strictEqual(run.gate.warranted.pass, false, `${f}: the budget row is what failed it`);
+      assert.ok(run.score.warrantedSuppression > run.gate.budget, `${f}: over budget, not merely at it`);
+    }
 
     // Every decision in the paired record file names the template it came from
     // (see replayBinding) — a run file is otherwise attributable to any prompt.
@@ -301,4 +316,9 @@ test("the committed runs record a FAILING gate, and their records name the promp
     assert.strictEqual(recs.length, run.score.n, `${jsonl}: one record per scored case`);
     assert.strictEqual(m.replayBinding(recs, run.tplSha).status, "bound", `${jsonl}: bound to ${run.tplSha}`);
   }
+  assert.ok(
+    certifying.length >= 2,
+    `the shipped prompt (sha ${shippedSha}) is certified by at least two committed draws; found ${certifying.length}. ` +
+      "An edited prompt must be re-scored (scripts/intent-eval/run.js --out/--json into runs/) before it ships."
+  );
 });

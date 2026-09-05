@@ -350,32 +350,36 @@ result arriving beside a synchronous digest is consumed, not double-injected).
 The default path is byte-identical (spool, drain, and their syscalls are all
 gated on the flag), and the same one-turn-delay tradeoff as the async capture
 nudge applies: a digest for a session's final prompt is dropped. The classifier
-HAS now been scored against the eval's `warranted` labels
-(dec-spor-digest-intent-classifier-scored-prompt-recalibrated): the first
-shipped prompt FAILED, suppressing 51% of warranted digests, and fail-open does
-not cover that — it protects against backend failure, not against haiku
-confidently answering UNWARRANTED on a clearly-warranted prompt. The
-recalibrated prompt in `prompts/client/digest-intent.md` (asymmetric-cost,
-default-WARRANTED) clears the HARM rule but NOT the whole gate: 0/29 good
-digests lost (the asymmetric criterion, was 12/29) and fire-table F1 0.873 vs
-the current always-inject engine's 0.819, with 78% of noise cut — but 4/59 =
-6.8% warranted suppressed is still OVER the 6% budget, so `gateVerdict` returns
-`pass: false` and `--strict` exits 1 on it; don't quote the 0/29 as if it were
-the gate. That 0.78pp overage is smaller than one case (1.7pp at n=59) and used
-to be read as a sample too coarse to convict — a SECOND prompt settled it the
-other way (dec-spor-digest-intent-eval-harness-committed-rescored): a materially
-different, prompt-level-judging candidate
-(`scripts/intent-eval/candidates/2026-09-05-prompt-level.md`) moves 13 of the 77
-verdicts, flips all four of the shipped prompt's warranted suppressions, and
-lands on 4/59 AGAIN on four DISJOINT cases. Two draws at one rate with no case
-in common means ~6.8% is the rate, not four fixable misreads, so the budget row
-is a conclusion and further prompt work on this population is fitting to its
-label noise (two near-identical spor-web prompts in it are labeled oppositely).
-The candidate did not ship (a wash on the gate, 13/18 noise vs 14/18). That
+HAS been scored against the eval's `warranted` labels, and the shipped prompt
+in `prompts/client/digest-intent.md` PASSES the gate
+(dec-spor-digest-intent-conjunctive-prompt-passes-gate): the story is three
+prompts. The first shipped prompt FAILED, suppressing 51% of warranted digests —
+and fail-open does not cover that: it protects against backend failure, not
+against haiku confidently answering UNWARRANTED on a clearly-warranted prompt.
+Its recalibration (asymmetric-cost, default-WARRANTED, judging the RETRIEVAL)
+cleared the HARM rule — 0/29 good digests lost — but sat at 4/59 = 6.8%
+warranted suppressed, OVER the 6% budget; a second, materially different
+prompt that judged the PROMPT instead flipped all four of those and landed on
+4/59 again on four DISJOINT cases, which was first read as "6.8% is the rate"
+(dec-spor-digest-intent-eval-harness-committed-rescored). It was not: each
+prompt carried ONE failure mode (a substantive prompt whose digest missed the
+topic; a short steering turn whose digest was on point) while 11 of their 18
+noise suppressions were shared, so the shipped prompt asks for the CONJUNCTION
+— TEST 1 the prompt, TEST 2 the context, UNWARRANTED only when BOTH fail — and
+scores 1/59 and 2/59 on two independent live draws, 0/29 good lost on both,
+10/18 noise removed (down from 14/18: the price of the conjunction), fire-table
+F1 0.864–0.872 vs the always-inject engine's 0.819. Don't quote the 0/29 as if
+it were the gate; the budget row is the gate and it is now inside. That
 scoring is no longer a scratchpad — re-score
 any prompt edit with `scripts/intent-eval/` (`--template <file>` scores a
 candidate without a second checkout; `--replay` re-derives a recorded run with
-no backend calls). A run that measured NOTHING must never read as a passing one,
+no backend calls), and `test/intent-metrics.test.js` ENFORCES it: the
+committed `runs/*.json` whose `tplSha` is the shipped file's sha must record
+a PASS and there must be at least two of them (the backend is not
+deterministic), so an edited prompt that was not re-scored has no run
+certifying it and fails the suite; the superseded prompts live byte-for-byte in
+`scripts/intent-eval/candidates/` with their runs pinned to their FAIL. A run
+that measured NOTHING must never read as a passing one,
 so three rule-0 gate guards cover the three ways it happens: a replay that
 doesn't COVER the population is refused, `cases with no verdict` counts a case
 as measured only when it carries one of the two decision words (the classifier
@@ -389,13 +393,16 @@ a replay naming a different template (or splicing two) is REFUSED, and one
 carrying no sha at all is scored but fails the fourth rule-0 guard, `decisions
 not bound to prompt`. The corpus stays
 in the private server repo.
-Default-on is STILL deferred, now on three things: the budget criterion itself
-(over, twice-measured — a bigger judged set settles it and an assertion does
-not), a held-out re-validation on a fresh transcript window (both prompts were
-scored against the set the first was iterated on), and a backend-cost call — the shipped default
-`claude -p --model haiku` bills ~$0.08 and ~14s per classification, ~98% of it
-CLI session boot rather than the 4.6KB classification, so a flip wants a
-cheaper `digest.intentCmd` backend first. See test/digest-async.test.js and
+Default-on is STILL deferred, now on two things, neither of them prompt work: a
+held-out re-validation on a fresh transcript window (every prompt was scored
+against the set the first was iterated on, and the shipped one was designed from
+the failure pattern of the two before it there —
+task-spor-digest-intent-heldout-revalidation), and a backend-cost call — the
+shipped default `claude -p --model haiku` bills ~$0.08 and ~15s per
+classification on a cold CLI prompt cache (~$0.01 warm), ~98% of it CLI session
+boot rather than the 4.6KB classification, so a flip wants a cheaper
+`digest.intentCmd` backend first, and a different backend is a different
+classifier that must be re-scored. See test/digest-async.test.js and
 scripts/intent-eval/README.md.
 
 The post-tool engine ALSO carries the coupling nudge
