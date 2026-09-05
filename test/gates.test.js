@@ -699,8 +699,11 @@ test("an implementation stage takes every §2.1 default, and declaring the block
     budget: { runMaxMs: null, runIdleMs: null, attempts: 1 },
     retry: { attempts: 1, backoffMs: 60000 },
     // No expensive suite is prescribed twice, so author_checks defaults to
-    // none; the gate re-runs from the trusted ref regardless.
-    candidate: { requireClean: true, publish: "none", remote: "" },
+    // none; the gate re-runs from the trusted ref regardless. A candidate
+    // always carries a portable reference, and `bundle` is the one form that
+    // needs no credential and no network; "" on the store is the per-mode
+    // default the worker resolves at startup (a parse cannot know the mode).
+    candidate: { requireClean: true, publish: "bundle", remote: "", bundleStore: "" },
   });
   assert.deepStrictEqual(factory.completion, { by: "controller", after: "gates" }, "the block is the opt-in: a factory that adopted the stage asked for its semantics");
   // …and the boundary follows the LAST stage the factory actually declares.
@@ -717,7 +720,7 @@ test("a declared implementation stage is read as written — profile, instructio
       author_checks: ["typecheck"],
       budget: { run_max_ms: 5400000, run_idle_ms: 2700000, attempts: 2 },
       retry: { attempts: 0, backoff_ms: 120000 },
-      candidate: { require_clean: false, publish: "branch", remote: "origin" },
+      candidate: { require_clean: false, publish: "both", remote: "origin", bundle_store: "https://spor.example/v1/executions/exec-1/candidates/" },
     },
     completion: { by: "controller", after: "gates" },
   });
@@ -728,7 +731,9 @@ test("a declared implementation stage is read as written — profile, instructio
     authorChecks: ["typecheck"],
     budget: { runMaxMs: 5400000, runIdleMs: 2700000, attempts: 2 },
     retry: { attempts: 0, backoffMs: 120000 },
-    candidate: { requireClean: false, publish: "branch", remote: "origin" },
+    // The store is a URI PREFIX the locator is composed under (`<store>/<key>`,
+    // §3.4), so its trailing slash is normalized away.
+    candidate: { requireClean: false, publish: "both", remote: "origin", bundleStore: "https://spor.example/v1/executions/exec-1/candidates" },
   });
 });
 
@@ -803,9 +808,24 @@ test("the §2.4 validation table: a mistyped stage refuses the factory, and a le
     // E10: the completion boundary is adoptable ALONE — the stage's routing
     // and budget stay default, and `by` is what the operator wrote.
     ["E10", { completion: { by: "controller" } }, null],
+    ["V7", { implementation: { candidate: { publish: "bundle", bundle_store: "file:///srv/spor/candidates" } } }, null],
+    ["V8", { implementation: { candidate: { publish: "bundle" } } }, null],
+    ["V9", { gates: [{ id: "acceptance", kind: "command", command: "npm test", rejudge_on_repin: false }] }, null],
+    // E11: `none` was the word an earlier draft accepted; a candidate always
+    // carries a portable reference, so it is refused like any other stranger.
+    ["E11", { implementation: { candidate: { publish: "none" } } }, /^implementation\.candidate\.publish 'none' must be one of: bundle, branch, both — a candidate always carries a portable reference \(§3\.4\)$/],
+    ["E12", { implementation: { candidate: { publish: "bundle", bundle_store: "s3://bucket/x" } } }, /^implementation\.candidate\.bundle_store must be a file:\/\/ or https:\/\/ URI — 's3:\/\/' cannot be reached without a signing dependency$/],
+    ["E13", { gates: [{ ref: "gate-adversarial-review", rejudge_on_repin: true }] }, /rejudge_on_repin is not declarable on an agent-review gate — a review always re-judges a moved tip \(§3\.3\)/],
+    // E14: an `https://` store in LOCAL mode is a worker-startup refusal, not
+    // a parse error — a parse cannot know the mode, so the scheme is all it
+    // judges here.
+    ["E14", { implementation: { candidate: { publish: "bundle", bundle_store: "https://x/" } } }, null],
   ];
+  // E13's referenced gate: a shareable review gate the payload points at.
+  const GATE_NODES = new Map([["gate-adversarial-review", { kind: "agent-review", profile: "profile-codex-review" }]]);
+  const stageFactoryWithRefs = (payload) => gates.parseFactory(STAGE_BODY({ ...STAGE_BASE, ...payload }), { gateNodes: GATE_NODES });
   for (const [row, payload, expected] of ROWS) {
-    const { factory, errors } = stageFactory(payload);
+    const { factory, errors } = stageFactoryWithRefs(payload);
     if (expected === null) {
       assert.deepStrictEqual(errors, [], `${row} must be valid: ${errors.join("; ")}`);
       assert.ok(factory, `${row} must produce a factory`);
@@ -863,7 +883,28 @@ test("the §2.4 validation table: a mistyped stage refuses the factory, and a le
   assert.deepStrictEqual(stageFactory({ implementation: { author_checks: "typecheck" } }).errors, [], "a lone id may be written as a bare string, the way every other list field is");
   const publish = stageFactory({ implementation: { candidate: { publish: "ftp" } } });
   assert.strictEqual(publish.factory, null);
-  assert.match(publish.errors.join("; "), /implementation\.candidate\.publish 'ftp' must be one of: none, branch, bundle/);
+  assert.match(publish.errors.join("; "), /implementation\.candidate\.publish 'ftp' must be one of: bundle, branch, both — a candidate always carries a portable reference/);
+  // V7/V8/E14 as VALUES: a declared store is read as a URI prefix (trailing
+  // slash dropped, scheme lowercased — never the root slash of `file:///`),
+  // an undeclared one is "" so the worker resolves the per-mode default, and
+  // the https:// store E14 defers is carried for that startup check to judge.
+  assert.strictEqual(stageFactory(ROWS.find(([r]) => r === "V7")[1]).factory.implementation.candidate.bundleStore, "file:///srv/spor/candidates");
+  assert.strictEqual(stageFactory(ROWS.find(([r]) => r === "V8")[1]).factory.implementation.candidate.bundleStore, "");
+  assert.strictEqual(stageFactory(ROWS.find(([r]) => r === "E14")[1]).factory.implementation.candidate.bundleStore, "https://x");
+  assert.strictEqual(stageFactory({ implementation: { candidate: { bundle_store: "FILE:///srv/x//" } } }).factory.implementation.candidate.bundleStore, "file:///srv/x");
+  assert.strictEqual(stageFactory({ implementation: { candidate: { bundle_store: "file:///" } } }).factory.implementation.candidate.bundleStore, "file:///");
+  // …and it is validated whenever it is WRITTEN, whatever the publish form:
+  // an author who declared a store believes it is doing something.
+  assert.match(stageFactory({ implementation: { candidate: { publish: "branch", bundle_store: "s3://b/x" } } }).errors.join("; "), /bundle_store must be a file:\/\/ or https:\/\/ URI — 's3:\/\/'/);
+  for (const [junk, shown] of [["/srv/spor/candidates", "'/srv/spor/candidates'"], ["", "''"], ["candidates", "'candidates'"], [7, "7"], [true, "true"], [["file:///x"], '["file:///x"]'], [{ file: "/x" }, '{"file":"/x"}']]) {
+    const r = stageFactory({ implementation: { candidate: { bundle_store: junk } } });
+    assert.strictEqual(r.factory, null, `bundle_store ${JSON.stringify(junk)} must refuse`);
+    assert.ok(r.errors.some((e) => e === `implementation.candidate.bundle_store must be a file:// or https:// URI — ${shown} names no scheme`), `bundle_store ${JSON.stringify(junk)}: ${r.errors.join("; ")}`);
+  }
+  for (const scheme of ["http", "s3", "gs", "ssh", "ftp"]) {
+    assert.match(stageFactory({ implementation: { candidate: { bundle_store: `${scheme}://x/y` } } }).errors.join("; "), new RegExp(`'${scheme}://' cannot be reached without a signing dependency`), scheme);
+  }
+  assert.deepStrictEqual(stageFactory({ implementation: { candidate: { bundle_store: null } } }).errors, [], "an explicit null is the same as undeclared");
   const badCompletion = stageFactory({ completion: "controller" });
   assert.strictEqual(badCompletion.factory, null);
   assert.match(badCompletion.errors.join("; "), /completion: must be a JSON object/);
@@ -900,7 +941,7 @@ test("completion.by / completion.after / candidate.publish read an explicit fals
   assert.strictEqual(after.completion.after, "gates");
 
   const publish = gates.parseImplementation({ implementation: { candidate: { publish: false } } });
-  assert.match(publish.errors.join("; "), /implementation\.candidate\.publish 'false' must be one of: none, branch, bundle/);
+  assert.match(publish.errors.join("; "), /implementation\.candidate\.publish 'false' must be one of: bundle, branch, both/);
   assert.strictEqual(publish.implementation, null, "an unreadable candidate.publish still refuses the stage");
 
   // `undefined`/`null` remain "not specified" — the file's standing convention
@@ -972,7 +1013,7 @@ test("an implementation stage that did not PARSE must not move the completion bo
     authorChecks: [],
     budget: { runMaxMs: null, runIdleMs: null, attempts: 1 },
     retry: { attempts: 1, backoffMs: 60000 },
-    candidate: { requireClean: true, publish: "none", remote: "" },
+    candidate: { requireClean: true, publish: "bundle", remote: "", bundleStore: "" },
   });
   assert.deepStrictEqual(completionOnlyError.errors, ["completion.by 'nobody' must be one of: agent, controller"], "errors carries only the one completion mistake");
 });
@@ -1007,6 +1048,56 @@ test("the schema-factory candidate's own worked example parses clean", () => {
   const { factory, errors } = gates.parseFactory(["```json", JSON.stringify(payload), "```"].join("\n"), { gateNodes });
   assert.deepStrictEqual(errors, [], `the worked example must parse clean: ${errors.join("; ")}`);
   assert.ok(factory, "the worked example must produce a factory");
+});
+
+test("gates[].rejudge_on_repin: a command gate re-judges the tip by default, only an explicit false opts out, and no other kind may declare it", () => {
+  // Acceptance is a property of the TIP (FACTORY-IMPLEMENTATION-STAGE.md §3.3):
+  // a command gate whose pass is on an ancestor is re-run on the tip unless
+  // the operator explicitly stands on the ancestor for it (§2.4 V9). The knob
+  // is carried on every command gate — a parse cannot see the completion
+  // boundary the runner reads it under — so an existing factory that never
+  // heard of it parses with `true`, which is the safe direction: an extra
+  // suite run, never a dispatch.
+  const gateOf = (raw, gateNodes) => {
+    const { factory, errors } = gates.parseFactory(STAGE_BODY({ gates: [raw] }), { gateNodes });
+    return { gate: factory ? factory.gates[0] : null, errors };
+  };
+  const cmd = (extra) => ({ id: "acceptance", kind: "command", command: "npm test", ...extra });
+  assert.strictEqual(gateOf(cmd({})).gate.rejudgeOnRepin, true, "undeclared re-judges");
+  assert.strictEqual(gateOf(cmd({ rejudge_on_repin: true })).gate.rejudgeOnRepin, true);
+  assert.strictEqual(gateOf(cmd({ rejudge_on_repin: false })).gate.rejudgeOnRepin, false, "V9: the explicit opt-out");
+  // Anything that is not an explicit `false` fails toward the extra suite
+  // run, the way `require_clean` fails toward the refusal.
+  for (const junk of ["false", "no", 0, null, "", [], {}]) {
+    const r = gateOf(cmd({ rejudge_on_repin: junk }));
+    assert.deepStrictEqual(r.errors, [], `rejudge_on_repin ${JSON.stringify(junk)} is not a refusal`);
+    assert.strictEqual(r.gate.rejudgeOnRepin, true, `rejudge_on_repin ${JSON.stringify(junk)} is not an opt-out`);
+  }
+  // E13: a review ALWAYS re-judges a moved tip, and `false` is refused the
+  // same way as `true` — the author believes either is doing something.
+  // Inline, or written beside a `ref` to a shareable gate node, or on the
+  // node itself: the overlay makes the three one gate.
+  const REVIEW = { kind: "agent-review", profile: "profile-codex-review" };
+  const E13 = /gate\[0\]: rejudge_on_repin is not declarable on an agent-review gate — a review always re-judges a moved tip \(§3\.3\)/;
+  for (const value of [true, false]) {
+    const inline = gateOf({ id: "adversarial-review", ...REVIEW, rejudge_on_repin: value });
+    assert.strictEqual(inline.gate, null);
+    assert.match(inline.errors.join("; "), E13, `inline ${value}`);
+    const beside = gateOf({ ref: "gate-adversarial-review", rejudge_on_repin: value }, new Map([["gate-adversarial-review", REVIEW]]));
+    assert.strictEqual(beside.gate, null);
+    assert.match(beside.errors.join("; "), E13, `beside a ref ${value}`);
+    const onNode = gateOf({ ref: "gate-adversarial-review" }, new Map([["gate-adversarial-review", { ...REVIEW, rejudge_on_repin: value }]]));
+    assert.strictEqual(onNode.gate, null);
+    assert.match(onNode.errors.join("; "), E13, `on the node ${value}`);
+  }
+  // A human gate is an approval, not a suite: the knob is a command gate's only.
+  const human = gateOf({ id: "security-approval", kind: "human", rejudge_on_repin: true });
+  assert.strictEqual(human.gate, null);
+  assert.match(human.errors.join("; "), /gate\[0\]: rejudge_on_repin is not declarable on a human gate — it is a command-gate knob \(§2\.1\)/);
+  // …and neither carries the field at all, so no consumer can read a default
+  // off a kind that has none.
+  assert.ok(!("rejudgeOnRepin" in gateOf({ id: "adversarial-review", ...REVIEW }).gate));
+  assert.ok(!("rejudgeOnRepin" in gateOf({ id: "security-approval", kind: "human" }).gate));
 });
 
 test("parseRescueReport reads the structured diagnosis in code — last fence wins, unknown category reads unknown, prose-only is unread but salvaged", () => {

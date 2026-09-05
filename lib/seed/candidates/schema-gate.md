@@ -2,7 +2,7 @@
 id: schema-gate
 type: schema
 kind: node-schema
-schema_version: 2026.09.04.1
+schema_version: 2026.09.05.1
 title: Shareable factory gate
 summary: One reusable gate — command, agent-review or human — that any factory definition can reference by id, so an org vets a gate once (a `gate-security-review`) and reuses it product-wide instead of copying it into every factory.
 date: 2026-08-26
@@ -40,9 +40,20 @@ Keys by kind:
   costs a suite run and never a fix dispatch, and a pass on a rerun PASSES
   but its `art-gate-*` fact names the rerun and carries the first failure as
   evidence, so a flaky suite stays countable in the telemetry instead of
-  laundering into clean passes. There is deliberately no way to name a ref
-  or a protected path here: those are the FACTORY's, so one shared gate
-  cannot quietly relax another team's trusted boundary.
+  laundering into clean passes. Optional `rejudge_on_repin` (default true) is
+  read only by a factory whose completion is controller-written
+  (FACTORY-IMPLEMENTATION-STAGE.md §3.3): acceptance is a property of the tip,
+  so when the candidate moves under the pipeline (a fix cycle, a rescue, an
+  integration fix) a command gate whose pass is on an ancestor tree is re-run
+  on the tip before the item completes — a suite run, never a dispatch. An
+  explicit `false` is the startup-logged opt-out for a suite the operator
+  accepts standing on an ancestor for; anything else reads as `true`. It is a
+  command gate's knob only: on an agent-review gate it is an error either way
+  (a review always re-judges a moved tip — independent review of what is
+  accepted is not an operator's to relax), and on a human gate too. There is
+  deliberately no way to name a ref or a protected path here: those are the
+  FACTORY's, so one shared gate cannot quietly relax another team's trusted
+  boundary.
 - **agent-review** — `profile` (required: the review lane, cross-model by
   convention; the machine's declared binding decides what that actually
   executes), `instructions`, `await_ms`, and `risk`. The reviewer answers with a

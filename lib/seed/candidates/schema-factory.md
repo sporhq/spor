@@ -2,7 +2,7 @@
 id: schema-factory
 type: schema
 kind: node-schema
-schema_version: 2026.09.05.1
+schema_version: 2026.09.05.2
 title: Software-factory definition
 summary: A factory definition — the ordered gate list a worker enforces between claim and resolve, plus the trusted ref, the repos it may judge, protected test paths, test-change lane, risk classes those gates key on, an optional integration (merge-queue landing) stage, an optional rescue lane (a strong-model step before any human escalation), an optional implementation stage and the completion boundary that says who writes the resolving edge. Candidate pack; adopt it into a graph to use `spor work --factory`.
 date: 2026-08-26
@@ -46,7 +46,7 @@ convention schema nodes use:
       "risk_classes": { "touches:auth": ["lib/auth.js", "**/auth/**"] },
       "gates": [
         {"id": "typecheck", "kind": "command", "command": "npm run typecheck", "timeout_ms": 120000},
-        {"id": "acceptance", "kind": "command", "command": "npm test", "timeout_ms": 900000},
+        {"id": "acceptance", "kind": "command", "command": "npm test", "timeout_ms": 900000, "rejudge_on_repin": true},
         {"ref": "gate-adversarial-review", "cycles": 2},
         {"id": "security-approval", "kind": "human", "risk": ["touches:auth"]}
       ],
@@ -57,7 +57,7 @@ convention schema nodes use:
         "author_checks": ["typecheck"],
         "budget": {"run_max_ms": 5400000, "run_idle_ms": 2700000, "attempts": 1},
         "retry": {"attempts": 1, "backoff_ms": 60000},
-        "candidate": {"require_clean": true, "publish": "none"}
+        "candidate": {"require_clean": true, "publish": "bundle", "bundle_store": "file:///srv/spor/candidates"}
       },
       "completion": {"by": "controller", "after": "integration"}
     }
@@ -126,12 +126,29 @@ convention schema nodes use:
   list) takes the DEFAULT — a typo must never be read as "no
   retries" or "retry in a second". `candidate.require_clean`
   (default true) refuses a dirty tree at submission rather than inside the
-  first gate, and `candidate.publish` (`none`|`branch`|`bundle`, default
-  `none`) is how the pinned commit is made reachable to a controller that does
-  not share a filesystem with the implementer — `candidate.remote` names the git
-  remote a `branch` publish pushes to, and a `branch` publish with no remote is
-  NOT a parse error (a parse cannot read a checkout): it is refused at worker
-  startup, beside the `gh` capability check `integration.mode: propose` makes.
+  first gate, and `candidate.publish` (`bundle`|`branch`|`both`, default
+  `bundle`) is how the pinned commit is made reachable to a controller that does
+  not share a filesystem with the implementer. A candidate ALWAYS carries a
+  portable reference — there is no `none`, and writing it is an error (the
+  machine-local workspace path is recorded as provenance, never as the
+  reference). `bundle` is the default because it needs no credential and no
+  network: a `git bundle` of the candidate's commits into
+  `candidate.bundle_store`, a URI PREFIX that is `file://` (the default is
+  machine-local state under the graph home, `file://<SPOR_HOME>/candidates`;
+  a shared filesystem reaches further) or `https://` (the server's candidate
+  door, the remote-mode default) and nothing else — a zero-dependency client
+  cannot sign an object-store request, so `s3://` and its kin are refused at
+  parse rather than at the first publish, and an `https://` store in LOCAL mode
+  is refused at worker startup (no server, no door). `branch` pushes an
+  immutable candidate ref to `candidate.remote` (the git remote name, resolved
+  to its URL at publish; default `origin`), `both` publishes both forms. A
+  `branch` publish with no remote is NOT a parse error (a parse cannot read a
+  checkout): it is refused at worker startup, beside the `gh` capability check
+  `integration.mode: propose` makes. `gates[].rejudge_on_repin` (command gates
+  only, default true; the `gate` candidate node documents it) is the per-gate
+  half of this stage: acceptance is a property of the TIP, so a command gate
+  whose pass is on an ancestor of the candidate the item completes with is
+  re-run on the tip unless the operator explicitly opts that gate out.
 - `completion` (optional) — WHO writes the resolving edge that retires the work
   item, and WHEN. `by: agent` is today's behavior (the implementer writes the
   edge and flips the status), and stays the default for a factory that declares
@@ -148,9 +165,11 @@ convention schema nodes use:
   asks for. A block that refuses the factory adopted nothing and leaves the
   boundary on the agent, so a typo in the stage never moves who completes.
   The boundary is adoptable ALONE, with the stage left at its defaults.
-- **Not yet enforced.** As of `schema_version` 2026.09.05.1 the runner PARSES
+- **Not yet enforced.** As of `schema_version` 2026.09.05.2 the runner PARSES
   and validates `implementation`/`completion` (a mistyped stage refuses to start
-  the worker) but does not yet execute them: the stage dispatch, the candidate
+  the worker; 2026.09.05.1 read the earlier `none`|`branch`|`bundle` publish
+  vocabulary, which is why a `publish: none` factory now refuses) but does not
+  yet execute them: the stage dispatch, the candidate
   object and the controller-written completion land with items 2-4 of
   FACTORY-IMPLEMENTATION-STAGE.md §8. Until then a declared block is a
   DECLARATION of intent, not a behavior change — `spor work` still dispatches
