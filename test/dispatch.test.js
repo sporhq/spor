@@ -15,7 +15,11 @@ const path = require("node:path");
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const u = require(path.join(__dirname, "..", "scripts", "engines", "util.js"));
 const { pathWithOnlyGitAndNode, writeSpawnableNodeStub } = require("./helpers/portable");
-const { waitForFile } = require("./helpers/launch.js");
+const { waitFor, waitForFile, stubExitTail } = require("./helpers/launch.js");
+// The local-mode dispatch lock (issue-spor-local-mode-work-loop-concurrency-
+// hazard) is a pure-ish helper (fs only, no CLI parsing) exported for direct
+// unit testing, same seam spor-cli.test.js uses for nodeFloor/nodeRuntimeCheck.
+const cli = require(CLI);
 
 // Env with no SPOR_*/SUBSTRATE_* leakage; force LOCAL mode (no server). Also
 // isolate the config-cascade homes to an empty temp dir so the developer's real
@@ -2286,6 +2290,163 @@ test("dispatch <node-id> --print: previews the in-flight warning; clean when not
   // and a clean run (no agents) prints no in-flight line at all
   const clean = run(["dispatch", "dec-x", "--no-brief", "--print"], { SPOR_HOME: home, SPOR_FAKE_AGENTS_JSON: "[]" });
   assert.doesNotMatch(clean.stdout, /in-flight:/);
+});
+
+// --- local-mode atomic dispatch lock (issue-spor-local-mode-work-loop-
+// concurrency-hazard). The same-machine guard above (dispatchedAgents()) is a
+// snapshot read of agents already registered — race-free only once one
+// exists, so two dispatches of the SAME node started in the same tick both
+// see it empty and both used to pass. Remote mode closes that window with the
+// server-held claim; local mode gets its own machine-local exclusive lockfile.
+
+test("acquireLocalDispatchLock: a second acquire for the same name is refused while the first is held", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-lock-"));
+  const first = cli.acquireLocalDispatchLock(home, "dec-x");
+  assert.strictEqual(first.ok, true);
+  assert.ok(first.file && fs.existsSync(first.file));
+  const second = cli.acquireLocalDispatchLock(home, "dec-x");
+  assert.strictEqual(second.ok, false, "a live holder refuses a second acquire, it does not wait");
+  // a DIFFERENT name is unaffected — the lock is scoped per node/name
+  const other = cli.acquireLocalDispatchLock(home, "dec-y");
+  assert.strictEqual(other.ok, true);
+  cli.releaseLocalDispatchLock(first);
+  cli.releaseLocalDispatchLock(other);
+});
+
+test("acquireLocalDispatchLock: releasing frees the name for a later acquire", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-lock-"));
+  const first = cli.acquireLocalDispatchLock(home, "dec-x");
+  assert.strictEqual(first.ok, true);
+  cli.releaseLocalDispatchLock(first);
+  assert.ok(!fs.existsSync(first.file), "release removes the lockfile");
+  const second = cli.acquireLocalDispatchLock(home, "dec-x");
+  assert.strictEqual(second.ok, true, "a released lock can be re-acquired");
+  cli.releaseLocalDispatchLock(second);
+});
+
+test("acquireLocalDispatchLock: a stale lock (holder pid gone) self-heals and is reclaimed", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-lock-"));
+  const file = cli.localDispatchLockFile(home, "dec-x");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  // A pid that (almost certainly) is not alive, with no started_ticks — the
+  // same "no stamp: the pid probe is all there is" fallback workerAlive uses.
+  fs.writeFileSync(file, JSON.stringify({ pid: 999999, started_ticks: null, at: new Date().toISOString() }));
+  const acquired = cli.acquireLocalDispatchLock(home, "dec-x");
+  assert.strictEqual(acquired.ok, true, "a lock held by a dead pid does not block a real dispatch forever");
+  cli.releaseLocalDispatchLock(acquired);
+});
+
+test("acquireLocalDispatchLock: an unreadable lock file cannot be honored as live — reclaimed", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-lock-"));
+  const file = cli.localDispatchLockFile(home, "dec-x");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "not json at all");
+  const acquired = cli.acquireLocalDispatchLock(home, "dec-x");
+  assert.strictEqual(acquired.ok, true);
+  cli.releaseLocalDispatchLock(acquired);
+});
+
+test("acquireLocalDispatchLock: an unwritable journal fails open (nothing to release)", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-lock-"));
+  const journal = path.join(home, "journal");
+  fs.mkdirSync(journal, { recursive: true });
+  // Read+execute only, no write — mkdirSync under it fails EACCES, the
+  // "unwritable journal" case, same posture as acquireLocalIntegrationLease's
+  // EEXIST-only special case.
+  fs.chmodSync(journal, 0o500);
+  try {
+    const acquired = cli.acquireLocalDispatchLock(home, "dec-x");
+    assert.strictEqual(acquired.ok, true, "an unwritable lock dir must not block dispatch");
+    assert.strictEqual(acquired.file, null, "nothing was written, so there is nothing to release");
+    cli.releaseLocalDispatchLock(acquired); // a no-op; must not throw
+  } finally {
+    fs.chmodSync(journal, 0o700); // restore so the temp-dir cleanup can remove it
+  }
+});
+
+test("dispatch <node-id> (local): two concurrent dispatches of the SAME node — exactly one launches", async () => {
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  // Each racer's stub writes ITS OWN pid-named sentinel the instant it starts,
+  // then HOLDS ITSELF ALIVE (stubExitTail's holdFile pattern) instead of
+  // exiting right away. That matters: a stub that exits instantly makes a
+  // SEQUENTIAL, non-overlapping re-dispatch (the first agent finishes, then a
+  // second one starts against the now-idle node) look identical to the actual
+  // hazard — two agents assigned to the same checkout with neither aware of
+  // the other. Held alive, a real double-dispatch would show BOTH sentinels
+  // while both stubs are still running, not one after the other has exited.
+  const releaseFile = path.join(home, "race-release");
+  const stub = writeSpawnableNodeStub(home, "claude-race", `
+const fs = require("node:fs");
+const path = require("node:path");
+fs.writeFileSync(path.join(${JSON.stringify(home)}, "launched-" + process.pid), "launched\\n");
+${stubExitTail({ holdFile: releaseFile, exitCode: 0 })}
+`);
+  const env = bare({ SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  const listLaunched = () => fs.readdirSync(home).filter((f) => f.startsWith("launched-"));
+  try {
+    const [r1, r2] = await Promise.all([
+      runAsync(["dispatch", "dec-x", "--no-brief"], env),
+      runAsync(["dispatch", "dec-x", "--no-brief"], env),
+    ]);
+    const results = [r1, r2];
+    const winners = results.filter((r) => r.status === 0);
+    const losers = results.filter((r) => r.status !== 0);
+    assert.strictEqual(winners.length, 1, "exactly one dispatch succeeded");
+    assert.strictEqual(losers.length, 1, "exactly one dispatch was refused");
+    // Whichever guard actually caught this particular race — the ordinary
+    // same-machine check (if the winner's run record registered just in time)
+    // or the new local dispatch lock (if it did not, the exact window this
+    // fix closes) — the loser names this machine either way.
+    assert.match(losers[0].stderr, /already (has a background agent in flight|being dispatched by another 'spor work'\/'spor dispatch') on this machine/);
+    // The winner's agent is a DETACHED launch (see helpers/launch.js): wait
+    // for its sentinel, then hold a settle window — with the stub pinned
+    // alive, a second, buggy launch would show up as a second sentinel while
+    // the first is still running, not after it has already exited.
+    await waitFor(() => (listLaunched().length ? true : null));
+    await new Promise((r) => setTimeout(r, 500));
+    assert.strictEqual(listLaunched().length, 1, "exactly one racer's agent actually launched");
+  } finally {
+    fs.writeFileSync(releaseFile, "go\n"); // let the held winner exit; never leak a live child
+  }
+});
+
+test("dispatch <node-id> (local): two concurrent dispatches of DIFFERENT nodes both launch", async () => {
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const s1 = path.join(home, "launched-x");
+  const s2 = path.join(home, "launched-y");
+  const stubX = writeSpawnableNodeStub(home, "claude-x", `require("node:fs").writeFileSync(${JSON.stringify(s1)}, "x\\n");`);
+  const stubY = writeSpawnableNodeStub(home, "claude-y", `require("node:fs").writeFileSync(${JSON.stringify(s2)}, "y\\n");`);
+  const [r1, r2] = await Promise.all([
+    runAsync(["dispatch", "dec-x", "--no-brief"], bare({ SPOR_HOME: home, SPOR_CLAUDE_CMD: stubX })),
+    runAsync(["dispatch", "task-rotate", "--dir", repo, "--no-brief"], bare({ SPOR_HOME: home, SPOR_CLAUDE_CMD: stubY })),
+  ]);
+  assert.strictEqual(r1.status, 0, r1.stderr);
+  assert.strictEqual(r2.status, 0, r2.stderr);
+  assert.ok(await waitForFile(s1), "the lock is per-node — a different node is unaffected");
+  assert.ok(await waitForFile(s2), "the lock is per-node — a different node is unaffected");
+});
+
+test("dispatch <node-id> --force (local): a race is not locked out from itself — both proceed", async () => {
+  // --force already means "dispatch anyway" for the ordinary same-machine
+  // guard; the local lock honors the same override rather than adding a
+  // second, unbypassable guard behind the operator's back.
+  const { home, repo } = fixture();
+  run(["repos", "add", "demo", repo], { SPOR_HOME: home });
+  const stub = writeSpawnableNodeStub(home, "claude-force-race", `
+require("node:fs").writeFileSync(require("node:path").join(${JSON.stringify(home)}, "forced-" + process.pid), "launched\\n");
+`);
+  const env = bare({ SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  const [r1, r2] = await Promise.all([
+    runAsync(["dispatch", "dec-x", "--no-brief", "--force"], env),
+    runAsync(["dispatch", "dec-x", "--no-brief", "--force"], env),
+  ]);
+  assert.strictEqual(r1.status, 0, r1.stderr);
+  assert.strictEqual(r2.status, 0, r2.stderr);
+  const listLaunched = () => fs.readdirSync(home).filter((f) => f.startsWith("forced-"));
+  await waitFor(() => (listLaunched().length >= 2 ? true : null));
+  assert.strictEqual(listLaunched().length, 2, "--force takes no lock, so both racers launch as before");
 });
 
 test("dispatch <node-id> (remote): an in-flight agent refuses BEFORE the claim — no claim POST, no launch", async () => {

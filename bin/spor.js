@@ -7790,6 +7790,81 @@ async function claimDispatch(cfg, nodeId, session, dispatch) {
   return { ok: false, error: r.transport ? r.error : `HTTP ${r.status}${code ? ` (${code})` : ""}` };
 }
 
+// The LOCAL-mode analog of the claim above (issue-spor-local-mode-work-loop-
+// concurrency-hazard). claimDispatch is a real atomic operation on the server:
+// two concurrent claims of the same node resolve to one winner and one 409.
+// Local mode has no server, so cmdDispatch's own same-machine duplicate guard
+// (dispatchedAgents(), checked just before this lock) is all that stands in
+// the way there — and that guard is a plain snapshot READ of agents already
+// registered, race-free only once one exists. Two dispatches of the SAME node
+// started within the same tick (two `spor work` loops on one box, or a person
+// re-running `spor dispatch` while a worker is mid-launch) both see an empty
+// in-flight list and both pass, launching two agents onto one checkout — the
+// exact hazard a lease exists to prevent.
+//
+// Closed the same way the integration stage's `serialize: repo` lease closes
+// its own local-mode gap (acquireLocalIntegrationLease, below): a machine-local
+// exclusive lockfile, `wx`-created so two racing writers can never both
+// succeed. Unlike that lease this one never WAITS out a busy holder — a beaten
+// racer is refused immediately, mirroring claimDispatch's 409, because the
+// caller here is a dispatch attempt that should cool off and retry later (the
+// work loop already does exactly that for every other refusal), not a landing
+// pass worth holding up for. It only has to survive from the guard above to
+// the point the launch is durably visible somewhere dispatchedAgents() can see
+// it (a run record, or the harness's own live-agent listing) — cmdDispatch
+// holds it for the rest of its own call and releases it in a `finally`, never
+// for the life of the dispatched agent itself. A stale lock (the holder's pid
+// is gone, or the age check below fires) self-heals exactly like the
+// integration lease's.
+const LOCAL_DISPATCH_LOCK_STALE_MS = 5 * 60 * 1000; // generous over one launch (a sync spawn + a short session-capture poll), nowhere near a run's own life
+function localDispatchLockFile(home, name) {
+  const key = crypto.createHash("sha256").update(String(name || "")).digest("hex").slice(0, 24);
+  return path.join(home, "journal", "dispatch-lock", `${key}.lock`);
+}
+function writeLocalDispatchLock(file) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ pid: process.pid, started_ticks: dispatchRuns.processStartTicks(process.pid), at: new Date().toISOString() }),
+    { flag: "wx" }
+  );
+}
+function acquireLocalDispatchLock(home, name) {
+  const file = localDispatchLockFile(home, name);
+  try {
+    writeLocalDispatchLock(file);
+    return { ok: true, file };
+  } catch (e) {
+    if (e.code !== "EEXIST") return { ok: true, file: null }; // an unwritable journal is not worth blocking dispatch over — fail open, nothing to release
+  }
+  // Held — by a live racer, or a dead one that never cleaned up. Only the
+  // latter self-heals; a live holder is refused, not waited on.
+  let stale = false;
+  try {
+    const held = JSON.parse(fs.readFileSync(file, "utf8"));
+    const age = Date.now() - (Date.parse(held.at || "") || 0);
+    stale = age > LOCAL_DISPATCH_LOCK_STALE_MS || !workerAlive(held.pid, held.started_ticks);
+  } catch {
+    stale = true; // an unreadable lock cannot be honored as a live one
+  }
+  if (!stale) return { ok: false };
+  try {
+    fs.rmSync(file, { force: true });
+    writeLocalDispatchLock(file);
+    return { ok: true, file };
+  } catch {
+    return { ok: false }; // a racer beat us to the retry — refuse rather than risk two holders
+  }
+}
+function releaseLocalDispatchLock(token) {
+  if (!token || !token.file) return;
+  try {
+    fs.rmSync(token.file, { force: true });
+  } catch {
+    /* it lapses on its own next stale check */
+  }
+}
+
 // Renew the dispatch lease, binding it to the REAL session captured post-launch
 // (dec-spor-dispatch-bg-session-late-bind). The pre-launch claim was person-scoped;
 // this binds the lease's session to the real `claude --bg` run so the lease and the
@@ -9409,338 +9484,356 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
     return 1;
   }
 
-  // Preflight only the PATH route — a launcher naming no directory, whether it
-  // is the adapter default or an explicitly configured bare name. A launcher
-  // given as a PATH is left to the launch, whose own `could not launch <path>:
-  // ENOENT` already names the exact path that was tried, and which releases the
-  // claim this dispatch established; refusing it earlier would skip that.
-  const binary = dispatchHarnesses.describeHarnessBin(harnessAdapter, { env: process.env, cfg });
-  if (binary.onPath && !hasCmd(binary.command)) {
-    err(binary.explicit
-      ? `${binary.command} not found on PATH (${binary.source} names it) — install it, or give ${binary.source} an absolute path.`
-      : `${harnessAdapter.missingBinary}, then re-run (or 'spor dispatch … --print' to see the prompt).`);
-    return 1;
-  }
-
-  // Agent-scoped identity injection (dec-spor-session-identity-active-record,
-  // the VERIFIED mechanism): mint a per-session agent-scoped token, write it into
-  // a 0600 --mcp-config that exposes ONLY the agent's own Spor MCP, and add
-  // --strict-mcp-config so the account connector is excluded by construction. The
-  // server then stamps authored_by_agent + session from that token. The token is
-  // minted session-DEFERRED — the run session isn't known until `claude --bg`
-  // self-allocates it, so we bind it AFTER launch (dec-spor-dispatch-bg-session-
-  // late-bind), keeping `agentToken` to authenticate that late bind. Per
-  // dec-spor-worker-strictness-split-interactive-lenient a mint failure now HARD
-  // FAILS — a server without the mint surface, or a transient minting error, must
-  // not silently attribute the dispatched agent's writes to the person — unless
-  // --allow-person-token (or dispatch.allowPersonToken) opts back into the old
-  // fail-soft. Nothing has claimed a lease, written local config, or launched
-  // anything yet, so a hard fail here leaves no cleanup behind
-  // (issue-spor-dispatch-config-write-before-mint-fail: this block must stay
-  // ahead of the "Side effects" registration below, not just the claim/launch —
-  // a mint failure that hard-fails must not have already mutated
-  // dispatch.repos). Remote + a configured agent only; local/unconfigured
-  // dispatch never reaches this block.
-  let agentToken = null;
-  let agentMcpFile = null;
-  if (identityAgent) {
-    // Always session-DEFERRED — the run session is bound after launch (below),
-    // even when SPOR_SESSION_ID pins it (the pin feeds the capture, not the mint),
-    // so the bind path is uniform.
-    const mint = await mintAgentToken(cfg, { agent: identityAgent });
-    if (mint.ok) {
-      agentToken = mint.token;
-      if (harnessAdapter.identityMode === "mcp-file") {
-        agentMcpFile = writeDispatchMcpConfig(cfg, { token: mint.token, key: mcpKey });
-      }
-      out(`agent:  ${identityAgent} (writes attributed agent-on-behalf-of-you; run session bound after launch)`);
-    } else if (!allowPersonToken) {
-      // Name the offending agent and the fix — a bare "(HTTP 422 …)" tells the
-      // operator nothing about WHICH id is wrong or how to repair it. The format
-      // gate is caught client-side above, so a 422 here means the id is a
-      // well-formed 'agent-<slug>' the server still rejected (e.g. no such agent /
-      // not owned); point at the list either way
-      // (issue-spor-dispatch-agent-id-prefix-validation-gap).
-      err(
-        `cannot dispatch ${nodeId || name}: could not mint an agent-scoped token for ${identityAgent}` +
-          `${mint.absent ? " (this server can't mint agent-scoped session tokens yet)" : ` (${mint.error})`}.`
-      );
-      err(`  check it exists and you own it: spor agent list  (fix: spor agent use <agent-id>)`);
-      err(`  pass --allow-person-token to dispatch person-scoped anyway (dispatch.allowPersonToken makes it standing).`);
-      return 1;
-    } else if (mint.absent) {
-      err(`warning: this server can't mint agent-scoped session tokens yet — dispatching person-scoped (--allow-person-token).`);
-    } else {
-      err(`warning: could not mint an agent token for ${identityAgent} (${mint.error}) — dispatching person-scoped (--allow-person-token).`);
-      err(`  check it exists and you own it: spor agent list  (set this machine's default with: spor agent use <agent-id>)`);
-    }
-  }
-
-  // Local config side effects (real run only — --print writes nothing), now
-  // that a hard mint failure above has already returned without reaching here.
-  // --backfill is the onboarding door, so it sets the repo up (init + enable)
-  // first; every dispatch self-registers the dir it resolved.
-  if (backfill) onboardRepo(cfg, res.dir);
-  // The slug->path map is machine-local — written to the PERSONAL user config
-  // home, never the (possibly marker-shared) graph home
-  // (issue-spor-config-desync-shared-graph-home).
-  u.registerRepo(cfg.userConfigHome(), res.slug, res.dir);
-  if (backfill) out(`registered ${res.slug} → ${res.dir}; launching the backfill agent…`);
-
-  // Establish the claim/lease BEFORE launching (task-spor-dispatch-auto-claim):
-  // a node already claimed by someone else is caught here, so we never launch a
-  // duplicate agent onto contested work, and the lease is live the moment the
-  // agent starts (its post-tool writes then renew it — and seeing its own held
-  // claim, it skips the redundant claim-nudge). Remote node-mode only; --no-claim
-  // opts out (dispatch with no lease, the prior behavior). PERSON-SCOPED here
-  // (session omitted, dec-spor-dispatch-bg-session-late-bind): the real session
-  // isn't known until after launch in ANY launch mode (the supervised stream
-  // announces it, `claude --bg` self-allocates it), so we bind it to the lease
-  // via renewDispatch below; until then any of this person's sessions may renew it.
-  let claimEstablished = false;
-  if (nodeId && !backfill && !noClaim && cfg.mode() === "remote") {
-    // Tag this claim with a per-invocation dispatch nonce so the server refuses a
-    // SECOND concurrent dispatch of the same node — even by this same person, on
-    // any machine (inc-spor-dispatch-duplicate-task-2026-06-18). --force opts out
-    // (omit the nonce) so a deliberate re-dispatch renews instead of conflicting.
-    const dispatchNonce = force ? null : crypto.randomUUID();
-    const c = await claimDispatch(cfg, nodeId, null, dispatchNonce);
-    if (c.conflict) {
-      err(`${nodeId} is already claimed — ${c.message}`);
-      err(`  not dispatching a duplicate. Re-run with --force to dispatch anyway (keeps the lease),`);
-      err(`  --no-claim to dispatch with no lease, or pick another task with 'spor next'.`);
+  // Close the race the guard above cannot (issue-spor-local-mode-work-loop-
+  // concurrency-hazard): remote mode's server-held claim below makes THAT
+  // guard atomic; local mode has none, so this machine-local lock is what
+  // stands between two `spor work` loops (or dispatches) picking the same
+  // node in the same tick. --force means "dispatch anyway" for the in-flight
+  // guard above, so it means the same here — a forced dispatch takes no lock
+  // and contends with nothing. Released in the `finally` below, whichever way
+  // the rest of this dispatch ends.
+  let localDispatchLock = null;
+  if (nodeId && !backfill && cfg.mode() !== "remote" && !force) {
+    const acquired = acquireLocalDispatchLock(cfg.userConfigHome(), name);
+    if (!acquired.ok) {
+      err(`${name} is already being dispatched by another 'spor work'/'spor dispatch' on this machine right now — not launching a duplicate.`);
+      err(`  this is the local-mode race window dispatchedAgents() cannot see yet; re-run in a moment, or 'spor next --json' to check what's in flight.`);
       return 1;
     }
-    if (c.ok) {
-      // Only mark this as a lease WE established: a --force claim omits the
-      // nonce and RENEWS whatever lease already exists (per the conflict
-      // message above, "keeps the lease") — that may be a live lease held by
-      // an already-running agent from an earlier dispatch. Abort-cleanup below
-      // must never release a lease this invocation didn't freshly create.
-      claimEstablished = !!dispatchNonce;
-      out(`claimed ${nodeId} (lease established; the agent's writes will renew it)`);
-    } else err(`warning: could not establish a lease on ${nodeId}: ${c.error} — dispatching without a claim`);
+    localDispatchLock = acquired.file ? acquired : null;
   }
-  // A worktree-creation/setup-hook failure, or a failure to even launch the
-  // agent process, below aborts the dispatch without ever running an agent —
-  // release the lease claimed just above so it doesn't strand the node
-  // claimed-but-unattended (issue-spor-dispatch-worktree-setup-wrong-repo-
-  // config: the failed attempt used to need a manual `spor release` before a
-  // retry). Best-effort: a release failure here just leaves the existing
-  // "needs a manual spor release" state, no worse than before.
-  const releaseClaimOnAbort = async () => {
-    if (!claimEstablished) return;
-    const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}/release`, {}, { timeoutMs: 6000 });
-    if (r.ok) out(`  released the claim on ${nodeId}`);
-    else err(`  warning: could not release the claim on ${nodeId} — retry with 'spor release ${nodeId}'`);
-  };
-  // Materialize the worktree just before launch — AFTER every guard/claim, so a
-  // refused dispatch never leaves a worktree behind — and run the agent inside it.
-  // res.dir stays the registered slug->path target (the durable main checkout,
-  // issue-spor-dispatch-worktree-dir-stamping); only the launch cwd moves.
-  let launchDir = res.dir;
-  if (useWorktree) {
-    const wt = createDispatchWorktree(res.dir, name, { slug: res.slug, nodeId });
-    if (wt.error) {
-      err(`could not create dispatch worktree under ${res.dir}: ${wt.error}`);
-      err(`  (is ${res.dir} a git repo with at least one commit? or pass --no-worktree.)`);
-      await releaseClaimOnAbort();
+
+  try {
+    // Side effects (real run only — --print writes nothing). --backfill is the
+    // onboarding door, so it sets the repo up (init + enable) first; every
+    // dispatch self-registers the dir it resolved.
+    if (backfill) onboardRepo(cfg, res.dir);
+    // The slug->path map is machine-local — written to the PERSONAL user config
+    // home, never the (possibly marker-shared) graph home
+    // (issue-spor-config-desync-shared-graph-home).
+    u.registerRepo(cfg.userConfigHome(), res.slug, res.dir);
+    if (backfill) out(`registered ${res.slug} → ${res.dir}; launching the backfill agent…`);
+
+    // Preflight only the PATH route — a launcher naming no directory, whether it
+    // is the adapter default or an explicitly configured bare name. A launcher
+    // given as a PATH is left to the launch, whose own `could not launch <path>:
+    // ENOENT` already names the exact path that was tried, and which releases the
+    // claim this dispatch established; refusing it earlier would skip that.
+    const binary = dispatchHarnesses.describeHarnessBin(harnessAdapter, { env: process.env, cfg });
+    if (binary.onPath && !hasCmd(binary.command)) {
+      err(binary.explicit
+        ? `${binary.command} not found on PATH (${binary.source} names it) — install it, or give ${binary.source} an absolute path.`
+        : `${harnessAdapter.missingBinary}, then re-run (or 'spor dispatch … --print' to see the prompt).`);
       return 1;
     }
-    if (wt.setupError) {
-      err(`dispatch worktree setup hook failed: ${wt.setupError}`);
-      if (wt.created) {
-        const rm = removeDispatchWorktree(res.dir, wt.dir, wt.branch);
-        if (rm.removed) {
-          err(`  removed the half-prepped worktree ${wt.dir}. Fix dispatch.worktreeSetup or pass --no-worktree.`);
-        } else {
-          err(`  could not remove the half-prepped worktree ${wt.dir}: ${rm.reason}`);
-          err(`  clean it up manually, then fix dispatch.worktreeSetup or pass --no-worktree.`);
+
+    // Agent-scoped identity injection (dec-spor-session-identity-active-record,
+    // the VERIFIED mechanism): mint a per-session agent-scoped token, write it into
+    // a 0600 --mcp-config that exposes ONLY the agent's own Spor MCP, and add
+    // --strict-mcp-config so the account connector is excluded by construction. The
+    // server then stamps authored_by_agent + session from that token. The token is
+    // minted session-DEFERRED — the run session isn't known until `claude --bg`
+    // self-allocates it, so we bind it AFTER launch (dec-spor-dispatch-bg-session-
+    // late-bind), keeping `agentToken` to authenticate that late bind. Per
+    // dec-spor-worker-strictness-split-interactive-lenient a mint failure now HARD
+    // FAILS — a server without the mint surface, or a transient minting error, must
+    // not silently attribute the dispatched agent's writes to the person — unless
+    // --allow-person-token (or dispatch.allowPersonToken) opts back into the old
+    // fail-soft. Nothing has claimed a lease or launched anything yet, so a hard
+    // fail here leaves no cleanup behind. Remote + a configured agent only;
+    // local/unconfigured dispatch never reaches this block.
+    let agentToken = null;
+    let agentMcpFile = null;
+    if (identityAgent) {
+      // Always session-DEFERRED — the run session is bound after launch (below),
+      // even when SPOR_SESSION_ID pins it (the pin feeds the capture, not the mint),
+      // so the bind path is uniform.
+      const mint = await mintAgentToken(cfg, { agent: identityAgent });
+      if (mint.ok) {
+        agentToken = mint.token;
+        if (harnessAdapter.identityMode === "mcp-file") {
+          agentMcpFile = writeDispatchMcpConfig(cfg, { token: mint.token, key: mcpKey });
         }
+        out(`agent:  ${identityAgent} (writes attributed agent-on-behalf-of-you; run session bound after launch)`);
+      } else if (!allowPersonToken) {
+        // Name the offending agent and the fix — a bare "(HTTP 422 …)" tells the
+        // operator nothing about WHICH id is wrong or how to repair it. The format
+        // gate is caught client-side above, so a 422 here means the id is a
+        // well-formed 'agent-<slug>' the server still rejected (e.g. no such agent /
+        // not owned); point at the list either way
+        // (issue-spor-dispatch-agent-id-prefix-validation-gap).
+        err(
+          `cannot dispatch ${nodeId || name}: could not mint an agent-scoped token for ${identityAgent}` +
+            `${mint.absent ? " (this server can't mint agent-scoped session tokens yet)" : ` (${mint.error})`}.`
+        );
+        err(`  check it exists and you own it: spor agent list  (fix: spor agent use <agent-id>)`);
+        err(`  pass --allow-person-token to dispatch person-scoped anyway (dispatch.allowPersonToken makes it standing).`);
+        return 1;
+      } else if (mint.absent) {
+        err(`warning: this server can't mint agent-scoped session tokens yet — dispatching person-scoped (--allow-person-token).`);
       } else {
-        err(`  left the reused worktree ${wt.dir} in place. Fix dispatch.worktreeSetup or pass --no-worktree.`);
+        err(`warning: could not mint an agent token for ${identityAgent} (${mint.error}) — dispatching person-scoped (--allow-person-token).`);
+        err(`  check it exists and you own it: spor agent list  (set this machine's default with: spor agent use <agent-id>)`);
       }
-      await releaseClaimOnAbort();
-      return 1;
     }
-    launchDir = wt.dir;
-    out(`worktree: ${wt.dir} (branch ${wt.branch}${wt.reused ? ", reused" : ""}${wt.setupRan ? "; setup ran" : ""})`);
-  }
 
-  if (harnessAdapter.launchMode === "supervised-jsonl") {
-    const personToken = cfg.mode() === "remote" ? remote.token(cfg) : "";
-    const mcpToken = agentToken || personToken;
-    const wantsSporMcp = harnessAdapter.identityMode === "env-mcp" && cfg.mode() === "remote" && (
-      !!identityAgent || (Array.isArray(profileRuntime.mcp) && profileRuntime.mcp.includes("spor"))
-    );
-    const args = harnessAdapter.buildArgs({
+    // Establish the claim/lease BEFORE launching (task-spor-dispatch-auto-claim):
+    // a node already claimed by someone else is caught here, so we never launch a
+    // duplicate agent onto contested work, and the lease is live the moment the
+    // agent starts (its post-tool writes then renew it — and seeing its own held
+    // claim, it skips the redundant claim-nudge). Remote node-mode only; --no-claim
+    // opts out (dispatch with no lease, the prior behavior). PERSON-SCOPED here
+    // (session omitted, dec-spor-dispatch-bg-session-late-bind): the real session
+    // isn't known until after launch in ANY launch mode (the supervised stream
+    // announces it, `claude --bg` self-allocates it), so we bind it to the lease
+    // via renewDispatch below; until then any of this person's sessions may renew it.
+    let claimEstablished = false;
+    if (nodeId && !backfill && !noClaim && cfg.mode() === "remote") {
+      // Tag this claim with a per-invocation dispatch nonce so the server refuses a
+      // SECOND concurrent dispatch of the same node — even by this same person, on
+      // any machine (inc-spor-dispatch-duplicate-task-2026-06-18). --force opts out
+      // (omit the nonce) so a deliberate re-dispatch renews instead of conflicting.
+      const dispatchNonce = force ? null : crypto.randomUUID();
+      const c = await claimDispatch(cfg, nodeId, null, dispatchNonce);
+      if (c.conflict) {
+        err(`${nodeId} is already claimed — ${c.message}`);
+        err(`  not dispatching a duplicate. Re-run with --force to dispatch anyway (keeps the lease),`);
+        err(`  --no-claim to dispatch with no lease, or pick another task with 'spor next'.`);
+        return 1;
+      }
+      if (c.ok) {
+        // Only mark this as a lease WE established: a --force claim omits the
+        // nonce and RENEWS whatever lease already exists (per the conflict
+        // message above, "keeps the lease") — that may be a live lease held by
+        // an already-running agent from an earlier dispatch. Abort-cleanup below
+        // must never release a lease this invocation didn't freshly create.
+        claimEstablished = !!dispatchNonce;
+        out(`claimed ${nodeId} (lease established; the agent's writes will renew it)`);
+      } else err(`warning: could not establish a lease on ${nodeId}: ${c.error} — dispatching without a claim`);
+    }
+    // A worktree-creation/setup-hook failure, or a failure to even launch the
+    // agent process, below aborts the dispatch without ever running an agent —
+    // release the lease claimed just above so it doesn't strand the node
+    // claimed-but-unattended (issue-spor-dispatch-worktree-setup-wrong-repo-
+    // config: the failed attempt used to need a manual `spor release` before a
+    // retry). Best-effort: a release failure here just leaves the existing
+    // "needs a manual spor release" state, no worse than before.
+    const releaseClaimOnAbort = async () => {
+      if (!claimEstablished) return;
+      const r = await remote.post(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}/release`, {}, { timeoutMs: 6000 });
+      if (r.ok) out(`  released the claim on ${nodeId}`);
+      else err(`  warning: could not release the claim on ${nodeId} — retry with 'spor release ${nodeId}'`);
+    };
+    // Materialize the worktree just before launch — AFTER every guard/claim, so a
+    // refused dispatch never leaves a worktree behind — and run the agent inside it.
+    // res.dir stays the registered slug->path target (the durable main checkout,
+    // issue-spor-dispatch-worktree-dir-stamping); only the launch cwd moves.
+    let launchDir = res.dir;
+    if (useWorktree) {
+      const wt = createDispatchWorktree(res.dir, name, { slug: res.slug, nodeId });
+      if (wt.error) {
+        err(`could not create dispatch worktree under ${res.dir}: ${wt.error}`);
+        err(`  (is ${res.dir} a git repo with at least one commit? or pass --no-worktree.)`);
+        await releaseClaimOnAbort();
+        return 1;
+      }
+      if (wt.setupError) {
+        err(`dispatch worktree setup hook failed: ${wt.setupError}`);
+        if (wt.created) {
+          const rm = removeDispatchWorktree(res.dir, wt.dir, wt.branch);
+          if (rm.removed) {
+            err(`  removed the half-prepped worktree ${wt.dir}. Fix dispatch.worktreeSetup or pass --no-worktree.`);
+          } else {
+            err(`  could not remove the half-prepped worktree ${wt.dir}: ${rm.reason}`);
+            err(`  clean it up manually, then fix dispatch.worktreeSetup or pass --no-worktree.`);
+          }
+        } else {
+          err(`  left the reused worktree ${wt.dir} in place. Fix dispatch.worktreeSetup or pass --no-worktree.`);
+        }
+        await releaseClaimOnAbort();
+        return 1;
+      }
+      launchDir = wt.dir;
+      out(`worktree: ${wt.dir} (branch ${wt.branch}${wt.reused ? ", reused" : ""}${wt.setupRan ? "; setup ran" : ""})`);
+    }
+
+    if (harnessAdapter.launchMode === "supervised-jsonl") {
+      const personToken = cfg.mode() === "remote" ? remote.token(cfg) : "";
+      const mcpToken = agentToken || personToken;
+      const wantsSporMcp = harnessAdapter.identityMode === "env-mcp" && cfg.mode() === "remote" && (
+        !!identityAgent || (Array.isArray(profileRuntime.mcp) && profileRuntime.mcp.includes("spor"))
+      );
+      const args = harnessAdapter.buildArgs({
+        name,
+        model: effectiveModel,
+        permissionMode: permMode,
+        agent,
+        // The `mcp-file` identity mechanism (Claude Code): the agent-scoped token
+        // rides the 0600 --mcp-config written above, exactly as the native launch
+        // carried it; an `env-mcp`/`env-token` adapter never has a file here.
+        mcpConfig: agentMcpFile,
+        sandbox: effectiveSandbox,
+        approvalPolicy: effectiveApprovalPolicy,
+        reportPath: dispatchHarnesses.REPORT_PLACEHOLDER,
+        sporMcp: wantsSporMcp && mcpToken ? { url: `${remote.base(cfg)}/mcp` } : null,
+        readOnly: readOnlyPosture,
+      });
+      const launched = await launchSupervisedHarness(cfg, {
+        adapter: harnessAdapter,
+        command: harnessBin,
+        args,
+        cwd: launchDir,
+        readOnly: !!readOnlyPosture,
+        name,
+        nodeId,
+        prompt,
+        server: cfg.mode() === "remote" ? remote.base(cfg) : null,
+        localNodesDir: cfg.mode() === "remote" ? null : cfg.nodesDir(),
+        childToken: agentToken,
+        mcpToken: wantsSporMcp ? mcpToken : null,
+        bindToken: agentToken,
+        renewToken: agentToken || personToken,
+        renewNode: nodeId && !backfill && !noClaim ? nodeId : null,
+        releaseNode: claimEstablished ? nodeId : null,
+        project: res.slug || null,
+      });
+      if (!launched.ok) {
+        err(`could not launch ${harnessBin}: ${launched.error}`);
+        await releaseClaimOnAbort();
+        return 1;
+      }
+      if (ctx && ctx.onLaunch) {
+        ctx.onLaunch({
+          run_id: launched.runId, harness: harnessAdapter.id, launch_mode: harnessAdapter.launchMode,
+          node_id: nodeId || null, record_path: launched.paths.record,
+        });
+      }
+      out(`run:     ${launched.runId} (${harnessAdapter.label} supervisor ${launched.state.state || "launching"})`);
+      out(`log:     ${launched.paths.log}`);
+      out(`report:  ${launched.paths.report}`);
+      if (launched.state.session_id) out(`session: ${launched.state.session_id}`);
+      return 0;
+    }
+
+    const nativeArgs = harnessAdapter.buildArgs({
       name,
       model: effectiveModel,
       permissionMode: permMode,
       agent,
-      // The `mcp-file` identity mechanism (Claude Code): the agent-scoped token
-      // rides the 0600 --mcp-config written above, exactly as the native launch
-      // carried it; an `env-mcp`/`env-token` adapter never has a file here.
       mcpConfig: agentMcpFile,
-      sandbox: effectiveSandbox,
-      approvalPolicy: effectiveApprovalPolicy,
-      reportPath: dispatchHarnesses.REPORT_PLACEHOLDER,
-      sporMcp: wantsSporMcp && mcpToken ? { url: `${remote.base(cfg)}/mcp` } : null,
+      prompt,
       readOnly: readOnlyPosture,
     });
-    const launched = await launchSupervisedHarness(cfg, {
-      adapter: harnessAdapter,
-      command: harnessBin,
-      args,
-      cwd: launchDir,
-      readOnly: !!readOnlyPosture,
-      name,
-      nodeId,
-      prompt,
-      server: cfg.mode() === "remote" ? remote.base(cfg) : null,
-      localNodesDir: cfg.mode() === "remote" ? null : cfg.nodesDir(),
-      childToken: agentToken,
-      mcpToken: wantsSporMcp ? mcpToken : null,
-      bindToken: agentToken,
-      renewToken: agentToken || personToken,
-      renewNode: nodeId && !backfill && !noClaim ? nodeId : null,
-      releaseNode: claimEstablished ? nodeId : null,
-      project: res.slug || null,
+    // A durable run record for the NATIVE-background launch (the `--bg` opt-in;
+    // the supervised default writes its own record from the supervisor,
+    // inc-spor-dispatch-session-vanished-2026-07-18). `claude --bg` hands the
+    // child to its own daemon and returns, so this launcher never observes the
+    // child's exit, and `claude agents --json` lists only LIVE agents — a run that
+    // finished and a run that died look identical afterwards, which is precisely
+    // how the 2026-07-18 Sonnet dispatches "vanished". Write the record at every
+    // boundary we DO observe (launch, launcher exit, session bind); `spor runs`
+    // classifies the terminal outcome later from the harness's own transcript.
+    dispatchRuns.pruneRuns(cfg.userConfigHome(), { maxAgeMs: cfg.getNum("dispatch.runRetentionMs", 1209600000) });
+    const nativeRun = dispatchRuns.beginNativeRun(cfg.userConfigHome(), {
+      harness: harnessAdapter.id, name, nodeId, cwd: launchDir, model: effectiveModel || null,
     });
-    if (!launched.ok) {
-      err(`could not launch ${harnessBin}: ${launched.error}`);
+    // The agent's git must follow launchDir (its worktree, or the target checkout),
+    // so hand it an env scrubbed of the git location vars — an ambient GIT_DIR
+    // would otherwise point every commit it makes at the LAUNCHER's repo
+    // (issue-spor-dispatch-worktree-wrong-repo-location). PWD gets the same
+    // treatment as the supervised launch's cwd-agreeing env (opencodePrepareRun):
+    // a spawn's `cwd` moves the child's real working directory but leaves the
+    // INHERITED `PWD` pointing at the launcher's — pin it to launchDir so the two
+    // launch modes agree instead of disagreeing about which env var is authoritative.
+    const r = spawnPortableSync(harnessBin, nativeArgs, { cwd: launchDir, stdio: "inherit", env: { ...u.gitEnv(), PWD: launchDir } });
+    if (r.error) {
+      dispatchRuns.updateRun(nativeRun, {
+        state: "failed_launch", termination_class: "launch", termination_signal: "launch-failed",
+        termination_reason: r.error.message, error: r.error.message, finished_at: new Date().toISOString(),
+        // A terminal record must always carry an outcome
+        // (task-spor-dispatch-terminal-states-contract). Nothing here was checked
+        // against the graph — no agent ever ran — so it is unenforced, and the
+        // lease is handed back by releaseClaimOnAbort() below rather than by the
+        // contract.
+        ...dispatchRuns.unenforcedOutcome("failed_launch", "the harness process could not be started, so nothing was verified against the graph"),
+      });
+      err(`could not launch ${harnessBin}: ${r.error.message}`);
       await releaseClaimOnAbort();
       return 1;
     }
-    if (ctx && ctx.onLaunch) {
+    const launcherOk = r.status === 0;
+    dispatchRuns.updateRun(nativeRun, launcherOk
+      ? { state: "running", launched_at: new Date().toISOString(), launcher_exit: 0 }
+      : {
+          state: "failed_launch", launcher_exit: r.status == null ? null : r.status,
+          termination_class: "launch", termination_signal: "launcher-nonzero",
+          termination_reason: `${harnessBin} exited ${r.status == null ? "abnormally" : r.status} without leaving a background agent`,
+          finished_at: new Date().toISOString(),
+          ...dispatchRuns.unenforcedOutcome("failed_launch", "the harness left no background agent, so nothing was verified against the graph"),
+        });
+    if (ctx && ctx.onLaunch && launcherOk) {
       ctx.onLaunch({
-        run_id: launched.runId, harness: harnessAdapter.id, launch_mode: harnessAdapter.launchMode,
-        node_id: nodeId || null, record_path: launched.paths.record,
+        run_id: nativeRun.runId, harness: harnessAdapter.id, launch_mode: harnessAdapter.launchMode,
+        node_id: nodeId || null, record_path: nativeRun.paths.record,
       });
     }
-    out(`run:     ${launched.runId} (${harnessAdapter.label} supervisor ${launched.state.state || "launching"})`);
-    out(`log:     ${launched.paths.log}`);
-    out(`report:  ${launched.paths.report}`);
-    if (launched.state.session_id) out(`session: ${launched.state.session_id}`);
-    return 0;
-  }
+    out(`run:     ${nativeRun.runId} (${harnessAdapter.label}; 'spor runs' for its outcome)`);
+    if (!launcherOk) {
+      // A non-zero exit here means the harness never left a background agent
+      // behind — the same "no agent will ever attend this node" case the
+      // spawn-error branch above already aborts on, so it needs the same
+      // releaseClaimOnAbort() so the claim doesn't strand the node.
+      err(`${harnessBin} exited ${r.status == null ? "abnormally" : r.status} without leaving a background agent`);
+      await releaseClaimOnAbort();
+      return r.status == null ? 1 : r.status;
+    }
 
-  const nativeArgs = harnessAdapter.buildArgs({
-    name,
-    model: effectiveModel,
-    permissionMode: permMode,
-    agent,
-    mcpConfig: agentMcpFile,
-    prompt,
-    readOnly: readOnlyPosture,
-  });
-  // A durable run record for the NATIVE-background launch (the `--bg` opt-in;
-  // the supervised default writes its own record from the supervisor,
-  // inc-spor-dispatch-session-vanished-2026-07-18). `claude --bg` hands the
-  // child to its own daemon and returns, so this launcher never observes the
-  // child's exit, and `claude agents --json` lists only LIVE agents — a run that
-  // finished and a run that died look identical afterwards, which is precisely
-  // how the 2026-07-18 Sonnet dispatches "vanished". Write the record at every
-  // boundary we DO observe (launch, launcher exit, session bind); `spor runs`
-  // classifies the terminal outcome later from the harness's own transcript.
-  dispatchRuns.pruneRuns(cfg.userConfigHome(), { maxAgeMs: cfg.getNum("dispatch.runRetentionMs", 1209600000) });
-  const nativeRun = dispatchRuns.beginNativeRun(cfg.userConfigHome(), {
-    harness: harnessAdapter.id, name, nodeId, cwd: launchDir, model: effectiveModel || null,
-  });
-  // The agent's git must follow launchDir (its worktree, or the target checkout),
-  // so hand it an env scrubbed of the git location vars — an ambient GIT_DIR
-  // would otherwise point every commit it makes at the LAUNCHER's repo
-  // (issue-spor-dispatch-worktree-wrong-repo-location). PWD gets the same
-  // treatment as the supervised launch's cwd-agreeing env (opencodePrepareRun):
-  // a spawn's `cwd` moves the child's real working directory but leaves the
-  // INHERITED `PWD` pointing at the launcher's — pin it to launchDir so the two
-  // launch modes agree instead of disagreeing about which env var is authoritative.
-  const r = spawnPortableSync(harnessBin, nativeArgs, { cwd: launchDir, stdio: "inherit", env: { ...u.gitEnv(), PWD: launchDir } });
-  if (r.error) {
-    dispatchRuns.updateRun(nativeRun, {
-      state: "failed_launch", termination_class: "launch", termination_signal: "launch-failed",
-      termination_reason: r.error.message, error: r.error.message, finished_at: new Date().toISOString(),
-      // A terminal record must always carry an outcome
-      // (task-spor-dispatch-terminal-states-contract). Nothing here was checked
-      // against the graph — no agent ever ran — so it is unenforced, and the
-      // lease is handed back by releaseClaimOnAbort() below rather than by the
-      // contract.
-      ...dispatchRuns.unenforcedOutcome("failed_launch", "the harness process could not be started, so nothing was verified against the graph"),
-    });
-    err(`could not launch ${harnessBin}: ${r.error.message}`);
-    await releaseClaimOnAbort();
-    return 1;
-  }
-  const launcherOk = r.status === 0;
-  dispatchRuns.updateRun(nativeRun, launcherOk
-    ? { state: "running", launched_at: new Date().toISOString(), launcher_exit: 0 }
-    : {
-        state: "failed_launch", launcher_exit: r.status == null ? null : r.status,
-        termination_class: "launch", termination_signal: "launcher-nonzero",
-        termination_reason: `${harnessBin} exited ${r.status == null ? "abnormally" : r.status} without leaving a background agent`,
-        finished_at: new Date().toISOString(),
-        ...dispatchRuns.unenforcedOutcome("failed_launch", "the harness left no background agent, so nothing was verified against the graph"),
-      });
-  if (ctx && ctx.onLaunch && launcherOk) {
-    ctx.onLaunch({
-      run_id: nativeRun.runId, harness: harnessAdapter.id, launch_mode: harnessAdapter.launchMode,
-      node_id: nodeId || null, record_path: nativeRun.paths.record,
-    });
-  }
-  out(`run:     ${nativeRun.runId} (${harnessAdapter.label}; 'spor runs' for its outcome)`);
-  if (!launcherOk) {
-    // A non-zero exit here means the harness never left a background agent
-    // behind — the same "no agent will ever attend this node" case the
-    // spawn-error branch above already aborts on, so it needs the same
-    // releaseClaimOnAbort() so the claim doesn't strand the node.
-    err(`${harnessBin} exited ${r.status == null ? "abnormally" : r.status} without leaving a background agent`);
-    await releaseClaimOnAbort();
-    return r.status == null ? 1 : r.status;
-  }
-
-  // Late session binding for the NATIVE-background `--bg` opt-in
-  // (dec-spor-dispatch-bg-session-late-bind; a supervised run binds its session
-  // from its own stream in the supervisor instead). `claude --bg`
-  // has now self-allocated its run session and registered the agent; read the
-  // REAL session from `claude agents --json` and bind it: (a) rebind the agent
-  // token's session so every subsequent agent write stamps the real run, and
-  // (b) renew the lease to it so lease and token agree (instead of waiting for
-  // the agent's first heartbeat to self-heal). Best-effort throughout — a capture
-  // miss or any bind failure leaves the token session-null (writes carry no
-  // session: honest, never a phantom) and the lease self-healing via heartbeat.
-  // Remote only, and only when there's something to bind (an agent token and/or a
-  // claimed node).
-  //
-  // The capture itself now runs in BOTH modes, because the session id is the
-  // only thing that ties a run to its own transcript: a project dir is one
-  // CHECKOUT, and every `--no-worktree` dispatch into the same repo shares it,
-  // so without this a run can only be identified by co-location — which is how
-  // a live sibling agent held a dead run open and donated it a transcript
-  // (issue-spor-dispatch-run-liveness-same-cwd-misattribution). Only the
-  // remote-side binding below stays remote-only. Best-effort: a capture miss
-  // leaves the record honestly session-less rather than guessing.
-  const realSession = await captureDispatchSession(cfg, name, launchDir, pinnedSession, Date.parse(nativeRun.record.created_at) || 0);
-  // Record the session whether or not the remote bind succeeds: it is the
-  // pointer `spor runs` follows to the harness transcript that holds this
-  // run's terminal reason.
-  if (realSession) dispatchRuns.updateRun(nativeRun, { session_id: realSession, bound_at: new Date().toISOString() });
-  const wantBind = cfg.mode() === "remote" && (agentToken || (nodeId && !backfill && !noClaim));
-  if (wantBind) {
-    if (realSession) {
-      if (agentToken) {
-        const b = await bindAgentSession(cfg, agentToken, realSession);
-        if (b.ok) out(`session: ${realSession} (bound — the agent's writes trace to this run)`);
-        else if (b.conflict) err(`note: the agent token is already bound to another session — leaving it.`);
-        // absent/transport error: token stays session-deferred (no phantom) — silent, fail-open.
-      } else {
-        out(`session: ${realSession}`);
+    // Late session binding for the NATIVE-background `--bg` opt-in
+    // (dec-spor-dispatch-bg-session-late-bind; a supervised run binds its session
+    // from its own stream in the supervisor instead). `claude --bg`
+    // has now self-allocated its run session and registered the agent; read the
+    // REAL session from `claude agents --json` and bind it: (a) rebind the agent
+    // token's session so every subsequent agent write stamps the real run, and
+    // (b) renew the lease to it so lease and token agree (instead of waiting for
+    // the agent's first heartbeat to self-heal). Best-effort throughout — a capture
+    // miss or any bind failure leaves the token session-null (writes carry no
+    // session: honest, never a phantom) and the lease self-healing via heartbeat.
+    // Remote only, and only when there's something to bind (an agent token and/or a
+    // claimed node).
+    //
+    // The capture itself now runs in BOTH modes, because the session id is the
+    // only thing that ties a run to its own transcript: a project dir is one
+    // CHECKOUT, and every `--no-worktree` dispatch into the same repo shares it,
+    // so without this a run can only be identified by co-location — which is how
+    // a live sibling agent held a dead run open and donated it a transcript
+    // (issue-spor-dispatch-run-liveness-same-cwd-misattribution). Only the
+    // remote-side binding below stays remote-only. Best-effort: a capture miss
+    // leaves the record honestly session-less rather than guessing.
+    const realSession = await captureDispatchSession(cfg, name, launchDir, pinnedSession, Date.parse(nativeRun.record.created_at) || 0);
+    // Record the session whether or not the remote bind succeeds: it is the
+    // pointer `spor runs` follows to the harness transcript that holds this
+    // run's terminal reason.
+    if (realSession) dispatchRuns.updateRun(nativeRun, { session_id: realSession, bound_at: new Date().toISOString() });
+    const wantBind = cfg.mode() === "remote" && (agentToken || (nodeId && !backfill && !noClaim));
+    if (wantBind) {
+      if (realSession) {
+        if (agentToken) {
+          const b = await bindAgentSession(cfg, agentToken, realSession);
+          if (b.ok) out(`session: ${realSession} (bound — the agent's writes trace to this run)`);
+          else if (b.conflict) err(`note: the agent token is already bound to another session — leaving it.`);
+          // absent/transport error: token stays session-deferred (no phantom) — silent, fail-open.
+        } else {
+          out(`session: ${realSession}`);
+        }
+        if (nodeId && !backfill && !noClaim) await renewDispatch(cfg, nodeId, realSession);
+      } else if (agentToken) {
+        err(`note: could not read the run session from 'claude agents' — writes will carry no session stamp (the lease still self-heals).`);
       }
-      if (nodeId && !backfill && !noClaim) await renewDispatch(cfg, nodeId, realSession);
-    } else if (agentToken) {
-      err(`note: could not read the run session from 'claude agents' — writes will carry no session stamp (the lease still self-heals).`);
     }
+    return r.status == null ? 1 : r.status;
+  } finally {
+    releaseLocalDispatchLock(localDispatchLock);
   }
-  return r.status == null ? 1 : r.status;
 }
 
 // --- spor work: the pull-based continuous worker loop (task-spor-work-loop) --
@@ -16099,7 +16192,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
+module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, proposeIntegrationPR, ghPrStatus, integrationSatisfiability };
 
 if (require.main === module) {
   main()
