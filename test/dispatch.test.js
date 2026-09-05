@@ -2765,6 +2765,54 @@ test("dispatch <node-id> --print (local): previews the resolved warning; --force
   assert.doesNotMatch(clean.stdout, /resolved:/);
 });
 
+// issue-spor-dispatch-offline-check-graph-load-order: the LOCAL-mode guard
+// must consult the LOADED GRAPH's registry before it ever falls back to the
+// offline seed-only vocabulary — a graph-resident schema override making a
+// seed-terminal status live again must not be silently outrun by an offline
+// check that runs first. `released` is exactly the artifact-scoped status the
+// seed pack calls terminal (schema-artifact's own status.terminal); a resident
+// override here drops it from that partition, so a node reading `released`
+// must dispatch normally under the override rather than being wrongly
+// refused as already-resolved.
+function residentOverrideFixture() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-override-"));
+  const nodes = path.join(home, "nodes");
+  fs.mkdirSync(nodes, { recursive: true });
+  fs.writeFileSync(
+    path.join(nodes, "schema-node-artifact-live-override.md"),
+    `---\nid: schema-node-artifact-live-override\ntype: schema\nkind: node-schema\nschema_version: 2026.06.10.5\ntitle: Artifact override making 'released' live\nsummary: A graph-resident override removing 'released' from the artifact terminal partition.\ndate: 2026-06-10\nstatus: active\n---\n\n` +
+      "```json\n" +
+      JSON.stringify({ node_type: "artifact", prefix: ["art-"], status: { terminal: ["merged", "done"] } }) +
+      "\n```\n"
+  );
+  fs.writeFileSync(
+    path.join(nodes, "art-live-released.md"),
+    `---\nid: art-live-released\ntype: artifact\nrepo: demo\nstatus: released\ntitle: A released artifact kept live by the resident override\nsummary: An artifact whose status the seed pack would call terminal, but a graph-resident override keeps live.\ndate: 2026-06-01\n---\nbody\n`
+  );
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-disp-repo-"));
+  return { home, nodes, repo };
+}
+
+test("dispatch <node-id> (local): a resident schema override making a seed-terminal status ACTIVE is honored — dispatch proceeds", async () => {
+  const { home, repo } = residentOverrideFixture();
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "art-live-released", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.ok(await waitForFile(sentinel), "the override makes 'released' live, so the loaded graph must not skip this node");
+});
+
+test("dispatch <node-id> (local): the SAME released artifact refuses once the resident override is removed (offline vocabulary alone would already catch this)", () => {
+  const { home, nodes, repo } = residentOverrideFixture();
+  fs.unlinkSync(path.join(nodes, "schema-node-artifact-live-override.md"));
+  const sentinel = path.join(home, "g-launched");
+  const stub = claudeStub(home, sentinel);
+  const r = run(["dispatch", "art-live-released", "--dir", repo, "--no-brief"], { SPOR_HOME: home, SPOR_CLAUDE_CMD: stub });
+  assert.strictEqual(r.status, 1, r.stderr);
+  assert.match(r.stderr, /art-live-released is already resolved \(status: released\)/);
+  assert.ok(!fs.existsSync(sentinel), "without the override the seed partition is authoritative and the artifact is terminal");
+});
+
 test("dispatch <node-id> (remote): a node the server reports resolved refuses BEFORE the claim — no claim POST, no launch", async () => {
   const { home, repo } = fixture();
   // The server's get(node) surfaces the inbound resolver as `resolution` (API.md §3).
