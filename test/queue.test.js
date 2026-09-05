@@ -1434,6 +1434,25 @@ Body.
   assert.equal(graph.projectKnown(g, "sol"), false, "a near-miss typo is unknown");
 });
 
+test("projectKnown: an ordinary task/issue/decision node id is NOT known (issue-spor-kernel-project-known-accepts-arbitrary-nodes)", () => {
+  const g = tmpGraph(Object.fromEntries([
+    node("task-x", "task", { status: "open" }),
+    node("issue-y", "issue", { status: "open" }),
+    node("dec-z", "decision", { status: "proposed" }),
+  ])).load();
+  assert.equal(graph.projectKnown(g, "task-x"), false, "an existing task id is not a scope identity");
+  assert.equal(graph.projectKnown(g, "issue-y"), false, "an existing issue id is not a scope identity");
+  assert.equal(graph.projectKnown(g, "dec-z"), false, "an existing decision id is not a scope identity");
+});
+
+test("projectKnown: prototype keys (constructor, toString, __proto__) are not known", () => {
+  const g = tmpGraph(Object.fromEntries([node("task-x", "task", { status: "open" })])).load();
+  assert.equal(graph.projectKnown(g, "constructor"), false);
+  assert.equal(graph.projectKnown(g, "toString"), false);
+  assert.equal(graph.projectKnown(g, "__proto__"), false);
+  assert.equal(graph.projectKnown(g, "hasOwnProperty"), false);
+});
+
 // ---------- memoization of HEAD-pure derived indexes (task-cc-rankqueue-memoization) ----------
 //
 // rankQueue caches resolutionMap, openFindingsMap, blockersIndex, and per-item
