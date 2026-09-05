@@ -176,6 +176,47 @@ test("a command gate whose suite fails escalates to a human item, and the fact c
   assert.match(seen.facts[0].markdown, /Escalated to task-gate-acceptance/);
 });
 
+// task-spor-gate-runner-record-takes-outcome-not-picked-fields: `record` takes
+// the gate's OUTCOME object WHOLE. Its three call sites (the pass path, the
+// rescue-first write, the escalation write) each used to spell out the fields
+// it forwarded by hand, so a field added to the outcome reached one fact and
+// was silently dropped by the others — F7 on task-spor-factory-flake-rescue-
+// should-not-burn-when-failure-is-off-diff, where a charged off-diff pass
+// wrote a fact linking none of the flake issues that same run had just filed.
+test("gateFactFields carries EVERY outcome field into the fact, and only the call site's own additions override it", () => {
+  const outcome = { passed: false, verdict: "failed", detail: "the suite failed", evidence: "1 failing", ledger: [{ id: "F1" }], flake: ["issue-flake-lib-x"] };
+  const fields = gateRunner.gateFactFields(outcome, { attempts: [{ verdict: "failed" }], ledger: [{ id: "F2" }], rescue: 2 });
+  assert.deepStrictEqual(fields.flake, ["issue-flake-lib-x"], "a field no call site names by hand still reaches the fact");
+  assert.strictEqual(fields.evidence, "1 failing");
+  assert.strictEqual(fields.detail, "the suite failed");
+  assert.deepStrictEqual(fields.ledger, [{ id: "F2" }], "where they collide the call site's own addition wins — that is what an extra IS");
+  assert.strictEqual(fields.rescue, 2);
+  // The two defaults `record` used to apply while destructuring, including for
+  // a key a site passes as an explicit undefined.
+  assert.strictEqual(gateRunner.gateFactFields(outcome, {}).rescue, 0);
+  assert.strictEqual(gateRunner.gateFactFields(outcome, {}).rescueNext, null);
+  assert.strictEqual(gateRunner.gateFactFields(outcome, { rescue: undefined }).rescue, 0);
+  assert.strictEqual(gateRunner.gateFactFields(outcome, { rescueNext: undefined }).rescueNext, null);
+});
+
+test("both FAILURE paths record what the outcome carried — the fact handed to the rescue and the escalation's fact say what a passing one would have", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }], rescue: { profile: "profile-claude-fable" } });
+  const { deps, seen } = fakes({ suite: () => ({ ok: false, code: 1, output: "1 failing\n  the sync worker drops records\n" }) });
+  deps.rescue = async () => ({ ok: true, runId: "run-rescue-1", diagnosis: "the suite is genuinely red", category: "real-defect", fixed: true, filed: [] });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  const gateFacts = seen.facts.filter((f) => f.id.startsWith("art-gate-"));
+  assert.strictEqual(gateFacts.length, 2, "the refusal handed to the rescue, and the rescue pass's own refusal");
+  for (const f of gateFacts) {
+    assert.match(f.markdown, /the sync worker drops records/, "the outcome's evidence rides EVERY fact, not just the pass path's");
+    assert.match(f.markdown, /Outcome: `npm test` exited 1/, "so does the outcome's detail");
+  }
+  // The only thing that differs between the two is what each SITE adds.
+  assert.match(gateFacts[0].markdown, /Rescue: attempt 1 of 1 under `profile-claude-fable`/);
+  assert.doesNotMatch(gateFacts[0].markdown, /Escalated to/, "the refusal the rescue takes next is not yet an escalation");
+  assert.match(gateFacts[1].markdown, /Escalated to task-gate-acceptance/);
+});
+
 // task-spor-factory-spor-flaky-command-gate-needs-fix-cycle-or-rerun: a
 // declared rerun budget re-runs the SAME suite on the SAME tree before a
 // failure is charged, so a flake costs a suite run, never a fix cycle, a
