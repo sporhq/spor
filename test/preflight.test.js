@@ -340,7 +340,7 @@ test("a lock's TTL bounds only an UNVERIFIABLE holder — a verified live one ke
   assert.deepStrictEqual(preflight.workspaceLockContends("not-one-of-ours"), { contends: false, prunable: false }, "a foreign file is never touched");
 });
 
-test("two CONCURRENT processes racing for one candidate: exactly one holds it", async () => {
+test("zero-wait concurrent candidate claims are exclusive and acquire after contention clears", async () => {
   // The same-process test above cannot see the real hazard — a `wx` create is
   // open-then-write, so a cross-process racer can read a live lock as empty,
   // and a well-known lock pathname lets two contenders break one stale lock and
@@ -372,7 +372,21 @@ test("two CONCURRENT processes racing for one candidate: exactly one holds it", 
   for (let attempt = 0; attempt < 5; attempt++) {
     const [a, b] = await Promise.all([contend(), contend()]);
     const holders = [a, b].filter((r) => r.held).length;
-    assert.strictEqual(holders, 1, `exactly one contender may hold the candidate, saw ${JSON.stringify([a, b])}`);
+    for (const result of [a, b]) {
+      assert.strictEqual(typeof result.ok, "boolean", "a contender must report a real acquisition result");
+      assert.strictEqual(typeof result.held, "boolean", "a crashed contender is not a safe refusal");
+      assert.strictEqual(result.degraded, null, "the test must exercise the lock, not degraded unlocked operation");
+      assert.strictEqual(result.ok, result.held, "a successful non-degraded acquisition must hold a token");
+    }
+    // With no retry wait, both may observe the other's unique contender lock
+    // and safely withdraw. Exclusivity forbids TWO holders; it does not require
+    // either contender to win that first simultaneous observation.
+    assert.ok(holders <= 1, `at most one contender may hold the candidate, saw ${JSON.stringify([a, b])}`);
+    // Both children have now exited. A fresh acquisition must make progress,
+    // including when the zero-wait attempt left no winner at all.
+    const next = await preflight.acquireWorkspace(home, dir, { waitMs: 1000 });
+    assert.ok(next.ok && next.token, `acquisition must succeed once contention clears: ${JSON.stringify(next)}`);
+    preflight.releaseWorkspace(next.token);
     // A stale lock from the previous round must not let both in next time.
     for (const f of fs.readdirSync(path.join(home, "journal", "workspace"))) {
       fs.rmSync(path.join(home, "journal", "workspace", f), { force: true });
