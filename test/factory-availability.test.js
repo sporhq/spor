@@ -183,3 +183,81 @@ test("candidate remote probe stays below its output bound with thousands of adve
   assert.equal(result.ok, true, result.reason);
   assert.deepEqual(calls, [["ls-remote", "origin", "HEAD"]]);
 });
+
+function isolatedSshEnv(t) {
+  const keys = ["GIT_SSH_COMMAND", "GIT_SSH", "GIT_SSH_VARIANT", "GIT_ASKPASS", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "DISPLAY", "SPOR_ATTESTATION_KEY"];
+  const previous = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+  for (const k of keys) delete process.env[k];
+  t.after(() => { for (const k of keys) { if (previous[k] === undefined) delete process.env[k]; else process.env[k] = previous[k]; } });
+}
+function sshFixture(t, { hanging = false } = {}) {
+  const f = fixture();
+  const { gitSpawn } = require("../lib/shell/git-exec.js");
+  const init = gitSpawn(f.cwd, ["init", "--bare", "--initial-branch=main"]);
+  assert.equal(init.status, 0, init.stderr);
+  fs.writeFileSync(path.join(f.cwd, "refs", "heads", "main"), "a".repeat(40) + "\n");
+  assert.equal(gitSpawn(f.cwd, ["remote", "add", "origin", "probe.invalid:repo"]).status, 0);
+  const record = path.join(f.home, "ssh-invocation.json");
+  const wrapper = path.join(f.home, "configured ssh wrapper");
+  const body = hanging
+    ? `const child = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], {stdio:'inherit'}); fs.writeFileSync(${JSON.stringify(record)}, JSON.stringify({pid:process.pid,child:child.pid})); setInterval(()=>{},1000);`
+    : `let tty = false; try { const fd = fs.openSync('/dev/tty','r'); fs.closeSync(fd); tty = true; } catch {}\nfs.writeFileSync(${JSON.stringify(record)}, JSON.stringify({args:process.argv.slice(2),tty,terminal:process.env.GIT_TERMINAL_PROMPT,askpass:process.env.GIT_ASKPASS,sshAskpass:process.env.SSH_ASKPASS,requireAskpass:process.env.SSH_ASKPASS_REQUIRE,display:process.env.DISPLAY,signing:process.env.SPOR_ATTESTATION_KEY,command:process.env.GIT_SSH_COMMAND,ssh:process.env.GIT_SSH,variant:process.env.GIT_SSH_VARIANT}));\nconst r = require('node:child_process').spawnSync('git',['upload-pack',${JSON.stringify(f.cwd)}],{stdio:'inherit'}); process.exit(r.status ?? 1);`;
+  fs.writeFileSync(wrapper, `#!${process.execPath}\nconst fs=require('node:fs');\n${body}\n`, { mode: 0o700 });
+  return { ...f, record, wrapper, gitSpawn };
+}
+
+for (const transport of ["environment-command", "core-command", "ssh-executable", "tortoiseplink-variant"]) {
+  test(`availability uses configured ${transport} through actual Git without a network connection`, { skip: process.platform === "win32" }, async t => {
+    isolatedSshEnv(t);
+    const f = sshFixture(t);
+    const command = `'${f.wrapper.replaceAll("'", "'\\''")}' --configured-route`;
+    process.env.GIT_SSH_VARIANT = transport === "tortoiseplink-variant" ? "tortoiseplink" : "simple";
+    if (transport === "core-command") assert.equal(f.gitSpawn(f.cwd, ["config", "core.sshCommand", command]).status, 0);
+    else if (transport === "ssh-executable") process.env.GIT_SSH = f.wrapper;
+    else process.env.GIT_SSH_COMMAND = command;
+    process.env.GIT_ASKPASS = "/must-not-run";
+    process.env.SSH_ASKPASS = "/must-not-run";
+    process.env.SSH_ASKPASS_REQUIRE = "force";
+    process.env.DISPLAY = ":must-not-open";
+    process.env.SPOR_ATTESTATION_KEY = "must-not-reach-transport";
+    const result = await availability.probeFactoryAvailability({ ...f.args, factory: { integration: { mode: "push", targetRef: "origin/main" } } });
+    assert.equal(result.ok, true, result.reason);
+    const observed = JSON.parse(fs.readFileSync(f.record, "utf8"));
+    assert.equal(observed.tty, false);
+    assert.equal(observed.terminal, "0");
+    assert.equal(observed.askpass, ""); assert.equal(observed.sshAskpass, "");
+    assert.equal(observed.requireAskpass, "never"); assert.equal(observed.display, undefined);
+    assert.equal(observed.signing, undefined);
+    assert.equal(observed.variant, process.env.GIT_SSH_VARIANT);
+    assert.equal(observed.command, process.env.GIT_SSH_COMMAND);
+    assert.equal(observed.ssh, process.env.GIT_SSH);
+    assert.equal(observed.args.some(arg => arg.includes("BatchMode")), false, "do not translate arbitrary transport commands into OpenSSH");
+    if (transport !== "ssh-executable") assert.ok(observed.args.includes("--configured-route"));
+    if (transport === "tortoiseplink-variant") assert.ok(observed.args.includes("-batch"), "Git's own variant behavior is retained");
+  });
+}
+
+test("availability timeout kills the owned POSIX Git/SSH group including a child holding output pipes", { skip: process.platform !== "linux", timeout: 15000 }, async t => {
+  isolatedSshEnv(t);
+  const f = sshFixture(t, { hanging: true });
+  process.env.GIT_SSH_COMMAND = `'${f.wrapper.replaceAll("'", "'\\''")}'`;
+  process.env.GIT_SSH_VARIANT = "simple";
+  let observed;
+  t.after(() => {
+    if (!observed && fs.existsSync(f.record)) observed = JSON.parse(fs.readFileSync(f.record, "utf8"));
+    for (const pid of observed ? [observed.pid, observed.child] : []) { try { process.kill(pid, "SIGKILL"); } catch {} }
+  });
+  const start = Date.now();
+  const result = await availability.probeFactoryAvailability({ ...f.args, factory: { integration: { mode: "push", targetRef: "origin/main" } } });
+  const elapsed = Date.now() - start;
+  assert.equal(result.ok, false);
+  assert.ok(elapsed >= 4500 && elapsed < 10000, `five-second probe returned in ${elapsed}ms`);
+  observed = JSON.parse(fs.readFileSync(f.record, "utf8"));
+  const terminated = pid => {
+    try { const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8"); return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z "); }
+    catch (e) { if (e.code === "ENOENT") return true; throw e; }
+  };
+  for (let attempt = 0; attempt < 50 && ![observed.pid, observed.child].every(terminated); attempt++) await new Promise(resolve => setTimeout(resolve, 20));
+  assert.ok(terminated(observed.pid), "SSH wrapper is no longer running");
+  assert.ok(terminated(observed.child), "inherited-pipe child is no longer running");
+});
