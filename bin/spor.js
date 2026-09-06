@@ -13003,7 +13003,7 @@ function refuseDirtyCandidate(factory, cwd) {
 
 function makeGateDeps(
   cfg,
-  { record, entry, factory, slug, passthrough, warn, sleep, log, workerId = null, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, runIdleMs = workLoop.WORK_DEFAULTS.runIdleMs, stopping = () => false, dispatch = dispatchThrough, home = cfg.userConfigHome() }
+  { record, entry, factory, slug, passthrough, warn, sleep, log, workerId = null, gateOwner = undefined, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, runIdleMs = workLoop.WORK_DEFAULTS.runIdleMs, stopping = () => false, dispatch = dispatchThrough, home = cfg.userConfigHome() }
 ) {
   const date = () => new Date().toISOString().slice(0, 10);
   const stem = gateStem(entry.node_id);
@@ -13017,6 +13017,18 @@ function makeGateDeps(
   // Pass 0 hands back the exact keys above.
   const keysFor = (rescue) => (rescue ? { short: gateRunner.shortRunAttempt(entry.run_id, entry.attempt, rescue), runKey: gateRunner.gateRunKey(entry.run_id, entry.attempt, rescue) } : { short, runKey });
   const progressKey = (gate, rescue) => (rescue ? `${gate.id}#x${rescue}` : gate.id);
+  // Capture the owning nonce once, never refresh it after another adopter
+  // takes over. The controller supplies its claim explicitly; standalone
+  // callers inherit only the record they observed when creating these deps.
+  const progressOwner = gateOwner !== undefined ? gateOwner : (() => {
+    try { const r = dispatchRuns.readJson(dispatchRuns.runPaths(home, entry.run_id).record); return r ? r.gate_settle_id ?? r.gate_at ?? null : null; }
+    catch { return null; }
+  })();
+  const updateGateProgress = (mutate, sidePatch = {}) => {
+    const result = dispatchRuns.updateGateProgress(home, entry.run_id, mutate, { key: runKey, attempt: entry.attempt, own: progressOwner, sidePatch });
+    if (!result.ok) throw new Error(`the run record could not be updated: ${result.reason}`);
+    return result.progress;
+  };
   let change = null;
   // The local graph, loaded lazily and at most once, for the one inbound fact
   // the `node` dep cannot read off a node's own file (see there). Remote mode
@@ -13547,7 +13559,7 @@ function makeGateDeps(
     // resumed pipeline whose progress save never landed (the crash window
     // between this stamp and `onLaunch` below) can read the launch back from
     // the stamp instead of taking the fix for undispatched (loadGateProgress).
-    dispatchRuns.stampGateState(home, entry.run_id, { gate_fix_run_id: launched.run.run_id, gate_fix_at: new Date().toISOString(), gate_fix_gate: gate.id, gate_fix_cycle: cycle });
+    updateGateProgress(null, { gate_fix_run_id: launched.run.run_id, gate_fix_at: new Date().toISOString(), gate_fix_gate: gate.id, gate_fix_cycle: cycle });
     // …and the runner charges the fix cycle to the gate's progress at this
     // same moment: launched, not merely decided on (a worker killed before
     // this line resumes INTO the fix; one killed after it resumes past it).
@@ -13608,21 +13620,7 @@ function makeGateDeps(
     }
     return { ...p, lastFix };
   };
-  const saveGateProgress = async ({ gate, progress, rescue = 0 }) => {
-    const r = readRecordNow();
-    const prev = r && r.gate_progress && r.gate_progress.key === runKey && r.gate_progress.gates && typeof r.gate_progress.gates === "object" ? r.gate_progress.gates : {};
-    // The rescue lane's own entries and the pipeline's shared infrastructure
-    // pool ride beside the gates under the same key (loadRescueState /
-    // loadGatePools below) and are carried, never dropped, by a gate save.
-    const carried = r && r.gate_progress && r.gate_progress.key === runKey && Array.isArray(r.gate_progress.rescue) ? { rescue: r.gate_progress.rescue } : {};
-    const carriedPools = r && r.gate_progress && r.gate_progress.key === runKey && r.gate_progress.pools && typeof r.gate_progress.pools === "object" ? { pools: r.gate_progress.pools } : {};
-    const stamp = { key: runKey, at: new Date().toISOString(), seq: (prev && r && r.gate_progress && Number.isInteger(r.gate_progress.seq) ? r.gate_progress.seq : 0) + 1, gates: { ...prev, [progressKey(gate, rescue)]: progress }, ...carried, ...carriedPools };
-    const wrote = dispatchRuns.stampGateState(home, entry.run_id, { gate_progress: stamp });
-    // stampGateState hands back the record UNCHANGED (not null) when the
-    // verdict is already settled; a progress write that did not land is a
-    // failure the runner should hear about, not a silent no-op.
-    if (!wrote || wrote.gate_progress !== stamp) throw new Error("the run record could not be updated");
-  };
+  const saveGateProgress = async ({ gate, progress, rescue = 0 }) => updateGateProgress({ gates: { [progressKey(gate, rescue)]: progress } });
   // The rescue lane's durable state (task-spor-factory-rescue-lane): one
   // entry per rescue attempt — the refusal it was handed, the seed its gate
   // pass starts from, its run and its diagnosis — on the same `gate_progress`
@@ -13643,13 +13641,7 @@ function makeGateDeps(
       return out;
     });
   };
-  const saveRescueState = async ({ rescues }) => {
-    const r = readRecordNow();
-    const prevAll = r && r.gate_progress && r.gate_progress.key === runKey ? r.gate_progress : null;
-    const stamp = { key: runKey, at: new Date().toISOString(), seq: (prevAll && Number.isInteger(prevAll.seq) ? prevAll.seq : 0) + 1, gates: prevAll && prevAll.gates && typeof prevAll.gates === "object" ? prevAll.gates : {}, rescue: rescues, ...(prevAll && prevAll.pools && typeof prevAll.pools === "object" ? { pools: prevAll.pools } : {}) };
-    const wrote = dispatchRuns.stampGateState(home, entry.run_id, { gate_progress: stamp });
-    if (!wrote || wrote.gate_progress !== stamp) throw new Error("the run record could not be updated");
-  };
+  const saveRescueState = async ({ rescues }) => updateGateProgress({ rescue: rescues });
 
   // The pipeline's shared INFRASTRUCTURE pool (FACTORY-IMPLEMENTATION-STAGE.md
   // §5.3, task-spor-factory-execution-outcome-classifier): ONE count for the
@@ -13675,8 +13667,9 @@ function makeGateDeps(
   //   (c) the check-then-write race — one worker owns a pipeline: a second is
   //       kept off the node by the gating-slot exclusion, and an ORPHAN is
   //       adopted only after its worker is dead (§10.8), reading this count
-  //       back before it charges. The write itself goes through
-  //       `stampGateState`, which refuses to overwrite a settled verdict.
+  //       back before it charges. The merging writer checks the captured
+  //       owner and attempt under the record lock and refuses settled state.
+  //       Atomic reservations can use updateGateProgress's fresh callback.
   //   (d) a stale count against settled state — the count is keyed on the
   //       ATTEMPT's run key, so a `--regate` reads none and starts fresh (the
   //       outage that exhausted the last pool may be long over), and a
@@ -13687,20 +13680,10 @@ function makeGateDeps(
     if (!all || all.key !== runKey || !all.pools || typeof all.pools !== "object") return null;
     return all.pools;
   };
-  const saveGatePools = async ({ pools }) => {
-    const r = readRecordNow();
-    const prevAll = r && r.gate_progress && r.gate_progress.key === runKey ? r.gate_progress : null;
-    const stamp = {
-      key: runKey,
-      at: new Date().toISOString(),
-      seq: (prevAll && Number.isInteger(prevAll.seq) ? prevAll.seq : 0) + 1,
-      gates: prevAll && prevAll.gates && typeof prevAll.gates === "object" ? prevAll.gates : {},
-      ...(prevAll && Array.isArray(prevAll.rescue) ? { rescue: prevAll.rescue } : {}),
-      pools,
-    };
-    const wrote = dispatchRuns.stampGateState(home, entry.run_id, { gate_progress: stamp });
-    if (!wrote || wrote.gate_progress !== stamp) throw new Error("the run record could not be updated");
-  };
+  const saveGatePools = async ({ pools }) => updateGateProgress((fresh) => ({ pools: {
+    ...fresh.pools,
+    ...Object.fromEntries(Object.entries(pools).map(([name, pool]) => [name, { ...fresh.pools?.[name], ...pool }])),
+  } }));
 
   // --- the rescue lane (task-spor-factory-rescue-lane, WORKERS.md §10.10) ---
   // Composed HERE, deterministically, like the review and the fix: the
@@ -13887,7 +13870,7 @@ function makeGateDeps(
     const launched = already ? { ok: true, run: already, adopted: true } : await dispatch(cfg, values, [prompt], { allowAttended });
     if (!launched.ok) return { ok: false, reason: `the rescue under ${lane.profile} could not be dispatched: ${launched.reason}` };
     if (launched.adopted) log(`work: rescue attempt ${attempt} on ${entry.node_id} was already launched as run ${String(launched.run.run_id).slice(0, 8)} — adopting it, not dispatching again`);
-    dispatchRuns.stampGateState(home, entry.run_id, { gate_rescue_run_id: launched.run.run_id, gate_rescue_at: new Date().toISOString(), gate_rescue_attempt: attempt });
+    updateGateProgress(null, { gate_rescue_run_id: launched.run.run_id, gate_rescue_at: new Date().toISOString(), gate_rescue_attempt: attempt });
     if (onLaunch) {
       try {
         await onLaunch({ runId: launched.run.run_id });
@@ -14079,6 +14062,7 @@ function makeGateDeps(
     saveRescueState,
     loadGatePools,
     saveGatePools,
+    updateGateProgress,
     rescue,
     implement,
     loadImplAttempts,
@@ -17040,6 +17024,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     };
   }
   const ownToken = claim.ok ? claim.token : null;
+  dctx.gateOwner = ownToken;
   const controller = completionKernel.isControllerRecord(record) && ctx.factory.completion && ctx.factory.completion.by === "controller";
   // The boundary is the CLAIM's (pinned at H1), never the factory node's
   // current text — an edit mid-pipeline changes nothing (§7.2).

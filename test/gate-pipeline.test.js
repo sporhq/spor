@@ -4621,6 +4621,11 @@ test("the review dispatch is read-only and carries the work item, the diff, the 
   // And the fix prompt names the findings by id, splits advisory from blocking,
   // and lists what earlier cycles already resolved.
   let fixLaunch = null;
+  // The fix launch now checks its durable parent stamp instead of silently
+  // continuing when the prompt-only fixture has no parent run record.
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").record, {
+    run_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", node_id: "task-fix-me", state: "done",
+  });
   const fixDeps = sporCli.makeGateDeps(cfg, {
     record: { node_id: "task-fix-me", cwd: repo }, entry: { run_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", node_id: "task-fix-me", project: null },
     factory: { id: "factory-test" }, slug: null, passthrough: { sandbox: "danger-full-access", "permission-mode": "bypassPermissions", model: "worker-model" },
