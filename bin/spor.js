@@ -9606,6 +9606,13 @@ async function cmdRuns(cfg, { values, positionals: pos }) {
       if (r.gates_state || r.integration_state) out(`              gates ${r.gates_state || "-"}, integration ${r.integration_state || "-"}`);
       if (Array.isArray(r.completion_premature) && r.completion_premature.length) out(`              premature resolution retyped: ${r.completion_premature.join(", ")}`);
     }
+    // WHY a candidate reads `unpublished` above. Without it the summary says a
+    // publish is owed and the only record of what is blocking it is a log line
+    // that scrolled past — which is exactly the state an operator is reading
+    // `spor runs` to understand.
+    if (r.publish_pending && r.publish_pending.reason) {
+      out(`  publish:    owed (${r.publish_pending.classification || "failed"}) — ${r.publish_pending.reason}`);
+    }
     if (r.child_reaped) out(`  reaped:     an orphaned harness child was terminated at reconciliation`);
     if (r.cwd) out(`  cwd:        ${r.cwd}`);
     if (r.session_id) out(`  session:    ${r.session_id}`);
@@ -13495,26 +13502,29 @@ function makeGateDeps(
         const policy = factory.implementation.candidate || {};
         const kinds = candidatePublish.publishKinds(policy.publish);
         let store = null;
+        let storeReason = "";
         if (kinds.includes("bundle")) {
           const resolved = candidatePublish.resolveBundleStore(factory, { graphHome: home, mode: cfg.mode() });
           // A store the worker's own startup check already refused is reported
           // here too rather than silently skipped: this closure also runs for a
-          // pipeline RESUMED by a worker that never made that check.
+          // pipeline RESUMED by a worker that never made that check. It is
+          // handed to the publisher as the REASON rather than short-circuiting,
+          // so the failure leaves the same `publish_attempts` trail every other
+          // one does.
           store = resolved.errors.length ? null : resolved.store;
-          if (resolved.errors.length) publishPending = { reason: resolved.errors[0], classification: "infrastructure", at: new Date().toISOString() };
+          storeReason = resolved.errors[0] || "";
         }
-        if (!publishPending) {
-          const published = await candidatePublish.publishCandidate(folded.candidate, {
-            cwd: (folded.candidate.provenance && folded.candidate.provenance.cwd) || record.cwd || null,
-            publish: policy.publish,
-            bundleStore: store,
-            remote: policy.remote,
-            http: candidatePublish.httpStoreClient({ bearer: cfg.mode() === "remote" ? remote.token(cfg) : null }),
-          });
-          folded = { ...folded, candidate: published.candidate || folded.candidate };
-          if (!published.ok) publishPending = { reason: published.reason, classification: published.classification, at: new Date().toISOString() };
-          else if (published.published) log(`work: published candidate ${folded.candidate.candidate_id} to ${folded.candidate.reference.locator}`);
-        }
+        const published = await candidatePublish.publishCandidate(folded.candidate, {
+          cwd: (folded.candidate.provenance && folded.candidate.provenance.cwd) || record.cwd || null,
+          publish: policy.publish,
+          bundleStore: store,
+          bundleStoreReason: storeReason,
+          remote: policy.remote,
+          http: candidatePublish.httpStoreClient({ bearer: cfg.mode() === "remote" ? remote.token(cfg) : null }),
+        });
+        folded = { ...folded, candidate: published.candidate || folded.candidate };
+        if (!published.ok) publishPending = { reason: published.reason, classification: published.classification, at: new Date().toISOString() };
+        else if (published.published) log(`work: published candidate ${folded.candidate.candidate_id} to ${folded.candidate.reference.locator}`);
         if (publishPending) log(`work: candidate ${folded.candidate.candidate_id} is not published yet (${publishPending.reason}) — the tree is judged regardless`);
       }
       const patch = {
@@ -13540,12 +13550,20 @@ function makeGateDeps(
         // that decides which pool an outcome charges — is
         // task-spor-factory-execution-outcome-classifier's.
         patch.impl_pool = "implementation";
-        // §3.4: submission is not complete until the reference verified, so a
-        // candidate carrying no verified reference leaves the stage UNSETTLED
-        // with the publish owed. Nothing publishes yet (that is
-        // task-spor-factory-candidate-portable-reference), so today this always
-        // reads `running` — one predicate for the publisher to satisfy rather
-        // than a rule restated at each call site.
+      }
+      // §3.4: submission is not complete until the reference verified, so a
+      // candidate carrying no verified reference leaves the stage UNSETTLED
+      // with the publish owed.
+      //
+      // Deliberately NOT confined to the first pin. §3.3's "a re-pin never
+      // touches `impl_state`" is a rule about not REOPENING a settled verdict —
+      // which `stampImplState` enforces on its own, by dropping an `impl_state`
+      // write onto an already-settled record — not a rule about never reaching
+      // one. A publish that failed and was re-attempted from the workspace
+      // settles on a LATER pin, and gating that on `created` left exactly the
+      // retry path §3.4 prescribes with a verified reference, no debt, and a
+      // stage stuck at `running` forever.
+      if (folded.change === "created" || candidateKernel.candidateSubmitted(folded.candidate)) {
         patch.impl_state = candidateKernel.candidateSubmitted(folded.candidate) ? "candidate" : "running";
       }
       const stamped = dispatchRuns.stampImplState(home, entry.run_id, patch);

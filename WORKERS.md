@@ -1111,9 +1111,15 @@ Four properties the publisher is built around:
 - **The published object is immutable and keyed by `candidate_id`.** A re-pin
   onto the same tree publishes nothing (its commit joins `commits_seen`); a
   re-pin onto a new tree is a new candidate with its own object. A store that
-  already holds the id is READ, never overwritten: the same bytes are a
-  replayed no-op (a crash after a landed publish), different bytes are a
-  `publish-conflict`.
+  already holds the id is never overwritten — it is FETCHED and asked what it
+  resolves to: our pinned commit and tree is this publish replayed (a crash
+  after a landed put, or a retry from the workspace), anything else is a
+  `publish-conflict`. Deliberately **not** a byte comparison: `git bundle
+  create` is not byte-reproducible (threaded delta search repacks differently
+  run to run), so comparing bytes would call the designed retry corruption and
+  poison the id permanently. A `file://` put is a hardlink of a FINISHED temp
+  file into place (`wx` reservation + rename where hardlinks are unavailable),
+  never a copy into the target — a copy is observable half-written.
 - **The producer verifies its own publish by fetching it back**, into a scratch
   repository, from the locator — never by reading its working tree. `commit`
   and `commit^{tree}` must match what the candidate pins, or the publish is a

@@ -893,8 +893,10 @@ function spoolStats(dir) {
 // Machine-local / ephemeral state inside a graph home that must NEVER ride a
 // SHARED graph repo's git flow (issue-cc-local-mode-graph-sharing-gap,
 // dec-spor-local-mode-sharing-boundary): journal/cache/outbox are runtime
-// scratch, candidates/ holds factory candidate BUNDLES (binary git artifacts,
-// the default `implementation.candidate.bundle_store`,
+// scratch, candidates/ holds factory candidate BUNDLES (binary git artifacts —
+// the default `implementation.candidate.bundle_store` is machine-local, under
+// the USER home rather than a marker-resolved shared one, so this line is what
+// covers an operator who points the store at the shared home instead,
 // FACTORY-IMPLEMENTATION-STAGE.md §2.1), and auth/ + config.json hold tokens,
 // so this doubles as a secret-leak guard (broader than the decision's
 // "journal/cache/outbox"). The durable graph — nodes/ and history/ — is

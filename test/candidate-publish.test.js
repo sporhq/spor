@@ -137,13 +137,56 @@ test("a replayed bundle publish is a no-op, and a DIFFERENT object under the id 
   assert.strictEqual(again.ok, true, again.reason);
   assert.strictEqual(again.candidate.publish_attempts[0].outcome, "replayed");
 
-  // Corruption, not a race: a different object under one content-addressed id.
+  // Corruption, not a race: something under our id that is not our candidate.
   fs.writeFileSync(fileURLToPath(first.candidate.reference.locator), "not a bundle\n");
   const conflict = await publisher.publishCandidate(cand, { cwd: repo.dir, publish: "bundle", bundleStore: store });
   assert.strictEqual(conflict.ok, false);
   assert.strictEqual(conflict.classification, "publish-conflict");
   assert.match(conflict.reason, /already holds a DIFFERENT object/);
   assert.strictEqual(conflict.candidate.publish_attempts.at(-1).pool, null, "a conflict consumes no pool");
+});
+
+// The idempotency claim the whole CAS rests on. `git bundle create` is NOT
+// byte-reproducible (threaded delta search alone repacks differently run to
+// run), so an id that already holds an object cannot be judged by comparing
+// bytes: the designed retry — a publish that landed and then failed afterwards,
+// re-attempted from the workspace — would rebuild a different-byte bundle of
+// the SAME content and be called corruption forever. What is under the id is
+// settled by fetching it and asking what it resolves to.
+test("an occupied id holding a DIFFERENT-BYTES bundle of the same commit is a replay, not a conflict", async (t) => {
+  const repo = producerRepo(t);
+  const storeDir = scratch(t, "cand-store");
+  const store = pathToFileURL(storeDir).href;
+  const cand = mintFor(repo);
+
+  const first = await publisher.publishCandidate(cand, { cwd: repo.dir, publish: "bundle", bundleStore: store });
+  assert.strictEqual(first.ok, true, first.reason);
+  const target = fileURLToPath(first.candidate.reference.locator);
+
+  // A bundle carrying the SAME ref at the SAME commit, packed differently —
+  // exactly what a rebuild produces on a repo of any size.
+  const ref = publisher.candidateRef(cand.candidate_id);
+  repo.g("update-ref", ref, repo.commit);
+  repo.g("update-ref", "refs/alt/extra", repo.commit);
+  const alt = path.join(scratch(t, "cand-alt"), "alt.bundle");
+  repo.g("bundle", "create", alt, `${repo.base}..${ref}`, `${repo.base}..refs/alt/extra`);
+  repo.g("update-ref", "-d", "refs/alt/extra");
+  repo.g("update-ref", "-d", ref);
+  const altBytes = fs.readFileSync(alt);
+  assert.notStrictEqual(
+    crypto.createHash("sha256").update(altBytes).digest("hex"),
+    first.candidate.reference.sha256,
+    "the fixture must actually differ byte-wise, or it proves nothing"
+  );
+  fs.writeFileSync(target, altBytes);
+
+  const again = await publisher.publishCandidate(cand, { cwd: repo.dir, publish: "bundle", bundleStore: store });
+  assert.strictEqual(again.ok, true, again.reason);
+  assert.strictEqual(again.candidate.publish_attempts.at(-1).outcome, "replayed");
+  // …and the reference records the STORED object's digest, which is what a
+  // reader will actually check the fetch against.
+  assert.strictEqual(again.candidate.reference.sha256, crypto.createHash("sha256").update(altBytes).digest("hex"));
+  assert.strictEqual(again.candidate.reference.bytes, altBytes.length);
 });
 
 test("a candidate whose pinned tree is not what the store returns is a candidate-mismatch, not an outage", async (t) => {
@@ -171,7 +214,7 @@ test("a store that answers with bytes we did not publish is a candidate-mismatch
   const r = await publisher.publishCandidate(mintFor(repo), { cwd: repo.dir, publish: "bundle", bundleStore: "https://api.example/candidates", http });
   assert.strictEqual(r.ok, false);
   assert.strictEqual(r.classification, "candidate-mismatch");
-  assert.match(r.reason, /sha256 is not the one we published/);
+  assert.match(r.reason, /does not verify/);
   assert.strictEqual(r.candidate.publish_attempts.at(-1).pool, null, "a mismatch consumes no pool");
 });
 
@@ -290,11 +333,13 @@ test("an https bundle store speaks the hosted door's 201/200/409 (§7.5), and 40
   assert.strictEqual(replay.ok, true, replay.reason);
   assert.strictEqual(replay.candidate.publish_attempts[0].outcome, "replayed");
 
-  // A 409 whose stored bytes ARE ours is the replayed no-op; a 409 over
-  // different bytes is the conflict.
+  // A 409 whose stored object IS our candidate is the replayed no-op; a 409
+  // over an object that is not is the conflict. The test is what the object
+  // RESOLVES TO, never its bytes.
   mode = "conflict";
-  const sameBytes = await publisher.publishCandidate(cand, { cwd: repo.dir, publish: "bundle", bundleStore: store, http });
-  assert.strictEqual(sameBytes.ok, true, sameBytes.reason);
+  const sameContent = await publisher.publishCandidate(cand, { cwd: repo.dir, publish: "bundle", bundleStore: store, http });
+  assert.strictEqual(sameContent.ok, true, sameContent.reason);
+  assert.strictEqual(sameContent.candidate.publish_attempts.at(-1).outcome, "replayed");
   held.set(`${store}/${cand.candidate_id}.bundle`, Buffer.from("something else"));
   const conflict = await publisher.publishCandidate(cand, { cwd: repo.dir, publish: "bundle", bundleStore: store, http });
   assert.strictEqual(conflict.ok, false);
@@ -307,6 +352,35 @@ test("an https store with no client configured is an outage, never a silently lo
   assert.strictEqual(r.ok, false);
   assert.strictEqual(r.classification, "infrastructure");
   assert.match(r.reason, /no HTTPS store client/);
+});
+
+test("an unusable store leaves the same publish_attempts trail every other failure does", async (t) => {
+  const repo = producerRepo(t);
+  const r = await publisher.publishCandidate(mintFor(repo), {
+    cwd: repo.dir,
+    publish: "bundle",
+    bundleStore: null,
+    bundleStoreReason: "the store is not writable from this machine",
+  });
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.classification, "infrastructure");
+  assert.strictEqual(r.reason, "the store is not writable from this machine");
+  // The trail is what the retry pool is charged against and what an escalation
+  // names — a debt with no attempt reads as a stage that never tried.
+  assert.strictEqual(r.candidate.publish_attempts.length, 1);
+  assert.strictEqual(r.candidate.publish_attempts[0].pool, "retry");
+});
+
+test("a store shape that can NEVER verify is refused at startup, not retried until the pool is spent", (t) => {
+  const home = scratch(t, "cand-home");
+  for (const [store, re] of [
+    ["file:///srv/repo/.git/candidates", /\.git directory/],
+    ["file:///srv/../srv/candidates", /relative path segment/],
+  ]) {
+    const v = publisher.publishSatisfiability(factoryWith({ publish: "bundle", bundle_store: store }), { graphHome: home, mode: "local" });
+    assert.strictEqual(v.ok, false, store);
+    assert.match(v.errors[0], re);
+  }
 });
 
 // ------------------------------------------------- startup refusals (E9, E14) --
@@ -533,4 +607,47 @@ test("a fix cycle that MOVES the tree supersedes the candidate and publishes the
   // Both objects are in the store: the chain is auditable, not overwritten.
   for (const c of rec.impl_candidates) assert.ok(fs.existsSync(path.join(wired.home, "candidates", `${c.candidate_id}.bundle`)));
   assert.strictEqual(rec.impl_candidates.length, 2);
+});
+
+test("a publish that failed and then SUCCEEDS on a re-pin settles the stage — the retry path is not a dead end", async (t) => {
+  const repo = producerRepo(t);
+  const wired = pipelineFor(t, repo, { candidate: { publish: "branch" } });
+  assert.ok((await wired.deps.changedPaths({ trustedRef: "main" })).ok);
+  await wired.deps.pinCandidate({ submittedBy: { stage: "implementation", cycle: 0, rescue: 0 } });
+  assert.strictEqual(wired.readRecord().impl_state, "running");
+
+  // The outage clears — the remote appears — and the publish is re-attempted
+  // FROM THE WORKSPACE on the next pin, with no second implementer dispatch.
+  const remoteDir = scratch(t, "cand-remote");
+  execFileSync("git", ["init", "-q", "--bare", remoteDir], { stdio: "ignore" });
+  repo.g("remote", "add", "origin", pathToFileURL(remoteDir).href);
+
+  assert.ok((await wired.deps.changedPaths({ trustedRef: "main" })).ok);
+  const again = await wired.deps.pinCandidate({ submittedBy: { stage: "implementation", cycle: 0, rescue: 0 } });
+  assert.strictEqual(again.change, "unchanged", "the same tree — a retry is by construction a re-pin");
+  const rec = wired.readRecord();
+  assert.ok(rec.impl_candidate.reference.verified_at, "the publish landed");
+  assert.strictEqual(rec.publish_pending, null, "the debt is discharged");
+  assert.strictEqual(rec.impl_state, "candidate", "…and the stage actually settles, rather than staying `running` forever");
+});
+
+test("publish_pending survives an in-process whole-record write, like the rest of the stage namespace", (t) => {
+  const home = scratch(t, "cand-carry-home");
+  const paths = dispatchRuns.runPaths(home, "run-1");
+  fs.mkdirSync(path.dirname(paths.record), { recursive: true });
+  fs.writeFileSync(paths.record, JSON.stringify({ run_id: "run-1", node_id: "task-x", state: "done" }));
+  const handle = { paths, record: JSON.parse(fs.readFileSync(paths.record, "utf8")) };
+
+  // The pin stamps the debt out of band, AFTER the handle's copy was taken…
+  dispatchRuns.stampImplState(home, "run-1", {
+    impl_state: "running",
+    publish_pending: { reason: "the store is unreachable", classification: "infrastructure", at: "2026-09-06T00:00:00Z" },
+  });
+  // …and the supervisor then lands its verified outcome from that stale copy.
+  dispatchRuns.updateRun(handle, { terminal_state: "reported" });
+
+  const rec = JSON.parse(fs.readFileSync(paths.record, "utf8"));
+  assert.strictEqual(rec.terminal_state, "reported");
+  assert.strictEqual(rec.impl_state, "running");
+  assert.strictEqual(rec.publish_pending.reason, "the store is unreachable", "the only record of WHY the candidate is unpublished is not erased by a later write");
 });
