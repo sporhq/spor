@@ -12107,6 +12107,65 @@ function gateRunReportText(record) {
   return "";
 }
 
+// Did this record have a report CHANNEL at all — a place a verdict could have
+// been written, whether or not anything was? The two readable channels are the
+// two `gateRunReportText` reads: a supervised run's `report_path`, and a
+// native-background run's bound session transcript. A record with neither had
+// nowhere to put a verdict; a record with either had somewhere and left it
+// empty, which is a different fact about a different thing.
+function gateRunHadReportChannel(record) {
+  if (!record) return false;
+  if (record.report_path) return true;
+  // Mirrors `nativeRunReportText`'s own rule exactly — the stamped
+  // `transcript_path` first, then the session-bound file it would find — so
+  // "had a channel" can never disagree with what the reader actually reads.
+  if (record.launch_mode !== "native-background") return false;
+  return !!(record.transcript_path || dispatchRuns.findTranscript(record));
+}
+
+// Why a review came back with no verdict to read — the message the fixer is
+// dispatched at, so it has to name the thing that is actually wrong
+// (issue-spor-review-gate-reportless-run-blamed-on-routing).
+//
+// The branch that matters: a run that HAD a report channel and still wrote
+// nothing did not fail at ROUTING. Saying "route to a harness whose report is
+// readable" to a run already launched `supervised-jsonl` is advice with no
+// action behind it — it sent two fix cycles at the reviewer's plumbing while
+// the record's own `termination_reason` ("the supervised child exited 1", over
+// a log holding the provider's credit-exhaustion message) went unread. So the
+// routing advice is kept for EXACTLY the case it is true of — a launch with no
+// channel — and every other report-less ending is named from the record.
+//
+// `classifyExecutionOutcome` is the one table every factory dispatch is read
+// through, so the reason comes from there rather than from a second reading of
+// the same fields. When the record explains nothing beyond the exit status
+// (`nonzero-exit` — the signature table recognized no wording and the harness
+// declared no failure), the log TAIL is the only place the reason exists, so a
+// bounded excerpt of it rides along: that is the line that says "usage limit".
+function reportlessReviewReason(record, classification) {
+  if (!gateRunHadReportChannel(record)) {
+    return "left no final report to read a verdict from"
+      + " (an agent-review gate must route to a harness whose report is readable — supervised, or native-background with a bound transcript)";
+  }
+  const mode = record.launch_mode ? `launched ${record.launch_mode}` : "launched with a report channel";
+  const signal = record.termination_signal ? ` (${record.termination_signal})` : "";
+  const why = (classification && classification.reason) || record.termination_reason || "it wrote nothing and gave no reason";
+  const tail = record.termination_signal === "nonzero-exit" ? gateRunLogExcerpt(record) : "";
+  return `wrote no final report to read a verdict from, and it was ${mode} — so the report channel was there and this is the run's own ending, not a routing fault: ${why}${signal}${tail}`;
+}
+
+// A bounded excerpt of a run's own log, for the one case the record explains
+// nothing: the last few non-empty lines, whitespace-collapsed and capped, so a
+// provider's error message reaches the fixer without a wall of JSON doing it.
+function gateRunLogExcerpt(record, { lines = 3, cap = 600 } = {}) {
+  const file = record && record.log_path;
+  if (!file) return "";
+  const text = dispatchRuns.lastLines(dispatchRuns.tailFile(file) || "", lines);
+  if (!text.trim()) return "";
+  const flat = text.replace(/\s+/g, " ").trim();
+  return `. Its log ends: ${flat.length > cap ? `${flat.slice(0, cap - 1)}…` : flat}`;
+}
+
 // A rescue's diagnosis (WORKERS.md §10.10): the final report first, then —
 // when that carries no block — the LAST block in any EARLIER message on the
 // run's own stream, newest first. The supervisor keeps the last assistant
@@ -13160,11 +13219,16 @@ function makeGateDeps(
     }
     const text = gateRunReportText(done.record);
     if (!text.trim()) {
+      // `classification` rides back for the record, not for a branch:
+      // `outageOf` acts only on `infrastructure`/`unroutable`, and this arm is
+      // reached only after the infrastructure branch above declined it — so
+      // the refusal is charged exactly as it always was, and only its REASON
+      // changes (issue-spor-review-gate-reportless-run-blamed-on-routing).
       return {
         ok: false,
-        reason:
-          `the review run under ${gate.profile} left no final report to read a verdict from` +
-          ` (an agent-review gate must route to a harness whose report is readable — supervised, or native-background with a bound transcript)`,
+        reason: `the review run under ${gate.profile} ${reportlessReviewReason(done.record, classification)}`,
+        classification,
+        runId: launched.run.run_id,
       };
     }
     return { ok: true, text, runId: launched.run.run_id };
