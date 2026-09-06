@@ -1820,6 +1820,85 @@ test("spor work --status counts the done entries it does not list, instead of st
   assert.strictEqual(JSON.parse(json.stdout).workers[0].recent.length, 20);
 });
 
+test("spor work --status shows a gating slot's execution hold and its stale reading, same as `spor get`'s note (task-spor-work-status-show-execution-hold-and-stale-reading)", () => {
+  // Controller completion (dec-spor-factory-controller-completion-hold-and-cas)
+  // stamps the item with `execution:` before it ever dispatches, and pins the
+  // claim on the RUN RECORD as `impl_claim` — never restamped on the worker's
+  // own status file, same as the fix-cycle/candidate lines beside the gating
+  // slot. `--status` must read it from there, exactly as `spor runs` does for
+  // its completion line and `spor get` does for its HELD note.
+  const dispatchRunsLib = require("../lib/shell/agent-dispatch-runner.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-gating-hold-"));
+  fs.mkdirSync(dispatchRunsLib.dispatchRunDir(home), { recursive: true });
+  const runId = "22222222-3333-4444-5555-666666666666";
+  dispatchRunsLib.atomicJson(dispatchRunsLib.runPaths(home, runId).record, {
+    run_id: runId,
+    node_id: "task-held",
+    state: "running",
+    created_at: new Date().toISOString(),
+    gate_state: "running",
+    gate_worker: "worker-gone",
+    impl_claim: {
+      execution_id: "exec-dead0123456789",
+      claimed_at: "2026-09-06T00:00:00.000Z",
+      completion: { by: "controller", after: "gates" },
+    },
+  });
+  workLoop.writeWorkerStatus(home, {
+    worker_id: "worker-gone",
+    pid: 999999, // long-dead pid: this worker itself is STALE
+    started_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    active: [],
+    gating: [{ run_id: runId, node_id: "task-held", harness: "fake", started_at: "2026-09-06T00:05:00.000Z" }],
+    recent: [],
+    skipped: [],
+  });
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home };
+  const text = cli(["work", "--status"], env);
+  assert.strictEqual(text.status, 0, text.stderr);
+  assert.match(text.stdout, /^  gating:   task-held  run 22222222/m);
+  assert.match(
+    text.stdout,
+    /^ {12}execution: exec-dead0123456789 \(boundary 'gates'\), held since 2026-09-06T00:00:00\.000Z — STALE — run 22222222 on this box, its worker is gone/m
+  );
+  const json = cli(["work", "--status", "--json"], env);
+  const gating = JSON.parse(json.stdout).workers[0].gating[0];
+  assert.deepStrictEqual(gating.hold, {
+    execution: "exec-dead0123456789",
+    boundary: "gates",
+    since: "2026-09-06T00:00:00.000Z",
+    stale: true,
+    where: "STALE — run 22222222 on this box, its worker is gone; a same-factory 'spor work' resumes it",
+  });
+});
+
+test("spor work --status omits `hold` on a gating slot with no execution claim (completion.by: agent, or a legacy run)", () => {
+  const dispatchRunsLib = require("../lib/shell/agent-dispatch-runner.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-gating-nohold-"));
+  fs.mkdirSync(dispatchRunsLib.dispatchRunDir(home), { recursive: true });
+  const runId = "33333333-4444-5555-6666-777777777777";
+  dispatchRunsLib.atomicJson(dispatchRunsLib.runPaths(home, runId).record, {
+    run_id: runId, node_id: "task-legacy", state: "running", created_at: new Date().toISOString(), gate_state: "running", gate_worker: "w1",
+  });
+  workLoop.writeWorkerStatus(home, {
+    worker_id: "w1",
+    pid: process.pid, // live
+    started_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    active: [],
+    gating: [{ run_id: runId, node_id: "task-legacy", harness: "fake", started_at: new Date().toISOString() }],
+    recent: [],
+    skipped: [],
+  });
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home };
+  const text = cli(["work", "--status"], env);
+  assert.strictEqual(text.status, 0, text.stderr);
+  assert.doesNotMatch(text.stdout, /execution:/);
+  const json = cli(["work", "--status", "--json"], env);
+  assert.strictEqual("hold" in JSON.parse(json.stdout).workers[0].gating[0], false);
+});
+
 test("spor work --status with nothing recorded says so, in both renderings", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-work-empty-"));
   const text = cli(["work", "--status"], { SPOR_HOME: home, XDG_CONFIG_HOME: home });

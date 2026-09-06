@@ -3121,8 +3121,13 @@ record is consumed, and a pipeline that settled without reaching its boundary
 longer carries its hold, so a later abandonment is still seen — and the
 per-pass journal read stops paying for it; a `--regate` re-opens it. The pass is
 bounded in RECORDS EXAMINED, not in writes. `spor runs` prints the completion
-line (boundary, state, debt, execution); `spor work --status` shows the gating
-slot as before.
+line (boundary, state, debt, execution); `spor work --status` shows a held
+gating slot's execution: the holder (execution id), the completion boundary
+it is pinned to, when it was claimed, and the same live/STALE reading `spor
+get`'s note uses (`describeExecutionHolder` in bin/spor.js, read fresh off the
+gate run record's `impl_claim` — never restamped on the worker's own status
+file) — `--status --json` carries it as a `hold` object on the gating entry,
+absent under `completion.by: agent` or on a legacy run.
 
 See test/completion-boundary.test.js.
 

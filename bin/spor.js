@@ -1170,26 +1170,37 @@ async function cmdGet(cfg, { positionals, values }) {
   return 0;
 }
 
+// Given an execution id, this box's own run journal says whether the worker
+// that holds it is live, gone (STALE, fail-closed until released or
+// resumed), or not on this box at all — the one reading `spor get` and `spor
+// work --status`'s gating slots (task-spor-work-status-show-execution-hold-
+// and-stale-reading) both need, so they can never disagree about what "held"
+// means. Never throws; a missing/unreadable journal just reads as "no run on
+// this box carries it".
+function describeExecutionHolder(home, executionId) {
+  let where = "no run on this box carries it";
+  let stale = null;
+  try {
+    const rec = dispatchRuns.readRunRecords(home).find((r) => r.impl_claim && r.impl_claim.execution_id === executionId);
+    if (rec) {
+      const live = rec.gate_worker && workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === rec.gate_worker);
+      stale = !live;
+      where = live ? `run ${String(rec.run_id).slice(0, 8)}, its worker is live` : `STALE — run ${String(rec.run_id).slice(0, 8)} on this box, its worker is gone; a same-factory 'spor work' resumes it`;
+    }
+  } catch {
+    /* the reading stands without the journal */
+  }
+  return { where, stale };
+}
+
 // A node under a factory controller's EXECUTION HOLD reads as held, never as
 // done (FACTORY-IMPLEMENTATION-STAGE.md §4.5): one stderr line beside the raw
-// node naming the execution and — from this box's own run journal — whether
-// the worker that holds it is live, gone (STALE, fail-closed until released
-// or resumed), or not on this box at all. Never fails the read.
+// node naming the execution and its stale reading (above). Never fails the read.
 function noteExecutionHold(cfg, id, raw) {
   const m = /^execution:\s*(\S+)\s*$/m.exec(String(raw || ""));
   if (!m) return;
   const executionId = m[1];
-  let where = "no run on this box carries it";
-  try {
-    const home = cfg.userConfigHome();
-    const rec = dispatchRuns.readRunRecords(home).find((r) => r.impl_claim && r.impl_claim.execution_id === executionId);
-    if (rec) {
-      const live = rec.gate_worker && workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === rec.gate_worker);
-      where = live ? `run ${String(rec.run_id).slice(0, 8)}, its worker is live` : `STALE — run ${String(rec.run_id).slice(0, 8)} on this box, its worker is gone; a same-factory 'spor work' resumes it`;
-    }
-  } catch {
-    /* the note stands without the journal */
-  }
+  const { where } = describeExecutionHolder(cfg.userConfigHome(), executionId);
   err(`note: ${id} is HELD by execution ${executionId} (${where}) — no resolving edge or terminal status retires it until the controller completes it or a person runs 'spor release ${id} --execution ${executionId}'`);
 }
 
@@ -11619,9 +11630,53 @@ function workerAlive(pid, ticks, opts) {
   return dispatchRuns.isSameSupervisor(pid, ticks, opts).reallyAlive;
 }
 
+// A `gating` slot under `completion.by: controller` is judging an item this
+// worker put under an EXECUTION HOLD before it ever dispatched (H1,
+// dec-spor-factory-controller-completion-hold-and-cas) — the same hold `spor
+// get` notes and `spor runs` prints the completion line for
+// (task-spor-work-status-show-execution-hold-and-stale-reading). Read off the
+// gate run record for the same reason the fix-cycle/candidate lines beside it
+// are: the claim is a durable fact on the RUN
+// (`impl_claim.{execution_id,claimed_at,completion.after}`), never restamped
+// on `journal/work/*.work.json`. Returns null on a legacy run and on any
+// pipeline under `completion.by: agent` (no `impl_claim` at all).
+// `describeExecutionHolder` gives the stale reading, exactly as
+// `noteExecutionHold` does — so `spor get`, `spor runs`, and `spor work
+// --status` can never disagree about whether a hold's worker is live.
+function gatingSlotHold(home, runId) {
+  let gateRecord = null;
+  try {
+    gateRecord = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  } catch {
+    return null;
+  }
+  const claim = gateRecord && gateRecord.impl_claim;
+  if (!claim || !claim.execution_id) return null;
+  const { where, stale } = describeExecutionHolder(home, claim.execution_id);
+  return {
+    execution: claim.execution_id,
+    boundary: (claim.completion && claim.completion.after) || null,
+    since: claim.claimed_at || null,
+    stale,
+    where,
+  };
+}
+
 function cmdWorkStatus(cfg, { json }) {
   const home = cfg.userConfigHome();
   const workers = workLoop.readWorkerStatuses(home, { alive: workerAlive });
+  // Enrich every gating slot with its execution-hold reading up front so the
+  // --json shape and the text rendering below read the exact same data and
+  // can never disagree (task-spor-work-status-show-execution-hold-and-stale-
+  // reading). A slot with no hold (completion.by: agent, or a legacy run)
+  // carries no `hold` key at all — never a bare `null` a consumer has to
+  // branch on.
+  for (const w of workers) {
+    for (const g of w.gating || []) {
+      const hold = g && g.run_id ? gatingSlotHold(home, g.run_id) : null;
+      if (hold) g.hold = hold;
+    }
+  }
   if (json) {
     out(JSON.stringify({ count: workers.length, workers }, null, 2));
     return 0;
@@ -11665,6 +11720,15 @@ function cmdWorkStatus(cfg, { json }) {
     for (const a of w.active || []) out(`  active:   ${a.node_id || "(free-text)"}  run ${String(a.run_id).slice(0, 8)}  ${a.harness || ""}  since ${a.started_at}`);
     for (const g of w.gating || []) {
       out(`  gating:   ${g.node_id}  run ${String(g.run_id).slice(0, 8)}  since ${g.started_at}`);
+      // The execution hold this pipeline claimed before it ever dispatched
+      // (task-spor-work-status-show-execution-hold-and-stale-reading) — the
+      // holder, the completion boundary it is pinned to, and the same
+      // live/STALE reading `spor get`'s note and `spor runs`' completion line
+      // use, so an operator staring at a stuck gating slot sees why nothing
+      // is retiring the item without a second command.
+      if (g.hold) {
+        out(`            execution: ${g.hold.execution}${g.hold.boundary ? ` (boundary '${g.hold.boundary}')` : ""}${g.hold.since ? `, held since ${g.hold.since}` : ""} — ${g.hold.where}`);
+      }
       // A fix cycle a stopped worker's pipeline left running is a durable
       // fact on the RUN RECORD (gate_fix_run_id, stamped the moment the fix
       // was dispatched — see makeGateDeps' `fix`), not on this status file, so
