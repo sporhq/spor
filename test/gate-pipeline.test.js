@@ -3692,6 +3692,48 @@ test("end to end: a run refused for an external cause is re-judged with --regate
   assert.match(again.stderr, /already read 'passed'/);
 });
 
+// issue-spor-regate-omits-worker-id: --regate is a single-shot invocation with
+// no work-loop worker to inherit an identity from, unlike the loop's own call
+// site (which threads `workerId` through for exactly this reason). The bug:
+// cmdWorkRegate's ctx omitted it, so a re-pin triggered on the --regate path
+// (here, the trusted-ref merge moving the tree) permanently stamped the fresh
+// candidate's `provenance.worker` null — permanent because a candidate's
+// identity is content-addressed and a later re-pin cannot backfill an earlier
+// one's provenance.
+test("--regate re-pins the factory candidate with THIS invocation's own worker identity, not null", () => {
+  const { home, repo, nodes, outfile } = cliFixture({ factoryPayload: { ...OK_FACTORY, implementation: { profile: "profile-impl" } } });
+  fs.writeFileSync(path.join(repo, "test", "acceptance.js"), 'const fs = require("fs");\nif (!fs.existsSync("lib/fixed.js")) { console.error("✖ the trusted ref is red"); process.exit(1); }\n');
+  git(repo, "checkout", "-q", "main");
+  git(repo, "add", "-A");
+  git(repo, "commit", "-q", "-m", "a red trusted suite");
+  git(repo, "checkout", "-q", "impl");
+  git(repo, "merge", "-q", "--no-edit", "main");
+  const env = { SPOR_HOME: home, XDG_CONFIG_HOME: home, GATE_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() };
+  const first = cli(["work", "--once", "--max", "1", "--interval", "1", "--no-brief", "--no-worktree", "--factory", "factory-demo"], env);
+  assert.strictEqual(first.status, 0, `${first.stderr}\n${first.stdout}`);
+  const runId = fs.readdirSync(path.join(home, "journal", "dispatch")).find((f) => f.endsWith(".run.json")).replace(".run.json", "");
+  const recordPath = path.join(home, "journal", "dispatch", `${runId}.run.json`);
+  const refused = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  assert.ok(refused.impl_candidate, "the work loop's own run pinned a candidate even though the gate later refused");
+  assert.ok(refused.impl_candidate.provenance.worker, "the loop's own workerId is recorded — this half was never broken");
+  const loopWorker = refused.impl_candidate.provenance.worker;
+
+  // Fix the trusted ref and re-gate; the merge below moves the tree, so the
+  // re-gate's own readChanged() re-pins a NEW ("superseded") candidate — from
+  // THIS single-shot --regate invocation, never the work loop.
+  git(repo, "checkout", "-q", "main");
+  fs.writeFileSync(path.join(repo, "lib", "fixed.js"), "module.exports = true;\n");
+  git(repo, "add", "-A");
+  git(repo, "commit", "-q", "-m", "fix the trusted ref");
+  git(repo, "checkout", "-q", "impl");
+  const second = cli(["work", "--regate", runId.slice(0, 8), "--factory", "factory-demo"], env);
+  assert.strictEqual(second.status, 0, `${second.stderr}\n${second.stdout}`);
+  const after = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  assert.notStrictEqual(after.impl_candidate.candidate_id, refused.impl_candidate.candidate_id, "the merge moved the tree, so the regate really did re-pin");
+  assert.ok(after.impl_candidate.provenance.worker, "the regate's own worker identity is recorded on the re-pin, never null");
+  assert.notStrictEqual(after.impl_candidate.provenance.worker, loopWorker, "a single-shot regate mints its own identity rather than borrowing the loop's");
+});
+
 test("stampGateState refuses to overwrite a settled verdict unless the caller is an explicit re-gate", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-stamp-"));
   const dir = path.join(home, "journal", "dispatch");

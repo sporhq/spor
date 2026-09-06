@@ -14923,10 +14923,19 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   const stamp = (patch) => dispatchRuns.stampGateState(home, record.run_id, patch, { force: true });
   stamp({ gate_state: "running", gate_at: new Date().toISOString(), gate_worker: null, gate_regate_count: attempt - 1, gate_regated_at: new Date().toISOString() });
   const entry = { run_id: record.run_id, node_id: record.node_id, harness: record.harness || null, project, attempt };
+  // A single-shot identity for THIS invocation — --regate has no work-loop
+  // worker to inherit one from, but a re-pin (a fix cycle, or the trusted-ref
+  // merge above moving the tree) still mints a candidate whose provenance
+  // needs SOME worker to attribute it to; a mint that never got one is
+  // permanently unattributed (candidate identity is content-addressed, so a
+  // later re-pin cannot backfill it). Provenance only, same as the loop's own
+  // (task-spor-factory-candidate-record §3.1).
+  const workerId = crypto.randomUUID();
   let res;
   try {
     res = await runGateAndIntegration(cfg, entry, record, {
       factory, slug, passthrough, warn, runMaxMs,
+      workerId,
       log: (line) => out(line),
       stopping: () => false,
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
