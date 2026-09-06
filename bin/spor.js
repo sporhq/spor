@@ -14042,9 +14042,13 @@ function makeGateDeps(
       const orphan = saved.flatMap((p) => p ? [p.filingIntent, p.evidence && !p.evidence.complete ? p.evidence : null] : [])
         .filter(Boolean).find((e) => !e.gate || !current.has(e.gate.id));
       if (orphan) return { ok: false, reason: "pending flake evidence belongs to a removed or renamed gate; restore its original declaration and settle its obligation before changing the factory" };
-      return evidence.every((e) => attestationOriginMatches(cfg, e.origin))
-        ? { ok: true }
-        : { ok: false, reason: "pending flake evidence belongs to a different or unknown graph; resume against its original graph" };
+      if (!evidence.every((e) => attestationOriginMatches(cfg, e.origin))) return { ok: false, reason: "pending flake evidence belongs to a different or unknown graph; resume against its original graph" };
+      const pending = Object.entries(progress.gates || {}).filter(([, p]) => p && (p.filingIntent || p.evidence && !p.evidence.complete)).map(([key, p]) => ({
+        gate: (p.filingIntent || p.evidence).gate,
+        rescue: Number((/#x(\d+)$/.exec(key) || [])[1]) || 0,
+        progress: p,
+      }));
+      return pending.length ? { ok: true, pending } : { ok: true };
     },
     saveGateProgress,
     loadRescueState,
