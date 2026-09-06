@@ -796,3 +796,71 @@ test("publish_pending survives an in-process whole-record write, like the rest o
   assert.strictEqual(rec.impl_state, "running");
   assert.strictEqual(rec.publish_pending.reason, "the store is unreachable", "the only record of WHY the candidate is unpublished is not erased by a later write");
 });
+
+for (const transport of ["environment", "repository", "environment-over-repository", "environment-relative", "repository-relative"]) {
+  test(`branch publication preserves ${transport} SSH transport through push and isolated verification`, { skip: process.platform === "win32" }, async t => {
+    const repo = producerRepo(t);
+    const remote = scratch(t, "candidate-ssh-remote");
+    execFileSync("git", ["init", "--bare", "-q", remote]);
+    repo.g("remote", "add", "origin", "ssh://probe.invalid/remote.git");
+    const log = path.join(scratch(t, "candidate-ssh-wrapper"), "calls.jsonl");
+    const wrapper = path.join(path.dirname(log), "ssh wrapper");
+    fs.writeFileSync(wrapper, `#!${process.execPath}\nconst fs=require('node:fs');\nconst args=process.argv.slice(2);\nfs.appendFileSync(${JSON.stringify(log)},JSON.stringify({cwd:process.cwd(),args,command:process.env.GIT_SSH_COMMAND,variant:process.env.GIT_SSH_VARIANT,terminal:process.env.GIT_TERMINAL_PROMPT,askpass:process.env.GIT_ASKPASS,signing:process.env.SPOR_ATTESTATION_KEY})+'\\n');\nconst mode=args.some(arg=>arg.includes('git-receive-pack'))?'receive-pack':'upload-pack';\nconst r=require('node:child_process').spawnSync('git',[mode,${JSON.stringify(remote)}],{stdio:'inherit'});process.exit(r.status??1);\n`, { mode: 0o700 });
+    const commandPath = transport.endsWith("-relative") ? path.relative(repo.dir, wrapper) : wrapper;
+    const command = `'${commandPath.replaceAll("'", "'\\''")}' --configured-wrapper`;
+    const keys = ["GIT_SSH_COMMAND", "GIT_SSH", "GIT_SSH_VARIANT", "SPOR_ATTESTATION_KEY"];
+    const old = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+    for (const k of keys) delete process.env[k];
+    t.after(() => { for (const k of keys) { if (old[k] === undefined) delete process.env[k]; else process.env[k] = old[k]; } });
+    if (transport.startsWith("repository")) {
+      repo.g("config", "core.sshCommand", command);
+      repo.g("config", "ssh.variant", "simple");
+    } else {
+      process.env.GIT_SSH_COMMAND = command;
+      process.env.GIT_SSH_VARIANT = "simple";
+      if (transport === "environment-over-repository") {
+        repo.g("config", "core.sshCommand", "/this-configured-command-must-not-run");
+        repo.g("config", "ssh.variant", "plink");
+      }
+    }
+    process.env.SPOR_ATTESTATION_KEY = "must-not-leave-parent";
+    const { gitSpawn } = require("../lib/shell/git-exec.js");
+    const networkCalls = [];
+    const git = (cwd, args, options) => {
+      if (args.some(a => ["push", "fetch", "ls-remote"].includes(a))) networkCalls.push({ cwd, args, options });
+      return gitSpawn(cwd, args, options);
+    };
+    const cand = mintFor(repo);
+    const published = await publisher.publishCandidate(cand, { cwd: repo.dir, publish: "branch", remote: "origin", git });
+    assert.equal(published.ok, true, published.reason);
+    const replayed = await publisher.publishCandidate(cand, { cwd: repo.dir, publish: "branch", remote: "origin", git });
+    assert.equal(replayed.ok, true, replayed.reason);
+    assert.equal(replayed.candidate.reference.commit, repo.commit);
+    const landed = execFileSync("git", ["-C", remote, "rev-parse", publisher.candidateRef(cand.candidate_id)], { encoding: "utf8" }).trim();
+    assert.equal(landed, repo.commit);
+    execFileSync("git", ["-C", remote, "update-ref", publisher.candidateRef(cand.candidate_id), repo.base]);
+    const conflict = await publisher.publishCandidate(cand, { cwd: repo.dir, publish: "branch", remote: "origin", git });
+    assert.equal(conflict.ok, false); assert.equal(conflict.classification, "publish-conflict");
+    const calls = fs.readFileSync(log, "utf8").trim().split("\n").map(JSON.parse);
+    assert.ok(calls.some(c => c.cwd === repo.dir && c.args.some(a => a.includes("git-receive-pack"))));
+    const fetchCalls = networkCalls.filter(c => c.args.includes("fetch"));
+    assert.ok(fetchCalls.length >= 2, "fresh verification repositories used the same configured transport");
+    for (const call of fetchCalls) {
+      assert.equal(call.cwd, repo.dir, "relative transport paths retain producer cwd");
+      assert.ok(call.args[0].startsWith("--git-dir="));
+      assert.notEqual(call.args[0], `--git-dir=${path.join(repo.dir, ".git")}`, "verification has its own object database");
+      assert.equal(call.options.env.GIT_SSH_COMMAND, command);
+      assert.equal(call.options.env.GIT_SSH_VARIANT, "simple");
+    }
+    for (const call of calls) {
+      assert.ok(call.args.includes("--configured-wrapper"));
+      assert.equal(call.args.some(arg => arg.includes("BatchMode")), false);
+      assert.equal(call.terminal, "0"); assert.equal(call.askpass, ""); assert.equal(call.signing, undefined);
+    }
+    assert.ok(networkCalls.some(c => c.args[0] === "ls-remote"), "existing ref replay checks use the same transport primitive");
+    for (const call of networkCalls) {
+      assert.equal(call.options.timeout, 300000, "publication retains its existing five-minute per-call budget");
+      assert.equal(call.options.maxBuffer, undefined, "publication retains gitSpawn's existing default output bound");
+    }
+  });
+}
