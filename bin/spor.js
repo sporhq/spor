@@ -11403,9 +11403,14 @@ async function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, idleMs = 0, warn = () =
 // leave the protected suite alone, resolve last (lib/shell/worker-contract.js).
 // `spor dispatch` on its own stays byte-identical — a person aiming one agent
 // at one node writes their own instructions; an unattended loop cannot.
-async function dispatchWorkItem(cfg, item, passthrough, { factory = null, home = cfg.userConfigHome(), log = () => {} } = {}) {
+async function dispatchWorkItem(cfg, item, passthrough, { factory = null, home = cfg.userConfigHome(), log = () => {}, cmdDispatch: cmdDispatchOverride = null } = {}) {
   const values = { ...passthrough, node: item.id };
   if (!values.profile && item.profile) values.profile = item.profile;
+  // cmdDispatchOverride: test-only seam (default null, real cmdDispatch used)
+  // so a fake dispatcher can exercise dispatchThroughLocked's launch-wins-over-
+  // exit-code contract without launching a real harness — see
+  // test/completion-boundary.test.js.
+  const dispatchOpts = cmdDispatchOverride ? { cmdDispatch: cmdDispatchOverride } : {};
   // Under `completion.by: controller` (task-spor-factory-controller-
   // completion-boundary) the item is HELD before any dispatch — H1: the
   // execution hold stamped by compare-and-swap, the claim pins riding the run
@@ -11415,10 +11420,10 @@ async function dispatchWorkItem(cfg, item, passthrough, { factory = null, home =
   // unsatisfiable profile, a launcher that does not resolve) clears the hold
   // through the same door, so a refused item is never left held.
   const controller = !!(factory && factory.completion && factory.completion.by === "controller");
-  if (!controller) return dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })]);
+  if (!controller) return dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })], dispatchOpts);
   const held = await claimExecutionHold(cfg, item, factory, { home, log });
   if (!held.ok) return { ok: false, reason: held.reason };
-  const launched = await dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })], { recordFields: held.recordFields });
+  const launched = await dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })], { recordFields: held.recordFields, ...dispatchOpts });
   if (!launched.ok) {
     const cleared = await completionShell.clearHold({ nodeId: item.id, executionId: held.executionId, deps: makeCompletionDeps(cfg, { home }) });
     if (!cleared.ok) log(`work: ${item.id} — the dispatch was refused and its execution hold ${held.executionId} could not be cleared (${cleared.reason}); release it with 'spor release ${item.id} --execution ${held.executionId}'`);
@@ -11494,7 +11499,10 @@ async function dispatchThroughLocked(cfg, values, positionals = [], opts = {}) {
     // recordFields: the stage launch's claim pins (`impl_claim` + the initial
     // `impl_*` stamps), merged into the run record's creation write
     // (launchSupervisedHarness) — one stamp, never a second write.
-    code = await cmdDispatch(cfg, { values, positionals }, { onLaunch: (l) => launches.push(l), supervisedOnly: true, carryTask: true, unattended: true, allowAttended: !!opts.allowAttended, recordFields: opts.recordFields || null });
+    // opts.cmdDispatch: test-only seam, defaulting to the real cmdDispatch —
+    // see dispatchWorkItem's cmdDispatchOverride.
+    const runDispatch = opts.cmdDispatch || cmdDispatch;
+    code = await runDispatch(cfg, { values, positionals }, { onLaunch: (l) => launches.push(l), supervisedOnly: true, carryTask: true, unattended: true, allowAttended: !!opts.allowAttended, recordFields: opts.recordFields || null });
   } catch (e) {
     // A throw AFTER the launch (the post-launch session capture and bind are
     // network calls) still means an agent is running and holding a lease —
@@ -11510,7 +11518,15 @@ async function dispatchThroughLocked(cfg, values, positionals = [], opts = {}) {
     // the one that has to sweep (task-spor-worker-preflight-validation).
     preflight.releaseHeldWorkspaces();
   }
-  if (code === 0 && launches.length) return { ok: true, run: launches[0] };
+  // A recorded launch wins over the exit code: cmdDispatch can fail AFTER
+  // onLaunch fires (the post-launch session capture/bind is a network call,
+  // same as the throw case above) while an agent is already running and
+  // holding a lease. Reporting that as a refusal would let dispatchWorkItem
+  // clear the item's controller-completion execution hold out from under a
+  // live run (issue-spor-dispatch-through-locked-post-launch-failure-clears-
+  // execution-hold) — so any recorded launch is reported regardless of `code`,
+  // and only a launch-free outcome ever takes the refusal path below.
+  if (launches.length) return { ok: true, run: launches[0] };
   // Exit 0 with no launch is the one shape that is neither: --print, or a
   // harness this client launched but cannot follow. Treat it as a skip — a
   // slot held for a run we can never see end would never be freed.

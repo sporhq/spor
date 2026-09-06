@@ -761,6 +761,52 @@ test("local mode, end to end through the real doors: H1 holds the item and pins 
   assert.equal(JSON.parse(fs.readFileSync(p.record, "utf8")).completion_written_at, written.completion_written_at);
 });
 
+// ---------- dispatchThroughLocked / dispatchWorkItem: a recorded launch wins
+// over the exit code (issue-spor-dispatch-through-locked-post-launch-failure-
+// clears-execution-hold) ----------
+
+test("dispatchWorkItem under `completion.by: controller`: a fake dispatcher that records a launch via ctx.onLaunch and then exits 1 is reported ok:true and the execution hold stays in place — a post-launch failure must never clear a hold while an agent may be running", async () => {
+  const t = tmpGraph(Object.fromEntries([node("task-x", "task", { status: "open" })]));
+  const cfg = localCfg(t.dir);
+  const factory = factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "true" }], completion: { by: "controller" } });
+  factory.id = "factory-t";
+  const lines = [];
+  const fakeCmdDispatch = async (fcfg, { values }, ctx) => {
+    ctx.onLaunch({ run_id: "run-fake-1", harness: "fake", launch_mode: "supervised-jsonl", node_id: values.node, record_path: path.join(t.dir, "run-fake-1.json") });
+    // The launch is recorded; a failure AFTER it (a post-launch session
+    // capture/bind, say) must not read as a refusal.
+    return 1;
+  };
+  const result = await spor.dispatchWorkItem(cfg, { id: "task-x" }, {}, { factory, home: t.dir, log: (l) => lines.push(l), cmdDispatch: fakeCmdDispatch });
+  assert.equal(result.ok, true, lines.join("\n"));
+  assert.equal(result.run.run_id, "run-fake-1");
+  // The hold is still stamped on the node — nothing cleared it.
+  const raw = fs.readFileSync(path.join(t.nodesDir, "task-x.md"), "utf8");
+  assert.match(raw, /^execution: exec-[0-9a-f]{16}$/m);
+  assert.deepEqual(
+    lines.filter((l) => /execution hold .* could not be cleared/.test(l)),
+    [],
+    "clearHold must never even be attempted for a launched run"
+  );
+  // A second hold claim is refused (H2): the first is still live.
+  const second = await spor.claimExecutionHold(cfg, { id: "task-x" }, factory, { home: t.dir });
+  assert.equal(second.ok, false);
+  assert.equal(second.kind, "foreign-hold");
+});
+
+test("dispatchWorkItem under `completion.by: controller`: a fake dispatcher that records NO launch and exits 1 is reported ok:false and clears the execution hold — the refusal path still works", async () => {
+  const t = tmpGraph(Object.fromEntries([node("task-x", "task", { status: "open" })]));
+  const cfg = localCfg(t.dir);
+  const factory = factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "true" }], completion: { by: "controller" } });
+  factory.id = "factory-t";
+  const lines = [];
+  const fakeCmdDispatch = async () => 1; // never calls ctx.onLaunch — nothing was launched
+  const result = await spor.dispatchWorkItem(cfg, { id: "task-x" }, {}, { factory, home: t.dir, log: (l) => lines.push(l), cmdDispatch: fakeCmdDispatch });
+  assert.equal(result.ok, false);
+  const raw = fs.readFileSync(path.join(t.nodesDir, "task-x.md"), "utf8");
+  assert.doesNotMatch(raw, /^execution:/m, "a launch-free refusal still clears the hold it just claimed");
+});
+
 test("local mode: a refused pipeline's record is NOT consumed while the item still carries its hold (a later abandon must still be seen), and is consumed once the person's door ended the execution", async () => {
   const t = tmpGraph(Object.fromEntries([node("task-x", "task", { status: "open", extra: "execution: exec-refused\n" })]));
   const cfg = localCfg(t.dir);
