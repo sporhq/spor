@@ -16343,14 +16343,38 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
     integrationSettled: (state, { ref = null, commit = null } = {}) =>
       send({ type: "integration.settled", attempt: integrationAttempt || 1, state, ...(ref ? { ref } : {}), ...(commit ? { commit } : {}) }),
     completionWritten: (resolver) => send({ type: "completion.written", resolver }),
-    // The pipeline produces nothing further under this execution: the
-    // pool-spent terminal (the one non-escalation door to `refused`), which
-    // frees the item pointer for the next attempt. Then the reporter leaves.
+    // Refusal retains the hold. Persist both steps until the explicit release
+    // is acknowledged; graph completion stamps must not hide this store debt.
     async end(reason, { outcome = "cancelled" } = {}) {
-      const attempt = last && Array.isArray(last.attempts) && last.attempts.length ? last.attempts[last.attempts.length - 1].index : 1;
-      const r = await send({ type: "stage.observed", attempt, state: "exhausted", outcome, ...(reason ? { reason } : {}) });
+      const fresh = dispatchRuns.readJson(dispatchRuns.runPaths(home, record.run_id).record);
+      const prior = fresh?.completion_execution_end;
+      const attempt = last?.attempts?.length ? last.attempts[last.attempts.length - 1].index : 1;
+      const debt = prior?.event ? prior : { execution_id: id, reason, outcome, phase: "observe", event: { type: "stage.observed", attempt, state: "exhausted", outcome, ...(reason ? { reason } : {}) } };
+      if (debt.execution_id !== id) return { ok: false, code: "conflict", message: "execution release debt belongs to another execution" };
+      const stamp = (value) => dispatchRuns.stampCompletionState(home, record.run_id, { completion_execution_end: value });
+      if (!stamp(debt)) return { ok: false, code: "conflict", message: "could not persist execution release debt" };
       LIVE_EXECUTIONS.delete(id);
-      return r.ok ? st.release(id, { fence }) : r;
+      if (debt.phase !== "release") {
+        const r = await send(debt.event);
+        if (!r.ok) return r;
+        if (!stamp({ ...debt, phase: "release" })) return { ok: false, code: "conflict", message: "could not persist execution release phase" };
+      }
+      const released = await st.release(id, { fence });
+      if (released.ok) stamp(null);
+      return released;
+    },
+    async retryEnd(debt) {
+      if (debt.execution_id && debt.execution_id !== id) return { ok: false, code: "conflict", message: "execution release debt belongs to another execution" };
+      // An acknowledgement can be lost after release; an authoritative closed
+      // record settles our debt without trying to claim an already closed hold.
+      const observed = await st.get(id);
+      if (observed.ok && !observed.cached && observed.execution && executionKernel.isTerminal(observed.execution)) {
+        dispatchRuns.stampCompletionState(home, record.run_id, { completion_execution_end: null });
+        return { ok: true, replayed: true };
+      }
+      const resumed = await reporter.resume();
+      if (!resumed.ok || resumed.unconfirmed) return resumed;
+      return reporter.end(debt.reason, { outcome: debt.outcome || "cancelled" });
     },
     async release() {
       LIVE_EXECUTIONS.delete(id);
@@ -16517,11 +16541,21 @@ async function candidateResolverFromReport(cfg, producer, nodeId, fallback) {
 // per pass and fail-soft: an unreadable graph leaves every debt owed.
 const COMPLETION_RECONCILE_MAX = 10;
 async function reconcileCompletions(cfg, { home = cfg.userConfigHome(), log = () => {} } = {}) {
-  const records = dispatchRuns.readRunRecords(home).filter((r) => completionKernel.isControllerRecord(r) && !r.completion_written_at && !r.completion_withdrawn_at && !r.completion_consumed_at);
+  const records = dispatchRuns.readRunRecords(home).filter((r) => completionKernel.isControllerRecord(r) && (r.completion_execution_end || (!r.completion_written_at && !r.completion_withdrawn_at && !r.completion_consumed_at)));
   let worked = 0;
   for (const r of records) {
     if (worked >= COMPLETION_RECONCILE_MAX) break;
     worked += 1; // every EXAMINED record counts — a pass is bounded in reads, not in writes
+    if (r.completion_execution_end) {
+      const ending = executionReporter(cfg, r, { home, log });
+      try {
+        const result = ending && await ending.retryEnd(r.completion_execution_end);
+        if (!result?.ok) log(`work: ${r.node_id} — execution release remains owed`);
+      } catch (e) {
+        log(`work: ${r.node_id} — execution release retry deferred (${e.message || e})`);
+      } finally { if (ending) ending.leave(); }
+      continue;
+    }
     // A pipeline still RUNNING under a live worker owns its own completion;
     // the reconciler only ever picks up what nothing else is holding — a
     // settled verdict with the boundary reached but the write not landed, a

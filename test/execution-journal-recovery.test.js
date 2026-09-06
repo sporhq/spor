@@ -210,3 +210,61 @@ test('new local publication logs normalized clocks and replays the exact returne
     assert.deepEqual((await engine().get(id)).execution, accepted.execution, 'same-reference publication metadata is replay-identical');
   }
 });
+
+for (const corrupt of [false, true]) test(`duplicate business journal rows refuse rebuild (altered=${corrupt})`, async t => {
+  const { home, engine } = setup(t), e = engine();
+  const opened = await e.open(args), id = opened.execution.execution_id;
+  await e.event(id, { fence: opened.fence, event: { type: 'stage.started', attempt: 1, run_id: 'run-1' } });
+  const rows = store.readEvents(home, 'local', id);
+  const duplicate = { ...rows.at(-1), ...(corrupt ? { seq: 999, fence: 99 } : {}) };
+  fs.appendFileSync(files(home, id).log, JSON.stringify(duplicate) + '\n');
+  const result = await e.get(id);
+  assert.equal(result.code, 'conflict');
+  assert.match(result.message, /duplicate event key/);
+});
+
+for (const ownership of [false, true]) test(`orphan opening retains its item hold across a different factory request (ownership=${ownership})`, async t => {
+  const { home, engine } = setup(t), e = engine();
+  const opened = await e.open(args), id = opened.execution.execution_id, f = files(home, id);
+  const rows = store.readEvents(home, 'local', id);
+  fs.writeFileSync(f.log, rows.slice(0, ownership ? 2 : 1).map(JSON.stringify).join('\n') + '\n');
+  fs.rmSync(f.view); fs.rmSync(f.pointer);
+  const originalLog = fs.readFileSync(f.log, 'utf8');
+  const refused = await e.open({ ...args, factory: 'factory-other' });
+  assert.equal(refused.code, 'execution_open');
+  assert.equal(store.readItem(home, 'local', args.node_id).open, id);
+  assert.equal(fs.readFileSync(f.log, 'utf8'), originalLog, 'a foreign factory cannot claim the orphan');
+  const resumed = await e.open(args);
+  assert.equal(resumed.ok, true); assert.equal(resumed.execution.execution_id, id);
+  assert.equal((await e.list()).count, 1);
+});
+
+test('trusted historical gates and completion replay without publication while new requests require it', async t => {
+  const { home, engine } = setup(t), e = engine();
+  const opened = await e.open(args), id = opened.execution.execution_id;
+  const candidate = { candidate_id: 'cand-legacy', commit: 'a'.repeat(40), tree: 'b'.repeat(40), provenance: { attempt: 1 } };
+  assert.equal((await e.event(id, { fence: opened.fence, event: { type: 'candidate.submitted', candidate } })).ok, true);
+  const gate = { type: 'gate.settled', gate_id: 'review', attempt: 1, state: 'passed' };
+  assert.equal((await e.event(id, { fence: opened.fence, event: gate })).code, 'no_candidate');
+  const log = files(home, id).log;
+  fs.appendFileSync(log, JSON.stringify({ ...gate, execution_id: id, seq: 2, fence: opened.fence, at: T0 }) + '\n');
+  assert.equal((await e.get(id)).execution.gate_results[0].state, 'passed');
+  assert.equal((await e.event(id, { fence: opened.fence, event: { type: 'completion.written', resolver: 'art-legacy' } })).code, 'boundary_not_reached');
+  fs.appendFileSync(log, JSON.stringify({ type: 'completion.written', resolver: 'art-legacy', execution_id: id, seq: 3, fence: opened.fence, at: T0 }) + '\n');
+  assert.equal((await e.get(id)).execution.stage, 'completed');
+});
+
+test('trusted historical post-repin omitted candidate binding replays while new requests reject it', async t => {
+  const { home, engine } = setup(t), e = engine();
+  const opened = await e.open(args), id = opened.execution.execution_id;
+  const a = { candidate_id: 'cand-legacy-a', commit: 'a'.repeat(40), tree: 'b'.repeat(40), reference: { verified_at: T0 }, provenance: { attempt: 1 } };
+  const b = { ...a, candidate_id: 'cand-legacy-b', supersedes: a.candidate_id, commit: 'c'.repeat(40), tree: 'd'.repeat(40) };
+  assert.equal((await e.event(id, { fence: opened.fence, event: { type: 'candidate.submitted', candidate: a } })).ok, true);
+  assert.equal((await e.event(id, { fence: opened.fence, event: { type: 'candidate.superseded', candidate: b } })).ok, true);
+  const gate = { type: 'gate.settled', gate_id: 'review', attempt: 1, state: 'passed' };
+  assert.equal((await e.event(id, { fence: opened.fence, event: gate })).code, 'invalid_event');
+  fs.appendFileSync(files(home, id).log, JSON.stringify({ ...gate, execution_id: id, seq: 3, fence: opened.fence, at: T0 }) + '\n');
+  const got = await e.get(id);
+  assert.equal(got.ok, true, got.message);
+  assert.equal(got.execution.gate_results[0].candidate_id, b.candidate_id);
+});

@@ -674,3 +674,46 @@ test("reporter emits publication for an unchanged pin and settles only persisted
   assert.equal(observed[2].candidate_id, CAND.candidate_id, "late A fact remains bound to A after B pin");
   assert.equal(observed[2].attempt, 1, "refused writes do not spend settlement keys");
 });
+
+for (const failure of ['before-release', 'lost-ack', 'before-report']) test(`withdrawal persists execution release debt across ${failure}`, async t => {
+  const fake = await startFakeExecutionServer({ nodes: { 'task-x': itemNode('task-x'), 'factory-t': itemNode('factory-t') } });
+  const home = tmp('release-debt');
+  t.after(async () => { spor.LIVE_EXECUTIONS.clear(); await fake.close(); fs.rmSync(home, { recursive: true, force: true }); });
+  const cfg = remoteCfg(home, fake.base);
+  const factory = factoryOf({ factory: 't', trusted_ref: 'main', gates: [{ id: 'acceptance', kind: 'command', command: 'true' }], completion: { by: 'controller' } });
+  const held = await spor.claimExecutionHold(cfg, { id: 'task-x', project: 'spor' }, factory, { home });
+  assert.equal(held.ok, true, held.reason);
+  const record = { run_id: 'run-release-debt', node_id: 'task-x', state: 'done', gate_state: 'failed', ...held.recordFields };
+  const p = dispatchRuns.runPaths(home, record.run_id);
+  fs.mkdirSync(path.dirname(p.record), { recursive: true }); fs.writeFileSync(p.record, JSON.stringify(record));
+  const reporter = spor.executionReporter(cfg, record, { home });
+  await reporter.resume();
+  const engine = [...fake.state.engines.values()][0];
+  const release = engine.release.bind(engine);
+  let calls = 0;
+  engine.release = async (...args) => {
+    calls++;
+    if (calls === 1 && failure === 'before-release') return { ok: false, code: 'unavailable' };
+    const result = await release(...args);
+    if (calls === 1 && failure === 'lost-ack') return { ok: false, code: 'unavailable' };
+    return result;
+  };
+  const execution = spor.executionCompletionDeps(reporter);
+  if (failure === 'before-report') execution.ended = async () => { throw new Error('crash before report'); };
+  const deps = spor.makeCompletionDeps(cfg, { home, runId: record.run_id, execution });
+  const withdrawn = await completionShell.withdrawCompletion({ record, deps, why: 'person abandoned item' });
+  assert.equal(withdrawn.settled, 'withdrawn');
+  let saved = dispatchRuns.readJson(p.record);
+  assert.ok(saved.completion_withdrawn_at);
+  assert.ok(saved.completion_execution_end, 'settled completion must retain store debt');
+  const originalStamp = saved.completion_withdrawn_at;
+  reporter.leave();
+  await spor.reconcileCompletions(cfg, { home });
+  saved = dispatchRuns.readJson(p.record);
+  assert.equal(saved.completion_execution_end, null);
+  assert.equal(saved.completion_withdrawn_at, originalStamp);
+  assert.ok(fake.record(held.executionId).released_at);
+  const count = calls;
+  await spor.reconcileCompletions(cfg, { home });
+  assert.equal(calls, count, 'acknowledged release does not repeat');
+});
