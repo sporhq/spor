@@ -289,3 +289,24 @@ test('new gate restart overrides caller admission metadata and rebuilds the exac
     assert.equal((await send({ type: 'completion.written', resolver: 'art-not-yet' })).code, 'boundary_not_reached');
   }
 });
+
+test('new repin invalidates integration identically on replay while historical repin preserves it', async t => {
+  const { home, engine } = setup(t), e = engine();
+  const opened = await e.open({ ...args, boundary: 'integration' }), id = opened.execution.execution_id;
+  const a = { candidate_id: 'cand-integration-a', commit: 'a'.repeat(40), tree: 'b'.repeat(40), reference: { verified_at: T0 }, provenance: { attempt: 1 } };
+  const b = { ...a, candidate_id: 'cand-integration-b', supersedes: a.candidate_id, commit: 'c'.repeat(40), tree: 'd'.repeat(40) };
+  const send = event => e.event(id, { fence: opened.fence, event });
+  assert.equal((await send({ type: 'candidate.submitted', candidate: a })).ok, true);
+  assert.equal((await send({ type: 'gate.settled', gate_id: 'review', state: 'passed', attempt: 1 })).ok, true);
+  assert.equal((await send({ type: 'integration.started', attempt: 1 })).ok, true);
+  const before = store.readEvents(home, 'local', id);
+  const repin = await send({ type: 'candidate.superseded', candidate: b, admission_version: 1 });
+  assert.equal(repin.ok, true, repin.message);
+  assert.equal(repin.execution.integration, null);
+  assert.deepEqual((await e.get(id)).execution, repin.execution);
+  const newRow = store.readEvents(home, 'local', id).at(-1);
+  assert.equal(newRow.admission_version, 2);
+  const { admission_version, ...oldRow } = newRow;
+  const historical = store.rebuildFromEvents(home, 'local', id, [...before, oldRow]);
+  assert.equal(historical.integration.state, 'running');
+});
