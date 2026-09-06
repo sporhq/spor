@@ -1056,6 +1056,16 @@ it, and §10.7 still demotes it on a refusal. No record is ever rewritten, and
 | `impl_run_id` | string | the run that submitted the candidate — the stage's own run, never a fix cycle's |
 | `impl_candidate` | object | the **tip** candidate: the pinned commit plus the tree it resolves to, plus provenance and a portable reference. See the table below |
 | `impl_candidates` | object[] | the **chain** of pins, oldest first, **ending at the tip**. A fix cycle or a rescue moves HEAD, and each re-pin onto a new tree appends here; a re-pin onto the SAME tree updates the last entry in place (it is the same candidate — the new commit joins its `commits_seen`). A tree can come back (a fix that reverts a one-hunk change reproduces it exactly), so **one `candidate_id` may appear more than once** — read the chain as an ordered list of pin events, never as a map keyed by id (§10.12) |
+| `impl_claim` | object | **controller completion only** (§10.13) — the claim pins, riding the record's CREATION write in ONE stamp with the initial `impl_state: "dispatched"`, so a record either has all of it or was not created by a stage launch: `{execution_id, claimed_at, completion: {by, after}, publish: {kind, bundle_store, remote}, factory: {node_id, revision}, item_revision, resolving_snapshot, status_snapshot}`. Everything the pipeline enforces is pinned HERE — an edit to the factory node mid-pipeline changes nothing. **A record with no `impl_claim` is a legacy run and reads as `completion.by: agent`.** |
+| `gates_state` | string | `"passed"` \| `"failed"` \| `"blocked"` — the settled verdict of the gate LIST alone, stamped when the list settles and before the integration stage starts. Stamped for every gated run; the fold into `gate_state` stays for legacy readers, but `gate_state: passed` cannot say WHICH boundary was passed and the completion predicate must (§10.13) |
+| `integration_state` | string | `"running"` \| `"landed"` \| `"parked"` \| `"failed"` \| `"refused"` — the integration stage's own verdict, stamped as it runs and settles |
+| `completion_debt` | string \| null | **controller completion only** — ONE field, never a set of booleans: `"write"` (the boundary was reached and the edge + status are owed), `"retract"` (a premature resolving edge is owed its retype), `"withdraw"` (our edge stands on an item abandoned under us and is owed its retype back), or `null`. Every transition is a single overwriting stamp (owe-first), and every pass RE-DERIVES the debt from `impl_claim.completion.after` against `gates_state`/`integration_state` and the graph rather than trusting the flag (§10.13) |
+| `completion_written_at` / `completion_withdrawn_at` / `completion_consumed_at` | ISO 8601 | when the completion settled, and how: written (the CAS landed), withdrawn (a person abandoned or released the item under us; our edge retyped back), consumed (the item was already terminal and released — resolved elsewhere, nothing written). Exactly one is ever set |
+| `completion_resolver` | string | the id of the completion record the controller wrote (`art-completion-<stem>-<candidate>`), content-addressed to the candidate it completed |
+| `completion_boundary` | string | `"gates"` \| `"integration"` — which declared boundary the completion was written at |
+| `completion_premature` | string[] | the source node ids of resolving edges that were written under the hold and retyped `relates-to` as evidence (§10.13) |
+| `completion_facts` | string[] | the gate/merge fact ids the pipeline filed, carried so a completion re-driven by a later pass can still link them |
+| `completion_note` | string | optional — the one-line reason a completion was withdrawn or consumed |
 
 **The candidate object** (`impl_candidate`, and every entry of
 `impl_candidates`), minted by `lib/kernel/candidate.js`:
@@ -1254,6 +1264,16 @@ the pool carrying its report) and a `failed` run produced nothing to gate. A
 `declined` run (§6) is never gated, enforced or not: it declared the item wrong
 and its route is triage — the finding it filed re-briefs the item, and its
 readiness stamp is gone, so it does not come straight back to a worker either.
+
+Under **controller completion** (§10.13) there is a third case, and it is the
+whole point of the stage: the implementer never writes the resolving edge, so
+its run can never read `resolved` — the graph, under the item's execution
+hold, answers "not resolved" and §6 files an ENFORCED `reported`. That run IS
+the candidate submission, so a record whose claim pins `completion.by:
+controller` (`impl_claim`) is gated on every terminal state but `declined`; the
+pipeline's own empty-diff and dirty-tree refusals then judge whether a
+candidate is actually there. A legacy record (no `impl_claim`) reads exactly as
+the two cases above.
 
 A gated run whose diff is EMPTY may still be a correct outcome — the item's
 real work was scoping, not code. That is not a fourth gated outcome but a
@@ -2858,3 +2878,144 @@ when it was re-pinned); `spor work --status` prints the tip beside the slot that
 is gating it, read off the run record — `journal/work/*.work.json` deliberately
 does not change shape for this stage. See `lib/kernel/candidate.js`,
 `pinCandidate` in `lib/shell/gate-runner.js`, and test/candidate.test.js.
+
+### 10.13 Controller completion — the resolving edge written at a declared boundary
+
+Under the shipped `by: agent` contract the gate necessarily runs AFTER the run
+wrote its resolver, and queue liveness is derived from the resolving EDGE — so
+every dependent of the item is released by a claim no gate has judged yet, and
+stays released if the gates then refuse; §10.7's demotion exists to paper over
+exactly that. A factory that declares an `implementation:` stage (or
+`completion: {by: controller}` alone — FACTORY-IMPLEMENTATION-STAGE.md §2.4
+E10) moves the completion off the implementer and onto the runner
+(dec-spor-factory-implementation-stage-contract; task-spor-factory-controller-
+completion-boundary). Nothing below runs for a factory declaring neither key:
+its prompt, its records and its pipeline are byte-identical to before.
+
+**The implementer submits a candidate; the controller completes.** The worker
+contract's step 5 becomes a SUBMISSION (lib/shell/worker-contract.js): commit on
+the launched branch, leave the tree clean, write the resolver node with a
+`relates-to` edge — NOT `resolves` — never flip the status, and open the final
+report with the fixed form `CANDIDATE: <resolver node id> — <why>` (read back by
+`parseCandidateReport` so the completion record can link the implementer's own
+account; a missing line is not a refusal, only an unlinked why). Under a
+declared `implementation:` block, step 3 lists only the `author_checks` gates and
+NAMES the suites the factory runs from the trusted ref after the run — a prompt
+that merely omitted them invites an agent to run them anyway. The run therefore
+ends as an ENFORCED `reported` (the graph answers "not resolved"), and §10.2's
+third case gates it.
+
+**The execution hold.** Before any dispatch the worker stamps the ITEM with
+`execution: <execution_id>` (+ `execution_at:`) by compare-and-swap — H1
+(`claimExecutionHold` in bin/spor.js, `stampHold` in lib/shell/completion.js):
+`put_node` with the item's `revision` remotely, a blob-sha compare under the
+machine-local integration lease locally, temp-file-plus-rename. It refuses (no
+hold, no launch, the loop cools the item) when the item already carries a LIVE
+resolving edge (not gateable), or a hold of a DIFFERENT execution — two
+executions never hold one item, and a foreign hold is taken over only by a
+same-factory resume (the record pins the id) or a person's explicit `spor
+release <id> --execution <exec>`, never by a fresh claim. A dispatch refused
+after the hold landed but before any run record (an unsatisfiable profile, a
+launcher that does not resolve) clears the hold through the same door. The
+claim pins ride the run record's CREATION write as `impl_claim` (§8) — one
+stamp, so the boundary, the publish policy, the factory revision, the
+resolving-edge snapshot and the status snapshot are what the pipeline enforces,
+whatever the factory node says later.
+
+**The hold is a READ rule, and it is the guarantee.** Between the stamp and the
+completion write, `resolutionMap` (lib/kernel/resolution.js, the edge half)
+counts NO inbound `resolves`/`answers` into a held item, and `queue.isLive`
+(the status half) reads it live whatever its status says — every `blocks`
+traversal, `liveBlockers`, `deriveReadiness`, `rankQueue`, the program view and
+the briefing render go through those two functions, in both modes, on every
+reader running this lib. An implementer that writes its `resolves` edge anyway,
+or hand-flips `done`, has broken the contract, but the write is INERT from the
+instant it lands: dependents stay blocked, and the window an earlier draft
+admitted ("between the write and the next poll") does not exist. Write-side
+hygiene sits on top: the seed schema-task/-issue `transitions()` refuse a
+completion status on a proposed node still carrying `execution:` (the
+controller's CAS removes the key in the same body and passes; a bare
+`set_status done` is refused naming the execution), `setStatusLocal` is the
+local twin, and their `get()` hook rides `execution_hold` — id, stamp time,
+every inert inbound resolver, a note — INSTEAD of the `resolution` ride-along.
+`spor get` prints a HELD note and, from this box's run journal, whether the
+holding worker is live, gone (**stale** — fail-closed until released or
+resumed, never read as done), or elsewhere. The hold keeps a COMPLETION inert,
+not a person's decision to drop the work: a give-up status (`abandoned`,
+`rejected` — the registry's non-resolving partition) is dead on the status half
+even while held; the local status door ends the execution in the same write,
+and the reconciler withdraws a hold that outlived an abandonment (and retypes
+our edge back, if it stood) — `set_status abandoned` is the person's door out
+of an execution, and the escalation a refusal files names both doors (`spor
+work --regate <run>`, `spor release <id> --execution <exec>`).
+
+**Premature resolution is retyped as evidence.** At submission (before any gate
+runs) and at every reconciliation pass, every inbound resolving edge whose
+source is not in the claim's `resolving_snapshot` — whoever wrote it — is
+retyped `resolves` → `relates-to` on its source node (remote: `DELETE` then
+`POST` on the edges door; local: `removeEdgeLine` + `appendEdgeLine`), and a
+terminal status written under the hold is rolled back to the snapshot; the
+retype is recorded on the record (`completion_premature`), on the candidate
+(`premature_resolution: true`) and on the completion record. The node stays,
+the link stays, only its type changes — §10.7's reason for never retracting
+under `by: agent` is honored. None of this is load-bearing for dependents; the
+hold is.
+
+**The completion write, in forced order** (`writeCompletion`): the debt is
+stamped `write` FIRST; the item is re-read and reconciled against settled
+state; premature edges are retyped; then (1) the completion record — an
+`artifact`, `art-completion-<stem>-<candidate>`, content-addressed to the
+candidate, carrying the `resolves` edge onto the item in its own validated
+write plus `relates-to` every gate/merge fact and the implementer's resolver —
+and (2) ONE compare-and-swap `put_node` of the ITEM writing the terminal status
+AND removing `execution:`/`execution_at:` on the revision step 0 read. The seed
+completion gate refuses a terminal status with no resolver, so status-first
+cannot land; `set_status` is deliberately not used (a read-modify-write with no
+revision echo is exactly the window the CAS closes). The moment (2) lands the
+hold is gone, our edge counts, and dependents are released — by this write and
+by nothing before it. On a `409` the write re-reads and branches: the item went
+`abandoned` → our edge is retyped back and the hold cleared alone (`withdrawn`;
+a gate never reverses a person's decision to drop work); `done` with the hold
+gone → consumed, nothing more written; `done` with our hold still present (a
+person's `set_status` past the gate) → the CAS is retried writing the
+hold-clear, the person's status stands; a DIFFERENT execution's hold → our edge
+is withdrawn and nothing on the item is written; only a non-terminal field
+moved → retry, bounded at 3, then the debt is left owed. The debt clears only
+after the CAS landed; a crash between (1) and (2) leaves `write` set and the
+next pass performs only (2), idempotently.
+
+**Which boundary.** `completion.after: gates` completes when the gate list
+settles `passed` (`gates_state`); with an integration block declared under
+that boundary, integration runs AFTER the completion and a landing failure
+files a `relates-to` item and never demotes — the item stays completed by
+declaration. `after: integration` (the default whenever integration is
+declared) completes only on `integration_state: landed`; a `parked` proposal
+completes when the per-pass proposal check sees the merge (its landed fact is
+the boundary's evidence, and `restoreProposal` writes the completion instead of
+promoting a status that was never flipped). A refusal at any stage writes NO
+edge and clears NO hold: the item stays open, held, blocked by the escalation
+the gate filed (§10.7's fail-closed half, unchanged), and its dependents stay
+blocked.
+
+**`completion_debt` is designed against all four durable-flag failure modes at
+once** (lib/kernel/completion.js `deriveCompletionDebt`, the per-pass
+`reconcileCompletions` in the same slot as the proposal check): (a) a stamp that
+fails is never the only record — the debt is re-derived every pass from the
+PINNED boundary against `gates_state`/`integration_state` and the graph, and
+`gate_state: passed` with `after: integration` and an integration still running
+derives NOTHING; (b) owe-first — `write` is stamped before step (1) and cleared
+only after the CAS, and moving from one debt to another is one overwrite; (c) a
+status move on the item turns the CAS into a `409` with a branch, and a foreign
+resolving edge — which does not move the item's revision — is inert under the
+hold until the CAS that clears it, which is ours; (d) every pass re-reads
+first: a `write` against an item already terminal and released is consumed, a
+`retract` against an edge already gone is consumed, any debt on a `superseded`
+record is consumed, and a pipeline that settled without reaching its boundary
+(refused, blocked, superseded, scoped) is stamped consumed — once the item no
+longer carries its hold, so a later abandonment is still seen — and the
+per-pass journal read stops paying for it; a `--regate` re-opens it. The pass is
+bounded in RECORDS EXAMINED, not in writes. `spor runs` prints the completion
+line (boundary, state, debt, execution); `spor work --status` shows the gating
+slot as before.
+
+See test/completion-boundary.test.js.

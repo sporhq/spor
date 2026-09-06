@@ -96,6 +96,21 @@ Rules:
   viewer — the renew-the-cert / schedule-the-audit shape, kept with the
   work instead of in one person's calendar. Everything else (compiles,
   briefings, edges) sees a dormant node normally.
+- `execution` / `execution_at` are optional flat scalars a factory worker
+  running under `completion.by: controller` stamps on the work item it is
+  about to implement (the **execution hold**, WORKERS.md §10.13,
+  FACTORY-IMPLEMENTATION-STAGE.md §4.5): `execution: exec-<16 hex>` names the
+  execution, `execution_at` when it was stamped, and a person's release adds
+  `execution_released_by`. While `execution:` is present the item is HELD:
+  `resolutionMap` counts no inbound resolving edge into it and `isLive` reads
+  it live whatever its status says, so a premature `resolves` edge or a
+  hand-flipped `done` retires nothing until the controller's completion write
+  removes the key in the same write as the terminal status. The seed task and
+  issue schemas refuse a completion status on a node still carrying the key,
+  and their `get()` rides `execution_hold` (the id, the stamp, the inert
+  resolvers) instead of `resolution`. A person ends a hold explicitly with
+  `spor release <id> --execution <exec>`; never hand-delete the key on a node a
+  live worker holds.
 - One fact per node. If you're writing "also" a lot, split it.
 - A node file the parser cannot read is **skipped, not fatal**
   (dec-spor-buildgraph-per-node-fault-isolation). `loadGraph` isolates each

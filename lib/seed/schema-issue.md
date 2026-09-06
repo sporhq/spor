@@ -2,7 +2,7 @@
 id: schema-issue
 type: schema
 kind: node-schema
-schema_version: 2026.08.22.1
+schema_version: 2026.09.06.1
 title: Seed schema for issue nodes
 summary: Node schema for the issue type — a defect/finding and its resolution lineage; queueable, so open issues join the decision queue. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -103,6 +103,15 @@ drives these hooks through the sandbox and fails if they and this payload
 disagree. Backward-readable: declaration only, no stored-shape change, no
 upgrade chain.
 
+`transitions()` + `get()` (2026.09.06.1, task-spor-factory-controller-completion-
+boundary): the **execution hold**, mirroring schema-task — `resolved` is REFUSED
+on a proposed node still carrying `execution:` (a factory controller's open
+execution; its completion CAS removes the key in the same write and passes),
+and `get()` rides along `execution_hold` (id, stamp time, inert inbound
+resolvers, a note) instead of the `resolution` ride-along while the key is
+present, matching the kernel's `resolutionMap`/`isLive` hold rule. See
+GRAPH.md "Execution hold". Backward-readable, no upgrade chain.
+
 ```json
 {
   "node_type": "issue",
@@ -178,6 +187,23 @@ export function transitions(current, proposed, view) {
   // that omits the partition behaves exactly as before (backward-readable). Issues
   // have no abandon path; `resolved` is the only terminal, so it is always gated.
   if (next === "resolved") {
+    // (3) the EXECUTION HOLD (2026.09.06.1, FACTORY-IMPLEMENTATION-STAGE.md
+    // §4.5): a proposed node still carrying `execution:` is under a factory
+    // controller's open execution, and the completion is the CONTROLLER's to
+    // write — its CAS write removes the key in the same body as the status, so
+    // it passes here; a bare `set_status resolved` on a held item does not.
+    // Write-side hygiene on top of the read guarantee (the kernel's
+    // executionHeld makes a premature status inert anyway).
+    const held = proposed && typeof proposed.execution === "string" && proposed.execution.trim() !== "";
+    if (held) {
+      return {
+        allow: false,
+        reason: "resolved is refused while this issue is under execution '" + proposed.execution +
+          "' (a factory controller holds it): the controller writes the completion " +
+          "when its gates pass, and a person ends the execution explicitly with " +
+          "'spor release <id> --execution " + proposed.execution + "'. (dec-spor-factory-implementation-stage-contract)",
+      };
+    }
     const rs = (view && view.resolvers) || [];
     const nonResolving = (view && view.non_resolving_statuses) || [];
     let ok = false;
@@ -223,6 +249,38 @@ export function transitions(current, proposed, view) {
 export function get(node, ctx) {
   const neighbors = (ctx && ctx.neighbors) || [];
   const nonResolving = (ctx && ctx.non_resolving_statuses) || [];
+  // (2026.09.06.1) The EXECUTION HOLD's read-time twin (FACTORY-IMPLEMENTATION-
+  // STAGE.md §4.5): a node carrying `execution:` is held by a factory
+  // controller, and under the hold NO inbound resolving edge retires it (the
+  // kernel's resolutionMap rule) — so the `resolution` ride-along below must
+  // not report one as retiring it either. Instead ride along `execution_hold`:
+  // the execution id, when it was stamped, a note saying WHY a resolver does
+  // not count, and every inert resolver (the controller reads this list to
+  // find a PREMATURE resolution — one whose source it did not see at claim
+  // time — and retype it as evidence).
+  if (typeof node.execution === "string" && node.execution.trim() !== "") {
+    var inert = [];
+    for (var h = 0; h < neighbors.length; h++) {
+      var hb = neighbors[h];
+      if (hb.dir !== "in" || hb.superseded) continue;
+      if (hb.edge !== "resolves" && hb.edge !== "answers") continue;
+      if (nonResolving.indexOf((hb.status || "").toLowerCase()) !== -1) continue;
+      if (hb.edge === "answers" && node.type !== "question") continue;
+      inert.push({ by: hb.id, edge: hb.edge, type: hb.type != null ? hb.type : null });
+    }
+    return {
+      execution_hold: {
+        id: node.execution,
+        since: node.execution_at != null ? node.execution_at : null,
+        inert_resolvers: inert,
+        note: "under execution " + node.execution + (node.execution_at ? " since " + node.execution_at : "") +
+          " — held by a factory controller: no resolving edge and no terminal status retires this node " +
+          "until the controller's completion write clears the hold" +
+          (inert.length ? " (" + inert.length + " inert resolver" + (inert.length === 1 ? "" : "s") + ": " + inert.map(function (r) { return r.by; }).join(", ") + ")" : "") +
+          ". A person ends it explicitly with 'spor release " + node.id + " --execution " + node.execution + "'.",
+      },
+    };
+  }
   for (let i = 0; i < neighbors.length; i++) {
     const nb = neighbors[i];
     if (nb.dir !== "in") continue;

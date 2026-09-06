@@ -39,6 +39,8 @@ const sat = require(path.join(ROOT, "lib", "kernel", "satisfiability.js"));
 const workLoop = require(path.join(ROOT, "lib", "shell", "work-loop.js"));
 const gatesKernel = require(path.join(ROOT, "lib", "kernel", "gates.js"));
 const candidateKernel = require(path.join(ROOT, "lib", "kernel", "candidate.js"));
+const completionKernel = require(path.join(ROOT, "lib", "kernel", "completion.js"));
+const completionShell = require(path.join(ROOT, "lib", "shell", "completion.js"));
 const gateRunner = require(path.join(ROOT, "lib", "shell", "gate-runner.js"));
 const integrationRunner = require(path.join(ROOT, "lib", "shell", "integration-runner.js"));
 const workerContractLib = require(path.join(ROOT, "lib", "shell", "worker-contract.js"));
@@ -47,7 +49,8 @@ const { workerContract } = workerContractLib;
 // TERMINAL status OR a live inbound resolves/answers edge — the same partition the
 // queue ranker and read surfaces use. The dispatch guard reads it so it never
 // launches an agent at already-finished work (issue-spor-dispatch-resolved-task-no-guard).
-const { isTerminalStatus, resolutionOf, openFindingsFor } = require(path.join(ROOT, "lib", "kernel", "resolution.js"));
+const resolution = require(path.join(ROOT, "lib", "kernel", "resolution.js"));
+const { isTerminalStatus, resolutionOf, openFindingsFor } = resolution;
 // Agent-readiness (dec-spor-agent-readiness-derived-classification): the same
 // derivation rankQueue uses per queue item, reused here for ONE node so the
 // dispatch guard (task-spor-dispatch-readiness-guard) shares its classification
@@ -1109,6 +1112,7 @@ async function cmdGet(cfg, { positionals, values }) {
     }
     if (!values.json) {
       out(r.json && r.json.raw ? r.json.raw : r.text);
+      noteExecutionHold(cfg, id, r.json && r.json.raw ? r.json.raw : r.text);
       return 0;
     }
     // --json: parse the raw with the SAME lib parser as local (parity), take the
@@ -1137,13 +1141,16 @@ async function cmdGet(cfg, { positionals, values }) {
   const nodesDir = cfg.nodesDir();
   const f = path.join(nodesDir, `${id}.md`);
   if (!values.json) {
+    let rawText;
     try {
-      out(fs.readFileSync(f, "utf8"));
-      return 0;
+      rawText = fs.readFileSync(f, "utf8");
     } catch {
       err(`no such node: ${id}`);
       return 1;
     }
+    out(rawText);
+    noteExecutionHold(cfg, id, rawText);
+    return 0;
   }
   // --json: parse the file, scan the loaded graph for inbound edges, and stamp the
   // git blob SHA as `revision` — recomputed zero-dep (crypto builtin), byte-
@@ -1160,6 +1167,29 @@ async function cmdGet(cfg, { positionals, values }) {
   const inbound = inboundEdges(graphLib.loadGraph(nodesDir), node.id);
   out(JSON.stringify(getNodeJson(node, inbound, gitBlobSha(raw)), null, 2));
   return 0;
+}
+
+// A node under a factory controller's EXECUTION HOLD reads as held, never as
+// done (FACTORY-IMPLEMENTATION-STAGE.md §4.5): one stderr line beside the raw
+// node naming the execution and — from this box's own run journal — whether
+// the worker that holds it is live, gone (STALE, fail-closed until released
+// or resumed), or not on this box at all. Never fails the read.
+function noteExecutionHold(cfg, id, raw) {
+  const m = /^execution:\s*(\S+)\s*$/m.exec(String(raw || ""));
+  if (!m) return;
+  const executionId = m[1];
+  let where = "no run on this box carries it";
+  try {
+    const home = cfg.userConfigHome();
+    const rec = dispatchRuns.readRunRecords(home).find((r) => r.impl_claim && r.impl_claim.execution_id === executionId);
+    if (rec) {
+      const live = rec.gate_worker && workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === rec.gate_worker);
+      where = live ? `run ${String(rec.run_id).slice(0, 8)}, its worker is live` : `STALE — run ${String(rec.run_id).slice(0, 8)} on this box, its worker is gone; a same-factory 'spor work' resumes it`;
+    }
+  } catch {
+    /* the note stands without the journal */
+  }
+  err(`note: ${id} is HELD by execution ${executionId} (${where}) — no resolving edge or terminal status retires it until the controller completes it or a person runs 'spor release ${id} --execution ${executionId}'`);
 }
 
 // The `spor get --json` shape (issue-spor-cli-get-missing-json-flag): one
@@ -4192,7 +4222,35 @@ function setStatusLocal(cfg, id, value, { graph = null } = {}) {
   if (allowed.size && !allowed.has(String(value))) {
     return { ok: false, reason: `status '${value}' not allowed for type '${type}' — allowed: ${[...allowed].join(", ")}` };
   }
-  const newRaw = rewriteStatus(raw, value);
+  // The EXECUTION HOLD's local write-side twin (FACTORY-IMPLEMENTATION-
+  // STAGE.md §4.5; the seed schema-task/-issue `transitions()` gate is the
+  // remote one): a node a factory controller holds (`execution:`) does not
+  // take a completion status from this door — the controller's own CAS write
+  // clears the hold in the same body as the status (completionWriteLocal), and
+  // a person ends the execution explicitly with `spor release --execution`.
+  // The give-up statuses (the registry's non-resolving partition — abandoned,
+  // rejected) are the person's OTHER door and stay allowed: the controller's
+  // completion write reads `abandoned` and withdraws (§4.3).
+  const current = g.nodes[id] || {};
+  let clearHold = false;
+  if (resolution.executionHeld(current) && resolution.isTerminalStatus(String(value), type, g)) {
+    if (!resolution.isGiveUpStatus(String(value), g)) {
+      return {
+        ok: false,
+        reason: `'${value}' is refused while ${id} is under execution '${current.execution}' (a factory controller holds it): the controller writes the completion when its gates pass; end the execution explicitly with 'spor release ${id} --execution ${current.execution}' first`,
+      };
+    }
+    // The person's door is ONE write: a give-up status on a held item also
+    // ends the execution, so the hold never outlives the work it was holding
+    // (the controller's own withdraw branch does the same after the fact).
+    clearHold = true;
+  }
+  let newRaw = rewriteStatus(raw, value);
+  if (newRaw != null && clearHold) {
+    newRaw = completionShell.setFrontmatterKey(newRaw, "execution", null);
+    newRaw = newRaw && completionShell.setFrontmatterKey(newRaw, "execution_at", null);
+    newRaw = newRaw && completionShell.setFrontmatterKey(newRaw, "execution_released_by", `set-status:${value}@${new Date().toISOString()}`);
+  }
   if (newRaw == null) return { ok: false, reason: `could not locate frontmatter in ${id}` };
   let node;
   try {
@@ -4515,12 +4573,36 @@ function leaseLine(lease) {
 
 const _LEASE_PAST = { claim: "claimed", renew: "renewed", extend: "extended", release: "released" };
 
-async function cmdLease(cfg, action, { positionals }) {
+async function cmdLease(cfg, action, { positionals, values = {} }) {
   const id = positionals[0];
   if (!id) {
-    err(`usage: spor ${action} <node-id>${action === "extend" ? " <duration>" : ""}`);
+    err(`usage: spor ${action} <node-id>${action === "extend" ? " <duration>" : ""}${action === "release" ? " [--execution <exec-id>]" : ""}`);
     if (action === "extend") err("  duration: 2h / 45m / 30s / 1d (or bare milliseconds)");
     return 1;
+  }
+  // The person's door out of a factory controller's EXECUTION HOLD
+  // (task-spor-factory-controller-completion-boundary, FACTORY-IMPLEMENTATION-
+  // STAGE.md §4.5): `spor release <id> --execution <exec-id>` clears the
+  // `execution:` key with the same compare-and-swap door the controller uses,
+  // recording who released it. Works in BOTH modes (the hold exists in both);
+  // it is the hold-clear only — the ordinary lease release is the bare verb.
+  // A hold left by a dead worker is fail-closed until this (or a same-factory
+  // resume) ends it, so the id must be named: it is the proof you looked.
+  if (action === "release" && values.execution != null) {
+    const executionId = String(values.execution || "").trim();
+    if (!executionId) {
+      err("spor release --execution needs the execution id the item carries ('spor get <id>' shows it)");
+      return 1;
+    }
+    const deps = makeCompletionDeps(cfg, {});
+    const who = cfg.mode() === "remote" ? "person" : os.userInfo().username || "person";
+    const cleared = await completionShell.clearHold({ nodeId: id, executionId, deps, releasedBy: `${who}@${new Date().toISOString()}` });
+    if (!cleared.ok) {
+      err(`cannot release execution ${executionId} on ${id}: ${cleared.reason}`);
+      return 1;
+    }
+    out(cleared.cleared ? `released execution ${cleared.holder} on ${id} — the hold is cleared; a resolving edge now retires it as usual` : cleared.note);
+    return 0;
   }
 
   // Remote-only: local mode has no lease pool, so degrade with one clear line
@@ -9174,6 +9256,7 @@ async function launchSupervisedHarness(cfg, {
   adapter, command, args, cwd, name, nodeId, prompt, server, localNodesDir, childToken, mcpToken, bindToken,
   renewToken, renewNode, releaseNode, project, itemRepo = null, itemCommits = null, readOnly = false,
   resolvedProfile = null,
+  recordFields = null,
 }) {
   const runId = crypto.randomUUID();
   const p = dispatchRuns.runPaths(cfg.userConfigHome(), runId);
@@ -9222,6 +9305,13 @@ async function launchSupervisedHarness(cfg, {
     // (issue-spor-idle-stop-never-releases-lease).
     release_node: releaseNode || null,
     server: server || null,
+    // The stage launch's CLAIM PINS (task-spor-factory-controller-completion-
+    // boundary, FACTORY-IMPLEMENTATION-STAGE.md §6.5): `impl_claim` and the
+    // stage's initial `impl_*` dimensions ride the record's CREATION write —
+    // ONE stamp — so a record either has all of it or was not created by a
+    // stage launch. Supplied by `spor work` through `ctx.recordFields`; a
+    // person's own dispatch supplies none and the record is byte-identical.
+    ...(recordFields && typeof recordFields === "object" ? recordFields : {}),
   };
   dispatchRuns.pruneRuns(cfg.userConfigHome(), { maxAgeMs: cfg.getNum("dispatch.runRetentionMs", 1209600000) });
   writePrivate(p.prompt, prompt);
@@ -9496,6 +9586,24 @@ async function cmdRuns(cfg, { values, positionals: pos }) {
       // worth a second line, and one longer than that is the record of every
       // fixer that moved the tree under the gates.
       if (chain.length > 1) out(`              re-pinned ${chain.length - 1}x — ${chain.slice(0, -1).map((c) => String(c.candidate_id || "?")).join(" -> ")} -> (tip)`);
+    }
+    // The controller completion's own dimension (task-spor-factory-
+    // controller-completion-boundary, WORKERS.md §8): the pinned boundary,
+    // what was written (or withdrawn/consumed), and any debt still owed.
+    if (r.impl_claim && r.impl_claim.completion) {
+      const c = r.impl_claim.completion;
+      const state = r.completion_written_at
+        ? `written ${r.completion_written_at}${r.completion_resolver ? ` by ${r.completion_resolver}` : ""}`
+        : r.completion_withdrawn_at
+          ? `withdrawn ${r.completion_withdrawn_at}${r.completion_note ? ` — ${r.completion_note}` : ""}`
+          : r.completion_consumed_at
+            ? `consumed ${r.completion_consumed_at}${r.completion_note ? ` — ${r.completion_note}` : ""}`
+            : r.completion_debt
+              ? `owed (${r.completion_debt})`
+              : "pending";
+      out(`  completion: by ${c.by} at '${c.after}' — ${state}${r.impl_claim.execution_id ? `; execution ${r.impl_claim.execution_id}` : ""}`);
+      if (r.gates_state || r.integration_state) out(`              gates ${r.gates_state || "-"}, integration ${r.integration_state || "-"}`);
+      if (Array.isArray(r.completion_premature) && r.completion_premature.length) out(`              premature resolution retyped: ${r.completion_premature.join(", ")}`);
     }
     if (r.child_reaped) out(`  reaped:     an orphaned harness child was terminated at reconciliation`);
     if (r.cwd) out(`  cwd:        ${r.cwd}`);
@@ -10801,6 +10909,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
         itemRepo,
         itemCommits,
         resolvedProfile: profileCheck && profileCheck.id ? profileCheck.id : null,
+        recordFields: ctx && ctx.recordFields ? ctx.recordFields : null,
       });
       if (!launched.ok) {
         err(`could not launch ${harnessBin}: ${launched.error}`);
@@ -11286,10 +11395,27 @@ async function pollWorkRuns(cfg, runIds, { maxAgeMs = 0, idleMs = 0, warn = () =
 // leave the protected suite alone, resolve last (lib/shell/worker-contract.js).
 // `spor dispatch` on its own stays byte-identical — a person aiming one agent
 // at one node writes their own instructions; an unattended loop cannot.
-async function dispatchWorkItem(cfg, item, passthrough, { factory = null } = {}) {
+async function dispatchWorkItem(cfg, item, passthrough, { factory = null, home = cfg.userConfigHome(), log = () => {} } = {}) {
   const values = { ...passthrough, node: item.id };
   if (!values.profile && item.profile) values.profile = item.profile;
-  return dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })]);
+  // Under `completion.by: controller` (task-spor-factory-controller-
+  // completion-boundary) the item is HELD before any dispatch — H1: the
+  // execution hold stamped by compare-and-swap, the claim pins riding the run
+  // record's creation write. A hold that cannot be stamped is H2: no hold, no
+  // launch, and the loop cools the item like any other refusal. A dispatch
+  // refused AFTER the hold landed but before any run record (I2 — an
+  // unsatisfiable profile, a launcher that does not resolve) clears the hold
+  // through the same door, so a refused item is never left held.
+  const controller = !!(factory && factory.completion && factory.completion.by === "controller");
+  if (!controller) return dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })]);
+  const held = await claimExecutionHold(cfg, item, factory, { home, log });
+  if (!held.ok) return { ok: false, reason: held.reason };
+  const launched = await dispatchThrough(cfg, values, [workerContract({ nodeId: item.id, factory })], { recordFields: held.recordFields });
+  if (!launched.ok) {
+    const cleared = await completionShell.clearHold({ nodeId: item.id, executionId: held.executionId, deps: makeCompletionDeps(cfg, { home }) });
+    if (!cleared.ok) log(`work: ${item.id} — the dispatch was refused and its execution hold ${held.executionId} could not be cleared (${cleared.reason}); release it with 'spor release ${item.id} --execution ${held.executionId}'`);
+  }
+  return launched;
 }
 
 // Whether THIS machine can satisfy a loaded factory's integration
@@ -11357,7 +11483,10 @@ async function dispatchThroughLocked(cfg, values, positionals = [], opts = {}) {
     // for a launch whose posture it already translated by meaning to a
     // genuinely attended one — see cmdDispatch's own comment
     // (issue-spor-rescue-posture-attended-translation-hard-refuses).
-    code = await cmdDispatch(cfg, { values, positionals }, { onLaunch: (l) => launches.push(l), supervisedOnly: true, carryTask: true, unattended: true, allowAttended: !!opts.allowAttended });
+    // recordFields: the stage launch's claim pins (`impl_claim` + the initial
+    // `impl_*` stamps), merged into the run record's creation write
+    // (launchSupervisedHarness) — one stamp, never a second write.
+    code = await cmdDispatch(cfg, { values, positionals }, { onLaunch: (l) => launches.push(l), supervisedOnly: true, carryTask: true, unattended: true, allowAttended: !!opts.allowAttended, recordFields: opts.recordFields || null });
   } catch (e) {
     // A throw AFTER the launch (the post-launch session capture and bind are
     // network calls) still means an agent is running and holding a lease —
@@ -13315,11 +13444,11 @@ function makeGateDeps(
         // needs a graph read that belongs to the completion boundary, not to a
         // pin. `answers` counts beside `resolves`: both retire an item, so
         // reading only one would be the fail-open direction.
-        resolver: {
+        resolver: await candidateResolverFromReport(cfg, producer, entry.node_id, {
           node: producer.resolved_by || null,
           written: !!producer.resolved_by,
           resolves_edge: producer.resolved_edge === "resolves" || producer.resolved_edge === "answers",
-        },
+        }),
       });
       if (!pinned.ok) return pinned;
       const folded = candidateKernel.repinCandidate(current.impl_candidate || null, pinned.candidate);
@@ -13362,6 +13491,19 @@ function makeGateDeps(
       // and judges the tree regardless), but never a silent ok:true.
       if (!stamped) return { ok: false, reason: `the candidate for ${entry.node_id} was pinned but could not be stamped onto its run record` };
       return { ok: true, candidate: folded.candidate, change: folded.change };
+    },
+    // The premature-resolution check at submission (task-spor-factory-
+    // controller-completion-boundary, §4.5): the shell/completion.js retype
+    // driven on this pipeline's own record, and the candidate stamped
+    // `premature_resolution: true` when anything was retyped.
+    premature: async () => {
+      const current = freshRecord(home, record);
+      if (!completionKernel.isControllerRecord(current)) return { ok: true, retyped: [] };
+      const r = await completionShell.retractPremature({ record: current, deps: makeCompletionDeps(cfg, { home, runId: entry.run_id }), log });
+      if (r && r.retyped && r.retyped.length && current.impl_candidate) {
+        dispatchRuns.stampImplState(home, entry.run_id, { impl_candidate: { ...current.impl_candidate, premature_resolution: true } });
+      }
+      return r;
     },
     // The two reads behind a SUPERSEDED verdict (issue-spor-work-adopts-
     // orphaned-pipeline-of-hand-landed-run): is the item resolved on the graph
@@ -13608,6 +13750,16 @@ function makeGateDeps(
         `This item \`blocks\` ${entry.node_id} on the graph, and if that item had already been flipped to a`,
         "completion status the worker rolled it back. The run's resolver is left standing: it is the record of",
         "what the agent did, and retiring it (or letting it stand) is the judgement this item is asking for.",
+        ...(completionKernel.isControllerRecord(record)
+          ? [
+              "",
+              `${entry.node_id} is HELD by execution \`${record.impl_claim.execution_id}\` (this factory completes items itself, at its`,
+              `'${record.impl_claim.completion.after}' boundary): no resolving edge and no terminal status retires it while the hold stands, and a`,
+              "fresh worker never takes a held item. The doors back are 'spor work --regate " + entry.run_id + "' (re-judge this run under",
+              `the same execution) or 'spor release ${entry.node_id} --execution ${record.impl_claim.execution_id}' (end the execution; the item then`,
+              "returns to the pool, or is resolved by hand as usual).",
+            ]
+          : []),
         "",
         detail ? `Last outcome: ${detail}` : "",
         "",
@@ -14160,7 +14312,7 @@ function buildProposalTrackingNode({ id, nodeId, runId, targetRef, proposal, pro
 // integration-runner.js's pure orchestration, mirroring makeGateDeps above.
 // Only ever constructed when `factory.integration` resolved, so a bare
 // factory (or one with no integration block) never touches any of this.
-function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, warn, sleep, log, workerId = null, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, dispatch = dispatchThrough, home = cfg.userConfigHome() }) {
+function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, warn, sleep, log, workerId = null, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, dispatch = dispatchThrough, home = cfg.userConfigHome(), completedBeforeIntegration = false }) {
   const integration = factory.integration;
   const date = () => new Date().toISOString().slice(0, 10);
   const stem = gateStem(entry.node_id);
@@ -14413,7 +14565,14 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       if (!repoDir || path.resolve(repoDir) === path.resolve(dir)) return; // the main checkout, not a dispatch worktree — nothing to remove
       removeDispatchWorktree(repoDir, dir, path.basename(dir));
     },
-    demote: ({ blockerId }) => gateDemoteItem(cfg, entry.node_id, { blockerId }),
+    // Post-completion integration (FACTORY-IMPLEMENTATION-STAGE.md §4.2 C3-C4):
+    // under `completion.after: gates` the item was completed BEFORE this stage
+    // ran, so a failure here never demotes it — a completed item has nothing
+    // to block — and its escalation `relates-to` the work item instead.
+    demote: ({ blockerId }) =>
+      completedBeforeIntegration
+        ? Promise.resolve({ ok: true, demoted: false, note: `${entry.node_id} was completed at the 'gates' boundary and stays completed; the landing is left for a person (${blockerId})` })
+        : gateDemoteItem(cfg, entry.node_id, { blockerId }),
     escalate: async ({ attempts, detail, evidence }) => {
       const id = `task-integration-${stem}-${short}-${gateIdSuffix("integration-escalate", "integration", entry.node_id, runKey)}`.toLowerCase();
       // A lost CAS race is nobody's fix cycle (integration-runner.js never
@@ -14429,9 +14588,17 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
         `The integration stage could not land ${entry.node_id} onto \`${integration.targetRef}\` — ${why}. A person`,
         "decides what happens next — the worker has stopped retrying it.",
         "",
-        `This item \`blocks\` ${entry.node_id} on the graph, and if that item had already been flipped to a`,
-        "completion status the worker rolled it back. Every declared gate already passed; only the merge-queue",
-        "landing itself is unresolved. The run's resolver is left standing.",
+        ...(completedBeforeIntegration
+          ? [
+              `This item \`relates-to\` ${entry.node_id}, which was COMPLETED at the factory's 'gates' boundary before this`,
+              "stage ran and stays completed — the operator chose to release dependents before the change is on the",
+              "target ref. Every declared gate already passed; only the merge-queue landing itself is unresolved.",
+            ]
+          : [
+              `This item \`blocks\` ${entry.node_id} on the graph, and if that item had already been flipped to a`,
+              "completion status the worker rolled it back. Every declared gate already passed; only the merge-queue",
+              "landing itself is unresolved. The run's resolver is left standing.",
+            ]),
         "",
         detail ? `Last outcome: ${detail}` : "",
         "",
@@ -14452,12 +14619,376 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
           project: slug,
           date: date(),
           requiresHuman: true,
-          edges: [{ type: "blocks", to: entry.node_id }],
+          edges: [{ type: completedBeforeIntegration ? "relates-to" : "blocks", to: entry.node_id }],
         })
       );
     },
     log,
   };
+}
+
+// --- controller completion (task-spor-factory-controller-completion-boundary)
+// The shell doors lib/shell/completion.js drives: the item read (with the
+// inbound resolvers the hold keeps inert), the compare-and-swap write, the
+// edge micro-mutations, the resolver write, and the run-record stamps.
+// Everything here is mode-aware; nothing here decides anything.
+
+// One edge mutation on a node, in either mode — the machine twin of `spor
+// edge` (add) / `spor edge --remove`, without its CLI chatter. Local mode
+// normalizes through the registry exactly as cmdEdge does (an inverse form
+// lands on the other node), validates the rewritten node, and writes it.
+async function graphEdgeMutation(cfg, from, type, to, { remove = false } = {}) {
+  if (cfg.mode() === "remote") {
+    const r = remove
+      ? await remote.del(cfg, `/v1/nodes/${encodeURIComponent(from)}/edges`, { body: { type, to }, timeoutMs: 8000 })
+      : await remote.post(cfg, `/v1/nodes/${encodeURIComponent(from)}/edges`, { type, to }, { timeoutMs: 8000 });
+    if (r.transport) return { ok: false, reason: `offline — ${r.error}` };
+    if (!r.ok) {
+      const e = (r.json && r.json.error) || {};
+      return { ok: false, reason: `edge error ${r.status}${e.message ? `: ${e.message}` : ""}` };
+    }
+    return { ok: true, skipped: !!(r.json && r.json.status === "skipped") };
+  }
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  const nodesDir = cfg.nodesDir();
+  let g;
+  try {
+    g = graphLib.loadGraph(nodesDir);
+  } catch (e) {
+    return { ok: false, reason: `could not load graph: ${e.message}` };
+  }
+  const reg = g.registry;
+  let srcId = from, edgeType = type, target = to;
+  const inverses = reg.edgeInverses();
+  const renames = reg.edgeRenames();
+  if (inverses[edgeType]) {
+    edgeType = inverses[edgeType];
+    const t = srcId; srcId = target; target = t;
+  } else if (renames[edgeType]) edgeType = renames[edgeType];
+  if (!NODE_ID_RE.test(srcId) || !NODE_ID_RE.test(target)) return { ok: false, reason: `bad node id ('${srcId}' / '${target}')` };
+  if (!reg.isKnownEdge(edgeType)) return { ok: false, reason: `unknown edge type '${type}'` };
+  const file = path.join(nodesDir, `${srcId}.md`);
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    return { ok: false, reason: `no such node: ${srcId}` };
+  }
+  const existing = (g.nodes[srcId] && g.nodes[srcId].edges) || [];
+  const present = existing.some((e) => e.type === edgeType && e.to === target);
+  if (remove && !present) return { ok: true, skipped: true };
+  if (!remove && present) return { ok: true, skipped: true };
+  const newRaw = remove ? removeEdgeLine(raw, edgeType, target) : appendEdgeLine(raw, edgeType, target, null);
+  if (newRaw == null) return { ok: false, reason: `could not ${remove ? "remove" : "add"} ${srcId} -[${edgeType}]-> ${target}: the frontmatter${remove ? " line" : ""} could not be located` };
+  let node;
+  try {
+    node = graphLib.parseFrontmatter(newRaw, `${srcId}.md`);
+  } catch (e) {
+    return { ok: false, reason: `invalid node after edge rewrite: ${e.message}` };
+  }
+  const v = graphLib.validateNode(g, node);
+  if (!v.ok) return { ok: false, reason: `invalid node after edge rewrite: ${v.errors.join("; ")}` };
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tmp, newRaw);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* already gone */ }
+    return { ok: false, reason: `could not write ${srcId}: ${e.message}` };
+  }
+  return { ok: true, skipped: false };
+}
+
+// The item as the completion runner needs to see it (lib/shell/completion.js
+// `readItem`): status/type/terminal, the hold, the revision the CAS sends
+// back, and the inbound resolving edges the hold keeps INERT. Remotely those
+// ride the seed schema's `execution_hold` enrichment (schema-task/-issue
+// get(), 2026.09.06.1); an older server that has not shipped the hook still
+// reports the first live resolver as `resolution`, which is read as the one
+// inbound edge it is. Locally they are the kernel's own inboundResolvers over
+// a FRESH graph load — never the cached one: this read sits between writes.
+async function completionReadItem(cfg, nodeId) {
+  const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+  if (cfg.mode() === "remote") {
+    const r = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(nodeId)}`, { timeoutMs: 8000 });
+    if (r.transport) return { ok: false, reason: `offline — ${r.error}` };
+    if (!r.ok) return { ok: false, reason: r.status === 404 ? `no such node: ${nodeId}` : `HTTP ${r.status}` };
+    if (r.jsonError || !r.json || typeof r.json !== "object" || typeof r.json.raw !== "string") return { ok: false, reason: `${nodeId}: the server answered with no readable node body` };
+    let fm = {};
+    try {
+      fm = graphLib.parseFrontmatter(r.json.raw, `${nodeId}.md`);
+    } catch (e) {
+      return { ok: false, reason: `${nodeId}: unparseable frontmatter (${e.message})` };
+    }
+    const hold = r.json.execution_hold && typeof r.json.execution_hold === "object" ? r.json.execution_hold : null;
+    const inbound = hold && Array.isArray(hold.inert_resolvers)
+      ? hold.inert_resolvers.filter((x) => x && x.by).map((x) => ({ by: x.by, edge: x.edge || "resolves" }))
+      : r.json.resolution && r.json.resolution.by
+        ? [{ by: r.json.resolution.by, edge: r.json.resolution.edge || "resolves" }]
+        : [];
+    const status = String(fm.status || "");
+    return {
+      ok: true,
+      status,
+      type: String(fm.type || ""),
+      terminal: !!status && graphLib.isTerminalStatusOffline(status, fm.type || null),
+      execution: typeof fm.execution === "string" ? fm.execution : "",
+      executionAt: typeof fm.execution_at === "string" ? fm.execution_at : null,
+      giveUp: resolution.isGiveUpStatus(status, null),
+      revision: r.json.revision || null,
+      raw: r.json.raw,
+      inbound,
+      resolvedBy: (r.json.resolution && r.json.resolution.by) || null,
+    };
+  }
+  const nodesDir = cfg.nodesDir();
+  const file = path.join(nodesDir, `${nodeId}.md`);
+  let buf;
+  try {
+    buf = fs.readFileSync(file);
+  } catch (e) {
+    return { ok: false, reason: e && e.code === "ENOENT" ? `no such node: ${nodeId}` : `${nodeId} could not be read: ${e.message}` };
+  }
+  let g;
+  try {
+    g = graphLib.loadGraph(nodesDir);
+  } catch (e) {
+    return { ok: false, reason: `could not load graph: ${e.message}` };
+  }
+  const n = g.nodes[nodeId];
+  if (!n) return { ok: false, reason: `${nodeId} did not load (an unparseable node file?)` };
+  const status = String(n.status || "");
+  const res = resolutionOf(g, nodeId);
+  return {
+    ok: true,
+    status,
+    type: String(n.type || ""),
+    terminal: !!status && isTerminalStatus(status, n.type, g),
+    execution: typeof n.execution === "string" ? n.execution : "",
+    executionAt: typeof n.execution_at === "string" ? n.execution_at : null,
+    giveUp: resolution.isGiveUpStatus(status, g),
+    revision: gitBlobSha(buf),
+    raw: buf.toString("utf8"),
+    inbound: resolution.inboundResolvers(g, nodeId).map((x) => ({ by: x.by, edge: x.edge })),
+    resolvedBy: res && res.by ? res.by : null,
+  };
+}
+
+// The compare-and-swap write of a whole node (lib/shell/completion.js
+// `casWrite`). Remote: `put_node` with `if_exists: update` and the revision —
+// API.md §1 rejects a stale revision with `conflict` rather than last-writer-
+// wins. Local: the node file's blob sha read at step 0 is compared against
+// the sha at write time under the machine-local integration lease
+// (acquireLocalIntegrationLease, so the only other writer on the box — a
+// second worker — is serialized), a person's hand edit is caught by the
+// compare, and the write itself is temp-file-plus-rename. The rewritten node
+// is validated through the same door `spor put-node` uses.
+async function completionCasWrite(cfg, { nodeId, revision, raw }, { home = cfg.userConfigHome() } = {}) {
+  if (cfg.mode() === "remote") {
+    const r = await remote.post(cfg, "/v1/nodes", { nodes: [{ node: raw, if_exists: "update", revision: revision || undefined }] }, { timeoutMs: 15000 });
+    if (r.transport) return { ok: false, reason: `offline — ${r.error}` };
+    const res0 = r.json && r.json.results && r.json.results[0];
+    if (res0 && res0.ok) return { ok: true, revision: res0.revision || null };
+    // A batch entry's verdict is FLAT on the entry (`{ok, code, message,
+    // details, revision}` — the server's putNode result, API.md §3); a
+    // request-level refusal is the envelope's `error`. A stale revision is
+    // `code: "conflict"` ("stale revision for '<id>'; re-read and retry").
+    const e = res0 && (res0.code || res0.message) ? res0 : (r.json && r.json.error) || {};
+    const code = String(e.code || "").toLowerCase();
+    const msg = String(e.message || "");
+    const conflict = r.status === 409 || code === "conflict" || (/revision/i.test(msg) && /conflict|stale|mismatch/i.test(msg));
+    if (conflict) return { ok: false, conflict: true, reason: msg || "revision conflict" };
+    return { ok: false, reason: putNodeEntryError(res0, r.status, "completion") };
+  }
+  const nodesDir = cfg.nodesDir();
+  const file = path.join(nodesDir, `${nodeId}.md`);
+  const lease = await acquireLocalIntegrationLease(home, nodesDir, { waitMs: 15000 });
+  try {
+    let current;
+    try {
+      current = fs.readFileSync(file);
+    } catch (e) {
+      return { ok: false, reason: `${nodeId} could not be read: ${e.message}` };
+    }
+    const now = gitBlobSha(current);
+    if (revision && now !== revision) return { ok: false, conflict: true, reason: `stale revision for ${nodeId}: expected ${String(revision).slice(0, 12)}, found ${now.slice(0, 12)}` };
+    const parsed = parsePutNode(raw, `${nodeId}.md`);
+    if (parsed.error) return { ok: false, reason: parsed.error };
+    if (parsed.node.id !== nodeId) return { ok: false, reason: `the rewritten node's id '${parsed.node.id}' is not ${nodeId}` };
+    const valid = validatePutNodeLocal(nodesDir, parsed.node, raw);
+    if (valid.error) return { ok: false, reason: valid.error };
+    const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      fs.writeFileSync(tmp, raw);
+      fs.renameSync(tmp, file);
+    } catch (e) {
+      try { fs.unlinkSync(tmp); } catch { /* already gone */ }
+      return { ok: false, reason: `could not write ${nodeId}: ${e.message}` };
+    }
+    return { ok: true, revision: gitBlobSha(Buffer.from(raw)) };
+  } finally {
+    releaseLocalIntegrationLease(lease);
+  }
+}
+
+// The declared completion status of a type: the local registry's own
+// declaration where a graph is here to be read, else the seed fallback
+// (the same table gatePromoteItem's remote branch uses).
+function completionStatusFor(cfg, type) {
+  if (cfg.mode() !== "remote") {
+    try {
+      const { graph: g } = u.loadGraphCached(cfg.nodesDir());
+      const declared = type ? g.registry.completionStatus(type) : null;
+      if (declared) return declared;
+    } catch {
+      /* fall through */
+    }
+  }
+  return GATE_TYPE_COMPLETION_FALLBACK[type] || "done";
+}
+
+// The deps one completion write runs on. `runId` names the record the
+// stamps land on (the pipeline's own run).
+function makeCompletionDeps(cfg, { home = cfg.userConfigHome(), runId = null } = {}) {
+  return {
+    readItem: (nodeId) => completionReadItem(cfg, nodeId),
+    casWrite: (args) => completionCasWrite(cfg, args, { home }),
+    writeNode: (id, markdown) => writeGateNode(cfg, id, markdown),
+    readNode: async (id) => {
+      const node = await resolveNode(cfg, id);
+      if (!node || nodeUnreadable(node)) return null;
+      return { ok: true, edges: node.edges || [], status: node.status || "", type: node.type || "" };
+    },
+    addEdge: (from, type, to) => graphEdgeMutation(cfg, from, type, to),
+    removeEdge: (from, type, to) => graphEdgeMutation(cfg, from, type, to, { remove: true }),
+    completionStatus: (type) => completionStatusFor(cfg, type),
+    stamp: (patch) => (runId ? dispatchRuns.stampCompletionState(home, runId, patch) : null),
+    stampImpl: (patch) => (runId ? dispatchRuns.stampImplState(home, runId, patch) : null),
+    now: () => Date.now(),
+  };
+}
+
+// H1 (FACTORY-IMPLEMENTATION-STAGE.md §4.2): the execution hold, stamped on
+// the item BEFORE the implementer is dispatched, and the claim pins the run
+// record is created with (`ctx.recordFields`). Returns the recordFields, or a
+// refusal — an unroutable item (H2): no hold, no launch, cooled by the loop.
+async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHome(), log = () => {} } = {}) {
+  const claimedAt = new Date().toISOString();
+  const tenant = cfg.mode() === "remote" ? remote.base(cfg) : "local";
+  const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");
+  const executionId = completionKernel.executionIdFor({ tenant, nodeId: item.id, factoryId: factory.id, claimedAt }, sha256);
+  const deps = makeCompletionDeps(cfg, { home });
+  const held = await completionShell.stampHold({ nodeId: item.id, executionId, deps });
+  if (!held.ok) return { ok: false, reason: `execution hold refused on ${item.id}: ${held.reason}`, kind: held.kind };
+  const impl = factory.implementation || null;
+  const recordFields = {
+    impl_claim: {
+      execution_id: executionId,
+      claimed_at: held.pins.claimed_at,
+      completion: { by: factory.completion.by, after: factory.completion.after },
+      publish: impl ? { kind: impl.candidate.publish, bundle_store: impl.candidate.bundleStore || null, remote: impl.candidate.remote || null } : { kind: "bundle", bundle_store: null, remote: null },
+      factory: { node_id: factory.id, revision: factory.revision || null },
+      item_revision: held.pins.revision,
+      resolving_snapshot: held.pins.resolving_snapshot,
+      status_snapshot: held.pins.status_snapshot,
+    },
+    impl_state: "dispatched",
+    impl_attempt: 1,
+  };
+  log(`work: ${item.id} — held by execution ${executionId} (completion by controller at the '${factory.completion.after}' boundary)${held.restamped ? " (re-stamped)" : ""}`);
+  return { ok: true, executionId, recordFields };
+}
+
+// Fill the candidate's `resolver` from the run's OWN report (the `CANDIDATE:`
+// fixed form, lib/shell/worker-contract.js) verified against the graph — the
+// read the candidate record could not make (task-spor-factory-candidate-
+// record's note: `written` used to equal `resolves_edge`, so a resolver
+// written with NO edge — the intended steady state under controller
+// completion — left no trace). `written: true` means the node exists on the
+// graph; `resolves_edge` says whether it (prematurely) carries a resolving
+// edge onto the item. Fail-soft: an unreadable graph leaves the terminal
+// contract's own reading in place.
+async function candidateResolverFromReport(cfg, producer, nodeId, fallback) {
+  const text = gateRunReportText(producer);
+  const parsed = completionKernel.parseCandidateReport(text);
+  if (!parsed.ok) return fallback;
+  let node = null;
+  try {
+    node = await resolveNode(cfg, parsed.resolver);
+  } catch {
+    node = null;
+  }
+  if (!node || nodeUnreadable(node)) return { ...fallback, node: parsed.resolver, written: false };
+  const edges = Array.isArray(node.edges) ? node.edges : [];
+  return {
+    node: parsed.resolver,
+    written: true,
+    resolves_edge: fallback.resolves_edge || edges.some((e) => e && (e.type === "resolves" || e.type === "answers") && e.to === nodeId),
+  };
+}
+
+// The per-pass reconciliation (§6.5 (a), the slot `checkProposals` occupies):
+// for every controller record on this box whose completion is not settled,
+// re-derive the debt from the record's pinned boundary plus the graph and act
+// on it — `write` at a reached boundary (a crash between the edge and the
+// status resumes here, idempotently), `retract` for a premature edge (P1 at
+// every poll), `withdraw` for an item abandoned under us. A parked proposal's
+// boundary is its landed fact, exactly checkProposals' own evidence. Bounded
+// per pass and fail-soft: an unreadable graph leaves every debt owed.
+const COMPLETION_RECONCILE_MAX = 10;
+async function reconcileCompletions(cfg, { home = cfg.userConfigHome(), log = () => {} } = {}) {
+  const records = dispatchRuns.readRunRecords(home).filter((r) => completionKernel.isControllerRecord(r) && !r.completion_written_at && !r.completion_withdrawn_at && !r.completion_consumed_at);
+  let worked = 0;
+  for (const r of records) {
+    if (worked >= COMPLETION_RECONCILE_MAX) break;
+    worked += 1; // every EXAMINED record counts — a pass is bounded in reads, not in writes
+    // A pipeline still RUNNING under a live worker owns its own completion;
+    // the reconciler only ever picks up what nothing else is holding — a
+    // settled verdict with the boundary reached but the write not landed, a
+    // parked proposal, or an orphan. Its P1 detection still runs for a
+    // running pipeline (one read), since that is what "at every poll" means.
+    const running = r.gate_state === "running" && r.gate_worker && workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === r.gate_worker);
+    let landedFactPresent = false;
+    if (r.integration_state === "parked" || r.gate_state === "parked") {
+      try {
+        const lf = await resolveNode(cfg, integrationRunner.integrationFactId(r.node_id, r.run_id, "landed"));
+        landedFactPresent = !!(lf && !nodeUnreadable(lf));
+      } catch {
+        landedFactPresent = false;
+      }
+    }
+    const deps = makeCompletionDeps(cfg, { home, runId: r.run_id });
+    try {
+      const facts = Array.isArray(r.completion_facts) ? r.completion_facts : [];
+      const res = running
+        ? await completionShell.retractPremature({ record: r, deps, log })
+        : await completionShell.reconcileCompletion({ record: r, deps, log, facts, landedFactPresent });
+      if (res && res.ok === false) log(`work: ${r.node_id} — completion reconciliation deferred (${res.reason}); re-examined next pass`);
+      // A pipeline that settled WITHOUT reaching its boundary (refused,
+      // blocked, superseded, scoped) owes no completion, and nothing later
+      // changes that except a `--regate` — which re-opens the record (below).
+      // Stamp it consumed so the journal read above stops paying for it
+      // every pass for the record's whole retention.
+      // ...but NOT while the item still carries OUR hold: a refusal leaves it
+      // held (T1), and a person's later `abandoned` on it is a `withdraw` this
+      // pass has to be able to see (one extra read per held refusal, bounded
+      // by the pass cap above; a released or re-claimed item is consumed).
+      if (res === null && !running && r.gate_state && gatesKernel.SETTLED_GATE_STATES.has(r.gate_state) && r.gate_state !== "passed" && r.gate_state !== "parked") {
+        let stillOurs = false;
+        try {
+          const item = await deps.readItem(r.node_id);
+          stillOurs = !item || !item.ok || String(item.execution || "") === String(r.impl_claim.execution_id || "");
+        } catch {
+          stillOurs = true; // unknown is not evidence the hold is gone
+        }
+        if (!stillOurs) {
+          dispatchRuns.stampCompletionState(home, r.run_id, { completion_consumed_at: new Date().toISOString(), completion_note: `the pipeline settled '${r.gate_state}' without reaching its completion boundary and the item no longer carries its hold; nothing owed unless it is re-gated` });
+        }
+      }
+    } catch (e) {
+      log(`work: ${r.node_id} — completion reconciliation threw (${(e && e.message) || e}); re-examined next pass`);
+    }
+  }
 }
 
 // Run the gate pipeline and, if every declared gate passed and the factory
@@ -14480,10 +15011,64 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // a refusal (§10.7) under the worker's scope token would hide it from exactly
   // the project-scoped queue a person would look in.
   const dctx = { ...ctx, slug: item.project || ctx.slug || null, record, entry };
+  const home = ctx.home || cfg.userConfigHome();
+  const controller = completionKernel.isControllerRecord(record) && ctx.factory.completion && ctx.factory.completion.by === "controller";
+  // The boundary is the CLAIM's (pinned at H1), never the factory node's
+  // current text — an edit mid-pipeline changes nothing (§7.2).
+  const boundary = controller ? record.impl_claim.completion.after : null;
   const gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: makeGateDeps(cfg, dctx) });
+  // The SPLIT verdict of the gate list alone (task-spor-factory-controller-
+  // completion-boundary, §6.5): `gates_state` says what the gates said, and
+  // `integration_state` below what the integration stage said, so the
+  // completion predicate can read WHICH boundary was passed — the fold into
+  // one `gate_state` the caller stamps afterwards stays for every legacy
+  // reader. Stamped for every gated run, controller or not, so the record is
+  // one shape.
+  if (completionKernel.GATES_STATES.includes(gateResult.state)) {
+    dispatchRuns.stampCompletionState(home, entry.run_id, { gates_state: gateResult.state, ...(gateResult.facts && gateResult.facts.length ? { completion_facts: gateResult.facts } : {}) });
+  }
+  // The completion at the `gates` boundary (C1): edge, then the CAS that
+  // writes the terminal status and clears the hold in one write. A refusal
+  // writes nothing and clears nothing — the item stays held, open, blocked by
+  // the escalation the gate filed (§4.4).
+  let completed = null;
+  if (controller && boundary === "gates" && gateResult.state === "passed") {
+    completed = await completionShell.writeCompletion({ record: freshRecord(home, record), deps: makeCompletionDeps(cfg, { home, runId: entry.run_id }), log: ctx.log, facts: gateResult.facts || [], boundary: "gates" });
+    if (!completed.ok) ctx.log(`work: ${entry.node_id} — the completion could not be written at the gates boundary (${completed.reason}); the debt stands and the next pass retries it`);
+  }
   if (gateResult.state !== "passed" || !ctx.factory.integration) return gateResult;
-  const intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, deps: makeIntegrationDeps(cfg, dctx) });
-  return { ...intResult, gates: gateResult.gates, facts: [...(gateResult.facts || []), ...(intResult.facts || [])] };
+  // Post-completion integration (C2-C4): the item is already completed by
+  // declaration, so a failure here files a `relates-to` item and never
+  // demotes — the operator chose `after: gates` with integration declared.
+  // `consumed` counts too: the item was already completed (by a person, or an
+  // earlier pass) and stays so — a landing failure must not demote it.
+  const intCtx = completed && completed.ok && (completed.settled === "written" || completed.settled === "consumed") ? { ...dctx, completedBeforeIntegration: true } : dctx;
+  dispatchRuns.stampCompletionState(home, entry.run_id, { integration_state: "running" });
+  const intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, deps: makeIntegrationDeps(cfg, intCtx) });
+  const intState = completionKernel.INTEGRATION_STATES.includes(intResult.state) ? intResult.state : intResult.state === "passed" ? "landed" : "failed";
+  const allFacts = [...(gateResult.facts || []), ...(intResult.facts || [])];
+  dispatchRuns.stampCompletionState(home, entry.run_id, { integration_state: intState, ...(allFacts.length ? { completion_facts: allFacts } : {}) });
+  // The completion at the `integration` boundary (N7): only a LANDED
+  // candidate completes; a parked proposal completes when checkProposals sees
+  // the merge (N8), a refusal never does.
+  if (controller && boundary === "integration" && intState === "landed") {
+    const written = await completionShell.writeCompletion({ record: freshRecord(home, record), deps: makeCompletionDeps(cfg, { home, runId: entry.run_id }), log: ctx.log, facts: allFacts, boundary: "integration" });
+    if (!written.ok) ctx.log(`work: ${entry.node_id} — the completion could not be written at the integration boundary (${written.reason}); the debt stands and the next pass retries it`);
+  }
+  if (intCtx.completedBeforeIntegration && intResult.state !== "passed" && intResult.state !== "parked") {
+    return { ...intResult, gates: gateResult.gates, facts: allFacts, demoted: false, demote_reason: null, reason: `${intResult.reason || intResult.state} (the item was completed at the 'gates' boundary and stays completed; the landing is a person's to finish)` };
+  }
+  return { ...intResult, gates: gateResult.gates, facts: allFacts };
+}
+
+// The run record as it reads NOW — the pipeline's captured copy predates every
+// out-of-band `impl_`/`completion_` stamp made since it started.
+function freshRecord(home, record) {
+  try {
+    return dispatchRuns.readJson(dispatchRuns.runPaths(home, record.run_id).record) || record;
+  } catch {
+    return record;
+  }
 }
 
 // task-spor-integration-propose-mode: the LATER half of propose mode's
@@ -14543,7 +15128,22 @@ async function blockerAlreadyClosed(cfg, id) {
 // what would strand the tracking item open forever, since a later pass's
 // blockerAlreadyClosed check (below) would keep finding it non-terminal and
 // keep retrying — this is what actually makes those retries converge.
-async function restoreProposal(cfg, { blockerId, nodeId }) {
+async function restoreProposal(cfg, { blockerId, nodeId, record = null, home = cfg.userConfigHome() }) {
+  // Under controller completion (N8, FACTORY-IMPLEMENTATION-STAGE.md §4.2) the
+  // item was never flipped, so there is nothing to promote: the landed fact is
+  // the boundary, and the COMPLETION is written here — edge, then the CAS that
+  // clears the hold with the status. Idempotent on a re-run.
+  if (record && completionKernel.isControllerRecord(record)) {
+    const written = await completionShell.writeCompletion({
+      record, deps: makeCompletionDeps(cfg, { home, runId: record.run_id }), log: () => {},
+      facts: [...(Array.isArray(record.gate_facts) ? record.gate_facts : []), integrationRunner.integrationFactId(nodeId, record.run_id, "landed")],
+      boundary: "integration",
+    });
+    if (!written.ok) return { ok: false, reason: written.reason };
+    const closedC = await gateWriteStatus(cfg, blockerId, "done");
+    if (!closedC.ok) return { ok: true, restored: written.settled === "written", note: `${nodeId} completed by the controller (${written.settled}); ${blockerId} could not be closed (${closedC.reason})` };
+    return { ok: true, restored: written.settled === "written", note: `${nodeId} completed by the controller (${written.settled})` };
+  }
   const promoted = await gatePromoteItem(cfg, nodeId);
   if (!promoted.ok) return promoted;
   const closed = await gateWriteStatus(cfg, blockerId, "done");
@@ -14848,7 +15448,7 @@ async function checkProposals(cfg, { home = cfg.userConfigHome(), log = () => {}
         deps: {
           prStatus: (p) => ghPrStatus(p),
           recordFact: ({ id, markdown }) => writeGateNode(cfg, id, markdown),
-          restore: (args) => restoreProposal(cfg, args),
+          restore: (args) => restoreProposal(cfg, { ...args, record: r, home }),
         },
         log,
       });
@@ -14898,7 +15498,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     err(`spor work --regate: run ${shortId} was a free-text dispatch with no work item — there is nothing to gate.`);
     return 1;
   }
-  if (!workLoop.shouldGate(record)) {
+  if (!workLoop.shouldGate(record, record)) {
     err(
       `spor work --regate: run ${shortId} ended '${record.terminal_state || record.state}'${record.terminal_enforced ? " (enforced)" : ""} — ` +
         "it carries no claim of completion to judge (only a resolved run, or an unenforced reported one, is gated; a declined run never is)."
@@ -14952,6 +15552,12 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   out(`work: re-gating ${record.node_id} — run ${shortId}, attempt ${attempt}, under ${factoryId} (previously ${previous})`);
   const stamp = (patch) => dispatchRuns.stampGateState(home, record.run_id, patch, { force: true });
   stamp({ gate_state: "running", gate_at: new Date().toISOString(), gate_worker: null, gate_regate_count: attempt - 1, gate_regated_at: new Date().toISOString() });
+  // A re-gate re-opens a controller record's completion: a refusal's
+  // `consumed` stamp (reconcileCompletions) must not hide a completion this
+  // attempt may now write and then owe.
+  if (completionKernel.isControllerRecord(record) && record.completion_consumed_at) {
+    dispatchRuns.stampCompletionState(home, record.run_id, { completion_consumed_at: null, completion_note: null });
+  }
   const entry = { run_id: record.run_id, node_id: record.node_id, harness: record.harness || null, project, attempt };
   // A single-shot identity for THIS invocation — --regate has no work-loop
   // worker to inherit one from, but a re-pin (a fix cycle, or the trusted-ref
@@ -14964,7 +15570,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   let res;
   try {
     res = await runGateAndIntegration(cfg, entry, record, {
-      factory, slug, passthrough, warn, runMaxMs,
+      factory, slug, passthrough, warn, runMaxMs, home,
       workerId,
       log: (line) => out(line),
       stopping: () => false,
@@ -15724,6 +16330,15 @@ async function cmdWork(cfg, { values }) {
   // definition-per-pass) — say which revision this is so a later `--status`
   // reading a different one is legible against this line.
   if (factory) out(`work: factory ${factoryId} loaded @ ${(factory.revision || "?").slice(0, 12)} — re-read every poll pass; an edit takes effect on the next pass, a bad one is rejected and logged here`);
+  // The completion boundary this worker will use (FACTORY-IMPLEMENTATION-
+  // STAGE.md §2.4 V6): logged at startup so an operator's choice — completing
+  // at acceptance before the change is on the target ref — is visible.
+  if (factory && factory.completion && factory.completion.by === "controller") {
+    out(
+      `work: completion by the CONTROLLER at the '${factory.completion.after}' boundary — implementers submit candidates; the resolving edge and terminal status are written here once the gates${factory.completion.after === "integration" ? " and the integration stage" : ""} pass` +
+        (factory.completion.after === "gates" && factory.integration ? " (integration runs AFTER completion: a landing failure files a relates-to item and never demotes)" : "")
+    );
+  }
   out(`work: status at ${workLoop.workerStatusPath(home, workerId)}  ('spor work --status')`);
   // What code this worker runs, said once up front and re-checked each pass
   // (task-spor-work-announce-lib-commit-and-notice-main-moved): a long-running
@@ -15770,7 +16385,7 @@ async function cmdWork(cfg, { values }) {
           const verdict = integrationSatisfiability(cfg, factory);
           if (!verdict.ok) return { ok: false, reason: verdict.reasons[0] };
         }
-        return dispatchWorkItem(cfg, item, passthrough, { factory });
+        return dispatchWorkItem(cfg, item, passthrough, { factory, home, log: (line) => out(line) });
       },
       pollRuns: (ids) => pollWorkRuns(cfg, ids, { maxAgeMs: runMaxMs, idleMs: runIdleMs, warn }),
       publish: (status) => workLoop.writeWorkerStatus(home, status),
@@ -15891,6 +16506,7 @@ async function cmdWork(cfg, { values }) {
                 passthrough,
                 warn,
                 runMaxMs,
+                home,
                 // Provenance only: which worker on this box pinned the
                 // candidate (task-spor-factory-candidate-record §3.1).
                 workerId,
@@ -15947,7 +16563,17 @@ async function cmdWork(cfg, { values }) {
             // outside the slot/concurrency accounting — it never opens a
             // candidate worktree or a run, just reads this box's own run
             // journal and a handful of `gh` calls.
-            checkProposals: () => (factory.integration && factory.integration.mode === "propose" ? checkProposals(cfg, { home, log: (line) => out(line) }) : Promise.resolve()),
+            // ...and, in the same per-pass slot, the controller completion's
+            // reconciliation (task-spor-factory-controller-completion-boundary,
+            // §6.5 (a)): re-derive and act on every unsettled completion debt
+            // on this box — a boundary reached but not written, a premature
+            // edge to retype, an item abandoned under a hold. A factory whose
+            // completion is the agent's has no controller records, so the
+            // journal read finds nothing and the pass is unchanged.
+            checkProposals: async () => {
+              if (factory.integration && factory.integration.mode === "propose") await checkProposals(cfg, { home, log: (line) => out(line) });
+              if (factory.completion && factory.completion.by === "controller") await reconcileCompletions(cfg, { home, log: (line) => out(line) });
+            },
           }
         : {}),
       sleep: (ms) =>
@@ -18039,9 +18665,17 @@ const COMMANDS = {
       "releasing a task you hold no lease on still cleans up any lingering 'assigned'\n" +
       "edge of yours and succeeds. Releasing a claim SOMEONE ELSE holds is refused\n" +
       "naming the holder — you can't release another's claim. Remote-only — local mode\n" +
-      "has no lease.",
-    options: {},
-    examples: ["spor release task-x"],
+      "has no lease.\n\n" +
+      "--execution <exec-id> instead clears a factory controller's EXECUTION HOLD on\n" +
+      "the node (the `execution:` key a 'spor work' controller stamps before it\n" +
+      "dispatches an implementer, under which no resolving edge or terminal status\n" +
+      "retires the item). Both modes. Name the id the node carries ('spor get') — a\n" +
+      "hold left by a dead worker is fail-closed until a person ends it here or a\n" +
+      "same-factory worker resumes the pipeline.",
+    options: {
+      execution: { type: "string", desc: "clear the execution hold with this id instead of releasing the lease" },
+    },
+    examples: ["spor release task-x", "spor release task-x --execution exec-0123456789abcdef"],
     run: (cfg, p) => cmdLease(cfg, "release", p),
   },
 
@@ -18742,7 +19376,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget };
+module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem };
 
 if (require.main === module) {
   main()
