@@ -315,6 +315,51 @@ test("a file:// reference under the producing run's own working tree is refused"
   );
 });
 
+test("the own-working-tree guard fires for a drive-letter cwd", () => {
+  // Regression for the fix below: a Windows cwd's file URL puts the drive
+  // letter after a leading slash (`file:///C:/repo`), not glued straight onto
+  // the scheme's own `//` (`file://C:\repo/`) — this must keep working.
+  const ref = { kind: "bundle", key: "c.bundle", commit: COMMIT, locator: "file:///C:/repo/run-1/c.bundle" };
+  assert.match(candidate.referenceRefusal(ref, { cwd: "C:\\repo\\run-1" }), /working tree/);
+  assert.strictEqual(
+    candidate.referenceRefusal({ ...ref, locator: "file:///C:/elsewhere/c.bundle" }, { cwd: "C:\\repo\\run-1" }),
+    null
+  );
+});
+
+test("the own-working-tree guard fires for a UNC cwd", () => {
+  // A UNC cwd (`\\srv\share\run-1`, an SMB worker checkout) is a second shape
+  // the drive-letter fold above doesn't cover: `pathToFileURL` treats the
+  // server name as the URL HOST (`file://srv/share/run-1`), not as more path —
+  // so the guard's own hand-rolled cwd-to-URL fold must match that, not the
+  // `file:////srv/...` a naive backslash-to-slash swap produces
+  // (issue-spor-candidate-own-working-tree-guard-misses-unc-cwd).
+  const ref = { kind: "bundle", key: "c.bundle", commit: COMMIT, locator: "file://srv/share/run-1/c.bundle" };
+  assert.match(candidate.referenceRefusal(ref, { cwd: "\\\\srv\\share\\run-1" }), /working tree/);
+  // A sibling share/dir is a different place, same as the posix case.
+  assert.strictEqual(
+    candidate.referenceRefusal({ ...ref, locator: "file://srv/share/run-10/c.bundle" }, { cwd: "\\\\srv\\share\\run-1" }),
+    null
+  );
+  // A different server entirely is obviously not the same working tree.
+  assert.strictEqual(
+    candidate.referenceRefusal({ ...ref, locator: "file://other/share/run-1/c.bundle" }, { cwd: "\\\\srv\\share\\run-1" }),
+    null
+  );
+});
+
+test("a POSIX cwd that merely starts with two literal slashes is not mistaken for a UNC host", () => {
+  // `pathToFileURL` only takes its UNC branch when the RAW path starts with a
+  // literal `\\`, gated on the platform being Windows — never merely because
+  // the path, once slash-folded, happens to read `//something/...`. A rare
+  // but legal POSIX absolute path spelled with two leading slashes must keep
+  // the ordinary (non-host) reading, or this guard would be silently inert
+  // for exactly that shape — the same failure class the UNC fix exists to
+  // close, from the other side.
+  const ref = { kind: "bundle", key: "c.bundle", commit: COMMIT, locator: "file:////tmp/run-1/c.bundle" };
+  assert.match(candidate.referenceRefusal(ref, { cwd: "//tmp/run-1" }), /working tree/);
+});
+
 test("a scheme is case-insensitive, but the path it names is not", () => {
   const store = "file:///home/x/.spor/candidates";
   const ok = { kind: "bundle", key: "k", commit: COMMIT };
