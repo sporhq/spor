@@ -2355,11 +2355,11 @@ test("makeIntegrationDeps' escalate: a mismatch reads as a refusal, and names th
   // The escalation id is deterministic per (item, run), so each of the three
   // readings below needs its own run — otherwise the second write collides
   // with the first under writeGateNode's same-id-same-content rule.
-  const depsFor = (runId) =>
+  const depsFor = (runId, completedBeforeIntegration = false) =>
     sporCli.makeIntegrationDeps(cfg, {
       record: { cwd: home },
       entry: { run_id: runId, node_id: "task-demo", project: "demo", attempt: 1 },
-      factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home,
+      factory, completedBeforeIntegration, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home,
     });
 
   const readNode = (id) => fs.readFileSync(path.join(home, "nodes", `${id}.md`), "utf8");
@@ -2406,6 +2406,8 @@ test("makeIntegrationDeps' escalate: a mismatch reads as a refusal, and names th
   assert.strictEqual(mid.ok, true, mid.reason);
   const midBody = readNode(mid.id);
   assert.match(midBody, /found after 1 fix cycle, cap 2/);
+  assert.match(midBody, /gates passed on the previously pinned candidate; the current branch has not been accepted/);
+  assert.doesNotMatch(midBody, /Every declared gate already passed/);
   assert.match(midBody, /1 fix cycle ran and the drift was found on the re-check/);
   assert.doesNotMatch(midBody, /Nothing was built/, "a fix cycle DID build and run — the escalation must not claim otherwise");
 
@@ -2415,6 +2417,12 @@ test("makeIntegrationDeps' escalate: a mismatch reads as a refusal, and names th
   const plainBody = readNode(plain.id);
   assert.match(plainBody, /its fix cycles are spent \(1 attempt, cap 2\)/);
   assert.doesNotMatch(plainBody, /no longer carries the candidate/);
+  const completed = await depsFor("11111111-2222-3333-4444-0000000000d5", true).escalate({ attempts: [], detail: "branch drifted", evidence: "", kind: "mismatch" });
+  assert.equal(completed.ok, true);
+  const completedBody = readNode(completed.id);
+  assert.match(completedBody, /COMPLETED at the factory's 'gates' boundary/);
+  assert.match(completedBody, /gates passed on the previously pinned candidate; the current branch has not been accepted/);
+  assert.doesNotMatch(completedBody, /Every declared gate already passed/);
   fs.rmSync(home, { recursive: true, force: true });
 });
 
@@ -2424,10 +2432,8 @@ test("a mismatch is a SETTLED gate state — a mismatched pipeline is never re-a
   // The `--regate` guard names the verdicts there is nothing left to judge;
   // a mismatch is deliberately NOT one of them (the branch or the pin can be
   // put right and the run re-judged).
-  const src = fs.readFileSync(path.join(__dirname, "..", "bin", "spor.js"), "utf8");
-  const guard = /record\.gate_state === "passed" \|\| record\.gate_state === "parked" \|\| record\.gate_state === "superseded" \|\| record\.gate_state === "scoped"/;
-  assert.match(src, guard);
-  assert.doesNotMatch(src.match(guard)[0], /mismatch/);
+  for (const state of ["mismatch", "failed", "blocked", "running", null, undefined]) assert.equal(gatesKernel.canRegateState(state), true, String(state));
+  for (const state of ["passed", "parked", "superseded", "scoped"]) assert.equal(gatesKernel.canRegateState(state), false, state);
 });
 
 test("a candidate carrying a commit but NO tree is judged the same way in every mode — never a propose-only refusal", () => {
@@ -4723,5 +4729,81 @@ test("missing branch publication remote and integration target are item skips, w
     assert.strictEqual(r.status, 1, r.stdout);
     assert.match(r.stderr, /invalid|cannot be used|needs a Spor server/);
     assert.ok(!fs.existsSync(f.outfile));
+  }
+});
+
+test("checkProposals withholds controller completion when the hosted proposal fence is lost or changes after resume", async () => {
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const executionStore = require("../lib/shell/execution-store.js");
+  const { loadConfig } = require("../lib/config.js");
+  const { startFakeExecutionServer } = require("./helpers/fake-execution-server.js");
+  for (const timing of ["before-resume", "after-resume"]) {
+    const nodeId = "task-proposed", runId = "11111111-2222-3333-4444-0000000000fa";
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-proposal-fence-"));
+    const fake = await startFakeExecutionServer({ nodes: {
+      [nodeId]: fakeNode(nodeId, "type: task\ntitle: Proposed work\nsummary: Complete proposed work.\nstatus: open\n"),
+      "factory-demo": fakeNode("factory-demo", "type: context\ntitle: Factory\nsummary: Test factory.\n"),
+    } });
+    const originalPath = process.env.PATH, originalFetch = global.fetch;
+    try {
+      const config = (token, dir) => loadConfig({ cwd: dir, env: { SPOR_HOME: dir, XDG_CONFIG_HOME: dir, SPOR_SERVER: fake.base, SPOR_TOKEN: token } });
+      const cfg = config("tok-a", home);
+      const a = executionStore.openExecutionStore(cfg, { home });
+      const b = executionStore.openExecutionStore(config("tok-b", path.join(home, "other")), { home: path.join(home, "other") });
+      const opened = await a.open({ node_id: nodeId, factory: "factory-demo", gates: [], boundary: "integration" });
+      assert.equal(opened.ok, true, JSON.stringify(opened));
+      const executionId = opened.execution.execution_id;
+      fake.state.nodes.set(nodeId, fakeNode(nodeId, `type: task\ntitle: Proposed work\nsummary: Complete proposed work.\nstatus: open\nexecution: ${executionId}\n`));
+      const trackerId = sporCli.proposalTrackingId(nodeId, runId);
+      const tracker = fakeNode(trackerId, `type: task\ntitle: Integration proposed\nsummary: Review proposed work.\nstatus: open\nrequires: [human]\nedges:\n  - {type: blocks, to: ${nodeId}}\n`);
+      fake.state.nodes.set(trackerId, tracker);
+      dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, {
+        run_id: runId, node_id: nodeId, state: "done", gate_state: "parked",
+        gate_proposal_number: 55, gate_proposal_repo: "demo/repo", gate_proposal_url: "https://github.com/demo/repo/pull/55",
+        gate_proposal_branch: nodeId, gate_proposal_target_ref: "main", gate_proposal_strategy: "merge", gate_proposal_project: "demo", gate_proposal_factory: "factory-demo", gate_proposal_blocker: trackerId,
+        impl_claim: { execution_id: executionId, store: "remote", fence: opened.fence, gates: [], completion: { by: "controller", after: "integration" }, factory: { node_id: "factory-demo" } },
+        impl_candidate: { candidate_id: "cand-abc123def456", commit: "deadbeef00", tree: "beadfeed00" },
+      });
+      const ghDir = path.join(home, "bin");
+      fs.mkdirSync(ghDir);
+      const statusFile = path.join(home, "pr.json");
+      fs.writeFileSync(statusFile, JSON.stringify({ state: "MERGED", mergedAt: "2026-09-06T00:00:00Z", mergeCommit: { oid: "deadbeefcafe" }, mergedBy: { login: "reviewer" }, baseRefName: "main" }));
+      writeFakePathBin(ghDir, "gh", `if [ "$1" = "--version" ]; then echo "gh version 2.0.0"; exit 0; fi\ncat "${statusFile}"\n`);
+      process.env.PATH = `${ghDir}${path.delimiter}${originalPath}`;
+      let taken = false;
+      const takeOver = async () => {
+        fake.expireLease(executionId);
+        const claimed = await b.claim(executionId, { takeover: true });
+        assert.equal(claimed.ok, true, JSON.stringify(claimed));
+        assert.ok(claimed.fence > opened.fence);
+        taken = true;
+      };
+      if (timing === "before-resume") await takeOver();
+      else global.fetch = async (url, options) => {
+        const response = await originalFetch(url, options);
+        if (!taken && String(url).endsWith(`/v1/executions/${executionId}/claim`)) {
+          taken = true; // The takeover's own request must not recurse.
+          await takeOver();
+        }
+        return response;
+      };
+      fake.state.requests.length = 0;
+      const logs = [];
+      await sporCli.checkProposals(cfg, { home, log: (line) => logs.push(line) });
+      assert.equal(taken, true, timing);
+      assert.ok(fake.state.requests.some((r) => r.path.endsWith(`/v1/executions/${executionId}/claim`) && r.bearer === "tok-a"), "real restoreProposal attempted to resume its hosted execution");
+      assert.ok(logs.some((line) => /not held by this worker|fence could not be confirmed/.test(line)), logs.join("\n"));
+      assert.equal(fake.state.nodes.get(trackerId), tracker, "the tracker is not closed or rewritten");
+      assert.match(fake.state.nodes.get(nodeId), /^status: open$/m);
+      for (const raw of fake.state.nodes.values()) assert.doesNotMatch(raw, new RegExp(`type: resolves, to: ${nodeId}\\}`), "no work-item resolving edge may precede fence confirmation");
+      assert.equal(JSON.parse(fs.readFileSync(dispatchRuns.runPaths(home, runId).record, "utf8")).gate_state, "parked");
+      assert.equal(fake.record(executionId).owner.worker, "agent-b");
+    } finally {
+      global.fetch = originalFetch;
+      process.env.PATH = originalPath;
+      await fake.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   }
 });

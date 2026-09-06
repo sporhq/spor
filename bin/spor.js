@@ -15989,12 +15989,16 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
           ? [
               `This item \`relates-to\` ${entry.node_id}, which was COMPLETED at the factory's 'gates' boundary before this`,
               "stage ran and stays completed — the operator chose to release dependents before the change is on the",
-              "target ref. Every declared gate already passed; only the merge-queue landing itself is unresolved.",
+              kind === "mismatch"
+                ? "target ref. The gates passed on the previously pinned candidate; the current branch has not been accepted."
+                : "target ref. Every declared gate already passed; only the merge-queue landing itself is unresolved.",
             ]
           : [
               `This item \`blocks\` ${entry.node_id} on the graph, and if that item had already been flipped to a`,
-              "completion status the worker rolled it back. Every declared gate already passed; only the merge-queue",
-              "landing itself is unresolved. The run's resolver is left standing.",
+              kind === "mismatch"
+                ? "completion status the worker rolled it back. The gates passed on the previously pinned candidate; the current branch has not been accepted."
+                : "completion status the worker rolled it back. Every declared gate already passed; only the merge-queue landing itself is unresolved.",
+              "The run's resolver is left standing.",
             ]),
         "",
         detail ? `Last outcome: ${detail}` : "",
@@ -18078,7 +18082,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     );
     return 1;
   }
-  if (record.gate_state === "passed" || record.gate_state === "parked" || record.gate_state === "superseded" || record.gate_state === "scoped") {
+  if (!gatesKernel.canRegateState(record.gate_state)) {
     err(`spor work --regate: run ${shortId} already read '${record.gate_state}'${record.gate_reason ? ` (${record.gate_reason})` : ""} — there is nothing to re-judge.`);
     return 1;
   }
