@@ -289,6 +289,16 @@ test("a reference must be fetchable by locator, or it is refused with the reason
   }
 });
 
+test("ssh:// is a reachable scheme for a branch reference — the common git-over-ssh origin — but not for a bundle", () => {
+  const branchOk = { kind: "branch", locator: "ssh://git@github.com/sporhq/spor.git", ref: "refs/spor/candidates/cand-1", commit: COMMIT };
+  assert.strictEqual(candidate.referenceRefusal(branchOk), null);
+  // A bundle's locator is always the declared/default bundle_store, which
+  // stays file:// or https:// only (resolveBundleStore) — ssh:// is refused here
+  // exactly as it always was.
+  const bundleSsh = { kind: "bundle", locator: "ssh://git@h/r.git", key: "cand-1.bundle", commit: COMMIT };
+  assert.match(candidate.referenceRefusal(bundleSsh, { bundleStore: "file:///home/x/.spor/candidates" }), /not a reachable scheme/);
+});
+
 test("a file:// reference under the producing run's own working tree is refused", () => {
   const ref = { kind: "bundle", key: "c.bundle", commit: COMMIT, locator: "file:///w/run-1/c.bundle" };
   assert.match(candidate.referenceRefusal(ref, { cwd: "/w/run-1" }), /working tree/);

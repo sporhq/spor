@@ -1126,10 +1126,22 @@ Four properties the publisher is built around:
   `candidate-mismatch` caught on the machine that can still fix it.
   `reference.verified_at` is stamped only by that round trip, and a candidate is
   not SUBMITTED (`impl_state: candidate`) until it is.
-- **A locator is an absolute `file://` or `https://` URI.** A remote NAME, an
-  `ssh://`/scp-style remote, a bare sha, a relative path and anything under the
-  producing run's own working tree or inside a `.git` directory are refused —
-  they resolve only on the machine that is about to disappear.
+- **A locator is an absolute `file://` or `https://` URI — or, for a `branch`
+  reference only, `ssh://`** (issue-spor-candidate-reference-locator-vocabulary-lacks-ssh:
+  a `bundle` reference's locator is always the declared/default `bundle_store`,
+  which stays `file://`/`https://` only, so `ssh://` is admitted exactly where
+  §3.4's `branch` door already resolves a git remote). An scp-style spelling
+  (`git@host:org/repo.git` — what `git remote get-url` most often answers for
+  an `origin` cloned over ssh) is normalized to its canonical `ssh://` form
+  before it is ever stamped as a locator, since a bare `user@host:path` is not
+  an absolute URI on its own; the normalization does not reproduce git's own
+  home-relative-path distinction (`git@host:path` vs `git@host:/path`) because
+  every host this matters for in practice — GitHub, GitLab, Bitbucket,
+  self-hosted forges — routes on the path text itself, so both spellings
+  collapse to the same `ssh://user@host/path`. A remote NAME, a bare sha, a
+  relative path and anything under the producing run's own working tree or
+  inside a `.git` directory are still refused — they resolve only on the
+  machine that is about to disappear.
 - **A worker refuses at startup what a parse could not read**: an `https://`
   store in local mode (there is no candidate door without a server), a
   `file://` store it cannot write, and a `branch` publish whose remote does not

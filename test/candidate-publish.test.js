@@ -511,19 +511,52 @@ test("the locator is spelled ONE way, whatever the store's trailing slash", () =
   assert.strictEqual(publisher.storeLocator("file:///s/", "k.bundle"), "file:///s/k.bundle");
 });
 
-test("an ssh remote is refused at STARTUP — §3.4 admits file:// and https:// only, and it would fail at the publish", (t) => {
+test("an ssh or scp-style remote — the common git-over-ssh origin — is satisfiable at startup (issue-spor-candidate-reference-locator-vocabulary-lacks-ssh)", (t) => {
   const repo = producerRepo(t);
   const home = scratch(t, "cand-home");
   repo.g("remote", "add", "origin", "git@github.com:sporhq/spor.git");
   const f = factoryWith({ publish: "branch" }, { repos: ["spor"] });
   const v = publisher.publishSatisfiability(f, { graphHome: home, mode: "local", repoPaths: { spor: repo.dir } });
-  assert.strictEqual(v.ok, false);
-  assert.match(v.errors[0], /is not an absolute URI/);
+  assert.strictEqual(v.ok, true, v.errors.join("; "));
 
   const declared = factoryWith({ publish: "branch", remote: "ssh://git@github.com/sporhq/spor.git" }, { repos: ["spor"] });
   const dv = publisher.publishSatisfiability(declared, { graphHome: home, mode: "local", repoPaths: {} });
+  assert.strictEqual(dv.ok, true, dv.errors.join("; "));
+
+  const scpDeclared = factoryWith({ publish: "branch", remote: "git@github.com:sporhq/spor.git" }, { repos: ["spor"] });
+  const sv = publisher.publishSatisfiability(scpDeclared, { graphHome: home, mode: "local", repoPaths: {} });
+  assert.strictEqual(sv.ok, true, sv.errors.join("; "));
+});
+
+test("a git:// remote (or any other unreachable scheme) is still refused — only ssh:// was added", (t) => {
+  const declared = factoryWith({ publish: "branch", remote: "git://git.example/spor.git" }, { repos: ["spor"] });
+  const dv = publisher.publishSatisfiability(declared, { graphHome: scratch(t, "cand-home"), mode: "local", repoPaths: {} });
   assert.strictEqual(dv.ok, false);
-  assert.match(dv.errors[0], /is a ssh:\/\/ remote/);
+  assert.match(dv.errors[0], /is a git:\/\/ remote/);
+});
+
+test("resolveRemoteUrl normalizes an scp-style remote to its canonical ssh:// spelling, treating a home-relative and an absolute path the same (the common forge case)", () => {
+  assert.strictEqual(publisher.resolveRemoteUrl("git@github.com:sporhq/spor.git", null).url, "ssh://git@github.com/sporhq/spor.git");
+  assert.strictEqual(publisher.resolveRemoteUrl("git@github.com:/sporhq/spor.git", null).url, "ssh://git@github.com/sporhq/spor.git");
+  // Already a URI: left alone.
+  assert.strictEqual(publisher.resolveRemoteUrl("ssh://git@github.com/sporhq/spor.git", null).url, "ssh://git@github.com/sporhq/spor.git");
+  assert.strictEqual(publisher.resolveRemoteUrl("https://git.example/spor.git", null).url, "https://git.example/spor.git");
+});
+
+test("a checkout's own scp-style origin (git remote get-url) is normalized too, not just a declared remote", (t) => {
+  const repo = producerRepo(t);
+  repo.g("remote", "add", "origin", "git@github.com:sporhq/spor.git");
+  const r = publisher.resolveRemoteUrl("origin", repo.dir);
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.url, "ssh://git@github.com/sporhq/spor.git");
+});
+
+test("portableRemoteRefusal admits ssh:// (branch reference) beside file:// and https://", () => {
+  assert.strictEqual(publisher.portableRemoteRefusal("ssh://git@github.com/sporhq/spor.git"), null);
+  assert.strictEqual(publisher.portableRemoteRefusal("file:///store/x"), null);
+  assert.strictEqual(publisher.portableRemoteRefusal("https://h/r.git"), null);
+  assert.match(publisher.portableRemoteRefusal("git://h/r.git"), /is a git:\/\/ remote/);
+  assert.match(publisher.portableRemoteRefusal("origin"), /not an absolute URI/);
 });
 
 // ------------------------------------------------------- the real wiring --
