@@ -4066,6 +4066,63 @@ test("retryOneEscalation: an integration refusal whose factory no longer declare
   fs.rmSync(home, { recursive: true, force: true });
 });
 
+// issue-spor-gate-start-not-conditional-on-candidate-submitted: the CANDIDATE
+// SUBMISSION check's own escalation_retry payload (gate-runner.js) is keyed
+// `stage: "candidate"`, the same discriminator shape as an integration
+// refusal — but its `gate` is never declared (the id is reserved, §2.2), so
+// the retry replays through the ORDINARY gate deps/escalate call with a
+// reconstructed gate object instead of a factory lookup.
+test("retryOneEscalation replays a CANDIDATE-submission refusal through the gate deps — no declared gate to find, since the id is reserved — demotes, and closes the fact", async () => {
+  const { home, cfg, dispatchRuns } = scratchGraphForRetry();
+  const runId = "cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const factId = gateRunner.gateFactId("candidate", "task-demo", runId, 0, 0);
+  const record = pendingRecord(dispatchRuns, home, runId, {
+    pending: {
+      stage: "candidate", gateId: "candidate",
+      attempts: [{ verdict: "failed", detail: "no candidate could be submitted" }],
+      detail: "no candidate could be submitted for task-demo: the tree has no identity",
+      evidence: "", factId, findings: [], ledger: [],
+    },
+  });
+  assert.strictEqual(record.gate_escalation_pending.stage, "candidate");
+
+  const factory = { id: "factory-test", implementation: { profile: "" }, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] };
+  await sporCli.retryOneEscalation(cfg, { record, attempts: 0 }, { factory, log: () => {}, warn: () => {}, home });
+
+  const after = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  assert.strictEqual(after.gate_escalation_failed, false);
+  assert.strictEqual(after.gate_escalation_pending, null);
+  assert.ok(after.gate_escalated_to, "an escalation now exists");
+  assert.match(after.gate_escalated_to, /^task-gate-candidate-/, "the ordinary gate-escalation shape, filed under the reserved 'candidate' id");
+  const escMd = fs.readFileSync(path.join(home, "nodes", `${after.gate_escalated_to}.md`), "utf8");
+  assert.match(escMd, /blocks, to: task-demo/);
+  assert.match(escMd, /no candidate could be submitted for task-demo/);
+  assert.match(fs.readFileSync(path.join(home, "nodes", "task-demo.md"), "utf8"), /status: open/, "demoted once the escalation landed");
+
+  const closing = fs.readdirSync(path.join(home, "nodes")).filter((f) => f.startsWith("art-gate-retry-candidate-demo-"));
+  assert.strictEqual(closing.length, 1, "one closing artifact, keyed on the reserved candidate id");
+  const closingMd = fs.readFileSync(path.join(home, "nodes", closing[0]), "utf8");
+  assert.match(closingMd, new RegExp(`relates-to, to: ${factId}`));
+  assert.match(closingMd, new RegExp(`relates-to, to: ${after.gate_escalated_to}`));
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("retryOneEscalation: a candidate-submission refusal whose factory no longer declares an implementation stage gives up", async () => {
+  const { home, cfg, dispatchRuns } = scratchGraphForRetry();
+  const runId = "dddddddd-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const record = pendingRecord(dispatchRuns, home, runId, {
+    pending: { stage: "candidate", gateId: "candidate", attempts: [], detail: "no candidate could be submitted", evidence: "", factId: "art-gate-candidate-demo-x", findings: [], ledger: [] },
+  });
+  const logs = [];
+  await sporCli.retryOneEscalation(cfg, { record, attempts: 0 }, { factory: RETRY_FACTORY, log: (l) => logs.push(l), warn: (l) => logs.push(l), home });
+  const after = dispatchRuns.readJson(dispatchRuns.runPaths(home, runId).record);
+  assert.strictEqual(after.gate_escalation_retry_exhausted, true);
+  assert.strictEqual(after.gate_escalation_failed, true, "still unescalated");
+  assert.ok(logs.some((l) => /no longer declares an implementation stage/.test(l)), logs.join("\n"));
+  assert.deepStrictEqual(fs.readdirSync(path.join(home, "nodes")).filter((f) => f.startsWith("task-")), ["task-demo.md"], "nothing was filed");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 // Review finding: a record predating item_repo (or one that never carried it)
 // must not file the escalation under NO project at all — that hides it from
 // exactly the project-scoped queue a person would look in. Mirrors --regate's
@@ -6291,6 +6348,16 @@ test("the scoping gate id is RESERVED — a factory declaring it refuses to pars
   assert.strictEqual(factory, null);
   assert.ok(
     errors.some((e) => /id 'scoping' is reserved for the no-code-outcome route/.test(e)),
+    errors.join("; ")
+  );
+});
+
+test("the candidate gate id is RESERVED — a factory declaring it refuses to parse rather than minting a colliding fact", () => {
+  const body = ["```json", JSON.stringify({ ...BASE, gates: [{ id: "candidate", kind: "command", command: "npm test" }] }), "```"].join("\n");
+  const { factory, errors } = gates.parseFactory(body, { id: "factory-test" });
+  assert.strictEqual(factory, null);
+  assert.ok(
+    errors.some((e) => /id 'candidate' is reserved for the candidate-submission check/.test(e)),
     errors.join("; ")
   );
 });

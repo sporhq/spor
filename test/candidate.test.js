@@ -661,6 +661,16 @@ const PASSING = {
   gates: [{ id: "suite", kind: "command", command: "npm test" }],
 };
 
+// A candidate whose reference has verified (§3.4) — the pipeline fixture's
+// default, since these tests exercise WHEN and with WHAT provenance a pin
+// happens, not gate-start's own dependency on submission
+// (issue-spor-gate-start-not-conditional-on-candidate-submitted, covered
+// separately below). An unsubmitted `mint()` stays the default everywhere
+// else in this file.
+function submittedMint(over = {}) {
+  return mint({ reference: { kind: "bundle", verified_at: "2026-09-05T00:00:00Z" }, ...over });
+}
+
 function pipelineDeps(pins) {
   return {
     now: () => 1_700_000_000_000,
@@ -672,7 +682,7 @@ function pipelineDeps(pins) {
     demote: async () => ({ ok: true, demoted: true, note: "" }),
     pinCandidate: async ({ submittedBy }) => {
       pins.push(submittedBy);
-      return { ok: true, candidate: mint(), change: pins.length === 1 ? "created" : "unchanged" };
+      return { ok: true, candidate: submittedMint(), change: pins.length === 1 ? "created" : "unchanged" };
     },
   };
 }
@@ -699,18 +709,77 @@ test("a declared implementation stage pins at the submission read, naming the st
   assert.deepStrictEqual(pins, [{ stage: "implementation", cycle: 0, rescue: 0 }]);
 });
 
-test("a pin that refuses is logged and the tree is judged regardless", async () => {
+// issue-spor-gate-start-not-conditional-on-candidate-submitted: a pin failure
+// means there is no candidate ANY reader could obtain, so gate 0 must never
+// start on it (§3.4, §4.2 I3/I3a) — refused, escalated and demoted like any
+// other gate refusal, never silently judged regardless.
+test("a candidate that cannot be pinned refuses before any gate runs, and files the refusal like any other gate failure", async () => {
   const lines = [];
+  let suiteRuns = 0;
   const deps = pipelineDeps([]);
   deps.pinCandidate = async () => ({ ok: false, reason: "the tree has no identity" });
+  deps.runSuite = async () => {
+    suiteRuns += 1;
+    return { ok: true };
+  };
   const res = await gateRunner.runGatePipeline({
     item: { node_id: "task-x", run_id: "run-1", attempt: 1 },
     factory: factoryOf({ ...PASSING, implementation: { profile: "profile-impl" } }),
     deps,
     log: (l) => lines.push(l),
   });
-  assert.strictEqual(res.state, "passed", "the candidate is a record OF what was judged, not a precondition for judging it");
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(suiteRuns, 0, "no gate ran");
+  assert.strictEqual(res.escalated_to, "task-esc");
+  assert.strictEqual(res.demoted, true);
   assert.ok(lines.some((l) => /no candidate could be pinned/.test(l)));
+  assert.ok(lines.some((l) => /no candidate could be submitted.*no gate ran/.test(l)));
+});
+
+// A factory with no `implementation:` block pins nothing (§2.1), so the same
+// pin failure — impossible in practice, since pinCandidate is never even
+// called — could never gate anything for it; covered by "a factory that
+// declares no implementation stage pins nothing at all" above.
+
+test("a candidate that cannot be pinned, when the escalation itself cannot be filed, carries a retriable escalation_retry payload — never a permanently-stuck refusal", async () => {
+  const deps = pipelineDeps([]);
+  deps.pinCandidate = async () => ({ ok: false, reason: "the tree has no identity" });
+  deps.escalate = async () => ({ ok: false, reason: "the graph is unreachable" });
+  const res = await gateRunner.runGatePipeline({
+    item: { node_id: "task-x", run_id: "run-1", attempt: 1 },
+    factory: factoryOf({ ...PASSING, implementation: { profile: "profile-impl" } }),
+    deps,
+  });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(res.escalated_to, null);
+  assert.strictEqual(res.escalation_failed, true);
+  assert.ok(res.escalation_retry, "a retriable payload survives the failed write");
+  assert.strictEqual(res.escalation_retry.stage, "candidate");
+  assert.strictEqual(res.escalation_retry.gateId, "candidate");
+  assert.strictEqual(res.escalation_retry.attempt, 1);
+  assert.match(res.escalation_retry.detail, /no candidate could be submitted for task-x/);
+});
+
+// issue-spor-pin-candidate-settled-record-stamp-race: a losing worker's late
+// first pin arriving after the run record already settled through a path
+// that never pinned a candidate at all (`pinCandidate`'s own
+// `refused-settled` outcome) is a fact about the RECORD, not evidence that
+// THIS pass's tree is unsubmitted — it must not be read as one and escalate.
+test("a pin that reads a benign 'refused-settled' no-op does not escalate — the record already settled elsewhere", async () => {
+  let suiteRuns = 0;
+  const deps = pipelineDeps([]);
+  deps.pinCandidate = async () => ({ ok: true, candidate: null, change: "refused-settled" });
+  deps.runSuite = async () => {
+    suiteRuns += 1;
+    return { ok: true };
+  };
+  const res = await gateRunner.runGatePipeline({
+    item: { node_id: "task-x", run_id: "run-1", attempt: 1 },
+    factory: factoryOf({ ...PASSING, implementation: { profile: "profile-impl" } }),
+    deps,
+  });
+  assert.strictEqual(res.state, "passed", "a benign no-op pin must not read as an unsubmitted candidate and refuse gate 0");
+  assert.strictEqual(suiteRuns, 1, "the declared gate still ran");
 });
 
 test("the implementer's commit-or-discard round-trip pins as the SUBMISSION, not a fix", async () => {
@@ -740,7 +809,7 @@ test("a re-pin names the run that actually made the commit", async () => {
   const deps = pipelineDeps([]);
   deps.pinCandidate = async ({ submittedBy, runId }) => {
     seen.push({ stage: submittedBy.stage, runId });
-    return { ok: true, candidate: mint(), change: seen.length === 1 ? "created" : "unchanged" };
+    return { ok: true, candidate: submittedMint(), change: seen.length === 1 ? "created" : "unchanged" };
   };
   let suites = 0;
   deps.runSuite = async () => (suites++ === 0 ? { ok: false, output: "boom" } : { ok: true });

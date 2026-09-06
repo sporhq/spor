@@ -3094,9 +3094,20 @@ must read the chain as a list, not as a map keyed by id.
 A re-pin never touches `impl_state`: the stage settled at the first candidate,
 and a moved HEAD is not a new verdict.
 
-**Pinning is fail-soft.** A tree that could not be read is logged and the
-pipeline judges the tree regardless — the candidate is a record *of* what was
-judged, never a precondition for judging it.
+**Pinning is fail-soft — except for the one thing it exists to guarantee.** A
+tree that could not be read is logged and the pipeline judges the tree
+regardless for every RE-pin (a fix cycle, a rescue pass): the candidate is a
+record *of* what was judged, never a precondition for judging it. The
+SUBMISSION pin is the one exception (issue-spor-gate-start-not-conditional-on-
+candidate-submitted): submission is not complete until the reference verified
+(§10.14's `candidate.publish`), so gate 0 never starts on a candidate that
+could not be pinned at all, or whose publish never verified — a candidate no
+reader could obtain is not a candidate. That check runs once, right where the
+gate list would otherwise begin, and is refused the same way any other gate
+failure is: an escalation `blocks` the item and its completion status is
+rolled back (§10.7), under the reserved gate id `candidate`. A factory
+declaring no `implementation:` block pins nothing and never reaches this
+check, so it is byte-identical to before the check existed.
 
 `spor runs` prints the stage line and the tip candidate (with the chain length
 when it was re-pinned); `spor work --status` prints the tip beside the slot that
@@ -3399,17 +3410,21 @@ everything `completion` governs — the execution hold, the `CANDIDATE:`
 submission, the candidate pin and the controller's completion write (§10.12,
 §10.13) — candidate publication (`lib/shell/candidate-publish.js`: `bundle`
 | `branch` | `both`, the `spor work`-startup `publishSatisfiability` refusal
-above, and the `publish_pending` debt of an outage), and `candidate.require_clean`
+above, and the `publish_pending` debt of an outage), `candidate.require_clean`
 (issue-spor-candidate-require-clean-parsed-never-read: the pin itself refuses,
 with its own reason, on a checkout with uncommitted tracked changes — see
-above) are shipped. The rest of the stage is declared and validated but not
-yet executed: no dispatch is routed by `implementation.profile`, no budget or
-retry pool is spent (task-spor-factory-implementation-stage-runner, on the
-outcome classifier that separates the two pools,
-task-spor-factory-execution-outcome-classifier), and `rejudge_on_repin` is
-parsed onto the gate and read by nobody. Declaring those keys today is a
-DECLARATION of intent that the runner already validates and will honor when
-those items land; nothing about them changes what a worker does now.
+above), and gate start being CONDITIONAL on that submission — a candidate
+that could not be pinned, or whose publish never verified, starts no gate; it
+is refused, escalated and demoted exactly like any other gate failure
+(§10.12's exception to fail-soft pinning) — are shipped. The rest of the
+stage is declared and validated but not yet executed: no dispatch is routed by
+`implementation.profile`, no budget or retry pool is spent
+(task-spor-factory-implementation-stage-runner, on the outcome classifier that
+separates the two pools, task-spor-factory-execution-outcome-classifier), and
+`rejudge_on_repin` is parsed onto the gate and read by nobody. Declaring those
+keys today is a DECLARATION of intent that the runner already validates and
+will honor when those items land; nothing about them changes what a worker
+does now.
 
 See test/gates.test.js (the validation table), test/worker-contract.test.js,
 test/candidate.test.js and test/completion-boundary.test.js.

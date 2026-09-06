@@ -13844,7 +13844,12 @@ function makeGateDeps(
       // like the rest of pinCandidate (the caller's `pin` wrapper logs `reason`
       // and judges the tree regardless), but never a silent ok:true.
       if (!stamped) return { ok: false, reason: `the candidate for ${entry.node_id} was pinned but could not be stamped onto its run record` };
-      return { ok: true, candidate: folded.candidate, change: folded.change };
+      // `publish_pending` rides along so a caller that gates gate-start on
+      // `candidateSubmitted` (issue-spor-gate-start-not-conditional-on-
+      // candidate-submitted) can report WHY, not just that submission is
+      // unsettled — the same debt `spor runs`/`spor work --status` already
+      // read off the run record.
+      return { ok: true, candidate: folded.candidate, change: folded.change, publish_pending: publishPending };
     },
     // The premature-resolution check at submission (task-spor-factory-
     // controller-completion-boundary, §4.5): the shell/completion.js retype
@@ -14224,16 +14229,31 @@ async function retryOneEscalation(
   // reappear on its own. An INTEGRATION-stage refusal (integration-runner.js
   // settle(), `stage: "integration"`) has no gate to find: it replays through
   // the integration deps' own `escalate` instead, and its give-up is a factory
-  // that no longer declares the stage at all. The route is the payload's
+  // that no longer declares the stage at all. A CANDIDATE-submission refusal
+  // (gate-runner.js's `CANDIDATE SUBMISSION` check, `stage:
+  // gates.CANDIDATE_GATE_ID`) is the same shape as an ordinary gate refusal —
+  // it replays through the SAME `escalate`/`demote` calls — except its `gate`
+  // is never declared (the id is reserved, §2.2), so it is reconstructed
+  // rather than looked up, and its give-up is a factory that no longer
+  // declares an `implementation:` block at all. The route is the payload's
   // `stage`, never its `gateId` — a declared gate may be named `integration`.
   const fromIntegration = !!(payload && payload.stage === integrationRunner.INTEGRATION_STAGE_ID);
-  const gate = payload && !fromIntegration && factory && Array.isArray(factory.gates) ? factory.gates.find((g) => g.id === payload.gateId) : null;
-  if (!payload || (fromIntegration ? !(factory && factory.integration) : !gate)) {
+  const fromCandidate = !!(payload && payload.stage === gatesKernel.CANDIDATE_GATE_ID);
+  const gate = payload && !fromIntegration
+    ? fromCandidate
+      ? { id: gatesKernel.CANDIDATE_GATE_ID, kind: gatesKernel.CANDIDATE_GATE_ID }
+      : factory && Array.isArray(factory.gates)
+      ? factory.gates.find((g) => g.id === payload.gateId)
+      : null
+    : null;
+  if (!payload || (fromIntegration ? !(factory && factory.integration) : fromCandidate ? !(factory && factory.implementation) : !gate)) {
     giveUp(
       !payload
         ? "no retry payload was recorded for this refusal"
         : fromIntegration
         ? `factory '${(factory && factory.id) || "?"}' no longer declares an integration stage`
+        : fromCandidate
+        ? `factory '${(factory && factory.id) || "?"}' no longer declares an implementation stage`
         : `gate '${payload.gateId}' is no longer declared by factory '${(factory && factory.id) || "?"}'`
     );
     return;
