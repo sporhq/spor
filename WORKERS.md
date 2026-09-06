@@ -4043,3 +4043,33 @@ what makes `propose` mode worth adopting for a PR-policy team.
 See test/attestation.test.js, the provenance assertions in
 test/gate-pipeline.test.js and test/gates.test.js, and the head-equality tests
 plus the local end-to-end attestation check in test/integration-step.test.js.
+
+
+### Attestation settlement recovery and ownership (2026-09 repair)
+
+The run-record claim precedes every pipeline mutation. The work loop does not
+pre-stamp `gate_worker`: a losing adopter must not overwrite the live owner's
+nonce before the claim check. Native and supervised judged children both strip
+`SPOR_ATTESTATION_KEY` and `SUBSTRATE_ATTESTATION_KEY` from their environments.
+
+Settlement atomically writes the verdict and `gate_attestation_pending`, an
+outbox containing the exact artifact bytes and signature (never the signing
+key). `gate_attestation_missing` remains true until publication succeeds.
+Subsequent worker passes replay this debt without rerunning the gates or
+resigning evidence. A parked proposal retains its debt until its PR body is
+refreshed successfully. Pending debt prevents run retention from pruning the
+record. Gate, implementation and completion stamps share the same record lock.
+
+A stale breaker lock is deliberately fail-closed: age alone cannot authorize
+unlinking its pathname because that pathname may already name a live successor.
+If a worker dies while holding `<run-record>.lock.break`, stop all writers of
+that run record before removing that abandoned breaker and resuming work.
+Ordinary stale record locks still use the serialized rename-and-recheck path;
+no observer automatically removes an abandoned breaker lock.
+
+PR refresh first reads the current body and replaces only Spor's managed
+`spor-proposal` block (or the legacy `spor-attestation` block). Human text and
+other automation outside that block survive byte-for-byte. Ambiguous or
+unterminated markers refuse the update. GitHub provides no compare-and-swap
+operation for this body edit, so truly concurrent external edits between the
+read and update remain an API limitation.

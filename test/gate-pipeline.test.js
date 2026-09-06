@@ -1015,7 +1015,7 @@ test("a failed escalation leaves a replayable retry payload — gate id, attempt
   // retry can write its closing artifact over the node that says "no
   // escalation could be filed" (task-spor-escalation-retry-closing-artifact-
   // and-integration-settle).
-  assert.strictEqual(res.escalation_retry.factId, gateRunner.gateFactId("acceptance", ITEM.node_id, ITEM.run_id, 3, 0));
+  assert.strictEqual(res.escalation_retry.factId, gateRunner.gateFactId("acceptance", ITEM.node_id, ITEM.run_id, 3, 0, "headsha0000000000000000000000000000000001"));
   assert.ok(res.facts.includes(res.escalation_retry.factId), "it names the fact this refusal recorded");
 });
 
@@ -1537,7 +1537,7 @@ test("orphanedGateRuns joins the dead workers' slots to the run journal, and no 
   for (const gate_state of ["passed", "failed", "blocked"]) {
     assert.deepStrictEqual(workLoop.orphanedGateRuns([dead()], { records: new Map([["run-orphan", { ...ORPHAN_RECORD, gate_state }]]) }), []);
   }
-  for (const gate_state of ["running", "interrupted"]) {
+  for (const gate_state of ["interrupted"]) {
     assert.strictEqual(workLoop.orphanedGateRuns([dead()], { records: new Map([["run-orphan", { ...ORPHAN_RECORD, gate_state }]]) }).length, 1, gate_state);
   }
 
@@ -1774,7 +1774,7 @@ test("a worker RESUMES an unfinished gate pipeline before taking new work, and s
   h.deps.markGate = (runId, patch) => marks.push({ run_id: runId, ...patch });
   // The real scan stops offering a run once a LIVE worker stamps it `running`.
   h.deps.pendingGates = async () =>
-    marks.some((m) => m.gate_state === "running") ? [] : [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake", record: ORPHAN_RECORD }];
+    marks.some((m) => m.gate_state) ? [] : [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake", record: ORPHAN_RECORD }];
 
   const status = await workLoop.runWorkLoop({ opts: { workerId: "w2", concurrency: 1, intervalMs: 1000 }, deps: h.deps, control: h.control });
   assert.strictEqual(h.state.gateCalls.length, 1, "the abandoned pipeline is picked up, not left standing forever");
@@ -1784,7 +1784,7 @@ test("a worker RESUMES an unfinished gate pipeline before taking new work, and s
   assert.strictEqual(status.recent[0].node_id, "task-orphan");
   assert.strictEqual(status.recent[0].gate, "failed", "and the resumed run gets its verdict on the status surface");
   assert.strictEqual(status.skipped[0].id, "task-orphan", "a refused resume cools the node like any other");
-  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["running", "failed"]);
+  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["failed"]);
   assert.strictEqual(marks[0].gate_worker, "w2");
   assert.ok(marks.every((m) => m.gate_at), "every stamp is dated");
 });
@@ -1805,12 +1805,12 @@ test("a refusal whose escalation never landed is MARKED on the run record, and s
   });
   h.deps.markGate = (runId, patch) => marks.push({ run_id: runId, ...patch });
   h.deps.pendingGates = async () =>
-    marks.some((m) => m.gate_state === "running") ? [] : [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake", record: ORPHAN_RECORD }];
+    marks.some((m) => m.gate_state) ? [] : [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake", record: ORPHAN_RECORD }];
 
   const status = await workLoop.runWorkLoop({ opts: { workerId: "w9", concurrency: 1, intervalMs: 1000 }, deps: h.deps, control: h.control });
-  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["running", "failed"]);
-  assert.strictEqual(marks[1].gate_escalation_failed, true, "the record says this refusal is readable only on this box");
-  assert.strictEqual(marks[1].gate_demoted, false, "and that nothing was rolled back");
+  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["failed"]);
+  assert.strictEqual(marks[0].gate_escalation_failed, true, "the record says this refusal is readable only on this box");
+  assert.strictEqual(marks[0].gate_demoted, false, "and that nothing was rolled back");
   assert.strictEqual(status.recent[0].escalation_failed, true, "--status surfaces it beside the verdict");
   assert.strictEqual(status.gates.failed, 1);
   assert.strictEqual(status.skipped[0].id, "task-orphan", "a refused resume cools the node like any other");
@@ -1852,7 +1852,7 @@ test("a failed escalation's retry payload is stamped onto the run record beside 
   });
   h.deps.markGate = (runId, patch) => marks.push({ run_id: runId, ...patch });
   h.deps.pendingGates = async () =>
-    marks.some((m) => m.gate_state === "running") ? [] : [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake", record: ORPHAN_RECORD }];
+    marks.some((m) => m.gate_state) ? [] : [{ run_id: "run-orphan", node_id: "task-orphan", harness: "fake", record: ORPHAN_RECORD }];
 
   await workLoop.runWorkLoop({ opts: { workerId: "w10", concurrency: 1, intervalMs: 1000 }, deps: h.deps, control: h.control });
   const settled = marks.find((m) => m.gate_state === "failed");
@@ -1964,12 +1964,12 @@ test("a stop folds in the verdicts that DID land before abandoning the rest", as
   assert.deepStrictEqual(status.gating.map((g) => g.node_id), ["task-b"], "and only the pipeline that never reported is abandoned");
   assert.deepStrictEqual(
     marks.filter((m) => m.run_id === "run-task-a").map((m) => m.gate_state),
-    ["running", "failed"],
+    ["failed"],
     "the settled run is stamped with its verdict, never 'interrupted'"
   );
   assert.deepStrictEqual(
     marks.filter((m) => m.run_id === "run-task-b").map((m) => m.gate_state),
-    ["running", "interrupted"],
+    ["interrupted"],
     "and the one that never reported is left in the state the next worker resumes from"
   );
 });
@@ -1994,7 +1994,7 @@ test("a stop marks its abandoned pipelines INTERRUPTED — the state the next wo
   };
   const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000 }, deps, control });
   assert.strictEqual(status.gating.length, 1, "the slot stays in the published record — it is what the next worker joins on");
-  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["running", "interrupted"]);
+  assert.deepStrictEqual(marks.map((m) => m.gate_state), ["interrupted"]);
 });
 
 test("the resume scan reads back what the run journal and the worker status files actually store", () => {
@@ -6011,7 +6011,7 @@ test("the loop settles a SUPERSEDED verdict like a pass: tallied, stamped settle
   assert.strictEqual(status.gates.passed, 0);
   assert.deepStrictEqual(status.skipped, [], "a superseded item is done — no cooldown");
   assert.strictEqual(status.recent[0].gate, "superseded");
-  assert.deepStrictEqual(stamps.map((s) => s.gate_state), ["running", "superseded"]);
+  assert.deepStrictEqual(stamps.map((s) => s.gate_state), ["superseded"]);
   assert.ok(gates.SETTLED_GATE_STATES.has("superseded"));
   const slot = { run_id: "run-orphan", node_id: "task-orphan", harness: "fake" };
   const dead = { worker_id: "w1", live: false, gates: { passed: 0, failed: 0, blocked: 0 }, gating: [slot], active: [] };
@@ -6414,7 +6414,7 @@ test("the loop tallies SCOPED, stamps it settled, and cools the item off — it 
   assert.strictEqual(status.gates.passed, 0);
   assert.strictEqual(status.gates.failed, 0);
   assert.strictEqual(status.recent[0].gate, "scoped");
-  assert.deepStrictEqual(stamps.map((s) => s.gate_state), ["running", "scoped"]);
+  assert.deepStrictEqual(stamps.map((s) => s.gate_state), ["scoped"]);
   assert.deepStrictEqual(
     status.skipped.map((s) => s.id),
     ["task-a"],
@@ -7397,9 +7397,9 @@ test("a fix cycle that moves the head sends the pipeline back to the first gate,
   let head = H1;
   let call = 0;
   const { deps, seen } = fakes({
-    review: () => {
+    review: ({ prior }) => {
       call += 1;
-      return { ok: true, text: call === 1 ? '```json\n{"verdict":"changes_requested","findings":[{"summary":"x","severity":"blocking","file":"lib/x.js","evidence":"deterministic failure"}]}\n```' : '```json\n{"verdict":"pass"}\n```' };
+      return { ok: true, text: call === 1 ? '```json\n{"verdict":"changes_requested","findings":[{"summary":"x","severity":"blocking","file":"lib/x.js","evidence":"deterministic failure"}]}\n```' : `\`\`\`json\n${JSON.stringify({verdict:"pass", prior: (prior || []).map(p => ({id:p.id,status:"resolved",evidence:"fixed in new head"}))})}\n\`\`\`` };
     },
     fix: () => {
       head = H2; // the fix cycle committed
@@ -7464,9 +7464,9 @@ test("fix cycles are charged cumulatively across restarts — a restarted gate d
     // review#1 changes_requested -> fix (head moves) -> review#2 pass; then
     // `second` fails -> fix (head moves) -> pass; restart: review at the
     // third head fails again — its ONE cycle is spent, so it escalates.
-    review: ({ gate }) => {
+    review: ({ gate, prior }) => {
       n += 1;
-      const pass = '```json\n{"verdict":"pass"}\n```';
+      const pass = `\`\`\`json\n${JSON.stringify({verdict:"pass", prior: (prior || []).map(p => ({id:p.id,status:"resolved",evidence:"fixed in new head"}))})}\n\`\`\``;
       const fail = '```json\n{"verdict":"changes_requested","findings":[{"summary":"x","severity":"blocking","file":"lib/x.js","evidence":"deterministic failure"}]}\n```';
       if (gate.id === "review") return { ok: true, text: n === 2 ? pass : fail };
       return { ok: true, text: n === 3 ? fail : pass };
@@ -7890,4 +7890,21 @@ test("the judge's git runs hook-free over the judged tree: a committed core.hook
   assert.strictEqual(env.PATH, "/bin");
   assert.deepStrictEqual([env.GIT_CONFIG_COUNT, env.GIT_CONFIG_KEY_0, env.GIT_CONFIG_VALUE_0, env.GIT_CONFIG_KEY_1, env.GIT_CONFIG_VALUE_1], ["2", "a.b", "c", "core.hooksPath", gateRunner.noHooksPath()]);
   if (process.platform !== "win32") assert.ok(gateRunner.noHooksPath().startsWith(os.devNull), "a path nothing on the box can create a hook under");
+});
+
+test("attestation uses the rescue pass's current gate verdicts while preserving all historical facts", async () => {
+  const factory = factoryOf({ ...BASE, protected_paths: [], gates: [{ id: "acceptance", kind: "command", command: "npm test", cycles: 0 }], rescue: { profile: "profile-codex-sol", attempts: 1 } });
+  let rescued = false;
+  const world = withRescue(fakes({ suite: () => ({ ok: rescued, reason: rescued ? null : "first candidate failed" }) }), () => {
+    rescued = true;
+    return { ok: true, runId: "run-rescue-test", category: "real-defect", diagnosis: "fixed", fixed: true, filed: [] };
+  });
+  world.deps.changedPaths = async () => ({ ok: true, paths: ["lib/x.js"], head: rescued ? "head-new" : "head-old", base: "base", trustedRef: "main", trustedSha: "base" });
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: world.deps });
+  assert.equal(result.state, "passed", result.reason);
+  assert.ok(result.gates.some(g => g.verdict === "failed"), "history retains the original refusal");
+  const evidence = require("../lib/shell/attestation.js").buildAttestationObject({ item: ITEM, factory, gate: result });
+  assert.equal(evidence.passed, true, "a completed rescue attests the latest judgement");
+  assert.deepEqual(evidence.gate.steps.map(s => [s.id, s.verdict, s.head]), [["acceptance", "passed", "head-new"]]);
+  assert.ok(result.facts.length >= 3, "original refusal, rescue, and final pass all keep lineage");
 });

@@ -675,6 +675,7 @@ function proposeFakeBin({ listJson, createOut = "https://github.com/demo/repo/pu
     `fs.appendFileSync(${JSON.stringify(callsFile)}, "gh " + args.join(" ") + "\\n");`,
     'if (args[0] === "--version") { process.stdout.write("gh version 2.0.0\\n"); process.exit(0); }',
     `if (args[0] === "pr" && args[1] === "list") { process.stdout.write(${JSON.stringify(listJson)}); process.exit(0); }`,
+    'if (args[0] === "pr" && args[1] === "view") { process.stdout.write(JSON.stringify({body:"Human context"})); process.exit(0); }',
     `if (args[0] === "pr" && args[1] === "edit") { ${editRefused ? `process.stderr.write(${JSON.stringify(editRefused)}); process.exit(1);` : "process.exit(0);"} }`,
     `if (args[0] === "pr" && args[1] === "create") { ${onCreate} }`,
     'process.stderr.write("unexpected gh invocation: " + args.join(" ") + "\\n");',
