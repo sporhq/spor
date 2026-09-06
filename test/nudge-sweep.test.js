@@ -482,8 +482,13 @@ test("SessionStart spawns the sweep, and a stranded finding lands with no sessio
 
   sessionStart(home, cwd, "sNew");
 
-  assert.ok(await waitFor(() => nodeFiles(home).length === 1), "the detached sweeper must recover the spool");
-  assert.deepStrictEqual(outFiles(home, "sA"), []);
+  // The consume TRAILS the durable write by design, so waiting on the node alone
+  // can observe the interim window where the claim is still held; the recovery is
+  // not complete until the result is consumed too.
+  assert.ok(
+    await waitFor(() => nodeFiles(home).length === 1 && outFiles(home, "sA").length === 0),
+    "the detached sweeper must recover the spool and consume its result"
+  );
   assert.match(
     fs.readFileSync(path.join(home, "nodes", nodeFiles(home)[0]), "utf8"),
     /a finding no session came back for/
