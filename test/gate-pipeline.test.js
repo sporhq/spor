@@ -9338,3 +9338,107 @@ test("removed gate obligations block before candidate pinning or any new green s
     assert.deepEqual(real.checkEvidenceOrigins(), { ok: true }, "paid history does not prohibit changing declarations");
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
+
+test("nested root package imports cannot justify off-diff isolation", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-nested-package-ref-"));
+  try {
+    fs.mkdirSync(path.join(dir, "test", "unit"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "lib"));
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ main: "lib/graph.js" }));
+    fs.writeFileSync(path.join(dir, "lib", "graph.js"), "module.exports = 1;");
+    const file = "test/unit/off.test.js";
+    for (const source of ['require("../..")', 'require("../../")', 'import x from "../.."', 'import("../../")', 'require("../unit/../..")']) {
+      fs.writeFileSync(path.join(dir, file), source);
+      const reference = gateRunner.changeReferencedBy(dir, [file], ["lib/graph.js"]);
+      assert.ok(reference.unknown || reference.reached.includes("lib/graph.js"), source);
+      const f = treeFakes({ dir, changed: ["lib/graph.js"], run: (_n, command) => command ? { ok: true } : { ok: false, code: 1, output: `✖ fail\n ${file}:1:1` } });
+      const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}", cycles: 0, reruns: 0 }] });
+      assert.equal((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps })).state, "failed", source);
+      assert.equal(f.seen.flakes.length, 0, source);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("completed evidence receipts survive a crash before rescue state and prevent a second occurrence", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }], rescue: RESCUE });
+  const f = withRescue(fakes(), () => ({ ok: false, reason: "rescue could not launch" }));
+  const first = "art-gate-original-paid";
+  const flake = { issues: ["issue-flake-one"], files: ["test/off.test.js"], linked: [] };
+  const outcome = { passed: false, verdict: "failed", detail: "original failure", flake, rescueNext: { n: 1, attempts: 1, profile: RESCUE.profile }, attempts: [], ledger: [] };
+  const change = await f.deps.changedPaths({});
+  f.seen.reads = 0;
+  const { ok, paths, ...savedChange } = change;
+  const original = JSON.stringify(outcome);
+  let progress = { evidence: { complete: true, fact: first, gate: factory.gates[0], outcome, payment_receipts: { ...flake, linked: ["issue-flake-one"], linkedBy: first }, change: savedChange, definition: factory.definition || null } };
+  f.deps.loadGateProgress = async () => progress;
+  f.deps.saveGateProgress = async ({ progress: p }) => { progress = JSON.parse(JSON.stringify(p)); };
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+  assert.equal(result.state, "failed");
+  assert.equal(f.seen.rescues.length, 1);
+  assert.deepEqual(f.seen.suites, [], "completed evidence is adopted without another judgement");
+  const occurrenceEdges = f.seen.facts.reduce((count, fact) => count + (fact.markdown.match(/type: relates-to, to: issue-flake-one/g) || []).length, 0);
+  assert.equal(occurrenceEdges, 0, "the existing first fact already paid this occurrence");
+  assert.equal(JSON.stringify(outcome), original, "the original classified outcome remains immutable");
+});
+
+test("all pending gate and rescue-pass evidence settles before tree reads, pins, fixes or earlier gates", async () => {
+  const { home, cfg, dispatchRuns } = scratchGraphForRetry();
+  try {
+    const entry = { node_id: "task-demo", run_id: "11223344-bbbb-cccc-dddd-eeeeeeeeeeee" };
+    const path = dispatchRuns.runPaths(home, entry.run_id).record;
+    dispatchRuns.atomicJson(path, { ...entry, state: "done" });
+    const factory = factoryOf({ ...BASE, gates: [{ id: "first", kind: "command", command: "first" }, { id: "acceptance", kind: "command", command: "acceptance" }] });
+    const real = sporCli.makeGateDeps(cfg, { entry, factory, slug: null, log: () => {} });
+    const origin = real.evidenceOrigin();
+    const gate = factory.gates[1];
+    const savedChange = { head: "original-head", base: "original-base", trustedRef: "original-main", trustedSha: "original-trust" };
+    const definition = { gates: [{ id: "acceptance", digest: "original-definition" }] };
+    for (const rescue of [0, 2]) {
+      const outcome = { passed: true, verdict: "passed", detail: "original classified failure", rescue, flake: { issues: ["issue-original"], files: ["test/off.test.js"], linked: [] } };
+      const debt = { gate, outcome, change: savedChange, definition, origin, candidate_id: "cand-original", complete: false };
+      await real.saveGateProgress({ gate, rescue, item: entry, progress: rescue ? { filingIntent: debt } : { evidence: debt } });
+    }
+    assert.equal(real.checkEvidenceOrigins().pending.length, 2, "journal preflight includes later gates in every pass");
+    let payable = false;
+    const calls = [];
+    const worker = () => {
+      const f = fakes();
+      f.deps.checkEvidenceOrigins = real.checkEvidenceOrigins;
+      f.deps.acceptsEvidenceOrigin = real.acceptsEvidenceOrigin;
+      f.deps.evidenceOrigin = real.evidenceOrigin;
+      f.deps.loadGateProgress = real.loadGateProgress;
+      f.deps.saveGateProgress = real.saveGateProgress;
+      const changedPaths = f.deps.changedPaths;
+      f.deps.changedPaths = async (args) => { calls.push("tree"); assert.ok(payable); return changedPaths(args); };
+      f.deps.pinCandidate = async () => { calls.push("pin"); assert.ok(payable); return { ok: true }; };
+      f.deps.fix = async () => { calls.push("fix"); assert.ok(payable); return { ok: true }; };
+      const suite = f.deps.runSuite;
+      f.deps.runSuite = async (args) => { calls.push(args.gate.id); assert.ok(payable); return suite(args); };
+      const recordFact = f.deps.recordFact;
+      f.deps.recordFact = async (args) => {
+        if (args.flakeIssues && args.flakeIssues.length) {
+          calls.push(`debt:${args.rescue || 0}`);
+          assert.equal(args.candidate_id, "cand-original");
+          assert.equal(args.head, savedChange.head);
+          assert.deepEqual(args.origin, origin);
+          assert.match(args.markdown, /original-definition/);
+          return payable ? { ok: true, id: args.id } : { ok: false, reason: "offline" };
+        }
+        return recordFact(args);
+      };
+      return f;
+    };
+    const blocked = worker();
+    assert.equal((await gateRunner.runGatePipeline({ item: entry, factory, deps: blocked.deps })).state, "interrupted");
+    assert.deepEqual(calls, ["debt:0"]);
+    assert.equal(blocked.seen.reads, 0);
+    assert.deepEqual(blocked.seen.suites, []);
+    payable = true; calls.length = 0;
+    const resumed = worker();
+    assert.equal((await gateRunner.runGatePipeline({ item: entry, factory, deps: resumed.deps })).state, "passed");
+    assert.deepEqual(calls.slice(0, 2), ["debt:0", "debt:2"]);
+    assert.ok(calls.indexOf("tree") > 1);
+    assert.ok(calls.indexOf("first") > 1);
+    assert.deepEqual(real.checkEvidenceOrigins(), { ok: true }, "paid obligations do not deadlock normal resumes");
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
