@@ -14270,15 +14270,29 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       });
       if (!pinned.ok) return pinned;
       const folded = candidateKernel.repinCandidate(current.impl_candidate || null, pinned.candidate);
-      // Only the `impl_candidate`/`impl_candidates` chain — never
-      // `impl_run_id`/`impl_attempt`/`impl_pool`/`impl_state`, which name the
-      // IMPLEMENTATION stage's own submission and are stamped once by
-      // makeGateDeps' pinCandidate. `stampImplState` merges additively, so
-      // leaving them out here never clobbers what that pin already wrote.
-      dispatchRuns.stampImplState(home, entry.run_id, {
+      const patch = {
         impl_candidate: folded.candidate,
         impl_candidates: candidateKernel.appendCandidateChain(current.impl_candidates, folded.candidate),
-      });
+      };
+      // Ordinarily `impl_run_id`/`impl_attempt`/`impl_pool`/`impl_state` name
+      // the IMPLEMENTATION stage's own submission and are stamped once by
+      // makeGateDeps' pinCandidate at the gate pipeline's own (unconditional)
+      // opening read — `stampImplState` merges additively, so leaving them
+      // out of every OTHER re-pin here never clobbers what that pin wrote.
+      // But that opening read is itself fail-soft (a dirty/unreadable tree
+      // just logs and the gate pipeline proceeds regardless), so a factory
+      // can reach integration having never successfully pinned anything.
+      // `folded.change === "created"` is exactly that case reached from here
+      // instead: THIS is now the first-ever pin, so it must stamp the same
+      // fields the gate version's own `created` branch does, or they would
+      // stay unset forever even once `impl_candidate` exists.
+      if (folded.change === "created") {
+        patch.impl_run_id = entry.run_id;
+        patch.impl_attempt = current.impl_attempt || 1;
+        patch.impl_pool = "implementation";
+        patch.impl_state = candidateKernel.candidateSubmitted(folded.candidate) ? "candidate" : "running";
+      }
+      dispatchRuns.stampImplState(home, entry.run_id, patch);
       return { ok: true, candidate: folded.candidate, change: folded.change };
     },
     acquireLease: () => acquireIntegrationLease(cfg, home, top || (record && record.cwd), { slug }),

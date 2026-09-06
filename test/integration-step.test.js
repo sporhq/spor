@@ -1845,6 +1845,87 @@ test("REGRESSION issue-spor-integration-fix-cycle-does-not-repin-candidate: a fi
   assert.strictEqual(rec.impl_candidates.length, 2, "the chain carries both the pre-fix and the re-pinned candidate");
 });
 
+// A narrower sibling of the regression above: the gate pipeline's OWN opening
+// pin (makeGateDeps' pinCandidate, at the unconditional first readChanged) is
+// itself fail-soft — a dirty/unreadable tree just logs and the gate pipeline
+// proceeds regardless — so a factory can reach integration having never
+// successfully pinned anything at all. In that case an integration fix
+// cycle's own re-pin is the FIRST successful pin (`folded.change ===
+// "created"`), and makeIntegrationDeps' pinCandidate must stamp
+// impl_run_id/impl_attempt/impl_pool/impl_state exactly like makeGateDeps'
+// own `created` branch does — a correctness gap a medium-effort review of
+// this fix caught: the first cut only ever wrote impl_candidate/
+// impl_candidates, leaving those four fields permanently unset even once a
+// candidate existed.
+test("when no candidate was ever pinned before integration ran, an integration fix cycle's re-pin is the FIRST pin and stamps impl_run_id/impl_attempt/impl_pool/impl_state, not just the candidate", async () => {
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+
+  const dir = integrationRepo();
+  git(dir, "checkout", "-q", "branch");
+  const targetRef = "main";
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-integration-repin-first-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+
+  const factory = {
+    id: "factory-repin-first",
+    integration: { targetRef, mode: "local", command: "true", strategy: "merge", serialize: "repo", cycles: 1, timeoutMs: 900000 },
+    trustedRef: targetRef,
+    protectedPaths: [],
+    implementation: { profile: "profile-impl" },
+  };
+  const entry = { run_id: "11111111-2222-3333-4444-0000000000aa", node_id: "task-demo", project: "demo", attempt: 1 };
+  const record = { cwd: dir };
+
+  // The run record EXISTS (a real dispatch always writes one) but carries no
+  // impl_ fields at all — the gate pipeline's own opening pin never
+  // succeeded, byte-identical to what a dirty/unreadable-tree read leaves
+  // behind.
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, entry.run_id).record, { run_id: entry.run_id, node_id: entry.node_id, state: "running" });
+
+  const realDeps = sporCli.makeIntegrationDeps(cfg, { record, entry, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home });
+  let suiteRuns = 0;
+  const deps = {
+    ...realDeps,
+    acquireLease: async () => null,
+    releaseLease: async () => {},
+    buildCandidate: async ({ head, targetRef: t, strategy }) => integrationRunner.buildCandidateTree({ top: dir, head, targetRef: t, strategy }),
+    runSuite: async ({ dir: candidateDir }) => {
+      suiteRuns += 1;
+      return fs.existsSync(path.join(candidateDir, "lib", "fix-marker.js"))
+        ? { ok: true }
+        : { ok: false, reason: "the candidate is missing the implementer's fix", output: "" };
+    },
+    land: async (args) => integrationRunner.landCandidate(args),
+    fix: async () => {
+      fs.writeFileSync(path.join(dir, "lib", "fix-marker.js"), "module.exports = true;\n");
+      git(dir, "add", "-A");
+      git(dir, "commit", "-q", "-m", "fix: add the marker the suite requires");
+      return { ok: true, runId: "run-fixxxxxx" };
+    },
+    escalate: async () => ({ ok: true, id: "task-integration-escalate-x" }),
+    demote: async () => ({ ok: true, demoted: false }),
+    recordFact: async () => ({ ok: true }),
+    cleanupImplementer: async () => {},
+  };
+
+  const item = { node_id: entry.node_id, run_id: entry.run_id, project: entry.project, attempt: entry.attempt };
+  const res = await integrationRunner.runIntegrationStage({ item, factory, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.strictEqual(suiteRuns, 2);
+
+  const fixedHead = git(dir, "rev-parse", "branch").trim();
+  const rec = dispatchRuns.readJson(dispatchRuns.runPaths(home, entry.run_id).record);
+  assert.ok(rec.impl_candidate, "the first-ever pin still lands, even though it happened at integration-fix rather than implementation");
+  assert.strictEqual(rec.impl_candidate.commit, fixedHead);
+  assert.strictEqual(rec.impl_run_id, entry.run_id, "impl_run_id is stamped on the FIRST pin, wherever it happens");
+  assert.strictEqual(rec.impl_attempt, 1);
+  assert.strictEqual(rec.impl_pool, "implementation", "the record-level pool names the implementation run this record represents, not which stage produced the first readable tree");
+  assert.ok(rec.impl_state === "candidate" || rec.impl_state === "running", `impl_state must be set, not left undefined: got ${rec.impl_state}`);
+});
+
 test("squash and rebase strategies both produce a candidate that descends cleanly from the target ref", () => {
   const dir = integrationRepo();
   const head = git(dir, "rev-parse", "branch").trim();
