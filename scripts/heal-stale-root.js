@@ -375,26 +375,38 @@ function chunks(arr, n) {
 // its OWN previous reflog position, not a hardcoded branch name, so this also
 // guards a shared root for any other repo this tool is invoked against.
 
-// The branch HEAD is on, or null on a detached HEAD (no branch ref that could
-// have rewound). `--quiet` makes a detached HEAD a clean non-zero exit rather
-// than the stderr `fatal: ref HEAD is not a symbolic ref` this tool would
-// otherwise have to filter out of every other failure.
+// "The probe itself did not run" — a spawn failure (git could not be
+// launched at all: ENOENT, EAGAIN on a loaded box, …), distinct from a clean
+// non-zero exit. Every other probe in this file treats this as a hard
+// refusal (see gitRun's `r.error` check); currentBranch/reflogPrevious below
+// must too; collapsing it into the same null as "detached HEAD" or "no prior
+// reflog entry" would silently skip the rewind check instead of refusing.
+const PROBE_FAILED = Symbol('rewind-probe-failed');
+
+// The branch HEAD is on, null on a detached HEAD (no branch ref that could
+// have rewound), or PROBE_FAILED if the spawn itself failed. `--quiet` makes
+// a detached HEAD a clean non-zero exit rather than the stderr `fatal: ref
+// HEAD is not a symbolic ref` this tool would otherwise have to filter out of
+// every other failure.
 function currentBranch(repo) {
   const r = gitSpawn(repo, ['symbolic-ref', '--quiet', '--short', 'HEAD'], {
     encoding: 'utf8',
     env: envWithoutRepoLocalVars(),
   });
+  if (r.error) return PROBE_FAILED;
   return r.status === 0 ? (r.stdout || '').trim() : null;
 }
 
 // `<branch>@{1}` — the reflog's record of that ref's own previous position —
-// or null when there is no second entry yet (a fresh clone, a freshly created
-// branch): nothing to compare against, so not rewind evidence either way.
+// null when there is no second entry yet (a fresh clone, a freshly created
+// branch: nothing to compare against, so not rewind evidence either way), or
+// PROBE_FAILED if the spawn itself failed.
 function reflogPrevious(repo, branch) {
   const r = gitSpawn(repo, ['rev-parse', '--verify', '-q', `${branch}@{1}`], {
     encoding: 'utf8',
     env: envWithoutRepoLocalVars(),
   });
+  if (r.error) return PROBE_FAILED;
   return r.status === 0 ? (r.stdout || '').trim() : null;
 }
 
@@ -413,17 +425,22 @@ function isAncestor(repo, ancestor, descendant) {
   return null;
 }
 
-// {branch, prev, head} when `head` is a non-descendant rewind of the checked-
-// out branch's own previous reflog position; null when there is nothing to
-// refuse — no branch (detached HEAD), no prior reflog entry, the ref hasn't
-// moved, or an ordinary fast-forward/merge advance.
+// {branch, prev, head, probeFailed} when there is something to refuse:
+// either a confirmed/unconfirmed non-descendant rewind (probeFailed false,
+// prev set), or a probe that could not even run (probeFailed true, prev
+// null — cannot confirm ancestry, so cannot say the tip is safe). null when
+// there is nothing to refuse — no branch (detached HEAD), no prior reflog
+// entry, the ref hasn't moved, or a confirmed ordinary fast-forward/merge
+// advance.
 function detectRewind(repo, head) {
   const branch = currentBranch(repo);
+  if (branch === PROBE_FAILED) return { branch: null, prev: null, head, probeFailed: true };
   if (!branch) return null;
   const prev = reflogPrevious(repo, branch);
+  if (prev === PROBE_FAILED) return { branch, prev: null, head, probeFailed: true };
   if (!prev || prev === head) return null;
   if (isAncestor(repo, prev, head) === true) return null; // an ordinary advance
-  return { branch, prev, head }; // a non-descendant, or unconfirmed — refuse either way
+  return { branch, prev, head, probeFailed: false }; // a non-descendant, or unconfirmed — refuse either way
 }
 
 // ---------- identity ----------
@@ -899,7 +916,13 @@ function main() {
 
   if (!opts.forceRewind) {
     const rewind = detectRewind(repo, head);
-    if (rewind) {
+    if (rewind && rewind.probeFailed) {
+      usage(
+        `cannot confirm ${rewind.branch ? `${rewind.branch}'s` : "HEAD's"} previous position was an ancestor of ` +
+        `${rewind.head.slice(0, 8)} — a probe needed to rule out a rewind could not run. Refusing to heal without ` +
+        'that proof. If this is the deliberate re-CAS of a bad swap, re-run with --force-rewind.'
+      );
+    } else if (rewind) {
       usage(
         `${rewind.branch} moved to ${rewind.head.slice(0, 8)}, which does not descend from its previous position ` +
         `${rewind.prev.slice(0, 8)} (${rewind.branch}@{1}) — this looks like a rewind, not a merge or fast-forward. ` +
