@@ -15892,6 +15892,17 @@ async function gateCoveragePreview(cfg, gate) {
   return `armed — reviews read-only under ${adapter.label}${gate.cycles ? `, then up to ${gate.cycles} fix cycle${gate.cycles === 1 ? "" : "s"}` : ""}`;
 }
 
+// The queue-fetch scope token a factory with no explicit --project narrows
+// to: a single declared repo auto-narrows `slug` to it (the token an
+// operator would type themselves), anything else leaves it unscoped. Callers
+// guard this with `if (!explicitSlug)` — an operator's own --project is
+// never overridden — both at cmdWork startup and again inside reloadFactory
+// whenever `repos:` changes (task-spor-work-factory-reload-extend-to-repo-
+// scope), so the derivation itself lives here once instead of twice.
+function factoryScopeSlug(repos) {
+  return repos.length === 1 ? repos[0] : null;
+}
+
 async function cmdWork(cfg, { values }) {
   if (values.status) return cmdWorkStatus(cfg, { json: !!values.json });
 
@@ -16135,7 +16146,7 @@ async function cmdWork(cfg, { values }) {
     return graph;
   };
   let factoryRepos = (factory && factory.repos) || [];
-  if (!explicitSlug && factoryRepos.length === 1) slug = factoryRepos[0];
+  if (!explicitSlug) slug = factoryScopeSlug(factoryRepos);
   let localFactoryGraph = await checkFactoryRepoScope(factoryRepos);
   // The change-detection key `reloadFactory` compares against below, so the
   // (comparatively expensive — a full local graph load, or a remote round
@@ -16477,7 +16488,7 @@ async function cmdWork(cfg, { values }) {
                   // them, but dispatchableQueuePage(cfg, slug, ...) below
                   // never returns them in the first place. Never touches an
                   // operator's own explicit --project.
-                  if (!explicitSlug) slug = factoryRepos.length === 1 ? factoryRepos[0] : null;
+                  if (!explicitSlug) slug = factoryScopeSlug(factoryRepos);
                 }
                 // Handed back on EVERY ok reload (not only a changed one) so
                 // the loop's own `repos`/`graph` bindings — which feed
