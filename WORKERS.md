@@ -1103,7 +1103,7 @@ door(s) under `implementation.candidate`:
 
 | `publish` | what is written | `reference` fields |
 |---|---|---|
-| `bundle` (default) | `git bundle create` of `base.merge_base..commit`, under `refs/spor/candidates/<candidate_id>`, into `candidate.bundle_store` (default `file://<SPOR_HOME>/candidates`, gitignored beside `journal/`) | `{kind, store, key, locator, commit, sha256, bytes, verified_at}` |
+| `bundle` (default) | `git bundle create` of `base.merge_base..commit`, under `refs/spor/candidates/<candidate_id>`, into `candidate.bundle_store` (default `file://<userConfigHome>/candidates` — machine-local, **not** a marker-resolved shared graph home; gitignored in whichever directory the store itself resolves to, if that's a git working tree — task-spor-candidate-store-home-vs-shared-graph-home-trap) | `{kind, store, key, locator, commit, sha256, bytes, verified_at}` |
 | `branch` | `git push <resolved url> <commit>:refs/spor/candidates/<candidate_id> --force-with-lease=<ref>:` — the empty expectation, i.e. **create only if absent**, never `--force` | `{kind, locator, ref, commit, verified_at}` |
 | `both` | both, with the bundle as `reference` and `references[]` carrying both doors | as above |
 

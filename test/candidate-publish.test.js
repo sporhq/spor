@@ -458,6 +458,57 @@ test("the default store is file://<SPOR_HOME>/candidates and is created on deman
   assert.ok(fs.existsSync(path.join(home, "candidates")));
 });
 
+// -------------------- gitignore follows the store's OWN resolved home --
+// (task-spor-candidate-store-home-vs-shared-graph-home-trap): the default
+// store lives under `graphHome` (userConfigHome() in real use, NEVER the
+// marker-resolved shared graph home), so the ignore line belongs there, not
+// in some other directory the store never touches.
+
+test("a git-tracked default home gets its own /candidates/ .gitignore line", (t) => {
+  const home = scratch(t, "cand-home");
+  execFileSync("git", ["init", "-q", home], { stdio: "ignore" });
+  const f = factoryWith({});
+  const v = publisher.publishSatisfiability(f, { graphHome: home, mode: "local" });
+  assert.deepStrictEqual(v.errors, []);
+  const gi = fs.readFileSync(path.join(home, ".gitignore"), "utf8");
+  assert.ok(gi.split("\n").some((l) => l.trim() === "/candidates/"), gi);
+});
+
+test("a NON-git-tracked home is left with no .gitignore at all", (t) => {
+  const home = scratch(t, "cand-home");
+  const f = factoryWith({});
+  const v = publisher.publishSatisfiability(f, { graphHome: home, mode: "local" });
+  assert.deepStrictEqual(v.errors, []);
+  assert.strictEqual(fs.existsSync(path.join(home, ".gitignore")), false);
+});
+
+test("an operator-declared store elsewhere is gitignored in ITS OWN home, not the default graphHome", (t) => {
+  const home = scratch(t, "cand-home"); // never touched by the store
+  const shared = scratch(t, "cand-shared"); // the marker-resolved shared graph home, stands in
+  execFileSync("git", ["init", "-q", shared], { stdio: "ignore" });
+  const f = factoryWith({ publish: "bundle", bundle_store: pathToFileURL(path.join(shared, "candidates")).href });
+  const v = publisher.publishSatisfiability(f, { graphHome: home, mode: "local" });
+  assert.deepStrictEqual(v.errors, []);
+  assert.strictEqual(fs.existsSync(path.join(home, ".gitignore")), false);
+  const gi = fs.readFileSync(path.join(shared, ".gitignore"), "utf8");
+  assert.ok(gi.split("\n").some((l) => l.trim() === "/candidates/"), gi);
+});
+
+test("ensureStoreGitignore is idempotent and fail-open on a bad path", () => {
+  assert.strictEqual(publisher.ensureStoreGitignore(""), false);
+  assert.strictEqual(publisher.ensureStoreGitignore(null), false);
+});
+
+test("a store nested several directories below the git root is found by walking up, and the ignore line is RELATIVE to the root", (t) => {
+  const shared = scratch(t, "cand-shared-nested");
+  execFileSync("git", ["init", "-q", shared], { stdio: "ignore" });
+  const f = factoryWith({ publish: "bundle", bundle_store: pathToFileURL(path.join(shared, "data", "nested", "candidates")).href });
+  const v = publisher.publishSatisfiability(f, { graphHome: scratch(t, "cand-home-unused"), mode: "local" });
+  assert.deepStrictEqual(v.errors, []);
+  const gi = fs.readFileSync(path.join(shared, ".gitignore"), "utf8");
+  assert.ok(gi.split("\n").some((l) => l.trim() === "/data/nested/candidates/"), gi);
+});
+
 test("E9: a branch publish with no such remote in any known checkout is refused at startup", (t) => {
   const repo = producerRepo(t);
   const home = scratch(t, "cand-home");

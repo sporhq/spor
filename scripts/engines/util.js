@@ -893,16 +893,25 @@ function spoolStats(dir) {
 // Machine-local / ephemeral state inside a graph home that must NEVER ride a
 // SHARED graph repo's git flow (issue-cc-local-mode-graph-sharing-gap,
 // dec-spor-local-mode-sharing-boundary): journal/cache/outbox are runtime
-// scratch, candidates/ holds factory candidate BUNDLES (binary git artifacts —
-// the default `implementation.candidate.bundle_store` is machine-local, under
-// the USER home rather than a marker-resolved shared one, so this line is what
-// covers an operator who points the store at the shared home instead,
-// FACTORY-IMPLEMENTATION-STAGE.md §2.1), and auth/ + config.json hold tokens,
-// so this doubles as a secret-leak guard (broader than the decision's
-// "journal/cache/outbox"). The durable graph — nodes/ and history/ — is
-// intentionally NOT ignored. Anchored with a leading slash to the home root so
-// a same-named dir under nodes/ is unaffected.
-const GRAPH_IGNORES = ["/journal/", "/cache/", "/outbox/", "/candidates/", "/auth/", "/config.json"];
+// scratch, and auth/ + config.json hold tokens, so this doubles as a
+// secret-leak guard (broader than the decision's "journal/cache/outbox"). The
+// durable graph — nodes/ and history/ — is intentionally NOT ignored.
+// Anchored with a leading slash to the home root so a same-named dir under
+// nodes/ is unaffected.
+//
+// candidates/ (factory candidate BUNDLES — binary git artifacts,
+// FACTORY-IMPLEMENTATION-STAGE.md §2.1) is deliberately NOT in this list: the
+// default `implementation.candidate.bundle_store` is machine-local, under
+// userConfigHome() rather than this marker-resolved shared home, so a static
+// `/candidates/` line here would be dead weight almost always and cover an
+// operator override only by accident
+// (task-spor-candidate-store-home-vs-shared-graph-home-trap). Instead
+// `ensureStoreGitignore` in lib/shell/candidate-publish.js runs at the point
+// the store is actually resolved and writes the ignore line into WHICHEVER
+// directory the store lands in — the default userConfigHome(), or this shared
+// home when an operator declares `bundle_store` inside it — so the ignore
+// line always follows the store's real home instead of a fixed guess.
+const GRAPH_IGNORES = ["/journal/", "/cache/", "/outbox/", "/auth/", "/config.json"];
 
 // Ensure a shared graph home carries a .gitignore covering GRAPH_IGNORES.
 // Idempotent and ADDITIVE: writes the full block (with a header) when absent,

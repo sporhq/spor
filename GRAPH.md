@@ -769,7 +769,11 @@ edges:
   marker dir) and overrides `SPOR_HOME` in local mode; a contributor with their
   own personal `SPOR_HOME` still inherits the shared graph inside the repo. See
   API.md §6.1 for the full contract (precedence, the generated `.gitignore`, and
-  the distiller's PR-flow behavior).
+  the distiller's PR-flow behavior). A factory's candidate bundle store does
+  **not** follow this binding — it stays machine-local under `userConfigHome()`
+  by default even when a `graph:` binding is active, so the two homes can
+  legitimately differ; API.md §6.1 says where each home's `.gitignore` hygiene
+  actually lands.
 - **Git worktrees** resolve to their main repo, not the worktree directory's
   basename. A linked worktree shares the main repo's root-commit sha and
   remotes, so inferring identity from its (markerless, often throwaway-named)

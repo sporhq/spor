@@ -16,7 +16,7 @@ const { gitInit } = require('./helpers/git');
 function tmp() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'spor-share-'));
 }
-const IGNORES = ['/journal/', '/cache/', '/outbox/', '/candidates/', '/auth/', '/config.json'];
+const IGNORES = ['/journal/', '/cache/', '/outbox/', '/auth/', '/config.json'];
 
 // --- ensureGraphGitignore -------------------------------------------------
 

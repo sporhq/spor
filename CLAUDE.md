@@ -678,7 +678,20 @@ machine-local state (`/journal/ /cache/ /outbox/ /auth/ /config.json`; durable
 auto-commit when the graph home is the same git repo as the code repo (the
 nested-repo case — `Config.sharedGraphHome()` gates the first,
 `graphInsideCodeRepo()` the second; distilled nodes then ride the human PR
-flow). **Opt-in activation (task-spor-plugin-opt-in-default):** the plugin is a
+flow). **A factory's candidate bundle store is a separate, THIRD home and does
+not follow this marker at all**
+(task-spor-candidate-store-home-vs-shared-graph-home-trap): the default
+`implementation.candidate.bundle_store` is `file://<userConfigHome>/candidates`
+— this machine's personal env home, chosen deliberately because binary
+bundles don't belong riding a shared repo's git flow — even while a `graph:`
+marker points the *graph* itself elsewhere. Its `.gitignore` line is
+maintained precisely where the store resolves (`ensureStoreGitignore` in
+lib/shell/candidate-publish.js, run every time `resolveBundleStore` validates
+the store), not folded into the marker-home gitignore above: an operator who
+declares `bundle_store` inside the marker home gets the ignore line there
+instead, so the line always follows the store's actual directory rather than
+guessing which of the two homes it landed in. **Opt-in activation
+(task-spor-plugin-opt-in-default):** the plugin is a
 no-op in any repo that hasn't opted in — `Config.enabled()` is true only when
 mode≠`off` AND either (a) an explicit `enabled` flag resolved anywhere in the
 cascade (`enabled:true`/`false` in any config layer, `SPOR_ENABLED` env, or a

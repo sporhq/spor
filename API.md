@@ -971,6 +971,20 @@ Contract:
   `nodes/` and brief `history/` are committed. The SessionEnd distiller leaves
   distilled nodes **uncommitted** (for the human PR flow) instead of
   auto-committing when the graph home is the same git repo as the code repo.
+- **Factory candidate bundles are a THIRD, separate home** — they do not
+  follow this marker binding at all
+  (task-spor-candidate-store-home-vs-shared-graph-home-trap). A factory's
+  `implementation.candidate.bundle_store` defaults to
+  `file://<userConfigHome>/candidates`, i.e. this machine's personal env home,
+  never this marker's shared graph home — binary bundle artifacts have no
+  business riding a shared repo's git flow by default. Its `.gitignore` line
+  is therefore maintained separately, at whichever directory the store
+  actually resolves to (`ensureStoreGitignore` in
+  `lib/shell/candidate-publish.js`), only when that directory is itself a git
+  working tree — so an operator who deliberately declares `bundle_store`
+  *inside* this marker home gets the same hygiene here, and everyone else's
+  personal home gets it there instead, rather than a fixed line landing in
+  whichever home happens to be wrong.
 
 ### 6.2 Multi-tenant credentials (the credential store + tenant selector)
 

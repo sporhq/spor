@@ -1593,11 +1593,16 @@ test('session-start: a `.spor` graph: marker overrides the env home and writes t
   assert.match(ctx, /brief-code v9/);
   assert.match(ctx, /shared-graph briefing body/);
   assert.ok(ctx.includes(path.join(shared, 'nodes')), 'briefing should name the shared nodes dir');
-  // The shared home got a .gitignore covering machine-local state.
+  // The shared home got a .gitignore covering machine-local state. /candidates/
+  // is NOT part of this blanket list (task-spor-candidate-store-home-vs-shared-
+  // graph-home-trap): the candidate store defaults to userConfigHome(), not
+  // this marker-resolved shared home, so its ignore line is written only where
+  // the store actually resolves (lib/shell/candidate-publish.js), not here.
   const gi = fs.readFileSync(path.join(shared, '.gitignore'), 'utf8');
-  for (const ig of ['/journal/', '/cache/', '/outbox/', '/candidates/', '/auth/', '/config.json']) {
+  for (const ig of ['/journal/', '/cache/', '/outbox/', '/auth/', '/config.json']) {
     assert.ok(gi.includes(ig), `shared .gitignore missing ${ig}`);
   }
+  assert.ok(!gi.includes('/candidates/'), 'shared .gitignore should not presume candidates land here');
   // The personal env home was untouched (no .gitignore generated there).
   assert.ok(!fs.existsSync(path.join(personal, '.gitignore')), 'personal home must not get a .gitignore');
 });
