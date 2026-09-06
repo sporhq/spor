@@ -1469,12 +1469,202 @@ outside git (a database on a fixed port, a `db reset`):
   lease, when declared, is held across the reruns. The suite sees `SPOR_GATE_ATTEMPT`
   (1 for the declared run, N+1 for the Nth rerun) beside the rest of its
   environment.
+- **`isolate`** — a command template carrying a `{files}` token, e.g. `node
+  --test {files}`, and the gate's answer to a failure the change is
+  demonstrably not the cause of
+  (task-spor-factory-flake-rescue-should-not-burn-when-failure-is-off-diff).
+  After every declared rerun and before the failure is charged, the runner
+  reads the FILE PATHS the failure named and asks whether the change is
+  implicated in them at all. Only when it is demonstrably not are the failing
+  test files re-run through this template on that same prepared tree — and if
+  they pass alone, the whole-suite failure is an **off-diff flake**: the gate
+  PASSES, and the flake is filed as its own `issue-flake-*` node rather than
+  spending the item's fix cycles, its rescue lane and finally a person on work
+  that was never wrong. ONE issue per failing FILE, keyed on that file alone —
+  a flake belongs to the file that flakes, not to the set it happened to fail
+  beside (a set that shifts with load and ordering, and whose every permutation
+  would otherwise be its own near-duplicate). The pass needs every one of them
+  to land: a file with no durable record is the one thing it may not trade
+  away, and a filing that fails charges the failure as before.
+
+  "Off-diff" is TWO claims, and both must hold. First, no failed run named a
+  file the change edits — every run, not just the last, since a declared
+  `reruns` budget means a charged failure is several samples of one tree and
+  they need not fail the same way. Second, the failing tests do not
+  **reference** the change either: not appearing in a diff is a coincidence,
+  not an argument, and a test that never appears in one can still import,
+  spawn or read a file that does (the refusal that prompted this feature is
+  exactly that shape — test/codex-dispatch.test.js spawns `bin/spor.js`,
+  which the change had edited). So the files the failure named, and everything
+  reachable from them through the local files they name, are READ and asked
+  that question two ways — because one spelling misses the other's shape. TEXTUALLY: any
+  spelling of a changed path in the source — the path itself, its basename as
+  a token (what a `path.join(ROOT, "bin", "spor.js")` leaves behind), an
+  extensionless quoted specifier. And by RESOLVED IMPORT EDGE: every local file
+  the source names, resolved against its own directory and compared to the
+  change set exactly, which is what catches a segmented spelling whose text
+  contains no repo-relative path at all (`lib/index.js` requiring
+  `./kernel/queue.js` references `lib/kernel/queue.js` while spelling neither).
+  The edge question is asked of every file the walk reads, the last one
+  included.
+
+  HOW FAR it looks is the whole transitive closure, not a fixed number of hops.
+  "Imported or executed by the failing test" is a transitive claim — a test that
+  reaches the change through two helpers executes it exactly as much as one that
+  requires it directly — and a walk that simply STOPPED at a depth limit would
+  answer "no reference" in a voice indistinguishable from having looked
+  everywhere. So the frontier is followed to exhaustion, and the only bounds
+  left are read budgets that fail CLOSED: a file the walk still had to read
+  when it ran out of budget is `unknown`, and the failure is charged.
+
+  WHICH files are asked is likewise two sets. The test files the isolation
+  would re-RUN are HARD seeds: anything that stops us reading one stops the
+  pass, since we would otherwise re-run a file we could not judge. The other
+  files the failure named ride along as soft seeds — the failure went THROUGH
+  them, so what they import is as much part of the question, but a path
+  scraped out of a stack frame need not exist in this tree and one that does
+  not is importing nothing. That softness is about ABSENCE only: once a file
+  is here, not reading it leaves the question open exactly as much as for a
+  hard seed, so an existing file the walk cannot read (too large, a permission
+  error, an I/O fault) is `unknown` whichever kind of seed it is. That check is
+  deliberately over-inclusive and bounded: a reference it cannot rule out, a
+  hard seed that is not there, a file it cannot read, and a walk that would
+  exceed its budget all read as "not demonstrably off-diff". The practical
+  consequence is that the pass is NARROW — in a repo whose tests drive one
+  large entry point, most changes are implicated in most failures and the
+  failure is charged as it always was. That is the intended trade: the
+  `reruns` budget is the broad flake mitigation, and this is the one case
+  where the gate can say the change had nothing to do with it.
+
+  Bounded and conservative in every other direction too:
+
+  - it reads paths and nothing else — no verdicts, no counts, no test names.
+    A harness's RESULT structure is the harness's (that is why
+    dec-spor-command-gate-bounded-same-tree-rerun dismissed "re-run what
+    failed"); a file path is printed the same way by all of them, and the
+    verdict still comes from the isolated run's own exit code. What it does
+    read from the output's shape is only WHERE a path may be taken from: the
+    failure's own region (a `not ok`/`✖`/`FAIL`/Error/traceback line and the
+    indented block under it), never a line the run marked as a PASS — a whole
+    suite prints one line per file it ran, and a set of passing files is
+    trivially off-diff and trivially passes in isolation;
+  - a failure that named no readable path, or named one the change touches,
+    is **not** off-diff and is charged exactly as before. So is one whose
+    isolated re-run fails too — off-diff is a reason to look, never to pass;
+  - only files a harness would recognize as TESTS are re-run (a `lib/` path
+    scraped out of a stack frame handed to `node --test` would exit 0 for
+    having no tests in it), and at most five of them: six files failing at
+    once is a breakage, not a load-sensitive flake;
+  - the isolated run happens inside the SAME prepared tree, before it is torn
+    down and under the same lease, so a pass means "these files pass HERE",
+    never "on some fresh checkout at the same sha". It sees
+    `SPOR_GATE_ISOLATE=1`;
+  - it is never a laundering step: the whole-suite failure rides the
+    `art-gate-*` fact as evidence, the outcome line names the flake, and the
+    fact carries a `relates-to` edge to the flake issue. The pass is
+    CONDITIONAL on that flake issue landing — a gate fact write is
+    best-effort, so a flake that could be filed nowhere would be a pass over a
+    red suite that nothing records; when the filing fails the failure is
+    charged instead, and the outcome says the isolated run passed and why it
+    was charged anyway. The filings that DID land before one failed still ride
+    that charged fact as `relates-to` edges: each is this run's occurrence of
+    that file's flake, and an issue no fact links to has no provenance and no
+    occurrence to its name. That edge is a DEBT, tracked PER ISSUE on the
+    flake payload itself and discharged only by a landing the pipeline
+    OBSERVED — a write that CREATED the fact, or, when the write door reported
+    the id already occupied (`if_exists: skip` remotely, identical-content
+    adoption locally, neither of which is this markdown landing), a read of
+    that occupant which saw the edge, or an edge written straight onto that
+    occupant. A write door's bare success never discharges it, and neither
+    does the mere presence of a fact id. That read-back answers TWO questions,
+    not one. Is the node under this deterministic id THIS record? Another
+    actor — a resumed pipeline, a second worker, a heal pass — can have
+    written this gate run's fact between the check and the write, and what a
+    race changes under us is the VERDICT, which is what the frontmatter
+    `title:` carries; a title that differs means this markdown did not land,
+    so the verdict is not reported as recorded and the fact is not offered to
+    the rescue as its `derived-from` anchor. (A byte compare is the wrong
+    instrument for the remote half: the server stamps `author`/`authored_via`
+    onto what it stores, and a legitimate earlier incarnation of the same
+    record — one written before a filing landed — differs in body and detail
+    while being the same verdict with a smaller debt.) And which edges are on
+    it, read TYPED: an occurrence is a `relates-to`, so a `mentions` or a
+    `derived-from` pointing at the same issue from the same fact names it
+    without recording an occurrence of it, and counting it would silently lose
+    one from the file's count. An edge the fact could not carry is then paid
+    ONTO that fact, through the idempotent add_edge door, at the moment the
+    debt is known — a PASSING gate and the final refusal have no later fact of
+    that pass to carry it, so a debt deferred there is a debt that sinks. The
+    payment is recorded only from the door's own success. Before any fact
+    publication, the exact outcome and judged head are saved in the gate's
+    `gate_progress` evidence entry. A failed fact write, edge payment, or
+    receipt save leaves the attempt **interrupted**, with its debt retained.
+    Resume retries that evidence without running commands or spending another
+    fix or rescue cycle. A completed receipt is reused, including across a
+    restart; an edge that landed just before a failed receipt save is recovered
+    by reading the fact. Legacy rescue entries still carry their per-issue
+    discharge state, so they remain resumable without double counting.
+
+    Fresh facts omit occurrence edges from their initial publication. Every
+    occurrence is paid through the guarded edge door, including fresh facts:
+    remotely `POST /v1/nodes/:id/edges/live`, with a `target_guard: live`
+    acknowledgement. An older server returns 404 without mutating the graph.
+    The server tests liveness inside its mutation queue; the local graph door
+    checks its current snapshot synchronously before appending. A target that
+    settled after selection advances to a live recurrence rung. A historical
+    edge remains paid after its target settles, so replay never manufactures
+    another occurrence on the next rung. The fact's body, head and gate
+    definition must still match; only the known occurrence edges are ignored
+    when reconciling that evidence identity.
+
+  The flake issue is the one node a gate files whose id and body are keyed on
+  the failing FILES rather than on the run — a flake is a property of the
+  file, so the same file flaking on ten dispatches converges on ONE issue
+  instead of ten near-duplicates. The occurrence count is that issue's inbound
+  `relates-to` edges from the gate facts, each of which carries the run, the
+  item and the evidence. It is routed to the factory's `test_lane_profile`,
+  because fixing a flaky test is a test change and must not come from the
+  implementer's lane. The convergence is RECONCILED against settled state
+  rather than taken on the strength of the id: the candidate is read first,
+  and an id occupied by LIVE work is linked (never rewritten — for every other
+  node a gate files an occupied id is a refusal, since adopting a stranger's
+  approval item would pass a gate nobody looked at, but this id is keyed on
+  the failing files and on nothing else, so the occupant is this flake's issue
+  by construction), while an id whose occupant is already RESOLVED or CLOSED
+  advances to a recurrence rung (`…-r2`, `…-r3`) that links back to it — a
+  fresh occurrence hung on a terminal node is no signal at all. A file that
+  has been closed and reopened past every rung is reported unfiled, which
+  charges the failure and gets a person, the right answer for a test that
+  keeps coming back.
+
+  That reconciliation is only as good as the read behind it, so a read that
+  did not HAPPEN settles nothing. "No such node" and "could not look" are
+  different answers (a 404 versus a transport error or a 5xx; ENOENT versus an
+  I/O fault), and an occupant that could not be read is reported unfiled — not
+  written past as if absent, not linked as if live, not climbed over as if
+  settled. The write is not a second chance at that question: its door reports
+  an id that was already occupied as a SUCCESS (`if_exists: skip` remotely,
+  identical-content adoption locally), so believing it would adopt whatever is
+  there unread — which for a resolved occupant is the very thing this
+  reconciliation exists to prevent. A write that created NOTHING therefore
+  sends the id back through the read once and lets the same live / settled /
+  unreadable rule decide. That also covers the check-then-write RACE: two
+  workers tripping over the same flaky file both read the id as free, and the
+  loser's skip is read back rather than reported as a filing.
+
+  Declaring nothing keeps the pre-existing behaviour exactly: with no
+  `isolate` the runner never runs an extra command. What it DOES do for every
+  command gate, declared or not, is put the failing file paths on the charged
+  failure's outcome — flake telemetry aggregatable by file, where before the
+  record said only that `npm test` exited 1.
 
 The suite's environment says what it is judging: `SPOR_GATE_BASE` and
 `SPOR_GATE_HEAD` (the shas), `SPOR_TRUSTED_REF`, `SPOR_GATE_STAGE` (`gate`,
 or `integration` for the candidate suite, where base/head are the target
 ref's tip and the candidate), and `SPOR_GATE_NODE`, beside `CI=1` and
 `SPOR_GATE=<id>` — enough for a script to diff and decide what to run.
+`SPOR_GATE_ISOLATE=1` is set only for an `isolate` re-run, so a suite that
+wants to skip its own setup for a single-file pass can tell the two apart.
 
 Step 3 is belt and braces — step 2 already refuses a branch that touched those
 paths — and that is the point: the guarantee that the suite is the trusted ref's

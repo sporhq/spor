@@ -2207,3 +2207,180 @@ test("canonicalJson sorts keys recursively, drops undefined, and definitionDiges
   assert.strictEqual(gates.definitionDigest({ a: 1, b: 2 }), gates.definitionDigest({ b: 2, a: 1 }));
   assert.match(gates.definitionDigest({}), /^sha256:[0-9a-f]{64}$/);
 });
+
+// --- the off-diff flake pass (task-spor-factory-flake-rescue-should-not-burn-
+// when-failure-is-off-diff) ---
+//
+// The properties worth pinning are the ones that keep this from laundering a
+// real failure into a flake: it reads PATHS and nothing else, it only ever
+// finds FEWER files when it is unsure, and "off-diff" is a claim it refuses to
+// make unless it read at least one file and the change touches none of them.
+
+test("failingFiles reads the repo-relative source paths a suite's failure names, and drops everything outside the judged tree", () => {
+  const out = [
+    "\u001b[31m✖ the launch handshake (40001.2ms)\u001b[0m",
+    "  AssertionError [ERR_ASSERTION]: the record was never written",
+    "      at TestContext.<anonymous> (/tmp/gate-tree/test/codex-dispatch.test.js:120:5)",
+    "      at node:internal/test_runner/test:1050:5",
+    "      at Module._compile (/tmp/gate-tree/node_modules/foo/index.js:3:1)",
+    "      at run (./lib/shell/dispatch.js:9:2)",
+    "      at fetch (https://example.com/some/page.js:1:1)",
+    "✖ failing tests:",
+    "",
+    "test/codex-dispatch.test.js:118:1",
+    "ℹ pass 1022",
+  ].join("\n");
+  assert.deepStrictEqual(gates.failingFiles(out, { dir: "/tmp/gate-tree" }), [
+    "test/codex-dispatch.test.js",
+    "lib/shell/dispatch.js",
+  ], "the absolute frame folds onto the relative one, node_modules and an internal frame are dropped, and ./ is normalized");
+  // A URL survives ONLY because it has no tree to be outside of; with the root
+  // known it is absolute-and-elsewhere, which is exactly the drop rule.
+  assert.ok(!gates.failingFiles(out, { dir: "/tmp/gate-tree" }).some((f) => f.includes("example.com")));
+  // With no root, every absolute path is unresolvable and dropped — the
+  // direction that finds fewer files, so the caller cannot claim off-diff on
+  // paths it could not place.
+  assert.deepStrictEqual(gates.failingFiles(out), ["lib/shell/dispatch.js", "test/codex-dispatch.test.js"]);
+  assert.deepStrictEqual(gates.failingFiles(""), []);
+  assert.deepStrictEqual(gates.failingFiles("npm test exited 1\nFailed tasks: server:test"), [], "an exit-code-only failure names nothing");
+  assert.strictEqual(gates.failingFiles(Array.from({ length: 200 }, (_, i) => `✖ boom\ntest/f${i}.test.js:1:1`).join("\n")).length, 20, "bounded");
+});
+
+// The single most dangerous way this could launder a red suite: a whole-suite
+// run prints a line per file it RAN, and a set of PASSING files is trivially
+// off-diff and trivially passes in isolation. Collection is therefore scoped to
+// the failure's own region, never to every path in the log.
+test("failingFiles collects from the FAILURE's region only — a passing file's own line, and the block under it, are never the failure's files", () => {
+  const tap = [
+    "TAP version 13",
+    "# Subtest: test/passes-first.test.js",
+    "    ok 1 - a thing that throws TypeError on bad input",
+    "    1..1",
+    "ok 1 - test/passes-first.test.js",
+    "  ---",
+    "  duration_ms: 12.3",
+    "  location: 'test/passes-first.test.js:1:1'",
+    "  ...",
+    "# Subtest: test/flaky.test.js",
+    "    not ok 1 - the launch handshake",
+    "      ---",
+    "      location: 'test/flaky.test.js:120:5'",
+    "      error: 'the record was never written'",
+    "      ...",
+    "not ok 2 - test/flaky.test.js",
+    "  ---",
+    "  failureType: 'subtestsFailed'",
+    "  ...",
+    "# pass 1021",
+    "# fail 1",
+  ].join("\n");
+  assert.deepStrictEqual(gates.failingFiles(tap), ["test/flaky.test.js"], "only the file the run said NOT OK");
+  // The same property in the spec reporter's vocabulary, where a passing file
+  // is a group heading and its passing test NAMES may carry failure words.
+  const spec = [
+    "▶ test/passes-first.test.js",
+    "  ✔ rejects with an AssertionError (2ms)",
+    "  location: test/passes-first.test.js:4:1",
+    "◀ test/passes-first.test.js (9ms)",
+    "▶ test/flaky.test.js",
+    "  ✖ the launch handshake (40001ms)",
+    "    AssertionError: the record was never written",
+    "        at TestContext.<anonymous> (test/flaky.test.js:120:5)",
+    "◀ test/flaky.test.js (40s)",
+  ].join("\n");
+  assert.deepStrictEqual(gates.failingFiles(spec), ["test/flaky.test.js"]);
+});
+
+test("offDiffRuns folds EVERY failed run, so an on-diff failure on one run is never overwritten by an off-diff one on the next", () => {
+  const onDiffRun = "✖ boom\n  at x (lib/kernel/queue.js:3:1)\n  at y (test/queue.test.js:9:1)";
+  const offDiffRun = "✖ boom\n  at x (test/flaky.test.js:9:1)";
+  const changed = ["lib/kernel/queue.js"];
+  assert.strictEqual(gates.offDiffRuns([offDiffRun, offDiffRun], changed).offDiff, true, "both runs failed off the diff");
+  const mixed = gates.offDiffRuns([onDiffRun, offDiffRun], changed);
+  assert.strictEqual(mixed.offDiff, false, "run 1 named a file the change edits — the claim has to hold for every run");
+  assert.deepStrictEqual(mixed.onDiff, ["lib/kernel/queue.js"]);
+  // A run whose output named nothing readable leaves the set unreadable: there
+  // is no off-diff claim to be made about a run that could not be read.
+  const unread = gates.offDiffRuns([offDiffRun, "Failed tasks: server:test"], changed);
+  assert.deepStrictEqual([unread.offDiff, unread.unreadable], [false, true]);
+  assert.strictEqual(gates.offDiffRuns([], changed).offDiff, false);
+});
+
+test("mentionsChanged is the reference half of off-diff: it fails CLOSED on every spelling of a path a test could use", () => {
+  const changed = ["bin/spor.js", "lib/kernel/gates.js"];
+  assert.deepStrictEqual(gates.mentionsChanged('const CLI = path.join(__dirname, "..", "bin", "spor.js");', changed), ["bin/spor.js"], "a segmented path.join spelling — the shape the refusal that prompted this feature had");
+  assert.deepStrictEqual(gates.mentionsChanged('require("../lib/kernel/gates.js")', changed), ["lib/kernel/gates.js"]);
+  assert.deepStrictEqual(gates.mentionsChanged("// see bin/spor.js for why", changed), ["bin/spor.js"], "a comment counts: the question is whether the change is implicated, not how");
+  assert.deepStrictEqual(gates.mentionsChanged('const g = require("../lib/kernel/gates");', changed), ["lib/kernel/gates.js"], "an extensionless specifier");
+  assert.deepStrictEqual(gates.mentionsChanged("const x = 1;\n// unrelated\n", changed), []);
+  assert.deepStrictEqual(gates.mentionsChanged("gates and spor are words in prose", changed), [], "a bare word is not a reference — only a path, a basename token or a quoted specifier");
+  assert.deepStrictEqual(gates.mentionsChanged("", changed), []);
+});
+
+test("referencedCandidates names the local files a source itself points at, one hop out", () => {
+  const src = 'require("./helpers/launch");\nconst {x} = require("../lib/shell/dispatch-harnesses.js");\nfs.readFileSync("test/fixtures/a.json");\nrequire("node:fs");\nrequire("../node_modules/foo/index.js");';
+  const got = gates.referencedCandidates(src, "test/codex-dispatch.test.js");
+  assert.ok(got.includes("lib/shell/dispatch-harnesses.js"), "a relative specifier resolves against the file's own directory");
+  assert.ok(got.includes("test/helpers/launch.js"), "an extensionless specifier gets the extensions a resolver would try");
+  assert.ok(!got.some((p) => p.includes("node_modules")), "a dependency is never a hop");
+  assert.deepStrictEqual(gates.referencedCandidates("", "test/a.test.js"), []);
+});
+
+test("offDiffFailure claims off-diff only when it read a file AND the change touches none of them", () => {
+  const off = gates.offDiffFailure(["test/codex-dispatch.test.js"], ["lib/kernel/queue.js", "API.md"]);
+  assert.deepStrictEqual([off.offDiff, off.onDiff], [true, []]);
+  const on = gates.offDiffFailure(["test/queue.test.js", "lib/kernel/queue.js"], ["lib/kernel/queue.js"]);
+  assert.deepStrictEqual([on.offDiff, on.onDiff], [false, ["lib/kernel/queue.js"]], "one touched file is enough to make the whole failure the change's to answer for");
+  assert.strictEqual(gates.offDiffFailure([], ["lib/x.js"]).offDiff, false, "a failure that named nothing is never off-diff");
+  assert.strictEqual(gates.offDiffFailure(null, null).offDiff, false);
+  assert.strictEqual(gates.offDiffFailure(["test\\win.test.js"], ["test/win.test.js"]).offDiff, false, "separators are normalized before the comparison");
+});
+
+test("isolatableTests takes TEST files only, and only while there are few enough of them for 'flake' to be the likelier reading", () => {
+  assert.deepStrictEqual(gates.isolatableTests(["test/a.test.js", "lib/kernel/queue.js", "spec/b_spec.rb", "tests/test_c.py"]), ["test/a.test.js", "spec/b_spec.rb", "tests/test_c.py"], "a lib path scraped from a stack frame is never handed to a test runner (where a file with no tests in it exits 0)");
+  assert.deepStrictEqual(gates.isolatableTests(["lib/a.js", "lib/b.js"]), []);
+  assert.deepStrictEqual(gates.isolatableTests(Array.from({ length: 6 }, (_, i) => `test/f${i}.test.js`)), [], "six files failing at once is a breakage, not a flake");
+  assert.strictEqual(gates.isolatableTests(Array.from({ length: 6 }, (_, i) => `test/f${i}.test.js`), { max: 6 }).length, 6);
+});
+
+test("isolateCommand fills the declared {files} token, and refuses a template or a file set that cannot make one", () => {
+  assert.strictEqual(gates.isolateCommand({ isolate: "node --test {files}" }, ["test/a.test.js", "test/b.test.js"]), "node --test 'test/a.test.js' 'test/b.test.js'");
+  assert.strictEqual(gates.isolateCommand({ isolate: "npx jest {files} --ci" }, ["a.test.js"]), "npx jest 'a.test.js' --ci");
+  assert.strictEqual(gates.isolateCommand({ isolate: "node --test {files}" }, []), "");
+  assert.strictEqual(gates.isolateCommand({ isolate: "npm test" }, ["a.test.js"]), "", "a template with no token has nowhere to put them");
+  assert.strictEqual(gates.isolateCommand({}, ["a.test.js"]), "");
+  assert.strictEqual(gates.isolateCommand({ isolate: "t {files}" }, ["it's.test.js"]), "t 'it'\\''s.test.js'", "single-quoted regardless of what the extractor's character class already guarantees");
+});
+
+test("a command gate's `isolate` must carry a {files} token, and a factory that gets it wrong refuses to start", () => {
+  const ok = gates.parseFactory(factoryBody({ ...INLINE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: " node --test {files} " }] }), { id: "factory-demo" });
+  assert.deepStrictEqual(ok.errors, []);
+  assert.strictEqual(ok.factory.gates[0].isolate, "node --test {files}");
+  const bad = gates.parseFactory(factoryBody({ ...INLINE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test" }] }), { id: "factory-demo" });
+  assert.match(bad.errors.join("\n"), /must carry a \{files\} token/);
+  assert.strictEqual(bad.factory, null);
+  // Declaring nothing is the default posture: no template, and the runner's
+  // isolation pass is gated on it, so an existing factory is unchanged.
+  const bare = gates.parseFactory(factoryBody({ ...INLINE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] }), { id: "factory-demo" });
+  assert.strictEqual(bare.factory.gates[0].isolate, "");
+});
+
+test("describeFailingFiles is the per-file telemetry a charged failure carries, and says nothing when it read nothing", () => {
+  const off = gates.offDiffFailure(["test/a.test.js"], ["lib/x.js"]);
+  assert.match(gates.describeFailingFiles(off), /names 1 file\(s\) — test\/a\.test\.js — none of which the change touches/);
+  assert.match(gates.describeFailingFiles(off, { ok: false, files: ["test/a.test.js"], reason: "exited 1" }), /re-running test\/a\.test\.js on its own \(exited 1\) failed too/);
+  assert.strictEqual(gates.describeFailingFiles(off, { ok: true, files: ["test/a.test.js"] }).includes("failed too"), false, "an isolated PASS is a flake, never a charged failure");
+  const on = gates.offDiffFailure(["lib/x.js"], ["lib/x.js"]);
+  assert.match(gates.describeFailingFiles(on), /1 of which the change touches \(lib\/x\.js\)/);
+  assert.strictEqual(gates.describeFailingFiles(gates.offDiffFailure([], [])), "");
+  assert.strictEqual(gates.describeFailingFiles(null), "");
+});
+
+test("describeFlake says what failed, that the change does not touch it, that it passed alone — and where the flake was filed", () => {
+  const d = gates.describeFlake("npm test", "node --test 'test/a.test.js'", ["test/a.test.js"], "issue-flake-test-a-test-js-abcd1234");
+  assert.match(d, /`npm test` failed on test\/a\.test\.js, which the change does not touch/);
+  assert.match(d, /passed on the same tree/);
+  assert.match(d, /not a failure of the change/);
+  assert.match(d, /filed as issue-flake-test-a-test-js-abcd1234/);
+  assert.doesNotMatch(gates.describeFlake("npm test", "x", ["test/a.test.js"]), /filed as/);
+});
