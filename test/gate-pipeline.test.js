@@ -9731,7 +9731,7 @@ test("mandatory flake payment and durable receipt precede execution settlement a
       };
       fresh.deps.recordFact = async () => { actions.push("bare-fact"); return { ok: true, linked: paid ? ["issue-one"] : [] }; };
       fresh.deps.linkFact = async () => { actions.push("payment"); if (armed && fault === "payment") return { ok: false }; paid = true; return { ok: true }; };
-      fresh.deps = require("../bin/spor.js").reportingGateDeps(fresh.deps, { gateSettled: async (id, verdict, options) => { settlements.push({ id, verdict, options }); assert.equal(saved.evidence.complete, true, "settlement requires durable complete payment receipt"); }, rescueStarted: async () => {} });
+      fresh.deps = require("../bin/spor.js").reportingGateDeps(fresh.deps, { gateSettled: async (id, verdict, options) => { settlements.push({ id, verdict, options }); assert.equal(saved.evidence.complete, true, "settlement requires durable complete payment receipt"); return { ok: true }; }, rescueStarted: async () => {} });
       return fresh;
     };
     const first = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: worker().deps });
@@ -9764,4 +9764,46 @@ test("completed flake receipt restored during rewind has one verdict per gate an
   assert.equal(f.seen.fixes.length, 1);
   assert.deepEqual(result.gates.map(r => [r.gate, r.head]), [["fast", b], ["later", b]]);
   assert.equal(result.facts.filter(id => id === "paid-original").length, 1, "original fact remains evidence without an extra verdict");
+});
+
+
+test("rejected or throwing settlement stays retryable when a receipt is adopted again", async (t) => {
+  for (const mode of ["refused", "throws", "queued"]) await t.test(mode, async () => {
+    const f = repinWorld();
+    let fastCalls = 0;
+    f.deps = require("../bin/spor.js").reportingGateDeps(f.deps, {
+      candidateSubmitted: async () => ({ ok: true }),
+      gateSettled: async (id) => {
+        if (id !== "fast") return { ok: true };
+        fastCalls++;
+        if (fastCalls === 1) {
+          if (mode === "throws") throw new Error("store write refused");
+          return mode === "queued" ? { ok: false, deferred: true, pending: 1 } : { ok: false };
+        }
+        return { ok: true };
+      },
+    });
+    const result = await gateRunner.runGatePipeline({ item: ITEM, factory: f.factory, deps: f.deps });
+    assert.equal(result.state, "passed");
+    assert.equal(fastCalls, mode === "queued" ? 1 : 2, "only acknowledged or durable queued reporting is deduplicated");
+  });
+});
+
+test("rescue publication reports execution history after its fact is confirmed", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "test", cycles: 0, reruns: 0 }], rescue: RESCUE });
+  let rescued = false;
+  const f = withRescue(fakes({ suite: () => ({ ok: rescued }) }), () => {
+    rescued = true;
+    return { ok: true, runId: "run-rescue-1", category: "real-defect", fixed: true };
+  });
+  const events = [];
+  f.deps = require("../bin/spor.js").reportingGateDeps(f.deps, {
+    gateSettled: async (_id, verdict) => { events.push(verdict); return { ok: true }; },
+    rescueStarted: async (n) => {
+      assert.ok(f.seen.facts.some(fact => fact.id.startsWith("art-rescue-")), "fact publication precedes execution reporting");
+      events.push(`rescue-${n}`); return { ok: true };
+    },
+  });
+  assert.equal((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps })).state, "passed");
+  assert.deepEqual(events, ["failed", "rescue-1", "passed"]);
 });

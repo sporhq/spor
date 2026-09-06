@@ -16788,11 +16788,12 @@ function reportingGateDeps(deps, reporter) {
     if (deps.gateEvidenceRecorded) await deps.gateEvidenceRecorded(args);
     try {
       const gate = args && args.gate;
-      if (gate && gate.kind === "rescue") await reporter.rescueStarted(Number(args.rescue) || 1);
-      else if (gate && gate.id) await reporter.gateSettled(gate.id, args.verdict, { candidateId: args.candidate_id || null });
+      if (gate && gate.kind === "rescue") return await reporter.rescueStarted(Number(args.rescue) || 1);
+      if (gate && gate.id) return await reporter.gateSettled(gate.id, args.verdict, { candidateId: args.candidate_id || null });
     } catch {
-      /* fail-soft: the reporter owns its execution publication outbox */
+      // Fail-soft for the verdict, but preserve the caller's reporting retry.
     }
+    return { ok: false };
   };
   if (deps.escalate) {
     wrapped.escalate = async (args) => {
