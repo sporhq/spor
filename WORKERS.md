@@ -4069,7 +4069,9 @@ record. Gate, implementation, completion, native/contract settlement and final
 run bookkeeping all share the same record lock, including their read/merge.
 
 A re-gate publishes its PID and process start ticks before atomically reopening
-the prior verdict. Other workers therefore recognize its live ownership. Its
+the prior verdict. Reopening refuses while the prior judgement still owes an
+attestation outbox; replay that evidence through its original graph first.
+Other workers therefore recognize its live ownership. Its
 final bookkeeping and recovery mutations retain the same ownership nonce; a
 losing re-gate cannot overwrite the successor. Human approval requests name
 and key their identity on the exact judged commit, so a fix that changes the

@@ -293,3 +293,23 @@ test("atomic reopen rejects a stale snapshot and a live settler, while mismatch 
   assert.equal(runner.claimGateRecord(f.home, f.item.run_id, { workerId: "racer", reopen }).ok, false);
   assert.equal(runner.readJson(f.file).gate_settle_id, winner.token);
 });
+
+test("re-gating cannot overwrite an unpaid signed outbox; matching-origin replay must finish first", async () => {
+  const f = fixture();
+  const verdict = { ...f.gateResult, state: "failed", reason: "prior review refused" };
+  const pending = cli.prepareRunAttestation(f.cfg, { item: f.item, factory: f.factory, gateResult: verdict, intResult: null });
+  pending.built = att.buildAttestationNode({ item: f.item, factory: f.factory, gate: verdict, signing: { key: "original-debt-secret", keyId: "old-judge" } });
+  cli.settleRunRecord(f.home, f.item.run_id, verdict, "w", { token: "winner", pending });
+  const before = fs.readFileSync(f.file, "utf8");
+  const reopen = { settleId: "winner", regateCount: 0, state: "failed" };
+  const tryReopen = () => runner.claimGateRecord(f.home, f.item.run_id, { workerId: "new-attempt", reopen });
+  assert.match(tryReopen().refused, /publication is still owed.*original graph/);
+  assert.equal(fs.readFileSync(f.file, "utf8"), before, "neither nonce nor signed bytes nor attempt changed");
+  await cli.replayAttestationDebts({ mode: () => "local", nodesDir: () => path.join(f.home, "foreign") }, { home: f.home });
+  assert.equal(fs.readFileSync(f.file, "utf8"), before, "foreign graph cannot discharge debt to permit reopen");
+  assert.equal(tryReopen().ok, false);
+  await cli.replayAttestationDebts(f.cfg, { home: f.home });
+  assert.equal(fs.readFileSync(path.join(f.home, "nodes", `${pending.built.id}.md`), "utf8"), pending.built.markdown);
+  assert.equal(tryReopen().ok, true);
+  assert.equal(runner.readJson(f.file).gate_regate_count, 1);
+});
