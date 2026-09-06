@@ -152,3 +152,27 @@ for (const body of ['', '{malformed']) for (const readbackFails of [false, true]
     assert.equal(cleanups, 1); assert.equal(debts(home).length, 0); assert.equal(posts, 1, 'receipt recovery does not replay person authority');
   });
 }
+
+
+test('actual adapter returns definitive unauthorized force refusal without cleanup debt', async t => {
+  const { home, args, engine } = setup(t);
+  const backend = engine({ person: 'person-operator' });
+  const id = (await backend.open(args)).execution.execution_id;
+  let gets = 0, posts = 0;
+  const server = require('node:http').createServer(async (req, res) => {
+    res.setHeader('content-type', 'application/json');
+    if (req.method === 'GET') { gets++; res.end(JSON.stringify(await backend.get(id))); return; }
+    posts++; req.resume(); res.writeHead(401);
+    res.end(JSON.stringify({ error: { code: 'unauthorized', message: 'credential revoked' } }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: `http://127.0.0.1:${server.address().port}`, SPOR_TOKEN: 'revoked-credential' } });
+  const cli = require('../bin/spor.js'), origin = cli.attestationGraphOrigin(cfg);
+  const adapter = store.openExecutionStore(cli.attestationPublicationConfig(cfg, origin), { home: path.join(home, 'client') });
+  const result = await personForceRelease({ home, store: adapter, origin, nodeId: args.node_id, executionId: id, reason: 'Cancel', clearHold: async () => { throw new Error('must not clean a refused release'); } });
+  assert.equal(result.ok, false); assert.match(result.reason, /credential revoked|unauthorized/);
+  assert.equal(result.pending, undefined); assert.equal(debts(home).length, 0);
+  assert.equal(posts, 1); assert.equal(gets, 1);
+  assert.equal((await backend.get(id)).execution.released_at, undefined);
+});
