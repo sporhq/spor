@@ -127,3 +127,59 @@ test("worker stays alive through unavailable-to-available transition without cla
   assert.ok(skipped.some((s) => s.reason === "store offline" && s.kind === "availability" && Date.parse(s.until) > Date.parse(s.at)));
   assert.equal(fs.existsSync(path.join(f.home, "journal", "dispatch")), false, "unavailable work did not create a run record");
 });
+
+test("HEAD 405 falls back to authenticated bounded GET and releases every response body", async () => {
+  for (const [status, expected] of [[401, false], [403, false], [405, false], [404, true], [200, true], [206, true]]) {
+    const calls = [], released = [];
+    const result = await availability.probeHttpStore("https://example.test/store", { bearer: "probe-token", fetcher: async (_url, options) => {
+      calls.push(options);
+      const responseStatus = options.method === "HEAD" ? 405 : status;
+      return { status: responseStatus, ok: responseStatus >= 200 && responseStatus < 300, body: { cancel: async () => released.push(options.method) } };
+    } });
+    assert.equal(result.ok, expected, `GET ${status}`);
+    assert.deepEqual(calls.map(c => c.method), ["HEAD", "GET"]);
+    assert.deepEqual(released, ["HEAD", "GET"]);
+    assert.equal(calls[1].headers.Authorization, "Bearer probe-token");
+    assert.equal(calls[1].headers.Range, "bytes=0-0");
+    assert.equal(calls[1].signal, calls[0].signal, "one deadline spans the fallback");
+    assert.equal(calls[1].redirect, "error");
+    assert.ok(calls.every(c => c.body === undefined));
+  }
+});
+
+test("propose checks its local target before probing the remote and recovers without fetching", async () => {
+  const f = fixture(); let local = false; const calls = [];
+  const definition = { integration: { mode: "propose", targetRef: "origin/main" } };
+  const git = (_cwd, args, opts) => {
+    calls.push(args);
+    assert.equal(opts.timeout, availability.PROBE_TIMEOUT_MS);
+    return { status: args[0] === "rev-parse" && !local ? 1 : 0 };
+  };
+  const missing = await availability.probeFactoryAvailability({ ...f.args, factory: definition }, { git });
+  assert.equal(missing.ok, false);
+  assert.match(missing.reason, /does not resolve/);
+  assert.deepEqual(calls, [["rev-parse", "--verify", "origin/main^{commit}"]]);
+  local = true; calls.length = 0;
+  assert.equal((await availability.probeFactoryAvailability({ ...f.args, factory: definition }, { git })).ok, true);
+  assert.deepEqual(calls, [["rev-parse", "--verify", "origin/main^{commit}"], ["ls-remote", "--exit-code", "origin", "refs/heads/main"]]);
+});
+
+test("candidate remote probe stays below its output bound with thousands of advertised refs", async () => {
+  const f = fixture();
+  const { gitSpawn } = require("../lib/shell/git-exec.js");
+  const init = gitSpawn(f.cwd, ["init", "--bare", "--initial-branch=main"]);
+  assert.equal(init.status, 0, init.stderr);
+  const hash = "a".repeat(40);
+  fs.writeFileSync(path.join(f.cwd, "packed-refs"), ["# pack-refs with: peeled fully-peeled sorted", `${hash} refs/heads/main`, ...Array.from({ length: 7000 }, (_, i) => `${hash} refs/tags/advertised-${String(i).padStart(5, "0")}`)].join("\n") + "\n");
+  const all = gitSpawn(f.cwd, ["ls-remote", f.cwd], { maxBuffer: 256 * 1024 });
+  assert.notEqual(all.status, 0, "fixture reproduces unbounded advertisement overflow");
+  const calls = [];
+  const git = (cwd, args, opts) => {
+    if (args[0] === "remote") return { status: 0, stdout: "https://example.test/repo.git" };
+    calls.push(args);
+    return gitSpawn(cwd, [args[0], f.cwd, ...args.slice(2)], opts);
+  };
+  const result = await availability.probeFactoryAvailability({ ...f.args, factory: factory({ publish: "branch", remote: "origin" }) }, { git });
+  assert.equal(result.ok, true, result.reason);
+  assert.deepEqual(calls, [["ls-remote", "origin", "HEAD"]]);
+});
