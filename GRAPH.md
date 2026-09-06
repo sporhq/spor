@@ -1043,11 +1043,21 @@ date: 2026-06-18
   launcher the client ships no in-code adapter for — a team's modified build,
   an internal wrapper — in which case the profile still carries nothing but the
   id, and each machine that should run it declares `dispatch.harness.<id>`
-  ({`command`, `args`, `label`, `report`, `session`}) in its own
+  ({`command`, `args`, `label`, `report`, `session`, optional `posture`}) in its own
   `$SPOR_HOME/config.json`. **A graph write must never define what a machine
   executes:** a profile carrying `command`, `args`, `argv`, `bin`, `exec`,
   `entrypoint`, `env`, `report`, `session`, `launch_mode` or `identity_mode` is
-  REFUSED by `spor dispatch`, not honoured and not silently ignored. So an org
+  REFUSED by `spor dispatch`, not honoured and not silently ignored.
+  A declaration may add `posture: "unattended" | "attended" | "read-only"`
+  to describe the permissions behavior of its machine-bound command and args.
+  The declaration grants no permissions and changes no argv; the operator
+  must configure the launcher to enforce the stated posture. Preflight uses
+  the same posture rules as built-in adapters: unattended workers require
+  unattended writes, while `--read-only` requires a read-only launcher.
+  Stricter invocation flags are never silently discarded or widened; foreign
+  harness flags still refuse. Omission preserves the existing operator-bound
+  warning and behavior; unknown values are rejected. The capability probe's
+  `machine.harnesses` shape is unchanged. A team
   can publish a profile naming an unadapted harness and only the boxes whose
   OWNER bound that id will take the work (a machine with no binding fails
   satisfiability below).

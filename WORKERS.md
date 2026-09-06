@@ -257,11 +257,14 @@ exists to prevent. Three cases:
 | `attended`, or none resolved at all | **refused**, naming the flags that would fix it | proceeds — a person IS the answer to the prompt |
 | `read-only` under `--read-only` (a review gate) | proceeds — no writes were requested | proceeds |
 
-A **declared** custom harness (`dispatch.harness.<id>`) is operator-bound: v1
-scope fixes its argv and every posture flag is refused by its own
-`validateOptions`, so this client can neither express nor verify a posture for
-it. That is warned about, never refused — and as a `warning:` line, so it can
-never become a refusal reason.
+A **declared** custom harness (`dispatch.harness.<id>`) is operator-bound: its
+fixed command/argv may declare `posture: unattended|attended|read-only`. This
+metadata describes the configured launch; it does not add permission flags or
+grant access. Declared postures use the same preflight checks as built-ins:
+attended/read-only commands cannot satisfy unattended write work, and only a
+read-only declaration can satisfy `--read-only`. Omission preserves the legacy
+operator-bound warning, which never becomes a refusal reason for ordinary
+implementation dispatch. Foreign harness-specific flags remain refused.
 
 **Candidate workspace.** `dispatch.worktree` (repo `.spor.json` first, then the
 standing config, then `--worktree`/`--no-worktree`) decides whether a dispatch
@@ -1545,7 +1548,7 @@ Code's plan mode) — the
 reviewer reads the implementer's live checkout, so it must not be able to write
 to it, and the posture overrides any write-capable `--sandbox`/
 `--permission-mode` the worker's passthrough carries. A harness with NO
-declared posture — a declared custom harness, by v1 scope — is **refused**
+read-only posture — including a custom harness without `posture: read-only` — is **refused**
 before launch, never run write-capable behind a warning: `--read-only` is a
 promise, and a review gate has to route to a harness that can keep it), with a
 prompt that carries everything the reviewer needs

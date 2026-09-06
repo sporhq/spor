@@ -105,6 +105,21 @@ test("a DECLARED custom harness is operator-bound: warned about, never refused (
   assert.match(v.warning, /dispatch\.harness\.myfake\.args/);
 });
 
+test("an optional declared posture uses the built-in worker and attended-rescue checks", () => {
+  for (const posture of ["unattended", "attended", "read-only"]) {
+    const { declaration } = dispatchHarnesses.normalizeHarnessDeclaration("myfake", { command: "/bin/true", posture });
+    const adapter = dispatchHarnesses.declaredAdapter(declaration);
+    const options = { sandbox: "workspace-write", approvalPolicy: "never" };
+    assert.strictEqual(preflight.launchPostureMeaning(adapter, options), posture, "ambient Codex defaults never overwrite the declaration");
+    const worker = preflight.checkWritePosture({ adapter, options, unattended: true });
+    assert.strictEqual(worker.policy, "declared");
+    assert.strictEqual(worker.ok, posture === "unattended");
+    assert.strictEqual(worker.warning, undefined);
+    const rescue = preflight.checkWritePosture({ adapter, options, unattended: true, allowAttended: true });
+    assert.strictEqual(rescue.ok, posture !== "read-only", "attended acknowledgment cannot permit read-only writes");
+  }
+});
+
 test("liveWorkspaceWriters counts only live, write-capable runs in the exact candidate", () => {
   const dir = path.resolve("/tmp/candidate");
   const watching = (r) => r.runner_pid === 111;
@@ -558,6 +573,29 @@ test("the pilot's missing-posture case: an unattended worker refuses a claude-co
     0,
     "and no run was opened"
   );
+});
+
+test("spor work checks a custom harness's optional posture before opening a run", async () => {
+  for (const posture of ["unattended", "attended", "read-only"]) {
+    const f = fixture({ profileHarness: "custom-pre" });
+    fs.writeFileSync(path.join(f.home, "config.json"), JSON.stringify({ dispatch: {
+      repos: { demo: f.repo },
+      harness: { "custom-pre": { command: f.env.SPOR_CLAUDE_CMD, posture, session: "session_id" } },
+    } }));
+    const result = await cliAsync(["work", "--once", "--max", "1", "--interval", "1", "--no-brief"], f.env);
+    assert.strictEqual(result.status, 0, `${result.stderr}\n${result.stdout}`);
+    if (posture === "unattended") {
+      assert.match(result.stdout, /work: dispatched task-ready/);
+      assert.ok(await waitForFile(f.outfile), "the declared launcher ran");
+      const invocation = JSON.parse(fs.readFileSync(f.outfile, "utf8").trim());
+      assert.deepStrictEqual(invocation.args, [], "the posture added no permission flags");
+    } else {
+      assert.match(result.stdout, /work: skipping task-ready/);
+      assert.match(result.stdout, /ATTENDED|read-only/);
+      assert.ok(!fs.existsSync(f.outfile), "the restriction refused before launching");
+      assert.strictEqual(runRecords(f.home).length, 0, "no run or execution opened");
+    }
+  }
 });
 
 test("...and the same item dispatches once the worker is given an unattended posture", async () => {
