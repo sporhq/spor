@@ -83,7 +83,7 @@ Codex test profile.
   return { home, nodes, repo };
 }
 
-function codexStub(home, { delayMs = 0, exitCode = 0, holdFile = null } = {}) {
+function codexStub(home, { delayMs = 0, exitCode = 0, holdFile = null, failText = null, staleReport = false, transientError = null, omitReport = false } = {}) {
   return writeSpawnableNodeStub(home, "codex-stub", `
 const fs = require("node:fs");
 let prompt = "";
@@ -93,7 +93,8 @@ process.stdin.on("end", () => {
   const args = process.argv.slice(2);
   const reportAt = args.indexOf("--output-last-message");
   const report = reportAt >= 0 ? args[reportAt + 1] : null;
-  if (report) fs.writeFileSync(report, "stub final report\\n");
+  const failText = ${JSON.stringify(failText)};
+  if (report && (!failText || ${JSON.stringify(staleReport)}) && !${JSON.stringify(omitReport)}) fs.writeFileSync(report, "stub final report\\n");
   fs.writeFileSync(process.env.OUTFILE, JSON.stringify({
     args,
     cwd: process.cwd(),
@@ -107,10 +108,93 @@ process.stdin.on("end", () => {
     refreshToken: process.env.SPOR_REFRESH_TOKEN || null,
   }, null, 2));
   process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "codex-thread-fixture" }) + "\\n");
+  if (failText) {
+    process.stdout.write(JSON.stringify({ type: "error", message: failText }) + "\\n");
+    process.stdout.write(JSON.stringify({ type: "turn.failed", error: { message: failText } }) + "\\n");
+  } else if (${JSON.stringify(transientError)}) {
+    process.stdout.write(JSON.stringify({ type: "error", message: ${JSON.stringify(transientError)} }) + "\\n");
+    process.stdout.write(JSON.stringify({ type: "turn.completed", usage: {} }) + "\\n");
+  }
   ${stubExitTail({ holdFile, exitCode, delayMs })}
 });
 `);
 }
+
+const CODEX_USAGE_LIMIT = "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 7th, 2026 6:27 AM.";
+
+test("codex declares a failure from a turn.failed event, and from nothing else", () => {
+  const { failureFromEvent } = getHarness("codex");
+  assert.strictEqual(typeof failureFromEvent, "function");
+  assert.deepStrictEqual(
+    failureFromEvent({ type: "turn.failed", error: { message: CODEX_USAGE_LIMIT } }),
+    { reason: `turn.failed: ${CODEX_USAGE_LIMIT}` }
+  );
+  assert.deepStrictEqual(failureFromEvent({ type: "turn.failed" }), { reason: "turn.failed" }, "a bare turn.failed still declares failure");
+  assert.deepStrictEqual(failureFromEvent({ type: "turn.failed", error: "not an object", message: " top-level text " }), { reason: "turn.failed: top-level text" });
+  // A retried request's `error` event is not the turn's end — only turn.failed is.
+  assert.strictEqual(failureFromEvent({ type: "error", message: CODEX_USAGE_LIMIT }), null);
+  assert.strictEqual(failureFromEvent({ type: "turn.completed", usage: {} }), null);
+  assert.strictEqual(failureFromEvent({ type: "item.completed", item: { type: "agent_message", text: "turn.failed" } }), null, "only the event type declares it");
+  assert.strictEqual(failureFromEvent(null), null);
+});
+
+test("a supervised Codex run whose turn.failed carries Codex's usage-limit wording classifies ENVIRONMENT / usage-limit — an outage, never a report-less rejection", async () => {
+  // Run 93f9ca4e, replayed: the review under profile-codex-sol died on
+  // credits, the record read `failed / nonzero-exit / the supervised child
+  // exited 1`, and the review gate — which reads an environment class as an
+  // outage BEFORE it looks for a report — fell through to "left no final
+  // report" and spent a fix cycle on a finding nobody made.
+  const { home, repo } = fixture();
+  const outfile = path.join(home, "codex-invocation.json");
+  const stub = codexStub(home, { delayMs: 100, exitCode: 1, failText: CODEX_USAGE_LIMIT });
+  const result = run(
+    ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--no-brief"],
+    { SPOR_HOME: home, SPOR_CODEX_CMD: stub, OUTFILE: outfile }
+  );
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.ok(await awaitJson(outfile), "the detached stub ran");
+  const settled = await awaitRecord(home, (record) => record.contract_pending === false);
+  assert.ok(settled, "the run settled");
+  assert.strictEqual(settled.state, "failed");
+  assert.strictEqual(settled.exit_code, 1);
+  assert.strictEqual(settled.termination_class, "environment", "credit exhaustion is the environment's fault, not the work's");
+  assert.strictEqual(settled.termination_signal, "usage-limit");
+  assert.match(settled.termination_reason, /hit your usage limit/, "Codex's own wording is retained as the reason");
+  assert.strictEqual(settled.terminal_state, "failed", "never `reported`");
+  assert.ok(!fs.existsSync(settled.report_path), "a failed turn wrote no report, and none is synthesized");
+  assert.match(fs.readFileSync(settled.log_path, "utf8"), /"type":"turn.failed"/, "the log still holds the whole stream");
+  // The gate's reading of that record: an infrastructure outcome on the retry
+  // pool, which the review gate returns as `the review run under <profile>
+  // the harness ended on an environment failure (usage-limit)` instead of
+  // reading a missing report as changes_requested.
+  const gates = require("../lib/kernel/gates.js");
+  const outcome = gates.classifyExecutionOutcome(settled);
+  assert.strictEqual(outcome.outcome, "infrastructure");
+  assert.strictEqual(outcome.pool, "retry");
+  assert.match(outcome.reason, /environment failure \(usage-limit\)/);
+});
+
+test("a supervised Codex run whose turn.failed names no environment signal is the run's own failure, with Codex's message as the reason", async () => {
+  // Exit 0 on purpose: the declared failure alone has to fail the run.
+  const { home, repo } = fixture();
+  const outfile = path.join(home, "codex-invocation.json");
+  const stub = codexStub(home, { delayMs: 100, exitCode: 0, failText: "The model produced an invalid tool call and the turn was aborted." });
+  const result = run(
+    ["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--no-brief"],
+    { SPOR_HOME: home, SPOR_CODEX_CMD: stub, OUTFILE: outfile }
+  );
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.ok(await awaitJson(outfile), "the detached stub ran");
+  const settled = await awaitRecord(home, (record) => record.contract_pending === false);
+  assert.ok(settled, "the run settled");
+  assert.strictEqual(settled.state, "failed");
+  assert.strictEqual(settled.exit_code, 0, "the child exited 0 — the declared failure is what failed the run");
+  assert.strictEqual(settled.termination_class, "failed");
+  assert.strictEqual(settled.termination_signal, "error-result");
+  assert.match(settled.termination_reason, /turn\.failed: The model produced an invalid tool call/);
+  assert.strictEqual(settled.terminal_state, "failed");
+  assert.ok(!fs.existsSync(settled.report_path));
+});
 
 test("dispatch harness registry exposes one uniform adapter contract", () => {
   // The registry is open by design (dec-spor-dispatch-harness-adapter-contract):
@@ -705,4 +789,42 @@ poll();
   fs.writeFileSync(release, "");
   const record = await awaitRecord(home, (r) => /stub, delayed write/.test(r.error || ""));
   assert.ok(record, "the withheld record write lands once released");
+});
+
+test("Codex structured quota codes use the canonical terminal classifier", () => {
+  const adapter = getHarness("codex");
+  for (const error of [{ code: "insufficient_quota" }, { message: "Request refused", code: "insufficient_quota" }, { type: "insufficient_quota" }]) {
+    const failure = adapter.failureFromEvent({ type: "turn.failed", error });
+    assert.equal(runner.classifyTerminalText(failure.reason).signal, "usage-limit");
+  }
+  assert.equal(runner.classifyTerminalText(adapter.failureFromEvent({ type: "turn.failed", error: { code: "invalid_tool_call" } }).reason), null);
+});
+
+test("Codex terminal failure overrides a stale report and exit zero while transient errors and absent reports do not invent outages", async () => {
+  const cases = [
+    { label: "failed-quota-stale-report", options: { failText: CODEX_USAGE_LIMIT, staleReport: true, exitCode: 0 }, state: "failed", classification: "infrastructure", report: true },
+    { label: "transient-error-completed", options: { transientError: CODEX_USAGE_LIMIT, exitCode: 0 }, state: "done", classification: "completed", report: true },
+    { label: "missing-report-failed", options: { omitReport: true, exitCode: 1 }, state: "failed", classification: "failed", report: false },
+    { label: "missing-report-exit-zero", options: { omitReport: true, exitCode: 0 }, state: "done", report: false },
+  ];
+  for (const example of cases) {
+    const { home, repo } = fixture();
+    const outfile = path.join(home, "codex-invocation.json");
+    const stub = codexStub(home, { delayMs: 100, ...example.options });
+    const result = run(["dispatch", "task-codex", "--dir", repo, "--profile", "profile-codex", "--no-brief"], { SPOR_HOME: home, SPOR_CODEX_CMD: stub, OUTFILE: outfile });
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(await awaitJson(outfile), example.label);
+    const record = await awaitRecord(home, (r) => r.contract_pending === false);
+    assert.ok(record, example.label);
+    assert.equal(record.state, example.state, example.label);
+    const classified = require("../lib/kernel/gates.js").classifyExecutionOutcome(record);
+    if (example.classification) assert.equal(classified.outcome, example.classification, example.label);
+    else assert.notEqual(classified.outcome, "infrastructure", "missing output alone creates no retry allowance");
+    assert.equal(fs.existsSync(record.report_path), example.report, example.label);
+    if (example.options.failText) {
+      assert.equal(record.terminal_state, "failed", "a stale file cannot supply a successful report channel");
+      assert.equal(classified.pool, "retry");
+    }
+    if (example.options.transientError) assert.equal(record.termination_class, "completed");
+  }
 });

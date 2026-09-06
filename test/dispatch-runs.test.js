@@ -135,6 +135,15 @@ test("classifyTerminalText: provider credit exhaustion is an ENVIRONMENT failure
 
 test("classifyTerminalText: usage limits, rate limits and rejected auth are environment; ordinary failure is not", () => {
   assert.strictEqual(runner.classifyTerminalText("Claude AI usage limit reached").class, "environment");
+  // Codex's wording of the same exhaustion (run 93f9ca4e's `turn.failed`,
+  // verbatim), and the OpenAI API's error code for it. Unrecognized, a
+  // credit-dead Codex review was a plain nonzero exit and the review gate read
+  // its missing report as a rejection.
+  const codex = runner.classifyTerminalText(JSON.stringify({ type: "turn.failed", error: { message: "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 7th, 2026 6:27 AM." } }));
+  assert.strictEqual(codex.class, "environment");
+  assert.strictEqual(codex.signal, "usage-limit");
+  assert.match(codex.reason, /hit your usage limit/);
+  assert.strictEqual(runner.classifyTerminalText('{"error":{"type":"insufficient_quota","code":"insufficient_quota"}}').signal, "usage-limit");
   assert.strictEqual(runner.classifyTerminalText('{"type":"error","error":{"type":"rate_limit_error"}}').signal, "rate-limited");
   assert.strictEqual(runner.classifyTerminalText("authentication_error: invalid x-api-key").signal, "auth-rejected");
   // A product failure must NOT be laundered into "environment" — that is the
