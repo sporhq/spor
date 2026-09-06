@@ -11710,7 +11710,9 @@ function cmdWorkStatus(cfg, { json }) {
           (w.repos || []).length ? ` [judges ${w.repos.join(", ")}]` : ""
         } — passed ${w.gates.passed || 0}, failed ${w.gates.failed || 0}, blocked ${w.gates.blocked || 0}${
           w.gates.scoped ? `, scoped ${w.gates.scoped}` : ""
-        }${w.gates.parked ? `, parked ${w.gates.parked}` : ""}${w.gates.superseded ? `, superseded ${w.gates.superseded}` : ""}`
+        }${w.gates.parked ? `, parked ${w.gates.parked}` : ""}${w.gates.superseded ? `, superseded ${w.gates.superseded}` : ""}${
+          w.gates.mismatch ? `, mismatch ${w.gates.mismatch}` : ""
+        }`
       );
       // A rejected reload never stops the worker — it keeps enforcing the last
       // definition that DID parse — but an operator staring at `--status` must
@@ -14972,6 +14974,25 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       if (!stamped) return { ok: false, reason: `the candidate for ${entry.node_id} was pinned but could not be stamped onto its run record` };
       return { ok: true, candidate: folded.candidate, change: folded.change };
     },
+    // The TIP candidate as the run record reads NOW (task-spor-integration-
+    // builds-candidate-from-pinned-commit): every pin the gate pipeline made
+    // — its opening one, each fix cycle's, a rescue's — landed on disk AFTER
+    // this closure's `record` was captured, so the captured copy is the
+    // fallback, never the source of truth. `null` means nothing was ever
+    // pinned and the branch head is integrated exactly as it always was.
+    tipCandidate: async () => {
+      let current = record;
+      try {
+        current = dispatchRuns.readJson(dispatchRuns.runPaths(home, entry.run_id).record) || record;
+      } catch {
+        /* an unreadable record falls back to the captured copy, which is the safe direction */
+      }
+      return (current && current.impl_candidate) || null;
+    },
+    // The git facts behind the §4.2 M1 reading; the judgement is the runner's.
+    // `top` is whatever `changedTree` last resolved — the implementer's own
+    // checkout, which is where the pinned commit lives.
+    candidateStanding: async ({ top: from, head, commit, tree }) => integrationRunner.candidateStanding({ top: from || top, head, commit, tree }),
     acquireLease: () => acquireIntegrationLease(cfg, home, top || (record && record.cwd), { slug }),
     releaseLease: (token) => releaseIntegrationLease(cfg, token),
     buildCandidate: async ({ head, targetRef, strategy, mode }) => {
@@ -15068,7 +15089,7 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       completedBeforeIntegration
         ? Promise.resolve({ ok: true, demoted: false, note: `${entry.node_id} was completed at the 'gates' boundary and stays completed; the landing is left for a person (${blockerId})` })
         : gateDemoteItem(cfg, entry.node_id, { blockerId }),
-    escalate: async ({ attempts, detail, evidence }) => {
+    escalate: async ({ attempts, detail, evidence, kind = null, fixCycles = null }) => {
       const id = `task-integration-${stem}-${short}-${gateIdSuffix("integration-escalate", "integration", entry.node_id, runKey)}`.toLowerCase();
       // A lost CAS race is nobody's fix cycle (integration-runner.js never
       // charges it against the cap), so it must not be counted as one here —
@@ -15076,9 +15097,30 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       // fixes would mislead whoever triages it about what actually happened.
       const raced = attempts.filter((a) => a.verdict === "race").length;
       const cycles = attempts.length - raced;
-      const why = cycles
-        ? `its fix cycles are spent (${cycles} attempt${cycles === 1 ? "" : "s"}, cap ${integration.cycles})`
-        : `it lost the landing race ${raced} time${raced === 1 ? "" : "s"} in a row`;
+      // A `mismatch` did not spend its fix cycles — it refused the candidate
+      // rather than failing to land it (task-spor-integration-builds-
+      // candidate-from-pinned-commit) — so it says exactly that rather than
+      // borrowing the spent-cycles wording. It can still arrive MID-pipeline:
+      // the drift is re-checked after every fix cycle's re-pin, so the cycles
+      // spent BEFORE the drift are reported beside it, or the escalation would
+      // claim nothing was spent directly above an `Attempts:` list saying
+      // otherwise.
+      //
+      // The count is the runner's OWN charged-cycle counter (`fixCycles`),
+      // never `attempts.length`: the attempt list is not a cycle log — a
+      // rerun-rescued suite pass pushes an entry of its own — so inferring it
+      // from the list over-reports, and past a couple of reruns prints a
+      // number above the declared cap. An older caller that sends no count
+      // falls back to the inference rather than claiming zero.
+      const mismatchCycles = kind !== "mismatch" ? cycles : Number.isFinite(fixCycles) ? Math.max(0, fixCycles) : Math.max(0, cycles - 1);
+      const why =
+        kind === "mismatch"
+          ? `the branch no longer carries the candidate its gates judged, so there is nothing safe to land${
+              mismatchCycles ? ` (found after ${mismatchCycles} fix cycle${mismatchCycles === 1 ? "" : "s"}, cap ${integration.cycles})` : ""
+            }`
+          : cycles
+          ? `its fix cycles are spent (${cycles} attempt${cycles === 1 ? "" : "s"}, cap ${integration.cycles})`
+          : `it lost the landing race ${raced} time${raced === 1 ? "" : "s"} in a row`;
       const body = [
         `The integration stage could not land ${entry.node_id} onto \`${integration.targetRef}\` — ${why}. A person`,
         "decides what happens next — the worker has stopped retrying it.",
@@ -15098,6 +15140,19 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
         detail ? `Last outcome: ${detail}` : "",
         "",
         ...(evidence ? ["Evidence:", "", "```", fenceSafe(String(evidence).slice(0, 3000)), "```", ""] : []),
+        ...(kind === "mismatch"
+          ? [
+              mismatchCycles
+                ? `Nothing was landed: ${mismatchCycles} fix cycle${mismatchCycles === 1 ? " ran" : "s ran"} and the drift was found on the re-check after${
+                    mismatchCycles === 1 ? " it" : " them"
+                  }, so the`
+                : "Nothing was built and nothing was landed: the stage refused before it cut a candidate worktree, so the",
+              "candidate itself was never judged again and no further cycle or budget was spent on it. Re-pin the",
+              "candidate (re-run the item) or restore the branch to the commit named above, then re-judge with",
+              `'spor work --regate ${entry.run_id}'.`,
+              "",
+            ]
+          : []),
         ...(attempts.length > 1 ? ["Attempts:", ...attempts.map((a, i) => `${i + 1}. ${a.verdict} — ${String(a.detail || "").slice(0, 200)}`), ""] : []),
         `The run's own record is \`${entry.run_id}\` ('spor runs ${entry.run_id}').`,
       ]
@@ -15108,8 +15163,11 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
         id,
         buildGateWorkNode({
           id,
-          title: `Integration escalation — could not land ${entry.node_id}`,
-          summary: `The integration stage could not land ${entry.node_id} onto ${integration.targetRef} after ${attempts.length} attempt(s); it needs a person${detail ? `: ${String(detail).slice(0, 200)}` : "."}`,
+          title: kind === "mismatch" ? `Integration mismatch — ${entry.node_id} drifted off its candidate` : `Integration escalation — could not land ${entry.node_id}`,
+          summary:
+            kind === "mismatch"
+              ? `The integration stage refused to land ${entry.node_id} onto ${integration.targetRef}: the branch no longer carries the candidate its gates judged; it needs a person${detail ? `: ${String(detail).slice(0, 200)}` : "."}`
+              : `The integration stage could not land ${entry.node_id} onto ${integration.targetRef} after ${attempts.length} attempt(s); it needs a person${detail ? `: ${String(detail).slice(0, 200)}` : "."}`,
           body,
           project: slug,
           date: date(),
@@ -17128,7 +17186,9 @@ async function cmdWork(cfg, { values }) {
     out(
       `work: gates — passed ${final.gates.passed}, failed ${final.gates.failed}, blocked ${final.gates.blocked}${
         final.gates.scoped ? `, scoped ${final.gates.scoped}` : ""
-      }${final.gates.parked ? `, parked ${final.gates.parked}` : ""}${final.gates.superseded ? `, superseded ${final.gates.superseded}` : ""} (factory ${factoryId}).`
+      }${final.gates.parked ? `, parked ${final.gates.parked}` : ""}${final.gates.superseded ? `, superseded ${final.gates.superseded}` : ""}${
+        final.gates.mismatch ? `, mismatch ${final.gates.mismatch}` : ""
+      } (factory ${factoryId}).`
     );
   }
   if (final.active.length) out(`work: ${final.active.length} run(s) still in flight — 'spor runs' follows them to their terminal state.`);

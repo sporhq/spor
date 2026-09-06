@@ -1956,6 +1956,27 @@ test("a declined run frees its slot without a gate, is tallied apart, and cools 
   assert.strictEqual(cooled.kind, "outcome");
 });
 
+// task-spor-integration-builds-candidate-from-pinned-commit: the integration
+// stage's `mismatch` refusal is a settled pipeline verdict like any other, so
+// the loop must count it (or an operator staring at `--status` sees a factory
+// whose every item drifted reading "passed 0, failed 0, blocked 0") and cool
+// the item off rather than re-dispatching it.
+test("a `mismatch` pipeline verdict is counted in status.gates and cools the item off — it is settled, not a retry", async () => {
+  const h = harness({
+    queue: [{ id: "task-a", readiness: "agent" }],
+    opts: { concurrency: 1, max: 1 },
+    maxPasses: 6,
+    onTick: (state) => state.finishAll({ terminal_state: "resolved", terminal_enforced: true }),
+    gate: async () => ({ state: "mismatch", reason: "the pinned candidate cand-x is not what this checkout would land", facts: [], escalated_to: "task-integration-escalate-x" }),
+  });
+  const status = await h.run();
+  assert.strictEqual(status.gates.mismatch, 1, "the verdict is counted, not silently dropped by the `!= null` guard");
+  assert.strictEqual(status.gates.passed, 0);
+  const cooled = status.skipped.find((x) => x.id === "task-a");
+  assert.ok(cooled, "a mismatched item does not come straight back to this worker");
+  assert.match(cooled.reason, /gate pipeline mismatch/);
+});
+
 // ------------------------------------------------ pollWorkRuns: idle + grace --
 //
 // The two halves of task-spor-work-idle-run-detection, driven through the real

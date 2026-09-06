@@ -1026,7 +1026,7 @@ written only after the outcome dimension exists):
 
 | Field | Type | Meaning |
 |---|---|---|
-| `gate_state` | string | `"running"` \| `"interrupted"` \| `"passed"` \| `"failed"` \| `"blocked"` \| `"superseded"` \| `"scoped"` — the last thing a gate pipeline said about this run. The three verdicts, `superseded` (an adopted pipeline whose item was already landed by hand, §10.8 — no gate ran) and `scoped` (a verified no-code outcome, §10.11 — no gate ran) are SETTLED; `running`/`interrupted` mean a pipeline started and never reported, which is what a later worker resumes from (§10.8). Propose-mode integration adds `parked` (§10.9) |
+| `gate_state` | string | `"running"` \| `"interrupted"` \| `"passed"` \| `"failed"` \| `"blocked"` \| `"superseded"` \| `"scoped"` \| `"mismatch"` — the last thing a gate pipeline said about this run. The three verdicts, `superseded` (an adopted pipeline whose item was already landed by hand, §10.8 — no gate ran), `scoped` (a verified no-code outcome, §10.11 — no gate ran) and `mismatch` (the branch stopped carrying the pinned candidate its gates judged, §10.9 — nothing was built) are SETTLED; `running`/`interrupted` mean a pipeline started and never reported, which is what a later worker resumes from (§10.8). Propose-mode integration adds `parked` (§10.9) |
 | `gate_worker` | string | the worker id that last touched it |
 | `gate_at` | ISO 8601 | when that stamp was written |
 | `gate_reason` | string | optional — the settled verdict's one-line reason |
@@ -1059,7 +1059,7 @@ it, and §10.7 still demotes it on a refusal. No record is ever rewritten, and
 | `impl_candidates` | object[] | the **chain** of pins, oldest first, **ending at the tip**. A fix cycle or a rescue moves HEAD, and each re-pin onto a new tree appends here; a re-pin onto the SAME tree updates the last entry in place (it is the same candidate — the new commit joins its `commits_seen`). A tree can come back (a fix that reverts a one-hunk change reproduces it exactly), so **one `candidate_id` may appear more than once** — read the chain as an ordered list of pin events, never as a map keyed by id (§10.12) |
 | `impl_claim` | object | **controller completion only** (§10.13) — the claim pins, riding the record's CREATION write in ONE stamp with the initial `impl_state: "dispatched"`, so a record either has all of it or was not created by a stage launch: `{execution_id, claimed_at, completion: {by, after}, publish: {kind, bundle_store, remote}, factory: {node_id, revision}, item_revision, resolving_snapshot, status_snapshot}`. Everything the pipeline enforces is pinned HERE — an edit to the factory node mid-pipeline changes nothing. **A record with no `impl_claim` is a legacy run and reads as `completion.by: agent`.** |
 | `gates_state` | string | `"passed"` \| `"failed"` \| `"blocked"` — the settled verdict of the gate LIST alone, stamped when the list settles and before the integration stage starts. Stamped for every gated run; the fold into `gate_state` stays for legacy readers, but `gate_state: passed` cannot say WHICH boundary was passed and the completion predicate must (§10.13) |
-| `integration_state` | string | `"running"` \| `"landed"` \| `"parked"` \| `"failed"` \| `"refused"` — the integration stage's own verdict, stamped as it runs and settles |
+| `integration_state` | string | `"running"` \| `"landed"` \| `"parked"` \| `"failed"` \| `"refused"` \| `"mismatch"` — the integration stage's own verdict, stamped as it runs and settles. `mismatch` is the one that spent nothing: the branch no longer carries the pinned candidate, so no worktree was cut and no fix cycle ran (§10.9) |
 | `completion_debt` | string \| null | **controller completion only** — ONE field, never a set of booleans: `"write"` (the boundary was reached and the edge + status are owed), `"retract"` (a premature resolving edge is owed its retype), `"withdraw"` (our edge stands on an item abandoned under us and is owed its retype back), or `null`. Every transition is a single overwriting stamp (owe-first), and every pass RE-DERIVES the debt from `impl_claim.completion.after` against `gates_state`/`integration_state` and the graph rather than trusting the flag (§10.13) |
 | `completion_written_at` / `completion_withdrawn_at` / `completion_consumed_at` | ISO 8601 | when the completion settled, and how: written (the CAS landed), withdrawn (a person abandoned or released the item under us; our edge retyped back), consumed (the item was already terminal and released — resolved elsewhere, nothing written). Exactly one is ever set |
 | `completion_resolver` | string | the id of the completion record the controller wrote (`art-completion-<stem>-<candidate>`), content-addressed to the candidate it completed |
@@ -2339,14 +2339,56 @@ to integration with no separate machinery and no separate code path in the
 loop itself. A factory with gates but no integration block is byte-identical
 to what shipped before this stage existed.
 
-**The candidate build.** A throwaway worktree at `merge(target_ref, branch)`
-per the declared strategy — `merge` lands the branch onto the target,
-`rebase` replays the branch's own commits onto it, `squash` folds the branch
-into one commit on top of it. **A merge conflict is a fix-cycle event, not a
+**The candidate build.** A throwaway worktree at `merge(target_ref, <what is
+being integrated>)` per the declared strategy — `merge` lands it onto the
+target, `rebase` replays its own commits onto the target, `squash` folds it
+into one commit on top. **A merge conflict is a fix-cycle event, not a
 terminal error** — it is fed back to the same implementer, through the same
 cycle-cap-then-escalate machinery §10.3's protected-path lane and §10.4's
 review loop already use, because "the branch needs a rebase" is exactly the
 kind of thing the implementer's own context is best placed to fix.
+
+**What is integrated is the PINNED CANDIDATE, not the branch head.** Under a
+declared implementation stage (§10.13) the judged object is the candidate —
+content-addressed on its tree, published under its pinned commit, and named by
+every `art-gate-…` fact that passed it — so the candidate worktree is built at
+`merge(target_ref, impl_candidate.commit)`. A branch that moved on after the
+pin therefore lands nothing extra: the commits on top of the pin were never
+judged, and integration is not the place they first become someone's. **A
+factory with no implementation stage pins nothing, so its build is
+`merge(target_ref, branch)` exactly as it always was** — byte-identical, along
+with a pipeline whose fail-soft pins never landed a candidate at all.
+
+The stage checks, before every build, that the branch it is standing on still
+carries the pinned candidate:
+
+- a branch that merely **advanced** past the pin is fine — the pinned commit is
+  still contained, and it is what lands;
+- a head that is a **same-tree relabel** of the pinned commit (an amend, a
+  re-commit of the same files) is fine too, and deliberately: first-published-
+  wins means the *published* commit is what lands, and its tree is the head's;
+- anything else — a rebase, a reset, a rewrite onto different content, a pinned
+  commit that no longer resolves to its pinned tree, or a reading git could not
+  make at all — is a **`mismatch`**: refused before a lease is taken or a
+  worktree is cut, with **no fix cycle and no budget spent on it**, and
+  escalated to a person naming the candidate, both shas and the locator its
+  reference publishes. It is a settled verdict, not a retry: the evidence is
+  what is wrong, not the code, so re-offering the run would only re-refuse it.
+  The door back is a person, or `spor work --regate <run>` once the branch (or
+  the pin) is put right.
+
+In `propose` mode the bar is higher, because what lands there is the **branch**
+— the PR is opened from the branch head, not from a tree this stage builds — so
+a head that merely *contains* the candidate is a `mismatch` too: it would put
+unjudged commits into the merge.
+
+**Only this stage's own fix cycles re-pin.** An integration fix cycle commits in
+the implementer's checkout, so the per-cycle tree refresh re-pins the candidate
+(stage `integration-fix`, §10.12) and the rebuild merges the commit that re-pin
+named. A re-pin that could not be made leaves no tip, and the refreshed head is
+integrated instead — never the pre-fix candidate, which would silently drop the
+very commit the fix cycle was run to produce. A lost landing race is not a
+re-pin: the rebuild is against the ref's new tip with the same candidate.
 
 **Protected paths are forced, again.** The candidate tree gets the SAME
 guarantee a command gate's tree gets (§10.3): every declared `protected_paths`

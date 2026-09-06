@@ -143,7 +143,7 @@ function integrationFakes({
   escalate = () => ({ ok: true, id: "task-integration-escalate-x" }),
   demote = () => ({ ok: true, demoted: true, note: "task-demo rolled back done -> open" }),
 } = {}) {
-  const seen = { builds: 0, suites: 0, lands: 0, proposals: 0, parks: [], fixes: [], escalations: [], demotions: [], facts: [], cleanups: 0, leaseAcquired: 0, leaseReleased: 0 };
+  const seen = { builds: 0, buildArgs: [], suites: 0, lands: 0, proposals: 0, parks: [], fixes: [], escalations: [], demotions: [], facts: [], cleanups: 0, leaseAcquired: 0, leaseReleased: 0 };
   let buildCalls = 0;
   const deps = {
     now: () => 1_700_000_000_000,
@@ -157,6 +157,7 @@ function integrationFakes({
     },
     buildCandidate: async (args) => {
       seen.builds += 1;
+      seen.buildArgs.push(args);
       const cleanup = () => {
         seen.cleanups += 1;
       };
@@ -1973,6 +1974,374 @@ test("issue-spor-integration-stale-head-across-fix-cycles: a fix-cycle retry reb
   assert.strictEqual(seen.fixes.length, 1);
 });
 
+// ------------------------------------------- integration merges the PINNED commit --
+//
+// task-spor-integration-builds-candidate-from-pinned-commit,
+// FACTORY-IMPLEMENTATION-STAGE.md §3.2 ("everything downstream consumes the
+// PINNED commit, never the branch head") and §4.2 M1 (the mismatch refusal).
+// The judged object is the candidate; a branch that moved after the pin must
+// never be what lands.
+
+const FACTORY_IMPL = { ...FACTORY, implementation: { profile: "profile-impl" } };
+// A pinned candidate whose commit is NOT the branch head: the branch advanced
+// after the pin (`tree.head` is "headsha" in the fakes).
+const PINNED = {
+  candidate_id: "cand-3f9a1c72e5b40d16",
+  commit: "pinnedcommit",
+  tree: "pinnedtree",
+  reference: { kind: "bundle", locator: "file:///home/x/.spor/candidates/cand-3f9a1c72e5b40d16.bundle", verified_at: "2026-09-06T00:00:00Z" },
+};
+// The standing a pinned commit has on a branch that merely ADVANCED past it.
+const ADVANCED = { known: true, contained: true, commitTreeMatches: true, headTreeMatches: false };
+
+function pinnedFakes(opts = {}, { candidate = PINNED, standing = ADVANCED } = {}) {
+  const made = integrationFakes(opts);
+  made.seen.standings = [];
+  made.deps.tipCandidate = async () => candidate;
+  made.deps.candidateStanding = async (args) => {
+    made.seen.standings.push(args);
+    return typeof standing === "function" ? standing(args, made.seen) : standing;
+  };
+  return made;
+}
+
+test("a pinned candidate is what integration merges: the candidate tree is built from impl_candidate.commit, not the branch head", async () => {
+  const { deps, seen } = pinnedFakes();
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_IMPL, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.strictEqual(seen.builds, 1);
+  assert.strictEqual(seen.buildArgs[0].head, "pinnedcommit", "the build merges the PINNED commit, never the branch head the gates never judged");
+  assert.deepStrictEqual(seen.standings, [{ top: "/repo", head: "headsha", commit: "pinnedcommit", tree: "pinnedtree" }]);
+});
+
+test("no candidate pinned — no implementation stage, or a caller with no tipCandidate dep — integrates the branch head exactly as before", async () => {
+  const { deps, seen } = pinnedFakes();
+  // The stage is not declared, so nothing is a tip: byte-identical.
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.strictEqual(seen.buildArgs[0].head, "headsha");
+  assert.deepStrictEqual(seen.standings, [], "nothing is checked when nothing is pinned");
+
+  // Declared, but this caller wires no tip read at all — same door.
+  const bare = integrationFakes();
+  const res2 = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_IMPL, deps: bare.deps });
+  assert.strictEqual(res2.state, "passed", res2.reason);
+  assert.strictEqual(bare.seen.buildArgs[0].head, "headsha");
+});
+
+test("a pinned candidate with no commit on it yet falls back to the branch head rather than building from nothing", async () => {
+  const { deps, seen } = pinnedFakes({}, { candidate: { candidate_id: "cand-x" } });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_IMPL, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.strictEqual(seen.buildArgs[0].head, "headsha");
+  assert.deepStrictEqual(seen.standings, []);
+});
+
+test("the branch head no longer CONTAINS the pinned commit: a MISMATCH — refused before a lease, a worktree or a fix cycle, and escalated to a person", async () => {
+  const { deps, seen } = pinnedFakes({}, { standing: { known: true, contained: false, commitTreeMatches: true, headTreeMatches: false } });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_IMPL, deps });
+  assert.strictEqual(res.state, "mismatch");
+  assert.strictEqual(seen.builds, 0, "nothing is built from a branch that dropped the candidate");
+  assert.strictEqual(seen.leaseAcquired, 0, "the refusal costs no serialization either");
+  assert.strictEqual(seen.fixes.length, 0, "a mismatch is never a fix cycle — the evidence is wrong, not the code");
+  assert.strictEqual(seen.escalations.length, 1);
+  assert.strictEqual(seen.escalations[0].kind, "mismatch", "the escalation is framed as a mismatch, not as spent fix cycles");
+  assert.strictEqual(seen.escalations[0].fixCycles, 0, "nothing was charged before the refusal");
+  assert.match(seen.escalations[0].detail, /cand-3f9a1c72e5b40d16/);
+  assert.match(seen.escalations[0].detail, /no longer contains it/);
+  assert.match(seen.escalations[0].detail, /cand-3f9a1c72e5b40d16\.bundle/, "the locator a reader would fetch is named");
+  assert.strictEqual(seen.facts.length, 1);
+  assert.match(seen.facts[0].markdown, /Integration mismatch/);
+  assert.match(seen.facts[0].markdown, /the branch no longer carries the candidate the gates judged/);
+  assert.strictEqual(seen.demotions.length, 1, "the refusal's graph-state half runs exactly as any other refusal's does");
+});
+
+test("a same-tree RELABEL of the pinned commit is NOT a mismatch — §3.2's first-published-wins lands the published commit", async () => {
+  // The head is an amend of the pinned commit: not contained, same tree.
+  const { deps, seen } = pinnedFakes({}, { standing: { known: true, contained: false, commitTreeMatches: true, headTreeMatches: true } });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_IMPL, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.strictEqual(seen.buildArgs[0].head, "pinnedcommit", "the commit that was PUBLISHED is what lands, not the relabel");
+});
+
+test("a pinned commit that no longer resolves to its pinned TREE is a mismatch — M1's own definition", async () => {
+  const { deps, seen } = pinnedFakes({}, { standing: { known: true, contained: true, commitTreeMatches: false, headTreeMatches: false } });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_IMPL, deps });
+  assert.strictEqual(res.state, "mismatch");
+  assert.strictEqual(seen.builds, 0);
+  assert.match(seen.escalations[0].detail, /no longer resolves to its pinned tree/);
+});
+
+test("a standing git could not read FAILS CLOSED: a tree this stage cannot verify is exactly the tree it must not land", async () => {
+  const { deps, seen } = pinnedFakes({}, { standing: { known: false, contained: null, commitTreeMatches: null, headTreeMatches: null, reason: "the pinned commit is not in /repo" } });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_IMPL, deps });
+  assert.strictEqual(res.state, "mismatch");
+  assert.strictEqual(seen.builds, 0);
+  assert.match(seen.escalations[0].detail, /could not be verified against the branch head/);
+  assert.match(seen.escalations[0].detail, /the pinned commit is not in \/repo/);
+
+  // A dep that THROWS reads the same way — never as "verified".
+  const thrown = pinnedFakes();
+  thrown.deps.candidateStanding = async () => {
+    throw new Error("git exploded");
+  };
+  const res2 = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_IMPL, deps: thrown.deps });
+  assert.strictEqual(res2.state, "mismatch");
+  assert.strictEqual(thrown.seen.builds, 0);
+  assert.match(thrown.seen.escalations[0].detail, /git exploded/);
+});
+
+test("in `propose` mode a head that merely CONTAINS the candidate is a mismatch — the PR lands the branch, so the branch must BE the candidate", async () => {
+  // Exactly the standing that PASSES in local mode (the branch advanced past
+  // the pin): local mode lands the pinned commit and leaves the drift behind,
+  // but a merged PR would carry it.
+  const { deps, seen } = pinnedFakes({}, { standing: ADVANCED });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: { ...FACTORY_PROPOSE, implementation: { profile: "profile-impl" } }, deps });
+  assert.strictEqual(res.state, "mismatch");
+  assert.strictEqual(seen.proposals, 0, "no pull request is opened for a branch carrying commits the gates never judged");
+  assert.match(seen.escalations[0].detail, /`propose` mode lands the branch itself/);
+
+  // The same branch, once the head IS the candidate's tree, proposes as usual.
+  const ok = pinnedFakes({}, { standing: { known: true, contained: true, commitTreeMatches: true, headTreeMatches: true } });
+  const res2 = await integrationRunner.runIntegrationStage({ item: ITEM, factory: { ...FACTORY_PROPOSE, implementation: { profile: "profile-impl" } }, deps: ok.deps });
+  assert.strictEqual(res2.state, "parked", res2.reason);
+  assert.strictEqual(ok.seen.proposals, 1);
+});
+
+test("an integration fix cycle RE-PINS, and the rebuild merges the commit that re-pin named — not the stale tip and not the moved head", async () => {
+  const buildSequence = (args, s) => (s.builds === 1 ? { ok: false, conflict: true, reason: "merging onto main conflicts" } : { ok: true, dir: "/tmp/candidate", sha: "candidatesha", expectedSha: "expected2" });
+  const { deps, seen } = pinnedFakes({ build: buildSequence, tree: { ok: true, top: "/repo", head: "headsha", cwd: "/repo/wt" }, fix: () => ({ ok: true, runId: "run-fix-1" }) });
+  deps.pinCandidate = async () => ({ ok: true, candidate: { candidate_id: "cand-after-fix", commit: "fixedcommit", tree: "fixedtree" }, change: "superseded" });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_IMPL, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.deepStrictEqual(
+    seen.buildArgs.map((b) => b.head),
+    ["pinnedcommit", "fixedcommit"],
+    "the first build merges the tip as it stood; the rebuild merges what the fix cycle's own re-pin named"
+  );
+  // And the re-pinned tip is re-checked against the branch before it is built.
+  assert.deepStrictEqual(seen.standings[1], { top: "/repo", head: "headsha", commit: "fixedcommit", tree: "fixedtree" });
+});
+
+test("a fix cycle whose re-pin FAILS integrates the refreshed head, never the pre-fix candidate that would silently drop the fix", async () => {
+  const buildSequence = (args, s) => (s.builds === 1 ? { ok: false, conflict: true, reason: "merging onto main conflicts" } : { ok: true, dir: "/tmp/candidate", sha: "candidatesha", expectedSha: "expected2" });
+  const { deps, seen } = pinnedFakes({ build: buildSequence, fix: () => ({ ok: true, runId: "run-fix-1" }) });
+  deps.pinCandidate = async () => ({ ok: false, reason: "the run record could not be stamped" });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_IMPL, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.deepStrictEqual(seen.buildArgs.map((b) => b.head), ["pinnedcommit", "headsha"]);
+  assert.strictEqual(seen.standings.length, 1, "with no tip there is nothing left to check the branch against");
+});
+
+test("a lost landing race rebuilds with the SAME pinned candidate — a race is not a re-pin", async () => {
+  const { deps, seen } = pinnedFakes({
+    land: (args, s) => (s.lands === 1 ? { ok: false, race: true, reason: "main moved under us" } : { ok: true, detail: "landed" }),
+  });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_IMPL, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.deepStrictEqual(seen.buildArgs.map((b) => b.head), ["pinnedcommit", "pinnedcommit"]);
+});
+
+test("the drift is RE-CHECKED after every fix cycle's re-pin: a branch rewritten mid-pipeline is a mismatch, and the escalation says what was already spent", async () => {
+  const buildSequence = (args, s) => (s.builds === 1 ? { ok: false, conflict: true, reason: "merging onto main conflicts" } : { ok: true, dir: "/tmp/candidate", sha: "candidatesha", expectedSha: "expected2" });
+  // Clean up front; the fix cycle's own re-pin lands on a branch that dropped it.
+  let checks = 0;
+  const { deps, seen } = pinnedFakes(
+    { build: buildSequence, fix: () => ({ ok: true, runId: "run-fix-1" }) },
+    {
+      standing: () => {
+        checks += 1;
+        return checks === 1 ? { known: true, contained: true, commitTreeMatches: true, headTreeMatches: true } : { known: true, contained: false, commitTreeMatches: true, headTreeMatches: false };
+      },
+    }
+  );
+  deps.pinCandidate = async () => ({ ok: true, candidate: { candidate_id: "cand-after-fix", commit: "fixedcommit", tree: "fixedtree" }, change: "superseded" });
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_IMPL, deps });
+  assert.strictEqual(res.state, "mismatch");
+  assert.strictEqual(seen.builds, 1, "the first build ran; the rebuild never did");
+  assert.strictEqual(seen.fixes.length, 1);
+  assert.strictEqual(seen.escalations[0].kind, "mismatch");
+  // The escalation must not claim nothing was spent when a fix cycle already
+  // ran: the runner reports its OWN charged-cycle count.
+  assert.strictEqual(seen.escalations[0].fixCycles, 1);
+  assert.strictEqual(
+    seen.escalations[0].attempts.filter((a) => a.verdict === "mismatch").length,
+    1,
+    "the mismatch rides the attempt list beside the conflict that preceded it"
+  );
+});
+
+// The escalation PROSE is the thing a person reads, so it is asserted against
+// the REAL escalate closure, not a fake: a mismatch found after a fix cycle
+// must not say "no fix cycle, retry or budget was spent on it".
+test("makeIntegrationDeps' escalate: a mismatch reads as a refusal, and names the cycles already spent when it was found mid-pipeline", async () => {
+  const sporCli = require("../bin/spor.js");
+  const { loadConfig } = require("../lib/config.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-integration-esc-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const factory = { id: "factory-esc", integration: { targetRef: "main", mode: "local", command: "true", strategy: "merge", serialize: "repo", cycles: 2, timeoutMs: 900000 }, trustedRef: "main", protectedPaths: [] };
+  // The escalation id is deterministic per (item, run), so each of the three
+  // readings below needs its own run — otherwise the second write collides
+  // with the first under writeGateNode's same-id-same-content rule.
+  const depsFor = (runId) =>
+    sporCli.makeIntegrationDeps(cfg, {
+      record: { cwd: home },
+      entry: { run_id: runId, node_id: "task-demo", project: "demo", attempt: 1 },
+      factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home,
+    });
+
+  const readNode = (id) => fs.readFileSync(path.join(home, "nodes", `${id}.md`), "utf8");
+
+  const up = await depsFor("11111111-2222-3333-4444-0000000000d1").escalate({ attempts: [{ verdict: "mismatch", detail: "the pinned candidate cand-x is not what this checkout would land" }], detail: "drifted", evidence: "", kind: "mismatch" });
+  assert.strictEqual(up.ok, true, up.reason);
+  const upFront = readNode(up.id);
+  assert.match(upFront, /the branch no longer carries the candidate its gates judged/);
+  assert.doesNotMatch(upFront, /fix cycles are spent/, "a mismatch never borrows the spent-cycles wording");
+  assert.match(upFront, /Nothing was built and nothing was landed/);
+  assert.doesNotMatch(upFront, /found after \d+ fix cycle/, "nothing ran before this one, so nothing is claimed to have");
+
+  // The same refusal, found after a fix cycle: the prose must change.
+  // A rerun-rescued suite pass pushes an attempt entry of its own, so the
+  // count must come from the runner's own charged-cycle counter — inferring it
+  // from `attempts.length` reports two cycles where one ran, and past a couple
+  // of reruns a number above the declared cap.
+  const inflated = await depsFor("11111111-2222-3333-4444-0000000000d4").escalate({
+    attempts: [
+      { verdict: "passed", detail: "the candidate suite passed on rerun 2 of 2" },
+      { verdict: "failed", detail: "could not land" },
+      { verdict: "mismatch", detail: "the pinned candidate cand-x is not what this checkout would land" },
+    ],
+    detail: "drifted after the fix",
+    evidence: "",
+    kind: "mismatch",
+    fixCycles: 1,
+  });
+  assert.strictEqual(inflated.ok, true, inflated.reason);
+  const inflatedBody = readNode(inflated.id);
+  assert.match(inflatedBody, /found after 1 fix cycle, cap 2/);
+  assert.doesNotMatch(inflatedBody, /found after 2 fix cycles/, "the rerun-rescued pass is not a fix cycle");
+
+  const mid = await depsFor("11111111-2222-3333-4444-0000000000d2").escalate({
+    attempts: [
+      { verdict: "conflict", detail: "merging onto main conflicts" },
+      { verdict: "mismatch", detail: "the pinned candidate cand-x is not what this checkout would land" },
+    ],
+    detail: "drifted after the fix",
+    evidence: "",
+    kind: "mismatch",
+    fixCycles: 1,
+  });
+  assert.strictEqual(mid.ok, true, mid.reason);
+  const midBody = readNode(mid.id);
+  assert.match(midBody, /found after 1 fix cycle, cap 2/);
+  assert.match(midBody, /1 fix cycle ran and the drift was found on the re-check/);
+  assert.doesNotMatch(midBody, /Nothing was built/, "a fix cycle DID build and run — the escalation must not claim otherwise");
+
+  // And an ordinary refusal is untouched by any of it.
+  const plain = await depsFor("11111111-2222-3333-4444-0000000000d3").escalate({ attempts: [{ verdict: "failed", detail: "the candidate suite failed" }], detail: "suite failed", evidence: "" });
+  assert.strictEqual(plain.ok, true, plain.reason);
+  const plainBody = readNode(plain.id);
+  assert.match(plainBody, /its fix cycles are spent \(1 attempt, cap 2\)/);
+  assert.doesNotMatch(plainBody, /no longer carries the candidate/);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("a mismatch is a SETTLED gate state — a mismatched pipeline is never re-adopted as an orphan, and `--regate` is still the door back", () => {
+  const gatesKernel = require("../lib/kernel/gates.js");
+  assert.ok(gatesKernel.SETTLED_GATE_STATES.has("mismatch"), "an unsettled verdict would be re-run on every resume pass, re-refusing the same evidence forever");
+  // The `--regate` guard names the verdicts there is nothing left to judge;
+  // a mismatch is deliberately NOT one of them (the branch or the pin can be
+  // put right and the run re-judged).
+  const src = fs.readFileSync(path.join(__dirname, "..", "bin", "spor.js"), "utf8");
+  const guard = /record\.gate_state === "passed" \|\| record\.gate_state === "parked" \|\| record\.gate_state === "superseded" \|\| record\.gate_state === "scoped"/;
+  assert.match(src, guard);
+  assert.doesNotMatch(src.match(guard)[0], /mismatch/);
+});
+
+test("a candidate carrying a commit but NO tree is judged the same way in every mode — never a propose-only refusal", () => {
+  const dir = integrationRepo();
+  const tip = git(dir, "rev-parse", "branch").trim();
+  const st = integrationRunner.candidateStanding({ top: dir, head: tip, commit: tip, tree: null });
+  assert.strictEqual(st.known, true);
+  assert.strictEqual(st.contained, true);
+  assert.strictEqual(st.commitTreeMatches, null, "nothing was recorded to disagree with");
+  assert.strictEqual(st.headTreeMatches, true, "the head IS the pinned commit, so it is trivially the same tree — in propose mode too");
+  const behind = integrationRunner.candidateStanding({ top: dir, head: tip, commit: git(dir, "rev-parse", "branch~1").trim(), tree: null });
+  assert.strictEqual(behind.headTreeMatches, false, "a branch that moved on is still a different tree");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("candidateStanding refuses a commit that is not a full object name rather than handing it to git as an option", () => {
+  const dir = integrationRepo();
+  const tip = git(dir, "rev-parse", "branch").trim();
+  for (const bad of ["--all", "HEAD", tip.slice(0, 8), ""]) {
+    const st = integrationRunner.candidateStanding({ top: dir, head: tip, commit: bad, tree: null });
+    assert.strictEqual(st.known, false, `'${bad}' must not be probed`);
+    assert.strictEqual(st.contained, null);
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("a caller that wires tipCandidate WITHOUT candidateStanding integrates the head — a tip is never consumed unchecked, a fix cycle's own re-pin included", async () => {
+  const { deps, seen } = integrationFakes();
+  deps.tipCandidate = async () => PINNED;
+  const res = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_IMPL, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.strictEqual(seen.buildArgs[0].head, "headsha", "with no way to check the tip against the branch, the branch is what is integrated");
+
+  // The fix cycle's re-pin is the back door: it assigns a fresh tip AFTER the
+  // opening read's guard has run, so it needs the same one.
+  const buildSequence = (args, st) => (st.builds === 1 ? { ok: false, conflict: true, reason: "merging onto main conflicts" } : { ok: true, dir: "/tmp/candidate", sha: "candidatesha", expectedSha: "expected2" });
+  const after = integrationFakes({ build: buildSequence, fix: () => ({ ok: true, runId: "run-fix-1" }) });
+  const pins = [];
+  after.deps.tipCandidate = async () => PINNED;
+  after.deps.pinCandidate = async (args) => {
+    pins.push(args);
+    return { ok: true, candidate: { candidate_id: "cand-after-fix", commit: "fixedcommit", tree: "fixedtree" }, change: "superseded" };
+  };
+  const res2 = await integrationRunner.runIntegrationStage({ item: ITEM, factory: FACTORY_IMPL, deps: after.deps });
+  assert.strictEqual(res2.state, "passed", res2.reason);
+  assert.strictEqual(pins.length, 1, "the re-pin is still OWED — it is the run record's bookkeeping, not this stage's judgement");
+  assert.deepStrictEqual(after.seen.buildArgs.map((b) => b.head), ["headsha", "headsha"], "and the tip it produced is still not consumed unchecked");
+});
+
+// The real-git half: the three facts the runner's judgement is made of.
+test("candidateStanding, real git: containment, the commit's own tree, and a same-tree relabel — with an unresolvable commit reading `known: false`", () => {
+  const dir = integrationRepo();
+  const branchTip = git(dir, "rev-parse", "branch").trim();
+  const branchBase = git(dir, "rev-parse", "branch~1").trim();
+  const branchTree = git(dir, "rev-parse", "branch^{tree}").trim();
+  const baseTree = git(dir, "rev-parse", "branch~1^{tree}").trim();
+
+  // An unmoved branch: the tip is its own ancestor, and its tree is its own.
+  const same = integrationRunner.candidateStanding({ top: dir, head: branchTip, commit: branchTip, tree: branchTree });
+  assert.deepStrictEqual({ known: same.known, contained: same.contained, commitTreeMatches: same.commitTreeMatches, headTreeMatches: same.headTreeMatches }, { known: true, contained: true, commitTreeMatches: true, headTreeMatches: true });
+
+  // A branch that ADVANCED past the pin: contained, but the head is a
+  // different tree.
+  const advanced = integrationRunner.candidateStanding({ top: dir, head: branchTip, commit: branchBase, tree: baseTree });
+  assert.deepStrictEqual({ contained: advanced.contained, commitTreeMatches: advanced.commitTreeMatches, headTreeMatches: advanced.headTreeMatches }, { contained: true, commitTreeMatches: true, headTreeMatches: false });
+
+  // A commit whose recorded tree is not the tree it resolves to — M1.
+  const wrongTree = integrationRunner.candidateStanding({ top: dir, head: branchTip, commit: branchTip, tree: baseTree });
+  assert.strictEqual(wrongTree.commitTreeMatches, false);
+
+  // A same-tree RELABEL: amend the branch tip's message, leaving its tree.
+  git(dir, "checkout", "-q", "branch");
+  git(dir, "commit", "-q", "--amend", "-m", "branch work, said differently");
+  const relabelled = git(dir, "rev-parse", "HEAD").trim();
+  assert.notStrictEqual(relabelled, branchTip);
+  const relabel = integrationRunner.candidateStanding({ top: dir, head: relabelled, commit: branchTip, tree: branchTree });
+  assert.deepStrictEqual({ contained: relabel.contained, commitTreeMatches: relabel.commitTreeMatches, headTreeMatches: relabel.headTreeMatches }, { contained: false, commitTreeMatches: true, headTreeMatches: true });
+
+  // A commit this checkout does not have at all is not evidence of anything.
+  const gone = integrationRunner.candidateStanding({ top: dir, head: relabelled, commit: "0".repeat(40), tree: branchTree });
+  assert.strictEqual(gone.known, false);
+  assert.strictEqual(gone.contained, null);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 // issue-spor-integration-fix-cycle-does-not-repin-candidate: refreshTree
 // re-reads the tree above (the stale-head regression this test sits beside),
 // but used to never re-pin the candidate — so it kept naming the commit the
@@ -2059,6 +2428,152 @@ test("REGRESSION, real git: a fix cycle's commit in the implementer's checkout r
   assert.strictEqual(suiteRuns, 2, "the suite ran once before the fix and once on the retried candidate");
   const landedSha = git(dir, "rev-parse", targetRef).trim();
   assert.doesNotThrow(() => git(dir, "show", `${landedSha}:lib/fix-marker.js`), "the landed tree carries the fix cycle's commit, not the stale pre-fix head");
+});
+
+// The pinned-commit rule wired against the REAL production deps
+// (bin/spor.js's makeIntegrationDeps — `tipCandidate` reading the run record
+// off disk, `candidateStanding` reading real git), with only the pieces that
+// would dispatch an agent or run a real suite faked out. Two halves of the
+// same fact: a branch that ADVANCED past the pin lands the PINNED tree, and a
+// branch REWRITTEN off the pin lands nothing at all.
+test("REAL deps: a branch that advanced after the pin lands the PINNED commit's tree, not the drift the gates never judged", async () => {
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+
+  const dir = integrationRepo();
+  git(dir, "checkout", "-q", "branch");
+  const targetRef = "main";
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-integration-pinned-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+
+  const factory = {
+    id: "factory-pinned",
+    integration: { targetRef, mode: "local", command: "true", strategy: "merge", serialize: "repo", cycles: 1, timeoutMs: 900000 },
+    trustedRef: targetRef,
+    protectedPaths: [],
+    implementation: { profile: "profile-impl" },
+  };
+  const entry = { run_id: "11111111-2222-3333-4444-0000000000bb", node_id: "task-demo", project: "demo", attempt: 1 };
+  const record = { cwd: dir };
+
+  const pinnedHead = git(dir, "rev-parse", "HEAD").trim();
+  const change = gateRunner.gateChangeSet(record, targetRef);
+  const seeded = gateRunner.pinCandidate(record, targetRef, {
+    change, repo: "demo", nodeId: entry.node_id,
+    submittedBy: { stage: "implementation", cycle: 0, rescue: 0 },
+    provenance: { run_id: entry.run_id, attempt: 1 },
+    resolver: { node: null, written: false, resolves_edge: false },
+  });
+  assert.strictEqual(seeded.ok, true, seeded.reason);
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, entry.run_id).record, {
+    run_id: entry.run_id, node_id: entry.node_id, state: "running",
+    impl_state: "candidate", impl_candidate: seeded.candidate, impl_candidates: [seeded.candidate],
+  });
+
+  // The branch MOVES after the pin — a stray commit nothing judged.
+  fs.writeFileSync(path.join(dir, "lib", "drift.js"), "module.exports = 'never judged';\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "drift: committed after the candidate was pinned");
+  assert.notStrictEqual(git(dir, "rev-parse", "HEAD").trim(), pinnedHead, "sanity: the branch really moved");
+
+  const realDeps = sporCli.makeIntegrationDeps(cfg, { record, entry, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home });
+  const deps = {
+    ...realDeps,
+    acquireLease: async () => null,
+    releaseLease: async () => {},
+    runSuite: async () => ({ ok: true }),
+    fix: async () => ({ ok: true }),
+    escalate: async () => ({ ok: true, id: "task-integration-escalate-x" }),
+    demote: async () => ({ ok: true, demoted: false }),
+    recordFact: async () => ({ ok: true }),
+    cleanupImplementer: async () => {},
+  };
+  const item = { node_id: entry.node_id, run_id: entry.run_id, project: entry.project, attempt: entry.attempt };
+  const res = await integrationRunner.runIntegrationStage({ item, factory, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  const landed = git(dir, "rev-parse", targetRef).trim();
+  assert.doesNotThrow(() => git(dir, "show", `${landed}:lib/sub.js`), "the pinned candidate's own work landed");
+  assert.throws(() => git(dir, "show", `${landed}:lib/drift.js`), "the commit made after the pin is NOT what landed — the gates never judged it");
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("REAL deps: a branch REWRITTEN off its pinned candidate refuses with a mismatch — nothing is built and the target ref never moves", async () => {
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+
+  const dir = integrationRepo();
+  git(dir, "checkout", "-q", "branch");
+  const targetRef = "main";
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-integration-mismatch-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+
+  const factory = {
+    id: "factory-mismatch",
+    integration: { targetRef, mode: "local", command: "true", strategy: "merge", serialize: "repo", cycles: 1, timeoutMs: 900000 },
+    trustedRef: targetRef,
+    protectedPaths: [],
+    implementation: { profile: "profile-impl" },
+  };
+  const entry = { run_id: "11111111-2222-3333-4444-0000000000cc", node_id: "task-demo", project: "demo", attempt: 1 };
+  const record = { cwd: dir };
+
+  const change = gateRunner.gateChangeSet(record, targetRef);
+  const seeded = gateRunner.pinCandidate(record, targetRef, {
+    change, repo: "demo", nodeId: entry.node_id,
+    submittedBy: { stage: "implementation", cycle: 0, rescue: 0 },
+    provenance: { run_id: entry.run_id, attempt: 1 },
+    resolver: { node: null, written: false, resolves_edge: false },
+  });
+  assert.strictEqual(seeded.ok, true, seeded.reason);
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, entry.run_id).record, {
+    run_id: entry.run_id, node_id: entry.node_id, state: "running",
+    impl_state: "candidate", impl_candidate: seeded.candidate, impl_candidates: [seeded.candidate],
+  });
+
+  // The branch is REWRITTEN onto different content — the pinned commit is no
+  // longer reachable from it, and the head is not a relabel of it either.
+  const targetBefore = git(dir, "rev-parse", targetRef).trim();
+  git(dir, "reset", "-q", "--hard", "HEAD~1");
+  fs.writeFileSync(path.join(dir, "lib", "other.js"), "module.exports = 'something else entirely';\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "rewrite: different work on the same branch");
+
+  const realDeps = sporCli.makeIntegrationDeps(cfg, { record, entry, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home });
+  let builds = 0;
+  const escalations = [];
+  const deps = {
+    ...realDeps,
+    acquireLease: async () => null,
+    releaseLease: async () => {},
+    buildCandidate: async (args) => {
+      builds += 1;
+      return realDeps.buildCandidate(args);
+    },
+    runSuite: async () => ({ ok: true }),
+    fix: async () => ({ ok: true }),
+    escalate: async (args) => {
+      escalations.push(args);
+      return { ok: true, id: "task-integration-escalate-x" };
+    },
+    demote: async () => ({ ok: true, demoted: false }),
+    recordFact: async () => ({ ok: true }),
+    cleanupImplementer: async () => {},
+  };
+  const item = { node_id: entry.node_id, run_id: entry.run_id, project: entry.project, attempt: entry.attempt };
+  const res = await integrationRunner.runIntegrationStage({ item, factory, deps });
+  assert.strictEqual(res.state, "mismatch", res.reason);
+  assert.strictEqual(builds, 0);
+  assert.strictEqual(escalations.length, 1);
+  assert.strictEqual(escalations[0].kind, "mismatch");
+  assert.match(escalations[0].detail, new RegExp(seeded.candidate.candidate_id));
+  assert.strictEqual(git(dir, "rev-parse", targetRef).trim(), targetBefore, "nothing landed");
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(home, { recursive: true, force: true });
 });
 
 // issue-spor-integration-fix-cycle-does-not-repin-candidate: the per-cycle
