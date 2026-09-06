@@ -70,6 +70,16 @@ and the pipeline mechanics are proposed rather than asked.
 > review argument about naming. Don't page me until something smart has had a
 > look and either fixed it or can tell me what's actually wrong."
 
+> **Q9. When an agent says a piece of work is finished, should everything
+> waiting on it start moving right away — or only once your checks have
+> passed?**
+>
+> "Only once it's landed. I've had a task marked 'done' before that wasn't —
+> someone just said so. If it says finished, it needs to mean it actually
+> went through the review, the payments approval where that applies, and the
+> merge. And say that plainly in the setup: nothing here should call itself
+> finished just because the agent thinks it is."
+
 ## The proposal that was confirmed (step 4)
 
 1. **Acceptance** — run what CI runs (`npm test`) from `main`'s copy, never the
@@ -104,6 +114,18 @@ and the pipeline mechanics are proposed rather than asked.
    place the first-factory advice ("a `rescue:` block only once there is a
    strong-model profile and the operator has seen an escalation they would
    rather not have") is met at creation: Q8 IS that escalation, three times.
+8. **Completion boundary** (Q9) — "only once it's landed" is `completion:
+   {by: controller}`: the implementer commits and submits a candidate instead
+   of writing the resolving edge itself, and the factory writes it — at
+   `after: integration`, since Q7 already made the merge the finish line the
+   owner cares about. Declaring the `implementation:` block (with just an
+   `instructions` line carrying the owner's own "nothing here should call
+   itself finished" sentence) is what flips `completion.by` to `controller`
+   in the first place; nothing about the implementer's routing, budget, or
+   candidate publication was asked for, so those keys are left at their
+   defaults. State the cost back plainly: an agent can no longer mark its own
+   homework, and until the gates and the merge both pass, the item stays open
+   and every dependent stays blocked.
 
 ## What was emitted (step 5)
 
@@ -113,7 +135,7 @@ and the pipeline mechanics are proposed rather than asked.
 | `profile-codex-review` | the cross-model lane that gate routes to |
 | `profile-acme-test-writer` | the lane a protected-path hit routes to, and the one that writes the seeded suite |
 | `profile-acme-rescue` | the strong-model lane the factory-level `rescue:` block routes to — a different, stronger model than the implementer's, on a supervised harness that can write |
-| `factory-acme-checkout` | the ordered pipeline, trusted ref, protected paths, the `touches:payments` risk class, the `integration:` block from Q7, and the `rescue:` block from Q8 |
+| `factory-acme-checkout` | the ordered pipeline, trusted ref, protected paths, the `touches:payments` risk class, the `integration:` block from Q7, the `rescue:` block from Q8, and the `implementation:`/`completion:` blocks from Q9 |
 | `task-acme-checkout-acceptance-suite` | the missing black-box suite, carrying Q1-Q3 verbatim as its spec |
 
 Nothing was turned on: `spor work --factory factory-acme-checkout` is the

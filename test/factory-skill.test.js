@@ -197,6 +197,29 @@ test("the emitted integration block parses with the runner's own vocabulary", ()
   assert.strictEqual(integration.mode, "propose");
 });
 
+test("the emitted implementation and completion blocks parse with the runner's own vocabulary", () => {
+  // The skill's interview question 9 payoff (task-spor-factory-skill-fixture-
+  // emits-implementation-and-completion): declaring `implementation:` — even
+  // with nothing but an `instructions` line — must be exactly what
+  // lib/kernel/gates.js parseImplementation accepts, and it flips
+  // `completion.by` to `controller` on its own, matching the owner's Q9
+  // answer ("only once it's landed") without the skill having to spell out
+  // `completion.by` a second time.
+  const { factory, errors } = resolveEmittedFactory();
+  assert.deepStrictEqual(errors, []);
+  assert.ok(factory.implementation, "the fixture's Q9 answer emits an implementation block");
+  assert.deepStrictEqual(factory.implementation, {
+    profile: "",
+    instructions: "Nothing here is finished until it is committed, clean, and handed to the pipeline — not just said to be.",
+    authorChecks: [],
+    budget: { runMaxMs: null, runIdleMs: null, attempts: 1 },
+    retry: { attempts: 1, backoffMs: 60000 },
+    candidate: { requireClean: true, publish: "bundle", remote: "", bundleStore: "" },
+  });
+  assert.deepStrictEqual(factory.completion, { by: "controller", after: "integration" },
+    "after: integration because Q7 already made the merge the finish line");
+});
+
 test("nothing the skill emitted dangles: every ref and every routed profile exists", () => {
   const { byId, factory } = resolveEmittedFactory();
   const have = (id) => byId.has(id);

@@ -45,6 +45,14 @@ re-runs on what it leaves. Only if that pass also refuses is the owner paged,
 and the item they get opens with the diagnosis. It never passes anything
 itself.
 
+And "only once it's landed" (Q9): an agent no longer gets to mark its own
+work done. It commits and submits a candidate instead of writing the
+resolving edge itself, and the factory writes that edge — and flips the
+item's status — only once every gate above has passed and the merge in Q7 has
+actually landed. Until then the item stays open and every dependent stays
+blocked, which is the point: a claim no gate has judged never again releases
+work waiting on it.
+
 ```json
 {
   "factory": "acme-checkout",
@@ -73,6 +81,13 @@ itself.
     "attempts": 1,
     "await_ms": 3600000,
     "instructions": "Prefer the smallest fix that makes the prior findings resolve; if the review was arguing about naming, say so."
+  },
+  "implementation": {
+    "instructions": "Nothing here is finished until it is committed, clean, and handed to the pipeline — not just said to be."
+  },
+  "completion": {
+    "by": "controller",
+    "after": "integration"
   }
 }
 ```
