@@ -1149,13 +1149,20 @@ Four properties the publisher is built around:
   relative path and anything under the producing run's own working tree or
   inside a `.git` directory are still refused — they resolve only on the
   machine that is about to disappear.
-- **A worker refuses at startup what a parse could not read**: an `https://`
-  store in local mode (there is no candidate door without a server), a
-  `file://` store it cannot write, and a `branch` publish whose remote does not
-  exist — or resolves to a scheme no reader can fetch — in every checkout it
-  knows about. This is FATAL, unlike the `gh`/propose warning: a box that
-  cannot publish can submit nothing at all, so dispatching implementers there
-  burns spend to produce nothing.
+- **Invalid publication configuration is fatal; runtime unavailability skips
+  work before claim.** An unsupported store/remote scheme, invalid file URI,
+  or `https://` store in local mode refuses startup. A temporarily unwritable
+  store, missing or unreachable remote, unavailable integration target, or
+  missing `gh` leaves the worker alive. Each selected item is checked against
+  its own checkout before any dispatch lease or controller hold, so an
+  available sibling repo never masks its failure. `--print` shows those skips;
+  `--status` retains the reason and retry deadline. Failed checks back off from
+  the polling interval to `--max-interval`, with `--retry-after` as the existing
+  item cooldown floor. Recovery resumes the same profile; no fallback profile
+  or publication mode is substituted. Remote Git/HTTP probes are read-only,
+  non-interactive, and capped at five seconds each. HTTP checks establish
+  reachability/auth only (a missing probe object is expected); immutable
+  publication verification and integration checks still run at execution.
 - **A refused reference SHAPE is `unpublishable`, never `infrastructure`.**
   Every reason the shape check above can give — a locator under the
   producing run's own working tree included — is a structural fact about the
@@ -3376,12 +3383,11 @@ path, the run record and the idle-stop that already own them.
   object-store request, so `s3://` and its kin are refused at parse rather than
   at the first publish. `branch` pushes an immutable candidate ref to
   `candidate.remote` (a remote NAME, resolved to its URL at publish; default
-  `origin`); `both` publishes both. Two refusals a parse cannot make — an
-  `https://` store in LOCAL mode, where there is no candidate door, and a
-  `branch` publish with no usable remote — belong at worker startup beside the
-  `gh` capability check `integration.mode: propose` makes: `spor work` runs
-  `candidatePublish.publishSatisfiability` there (§2.4 E9/E14) and refuses to
-  start the worker on a box that cannot publish (see "What runs today" below).
+  `origin`); `both` publishes both. Declaration/mode errors a parse cannot
+  decide, such as `https://` in local mode, are fatal startup checks.
+  Runtime store/remote unavailability is checked per selected item before
+  claim, alongside integration satisfiability, and idles with visible bounded
+  retries rather than stopping the worker (§2.4 E9/E14).
 - **`gates[].rejudge_on_repin`** (command gates only, default true; read only
   under `completion.by: controller`) — the per-gate half of the stage.
   Acceptance is a property of the TIP (§10.12): the completion write asserts
@@ -3432,7 +3438,7 @@ floor, because a typo must never read as "no retries", "retry in a second", or
 everything `completion` governs — the execution hold, the `CANDIDATE:`
 submission, the candidate pin and the controller's completion write (§10.12,
 §10.13) — candidate publication (`lib/shell/candidate-publish.js`: `bundle`
-| `branch` | `both`, the `spor work`-startup `publishSatisfiability` refusal
+| `branch` | `both`, the startup configuration and per-item runtime `publishSatisfiability` checks
 above, and the `publish_pending` debt of an outage), `candidate.require_clean`
 (issue-spor-candidate-require-clean-parsed-never-read: the pin itself refuses,
 with its own reason, on a checkout with uncommitted tracked changes — see

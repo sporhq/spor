@@ -3028,7 +3028,7 @@ function cli(args, env) {
 // a factory definition. Mirrors gate-pipeline.test.js's cliFixture, scoped
 // down to what the integration end-to-end tests need: one command gate, and
 // (when `integration` is passed) an integration block riding beside it.
-function integrationCliFixture({ integration = null } = {}) {
+function integrationCliFixture({ integration = null, implementation = null, completion = null } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-integration-home-"));
   const nodes = path.join(home, "nodes");
   fs.mkdirSync(nodes, { recursive: true });
@@ -3047,6 +3047,8 @@ function integrationCliFixture({ integration = null } = {}) {
     trusted_ref: "main",
     gates: [{ id: "acceptance", kind: "command", command: `"${process.execPath}" test/acceptance.js` }],
     ...(integration ? { integration } : {}),
+    ...(implementation ? { implementation } : {}),
+    ...(completion ? { completion } : {}),
   };
   write("factory-demo", "type: factory\ntitle: The demo factory\nsummary: The gate+integration pipeline the demo project enforces between claim and resolve.\nstatus: active\n", ["```json", JSON.stringify(payload, null, 2), "```"].join("\n"));
   const outfile = path.join(home, "invocations.jsonl");
@@ -4680,4 +4682,46 @@ test("propose mode refuses to open a PR without its attestation body: a body tha
   assert.strictEqual((await deps3.propose({ head: "abc123", targetRef: "main", chain: null })).ok, true);
   assert.strictEqual(opened.length, 1);
   assert.match(opened[0].body, /spor-attestation:begin/);
+});
+
+test("unwritable publication store idles before controller hold, with the same skip in print and durable status", () => {
+  const f = integrationCliFixture({ implementation: { candidate: { publish: "bundle" } }, completion: { by: "controller", after: "gates" } });
+  fs.writeFileSync(path.join(f.home, "candidates"), "temporarily unavailable store");
+  const node = path.join(f.nodes, "task-ready.md"); const before = fs.readFileSync(node, "utf8");
+  const env = { SPOR_HOME: f.home, XDG_CONFIG_HOME: f.home, OUTFILE: f.outfile, PATH: pathWithGitAndNodeButNoGh() };
+  const preview = cli(["work", "--print", "--factory", "factory-demo"], env);
+  assert.strictEqual(preview.status, 0, preview.stderr);
+  assert.match(preview.stdout, /skip task-ready — .*not writable/);
+  assert.match(preview.stdout, /queue:   0 candidate/);
+  const actual = cli(["work", "--once", "--interval", "1", "--factory", "factory-demo"], env);
+  assert.strictEqual(actual.status, 0, `${actual.stderr}\n${actual.stdout}`);
+  assert.match(actual.stdout, /work: skipping task-ready — .*not writable/);
+  assert.strictEqual(fs.readFileSync(node, "utf8"), before, "controller did not establish a hold");
+  assert.ok(!fs.existsSync(f.outfile), "implementer never launched");
+  assert.strictEqual(require("../lib/shell/agent-dispatch-runner.js").readRunRecords(f.home).length, 0, "no dispatch claim/run exists");
+  const status = JSON.parse(cli(["work", "--status", "--json"], env).stdout);
+  assert.strictEqual(status.workers[0].skipped[0].kind, "availability");
+  assert.match(status.workers[0].skipped[0].reason, /not writable/);
+});
+
+test("missing branch publication remote and integration target are item skips, while invalid publication configuration remains fatal", () => {
+  for (const setup of [
+    { implementation: { candidate: { publish: "branch" } } },
+    { integration: { mode: "push", target_ref: "origin/main", command: "true" } },
+    { integration: { mode: "local", target_ref: "missing-main", command: "true" } },
+  ]) {
+    const f = integrationCliFixture(setup);
+    const env = { SPOR_HOME: f.home, XDG_CONFIG_HOME: f.home, OUTFILE: f.outfile, PATH: pathWithGitAndNodeButNoGh() };
+    const r = cli(["work", "--once", "--interval", "1", "--factory", "factory-demo"], env);
+    assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
+    assert.match(r.stdout, /work: skipping task-ready — /);
+    assert.ok(!fs.existsSync(f.outfile));
+  }
+  for (const bundle_store of ["https://example.test/candidates", "s3://bucket/candidates"]) {
+    const f = integrationCliFixture({ implementation: { candidate: { publish: "bundle", bundle_store } } });
+    const r = cli(["work", "--print", "--factory", "factory-demo"], { SPOR_HOME: f.home, XDG_CONFIG_HOME: f.home, PATH: pathWithGitAndNodeButNoGh() });
+    assert.strictEqual(r.status, 1, r.stdout);
+    assert.match(r.stderr, /invalid|cannot be used|needs a Spor server/);
+    assert.ok(!fs.existsSync(f.outfile));
+  }
 });

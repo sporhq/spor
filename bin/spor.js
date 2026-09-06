@@ -45,6 +45,7 @@ const executionStore = require(path.join(ROOT, "lib", "shell", "execution-store.
 const executionKernel = require(path.join(ROOT, "lib", "kernel", "execution.js"));
 const gateRunner = require(path.join(ROOT, "lib", "shell", "gate-runner.js"));
 const candidatePublish = require(path.join(ROOT, "lib", "shell", "candidate-publish.js"));
+const factoryAvailability = require(path.join(ROOT, "lib", "shell", "factory-availability.js"));
 const integrationRunner = require(path.join(ROOT, "lib", "shell", "integration-runner.js"));
 const implementationStage = require(path.join(ROOT, "lib", "shell", "implementation-stage.js"));
 const workerContractLib = require(path.join(ROOT, "lib", "shell", "worker-contract.js"));
@@ -11673,6 +11674,29 @@ function integrationSatisfiability(cfg, factory, { persistProbe = true } = {}) {
   return sat.satisfiesIntegration(machine, factory);
 }
 
+// Availability is checked on the selected item's own checkout before the
+// controller hold or dispatch lease exists. Cache failures only, and include
+// definition and checkout in the key so config/repo changes take effect.
+function makeFactoryAvailabilityCheck(cfg, { passthrough = {}, baseMs, maxMs, now, persistProbe = true, probe = factoryAvailability.probeFactoryAvailability, integrationCheck = integrationSatisfiability } = {}) {
+  const retry = factoryAvailability.availabilityBackoff({ baseMs, maxMs, now });
+  return async (factory, item) => {
+    if (!factory) return { ok: true };
+    const repo = item.project || item.repo || null;
+    const cwd = resolveDir(cfg, { dir: passthrough.dir, slug: repo }).dir;
+    const key = JSON.stringify([factory, repo, cwd, cfg.mode()]);
+    return retry(key, async () => {
+      const integration = integrationCheck(cfg, factory, { persistProbe });
+      if (!integration.ok) return { ok: false, reason: integration.reasons.join("; "), kind: "availability" };
+      const result = await probe({ factory, repo, cwd, graphHome: cfg.userConfigHome(), mode: cfg.mode(), bearer: cfg.mode() === "remote" ? remote.token(cfg) : null });
+      return result.ok ? result : { ...result, kind: "availability" };
+    });
+  };
+}
+async function dispatchSatisfiableWorkItem(cfg, item, passthrough, { checkAvailability, dispatch = dispatchWorkItem, ...ctx }) {
+  const verdict = await checkAvailability(ctx.factory, item);
+  return verdict.ok ? dispatch(cfg, item, passthrough, ctx) : verdict;
+}
+
 // The shared body of the above and of the gate pipeline's review/fix launches
 // (task-spor-work-gate-pipeline): one dispatch through the real code path,
 // reporting the run it started or the refusal's own reason.
@@ -18151,14 +18175,8 @@ async function cmdWork(cfg, { values }) {
       err(`spor work: factory '${factoryId}' declares integration mode 'propose', but ${startupGh.reasons[0]}`);
       err("  every candidate under this factory will be skipped here (see 'spor work --status') until gh is available, or run this worker on a box that has it.");
     }
-    // §2.4 E9 and E14, deferred out of the parser because a parse can read
-    // neither a checkout nor a filesystem nor a mode. Unlike the `gh` check
-    // above this is FATAL: a box that cannot publish can complete nothing at
-    // all — every candidate must carry a portable reference, there is no
-    // `publish: none` to degrade to, and a worker that dispatches implementers
-    // whose candidates can never be submitted burns real model spend to produce
-    // nothing. Saying so once, here, is more honest than failing every item
-    // identically at its publish.
+    // Invalid declarations remain fatal. Runtime store/remote outages are
+    // item-level refusals before claim, visible in status and retried boundedly.
     const startupPublish = candidatePublish.publishSatisfiability(factory, {
       graphHome: cfg.userConfigHome(),
       mode: cfg.mode(),
@@ -18171,12 +18189,13 @@ async function cmdWork(cfg, { values }) {
       ),
     });
     for (const w of startupPublish.warnings) err(`spor work: ${w}`);
-    if (!startupPublish.ok) {
-      err(`spor work: factory '${factoryId}' cannot publish a candidate from this machine:`);
-      for (const e of startupPublish.errors) err(`  ${e}`);
-      err("  every candidate carries a portable reference (there is no publish: none), so a worker that cannot publish cannot submit one — fix the store/remote, or run this worker on a box that can reach them.");
+    if (startupPublish.configurationErrors.length) {
+      err(`spor work: factory '${factoryId}' has invalid publication configuration:`);
+      for (const e of startupPublish.configurationErrors) err(`  ${e}`);
       return 1;
     }
+    for (const e of startupPublish.unavailable) err(`spor work: ${e} — affected items will be skipped before claim and retried (see 'spor work --status').`);
+
   }
   // A standing `dispatch.claudeLaunchMode: native-background` is honored by an
   // interactive `spor dispatch` and IGNORED by every dispatch this loop makes
@@ -18319,6 +18338,7 @@ async function cmdWork(cfg, { values }) {
   // Read before `candidates` closes over it: `--print` calls that closure
   // before the loop starts, so this cannot be declared further down.
   const home = cfg.userConfigHome();
+  const checkAvailability = makeFactoryAvailabilityCheck(cfg, { passthrough, baseMs: intervalMs, maxMs: maxIntervalMs, persistProbe: !values.print });
 
   // The page width the last pass NEEDED, carried across polls
   // (task-spor-queue-api-offset-paging). A worker whose only eligible work sits
@@ -18472,10 +18492,19 @@ async function cmdWork(cfg, { values }) {
     const cands = workLoop.selectWorkCandidates(await candidates(), { accept, repos: factoryRepos, graph: localFactoryGraph, selfAgent, onSkip: (it, reason, kind) => policySkips.push({ it, reason, kind }) });
     if (!cands.length) out("queue:   nothing dispatchable right now");
     else {
-      out(`queue:   ${cands.length} candidate(s); this pass would take the first ${Math.min(concurrency, cands.length)}`);
-      for (const [i, it] of cands.entries()) {
+      const available = [];
+      const unavailable = [];
+      for (const it of cands) {
+        const verdict = await checkAvailability(factory, it);
+        if (verdict.ok) available.push(it);
+        else unavailable.push({ it, reason: verdict.reason });
+      }
+      out(`queue:   ${available.length} candidate(s); this pass would take the first ${Math.min(concurrency, available.length)}`);
+      for (const [i, it] of available.entries()) {
         out(`  ${i < concurrency ? "->" : "  "} ${it.id}  ${it.readiness || "untriaged"}  ${it.title || it.summary || ""}`.slice(0, 160));
       }
+      for (const { it, reason } of unavailable.slice(0, workLoop.SKIP_LOG_CAP)) out(`  skip ${it.id} — ${reason}`);
+      if (unavailable.length > workLoop.SKIP_LOG_CAP) out(`  ...and ${unavailable.length - workLoop.SKIP_LOG_CAP} more unavailable items`);
     }
     // Same treatment as the loop's own log and `--status`: a widened page can
     // hold hundreds of skips, and a preview that scrolls them all off the
@@ -18575,13 +18604,7 @@ async function cmdWork(cfg, { values }) {
       // ever established for an item this box can never finish landing. The
       // loop's existing refusal-cooldown machinery does the rest — the same
       // path any other unsatisfiable-profile refusal already takes.
-      dispatch: (item) => {
-        if (factory) {
-          const verdict = integrationSatisfiability(cfg, factory);
-          if (!verdict.ok) return { ok: false, reason: verdict.reasons[0] };
-        }
-        return dispatchWorkItem(cfg, item, passthrough, { factory, home, log: (line) => out(line) });
-      },
+      dispatch: (item) => dispatchSatisfiableWorkItem(cfg, item, passthrough, { checkAvailability, factory, home, log: (line) => out(line) }),
       pollRuns: (ids) => pollWorkRuns(cfg, ids, { maxAgeMs: runMaxMs, idleMs: runIdleMs, warn }),
       publish: (status) => workLoop.writeWorkerStatus(home, status),
       log: (line) => out(line),
@@ -21658,7 +21681,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { cmdWorkRegate, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning };
+module.exports = { makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning };
 
 if (require.main === module) {
   main()
