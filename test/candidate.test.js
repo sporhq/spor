@@ -27,6 +27,8 @@ const candidate = require("../lib/kernel/candidate.js");
 const gates = require("../lib/kernel/gates.js");
 const gateRunner = require("../lib/shell/gate-runner.js");
 const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+const sporCli = require("../bin/spor.js");
+const { loadConfig } = require("../lib/config.js");
 
 const sha256 = (s) => crypto.createHash("sha256").update(String(s), "utf8").digest("hex");
 const TREE = "a".repeat(40);
@@ -491,6 +493,95 @@ test("a whole-record write by an in-process writer carries the impl_ namespace a
   assert.strictEqual(rec.terminal_state, "reported");
   assert.strictEqual(rec.impl_state, "candidate", "the candidate is not erased by a later whole-record write");
   assert.ok(rec.impl_candidate);
+});
+
+// ---------------------------------------------- the settled-record race fix --
+//
+// issue-spor-pin-candidate-settled-record-stamp-race: the CLOSURE
+// (`makeGateDeps`'s `pinCandidate` in bin/spor.js — the caller of
+// `gateRunner.pinCandidate` and `stampImplState` above, neither of which alone
+// reproduces the bug), against a REAL git repo and a REAL run-record file, the
+// same "only the real door proves it" scoping the escalation/demote tests use.
+
+function realGateDeps(t, { home, entry, factory = { trustedRef: "main" }, record, warn = () => {} }) {
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  return sporCli.makeGateDeps(cfg, { record, entry, factory, slug: "demo", log: () => {}, warn, home });
+}
+
+test("a late first pin arriving after impl_state already settled elsewhere is refused whole, not laundered in", async (t) => {
+  const { dir } = realRepo();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const home = scratchHome(t);
+  const runId = "11111111-1111-1111-1111-111111111111";
+  // The settling path this reproduces never goes through pinCandidate at all
+  // (two workers adopting one orphaned pipeline; the winner's `exhausted`
+  // lands via stampImplState directly) — so the record is settled with NO
+  // impl_candidate ever recorded, which is exactly what makes the late
+  // first pin read as `folded.change === "created"`.
+  const file = writeRecord(home, runId, { impl_state: "exhausted" });
+  const record = { cwd: dir, run_id: runId, harness: "claude-code" };
+  const entry = { run_id: runId, node_id: "task-x", project: "demo" };
+  const warnings = [];
+  const deps = realGateDeps(t, { home, entry, record, warn: (l) => warnings.push(l) });
+
+  const change = await deps.changedPaths({ trustedRef: "main" });
+  assert.strictEqual(change.ok, true, change.reason);
+  const result = await deps.pinCandidate({ submittedBy: { stage: "implementation", cycle: 0, rescue: 0 } });
+
+  assert.strictEqual(result.ok, true, "a refusal here is a no-op, not a pipeline failure");
+  assert.strictEqual(result.change, "refused-settled");
+  assert.strictEqual(result.candidate, null, "nothing was ever pinned for this record");
+  assert.ok(
+    warnings.some((w) => /impl_state already settled/.test(w) && /exhausted/.test(w)),
+    "the refusal is logged, not silent"
+  );
+
+  const rec = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.strictEqual(rec.impl_state, "exhausted", "the terminal verdict stands untouched");
+  assert.strictEqual(rec.impl_run_id, undefined, "no live-run metadata is stamped beside a settled verdict");
+  assert.strictEqual(rec.impl_attempt, undefined);
+  assert.strictEqual(rec.impl_pool, undefined);
+  assert.strictEqual(rec.impl_candidate, undefined, "no candidate is fabricated for a stage that never actually submitted one");
+});
+
+test("a legitimate re-pin after settling still lands — only a late FIRST pin is refused", async (t) => {
+  const { dir, g } = realRepo();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const home = scratchHome(t);
+  const runId = "22222222-2222-2222-2222-222222222222";
+  writeRecord(home, runId);
+  const record = { cwd: dir, run_id: runId, harness: "claude-code" };
+  const entry = { run_id: runId, node_id: "task-x", project: "demo" };
+  const deps = realGateDeps(t, { home, entry, record });
+
+  await deps.changedPaths({ trustedRef: "main" });
+  const first = await deps.pinCandidate({ submittedBy: { stage: "implementation", cycle: 0, rescue: 0 } });
+  assert.strictEqual(first.ok, true);
+  assert.strictEqual(first.change, "created");
+  const file = dispatchRuns.runPaths(home, runId).record;
+  const afterFirst = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.strictEqual(afterFirst.impl_run_id, runId);
+  assert.strictEqual(afterFirst.impl_pool, "implementation");
+
+  // The stage settles — via the boundary, not via pinCandidate — while a fix
+  // cycle then moves the tree. This is the documented steady state
+  // (stampImplState's own header comment): the verdict is final, but the
+  // TIP still moves.
+  dispatchRuns.stampImplState(home, runId, { impl_state: "candidate" });
+  fs.writeFileSync(path.join(dir, "c.txt"), "three\n");
+  g("add", "-A");
+  g("commit", "-q", "-m", "a fix cycle");
+
+  await deps.changedPaths({ trustedRef: "main" });
+  const second = await deps.pinCandidate({ submittedBy: { stage: "fix", cycle: 1, rescue: 0 } });
+  assert.strictEqual(second.ok, true);
+  assert.notStrictEqual(second.change, "refused-settled", "a re-pin — not a first pin — must not be caught by the settled-record guard");
+
+  const afterSecond = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.strictEqual(afterSecond.impl_state, "candidate", "the verdict is still final");
+  assert.strictEqual(afterSecond.impl_candidate.candidate_id, second.candidate.candidate_id, "…but the tip moved with the fix");
+  assert.strictEqual(afterSecond.impl_run_id, runId, "the submission's own dimensions are untouched by the fixer's re-pin");
+  assert.strictEqual(afterSecond.impl_pool, "implementation");
 });
 
 // ---------------------------------------------------- the pipeline wiring --
