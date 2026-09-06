@@ -9505,8 +9505,8 @@ async function launchSupervisedHarness(cfg, {
       // reused the pid) can be told apart from a genuinely long-lived
       // supervisor (issue-spor-dispatch-supervisor-identity-stale-timeout).
       const startTicks = dispatchRuns.processStartTicks(child.pid);
-      dispatchRuns.atomicJson(p.record, {
-        ...record, runner_pid: child.pid,
+      dispatchRuns.stampRun(cfg.userConfigHome(), runId, {
+        runner_pid: child.pid,
         ...(startTicks != null ? { runner_started_ticks: startTicks } : {}),
       });
     }
@@ -14450,11 +14450,12 @@ function makeGateDeps(
     evidenceOrigin: () => attestationGraphOrigin(cfg),
     acceptsEvidenceOrigin: (origin) => attestationOriginMatches(cfg, origin),
     recordFact: async ({ id, markdown, flakeIssues = [], origin }) => {
-      if (flakeIssues.length && !attestationOriginMatches(cfg, origin)) return { ok: false, reason: "flake evidence belongs to a different or unknown graph" };
+      const publicationCfg = origin ? attestationPublicationConfig(cfg, origin) : flakeIssues.length ? null : cfg;
+      if (!publicationCfg) return { ok: false, reason: "flake evidence belongs to a different or unknown graph" };
       // Occurrence edges use the guarded micro-mutation even on fresh facts:
       // issue selection is not a liveness guarantee at publication time.
       const bare = withoutFlakeEdges(markdown, flakeIssues);
-      const wrote = await writeGateNode(cfg, id, bare);
+      const wrote = await writeGateNode(publicationCfg, id, bare);
       return { ...wrote, linked: [] };
     },
     // Reconcile the complete evidence identity, ignoring only this flake's
@@ -14462,12 +14463,14 @@ function makeGateDeps(
     // guarded payments; title equality alone cannot vouch for a judged head,
     // gate definition, or evidence body. Return typed edges so mentions never
     // discharge occurrence debt.
-    readFact: async ({ id, markdown, flakeIssues = [] }) => {
+    readFact: async ({ id, markdown, flakeIssues = [], origin }) => {
+      const publicationCfg = origin ? attestationPublicationConfig(cfg, origin) : cfg;
+      if (!publicationCfg) return { ok: false, reason: "flake evidence belongs to a different or unknown graph" };
       const graphLib = require(path.join(ROOT, "lib", "graph.js"));
       const read = {};
       let node = null;
       try {
-        node = await resolveNode(cfg, id, read);
+        node = await resolveNode(publicationCfg, id, read);
       } catch (e) {
         return { ok: false, reason: `${id} could not be read (${(e && e.message) || e})` };
       }
@@ -14505,13 +14508,14 @@ function makeGateDeps(
     // so a flake issue that vanished leaves the debt logged unpaid rather than
     // an edge pointing at nothing.
     linkFact: async function ({ id, type, to, gate, file, files, origin }) {
-      if (file && !attestationOriginMatches(cfg, origin)) return { ok: false, reason: "flake evidence belongs to a different or unknown graph" };
-      const first = await addGateEdge(cfg, id, type, to);
+      const publicationCfg = origin ? attestationPublicationConfig(cfg, origin) : file ? null : cfg;
+      if (!publicationCfg) return { ok: false, reason: "flake evidence belongs to a different or unknown graph" };
+      const first = await addGateEdge(publicationCfg, id, type, to);
       if (first.ok || !["target_not_live", "local_atomic_unavailable"].includes(first.code) || !file || !gate) return first;
       // A settled selection owes a recurrence. Before selecting another rung,
       // recover a payment that landed before a process died: it remains paid
       // even when that recurrence itself has since been settled.
-      const source = await resolveNode(cfg, id);
+      const source = await resolveNode(publicationCfg, id);
       if (!source || nodeUnreadable(source)) return { ok: false, reason: "the occurrence fact could not be read before recurrence selection" };
       const graphLib = require(path.join(ROOT, "lib", "graph.js"));
       const family = (target) => String(target).replace(/-r[2-4]$/, "");
@@ -14519,9 +14523,9 @@ function makeGateDeps(
       const paid = edges.find((e) => e.type === type && family(e.to) === family(to));
       if (paid) return { ok: true, id, to: paid.to };
       if (first.code === "local_atomic_unavailable") return first;
-      const next = await this.fileFlakeItem({ gate, file, files, command: gate.command, isolate: gate.isolate });
+      const next = await this.fileFlakeItem({ gate, file, files, command: gate.command, isolate: gate.isolate, origin });
       if (!next || !next.ok) return next || { ok: false, reason: "recurrence selection returned no answer" };
-      return { ...await addGateEdge(cfg, id, type, next.id), to: next.id };
+      return { ...await addGateEdge(publicationCfg, id, type, next.id), to: next.id };
     },
     fileTestLaneItem: async ({ gate, paths, profile, rescue = 0 }) => {
       const k = keysFor(rescue);
@@ -14604,7 +14608,9 @@ function makeGateDeps(
     // exists to prevent. That is why a write that did not create anything
     // (`existing`, in either mode) sends the id back through the read once,
     // instead of being returned as a filing.
-    fileFlakeItem: async ({ gate, file, files, command, isolate }) => {
+    fileFlakeItem: async ({ gate, file, files, command, isolate, origin }) => {
+      const publicationCfg = origin ? attestationPublicationConfig(cfg, origin) : origin === null ? null : cfg;
+      if (!publicationCfg) return { ok: false, reason: "flake filing belongs to a different or unknown graph" };
       const list = (files || []).map(String);
       // ONE issue per FILE, keyed on that file and nothing else. Keying it on
       // the whole co-failing SET would mint a fresh issue for the same flaky
@@ -14661,12 +14667,12 @@ function makeGateDeps(
         const read = {};
         let node = null;
         try {
-          node = await resolveNode(cfg, id, read);
+          node = await resolveNode(publicationCfg, id, read);
         } catch (e) {
           return { state: "unknown", why: `${id} could not be read (${(e && e.message) || e})` };
         }
         if (node && !nodeUnreadable(node)) {
-          const settled = dispatchResolutionReason(cfg, node);
+          const settled = dispatchResolutionReason(publicationCfg, node);
           return settled ? { state: "settled", why: settled } : { state: "live" };
         }
         return (read.unreadable || (node && nodeUnreadable(node))) ? { state: "unknown", why: `${id} could not be read` } : { state: "absent" };
@@ -14692,7 +14698,7 @@ function makeGateDeps(
           raced = false;
           continue;
         }
-        const written = await writeGateNode(cfg, id, markdown(id, prior, priorWhy));
+        const written = await writeGateNode(publicationCfg, id, markdown(id, prior, priorWhy));
         // Created it: this filing IS the record.
         if (written.ok && !written.existing) return written;
         // The id was occupied between the read and the write — another worker
@@ -17085,7 +17091,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // every fact write — the verdict is the enforcement, the attestation is its
   // record.
   const { attestationObject, ...attested } = await writeRunAttestation(cfg, {
-    item, factory: ctx.factory, gateResult: gateAsStands, intResult, log: ctx.log, home, workerId: ctx.workerId || null, settleToken: settled.token, built: pending.built,
+    item, factory: ctx.factory, gateResult: gateAsStands, intResult, log: ctx.log, home, workerId: ctx.workerId || null, settleToken: settled.token, built: pending.built, origin: pending.origin,
   });
   // Propose mode: the PR body written at propose time predates the graph
   // artifact it must be bound to (the artifact is minted only after the run
@@ -17306,7 +17312,18 @@ function prepareRunAttestation(cfg, { item, factory, gateResult, intResult, work
 
 // Exact publication destination; no ambient fallback for old unbound outboxes.
 function attestationGraphOrigin(cfg) {
-  if (cfg.mode() === "remote") return { mode: "remote", server: remote.base(cfg), org: String((typeof cfg.tenant === "function" && cfg.tenant()?.org) || "") };
+  if (cfg.mode() === "remote") {
+    const bearer = remote.token(cfg);
+    const server = remote.base(cfg);
+    if (!server || !bearer) throw new Error("remote attestation publication identity is unknown");
+    const org = auth.jwtOrg(bearer);
+    const selectedOrg = typeof cfg.tenant === "function" ? cfg.tenant()?.org : null;
+    if (org && selectedOrg && org !== selectedOrg) throw new Error("effective publication credential disagrees with the selected organization");
+    // Opaque credentials cannot prove an org from tenant metadata. Bind the
+    // actual credential instead; its raw bytes never enter the durable outbox.
+    const credential = crypto.createHash("sha256").update(`spor-attestation-origin\0${bearer}`).digest("hex");
+    return { mode: "remote", server, org: org || null, credential };
+  }
   const nodes = cfg.nodesDir();
   let canonical;
   try { canonical = fs.realpathSync(nodes); } catch { canonical = path.resolve(nodes); }
@@ -17314,8 +17331,26 @@ function attestationGraphOrigin(cfg) {
 }
 function attestationOriginMatches(cfg, origin) {
   if (!origin) return false;
-  try { const current = attestationGraphOrigin(cfg); return current.mode === origin.mode && (current.mode === "remote" ? !!origin.server && current.server === origin.server && current.org === origin.org : current.nodes === origin.nodes); }
+  try { const current = attestationGraphOrigin(cfg); return current.mode === origin.mode && (current.mode === "remote" ? !!origin.server && current.server === origin.server && current.org === origin.org && !!origin.credential && current.credential === origin.credential : current.nodes === origin.nodes); }
   catch { return false; }
+}
+
+// Freeze the exact bearer and server whose fingerprint was checked. Ordinary
+// HTTP requests may refresh a selected tenant's token, which is unsafe for
+// replay when its metadata disagrees with an explicit token override. Refresh
+// and credential rotation are therefore fail-closed for this publication.
+function attestationPublicationConfig(cfg, origin) {
+  if (!attestationOriginMatches(cfg, origin)) return null;
+  if (origin.mode !== "remote") return cfg;
+  const bearer = remote.token(cfg);
+  const credential = crypto.createHash("sha256").update(`spor-attestation-origin\0${bearer}`).digest("hex");
+  if (credential !== origin.credential) return null;
+  const fixed = { mode: () => "remote", server: () => origin.server, token: () => bearer, tenant: () => null };
+  return new Proxy(cfg, { get(target, key) {
+    if (Object.prototype.hasOwnProperty.call(fixed, key)) return fixed[key];
+    const value = Reflect.get(target, key);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
 }
 
 async function replayAttestationDebts(cfg, { home = cfg.userConfigHome(), log = () => {}, write = writeRunAttestation, refresh = refreshProposalAttestation } = {}) {
@@ -17338,7 +17373,7 @@ async function replayAttestationDebts(cfg, { home = cfg.userConfigHome(), log = 
 // stamp goes through stampGateState's `own` door, so it lands only while the
 // record still holds THIS pipeline's verdict — never force, which would let a
 // pipeline that lost the settle race overwrite the winner's evidence.
-async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, log = () => {}, home = null, workerId = null, settleToken = null, built: prepared = null }) {
+async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, log = () => {}, home = null, workerId = null, settleToken = null, built: prepared = null, origin = null }) {
   // `attestation_missing`/`attestation_error` ride on the result the loop
   // publishes (`--status`), the same fields the run record is stamped with —
   // a missing attestation is part of the verdict's evidence, not a log line
@@ -17360,7 +17395,9 @@ async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, 
     return missing(reason);
   }
   try {
-    const wrote = await writeGateNode(cfg, built.id, built.markdown);
+    const destination = attestationPublicationConfig(cfg, origin || (!prepared ? attestationGraphOrigin(cfg) : null));
+    if (!destination) return missing("publication origin is unknown or its effective credential changed; original evidence remains owed");
+    const wrote = await writeGateNode(destination, built.id, built.markdown);
     if (wrote && wrote.ok) out.attestation = built.id;
     else log(`work: the attestation for ${item.node_id} could not be recorded on the graph (${(wrote && wrote.reason) || "no response"}) — the verdict still stands`);
   } catch (e) {
@@ -21977,7 +22014,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { cmdWorkRegate, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning };
+module.exports = { launchSupervisedHarness, attestationPublicationConfig, cmdWorkRegate, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning };
 
 if (require.main === module) {
   main()

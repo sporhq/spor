@@ -195,13 +195,13 @@ test("outbox replay refuses other servers, organizations, local graphs, and lega
   cli.settleRunRecord(f.home, f.item.run_id, f.gateResult, "w", { token: "winner", pending: f.pending });
   const saved = runner.readJson(f.file);
   const otherLocal = { mode: () => "local", nodesDir: () => path.join(f.home, "other-nodes") };
-  const remote = (server, org) => ({ mode: () => "remote", server: () => server, tenant: () => ({ org }) });
+  const remote = (server, org) => ({ mode: () => "remote", server: () => server, token: () => `token-${org}`, tenant: () => ({ org }) });
   let writes = 0;
   const write = async () => { writes++; return { attestation: null }; };
   for (const [origin, cfg] of [
     [f.pending.origin, otherLocal], [f.pending.origin, remote("https://a.example", "a")],
-    [{ mode: "remote", server: "https://a.example", org: "a" }, remote("https://b.example", "a")],
-    [{ mode: "remote", server: "https://a.example", org: "a" }, remote("https://a.example", "b")],
+    [cli.attestationGraphOrigin(remote("https://a.example", "a")), remote("https://b.example", "a")],
+    [cli.attestationGraphOrigin(remote("https://a.example", "a")), remote("https://a.example", "b")],
     [null, f.cfg],
   ]) {
     runner.atomicJson(f.file, { ...saved, gate_attestation_pending: { ...f.pending, origin } });
@@ -211,7 +211,7 @@ test("outbox replay refuses other servers, organizations, local graphs, and lega
     assert.equal(fs.readFileSync(f.file, "utf8"), bytes, "wrong graph cannot clear original debt");
   }
   const cfg = remote("https://a.example/", "a");
-  runner.atomicJson(f.file, { ...saved, gate_attestation_pending: { ...f.pending, origin: { mode: "remote", server: "https://a.example", org: "a" } } });
+  runner.atomicJson(f.file, { ...saved, gate_attestation_pending: { ...f.pending, origin: cli.attestationGraphOrigin(cfg) } });
   await cli.replayAttestationDebts(cfg, { home: f.home, write });
   assert.equal(writes, 1, "matching origin alone may pay the debt");
 });
@@ -326,4 +326,94 @@ test("re-gating cannot clear incomplete flake evidence under the record claim lo
   runner.atomicJson(f.file, record);
   assert.equal(runner.claimGateRecord(f.home, f.item.run_id, { workerId: "new", reopen }).ok, true);
   assert.equal(runner.readJson(f.file).gate_regate_count, 1);
+});
+
+test("effective token override cannot replay another credential's outbox despite matching stored tenant metadata", async () => {
+  const f = fixture();
+  const auth = require("../lib/auth.js");
+  const server = "https://attestation.example.test";
+  const key = auth.tenantKey(server, "org-a");
+  auth.writeStore(f.home, { default: key, tenants: { [key]: { server, org: "org-a", access_token: "opaque-token-a", refresh_token: "stored-refresh-a", exp: 1 } } });
+  const config = (token) => loadConfig({ cwd: f.home, env: { SPOR_HOME: f.home, XDG_CONFIG_HOME: f.home, SPOR_SERVER: server, SPOR_TOKEN: token } });
+  const a = config("opaque-token-a"), b = config("opaque-token-b");
+  assert.equal(a.tenant().org, b.tenant().org, "reproduces stored org A even while B overrides authentication");
+  const pending = cli.prepareRunAttestation(a, { item: f.item, factory: f.factory, gateResult: f.gateResult, intResult: null });
+  assert.ok(pending.built, pending.error);
+  assert.ok(pending.origin.credential);
+  assert.equal(JSON.stringify(pending).includes("opaque-token-a"), false);
+  cli.settleRunRecord(f.home, f.item.run_id, f.gateResult, "w", { token: "winner", pending });
+  const before = fs.readFileSync(f.file, "utf8");
+  const originalFetch = global.fetch, originalRefresh = auth.refreshTenant;
+  const requests = []; let refreshes = 0;
+  auth.refreshTenant = async () => { refreshes++; return "wrong-refreshed-identity"; };
+  global.fetch = async (url, opts) => { requests.push({ url, bearer: opts.headers.Authorization }); return new Response(JSON.stringify({ results: [{ status: "created" }] }), { status: 200 }); };
+  try {
+    await cli.replayAttestationDebts(b, { home: f.home });
+    assert.equal(requests.length, 0, "private evidence never leaves under effective token B");
+    assert.equal(fs.readFileSync(f.file, "utf8"), before);
+    await cli.replayAttestationDebts(a, { home: f.home });
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].bearer, "Bearer opaque-token-a");
+    assert.equal(refreshes, 0, "an expired selected tenant cannot silently replace the bound credential");
+    assert.equal(runner.readJson(f.file).gate_attestation_pending, null);
+    const unknown = config(""); unknown.token = () => "";
+    assert.equal(cli.attestationOriginMatches(unknown, pending.origin), false);
+    const jwtB = `e30.${Buffer.from(JSON.stringify({ org: "org-b" })).toString("base64url")}.sig`;
+    assert.throws(() => cli.attestationGraphOrigin(config(jwtB)), /disagrees/);
+  } finally { global.fetch = originalFetch; auth.refreshTenant = originalRefresh; }
+});
+
+test("frozen publication cfg retains matched server/bearer and never refreshes on an auth refusal", async () => {
+  const remote = require("../lib/remote.js");
+  const auth = require("../lib/auth.js");
+  let bearer = "original-token", server = "https://original.example.test";
+  const cfg = { mode: () => "remote", token: () => bearer, server: () => server, tenant: () => ({ org: "a", refresh_token: "refresh-a", exp: 1 }) };
+  const origin = cli.attestationGraphOrigin(cfg);
+  const bound = cli.attestationPublicationConfig(cfg, origin);
+  bearer = "successor-token"; server = "https://successor.example.test";
+  assert.equal(cli.attestationPublicationConfig(cfg, origin), null);
+  const originalFetch = global.fetch, originalRefresh = auth.refreshTenant;
+  const requests = []; let refreshes = 0;
+  global.fetch = async (url, opts) => { requests.push({ url, token: opts.headers.Authorization }); return new Response("denied", { status: 401 }); };
+  auth.refreshTenant = async () => { refreshes++; return "refreshed"; };
+  try {
+    assert.equal((await remote.post(bound, "/v1/nodes", { nodes: [] })).status, 401);
+    assert.deepEqual(requests, [{ url: "https://original.example.test/v1/nodes", token: "Bearer original-token" }]);
+    assert.equal(refreshes, 0);
+  } finally { global.fetch = originalFetch; auth.refreshTenant = originalRefresh; }
+});
+
+test("delayed launcher PID bookkeeping cannot replace a supervisor's terminal record or re-gate outbox", async () => {
+  const f = fixture();
+  const script = path.join(f.home, "fake-supervisor.js");
+  fs.writeFileSync(script, 'require("node:fs").writeSync(3, JSON.stringify({ok:true})+"\\n");\n');
+  const originalCmd = process.env.SPOR_DISPATCH_RUNNER_CMD;
+  const originalTicks = runner.processStartTicks;
+  process.env.SPOR_DISPATCH_RUNNER_CMD = script;
+  let expected, recordFile;
+  runner.processStartTicks = (pid) => {
+    // Deterministic pause seam: the real supervisor has been spawned, but the
+    // launcher's post-spawn bookkeeping has not yet read/merged its record.
+    const launched = runner.readRunRecords(f.home).find((r) => r.run_id !== f.item.run_id);
+    assert.ok(launched);
+    recordFile = runner.runPaths(f.home, launched.run_id).record;
+    runner.stampRun(f.home, launched.run_id, { state: "done", terminal_state: "resolved", terminal_enforced: true });
+    const claim = runner.claimGateRecord(f.home, launched.run_id, { workerId: "regate-owner" });
+    const item = { ...f.item, run_id: launched.run_id };
+    const pending = cli.prepareRunAttestation(f.cfg, { item, factory: f.factory, gateResult: f.gateResult, intResult: null });
+    assert.equal(cli.settleRunRecord(f.home, launched.run_id, f.gateResult, "regate-owner", { token: claim.token, pending }).landed, true);
+    expected = runner.readJson(recordFile);
+    return originalTicks(pid);
+  };
+  try {
+    const launched = await cli.launchSupervisedHarness(f.cfg, { adapter: { id: "codex", label: "Codex", launchMode: "supervised-jsonl" }, command: process.execPath, args: [], cwd: f.home, name: "late-launcher", nodeId: "task-late", prompt: "test only", server: null, localNodesDir: f.cfg.nodesDir() });
+    assert.equal(launched.ok, true, launched.error);
+    const actual = runner.readJson(recordFile);
+    assert.equal(actual.state, "done");
+    assert.equal(actual.terminal_state, "resolved");
+    assert.equal(actual.gate_settle_id, expected.gate_settle_id);
+    assert.deepEqual(actual.gate_attestation_pending, expected.gate_attestation_pending);
+    assert.equal(actual.gate_worker, "regate-owner");
+    assert.ok(actual.runner_pid);
+  } finally { runner.processStartTicks = originalTicks; if (originalCmd === undefined) delete process.env.SPOR_DISPATCH_RUNNER_CMD; else process.env.SPOR_DISPATCH_RUNNER_CMD = originalCmd; }
 });

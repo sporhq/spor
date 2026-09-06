@@ -4257,13 +4257,21 @@ Settlement atomically writes the verdict and `gate_attestation_pending`, an
 outbox containing the exact artifact bytes and signature (never the signing
 key). `gate_attestation_missing` remains true until publication succeeds.
 Subsequent worker passes replay this debt without rerunning the gates or
-resigning evidence. Replay requires the original server and organization, or
-the canonical local nodes directory. An old outbox without an origin binding
+resigning evidence. Replay requires the original server and effective
+credential fingerprint, or the canonical local nodes directory. The raw token
+is never stored. A conflicting JWT organization refuses the binding; opaque
+tokens bind by fingerprint rather than stored tenant metadata. Publication
+freezes that exact bearer/server and disables automatic token refresh, so an
+environment override or credential rotation cannot redirect pending evidence.
+Changed or unknown credentials leave the debt owed for manual reconciliation. An old outbox without an origin binding
 is retained for manual reconciliation and is never published through an ambient
 graph selection. A parked proposal retains its debt until its PR body is
 refreshed successfully. Pending debt prevents run retention from pruning the
 record. Gate, implementation, completion, native/contract settlement and final
 run bookkeeping all share the same record lock, including their read/merge.
+The launcher also merges its post-spawn PID stamp through this lock: a paused
+launcher cannot restore its original record over a completed supervisor or
+subsequent re-gate.
 
 A re-gate publishes its PID and process start ticks before atomically reopening
 the prior verdict. Reopening refuses while the prior judgement still owes an

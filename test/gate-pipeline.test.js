@@ -8945,7 +8945,7 @@ test("unpaid flake evidence survives a process restart without rerunning command
   let writable = false;
   let failFactCreate = true;
   let failReceipt = false;
-  const remoteOrigin = (server, org) => ({ mode: () => "remote", server: () => server, tenant: () => ({ org }) });
+  const remoteOrigin = (server, org) => ({ mode: () => "remote", server: () => server, token: () => `credential-${org}`, tenant: () => ({ org }) });
   const originalCfg = remoteOrigin("https://graph-a.example", "team-a");
   let currentCfg = originalCfg;
   const facts = new Map();
@@ -9208,4 +9208,52 @@ test("a crash after flake issue filing resumes the saved classification even whe
   assert.strictEqual(saved.filingIntent, undefined, "intent is replaced by evidence and its receipt in one save");
   assert.strictEqual(saved.evidence.complete, true);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("flake graph doors freeze the verified credential across filing and refuse rotated replay without refresh", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-flake-bound-"));
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: "https://flake.example.test", SPOR_TOKEN: "original" } });
+  let bearer = "original";
+  cfg.mode = () => "remote";
+  cfg.server = () => "https://flake.example.test";
+  cfg.token = () => bearer;
+  cfg.tenant = () => ({ org: "selected", exp: 1, refresh_token: "refresh-selected" });
+  const deps = flakeDeps(cfg, home);
+  const origin = deps.evidenceOrigin();
+  assert.strictEqual(JSON.stringify(origin).includes("original"), false);
+  const auth = require("../lib/auth.js");
+  const originalFetch = global.fetch, originalRefresh = auth.refreshTenant;
+  const requests = [];
+  let refreshes = 0;
+  const fact = gateRunner.buildGateFact({ gate: { id: "acceptance", kind: "command" }, nodeId: "task-p", runId: "run-abcdef12", verdict: "passed", detail: "classified evidence", factory: "factory-demo", date: "2026-09-06" });
+  auth.refreshTenant = async () => { refreshes += 1; return "refreshed-wrong-identity"; };
+  global.fetch = async (url, options) => {
+    requests.push({ url, bearer: options.headers.Authorization });
+    if (url.endsWith("/edges/live")) return new Response("denied", { status: 401 });
+    if (options.method === "GET") {
+      if (url.endsWith(fact.id)) return new Response(JSON.stringify({ raw: fact.markdown }), { status: 200 });
+      bearer = "successor"; // config rotates after selection, before issue POST
+      return new Response("missing", { status: 404 });
+    }
+    return new Response(JSON.stringify({ results: [{ status: "created" }] }), { status: 200 });
+  };
+  try {
+    const gate = { id: "acceptance", command: "npm test", isolate: "node --test {files}" };
+    const filed = await deps.fileFlakeItem({ gate, file: "test/off.test.js", files: ["test/off.test.js"], command: gate.command, isolate: gate.isolate, origin });
+    assert.ok(filed.ok, JSON.stringify({ filed, requests }));
+    assert.strictEqual(requests.length, 2);
+    const before = requests.length;
+    assert.strictEqual((await deps.recordFact({ ...fact, flakeIssues: ["issue-flake-one"], origin })).ok, false);
+    assert.strictEqual(requests.length, before, "rotated replay sends no evidence");
+    bearer = "original";
+    assert.ok((await deps.recordFact({ ...fact, flakeIssues: ["issue-flake-one"], origin })).ok);
+    assert.ok((await deps.readFact({ ...fact, flakeIssues: ["issue-flake-one"], origin })).same);
+    assert.strictEqual((await deps.linkFact({ id: fact.id, type: "relates-to", to: "issue-flake-one", gate, file: "test/off.test.js", files: ["test/off.test.js"], origin })).ok, false);
+    assert.ok(requests.every((request) => request.bearer === "Bearer original"));
+    assert.strictEqual(refreshes, 0, "publication never substitutes the selected tenant credential");
+  } finally {
+    global.fetch = originalFetch;
+    auth.refreshTenant = originalRefresh;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
