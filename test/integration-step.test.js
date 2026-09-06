@@ -1374,6 +1374,298 @@ test("checkProposals never retries a pending demotion against an already-closed 
   assert.deepStrictEqual(third.filter((l) => l.includes("task-proposed")), []);
 });
 
+// ----------------------------- propose mode against an ENFORCING remote fake --
+//
+// issue-spor-restore-proposal-closes-tracking-item-with-bare-done-no-resolver:
+// every propose-mode test above drives checkProposals/restoreProposal against a
+// LOCAL nodes dir, whose write door (setStatusLocal) only checks status-vocabulary
+// membership and the execution hold — it never runs the seed schema's
+// transitions() completion gate (task-cc-terminal-status-requires-resolver), so a
+// bare `done` with no resolver silently succeeds there. The real gate is remote
+// (the server runs transitions() on every status write), so only a fake that
+// ENFORCES it — reproducing the seed schema-task rule "a completion status needs a
+// live resolves/answers edge from a decision or artifact" — can prove
+// restoreProposal never closes the tracking item with a bare status flip.
+function startFakeGraphServer() {
+  const http = require("node:http");
+  const graphLib = require("../lib/graph.js");
+  const completionShellHelper = require("../lib/shell/completion.js");
+  const store = new Map(); // id -> { raw, revision }
+
+  const parse = (raw, id) => {
+    try {
+      return graphLib.parseFrontmatter(raw, `${id}.md`);
+    } catch {
+      return {};
+    }
+  };
+  // Mirrors lib/seed/schema-task.md's declared `status.completion` /
+  // `status.resolver_required` — the ONLY types this fake's proposal graphs use.
+  const COMPLETION_BY_TYPE = { task: "done" };
+  const resolverOf = (id) => {
+    for (const [srcId, entry] of store) {
+      if (srcId === id) continue;
+      const node = parse(entry.raw, srcId);
+      if (node.type !== "decision" && node.type !== "artifact") continue;
+      const hit = (node.edges || []).find((e) => (e.type === "resolves" || e.type === "answers") && e.to === id);
+      if (hit) return { by: srcId, edge: hit.type };
+    }
+    return null;
+  };
+  const readBody = (req) =>
+    new Promise((resolve) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => resolve(body));
+    });
+
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, "http://localhost");
+    const send = (status, obj) => {
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify(obj));
+    };
+
+    if (req.method === "GET" && url.pathname.startsWith("/v1/nodes/")) {
+      const id = decodeURIComponent(url.pathname.slice("/v1/nodes/".length));
+      const entry = store.get(id);
+      if (!entry) return send(404, { error: { message: "not found" } });
+      const resolution = resolverOf(id);
+      return send(200, { raw: entry.raw, revision: String(entry.revision), resolution: resolution ? { by: resolution.by, edge: resolution.edge } : null });
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1/nodes") {
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const results = [];
+      for (const item of body.nodes || []) {
+        const node = parse(item.node, "unknown");
+        const id = node.id;
+        if (!id) {
+          results.push({ ok: false, code: "invalid", message: "node has no id" });
+          continue;
+        }
+        const existing = store.get(id);
+        if (item.if_exists === "skip" && existing) {
+          results.push({ ok: true, status: "skipped" });
+          continue;
+        }
+        if (item.if_exists === "update") {
+          if (!existing) {
+            results.push({ ok: false, code: "not_found", message: `no such node: ${id}` });
+            continue;
+          }
+          if (item.revision != null && String(item.revision) !== String(existing.revision)) {
+            results.push({ ok: false, code: "conflict", message: `stale revision for '${id}'` });
+            continue;
+          }
+          store.set(id, { raw: item.node, revision: existing.revision + 1 });
+          results.push({ ok: true, revision: String(existing.revision + 1) });
+          continue;
+        }
+        if (existing) {
+          results.push({ ok: false, code: "exists", message: `${id} already exists` });
+          continue;
+        }
+        store.set(id, { raw: item.node, revision: 1 });
+        results.push({ ok: true, status: "created" });
+      }
+      return send(200, { results });
+    }
+
+    const statusMatch = /^\/v1\/nodes\/([^/]+)\/status$/.exec(url.pathname);
+    if (req.method === "POST" && statusMatch) {
+      const id = decodeURIComponent(statusMatch[1]);
+      const entry = store.get(id);
+      if (!entry) return send(404, { error: { message: "not found" } });
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const node = parse(entry.raw, id);
+      // The seed completion gate (task-cc-terminal-status-requires-resolver): a
+      // completion status needs a live resolves/answers edge from a decision or
+      // artifact node ALREADY on the graph — this is what a bare status flip
+      // with no resolver refuses.
+      const completionValue = COMPLETION_BY_TYPE[node.type];
+      if (completionValue && body.status === completionValue && !resolverOf(id)) {
+        return send(409, {
+          error: {
+            code: "transition_denied",
+            message:
+              "done requires a decision or artifact node in a RESOLVING state that resolves this task (an inbound resolves edge) (task-cc-terminal-status-requires-resolver)",
+          },
+        });
+      }
+      const rewritten = completionShellHelper.setFrontmatterKey(entry.raw, "status", body.status);
+      store.set(id, { raw: rewritten != null ? rewritten : entry.raw, revision: entry.revision + 1 });
+      return send(200, {});
+    }
+
+    const edgeMatch = /^\/v1\/nodes\/([^/]+)\/edges$/.exec(url.pathname);
+    if (req.method === "POST" && edgeMatch) {
+      const id = decodeURIComponent(edgeMatch[1]);
+      const entry = store.get(id);
+      if (!entry) return send(404, { error: { message: "not found" } });
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const rewritten = `${entry.raw.replace(/\n---\n/, `\n  - {type: ${body.type}, to: ${body.to}}\n---\n`)}`;
+      store.set(id, { raw: rewritten, revision: entry.revision + 1 });
+      return send(200, {});
+    }
+
+    send(404, { error: { message: "unknown route" } });
+  });
+
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => resolve({ server, port: server.address().port, store }));
+  });
+}
+
+function fakeNode(id, front) {
+  return `---\nid: ${id}\n${front}date: 2026-09-06\n---\n\nBody.\n`;
+}
+
+test("issue-spor-restore-proposal-closes-tracking-item-with-bare-done-no-resolver: propose mode under CONTROLLER completion — the landed fact resolves the tracking item BEFORE its status flips, so a remote-mode completion gate never refuses it", async (t) => {
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+
+  const { server, port, store } = await startFakeGraphServer();
+  t.after(() => server.close());
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-propose-remote-gate-"));
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: `http://127.0.0.1:${port}`, SPOR_TOKEN: "t" } });
+  assert.strictEqual(cfg.mode(), "remote");
+
+  const nodeId = "task-proposed";
+  const runId = "11111111-2222-3333-4444-0000000000aa";
+  const trackerId = sporCli.proposalTrackingId(nodeId, runId);
+  const executionId = "exec-test-remote-gate";
+
+  // The work item is HELD by a factory controller (execution:) — the same
+  // state it would be in when the integration stage parks it for review.
+  store.set(nodeId, { raw: fakeNode(nodeId, `type: task\ntitle: Add bounded retry\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: open\nexecution: ${executionId}\nexecution_at: 2026-09-06T00:00:00.000Z\n`), revision: 1 });
+  // The tracking item park() would have filed — content doesn't need to match
+  // buildProposalTrackingNode byte-for-byte; checkProposals only needs it present.
+  store.set(trackerId, { raw: fakeNode(trackerId, `type: task\ntitle: Integration proposed\nsummary: The integration stage opened a PR for ${nodeId}; it lands automatically once merged.\nstatus: open\nrequires: [human]\nedges:\n  - {type: blocks, to: ${nodeId}}\n`), revision: 1 });
+
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, {
+    run_id: runId,
+    node_id: nodeId,
+    state: "done",
+    gate_state: "parked",
+    gate_proposal_number: 55,
+    gate_proposal_repo: "demo/repo",
+    gate_proposal_url: "https://github.com/demo/repo/pull/55",
+    gate_proposal_branch: nodeId,
+    gate_proposal_target_ref: "main",
+    gate_proposal_strategy: "merge",
+    gate_proposal_project: "demo",
+    gate_proposal_factory: "factory-demo",
+    gate_proposal_blocker: trackerId,
+    impl_claim: {
+      execution_id: executionId,
+      completion: { by: "controller", after: "integration" },
+      factory: { node_id: "factory-demo" },
+    },
+    impl_candidate: { candidate_id: "cand-abc123def456", commit: "deadbeef00", tree: "beadfeed00" },
+  });
+
+  const ghDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-fake-gh-remote-gate-"));
+  const stateFile = path.join(ghDir, "state.json");
+  fs.writeFileSync(stateFile, JSON.stringify({ state: "MERGED", mergedAt: "2026-09-06T00:00:00Z", mergeCommit: { oid: "deadbeefcafe" }, mergedBy: { login: "reviewer" }, baseRefName: "main" }));
+  writeFakePathBin(ghDir, "gh", `if [ "$1" = "--version" ]; then echo "gh version 2.0.0"; exit 0; fi\ncat "${stateFile}"\n`);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${ghDir}${path.delimiter}${originalPath}`;
+  t.after(() => { process.env.PATH = originalPath; });
+
+  const log = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => log.push(l) });
+
+  const statusOf = (id) => {
+    const parsed = require("../lib/graph.js").parseFrontmatter(store.get(id).raw, `${id}.md`);
+    return parsed.status;
+  };
+
+  assert.ok(!log.some((l) => /could not be closed/.test(l)), `the tracking item's completion gate should never refuse it once the landed fact exists:\n${log.join("\n")}`);
+  assert.strictEqual(statusOf(nodeId), "done", "the controller wrote the work item's own completion");
+  assert.strictEqual(statusOf(trackerId), "done", "the tracking item closed too, with a resolver already on the graph");
+
+  const landedFactId = require("../lib/shell/integration-runner.js").integrationFactId(nodeId, runId, "landed");
+  assert.ok(store.has(landedFactId), "the landed fact was recorded");
+  assert.match(store.get(landedFactId).raw, new RegExp(`- \\{type: resolves, to: ${trackerId}\\}`), "the landed fact is the tracking item's resolver");
+
+  const completionResolverId = `art-completion-${nodeId.replace(/^task-/, "")}-abc123def456`;
+  assert.ok(store.has(completionResolverId), "the controller's own completion resolver was written for the work item");
+  assert.match(store.get(completionResolverId).raw, new RegExp(`- \\{type: resolves, to: ${nodeId}\\}`));
+});
+
+// The LEGACY half of the same scenario: no impl_claim, so restoreProposal takes
+// the non-controller branch (gatePromoteItem, restoring a resolver the
+// IMPLEMENTER already wrote before park() demoted it, rather than one the
+// controller writes here) — same enforcing gate, same "the tracking item's own
+// resolver must already exist before its status flips" requirement.
+test("issue-spor-restore-proposal-closes-tracking-item-with-bare-done-no-resolver: propose mode under LEGACY (agent-resolved) completion — the tracking item still closes against the enforcing remote gate", async (t) => {
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+
+  const { server, port, store } = await startFakeGraphServer();
+  t.after(() => server.close());
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-propose-remote-gate-legacy-"));
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: `http://127.0.0.1:${port}`, SPOR_TOKEN: "t" } });
+  assert.strictEqual(cfg.mode(), "remote");
+
+  const nodeId = "task-proposed-legacy";
+  const runId = "11111111-2222-3333-4444-0000000000bb";
+  const trackerId = sporCli.proposalTrackingId(nodeId, runId);
+
+  // The implementer already resolved the work item itself (a decision node,
+  // pre-dating the controller-completion boundary) and park() rolled its
+  // status back to `open`, blocked by the tracking item — the pre-existing
+  // propose-mode shape (task-spor-integration-propose-mode).
+  store.set("dec-resolver-legacy", { raw: fakeNode("dec-resolver-legacy", `type: decision\ntitle: Added bounded retry\nsummary: Added bounded retry with backoff to the sync worker.\nedges:\n  - {type: resolves, to: ${nodeId}}\n`), revision: 1 });
+  store.set(nodeId, { raw: fakeNode(nodeId, `type: task\ntitle: Add bounded retry\nsummary: Add bounded retry with backoff to the sync worker so transient failures never drop records.\nstatus: open\n`), revision: 1 });
+  store.set(trackerId, { raw: fakeNode(trackerId, `type: task\ntitle: Integration proposed\nsummary: The integration stage opened a PR for ${nodeId}; it lands automatically once merged.\nstatus: open\nrequires: [human]\nedges:\n  - {type: blocks, to: ${nodeId}}\n`), revision: 1 });
+
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, runId).record, {
+    run_id: runId,
+    node_id: nodeId,
+    state: "done",
+    gate_state: "parked",
+    gate_proposal_number: 56,
+    gate_proposal_repo: "demo/repo",
+    gate_proposal_url: "https://github.com/demo/repo/pull/56",
+    gate_proposal_branch: nodeId,
+    gate_proposal_target_ref: "main",
+    gate_proposal_strategy: "merge",
+    gate_proposal_project: "demo",
+    gate_proposal_factory: "factory-demo",
+    gate_proposal_blocker: trackerId,
+  });
+
+  const ghDir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-fake-gh-remote-gate-legacy-"));
+  const stateFile = path.join(ghDir, "state.json");
+  fs.writeFileSync(stateFile, JSON.stringify({ state: "MERGED", mergedAt: "2026-09-06T00:00:00Z", mergeCommit: { oid: "deadbeefcafe" }, mergedBy: { login: "reviewer" }, baseRefName: "main" }));
+  writeFakePathBin(ghDir, "gh", `if [ "$1" = "--version" ]; then echo "gh version 2.0.0"; exit 0; fi\ncat "${stateFile}"\n`);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${ghDir}${path.delimiter}${originalPath}`;
+  t.after(() => { process.env.PATH = originalPath; });
+
+  const log = [];
+  await sporCli.checkProposals(cfg, { home, log: (l) => log.push(l) });
+
+  const statusOf = (id) => {
+    const parsed = require("../lib/graph.js").parseFrontmatter(store.get(id).raw, `${id}.md`);
+    return parsed.status;
+  };
+
+  assert.ok(!log.some((l) => /could not be closed/.test(l)), `the tracking item's completion gate should never refuse it once the landed fact exists:\n${log.join("\n")}`);
+  assert.strictEqual(statusOf(nodeId), "done", "the work item's own completion status was restored");
+  assert.strictEqual(statusOf(trackerId), "done", "the tracking item closed too, with a resolver already on the graph");
+
+  const landedFactId = require("../lib/shell/integration-runner.js").integrationFactId(nodeId, runId, "landed");
+  assert.ok(store.has(landedFactId), "the landed fact was recorded");
+  assert.match(store.get(landedFactId).raw, new RegExp(`- \\{type: resolves, to: ${trackerId}\\}`), "the landed fact is the tracking item's resolver");
+});
+
 // ---------------------------------------------------- the git plumbing, for real --
 
 function git(dir, ...args) {
