@@ -2048,3 +2048,92 @@ test("verifyStalePremise refuses on anything short of fully-verified, fully-land
   assert.strictEqual(partial.ok, false);
   assert.match(partial.reason, /not all land on the trusted ref \(spor@bbb do not\)/);
 });
+
+// ------------------------------------ classifyExecutionOutcome (§5.3) --------
+//
+// task-spor-factory-execution-outcome-classifier: ONE pure table, over what a
+// run record already carries, that separates an infrastructure OUTAGE from a
+// code FAILURE — plus the two rules that bound it. Driven as a table so a row
+// added on one side of the client can never be added on the other only.
+
+test("classifyExecutionOutcome maps §5.3's table, outcome and pool together", () => {
+  const rows = [
+    // [what the record says, outcome, pool]
+    [{ state: "failed", termination_class: "environment", termination_signal: "credit-exhausted" }, "infrastructure", "retry"],
+    [{ state: "failed", termination_class: "environment", termination_signal: "rate-limited" }, "infrastructure", "retry"],
+    [{ state: "failed_launch", termination_class: "launch", termination_signal: "launch-failed" }, "infrastructure", "retry"],
+    [{ state: "failed_launch", termination_class: "launch", termination_signal: "launcher-nonzero" }, "infrastructure", "retry"],
+    [{ state: "failed", termination_class: "unknown", termination_signal: "supervisor-gone" }, "infrastructure", "retry"],
+    [{ state: "done", termination_class: "completed", terminal_enforced: false, terminal_unreachable: true }, "infrastructure", "retry"],
+    [{ state: "failed", termination_class: "failed", termination_signal: "nonzero-exit" }, "failed", "implementation"],
+    [{ state: "failed", termination_class: "idle", termination_signal: "idle-timeout" }, "cancelled", "implementation"],
+    [{ state: "done", termination_class: "completed", terminal_state: "declined", declined_reason: "the item is already done" }, "declined", null],
+    [{ state: "done", termination_class: "completed", termination_signal: "turn-complete" }, "completed", null],
+  ];
+  for (const [record, outcome, pool] of rows) {
+    const got = gates.classifyExecutionOutcome(record);
+    assert.strictEqual(got.outcome, outcome, JSON.stringify(record));
+    assert.strictEqual(got.pool, pool, JSON.stringify(record));
+    assert.ok(got.reason, "every reading says why");
+  }
+});
+
+test("rule 1: ambiguity classifies `failed`, the BOUNDED side — never `infrastructure`", () => {
+  // An infrastructure reading spends a pool that does not consume the item's
+  // attempts, so a misclassification there LOOPS; the same misclassification
+  // the other way costs one attempt and stops.
+  for (const record of [
+    { state: "vanished", termination_class: "unknown", termination_signal: "empty-transcript" },
+    { state: "vanished", termination_class: "unknown", termination_signal: "no-transcript" },
+    // A signal a NEWER client wrote and this one does not know.
+    { state: "failed", termination_class: "quantum-flux", termination_signal: "who-knows" },
+    // Unenforced for some reason OTHER than an unreachable graph: the runner's
+    // own provisional patch is unenforced too, and reading that as an outage
+    // is exactly the loop rule 1 forbids.
+    { state: "failed", terminal_enforced: false },
+    {},
+  ]) {
+    const got = gates.classifyExecutionOutcome(record);
+    assert.strictEqual(got.outcome, "failed", JSON.stringify(record));
+    assert.strictEqual(got.pool, "implementation");
+  }
+});
+
+test("rule 2: a refusal is not an attempt — `unroutable`, and neither pool", () => {
+  const got = gates.classifyExecutionOutcome(null, "cannot dispatch task-a: this box cannot satisfy profile-x");
+  assert.strictEqual(got.outcome, "unroutable");
+  assert.strictEqual(got.pool, null);
+  assert.match(got.reason, /cannot satisfy profile-x/);
+  // The object form the shell's own refusals arrive in.
+  assert.strictEqual(gates.classifyExecutionOutcome(null, { reason: "no launcher resolved" }).outcome, "unroutable");
+  // A RECORD is the evidence when there is one: a refusal is only read when
+  // no record was ever created, so the two rows of the table cannot disagree.
+  const withRecord = gates.classifyExecutionOutcome({ state: "failed", termination_class: "environment" }, "a stale refusal string");
+  assert.strictEqual(withRecord.outcome, "infrastructure");
+  // Neither a record nor a refusal names nothing — the bounded side again.
+  assert.strictEqual(gates.classifyExecutionOutcome(null, null).outcome, "failed");
+});
+
+test("executionOutcomeSettles: every reading but `completed` settles its attempt", () => {
+  for (const o of ["failed", "infrastructure", "cancelled", "declined", "unroutable"]) assert.strictEqual(gates.executionOutcomeSettles(o), true, o);
+  assert.strictEqual(gates.executionOutcomeSettles("completed"), false, "a clean run's outcome is what it produced");
+  assert.strictEqual(gates.executionOutcomeSettles("nonsense"), false);
+});
+
+test("the pool caps come from the declared stage — a factory that declared none has neither pool", () => {
+  const { implementation } = gates.parseImplementation({ implementation: { profile: "profile-impl", budget: { attempts: 2 }, retry: { attempts: 3 } } });
+  assert.strictEqual(gates.executionPoolCap(implementation, "implementation"), 2);
+  assert.strictEqual(gates.executionPoolCap(implementation, "retry"), 3);
+  assert.strictEqual(gates.executionPoolHeadroom(implementation, "retry", 3), 0);
+  assert.strictEqual(gates.executionPoolHeadroom(implementation, "retry", 1), 2);
+  // Undeclared: no stage, no pools — the no-cliff posture.
+  assert.strictEqual(gates.executionPoolCap(null, "retry"), 0);
+  assert.strictEqual(gates.executionPoolCap(null, "implementation"), 0);
+  assert.strictEqual(gates.executionPoolHeadroom(null, "retry", 0), 0);
+  // The defaults §2.1 declares, when the block is there but the budgets are not.
+  const { implementation: defaults } = gates.parseImplementation({ implementation: { profile: "profile-impl" } });
+  assert.strictEqual(gates.executionPoolCap(defaults, "implementation"), 1);
+  assert.strictEqual(gates.executionPoolCap(defaults, "retry"), 1);
+  // A pool nobody named is not a pool.
+  assert.strictEqual(gates.executionPoolCap(defaults, "cycle"), 0);
+});

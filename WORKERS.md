@@ -1015,6 +1015,7 @@ record still `launching`/`running` has none of these yet):
 | `readiness_cleared` | bool | declined only — whether the target's `readiness: agent` stamp was cleared |
 | `lease_released` | bool | optional — `true` once the server CONFIRMED the handback. `false` means it was **not confirmed**, which is strictly weaker than "still held" and is all a client can honestly record: it covers a release deliberately never attempted (the report or finding write was refused, §6), one the server refused, and one whose answer never came back at all — and that last case sits over a release the server may well have committed and lost the ack for. Read it as "nobody has seen this lease come back", and act on it the same way either way: `spor release <id>`, or wait out the TTL. That remedy reconciles rather than assuming — release is idempotent, and a claim someone else now holds answers `409` naming the holder (API.md §3) instead of being yanked out from under a live agent. **Omitted** (not `false`) when no lease was this run's to release at all |
 | `terminal_note` | string | a human-readable explanation of the outcome, always present once this dimension exists |
+| `terminal_unreachable` | bool | optional — the §6 contract could not REACH the graph to verify this run, so its outcome is unverified for a TRANSPORT reason rather than an agent one. `terminal_enforced: false` alone cannot say that (a never-started run and the runner's own provisional patch are unenforced too), and the execution classifier (§10.4) reads an outage off this rather than off a note string |
 
 A record with `terminal_state` unset (or `state` still non-terminal) has not
 finished; poll or watch the record file rather than assuming absence means
@@ -1031,7 +1032,7 @@ written only after the outcome dimension exists):
 | `gate_reason` | string | optional — the settled verdict's one-line reason |
 | `gate_fix_run_id` | string | optional — the run id of the most recent fix cycle this pipeline dispatched at the same node, stamped the moment it was dispatched (not when it finishes). If a stop lands while that fix cycle is still going, this field is what turns "the pipeline was abandoned" into "here is the run to go check" — a fix cycle's own dispatched run is detached and keeps going regardless (§10.7), and this is the only durable pointer to it. `spor runs`/`spor work --status` surface it. |
 | `gate_fix_at` | ISO 8601 | when `gate_fix_run_id` was stamped |
-| `gate_progress` | object | optional — `{key, at, seq, gates: {<gate id>: {fixes, attempts, ledger, lastFix}}}`: each gate's own memory (§10.4), saved after every review verdict (with the fix it decided on as `lastFix.dispatched: false`) and again when the fix's launch is known (`fixes` counts LAUNCHED fixes only). `key` is the attempt's run key — a resumed pipeline of the same attempt reads it back; a `--regate` (a new attempt) ignores it. Best-effort like every `gate_*` stamp: a write that fails is logged and the pipeline goes on |
+| `gate_progress` | object | optional — `{key, at, seq, gates: {<gate id>: {fixes, attempts, ledger, lastFix}}, rescue, pools}`: each gate's own memory (§10.4), saved after every review verdict (with the fix it decided on as `lastFix.dispatched: false`) and again when the fix's launch is known (`fixes` counts LAUNCHED fixes only). `key` is the attempt's run key — a resumed pipeline of the same attempt reads it back; a `--regate` (a new attempt) ignores it. Best-effort like every `gate_*` stamp: a write that fails is logged and the pipeline goes on. `pools` is the pipeline's shared INFRASTRUCTURE pool — `{retry: {spent}}`, §10.4 — carried by every other save under the same key; unlike the rest of the stamp its write is NOT best-effort, since a retry nobody recorded is one the next resume would grant again |
 | `gate_escalation_failed` | boolean | optional — set when the refusal (a gate's, or the integration stage's, §10.9) could not file the escalation that carries it, so nothing was written to the graph and (§10.7) nothing was demoted either. The verdict is still settled; this is what says the refusal is readable only on this box, and that the bounded auto-retry below — or `spor work --regate` once it gives up — is the door back. Cleared (`false`) once an escalation lands, by hand or by the auto-retry |
 | `gate_escalation_pending` | object | optional (§10.7) — the exact args `deps.escalate` needs to replay the failed write. A gate refusal's: `{gateId, attempt, attempts, detail, evidence, findings, ledger, factId, rescue?, rescues?}`; the integration stage's (§10.9): `{stage: "integration", gateId: "integration", attempt, attempts, detail, evidence, factId}` — `stage` is what routes the replay to the stage's own escalation (a declared gate may be named `integration` too), and `factId` names the refusal's own `art-gate-…`/`art-merge-…` fact so a landed retry can close it. What the bounded auto-retry reads; absent for a blocked human gate (no escalate call to replay). Cleared (`null`) once the escalation lands |
 | `gate_escalation_retry_count` | number | optional — how many times the bounded auto-retry has attempted this refusal's escalation write, landed or not. `0` the moment `gate_escalation_pending` is first stamped |
@@ -1874,6 +1875,82 @@ factory opts into re-dispatching an implementer); a factory that routes to a
 review gate should declare at least one, since with the floor above the only
 thing that reaches a person is a demonstrated blocking finding the implementer
 never got to fix.
+
+#### An OUTAGE is not a rejection
+
+A reviewer that never answered is not information about the change. Every
+dispatch a pipeline makes — the review, its fix cycles — is read through ONE
+shared classifier, `classifyExecutionOutcome` in `lib/kernel/gates.js`
+(FACTORY-IMPLEMENTATION-STAGE.md §5.3,
+task-spor-factory-execution-outcome-classifier), which separates an
+**infrastructure** outage from a **code** failure over what the run record
+already carries — `state`, `termination_class`, `termination_signal`,
+`terminal_state`, `terminal_enforced` — or, where no record was ever created,
+over the dispatch refusal itself:
+
+| what the record says | class | pool |
+|---|---|---|
+| `termination_class: environment` (credit / rate / auth exhaustion) | `infrastructure` | `implementation.retry` |
+| `state: failed_launch` — a record exists and the harness died at boot | `infrastructure` | `implementation.retry` |
+| `termination_signal: supervisor-gone` | `infrastructure` | `implementation.retry` |
+| the terminal contract could not REACH the graph (`terminal_unreachable`) | `infrastructure` | `implementation.retry` |
+| a nonzero exit for no recognized environment reason | `failed` | `implementation.budget.attempts` |
+| the idle watchdog stopped it | `cancelled` | `implementation.budget.attempts` |
+| the report opens `DECLINED:` | `declined` | neither — triage, never a retry |
+| ended its turn cleanly | `completed` | neither — the outcome is what it PRODUCED |
+| refused before any run record (unsatisfiable profile, launcher that does not resolve, refused claim, out-of-scope item) | `unroutable` | neither — a refusal is not an attempt |
+
+Two rules bound it. **Ambiguity classifies `failed`, not `infrastructure`** — an
+infrastructure reading spends a pool that does not consume the item's attempts,
+so a misclassification there loops, while the same misclassification the other
+way costs one attempt and stops; only the readings above are infrastructure, and
+a signal this client does not recognize is `failed`. And **a refusal is not an
+attempt** — anything refused before a run record exists spends neither pool, and
+the item cools off and waits for a box (or a config) that can run the profile,
+exactly as a satisfiability refusal does today.
+
+So an `infrastructure` reading of a review dispatch **charges no fix cycle,
+folds no finding and dispatches no fixer**. The runner asks the SAME gate again
+at the SAME cycle after `implementation.retry.backoff_ms`, paid for out of the
+**shared infrastructure pool**: `implementation.retry.attempts` is ONE pool per
+PIPELINE — implementation, reviews, fixes and rescues together — which is what
+keeps the dispatch bound a sum and not a product. The count rides
+`gate_progress.pools` (§8), keyed to the attempt, so an outage that outlives a
+worker cannot be handed a fresh allowance by every resume, and a charge that
+does not land REFUSES the retry it was paying for rather than spending an
+unrecorded one. When the pool is spent the gate refuses and the escalation names
+the **outage**, not the code — and the rescue lane (§10.10) is never entered: it
+diagnoses a defect, and a reviewer whose harness never answered found none.
+
+An `unroutable` reading is off that ladder entirely: waiting buys nothing for a
+dispatch this box refused, so it refuses at once, still without charging a fix
+cycle. Whichever way it stops, the refusal records WHY it did not ask again —
+the pool is spent, the factory declared none, the charge would not land, the
+worker was asked to stop — and the escalation says that rather than reporting
+every reason as an exhausted budget.
+
+A FIXER's own dispatch is read through the same classifier, and what its class
+means depends on what it left behind: a fix whose harness died on the
+environment and left HEAD exactly where it was produced nothing to judge, so the
+gate stops there instead of re-reviewing an unchanged tree and spending the rest
+of its cycles (and then its whole refusal) on the outage; a fix that COMMITTED
+before it died did produce work, and that work is judged like any other fix. A
+fix REFUSED before any run record existed is `unroutable`, spends neither pool
+and — like a review outage — is never handed to the rescue lane.
+
+The same reading is what the loop's own surfaces report: a terminal run whose
+class is not `completed` carries `execution_class` on its `spor work --status`
+entry (and in `--status --json`), so a box whose runs are all dying on credit
+exhaustion does not read as a box whose code keeps failing. It is a READING
+only — the pools are spent by the pipeline that owns the dispatch, never by
+the loop's bookkeeping.
+
+A factory that declares no `implementation:` block has no pool (cap 0): an
+outage there stops immediately instead of being charged to the code — which is
+still the fix, since what was burning fix cycles, a rescue and a human
+escalation was reading an outage as `changes_requested`. And a reviewer that
+RAN and wrote garbage is unchanged: that is still a judgement of the change,
+and the fail-closed rule above stands.
 
 ### 10.5 Human gates — approval keyed on declared risk
 

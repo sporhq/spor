@@ -12981,9 +12981,36 @@ function makeGateDeps(
       { ...reviewPassthrough(passthrough), profile: gate.profile, dir: change.cwd, "no-brief": true, "no-worktree": true, "read-only": true, "no-auto-route": true, name: `gate-${gate.id}-${keysFor(rescue).short}-${cycle}` },
       [prompt]
     );
-    if (!launched.ok) return { ok: false, reason: `the review under ${gate.profile} could not be dispatched: ${launched.reason}` };
+    // The CLASSIFICATION rides every failure this closure hands back
+    // (FACTORY-IMPLEMENTATION-STAGE.md §5.3, task-spor-factory-execution-
+    // outcome-classifier). The kernel owns the table; the shell owns the two
+    // inputs it reads — the dispatch REFUSAL (no run record was ever created)
+    // and the run RECORD (one was). The runner never guesses at either.
+    if (!launched.ok) {
+      return {
+        ok: false,
+        reason: `the review under ${gate.profile} could not be dispatched: ${launched.reason}`,
+        classification: gatesKernel.classifyExecutionOutcome(null, launched.reason),
+      };
+    }
     const done = await awaitGateRun(cfg, launched.run.run_id, { timeoutMs: gate.awaitMs, warn, sleep });
+    // A review that burned its whole `await_ms` window, or whose record could
+    // not be read, is deliberately NOT classified: there is no terminal record
+    // to read, and waiting again buys nothing that waiting has not already
+    // failed to buy. It keeps the fail-closed reading it always had.
     if (!done.ok) return { ok: false, reason: done.reason };
+    // The reviewer's harness reached a terminal state. If that state is an
+    // OUTAGE — credit or rate exhaustion, an auth refusal, a harness that died
+    // at boot, a supervisor that vanished — then whatever it did or did not
+    // write is not a verdict on the change, and reading its (absent) report as
+    // `changes_requested` is what dispatched a fixer at a finding nobody made
+    // (issue-spor-review-gate-reviewer-outage-read-as-rejection). Read BEFORE
+    // the report, so the misleading "no final report" message stops standing in
+    // for the harness's own reason.
+    const classification = gatesKernel.classifyExecutionOutcome(done.record);
+    if (classification.outcome === "infrastructure") {
+      return { ok: false, reason: `the review run under ${gate.profile} ${classification.reason}`, classification, runId: launched.run.run_id };
+    }
     const text = gateRunReportText(done.record);
     if (!text.trim()) {
       return {
@@ -13154,7 +13181,11 @@ function makeGateDeps(
       { ...passthrough, node: entry.node_id, dir: change ? change.cwd : (record && record.cwd) || undefined, force: true, "no-worktree": true, "no-auto-route": true, name: fixName },
       [prompt]
     );
-    if (!launched.ok) return { ok: false, reason: launched.reason };
+    // Refused before any run record: `unroutable` (§5.3) — it spends neither
+    // pool and it is not a defect, so the runner keeps it out of the rescue
+    // lane rather than paying a strong-model dispatch to diagnose a fixer
+    // that never started.
+    if (!launched.ok) return { ok: false, reason: launched.reason, classification: gatesKernel.classifyExecutionOutcome(null, launched.reason) };
     if (launched.adopted) log(`work: gate ${gate.id} fix cycle ${cycle} on ${entry.node_id} was already launched as run ${String(launched.run.run_id).slice(0, 8)} — adopting it, not dispatching again`);
     // The fix cycle's own run is DETACHED — it outlives this worker process,
     // and the await below can run for up to `runMaxMs` (a day by default). If
@@ -13188,7 +13219,14 @@ function makeGateDeps(
     // dispatched run holds an active one.
     const done = await awaitGateRun(cfg, launched.run.run_id, { timeoutMs: runMaxMs, warn, sleep });
     if (!done.ok) return { ok: false, reason: done.reason };
-    return { ok: true, runId: launched.run.run_id, record: done.record };
+    // How the FIXER's own run ended, read through the same classifier as the
+    // review's (§5.3). It rides the successful result rather than replacing
+    // it: a fixer that died on credit exhaustion may still have COMMITTED
+    // before it died, and that work is judged like any other. The runner
+    // decides what the classification means by looking at whether the tree
+    // actually moved (gate-runner.js) — this closure only reports how the run
+    // ended, which is the one thing it is in a position to know.
+    return { ok: true, runId: launched.run.run_id, record: done.record, classification: gatesKernel.classifyExecutionOutcome(done.record) };
   };
 
   // The gate's durable memory (review finding 1 on this gate's first cut):
@@ -13229,10 +13267,12 @@ function makeGateDeps(
   const saveGateProgress = async ({ gate, progress, rescue = 0 }) => {
     const r = readRecordNow();
     const prev = r && r.gate_progress && r.gate_progress.key === runKey && r.gate_progress.gates && typeof r.gate_progress.gates === "object" ? r.gate_progress.gates : {};
-    // The rescue lane's own entries ride beside the gates under the same key
-    // (loadRescueState below) and are carried, never dropped, by a gate save.
+    // The rescue lane's own entries and the pipeline's shared infrastructure
+    // pool ride beside the gates under the same key (loadRescueState /
+    // loadGatePools below) and are carried, never dropped, by a gate save.
     const carried = r && r.gate_progress && r.gate_progress.key === runKey && Array.isArray(r.gate_progress.rescue) ? { rescue: r.gate_progress.rescue } : {};
-    const stamp = { key: runKey, at: new Date().toISOString(), seq: (prev && r && r.gate_progress && Number.isInteger(r.gate_progress.seq) ? r.gate_progress.seq : 0) + 1, gates: { ...prev, [progressKey(gate, rescue)]: progress }, ...carried };
+    const carriedPools = r && r.gate_progress && r.gate_progress.key === runKey && r.gate_progress.pools && typeof r.gate_progress.pools === "object" ? { pools: r.gate_progress.pools } : {};
+    const stamp = { key: runKey, at: new Date().toISOString(), seq: (prev && r && r.gate_progress && Number.isInteger(r.gate_progress.seq) ? r.gate_progress.seq : 0) + 1, gates: { ...prev, [progressKey(gate, rescue)]: progress }, ...carried, ...carriedPools };
     const wrote = dispatchRuns.stampGateState(home, entry.run_id, { gate_progress: stamp });
     // stampGateState hands back the record UNCHANGED (not null) when the
     // verdict is already settled; a progress write that did not land is a
@@ -13262,7 +13302,58 @@ function makeGateDeps(
   const saveRescueState = async ({ rescues }) => {
     const r = readRecordNow();
     const prevAll = r && r.gate_progress && r.gate_progress.key === runKey ? r.gate_progress : null;
-    const stamp = { key: runKey, at: new Date().toISOString(), seq: (prevAll && Number.isInteger(prevAll.seq) ? prevAll.seq : 0) + 1, gates: prevAll && prevAll.gates && typeof prevAll.gates === "object" ? prevAll.gates : {}, rescue: rescues };
+    const stamp = { key: runKey, at: new Date().toISOString(), seq: (prevAll && Number.isInteger(prevAll.seq) ? prevAll.seq : 0) + 1, gates: prevAll && prevAll.gates && typeof prevAll.gates === "object" ? prevAll.gates : {}, rescue: rescues, ...(prevAll && prevAll.pools && typeof prevAll.pools === "object" ? { pools: prevAll.pools } : {}) };
+    const wrote = dispatchRuns.stampGateState(home, entry.run_id, { gate_progress: stamp });
+    if (!wrote || wrote.gate_progress !== stamp) throw new Error("the run record could not be updated");
+  };
+
+  // The pipeline's shared INFRASTRUCTURE pool (FACTORY-IMPLEMENTATION-STAGE.md
+  // §5.3, task-spor-factory-execution-outcome-classifier): ONE count for the
+  // whole pipeline — implementation, reviews, fixes and rescues together — on
+  // the SAME `gate_progress` stamp, keyed to this attempt so a `--regate`
+  // starts with a fresh pool while a RESUMED pipeline inherits exactly the
+  // charges the killed worker had already spent. Without that an outage that
+  // outlives a worker would be handed a full allowance by every resume, which
+  // is precisely the unbounded case the pool exists to stop. Unlike the
+  // ledger's fail-soft saves, a charge that does not land THROWS: the runner
+  // refuses the retry it could not pay for rather than spending an
+  // unrecorded one.
+  //
+  // The durable-flag rows (gatesKernel.renderDurableFlagChecklist), each
+  // answered:
+  //   (a) the write fails — it THROWS, and the runner refuses the retry it was
+  //       paying for. Nothing is owed, because nothing was spent.
+  //   (b) the crash window — the charge is written BEFORE the retry it
+  //       authorizes, and the pool is only ever INCREMENTED (there is no clear
+  //       to order against it). A crash in between costs one retry that never
+  //       ran, which is the bounded side; the mirror ordering would spend an
+  //       unrecorded one, which the next resume would grant again.
+  //   (c) the check-then-write race — one worker owns a pipeline: a second is
+  //       kept off the node by the gating-slot exclusion, and an ORPHAN is
+  //       adopted only after its worker is dead (§10.8), reading this count
+  //       back before it charges. The write itself goes through
+  //       `stampGateState`, which refuses to overwrite a settled verdict.
+  //   (d) a stale count against settled state — the count is keyed on the
+  //       ATTEMPT's run key, so a `--regate` reads none and starts fresh (the
+  //       outage that exhausted the last pool may be long over), and a
+  //       settled pipeline never reads it again.
+  const loadGatePools = async () => {
+    const r = readRecordNow();
+    const all = r && r.gate_progress && typeof r.gate_progress === "object" ? r.gate_progress : null;
+    if (!all || all.key !== runKey || !all.pools || typeof all.pools !== "object") return null;
+    return all.pools;
+  };
+  const saveGatePools = async ({ pools }) => {
+    const r = readRecordNow();
+    const prevAll = r && r.gate_progress && r.gate_progress.key === runKey ? r.gate_progress : null;
+    const stamp = {
+      key: runKey,
+      at: new Date().toISOString(),
+      seq: (prevAll && Number.isInteger(prevAll.seq) ? prevAll.seq : 0) + 1,
+      gates: prevAll && prevAll.gates && typeof prevAll.gates === "object" ? prevAll.gates : {},
+      ...(prevAll && Array.isArray(prevAll.rescue) ? { rescue: prevAll.rescue } : {}),
+      pools,
+    };
     const wrote = dispatchRuns.stampGateState(home, entry.run_id, { gate_progress: stamp });
     if (!wrote || wrote.gate_progress !== stamp) throw new Error("the run record could not be updated");
   };
@@ -13480,6 +13571,8 @@ function makeGateDeps(
     saveGateProgress,
     loadRescueState,
     saveRescueState,
+    loadGatePools,
+    saveGatePools,
     rescue,
     changedPaths: async ({ trustedRef }) => {
       change = null;
@@ -13944,7 +14037,7 @@ function makeGateDeps(
     },
     checkApproval: ({ id }) => gateApprovalState(cfg, id),
     demote: ({ blockerId }) => gateDemoteItem(cfg, entry.node_id, { blockerId }),
-    escalate: async ({ gate, attempts, detail, evidence, findings, ledger, rescue = 0, rescues = [] }) => {
+    escalate: async ({ gate, attempts, detail, evidence, findings, ledger, rescue = 0, rescues = [], outage = null }) => {
       const k = keysFor(rescue);
       const id = `task-gate-${gate.id.slice(0, 24)}-${stem}-${k.short}-${gateIdSuffix("escalate", gate.id, entry.node_id, k.runKey)}`.toLowerCase();
       const cycles = attempts.length;
@@ -13969,11 +14062,39 @@ function makeGateDeps(
             "",
           ]
         : [];
+      // An OUTAGE refusal did not judge the change at all — the dispatch never
+      // answered — so the body must not open by saying the gate refused the
+      // item and spent its fix cycles. It spent NONE: that is the whole point
+      // of the classification (§5.3, issue-spor-review-gate-reviewer-outage-
+      // read-as-rejection), and a person paged with the wrong story looks for
+      // a defect that is not there.
+      const outageLines = outage
+        ? [
+            `The \`${gate.kind}\` gate \`${gate.id}\` could not JUDGE ${entry.node_id}: its dispatch never answered`,
+            `(${outage.reason || "no reason was recorded"}).`,
+            outage.outcome === "unroutable"
+              ? "This box refused the dispatch before it ever started — an unsatisfiable profile, or a launcher that does not resolve — so it is a configuration problem, not a defect in the change, and no budget was spent on it."
+              : "That is an OUTAGE, not a verdict on the change: no fix cycle was charged for it, no finding was folded and no implementer was dispatched at one.",
+            // WHY the gate stopped instead of asking again — recorded by the
+            // runner (gate-runner.js spendOutage), never guessed here. "The
+            // pool is spent" and "the worker was asked to stop" settle the
+            // gate identically and send a person to two different places.
+            `It stopped rather than asking again because ${outage.notRetried || "the runner recorded no reason"}.`,
+            "",
+            `Nothing here says the change is wrong. Re-run the gates once the harness is back with 'spor work --regate ${entry.run_id}'.`,
+            "",
+          ]
+        : [];
       const body = [
         ...rescueLines,
-        `The \`${gate.kind}\` gate \`${gate.id}\` refused ${entry.node_id} and its fix cycles are spent`,
-        `(${spent.text})${rescue ? `, after rescue attempt ${rescue}` : ""}. A person decides what happens next —`,
-        "the worker has stopped re-dispatching it.",
+        ...outageLines,
+        ...(outage
+          ? []
+          : [
+              `The \`${gate.kind}\` gate \`${gate.id}\` refused ${entry.node_id} and its fix cycles are spent`,
+              `(${spent.text})${rescue ? `, after rescue attempt ${rescue}` : ""}. A person decides what happens next —`,
+              "the worker has stopped re-dispatching it.",
+            ]),
         "",
         `This item \`blocks\` ${entry.node_id} on the graph, and if that item had already been flipped to a`,
         "completion status the worker rolled it back. The run's resolver is left standing: it is the record of",
@@ -14006,10 +14127,14 @@ function makeGateDeps(
         id,
         buildGateWorkNode({
           id,
-          title: `Gate escalation — ${gate.id} refused ${entry.node_id}${rescue ? " after rescue" : ""}`,
-          summary: last
-            ? `Rescue ${last.error ? "could not run" : `diagnosed ${last.category || "unknown"}`}: ${String(last.error || last.diagnosis || "no diagnosis").slice(0, 200)} — the ${gate.id} ${gate.kind} gate still refused ${entry.node_id}; it needs a person.`
-            : `The ${gate.id} ${gate.kind} gate refused ${entry.node_id} after ${spent.fixes} fix cycle(s); it needs a person${detail ? `: ${String(detail).slice(0, 200)}` : "."}`,
+          title: outage
+            ? `Gate escalation — ${gate.id} could not review ${entry.node_id} (${outage.outcome === "unroutable" ? "dispatch refused" : "reviewer unavailable"})`
+            : `Gate escalation — ${gate.id} refused ${entry.node_id}${rescue ? " after rescue" : ""}`,
+          summary: outage
+            ? `The ${gate.id} ${gate.kind} gate could not judge ${entry.node_id}: its dispatch never answered (${String(outage.reason || "no reason recorded").slice(0, 200)}). No fix cycle was charged and the change was not judged wrong — it needs a person, or 'spor work --regate'.`
+            : last
+              ? `Rescue ${last.error ? "could not run" : `diagnosed ${last.category || "unknown"}`}: ${String(last.error || last.diagnosis || "no diagnosis").slice(0, 200)} — the ${gate.id} ${gate.kind} gate still refused ${entry.node_id}; it needs a person.`
+              : `The ${gate.id} ${gate.kind} gate refused ${entry.node_id} after ${spent.fixes} fix cycle(s); it needs a person${detail ? `: ${String(detail).slice(0, 200)}` : "."}`,
           body,
           project: slug,
           date: date(),
@@ -14118,6 +14243,10 @@ async function retryOneEscalation(
           findings: payload.findings || [],
           ledger: payload.ledger || [],
           ...(payload.rescue ? { rescue: payload.rescue, rescues: payload.rescues || [] } : {}),
+          // The refusal's CLASS travels with the payload too: a retry of a failed
+          // escalation write must file the same story, not an outage's refusal
+          // re-told as a spent fix-cycle budget.
+          ...(payload.outage ? { outage: payload.outage } : {}),
         });
   } catch (e) {
     esc = { ok: false, reason: (e && e.message) || String(e) };

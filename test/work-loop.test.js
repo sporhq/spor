@@ -3670,3 +3670,24 @@ test("settleNativeOutcome: a verified `resolved` still wins after a weaker verdi
   const again = dispatchRuns.settleNativeOutcome(home, record, weaker);
   assert.strictEqual(again.terminal_state, "resolved");
 });
+
+// task-spor-factory-execution-outcome-classifier: a worker whose runs are dying
+// on credit exhaustion must not read, on `--status` or in the log, as a worker
+// whose code keeps failing. The class is a READING of the run record through
+// the one shared classifier — never a charge; the pools are spent by the
+// pipeline that owns the dispatch.
+test("outcomeOf carries the execution CLASS, and only when it says something", () => {
+  const base = { run_id: "r1", node_id: "task-a", harness: "codex" };
+  const outage = workLoop.outcomeOf({ ...base, state: "failed", terminal_state: "failed", terminal_enforced: true, termination_class: "environment", termination_signal: "credit-exhausted" });
+  assert.strictEqual(outage.execution_class, "infrastructure");
+  assert.strictEqual(outage.terminal_state, "failed", "the run's own outcome dimension is untouched");
+
+  const code = workLoop.outcomeOf({ ...base, state: "failed", terminal_state: "failed", terminal_enforced: true, termination_class: "failed", termination_signal: "nonzero-exit" });
+  assert.strictEqual(code.execution_class, "failed");
+
+  // The ordinary case carries no class at all — the field appears only when
+  // there is something to say.
+  const clean = workLoop.outcomeOf({ ...base, state: "done", terminal_state: "resolved", terminal_enforced: true, termination_class: "completed", termination_signal: "turn-complete" });
+  assert.strictEqual(clean.execution_class, undefined);
+  assert.strictEqual(workLoop.outcomeOf(null).execution_class, undefined);
+});
