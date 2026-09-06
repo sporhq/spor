@@ -14034,7 +14034,14 @@ function makeGateDeps(
       const r = readRecordNow();
       const progress = r && r.gate_progress;
       if (!progress || progress.key !== runKey) return { ok: true };
-      const evidence = Object.values(progress.gates || {}).flatMap((p) => p ? [p.evidence, p.filingIntent] : []).filter(Boolean);
+      const saved = Object.values(progress.gates || {});
+      const evidence = saved.flatMap((p) => p ? [p.evidence, p.filingIntent] : []).filter(Boolean);
+      // Enumerate the journal, not the current gate list: removing/renaming a
+      // declaration must not make an existing graph obligation unreachable.
+      const current = new Set((factory.gates || []).map((g) => g.id));
+      const orphan = saved.flatMap((p) => p ? [p.filingIntent, p.evidence && !p.evidence.complete ? p.evidence : null] : [])
+        .filter(Boolean).find((e) => !e.gate || !current.has(e.gate.id));
+      if (orphan) return { ok: false, reason: "pending flake evidence belongs to a removed or renamed gate; restore its original declaration and settle its obligation before changing the factory" };
       return evidence.every((e) => attestationOriginMatches(cfg, e.origin))
         ? { ok: true }
         : { ok: false, reason: "pending flake evidence belongs to a different or unknown graph; resume against its original graph" };

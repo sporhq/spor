@@ -9257,3 +9257,84 @@ test("flake graph doors freeze the verified credential across filing and refuse 
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("package entry imports refuse flake isolation when changed source could be their entry", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-package-ref-"));
+  try {
+    fs.mkdirSync(path.join(dir, "test"));
+    fs.mkdirSync(path.join(dir, "lib"));
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "self-package", main: "lib/graph.js" }));
+    fs.writeFileSync(path.join(dir, "lib", "graph.js"), "module.exports = 1;");
+    fs.writeFileSync(path.join(dir, "lib", "package.json"), JSON.stringify({ main: "graph.js" }));
+    for (const source of ['require("..")', 'require("../")', 'import x from ".."', 'import {\n x\n} from ".."', 'import("..")', 'require("../lib")', 'require("self-package")']) {
+      fs.writeFileSync(path.join(dir, "test", "off.test.js"), source);
+      const reference = gateRunner.changeReferencedBy(dir, ["test/off.test.js"], ["lib/graph.js"]);
+      assert.ok(reference.unknown || reference.reached.includes("lib/graph.js"), source);
+      const f = treeFakes({ dir, changed: ["lib/graph.js"], run: (n, command) => command ? { ok: true } : { ok: false, code: 1, output: "✖ fail\n test/off.test.js:1:1" } });
+      const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}", cycles: 0, reruns: 0 }] });
+      const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+      assert.equal(result.state, "failed", source);
+      assert.equal(f.seen.flakes.length, 0, source);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("partial occurrence payments preserve the original fact payload on restart", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-partial-payment-"));
+  try {
+    fs.mkdirSync(path.join(dir, "test"));
+    for (const name of ["one", "two"]) fs.writeFileSync(path.join(dir, "test", `${name}.test.js`), 'require("node:assert");');
+    const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+    let progress = null, retry = false, original = null;
+    const receipts = new Set(), calls = [];
+    const worker = () => {
+      const f = treeFakes({ dir, changed: ["lib/x.js"], run: (n, command) => command ? { ok: true } : { ok: false, code: 1, output: "✖ fail\n test/one.test.js:1:1\n test/two.test.js:1:1" } });
+      f.deps.fileFlakeItem = async ({ file }) => ({ ok: true, id: file.includes("one") ? "issue-one" : "issue-two" });
+      f.deps.loadGateProgress = async () => progress;
+      f.deps.saveGateProgress = async ({ progress: p }) => { progress = JSON.parse(JSON.stringify(p)); };
+      f.deps.recordFact = async ({ markdown }) => { if (original) return { existing: true }; original = markdown; return { ok: true, linked: [] }; };
+      f.deps.readFact = async ({ markdown }) => ({ ok: true, same: markdown === original, edges: [...receipts].map((to) => ({ type: "relates-to", to })) });
+      f.deps.linkFact = async ({ to }) => { calls.push(to); if (to === "issue-two" && !retry) return { ok: false }; receipts.add(to); return { ok: true }; };
+      return f;
+    };
+    assert.equal((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: worker().deps })).state, "interrupted");
+    const outcome = JSON.stringify(progress.evidence.outcome);
+    assert.equal(progress.evidence.complete, false);
+    assert.deepEqual(progress.evidence.payment_receipts.linked, ["issue-one"]);
+    retry = true;
+    const resumed = worker();
+    assert.equal((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: resumed.deps })).state, "passed");
+    assert.equal(JSON.stringify(progress.evidence.outcome), outcome);
+    assert.deepEqual(calls, ["issue-one", "issue-two", "issue-two"]);
+    assert.equal(progress.evidence.complete, true);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("removed gate obligations block before candidate pinning or any new green suite", async () => {
+  const { home, cfg, dispatchRuns } = scratchGraphForRetry();
+  try {
+    const entry = { node_id: "task-demo", run_id: "aabbccdd-bbbb-cccc-dddd-eeeeeeeeeeee" };
+    const record = dispatchRuns.runPaths(home, entry.run_id).record;
+    dispatchRuns.atomicJson(record, { ...entry, state: "done" });
+    const oldGate = { id: "acceptance", kind: "command" };
+    const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance-v2", kind: "command", command: "true" }] });
+    const real = sporCli.makeGateDeps(cfg, { entry, factory, slug: null, log: () => {} });
+    for (const pending of [
+      { evidence: { gate: oldGate, complete: false, origin: real.evidenceOrigin(), outcome: { passed: true } } },
+      { filingIntent: { gate: oldGate, origin: real.evidenceOrigin(), draft: {} } },
+    ]) {
+      await real.saveGateProgress({ gate: oldGate, item: entry, progress: pending });
+      const bytes = fs.readFileSync(record, "utf8");
+      const f = fakes();
+      f.deps.checkEvidenceOrigins = real.checkEvidenceOrigins;
+      f.deps.pinCandidate = async () => { throw new Error("must refuse before pin"); };
+      f.deps.changedPaths = async () => { throw new Error("must refuse before tree work"); };
+      const result = await gateRunner.runGatePipeline({ item: entry, factory, deps: f.deps });
+      assert.equal(result.state, "interrupted");
+      assert.match(result.reason, /removed or renamed gate/);
+      assert.equal(fs.readFileSync(record, "utf8"), bytes);
+    }
+    await real.saveGateProgress({ gate: oldGate, item: entry, progress: { evidence: { gate: oldGate, complete: true, origin: real.evidenceOrigin() } } });
+    assert.deepEqual(real.checkEvidenceOrigins(), { ok: true }, "paid history does not prohibit changing declarations");
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});

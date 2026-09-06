@@ -1557,7 +1557,10 @@ outside git (a database on a fixed port, a `db reset`):
     once is a breakage, not a load-sensitive flake;
   - the isolated run happens inside the SAME prepared tree, before it is torn
     down and under the same lease, so a pass means "these files pass HERE",
-    never "on some fresh checkout at the same sha". It sees
+    never "on some fresh checkout at the same sha". A failure output exceeding
+    the path collection limit cannot certify off-diff isolation. Package or
+    directory entry imports whose targets were not resolved also keep the
+    failure charged, because an entry may load changed source. It sees
     `SPOR_GATE_ISOLATE=1`;
   - it is never a laundering step: the whole-suite failure rides the
     `art-gate-*` fact as evidence, the outcome line names the flake, and the
@@ -1604,6 +1607,11 @@ outside git (a database on a fixed port, a `db reset`):
     tenant (or canonical local nodes directory). A missing or mismatched
     origin refuses replay and leaves the obligation intact. A failed fact write, edge payment, or
     receipt save leaves the attempt **interrupted**, with its debt retained.
+    Partial payment receipts are stored separately from the original outcome:
+    replay renders exactly the same fact body while paying only missing edges.
+    Removing or renaming a gate with an unpaid evidence entry or filing intent
+    refuses the pipeline before candidate pinning, tests, or fixes. Restore its
+    original declaration and settle the debt before changing that factory.
     Resume retries that evidence without running commands or spending another
     fix or rescue cycle. A completed receipt is reused, including across a
     restart; an edge that landed just before a failed receipt save is recovered

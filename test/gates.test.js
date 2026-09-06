@@ -2384,3 +2384,15 @@ test("describeFlake says what failed, that the change does not touch it, that it
   assert.match(d, /filed as issue-flake-test-a-test-js-abcd1234/);
   assert.doesNotMatch(gates.describeFlake("npm test", "x", ["test/a.test.js"]), /filed as/);
 });
+
+test("failure path truncation cannot certify an omitted on-diff failure", () => {
+  const output = Array.from({ length: 21 }, (_, i) => `✖ fail\n test/f${i}.test.js:1:1`).join("\n");
+  const files = gates.failingFiles(output);
+  assert.equal(files.length, 20);
+  assert.equal(files.truncated, true);
+  const classified = gates.offDiffRuns([output], ["test/f20.test.js"]);
+  assert.equal(classified.truncated, true);
+  assert.equal(classified.offDiff, false);
+  assert.match(gates.describeFailingFiles(classified), /limit was exceeded/);
+  assert.equal(gates.offDiffRuns([output.split("✖ fail").slice(0, 21).join("✖ fail")], ["lib/x.js"]).offDiff, true, "exactly the cap with no omitted path remains complete");
+});
