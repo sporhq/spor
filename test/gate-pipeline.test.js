@@ -9257,3 +9257,66 @@ test("flake graph doors freeze the verified credential across filing and refuse 
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+function repinWorld({ optOut = true, controller = true, progress = new Map(), command = "fast", head = "a".repeat(40), fixMoves = true } = {}) {
+  const factory = factoryOf({ ...BASE, implementation: { budget: { attempts: 1 } }, completion: { by: controller ? "controller" : "agent" }, gates: [
+    { id: "fast", kind: "command", command, ...(optOut ? { rejudge_on_repin: false } : {}) },
+    { id: "review", kind: "agent-review", profile: "profile-review" },
+    { id: "later", kind: "command", command: "later", cycles: 1, reruns: 0 },
+  ] });
+  gates.stampDefinitionRevisions(factory, { factory: "definition-1", gates: {} });
+  const f = fakes({ suite: ({ gate }) => ({ ok: gate.id !== "later" || !fixMoves || head[0] === "b", output: "needs a committed fix" }), fix: () => { head = "b".repeat(40); return { ok: true }; } });
+  f.deps.changedPaths = async () => ({ ok: true, paths: ["lib/x.js"], head, base: "c".repeat(40), trustedRef: "main", trustedSha: "c".repeat(40), branch: "candidate" });
+  f.deps.pinCandidate = async () => ({ ok: true, candidate: { candidate_id: `cand-${head[0]}`, reference: { verified_at: "2026-09-06" } } });
+  f.deps.loadGateProgress = async ({ gate, rescue = 0 }) => progress.get(`${rescue}:${gate.id}`) || null;
+  f.deps.saveGateProgress = async ({ gate, rescue = 0, progress: p }) => progress.set(`${rescue}:${gate.id}`, JSON.parse(JSON.stringify(p)));
+  return { ...f, factory, progress };
+}
+
+test("controller command opt-out retains the original verdict while default commands and reviews judge the moved tip", async () => {
+  for (const [optOut, controller, expected] of [[true, true, 1], [false, true, 2], [true, false, 2]]) {
+    const f = repinWorld({ optOut, controller });
+    const result = await gateRunner.runGatePipeline({ item: ITEM, factory: f.factory, deps: f.deps });
+    assert.strictEqual(result.state, "passed");
+    assert.strictEqual(f.seen.suites.filter((id) => id === "fast").length, expected);
+    assert.strictEqual(f.seen.reviews.length, 2, "the review always re-judges the moved tip");
+    const fast = result.gates.find((g) => g.gate === "fast");
+    assert.strictEqual(fast.head, (expected === 1 ? "a" : "b").repeat(40));
+    assert.strictEqual(fast.candidate_id, expected === 1 ? "cand-a" : "cand-b");
+    assert.strictEqual(result.gates.find((g) => g.gate === "review").head, "b".repeat(40));
+    const att = require("../lib/shell/attestation.js").buildAttestationObject({ item: ITEM, factory: f.factory, gate: result, signing: { key: "test-signing", keyId: "test" } });
+    assert.strictEqual(att.passed, true);
+    assert.strictEqual(att.gate.head_consistent, expected !== 1, "ancestor evidence is never relabeled as current-head evidence");
+    assert.strictEqual(require("../lib/shell/attestation.js").verifyAttestation(att, { key: "test-signing" }).ok, true);
+  }
+});
+
+test("retained command receipts survive restart only within the same attempt and pinned factory declaration", async () => {
+  const initial = repinWorld();
+  await gateRunner.runGatePipeline({ item: ITEM, factory: initial.factory, deps: initial.deps });
+  const saved = new Map(initial.progress);
+  const resumed = repinWorld({ progress: new Map(saved), head: "b".repeat(40), fixMoves: false });
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory: resumed.factory, deps: resumed.deps });
+  assert.strictEqual(resumed.seen.suites.includes("fast"), false);
+  assert.strictEqual(result.gates.find((g) => g.gate === "fast").candidate_id, "cand-a");
+  for (const [item, command] of [[{ ...ITEM, attempt: 1 }, "fast"], [ITEM, "new-fast-command"]]) {
+    const rerun = repinWorld({ progress: new Map(saved), head: "b".repeat(40), fixMoves: false, command });
+    assert.strictEqual((await gateRunner.runGatePipeline({ item, factory: rerun.factory, deps: rerun.deps })).state, "passed");
+    assert.strictEqual(rerun.seen.suites.filter((id) => id === "fast").length, 1, "a new attempt or changed declaration reruns the command");
+  }
+});
+
+test("a retained command receipt cannot bypass unpaid occurrence debt or a filing intent", async () => {
+  const initial = repinWorld();
+  await gateRunner.runGatePipeline({ item: ITEM, factory: initial.factory, deps: initial.deps });
+  for (const kind of ["evidence", "filingIntent"]) {
+    const saved = new Map(JSON.parse(JSON.stringify([...initial.progress])));
+    const p = saved.get("0:fast");
+    p[kind] = kind === "filingIntent" ? { origin: "unknown" } : { complete: false, outcome: { passed: true, verdict: "passed", flake: { files: ["test/off.js"], issues: ["issue-flake-one"] } }, change: { head: "a".repeat(40) } };
+    const resumed = repinWorld({ progress: saved, head: "b".repeat(40), fixMoves: false });
+    if (kind === "filingIntent") resumed.deps.acceptsEvidenceOrigin = () => false;
+    else resumed.deps.recordFact = async () => ({ ok: false, reason: "offline" });
+    assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory: resumed.factory, deps: resumed.deps })).state, "interrupted");
+    assert.deepStrictEqual(resumed.seen.reviews, []);
+  }
+});
