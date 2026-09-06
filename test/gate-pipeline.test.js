@@ -7285,6 +7285,14 @@ test("a re-gate is a NEW segment of the ledger: the settled segment stays as his
   assert.strictEqual(h.seen.implements[0].name, `impl-${gateRunner.shortRunAttempt(ITEM.run_id, 0)}-2`, "the ORIGINAL segment's name, which the launcher adopts");
   assert.deepStrictEqual(h.seen.attempts.map((e) => `${e.attempt || 0}/${e.index}:${e.outcome}`), ["0/1:failed", "0/2:candidate"], "settled in the segment that owed it; no fresh segment opened");
 
+  const unlaunched = [...history, { index: 2, run_id: null, outcome: "pending", pool: null }];
+  const orphan = stageFakes({ implState: "running", attempts: unlaunched });
+  const regated = await runStage(stageFactory({ budget: { attempts: 2 } }), orphan, { ...ITEM, attempt: 2 });
+  assert.strictEqual(regated.state, "candidate");
+  assert.strictEqual(orphan.seen.implements.length, 0, "no old unlaunched reservation is dispatched");
+  assert.deepStrictEqual(orphan.seen.attempts.map(e => `${e.attempt || 0}/${e.index}:${e.outcome}`), ["0/1:no-candidate", "2/1:candidate"], "new segment atomically retires only unlaunched prior reservations");
+  assert.strictEqual(gates.implAttemptsSpent(orphan.seen.attempts, "implementation"), 1, "settled earlier history keeps its original charge");
+
   // The journal's force arm cmdWorkRegate uses: a settled refusal reopens, a
   // settled candidate never does, and without force nothing moves.
   const dr = require("../lib/shell/agent-dispatch-runner.js");
