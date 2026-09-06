@@ -2085,6 +2085,75 @@ test("a settle that gets clobbered by a concurrent whole-record write is re-appl
   assert.strictEqual(dispatchRuns.readJson(paths.record).gate_state, "blocked");
 });
 
+// Review finding F4: `gate_progress` is an ACCUMULATOR shared by three writers
+// (the fix-cycle ledger, the rescue lane's entries, the shared retry pool), and
+// each builds the next version by rewriting the whole object. Without a
+// compare-and-set the writer that reads first and lands second erases what the
+// other recorded — and an erased pool charge is an unrecorded retry, exactly
+// the unbounded case the pool exists to stop.
+test("stampGateState's expectProgress is a compare-and-set: a racing writer's stamp is never silently overwritten", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-cas-"));
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  const runId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const paths = dispatchRuns.runPaths(home, runId);
+  const base = { run_id: runId, node_id: "task-x", state: "running", gate_state: "running" };
+  const stampOf = (seq, extra) => ({ key: "k1", at: "2026-09-06T00:00:00.000Z", seq, gates: {}, ...extra });
+
+  // First write of an attempt: nothing to merge from, so the expectation is a
+  // null seq and the write lands.
+  dispatchRuns.atomicJson(paths.record, base);
+  const first = stampOf(1, { pools: { retry: 1 } });
+  assert.ok(
+    dispatchRuns.stampGateState(home, runId, { gate_progress: first }, { expectProgress: { key: "k1", seq: null } }),
+    "the first write of an attempt merges from nothing"
+  );
+  assert.deepEqual(dispatchRuns.readJson(paths.record).gate_progress, first);
+
+  // Now the race: a rescue save read seq 1, a pool charge landed seq 2 in
+  // between, and the rescue's rewrite (which carries `pools` from its stale
+  // read) must be REFUSED rather than erasing the charge.
+  const charged = stampOf(2, { pools: { retry: 2 } });
+  dispatchRuns.stampGateState(home, runId, { gate_progress: charged }, { expectProgress: { key: "k1", seq: 1 } });
+  const status = {};
+  const stale = stampOf(2, { pools: { retry: 1 }, rescue: [{ n: 1 }] });
+  const refused = dispatchRuns.stampGateState(home, runId, { gate_progress: stale }, { expectProgress: { key: "k1", seq: 1 }, status });
+  assert.strictEqual(refused, null, "the loser writes nothing");
+  assert.strictEqual(status.conflict, true, "and says why — a race, not a failed journal write");
+  assert.deepEqual(dispatchRuns.readJson(paths.record).gate_progress.pools, { retry: 2 }, "the charge survives");
+
+  // Row (d): progress under ANOTHER attempt's key is the EMPTY state, not a
+  // conflict — a `--regate` mints a new key and starts its ledger fresh.
+  const regated = { key: "k2", at: "2026-09-06T00:00:01.000Z", seq: 1, gates: {} };
+  assert.ok(
+    dispatchRuns.stampGateState(home, runId, { gate_progress: regated }, { expectProgress: { key: "k2", seq: null } }),
+    "a fresh attempt key expects nothing and lands"
+  );
+  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_progress.key, "k2");
+
+  // A reverting whole-record writer is retried, not reported as landed: the
+  // CAS write is read back like a gate_state write is.
+  dispatchRuns.atomicJson(paths.record, base);
+  let reads = 0;
+  const clobberOnce = (file) => {
+    reads += 1;
+    if (reads === 1) dispatchRuns.atomicJson(paths.record, base); // the supervisor's stale copy
+    return dispatchRuns.readJson(file);
+  };
+  const reapplied = dispatchRuns.stampGateState(
+    home, runId, { gate_progress: first }, { expectProgress: { key: "k1", seq: null }, readBack: clobberOnce }
+  );
+  assert.ok(reapplied, "the reverted progress write is re-applied");
+  assert.strictEqual(reads, 2);
+  assert.deepEqual(dispatchRuns.readJson(paths.record).gate_progress, first);
+
+  // Undefined expectProgress leaves every other caller byte-identical.
+  const unchecked = stampOf(99, {});
+  assert.ok(dispatchRuns.stampGateState(home, runId, { gate_progress: unchecked }));
+  assert.deepEqual(dispatchRuns.readJson(paths.record).gate_progress, unchecked);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 // ------------------------------------------- the approval oracle + gate ids --
 
 const sporCli = require("../bin/spor.js");

@@ -655,16 +655,47 @@ test("isEdgeVerified: the DECLARATION decides, the get()-hook proxy only answers
   assert.equal(reg.isEdgeVerified("lens"), true, "undeclared -> the legacy proxy answers");
 });
 
+// Review finding F2: `lib/` is a PUBLISHED surface imported by name (the
+// server, and any sibling checkout pinned to an older client), so the rename
+// keeps the old spellings alive as deprecated aliases rather than turning a
+// rename into a TypeError. They resolve to the DECLARATION-driven answer,
+// which is the question their callers were asking; the literal hook fact has
+// its own name now.
+test("the pre-rename spellings still resolve, and to the declaration, not the hook", () => {
+  const reg = graph.seedRegistry();
+  assert.equal(typeof reg.attachesResolutionHook, "function");
+  assert.equal(reg.attachesResolutionHook("task"), true);
+  assert.equal(reg.attachesResolutionHook("decision"), false);
+  assert.equal(typeof graph.attachesResolutionHookOffline, "function");
+  assert.equal(graph.attachesResolutionHookOffline("task"), true);
+  assert.equal(graph.attachesResolutionHookOffline("decision"), false);
+  // The one case the alias and the literal hook fact disagree — the bug the
+  // rename is about — the alias answers with the declaration.
+  reg.add({
+    id: "schema-decision", kind: "node-schema", version: "2026.09.06.2", key: "decision",
+    payload: { node_type: "decision", resolution: { verified_by: "status" } },
+    code: { get: "export function get() { return {}; }" }, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.equal(reg.attachesGetHook("decision"), true);
+  assert.equal(reg.attachesResolutionHook("decision"), false, "the alias is isEdgeVerified, not the proxy");
+});
+
 test("snapshot: every node type carries its resolution declaration, so a remote reader need not proxy", () => {
   const snap = graph.seedRegistry().snapshot();
   const byType = Object.fromEntries(snap.node_types.map((n) => [n.type, n.resolution]));
   assert.equal(byType.task, "edge");
   assert.equal(byType.question, "edge");
   assert.equal(byType.decision, "status");
-  // The native `schema` entry omits every declarative-policy key (vocabulary,
-  // completion, resolver_required) and this one with them — a reader treats a
-  // missing key exactly as it treats a null one.
-  assert.equal(byType.schema, undefined, "the native `schema` type declares none");
+  // The native `schema` entry declares none — but it says so with the key
+  // PRESENT and null, the way the node_types contract documents every entry
+  // (API.md `GET /v1/schema`, review finding F3). A reader distinguishing
+  // "declared status" from "undeclared" must not have to treat one row's
+  // missing key as a third state.
+  assert.ok(
+    snap.node_types.some((n) => n.type === "schema" && Object.prototype.hasOwnProperty.call(n, "resolution")),
+    "the native entry carries the key"
+  );
+  assert.equal(byType.schema, null, "the native `schema` type declares none");
   const undeclared = snap.node_types.filter((n) => n.type !== "schema" && n.resolution == null);
   assert.deepEqual(undeclared.map((n) => n.type), [],
     "a seed type with no declaration would be decided by the proxy this key retires");

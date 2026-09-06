@@ -13475,21 +13475,66 @@ function makeGateDeps(
     }
     return { ...p, lastFix };
   };
-  const saveGateProgress = async ({ gate, progress, rescue = 0 }) => {
-    const r = readRecordNow();
-    const prev = r && r.gate_progress && r.gate_progress.key === runKey && r.gate_progress.gates && typeof r.gate_progress.gates === "object" ? r.gate_progress.gates : {};
+  // Every `gate_progress` write goes through here (review finding F4). The
+  // object is an ACCUMULATOR — the finding ledger, the fix counts, the rescue
+  // entries and the shared retry pool on one stamp — and each of its three
+  // writers builds the next version by reading the current one and rewriting
+  // the whole thing. Read-modify-write across two separate file reads is a
+  // check-then-write race: whoever writes second silently erases what the
+  // other just recorded, and a lost pool charge is an unrecorded retry, the
+  // unbounded case the pool exists to stop. So `build` is called on a FRESH
+  // read and the write is a compare-and-set on the version it merged from
+  // (`stampGateState`'s `expectProgress`); a caller that loses the race
+  // rebuilds on the winner's state instead of overwriting it, bounded because
+  // an unbounded retry against a contended file is a spin.
+  //
+  // The durable-flag rows (gatesKernel.renderDurableFlagChecklist) for this
+  // write, answered once for all three writers:
+  //   (a) the write fails — nothing landed and nothing is silently believed to
+  //       have: after the bounded attempts this THROWS, exactly as it did
+  //       before, and the runner refuses the step the write was paying for.
+  //   (b) clear-before-owe — there is no clear: a stamp is one whole-object
+  //       write, so a ledger entry, a cycle count and a pool charge that must
+  //       agree land together or not at all; there is no window with one
+  //       written and the next owed.
+  //   (c) the check-then-write race — THIS is what the CAS closes. The loser
+  //       does not overwrite; it re-reads and rebuilds. `stampGateState` also
+  //       reads the write back, so an unlocked whole-record writer that
+  //       reverts the stamp is retried rather than reported as landed.
+  //   (d) a stale version against settled state — the CAS is keyed on this
+  //       ATTEMPT's `runKey`, so a `--regate` reads and expects none (a
+  //       foreign key's progress is the empty state, not a conflict), and
+  //       `stampGateState`'s settled-verdict guard still refuses the write on
+  //       a settled record — which surfaces as the same throw, never as a
+  //       write believed to have landed.
+  const casProgress = (build) => {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const r = readRecordNow();
+      const prevAll = r && r.gate_progress && r.gate_progress.key === runKey ? r.gate_progress : null;
+      const stamp = build(r, prevAll);
+      const status = {};
+      const wrote = dispatchRuns.stampGateState(home, entry.run_id, { gate_progress: stamp }, {
+        expectProgress: { key: runKey, seq: prevAll && Number.isInteger(prevAll.seq) ? prevAll.seq : null },
+        status,
+      });
+      // stampGateState hands back the record UNCHANGED (not null) when the
+      // verdict is already settled; a progress write that did not land is a
+      // failure the runner should hear about, not a silent no-op.
+      if (wrote && wrote.gate_progress === stamp) return;
+      if (!status.conflict) break; // not a race — a real write failure
+    }
+    throw new Error("the run record could not be updated");
+  };
+  const nextSeq = (prevAll) => (prevAll && Number.isInteger(prevAll.seq) ? prevAll.seq : 0) + 1;
+  const saveGateProgress = async ({ gate, progress, rescue = 0 }) => casProgress((r, prevAll) => {
+    const prev = prevAll && prevAll.gates && typeof prevAll.gates === "object" ? prevAll.gates : {};
     // The rescue lane's own entries and the pipeline's shared infrastructure
     // pool ride beside the gates under the same key (loadRescueState /
     // loadGatePools below) and are carried, never dropped, by a gate save.
-    const carried = r && r.gate_progress && r.gate_progress.key === runKey && Array.isArray(r.gate_progress.rescue) ? { rescue: r.gate_progress.rescue } : {};
-    const carriedPools = r && r.gate_progress && r.gate_progress.key === runKey && r.gate_progress.pools && typeof r.gate_progress.pools === "object" ? { pools: r.gate_progress.pools } : {};
-    const stamp = { key: runKey, at: new Date().toISOString(), seq: (prev && r && r.gate_progress && Number.isInteger(r.gate_progress.seq) ? r.gate_progress.seq : 0) + 1, gates: { ...prev, [progressKey(gate, rescue)]: progress }, ...carried, ...carriedPools };
-    const wrote = dispatchRuns.stampGateState(home, entry.run_id, { gate_progress: stamp });
-    // stampGateState hands back the record UNCHANGED (not null) when the
-    // verdict is already settled; a progress write that did not land is a
-    // failure the runner should hear about, not a silent no-op.
-    if (!wrote || wrote.gate_progress !== stamp) throw new Error("the run record could not be updated");
-  };
+    const carried = prevAll && Array.isArray(prevAll.rescue) ? { rescue: prevAll.rescue } : {};
+    const carriedPools = prevAll && prevAll.pools && typeof prevAll.pools === "object" ? { pools: prevAll.pools } : {};
+    return { key: runKey, at: new Date().toISOString(), seq: nextSeq(prevAll), gates: { ...prev, [progressKey(gate, rescue)]: progress }, ...carried, ...carriedPools };
+  });
   // The rescue lane's durable state (task-spor-factory-rescue-lane): one
   // entry per rescue attempt — the refusal it was handed, the seed its gate
   // pass starts from, its run and its diagnosis — on the same `gate_progress`
@@ -13510,13 +13555,14 @@ function makeGateDeps(
       return out;
     });
   };
-  const saveRescueState = async ({ rescues }) => {
-    const r = readRecordNow();
-    const prevAll = r && r.gate_progress && r.gate_progress.key === runKey ? r.gate_progress : null;
-    const stamp = { key: runKey, at: new Date().toISOString(), seq: (prevAll && Number.isInteger(prevAll.seq) ? prevAll.seq : 0) + 1, gates: prevAll && prevAll.gates && typeof prevAll.gates === "object" ? prevAll.gates : {}, rescue: rescues, ...(prevAll && prevAll.pools && typeof prevAll.pools === "object" ? { pools: prevAll.pools } : {}) };
-    const wrote = dispatchRuns.stampGateState(home, entry.run_id, { gate_progress: stamp });
-    if (!wrote || wrote.gate_progress !== stamp) throw new Error("the run record could not be updated");
-  };
+  const saveRescueState = async ({ rescues }) => casProgress((r, prevAll) => ({
+    key: runKey,
+    at: new Date().toISOString(),
+    seq: nextSeq(prevAll),
+    gates: prevAll && prevAll.gates && typeof prevAll.gates === "object" ? prevAll.gates : {},
+    rescue: rescues,
+    ...(prevAll && prevAll.pools && typeof prevAll.pools === "object" ? { pools: prevAll.pools } : {}),
+  }));
 
   // The pipeline's shared INFRASTRUCTURE pool (FACTORY-IMPLEMENTATION-STAGE.md
   // §5.3, task-spor-factory-execution-outcome-classifier): ONE count for the
@@ -13542,8 +13588,16 @@ function makeGateDeps(
   //   (c) the check-then-write race — one worker owns a pipeline: a second is
   //       kept off the node by the gating-slot exclusion, and an ORPHAN is
   //       adopted only after its worker is dead (§10.8), reading this count
-  //       back before it charges. The write itself goes through
-  //       `stampGateState`, which refuses to overwrite a settled verdict.
+  //       back before it charges. That leaves the SAME-object race — the pool
+  //       shares one `gate_progress` stamp with the ledger and the rescue
+  //       entries, so a gate-progress or rescue save that read before this
+  //       charge would rewrite the whole object without it and erase an
+  //       already-spent retry (review finding F4). Every writer now goes
+  //       through `casProgress`, which merges from a fresh read and
+  //       compare-and-sets on the version it merged from, so the loser
+  //       rebuilds on the winner's count instead of overwriting it. The write
+  //       still goes through `stampGateState`, which refuses to overwrite a
+  //       settled verdict.
   //   (d) a stale count against settled state — the count is keyed on the
   //       ATTEMPT's run key, so a `--regate` reads none and starts fresh (the
   //       outage that exhausted the last pool may be long over), and a
@@ -13554,20 +13608,14 @@ function makeGateDeps(
     if (!all || all.key !== runKey || !all.pools || typeof all.pools !== "object") return null;
     return all.pools;
   };
-  const saveGatePools = async ({ pools }) => {
-    const r = readRecordNow();
-    const prevAll = r && r.gate_progress && r.gate_progress.key === runKey ? r.gate_progress : null;
-    const stamp = {
-      key: runKey,
-      at: new Date().toISOString(),
-      seq: (prevAll && Number.isInteger(prevAll.seq) ? prevAll.seq : 0) + 1,
-      gates: prevAll && prevAll.gates && typeof prevAll.gates === "object" ? prevAll.gates : {},
-      ...(prevAll && Array.isArray(prevAll.rescue) ? { rescue: prevAll.rescue } : {}),
-      pools,
-    };
-    const wrote = dispatchRuns.stampGateState(home, entry.run_id, { gate_progress: stamp });
-    if (!wrote || wrote.gate_progress !== stamp) throw new Error("the run record could not be updated");
-  };
+  const saveGatePools = async ({ pools }) => casProgress((r, prevAll) => ({
+    key: runKey,
+    at: new Date().toISOString(),
+    seq: nextSeq(prevAll),
+    gates: prevAll && prevAll.gates && typeof prevAll.gates === "object" ? prevAll.gates : {},
+    ...(prevAll && Array.isArray(prevAll.rescue) ? { rescue: prevAll.rescue } : {}),
+    pools,
+  }));
 
   // --- the rescue lane (task-spor-factory-rescue-lane, WORKERS.md §10.10) ---
   // Composed HERE, deterministically, like the review and the fix: the

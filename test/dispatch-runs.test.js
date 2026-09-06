@@ -155,12 +155,26 @@ test("classifyTerminalText: a provider's OWN wording of exhaustion is environmen
   const c = runner.classifyTerminalText(codex);
   assert.ok(c, "Codex's usage-limit wording is recognized at all");
   assert.strictEqual(c.class, "environment", "an outage, not the agent's failure");
+  assert.strictEqual(c.signal, "usage-limit", "matched on the state Codex asserts, not on the remedy it offers");
   assert.match(c.reason, /hit your usage limit/, "the provider's own line is retained as the reason");
   // Both spellings the row now carries, and the possessive anchor that keeps it
   // off prose: a line ABOUT usage limits is not this run hitting one.
   assert.strictEqual(runner.classifyTerminalText("you have reached your usage limit").signal, "usage-limit");
   assert.strictEqual(runner.classifyTerminalText("Claude AI usage limit reached").signal, "usage-limit");
   assert.strictEqual(runner.classifyTerminalText("the usage limit table lives in agent-dispatch-runner.js"), null);
+  // Review finding F1: a row matches what only the PROVIDER can assert, never
+  // the remedy it offers — a call to action is text anyone may write, and the
+  // unclassified-nonzero-exit path scans the whole log tail, which holds the
+  // agent's own turns. Prose about buying credits must not launder a code
+  // failure into an environment outage the pipeline re-dispatches with
+  // headroom.
+  for (const prose of [
+    "I'll add a banner telling the user to purchase more credits when the balance runs low",
+    '+  <a href="/billing">Purchase more credits</a>',
+    "the docs say to purchase more credits; npm test failed: 3 assertions",
+  ]) {
+    assert.strictEqual(runner.classifyTerminalText(prose), null, `prose is not an outage: ${prose}`);
+  }
   // The end of the chain: a record classified this way is an INFRASTRUCTURE
   // outage to the gate pipeline, so it charges the retry pool instead of a fix
   // cycle. Both rows Codex's wording can land on say the same thing here.
