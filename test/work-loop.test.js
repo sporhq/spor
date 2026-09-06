@@ -1090,6 +1090,85 @@ test("a gated worker judges only the repos its factory declares — the grouping
   assert.match(defaulted.stdout, /-> task-server-ready/);
 });
 
+// task-spor-work-factory-reload-extend-to-repo-scope: the fake `candidates()`
+// deps in the reload tests further down (work-loop.js's own unit tests) prove
+// the `repos`/`graph` reload-sync plumbing, but they bypass bin/spor.js's
+// `slug` entirely — `slug` is the queue-fetch SCOPE TOKEN
+// (`dispatchableQueuePage(cfg, slug, ...)`), and a single-repo factory
+// auto-narrows it to that one repo at startup. Widening `repos:` without also
+// re-deriving `slug` would leave the fetch itself pinned to the old repo, so
+// the newly-declared repo's items would never even be RETRIEVED, no matter
+// how correctly the post-fetch guard (`factoryRepos`) reloaded. This drives
+// the real CLI process — the only place `slug` and the queue fetch actually
+// live — through exactly that edit, with no dispatch harness or git repo
+// needed at all: an out-of-scope item logs a SCOPE skip ("outside the
+// factory's repo scope"), while an in-scope item with no `dispatch.repos`
+// mapping logs a completely different, LATER-stage refusal ("don't know
+// where '<repo>' lives") — so which skip an item gets is proof of which side
+// of the scope boundary the queue fetch put it on.
+test("the real CLI: widening a single-repo factory's repos: mid-run also widens the underlying queue FETCH scope (slug), not just the post-fetch filter", async () => {
+  // No `repos` in the payload: factoryRepos defaults to the factory node's own
+  // `repo: demo-server` stamp, so `slug` auto-narrows to "demo-server" at
+  // startup (the single-repo case the comment above is about) — no
+  // `dispatch.repos` mapping for EITHER repo, on purpose (see above).
+  const { home } = groupedFixture();
+  const factoryPath = path.join(home, "nodes", "factory-demo-server.md");
+  const env = cleanEnv({ SPOR_HOME: home, XDG_CONFIG_HOME: home, PATH: pathWithOnlyGitAndNode() });
+  // `--max-interval 1`: without it, an idle pass backs off exponentially from
+  // the base interval, and this test would need to wait out that backoff to
+  // see a second pass at all. `--retry-after 0`: EVERY skip — including the
+  // scope one — cools the item off for the ordinary 10 minute default, which
+  // would keep task-client-ready sitting out the widened scope for 10 minutes
+  // after the edit even though it now qualifies.
+  const child = spawn(
+    process.execPath,
+    [CLI, "work", "--interval", "1", "--max-interval", "1", "--retry-after", "0", "--no-brief", "--no-worktree", "--factory", "factory-demo-server"],
+    { env, stdio: ["ignore", "pipe", "pipe"] }
+  );
+  let stdout = "";
+  child.stdout.on("data", (c) => (stdout += c));
+  let stderr = "";
+  child.stderr.on("data", (c) => (stderr += c));
+  try {
+    // Startup: task-client-ready (repo "demo") never reaches dispatch at all —
+    // the fetch itself is scoped to "demo-server", so the guard skips it as
+    // out of SCOPE.
+    const deadline1 = Date.now() + 20000;
+    for (;;) {
+      if (/skipping task-client-ready — outside the factory's repo scope/.test(stdout)) break;
+      if (Date.now() > deadline1) throw new Error(`timed out waiting for the startup scope skip.\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.doesNotMatch(stdout, /task-client-ready[^\n]*lives on this machine/, "the sibling repo's item must not reach dispatch before the edit");
+
+    // Widen the LIVE factory node to also declare the sibling repo — no
+    // restart.
+    const raw = fs.readFileSync(factoryPath, "utf8");
+    const bodyMatch = raw.match(/```json\n([\s\S]*?)\n```/);
+    const payload = JSON.parse(bodyMatch[1]);
+    payload.repos = ["demo-server", "demo"];
+    fs.writeFileSync(factoryPath, raw.replace(bodyMatch[0], "```json\n" + JSON.stringify(payload, null, 2) + "\n```"));
+
+    // After the edit, with the SAME process still running: task-client-ready
+    // clears the scope check and reaches an actual dispatch attempt, refusing
+    // for a totally different, LATER-stage reason (no repo mapping) — proof
+    // the queue FETCH itself, not just the post-fetch filter, now includes
+    // it.
+    const deadline2 = Date.now() + 20000;
+    for (;;) {
+      if (/skipping task-client-ready — don't know where 'demo' lives on this machine\./.test(stdout)) break;
+      if (Date.now() > deadline2) throw new Error(`timed out waiting for the widened repo's item to reach dispatch, no restart.\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  } finally {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  }
+});
+
 test("a declared repo that names nothing in this graph is called out at startup, not left to look like an empty queue", () => {
   // The quiet failure mode of the whole feature: one typo in `repos` and every
   // item is out of scope, so the worker reads an empty page and idles with
@@ -2515,6 +2594,61 @@ test("a reloadFactory that throws never stops the loop, and the failure — not 
   assert.ok(calls >= 3, `the throw stopped the reload from being retried (${calls} calls)`);
   assert.strictEqual(status.gates.factory_revision, "rev0", "the last good definition's revision is untouched");
   assert.strictEqual(status.gates.factory_error, "graph unreachable");
+});
+
+// task-spor-work-factory-reload-extend-to-repo-scope: the gate/dispatch knobs
+// above reload every pass, but candidate repo-scope selection used to stay
+// frozen at startup — an operator widening a running factory's `repos:` saw
+// the new revision named in `--status` while a newly-in-scope item never
+// paged in until restart. `reloadFactory`'s {repos, graph} is the loop's own
+// half of the fix: when the caller (cmdWork) hands back a wider list, the
+// loop's `repos`/`graph` bindings swap in and the very next pass's
+// `selectWorkCandidates` call judges against the new scope.
+test("reloadFactory's {repos, graph} widens candidate selection mid-run: an item outside the startup scope pages in once the factory's repos: grows, no restart needed", async () => {
+  let reloadCalls = 0;
+  const h = harness({
+    queue: [
+      { id: "task-a", project: "a" },
+      { id: "task-b", project: "b" },
+    ],
+    opts: { concurrency: 2, retryAfterMs: 0, factory: "factory-x", factoryRevision: "rev0", repos: ["a"] },
+    maxPasses: 2,
+    gate: async () => ({ state: "passed", gates: [], facts: [] }),
+    extraDeps: {
+      reloadFactory: async () => {
+        reloadCalls += 1;
+        // Pass 1: unchanged (still just 'a'). From pass 2 on: widened to 'b' too
+        // — modelling an operator editing the live factory node mid-run.
+        const repos = reloadCalls === 1 ? ["a"] : ["a", "b"];
+        return { ok: true, revision: `rev${reloadCalls}`, repos, graph: null };
+      },
+    },
+  });
+  const status = await h.run();
+  assert.deepStrictEqual(
+    h.dispatched.map((d) => d.id).sort(),
+    ["task-a", "task-b"],
+    "task-b was out of scope on pass 1 and must be picked up once the reload widens the scope, without a restart"
+  );
+  assert.deepStrictEqual(status.repos, ["a", "b"], "`--status` names the LIVE scope, not the one this worker started with");
+});
+
+// A rejected reload must leave candidate selection exactly where it was, same
+// as it already leaves `factory` itself — a bad edit must never widen (or
+// narrow) what a worker judges.
+test("reloadFactory: a REJECTED reload leaves repo-scope selection untouched — only a clean parse's {repos, graph} is adopted", async () => {
+  const h = harness({
+    queue: [{ id: "task-a", project: "a" }, { id: "task-b", project: "b" }],
+    opts: { concurrency: 2, retryAfterMs: 0, factory: "factory-x", factoryRevision: "rev0", repos: ["a"] },
+    maxPasses: 2,
+    gate: async () => ({ state: "passed", gates: [], facts: [] }),
+    extraDeps: {
+      reloadFactory: async () => ({ ok: false, revision: "rev0", errors: ["gate 'acceptance': reruns must be an integer"] }),
+    },
+  });
+  const status = await h.run();
+  assert.deepStrictEqual(h.dispatched.map((d) => d.id), ["task-a"], "task-b stays out of scope — the bad edit never widened it");
+  assert.deepStrictEqual(status.repos, ["a"], "`--status` still names the last scope that DID parse");
 });
 
 // A bare worker (no --factory, so bin/spor.js never builds a reloadFactory

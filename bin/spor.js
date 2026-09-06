@@ -15254,87 +15254,111 @@ async function cmdWork(cfg, { values }) {
     err(`spor work: dispatch.claudeLaunchMode '${configuredLaunchMode}' is not recognized (supervised | native-background) — ignoring it; this worker always launches supervised.`);
   }
   // The factory's repo scope (issue-spor-work-scope-union-factory-mismatch).
-  // Two distinct jobs, and only the second is load-bearing:
-  //   - the queue SCOPE TOKEN, which just decides how wide a page we read. A
-  //     single-repo factory with no explicit --project defaults it to that
-  //     repo's slug — the token an operator would type, union semantics and
-  //     all — rather than reading every project's queue and discarding most
-  //     of it. Deliberately NOT the `repo-<slug>` node-id form: that pins a
-  //     single repo only when such a node EXISTS, and silently yields an
-  //     empty queue when it doesn't, which is a stalled worker with no
+  // Two distinct jobs, and originally only the second was load-bearing:
+  //   - the queue SCOPE TOKEN (`slug`), which decides how wide a page we
+  //     read. A single-repo factory with no explicit --project defaults it to
+  //     that repo's slug — the token an operator would type, union semantics
+  //     and all — rather than reading every project's queue and discarding
+  //     most of it. Deliberately NOT the `repo-<slug>` node-id form: that
+  //     pins a single repo only when such a node EXISTS, and silently yields
+  //     an empty queue when it doesn't, which is a stalled worker with no
   //     message. A too-wide token costs a filtered candidate; a wrong-narrow
   //     one costs the work.
-  //   - the GUARD below, which is what actually bounds the factory: whatever
-  //     the token unions in, only items stamped with a repo this factory
-  //     declares are candidates. That is the fix — the scope token is a
-  //     read hint, the declared repos are the contract.
-  // NOT reloaded per pass (task-spor-work-reload-factory-definition-per-pass
-  // covers gate knobs — reruns, isolate, serialize — read fresh off the live
-  // `factory` binding at gate/dispatch time; this constant is captured once
-  // and frozen into the `candidates()` closure below, same as `slug` and
-  // `localFactoryGraph`). An operator editing a running factory's `repos:`
-  // list will see the new revision named in `--status` and the new gate list
-  // enforced, but candidate SELECTION keeps filtering on the repos declared
-  // at startup — a newly-added repo's items are never even paged in until
-  // the worker restarts. Widening this is a separate, larger change (it also
-  // touches the unknown-repo startup warning and `localFactoryGraph` below);
-  // left as a known limitation rather than folded in here.
-  const factoryRepos = (factory && factory.repos) || [];
-  if (!explicitSlug && factoryRepos.length === 1) slug = factoryRepos[0];
+  //   - the GUARD below, which bounds the factory: whatever the token unions
+  //     in, only items stamped with a repo this factory declares are
+  //     candidates. That was the ORIGINAL fix (issue-spor-work-scope-union-
+  //     factory-mismatch) — the scope token is a read hint, the declared
+  //     repos are the contract.
+  // BOTH reload every pass now (task-spor-work-factory-reload-extend-to-repo-
+  // scope): a first cut of this fix widened only the guard (`factoryRepos`/
+  // `localFactoryGraph`, `let` bindings the `candidates()` closure reads
+  // live) and left `slug` frozen at its startup value, on the theory that it
+  // is "just" a read hint. That theory doesn't survive contact with the most
+  // common real edit — a single-repo factory later widened to a sibling
+  // repo: `slug` had auto-narrowed to that sole repo at startup, so
+  // `dispatchableQueuePage(cfg, slug, ...)` below never even FETCHES the
+  // newly-declared repo's items — the guard would happily admit them, but
+  // they never reach it. So `slug` is re-derived the SAME way inside
+  // `reloadFactory`, under the same `!explicitSlug` guard (an operator's own
+  // `--project` is never overridden), whenever `factoryRepos` actually
+  // changes — see the repo-scope-changed branch below.
   // A declared repo that names nothing in this graph is the quiet failure mode
   // of the whole feature: every item is out of scope, so the worker reads an
   // empty page (or filters the whole one away) and idles with nothing to say.
-  // Say so at startup, where an operator is watching. A WARNING, not a
-  // refusal: a repo whose identity node does not exist yet is not a typo. In
-  // LOCAL mode the graph is right here (projectKnown); in REMOTE mode the
-  // server answers the same question — GET /v1/queue?project=<repo> echoes a
-  // zero-match token as the additive `project_warning` string
+  // Say so where an operator is watching. A WARNING, not a refusal: a repo
+  // whose identity node does not exist yet is not a typo. In LOCAL mode the
+  // graph is right here (projectKnown); in REMOTE mode the server answers the
+  // same question — GET /v1/queue?project=<repo> echoes a zero-match token as
+  // the additive `project_warning` string
   // (task-spor-remote-next-print-project-warning) — so one bounded, fail-open
   // probe per declared repo asks it. The warning line is the SAME in both
   // modes (norm-spor-cli-mode-parity); a dead server, an error, or an older
   // server that omits the field says nothing here and falls back to the
-  // loop's own scope-starvation notice.
+  // loop's own scope-starvation notice. Deduped PER REPO across the whole
+  // run (not per poll): `checkFactoryRepoScope` below is only re-invoked when
+  // the reloaded factory's `repos:` actually changed, so a factory that never
+  // edits its scope warns exactly once, same as the old startup-only check —
+  // it is the CHANGE that re-runs the check, not the poll timer.
   const unknownRepoWarning = (r) => `warning: factory '${factoryId}' declares repo '${r}', which names no repo or project in this graph — items stamped with it will never be found.`;
-  // Loaded once here (local mode only — the graph is not "cheaply available"
-  // remotely) and reused below to resolve historical `project:` stamps
-  // through `graph.projectAliases` when checking a factory's declared repo
-  // scope (task-spor-factory-alias-resolution-local-mode): a legacy stamp
-  // (`substrate`) and a current-slug declaration (`repos: ["spor"]`) both
-  // resolve to the same repo node's canonical id there. Stays null in remote
-  // mode or on an unreadable graph, which is exactly the byte-identical
-  // raw-stamp-comparison fallback gates.repoScope/inRepoScope already have.
-  let localFactoryGraph = null;
-  if (factoryRepos.length && cfg.mode() === "local") {
-    try {
-      const graphLib = require(path.join(ROOT, "lib", "graph.js"));
-      localFactoryGraph = graphLib.loadGraph(cfg.nodesDir());
-      for (const r of factoryRepos) {
-        if (!graphLib.projectKnown(localFactoryGraph, r)) err(unknownRepoWarning(r));
-      }
-    } catch {
-      /* an unreadable graph is the queue read's problem to report, not this check's */
-      localFactoryGraph = null;
-    }
-  } else if (factoryRepos.length && cfg.mode() === "remote") {
-    for (const r of factoryRepos) {
+  const warnedUnknownFactoryRepos = new Set();
+  const warnUnknownFactoryRepoOnce = (r) => {
+    if (warnedUnknownFactoryRepos.has(r)) return;
+    warnedUnknownFactoryRepos.add(r);
+    err(unknownRepoWarning(r));
+  };
+  // Loaded fresh whenever `repos:` changes (local mode only — the graph is not
+  // "cheaply available" remotely) and reused to resolve historical `project:`
+  // stamps through `graph.projectAliases` when checking a factory's declared
+  // repo scope (task-spor-factory-alias-resolution-local-mode): a legacy
+  // stamp (`substrate`) and a current-slug declaration (`repos: ["spor"]`)
+  // both resolve to the same repo node's canonical id there. Stays null in
+  // remote mode or on an unreadable graph, which is exactly the
+  // byte-identical raw-stamp-comparison fallback gates.repoScope/inRepoScope
+  // already have.
+  const checkFactoryRepoScope = async (repos) => {
+    if (!repos.length) return null;
+    let graph = null;
+    if (cfg.mode() === "local") {
       try {
-        const res = await remote.get(cfg, `/v1/queue?project=${encodeURIComponent(r)}&limit=1`, { timeoutMs: 3000 });
-        const warning = res.ok ? takeProjectWarning(res.json) : null;
-        if (!warning) continue;
-        // The server's text is the authoritative answer, so print it VERBATIM
-        // (the acceptance: byte-matching what `spor next --project <typo>`
-        // prints), then the factory-shaped context line local mode prints. The
-        // verbatim line goes through the once-per-token printer so a
-        // single-repo factory — whose page read is scoped to this same repo and
-        // carries the same field — says it once, while a multi-repo factory —
-        // whose page read is UNSCOPED and never sees it — still says it per repo.
-        warnQueueProjectOnce(r, warning);
-        err(unknownRepoWarning(r));
+        const graphLib = require(path.join(ROOT, "lib", "graph.js"));
+        graph = graphLib.loadGraph(cfg.nodesDir());
+        for (const r of repos) {
+          if (!graphLib.projectKnown(graph, r)) warnUnknownFactoryRepoOnce(r);
+        }
       } catch {
-        /* fail-open: an unreachable server is the queue read's problem to report */
+        /* an unreadable graph is the queue read's problem to report, not this check's */
+        graph = null;
+      }
+    } else if (cfg.mode() === "remote") {
+      for (const r of repos) {
+        try {
+          const res = await remote.get(cfg, `/v1/queue?project=${encodeURIComponent(r)}&limit=1`, { timeoutMs: 3000 });
+          const warning = res.ok ? takeProjectWarning(res.json) : null;
+          if (!warning) continue;
+          // The server's text is the authoritative answer, so print it VERBATIM
+          // (the acceptance: byte-matching what `spor next --project <typo>`
+          // prints), then the factory-shaped context line local mode prints. The
+          // verbatim line goes through the once-per-token printer so a
+          // single-repo factory — whose page read is scoped to this same repo and
+          // carries the same field — says it once, while a multi-repo factory —
+          // whose page read is UNSCOPED and never sees it — still says it per repo.
+          warnQueueProjectOnce(r, warning);
+          warnUnknownFactoryRepoOnce(r);
+        } catch {
+          /* fail-open: an unreachable server is the queue read's problem to report */
+        }
       }
     }
-  }
+    return graph;
+  };
+  let factoryRepos = (factory && factory.repos) || [];
+  if (!explicitSlug && factoryRepos.length === 1) slug = factoryRepos[0];
+  let localFactoryGraph = await checkFactoryRepoScope(factoryRepos);
+  // The change-detection key `reloadFactory` compares against below, so the
+  // (comparatively expensive — a full local graph load, or a remote round
+  // trip per declared repo) recompute runs only when `repos:` itself moved,
+  // never on every poll.
+  let factoryReposKey = JSON.stringify(factoryRepos);
 
   // Passed straight through to every dispatch this loop makes. Deliberately NOT
   // --force: a loop that forces past the duplicate/resolved guards is exactly
@@ -15640,7 +15664,35 @@ async function cmdWork(cfg, { values }) {
               const loaded = await loadFactoryDefinition(cfg, factoryId);
               if (loaded.factory) {
                 factory = loaded.factory;
-                return { ok: true, revision: loaded.revision || null };
+                // task-spor-work-factory-reload-extend-to-repo-scope: candidate
+                // repo-scope selection reloads too, not just the gate knobs
+                // above — but only when `repos:` actually changed, so an
+                // unrelated edit (reruns, isolate, serialize) never pays for a
+                // full local graph reload / remote round trip it doesn't need.
+                // `factoryRepos`/`localFactoryGraph` are `let` bindings the
+                // `candidates()` closure reads live, so reassigning them here
+                // reaches the very next poll's page read with no restart.
+                const newRepos = factory.repos || [];
+                const newKey = JSON.stringify(newRepos);
+                if (newKey !== factoryReposKey) {
+                  factoryReposKey = newKey;
+                  factoryRepos = newRepos;
+                  localFactoryGraph = await checkFactoryRepoScope(factoryRepos);
+                  // The queue-fetch scope TOKEN needs the SAME re-derivation
+                  // `slug` got at startup (see the comment above), or a
+                  // single-repo factory widened to a sibling repo never even
+                  // FETCHES that repo's items — the guard above would admit
+                  // them, but dispatchableQueuePage(cfg, slug, ...) below
+                  // never returns them in the first place. Never touches an
+                  // operator's own explicit --project.
+                  if (!explicitSlug) slug = factoryRepos.length === 1 ? factoryRepos[0] : null;
+                }
+                // Handed back on EVERY ok reload (not only a changed one) so
+                // the loop's own `repos`/`graph` bindings — which feed
+                // `selectWorkCandidates` and the scope-starvation notice —
+                // stay in sync too; the unchanged case is just a reference
+                // copy, not a recompute.
+                return { ok: true, revision: loaded.revision || null, repos: factoryRepos, graph: localFactoryGraph };
               }
               return { ok: false, revision: loaded.revision || null, errors: loaded.errors };
             },
