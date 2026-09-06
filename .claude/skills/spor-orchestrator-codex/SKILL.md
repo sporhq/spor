@@ -67,6 +67,14 @@ recovery work, identify original candidate SHAs, source findings and whether
 those commits already landed. Never manufacture a change to obtain a nonempty
 diff: review the original committed range and verify its presence at current main.
 
+For source recovery, keep a per-source evidence table: original run and candidate,
+source-to-landed commit mapping, exact reviewed range, completed test log and exit
+status, and outstanding findings. Distinguish **fixed, awaiting review** from
+**independently reviewed**; an implementer's report or a repaired document's own
+finding ledger cannot supply its review verdict. Track checkout/main identity and
+observed loaded-worker identity separately. A newer checkout does not prove a
+running worker loaded it; keep an unavailable loaded revision explicitly unknown.
+
 Select actionable, ready items that are not already in flight, resolved,
 blocked, or held by another agent. Read their briefings to avoid two agents
 editing the same module concurrently. Leases prevent duplicate node ownership;
