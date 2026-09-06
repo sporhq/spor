@@ -13351,7 +13351,16 @@ function makeGateDeps(
         // than a rule restated at each call site.
         patch.impl_state = candidateKernel.candidateSubmitted(folded.candidate) ? "candidate" : "running";
       }
-      dispatchRuns.stampImplState(home, entry.run_id, patch);
+      const stamped = dispatchRuns.stampImplState(home, entry.run_id, patch);
+      // stampImplState hands back null when the write could not be made (an
+      // unreadable run record, a mid-write exception) — silently reporting
+      // success there is exactly this closure's own bug
+      // (issue-spor-pin-candidate-silent-stamp-failure): the candidate was
+      // minted but never landed, so `spor runs`/`spor work --status` would
+      // show a stale or missing impl_candidate with no way to tell. Fail-soft
+      // like the rest of pinCandidate (the caller's `pin` wrapper logs `reason`
+      // and judges the tree regardless), but never a silent ok:true.
+      if (!stamped) return { ok: false, reason: `the candidate for ${entry.node_id} was pinned but could not be stamped onto its run record` };
       return { ok: true, candidate: folded.candidate, change: folded.change };
     },
     // The two reads behind a SUPERSEDED verdict (issue-spor-work-adopts-
@@ -14307,7 +14316,13 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
         patch.impl_pool = "implementation";
         patch.impl_state = candidateKernel.candidateSubmitted(folded.candidate) ? "candidate" : "running";
       }
-      dispatchRuns.stampImplState(home, entry.run_id, patch);
+      const stamped = dispatchRuns.stampImplState(home, entry.run_id, patch);
+      // See makeGateDeps' own pinCandidate above
+      // (issue-spor-pin-candidate-silent-stamp-failure): a null return means
+      // the write did not land, and that must surface as a refusal rather
+      // than a silent ok:true — the caller's `pin` wrapper already logs
+      // `reason` and judges the tree regardless.
+      if (!stamped) return { ok: false, reason: `the candidate for ${entry.node_id} was pinned but could not be stamped onto its run record` };
       return { ok: true, candidate: folded.candidate, change: folded.change };
     },
     acquireLease: () => acquireIntegrationLease(cfg, home, top || (record && record.cwd), { slug }),

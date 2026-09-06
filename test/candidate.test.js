@@ -619,6 +619,62 @@ test("a fix cycle re-pins, and the re-pin names the fix rather than the submissi
   assert.strictEqual(pins[1].cycle, 1, "the re-pin names which cycle moved the tree");
 });
 
+// ------------------------ REAL pinCandidate wiring: the stamp must be heard --
+//
+// issue-spor-pin-candidate-silent-stamp-failure: bin/spor.js's own
+// `pinCandidate` closures (makeGateDeps' and its makeIntegrationDeps twin)
+// used to discard dispatchRuns.stampImplState's return value and report
+// `{ok: true, ...}` unconditionally — so a write failure (an unreadable run
+// record, a mid-write exception) was masked: the candidate was minted but
+// never landed, and `spor runs`/`spor work --status` would show a stale or
+// missing impl_candidate with no way to tell something went wrong. These
+// drive the REAL bin/spor.js closures (not gate-runner.js's own pin wrapper,
+// which the tests above already cover with a fake dep) against a real git
+// repo, forcing the failure with the simplest reproduction of "an unreadable
+// run record": no run-record file was ever written for this run_id.
+
+test("REGRESSION issue-spor-pin-candidate-silent-stamp-failure: makeGateDeps' pinCandidate reports ok:false, not a silent success, when the run record cannot be stamped", async (t) => {
+  const sporCli = require("../bin/spor.js");
+  const { loadConfig } = require("../lib/config.js");
+  const { dir } = realRepo();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const home = scratchHome(t);
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const entry = { run_id: "22222222-3333-4444-5555-000000000001", node_id: "task-x", project: "demo", attempt: 1 };
+  const record = { cwd: dir };
+  const factory = { trustedRef: "main" };
+  const deps = sporCli.makeGateDeps(cfg, { record, entry, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home });
+
+  const changed = await deps.changedPaths({ trustedRef: "main" });
+  assert.strictEqual(changed.ok, true, changed.reason);
+
+  assert.strictEqual(dispatchRuns.readJson(dispatchRuns.runPaths(home, entry.run_id).record), null, "sanity: no run record was ever written for this run_id");
+  const res = await deps.pinCandidate({ submittedBy: { stage: "implementation", cycle: 0, rescue: 0 } });
+  assert.strictEqual(res.ok, false, "an unreadable run record must never be reported as a successful pin");
+  assert.match(res.reason, /could not be stamped/);
+});
+
+test("REGRESSION issue-spor-pin-candidate-silent-stamp-failure: makeIntegrationDeps' pinCandidate reports ok:false, not a silent success, when the run record cannot be stamped", async (t) => {
+  const sporCli = require("../bin/spor.js");
+  const { loadConfig } = require("../lib/config.js");
+  const { dir } = realRepo();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const home = scratchHome(t);
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const entry = { run_id: "22222222-3333-4444-5555-000000000002", node_id: "task-x", project: "demo", attempt: 1 };
+  const record = { cwd: dir };
+  const factory = { integration: { targetRef: "main" }, trustedRef: "main" };
+  const deps = sporCli.makeIntegrationDeps(cfg, { record, entry, factory, slug: "demo", passthrough: {}, warn: () => {}, sleep: async () => {}, log: () => {}, home });
+
+  const changed = await deps.changedTree();
+  assert.strictEqual(changed.ok, true, changed.reason);
+
+  assert.strictEqual(dispatchRuns.readJson(dispatchRuns.runPaths(home, entry.run_id).record), null, "sanity: no run record was ever written for this run_id");
+  const res = await deps.pinCandidate({ submittedBy: { stage: "integration-fix", cycle: 1, rescue: 0 } });
+  assert.strictEqual(res.ok, false, "an unreadable run record must never be reported as a successful pin");
+  assert.match(res.reason, /could not be stamped/);
+});
+
 // ------------------------------------------------------ the CLI surfaces --
 
 const CLI = path.join(__dirname, "..", "bin", "spor.js");
