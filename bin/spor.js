@@ -9173,6 +9173,7 @@ function awaitLaunchHandshake(stream, timeoutMs) {
 async function launchSupervisedHarness(cfg, {
   adapter, command, args, cwd, name, nodeId, prompt, server, localNodesDir, childToken, mcpToken, bindToken,
   renewToken, renewNode, releaseNode, project, itemRepo = null, itemCommits = null, readOnly = false,
+  resolvedProfile = null,
 }) {
   const runId = crypto.randomUUID();
   const p = dispatchRuns.runPaths(cfg.userConfigHome(), runId);
@@ -9207,6 +9208,10 @@ async function launchSupervisedHarness(cfg, {
     // value — see itemCommits above for why this must never be re-read from
     // the item's current state.
     ...(Array.isArray(itemCommits) && itemCommits.length ? { item_commits: itemCommits } : {}),
+    // The profile THIS launch actually resolved to (issue-spor-candidate-
+    // provenance-profile-blind-to-self-routed-items) — see beginNativeRun's
+    // twin field for why it lives on the record and not the work-loop slot.
+    ...(resolvedProfile ? { resolved_profile: resolvedProfile } : {}),
     log_path: p.log,
     report_path: p.report,
     // The lease this launch established (and only that one — see `release_node`
@@ -10795,6 +10800,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
         project: res.slug || null,
         itemRepo,
         itemCommits,
+        resolvedProfile: profileCheck && profileCheck.id ? profileCheck.id : null,
       });
       if (!launched.ok) {
         err(`could not launch ${harnessBin}: ${launched.error}`);
@@ -10847,6 +10853,7 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
       localNodesDir: cfg.mode() === "remote" ? null : cfg.nodesDir(),
       server: cfg.mode() === "remote" ? remote.base(cfg) : null,
       org: cfg.mode() === "remote" ? (cfg.tenant() || {}).org || null : null,
+      resolvedProfile: profileCheck && profileCheck.id ? profileCheck.id : null,
     });
     // The agent's git must follow launchDir (its worktree, or the target checkout),
     // so hand it an env scrubbed of the git location vars — an ambient GIT_DIR
@@ -13245,11 +13252,19 @@ function makeGateDeps(
       // itself: `rescue.profile` is dispatched deliberately in place of the
       // worker's own (and `rescuePassthrough` strips the routing flags so the
       // lane's stronger model wins), so reading the worker's passthrough there
-      // would name a profile that demonstrably did not produce this tree.
+      // would name a profile that demonstrably did not produce this tree. Every
+      // other stage reads `producer.resolved_profile` — the profile cmdDispatch
+      // ACTUALLY resolved for the producer's own launch (its own
+      // `resolveDispatchProfile` verdict, stamped onto that run's record at
+      // launch: see beginNativeRun/launchSupervisedHarness), not the worker's
+      // `--profile` passthrough — so an item that routed ITSELF (a `profile:`
+      // frontmatter, an `assigned -> agent {profile:}` edge, §2.3 levels 2-3)
+      // records the profile it actually ran under instead of null
+      // (issue-spor-candidate-provenance-profile-blind-to-self-routed-items).
       const producerProfile =
         submittedBy && submittedBy.stage === "rescue"
           ? (factory.rescue && factory.rescue.profile) || null
-          : (passthrough && passthrough.profile) || null;
+          : producer.resolved_profile || null;
       const pinned = gateRunner.pinCandidate(record, factory.trustedRef, {
         change,
         // The ITEM's own repo, not the worker's scope token: the repo is part
@@ -13269,14 +13284,14 @@ function makeGateDeps(
           // itself is task-spor-factory-execution-outcome-classifier's.)
           pool: submittedBy && submittedBy.stage === "implementation" ? "implementation" : null,
           harness: producer.harness || null,
-          // The rescue lane's declared profile, else the worker's own
-          // `--profile` passthrough — the only two routing inputs visible here.
-          // The work-loop SLOT (`entry`) carries no profile — it is `{run_id,
-          // node_id, harness, project}`, and its shape is the one
-          // `journal/work/*.work.json` publishes — so an item that routed
-          // ITSELF (a `profile:` frontmatter, an `assigned -> agent {profile:}`
-          // edge, §2.3 levels 2 and 3) is not recorded here. Null means "not
-          // recorded", never "unrouted".
+          // The rescue lane's declared profile, else the profile the producer's
+          // own launch resolved to — see `producerProfile` above. The work-loop
+          // SLOT (`entry`) carries no profile — it is `{run_id, node_id,
+          // harness, project}`, and its shape is the one
+          // `journal/work/*.work.json` publishes — but that is no longer where
+          // this reads from; a resolveDispatchProfile miss (no explicit flag,
+          // no frontmatter, no assigned edge) is still recorded as null, which
+          // means "unrouted" here, not "not recorded".
           profile: producerProfile,
           agent: dispatchAgentId(cfg),
           worker: workerId || null,

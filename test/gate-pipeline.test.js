@@ -3134,6 +3134,32 @@ test("end to end: a dispatched run is gated, and the gate outcome lands in the g
   );
 });
 
+// issue-spor-candidate-provenance-profile-blind-to-self-routed-items: an item
+// that routes ITSELF (here, `task-ready`'s own `assigned -> agent-gatebox
+// {profile: profile-gate}` edge — cliFixture's fixed self-routing, no worker
+// `--profile` flag anywhere on the command line, and the factory's own
+// `implementation:` block names no profile either) must still record which
+// profile actually produced the candidate — not null, which used to read as
+// "unrouted" when this only ever reflected the worker's own `--profile`
+// passthrough.
+test("end to end: a self-routed item's candidate pin records the profile it actually ran under, not null", () => {
+  const { home, outfile } = cliFixture({ factoryPayload: { ...OK_FACTORY, implementation: {} } });
+  const r = cli(
+    ["work", "--once", "--max", "1", "--interval", "1", "--no-brief", "--no-worktree", "--factory", "factory-demo"],
+    { SPOR_HOME: home, XDG_CONFIG_HOME: home, GATE_OUTFILE: outfile, PATH: pathWithOnlyGitAndNode() }
+  );
+  assert.strictEqual(r.status, 0, `${r.stderr}\n${r.stdout}`);
+  assert.match(r.stdout, /gate acceptance passed on task-ready/);
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const record = dispatchRuns.readRunRecords(home).find((rec) => rec.node_id === "task-ready" && rec.impl_candidate);
+  assert.ok(record, "expected the implementation-stage run to carry a pinned candidate");
+  assert.strictEqual(
+    record.impl_candidate.provenance.profile,
+    "profile-gate",
+    "the item routed itself via its own assigned -> agent {profile:} edge — no --profile flag was ever passed — so provenance.profile must name that profile instead of reading null"
+  );
+});
+
 test("end to end: an armed human gate files a requires:[human] approval item and BLOCKS the resolve", () => {
   const { home, nodes, outfile } = cliFixture({
     factoryPayload: {

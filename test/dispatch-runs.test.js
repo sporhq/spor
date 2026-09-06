@@ -378,6 +378,30 @@ test("reconcileRuns: resolves dead native runs, keeps live ones, and leaves a li
   assert.strictEqual(runRecords(home).find((r) => r.run_id === "sup-1").state, "running", "a healthy supervised run is never prematurely finalized");
 });
 
+// --- resolved_profile provenance stamp ------------------------------------
+// (issue-spor-candidate-provenance-profile-blind-to-self-routed-items): the
+// profile a launch actually resolved to — including one an item routed to
+// ITSELF via `profile:` frontmatter or an `assigned -> agent {profile:}`
+// edge, which the work-loop slot never carries — is stamped on the run
+// record at launch so a later candidate pin can read what really produced
+// the tree, instead of only ever seeing the worker's own `--profile` flag.
+
+test("beginNativeRun: stamps resolved_profile when the launcher resolved one, and omits the key when it did not", () => {
+  const home = scratch("spor-runs-resolved-profile-");
+  const routed = runner.beginNativeRun(home, {
+    harness: "claude-code", name: "n-routed", nodeId: "issue-routed", cwd: "/tmp/nope",
+    resolvedProfile: "profile-lane-strict", now: () => "2026-09-06T10:00:00.000Z",
+  });
+  assert.strictEqual(routed.record.resolved_profile, "profile-lane-strict");
+  assert.strictEqual(runRecords(home).find((r) => r.run_id === routed.runId).resolved_profile, "profile-lane-strict");
+
+  const unrouted = runner.beginNativeRun(home, {
+    harness: "claude-code", name: "n-unrouted", nodeId: "issue-unrouted", cwd: "/tmp/nope",
+    now: () => "2026-09-06T10:00:00.000Z",
+  });
+  assert.strictEqual("resolved_profile" in unrouted.record, false, "a launch that resolved no profile stamps no key, not null");
+});
+
 test("reconcileRuns: two concurrent dispatches in ONE checkout resolve independently", () => {
   // The `--no-worktree` shape from issue-spor-dispatch-run-liveness-same-cwd-
   // misattribution: both runs share a cwd and neither bound a session. The dead
