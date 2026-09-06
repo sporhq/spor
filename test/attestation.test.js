@@ -712,3 +712,25 @@ test("attestation refuses stale reviews and unpinned or incomplete retention exc
     assert.equal(attestation.verifyAttestation(att, { key: "k" }).ok, false);
   }
 });
+
+test("rendered size-ladder copies retain the signed ancestor policy and candidate fields", () => {
+  let thinned = false;
+  for (const count of Array.from({ length: 20 }, (_, i) => i + 1)) {
+    const factory = factoryOf({ factory: "retention", trusted_ref: "main", completion: { by: "controller" }, gates: Array.from({ length: count }, (_, i) => ({ id: `gate-${i}`, kind: "command", command: `check-${i}`, rejudge_on_repin: false })) });
+    const result = gateResult({ definition: factory.definition, facts: [], gates: factory.gates.map((g, i) => ({
+      gate: g.id, kind: g.kind, verdict: "passed", head: "a".repeat(40), candidate_id: "candidate-original", retained: true, rejudge_on_repin: false, retained_for: HEAD, ancestry_verified: true,
+      digest: factory.definition.gates[i].digest, fact: `art-gate-${i}`, detail: "evidence ".repeat(40), source: "inline", revision: "f00d", base: "b".repeat(40), cycles: 1,
+      started_at: "2026-09-06T10:00:00.000Z", finished_at: "2026-09-06T10:00:01.000Z", duration_ms: 1000,
+    })) });
+    const node = attestation.buildAttestationNode({ item: ITEM, factory, gate: result, signing: { key: "k" } });
+    const rendered = JSON.parse(/```json\n([\s\S]*?)\n```/.exec(node.markdown)[1]);
+    if (rendered.abridged && rendered.gate.steps) {
+      thinned = true;
+      assert.equal(rendered.gate.steps[0].candidate_id, "candidate-original");
+      assert.equal(rendered.gate.steps[0].retained_for, HEAD);
+    }
+    assert.equal(attestation.attestationDigest(rendered), node.attestation.digest, `size ${count}`);
+    assert.equal(attestation.verifyAttestation(rendered, { key: "k" }).ok, true, `size ${count}`);
+  }
+  assert.equal(thinned, true, "exercise the middle rung which keeps a reduced step list");
+});
