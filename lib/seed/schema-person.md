@@ -2,7 +2,7 @@
 id: schema-person
 type: schema
 kind: node-schema
-schema_version: 2026.07.14.1
+schema_version: 2026.09.06.1
 title: Seed schema for person nodes
 summary: Node schema for the person type — a member of the org, with a mutable display name plus the identity anchor for $viewer binding and Tier-2 question routing. Seed-pack default; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -72,6 +72,17 @@ person declares the handle. Declarative data only — absent it, that person is
 simply unresolvable from a GitHub login and the field has no effect, so this
 register is purely additive (existing person nodes are unchanged).
 
+`resolution` (2026.09.06.1, issue-spor-offline-check-get-hook-resolution-proxy):
+the attestation path for this type's completion, DECLARED as registry data.
+`verified_by: status` — a person's own terminal status retires it; no inbound
+resolving edge attests it. Readers (remote dispatch's terminal-state verify,
+`spor schema`) used to infer this from the ABSENCE of a `get()` hook on this
+schema, which is the general-purpose read-time enrichment verb and says
+nothing about resolution — so adopting one here for any other purpose would
+have silently flipped this type to edge-verified and read genuinely
+status-retired work as unattested. Declaration only — enforcement stays in the
+hooks — no stored-shape change, no upgrade chain.
+
 ```json
 {
   "node_type": "person",
@@ -107,6 +118,9 @@ register is purely additive (existing person nodes are unchanged).
       ],
       "description": "GitHub login to person mapping key for review reflection"
     }
+  },
+  "resolution": {
+    "verified_by": "status"
   }
 }
 ```

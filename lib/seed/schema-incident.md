@@ -2,7 +2,7 @@
 id: schema-incident
 type: schema
 kind: node-schema
-schema_version: 2026.06.19.1
+schema_version: 2026.09.06.1
 title: Seed schema for incident nodes
 summary: Node schema for the incident type — something that went wrong in operation; queueable, so live incidents join the decision queue. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -29,6 +29,17 @@ silent narrowing of the old all-types behavior
 (task-spor-getnode-surface-resolution-on-terminal). Pure, read-only, fail-soft;
 registry behavior only, backward-readable, no upgrade chain.
 
+`resolution` (2026.09.06.1, issue-spor-offline-check-get-hook-resolution-proxy):
+the attestation path for this type's completion, DECLARED as registry data.
+`verified_by: edge` — an incident is retired by a live inbound resolving edge
+(the `get()` ride-along above), never by its status alone. It restates as data
+what the hook already implies, because readers used to INFER it from the mere
+presence of a `get()` hook: `get()` is the general-purpose read-time enrichment
+verb (a held-note, an execution hold, a question's answers), so that proxy
+would have reclassified any type adopting one for an unrelated purpose.
+Declaration only — enforcement stays in the hooks — no stored-shape change, no
+upgrade chain.
+
 ```json
 {
   "node_type": "incident",
@@ -36,7 +47,10 @@ registry behavior only, backward-readable, no upgrade chain.
   "prefix": [
     "inc-"
   ],
-  "queueable": true
+  "queueable": true,
+  "resolution": {
+    "verified_by": "edge"
+  }
 }
 ```
 

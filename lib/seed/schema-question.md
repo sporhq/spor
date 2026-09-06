@@ -2,7 +2,7 @@
 id: schema-question
 type: schema
 kind: node-schema
-schema_version: 2026.08.22.1
+schema_version: 2026.09.06.1
 title: Seed schema for question nodes
 summary: Node schema for the question type — a routed ask that the graph could not answer; queueable so open questions join the decision queue, routed-to a steward, answered by nodes carrying answers edges. Seed-pack default; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -72,6 +72,17 @@ write door; `test/seed-declarative-status-policy.test.js` drives it through the
 sandbox and fails if the hook and this payload disagree. Backward-readable:
 declaration only, no stored-shape change, no upgrade chain.
 
+`resolution` (2026.09.06.1, issue-spor-offline-check-get-hook-resolution-proxy):
+the attestation path for this type's completion, DECLARED as registry data.
+`verified_by: edge` — a question is retired by a live inbound resolving edge
+(the `get()` ride-along above), never by its status alone. It restates as data
+what the hook already implies, because readers used to INFER it from the mere
+presence of a `get()` hook: `get()` is the general-purpose read-time enrichment
+verb (a held-note, an execution hold, a question's answers), so that proxy
+would have reclassified any type adopting one for an unrelated purpose.
+Declaration only — enforcement stays in the hooks — no stored-shape change, no
+upgrade chain.
+
 ```json
 {
   "node_type": "question",
@@ -86,6 +97,9 @@ declaration only, no stored-shape change, no upgrade chain.
       "answered"
     ],
     "completion": "answered"
+  },
+  "resolution": {
+    "verified_by": "edge"
   }
 }
 ```

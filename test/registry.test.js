@@ -593,6 +593,114 @@ test("parseSchemaNode: rejects a malformed completion policy", () => {
   assert.equal(ok.ok, true, ok.errors.join("; "));
 });
 
+test("parseSchemaNode: rejects a malformed resolution declaration", () => {
+  // issue-spor-offline-check-get-hook-resolution-proxy: the declaration is a
+  // CLOSED enum on purpose. A typo that parsed as "undeclared" would silently
+  // drop the type back onto the legacy `get`-hook proxy the declaration exists
+  // to retire — the reader would then be confidently wrong in exactly the way
+  // this key was added to prevent.
+  const parse = (id, payload) => registry.parseSchemaNode({
+    id, kind: "node-schema", schema_version: "2026.09.06.1",
+    body: "```json\n" + JSON.stringify(payload) + "\n```",
+  });
+  assert.ok(parse("schema-a", { node_type: "a", resolution: "edge" })
+    .errors.some((e) => /resolution must be an object/.test(e)));
+  assert.ok(parse("schema-b", { node_type: "b", resolution: {} })
+    .errors.some((e) => /resolution.verified_by is required/.test(e)));
+  assert.ok(parse("schema-c", { node_type: "c", resolution: { verified_by: "edges" } })
+    .errors.some((e) => /must be 'edge' or 'status'/.test(e)));
+  for (const v of ["edge", "status"]) {
+    const ok = parse("schema-k", { node_type: "k", resolution: { verified_by: v } });
+    assert.equal(ok.ok, true, ok.errors.join("; "));
+  }
+});
+
+test("isEdgeVerified: the DECLARATION decides, the get()-hook proxy only answers for a schema that declares nothing", () => {
+  // issue-spor-offline-check-get-hook-resolution-proxy. `get()` is the
+  // general-purpose read-time enrichment verb, so its presence was never
+  // evidence about resolution; the proxy survives only for a graph-resident
+  // schema authored before this key existed.
+  const reg = graph.seedRegistry();
+  assert.equal(reg.resolutionVerification("task"), "edge");
+  assert.equal(reg.resolutionVerification("decision"), "status");
+  assert.equal(reg.resolutionVerification("no-such-type"), null);
+
+  // a resident override that adds a get() hook for UNRELATED enrichment and
+  // leaves the declaration alone: still status-verified.
+  reg.add({
+    id: "schema-decision", kind: "node-schema", version: "2026.09.06.2", key: "decision",
+    payload: { node_type: "decision", resolution: { verified_by: "status" } },
+    code: { get: "export function get() { return {}; }" }, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.equal(reg.attachesGetHook("decision"), true, "the hook IS attached");
+  assert.equal(reg.isEdgeVerified("decision"), false, "…and says nothing about resolution");
+
+  // a resident override that declares `edge` and attaches no hook at all:
+  // still edge-verified. The declaration outranks the proxy in both directions.
+  reg.add({
+    id: "schema-finding", kind: "node-schema", version: "2026.09.06.2", key: "finding",
+    payload: { node_type: "finding", resolution: { verified_by: "edge" } },
+    code: {}, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.equal(reg.isEdgeVerified("finding"), true);
+
+  // and an override that declares NOTHING falls back to the proxy — the
+  // pre-declaration reading, kept so such a schema is honored unchanged.
+  reg.add({
+    id: "schema-lens", kind: "node-schema", version: "2026.09.06.2", key: "lens",
+    payload: { node_type: "lens" },
+    code: { get: "export function get() { return {}; }" }, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.equal(reg.resolutionVerification("lens"), null);
+  assert.equal(reg.isEdgeVerified("lens"), true, "undeclared -> the legacy proxy answers");
+});
+
+// Review finding F2: `lib/` is a PUBLISHED surface imported by name (the
+// server, and any sibling checkout pinned to an older client), so the rename
+// keeps the old spellings alive as deprecated aliases rather than turning a
+// rename into a TypeError. They resolve to the DECLARATION-driven answer,
+// which is the question their callers were asking; the literal hook fact has
+// its own name now.
+test("the pre-rename spellings still resolve, and to the declaration, not the hook", () => {
+  const reg = graph.seedRegistry();
+  assert.equal(typeof reg.attachesResolutionHook, "function");
+  assert.equal(reg.attachesResolutionHook("task"), true);
+  assert.equal(reg.attachesResolutionHook("decision"), false);
+  assert.equal(typeof graph.attachesResolutionHookOffline, "function");
+  assert.equal(graph.attachesResolutionHookOffline("task"), true);
+  assert.equal(graph.attachesResolutionHookOffline("decision"), false);
+  // The one case the alias and the literal hook fact disagree — the bug the
+  // rename is about — the alias answers with the declaration.
+  reg.add({
+    id: "schema-decision", kind: "node-schema", version: "2026.09.06.2", key: "decision",
+    payload: { node_type: "decision", resolution: { verified_by: "status" } },
+    code: { get: "export function get() { return {}; }" }, codeBlocks: [], upgrades: [],
+  }, "graph");
+  assert.equal(reg.attachesGetHook("decision"), true);
+  assert.equal(reg.attachesResolutionHook("decision"), false, "the alias is isEdgeVerified, not the proxy");
+});
+
+test("snapshot: every node type carries its resolution declaration, so a remote reader need not proxy", () => {
+  const snap = graph.seedRegistry().snapshot();
+  const byType = Object.fromEntries(snap.node_types.map((n) => [n.type, n.resolution]));
+  assert.equal(byType.task, "edge");
+  assert.equal(byType.question, "edge");
+  assert.equal(byType.decision, "status");
+  // The native `schema` entry declares none — but it says so with the key
+  // PRESENT and null, the way the node_types contract documents every entry
+  // (API.md `GET /v1/schema`, review finding F3). A reader distinguishing
+  // "declared status" from "undeclared" must not have to treat one row's
+  // missing key as a third state.
+  assert.ok(
+    snap.node_types.some((n) => n.type === "schema" && Object.prototype.hasOwnProperty.call(n, "resolution")),
+    "the native entry carries the key"
+  );
+  assert.equal(byType.schema, null, "the native `schema` type declares none");
+  const undeclared = snap.node_types.filter((n) => n.type !== "schema" && n.resolution == null);
+  assert.deepEqual(undeclared.map((n) => n.type), [],
+    "a seed type with no declaration would be decided by the proxy this key retires");
+});
+
 test("seed pack: the completion policy is readable off the registry, per type", () => {
   // The surface spor-server's gardener derives TERMINAL_STATUS_BY_TYPE and
   // RESOLVER_REQUIRED_TERMINAL from, replacing three hand-maintained tables

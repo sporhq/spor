@@ -2,7 +2,7 @@
 id: schema-factory
 type: schema
 kind: node-schema
-schema_version: 2026.09.06.1
+schema_version: 2026.09.06.2
 title: Software-factory definition
 summary: A factory definition — the ordered gate list a worker enforces between claim and resolve, plus the trusted ref, the repos it may judge, protected test paths, test-change lane, risk classes those gates key on, an optional integration (merge-queue landing) stage, an optional rescue lane (a strong-model step before any human escalation), an optional implementation stage and the completion boundary that says who writes the resolving edge. Candidate pack; adopt it into a graph to use `spor work --factory`.
 date: 2026-08-26
@@ -193,6 +193,17 @@ convention schema nodes use:
   is a DECLARATION of intent the runner already validates; it changes nothing
   about what a worker does now.
 
+`resolution` (2026.09.06.2, issue-spor-offline-check-get-hook-resolution-proxy):
+the attestation path for this type's completion, DECLARED as registry data.
+`verified_by: status` — a factory's own terminal status retires it; no inbound
+resolving edge attests it. Readers (remote dispatch's terminal-state verify,
+`spor schema`) used to infer this from the ABSENCE of a `get()` hook on this
+schema, which is the general-purpose read-time enrichment verb and says
+nothing about resolution — so adopting one here for any other purpose would
+have silently flipped this type to edge-verified and read genuinely
+status-retired work as unattested. Declaration only — enforcement stays in the
+hooks — no stored-shape change, no upgrade chain.
+
 ```json
 {
   "node_type": "factory",
@@ -206,6 +217,9 @@ convention schema nodes use:
     "vocabulary": ["proposed", "active", "retired"],
     "terminal": ["retired"],
     "resolver_required": false
+  },
+  "resolution": {
+    "verified_by": "status"
   }
 }
 ```

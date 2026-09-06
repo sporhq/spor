@@ -2,7 +2,7 @@
 id: schema-issue
 type: schema
 kind: node-schema
-schema_version: 2026.09.06.1
+schema_version: 2026.09.06.2
 title: Seed schema for issue nodes
 summary: Node schema for the issue type — a defect/finding and its resolution lineage; queueable, so open issues join the decision queue. Seed-pack mirror of the GRAPH.md ontology; a graph-resident schema node for this type overrides it.
 date: 2026-06-10
@@ -112,6 +112,17 @@ resolvers, a note) instead of the `resolution` ride-along while the key is
 present, matching the kernel's `resolutionMap`/`isLive` hold rule. See
 GRAPH.md "Execution hold". Backward-readable, no upgrade chain.
 
+`resolution` (2026.09.06.2, issue-spor-offline-check-get-hook-resolution-proxy):
+the attestation path for this type's completion, DECLARED as registry data.
+`verified_by: edge` — an issue is retired by a live inbound resolving edge
+(the `get()` ride-along above), never by its status alone. It restates as data
+what the hook already implies, because readers used to INFER it from the mere
+presence of a `get()` hook: `get()` is the general-purpose read-time enrichment
+verb (a held-note, an execution hold, a question's answers), so that proxy
+would have reclassified any type adopting one for an unrelated purpose.
+Declaration only — enforcement stays in the hooks — no stored-shape change, no
+upgrade chain.
+
 ```json
 {
   "node_type": "issue",
@@ -128,6 +139,9 @@ GRAPH.md "Execution hold". Backward-readable, no upgrade chain.
     ],
     "completion": "resolved",
     "resolver_required": true
+  },
+  "resolution": {
+    "verified_by": "edge"
   }
 }
 ```

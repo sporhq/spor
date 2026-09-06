@@ -495,42 +495,104 @@ function schemaSnapshotWithOverride(type, patch) {
   return snap;
 }
 
-test("a resident override that ADDS a get() hook to a status-only type is honored: a terminal status with no resolving edge no longer over-reads resolved (issue-spor-remote-dispatch-ignores-resident-resolution-hooks)", async () => {
+test("a resident override that DECLARES a status-only type edge-verified is honored: a terminal status with no resolving edge no longer over-reads resolved (issue-spor-remote-dispatch-ignores-resident-resolution-hooks)", async () => {
   const t = transport({
     "GET /v1/nodes/dec-x": { ok: true, status: 200, json: { id: "dec-x", type: "decision", status: "settled" } },
-    "GET /v1/schema": { ok: true, status: 200, json: schemaSnapshotWithOverride("decision", { hooks: ["get", "validate", "transitions"] }) },
+    "GET /v1/schema": { ok: true, status: 200, json: schemaSnapshotWithOverride("decision", { resolution: "edge", hooks: ["get", "validate", "transitions"] }) },
     "POST /v1/nodes": { ok: true, status: 200, json: { results: [{ ok: true, status: "created" }] } },
   });
   const patch = await terminal.applyTerminalContract({
     ...BASE, nodeId: "dec-x", releaseNode: "dec-x", state: "done",
     reportText: "Settled the decision, but nothing resolves it on the graph yet.", request: t.call,
   });
-  // The shipped SEED pack alone (decision has no `get` hook there) would have
-  // read this as status-only and resolved it off the terminal status alone —
-  // the exact over-read this override exists to prevent: this graph now
+  // The shipped SEED pack (decision declares `verified_by: status` there) would
+  // have read this as status-only and resolved it off the terminal status alone
+  // — the exact over-read this override exists to prevent: this graph now
   // requires a resolving edge for a decision, and none exists.
   assert.notStrictEqual(patch.terminal_state, "resolved");
   assert.strictEqual(patch.terminal_state, "reported");
   assert.strictEqual(patch.terminal_enforced, true);
 });
 
-test("a resident override that DROPS the get() hook from an edge-verified type is honored: own-status completion now resolves with no edge (issue-spor-remote-dispatch-ignores-resident-resolution-hooks)", async () => {
+test("a `get()` hook ADDED to a status-only type for unrelated enrichment does NOT flip it to edge-verified (issue-spor-offline-check-get-hook-resolution-proxy)", async () => {
+  const t = transport({
+    "GET /v1/nodes/dec-x": { ok: true, status: 200, json: { id: "dec-x", type: "decision", status: "settled" } },
+    // The override adds a `get()` hook — a held-note, a supersession ride-along,
+    // any of the read-time enrichment that verb is FOR — and leaves the type's
+    // own `resolution` declaration alone.
+    "GET /v1/schema": { ok: true, status: 200, json: schemaSnapshotWithOverride("decision", { hooks: ["get", "validate", "transitions"] }) },
+    "POST /v1/nodes": { ok: true, status: 200, json: { results: [{ ok: true, status: "created" }] } },
+  });
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, nodeId: "dec-x", releaseNode: "dec-x", state: "done",
+    reportText: "Settled it.", request: t.call,
+  });
+  // Reading the hook's presence as the resolution signal (what this leg did
+  // before the declaration existed) would demand a resolving edge a decision
+  // never has, file a report claiming one is missing, and hand back the lease
+  // on genuinely finished work. The declaration says `status`, so the terminal
+  // status attests it.
+  assert.strictEqual(patch.terminal_state, "resolved");
+  assert.strictEqual(patch.terminal_enforced, true);
+  assert.match(patch.terminal_note, /status 'settled' is terminal for 'decision' nodes/);
+  assert.ok(!t.calls.some((c) => c.method === "POST" && c.path === "/v1/nodes"), "nothing filed");
+});
+
+test("an OLDER server's snapshot (no `resolution` key at all) still falls back to the `get()`-hook proxy (issue-spor-offline-check-get-hook-resolution-proxy)", async () => {
+  const legacy = schemaSnapshotWithOverride("decision", { hooks: ["get", "validate", "transitions"] });
+  for (const entry of legacy.node_types) delete entry.resolution;
+  const t = transport({
+    "GET /v1/nodes/dec-x": { ok: true, status: 200, json: { id: "dec-x", type: "decision", status: "settled" } },
+    "GET /v1/schema": { ok: true, status: 200, json: legacy },
+    "POST /v1/nodes": { ok: true, status: 200, json: { results: [{ ok: true, status: "created" }] } },
+  });
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, nodeId: "dec-x", releaseNode: "dec-x", state: "done",
+    reportText: "Settled the decision, but nothing resolves it on the graph yet.", request: t.call,
+  });
+  // A snapshot with no declaration anywhere is an older server, not a graph
+  // saying "status": the proxy is the only reading available, and it is the
+  // one this leg had before the key existed — byte-identical, not fail-open.
+  assert.strictEqual(patch.terminal_state, "reported");
+  assert.strictEqual(patch.terminal_enforced, true);
+});
+
+test("a resident override that DECLARES an edge-verified type status-verified is honored: own-status completion now resolves with no edge (issue-spor-remote-dispatch-ignores-resident-resolution-hooks)", async () => {
   const t = transport({
     "GET /v1/nodes/task-x": { ok: true, status: 200, json: { id: "task-x", type: "task", status: "done" } },
-    "GET /v1/schema": { ok: true, status: 200, json: schemaSnapshotWithOverride("task", { hooks: [], terminal: ["done", "abandoned"] }) },
+    "GET /v1/schema": { ok: true, status: 200, json: schemaSnapshotWithOverride("task", { resolution: "status", hooks: [], terminal: ["done", "abandoned"] }) },
   });
   const patch = await terminal.applyTerminalContract({
     ...BASE, nodeId: "task-x", releaseNode: "task-x", state: "done",
     reportText: "Retired by status alone under this graph's override.", request: t.call,
   });
-  // The shipped SEED pack alone (task has a `get` hook there) would have kept
-  // demanding a resolving edge and read this genuinely-done node as not
+  // The shipped SEED pack (task declares `verified_by: edge` there) would have
+  // kept demanding a resolving edge and read this genuinely-done node as not
   // attested — the exact false negative this override exists to prevent.
   assert.strictEqual(patch.terminal_state, "resolved");
   assert.strictEqual(patch.terminal_enforced, true);
   assert.match(patch.terminal_note, /status 'done' is terminal for 'task' nodes/);
   // Verified done, nothing filed or released — the same as any other resolved read.
   assert.deepStrictEqual(t.calls.map((c) => `${c.method} ${c.path}`), ["GET /v1/nodes/task-x", "GET /v1/schema"]);
+});
+
+test("the DECLARATION outranks the hook: a type declared edge-verified keeps demanding the edge even with no get() hook (issue-spor-offline-check-get-hook-resolution-proxy)", async () => {
+  const t = transport({
+    "GET /v1/nodes/task-x": { ok: true, status: 200, json: { id: "task-x", type: "task", status: "done" } },
+    "GET /v1/schema": { ok: true, status: 200, json: schemaSnapshotWithOverride("task", { hooks: [], terminal: ["done", "abandoned"] }) },
+    "POST /v1/nodes": { ok: true, status: 200, json: { results: [{ ok: true, status: "created" }] } },
+  });
+  const patch = await terminal.applyTerminalContract({
+    ...BASE, nodeId: "task-x", releaseNode: "task-x", state: "done",
+    reportText: "Status says done, but nothing resolves it.", request: t.call,
+  });
+  // An override may well drop the hook for its own reasons (this graph's
+  // get_node carries no `resolution` ride-along) without meaning to change how
+  // a task is RETIRED. The declaration is the only thing that says that, and it
+  // still says `edge` — so a `done` status with nothing resolving it is not
+  // attested, and the run files its report.
+  assert.strictEqual(patch.terminal_state, "reported");
+  assert.strictEqual(patch.terminal_enforced, true);
 });
 
 test("a malformed schema body (parses, but carries no node_types) is refused and falls back to the seed pack, never silently read as an unregistered type (issue-spor-remote-dispatch-ignores-resident-resolution-hooks)", async () => {
@@ -621,6 +683,25 @@ test("a filed report reads `reported`, fully enforced, for a status-only type wh
     "POST /v1/nodes",
     "POST /v1/nodes/dec-x/release",
   ]);
+});
+
+test("the filed report ARTIFACT names the non-terminal status, never a resolving edge a status-only type could not have (issue-spor-offline-check-get-hook-resolution-proxy)", async () => {
+  // The second half of that issue: the outcome NOTE said the right thing while
+  // the artifact filed on the graph — the durable half, the one a person reads
+  // in triage — asserted a missing `resolves` edge for a type retired by its
+  // own status.
+  const t = transport({
+    "GET /v1/nodes/find-x": { ok: true, status: 200, json: { id: "find-x", type: "finding", status: "open" } },
+    "POST /v1/nodes": { ok: true, status: 200, json: { results: [{ ok: true, status: "created" }] } },
+  });
+  await terminal.applyTerminalContract({
+    ...BASE, nodeId: "find-x", releaseNode: "find-x", state: "done",
+    reportText: "Investigated it; the remedy needs a person.", request: t.call,
+  });
+  const write = t.calls.find((c) => c.method === "POST" && c.path === "/v1/nodes");
+  const markdown = write.body.nodes[0].node;
+  assert.match(markdown, /has not reached a terminal 'finding' status/);
+  assert.ok(!/no resolving edge/.test(markdown), "a finding never had one to be missing");
 });
 
 test("a status-only type with no report and a non-terminal status fails, fully enforced, and releases the lease", async () => {

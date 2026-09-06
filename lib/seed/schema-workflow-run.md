@@ -2,7 +2,7 @@
 id: schema-workflow-run
 type: schema
 kind: node-schema
-schema_version: 2026.06.11.1
+schema_version: 2026.09.06.1
 title: Seed schema for workflow-run nodes
 summary: Node schema for the workflow-run type — one node per execution, carrying the org-meaningful state of that run (per-step status, claimants, verdicts, outcome) and its lineage (performs the workflow, triggered-by the cause). Live runs are queueable so STUCK runs (held, or a step idle past a staleness threshold) surface in the decision queue. Seed-pack default; a graph-resident schema node overrides it.
 date: 2026-06-11
@@ -28,6 +28,17 @@ mechanized for automation. A completed run goes terminal (`succeeded` /
 `failed` / `cancelled`) and leaves the queue like any done task.
 `capturable: false` — runs are created by the engine, never from raw text.
 
+`resolution` (2026.09.06.1, issue-spor-offline-check-get-hook-resolution-proxy):
+the attestation path for this type's completion, DECLARED as registry data.
+`verified_by: status` — a workflow-run's own terminal status retires it; no inbound
+resolving edge attests it. Readers (remote dispatch's terminal-state verify,
+`spor schema`) used to infer this from the ABSENCE of a `get()` hook on this
+schema, which is the general-purpose read-time enrichment verb and says
+nothing about resolution — so adopting one here for any other purpose would
+have silently flipped this type to edge-verified and read genuinely
+status-retired work as unattested. Declaration only — enforcement stays in the
+hooks — no stored-shape change, no upgrade chain.
+
 ```json
 {
   "node_type": "workflow-run",
@@ -37,6 +48,9 @@ mechanized for automation. A completed run goes terminal (`succeeded` /
   "capturable": false,
   "fields": {
     "status": { "enum": ["running", "held", "succeeded", "failed", "cancelled"] }
+  },
+  "resolution": {
+    "verified_by": "status"
   }
 }
 ```

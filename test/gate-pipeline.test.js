@@ -2085,6 +2085,75 @@ test("a settle that gets clobbered by a concurrent whole-record write is re-appl
   assert.strictEqual(dispatchRuns.readJson(paths.record).gate_state, "blocked");
 });
 
+// Review finding F4: `gate_progress` is an ACCUMULATOR shared by three writers
+// (the fix-cycle ledger, the rescue lane's entries, the shared retry pool), and
+// each builds the next version by rewriting the whole object. Without a
+// compare-and-set the writer that reads first and lands second erases what the
+// other recorded — and an erased pool charge is an unrecorded retry, exactly
+// the unbounded case the pool exists to stop.
+test("stampGateState's expectProgress is a compare-and-set: a racing writer's stamp is never silently overwritten", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-cas-"));
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  const runId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const paths = dispatchRuns.runPaths(home, runId);
+  const base = { run_id: runId, node_id: "task-x", state: "running", gate_state: "running" };
+  const stampOf = (seq, extra) => ({ key: "k1", at: "2026-09-06T00:00:00.000Z", seq, gates: {}, ...extra });
+
+  // First write of an attempt: nothing to merge from, so the expectation is a
+  // null seq and the write lands.
+  dispatchRuns.atomicJson(paths.record, base);
+  const first = stampOf(1, { pools: { retry: 1 } });
+  assert.ok(
+    dispatchRuns.stampGateState(home, runId, { gate_progress: first }, { expectProgress: { key: "k1", seq: null } }),
+    "the first write of an attempt merges from nothing"
+  );
+  assert.deepEqual(dispatchRuns.readJson(paths.record).gate_progress, first);
+
+  // Now the race: a rescue save read seq 1, a pool charge landed seq 2 in
+  // between, and the rescue's rewrite (which carries `pools` from its stale
+  // read) must be REFUSED rather than erasing the charge.
+  const charged = stampOf(2, { pools: { retry: 2 } });
+  dispatchRuns.stampGateState(home, runId, { gate_progress: charged }, { expectProgress: { key: "k1", seq: 1 } });
+  const status = {};
+  const stale = stampOf(2, { pools: { retry: 1 }, rescue: [{ n: 1 }] });
+  const refused = dispatchRuns.stampGateState(home, runId, { gate_progress: stale }, { expectProgress: { key: "k1", seq: 1 }, status });
+  assert.strictEqual(refused, null, "the loser writes nothing");
+  assert.strictEqual(status.conflict, true, "and says why — a race, not a failed journal write");
+  assert.deepEqual(dispatchRuns.readJson(paths.record).gate_progress.pools, { retry: 2 }, "the charge survives");
+
+  // Row (d): progress under ANOTHER attempt's key is the EMPTY state, not a
+  // conflict — a `--regate` mints a new key and starts its ledger fresh.
+  const regated = { key: "k2", at: "2026-09-06T00:00:01.000Z", seq: 1, gates: {} };
+  assert.ok(
+    dispatchRuns.stampGateState(home, runId, { gate_progress: regated }, { expectProgress: { key: "k2", seq: null } }),
+    "a fresh attempt key expects nothing and lands"
+  );
+  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_progress.key, "k2");
+
+  // A reverting whole-record writer is retried, not reported as landed: the
+  // CAS write is read back like a gate_state write is.
+  dispatchRuns.atomicJson(paths.record, base);
+  let reads = 0;
+  const clobberOnce = (file) => {
+    reads += 1;
+    if (reads === 1) dispatchRuns.atomicJson(paths.record, base); // the supervisor's stale copy
+    return dispatchRuns.readJson(file);
+  };
+  const reapplied = dispatchRuns.stampGateState(
+    home, runId, { gate_progress: first }, { expectProgress: { key: "k1", seq: null }, readBack: clobberOnce }
+  );
+  assert.ok(reapplied, "the reverted progress write is re-applied");
+  assert.strictEqual(reads, 2);
+  assert.deepEqual(dispatchRuns.readJson(paths.record).gate_progress, first);
+
+  // Undefined expectProgress leaves every other caller byte-identical.
+  const unchecked = stampOf(99, {});
+  assert.ok(dispatchRuns.stampGateState(home, runId, { gate_progress: unchecked }));
+  assert.deepEqual(dispatchRuns.readJson(paths.record).gate_progress, unchecked);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 // ------------------------------------------- the approval oracle + gate ids --
 
 const sporCli = require("../bin/spor.js");
@@ -4745,6 +4814,86 @@ test("a native-background reviewer's verdict is read off its transcript, and a n
   assert.strictEqual(withoutTranscript.ok, false, "a native record with no transcript still fails closed");
   assert.match(withoutTranscript.reason, /left no final report to read a verdict from/);
   assert.match(withoutTranscript.reason, /native-background with a bound transcript/);
+});
+
+// issue-spor-review-gate-reportless-run-blamed-on-routing: the mirror case of
+// the test above. A SUPERVISED reviewer that dies before it writes anything
+// also comes back report-less — but it had a report channel, so the routing
+// advice above is false about it. Two fix cycles were dispatched at a
+// credit-dead Codex reviewer's "plumbing" while the record's own termination
+// and the provider's message in its log went unread; the refusal must name the
+// run's own ending instead.
+test("a report-less reviewer that HAD a report channel is refused on its own ending, not on routing", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-review-reportless-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, "nodes", "task-fix-me.md"),
+    "---\nid: task-fix-me\ntype: task\ntitle: Make the bound exclusive\nsummary: The loop over-reads by one element.\nstatus: open\ndate: 2026-09-05\n---\n\nAcceptance: reading N items yields N.\n"
+  );
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "spor-review-reportless-repo-"));
+  const g = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } }).trim();
+  g("init", "-q", "-b", "main");
+  fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n;\n");
+  g("add", "."); g("commit", "-q", "-m", "base");
+  g("checkout", "-q", "-b", "task-fix-me");
+  fs.writeFileSync(path.join(repo, "x.js"), "module.exports = (n) => n + 1;\n");
+  g("commit", "-q", "-am", "implement");
+
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  fs.mkdirSync(dispatchRuns.dispatchRunDir(home), { recursive: true });
+  const gate = { id: "adversarial-review", kind: "agent-review", profile: "profile-codex-sol", cycles: 2, awaitMs: 5000 };
+  // The real ending of run 57a6143f: codex exec declared the turn failed on a
+  // usage limit, wrote no --output-last-message file, and exited 1.
+  const logPath = path.join(home, "reportless.log");
+  fs.writeFileSync(
+    logPath,
+    '{"type":"thread.started","thread_id":"01a07746"}\n' +
+      '{"type":"turn.started"}\n' +
+      '{"type":"error","message":"You\'ve hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits."}\n'
+  );
+
+  const deps = sporCli.makeGateDeps(cfg, {
+    record: { node_id: "task-fix-me", cwd: repo },
+    entry: { run_id: "aaaaaaaa-bbbb-cccc-dddd-ffffffffffff", node_id: "task-fix-me", project: null },
+    factory: { id: "factory-test" },
+    slug: null, passthrough: {},
+    warn: () => {}, log: () => {}, stopping: () => false, home,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    dispatch: async () => {
+      const runId = "reportless-review-run";
+      const p = dispatchRuns.runPaths(home, runId);
+      dispatchRuns.atomicJson(p.record, {
+        run_id: runId, node_id: null, name: "gate-adversarial-review", harness: "codex",
+        launch_mode: "supervised-jsonl", state: "failed", created_at: new Date().toISOString(),
+        // The channel EXISTED — codex exec was given a report file to write —
+        // it just died before writing it, so the path names no file.
+        report_path: path.join(home, "never-written.report.md"),
+        log_path: logPath, exit_code: 1,
+        termination_class: "failed", termination_signal: "nonzero-exit",
+        termination_reason: "the supervised child exited 1",
+      });
+      return { ok: true, run: { run_id: runId, harness: "codex" } };
+    },
+  });
+  assert.ok((await deps.changedPaths({ trustedRef: "main" })).ok);
+
+  const res = await deps.review({ gate, cycle: 0, prior: [], fix: null });
+  assert.strictEqual(res.ok, false, "a reviewer that wrote no verdict still fails closed");
+  assert.doesNotMatch(res.reason, /must route to a harness/, "the run was supervised — routing advice is false about it");
+  assert.match(res.reason, /supervised-jsonl/);
+  assert.match(res.reason, /not a routing fault/);
+  assert.match(res.reason, /the supervised child exited 1/);
+  assert.match(res.reason, /nonzero-exit/);
+  // The record explained nothing past the exit status, so the provider's own
+  // message — the only place the reason exists — rides along bounded.
+  assert.match(res.reason, /Its log ends:/);
+  assert.match(res.reason, /usage limit/);
+  // The refusal is charged exactly as before: `failed` is not an outage, so
+  // `outageOf` still declines it and a fix cycle is spent, not a retry.
+  // `outageOf` acts only on `infrastructure`/`unroutable`, so this reading is
+  // still not an outage and the refusal spends a fix cycle exactly as before.
+  assert.strictEqual(res.classification.outcome, "failed");
 });
 
 // --- the dirty-tree round-trip (task-spor-worker-declined-outcome) --------

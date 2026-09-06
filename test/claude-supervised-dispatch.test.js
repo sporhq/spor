@@ -215,9 +215,31 @@ test("claude-code declares a failure from an is_error result, and from nothing e
   assert.strictEqual(failureFromEvent({ type: "assistant", message: { content: [{ type: "text", text: "is_error: true" }] } }), null, "only a result event can declare it");
   assert.strictEqual(failureFromEvent({ type: "system", subtype: "init" }), null);
   assert.strictEqual(failureFromEvent(null), null);
-  for (const id of ["codex", "opencode", "copilot"]) {
+  for (const id of ["opencode", "copilot"]) {
     assert.strictEqual(getHarness(id).failureFromEvent, undefined, `${id} declares no stream failure — its supervision is byte-identical`);
   }
+});
+
+// issue-spor-codex-usage-limit-outage-read-as-a-code-failure: Codex had no
+// declaration hook at all, so its `turn.failed` was invisible to the supervisor
+// and a provider outage settled as a bare `nonzero-exit`.
+test("codex declares a failure from turn.failed, and from nothing else", () => {
+  const { failureFromEvent } = getHarness("codex");
+  assert.strictEqual(typeof failureFromEvent, "function");
+  assert.deepStrictEqual(
+    failureFromEvent({ type: "turn.failed", error: { message: "You've hit your usage limit." } }),
+    { reason: "You've hit your usage limit." }
+  );
+  assert.deepStrictEqual(failureFromEvent({ type: "turn.failed" }), { reason: "turn.failed" }, "a bare turn.failed still declares failure");
+  assert.deepStrictEqual(failureFromEvent({ type: "turn.failed", error: {} }), { reason: "turn.failed" });
+  // The bare `error` event precedes turn.failed carrying the same text, but the
+  // supervisor cannot UNSET a declaration once made, so declaring on it would
+  // fail a run that recovered — and suppress the report of a review that passed.
+  assert.strictEqual(failureFromEvent({ type: "error", message: "transient tool error" }), null, "a bare error event is not terminal for the turn");
+  assert.strictEqual(failureFromEvent({ type: "turn.completed", usage: {} }), null);
+  assert.strictEqual(failureFromEvent({ type: "item.completed", item: { type: "agent_message", text: "turn.failed" } }), null, "only the event itself can declare it");
+  assert.strictEqual(failureFromEvent({ type: "thread.started", thread_id: "th-1" }), null);
+  assert.strictEqual(failureFromEvent(null), null);
 });
 
 test("a supervised claude-code run ending in an is_error result classifies FAILED with the error text as the reason — no report, never `reported`", async () => {

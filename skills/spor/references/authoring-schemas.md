@@ -51,7 +51,8 @@ that should retire only ONE type in that schema's `status.inert`/
     "vocabulary": ["open", "active", "done", "abandoned"],
     "completion": "done",
     "resolver_required": true
-  }
+  },
+  "resolution": { "verified_by": "edge" }
 }
 ```
 
@@ -101,6 +102,17 @@ that should retire only ONE type in that schema's `status.inert`/
   mechanical close for this type. Keep them TRUE to the hooks: the seed pack's
   `test/seed-declarative-status-policy.test.js` drives every schema's hooks
   through the sandbox and fails on disagreement.
+- `resolution.verified_by` — **how this type's completion is attested**
+  (issue-spor-offline-check-get-hook-resolution-proxy): `edge` (only a live
+  inbound resolving `resolves`/`answers` edge counts — task, issue, question,
+  incident) or `status` (the node's own terminal status retires it — everything
+  else). A dispatched agent's run is judged against whichever you declare, so
+  declare it on every node schema you write. It used to be inferred from
+  whether the schema attached a `get()` hook — but `get()` is the
+  general-purpose read-time enrichment verb, so adding one for a held-note or
+  any other ride-along would silently reclassify your type and make finished
+  work read as unattested. Declaring it is how you say which you mean; it
+  declares, it does not enforce.
 
 Note what the payload does **not** hold: there is no field list and no status
 *enum*. Extra frontmatter fields are allowed as-is — a custom `severity:` line

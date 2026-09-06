@@ -2,7 +2,7 @@
 id: schema-routine
 type: schema
 kind: node-schema
-schema_version: 2026.06.18.1
+schema_version: 2026.09.06.1
 title: Seed schema for routine nodes
 summary: Node schema for the routine type — owner-scoped (owned-by a person) trigger→action automation: declarative when→do rules over graph events that dispatch ONLY the owner's agents, AND-ed with org policy. Declarative register first; attached sandboxed code is a later schema-gated escape hatch. Seed-pack default; a graph-resident schema node for this type overrides it.
 date: 2026-06-18
@@ -79,6 +79,17 @@ drafted from a capture or distilled from a transcript — mirroring `agent`,
 `profile`, `person`, and `workflow-run`. Graphs without routine nodes behave
 exactly as before.
 
+`resolution` (2026.09.06.1, issue-spor-offline-check-get-hook-resolution-proxy):
+the attestation path for this type's completion, DECLARED as registry data.
+`verified_by: status` — a routine's own terminal status retires it; no inbound
+resolving edge attests it. Readers (remote dispatch's terminal-state verify,
+`spor schema`) used to infer this from the ABSENCE of a `get()` hook on this
+schema, which is the general-purpose read-time enrichment verb and says
+nothing about resolution — so adopting one here for any other purpose would
+have silently flipped this type to edge-verified and read genuinely
+status-retired work as unattested. Declaration only — enforcement stays in the
+hooks — no stored-shape change, no upgrade chain.
+
 ```json
 {
   "node_type": "routine",
@@ -86,6 +97,9 @@ exactly as before.
   "prefix": [
     "routine-"
   ],
-  "capturable": false
+  "capturable": false,
+  "resolution": {
+    "verified_by": "status"
+  }
 }
 ```

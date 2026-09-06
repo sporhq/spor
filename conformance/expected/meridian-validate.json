@@ -1,6 +1,9 @@
 {
   "errors": [],
-  "warnings": [],
+  "warnings": [
+    "registry: graph schema 'schema-lens-actions' (lens @ 2026.06.10.2) shadows a newer seed schema (@ 2026.09.06.1) — bump the resident override in lockstep with seed changes, or retire it",
+    "registry: graph schema 'schema-person' (person @ 2026.07.14.1) shadows a newer seed schema (@ 2026.09.06.1) — bump the resident override in lockstep with seed changes, or retire it"
+  ],
   "byType": {
     "feature": 4,
     "key-result": 3,
