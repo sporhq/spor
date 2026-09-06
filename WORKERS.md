@@ -1974,6 +1974,22 @@ escalation was reading an outage as `changes_requested`. And a reviewer that
 RAN and wrote garbage is unchanged: that is still a judgement of the change,
 and the fail-closed rule above stands.
 
+The classifier's table decides who PAYS for a reviewer that never answered; it
+does not decide whether there is anything to fix. **A review that produced no
+verdict text at all — the dispatch was refused, the run never reached a
+terminal state, or it ended having written nothing — raises no finding of its
+own, so with no PRIOR finding still open it charges no fix cycle and no
+rescue**, whatever the classifier read. It refuses and escalates, saying so. A
+fix cycle with an empty findings list is an implementer dispatched at a detail
+line that says the reviewer wrote no report: three program items spent all four
+attempts and then a rescue exactly that way while Codex was credit-dead (16
+reviewer dispatches, 0 verdicts, every one a usage-limit refusal —
+task-spor-program-review-report-recovery-20260906). The `infrastructure` branch
+above now routes that particular reading to the pool, but only for an ending the
+signature table RECOGNIZES; this rule does not wait on the table agreeing. Where
+prior findings ARE still open the cycle is charged as before — the fixer has
+real, named work, and a review that never ran cleared none of it.
+
 ### 10.5 Human gates — approval keyed on declared risk
 
 A human gate declares the `risk` classes that ARM it (a gate declaring none is

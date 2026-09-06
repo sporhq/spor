@@ -4889,10 +4889,11 @@ test("a report-less reviewer that HAD a report channel is refused on its own end
   // message — the only place the reason exists — rides along bounded.
   assert.match(res.reason, /Its log ends:/);
   assert.match(res.reason, /usage limit/);
-  // The refusal is charged exactly as before: `failed` is not an outage, so
-  // `outageOf` still declines it and a fix cycle is spent, not a retry.
-  // `outageOf` acts only on `infrastructure`/`unroutable`, so this reading is
-  // still not an outage and the refusal spends a fix cycle exactly as before.
+  // `failed` is not an outage, so `outageOf` still declines it and the
+  // infrastructure pool is not charged. What the PIPELINE then does with a
+  // report-less refusal depends on whether any prior finding is open — with
+  // none it refuses without a fix cycle, asserted over runGatePipeline in
+  // "a review that produced NO verdict and carries no prior finding …".
   assert.strictEqual(res.classification.outcome, "failed");
 });
 
@@ -6744,6 +6745,70 @@ test("a reviewer that RAN and wrote garbage is still a rejection — the fail-cl
   assert.strictEqual(res.state, "failed");
   assert.strictEqual(seen.fixes.length, 2, "an unreadable verdict still spends the declared fix cycles");
   assert.deepStrictEqual(seen.pools, { retry: { spent: 0 } }, "and never the infrastructure pool");
+});
+
+// task-spor-program-review-report-recovery-20260906: the classifier's table
+// decides who PAYS for a reviewer that never answered; it does not decide
+// whether there is anything to fix. Three program items burned all four
+// attempts and then a rescue on a Codex reviewer that was credit-dead — 16
+// dispatches, 0 verdicts — because a report-less review with no prior finding
+// still read as a `failed` gate and a `failed` gate retries. The
+// `infrastructure` reading now routes that particular ending to the pool, but
+// only when the signature table recognizes its wording, so the rule here is
+// stated over what the review PRODUCED instead: no verdict and nothing carried
+// is nothing to fix.
+test("a review that produced NO verdict and carries no prior finding charges no fix cycle and no rescue", async () => {
+  const factory = factoryOf({
+    ...OUTAGE_BASE,
+    gates: [{ id: "review", kind: "agent-review", profile: "profile-codex-sol", cycles: 3 }],
+    rescue: { profile: "profile-rescue" },
+  });
+  // The shape the shell hands back for a reviewer that HAD a report channel and
+  // died before writing to it, with an ending the signature table did not
+  // recognize — so `classification` is `failed`, not an outage.
+  const reportless = {
+    ok: false,
+    reason: "the review run under profile-codex-sol wrote no final report to read a verdict from, and it was launched supervised-jsonl",
+    classification: { outcome: "failed", pool: "implementation", reason: "the supervised child exited 1 (nonzero-exit)" },
+  };
+  const { deps, seen } = fakes({ pools: { retry: { spent: 0 } }, review: () => reportless });
+  deps.rescue = async () => {
+    throw new Error("a reviewer that produced no verdict left no defect to diagnose");
+  };
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(seen.reviews.length, 1, "the gate refuses on the first report-less review");
+  assert.strictEqual(seen.fixes.length, 0, "an implementer dispatched at an empty findings list is dispatched at nothing");
+  assert.deepStrictEqual(seen.pools, { retry: { spent: 0 } }, "and this is not an outage reading, so no pool is charged either");
+  assert.strictEqual(seen.escalations.length, 1);
+  assert.deepStrictEqual(seen.escalations[0].findings, []);
+  assert.strictEqual(seen.escalations[0].attempts.length, 1, "one attempt, not the declared four");
+  assert.match(seen.escalations[0].detail, /wrote no final report/);
+  assert.match(seen.escalations[0].detail, /nothing for a fix cycle to fix/);
+});
+
+// The mirror half, and the one that must stay byte-identical: a review that
+// never answered cleared nothing, so where prior findings ARE open the fixer
+// has real, named work and the cycle is charged exactly as before.
+test("a review that produced no verdict still spends its cycles while a PRIOR finding is open", async () => {
+  const factory = factoryOf({
+    ...OUTAGE_BASE,
+    gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 2 }],
+  });
+  const raise = { ok: true, text: '```json\n{"verdict":"changes_requested","findings":[{"severity":"blocking","file":"lib/x.js","summary":"the bound over-reads","evidence":"ran npm test -- x.test.js, it failed"}]}\n```' };
+  let call = 0;
+  const { deps, seen } = fakes({
+    review: () => {
+      call += 1;
+      return call === 1 ? raise : { ok: false, reason: "the review run under profile-review left no final report to read a verdict from" };
+    },
+  });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(seen.reviews.length, 3, "the declared cycles are spent, as they were before");
+  assert.strictEqual(seen.fixes.length, 2);
+  assert.strictEqual(seen.fixes[1].findings.length, 1, "the fixer is sent back at the finding the reviewer never got to clear");
+  assert.strictEqual(seen.fixes[1].findings[0].origin, "prior");
 });
 
 test("a FIX dispatch refused before any run record is unroutable: no rescue, and the refusal says so", async () => {
