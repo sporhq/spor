@@ -354,6 +354,105 @@ on what it left (it never passes anything itself); and only if that also
 refuses is the person paged — with the diagnosis first. Each attempt leaves
 an `art-rescue-*` fact (WORKERS.md §10.10, `references/maintenance.md`).
 
+## 3e. The implementation stage and the completion boundary (optional)
+
+Only emit these if the operator answered interview question 9 — "when an agent
+says it is finished, should the work waiting on it start moving, or should the
+factory decide?" Absent, both are inert and the factory behaves exactly as
+§3-§3d describe (WORKERS.md §10.14 is the contract; `parseImplementation` in
+`lib/kernel/gates.js` is the authority).
+
+They answer two different questions and are adoptable separately:
+
+- **`completion`** — WHO writes the resolving edge that retires the work item,
+  and WHEN. This is the one with teeth today. Under the default `by: agent` the
+  implementer writes the edge and flips the status, and because queue liveness
+  is derived from that edge, **every dependent of the item is released by a
+  claim no gate has judged yet** — the demotion of WORKERS.md §10.7 exists to
+  paper over exactly that. Under `by: controller` the implementer submits a
+  candidate instead, and the runner writes the edge itself at the declared
+  boundary, so a pending or refused pipeline releases nothing.
+- **`implementation`** — the stage that PRODUCES the candidate the gates judge:
+  the lane it routes to, what the implementer is asked to run itself, its
+  budgets, and how the pinned commit is published. Declaring the block also
+  flips `completion.by` to `controller`, because that is the semantics the
+  stage asks for.
+
+```json
+{
+  "factory": "<team-or-product>",
+  "gates": [ "..." ],
+  "implementation": {
+    "author_checks": ["typecheck"],
+    "instructions": "Prefer the smallest change that makes the acceptance suite honest."
+  },
+  "completion": {"by": "controller", "after": "gates"}
+}
+```
+
+**Emit only what the runner honors today, unless the operator asks otherwise.**
+Live now: `completion.by`/`completion.after` (the execution hold, the candidate
+submission, the controller's completion write) and the two contract keys above
+— `author_checks`, the command gate ids the implementer runs ITSELF, and
+`instructions`, appended to the worker contract. Parsed and validated — and,
+for the publish policy alone, pinned on the run record as
+`impl_claim.publish` — but **not yet executed**: `profile`, `budget`, `retry`,
+`candidate.publish`/`remote`/`bundle_store`, `candidate.require_clean` and
+`gates[].rejudge_on_repin`. Writing those is a declaration of intent the runner
+already validates and will honor when the stage runner lands — legitimate if the
+operator wants the lane recorded, but say plainly that nothing about them
+changes what a worker does now, or they will read the factory as doing work it
+is not doing.
+
+Keys, with the defaults you get by writing nothing:
+
+- **`author_checks`** (default `[]`) — command gate ids ONLY, and each must be
+  a gate this factory declares. Default none is deliberate: the gate re-runs
+  the suite from the trusted ref regardless, so an author run of the same suite
+  is duplicate spend. Name the cheap ones (a typecheck, a lint) and nothing
+  else; the contract then tells the implementer which suites the factory runs
+  after it, so it does not run them anyway. Naming an agent-review or human
+  gate, or an id the factory never declared, refuses the worker at startup.
+- **`instructions`** (default `""`) — lane guidance appended to the worker
+  contract. It never replaces the contract; do not try to restate the
+  commit-then-submit discipline in it.
+- **`profile`** (default `""`) — the lane's default implementer, and the
+  LOWEST-precedence router: an explicit `--profile`, the item's own `profile:`
+  frontmatter and its `assigned -> agent` edge all still win. Route it like any
+  other profile: a harness id and never a command.
+- **`budget`** — `run_max_ms` / `run_idle_ms` INHERIT the worker's own ceilings
+  when you omit them (do not restate the defaults; a factory that says nothing
+  must not silently shorten a watchdog), `attempts` (default 1, max 3) is the
+  code pool.
+- **`retry`** — `attempts` (default 1, max 3) and `backoff_ms` (default 60000):
+  the separate INFRASTRUCTURE pool, so an outage is not charged to the code.
+- **`candidate`** — `require_clean` (default true) and `publish`
+  (`bundle` | `branch` | `both`, default `bundle`). There is no `none`: a
+  candidate always carries a portable reference. `bundle_store` is a `file://`
+  or `https://` URI prefix and NOTHING else (an `s3://` store is a parse
+  error); `remote` is read only under `branch`/`both`.
+- **`completion.by`** — `agent` (today's behavior) or `controller`. Defaults to
+  `controller` when an `implementation` block parses, `agent` otherwise.
+- **`completion.after`** — `gates` or `integration`, defaulting to the LAST
+  stage the factory actually declares. **Writing `integration` without an
+  `integration` block is a parse error** — the boundary would never be reached
+  — so if you emit `after: integration`, emit §3b's block too.
+
+Never write `command`, `args`, `argv`, `bin`, `exec`, `entrypoint`, `env`,
+`report`, `session`, `launch_mode` or `identity_mode` inside `implementation`.
+It is the same rule that binds a profile: the graph names a lane, the machine's
+`dispatch.harness.<id>` decides what runs. Each of those keys is a parse error
+naming the key, so a factory carrying one refuses to start the worker.
+
+State back to the operator, one line each: under `by: controller` an agent can
+no longer mark its own work done — it commits, writes its account of the change
+with a `relates-to` edge (never `resolves`), and the factory writes the
+resolving edge only if the gates (and, at `after: integration`, the landing)
+pass; anything waiting on that work stays blocked until then, and an edge or a
+status written early is inert and retyped as evidence rather than obeyed; a
+refused pipeline leaves the item open, held and blocked by the escalation, so
+the person reads a queue that is telling the truth.
+
 ## 4. The test-writer lane
 
 When step 2 of the creation flow found no acceptance suite, the operator's
@@ -418,7 +517,12 @@ nothing — so a bad `integration:` block surfaces there as a load error before
 anyone hands the factory off, (for `mode: propose`) a missing `gh` on
 PATH surfaces as a refusal to start rather than a silent no-op, and a
 `rescue.profile` routed to a native-background harness is refused the same
-way an agent-review gate's would be.
+way an agent-review gate's would be. The same `--print` load is where an
+`implementation:`/`completion:` mistake surfaces: an `author_checks` name that
+is not a declared command gate, a launch field written inside the stage, an
+`after: integration` with no integration block, or an unreachable
+`bundle_store` scheme each refuse the worker at startup rather than at the
+first item.
 
 ## Writing from Cowork or the connector
 

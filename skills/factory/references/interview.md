@@ -1,6 +1,6 @@
 # The interview
 
-Seven questions decide a factory. They do not change with the operator; only
+Nine questions decide a factory. They do not change with the operator; only
 the language does. Ask a few at a time, reflect the answers back in your own
 words, and stop asking anything the repo or the graph already answered.
 
@@ -14,8 +14,9 @@ words, and stop asking anything the repo or the graph already answered.
 | 6 | What a person must see before it ships | a `human` gate and the `risk_classes` that arm it |
 | 7 | What happens once everything above passes | an `integration:` block (merge-queue landing), or nothing — resolve-without-merge stays the default |
 | 8 | Who gets a refusal before they do | a `rescue:` block (a strong-model profile that diagnoses, fixes and files before any human escalation), or nothing — the person is paged at the cycle cap as today |
+| 9 | Whether an agent's own "done" retires the work, or the factory writes it | a `completion:` boundary (`by: controller`), and — when they want the implementing lane declared too — an `implementation:` block |
 
-Which repos the factory may judge (`repos`) is not one of the seven: you are
+Which repos the factory may judge (`repos`) is not one of the nine: you are
 standing in the answer. Emit the repo you compiled it in, and only ask when the
 operator's acceptance criteria plainly span more than one — the worker's
 `--project` will NOT bound it (a bare slug unions the whole product grouping),
@@ -85,6 +86,18 @@ owner, and every answer is evidence you carry verbatim into the nodes you emit.
    and say so). The hook that starts and stops the service is engineering's
    to write (emitting.md §3c); tell them one will be needed.
 
+9. **"When an agent says a piece of work is finished, should everything that
+   was waiting on it start moving right away — or only once your checks have
+   passed?"** — decides the `completion:` boundary. "Only once the checks pass"
+   is `by: controller`: the agent commits and writes its account of the change,
+   and the *factory* records the work as done, so nothing downstream is
+   unblocked by a claim no gate has judged. Say the two costs plainly: an agent
+   can no longer mark its own homework (which is the point), and until the
+   gates pass the item stays open and held, so the queue shows it as still in
+   flight rather than done. "Right away" is today's behavior — leave both keys
+   out. If they also want the landing to count as the finish line, that is
+   `after: integration`, and it needs the `integration:` block from question 7.
+
 **What not to ask them**: which harness, what timeout, how many fix cycles,
 what glob covers auth, whether to inline or reference a gate. Decide those,
 state them in the proposal in one plain line each, and let them push back.
@@ -143,6 +156,21 @@ state them in the proposal in one plain line each, and let them push back.
     the gates per attempt; a factory with one or two cheap gates may not
     want it.
 
+11. Completion boundary: does the implementer write the resolving edge, or
+    does the runner? `completion: {by: controller}` moves it — the implementer
+    submits a candidate (commit, clean tree, a resolver node linked
+    `relates-to`) and the runner writes the edge and the terminal status at
+    `after: gates` or `after: integration`, under an execution hold that keeps
+    a premature edge or a hand-flipped status inert. Declaring an
+    `implementation:` block flips `by` to `controller` on its own. Ask for the
+    block itself only if they want the lane recorded: `author_checks` (the
+    command gate ids the implementer runs itself — default none, since the gate
+    re-runs the suite from the trusted ref anyway) and `instructions` take
+    effect today; `profile`, `budget`, `retry` and `candidate.publish` are
+    parsed, validated and pinned but not yet spent by the runner, so say so
+    rather than letting them read the factory as routing work it is not routing
+    (WORKERS.md §10.14).
+
 ## Translating a product answer into a gate
 
 | They said | You emit | What you must state back |
@@ -156,6 +184,7 @@ state them in the proposal in one plain line each, and let them push back.
 | "It should ship, but through a PR someone reviews" | an `integration:` block, `mode: propose` | that it still runs the full suite pre-PR, then opens a PR via `gh` and parks the item for review rather than landing directly — and that `gh` must be on PATH wherever the worker runs |
 | "I want to open the PR myself" | nothing — omit `integration:` | that a gate-passed branch still resolves the work without merging it; landing stays a manual step until they say otherwise |
 | "Don't page me until something smart has had a look" | a `rescue:` block routed to a strong-model profile | that the rescue runs in the implementer's checkout, that the gates re-run on whatever it commits (it never passes anything itself), and that the escalation they do get opens with its diagnosis and the tasks it filed |
+| "Don't let anything move until the checks pass" / "an agent shouldn't be able to say it's done" | `completion: {by: controller}` (plus `after: integration` if landing is the finish line) | that the agent now submits rather than resolves, that the factory writes the resolving edge only on a pass, and that until then the item stays open and its dependents stay blocked |
 | "The tests need the database" | the same `command` gate, plus `serialize: "repo"` if the database is one-per-box, plus a `risk` class over the migration/schema paths so it runs only when they change — and a setup/teardown hook pair for the box that has the database | that the gate queues behind any other run of itself, that it is skipped (and says so) for changes that never touch the database, and that someone must write the hook that starts and stops the stack |
 
 ## What a first factory should look like
@@ -174,6 +203,12 @@ complete one that scares them off:
   landing — it is the one piece of this pipeline that mutates the target ref
   on its own, so it is opt-in even more deliberately than the gates are.
   Resolve-without-merge (today's default) is a fine first factory.
+- **`completion: {by: controller}` as soon as anything downstream depends on
+  this work** — it is the cheapest of these to adopt (two keys, no new profile,
+  no new dispatch) and it is what stops a dependent being released by a claim
+  no gate has judged. Leave it out for a first factory whose items block
+  nothing, and leave the `implementation:` block out until the operator wants
+  the lane itself recorded.
 - **a `rescue:` block only once there is a strong-model profile to route it
   to** and the operator has seen at least one escalation they would rather
   not have received — it is the maintenance-flow's answer to "why do I keep

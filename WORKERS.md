@@ -1265,6 +1265,14 @@ the two shapes identically**: a reference is unwrapped into exactly the object a
 inline gate would have been, with keys written beside the `ref` overriding it.
 The only visible difference is the provenance stamped on the recorded outcome.
 
+The same payload may declare optional blocks BESIDE `gates`, each parsed the
+same fail-closed way and each inert when absent: `integration:`, the
+merge-queue landing stage that runs once every gate has passed (§10.9);
+`rescue:`, the strong-model step before any human escalation (§10.10); and
+`implementation:` / `completion:`, the stage that produces the candidate the
+gates judge and the boundary at which the resolving edge is written (§10.12-
+§10.14).
+
 Writing one by hand is not the only door: the reference client ships a
 factory-builder skill (`/spor:factory`, `skills/factory/`) that compiles a
 definition from an operator interview plus a read of the repo, the graph and
@@ -2871,7 +2879,8 @@ test/gate-pipeline.test.js ("stale premise").
 ### 10.12 The candidate — what a pipeline is judging, pinned
 
 A `type: factory` may declare an `implementation:` stage beside its
-`integration:` block (`dec-spor-factory-implementation-stage-contract`). A
+`integration:` block (`dec-spor-factory-implementation-stage-contract`); its
+keys, and which of them the shipped runner acts on, are §10.14. A
 factory that declares none is unaffected by everything below: nothing is
 pinned, no `impl_*` field is written, and the pipeline is byte-identical to
 before the stage existed.
@@ -3064,3 +3073,162 @@ line (boundary, state, debt, execution); `spor work --status` shows the gating
 slot as before.
 
 See test/completion-boundary.test.js.
+
+### 10.14 Declaring the stage — the `implementation:` and `completion:` blocks
+
+§10.12 says what a pipeline pins and §10.13 who writes the completion. This is
+how a factory DECLARES both, and which half of the declaration the shipped
+runner acts on. Both keys are optional and independent; a factory that declares
+neither is byte-identical to one written before the stage existed
+(dec-spor-factory-implementation-stage-contract, parsed by
+`parseImplementation` in `lib/kernel/gates.js`).
+
+```json
+"implementation": {
+  "profile": "profile-implementer",
+  "instructions": "Prefer the smallest change that makes the acceptance suite honest.",
+  "author_checks": ["typecheck"],
+  "budget": {"run_max_ms": 5400000, "run_idle_ms": 2700000, "attempts": 1},
+  "retry": {"attempts": 1, "backoff_ms": 60000},
+  "candidate": {"require_clean": true, "publish": "bundle"}
+},
+"completion": {"by": "controller", "after": "integration"}
+```
+
+**The stage routes by PROFILE and by nothing else.** No `command`, `args`,
+`argv`, `bin`, `exec`, `entrypoint`, `env`, `report`, `session`, `launch_mode`
+or `identity_mode` (nor the `launchMode`/`identityMode` spellings) — the same
+rule already enforced on profiles and kept by
+agent-review gates and the rescue lane: a graph write must never define what a
+machine executes (dec-spor-declarative-harness-machine-binds-execution). A
+bespoke implementer is a `dispatch.harness.<id>` declaration on the MACHINE,
+and the graph names only the id. Any of those keys present is a parse error
+NAMING the key rather than a silent drop, because an author who wrote
+`command` believes it is doing something. That is why the stage needs no
+parallel runner: start, observe, cancel and recover all map onto the dispatch
+path, the run record and the idle-stop that already own them.
+
+- **`profile`** (default `""`) — the lane's default implementer. It is the
+  LOWEST-precedence router: an explicit `--profile` on the worker wins, then
+  the item's own `profile:` frontmatter (which is how the test-change lane of
+  §10.3 self-routes — a factory default that overrode it would defeat the
+  lane), then its `assigned -> agent` edge, and only then this. A lane default
+  never overrides a per-item routing decision, and the stage never SUBSTITUTES
+  on unsatisfiability: a box that cannot satisfy the resolved profile refuses
+  loudly and leaves the assignment and the lease intact, exactly as `spor
+  dispatch --profile` does.
+- **`instructions`** (default `""`) — appended to the worker contract, never
+  replacing it. A factory may add lane guidance; the commit-before-you-submit
+  discipline is the runner's, not an operator's to delete.
+- **`author_checks`** (default `[]`) — the command gate ids the implementer is
+  asked to run itself. **No expensive suite is prescribed twice**: the gate
+  re-runs the command from the trusted ref's copy regardless, so an author run
+  of the same suite is pure duplicate spend — naming a cheap gate (a typecheck,
+  a lint) buys an early failure at a price worth paying, and the operator makes
+  that call per gate. The contract's step 3 then lists only these and NAMES the
+  suites the factory withholds, because a prompt that merely omitted them
+  invites an agent to run them anyway. A name that is not a declared gate id,
+  or that names an agent-review or human gate, is fatal. Declaring no block at
+  all keeps today's every-command-gate mapping, so an existing factory's prompt
+  does not move.
+- **`budget.run_max_ms` / `budget.run_idle_ms`** — default to INHERITING the
+  worker's own `work.runMaxMs` (24h) / `work.runIdleMs` (45min). A factory that
+  says nothing must not silently shorten a worker's watchdog, nor remove one:
+  `run_max_ms` has no disabling value, so anything unreadable inherits, while
+  `run_idle_ms: 0` IS the declared disable for a lane whose steps genuinely run
+  that long (§8). Both are ceilings the loop applies per RUN RECORD at its
+  poll, never a dispatch flag.
+- **`budget.attempts`** (default 1, max 3) — the **code** pool. A second
+  implementation attempt at the same item with the same prompt is the least
+  informative retry available; the fix cycle, which carries the findings, is
+  the mechanism that differs. So re-implementation is opt-in and capped.
+- **`retry.attempts`** (default 1, max 3) / **`retry.backoff_ms`** (default
+  60s) — the **infrastructure** pool, ONE per pipeline shared by every dispatch
+  it makes, so an outage during a review cannot multiply the bound. One retry
+  covers a blip; a real outage outlives any backoff, and the item's cooldown
+  plus the next poll is the honest remedy.
+- **`candidate.require_clean`** (default true) — refuse a dirty tree at
+  submission rather than inside the first gate, where the round-trip already
+  lives.
+- **`candidate.publish`** (`bundle` | `branch` | `both`, default `bundle`) —
+  how the pinned commit is made reachable to a controller that does not share a
+  filesystem with the implementer. **A candidate always carries a portable
+  reference; there is no `none`**, and writing one is an error — the
+  machine-local workspace path is provenance, never the reference. `bundle` is
+  the default because it is the one form that needs no credential and no
+  network: a `git bundle` into `candidate.bundle_store`, a URI PREFIX that is
+  `file://` (default `file://<SPOR_HOME>/candidates`; a shared filesystem
+  reaches further) or `https://` (the server's candidate door, the remote-mode
+  default) and nothing else — a zero-dependency client cannot sign an
+  object-store request, so `s3://` and its kin are refused at parse rather than
+  at the first publish. `branch` pushes an immutable candidate ref to
+  `candidate.remote` (a remote NAME, resolved to its URL at publish; default
+  `origin`); `both` publishes both. Two refusals a parse cannot make — an
+  `https://` store in LOCAL mode, where there is no candidate door, and a
+  `branch` publish with no usable remote — belong at worker startup beside the
+  `gh` capability check `integration.mode: propose` makes; they land with the
+  publisher itself and are not enforced today (see "What runs today" below).
+- **`gates[].rejudge_on_repin`** (command gates only, default true; read only
+  under `completion.by: controller`) — the per-gate half of the stage.
+  Acceptance is a property of the TIP (§10.12): the completion write asserts
+  that every gate passed the candidate it completes, and a verdict on an
+  ancestor tree is not that, so a command gate whose pass stands on an ancestor
+  is re-run on the tip — a suite run, never a dispatch, so it moves no dispatch
+  bound. `false` is the explicit opt-out for a suite the
+  operator accepts standing on an ancestor. It is not declarable on an
+  agent-review gate at all: a review ALWAYS re-judges a moved tip, which is not
+  an operator's to relax.
+- **`completion.by`** (`agent` | `controller`) — `agent` is the shipped
+  contract (the implementer writes the resolving edge and flips the status).
+  `controller` is §10.13. It defaults to `controller` for a factory whose
+  `implementation` block PARSES — the block is the opt-in and controller-written
+  completion is the semantics it asks for — and to `agent` otherwise. A block
+  that FAILS to parse adopted nothing, so it never moves the boundary either: a
+  typo in the stage must not silently hold back every completion.
+- **`completion.after`** (`gates` | `integration`) — the boundary, defaulting
+  to the LAST stage the factory actually declares, so it is reachable by
+  construction and a factory with no integration still completes. `gates` WITH
+  an integration block is valid and means "complete on acceptance, then land":
+  integration runs after the completion write and its failure cannot
+  un-complete the item — an operator's explicit choice to release dependents
+  before the change is on the target ref. Declaring `integration` with no
+  integration block is FATAL, not coerced: a boundary that can never be reached
+  leaves every item of the factory unresolved forever, which is
+  indistinguishable from a worker that quietly stopped completing anything.
+
+The two blocks are adoptable separately. `"implementation": {}` is valid and
+takes every default above (and moves completion to the controller);
+`"completion": {"by": "controller"}` with no `implementation` block is valid
+too, and deliberately so — an operator may adopt the boundary alone, leaving
+routing, budget and publication at their defaults. It is NOT byte-identical:
+it changes the contract's step 5 to a candidate submission and arms the
+controller's completion write.
+
+Like every other factory error, a mistyped stage **refuses to start the
+worker** (§10.1's fatal list). A stage that parsed wrong must never produce a
+worker that dispatches unbudgeted, so the counts follow this file's standing
+convention: a readable but out-of-range number CLAMPS (`attempts: 9` -> 3,
+`attempts: -1` -> 0), while a value not readable as a number at all — a blank,
+a `null`, a `false`, a list — takes the documented DEFAULT rather than the
+floor, because a typo must never read as "no retries", "retry in a second", or
+"no watchdog".
+
+**What runs today.** The parse and its refusals, `author_checks` and
+`instructions` in the worker contract (`lib/shell/worker-contract.js`), and
+everything `completion` governs — the execution hold, the `CANDIDATE:`
+submission, the candidate pin and the controller's completion write (§10.12,
+§10.13) — are shipped. The rest of the stage is declared and validated — and
+the publish policy alone is pinned on the run record, as `impl_claim.publish`
+(§8) — but not yet executed: no dispatch
+is routed by `implementation.profile`, no budget or retry pool is spent
+(task-spor-factory-implementation-stage-runner, on the outcome classifier that
+separates the two pools, task-spor-factory-execution-outcome-classifier), no
+candidate object is published to a bundle store or a branch
+(task-spor-factory-candidate-portable-reference), `require_clean` is still
+enforced one step later by the first command gate's own dirty-tree refusal, and
+`rejudge_on_repin` is parsed onto the gate and read by nobody. Declaring those
+keys today is a DECLARATION of intent that the runner already validates and will honor
+when those items land; nothing about them changes what a worker does now.
+
+See test/gates.test.js (the validation table), test/worker-contract.test.js,
+test/candidate.test.js and test/completion-boundary.test.js.

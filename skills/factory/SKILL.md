@@ -56,8 +56,10 @@ ask an operator a question the repo or the graph already answers.
 Read the room first. A **non-technical owner** ("I want my agents to stop
 breaking checkout") gets product questions; an **engineer** ("I want a codex
 review gate with two fix cycles") gets pipeline questions and denser proposals.
-The underlying questions are the same seven — including whether gate-passed
-work should land itself, the `integration:` block — only the language changes.
+The underlying questions are the same nine — including whether gate-passed
+work should land itself (the `integration:` block) and whether an agent's own
+"done" retires the work or the factory writes it (the `completion:` boundary) —
+only the language changes.
 
 The acceptance-criteria interview is the non-technical operator's whole factory
 job made first-class: **human judgment defines what correct looks like**, and
@@ -135,6 +137,21 @@ runs `spor work` (a preflight refuses to start otherwise). Leaving
 `integration:` out entirely keeps resolve-without-merge working as it does
 today.
 
+If anything downstream waits on this work, raise the **completion boundary**
+even if they did not: today the implementer writes the resolving edge itself, and
+because queue liveness is derived from that edge, every dependent is released by
+a claim no gate has judged yet. `completion: {by: controller}` moves the write
+onto the runner — the agent commits and writes its account of the change, the
+factory writes the resolving edge and the terminal status only once the gates
+(and, at `after: integration`, the landing) pass, and an edge or status written
+early is inert under the item's execution hold rather than obeyed. Say the cost
+too: until the pipeline passes the item reads open and held, not done. The
+`implementation:` block beside it declares the implementing lane itself — but
+only `author_checks` and `instructions` take effect today, so offer the rest
+(`profile`, `budget`, `retry`, `candidate.publish`) as a recorded intent the
+runner validates and does not yet spend, never as routing that is happening
+(WORKERS.md §10.14, `references/emitting.md` §3e).
+
 If they want a `rescue:` block, say what it is: not a gate, and not an
 orchestrator — a strong-model profile the runner dispatches into the
 implementer's checkout when any gate has spent its fix cycles, BEFORE the
@@ -173,6 +190,13 @@ right failure but a rude way to discover a typo:
 - if you wrote a `rescue:` block: `profile` names a supervised, write-capable
   strong-model profile (the worker refuses a native-background one at load
   time), and `attempts` is 1-3;
+- if you wrote an `implementation:` block: it names NO command/args/argv/bin/
+  exec/entrypoint/env/report/session/launch_mode/identity_mode (the same rule
+  that binds a profile — each is a parse error naming the key), every
+  `author_checks` entry is the id of a COMMAND gate this factory declares, and
+  `candidate.bundle_store`, if written, is a `file://` or `https://` URI;
+- if you wrote `completion: {after: "integration"}`: there is an `integration:`
+  block to reach — declaring the boundary without one is fatal;
 - if you wrote an `integration:` block: `mode` is `local`, `push`, or
   `propose`, `command` is set, `strategy` is one of `merge`/`squash`/`rebase`,
   and `serialize` is `repo` — and if `mode` is `propose`, the `gh` CLI must be

@@ -138,6 +138,36 @@ last, so a gate-passed item that never landed failed *after* every gate:
   implementer knows where to stop, and check the fixer's commits for surface
   that should simply be deleted.
 
+## "The agent says it finished, but the item is still open"
+
+Only relevant when the factory declares `completion: {by: controller}` (or an
+`implementation:` block, which turns it on). That is the boundary working, not
+a stuck worker: under it the implementer never writes the resolving edge, so an
+item reads open — and HELD, with `execution:` stamped on it — from the claim
+until the runner's own completion write at `after: gates` or `after:
+integration` (WORKERS.md §10.13). Read it in this order:
+
+```bash
+spor get <item>                  # the HELD note: which execution, and whether that worker is live
+spor runs --json                 # the record's impl_state / gates_state / integration_state / completion_debt
+spor query --type artifact --id-prefix art-completion- --summary   # completions already written
+```
+
+- **held, worker live, gates still running** — nothing is wrong; the pipeline
+  has not reached its boundary.
+- **held, worker gone (the note reads stale)** — fail-closed by design, never
+  read as done. `spor work --regate <run>` re-drives the pipeline; a person's
+  `spor release <item> --execution <exec>` is the other door out.
+- **held with an escalation blocking it** — the pipeline refused. The item is
+  meant to stay open and held; the escalation is the thing to answer (§10.7).
+- **an `art-completion-*` fact exists** — the completion was written; if the
+  status still lags, read that fact rather than flipping the status by hand.
+
+The one factory edit this question ever argues for is the boundary itself: an
+operator who wants dependents released before the landing wants `after: gates`
+rather than `after: integration`, and should hear what that trades (dependents
+move while the change is not yet on the target ref).
+
 ## "The reviews are too strict"
 
 Answer with evidence, in this order, and prefer the smallest edit the evidence

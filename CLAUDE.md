@@ -1113,6 +1113,48 @@ left for a person, same as a rejected `human`-gate approval. See WORKERS.md
 `art-merge-…` graph fact, the integration stage's twin of a gate's
 `art-gate-…` fact; a failure (or a closed-unmerged PR) demotes the item
 exactly as a failed gate does (§10.7). See test/integration-step.test.js.
+**The implementation stage and the completion boundary
+(dec-spor-factory-implementation-stage-contract, WORKERS.md §10.12-§10.14):**
+two more optional blocks on the same payload, parsed by `parseImplementation`
+in `lib/kernel/gates.js`. `implementation:` is the stage that PRODUCES the
+candidate the gates judge — the one step of the pipeline a factory could not
+describe — and, like every other declared lane, it routes by PROFILE and
+declares no command line at all (`sat.GRAPH_LAUNCH_FIELDS` is refused key by
+key, NAMED not dropped: a graph write must never define what a machine
+executes). `completion:` is the second half: `by: agent` is the shipped
+contract (the implementer writes the resolving edge and flips the status, so
+queue liveness — which is EDGE-derived — releases every dependent before a gate
+has run, which is what §10.7's demotion papers over), `by: controller` moves
+both onto the runner at `after: gates|integration`, defaulting to the last
+stage the factory declares so the boundary is reachable by construction (naming
+`integration` without the block is fatal). Declaring an `implementation:` block
+that PARSES defaults `by` to `controller`; one that FAILS to parse adopted
+nothing and leaves the boundary on the agent, so a typo never silently holds
+back every completion. What EXECUTES today is the completion half plus the two
+contract keys that shape the prompt: the execution hold stamped on the item by
+CAS before dispatch (`execution:`/`execution_at:`, a READ rule in BOTH liveness
+halves — `resolutionMap` and `queue.isLive` — so a premature `resolves` edge or
+a hand-flipped `done` is inert from the instant it lands and is retyped as
+evidence), the worker contract's step 5 becoming a `CANDIDATE:` submission
+(`lib/shell/worker-contract.js`), the content-addressed candidate pinned at
+every `readChanged` (`lib/kernel/candidate.js`, identity is the TREE), and the
+controller's forced-order completion write — debt stamped first, the
+`art-completion-…` resolver, then ONE CAS `put_node` of the item writing the
+terminal status and clearing the hold (`lib/kernel/completion.js` +
+`lib/shell/completion.js`). `implementation.author_checks` (command gate ids
+only, default NONE — the gate re-runs the suite from the trusted ref regardless,
+so an author run is duplicate spend) and `.instructions` shape that same
+prompt. The REST — `profile` routing, `budget`, `retry`,
+`candidate.publish`/`remote`/`bundle_store`, `require_clean`,
+`gates[].rejudge_on_repin` — is validated — and, for the publish policy alone,
+pinned on the run record as `impl_claim.publish` — but not yet spent: the
+stage's dispatch loop
+(task-spor-factory-implementation-stage-runner, on
+task-spor-factory-execution-outcome-classifier) and candidate publication
+(task-spor-factory-candidate-portable-reference) are still to land, so a
+declared key there is intent the runner validates and does not act on. A
+factory declaring neither block is byte-identical. See
+test/completion-boundary.test.js + test/candidate.test.js.
 Server-side ops vars
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard

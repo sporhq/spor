@@ -473,7 +473,41 @@ beside `gates`, parsed the same fail-closed way — and an optional `rescue`
 block (task-spor-factory-rescue-lane): a strong-model profile the runner
 dispatches at a gate's exhaustion BEFORE any human escalation, to diagnose,
 fix and file factory-improvement tasks, re-running the gates on what it
-commits (WORKERS.md §10.10). Both `gate` and `factory` are
+commits (WORKERS.md §10.10). Two further optional blocks declare the step
+BEFORE the gates, and who writes the outcome of them all
+(dec-spor-factory-implementation-stage-contract): `implementation` is the stage
+that PRODUCES the candidate the gates judge — the one step of the pipeline a
+factory could not describe, its budget the worker's global watchdog and its
+only retry a machine-local cooldown while every judging step was declared data
+— and `completion` says WHO writes the resolving edge that retires the work
+item, and WHEN. The stage routes by PROFILE and by nothing else:
+`command`/`args`/`argv`/`bin`/`exec`/`entrypoint`/`env`/`report`/`session`/
+`launch_mode`/`identity_mode` are refused BY NAME rather than dropped, because
+a graph write must never define what a machine executes
+(dec-spor-declarative-harness-machine-binds-execution) — a bespoke implementer
+is a `dispatch.harness.<id>` declaration on the MACHINE. Beside `profile` it
+declares `instructions` (appended to the worker contract, never replacing it),
+`author_checks` (the command gate ids the implementer runs itself — default
+NONE, since the gate re-runs the suite from the trusted ref regardless and an
+author run of the same suite is duplicate spend), `budget`
+(`run_max_ms`/`run_idle_ms` INHERIT the worker's own ceilings when undeclared,
+`attempts` is the code pool), `retry` (the separate infrastructure pool an
+outage spends instead of the code's) and `candidate` (`require_clean`, and
+`publish: bundle|branch|both` with `bundle_store`/`remote` — a candidate always
+carries a portable reference, so there is deliberately no `none`).
+`completion.by` is `agent` (today's behavior: the implementer writes the edge
+and flips the status) or `controller` (the runner writes both at the boundary,
+so a pending or refused pipeline releases none of the item's dependents — the
+`execution` hold above is what keeps a premature edge inert meanwhile), and it
+defaults to `controller` for a factory whose `implementation` block PARSES,
+`agent` otherwise. `completion.after` is the boundary — `gates` or
+`integration` — defaulting to the LAST stage the factory actually declares so
+it is reachable by construction; naming `integration` with no integration block
+is fatal, since a boundary that can never be reached leaves every item
+unresolved forever. WORKERS.md §10.12-§10.14 documents what runs today (the
+candidate, the execution hold, the controller's completion write) and what is
+parsed and pinned but not yet executed (the stage's own dispatch loop and
+candidate publication). Both `gate` and `factory` are
 `capturable: false` (the distiller never drafts one: a factory changes what a
 worker will accept, so it is written deliberately) and both arrive by adoption
 rather than in the seed, for the same reason. WORKERS.md §10 documents the
