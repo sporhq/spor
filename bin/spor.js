@@ -13452,6 +13452,29 @@ function makeGateDeps(
       });
       if (!pinned.ok) return pinned;
       const folded = candidateKernel.repinCandidate(current.impl_candidate || null, pinned.candidate);
+      // A late or racing FIRST pin (issue-spor-pin-candidate-settled-record-
+      // stamp-race): `current.impl_candidate` reads null — so `folded.change`
+      // reads "created" — whenever no earlier pin from THIS record's own
+      // history landed, but the record's `impl_state` can already be settled
+      // through a path that never went through this closure at all (the
+      // two-workers-adopt-one-orphan race stampImplState's own comment
+      // describes: the winner settles `exhausted` directly, never having
+      // pinned a candidate). Treating that as an ordinary first submission
+      // would stamp impl_run_id/impl_attempt/impl_pool — the stage's OWN
+      // dimensions, meant to name the implementer that actually settled it —
+      // onto a record a settled verdict already closed, making a resolved
+      // item read as an active live candidate. This is narrower than the
+      // journal's own `impl_state`-key strip: a RE-PIN after settling (a fix
+      // cycle or integration-fix moving the tip on an already-accepted
+      // candidate, folded.change "seen"/"unchanged"/"superseded") is the
+      // documented steady state and must still land — only a "created" event
+      // arriving at an already-settled record is a submission that never
+      // actually happened, and it is refused whole: fail-soft, logged, no
+      // write, the settled record standing exactly as it was.
+      if (folded.change === "created" && candidateKernel.implSettled(current.impl_state)) {
+        warn(`warning: pinCandidate refusing a late first-pin stamp on ${entry.run_id} — impl_state already settled (${current.impl_state})`);
+        return { ok: true, candidate: current.impl_candidate || null, change: "refused-settled" };
+      }
       const patch = {
         impl_candidate: folded.candidate,
         impl_candidates: candidateKernel.appendCandidateChain(current.impl_candidates, folded.candidate),
@@ -14446,6 +14469,22 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       });
       if (!pinned.ok) return pinned;
       const folded = candidateKernel.repinCandidate(current.impl_candidate || null, pinned.candidate);
+      // Same settled-record race makeGateDeps' own pinCandidate guards against
+      // (issue-spor-pin-candidate-settled-record-stamp-race): the gate
+      // pipeline's opening read is fail-soft, so a factory can reach
+      // integration having never successfully pinned anything — a late or
+      // racing first pin from HERE then arrives at a record whose `impl_state`
+      // was already settled through a path that never pinned a candidate at
+      // all (two workers adopting one orphaned pipeline; the winner's
+      // `exhausted` lands via stampImplState directly). Refuse the whole
+      // stamp rather than only the `impl_state` key: a genuine re-pin after
+      // settling (`folded.change` "seen"/"unchanged"/"superseded") still must
+      // land — only a "created" event reaching an already-settled record is a
+      // submission that never actually happened.
+      if (folded.change === "created" && candidateKernel.implSettled(current.impl_state)) {
+        warn(`warning: pinCandidate refusing a late first-pin stamp on ${entry.run_id} — impl_state already settled (${current.impl_state})`);
+        return { ok: true, candidate: current.impl_candidate || null, change: "refused-settled" };
+      }
       const patch = {
         impl_candidate: folded.candidate,
         impl_candidates: candidateKernel.appendCandidateChain(current.impl_candidates, folded.candidate),

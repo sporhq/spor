@@ -1926,6 +1926,68 @@ test("when no candidate was ever pinned before integration ran, an integration f
   assert.ok(rec.impl_state === "candidate" || rec.impl_state === "running", `impl_state must be set, not left undefined: got ${rec.impl_state}`);
 });
 
+// The integration twin of the makeGateDeps regression in
+// test/candidate.test.js: `pinCandidate` here has the exact same
+// `folded.change === "created"` first-pin branch, so it is exposed to the
+// exact same late/racing-pin race (issue-spor-pin-candidate-settled-record-
+// stamp-race) — a record whose `impl_state` settled through a path that never
+// pinned a candidate (two workers adopting one orphaned pipeline; the
+// winner's `exhausted` lands via stampImplState directly) reads
+// `impl_candidate` as still null, so a late integration-fix re-pin arriving
+// afterward would otherwise be read as the first-ever submission and stamp
+// impl_run_id/impl_attempt/impl_pool beside the terminal verdict.
+test("REGRESSION issue-spor-pin-candidate-settled-record-stamp-race (integration twin): a late first pin arriving after impl_state already settled is refused, not stamped beside the settled verdict", async () => {
+  const sporCli = require("../bin/spor.js");
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const { loadConfig } = require("../lib/config.js");
+
+  const dir = integrationRepo();
+  git(dir, "checkout", "-q", "branch");
+  const targetRef = "main";
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-integration-repin-settled-"));
+  fs.mkdirSync(path.join(home, "nodes"), { recursive: true });
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+
+  const factory = {
+    id: "factory-repin-settled",
+    integration: { targetRef, mode: "local", command: "true", strategy: "merge", serialize: "repo", cycles: 1, timeoutMs: 900000 },
+    trustedRef: targetRef,
+    protectedPaths: [],
+    implementation: { profile: "profile-impl" },
+  };
+  const entry = { run_id: "33333333-4444-5555-6666-0000000000bb", node_id: "task-demo", project: "demo", attempt: 1 };
+  const record = { cwd: dir };
+
+  // Settled through a path that never pinned a candidate at all.
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, entry.run_id).record, {
+    run_id: entry.run_id, node_id: entry.node_id, state: "running", impl_state: "exhausted",
+  });
+
+  const warnings = [];
+  const deps = sporCli.makeIntegrationDeps(cfg, {
+    record, entry, factory, slug: "demo", passthrough: {}, warn: (l) => warnings.push(l), sleep: async () => {}, log: () => {}, home,
+  });
+
+  const changed = await deps.changedTree();
+  assert.strictEqual(changed.ok, true, changed.reason);
+  const result = await deps.pinCandidate({ submittedBy: { stage: "integration-fix", cycle: 1, rescue: 0 } });
+
+  assert.strictEqual(result.ok, true, "a refusal here is a no-op, not a pipeline failure");
+  assert.strictEqual(result.change, "refused-settled");
+  assert.strictEqual(result.candidate, null, "nothing was ever pinned for this record");
+  assert.ok(
+    warnings.some((w) => /impl_state already settled/.test(w) && /exhausted/.test(w)),
+    "the refusal is logged, not silent"
+  );
+
+  const rec = dispatchRuns.readJson(dispatchRuns.runPaths(home, entry.run_id).record);
+  assert.strictEqual(rec.impl_state, "exhausted", "the terminal verdict stands untouched");
+  assert.strictEqual(rec.impl_run_id, undefined, "no live-run metadata is stamped beside a settled verdict");
+  assert.strictEqual(rec.impl_attempt, undefined);
+  assert.strictEqual(rec.impl_pool, undefined);
+  assert.strictEqual(rec.impl_candidate, undefined, "no candidate is fabricated for a stage that never actually submitted one");
+});
+
 test("squash and rebase strategies both produce a candidate that descends cleanly from the target ref", () => {
   const dir = integrationRepo();
   const head = git(dir, "rev-parse", "branch").trim();
