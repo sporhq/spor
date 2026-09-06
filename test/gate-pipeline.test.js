@@ -9029,15 +9029,16 @@ test("unpaid flake evidence survives a process restart without rerunning command
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("a flake evidence journal write failure stops before graph publication", async () => {
+test("a first flake intent journal write failure stops before any graph publication", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-flake-debt-save-"));
   fs.mkdirSync(path.join(dir, "test"));
   fs.writeFileSync(path.join(dir, "test", "off.test.js"), 'require("node:assert");\n');
   const f = treeFakes({ dir, changed: ["lib/x.js"], run: (n, command) => command ? { ok: true } : { ok: false, code: 1, output: "✖ flakes\n at TestContext.<anonymous> (test/off.test.js:4:2)" } });
-  f.deps.saveGateProgress = async ({ progress }) => { if (progress.evidence) throw new Error("disk full"); };
+  f.deps.saveGateProgress = async ({ progress }) => { if (progress.filingIntent) throw new Error("disk full"); };
   const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
   assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps })).state, "interrupted");
   assert.deepStrictEqual(f.seen.facts, [], "no graph payment is attempted without a durable obligation");
+  assert.deepStrictEqual(f.seen.flakes, [], "the initial issue filing also waits for the durable intent");
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -9168,4 +9169,43 @@ test("a later gate fix changes the commit and requires a fresh human approval de
   assert.match(fs.readFileSync(path.join(home, "nodes", `${approvals[1].id}.md`), "utf8"), new RegExp(h2));
   assert.equal((await sporCli.gateApprovalState(cfg, approvals[0].id)).state, "approved");
   assert.equal((await sporCli.gateApprovalState(cfg, approvals[1].id)).state, "pending");
+});
+
+test("a crash after flake issue filing resumes the saved classification even when a fresh suite would be green", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-flake-intent-crash-"));
+  fs.mkdirSync(path.join(dir, "test"));
+  fs.writeFileSync(path.join(dir, "test", "off.test.js"), 'require("node:assert");\n');
+  const file = path.join(dir, "progress.json");
+  const issues = new Set();
+  let crash = true;
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}" }] });
+  const worker = () => {
+    const f = treeFakes({ dir, changed: ["lib/x.js"], run: (n, command) => !crash || command ? { ok: true } : { ok: false, code: 1, output: "✖ original failure\n at TestContext.<anonymous> (test/off.test.js:4:2)" } });
+    f.deps.loadGateProgress = async () => fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : null;
+    f.deps.saveGateProgress = async ({ progress }) => {
+      if (crash && progress.filingIntent && progress.filingIntent.outcome) throw new Error("crash after issue write, before result save");
+      fs.writeFileSync(file, JSON.stringify(progress));
+    };
+    f.deps.fileFlakeItem = async () => { issues.add("issue-flake-one"); return { ok: true, id: "issue-flake-one" }; };
+    return f;
+  };
+  const a = worker();
+  assert.strictEqual((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: a.deps })).state, "interrupted");
+  assert.strictEqual(issues.size, 1, "the issue landed before the simulated crash");
+  const intent = JSON.parse(fs.readFileSync(file, "utf8")).filingIntent;
+  assert.match(intent.draft.firstFailure.output, /original failure/);
+  assert.deepStrictEqual(intent.draft.isolation.files, ["test/off.test.js"]);
+  assert.strictEqual(intent.outcome, undefined);
+  crash = false;
+  const b = worker();
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: b.deps });
+  assert.strictEqual(result.state, "passed");
+  assert.deepStrictEqual(b.seen.suites, [], "the later green suite cannot erase the classified occurrence");
+  assert.strictEqual(issues.size, 1);
+  assert.match(b.seen.facts[0].markdown, /original failure/);
+  assert.match(b.seen.facts[0].markdown, /relates-to, to: issue-flake-one/);
+  const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.strictEqual(saved.filingIntent, undefined, "intent is replaced by evidence and its receipt in one save");
+  assert.strictEqual(saved.evidence.complete, true);
+  fs.rmSync(dir, { recursive: true, force: true });
 });

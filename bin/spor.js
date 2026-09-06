@@ -14034,7 +14034,7 @@ function makeGateDeps(
       const r = readRecordNow();
       const progress = r && r.gate_progress;
       if (!progress || progress.key !== runKey) return { ok: true };
-      const evidence = Object.values(progress.gates || {}).map((p) => p && p.evidence).filter(Boolean);
+      const evidence = Object.values(progress.gates || {}).flatMap((p) => p ? [p.evidence, p.filingIntent] : []).filter(Boolean);
       return evidence.every((e) => attestationOriginMatches(cfg, e.origin))
         ? { ok: true }
         : { ok: false, reason: "pending flake evidence belongs to a different or unknown graph; resume against its original graph" };

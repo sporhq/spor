@@ -1595,8 +1595,11 @@ outside git (a database on a fixed port, a `db reset`):
     ONTO that fact, through the idempotent add_edge door, at the moment the
     debt is known — a PASSING gate and the final refusal have no later fact of
     that pass to carry it, so a debt deferred there is a debt that sinks. The
-    payment is recorded only from the door's own success. Before any fact
-    publication, the exact outcome and judged head are saved in the gate's
+    payment is recorded only from the door's own success. Before the first
+    issue filing, the exact isolated classification and failing evidence are
+    saved as a filing intent. A failed first save writes no graph node; a
+    crash after issue filing resumes that intent without rerunning the suite.
+    The intent is replaced atomically by the exact outcome and judged head in the gate's
     `gate_progress` evidence entry, bound to the original graph server and
     tenant (or canonical local nodes directory). A missing or mismatched
     origin refuses replay and leaves the obligation intact. A failed fact write, edge payment, or
