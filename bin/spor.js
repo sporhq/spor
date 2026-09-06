@@ -10411,8 +10411,8 @@ async function cmdDispatch(cfg, { values, positionals: pos }, ctx = null) {
   // reviewer write-capable on exactly the harnesses that had no posture yet):
   // `--read-only` is a promise the caller relies on, and a launch that cannot
   // keep it must not proceed as if it had. Every built-in adapter declares a
-  // posture; a declared custom harness has none by v1 scope, so a review gate
-  // has to route to a built-in one.
+  // posture; a custom harness must explicitly declare its fixed launcher
+  // read-only before it can serve a review gate.
   if (readOnly && harnessAdapter) {
     const ro = harnessAdapter.readOnly || null;
     if (!ro) {
