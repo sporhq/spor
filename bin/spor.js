@@ -15947,7 +15947,7 @@ async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHom
   // is content-addressed the same way in both (tenant, item, factory, pipeline
   // attempt), so a local execution and a hosted one describe the same thing.
   let store = openExecutionStoreFor(cfg, { home, log });
-  const gates = (factory.gates || []).map((g) => ({ id: g.id, node_id: g.source && g.source !== "inline" ? String(g.source) : null }));
+  const gates = (factory.gates || []).map((g) => ({ id: g.id, node_id: g.source && g.source !== "inline" ? String(g.source) : null, rejudge_on_repin: g.rejudgeOnRepin !== false }));
   const openArgs = { node_id: item.id, factory: factory.id, gates, boundary: factory.completion.after, repo: item.project || null };
   let opened = await store.open(openArgs);
   // A server that does not serve the surface (an older version, or one with
@@ -16053,8 +16053,7 @@ async function claimExecutionHold(cfg, item, factory, { home = cfg.userConfigHom
 // dispatch agent when one is configured (the same identity the hosted store
 // derives from an agent token), else the user. Remote mode never sends it as
 // its own name — the server derives the principal from the authenticated
-// identity and reads a body `worker` only as the fallback label for an
-// unbound token.
+// identity; an unbound token cannot acquire execution ownership.
 function executionWorkerPrincipal(cfg) {
   const agent = cfg.get("dispatch.agent", null);
   if (agent) return String(agent);
@@ -16153,6 +16152,7 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
   let fence = claim.fence != null ? Number(claim.fence) : null;
   let owned = fence != null;
   let last = null; // the latest execution record any store answer carried
+  let candidateTip = null; // latest locally pinned candidate, including owed events
   const pinned = new Set(Array.isArray(claim.gates) ? claim.gates.map(String) : []);
   // Attempt counters, ADVANCED LOCALLY on every report whether or not it was
   // delivered: the idempotency key of a gate verdict or an integration
@@ -16315,14 +16315,20 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
       return r;
     },
     stageObserved: (attempt, state, extra = {}) => send({ type: "stage.observed", attempt, state, ...extra }),
-    candidateSubmitted: (candidate, { premature = false } = {}) =>
-      send({ type: "candidate.submitted", candidate, ...(premature ? { premature_resolution: true } : {}) }),
-    gateSettled: (gateId, verdict) => {
+    candidateSubmitted: async (candidate, { premature = false } = {}) => {
+      candidateTip = candidate;
+      const pinnedResult = await send({ type: candidate.supersedes ? "candidate.superseded" : "candidate.submitted", candidate, ...(premature ? { premature_resolution: true } : {}) });
+      if (candidate.reference?.verified_at && (pinnedResult.ok || pinnedResult.deferred)) {
+        return send({ type: "candidate.published", candidate_id: candidate.candidate_id, reference: candidate.reference, verified_at: candidate.reference.verified_at });
+      }
+      return pinnedResult;
+    },
+    gateSettled: (gateId, verdict, { candidateId = null } = {}) => {
       const state = GATE_VERDICT_TO_STATE[String(verdict || "")] || null;
       if (!state) return Promise.resolve({ ok: true, skipped: true });
       if (pinned.size && !pinned.has(String(gateId))) return Promise.resolve({ ok: true, skipped: true }); // a synthetic gate (scoping, no-code) is not in the pinned list
       const attempt = gateAttempt(String(gateId));
-      return send({ type: "gate.settled", gate_id: String(gateId), attempt, state });
+      return send({ type: "gate.settled", gate_id: String(gateId), attempt, state, candidate_id: candidateId || candidateTip?.candidate_id || last?.candidate?.candidate_id || null });
     },
     rescueStarted: (attempt) => send({ type: "rescue.started", attempt }),
     escalationFiled: (nodeId, reason, { terminal = false } = {}) => send({ type: "escalation.filed", node_id: nodeId, reason: reason || null, ...(terminal ? { terminal: true } : {}) }),
@@ -16341,7 +16347,7 @@ function executionReporter(cfg, record, { home = cfg.userConfigHome(), log = () 
       const attempt = last && Array.isArray(last.attempts) && last.attempts.length ? last.attempts[last.attempts.length - 1].index : 1;
       const r = await send({ type: "stage.observed", attempt, state: "exhausted", outcome, ...(reason ? { reason } : {}) });
       LIVE_EXECUTIONS.delete(id);
-      return r;
+      return r.ok ? st.release(id, { fence }) : r;
     },
     async release() {
       LIVE_EXECUTIONS.delete(id);
@@ -16383,7 +16389,7 @@ function reportingGateDeps(deps, reporter) {
     wrapped.pinCandidate = async (args) => {
       const r = await deps.pinCandidate(args);
       try {
-        if (r && r.ok && r.candidate && (r.change === "created" || r.change === "superseded")) {
+        if (r && r.ok && r.candidate) {
           await reporter.candidateSubmitted(r.candidate, { premature: !!(r.candidate.resolver && r.candidate.resolver.resolves_edge) });
         }
       } catch {
@@ -16398,7 +16404,7 @@ function reportingGateDeps(deps, reporter) {
       try {
         const gate = args && args.gate;
         if (gate && gate.kind === "rescue") await reporter.rescueStarted(Number(args.rescue) || 1);
-        else if (gate && gate.id) await reporter.gateSettled(gate.id, args.verdict);
+        else if (gate && gate.id && r && r.ok) await reporter.gateSettled(gate.id, args.verdict, { candidateId: args.candidate_id || null });
       } catch {
         /* fail-soft */
       }

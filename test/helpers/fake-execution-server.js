@@ -62,22 +62,23 @@ async function startFakeExecutionServer({ tenant = "acme", nodes = {}, workers =
     unavailable: false,
     engines: new Map(),
   };
-  const engineFor = (bearer) => {
+  const engineFor = (bearer, machine = null) => {
     const worker = workers[bearer] || `unknown-${bearer}`;
-    if (!state.engines.has(worker)) {
+    const key = JSON.stringify([worker, machine]);
+    if (!state.engines.has(key)) {
       state.engines.set(
-        worker,
+        key,
         executionStore.localExecutionEngine({
           home,
           tenant,
           worker,
-          machine: "fake-box",
+          machine,
           now: now || (() => new Date().toISOString()),
           pinRead: (id) => (state.nodes.has(id) ? { revision: gitBlobSha(state.nodes.get(id)), repo: "spor" } : null),
         })
       );
     }
-    return state.engines.get(worker);
+    return state.engines.get(key);
   };
   const reply = (res, status, body) => {
     res.writeHead(status, { "Content-Type": "application/json" });
@@ -114,7 +115,7 @@ async function startFakeExecutionServer({ tenant = "acme", nodes = {}, workers =
           if (state.unserved) return reply(res, 404, { message: "Route not found" });
           if (state.unservedEnveloped) return reply(res, 404, { error: { code: "not_found", message: "no such route", details: [] } });
           if (state.unavailable) return answer(res, { ok: false, code: "unavailable", message: "the execution store is not configured on this server" });
-          const eng = engineFor(bearer);
+          const eng = engineFor(bearer, body?.machine ?? null);
           const m = /^\/v1\/executions\/([^/]+)(?:\/(claim|renew|release|events))?$/.exec(p);
           if (req.method === "POST" && p === "/v1/executions") {
             // The server pins at open and refuses an item or factory it cannot
@@ -182,7 +183,7 @@ async function startFakeExecutionServer({ tenant = "acme", nodes = {}, workers =
       const rec = executionStore.readRecord(home, tenant, executionId);
       if (rec && rec.owner) {
         rec.owner.lease_expires_at = new Date(Date.now() - 1000).toISOString();
-        executionStore.writeRecord(home, tenant, rec);
+        executionStore.writeRecord(home, tenant, rec, { type: "ownership.changed", execution_id: executionId, owner: rec.owner, at: rec.updated_at, seq: rec.seq });
       }
     },
     record: (id) => executionStore.readRecord(home, tenant, id),

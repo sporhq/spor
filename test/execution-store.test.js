@@ -50,7 +50,7 @@ const SPEC = {
   boundary: "gates",
   at: T0,
 };
-const CAND = { candidate_id: "cand-1111222233334444", commit: "b".repeat(40), tree: "a".repeat(40), provenance: { attempt: 1 } };
+const CAND = { candidate_id: "cand-1111222233334444", commit: "b".repeat(40), tree: "a".repeat(40), provenance: { attempt: 1 }, reference: { kind: "git", commit: "b".repeat(40), verified_at: T0 } };
 
 function itemNode(id, { status = "open", extra = "", edges = [] } = {}) {
   return `---
@@ -84,7 +84,7 @@ test("kernel: the execution id is the server's — exec- plus 16 hex of the NUL-
   assert.notEqual(id, kernel.executionIdFor({ tenant: "local", node_id: "task-x", factory: "factory-t", pipeline_attempt: 2 }, sha256), "a re-run is a fresh execution");
   // kernel/completion.js spells the same derivation for the claim's inputs.
   assert.equal(completionKernel.executionIdFor({ tenant: "local", nodeId: "task-x", factoryId: "factory-t", pipelineAttempt: 1 }, sha256), id);
-  assert.equal(kernel.serverCandidateIdFor({ node_id: "t", attempt: 1, commit: "c", tree: "d" }, sha256), "cand-d0178a1ec298c168");
+  assert.equal(kernel.serverCandidateIdFor({ repo: "spor", node_id: "t", tree: "d" }, sha256), "cand-e7cf9ec8926e36d5");
   assert.throws(() => kernel.executionIdFor({ tenant: "x", node_id: "y", factory: "z", pipeline_attempt: 1 }), /sha256/);
 });
 
@@ -92,8 +92,8 @@ test("kernel: initExecution pins the definition and seeds every declared gate; r
   const rec = kernel.initExecution(SPEC, { sha256 });
   assert.equal(rec.spec_version, 1);
   assert.equal(rec.execution_id, "exec-4da6d4763543a301");
-  assert.deepEqual(rec.factory.gates, SPEC.gates);
-  assert.deepEqual(rec.gate_results, [{ id: "acceptance", state: null, attempt: 0, settled_at: null }, { id: "review", state: null, attempt: 0, settled_at: null }]);
+  assert.deepEqual(rec.factory.gates, SPEC.gates.map(g => ({ ...g, rejudge_on_repin: true })));
+  assert.deepEqual(rec.gate_results, [{ id: "acceptance", state: null, attempt: 0, settled_at: null, candidate_id: null }, { id: "review", state: null, attempt: 0, settled_at: null, candidate_id: null }]);
   assert.equal(rec.stage, "implementation");
   assert.equal(kernel.boundaryReached(rec), false);
   const c = kernel.claim(rec, { worker: "agent-a", machine: "box", lease_expires_at: later(900), now: T0 });
@@ -168,10 +168,11 @@ test("kernel: a seen idempotency key is a no-op even from a fenced-out worker; a
   const taken = kernel.claim(rec, { worker: "agent-b", lease_expires_at: later(2000), now: later(901) });
   assert.equal(taken.fence, 2);
   assert.equal(kernel.renew(taken.record, { fence: 1, lease_expires_at: later(3000), now: later(902) }).code, "fence_stale", "the fenced-out worker cannot resurrect its lease");
-  // A refusal is terminal for everyone.
+  // A refusal retains the hold for re-gating; only explicit release ends it.
   const refused = kernel.applyExecutionEvent(taken.record, { type: "escalation.filed", node_id: "task-gate-x", terminal: true, fence: 2, at: later(903) }, { seen }).record;
   assert.equal(refused.stage, "refused");
-  assert.equal(kernel.applyExecutionEvent(refused, { type: "completion.written", resolver: "art-x", fence: 2, at: later(904) }, { seen }).code, "execution_terminal");
+  assert.equal(kernel.applyExecutionEvent(refused, { type: "completion.written", resolver: "art-x", fence: 2, at: later(904) }, { seen }).code, "boundary_not_reached");
+  assert.equal(kernel.isTerminal(refused), false);
   assert.equal(kernel.boundaryReached(refused), false);
   assert.equal(kernel.applyExecutionEvent(refused, { type: "bogus", fence: 2 }, { seen }).code, "invalid_event");
 });
@@ -189,7 +190,7 @@ test("local store: the server's layout under journal/executions/<tenant>/, the e
   const id = o.execution.execution_id;
   assert.equal(id, "exec-4da6d4763543a301", "the same id the hosted store would mint for tenant `local`");
   assert.equal(o.execution.item.revision, "rev-task-x");
-  assert.deepEqual(o.execution.factory.gates, [{ id: "acceptance", node_id: "gate-acc", revision: "rev-gate-acc" }]);
+  assert.deepEqual(o.execution.factory.gates, [{ id: "acceptance", node_id: "gate-acc", revision: "rev-gate-acc", rejudge_on_repin: true }]);
   assert.ok(fs.existsSync(path.join(home, "journal", "executions", "local", "exec", `${id}.json`)));
   assert.ok(fs.existsSync(path.join(home, "journal", "executions", "local", "exec", `${id}.events.jsonl`)));
   assert.deepEqual(store.readItem(home, "local", "task-x"), { node_id: "task-x", open: id, executions: [id] });
@@ -227,10 +228,10 @@ test("local store: the server's layout under journal/executions/<tenant>/, the e
   const ended = await st.terminate(second.execution.execution_id, { fence: second.fence, reason: "hold refused" });
   assert.equal(ended.execution.stage, "refused");
   assert.equal(store.readItem(home, "local", "task-x").open, null);
-  // A corrupt record fails closed on read, never as absent.
+  // Local reads recover a corrupt materialized view from the authoritative log.
   fs.writeFileSync(store.recordPath(home, "local", id), "{not json");
-  assert.equal((await st.get(id)).code, "conflict");
-  assert.throws(() => store.readRecord(home, "local", id), /corrupt/);
+  assert.equal((await st.get(id)).execution.stage, "completed");
+  assert.equal(store.readRecord(home, "local", id).stage, "completed");
 });
 
 // ---------- 3. the remote adapter against the fake ----------
@@ -264,7 +265,7 @@ test("remote adapter: open, claim, renew, release and every event ride the fence
     assert.equal(posted[0].body.event.idempotency_key, CAND.candidate_id, "the client stamps the deterministic key");
     assert.equal(posted[1].body.event.idempotency_key, `${id}:acceptance:1`);
     assert.equal((await st.renew(id, { fence: 1 })).ok, true);
-    assert.deepEqual(fake.state.requests[fake.state.requests.length - 1].body, { fence: 1 });
+    assert.deepEqual(fake.state.requests[fake.state.requests.length - 1].body, { fence: 1, machine: "box-a" });
     assert.equal((await st.renew(id, { fence: 7 })).code, "fence_stale");
     const c = await st.confirmOwnership(id, 1);
     assert.equal(c.confirmed, true);
@@ -475,7 +476,7 @@ test("bin/spor.js, remote mode: claimExecutionHold opens the hosted execution, n
     await wrapped.recordFact({ id: "art-gate-1", markdown: "", nodeId: "task-x", gate: { id: "acceptance", kind: "command" }, verdict: "passed" });
     await wrapped.recordFact({ id: "art-gate-2", markdown: "", nodeId: "task-x", gate: { id: "scoping", kind: "scoping" }, verdict: "scoped" }); // synthetic: not reported
     const types = fake.state.requests.filter((q) => q.path.endsWith("/events") && q.method === "POST").map((q) => `${q.body.event.type}${q.body.event.gate_id ? `:${q.body.event.gate_id}` : ""}`);
-    assert.deepEqual(types, ["stage.started", "candidate.submitted", "gate.settled:acceptance"]);
+    assert.deepEqual(types, ["stage.started", "candidate.submitted", "candidate.published", "gate.settled:acceptance"]);
     const rec = fake.record(reporter.id);
     assert.equal(rec.boundary_reached, undefined);
     assert.equal(kernel.boundaryReached(rec), true);
@@ -492,7 +493,7 @@ test("bin/spor.js, remote mode: claimExecutionHold opens the hosted execution, n
     assert.equal(cli.status, 0, cli.stderr);
     assert.match(cli.stdout, new RegExp(`^${reporter.id}  gating \\(boundary reached\\)`, "m"));
     assert.match(cli.stdout, /gate acceptance: passed \(attempt 1\)/);
-    assert.match(cli.stdout, /owner agent-a on fake-box/);
+    assert.ok(cli.stdout.includes(`owner agent-a on ${os.hostname()}`), cli.stdout);
     const list = spawnSync(process.execPath, [path.join(__dirname, "..", "bin", "spor.js"), "executions", "--node", "task-x", "--json"], { env: { ...process.env, SPOR_HOME: home, XDG_CONFIG_HOME: home, SPOR_SERVER: fake.base, SPOR_TOKEN: "tok-a" }, cwd: home, encoding: "utf8" });
     assert.equal(JSON.parse(list.stdout).count, 1);
   } finally {
@@ -507,7 +508,7 @@ test("bin/spor.js, remote mode against a server that does not serve /v1/executio
     fake.state.unserved = true;
     const home = tmp("cli-unserved");
     const cfg = remoteCfg(home, fake.base);
-    const factory = factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "true" }], completion: { by: "controller" } });
+    const factory = factoryOf({ factory: "t", trusted_ref: "main", gates: [{ id: "acceptance", kind: "command", command: "true", rejudge_on_repin: false }], completion: { by: "controller" } });
     const lines = [];
     const held = await spor.claimExecutionHold(cfg, { id: "task-x" }, factory, { home, log: (l) => lines.push(l) });
     assert.equal(held.ok, true, held.reason);
@@ -516,6 +517,7 @@ test("bin/spor.js, remote mode against a server that does not serve /v1/executio
     assert.equal(held.recordFields.impl_claim.tenant, "local");
     assert.ok(lines.some((l) => /does not serve \/v1\/executions/.test(l)), lines.join("\n"));
     assert.equal(store.readItem(home, "local", "task-x").open, held.executionId);
+    assert.equal(store.readRecord(home, "local", held.executionId).factory.gates[0].rejudge_on_repin, false, "parsed command opt-out survives CLI local pin mapping");
     // The real older server's route-miss carries the standard envelope; it
     // falls back the same way (a served open's not_found names a node).
     fake.state.unserved = false;
@@ -617,4 +619,58 @@ test("legacy and pre-adapter records report nothing: no impl_claim, or an impl_c
   assert.equal("execution" in deps, false, "no store door on a legacy record");
   const plain = { pinCandidate: async () => 1 };
   assert.equal(spor.reportingGateDeps(plain, null), plain, "the deps object is untouched without a reporter");
+});
+
+test("remote ownership belongs to the fixed agent and machine pair on every mutation", async () => {
+  let clock = T0;
+  const fake = await startFakeExecutionServer({ nodes: { "task-x": itemNode("task-x"), "factory-t": itemNode("factory-t") }, now: () => clock });
+  try {
+    const a = store.openExecutionStore(remoteCfg(tmp("pair-a"), fake.base), { machine: "box-a" });
+    const b = store.openExecutionStore(remoteCfg(tmp("pair-b"), fake.base), { machine: "box-b" });
+    const opened = await a.open({ node_id: "task-x", factory: "factory-t", gates: [], boundary: "gates" });
+    assert.equal(opened.ok, true, JSON.stringify(opened));
+    const id = opened.execution.execution_id;
+    assert.equal(opened.execution.owner.machine, "box-a");
+    assert.equal((await a.claim(id, {})).fence, opened.fence, "same pair retains fence");
+    for (const result of [
+      await b.claim(id, { machine: "box-a" }),
+      await b.renew(id, { fence: opened.fence }),
+      await b.release(id, { fence: opened.fence }),
+      await b.event(id, { fence: opened.fence, event: { type: "stage.started", attempt: 1 } }),
+    ]) assert.equal(result.ok, false, JSON.stringify(result));
+    assert.equal(fake.record(id).owner.machine, "box-a");
+    clock = later(3600);
+    const takeover = await b.claim(id, { takeover: true });
+    assert.equal(takeover.ok, true, JSON.stringify(takeover));
+    assert.ok(takeover.fence > opened.fence);
+    assert.equal((await a.renew(id, { fence: takeover.fence })).ok, false, "copying a new fence does not confer identity");
+    const posts = fake.state.requests.filter(r => r.method === "POST" && r.path.startsWith("/v1/executions"));
+    assert.ok(posts.every(r => ["box-a", "box-b"].includes(r.body.machine)));
+    assert.equal(posts.find(r => r.path.endsWith("/claim") && r.body.machine === "box-b").body.machine, "box-b", "adapter never copies a caller-supplied holder machine");
+  } finally { await fake.close(); }
+});
+
+test("reporter emits publication for an unchanged pin and settles only persisted facts against their judged candidate", async () => {
+  const observed = [];
+  const cfg = { userConfigHome: () => tmp("report-binding") };
+  const claim = { execution_id: "exec-binding", store: "local", fence: 1, gates: ["acceptance"], completion: { by: "controller", after: "gates" } };
+  const reporter = spor.executionReporter(cfg, { node_id: "task-x", run_id: "run-binding", impl_claim: claim }, {
+    home: tmp("binding"), store: { event: async (_id, { event }) => { observed.push(event); return { ok: true }; } },
+  });
+  let factOk = false;
+  const b = { ...CAND, candidate_id: "cand-new", supersedes: CAND.candidate_id };
+  const wrapped = spor.reportingGateDeps({
+    pinCandidate: async () => ({ ok: true, candidate: b, created: false }),
+    recordFact: async () => ({ ok: factOk }),
+  }, reporter);
+  await wrapped.pinCandidate({});
+  assert.deepEqual(observed.map(e => e.type), ["candidate.superseded", "candidate.published"]);
+  const fact = { gate: { id: "acceptance", kind: "command" }, verdict: "passed", candidate_id: CAND.candidate_id };
+  await wrapped.recordFact(fact);
+  assert.equal(observed.length, 2, "a refused fact cannot produce successful gate evidence");
+  factOk = true;
+  await wrapped.recordFact(fact);
+  assert.equal(observed[2].type, "gate.settled");
+  assert.equal(observed[2].candidate_id, CAND.candidate_id, "late A fact remains bound to A after B pin");
+  assert.equal(observed[2].attempt, 1, "refused writes do not spend settlement keys");
 });
