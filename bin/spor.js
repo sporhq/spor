@@ -49,6 +49,7 @@ const integrationRunner = require(path.join(ROOT, "lib", "shell", "integration-r
 const implementationStage = require(path.join(ROOT, "lib", "shell", "implementation-stage.js"));
 const workerContractLib = require(path.join(ROOT, "lib", "shell", "worker-contract.js"));
 const { workerContract } = workerContractLib;
+const attestation = require(path.join(ROOT, "lib", "shell", "attestation.js"));
 // Resolution truth (lib/kernel/resolution.js): a node is "done" when it carries a
 // TERMINAL status OR a live inbound resolves/answers edge — the same partition the
 // queue ranker and read surfaces use. The dispatch guard reads it so it never
@@ -7658,6 +7659,7 @@ async function resolveNode(cfg, id) {
   let resolution = null;
   let held = null;
   let inert = null;
+  let revision = null;
   // `open_findings` (API.md §3) is the same hook's open-gardener-findings
   // ride-along — every LIVE (non-terminal, non-superseded) finding that
   // `relates-to` this node, as `[{id, title, summary}]`. Kept so the decline-
@@ -7690,9 +7692,11 @@ async function resolveNode(cfg, id) {
     inert = typeof r.json.inert === "boolean" ? r.json.inert : null;
     openFindings = Array.isArray(r.json.open_findings) ? r.json.open_findings : null;
     supersededBy = r.json.superseded_by || r.json.supersededBy || null;
+    revision = (r.json && typeof r.json.revision === "string" && r.json.revision) || null;
   } else {
     try {
       raw = fs.readFileSync(path.join(cfg.nodesDir(), `${id}.md`), "utf8");
+      revision = gitBlobSha(Buffer.from(raw, "utf8"));
     } catch {
       return null;
     }
@@ -7730,6 +7734,13 @@ async function resolveNode(cfg, id) {
     held,
     inert,
     openFindings,
+    revision,
+    // Server-stamped authorship (API.md §3): who wrote the node and through
+    // what. In local mode these are whatever the file says — a validator
+    // treats a local graph's provenance as unverifiable (attestation.js).
+    author: parsed.author || null,
+    authored_by_agent: parsed.authored_by_agent || null,
+    authored_via: parsed.authored_via || null,
   };
 }
 
@@ -8860,9 +8871,19 @@ function runWorktreeHook(which, dir, { repoDir, slug = null, nodeId = null, stdi
     // Scrubbed of the git location vars (u.gitEnv): the hook stages the fresh
     // worktree, so its git must follow cwd rather than an ambient GIT_DIR
     // inherited from whatever launched dispatch
-    // (issue-spor-dispatch-worktree-wrong-repo-location).
+    // (issue-spor-dispatch-worktree-wrong-repo-location). And run under the
+    // JUDGE's environment (gateRunner.judgeGitEnv — cross-model review,
+    // blocking finding 1): the hook is resolved from the tree's OWN checkout,
+    // i.e. from the commit under judgement (a gate tree, the integration
+    // candidate — and a reused dispatch worktree on a fix cycle sits at the
+    // implementer's branch too), so it is candidate-controlled code that ran
+    // BEFORE the scrubbed gate command with the attestation signing key and
+    // the graph credentials in its environment. Same scrub as the suite
+    // (scrubSecretEnv: the key, every graph bearer/refresh/admin token, both
+    // SPOR_/SUBSTRATE_ spellings) plus every git hook disabled. The hook
+    // never needs the judge's credentials: it stages files.
     env: {
-      ...u.gitEnv(),
+      ...gateRunner.judgeGitEnv(u.gitEnv()),
       SPOR_WORKTREE: dir,
       SPOR_MAIN_CHECKOUT: repoDir,
       SPOR_DISPATCH_SLUG: slug || "",
@@ -9711,6 +9732,16 @@ async function cmdRuns(cfg, { values, positionals: pos }) {
     // 'spor runs <that id>' is how a human (or a restarted 'spor work') finds
     // out whether it is still going.
     if (r.gate_state) out(`  gate:       ${r.gate_state}${r.gate_reason ? ` — ${r.gate_reason}` : ""}`);
+    if (r.gate_head) out(`  gated head: ${r.gate_head}${r.gate_landed_sha ? ` (landed ${String(r.gate_landed_sha).slice(0, 12)})` : ""}`);
+    if (r.gate_attestation) out(`  attested:   ${r.gate_attestation}`);
+    // A run that PROMISED an attestation and has none says so here, never
+    // only in the worker's log (cross-model review, minor finding 8) — the
+    // record's `gate_attestation_missing`/`_error` stamps are the evidence
+    // chain's own "no evidence" entry, and a parked proposal whose PR body
+    // could not be refreshed with the bound copy is a PR a validator will
+    // refuse against the graph artifact.
+    if (r.gate_attestation_missing) out(`  attested:   MISSING — ${r.gate_attestation_error || "the attestation was not recorded"}`);
+    if (r.gate_proposal_attestation_stale) out(`  proposal:   PR body carries a STALE attestation${r.gate_proposal_attestation ? ` (graph copy ${r.gate_proposal_attestation})` : ""}${r.gate_proposal_attestation_error ? ` — ${r.gate_proposal_attestation_error}` : ""}`);
     if (r.gate_fix_run_id) {
       out(`  fix cycle:  run ${String(r.gate_fix_run_id).slice(0, 8)} — 'spor runs ${r.gate_fix_run_id}' follows it${r.gate_state === "interrupted" ? " (left running by a stopped worker)" : ""}`);
     }
@@ -11873,12 +11904,30 @@ function cmdWorkStatus(cfg, { json }) {
         `  done:     ${r.node_id || "(free-text)"}  ${r.terminal_state || r.state || "?"}` +
           `${r.terminal_state && !r.terminal_enforced ? " (unenforced)" : ""}` +
           `${r.resolved_by ? ` by ${r.resolved_by}` : ""}${r.report_node_id ? ` — report ${r.report_node_id}` : ""}` +
-          `${r.gate ? `  gates ${r.gate}` : ""}`
+          `${r.gate ? `  gates ${r.gate}` : ""}${r.superseded ? " (superseded)" : ""}`
       );
       if (r.gate && r.gate !== "passed" && r.gate_reason) out(`            ${r.gate_reason}`);
+      // A verdict this worker's pipeline did NOT produce (cross-model review,
+      // minor finding 5): the `gates` state above is the record's — the one
+      // that won the settle race — and this worker's own verdict lost and was
+      // never recorded. Without the marker a displayed `passed` reads as this
+      // worker's judgement.
+      if (r.superseded) {
+        const own = r.superseded_verdict || {};
+        out(
+          `            superseded: this worker's own '${own.state || "failed"}' verdict${own.head ? ` at ${String(own.head).slice(0, 12)}` : ""} lost the settle race and is not recorded — shown is the record's verdict${
+            r.gate_worker ? `, settled by ${r.gate_worker}` : ", settled by another pipeline"
+          }`
+        );
+      }
       // The fail-soft half of a refusal: the verdict stands either way, but an
       // operator has to know the item is still reading DONE on the graph.
       if (r.demote_reason) out(`            not demoted on the graph: ${r.demote_reason}`);
+      // The evidence chain's own holes (cross-model review, minor finding 8):
+      // a verdict whose attestation was never recorded, or a parked PR whose
+      // body still carries the propose-time copy a validator will refuse.
+      if (r.attestation_missing) out(`            attestation MISSING: ${r.attestation_error || "not recorded"}`);
+      if (r.proposal_attestation_stale) out(`            PR body carries a STALE attestation${r.proposal_attestation_error ? `: ${r.proposal_attestation_error}` : ""}`);
       // ...and its atomic twin: the escalation never landed, so NOTHING was
       // written to the graph — no blocker, and deliberately no rollback either
       // (task-spor-gate-escalation-demote-atomic). This refusal exists only
@@ -11966,10 +12015,16 @@ async function loadFactoryDefinition(cfg, id) {
   }
   const errors = [];
   const gateNodes = new Map();
+  // Definition provenance (task-spor-factory-gate-attestation): the revision
+  // (blob sha) of the factory node and of every referenced gate node, stamped
+  // onto the parsed definition beside the kernel's digests so each fact says
+  // which revision of which definition judged it.
+  const gateRevisions = {};
   const explainedRefs = new Set(); // refs whose problem we already reported below
   for (const ref of gatesKernel.factoryRefs(parsed.body || "")) {
     const gn = await resolveNode(cfg, ref);
     if (!gn || !gn.raw) continue; // resolveGates reports the missing reference itself
+    if (gn.revision) gateRevisions[ref] = gn.revision;
     const pg = parse(gn.raw, `${ref}.md`);
     if ((pg.type || "") !== "gate") {
       errors.push(`referenced gate '${ref}' is a '${pg.type || "?"}' node, not a 'type: gate' node`);
@@ -11993,6 +12048,7 @@ async function loadFactoryDefinition(cfg, id) {
   // payload declares no `repos` (issue-spor-work-scope-union-factory-mismatch)
   // — a factory authored for one repo says so by living in it.
   const res = gatesKernel.parseFactory(parsed.body || "", { gateNodes, id, project: parsed.project || null });
+  if (res.factory) gatesKernel.stampDefinitionRevisions(res.factory, { factory: node.revision || null, gates: gateRevisions });
   // A ref we already explained above (wrong type, retired, bad payload) is left
   // out of gateNodes on purpose, which makes resolveGates raise its own generic
   // "could not be read from the graph" for the same ref — accurate for an
@@ -12206,6 +12262,38 @@ function stripFrontmatterDate(markdown) {
   return text.slice(0, end).replace(/^date: .*$/m, "date:") + text.slice(end);
 }
 
+// Is the node the graph already holds under a gate id the SAME node this
+// runner is writing? The server stamps what it stamps on write (author,
+// authored_via, agent/session attribution, timestamps) and the calendar day
+// drifts (stripFrontmatterDate), so the comparison is over the frontmatter
+// lines that carry the fact — order-insensitive, minus the server's own keys —
+// and the body, whitespace-trimmed. Anything else (a different verdict, a
+// different head, a different summary) is a different node.
+const SERVER_STAMPED_KEYS = new Set(["date", "author", "authored_via", "authored_by_agent", "session", "revision", "created_at", "updated_at", "captured_at", "authored_at"]);
+function gateNodeShape(markdown) {
+  const text = String(markdown || "").replace(/\r\n/g, "\n");
+  if (!text.startsWith("---\n")) return { fm: [], body: text.trim() };
+  const end = text.indexOf("\n---", 4);
+  if (end === -1) return { fm: [], body: text.trim() };
+  const fm = text
+    .slice(4, end)
+    .split("\n")
+    .map((l) => l.replace(/\s+$/, ""))
+    .filter((l) => l.trim())
+    .filter((l) => {
+      const m = /^([A-Za-z_][\w-]*):/.exec(l);
+      return !(m && SERVER_STAMPED_KEYS.has(m[1]));
+    })
+    .sort();
+  const body = text.slice(end + 4).replace(/^\n+/, "").trim();
+  return { fm, body };
+}
+function gateNodeEquivalent(a, b) {
+  const x = gateNodeShape(a);
+  const y = gateNodeShape(b);
+  return x.body === y.body && x.fm.length === y.fm.length && x.fm.every((l, i) => l === y.fm[i]);
+}
+
 // Write a gate's node — a fact, an escalation, an approval — through the same
 // validated door `spor put-node` uses, idempotently (a deterministic id written
 // twice is one node, never two).
@@ -12214,7 +12302,20 @@ async function writeGateNode(cfg, id, markdown) {
     const r = await remote.post(cfg, "/v1/nodes", { nodes: [{ node: markdown, if_exists: "skip" }] }, { timeoutMs: 15000 });
     if (r.transport) return { ok: false, reason: `offline — ${r.error}` };
     const res0 = r.json && r.json.results && r.json.results[0];
-    if (res0 && (res0.ok === true || res0.status === "skipped" || res0.status === "created")) return { ok: true, id };
+    if (res0 && res0.status === "skipped") {
+      // The SAME distinction the local door draws below (review finding 5): a
+      // skip means the id exists, not that THIS fact landed. Read it back and
+      // compare — a racing runner's node under this id carrying a different
+      // verdict is a collision to refuse, never evidence to adopt. An
+      // unreadable existing node is refused too (fail closed: it cannot be
+      // shown to be this fact).
+      const existing = await remote.get(cfg, `/v1/nodes/${encodeURIComponent(id)}`, { timeoutMs: 8000 });
+      if (existing.transport) return { ok: false, id, existing: true, reason: `${id} already exists and could not be read back to compare (offline — ${existing.error})` };
+      const raw = existing.ok ? (existing.json && existing.json.raw) || existing.text || "" : "";
+      if (!existing.ok || !raw) return { ok: false, id, existing: true, reason: `${id} already exists and could not be read back to compare (HTTP ${existing.status})` };
+      return gateNodeEquivalent(raw, markdown) ? { ok: true, id, existing: true } : { ok: false, id, existing: true, reason: `${id} already exists with different content — refusing to adopt another gate's node` };
+    }
+    if (res0 && (res0.ok === true || res0.status === "created")) return { ok: true, id };
     return { ok: false, reason: putNodeEntryError(res0, r.status, "gate") };
   }
   const dir = cfg.nodesDir();
@@ -14952,7 +15053,7 @@ function ghRepoSlug(top) {
 // Idempotent across a fix cycle: a re-run pushes the branch's new tip and
 // reuses whatever PR is already open for it rather than erroring on a
 // duplicate.
-function proposeIntegrationPR({ top, head, targetRef }) {
+function proposeIntegrationPR({ top, head, targetRef, body = null, editBody = editProposalBody }) {
   if (!hasCmd("gh")) return { ok: false, reason: "the 'gh' CLI is not on PATH — propose mode needs it to open pull requests" };
   const repo = ghRepoSlug(top);
   if (!repo) return { ok: false, reason: `could not resolve a github.com 'owner/repo' from ${top}'s 'origin' remote — propose mode needs a GitHub remote` };
@@ -14986,6 +15087,12 @@ function proposeIntegrationPR({ top, head, targetRef }) {
       const list = JSON.parse(existing.stdout);
       const j = Array.isArray(list) ? list[0] : null;
       if (j && j.number && String(j.state || "").toUpperCase() === "OPEN" && j.baseRefName === baseBranch) {
+        if (body) {
+          const edited = editBody({ top, repo, number: j.number, body });
+          if (!edited || !edited.ok) {
+            return { ok: false, reason: `PR #${j.number} is already open (${j.url}) and now carries ${head.slice(0, 8)}, but its body could not be refreshed with that head's attestation — ${(edited && edited.reason) || "gh pr edit failed"}` };
+          }
+        }
         return { ok: true, number: j.number, url: j.url, repo, branch: branchName, targetRef, detail: `PR #${j.number} already open (${j.url}) — updated with ${head.slice(0, 8)}` };
       }
     } catch {
@@ -14997,7 +15104,7 @@ function proposeIntegrationPR({ top, head, targetRef }) {
     [
       "pr", "create", "--repo", repo, "--base", baseBranch, "--head", branchName,
       "--title", `Integration: ${branchName}`,
-      "--body", `Opened by the spor work integration stage (\`propose\` mode) for \`${branchName}\` onto \`${baseBranch}\`.`,
+      "--body", body || `Opened by the spor work integration stage (\`propose\` mode) for \`${branchName}\` onto \`${baseBranch}\`.`,
     ],
     { cwd: top }
   );
@@ -15008,6 +15115,19 @@ function proposeIntegrationPR({ top, head, targetRef }) {
   const num = (url.match(/\/pull\/(\d+)/) || [])[1];
   if (!num) return { ok: false, reason: `gh pr create did not report a pull request number/url (got: ${url || "nothing"})` };
   return { ok: true, number: Number(num), url, repo, branch: branchName, targetRef, detail: `opened PR #${num} (${url}) for ${head.slice(0, 8)} onto ${targetRef}` };
+}
+
+// Replace a PR's description — the attestation refresh door, used both by the
+// reuse arm above and by runGateAndIntegration once the run has SETTLED and the
+// graph artifact the PR body must be bound to exists (the body written at
+// propose time predates that artifact, so it is refreshed with the final,
+// digest-bound copy). {ok} | {ok:false, reason}.
+function editProposalBody({ top = null, repo, number, body }) {
+  if (!hasCmd("gh")) return { ok: false, reason: "the 'gh' CLI is not on PATH" };
+  if (!repo || !number) return { ok: false, reason: "no pull request repo/number to edit" };
+  const r = runGh(["pr", "edit", String(number), "--repo", repo, "--body", String(body || "")], top ? { cwd: top } : {});
+  if (r.status !== 0) return { ok: false, reason: (r.stderr || r.stdout || "").trim().split("\n").filter(Boolean).pop() || "gh pr edit failed" };
+  return { ok: true };
 }
 
 // The PR's current state, for checkProposals below — {ok, state: "open" |
@@ -15092,8 +15212,36 @@ function buildProposalTrackingNode({ id, nodeId, runId, targetRef, proposal, pro
 // integration-runner.js's pure orchestration, mirroring makeGateDeps above.
 // Only ever constructed when `factory.integration` resolved, so a bare
 // factory (or one with no integration block) never touches any of this.
-function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, warn, sleep, log, workerId = null, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, dispatch = dispatchThrough, home = cfg.userConfigHome(), completedBeforeIntegration = false }) {
+// The propose-time PR body: the run's attestation as it stands (the gate
+// verdicts bound to the head being proposed, with the candidate suite the
+// stage just ran), rendered with the validation recipe
+// (task-spor-factory-gate-attestation, piece 4). Built here rather than in
+// the pure runner because it needs the gate pipeline's result and the
+// environment, which the stage never sees. Throws when it cannot be built —
+// the caller (makeIntegrationDeps `propose`) turns that into a failed
+// proposal, never a PR without it.
+function buildProposalBody({ cfg, entry, factory, slug, workerId, top, head, targetRef, chain = null, integration, gate }) {
+  const baseBranch = integrationRunner.splitRemoteRef(targetRef).branch;
+  const partial = {
+    mode: integration.mode, strategy: integration.strategy, state: "proposing", target_ref: targetRef,
+    target_sha: chain ? chain.targetSha : null, head: head || (chain && chain.head) || null,
+    gated_head: chain ? chain.gatedHead : null, landed_sha: null, candidate: chain ? chain.candidate : null,
+  };
+  const att = attestation.buildAttestationObject({
+    item: { ...entry, project: slug || entry.project || null }, factory,
+    gate,
+    integration: partial,
+    environment: attestationEnvironment(cfg, workerId),
+    signing: attestationSigning(cfg),
+  });
+  return attestation.renderPrBody({ attestation: att, branch: (git(top, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout || "").trim() || "HEAD", base: baseBranch });
+}
+
+function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, warn, sleep, log, workerId = null, runMaxMs = workLoop.WORK_DEFAULTS.runMaxMs, dispatch = dispatchThrough, home = cfg.userConfigHome(), completedBeforeIntegration = false, gateResult = null, regate = null, buildProposalBody: buildBody = buildProposalBody, proposeIntegrationPR: proposePR = proposeIntegrationPR }) {
   const integration = factory.integration;
+  // The gate pipeline's result AS IT STANDS — a re-gate of a moved head
+  // (below) replaces it, and the PR body's attestation must carry the latest.
+  const currentGate = () => (typeof gateResult === "function" ? gateResult() : gateResult);
   const date = () => new Date().toISOString().slice(0, 10);
   const stem = gateStem(entry.node_id);
   const short = gateRunner.shortRunAttempt(entry.run_id, entry.attempt);
@@ -15315,7 +15463,15 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       return built;
     },
     forceProtected: ({ dir, sha }) => {
-      const forced = gateRunner.forceProtectedPaths({ top, dir, trustedRef: factory.trustedRef, protectedPaths: factory.protectedPaths });
+      // Pin the trusted ref to ONE commit before touching the tree, and force
+      // from that sha — never from the symbolic ref, which can advance between
+      // this restore and the attestation naming it (cross-model review, major
+      // finding 5). An unresolvable ref refuses the stage rather than forcing
+      // from whatever the ref means by the time checkout runs.
+      const pin = git(top, ["rev-parse", "--verify", `${factory.trustedRef}^{commit}`]);
+      const trustedSha = pin.status === 0 ? (pin.stdout || "").trim() : null;
+      if (!trustedSha) return { ok: false, reason: `the trusted ref '${factory.trustedRef}' does not resolve to a commit in ${top}, so the candidate's protected paths cannot be pinned to it` };
+      const forced = gateRunner.forceProtectedPaths({ top, dir, trustedRef: trustedSha, protectedPaths: factory.protectedPaths });
       if (!forced.ok) return forced;
       // The restore above only touches the candidate worktree's WORKING
       // DIRECTORY — `sha` still names the pre-restoration commit. Landing it
@@ -15323,7 +15479,8 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       // meant to strip (issue-spor-integration-landed-sha-pre-restoration), so
       // re-commit when the restore actually changed anything and land that
       // sha instead; a no-op restore returns `sha` unchanged.
-      return integrationRunner.reconcileCandidateSha({ dir, sha });
+      const reconciled = integrationRunner.reconcileCandidateSha({ dir, sha });
+      return reconciled && reconciled.ok ? { ...reconciled, trusted_sha: trustedSha } : reconciled;
     },
     runSuite: ({ dir, base, head, attempt = 1 }) =>
       gateRunner.runGateCommand({ id: "integration", command: integration.command, timeoutMs: integration.timeoutMs }, dir, {
@@ -15338,7 +15495,32 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
         },
       }),
     land: (args) => integrationRunner.landCandidate(args),
-    propose: ({ head, targetRef }) => proposeIntegrationPR({ top, head, targetRef }),
+    // The PR body carries the run's attestation (task-spor-factory-gate-
+    // attestation, piece 4): the gate verdicts as they stand, bound to the head
+    // being proposed, with the candidate suite the stage just ran. Built here
+    // rather than in the pure runner because it needs the gate pipeline's
+    // result (ctx.gateResult) and the environment, which the stage never sees.
+    // A PR that cannot carry its attestation is NOT opened (cross-model
+    // review, major finding 5): the attestation-bearing body is the contract
+    // a PR-policy repo's CI validates, and a PR opened with a generic body
+    // would pass through that repo's merge queue with nothing to check. A
+    // body that cannot be built is a failed proposal, which the stage
+    // routes like any other failure (§10.9) — never a silent downgrade.
+    propose: ({ head, targetRef, chain = null }) => {
+      let body = null;
+      try {
+        body = buildBody({
+          cfg, entry, factory, slug, workerId, top, head, targetRef, chain, integration,
+          gate: currentGate() || { state: "passed", gates: [], facts: [], definition: factory.definition || null },
+        });
+      } catch (e) {
+        const reason = `the attestation for the pull request body could not be built (${(e && e.message) || e}) — a proposal must carry its attestation, so no PR was opened`;
+        log(`work: ${reason}`);
+        return { ok: false, reason };
+      }
+      if (!body) return { ok: false, reason: "the attestation for the pull request body was not built — a proposal must carry its attestation, so no PR was opened" };
+      return proposePR({ top, head, targetRef, body });
+    },
     parkForReview: async ({ proposal }) => {
       const id = proposalTrackingId(entry.node_id, entry.run_id);
       const written = await writeGateNode(
@@ -15375,6 +15557,10 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
       return { ...written, id };
     },
     fix,
+    // A fix cycle moved the implementer's head: the stage hands it back to the
+    // gate pipeline before anything at that head can land (review finding 2).
+    // Wired by runGateAndIntegration, which owns the pipeline's result.
+    ...(typeof regate === "function" ? { regate } : {}),
     recordFact: ({ id, markdown }) => writeGateNode(cfg, id, markdown),
     cleanupImplementer: async () => {
       const dir = record && record.cwd;
@@ -16403,7 +16589,41 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // a refusal (§10.7) under the worker's scope token would hide it from exactly
   // the project-scoped queue a person would look in.
   const dctx = { ...ctx, slug: item.project || ctx.slug || null, record, entry };
+  // OWN THE RECORD BEFORE JUDGING (cross-model review, blocking finding 2).
+  // The settle below is a compare-and-swap, but the pipeline writes facts,
+  // files an escalation and demotes the item on its way there — irreversible
+  // graph state — so the ownership nonce is taken FIRST, under the record
+  // lock: a record another pipeline already settled, or one a still-live
+  // worker is gating, refuses the claim and this worker runs NOTHING for it
+  // (no fact, no escalation, no demotion, no attestation). Only a dead
+  // owner's record is taken over, which is what orphan resumption is. The
+  // settle then lands only while the record still carries this token.
   const home = ctx.home || cfg.userConfigHome();
+  const ownerLive =
+    ctx.ownerLive ||
+    ((owner) => {
+      try {
+        return workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner);
+      } catch {
+        return false;
+      }
+    });
+  const claim = dispatchRuns.claimGateRecord(home, item.run_id, { workerId: ctx.workerId || null, ownerLive });
+  if (claim.refused) {
+    const rec = claim.record || null;
+    ctx.log(`work: the run record for ${item.node_id} (run ${String(item.run_id).slice(0, 8)}) is ${claim.refused} — this worker does not run the gate pipeline for it: no fact, escalation, demotion or attestation is written`);
+    return {
+      state: (rec && rec.gate_state) || "failed",
+      reason: `the gate pipeline was not run: the run record is ${claim.refused}`,
+      gates: [],
+      facts: [],
+      attestation: null,
+      superseded: true,
+      not_run: true,
+      settled: rec ? settledGateSummary(rec) : null,
+    };
+  }
+  const ownToken = claim.ok ? claim.token : null;
   const controller = completionKernel.isControllerRecord(record) && ctx.factory.completion && ctx.factory.completion.by === "controller";
   // The boundary is the CLAIM's (pinned at H1), never the factory node's
   // current text — an edit mid-pipeline changes nothing (§7.2).
@@ -16466,7 +16686,9 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     }
     if (stage.handoff) ctx.log(`work: ${entry.node_id} — implementation stage hands the run to the gates: ${stage.handoff}`);
   }
-  const gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: gateDeps });
+  let gateResult = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: gateDeps });
+  const gateFacts = [...(gateResult.facts || [])];
+  let intResult = null;
   // The SPLIT verdict of the gate list alone (task-spor-factory-controller-
   // completion-boundary, §6.5): `gates_state` says what the gates said, and
   // `integration_state` below what the integration stage said, so the
@@ -16483,10 +16705,69 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // the escalation the gate filed (§4.4).
   // The reporter leaves the heartbeat set when the pass returns: a completion
   // still owed is re-driven by reconcileCompletions under its own resume.
-  const leave = (r) => {
+  const leave = async (result) => {
     if (reporter) reporter.leave();
-    return r;
+    const gateAsStands = { ...gateResult, facts: gateFacts };
+  // SETTLE FIRST, ATTEST SECOND (review finding 5): the verdict is written to
+  // the run record — the durable, read-back-verified `gate_state` the resume
+  // scan and `spor runs` key on — BEFORE the attestation node exists, so no
+  // window has a graph artifact claiming a verdict the record does not yet
+  // hold (a worker dying in that window would leave evidence a resumed
+  // pipeline could later be pointed at). The loop's own settle stamp after
+  // this is a no-op against an already-settled verdict, by stampGateState's
+  // contract; the `--regate` path stamps with force and lands regardless.
+  //
+  // The evidence fields (gate_head/gate_base/trusted sha/factory digest/landed
+  // sha) ride IN the settle stamp — one write, one writer — and the settle
+  // reports whether it LANDED. When it did not (another pipeline for the same
+  // run — a duplicate adopter, a resumed orphan — settled first and the guard
+  // yielded to it), this pipeline's verdict is not the record's, so it writes
+  // NO attestation and touches NO evidence field (cross-model review, blocking
+  // finding 1): the graph and the record must describe one verdict at one
+  // head, and that is the winner's. The result still reports what this
+  // pipeline found (`superseded` says the record disagrees) so the loop's own
+  // bookkeeping stays honest.
+  const settled = settleRunRecord(home, item.run_id, result, ctx.workerId || null, { gateResult: gateAsStands, factory: ctx.factory, intResult, token: ownToken });
+  if (!settled.landed) {
+    ctx.log(
+      `work: the run record for ${item.node_id} (run ${String(item.run_id).slice(0, 8)}) was already settled${settled.record && settled.record.gate_state ? ` as '${settled.record.gate_state}'` : ""}${settled.record && settled.record.gate_worker ? ` by ${settled.record.gate_worker}` : ""} — this pipeline's '${result.state}' verdict is not recorded and no attestation is written for it`
+    );
+    const rec = settled.record || null;
+    return {
+      ...result,
+      attestation: null,
+      superseded: true,
+      // What the record DOES hold — the winner's verdict — so the loop's status
+      // surface publishes that, never this pipeline's losing head and verdict
+      // (cross-model review, major finding 4).
+      settled: rec ? settledGateSummary(rec) : null,
+    };
+  }
+  // ONE attestation per run (piece 4): the evidence chain over everything
+  // above, written as a graph artifact and stamped onto the run record
+  // (`gate_attestation`) through the settler's OWN door (`own: gate_at`), so
+  // it can never land on a record another writer settled. Fail-soft like
+  // every fact write — the verdict is the enforcement, the attestation is its
+  // record.
+  const { attestationObject, ...attested } = await writeRunAttestation(cfg, {
+    item, factory: ctx.factory, gateResult: gateAsStands, intResult, log: ctx.log, home, workerId: ctx.workerId || null, settleToken: settled.token,
+  });
+  // Propose mode: the PR body written at propose time predates the graph
+  // artifact it must be bound to (the artifact is minted only after the run
+  // settles, above), so the PR is refreshed with the final, digest-bound copy
+  // the graph holds — the copy a CI validate-attestation job compares against.
+  if (attested.attestation && attestationObject && intResult && intResult.state === "parked" && intResult.proposal && intResult.proposal.number && ctx.factory.integration && ctx.factory.integration.mode === "propose") {
+    const refreshed = await refreshProposalAttestation(cfg, {
+      item, factory: ctx.factory, intResult, attestationObject, home, log: ctx.log, settleToken: settled.token,
+      cwd: (record && record.cwd) || null, editBody: ctx.editProposalBody || editProposalBody,
+    });
+    attested.proposal_attestation_stale = !refreshed.ok;
+    if (!refreshed.ok) attested.proposal_attestation_error = String(refreshed.reason || "no response").slice(0, 300);
+  }
+  return { ...result, ...attested };
   };
+
+
   let completed = null;
   if (controller && boundary === "gates" && gateResult.state === "passed") {
     completed = await completionShell.writeCompletion({ record: freshRecord(home, record), deps: makeCompletionDeps(cfg, { home, runId: entry.run_id, execution: executionCompletionDeps(reporter) }), log: ctx.log, facts: gateResult.facts || [], boundary: "gates" });
@@ -16501,9 +16782,16 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   const intCtx = completed && completed.ok && (completed.settled === "written" || completed.settled === "consumed") ? { ...dctx, completedBeforeIntegration: true } : dctx;
   dispatchRuns.stampCompletionState(home, entry.run_id, { integration_state: "running" });
   if (reporter) await reporter.integrationStarted();
-  const intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, deps: makeIntegrationDeps(cfg, intCtx) });
+    const regate = async ({ head }) => {
+      const again = await gateRunner.runGatePipeline({ item, factory: ctx.factory, log: ctx.log, deps: makeGateDeps(cfg, dctx) });
+      for (const f of again.facts || []) if (!gateFacts.includes(f)) gateFacts.push(f);
+      gateResult = again;
+      if (again.state === "passed" && again.head !== head) ctx.log(`work: the re-gate of ${item.node_id} judged ${String(again.head || "an unknown head").slice(0, 12)}, not the moved head ${String(head).slice(0, 12)}`);
+      return again;
+    };
+  intResult = await integrationRunner.runIntegrationStage({ item, factory: ctx.factory, log: ctx.log, gatedHead: gateResult.head || null, deps: makeIntegrationDeps(cfg, { ...intCtx, gateResult: () => gateResult, regate }) });
   const intState = completionKernel.INTEGRATION_STATES.includes(intResult.state) ? intResult.state : intResult.state === "passed" ? "landed" : "failed";
-  const allFacts = [...(gateResult.facts || []), ...(intResult.facts || [])];
+  const allFacts = [...gateFacts, ...(intResult.facts || [])];
   dispatchRuns.stampCompletionState(home, entry.run_id, { integration_state: intState, ...(allFacts.length ? { completion_facts: allFacts } : {}) });
   // The store's integration verdict: landed and parked are its own words; a
   // failure or a refusal is `failed` (a fix cycle or a refusal follows).
@@ -16516,9 +16804,9 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     if (!written.ok) ctx.log(`work: ${entry.node_id} — the completion could not be written at the integration boundary (${written.reason}); the debt stands and the next pass retries it`);
   }
   if (intCtx.completedBeforeIntegration && intResult.state !== "passed" && intResult.state !== "parked") {
-    return leave({ ...intResult, gates: gateResult.gates, facts: allFacts, demoted: false, demote_reason: null, reason: `${intResult.reason || intResult.state} (the item was completed at the 'gates' boundary and stays completed; the landing is a person's to finish)` });
+    return leave({ ...intResult, gates: gateResult.gates, gate_head: gateResult.head || null, facts: allFacts, demoted: false, demote_reason: null, reason: `${intResult.reason || intResult.state} (the item was completed at the 'gates' boundary and stays completed; the landing is a person's to finish)` });
   }
-  return leave({ ...intResult, gates: gateResult.gates, facts: allFacts });
+  return leave({ ...intResult, gates: gateResult.gates, gate_head: gateResult.head || null, facts: allFacts });
 }
 
 // The run record as it reads NOW — the pipeline's captured copy predates every
@@ -16529,6 +16817,329 @@ function freshRecord(home, record) {
   } catch {
     return record;
   }
+}
+// The settled verdict, on the run record, in the same shape work-loop.js's
+// settleGates stamps it (one writer's fields, not two disagreeing ones), plus
+// the run's evidence fields when the pipeline's inputs are given. Returns
+// {landed, at, token, record}: `landed` is whether THIS stamp is the verdict
+// now on the file — false when the settled-verdict guard yielded to an earlier
+// writer (the record returned is theirs) or the write could not be made at
+// all. The stamp is a locked compare-and-swap (stampGateState) and what comes
+// back is the record READ FROM DISK after the write, so `landed` is a disk
+// fact, never this process's belief. `token` is the settler's ownership nonce
+// (`gate_settle_id`, random — two settlers in one millisecond cannot share it
+// the way they could share `gate_at`): every evidence field stamped after the
+// verdict goes through stampGateState's `own` door with it.
+function settleRunRecord(home, runId, res, workerId = null, { gateResult = null, factory = null, intResult = null, token: owned = null } = {}) {
+  const at = new Date().toISOString();
+  // The token claimGateRecord minted before the pipeline ran, when there was a
+  // record to own — the settle then goes through the `own` door and lands only
+  // while the record still carries it (a re-gate or another owner in between
+  // refuses it). With no record to own beforehand, a fresh nonce and the
+  // settled-verdict guard alone, as before.
+  const token = owned || crypto.randomBytes(12).toString("hex");
+  try {
+    const state = res && res.state ? res.state : "failed";
+    const reason = res && res.reason ? String(res.reason).slice(0, 300) : null;
+    const stamped = dispatchRuns.stampGateState(home, runId, {
+      gate_state: state,
+      gate_at: at,
+      gate_settle_id: token,
+      ...(workerId ? { gate_worker: workerId } : {}),
+      ...(reason ? { gate_reason: reason } : {}),
+      ...(res && res.escalated_to ? { gate_escalated_to: res.escalated_to, gate_escalation_ids: [res.escalated_to] } : {}),
+      ...(res && res.demoted != null ? { gate_demoted: !!res.demoted } : {}),
+      ...(gateResult
+        ? {
+            gate_head: gateResult.head || null,
+            gate_base: gateResult.base || null,
+            gate_trusted_sha: gateResult.trusted_sha || null,
+            gate_factory_digest: (factory && factory.definition && factory.definition.factory && factory.definition.factory.digest) || null,
+            ...(intResult && intResult.landed_sha ? { gate_landed_sha: intResult.landed_sha } : {}),
+          }
+        : {}),
+    }, owned ? { own: owned } : {});
+    const landed = !!stamped && stamped.gate_settle_id === token && stamped.gate_state === state;
+    return { landed, at, token, record: stamped || null };
+  } catch {
+    /* fail-soft: the loop's own settle stamp is the second writer */
+    return { landed: false, at, token, record: null };
+  }
+}
+
+// What the run record holds of a settled pipeline, for the loop's `--status`
+// surface — INCLUDING the attestation's own failure stamps (a promised
+// attestation that is missing, a parked PR whose body is stale), so the
+// status a person reads never shows a clean verdict over an evidence chain
+// with a hole in it (cross-model review, minor finding 8).
+function settledGateSummary(rec) {
+  return {
+    state: rec.gate_state || null,
+    reason: rec.gate_reason || null,
+    head: rec.gate_head || null,
+    attestation: rec.gate_attestation || null,
+    attestation_missing: rec.gate_attestation_missing === true,
+    attestation_error: rec.gate_attestation_error || null,
+    proposal_attestation_stale: rec.gate_proposal_attestation_stale === true,
+    proposal_attestation_error: rec.gate_proposal_attestation_error || null,
+    worker: rec.gate_worker || null,
+    at: rec.gate_at || null,
+  };
+}
+
+// The HMAC key the pipeline signs each attestation with, from the config
+// cascade (`attestation.signingKey` / SPOR_ATTESTATION_KEY — never a repo
+// `.spor.json`, lib/config.js REPO_FORBIDDEN_PATHS). No key = digest-only
+// binding through the graph artifact.
+function attestationSigning(cfg) {
+  let key = null;
+  let keyId = null;
+  try {
+    key = cfg.get("attestation.signingKey", null) || null;
+    keyId = cfg.get("attestation.keyId", null) || null;
+  } catch {
+    /* no config — unsigned */
+  }
+  return key ? { key: String(key), keyId: keyId ? String(keyId) : "default" } : null;
+}
+
+// Refresh a parked proposal's PR body with the run's FINAL attestation — the
+// digest-bound copy of the graph artifact, the thing a CI validate-attestation
+// job is told to compare against. Not best-effort: a refresh that fails leaves
+// the PR carrying the propose-time (pre-artifact, unbound) copy, so the failure
+// is logged loudly and stamped on the run record (`gate_proposal_attestation_
+// stale`), where `spor runs`/`--status` surface it; a validator comparing the
+// PR body to the graph artifact fails closed on the digest mismatch anyway.
+async function refreshProposalAttestation(cfg, { item, factory, intResult, attestationObject, home, log = () => {}, settleToken, cwd = null, editBody = editProposalBody }) {
+  const proposal = intResult.proposal;
+  let edited;
+  try {
+    const base = integrationRunner.splitRemoteRef(factory.integration.targetRef).branch;
+    const body = attestation.renderPrBody({ attestation: attestationObject, branch: proposal.branch || "HEAD", base });
+    edited = await editBody({ top: cwd, repo: proposal.repo, number: proposal.number, body });
+  } catch (e) {
+    edited = { ok: false, reason: (e && e.message) || String(e) };
+  }
+  const ok = !!(edited && edited.ok);
+  if (ok) log(`work: PR #${proposal.number} now carries the bound attestation ${attestationObject.id} for ${item.node_id}`);
+  else log(`work: PR #${proposal.number} for ${item.node_id} could NOT be refreshed with the bound attestation ${attestationObject.id} (${(edited && edited.reason) || "no response"}) — its body still carries the propose-time copy, which a validator will refuse against the graph artifact`);
+  try {
+    dispatchRuns.stampGateState(
+      home,
+      item.run_id,
+      { gate_proposal_attestation: attestationObject.id, gate_proposal_attestation_stale: !ok, ...(ok ? {} : { gate_proposal_attestation_error: String((edited && edited.reason) || "no response").slice(0, 300) }) },
+      { own: settleToken }
+    );
+  } catch {
+    /* fail-soft: the log line above is the record of it */
+  }
+  return { ok, reason: ok ? null : (edited && edited.reason) || "no response" };
+}
+
+// What the attestation says about where it was produced. `spor_version` is the
+// package's; the rest is the box, so two attestations for one commit from two
+// workers stay distinguishable.
+function attestationEnvironment(cfg, workerId = null) {
+  let version = null;
+  try {
+    version = require(path.join(ROOT, "package.json")).version || null;
+  } catch {
+    /* an unreadable package.json is not worth failing an attestation over */
+  }
+  let mode = null;
+  try {
+    mode = cfg.mode();
+  } catch {
+    /* unknown */
+  }
+  return { spor_version: version, worker: workerId || null, host: os.hostname(), platform: `${process.platform}-${process.arch}`, node: process.version, mode };
+}
+
+// Build, write, and stamp the run's attestation. Returns `{attestation,
+// attestationObject}` — the node id (null when it could not be recorded) and
+// the bound object itself — for the gate result to carry onward; never throws.
+// `settleToken` is the settler's own `gate_settle_id`: the `gate_attestation`
+// stamp goes through stampGateState's `own` door, so it lands only while the
+// record still holds THIS pipeline's verdict — never force, which would let a
+// pipeline that lost the settle race overwrite the winner's evidence.
+async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, log = () => {}, home = null, workerId = null, settleToken = null }) {
+  // `attestation_missing`/`attestation_error` ride on the result the loop
+  // publishes (`--status`), the same fields the run record is stamped with —
+  // a missing attestation is part of the verdict's evidence, not a log line
+  // (cross-model review, minor finding 8).
+  const out = { attestation: null, attestationObject: null, attestation_missing: false, attestation_error: null };
+  const missing = (reason) => {
+    out.attestation_missing = true;
+    out.attestation_error = String(reason || "unknown").slice(0, 300);
+    stampAttestationMissing(cfg, { item, home, settleToken, reason });
+    return out;
+  };
+  let built = null;
+  try {
+    built = attestation.buildAttestationNode({ item, factory, gate: gateResult, integration: intResult, environment: attestationEnvironment(cfg, workerId), signing: attestationSigning(cfg) });
+    out.attestationObject = built.attestation;
+  } catch (e) {
+    const reason = `could not be built: ${(e && e.message) || e}`;
+    log(`work: the attestation for ${item.node_id} ${reason} — the verdict still stands, and the record says the attestation is MISSING`);
+    return missing(reason);
+  }
+  try {
+    const wrote = await writeGateNode(cfg, built.id, built.markdown);
+    if (wrote && wrote.ok) out.attestation = built.id;
+    else log(`work: the attestation for ${item.node_id} could not be recorded on the graph (${(wrote && wrote.reason) || "no response"}) — the verdict still stands`);
+  } catch (e) {
+    log(`work: the attestation for ${item.node_id} could not be recorded on the graph (${(e && e.message) || e}) — the verdict still stands`);
+  }
+  if (!out.attestation) return missing("could not be recorded on the graph");
+  try {
+    const stamped = dispatchRuns.stampGateState(home || cfg.userConfigHome(), item.run_id, { gate_attestation: out.attestation }, settleToken ? { own: settleToken } : {});
+    if (!stamped || stamped.gate_attestation !== out.attestation) log(`work: the run record for ${item.node_id} no longer holds this pipeline's verdict — attestation ${out.attestation} is on the graph but not stamped on the record`);
+  } catch {
+    /* fail-soft: the run record is bookkeeping, the attestation node is the record */
+  }
+  return out;
+}
+
+// A run that promised an attestation and has none says so ON THE RECORD
+// (`gate_attestation_missing` + the reason), through the settler's own door —
+// a log line alone is exactly the silent loss the review refused (cross-model
+// review, major finding 3). `spor runs` and `--status` read the field.
+function stampAttestationMissing(cfg, { item, home, settleToken, reason }) {
+  try {
+    dispatchRuns.stampGateState(home || cfg.userConfigHome(), item.run_id, { gate_attestation: null, gate_attestation_missing: true, gate_attestation_error: String(reason || "unknown").slice(0, 300) }, settleToken ? { own: settleToken } : {});
+  } catch {
+    /* the log line above is the last record of it */
+  }
+}
+
+// `spor attestation verify` — the validator's half of the evidence chain
+// (task-spor-factory-gate-attestation, piece 4): what a repo's CI runs against
+// a propose-mode PR instead of re-running the suite. Reads an attestation from
+// a PR body (between the spor-attestation markers), a JSON file, or stdin;
+// then, by default, fetches the graph artifact it names (`art-attest-*`, the
+// runner's own write — a store the PR author does not write through) and
+// requires the two digests to agree; verifies the HMAC signature when this box
+// holds the key (`attestation.signingKey` / SPOR_ATTESTATION_KEY); and checks
+// the caller's commit/freshness/factory-digest expectations. Every check is
+// fail-closed (lib/shell/attestation.js verifyAttestation); exit 1 on any
+// failure, so a CI job can gate on the exit code alone.
+async function cmdAttestation(cfg, args) {
+  const usage = "usage: spor attestation verify (--pr-body <file>|--file <file>|-) [--commit <sha>] [--target <sha>] [--target-ref <ref>] [--max-age <ms|1h|24h>] [--factory-digest <sha256:…>|--factory <id>] [--key-id <id>] [--require-signature] [--no-graph] [--json]";
+  if (args[0] !== "verify") {
+    err(usage);
+    return 1;
+  }
+  const json = args.includes("--json");
+  const prBodyPath = optVal(args, "pr-body");
+  const filePath = optVal(args, "file");
+  const fromStdin = args.includes("-");
+  if (!prBodyPath && !filePath && !fromStdin) {
+    err(usage);
+    return 1;
+  }
+  let text;
+  try {
+    text = fromStdin && !prBodyPath && !filePath ? fs.readFileSync(0, "utf8") : fs.readFileSync(prBodyPath || filePath, "utf8");
+  } catch (e) {
+    err(`could not read ${prBodyPath || filePath || "stdin"}: ${(e && e.message) || e}`);
+    return 1;
+  }
+  // A PR body carries the JSON between markers; a bare file/stdin is the JSON
+  // itself — or a PR body, if the markers are there.
+  let att = null;
+  if (text.includes(attestation.PR_BEGIN)) att = attestation.extractPrAttestation(text);
+  else {
+    try {
+      att = JSON.parse(text);
+    } catch {
+      att = null;
+    }
+  }
+  const finish = (result) => {
+    if (json) out(JSON.stringify(result, null, 2));
+    else {
+      for (const c of result.checks) out(`${c.ok ? "ok  " : "FAIL"}  ${c.check.padEnd(9)} ${c.detail}`);
+      out(result.ok ? `attestation ${result.id || ""} verified` : `attestation ${result.id || ""} REFUSED — ${result.reason}`);
+    }
+    return result.ok ? 0 : 1;
+  };
+  if (!att) return finish({ ok: false, id: null, checks: [{ check: "schema", ok: false, detail: `no ${attestation.SCHEMA} attestation could be read from ${prBodyPath || filePath || "stdin"}` }], reason: "unreadable attestation" });
+
+  const maxAgeRaw = optVal(args, "max-age");
+  const maxAgeMs = maxAgeRaw != null ? parseDurationMs(maxAgeRaw) : null;
+  if (maxAgeRaw != null && maxAgeMs == null) {
+    err(`--max-age: '${maxAgeRaw}' is not a duration (ms, or 30s/10m/24h/7d)`);
+    return 1;
+  }
+  const commit = optVal(args, "commit");
+  const target = optVal(args, "target");
+  const targetRef = optVal(args, "target-ref");
+  let factoryDigest = optVal(args, "factory-digest");
+  const extra = [];
+  // `--factory <id>`: recompute the digest from the factory AS IT STANDS on
+  // the graph (the definition a validator must compare against), through the
+  // same loader the worker uses, so the two can never disagree on shape.
+  const factoryId = optVal(args, "factory");
+  if (factoryId && !factoryDigest) {
+    const loaded = await loadFactoryDefinition(cfg, factoryId);
+    if (!loaded.factory) extra.push({ check: "config", ok: false, detail: `the factory '${factoryId}' could not be loaded to compare against: ${loaded.errors.join("; ")}` });
+    else factoryDigest = loaded.factory.definition && loaded.factory.definition.factory && loaded.factory.definition.factory.digest;
+  }
+  // The trusted copy: the graph artifact the attestation names.
+  let trusted = null;
+  let trustedProvenance = null;
+  const noGraph = args.includes("--no-graph");
+  if (!noGraph) {
+    const id = att.id;
+    if (!id || !/^art-attest-/.test(String(id))) extra.push({ check: "trusted", ok: false, detail: `the attestation names no art-attest-* graph artifact (id: ${id || "none"})` });
+    else {
+      let node = null;
+      try {
+        node = await resolveNode(cfg, id);
+      } catch {
+        node = null;
+      }
+      const raw = node && node.raw;
+      const m = raw ? /```json\n([\s\S]*?)\n```/.exec(raw) : null;
+      if (!raw) extra.push({ check: "trusted", ok: false, detail: `the graph artifact ${id} could not be read (${cfg.mode()} mode) — pass --no-graph to skip the graph binding deliberately` });
+      else if (!m) extra.push({ check: "trusted", ok: false, detail: `the graph artifact ${id} carries no attestation JSON` });
+      else {
+        try {
+          trusted = JSON.parse(m[1]);
+          // The node's server-stamped authorship is what makes the graph copy
+          // an anchor (attestation.js verifyAttestation `anchor`): only a
+          // remote-mode node not written by an agent counts without a key.
+          trustedProvenance = { mode: cfg.mode(), author: node.author, authored_by_agent: node.authored_by_agent, authored_via: node.authored_via };
+        } catch {
+          extra.push({ check: "trusted", ok: false, detail: `the graph artifact ${id}'s attestation JSON does not parse` });
+        }
+      }
+    }
+  }
+  const signing = attestationSigning(cfg);
+  const keyId = optVal(args, "key-id") || null;
+  // `--no-graph` drops the runner-written artifact, which leaves the HMAC
+  // signature as the ONLY anchor a PR author does not control — so it implies
+  // `--require-signature`, and with no key on this box there is nothing to
+  // verify against: refused, never passed on the self-authored digest
+  // (cross-model review, blocking finding 1).
+  if (noGraph && !signing) extra.push({ check: "signature", ok: false, detail: "--no-graph drops the graph anchor, so a verification key is required (attestation.signingKey / SPOR_ATTESTATION_KEY) — none is configured on this box" });
+  const result = attestation.verifyAttestation(att, {
+    key: signing ? signing.key : null,
+    keyId,
+    maxAgeMs,
+    commit: commit || null,
+    target: target || null,
+    targetRef: targetRef || null,
+    factoryDigest: factoryDigest || null,
+    trusted,
+    trustedProvenance,
+    requireSignature: args.includes("--require-signature") || (noGraph && !!signing),
+    requireTrusted: !noGraph && !trusted && !extra.some((c) => c.check === "trusted"),
+  });
+  const checks = [...result.checks, ...extra];
+  const failed = checks.filter((c) => !c.ok);
+  return finish({ ok: failed.length === 0, id: att.id || null, checks, reason: failed.length ? failed.map((c) => `${c.check}: ${c.detail}`).join("; ") : null });
 }
 
 // task-spor-integration-propose-mode: the LATER half of propose mode's
@@ -17025,7 +17636,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   const escalatedBefore = [...new Set([...(Array.isArray(record.gate_escalation_ids) ? record.gate_escalation_ids : []), record.gate_escalated_to].filter(Boolean))];
   out(`work: re-gating ${record.node_id} — run ${shortId}, attempt ${attempt}, under ${factoryId} (previously ${previous})`);
   const stamp = (patch) => dispatchRuns.stampGateState(home, record.run_id, patch, { force: true });
-  stamp({ gate_state: "running", gate_at: new Date().toISOString(), gate_worker: null, gate_regate_count: attempt - 1, gate_regated_at: new Date().toISOString() });
+  stamp({ gate_state: "running", gate_at: new Date().toISOString(), gate_settle_id: null, gate_worker: null, gate_regate_count: attempt - 1, gate_regated_at: new Date().toISOString() });
   // A re-gate re-opens a controller record's completion: a refusal's
   // `consumed` stamp (reconcileCompletions) must not hide a completion this
   // attempt may now write and then owe.
@@ -20550,6 +21161,55 @@ const COMMANDS = {
     examples: ["spor executions", "spor executions --node task-x", "spor executions exec-4da6d4763543a301 --events"],
     run: (cfg, p) => cmdExecutions(cfg, p),
   },
+  attestation: {
+    group: "Dispatch (background agents)", parse: "raw",
+    args: "verify (--pr-body <file>|--file <file>|-) [--commit <sha>] [--target <sha>] [--target-ref <ref>] [--max-age <dur>] [--factory <id>|--factory-digest <sha256:…>] [--key-id <id>] [--require-signature] [--no-graph] [--json]",
+    summary: "validate a gate-pipeline attestation (PR body or JSON) against the graph, a key, a commit",
+    help:
+      "The validator's half of the factory gate pipeline's evidence chain\n" +
+      "(task-spor-factory-gate-attestation): what a PR-policy repo's CI runs on a\n" +
+      "`propose`-mode pull request INSTEAD of re-running the whole suite.\n\n" +
+      "The attestation is read from the PR body (the JSON between the\n" +
+      "<!-- spor-attestation:begin/end --> markers), a JSON file, or stdin. PR text\n" +
+      "is not evidence by itself — anyone who can edit the PR can edit it — so the\n" +
+      "checks bind it to what the runner itself wrote:\n\n" +
+      "  trusted    the graph artifact it names (art-attest-*, written by the runner,\n" +
+      "             never by a PR author) is fetched, its `digest` must equal this\n" +
+      "             copy's, and it must be an attestation in its own right (its\n" +
+      "             digest recomputes; under a key its signature verifies) (skip\n" +
+      "             ONLY deliberately, with --no-graph — which then REQUIRES a\n" +
+      "             verified signature: no key on this box, no pass)\n" +
+      "  anchor     without a key, the graph copy anchors only when the server\n" +
+      "             stamped it as written by a PERSON in remote mode — a node an\n" +
+      "             agent wrote (a dispatched implementer has graph-write authority),\n" +
+      "             a local-mode graph, or unknown provenance is no anchor\n" +
+      "  digest     the copy's `digest` matches a recomputation over its own core\n" +
+      "  signature  when this box holds the key (attestation.signingKey /\n" +
+      "             SPOR_ATTESTATION_KEY), the HMAC-SHA256 signature must verify;\n" +
+      "             --require-signature refuses an unsigned attestation outright\n" +
+      "  passed     `passed` is true\n" +
+      "  verdicts   the evidence beneath it agrees: gate.allPassed, every listed step\n" +
+      "             passed AT the subject commit, the stage's head is the gated head,\n" +
+      "             and the candidate suite passed — a `passed` over failed evidence\n" +
+      "             is refused whatever bound it\n" +
+      "  commit     --commit <sha>: `subject.commit` equals it (the PR head)\n" +
+      "  target     --target <sha>: the target tip the candidate was merged with\n" +
+      "             (integration.candidate.base) equals it — the PR base's CURRENT\n" +
+      "             tip, so an attestation goes stale when the target advances and\n" +
+      "             cannot be reused against another base; --target-ref <ref> checks\n" +
+      "             the stage's target_ref names that ref\n" +
+      "  fresh      --max-age <dur>: `issued_at` is within it (ms, 30s, 24h, 7d)\n" +
+      "  config     --factory <id> recomputes the factory's digest AS IT STANDS on the\n" +
+      "             graph (same loader the worker uses) — or --factory-digest gives it\n" +
+      "             — and `configIntegrity.factory.digest` must equal it\n\n" +
+      "Every check is fail-closed; exit 1 on any failure, 0 only when all pass.\n" +
+      "--json prints {ok, id, checks[], reason}.",
+    examples: [
+      "gh pr view 42 --json body -q .body > pr.md && spor attestation verify --pr-body pr.md --commit $(git rev-parse HEAD) --target $(git rev-parse origin/main) --target-ref main --max-age 24h --factory factory-spor",
+      "spor attestation verify --file att.json --no-graph --require-signature",
+    ],
+    run: (cfg, args) => cmdAttestation(cfg, args),
+  },
   runs: {
     group: "Dispatch (background agents)", parse: "strict", args: "[<run-id>]",
     summary: "what happened to the runs this machine dispatched",
@@ -20936,7 +21596,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS };
+module.exports = { dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning };
 
 if (require.main === module) {
   main()

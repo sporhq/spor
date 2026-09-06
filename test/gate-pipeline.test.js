@@ -67,7 +67,7 @@ function fakes({ changed = ["lib/x.js"], changedSeq = null, suite = () => ({ ok:
     changedPaths: async () => {
       seen.reads += 1;
       if (changedSeq) return changedSeq[Math.min(seen.reads - 1, changedSeq.length - 1)];
-      return changed === null ? { ok: false, reason: "unreadable tree" } : { ok: true, paths: changed };
+      return changed === null ? { ok: false, reason: "unreadable tree" } : { ok: true, paths: changed, head: "headsha0000000000000000000000000000000001", base: "basesha0000000000000000000000000000000002", trustedRef: "main", trustedSha: "trustsha000000000000000000000000000000003", branch: "task-demo" };
     },
     runSuite: async (args) => {
       seen.suites.push(args.gate.id);
@@ -163,6 +163,39 @@ test("a passing pipeline runs its gates IN ORDER and records a graph fact for ea
   }
   assert.strictEqual(new Set(seen.facts.map((f) => f.id)).size, 3, "one distinct fact per gate");
   assert.strictEqual(seen.human.length, 0, "an unarmed human gate files nothing");
+
+  // task-spor-factory-gate-attestation: every fact is commit-bound and
+  // definition-bound, and the pipeline hands the chain back for the run record.
+  for (const f of seen.facts) {
+    assert.match(f.markdown, /^gate_head: headsha0000000000000000000000000000000001$/m, "the fact names the head it judged");
+    assert.match(f.markdown, /^gate_base: basesha0000000000000000000000000000000002$/m);
+    assert.match(f.markdown, /trusted ref `main` at `trustsha000000000000000000000000000000003`/);
+    assert.match(f.markdown, /on branch `task-demo`/);
+    assert.match(f.markdown, new RegExp(`Definition: factory \\\`factory-test\\\` digest \\\`${factory.definition.factory.digest}\\\``), "the fact names the definition that judged it");
+  }
+  assert.match(seen.facts[0].markdown, new RegExp(`gate \\\`acceptance\\\` digest \\\`${factory.definition.gates[0].digest}\\\``));
+  assert.strictEqual(res.head, "headsha0000000000000000000000000000000001");
+  assert.strictEqual(res.base, "basesha0000000000000000000000000000000002");
+  assert.strictEqual(res.trusted_ref, "main");
+  assert.strictEqual(res.trusted_sha, "trustsha000000000000000000000000000000003");
+  assert.strictEqual(res.branch, "task-demo");
+  assert.strictEqual(res.definition.factory.digest, factory.definition.factory.digest);
+  for (const g of res.gates) {
+    assert.strictEqual(g.head, "headsha0000000000000000000000000000000001", "each step records the head it judged");
+    assert.match(g.digest, /^sha256:/);
+    assert.match(g.started_at, /^\d{4}-\d{2}-\d{2}T/);
+    assert.ok(g.duration_ms >= 0);
+  }
+});
+
+test("a fact for an UNREADABLE change says so rather than inventing a head, and the chain reads null", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }] });
+  const { deps, seen } = fakes({ changed: null });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(res.head, null);
+  assert.doesNotMatch(seen.facts[0].markdown, /^gate_head:/m);
+  assert.match(seen.facts[0].markdown, /Judged commit: unknown/);
 });
 
 test("a REFERENCED shareable gate node runs exactly like the same gate written inline", async () => {
@@ -1107,6 +1140,12 @@ test("gateChangeSet reads the committed change against the trusted ref, and refu
   assert.strictEqual(change.ok, true, change.reason);
   assert.deepStrictEqual(change.paths.sort(), ["lib/add.js", "test/acceptance.js"]);
   assert.strictEqual(change.head, git(dir, "rev-parse", "HEAD").trim());
+  // The evidence chain (task-spor-factory-gate-attestation): the trusted ref's
+  // own tip and the branch name ride along with the merge-base.
+  assert.strictEqual(change.trustedRef, "main");
+  assert.strictEqual(change.trustedSha, git(dir, "rev-parse", "main").trim());
+  assert.strictEqual(change.branch, git(dir, "rev-parse", "--abbrev-ref", "HEAD").trim());
+  assert.notStrictEqual(change.branch, "HEAD");
 
   fs.writeFileSync(path.join(dir, "lib", "add.js"), "module.exports = () => 0;\n");
   const dirty = gateRunner.gateChangeSet({ cwd: dir }, "main");
@@ -7342,4 +7381,513 @@ test("real doors: runGateAndIntegration runs the implementation stage before any
   const again = await sporCli.runGateAndIntegration(cfg, entry, JSON.parse(fs.readFileSync(dispatchRunsLib.runPaths(home, runId).record, "utf8")), { factory, slug: "demo", passthrough: {}, warn: () => {}, runMaxMs: 1000, home, log: () => {}, stopping: () => false, sleep: async () => {} });
   assert.strictEqual(again.escalated_to, res.escalated_to);
   assert.strictEqual(fs.readdirSync(nodes).filter((f) => f.startsWith("task-impl-")).length, 1, "one escalation, however many times the settled stage is re-entered");
+});
+
+// ------------------------------------------------ head consistency across fix cycles --
+// (task-spor-factory-gate-attestation, review findings 1, 3 and 6)
+
+// Gate A passes at H1; gate B's fix cycle commits H2 and B passes there. A
+// never judged H2 — so the pipeline goes back to A, re-runs it at H2, and the
+// result's every step binds to the SAME head. The H1 fact stays on the graph
+// (a record of what was judged), under a different id than the H2 fact.
+test("a fix cycle that moves the head sends the pipeline back to the first gate, and every step then binds to the moved head", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test" }, { id: "review", kind: "agent-review", profile: "profile-review", cycles: 2 }] });
+  const H1 = "head1000000000000000000000000000000000001";
+  const H2 = "head2000000000000000000000000000000000002";
+  let head = H1;
+  let call = 0;
+  const { deps, seen } = fakes({
+    review: () => {
+      call += 1;
+      return { ok: true, text: call === 1 ? '```json\n{"verdict":"changes_requested","findings":[{"summary":"x","severity":"blocking","file":"lib/x.js","evidence":"deterministic failure"}]}\n```' : '```json\n{"verdict":"pass"}\n```' };
+    },
+    fix: () => {
+      head = H2; // the fix cycle committed
+      return { ok: true };
+    },
+  });
+  deps.changedPaths = async () => ({ ok: true, paths: ["lib/x.js"], head, base: "basesha", trustedRef: "main", trustedSha: "trustsha", branch: "task-demo" });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed", res.reason);
+  assert.strictEqual(res.head, H2);
+  assert.deepStrictEqual(res.gates.map((g) => [g.gate, g.verdict, g.head]), [["acceptance", "passed", H2], ["review", "passed", H2]], "every step in the result judged the moved head");
+  assert.strictEqual(seen.suites.length, 2, "the acceptance suite ran again at the moved head");
+  assert.strictEqual(seen.reviews.length, 2, "the review that already passed at H2 was NOT re-dispatched");
+  assert.strictEqual(seen.fixes.length, 1);
+  // Three facts: acceptance@H1, review@H2, acceptance@H2 — distinct ids.
+  assert.strictEqual(seen.facts.length, 3);
+  assert.strictEqual(new Set(seen.facts.map((f) => f.id)).size, 3, "the re-run's fact does not collide with the H1 fact's id");
+  assert.strictEqual(seen.facts.filter((f) => /gate_head: head1/.test(f.markdown)).length, 1);
+  assert.strictEqual(seen.facts.filter((f) => /gate_head: head2/.test(f.markdown)).length, 2);
+  assert.strictEqual(res.facts.length, 3, "the pipeline hands back every fact it minted, the superseded one included");
+  assert.strictEqual(gateRunner.gateFactId("acceptance", "task-demo", "run-abcdef12", 0, 0, H1) !== gateRunner.gateFactId("acceptance", "task-demo", "run-abcdef12", 0, 0, H2), true);
+});
+
+// Cross-model review, major finding 4: a change read that FAILS after a fix
+// cycle must not leave the pre-fix head standing as the judged commit — the
+// tree moved and nobody could read where to. The fact and the chain say
+// "unknown", and nothing is recorded as judged at the stale head.
+test("a change read that fails AFTER a fix cycle reports the judged commit as unknown, never the pre-fix head", async () => {
+  const H1 = "head1000000000000000000000000000000000001";
+  const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", cycles: 1 }] });
+  let reads = 0;
+  const { deps, seen } = fakes({
+    suite: () => ({ ok: false, reason: "1 failing" }),
+    fix: () => ({ ok: true }),
+  });
+  deps.changedPaths = async () => {
+    reads += 1;
+    if (reads === 1) return { ok: true, paths: ["lib/x.js"], head: H1, base: "basesha", trustedRef: "main", trustedSha: "trustsha", branch: "task-demo" };
+    return { ok: false, reason: "git diff exited 128 after the fix cycle" };
+  };
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.strictEqual(reads, 2, "the change was re-read after the fix cycle");
+  assert.strictEqual(res.head, null, "the chain does not carry the pre-fix head");
+  assert.strictEqual(res.base, null);
+  assert.strictEqual(res.branch, null);
+  assert.match(res.reason, /exited 128 after the fix cycle/);
+  const last = seen.facts[seen.facts.length - 1];
+  assert.match(last.markdown, /Judged commit: unknown/);
+  assert.doesNotMatch(last.markdown, /gate_head: head1/, "the escalating fact does not name the stale head as what it judged");
+  assert.strictEqual(seen.escalations.length, 1);
+});
+
+// The restart is bounded: fix cycles are charged against each gate's cap
+// CUMULATIVELY, so a gate that keeps failing after a restart escalates at its
+// declared cap rather than getting a fresh budget every time the head moves.
+test("fix cycles are charged cumulatively across restarts — a restarted gate does not get a fresh budget", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 1 }, { id: "second", kind: "agent-review", profile: "profile-review", cycles: 1 }] });
+  let n = 0;
+  let head = "head-a";
+  const { deps, seen } = fakes({
+    // review#1 changes_requested -> fix (head moves) -> review#2 pass; then
+    // `second` fails -> fix (head moves) -> pass; restart: review at the
+    // third head fails again — its ONE cycle is spent, so it escalates.
+    review: ({ gate }) => {
+      n += 1;
+      const pass = '```json\n{"verdict":"pass"}\n```';
+      const fail = '```json\n{"verdict":"changes_requested","findings":[{"summary":"x","severity":"blocking","file":"lib/x.js","evidence":"deterministic failure"}]}\n```';
+      if (gate.id === "review") return { ok: true, text: n === 2 ? pass : fail };
+      return { ok: true, text: n === 3 ? fail : pass };
+    },
+    fix: () => {
+      head = `${head}+`;
+      return { ok: true };
+    },
+  });
+  deps.changedPaths = async () => ({ ok: true, paths: ["lib/x.js"], head, base: "b", trustedRef: "main", trustedSha: "t", branch: "task-demo" });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "failed");
+  assert.match(res.reason, /gate 'review' failed/);
+  assert.strictEqual(seen.fixes.filter((f) => f.gate === "review").length, 1, "review's single cycle was spent before the restart and not replenished by it");
+  assert.strictEqual(seen.escalations.length, 1);
+});
+
+// A review gate with nothing readable to review is a failure like the command
+// and human gates already were — never a passing fact with no head.
+test("an unconditional review keeps current arming policy when diff is unreadable, and its evidence has no invented head", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "review", kind: "agent-review", profile: "profile-review", cycles: 2 }] });
+  const { deps, seen } = fakes({ changed: null });
+  const res = await gateRunner.runGatePipeline({ item: ITEM, factory, deps });
+  assert.strictEqual(res.state, "passed");
+  assert.strictEqual(seen.reviews.length, 1);
+  assert.strictEqual(res.head, null);
+  assert.strictEqual(res.gates[0].head, null);
+  assert.match(seen.facts[0].markdown, /Judged commit: unknown/);
+});
+
+// The status surface must say what the run record says: with an integration
+// stage folded in, the result's `head` is the stage's re-read head and the
+// gated head rides as `gate_head`.
+test("work --status records the GATED head, not the integration stage's head, when both are present", async () => {
+  const { deps, control } = loopHarness({
+    queue: [{ id: "task-a" }],
+    gate: () => ({ state: "passed", reason: "landed", head: "integration-head", gate_head: "gated-head", facts: [] }),
+  });
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, max: 1 }, deps, control });
+  assert.strictEqual(status.recent[0].gate, "passed");
+  assert.strictEqual(status.recent[0].gate_head, "gated-head");
+  const { deps: d2, control: c2 } = loopHarness({ queue: [{ id: "task-b" }], gate: () => ({ state: "passed", reason: "ok", head: "only-head", facts: [] }) });
+  const s2 = await workLoop.runWorkLoop({ opts: { workerId: "w", concurrency: 1, intervalMs: 1000, max: 1 }, deps: d2, control: c2 });
+  assert.strictEqual(s2.recent[0].gate_head, "only-head", "with no stage, the pipeline's own head is the gated head");
+});
+
+// -- blocking finding 2 (cross-model review): settlement is a locked
+// compare-and-swap. Two pipelines for one run cannot both pass the
+// unsettled guard, and what a stamp returns is the record ON DISK after its
+// write — so "did my verdict land" is a disk fact, never a process's belief.
+test("stampGateState is a locked CAS: a held lock refuses the stamp, a stale lock is broken, and two settlers cannot both own the record", () => {
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-cas-"));
+  const runId = "11111111-2222-3333-4444-00000000cas0";
+  const paths = dispatchRuns.runPaths(home, runId);
+  const base = { run_id: runId, node_id: "task-x", state: "done", terminal_state: "resolved", terminal_enforced: true, gate_state: "running" };
+  dispatchRuns.atomicJson(paths.record, base);
+  const lock = dispatchRuns.recordLockPath(paths.record);
+
+  // Held by a LIVE writer: the stamp does not land and reports so (null).
+  fs.writeFileSync(lock, "4242\n");
+  assert.strictEqual(dispatchRuns.stampGateState(home, runId, { gate_state: "passed", gate_at: "t1" }, { lock: (file, fn, o) => dispatchRuns.withRecordLock(file, fn, { ...o, attempts: 3, waitMs: 1 }) }), null);
+  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_state, "running", "the record is untouched under a held lock");
+  assert.ok(fs.existsSync(lock), "and the holder's lock is left alone");
+
+  // A corpse — a lock older than the stale window — is broken and the stamp lands.
+  const old = new Date(Date.now() - dispatchRuns.RECORD_LOCK_STALE_MS - 5000);
+  fs.utimesSync(lock, old, old);
+  const landed = dispatchRuns.stampGateState(home, runId, { gate_state: "passed", gate_at: "t1", gate_settle_id: "tok-A" });
+  assert.strictEqual(landed.gate_state, "passed");
+  assert.strictEqual(landed.gate_settle_id, "tok-A");
+  assert.ok(!fs.existsSync(lock), "the lock is released after the stamp");
+
+  // A second settler for the same run: the guard yields and it gets the
+  // WINNER's record back — settle id and all — so it can tell it lost.
+  const lost = dispatchRuns.stampGateState(home, runId, { gate_state: "failed", gate_at: "t2", gate_settle_id: "tok-B" });
+  assert.strictEqual(lost.gate_settle_id, "tok-A");
+  assert.strictEqual(lost.gate_state, "passed");
+  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_settle_id, "tok-A");
+
+  // The `own` door keys on the settle id when the record has one: the
+  // loser's `gate_at` — even an identical timestamp — is not ownership.
+  dispatchRuns.atomicJson(paths.record, { ...base, gate_state: "passed", gate_at: "same-ms", gate_settle_id: "tok-A" });
+  const byAt = dispatchRuns.stampGateState(home, runId, { gate_attestation: "art-attest-loser" }, { own: "same-ms" });
+  assert.strictEqual(byAt.gate_attestation, undefined, "gate_at alone does not open the door on a record that carries a settle id");
+  const byToken = dispatchRuns.stampGateState(home, runId, { gate_attestation: "art-attest-winner" }, { own: "tok-A" });
+  assert.strictEqual(byToken.gate_attestation, "art-attest-winner");
+  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_attestation, "art-attest-winner");
+
+  // Every stamp inside the lock reads and writes under it — a writer that
+  // sees the lock taken waits for it rather than interleaving.
+  dispatchRuns.atomicJson(paths.record, base);
+  let order = [];
+  const held = dispatchRuns.withRecordLock(paths.record, () => {
+    order.push("first-in");
+    const r = dispatchRuns.stampGateState(home, runId, { gate_state: "blocked", gate_settle_id: "tok-C" }, { lock: (file, fn, o) => dispatchRuns.withRecordLock(file, fn, { ...o, attempts: 2, waitMs: 1 }) });
+    order.push(r === null ? "second-refused" : "second-landed");
+    return "done";
+  });
+  assert.deepStrictEqual([held.ok, held.value, order], [true, "done", ["first-in", "second-refused"]]);
+  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_state, "running");
+});
+
+// -- major finding 4 (cross-model review): the loop publishes the RECORD's
+// verdict for a superseded pipeline — never the loser's head and verdict —
+// and stamps nothing on its behalf.
+test("a superseded pipeline's verdict is not what the loop publishes: the status surface carries the record's settled verdict, head and attestation", async () => {
+  const marks = [];
+  const { deps, control, state } = loopHarness({
+    queue: [{ id: "task-a" }],
+    gate: () => ({
+      state: "passed", reason: "2 gate(s) passed", gate_head: "loserhead", attestation: null, gates: [{ gate: "acceptance", verdict: "passed" }],
+      superseded: true,
+      settled: { state: "failed", reason: "gate 'acceptance' failed: npm test exited 1", head: "winnerhead", attestation: "art-attest-winner", worker: "w-other", at: "2026-09-02T10:00:00.000Z" },
+    }),
+  });
+  deps.markGate = (runId, patch) => {
+    marks.push({ runId, patch });
+    return null;
+  };
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", intervalMs: 1000, retryAfterMs: 600000, max: 1 }, deps, control });
+  const entry = status.recent[0];
+  assert.strictEqual(entry.gate, "failed", "the record's verdict, not the loser's 'passed'");
+  assert.strictEqual(entry.gate_head, "winnerhead");
+  assert.strictEqual(entry.attestation, "art-attest-winner");
+  assert.strictEqual(entry.gate_worker, "w-other");
+  assert.strictEqual(entry.superseded, true);
+  assert.deepStrictEqual(entry.superseded_verdict, { state: "passed", head: "loserhead" }, "what this pipeline found is kept, labeled as superseded");
+  assert.strictEqual(entry.gates, undefined, "the loser's per-gate steps are not published as the run's");
+  assert.strictEqual(status.gates.failed, 1);
+  assert.strictEqual(status.gates.superseded, 1);
+  assert.strictEqual(status.gates.passed, 0);
+  assert.ok(marks.every((m) => m.patch.gate_state !== "passed"), "the loser stamps no verdict on the record");
+  assert.strictEqual(marks.filter((m) => m.patch.gate_state && m.patch.gate_state !== "running").length, 0, "no settle stamp at all from the loser");
+  assert.strictEqual(status.skipped.length, 1, "the node cools off per the RECORD's failed verdict, not the loser's pass");
+  assert.match(status.skipped[0].reason, /settled by another pipeline/);
+  assert.ok(state.log.some((l) => /gates failed \(settled by w-other\) — this pipeline's 'passed' verdict was superseded/.test(l)), state.log.join("\n"));
+
+  // With no settled info carried back, the verdict is UNKNOWN — published as
+  // superseded, and the node cools (the safe direction), never a pass.
+  const { deps: d2, control: c2 } = loopHarness({ queue: [{ id: "task-b" }], gate: () => ({ state: "passed", superseded: true }) });
+  const s2 = await workLoop.runWorkLoop({ opts: { workerId: "w", intervalMs: 1000, retryAfterMs: 600000, max: 1 }, deps: d2, control: c2 });
+  assert.strictEqual(s2.recent[0].gate, "superseded");
+  assert.strictEqual(s2.gates.superseded, 1);
+  assert.strictEqual(s2.gates.passed, 0);
+  assert.strictEqual(s2.skipped.length, 0, "superseded work retains current no-cooldown policy");
+});
+
+// -- cross-model review (second round), blocking finding 1: the judged
+// repository's own suite ran with the judge's credentials in its environment —
+// the attestation signing key (forge the signature anchor) and the graph
+// bearer token (write the graph anchor as the runner). Both doors are
+// scrubbed, whichever way the name arrives.
+test("runGateCommand never hands the suite the attestation key or a graph token — from the process env or the caller's extra env", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-gate-secret-"));
+  const probe = 'const e = process.env; const leaked = ["SPOR_ATTESTATION_KEY","SPOR_TOKEN","SUBSTRATE_TOKEN","SPOR_REFRESH_TOKEN","SPOR_CI_SECRET"].filter((k) => k in e); if (leaked.length) { console.error("leaked " + leaked.join(",")); process.exit(3); } if (e.SPOR_HOME !== "/keep" || e.KEEP !== "1" || e.SPOR_GATE !== "secretgate") { console.error("lost a harmless var"); process.exit(4); } process.exit(0);';
+  const gate = { id: "secretgate", command: `"${process.execPath}" -e '${probe}'`, timeoutMs: 20000 };
+  const saved = {};
+  for (const k of ["SPOR_ATTESTATION_KEY", "SPOR_TOKEN", "SUBSTRATE_TOKEN"]) {
+    saved[k] = process.env[k];
+    process.env[k] = "hunter2";
+  }
+  try {
+    const r = await gateRunner.runGateCommand(gate, dir, { env: { SPOR_HOME: "/keep", KEEP: "1", SPOR_REFRESH_TOKEN: "x", SPOR_CI_SECRET: "y" } });
+    assert.strictEqual(r.ok, true, r.output || r.reason);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+  assert.deepStrictEqual(gateRunner.scrubSecretEnv({ SPOR_ATTESTATION_KEY: "k", SPOR_TOKEN: "t", SUBSTRATE_TOKEN: "t", SPOR_HOME: "h", SPOR_SERVER: "s", PATH: "p", MY_API_KEY: "kept" }), { SPOR_HOME: "h", SPOR_SERVER: "s", PATH: "p", MY_API_KEY: "kept" }, "only the judge's own credentials are scrubbed — a repo's unrelated keys stay");
+});
+
+// -- major finding 5: the attested `trusted_sha` was resolved by one
+// rev-parse while the protected paths were restored from the SYMBOLIC ref by
+// a later checkout — a ref that moved in between put a different suite in
+// the tree than the fact named. The restore now forces from the pinned sha.
+test("prepareGateTree forces the protected paths from the sha gateChangeSet pinned, not from a ref that has since moved", () => {
+  const dir = repoWithBranch();
+  const change = gateRunner.gateChangeSet({ cwd: dir }, "main");
+  assert.strictEqual(change.ok, true, change.reason);
+  const pinned = change.trustedSha;
+  // Move `main` AFTER the change-set read: a new commit that rewrites the suite.
+  git(dir, "checkout", "-q", "main");
+  fs.writeFileSync(path.join(dir, "test", "acceptance.js"), "console.log('moved suite'); process.exit(0);\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "main moved");
+  assert.notStrictEqual(git(dir, "rev-parse", "main").trim(), pinned);
+  git(dir, "checkout", "-q", "impl");
+  const tree = gateRunner.prepareGateTree(change, { trustedRef: "main", protectedPaths: ["test/**"] });
+  assert.strictEqual(tree.ok, true, tree.reason);
+  try {
+    assert.match(fs.readFileSync(path.join(tree.dir, "test", "acceptance.js"), "utf8"), /add is broken/, "the suite is the PINNED sha's copy — what the fact's trusted_sha names");
+  } finally {
+    tree.cleanup();
+  }
+  // A caller whose change carries no pin falls back to the ref, as before.
+  const unpinned = gateRunner.prepareGateTree({ ...change, trustedSha: null }, { trustedRef: "main", protectedPaths: ["test/**"] });
+  try {
+    assert.match(fs.readFileSync(path.join(unpinned.dir, "test", "acceptance.js"), "utf8"), /moved suite/);
+  } finally {
+    unpinned.cleanup();
+  }
+});
+
+// -- blocking finding 4: the two whole-record writers (updateRun, the
+// supervisor's `update`) carried the on-disk gate fields but did their
+// read+rename OUTSIDE the record lock the settle takes — a settle landing
+// between the two was renamed over, erasing the verdict the settler's own
+// read-back had just verified. Every whole-record writer now takes the lock.
+test("whole-record writers take the record lock: a held lock makes them wait, a stale lock is broken, and a gate settle is never renamed over", () => {
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-writer-lock-"));
+  const runId = "11111111-2222-3333-4444-00000000wr10";
+  const paths = dispatchRuns.runPaths(home, runId);
+  const base = { run_id: runId, node_id: "task-x", state: "running" };
+  dispatchRuns.atomicJson(paths.record, base);
+  const lock = dispatchRuns.recordLockPath(paths.record);
+
+  // A settle that landed after the writer's in-memory copy was taken is
+  // carried, whichever writer runs: updateRun (a handle), closeRun,
+  // mergeTerminalOutcome, and the raw writeRecordCarryingGate.
+  const handle = { paths, record: { ...base } };
+  dispatchRuns.stampGateState(home, runId, { gate_state: "passed", gate_settle_id: "tok", gate_attestation: "art-attest-x" }, { force: true });
+  dispatchRuns.updateRun(handle, { state: "done" });
+  let onDisk = dispatchRuns.readJson(paths.record);
+  assert.strictEqual(onDisk.state, "done");
+  assert.strictEqual(onDisk.gate_state, "passed");
+  assert.strictEqual(onDisk.gate_attestation, "art-attest-x", "the settle survives the whole-record write");
+  assert.ok(!fs.existsSync(lock), "the writer released the lock");
+
+  // Held by a live writer: the write WAITS for the bounded window and, if the
+  // lock is still held, DOES NOT HAPPEN — never an unlocked fallback (cross-
+  // model review, blocking finding 3): an unlocked carry is the rename-over-
+  // the-settle the lock exists to prevent. The bounded window is shortened
+  // here through the injectable lock; the real one outlasts the stale window.
+  fs.writeFileSync(lock, "4242\n");
+  const shortLock = (file, fn, o) => dispatchRuns.withRecordLock(file, fn, { ...o, attempts: 20, waitMs: 5 });
+  const t0 = Date.now();
+  assert.throws(() => dispatchRuns.writeRecordCarryingGate(paths.record, { ...onDisk, note: "late" }, { lock: shortLock }), /not written: record lock contended/);
+  const waited = Date.now() - t0;
+  assert.ok(waited >= 50, `waited for the lock (${waited}ms)`);
+  assert.strictEqual(dispatchRuns.closeRun(paths.record, { state: "failed" }, null, { lock: shortLock }), null, "closeRun under a live lock did not write");
+  assert.strictEqual(dispatchRuns.mergeTerminalOutcome(paths.record, { terminal_state: "failed" }, { lock: shortLock }), null, "mergeTerminalOutcome under a live lock did not write");
+  onDisk = dispatchRuns.readJson(paths.record);
+  assert.strictEqual(onDisk.note, undefined, "nothing landed unlocked");
+  assert.strictEqual(onDisk.state, "done");
+  assert.strictEqual(onDisk.gate_attestation, "art-attest-x");
+  assert.ok(fs.existsSync(lock), "a live holder's lock is left alone");
+  assert.strictEqual(fs.readFileSync(lock, "utf8"), "4242\n", "...and untouched");
+  // The real bounded wait outlasts the stale window, so no writer ever needs
+  // an unlocked path: a corpse is always broken before the wait runs out.
+  assert.ok(dispatchRuns.RECORD_LOCK_ATTEMPTS * dispatchRuns.RECORD_LOCK_WAIT_MS > dispatchRuns.RECORD_LOCK_STALE_MS, "the wait outlasts the stale window");
+
+  // A corpse is broken and the write goes through at once.
+  const old = new Date(Date.now() - dispatchRuns.RECORD_LOCK_STALE_MS - 5000);
+  fs.utimesSync(lock, old, old);
+  dispatchRuns.atomicJson(paths.record, { ...onDisk, state: "running" });
+  const t1 = Date.now();
+  const closed = dispatchRuns.closeRun(paths.record, { state: "failed", terminal_state: "failed" });
+  assert.strictEqual(closed.state, "failed");
+  assert.ok(Date.now() - t1 < 400, "no wait on a stale lock");
+  assert.strictEqual(closed.gate_attestation, "art-attest-x");
+  assert.ok(!fs.existsSync(lock), "the corpse is gone");
+  // closeRun refuses a record that is already terminal; mergeTerminalOutcome adds to it.
+  assert.strictEqual(dispatchRuns.closeRun(paths.record, { state: "done" }).state, "failed");
+  const merged = dispatchRuns.mergeTerminalOutcome(paths.record, { terminal_state: "resolved" });
+  assert.strictEqual(merged.terminal_state, "failed", "the earlier terminal outcome stands");
+  assert.strictEqual(dispatchRuns.readJson(paths.record).gate_state, "passed");
+});
+
+// -- minor finding 8: the record's `gate_attestation_missing`/`_error` and
+// `gate_proposal_attestation_stale` stamps were documented but rendered
+// nowhere. `spor runs` prints them and the work loop's status carries them.
+test("a missing attestation and a stale proposal body surface on 'spor runs' and on the work loop's status entry", async () => {
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-attest-missing-"));
+  const runId = "11111111-2222-3333-4444-0000000miss1";
+  const paths = dispatchRuns.runPaths(home, runId);
+  dispatchRuns.atomicJson(paths.record, {
+    run_id: runId, node_id: "task-x", harness: "claude-code", launch_mode: "supervised-jsonl", state: "done", terminal_state: "resolved", terminal_enforced: true,
+    created_at: "2026-09-02T10:00:00.000Z", finished_at: "2026-09-02T10:05:00.000Z",
+    gate_state: "passed", gate_head: "abc123", gate_attestation: null, gate_attestation_missing: true, gate_attestation_error: "could not be recorded on the graph",
+    gate_proposal_attestation: "art-attest-x-1", gate_proposal_attestation_stale: true, gate_proposal_attestation_error: "gh pr edit exited 1",
+  });
+  const shown = cli(["runs", runId], { SPOR_HOME: home, XDG_CONFIG_HOME: home });
+  assert.strictEqual(shown.status, 0, shown.stderr);
+  assert.match(shown.stdout, /attested: {3}MISSING — could not be recorded on the graph/);
+  assert.match(shown.stdout, /proposal: {3}PR body carries a STALE attestation \(graph copy art-attest-x-1\) — gh pr edit exited 1/);
+
+  const { deps, control } = loopHarness({
+    queue: [{ id: "task-a" }],
+    gate: () => ({ state: "passed", reason: "2 gate(s) passed", gate_head: "abc123", attestation: null, attestation_missing: true, attestation_error: "could not be built: boom", proposal_attestation_stale: true, proposal_attestation_error: "gh pr edit exited 1" }),
+  });
+  deps.markGate = () => null;
+  const status = await workLoop.runWorkLoop({ opts: { workerId: "w", intervalMs: 1000, retryAfterMs: 600000, max: 1 }, deps, control });
+  const entry = status.recent[0];
+  assert.strictEqual(entry.gate, "passed");
+  assert.strictEqual(entry.attestation_missing, true);
+  assert.strictEqual(entry.attestation_error, "could not be built: boom");
+  assert.strictEqual(entry.proposal_attestation_stale, true);
+  assert.strictEqual(entry.proposal_attestation_error, "gh pr edit exited 1");
+  // ...and for a superseded pipeline, the RECORD's own stamps are what is published.
+  const sup = loopHarness({
+    queue: [{ id: "task-b" }],
+    gate: () => ({ state: "passed", superseded: true, settled: { state: "passed", head: "def", attestation: null, attestation_missing: true, attestation_error: "could not be recorded on the graph", worker: "w-other", at: "t" } }),
+  });
+  sup.deps.markGate = () => null;
+  const status2 = await workLoop.runWorkLoop({ opts: { workerId: "w", intervalMs: 1000, retryAfterMs: 600000, max: 1 }, deps: sup.deps, control: sup.control });
+  assert.strictEqual(status2.recent[0].attestation_missing, true);
+  assert.strictEqual(status2.recent[0].attestation_error, "could not be recorded on the graph");
+});
+
+// -- blocking finding 3 (cross-model review): breaking a stale lock is
+// ownership-safe, and releasing one is checked.
+test("the record lock is ownership-safe: a corpse is broken by rename (one breaker wins), a live lock a breaker took by mistake is handed back, and release never removes another holder's lock", () => {
+  const dispatchRuns = require("../lib/shell/agent-dispatch-runner.js");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-lock-own-"));
+  const file = path.join(home, "r.json");
+  dispatchRuns.atomicJson(file, { a: 1 });
+  const lock = dispatchRuns.recordLockPath(file);
+  const staleMs = dispatchRuns.RECORD_LOCK_STALE_MS;
+
+  // A FRESH lock that a breaker takes (its stat said stale a moment ago, the
+  // holder changed in between): the breaker finds it live and puts it back —
+  // same content, same path — and reports nothing broken.
+  fs.writeFileSync(lock, "4242:live\n");
+  assert.strictEqual(dispatchRuns.breakStaleLock(lock, { staleMs, now: Date.now }), false);
+  assert.ok(fs.existsSync(lock), "the live lock is back where its holder will release it");
+  assert.strictEqual(fs.readFileSync(lock, "utf8"), "4242:live\n");
+  assert.deepStrictEqual(fs.readdirSync(home).filter((f) => f.includes(".stale-")), [], "no renamed corpse left behind");
+
+  // A corpse: broken, and the lock path is free.
+  const old = new Date(Date.now() - staleMs - 5000);
+  fs.utimesSync(lock, old, old);
+  assert.strictEqual(dispatchRuns.breakStaleLock(lock, { staleMs, now: Date.now }), true);
+  assert.ok(!fs.existsSync(lock));
+  // ...and a second breaker for the same corpse finds nothing to break.
+  assert.strictEqual(dispatchRuns.breakStaleLock(lock, { staleMs, now: Date.now }), false);
+
+  // A holder whose lock was re-taken under the same name by someone else
+  // (the race the naive unlink produced) does NOT remove the newcomer's lock.
+  const held = dispatchRuns.withRecordLock(file, () => {
+    const mine = fs.readFileSync(lock, "utf8");
+    assert.match(mine, new RegExp(`^${process.pid}:[0-9a-f]{16}\\n$`), "the holder's token is in the lock");
+    fs.unlinkSync(lock);
+    fs.writeFileSync(lock, "9999:someone-else\n");
+    return "ran";
+  });
+  assert.deepStrictEqual(held, { ok: true, value: "ran" });
+  assert.strictEqual(fs.readFileSync(lock, "utf8"), "9999:someone-else\n", "release is checked: another holder's lock is left alone");
+  fs.unlinkSync(lock);
+
+  // The ordinary path: acquire, run, release — the lock is gone afterwards.
+  assert.deepStrictEqual(dispatchRuns.withRecordLock(file, () => 7), { ok: true, value: 7 });
+  assert.ok(!fs.existsSync(lock));
+
+  // Two waiters over one corpse, end to end: both go through the breaker and
+  // exactly one holds at a time (the critical sections never overlap).
+  fs.writeFileSync(lock, "4242:corpse\n");
+  fs.utimesSync(lock, old, old);
+  let inside = 0;
+  let overlap = false;
+  const run = () => dispatchRuns.withRecordLock(file, () => {
+    inside += 1;
+    if (inside > 1) overlap = true;
+    inside -= 1;
+    return true;
+  }, { attempts: 200, waitMs: 1 });
+  assert.deepStrictEqual([run().ok, run().ok, overlap], [true, true, false]);
+  assert.ok(!fs.existsSync(lock));
+});
+
+// -- blocking finding 1 (cross-model review): the judge's git never runs a
+// hook the judged change controls, and never carries the judge's secrets.
+test("the judge's git runs hook-free over the judged tree: a committed core.hooksPath hook does not fire on the gate worktree, and the signing key is scrubbed", () => {
+  const dir = repoWithBranch({ weakenTest: false, regress: false });
+  // The implementer's commit points core.hooksPath at a TRACKED directory
+  // (the repo's own config does — as a `.githooks` convention would) whose
+  // post-checkout hook leaves a marker and exfiltrates the judge's key.
+  git(dir, "checkout", "-q", "impl");
+  const marker = path.join(dir, "..", `hook-fired-${path.basename(dir)}`);
+  fs.mkdirSync(path.join(dir, ".githooks"));
+  const hook = path.join(dir, ".githooks", "post-checkout");
+  fs.writeFileSync(hook, `#!/bin/sh\nprintf '%s' "\${SPOR_ATTESTATION_KEY:-none}" > "${marker}"\n`);
+  fs.chmodSync(hook, 0o755);
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "hooks");
+  git(dir, "config", "core.hooksPath", ".githooks");
+  // Sanity: the hook DOES fire for an ordinary checkout in that repo.
+  git(dir, "checkout", "-q", "main");
+  git(dir, "checkout", "-q", "impl");
+  assert.ok(fs.existsSync(marker), "the hook fires for a plain checkout");
+  fs.unlinkSync(marker);
+
+  const prevKey = process.env.SPOR_ATTESTATION_KEY;
+  process.env.SPOR_ATTESTATION_KEY = "judge-secret";
+  try {
+    const change = gateRunner.gateChangeSet({ cwd: dir }, "main");
+    assert.strictEqual(change.ok, true, change.reason);
+    const tree = gateRunner.prepareGateTree(change, { trustedRef: "main", protectedPaths: ["test/**"] });
+    assert.strictEqual(tree.ok, true, tree.reason);
+    try {
+      assert.ok(!fs.existsSync(marker), "no hook ran on the judge's worktree add / protected-path checkout");
+      assert.ok(fs.existsSync(path.join(tree.dir, ".githooks", "post-checkout")), "the tree itself is materialized");
+    } finally {
+      tree.cleanup && tree.cleanup();
+    }
+  } finally {
+    if (prevKey === undefined) delete process.env.SPOR_ATTESTATION_KEY;
+    else process.env.SPOR_ATTESTATION_KEY = prevKey;
+  }
+  if (process.platform !== "win32") assert.ok(!fs.existsSync(marker), "still no hook");
+
+  // The env itself: secrets scrubbed, hooks path forced, an existing
+  // GIT_CONFIG_COUNT appended to rather than clobbered.
+  const env = gateRunner.judgeGitEnv({ PATH: "/bin", SPOR_ATTESTATION_KEY: "k", SPOR_TOKEN: "t", GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "a.b", GIT_CONFIG_VALUE_0: "c" });
+  assert.strictEqual(env.SPOR_ATTESTATION_KEY, undefined);
+  assert.strictEqual(env.SPOR_TOKEN, undefined);
+  assert.strictEqual(env.PATH, "/bin");
+  assert.deepStrictEqual([env.GIT_CONFIG_COUNT, env.GIT_CONFIG_KEY_0, env.GIT_CONFIG_VALUE_0, env.GIT_CONFIG_KEY_1, env.GIT_CONFIG_VALUE_1], ["2", "a.b", "c", "core.hooksPath", gateRunner.noHooksPath()]);
+  if (process.platform !== "win32") assert.ok(gateRunner.noHooksPath().startsWith(os.devNull), "a path nothing on the box can create a hook under");
 });

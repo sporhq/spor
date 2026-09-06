@@ -991,7 +991,87 @@ live RESOLVING EDGE (approved — a bare status flip is not an approval) or any
 other terminal status (refused) answers it, reporting `blocked` at `approval_timeout_ms` rather than deciding for the
 person. Every gate outcome is a deterministic, idempotent `art-gate-*` artifact
 carrying `relates-to` the work item (never `resolves` — a gate records, it does
-not retire). Only a CLAIM is gated (`shouldGate`: a verified `resolved`, or an
+not retire). Every fact is COMMIT-BOUND and DEFINITION-BOUND
+(task-spor-factory-gate-attestation, WORKERS.md §10.10): `gate_head:`/`gate_base:`
+frontmatter plus the trusted ref's sha and branch in the body, and the
+`sha256:` digest (canonical JSON of the normalized definition,
+`gates.definitionDigest`) and node revision of the factory and gate that judged
+it (`factory.definition`, stamped by `loadFactoryDefinition`). Every step must
+judge the SAME head: a fix cycle that moves the head restarts the pipeline from
+gate 0 (a gate already passed at the current head stands; cycle caps are
+cumulative across restarts; fact ids fold the judged head in, so the superseded
+fact keeps its own id), and an unreadable change fails every gate kind closed —
+a read that fails AFTER a fix cycle leaves the judged commit UNKNOWN in the fact
+and the chain, never the pre-fix head.
+The integration stage REFUSES (settled failed, never a fix cycle — a fix
+commits and so can never restore equality) when its own re-read of the tree
+finds a head other than the one the last passing gate judged (`gatedHead`); its
+OWN fix cycles move the head by construction, so after each one the moved head
+is handed back through `deps.regate` (re-running the real pipeline) and only a
+pass at exactly that head lets it land. `runGateAndIntegration` CLAIMS the run
+record's ownership nonce (`claimGateRecord`, under the record lock) BEFORE the
+first gate runs — a record another pipeline settled, or one a live worker is
+gating, refuses the pipeline outright (`not_run` + `superseded`: no fact, no
+escalation, no demotion, no attestation; only a dead owner's record is taken
+over) — then SETTLES the run record through that claim's `own` door, then
+writes ONE `art-attest-<stem>-<run>-<hash>` artifact per run
+(`schema: spor.attestation/1` — subject/factory/gate/integration/
+configIntegrity/timing/environment, `lib/shell/attestation.js`; `allPassed`
+also checks every step bound to the subject commit; the JSON is thinned to fit
+the 8KB node cap, never byte-cut — the floor is bounded and MEASURED, and a
+missing attestation is stamped `gate_attestation_missing`/`_error` on the
+record) linking every fact, stamping
+`gate_head`/`gate_attestation`/… on the record — but ONLY when its own settle
+LANDED: the settle is a LOCKED compare-and-swap (`stampGateState` takes a
+per-record `.lock`, O_EXCL, stale after 30s, and returns the record read back
+from disk) keyed on the claim's random `gate_settle_id`; a duplicate pipeline that lost
+the settle race writes no attestation and touches no evidence field
+(`superseded: true`, carrying the record's own verdict as `settled`, which is
+what the work loop publishes on `--status` — the loser's stays labeled
+`superseded_verdict`), and the post-settle stamps go through `stampGateState`'s
+`own: <gate_settle_id>` door, never `force`. Every attestation is BOUND —
+`digest` (sha256 over the canonical JSON of its core — subject, verdicts,
+config (protected paths by count + digest, never the list), and the
+integration stage's bound fields INCLUDING the candidate-suite evidence and
+proposal identity — which survives the node-body ladder via
+`steps_digest`/`gates_digest`/`protected_paths_digest`) plus an
+HMAC-SHA256 `signature` when `attestation.signingKey` (`SPOR_ATTESTATION_KEY`,
+a secret stripped from repo `.spor.json`) is set; verification with neither a
+key nor the graph copy FAILS (`anchor`) — and the graph copy is an anchor
+only when it recomputes its own digest (and verifies under the key, if held)
+AND its server-stamped provenance rules out the judged code having written it:
+without a key, an `authored_by_agent` node, a LOCAL-mode node, or unknown
+provenance fails `anchor` (a dispatched agent has graph-write authority) — so
+`spor attestation verify --no-graph`
+requires a verified signature and is refused on a box with no key — and the definition digests
+hash the runtime-effective definition only (gate `source` stripped, so inline
+== referenced). Verification also checks the EVIDENCE under `passed`
+(`verdicts`: allPassed, head-consistent, every listed step passed at the
+gated head, the stage's head is the gated head, the candidate suite passed)
+and binds the target (`--target <sha>` against the candidate's base tip,
+`--target-ref`). `issued_at` is derived from the last step's finish, never
+the clock (a rebuilt attestation is byte-identical); the propose-time PR body
+is a PASSING, signed attestation in state `proposing`; the gate/candidate
+suites run with the judge's credentials SCRUBBED, the dispatched implementer
+never inherits `SPOR_ATTESTATION_KEY`/admin/refresh secrets (`JUDGE_ONLY_ENV`
+in the supervisor), and every judge-side git call over the judged tree runs
+hook-free with secrets scrubbed (`judgeGitEnv`: `core.hooksPath` forced to an
+uncreatable path, so a committed `.githooks/post-checkout` never runs as the
+judge) (`scrubSecretEnv`:
+`SPOR_ATTESTATION_KEY`, graph tokens); protected paths are forced from the
+pinned `trusted_sha`, never the moving ref; and every whole-record run-record
+writer takes the record lock (`writeRecordCarryingGate`) with NO unlocked
+fallback — the bounded wait outlasts the stale window, stale locks are broken
+by rename (one breaker wins, a live lock taken by mistake is handed back) and
+release is token-checked. In `propose` mode the same attestation rides in the PR body — a body that cannot be built is a FAILED proposal, never a generic PR —
+between `<!-- spor-attestation:begin/end -->` markers, refreshed with the final
+graph-bound copy after settlement (a failed `gh pr edit` is a failed proposal
+on reuse, and a stamped-stale record post-settle, never a silent success), so
+a repo's CI runs `spor attestation verify --pr-body … --commit … --max-age …
+--factory …` (fail-closed: digest, signature, graph-artifact binding, passed,
+commit, freshness, factory digest as it stands) instead of re-running. Every gate-minted node is
+written `if_exists: skip` in both modes with a read-back content comparison on
+skip — a different node under the same id is refused, never adopted. Only a CLAIM is gated (`shouldGate`: a verified `resolved`, or an
 UNENFORCED `reported` where nothing could check it), the gated item HOLDS its
 slot until the pipeline settles (and its node is out of candidate selection for
 EVERY worker on the box while it does, so a free slot never re-dispatches what a
