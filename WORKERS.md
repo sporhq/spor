@@ -1614,6 +1614,11 @@ outside git (a database on a fixed port, a `db reset`):
     tenant (or canonical local nodes directory). A missing or mismatched
     origin refuses replay and leaves the obligation intact. A failed fact write, edge payment, or
     receipt save leaves the attempt **interrupted**, with its debt retained.
+    The execution store receives `gate.settled` only after every required edge
+    payment and the complete receipt are confirmed. A bare fact cannot open
+    the completion boundary. Receipt adoption after restart reports the original
+    candidate binding; a later fix replaces the verdict for that gate and rescue
+    pass, retaining historical facts without duplicate stale-head verdicts.
     Partial payment receipts are stored separately from the original outcome:
     replay renders exactly the same fact body while paying only missing edges.
     Removing or renaming a gate with an unpaid evidence entry or filing intent

@@ -9711,3 +9711,57 @@ test("a paid filing continuation preserves the cap and only judges its original 
     assert.equal(f.seen.escalations.length, changed ? 0 : 1);
   });
 });
+
+test("mandatory flake payment and durable receipt precede execution settlement across interruption and restart", async (t) => {
+  for (const fault of ["payment", "receipt-before", "receipt-after"]) await t.test(fault, async () => {
+    const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "test", cycles: 0 }] });
+    const f = fakes(), gate = factory.gates[0];
+    const { ok, paths, ...change } = await f.deps.changedPaths();
+    const flake = { issues: ["issue-one"], files: ["test/off.js"], linked: [] };
+    let saved = { evidence: { gate, outcome: { passed: true, verdict: "passed", detail: "isolation passed", flake }, change, definition: factory.definition || null, candidate_id: "candidate-original" } };
+    let armed = true, paid = false;
+    const settlements = [], actions = [];
+    const worker = () => {
+      const fresh = fakes();
+      fresh.deps.loadGateProgress = async () => JSON.parse(JSON.stringify(saved));
+      fresh.deps.saveGateProgress = async ({ progress }) => {
+        if (armed && progress.evidence?.complete && fault === "receipt-before") throw new Error("before receipt persistence");
+        saved = JSON.parse(JSON.stringify(progress));
+        if (armed && progress.evidence?.complete && fault === "receipt-after") throw new Error("after receipt persistence");
+      };
+      fresh.deps.recordFact = async () => { actions.push("bare-fact"); return { ok: true, linked: paid ? ["issue-one"] : [] }; };
+      fresh.deps.linkFact = async () => { actions.push("payment"); if (armed && fault === "payment") return { ok: false }; paid = true; return { ok: true }; };
+      fresh.deps = require("../bin/spor.js").reportingGateDeps(fresh.deps, { gateSettled: async (id, verdict, options) => { settlements.push({ id, verdict, options }); assert.equal(saved.evidence.complete, true, "settlement requires durable complete payment receipt"); }, rescueStarted: async () => {} });
+      return fresh;
+    };
+    const first = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: worker().deps });
+    assert.equal(first.state, "interrupted");
+    assert.equal(settlements.length, 0, "a bare fact cannot advance the execution boundary");
+    assert.ok(saved.evidence.outcome.flake.issues.includes("issue-one"), "original obligation survives failure");
+    armed = false;
+    const resumed = worker(), result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: resumed.deps });
+    assert.equal(result.state, "passed");
+    assert.equal(settlements.length, 1, "receipt adoption reports exactly once in the resumed pass");
+    assert.equal(settlements[0].options.candidateId, "candidate-original");
+    assert.deepEqual(resumed.seen.suites, [], "receipt replay does not rerun the suite");
+  });
+});
+
+test("completed flake receipt restored during rewind has one verdict per gate and pass", async () => {
+  const factory = factoryOf({ ...BASE, gates: [{ id: "fast", kind: "command", command: "fast" }, { id: "later", kind: "command", command: "later", cycles: 1, reruns: 0 }] });
+  const a = "a".repeat(40), b = "b".repeat(40);
+  let head = a;
+  const f = fakes({ suite: ({ gate }) => ({ ok: gate.id === "fast" || head === b }), fix: () => { head = b; return { ok: true }; } });
+  const snapshot = { paths: ["lib/x.js"], base: "base", trustedRef: "main", trustedSha: "trusted", branch: "task-demo" };
+  f.deps.changedPaths = async () => ({ ok: true, ...snapshot, head });
+  const change = { ...snapshot, head: a }; delete change.paths;
+  const flake = { issues: ["issue-one"], files: ["test/off.js"], linked: [] };
+  const progress = new Map([["fast", { evidence: { complete: true, gate: factory.gates[0], fact: "paid-original", outcome: { passed: true, verdict: "passed", flake }, payment_receipts: { ...flake, linked: ["issue-one"] }, change, definition: factory.definition || null, candidate_id: "candidate-a", result: { gate: "fast", kind: "command", verdict: "passed", head: a, candidate_id: "candidate-a", fact: "paid-original" } } }]]);
+  f.deps.loadGateProgress = async ({ gate }) => JSON.parse(JSON.stringify(progress.get(gate.id) || null));
+  f.deps.saveGateProgress = async ({ gate, progress: p }) => progress.set(gate.id, JSON.parse(JSON.stringify(p)));
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+  assert.equal(result.state, "passed");
+  assert.equal(f.seen.fixes.length, 1);
+  assert.deepEqual(result.gates.map(r => [r.gate, r.head]), [["fast", b], ["later", b]]);
+  assert.equal(result.facts.filter(id => id === "paid-original").length, 1, "original fact remains evidence without an extra verdict");
+});

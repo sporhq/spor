@@ -16761,7 +16761,7 @@ async function renewLiveExecutions(log = () => {}) {
 }
 
 // Wrap a gate-deps object so the reporter sees the seams the pipeline
-// already has — the candidate pin, the recorded fact, the escalation, the
+// already has — the candidate pin, completed evidence, the escalation, the
 // human-gate approval item — without gate-runner.js learning about the store.
 // Each wrapper calls the original first (the pipeline's own verdict is never
 // held up by a report) and reports fail-soft afterwards.
@@ -16781,19 +16781,19 @@ function reportingGateDeps(deps, reporter) {
       return r;
     };
   }
-  if (deps.recordFact) {
-    wrapped.recordFact = async (args) => {
-      const r = await deps.recordFact(args);
-      try {
-        const gate = args && args.gate;
-        if (gate && gate.kind === "rescue") await reporter.rescueStarted(Number(args.rescue) || 1);
-        else if (gate && gate.id && r && r.ok) await reporter.gateSettled(gate.id, args.verdict, { candidateId: args.candidate_id || null });
-      } catch {
-        /* fail-soft */
-      }
-      return r;
-    };
-  }
+  // A bare fact is not a settled gate: its mandatory occurrence edges and
+  // durable receipt may still be owed. The runner calls this seam only after
+  // all payment is confirmed, including adoption of a completed receipt.
+  wrapped.gateEvidenceRecorded = async (args) => {
+    if (deps.gateEvidenceRecorded) await deps.gateEvidenceRecorded(args);
+    try {
+      const gate = args && args.gate;
+      if (gate && gate.kind === "rescue") await reporter.rescueStarted(Number(args.rescue) || 1);
+      else if (gate && gate.id) await reporter.gateSettled(gate.id, args.verdict, { candidateId: args.candidate_id || null });
+    } catch {
+      /* fail-soft: the reporter owns its execution publication outbox */
+    }
+  };
   if (deps.escalate) {
     wrapped.escalate = async (args) => {
       const r = await deps.escalate(args);

@@ -473,8 +473,8 @@ test("bin/spor.js, remote mode: claimExecutionHold opens the hosted execution, n
     // The gate-deps seams: a pinned candidate and a recorded fact report.
     const wrapped = spor.reportingGateDeps({ pinCandidate: async () => ({ ok: true, change: "created", candidate: CAND }), recordFact: async () => ({ ok: true }), escalate: async () => ({ ok: true, id: "task-gate-x" }) }, reporter);
     await wrapped.pinCandidate({});
-    await wrapped.recordFact({ id: "art-gate-1", markdown: "", nodeId: "task-x", gate: { id: "acceptance", kind: "command" }, verdict: "passed" });
-    await wrapped.recordFact({ id: "art-gate-2", markdown: "", nodeId: "task-x", gate: { id: "scoping", kind: "scoping" }, verdict: "scoped" }); // synthetic: not reported
+    await wrapped.gateEvidenceRecorded({ id: "art-gate-1", markdown: "", nodeId: "task-x", gate: { id: "acceptance", kind: "command" }, verdict: "passed" });
+    await wrapped.gateEvidenceRecorded({ id: "art-gate-2", markdown: "", nodeId: "task-x", gate: { id: "scoping", kind: "scoping" }, verdict: "scoped" }); // synthetic: not reported
     const types = fake.state.requests.filter((q) => q.path.endsWith("/events") && q.method === "POST").map((q) => `${q.body.event.type}${q.body.event.gate_id ? `:${q.body.event.gate_id}` : ""}`);
     assert.deepEqual(types, ["stage.started", "candidate.submitted", "candidate.published", "gate.settled:acceptance"]);
     const rec = fake.record(reporter.id);
@@ -670,6 +670,8 @@ test("reporter emits publication for an unchanged pin and settles only persisted
   assert.equal(observed.length, 2, "a refused fact cannot produce successful gate evidence");
   factOk = true;
   await wrapped.recordFact(fact);
+  assert.equal(observed.length, 2, "a bare fact still owes its payment confirmation");
+  await wrapped.gateEvidenceRecorded(fact);
   assert.equal(observed[2].type, "gate.settled");
   assert.equal(observed[2].candidate_id, CAND.candidate_id, "late A fact remains bound to A after B pin");
   assert.equal(observed[2].attempt, 1, "refused writes do not spend settlement keys");
@@ -720,4 +722,46 @@ for (const failure of ['before-release', 'lost-ack', 'before-report', 'released-
   const count = calls;
   await spor.reconcileCompletions(cfg, { home });
   assert.equal(calls, count, 'acknowledged release does not repeat');
+});
+
+test('execution boundary stays closed until flake payment and receipt persist, including restart', async t => {
+  const fake = await startFakeExecutionServer({ nodes: { 'task-x': itemNode('task-x'), 'factory-t': itemNode('factory-t') } });
+  const home = tmp('payment-boundary');
+  t.after(async () => { spor.LIVE_EXECUTIONS.clear(); await fake.close(); fs.rmSync(home, { recursive: true, force: true }); });
+  const cfg = remoteCfg(home, fake.base);
+  const factory = factoryOf({ factory: 't', trusted_ref: 'main', gates: [{ id: 'acceptance', kind: 'command', command: 'true' }], completion: { by: 'controller' } });
+  const held = await spor.claimExecutionHold(cfg, { id: 'task-x', project: 'spor' }, factory, { home });
+  assert.equal(held.ok, true);
+  const record = { run_id: 'run-payment-boundary', node_id: 'task-x', state: 'done', ...held.recordFields };
+  dispatchRuns.atomicJson(dispatchRuns.runPaths(home, record.run_id).record, record);
+  const firstReporter = spor.executionReporter(cfg, record, { home });
+  assert.equal((await firstReporter.resume()).ok, true);
+  await firstReporter.candidateSubmitted(CAND);
+  const change = { head: CAND.commit, base: 'base', trustedRef: 'main', trustedSha: 'trusted', branch: 'task-x' };
+  let progress = { evidence: { gate: factory.gates[0], outcome: { passed: true, verdict: 'passed', flake: { issues: ['issue-flake'], files: ['test/off.js'], linked: [] } }, change, definition: factory.definition || null, candidate_id: CAND.candidate_id } };
+  let allowPayment = false;
+  const depsFor = reporter => spor.reportingGateDeps({
+    changedPaths: async () => ({ ok: true, paths: ['lib/x.js'], ...change }),
+    loadGateProgress: async () => JSON.parse(JSON.stringify(progress)),
+    saveGateProgress: async ({ progress: p }) => { progress = JSON.parse(JSON.stringify(p)); },
+    recordFact: async () => ({ ok: true, linked: [] }),
+    linkFact: async () => ({ ok: allowPayment }),
+    runSuite: async () => assert.fail('stored classified outcome must survive restart'),
+    demote: async () => ({ ok: true }),
+  }, reporter);
+  const run = reporter => require('../lib/shell/gate-runner.js').runGatePipeline({ item: record, factory, deps: depsFor(reporter) });
+  assert.equal((await run(firstReporter)).state, 'interrupted');
+  assert.equal(kernel.boundaryReached(fake.record(firstReporter.id)), false);
+  assert.equal(progress.evidence.complete, false);
+  firstReporter.leave();
+  const resumedReporter = spor.executionReporter(cfg, record, { home });
+  assert.equal((await resumedReporter.resume()).ok, true);
+  allowPayment = true;
+  assert.equal((await run(resumedReporter)).state, 'passed');
+  const durable = fake.record(resumedReporter.id);
+  assert.equal(progress.evidence.complete, true);
+  assert.equal(kernel.boundaryReached(durable), true);
+  assert.equal(durable.gate_results[0].candidate_id, CAND.candidate_id);
+  const settlements = fake.state.requests.filter(q => q.path.endsWith('/events') && q.body?.event?.type === 'gate.settled');
+  assert.equal(settlements.length, 1);
 });
