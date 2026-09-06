@@ -652,3 +652,63 @@ test("a forged graph artifact is no anchor: the graph copy must recompute its ow
   assert.deepStrictEqual(failing(forgedSig), ["trusted"]);
   assert.match(forgedSig.reason, /signature does not verify with the key held/);
 });
+
+function retainedAttestationFixture() {
+  const factory = factoryOf({ factory: "test", trusted_ref: "main", completion: { by: "controller" }, gates: [
+    { id: "acceptance", kind: "command", command: "npm test", rejudge_on_repin: false },
+    { id: "review", kind: "agent-review", profile: "profile-review" },
+  ] });
+  const result = gateResult({ definition: factory.definition });
+  result.gates.forEach((step, i) => { step.digest = factory.definition.gates[i].digest; step.candidate_id = "candidate-tip"; });
+  Object.assign(result.gates[0], { head: "a".repeat(40), candidate_id: "candidate-original", retained: true, rejudge_on_repin: false, retained_for: HEAD, ancestry_verified: true });
+  return { factory, result };
+}
+
+test("retained controller command evidence binds original candidate, ancestor proof, and pinned policy", () => {
+  const { factory, result } = retainedAttestationFixture();
+  const att = attestation.buildAttestationObject({ item: ITEM, factory, gate: result, signing: { key: "k" } });
+  assert.equal(att.passed, true);
+  assert.equal(att.gate.head_consistent, false);
+  assert.equal(att.gate.policy_consistent, true);
+  assert.equal(att.gate.steps[0].head, "a".repeat(40));
+  assert.equal(att.gate.steps[0].candidate_id, "candidate-original");
+  assert.equal(att.subject.commit, HEAD);
+  assert.equal(attestation.verifyAttestation(att, { key: "k" }).ok, true);
+  for (const mutate of [
+    (a) => { a.gate.steps[0].candidate_id = "candidate-tip"; },
+    (a) => { a.gate.steps[0].retained_for = "other-tip"; },
+    (a) => { a.gate.steps[0].ancestry_verified = false; },
+    (a) => { a.configIntegrity.gates[0].rejudge_on_repin = true; },
+    (a) => { a.configIntegrity.factory.completion_by = "agent"; },
+  ]) {
+    const changed = structuredClone(att);
+    mutate(changed);
+    assert.equal(attestation.verifyAttestation(changed, { key: "k" }).ok, false, "retention metadata is signed");
+  }
+  const floor = structuredClone(att);
+  delete floor.gate.steps;
+  delete floor.configIntegrity.gates;
+  assert.equal(attestation.attestationDigest(floor), att.digest);
+  assert.equal(attestation.verifyAttestation(floor, { key: "k" }).ok, true);
+});
+
+test("attestation refuses stale reviews and unpinned or incomplete retention exceptions", () => {
+  for (const mutate of [
+    (f, r) => { delete r.gates[0].candidate_id; },
+    (f, r) => { delete r.gates[0].ancestry_verified; },
+    (f, r) => { r.gates[0].retained_for = "another-tip"; },
+    (f, r) => { r.gates[0].digest = "changed-declaration"; },
+    (f, r) => { r.gates[0].kind = "agent-review"; },
+    (f, r) => { r.gates[0].kind = "human"; },
+    (f, r) => { r.gates[1].head = "a".repeat(40); },
+    (f) => { f.completion.by = "agent"; },
+    (f) => { f.gates[0].rejudgeOnRepin = true; },
+    (f) => { f.gates[0].command = "different-command-with-old-digest"; },
+  ]) {
+    const { factory, result } = retainedAttestationFixture();
+    mutate(factory, result);
+    const att = attestation.buildAttestationObject({ item: ITEM, factory, gate: result, signing: { key: "k" } });
+    assert.equal(att.passed, false);
+    assert.equal(attestation.verifyAttestation(att, { key: "k" }).ok, false);
+  }
+});

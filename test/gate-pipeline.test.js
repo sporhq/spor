@@ -9268,6 +9268,7 @@ function repinWorld({ optOut = true, controller = true, progress = new Map(), co
   const f = fakes({ suite: ({ gate }) => ({ ok: gate.id !== "later" || !fixMoves || head[0] === "b", output: "needs a committed fix" }), fix: () => { head = "b".repeat(40); return { ok: true }; } });
   f.deps.changedPaths = async () => ({ ok: true, paths: ["lib/x.js"], head, base: "c".repeat(40), trustedRef: "main", trustedSha: "c".repeat(40), branch: "candidate" });
   f.deps.pinCandidate = async () => ({ ok: true, candidate: { candidate_id: `cand-${head[0]}`, reference: { verified_at: "2026-09-06" } } });
+  f.deps.retainedHeadIsAncestor = ({ head: prior, tip }) => prior[0] === "a" && tip[0] === "b";
   f.deps.loadGateProgress = async ({ gate, rescue = 0 }) => progress.get(`${rescue}:${gate.id}`) || null;
   f.deps.saveGateProgress = async ({ gate, rescue = 0, progress: p }) => progress.set(`${rescue}:${gate.id}`, JSON.parse(JSON.stringify(p)));
   return { ...f, factory, progress };
@@ -9400,4 +9401,73 @@ test("removed gate obligations block before candidate pinning or any new green s
     await real.saveGateProgress({ gate: oldGate, item: entry, progress: { evidence: { gate: oldGate, complete: true, origin: real.evidenceOrigin() } } });
     assert.deepEqual(real.checkEvidenceOrigins(), { ok: true }, "paid history does not prohibit changing declarations");
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test("command retention reruns when ancestry or the original candidate cannot be proved", async () => {
+  for (const missing of ["ancestry", "candidate"]) {
+    const f = repinWorld();
+    if (missing === "ancestry") f.deps.retainedHeadIsAncestor = () => false;
+    else f.deps.pinCandidate = async () => ({ ok: true, candidate: { reference: { verified_at: "2026-09-06" } } });
+    const result = await gateRunner.runGatePipeline({ item: ITEM, factory: f.factory, deps: f.deps });
+    assert.equal(result.state, "passed");
+    assert.equal(f.seen.suites.filter((g) => g === "fast").length, 2);
+    assert.equal(result.gates.find((g) => g.gate === "fast").head, "b".repeat(40));
+  }
+});
+
+test("a command-only pipeline still attests its retained ancestor when no review forces a rewind", async () => {
+  const f = repinWorld();
+  f.factory.gates = f.factory.gates.filter((g) => g.id !== "review");
+  f.factory.definition = gates.describeDefinition(f.factory);
+  gates.stampDefinitionRevisions(f.factory, { factory: "definition-1", gates: {} });
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory: f.factory, deps: f.deps });
+  const retained = result.gates.find((g) => g.gate === "fast");
+  assert.equal(result.state, "passed");
+  assert.equal(f.seen.suites.filter((g) => g === "fast").length, 1);
+  assert.equal(retained.retained, true);
+  assert.equal(retained.retained_for, "b".repeat(40));
+  assert.equal(require("../lib/shell/attestation.js").buildAttestationObject({ item: ITEM, factory: f.factory, gate: result }).passed, true);
+});
+
+test("an unknown head does not trigger an unbounded rejudge loop or gain retention evidence", async () => {
+  let runs = 0;
+  const f = fakes({ suite: () => { if (++runs > 1) return { ok: false, code: 1 }; return { ok: true }; } });
+  f.deps.changedPaths = async () => ({ ok: true, paths: ["lib/x.js"] });
+  const factory = factoryOf({ ...BASE, gates: [{ id: "once", kind: "command", command: "test", cycles: 0, reruns: 0 }] });
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+  assert.equal(runs, 1);
+  assert.equal(result.state, "passed");
+  assert.equal(result.gates[0].retained, undefined);
+  assert.equal(require("../lib/shell/attestation.js").buildAttestationObject({ item: ITEM, factory, gate: result }).passed, false, "unknown heads still cannot attest acceptance");
+});
+
+test("real Git ancestry retains the opted-out command while human approval follows the new commit", async () => {
+  const dir = repoWithBranch({ weakenTest: false, regress: false });
+  try {
+    const original = git(dir, "rev-parse", "HEAD").trim();
+    let moved = false;
+    const factory = factoryOf({ ...BASE, risk_classes: { "touches:auth": ["lib/sub.js"] }, implementation: {}, completion: { by: "controller" }, gates: [
+      { id: "fast", kind: "command", command: "fast", rejudge_on_repin: false },
+      { id: "approval", kind: "human", risk: ["touches:auth"] },
+      { id: "later", kind: "command", command: "later", cycles: 1, reruns: 0 },
+    ] });
+    const f = fakes({ suite: ({ gate }) => ({ ok: gate.id !== "later" || moved }), fix: () => {
+      fs.appendFileSync(path.join(dir, "lib", "sub.js"), "// committed fix\n");
+      git(dir, "add", "lib/sub.js");
+      git(dir, "commit", "-q", "-m", "fix candidate");
+      moved = true;
+      return { ok: true };
+    } });
+    f.deps.changedPaths = async () => gateRunner.gateChangeSet({ cwd: dir }, "main");
+    f.deps.pinCandidate = async () => ({ ok: true, candidate: { candidate_id: `candidate-${git(dir, "rev-parse", "HEAD").trim()}`, reference: { verified_at: "2026-09-06" } } });
+    const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+    const tip = git(dir, "rev-parse", "HEAD").trim();
+    assert.equal(result.state, "passed");
+    assert.equal(f.seen.suites.filter((g) => g === "fast").length, 1);
+    assert.deepEqual(f.seen.human.map((a) => a.head), [original, tip]);
+    assert.equal(result.gates.find((g) => g.gate === "fast").head, original);
+    assert.equal(result.gates.find((g) => g.gate === "fast").retained_for, tip);
+    assert.equal(result.gates.find((g) => g.gate === "approval").head, tip);
+    assert.equal(require("../lib/shell/attestation.js").buildAttestationObject({ item: ITEM, factory, gate: result }).passed, true);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

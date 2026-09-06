@@ -3595,8 +3595,17 @@ path, the run record and the idle-stop that already own them.
   is re-run on the tip — a suite run, never a dispatch, so it moves no dispatch
   bound. `false` is the explicit opt-out for a suite the
   operator accepts standing on an ancestor. It is not declarable on an
-  agent-review gate at all: a review ALWAYS re-judges a moved tip, which is not
-  an operator's to relax.
+  agent-review or human gate: reviews and approvals always re-judge a moved
+  tip. Under agent completion, commands also keep the default re-judgement.
+  A retained pass keeps its original head and candidate ID; the runner proves
+  that head is an ancestor of the new tip. Unknown ancestry or missing original
+  candidate identity causes a fresh command run. Same-attempt restarts may
+  reuse a saved pass under the exact same pinned factory declaration. A new
+  attempt (re-gate), rescue pass, or changed declaration reruns the command;
+  unpaid flake evidence and filing intents are settled before cache reuse.
+  Attestations preserve `head_consistent: false` for retained ancestor evidence
+  and separately sign `policy_consistent: true`, the explicit pinned opt-out,
+  the original candidate, and the tip for which ancestry was verified.
 - **`completion.by`** (`agent` | `controller`) — `agent` is the shipped
   contract (the implementer writes the resolving edge and flips the status).
   `controller` is §10.13. It defaults to `controller` for a factory whose
@@ -3644,11 +3653,10 @@ with its own reason, on a checkout with uncommitted tracked changes — see
 above), and the STAGE RUNNER itself (§10.16: `implementation.profile` routing,
 `budget.attempts`, `retry.attempts`/`backoff_ms`, `budget.run_max_ms`/
 `run_idle_ms`, and the dirty-tree round-trip the stage re-dispatches under
-`require_clean` before the pin ever refuses) are shipped. The one key still
-declared and validated but read by nobody is `rejudge_on_repin` (parsed onto
-the gate; issue-spor-gate-rejudge-on-repin-parsed-never-read). Declaring it
-today is a DECLARATION of intent the runner validates and will honor when that
-item lands; nothing about it changes what a worker does now.
+`require_clean` before the pin ever refuses) are shipped. The gate runner also
+honors command `rejudge_on_repin: false` under controller completion, with the
+retention checks and signed evidence described above. Reviews, human approvals,
+and factories using agent completion continue to judge the current tip.
 
 See test/gates.test.js (the validation table), test/worker-contract.test.js,
 test/candidate.test.js and test/completion-boundary.test.js.
