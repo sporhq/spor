@@ -9807,3 +9807,24 @@ test("rescue publication reports execution history after its fact is confirmed",
   assert.equal((await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps })).state, "passed");
   assert.deepEqual(events, ["failed", "rescue-1", "passed"]);
 });
+
+
+test("integration escalation retry preserves completed-at-gates posture across declaration changes", async (t) => {
+  for (const legacy of [false, true]) await t.test(legacy ? "legacy written boundary" : "explicit captured posture", async () => {
+    const { home, cfg, dispatchRuns } = scratchGraphForRetry();
+    t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+    const record = pendingRecord(dispatchRuns, home, "post-completion-retry", { pending: {
+      stage: "integration", gateId: "integration", attempts: [{ verdict: "failed", detail: "suite failed" }], detail: "suite failed", evidence: "", factId: "art-merge-original",
+      ...(legacy ? {} : { completedBeforeIntegration: true }),
+    } });
+    if (legacy) { record.completion_written_at = "2026-09-06T12:00:00Z"; record.completion_boundary = "gates"; }
+    await sporCli.retryOneEscalation(cfg, { record, attempts: 0 }, {
+      factory: { ...RETRY_INTEGRATION_FACTORY, completion: { by: "controller", after: "integration" } }, home, log: () => {},
+    });
+    const after = dispatchRuns.readJson(dispatchRuns.runPaths(home, record.run_id).record);
+    assert.equal(after.gate_demoted, false);
+    const escalation = fs.readFileSync(path.join(home, "nodes", `${after.gate_escalated_to}.md`), "utf8");
+    assert.match(escalation, /relates-to, to: task-demo/); assert.doesNotMatch(escalation, /type: blocks/);
+    assert.match(fs.readFileSync(path.join(home, "nodes", "task-demo.md"), "utf8"), /status: done/);
+  });
+});

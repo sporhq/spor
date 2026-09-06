@@ -15016,7 +15016,12 @@ async function retryOneEscalation(
   // have filed) — so the id a retry lands is the one the first attempt
   // reached for, and a person reads one escalation shape per refusal kind.
   const deps = fromIntegration
-    ? makeIntegrationDeps(cfg, { record, entry, factory, slug: project, log, warn, home })
+    ? makeIntegrationDeps(cfg, { record, entry, factory, slug: project, log, warn, home,
+        completedBeforeIntegration: typeof payload.completedBeforeIntegration === "boolean"
+          ? payload.completedBeforeIntegration
+          : !!((record.completion_boundary === "gates" && record.completion_written_at)
+            || (record.impl_claim?.completion?.after === "gates" && record.completion_consumed_at)),
+      })
     : makeGateDeps(cfg, { record, entry, factory, slug: project, log, home });
   let esc;
   try {
@@ -15669,6 +15674,7 @@ function makeIntegrationDeps(cfg, { record, entry, factory, slug, passthrough, w
   };
 
   return {
+    completedBeforeIntegration: completedBeforeIntegration === true,
     now: () => Date.now(),
     changedTree: async () => {
       const c = gateRunner.gateChangeSet(record, integration.targetRef);

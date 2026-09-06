@@ -4809,3 +4809,11 @@ test("checkProposals withholds controller completion when the hosted proposal fe
     }
   }
 });
+
+
+test("integration refusal snapshots completed-before-integration into its retry payload", async () => {
+  const { deps } = integrationFakes({ suite: () => ({ ok: false, reason: "failed" }), escalate: () => ({ ok: false, reason: "offline" }) });
+  deps.completedBeforeIntegration = true;
+  const result = await integrationRunner.runIntegrationStage({ item: ITEM, factory: { ...FACTORY, integration: { ...FACTORY.integration, cycles: 0 } }, deps });
+  assert.equal(result.escalation_retry.completedBeforeIntegration, true);
+});
