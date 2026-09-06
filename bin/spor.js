@@ -9497,8 +9497,8 @@ async function launchSupervisedHarness(cfg, {
       // reused the pid) can be told apart from a genuinely long-lived
       // supervisor (issue-spor-dispatch-supervisor-identity-stale-timeout).
       const startTicks = dispatchRuns.processStartTicks(child.pid);
-      dispatchRuns.atomicJson(p.record, {
-        ...record, runner_pid: child.pid,
+      dispatchRuns.stampRun(cfg.userConfigHome(), runId, {
+        runner_pid: child.pid,
         ...(startTicks != null ? { runner_started_ticks: startTicks } : {}),
       });
     }
@@ -14398,9 +14398,10 @@ function makeGateDeps(
         })
       );
     },
-    fileHumanItem: async ({ gate, classes, rescue = 0 }) => {
+    fileHumanItem: async ({ gate, classes, head, rescue = 0 }) => {
+      if (!head || !/^[0-9a-f]{40,64}$/i.test(head)) return { ok: false, reason: "the judged commit is unknown; approval cannot be bound to a candidate" };
       const k = keysFor(rescue);
-      const id = `task-approve-${gate.id.slice(0, 24)}-${stem}-${k.short}-${gateIdSuffix("approve", gate.id, entry.node_id, k.runKey)}`.toLowerCase();
+      const id = `task-approve-${gate.id.slice(0, 24)}-${stem}-${k.short}-${gateIdSuffix("approve", gate.id, entry.node_id, `${k.runKey}@${head}`)}`.toLowerCase();
       const body = [
         `The \`${gate.id}\` human gate is armed for ${entry.node_id}: the change touches` +
           (classes.length ? ` the declared risk class(es) ${classes.map((c) => `\`${c.class}\``).join(", ")}.` : " work this factory always has a person approve."),
@@ -14408,6 +14409,8 @@ function makeGateDeps(
         ...(classes.length
           ? classes.map((c) => `- \`${c.class}\`: ${c.paths.slice(0, 8).map((p) => `\`${p}\``).join(", ")}${c.paths.length > 8 ? ` (+${c.paths.length - 8} more)` : ""}`)
           : []),
+        "",
+        `Judged commit: \`${head}\`. This approval applies only to this commit; a changed candidate needs a new approval.`,
         "",
         gate.instructions || "Review the change and decide whether it may stand.",
         "",
@@ -15028,7 +15031,7 @@ async function releaseIntegrationLease(cfg, token) {
 // direct caller of makeIntegrationDeps (a test, a future entry point) gets
 // the same refusal rather than a raw ENOENT.
 function runGh(args, opts = {}) {
-  return spawnPortableSync("gh", args, { encoding: "utf8", timeout: 20000, ...opts });
+  return spawnPortableSync("gh", args, { encoding: "utf8", timeout: 20000, ...opts, env: gateRunner.judgeGitEnv(opts.env) });
 }
 
 // The github.com `owner/repo` slug `gh --repo` needs, read from the `origin`
@@ -15061,7 +15064,7 @@ function proposeIntegrationPR({ top, head, targetRef, body = null, editBody = ed
   const branchName = (git(top, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout || "").trim();
   if (!branchName || branchName === "HEAD") return { ok: false, reason: `could not read the branch name to propose from — ${top} is in detached HEAD` };
 
-  const push = git(top, ["push", "-u", remoteName, `${head}:refs/heads/${branchName}`]);
+  const push = git(top, ["push", "-u", remoteName, `${head}:refs/heads/${branchName}`], { env: gateRunner.judgeGitEnv() });
   if (push.status !== 0) {
     return { ok: false, reason: (push.stderr || "").trim().split("\n").filter(Boolean).pop() || "git push failed" };
   }
@@ -16622,7 +16625,8 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
         return false;
       }
     });
-  const claim = dispatchRuns.claimGateRecord(home, item.run_id, { workerId: ctx.workerId || null, ownerLive });
+  const claim = ctx.gateClaim || dispatchRuns.claimGateRecord(home, item.run_id, { workerId: ctx.workerId || null, ownerLive });
+  if (ctx.gateClaim && freshRecord(home, record).gate_settle_id !== claim.token) claim.refused = "the re-gate ownership changed before judging";
   if (claim.refused) {
     const rec = claim.record || null;
     ctx.log(`work: the run record for ${item.node_id} (run ${String(item.run_id).slice(0, 8)}) is ${claim.refused} — this worker does not run the gate pipeline for it: no fact, escalation, demotion or attestation is written`);
@@ -16731,7 +16735,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
     // hold (a worker dying in that window would leave evidence a resumed
     // pipeline could later be pointed at). The loop's own settle stamp after
     // this is a no-op against an already-settled verdict, by stampGateState's
-    // contract; the `--regate` path stamps with force and lands regardless.
+    // contract; the `--regate` path retains the same ownership fence for final bookkeeping.
     //
     // The evidence fields (gate_head/gate_base/trusted sha/factory digest/landed
     // sha) ride IN the settle stamp — one write, one writer — and the settle
@@ -16768,7 +16772,7 @@ async function runGateAndIntegration(cfg, entry, record, ctx) {
   // every fact write — the verdict is the enforcement, the attestation is its
   // record.
   const { attestationObject, ...attested } = await writeRunAttestation(cfg, {
-    item, factory: ctx.factory, gateResult: gateAsStands, intResult, log: ctx.log, home, workerId: ctx.workerId || null, settleToken: settled.token, built: pending.built,
+    item, factory: ctx.factory, gateResult: gateAsStands, intResult, log: ctx.log, home, workerId: ctx.workerId || null, settleToken: settled.token, built: pending.built, origin: pending.origin,
   });
   // Propose mode: the PR body written at propose time predates the graph
   // artifact it must be bound to (the artifact is minted only after the run
@@ -16983,14 +16987,57 @@ function attestationEnvironment(cfg, workerId = null) {
 function prepareRunAttestation(cfg, { item, factory, gateResult, intResult, workerId = null, cwd = null }) {
   try {
     const built = attestation.buildAttestationNode({ item, factory, gate: gateResult, integration: intResult, environment: attestationEnvironment(cfg, workerId), signing: attestationSigning(cfg) });
-    return { built, item, factory: { id: factory.id, integration: factory.integration || null }, intResult, cwd };
+    return { built, item, origin: attestationGraphOrigin(cfg), factory: { id: factory.id, integration: factory.integration || null }, intResult, cwd };
   } catch (e) { return { error: `attestation could not be built: ${e.message}` }; }
+}
+
+// Exact publication destination; no ambient fallback for old unbound outboxes.
+function attestationGraphOrigin(cfg) {
+  if (cfg.mode() === "remote") {
+    const bearer = remote.token(cfg);
+    const server = remote.base(cfg);
+    if (!server || !bearer) throw new Error("remote attestation publication identity is unknown");
+    const org = auth.jwtOrg(bearer);
+    const selectedOrg = typeof cfg.tenant === "function" ? cfg.tenant()?.org : null;
+    if (org && selectedOrg && org !== selectedOrg) throw new Error("effective publication credential disagrees with the selected organization");
+    // Opaque credentials cannot prove an org from tenant metadata. Bind the
+    // actual credential instead; its raw bytes never enter the durable outbox.
+    const credential = crypto.createHash("sha256").update(`spor-attestation-origin\0${bearer}`).digest("hex");
+    return { mode: "remote", server, org: org || null, credential };
+  }
+  const nodes = cfg.nodesDir();
+  let canonical;
+  try { canonical = fs.realpathSync(nodes); } catch { canonical = path.resolve(nodes); }
+  return { mode: "local", nodes: canonical };
+}
+function attestationOriginMatches(cfg, origin) {
+  if (!origin) return false;
+  try { const current = attestationGraphOrigin(cfg); return current.mode === origin.mode && (current.mode === "remote" ? !!origin.server && current.server === origin.server && current.org === origin.org && !!origin.credential && current.credential === origin.credential : current.nodes === origin.nodes); }
+  catch { return false; }
+}
+
+// Freeze the exact bearer and server whose fingerprint was checked. Ordinary
+// HTTP requests may refresh a selected tenant's token, which is unsafe for
+// replay when its metadata disagrees with an explicit token override. Refresh
+// and credential rotation are therefore fail-closed for this publication.
+function attestationPublicationConfig(cfg, origin) {
+  if (!attestationOriginMatches(cfg, origin)) return null;
+  if (origin.mode !== "remote") return cfg;
+  const bearer = remote.token(cfg);
+  const credential = crypto.createHash("sha256").update(`spor-attestation-origin\0${bearer}`).digest("hex");
+  if (credential !== origin.credential) return null;
+  const fixed = { mode: () => "remote", server: () => origin.server, token: () => bearer, tenant: () => null };
+  return new Proxy(cfg, { get(target, key) {
+    if (Object.prototype.hasOwnProperty.call(fixed, key)) return fixed[key];
+    const value = Reflect.get(target, key);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
 }
 
 async function replayAttestationDebts(cfg, { home = cfg.userConfigHome(), log = () => {}, write = writeRunAttestation, refresh = refreshProposalAttestation } = {}) {
   for (const record of dispatchRuns.readRunRecords(home)) {
     const pending = record.gate_attestation_pending;
-    if (!pending || !pending.built || !gatesKernel.SETTLED_GATE_STATES.has(record.gate_state) || !record.gate_settle_id) continue;
+    if (!pending || !pending.built || !attestationOriginMatches(cfg, pending.origin) || !gatesKernel.SETTLED_GATE_STATES.has(record.gate_state) || !record.gate_settle_id) continue;
     const current = freshRecord(home, record);
     if (current.gate_settle_id !== record.gate_settle_id || !current.gate_attestation_pending) continue;
     const r = await write(cfg, { ...pending, built: pending.built, home, log, settleToken: record.gate_settle_id });
@@ -17007,7 +17054,7 @@ async function replayAttestationDebts(cfg, { home = cfg.userConfigHome(), log = 
 // stamp goes through stampGateState's `own` door, so it lands only while the
 // record still holds THIS pipeline's verdict — never force, which would let a
 // pipeline that lost the settle race overwrite the winner's evidence.
-async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, log = () => {}, home = null, workerId = null, settleToken = null, built: prepared = null }) {
+async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, log = () => {}, home = null, workerId = null, settleToken = null, built: prepared = null, origin = null }) {
   // `attestation_missing`/`attestation_error` ride on the result the loop
   // publishes (`--status`), the same fields the run record is stamped with —
   // a missing attestation is part of the verdict's evidence, not a log line
@@ -17029,7 +17076,9 @@ async function writeRunAttestation(cfg, { item, factory, gateResult, intResult, 
     return missing(reason);
   }
   try {
-    const wrote = await writeGateNode(cfg, built.id, built.markdown);
+    const destination = attestationPublicationConfig(cfg, origin || (!prepared ? attestationGraphOrigin(cfg) : null));
+    if (!destination) return missing("publication origin is unknown or its effective credential changed; original evidence remains owed");
+    const wrote = await writeGateNode(destination, built.id, built.markdown);
     if (wrote && wrote.ok) out.attestation = built.id;
     else log(`work: the attestation for ${item.node_id} could not be recorded on the graph (${(wrote && wrote.reason) || "no response"}) — the verdict still stands`);
   } catch (e) {
@@ -17662,6 +17711,14 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
       /* the worker's scope token stands in */
     }
   }
+  const workerId = crypto.randomUUID();
+  const status = { worker_id: workerId, pid: process.pid, started_ticks: dispatchRuns.processStartTicks(process.pid), started_at: new Date().toISOString(), updated_at: new Date().toISOString(), kind: "regate" };
+  if (!workLoop.writeWorkerStatus(home, status)) { err("spor work --regate: could not publish worker liveness; no judgement started"); return 1; }
+  try {
+  const gateClaim = dispatchRuns.claimGateRecord(home, record.run_id, { workerId, ownerLive: (owner) => workLoop.readWorkerStatuses(home, { alive: workerAlive }).some((w) => w.live && w.worker_id === owner), reopen: { settleId: record.gate_settle_id || null, regateCount: Number(record.gate_regate_count) || 0, state: record.gate_state } });
+  if (!gateClaim.ok) { err(`spor work --regate: ${gateClaim.refused || gateClaim.reason}`); return 1; }
+  const owns = () => freshRecord(home, record).gate_settle_id === gateClaim.token;
+  const stamp = (patch) => dispatchRuns.stampGateState(home, record.run_id, patch, { own: gateClaim.token });
   // Bring the implementer's branch up to the trusted ref BEFORE judging it
   // (issue-spor-command-gate-judges-stale-branch-base): the usual reason a
   // run is re-gated is that the trusted ref was red and has since been fixed,
@@ -17671,6 +17728,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // a dirty tree is left alone and refused by the gate as before.
   const refreshed = refreshBranchFromTrustedRef(record.cwd, factory.trustedRef);
   if (refreshed.refused) {
+    stamp({ gate_state: "failed", gate_reason: refreshed.refused });
     err(`spor work --regate: ${refreshed.refused}`);
     return 1;
   }
@@ -17680,8 +17738,6 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // re-gate answers all of them, not only the latest.
   const escalatedBefore = [...new Set([...(Array.isArray(record.gate_escalation_ids) ? record.gate_escalation_ids : []), record.gate_escalated_to].filter(Boolean))];
   out(`work: re-gating ${record.node_id} — run ${shortId}, attempt ${attempt}, under ${factoryId} (previously ${previous})`);
-  const stamp = (patch) => dispatchRuns.stampGateState(home, record.run_id, patch, { force: true });
-  stamp({ gate_state: "running", gate_at: new Date().toISOString(), gate_settle_id: null, gate_worker: null, gate_regate_count: attempt - 1, gate_regated_at: new Date().toISOString() });
   // A re-gate re-opens a controller record's completion: a refusal's
   // `consumed` stamp (reconcileCompletions) must not hide a completion this
   // attempt may now write and then owe.
@@ -17701,19 +17757,11 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
     out(`work: re-gating ${record.node_id} — its implementation stage had settled '${record.impl_state}'; re-judging the run under attempt ${attempt}`);
   }
   const entry = { run_id: record.run_id, node_id: record.node_id, harness: record.harness || null, project, attempt };
-  // A single-shot identity for THIS invocation — --regate has no work-loop
-  // worker to inherit one from, but a re-pin (a fix cycle, or the trusted-ref
-  // merge above moving the tree) still mints a candidate whose provenance
-  // needs SOME worker to attribute it to; a mint that never got one is
-  // permanently unattributed (candidate identity is content-addressed, so a
-  // later re-pin cannot backfill it). Provenance only, same as the loop's own
-  // (task-spor-factory-candidate-record §3.1).
-  const workerId = crypto.randomUUID();
   let res;
   try {
     res = await runGateAndIntegration(cfg, entry, record, {
       factory, slug, passthrough, warn, runMaxMs, home,
-      workerId,
+      workerId, gateClaim,
       log: (line) => out(line),
       stopping: () => false,
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -17721,6 +17769,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   } catch (e) {
     res = { state: "failed", reason: `the gate pipeline threw: ${(e && e.message) || e}` };
   }
+  if (!owns() || res?.superseded || res?.not_run) { err("spor work --regate: ownership changed; no final mutation is applied"); return 1; }
   const state = (res && res.state) || "failed";
   const reason = res && res.reason ? String(res.reason).slice(0, 300) : null;
   stamp({
@@ -17761,6 +17810,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // back comes back. A `scoped` re-judgement answers the escalation but leaves
   // the rollback standing; see the branch below for why.
   const notes = [];
+  if (!owns()) return 1;
   if (escalatedBefore.length) {
     const closed = await writeRegateArtifact(cfg, { record, entry, factoryId, previous, reason, escalatedTo: escalatedBefore, project, state });
     notes.push(closed.ok ? `closed ${escalatedBefore.join(", ")} with ${closed.id}` : `could not close ${escalatedBefore.join(", ")} (${closed.reason}) — resolve by hand`);
@@ -17771,6 +17821,7 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   // superseded — so promoting it back to `done` would mark work complete that
   // the verified outcome says is still outstanding. The rollback stands, and
   // the note says so rather than leaving it unexplained.
+  if (!owns()) return 1;
   if (record.gate_demoted && state === "scoped") {
     notes.push(`left ${record.node_id} open — a scoping result is not a completion, and the earlier rollback is where the scoping wants it`);
   } else if (record.gate_demoted) {
@@ -17779,12 +17830,14 @@ async function cmdWorkRegate(cfg, values, { factory, factoryId, slug, passthroug
   }
   out(`work: re-gate of ${record.node_id} ${state} — ${reason || (state === "scoped" ? "a verified no-code outcome" : "every gate passed")}${notes.length ? `; ${notes.join("; ")}` : ""}`);
   return 0;
+  } finally { workLoop.writeWorkerStatus(home, { ...status, stopped_at: new Date().toISOString(), updated_at: new Date().toISOString() }); }
 }
 
 // Merge the trusted ref into the run's checkout ahead of a re-gate. Returns
 // {note} (what happened, for the log), {} (nothing to do — no checkout, not a
 // git tree, dirty, or already up to date), or {refused} (a conflict).
 function refreshBranchFromTrustedRef(cwd, trustedRef) {
+  const git = (dir, args) => gitSpawn(dir, args, { env: gateRunner.judgeGitEnv() });
   if (!cwd || !fs.existsSync(cwd)) return {};
   if (git(cwd, ["rev-parse", "--is-inside-work-tree"]).status !== 0) return {};
   const dirty = git(cwd, ["status", "--porcelain", "--untracked-files=no"]);
@@ -21642,7 +21695,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning };
+module.exports = { launchSupervisedHarness, attestationPublicationConfig, cmdWorkRegate, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning };
 
 if (require.main === module) {
   main()

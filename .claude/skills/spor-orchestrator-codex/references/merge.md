@@ -46,20 +46,30 @@ resume waiting for that command's result. A helper must not select more work.
    ```bash
    git merge-base --is-ancestor "$BASE" "$CANDIDATE"
    git log --oneline "$BASE..$CANDIDATE"
-   git update-ref refs/heads/main "$CANDIDATE" "$BASE"
    ```
 
-   These are separate checks: proceed to `update-ref` ONLY if ancestry succeeds
-   and the log contains the intended commits. CAS failure means main moved;
-   rebase/test/review anew. Never replace `BASE` with a tip you did not test.
-   Substitute the agreed target ref if this repo does not use `main`.
-5. Updating a ref leaves the shared checkout's index/files at its old content.
-   Never `reset --hard` over that state. For Spor, invoke the client repo's
-   `scripts/heal-stale-root.js --repo <shared-root>` in dry-run mode first.
-   `IN-SYNC` needs nothing; only `STALE` permits the same command with `--apply`.
-   `ROOT-UNSYNCED`, `UNVERIFIED`, or errors mean preserve the root and report it.
-   When the helper is unavailable or cannot confirm safety, validate in a
-   temporary detached worktree at the exact candidate SHA instead.
+   Proceed only when ancestry succeeds and the log contains the intended
+   commits. Under the serialized merge slot, verify the active target checkout
+   is on the agreed branch, still at `BASE`, with a clean index and tracked
+   files. Use `git merge --ff-only "$CANDIDATE"` there so Git updates the ref,
+   index and files together and protects obstructing untracked files. Never
+   stage unrelated untracked work. Recheck the resulting SHA.
+
+   For a target branch that is not checked out, use the compare-and-swap
+   `git update-ref refs/heads/main "$CANDIDATE" "$BASE"` after the same gates.
+   CAS failure means main moved; reconcile and repeat affected checks. Never
+   substitute a tip you did not test. Substitute the agreed target branch if
+   this repo does not use `main`.
+5. If a previous ref-only merge left a shared checkout stale, never use
+   `reset --hard`. For Spor, run `scripts/heal-stale-root.js --repo <shared-root>`
+   in dry-run mode. `IN-SYNC` needs nothing; only `STALE` permits `--apply`.
+   The helper searches first-parent history: it can conservatively report
+   `ROOT-UNSYNCED` when the old main survives as a merge's second parent.
+   Preserve the checkout on any refusal. If and only if your own just-completed
+   CAS is still the target tip and both the index and tracked files exactly
+   match captured `BASE`, you may CAS-undo that ref-only move and perform the
+   guarded fast-forward above. Otherwise use an isolated exact-SHA checkout
+   and investigate; never force healing or erase uncommitted work.
 6. Run the required post-merge suite on that exact merged tree (shared root
    only when verified in sync). If it fails, report the regression immediately
    and perform a reviewed revert within existing authorization, preserving

@@ -4052,16 +4052,38 @@ plus the local end-to-end attestation check in test/integration-step.test.js.
 
 The run-record claim precedes every pipeline mutation. The work loop does not
 pre-stamp `gate_worker`: a losing adopter must not overwrite the live owner's
-nonce before the claim check. Native and supervised judged children both strip
+nonce before the claim check. Proposal pushes and trusted-ref re-gate merges disable repository hooks.
+Native and supervised judged children both strip
 `SPOR_ATTESTATION_KEY` and `SUBSTRATE_ATTESTATION_KEY` from their environments.
 
 Settlement atomically writes the verdict and `gate_attestation_pending`, an
 outbox containing the exact artifact bytes and signature (never the signing
 key). `gate_attestation_missing` remains true until publication succeeds.
 Subsequent worker passes replay this debt without rerunning the gates or
-resigning evidence. A parked proposal retains its debt until its PR body is
+resigning evidence. Replay requires the original server and effective
+credential fingerprint, or the canonical local nodes directory. The raw token
+is never stored. A conflicting JWT organization refuses the binding; opaque
+tokens bind by fingerprint rather than stored tenant metadata. Publication
+freezes that exact bearer/server and disables automatic token refresh, so an
+environment override or credential rotation cannot redirect pending evidence.
+Changed or unknown credentials leave the debt owed for manual reconciliation. An old outbox without an origin binding
+is retained for manual reconciliation and is never published through an ambient
+graph selection. A parked proposal retains its debt until its PR body is
 refreshed successfully. Pending debt prevents run retention from pruning the
-record. Gate, implementation and completion stamps share the same record lock.
+record. Gate, implementation, completion, native/contract settlement and final
+run bookkeeping all share the same record lock, including their read/merge.
+The launcher also merges its post-spawn PID stamp through this lock: a paused
+launcher cannot restore its original record over a completed supervisor or
+subsequent re-gate.
+
+A re-gate publishes its PID and process start ticks before atomically reopening
+the prior verdict. Reopening refuses while the prior judgement still owes an
+attestation outbox; replay that evidence through its original graph first.
+Other workers therefore recognize its live ownership. Its
+final bookkeeping and recovery mutations retain the same ownership nonce; a
+losing re-gate cannot overwrite the successor. Human approval requests name
+and key their identity on the exact judged commit, so a fix that changes the
+candidate requires a fresh approval even when its risk paths stay unchanged.
 
 A stale breaker lock is deliberately fail-closed: age alone cannot authorize
 unlinking its pathname because that pathname may already name a live successor.
