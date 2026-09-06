@@ -783,6 +783,117 @@ test("edge --remove rejects --attr client-side (a removal is identified by type+
   assert.match(r.stderr, /--attr is not accepted with --remove/);
 });
 
+// ---------------- legacy alias spellings in the frontmatter ----------------
+// issue-spor-cmd-edge-alias-spelling-not-canonicalized: parseFrontmatter never
+// canonicalizes an edge type, so a node carrying a legacy alias (`related-to`,
+// `supercedes`, `derives-from`) kept that spelling verbatim while cmdEdge had
+// already canonicalized the REQUESTED type through edgeRenames(). Comparing
+// the raw spellings double-added the canonical form on add, and reported
+// "already absent" on --remove. Both sides canonicalize before comparing; the
+// file's own spelling is never rewritten.
+
+// A dec-y carrying `edges:` written with the legacy alias `spelling`.
+function aliasFixture(spelling, to = "task-x") {
+  const { home, nodes } = fixtureGraph();
+  fs.writeFileSync(path.join(nodes, "dec-y.md"), `---
+id: dec-y
+type: decision
+project: demo
+title: A demo decision
+summary: A decision node used as a resolves-edge target in the local edge test.
+date: 2026-06-01
+edges:
+  - {type: ${spelling}, to: ${to}}
+---
+Body about the decision.
+`);
+  return { home, nodes };
+}
+
+test("edge (local) does not double-add onto a node carrying the legacy alias spelling", () => {
+  const { home, nodes } = aliasFixture("related-to");
+  const r = run(["edge", "dec-y", "relates-to", "task-x"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /edge already present: dec-y -\[relates-to\]-> task-x/);
+  const md = readNode(nodes, "dec-y");
+  assert.match(md, /- \{type: related-to, to: task-x\}/, "the file's own spelling is untouched");
+  assert.doesNotMatch(md, /- \{type: relates-to, to: task-x\}/, "no canonical duplicate appended");
+});
+
+test("edge (local) does not double-add when the alias is REQUESTED against a canonical line", () => {
+  const { home, nodes } = fixtureGraph();
+  run(["edge", "dec-y", "relates-to", "task-x"], { SPOR_HOME: home });
+  const r = run(["edge", "dec-y", "related-to", "task-x"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /edge already present: dec-y -\[related-to\]-> task-x/);
+  assert.strictEqual((readNode(nodes, "dec-y").match(/to: task-x/g) || []).length, 1);
+});
+
+test("edge --remove (local) removes a legacy alias line asked for by its canonical name", () => {
+  const { home, nodes } = aliasFixture("supercedes", "dec-y2");
+  fs.writeFileSync(path.join(nodes, "dec-y2.md"), `---\nid: dec-y2\ntype: decision\nproject: demo\ntitle: A superseded decision\nsummary: A decision node used as the target of a legacy supercedes edge.\ndate: 2026-06-01\n---\nBody.\n`);
+  const r = run(["edge", "dec-y", "supersedes", "dec-y2", "--remove"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /edge removed: dec-y -\[supersedes\]-> dec-y2/);
+  assert.doesNotMatch(readNode(nodes, "dec-y"), /supercedes/);
+  const v = validateGraph(nodes);
+  assert.strictEqual(v.status, 0, v.stdout);
+  assert.match(v.stdout, /0 errors/);
+});
+
+test("edge --remove (local) removes a legacy alias line asked for by the alias itself", () => {
+  const { home, nodes } = aliasFixture("related-to");
+  const r = run(["edge", "dec-y", "related-to", "task-x", "--remove"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /edge removed: dec-y -\[related-to\]-> task-x/);
+  assert.doesNotMatch(readNode(nodes, "dec-y"), /related-to/);
+});
+
+test("edge --remove (local) removes a block-form entry carrying the legacy alias", () => {
+  const { home, nodes } = fixtureGraph();
+  fs.writeFileSync(path.join(nodes, "dec-y.md"), `---
+id: dec-y
+type: decision
+project: demo
+title: A demo decision
+summary: A decision node used as a resolves-edge target in the local edge test.
+date: 2026-06-01
+edges:
+  - type: related-to
+    to: task-x
+---
+Body about the decision.
+`);
+  const r = run(["edge", "dec-y", "relates-to", "task-x", "--remove"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = readNode(nodes, "dec-y");
+  assert.doesNotMatch(md, /related-to/);
+  assert.doesNotMatch(md, /to: task-x/);
+});
+
+test("edge --remove (local) leaves an alias edge to a DIFFERENT target alone", () => {
+  const { home, nodes } = fixtureGraph();
+  fs.writeFileSync(path.join(nodes, "task-x2.md"), `---\nid: task-x2\ntype: task\nproject: demo\ntitle: A second demo task\nsummary: A second demo task whose id shares a prefix with task-x.\ndate: 2026-06-01\n---\nBody.\n`);
+  fs.writeFileSync(path.join(nodes, "dec-y.md"), `---
+id: dec-y
+type: decision
+project: demo
+title: A demo decision
+summary: A decision node used as a resolves-edge target in the local edge test.
+date: 2026-06-01
+edges:
+  - {type: related-to, to: task-x}
+  - {type: related-to, to: task-x2}
+---
+Body about the decision.
+`);
+  const r = run(["edge", "dec-y", "relates-to", "task-x", "--remove"], { SPOR_HOME: home });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = readNode(nodes, "dec-y");
+  assert.doesNotMatch(md, /- \{type: related-to, to: task-x\}/);
+  assert.match(md, /- \{type: related-to, to: task-x2\}/, "the sibling alias edge survives");
+});
+
 test("edge --remove (remote) DELETEs {type, to} to the node's edges endpoint", async () => {
   const { srv, hits, base } = await edgeStub();
   try {

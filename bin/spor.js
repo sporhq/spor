@@ -4345,6 +4345,21 @@ function appendEdgeLine(raw, type, to, attrs) {
   return `---\n${lines.join("\n")}\n---\n${body}`;
 }
 
+// An edge type as the registry's canonical spelling. parseFrontmatter never
+// canonicalizes, so a node authored by hand — or distilled before a rename
+// landed — carries its legacy ALIAS verbatim (`related-to`, `supercedes`,
+// `derives-from`), while every write path here has already run the REQUESTED
+// type through edgeRenames(). Comparing the two raw spellings therefore
+// double-added the canonical form onto a node that already carried the alias,
+// and reported "already absent" when asked to remove the alias
+// (issue-spor-cmd-edge-alias-spelling-not-canonicalized). Both sides go
+// through this before any equality test. It is a COMPARISON-time normalization
+// only: the file's own spelling is never rewritten, so an add still appends
+// the canonical form and a remove withdraws whichever spelling is present.
+function canonEdgeType(type, renames) {
+  return (renames && renames[type]) || type;
+}
+
 // Remove an edge entry matching (type, to) exactly — the withdrawal twin of
 // appendEdgeLine (local `spor edge --remove`, the remove_edge micro-mutation,
 // API.md §1/§3, and the controller-completion retract of a premature
@@ -4374,7 +4389,11 @@ function appendEdgeLine(raw, type, to, attrs) {
 // Returns the new raw, or null when no matching entry exists (the caller
 // reports an idempotent skip, mirroring the server's remove_edge contract) or
 // the frontmatter can't be located.
-function removeEdgeLine(raw, type, to) {
+//
+// `renames` is the registry's `edgeRenames()` map, so an entry written with a
+// legacy ALIAS spelling matches the canonical `type` the caller asks for —
+// see canonEdgeType above. Omitting it degrades to a raw spelling match.
+function removeEdgeLine(raw, type, to, renames) {
   const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(raw);
   if (!m) return null;
   const body = m[2];
@@ -4387,7 +4406,7 @@ function removeEdgeLine(raw, type, to) {
   let match = null; // {start, end} once the target entry is located
 
   const flushEdgeBuf = (end) => {
-    if (edgeBuf && !match && edgeBuf.type === type && edgeBuf.to === to) match = { start: edgeStart, end };
+    if (edgeBuf && !match && canonEdgeType(edgeBuf.type, renames) === type && edgeBuf.to === to) match = { start: edgeStart, end };
     edgeBuf = null;
     edgeStart = -1;
   };
@@ -4403,7 +4422,7 @@ function removeEdgeLine(raw, type, to) {
     const flow = line.match(FLOW_EDGE_RE);
     if (flow) {
       flushEdgeBuf(i);
-      if (!match && flow[1] === type && flow[2] === to) match = { start: i, end: i + 1 };
+      if (!match && canonEdgeType(flow[1], renames) === type && flow[2] === to) match = { start: i, end: i + 1 };
       continue;
     }
     if (inEdgesBlock) {
@@ -4547,12 +4566,12 @@ async function cmdEdge(cfg, { values, positionals }) {
   if (remove) {
     // Unlike add, a removal target need not still exist (removing a stale
     // edge onto a since-deleted node is exactly the cleanup this is for).
-    if (!existing.some((e) => e.type === edgeType && e.to === target)) {
+    if (!existing.some((e) => canonEdgeType(e.type, renames) === edgeType && e.to === target)) {
       out(`edge already absent: ${id} -[${type}]-> ${to}`);
       out(writeTargetLine(cfg));
       return 0;
     }
-    const newRaw = removeEdgeLine(raw, edgeType, target);
+    const newRaw = removeEdgeLine(raw, edgeType, target, renames);
     if (newRaw == null) {
       err(`could not remove ${srcId} -[${edgeType}]-> ${target}: no matching edge entry found in the frontmatter`);
       err(`  (the edge is present per the parsed graph but its line(s) could not be located — rewrite the node with 'spor put-node' instead)`);
@@ -4579,7 +4598,7 @@ async function cmdEdge(cfg, { values, positionals }) {
     err(`edge target '${target}' does not exist — create it first (add_edge never creates dangling edges)`);
     return 1;
   }
-  if (existing.some((e) => e.type === edgeType && e.to === target) && !attrs) {
+  if (existing.some((e) => canonEdgeType(e.type, renames) === edgeType && e.to === target) && !attrs) {
     out(`edge already present: ${id} -[${type}]-> ${to}`);
     out(writeTargetLine(cfg));
     return 0;
@@ -16175,10 +16194,10 @@ async function graphEdgeMutation(cfg, from, type, to, { remove = false } = {}) {
     return { ok: false, reason: `no such node: ${srcId}` };
   }
   const existing = (g.nodes[srcId] && g.nodes[srcId].edges) || [];
-  const present = existing.some((e) => e.type === edgeType && e.to === target);
+  const present = existing.some((e) => canonEdgeType(e.type, renames) === edgeType && e.to === target);
   if (remove && !present) return { ok: true, skipped: true };
   if (!remove && present) return { ok: true, skipped: true };
-  const newRaw = remove ? removeEdgeLine(raw, edgeType, target) : appendEdgeLine(raw, edgeType, target, null);
+  const newRaw = remove ? removeEdgeLine(raw, edgeType, target, renames) : appendEdgeLine(raw, edgeType, target, null);
   if (newRaw == null) return { ok: false, reason: `could not ${remove ? "remove" : "add"} ${srcId} -[${edgeType}]-> ${target}: the frontmatter${remove ? " line" : ""} could not be located` };
   let node;
   try {
