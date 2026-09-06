@@ -188,7 +188,12 @@ when the report is blocked/missing, the run failed, or verification fails.
 Inspect the final report and logs first. Fix environment problems at the same
 tier; escalate capability problems one tier, with Astra as the ceiling.
 
-Allow one recovery attempt per item, then escalate. Verify the old attempt
+Allow one opaque redispatch recovery per item, then escalate to the supervisor.
+A confirmed review defect is concrete work: file its lineage, assign a bounded
+repair within the existing authorization, and rerun affected tests and a fresh
+review. Escalation does not mean abandoning an authorized program or repeatedly
+asking the user to approve ordinary fixes. Keep dependent branches pending and
+reconcile late fixes before their final acceptance. Verify the old attempt
 has ended and its lease permits recovery. Preserve its commits and dirty work;
 never reset or delete them to get a fresh run. Inspect `spor dispatch --print`
 before redispatch if branch/worktree reuse is uncertain. Supply the previous
