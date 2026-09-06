@@ -1163,6 +1163,30 @@ task-spor-factory-execution-outcome-classifier) is still to land, so a declared
 key there is intent the runner validates and does not act on. A factory
 declaring neither block is byte-identical. See test/completion-boundary.test.js
 + test/candidate.test.js + test/candidate-publish.test.js.
+**The execution store adapter (task-spor-client-execution-store-adapter,
+WORKERS.md §10.15):** a controller pipeline's coordination state — one
+execution per (item, factory, pipeline attempt), a fenced lease, an ordered
+idempotent event log, the pinned completion boundary — is held by the SERVER's
+`/v1/executions` store in remote mode (EXECUTION-STATE.md in spor-server is the
+contract; the server refuses a resolving edge into a held item, the one thing a
+client cannot) and by a shape-compatible local store under
+`journal/executions/<tenant>/` in personal mode. `lib/kernel/execution.js` is a
+PORT of the server's reducer and must stay byte-identical to it — the ids
+(`exec-<16 hex>` over the NUL-joined `(tenant, node_id, factory,
+pipeline_attempt)`), the record shape, the event keys, the fence arithmetic —
+so a local execution and a hosted one describe the same thing (the test pins
+the literal the server mints); when the server's reducer changes, this changes
+with it. `lib/shell/execution-store.js` is the two-backed adapter; `bin/spor.js`
+wires it at the claim (`claimExecutionHold` opens the execution and stamps
+`impl_claim.store/tenant/pipeline_attempt/fence` additively), through the
+gate-deps seams (`reportingGateDeps`, so gate-runner/integration-runner learn
+nothing), the per-pass heartbeat (`renewLiveExecutions`), the completion write's
+fence check (`deps.execution.confirm` in lib/shell/completion.js — never the
+resolving edge while ownership cannot be confirmed; a partition spools events to
+a per-execution outbox and replays them in order) and `spor executions`. A legacy
+record or a pre-adapter claim (no `impl_claim.store`) touches no store. Knobs:
+`execution.leaseTtlMs` (`SPOR_EXECUTION_TTL`), `execution.timeoutMs`
+(`SPOR_EXECUTION_TIMEOUT`). See test/execution-store.test.js.
 Server-side ops vars
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard

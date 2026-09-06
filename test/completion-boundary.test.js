@@ -275,12 +275,17 @@ test("parseCandidateReport reads the first non-blank line only, in the fixed for
   assert.deepEqual(completion.parseCandidateReport(null), { ok: false });
 });
 
-test("executionIdFor: exec- plus 16 hex of a field-terminated key over tenant, item, factory and claim time", () => {
-  const parts = { tenant: "https://x", nodeId: "task-x", factoryId: "factory-t", claimedAt: "2026-09-06T00:00:00Z" };
+test("executionIdFor: exec- plus 16 hex of the server's NUL-joined key over tenant, item, factory and pipeline attempt (task-spor-client-execution-store-adapter)", () => {
+  const parts = { tenant: "acme", nodeId: "task-x", factoryId: "factory-t", pipelineAttempt: 1 };
   const id = completion.executionIdFor(parts, sha256);
-  assert.equal(id, `exec-${sha256("https://x\ntask-x\nfactory-t\n2026-09-06T00:00:00Z\n").slice(0, 16)}`);
-  assert.notEqual(id, completion.executionIdFor({ ...parts, claimedAt: "2026-09-06T00:00:01Z" }, sha256), "a fresh claim is a fresh execution");
+  assert.equal(id, `exec-${sha256("acme\u0000task-x\u0000factory-t\u00001").slice(0, 16)}`);
+  assert.notEqual(id, completion.executionIdFor({ ...parts, pipelineAttempt: 2 }, sha256), "a fresh pipeline attempt is a fresh execution");
   assert.equal(completion.executionIdFor({ ...parts, tenant: "" }, sha256), completion.executionIdFor({ ...parts, tenant: "local" }, sha256));
+  assert.equal(completion.executionIdFor({ ...parts, pipelineAttempt: undefined }, sha256), id, "the first attempt is the default");
+  // The literal the server's own reducer mints for the same inputs (pinned
+  // from lib-engine/kernel/execution.js at spor-server bdad326): a local
+  // execution and a hosted one describe the same thing.
+  assert.equal(completion.executionIdFor({ tenant: "local", nodeId: "task-x", factoryId: "factory-t", pipelineAttempt: 1 }, sha256), "exec-4da6d4763543a301");
   assert.throws(() => completion.executionIdFor(parts, null), /sha256/);
 });
 
@@ -726,10 +731,24 @@ test("local mode, end to end through the real doors: H1 holds the item and pins 
   assert.equal(held.recordFields.impl_state, "dispatched");
   assert.deepEqual(held.recordFields.impl_claim.resolving_snapshot, []);
   assert.match(fs.readFileSync(path.join(t.nodesDir, "task-x.md"), "utf8"), new RegExp(`^execution: ${held.executionId}$`, "m"));
-  // A second claim of the same item under a fresh execution is refused (H2).
-  const second = await spor.claimExecutionHold(cfg, { id: "task-x" }, factory, { home: t.dir });
+  // The claim OPENED the execution in the store (task-spor-client-execution-
+  // store-adapter): the id is the store's, the fence is the first lease's.
+  assert.equal(held.store, "local");
+  assert.equal(held.fence, 1);
+  assert.equal(held.recordFields.impl_claim.store, "local");
+  assert.equal(held.recordFields.impl_claim.pipeline_attempt, 1);
+  assert.equal(held.recordFields.impl_claim.tenant, "local");
+  // A second claim by a DIFFERENT worker of the same item is refused (H2):
+  // the first execution's lease is live. (The same worker re-opening is a
+  // RESUME — the store hands its own execution back — not a second one.)
+  const other = loadConfig({ cwd: t.dir, env: { SPOR_HOME: t.dir, XDG_CONFIG_HOME: t.dir, SPOR_DISPATCH_AGENT: "agent-other" } });
+  const second = await spor.claimExecutionHold(other, { id: "task-x" }, factory, { home: t.dir });
   assert.equal(second.ok, false);
   assert.equal(second.kind, "foreign-hold");
+  assert.match(second.reason, /is held by/);
+  const same = await spor.claimExecutionHold(cfg, { id: "task-x" }, factory, { home: t.dir });
+  assert.equal(same.ok, true, "the same worker re-claiming is a resume of the live execution");
+  assert.equal(same.executionId, held.executionId);
   // The queue: task-down is blocked, and stays so with a premature edge.
   fs.writeFileSync(path.join(t.nodesDir, "dec-early.md"), node("dec-early", "decision", { edges: [["resolves", "task-x"]] })[1]);
   let g = graphLib.loadGraph(t.nodesDir);
@@ -788,8 +807,9 @@ test("dispatchWorkItem under `completion.by: controller`: a fake dispatcher that
     [],
     "clearHold must never even be attempted for a launched run"
   );
-  // A second hold claim is refused (H2): the first is still live.
-  const second = await spor.claimExecutionHold(cfg, { id: "task-x" }, factory, { home: t.dir });
+  // A second hold claim by another worker is refused (H2): the first is still live.
+  const other = loadConfig({ cwd: t.dir, env: { SPOR_HOME: t.dir, XDG_CONFIG_HOME: t.dir, SPOR_DISPATCH_AGENT: "agent-other" } });
+  const second = await spor.claimExecutionHold(other, { id: "task-x" }, factory, { home: t.dir });
   assert.equal(second.ok, false);
   assert.equal(second.kind, "foreign-hold");
 });
