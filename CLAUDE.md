@@ -1144,17 +1144,19 @@ terminal status and clearing the hold (`lib/kernel/completion.js` +
 `lib/shell/completion.js`). `implementation.author_checks` (command gate ids
 only, default NONE — the gate re-runs the suite from the trusted ref regardless,
 so an author run is duplicate spend) and `.instructions` shape that same
-prompt. The REST — `profile` routing, `budget`, `retry`,
-`candidate.publish`/`remote`/`bundle_store`, `require_clean`,
-`gates[].rejudge_on_repin` — is validated — and, for the publish policy alone,
-pinned on the run record as `impl_claim.publish` — but not yet spent: the
-stage's dispatch loop
+prompt. Candidate publication (`bundle` | `branch` | `both`, per
+`candidate.publish`/`remote`/`bundle_store`) is shipped too
+(`lib/shell/candidate-publish.js`): a candidate with a commit and no verified
+reference is published at every pin, `spor work` startup refuses to run a
+factory this box cannot publish from (§2.4 E9/E14), and a publish failure
+leaves `publish_pending` owed rather than refusing the pin. The REST —
+`profile` routing, `budget`, `retry`, `require_clean`, `gates[].rejudge_on_repin`
+— is validated but not yet spent: the stage's dispatch loop
 (task-spor-factory-implementation-stage-runner, on
-task-spor-factory-execution-outcome-classifier) and candidate publication
-(task-spor-factory-candidate-portable-reference) are still to land, so a
-declared key there is intent the runner validates and does not act on. A
-factory declaring neither block is byte-identical. See
-test/completion-boundary.test.js + test/candidate.test.js.
+task-spor-factory-execution-outcome-classifier) is still to land, so a declared
+key there is intent the runner validates and does not act on. A factory
+declaring neither block is byte-identical. See test/completion-boundary.test.js
++ test/candidate.test.js + test/candidate-publish.test.js.
 Server-side ops vars
 (`SPOR_GARDENER_MS`, `SPOR_INGEST_CMD`, `SPOR_SANDBOX`, `SPOR_SOLO`,
 `SPOR_ROOT_ID`), worker IPC (`SPOR_STEP`), and the recursion guard

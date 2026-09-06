@@ -176,17 +176,17 @@ convention schema nodes use:
   candidate the gates judge and has the runner write the resolving edge and the
   terminal status at `completion.after` (WORKERS.md §10.12-§10.14). So do
   `implementation.author_checks` and `.instructions`, which shape that contract.
-  The rest of the stage — `profile` routing, `budget`, `retry`,
-  `candidate.publish`/`remote`/`bundle_store`, `require_clean` and
-  `gates[].rejudge_on_repin` — is validated (and, for the publish policy alone,
-  pinned on the run record as `impl_claim.publish`) but not yet spent: the
-  stage's own dispatch loop and candidate publication land with the remaining
-  items of FACTORY-IMPLEMENTATION-STAGE.md §8
-  (task-spor-factory-implementation-stage-runner,
-  task-spor-factory-execution-outcome-classifier,
-  task-spor-factory-candidate-portable-reference). Declaring those keys today is
-  a DECLARATION of intent the runner already validates; it changes nothing about
-  what a worker does now.
+  Candidate publication also runs: `candidate.publish`/`remote`/`bundle_store`
+  govern how the pinned commit is made reachable (`bundle` | `branch` | `both`),
+  `spor work` refuses to start a factory this box cannot publish from, and a
+  publish failure owes `publish_pending` rather than refusing the pin. The rest
+  of the stage — `profile` routing, `budget`, `retry`, `require_clean` and
+  `gates[].rejudge_on_repin` — is validated but not yet spent: the stage's own
+  dispatch loop lands with the remaining items of FACTORY-IMPLEMENTATION-
+  STAGE.md §8 (task-spor-factory-implementation-stage-runner,
+  task-spor-factory-execution-outcome-classifier). Declaring those keys today
+  is a DECLARATION of intent the runner already validates; it changes nothing
+  about what a worker does now.
 
 ```json
 {

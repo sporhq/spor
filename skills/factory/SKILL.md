@@ -146,11 +146,11 @@ factory writes the resolving edge and the terminal status only once the gates
 (and, at `after: integration`, the landing) pass, and an edge or status written
 early is inert under the item's execution hold rather than obeyed. Say the cost
 too: until the pipeline passes the item reads open and held, not done. The
-`implementation:` block beside it declares the implementing lane itself — but
-only `author_checks` and `instructions` take effect today, so offer the rest
-(`profile`, `budget`, `retry`, `candidate.publish`) as a recorded intent the
-runner validates and does not yet spend, never as routing that is happening
-(WORKERS.md §10.14, `references/emitting.md` §3e).
+`implementation:` block beside it declares the implementing lane itself —
+`author_checks`, `instructions` and `candidate.publish`/`remote`/`bundle_store`
+take effect today, so offer the rest (`profile`, `budget`, `retry`) as a
+recorded intent the runner validates and does not yet spend, never as routing
+that is happening (WORKERS.md §10.14, `references/emitting.md` §3e).
 
 If they want a `rescue:` block, say what it is: not a gate, and not an
 orchestrator — a strong-model profile the runner dispatches into the

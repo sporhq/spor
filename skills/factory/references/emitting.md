@@ -392,17 +392,18 @@ They answer two different questions and are adoptable separately:
 
 **Emit only what the runner honors today, unless the operator asks otherwise.**
 Live now: `completion.by`/`completion.after` (the execution hold, the candidate
-submission, the controller's completion write) and the two contract keys above
-— `author_checks`, the command gate ids the implementer runs ITSELF, and
-`instructions`, appended to the worker contract. Parsed and validated — and,
-for the publish policy alone, pinned on the run record as
-`impl_claim.publish` — but **not yet executed**: `profile`, `budget`, `retry`,
-`candidate.publish`/`remote`/`bundle_store`, `candidate.require_clean` and
-`gates[].rejudge_on_repin`. Writing those is a declaration of intent the runner
-already validates and will honor when the stage runner lands — legitimate if the
-operator wants the lane recorded, but say plainly that nothing about them
-changes what a worker does now, or they will read the factory as doing work it
-is not doing.
+submission, the controller's completion write), the two contract keys above —
+`author_checks`, the command gate ids the implementer runs ITSELF, and
+`instructions`, appended to the worker contract — and candidate publication
+(`candidate.publish`/`remote`/`bundle_store`: `bundle` | `branch` | `both`,
+`spor work` refuses to start on a box that cannot publish, a publish failure
+owes `publish_pending` rather than refusing the pin). Parsed and validated but
+**not yet executed**: `profile`, `budget`, `retry` and
+`candidate.require_clean`/`gates[].rejudge_on_repin`. Writing those is a
+declaration of intent the runner already validates and will honor when the
+stage runner lands — legitimate if the operator wants the lane recorded, but
+say plainly that nothing about them changes what a worker does now, or they
+will read the factory as doing work it is not doing.
 
 Keys, with the defaults you get by writing nothing:
 

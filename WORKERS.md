@@ -3166,8 +3166,9 @@ path, the run record and the idle-stop that already own them.
   `origin`); `both` publishes both. Two refusals a parse cannot make — an
   `https://` store in LOCAL mode, where there is no candidate door, and a
   `branch` publish with no usable remote — belong at worker startup beside the
-  `gh` capability check `integration.mode: propose` makes; they land with the
-  publisher itself and are not enforced today (see "What runs today" below).
+  `gh` capability check `integration.mode: propose` makes: `spor work` runs
+  `candidatePublish.publishSatisfiability` there (§2.4 E9/E14) and refuses to
+  start the worker on a box that cannot publish (see "What runs today" below).
 - **`gates[].rejudge_on_repin`** (command gates only, default true; read only
   under `completion.by: controller`) — the per-gate half of the stage.
   Acceptance is a property of the TIP (§10.12): the completion write asserts
@@ -3214,21 +3215,21 @@ floor, because a typo must never read as "no retries", "retry in a second", or
 "no watchdog".
 
 **What runs today.** The parse and its refusals, `author_checks` and
-`instructions` in the worker contract (`lib/shell/worker-contract.js`), and
+`instructions` in the worker contract (`lib/shell/worker-contract.js`),
 everything `completion` governs — the execution hold, the `CANDIDATE:`
 submission, the candidate pin and the controller's completion write (§10.12,
-§10.13) — are shipped. The rest of the stage is declared and validated — and
-the publish policy alone is pinned on the run record, as `impl_claim.publish`
-(§8) — but not yet executed: no dispatch
-is routed by `implementation.profile`, no budget or retry pool is spent
+§10.13) — and candidate publication (`lib/shell/candidate-publish.js`: `bundle`
+| `branch` | `both`, the `spor work`-startup `publishSatisfiability` refusal
+above, and the `publish_pending` debt of an outage) are shipped. The rest of
+the stage is declared and validated but not yet executed: no dispatch is
+routed by `implementation.profile`, no budget or retry pool is spent
 (task-spor-factory-implementation-stage-runner, on the outcome classifier that
-separates the two pools, task-spor-factory-execution-outcome-classifier), no
-candidate object is published to a bundle store or a branch
-(task-spor-factory-candidate-portable-reference), `require_clean` is still
-enforced one step later by the first command gate's own dirty-tree refusal, and
-`rejudge_on_repin` is parsed onto the gate and read by nobody. Declaring those
-keys today is a DECLARATION of intent that the runner already validates and will honor
-when those items land; nothing about them changes what a worker does now.
+separates the two pools, task-spor-factory-execution-outcome-classifier),
+`require_clean` is still enforced one step later by the first command gate's
+own dirty-tree refusal, and `rejudge_on_repin` is parsed onto the gate and read
+by nobody. Declaring those keys today is a DECLARATION of intent that the
+runner already validates and will honor when those items land; nothing about
+them changes what a worker does now.
 
 See test/gates.test.js (the validation table), test/worker-contract.test.js,
 test/candidate.test.js and test/completion-boundary.test.js.

@@ -165,11 +165,12 @@ state them in the proposal in one plain line each, and let them push back.
     `implementation:` block flips `by` to `controller` on its own. Ask for the
     block itself only if they want the lane recorded: `author_checks` (the
     command gate ids the implementer runs itself — default none, since the gate
-    re-runs the suite from the trusted ref anyway) and `instructions` take
-    effect today; `profile`, `budget`, `retry` and `candidate.publish` are
-    parsed, validated and pinned but not yet spent by the runner, so say so
-    rather than letting them read the factory as routing work it is not routing
-    (WORKERS.md §10.14).
+    re-runs the suite from the trusted ref anyway), `instructions`, and
+    `candidate.publish`/`remote`/`bundle_store` (how the pinned commit is made
+    reachable to the controller — `bundle` | `branch` | `both`) take effect
+    today; `profile`, `budget` and `retry` are parsed, validated and pinned but
+    not yet spent by the runner, so say so rather than letting them read the
+    factory as routing work it is not routing (WORKERS.md §10.14).
 
 ## Translating a product answer into a gate
 

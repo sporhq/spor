@@ -505,9 +505,9 @@ defaults to `controller` for a factory whose `implementation` block PARSES,
 it is reachable by construction; naming `integration` with no integration block
 is fatal, since a boundary that can never be reached leaves every item
 unresolved forever. WORKERS.md §10.12-§10.14 documents what runs today (the
-candidate, the execution hold, the controller's completion write) and what is
-parsed and pinned but not yet executed (the stage's own dispatch loop and
-candidate publication). Both `gate` and `factory` are
+candidate, the execution hold, the controller's completion write, and
+candidate publication to a `bundle`/`branch`) and what is parsed and pinned but
+not yet executed (the stage's own dispatch loop). Both `gate` and `factory` are
 `capturable: false` (the distiller never drafts one: a factory changes what a
 worker will accept, so it is written deliberately) and both arrive by adoption
 rather than in the seed, for the same reason. WORKERS.md §10 documents the
