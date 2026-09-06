@@ -1674,3 +1674,33 @@ test("SLOTS extensibility: a synthetic slot flows through validation, parsing, c
   }).errors.some((e) => /kind 'widget-schema' must be one of/.test(e)), true,
     "the synthetic kind is gone again after cleanup");
 });
+
+test("status snapshot projection preserves per-type partitions and universal give-up vocabulary", () => {
+  const resolution = require("../lib/kernel/resolution.js");
+  const source = graph.seedRegistry();
+  const snapshot = source.snapshot();
+  const projected = registry.statusRegistryFromSnapshot(snapshot);
+  assert.ok(projected);
+  for (const type of source.nodeSchemas.keys()) {
+    assert.deepEqual(projected.nonResolvingStatuses(type), source.nonResolvingStatuses(type));
+    assert.deepEqual(projected.inertStatuses(type), source.inertStatuses(type));
+  }
+  const task = snapshot.node_types.find((n) => n.type === "task");
+  task.non_resolving = ["dropped", "awaiting-review"];
+  task.inert = [];
+  snapshot.registers.find((r) => r.name === "terminal-status").classes.push({ id: "dropped" });
+  const g = { registry: registry.statusRegistryFromSnapshot(snapshot) };
+  assert.equal(resolution.isGiveUpStatus("dropped", "task", g), true);
+  assert.equal(resolution.isGiveUpStatus("dropped", "artifact", g), false);
+  assert.equal(resolution.isGiveUpStatus("awaiting-review", "task", g), false);
+  assert.equal(resolution.isGiveUpStatus("abandoned", "task", g), false, "resident declarations replace the seed partition");
+});
+
+test("unreadable status snapshot is unknown rather than an empty policy", () => {
+  for (const value of [null, {}, { node_types: [], registers: null }, { node_types: [{ type: "task" }], registers: [] }]) {
+    assert.equal(registry.statusRegistryFromSnapshot(value), null);
+  }
+  const snapshot = graph.seedRegistry().snapshot();
+  snapshot.node_types.push(snapshot.node_types[0]);
+  assert.equal(registry.statusRegistryFromSnapshot(snapshot), null, "duplicate type policies are ambiguous");
+});

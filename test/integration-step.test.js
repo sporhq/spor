@@ -1607,6 +1607,8 @@ function startFakeGraphServer() {
       res.end(JSON.stringify(obj));
     };
 
+    if (req.method === "GET" && url.pathname === "/v1/schema") return send(200, graphLib.seedRegistry().snapshot());
+
     if (req.method === "GET" && url.pathname.startsWith("/v1/nodes/")) {
       const id = decodeURIComponent(url.pathname.slice("/v1/nodes/".length));
       const entry = store.get(id);

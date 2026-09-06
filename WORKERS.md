@@ -3412,9 +3412,14 @@ every inert inbound resolver, a note — INSTEAD of the `resolution` ride-along.
 `spor get` prints a HELD note and, from this box's run journal, whether the
 holding worker is live, gone (**stale** — fail-closed until released or
 resumed, never read as done), or elsewhere. The hold keeps a COMPLETION inert,
-not a person's decision to drop the work: a give-up status (`abandoned`,
-`rejected` — the registry's non-resolving partition) is dead on the status half
-even while held; the local status door ends the execution in the same write,
+not a person's decision to drop the work: a give-up status must be both
+non-resolving for the item's own type and inert for that type (including the
+universal terminal register). Task `abandoned` qualifies; artifact `in-review`
+and `approved` do not. No type borrows another type's non-resolving stages.
+Remote completion reads the live `/v1/schema` partitions and refuses to mutate
+completion when that policy cannot be verified; it never substitutes shipped
+seed assumptions for an organization's override. A give-up status is dead
+on the status half even while held; the local status door ends the execution in the same write,
 and the reconciler withdraws a hold that outlived an abandonment (and retypes
 our edge back, if it stood) — `set_status abandoned` is the person's door out
 of an execution, and the escalation a refusal files names both doors (`spor

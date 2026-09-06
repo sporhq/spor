@@ -111,6 +111,7 @@ async function startFakeExecutionServer({ tenant = "acme", nodes = {}, workers =
       state.requests.push({ method: req.method, path: url.pathname + url.search, body, bearer });
       const p = url.pathname;
       try {
+        if (req.method === "GET" && p === "/v1/schema") return reply(res, 200, require("../../lib/graph.js").seedRegistry().snapshot());
         if (p.startsWith("/v1/executions")) {
           if (state.unserved) return reply(res, 404, { message: "Route not found" });
           if (state.unservedEnveloped) return reply(res, 404, { error: { code: "not_found", message: "no such route", details: [] } });

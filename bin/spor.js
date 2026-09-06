@@ -4251,7 +4251,7 @@ function setStatusLocal(cfg, id, value, { graph = null } = {}) {
   const current = g.nodes[id] || {};
   let clearHold = false;
   if (resolution.executionHeld(current) && resolution.isTerminalStatus(String(value), type, g)) {
-    if (!resolution.isGiveUpStatus(String(value), g)) {
+    if (!resolution.isGiveUpStatus(String(value), type, g)) {
       return {
         ok: false,
         reason: `'${value}' is refused while ${id} is under execution '${current.execution}' (a factory controller holds it): the controller writes the completion when its gates pass; end the execution explicitly with 'spor release ${id} --execution ${current.execution}' first`,
@@ -16127,15 +16127,23 @@ async function completionReadItem(cfg, nodeId) {
       : r.json.resolution && r.json.resolution.by
         ? [{ by: r.json.resolution.by, edge: r.json.resolution.edge || "resolves" }]
         : [];
+    // Withdrawing a hold is a mutation based on status policy. A shipped
+    // seed fallback cannot establish an organization's give-up semantics.
+    const schema = await remote.get(cfg, "/v1/schema", { timeoutMs: 8000 });
+    const statusRegistry = schema.ok && !schema.jsonError
+      ? require(path.join(ROOT, "lib", "kernel", "registry.js")).statusRegistryFromSnapshot(schema.json) : null;
+    if (!statusRegistry || !statusRegistry.nodeSchemas.has(fm.type)) return { ok: false, reason: `${nodeId}: live status policy could not be read; completion hold is unchanged` };
+    const statusGraph = { registry: statusRegistry };
     const status = String(fm.status || "");
+    const terminal = !!status && (typeof r.json.inert === "boolean" ? r.json.inert : resolution.isTerminalStatus(status, fm.type, statusGraph));
     return {
       ok: true,
       status,
       type: String(fm.type || ""),
-      terminal: !!status && graphLib.isTerminalStatusOffline(status, fm.type || null),
+      terminal,
       execution: typeof fm.execution === "string" ? fm.execution : "",
       executionAt: typeof fm.execution_at === "string" ? fm.execution_at : null,
-      giveUp: resolution.isGiveUpStatus(status, null),
+      giveUp: terminal && resolution.isGiveUpStatus(status, fm.type, statusGraph),
       revision: r.json.revision || null,
       raw: r.json.raw,
       inbound,
@@ -16167,7 +16175,7 @@ async function completionReadItem(cfg, nodeId) {
     terminal: !!status && isTerminalStatus(status, n.type, g),
     execution: typeof n.execution === "string" ? n.execution : "",
     executionAt: typeof n.execution_at === "string" ? n.execution_at : null,
-    giveUp: resolution.isGiveUpStatus(status, g),
+    giveUp: resolution.isGiveUpStatus(status, n.type, g),
     revision: gitBlobSha(buf),
     raw: buf.toString("utf8"),
     inbound: resolution.inboundResolvers(g, nodeId).map((x) => ({ by: x.by, edge: x.edge })),
