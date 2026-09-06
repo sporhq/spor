@@ -922,3 +922,34 @@ Spor is licensed under Apache-2.0. See `LICENSE` and `NOTICE`.
 
 Contributions are welcome under inbound = outbound Apache-2.0.
 
+
+To cancel a factory execution still owned by another worker or machine, use the
+explicit person door:
+
+```sh
+spor release <node-id> --execution <execution-id> --force --reason "Why this execution must stop"
+```
+
+This requires a person credential on a server. Agent credentials cannot use the
+command, including an agent owned by that person. Authorization uses the existing
+tenant graph boundary; it does not introduce a separate project ACL. In local
+mode, the graph home's Git email must bind to a person node and `dispatch.agent`
+must be unset. That local check trusts filesystem/configuration access; it is not
+cryptographic proof of a human at the keyboard.
+
+The command inspects the exact execution, then releases it only if its observed
+state is unchanged. The journal records the person, time, reason, prior owner and
+fence. Late writes from the old worker are refused; release does not mark the
+work complete. The execution acknowledgement precedes graph hold cleanup, and
+cleanup never clears a different execution's hold. No local dispatch record is
+required. If the response is lost or graph cleanup fails, a credential-bound
+cleanup intent stays in `journal/person-force-release` under the user config
+home. Repeat the same explicit command and reason to recover. Receipt recovery
+only reads the authoritative acknowledgement and retries exact graph cleanup;
+it never submits a force release unattended.
+
+Local execution mutations use a filesystem lock across processes. A live writer
+keeps its lock regardless of elapsed time; a verifiably dead process can be
+recovered. Malformed ownership or an abandoned breaker fails closed. Stop all
+local execution writers before manually removing such a lock from the execution
+item index directory; ordinary execution reads never repair or delete it.

@@ -4659,6 +4659,18 @@ async function cmdLease(cfg, action, { positionals, values = {} }) {
     if (action === "extend") err("  duration: 2h / 45m / 30s / 1d (or bare milliseconds)");
     return 1;
   }
+  if (action === "release" && (values.force || values.reason != null)) {
+    if (!values.force || !values.execution || !values.reason || !String(values.reason).trim()) {
+      err("usage: spor release <node-id> --execution <exec-id> --force --reason <reason>");
+      return 1;
+    }
+    try {
+      const result = await forceReleaseFromCli(cfg, { nodeId: id, executionId: String(values.execution).trim(), reason: String(values.reason) });
+      if (!result.ok) { err(result.reason); return 1; }
+      out(`released execution ${values.execution} on ${id} — person release recorded; graph hold cleanup complete`);
+      return 0;
+    } catch (e) { err(`cannot force release: ${e.message || e}`); return 1; }
+  }
   // The person's door out of a factory controller's EXECUTION HOLD
   // (task-spor-factory-controller-completion-boundary, FACTORY-IMPLEMENTATION-
   // STAGE.md §4.5): `spor release <id> --execution <exec-id>` clears the
@@ -16462,6 +16474,27 @@ function openExecutionStoreFor(cfg, { home = cfg.userConfigHome(), mode = null, 
   });
 }
 
+// The local person binding is the existing graph-home Git email viewer. It
+// is filesystem/configuration trust, not proof of an interactive human. An
+// agent-configured local principal is deliberately not promoted to its owner.
+async function forceReleaseFromCli(cfg, { nodeId, executionId, reason, home = cfg.userConfigHome(), remote: remoteOverride = null, clearHold: clearOverride = null } = {}) {
+  let person = null;
+  if (cfg.mode() !== "remote") {
+    if (cfg.get("dispatch.agent", null)) throw new Error("local force release requires person configuration; dispatch.agent is set");
+    const q = require(path.join(ROOT, "lib", "queue.js"));
+    const graph = require(path.join(ROOT, "lib", "graph.js")).loadGraph(cfg.nodesDir());
+    person = q.viewerFor(graph, q.gitIdentityEmail(path.dirname(cfg.nodesDir())))?.id || null;
+    if (!person) throw new Error("local force release requires Git email bound to a person node in this graph");
+  }
+  const origin = attestationGraphOrigin(cfg);
+  const bound = attestationPublicationConfig(cfg, origin);
+  if (!bound) throw new Error("publication identity changed; nothing released");
+  const store = executionStore.openExecutionStore(bound, { home, worker: executionWorkerPrincipal(cfg), person, machine: os.hostname(), pinRead: executionPinRead(cfg), remote: remoteOverride });
+  const deps = makeCompletionDeps(bound, { home });
+  const clearHold = clearOverride || (args => completionShell.clearHold({ ...args, deps }));
+  return require(path.join(ROOT, "lib", "shell", "person-force-release.js")).personForceRelease({ home, store, origin, nodeId, executionId, reason, clearHold });
+}
+
 // The gate verdict words the pipeline records (gate-runner.js's facts) mapped
 // onto the store's fixed `gate.settled` states. `blocked` is not a settled
 // state — a human gate awaiting its approval has not settled — so it reports
@@ -21302,9 +21335,15 @@ const COMMANDS = {
       "dispatches an implementer, under which no resolving edge or terminal status\n" +
       "retires the item). Both modes. Name the id the node carries ('spor get') — a\n" +
       "hold left by a dead worker is fail-closed until a person ends it here or a\n" +
-      "same-factory worker resumes the pipeline.",
+      "same-factory worker resumes the pipeline.\n\n" +
+      "Add --force --reason <text> to end a live foreign execution deliberately.\n" +
+      "Requires a person credential remotely; locally, Git email must bind a person\n" +
+      "and dispatch.agent must be unset. The execution is released before graph cleanup.\n" +
+      "Repeat this exact command to recover a lost acknowledgement or owed cleanup.",
     options: {
       execution: { type: "string", desc: "clear the execution hold with this id instead of releasing the lease" },
+      force: { type: "boolean", desc: "explicit person release of a live foreign execution (requires --reason)" },
+      reason: { type: "string", desc: "audited reason for --force (1-2000 characters)" },
     },
     examples: ["spor release task-x", "spor release task-x --execution exec-0123456789abcdef"],
     run: (cfg, p) => cmdLease(cfg, "release", p),
@@ -22085,7 +22124,7 @@ async function main() {
 // Expose the pure helpers for unit tests (the version-check logic has no I/O),
 // and only run the CLI when invoked directly — requiring this file must not
 // kick off main() and call process.exit under the test runner.
-module.exports = { makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig };
+module.exports = { forceReleaseFromCli, makeFactoryAvailabilityCheck, dispatchSatisfiableWorkItem, cmdWorkRegate, refreshBranchFromTrustedRef, attestationGraphOrigin, attestationOriginMatches, prepareRunAttestation, replayAttestationDebts, settleRunRecord, writeRunAttestation, dispatchableQueuePage, ladderWidth, extractOrgFlag, isCredentialAcquisition, loadedCodeCommit, makeCodeMovedNotice, codeWatchRef, gateRescueDiagnosis, rescueDiagnosisPath, excludeRescueDiagnosisDir, nodeFloor, nodeRuntimeCheck, nodeConfirmedAbsent, verCmp, sporConnectorBound, hasCmd, COMMANDS, resolveVerb, getNodeJson, gitBlobSha, refreshAgentsBlockIfManaged, gateApprovalState, gateIdSuffix, writeGateNode, buildGateWorkNode, gateDemoteItem, gatePromoteItem, blockerAlreadyClosed, proposalSettledMeanwhile, restoreProposal, checkProposals, healProposalTracking, proposalTrackingId, buildProposalTrackingNode, setStatusLocal, makeGateDeps, makeIntegrationDeps, runGateAndIntegration, retryOneEscalation, writeEscalationRetryArtifact, acquireLocalIntegrationLease, releaseLocalIntegrationLease, integrationLeaseKey, acquireIntegrationLease, releaseIntegrationLease, gateLeaseBudgetMs, acquireLocalDispatchLock, releaseLocalDispatchLock, localDispatchLockFile, loadFactoryDefinition, runSupervisorAlive, workerAlive, pollWorkRuns, nativeAgentEvidence, verifyRunResolution, releaseIdleLease, runGraphMatches, settleNativeContracts, nativeContractDoor, stopNativeAgent, makeAgentReaper, proposeIntegrationPR, ghPrStatus, integrationSatisfiability, resolveCmdShimNodeTarget, claimExecutionHold, implBudgetStamp, makeCompletionDeps, completionReadItem, completionCasWrite, graphEdgeMutation, reconcileCompletions, dispatchWorkItem, executionReporter, openExecutionStoreFor, reportingGateDeps, executionCompletionDeps, renewLiveExecutions, LIVE_EXECUTIONS, editProposalBody, refreshProposalAttestation, buildProposalBody, attestationSigning, launchSupervisedHarness, attestationPublicationConfig };
 
 if (require.main === module) {
   main()
