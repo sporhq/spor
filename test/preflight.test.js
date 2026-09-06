@@ -34,7 +34,7 @@ const CLI = path.join(__dirname, "..", "bin", "spor.js");
 const preflight = require("../lib/shell/preflight.js");
 const dispatchHarnesses = require("../lib/shell/dispatch-harnesses.js");
 const { writeSpawnableNodeStub, pathWithOnlyGitAndNode } = require("./helpers/portable");
-const { waitForFile } = require("./helpers/launch.js");
+const { waitForFile, scale } = require("./helpers/launch.js");
 
 // ------------------------------------------------------------- pure layer --
 
@@ -340,14 +340,17 @@ test("two CONCURRENT processes racing for one candidate: exactly one holds it", 
   const r = await preflight.acquireWorkspace(process.argv[2], process.argv[3], { waitMs: 0 });
   process.stdout.write(JSON.stringify({ ok: r.ok, held: !!r.token, degraded: r.degraded || null }));
   // Hold it: the point is whether BOTH believe they own it at the same moment.
-  await new Promise((res) => setTimeout(res, 1500));
+  // A loaded box can stretch node-spawn + require() latency past a fixed hold,
+  // so the loser's read can land after the winner already exited and its pid
+  // reads as recycled rather than alive — the hold must scale with load too.
+  await new Promise((res) => setTimeout(res, Number(process.argv[4])));
 })();
 `
   );
   const contend = () =>
     new Promise((resolve) => {
       let out = "";
-      const c = spawn(process.execPath, [script, home, dir], { stdio: ["ignore", "pipe", "ignore"] });
+      const c = spawn(process.execPath, [script, home, dir, String(scale(1500))], { stdio: ["ignore", "pipe", "ignore"] });
       c.stdout.on("data", (d) => (out += d));
       c.on("close", () => resolve(JSON.parse(out || "{}")));
     });

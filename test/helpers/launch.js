@@ -101,4 +101,4 @@ function stubExitTail({ holdFile = null, exitCode = 0, delayMs = 0 } = {}) {
 }`.trim();
 }
 
-module.exports = { waitFor, waitForFile, awaitJson, awaitRecord, stubExitTail };
+module.exports = { scale, waitFor, waitForFile, awaitJson, awaitRecord, stubExitTail };

@@ -24,19 +24,39 @@ const assert = require("node:assert/strict");
 const path = require("path");
 
 const graph = require(path.join(__dirname, "..", "lib", "graph.js"));
-const { sandboxFor } = require(path.join(__dirname, "..", "lib", "sandbox.js"));
+const { createSandbox } = require(path.join(__dirname, "..", "lib", "sandbox.js"));
 const { STATUS_VOCAB } = require(path.join(__dirname, "helpers", "status-vocab.js"));
+const { scale } = require(path.join(__dirname, "helpers", "launch.js"));
 
-const SLACK = { timeoutMs: 5000 };
+// `sandboxFor`'s memoized instance is built with the sandbox's own
+// PRODUCTION default (a 100ms vm-script timeout on the one-time setup/freeze
+// script, lib/sandbox.js DEFAULT_TIMEOUT_MS) with no way for a caller to
+// raise it. That fixed budget is wall-clock, not CPU-time, so a loaded fleet
+// box can blow it on nothing more than a few freeze() calls — this suite
+// builds its own scaled sandboxes via createSandbox() directly instead
+// (mirroring sandboxFor's own cache), so only the test's budget moves.
+const SLACK = { timeoutMs: scale(5000) };
+const _sandboxCache = new Map();
+function scaledSandboxFor(schema) {
+  const src = schema.codeBlocks && schema.codeBlocks.length ? schema.codeBlocks.join("\n") : null;
+  if (!src) return null;
+  const key = `${schema.id}@${schema.version}:${src}`;
+  let sb = _sandboxCache.get(key);
+  if (!sb) {
+    sb = createSandbox(src, { timeoutMs: scale(100) });
+    _sandboxCache.set(key, sb);
+  }
+  return sb;
+}
 
 function schemaFor(key) {
   const s = graph.loadSeedSchemas().find((x) => x.key === key);
   assert.ok(s, `seed schema for '${key}' not found`);
   return s;
 }
-const callValidate = (key, node) => sandboxFor(schemaFor(key)).call("validate", [node], SLACK);
+const callValidate = (key, node) => scaledSandboxFor(schemaFor(key)).call("validate", [node], SLACK);
 const callTransitions = (key, cur, prop, view) =>
-  sandboxFor(schemaFor(key)).call("transitions", [cur, prop, view || {}], SLACK);
+  scaledSandboxFor(schemaFor(key)).call("transitions", [cur, prop, view || {}], SLACK);
 
 // The simple vocabulary types: validate() rejects exactly the off-vocabulary
 // statuses, accepts every valid one and the status-less (live) case.
@@ -83,7 +103,7 @@ test("seed schema-artifact: 'active' and 'done' are in-vocabulary (non-delivery 
 });
 
 test("seed schema-artifact: the type is gated on membership only — no transitions() hook", () => {
-  const sb = sandboxFor(schemaFor("artifact"));
+  const sb = scaledSandboxFor(schemaFor("artifact"));
   assert.deepEqual(sb.names, ["validate"],
     "artifact exports validate() only: the stages are not a state machine, so nothing gates ORDER");
 });
