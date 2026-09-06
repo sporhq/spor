@@ -9442,3 +9442,101 @@ test("all pending gate and rescue-pass evidence settles before tree reads, pins,
     assert.deepEqual(real.checkEvidenceOrigins(), { ok: true }, "paid obligations do not deadlock normal resumes");
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
+
+test("flake filing replay preserves the remaining fix cycles independently of payment completion", async (t) => {
+  for (const priorFixes of [0, 1]) for (const crashAt of ["draft", "outcome", "receipt-before", "receipt-after"]) {
+    await t.test(`${priorFixes} earlier fixes; crash at ${crashAt}`, async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "spor-flake-continuation-"));
+      try {
+        fs.mkdirSync(path.join(dir, "test"));
+        for (const name of ["one", "two"]) fs.writeFileSync(path.join(dir, "test", `${name}.test.js`), 'require("node:assert");');
+        const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "npm test", isolate: "node --test {files}", cycles: priorFixes + 1, reruns: 0 }] });
+        const run = async (interrupted) => {
+          let progress = null, fixes = 0, armed = interrupted;
+          const facts = new Map(), events = [], workers = [];
+          const worker = () => {
+            const f = treeFakes({ dir, changed: ["lib/x.js"], run: (_attempt, command) => {
+              events.push(command ? "isolate" : "suite");
+              if (command || fixes > priorFixes) return { ok: true };
+              return { ok: false, code: 1, output: fixes < priorFixes ? "an ordinary first-cycle failure" : "✖ original flake\n test/one.test.js:1:1\n test/two.test.js:1:1" };
+            }, fix: async ({ cycle, onLaunch }) => {
+              events.push(`fix:${cycle}`);
+              assert.equal(cycle, fixes, "replay neither skips nor replenishes a fix cycle");
+              await onLaunch({ runId: `fix-${cycle}` });
+              fixes += 1;
+              return { ok: true, runId: `fix-${cycle}` };
+            } });
+            const read = f.deps.changedPaths;
+            f.deps.changedPaths = async () => { events.push("tree"); return { ...await read(), head: `head-${fixes}` }; };
+            f.deps.fileFlakeItem = async ({ file }) => file.includes("one") ? { ok: true, id: "issue-one" } : { ok: false, reason: "second filing refused" };
+            f.deps.loadGateProgress = async () => progress && JSON.parse(JSON.stringify(progress));
+            f.deps.saveGateProgress = async ({ progress: p }) => {
+              const outcome = p.filingIntent && p.filingIntent.outcome;
+              const receipt = p.evidence && p.evidence.complete;
+              if (armed && ((crashAt === "draft" && outcome) || (crashAt === "receipt-before" && receipt))) {
+                armed = false; throw new Error("injected crash before save");
+              }
+              progress = JSON.parse(JSON.stringify(p));
+              if (armed && ((crashAt === "outcome" && outcome) || (crashAt === "receipt-after" && receipt))) {
+                armed = false; throw new Error("injected crash after save");
+              }
+            };
+            f.deps.recordFact = async ({ id, markdown, flakeIssues }) => {
+              if (flakeIssues.length) events.push("pay");
+              const previous = facts.get(id);
+              if (previous) assert.equal(markdown, previous, "payment replay preserves the original fact");
+              facts.set(id, markdown);
+              return { ok: true, id, existing: !!previous, identical: true };
+            };
+            workers.push(f);
+            return f;
+          };
+          const first = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: worker().deps });
+          let result = first;
+          if (interrupted) {
+            assert.equal(first.state, "interrupted");
+            assert.equal(fixes, priorFixes, "the interrupted filing has not launched its remaining fix");
+            const before = events.length;
+            const debtWasPaid = progress.evidence && progress.evidence.complete;
+            result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: worker().deps });
+            const replay = events.slice(before);
+            assert.deepEqual(replay.filter((x) => x === "suite" || x === "isolate"), ["suite"], "only the fixed head is tested; the filed outcome is consumed without another suite or isolation");
+            if (!debtWasPaid) assert.ok(replay.indexOf("pay") >= 0 && replay.indexOf("pay") < replay.indexOf("tree"), "payment precedes candidate reads and all ordinary work");
+            else assert.equal(replay.includes("pay"), false, "a completed receipt is not paid again");
+          }
+          assert.equal(result.state, "passed");
+          assert.equal(fixes, priorFixes + 1);
+          assert.equal(workers.reduce((n, f) => n + f.seen.escalations.length, 0), 0);
+          assert.equal([...facts.values()].filter((md) => md.includes("type: relates-to, to: issue-one")).length, 1, "the original occurrence is recorded once");
+          return { state: result.state, fixes, cycles: workers.flatMap((f) => f.seen.fixes.map((x) => x.cycle)) };
+        };
+        assert.deepEqual(await run(true), await run(false), "crash/replay has the same fix budget and outcome as uninterrupted execution");
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
+});
+
+test("a paid filing continuation preserves the cap and only judges its original head and declaration", async (t) => {
+  for (const scenario of ["exhausted", "no-retry", "new-head", "new-definition"]) await t.test(scenario, async () => {
+    const factory = factoryOf({ ...BASE, gates: [{ id: "acceptance", kind: "command", command: "test", cycles: 1, reruns: 0 }] });
+    const f = fakes();
+    const { ok, paths, ...change } = await f.deps.changedPaths();
+    const flake = { issues: ["issue-one"], files: ["test/off.test.js"], linked: ["issue-one"], linkedBy: "original-fact" };
+    const outcome = { passed: false, verdict: "failed", detail: "original classified failure", flake, ...(scenario === "no-retry" ? { noRetry: true } : {}) };
+    let progress = {
+      fixes: scenario === "exhausted" ? 1 : 0,
+      attempts: scenario === "exhausted" ? [{ passed: false, verdict: "failed", detail: "earlier failure" }] : [], ledger: [],
+      evidence: { complete: true, fact: "original-fact", outcome, payment_receipts: flake, gate: factory.gates[0], change, definition: factory.definition || null, continuation: { phase: "judge", cycle: scenario === "exhausted" ? 1 : 0 } },
+    };
+    if (scenario === "new-head") progress.evidence.change = { ...change, head: "old-head" };
+    if (scenario === "new-definition") progress.evidence.definition = { revision: "old-declaration" };
+    f.deps.loadGateProgress = async () => JSON.parse(JSON.stringify(progress));
+    f.deps.saveGateProgress = async ({ progress: p }) => { progress = JSON.parse(JSON.stringify(p)); };
+    const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+    const changed = scenario.startsWith("new-");
+    assert.equal(result.state, changed ? "passed" : "failed");
+    assert.equal(f.seen.fixes.length, 0, "no extra fix after the cap, explicit noRetry, or a newly passing candidate");
+    assert.deepEqual(f.seen.suites, changed ? ["acceptance"] : [], "only a changed candidate needs a new judgement");
+    assert.equal(f.seen.escalations.length, changed ? 0 : 1);
+  });
+});
