@@ -893,12 +893,14 @@ function spoolStats(dir) {
 // Machine-local / ephemeral state inside a graph home that must NEVER ride a
 // SHARED graph repo's git flow (issue-cc-local-mode-graph-sharing-gap,
 // dec-spor-local-mode-sharing-boundary): journal/cache/outbox are runtime
-// scratch, and auth/ + config.json hold tokens, so this doubles as a
-// secret-leak guard (broader than the decision's "journal/cache/outbox"). The
-// durable graph — nodes/ and history/ — is intentionally NOT ignored. Anchored
-// with a leading slash to the home root so a same-named dir under nodes/ is
-// unaffected.
-const GRAPH_IGNORES = ["/journal/", "/cache/", "/outbox/", "/auth/", "/config.json"];
+// scratch, candidates/ holds factory candidate BUNDLES (binary git artifacts,
+// the default `implementation.candidate.bundle_store`,
+// FACTORY-IMPLEMENTATION-STAGE.md §2.1), and auth/ + config.json hold tokens,
+// so this doubles as a secret-leak guard (broader than the decision's
+// "journal/cache/outbox"). The durable graph — nodes/ and history/ — is
+// intentionally NOT ignored. Anchored with a leading slash to the home root so
+// a same-named dir under nodes/ is unaffected.
+const GRAPH_IGNORES = ["/journal/", "/cache/", "/outbox/", "/candidates/", "/auth/", "/config.json"];
 
 // Ensure a shared graph home carries a .gitignore covering GRAPH_IGNORES.
 // Idempotent and ADDITIVE: writes the full block (with a header) when absent,

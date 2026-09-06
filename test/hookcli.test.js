@@ -1595,7 +1595,7 @@ test('session-start: a `.spor` graph: marker overrides the env home and writes t
   assert.ok(ctx.includes(path.join(shared, 'nodes')), 'briefing should name the shared nodes dir');
   // The shared home got a .gitignore covering machine-local state.
   const gi = fs.readFileSync(path.join(shared, '.gitignore'), 'utf8');
-  for (const ig of ['/journal/', '/cache/', '/outbox/', '/auth/', '/config.json']) {
+  for (const ig of ['/journal/', '/cache/', '/outbox/', '/candidates/', '/auth/', '/config.json']) {
     assert.ok(gi.includes(ig), `shared .gitignore missing ${ig}`);
   }
   // The personal env home was untouched (no .gitignore generated there).

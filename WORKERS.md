@@ -1066,6 +1066,7 @@ it, and §10.7 still demotes it on a refusal. No record is ever rewritten, and
 | `completion_premature` | string[] | the source node ids of resolving edges that were written under the hold and retyped `relates-to` as evidence (§10.13) |
 | `completion_facts` | string[] | the gate/merge fact ids the pipeline filed, carried so a completion re-driven by a later pass can still link them |
 | `completion_note` | string | optional — the one-line reason a completion was withdrawn or consumed |
+| `publish_pending` | object \| null | the publish a candidate still **owes** (`{reason, classification, at}`), stamped whenever a pin could not publish and cleared by the publish that verifies. `classification` is `infrastructure` (an outage — re-attempted from the workspace on the next pin, never by re-dispatching the implementer), `candidate-mismatch` (the published evidence does not describe the candidate) or `publish-conflict` (the id already holds a different object). A pin never FAILS on it: the tree is judged regardless, but the stage stays unsettled |
 
 **The candidate object** (`impl_candidate`, and every entry of
 `impl_candidates`), minted by `lib/kernel/candidate.js`:
@@ -1092,6 +1093,44 @@ A consumer reading `impl_state` as a verdict must check it is settled, exactly
 as for `gate_state`. A consumer reading `impl_candidate` must consume the
 **pinned** `commit`, never a branch head: a head that is a same-tree relabel of
 the pinned commit is not what was judged.
+
+**Publishing the candidate** (`lib/shell/candidate-publish.js`). Every
+candidate carries a portable reference — **there is no `publish: none`** — so
+that a controller which does not share a filesystem with the implementer can
+obtain `commit` and prove it resolves to `tree`. The factory declares which
+door(s) under `implementation.candidate`:
+
+| `publish` | what is written | `reference` fields |
+|---|---|---|
+| `bundle` (default) | `git bundle create` of `base.merge_base..commit`, under `refs/spor/candidates/<candidate_id>`, into `candidate.bundle_store` (default `file://<SPOR_HOME>/candidates`, gitignored beside `journal/`) | `{kind, store, key, locator, commit, sha256, bytes, verified_at}` |
+| `branch` | `git push <resolved url> <commit>:refs/spor/candidates/<candidate_id> --force-with-lease=<ref>:` — the empty expectation, i.e. **create only if absent**, never `--force` | `{kind, locator, ref, commit, verified_at}` |
+| `both` | both, with the bundle as `reference` and `references[]` carrying both doors | as above |
+
+Four properties the publisher is built around:
+
+- **The published object is immutable and keyed by `candidate_id`.** A re-pin
+  onto the same tree publishes nothing (its commit joins `commits_seen`); a
+  re-pin onto a new tree is a new candidate with its own object. A store that
+  already holds the id is READ, never overwritten: the same bytes are a
+  replayed no-op (a crash after a landed publish), different bytes are a
+  `publish-conflict`.
+- **The producer verifies its own publish by fetching it back**, into a scratch
+  repository, from the locator — never by reading its working tree. `commit`
+  and `commit^{tree}` must match what the candidate pins, or the publish is a
+  `candidate-mismatch` caught on the machine that can still fix it.
+  `reference.verified_at` is stamped only by that round trip, and a candidate is
+  not SUBMITTED (`impl_state: candidate`) until it is.
+- **A locator is an absolute `file://` or `https://` URI.** A remote NAME, an
+  `ssh://`/scp-style remote, a bare sha, a relative path and anything under the
+  producing run's own working tree or inside a `.git` directory are refused —
+  they resolve only on the machine that is about to disappear.
+- **A worker refuses at startup what a parse could not read**: an `https://`
+  store in local mode (there is no candidate door without a server), a
+  `file://` store it cannot write, and a `branch` publish whose remote does not
+  exist — or resolves to a scheme no reader can fetch — in every checkout it
+  knows about. This is FATAL, unlike the `gh`/propose warning: a box that
+  cannot publish can submit nothing at all, so dispatching implementers there
+  burns spend to produce nothing.
 
 A consumer reading `gate_state` as a verdict must check it is one of the
 settled values (`passed`/`failed`/`blocked`/`superseded`/`scoped`, or `parked`

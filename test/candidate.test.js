@@ -264,6 +264,13 @@ test("a reference must be fetchable by locator, or it is refused with the reason
     [{ ...ok, locator: "ssh://git@h/r.git" }, /not a reachable scheme/],
     [{ ...ok, commit: "abc" }, /reference.commit must be the full pinned commit/],
     [{ ...ok, locator: "file:///home/x/repo/.git/cand.bundle" }, /\.git directory/],
+    // issue-spor-candidate-reference-percent-encoding-bypass: the `.git` rule
+    // ran on the RAW locator while the traversal rule decoded first, so a
+    // percent-encoded dot walked straight past it into the one place §3.4 names
+    // explicitly as not-a-store. Both rules judge the decoded form now.
+    [{ ...ok, locator: "file:///home/x/.spor/candidates/%2egit/objects/c.bundle" }, /\.git directory/],
+    [{ ...ok, locator: "file:///home/x/.spor/candidates/%2Egit/objects/c.bundle" }, /\.git directory/],
+    [{ ...ok, locator: "file:///home/x/.spor/candidates/repo%2F%2egit/c.bundle" }, /\.git directory/],
     [{ ...ok, locator: "file:///home/x/.spor/candidates/../../../etc/x.bundle" }, /relative path segment/],
     [{ ...ok, locator: "file:///home/x/.spor/candidates/%2e%2e/x.bundle" }, /relative path segment/],
     // `\` is a path separator for special schemes on EVERY platform per the

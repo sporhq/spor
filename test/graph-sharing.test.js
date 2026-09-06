@@ -16,7 +16,7 @@ const { gitInit } = require('./helpers/git');
 function tmp() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'spor-share-'));
 }
-const IGNORES = ['/journal/', '/cache/', '/outbox/', '/auth/', '/config.json'];
+const IGNORES = ['/journal/', '/cache/', '/outbox/', '/candidates/', '/auth/', '/config.json'];
 
 // --- ensureGraphGitignore -------------------------------------------------
 
@@ -55,7 +55,7 @@ test('gitignore: additive — preserves a contributor file, appends only the mis
   assert.ok(body.includes('*.log'), 'clobbered user rule');
   // /cache/ was already present -> not duplicated
   assert.strictEqual(body.split('\n').filter((l) => l.trim() === '/cache/').length, 1);
-  // the other four were appended
+  // every other entry was appended
   for (const ig of IGNORES.filter((x) => x !== '/cache/')) assert.ok(body.includes(ig), `missing ${ig}`);
 });
 

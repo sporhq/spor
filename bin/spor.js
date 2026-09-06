@@ -42,6 +42,7 @@ const candidateKernel = require(path.join(ROOT, "lib", "kernel", "candidate.js")
 const completionKernel = require(path.join(ROOT, "lib", "kernel", "completion.js"));
 const completionShell = require(path.join(ROOT, "lib", "shell", "completion.js"));
 const gateRunner = require(path.join(ROOT, "lib", "shell", "gate-runner.js"));
+const candidatePublish = require(path.join(ROOT, "lib", "shell", "candidate-publish.js"));
 const integrationRunner = require(path.join(ROOT, "lib", "shell", "integration-runner.js"));
 const workerContractLib = require(path.join(ROOT, "lib", "shell", "worker-contract.js"));
 const { workerContract } = workerContractLib;
@@ -13451,7 +13452,7 @@ function makeGateDeps(
         }),
       });
       if (!pinned.ok) return pinned;
-      const folded = candidateKernel.repinCandidate(current.impl_candidate || null, pinned.candidate);
+      let folded = candidateKernel.repinCandidate(current.impl_candidate || null, pinned.candidate);
       // A late or racing FIRST pin (issue-spor-pin-candidate-settled-record-
       // stamp-race): `current.impl_candidate` reads null — so `folded.change`
       // reads "created" — whenever no earlier pin from THIS record's own
@@ -13475,9 +13476,53 @@ function makeGateDeps(
         warn(`warning: pinCandidate refusing a late first-pin stamp on ${entry.run_id} — impl_state already settled (${current.impl_state})`);
         return { ok: true, candidate: current.impl_candidate || null, change: "refused-settled" };
       }
+      // PUBLISH (task-spor-factory-candidate-portable-reference, §3.4).
+      // Submission is not complete until the reference verified, and there is
+      // no `publish: none` — so a candidate with a commit and no verified
+      // reference is a publish OWED, never a deliberate omission. It runs at
+      // submission and again at every re-pin; a re-pin that only grew
+      // `commits_seen` returns the SAME already-published object and the
+      // publisher does nothing (`candidateSubmitted` short-circuits it).
+      //
+      // A failure NEVER refuses the pin: the tree is judged regardless (a
+      // publish is how a controller obtains the candidate, not what makes the
+      // candidate). What it does is leave the stage UNSETTLED with
+      // `publish_pending` owed — re-attemptable from the workspace on the next
+      // re-pin under the retry pool, which is the one retry that must never
+      // re-dispatch the implementer.
+      let publishPending = null;
+      if (!candidateKernel.candidateSubmitted(folded.candidate)) {
+        const policy = factory.implementation.candidate || {};
+        const kinds = candidatePublish.publishKinds(policy.publish);
+        let store = null;
+        if (kinds.includes("bundle")) {
+          const resolved = candidatePublish.resolveBundleStore(factory, { graphHome: home, mode: cfg.mode() });
+          // A store the worker's own startup check already refused is reported
+          // here too rather than silently skipped: this closure also runs for a
+          // pipeline RESUMED by a worker that never made that check.
+          store = resolved.errors.length ? null : resolved.store;
+          if (resolved.errors.length) publishPending = { reason: resolved.errors[0], classification: "infrastructure", at: new Date().toISOString() };
+        }
+        if (!publishPending) {
+          const published = await candidatePublish.publishCandidate(folded.candidate, {
+            cwd: (folded.candidate.provenance && folded.candidate.provenance.cwd) || record.cwd || null,
+            publish: policy.publish,
+            bundleStore: store,
+            remote: policy.remote,
+            http: candidatePublish.httpStoreClient({ bearer: cfg.mode() === "remote" ? remote.token(cfg) : null }),
+          });
+          folded = { ...folded, candidate: published.candidate || folded.candidate };
+          if (!published.ok) publishPending = { reason: published.reason, classification: published.classification, at: new Date().toISOString() };
+          else if (published.published) log(`work: published candidate ${folded.candidate.candidate_id} to ${folded.candidate.reference.locator}`);
+        }
+        if (publishPending) log(`work: candidate ${folded.candidate.candidate_id} is not published yet (${publishPending.reason}) — the tree is judged regardless`);
+      }
       const patch = {
         impl_candidate: folded.candidate,
         impl_candidates: candidateKernel.appendCandidateChain(current.impl_candidates, folded.candidate),
+        // Cleared by the publish that verifies, so an operator reading `spor
+        // runs` never sees a stale debt beside a published candidate.
+        publish_pending: publishPending,
       };
       // The FIRST pin is the stage's submission and is the only one that
       // stamps the stage's own dimensions: a re-pin never touches `impl_state`
@@ -16031,6 +16076,32 @@ async function cmdWork(cfg, { values }) {
     if (!startupGh.ok) {
       err(`spor work: factory '${factoryId}' declares integration mode 'propose', but ${startupGh.reasons[0]}`);
       err("  every candidate under this factory will be skipped here (see 'spor work --status') until gh is available, or run this worker on a box that has it.");
+    }
+    // §2.4 E9 and E14, deferred out of the parser because a parse can read
+    // neither a checkout nor a filesystem nor a mode. Unlike the `gh` check
+    // above this is FATAL: a box that cannot publish can complete nothing at
+    // all — every candidate must carry a portable reference, there is no
+    // `publish: none` to degrade to, and a worker that dispatches implementers
+    // whose candidates can never be submitted burns real model spend to produce
+    // nothing. Saying so once, here, is more honest than failing every item
+    // identically at its publish.
+    const startupPublish = candidatePublish.publishSatisfiability(factory, {
+      graphHome: cfg.userConfigHome(),
+      mode: cfg.mode(),
+      // The checkouts this machine actually knows about (`dispatch.repos`,
+      // per-machine and never committable), narrowed to what the factory
+      // declares. A repo we hold no path for is not a refusal — we could not
+      // prove a failure — and the check says so rather than guessing.
+      repoPaths: Object.fromEntries(
+        (factory.repos || []).map((r) => [r, (cfg.get("dispatch.repos", {}) || {})[r]]).filter(([, dir]) => dir)
+      ),
+    });
+    for (const w of startupPublish.warnings) err(`spor work: ${w}`);
+    if (!startupPublish.ok) {
+      err(`spor work: factory '${factoryId}' cannot publish a candidate from this machine:`);
+      for (const e of startupPublish.errors) err(`  ${e}`);
+      err("  every candidate carries a portable reference (there is no publish: none), so a worker that cannot publish cannot submit one — fix the store/remote, or run this worker on a box that can reach them.");
+      return 1;
     }
   }
   // A standing `dispatch.claudeLaunchMode: native-background` is honored by an
