@@ -2120,6 +2120,25 @@ test("executionOutcomeSettles: every reading but `completed` settles its attempt
   assert.strictEqual(gates.executionOutcomeSettles("nonsense"), false);
 });
 
+// issue-spor-unpublishable-reference-shape-classified-infrastructure-until-
+// pool-drains: the candidate PUBLISHER (shell/candidate-publish.js) answers a
+// different question than classifyExecutionOutcome above — not "did the
+// dispatch run" but "did the candidate reach a reader" — but the two spend
+// the SAME per-pipeline `retry` pool, so `publishOutcomePool` is the one
+// table that decides which publish classifications may charge it.
+test("publishOutcomePool: only a genuine infrastructure outage charges the retry pool", () => {
+  assert.strictEqual(gates.publishOutcomePool("infrastructure"), "retry");
+  for (const cls of ["unpublishable", "candidate-mismatch", "publish-conflict"]) {
+    assert.strictEqual(gates.publishOutcomePool(cls), null, cls);
+  }
+  // An unrecognized classification — written by a newer client — is the
+  // bounded reading, same as rule 1's ambiguity above: never assumed
+  // retriable.
+  assert.strictEqual(gates.publishOutcomePool("something-new"), null);
+  assert.strictEqual(gates.publishOutcomePool(null), null);
+  assert.strictEqual(gates.publishOutcomePool(undefined), null);
+});
+
 test("the pool caps come from the declared stage — a factory that declared none has neither pool", () => {
   const { implementation } = gates.parseImplementation({ implementation: { profile: "profile-impl", budget: { attempts: 2 }, retry: { attempts: 3 } } });
   assert.strictEqual(gates.executionPoolCap(implementation, "implementation"), 2);

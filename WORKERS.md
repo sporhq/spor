@@ -1152,6 +1152,23 @@ Four properties the publisher is built around:
   knows about. This is FATAL, unlike the `gh`/propose warning: a box that
   cannot publish can submit nothing at all, so dispatching implementers there
   burns spend to produce nothing.
+- **A refused reference SHAPE is `unpublishable`, never `infrastructure`.**
+  Every reason the shape check above can give — a locator under the
+  producing run's own working tree included — is a structural fact about the
+  declared store/remote, not an outage: retrying changes nothing, so it
+  spends no pool and escalates naming the shape rather than being retried
+  until the retry pool drains
+  (issue-spor-unpublishable-reference-shape-classified-infrastructure-until-
+  pool-drains). Two of the three refused shapes are knowable without a
+  checkout and are caught by the startup refusal above; the third — a store
+  resolving under the producing run's own working tree — needs a run's `cwd`,
+  which a startup check never has, so it is caught here, on the first
+  publish attempt, and only once. `gates.js`'s `publishOutcomePool` is the
+  one table that says which publish classifications may charge
+  `implementation.retry.attempts` — the same shared per-pipeline pool §10.4
+  charges a review or fix outage against — so the two questions ("did the
+  dispatch run", "did the candidate reach a reader") are never answered by
+  two disagreeing copies.
 
 A consumer reading `gate_state` as a verdict must check it is one of the
 settled values (`passed`/`failed`/`blocked`/`superseded`/`scoped`, or `parked`

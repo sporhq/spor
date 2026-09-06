@@ -391,6 +391,26 @@ test("an unusable store leaves the same publish_attempts trail every other failu
   assert.strictEqual(r.candidate.publish_attempts[0].pool, "retry");
 });
 
+// issue-spor-unpublishable-reference-shape-classified-infrastructure-until-
+// pool-drains: a store under the producing run's own working tree is the ONE
+// permanent shape resolveBundleStore cannot refuse at startup — it needs a
+// cwd a startup check never has — so it was reaching this classification as
+// `infrastructure` and being retried until the whole retry pool was spent,
+// even though no retry could ever make it verify.
+test("a bundle store under the producing run's OWN working tree is unpublishable, not an outage, and spends no retry", async (t) => {
+  const repo = producerRepo(t);
+  const store = pathToFileURL(path.join(repo.dir, "candidates")).href;
+  const r = await publisher.publishCandidate(mintFor(repo), { cwd: repo.dir, publish: "bundle", bundleStore: store });
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.classification, "unpublishable");
+  assert.match(r.reason, /working tree/);
+  // The same trail an outage leaves, but charging NEITHER pool — a shape a
+  // retry can never fix must not drain the one budget an actual outage needs.
+  assert.strictEqual(r.candidate.publish_attempts.length, 1);
+  assert.strictEqual(r.candidate.publish_attempts[0].outcome, "unpublishable");
+  assert.strictEqual(r.candidate.publish_attempts[0].pool, null);
+});
+
 test("a store shape that can NEVER verify is refused at startup, not retried until the pool is spent", (t) => {
   const home = scratch(t, "cand-home");
   for (const [store, re] of [
@@ -672,6 +692,27 @@ test("a publish that fails leaves the stage UNSETTLED with the debt named — th
   assert.match(rec.publish_pending.reason, /no git remote named 'origin'/);
   assert.strictEqual(rec.impl_candidate.publish_attempts.at(-1).pool, "retry");
   assert.ok(wired.logs.some((l) => /is not published yet/.test(l)));
+});
+
+test("a declared bundle_store under the producing run's own cwd fails once and spends no retry, through the real pin", async (t) => {
+  const repo = producerRepo(t);
+  // A factory whose declared store happens to resolve INSIDE the checkout the
+  // implementation stage runs from — the one shape resolveBundleStore cannot
+  // refuse at startup, since it has no cwd to check against
+  // (issue-spor-unpublishable-reference-shape-classified-infrastructure-
+  // until-pool-drains). Every re-pin runs from the SAME cwd, so this is not a
+  // transient outage a retry could clear — it fails identically forever.
+  const store = pathToFileURL(path.join(repo.dir, "candidates")).href;
+  const wired = pipelineFor(t, repo, { candidate: { publish: "bundle", bundle_store: store } });
+  assert.ok((await wired.deps.changedPaths({ trustedRef: "main" })).ok);
+  const pinned = await wired.deps.pinCandidate({ submittedBy: { stage: "implementation", cycle: 0, rescue: 0 } });
+  assert.strictEqual(pinned.ok, true, "the pin still succeeds — a publish is how a controller OBTAINS the candidate, not what makes one");
+
+  const rec = wired.readRecord();
+  assert.strictEqual(rec.impl_state, "running", "an unpublished candidate is not a submission");
+  assert.strictEqual(rec.publish_pending.classification, "unpublishable");
+  assert.match(rec.publish_pending.reason, /working tree/);
+  assert.strictEqual(rec.impl_candidate.publish_attempts.at(-1).pool, null, "a shape a retry can never fix must not charge the retry pool");
 });
 
 test("a re-pin of the SAME tree publishes nothing again and keeps the reference it already has", async (t) => {
