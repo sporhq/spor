@@ -7908,3 +7908,35 @@ test("attestation uses the rescue pass's current gate verdicts while preserving 
   assert.deepEqual(evidence.gate.steps.map(s => [s.id, s.verdict, s.head]), [["acceptance", "passed", "head-new"]]);
   assert.ok(result.facts.length >= 3, "original refusal, rescue, and final pass all keep lineage");
 });
+
+test("a later gate fix changes the commit and requires a fresh human approval despite identical risk paths", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "spor-human-head-"));
+  fs.mkdirSync(path.join(home, "nodes"));
+  const { loadConfig } = require("../lib/config.js");
+  const cfg = loadConfig({ cwd: home, env: { SPOR_HOME: home, XDG_CONFIG_HOME: home } });
+  const h1 = "a".repeat(40), h2 = "b".repeat(40);
+  const factory = factoryOf({ ...BASE, gates: [
+    { id: "security", kind: "human", risk: ["touches:auth"], approval_timeout_ms: 1, poll_ms: 1 },
+    { id: "suite", kind: "command", command: "test", reruns: 0, cycles: 1 },
+  ] });
+  let head = h1, suites = 0;
+  const f = fakes({ suite: () => ({ ok: ++suites > 1, output: "first attempt requires a fix" }), fix: () => { head = h2; return { ok: true }; } });
+  f.deps.changedPaths = async () => ({ ok: true, paths: ["lib/auth.js"], head, base: "c".repeat(40), trustedRef: "main", trustedSha: "c".repeat(40), branch: "candidate" });
+  const real = sporCli.makeGateDeps(cfg, { entry: ITEM, factory, slug: null, log: () => {} });
+  const approvals = [];
+  f.deps.fileHumanItem = async (args) => {
+    const filed = await real.fileHumanItem(args);
+    assert.ok(filed.ok, filed.reason);
+    approvals.push({ id: filed.id, head: args.head });
+    if (args.head === h1) fs.writeFileSync(path.join(home, "nodes", "dec-first-approved.md"), `---\nid: dec-first-approved\ntype: decision\ntitle: Approved the first commit\nsummary: Approved the first candidate only.\nstatus: accepted\nedges:\n  - {type: resolves, to: ${filed.id}}\n---\n`);
+    return filed;
+  };
+  f.deps.checkApproval = ({ id }) => sporCli.gateApprovalState(cfg, id);
+  const result = await gateRunner.runGatePipeline({ item: ITEM, factory, deps: f.deps });
+  assert.equal(result.state, "blocked", JSON.stringify(result));
+  assert.deepStrictEqual(approvals.map((a) => a.head), [h1, h2]);
+  assert.notEqual(approvals[0].id, approvals[1].id);
+  assert.match(fs.readFileSync(path.join(home, "nodes", `${approvals[1].id}.md`), "utf8"), new RegExp(h2));
+  assert.equal((await sporCli.gateApprovalState(cfg, approvals[0].id)).state, "approved");
+  assert.equal((await sporCli.gateApprovalState(cfg, approvals[1].id)).state, "pending");
+});

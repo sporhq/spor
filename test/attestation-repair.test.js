@@ -164,3 +164,132 @@ test("implementation and completion writers respect the settlement lock; pending
   runner.pruneRuns(f.home, { maxAgeMs: 1 });
   assert.ok(fs.existsSync(f.file), "settled process retention cannot erase publication debt");
 });
+
+test("every terminal bookkeeping writer locks before reading and preserves a concurrently settled outbox", () => {
+  for (const writer of ["settleNativeOutcome", "settleContractOutcome", "stampRun"]) {
+    const f = fixture();
+    runner.atomicJson(f.file, { ...runner.readJson(f.file), contract_pending: true });
+    let entered = false;
+    const lock = (file, body) => {
+      entered = true;
+      const settled = cli.settleRunRecord(f.home, f.item.run_id, f.gateResult, "w", { token: "winner", pending: f.pending });
+      assert.equal(settled.landed, true);
+      return runner.withRecordLock(file, body);
+    };
+    const record = runner.readJson(f.file);
+    const patch = { terminal_state: "resolved", terminal_enforced: true, lease_released: true };
+    runner[writer](f.home, writer === "stampRun" ? f.item.run_id : record, patch, { lock });
+    assert.equal(entered, true, writer);
+    const final = runner.readJson(f.file);
+    assert.equal(final.gate_settle_id, "winner", writer);
+    assert.deepEqual(final.gate_attestation_pending, f.pending, writer);
+    assert.equal(final.terminal_state, "resolved", writer);
+    const bytes = fs.readFileSync(f.file, "utf8");
+    runner[writer](f.home, writer === "stampRun" ? f.item.run_id : final, { terminal_state: "reported" }, { lock: () => ({ ok: false, reason: "busy" }) });
+    assert.equal(fs.readFileSync(f.file, "utf8"), bytes, "lock refusal makes no write");
+  }
+});
+
+test("outbox replay refuses other servers, organizations, local graphs, and legacy unbound evidence", async () => {
+  const f = fixture();
+  cli.settleRunRecord(f.home, f.item.run_id, f.gateResult, "w", { token: "winner", pending: f.pending });
+  const saved = runner.readJson(f.file);
+  const otherLocal = { mode: () => "local", nodesDir: () => path.join(f.home, "other-nodes") };
+  const remote = (server, org) => ({ mode: () => "remote", server: () => server, tenant: () => ({ org }) });
+  let writes = 0;
+  const write = async () => { writes++; return { attestation: null }; };
+  for (const [origin, cfg] of [
+    [f.pending.origin, otherLocal], [f.pending.origin, remote("https://a.example", "a")],
+    [{ mode: "remote", server: "https://a.example", org: "a" }, remote("https://b.example", "a")],
+    [{ mode: "remote", server: "https://a.example", org: "a" }, remote("https://a.example", "b")],
+    [null, f.cfg],
+  ]) {
+    runner.atomicJson(f.file, { ...saved, gate_attestation_pending: { ...f.pending, origin } });
+    const bytes = fs.readFileSync(f.file, "utf8");
+    await cli.replayAttestationDebts(cfg, { home: f.home, write });
+    assert.equal(writes, 0);
+    assert.equal(fs.readFileSync(f.file, "utf8"), bytes, "wrong graph cannot clear original debt");
+  }
+  const cfg = remote("https://a.example/", "a");
+  runner.atomicJson(f.file, { ...saved, gate_attestation_pending: { ...f.pending, origin: { mode: "remote", server: "https://a.example", org: "a" } } });
+  await cli.replayAttestationDebts(cfg, { home: f.home, write });
+  assert.equal(writes, 1, "matching origin alone may pay the debt");
+});
+
+test("re-gate publishes liveness before claiming and cannot overwrite a successor at final settlement", async () => {
+  const gates = require("../lib/shell/gate-runner.js");
+  const loop = require("../lib/shell/work-loop.js");
+  for (const steal of [false, true]) {
+    const f = fixture();
+    runner.atomicJson(f.file, { ...runner.readJson(f.file), terminal_state: "resolved", terminal_enforced: true, gate_state: "failed", gate_worker: "old" });
+    const original = gates.runGatePipeline;
+    let workerId;
+    gates.runGatePipeline = async () => {
+      const rec = runner.readJson(f.file);
+      workerId = rec.gate_worker;
+      assert.ok(loop.readWorkerStatuses(f.home, { alive: cli.workerAlive }).some((w) => w.worker_id === workerId && w.live));
+      const rival = runner.claimGateRecord(f.home, f.item.run_id, { workerId: "rival", ownerLive: (id) => loop.readWorkerStatuses(f.home, { alive: cli.workerAlive }).some((w) => w.live && w.worker_id === id) });
+      assert.equal(rival.ok, false, "orphan scan cannot adopt live re-gate");
+      if (steal) runner.stampGateState(f.home, f.item.run_id, { gate_state: "passed", gate_settle_id: "successor", gate_worker: "successor", gate_reason: "successor verdict" }, { force: true });
+      return f.gateResult;
+    };
+    try {
+      const code = await cli.cmdWorkRegate(f.cfg, { regate: f.item.run_id }, { factory: f.factory, factoryId: f.factory.id, slug: null, passthrough: {}, warn: () => {}, runMaxMs: 1000, home: f.home });
+      assert.equal(code, steal ? 1 : 0);
+    } finally { gates.runGatePipeline = original; }
+    const final = runner.readJson(f.file);
+    assert.equal(final.gate_worker, steal ? "successor" : workerId);
+    if (steal) {
+      assert.equal(final.gate_settle_id, "successor");
+      assert.equal(final.gate_reason, "successor verdict");
+      assert.equal(fs.existsSync(path.join(f.home, "nodes", `${f.pending.built.id}.md`)), false);
+    }
+    assert.equal(loop.readWorkerStatuses(f.home, { alive: cli.workerAlive }).find((w) => w.worker_id === workerId).live, false);
+  }
+});
+
+test("proposal push and trusted-ref merge never execute repository hooks with judge credentials", () => {
+  const f = fixture();
+  const repo = path.join(f.home, "repo");
+  const bare = path.join(f.home, "remote.git");
+  const bin = path.join(f.home, "bin");
+  fs.mkdirSync(repo); fs.mkdirSync(bin);
+  const git = (cwd, ...args) => { const r = spawnSync("git", ["-c", "core.hooksPath=/dev/null", ...args], { cwd, encoding: "utf8" }); assert.equal(r.status, 0, r.stderr); return r.stdout.trim(); };
+  git(repo, "init", "-q", "-b", "main"); git(repo, "config", "user.name", "test"); git(repo, "config", "user.email", "test@example.com");
+  fs.writeFileSync(path.join(repo, "base"), "base"); git(repo, "add", "."); git(repo, "commit", "-qm", "base");
+  git(f.home, "init", "--bare", "-q", bare);
+  git(repo, "remote", "add", "origin", "https://github.com/example/test.git");
+  git(repo, "config", "url." + bare + ".insteadOf", "https://github.com/example/test.git");
+  git(repo, "checkout", "-qb", "candidate"); fs.writeFileSync(path.join(repo, "candidate"), "candidate"); git(repo, "add", "."); git(repo, "commit", "-qm", "candidate");
+  git(repo, "checkout", "-q", "main"); fs.writeFileSync(path.join(repo, "trusted"), "trusted"); git(repo, "add", "."); git(repo, "commit", "-qm", "trusted"); git(repo, "checkout", "-q", "candidate");
+  const leaked = path.join(f.home, "hook-ran");
+  for (const hook of ["pre-push", "post-merge", "pre-merge-commit"]) fs.writeFileSync(path.join(repo, ".git", "hooks", hook), `#!/bin/sh\nprintf '%s' "$SPOR_ATTESTATION_KEY" > '${leaked}'\nexit 1\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, "gh"), "#!/bin/sh\nif [ \"$2\" = list ]; then echo '[]'; else echo 'https://github.com/example/test/pull/1'; fi\n", { mode: 0o755 });
+  // get-url expands insteadOf, so use an explicit pushURL to a local receiver.
+  git(repo, "config", "--unset", "url." + bare + ".insteadOf"); git(repo, "remote", "set-url", "--push", "origin", bare);
+  const oldPath = process.env.PATH, oldKey = process.env.SPOR_ATTESTATION_KEY;
+  process.env.PATH = bin + path.delimiter + oldPath; process.env.SPOR_ATTESTATION_KEY = "never-child-visible";
+  try {
+    assert.equal(cli.refreshBranchFromTrustedRef(repo, "main").refused, undefined);
+    const head = git(repo, "rev-parse", "HEAD");
+    assert.equal(cli.proposeIntegrationPR({ top: repo, head, targetRef: "origin/main" }).ok, true);
+    assert.equal(fs.existsSync(leaked), false);
+    assert.equal(git(bare, "rev-parse", "refs/heads/candidate"), head, "actual local push completed");
+  } finally { process.env.PATH = oldPath; if (oldKey === undefined) delete process.env.SPOR_ATTESTATION_KEY; else process.env.SPOR_ATTESTATION_KEY = oldKey; }
+});
+
+test("atomic reopen rejects a stale snapshot and a live settler, while mismatch remains re-gateable", () => {
+  const f = fixture();
+  const before = { ...runner.readJson(f.file), gate_state: "mismatch", gate_regate_count: 0 };
+  runner.atomicJson(f.file, before);
+  const reopen = { settleId: "winner", regateCount: 0, state: "mismatch" };
+  assert.equal(runner.claimGateRecord(f.home, f.item.run_id, { workerId: "new", reopen, ownerLive: () => true }).ok, false);
+  assert.deepEqual(runner.readJson(f.file), before);
+  assert.equal(runner.claimGateRecord(f.home, f.item.run_id, { workerId: "new", reopen: { ...reopen, settleId: "older" } }).ok, false);
+  assert.deepEqual(runner.readJson(f.file), before);
+  const winner = runner.claimGateRecord(f.home, f.item.run_id, { workerId: "new", reopen });
+  assert.equal(winner.ok, true);
+  assert.equal(winner.record.gate_regate_count, 1);
+  assert.equal(runner.claimGateRecord(f.home, f.item.run_id, { workerId: "racer", reopen }).ok, false);
+  assert.equal(runner.readJson(f.file).gate_settle_id, winner.token);
+});
