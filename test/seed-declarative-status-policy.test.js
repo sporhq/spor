@@ -76,6 +76,7 @@ function hooks(schema) {
     names: sb.names,
     validate: (node) => sb.call("validate", [node], SLACK),
     transitions: (cur, prop, view) => sb.call("transitions", [cur, prop, view || {}], SLACK),
+    get: (node, ctx) => sb.call("get", [node, ctx || {}], SLACK),
   };
 }
 
@@ -201,4 +202,90 @@ test("the registry accessors expose the seed completion policy the gardener deri
     assert.equal(reg.statusVocabulary(t).size, 0, `${t} has no closed status vocabulary`);
     assert.equal(reg.completionStatus(t), null);
   }
+});
+
+// ---- resolution: the attestation path, declared instead of inferred ----
+//
+// issue-spor-offline-check-get-hook-resolution-proxy. How a type's completion
+// is attested — a live resolving edge, or the node's own terminal status — used
+// to be INFERRED from whether the schema attached a `get()` hook at all. That
+// verb is the general-purpose read-time enrichment hook (a held-note, an
+// execution hold, a question's answers), so the proxy was only ever a
+// coincidence of which four seed types happened to use it for `resolution`,
+// and the day a status-retired type adopts one for anything else it would
+// silently read as edge-verified: remote dispatch would demand an edge that
+// type never has, file a report saying one is missing, and hand the lease back
+// on finished work. So each schema DECLARES it. Same rule as the completion
+// policy above — a declaration that drifts from its hook is worse than none —
+// so this pins the two together in both directions.
+
+// A live inbound resolving edge of each spelling, plus the ctx keys the seed
+// `get()` hooks read. Whatever a type's hook makes of this, an edge-verified
+// one must surface it as `resolution`.
+const RESOLVED_CTX = {
+  neighbors: [
+    { dir: "in", edge: "resolves", id: "dec-x", type: "decision", status: "", superseded: false, date: "2026-09-06", summary: "why" },
+    { dir: "in", edge: "answers", id: "art-x", type: "artifact", status: "", superseded: false, date: "2026-09-06", summary: "why" },
+  ],
+  non_resolving_statuses: [],
+  terminal: false,
+};
+
+const declaredResolution = (s) => {
+  const r = s.payload && s.payload.resolution;
+  return r && typeof r === "object" ? r.verified_by : null;
+};
+
+test("every seed node-schema declares resolution.verified_by", () => {
+  for (const s of nodeSchemas()) {
+    assert.ok(["edge", "status"].includes(declaredResolution(s)),
+      `${s.id} declares no resolution.verified_by — an undeclared type falls back to the legacy ` +
+      `get()-hook proxy, which is exactly what this key exists to retire`);
+  }
+});
+
+test("every CANDIDATE node-schema declares it too, so promotion into lib/seed/ can't smuggle an undeclared type in", () => {
+  const { loadCandidates } = require(path.join(__dirname, "..", "lib", "candidates.js"));
+  const { parseSchemaNode } = require(path.join(__dirname, "..", "lib", "kernel", "registry.js"));
+  for (const cand of loadCandidates()) {
+    const parsed = parseSchemaNode(cand.node);
+    assert.ok(parsed.ok, `${cand.id} does not parse: ${(parsed.errors || []).join("; ")}`);
+    if (parsed.schema.kind !== "node-schema") continue;
+    assert.ok(["edge", "status"].includes(declaredResolution(parsed.schema)),
+      `${cand.id} declares no resolution.verified_by`);
+  }
+});
+
+test("the declaration matches what each type's own get() hook actually attaches", () => {
+  for (const s of nodeSchemas()) {
+    const declared = declaredResolution(s);
+    const h = hooks(s);
+    if (!h.names.includes("get")) {
+      assert.equal(declared, "status",
+        `${s.id} declares resolution.verified_by: edge but attaches no get() hook to surface the ` +
+        `resolution enrichment a reader would then demand`);
+      continue;
+    }
+    const node = { id: `${s.key}-probe`, type: s.key };
+    const enriched = h.get(node, RESOLVED_CTX) || {};
+    const attaches = Object.prototype.hasOwnProperty.call(enriched, "resolution");
+    assert.equal(attaches, declared === "edge",
+      declared === "edge"
+        ? `${s.id} declares edge-verified completion but its get() surfaces no resolution ride-along ` +
+          `for a live resolving edge — a caller would demand an attestation the read never carries`
+        : `${s.id} declares status-verified completion but its get() DOES surface a resolution ` +
+          `ride-along — the declaration and the hook disagree about how this type is retired`);
+  }
+});
+
+test("the seed pack's declarations reproduce the four edge-verified types exactly", () => {
+  // The set the old hardcoded table named, now read off the declaration —
+  // pinned so a seed edit that flips a type's attestation path has to say so
+  // here (task-spor-dispatch-terminal-resolution-all-types).
+  const reg = new Registry();
+  for (const s of graph.loadSeedSchemas()) reg.add(s, "seed");
+  const edge = nodeSchemas().map((s) => s.key).filter((t) => reg.isEdgeVerified(t)).sort();
+  assert.deepEqual(edge, ["incident", "issue", "question", "task"]);
+  assert.equal(graph.isEdgeVerifiedOffline("decision"), false);
+  assert.equal(graph.isEdgeVerifiedOffline("task"), true);
 });

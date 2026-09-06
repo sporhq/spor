@@ -2,7 +2,7 @@
 id: schema-repo
 type: schema
 kind: node-schema
-schema_version: 2026.06.13.1
+schema_version: 2026.09.06.1
 title: Seed schema for repo nodes
 summary: Node schema for the repo type — durable git-repo identity owning a slug-alias list and repo fingerprints, so renames are healed by read-time alias resolution instead of orphaning historical project tags. Renamed from the former `project` node type (dec-cc-repo-project-two-layer-identity); the new grouping above repos is `type: project`. Seed-pack default; a graph-resident schema node for this type overrides it.
 date: 2026-06-13
@@ -73,6 +73,17 @@ existing identity-node set (`proj-<slug>` → `repo-<slug>`, edges rewritten,
 `supersedes` links preserved), NOT a lazy upgrade chain. The freed `proj-`
 prefix is taken by the new `type: project` grouping.
 
+`resolution` (2026.09.06.1, issue-spor-offline-check-get-hook-resolution-proxy):
+the attestation path for this type's completion, DECLARED as registry data.
+`verified_by: status` — a repo's own terminal status retires it; no inbound
+resolving edge attests it. Readers (remote dispatch's terminal-state verify,
+`spor schema`) used to infer this from the ABSENCE of a `get()` hook on this
+schema, which is the general-purpose read-time enrichment verb and says
+nothing about resolution — so adopting one here for any other purpose would
+have silently flipped this type to edge-verified and read genuinely
+status-retired work as unattested. Declaration only — enforcement stays in the
+hooks — no stored-shape change, no upgrade chain.
+
 ```json
 {
   "node_type": "repo",
@@ -80,6 +91,9 @@ prefix is taken by the new `type: project` grouping.
   "prefix": [
     "repo-"
   ],
-  "capturable": false
+  "capturable": false,
+  "resolution": {
+    "verified_by": "status"
+  }
 }
 ```

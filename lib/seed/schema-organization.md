@@ -2,7 +2,7 @@
 id: schema-organization
 type: schema
 kind: node-schema
-schema_version: 2026.06.23.1
+schema_version: 2026.09.06.1
 title: Seed schema for organization nodes
 summary: Node schema for durable organization identity anchors used by front-door membership and stewardship relations.
 date: 2026-06-23
@@ -16,6 +16,17 @@ Organization nodes are deliberately authored by trusted identity-management
 surfaces, not inferred by capture. `org-root` remains the virtual graph-wide
 operator anchor and is not an organization node.
 
+`resolution` (2026.09.06.1, issue-spor-offline-check-get-hook-resolution-proxy):
+the attestation path for this type's completion, DECLARED as registry data.
+`verified_by: status` — an organization's own terminal status retires it; no inbound
+resolving edge attests it. Readers (remote dispatch's terminal-state verify,
+`spor schema`) used to infer this from the ABSENCE of a `get()` hook on this
+schema, which is the general-purpose read-time enrichment verb and says
+nothing about resolution — so adopting one here for any other purpose would
+have silently flipped this type to edge-verified and read genuinely
+status-retired work as unattested. Declaration only — enforcement stays in the
+hooks — no stored-shape change, no upgrade chain.
+
 ```json
 {
   "node_type": "organization",
@@ -23,7 +34,10 @@ operator anchor and is not an organization node.
   "prefix": [
     "org-"
   ],
-  "capturable": false
+  "capturable": false,
+  "resolution": {
+    "verified_by": "status"
+  }
 }
 ```
 

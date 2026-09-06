@@ -580,63 +580,66 @@ nothing cleared) rather than as an unenforced `reported`, so a local factory
 does not gate it either.
 
 **Two attestation paths, one verdict.** Types differ in how completion is
-*attested*, not in whether it can be judged. The seed types whose schema
-attaches the `get()` resolution hook — `task`, `issue`, `question`,
+*attested*, not in whether it can be judged. The seed types that declare
+`resolution.verified_by: edge` — `task`, `issue`, `question`,
 `incident` — are attested by a **resolving edge**, above. Every other
 dispatchable type (`decision`, `finding`, `capture-pending`, …) is retired by
 its **own status**, and is judged against that instead: `resolved` once the
 node's status has reached its type's terminal partition (a decision
 `settled`, a finding `resolved`, a capture-pending `merged` — unioned with
 the type-blind completion words), not resolved while it has not. Which of the
-two paths applies is read off a **schema registry** — does this type's schema
-declare the `get()` hook — never off a hardcoded type list
-(norm-cc-registry-is-contract,
-task-spor-dispatch-terminal-resolution-all-types). *Which* registry answers
+two paths applies is read off a **schema registry** — the type's own declared
+`resolution.verified_by` (`edge` or `status`, GRAPH.md) — never off a
+hardcoded type list (norm-cc-registry-is-contract,
+task-spor-dispatch-terminal-resolution-all-types). A schema that declares
+NEITHER is read through the legacy proxy that predates the key — does the
+type attach a `get()` hook — which was never sound: `get()` is the
+general-purpose read-time enrichment verb, so any status-retired type
+adopting one for another purpose read as edge-verified and had its finished
+work reported as unattested (issue-spor-offline-check-get-hook-resolution-
+proxy). Every seed type declares one; only a resident override written before
+the key existed still falls back. *Which* registry answers
 that is part of the contract, not a detail: the reference client asks a
-different one on each of its two verification legs, and only one of them is
-the graph's own, so a resident `type: schema` override that moves a `get()`
-hook is honored on one leg and **invisible** on the other. Read the next
-paragraph before assuming either. A target whose type the graph does not echo
-at all is treated as edge-verified: nothing short of a resolving edge attests
-it, which is the fail-safe direction.
+different one on each of its two verification legs — the graph's own locally,
+the server's `GET /v1/schema` remotely — and the remote one degrades to the
+shipped seed pack when that endpoint cannot be read, at which point a resident
+override becomes **invisible**. Read
+the next paragraph before assuming either. A target whose type the graph does
+not echo at all is treated as edge-verified: nothing short of a resolving edge
+attests it, which is the fail-safe direction.
 
 **The two legs, and the registry each one actually reads.** A registry is
 only as live as the graph behind it:
 
 - **Local-mode verification** loads the graph it is verifying against, so it
-  asks that graph's own registry (`registry.attachesResolutionHook`). A
-  resident `type: schema` override that attaches the hook to another type —
-  or drops it — is honored there with no code change.
-- **The remote leg** holds one node's JSON and no graph, and answers from the
-  **shipped seed pack** (`attachesResolutionHookOffline`, `lib/graph.js`),
-  which by construction cannot see a resident override — the same graph-less
-  limitation API.md's reserved `inert` key names
-  (issue-spor-type-blind-terminal-status-fallbacks). The seed answer is right
-  for every graph that leaves the `get()` hooks where the seed pack puts them.
-  Where an override moves one, this leg is wrong in **both** directions — the
-  server's own `resolution` enrichment (read FIRST, and authoritative when it
-  is there) covers only part of one of them:
-  - an override that **adds** the hook to a status-only type: a real resolving
-    edge still reads `resolved`, off the enrichment the override now produces.
-    The residual is the node carrying no such edge whose own status happens to
-    be terminal — the seed's status-only answer accepts that status and reads
-    `resolved`, an **over-read** of an attestation the live registry would not
-    have accepted.
-  - an override that **drops** the hook from an edge-verified type: the
-    enrichment goes with it, so nothing answers first, and the seed's
-    edge-verified answer never consults the status at all — a node genuinely
-    retired by its own terminal status reads as not attested, so the run files
-    a report and hands the lease back on finished work (and a factory gates an
-    item that is done). Fail-closed, but wrong.
-
-  Both directions are tracked as
-  issue-spor-remote-dispatch-ignores-resident-resolution-hooks; the bullet
-  below is what a worker does about it today.
-- **A third-party worker should do better than the reference client's remote
-  leg**, and can: read the live answer from `GET /v1/schema` — the type's
-  `hooks` array contains `get` (`spor schema <type> --json` prints the same
-  registry snapshot) — which is exactly the "agents reverse-engineering the
-  registry from `lib/seed/`" failure that endpoint exists to close.
+  asks that graph's own registry (`registry.isEdgeVerified`). A resident
+  `type: schema` override that declares another type edge-verified — or
+  declares an edge-verified one status-retired — is honored there with no code
+  change.
+- **The remote leg** holds one node's JSON and no graph, so it asks the server
+  for its own live registry — `GET /v1/schema`, whose per-type `resolution`
+  key carries resident overrides the shipped seed pack cannot see
+  (issue-spor-remote-dispatch-ignores-resident-resolution-hooks). That fetch
+  is best-effort: an older server with no such endpoint, a network fault, or a
+  body that parses but carries no `node_types` all fall back to the **shipped
+  seed pack** (`isEdgeVerifiedOffline`, `lib/graph.js`) rather than failing the
+  dispatch over an introspection endpoint — the same graph-less limitation
+  API.md's reserved `inert` key names
+  (issue-spor-type-blind-terminal-status-fallbacks). On that fallback the seed
+  answer is right for every graph that leaves the attestation paths where the
+  seed pack puts them, and wrong in **both** directions where an override
+  moves one — an over-read (a terminal status accepted for a type this graph
+  makes edge-verified) or a fail-closed under-read (a node genuinely retired
+  by its own status reported as unattested, so the run files a report and
+  hands the lease back on finished work).
+- **A third-party worker should read the same live answer**: the type's
+  `resolution` field from `GET /v1/schema` (`spor schema <type> --json` prints
+  the same registry snapshot), falling back to `hooks` containing `get` only
+  for a type that declares none. Never read `hooks` first — it is the legacy
+  proxy, and it says only that the type attaches read-time enrichment, not how
+  it is retired (issue-spor-offline-check-get-hook-resolution-proxy). Reading
+  the registry here is exactly the "agents reverse-engineering the registry
+  from `lib/seed/`" failure that endpoint exists to close.
 
 **Both paths are fully enforced, and both run the ordering below unchanged**
 — including the release. A status-only target whose status has *not* gone

@@ -2,7 +2,7 @@
 id: schema-gate
 type: schema
 kind: node-schema
-schema_version: 2026.09.05.1
+schema_version: 2026.09.06.1
 title: Shareable factory gate
 summary: One reusable gate — command, agent-review or human — that any factory definition can reference by id, so an org vets a gate once (a `gate-security-review`) and reuses it product-wide instead of copying it into every factory.
 date: 2026-08-26
@@ -72,6 +72,17 @@ before the runner escalates to a human queue item. Reruns come BEFORE fix
 cycles: a command gate spends its `reruns` budget on one tree first, and only
 a suite that failed every run is charged a cycle.
 
+`resolution` (2026.09.06.1, issue-spor-offline-check-get-hook-resolution-proxy):
+the attestation path for this type's completion, DECLARED as registry data.
+`verified_by: status` — a gate's own terminal status retires it; no inbound
+resolving edge attests it. Readers (remote dispatch's terminal-state verify,
+`spor schema`) used to infer this from the ABSENCE of a `get()` hook on this
+schema, which is the general-purpose read-time enrichment verb and says
+nothing about resolution — so adopting one here for any other purpose would
+have silently flipped this type to edge-verified and read genuinely
+status-retired work as unattested. Declaration only — enforcement stays in the
+hooks — no stored-shape change, no upgrade chain.
+
 ```json
 {
   "node_type": "gate",
@@ -85,6 +96,9 @@ a suite that failed every run is charged a cycle.
     "vocabulary": ["proposed", "active", "retired"],
     "terminal": ["retired"],
     "resolver_required": false
+  },
+  "resolution": {
+    "verified_by": "status"
   }
 }
 ```

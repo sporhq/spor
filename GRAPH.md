@@ -355,6 +355,29 @@ and hook are pinned together by `test/seed-declarative-status-policy.test.js`,
 which drives every seed schema's hooks through the sandbox and fails if the two
 disagree; read the live values with `spor schema <type>`.
 
+**The attestation path — how completion is verified**
+(issue-spor-offline-check-get-hook-resolution-proxy). A separate top-level
+`resolution` block, one key: `resolution.verified_by`, either `edge` (only a
+live inbound resolving `resolves`/`answers` edge attests this type's
+completion — task, issue, question, incident) or `status` (the node's own
+terminal status retires it — decision, finding, capture-pending, and every
+other type). Remote dispatch's terminal-state verify reads it to decide what
+it is looking for on a finished run (WORKERS.md §7), through
+`registry.isEdgeVerified(type)` locally and the `resolution` key of
+`GET /v1/schema` remotely. It USED to infer the answer from whether the
+schema attached a `get()` hook at all: that verb is the general-purpose
+read-time enrichment hook, so its presence was never evidence about
+resolution, and the first status-retired type to adopt one for anything else
+(a held-note, an execution hold) would have flipped to edge-verified — a run
+that genuinely finished the work then reads as unattested, files a report
+claiming a missing edge that type never has, and hands its lease back. A
+schema declaring neither value still falls back to that proxy, so a resident
+override written before the key existed is honored unchanged; every schema in
+the seed and candidate packs declares one, pinned against its own hook by
+`test/seed-declarative-status-policy.test.js`. Like the completion policy
+above, **declaring it gates nothing** — it tells a reader what the hooks
+already do.
+
 Otherwise there is **no declarative field list and no status enum.** Custom fields are free-form: any flat frontmatter key the
 regex parser accepts (simple `key: value` scalars, YAML-folded multi-line
 values, `pin:`/`exclude:` inline lists, `- {type: X, to: Y}` edges — and nothing

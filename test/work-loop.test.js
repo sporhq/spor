@@ -3349,16 +3349,20 @@ test("ladderWidth: the narrowest rung that reaches a depth, never past the cap",
 // verifyRunResolution (issue-spor-remote-dispatch-ignores-resident-resolution-
 // hooks): the REMOTE leg used to answer "does this type need a resolving
 // edge?" off the shipped seed pack alone, so a graph-resident schema override
-// that drops the `get()` hook from an edge-verified type (task, here) was
-// invisible to it — a genuinely-done node (retired by its own terminal status
-// under the override) read as unresolved. It now fetches the LIVE registry via
-// `GET /v1/schema` before answering.
-test("verifyRunResolution (remote): a resident override that drops a type's get() hook is honored via the live registry, not the seed pack", async () => {
+// that makes an edge-verified type (task, here) status-retired was invisible
+// to it — a genuinely-done node (retired by its own terminal status under the
+// override) read as unresolved. It now fetches the LIVE registry via
+// `GET /v1/schema` before answering. The override says so by DECLARING
+// `resolution.verified_by: status` (issue-spor-offline-check-get-hook-
+// resolution-proxy); dropping the `get()` hook is the legacy way to say it,
+// covered in test/dispatch-terminal.test.js.
+test("verifyRunResolution (remote): a resident override that declares a type status-verified is honored via the live registry, not the seed pack", async () => {
   const http = require("node:http");
   const seedSnap = require("../lib/graph.js").seedRegistry().snapshot();
   const overridden = JSON.parse(JSON.stringify(seedSnap));
   const taskEntry = overridden.node_types.find((n) => n.type === "task");
-  taskEntry.hooks = []; // the resident override: task is no longer edge-verified
+  taskEntry.resolution = "status"; // the resident override: task is no longer edge-verified
+  taskEntry.hooks = [];
   taskEntry.terminal = ["done", "abandoned"];
   const srv = http.createServer((req, res) => {
     if (req.method === "GET" && req.url === "/v1/nodes/task-x") {
